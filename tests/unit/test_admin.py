@@ -17,11 +17,22 @@ import httpx
 import pytest
 import uvicorn
 
+from tests.fakes.oauth_server import FakeAuthServer
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy, parse_policy
-from zoeymcp.vault.admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir
+from zoeymcp.vault import logs
+from zoeymcp.vault.admin import (
+    NOT_WRITTEN,
+    AdminApp,
+    AdminSocketError,
+    SetupCodes,
+    check_socket_dir,
+    json_safe,
+)
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.oauth.protocol import CREDENTIAL_UNAVAILABLE
+from zoeymcp.vault.oauth.tokens import OAuthUnavailable, TokenManager
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
@@ -43,14 +54,47 @@ def example_policy() -> Policy:
 # --- admin app (in process) --------------------------------------------------------------------
 
 
+BROKER_TOKEN_URL = "https://auth.broker.example/oauth/token"
+BROKER_UPSTREAM = "https://mcp.broker.example/mcp"
+BROKER_CLIENT_ID = "broker-client-0001"
+
+
+def broker_server() -> tuple[FakeAuthServer, Any]:
+    """The broker's token endpoint: the fake AS, reached at the example policy's path."""
+    server = FakeAuthServer(client_id=BROKER_CLIENT_ID, auth="none", rotate=True, prefix="broker")
+    app = server.app()
+
+    async def at_policy_path(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["path"] == "/oauth/token":
+            scope = {**scope, "path": "/token", "raw_path": b"/token"}
+        await app(scope, receive, send)
+
+    return server, at_policy_path
+
+
 class AdminRig:
-    def __init__(self, tmp_path: Path, clock: list[float] | None = None) -> None:
+    """The admin app with the example policy and, as in the vault, a token manager."""
+
+    def __init__(
+        self, tmp_path: Path, clock: list[float] | None = None, *, tokens: bool = True
+    ) -> None:
         self.policy = example_policy()
         self.store = SecretStore(tmp_path, KEYS)
         self.store.load()
         self.clock = clock or [1_000_000.0]
         self.setup = SetupCodes(tmp_path, clock=lambda: self.clock[0])
-        self.admin = AdminApp(self.store, KEYS, lambda: self.policy, self.setup)
+        self.server, token_app = broker_server()
+        self.token_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=token_app))
+        self.tokens = TokenManager(self.store, self.token_client)
+        self.tokens.configure(self.policy, {})
+        self.admin = AdminApp(
+            self.store, KEYS, lambda: self.policy, self.setup, self.tokens if tokens else None
+        )
+
+    def set_policy(self, policy: Policy) -> None:
+        """As a reload does: the admin and the token manager see the same policy."""
+        self.policy = policy
+        self.tokens.configure(policy, {})
 
     async def call(self, method: str, path: str, body: Any = None) -> httpx.Response:
         transport = httpx.ASGITransport(app=self.admin.app)
@@ -147,7 +191,7 @@ async def test_an_oauth_secret_with_no_route_is_refused(tmp_path: Path) -> None:
     rig = AdminRig(tmp_path)
     raw = rig.policy.model_dump(by_alias=True)
     raw["routes"] = [r for r in raw["routes"] if r["credential"] != "broker-mcp"]
-    rig.policy = Policy.model_validate(raw)
+    rig.set_policy(Policy.model_validate(raw))
     response = await rig.call("PUT", "/secrets/broker-refresh", {"value": "rt-123456"})
     assert response.status_code == 409
     assert response.json() == {
@@ -383,3 +427,189 @@ def test_setup_file_is_json(tmp_path: Path) -> None:
     SetupCodes(tmp_path).issue()
     record = json.loads((tmp_path / "setup.json").read_text(encoding="utf-8"))
     assert set(record) == {"sha256", "expires"}
+
+
+# --- OAuth secrets go through the token manager (design D.12) ----------------------------------
+
+
+async def broker_ready(rig: AdminRig) -> str:
+    """Set the broker's client ID and a refresh token through the admin app."""
+    refresh = rig.server.issue_grant()
+    for name, value in (("broker-client-id", BROKER_CLIENT_ID), ("broker-refresh", refresh)):
+        response = await rig.call("PUT", f"/secrets/{name}", {"value": value})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"name": name, "binding": BROKER_BINDING}
+    return refresh
+
+
+@pytest.mark.anyio
+async def test_oauth_secret_set_waits_for_a_refresh_then_resets(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    await broker_ready(rig)
+    gate = rig.server.hold()
+    refresh = asyncio.create_task(rig.tokens.grant_for("broker-mcp", BROKER_UPSTREAM))
+    await rig.server.arrived()
+    replacement = rig.server.issue_grant()
+    put = asyncio.create_task(rig.call("PUT", "/secrets/broker-refresh", {"value": replacement}))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not put.done()
+    gate.set()
+    grant = await refresh
+    assert (await put).status_code == 200
+    # The operator's value, not the successor the refresh saved first.
+    stored = rig.store.get_for_oauth("broker-refresh", token_url=BROKER_TOKEN_URL)[0]
+    assert stored.reveal() == replacement
+    entry = rig.store.entry("broker-refresh")
+    assert entry is not None
+    assert entry.meta == {
+        "oauth": {"source": "operator", "consented_at": None, "credential": "broker-mcp"}
+    }
+    # The cached token was dropped: the next request refreshes with the new value.
+    again = await rig.tokens.grant_for("broker-mcp", BROKER_UPSTREAM)
+    assert again.serial != grant.serial
+    assert rig.server.refresh_calls[-1].refresh_token == replacement
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_oauth_secret_delete_goes_through_the_manager(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    await broker_ready(rig)
+    await rig.tokens.grant_for("broker-mcp", BROKER_UPSTREAM)
+    response = await rig.call("DELETE", "/secrets/broker-refresh")
+    assert response.status_code == 200
+    assert response.json() == {"name": "broker-refresh", "deleted": True}
+    assert rig.store.names() == ["broker-client-id"]
+    # The cache went with it: nothing is left to present.
+    with pytest.raises(OAuthUnavailable) as caught:
+        await rig.tokens.grant_for("broker-mcp", BROKER_UPSTREAM)
+    assert caught.value.code == CREDENTIAL_UNAVAILABLE
+    missing = await rig.call("DELETE", "/secrets/broker-refresh")
+    assert missing.status_code == 404
+    assert missing.json() == {"error": "no such secret"}
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_without_a_manager_oauth_secrets_go_to_the_store(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path, tokens=False)
+    response = await rig.call("PUT", "/secrets/broker-refresh", {"value": "rt-123456"})
+    assert response.json() == {"name": "broker-refresh", "binding": BROKER_BINDING}
+    entry = rig.store.entry("broker-refresh")
+    assert entry is not None
+    assert entry.meta is None
+    assert (await rig.call("DELETE", "/secrets/broker-refresh")).status_code == 200
+    assert rig.store.names() == []
+    await rig.token_client.aclose()
+
+
+@pytest.fixture
+def failing_writes(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Set the flag to make the store's atomic rename fail."""
+    failing = [False]
+    real = os.replace
+
+    def replace(src: str, dst: str | Path) -> None:
+        if failing[0]:
+            raise OSError(28, "No space left on device")
+        real(src, dst)
+
+    monkeypatch.setattr("zoeymcp.vault.store.os.replace", replace)
+    return failing
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["music-stats", "broker-refresh"])
+async def test_a_failed_write_is_a_500_and_kept_in_memory(
+    tmp_path: Path, failing_writes: list[bool], name: str
+) -> None:
+    rig = AdminRig(tmp_path)
+    failing_writes[0] = True
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        response = await rig.call("PUT", f"/secrets/{name}", {"value": "v-123456"})
+        kept = rig.store.names()
+        deleted = await rig.call("DELETE", f"/secrets/{name}")
+    finally:
+        logs.set_stream(None)
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": "kept in memory, not written to disk; check the state volume"
+    }
+    assert response.json()["error"] == NOT_WRITTEN
+    assert kept == [name]
+    assert deleted.status_code == 500
+    assert deleted.json() == {"error": NOT_WRITTEN}
+    assert rig.store.names() == []
+    assert rig.store.dirty
+    lines = [json.loads(line) for line in buffer.getvalue().splitlines()]
+    failed = [line for line in lines if line["event"] in ("secret_set", "secret_deleted")]
+    assert failed == [
+        {
+            "ts": failed[0]["ts"],
+            "event": "secret_set",
+            "name": name,
+            "persisted": False,
+            "error_type": "StoreWriteError",
+        },
+        {
+            "ts": failed[1]["ts"],
+            "event": "secret_deleted",
+            "name": name,
+            "persisted": False,
+            "error_type": "StoreWriteError",
+        },
+    ]
+    assert "v-123456" not in buffer.getvalue()
+    failing_writes[0] = False
+    rig.store.flush()
+    assert not rig.store.dirty
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_failed_live_slot_delete_is_a_500(
+    tmp_path: Path, failing_writes: list[bool]
+) -> None:
+    rig = AdminRig(tmp_path)
+    rig.store.put("oauth.broker-mcp.live", "rt-123456", BROKER_BINDING)
+    failing_writes[0] = True
+    response = await rig.call("DELETE", "/secrets/oauth.broker-mcp.live")
+    assert response.status_code == 500
+    assert response.json() == {"error": NOT_WRITTEN}
+    await rig.token_client.aclose()
+
+
+def test_json_safe() -> None:
+    nan, inf = float("nan"), float("inf")
+    assert json_safe({"a": nan, "b": [inf, -inf, 1.5, {"c": nan}], "d": "x", "e": 3}) == {
+        "a": None,
+        "b": [None, None, 1.5, {"c": None}],
+        "d": "x",
+        "e": 3,
+    }
+    assert json_safe(0.0) == 0.0
+    assert json_safe(None) is None
+
+
+@pytest.mark.anyio
+async def test_a_tampered_meta_still_lists(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    rig.store.put("music-stats", "lfm-123456", {"origins": ["https://api.stats.example:443"]})
+    document = json.loads(rig.store.path.read_text(encoding="utf-8"))
+    document["entries"]["music-stats"]["meta"] = {
+        "oauth": {"rotations": float("nan"), "seen": [float("inf")]}
+    }
+    tampered = json.dumps(document)
+    assert "NaN" in tampered
+    assert "Infinity" in tampered
+    rig.store.path.write_text(tampered, encoding="utf-8")
+    fresh = AdminRig(tmp_path)
+    response = await fresh.call("GET", "/secrets")
+    assert response.status_code == 200
+    [entry] = response.json()["secrets"]
+    assert entry["meta"] == {"oauth": {"rotations": None, "seen": [None]}}
+    await rig.token_client.aclose()
+    await fresh.token_client.aclose()

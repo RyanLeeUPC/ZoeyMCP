@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import io
 import json
@@ -10,11 +11,12 @@ import sys
 import types
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from zoeymcp.vault import logs, server
+from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.server import LOCK_FILE, StartupError, acquire_state_lock, load_runtime
 from zoeymcp.vault.store import SecretStore, origin_binding
@@ -260,3 +262,123 @@ def test_run_locks_the_state_directory_before_loading(
     with pytest.raises(StartupError, match="stop here"):
         server.run(None, ["127.0.0.1:0"], tmp_path, env(), None)
     assert calls == ["lock", "lock", "load"]
+
+
+# --- reload and shutdown -------------------------------------------------------------------------
+
+
+def _app(tmp_path: Path) -> VaultApp:
+    runtime = load_runtime(str(EXAMPLE_POLICY), tmp_path / "state", env())
+    return VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+
+
+def test_reload_reports_oauth_resets(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    app = _app(tmp_path)
+    same = tmp_path / "same.yaml"
+    same.write_text(example_text, encoding="utf-8")
+    server.reload_policy(app, str(same), env())
+    assert _log_lines(log_buffer)[-1] == {
+        "ts": _log_lines(log_buffer)[-1]["ts"],
+        "event": "reload_ok",
+        "oauth_reset": [],
+    }
+    moved = tmp_path / "moved.yaml"
+    moved.write_text(
+        example_text.replace("https://mcp.broker.example\n", "https://mcp2.broker.example\n"),
+        encoding="utf-8",
+    )
+    server.reload_policy(app, str(moved), env())
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert "egress_proxy_change_needs_restart" not in events
+    assert _log_lines(log_buffer)[-1]["oauth_reset"] == ["broker-mcp"]
+    assert app.policy.routes[1].upstream == "https://mcp2.broker.example"
+    asyncio.run(app.aclose())
+
+
+def test_reload_refuses_a_bad_policy(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    app = _app(tmp_path)
+    before = app.policy
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(example_text.replace("mode: declarative", "mode: managed"), encoding="utf-8")
+    server.reload_policy(app, str(bad), env())
+    line = _log_lines(log_buffer)[-1]
+    assert line["event"] == "reload_refused"
+    assert "managed mode arrives in M6" in line["reason"]
+    assert app.policy is before
+    asyncio.run(app.aclose())
+
+
+def _with_proxy(example_text: str, proxy: str | None) -> str:
+    if proxy is None:
+        return example_text
+    return example_text.replace(
+        "gateway_key_generation: 1", f"gateway_key_generation: 1\negress_proxy: {proxy}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "restart"),
+    [
+        (None, "http://proxy:3128", True),
+        ("http://proxy:3128", None, True),
+        ("http://proxy:3128", "http://other-proxy:3128", True),
+        ("http://proxy:3128", "http://proxy:3128", False),
+        (None, None, False),
+    ],
+)
+def test_reload_says_an_egress_proxy_change_needs_a_restart(
+    tmp_path: Path,
+    example_text: str,
+    log_buffer: io.StringIO,
+    before: str | None,
+    after: str | None,
+    restart: bool,
+) -> None:
+    first = tmp_path / "first.yaml"
+    first.write_text(_with_proxy(example_text, before), encoding="utf-8")
+    runtime = load_runtime(str(first), tmp_path / "state", env())
+    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+    assert app.policy.egress_proxy == before
+    second = tmp_path / "second.yaml"
+    second.write_text(_with_proxy(example_text, after), encoding="utf-8")
+    server.reload_policy(app, str(second), env())
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert events[-1] == "reload_ok"
+    assert ("egress_proxy_change_needs_restart" in events) is restart
+    if restart:
+        assert events[-2] == "egress_proxy_change_needs_restart"
+    assert app.policy.egress_proxy == after
+    asyncio.run(app.aclose())
+
+
+def test_serve_closes_the_app_on_the_way_out(log_buffer: io.StringIO) -> None:
+    calls: list[str] = []
+
+    class App:
+        async def aclose(self) -> None:
+            calls.append("aclose")
+
+    asyncio.run(server.serve(cast(VaultApp, App()), [], config=None, environ={}))
+    assert calls == ["aclose"]
+    assert _log_lines(log_buffer)[-1]["event"] == "vault_stopped"
+
+
+def test_run_gives_the_admin_the_token_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(app=app, **kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
+    assert seen["admin"]._tokens is seen["app"].tokens

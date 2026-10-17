@@ -2,7 +2,9 @@
 
 The vault runs with the operator's **real** policy. Every upstream is replaced by the echo
 server, and every secret by a generated dummy value, so a case can assert exactly what would
-have been sent (and that a refused request sent nothing).
+have been sent (and that a refused request sent nothing). Token endpoints are played by
+:class:`TokenEcho`, through the same in-process transport: there is no network transport at all,
+so a self-test can never refresh a real token.
 
 ``--mutate`` then breaks the policy one rule at a time (wider methods, wider paths, a dropped
 constraint, pin or forced parameter, a deleted rule) and reruns the cases. A mutant no case
@@ -23,11 +25,13 @@ from typing import Any
 
 import httpx
 from pydantic import ValidationError
+from starlette.types import Receive, Scope, Send
 
 from ..common.policy.check import secret_references
 from ..common.policy.schema import (
     BasicCredential,
     HeaderCredential,
+    OAuth2Credential,
     PathCredential,
     PlaceholderCaller,
     Policy,
@@ -41,7 +45,7 @@ from ..vault.bindings import BindingError, derive_binding
 from ..vault.keys import KeySet, generate_master_key
 from ..vault.store import SecretStore
 from .cases import Case, CaseFile, PlaceholderPresent
-from .echo import EchoUpstream, Received
+from .echo import EchoUpstream, Received, TokenClient, TokenEcho
 
 ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
@@ -94,8 +98,19 @@ class Rig:
 
     async def run(self, policy: Policy, cases: CaseFile) -> list[CaseResult]:
         echo = EchoUpstream()
-        upstream = httpx.AsyncClient(transport=httpx.ASGITransport(app=echo))
-        app = VaultApp(policy, self.store, self.keys, client=upstream, environ=self.environ)
+        tokens = TokenEcho(self.token_clients(policy))
+
+        async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
+            # Token calls never show in echo.received, so "1 upstream request" still holds.
+            if scope["type"] == "http" and tokens.handles(scope):
+                await tokens(scope, receive, send)
+            else:
+                await echo(scope, receive, send)
+
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=dispatch))
+        app = VaultApp(
+            policy, self.store, self.keys, client=client, token_client=client, environ=self.environ
+        )
         results = []
         with logs.quiet():
             try:
@@ -103,10 +118,33 @@ class Rig:
                     before = len(echo.received)
                     response = await self._send(app, policy, case)
                     received = echo.received[before:]
-                    results.append(self._evaluate(policy, case, response, received))
+                    results.append(self._evaluate(policy, case, response, received, tokens))
             finally:
                 await app.aclose()
         return results
+
+    def token_clients(self, policy: Policy) -> list[TokenClient]:
+        """What each oauth2 credential must send to its token endpoint, with the dummies."""
+        clients = []
+        for name, cred in sorted(policy.credentials.items()):
+            if not isinstance(cred, OAuth2Credential):
+                continue
+            client_id = cred.client_id
+            if is_secret_ref(client_id):
+                client_id = self.values.get(client_id, "")
+            clients.append(
+                TokenClient(
+                    credential=name,
+                    token_url=cred.token_url,
+                    grant=cred.grant,
+                    auth=cred.effective_client_auth,
+                    body=cred.token_body,
+                    client_id=client_id,
+                    client_secret=self.values.get(cred.client_secret or ""),
+                    refresh_token=self.values.get(cred.refresh_token or ""),
+                )
+            )
+        return clients
 
     async def _send(self, app: VaultApp, policy: Policy, case: Case) -> httpx.Response:
         request = case.request
@@ -131,7 +169,12 @@ class Rig:
             )
 
     def _evaluate(
-        self, policy: Policy, case: Case, response: httpx.Response, received: list[Received]
+        self,
+        policy: Policy,
+        case: Case,
+        response: httpx.Response,
+        received: list[Received],
+        tokens: TokenEcho,
     ) -> CaseResult:
         result = CaseResult(case.name)
         expect = case.expect
@@ -163,15 +206,21 @@ class Rig:
                 result.problems.append(f"header {name!r} is {actual!r}, expected {value!r}")
         if want.credential is not None:
             route = _route_for(policy, case.request.path)
-            injected = route is not None and self._credential_injected(policy, route, got)
+            injected = route is not None and self._credential_injected(policy, route, got, tokens)
             if want.credential and not injected:
                 result.problems.append("the route's credential wasn't injected")
-            if not want.credential and self._any_secret_in(got):
+            if not want.credential and self._any_secret_in(got, tokens):
                 result.problems.append("a secret reached the upstream")
         return result
 
-    def _credential_injected(self, policy: Policy, route: Route, got: Received) -> bool:
-        cred = policy.credentials.get(route.credential or "")
+    def _credential_injected(
+        self, policy: Policy, route: Route, got: Received, tokens: TokenEcho
+    ) -> bool:
+        name = route.credential or ""
+        cred = policy.credentials.get(name)
+        if isinstance(cred, OAuth2Credential):
+            issued = tokens.last_issued.get(name)
+            return issued is not None and got.header("authorization") == f"Bearer {issued}"
         if cred is None or not hasattr(cred, "secret"):
             return False
         value = self.values.get(cred.secret)
@@ -191,9 +240,9 @@ class Rig:
             return got.header("authorization") == f"Basic {token}"
         return False
 
-    def _any_secret_in(self, got: Received) -> bool:
+    def _any_secret_in(self, got: Received, tokens: TokenEcho) -> bool:
         haystack = got.path + repr(got.query) + repr(got.headers) + got.body.decode("latin-1")
-        return any(value in haystack for value in self.values.values())
+        return any(value in haystack for value in [*self.values.values(), *tokens.issued])
 
 
 def _route_for(policy: Policy, path: str) -> Route | None:

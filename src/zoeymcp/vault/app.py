@@ -3,19 +3,30 @@
 For each request, in order: normalize the path, pick the route by prefix, identify the caller,
 match a rule, apply query and header policy, inject the credential, forward through the egress
 proxy, then filter and scrub the response. Every refusal is logged with its reason; the response
-body never says which check failed.
+body never says which check failed. Only after identity and a rule matched may a 502 carry a stable
+``code`` (such as ``oauth_reconsent_needed``), so a caller entitled to the route can tell what the
+operator must do.
+
+OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
+token is bad drops it, and a request that's safe to repeat is sent once more with a new token
+(design D.10). Neither HTTP client keeps cookies: an upstream's session cookie must never reach
+another caller (N2).
 """
 
 from __future__ import annotations
 
 import base64
 import hmac
+import http.cookiejar
 import ipaddress
+import math
 import os
+import re
 import time
+import urllib.request
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -37,6 +48,9 @@ from ..common.policy.schema import (
 )
 from . import logs
 from .keys import KeySet
+from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
+from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
+from .oauth.tokens import UPSTREAM_INSUFFICIENT_SCOPE, Grant, OAuthUnavailable, TokenManager
 from .request import (
     RequestRejected,
     apply_query_policy,
@@ -59,6 +73,11 @@ MAX_SCRUB_BYTES = 1024 * 1024
 CONNECT_TIMEOUT = 10.0
 READ_TIMEOUT = 60.0
 _STREAM_TYPES = ("text/event-stream", "application/x-ndjson")
+# A 401 to these is answered by retrying once with a new token. POST and PATCH may have had an
+# effect, so their 401 goes back to the caller and only the next request gets a new token.
+_RETRY_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+# The error parameter of a WWW-Authenticate challenge. error_description and error_uri don't match.
+_AUTH_ERROR = re.compile(r'(?:^|[\s,])error\s*=\s*"?([^",\s]*)', re.IGNORECASE)
 _SCRUBBED_TYPES = (
     "text/",
     "application/json",
@@ -70,12 +89,45 @@ _SCRUBBED_TYPES = (
 
 
 class Refused(Exception):
-    """Stop handling a request with this status. ``reason`` goes to the log only."""
+    """Stop handling a request with this status. ``reason`` goes to the log only.
 
-    def __init__(self, status: int, reason: str) -> None:
+    ``code`` is a stable code for the response body, set only after identity and a rule matched.
+    ``retry_after`` (seconds) becomes a ``Retry-After`` header.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        reason: str,
+        *,
+        code: str | None = None,
+        retry_after: int | None = None,
+    ) -> None:
         self.status = status
         self.reason = reason
+        self.code = code
+        self.retry_after = retry_after
         super().__init__(reason)
+
+
+class _DiscardingJar(http.cookiejar.CookieJar):
+    """A cookie jar that keeps nothing (N2)."""
+
+    def set_cookie(self, cookie: http.cookiejar.Cookie) -> None:
+        pass
+
+    def extract_cookies(self, response: Any, request: urllib.request.Request) -> None:
+        pass
+
+
+def without_cookies(client: httpx.AsyncClient) -> httpx.AsyncClient:
+    """Give ``client`` a cookie jar that discards everything, and return it.
+
+    httpx keeps a jar per client and sends its cookies on later requests to the same host, from
+    any caller. The vault's clients must never do that.
+    """
+    client.cookies = _DiscardingJar()
+    return client
 
 
 _PUBLIC_MESSAGES = {
@@ -147,34 +199,54 @@ class VaultApp:
         keys: KeySet,
         *,
         client: httpx.AsyncClient | None = None,
+        token_client: httpx.AsyncClient | None = None,
+        tokens: TokenManager | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> None:
+        """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
+        keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
+        so ``token_client`` is then not used.
+        """
         self._store = store
         self._keys = keys
-        self._client = client or httpx.AsyncClient(
-            proxy=policy.egress_proxy,
-            trust_env=False,
-            follow_redirects=False,
-            timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT),
-        )
+        self._client = without_cookies(client or _upstream_client(policy))
+        self._token_client: httpx.AsyncClient | None = None
+        if tokens is None:
+            self._token_client = without_cookies(token_client or _token_client(policy))
+            tokens = TokenManager(store, self._token_client)
+        self._tokens = tokens
+        # The last access token serial seen per credential, for the request log.
+        self._serials: dict[str, int] = {}
         self._environ = os.environ if environ is None else environ
         self._install(policy)
 
-    def _install(self, policy: Policy) -> None:
+    def _install(self, policy: Policy) -> list[str]:
         self._policy = policy
         self._routes = _compile(policy)
         self._env_secrets = snapshot_env_secrets(policy, self._environ)
         self._gateway_key = self._keys.gateway_key(policy.gateway_key_generation).encode()
+        return self._tokens.configure(policy, self._env_secrets)
 
     @property
     def policy(self) -> Policy:
         return self._policy
 
-    def reload(self, policy: Policy) -> None:
-        self._install(policy)
+    @property
+    def tokens(self) -> TokenManager:
+        return self._tokens
+
+    def reload(self, policy: Policy) -> list[str]:
+        """Swap the policy. Returns the OAuth credentials whose cached tokens were reset."""
+        return self._install(policy)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        """Wait for refreshes in flight, then close the clients (N5)."""
+        try:
+            await self._tokens.aclose()
+        finally:
+            await self._client.aclose()
+            if self._token_client is not None and self._token_client is not self._client:
+                await self._token_client.aclose()
 
     # --- ASGI ----------------------------------------------------------------------------------
 
@@ -190,9 +262,13 @@ class VaultApp:
             response = await self._handle(request, log)
         except Refused as refusal:
             log.update(status=refusal.status, reason=refusal.reason)
-            response = JSONResponse(
-                {"error": _PUBLIC_MESSAGES.get(refusal.status, "error")}, status_code=refusal.status
-            )
+            body = {"error": _PUBLIC_MESSAGES.get(refusal.status, "error")}
+            headers = None
+            if refusal.code is not None:
+                body["code"] = log["code"] = refusal.code
+            if refusal.retry_after is not None:
+                headers = {"retry-after": str(refusal.retry_after)}
+            response = JSONResponse(body, status_code=refusal.status, headers=headers)
         else:
             log["status"] = response.status_code
         log["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
@@ -244,9 +320,7 @@ class VaultApp:
         path_prefix = ""
 
         cred = self._policy.credentials.get(route.credential) if route.credential else None
-        if isinstance(cred, OAuth2Credential):
-            raise Refused(501, "OAuth credentials arrive in M2")
-        if cred is not None:
+        if cred is not None and not isinstance(cred, OAuth2Credential):
             value = self._resolve(cred.secret, route.upstream).reveal()
             if isinstance(cred, HeaderCredential):
                 headers.append((cred.header, cred.format.replace("{secret}", value)))
@@ -272,10 +346,45 @@ class VaultApp:
         except RequestRejected as exc:
             raise Refused(403, exc.reason) from exc
 
+        # Last of all, as it may call the token endpoint: a request refused above causes none.
+        grant: Grant | None = None
+        if isinstance(cred, OAuth2Credential):
+            assert route.credential is not None  # noqa: S101 - cred was found by this name
+            grant = await self._grant(route.credential, route.upstream)
+            # The caller's Authorization was dropped with the other caller credentials.
+            headers.append(_bearer(grant))
+            variants = list(grant.variants)
+            log["credential"] = route.credential
+            seen = self._serials.get(route.credential)
+            log["oauth"] = "cached" if seen == grant.serial else "refreshed"
+            self._serials[route.credential] = grant.serial
+
         url = upstream_origin + base_path + path_prefix + rest.encoded()
         if query:
             url += "?" + encode_query(query)
-        return await self._forward(request.method, url, headers, body, route, variants, log)
+        upstream_response = await self._send(request.method, url, headers, body, route)
+        if grant is not None:
+            assert route.credential is not None  # noqa: S101 - set for every OAuth route
+            status = upstream_response.status_code
+            if status in (401, 403) and "insufficient_scope" in _challenge_errors(
+                upstream_response
+            ):
+                # A new token won't fix that; the operator may need to log in with more scopes.
+                self._tokens.note_upstream(route.credential, UPSTREAM_INSUFFICIENT_SCOPE)
+            if status == 401:
+                upstream_response, variants = await self._after_401(
+                    upstream_response,
+                    route=route,
+                    credential=route.credential,
+                    grant=grant,
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    body=body,
+                    variants=variants,
+                    log=log,
+                )
+        return await self._respond(upstream_response, route, variants, log)
 
     def _identify(
         self, compiled: _CompiledRoute, request: Request, params: list[tuple[str, str]]
@@ -342,8 +451,72 @@ class VaultApp:
                     raise SecretUnavailable(ref, "env var not set when the policy was loaded")
                 return secret
         except SecretUnavailable as exc:
-            raise Refused(502, f"credential unavailable: {exc.reason}") from exc
-        raise Refused(502, "credential reference not understood")
+            raise Refused(
+                502, f"credential unavailable: {exc.reason}", code=CREDENTIAL_UNAVAILABLE
+            ) from exc
+        raise Refused(502, "credential reference not understood", code=CREDENTIAL_UNAVAILABLE)
+
+    async def _grant(self, credential: str, upstream: str) -> Grant:
+        """An access token for ``upstream``, or a 502 with the manager's stable code."""
+        try:
+            return await self._tokens.grant_for(credential, upstream)
+        except OAuthUnavailable as exc:
+            retry_after = None
+            if exc.code == OAUTH_UNAVAILABLE:
+                retry_after = max(1, math.ceil(exc.retry_after or 0))
+            raise Refused(502, str(exc), code=exc.code, retry_after=retry_after) from exc
+
+    async def _after_401(
+        self,
+        upstream: httpx.Response,
+        *,
+        route: Route,
+        credential: str,
+        grant: Grant,
+        method: str,
+        url: str,
+        headers: list[tuple[str, str]],
+        body: bytes,
+        variants: list[bytes],
+        log: dict[str, Any],
+    ) -> tuple[httpx.Response, list[bytes]]:
+        """The upstream refused the access token (design D.10).
+
+        The token is dropped unless it's younger than ``MIN_401_AGE``. A request that's safe to
+        repeat is then sent once more with a new token; the second answer is final.
+        """
+        if not _token_refused(upstream):
+            return upstream, variants
+        action: str = self._tokens.rejected(credential, grant)
+        try:
+            if action == "suppressed" or method not in _RETRY_METHODS:
+                return upstream, variants
+            assert route.upstream is not None  # noqa: S101 - OAuth routes have an upstream
+            # A refresh may take a while: don't hold the upstream connection meanwhile.
+            await upstream.aclose()
+            fresh = await self._grant(credential, route.upstream)
+            if fresh.serial == grant.serial:
+                # rejected() dropped that token or saw another, so this can't happen. The 401
+                # is closed already, so answer as if no token could be had.
+                raise Refused(
+                    502, "no new access token after a 401", code=OAUTH_UNAVAILABLE, retry_after=1
+                )
+            retry = [h for h in headers if h[0] != "authorization"]
+            retry.append(_bearer(fresh))
+            upstream = await self._send(method, url, retry, body, route)
+            self._serials[credential] = fresh.serial
+            action = log["oauth"] = "retried"
+            return upstream, sorted({*variants, *fresh.variants}, key=len, reverse=True)
+        finally:
+            # Also when the refresh or the retry failed: those are the ones to look into.
+            logs.event(
+                "oauth_upstream_401",
+                route=route.name,
+                credential=credential,
+                method=method,
+                action=action,
+                fresh_token=action == "suppressed",
+            )
 
     @staticmethod
     async def _read_body(request: Request) -> bytes:
@@ -359,33 +532,42 @@ class VaultApp:
             chunks.append(chunk)
         return b"".join(chunks)
 
-    async def _forward(
+    async def _send(
         self,
         method: str,
         url: str,
         headers: list[tuple[str, str]],
         body: bytes,
         route: Route,
-        variants: list[bytes],
-        log: dict[str, Any],
-    ) -> Response:
+    ) -> httpx.Response:
+        """Send the request upstream. Returns once the status line and headers arrived."""
         timeout = httpx.Timeout(None if route.stream else READ_TIMEOUT, connect=CONNECT_TIMEOUT)
         outgoing = self._client.build_request(
             method, url, headers=headers, content=body, timeout=timeout
         )
         try:
-            upstream = await self._client.send(outgoing, stream=True)
+            return await self._client.send(outgoing, stream=True)
         except httpx.HTTPError as exc:
             raise Refused(502, f"upstream request failed: {type(exc).__name__}") from exc
 
+    async def _respond(
+        self,
+        upstream: httpx.Response,
+        route: Route,
+        variants: list[bytes],
+        log: dict[str, Any],
+    ) -> Response:
+        """Relay a stream as it arrives, or buffer and scrub everything else."""
         response_headers, header_hits = scrub_headers(
             filter_response_headers(upstream.headers.multi_items()), variants
         )
         log["upstream_status"] = upstream.status_code
 
         # Only real streams are relayed as they arrive. Anything else on a stream route (JSON
-        # errors especially, which is where upstreams echo keys) is buffered and scrubbed.
-        if route.stream and _is_stream(upstream.headers.get("content-type", "")):
+        # errors especially, which is where upstreams echo keys) is buffered and scrubbed. A 401
+        # is never relayed as a stream: it may echo the token it refused.
+        content_type = upstream.headers.get("content-type", "")
+        if route.stream and upstream.status_code != 401 and _is_stream(content_type):
             log.update(streamed=True, scrubbed=header_hits)
             streamed = StreamingResponse(
                 _relay(upstream),
@@ -419,6 +601,46 @@ class VaultApp:
             (b"content-length", str(len(content)).encode()),
         ]
         return response
+
+
+def _upstream_client(policy: Policy) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        proxy=policy.egress_proxy,
+        trust_env=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT),
+    )
+
+
+def _token_client(policy: Policy) -> httpx.AsyncClient:
+    """The client for token endpoints (design D.14). A redirect would re-send secrets."""
+    return httpx.AsyncClient(
+        proxy=policy.egress_proxy,
+        trust_env=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(ATTEMPT_DEADLINE, connect=TOKEN_CONNECT_TIMEOUT),
+    )
+
+
+def _bearer(grant: Grant) -> tuple[str, str]:
+    return ("authorization", "Bearer " + grant.token.reveal())
+
+
+def _challenge_errors(response: httpx.Response) -> list[str]:
+    """The ``error`` of each ``WWW-Authenticate`` challenge."""
+    return [
+        match.group(1)
+        for value in response.headers.get_list("www-authenticate")
+        for match in _AUTH_ERROR.finditer(value)
+    ]
+
+
+def _token_refused(response: httpx.Response) -> bool:
+    """A 401 that a new token may fix: no error in the challenge, or ``invalid_token``.
+
+    ``insufficient_scope`` and ``invalid_request`` won't change with a new token.
+    """
+    return all(error == "invalid_token" for error in _challenge_errors(response))
 
 
 def _is_stream(content_type: str) -> bool:

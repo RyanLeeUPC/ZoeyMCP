@@ -71,6 +71,8 @@ from .protocol import (
 # How often a healthy slot's last_ok is written to its clear meta.
 META_OK_INTERVAL: Final = 86400.0
 CC_PREFIX: Final = "cc:"
+# An upstream said the access token lacks a scope (design D.10). Shown by status, never decides.
+UPSTREAM_INSUFFICIENT_SCOPE: Final = "upstream_insufficient_scope"
 # The longest refresh_token_expires_in shown in meta. Beyond it no date is shown: a token
 # endpoint's number must never stop the write that saves a new refresh token.
 MAX_REFRESH_EXPIRES_IN: Final = 100 * 365 * 86400
@@ -274,6 +276,8 @@ class TokenManager:
         # when the cache entry is dropped.
         self._previous: dict[str, Secret] = {}
         self._granted: dict[str, tuple[str, ...]] = {}
+        # The last thing an upstream said about a credential's token, for status.
+        self._upstream: dict[str, dict[str, str]] = {}
         self._serial = 0
         self._closing = False
 
@@ -375,6 +379,13 @@ class TokenManager:
         self._slots[self._configs[credential].slot].trigger = "upstream_401"
         return "invalidated"
 
+    def note_upstream(self, credential: str, code: str) -> None:
+        """Record what an upstream said about the credential's token, for :meth:`status`.
+
+        Memory only: a caller can make the upstream say it on every request. A login clears it.
+        """
+        self._upstream[credential] = {"code": code, "at": _iso(self._wall())}
+
     # --- writers -------------------------------------------------------------------------------
 
     async def replace_secret(self, name: str, value: str) -> dict[str, Any]:
@@ -473,6 +484,7 @@ class TokenManager:
         self._granted[credential] = minted.scope or tuple(
             split_scope(cfg.cred.scope, cfg.cred.scope_separator)
         )
+        self._upstream.pop(credential, None)
         logs.event("oauth_cache_reset", credential=credential, reason="login")
         return LoginCommit(cfg.slot, binding, persisted, consented_at, grant)
 
@@ -523,6 +535,7 @@ class TokenManager:
                     "access_expires_in": expires_in,
                     "persisted": not self._store.dirty,
                     "meta": meta if isinstance(meta, dict) else None,
+                    "upstream": self._upstream.get(name),
                 }
             )
         return result

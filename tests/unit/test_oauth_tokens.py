@@ -43,6 +43,7 @@ from zoeymcp.vault.oauth.protocol import (
     seed_sha256,
 )
 from zoeymcp.vault.oauth.tokens import (
+    UPSTREAM_INSUFFICIENT_SCOPE,
     BindingChanged,
     Grant,
     OAuthUnavailable,
@@ -1521,6 +1522,27 @@ async def test_commit_login_stores_and_caches(tmp_path: Path, clock: FakeClock) 
     assert meta["refresh_expires_at"] == "2026-10-18T09:00:00Z"
     assert (await rig.grant()) is result.grant
     assert rig.calls == 0
+
+
+async def test_an_upstream_scope_complaint_shows_until_a_login(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    assert rig.status()["upstream"] is None
+    clock.advance(60)
+    rig.manager.note_upstream("music", UPSTREAM_INSUFFICIENT_SCOPE)
+    assert rig.status()["upstream"] == {
+        "code": "upstream_insufficient_scope",
+        "at": "2026-10-17T09:01:00Z",
+    }
+    await rig.manager.commit_login(
+        "music",
+        refresh_token=Secret("fake-rt-login"),
+        minted=minted(),
+        sent_at=clock.mono,
+        rebind=False,
+    )
+    assert rig.status()["upstream"] is None
 
 
 async def test_commit_login_refuses_a_changed_binding_without_rebind(

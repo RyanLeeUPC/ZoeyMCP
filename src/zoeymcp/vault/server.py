@@ -178,12 +178,7 @@ async def serve(
             server.should_exit = True
 
     def reload() -> None:
-        try:
-            app.reload(load_policy(config, environ))
-        except StartupError as exc:
-            logs.event("reload_refused", reason=str(exc))
-        else:
-            logs.event("reload_ok")
+        reload_policy(app, config, environ)
 
     loop = asyncio.get_running_loop()
     if sys.platform != "win32":
@@ -198,8 +193,27 @@ async def serve(
         )
         await asyncio.gather(*(server.serve() for server in servers))
     finally:
+        # Refreshes in flight finish (and are saved) before the clients close (N5).
         await app.aclose()
         logs.event("vault_stopped")
+
+
+def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str]) -> None:
+    """``SIGHUP``: load and check the policy again, and swap it in if it passes.
+
+    Synchronous, like every writer of OAuth state: the token manager keeps its slots and tasks,
+    so a reload never starts a second refresh (design D.13).
+    """
+    try:
+        policy = load_policy(config, environ)
+    except StartupError as exc:
+        logs.event("reload_refused", reason=str(exc))
+        return
+    if policy.egress_proxy != app.policy.egress_proxy:
+        # The HTTP clients were built with the old proxy.
+        logs.event("egress_proxy_change_needs_restart")
+    reset = app.reload(policy)
+    logs.event("reload_ok", oauth_reset=reset)
 
 
 def run(
@@ -220,7 +234,9 @@ def run(
             check_socket_dir(admin_socket)
         except AdminSocketError as exc:
             raise StartupError(str(exc)) from exc
-        admin = AdminApp(runtime.store, runtime.keys, lambda: app.policy, SetupCodes(state_dir))
+        admin = AdminApp(
+            runtime.store, runtime.keys, lambda: app.policy, SetupCodes(state_dir), app.tokens
+        )
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
         admin_socket = None

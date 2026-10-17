@@ -35,6 +35,8 @@ services:
     image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
     command: [vault, --listen, "0.0.0.0:8080"]
     user: "10001:10001"
+    # On stop, OAuth refreshes in flight finish and are saved (up to 45 s) before the vault exits.
+    stop_grace_period: 50s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
       # The policy, inline: no bind mounts needed. Reload it with `docker compose kill -s HUP vault`

@@ -6,6 +6,10 @@ uid (or root, which already has the host) can connect. The CLI reaches it with
 ``docker exec <vault> zoeymcp secret ...``.
 
 There is deliberately no endpoint that returns a secret value.
+
+Secrets an oauth2 credential uses are written and deleted through the token manager, which first
+waits for any refresh of that slot (design D.12). If the store can't write its file, the change
+is kept in memory and the answer is a 500 that says so (B.4).
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -36,7 +41,8 @@ from ..common.textrules import find_violations
 from . import logs
 from .bindings import VAULT_PREFIX, BindingError, derive_binding, oauth_secret_names
 from .keys import KeySet
-from .store import SecretStore, origin_binding
+from .oauth.tokens import TokenManager
+from .store import SecretStore, StoreWriteError, origin_binding
 
 DEFAULT_SOCKET = "/run/zoeymcp/admin.sock"
 SOCKET_ENV = "ZOEYMCP_ADMIN_SOCKET"
@@ -46,6 +52,7 @@ MAX_BODY = 128 * 1024
 
 # The same shape as the name in a store: reference.
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+NOT_WRITTEN = "kept in memory, not written to disk; check the state volume"
 
 
 class AdminSocketError(Exception):
@@ -106,6 +113,21 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
 
 
+def json_safe(value: Any) -> Any:
+    """``value`` with every NaN or infinity replaced by ``None``.
+
+    A store entry's ``meta`` is clear text anyone with the state file can edit, and JSON answers
+    can't carry those numbers.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    return value
+
+
 class AdminApp:
     def __init__(
         self,
@@ -113,11 +135,13 @@ class AdminApp:
         keys: KeySet,
         policy: Callable[[], Policy],
         setup: SetupCodes,
+        tokens: TokenManager | None = None,
     ) -> None:
         self._store = store
         self._keys = keys
         self._policy = policy
         self._setup = setup
+        self._tokens = tokens
         self.app = Starlette(
             routes=[
                 Route("/secrets", self._list, methods=["GET"]),
@@ -129,7 +153,7 @@ class AdminApp:
         )
 
     async def _list(self, request: Request) -> Response:
-        return JSONResponse({"secrets": [m.as_dict() for m in self._store.metadata()]})
+        return JSONResponse({"secrets": [json_safe(m.as_dict()) for m in self._store.metadata()]})
 
     async def _put(self, request: Request) -> Response:
         name = request.path_params["name"]
@@ -152,16 +176,23 @@ class AdminApp:
         if find_violations(value, max_chars=65536, single_line=True, allow_tabs=False):
             return _error(400, "value has line breaks, control or invisible characters")
         origins = data.get("origins")
+        oauth = name in oauth_secret_names(self._policy())
         try:
             if origins is not None:
                 if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins):
                     return _error(400, "origins must be a list of URLs")
-                if name in oauth_secret_names(self._policy()):
+                if oauth:
                     return _error(409, "OAuth secrets are bound by the policy; drop --origin")
                 binding = origin_binding(origins)
+                self._store.put(name, value, binding)
+            elif oauth and self._tokens is not None:
+                binding = await self._tokens.replace_secret(name, value)
             else:
                 binding = derive_binding(self._policy(), name)
-            self._store.put(name, value, binding)
+                self._store.put(name, value, binding)
+        except StoreWriteError as exc:
+            logs.event("secret_set", name=name, persisted=False, error_type=type(exc).__name__)
+            return _error(500, NOT_WRITTEN)
         except (BindingError, ValueError) as exc:
             return _error(409, str(exc))
         logs.event("secret_set", name=name, binding=binding)
@@ -169,7 +200,15 @@ class AdminApp:
 
     async def _delete(self, request: Request) -> Response:
         name = request.path_params["name"]
-        if not self._store.delete(name):
+        try:
+            if name in oauth_secret_names(self._policy()) and self._tokens is not None:
+                existed = await self._tokens.forget(name)
+            else:
+                existed = self._store.delete(name)
+        except StoreWriteError as exc:
+            logs.event("secret_deleted", name=name, persisted=False, error_type=type(exc).__name__)
+            return _error(500, NOT_WRITTEN)
+        if not existed:
             return _error(404, "no such secret")
         logs.event("secret_deleted", name=name)
         return JSONResponse({"name": name, "deleted": True})

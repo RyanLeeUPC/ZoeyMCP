@@ -5,8 +5,9 @@
 # Each case is a request and what must happen. Refusals matter as much as successes: with
 # --mutate, every rule in the policy is weakened in turn, and some case must notice each time.
 #
-# The broker route uses OAuth (M2) and the mail route a connector (M4), so their allowed
-# requests answer 501 for now. That still proves the request got past identity and rules.
+# The broker route uses OAuth: the self-test plays its token endpoint with dummy values, so the
+# allowed request is forwarded with a dummy access token. The mail route uses a connector (M4),
+# so its allowed requests answer 501 for now. That still proves they got past identity and rules.
 
 cases:
   # --- stats: a sandbox script with a placeholder ----------------------------------------------
@@ -51,9 +52,11 @@ cases:
     expect: { status: 400 }
 
   # --- broker: an MCP server, gateway only -------------------------------------------------------
-  - name: the gateway may post to the broker's MCP endpoint (OAuth arrives in M2)
+  - name: the gateway may post to the broker's MCP endpoint with an access token
     request: { method: POST, path: /broker/mcp, caller: gateway }
-    expect: { status: 501 }
+    expect:
+      status: 200
+      upstream: { method: POST, path: /mcp, credential: true }
 
   - name: the broker route refuses other methods
     request: { method: PUT, path: /broker/mcp, caller: gateway }
