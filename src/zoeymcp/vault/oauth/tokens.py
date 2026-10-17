@@ -98,7 +98,7 @@ PRE_SEND: Final = (
     httpx.UnsupportedProtocol,
 )
 
-Trigger = Literal["expiry", "first_use", "upstream_401"]
+Trigger = Literal["expiry", "first_use", "upstream_401", "login"]
 Rejection = Literal["reused_newer", "invalidated", "suppressed"]
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
@@ -148,6 +148,13 @@ class LoginCommit:
     persisted: bool
     consented_at: str
     grant: Grant
+    # The scopes granted, or the requested ones when the response didn't say.
+    granted_scopes: tuple[str, ...] = ()
+    refresh_expires_at: str | None = None
+    # consented_at plus grant_lifetime_days, when the policy sets it.
+    grant_expires_at: str | None = None
+    # An env seed is set, and the live slot now records it as superseded.
+    seed_present: bool = False
 
 
 @dataclass
@@ -280,6 +287,15 @@ class TokenManager:
         self._upstream: dict[str, dict[str, str]] = {}
         self._serial = 0
         self._closing = False
+
+    @property
+    def policy(self) -> Policy:
+        """The policy of the last :meth:`configure`."""
+        return self._require_policy()
+
+    @property
+    def store(self) -> SecretStore:
+        return self._store
 
     # --- configuration -------------------------------------------------------------------------
 
@@ -450,16 +466,18 @@ class TokenManager:
         wall = self._wall()
         consented_at = _iso(wall)
         value = refresh_token
+        seed = None
         if self._seeded(cfg):
             seed = self._env.get(self._env_name(cfg))
             seed_hash = None if seed is None else seed_sha256(seed.reveal())
             value = encode_envelope(refresh_token, seed_hash)
+        ok_fields = self._ok_fields(cfg, minted, wall, {})
         meta = {
             "credential": credential,
             "source": "login",
             "consented_at": consented_at,
             "rotations": 0,
-            **self._ok_fields(cfg, minted, wall, {}),
+            **ok_fields,
         }
         persisted = True
         try:
@@ -481,21 +499,44 @@ class TokenManager:
             refresh_token=refresh_token,
             client=client if isinstance(client, Client) else None,
         )
-        self._granted[credential] = minted.scope or tuple(
-            split_scope(cfg.cred.scope, cfg.cred.scope_separator)
-        )
+        granted = minted.scope or tuple(split_scope(cfg.cred.scope, cfg.cred.scope_separator))
+        self._granted[credential] = granted
         self._upstream.pop(credential, None)
         logs.event("oauth_cache_reset", credential=credential, reason="login")
-        return LoginCommit(cfg.slot, binding, persisted, consented_at, grant)
+        days = cfg.cred.grant_lifetime_days
+        return LoginCommit(
+            cfg.slot,
+            binding,
+            persisted,
+            consented_at,
+            grant,
+            granted_scopes=granted,
+            refresh_expires_at=ok_fields["refresh_expires_at"],
+            grant_expires_at=None if days is None else _iso(wall + days * 86400),
+            seed_present=seed is not None,
+        )
 
-    def reset(self, credential: str) -> bool:
-        """``oauth reset``: clear the failure state, so the next request tries once."""
+    def reset(self, credential: str, *, reason: str = "reset") -> bool:
+        """``oauth reset``: clear the failure state, so the next request tries once.
+
+        A client_credentials login that worked does the same, with ``reason`` ``login``.
+        """
         cfg = self._configs.get(credential)
         if cfg is None:
             return False
         self._clear_failure(self._slots[cfg.slot])
-        logs.event("oauth_cache_reset", credential=credential, reason="reset")
+        logs.event("oauth_cache_reset", credential=credential, reason=reason)
         return True
+
+    def client_for(self, credential: str) -> Client | Failure:
+        """The client ID and secret ``credential``'s token requests send (login uses them).
+
+        A secret from the store must be bound to the credential's token endpoint.
+        """
+        cfg = self._configs.get(credential)
+        if cfg is None:
+            return Failure("terminal", CREDENTIAL_UNAVAILABLE, "not_configured")
+        return self._client_for(cfg)
 
     # --- health and shutdown -------------------------------------------------------------------
 
@@ -529,6 +570,7 @@ class TokenManager:
                     "state": state,
                     "refreshing": slot.task is not None,
                     "code": failure.code if failure is not None else None,
+                    "reason": failure.reason if failure is not None else None,
                     "error": failure.error if failure is not None else None,
                     "failures": slot.failures,
                     "retry_in": retry_in,
@@ -762,7 +804,7 @@ class TokenManager:
         """
         sent_at = self._clock()
         try:
-            response = await self._post(prep.request)
+            response = await self.post(prep.request)
         except PRE_SEND:
             return transport_failure("pre_send"), 1, False, sent_at
         except Exception:
@@ -772,20 +814,26 @@ class TokenManager:
         await self._sleep(REPLAY_DELAY)
         sent_at = self._clock()
         try:
-            response = await self._post(prep.request)
+            response = await self.post(prep.request)
         except Exception:
             return transport_failure("no_response"), 2, True, sent_at
         return self._classify(cfg, prep, response, replayed=True), 2, True, sent_at
 
-    async def _post(self, request: TokenRequest) -> TokenResponse:
-        """One POST. Redirects are never followed; the body is read until it passes the cap."""
-        async with asyncio.timeout(ATTEMPT_DEADLINE):
+    async def post(self, request: TokenRequest, *, deadline: float | None = None) -> TokenResponse:
+        """One POST through the token client, within ``deadline`` seconds (login uses it too).
+
+        The default is ``ATTEMPT_DEADLINE``, read at call time. Redirects are never followed;
+        the body is read until it passes the cap.
+        """
+        if deadline is None:
+            deadline = ATTEMPT_DEADLINE
+        async with asyncio.timeout(deadline):
             outgoing = self._client.build_request(
                 "POST",
                 request.url,
                 headers=list(request.headers),
                 content=request.body,
-                timeout=httpx.Timeout(ATTEMPT_DEADLINE, connect=CONNECT_TIMEOUT),
+                timeout=httpx.Timeout(deadline, connect=CONNECT_TIMEOUT),
             )
             response = await self._client.send(outgoing, stream=True, follow_redirects=False)
             try:

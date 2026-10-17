@@ -217,6 +217,24 @@ def test_an_unreadable_query() -> None:
     assert (error.reason, str(error)) == ("redirect_mismatch", "the address's query can't be read")
 
 
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        f"{REDIRECT}?code={CODE}&state=\ud800",
+        f"{REDIRECT}?code={CODE}&state={STATE}&x=\udcff",
+        f"http://127.0.0.1\ud800/callback?code={CODE}&state={STATE}",
+    ],
+    ids=["state", "other-param", "host"],
+)
+def test_a_lone_surrogate_is_unreadable(pasted: str) -> None:
+    error = refused(pasted)
+    assert (error.reason, str(error)) == ("redirect_mismatch", "the address can't be read")
+
+
+def test_other_unicode_is_read() -> None:
+    assert parse(ok_url("&x=café")) == (CODE, None)
+
+
 @pytest.mark.parametrize("name", ["code", "state", "error", "iss"])
 def test_duplicates_are_refused(name: str) -> None:
     extra = f"&{name}=x" if name in ("code", "state") else f"&{name}=a&{name}=b"

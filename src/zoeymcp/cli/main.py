@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from .. import __version__
 from ..common.policy import (
@@ -21,11 +22,17 @@ from ..common.policy import (
 )
 from ..vault.admin import DEFAULT_SOCKET, SOCKET_ENV
 from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
+from ..vault.oauth.pkce import FLOW_TTL
 from . import admin_client
 
 EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_UNREADABLE = 2
+
+PASTE_PROMPT = "> "
+NOT_PERSISTED = (
+    "kept in memory, not on disk; fix the state volume; zoeymcp oauth status shows when it is saved"
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -120,9 +127,42 @@ def _build_parser() -> argparse.ArgumentParser:
     commands.add_parser("setup-code", help="issue a one-time portal setup code (15 minutes)")
     commands.add_parser("gateway-key", help="print the gateway key for the current generation")
 
-    for sub in secret_commands.choices.values():
+    login = commands.add_parser(
+        "login",
+        help="consent to an OAuth credential and store its refresh token (inside the vault)",
+        description=(
+            "Open the printed URL in a browser and approve. The browser is then sent to the "
+            "credential's redirect_uri, which fails to load: paste that address back. It is read "
+            "from a hidden prompt, or one line of stdin, never from the command line. For the "
+            "client_credentials grant, login is a test fetch."
+        ),
+    )
+    login.add_argument("credential")
+    login.add_argument(
+        "--rebind", action="store_true", help="accept a binding the policy has changed"
+    )
+    mode = login.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--start", action="store_true", help="print the URL and the flow ID, then exit"
+    )
+    mode.add_argument(
+        "--flow", metavar="ID", help="complete a flow from --start; reads the address from stdin"
+    )
+
+    oauth = commands.add_parser("oauth", help="OAuth health: status and reset (inside the vault)")
+    oauth_commands = oauth.add_subparsers(dest="action", required=True, metavar="action")
+    oauth_status = oauth_commands.add_parser(
+        "status", help="state, failures and warnings of each oauth2 credential (never values)"
+    )
+    oauth_status.add_argument("credential", nargs="?")
+    oauth_reset = oauth_commands.add_parser(
+        "reset", help="clear a credential's failure state, so the next request tries once"
+    )
+    oauth_reset.add_argument("credential")
+
+    for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")
-    for name in ("setup-code", "gateway-key"):
+    for name in ("setup-code", "gateway-key", "login"):
         commands.choices[name].add_argument("--socket", metavar="PATH", help="admin socket path")
     return parser
 
@@ -182,6 +222,187 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
         err.write(f"zoeymcp {args.command}: {exc}\n")
         return EXIT_FINDINGS
     return EXIT_OK
+
+
+# --- login and oauth ---------------------------------------------------------------------------
+
+
+def _cmd_login(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    socket = admin_client.socket_path(args.socket)
+    try:
+        if args.flow is not None:
+            url = _read_paste(socket, args.flow, stdin, err)
+            if url is None:
+                return EXIT_FINDINGS
+            result = admin_client.oauth_complete(socket, args.credential, args.flow, url)
+            return _report_login(args.credential, result, out, err)
+        started = admin_client.oauth_login(socket, args.credential, rebind=args.rebind)
+        if "flow" not in started:
+            return _report_test_fetch(args.credential, started, out, err)
+        _describe_login(args.credential, started, out)
+        minutes = round(FLOW_TTL / 60)
+        if args.start:
+            out.write(
+                f"\nThen, within {minutes} minutes, run: zoeymcp login {args.credential} "
+                f"--flow {started['flow']}\nand give it the address your browser was sent to.\n"
+            )
+            return EXIT_OK
+        how = "input hidden" if stdin.isatty() else "one line on stdin"
+        out.write(
+            f"\nYour browser will then try to open {started['redirect_uri']}?... and fail to "
+            "load. That is\nexpected. Copy the full address from the address bar and paste it "
+            f"here ({how}, {minutes} minutes):\n"
+        )
+        out.flush()
+        url = _read_paste(socket, started["flow"], stdin, err)
+        if url is None:
+            return EXIT_FINDINGS
+        result = admin_client.oauth_complete(socket, args.credential, started["flow"], url)
+        return _report_login(args.credential, result, out, err)
+    except admin_client.AdminUnavailable as exc:
+        _report_login_error(exc, err)
+        return EXIT_FINDINGS
+
+
+def _read_paste(socket: str, flow: str, stdin: TextIO, err: TextIO) -> str | None:
+    """The pasted address. Without one (Ctrl-C, end of input, an empty line) the flow is
+    cancelled, and the result is None after an interruption."""
+    try:
+        return admin_client.read_redirect_url(stdin, PASTE_PROMPT)
+    except (KeyboardInterrupt, EOFError, admin_client.AdminUnavailable) as exc:
+        with contextlib.suppress(admin_client.AdminUnavailable):
+            admin_client.oauth_cancel(socket, flow)
+        if isinstance(exc, admin_client.AdminUnavailable):
+            raise
+        err.write("zoeymcp login: cancelled\n")
+        return None
+
+
+def _describe_login(credential: str, started: dict[str, Any], out: TextIO) -> None:
+    client = "public client" if started["client_auth"] == "none" else "confidential client"
+    rotation = "rotating" if started["rotates"] else "non-rotating"
+    oauth = started["binding"]["oauth"]
+    scopes = " ".join(started["requested_scopes"]) or "(none requested)"
+    out.write(f"Credential   {credential} ({client}, PKCE S256, {rotation} refresh tokens)\n")
+    out.write(f"Binding      token endpoint {oauth['token']}\n")
+    out.write(f"             access tokens to {', '.join(oauth['resources'])}\n")
+    change = started["binding_change"]
+    if change is not None:
+        out.write(f"Rebinding    was {admin_client.describe_binding(change['old'])}\n")
+    out.write(f"Scopes       {scopes}\n")
+    out.write(f"\nOpen this URL in a browser and approve:\n  {started['authorize_url']}\n")
+
+
+def _report_scopes(result: dict[str, Any], out: TextIO, err: TextIO) -> None:
+    out.write(f"Granted: {' '.join(result['granted_scopes']) or '(no scopes)'}\n")
+    if result["unexpected_scopes"]:
+        err.write(f"UNEXPECTED: {' '.join(result['unexpected_scopes'])}\n")
+    if result["missing_scopes"]:
+        err.write(f"missing: {' '.join(result['missing_scopes'])}\n")
+
+
+def _report_login(credential: str, result: dict[str, Any], out: TextIO, err: TextIO) -> int:
+    out.write(f"Stored the refresh token for {credential} as {result['slot']}.\n")
+    _report_scopes(result, out, err)
+    for key, text in (
+        ("grant_expires_at", "The grant ends at"),
+        ("refresh_expires_at", "The refresh token expires at"),
+    ):
+        if result[key] is not None:
+            out.write(f"{text} {result[key]}; run login again before then.\n")
+    if result["seed_note"] is not None:
+        out.write(f"{result['seed_note']}\n")
+    if not result["persisted"]:
+        err.write(f"zoeymcp login: {NOT_PERSISTED}\n")
+        return EXIT_FINDINGS
+    return EXIT_OK
+
+
+def _report_test_fetch(credential: str, result: dict[str, Any], out: TextIO, err: TextIO) -> int:
+    out.write(
+        f"The client credentials of {credential} work: the token endpoint issued an access "
+        f"token for {result['access_expires_in']} s. Nothing was stored.\n"
+    )
+    _report_scopes(result, out, err)
+    return EXIT_OK
+
+
+def _report_login_error(exc: admin_client.AdminUnavailable, err: TextIO) -> None:
+    err.write(f"zoeymcp login: {exc}\n")
+    data = exc.data
+    if exc.reason == "binding_changed":
+        err.write(f"  old: {admin_client.describe_binding(data['old'])}\n")
+        err.write(f"  new: {admin_client.describe_binding(data['new'])}\n")
+    elif exc.reason == "provider_error" and data.get("description"):
+        err.write(f"  the provider says: {data['description']}\n")
+
+
+def _cmd_oauth(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    socket = admin_client.socket_path(args.socket)
+    try:
+        if args.action == "reset":
+            admin_client.oauth_reset(socket, args.credential)
+            out.write(f"reset {args.credential}: the next request that needs a token tries once\n")
+            return EXIT_OK
+        entries = admin_client.oauth_status(socket)["credentials"]
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp oauth {args.action}: {exc}\n")
+        return EXIT_FINDINGS
+    if args.credential is not None:
+        entries = [e for e in entries if e["credential"] == args.credential]
+        if not entries:
+            err.write(f"zoeymcp oauth status: no oauth2 credential named {args.credential!r}\n")
+            return EXIT_FINDINGS
+    if not entries:
+        out.write("no oauth2 credentials\n")
+    for entry in entries:
+        out.write("".join(f"{line}\n" for line in format_status(entry)))
+    return EXIT_OK
+
+
+def format_status(entry: dict[str, Any]) -> list[str]:
+    """The lines ``oauth status`` prints for one credential."""
+    head = f"{entry['credential']}: {entry['state']}"
+    if entry["code"]:
+        head += f" {entry['code']}"
+    if entry["refreshing"]:
+        head += " (refreshing)"
+    lines = [head]
+    if entry.get("hint"):
+        lines.append(f"  hint: {entry['hint']}")
+    if entry["retry_in"] is not None:
+        lines.append(f"  retry in {duration(entry['retry_in'])}")
+    if entry["access_expires_in"] is not None:
+        lines.append(f"  access token expires in {duration(entry['access_expires_in'])}")
+    if entry.get("last_ok_ago") is not None:
+        lines.append(f"  last success {duration(entry['last_ok_ago'])} ago")
+    if entry.get("reconsent_due"):
+        lines.append(f"  WARNING re-consent due by {entry['reconsent_due']}")
+    scopes = entry.get("scopes") or {}
+    if scopes.get("unexpected"):
+        lines.append(f"  UNEXPECTED scopes: {' '.join(scopes['unexpected'])}")
+    if scopes.get("missing"):
+        lines.append(f"  missing scopes: {' '.join(scopes['missing'])}")
+    upstream = entry.get("upstream")
+    if upstream:
+        lines.append(f"  WARNING an upstream said {upstream['code']} at {upstream['at']}")
+    if not entry["persisted"]:
+        lines.append(
+            "  degraded (not persisted): the store can't be written; check the state volume"
+        )
+    return lines
+
+
+def duration(seconds: float) -> str:
+    """A rough, readable length of time."""
+    value = int(seconds)
+    if value < 120:
+        return f"{value} s"
+    if value < 2 * 3600:
+        return f"{value // 60} min"
+    if value < 2 * 86400:
+        return f"{value // 3600} h"
+    return f"{value // 86400} days"
 
 
 def _cmd_selftest(args: argparse.Namespace, stdin: TextIO, out: TextIO) -> int:
@@ -288,6 +509,10 @@ def main(
         return _cmd_selftest(args, stdin, out)
     if args.command in ("secret", "setup-code", "gateway-key"):
         return _cmd_admin(args, stdin, out, err)
+    if args.command == "login":
+        return _cmd_login(args, stdin, out, err)
+    if args.command == "oauth":
+        return _cmd_oauth(args, out, err)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 

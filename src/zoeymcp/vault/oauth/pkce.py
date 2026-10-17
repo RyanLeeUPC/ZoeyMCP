@@ -119,6 +119,11 @@ def parse_redirect(
 ) -> Redirect:
     """Check the address the browser was sent to and take the code from it."""
     text = pasted.strip()
+    try:
+        # A lone surrogate (from JSON, or undecodable stdin) can't be compared or answered.
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise RedirectError("redirect_mismatch", "the address can't be read") from None
     expected = urlsplit(redirect_uri)
     try:
         parts = urlsplit(text)

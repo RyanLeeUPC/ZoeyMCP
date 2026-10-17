@@ -372,17 +372,19 @@ class FakeAuthServer:
         return not (self.omit_refresh_every and self._rotations % self.omit_refresh_every == 0)
 
     def _exchange(self, params: dict[str, str]) -> Response:
-        code = self._codes.get(params.get("code", ""))
+        # The "echo" error shape repeats the presented code, as a careless provider might.
+        presented = params.get("code", "")
+        code = self._codes.get(presented)
         if code is None or code.used:
-            return self._grant_error("Invalid authorization code", None)
+            return self._grant_error("Invalid authorization code", presented)
         code.used = True
         if params.get("redirect_uri") != code.redirect_uri:
-            return self._grant_error("redirect_uri doesn't match", None)
+            return self._grant_error("redirect_uri doesn't match", presented)
         verifier = params.get("code_verifier", "")
         digest = hashlib.sha256(verifier.encode("ascii", "replace")).digest()
         challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
         if challenge != code.challenge:
-            return self._grant_error("PKCE verification failed", None)
+            return self._grant_error("PKCE verification failed", verifier)
         family = _Family(
             scopes=self.granted_scopes or code.scopes,
             consented_at=self.clock(),

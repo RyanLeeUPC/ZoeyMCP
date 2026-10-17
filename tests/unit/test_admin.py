@@ -20,8 +20,10 @@ import uvicorn
 from tests.fakes.oauth_server import FakeAuthServer
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy, parse_policy
+from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault import logs
 from zoeymcp.vault.admin import (
+    NO_TOKENS,
     NOT_WRITTEN,
     AdminApp,
     AdminSocketError,
@@ -31,6 +33,7 @@ from zoeymcp.vault.admin import (
 )
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.oauth.login import LoginError, LoginService
 from zoeymcp.vault.oauth.protocol import CREDENTIAL_UNAVAILABLE
 from zoeymcp.vault.oauth.tokens import OAuthUnavailable, TokenManager
 from zoeymcp.vault.store import SecretStore
@@ -611,5 +614,291 @@ async def test_a_tampered_meta_still_lists(tmp_path: Path) -> None:
     assert response.status_code == 200
     [entry] = response.json()["secrets"]
     assert entry["meta"] == {"oauth": {"rotations": None, "seen": [None]}}
+    await rig.token_client.aclose()
+    await fresh.token_client.aclose()
+
+
+# --- OAuth login endpoints (design E.1) --------------------------------------------------------
+
+BROKER_AUTHORIZE = "https://auth.broker.example/authorize"
+
+
+def login_policy() -> Policy:
+    """The example policy, with the broker's client ID written in and an authorize_url."""
+    raw = load_mapping(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    broker = raw["credentials"]["broker-mcp"]
+    broker["client_id"] = BROKER_CLIENT_ID
+    broker["authorize_url"] = BROKER_AUTHORIZE
+    return Policy.model_validate(raw)
+
+
+async def browse(rig: AdminRig, url: str) -> str:
+    transport = httpx.ASGITransport(app=rig.server.app())
+    async with httpx.AsyncClient(transport=transport) as browser:
+        response = await browser.get(url)
+    assert response.status_code == 302
+    location: str = response.headers["location"]
+    return location
+
+
+@pytest.mark.anyio
+async def test_oauth_login_through_the_admin_app(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    rig.set_policy(login_policy())
+    started = await rig.call("POST", "/oauth/broker-mcp/login")
+    assert started.status_code == 200, started.text
+    data = started.json()
+    assert set(data) == {
+        "flow",
+        "authorize_url",
+        "redirect_uri",
+        "expires",
+        "requested_scopes",
+        "expected_scopes",
+        "client_auth",
+        "rotates",
+        "binding",
+        "binding_change",
+    }
+    assert data["binding"] == BROKER_BINDING
+    assert data["authorize_url"].startswith(BROKER_AUTHORIZE + "?response_type=code&")
+    pasted = await browse(rig, data["authorize_url"])
+    body = {"flow": data["flow"], "redirect_url": pasted}
+    done = await rig.call("POST", "/oauth/broker-mcp/complete", body)
+    assert done.status_code == 200, done.text
+    assert done.json()["slot"] == "broker-refresh"
+    assert done.json()["persisted"] is True
+    stored = rig.store.get_for_oauth("broker-refresh", token_url=BROKER_TOKEN_URL)[0]
+    assert stored.reveal() == rig.server.active_refresh_token()
+    for value in (stored.reveal(), pasted, data["flow"]):
+        assert value not in done.text
+    listing = await rig.call("GET", "/oauth")
+    assert listing.status_code == 200
+    [status] = listing.json()["credentials"]
+    assert (status["credential"], status["state"], status["hint"]) == ("broker-mcp", "ok", None)
+    assert stored.reveal() not in listing.text
+    reset = await rig.call("POST", "/oauth/broker-mcp/reset")
+    assert (reset.status_code, reset.json()) == (200, {"credential": "broker-mcp", "reset": True})
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_oauth_errors_carry_a_reason(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    cases = [
+        ("POST", "/oauth/broker-mcp/login", None, 409, "no_authorize_url"),
+        ("POST", "/oauth/music-stats/login", None, 404, "not_oauth"),
+        ("POST", "/oauth/nope/reset", None, 404, "not_oauth"),
+        (
+            "POST",
+            "/oauth/broker-mcp/complete",
+            {"flow": "nope", "redirect_url": "http://127.0.0.1/callback"},
+            404,
+            "flow_unknown",
+        ),
+    ]
+    for method, path, body, status, reason in cases:
+        response = await rig.call(method, path, body)
+        assert (response.status_code, response.json()["reason"]) == (status, reason), path
+        assert set(response.json()) == {"error", "reason"}
+    rig.set_policy(login_policy())
+    rig.store.put(
+        "broker-refresh",
+        "rt-123456",
+        {"oauth": {"token": "https://x.example:443", "resources": ["https://x.example:443"]}},
+    )
+    login_bodies: list[dict[str, bool] | None] = [None, {}, {"rebind": False}]
+    for login_body in login_bodies:
+        changed = await rig.call("POST", "/oauth/broker-mcp/login", login_body)
+        assert changed.status_code == 409, login_body
+        assert changed.json()["reason"] == "binding_changed"
+        assert changed.json()["new"] == BROKER_BINDING
+    rebound = await rig.call("POST", "/oauth/broker-mcp/login", {"rebind": True})
+    assert rebound.status_code == 200
+    assert rebound.json()["binding_change"]["new"] == BROKER_BINDING
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "content", "status", "message"),
+    [
+        ("/oauth/broker-mcp/login", b"[]", 400, "body must be a JSON object"),
+        ("/oauth/broker-mcp/login", b"{", 400, "body must be JSON"),
+        ("/oauth/broker-mcp/login", b'{"rebind": "yes"}', 400, "expected {rebind?: bool}"),
+        ("/oauth/broker-mcp/login", b'{"other": 1}', 400, "expected {rebind?: bool}"),
+        ("/oauth/broker-mcp/login", b" " * (128 * 1024 + 1), 413, "body too large"),
+        ("/oauth/broker-mcp/complete", b"{}", 400, "expected {flow, redirect_url}"),
+        ("/oauth/broker-mcp/complete", b'{"flow": "f"}', 400, "expected {flow, redirect_url}"),
+        (
+            "/oauth/broker-mcp/complete",
+            b'{"flow": 1, "redirect_url": "x"}',
+            400,
+            "expected {flow, redirect_url}",
+        ),
+        (
+            "/oauth/broker-mcp/complete",
+            b'{"flow": "f", "redirect_url": "x", "more": 1}',
+            400,
+            "expected {flow, redirect_url}",
+        ),
+        ("/oauth/broker-mcp/complete", b" " * (8 * 1024 + 1), 413, "body too large"),
+    ],
+    ids=[
+        "login-list",
+        "login-not-json",
+        "login-rebind-type",
+        "login-other-key",
+        "login-too-large",
+        "complete-empty",
+        "complete-no-url",
+        "complete-flow-type",
+        "complete-extra-key",
+        "complete-too-large",
+    ],
+)
+async def test_oauth_bodies_are_checked(
+    tmp_path: Path, path: str, content: bytes, status: int, message: str
+) -> None:
+    rig = AdminRig(tmp_path)
+    transport = httpx.ASGITransport(app=rig.admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
+        response = await client.post(path, content=content)
+    assert (response.status_code, response.json()) == (status, {"error": message})
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_complete_body_of_8_kib_is_read(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    body = json.dumps({"flow": "nope", "redirect_url": "x"}).encode()
+    body += b" " * (8 * 1024 - len(body))
+    transport = httpx.ASGITransport(app=rig.admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
+        response = await client.post("/oauth/broker-mcp/complete", content=body)
+    assert response.json()["reason"] == "flow_unknown"
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_login_body_of_128_kib_is_read(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    body = json.dumps({"rebind": False}).encode()
+    body += b" " * (128 * 1024 - len(body))
+    transport = httpx.ASGITransport(app=rig.admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
+        response = await client.post("/oauth/broker-mcp/login", content=body)
+    assert (response.status_code, response.json()["reason"]) == (409, "no_authorize_url")
+    await rig.token_client.aclose()
+
+
+class RefusingLogin(LoginService):
+    """Refuses every start and completion with one reason."""
+
+    def __init__(self, tokens: TokenManager, error: LoginError) -> None:
+        super().__init__(tokens)
+        self.error = error
+
+    async def start(self, credential: str, *, rebind: bool = False) -> dict[str, Any]:
+        raise self.error
+
+    async def complete(self, credential: str, flow_id: str, redirect_url: str) -> dict[str, Any]:
+        raise self.error
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("reason", "status"),
+    [
+        ("not_oauth", 404),
+        ("flow_unknown", 404),
+        ("no_authorize_url", 409),
+        ("no_route", 409),
+        ("authorize_misconfigured", 409),
+        ("binding_changed", 409),
+        ("client_id_unavailable", 409),
+        ("client_secret_unavailable", 409),
+        ("too_many_flows", 429),
+        ("redirect_mismatch", 400),
+        ("provider_error", 400),
+        ("no_refresh_token", 400),
+        ("exchange_failed:oauth_unavailable", 400),
+    ],
+)
+async def test_login_reasons_have_their_status(tmp_path: Path, reason: str, status: int) -> None:
+    rig = AdminRig(tmp_path)
+    details = {"provider_error": "access_denied", "description": "fake description"}
+    error = LoginError(reason, "fake message", details=details)
+    rig.admin = AdminApp(
+        rig.store, KEYS, lambda: rig.policy, rig.setup, rig.tokens, RefusingLogin(rig.tokens, error)
+    )
+    expected = {"error": "fake message", "reason": reason, **details}
+    login = await rig.call("POST", "/oauth/broker-mcp/login")
+    assert (login.status_code, login.json()) == (status, expected)
+    body = {"flow": "f", "redirect_url": "x"}
+    complete = await rig.call("POST", "/oauth/broker-mcp/complete", body)
+    assert (complete.status_code, complete.json()) == (status, expected)
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_paste_with_a_lone_surrogate_is_refused(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    rig.set_policy(login_policy())
+    flow = (await rig.call("POST", "/oauth/broker-mcp/login")).json()["flow"]
+    content = json.dumps({"flow": flow, "redirect_url": "http://127.0.0.1/callback?state=\ud800"})
+    transport = httpx.ASGITransport(app=rig.admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
+        response = await client.post("/oauth/broker-mcp/complete", content=content)
+    assert response.status_code == 400
+    assert response.json() == {"error": "the address can't be read", "reason": "redirect_mismatch"}
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_oauth_needs_the_token_manager(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path, tokens=False)
+    for method, path in [
+        ("GET", "/oauth"),
+        ("POST", "/oauth/broker-mcp/login"),
+        ("POST", "/oauth/broker-mcp/complete"),
+        ("POST", "/oauth/broker-mcp/reset"),
+        ("DELETE", "/oauth/flows/f"),
+    ]:
+        response = await rig.call(method, path)
+        assert response.status_code == 503, path
+        assert response.json() == {"error": NO_TOKENS}
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_oauth_cancel(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    rig.set_policy(login_policy())
+    assert (await rig.call("DELETE", "/oauth/flows/nope")).json() == {"cancelled": False}
+    flow = (await rig.call("POST", "/oauth/broker-mcp/login")).json()["flow"]
+    assert (await rig.call("DELETE", f"/oauth/flows/{flow}")).json() == {"cancelled": True}
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_oauth_status_is_json_safe(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    rig.store.put(
+        "broker-refresh",
+        "rt-123456",
+        BROKER_BINDING,
+        meta={"oauth": {"rotations": 1, "granted_scope": "read"}},
+    )
+    document = json.loads(rig.store.path.read_text(encoding="utf-8"))
+    document["entries"]["broker-refresh"]["meta"]["oauth"]["rotations"] = float("nan")
+    rig.store.path.write_text(json.dumps(document), encoding="utf-8")
+    fresh = AdminRig(tmp_path)
+    response = await fresh.call("GET", "/oauth")
+    assert response.status_code == 200
+    [status] = response.json()["credentials"]
+    assert status["meta"] == {"rotations": None, "granted_scope": "read"}
+    assert status["scopes"] == {"unexpected": [], "missing": ["trade"]}
+    assert "rt-123456" not in response.text
     await rig.token_client.aclose()
     await fresh.token_client.aclose()

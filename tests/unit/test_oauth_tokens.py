@@ -37,7 +37,10 @@ from zoeymcp.vault.oauth.protocol import (
     OAUTH_ROTATION_LOST,
     OAUTH_UNAVAILABLE,
     OAUTH_UNSUPPORTED,
+    Client,
+    Failure,
     Minted,
+    TokenRequest,
     encode_envelope,
     parse_envelope,
     seed_sha256,
@@ -1910,14 +1913,16 @@ async def test_status(tmp_path: Path, clock: FakeClock) -> None:
     assert status["refreshing"] is False
     assert status["access_expires_in"] == pytest.approx(3500)
     assert status["retry_in"] is None
+    assert (status["code"], status["reason"]) == (None, None)
     assert status["meta"]["source"] == "rotation"
     rig.server.fail_next(1, 503)
     clock.advance(3500)
     await rig.refused()
     status = rig.status()
-    assert (status["state"], status["code"], status["retry_in"]) == (
+    assert (status["state"], status["code"], status["reason"], status["retry_in"]) == (
         "backoff",
         OAUTH_UNAVAILABLE,
+        "http_status",
         5.0,
     )
     assert status["access_expires_in"] is None
@@ -3037,3 +3042,145 @@ async def test_a_client_secret_bound_to_another_token_endpoint_is_unavailable(
     assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "client_secret_unavailable")
     assert rig.calls == 0
     assert GOOGLE_SECRET not in captured.text
+
+
+# --- what login uses (design E) ----------------------------------------------------------------
+
+
+async def test_the_policy_and_store_login_reads(tmp_path: Path, clock: FakeClock) -> None:
+    store = SecretStore(tmp_path, KEYS)
+    manager = TokenManager(store, httpx.AsyncClient())
+    assert manager.store is store
+    with pytest.raises(RuntimeError, match=r"^configure\(\) hasn't been called$"):
+        _ = manager.policy
+    rig = spotify_rig(tmp_path / "rig", clock)
+    assert rig.manager.policy is rig.policy
+
+
+async def test_client_for(tmp_path: Path, clock: FakeClock) -> None:
+    rig = google_rig(tmp_path, clock)
+    client = rig.manager.client_for("music")
+    assert isinstance(client, Client)
+    assert client.client_id == GOOGLE_ID
+    assert client.secret is not None
+    assert client.secret.reveal() == GOOGLE_SECRET
+    assert rig.manager.client_for("nope") == Failure(
+        "terminal", CREDENTIAL_UNAVAILABLE, "not_configured"
+    )
+    rig.store.delete("google-secret")
+    assert rig.manager.client_for("music") == Failure(
+        "terminal", CREDENTIAL_UNAVAILABLE, "client_secret_unavailable"
+    )
+
+
+async def test_reset_logs_its_reason(tmp_path: Path, clock: FakeClock, captured: Captured) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    assert rig.manager.reset("music") is True
+    assert rig.manager.reset("music", reason="login") is True
+    assert rig.manager.reset("nope", reason="login") is False
+    lines = [(e["credential"], e["reason"]) for e in captured.events("oauth_cache_reset")]
+    assert lines == [("music", "reset"), ("music", "login")]
+
+
+async def test_post_sends_with_the_deadline(tmp_path: Path, clock: FakeClock) -> None:
+    timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"ok": True}, headers={"retry-after": "7"})
+
+    rig = Rig(
+        tmp_path,
+        clock,
+        spotify_style(clock.time),
+        make_policy(spotify_cred()),
+        transport=httpx.MockTransport(handler),
+    )
+    request = TokenRequest(TOKEN_URL, (("accept", "application/json"),), b"x=1")
+    answer = await rig.manager.post(request)
+    assert (answer.status, answer.retry_after) == (200, "7")
+    assert json.loads(answer.body) == {"ok": True}
+    await rig.manager.post(request, deadline=7.5)
+    assert timeouts == [
+        {"connect": 5.0, "read": 20.0, "write": 20.0, "pool": 20.0},
+        {"connect": 5.0, "read": 7.5, "write": 7.5, "pool": 7.5},
+    ]
+
+
+async def test_post_reads_the_attempt_deadline_when_called(
+    tmp_path: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reads.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200)
+
+    rig = Rig(
+        tmp_path,
+        clock,
+        spotify_style(clock.time),
+        make_policy(spotify_cred()),
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(tokens, "ATTEMPT_DEADLINE", 3.25)
+    await rig.manager.post(TokenRequest(TOKEN_URL, (), b""))
+    assert reads == [3.25]
+
+
+async def test_post_gives_up_at_the_deadline(tmp_path: Path, clock: FakeClock) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(200)
+
+    rig = Rig(
+        tmp_path,
+        clock,
+        spotify_style(clock.time),
+        make_policy(spotify_cred()),
+        transport=httpx.MockTransport(handler),
+    )
+    request = TokenRequest(TOKEN_URL, (), b"")
+    with pytest.raises(TimeoutError):
+        await rig.manager.post(request, deadline=0.05)
+
+
+async def test_a_login_commit_reports_what_it_stored(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock, grant_lifetime_days=2, scope="a b")
+    result = await rig.manager.commit_login(
+        "music",
+        refresh_token=Secret("fake-rt-login"),
+        minted=minted(scope=None),
+        sent_at=clock.mono,
+        rebind=False,
+    )
+    assert result.granted_scopes == ("a", "b")
+    assert result.refresh_expires_at == "2026-10-18T09:00:00Z"
+    assert result.grant_expires_at == "2026-10-19T09:00:00Z"
+    assert result.seed_present is False
+    other = spotify_rig(tmp_path / "other", clock)
+    result = await other.manager.commit_login(
+        "music",
+        refresh_token=Secret("fake-rt-login"),
+        minted=Minted(Secret("fake-at-login"), 3600, 3600, ("x",), None),
+        sent_at=clock.mono,
+        rebind=False,
+    )
+    assert result.granted_scopes == ("x",)
+    assert result.refresh_expires_at is None
+    assert result.grant_expires_at is None
+
+
+async def test_a_login_commit_says_whether_an_env_seed_is_set(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    for directory, seed, present in (("a", "fake-rt-seed", True), ("b", None, False)):
+        rig, _ = seeded_rig(tmp_path / directory, clock, seed)
+        result = await rig.manager.commit_login(
+            "music",
+            refresh_token=Secret("fake-rt-login"),
+            minted=minted(),
+            sent_at=clock.mono,
+            rebind=False,
+        )
+        assert result.seed_present is present
