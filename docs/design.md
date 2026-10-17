@@ -37,7 +37,7 @@ say so.
 | R2 | Real secrets live only in the vault: in its **encrypted store** (§4.5), or optionally in its own environment. Config references secrets **by name**, never by value | Must |
 | R3 | Each placeholder works only on its own routes. One client's placeholder never works on another's route. Caller identity is **cryptographic or kernel-checked first** (a key, a token, a Unix socket peer uid); source-address pins are defense in depth | Must |
 | R4 | Every route is **default deny**: an explicit method and path allowlist, optional forced or stripped query parameters, optional limits on resource IDs in the path | Must |
-| R5 | All outbound traffic can go through an operator-run egress proxy (HTTP CONNECT), so host-level egress allowlists keep working | Must |
+| R5 | All outbound traffic can go through an egress proxy (HTTP CONNECT): the built-in `zoeymcp egress` role (§4.7), or the operator's own, configured from an exported allowlist | Must |
 | R6 | A policy that must hold against the model lives in the vault or gateway, never in the agent or its sandbox (which can be assumed to reach the vault) | Must |
 
 ### 2.2 Credentials
@@ -152,6 +152,7 @@ say so.
 | **vault** | `zoeymcp vault` | yes (store + master key) | store, policy versions, portal accounts | official, unmodified |
 | **gateway** | `zoeymcp gateway` | no | ledger | official, or a derived gateway-only image with toolkits |
 | **bridge** | `zoeymcp bridge -- <cmd> …` | no (placeholders) | none | derived per stdio server |
+| **egress** (optional) | `zoeymcp egress` | no; it only tunnels TLS and never sees plaintext | none | official |
 | **CLI** | `zoeymcp keygen / setup-code / secret / login / review / check / selftest` | only while running, never written | none | official, or installed with `pip` |
 
 ### 3.1 Why the vault is separate from the gateway
@@ -277,7 +278,7 @@ Optional compose profiles:
 | Profile | Adds | Notes |
 | --- | --- | --- |
 | `lan` | an inbound proxy (pinned Caddy) on a published port and on `agents`, forwarding only to the gateway, **with TLS** | so desktop clients on the LAN can connect without client tokens crossing the LAN in cleartext. The proxy has egress but holds no secrets; client tokens, not addresses, identify clients |
-| `egress-proxy` | a CONNECT-only allowlist proxy for the vault and for bridges that can't use vault routes | per-source allowlists generated from the policy by `zoeymcp check --emit-egress-allowlist` (or read directly; §12.2) |
+| `egress-proxy` | the built-in `zoeymcp egress` role (§4.7): a CONNECT-only allowlist proxy for bridges that can't use vault routes, and optionally for the vault | per-source allowlists come straight from the policy. Operators who run their own proxy use `check --emit-egress-allowlist` instead |
 
 ## 4. The vault
 
@@ -461,6 +462,53 @@ part contains no secrets, and the gateway can't write policy.
   compromised. It is a cheap integrity check, not a boundary.
 - **Validation:** every save (managed) or load (declarative) runs `check` first. A policy that
   fails is rejected, and the running one stays.
+
+### 4.7 The egress role
+
+`zoeymcp egress` is an optional, built-in, CONNECT-only allowlist proxy (stdlib asyncio), deployed
+by the `egress-proxy` compose profile. It holds no secrets: it only tunnels TLS, and the vault and
+bridges verify certificates end to end.
+
+**What it protects, honestly:**
+- **Bridges** are the main reason it exists. They run third-party code, and the proxy limits each
+  bridge to its own declared hosts.
+- **For the vault**, the allowlist comes from the same policy the vault already enforces. So
+  routing the vault through it adds the private-address guard below, but no protection against a
+  bad policy edit; secret bindings (§4.5) cover that. Using it for the vault is optional.
+
+**Sources and allowlists:**
+- **One listener per source,** each on its own Docker network shared only with that source. The
+  listener a connection arrives on identifies the source, and nothing on that network can
+  impersonate another source.
+- **A bridge's allowlist** is the `egress:` list on its server entry (`host:port` pairs).
+- **The vault's allowlist** is every route upstream, OAuth token endpoint and connector
+  `host:port` in the policy.
+- **Policy:** the role reads its part from the vault, as the gateway does, using an egress token
+  that only grants reading the allowlists. On a policy change, new tunnels use the new
+  allowlist, and open tunnels to destinations that were removed are closed.
+
+**Per connection:**
+1. Read the request line and headers, bounded to 8 KB and 10 seconds. Anything but `CONNECT` →
+   405. Plain-HTTP forwarding doesn't exist.
+2. `host:port` must match the listener's allowlist exactly. Hostnames are compared lowercase after
+   IDNA normalization; an IP literal matches only if it is listed literally.
+3. Resolve the name, then refuse loopback, private (RFC 1918), CGNAT (`100.64.0.0/10`),
+   link-local (including `169.254.169.254`), multicast and reserved addresses, and IPv4-mapped
+   IPv6 forms of these. A destination can opt out with `allow_private: true` (for a self-hosted
+   service on the LAN).
+4. Connect to **the address that was checked**: no second lookup, so a hostname can't be made to
+   resolve elsewhere between the check and the connection (DNS rebinding).
+5. Answer `200`, then copy bytes both ways, with an idle timeout and a maximum tunnel duration.
+
+**Limits:** concurrent tunnels per listener, and a bound on the time to establish a tunnel. It
+doesn't cache, authenticate users, inspect TLS, or forward anything but CONNECT tunnels.
+
+**Logs:** one JSON line per tunnel: source, host, port, resolved address, result, bytes each way,
+duration.
+
+**Bring your own proxy:** `zoeymcp check --emit-egress-allowlist` prints the same per-source
+allowlists, as plain `host:port` lists and as a Squid snippet, for operators who already run an
+egress proxy. They set `egress_proxy` to their own and skip the role.
 
 ## 5. The gateway
 
@@ -750,7 +798,7 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp login <credential>` / `login --mcp <url>` | `docker exec` in the vault | the onboarding of §7.4, with the paste-the-redirect-URL step; tokens go straight into the store |
 | `zoeymcp review <server>` | `docker exec` | drift diff and new pins |
 | `zoeymcp policy export / import` | `docker exec` | managed-mode YAML round trip |
-| `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --emit-egress-allowlist` writes the egress proxy's per-source allowlists |
+| `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --emit-egress-allowlist` prints the per-source allowlists (plain `host:port` lists and a Squid snippet) for operators who run their own proxy |
 
 Admin commands run inside the vault container and use the local admin socket, so they need host
 access instead of a passkey.
@@ -824,6 +872,9 @@ ZoeyMCP is done when every shape passes. Shapes are named by pattern; providers 
     behind a different content type doesn't get past the hold, and a denied request sends
     nothing upstream;
   - a retired gateway key generation stays retired across a vault restart;
+  - the egress role refuses a host outside the listener's allowlist, a plain-HTTP request, a name
+    that resolves to a private or metadata address (including after a DNS change between two
+    lookups), and one source's destinations on another source's listener;
   - no admin endpoint returns a secret;
   - in the **standard tier**, the gateway uid can't read `/state/vault` or the vault's environ;
   - in the **hardened tier**, the gateway can't reach the internet or the admin listener.
@@ -962,6 +1013,7 @@ src/zoeymcp/
   portal/       admin API, WebAuthn, sessions, static UI
   gateway/      app, upstream sessions, filtering + pins, approvals/, toolkit SDK, ledger
   bridge/       stdio ↔ streamable HTTP
+  egress/       CONNECT-only allowlist proxy
   entrypoint/   the standard tier's privilege-dropping launcher
   cli/          keygen, setup-code, secret, login, review, policy, check, selftest
 profiles/       provider profiles, one per acceptance shape
@@ -985,7 +1037,7 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | M4 | **Approvals:** elicitation back end, locks, ledger; toolkit SDK and the derived-image example; SMTP connector + example toolkits | S12 (sampling, elicitation), S13–S16 |
 | M5 | **Portal v1:** setup code, passkeys, step-up, hardening, write-only secrets, OAuth connect (including pasting the redirect URL), credential health, ledger view | portal tests |
 | M6 | **Portal v2:** tool-drift review and re-pin; **managed mode** with versioning, history, rollback, export/import | portal tests |
-| M7 | `bridge`; the `egress-proxy` profile and `--emit-egress-allowlist`; MCP onboarding by URL (discovery + DCR) in the portal and CLI | S9, S11 |
+| M7 | `bridge`; the `egress` role, the `egress-proxy` profile and `--emit-egress-allowlist`; MCP onboarding by URL (discovery + DCR) in the portal and CLI | S9, S11 |
 | M8 | **Vault-enforced approvals** (§6.4); out-of-band approvers in the vault (Telegram, the portal queue); image publishing with digests and SBOM | S3 end to end as the approver; S13/S15 again under `vault_approval` |
 
 Each milestone ships with its effect tests and its shapes' acceptance tests. Nothing merges with a
@@ -1008,11 +1060,8 @@ only declarative mode exists.
 | LAN access to a hardened gateway | `lan` compose profile: an inbound proxy with TLS | §3.4 |
 | Bridge egress and egress proxy | one optional `egress-proxy` profile with per-source allowlists generated from the policy; each bridge on its own network; a bridge holding a real secret is a flagged exception | §3.4, R35 |
 | Gateway key rotation | ratchet on first use of the new generation, capped at 5 minutes; persisted; `--immediate` for a suspected leak | §4.5 |
+| Egress proxy implementation | the built-in `zoeymcp egress` role, reading the policy directly; `check --emit-egress-allowlist` exports the allowlists for operators who run their own proxy. Squid (config drift, a large codebase), Smokescreen (needs client-certificate roles) and tinyproxy (no per-source lists, no private-address guard) were considered | §4.7 |
 
 ### 12.2 Open
 
-1. **Egress proxy implementation:** a pinned Squid image configured by
-   `check --emit-egress-allowlist`, or a small built-in `zoeymcp egress` role (a CONNECT-only
-   allowlist proxy that reads the policy directly, so there's no second product to configure)?
-   Squid is proven; the built-in role is about 150 lines we would own, and it is one less moving
-   part to keep in sync.
+None at the moment. New questions go here as the build raises them.
