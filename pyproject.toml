@@ -32,6 +32,7 @@ zoeymcp = "zoeymcp.cli.main:main"
 [dependency-groups]
 dev = [
     "hypothesis>=6.100",
+    "mutmut>=3",
     "mypy>=1.11",
     "pytest>=8.3",
     "ruff>=0.6",
@@ -74,3 +75,16 @@ follow_untyped_imports = true
 testpaths = ["tests"]
 addopts = ["-q", "--strict-markers", "--strict-config"]
 xfail_strict = true
+
+[tool.mutmut]
+# Mutation testing for the security-critical modules (CI only: mutmut doesn't run on Windows).
+source_paths = ["src"]
+only_mutate = [
+    "*zoeymcp/vault/request.py",
+    "*zoeymcp/vault/store.py",
+    "*zoeymcp/common/textrules.py",
+    "*zoeymcp/common/canonical.py",
+    "*zoeymcp/common/policy/check.py",
+]
+pytest_add_cli_args_test_selection = ["tests/unit"]
+also_copy = ["examples", "profiles", "tests"]
