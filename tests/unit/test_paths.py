@@ -23,6 +23,13 @@ def test_root_pattern() -> None:
     assert parse_path_pattern("/").segments == ()
 
 
+def test_trailing_slash_pattern() -> None:
+    parsed = parse_path_pattern("/api/things/")
+    assert parsed.segments == (Segment("literal", "api"), Segment("literal", "things"))
+    assert parsed.trailing_slash is True
+    assert parse_path_pattern("/api/things").trailing_slash is False
+
+
 @pytest.mark.parametrize(
     "literal", ["v1", "2.0", "user@host", "a:b", "x-y_z~", "it's", "a+b", "a=b;c"]
 )
@@ -35,7 +42,8 @@ def test_literal_characters(literal: str) -> None:
     [
         ("api", "must start with '/'"),
         ("/api//x", "empty segment"),
-        ("/api/", "empty segment"),
+        ("/api//", "empty segment"),
+        ("/api/**/", "already matches a trailing"),
         ("/**/x", "only allowed as the last segment"),
         ("/{Doc}", "invalid capture name"),
         ("/{}", "invalid capture name"),
