@@ -83,6 +83,8 @@ only_mutate = [
     "*zoeymcp/vault/request.py",
     "*zoeymcp/vault/store.py",
     "*zoeymcp/vault/bindings.py",
+    "*zoeymcp/vault/oauth/protocol.py",
+    "*zoeymcp/vault/oauth/pkce.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/policy/check.py",

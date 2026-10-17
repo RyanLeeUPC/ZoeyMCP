@@ -20,6 +20,8 @@ from zoeymcp.vault.request import (
     find_rule,
     match_pattern,
     normalize_path,
+    oauth_basic_credentials,
+    oauth_client_variants,
     parse_query,
     rule_matches,
     scrub,
@@ -325,3 +327,77 @@ def test_scrub_headers() -> None:
     headers, count = scrub_headers([("Location", f"https://x/?k={SECRET}"), ("X", "ok")], variants)
     assert count == 1
     assert headers == [("Location", "https://x/?k=[REDACTED]"), ("X", "ok")]
+
+
+# --- OAuth client secrets ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client_id", "secret", "pair"),
+    [
+        ("app-1", "cs-value-1", b"app-1:cs-value-1"),
+        ("my app:1", "p+%/ s", b"my+app%3A1:p%2B%25%2F+s"),
+        ("a~b_c.d-e", "a*b", b"a~b_c.d-e:a%2Ab"),
+        ("app", "s\u00fc\u00df", b"app:s%C3%BC%C3%9F"),
+    ],
+)
+def test_oauth_basic_credentials_form_encode_both_parts(
+    client_id: str, secret: str, pair: bytes
+) -> None:
+    assert oauth_basic_credentials(client_id, secret) == base64.b64encode(pair).decode()
+
+
+def test_oauth_client_variants() -> None:
+    variants = oauth_client_variants("my app", SECRET)
+    for form in secret_variants(SECRET):
+        assert form in variants
+    assert b"sk-live%2FAb%2BCd%3D%22q%22" in variants
+    basic = oauth_basic_credentials("my app", SECRET).encode()
+    assert basic == base64.b64encode(b"my+app:sk-live%2FAb%2BCd%3D%22q%22")
+    assert basic in variants
+    assert variants == sorted(variants, key=len, reverse=True)
+    assert len(variants) == len(set(variants))
+    # The raw Basic form isn't sent, so it isn't added.
+    assert base64.b64encode(f"my app:{SECRET}".encode()) not in variants
+
+
+def test_oauth_client_variants_add_the_form_encoding() -> None:
+    variants = oauth_client_variants("app", "a b+c")
+    assert b"a+b%2Bc" in variants
+    assert b"a%20b%2Bc" in variants
+
+
+def test_short_client_secrets_get_no_variants() -> None:
+    assert oauth_client_variants("app", "abc") == []
+    assert oauth_client_variants("app", "abcd") != []
+
+
+CLIENT_SECRET = "cs value+1"
+
+
+@pytest.mark.parametrize(
+    ("echo", "expected"),
+    [
+        (
+            "Authorization: Basic " + oauth_basic_credentials("app", CLIENT_SECRET),
+            b"Authorization: Basic " + REDACTED,
+        ),
+        # Only the form encoding turns the space into "+".
+        (
+            "grant_type=refresh_token&client_secret=cs+value%2B1",
+            b"grant_type=refresh_token&client_secret=" + REDACTED,
+        ),
+        (
+            json.dumps({"client_secret": CLIENT_SECRET}),
+            b'{"client_secret": "' + REDACTED + b'"}',
+        ),
+    ],
+)
+def test_scrub_removes_oauth_client_secrets(echo: str, expected: bytes) -> None:
+    cleaned, count = scrub(echo.encode(), oauth_client_variants("app", CLIENT_SECRET))
+    assert (cleaned, count) == (expected, 1)
+
+
+def test_only_the_oauth_variants_catch_the_form_and_basic_echoes() -> None:
+    for echo in ("client_secret=cs+value%2B1", oauth_basic_credentials("app", CLIENT_SECRET)):
+        assert scrub(echo.encode(), secret_variants(CLIENT_SECRET)) == (echo.encode(), 0)

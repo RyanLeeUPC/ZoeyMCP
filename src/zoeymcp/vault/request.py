@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, quote, unquote_to_bytes, urlencode
+from urllib.parse import parse_qsl, quote, quote_plus, unquote_to_bytes, urlencode
 
 from ..common.policy.paths import SEGMENT_CHARS, PathPattern, parse_path_pattern
 from ..common.policy.schema import QueryPolicy, RegexParam, Rule
@@ -308,6 +308,30 @@ def secret_variants(secret: str, *, basic_user: str | None = None) -> list[bytes
         forms.add(base64.b64encode(f"{basic_user}:{secret}".encode()).decode())
     encoded = {form.encode("utf-8") for form in forms if len(form) >= _MIN_VARIANT}
     return sorted(encoded, key=len, reverse=True)
+
+
+def oauth_basic_credentials(client_id: str, client_secret: str) -> str:
+    """The Basic credentials of an OAuth client (RFC 6749 section 2.3.1).
+
+    Both parts are form-urlencoded before they're joined, so a ``:`` in the client ID can't move
+    the split. This is what the vault sends, and what :func:`oauth_client_variants` scrubs.
+    """
+    pair = f"{quote_plus(client_id)}:{quote_plus(client_secret)}"
+    return base64.b64encode(pair.encode("ascii")).decode("ascii")
+
+
+def oauth_client_variants(client_id: str, client_secret: str) -> list[bytes]:
+    """The forms an echoed OAuth client secret may take, longest first.
+
+    These are :func:`secret_variants`, plus the secret form-urlencoded as in a token request body,
+    plus the Basic credentials as sent.
+    """
+    if len(client_secret) < _MIN_VARIANT:
+        return []
+    forms = set(secret_variants(client_secret))
+    forms.add(quote_plus(client_secret).encode("ascii"))
+    forms.add(oauth_basic_credentials(client_id, client_secret).encode("ascii"))
+    return sorted(forms, key=len, reverse=True)
 
 
 def scrub(data: bytes, variants: Sequence[bytes]) -> tuple[bytes, int]:

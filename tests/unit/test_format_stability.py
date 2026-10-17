@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.oauth.protocol import encode_envelope, parse_envelope
 from zoeymcp.vault.store import SecretStore, _aad, smtp_binding
 
 GOLDEN = Path(__file__).parent / "data" / "golden-store"
@@ -129,7 +130,10 @@ def test_the_live_slot_envelope_is_pinned(tmp_path: Path) -> None:
     )
     text = value.reveal()
     assert text == ('{"rt":"golden-live-value-4","seed_sha256":"' + SEED_SHA256 + '","v":1}')
-    assert json.loads(text) == {"v": 1, "rt": "golden-live-value-4", "seed_sha256": SEED_SHA256}
+    envelope = parse_envelope(value)
+    assert envelope.rt.reveal() == "golden-live-value-4"
+    assert envelope.seed_sha256 == SEED_SHA256
+    assert encode_envelope(envelope.rt, SEED_SHA256).reveal() == text
     assert hashlib.sha256(b"golden-seed-value-5").hexdigest() == SEED_SHA256
 
 
@@ -149,4 +153,4 @@ def test_meta_survives_a_load_with_the_previous_key(tmp_path: Path) -> None:
     assert calendar is not None
     assert calendar.meta == CALENDAR_META
     value, _ = reopened.get_for_oauth("oauth.music.live", token_url=TOKEN_URL)
-    assert json.loads(value.reveal())["seed_sha256"] == SEED_SHA256
+    assert parse_envelope(value).seed_sha256 == SEED_SHA256
