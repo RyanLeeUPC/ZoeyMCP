@@ -93,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Store or replace a secret. The value is read from stdin, or from a hidden prompt on "
             "a terminal, never from the command line. Its binding is derived from the policy "
-            "unless --origin is given."
+            "unless --origin is given. OAuth secrets always take the policy's binding."
         ),
     )
     secret_set.add_argument("name")

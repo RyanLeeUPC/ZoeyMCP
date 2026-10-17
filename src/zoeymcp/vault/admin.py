@@ -34,7 +34,7 @@ from starlette.routing import Route
 from ..common.policy.schema import Policy
 from ..common.textrules import find_violations
 from . import logs
-from .bindings import BindingError, derive_binding
+from .bindings import VAULT_PREFIX, BindingError, derive_binding, oauth_secret_names
 from .keys import KeySet
 from .store import SecretStore, origin_binding
 
@@ -135,6 +135,8 @@ class AdminApp:
         name = request.path_params["name"]
         if not _NAME.match(name):
             return _error(400, "invalid secret name")
+        if name.startswith(VAULT_PREFIX):
+            return _error(409, "managed by the vault; use zoeymcp login")
         body = await request.body()
         if len(body) > MAX_BODY:
             return _error(413, "body too large")
@@ -154,6 +156,8 @@ class AdminApp:
             if origins is not None:
                 if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins):
                     return _error(400, "origins must be a list of URLs")
+                if name in oauth_secret_names(self._policy()):
+                    return _error(409, "OAuth secrets are bound by the policy; drop --origin")
                 binding = origin_binding(origins)
             else:
                 binding = derive_binding(self._policy(), name)

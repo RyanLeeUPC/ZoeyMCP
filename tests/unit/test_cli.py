@@ -3,9 +3,11 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from zoeymcp.cli import admin_client
 from zoeymcp.cli.main import EXIT_FINDINGS, EXIT_OK, EXIT_UNREADABLE, main
 
 from .conftest import EXAMPLE_POLICY
@@ -96,3 +98,39 @@ def test_keygen_prints_a_matching_pair() -> None:
         KeySet.from_text(lines["ZOEYMCP_MASTER_KEY"]).gateway_key(1) == lines["ZOEYMCP_GATEWAY_KEY"]
     )
     assert run(["keygen"])[1] != out
+
+
+@pytest.mark.parametrize(
+    ("binding", "text"),
+    [
+        (
+            {"origins": ["https://a.example:443", "https://b.example:443"]},
+            "origins https://a.example:443, https://b.example:443",
+        ),
+        (
+            {
+                "oauth": {
+                    "token": "https://accounts.example:443",
+                    "resources": ["https://api.example:443", "https://files.example:443"],
+                }
+            },
+            "token endpoint https://accounts.example:443, "
+            "access tokens to https://api.example:443, https://files.example:443",
+        ),
+        (
+            {
+                "smtp": {
+                    "host": "smtp.mail.example",
+                    "port": 465,
+                    "from": "a@mail.example",
+                    "to": ["b@mail.example", "c@mail.example"],
+                }
+            },
+            "SMTP smtp.mail.example:465 from a@mail.example to b@mail.example, c@mail.example",
+        ),
+        ({"other": 1}, '{"other": 1}'),
+    ],
+    ids=["origins", "oauth", "smtp", "unknown"],
+)
+def test_describe_binding(binding: dict[str, Any], text: str) -> None:
+    assert admin_client.describe_binding(binding) == text

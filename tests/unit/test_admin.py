@@ -18,10 +18,9 @@ import pytest
 import uvicorn
 
 from zoeymcp.cli.main import main
-from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.vault.admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir
 from zoeymcp.vault.app import VaultApp
-from zoeymcp.vault.bindings import BindingError, derive_binding
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.store import SecretStore
 
@@ -29,50 +28,16 @@ from .conftest import EXAMPLE_POLICY
 
 KEYS = KeySet.from_master(bytes(range(32)))
 ZWSP = chr(0x200B)
+BROKER_BINDING = {
+    "oauth": {
+        "token": "https://auth.broker.example:443",
+        "resources": ["https://mcp.broker.example:443"],
+    }
+}
 
 
 def example_policy() -> Policy:
-    from zoeymcp.common.policy import parse_policy
-
     return parse_policy(EXAMPLE_POLICY.read_text(encoding="utf-8"), "example")
-
-
-# --- bindings ----------------------------------------------------------------------------------
-
-
-def test_route_credential_binds_to_its_upstream() -> None:
-    assert derive_binding(example_policy(), "music-stats") == {
-        "origins": ["https://api.stats.example:443"]
-    }
-
-
-def test_oauth_secrets_bind_to_the_token_endpoint_only() -> None:
-    policy = example_policy()
-    for name in ("broker-refresh", "broker-client-id"):
-        assert derive_binding(policy, name) == {"origins": ["https://auth.broker.example:443"]}
-
-
-def test_smtp_password_binds_to_the_connector() -> None:
-    assert derive_binding(example_policy(), "mail-pass") == {
-        "smtp": {
-            "host": "smtp.mail.example",
-            "port": 465,
-            "from": "Agent <agent@mail.example>",
-            "to": ["partner@mail.example"],
-        }
-    }
-
-
-def test_unreferenced_secret_needs_an_explicit_origin() -> None:
-    with pytest.raises(BindingError, match="pass --origin"):
-        derive_binding(example_policy(), "nobody-uses-this")
-
-
-def test_conflicting_uses_are_refused() -> None:
-    raw = example_policy().model_dump(by_alias=True)
-    raw["credentials"]["music-stats"]["secret"] = "store:mail-pass"
-    with pytest.raises(BindingError, match="both by a connector"):
-        derive_binding(Policy.model_validate(raw), "mail-pass")
 
 
 # --- admin app (in process) --------------------------------------------------------------------
@@ -138,6 +103,86 @@ async def test_put_refusals(tmp_path: Path, body: Any, status: int, message: str
     response = await rig.call("PUT", f"/secrets/{name}", body)
     assert response.status_code == status
     assert message in response.json()["error"]
+    assert rig.store.names() == []
+
+
+@pytest.mark.anyio
+async def test_oauth_secrets_take_the_policy_binding(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    response = await rig.call("PUT", "/secrets/broker-refresh", {"value": "rt-123456"})
+    assert response.status_code == 200
+    assert response.json()["binding"] == BROKER_BINDING
+    secret, binding = rig.store.get_for_oauth(
+        "broker-refresh",
+        token_url="https://auth.broker.example/oauth/token",
+        resource_url="https://mcp.broker.example/mcp",
+    )
+    assert secret.reveal() == "rt-123456"
+    assert binding == BROKER_BINDING
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["broker-refresh", "broker-client-id"])
+async def test_origin_on_an_oauth_secret_is_refused(tmp_path: Path, name: str) -> None:
+    rig = AdminRig(tmp_path)
+    body = {"value": "v-123456", "origins": ["https://auth.broker.example"]}
+    response = await rig.call("PUT", f"/secrets/{name}", body)
+    assert response.status_code == 409
+    assert response.json() == {"error": "OAuth secrets are bound by the policy; drop --origin"}
+    assert rig.store.names() == []
+
+
+@pytest.mark.anyio
+async def test_malformed_origins_on_an_oauth_secret_are_a_bad_request(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    body = {"value": "v-123456", "origins": "https://auth.broker.example"}
+    response = await rig.call("PUT", "/secrets/broker-refresh", body)
+    assert response.status_code == 400
+    assert response.json() == {"error": "origins must be a list of URLs"}
+    assert rig.store.names() == []
+
+
+@pytest.mark.anyio
+async def test_an_oauth_secret_with_no_route_is_refused(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    raw = rig.policy.model_dump(by_alias=True)
+    raw["routes"] = [r for r in raw["routes"] if r["credential"] != "broker-mcp"]
+    rig.policy = Policy.model_validate(raw)
+    response = await rig.call("PUT", "/secrets/broker-refresh", {"value": "rt-123456"})
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "no route uses broker-mcp; there is nothing to bind the access tokens minted "
+        "with 'broker-refresh' to"
+    }
+    assert rig.store.names() == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("body", [{"value": "rt-123456"}, "not an object"])
+async def test_vault_managed_names_are_refused(tmp_path: Path, body: Any) -> None:
+    rig = AdminRig(tmp_path)
+    for name in ("oauth.broker-mcp.live", "oauth.anything"):
+        response = await rig.call("PUT", f"/secrets/{name}", body)
+        assert response.status_code == 409
+        assert response.json() == {"error": "managed by the vault; use zoeymcp login"}
+    assert rig.store.names() == []
+
+
+@pytest.mark.anyio
+async def test_names_that_only_look_vault_managed_are_not_refused(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    body = {"value": "v-123456", "origins": ["https://x.example"]}
+    for name in ("oauth", "oauthx.live", "my.oauth.live"):
+        assert (await rig.call("PUT", f"/secrets/{name}", body)).status_code == 200
+    assert rig.store.names() == ["my.oauth.live", "oauth", "oauthx.live"]
+
+
+@pytest.mark.anyio
+async def test_a_live_slot_can_be_deleted(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    rig.store.put("oauth.broker-mcp.live", "rt-123456", BROKER_BINDING)
+    response = await rig.call("DELETE", "/secrets/oauth.broker-mcp.live")
+    assert response.status_code == 200
     assert rig.store.names() == []
 
 
@@ -280,7 +325,40 @@ def test_cli_over_the_socket(tmp_path: Path, socket_dir: Path) -> None:
         code, _, err = cli(["secret", "set", "nobody-uses", "--socket", sock], stdin="v-123456")
         assert code == 1
         assert "pass --origin" in err
+        code, out, _ = cli(["secret", "set", "broker-refresh", "--socket", sock], stdin="rt-1")
+        assert code == 0
+        assert out == (
+            "stored broker-refresh, bound to token endpoint https://auth.broker.example:443, "
+            "access tokens to https://mcp.broker.example:443\n"
+        )
+        argv = ["secret", "set", "broker-refresh", "--origin", "https://x.example"]
+        code, _, err = cli([*argv, "--socket", sock], stdin="rt-2")
+        assert code == 1
+        assert "drop --origin" in err
         assert cli(["secret", "delete", "music-stats", "--socket", sock])[0] == 0
+
+
+def test_cli_secret_set_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``secret set`` output and refusals, with the socket swapped for the app in process."""
+    rig = AdminRig(tmp_path)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        response = asyncio.run(rig.call(request.method, request.url.path, body))
+        return httpx.Response(response.status_code, content=response.content)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **_: httpx.MockTransport(handle))
+    code, out, _ = cli(["secret", "set", "broker-refresh", "--socket", "x"], stdin="rt-1\n")
+    assert code == 0
+    assert out == (
+        "stored broker-refresh, bound to token endpoint https://auth.broker.example:443, "
+        "access tokens to https://mcp.broker.example:443\n"
+    )
+    argv = ["secret", "set", "broker-client-id", "--origin", "https://x.example", "--socket", "x"]
+    code, out, err = cli(argv, stdin="id-2")
+    assert (code, out) == (1, "")
+    assert err == "zoeymcp secret: OAuth secrets are bound by the policy; drop --origin\n"
+    assert rig.store.names() == ["broker-refresh"]
 
 
 def test_cli_reports_an_unreachable_socket(tmp_path: Path) -> None:

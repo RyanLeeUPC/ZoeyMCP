@@ -99,6 +99,9 @@ def gateway_key(socket: str, transport: httpx.BaseTransport | None = None) -> di
 def describe_binding(binding: dict[str, Any]) -> str:
     if "origins" in binding:
         return "origins " + ", ".join(binding["origins"])
+    if "oauth" in binding:
+        oauth = binding["oauth"]
+        return f"token endpoint {oauth['token']}, access tokens to {', '.join(oauth['resources'])}"
     if "smtp" in binding:
         smtp = binding["smtp"]
         return f"SMTP {smtp['host']}:{smtp['port']} from {smtp['from']} to {', '.join(smtp['to'])}"
