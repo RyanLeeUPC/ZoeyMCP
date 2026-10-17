@@ -91,13 +91,14 @@ def test_property_a_format_character_after_anything_is_caught(before: str, hidde
 # --- canonical: `continue` -> `break` after null/bool; depth through objects; size boundary ---
 
 
+# _validate walks a stack, so the bad value must come *after* the null or boolean.
 @pytest.mark.parametrize(
     "value",
     [
-        [None, float("nan")],
-        [True, MAX_SAFE_INTEGER + 1],
-        [False, "x", float("inf")],
-        {"a": None, "b": float("nan")},
+        [float("nan"), None],
+        [MAX_SAFE_INTEGER + 1, True],
+        [float("inf"), "x", False],
+        {"b": float("nan"), "a": None},
     ],
 )
 def test_validation_continues_past_null_and_booleans(value: Any) -> None:

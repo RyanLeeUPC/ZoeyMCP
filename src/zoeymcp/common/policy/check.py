@@ -97,10 +97,15 @@ def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, st
             continue
         var = ref.removeprefix("env:")
         if is_seed:
+            cred = policy.credentials.get(path.split(".")[1])
+            if getattr(cred, "reseed", "never") == "on-change":
+                effect = "a changed env value replaces the live token (reseed: on-change)"
+            else:
+                effect = "a changed env value is ignored (reseed: never)"
             report.warning(
                 path,
                 f"refresh token seeded from env var {var}: the live token is kept in the "
-                "store, and a changed env value is ignored unless reseed is on-change",
+                f"store, and {effect}",
             )
         else:
             report.warning(
