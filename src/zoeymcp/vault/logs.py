@@ -19,11 +19,12 @@ from typing import Any, TextIO
 from .store import Secret
 
 _lock = threading.Lock()
-_stream: TextIO = sys.stdout
+# None means "whatever sys.stdout is when a line is written", so a replaced stdout is honored.
+_stream: TextIO | None = None
 
 
-def set_stream(stream: TextIO) -> None:
-    """Send log lines elsewhere (tests)."""
+def set_stream(stream: TextIO | None) -> None:
+    """Send log lines elsewhere (tests); ``None`` goes back to stdout."""
     global _stream
     _stream = stream
 
@@ -47,5 +48,6 @@ def event(kind: str, **fields: Any) -> None:
         record[key] = value
     line = json.dumps(record, default=str, separators=(",", ":"))
     with _lock:
-        _stream.write(line + "\n")
-        _stream.flush()
+        stream = _stream or sys.stdout
+        stream.write(line + "\n")
+        stream.flush()

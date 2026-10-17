@@ -1036,9 +1036,9 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | # | Scope | Shapes |
 | --- | --- | --- |
 | M0 | Repo, CI, policy schema, `check`, text rules, canonical JSON, fake-provider harness | — |
-| M1 | **Vault core:** routes, path rules, header/query/path/basic credentials, key hierarchy, store with bindings, local admin socket + `secret set` / `setup-code`, declarative mode, egress proxy, logs, `selftest`. **Both tiers:** the entrypoint and the hardened compose | S1–S4, S7, S8 |
+| M1 | **Vault core:** routes, path rules, header/query/path/basic credentials, key hierarchy, store with bindings, local admin socket + `secret set` / `setup-code`, declarative mode, egress proxy, logs, `selftest` (with `--mutate`), the image and the **hardened compose**, mutation testing in CI | S1–S4, S7, S8 |
 | M2 | **OAuth:** refresh, rotation in the store, seed vs live; CLI `login <credential>` | S5, S6 |
-| M3 | **Gateway:** `remote` servers through the vault, gateway identity and key rotation, policy fetch, per-client scoping, per-client upstream sessions, include + pins, schema validation, `review`; the `lan` compose profile | S10, S12 (drift, injection) |
+| M3 | **Gateway:** `remote` servers through the vault, the **standard tier's entrypoint** (two uids, Unix socket; moved from M1, since it only separates the vault from the gateway), gateway identity and key rotation, policy fetch, per-client scoping, per-client upstream sessions, include + pins, schema validation, `review`; the `lan` compose profile | S10, S12 (drift, injection) |
 | M4 | **Approvals:** elicitation back end, locks, ledger; toolkit SDK and the derived-image example; SMTP connector + example toolkits | S12 (sampling, elicitation), S13–S16 |
 | M5 | **Portal v1:** setup code, passkeys, step-up, hardening, write-only secrets, OAuth connect (including pasting the redirect URL), credential health, ledger view | portal tests |
 | M6 | **Portal v2:** tool-drift review and re-pin; **managed mode** with versioning, history, rollback, export/import | portal tests |

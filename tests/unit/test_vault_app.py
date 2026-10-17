@@ -143,7 +143,7 @@ async def test_log_contents(tmp_path: Path) -> None:
         await r.call("GET", "/api/v1/x", headers=bearer("wrong-placeholder-0000"))
         await r.app.aclose()
     finally:
-        logs.set_stream(__import__("sys").stdout)
+        logs.set_stream(None)
     text = buffer.getvalue()
     for forbidden in (SECRET, PH, "private-value", "wrong-placeholder-0000"):
         assert forbidden not in text
