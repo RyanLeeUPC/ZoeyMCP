@@ -47,3 +47,23 @@ jobs:
           version: ${{ env.UV_VERSION }}
       - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv run --locked pytest
+
+  image:
+    name: image build and smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: >-
+          docker build
+          --build-arg SOURCE_REVISION="$(git rev-parse HEAD)"
+          --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          -t zoeymcp:ci .
+      - name: Labels match the source
+        run: |
+          tree="$(docker inspect zoeymcp:ci --format '{{ index .Config.Labels "io.zoeymcp.source-tree" }}')"
+          test "$tree" = "$(git rev-parse 'HEAD^{tree}')"
+      - name: Smoke test, hardened
+        run: sh scripts/smoke-image.sh zoeymcp:ci
