@@ -1,0 +1,293 @@
+# Operating ZoeyMCP
+
+How to run what is built so far: the vault (M1) and OAuth in the vault (M2). The design and the
+reasons behind it are in [design.md](design.md); this page is the how-to.
+
+Admin commands run **inside the vault container** and talk to it over its admin socket
+(`/run/zoeymcp/admin.sock`, or `--socket`). With the hardened compose:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp oauth status
+```
+
+The examples below shorten that to `zoeymcp ...`. `docker compose exec` gives the command a
+terminal, which the hidden prompts need. Add `-T` to pipe a value in instead.
+
+## 1. The state volume
+
+The vault keeps its state in one directory (`/state`, the `vault-state` volume):
+
+- `store.json`: the encrypted secrets, written atomically (a temporary file, then a rename);
+- `vault.lock`: held with `flock` while the vault runs;
+- `setup.json`: the pending portal setup code.
+
+**One vault per state volume.** A second vault on the same directory refuses to start ("another
+vault is using this state directory"). Network filesystems are unsupported: without `flock` the
+vault refuses to start, and a lock that isn't shared between hosts protects nothing.
+
+**When the store can't be written** (a full or read-only volume), nothing is lost while the vault
+runs: the new value stays in memory and is used. The vault says so:
+
+- `secret set` and `secret delete` answer "kept in memory, not written to disk; check the state
+  volume" (an HTTP 500, exit code 1);
+- `zoeymcp login` prints "kept in memory, not on disk; fix the state volume; zoeymcp oauth status
+  shows when it is saved" and exits 1;
+- `oauth status` shows `degraded (not persisted): the store can't be written; check the state
+  volume` under every credential;
+- the log has `oauth_persist_failed` (level `critical` for a credential with `rotates: true`,
+  `error` otherwise).
+
+Fix the volume. The next write then saves everything: the vault retries before every refresh and
+when it stops, and logs `oauth_persist_recovered`. **Don't restart the vault while it is
+degraded:** a crash or restart before a successful write loses the change, and for a rotating
+refresh token that means a new `zoeymcp login`.
+
+**Stopping.** The vault waits up to 45 s for refreshes in flight, so a new refresh token is saved
+before it exits. The hardened compose sets `stop_grace_period: 50s` for this. Docker's default
+is 10 s, so when running the image some other way, give it the same time (`docker stop -t 50`).
+
+## 2. Logging in
+
+`zoeymcp login <credential>` consents to an OAuth credential and stores its refresh token. It
+needs the credential's `authorize_url`, a route that uses the credential, and, for a
+confidential client, the client secret stored first (`zoeymcp secret set <name>`). Register the
+credential's `redirect_uri` with the provider exactly as written; the default is
+`http://127.0.0.1/callback`, with no port.
+
+```text
+$ zoeymcp login spotify
+Credential   spotify (public client, PKCE S256, rotating refresh tokens)
+Binding      token endpoint https://accounts.spotify.com:443
+             access tokens to https://api.spotify.com:443
+Scopes       user-read-currently-playing user-top-read
+
+Open this URL in a browser and approve:
+  https://accounts.spotify.com/authorize?response_type=code&client_id=...
+
+Your browser will then try to open http://127.0.0.1/callback?... and fail to load. That is
+expected. Copy the full address from the address bar and paste it here (input hidden, 10 minutes):
+>
+Stored the refresh token for spotify as spotify-refresh.
+Granted: user-read-currently-playing user-top-read
+The grant ends at 2027-04-15T09:00:00Z; run login again before then.
+```
+
+- Open the URL in any browser, on any machine: the redirect goes to the browser's own machine and
+  never has to reach the vault. Paste the whole address, including `?code=...&state=...`.
+- The address is read from a hidden prompt (or one line of stdin), never from the command line,
+  and never echoed or logged. Ctrl-C, an empty line or the end of input cancels the login.
+- A login lasts 10 minutes and works once: after any failure, run `login` again. Starting a new
+  login for a credential replaces its pending one; at most 8 can be pending.
+- Scopes outside the expected set are stored and flagged: `UNEXPECTED: ...` on stderr, exit
+  code 0, and a warning in `oauth status`. Missing ones print `missing: ...`.
+- For an `env:`-seeded credential, login stores the token in `oauth.<credential>.live` and says
+  what happens to the seed: "The env seed VAR is now ignored (reseed: never). You may remove
+  it."
+- Exit codes: 0 when stored (warnings or not), 1 on any failure or when the store couldn't be
+  written.
+
+**In two steps,** for example from a script or when the vault and the browser are far apart:
+
+```text
+$ zoeymcp login spotify --start
+...
+Then, within 10 minutes, run: zoeymcp login spotify --flow=<ID>
+and give it the address your browser was sent to.
+$ zoeymcp login spotify --flow=<ID>
+```
+
+The second command reads the address the same way (a hidden prompt, or one line piped in with
+`exec -T`). Keep the `=`: a flow ID can start with a dash.
+
+**`--rebind`.** A login is refused when the policy now binds the grant differently from the
+stored one, for example after a route moved to a new upstream origin. The CLI prints the old and
+the new binding; run the login again with `--rebind` to accept the new one.
+
+**`client_credentials`.** There is nothing to consent to: `login` makes one token call, prints
+"The client credentials of <name> work: ...", stores nothing, and clears the credential's failure
+state.
+
+**Timeouts.** The CLI waits up to 76 s for a login answer (the 20 s code exchange, up to 41 s for
+a refresh of the same slot that is already running, and 15 s to spare), up to 56 s for
+`secret set` and `secret delete` (a secret an OAuth credential uses waits for a refresh in
+flight), and 10 s for everything else. After a timeout, check `oauth status` before
+trying again: the vault may have finished.
+
+**Why a login is refused.** The CLI prints a message; the admin answer also carries one of
+these `reason` codes:
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| `not_oauth` | no `oauth2` credential has that name, or it no longer uses the refresh grant | check the name and the policy |
+| `no_authorize_url` | the credential has no `authorize_url` | add one, or give the refresh token another way (the message says how) |
+| `no_route` | no route uses the credential, so there is nothing to bind its tokens to | add a route |
+| `authorize_misconfigured` | the authorization URL can't be built: a `client_id` ref, or an `authorize_params` name the vault sets (`check` reports both) | fix the policy and run `check` |
+| `client_id_unavailable`, `client_secret_unavailable` | the client ID ref or client secret isn't set, or isn't bound to the token endpoint | `zoeymcp secret set <name>`, or set the env var and restart (the message says which) |
+| `not_configured` | the token manager doesn't know the credential; it shouldn't happen | reload the policy (§7) or restart the vault |
+| `binding_changed` | the stored grant is bound differently from what the policy now derives | `--rebind` |
+| `too_many_flows` | 8 logins are pending | finish one, or wait 10 minutes |
+| `flow_unknown` | the flow expired, was used, or belongs to another credential | run `login` again |
+| `redirect_mismatch` | the pasted address isn't under `redirect_uri`, can't be read, or has the answer in the fragment | paste the full address from the address bar |
+| `state_mismatch` | the address is from a different login | use the URL of the latest login |
+| `duplicate_param`, `no_code` | the address has a parameter twice, or no usable code | run `login` again |
+| `iss_mismatch` | the answer names a different issuer than `issuer` | check `issuer` against the provider's metadata |
+| `provider_error` | the provider refused (for example, consent was denied); its description is shown, never logged | act on the description |
+| `exchange_failed:<code>` | the token endpoint refused the code; `<code>` is one of §4's codes | for `invalid_grant`, the code expired or was used: run `login` again |
+| `no_refresh_token` | the provider issued no refresh token | Google: keep `access_type: offline` and `prompt: consent`; other providers may need an `offline_access` scope |
+
+## 3. OAuth health: `oauth status` and `oauth reset`
+
+```text
+$ zoeymcp oauth status
+google-calendar: terminal oauth_reconsent_needed
+  hint: run: zoeymcp login google-calendar
+  last success 3 days ago
+spotify: ok
+  access token expires in 52 min
+  last success 8 min ago
+  WARNING re-consent due by 2027-04-15T09:00:00Z
+```
+
+Each credential gets a line with its state, then details. Nothing in it is a secret.
+
+- **States:** `ok` (an access token is cached), `idle` (none is cached: not needed yet, or
+  expired), `backoff` (a transient failure; `retry in ...` says when the next request may try),
+  `terminal` (no token calls until you act). `(refreshing)` means a refresh is running.
+- `hint:` what to do about the code (below).
+- `last success ... ago`: from the store's display metadata. Google drops a refresh token unused
+  for 6 months.
+- `WARNING re-consent due by ...`: the grant ends within 14 days, by `consented_at` plus
+  `grant_lifetime_days`, or by the refresh token's own expiry.
+- `UNEXPECTED scopes: ...` / `missing scopes: ...`: the last granted scopes against the expected
+  ones.
+- `WARNING an upstream said upstream_insufficient_scope at ...`: an upstream answered that the
+  token lacks a scope. A new token won't fix that; log in with more scopes, or narrow the rules.
+- `degraded (not persisted)`: see §1.
+
+**Hints.** The hint depends on why the credential failed, then on its code:
+
+| When | Hint |
+| --- | --- |
+| reason `client_id_unavailable` / `client_secret_unavailable` | "enter the client ID (or secret) with zoeymcp secret set NAME" or "set the client ID (or secret) in env VAR and restart the vault", then "then run: zoeymcp oauth reset NAME" |
+| reason `no_route` | "no route uses NAME; fix the policy" |
+| `oauth_reconsent_needed`, `oauth_rotation_lost`, `credential_unavailable` | with `authorize_url`: "run: zoeymcp login NAME". Without one, how to give a new refresh token: "enter the refresh token with zoeymcp secret set ENTRY", or for an env seed "put a new refresh token in env VAR and restart the vault (reseed: on-change)" or "put a new refresh token in env VAR, delete oauth.NAME.live with zoeymcp secret delete (reseed: never keeps it), and restart the vault". For `client_credentials`: "check the client ID and secret, then run: zoeymcp oauth reset NAME" |
+| `oauth_client_rejected` | "check the client ID and secret, then run: zoeymcp oauth reset NAME" |
+| `oauth_misconfigured` | "fix the policy, then run: zoeymcp oauth reset NAME" |
+| `oauth_unsupported` | "the provider's tokens aren't Bearer tokens the vault can use" |
+| `oauth_unavailable` | "the token endpoint is unavailable; a request after the backoff tries again" |
+
+**`zoeymcp oauth reset <credential>`** clears the failure state, so the next request that needs a
+token tries once. Use it after fixing something the vault can't see: a client re-enabled at the
+provider, a corrected policy, or a spurious `invalid_grant` during a provider outage. Fixing the
+cause through the vault (a login, `secret set` or `secret delete` of a secret the credential uses,
+a reload that changes the credential) clears the state by itself. So does a restart, since
+failure states live in memory.
+
+The `reason` behind a failure is in the admin answer's `reason` field and in the `oauth_refresh`
+log line's `failure_reason`: `provider_error` and `http_status` (the token endpoint refused),
+`no_response` and `pre_send` (no answer), `unparseable_body`, `not_ok`, `bad_access_token`,
+`token_type` and `unusable_refresh_token` (an answer the vault can't use), `internal_error`, and,
+before any call, `no_token`, `live_unusable`, `seed_unusable`, `no_route`, `request` (the policy
+can't build the request), `client_id_unavailable` and `client_secret_unavailable`.
+
+## 4. Codes
+
+After a caller is identified and a rule matched, a route that can't get its credential answers
+502 `{"error": "upstream unavailable", "code": "<code>"}`. The codes are stable, and each needs a
+different action:
+
+| Code | Meaning | Action |
+| --- | --- | --- |
+| `credential_unavailable` | no usable secret: none stored, a refused or tampered entry, an unset env var, or a route outside the grant's resources | set the secret, or log in; `oauth status` has the hint |
+| `oauth_reconsent_needed` | the provider refused the refresh token (`invalid_grant`): revoked, expired, or retired | `zoeymcp login <credential>` |
+| `oauth_rotation_lost` | as above, right after a replay: the successor of a rotating token was probably lost in transit | `zoeymcp login <credential>` |
+| `oauth_client_rejected` | the provider refused the client ID or secret | check them, `secret set` the secret, or `oauth reset` |
+| `oauth_misconfigured` | the provider refused the request (`invalid_scope`, `invalid_request`, ...) | fix the policy (scope, `extra_params`, `client_auth`), reload, or `oauth reset` |
+| `oauth_unsupported` | the provider's tokens can't be used (DPoP or another non-Bearer type), or it sent a malformed refresh token | not usable with this vault yet |
+| `oauth_unavailable` | the token endpoint is down, rate limiting, or answered with nothing usable | none: the vault backs off and the next request after `Retry-After` tries again |
+
+A 502 for an upstream that failed by itself carries no code. Identity failures stay a bare 403.
+
+## 5. Seed vs live
+
+A refresh token can be given three ways:
+
+- `store:<name>`: entered with `zoeymcp login` or `zoeymcp secret set <name>`, and replaced in
+  place on every rotation.
+- `env:<VAR>`: a **seed**. On its first success the vault promotes it into the store entry
+  `oauth.<credential>.live`, and uses that **live** token from then on. `check` says so for every
+  seeded credential.
+- `client_credentials` has no refresh token at all.
+
+With the default `reseed: never`, a changed env value is ignored once a live token exists.
+With `reseed: on-change`, a value different from the one last seeded (or the one set at the last
+login) replaces the live token. Every `oauth_refresh` log line says which token was used
+(`token_source`: `store`, `live` or `seed`) and why (`reason`, design §4.3).
+
+**To re-seed,** in order of preference:
+
+1. `zoeymcp login <credential>`: no redeploy. The seed is then superseded, and login says so.
+2. `zoeymcp secret delete oauth.<credential>.live`: the next refresh presents the env seed and
+   promotes it.
+3. `reseed: on-change`, a new env value, and a restart.
+
+**A rotating seed works once. Never roll an env seed back.** With `rotates: true` the provider
+retires the seed on its first use. Presenting an old one again (an earlier env value, with
+`reseed: on-change`) fails, and providers with reuse detection revoke the whole grant when they
+see it.
+
+A seed env var that is unset is only a warning in `check`: the vault uses the live token, so the
+seed may be removed once it has been promoted.
+
+## 6. Recovery per kind
+
+| Credential | Lost master key or state volume | Lost rotation |
+| --- | --- | --- |
+| `header`, `query`, `path`, `basic` | `secret set` again | — |
+| OAuth refresh token in `store:` | `zoeymcp login` | `zoeymcp login` |
+| OAuth env seed, not rotating | automatic: the seed is promoted again | — |
+| OAuth env seed, rotating | `zoeymcp login` | `zoeymcp login` |
+| `client_credentials` | `secret set` the client secret | — |
+
+A rotation is lost when the vault never saved the newest refresh token: a crash between the
+token answer and the write, a store that couldn't be written followed by a restart, or an answer
+lost in transit by a provider without a grace window (`oauth_rotation_lost`).
+
+## 7. Reloading the policy
+
+```sh
+docker compose -f deploy/compose.hardened.yaml kill -s HUP vault
+```
+
+On `SIGHUP` the vault loads and checks its policy file again:
+
+- A policy that fails is refused (`reload_refused` in the log), and the running one stays.
+- On success the log has `reload_ok`, with `oauth_reset` listing the OAuth credentials whose
+  settings or route origins changed. Their cached access tokens are dropped and their failure
+  states cleared. A refresh in flight still saves its new refresh token.
+- A changed `egress_proxy` needs a restart (`egress_proxy_change_needs_restart`).
+- A route moved to a new upstream origin can't use its stored grant until
+  `zoeymcp login <credential> --rebind`.
+- The environment is read once, at startup: a new env value (a seed, a client secret) needs a
+  restart. An inline policy in `ZOEYMCP_CONFIG` is part of the environment too, so changing it
+  means recreating the container.
+
+## 8. Provider notes
+
+**Google** (`profiles/google-oauth.yaml`):
+
+- Register a **Desktop app** client: it accepts the loopback redirect.
+- Keep `authorize_params: {access_type: offline, prompt: consent}`, or no refresh token is
+  issued.
+- While the consent screen is in **Testing** status, a grant lasts 7 days.
+- At most 100 refresh tokens per account and client ID; another login retires the oldest.
+- A refresh token unused for 6 months stops working.
+- `invalid_grant` with `error_subtype: invalid_rapt` means a Workspace re-authentication policy
+  wants the user to sign in again: `zoeymcp login`.
+
+**Spotify** (`profiles/spotify-pkce.yaml`):
+
+- Register the redirect URI `http://127.0.0.1/callback` exactly: no port, never `localhost`.
+- Refresh tokens rotate on every use (`rotates: true`).
+- The grant ends 6 months after consent. The profile sets `grant_lifetime_days: 180`, so
+  `oauth status` warns 14 days before.

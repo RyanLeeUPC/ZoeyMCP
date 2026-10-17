@@ -1,6 +1,8 @@
 # ZoeyMCP design
 
-Status: **draft for review**. Nothing here is built yet.
+Status: **draft for review**. M1 (the vault core) and M2 (OAuth in the vault, `zoeymcp login`)
+are built; everything else here is not yet. Operating the built parts is in
+[operations.md](operations.md).
 
 ZoeyMCP is a self-hosted proxy that lets AI agents use outside services and MCP servers **without
 ever holding a real credential**, and that puts a human approval of the **exact arguments** in front
@@ -294,14 +296,17 @@ For each request, in order:
    where the route expects it (bearer header by default, or a named header or query parameter).
    It must be an identity the route accepts, and match its source-address pins if it has any.
    Otherwise → 403. Every identity failure gets the same 403, so a caller learns nothing about
-   which check failed. The placeholder is removed before forwarding.
+   which check failed. The placeholder is removed before forwarding. Only a caller that passed
+   this step and step 3 can get a 502 with a stable `code` (§4.3).
 3. Check **method + path** against the route's rules (§4.2). No rule → 403.
 4. Apply **query policy**: forced parameters overwrite whatever was sent; stripped ones are
    removed; unknown ones are kept unless `query.allow` is set.
 5. Apply **header policy**: hop-by-hop headers, and `Authorization`/`Cookie` from the caller, are
    dropped unless the route allows them; a configurable `Host`.
 6. **Inject the credential** (§4.3). The store refuses to decrypt a secret whose **binding**
-   doesn't cover this request's origin (§4.5).
+   doesn't cover this request's origin (§4.5). For `oauth2`, the access token comes from the
+   token manager and is used only if the route's upstream origin is one of the grant's
+   resources. This is the last check, so a request refused earlier never causes a token call.
 7. Forward through the egress proxy. Streamed bodies (SSE) pass through unbuffered; a size limit
    applies to request bodies.
 8. **Scrub the response.** Upstreams sometimes echo credentials in error bodies, especially
@@ -310,6 +315,9 @@ For each request, in order:
      scrubbed by default (configurable).
    - Matching covers the secret as raw bytes, **percent-encoded**, **JSON-escaped**, and for basic
      auth **base64** of `user:secret`. Each match is replaced with `[REDACTED]`.
+   - On an `oauth2` route the scrub set is the current and the previous access token, the
+     refresh token and the client secret, including the client secret's form-encoded variant
+     and the `client_secret_basic` header value the vault actually sends.
    - The vault asks upstreams for `Accept-Encoding: identity`, or decompresses before scanning,
      and recomputes `Content-Length`.
    - Streamed and larger bodies aren't scrubbed. The docs say so.
@@ -355,22 +363,119 @@ rules:
 **OAuth 2** (`oauth2`):
 
 - **Grants:** `refresh_token` (the normal case), with a confidential client (ID and secret) or a
-  public one (ID only, consented with PKCE). `client_credentials` too, for service accounts.
-- **Extra token parameters** come from config (`resource`, `audience`, `scope`).
-- **Caching:** access tokens are cached in memory and refreshed `refresh_skew` seconds (default
-  120) before expiry. A 401 from the upstream triggers one refresh and one retry, for idempotent
-  methods only. Concurrent requests share one in-flight refresh.
-- **Rotation:** with `rotates: true`, each new refresh token is written to the store before the
-  access token is used.
-  - A refresh token kept in the store is simply replaced in place, and onboarding (portal or CLI)
-    writes a fresh one there directly.
-  - A refresh token given as `env:` is only a **seed**. It is used when the store holds none, or
-    when its fingerprint differs from the one the store was seeded from **and**
-    `reseed: on-change` is set. The default is `reseed: never`, so a stale env can't overwrite a
-    live token. Every refresh logs the seed-vs-live decision.
-- **Failure:** a refresh error (e.g. `invalid_grant`) makes the route answer 502 with a stable
-  error code. The portal shows "re-consent needed" for that credential. It is never retried in a
-  tight loop.
+  public one (ID only, consented with PKCE). `client_credentials` too, for service accounts. A
+  refresh token is consented with `zoeymcp login` (§7.4), entered with `secret set`, or seeded
+  from `env:`.
+- **Client authentication:** `client_auth: basic` (encoded as RFC 6749 §2.3.1 says), `post` (in
+  the body) or `none` (a public client). Unset, it is `basic` with a `client_secret` and `none`
+  without one. `client_id` may be a secret ref, except when `authorize_url` is set: client IDs
+  appear in the authorization URL, so `check` asks for the literal.
+- **Request shape:** `token_body: form | json`; `token_headers` (never one the vault sets, such
+  as `Authorization` or `Content-Type`); `scope_separator: " " | ","`; `extra_params` on token
+  requests and `authorize_params` on the authorization request, where a value may be a list
+  (a repeated `resource`). Names the vault sets are reserved, and `check` refuses them.
+
+  | Request | Sent |
+  | --- | --- |
+  | authorize | `response_type=code`, `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method=S256`, `scope` if set, then `authorize_params` |
+  | code exchange | `grant_type=authorization_code`, `code`, `redirect_uri` (byte-identical to the authorization request's), `code_verifier`, client authentication, `extra_params` |
+  | refresh | `grant_type=refresh_token`, `refresh_token`, client authentication, `extra_params`. Never `scope`: leaving it out means the original grant (RFC 6749 §6) |
+  | client_credentials | `grant_type=client_credentials`, `scope` if set, client authentication, `extra_params` |
+
+  Token requests also carry `Accept: application/json`, `Content-Type` per `token_body`,
+  `User-Agent: zoeymcp/<version>` (unless `token_headers` sets one) and `token_headers`, never a
+  caller's header. They go through the egress proxy on a client that follows no redirects, keeps
+  no cookies, and reads at most 64 KiB of an answer.
+- **Every new refresh token is saved before use** (invariant I3). A refresh token in any 2xx
+  answer is written to the store before the access token from that answer is cached or used,
+  whatever `rotates` says. `rotates` states what to expect: with `true` the old token dies on
+  use, a missing successor is logged (`oauth_rotation_missing`) and a failed write is critical;
+  with `false` a successor is still saved, and logged as `oauth_rotation_observed`. A
+  `refresh_token` that is present but malformed is terminal (`oauth_unsupported`), and the old
+  one is never presented again.
+- **Access tokens** live in memory only; a restart costs one refresh per credential. A token is
+  refreshed when a request needs one and it is within `refresh_skew` seconds (default 120, at
+  most half its lifetime) of expiry. `expires_in` is clamped to 60 s–24 h, and a missing one
+  means `default_expires_in` (3600). There is **no background refresh**: an idle credential
+  makes no token calls. During a refresh, a backoff or a terminal state, a cached token is still
+  served until it expires. A `token_type` other than Bearer is refused and nothing is
+  forwarded; DPoP is unsupported (a possible future option).
+- **One refresh at a time** per refresh token (I2). A refresh runs as a task the token manager
+  owns; every request that needs it waits for it, and a caller that gives up never cancels it.
+  Login, `secret set` and `delete` wait for it before writing the slot, and shutdown waits up
+  to 45 s for refreshes in flight. A reload doesn't wait: the task keeps running, so no second
+  refresh can start. If the reload changed the credential, the task still saves any new refresh
+  token but doesn't cache its access token; a request waiting on it gets 502
+  `oauth_unavailable`, and the next request refreshes again.
+- **Seed vs live.** A refresh token given as `store:<name>` is replaced in place. One given as
+  `env:<VAR>` is only a **seed**: on its first success it is promoted into the store entry
+  `oauth.<credential>.live`, with the seed's SHA-256 (§4.5). Each refresh then decides:
+
+  | Live slot | Env seed | `reseed` | Presents | `reason` |
+  | --- | --- | --- | --- | --- |
+  | absent | not set | any | nothing (`credential_unavailable`) | `no_token` |
+  | absent | set | any | the seed, promoted on success | `no_live` |
+  | present | not set | any | the live token | `seed_absent` |
+  | present | set | `never` (default) | the live token | `reseed_never` |
+  | present | set, hash unchanged | `on-change` | the live token | `seed_unchanged` |
+  | present | set, hash changed | `on-change` | the seed, which replaces the live token on success | `seed_changed` |
+  | present but refused (binding, tampering) | any | any | nothing (`credential_unavailable`) | `live_unusable` |
+
+  A refused live slot never falls back to the seed, and a changed seed that fails is not
+  followed by the old live token. Every `oauth_refresh` log line carries the decision as
+  `token_source` (`store`, `live` or `seed`) and `reason`. A login records the hash of the seed
+  set at that moment, so with `on-change` only a new env value re-seeds afterwards. A rotating
+  seed works once: never roll an env seed back.
+- **Failures** are classified by the OAuth `error` first and the HTTP status second
+  (`invalid_grant` arrives as 400, 403, or even 200):
+
+  | Condition | Kind | Code |
+  | --- | --- | --- |
+  | `invalid_grant`, `bad_refresh_token`, `invalid_refresh_token` | terminal | `oauth_rotation_lost` after the replay below, else `oauth_reconsent_needed` (`oauth_client_rejected` for `client_credentials`) |
+  | `invalid_client`, `unauthorized_client`, `incorrect_client_credentials`, any other 401 | terminal | `oauth_client_rejected` |
+  | `invalid_scope`, `invalid_target`, `invalid_request`, `unsupported_grant_type`, any other status | terminal | `oauth_misconfigured` |
+  | `use_dpop_nonce`, a non-Bearer token, a malformed refresh token | terminal | `oauth_unsupported` |
+  | 429, 5xx, `temporarily_unavailable`, `slow_down`, `server_error`, no answer, an unusable 2xx | backoff | `oauth_unavailable` |
+  | no refresh token, a refused slot, a client ID or secret that isn't set or bound | terminal | `credential_unavailable` |
+
+  - A terminal state makes no token calls until the operator acts: `login`, `secret set` or
+    `delete` of a secret the credential uses, `oauth reset`, a reload that changes the
+    credential, or a restart. Each allows one attempt.
+  - Backoff waits 5, 15, 60, 300, then 900 s (±10%) after consecutive failures. A longer
+    `Retry-After` (seconds or an HTTP date, capped at an hour) wins, and a 429 without one waits
+    60 s. The next request that needs a token after the wait makes one attempt.
+  - Only `error` and `error_subtype` are logged, filtered to `[A-Za-z0-9_.-]{1,64}` (anything
+    else is logged as `other`). `error_description` and raw bodies are never logged, stored or
+    returned.
+- **The one replay.** A token call that may have reached the provider but got no answer (a
+  read error, or the 20 s attempt deadline) is sent once more after 1 s, with the same refresh
+  token. Within a provider's grace window that recovers the successor; without one, the provider
+  answers `invalid_grant`, which becomes `oauth_rotation_lost`. A call that never left (a connect
+  error) is not replayed.
+- **The 401 rule.** An upstream 401 whose `WWW-Authenticate` names no error, or
+  `invalid_token`, drops the cached token, unless the token is younger than 30 s. So 401-driven
+  refreshes are at least 30 s apart per credential, whatever else the upstream answers. A `GET`,
+  `HEAD`, `OPTIONS`, `PUT` or `DELETE` is then sent once more with a new token, and that answer
+  is final. A `POST` or `PATCH` may already have had an effect: its 401 goes back to the caller,
+  and the next request gets the new token. `insufficient_scope` (on a 401 or a 403) never
+  triggers a refresh; `oauth status` shows it as a warning.
+- **Errors to callers.** When no token can be had, the route answers 502
+  `{"error": "upstream unavailable", "code": "<code>"}`, with `Retry-After` for
+  `oauth_unavailable`. A `code` comes only after identity and a rule matched, so it tells a
+  caller already entitled to the route what the operator must do; identity failures stay a bare
+  403. M1 credential kinds answer `credential_unavailable` the same way. A 502 because the
+  upstream itself failed carries no code.
+- **Scopes** are compared as sets of exact strings. At login, scopes outside `expected_scopes`
+  (or `scope`, when that is empty) are stored and flagged, never refused; missing ones are a
+  warning. On refresh, a narrower grant logs `oauth_scope_narrowed` and scopes outside the
+  expected set `oauth_scope_unexpected`. Neither blocks: route rules still bound what can be
+  called.
+- **Known ways to need re-consent** (accepted risks):
+  - a crash between the token answer and the store's fsync, with a rotating refresh token;
+  - a lost answer from a provider with no grace window (`oauth_rotation_lost`);
+  - a store write failure followed by a restart before any write succeeded;
+  - a spurious `invalid_grant` during a provider outage, which stays terminal by design: it is
+    visible in `oauth status`, and `oauth reset` allows one more attempt.
 
 ### 4.4 Connectors
 
@@ -425,8 +530,44 @@ it can be revoked without touching the master key.
   or a connector whose constraints have changed, **can't use the secret** until the secret is
   entered again for the new binding. This holds even when the policy was edited by someone holding
   a stolen admin session.
-- **Metadata in the clear:** name, binding, created/updated time, key ID, and for OAuth, expiry and
-  the last refresh result. Health can be shown without decrypting anything.
+- **Metadata in the clear:** name, binding, created/updated time, key ID, and an optional `meta`
+  object outside the authenticated data. For OAuth, `meta` holds display fields: the
+  credential, where the token came from (`login`, `seed`, `operator` or `rotation`), the consent
+  time, the number of rotations, the granted scopes, the refresh token's expiry, and the last
+  success and error. Anyone with the file can edit it, so **no decision reads `meta`**: it is
+  shown by `oauth status`, nothing more. Health can be shown without decrypting anything.
+- **Write failures.** A write changes memory first. If writing the file then fails, memory keeps
+  the new value, the store is marked dirty, and the caller is told: `secret set` answers 500
+  "kept in memory, not written to disk", a login reports that nothing was persisted. The next
+  successful write saves everything, and the vault retries before each refresh and at shutdown.
+  A crash before then loses the change.
+- **One vault per state directory.** At startup the vault takes `flock` on `<state>/vault.lock`
+  and refuses to start if another vault holds it, or if the filesystem has no locks. Network
+  filesystems are unsupported.
+
+**OAuth bindings.** Every secret an `oauth2` credential uses (its refresh token, its client
+secret, a `client_id` ref) is bound to the token endpoint and the credential's resource origins:
+
+```json
+{"oauth": {"token": "https://accounts.example:443", "resources": ["https://api.example:443"]}}
+```
+
+- It has no `origins` key, so a static credential can never inject an OAuth secret. `check`
+  refuses a secret shared by an OAuth credential and anything else, and deriving its binding
+  refuses it again.
+- Every token call checks `token`. The grant's **anchor** (the refresh token, or the client
+  secret for `client_credentials`) is also checked against the route's origin, and its
+  `resources` go with every access token minted from it: the token is used only for a route
+  whose upstream origin is among them. A client secret used with the refresh grant is checked
+  for `token` only.
+- A rotation keeps the entry's binding. Only `login`, `secret set` and the promotion of a seed
+  derive one. A route moved to a new origin can't use the grant until `zoeymcp login --rebind`.
+- **Live slots.** The live refresh token of an `env:`-seeded credential is the entry
+  `oauth.<credential>.live`. The `oauth.` prefix belongs to the vault: `check` refuses a
+  `store:oauth.*` ref, and `secret set` of one is refused. `secret delete` of a live slot is
+  allowed, and forces a re-seed. Its value is an envelope inside the ciphertext,
+  `{"v": 1, "rt": "<refresh token>", "seed_sha256": "<hex>" | null}`, so the seed's hash is
+  hidden at rest, authenticated, and kept by master-key rotation.
 
 **What bindings don't cover:** widening path or method rules on the **same** origin, adding
 callers, or moving a tool from `approve` to `allow`. Those are policy changes, guarded by passkey
@@ -443,8 +584,9 @@ step-up (R62) and versioning (R66).
    ratchet-or-5-minutes rule as a generation bump.
 3. Remove the old key afterwards.
 
-**Losing the key or the volume:** every secret must be entered again, and every rotating OAuth
-credential re-consented (R14).
+**Losing the key or the volume:** every secret must be entered again, and every OAuth grant held
+in the store consented again with `zoeymcp login`; only a non-rotating env seed recovers on its
+own (R14; [operations.md](operations.md) has the table per kind).
 
 ### 4.6 Policy: managed and declarative modes
 
@@ -768,17 +910,34 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
 
 ### 7.4 OAuth and MCP onboarding
 
-- **OAuth for a configured credential:**
-  1. The vault runs PKCE (with a client secret, if confidential) and the operator approves in a new
-     tab.
-  2. The callback reaches the vault, which exchanges the code through the egress proxy, shows the
-     granted scopes, flags any outside `expected_scopes`, and writes the refresh token to the store
-     with its binding.
-- **From another machine:** the redirect URI is loopback (`http://127.0.0.1:<port>/callback`),
-  which points at the **browser's** machine. When the portal isn't open on the vault's host,
-  the modal says: *after approving, copy the `http://127.0.0.1…` URL from the address bar and paste
-  it here.* The vault takes `code` and `state` from it, checks the `state`, and completes the
-  exchange. The PKCE verifier never leaves the vault.
+- **OAuth for a configured credential** (`zoeymcp login` since M2; the portal in M5). **Pasting
+  the redirected address is the primary path**, so the browser can be on any machine:
+  1. The vault makes a flow: a PKCE verifier (S256 only, for confidential clients too), a
+     `state` and a flow ID, all in its memory only. It answers with the authorization URL, which
+     holds nothing secret.
+  2. The operator opens it in a browser and approves. The provider sends the browser to
+     `redirect_uri` (default `http://127.0.0.1/callback`, no port), which points at the
+     **browser's** machine and fails to load. That is expected: the operator copies the address
+     from the address bar and pastes it. The CLI reads it from a hidden prompt or one line of
+     stdin, never from its arguments.
+  3. The vault checks the pasted address: the origin and path of `redirect_uri`, a query of at
+     most 4 KiB, no second `code`, `state`, `error` or `iss`, no answer in the fragment, the
+     flow's `state` (compared in constant time), and an `iss`, when `issuer` is set and the
+     answer carries one, equal to it (RFC 9207; an answer without `iss` is accepted). A
+     provider `error` goes back to the operator with its description, cleaned and cut to 200
+     characters, and is never logged.
+  4. It exchanges the code once, with no replay (a code is single use), through the egress proxy,
+     sending the byte-identical `redirect_uri`. It stores the refresh token with its binding,
+     caches the access token, shows the granted scopes and flags any outside `expected_scopes`.
+  - A flow is removed when it's used, so any failure needs a new login. Flows last 10 minutes;
+    one per credential is pending, at most 8 in all.
+  - **`--rebind`:** when the policy now derives a different binding than the stored grant's (a
+    route moved, the token endpoint changed), login refuses and shows both until `--rebind`
+    accepts the new one.
+  - An answer with no refresh token is refused, with a hint: Google needs `access_type: offline`
+    and `prompt: consent`; some providers need an `offline_access` scope.
+  - In the portal (M5) the modal will say: *after approving, copy the `http://127.0.0.1…` URL
+    from the address bar and paste it here.* The PKCE verifier never leaves the vault.
 - **MCP server by URL:**
   1. The vault reads the server's protected-resource metadata, then its authorization server's
      metadata.
@@ -800,7 +959,9 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp gateway-key` | `docker exec` in the vault | prints the gateway key for the current `gateway_key_generation` |
 | `zoeymcp setup-code` | `docker exec` in the vault | prints a one-time setup code |
 | `zoeymcp secret set NAME --origin …` | `docker exec` in the vault | reads the value from a prompt or stdin (never argv), stores it with its binding |
-| `zoeymcp login <credential>` / `login --mcp <url>` | `docker exec` in the vault | the onboarding of §7.4, with the paste-the-redirect-URL step; tokens go straight into the store |
+| `zoeymcp login <credential> [--rebind] [--start \| --flow ID]` | `docker exec` in the vault | the OAuth onboarding of §7.4; tokens go straight into the store. `--start` prints the URL and the flow ID and exits, and `--flow ID` completes that flow from stdin. For `client_credentials`, a test fetch that stores nothing |
+| `zoeymcp oauth status [<credential>]` / `oauth reset <credential>` | `docker exec` in the vault | per credential: state, code, a hint, time since the last success, re-consent and scope warnings, never a value; `reset` clears a failure state so the next request tries once |
+| `zoeymcp login --mcp <url>` | `docker exec` in the vault | MCP onboarding by URL (§7.4, M7) |
 | `zoeymcp review <server>` | `docker exec` | drift diff and new pins |
 | `zoeymcp policy export / import` | `docker exec` | managed-mode YAML round trip |
 | `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --emit-egress-allowlist` prints the per-source allowlists (plain `host:port` lists and a Squid snippet) for operators who run their own proxy |
@@ -827,6 +988,8 @@ The product is defined by the **shapes** of the services it must front. Each sha
   runs in CI.
 
 ZoeyMCP is done when every shape passes. Shapes are named by pattern; providers are examples.
+The built shapes ship as profiles in `profiles/`; S5 is `google-oauth.yaml` and S6
+`spotify-pkce.yaml`.
 
 | # | Shape | Example providers | Milestone |
 | --- | --- | --- | --- |
@@ -877,6 +1040,20 @@ ZoeyMCP is done when every shape passes. Shapes are named by pattern; providers 
     behind a different content type doesn't get past the hold, and a denied request sends
     nothing upstream;
   - a retired gateway key generation stays retired across a vault restart;
+  - **OAuth (M2):**
+    - a new refresh token is in the store before its access token is used, with `rotates: false`
+      too, and after a failed write the next refresh presents it from memory;
+    - fifty concurrent requests cause one refresh, and a cancelled caller doesn't cancel it;
+    - a refresh token is never presented once a successor was parsed; the one replay recovers a
+      lost answer within a grace window and ends in `oauth_rotation_lost` without one;
+    - 401-driven refreshes are at least 30 s apart, also against alternating answers;
+    - an access token goes only to its grant's resources, and a refused live slot never falls
+      back to the seed;
+    - `secret set`, `delete` and login wait for a refresh in flight; a reload keeps it running,
+      and it saves its refresh token but skips publishing its access token;
+    - no token, code, verifier, `state`, client secret or `error_description` reaches a log
+      line, an admin answer, CLI output or the store file;
+    - selftest's token endpoint is a fake, so a selftest can never refresh a real token;
   - the egress role refuses a host outside the listener's allowlist, a plain-HTTP request, a name
     that resolves to a private or metadata address (including after a DNS change between two
     lookups), and one source's destinations on another source's listener;
@@ -1015,6 +1192,7 @@ deploy/
 src/zoeymcp/
   common/       policy schema + loading, text rules, canonical JSON, logging
   vault/        app, routing, path rules, credentials/, connectors/, store + keys, policy versions
+    oauth/      OAuth: protocol (pure), PKCE and flows, the token manager, login
   portal/       admin API, WebAuthn, sessions, static UI
   gateway/      app, upstream sessions, filtering + pins, approvals/, toolkit SDK, ledger
   bridge/       stdio ↔ streamable HTTP
@@ -1027,7 +1205,7 @@ tests/
   acceptance/   end-to-end shape tests, both tiers
   unit/, effect/, portal/
 examples/       example policies, example toolkits, a derived gateway image
-docs/           design.md (this), threat-model.md, operations.md (rotation, recovery, seed vs live)
+docs/           design.md (this), threat-model.md, operations.md (login, OAuth health, recovery, seed vs live)
 Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 ```
 
@@ -1066,6 +1244,11 @@ only declarative mode exists.
 | Bridge egress and egress proxy | one optional `egress-proxy` profile with per-source allowlists generated from the policy; each bridge on its own network; a bridge holding a real secret is a flagged exception | §3.4, R35 |
 | Gateway key rotation | ratchet on first use of the new generation, capped at 5 minutes; persisted; `--immediate` for a suspected leak | §4.5 |
 | Egress proxy implementation | the built-in `zoeymcp egress` role, reading the policy directly; `check --emit-egress-allowlist` exports the allowlists for operators who run their own proxy. Squid (config drift, a large codebase), Smokescreen (needs client-certificate roles) and tinyproxy (no per-source lists, no private-address guard) were considered | §4.7 |
+| Refresh tokens (M2) | every new refresh token is saved before its access token is used, whatever `rotates` says; one refresh at a time per slot; one replay after an ambiguous failure; no background refresh | §4.3 |
+| Extra scopes at login (M2) | stored and flagged (a stderr warning, exit 0, a health warning), never refused: route rules still bound what the token can do | §4.3, §7.4 |
+| Codes in 502 bodies (M2) | a stable `code` after identity and rule checks, `credential_unavailable` for M1 kinds too; identity failures stay a bare 403 | §4.1, §4.3 |
+| Default `redirect_uri` (M2) | `http://127.0.0.1/callback`, no port: RFC 8252 and Spotify accept it, and one string is registered once | §7.4 |
+| CLI consent (M2) | paste the redirected address; the CLI never listens on a port | §7.4 |
 
 ### 12.2 Open
 

@@ -580,6 +580,7 @@ async def test_a_flush_that_fails_again_is_logged_and_the_refresh_goes_on(
     assert captured.events("oauth_persist_recovered") == []
     flush_failures = [e for e in captured.events("oauth_persist_failed") if e["slot"] is None]
     assert flush_failures[0]["level"] == "critical"
+    assert flush_failures[0]["error_type"] == "StoreWriteError"
     assert rig.calls == 2
 
 
@@ -861,7 +862,11 @@ async def test_a_reload_with_a_changed_fingerprint_clears_a_terminal_state(
     assert rig.calls == 1
     changed = make_policy(spotify_cred(refresh_skew=60))
     assert rig.manager.configure(changed, {}) == ["music"]
-    assert captured.events("oauth_cache_reset")[-1]["reason"] == "reload"
+    assert without_ts(captured.events("oauth_cache_reset")[-1]) == {
+        "event": "oauth_cache_reset",
+        "credential": "music",
+        "reason": "reload",
+    }
     await rig.refused()
     assert rig.calls == 2
 
@@ -1095,7 +1100,13 @@ async def test_a_live_slot_and_a_seed(
     pol = make_policy(spotify_cred(refresh_token="env:MUSIC_REFRESH", reseed=reseed))
     rig = Rig(tmp_path, clock, server, pol, env={"MUSIC_REFRESH": seed})
     value = encode_envelope(Secret(live), seed_sha256(first_seed))
-    meta = {"oauth": {"rotations": 7, "consented_at": "2026-01-01T00:00:00Z"}}
+    meta = {
+        "oauth": {
+            "rotations": 7,
+            "consented_at": "2026-01-01T00:00:00Z",
+            "refresh_expires_at": "2027-01-01T00:00:00Z",
+        }
+    }
     rig.store.put(live_slot("music"), value.reveal(), oauth_binding(TOKEN_URL, [API]), meta=meta)
     await rig.grant()
     entry = rig.store.entry(live_slot("music"))
@@ -1106,10 +1117,13 @@ async def test_a_live_slot_and_a_seed(
         assert entry.meta["oauth"]["source"] == "seed"
         assert entry.meta["oauth"]["rotations"] == 1
         assert entry.meta["oauth"]["consented_at"] is None
+        # Nothing of the old grant is carried into the new one.
+        assert entry.meta["oauth"]["refresh_expires_at"] is None
     else:
         assert entry.meta["oauth"]["source"] == "rotation"
         assert entry.meta["oauth"]["rotations"] == 8
         assert entry.meta["oauth"]["consented_at"] == "2026-01-01T00:00:00Z"
+        assert entry.meta["oauth"]["refresh_expires_at"] == "2027-01-01T00:00:00Z"
     expected = live if presented == "live" else seed
     assert server.refresh_calls[0].refresh_token == expected
     line = captured.events("oauth_refresh")[0]
@@ -1194,6 +1208,7 @@ async def test_a_seed_that_is_not_a_valid_token_is_refused(
     refused = await rig.refused()
     assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "seed_unusable")
     assert rig.calls == 0
+    assert rig.status()["state"] == "terminal"
 
 
 async def test_a_seed_without_a_route_to_bind_is_refused(tmp_path: Path, clock: FakeClock) -> None:
@@ -1205,6 +1220,7 @@ async def test_a_seed_without_a_route_to_bind_is_refused(tmp_path: Path, clock: 
     refused = await rig.refused()
     assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "no_route")
     assert rig.calls == 0
+    assert rig.status()["state"] == "terminal"
 
 
 async def test_a_tampered_store_entry_is_unusable(tmp_path: Path, clock: FakeClock) -> None:
@@ -1236,7 +1252,8 @@ async def test_a_route_outside_the_anchor_binding_gets_nothing(
     grant = await rig.grant()
     assert grant.resources == frozenset({API_ORIGIN})
     # With a cached token, the token's own resources refuse it.
-    assert (await rig.refused(upstream=OTHER)).reason == "route_not_bound"
+    refused = await rig.refused(upstream=OTHER)
+    assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "route_not_bound")
     clock.advance(3600 - 120)
     assert (await rig.refused(upstream=OTHER)).reason == "route_not_bound"
     assert rig.calls == 1
@@ -1439,7 +1456,9 @@ async def test_replace_secret_waits_for_the_refresh_in_flight(
     assert captured.events("oauth_cache_reset")[-1]["reason"] == "secret_set"
 
 
-async def test_forget_waits_for_the_refresh_in_flight(tmp_path: Path, clock: FakeClock) -> None:
+async def test_forget_waits_for_the_refresh_in_flight(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
     rig = spotify_rig(tmp_path, clock)
     rig.seed()
     gate = rig.server.hold()
@@ -1454,6 +1473,9 @@ async def test_forget_waits_for_the_refresh_in_flight(tmp_path: Path, clock: Fak
     assert await writer is True
     assert rig.store.entry("music-refresh") is None
     assert rig.manager._cache == {}
+    assert [without_ts(e) for e in captured.events("oauth_cache_reset")] == [
+        {"event": "oauth_cache_reset", "credential": "music", "reason": "secret_delete"}
+    ]
     assert await rig.manager.forget("music-refresh") is False
 
 
@@ -1700,6 +1722,7 @@ async def test_client_credentials_unavailable_secret(tmp_path: Path, clock: Fake
     refused = await rig.refused("svc")
     assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "client_secret_unavailable")
     assert rig.calls == 0
+    assert rig.status()["state"] == "terminal"
 
 
 async def test_client_credentials_outside_the_binding(tmp_path: Path, clock: FakeClock) -> None:
@@ -1753,6 +1776,7 @@ async def test_a_request_that_cannot_be_built_is_misconfigured(
     refused = await rig.refused()
     assert (refused.code, refused.reason) == (OAUTH_MISCONFIGURED, "request")
     assert rig.calls == 0
+    assert rig.status()["state"] == "terminal"
 
 
 # --- health and meta (B.3) ---------------------------------------------------------------------
@@ -2013,7 +2037,8 @@ async def test_aclose_saves_a_dirty_store(
 async def test_aclose_with_nothing_to_do(tmp_path: Path, clock: FakeClock) -> None:
     rig = spotify_rig(tmp_path, clock)
     await rig.manager.aclose()
-    assert (await rig.refused()).reason == "no_grant"
+    refused = await rig.refused()
+    assert (refused.code, refused.reason) == (OAUTH_UNAVAILABLE, "no_grant")
 
 
 async def test_the_scrub_set(tmp_path: Path, clock: FakeClock) -> None:
@@ -2052,7 +2077,12 @@ async def test_an_internal_error_never_escapes_the_task(
     rig.seed()
     refused = await rig.refused()
     assert (refused.code, refused.reason) == (OAUTH_UNAVAILABLE, "internal_error")
-    assert captured.events("oauth_refresh_error")[0]["error_type"] == "RuntimeError"
+    assert [without_ts(e) for e in captured.events("oauth_refresh_error")] == [
+        {"event": "oauth_refresh_error", "credential": "music", "error_type": "RuntimeError"}
+    ]
+    # An internal error is transient: it backs off, it doesn't stop the credential.
+    assert rig.status()["state"] == "backoff"
+    assert captured.events("oauth_backoff")[0]["credential"] == "music"
     assert rig.manager._slots["music-refresh"].task is None
 
 
@@ -2338,6 +2368,7 @@ async def test_a_refresh_grant_without_a_refresh_token_makes_no_call(
     assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "no_token")
     assert rig.calls == 0
     assert rig.status()["slot"] == "oauth.music.live"
+    assert rig.status()["state"] == "terminal"
 
 
 async def test_a_first_rotation_records_no_consent(tmp_path: Path, clock: FakeClock) -> None:
@@ -2569,8 +2600,10 @@ async def test_client_credentials_that_cannot_be_built(tmp_path: Path, clock: Fa
         "extra_params": {"grant_type": "other"},
     }
     rig = Rig(tmp_path, clock, server, make_policy(cred, name="svc"), env={"CC_SECRET": "fake-x"})
-    assert (await rig.refused("svc")).reason == "request"
+    refused = await rig.refused("svc")
+    assert (refused.code, refused.reason) == (OAUTH_MISCONFIGURED, "request")
     assert rig.calls == 0
+    assert rig.status()["state"] == "terminal"
 
 
 async def test_client_credentials_with_an_unavailable_client_id(
@@ -2935,7 +2968,9 @@ async def test_a_failed_health_write_keeps_the_outcome(
     refused = await rig.refused()
     assert refused.code == OAUTH_RECONSENT_NEEDED
     failed = captured.events("oauth_persist_failed")
-    assert [(f["slot"], f["level"]) for f in failed] == [("music-refresh", "error")]
+    assert [(f["slot"], f["level"], f["error_type"]) for f in failed] == [
+        ("music-refresh", "error", "StoreWriteError")
+    ]
     assert captured.events("oauth_refresh_error") == []
     assert captured.events("oauth_refresh")[-1]["code"] == OAUTH_RECONSENT_NEEDED
     assert rig.status()["state"] == "terminal"
@@ -3184,3 +3219,267 @@ async def test_a_login_commit_says_whether_an_env_seed_is_set(
             rebind=False,
         )
         assert result.seed_present is present
+
+
+# --- gaps found by mutation testing ------------------------------------------------------------
+
+
+async def test_a_reload_without_changes_keeps_every_credential(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = Rig(tmp_path, clock, google_style(clock.time), shared_secret_policy())
+    assert rig.manager.configure(rig.policy, {}) == []
+    assert [s["credential"] for s in rig.manager.status()] == ["cal", "music"]
+
+
+async def test_routes_of_other_credentials_bind_nothing(tmp_path: Path, clock: FakeClock) -> None:
+    routes = [
+        {
+            "name": name,
+            "prefix": f"/{name}",
+            "upstream": upstream,
+            "credential": name,
+            "callers": [{"placeholder": f"ph-{name}-direct-000001"}],
+            "rules": [{"methods": ["GET"], "paths": ["/**"]}],
+        }
+        for name, upstream in (("svc", API), ("music", OTHER))
+    ]
+    credentials = {
+        "svc": {
+            "kind": "oauth2",
+            "token_url": TOKEN_URL,
+            "client_id": "app-cc",
+            "client_secret": "env:CC_SECRET",
+            "grant": "client_credentials",
+        },
+        "music": {"kind": "oauth2", "token_url": TOKEN_URL, **spotify_cred()},
+    }
+    pol = Policy.model_validate({**BASE, "routes": routes, "credentials": credentials})
+    server = FakeAuthServer(clock.time, client_id="app-cc", client_secret="fake-cc-secret")
+    rig = Rig(tmp_path, clock, server, pol, env={"CC_SECRET": "fake-cc-secret"})
+    refused = await rig.refused("svc", OTHER)
+    assert (refused.code, refused.reason) == (CREDENTIAL_UNAVAILABLE, "route_not_bound")
+    assert rig.calls == 0
+    assert (await rig.grant("svc", API)).resources == frozenset({API_ORIGIN})
+
+
+async def test_a_changed_credential_drops_its_cached_token(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    rig.seed()
+    first = await rig.grant()
+    rig.manager.configure(make_policy(spotify_cred(refresh_skew=60)), {})
+    second = await rig.grant()
+    assert rig.calls == 2
+    assert second.token.reveal() != first.token.reveal()
+
+
+async def test_a_refresh_task_is_named_after_its_credential(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    rig.seed()
+    gate = rig.server.hold()
+    waiter = asyncio.create_task(rig.grant())
+    await rig.server.arrived()
+    task = rig.manager._slots["music-refresh"].task
+    assert task is not None
+    assert task.get_name() == "oauth-refresh:music"
+    gate.set()
+    await waiter
+
+
+async def test_a_refusal_before_sending_is_logged(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    await rig.refused()
+    assert without_ts(captured.events("oauth_refresh")[0]) == {
+        "event": "oauth_refresh",
+        "credential": "music",
+        "slot": "music-refresh",
+        "grant": "refresh_token",
+        "trigger": "first_use",
+        "token_source": None,
+        "reason": "no_token",
+        "attempt": 0,
+        "replayed": False,
+        "http_status": None,
+        "outcome": "terminal",
+        "code": CREDENTIAL_UNAVAILABLE,
+        "error": None,
+        "error_subtype": None,
+        "failure_reason": "no_token",
+        "rotated": False,
+        "rotates": True,
+        "expires_in": None,
+        "lifetime": None,
+        "lifetime_clamped": False,
+        "skew": None,
+        "scope_status": None,
+        "notes": [],
+        "duration_ms": 0.0,
+    }
+
+
+async def test_a_client_credentials_invalid_grant_is_a_rejected_client(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    transport, _ = raising(httpx.Response(400, json={"error": "invalid_grant"}))
+    cred = {"client_id": "app-cc", "client_secret": "env:CC_SECRET", "grant": "client_credentials"}
+    rig = Rig(
+        tmp_path,
+        clock,
+        FakeAuthServer(clock.time, client_id="app-cc"),
+        make_policy(cred, name="svc"),
+        env={"CC_SECRET": "fake-cc-secret"},
+        transport=transport,
+    )
+    refused = await rig.refused("svc")
+    assert (refused.code, refused.reason) == (OAUTH_CLIENT_REJECTED, "provider_error")
+
+
+async def test_a_first_failure_is_written_to_the_meta(tmp_path: Path, clock: FakeClock) -> None:
+    rig = google_rig(tmp_path, clock)
+    rig.seed()
+    rig.server.revoke()
+    await rig.refused()
+    entry = rig.store.entry("music-refresh")
+    assert entry is not None
+    assert entry.meta is not None
+    assert entry.meta["oauth"]["last_error"] == {
+        "code": OAUTH_RECONSENT_NEEDED,
+        "error": "invalid_grant",
+        "at": "2026-10-17T09:00:00Z",
+    }
+
+
+async def test_an_unexpected_scope_on_refresh_is_logged(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = spotify_rig(tmp_path, clock, scope="user-top-read")
+    rig.server.granted_scopes = ("user-top-read", "playlist-modify-private")
+    rig.seed()
+    await rig.grant()
+    assert [without_ts(e) for e in captured.events("oauth_scope_unexpected")] == [
+        {
+            "event": "oauth_scope_unexpected",
+            "credential": "music",
+            "scopes": ["playlist-modify-private"],
+            "at": "refresh",
+        }
+    ]
+
+
+async def test_the_backoff_line_rounds_to_milliseconds(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    rig.jitter = 1.0123456
+    rig.seed()
+    rig.server.fail_next(1, 503)
+    await rig.refused()
+    assert captured.events("oauth_backoff")[0]["retry_in"] == 5.062
+
+
+async def test_the_error_subtype_is_logged(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    body = {"error": "invalid_grant", "error_subtype": "invalid_rapt"}
+    transport, _ = raising(httpx.Response(400, json=body))
+    rig = Rig(
+        tmp_path, clock, google_style(clock.time), make_policy(google_cred()), transport=transport
+    )
+    rig.put_client_secret()
+    rig.seed()
+    await rig.refused()
+    line = captured.events("oauth_refresh")[0]
+    assert (line["error"], line["error_subtype"]) == ("invalid_grant", "invalid_rapt")
+
+
+async def test_the_logged_skew_is_whole_seconds(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    rig.server.expires_in = 61
+    rig.seed()
+    await rig.grant()
+    line = captured.events("oauth_refresh")[0]
+    assert (line["lifetime"], line["skew"]) == (61, 30)
+
+
+async def test_the_duration_keeps_a_tenth_of_a_millisecond(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        clock.advance(0.01234)
+        return ok_response()
+
+    rig = Rig(
+        tmp_path,
+        clock,
+        spotify_style(clock.time),
+        make_policy(spotify_cred()),
+        transport=httpx.MockTransport(handler),
+    )
+    rig.seed()
+    await rig.grant()
+    assert captured.events("oauth_refresh")[0]["duration_ms"] == 12.3
+
+
+async def test_commit_login_details(
+    tmp_path: Path, clock: FakeClock, captured: Captured, writes: FailingWrites
+) -> None:
+    rig = spotify_rig(tmp_path, clock, scope="a,b", scope_separator=",")
+    with pytest.raises(ValueError, match=r"^not a valid refresh token$"):
+        await rig.manager.commit_login(
+            "music",
+            refresh_token=Secret(" fake-padded "),
+            minted=minted(),
+            sent_at=clock.mono,
+            rebind=False,
+        )
+    result = await rig.manager.commit_login(
+        "music",
+        refresh_token=Secret("fake-rt-login"),
+        minted=minted(scope=None),
+        sent_at=clock.mono,
+        rebind=False,
+    )
+    assert result.granted_scopes == ("a", "b")
+    entry = rig.store.entry("music-refresh")
+    assert entry is not None
+    assert entry.meta == {
+        "oauth": {
+            "credential": "music",
+            "source": "login",
+            "consented_at": "2026-10-17T09:00:00Z",
+            "rotations": 0,
+            "last_ok": "2026-10-17T09:00:00Z",
+            "last_error": None,
+            "granted_scope": None,
+            "refresh_expires_at": "2026-10-18T09:00:00Z",
+        }
+    }
+    assert [without_ts(e) for e in captured.events("oauth_cache_reset")] == [
+        {"event": "oauth_cache_reset", "credential": "music", "reason": "login"}
+    ]
+    writes.failing = True
+    result = await rig.manager.commit_login(
+        "music",
+        refresh_token=Secret("fake-rt-login-2"),
+        minted=minted(),
+        sent_at=clock.mono,
+        rebind=False,
+    )
+    assert result.persisted is False
+    assert [without_ts(e) for e in captured.events("oauth_persist_failed")] == [
+        {
+            "event": "oauth_persist_failed",
+            "credential": "music",
+            "slot": "music-refresh",
+            "error_type": "StoreWriteError",
+            "level": "critical",
+        }
+    ]

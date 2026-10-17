@@ -1567,3 +1567,91 @@ async def test_an_authorization_request_the_policy_cannot_build(
     assert (refused.reason, str(refused)) == ("authorize_misconfigured", message)
     # The flow it started is gone again.
     assert len(rig.login._flows) == 0
+
+
+# --- gaps found by mutation testing ------------------------------------------------------------
+
+
+async def test_a_changed_live_slot_binding_needs_rebind(tmp_path: Path, clock: FakeClock) -> None:
+    rig = Rig(tmp_path, clock, make_policy({"music": spotify(refresh_token="env:MUSIC_REFRESH")}))
+    rig.store.put(live_slot("music"), "fake-envelope", OTHER_BINDING)
+    refused = await rig.refused(rig.start())
+    assert refused.reason == "binding_changed"
+    assert refused.details == {"old": OTHER_BINDING, "new": BINDING}
+
+
+async def test_a_client_secret_removed_since_start(tmp_path: Path, clock: FakeClock) -> None:
+    rig = google_rig(tmp_path, clock)
+    flow, pasted = await rig.approved()
+    rig.store.delete("google-secret")
+    refused = await rig.refused(rig.login.complete("music", flow, pasted))
+    assert refused.reason == "client_secret_unavailable"
+    assert str(refused) == (
+        "the client secret isn't set or isn't bound to the token endpoint; "
+        "enter the client secret with zoeymcp secret set google-secret"
+    )
+    assert rig.server.calls == []
+
+
+async def test_a_test_fetch_logs_unexpected_scopes(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = machine_rig(tmp_path, clock, expected_scopes=["read"])
+    await rig.start()
+    assert [
+        {k: v for k, v in e.items() if k != "ts"} for e in captured.events("oauth_scope_unexpected")
+    ] == [
+        {
+            "event": "oauth_scope_unexpected",
+            "credential": "music",
+            "scopes": ["write"],
+            "at": "login",
+        }
+    ]
+
+
+async def test_a_retry_date_at_the_exchange_does_not_crash(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    # Login never shows the parsed date; this pins the whole refusal around it.
+    retry = httpx.Response(503, headers={"retry-after": "Sat, 17 Oct 2026 09:01:00 GMT"})
+    transport, _ = raising(retry)
+    rig = Rig(tmp_path, clock, make_policy({"music": spotify()}), transport=transport)
+    flow, pasted = await rig.approved()
+    refused = await rig.refused(rig.login.complete("music", flow, pasted))
+    assert refused.reason == f"exchange_failed:{OAUTH_UNAVAILABLE}"
+    assert str(refused) == "the token endpoint refused: http_status (HTTP 503)"
+    assert refused.details == {"provider_error": None}
+
+
+async def test_an_exchange_line_has_the_error_subtype(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    body = {"error": "invalid_grant", "error_subtype": "invalid_rapt"}
+    transport, _ = raising(httpx.Response(400, json=body))
+    rig = Rig(tmp_path, clock, make_policy({"music": spotify()}), transport=transport)
+    flow, pasted = await rig.approved()
+    await rig.refused(rig.login.complete("music", flow, pasted))
+    [call] = captured.events("oauth_refresh")
+    assert (call["error"], call["error_subtype"]) == ("invalid_grant", "invalid_rapt")
+
+
+async def test_an_exchange_line_keeps_a_tenth_of_a_millisecond(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        clock.advance(0.01234)
+        body = {
+            "access_token": "fake-at-login",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "fake-rt-login",
+        }
+        return httpx.Response(200, json=body)
+
+    transport = httpx.MockTransport(handler)
+    rig = Rig(tmp_path, clock, make_policy({"music": spotify()}), transport=transport)
+    flow, pasted = await rig.approved()
+    await rig.login.complete("music", flow, pasted)
+    [call] = captured.events("oauth_refresh")
+    assert call["duration_ms"] == 12.3

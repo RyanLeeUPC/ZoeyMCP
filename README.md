@@ -4,9 +4,20 @@ A self-hosted proxy that lets AI agents use outside APIs and MCP servers **witho
 real credential**, and that asks a human to approve the **exact arguments** of every consequential
 action.
 
-> **Not ready for use.** Early development: the vault works on its own, but the gateway,
-> approvals, OAuth and the admin portal don't exist yet, and nothing has been reviewed or
-> released. Don't deploy it. See [docs/design.md](docs/design.md) for where it's going.
+> **Not ready for use.** Early development: the vault works on its own, OAuth included, but the
+> gateway, approvals and the admin portal don't exist yet, and nothing has been reviewed or
+> released. Don't deploy it. See [docs/design.md](docs/design.md) for where it's going, and
+> [docs/operations.md](docs/operations.md) for running what exists.
+
+Built so far:
+
+- **M1, the vault core:** routes with default-deny method and path rules, header, query, path and
+  basic credentials, an encrypted store whose secrets are bound to their origins, the local admin
+  socket, the hardened compose, and `selftest`.
+- **M2, OAuth:** refresh with single-flight and backoff; every new refresh token saved before it
+  is used, so rotating tokens survive; env seeds promoted to a live token in the store;
+  `zoeymcp login` (PKCE, by pasting the redirected address), `oauth status` and `oauth reset`;
+  stable error codes for callers; profiles for Google and Spotify.
 
 ## What it does
 
