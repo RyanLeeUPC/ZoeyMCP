@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.17"
+
+jobs:
+  lint:
+    name: lint and types
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --locked --python 3.13
+      - run: uv run --locked ruff check src tests
+      - run: uv run --locked ruff format --check src tests
+      - run: uv run --locked mypy
+
+  test:
+    name: tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --locked --python ${{ matrix.python }}
+      - run: uv run --locked pytest
+
+  identity-guard:
+    name: identity guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check files and history against the denylist
+        env:
+          DENYLIST: ${{ secrets.IDENTITY_DENYLIST }}
+        run: |
+          if [ -z "$DENYLIST" ]; then
+            echo "::warning::IDENTITY_DENYLIST is not set, so the identity check was skipped"
+            exit 0
+          fi
+          pat="$(mktemp)"
+          printf '%s\n' "$DENYLIST" | tr -d '\r' | grep -v '^[[:space:]]*$' > "$pat"
+          while IFS= read -r entry; do echo "::add-mask::$entry"; done < "$pat"
+          fail=0
+          for commit in $(git rev-list --all); do
+            if git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$commit" | grep -qiF -f "$pat"; then
+              echo "::error::commit $commit: author, committer or message has a denied string"
+              fail=1
+            fi
+            if git grep -qiF -f "$pat" "$commit" -- .; then
+              echo "::error::commit $commit: a file has a denied string"
+              fail=1
+            fi
+          done
+          if git ls-tree -r --name-only HEAD | grep -qiF -f "$pat"; then
+            echo "::error::a file name has a denied string"
+            fail=1
+          fi
+          rm -f "$pat"
+          exit "$fail"

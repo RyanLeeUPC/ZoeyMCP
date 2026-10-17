@@ -1,0 +1,1 @@
+"""The ``zoeymcp`` command line."""

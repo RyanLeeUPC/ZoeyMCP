@@ -31,6 +31,21 @@ action.
 
 Built for one operator running a few agents. Multi-tenant features and SSO are non-goals.
 
+## Development
+
+Requires [uv](https://docs.astral.sh/uv/). Dependencies are locked with hashes in `uv.lock`, and
+resolution ignores releases newer than the `exclude-newer` date in `pyproject.toml` (a
+supply-chain cooldown, moved forward deliberately).
+
+```sh
+uv sync --locked
+uv run pytest                    # tests, including property tests
+uv run ruff check src tests      # lint
+uv run ruff format src tests     # format
+uv run mypy                      # strict type checks
+uv run zoeymcp check --config examples/policy.yaml
+```
+
 ## License
 
 [Apache License 2.0](LICENSE)

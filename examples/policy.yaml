@@ -1,0 +1,113 @@
+# An example policy (design §9). Every name and address here is made up.
+# Validate it with:  zoeymcp check --config examples/policy.yaml
+#
+# Secrets never appear in a policy, only references: store:<name> for the vault's encrypted
+# store, or env:<VAR>. The review pins below are illustrative; real ones come from
+# `zoeymcp review` or the portal's review screen.
+
+version: 1
+mode: declarative
+gateway_key_generation: 1
+
+admin:
+  listen: 0.0.0.0:8081
+  hosts: [localhost, 127.0.0.1, zoeymcp.tailnet.example]
+
+credentials:
+  music-stats:
+    kind: query
+    param: api_key
+    secret: store:music-stats
+  broker-mcp:
+    kind: oauth2
+    token_url: https://auth.broker.example/oauth/token
+    client_id: store:broker-client-id
+    refresh_token: store:broker-refresh # rotated in place in the store
+    rotates: true
+    extra_params:
+      resource: https://mcp.broker.example/
+    expected_scopes: [read, trade]
+
+connectors:
+  mail-out:
+    kind: smtp
+    host: smtp.mail.example
+    port: 465
+    username: store:mail-user
+    password: store:mail-pass # bound to host, port, from and to
+    from: "Agent <agent@mail.example>"
+    to: [partner@mail.example]
+    max_per_day: 20
+
+routes:
+  - name: stats # a direct route for a sandbox script
+    prefix: /stats
+    upstream: https://api.stats.example
+    credential: music-stats
+    callers:
+      - placeholder: ph-agent1-stats-4c1f9b27
+    query:
+      force: { user: alice }
+      strip: [api_key]
+    rules:
+      - methods: [GET]
+        paths: [/2.0/**]
+
+  - name: broker-mcp
+    prefix: /broker
+    upstream: https://mcp.broker.example
+    credential: broker-mcp
+    callers: [gateway] # the gateway only
+    stream: true
+    rules:
+      - methods: [GET, POST, DELETE]
+        paths: [/mcp]
+
+  - name: mail-send
+    prefix: /mail
+    connector: mail-out
+    callers: [gateway]
+    rules:
+      - methods: [GET]
+        paths: [/config]
+      - methods: [POST]
+        paths: [/send]
+
+gateway:
+  clients:
+    agent1:
+      token: ph-agent1-gw-8e2d6a51c3b7
+      servers: [broker-read, broker-trade, mail]
+
+  approvals:
+    approver: elicitation
+    timeout: 300
+    budget_chars: 3000
+
+  servers:
+    broker-read:
+      kind: remote
+      route: broker-mcp
+      path: /mcp
+      tools:
+        include: [get_quote, list_positions]
+        allow: [get_quote, list_positions]
+      review:
+        get_quote: sha256:f38bdb5361113171a5d49e2806e5e89fb9e1572c270a33d42c377b4447c30538
+        list_positions: sha256:2af456c008eb20c98470ebb4f890f9d248ca9451f2367ff8f1022d701d753cce
+
+    broker-trade:
+      kind: remote
+      route: broker-mcp
+      path: /mcp
+      tools:
+        include: [place_order, cancel_order]
+        approve: [place_order, cancel_order]
+      review:
+        place_order: sha256:f317bc9db239b40a77b4c454dd6dae362008d39485fcb2359844c73cd998ef97
+        cancel_order: sha256:26c3ac15931603b2f20397630050036633fd11d56ea08bd91e52895e92313ac7
+      on_drift: fail
+
+    mail:
+      kind: toolkit
+      module: my_toolkits.mail
