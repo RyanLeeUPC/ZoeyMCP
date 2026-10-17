@@ -82,3 +82,16 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
         main(["--version"])
     assert info.value.code == 0
     assert capsys.readouterr().out.startswith("zoeymcp ")
+
+
+def test_keygen_prints_a_matching_pair() -> None:
+    from zoeymcp.vault.keys import KeySet
+
+    code, out = run(["keygen"])
+    assert code == EXIT_OK
+    lines = dict(line.split("=", 1) for line in out.splitlines())
+    assert set(lines) == {"ZOEYMCP_MASTER_KEY", "ZOEYMCP_GATEWAY_KEY"}
+    assert (
+        KeySet.from_text(lines["ZOEYMCP_MASTER_KEY"]).gateway_key(1) == lines["ZOEYMCP_GATEWAY_KEY"]
+    )
+    assert run(["keygen"])[1] != out

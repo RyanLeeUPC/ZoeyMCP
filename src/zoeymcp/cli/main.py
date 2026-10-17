@@ -1,4 +1,4 @@
-"""``zoeymcp`` entry point. M0 has one command: ``check``."""
+"""``zoeymcp`` entry point."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from ..common.policy import (
     parse_policy,
     read_source,
 )
+from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
 
 EXIT_OK = 0
 EXIT_FINDINGS = 1
@@ -46,7 +47,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also fail if an env: secret reference names a variable that isn't set",
     )
+    commands.add_parser(
+        "keygen",
+        help="print a new master key and its generation-1 gateway key",
+        description=(
+            "Print a new ZOEYMCP_MASTER_KEY and the matching generation-1 ZOEYMCP_GATEWAY_KEY. "
+            "Set them as deployment secrets; nothing is written to disk."
+        ),
+    )
     return parser
+
+
+def _cmd_keygen(out: TextIO) -> int:
+    master = generate_master_key()
+    keys = KeySet.from_text(master)
+    out.write(f"{MASTER_KEY_ENV}={master}\n")
+    out.write(f"ZOEYMCP_GATEWAY_KEY={keys.gateway_key(1)}\n")
+    return EXIT_OK
 
 
 def _report(
@@ -93,6 +110,8 @@ def main(
     args = _build_parser().parse_args(argv)
     if args.command == "check":
         return _cmd_check(args, stdin or sys.stdin, out or sys.stdout)
+    if args.command == "keygen":
+        return _cmd_keygen(out or sys.stdout)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 

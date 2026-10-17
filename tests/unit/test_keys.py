@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import base64
+
+import pytest
+
+from zoeymcp.vault.keys import (
+    CONTEXT_CONFIG,
+    CONTEXT_KEY_ID,
+    CONTEXT_STORE,
+    KeySet,
+    MasterKeyError,
+    derive,
+    generate_master_key,
+    parse_master_key,
+)
+
+MASTER = bytes(range(32))
+MASTER_TEXT = base64.urlsafe_b64encode(MASTER).rstrip(b"=").decode()
+
+
+def test_generated_keys_parse_and_differ() -> None:
+    first, second = generate_master_key(), generate_master_key()
+    assert first != second
+    assert len(parse_master_key(first)) == 32
+    assert len(first) == 43
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("", "empty"),
+        (" " + MASTER_TEXT, "whitespace"),
+        (MASTER_TEXT + "\n", "whitespace"),
+        (MASTER_TEXT + "=", "without padding"),
+        (base64.b64encode(MASTER).decode(), "without padding"),
+        (base64.urlsafe_b64encode(bytes(16)).rstrip(b"=").decode(), "must be 32 bytes"),
+        ("!" * 43, "isn't valid base64url"),
+        (MASTER_TEXT[:-1] + "B", "canonical"),
+    ],
+)
+def test_bad_master_keys(text: str, message: str) -> None:
+    with pytest.raises(MasterKeyError, match=message):
+        parse_master_key(text)
+
+
+def test_contexts_give_independent_keys() -> None:
+    keys = KeySet.from_text(MASTER_TEXT)
+    derived = {
+        keys.store_key,
+        keys.config_key,
+        bytes.fromhex(keys.key_id),
+        keys.gateway_key(1).encode(),
+        keys.gateway_key(2).encode(),
+    }
+    assert len(derived) == 5
+    assert MASTER not in derived
+    assert keys.store_key == derive(MASTER, CONTEXT_STORE)
+    assert keys.config_key == derive(MASTER, CONTEXT_CONFIG)
+    assert keys.key_id == derive(MASTER, CONTEXT_KEY_ID, 8).hex()
+
+
+def test_derivation_is_deterministic_and_key_specific() -> None:
+    assert KeySet.from_master(MASTER).gateway_key(1) == KeySet.from_master(MASTER).gateway_key(1)
+    other = KeySet.from_master(bytes(32))
+    assert other.key_id != KeySet.from_master(MASTER).key_id
+    assert other.gateway_key(1) != KeySet.from_master(MASTER).gateway_key(1)
+
+
+def test_gateway_key_format() -> None:
+    key = KeySet.from_master(MASTER).gateway_key(3)
+    assert key.startswith("zgw1-")
+    assert len(base64.urlsafe_b64decode(key[5:] + "=")) == 32
+    with pytest.raises(ValueError, match="start at 1"):
+        KeySet.from_master(MASTER).gateway_key(0)
+
+
+def test_repr_hides_key_material() -> None:
+    text = repr(KeySet.from_master(MASTER))
+    assert MASTER.hex() not in text
+    assert "store_key" not in text
+    assert "key_id=" in text
