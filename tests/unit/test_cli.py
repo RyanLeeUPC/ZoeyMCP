@@ -486,6 +486,16 @@ def test_read_redirect_url() -> None:
         admin_client.read_redirect_url(io.StringIO(""), "> ")
 
 
+def test_secret_set_and_delete_wait_for_a_refresh_in_flight(admin: FakeAdmin) -> None:
+    admin.answers[("PUT", "/secrets/music-secret")] = (200, {"name": "music-secret"})
+    admin.answers[("DELETE", "/secrets/music-secret")] = (200, {"deleted": True})
+    admin_client.secret_set("x", "music-secret", "value", None)
+    admin_client.secret_delete("x", "music-secret")
+    # The vault may wait for a refresh of a credential that uses the secret.
+    assert admin.timeouts == [56.0, 56.0]
+    assert admin_client.SECRET_TIMEOUT == 41.0 + 15
+
+
 def test_the_admin_timeout_defaults_to_10_s(admin: FakeAdmin) -> None:
     admin.answers[("GET", "/oauth")] = (200, {"credentials": []})
     admin.answers[("POST", "/oauth/music/reset")] = (200, {"credential": "music", "reset": True})

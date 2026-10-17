@@ -21,6 +21,8 @@ DEFAULT_TIMEOUT: Final = 10.0
 # A login may wait for the code exchange, then for a refresh of the slot already in flight
 # (commit waits for it before storing), plus time to answer.
 LOGIN_TIMEOUT: Final = EXCHANGE_DEADLINE + REFRESH_BUDGET + 15
+# Setting or deleting a secret an OAuth credential uses waits for its refresh in flight.
+SECRET_TIMEOUT: Final = REFRESH_BUDGET + 15
 
 
 class AdminUnavailable(Exception):
@@ -109,7 +111,7 @@ def secret_set(
     body: dict[str, Any] = {"value": value}
     if origins:
         body["origins"] = origins
-    return _request(socket, "PUT", f"/secrets/{name}", body, transport)
+    return _request(socket, "PUT", f"/secrets/{name}", body, transport, SECRET_TIMEOUT)
 
 
 def secret_list(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
@@ -119,7 +121,9 @@ def secret_list(socket: str, transport: httpx.BaseTransport | None = None) -> di
 def secret_delete(
     socket: str, name: str, transport: httpx.BaseTransport | None = None
 ) -> dict[str, Any]:
-    return _request(socket, "DELETE", f"/secrets/{name}", transport=transport)
+    return _request(
+        socket, "DELETE", f"/secrets/{name}", transport=transport, timeout=SECRET_TIMEOUT
+    )
 
 
 def setup_code(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
