@@ -39,5 +39,12 @@ jobs:
       - run: uv run --locked mutmut export-cicd-stats
       - name: Surviving mutants
         run: uv run --locked mutmut results
+      - name: Diffs of surviving mutants
+        run: |
+          uv run --locked mutmut results | awk -F: '/: survived$/ {gsub(/ /, "", $1); print $1}' > survivors.txt
+          while read -r name; do
+            echo "=== $name"
+            uv run --locked mutmut show "$name"
+          done < survivors.txt
       - name: Gate
         run: uv run --locked python scripts/mutation-gate.py mutants/mutmut-cicd-stats.json --min-score 0
