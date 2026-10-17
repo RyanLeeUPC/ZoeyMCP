@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TextIO
 
 from .. import __version__
@@ -55,7 +56,34 @@ def _build_parser() -> argparse.ArgumentParser:
             "Set them as deployment secrets; nothing is written to disk."
         ),
     )
+    vault = commands.add_parser(
+        "vault",
+        help="run the vault",
+        description=(
+            "Run the vault: the only role that holds secrets. Needs ZOEYMCP_MASTER_KEY, and a "
+            f"policy from --config <file>, --config - or ${CONFIG_ENV}."
+        ),
+    )
+    vault.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
+    vault.add_argument(
+        "--listen",
+        action="append",
+        metavar="HOST:PORT",
+        help="address to listen on (repeatable; default 0.0.0.0:8080)",
+    )
+    vault.add_argument("--state", default="/state", metavar="DIR", help="state directory")
     return parser
+
+
+def _cmd_vault(args: argparse.Namespace, out: TextIO) -> int:
+    from ..vault.server import StartupError, run
+
+    try:
+        run(args.config, args.listen or ["0.0.0.0:8080"], Path(args.state), os.environ)
+    except StartupError as exc:
+        out.write(f"zoeymcp vault: {exc}\n")
+        return EXIT_UNREADABLE
+    return EXIT_OK
 
 
 def _cmd_keygen(out: TextIO) -> int:
@@ -112,6 +140,8 @@ def main(
         return _cmd_check(args, stdin or sys.stdin, out or sys.stdout)
     if args.command == "keygen":
         return _cmd_keygen(out or sys.stdout)
+    if args.command == "vault":
+        return _cmd_vault(args, out or sys.stderr)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 

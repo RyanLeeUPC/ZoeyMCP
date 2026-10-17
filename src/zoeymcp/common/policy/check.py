@@ -28,6 +28,18 @@ from .schema import (
 )
 
 MIN_TOKEN_LENGTH = 16
+_RESERVED_HEADERS = frozenset(
+    {
+        "authorization",
+        "host",
+        "cookie",
+        "content-length",
+        "content-type",
+        "connection",
+        "transfer-encoding",
+        "proxy-authorization",
+    }
+)
 
 
 class _Report:
@@ -199,6 +211,14 @@ def _check_route_callers(path: str, route: Route, is_mcp: bool, report: _Report)
         )
     if route.callers.count("gateway") > 1:
         report.warning(f"{path}.callers", "gateway listed more than once")
+    for index, caller in enumerate(route.callers):
+        if isinstance(caller, PlaceholderCaller) and caller.header is not None:
+            name = caller.header.lower()
+            if name in _RESERVED_HEADERS or name.startswith("x-zoeymcp-"):
+                report.error(
+                    f"{path}.callers[{index}].header",
+                    f"{caller.header!r} is reserved; omit header: to use Authorization: Bearer",
+                )
 
 
 def _check_route_rules(path: str, route: Route, report: _Report) -> None:

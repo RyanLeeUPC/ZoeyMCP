@@ -270,8 +270,19 @@ class SMTPConnector(_Model):
 
 
 class PlaceholderCaller(_Model):
+    """A caller identified by a placeholder: in ``Authorization: Bearer`` by default, or in a
+    named header or query parameter (``header:`` / ``query:``)."""
+
     placeholder: Token
+    header: HeaderName | None = None
+    query: QueryParam | None = None
     sources: list[Network] = []
+
+    @model_validator(mode="after")
+    def _one_location(self) -> PlaceholderCaller:
+        if self.header is not None and self.query is not None:
+            raise ValueError("a placeholder is read from a header or a query parameter, not both")
+        return self
 
     @field_validator("sources")
     @classmethod

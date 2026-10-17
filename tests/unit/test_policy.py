@@ -325,6 +325,18 @@ def test_check_warnings(example_raw: Raw, mutate: Callable[[Raw], object], expec
     assert any(w.startswith(expected) for w in found), found
 
 
+def test_placeholder_location(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "stats")["callers"][0]["header"] = "X-Api-Key"
+    assert errors(run(raw)) == []
+    route(raw, "stats")["callers"][0]["header"] = "Authorization"
+    assert any("'Authorization' is reserved" in e for e in errors(run(raw)))
+    route(raw, "stats")["callers"][0]["header"] = "X-ZoeyMCP-Gateway"
+    assert any("is reserved" in e for e in errors(run(raw)))
+    route(raw, "stats")["callers"][0].update(header="X-Api-Key", query="api_key")
+    assert any("not both" in e for e in schema_errors(raw))
+
+
 def test_resolve_env(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     raw["credentials"]["music-stats"]["secret"] = "env:STATS_KEY"
