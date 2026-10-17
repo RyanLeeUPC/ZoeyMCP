@@ -67,7 +67,7 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
 # --- secrets -----------------------------------------------------------------------------------
 
 
-def _secret_refs(policy: Policy) -> list[tuple[str, str, bool]]:
+def secret_references(policy: Policy) -> list[tuple[str, str, bool]]:
     """``(path, reference, is_seed)`` for every secret reference in the policy."""
     refs: list[tuple[str, str, bool]] = []
     for name, cred in policy.credentials.items():
@@ -92,7 +92,7 @@ def _secret_refs(policy: Policy) -> list[tuple[str, str, bool]]:
 
 
 def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, str] | None) -> None:
-    for path, ref, is_seed in _secret_refs(policy):
+    for path, ref, is_seed in secret_references(policy):
         if not ref.startswith("env:"):
             continue
         var = ref.removeprefix("env:")

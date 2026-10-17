@@ -1,0 +1,89 @@
+# Self-test cases for examples/policy.yaml. Run them with:
+#
+#   zoeymcp selftest --config examples/policy.yaml --cases examples/selftest-cases.yaml --mutate
+#
+# Each case is a request and what must happen. Refusals matter as much as successes: with
+# --mutate, every rule in the policy is weakened in turn, and some case must notice each time.
+#
+# The broker route uses OAuth (M2) and the mail route a connector (M4), so their allowed
+# requests answer 501 for now. That still proves the request got past identity and rules.
+
+cases:
+  # --- stats: a sandbox script with a placeholder ----------------------------------------------
+  - name: stats read gets the forced user and the injected key
+    request:
+      method: GET
+      path: /stats/2.0/?method=user.getinfo&user=mallory
+      caller: { placeholder: ph-agent1-stats-4c1f9b27 }
+    expect:
+      status: 200
+      upstream:
+        method: GET
+        path: /2.0/
+        query: { method: user.getinfo, user: alice }
+        credential: true
+
+  - name: stats refuses writes
+    request: { method: POST, path: /stats/2.0/, caller: { placeholder: ph-agent1-stats-4c1f9b27 } }
+    expect: { status: 403 }
+
+  - name: stats refuses other API versions
+    request: { method: GET, path: /stats/3.0/, caller: { placeholder: ph-agent1-stats-4c1f9b27 } }
+    expect: { status: 403 }
+
+  - name: a guessed placeholder reaches nothing
+    request: { method: GET, path: /stats/2.0/, caller: { placeholder: guessed-value-00000 } }
+    expect: { status: 403 }
+
+  - name: no identity reaches nothing
+    request: { method: GET, path: /stats/2.0/ }
+    expect: { status: 403 }
+
+  - name: the gateway can't use the sandbox route
+    request: { method: GET, path: /stats/2.0/, caller: gateway }
+    expect: { status: 403 }
+
+  - name: an encoded slash is refused
+    request:
+      method: GET
+      path: /stats/2.0/a%2Fb
+      caller: { placeholder: ph-agent1-stats-4c1f9b27 }
+    expect: { status: 400 }
+
+  # --- broker: an MCP server, gateway only -------------------------------------------------------
+  - name: the gateway may post to the broker's MCP endpoint (OAuth arrives in M2)
+    request: { method: POST, path: /broker/mcp, caller: gateway }
+    expect: { status: 501 }
+
+  - name: the broker route refuses other methods
+    request: { method: PUT, path: /broker/mcp, caller: gateway }
+    expect: { status: 403 }
+
+  - name: the broker route refuses other paths
+    request: { method: POST, path: /broker/other, caller: gateway }
+    expect: { status: 403 }
+
+  - name: a sandbox placeholder can't reach the broker
+    request: { method: POST, path: /broker/mcp, caller: { placeholder: ph-agent1-stats-4c1f9b27 } }
+    expect: { status: 403 }
+
+  # --- mail: a send connector, gateway only ------------------------------------------------------
+  - name: the gateway may read the mail config (connectors arrive in M4)
+    request: { method: GET, path: /mail/config, caller: gateway }
+    expect: { status: 501 }
+
+  - name: the gateway may send (connectors arrive in M4)
+    request: { method: POST, path: /mail/send, caller: gateway }
+    expect: { status: 501 }
+
+  - name: config can't be posted to
+    request: { method: POST, path: /mail/config, caller: gateway }
+    expect: { status: 403 }
+
+  - name: send can't be read
+    request: { method: GET, path: /mail/send, caller: gateway }
+    expect: { status: 403 }
+
+  - name: a sandbox placeholder can't send mail
+    request: { method: POST, path: /mail/send, caller: { placeholder: ph-agent1-stats-4c1f9b27 } }
+    expect: { status: 403 }

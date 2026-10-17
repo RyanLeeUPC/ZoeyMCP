@@ -104,6 +104,19 @@ def _build_parser() -> argparse.ArgumentParser:
     secret_delete = secret_commands.add_parser("delete", help="delete a secret")
     secret_delete.add_argument("name")
 
+    selftest = commands.add_parser(
+        "selftest",
+        help="test a policy's routes against an echo upstream",
+        description=(
+            "Run the vault with this policy, every upstream replaced by an echo server and every "
+            "secret by a dummy value, and check each case in --cases. With --mutate, also break "
+            "the policy one rule at a time and report weakenings no case notices."
+        ),
+    )
+    selftest.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
+    selftest.add_argument("--cases", metavar="FILE", required=True, help="cases file (YAML)")
+    selftest.add_argument("--mutate", action="store_true", help="also mutation-test the cases")
+
     commands.add_parser("setup-code", help="issue a one-time portal setup code (15 minutes)")
     commands.add_parser("gateway-key", help="print the gateway key for the current generation")
 
@@ -171,6 +184,53 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     return EXIT_OK
 
 
+def _cmd_selftest(args: argparse.Namespace, stdin: TextIO, out: TextIO) -> int:
+    import asyncio
+
+    from pydantic import ValidationError
+
+    from ..common.yamlload import YAMLRejected
+    from ..selftest import runner
+    from ..selftest.cases import parse_cases
+
+    try:
+        text, source = read_source(args.config, os.environ, stdin)
+        policy = parse_policy(text, source)
+    except PolicyError as exc:
+        _report(exc.source, exc.findings, "text", out, readable=exc.readable)
+        return EXIT_UNREADABLE
+    errors = [f for f in check_policy(policy) if f.level == "error"]
+    if errors:
+        _report(source, errors, "text", out)
+        return EXIT_UNREADABLE
+    try:
+        cases = parse_cases(Path(args.cases).read_text(encoding="utf-8"))
+    except (OSError, YAMLRejected, ValidationError) as exc:
+        print(f"zoeymcp selftest: can't use {args.cases}: {exc}", file=out)
+        return EXIT_UNREADABLE
+
+    with runner.temporary_state() as state:
+        rig = runner.Rig(policy, Path(state))
+        results = asyncio.run(rig.run(policy, cases))
+        for result in results:
+            print(f"{'PASS' if result.ok else 'FAIL'}  {result.name}", file=out)
+            for problem in result.problems:
+                print(f"        {problem}", file=out)
+        failed = sum(not r.ok for r in results)
+        print(f"{len(results) - failed}/{len(results)} cases passed", file=out)
+        if failed:
+            return EXIT_FINDINGS
+        if args.mutate:
+            report = asyncio.run(runner.mutate(policy, cases, rig))
+            total = len(report.killed) + len(report.survived)
+            print(f"mutants: {len(report.killed)}/{total} killed", file=out)
+            for description in report.survived:
+                print(f"SURVIVED  {description}", file=out)
+            if report.survived:
+                return EXIT_FINDINGS
+    return EXIT_OK
+
+
 def _report(
     source: str, findings: list[Finding], fmt: str, out: TextIO, *, readable: bool = True
 ) -> None:
@@ -224,6 +284,8 @@ def main(
         return _cmd_keygen(out)
     if args.command == "vault":
         return _cmd_vault(args, err)
+    if args.command == "selftest":
+        return _cmd_selftest(args, stdin, out)
     if args.command in ("secret", "setup-code", "gateway-key"):
         return _cmd_admin(args, stdin, out, err)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover

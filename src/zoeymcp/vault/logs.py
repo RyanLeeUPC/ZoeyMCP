@@ -7,10 +7,13 @@ last line of defense.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any, TextIO
 
 from .store import Secret
@@ -23,6 +26,17 @@ def set_stream(stream: TextIO) -> None:
     """Send log lines elsewhere (tests)."""
     global _stream
     _stream = stream
+
+
+@contextlib.contextmanager
+def quiet() -> Iterator[None]:
+    """Discard log lines for the duration (self-tests run thousands of requests)."""
+    global _stream
+    previous, _stream = _stream, io.StringIO()
+    try:
+        yield
+    finally:
+        _stream = previous
 
 
 def event(kind: str, **fields: Any) -> None:
