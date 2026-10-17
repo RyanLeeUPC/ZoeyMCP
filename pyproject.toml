@@ -87,4 +87,6 @@ only_mutate = [
     "*zoeymcp/common/policy/check.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
+# The hygiene test checks the repository itself, which mutmut only partly copies.
+pytest_add_cli_args = ["--ignore=tests/unit/test_source_hygiene.py"]
 also_copy = ["examples", "profiles", "tests"]

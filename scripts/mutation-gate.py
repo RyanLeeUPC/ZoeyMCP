@@ -36,6 +36,9 @@ def main() -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write(report + "\n")
+    if tested == 0:
+        print("no mutant was tested: the mutation run is broken", file=sys.stderr)
+        return 1
     if stats.get("segfault"):
         print("mutation run had segfaults", file=sys.stderr)
         return 1
