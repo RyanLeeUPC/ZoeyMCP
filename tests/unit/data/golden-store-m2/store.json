@@ -1,0 +1,79 @@
+{
+  "entries": {
+    "calendar-refresh": {
+      "binding": {
+        "oauth": {
+          "resources": [
+            "https://calendar.example:443"
+          ],
+          "token": "https://accounts.example:443"
+        }
+      },
+      "ciphertext": "sqztN6dcEe2e6/7T+FQrTG2cf58Brwx/9gphXEMJLjL/87scu6k=",
+      "created": "2026-10-17T17:24:13Z",
+      "kid": "94229fc20fd18d94",
+      "meta": {
+        "oauth": {
+          "consented_at": "2026-10-17T09:00:00Z",
+          "credential": "calendar",
+          "granted_scope": "calendar.readonly",
+          "last_error": null,
+          "last_ok": "2026-10-17T09:30:00Z",
+          "refresh_expires_at": null,
+          "rotations": 2,
+          "source": "login"
+        }
+      },
+      "nonce": "lkg8v6zGKRUi6Vji",
+      "updated": "2026-10-17T17:24:13Z"
+    },
+    "music-client-secret": {
+      "binding": {
+        "oauth": {
+          "resources": [
+            "https://music.example:443"
+          ],
+          "token": "https://accounts.example:443"
+        }
+      },
+      "ciphertext": "5v6EAXyBhc0mYe+Pd1kZCItH/DywXREE8sWo7N3Op+AOnEmYug==",
+      "created": "2026-10-17T17:24:13Z",
+      "kid": "94229fc20fd18d94",
+      "nonce": "o1qX5lOftSz1zKCV",
+      "updated": "2026-10-17T17:24:13Z"
+    },
+    "oauth.music.live": {
+      "binding": {
+        "oauth": {
+          "resources": [
+            "https://music.example:443"
+          ],
+          "token": "https://accounts.example:443"
+        }
+      },
+      "ciphertext": "/RtQylHOs2SnqwLEIIwoVVBVhZ5QfvVwKJsTX3x8Pw5t+QnrGJG6ZT/YYMoKJT40Q7h5XBBNGw1d4xS8DZCIav+/pmKnshZpY9G754lPw41hsG3JKFR536pd+LzuUbGVdvwn2wKeRsnCt2Af/iTdgurz4cngPcY66kRD8k4xFPfLlaA=",
+      "created": "2026-10-17T17:24:13Z",
+      "kid": "94229fc20fd18d94",
+      "meta": {
+        "oauth": {
+          "consented_at": null,
+          "credential": "music",
+          "granted_scope": "user-read-currently-playing",
+          "last_error": {
+            "at": "2026-10-17T09:45:00Z",
+            "code": "oauth_reconsent_needed",
+            "error": "invalid_grant"
+          },
+          "last_ok": null,
+          "refresh_expires_at": null,
+          "rotations": 0,
+          "source": "seed"
+        }
+      },
+      "nonce": "SBZD5aNz1GyFz2Z6",
+      "updated": "2026-10-17T17:24:13Z"
+    }
+  },
+  "format": 1,
+  "kid": "94229fc20fd18d94"
+}

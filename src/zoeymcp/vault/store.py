@@ -12,13 +12,24 @@ So editing the file, moving ciphertexts, or changing a binding makes the entry u
 and a policy change that sends a secret somewhere new can't use it until it's entered again.
 
 Metadata (name, binding, times, key ID) is kept in the clear, so health can be shown without
-decrypting anything. There is deliberately no way to list secret values.
+decrypting anything. There is deliberately no way to list secret values. Bindings and ``meta`` are
+copied on the way in and out: a caller changing its copy would otherwise break the entry's AAD.
+
+An entry may also carry a clear ``meta`` object (OAuth health). It is outside the authenticated
+data and is for display only: no decision reads it.
+
+Write failures: ``put``, ``delete`` and ``update_meta`` change memory first. If the file can't be
+written they set ``dirty`` and raise :class:`StoreWriteError`. Memory keeps the new value, and
+the next successful write or :meth:`SecretStore.flush` saves everything. A crash before that
+loses the change.
 """
 
 from __future__ import annotations
 
 import base64
 import contextlib
+import copy
+import enum
 import json
 import os
 import tempfile
@@ -27,7 +38,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
@@ -45,6 +56,18 @@ _DEFAULT_PORTS = {"https": 443, "http": 80}
 
 class StoreError(Exception):
     """The store file can't be used as it is (wrong key, corrupt, unknown format)."""
+
+
+class StoreWriteError(OSError):
+    """The store file couldn't be written. Memory holds the change, and ``dirty`` is set."""
+
+
+class _Keep(enum.Enum):
+    KEEP = enum.auto()
+
+
+KEEP: Final = _Keep.KEEP
+"""Passed as ``meta`` to :meth:`SecretStore.put`: keep the entry's current ``meta``."""
 
 
 class SecretUnavailable(Exception):
@@ -113,6 +136,7 @@ class EntryMeta:
     key_id: str
     created: str
     updated: str
+    meta: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -121,11 +145,34 @@ class EntryMeta:
             "key_id": self.key_id,
             "created": self.created,
             "updated": self.updated,
+            "meta": self.meta,
         }
 
 
 def _now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _clean_meta(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """A private copy of ``meta``. Refused unless it is plain JSON."""
+    try:
+        text = json.dumps(dict(meta), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"meta must be plain JSON: {exc}") from exc
+    clean: dict[str, Any] = json.loads(text)
+    return clean
+
+
+def _entry_meta(name: str, entry: Mapping[str, Any]) -> EntryMeta:
+    meta = entry.get("meta")
+    return EntryMeta(
+        name,
+        copy.deepcopy(entry["binding"]),
+        entry["kid"],
+        entry["created"],
+        entry["updated"],
+        copy.deepcopy(meta) if isinstance(meta, dict) else None,
+    )
 
 
 def _aad(key_id: str, name: str, binding: Mapping[str, Any]) -> bytes:
@@ -143,10 +190,16 @@ class SecretStore:
         self._previous = previous
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] = {}
+        self._dirty = False
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def dirty(self) -> bool:
+        """Memory holds changes the file doesn't, because a write failed."""
+        return self._dirty
 
     # --- loading and rotation ------------------------------------------------------------------
 
@@ -187,12 +240,18 @@ class SecretStore:
                 for name, entry in list(entries.items()):
                     if entry["kid"] == self._previous.key_id:
                         value = self._decrypt(name, entry, self._previous)
-                        self._entries[name] = self._encrypt(
+                        fresh = self._encrypt(
                             name, value, entry["binding"], created=entry["created"]
                         )
+                        if "meta" in entry:
+                            fresh["meta"] = entry["meta"]
+                        self._entries[name] = fresh
                         rotated += 1
                 if rotated:
-                    self._write()
+                    try:
+                        self._persist()
+                    except StoreWriteError as exc:
+                        raise StoreError(f"can't save the re-encrypted store: {exc}") from exc
             return rotated
 
     # --- reading -------------------------------------------------------------------------------
@@ -203,10 +262,13 @@ class SecretStore:
 
     def metadata(self) -> list[EntryMeta]:
         with self._lock:
-            return [
-                EntryMeta(name, e["binding"], e["kid"], e["created"], e["updated"])
-                for name, e in sorted(self._entries.items())
-            ]
+            return [_entry_meta(name, e) for name, e in sorted(self._entries.items())]
+
+    def entry(self, name: str) -> EntryMeta | None:
+        """One entry's clear metadata, or ``None`` if there is no such entry."""
+        with self._lock:
+            entry = self._entries.get(name)
+            return None if entry is None else _entry_meta(name, entry)
 
     def get_for_origin(self, name: str, url: str) -> Secret:
         """The secret, if its binding allows sending it to ``url``'s origin."""
@@ -218,6 +280,29 @@ class SecretStore:
                 name, f"not bound to {origin}; enter it again to authorize that origin"
             )
         return self._decrypt(name, entry, self._keys)
+
+    def get_for_oauth(
+        self, name: str, *, token_url: str, resource_url: str | None = None
+    ) -> tuple[Secret, dict[str, Any]]:
+        """An OAuth secret and a copy of its binding, if it is bound to ``token_url``'s origin.
+
+        With ``resource_url``, that origin must also be one of the binding's resources.
+        """
+        token_origin = canonical_origin(token_url)
+        resource_origin = canonical_origin(resource_url) if resource_url is not None else None
+        entry = self._entry(name)
+        oauth = entry["binding"].get("oauth")
+        if not isinstance(oauth, dict) or oauth.get("token") != token_origin:
+            raise SecretUnavailable(
+                name, f"not bound to token endpoint {token_origin}; enter it again to authorize it"
+            )
+        if resource_origin is not None:
+            resources = oauth.get("resources")
+            if not isinstance(resources, list) or resource_origin not in resources:
+                raise SecretUnavailable(
+                    name, f"not bound to {resource_origin}; run login again to authorize it"
+                )
+        return self._decrypt(name, entry, self._keys), copy.deepcopy(entry["binding"])
 
     def get_for_binding(self, name: str, binding: Mapping[str, Any]) -> Secret:
         """The secret, if it was stored with exactly this binding (connectors)."""
@@ -237,26 +322,71 @@ class SecretStore:
 
     # --- writing -------------------------------------------------------------------------------
 
-    def put(self, name: str, value: str, binding: Mapping[str, Any]) -> None:
-        """Store or replace a secret with its binding."""
+    def put(
+        self,
+        name: str,
+        value: str,
+        binding: Mapping[str, Any],
+        *,
+        meta: Mapping[str, Any] | _Keep | None = KEEP,
+    ) -> None:
+        """Store or replace a secret with its binding.
+
+        ``meta`` replaces the entry's clear metadata. ``None`` removes it; ``KEEP`` keeps it.
+        Raises :class:`StoreWriteError` if the file can't be written; memory has the new value.
+        """
         if not value:
             raise ValueError("a secret can't be empty")
         if len(value.encode("utf-8")) > MAX_SECRET_BYTES:
             raise ValueError(f"a secret can't be larger than {MAX_SECRET_BYTES} bytes")
         if not binding:
             raise ValueError("a secret needs a binding")
+        new_meta = None if meta is None or meta is KEEP else _clean_meta(meta)
         with self._lock:
             existing = self._entries.get(name)
             created = existing["created"] if existing else None
-            self._entries[name] = self._encrypt(name, Secret(value), dict(binding), created=created)
-            self._write()
+            entry = self._encrypt(
+                name, Secret(value), copy.deepcopy(dict(binding)), created=created
+            )
+            if meta is KEEP:
+                if existing is not None and "meta" in existing:
+                    entry["meta"] = existing["meta"]
+            elif new_meta is not None:
+                entry["meta"] = new_meta
+            self._entries[name] = entry
+            self._persist()
+
+    def update_meta(self, name: str, meta: Mapping[str, Any] | None) -> bool:
+        """Replace an entry's clear metadata without re-encrypting it. ``None`` removes it.
+
+        Returns ``False`` if there is no such entry. Raises :class:`StoreWriteError` like
+        :meth:`put`.
+        """
+        new_meta = None if meta is None else _clean_meta(meta)
+        with self._lock:
+            entry = self._entries.get(name)
+            if entry is None:
+                return False
+            if new_meta is None:
+                entry.pop("meta", None)
+            else:
+                entry["meta"] = new_meta
+            self._persist()
+            return True
 
     def delete(self, name: str) -> bool:
+        """Remove a secret. Raises :class:`StoreWriteError` like :meth:`put`."""
         with self._lock:
             if self._entries.pop(name, None) is None:
                 return False
-            self._write()
+            self._persist()
             return True
+
+    def flush(self) -> None:
+        """Write the file if an earlier write failed. Raises :class:`StoreWriteError`."""
+        with self._lock:
+            if self._dirty:
+                self._persist()
 
     # --- internals -----------------------------------------------------------------------------
 
@@ -289,6 +419,15 @@ class SecretStore:
                 name, "entry failed authentication (tampered or corrupt)"
             ) from exc
         return Secret(plain.decode("utf-8"))
+
+    def _persist(self) -> None:
+        """Write the file, or mark the store dirty and raise. Call with the lock held."""
+        try:
+            self._write()
+        except OSError as exc:
+            self._dirty = True
+            raise StoreWriteError(f"can't write {self._path}: {exc}") from exc
+        self._dirty = False
 
     def _write(self) -> None:
         document = {"format": STORE_FORMAT, "kid": self._keys.key_id, "entries": self._entries}
