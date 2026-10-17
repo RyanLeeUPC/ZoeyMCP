@@ -70,7 +70,7 @@ say so.
 | R32 | **Per-client scoping:** each client (agent) sees only the servers and tools assigned to it | Must |
 | R33 | **Tool pinning:** the gateway records a hash of each reviewed tool definition (name, description, input schema, annotations). A new or changed tool is hidden and reported until re-reviewed; this blocks "rug pull" changes and description poisoning | Must |
 | R34 | **Native toolkits:** the operator's own Python tools run in the gateway, with no secrets, calling the vault with placeholders. They are installed in a **gateway-only image**; the vault always runs the official image, unmodified (§3.1) | Must |
-| R35 | **stdio-only MCP servers** run in their own container behind a stdio-to-HTTP bridge. No third-party server code runs in an agent's container or in the vault | Must |
+| R35 | **stdio-only MCP servers** run in their own container behind a stdio-to-HTTP bridge. No third-party server code runs in an agent's container or in the vault. A bridge reaches the outside through vault routes, or, if the server can't be pointed at the vault, through the egress proxy with its own allowlist. A bridge that must hold a **real secret itself** is a flagged exception to R2: `check` warns, the docs state the cost, and its allowlist is narrowed to that provider | Must |
 | R36 | Server-side streaming (SSE / streamable HTTP) passes through without buffering | Must |
 | R37 | Batch-shaped tools are easy to write, for clients whose code sandboxes can't call MCP tools in a loop | Should |
 | R38 | Tool descriptions stay short, and the docs note that clients should load tools lazily where they can | Should |
@@ -85,8 +85,9 @@ say so.
 | R42 | The rendered approval **can't hide content**: plain text only, Unicode format characters (category Cf: zero-width, bidi overrides, tags) and control characters rejected, and the whole text under a configurable budget (default 3,000 characters). If it doesn't fit, the call is refused rather than truncated | Must |
 | R43 | The arguments executed are **byte-identical** to the arguments shown | Must |
 | R44 | One pending approval per tool per client: a second call while one waits is refused, so prompts can't be merged or confused | Must |
-| R45 | Approver back ends: **MCP elicitation** (the default; the prompt appears in the operator's own client) and an **out-of-band approver** (a Telegram bot), for clients that shouldn't be trusted to relay approvals or for approvals that must wait hours | Should |
+| R45 | Approver back ends: **MCP elicitation** (the default, synchronous; the prompt appears in the operator's own client) and **out-of-band approvers** hosted in the vault (Telegram, and an approval queue in the portal), for clients that shouldn't be trusted to relay approvals or for approvals that must wait | Should |
 | R46 | A **ledger** of consequential calls: time, client, tool, hash of the arguments, decision, result | Should |
+| R48 | **Vault-enforced approvals:** for routes marked `vault_approval`, the **vault** holds the request, renders the approval from the request itself, and forwards it only on approval, so even a fully compromised gateway can't skip it. Each approval happens in exactly one place: those routes skip the gateway's elicitation | Should |
 | R47 | Content from upstream is **data, not instructions**. The gateway can wrap results from a server in untrusted-content markers. Toolkits that need sender identity (e.g. mail) verify it in code and label failures | Should |
 
 ### 2.6 Admin portal
@@ -172,7 +173,8 @@ key can decrypt everything. So the question is which code runs next to the key:
 
 Secrets never cross the gateway–vault link: the vault injects them into the outbound request
 itself, and there is **no API that returns a secret**. A compromised gateway can still call its
-routes, so it could skip approvals on them; §12 has the option that closes that gap.
+routes, so it could skip the approvals the gateway runs. Routes marked `vault_approval` close that
+gap: the vault itself holds the request until the operator approves it (§6.4).
 
 **The image matters as much as the process.** Python runs every `.pth` file in `site-packages` at
 interpreter start, before any ZoeyMCP code. If the vault ran an image with toolkit dependencies
@@ -207,7 +209,7 @@ release. Toolkits go into a derived image used **only** by the gateway.
 | Gateway → vault | Unix socket, peer uid checked | gateway key over the `internal` network |
 | Gateway egress | **yes**: it shares the vault's network namespace, so a compromised gateway can send tool results anywhere | **none**: the gateway's only network peers are agents and the vault |
 | Admin listener | in the gateway's network namespace; protected by passkey auth, not by reachability | on the vault's `egress` address only; the gateway can't reach it |
-| Publishing ports | works | the gateway is on internal networks only; LAN access needs an inbound proxy (§12) |
+| Publishing ports | works | the gateway is on internal networks only; LAN access uses the `lan` profile (§3.4) |
 | Use for | evaluation, desktop clients, low-stakes setups | **anything that moves money, sends mail or touches personal data** |
 
 The README quickstart uses the standard tier, and says on the same page when to move to the
@@ -261,12 +263,21 @@ volumes: {vault-state: {}, gateway-state: {}}
 ```
 
 - **`agents` must be internal too.** A non-internal network would give the gateway internet egress
-  through the back door. Docker doesn't publish ports from internal-only networks; see §12.
+  through the back door. Docker doesn't publish ports from internal-only networks, so LAN access
+  goes through the `lan` profile (below).
 - **Subnets are left to Docker** unless the operator pins addresses for defense in depth;
   identity doesn't depend on them (§3.2).
-- **Bridges** reach the outside only through vault routes (most servers take a base-URL
-  override). A server that can't be pointed at the vault needs its own egress arrangement (§12).
+- **Bridges** reach the outside through vault routes where the server takes a base-URL override.
+  Otherwise, they go through the egress proxy (below), each bridge on **its own network** shared
+  only with the proxy, so the proxy's per-source allowlist can't be fooled by a spoofed address.
 - **The gateway gets its config from the vault** (§4.6), so there is one config, not two.
+
+Optional compose profiles:
+
+| Profile | Adds | Notes |
+| --- | --- | --- |
+| `lan` | an inbound proxy (pinned Caddy) on a published port and on `agents`, forwarding only to the gateway, **with TLS** | so desktop clients on the LAN can connect without client tokens crossing the LAN in cleartext. The proxy has egress but holds no secrets; client tokens, not addresses, identify clients |
+| `egress-proxy` | a CONNECT-only allowlist proxy for the vault and for bridges that can't use vault routes | per-source allowlists generated from the policy by `zoeymcp check --emit-egress-allowlist` (or read directly; §12.2) |
 
 ## 4. The vault
 
@@ -292,9 +303,15 @@ For each request, in order:
    doesn't cover this request's origin (§4.5).
 7. Forward through the egress proxy. Streamed bodies (SSE) pass through unbuffered; a size limit
    applies to request bodies.
-8. **Scrub the response**: remove any exact occurrence of the injected secret from response headers
-   (always) and from non-streamed bodies under a size limit (§12). Upstreams sometimes echo
-   credentials in errors.
+8. **Scrub the response.** Upstreams sometimes echo credentials in error bodies, especially
+   query-parameter and path secrets that appear in echoed URLs.
+   - Response headers are always scrubbed. Non-streamed text and JSON bodies under 1 MB are
+     scrubbed by default (configurable).
+   - Matching covers the secret as raw bytes, **percent-encoded**, **JSON-escaped**, and for basic
+     auth **base64** of `user:secret`. Each match is replaced with `[REDACTED]`.
+   - The vault asks upstreams for `Accept-Encoding: identity`, or decompresses before scanning,
+     and recomputes `Content-Length`.
+   - Streamed and larger bodies aren't scrubbed. The docs say so.
 9. Log one JSON line: route, method, path template (not the raw path), status, bytes, duration,
    caller identity name. No placeholders, no secrets, no query values.
 
@@ -377,6 +394,15 @@ it with HKDF-SHA256, with a separate context for each purpose:
 | `K_config` | `zoeymcp/config/v1` | HMAC over managed policy versions and their counter (§4.6) |
 | `K_gateway` | `zoeymcp/gateway/v1/gen-<N>` | the gateway key in the hardened tier. Rotated by bumping `gateway_key_generation` |
 
+**Gateway key rotation:**
+- After `gateway_key_generation` is bumped to N, the vault still accepts generation N-1, but only
+  **until the first request authenticated with generation N arrives, and for at most 5 minutes**.
+  The old generation is then retired.
+- The retirement is persisted in the vault's state and authenticated with `K_config`, so a vault
+  restart doesn't bring back N-1.
+- `--immediate` (portal option or CLI flag) retires N-1 at once, for a suspected leak.
+- While N-1 is still accepted, the portal shows `rotation pending: gateway still on gen N-1`.
+
 There is no derived admin credential: admin access starts from a one-time setup code (§7.2), so
 it can be revoked without touching the master key.
 
@@ -407,7 +433,8 @@ step-up (R62) and versioning (R66).
 
 1. Set `ZOEYMCP_MASTER_KEY_PREVIOUS` to the old key and `ZOEYMCP_MASTER_KEY` to the new one.
 2. On start, the vault re-encrypts every entry and re-authenticates the policy versions. The
-   gateway key changes too, so update it at the same time.
+   gateway key changes too, so update it at the same time; the old one follows the same
+   ratchet-or-5-minutes rule as a generation bump.
 3. Remove the old key afterwards.
 
 **Losing the key or the volume:** every secret must be entered again, and every rotating OAuth
@@ -450,6 +477,12 @@ server, which keeps tool names unprefixed and lets the client apply its own per-
 settings. Each endpoint checks the client's token, its optional source pin, and whether that
 client is assigned the server.
 
+**Upstream sessions:** one upstream MCP session per (client, server) by default, so two agents
+never share state on a stateful server (a browser, a database transaction). `shared_session: true`
+on a server opts into one shared session. It is meant for stateless servers, and for bridges
+whose subprocess is slow to start. The docs warn that sharing a session with a stateful server
+leaks state between agents.
+
 ### 5.1 Filtering and pinning
 
 On connecting to a `remote`/`bridge` server, the gateway lists its tools and compares each with the
@@ -474,15 +507,22 @@ annotations):
 Each included tool has a policy: `allow` (no prompt) or `approve`.
 
 - There is **no implicit default**: `check` fails on an included tool that is in neither list.
-- Upstream annotations (`readOnlyHint`, `destructiveHint`) are shown during review as hints only,
-  because the upstream controls them.
+- Upstream annotations (`readOnlyHint`, `destructiveHint`) are hints only, because the upstream
+  controls them. During review, the portal **pre-fills** the `allow`/`approve` choice from
+  `readOnlyHint`, labelled "suggested by the server", and nothing is saved until the operator
+  confirms. At runtime, annotations are never consulted.
 - Keep `allow` for calls that really are routine: a prompt on every call teaches the operator to
   approve without reading.
 
 For an `approve` call:
 
-1. **Validate** the arguments against the reviewed input schema. Reject `additionalProperties`
-   where the schema forbids them.
+1. **Validate** the arguments against the reviewed input schema, using `jsonschema` (pinned, in
+   the gateway only), and reject `additionalProperties` where the schema forbids them.
+   - Upstream schemas are untrusted input, so validation runs within size and depth limits, and
+     remote `$ref`s are never fetched.
+   - A `pattern` in a schema can hang validation if the regex is badly written, so patterns are
+     highlighted during review.
+   - This runs for `allow` tools too, not only `approve` ones.
 2. **Canonicalize** them: parse, then re-serialize as the exact JSON object that will be forwarded.
 3. **Render** the approval text: `<server> → <tool>`, then the arguments as indented JSON. JSON
    escaping makes the rendering unambiguous: a newline inside a value appears as `\n` and can't fake
@@ -548,24 +588,58 @@ The gateway sends an MCP `elicitation/create` with the rendered text and an empt
 Only `accept` counts. `decline`, `cancel`, a timeout, an error, or a client that didn't advertise
 elicitation support all mean declined.
 
+Elicitation is **synchronous**: it is a request/response tied to the client's active tool call,
+and if the client times out the call, the prompt is orphaned anyway. Its timeout is therefore
+kept within what clients allow for a tool call (typically 60–300 s). Approvals that must wait
+longer use an out-of-band approver (§6.3), which supports `pending` + `check_approval`.
+
 ### 6.2 What it trusts
 
 The client: that it shows the text whole, doesn't auto-accept, and doesn't let an "always allow"
 answer persist. Different clients behave differently; the docs keep a per-client notes page for
 clients that have been checked.
 
-### 6.3 `telegram` (out-of-band)
+### 6.3 Out-of-band approvers (hosted in the vault)
 
-- The operator gets a DM from a **dedicated bot**: plain text, with Approve / Deny buttons. The
-  token never reaches the gateway: Bot API calls go **through a vault route** with a `path`
-  credential that accepts only `caller: gateway`.
-- It acts only on a button press from the configured user ID in the configured chat, carrying the
-  request's nonce, while the request is pending and unexpired.
-- Approvals can wait longer (configurable, e.g. hours). While waiting, the tool call either blocks
-  (short waits) or returns `pending <id>`, with a `check_approval` tool for the result (long
-  waits).
+Out-of-band approvers run **in the vault**, which already holds the bot token and hosts the
+passkey-protected portal. That makes them independent of both the agent runtime and the gateway.
 
-More back ends (ntfy, Matrix, the portal itself) can follow the same interface later.
+- **`telegram`:** a **dedicated bot** sends the operator a DM in plain text, with Approve / Deny
+  buttons.
+  - The vault long-polls the Bot API itself.
+  - It acts only on a button press from the configured user ID in the configured chat, carrying
+    the request's nonce, while the request is pending and unexpired.
+- **`portal`:** a pending-approvals queue in the admin portal. Approving one is a step-up action,
+  so it needs a fresh passkey assertion.
+- **Waiting:** approvals can wait longer (configurable, e.g. hours). While waiting, the tool call
+  either blocks (short waits) or returns `pending <id>`, with a `check_approval` tool on that
+  server for the result (long waits).
+
+More back ends (ntfy, Matrix, Web Push) can follow the same interface later.
+
+### 6.4 Vault-enforced approvals
+
+A route marked `vault_approval: required` (typically send connectors, trading or payment tools) is
+approved **by the vault**, not the gateway:
+
+1. **The gateway forwards** the call without eliciting: each approval happens in exactly one
+   place.
+2. **The vault parses what it will approve:**
+   - For a **connector**, it reads the connector's known fields.
+   - For an upstream **MCP route**, it reads the JSON-RPC envelope with the stdlib `json` module
+     (never the MCP SDK). On these routes it accepts only a single, non-batched
+     `application/json` request. A `tools/call` for a tool listed under `vault_approval` is held;
+     any other method passes through only if the route's policy allows it. This is the one place
+     the vault reads MCP, and it reads only the envelope.
+3. **It renders and checks** the approval text with the same rules and budget as §5.2: the shared
+   text-rule code lives in `common/`.
+4. **It asks** an out-of-band approver (§6.3).
+5. **On approval, it forwards exactly the bytes it held,** injecting the credential only then. Any
+   other answer means nothing is sent.
+6. **Ledger** entries are written by the vault.
+
+Even a fully compromised gateway can't skip these approvals. It can only queue requests, which the
+operator sees and denies.
 
 ## 7. Admin portal, onboarding and CLI
 
@@ -581,6 +655,7 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
 | MCP servers | onboard by URL (§7.4), review tools, classify `allow`/`approve`, re-pin drifted tools with a side-by-side diff | save (managed) |
 | Policy (managed) | edit routes, connectors, clients and approvals; history with diffs; rollback; export/import YAML | every save |
 | Policy (declarative) | read-only view; generated YAML diffs to commit | — |
+| Approvals | the queue of pending vault-held and out-of-band approvals (§6.3, §6.4) | approve |
 | Ledger | consequential calls: decision, argument hash, result | — |
 | Passkeys | enrol, name and remove passkeys | every change |
 
@@ -593,6 +668,24 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
   invalidated when the first passkey is enrolled.
 - **Login:** a passkey (WebAuthn, `userVerification: required`). Several passkeys can be enrolled.
   Sessions are short-lived, with `SameSite=Strict` cookies.
+- **Verifier:** our own, strict and small, using only `cryptography`, with **no CBOR library** in
+  the vault.
+  - **Enrolment:** it requests `attestation: "none"`. The browser's `getPublicKey()` supplies the
+    key in standard DER form, and `getPublicKeyAlgorithm()` the algorithm. The credential ID is
+    read from fixed offsets in `authenticatorData`. If the browser returns no key, enrolment is
+    refused with a clear message. Trust in the new key comes from the session that started the
+    enrolment (setup code or step-up), not from attestation.
+  - **Assertions:** `authenticatorData` has a fixed layout (site-ID hash, flags, counter). The
+    signature covers `authenticatorData` followed by the SHA-256 of `clientDataJSON`, which is
+    plain JSON. If the extensions flag is set, the signature still covers the whole byte string,
+    but extensions are never parsed.
+  - **Checks:** the request type, a single-use server-side challenge, the exact origin, the
+    site-ID hash, and the user-present and user-verified flags. The signature counter is checked
+    for regressions as a warning only, because many passkeys always report 0.
+  - **Algorithms:** ES256 (`-7`), EdDSA (`-8`), and RS256 (`-257`, for Windows Hello on some
+    TPMs). Nothing else.
+  - This is the subset of WebAuthn we need, not full spec coverage (no attestation formats, no
+    extensions), and the docs say so.
 - **Step-up:** each security-relevant save (the table in §7.1) needs a fresh passkey assertion,
   bound to that request. A stolen session cookie can browse, but it can't change anything that
   matters.
@@ -657,7 +750,7 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp login <credential>` / `login --mcp <url>` | `docker exec` in the vault | the onboarding of §7.4, with the paste-the-redirect-URL step; tokens go straight into the store |
 | `zoeymcp review <server>` | `docker exec` | drift diff and new pins |
 | `zoeymcp policy export / import` | `docker exec` | managed-mode YAML round trip |
-| `zoeymcp check` / `selftest` | anywhere | §2.7, §8 |
+| `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --emit-egress-allowlist` writes the egress proxy's per-source allowlists |
 
 Admin commands run inside the vault container and use the local admin socket, so they need host
 access instead of a passkey.
@@ -725,6 +818,12 @@ ZoeyMCP is done when every shape passes. Shapes are named by pattern; providers 
   - an SMTP connector can't be made to add a recipient, and a changed recipient list makes the
     password unusable;
   - a route whose upstream changed can't use its old secret;
+  - an echoed secret is scrubbed in each encoding (raw, percent-encoded, JSON-escaped, base64),
+    including from a gzip-encoded body;
+  - on a `vault_approval` route, a batched request, a non-JSON body or a `tools/call` hidden
+    behind a different content type doesn't get past the hold, and a denied request sends
+    nothing upstream;
+  - a retired gateway key generation stays retired across a vault restart;
   - no admin endpoint returns a secret;
   - in the **standard tier**, the gateway uid can't read `/state/vault` or the vault's environ;
   - in the **hardened tier**, the gateway can't reach the internet or the admin listener.
@@ -734,6 +833,9 @@ ZoeyMCP is done when every shape passes. Shapes are named by pattern; providers 
   - a save without step-up is refused;
   - an OAuth callback with a reused, expired or foreign `state` is refused;
   - a setup code is single-use and expires;
+  - the WebAuthn verifier's test vectors pass: truncated `authenticatorData`, flags missing
+    user-verified, a wrong origin, a wrong site-ID hash, a reused challenge, an unsupported
+    algorithm, and a signature over altered bytes are all refused;
   - the CSP and the other headers are present on every response.
 - **`zoeymcp selftest --cases cases.yaml`** starts the vault with the operator's **real** policy,
   with every upstream (and the egress proxy) replaced by an echo server that reports what it
@@ -879,49 +981,38 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | M0 | Repo, CI, policy schema, `check`, text rules, canonical JSON, fake-provider harness | — |
 | M1 | **Vault core:** routes, path rules, header/query/path/basic credentials, key hierarchy, store with bindings, local admin socket + `secret set` / `setup-code`, declarative mode, egress proxy, logs, `selftest`. **Both tiers:** the entrypoint and the hardened compose | S1–S4, S7, S8 |
 | M2 | **OAuth:** refresh, rotation in the store, seed vs live; CLI `login <credential>` | S5, S6 |
-| M3 | **Gateway:** `remote` servers through the vault, gateway identity, policy fetch, per-client scoping, include + pins, `review` | S10, S12 (drift, injection) |
+| M3 | **Gateway:** `remote` servers through the vault, gateway identity and key rotation, policy fetch, per-client scoping, per-client upstream sessions, include + pins, schema validation, `review`; the `lan` compose profile | S10, S12 (drift, injection) |
 | M4 | **Approvals:** elicitation back end, locks, ledger; toolkit SDK and the derived-image example; SMTP connector + example toolkits | S12 (sampling, elicitation), S13–S16 |
 | M5 | **Portal v1:** setup code, passkeys, step-up, hardening, write-only secrets, OAuth connect (including pasting the redirect URL), credential health, ledger view | portal tests |
 | M6 | **Portal v2:** tool-drift review and re-pin; **managed mode** with versioning, history, rollback, export/import | portal tests |
-| M7 | `bridge`; MCP onboarding by URL (discovery + DCR) in the portal and CLI | S9, S11 |
-| M8 | Telegram approver; image publishing with digests and SBOM | S3 end to end as the approver |
+| M7 | `bridge`; the `egress-proxy` profile and `--emit-egress-allowlist`; MCP onboarding by URL (discovery + DCR) in the portal and CLI | S9, S11 |
+| M8 | **Vault-enforced approvals** (§6.4); out-of-band approvers in the vault (Telegram, the portal queue); image publishing with digests and SBOM | S3 end to end as the approver; S13/S15 again under `vault_approval` |
 
 Each milestone ships with its effect tests and its shapes' acceptance tests. Nothing merges with a
 failing mutation run on the policy modules. Managed mode is the default from M6 on; until then,
 only declarative mode exists.
 
-## 12. Open questions
+## 12. Decisions and open questions
 
-1. **Gateway ↔ upstream sessions:** one upstream MCP session per (client, server), or one shared per
-   server? Per-client is cleaner for upstream servers that keep state per session; shared is
-   lighter. Leaning per-client.
-2. **Long approvals over elicitation:** some clients cap how long a tool call may block. Should
-   `approve` support the `pending` + `check_approval` pattern for elicitation too, or only for
-   out-of-band approvers?
-3. **Response scrubbing of bodies:** default on (under a size limit) or off? On costs a copy of each
-   small body; it catches upstreams that echo keys in error messages.
-4. **Schema validation library:** use whatever the pinned MCP SDK already depends on, or add
-   `jsonschema` explicitly. Check the SDK's dependency set at M0.
-5. **Explicit classification (§5.2):** confirm that no tool gets a default policy from its
-   annotations. The alternative is treating tools without `readOnlyHint` as `approve`: less config,
-   but it trusts the upstream's own labels.
-6. **Approvals that survive a gateway compromise:** for designated connectors (sends, payments),
-   the vault could require a signed approval: the approver signs the hash of the canonical
-   arguments, and the vault checks it before acting. That only helps when the approver doesn't
-   run in the gateway: the Telegram approver hosted in the vault (which holds the bot token
-   anyway), or approvals in the portal itself.
-7. **The portal in the secret-holding process:** passkey verification has to live wherever admin
-   authority lives, so the portal is in the vault. That adds browser-facing HTTP, sessions and
-   WebAuthn parsing (CBOR, COSE keys) next to the master key. Keep dependencies minimal (a small,
-   audited WebAuthn library, or our own verification of the few algorithms we accept), or split
-   the portal's rendering into a secretless process that relays to a narrow, passkey-verified API
-   in the vault?
-8. **LAN-reachable gateway in the hardened tier:** ship an inbound-proxy service in the compose (as
-   a profile), or document accepting gateway egress?
-9. **Bridge egress** for stdio servers that can't take a base-URL override: a per-bridge egress
-   network with an allowlist proxy, as a compose profile?
-10. **Egress proxy in the compose:** ship an optional allowlist proxy whose allowlist `check`
-    generates from the route upstreams?
-11. **Gateway key rotation:** bumping `gateway_key_generation` needs the new gateway key set at the
-    same time as the policy change. Should the vault accept the previous generation for a short
-    grace period?
+### 12.1 Decided (2026-10-17)
+
+| Question | Decision | Where |
+| --- | --- | --- |
+| Upstream sessions | per (client, server); `shared_session: true` opt-in for stateless servers | §5 |
+| Long approvals | elicitation stays synchronous; `pending` + `check_approval` only with out-of-band approvers | §6.1, §6.3 |
+| Response scrubbing | on by default for text/JSON bodies under 1 MB, covering common encodings; headers always | §4.1 |
+| Schema validation | `jsonschema`, pinned, gateway only, with limits on size, depth and remote `$ref` | §5.2 |
+| Tool classification | explicit and mandatory; the portal pre-fills from `readOnlyHint` as a labelled suggestion | §5.2 |
+| Approvals that survive a gateway compromise | vault-enforced approvals on `vault_approval` routes; out-of-band approvers hosted in the vault | §6.3, §6.4 |
+| Portal location | in the vault, with our own WebAuthn verifier: `cryptography` only, no CBOR, ES256/EdDSA/RS256 | §7.2 |
+| LAN access to a hardened gateway | `lan` compose profile: an inbound proxy with TLS | §3.4 |
+| Bridge egress and egress proxy | one optional `egress-proxy` profile with per-source allowlists generated from the policy; each bridge on its own network; a bridge holding a real secret is a flagged exception | §3.4, R35 |
+| Gateway key rotation | ratchet on first use of the new generation, capped at 5 minutes; persisted; `--immediate` for a suspected leak | §4.5 |
+
+### 12.2 Open
+
+1. **Egress proxy implementation:** a pinned Squid image configured by
+   `check --emit-egress-allowlist`, or a small built-in `zoeymcp egress` role (a CONNECT-only
+   allowlist proxy that reads the policy directly, so there's no second product to configure)?
+   Squid is proven; the built-in role is about 150 lines we would own, and it is one less moving
+   part to keep in sync.
