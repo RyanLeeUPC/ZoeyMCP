@@ -1,0 +1,21 @@
+# S2: Last.fm. The key travels as a query parameter, and the user is forced, so a script can
+# only read the one account. Scripts send their placeholder as api_key, as they would the key.
+credentials:
+  lastfm-key:
+    kind: query
+    param: api_key
+    secret: store:lastfm-key
+
+routes:
+  - name: lastfm
+    prefix: /lastfm
+    upstream: https://ws.audioscrobbler.com
+    credential: lastfm-key
+    callers:
+      - placeholder: ph-replace-lastfm-00000
+        query: api_key
+    query:
+      force: { user: your-username, format: json }
+    rules:
+      - methods: [GET]
+        paths: [/2.0/]

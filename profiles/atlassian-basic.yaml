@@ -1,0 +1,17 @@
+# S4: Atlassian Cloud with an API token: HTTP basic with your account email as the username.
+credentials:
+  atlassian:
+    kind: basic
+    username: you@example.com
+    secret: store:atlassian
+
+routes:
+  - name: jira
+    prefix: /jira
+    upstream: https://your-site.atlassian.net
+    credential: atlassian
+    callers:
+      - placeholder: ph-replace-jira-0000000
+    rules:
+      - methods: [GET]
+        paths: [/rest/api/3/myself, /rest/api/3/search/jql]

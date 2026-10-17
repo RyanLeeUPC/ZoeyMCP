@@ -1,0 +1,22 @@
+# S8: the GitHub REST API, read-only. Use a fine-grained token with read permissions too:
+# the route's GET-only rule is one layer, the token's scope is another.
+credentials:
+  github-token:
+    kind: header
+    secret: store:github-token
+
+routes:
+  - name: github
+    prefix: /github
+    upstream: https://api.github.com
+    credential: github-token
+    callers:
+      - placeholder: ph-replace-github-00000
+    rules:
+      - methods: [GET]
+        paths:
+          - /repos/{owner}/{repo}/issues
+          - /repos/{owner}/{repo}/pulls
+          - /user
+        params:
+          owner: [your-org]

@@ -1,0 +1,19 @@
+# S3: the Telegram Bot API. The token is part of the URL path (/bot<token>/method).
+credentials:
+  telegram-bot:
+    kind: path
+    template: /bot{secret}
+    secret: store:telegram-bot
+
+routes:
+  - name: telegram
+    prefix: /telegram
+    upstream: https://api.telegram.org
+    credential: telegram-bot
+    callers:
+      - placeholder: ph-replace-telegram-000
+    rules:
+      - methods: [GET]
+        paths: [/getMe, /getUpdates]
+      - methods: [POST]
+        paths: [/sendMessage]

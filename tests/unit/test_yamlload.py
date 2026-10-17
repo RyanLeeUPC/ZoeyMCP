@@ -78,6 +78,11 @@ def test_merge_key_text_is_just_a_key() -> None:
     assert load_mapping("<<: 1\n") == {"<<": 1}
 
 
+def test_braces_in_an_inline_list_get_a_hint() -> None:
+    with pytest.raises(YAMLRejected, match="put each path on its own"):
+        load_mapping("paths: [/docs/{doc}/rows]")
+
+
 def test_size_limit() -> None:
     with pytest.raises(YAMLRejected, match="larger than"):
         load_mapping("a: " + "x" * 200, max_bytes=100)

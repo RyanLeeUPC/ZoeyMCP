@@ -1,0 +1,28 @@
+# S7: Grist, limited to one document. Records can be read, added and updated, never deleted;
+# table names must be plain identifiers. Grist's own access rules stay as a second layer.
+credentials:
+  grist-key:
+    kind: header
+    secret: store:grist-key
+
+routes:
+  - name: grist
+    prefix: /grist
+    upstream: https://docs.getgrist.com
+    credential: grist-key
+    callers:
+      - placeholder: ph-replace-grist-000000
+    rules:
+      - methods: [GET]
+        paths:
+          - /api/docs/{doc}/tables
+          - /api/docs/{doc}/tables/{table}/records
+        params:
+          doc: [replace-with-your-doc-id]
+          table: { regex: "[A-Za-z][A-Za-z0-9_]{0,63}" }
+      - methods: [POST, PATCH]
+        paths:
+          - /api/docs/{doc}/tables/{table}/records
+        params:
+          doc: [replace-with-your-doc-id]
+          table: { regex: "[A-Za-z][A-Za-z0-9_]{0,63}" }

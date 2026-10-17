@@ -58,6 +58,7 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SCRUB_BYTES = 1024 * 1024
 CONNECT_TIMEOUT = 10.0
 READ_TIMEOUT = 60.0
+_STREAM_TYPES = ("text/event-stream", "application/x-ndjson")
 _SCRUBBED_TYPES = (
     "text/",
     "application/json",
@@ -382,7 +383,9 @@ class VaultApp:
         )
         log["upstream_status"] = upstream.status_code
 
-        if route.stream:
+        # Only real streams are relayed as they arrive. Anything else on a stream route (JSON
+        # errors especially, which is where upstreams echo keys) is buffered and scrubbed.
+        if route.stream and _is_stream(upstream.headers.get("content-type", "")):
             log.update(streamed=True, scrubbed=header_hits)
             streamed = StreamingResponse(
                 _relay(upstream),
@@ -416,6 +419,10 @@ class VaultApp:
             (b"content-length", str(len(content)).encode()),
         ]
         return response
+
+
+def _is_stream(content_type: str) -> bool:
+    return content_type.lower().split(";", 1)[0].strip() in _STREAM_TYPES
 
 
 def _raw(headers: list[tuple[str, str]]) -> list[tuple[bytes, bytes]]:

@@ -1,0 +1,19 @@
+# S1: an OpenAI-compatible inference API. Static bearer key, JSON, streamed responses.
+credentials:
+  inference-key:
+    kind: header
+    secret: store:inference-key # sent as "Authorization: Bearer <key>"
+
+routes:
+  - name: inference
+    prefix: /inference
+    upstream: https://api.openai.com
+    credential: inference-key
+    stream: true # completions may stream server-sent events
+    callers:
+      - placeholder: ph-replace-inference-0000
+    rules:
+      - methods: [POST]
+        paths: [/v1/chat/completions, /v1/embeddings]
+      - methods: [GET]
+        paths: [/v1/models]

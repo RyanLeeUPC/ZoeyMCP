@@ -313,6 +313,9 @@ For each request, in order:
    - The vault asks upstreams for `Accept-Encoding: identity`, or decompresses before scanning,
      and recomputes `Content-Length`.
    - Streamed and larger bodies aren't scrubbed. The docs say so.
+   - On a `stream` route, only real streams (`text/event-stream`, `application/x-ndjson`)
+     are relayed as they arrive. Anything else, JSON errors especially, is buffered and
+     scrubbed like any other response.
 9. Log one JSON line: route, method, path template (not the raw path), status, bytes, duration,
    caller identity name. No placeholders, no secrets, no query values.
 
@@ -330,10 +333,12 @@ Paths are matched segment by segment:
 ```yaml
 rules:
   - methods: [GET]
-    paths: [/api/docs/{doc}/tables/**]
+    paths:
+      - /api/docs/{doc}/tables/**
     params: {doc: [d7Q2xk]}
   - methods: [PATCH, POST]
-    paths: [/api/docs/{doc}/tables/{table}/records]
+    paths:
+      - /api/docs/{doc}/tables/{table}/records
     params: {doc: [d7Q2xk], table: {regex: "[A-Za-z0-9_]{1,64}"}}
 ```
 

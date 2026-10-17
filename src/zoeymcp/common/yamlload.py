@@ -90,7 +90,13 @@ def load_mapping(text: str, *, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[str, 
     try:
         data = yaml.load(text, Loader=StrictLoader)  # noqa: S506 - StrictLoader is a SafeLoader
     except yaml.YAMLError as exc:
-        raise YAMLRejected(f"invalid YAML: {exc}") from exc
+        message = f"invalid YAML: {exc}"
+        if "flow" in str(exc) and "'{'" in str(exc):
+            message += (
+                " (hint: in an inline [a, b] list, {name} starts a mapping; "
+                "put each path on its own '- ' line, or quote it)"
+            )
+        raise YAMLRejected(message) from exc
     if not isinstance(data, dict):
         raise YAMLRejected("the top level must be a mapping")
     for key in data:
