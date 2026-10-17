@@ -4,7 +4,9 @@ A self-hosted proxy that lets AI agents use outside APIs and MCP servers **witho
 real credential**, and that asks a human to approve the **exact arguments** of every consequential
 action.
 
-> Status: design phase. Nothing is built yet. See [docs/design.md](docs/design.md).
+> **Not ready for use.** Early development: the vault works on its own, but the gateway,
+> approvals, OAuth and the admin portal don't exist yet, and nothing has been reviewed or
+> released. Don't deploy it. See [docs/design.md](docs/design.md) for where it's going.
 
 ## What it does
 
