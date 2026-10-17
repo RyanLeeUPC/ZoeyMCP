@@ -214,8 +214,8 @@ def _client_secret(client: Client) -> Secret:
 
 @dataclass(frozen=True)
 class TokenResponse:
-    """What came back from the token endpoint. ``body`` is at most ``MAX_TOKEN_BODY + 1`` bytes:
-    the reader stops one byte past the cap, so an oversized body is seen as such."""
+    """What came back from the token endpoint. The reader stops at the first chunk that takes
+    ``body`` past ``MAX_TOKEN_BODY`` bytes, so an oversized body is seen as such."""
 
     status: int
     body: bytes
