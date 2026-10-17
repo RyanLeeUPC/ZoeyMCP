@@ -20,20 +20,20 @@ def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
 def test_check_example_file() -> None:
     code, out = run(["check", "--config", str(EXAMPLE_POLICY)])
     assert code == EXIT_OK
-    assert out.strip().endswith("ok (0 error(s), 0 warning(s))")
+    assert out.strip().endswith("ok (0 error(s), 1 warning(s))")
 
 
 def test_check_from_stdin(example_text: str) -> None:
     code, out = run(["check", "--config", "-"], stdin=example_text)
     assert code == EXIT_OK
-    assert out.startswith("<stdin>: ok")
+    assert out.splitlines()[-1] == "<stdin>: ok (0 error(s), 1 warning(s))"
 
 
 def test_check_from_env(example_text: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZOEYMCP_CONFIG", example_text)
     code, out = run(["check"])
     assert code == EXIT_OK
-    assert out.startswith("$ZOEYMCP_CONFIG: ok")
+    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 1 warning(s))"
 
 
 def test_check_reports_errors_as_json(example_text: str) -> None:
@@ -46,7 +46,8 @@ def test_check_reports_errors_as_json(example_text: str) -> None:
     assert report["ok"] is False
     assert report["readable"] is True
     assert report["errors"] == 1
-    assert report["findings"][0]["path"] == "routes[1].callers"
+    found = [f["path"] for f in report["findings"] if f["level"] == "error"]
+    assert found == ["routes[1].callers"]
 
 
 def test_schema_errors_exit_with_findings() -> None:

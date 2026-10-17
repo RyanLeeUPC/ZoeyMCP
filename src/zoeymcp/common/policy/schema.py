@@ -21,6 +21,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -34,6 +35,9 @@ _HOSTNAME = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 _ADDRESS = re.compile(r"^[^@\s<>\"]{1,64}@[A-Za-z0-9.-]{1,253}$")
+# One scope token: RFC 6749 NQCHAR (printable ASCII without space, double quote or backslash).
+_SCOPE_TOKEN = re.compile(r"^[\x21\x23-\x5B\x5D-\x7E]{1,256}$")
+MAX_SCOPES = 64
 
 Name = Annotated[str, StringConstraints(pattern=NAME_PATTERN)]
 SecretRef = Annotated[str, StringConstraints(pattern=SECRET_REF_PATTERN)]
@@ -46,6 +50,9 @@ CaptureName = Annotated[str, StringConstraints(pattern=r"^[a-z_][a-z0-9_]{0,31}$
 ModulePath = Annotated[
     str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 ]
+ParamText = Annotated[str, Field(max_length=2048)]
+ParamValue = ParamText | Annotated[list[ParamText], Field(min_length=1, max_length=10)]
+ClientAuth = Literal["basic", "post", "none"]
 Method = Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 Capability = Literal["resources", "prompts", "sampling", "elicitation", "roots"]
 
@@ -77,6 +84,40 @@ def _check_url(value: str, *, schemes: tuple[str, ...], allow_path: bool) -> str
         _ = parts.port
     except ValueError as exc:
         raise ValueError(f"invalid port: {exc}") from exc
+    return value
+
+
+def _check_redirect_uri(value: str) -> str:
+    _check_url(value, schemes=("https", "http"), allow_path=True)
+    parts = urlsplit(value)
+    host = parts.hostname or ""
+    name = host.rstrip(".")  # a trailing dot names the same host
+    if name == "localhost" or name.endswith(".localhost"):
+        raise ValueError("use 127.0.0.1; RFC 8252 section 8.3 and some providers refuse localhost")
+    if parts.scheme == "http":
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            raise ValueError("http is only allowed with a loopback IP address like 127.0.0.1")
+    return value
+
+
+def split_scope(scope: str | None, separator: str) -> list[str]:
+    """The scopes in a ``scope`` string; none when it isn't set."""
+    return [] if scope is None else scope.split(separator)
+
+
+def param_values(value: str | list[str]) -> list[str]:
+    """A parameter's values: one, or several when it's repeated."""
+    return [value] if isinstance(value, str) else value
+
+
+def _check_params(value: dict[str, str | list[str]]) -> dict[str, str | list[str]]:
+    for item in value.values():
+        for text in param_values(item):
+            _no_line_breaks(text)
     return value
 
 
@@ -202,23 +243,96 @@ class OAuth2Credential(_Model):
     grant: Literal["refresh_token", "client_credentials"] = "refresh_token"
     client_id: Annotated[str, Field(min_length=1, max_length=512)]
     client_secret: SecretRef | None = None
+    # None means basic with a client secret, none without.
+    client_auth: ClientAuth | None = None
     refresh_token: SecretRef | None = None
     rotates: bool = False
     reseed: Literal["never", "on-change"] = "never"
-    extra_params: dict[QueryParam, Annotated[str, Field(max_length=2048)]] = {}
+    # Token requests. A list value is sent as a repeated parameter (several resources).
+    extra_params: dict[QueryParam, ParamValue] = {}
+    token_body: Literal["form", "json"] = "form"  # noqa: S105
+    token_headers: dict[HeaderName, Annotated[str, Field(min_length=1, max_length=256)]] = {}
+    # Scopes and lifetimes. The separator comes first so the scope validator can see it.
+    scope_separator: Literal[" ", ","] = " "
     scope: Annotated[str, Field(max_length=2048)] | None = None
     expected_scopes: list[Annotated[str, Field(min_length=1, max_length=256)]] = []
     refresh_skew: Annotated[int, Field(ge=0, le=3600)] = 120
+    default_expires_in: Annotated[int, Field(ge=60, le=86400)] = 3600
+    grant_lifetime_days: Annotated[int, Field(ge=1, le=3650)] | None = None
+    # Interactive consent: zoeymcp login.
+    authorize_url: str | None = None
+    authorize_params: dict[QueryParam, ParamValue] = {}
+    redirect_uri: str = "http://127.0.0.1/callback"
+    issuer: str | None = None
 
     @field_validator("token_url")
     @classmethod
     def _valid_token_url(cls, value: str) -> str:
         return _check_url(value, schemes=("https", "http"), allow_path=True)
 
+    @field_validator("authorize_url", "issuer")
+    @classmethod
+    def _valid_optional_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _check_url(value, schemes=("https", "http"), allow_path=True)
+
+    @field_validator("redirect_uri")
+    @classmethod
+    def _valid_redirect_uri(cls, value: str) -> str:
+        return _check_redirect_uri(value)
+
     @field_validator("client_id")
     @classmethod
     def _valid_client_id(cls, value: str) -> str:
         return _no_line_breaks(value)
+
+    @field_validator("extra_params", "authorize_params")
+    @classmethod
+    def _valid_params(cls, value: dict[str, str | list[str]]) -> dict[str, str | list[str]]:
+        return _check_params(value)
+
+    @field_validator("token_headers")
+    @classmethod
+    def _valid_token_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        for text in value.values():
+            _no_line_breaks(text)
+        return value
+
+    @field_validator("scope")
+    @classmethod
+    def _valid_scope(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        separator = info.data.get("scope_separator", " ")
+        scopes = split_scope(value, separator)
+        if len(scopes) > MAX_SCOPES:
+            raise ValueError(f"at most {MAX_SCOPES} scopes")
+        for scope in scopes:
+            if not _SCOPE_TOKEN.match(scope):
+                raise ValueError(
+                    f"invalid scope {scope!r}: 1 to 256 printable ASCII characters, without "
+                    "spaces, quotes or backslashes, separated by one scope_separator"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _client_auth_matches_secret(self) -> OAuth2Credential:
+        if self.client_auth in ("basic", "post") and self.client_secret is None:
+            raise ValueError(f"client_auth {self.client_auth} needs a client_secret")
+        if self.client_auth == "none" and self.client_secret is not None:
+            raise ValueError("client_auth none takes no client_secret")
+        return self
+
+    @property
+    def effective_client_auth(self) -> ClientAuth:
+        if self.client_auth is not None:
+            return self.client_auth
+        return "basic" if self.client_secret is not None else "none"
+
+    @property
+    def effective_expected_scopes(self) -> list[str]:
+        return self.expected_scopes or split_scope(self.scope, self.scope_separator)
 
 
 Credential = Annotated[

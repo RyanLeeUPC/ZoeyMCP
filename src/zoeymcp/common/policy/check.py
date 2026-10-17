@@ -25,6 +25,8 @@ from .schema import (
     RemoteServer,
     Route,
     is_secret_ref,
+    param_values,
+    split_scope,
 )
 
 MIN_TOKEN_LENGTH = 16
@@ -40,6 +42,49 @@ _RESERVED_HEADERS = frozenset(
         "proxy-authorization",
     }
 )
+# Store entries under this prefix belong to the vault (live refresh tokens).
+_VAULT_PREFIX = "store:oauth."
+# Parameters the vault sets itself on token requests and on the authorization request.
+# scope, request and request_uri are refused too, with their own messages.
+_TOKEN_PARAMS = frozenset(
+    {
+        "grant_type",
+        "refresh_token",
+        "client_id",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "redirect_uri",
+        "client_assertion",
+        "client_assertion_type",
+    }
+)
+_AUTHORIZE_PARAMS = frozenset(
+    {
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "code_verifier",
+        "client_secret",
+    }
+)
+_TOKEN_HEADERS = frozenset(
+    {
+        "authorization",
+        "content-type",
+        "content-length",
+        "host",
+        "accept",
+        "cookie",
+        "transfer-encoding",
+    }
+)
+# An absolute URI without a fragment (RFC 8707 section 2), in any scheme.
+_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:[^#\x00-\x20\x7f]+$")
+_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 class _Report:
@@ -54,9 +99,11 @@ class _Report:
 
 
 def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) -> list[Finding]:
-    """Return every finding for ``policy``. With ``environ``, ``env:`` references must resolve."""
+    """Return every finding for ``policy``. With ``environ``, ``env:`` references must resolve;
+    an unset refresh-token seed is only a warning, since the live token is in the store."""
     report = _Report()
     _check_secret_refs(policy, report, environ)
+    _check_oauth_refs(policy, report)
     _check_credentials(policy, report)
     _check_routes(policy, report)
     _check_tokens(policy, report)
@@ -93,11 +140,14 @@ def secret_references(policy: Policy) -> list[tuple[str, str, bool]]:
 
 def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, str] | None) -> None:
     for path, ref, is_seed in secret_references(policy):
+        if ref.startswith(_VAULT_PREFIX):
+            report.error(path, "the store:oauth. prefix is reserved for entries the vault manages")
         if not ref.startswith("env:"):
             continue
         var = ref.removeprefix("env:")
         if is_seed:
-            cred = policy.credentials.get(path.split(".")[1])
+            name = path.split(".")[1]
+            cred = policy.credentials.get(name)
             if getattr(cred, "reseed", "never") == "on-change":
                 effect = "a changed env value replaces the live token (reseed: on-change)"
             else:
@@ -105,7 +155,8 @@ def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, st
             report.warning(
                 path,
                 f"refresh token seeded from env var {var}: the live token is kept in the "
-                f"store, and {effect}",
+                f"store as oauth.{name}.live, and {effect}; "
+                f"zoeymcp secret delete oauth.{name}.live forces a re-seed",
             )
         else:
             report.warning(
@@ -114,7 +165,75 @@ def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, st
                 "origins; prefer store:<name>",
             )
         if environ is not None and var not in environ:
-            report.error(path, f"env var {var} is not set")
+            if is_seed:
+                # The live token is in the store, so the seed may go once it has been used.
+                report.warning(
+                    path,
+                    f"seed env var {var} is not set; the vault uses the live token in the "
+                    "store, if there is one",
+                )
+            else:
+                report.error(path, f"env var {var} is not set")
+
+
+def _check_oauth_refs(policy: Policy, report: _Report) -> None:
+    """OAuth secrets are used by OAuth credentials only, and go to one token endpoint.
+
+    A refresh token is replaced in place on every rotation, so its ref has no other use at all.
+    """
+    oauth: dict[str, list[str]] = defaultdict(list)
+    other: dict[str, list[str]] = defaultdict(list)
+    refresh: dict[str, list[str]] = defaultdict(list)
+    token_origins: dict[str, set[str]] = defaultdict(set)
+    for path, ref, _ in secret_references(policy):
+        owner = path.split(".")[1]
+        cred = policy.credentials[owner] if path.startswith("credentials.") else None
+        if isinstance(cred, OAuth2Credential):
+            oauth[ref].append(path)
+            token_origins[ref].add(_origin(cred.token_url) or cred.token_url)
+            if path.endswith(".refresh_token"):
+                refresh[ref].append(path)
+        else:
+            other[ref].append(path)
+    for ref, paths in refresh.items():
+        if len(paths) > 1:
+            for p in paths:
+                report.error(
+                    p,
+                    f"{ref} is the refresh token of {', '.join(paths)}; "
+                    "they would rotate it out from under each other",
+                )
+        others = [p for p in oauth[ref] if p not in paths]
+        if others:
+            for p in oauth[ref]:
+                report.error(
+                    p,
+                    f"{ref} is the refresh token of {', '.join(paths)} and is also used by "
+                    f"{', '.join(others)}; rotation would overwrite it",
+                )
+    for ref, paths in oauth.items():
+        if len(token_origins[ref]) > 1:
+            for p in paths:
+                report.error(
+                    p,
+                    f"{ref} would be sent to the token endpoints "
+                    f"{', '.join(sorted(token_origins[ref]))}; an OAuth secret is bound to one",
+                )
+        users = other.get(ref, [])
+        if not users:
+            continue
+        for p in paths:
+            report.error(
+                p,
+                f"{ref} is also used by {', '.join(users)}; "
+                "an OAuth secret must never be injectable as a static secret",
+            )
+        for p in users:
+            report.error(
+                p,
+                f"{ref} is an OAuth secret of {', '.join(paths)}; "
+                "it must never be injectable as a static secret",
+            )
 
 
 # --- credentials -------------------------------------------------------------------------------
@@ -125,33 +244,159 @@ def _check_credentials(policy: Policy, report: _Report) -> None:
     used_connectors = {r.connector for r in policy.routes if r.connector is not None}
     for name, cred in policy.credentials.items():
         path = f"credentials.{name}"
+        is_oauth = isinstance(cred, OAuth2Credential)
         if name not in used:
-            report.warning(path, "not used by any route")
+            report.warning(
+                path,
+                "not used by any route: login and refresh will refuse; access tokens would "
+                "have no resource origins"
+                if is_oauth
+                else "not used by any route",
+            )
         if isinstance(cred, OAuth2Credential):
-            _check_oauth(path, cred, report)
+            upstreams = [r.upstream for r in policy.routes if r.credential == name and r.upstream]
+            origins = {o for o in map(_origin, upstreams) if o is not None}
+            _check_oauth(path, cred, origins, report)
     for name in policy.connectors:
         if name not in used_connectors:
             report.warning(f"connectors.{name}", "not used by any route")
 
 
-def _check_oauth(path: str, cred: OAuth2Credential, report: _Report) -> None:
+def _origin(url: str) -> str | None:
+    """``scheme://host:port`` for an http(s) URL, or None when its port is invalid."""
+    parts = urlsplit(url)  # lowercases the scheme and the host
+    try:
+        port = parts.port or _DEFAULT_PORTS[parts.scheme]
+    except ValueError:
+        return None
+    return f"{parts.scheme}://{parts.hostname}:{port}"
+
+
+def _check_oauth(path: str, cred: OAuth2Credential, origins: set[str], report: _Report) -> None:
     if urlsplit(cred.token_url).scheme != "https":
         report.error(f"{path}.token_url", "the token endpoint must use https")
+    if cred.authorize_url is not None and urlsplit(cred.authorize_url).scheme != "https":
+        report.error(f"{path}.authorize_url", "the authorization endpoint must use https")
+    if cred.issuer is not None and urlsplit(cred.issuer).scheme != "https":
+        report.error(f"{path}.issuer", "the issuer must use https")
+    if is_secret_ref(cred.client_id) and cred.authorize_url is not None:
+        report.error(
+            f"{path}.client_id",
+            "client IDs are public and appear in the authorization URL; write it in the policy",
+        )
     if cred.grant == "refresh_token":
-        if cred.refresh_token is None:
-            report.error(f"{path}.refresh_token", "required for the refresh_token grant")
+        _check_refresh_grant(path, cred, report)
     else:
-        if cred.refresh_token is not None:
-            report.error(f"{path}.refresh_token", "not used by the client_credentials grant")
-        if cred.client_secret is None:
-            report.error(f"{path}.client_secret", "required for the client_credentials grant")
-        if cred.rotates:
-            report.error(f"{path}.rotates", "client_credentials tokens don't rotate")
-    if cred.reseed == "on-change" and not (cred.refresh_token or "").startswith("env:"):
+        _check_client_credentials(path, cred, report)
+    if cred.reseed == "on-change" and not _env_seeded(cred):
         report.warning(f"{path}.reseed", "only meaningful for a refresh token seeded from env:")
-    for param in ("grant_type", "refresh_token", "client_id", "client_secret", "code"):
-        if param in cred.extra_params:
+    _check_oauth_params(path, cred, report)
+    _check_oauth_scopes(path, cred, report)
+    _check_resources(path, cred, origins, report)
+
+
+def _env_seeded(cred: OAuth2Credential) -> bool:
+    return (cred.refresh_token or "").startswith("env:")
+
+
+def _check_refresh_grant(path: str, cred: OAuth2Credential, report: _Report) -> None:
+    if cred.refresh_token is None:
+        report.error(f"{path}.refresh_token", "required for the refresh_token grant")
+    if cred.authorize_url is None:
+        report.warning(
+            f"{path}.authorize_url",
+            "zoeymcp login can't run; enter the refresh token with secret set or seed it from env:",
+        )
+    if not cred.rotates and cred.effective_client_auth == "none":
+        report.warning(
+            f"{path}.rotates",
+            "public clients' refresh tokens usually rotate (RFC 9700 section 2.2.2); "
+            "set rotates: true",
+        )
+    if cred.reseed == "on-change" and cred.rotates and _env_seeded(cred):
+        report.warning(
+            f"{path}.reseed",
+            "a changed or rolled-back env value replaces the live token; an old rotating seed "
+            "is dead, and presenting it may revoke the grant",
+        )
+
+
+def _check_client_credentials(path: str, cred: OAuth2Credential, report: _Report) -> None:
+    grant = "the client_credentials grant"
+    if cred.refresh_token is not None:
+        report.error(f"{path}.refresh_token", f"not used by {grant}")
+    if cred.client_secret is None:
+        report.error(f"{path}.client_secret", f"required for {grant}")
+    if cred.rotates:
+        report.error(f"{path}.rotates", "client_credentials tokens don't rotate")
+    if cred.authorize_url is not None:
+        report.error(f"{path}.authorize_url", f"not used by {grant}")
+    if cred.client_auth == "none":
+        report.error(f"{path}.client_auth", f"none can't be used with {grant}")
+    if cred.grant_lifetime_days is not None:
+        report.warning(f"{path}.grant_lifetime_days", f"not used by {grant}")
+
+
+def _check_oauth_params(path: str, cred: OAuth2Credential, report: _Report) -> None:
+    for param in cred.extra_params:
+        if param.lower() == "scope":
+            report.error(f"{path}.extra_params.{param}", "use the scope field")
+        elif param.lower() in _TOKEN_PARAMS:
             report.error(f"{path}.extra_params.{param}", "set by the vault; can't be overridden")
+    for param in cred.authorize_params:
+        if param.lower() == "scope":
+            report.error(f"{path}.authorize_params.{param}", "use the scope field")
+        elif param.lower() in ("request", "request_uri"):
+            report.error(
+                f"{path}.authorize_params.{param}",
+                "request objects aren't supported; one could carry a different redirect_uri",
+            )
+        elif param.lower() in _AUTHORIZE_PARAMS:
+            report.error(
+                f"{path}.authorize_params.{param}", "set by the vault; can't be overridden"
+            )
+    for header in cred.token_headers:
+        name = header.lower()
+        if name in _TOKEN_HEADERS or name.startswith("x-zoeymcp-"):
+            report.error(f"{path}.token_headers.{header}", f"{header!r} is set by the vault")
+
+
+def _check_oauth_scopes(path: str, cred: OAuth2Credential, report: _Report) -> None:
+    if cred.authorize_url is not None and not cred.effective_expected_scopes:
+        report.warning(f"{path}.expected_scopes", "granted scopes can't be checked")
+    if cred.expected_scopes:
+        expected = set(cred.expected_scopes)
+        for scope in split_scope(cred.scope, cred.scope_separator):
+            if scope not in expected:
+                report.warning(
+                    f"{path}.scope", f"requested scope {scope!r} isn't in expected_scopes"
+                )
+
+
+def _check_resources(path: str, cred: OAuth2Credential, origins: set[str], report: _Report) -> None:
+    for field, params in (
+        ("extra_params", cred.extra_params),
+        ("authorize_params", cred.authorize_params),
+    ):
+        for value in param_values(params.get("resource", [])):
+            if not _RESOURCE.match(value):
+                report.error(
+                    f"{path}.{field}.resource",
+                    f"{value!r} must be an absolute URI without a fragment (RFC 8707)",
+                )
+    r_path = f"{path}.extra_params.resource"
+    if "resource" not in cred.extra_params:
+        return
+    for value in param_values(cred.extra_params["resource"]):
+        scheme = urlsplit(value).scheme
+        if scheme == "http":
+            report.warning(r_path, f"{value!r} uses plain http")
+        if scheme in _DEFAULT_PORTS and _origin(value) not in origins:
+            report.warning(
+                r_path, f"{value!r} isn't the origin of a route that uses this credential"
+            )
+    if cred.authorize_url is not None and "resource" not in cred.authorize_params:
+        report.warning(r_path, "RFC 8707: send it on the authorization request too")
 
 
 # --- routes ------------------------------------------------------------------------------------
