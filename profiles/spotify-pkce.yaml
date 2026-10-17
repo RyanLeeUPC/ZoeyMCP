@@ -1,0 +1,34 @@
+# S6: Spotify, read-only, through OAuth (authorization code with PKCE, a public client with no
+# client secret, refresh tokens that rotate on every use). Create an app in the Spotify developer
+# dashboard, register the redirect URI http://127.0.0.1/callback exactly (no port; never
+# localhost), replace client_id, then run `zoeymcp login spotify`.
+#
+# Spotify notes: every refresh returns a new refresh token and the old one stops working, so the
+# vault saves each one before using the access token. The grant ends 6 months after consent;
+# `zoeymcp oauth status` warns before then, and `zoeymcp login spotify` renews it.
+credentials:
+  spotify:
+    kind: oauth2
+    token_url: https://accounts.spotify.com/api/token
+    authorize_url: https://accounts.spotify.com/authorize
+    client_id: 0123456789abcdef0123456789abcdef
+    client_auth: none
+    refresh_token: store:spotify-refresh
+    rotates: true
+    grant_lifetime_days: 180
+    scope: user-read-currently-playing user-top-read
+
+routes:
+  - name: spotify
+    prefix: /spotify
+    upstream: https://api.spotify.com
+    credential: spotify
+    callers:
+      - placeholder: ph-replace-spotify-0000000
+    rules:
+      - methods: [GET]
+        paths:
+          - /v1/me/player/currently-playing
+          - /v1/me/top/{type}
+        params:
+          type: [artists, tracks]

@@ -29,6 +29,7 @@ docker run --rm "$image" --version
 [ "$(docker run --rm --entrypoint id "$image" -u)" = "10001" ] || fail "image doesn't run as uid 10001"
 
 step "check and selftest --mutate on the example policy"
+# The broker case expects 200: the self-test plays the OAuth token endpoint with dummy values.
 # shellcheck disable=SC2086
 docker run --rm $hardened -v "$examples:/examples:ro" "$image" check --config /examples/policy.yaml
 # shellcheck disable=SC2086
@@ -73,6 +74,11 @@ docker exec "$name" zoeymcp secret list | grep -q '^music-stats ' || fail "secre
 if docker exec "$name" grep -q 'lfm-smoke-0123456789' /state/store.json; then
     fail "the store file contains the secret value"
 fi
+
+step "oauth status through the admin socket"
+out="$(docker exec "$name" zoeymcp oauth status)"
+echo "$out"
+echo "$out" | grep -q '^broker-mcp: idle$' || fail "broker-mcp isn't listed as idle"
 
 step "the container is read-only outside its tmpfs and volume"
 if docker exec "$name" sh -c 'touch /opt/zoeymcp/x' 2>/dev/null; then

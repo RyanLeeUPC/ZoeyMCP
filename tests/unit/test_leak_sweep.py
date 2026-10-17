@@ -345,9 +345,9 @@ async def test_nothing_secret_leaves_the_vault(
     code, out, _ = await world.cli(["login", "music", "--start"])
     assert code == 0
     [url] = PRINTED_URL.findall(out)
-    flow = re.findall(r"--flow (\S+)", out)[0]
+    flow = re.findall(r"--flow=(\S+)", out)[0]
     pasted = await world.browse(url)
-    argv = ["login", "music", "--flow", flow]
+    argv = ["login", "music", f"--flow={flow}"]
     code, _, err = await world.cli(argv, with_query(pasted, state="another-login") + "\n")
     assert (code, err) == (1, "zoeymcp login: the address is for a different login\n")
 
@@ -357,7 +357,7 @@ async def test_nothing_secret_leaves_the_vault(
     refused = f"{REDIRECT}?" + urlencode(
         {"error": "access_denied", "error_description": SENTINEL, "state": state}
     )
-    code, _, err = await world.cli(["login", "music", "--flow", started["flow"]], refused)
+    code, _, err = await world.cli(["login", "music", f"--flow={started['flow']}"], refused)
     assert code == 1
     assert f"the provider says: {SENTINEL}" in err
 

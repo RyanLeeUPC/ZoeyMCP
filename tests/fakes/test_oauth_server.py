@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import threading
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -231,6 +233,28 @@ async def test_hostile_knobs() -> None:
     server.drop_after_processing = 1
     with pytest.raises(DroppedConnection):
         await refresh(server, body["refresh_token"], client_id=server.client_id)
+
+
+async def test_a_latch_holds_token_calls_until_another_thread_sets_it() -> None:
+    server = spotify_style(Clock())
+    server.latch = latch = threading.Event()
+    call = asyncio.create_task(refresh(server, server.issue_grant(), client_id=server.client_id))
+    await server.arrived()
+    await asyncio.sleep(0.05)
+    assert not call.done()
+    assert server.calls[-1].status == 0
+    await asyncio.to_thread(latch.set)
+    assert (await call).status_code == 200
+
+
+async def test_dropped_access_tokens_leave_the_refresh_token_working() -> None:
+    server = spotify_style(Clock())
+    body = (await refresh(server, server.issue_grant(), client_id=server.client_id)).json()
+    server.drop_access_tokens()
+    assert not server.access_ok(body["access_token"])
+    again = await refresh(server, body["refresh_token"], client_id=server.client_id)
+    assert again.status_code == 200
+    assert server.access_ok(again.json()["access_token"])
 
 
 async def test_revocation_and_the_resource_server() -> None:

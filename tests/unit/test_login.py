@@ -942,6 +942,19 @@ async def test_no_expected_scopes_flags_nothing(tmp_path: Path, clock: FakeClock
     assert (done["unexpected_scopes"], done["missing_scopes"]) == ([], [])
 
 
+async def test_an_empty_scope_grants_nothing(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    """An empty ``scope`` in the token response means nothing was granted (design D.7)."""
+    rig = spotify_rig(tmp_path, clock)
+    rig.server.granted_scopes = ()
+    done = await rig.login_once()
+    assert (done["granted_scopes"], done["unexpected_scopes"]) == ([], [])
+    assert done["missing_scopes"] == SPOTIFY_SCOPES
+    [narrowed] = captured.events("oauth_scope_narrowed")
+    assert narrowed["scopes"] == SPOTIFY_SCOPES
+
+
 async def test_a_login_with_an_env_seed_supersedes_it(tmp_path: Path, clock: FakeClock) -> None:
     cred = spotify(refresh_token="env:MUSIC_REFRESH")
     rig = Rig(tmp_path, clock, make_policy({"music": cred}), env={"MUSIC_REFRESH": "fake-seed"})

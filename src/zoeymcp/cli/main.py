@@ -244,7 +244,7 @@ def _cmd_login(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
         if args.start:
             out.write(
                 f"\nThen, within {minutes} minutes, run: zoeymcp login {args.credential} "
-                f"--flow {started['flow']}\nand give it the address your browser was sent to.\n"
+                f"--flow={started['flow']}\nand give it the address your browser was sent to.\n"
             )
             return EXIT_OK
         how = "input hidden" if stdin.isatty() else "one line on stdin"

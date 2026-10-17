@@ -499,7 +499,10 @@ class TokenManager:
             refresh_token=refresh_token,
             client=client if isinstance(client, Client) else None,
         )
-        granted = minted.scope or tuple(split_scope(cfg.cred.scope, cfg.cred.scope_separator))
+        # No scope in the response: the requested ones. An empty one grants nothing (D.7).
+        granted = minted.scope
+        if granted is None:
+            granted = tuple(split_scope(cfg.cred.scope, cfg.cred.scope_separator))
         self._granted[credential] = granted
         self._upstream.pop(credential, None)
         logs.event("oauth_cache_reset", credential=credential, reason="login")

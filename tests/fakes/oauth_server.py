@@ -17,6 +17,7 @@ import base64
 import enum
 import hashlib
 import json
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 Clock = Callable[[], float]
 ClientAuth = Literal["basic", "post", "none"]
@@ -42,6 +44,7 @@ MISSING: Final = _Missing.MISSING
 """A knob set to this leaves the field out of the token response."""
 
 DEFAULT_REDIRECT: Final = "http://127.0.0.1/callback"
+LATCH_TIMEOUT: Final = 30.0
 INSUFFICIENT_SCOPE_PATH: Final = "/forbidden"
 
 
@@ -51,6 +54,28 @@ class DroppedConnection(httpx.ReadError):
     Over ``ASGITransport`` it reaches the client as a read error: the request was handled, and
     the answer was lost.
     """
+
+
+class _Dropped(Response):
+    """Sends the status line and headers of ``response``, then drops the connection.
+
+    Raising after the response started is how an ASGI app breaks a connection: a real server
+    (uvicorn) closes it with the body missing, so the client gets a protocol error. Over
+    ``ASGITransport`` the exception itself reaches the client.
+    """
+
+    def __init__(self, response: Response) -> None:
+        self._response = response
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self._response.status_code,
+                "headers": self._response.raw_headers,
+            }
+        )
+        raise DroppedConnection("connection reset after the token was issued")
 
 
 @dataclass
@@ -150,6 +175,8 @@ class FakeAuthServer:
         self.bad_refresh_token_shape = False
         self.delay = 0.0
         self.gate: asyncio.Event | None = None
+        # Like ``gate``, for a test on another thread than the server's loop.
+        self.latch: threading.Event | None = None
         self.calls: list[TokenCall] = []
         self.revocations: list[str] = []
         self._failures: list[_Failure] = []
@@ -195,6 +222,14 @@ class FakeAuthServer:
         """Revoke every grant, as the user removing the app's access does."""
         for family in self._families:
             family.revoked = True
+
+    def drop_access_tokens(self) -> None:
+        """Forget every access token issued so far; refresh tokens keep working.
+
+        Providers do this on a password change or a key rotation: the resource server answers
+        401 to a token that hasn't expired yet.
+        """
+        self._access.clear()
 
     def hold(self) -> asyncio.Event:
         """Make token calls wait until the returned event is set."""
@@ -292,13 +327,15 @@ class FakeAuthServer:
         self._arrived.set()
         if self.gate is not None:
             await self.gate.wait()
+        if self.latch is not None:
+            await asyncio.to_thread(self.latch.wait, LATCH_TIMEOUT)
         if self.delay:
             await asyncio.sleep(self.delay)
         response = self._answer(call, params, headers)
         call.status = response.status_code
         if self.drop_after_processing:
             self.drop_after_processing -= 1
-            raise DroppedConnection("connection reset after the token was issued")
+            return _Dropped(response)
         return response
 
     def _answer(self, call: TokenCall, params: dict[str, str], headers: dict[str, str]) -> Response:
@@ -386,7 +423,7 @@ class FakeAuthServer:
         if challenge != code.challenge:
             return self._grant_error("PKCE verification failed", verifier)
         family = _Family(
-            scopes=self.granted_scopes or code.scopes,
+            scopes=code.scopes if self.granted_scopes is None else self.granted_scopes,
             consented_at=self.clock(),
             refresh_token=None,
         )

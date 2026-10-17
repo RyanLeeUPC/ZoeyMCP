@@ -1,0 +1,37 @@
+# S5: Google Calendar, read-only, through OAuth (authorization code with PKCE, a confidential
+# client, refresh tokens that don't rotate). Register a Desktop app client in the Google Cloud
+# console and replace client_id. Store the client secret with
+# `zoeymcp secret set google-client-secret`, then run `zoeymcp login google-calendar`.
+#
+# Google notes: while the consent screen is in Testing status, the grant must be renewed every
+# 7 days. There are at most 100 refresh tokens per account and client ID; logging in again
+# retires the oldest. A refresh token unused for 6 months stops working.
+credentials:
+  google-calendar:
+    kind: oauth2
+    token_url: https://oauth2.googleapis.com/token
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    client_id: 000000000000-example.apps.googleusercontent.com
+    client_secret: store:google-client-secret
+    client_auth: post
+    refresh_token: store:google-refresh
+    rotates: false
+    # Without both, Google issues no refresh token.
+    authorize_params: { access_type: offline, prompt: consent }
+    scope: https://www.googleapis.com/auth/calendar.readonly
+    # redirect_uri is left at the default http://127.0.0.1/callback.
+
+routes:
+  - name: google-calendar
+    prefix: /gcal
+    upstream: https://www.googleapis.com
+    credential: google-calendar
+    callers:
+      - placeholder: ph-replace-gcal-000000000
+    rules:
+      - methods: [GET]
+        paths:
+          - /calendar/v3/users/me/calendarList
+          - /calendar/v3/calendars/{cal}/events
+        params:
+          cal: [primary] # add the calendar IDs the agent may read

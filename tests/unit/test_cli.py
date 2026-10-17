@@ -3,6 +3,8 @@ from __future__ import annotations
 import getpass
 import io
 import json
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -285,7 +287,7 @@ def test_login_start_prints_the_url_and_the_flow(admin: FakeAdmin) -> None:
     code, out, err = cli(["login", "music", "--start", "--rebind", "--socket", "x"])
     assert code == EXIT_OK
     assert out == HEADER + (
-        "\nThen, within 10 minutes, run: zoeymcp login music --flow flow-0001\n"
+        "\nThen, within 10 minutes, run: zoeymcp login music --flow=flow-0001\n"
         "and give it the address your browser was sent to.\n"
     )
     assert err == ""
@@ -302,6 +304,22 @@ def test_login_flow_completes_from_stdin(admin: FakeAdmin) -> None:
         ("POST", "/oauth/music/complete", {"flow": "flow-0001", "redirect_url": PASTED})
     ]
     assert admin.timeouts == [76.0]
+
+
+def test_a_flow_id_may_start_with_a_dash(admin: FakeAdmin) -> None:
+    """Flow IDs are URL-safe base64, so one in 64 starts with a dash. The command --start
+    prints still parses."""
+    admin.answers[("POST", "/oauth/music/login")] = (200, {**STARTED, "flow": "-flow-0001"})
+    code, out, _ = cli(["login", "music", "--start", "--socket", "x"])
+    assert code == EXIT_OK
+    [printed] = re.findall(r"run: zoeymcp (login .*)$", out, re.MULTILINE)
+    code, out, _ = cli([*shlex.split(printed), "--socket", "x"], io.StringIO(PASTED))
+    assert (code, out) == (EXIT_OK, STORED)
+    assert admin.requests[-1] == (
+        "POST",
+        "/oauth/music/complete",
+        {"flow": "-flow-0001", "redirect_url": PASTED},
+    )
 
 
 def test_login_start_and_flow_exclude_each_other() -> None:
