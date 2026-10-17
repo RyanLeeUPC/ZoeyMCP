@@ -165,6 +165,10 @@ class VaultApp:
         self._env_secrets = snapshot_env_secrets(policy, self._environ)
         self._gateway_key = self._keys.gateway_key(policy.gateway_key_generation).encode()
 
+    @property
+    def policy(self) -> Policy:
+        return self._policy
+
     def reload(self, policy: Policy) -> None:
         self._install(policy)
 

@@ -19,6 +19,7 @@ import uvicorn
 
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
 from . import logs
+from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
 from .app import VaultApp
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
 from .store import SecretStore, StoreError
@@ -99,6 +100,8 @@ async def serve(
     *,
     config: str | None,
     environ: Mapping[str, str],
+    admin: AdminApp | None = None,
+    admin_socket: Path | None = None,
 ) -> None:
     servers = []
     for listen in listens:
@@ -110,6 +113,21 @@ async def serve(
                     host=host,
                     port=port,
                     proxy_headers=False,  # never trust X-Forwarded-For: callers can't spoof
+                    server_header=False,
+                    date_header=False,
+                    access_log=False,
+                    log_level="warning",
+                    lifespan="off",
+                )
+            )
+        )
+
+    if admin is not None and admin_socket is not None:
+        servers.append(
+            _Server(
+                uvicorn.Config(
+                    admin.app,
+                    uds=str(admin_socket),
                     server_header=False,
                     date_header=False,
                     access_log=False,
@@ -137,7 +155,11 @@ async def serve(
         loop.add_signal_handler(signal.SIGINT, stop)
         loop.add_signal_handler(signal.SIGHUP, reload)
     try:
-        logs.event("vault_started", listen=listens)
+        logs.event(
+            "vault_started",
+            listen=listens,
+            admin_socket=str(admin_socket) if admin_socket else None,
+        )
         await asyncio.gather(*(server.serve() for server in servers))
     finally:
         await app.aclose()
@@ -145,8 +167,24 @@ async def serve(
 
 
 def run(
-    config: str | None, listens: list[str], state_dir: Path, environ: Mapping[str, str]
+    config: str | None,
+    listens: list[str],
+    state_dir: Path,
+    environ: Mapping[str, str],
+    admin_socket: Path | None,
 ) -> None:
     runtime = load_runtime(config, state_dir, environ)
     app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ=environ)
-    asyncio.run(serve(app, listens, config=config, environ=environ))
+    admin = None
+    if admin_socket is not None and socket_supported():
+        try:
+            check_socket_dir(admin_socket)
+        except AdminSocketError as exc:
+            raise StartupError(str(exc)) from exc
+        admin = AdminApp(runtime.store, runtime.keys, lambda: app.policy, SetupCodes(state_dir))
+    elif admin_socket is not None:
+        logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
+        admin_socket = None
+    asyncio.run(
+        serve(app, listens, config=config, environ=environ, admin=admin, admin_socket=admin_socket)
+    )
