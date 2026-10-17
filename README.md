@@ -46,6 +46,11 @@ uv run mypy                      # strict type checks
 uv run zoeymcp check --config examples/policy.yaml
 ```
 
+Security-relevant behavior is covered by effect tests (a refused request really reaches
+nothing), acceptance tests per service shape over real TLS (`tests/acceptance`, using the
+shipped `profiles/`), and mutation testing of the security-critical modules in CI
+(`.github/workflows/mutation.yml`, gated at 89%).
+
 ## License
 
 [Apache License 2.0](LICENSE)

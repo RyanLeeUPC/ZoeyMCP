@@ -47,4 +47,4 @@ jobs:
             uv run --locked mutmut show "$name"
           done < survivors.txt
       - name: Gate
-        run: uv run --locked python scripts/mutation-gate.py mutants/mutmut-cicd-stats.json --min-score 0
+        run: uv run --locked python scripts/mutation-gate.py mutants/mutmut-cicd-stats.json --min-score 89
