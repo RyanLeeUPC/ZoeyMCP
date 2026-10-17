@@ -1,0 +1,35 @@
+{
+  "entries": {
+    "api-key": {
+      "binding": {
+        "origins": [
+          "https://api.example:443"
+        ]
+      },
+      "ciphertext": "UPfF1K4ofscLIphTtJQwPzemc+3HYPUcqvXyNJaF8DeUbg==",
+      "created": "2026-10-17T09:14:46Z",
+      "kid": "94229fc20fd18d94",
+      "nonce": "j5IWRDzvm7IGVE0+",
+      "updated": "2026-10-17T09:14:46Z"
+    },
+    "mail-pass": {
+      "binding": {
+        "smtp": {
+          "from": "A <a@mail.example>",
+          "host": "smtp.mail.example",
+          "port": 465,
+          "to": [
+            "p@mail.example"
+          ]
+        }
+      },
+      "ciphertext": "O830GutptkVwe69gXHbIJS3N2zhxqh2NJQ4iiuyHS33BR04=",
+      "created": "2026-10-17T09:14:46Z",
+      "kid": "94229fc20fd18d94",
+      "nonce": "IYZtU0aT4rMnYGCN",
+      "updated": "2026-10-17T09:14:46Z"
+    }
+  },
+  "format": 1,
+  "kid": "94229fc20fd18d94"
+}
