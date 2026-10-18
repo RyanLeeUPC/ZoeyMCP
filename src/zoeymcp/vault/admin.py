@@ -11,6 +11,9 @@ Secrets an oauth2 credential uses are written and deleted through the token mana
 waits for any refresh of that slot (design D.12). If the store can't write its file, the change
 is kept in memory and the answer is a 500 that says so (B.4).
 
+``zoeymcp gateway-key`` prints the gateway key and any rotation pending; ``--retire-previous``
+retires the previous key at once (M3 design C.2).
+
 ``zoeymcp login`` and ``oauth status|reset`` use the ``/oauth`` endpoints (design E.1). Their
 errors are ``{"error", "reason"}`` with a stable reason. No answer holds a token, code, verifier
 or secret; the authorization URL holds ``state`` and the PKCE challenge, which are useless
@@ -45,6 +48,7 @@ from ..common.policy.schema import Policy
 from ..common.textrules import find_violations
 from . import logs
 from .bindings import VAULT_PREFIX, BindingError, derive_binding, oauth_secret_names
+from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import KeySet
 from .oauth.login import LoginError, LoginService
 from .oauth.tokens import TokenManager
@@ -61,6 +65,7 @@ MAX_COMPLETE_BODY = 8 * 1024
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 NOT_WRITTEN = "kept in memory, not written to disk; check the state volume"
 NO_TOKENS = "OAuth needs the vault's token manager"
+NO_GATEWAY_KEYS = "the vault keeps no gateway key state"
 # Login reasons answered with something other than 400.
 _LOGIN_STATUS = {
     "not_oauth": 404,
@@ -178,9 +183,14 @@ class AdminApp:
         setup: SetupCodes,
         tokens: TokenManager | None = None,
         login: LoginService | None = None,
+        *,
+        gateway_keys: GatewayKeys | None = None,
     ) -> None:
+        """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
+        the policy and the previous key can't be retired here."""
         self._store = store
         self._keys = keys
+        self._gateway_keys = gateway_keys
         self._policy = policy
         self._setup = setup
         self._tokens = tokens
@@ -194,6 +204,7 @@ class AdminApp:
                 Route("/secrets/{name}", self._delete, methods=["DELETE"]),
                 Route("/setup-code", self._setup_code, methods=["POST"]),
                 Route("/gateway-key", self._gateway_key, methods=["GET"]),
+                Route("/gateway-key/retire-previous", self._retire_previous, methods=["POST"]),
                 Route("/oauth", self._oauth_status, methods=["GET"]),
                 Route("/oauth/flows/{flow}", self._oauth_cancel, methods=["DELETE"]),
                 Route("/oauth/{credential}/login", self._oauth_login, methods=["POST"]),
@@ -269,8 +280,21 @@ class AdminApp:
         return JSONResponse({"code": code, "expires": expires})
 
     async def _gateway_key(self, request: Request) -> Response:
-        generation = self._policy().gateway_key_generation
-        return JSONResponse({"generation": generation, "key": self._keys.gateway_key(generation)})
+        if self._gateway_keys is None:
+            generation = self._policy().gateway_key_generation
+            key = self._keys.gateway_key(generation)
+            return JSONResponse({"generation": generation, "key": key, "previous": None})
+        return JSONResponse(self._gateway_keys.info())
+
+    async def _retire_previous(self, request: Request) -> Response:
+        if self._gateway_keys is None:
+            return _error(503, NO_GATEWAY_KEYS)
+        try:
+            retired = self._gateway_keys.retire_previous()
+        except GatewayKeyError:
+            # The retirement took effect; only the file is behind (M3 design C.2).
+            return _error(500, NOT_WRITTEN)
+        return JSONResponse({"retired": retired, **self._gateway_keys.info()})
 
     # --- OAuth (design E.1) --------------------------------------------------------------------
 

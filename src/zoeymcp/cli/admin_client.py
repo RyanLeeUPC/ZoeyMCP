@@ -134,6 +134,13 @@ def gateway_key(socket: str, transport: httpx.BaseTransport | None = None) -> di
     return _request(socket, "GET", "/gateway-key", transport=transport)
 
 
+def gateway_key_retire_previous(
+    socket: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Retire the previous gateway key now. The answer is ``gateway_key``'s, plus ``retired``."""
+    return _request(socket, "POST", "/gateway-key/retire-previous", transport=transport)
+
+
 def oauth_login(
     socket: str, credential: str, *, rebind: bool, transport: httpx.BaseTransport | None = None
 ) -> dict[str, Any]:

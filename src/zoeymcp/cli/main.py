@@ -24,6 +24,7 @@ from ..common.policy import (
 )
 from ..common.policy.schema import hash_token
 from ..vault.admin import DEFAULT_SOCKET, SOCKET_ENV
+from ..vault.gatewaykeys import utc
 from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
 from ..vault.oauth.pkce import FLOW_TTL
 from . import admin_client
@@ -139,7 +140,20 @@ def _build_parser() -> argparse.ArgumentParser:
     selftest.add_argument("--mutate", action="store_true", help="also mutation-test the cases")
 
     commands.add_parser("setup-code", help="issue a one-time portal setup code (15 minutes)")
-    commands.add_parser("gateway-key", help="print the gateway key for the current generation")
+    gateway_key = commands.add_parser(
+        "gateway-key",
+        help="print the gateway key for the current generation",
+        description=(
+            "Print the gateway key for the current gateway_key_generation. After a bump, the "
+            "previous key stays accepted until the gateway first uses the new one, for at most 5 "
+            "minutes; while it is, a 'rotation pending' line goes to stderr."
+        ),
+    )
+    gateway_key.add_argument(
+        "--retire-previous",
+        action="store_true",
+        help="stop accepting the previous key now, for a suspected leak",
+    )
 
     login = commands.add_parser(
         "login",
@@ -230,9 +244,7 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
             out.write(f"{result['code']}\n")
             err.write("One-time code, valid for 15 minutes.\n")
         elif args.command == "gateway-key":
-            result = admin_client.gateway_key(socket)
-            out.write(f"ZOEYMCP_GATEWAY_KEY={result['key']}\n")
-            err.write(f"Generation {result['generation']}.\n")
+            _gateway_key(socket, args.retire_previous, out, err)
         elif args.action == "set":
             value = admin_client.read_secret_value(stdin)
             result = admin_client.secret_set(socket, args.name, value, args.origin)
@@ -253,6 +265,32 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
         err.write(f"zoeymcp {args.command}: {exc}\n")
         return EXIT_FINDINGS
     return EXIT_OK
+
+
+def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -> None:
+    if retire_previous:
+        result = admin_client.gateway_key_retire_previous(socket)
+    else:
+        result = admin_client.gateway_key(socket)
+    out.write(f"ZOEYMCP_GATEWAY_KEY={result['key']}\n")
+    err.write(f"Generation {result['generation']}.\n")
+    if retire_previous:
+        retired = result["retired"]
+        if retired is None:
+            err.write("No previous key was accepted.\n")
+        else:
+            err.write(f"Retired generation {retired}: only this key is accepted now.\n")
+    previous = result["previous"]
+    if previous is not None:
+        generations, master = f"generation {previous['generation']}", ""
+        if previous["master_key"] == "previous":
+            # The previous master's key(current) is accepted too.
+            master = " (previous master key)"
+            if previous["generation"] != result["generation"]:
+                generations = f"generations {previous['generation']} and {result['generation']}"
+        err.write(
+            f"rotation pending: {generations}{master} accepted until {utc(previous['until'])}\n"
+        )
 
 
 # --- login and oauth ---------------------------------------------------------------------------

@@ -21,8 +21,9 @@ from tests.fakes.oauth_server import FakeAuthServer
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.common.yamlload import load_mapping
-from zoeymcp.vault import logs
+from zoeymcp.vault import gatewaykeys, logs
 from zoeymcp.vault.admin import (
+    NO_GATEWAY_KEYS,
     NO_TOKENS,
     NOT_WRITTEN,
     AdminApp,
@@ -32,6 +33,7 @@ from zoeymcp.vault.admin import (
     json_safe,
 )
 from zoeymcp.vault.app import VaultApp
+from zoeymcp.vault.gatewaykeys import GatewayKeys
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.login import LoginError, LoginService
 from zoeymcp.vault.oauth.protocol import CREDENTIAL_UNAVAILABLE
@@ -248,6 +250,7 @@ async def test_no_endpoint_returns_a_value(tmp_path: Path) -> None:
         ("GET", "/secrets"),
         ("GET", "/secrets/music-stats"),
         ("GET", "/gateway-key"),
+        ("POST", "/gateway-key/retire-previous"),
         ("POST", "/setup-code"),
     ]:
         response = await rig.call(method, path)
@@ -258,7 +261,7 @@ async def test_no_endpoint_returns_a_value(tmp_path: Path) -> None:
 async def test_gateway_key(tmp_path: Path) -> None:
     rig = AdminRig(tmp_path)
     data = (await rig.call("GET", "/gateway-key")).json()
-    assert data == {"generation": 1, "key": KEYS.gateway_key(1)}
+    assert data == {"generation": 1, "key": KEYS.gateway_key(1), "previous": None}
 
 
 @pytest.mark.anyio
@@ -283,6 +286,87 @@ async def test_admin_and_proxy_share_the_store(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert ("api_key", "lfm-123456") in echo.received[-1].query
     await vault.aclose()
+
+
+# --- the gateway key ratchet (M3 design C.2) ---------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _with_ratchet(rig: AdminRig, ratchet: GatewayKeys) -> None:
+    rig.admin = AdminApp(rig.store, KEYS, lambda: rig.policy, rig.setup, gateway_keys=ratchet)
+
+
+@pytest.mark.anyio
+async def test_gateway_key_shows_a_rotation(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    clock = _Clock()
+    ratchet = GatewayKeys.load(tmp_path, KEYS, None, 1, clock=clock)
+    _with_ratchet(rig, ratchet)
+    data = (await rig.call("GET", "/gateway-key")).json()
+    assert data == {"generation": 1, "key": KEYS.gateway_key(1), "previous": None}
+    ratchet.advance(2)
+    data = (await rig.call("GET", "/gateway-key")).json()
+    assert data == {
+        "generation": 2,
+        "key": KEYS.gateway_key(2),
+        "previous": {"generation": 1, "until": 1_000_300, "master_key": "current"},
+    }
+
+
+@pytest.mark.anyio
+async def test_retire_previous(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    ratchet = GatewayKeys.load(tmp_path, KEYS, None, 1, clock=_Clock())
+    _with_ratchet(rig, ratchet)
+    ratchet.advance(2)
+    response = await rig.call("POST", "/gateway-key/retire-previous")
+    assert response.status_code == 200
+    assert response.json() == {
+        "retired": 1,
+        "generation": 2,
+        "key": KEYS.gateway_key(2),
+        "previous": None,
+    }
+    assert ratchet.authenticate(KEYS.gateway_key(1).encode()) is False
+    again = await rig.call("POST", "/gateway-key/retire-previous")
+    assert again.json()["retired"] is None
+    assert (await rig.call("GET", "/gateway-key/retire-previous")).status_code == 405
+
+
+@pytest.mark.anyio
+async def test_retire_previous_that_cant_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = AdminRig(tmp_path)
+    ratchet = GatewayKeys.load(tmp_path, KEYS, None, 1, clock=_Clock())
+    _with_ratchet(rig, ratchet)
+    ratchet.advance(2)
+
+    def broken(path: Path, data: bytes) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(gatewaykeys, "write_atomic", broken)
+    response = await rig.call("POST", "/gateway-key/retire-previous")
+    assert response.status_code == 500
+    assert response.json() == {"error": NOT_WRITTEN}
+    # It took effect all the same.
+    assert ratchet.authenticate(KEYS.gateway_key(1).encode()) is False
+
+
+@pytest.mark.anyio
+async def test_retire_previous_needs_the_ratchet(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    response = await rig.call("POST", "/gateway-key/retire-previous")
+    assert response.status_code == 503
+    assert response.json() == {"error": NO_GATEWAY_KEYS}
+    assert NO_GATEWAY_KEYS == "the vault keeps no gateway key state"
 
 
 # --- setup codes -------------------------------------------------------------------------------

@@ -47,6 +47,7 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from . import logs
+from .gatewaykeys import GatewayKeys
 from .keys import KeySet
 from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
 from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
@@ -202,13 +203,20 @@ class VaultApp:
         token_client: httpx.AsyncClient | None = None,
         tokens: TokenManager | None = None,
         environ: Mapping[str, str] | None = None,
+        gateway_keys: GatewayKeys | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
         so ``token_client`` is then not used.
+
+        ``gateway_keys`` is the persisted ratchet the vault loaded at startup. Without one, the
+        gateway keys are tracked in memory only (self-tests and unit tests).
         """
         self._store = store
         self._keys = keys
+        self._gateway_keys = gateway_keys or GatewayKeys.in_memory(
+            keys, policy.gateway_key_generation
+        )
         self._client = without_cookies(client or _upstream_client(policy))
         self._token_client: httpx.AsyncClient | None = None
         if tokens is None:
@@ -221,10 +229,12 @@ class VaultApp:
         self._install(policy)
 
     def _install(self, policy: Policy) -> list[str]:
+        # First, and written to disk before the policy takes effect. A lower generation or a
+        # failed write raises GatewayKeyError, and the running policy stays.
+        self._gateway_keys.advance(policy.gateway_key_generation)
         self._policy = policy
         self._routes = _compile(policy)
         self._env_secrets = snapshot_env_secrets(policy, self._environ)
-        self._gateway_key = self._keys.gateway_key(policy.gateway_key_generation).encode()
         return self._tokens.configure(policy, self._env_secrets)
 
     @property
@@ -235,8 +245,16 @@ class VaultApp:
     def tokens(self) -> TokenManager:
         return self._tokens
 
+    @property
+    def gateway_keys(self) -> GatewayKeys:
+        return self._gateway_keys
+
     def reload(self, policy: Policy) -> list[str]:
-        """Swap the policy. Returns the OAuth credentials whose cached tokens were reset."""
+        """Swap the policy. Returns the OAuth credentials whose cached tokens were reset.
+
+        Raises :class:`~zoeymcp.vault.gatewaykeys.GatewayKeyError` for a gateway key generation
+        that went backwards or can't be written; the running policy then stays.
+        """
         return self._install(policy)
 
     async def aclose(self) -> None:
@@ -392,10 +410,12 @@ class VaultApp:
         """Return ``(caller name, query param used, header used)`` or refuse with 403."""
         gateway = request.headers.getlist(GATEWAY_HEADER)
         if gateway:
+            # A key of an accepted generation (M3 design C.2). The first request made with the
+            # current key retires the previous one.
             if (
                 compiled.accepts_gateway
                 and len(gateway) == 1
-                and hmac.compare_digest(gateway[0].encode(), self._gateway_key)
+                and self._gateway_keys.authenticate(gateway[0].encode())
             ):
                 return "gateway", None, None
             raise Refused(403, "gateway key refused")

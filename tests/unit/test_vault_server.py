@@ -13,10 +13,12 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 
-from zoeymcp.vault import logs, server
-from zoeymcp.vault.app import VaultApp
+from zoeymcp.vault import gatewaykeys, logs, server
+from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
+from zoeymcp.vault.gatewaykeys import BACKWARDS, STATE_FILE, TAMPERED, State
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.server import LOCK_FILE, StartupError, acquire_state_lock, load_runtime
 from zoeymcp.vault.store import SecretStore, origin_binding
@@ -383,3 +385,255 @@ def test_run_gives_the_admin_the_token_manager(
     monkeypatch.setattr(server, "serve", serve)
     server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
     assert seen["admin"]._tokens is seen["app"].tokens
+
+
+# --- the gateway key ratchet (M3 design C.2) -----------------------------------------------------
+
+
+def _policy_file(
+    tmp_path: Path, example_text: str, generation: int, proxy: str | None = None
+) -> str:
+    path = tmp_path / f"gen-{generation}{'-proxy' if proxy else ''}.yaml"
+    text = _with_proxy(example_text, proxy)
+    path.write_bytes(
+        text.replace("gateway_key_generation: 1", f"gateway_key_generation: {generation}").encode()
+    )
+    return str(path)
+
+
+def test_load_runtime_starts_the_ratchet(tmp_path: Path) -> None:
+    runtime = load_runtime(str(EXAMPLE_POLICY), tmp_path, env())
+    assert runtime.gateway_keys.state == State(runtime.keys.key_id, 1, 1)
+    assert (tmp_path / STATE_FILE).is_file()
+
+
+def test_load_runtime_refuses_a_tampered_ratchet(tmp_path: Path) -> None:
+    environ = env()
+    load_runtime(str(EXAMPLE_POLICY), tmp_path, environ)
+    path = tmp_path / STATE_FILE
+    path.write_bytes(path.read_bytes().replace(b'"floor":1', b'"floor":2'))
+    with pytest.raises(StartupError) as caught:
+        load_runtime(str(EXAMPLE_POLICY), tmp_path, environ)
+    assert str(caught.value) == f"{path}: {TAMPERED}"
+
+
+def test_load_runtime_refuses_a_generation_that_went_backwards(
+    tmp_path: Path, example_text: str
+) -> None:
+    environ = env()
+    load_runtime(_policy_file(tmp_path, example_text, 3), tmp_path, environ)
+    with pytest.raises(StartupError) as caught:
+        load_runtime(str(EXAMPLE_POLICY), tmp_path, environ)
+    assert str(caught.value) == (
+        f"{tmp_path / STATE_FILE}: gateway_key_generation 1 is below 3: {BACKWARDS}"
+    )
+
+
+def test_load_runtime_reads_the_ratchet_under_the_previous_master(tmp_path: Path) -> None:
+    old = generate_master_key()
+    first = load_runtime(str(EXAMPLE_POLICY), tmp_path, {"ZOEYMCP_MASTER_KEY": old})
+    old_keys = first.keys
+    assert (tmp_path / STATE_FILE).is_file()
+    new = generate_master_key()
+    with pytest.raises(StartupError, match="ZOEYMCP_MASTER_KEY_PREVIOUS"):
+        load_runtime(str(EXAMPLE_POLICY), tmp_path, {"ZOEYMCP_MASTER_KEY": new})
+    environ = {"ZOEYMCP_MASTER_KEY": new, "ZOEYMCP_MASTER_KEY_PREVIOUS": old}
+    rotated = load_runtime(str(EXAMPLE_POLICY), tmp_path, environ)
+    previous = rotated.gateway_keys.state.previous
+    assert previous is not None
+    assert previous.key_id == old_keys.key_id
+    assert rotated.gateway_keys.authenticate(old_keys.gateway_key(1).encode()) is True
+
+
+def _gateway_status(app: VaultApp, key: str) -> int:
+    """A gateway-only route of the example. Its connector answers 501 once identity passed."""
+
+    async def call() -> int:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
+            response = await client.get("/mail/config", headers={GATEWAY_HEADER: key})
+            return response.status_code
+
+    return asyncio.run(call())
+
+
+def test_a_reload_starts_a_rotation(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    environ = env()
+    runtime = load_runtime(str(EXAMPLE_POLICY), tmp_path / "state", environ)
+    app = VaultApp(
+        runtime.policy, runtime.store, runtime.keys, environ={}, gateway_keys=runtime.gateway_keys
+    )
+    server.reload_policy(app, _policy_file(tmp_path, example_text, 2), environ)
+    assert [line["event"] for line in _log_lines(log_buffer)][-2:] == [
+        "gateway_key_rotation_started",
+        "reload_ok",
+    ]
+    assert app.policy.gateway_key_generation == 2
+    keys = runtime.keys
+    assert _gateway_status(app, keys.gateway_key(1)) == 501
+    assert _gateway_status(app, keys.gateway_key(2)) == 501
+    assert _gateway_status(app, keys.gateway_key(1)) == 403
+    asyncio.run(app.aclose())
+
+    # The effect test (design §8.2): a retired generation stays retired across a restart.
+    restarted = load_runtime(_policy_file(tmp_path, example_text, 2), tmp_path / "state", environ)
+    app = VaultApp(
+        restarted.policy,
+        restarted.store,
+        restarted.keys,
+        environ={},
+        gateway_keys=restarted.gateway_keys,
+    )
+    assert _gateway_status(app, keys.gateway_key(1)) == 403
+    assert _gateway_status(app, keys.gateway_key(2)) == 501
+    asyncio.run(app.aclose())
+
+
+def test_a_reload_that_goes_backwards_is_refused(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    environ = env()
+    runtime = load_runtime(_policy_file(tmp_path, example_text, 2), tmp_path / "state", environ)
+    app = VaultApp(
+        runtime.policy, runtime.store, runtime.keys, environ={}, gateway_keys=runtime.gateway_keys
+    )
+    before = app.policy
+    # The egress proxy changes too: a refused reload doesn't say it needs a restart.
+    server.reload_policy(app, _policy_file(tmp_path, example_text, 1, PROXY), environ)
+    line = _log_lines(log_buffer)[-1]
+    assert line["event"] == "reload_refused"
+    assert line["reason"] == f"gateway_key_generation 1 is below 2: {BACKWARDS}"
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert "egress_proxy_change_needs_restart" not in events
+    assert app.policy is before
+    asyncio.run(app.aclose())
+
+
+PROXY = "http://proxy:3128"
+
+
+def test_a_bump_that_cant_be_written_is_refused(
+    tmp_path: Path,
+    example_text: str,
+    log_buffer: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environ = env()
+    runtime = load_runtime(_policy_file(tmp_path, example_text, 1), tmp_path / "state", environ)
+    app = VaultApp(
+        runtime.policy, runtime.store, runtime.keys, environ={}, gateway_keys=runtime.gateway_keys
+    )
+    before = app.policy
+
+    def broken(path: Path, data: bytes) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(gatewaykeys, "write_atomic", broken)
+    server.reload_policy(app, _policy_file(tmp_path, example_text, 2, PROXY), environ)
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert events[-1] == "reload_refused"
+    assert "egress_proxy_change_needs_restart" not in events
+    assert "so the new generation can't be used: read-only" in _log_lines(log_buffer)[-1]["reason"]
+    assert app.policy is before
+    assert _gateway_status(app, runtime.keys.gateway_key(2)) == 403
+    asyncio.run(app.aclose())
+
+
+def test_the_gateway_key_timer_ticks() -> None:
+    ticks: list[int] = []
+
+    class Ratchet:
+        def tick(self) -> None:
+            ticks.append(1)
+
+    async def main() -> None:
+        timer = asyncio.create_task(
+            server.gateway_key_timer(cast(gatewaykeys.GatewayKeys, Ratchet()), 0)
+        )
+        while len(ticks) < 3:
+            await asyncio.sleep(0)
+        timer.cancel()
+
+    asyncio.run(main())
+    assert len(ticks) >= 3
+    assert server.GATEWAY_KEY_TICK == 5.0
+
+
+def test_serve_runs_and_stops_the_gateway_key_timer(
+    log_buffer: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class App:
+        async def aclose(self) -> None:
+            pass
+
+    ratchet = gatewaykeys.GatewayKeys.in_memory(KeySet.from_text(generate_master_key()), 1)
+    calls: list[tuple[Any, float]] = []
+    cancelled: list[bool] = []
+
+    async def main() -> list[asyncio.Task[Any]]:
+        running = asyncio.Event()
+
+        async def timer(gateway_keys: Any, interval: float) -> None:
+            calls.append((gateway_keys, interval))
+            running.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        class Server:
+            """Serves until the timer runs."""
+
+            def __init__(self, config: Any) -> None:
+                pass
+
+            async def serve(self) -> None:
+                await running.wait()
+
+        monkeypatch.setattr(server, "gateway_key_timer", timer)
+        monkeypatch.setattr(server, "_Server", Server)
+        await server.serve(
+            cast(VaultApp, App()),
+            ["127.0.0.1:0"],
+            config=None,
+            environ={},
+            gateway_keys=ratchet,
+        )
+        return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    assert asyncio.run(main()) == []
+    assert calls == [(ratchet, 5.0)]
+    assert cancelled == [True]
+    assert _log_lines(log_buffer)[-1]["event"] == "vault_stopped"
+
+
+def test_serve_without_a_ratchet_has_no_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+    class App:
+        async def aclose(self) -> None:
+            pass
+
+    calls: list[Any] = []
+    monkeypatch.setattr(server, "gateway_key_timer", lambda *args: calls.append(args))
+    asyncio.run(server.serve(cast(VaultApp, App()), [], config=None, environ={}))
+    assert calls == []
+
+
+def test_run_shares_the_ratchet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(app=app, **kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
+    ratchet = seen["app"].gateway_keys
+    assert (tmp_path / STATE_FILE).is_file()
+    assert seen["gateway_keys"] is ratchet
+    assert seen["admin"]._gateway_keys is ratchet

@@ -1,8 +1,10 @@
 """Running the vault: ``zoeymcp vault`` (design §4, §4.6).
 
 Startup refuses to run with a missing or malformed master key, a policy that fails ``check``, a
-store written under an unknown key, or a state directory another vault is using. ``SIGHUP``
-reloads the policy; a policy that fails validation is rejected and the running one stays.
+store written under an unknown key, a gateway key state that fails its MAC or would go backwards,
+or a state directory another vault is using. ``SIGHUP`` reloads the policy; a policy that fails
+validation, or whose gateway key generation went backwards or can't be written, is rejected and
+the running one stays.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from ..common.policy import Policy, PolicyError, check_policy, parse_policy, rea
 from . import logs
 from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
 from .app import VaultApp
+from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
 from .store import SecretStore, StoreError
 
@@ -29,6 +32,8 @@ if sys.platform != "win32":
     import fcntl
 
 LOCK_FILE = "vault.lock"
+# How often the timer retires an expired previous gateway key, in seconds.
+GATEWAY_KEY_TICK = 5.0
 
 
 class StartupError(Exception):
@@ -70,6 +75,7 @@ class Runtime:
     policy: Policy
     store: SecretStore
     keys: KeySet
+    gateway_keys: GatewayKeys
 
 
 def load_keys(environ: Mapping[str, str]) -> tuple[KeySet, KeySet | None]:
@@ -111,7 +117,11 @@ def load_runtime(config: str | None, state_dir: Path, environ: Mapping[str, str]
         raise StartupError(str(exc)) from exc
     if rotated:
         logs.event("store_rotated", entries=rotated, key_id=keys.key_id)
-    return Runtime(policy, store, keys)
+    try:
+        gateway_keys = GatewayKeys.load(state_dir, keys, previous, policy.gateway_key_generation)
+    except GatewayKeyError as exc:
+        raise StartupError(str(exc)) from exc
+    return Runtime(policy, store, keys, gateway_keys)
 
 
 class _Server(uvicorn.Server):
@@ -138,6 +148,7 @@ async def serve(
     environ: Mapping[str, str],
     admin: AdminApp | None = None,
     admin_socket: Path | None = None,
+    gateway_keys: GatewayKeys | None = None,
 ) -> None:
     servers = []
     for listen in listens:
@@ -185,6 +196,9 @@ async def serve(
         loop.add_signal_handler(signal.SIGTERM, stop)
         loop.add_signal_handler(signal.SIGINT, stop)
         loop.add_signal_handler(signal.SIGHUP, reload)
+    timer = None
+    if gateway_keys is not None:
+        timer = asyncio.create_task(gateway_key_timer(gateway_keys, GATEWAY_KEY_TICK))
     try:
         logs.event(
             "vault_started",
@@ -193,9 +207,21 @@ async def serve(
         )
         await asyncio.gather(*(server.serve() for server in servers))
     finally:
+        if timer is not None:
+            timer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await timer
         # Refreshes in flight finish (and are saved) before the clients close (N5).
         await app.aclose()
         logs.event("vault_stopped")
+
+
+async def gateway_key_timer(gateway_keys: GatewayKeys, interval: float) -> None:
+    """Retire an expired previous gateway key without waiting for a request, and retry a write
+    that failed."""
+    while True:
+        await asyncio.sleep(interval)
+        gateway_keys.tick()
 
 
 def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str]) -> None:
@@ -209,10 +235,16 @@ def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str])
     except StartupError as exc:
         logs.event("reload_refused", reason=str(exc))
         return
-    if policy.egress_proxy != app.policy.egress_proxy:
+    egress_changed = policy.egress_proxy != app.policy.egress_proxy
+    try:
+        # The gateway key generation moves first, and is written before the policy is used.
+        reset = app.reload(policy)
+    except GatewayKeyError as exc:
+        logs.event("reload_refused", reason=str(exc))
+        return
+    if egress_changed:
         # The HTTP clients were built with the old proxy.
         logs.event("egress_proxy_change_needs_restart")
-    reset = app.reload(policy)
     logs.event("reload_ok", oauth_reset=reset)
 
 
@@ -227,7 +259,13 @@ def run(
     # call that twice on one directory in one process.
     acquire_state_lock(state_dir)
     runtime = load_runtime(config, state_dir, environ)
-    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ=environ)
+    app = VaultApp(
+        runtime.policy,
+        runtime.store,
+        runtime.keys,
+        environ=environ,
+        gateway_keys=runtime.gateway_keys,
+    )
     admin = None
     if admin_socket is not None and socket_supported():
         try:
@@ -235,11 +273,24 @@ def run(
         except AdminSocketError as exc:
             raise StartupError(str(exc)) from exc
         admin = AdminApp(
-            runtime.store, runtime.keys, lambda: app.policy, SetupCodes(state_dir), app.tokens
+            runtime.store,
+            runtime.keys,
+            lambda: app.policy,
+            SetupCodes(state_dir),
+            app.tokens,
+            gateway_keys=runtime.gateway_keys,
         )
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
         admin_socket = None
     asyncio.run(
-        serve(app, listens, config=config, environ=environ, admin=admin, admin_socket=admin_socket)
+        serve(
+            app,
+            listens,
+            config=config,
+            environ=environ,
+            admin=admin,
+            admin_socket=admin_socket,
+            gateway_keys=runtime.gateway_keys,
+        )
     )

@@ -610,6 +610,83 @@ QUIET: dict[str, Any] = {
 }
 
 
+# --- gateway-key -------------------------------------------------------------------------------
+
+GATEWAY_KEY = "zgw1-fake-gateway-key-0002"
+
+
+def gateway_answer(previous: dict[str, Any] | None, **extra: Any) -> dict[str, Any]:
+    return {"generation": 2, "key": GATEWAY_KEY, "previous": previous, **extra}
+
+
+def test_gateway_key_prints_the_key(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/gateway-key")] = (200, gateway_answer(None))
+    code, out, err = cli(["gateway-key", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out == f"ZOEYMCP_GATEWAY_KEY={GATEWAY_KEY}\n"
+    assert err == "Generation 2.\n"
+    assert admin.requests == [("GET", "/gateway-key", None)]
+    assert admin.timeouts == [10.0]
+
+
+@pytest.mark.parametrize(
+    ("generation", "master_key", "line"),
+    [
+        (1, "current", "rotation pending: generation 1 accepted until 2026-10-05T21:14:27Z\n"),
+        (
+            2,
+            "previous",
+            "rotation pending: generation 2 (previous master key) accepted until "
+            "2026-10-05T21:14:27Z\n",
+        ),
+        (
+            1,
+            "previous",
+            "rotation pending: generations 1 and 2 (previous master key) accepted until "
+            "2026-10-05T21:14:27Z\n",
+        ),
+    ],
+)
+def test_gateway_key_shows_a_pending_rotation(
+    admin: FakeAdmin, generation: int, master_key: str, line: str
+) -> None:
+    previous = {"generation": generation, "until": 1_791_234_867, "master_key": master_key}
+    admin.answers[("GET", "/gateway-key")] = (200, gateway_answer(previous))
+    code, out, err = cli(["gateway-key", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out == f"ZOEYMCP_GATEWAY_KEY={GATEWAY_KEY}\n"
+    assert err == "Generation 2.\n" + line
+
+
+@pytest.mark.parametrize(
+    ("retired", "line"),
+    [
+        (1, "Retired generation 1: only this key is accepted now.\n"),
+        (None, "No previous key was accepted.\n"),
+    ],
+)
+def test_gateway_key_retire_previous(admin: FakeAdmin, retired: int | None, line: str) -> None:
+    path = "/gateway-key/retire-previous"
+    admin.answers[("POST", path)] = (200, gateway_answer(None, retired=retired))
+    code, out, err = cli(["gateway-key", "--retire-previous", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out == f"ZOEYMCP_GATEWAY_KEY={GATEWAY_KEY}\n"
+    assert err == "Generation 2.\n" + line
+    assert admin.requests == [("POST", path, None)]
+    assert admin.timeouts == [10.0]
+
+
+def test_gateway_key_retire_previous_not_written(admin: FakeAdmin) -> None:
+    error = {"error": "kept in memory, not written to disk; check the state volume"}
+    admin.answers[("POST", "/gateway-key/retire-previous")] = (500, error)
+    code, out, err = cli(["gateway-key", "--retire-previous", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert out == ""
+    assert err == (
+        "zoeymcp gateway-key: kept in memory, not written to disk; check the state volume\n"
+    )
+
+
 def test_format_status() -> None:
     assert format_status(STATUS) == [
         "music: terminal oauth_reconsent_needed (refreshing)",
