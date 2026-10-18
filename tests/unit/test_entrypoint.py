@@ -103,6 +103,8 @@ def test_parse_status() -> None:
         (("Uid:\t0\t0\t0\t0", "Uid:\t0\t0\t0\t0\t0"), "a malformed line"),
         (("NoNewPrivs:\t1", "NoNewPrivs:\t2"), "a malformed line"),
         (("NoNewPrivs:\t1", "NoNewPrivs:\tyes"), "a malformed line"),
+        # The name ends at the first colon: the rest of the line is its value.
+        (("CapBnd:\t00000000000000c0", "CapBnd:\t00000000000000c0:1"), "a malformed line"),
     ],
 )
 def test_a_status_without_what_is_needed_is_refused(change: tuple[str, str], message: str) -> None:
@@ -195,6 +197,14 @@ def test_the_directories_as_the_image_makes_them() -> None:
 )
 def test_a_wrong_directory_is_refused(found: Found | None, message: str) -> None:
     assert env.directory_refusals({**GOOD, "/run/zoeymcp-link": found}) == [message]
+
+
+def test_every_wrong_directory_is_named() -> None:
+    found = {**GOOD, "/state": None, "/run/zoeymcp-link": Found(10001, 10002, 0o755)}
+    assert env.directory_refusals(found) == [
+        "/state (the vault's state (a volume)) is missing; it must be 10001:10001 0700",
+        "/run/zoeymcp-link (the link socket) is 10001:10002 0755; it must be 10001:10002 0750",
+    ]
 
 
 def test_a_mode_with_the_file_type_bits_still_compares() -> None:
