@@ -4,7 +4,8 @@ It refuses to start with a master key or ``ZOEYMCP_CONFIG`` in its environment (
 (``--allow-root`` is for development). The ``http://`` link needs the gateway key; with
 ``unix:`` a key is ignored. ``SIGHUP`` (or ``HUP`` on the control pipe) fetches the view now
 and re-reads the key file; ``SIGTERM`` (or ``TERM``, or the pipe's end) stops, giving calls in
-flight 10 seconds. The admin socket answers ``GET /status``.
+flight 10 seconds. The admin socket answers ``GET /status``, ``POST /review/<server>`` and
+``POST /review/<server>/clear`` (:mod:`.review`).
 
 The SDK's own loggers are silenced: they log session ids and request headers (G20).
 """
@@ -16,6 +17,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import stat
 import sys
@@ -24,12 +26,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import anyio
 import uvicorn
 from starlette.types import Receive, Scope, Send
 
 from ..common import control
 from ..common.policy.view import ViewRemoteServer
-from . import logs
+from . import logs, review
 from .app import GatewayApp
 from .defstore import DefinitionStore
 from .marks import DriftMarks, MarksError
@@ -47,6 +50,7 @@ from .vaultlink import (
 STOP_GRACE = 10
 KEEP_ALIVE = 5
 VERSION = "1"
+_REVIEW_PATH = re.compile(r"/review/([a-z0-9][a-z0-9_-]{0,62})(/clear)?")
 
 
 class StartupError(RuntimeError):
@@ -140,10 +144,14 @@ def status(app: GatewayApp) -> dict[str, Any]:
             connections = [c for c in app.pool.connections() if c.server == name]
             phases = sorted({c.state.phase.value for c in connections})
             exposed = set()
+            reports: dict[str, set[str]] = {}
             verified = [c.state.verified_at for c in connections if c.state.verified_at is not None]
             for connection in connections:
-                if connection.state.evaluation is not None:
-                    exposed |= set(connection.state.evaluation.exposed)
+                evaluation = connection.state.evaluation
+                if evaluation is not None:
+                    exposed |= set(evaluation.exposed)
+                    for report in evaluation.reports:
+                        reports.setdefault(report.kind, set()).add(report.tool)
             servers[name] = {
                 "kind": "remote",
                 "state": phases or ["idle"],
@@ -152,6 +160,7 @@ def status(app: GatewayApp) -> dict[str, Any]:
                 "included": len(server.tools.include),
                 "exposed": len(exposed),
                 "marked": sorted(tool for tool, _ in app.pool.marks.for_server(name)),
+                "reports": {kind: sorted(tools) for kind, tools in sorted(reports.items())},
                 "listed_s_ago": round(app.clock() - max(verified), 1) if verified else None,
             }
     return {
@@ -163,18 +172,33 @@ def status(app: GatewayApp) -> dict[str, Any]:
 
 
 class AdminApp:
-    """The gateway's admin socket: ``GET /status``."""
+    """The gateway's admin socket: ``GET /status``, and ``review`` (one at a time)."""
 
     def __init__(self, app: GatewayApp) -> None:
         self.app = app
+        self.reviewing = anyio.Lock()
+
+    async def answer(self, method: str, path: str) -> tuple[int, dict[str, Any]]:
+        if (method, path) == ("GET", "/status"):
+            return 200, status(self.app)
+        found = _REVIEW_PATH.fullmatch(path)
+        if found is None:
+            return 404, {"error": "not found"}
+        if method != "POST":
+            return 405, {"error": "use POST"}
+        async with self.reviewing:
+            try:
+                return 200, await review.review(
+                    self.app, found.group(1), clear=found.group(2) is not None
+                )
+            except review.ReviewError as exc:
+                return exc.status, exc.answer()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             return
-        if (scope["method"], scope["path"]) == ("GET", "/status"):
-            code, body = 200, json.dumps(status(self.app)).encode()
-        else:
-            code, body = 404, b'{"error":"not found"}'
+        code, data = await self.answer(scope["method"], scope["path"])
+        body = json.dumps(data).encode()
         headers = [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),

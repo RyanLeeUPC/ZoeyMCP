@@ -71,7 +71,7 @@ from .defstore import DefinitionStore, changed_members
 from .egressrules import CallRegistry
 from .marks import DriftMarks
 from .sanitize import Outcome
-from .vaultlink import KeySource, Link, upstream_client
+from .vaultlink import REFUSAL_HEADER, KeySource, Link, upstream_client, vault_refusal_code
 
 CLIENT_INFO = Implementation(name="zoeymcp-gateway", version="1")
 COALESCE = 5.0  # seconds between listings of one connection, at least
@@ -154,6 +154,9 @@ class Connection:
         self.instructions: str | None = None
         self.server_info: Implementation | None = None
         self.session_id: str | None = None
+        # Why the connection failed, and the vault's last refusal (status, code), for review.
+        self.failure: str | None = None
+        self.vault_refusal: tuple[int, str | None] | None = None
         self.in_flight = 0
         self.holds = 0  # downstream listeners that keep this connection open
         self.last_used = pool.clock()
@@ -205,6 +208,8 @@ class Connection:
 
     def noted(self, request: Any, response: Any) -> None:
         """Called by the egress transport for every answer."""
+        if response.headers.get(REFUSAL_HEADER) == "refused":
+            self.vault_refusal = (response.status_code, vault_refusal_code(response.content))
         session = response.headers.get("mcp-session-id")
         if session:
             if self.session_id is None:
@@ -244,6 +249,7 @@ class Connection:
                     reason = (
                         exc.reason if isinstance(exc, _ConnectRefused | ListingFailed) else "error"
                     )
+                    self.failure = reason if reason != "error" else type(_leaf(exc)).__name__
                     logs.event(
                         "upstream_closed",
                         server=self.server,
@@ -399,6 +405,7 @@ class Connection:
             if isinstance(exc, TimeoutError):
                 reason = "timeout"
             logs.event("server_list_failed", server=self.server, key=self.label, reason=reason)
+            self.failure = reason
             now = self.pool.clock()
             interval = float(self.policy.drift_check_interval)
             failed = (

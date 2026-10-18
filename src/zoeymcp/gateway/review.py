@@ -1,0 +1,304 @@
+"""``zoeymcp review`` on the gateway's side (M3 design I).
+
+The CLI asks the running gateway, over its admin socket, so the CLI never handles a key and never
+runs the SDK. Each review opens a fresh connection of its own, ``(server, "review")``, lists every
+page, and closes it again. Like every connection, it evaluates its own listing: drift it sees
+marks the tool for every client, as drift seen anywhere does (G.3, G.4).
+
+:func:`report` turns one listing into the answer: per tool, its state, its projection and pin,
+the findings, and for drift the changed members and a diff against the reviewed definition from
+the definition store. The upstream's ``instructions`` and ``serverInfo`` are included for display
+only; they are never forwarded to an agent.
+
+``--clear`` lists again and, only if every included tool matches its pin, clears the server's
+drift marks and re-evaluates the server's live connections, so the tools come back for agents.
+A connection whose own last listing still shows drift marks the tool again.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence, Set
+from typing import Any, Literal
+
+import anyio
+from mcp.types import Implementation, Tool
+
+from ..common.policy.schema import GatewayLimits
+from ..common.policy.view import ViewRemoteServer
+from . import logs, pins
+from .connstate import WAITING, Phase
+from .defstore import changed_members, diff
+from .findings import tool_findings
+from .upstream import CLOSE_GRACE, Connection, UpstreamError
+
+MAX_INSTRUCTIONS_CHARS = 16_384
+WAIT_EXTRA = 15.0  # seconds beyond list_timeout a review waits for its listing
+
+# ok: exposed. marked: matches its pin, hidden by a drift mark. blocked: matches its pin, hidden
+# because on_drift: fail blocked the server. The rest are G.2's report kinds.
+ToolState = Literal[
+    "ok", "marked", "blocked", "drift", "unreviewed", "invalid", "duplicate", "missing"
+]
+MATCHING: frozenset[str] = frozenset({"ok", "marked", "blocked"})
+
+
+class ReviewError(Exception):
+    """The review couldn't run. ``reason`` is stable; ``data`` goes into the answer as is."""
+
+    def __init__(self, status: int, reason: str, message: str, **data: Any) -> None:
+        self.status = status
+        self.reason = reason
+        self.data = data
+        super().__init__(message)
+
+    def answer(self) -> dict[str, Any]:
+        return {"error": str(self), "reason": self.reason, **self.data}
+
+
+def classification(policy: ViewRemoteServer, tool: str) -> str | None:
+    if tool in policy.tools.allow:
+        return "allow"
+    if tool in policy.tools.approve:
+        return "approve"
+    return None
+
+
+def _state(
+    name: str,
+    evaluation: pins.Evaluation,
+    reports: Sequence[pins.Report],
+    pin: str | None,
+    policy: ViewRemoteServer,
+    marked: Set[str],
+) -> ToolState:
+    if name in evaluation.exposed:
+        return "ok"
+    kinds = {report.kind for report in reports}
+    kind: ToolState
+    for kind in ("duplicate", "invalid", "drift", "unreviewed"):
+        if kind in kinds:
+            return kind
+    if pin is None or policy.review.get(name) != pin:
+        return "unreviewed"
+    if name in marked:
+        return "marked"
+    return "blocked" if evaluation.blocked else "unreviewed"
+
+
+def _tool_entry(
+    name: str,
+    tool: Tool | None,
+    state: ToolState,
+    policy: ViewRemoteServer,
+    defs: Callable[[str], Mapping[str, Any] | None],
+    limits: GatewayLimits,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "name": name,
+        "state": state,
+        "included": name in policy.tools.include,
+        "classification": classification(policy, name),
+        "pin": None,
+        "pinned": policy.review.get(name),
+        "definition": None,
+        "findings": [],
+        "changed": None,
+        "diff": None,
+    }
+    if state == "missing":
+        return entry
+    if state == "duplicate":
+        entry["findings"] = [
+            {
+                "level": "error",
+                "pointer": "",
+                "message": "the server lists this name more than once",
+            }
+        ]
+        return entry
+    if tool is None:  # only missing and duplicate entries have no single tool
+        raise ValueError(f"no tool for a {state} entry")
+    try:
+        projected = pins.project_and_pin(tool)
+    except pins.ProjectionError as exc:
+        entry["findings"] = [{"level": "error", "pointer": "", "message": str(exc)}]
+        return entry
+    entry["pin"] = projected.pin
+    entry["definition"] = dict(projected.definition)
+    entry["findings"] = [
+        finding.as_dict() for finding in tool_findings(projected.definition, limits)
+    ]
+    pinned = entry["pinned"]
+    if state == "drift" and pinned is not None:
+        old = defs(pinned)
+        if old is not None:
+            entry["changed"] = changed_members(old, projected.definition)
+            entry["diff"] = diff(old, projected.definition)
+    return entry
+
+
+def report(
+    server: str,
+    policy: ViewRemoteServer,
+    tools: Sequence[Tool],
+    evaluation: pins.Evaluation,
+    *,
+    marks: Set[pins.Mark],
+    defs: Callable[[str], Mapping[str, Any] | None],
+    limits: GatewayLimits,
+    era: str | None,
+    protocol_version: str | None,
+    server_info: Implementation | None,
+    instructions: str | None,
+) -> dict[str, Any]:
+    """The review of one listing (pure, apart from reading the definition store)."""
+    marked = {tool for tool, _ in marks}
+    by_name: dict[str, list[Tool]] = {}
+    for tool in tools:
+        by_name.setdefault(tool.name if isinstance(tool.name, str) else "", []).append(tool)
+    entries = []
+    for name in sorted(by_name):
+        reports = [r for r in evaluation.reports if r.tool == name]
+        listed = by_name[name]
+        pin = None
+        if len(listed) == 1:
+            try:
+                pin = pins.project_and_pin(listed[0]).pin
+            except pins.ProjectionError:
+                pin = None
+        state = _state(name, evaluation, reports, pin, policy, marked)
+        single = listed[0] if len(listed) == 1 else None
+        entries.append(_tool_entry(name, single, state, policy, defs, limits))
+    for name in sorted(set(policy.tools.include) - set(by_name)):
+        entries.append(_tool_entry(name, None, "missing", policy, defs, limits))
+    info = None
+    if server_info is not None:
+        info = {"name": server_info.name, "version": server_info.version}
+        if server_info.title is not None:
+            info["title"] = server_info.title
+    if instructions is not None and len(instructions) > MAX_INSTRUCTIONS_CHARS:
+        instructions = instructions[:MAX_INSTRUCTIONS_CHARS] + "..."
+    included = [entry for entry in entries if entry["included"]]
+    return {
+        "server": server,
+        "kind": "remote",
+        "vault_path": policy.vault_path,
+        "era": era,
+        "asserted_era": policy.era,
+        "policy": {
+            "include": list(policy.tools.include),
+            "allow": list(policy.tools.allow),
+            "approve": list(policy.tools.approve),
+            "on_drift": policy.on_drift,
+        },
+        "protocol_version": protocol_version,
+        "server_info": info,
+        "instructions": instructions,
+        "blocked": evaluation.blocked,
+        "marked": sorted(marked),
+        "tools": entries,
+        "clean": not marked and all(entry["state"] == "ok" for entry in included),
+    }
+
+
+# --- running a review ----------------------------------------------------------------------------
+
+
+def _policy(app: Any, server: str) -> tuple[ViewRemoteServer, GatewayLimits]:
+    snapshot = app.policy.fresh()
+    if snapshot is None:
+        raise ReviewError(503, "no_view", "the gateway has no fresh view of the policy")
+    gateway = snapshot.view.gateway
+    policy = gateway.servers.get(server)
+    if policy is None:
+        raise ReviewError(404, "unknown_server", f"no gateway server named {server!r}")
+    if not isinstance(policy, ViewRemoteServer):
+        raise ReviewError(
+            409, "unsupported", f"{server!r} is a {policy.kind} server; this version can't serve it"
+        )
+    return policy, gateway.limits
+
+
+async def _listed(app: Any, connection: Connection, limits: GatewayLimits) -> pins.Evaluation:
+    """The review connection's evaluation once listed, or :class:`ReviewError`."""
+    with anyio.move_on_after(limits.list_timeout + WAIT_EXTRA):
+        while connection.state.phase in WAITING:
+            await connection.changed.wait()
+    state = connection.state
+    if state.phase is Phase.READY and state.evaluation is not None:
+        return state.evaluation
+    data: dict[str, Any] = {"failure": connection.failure or state.phase.value}
+    message = f"the review couldn't list the server's tools ({data['failure']})"
+    if connection.vault_refusal is not None:
+        status, code = connection.vault_refusal
+        data["vault"] = {"status": status, "code": code}
+        message += f"; the vault refused with {status}" + (f" {code}" if code else "")
+    raise ReviewError(502, "upstream", message, **data)
+
+
+async def _close(connection: Connection) -> None:
+    connection.request_close()
+    with anyio.move_on_after(CLOSE_GRACE + 1, shield=True):
+        await connection.done.wait()
+
+
+async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any]:
+    """Review ``server`` on a fresh connection; with ``clear``, also clear its drift marks if
+    every included tool matches. Raises :class:`ReviewError`."""
+    policy, limits = _policy(app, server)
+    pool = app.pool
+    try:
+        connection = pool.review_connection(server, policy)
+    except UpstreamError as exc:
+        raise ReviewError(503, "not_running", "the gateway's upstream pool isn't running") from exc
+    try:
+        evaluation = await _listed(app, connection, limits)
+        tools = list(connection.tools)
+        era = connection.era
+        version = connection.client.protocol_version if connection.client is not None else None
+        server_info, instructions = connection.server_info, connection.instructions
+    finally:
+        await _close(connection)
+
+    def build(evaluation: pins.Evaluation) -> dict[str, Any]:
+        return report(
+            server,
+            policy,
+            tools,
+            evaluation,
+            marks=pool.marks.for_server(server),
+            defs=pool.defs.get,
+            limits=limits,
+            era=era,
+            protocol_version=version,
+            server_info=server_info,
+            instructions=instructions,
+        )
+
+    answer = build(evaluation)
+    logs.event("review", server=server, tools=len(tools), clean=answer["clean"], clear=clear)
+    if not clear:
+        return answer
+    unmatched = [
+        entry["name"]
+        for entry in answer["tools"]
+        if entry["included"] and entry["state"] not in MATCHING
+    ]
+    if unmatched:
+        raise ReviewError(
+            409,
+            "not_clean",
+            "not every included tool matches its pin: " + ", ".join(unmatched),
+            tools=unmatched,
+            review=answer,
+        )
+    removed = pool.marks.replace(server, frozenset())[1]
+    if removed:
+        logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by="review")
+    for live in pool.connections():
+        if live.server == server:
+            live.reevaluate(live.policy)
+    # The review's own listing, as it evaluates with the marks gone.
+    answer = build(pins.evaluate(tools, policy, pool.marks.for_server(server), limits))
+    answer["cleared"] = sorted(tool for tool, _ in removed)
+    return answer

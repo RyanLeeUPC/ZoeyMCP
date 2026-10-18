@@ -22,6 +22,7 @@ import httpx2
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import McpFake
@@ -33,6 +34,7 @@ from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import project_and_pin
+from zoeymcp.gateway.server import AdminApp
 from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import KeySource, parse_link, view_client
 from zoeymcp.vault.app import VaultApp
@@ -233,6 +235,28 @@ def token_for(client: str) -> str:
     return f"zgc1-{client}-token"
 
 
+ADMIN_PREFIX = "/_test_admin"
+
+
+class WithAdmin:
+    """The gateway app, and its admin app under :data:`ADMIN_PREFIX`, on one event loop.
+
+    The admin socket is served next to the gateway in the same loop in production too: a review
+    opens a connection in the pool's task group.
+    """
+
+    def __init__(self, app: GatewayApp) -> None:
+        self.app = app
+        self.admin: ASGIApp = AdminApp(app)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] == "http" and path.startswith(ADMIN_PREFIX):
+            await self.admin({**scope, "path": path[len(ADMIN_PREFIX) :]}, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 @dataclass
 class Running:
     app: GatewayApp
@@ -240,6 +264,10 @@ class Running:
 
     def mcp(self, server: str = SERVER) -> str:
         return f"{self.url}/s/{server}/mcp"
+
+    @property
+    def admin_url(self) -> str:
+        return self.url + ADMIN_PREFIX
 
 
 @contextmanager
@@ -254,7 +282,7 @@ def gateway(deployed: Deployed, *, policy_wait: int = 1) -> Iterator[Running]:
     )
     http = view_client(parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1)))
     app = GatewayApp(pool, http, policy_wait=policy_wait)
-    with serve(app, lifespan=True, proxy_headers=False) as url:
+    with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
         deadline = time.monotonic() + 10
         while httpx.get(f"{url}/healthz", timeout=5).status_code != 200:
             if time.monotonic() > deadline:

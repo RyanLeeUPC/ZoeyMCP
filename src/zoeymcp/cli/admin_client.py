@@ -1,7 +1,12 @@
-"""CLI commands that talk to a running vault over its local admin socket.
+"""CLI commands that talk to a running vault or gateway over its local admin socket.
 
-They run inside the vault container (``docker exec <vault> zoeymcp secret set NAME``), as the
-vault's uid, so the socket's filesystem permissions are the authentication.
+They run inside the container (``docker exec <vault> zoeymcp secret set NAME``, ``docker exec
+<gateway> zoeymcp review notes``), as the uid that owns the socket's directory, so the socket's
+filesystem permissions are the authentication.
+
+``docker exec`` runs as root, and in the standard tier root has no ``DAC_OVERRIDE``, so it can't
+open those ``0700`` directories. Run as root, the CLI first becomes the directory's owner (M3
+design B.2): the container keeps ``SETUID`` and ``SETGID`` for this.
 """
 
 from __future__ import annotations
@@ -17,7 +22,12 @@ import httpx
 from ..vault.admin import DEFAULT_SOCKET, SOCKET_ENV
 from ..vault.oauth.protocol import EXCHANGE_DEADLINE, REFRESH_BUDGET
 
+GATEWAY_SOCKET: Final = "/run/zoeymcp-gateway/admin.sock"
+GATEWAY_SOCKET_ENV: Final = "ZOEYMCP_GATEWAY_ADMIN_SOCKET"
 DEFAULT_TIMEOUT: Final = 10.0
+# A review lists the server on a fresh connection: up to the largest list_timeout (300 s), the
+# gateway's own wait beyond it, and closing the connection.
+REVIEW_TIMEOUT: Final = 300 + 15 + 15
 # A login may wait for the code exchange, then for a refresh of the slot already in flight
 # (commit waits for it before storing), plus time to answer.
 LOGIN_TIMEOUT: Final = EXCHANGE_DEADLINE + REFRESH_BUDGET + 15
@@ -45,6 +55,36 @@ def socket_path(explicit: str | None) -> str:
     return explicit or os.environ.get(SOCKET_ENV) or DEFAULT_SOCKET
 
 
+def gateway_socket_path(explicit: str | None) -> str:
+    return explicit or os.environ.get(GATEWAY_SOCKET_ENV) or GATEWAY_SOCKET
+
+
+def become_socket_owner(socket: str, system: Any = os) -> None:
+    """Run as root, become the owner of the socket's directory before connecting.
+
+    ``system`` is :mod:`os`, or a stand-in in tests. Nothing happens unless the effective uid is
+    0 and the directory belongs to another uid. Supplementary groups are dropped first, then the
+    group, then the user, so nothing of root is left.
+    """
+    if not hasattr(system, "geteuid") or system.geteuid() != 0:
+        return
+    try:
+        info = system.stat(os.path.dirname(socket) or ".")
+    except OSError:
+        return  # connecting says what is wrong
+    if info.st_uid == 0:
+        return
+    try:
+        system.setgroups([])
+        system.setgid(info.st_gid)
+        system.setuid(info.st_uid)
+    except OSError as exc:
+        raise AdminUnavailable(
+            f"can't switch to uid {info.st_uid}, which owns {os.path.dirname(socket)} "
+            f"({exc.strerror}); run with -u {info.st_uid}"
+        ) from exc
+
+
 def _request(
     socket: str,
     method: str,
@@ -52,16 +92,20 @@ def _request(
     body: dict[str, Any] | None = None,
     transport: httpx.BaseTransport | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    *,
+    role: str = "vault",
 ) -> dict[str, Any]:
-    transport = transport or httpx.HTTPTransport(uds=socket)
+    if transport is None:
+        become_socket_owner(socket)
+        transport = httpx.HTTPTransport(uds=socket)
     try:
         with httpx.Client(
-            transport=transport, base_url="http://vault-admin", timeout=timeout
+            transport=transport, base_url=f"http://{role}-admin", timeout=timeout
         ) as client:
             response = client.request(method, path, json=body)
     except (httpx.HTTPError, OSError, RuntimeError) as exc:
         # RuntimeError: httpx on Windows, where Unix sockets aren't supported.
-        raise AdminUnavailable(f"can't reach the vault's admin socket at {socket}: {exc}") from exc
+        raise AdminUnavailable(f"can't reach the {role}'s admin socket at {socket}: {exc}") from exc
     try:
         data: dict[str, Any] = response.json()
     except ValueError as exc:
@@ -176,6 +220,20 @@ def oauth_reset(
 ) -> dict[str, Any]:
     path = f"/oauth/{quote(credential, safe='')}/reset"
     return _request(socket, "POST", path, transport=transport)
+
+
+def gateway_status(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    return _request(socket, "GET", "/status", transport=transport, role="gateway")
+
+
+def gateway_review(
+    socket: str, server: str, *, clear: bool, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Review ``server`` on a fresh connection; with ``clear``, also clear its drift marks."""
+    path = f"/review/{quote(server, safe='')}" + ("/clear" if clear else "")
+    return _request(
+        socket, "POST", path, transport=transport, timeout=REVIEW_TIMEOUT, role="gateway"
+    )
 
 
 def describe_binding(binding: dict[str, Any]) -> str:

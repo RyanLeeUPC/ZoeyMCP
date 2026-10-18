@@ -28,6 +28,7 @@ from ..vault.gatewaykeys import utc
 from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
 from ..vault.oauth.pkce import FLOW_TTL
 from . import admin_client
+from . import review as review_view
 
 EXIT_OK = 0
 EXIT_FINDINGS = 1
@@ -215,6 +216,69 @@ def _build_parser() -> argparse.ArgumentParser:
         help="stop accepting the previous key now, for a suspected leak",
     )
 
+    review = commands.add_parser(
+        "review",
+        help="review a gateway server's tools and print pins to commit (inside the gateway)",
+        description=(
+            "Ask the running gateway to list a server's tools on a fresh connection and show, per "
+            "tool, its state, pin and findings, a diff for drifted tools, and a YAML snippet for "
+            "the policy. With no server, one line per server and no upstream call. Exit 0 when "
+            "every included tool matches and nothing is marked, 1 when something needs you, 2 "
+            "when the review couldn't run."
+        ),
+    )
+    review.add_argument("server", nargs="?")
+    review.add_argument(
+        "--tool",
+        action="append",
+        default=[],
+        metavar="TOOL",
+        help="show only this tool (repeatable; the snippet still covers the whole server)",
+    )
+    review.add_argument(
+        "--show", action="append", default=[], metavar="TOOL", help="print TOOL's definition"
+    )
+    review.add_argument("--all", action="store_true", help="print every definition")
+    review.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        metavar="TOOL",
+        help="include TOOL in the snippet; you still classify it as allow or approve",
+    )
+    review.add_argument(
+        "--repin",
+        action="append",
+        default=[],
+        metavar="TOOL",
+        help="take a drifted tool's new pin in the snippet",
+    )
+    review.add_argument(
+        "--clear",
+        action="store_true",
+        help="clear the server's drift marks, if every included tool matches its pin again",
+    )
+    review.add_argument("--format", choices=("text", "json"), default="text")
+    gateway_status = commands.add_parser(
+        "gateway-status",
+        help="the gateway's view and each server's state (inside the gateway)",
+        description=(
+            "Print the gateway's view digest and, per server, its connections, era, exposed and "
+            "included tools, reports and drift marks. Never definitions or token hashes."
+        ),
+    )
+    gateway_status.add_argument("server", nargs="?")
+    gateway_status.add_argument("--format", choices=("text", "json"), default="text")
+    for sub in (review, gateway_status):
+        sub.add_argument(
+            "--socket",
+            metavar="PATH",
+            help=(
+                f"the gateway's admin socket (default ${admin_client.GATEWAY_SOCKET_ENV} or "
+                f"{admin_client.GATEWAY_SOCKET})"
+            ),
+        )
+
     login = commands.add_parser(
         "login",
         help="consent to an OAuth credential and store its refresh token (inside the vault)",
@@ -385,6 +449,79 @@ def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -
         err.write(
             f"rotation pending: {generations}{master} accepted until {utc(previous['until'])}\n"
         )
+
+
+# --- review and gateway-status ----------------------------------------------------------------
+
+
+def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    socket = admin_client.gateway_socket_path(args.socket)
+    if args.server is None:
+        if args.tool or args.show or args.all or args.add or args.repin or args.clear:
+            err.write("zoeymcp review: these options need a server\n")
+            return review_view.EXIT_COULD_NOT_RUN
+        try:
+            status = admin_client.gateway_status(socket)
+        except admin_client.AdminUnavailable as exc:
+            err.write(f"zoeymcp review: {exc}\n")
+            return review_view.EXIT_COULD_NOT_RUN
+        lines, code = review_view.summary(status)
+        if args.format == "json":
+            review_view.write_json(status, out)
+        else:
+            review_view.write_lines(lines, out)
+        return code
+    choices = review_view.Choices(
+        tools=frozenset(args.tool),
+        show=frozenset(args.show),
+        show_all=args.all,
+        add=tuple(dict.fromkeys(args.add)),
+        repin=frozenset(args.repin),
+    )
+    try:
+        result = admin_client.gateway_review(socket, args.server, clear=args.clear)
+    except admin_client.AdminUnavailable as exc:
+        if exc.reason == "not_clean" and isinstance(exc.data.get("review"), dict):
+            # --clear refused: show what doesn't match, and why.
+            err.write(f"zoeymcp review: --clear refused: {review_view.untrusted(exc)}\n")
+            _print_review(exc.data["review"], choices, args.format, out)
+            return review_view.EXIT_NEEDS_OPERATOR
+        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    try:
+        review_view.check_choices(result, choices)
+    except review_view.UsageError as exc:
+        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    _print_review(result, choices, args.format, out)
+    return review_view.exit_code(result)
+
+
+def _print_review(
+    result: dict[str, Any], choices: review_view.Choices, fmt: str, out: TextIO
+) -> None:
+    if fmt == "json":
+        review_view.write_json({**result, "snippet": review_view.snippet(result, choices)}, out)
+    else:
+        review_view.write_lines(review_view.render(result, choices), out)
+
+
+def _cmd_gateway_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    try:
+        status = admin_client.gateway_status(admin_client.gateway_socket_path(args.socket))
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp gateway-status: {exc}\n")
+        return EXIT_UNREADABLE
+    if args.server is not None and args.server not in status["servers"]:
+        err.write(f"zoeymcp gateway-status: no gateway server named {args.server!r}\n")
+        return EXIT_UNREADABLE
+    if args.format == "json":
+        if args.server is not None:
+            status = {**status, "servers": {args.server: status["servers"][args.server]}}
+        review_view.write_json(status, out)
+    else:
+        review_view.write_lines(review_view.status_lines(status, args.server), out)
+    return EXIT_OK
 
 
 # --- login and oauth ---------------------------------------------------------------------------
@@ -701,6 +838,10 @@ def main(
         return _cmd_selftest(args, stdin, out)
     if args.command in ("secret", "setup-code", "gateway-key"):
         return _cmd_admin(args, stdin, out, err)
+    if args.command == "review":
+        return _cmd_review(args, out, err)
+    if args.command == "gateway-status":
+        return _cmd_gateway_status(args, out, err)
     if args.command == "login":
         return _cmd_login(args, stdin, out, err)
     if args.command == "oauth":
