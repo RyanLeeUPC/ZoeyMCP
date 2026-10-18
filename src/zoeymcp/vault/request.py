@@ -1,5 +1,6 @@
 """Request policy as pure functions: path normalization, query and header policy, and response
-scrubbing (design §4.1, §4.2). Rule matching is in ``common/policy/match.py``.
+scrubbing (design §4.1, §4.2), streams included (M3 design J.2). Rule matching is in
+``common/policy/match.py``.
 
 Nothing here does I/O, so every rule can be tested directly and exhaustively.
 """
@@ -286,3 +287,132 @@ def scrub_headers(
         total += count
         result.append((name, cleaned.decode("latin-1")))
     return result, total
+
+
+# --- streams (M3 design J.2) -------------------------------------------------------------------
+
+# The longest SSE event or NDJSON line a stream may carry, line breaks included. It's above the
+# largest upstream message the gateway takes (16 MiB), so no stream an MCP client can read ends.
+MAX_STREAM_EVENT_BYTES = 17 * 1024 * 1024
+_CR = 0x0D
+_LF = 0x0A
+_COLON = 0x3A
+_LINE_BREAK = re.compile(rb"[\r\n]")
+_LF_BREAK = re.compile(rb"\n")
+
+
+class StreamEventTooLarge(ValueError):
+    """An SSE event or NDJSON line over the limit. The stream ends there, without it."""
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        super().__init__(f"a stream event of at least {size} bytes is over the limit")
+
+
+class SSEScrubber:
+    r"""Scrubs a ``text/event-stream`` one event at a time.
+
+    Bytes are held until their event ends with a blank line, then scrubbed and released, so a
+    secret split across chunks is still caught. A line ends with ``\n``, ``\r\n`` or ``\r``. A
+    comment line (``:``) at the start of an event is released when it ends, so keep-alives pass at
+    once. Nothing is held beyond one event. An event longer than ``max_event_bytes`` raises
+    :class:`StreamEventTooLarge`.
+
+    No secret variant contains a line break, so scrubbing event by event is the same as scrubbing
+    the whole stream.
+    """
+
+    def __init__(
+        self, variants: Sequence[bytes], *, max_event_bytes: int = MAX_STREAM_EVENT_BYTES
+    ) -> None:
+        self._variants = variants
+        self._max = max_event_bytes
+        self._held = bytearray()
+        # Where the current line starts, and where the next search for a line break starts. Each
+        # byte is looked at once, so a long line costs no more than its length.
+        self._line_start = 0
+        self._scanned = 0
+        self.scrubbed = 0
+
+    def feed(self, chunk: bytes) -> bytes:
+        """Take the next chunk and return what may be sent now."""
+        out = bytearray()
+        held = self._held
+        held += chunk
+        while found := _LINE_BREAK.search(held, max(self._line_start, self._scanned)):
+            index = found.start()
+            end = index + 1
+            # (A \r first in the buffer ended a blank line and went out, so index 0 is no \r\n.)
+            if held[index] == _LF and index and held[index - 1] == _CR:
+                # The \n of a \r\n split across chunks: the \r ended the line already. (When
+                # that \r ended an event, the \n is first in an empty buffer instead, and goes
+                # out alone as a blank line. The bytes the reader gets are the same.)
+                self._line_start = end
+                continue
+            if held[index] == _CR and end < len(held) and held[end] == _LF:
+                end += 1
+            blank = index == self._line_start
+            self._line_start = end
+            # A comment line first in the buffer: anything before it has been released.
+            if blank or held[0] == _COLON:
+                out += self._release(end)
+        # What's left from the line start on has no line break.
+        self._scanned = len(held)
+        if len(held) > self._max:
+            raise StreamEventTooLarge(len(held))
+        return bytes(out)
+
+    def finish(self) -> bytes:
+        """Return what's left when the stream ends (an event that never ended), scrubbed."""
+        return self._release(len(self._held))
+
+    def _release(self, end: int) -> bytes:
+        if end > self._max:
+            raise StreamEventTooLarge(end)
+        event, count = scrub(bytes(self._held[:end]), self._variants)
+        del self._held[:end]
+        self._line_start = self._scanned = 0
+        self.scrubbed += count
+        return event
+
+
+class NDJSONScrubber:
+    r"""Scrubs an ``application/x-ndjson`` stream one line at a time, as :class:`SSEScrubber` does
+    events. A line ends with ``\n``. A line longer than ``max_line_bytes`` raises
+    :class:`StreamEventTooLarge`.
+    """
+
+    def __init__(
+        self, variants: Sequence[bytes], *, max_line_bytes: int = MAX_STREAM_EVENT_BYTES
+    ) -> None:
+        self._variants = variants
+        self._max = max_line_bytes
+        self._held = bytearray()
+        self._scanned = 0
+        self.scrubbed = 0
+
+    def feed(self, chunk: bytes) -> bytes:
+        """Take the next chunk and return what may be sent now."""
+        held = self._held
+        held += chunk
+        start = 0
+        while found := _LF_BREAK.search(held, self._scanned):
+            end = found.end()
+            if end - start > self._max:
+                raise StreamEventTooLarge(end - start)
+            start = self._scanned = end
+        if len(held) - start > self._max:
+            raise StreamEventTooLarge(len(held) - start)
+        out = self._release(start)
+        self._scanned = len(held)
+        return out
+
+    def finish(self) -> bytes:
+        """Return what's left when the stream ends (a line with no line break), scrubbed."""
+        return self._release(len(self._held))
+
+    def _release(self, end: int) -> bytes:
+        lines, count = scrub(bytes(self._held[:end]), self._variants)
+        del self._held[:end]
+        self.scrubbed += count
+        return lines

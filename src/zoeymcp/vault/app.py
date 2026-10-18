@@ -20,6 +20,11 @@ OAuth routes get an access token from the :class:`TokenManager`. An upstream 401
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
 (design D.10). Neither HTTP client keeps cookies: an upstream's session cookie must never reach
 another caller (N2).
+
+Streams on stream routes are relayed as they arrive, scrubbed one SSE event or NDJSON line at a
+time. Answers to the gateway are scrubbed at any size, and an upstream redirect becomes a 502 for
+it. Once the body is read the vault watches the caller: if it leaves while the vault waits for
+upstream headers or relays the answer, the upstream request is closed (M3 design F.6, J.2).
 """
 
 from __future__ import annotations
@@ -34,15 +39,14 @@ import os
 import re
 import time
 import urllib.request
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
-from starlette.background import BackgroundTask
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
 from ..common.policy.match import NormalizedPath
@@ -65,7 +69,10 @@ from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAV
 from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
 from .oauth.tokens import UPSTREAM_INSUFFICIENT_SCOPE, Grant, OAuthUnavailable, TokenManager
 from .request import (
+    NDJSONScrubber,
     RequestRejected,
+    SSEScrubber,
+    StreamEventTooLarge,
     apply_query_policy,
     encode_query,
     filter_request_headers,
@@ -96,10 +103,15 @@ VIEW_MAX_WAITERS = 4
 _ENTITY_TAG = re.compile(r'\s*(?:W/)?"([\x21\x23-\x7e]*)"\s*')
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# Buffered answers to other callers are scrubbed up to this size; the gateway's at any size.
 MAX_SCRUB_BYTES = 1024 * 1024
 CONNECT_TIMEOUT = 10.0
 READ_TIMEOUT = 60.0
-_STREAM_TYPES = ("text/event-stream", "application/x-ndjson")
+SSE_TYPE = "text/event-stream"
+NDJSON_TYPE = "application/x-ndjson"
+# Tells a proxy in front of the vault (Caddy, nginx) to pass each relayed chunk on at once.
+NO_BUFFERING = (b"x-accel-buffering", b"no")
+_STREAM_TYPES = (SSE_TYPE, NDJSON_TYPE)
 # A 401 to these is answered by retrying once with a new token. POST and PATCH may have had an
 # effect, so their 401 goes back to the caller and only the next request gets a new token.
 _RETRY_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
@@ -137,6 +149,50 @@ class Refused(Exception):
         self.retry_after = retry_after
         self.allow = allow
         super().__init__(reason)
+
+
+class CallerGone(Exception):
+    """The caller left while the vault waited on the upstream. Nobody is left to answer.
+
+    ``phase`` is ``headers`` while waiting for the upstream's status and headers, and ``relay``
+    once they arrived.
+    """
+
+    def __init__(self, phase: Literal["headers", "relay"]) -> None:
+        self.phase = phase
+        super().__init__(f"the caller left during {phase}")
+
+
+class Departure:
+    """Watches the caller's ``receive()`` for a disconnect, once the request body has been read.
+
+    Starlette listens for disconnects while streaming only on servers older than ASGI 2.4, and
+    not at all while the vault waits for upstream headers. A silent upstream sends nothing that
+    would show the caller has gone, so the vault watches for itself (M3 design F.6).
+    """
+
+    def __init__(self, receive: Receive) -> None:
+        self._gone = asyncio.ensure_future(_disconnected(receive))
+
+    async def race[T](self, work: Awaitable[T], *, phase: Literal["headers", "relay"]) -> T:
+        """Await ``work``. If the caller leaves first, cancel it and raise :class:`CallerGone`."""
+        task = asyncio.ensure_future(work)
+        try:
+            await asyncio.wait((task, self._gone), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not task.done():
+                task.cancel()
+                # Let it finish: a cancelled httpx request closes its upstream connection here.
+                await asyncio.wait((task,))
+        if task.cancelled():
+            raise CallerGone(phase)
+        return task.result()
+
+    def close(self) -> None:
+        """Stop watching."""
+        # On a task that has already failed, cancel() also marks its error as retrieved, so
+        # asyncio doesn't report it as never retrieved.
+        self._gone.cancel()
 
 
 class _DiscardingJar(http.cookiejar.CookieJar):
@@ -350,8 +406,12 @@ class VaultApp:
         started = time.monotonic()
         listener: Listener = "gateway" if scope.get(LISTENER_SCOPE_KEY) == "gateway" else "tcp"
         log: dict[str, Any] = {"method": request.method, "listener": listener}
+        response: Response | None
         try:
             response = await self._handle(request, listener, log)
+        except CallerGone as gone:
+            log.update(outcome="cancelled", phase=gone.phase)
+            response = None
         except Refused as refusal:
             log.update(status=refusal.status, reason=refusal.reason)
             body = {"error": _PUBLIC_MESSAGES.get(refusal.status, "error")}
@@ -367,7 +427,8 @@ class VaultApp:
             log["status"] = response.status_code
         log["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
         logs.event("request", **log)
-        await response(scope, receive, send)
+        if response is not None:
+            await response(scope, receive, send)
 
     # --- handling ------------------------------------------------------------------------------
 
@@ -458,29 +519,49 @@ class VaultApp:
         url = upstream_origin + base_path + path_prefix + rest.encoded()
         if query:
             url += "?" + encode_query(query)
-        upstream_response = await self._send(request.method, url, headers, body, route)
-        if grant is not None:
-            assert route.credential is not None  # noqa: S101 - set for every OAuth route
-            status = upstream_response.status_code
-            if status in (401, 403) and "insufficient_scope" in _challenge_errors(
-                upstream_response
-            ):
-                # A new token won't fix that; the operator may need to log in with more scopes.
-                self._tokens.note_upstream(route.credential, UPSTREAM_INSUFFICIENT_SCOPE)
-            if status == 401:
-                upstream_response, variants = await self._after_401(
-                    upstream_response,
-                    route=route,
-                    credential=route.credential,
-                    grant=grant,
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    body=body,
-                    variants=variants,
-                    log=log,
-                )
-        return await self._respond(upstream_response, route, variants, log)
+        departure = Departure(request.receive)
+        try:
+            upstream_response = await self._send(
+                request.method, url, headers, body, route, departure
+            )
+            if grant is not None:
+                assert route.credential is not None  # noqa: S101 - set for every OAuth route
+                status = upstream_response.status_code
+                if status in (401, 403) and "insufficient_scope" in _challenge_errors(
+                    upstream_response
+                ):
+                    # A new token won't fix that; the operator may need to log in with more
+                    # scopes.
+                    self._tokens.note_upstream(route.credential, UPSTREAM_INSUFFICIENT_SCOPE)
+                if status == 401:
+                    upstream_response, variants = await self._after_401(
+                        upstream_response,
+                        route=route,
+                        credential=route.credential,
+                        grant=grant,
+                        method=request.method,
+                        url=url,
+                        headers=headers,
+                        body=body,
+                        variants=variants,
+                        departure=departure,
+                        log=log,
+                    )
+            response = await self._respond(
+                upstream_response,
+                route,
+                variants,
+                departure,
+                log,
+                gateway=caller == "gateway",
+            )
+        except BaseException:
+            departure.close()
+            raise
+        if not isinstance(response, Relay):
+            # Answered in full. A relay stops watching when its stream ends.
+            departure.close()
+        return response
 
     def _identify(
         self,
@@ -659,6 +740,7 @@ class VaultApp:
         headers: list[tuple[str, str]],
         body: bytes,
         variants: list[bytes],
+        departure: Departure,
         log: dict[str, Any],
     ) -> tuple[httpx.Response, list[bytes]]:
         """The upstream refused the access token (design D.10).
@@ -684,7 +766,7 @@ class VaultApp:
                 )
             retry = [h for h in headers if h[0] != "authorization"]
             retry.append(_bearer(fresh))
-            upstream = await self._send(method, url, retry, body, route)
+            upstream = await self._send(method, url, retry, body, route, departure)
             self._serials[credential] = fresh.serial
             action = log["oauth"] = "retried"
             return upstream, sorted({*variants, *fresh.variants}, key=len, reverse=True)
@@ -720,14 +802,16 @@ class VaultApp:
         headers: list[tuple[str, str]],
         body: bytes,
         route: Route,
+        departure: Departure,
     ) -> httpx.Response:
-        """Send the request upstream. Returns once the status line and headers arrived."""
+        """Send the request upstream. Returns once the status line and headers arrived, or
+        raises :class:`CallerGone` (and closes the request) if the caller leaves first."""
         timeout = httpx.Timeout(None if route.stream else READ_TIMEOUT, connect=CONNECT_TIMEOUT)
         outgoing = self._client.build_request(
             method, url, headers=headers, content=body, timeout=timeout
         )
         try:
-            return await self._client.send(outgoing, stream=True)
+            return await departure.race(self._client.send(outgoing, stream=True), phase="headers")
         except httpx.HTTPError as exc:
             raise Refused(502, f"upstream request failed: {type(exc).__name__}") from exc
 
@@ -736,13 +820,20 @@ class VaultApp:
         upstream: httpx.Response,
         route: Route,
         variants: list[bytes],
+        departure: Departure,
         log: dict[str, Any],
+        *,
+        gateway: bool,
     ) -> Response:
         """Relay a stream as it arrives, or buffer and scrub everything else."""
+        log["upstream_status"] = upstream.status_code
+        if gateway and 300 <= upstream.status_code <= 399:
+            # Following it could take the gateway to another route of the vault (M3 design G14).
+            await upstream.aclose()
+            raise Refused(502, "redirect refused")
         response_headers, header_hits = scrub_headers(
             filter_response_headers(upstream.headers.multi_items()), variants
         )
-        log["upstream_status"] = upstream.status_code
 
         # Only real streams are relayed as they arrive. Anything else on a stream route (JSON
         # errors especially, which is where upstreams echo keys) is buffered and scrubbed. A 401
@@ -750,16 +841,20 @@ class VaultApp:
         content_type = upstream.headers.get("content-type", "")
         if route.stream and upstream.status_code != 401 and _is_stream(content_type):
             log.update(streamed=True, scrubbed=header_hits)
-            streamed = StreamingResponse(
-                _relay(upstream),
-                status_code=upstream.status_code,
-                background=BackgroundTask(upstream.aclose),
+            relayed = [h for h in _raw(response_headers) if h[0] != NO_BUFFERING[0]]
+            return Relay(
+                upstream,
+                route=route.name,
+                headers=[*relayed, NO_BUFFERING],
+                scrubber=_scrubber(content_type, variants),
+                departure=departure,
+                scrubbed=header_hits,
             )
-            streamed.raw_headers = _raw(response_headers)
-            return streamed
 
         try:
-            content = await _read_limited(upstream, MAX_RESPONSE_BYTES)
+            content = await departure.race(
+                _read_limited(upstream, MAX_RESPONSE_BYTES), phase="relay"
+            )
         except httpx.HTTPError as exc:
             raise Refused(502, f"upstream response failed: {type(exc).__name__}") from exc
         finally:
@@ -769,10 +864,11 @@ class VaultApp:
 
         body_hits = 0
         content_type = upstream.headers.get("content-type", "").lower()
-        if (
-            variants
-            and len(content) <= MAX_SCRUB_BYTES
-            and content_type.startswith(_SCRUBBED_TYPES)
+        # The gateway passes what it gets on to agents, so its answers are scrubbed whatever
+        # their size or type (M3 design J.2).
+        if variants and (
+            gateway
+            or (len(content) <= MAX_SCRUB_BYTES and content_type.startswith(_SCRUBBED_TYPES))
         ):
             content, body_hits = scrub(content, variants)
         log.update(bytes_out=len(content), scrubbed=header_hits + body_hits)
@@ -864,17 +960,109 @@ def _token_refused(response: httpx.Response) -> bool:
     return all(error == "invalid_token" for error in _challenge_errors(response))
 
 
+def _media_type(content_type: str) -> str:
+    return content_type.lower().split(";", 1)[0].strip()
+
+
 def _is_stream(content_type: str) -> bool:
-    return content_type.lower().split(";", 1)[0].strip() in _STREAM_TYPES
+    return _media_type(content_type) in _STREAM_TYPES
+
+
+def _scrubber(content_type: str, variants: list[bytes]) -> SSEScrubber | NDJSONScrubber | None:
+    """The scrubber for a stream of this type, or None when there is no secret to look for."""
+    if not variants:
+        return None
+    if _media_type(content_type) == SSE_TYPE:
+        return SSEScrubber(variants)
+    return NDJSONScrubber(variants)
 
 
 def _raw(headers: list[tuple[str, str]]) -> list[tuple[bytes, bytes]]:
     return [(name.lower().encode("latin-1"), value.encode("latin-1")) for name, value in headers]
 
 
-async def _relay(upstream: httpx.Response) -> AsyncIterator[bytes]:
-    async for chunk in upstream.aiter_bytes():
-        yield chunk
+class Relay(Response):
+    """Relays an upstream stream as it arrives, through its scrubber if it has one.
+
+    The stream ends when the upstream's does, when the caller leaves, when an event is over the
+    limit, or when the upstream fails. Whichever it is, the upstream is closed in ``finally`` and
+    ``stream_closed`` says which (M3 design F.6, J.2).
+    """
+
+    def __init__(
+        self,
+        upstream: httpx.Response,
+        *,
+        route: str,
+        headers: list[tuple[bytes, bytes]],
+        scrubber: SSEScrubber | NDJSONScrubber | None,
+        departure: Departure,
+        scrubbed: int,
+    ) -> None:
+        self.status_code = upstream.status_code
+        self.raw_headers = headers
+        self.background = None
+        self._upstream = upstream
+        self._route = route
+        self._scrubber = scrubber
+        self._departure = departure
+        self._header_hits = scrubbed
+        self._sent = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        started = time.monotonic()
+        # Also what a cancelled task (shutdown) logs.
+        outcome = "cancelled"
+        phase = "relay"
+        try:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": self.status_code,
+                    "headers": self.raw_headers,
+                }
+            )
+            try:
+                await self._departure.race(self._pump(send), phase="relay")
+                outcome = "ok"
+            except StreamEventTooLarge:
+                # Fail closed: the event is never sent, and neither is anything after it.
+                outcome = "event_too_large"
+                logs.event("stream_event_too_large", route=self._route)
+            except httpx.HTTPError:
+                outcome = "upstream_error"
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except CallerGone as gone:
+            outcome = "cancelled"
+            phase = gone.phase
+        except OSError:
+            # The caller left, seen by a failed write.
+            outcome = "cancelled"
+        finally:
+            self._departure.close()
+            await self._upstream.aclose()
+            fields: dict[str, Any] = {
+                "route": self._route,
+                "bytes": self._sent,
+                "scrubbed": self._header_hits + (self._scrubber.scrubbed if self._scrubber else 0),
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "outcome": outcome,
+            }
+            if outcome == "cancelled":
+                fields["phase"] = phase
+            logs.event("stream_closed", **fields)
+
+    async def _pump(self, send: Send) -> None:
+        scrubber = self._scrubber
+        async for chunk in self._upstream.aiter_bytes():
+            await self._write(send, chunk if scrubber is None else scrubber.feed(chunk))
+        if scrubber is not None:
+            await self._write(send, scrubber.finish())
+
+    async def _write(self, send: Send, data: bytes) -> None:
+        if data:
+            self._sent += len(data)
+            await send({"type": "http.response.body", "body": data, "more_body": True})
 
 
 async def _read_limited(upstream: httpx.Response, limit: int) -> bytes | None:
