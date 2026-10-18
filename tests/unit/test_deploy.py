@@ -84,3 +84,48 @@ def test_the_standard_container_is_the_launchers_box() -> None:
     assert volumes == {"/state", "/state-gateway"}
     # The vault's environment holds the master key; the launcher keeps it from the gateway.
     assert "ZOEYMCP_MASTER_KEY" in service["environment"]
+
+
+def test_the_hardened_gateway_has_no_egress() -> None:
+    document = compose("compose.hardened.yaml")
+    networks = document["networks"]
+    gateway = document["services"]["gateway"]
+    unprivileged(gateway)
+    assert gateway["user"] == "10002:10002"
+    assert gateway["command"][:3] == ["gateway", "--vault", "http://vault:8080"]
+    assert sorted(gateway["networks"]) == ["agents", "internal"]
+    assert all(networks[name]["internal"] is True for name in gateway["networks"])
+    assert "ports" not in gateway
+    assert "ZOEYMCP_MASTER_KEY" not in gateway["environment"]
+    assert "ZOEYMCP_CONFIG" not in gateway["environment"]
+    assert "egress" in document["services"]["vault"]["networks"]
+
+
+@pytest.mark.parametrize(
+    ("path", "upstream"),
+    [("compose.yaml", "zoeymcp:8090"), ("compose.hardened.yaml", "gateway:8090")],
+)
+def test_the_lan_profile(path: str, upstream: str) -> None:
+    document = compose(path)
+    lan, init = document["services"]["lan"], document["services"]["lan-init"]
+    assert lan["profiles"] == init["profiles"] == ["lan"]
+    # Only for exec: the caddy binary has the file capability.
+    unprivileged(lan, ["NET_BIND_SERVICE"])
+    assert lan["image"] == init["image"]
+    assert "@sha256:" in lan["image"]
+    assert lan["ports"] == ["0.0.0.0:8443:8443"]
+    # The one-shot chown has only CHOWN, and no network.
+    assert (init["cap_drop"], init["cap_add"], init["network_mode"]) == (["ALL"], ["CHOWN"], "none")
+    caddyfile = lan["environment"]["ZOEYMCP_CADDYFILE"]
+    assert "https://zoeymcp.lan.example:8443 {" in caddyfile
+    assert "tls internal" in caddyfile
+    assert f"reverse_proxy {upstream} {{" in caddyfile
+    assert "flush_interval -1" in caddyfile
+    assert "admin off" in caddyfile
+    # The gateway must accept the LAN name, or it answers 421.
+    policy = next(
+        service["environment"]["ZOEYMCP_CONFIG"]
+        for service in document["services"].values()
+        if "ZOEYMCP_CONFIG" in service.get("environment", {})
+    )
+    assert "zoeymcp.lan.example" in yaml.safe_load(policy)["gateway"]["hosts"]

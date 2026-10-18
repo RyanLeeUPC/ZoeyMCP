@@ -8,6 +8,8 @@ image="${1:?usage: smoke-image.sh IMAGE}"
 name="zoeymcp-smoke-$$"
 volume="zoeymcp-smoke-state-$$"
 project="zoeymcp-smoke-$$"
+hardened_project="zoeymcp-smoke-hardened-$$"
+work="$(mktemp -d)"
 port=18080
 examples="$(cd "$(dirname "$0")/../examples" && pwd)"
 deploy="$(cd "$(dirname "$0")/../deploy" && pwd)"
@@ -17,10 +19,25 @@ hardened="--read-only --cap-drop ALL --security-opt no-new-privileges:true --tmp
 standard() {
     ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${key:-unset}"         docker compose -p "$project" -f "$deploy/compose.yaml" "$@"
 }
+# The hardened tier with the lan profile; override.yaml holds a policy with a real client
+# token.
+hardened_tier() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${hardened_master:-unset}" \
+        ZOEYMCP_GATEWAY_KEY="${gateway_key:-unset}" \
+        ZOEYMCP_GATEWAY_KEY_GENERATION="${generation:-1}" \
+        ZOEYMCP_LAN_BIND=127.0.0.1 ZOEYMCP_LAN_HOST="${lan_host:-zoeymcp.lan.example}" \
+        docker compose -p "$hardened_project" -f "$deploy/compose.hardened.yaml" \
+        -f "$work/override.yaml" --profile lan "$@"
+}
+
 cleanup() {
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker volume rm "$volume" >/dev/null 2>&1 || true
     standard down -v >/dev/null 2>&1 || true
+    if [ -f "$work/override.yaml" ]; then
+        hardened_tier down -v >/dev/null 2>&1 || true
+    fi
+    rm -rf "$work"
 }
 trap cleanup EXIT
 
@@ -28,6 +45,9 @@ fail() {
     echo "SMOKE FAIL: $*" >&2
     docker logs "$name" >&2 2>/dev/null || true
     standard logs >&2 2>/dev/null || true
+    if [ -f "$work/override.yaml" ]; then
+        hardened_tier logs >&2 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -338,5 +358,164 @@ for child in vault gateway; do
     standard logs zoeymcp | grep -q "\"event\":\"child_exited\",\"child\":\"$child\",\"status\":0" \
         || fail "the $child didn't stop cleanly"
 done
+
+step "hardened tier: up, from deploy/compose.hardened.yaml with the lan profile"
+keys="$(docker run --rm "$image" keygen)"
+hardened_master="$(echo "$keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+gateway_key="$(echo "$keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+first_key="$gateway_key"
+generation=1
+client="$(docker run --rm "$image" client-token 2>/dev/null)"
+token="$(echo "$client" | sed -n 's/^client_token: //p')"
+token_hash="$(echo "$client" | sed -n 's/^token_sha256: //p')"
+[ -n "$token" ] && [ -n "$token_hash" ] || fail "client-token printed no token"
+# The shipped policy's MCP part, with this run's client token. Compose interpolates the
+# generation.
+cat >"$work/override.yaml" <<EOF
+services:
+  vault:
+    environment:
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+        gateway_key_generation: \${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
+        admin:
+          listen: 0.0.0.0:8081
+          hosts: [localhost, 127.0.0.1]
+        credentials:
+          notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+        routes:
+          - name: notes-mcp
+            prefix: /notes
+            upstream: https://mcp.notes.example
+            credential: notes-key
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+        gateway:
+          hosts: [gateway, localhost, 127.0.0.1, zoeymcp.lan.example]
+          clients:
+            agent1: {token_sha256: "$token_hash", servers: [notes]}
+          servers:
+            notes: {kind: remote, route: notes-mcp, path: /mcp}
+EOF
+hardened_tier up -d
+gateway_fresh() {
+    hardened_tier exec -T gateway zoeymcp gateway-status 2>/dev/null \
+        | grep -q '^view sha256:[0-9a-f]*  fresh$'
+}
+i=0
+until gateway_fresh; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "the hardened gateway never got a fresh view"
+    sleep 0.3
+done
+
+step "hardened tier: the gateway has no way out"
+no_route='
+import socket, sys
+for target in (("1.1.1.1", 443), ("example.com", 443)):
+    try:
+        socket.create_connection(target, timeout=3).close()
+    except OSError:
+        continue
+    sys.exit(f"reached {target}")
+'
+hardened_tier exec -T gateway python -I -c "$no_route" || fail "the gateway reached the internet"
+out="$(hardened_tier exec -T gateway zoeymcp review)" || fail "review didn't reach the gateway"
+echo "$out" | grep -q "^notes  " || fail "review lists no notes server"
+
+step "lan: TLS from Caddy's own CA, and the gateway's checks behind it"
+i=0
+until hardened_tier cp lan:/data/caddy/pki/authorities/local/root.crt "$work/root.crt" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || fail "Caddy made no root certificate"
+    sleep 0.3
+done
+# lan_status HOST PATH CURL-OPTIONS...: the HTTP status; the body and headers land in $work.
+lan_status() {
+    lan_name="$1"
+    lan_path="$2"
+    shift 2
+    curl -s -o "$work/body" -D "$work/headers" -w '%{http_code}' --cacert "$work/root.crt" \
+        --resolve "$lan_name:8443:127.0.0.1" "$@" "https://$lan_name:8443$lan_path" || true
+}
+# lan_mcp HOST CURL-OPTIONS...: a JSON-RPC POST to the notes server.
+lan_mcp() {
+    lan_host_name="$1"
+    shift
+    lan_status "$lan_host_name" /s/notes/mcp -X POST -H 'content-type: application/json' \
+        -H 'accept: application/json, text/event-stream' "$@"
+}
+i=0
+until [ "$(lan_mcp zoeymcp.lan.example -d '{}')" = "401" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || fail "no 401 without a token through the lan proxy"
+    sleep 0.3
+done
+[ "$(lan_mcp zoeymcp.lan.example -H 'origin: https://evil.example' -d '{}')" = "403" ] \
+    || fail "an unlisted Origin wasn't 403 through the lan proxy"
+[ "$(lan_status zoeymcp.lan.example /elsewhere)" = "404" ] || fail "a path outside /s/ wasn't 404"
+initialize='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25",'
+initialize="$initialize"'"capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
+[ "$(lan_mcp zoeymcp.lan.example -H "authorization: Bearer $token" -d "$initialize")" = "200" ] \
+    || fail "initialize with the client token failed through the lan proxy"
+grep -qi '^content-type: text/event-stream' "$work/headers" || fail "the answer isn't an SSE stream"
+grep -q '^event: message' "$work/body" || fail "no SSE event came through"
+grep -q '"name":"zoeymcp/notes"' "$work/body" || fail "the gateway's serverInfo didn't come through"
+lan_host=other.lan.example
+hardened_tier up -d lan
+i=0
+until [ "$(lan_mcp other.lan.example -d '{}')" = "421" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || fail "a LAN name missing from gateway.hosts wasn't 421"
+    sleep 0.3
+done
+lan_host=zoeymcp.lan.example
+
+step "hardened tier: rotating the gateway key"
+generation=2
+hardened_tier up -d vault
+i=0
+until hardened_tier exec -T vault zoeymcp gateway-key 2>&1 \
+    | grep -q '^rotation pending: generation 1 accepted until'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "the bump started no rotation window"
+    sleep 0.3
+done
+gateway_key="$(hardened_tier exec -T vault zoeymcp gateway-key 2>/dev/null \
+    | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+[ -n "$gateway_key" ] && [ "$gateway_key" != "$first_key" ] || fail "no new gateway key"
+hardened_tier up -d gateway
+i=0
+until hardened_tier logs vault \
+    | grep -q '"event":"gateway_key_retired","generation":1,"reason":"new_key_used"'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "the new key's first use didn't retire the old one"
+    sleep 0.3
+done
+i=0
+until gateway_fresh; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "the gateway has no fresh view after the rotation"
+    sleep 0.3
+done
+if hardened_tier exec -T vault zoeymcp gateway-key 2>&1 | grep -q '^rotation pending'; then
+    fail "a rotation is still pending"
+fi
+old_key_view='
+import sys, urllib.error, urllib.request
+request = urllib.request.Request(
+    "http://vault:8080/_zoeymcp/gateway/v1/view", headers={"x-zoeymcp-gateway": sys.argv[1]}
+)
+try:
+    urllib.request.urlopen(request, timeout=10)
+except urllib.error.HTTPError as error:
+    sys.exit(0 if error.code == 403 else f"status {error.code}")
+sys.exit("the old key was accepted")
+'
+hardened_tier exec -T gateway python -I -c "$old_key_view" "$first_key" \
+    || fail "the retired key wasn't refused"
+hardened_tier down -v >/dev/null 2>&1
 
 echo "SMOKE OK"

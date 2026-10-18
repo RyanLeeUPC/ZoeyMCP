@@ -1,14 +1,30 @@
-# ZoeyMCP, hardened tier (design §3.3, §3.4).
+# ZoeyMCP, hardened tier (design §3.3, §3.4, M3 design B.3).
 #
-# M1 runs the vault alone; the gateway joins on the internal network in M3. Nothing here is
-# published to the host: agents' sandboxes reach the vault on the opt-in `direct` network.
+# The vault and the gateway in separate containers. The gateway reaches the vault only on the
+# internal network, with the gateway key; agents reach the gateway only on the agents network.
+# Neither network has a route out, so the gateway has no egress at all: everything upstream goes
+# through the vault. Nothing is published to the host unless you add the lan profile.
 #
-#   ZOEYMCP_MASTER_KEY=...  docker compose -f deploy/compose.hardened.yaml up -d
+#   ZOEYMCP_MASTER_KEY=... ZOEYMCP_GATEWAY_KEY=... \
+#     docker compose -f deploy/compose.hardened.yaml up -d
 #
-# Set secrets through the vault's admin socket, never in this file:
+# `zoeymcp keygen` prints both keys. Agents' containers join the agents network and use
+# http://gateway:8090/s/<server>/mcp with "Authorization: Bearer <client token>".
+#
+# Set secrets through the vault's admin socket, never in this file, and review servers through
+# the gateway's:
 #
 #   printf '%s' "$VALUE" | docker compose -f deploy/compose.hardened.yaml exec -T vault \
-#     zoeymcp secret set music-stats
+#     zoeymcp secret set notes-key
+#   docker compose -f deploy/compose.hardened.yaml exec gateway zoeymcp review notes
+#
+# Rotating the gateway key (docs/operations.md): raise ZOEYMCP_GATEWAY_KEY_GENERATION and
+# recreate the vault; the old key then works for at most 5 minutes. Print the new key with
+# `docker compose exec vault zoeymcp gateway-key`, set it as ZOEYMCP_GATEWAY_KEY, and recreate
+# the gateway. Its first request with the new key retires the old one.
+#
+# The lan profile (`--profile lan`) adds a TLS reverse proxy for agents on other hosts; see
+# below.
 
 name: zoeymcp
 
@@ -18,15 +34,23 @@ x-hardened: &hardened
   security_opt: ["no-new-privileges:true"]
   restart: unless-stopped
 
+# Caddy, for the lan profile. For a real deployment, check for a newer release.
+x-caddy: &caddy-image caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+
 networks:
-  # The gateway's link to the vault (M3). Internal: no route out.
+  # The gateway's link to the vault. Internal: no route out.
   internal:
+    internal: true
+  # The agents' way to the gateway. Attach the agents' containers to it. Internal too.
+  agents:
     internal: true
   # Opt-in: agent sandboxes calling plain API routes. Attach their containers to it.
   direct:
     internal: true
   # The vault's way out, directly or through an egress proxy.
   egress: {}
+  # The lan profile's published port.
+  lan: {}
 
 services:
   vault:
@@ -44,12 +68,15 @@ services:
       ZOEYMCP_CONFIG: |
         version: 1
         mode: declarative
+        gateway_key_generation: ${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
         admin:
           listen: 0.0.0.0:8081
           hosts: [localhost, 127.0.0.1]
         credentials:
           music-stats: {kind: query, param: api_key, secret: store:music-stats}
+          notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
         routes:
+          # A plain API route, for agent sandboxes on the direct network.
           - name: stats
             prefix: /stats
             upstream: https://ws.audioscrobbler.com
@@ -61,6 +88,31 @@ services:
             rules:
               - methods: [GET]
                 paths: [/2.0/]
+          # A remote MCP server, for the gateway only.
+          - name: notes-mcp
+            prefix: /notes
+            upstream: https://mcp.notes.example
+            credential: notes-key
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+        gateway:
+          # Agents use the service name. Add the lan profile's name if you use it.
+          hosts: [gateway, localhost, 127.0.0.1, zoeymcp.lan.example]
+          clients:
+            agent1:
+              # From `zoeymcp client-token`. This one matches no token anyone has.
+              token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              servers: [notes]
+          servers:
+            notes:
+              kind: remote
+              route: notes-mcp
+              path: /mcp
+              # Nothing is served until you review it: `zoeymcp review notes --add <tool>`,
+              # then classify each tool under allow or approve and commit the pins.
+              tools: {include: [], allow: [], approve: []}
+              review: {}
     tmpfs:
       - /tmp:size=16m
       - /run/zoeymcp:size=1m,mode=0700,uid=10001,gid=10001
@@ -68,5 +120,101 @@ services:
     volumes:
       - vault-state:/state
 
+  gateway:
+    <<: *hardened
+    image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
+    command: [gateway, --vault, "http://vault:8080", --listen, "0.0.0.0:8090"]
+    user: "10002:10002"
+    # Calls in flight get 10 s.
+    stop_grace_period: 20s
+    environment:
+      # Or ZOEYMCP_GATEWAY_KEY_FILE, a file the gateway re-reads on HUP (a Docker secret, say).
+      ZOEYMCP_GATEWAY_KEY: ${ZOEYMCP_GATEWAY_KEY:?print it with `zoeymcp keygen` or `zoeymcp gateway-key`}
+    tmpfs:
+      - /tmp:size=16m
+      - /run/zoeymcp-gateway:size=1m,mode=0700,uid=10002,gid=10002
+    networks: [agents, internal]
+    volumes:
+      - gateway-state:/state-gateway
+
+  # --- the lan profile -------------------------------------------------------------------------
+  #
+  # A TLS reverse proxy for agents on other hosts: https://${ZOEYMCP_LAN_HOST}:8443/s/<server>/mcp.
+  # TLS is always on. By default Caddy issues the certificate from its own CA, kept in the
+  # lan-data volume; copy its root to each client:
+  #
+  #   docker compose -f deploy/compose.hardened.yaml cp \
+  #     lan:/data/caddy/pki/authorities/local/root.crt ./zoeymcp-lan-root.crt
+  #
+  # (NODE_EXTRA_CA_CERTS=./zoeymcp-lan-root.crt for Node-based clients.) Caddy passes Host,
+  # Origin and the Mcp-* headers through unchanged, so gateway.hosts must list ZOEYMCP_LAN_HOST:
+  # a 421 from the gateway means it doesn't. Caddy terminates TLS, so it sees client tokens; it
+  # holds no other secret. Source pins can't work through it, and the gateway never trusts
+  # X-Forwarded-For: tokens identify clients.
+
+  # Makes the lan-data volume Caddy's, once; Caddy itself runs as an unprivileged uid.
+  lan-init:
+    profiles: [lan]
+    image: *caddy-image
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    network_mode: none
+    command: [chown, "10004:10004", /data]
+    volumes:
+      - lan-data:/data
+
+  lan:
+    <<: *hardened
+    profiles: [lan]
+    image: *caddy-image
+    user: "10004:10004"
+    # The image's caddy binary carries the file capability cap_net_bind_service, and won't
+    # start unless the bounding set holds it. It listens on 8443 and never uses it.
+    cap_add: [NET_BIND_SERVICE]
+    # Compose can't place a config file in a read-only container, so the Caddyfile comes
+    # in the environment and is written to tmpfs first.
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        printf '%s' "$$ZOEYMCP_CADDYFILE" >/tmp/Caddyfile
+        && exec caddy run --config /tmp/Caddyfile --adapter caddyfile
+    environment:
+      ZOEYMCP_CADDYFILE: |
+        {
+          admin off
+          auto_https disable_redirects
+          skip_install_trust
+        }
+        https://${ZOEYMCP_LAN_HOST:-zoeymcp.lan.example}:8443 {
+          tls internal
+          request_body {
+            max_size 16MB
+          }
+          @mcp path /s/*
+          handle @mcp {
+            reverse_proxy ${ZOEYMCP_LAN_UPSTREAM:-gateway:8090} {
+              flush_interval -1
+            }
+          }
+          handle {
+            respond 404
+          }
+        }
+    depends_on:
+      lan-init: {condition: service_completed_successfully}
+      gateway: {condition: service_started}
+    ports: ["${ZOEYMCP_LAN_BIND:-0.0.0.0}:8443:8443"]
+    tmpfs:
+      - /tmp:size=16m
+      - /config:size=1m,mode=0700,uid=10004,gid=10004
+    networks: [agents, lan]
+    volumes:
+      - lan-data:/data
+
 volumes:
   vault-state: {}
+  gateway-state: {}
+  lan-data: {}
