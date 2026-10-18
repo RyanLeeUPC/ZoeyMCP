@@ -98,7 +98,7 @@ def test_a_bad_key_is_refused(tmp_path: Path) -> None:
 
 def test_an_unreadable_marks_file_stops_it(tmp_path: Path) -> None:
     state = tmp_path / "state"
-    state.mkdir()
+    state.mkdir(mode=0o700)  # as the gateway makes it; a plain mkdir is open to others
     (state / MARKS_FILE).write_bytes(b"{")
     with pytest.raises(StartupError, match="drift marks"):
         prepare(options(tmp_path), {})
