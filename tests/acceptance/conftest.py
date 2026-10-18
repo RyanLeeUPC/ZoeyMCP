@@ -35,6 +35,8 @@ BASE: dict[str, Any] = {
     "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 STARTUP_TIMEOUT = 10.0
+# Responses still open when a server stops are cut after this many seconds.
+SHUTDOWN_GRACE = 1
 # Taken before any test patches httpx.HTTPTransport to reach the admin app.
 _HTTPTransport = httpx.HTTPTransport
 
@@ -61,7 +63,8 @@ def _wait_started(servers: list[_Server], thread: threading.Thread) -> list[int]
 
 
 @contextmanager
-def serve_tls(app: ASGIApp, ca: ProviderCA) -> Iterator[str]:
+def serve_tls(app: ASGIApp, ca: ProviderCA, *, lifespan: bool = False) -> Iterator[str]:
+    """``lifespan`` runs the app's ASGI lifespan (the fake MCP server needs it)."""
     config = uvicorn.Config(
         app,
         host="127.0.0.1",
@@ -69,7 +72,8 @@ def serve_tls(app: ASGIApp, ca: ProviderCA) -> Iterator[str]:
         ssl_certfile=str(ca.cert_file),
         ssl_keyfile=str(ca.key_file),
         log_level="warning",
-        lifespan="off",
+        lifespan="on" if lifespan else "off",
+        timeout_graceful_shutdown=SHUTDOWN_GRACE,
     )
     server = _Server(config)
     thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)

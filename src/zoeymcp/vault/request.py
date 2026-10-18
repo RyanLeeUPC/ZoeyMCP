@@ -231,11 +231,13 @@ def secret_variants(secret: str, *, basic_user: str | None = None) -> list[bytes
         secret,
         quote(secret, safe=""),
         quote(secret, safe="").lower(),
-        json.dumps(secret)[1:-1],
-        json.dumps(secret, ensure_ascii=False)[1:-1],
         base64.b64encode(secret.encode()).decode(),
         base64.urlsafe_b64encode(secret.encode()).decode().rstrip("="),
     }
+    for escaped in (json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1]):
+        forms.add(escaped)
+        # PHP's json_encode, among others, writes "/" as "\/".
+        forms.add(escaped.replace("/", "\\/"))
     if basic_user is not None:
         forms.add(base64.b64encode(f"{basic_user}:{secret}".encode()).decode())
     encoded = {form.encode("utf-8") for form in forms if len(form) >= _MIN_VARIANT}

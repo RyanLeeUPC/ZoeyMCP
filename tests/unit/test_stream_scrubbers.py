@@ -55,9 +55,21 @@ def test_the_limit() -> None:
 
 
 def test_every_variant_has_its_own_form() -> None:
-    # Raw, percent-encoded both ways, JSON-escaped, base64 and base64url: all different.
-    assert len(VARIANTS) == 6
+    # Raw, percent-encoded both ways, JSON-escaped with "/" kept and as "\/", base64 and
+    # base64url: all different.
+    assert len(VARIANTS) == 7
     assert all(b"\n" not in v and b"\r" not in v for v in VARIANTS)
+
+
+def test_json_escaped_variants_with_and_without_an_escaped_solidus() -> None:
+    a_umlaut = chr(0xE4)
+    secret = f"k/{a_umlaut}y-key"
+    variants = secret_variants(secret)
+    assert b"k/\\u00e4y-key" in variants
+    assert b"k\\/\\u00e4y-key" in variants
+    assert secret.encode() in variants
+    assert f"k\\/{a_umlaut}y-key".encode() in variants
+    assert len(variants) == 8
 
 
 # --- SSE -----------------------------------------------------------------------------------------

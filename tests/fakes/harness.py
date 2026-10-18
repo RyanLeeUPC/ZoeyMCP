@@ -12,6 +12,8 @@ import uvicorn
 from starlette.types import ASGIApp
 
 STARTUP_TIMEOUT = 10.0
+# A connection the client reset can stay registered on Windows until this runs out.
+SHUTDOWN_GRACE = 1
 
 
 class _ThreadServer(uvicorn.Server):
@@ -20,9 +22,20 @@ class _ThreadServer(uvicorn.Server):
 
 
 @contextmanager
-def serve(app: ASGIApp) -> Iterator[str]:
-    """Serve ``app`` on ``127.0.0.1`` and yield its base URL, e.g. ``http://127.0.0.1:53817``."""
-    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
+def serve(app: ASGIApp, *, lifespan: bool = False) -> Iterator[str]:
+    """Serve ``app`` on ``127.0.0.1`` and yield its base URL, e.g. ``http://127.0.0.1:53817``.
+
+    ``lifespan`` runs the app's ASGI lifespan (the fake MCP server needs it). Responses still
+    open at the end are cut after ``SHUTDOWN_GRACE`` seconds.
+    """
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=0,
+        log_level="warning",
+        lifespan="on" if lifespan else "off",
+        timeout_graceful_shutdown=SHUTDOWN_GRACE,
+    )
     server = _ThreadServer(config)
     thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
     thread.start()
