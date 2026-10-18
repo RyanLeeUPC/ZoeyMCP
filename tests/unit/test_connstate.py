@@ -36,7 +36,7 @@ PIN_A = "sha256:" + "a" * 64
 PIN_B = "sha256:" + "b" * 64
 
 
-def server(shared: bool = False) -> ViewRemoteServer:
+def server(shared: bool = False, era: str = "auto") -> ViewRemoteServer:
     raw: dict[str, Any] = {
         "kind": "remote",
         "vault_path": "/notes/mcp",
@@ -46,7 +46,7 @@ def server(shared: bool = False) -> ViewRemoteServer:
         "shared_session": shared,
         "wrap_results": False,
         "enable": [],
-        "era": "auto",
+        "era": era,
         "drift_check_interval": 300,
         "call_timeout": None,
     }
@@ -82,6 +82,26 @@ def ready(**tools: str) -> ConnState:
 )
 def test_connection_keys(era: Any, shared: bool, key: tuple[str, str]) -> None:
     assert connection_key("notes", server(shared), era, "alpha") == key
+
+
+@pytest.mark.parametrize(
+    ("asserted", "shared", "key"),
+    [
+        ("legacy", True, ("notes", "*")),
+        ("legacy", False, ("notes", "alpha")),
+        ("modern", False, ("notes", "*")),
+        ("auto", True, ("notes", "alpha")),
+    ],
+)
+def test_an_asserted_era_counts_before_one_is_seen(
+    asserted: str, shared: bool, key: tuple[str, str]
+) -> None:
+    assert connection_key("notes", server(shared, asserted), None, "alpha") == key
+
+
+def test_the_era_seen_wins_over_the_asserted_one() -> None:
+    assert connection_key("notes", server(True, "legacy"), "modern", "alpha") == ("notes", "*")
+    assert connection_key("notes", server(False, "modern"), "legacy", "alpha") == ("notes", "alpha")
 
 
 @pytest.mark.parametrize("version", ["2026-07-28", "2025-11-25", "2025-06-18"])

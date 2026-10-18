@@ -15,12 +15,9 @@ writes it and logs.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
-import os
 import re
-import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -29,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
+from ..common import files
 from ..common.canonical import JSONRejected, dumps_canonical, loads_strict
 from . import logs
 from .keys import KeySet
@@ -283,24 +281,7 @@ def unseal(data: bytes, keys: KeySet, previous_keys: KeySet | None) -> State:
 
 def write_atomic(path: Path, data: bytes) -> None:
     """Replace ``path`` with ``data`` (mode 0600), so a crash leaves the old file or the new."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".gateway-key-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-    if hasattr(os, "O_DIRECTORY"):
-        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+    files.write_atomic(path, data, prefix=".gateway-key-")
 
 
 def utc(timestamp: int) -> str:

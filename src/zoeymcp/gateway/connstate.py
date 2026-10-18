@@ -32,9 +32,12 @@ def connection_key(
 ) -> tuple[str, str]:
     """Which upstream connection a client's requests use (F.3).
 
-    Until the era is known, each client gets its own. A modern upstream has no session, so
-    clients share one connection; a legacy one is shared only with ``shared_session``.
+    The era is the one seen on the wire, else the one the policy asserts. Until it is known,
+    each client gets its own. A modern upstream has no session, so clients share one
+    connection; a legacy one is shared only with ``shared_session``.
     """
+    if era is None and server.era != "auto":
+        era = server.era
     if era == "modern" or (era == "legacy" and server.shared_session):
         return server_name, "*"
     return server_name, client

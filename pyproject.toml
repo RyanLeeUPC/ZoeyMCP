@@ -105,6 +105,7 @@ only_mutate = [
     "*zoeymcp/vault/peer.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
+    "*zoeymcp/common/files.py",
     "*zoeymcp/common/policy/check.py",
     "*zoeymcp/common/policy/match.py",
     "*zoeymcp/common/policy/view.py",
