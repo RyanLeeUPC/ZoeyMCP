@@ -5,7 +5,12 @@ match a rule, apply query and header policy, inject the credential, forward thro
 proxy, then filter and scrub the response. Every refusal is logged with its reason; the response
 body never says which check failed. Only after identity and a rule matched may a 502 carry a stable
 ``code`` (such as ``oauth_reconsent_needed``), so a caller entitled to the route can tell what the
-operator must do.
+operator must do. Every answer the vault makes itself carries ``x-zoeymcp-vault: refused``; relayed
+answers never do, since ``x-zoeymcp-*`` headers from upstreams are dropped (M3 design C.4).
+
+Each request is tagged with the listener it arrived on. On the link socket the caller is the
+gateway, proved by the kernel; on TCP it is whoever presents a placeholder or a gateway key, and
+when the link socket is configured TCP refuses gateway keys altogether (M3 design C.1).
 
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
@@ -68,6 +73,12 @@ from .request import (
 from .store import Secret, SecretStore, SecretUnavailable
 
 GATEWAY_HEADER = "x-zoeymcp-gateway"
+# Marks an answer the vault made itself, so the gateway can tell it from an upstream's (C.4).
+REFUSAL_HEADER = "x-zoeymcp-vault"
+REFUSAL_MARKER = "refused"
+# The scope key the listener wrapper sets: "gateway" on the link socket, "tcp" elsewhere.
+LISTENER_SCOPE_KEY = "zoeymcp.listener"
+Listener = Literal["gateway", "tcp"]
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SCRUB_BYTES = 1024 * 1024
@@ -204,6 +215,7 @@ class VaultApp:
         tokens: TokenManager | None = None,
         environ: Mapping[str, str] | None = None,
         gateway_keys: GatewayKeys | None = None,
+        gateway_link: bool = False,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
@@ -211,7 +223,11 @@ class VaultApp:
 
         ``gateway_keys`` is the persisted ratchet the vault loaded at startup. Without one, the
         gateway keys are tracked in memory only (self-tests and unit tests).
+
+        ``gateway_link`` says the link socket is configured: the gateway is then known by its
+        socket only, and a gateway key on TCP is refused.
         """
+        self._gateway_link = gateway_link
         self._store = store
         self._keys = keys
         self._gateway_keys = gateway_keys or GatewayKeys.in_memory(
@@ -275,17 +291,18 @@ class VaultApp:
             raise RuntimeError(f"unsupported scope {scope['type']}")
         request = Request(scope, receive)
         started = time.monotonic()
-        log: dict[str, Any] = {"method": request.method}
+        listener: Listener = "gateway" if scope.get(LISTENER_SCOPE_KEY) == "gateway" else "tcp"
+        log: dict[str, Any] = {"method": request.method, "listener": listener}
         try:
-            response = await self._handle(request, log)
+            response = await self._handle(request, listener, log)
         except Refused as refusal:
             log.update(status=refusal.status, reason=refusal.reason)
             body = {"error": _PUBLIC_MESSAGES.get(refusal.status, "error")}
-            headers = None
+            headers = {REFUSAL_HEADER: REFUSAL_MARKER}
             if refusal.code is not None:
                 body["code"] = log["code"] = refusal.code
             if refusal.retry_after is not None:
-                headers = {"retry-after": str(refusal.retry_after)}
+                headers["retry-after"] = str(refusal.retry_after)
             response = JSONResponse(body, status_code=refusal.status, headers=headers)
         else:
             log["status"] = response.status_code
@@ -295,7 +312,7 @@ class VaultApp:
 
     # --- handling ------------------------------------------------------------------------------
 
-    async def _handle(self, request: Request, log: dict[str, Any]) -> Response:
+    async def _handle(self, request: Request, listener: Listener, log: dict[str, Any]) -> Response:
         raw_path = request.scope.get("raw_path") or quote(request.scope["path"]).encode()
         try:
             path = normalize_path(raw_path)
@@ -312,7 +329,7 @@ class VaultApp:
         except RequestRejected as exc:
             raise Refused(400, exc.reason) from exc
 
-        caller, used_query, used_header = self._identify(compiled, request, params)
+        caller, used_query, used_header = self._identify(compiled, request, params, listener)
         log["caller"] = caller
 
         rest = path.without_first()
@@ -405,10 +422,23 @@ class VaultApp:
         return await self._respond(upstream_response, route, variants, log)
 
     def _identify(
-        self, compiled: _CompiledRoute, request: Request, params: list[tuple[str, str]]
+        self,
+        compiled: _CompiledRoute,
+        request: Request,
+        params: list[tuple[str, str]],
+        listener: Listener,
     ) -> tuple[str, str | None, str | None]:
         """Return ``(caller name, query param used, header used)`` or refuse with 403."""
+        if listener == "gateway":
+            # The kernel checked the peer's uid: the caller is the gateway and nothing else. No
+            # key or placeholder is read here (M3 design C.1).
+            if compiled.accepts_gateway:
+                return "gateway", None, None
+            raise Refused(403, "route doesn't accept the gateway")
         gateway = request.headers.getlist(GATEWAY_HEADER)
+        if gateway and self._gateway_link:
+            # The gateway has the link socket, so no gateway key exists in this tier.
+            raise Refused(403, "gateway key refused on tcp")
         if gateway:
             # A key of an accepted generation (M3 design C.2). The first request made with the
             # current key retires the previous one.

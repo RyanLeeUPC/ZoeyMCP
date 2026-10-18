@@ -95,13 +95,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--listen",
         action="append",
         metavar="HOST:PORT",
-        help="address to listen on (repeatable; default 0.0.0.0:8080)",
+        help=(
+            "address to listen on (repeatable; default 0.0.0.0:8080); 'none' for no TCP "
+            "listener, with --gateway-socket"
+        ),
     )
     vault.add_argument("--state", default="/state", metavar="DIR", help="state directory")
     vault.add_argument(
         "--admin-socket",
         metavar="PATH",
         help=f"admin Unix socket (default ${SOCKET_ENV} or {DEFAULT_SOCKET}); 'none' disables it",
+    )
+    vault.add_argument(
+        "--gateway-socket",
+        metavar="PATH",
+        help=(
+            "the gateway's link socket (Linux; with --gateway-uid). Only that uid may connect, "
+            "and TCP listeners then refuse gateway keys"
+        ),
+    )
+    vault.add_argument(
+        "--gateway-uid", type=int, metavar="UID", help="the gateway's uid on the link socket"
+    )
+    vault.add_argument(
+        "--control-fd",
+        type=int,
+        metavar="FD",
+        help="read HUP and TERM lines from this pipe; its end stops the vault (the launcher's)",
     )
 
     secret = commands.add_parser(
@@ -201,9 +221,22 @@ def _cmd_vault(args: argparse.Namespace, out: TextIO) -> int:
     admin_socket = None
     if args.admin_socket != "none":
         admin_socket = Path(admin_client.socket_path(args.admin_socket))
+    listens: list[str] = args.listen or ["0.0.0.0:8080"]
+    if "none" in listens:
+        if len(listens) > 1:
+            out.write("zoeymcp vault: --listen none can't be combined with other addresses\n")
+            return EXIT_UNREADABLE
+        listens = []
     try:
         run(
-            args.config, args.listen or ["0.0.0.0:8080"], Path(args.state), os.environ, admin_socket
+            args.config,
+            listens,
+            Path(args.state),
+            os.environ,
+            admin_socket,
+            gateway_socket=Path(args.gateway_socket) if args.gateway_socket else None,
+            gateway_uid=args.gateway_uid,
+            control_fd=args.control_fd,
         )
     except StartupError as exc:
         out.write(f"zoeymcp vault: {exc}\n")
