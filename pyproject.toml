@@ -111,6 +111,10 @@ only_mutate = [
     "*zoeymcp/gateway/pins.py",
     "*zoeymcp/gateway/findings.py",
     "*zoeymcp/gateway/schemas.py",
+    "*zoeymcp/gateway/sanitize.py",
+    "*zoeymcp/gateway/access.py",
+    "*zoeymcp/gateway/connstate.py",
+    "*zoeymcp/gateway/egressrules.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene and import-guard tests check the repository itself (the lock, the smoke script),
