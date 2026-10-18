@@ -12,8 +12,12 @@ import json
 import shutil
 from pathlib import Path
 
+from mcp.types import Tool
+
+from zoeymcp.common.canonical import dumps_canonical
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
+from zoeymcp.gateway.pins import PIN_TAG, project, project_and_pin
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.protocol import encode_envelope, parse_envelope
 from zoeymcp.vault.store import SecretStore, _aad, smtp_binding
@@ -230,3 +234,52 @@ def test_the_gateway_view_is_pinned() -> None:
 
 def test_the_pinned_view_still_parses() -> None:
     assert parse_view(VIEW_BYTES).digest == VIEW_DIGEST
+
+
+# --- tool pins (M3 design G.1) ------------------------------------------------------------------
+# Fixed wire JSON, parsed by the pinned SDK, to fixed pins. An SDK bump that changes parsing, or a
+# change to the projection or the canonical form, fails here instead of showing as drift on every
+# deployment's reviewed tools.
+
+TOOL_PIN_VECTORS = {
+    "minimal": (
+        r'{"name":"ping","inputSchema":{"type":"object"}}',
+        "sha256:926ff10c8c7e1652ed0f10860613cc3f5d36731c0668c2d458e75296a9f21237",
+    ),
+    "extras_and_nulls": (
+        r'{"name":"get_note","title":null,"description":"Returns one note.","inputSchema":'
+        r'{"type":"object","properties":{"id":{"type":"string","description":null}},'
+        r'"required":["id"]},"outputSchema":null,"annotations":{"title":null,'
+        r'"readOnlyHint":true,"destructiveHint":null,"audience":["user"]},"icons":[{"src":'
+        r'"https://tracker.example/p.png"}],"_meta":{"k":"v"},"execution":{"taskSupport":'
+        r'"optional"},"x-unknown":1}',
+        "sha256:1a2ae403b438ff6d591886b7d9d450a624cca485a55868a70b8c65a0ccfc1277",
+    ),
+    "unicode_floats_header": (
+        r'{"name":"shapes","title":"Caf\u00e9 \u65e5\u672c","description":"na\u00efve '
+        r'\ud83d\ude00","inputSchema":{"type":"object","properties":{"region":{"type":'
+        r'"string","x-mcp-header":"Region"},"ratio":{"type":"number","minimum":0.0,'
+        r'"maximum":1.5,"multipleOf":0.25},"big":{"type":"integer","maximum":'
+        r'9007199254740991,"minimum":-1e2},"label":{"enum":["caf\u00e9",null,1,1.0]}},'
+        r'"additionalProperties":false},"outputSchema":{"type":"object","properties":{"v":'
+        r'{"default":null,"exclusiveMinimum":1E-7}}},"annotations":{"title":"Shapes",'
+        r'"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,'
+        r'"openWorldHint":true}}',
+        "sha256:e28b97292666aaebf9cd5f6f144fbd13211fa383530a63d09b4a28209da3859d",
+    ),
+}
+
+
+def test_tool_pins_are_pinned() -> None:
+    for name, (wire, pin) in TOOL_PIN_VECTORS.items():
+        assert project_and_pin(Tool.model_validate_json(wire)).pin == pin, name
+
+
+def test_the_tagged_pin_encoding_is_pinned() -> None:
+    wire, pin = TOOL_PIN_VECTORS["minimal"]
+    tagged = {"zoeymcp": PIN_TAG, "tool": project(Tool.model_validate_json(wire))}
+    encoded = dumps_canonical(tagged)
+    assert encoded == (
+        b'{"tool":{"inputSchema":{"type":"object"},"name":"ping"},"zoeymcp":"tool-pin/1"}'
+    )
+    assert "sha256:" + hashlib.sha256(encoded).hexdigest() == pin

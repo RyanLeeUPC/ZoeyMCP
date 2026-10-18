@@ -48,7 +48,9 @@ dev = [
     "mypy>=1.11",
     "pytest>=8.3",
     "ruff>=0.6",
+    "types-jsonschema>=4.23",
     "types-pyyaml>=6.0",
+    "types-regex>=2024.9",
 ]
 
 [build-system]
@@ -106,6 +108,9 @@ only_mutate = [
     "*zoeymcp/common/policy/check.py",
     "*zoeymcp/common/policy/match.py",
     "*zoeymcp/common/policy/view.py",
+    "*zoeymcp/gateway/pins.py",
+    "*zoeymcp/gateway/findings.py",
+    "*zoeymcp/gateway/schemas.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene and import-guard tests check the repository itself (the lock, the smoke script),

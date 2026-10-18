@@ -4,12 +4,17 @@ Approval prompts, and every field that feeds one, must not be able to hide or di
 These rules reject anything that renders as nothing, renders differently from what it is, or can
 fake a line break, rather than trying to sanitize it: a refused call is safe, and a cleaned-up
 one is no longer exactly what was asked for.
+
+Text that must still be read whole, such as tool results and ``review`` output, goes through
+:func:`reveal_hidden` instead, which shows each refused character as a visible escape.
 """
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
 # Characters that render as nothing or as blank space without being format characters, so the
 # category check alone would let them through.
@@ -127,3 +132,23 @@ def check_text(
     if violations:
         raise TextRuleError(violations)
     return text
+
+
+# Everything but printable ASCII, \n and \t: the only characters reveal_hidden has to look at.
+_MAYBE_HIDDEN = re.compile(r"[^\x20-\x7e\n\t]")
+
+
+@lru_cache(maxsize=4096)
+def _revealed(char: str) -> str:
+    if char in INVISIBLE_CHARACTERS or unicodedata.category(char) in REJECTED_CATEGORIES:
+        return f"[U+{ord(char):04X}]"
+    return char
+
+
+def reveal_hidden(text: str) -> str:
+    """Return ``text`` with every character the rules refuse shown as ``[U+XXXX]``.
+
+    ``\\n`` and ``\\t`` stay as they are. Every other refused character, ``\\r`` and C1 controls
+    included, becomes visible to a model or a terminal instead of acting on it.
+    """
+    return _MAYBE_HIDDEN.sub(lambda match: _revealed(match.group()), text)
