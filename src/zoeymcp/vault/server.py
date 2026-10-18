@@ -294,6 +294,8 @@ async def serve(
         )
 
     def stop() -> None:
+        # Long polls first: the servers wait for every request in flight before they stop.
+        app.stop_view_waits()
         for server in servers:
             server.should_exit = True
 
@@ -391,7 +393,8 @@ def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str])
     """``SIGHUP``: load and check the policy again, and swap it in if it passes.
 
     Synchronous, like every writer of OAuth state: the token manager keeps its slots and tasks,
-    so a reload never starts a second refresh (design D.13).
+    so a reload never starts a second refresh (design D.13). A reload that takes effect wakes the
+    gateway's long polls of the view (M3 design D.2).
     """
     try:
         policy = load_policy(config, environ)

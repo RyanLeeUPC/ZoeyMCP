@@ -12,6 +12,10 @@ Each request is tagged with the listener it arrived on. On the link socket the c
 gateway, proved by the kernel; on TCP it is whoever presents a placeholder or a gateway key, and
 when the link socket is configured TCP refuses gateway keys altogether (M3 design C.1).
 
+Paths under ``/_zoeymcp/`` are the vault's own and never reach a route (no route prefix can start
+with ``_``). The only one is the gateway's policy view, a long poll that a reload wakes (M3 design
+D.1, D.2); the rest are 404.
+
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
 (design D.10). Neither HTTP client keeps cookies: an upstream's session cookie must never reach
@@ -20,6 +24,7 @@ another caller (N2).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hmac
 import http.cookiejar
@@ -40,6 +45,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
     BasicCredential,
     HeaderCredential,
@@ -51,6 +57,7 @@ from ..common.policy.schema import (
     Route,
     is_secret_ref,
 )
+from ..common.policy.view import build_view, dump_view
 from . import logs
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
@@ -79,6 +86,14 @@ REFUSAL_MARKER = "refused"
 # The scope key the listener wrapper sets: "gateway" on the link socket, "tcp" elsewhere.
 LISTENER_SCOPE_KEY = "zoeymcp.listener"
 Listener = Literal["gateway", "tcp"]
+# The vault's own endpoints. The gateway's view is the only one (M3 design D.1).
+INTERNAL_SEGMENT = "_zoeymcp"
+VIEW_PATH = NormalizedPath((INTERNAL_SEGMENT, "gateway", "v1", "view"))
+# The longest ``?wait=`` in seconds, and how many may wait at once (M3 design D.2).
+VIEW_MAX_WAIT = 25
+VIEW_MAX_WAITERS = 4
+# One entity tag of If-None-Match, weak or strong; the tag itself is the group.
+_ENTITY_TAG = re.compile(r'\s*(?:W/)?"([\x21\x23-\x7e]*)"\s*')
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SCRUB_BYTES = 1024 * 1024
@@ -104,7 +119,7 @@ class Refused(Exception):
     """Stop handling a request with this status. ``reason`` goes to the log only.
 
     ``code`` is a stable code for the response body, set only after identity and a rule matched.
-    ``retry_after`` (seconds) becomes a ``Retry-After`` header.
+    ``retry_after`` (seconds) becomes a ``Retry-After`` header, and ``allow`` an ``Allow`` header.
     """
 
     def __init__(
@@ -114,11 +129,13 @@ class Refused(Exception):
         *,
         code: str | None = None,
         retry_after: int | None = None,
+        allow: str | None = None,
     ) -> None:
         self.status = status
         self.reason = reason
         self.code = code
         self.retry_after = retry_after
+        self.allow = allow
         super().__init__(reason)
 
 
@@ -146,10 +163,20 @@ _PUBLIC_MESSAGES = {
     400: "bad request",
     403: "forbidden",
     404: "not found",
+    405: "method not allowed",
     413: "request too large",
+    429: "too many requests",
     501: "not implemented",
     502: "upstream unavailable",
 }
+
+
+@dataclass(frozen=True)
+class _ServedView:
+    """The gateway's view of the running policy, as served."""
+
+    digest: str
+    body: bytes
 
 
 @dataclass(frozen=True)
@@ -242,16 +269,30 @@ class VaultApp:
         # The last access token serial seen per credential, for the request log.
         self._serials: dict[str, int] = {}
         self._environ = os.environ if environ is None else environ
+        # Long polls of the view wait on this event. Each install sets it and puts a new one in
+        # its place, so every waiter wakes and looks at the view again.
+        self._view_changed = asyncio.Event()
+        self._view_waiters = 0
+        self._view_stopping = False
         self._install(policy)
 
     def _install(self, policy: Policy) -> list[str]:
-        # First, and written to disk before the policy takes effect. A lower generation or a
-        # failed write raises GatewayKeyError, and the running policy stays.
+        # Built first: it can't fail for a policy that passed check, and if it did nothing would
+        # have changed yet.
+        view = build_view(policy)
+        # Then the gateway key generation, written to disk before the policy takes effect. A
+        # lower generation or a failed write raises GatewayKeyError, and the running policy stays.
         self._gateway_keys.advance(policy.gateway_key_generation)
         self._policy = policy
         self._routes = _compile(policy)
         self._env_secrets = snapshot_env_secrets(policy, self._environ)
+        self._view = _ServedView(view.digest, dump_view(view))
+        self._wake_view_waiters()
         return self._tokens.configure(policy, self._env_secrets)
+
+    def _wake_view_waiters(self) -> None:
+        woken, self._view_changed = self._view_changed, asyncio.Event()
+        woken.set()
 
     @property
     def policy(self) -> Policy:
@@ -264,6 +305,22 @@ class VaultApp:
     @property
     def gateway_keys(self) -> GatewayKeys:
         return self._gateway_keys
+
+    @property
+    def view_digest(self) -> str:
+        """The digest of the view the gateway is served now."""
+        return self._view.digest
+
+    @property
+    def view_waiters(self) -> int:
+        """How many long polls of the view are waiting."""
+        return self._view_waiters
+
+    def stop_view_waits(self) -> None:
+        """Answer every long poll of the view now, and wait no more. For shutdown: the servers
+        wait for requests in flight, and a long poll would hold them for up to 25 s."""
+        self._view_stopping = True
+        self._wake_view_waiters()
 
     def reload(self, policy: Policy) -> list[str]:
         """Swap the policy. Returns the OAuth credentials whose cached tokens were reset.
@@ -303,6 +360,8 @@ class VaultApp:
                 body["code"] = log["code"] = refusal.code
             if refusal.retry_after is not None:
                 headers["retry-after"] = str(refusal.retry_after)
+            if refusal.allow is not None:
+                headers["allow"] = refusal.allow
             response = JSONResponse(body, status_code=refusal.status, headers=headers)
         else:
             log["status"] = response.status_code
@@ -318,6 +377,8 @@ class VaultApp:
             path = normalize_path(raw_path)
         except RequestRejected as exc:
             raise Refused(400, exc.reason) from exc
+        if path.segments[:1] == (INTERNAL_SEGMENT,):
+            return await self._internal(request, path, listener, log)
         if not path.segments or (compiled := self._routes.get(path.segments[0])) is None:
             raise Refused(404, "no route for this prefix")
         route = compiled.route
@@ -435,20 +496,8 @@ class VaultApp:
             if compiled.accepts_gateway:
                 return "gateway", None, None
             raise Refused(403, "route doesn't accept the gateway")
-        gateway = request.headers.getlist(GATEWAY_HEADER)
-        if gateway and self._gateway_link:
-            # The gateway has the link socket, so no gateway key exists in this tier.
-            raise Refused(403, "gateway key refused on tcp")
-        if gateway:
-            # A key of an accepted generation (M3 design C.2). The first request made with the
-            # current key retires the previous one.
-            if (
-                compiled.accepts_gateway
-                and len(gateway) == 1
-                and self._gateway_keys.authenticate(gateway[0].encode())
-            ):
-                return "gateway", None, None
-            raise Refused(403, "gateway key refused")
+        if self._gateway_key(request, accepted=compiled.accepts_gateway):
+            return "gateway", None, None
         client_host = request.client.host if request.client else None
         for caller in compiled.callers:
             presented = self._presented(caller, request, params)
@@ -460,6 +509,23 @@ class VaultApp:
             used_header = caller.name if caller.location == "header" else None
             return f"callers[{caller.index}]", used_query, used_header
         raise Refused(403, "no accepted identity presented")
+
+    def _gateway_key(self, request: Request, *, accepted: bool) -> bool:
+        """Whether a TCP request presents a valid gateway key; False when it presents none.
+
+        A key is refused when it isn't ``accepted`` here, when it isn't of an accepted generation
+        (M3 design C.2), or when the link socket is configured. The first request made with the
+        current key retires the previous one.
+        """
+        gateway = request.headers.getlist(GATEWAY_HEADER)
+        if not gateway:
+            return False
+        if self._gateway_link:
+            # The gateway has the link socket, so no gateway key exists in this tier.
+            raise Refused(403, "gateway key refused on tcp")
+        if accepted and len(gateway) == 1 and self._gateway_keys.authenticate(gateway[0].encode()):
+            return True
+        raise Refused(403, "gateway key refused")
 
     @staticmethod
     def _presented(
@@ -490,6 +556,71 @@ class VaultApp:
         except ValueError:
             return False
         return any(address in network for network in networks)
+
+    # --- the vault's own endpoints -------------------------------------------------------------
+
+    async def _internal(
+        self, request: Request, path: NormalizedPath, listener: Listener, log: dict[str, Any]
+    ) -> Response:
+        """``GET /_zoeymcp/gateway/v1/view`` for the gateway only; every other path here is 404.
+
+        The answer is the view with its digest as the ``ETag``, or 304 while the digest is one
+        the caller named in ``If-None-Match``. With ``?wait=N`` a 304 waits up to N seconds for
+        a reload that changes the view (M3 design D.2).
+        """
+        if path != VIEW_PATH:
+            raise Refused(404, "no such vault endpoint")
+        log["endpoint"] = "gateway_view"
+        if listener != "gateway" and not self._gateway_key(request, accepted=True):
+            raise Refused(403, "the view is for the gateway only")
+        log["caller"] = "gateway"
+        if request.method != "GET":
+            raise Refused(405, "the view takes GET only", allow="GET")
+        try:
+            wait = view_wait(parse_query(request.scope.get("query_string", b"")))
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason) from exc
+        tags = entity_tags(request.headers.getlist("if-none-match"))
+        started = time.monotonic()
+        if wait and self._view.digest in tags and not self._view_stopping:
+            await self._wait_for_view(tags, started + wait, request.receive, log)
+        view = self._view
+        headers = {"etag": f'"{view.digest}"', "cache-control": "no-store"}
+        if view.digest in tags:
+            return Response(status_code=304, headers=headers)
+        waited_ms = round((time.monotonic() - started) * 1000)
+        logs.event("gateway_view_served", digest=view.digest, waited_ms=waited_ms)
+        return Response(view.body, media_type="application/json", headers=headers)
+
+    async def _wait_for_view(
+        self, tags: frozenset[str], deadline: float, receive: Receive, log: dict[str, Any]
+    ) -> None:
+        """Wait until the view's digest isn't in ``tags``, the deadline, shutdown, or the
+        caller leaves. At most :data:`VIEW_MAX_WAITERS` wait; one more is refused with 429."""
+        if self._view_waiters >= VIEW_MAX_WAITERS:
+            raise Refused(429, "too many view waiters", retry_after=1)
+        self._view_waiters += 1
+        gone = asyncio.ensure_future(_disconnected(receive))
+        try:
+            while self._view.digest in tags and not self._view_stopping:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                changed = asyncio.ensure_future(self._view_changed.wait())
+                try:
+                    await asyncio.wait(
+                        (changed, gone), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    changed.cancel()
+                if gone.done():
+                    log["disconnected"] = True
+                    return
+        finally:
+            self._view_waiters -= 1
+            # On a task that has already failed, cancel() also marks its error as retrieved, so
+            # asyncio doesn't report it as never retrieved.
+            gone.cancel()
 
     def _resolve(self, ref: str, upstream: str) -> Secret:
         try:
@@ -651,6 +782,46 @@ class VaultApp:
             (b"content-length", str(len(content)).encode()),
         ]
         return response
+
+
+def view_wait(params: list[tuple[str, str]]) -> int:
+    """The seconds a view request may wait: ``?wait=N``, at most :data:`VIEW_MAX_WAIT`, or 0.
+
+    Any other parameter, a repeated ``wait``, or a value that isn't plain digits is refused.
+    """
+    if not params:
+        return 0
+    if len(params) > 1 or params[0][0] != "wait":
+        raise RequestRejected("the view takes one parameter, wait")
+    value = params[0][1]
+    if not (value.isascii() and value.isdigit()):
+        raise RequestRejected("wait must be a number of seconds")
+    # Capped before int(), which refuses a string of thousands of digits.
+    seconds = value.lstrip("0")
+    if len(seconds) > len(str(VIEW_MAX_WAIT)):
+        return VIEW_MAX_WAIT
+    return min(int(seconds or "0"), VIEW_MAX_WAIT)
+
+
+def entity_tags(values: list[str]) -> frozenset[str]:
+    """The entity tags named by ``If-None-Match`` headers, weak or strong, without quotes.
+
+    A header that isn't a list of entity tags (``*`` included) names none, so the view is sent.
+    """
+    tags: set[str] = set()
+    for value in values:
+        for part in value.split(","):
+            match = _ENTITY_TAG.fullmatch(part)
+            if match is None:
+                return frozenset()
+            tags.add(match.group(1))
+    return frozenset(tags)
+
+
+async def _disconnected(receive: Receive) -> None:
+    """Return once the caller has gone. A GET's body is empty, so nothing else is expected."""
+    while (await receive())["type"] != "http.disconnect":
+        pass
 
 
 def _upstream_client(policy: Policy) -> httpx.AsyncClient:

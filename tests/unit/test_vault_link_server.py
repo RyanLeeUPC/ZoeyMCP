@@ -498,6 +498,15 @@ def test_control_command_words() -> None:
 
 
 class _App:
+    """Stands in for VaultApp. Records whether the servers were still running when the view's
+    long polls were told to stop."""
+
+    def __init__(self) -> None:
+        self.waits_stopped: list[list[bool]] = []
+
+    def stop_view_waits(self) -> None:
+        self.waits_stopped.append([each.should_exit for each in FakeServer.made])
+
     async def aclose(self) -> None:
         pass
 
@@ -543,7 +552,7 @@ class FakePipe:
 
 def _serve_with_control(
     monkeypatch: pytest.MonkeyPatch, feed: Callable[[asyncio.StreamReader], Any]
-) -> tuple[list[Any], FakePipe]:
+) -> tuple[list[Any], FakePipe, _App]:
     pipe = FakePipe()
     reloads: list[Any] = []
     opened: list[int] = []
@@ -566,26 +575,29 @@ def _serve_with_control(
     app = _App()
     assert asyncio.run(main()) == []
     assert opened == [7]
-    return [(a is app, c, e) for a, c, e in reloads], pipe
+    return [(a is app, c, e) for a, c, e in reloads], pipe, app
 
 
 def test_serve_reloads_and_stops_on_the_control_pipe(
     monkeypatch: pytest.MonkeyPatch, fake_servers: list[FakeServer]
 ) -> None:
-    reloads, pipe = _serve_with_control(
+    reloads, pipe, app = _serve_with_control(
         monkeypatch, lambda reader: reader.feed_data(b"HUP\nHUP\nTERM\n")
     )
     assert reloads == [(True, "p.yaml", {"A": "1"})] * 2
     assert pipe.closed == 1
     assert [s.should_exit for s in fake_servers] == [True]
+    # The long polls stop first: the servers wait for requests in flight.
+    assert app.waits_stopped == [[False]]
 
 
 def test_serve_stops_when_the_control_pipe_fails(
     monkeypatch: pytest.MonkeyPatch, fake_servers: list[FakeServer], log_buffer: io.StringIO
 ) -> None:
-    reloads, pipe = _serve_with_control(
+    reloads, pipe, app = _serve_with_control(
         monkeypatch, lambda reader: reader.set_exception(OSError(errno.EIO, "I/O error"))
     )
+    assert app.waits_stopped == [[False]]
     assert reloads == []
     assert pipe.closed == 1
     assert [s.should_exit for s in fake_servers] == [True]
@@ -596,7 +608,8 @@ def test_serve_stops_when_the_control_pipe_fails(
 def test_serve_stops_at_the_end_of_the_control_pipe(
     monkeypatch: pytest.MonkeyPatch, fake_servers: list[FakeServer], log_buffer: io.StringIO
 ) -> None:
-    reloads, pipe = _serve_with_control(monkeypatch, lambda reader: reader.feed_eof())
+    reloads, pipe, app = _serve_with_control(monkeypatch, lambda reader: reader.feed_eof())
+    assert app.waits_stopped == [[False]]
     assert reloads == []
     assert pipe.closed == 1
     events = [line["event"] for line in log_lines(log_buffer)]
