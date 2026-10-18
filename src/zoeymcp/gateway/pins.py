@@ -269,10 +269,11 @@ def evaluate(
     reports.extend(
         Report("missing", name, pinned=review.get(name)) for name in sorted(included - set(counts))
     )
+    # Drift always leaves a held mark, so held covers it.
     blocked = server.on_drift == "fail" and (
         bool(held)
         or any(
-            report.kind in ("drift", "invalid", "duplicate") and report.tool in included
+            report.kind in ("invalid", "duplicate") and report.tool in included
             for report in reports
         )
     )

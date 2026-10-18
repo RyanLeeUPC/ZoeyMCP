@@ -410,15 +410,21 @@ def test_a_property_named_like_a_keyword_is_fine() -> None:
 
 
 def test_no_network_or_file_access(monkeypatch: pytest.MonkeyPatch) -> None:
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError("urlopen called")
+    # Recorded, not raised: referencing turns any retrieval error into "unresolvable", so a
+    # raising stub would hide an attempt behind the same refusal.
+    opened: list[object] = []
 
-    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    def record(*args: object, **kwargs: object) -> None:
+        opened.append(args)
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(urllib.request, "urlopen", record)
     for ref in ("https://evil.example/schema.json", "file:///etc/passwd", "other.json"):
         validator = SchemaValidator({"$ref": ref}, Draft202012Validator)
         with pytest.raises(SchemaRefused) as info:
             validator.errors({}, Budget.start())
         assert info.value.code == "schema_unresolvable"
+    assert opened == []
 
 
 # --- patterns --------------------------------------------------------------------------------
