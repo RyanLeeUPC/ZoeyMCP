@@ -376,8 +376,10 @@ agent that reads a JSON MCP config, typically:
 
 - Every request is authenticated, `GET` and `DELETE` included; a session id never stands in for
   the token. Tokens are never read from the query string.
-- **Revoking:** remove the client (or its `token_sha256`) and reload the policy. The gateway
-  refuses it from its next request, and closes its sessions and upstream connections.
+- **Revoking:** remove the client (or its `token_sha256`, or a server from its list) and reload
+  the policy. The gateway refuses it from its next request, stops its calls and streams in
+  flight there (`requests_stopped` in the log; the upstream calls are cancelled), and closes its
+  sessions and upstream connections.
 - A literal `token:` in the policy still works, with a `check` warning: anyone who reads the
   policy can act as that client.
 - Source pins (`sources:`) match the direct peer address only. Behind the `lan` proxy the peer is

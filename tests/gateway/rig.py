@@ -157,6 +157,39 @@ class Deployed:
         raw = raw_policy(self.fake_url, **{**self.options, **options})
         return build_view(Policy.model_validate(raw))
 
+    def reload(self, **options: Any) -> None:
+        """Reload the running vault with ``raw_policy`` options changed, as SIGHUP would."""
+        self.options = {**self.options, **options}
+        raw = raw_policy(self.fake_url, **self.options)
+        answer = httpx.post(self.vault_url + RELOAD_PATH, json=raw, timeout=10)
+        assert answer.status_code == 204, answer.text
+        self.policy = Policy.model_validate(raw)
+        self.view = build_view(self.policy)
+
+
+RELOAD_PATH = "/_test_reload"
+
+
+class Reloadable:
+    """The vault, plus a test-only path that swaps its policy on the vault's own loop."""
+
+    def __init__(self, app: VaultApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["path"] == RELOAD_PATH:
+            chunks = []
+            while True:
+                message = await receive()
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body"):
+                    break
+            self.app.reload(Policy.model_validate(json.loads(b"".join(chunks))))
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+            return
+        await self.app(scope, receive, send)
+
 
 @contextmanager
 def deployment(tmp_path: Path, fake: McpFake, **options: Any) -> Iterator[Deployed]:
@@ -170,7 +203,7 @@ def deployment(tmp_path: Path, fake: McpFake, **options: Any) -> Iterator[Deploy
             store.load()
             store.put("notes-key", fake.secret, derive_binding(policy, "notes-key"))
             app = VaultApp(policy, store, KEYS, client=httpx.AsyncClient(), environ={})
-            with serve(app) as vault_url:
+            with serve(Reloadable(app)) as vault_url:
                 yield Deployed(
                     fake,
                     vault_url,

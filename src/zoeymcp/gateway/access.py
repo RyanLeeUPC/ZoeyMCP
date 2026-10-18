@@ -232,6 +232,35 @@ def authenticate(
     return name
 
 
+def revoked(old: ViewGateway, new: ViewGateway) -> frozenset[tuple[str, str]]:
+    """The (client, server) pairs a new view takes away (M3 design D.3).
+
+    A pair is revoked when the client is gone, its token or source networks changed, it is no
+    longer assigned the server, or the server is no longer one this version serves. Requests in
+    flight for a revoked pair are stopped: the next request would be refused anyway.
+    """
+    gone: set[tuple[str, str]] = set()
+    for name, client in old.clients.items():
+        now = new.clients.get(name)
+        same = (
+            now is not None
+            and now.token_sha256 == client.token_sha256
+            and now.sources == client.sources
+        )
+        for server in client.servers:
+            if not isinstance(old.servers.get(server), ViewRemoteServer):
+                continue  # never served, so nothing can be in flight
+            kept = (
+                same
+                and now is not None
+                and server in now.servers
+                and isinstance(new.servers.get(server), ViewRemoteServer)
+            )
+            if not kept:
+                gone.add((name, server))
+    return frozenset(gone)
+
+
 # --- steps 7-8: server and protocol version -------------------------------------------------------
 
 

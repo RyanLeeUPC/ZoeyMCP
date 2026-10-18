@@ -10,7 +10,8 @@
 5. **Decide** from policy, never annotations: ``allow`` continues; ``approve`` is refused, since
    this version can't ask for an approval; anything unclassified is refused too.
 6. **Call** with the validated object, registered with the egress filter, under the pin it was
-   validated under.
+   validated under. A policy change that takes the client's access to the server away stops the
+   call (M3 design D.3), which cancels it upstream too.
 7. **Sanitize** the result (J.1).
 
 Upstream error text is never forwarded or logged: each outcome gets a fixed message with a
@@ -21,9 +22,12 @@ from __future__ import annotations
 
 import secrets
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+import anyio
 import mcp_types
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent
@@ -40,6 +44,39 @@ MAX_ARGUMENT_DEPTH = 32
 UNKNOWN_TOOL = "Unknown tool"
 APPROVAL_UNAVAILABLE = "refused: this tool needs an approval, and this version can't ask for one"
 UNCLASSIFIED = "refused: this tool is not classified"
+REVOKED = (
+    "refused: this client's access to the server changed while the call ran; "
+    "it may or may not have run"
+)
+
+
+class InFlight:
+    """Requests in flight per (client, server), so a policy change can stop them."""
+
+    def __init__(self) -> None:
+        self._scopes: dict[tuple[str, str], set[anyio.CancelScope]] = {}
+
+    @contextmanager
+    def track(self, client: str, server: str) -> Iterator[anyio.CancelScope]:
+        """A cancel scope that :meth:`stop` cancels; enter and leave it in one task."""
+        key = (client, server)
+        scope = anyio.CancelScope()
+        self._scopes.setdefault(key, set()).add(scope)
+        try:
+            with scope:
+                yield scope
+        finally:
+            held = self._scopes.get(key, set())
+            held.discard(scope)
+            if not held:
+                self._scopes.pop(key, None)
+
+    def stop(self, client: str, server: str) -> int:
+        """Cancel every request in flight for the pair. Returns how many there were."""
+        scopes = self._scopes.pop((client, server), set())
+        for scope in scopes:
+            scope.cancel()
+        return len(scopes)
 
 
 @dataclass(frozen=True)
@@ -84,6 +121,7 @@ async def call_tool(
     arguments: Any,
     *,
     progress: Progress | None = None,
+    in_flight: InFlight | None = None,
 ) -> CallToolResult:
     started = time.monotonic()
     ref = new_ref()
@@ -148,16 +186,20 @@ async def call_tool(
         log("refused", "unclassified")
         return refused(UNCLASSIFIED)
     # 6. Call
-    try:
-        raw = await pool.call(
-            call.server, call.policy, call.client, name, shaped, pin=pin, progress=progress
-        )
-    except NotAdmitted as exc:
-        log("upstream_error", exc.reason)
-        return map_upstream("unavailable", ref)
-    except UpstreamError as exc:
-        log("timeout" if exc.outcome == "timeout" else "upstream_error", exc.outcome)
-        return map_upstream(exc.outcome, ref)
+    with (in_flight or InFlight()).track(call.client, call.server) as scope:
+        try:
+            raw = await pool.call(
+                call.server, call.policy, call.client, name, shaped, pin=pin, progress=progress
+            )
+        except NotAdmitted as exc:
+            log("upstream_error", exc.reason)
+            return map_upstream("unavailable", ref)
+        except UpstreamError as exc:
+            log("timeout" if exc.outcome == "timeout" else "upstream_error", exc.outcome)
+            return map_upstream(exc.outcome, ref)
+    if scope.cancelled_caught:
+        log("cancelled", "revoked")
+        return refused(f"{REVOKED} (ref {ref})")
     # 7. Sanitize
     output_schema = exposed.definition.get("outputSchema")
     output_check = None

@@ -269,7 +269,7 @@ library only, and:
 Admin commands come in through `docker exec`, as root without `DAC_OVERRIDE`, which can't open
 those `0700` and `0750` directories. So the CLI, run as root, first becomes the owner of the
 socket's directory (`setgroups([])`, `setgid`, `setuid`), using the container's `SETUID` and
-`SETGID`; if that fails it says "run with -u <uid>".
+`SETGID`; if that fails it says `run with -u <uid>`.
 
 **Two virtual environments, one image.** `/opt/zoeymcp` (the vault, the CLI and the launcher; on
 `PATH`) and `/opt/zoeymcp-gateway` (the same plus the `gateway` extra: the MCP SDK, `httpx2`,
@@ -730,8 +730,11 @@ references, placeholders, upstream URLs or admin settings. A `digest` covers the
   gateway closes its upstream connections, so revocation can't lapse silently while the vault is
   unreachable.
 - **Applying it:** one immutable snapshot replaces the last; a request keeps the one it started
-  with. Tokens, assignments, hosts, origins and limits apply to the next request (a revoked
-  client is refused at once, and its connections close); a change to `include`, pins or
+  with. Tokens, assignments, hosts, origins and limits apply to the next request. Revocation is
+  immediate: when a client is removed, its token or source pins change, or it loses a server,
+  its calls and streams in flight on that server stop (the agent gets `isError` "refused: this
+  client's access to the server changed while the call ran; it may or may not have run", and
+  the upstream call is cancelled), and its own upstream connections close; a change to `include`, pins or
   `on_drift` re-evaluates every connection from its last listing; a changed `vault_path`, `era`,
   `shared_session` or timeout closes that server's connections, which reopen lazily. A view the
   gateway can't parse is refused (`policy_refused`), and the last good one stays.
@@ -987,7 +990,7 @@ Each included tool has a policy: `allow` (no prompt) or `approve`.
      refused. A whole call also has a 2 s budget, since `$ref` chains can grow exponentially;
    - Python's `$` also matches before a final newline and ECMA-262's doesn't, so for a pattern
      with an unescaped `$`, a string ending in `\n` is refused;
-   - a failure answers `isError` "arguments refused: at <pointer>: <keyword>", naming the
+   - a failure answers `isError` `arguments refused: at <pointer>: <keyword>`, naming the
      agent's own keys and never a value.
 4. **Decide** from policy, never from annotations. `allow` goes on. In M3 an `approve` tool is
    listed but refused with "refused: this tool needs an approval, and this version can't ask for
@@ -1070,7 +1073,7 @@ become visible escapes, to the model and to log readers. ZWJ emoji sequences tur
 that is accepted.
 
 **Never forwarded:** upstream `instructions`, `serverInfo` text and icons, JSON-RPC error
-`message` and `data` (every upstream error becomes `isError` "upstream error (ref <id>)", with
+`message` and `data` (every upstream error becomes `isError` `upstream error (ref <id>)`, with
 the ref also in the log), `notifications/message`, progress `message` text (progress numbers are
 relayed, at most 10 a second, only if the agent asked) and server → client request text. A result
 over `max_result_bytes` (4 MiB), an unknown `resultType` (a task included), and structured

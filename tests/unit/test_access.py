@@ -30,6 +30,7 @@ from zoeymcp.gateway.access import (
     parse_message,
     refusal_body,
     refusal_headers,
+    revoked,
     server_for,
     server_from_path,
     source_allowed,
@@ -294,6 +295,42 @@ def test_every_identity_failure_is_the_same_401(
 
 
 # --- steps 7-8 -------------------------------------------------------------------------------
+
+
+def clients_with(**changes: dict[str, Any]) -> dict[str, Any]:
+    raw: dict[str, Any] = gateway().model_dump()["clients"]
+    for name, change in changes.items():
+        raw[name] = {**raw[name], **change}
+    return raw
+
+
+def test_an_unchanged_view_revokes_nothing() -> None:
+    assert revoked(gateway(), gateway()) == frozenset()
+    # Adding a client or a server takes nothing away.
+    more = clients_with(gamma={"servers": ["notes"]})
+    assert revoked(gateway(), gateway(clients=more)) == frozenset()
+
+
+def test_a_removed_or_changed_client_is_revoked_everywhere() -> None:
+    raw = gateway().model_dump()["clients"]
+    del raw["alpha"]
+    # mail is a toolkit server, which this version never served: nothing to stop there.
+    assert revoked(gateway(), gateway(clients=raw)) == {("alpha", "notes")}
+    rekeyed = clients_with(alpha={"token_sha256": hash_token("zgc1-new-token")})
+    assert revoked(gateway(), gateway(clients=rekeyed)) == {("alpha", "notes")}
+    repinned = clients_with(beta={"sources": ["10.0.0.0/8"]})
+    assert revoked(gateway(), gateway(clients=repinned)) == {("beta", "notes")}
+
+
+def test_an_unassigned_or_unserved_server_is_revoked() -> None:
+    fewer = clients_with(alpha={"servers": ["mail"]})
+    assert revoked(gateway(), gateway(clients=fewer)) == {("alpha", "notes")}
+    both = clients_with(alpha={"servers": ["notes", "other"]})
+    assert revoked(gateway(clients=both), gateway()) == {("alpha", "other")}
+    servers = {"mail": {"kind": "toolkit"}, "other": REMOTE}
+    assert revoked(gateway(), gateway(servers=servers)) == {("alpha", "notes"), ("beta", "notes")}
+    toolkit = {"notes": {"kind": "toolkit"}, "mail": {"kind": "toolkit"}, "other": REMOTE}
+    assert revoked(gateway(), gateway(servers=toolkit)) == {("alpha", "notes"), ("beta", "notes")}
 
 
 def test_server_for() -> None:

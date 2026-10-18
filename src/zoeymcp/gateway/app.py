@@ -218,6 +218,7 @@ class GatewayApp:
         self.server.middleware = [server_info_from_path]
         self.sessions = access.SessionBindings(idle_timeout=1800)
         self.counters = access.ClientCounters()
+        self.in_flight = pipeline.InFlight()
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
@@ -260,6 +261,12 @@ class GatewayApp:
         """The policy client applied a new view (D.3)."""
         gateway = snapshot.view.gateway
         self.apply_view(gateway)
+        if previous is not None:
+            # Revocation is immediate: requests in flight stop, as the next one would be refused.
+            for client, server in sorted(access.revoked(previous.view.gateway, gateway)):
+                stopped = self.in_flight.stop(client, server)
+                if stopped:
+                    logs.event("requests_stopped", client=client, server=server, count=stopped)
         self.pool.apply(gateway)
         if previous is None:
             keep = {
@@ -537,7 +544,12 @@ class GatewayApp:
                 )
                 return stream
         await self._serve(
-            manager, scope, _replay(body, receive) if method == "POST" else receive, send, request
+            manager,
+            scope,
+            _replay(body, receive) if method == "POST" else receive,
+            send,
+            request,
+            stream=stream,
         )
         return stream
 
@@ -548,6 +560,8 @@ class GatewayApp:
         receive: Receive,
         send: Send,
         request: RequestScope,
+        *,
+        stream: bool = False,
     ) -> None:
         # The SDK compares Host as an exact string; the gateway's check lowercased it.
         raw = [(key, value.lower() if key == b"host" else value) for key, value in scope["headers"]]
@@ -568,7 +582,12 @@ class GatewayApp:
 
         token = CURRENT.set(request)
         try:
-            await manager.handle_request(sdk_scope, receive, watched)
+            if stream:
+                # A long-lived stream ends when the client's access to the server does.
+                with self.in_flight.track(request.client, request.server):
+                    await manager.handle_request(sdk_scope, receive, watched)
+            else:
+                await manager.handle_request(sdk_scope, receive, watched)
         finally:
             CURRENT.reset(token)
             if session_id is not None:
@@ -667,7 +686,12 @@ class GatewayApp:
             await ctx.session.report_progress(value, total)
 
         return await pipeline.call_tool(
-            self.pool, call, params.name, params.arguments, progress=progress
+            self.pool,
+            call,
+            params.name,
+            params.arguments,
+            progress=progress,
+            in_flight=self.in_flight,
         )
 
     async def _listen(

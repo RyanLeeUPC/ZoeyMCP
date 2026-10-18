@@ -28,7 +28,7 @@ from tests.gateway.rig import (
     until,
 )
 from zoeymcp.common.canonical import dumps_canonical
-from zoeymcp.gateway import upstream
+from zoeymcp.gateway import pipeline, upstream
 from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.marks import DriftMarks
@@ -808,3 +808,49 @@ async def test_the_status_names_servers_and_counts_never_secrets(tmp_path: Path)
     assert report["fresh"] is True
     dumped = json.dumps(report)
     assert "sha256:" not in dumped.replace(report["view"], "")
+
+
+# --- D.3: revocation stops what is in flight ------------------------------------------------------
+
+
+async def test_unassigning_a_client_stops_its_call_on_a_shared_connection(tmp_path: Path) -> None:
+    fake = McpFake()
+    options = {"include": TOOLS, "review": review(fake)}
+    results: dict[str, Any] = {}
+    with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
+        async with agent(running, CLIENTS[1]) as other, agent(running, CLIENTS[0]) as client:
+            # The first listing learns the era: modern, so both calls share one connection.
+            await other.list_tools()
+
+            async def call(who: str, connected: Any, steps: int) -> None:
+                arguments = {"steps": steps, "interval": 0.05}
+                results[who] = await connected.call_tool("slow", arguments)
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(call, "revoked", client, 400)
+                group.start_soon(call, "kept", other, 60)
+                await until(lambda: len([c for c in fake.calls if c.name == "slow"]) == 2)
+                await anyio.to_thread.run_sync(lambda: deployed.reload(assigned={CLIENTS[0]: []}))
+        assert await anyio.to_thread.run_sync(fake.cancelled.wait, 5)
+    shared = [line for line in deployed.events("upstream_connected") if line["key"] == "*"]
+    assert shared, "the calls didn't share a connection"
+    assert text(results["revoked"]).startswith(pipeline.REVOKED)
+    assert results["revoked"].is_error
+    assert not results["kept"].is_error
+    [stopped] = deployed.events("requests_stopped")
+    assert (stopped["client"], stopped["server"], stopped["count"]) == (CLIENTS[0], SERVER, 1)
+
+
+async def test_revoking_a_token_ends_its_legacy_stream(tmp_path: Path) -> None:
+    fake = McpFake()
+    options = {"include": TOOLS, "review": review(fake)}
+    with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
+        async with agent(running, mode="legacy") as client:
+            await client.list_tools()
+            await anyio.sleep(0.5)  # the session's GET stream is open by now
+            await anyio.to_thread.run_sync(lambda: deployed.reload(clients=(CLIENTS[1],)))
+            await until(lambda: deployed.events("requests_stopped"))
+            with pytest.raises(MCPError):
+                await client.list_tools()
+    stopped = deployed.events("requests_stopped")
+    assert {(line["client"], line["server"]) for line in stopped} == {(CLIENTS[0], SERVER)}
