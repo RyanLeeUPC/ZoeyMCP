@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..common import canonical
+from ..common.logs import refuse_type
 from ..common.policy.schema import NAME_PATTERN
 from ..common.policy.view import ViewClient, ViewGateway, ViewRemoteServer
 
@@ -152,23 +153,45 @@ def method_allowed(method: str) -> bool:
 # --- step 6: identity --------------------------------------------------------------------------
 
 
-def bearer_token(values: Sequence[str]) -> str | None:
+class ClientToken:
+    """A client token as an agent presented it. Its ``repr`` hides it, and logging it raises."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def sha256(self) -> str:
+        """``sha256:`` and the hex digest, as ``token_sha256`` holds it."""
+        return "sha256:" + hashlib.sha256(self._value.encode()).hexdigest()
+
+    def __repr__(self) -> str:
+        return "ClientToken(***)"
+
+
+refuse_type(ClientToken)
+
+
+def bearer_token(values: Sequence[str]) -> ClientToken | None:
     """The token from exactly one ``Authorization: Bearer <token>`` header, or None."""
     if len(values) != 1:
         return None
     scheme, space, token = values[0].partition(" ")
     if not space or scheme.lower() != "bearer" or _TOKEN.fullmatch(token) is None:
         return None
-    return token
+    return ClientToken(token)
 
 
-def identify(token: str, clients: Mapping[str, ViewClient]) -> str | None:
+def identify(token: ClientToken, clients: Mapping[str, ViewClient]) -> str | None:
     """The client whose ``token_sha256`` matches ``token``.
 
     Every client's hash is compared, with no early exit, so the time taken doesn't depend on
     which client matched or whether any did.
     """
-    presented = ("sha256:" + hashlib.sha256(token.encode()).hexdigest()).encode()
+    presented = token.sha256().encode()
     found: str | None = None
     for name, client in clients.items():
         if hmac.compare_digest(presented, client.token_sha256.encode()) and found is None:

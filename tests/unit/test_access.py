@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -9,9 +10,10 @@ import pytest
 
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import ViewGateway, ViewRemoteServer
-from zoeymcp.gateway import access
+from zoeymcp.gateway import access, logs
 from zoeymcp.gateway.access import (
     ClientCounters,
+    ClientToken,
     Refusal,
     SessionBindings,
     authenticate,
@@ -197,15 +199,27 @@ def test_other_methods_refused(method: str) -> None:
     ],
 )
 def test_bearer_token(values: list[str], token: str | None) -> None:
-    assert bearer_token(values) == token
+    found = bearer_token(values)
+    assert (found.reveal() if found is not None else None) == token
+
+
+def test_a_client_token_hides_itself_and_refuses_logging() -> None:
+    token = ClientToken("zgc1-abc")
+    assert repr(token) == "ClientToken(***)"
+    assert "zgc1-abc" not in f"{token!r} {token}"
+    assert token.sha256() == "sha256:" + hashlib.sha256(b"zgc1-abc").hexdigest()
+    with pytest.raises(TypeError, match="refusing to log a secret"):
+        logs.event("x", token=token)
+    with pytest.raises(TypeError, match="refusing to log a secret"):
+        logs.event("x", tokens=[token])
 
 
 def test_identify() -> None:
     clients = gateway().clients
-    assert identify(TOKENS["alpha"], clients) == "alpha"
-    assert identify(TOKENS["gamma"], clients) == "gamma"
-    assert identify("zgc1-unknown", clients) is None
-    assert identify(TOKENS["alpha"], {}) is None
+    assert identify(ClientToken(TOKENS["alpha"]), clients) == "alpha"
+    assert identify(ClientToken(TOKENS["gamma"]), clients) == "gamma"
+    assert identify(ClientToken("zgc1-unknown"), clients) is None
+    assert identify(ClientToken(TOKENS["alpha"]), {}) is None
 
 
 def test_every_client_hash_is_compared(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,14 +233,16 @@ def test_every_client_hash_is_compared(monkeypatch: pytest.MonkeyPatch) -> None:
     clients = gateway().clients
     for token in (TOKENS["alpha"], TOKENS["gamma"], "zgc1-unknown"):
         compared.clear()
-        identify(token, clients)
+        identify(ClientToken(token), clients)
         assert compared == [client.token_sha256.encode() for client in clients.values()]
 
 
 def test_the_first_match_wins_when_hashes_repeat() -> None:
     raw = gateway().model_dump()
     raw["clients"]["delta"] = dict(raw["clients"]["alpha"])
-    assert identify(TOKENS["alpha"], ViewGateway.model_validate(raw).clients) == "alpha"
+    assert identify(ClientToken(TOKENS["alpha"]), ViewGateway.model_validate(raw).clients) == (
+        "alpha"
+    )
 
 
 @pytest.mark.parametrize(
