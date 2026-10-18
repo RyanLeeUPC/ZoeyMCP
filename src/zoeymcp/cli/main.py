@@ -39,6 +39,9 @@ NOT_PERSISTED = (
     "kept in memory, not on disk; fix the state volume; zoeymcp oauth status shows when it is saved"
 )
 
+# The image's second virtual environment, the only one with the gateway's dependencies.
+GATEWAY_ENVIRONMENT = Path("/opt/zoeymcp-gateway")
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -592,6 +595,28 @@ def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO) -> int:
     return EXIT_FINDINGS if any(f.level == "error" for f in findings) else EXIT_OK
 
 
+def gateway_command(
+    argv: Sequence[str], *, environment: Path = GATEWAY_ENVIRONMENT, prefix: str | None = None
+) -> list[str] | None:
+    """The command that runs ``zoeymcp <argv>`` in the gateway's environment, or None to run it
+    in this process: when this is that environment, or it doesn't exist (a development checkout)."""
+    python = environment / "bin" / "python"
+    if not python.is_file():
+        return None
+    if Path(sys.prefix if prefix is None else prefix).resolve() == environment.resolve():
+        return None
+    # -I: no PYTHON* variables, no user site-packages, no current directory on the path.
+    return [str(python), "-I", "-m", "zoeymcp", *argv]
+
+
+def exec_gateway_environment(argv: Sequence[str]) -> None:
+    """Replace this process with ``zoeymcp <argv>`` in the gateway's environment, if there is one
+    to move to. Returns only when the command should run here."""
+    command = gateway_command(argv)
+    if command is not None:
+        os.execv(command[0], command)  # noqa: S606 - a fixed interpreter, no shell
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -599,6 +624,9 @@ def main(
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["gateway"]:
+        exec_gateway_environment(argv)
     args = _build_parser().parse_args(argv)
     stdin, out, err = stdin or sys.stdin, out or sys.stdout, err or sys.stderr
     if args.command == "check":

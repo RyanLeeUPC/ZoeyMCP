@@ -284,8 +284,9 @@ Optional compose profiles:
 
 ## 4. The vault
 
-An async HTTP reverse proxy (Starlette, uvicorn and httpx: the stack the MCP SDK already pins, but
-the vault process never imports the MCP SDK or any toolkit).
+An async HTTP reverse proxy (Starlette, uvicorn and httpx). The vault process never imports the MCP
+SDK or any toolkit, and its virtual environment doesn't contain them. The SDK brings its own HTTP
+stack (`httpx2`), installed only in the gateway's environment.
 
 ### 4.1 Request handling
 

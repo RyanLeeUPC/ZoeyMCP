@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import getpass
+import inspect
 import io
 import json
+import os
 import re
 import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,13 +15,17 @@ import httpx
 import pytest
 
 from zoeymcp.cli import admin_client
+from zoeymcp.cli import main as main_module
 from zoeymcp.cli.main import (
     EXIT_FINDINGS,
     EXIT_OK,
     EXIT_UNREADABLE,
+    GATEWAY_ENVIRONMENT,
     NOT_PERSISTED,
     duration,
+    exec_gateway_environment,
     format_status,
+    gateway_command,
     main,
     new_client_token,
 )
@@ -761,3 +768,116 @@ def test_oauth_reset(admin: FakeAdmin) -> None:
         "",
         "zoeymcp oauth status: OAuth needs the vault's token manager\n",
     )
+
+
+# --- the gateway's environment -----------------------------------------------------------------
+
+
+def _environment(tmp_path: Path) -> Path:
+    environment = tmp_path / "zoeymcp-gateway"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "bin" / "python").write_bytes(b"")
+    return environment
+
+
+def test_gateway_command_moves_into_the_gateway_environment(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    command = gateway_command(
+        ["gateway", "--listen", "0.0.0.0:8090"],
+        environment=environment,
+        prefix=str(tmp_path / "zoeymcp"),
+    )
+    python = str(environment / "bin" / "python")
+    assert command == [python, "-I", "-m", "zoeymcp", "gateway", "--listen", "0.0.0.0:8090"]
+
+
+def test_gateway_command_runs_here_inside_the_gateway_environment(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    assert gateway_command(["gateway"], environment=environment, prefix=str(environment)) is None
+    # The same directory, spelled another way.
+    other_spelling = str(environment / "bin" / "..")
+    assert gateway_command(["gateway"], environment=environment, prefix=other_spelling) is None
+    (tmp_path / "x").mkdir()
+    other_environment = tmp_path / "x" / ".." / "zoeymcp-gateway"
+    assert (
+        gateway_command(["gateway"], environment=other_environment, prefix=str(environment)) is None
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_gateway_command_runs_here_through_a_symlink(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(environment)
+    assert gateway_command(["gateway"], environment=link, prefix=str(environment)) is None
+    assert gateway_command(["gateway"], environment=environment, prefix=str(link)) is None
+
+
+def test_gateway_command_runs_here_without_the_environment(tmp_path: Path) -> None:
+    # A development checkout has no second environment.
+    absent = tmp_path / "absent"
+    assert gateway_command(["gateway"], environment=absent, prefix=str(tmp_path)) is None
+    # A directory where the interpreter should be isn't one.
+    broken = tmp_path / "broken"
+    (broken / "bin" / "python").mkdir(parents=True)
+    assert gateway_command(["gateway"], environment=broken, prefix=str(tmp_path)) is None
+
+
+def test_gateway_command_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Path("/opt/zoeymcp-gateway") == GATEWAY_ENVIRONMENT
+    parameters = inspect.signature(gateway_command).parameters
+    assert parameters["environment"].default == Path("/opt/zoeymcp-gateway")
+    assert parameters["prefix"].default is None
+    # Without a prefix, this interpreter's is used.
+    environment = _environment(tmp_path)
+    monkeypatch.setattr(sys, "prefix", str(environment))
+    assert gateway_command(["gateway"], environment=environment) is None
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    assert gateway_command(["gateway"], environment=environment) is not None
+
+
+def test_exec_gateway_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(os, "execv", lambda path, args: calls.append((path, args)))
+    monkeypatch.setattr(
+        main_module, "gateway_command", lambda argv: ["/env/bin/python", "-m", "zoeymcp", *argv]
+    )
+    exec_gateway_environment(["gateway", "--state", "/state-gateway"])
+    assert calls == [
+        (
+            "/env/bin/python",
+            ["/env/bin/python", "-m", "zoeymcp", "gateway", "--state", "/state-gateway"],
+        )
+    ]
+    calls.clear()
+    monkeypatch.setattr(main_module, "gateway_command", lambda argv: None)
+    exec_gateway_environment(["gateway"])
+    assert calls == []
+
+
+class _Moved(Exception):
+    pass
+
+
+def test_main_moves_only_the_gateway_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    moved: list[list[str]] = []
+
+    def move(argv: list[str]) -> None:
+        moved.append(list(argv))
+        raise _Moved
+
+    monkeypatch.setattr(main_module, "exec_gateway_environment", move)
+    with pytest.raises(_Moved):
+        main(["gateway", "--listen", "0.0.0.0:8090"])
+    assert moved == [["gateway", "--listen", "0.0.0.0:8090"]]
+    monkeypatch.setattr(sys, "argv", ["zoeymcp", "gateway"])
+    with pytest.raises(_Moved):
+        main()
+    assert moved[-1] == ["gateway"]
+    moved.clear()
+    # Other commands run here, even with "gateway" as an argument.
+    assert run(["keygen"])[0] == EXIT_OK
+    assert run(["check", "--config", "gateway"])[0] == EXIT_UNREADABLE
+    with pytest.raises(SystemExit):
+        main([])
+    assert moved == []
