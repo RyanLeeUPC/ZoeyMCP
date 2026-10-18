@@ -1,13 +1,19 @@
 # Operating ZoeyMCP
 
-How to run what is built so far: the vault (M1) and OAuth in the vault (M2). The design and the
-reasons behind it are in [design.md](design.md); this page is the how-to.
+How to run what is built so far: the vault (M1), OAuth in the vault (M2), and the gateway for
+remote MCP servers in both deployment tiers (M3, §9 onwards). The design and the reasons behind
+it are in [design.md](design.md); this page is the how-to.
 
-Admin commands run **inside the vault container** and talk to it over its admin socket
-(`/run/zoeymcp/admin.sock`, or `--socket`). With the hardened compose:
+Admin commands run **inside the container** and talk to the vault or the gateway over its admin
+socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
+gateway, or `--socket`):
 
 ```sh
+# hardened tier: one container per role
 docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp oauth status
+docker compose -f deploy/compose.hardened.yaml exec gateway zoeymcp review
+# standard tier: one container; the CLI becomes the socket's owner by itself
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp oauth status
 ```
 
 The examples below shorten that to `zoeymcp ...`. `docker compose exec` gives the command a
@@ -257,9 +263,12 @@ lost in transit by a provider without a grace window (`oauth_rotation_lost`).
 
 ```sh
 docker compose -f deploy/compose.hardened.yaml kill -s HUP vault
+docker compose -f deploy/compose.yaml kill -s HUP zoeymcp      # standard tier: both roles
 ```
 
-On `SIGHUP` the vault loads and checks its policy file again:
+On `SIGHUP` the vault loads and checks its policy file again, and the gateway sees the result
+within a second or two (it long-polls its view, §9). In the standard tier the launcher passes
+`HUP` on to both. The vault:
 
 - A policy that fails is refused (`reload_refused` in the log), and the running one stays.
 - On success the log has `reload_ok`, with `oauth_reset` listing the OAuth credentials whose
@@ -291,3 +300,264 @@ On `SIGHUP` the vault loads and checks its policy file again:
 - Refresh tokens rotate on every use (`rotates: true`).
 - The grant ends 6 months after consent. The profile sets `grant_lifetime_days: 180`, so
   `oauth status` warns 14 days before.
+
+## 9. Running the gateway
+
+The gateway is the MCP server agents connect to: one endpoint per server, `/s/<server>/mcp`. It
+holds no secret. Everything upstream goes through a vault route that accepts only the gateway,
+and the vault serves the gateway its view of the policy (design §4.6): one policy, kept in the
+vault.
+
+**Standard tier** (`deploy/compose.yaml`): one container, started as root with
+`cap_drop: [ALL]`, `cap_add: [SETUID, SETGID]` and `no-new-privileges`. Its launcher refuses to
+start otherwise, and says which setting is missing. It runs the vault as uid 10001 and the
+gateway as uid 10002, linked by a Unix socket only the gateway's uid may use, then drops to uid
+10003 with an empty environment. The gateway is published on `127.0.0.1:8090` only: a client
+token sent without TLS is readable on the network.
+
+```sh
+export ZOEYMCP_MASTER_KEY=...        # zoeymcp keygen; keep it as a deployment secret
+docker compose -f deploy/compose.yaml up -d
+curl -s http://127.0.0.1:8090/healthz # ok, once the gateway has its view
+```
+
+**Hardened tier** (`deploy/compose.hardened.yaml`): the gateway in its own container, on the
+`internal` network (to the vault) and the `agents` network, both without a route out, so it has
+no egress at all. It authenticates to the vault with the gateway key:
+
+```sh
+docker run --rm zoeymcp:local keygen  # prints ZOEYMCP_MASTER_KEY and ZOEYMCP_GATEWAY_KEY
+export ZOEYMCP_MASTER_KEY=... ZOEYMCP_GATEWAY_KEY=...
+docker compose -f deploy/compose.hardened.yaml up -d
+```
+
+Agents' containers join the `agents` network and use `http://gateway:8090/s/<server>/mcp`. For
+agents on other hosts, use the `lan` profile (§15).
+
+**What stops the gateway starting** (it prints one line and exits 2): the master key,
+`ZOEYMCP_MASTER_KEY_PREVIOUS` or `ZOEYMCP_CONFIG` in its environment; running as root; an
+`http://` link without `ZOEYMCP_GATEWAY_KEY` or `ZOEYMCP_GATEWAY_KEY_FILE`; a state directory
+open to other users; a drift-marks file it can't read (move it aside to start over, which forgets
+the marks).
+
+**Until it has a view**, and whenever it has had no answer from the vault for
+`gateway.limits.policy_max_stale` (300 s), `/healthz` and every agent request answer 503, and
+upstream connections close (`policy_stale`): a revoked client can't keep working while the vault
+is unreachable.
+
+**Stopping.** Calls in flight get 10 s. The standard tier's launcher gives both roles 50 s, so
+compose sets `stop_grace_period: 60s`.
+
+## 10. Client tokens
+
+Each agent gets its own client token. The policy holds only its hash:
+
+```text
+$ zoeymcp client-token
+client_token: zgc1-...
+token_sha256: sha256:3b1f0c...
+```
+
+```yaml
+gateway:
+  clients:
+    agent1:
+      token_sha256: sha256:3b1f0c...
+      servers: [notes]
+```
+
+Configure the agent's MCP client with the server's URL and the token as a bearer header. For an
+agent that reads a JSON MCP config, typically:
+
+```json
+{"mcpServers": {"notes": {"type": "http", "url": "http://localhost:8090/s/notes/mcp",
+                          "headers": {"Authorization": "Bearer zgc1-..."}}}}
+```
+
+- Every request is authenticated, `GET` and `DELETE` included; a session id never stands in for
+  the token. Tokens are never read from the query string.
+- **Revoking:** remove the client (or its `token_sha256`) and reload the policy. The gateway
+  refuses it from its next request, and closes its sessions and upstream connections.
+- A literal `token:` in the policy still works, with a `check` warning: anyone who reads the
+  policy can act as that client.
+- Source pins (`sources:`) match the direct peer address only. Behind the `lan` proxy the peer is
+  the proxy, so pins can't tell agents apart there; tokens do.
+
+## 11. Adding a remote MCP server
+
+1. **The route and credential,** for the gateway only (`profiles/remote-mcp-static-key.yaml` is
+   the shape): `callers: [gateway]`, `stream: true`, an `https` upstream, and rules for `POST`,
+   `GET` and `DELETE` on the server's path. `check` refuses anything less.
+2. **The server entry,** with nothing included yet, assigned to the clients that should see it:
+
+   ```yaml
+   gateway:
+     servers:
+       notes: {kind: remote, route: notes-mcp, path: /mcp}
+   ```
+
+3. **The secret:** `printf '%s' "$KEY" | zoeymcp secret set notes-key` (in the vault's
+   container).
+4. **Reload** the policy (§7).
+5. **Review it** in the gateway's container. The running gateway lists the server on a fresh
+   connection of its own; the server needn't be assigned to anyone yet:
+
+   ```text
+   $ zoeymcp review notes --add get_note --add search_notes
+   server notes  (remote, vault path /notes/mcp, modern 2026-07-28)
+     get_note      unreviewed  sha256:71d2a3b4c5d6...  not included
+     search_notes  unreviewed  sha256:0c4e1f2a3b4c...  not included
+   findings (heuristics; reading the definition is the control):
+     search_notes: note /annotations: suggested by the server: allow (readOnlyHint=true)
+
+   # YAML to commit (declarative mode). Review the changes above first.
+   gateway:
+     servers:
+       notes:
+         era: modern
+         tools:
+           include: [get_note, search_notes]
+           allow: []
+           approve: []
+           # get_note: put it in allow or approve; nothing is implied
+           # search_notes: put it in allow or approve; nothing is implied
+         review:
+           get_note: sha256:71d2...  # ADDED
+           search_notes: sha256:0c4e...  # ADDED
+   ```
+
+   Read each definition (`--show TOOL`, or `--all`) before you add it. Findings are heuristics:
+   instruction-like text, URLs, long base64 runs, nested-quantifier patterns, arguments that
+   travel in HTTP headers, and the server's suggested classification. Hidden characters are
+   shown as `[U+XXXX]`. A tool with an error finding (hidden characters, an unsafe schema) gets no
+   pin line at all.
+6. **Classify and commit:** put each added tool under `allow` or `approve`. `check` fails until
+   you do: there is no implicit default. In M3 an `approve` tool is listed but refused at call
+   time (approvals arrive in M4).
+7. **Reload** again. Agents see the tools at once (their clients are told the list changed).
+
+`review` exits 0 when every included tool matches its pin and nothing is marked, 1 when
+something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown or
+not a remote one, the vault refused, the upstream failed or a listing limit was hit). The
+message says which. `--format json` prints the same, with the snippet as a list of lines.
+
+## 12. Drift
+
+When an included tool's definition changes, the gateway hides it from every client of the
+server, logs `tool_drift` (with the members that changed), and marks it. The mark holds even if
+the server changes the tool back: a server that changed a tool once can do it again.
+
+```text
+$ zoeymcp review notes
+  get_note      ok          sha256:71d2a3b4c5d6...
+  search_notes  DRIFT       changed: description    hidden, marked
+diff search_notes:
+  --- reviewed
+  +++ listed
+  ...
+```
+
+- **Accept the change:** read the diff, then `zoeymcp review notes --repin search_notes` and
+  commit the snippet: the new pin replaces the old, and a changed pin clears the mark.
+- **The server changed it back:** the line says `MARKED`. Once every included tool matches again,
+  `zoeymcp review notes --clear` clears the server's marks. It lists fresh first and refuses
+  (exit 1, saying which tools don't match) unless every included tool matches.
+- **`on_drift: fail`** hides the whole server instead (`server_blocked`); its tools show
+  `BLOCKED`.
+- A tool the server no longer lists is `MISSING`. It comes back when it is listed again.
+
+The gateway checks for drift when the server says its list changed, when a session changes or
+reconnects, and every `drift_check_interval` (300 s) regardless, since a hostile server won't
+announce its changes. A silent change between two checks is caught at the next one.
+
+## 13. `gateway-status`
+
+```text
+$ zoeymcp gateway-status
+view sha256:5c1d...  fresh
+notes  remote  ready  era modern  connections 1  exposed 2/2
+  unreviewed: export_all
+  last listing 42 s ago
+```
+
+`zoeymcp review` with no server prints one line per server from the same data, and exits 1 if
+anything is drifted, marked, missing or invalid. Neither makes an upstream call, and neither
+shows definitions or token hashes. `--format json` for both.
+
+## 14. Rotating the gateway key (hardened tier)
+
+1. Raise `gateway_key_generation` in the policy (the shipped compose takes it from
+   `ZOEYMCP_GATEWAY_KEY_GENERATION`) and reload or recreate the vault. The old key now works for
+   at most 5 more minutes.
+2. `zoeymcp gateway-key` in the vault prints the new key. While the old one is still accepted, it
+   also prints `rotation pending: generation N-1 accepted until <time>` on stderr.
+3. Give the gateway the new key and recreate it (with a key file, `kill -s HUP gateway` is
+   enough). Its first request with the new key retires the old one (`gateway_key_retired` in the
+   vault's log).
+
+For a suspected leak, run `zoeymcp gateway-key --retire-previous` right after step 1. The gateway
+is then down until step 3. If step 3 misses the 5 minutes, the gateway logs
+`policy_fetch_failed` with `status: 403`, and answers 503 until it has the new key.
+
+A bump is written to `/state/gateway-key.json` before the new policy is used, and a vault restart
+doesn't revive a retired key. A generation lower than the current one is refused. The standard
+tier has no gateway key at all: the link socket's peer uid is the identity.
+
+## 15. The `lan` profile
+
+For agents on other hosts, add a TLS reverse proxy (Caddy, pinned by digest):
+
+```sh
+export ZOEYMCP_LAN_HOST=zoeymcp.lan.example   # the name agents use; the default
+docker compose -f deploy/compose.yaml --profile lan up -d
+docker compose -f deploy/compose.yaml cp \
+  lan:/data/caddy/pki/authorities/local/root.crt ./zoeymcp-lan-root.crt
+```
+
+- Agents use `https://<ZOEYMCP_LAN_HOST>:8443/s/<server>/mcp`. Install `zoeymcp-lan-root.crt`
+  as trusted on each client (`NODE_EXTRA_CA_CERTS=./zoeymcp-lan-root.crt` for Node-based ones).
+  The CA lives in the `lan-data` volume, so it survives restarts.
+- `gateway.hosts` must list the name: the shipped policies list `zoeymcp.lan.example`. A 421
+  from the gateway means it isn't listed.
+- `ZOEYMCP_LAN_BIND` (default `0.0.0.0`) picks the host address to publish on.
+- Caddy sees client tokens (it terminates TLS) and holds no other secret.
+
+## 16. Limits
+
+Under `gateway.limits`, all with defaults: request bodies (1 MiB), arguments (256 KiB), results
+(4 MiB), one upstream message (8 MiB), concurrent requests (8), streams (4) and legacy sessions
+(16) per client, upstream sessions (64), idle timeouts (1800 s for agents' sessions, 600 s
+upstream), the call and listing deadlines (300 s, 30 s), listing pages (32), tools (512) and
+bytes (4 MiB), schema size (64 KiB), depth (32) and subschemas (512), and `policy_max_stale`
+(300 s). A server's `call_timeout` overrides the call deadline. Changing the body limit or the
+session idle timeout takes a gateway restart (`limits_change_needs_restart`).
+
+## 17. What the gateway can't do
+
+- **Silent drift** between two checks is caught at the next check, not at the next call.
+- **Modern stateful servers** see one principal for every client (one credential): a handle
+  minted for one agent works for another. To keep agents' state apart, give each its own server
+  entry, route and credential. On legacy servers sessions are per client unless
+  `shared_session: true`, which `check` warns about.
+- **Deliberate disclosure:** a server can always leak the credential it was given in a form the
+  vault doesn't recognize. Bind credentials narrowly; in the hardened tier agents have no other
+  way out.
+- **Standard-tier egress:** the gateway shares the vault's network namespace. For anything that
+  moves money, sends mail or touches personal data, use the hardened tier.
+
+## 18. Troubleshooting the gateway
+
+| An agent sees | Likely cause | Look at |
+| --- | --- | --- |
+| 401 | a wrong or missing token, a source pin | `auth_refused` with `reason` `no_token`, `bad_token` or `source` |
+| 404 | the server isn't assigned to the client, doesn't exist, or isn't remote; another client's session | the policy; `auth_refused` with `reason` `unassigned` or `session` |
+| 421 / 403 | `Host` not in `gateway.hosts` / `Origin` not in `gateway.origins` | `auth_refused` with `reason` `host` or `origin` |
+| 429 | too many requests, streams or sessions for the client | `auth_refused` with `reason` `limit`; `gateway.limits` |
+| 503 | no view yet, or a stale one | `policy_stale`; `policy_fetch_failed` (`status: 403` is a refused gateway key) |
+| `-32602 Unknown tool` | not included, unpinned, drifted, marked or invalid | `zoeymcp review <server>` |
+| `-32603 upstream unavailable (ref ...)` | the listing failed, the vault refused (its `code` says why, e.g. `credential_unavailable`), or the upstream is down | grep the ref; `server_list_failed`, `vault_refused` |
+| `isError` with `(ref ...)` | an upstream error, a timeout, a lost connection, a result refused | grep the ref |
+| `arguments refused: at ...` | the arguments don't match the pinned schema | the tool's definition (`review --show`) |
+
+Every log line is JSON with `role` (`vault`, `gateway` or `launcher`). No client token or hash,
+gateway key, session id, argument value, result content or upstream error text is ever logged.

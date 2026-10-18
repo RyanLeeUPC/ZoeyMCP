@@ -4,9 +4,10 @@ A self-hosted proxy that lets AI agents use outside APIs and MCP servers **witho
 real credential**, and that asks a human to approve the **exact arguments** of every consequential
 action.
 
-> **Not ready for use.** Early development: the vault works on its own, OAuth included, but the
-> gateway, approvals and the admin portal don't exist yet, and nothing has been reviewed or
-> released. Don't deploy it. See [docs/design.md](docs/design.md) for where it's going, and
+> **Not ready for use.** Early development: the vault and the gateway work, but approvals,
+> toolkits and the admin portal don't exist yet, and nothing has been reviewed or released.
+> Don't deploy it. See [docs/design.md](docs/design.md) for where it's going,
+> [docs/threat-model.md](docs/threat-model.md) for what it defends against, and
 > [docs/operations.md](docs/operations.md) for running what exists.
 
 Built so far:
@@ -18,6 +19,47 @@ Built so far:
   is used, so rotating tokens survive; env seeds promoted to a live token in the store;
   `zoeymcp login` (PKCE, by pasting the redirected address), `oauth status` and `oauth reset`;
   stable error codes for callers; profiles for Google and Spotify.
+- **M3, the gateway:** an MCP server for remote MCP servers, in both protocol eras, holding no
+  secret and reaching upstreams only through the vault. Per-agent client tokens (stored as
+  hashes) and server assignments; tools served only when included and matching their pinned
+  definition, with drift hidden and marked; arguments validated against the pinned schema and
+  checked on the wire; results with hidden characters made visible; no sampling, elicitation or
+  roots from upstreams. `zoeymcp review` to onboard and re-pin; both deployment tiers (a
+  privilege-dropping single container, and a hardened compose with gateway key rotation); a
+  TLS `lan` profile.
+
+## Quickstart (standard tier)
+
+One container, the gateway on `localhost:8090`, for one remote MCP server that takes an API
+key. Build the image (`docker build -t zoeymcp:local .`), then:
+
+```sh
+docker run --rm zoeymcp:local keygen          # keep ZOEYMCP_MASTER_KEY; the gateway key isn't
+docker run --rm zoeymcp:local client-token    # for the agent; put token_sha256 in the policy
+```
+
+Edit the policy inside [deploy/compose.yaml](deploy/compose.yaml): the server's URL in
+`routes`, the client's `token_sha256`. Then:
+
+```sh
+export ZOEYMCP_MASTER_KEY=...
+docker compose -f deploy/compose.yaml up -d
+printf '%s' "$API_KEY" | docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp secret set notes-key
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes --add <tool>
+```
+
+Commit the snippet `review` prints, classifying each tool as `allow` or `approve`, recreate the
+container, and point the agent at the server:
+
+```json
+{"mcpServers": {"notes": {"type": "http", "url": "http://localhost:8090/s/notes/mcp",
+                          "headers": {"Authorization": "Bearer zgc1-..."}}}}
+```
+
+**When to move to the hardened tier** ([deploy/compose.hardened.yaml](deploy/compose.hardened.yaml)):
+for anything that moves money, sends mail or touches personal data. In the standard tier the
+gateway shares the vault's network namespace, so a compromised gateway has a way out; in the
+hardened tier it has none. Both are in [docs/operations.md](docs/operations.md) (§9 onwards).
 
 ## What it does
 
@@ -51,7 +93,7 @@ resolution ignores releases newer than the `exclude-newer` date in `pyproject.to
 supply-chain cooldown, moved forward deliberately).
 
 ```sh
-uv sync --locked
+uv sync --locked --all-extras    # the gateway's extra too, as CI does
 uv run pytest                    # tests, including property tests
 uv run ruff check src tests      # lint
 uv run ruff format src tests     # format
@@ -61,8 +103,9 @@ uv run zoeymcp check --config examples/policy.yaml
 
 Security-relevant behavior is covered by effect tests (a refused request really reaches
 nothing), acceptance tests per service shape over real TLS (`tests/acceptance`, using the
-shipped `profiles/`), and mutation testing of the security-critical modules in CI
-(`.github/workflows/mutation.yml`, gated at 89%).
+shipped `profiles/`), MCP SDK contract tests (`tests/sdk`), an image smoke test of both
+deployment tiers (`scripts/smoke-image.sh`), and mutation testing of the security-critical
+modules in CI (`.github/workflows/mutation.yml`, gated at 89%).
 
 ## License
 
