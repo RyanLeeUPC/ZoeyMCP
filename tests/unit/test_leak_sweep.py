@@ -10,6 +10,9 @@ client secret or ``error_description`` text from the fakes.
 Two things are shown by design and are taken out before the sweep: the authorization URL (it
 holds ``state`` and the PKCE challenge, useless without the verifier the vault keeps), and the
 ``error_description`` of a provider's redirect, which goes back to the operator's CLI only.
+
+The gateway's view of the policy gets its own sweep: built from a policy with every vault-side
+value filled in, it may hold none of them (M3 design D.1, invariant G1).
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ from tests.fakes.oauth_server import (
 )
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy.schema import hash_token
+from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.vault import logs
 from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.app import VaultApp
@@ -456,3 +461,182 @@ async def test_nothing_secret_leaves_the_vault(
 
     await world.vault.aclose()
     await world.token_client.aclose()
+
+
+# --- the gateway view (M3 design D.1, invariant G1) ---------------------------------------------
+
+LITERAL_TOKEN = "leak-client-token-literal-0001"
+# Every value the vault holds that the gateway must not see, by where it sits in the policy.
+VAULT_SIDE = {
+    "egress proxy": "leak-proxy.example",
+    "admin host": "leak-admin.example",
+    "client token": LITERAL_TOKEN,
+    "credential name": "leak-cred-",
+    "secret reference": "leak-ref-",
+    "header format": "LeakScheme",
+    "credential header": "X-Leak-Credential",
+    "query credential param": "leak_qparam",
+    "path template": "/leak-template/",
+    "basic username": "leak-basic-user",
+    "oauth client id": "leak-client-id",
+    "token url": "leak-token.example",
+    "authorize url": "leak-authorize.example",
+    "issuer": "leak-issuer.example",
+    "redirect uri": "/leak-callback",
+    "scope": "leak.scope",
+    "extra param": "leak-extra-value",
+    "token header": "leak-token-header-value",
+    "authorize param": "leak-authorize-value",
+    "smtp host": "leak-smtp.example",
+    "smtp user": "leak-smtp-user",
+    "smtp from": "leak-from@mail.example",
+    "smtp to": "leak-to@mail.example",
+    "connector name": "leak-connector",
+    "route name": "leak-route-",
+    "upstream url": "leak-upstream.example",
+    "placeholder": "leak-placeholder-",
+    "placeholder header": "X-Leak-Placeholder",
+    "placeholder query": "leak_ph_param",
+    "placeholder source": "192.0.2.77",
+    "forced query": "leak-force-value",
+    "rule path": "/leak-rule-path",
+    "rule param": "leak-rule-value",
+    "bridge url": "leak-bridge.example",
+    "bridge egress": "leak-egress.example",
+    "toolkit module": "leakmodule",
+}
+
+
+def secret_heavy_policy() -> Policy:
+    oauth = {
+        "kind": "oauth2",
+        "token_url": "https://leak-token.example/token",
+        "authorize_url": "https://leak-authorize.example/authorize",
+        "issuer": "https://leak-issuer.example",
+        "redirect_uri": "http://127.0.0.1/leak-callback",
+        "client_id": "leak-client-id",
+        "client_secret": "store:leak-ref-oauth-client",
+        "refresh_token": "env:LEAK_REF_REFRESH",
+        "scope": "leak.scope",
+        "extra_params": {"audience": "leak-extra-value"},
+        "token_headers": {"X-Extra": "leak-token-header-value"},
+        "authorize_params": {"prompt": "leak-authorize-value"},
+    }
+    credentials = {
+        "leak-cred-header": {
+            "kind": "header",
+            "header": "X-Leak-Credential",
+            "format": "LeakScheme {secret}",
+            "secret": "store:leak-ref-header",
+        },
+        "leak-cred-query": {"kind": "query", "param": "leak_qparam", "secret": "env:LEAK_REF_Q"},
+        "leak-cred-path": {
+            "kind": "path",
+            "template": "/leak-template/{secret}",
+            "secret": "store:leak-ref-path",
+        },
+        "leak-cred-basic": {
+            "kind": "basic",
+            "username": "leak-basic-user",
+            "secret": "store:leak-ref-basic",
+        },
+        "leak-cred-oauth": oauth,
+    }
+    connector = {
+        "kind": "smtp",
+        "host": "leak-smtp.example",
+        "port": 465,
+        "username": "leak-smtp-user",
+        "password": "store:leak-ref-smtp",
+        "from": "Leak <leak-from@mail.example>",
+        "to": ["leak-to@mail.example"],
+    }
+    placeholders = [
+        {"placeholder": "leak-placeholder-0001", "header": "X-Leak-Placeholder"},
+        {"placeholder": "leak-placeholder-0002", "query": "leak_ph_param"},
+        {"placeholder": "leak-placeholder-0003", "sources": ["192.0.2.77/32"]},
+    ]
+    routes = [
+        {
+            "name": "leak-route-mcp",
+            "prefix": "/mcp-a",
+            "upstream": "https://leak-upstream.example/base",
+            "credential": "leak-cred-header",
+            "callers": ["gateway"],
+            "stream": True,
+            "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+        },
+        *(
+            {
+                "name": f"leak-route-{name.removeprefix('leak-cred-')}",
+                "prefix": f"/r-{name.removeprefix('leak-cred-')}",
+                "upstream": "https://leak-upstream.example/other",
+                "credential": name,
+                "callers": placeholders,
+                "query": {"force": {"mode": "leak-force-value"}},
+                "rules": [
+                    {
+                        "methods": ["GET"],
+                        "paths": ["/leak-rule-path/{item}"],
+                        "params": {"item": ["leak-rule-value"]},
+                    }
+                ],
+            }
+            for name in credentials
+        ),
+        {
+            "name": "leak-route-mail",
+            "prefix": "/mail",
+            "connector": "leak-connector",
+            "callers": ["gateway"],
+            "rules": [{"methods": ["POST"], "paths": ["/send"]}],
+        },
+    ]
+    gateway = {
+        "clients": {
+            "literal": {"token": LITERAL_TOKEN, "servers": ["srv-remote"]},
+            "hashed": {
+                "token_sha256": "sha256:" + "3" * 64,
+                "servers": ["srv-remote", "srv-bridge", "srv-toolkit"],
+            },
+        },
+        "servers": {
+            "srv-remote": {"kind": "remote", "route": "leak-route-mcp", "path": "/mcp"},
+            "srv-bridge": {
+                "kind": "bridge",
+                "url": "http://leak-bridge.example:9000/mcp",
+                "egress": ["leak-egress.example:443"],
+            },
+            "srv-toolkit": {"kind": "toolkit", "module": "zoeymcp.toolkits.leakmodule"},
+        },
+    }
+    return Policy.model_validate(
+        {
+            "version": 1,
+            "mode": "managed",
+            "egress_proxy": "http://leak-proxy.example:3128",
+            "admin": {"listen": "127.0.0.1:8081", "hosts": ["leak-admin.example"]},
+            "credentials": credentials,
+            "connectors": {"leak-connector": connector},
+            "routes": routes,
+            "gateway": gateway,
+        }
+    )
+
+
+def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:
+    policy = secret_heavy_policy()
+    # Every sentinel is really in the policy.
+    policy_text = policy.model_dump_json(by_alias=True)
+    for where, value in VAULT_SIDE.items():
+        assert value in policy_text, where
+    view = build_view(policy)
+    served = dump_view(view).decode()
+    for where, value in VAULT_SIDE.items():
+        assert value not in served, where
+    for marker in ("store:", "env:", "https://", "http://", "placeholder", "secret"):
+        assert marker not in served, marker
+    # What the gateway does get: the token's hash and the vault path.
+    assert hash_token(LITERAL_TOKEN) in served
+    assert view.gateway.servers["srv-remote"].model_dump()["vault_path"] == "/mcp-a/mcp"
+    assert parse_view(served.encode()) == view

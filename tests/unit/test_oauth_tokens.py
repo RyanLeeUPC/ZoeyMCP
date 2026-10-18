@@ -2148,7 +2148,7 @@ async def test_grant_for_before_configure_is_unavailable(tmp_path: Path) -> None
 
 
 def without_ts(event: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in event.items() if k != "ts"}
+    return {k: v for k, v in event.items() if k not in ("ts", "role")}
 
 
 async def test_the_refresh_log_lines(tmp_path: Path, clock: FakeClock, captured: Captured) -> None:

@@ -1022,6 +1022,7 @@ async def test_a_401_refreshes_and_retries_once(
     [line] = events(captured, "oauth_upstream_401")
     assert line == {
         "ts": line["ts"],
+        "role": "vault",
         "event": "oauth_upstream_401",
         "route": "api",
         "credential": "music",

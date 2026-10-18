@@ -552,6 +552,7 @@ async def test_a_failed_write_is_a_500_and_kept_in_memory(
     assert failed == [
         {
             "ts": failed[0]["ts"],
+            "role": "vault",
             "event": "secret_set",
             "name": name,
             "persisted": False,
@@ -559,6 +560,7 @@ async def test_a_failed_write_is_a_500_and_kept_in_memory(
         },
         {
             "ts": failed[1]["ts"],
+            "role": "vault",
             "event": "secret_deleted",
             "name": name,
             "persisted": False,

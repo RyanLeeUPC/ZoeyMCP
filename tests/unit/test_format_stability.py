@@ -12,6 +12,8 @@ import json
 import shutil
 from pathlib import Path
 
+from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.protocol import encode_envelope, parse_envelope
 from zoeymcp.vault.store import SecretStore, _aad, smtp_binding
@@ -154,3 +156,77 @@ def test_meta_survives_a_load_with_the_previous_key(tmp_path: Path) -> None:
     assert calendar.meta == CALENDAR_META
     value, _ = reopened.get_for_oauth("oauth.music.live", token_url=TOKEN_URL)
     assert parse_envelope(value).seed_sha256 == SEED_SHA256
+
+
+# --- the gateway view (M3 design D.1) ------------------------------------------------------------
+
+# The gateway compares digests across vault restarts and upgrades (ETag, If-None-Match), and a
+# gateway parses what its vault serves: the bytes and the digest are part of the link protocol.
+VIEW_POLICY = {
+    "version": 1,
+    "mode": "declarative",
+    "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
+    "credentials": {
+        "notes-key": {
+            "kind": "header",
+            "header": "X-API-Key",
+            "format": "{secret}",
+            "secret": "store:notes-key",
+        }
+    },
+    "routes": [
+        {
+            "name": "notes-mcp",
+            "prefix": "/notes",
+            "upstream": "https://mcp.notes.example",
+            "credential": "notes-key",
+            "callers": ["gateway"],
+            "stream": True,
+            "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+        }
+    ],
+    "gateway": {
+        "hosts": ["localhost", "127.0.0.1", "gateway", "zoeymcp.lan.example"],
+        "clients": {"agent1": {"token_sha256": "sha256:" + "1" * 64, "servers": ["notes-read"]}},
+        "servers": {
+            "notes-read": {
+                "kind": "remote",
+                "route": "notes-mcp",
+                "path": "/mcp",
+                "era": "modern",
+                "tools": {"include": ["search_notes"], "allow": ["search_notes"]},
+                "review": {"search_notes": "sha256:" + "0" * 64},
+                "wrap_results": True,
+            },
+            "mail": {"kind": "toolkit", "module": "zoeymcp.toolkits.mail"},
+        },
+    },
+}
+VIEW_DIGEST = "sha256:5e83cfb6487f79f6d92f89d4b3f9305dcd20f9934a819389811ad10a32345661"
+VIEW_BYTES = (
+    b'{"digest":"' + VIEW_DIGEST.encode() + b'","gateway":{"approvals":{"approver":"elicitation",'
+    b'"budget_chars":3000,"timeout":300},"clients":{"agent1":{"servers":["notes-read"],'
+    b'"sources":[],"token_sha256":"sha256:' + b"1" * 64 + b'"}},'
+    b'"hosts":["localhost","127.0.0.1","gateway","zoeymcp.lan.example"],'
+    b'"limits":{"call_timeout":300,"list_timeout":30,"max_argument_bytes":262144,'
+    b'"max_concurrent_per_client":8,"max_list_bytes":4194304,"max_list_pages":32,'
+    b'"max_request_bytes":1048576,"max_result_bytes":4194304,"max_schema_bytes":65536,'
+    b'"max_schema_depth":32,"max_sessions_per_client":16,"max_streams_per_client":4,'
+    b'"max_subschemas":512,"max_tools_per_server":512,"max_upstream_message_bytes":8388608,'
+    b'"max_upstream_sessions":64,"policy_max_stale":300,"session_idle_timeout":1800,'
+    b'"upstream_idle_timeout":600},"origins":[],"servers":{"mail":{"kind":"toolkit"},'
+    b'"notes-read":{"call_timeout":null,"drift_check_interval":300,"enable":[],"era":"modern",'
+    b'"kind":"remote","on_drift":"hide","review":{"search_notes":"sha256:' + b"0" * 64 + b'"},'
+    b'"shared_session":false,"tools":{"allow":["search_notes"],"approve":[],'
+    b'"include":["search_notes"]},"vault_path":"/notes/mcp","wrap_results":true}}},"v":1}'
+)
+
+
+def test_the_gateway_view_is_pinned() -> None:
+    view = build_view(Policy.model_validate(VIEW_POLICY))
+    assert view.digest == VIEW_DIGEST
+    assert dump_view(view) == VIEW_BYTES
+
+
+def test_the_pinned_view_still_parses() -> None:
+    assert parse_view(VIEW_BYTES).digest == VIEW_DIGEST

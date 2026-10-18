@@ -320,7 +320,8 @@ async def test_start_answers_with_the_authorization_request(
     }
     assert rig.counter.issued == [FLOW_ID, STATE, VERIFIER]
     assert [
-        {k: v for k, v in e.items() if k != "ts"} for e in captured.events("oauth_login_started")
+        {k: v for k, v in e.items() if k not in ("ts", "role")}
+        for e in captured.events("oauth_login_started")
     ] == [{"event": "oauth_login_started", "credential": "music"}]
     # The verifier never leaves the vault, and nothing went to the token endpoint.
     assert VERIFIER not in json.dumps(started)
@@ -368,7 +369,7 @@ async def test_start_refuses_what_is_not_oauth(
     refused = await rig.refused(rig.start(name))
     assert (refused.reason, str(refused), refused.details) == ("not_oauth", message, {})
     failed = captured.events("oauth_login_failed")
-    assert [{k: v for k, v in e.items() if k != "ts"} for e in failed] == [
+    assert [{k: v for k, v in e.items() if k not in ("ts", "role")} for e in failed] == [
         {"event": "oauth_login_failed", "credential": name, "reason": "not_oauth"}
     ]
     assert captured.events("oauth_login_started") == []
@@ -509,7 +510,7 @@ async def test_a_login_stores_the_grant_and_caches_its_access_token(
     assert grant.hard_expiry == clock.mono + 3600
     assert len(rig.server.calls) == 1
     [completed] = captured.events("oauth_login_completed")
-    del completed["ts"]
+    del completed["ts"], completed["role"]
     assert completed == {
         "event": "oauth_login_completed",
         "credential": "music",
@@ -524,7 +525,7 @@ async def test_a_login_stores_the_grant_and_caches_its_access_token(
     assert captured.events("oauth_scope_unexpected") == []
     assert captured.events("oauth_scope_narrowed") == []
     [call] = captured.events("oauth_refresh")
-    del call["ts"]
+    del call["ts"], call["role"]
     assert call == {
         "event": "oauth_refresh",
         "credential": "music",
@@ -564,7 +565,7 @@ async def test_a_refused_exchange_is_logged_without_its_description(
     rig.manager.post = slow_post  # type: ignore[method-assign]
     await rig.refused(rig.login.complete("music", flow, with_query(fresh, code=reused)))
     call = captured.events("oauth_refresh")[-1]
-    del call["ts"]
+    del call["ts"], call["role"]
     assert call == {
         "event": "oauth_refresh",
         "credential": "music",
@@ -915,13 +916,13 @@ async def test_scopes_are_flagged_not_refused(
     assert rig.stored() == rig.server.active_refresh_token()
     [unexpected] = captured.events("oauth_scope_unexpected")
     [narrowed] = captured.events("oauth_scope_narrowed")
-    assert {k: v for k, v in unexpected.items() if k != "ts"} == {
+    assert {k: v for k, v in unexpected.items() if k not in ("ts", "role")} == {
         "event": "oauth_scope_unexpected",
         "credential": "music",
         "scopes": ["playlist-modify"],
         "at": "login",
     }
-    assert {k: v for k, v in narrowed.items() if k != "ts"} == {
+    assert {k: v for k, v in narrowed.items() if k not in ("ts", "role")} == {
         "event": "oauth_scope_narrowed",
         "credential": "music",
         "scopes": ["user-top-read"],
@@ -1167,7 +1168,7 @@ async def test_client_credentials_login_is_a_test_fetch(
     started = [e["credential"] for e in captured.events("oauth_login_started")]
     assert started == ["music"]
     [completed] = captured.events("oauth_login_completed")
-    del completed["ts"]
+    del completed["ts"], completed["role"]
     assert completed == {
         "event": "oauth_login_completed",
         "credential": "music",
@@ -1599,7 +1600,8 @@ async def test_a_test_fetch_logs_unexpected_scopes(
     rig = machine_rig(tmp_path, clock, expected_scopes=["read"])
     await rig.start()
     assert [
-        {k: v for k, v in e.items() if k != "ts"} for e in captured.events("oauth_scope_unexpected")
+        {k: v for k, v in e.items() if k not in ("ts", "role")}
+        for e in captured.events("oauth_scope_unexpected")
     ] == [
         {
             "event": "oauth_scope_unexpected",

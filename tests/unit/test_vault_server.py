@@ -281,6 +281,7 @@ def test_reload_reports_oauth_resets(
     server.reload_policy(app, str(same), env())
     assert _log_lines(log_buffer)[-1] == {
         "ts": _log_lines(log_buffer)[-1]["ts"],
+        "role": "vault",
         "event": "reload_ok",
         "oauth_reset": [],
     }
