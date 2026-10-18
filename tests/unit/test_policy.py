@@ -13,11 +13,23 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from zoeymcp.common.policy import Finding, PolicyError, check_policy, parse_policy
-from zoeymcp.common.policy.schema import OAuth2Credential, param_values, split_scope
+from zoeymcp.common.policy.schema import (
+    Client,
+    Gateway,
+    GatewayLimits,
+    OAuth2Credential,
+    RemoteServer,
+    hash_token,
+    param_values,
+    split_scope,
+)
 
 Raw = dict[str, Any]
+# agent1's token_sha256 in the example policy.
+AGENT1_HASH = "sha256:8ca973db011281c88e678afeb86d1955579aed24fd7deeae43155fe7aabb0f43"
 
 
 def run(raw: Raw, environ: dict[str, str] | None = None) -> list[Finding]:
@@ -46,7 +58,8 @@ def route(raw: Raw, name: str) -> Raw:
 def test_example_policy_is_clean(example_text: str) -> None:
     findings = check_policy(parse_policy(example_text, "example"))
     assert [f"{f.level} {f.path}" for f in findings] == [
-        "warning credentials.broker-mcp.authorize_url"
+        "warning credentials.broker-mcp.authorize_url",
+        "warning gateway.clients.agent1.servers",
     ]
 
 
@@ -215,13 +228,21 @@ def _connector_route_with_placeholder(r: Raw) -> None:
             "routes[0].query.force: 'api_key' carries the credential",
         ),
         (
-            lambda r: r["gateway"]["clients"]["agent1"].update(token="ph-agent1-stats-4c1f9b27"),
+            lambda r: r["gateway"]["clients"].update(
+                agent1={"token": "ph-agent1-stats-4c1f9b27", "servers": ["broker-read"]}
+            ),
             "gateway.clients.agent1.token: the same value is used as a placeholder and a client"
             " token",
         ),
         (
-            lambda r: r["gateway"]["clients"].update(agent2={"token": "ph-agent1-gw-8e2d6a51c3b7"}),
-            "gateway.clients.agent2.token: two clients share a token",
+            lambda r: r["gateway"]["clients"].update(
+                agent2={"token_sha256": AGENT1_HASH, "servers": ["broker-read"]}
+            ),
+            "gateway.clients.agent2.token_sha256: two clients share a token",
+        ),
+        (
+            lambda r: route(r, "broker-mcp").update(stream=False),
+            "gateway.servers.broker-read.route: route 'broker-mcp' must set stream: true for MCP",
         ),
         (
             lambda r: r["gateway"]["clients"]["agent1"]["servers"].append("ghost"),
@@ -306,10 +327,6 @@ def test_check_errors(example_raw: Raw, mutate: Callable[[Raw], object], expecte
         (
             lambda r: route(r, "stats")["rules"][0].update(paths=["/2.0/{method}"]),
             "routes[0].rules[0].paths: {method} has no constraint in params",
-        ),
-        (
-            lambda r: route(r, "broker-mcp").update(stream=False),
-            "gateway.servers.broker-read.route: route 'broker-mcp' should set stream: true",
         ),
         (
             lambda r: r["gateway"]["servers"]["broker-read"]["review"].update(
@@ -1189,3 +1206,714 @@ def test_resource_origins_on_plain_http() -> None:
     assert [w for w in warnings(run(raw)) if ".extra_params.resource" in w] == [
         "credentials.o.extra_params.resource: 'http://api.example:80/' uses plain http"
     ]
+
+
+# --- gateway: clients and tokens --------------------------------------------------------------
+
+
+def listed(raw: Raw, environ: dict[str, str] | None = None) -> list[str]:
+    """Every finding, as ``level path: message``."""
+    return found(raw, environ)
+
+
+def literal_client(raw: Raw, token: str) -> None:
+    raw["gateway"]["clients"]["agent1"] = {"token": token, "servers": ["broker-read"]}
+
+
+def test_hash_token() -> None:
+    assert hash_token("abc") == (
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+
+
+def test_a_client_takes_its_token_in_one_form(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    agent1 = raw["gateway"]["clients"]["agent1"]
+    agent1["token"] = "ph-agent1-gw-8e2d6a51c3b7"
+    both = "gateway.clients.agent1: Value error, set exactly one of token and token_sha256"
+    assert both in schema_errors(raw)
+    agent1.pop("token")
+    agent1.pop("token_sha256")
+    assert both in schema_errors(raw)
+
+
+def test_token_hash_of_either_form() -> None:
+    hashed = Client(token_sha256=AGENT1_HASH)
+    assert hashed.token_hash == AGENT1_HASH
+    literal = Client(token="abc")
+    assert literal.token_hash == hash_token("abc")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sha256:" + "A" * 64,
+        "sha256:" + "0" * 63,
+        "sha256:" + "0" * 65,
+        "sha512:" + "0" * 64,
+        "0" * 64,
+    ],
+)
+def test_token_sha256_format(example_raw: Raw, value: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["clients"]["agent1"]["token_sha256"] = value
+    assert any(
+        e.startswith("gateway.clients.agent1.token_sha256: String should match pattern")
+        for e in schema_errors(raw)
+    )
+
+
+def test_literal_tokens_warn(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    literal_client(raw, "ph-agent1-gw-8e2d6a51c3b7")
+    found = listed(raw)
+    assert (
+        "warning gateway.clients.agent1.token: anyone who reads the policy can act as this "
+        "client; use token_sha256 (zoeymcp client-token)"
+    ) in found
+    assert not any(f.startswith("error") for f in found), found
+    assert not any("anyone who reads" in f for f in listed(example_raw))
+
+
+def test_short_literal_tokens_warn_but_hashes_have_no_length(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    literal_client(raw, "p" * 15)
+    assert (
+        "warning gateway.clients.agent1.token: shorter than 16 characters, so easy to guess"
+        in listed(raw)
+    )
+    literal_client(raw, "p" * 16)
+    assert not any("easy to guess" in f for f in listed(raw))
+    assert not any("easy to guess" in f for f in listed(example_raw))
+
+
+def test_two_clients_with_one_hash(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["clients"]["agent2"] = {"token_sha256": AGENT1_HASH, "servers": ["mail"]}
+    found = errors(run(raw))
+    assert "gateway.clients.agent1.token_sha256: two clients share a token" in found
+    assert "gateway.clients.agent2.token_sha256: two clients share a token" in found
+    raw["gateway"]["clients"]["agent2"]["token_sha256"] = "sha256:" + "0" * 64
+    assert errors(run(raw)) == []
+
+
+def test_a_literal_token_matching_another_clients_hash(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    token = "zgc1-a-literal-token-for-agent2"
+    raw["gateway"]["clients"]["agent1"]["token_sha256"] = hash_token(token)
+    raw["gateway"]["clients"]["agent2"] = {"token": token, "servers": ["mail"]}
+    found = errors(run(raw))
+    assert found == [
+        "gateway.clients.agent1.token_sha256: two clients share a token",
+        "gateway.clients.agent2.token: two clients share a token",
+    ]
+    raw["gateway"]["clients"]["agent2"]["token"] = token + "x"
+    assert errors(run(raw)) == []
+
+
+def test_two_clients_with_one_literal_token(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    literal_client(raw, "ph-agent1-gw-8e2d6a51c3b7")
+    raw["gateway"]["clients"]["agent2"] = {"token": "ph-agent1-gw-8e2d6a51c3b7"}
+    found = errors(run(raw))
+    assert "gateway.clients.agent1.token: two clients share a token" in found
+    assert "gateway.clients.agent2.token: two clients share a token" in found
+
+
+def test_a_placeholder_whose_hash_is_a_client_token(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["clients"]["agent1"]["token_sha256"] = hash_token("ph-agent1-stats-4c1f9b27")
+    assert errors(run(raw)) == [
+        "gateway.clients.agent1.token_sha256: the same value is used as a placeholder and a "
+        "client token",
+        "routes[0].callers[0]: the same value is used as a placeholder and a client token",
+    ]
+    # Another placeholder clears the error.
+    route(raw, "stats")["callers"][0]["placeholder"] = "x" * 16
+    assert errors(run(raw)) == []
+    # Placeholders are compared by their hash, not as text: the hex digest itself is no match.
+    digest = hash_token("ph-agent1-stats-4c1f9b27").removeprefix("sha256:")
+    route(raw, "stats")["callers"][0]["placeholder"] = digest
+    assert errors(run(raw)) == []
+
+
+def test_clients_without_servers_warn(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["clients"]["agent1"]["servers"] = []
+    found = listed(raw)
+    assert "warning gateway.clients.agent1.servers: no servers: this client reaches nothing" in (
+        found
+    )
+    assert not any("reaches nothing" in f for f in listed(example_raw))
+
+
+def test_servers_this_version_does_not_serve(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["bridge1"] = {"kind": "bridge", "url": "https://bridge.example"}
+    raw["gateway"]["clients"]["agent1"]["servers"] = ["broker-read", "mail", "bridge1"]
+    found = [f for f in listed(raw) if f.startswith("warning gateway.clients.agent1")]
+    assert found == [
+        "warning gateway.clients.agent1.servers: 'bridge1' is a bridge server: "
+        "not served by this version",
+        "warning gateway.clients.agent1.servers: 'mail' is a toolkit server: "
+        "not served by this version",
+    ]
+
+
+def test_unassigned_servers_warn(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["clients"]["agent1"]["servers"] = ["broker-read", "mail"]
+    found = [f for f in listed(raw) if "assigned" in f]
+    assert found == ["warning gateway.servers.broker-trade: not assigned to any client"]
+    assert not any("assigned" in f for f in listed(example_raw))
+
+
+def test_any_client_assigns_a_server(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["clients"]["agent1"]["servers"] = ["broker-read", "mail"]
+    raw["gateway"]["clients"]["agent2"] = {
+        "token_sha256": "sha256:" + "0" * 64,
+        "servers": ["broker-trade"],
+    }
+    assert not any("assigned" in f for f in listed(raw))
+
+
+# --- gateway: MCP routes ------------------------------------------------------------------------
+
+
+def mcp_findings(raw: Raw, server: str = "broker-read") -> list[str]:
+    prefix = f"gateway.servers.{server}."
+    return [f for f in listed(raw) if f.split(" ", 1)[1].startswith(prefix)]
+
+
+def test_the_example_mcp_route_is_clean(example_raw: Raw) -> None:
+    assert mcp_findings(example_raw) == []
+    assert mcp_findings(example_raw, "broker-trade") == []
+
+
+def test_mcp_needs_post_on_the_server_path(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [{"methods": ["GET", "DELETE"], "paths": ["/mcp"]}]
+    assert mcp_findings(raw) == [
+        "error gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing POST /mcp"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("methods", "missing"),
+    [
+        (["POST", "GET"], "DELETE /mcp"),
+        (["POST", "DELETE"], "GET /mcp"),
+        (["POST"], "GET /mcp or DELETE /mcp"),
+    ],
+)
+def test_legacy_servers_need_get_and_delete(
+    example_raw: Raw, methods: list[str], missing: str
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [{"methods": methods, "paths": ["/mcp"]}]
+    assert mcp_findings(raw) == [
+        f"warning gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing "
+        f"{missing}: legacy servers use GET for notifications and DELETE to end a session"
+    ]
+
+
+def test_methods_may_come_from_several_rules(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["POST"], "paths": ["/mcp"]},
+        {"methods": ["GET"], "paths": ["/mcp"]},
+        {"methods": ["DELETE"], "paths": ["/mcp"]},
+    ]
+    assert mcp_findings(raw) == []
+
+
+def test_mcp_routes_must_stream(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["stream"] = False
+    assert mcp_findings(raw) == [
+        "error gateway.servers.broker-read.route: route 'broker-mcp' must set stream: true for MCP"
+    ]
+
+
+def test_mcp_over_plain_http_is_refused(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    mcp = route(raw, "broker-mcp")
+    mcp.update(upstream="http://mcp.broker.example", allow_insecure_upstream=True)
+    mcp.pop("credential")
+    raw["credentials"].pop("broker-mcp")
+    found = listed(raw)
+    assert (
+        "error gateway.servers.broker-read.route: route 'broker-mcp' uses plain http: "
+        "MCP over cleartext is refused"
+    ) in found
+    # The route alone would only be a warning.
+    assert "warning routes[1].upstream: plain http upstream" in found
+
+
+def test_rules_the_gateway_never_uses_warn(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["GET", "POST", "DELETE", "PUT"], "paths": ["/mcp", "/admin"]},
+        {"methods": ["PUT"], "paths": ["/mcp"]},
+    ]
+    assert mcp_findings(raw) == [
+        "warning gateway.servers.broker-read.route: route 'broker-mcp' also allows PUT /mcp, "
+        "GET /admin, POST /admin, DELETE /admin, PUT /admin; the gateway never uses them"
+    ]
+
+
+def test_every_server_path_on_a_route_is_used(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-trade"]["path"] = "/trade"
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["GET", "POST", "DELETE"], "paths": ["/mcp", "/trade"]}
+    ]
+    assert mcp_findings(raw) == []
+    assert mcp_findings(raw, "broker-trade") == []
+
+
+def broad(entries: str) -> str:
+    return (
+        f"warning gateway.servers.broker-read.route: route 'broker-mcp' allows {entries} by "
+        "pattern; the gateway only uses its servers' exact paths, so list those instead"
+    )
+
+
+@pytest.mark.parametrize("source", ["/mcp/**", "/**", "/*", "/{x}"])
+def test_rule_patterns_reach_the_server_path(example_raw: Raw, source: str) -> None:
+    # The vault matches the gateway's requests by pattern, so check does too.
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [{"methods": ["POST", "GET", "DELETE"], "paths": [source]}]
+    assert mcp_findings(raw) == [broad(f"POST {source}, GET {source}, DELETE {source}")]
+    assert errors(run(raw)) == []
+
+
+def test_capture_params_decide_whether_a_rule_reaches(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    rule = {"methods": ["POST", "GET", "DELETE"], "paths": ["/{x}"], "params": {"x": ["mcp"]}}
+    route(raw, "broker-mcp")["rules"] = [rule]
+    assert mcp_findings(raw) == [broad("POST /{x}, GET /{x}, DELETE /{x}")]
+    rule["params"] = {"x": ["other"]}
+    assert sorted(mcp_findings(raw)) == [
+        "error gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing POST /mcp",
+        "warning gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing "
+        "GET /mcp or DELETE /mcp: legacy servers use GET for notifications and DELETE to end a "
+        "session",
+        "warning gateway.servers.broker-read.route: route 'broker-mcp' also allows POST /{x}, "
+        "GET /{x}, DELETE /{x}; the gateway never uses them",
+    ]
+
+
+def test_a_pattern_that_misses_the_server_path(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]},
+        {"methods": ["POST"], "paths": ["/mcp/*"]},
+    ]
+    assert mcp_findings(raw) == [
+        "warning gateway.servers.broker-read.route: route 'broker-mcp' also allows "
+        "POST /mcp/*; the gateway never uses them"
+    ]
+
+
+def test_a_broad_entry_is_listed_once(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["POST"], "paths": ["/mcp", "/**"]},
+        {"methods": ["POST", "GET", "DELETE"], "paths": ["/**"]},
+    ]
+    assert mcp_findings(raw) == [broad("POST /**, GET /**, DELETE /**")]
+
+
+def test_bad_rule_patterns_on_an_mcp_route(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]},
+        {"methods": ["GET"], "paths": ["/a/**/b"]},
+    ]
+    assert mcp_findings(raw) == [
+        "warning gateway.servers.broker-read.route: route 'broker-mcp' also allows "
+        "GET /a/**/b; the gateway never uses them"
+    ]
+    assert any(e.startswith("routes[1].rules[1].paths[0]: ") for e in errors(run(raw)))
+
+
+@pytest.mark.parametrize("server_path", ["/a//b", "/./mcp", "/mcp/../x", "/*", "/{x}", "mcp"])
+def test_server_paths_the_vault_refuses(example_raw: Raw, server_path: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["path"] = server_path
+    assert mcp_findings(raw) == [
+        "error gateway.servers.broker-read.path: must be a plain absolute path"
+    ]
+    assert mcp_findings(raw, "broker-trade") == []
+
+
+def test_server_paths_match_exactly_as_the_vault_does(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["path"] = "/"
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp", "/"]}
+    ]
+    assert mcp_findings(raw) == []
+    # A trailing slash is part of the path.
+    raw["gateway"]["servers"]["broker-read"]["path"] = "/mcp/"
+    assert sorted(mcp_findings(raw)) == [
+        "error gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing "
+        "POST /mcp/",
+        "warning gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing "
+        "GET /mcp/ or DELETE /mcp/: legacy servers use GET for notifications and DELETE to end "
+        "a session",
+        "warning gateway.servers.broker-read.route: route 'broker-mcp' also allows POST /, "
+        "GET /, DELETE /; the gateway never uses them",
+    ]
+
+
+def test_a_connector_route_gets_one_error(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["route"] = "mail-send"
+    assert mcp_findings(raw) == [
+        "error gateway.servers.broker-read.route: points at a connector route, not an upstream"
+    ]
+
+
+# --- gateway: servers ---------------------------------------------------------------------------
+
+
+def bridge(**fields: Any) -> Raw:
+    return {
+        "kind": "bridge",
+        "url": "https://bridge.example/mcp",
+        "tools": {"include": ["t"], "allow": ["t"]},
+        "review": {"t": "sha256:" + "1" * 64},
+        **fields,
+    }
+
+
+@pytest.mark.parametrize("capability", ["resources", "completions", "roots"])
+def test_enable_is_an_error_for_now(example_raw: Raw, capability: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
+    raw["gateway"]["servers"]["bridge1"] = bridge(enable=[capability])
+    raw["gateway"]["clients"]["agent1"]["servers"].append("bridge1")
+    message = (
+        "resources, prompts, completions, sampling, elicitation and roots can't be enabled "
+        "yet; M3 serves tools only"
+    )
+    found = errors(run(raw))
+    assert found == [
+        f"gateway.servers.bridge1.enable: {message}",
+        f"gateway.servers.broker-read.enable: {message}",
+    ]
+
+
+def test_unknown_capabilities_are_schema_errors(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["enable"] = ["tasks"]
+    assert any(
+        e.startswith(
+            "gateway.servers.broker-read.remote.enable[0]: Input should be 'resources', "
+            "'prompts', 'completions'"
+        )
+        for e in schema_errors(raw)
+    )
+
+
+def test_shared_sessions_warn(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["shared_session"] = True
+    assert mcp_findings(raw) == [
+        "warning gateway.servers.broker-read.shared_session: legacy servers only: every client "
+        "shares one upstream session, so server-side state leaks between agents"
+    ]
+
+
+def test_tools_that_differ_only_in_case(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    server = raw["gateway"]["servers"]["broker-read"]
+    server["tools"] = {
+        "include": ["get_quote", "Get_Quote", "list_positions", "GET_QUOTE"],
+        "allow": ["get_quote", "Get_Quote", "list_positions", "GET_QUOTE"],
+    }
+    server["review"].update({"Get_Quote": "sha256:" + "2" * 64, "GET_QUOTE": "sha256:" + "3" * 64})
+    assert errors(run(raw)) == [
+        "gateway.servers.broker-read.tools: 'GET_QUOTE', 'Get_Quote', 'get_quote' differ only "
+        "in case"
+    ]
+
+
+def test_a_repeated_tool_is_not_a_case_clash(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["tools"]["include"].append("get_quote")
+    assert errors(run(raw)) == []
+
+
+def test_toolkit_tools_that_differ_only_in_case(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["mail"]["tools"] = {"include": ["send", "Send"]}
+    assert errors(run(raw)) == ["gateway.servers.mail.tools: 'Send', 'send' differ only in case"]
+
+
+def test_server_defaults(example_raw: Raw) -> None:
+    policy = parse_policy(yaml.safe_dump(example_raw, sort_keys=False), "test")
+    assert policy.gateway is not None
+    server = policy.gateway.servers["broker-trade"]
+    assert isinstance(server, RemoteServer)
+    assert server.era == "auto"
+    assert server.drift_check_interval == 300
+    assert server.call_timeout is None
+    assert server.enable == []
+    assert policy.gateway.servers["broker-read"].era == "modern"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("field", "low", "high"),
+    [("drift_check_interval", 60, 86400), ("call_timeout", 1, 3600)],
+)
+def test_server_bounds(example_raw: Raw, field: str, low: int, high: int) -> None:
+    raw = copy.deepcopy(example_raw)
+    server = raw["gateway"]["servers"]["broker-read"]
+    for good in (low, high):
+        server[field] = good
+        assert errors(run(raw)) == []
+    for bad in (low - 1, high + 1):
+        server[field] = bad
+        assert any(
+            e.startswith(f"gateway.servers.broker-read.remote.{field}: Input should be")
+            for e in schema_errors(raw)
+        )
+
+
+def test_era_values(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    for era in ("auto", "modern", "legacy"):
+        raw["gateway"]["servers"]["broker-read"]["era"] = era
+        assert errors(run(raw)) == []
+    raw["gateway"]["servers"]["broker-read"]["era"] = "2025-03-26"
+    assert any(
+        e.startswith("gateway.servers.broker-read.remote.era: Input should be")
+        for e in schema_errors(raw)
+    )
+
+
+# --- gateway: hosts, origins and limits ---------------------------------------------------------
+
+
+def test_gateway_defaults() -> None:
+    gateway = Gateway()
+    assert gateway.hosts == ["localhost", "127.0.0.1", "::1"]
+    assert gateway.origins == []
+    assert gateway.limits == GatewayLimits()
+    assert gateway.limits.model_dump() == {
+        "max_request_bytes": 2**20,
+        "max_argument_bytes": 256 * 1024,
+        "max_result_bytes": 4 * 2**20,
+        "max_upstream_message_bytes": 8 * 2**20,
+        "max_concurrent_per_client": 8,
+        "max_streams_per_client": 4,
+        "max_sessions_per_client": 16,
+        "max_upstream_sessions": 64,
+        "session_idle_timeout": 1800,
+        "upstream_idle_timeout": 600,
+        "call_timeout": 300,
+        "list_timeout": 30,
+        "max_list_pages": 32,
+        "max_tools_per_server": 512,
+        "max_list_bytes": 4 * 2**20,
+        "max_schema_bytes": 64 * 1024,
+        "max_schema_depth": 32,
+        "max_subschemas": 512,
+        "policy_max_stale": 300,
+    }
+
+
+@pytest.mark.parametrize("host", ["localhost", "::1", "fe80::1", "10.0.0.1", "gw.example"])
+def test_gateway_hosts_accept(example_raw: Raw, host: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["hosts"] = [host]
+    assert errors(run(raw)) == []
+
+
+@pytest.mark.parametrize(
+    ("hosts", "expected"),
+    [
+        ([], "gateway.hosts: List should have at least 1 item"),
+        (["[::1]"], "gateway.hosts: Value error, write IPv6 addresses without brackets: '[::1]'"),
+        (["gw.example:8080"], "gateway.hosts: Value error, invalid host name 'gw.example:8080'"),
+        (["bad_host.example"], "gateway.hosts: Value error, invalid host name"),
+        (["localhost", "-x"], "gateway.hosts: Value error, invalid host name '-x'"),
+    ],
+)
+def test_gateway_hosts_reject(example_raw: Raw, hosts: list[str], expected: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["hosts"] = hosts
+    found = schema_errors(raw)
+    assert any(e.startswith(expected) for e in found), found
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://a",
+        "https://app.example",
+        "https://app.example:8443",
+        "http://127.0.0.1:8080",
+        "http://[::1]:3000",
+        "https://app.example:80",
+        "http://app.example:443",
+    ],
+)
+def test_origins_accept(example_raw: Raw, origin: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["origins"] = [origin]
+    assert errors(run(raw)) == []
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("http://", "String should have at least 8 characters"),
+        ("https://" + "a" * 293, "String should have at most 300 characters"),
+        ("ftp://app.example", "Value error, scheme must be one of: http, https"),
+        ("https://app.example/", "Value error, an origin is scheme://host[:port], with no path"),
+        ("https://app.example/x", "Value error, a path is not allowed here"),
+        ("https://app.example:", "Value error, an origin is scheme://host[:port], with no path"),
+        ("https://app.example:0443", "Value error, an origin is scheme://host[:port]"),
+        ("https://app.example?x=1", "Value error, query strings and fragments are not allowed"),
+        ("https://app.example#x", "Value error, query strings and fragments are not allowed"),
+        ("https://u@app.example", "Value error, credentials in URLs are not allowed"),
+        ("https://App.example", "Value error, write origins in lower case"),
+        ("HTTPS://app.example", "Value error, write origins in lower case"),
+        ("https://bad_host.example", "Value error, invalid host name 'bad_host.example'"),
+        ("https://app.example:443", "Value error, leave out the default port 443; browsers do"),
+        ("http://app.example:80", "Value error, leave out the default port 80; browsers do"),
+        ("https://app.example:99999", "Value error, invalid port"),
+        ("https://app.example\n", "Value error, line breaks and NUL are not allowed"),
+    ],
+)
+def test_origins_reject(example_raw: Raw, origin: str, expected: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["origins"] = ["https://ok.example", origin]
+    found = schema_errors(raw)
+    assert any(e.startswith("gateway.origins") and expected in e for e in found), found
+
+
+def test_origin_length_bound(example_raw: Raw) -> None:
+    # A host name is at most 253 characters, so no valid origin reaches 300: at 300 characters
+    # only the host is refused, and the length rule starts at 301.
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["origins"] = ["https://" + "a" * 292]
+    found = schema_errors(raw)
+    assert any("invalid host name" in e for e in found), found
+    assert not any("at most 300 characters" in e for e in found), found
+
+
+LIMIT_BOUNDS = {
+    "max_request_bytes": (4096, 16 * 2**20),
+    "max_argument_bytes": (1024, 4 * 2**20),
+    "max_result_bytes": (65536, 16 * 2**20),
+    "max_upstream_message_bytes": (65536, 16 * 2**20),
+    "max_concurrent_per_client": (1, 64),
+    "max_streams_per_client": (1, 64),
+    "max_sessions_per_client": (1, 256),
+    "max_upstream_sessions": (1, 1024),
+    "session_idle_timeout": (60, 86400),
+    "upstream_idle_timeout": (30, 86400),
+    "call_timeout": (1, 3600),
+    "list_timeout": (1, 300),
+    "max_list_pages": (1, 1000),
+    "max_tools_per_server": (1, 10000),
+    "max_list_bytes": (65536, 64 * 2**20),
+    "max_schema_bytes": (1024, 2**20),
+    "max_schema_depth": (4, 128),
+    "max_subschemas": (16, 10000),
+    "policy_max_stale": (30, 3600),
+}
+
+
+def test_every_limit_has_bounds() -> None:
+    assert set(LIMIT_BOUNDS) == set(GatewayLimits.model_fields)
+
+
+@pytest.mark.parametrize("field", sorted(LIMIT_BOUNDS))
+def test_limit_bounds(field: str) -> None:
+    low, high = LIMIT_BOUNDS[field]
+    for good in (low, high):
+        assert getattr(GatewayLimits(**{field: good}), field) == good
+    for bad in (low - 1, high + 1):
+        with pytest.raises(ValidationError):
+            GatewayLimits(**{field: bad})
+
+
+def test_results_must_fit_in_an_upstream_message(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    limits = raw["gateway"]["limits"] = {
+        "max_result_bytes": 2**20,
+        "max_upstream_message_bytes": 2**20,
+    }
+    assert errors(run(raw)) == []
+    limits["max_result_bytes"] = 2**20 + 1
+    assert errors(run(raw)) == [
+        "gateway.limits: max_result_bytes (1048577) is larger than max_upstream_message_bytes "
+        "(1048576), so a result that size could never arrive"
+    ]
+
+
+# --- env secrets with line breaks ---------------------------------------------------------------
+
+LINE_BREAK = (
+    "credentials.music-stats.secret: env var STATS_KEY has a line break, so an upstream's echo "
+    "of it in a stream can't be scrubbed"
+)
+
+
+@pytest.mark.parametrize("value", ["a\nb", "a\rb", "ab\r\n"])
+def test_env_secrets_with_line_breaks_warn(example_raw: Raw, value: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["music-stats"]["secret"] = "env:STATS_KEY"
+    assert LINE_BREAK in warnings(run(raw, environ={"STATS_KEY": value}))
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        {"kind": "header", "header": "X-API-Key", "format": "{secret}"},
+        {"kind": "header"},
+        {"kind": "query", "param": "key"},
+        {"kind": "path", "template": "/k/{secret}"},
+        {"kind": "basic", "username": "user"},
+    ],
+)
+def test_every_injected_secret_kind_warns_on_line_breaks(credential: Raw) -> None:
+    raw = oauth_policy({"c": {**credential, "secret": "env:C_KEY"}})
+    found = warnings(run(raw, environ={"C_KEY": "x\ny"}))
+    assert (
+        "credentials.c.secret: env var C_KEY has a line break, so an upstream's echo of it in "
+        "a stream can't be scrubbed"
+    ) in found
+
+
+def test_env_secrets_without_line_breaks(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["music-stats"]["secret"] = "env:STATS_KEY"
+    assert not any("line break" in w for w in warnings(run(raw, environ={"STATS_KEY": "a b"})))
+    # Without the environment, check can't know.
+    assert not any("line break" in w for w in warnings(run(raw)))
+
+
+def test_line_breaks_matter_only_for_injected_secrets(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["broker-mcp"]["client_id"] = "env:BROKER_ID"
+    raw["credentials"]["broker-mcp"]["refresh_token"] = "env:BROKER_SEED"
+    raw["connectors"]["mail-out"]["password"] = "env:MAIL_PASS"
+    environ = {"BROKER_ID": "a\nb", "BROKER_SEED": "a\nb", "MAIL_PASS": "a\nb"}
+    assert not any("line break" in w for w in warnings(run(raw, environ=environ)))
+
+
+def test_basic_usernames_from_env_are_injected_too() -> None:
+    raw = oauth_policy({"b": {"kind": "basic", "username": "env:B_USER", "secret": "store:b"}})
+    found = warnings(run(raw, environ={"B_USER": "x\ny"}))
+    assert (
+        "credentials.b.username: env var B_USER has a line break, so an upstream's echo of it in "
+        "a stream can't be scrubbed"
+    ) in found

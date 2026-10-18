@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import json
 import os
+import secrets
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -20,6 +22,7 @@ from ..common.policy import (
     parse_policy,
     read_source,
 )
+from ..common.policy.schema import hash_token
 from ..vault.admin import DEFAULT_SOCKET, SOCKET_ENV
 from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
 from ..vault.oauth.pkce import FLOW_TTL
@@ -29,6 +32,7 @@ EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_UNREADABLE = 2
 
+CLIENT_TOKEN_PREFIX = "zgc1-"  # noqa: S105 - a format marker, not a secret
 PASTE_PROMPT = "> "
 NOT_PERSISTED = (
     "kept in memory, not on disk; fix the state volume; zoeymcp oauth status shows when it is saved"
@@ -64,6 +68,16 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Print a new ZOEYMCP_MASTER_KEY and the matching generation-1 ZOEYMCP_GATEWAY_KEY. "
             "Set them as deployment secrets; nothing is written to disk."
+        ),
+    )
+
+    commands.add_parser(
+        "client-token",
+        help="print a new gateway client token and its token_sha256 for the policy",
+        description=(
+            "Print a new client token for an agent, and the token_sha256 line to put under "
+            "gateway.clients.<name> in the policy. The agent sends the token as "
+            "Authorization: Bearer; the policy holds only its hash. Nothing is written to disk."
         ),
     )
 
@@ -188,6 +202,23 @@ def _cmd_keygen(out: TextIO) -> int:
     keys = KeySet.from_text(master)
     out.write(f"{MASTER_KEY_ENV}={master}\n")
     out.write(f"ZOEYMCP_GATEWAY_KEY={keys.gateway_key(1)}\n")
+    return EXIT_OK
+
+
+def new_client_token() -> str:
+    """A new client token: the prefix and 32 random bytes in unpadded base64url (48 characters)."""
+    raw = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    return CLIENT_TOKEN_PREFIX + raw
+
+
+def _cmd_client_token(out: TextIO, err: TextIO) -> int:
+    token = new_client_token()
+    out.write(f"client_token: {token}\n")
+    out.write(f"token_sha256: {hash_token(token)}\n")
+    err.write(
+        "Give the agent the client token (Authorization: Bearer). Put only the token_sha256 "
+        "line in the policy, under gateway.clients.<name>.\n"
+    )
     return EXIT_OK
 
 
@@ -503,6 +534,8 @@ def main(
         return _cmd_check(args, stdin, out)
     if args.command == "keygen":
         return _cmd_keygen(out)
+    if args.command == "client-token":
+        return _cmd_client_token(out, err)
     if args.command == "vault":
         return _cmd_vault(args, err)
     if args.command == "selftest":

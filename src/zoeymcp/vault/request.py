@@ -1,5 +1,5 @@
-"""Request policy as pure functions: path normalization and matching, query and header policy,
-and response scrubbing (design §4.1, §4.2).
+"""Request policy as pure functions: path normalization, query and header policy, and response
+scrubbing (design §4.1, §4.2). Rule matching is in ``common/policy/match.py``.
 
 Nothing here does I/O, so every rule can be tested directly and exhaustively.
 """
@@ -10,11 +10,11 @@ import base64
 import json
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from urllib.parse import parse_qsl, quote, quote_plus, unquote_to_bytes, urlencode
 
-from ..common.policy.paths import SEGMENT_CHARS, PathPattern, parse_path_pattern
-from ..common.policy.schema import QueryPolicy, RegexParam, Rule
+from ..common.policy.match import NormalizedPath, rule_matches
+from ..common.policy.paths import SEGMENT_CHARS
+from ..common.policy.schema import QueryPolicy, Rule
 
 MAX_PATH_BYTES = 4096
 MAX_QUERY_BYTES = 8192
@@ -31,31 +31,6 @@ class RequestRejected(ValueError):
 
 
 # --- paths -------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class NormalizedPath:
-    segments: tuple[str, ...]
-    trailing_slash: bool = False
-
-    @property
-    def text(self) -> str:
-        """The decoded path, e.g. ``/2.0/user/``."""
-        body = "/".join(self.segments)
-        if not self.segments:
-            return "/"
-        return "/" + body + ("/" if self.trailing_slash else "")
-
-    def encoded(self) -> str:
-        """The path as sent upstream, each segment percent-encoded again."""
-        if not self.segments:
-            return "/"
-        body = "/".join(quote(s, safe="!$&'()*+,;=:@~-._") for s in self.segments)
-        return "/" + body + ("/" if self.trailing_slash else "")
-
-    def without_first(self) -> NormalizedPath:
-        rest = self.segments[1:]
-        return NormalizedPath(rest, self.trailing_slash if rest else False)
 
 
 def normalize_path(raw: bytes) -> NormalizedPath:
@@ -99,50 +74,6 @@ def normalize_path(raw: bytes) -> NormalizedPath:
             raise RequestRejected("path segment has characters that aren't allowed")
         segments.append(text)
     return NormalizedPath(tuple(segments), trailing)
-
-
-def match_pattern(pattern: PathPattern, path: NormalizedPath) -> dict[str, str] | None:
-    """Captures if ``pattern`` matches ``path``, else ``None``."""
-    captures: dict[str, str] = {}
-    segments = path.segments
-    for index, segment in enumerate(pattern.segments):
-        if segment.kind == "globstar":
-            return captures
-        if index >= len(segments):
-            return None
-        actual = segments[index]
-        if segment.kind == "literal":
-            if actual != segment.value:
-                return None
-        elif segment.kind == "capture":
-            captures[segment.value] = actual
-    if len(segments) != len(pattern.segments):
-        return None
-    if path.trailing_slash != pattern.trailing_slash:
-        return None
-    return captures
-
-
-def _param_allows(constraint: list[str] | RegexParam, value: str) -> bool:
-    if isinstance(constraint, RegexParam):
-        return re.fullmatch(constraint.regex, value) is not None
-    return value in constraint
-
-
-def rule_matches(rule: Rule, method: str, path: NormalizedPath) -> bool:
-    if method not in rule.methods:
-        return False
-    for source in rule.paths:
-        captures = match_pattern(parse_path_pattern(source), path)
-        if captures is None:
-            continue
-        if all(
-            _param_allows(rule.params[name], value)
-            for name, value in captures.items()
-            if name in rule.params
-        ):
-            return True
-    return False
 
 
 def find_rule(rules: Sequence[Rule], method: str, path: NormalizedPath) -> int | None:

@@ -74,9 +74,14 @@ routes:
         paths: [/send]
 
 gateway:
+  # Host header values the gateway answers to; IPv6 addresses go without brackets.
+  hosts: [localhost, 127.0.0.1, "::1", zoeymcp.tailnet.example]
+
   clients:
     agent1:
-      token: ph-agent1-gw-8e2d6a51c3b7
+      # From `zoeymcp client-token`: the agent sends the token as Authorization: Bearer,
+      # and the policy holds only its hash.
+      token_sha256: sha256:8ca973db011281c88e678afeb86d1955579aed24fd7deeae43155fe7aabb0f43
       servers: [broker-read, broker-trade, mail]
 
   approvals:
@@ -89,6 +94,7 @@ gateway:
       kind: remote
       route: broker-mcp
       path: /mcp
+      era: modern # written by `zoeymcp review`
       tools:
         include: [get_quote, list_positions]
         allow: [get_quote, list_positions]
@@ -108,6 +114,7 @@ gateway:
         cancel_order: sha256:26c3ac15931603b2f20397630050036633fd11d56ea08bd91e52895e92313ac7
       on_drift: fail
 
+    # Toolkits run from M4: until then check warns, and the gateway serves the other servers.
     mail:
       kind: toolkit
       module: my_toolkits.mail

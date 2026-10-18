@@ -8,13 +8,12 @@ import pytest
 
 from zoeymcp.common.canonical import JSONRejected, loads_strict, render_for_approval
 from zoeymcp.common.policy import Policy, check_policy
+from zoeymcp.common.policy.match import NormalizedPath, rule_matches
 from zoeymcp.common.policy.schema import Rule
 from zoeymcp.common.textrules import TextRuleError, check_text
 from zoeymcp.vault.request import (
-    NormalizedPath,
     filter_response_headers,
     normalize_path,
-    rule_matches,
     scrub,
     secret_variants,
 )

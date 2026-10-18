@@ -12,10 +12,12 @@ from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 from .findings import Finding
+from .match import NormalizedPath, path_matches
 from .paths import PathPatternError, parse_path_pattern
 from .schema import (
     BasicCredential,
     BridgeServer,
+    Gateway,
     HeaderCredential,
     OAuth2Credential,
     PathCredential,
@@ -24,6 +26,8 @@ from .schema import (
     QueryCredential,
     RemoteServer,
     Route,
+    Rule,
+    hash_token,
     is_secret_ref,
     param_values,
     split_scope,
@@ -174,6 +178,23 @@ def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, st
                 )
             else:
                 report.error(path, f"env var {var} is not set")
+        elif environ is not None and _injected(policy, path) and _has_line_break(environ[var]):
+            report.warning(
+                path,
+                f"env var {var} has a line break, so an upstream's echo of it in a stream "
+                "can't be scrubbed",
+            )
+
+
+def _injected(policy: Policy, path: str) -> bool:
+    """Whether the reference at ``path`` is a static secret the vault injects upstream."""
+    if not path.startswith("credentials."):
+        return False
+    return not isinstance(policy.credentials[path.split(".")[1]], OAuth2Credential)
+
+
+def _has_line_break(value: str) -> bool:
+    return "\n" in value or "\r" in value
 
 
 def _check_oauth_refs(policy: Policy, report: _Report) -> None:
@@ -516,18 +537,31 @@ def _check_tokens(policy: Policy, report: _Report) -> None:
         for c_index, caller in enumerate(route.callers):
             if isinstance(caller, PlaceholderCaller):
                 placeholders[caller.placeholder].append(f"routes[{index}].callers[{c_index}]")
+    # Clients are compared by hash, so a literal token matches another client's token_sha256.
     clients: dict[str, list[str]] = defaultdict(list)
+    literals: dict[str, list[str]] = defaultdict(list)
     if policy.gateway is not None:
         for name, client in policy.gateway.clients.items():
-            clients[client.token].append(f"gateway.clients.{name}.token")
+            if client.token is None:
+                clients[client.token_hash].append(f"gateway.clients.{name}.token_sha256")
+                continue
+            path = f"gateway.clients.{name}.token"
+            clients[client.token_hash].append(path)
+            literals[client.token].append(path)
+            report.warning(
+                path,
+                "anyone who reads the policy can act as this client; "
+                "use token_sha256 (zoeymcp client-token)",
+            )
 
-    for value, paths in [*placeholders.items(), *clients.items()]:
+    for value, paths in [*placeholders.items(), *literals.items()]:
         if len(value) < MIN_TOKEN_LENGTH:
             for p in paths:
                 report.warning(p, f"shorter than {MIN_TOKEN_LENGTH} characters, so easy to guess")
     for value, paths in placeholders.items():
-        if value in clients:
-            for p in paths + clients[value]:
+        digest = hash_token(value)
+        if digest in clients:
+            for p in paths + clients[digest]:
                 report.error(p, "the same value is used as a placeholder and a client token")
         elif len(paths) > 1:
             for p in paths:
@@ -541,6 +575,8 @@ def _check_tokens(policy: Policy, report: _Report) -> None:
 # --- gateway -----------------------------------------------------------------------------------
 
 _MCP_SERVER_PATH = re.compile(r"^/[A-Za-z0-9._~/-]*$")
+# The methods the gateway sends on an MCP server's path.
+_MCP_METHODS = ("POST", "GET", "DELETE")
 
 
 def _check_gateway(policy: Policy, report: _Report) -> None:
@@ -548,19 +584,26 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
     if gateway is None:
         return
     routes = {r.name: r for r in policy.routes}
-    for name, client in gateway.clients.items():
-        for server_name in client.servers:
-            if server_name not in gateway.servers:
-                report.error(f"gateway.clients.{name}.servers", f"unknown server {server_name!r}")
+    _check_clients(gateway, report)
+    assigned = {s for client in gateway.clients.values() for s in client.servers}
+    server_paths: dict[str, list[NormalizedPath]] = defaultdict(list)
+    for server in gateway.servers.values():
+        if isinstance(server, RemoteServer):
+            request_path = _request_path(server.path)
+            if request_path is not None:
+                server_paths[server.route].append(request_path)
     for name, server in gateway.servers.items():
         path = f"gateway.servers.{name}"
+        if name not in assigned:
+            report.warning(path, "not assigned to any client")
         if isinstance(server, RemoteServer):
             route = routes.get(server.route)
             if route is None:
                 report.error(f"{path}.route", f"unknown route {server.route!r}")
             else:
-                _check_mcp_route(path, server, route, report)
+                _check_mcp_route(path, server, route, server_paths[route.name], report)
         if isinstance(server, RemoteServer | BridgeServer):
+            _check_upstream_server(path, server, report)
             _check_tools(
                 path, server.tools.include, server.tools.allow, server.tools.approve, report
             )
@@ -574,18 +617,131 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
                 report,
                 require_classification=False,
             )
+    limits = gateway.limits
+    if limits.max_result_bytes > limits.max_upstream_message_bytes:
+        report.error(
+            "gateway.limits",
+            f"max_result_bytes ({limits.max_result_bytes}) is larger than "
+            f"max_upstream_message_bytes ({limits.max_upstream_message_bytes}), "
+            "so a result that size could never arrive",
+        )
 
 
-def _check_mcp_route(path: str, server: RemoteServer, route: Route, report: _Report) -> None:
-    if not _MCP_SERVER_PATH.match(server.path):
+def _check_clients(gateway: Gateway, report: _Report) -> None:
+    for name, client in gateway.clients.items():
+        path = f"gateway.clients.{name}.servers"
+        if not client.servers:
+            report.warning(path, "no servers: this client reaches nothing")
+        for server_name in client.servers:
+            server = gateway.servers.get(server_name)
+            if server is None:
+                report.error(path, f"unknown server {server_name!r}")
+            elif not isinstance(server, RemoteServer):
+                report.warning(
+                    path, f"{server_name!r} is a {server.kind} server: not served by this version"
+                )
+
+
+def _request_path(path: str) -> NormalizedPath | None:
+    """A gateway server's ``path`` as the vault matches it, or ``None`` if the vault refuses it."""
+    if not _MCP_SERVER_PATH.match(path):
+        return None
+    try:
+        # The pattern above leaves out '*' and braces, so every segment is a literal.
+        parsed = parse_path_pattern(path)
+    except PathPatternError:
+        return None
+    return NormalizedPath(tuple(s.value for s in parsed.segments), parsed.trailing_slash)
+
+
+def _reaches(rule: Rule, source: str, path: NormalizedPath) -> bool:
+    """Whether the vault lets ``source`` (one of ``rule``'s paths) reach ``path``."""
+    try:
+        return path_matches(rule, source, path)
+    except PathPatternError:
+        return False  # reported with the route's rules
+
+
+def _check_mcp_route(
+    path: str,
+    server: RemoteServer,
+    route: Route,
+    server_paths: list[NormalizedPath],
+    report: _Report,
+) -> None:
+    """``server_paths`` are the valid paths of every gateway server on ``route``."""
+    request_path = _request_path(server.path)
+    if request_path is None:
         report.error(f"{path}.path", "must be a plain absolute path")
     if route.connector is not None:
         report.error(f"{path}.route", "points at a connector route, not an upstream")
+        return
+    if route.upstream is not None and urlsplit(route.upstream).scheme == "http":
+        report.error(
+            f"{path}.route", f"route {route.name!r} uses plain http: MCP over cleartext is refused"
+        )
     if not route.stream:
-        report.warning(f"{path}.route", f"route {route.name!r} should set stream: true for MCP")
-    if not any("POST" in rule.methods and server.path in rule.paths for rule in route.rules):
-        report.warning(
+        report.error(f"{path}.route", f"route {route.name!r} must set stream: true for MCP")
+    if request_path is None:
+        return
+    # Rules match by pattern, exactly as the vault matches the gateway's requests.
+    allowed = {
+        method
+        for rule in route.rules
+        for source in rule.paths
+        if _reaches(rule, source, request_path)
+        for method in rule.methods
+    }
+    if "POST" not in allowed:
+        report.error(
             f"{path}.path", f"route {route.name!r} has no rule allowing POST {server.path}"
+        )
+    missing = [f"{m} {server.path}" for m in ("GET", "DELETE") if m not in allowed]
+    if missing:
+        report.warning(
+            f"{path}.path",
+            f"route {route.name!r} has no rule allowing {' or '.join(missing)}: legacy servers "
+            "use GET for notifications and DELETE to end a session",
+        )
+    unused: list[str] = []
+    broad: list[str] = []
+    for rule in route.rules:
+        for source in rule.paths:
+            used = any(_reaches(rule, source, p) for p in server_paths)
+            # _reaches has parsed a used source. A pattern reaches more than the gateway's paths.
+            pattern = used and any(s.kind != "literal" for s in parse_path_pattern(source).segments)
+            for method in rule.methods:
+                entry = f"{method} {source}"
+                if method not in _MCP_METHODS or not used:
+                    if entry not in unused:
+                        unused.append(entry)
+                elif pattern and entry not in broad:
+                    broad.append(entry)
+    if unused:
+        report.warning(
+            f"{path}.route",
+            f"route {route.name!r} also allows {', '.join(unused)}; the gateway never uses them",
+        )
+    if broad:
+        report.warning(
+            f"{path}.route",
+            f"route {route.name!r} allows {', '.join(broad)} by pattern; the gateway only uses "
+            "its servers' exact paths, so list those instead",
+        )
+
+
+def _check_upstream_server(path: str, server: RemoteServer | BridgeServer, report: _Report) -> None:
+    if server.enable:
+        report.error(
+            f"{path}.enable",
+            "resources, prompts, completions, sampling, elicitation and roots can't be enabled "
+            "yet; M3 serves tools only",
+        )
+    if server.shared_session:
+        report.warning(
+            f"{path}.shared_session",
+            "legacy servers only: every client shares one upstream session, so server-side "
+            "state leaks between agents",
         )
 
 
@@ -601,6 +757,12 @@ def _check_tools(
     included = set(include)
     if len(included) != len(include):
         report.warning(f"{path}.tools.include", "a tool is listed more than once")
+    by_case: dict[str, list[str]] = defaultdict(list)
+    for tool in sorted(included):
+        by_case[tool.casefold()].append(tool)
+    for names in by_case.values():
+        if len(names) > 1:
+            report.error(f"{path}.tools", f"{', '.join(map(repr, names))} differ only in case")
     for tool in sorted(set(allow) & set(approve)):
         report.error(f"{path}.tools", f"{tool!r} is in both allow and approve")
     for tool in sorted((set(allow) | set(approve)) - included):

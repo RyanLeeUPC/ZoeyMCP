@@ -10,6 +10,7 @@ bound to the gateway, every included tool classified, ...) are in :mod:`.check`.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 from email.utils import parseaddr
@@ -44,6 +45,7 @@ SecretRef = Annotated[str, StringConstraints(pattern=SECRET_REF_PATTERN)]
 Token = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._~-]{1,256}$")]
 ToolName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
 Pin = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
+TokenHash = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 HeaderName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9-]{1,64}$")]
 QueryParam = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
 CaptureName = Annotated[str, StringConstraints(pattern=r"^[a-z_][a-z0-9_]{0,31}$")]
@@ -54,11 +56,18 @@ ParamText = Annotated[str, Field(max_length=2048)]
 ParamValue = ParamText | Annotated[list[ParamText], Field(min_length=1, max_length=10)]
 ClientAuth = Literal["basic", "post", "none"]
 Method = Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-Capability = Literal["resources", "prompts", "sampling", "elicitation", "roots"]
+Capability = Literal["resources", "prompts", "completions", "sampling", "elicitation", "roots"]
+_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 def is_secret_ref(value: str) -> bool:
     return bool(_SECRET_REF.match(value))
+
+
+def hash_token(token: str) -> str:
+    """The ``token_sha256`` form of a client token: ``sha256:`` and the hex SHA-256 of its UTF-8
+    bytes. Tokens are long and random, so no slow hash is needed."""
+    return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
 def _no_line_breaks(value: str) -> str:
@@ -159,6 +168,31 @@ def _check_hostname(value: str) -> str:
             ipaddress.ip_address(value)
         except ValueError as exc:
             raise ValueError(f"invalid host name {value!r}") from exc
+    return value
+
+
+def _check_gateway_host(value: str) -> str:
+    if value.startswith("["):
+        raise ValueError(f"write IPv6 addresses without brackets: {value!r}")
+    return _check_hostname(value)
+
+
+def _check_origin(value: str) -> str:
+    """An origin as browsers send it: ``scheme://host[:port]``, in lower case, with no path and
+    no default port."""
+    _check_url(value, schemes=("http", "https"), allow_path=False)
+    if value != value.lower():
+        raise ValueError("write origins in lower case, as browsers send them")
+    parts = urlsplit(value)
+    host = parts.hostname or ""
+    _check_hostname(host)
+    expected = f"{parts.scheme}://{f'[{host}]' if ':' in host else host}"
+    if parts.port is not None:
+        expected += f":{parts.port}"
+    if value != expected:
+        raise ValueError("an origin is scheme://host[:port], with no path, not even '/'")
+    if parts.port == _DEFAULT_PORTS[parts.scheme]:
+        raise ValueError(f"leave out the default port {parts.port}; browsers do")
     return value
 
 
@@ -472,7 +506,11 @@ class Route(_Model):
 
 
 class Client(_Model):
-    token: Token
+    """An agent. Its token is written as a hash (``zoeymcp client-token``), or literally, which
+    ``check`` warns about. Source pins see the direct peer only, never ``X-Forwarded-For``."""
+
+    token: Token | None = None
+    token_sha256: TokenHash | None = None
     servers: list[Name] = []
     sources: list[Network] = []
 
@@ -482,6 +520,20 @@ class Client(_Model):
         for source in value:
             _check_network(source)
         return value
+
+    @model_validator(mode="after")
+    def _one_token(self) -> Client:
+        if (self.token is None) == (self.token_sha256 is None):
+            raise ValueError("set exactly one of token and token_sha256")
+        return self
+
+    @property
+    def token_hash(self) -> str:
+        """The token's ``token_sha256`` form, however it was written."""
+        if self.token is not None:
+            return hash_token(self.token)
+        assert self.token_sha256 is not None  # noqa: S101 - guaranteed by _one_token
+        return self.token_sha256
 
 
 class Approvals(_Model):
@@ -498,11 +550,16 @@ class Tools(_Model):
 
 class _UpstreamServer(_Model):
     tools: Tools = Tools()
+    # "sha256:<hex>" is pin projection v1.
     review: dict[ToolName, Pin] = {}
     on_drift: Literal["hide", "fail"] = "hide"
-    shared_session: bool = False
+    shared_session: bool = False  # legacy upstreams only
     wrap_results: bool = False
-    enable: list[Capability] = []
+    enable: list[Capability] = []  # check refuses a non-empty list: tools only for now
+    # An assertion about the protocol era the upstream speaks, not a transport mode.
+    era: Literal["auto", "modern", "legacy"] = "auto"
+    drift_check_interval: Annotated[int, Field(ge=60, le=86400)] = 300
+    call_timeout: Annotated[int, Field(ge=1, le=3600)] | None = None  # overrides limits
 
 
 class RemoteServer(_UpstreamServer):
@@ -538,10 +595,56 @@ class ToolkitServer(_Model):
 Server = Annotated[RemoteServer | BridgeServer | ToolkitServer, Field(discriminator="kind")]
 
 
+class GatewayLimits(_Model):
+    """Sizes in bytes, times in seconds."""
+
+    max_request_bytes: Annotated[int, Field(ge=4096, le=16 * 2**20)] = 2**20
+    max_argument_bytes: Annotated[int, Field(ge=1024, le=4 * 2**20)] = 256 * 1024
+    max_result_bytes: Annotated[int, Field(ge=65536, le=16 * 2**20)] = 4 * 2**20
+    max_upstream_message_bytes: Annotated[int, Field(ge=65536, le=16 * 2**20)] = 8 * 2**20
+    max_concurrent_per_client: Annotated[int, Field(ge=1, le=64)] = 8
+    max_streams_per_client: Annotated[int, Field(ge=1, le=64)] = 4
+    max_sessions_per_client: Annotated[int, Field(ge=1, le=256)] = 16
+    max_upstream_sessions: Annotated[int, Field(ge=1, le=1024)] = 64
+    session_idle_timeout: Annotated[int, Field(ge=60, le=86400)] = 1800
+    upstream_idle_timeout: Annotated[int, Field(ge=30, le=86400)] = 600
+    call_timeout: Annotated[int, Field(ge=1, le=3600)] = 300
+    list_timeout: Annotated[int, Field(ge=1, le=300)] = 30
+    max_list_pages: Annotated[int, Field(ge=1, le=1000)] = 32
+    max_tools_per_server: Annotated[int, Field(ge=1, le=10000)] = 512
+    max_list_bytes: Annotated[int, Field(ge=65536, le=64 * 2**20)] = 4 * 2**20
+    max_schema_bytes: Annotated[int, Field(ge=1024, le=2**20)] = 64 * 1024
+    max_schema_depth: Annotated[int, Field(ge=4, le=128)] = 32
+    max_subschemas: Annotated[int, Field(ge=16, le=10000)] = 512
+    policy_max_stale: Annotated[int, Field(ge=30, le=3600)] = 300
+
+
+Origin = Annotated[str, Field(min_length=8, max_length=300)]
+
+
 class Gateway(_Model):
     clients: dict[Name, Client] = {}
     approvals: Approvals = Approvals()
     servers: dict[Name, Server] = {}
+    # Host header values the gateway answers to, without the port.
+    hosts: Annotated[list[str], Field(min_length=1)] = ["localhost", "127.0.0.1", "::1"]
+    # A request without Origin is fine; one with an Origin must name one of these.
+    origins: list[Origin] = []
+    limits: GatewayLimits = GatewayLimits()
+
+    @field_validator("hosts")
+    @classmethod
+    def _valid_hosts(cls, value: list[str]) -> list[str]:
+        for host in value:
+            _check_gateway_host(host)
+        return value
+
+    @field_validator("origins")
+    @classmethod
+    def _valid_origins(cls, value: list[str]) -> list[str]:
+        for origin in value:
+            _check_origin(origin)
+        return value
 
 
 # --- document ----------------------------------------------------------------------------------

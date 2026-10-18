@@ -90,6 +90,7 @@ only_mutate = [
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/policy/check.py",
+    "*zoeymcp/common/policy/match.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene test checks the repository itself, which mutmut only partly copies.

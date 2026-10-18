@@ -20,6 +20,7 @@ from zoeymcp.cli.main import (
     duration,
     format_status,
     main,
+    new_client_token,
 )
 
 from .conftest import EXAMPLE_POLICY
@@ -34,20 +35,20 @@ def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
 def test_check_example_file() -> None:
     code, out = run(["check", "--config", str(EXAMPLE_POLICY)])
     assert code == EXIT_OK
-    assert out.strip().endswith("ok (0 error(s), 1 warning(s))")
+    assert out.strip().endswith("ok (0 error(s), 2 warning(s))")
 
 
 def test_check_from_stdin(example_text: str) -> None:
     code, out = run(["check", "--config", "-"], stdin=example_text)
     assert code == EXIT_OK
-    assert out.splitlines()[-1] == "<stdin>: ok (0 error(s), 1 warning(s))"
+    assert out.splitlines()[-1] == "<stdin>: ok (0 error(s), 2 warning(s))"
 
 
 def test_check_from_env(example_text: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZOEYMCP_CONFIG", example_text)
     code, out = run(["check"])
     assert code == EXIT_OK
-    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 1 warning(s))"
+    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 2 warning(s))"
 
 
 def test_check_reports_errors_as_json(example_text: str) -> None:
@@ -110,6 +111,46 @@ def test_keygen_prints_a_matching_pair() -> None:
         KeySet.from_text(lines["ZOEYMCP_MASTER_KEY"]).gateway_key(1) == lines["ZOEYMCP_GATEWAY_KEY"]
     )
     assert run(["keygen"])[1] != out
+
+
+def test_client_token_prints_a_token_and_its_hash() -> None:
+    import hashlib
+
+    out, err = io.StringIO(), io.StringIO()
+    assert main(["client-token"], out=out, err=err) == EXIT_OK
+    lines = dict(line.split(": ", 1) for line in out.getvalue().splitlines())
+    assert list(lines) == ["client_token", "token_sha256"]
+    token = lines["client_token"]
+    assert re.fullmatch(r"zgc1-[A-Za-z0-9_-]{43}", token)
+    assert len(token) == 48
+    assert lines["token_sha256"] == "sha256:" + hashlib.sha256(token.encode()).hexdigest()
+    assert token not in err.getvalue()
+    assert "token_sha256" in err.getvalue()
+    assert run(["client-token"])[1] != out.getvalue()
+
+
+def test_a_client_token_passes_the_policy_schema(example_text: str) -> None:
+    out = io.StringIO()
+    main(["client-token"], out=out, err=io.StringIO())
+    lines = dict(line.split(": ", 1) for line in out.getvalue().splitlines())
+    pattern = r"token_sha256: \S+"
+    hashed, count = re.subn(pattern, f"token_sha256: {lines['token_sha256']}", example_text)
+    assert count == 1
+    assert f"token_sha256: {lines['token_sha256']}" in hashed
+    assert run(["check", "--config", "-"], stdin=hashed)[0] == EXIT_OK
+    literal, count = re.subn(pattern, f"token: {lines['client_token']}", example_text)
+    assert count == 1
+    code, report = run(["check", "--config", "-"], stdin=literal)
+    assert code == EXIT_OK
+    assert "gateway.clients.agent1.token: anyone who reads the policy" in report
+    assert "easy to guess" not in report
+
+
+def test_new_client_tokens_are_random(monkeypatch: pytest.MonkeyPatch) -> None:
+    import secrets
+
+    monkeypatch.setattr(secrets, "token_bytes", lambda n: bytes(range(n)))
+    assert new_client_token() == "zgc1-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 
 
 @pytest.mark.parametrize(

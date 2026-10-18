@@ -323,7 +323,7 @@ def test_mcp_route_needs_post_on_the_server_path_itself() -> None:
         ]
 
     assert (
-        "warning gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing "
+        "error gateway.servers.broker-read.path: route 'broker-mcp' has no rule allowing "
         "POST /mcp" in _findings(mutate)
     )
 

@@ -7,23 +7,21 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from zoeymcp.common.policy.match import NormalizedPath, match_pattern, rule_matches
 from zoeymcp.common.policy.paths import parse_path_pattern
 from zoeymcp.common.policy.schema import QueryPolicy, RegexParam, Rule
 from zoeymcp.vault.request import (
     REDACTED,
-    NormalizedPath,
     RequestRejected,
     apply_query_policy,
     encode_query,
     filter_request_headers,
     filter_response_headers,
     find_rule,
-    match_pattern,
     normalize_path,
     oauth_basic_credentials,
     oauth_client_variants,
     parse_query,
-    rule_matches,
     scrub,
     scrub_headers,
     secret_variants,
