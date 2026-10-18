@@ -127,6 +127,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="read HUP and TERM lines from this pipe; its end stops the vault (the launcher's)",
     )
 
+    gateway = commands.add_parser(
+        "gateway",
+        help="run the gateway",
+        description=(
+            "Run the gateway: the MCP server agents connect to. It holds no secret: everything "
+            "upstream goes through the vault, which serves it its view of the policy."
+        ),
+    )
+    gateway.add_argument(
+        "--vault",
+        required=True,
+        metavar="LINK",
+        help=(
+            "unix:<socket> (the standard tier's link) or http://host:port (the hardened tier's, "
+            "with ZOEYMCP_GATEWAY_KEY or ZOEYMCP_GATEWAY_KEY_FILE)"
+        ),
+    )
+    gateway.add_argument(
+        "--listen", default="0.0.0.0:8090", metavar="HOST:PORT", help="default 0.0.0.0:8090"
+    )
+    gateway.add_argument("--state", default="/state-gateway", metavar="DIR", help="state directory")
+    gateway.add_argument(
+        "--admin-socket",
+        default="/run/zoeymcp-gateway/admin.sock",
+        metavar="PATH",
+        help="admin Unix socket (GET /status); 'none' disables it",
+    )
+    gateway.add_argument(
+        "--allow-root", action="store_true", help="run as root anyway (development only)"
+    )
+    gateway.add_argument(
+        "--control-fd",
+        type=int,
+        metavar="FD",
+        help="read HUP and TERM lines from this pipe; its end stops the gateway (the launcher's)",
+    )
+
     secret = commands.add_parser(
         "secret",
         help="set, list or delete secrets in a running vault (run inside the vault container)",
@@ -243,6 +280,27 @@ def _cmd_vault(args: argparse.Namespace, out: TextIO) -> int:
         )
     except StartupError as exc:
         out.write(f"zoeymcp vault: {exc}\n")
+        return EXIT_UNREADABLE
+    return EXIT_OK
+
+
+def _cmd_gateway(args: argparse.Namespace, out: TextIO) -> int:
+    # Imported here: only the gateway's environment has its packages.
+    from ..gateway.server import Options, StartupError, run
+
+    admin_socket = None if args.admin_socket == "none" else Path(args.admin_socket)
+    options = Options(
+        vault=args.vault,
+        listen=args.listen,
+        state=Path(args.state),
+        admin_socket=admin_socket,
+        allow_root=args.allow_root,
+        control_fd=args.control_fd,
+    )
+    try:
+        run(options, os.environ)
+    except StartupError as exc:
+        out.write(f"zoeymcp gateway: {exc}\n")
         return EXIT_UNREADABLE
     return EXIT_OK
 
@@ -637,6 +695,8 @@ def main(
         return _cmd_client_token(out, err)
     if args.command == "vault":
         return _cmd_vault(args, err)
+    if args.command == "gateway":
+        return _cmd_gateway(args, err)
     if args.command == "selftest":
         return _cmd_selftest(args, stdin, out)
     if args.command in ("secret", "setup-code", "gateway-key"):

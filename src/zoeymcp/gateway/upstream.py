@@ -177,7 +177,8 @@ class Connection:
         old, self.state = self.state, state
         self.changed.set()
         self.changed = anyio.Event()
-        if state.version != old.version:
+        # The first listing creates the view rather than changing it: nobody has seen another.
+        if state.version != old.version and old.version > 0:
             self.pool.view_changed(self)
 
     def idle(self, now: float, timeout: float) -> bool:
@@ -520,7 +521,7 @@ class Connection:
         if isinstance(exc, MCPError):
             if self._expired:
                 return _SessionExpired()
-            if exc.error.code == mcp_types.CONNECTION_CLOSED:
+            if _sdk_closed(exc):
                 return UpstreamError("connection_lost")
             logs.event(
                 "upstream_error",
@@ -549,6 +550,20 @@ def _progress_relay(sink: Progress | None, clock: Callable[[], float]) -> Progre
         await sink(progress, total)
 
     return relay
+
+
+def _sdk_closed(error: MCPError) -> bool:
+    """The SDK's own "connection closed", not an upstream error that uses the same code.
+
+    ``CONNECTION_CLOSED`` is -32000, the first implementation-defined server error code, which
+    upstreams use for anything. An upstream that also copies the message only gets the more
+    cautious "may or may not have run".
+    """
+    return (
+        error.error.code == mcp_types.CONNECTION_CLOSED
+        and error.error.message == "Connection closed"
+        and error.error.data is None
+    )
 
 
 def _leaf(error: BaseException) -> BaseException:
@@ -706,13 +721,21 @@ class UpstreamPool:
         tool: str,
         arguments: dict[str, Any],
         *,
+        pin: str | None = None,
         progress: Progress | None = None,
     ) -> CallToolResult:
         """Admit and call. A legacy session that expired is re-opened and the call retried once,
-        if the tool is still admitted with the same pin."""
+        if the tool is still admitted with the same pin.
+
+        ``pin`` is the one the arguments were validated under: if the tool is admitted under
+        another one now, nothing is sent.
+        """
         timeout = float(policy.call_timeout or self.limits.call_timeout)
         connection = self.connection(server, policy, client)
-        pin = await self.admit(connection, tool)
+        admitted = await self.admit(connection, tool)
+        if pin is not None and admitted != pin:
+            raise NotAdmitted("pin changed after validation")
+        pin = admitted
         try:
             return await connection.call(tool, arguments, timeout=timeout, progress=progress)
         except _SessionExpired:

@@ -83,15 +83,15 @@ def test_the_size_cap_is_canonical_bytes() -> None:
 
 def test_the_depth_cap() -> None:
     schema = obj(properties={"a": {"properties": {"b": {}}}})  # 5 levels
-    assert schemas._depth(schema) == 5
+    assert schemas.depth(schema) == 5
     assert problems(schema, max_schema_depth=5) == []
     assert problems(schema, max_schema_depth=4) == [("", "schema_too_deep")]
 
 
 def test_depth_counts_arrays_and_scalars() -> None:
-    assert schemas._depth(1) == 0
-    assert schemas._depth({}) == 1
-    assert schemas._depth([[], {"a": [1]}]) == 3
+    assert schemas.depth(1) == 0
+    assert schemas.depth({}) == 1
+    assert schemas.depth([[], {"a": [1]}]) == 3
 
 
 def test_the_subschema_cap() -> None:

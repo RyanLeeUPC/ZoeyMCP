@@ -339,6 +339,13 @@ class ClientCounters:
             self.streams[client] = self.streams.get(client, 0) + 1
         return True
 
+    def try_add_stream(self, client: str, *, max_streams: int) -> bool:
+        """A request already counted turned out to be a long-lived stream."""
+        if self.streams.get(client, 0) >= max_streams:
+            return False
+        self.streams[client] = self.streams.get(client, 0) + 1
+        return True
+
     def release(self, client: str, *, stream: bool) -> None:
         self.requests[client] = max(0, self.requests.get(client, 0) - 1)
         if stream:

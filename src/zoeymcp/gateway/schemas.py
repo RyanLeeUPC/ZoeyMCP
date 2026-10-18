@@ -155,7 +155,7 @@ def _positions(root: dict[str, Any]) -> Iterator[_Position]:
         stack.extend(reversed(children))
 
 
-def _depth(value: Any) -> int:
+def depth(value: Any) -> int:
     """How deeply objects and arrays nest in ``value`` (a scalar is 0, ``{}`` is 1)."""
     deepest = 0
     stack: list[tuple[Any, int]] = [(value, 1)]
@@ -302,12 +302,12 @@ def schema_problems(schema: Any, *, role: Role, limits: GatewayLimits) -> list[S
             *problems,
             SchemaProblem("", "schema_too_large", f"{size} bytes, limit {limits.max_schema_bytes}"),
         ]
-    depth = _depth(schema)
-    if depth > limits.max_schema_depth:
+    nesting = depth(schema)
+    if nesting > limits.max_schema_depth:
         return [
             *problems,
             SchemaProblem(
-                "", "schema_too_deep", f"nested {depth} levels, limit {limits.max_schema_depth}"
+                "", "schema_too_deep", f"nested {nesting} levels, limit {limits.max_schema_depth}"
             ),
         ]
     positions = list(_positions(schema))

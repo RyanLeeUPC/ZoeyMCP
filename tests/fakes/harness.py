@@ -22,11 +22,12 @@ class _ThreadServer(uvicorn.Server):
 
 
 @contextmanager
-def serve(app: ASGIApp, *, lifespan: bool = False) -> Iterator[str]:
+def serve(app: ASGIApp, *, lifespan: bool = False, proxy_headers: bool = True) -> Iterator[str]:
     """Serve ``app`` on ``127.0.0.1`` and yield its base URL, e.g. ``http://127.0.0.1:53817``.
 
     ``lifespan`` runs the app's ASGI lifespan (the fake MCP server needs it). Responses still
-    open at the end are cut after ``SHUTDOWN_GRACE`` seconds.
+    open at the end are cut after ``SHUTDOWN_GRACE`` seconds. ``proxy_headers=False`` is how
+    the gateway runs: uvicorn's default trusts ``X-Forwarded-For`` from loopback.
     """
     config = uvicorn.Config(
         app,
@@ -34,6 +35,7 @@ def serve(app: ASGIApp, *, lifespan: bool = False) -> Iterator[str]:
         port=0,
         log_level="warning",
         lifespan="on" if lifespan else "off",
+        proxy_headers=proxy_headers,
         timeout_graceful_shutdown=SHUTDOWN_GRACE,
     )
     server = _ThreadServer(config)

@@ -60,7 +60,8 @@ class PolicyClient:
         self.snapshot: Snapshot | None = None
         self.last_contact: float | None = None
         self._failures = 0
-        self._wake = anyio.Event()
+        # Made in run(): an anyio event needs the loop it will be used on.
+        self._wake: anyio.Event | None = None
         self._stale_reported = False
 
     # --- freshness ------------------------------------------------------------------------
@@ -87,7 +88,8 @@ class PolicyClient:
 
     def refresh(self) -> None:
         """Fetch now (SIGHUP, the control pipe's HUP)."""
-        self._wake.set()
+        if self._wake is not None:
+            self._wake.set()
 
     async def fetch_once(self, wait: int | None = None) -> bool:
         """One request. Returns whether it was contact (a 200 with a usable view, or a 304)."""
@@ -135,6 +137,7 @@ class PolicyClient:
 
     async def run(self) -> None:
         """Fetch for ever: long polls while things work, backoff while they don't."""
+        self._wake = anyio.Event()
         while True:
             if await self.fetch_once():
                 if self._wake.is_set():

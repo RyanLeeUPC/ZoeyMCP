@@ -456,6 +456,19 @@ def test_streams_count_as_requests_and_streams() -> None:
     assert counters.try_acquire("alpha", stream=True, max_requests=3, max_streams=1)
 
 
+def test_a_counted_request_can_become_a_stream() -> None:
+    counters = ClientCounters()
+    assert counters.try_acquire("alpha", stream=False, max_requests=3, max_streams=1)
+    assert counters.try_add_stream("alpha", max_streams=1)
+    assert counters.streams["alpha"] == 1
+    assert counters.requests["alpha"] == 1
+    assert counters.try_acquire("alpha", stream=False, max_requests=3, max_streams=1)
+    assert not counters.try_add_stream("alpha", max_streams=1)
+    assert counters.streams["alpha"] == 1
+    counters.release("alpha", stream=True)
+    assert counters.streams["alpha"] == 0
+
+
 def test_release_never_goes_below_zero() -> None:
     counters = ClientCounters()
     counters.release("alpha", stream=True)

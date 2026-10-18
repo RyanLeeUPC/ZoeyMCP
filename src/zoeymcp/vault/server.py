@@ -27,6 +27,11 @@ from pathlib import Path
 import uvicorn
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from ..common import control as control_pipe
+from ..common.control import CONTROL_LINE_LIMIT as CONTROL_LINE_LIMIT
+from ..common.control import CONTROL_RELOAD as CONTROL_RELOAD
+from ..common.control import CONTROL_STOP as CONTROL_STOP
+from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
 from . import logs
 from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
@@ -43,9 +48,6 @@ LOCK_FILE = "vault.lock"
 # How often the timer retires an expired previous gateway key, in seconds.
 GATEWAY_KEY_TICK = 5.0
 # The launcher's control pipe: one command per line.
-CONTROL_RELOAD = b"HUP"
-CONTROL_STOP = b"TERM"
-CONTROL_LINE_LIMIT = 1024
 
 
 class StartupError(Exception):
@@ -343,50 +345,12 @@ async def gateway_key_timer(gateway_keys: GatewayKeys, interval: float) -> None:
         gateway_keys.tick()
 
 
-async def open_control(fd: int) -> tuple[asyncio.StreamReader, asyncio.BaseTransport]:
-    """Read the control pipe ``fd`` without blocking the loop. The transport owns ``fd``."""
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader(limit=CONTROL_LINE_LIMIT)
-    transport, _ = await loop.connect_read_pipe(
-        lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(fd, "rb", buffering=0)
-    )
-    return reader, transport
-
-
 async def read_control(
     reader: asyncio.StreamReader, *, reload: Callable[[], None], stop: Callable[[], None]
 ) -> None:
-    """Act on the launcher's commands: ``HUP`` reloads, ``TERM`` stops (M3 design B.2).
-
-    The end of the pipe stops the vault too: the launcher is gone, and nothing would stop the
-    vault any more. So does an error reading it. Anything else is logged by size and ignored.
-
-    A line over :data:`CONTROL_LINE_LIMIT` is dropped up to the limit, and what follows it is
-    read as the next line. Only the launcher holds the pipe, and it writes short lines.
-    """
-    while True:
-        try:
-            line = await reader.readline()
-        except ValueError:
-            logs.event("control_ignored", bytes=CONTROL_LINE_LIMIT)
-            continue
-        except OSError as exc:
-            logs.event("control_failed", error_type=type(exc).__name__)
-            stop()
-            return
-        if not line:
-            logs.event("control_received", command="EOF")
-            stop()
-            return
-        command = line.strip()
-        if command == CONTROL_RELOAD:
-            logs.event("control_received", command="HUP")
-            reload()
-        elif command == CONTROL_STOP:
-            logs.event("control_received", command="TERM")
-            stop()
-        else:
-            logs.event("control_ignored", bytes=len(line))
+    """Act on the launcher's commands (:func:`zoeymcp.common.control.read_control`), logging as
+    the vault."""
+    await control_pipe.read_control(reader, reload=reload, stop=stop, event=logs.event)
 
 
 def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str]) -> None:

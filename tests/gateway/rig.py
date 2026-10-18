@@ -18,6 +18,9 @@ from typing import Any
 
 import anyio
 import httpx
+import httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
 
 from tests.fakes.harness import serve
@@ -26,11 +29,12 @@ from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import GatewayView, ViewRemoteServer, build_view
 from zoeymcp.gateway import logs
+from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import project_and_pin
 from zoeymcp.gateway.upstream import UpstreamPool
-from zoeymcp.gateway.vaultlink import KeySource, parse_link
+from zoeymcp.gateway.vaultlink import KeySource, parse_link, view_client
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet
@@ -59,7 +63,50 @@ def raw_policy(
     limits: dict[str, Any] | None = None,
     clients: tuple[str, ...] = CLIENTS,
     path: str = "/mcp",
+    approve: list[str] | None = None,
+    wrap_results: bool = False,
+    sources: dict[str, list[str]] | None = None,
+    servers: dict[str, Any] | None = None,
+    assigned: dict[str, list[str]] | None = None,
+    hosts: list[str] | None = None,
+    origins: list[str] | None = None,
 ) -> dict[str, Any]:
+    """The rig's policy. ``servers`` adds gateway servers; ``assigned`` overrides a client's
+    server list (each client gets ``[SERVER]`` otherwise)."""
+    approve = approve or []
+    gateway: dict[str, Any] = {
+        "limits": limits or {},
+        "clients": {
+            name: {
+                "token_sha256": hash_token(f"zgc1-{name}-token"),
+                "servers": (assigned or {}).get(name, [SERVER]),
+                "sources": (sources or {}).get(name, []),
+            }
+            for name in clients
+        },
+        "servers": {
+            SERVER: {
+                "kind": "remote",
+                "route": "notes",
+                "path": path,
+                "era": era,
+                "on_drift": on_drift,
+                "shared_session": shared_session,
+                "wrap_results": wrap_results,
+                "tools": {
+                    "include": include,
+                    "allow": [name for name in include if name not in approve],
+                    "approve": approve,
+                },
+                "review": review,
+            },
+            **(servers or {}),
+        },
+    }
+    if hosts is not None:
+        gateway["hosts"] = hosts
+    if origins is not None:
+        gateway["origins"] = origins
     return {
         "version": 1,
         "mode": "declarative",
@@ -78,25 +125,7 @@ def raw_policy(
                 "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": [path]}],
             }
         ],
-        "gateway": {
-            "limits": limits or {},
-            "clients": {
-                name: {"token_sha256": hash_token(f"zgc1-{name}-token"), "servers": [SERVER]}
-                for name in clients
-            },
-            "servers": {
-                SERVER: {
-                    "kind": "remote",
-                    "route": "notes",
-                    "path": path,
-                    "era": era,
-                    "on_drift": on_drift,
-                    "shared_session": shared_session,
-                    "tools": {"include": include, "allow": include},
-                    "review": review,
-                }
-            },
-        },
+        "gateway": gateway,
     }
 
 
@@ -194,3 +223,59 @@ class Clock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+# --- the whole gateway ---------------------------------------------------------------------------
+
+
+def token_for(client: str) -> str:
+    """The token whose hash ``raw_policy`` gives each client."""
+    return f"zgc1-{client}-token"
+
+
+@dataclass
+class Running:
+    app: GatewayApp
+    url: str  # the gateway's base URL
+
+    def mcp(self, server: str = SERVER) -> str:
+        return f"{self.url}/s/{server}/mcp"
+
+
+@contextmanager
+def gateway(deployed: Deployed, *, policy_wait: int = 1) -> Iterator[Running]:
+    """The gateway app on a uvicorn thread, on the deployment's vault, once it is ready."""
+    pool = UpstreamPool(
+        parse_link(deployed.vault_url),
+        KeySource(KEYS.gateway_key(1)),
+        DriftMarks.load(deployed.state),
+        DefinitionStore(deployed.state),
+        limits=deployed.view.gateway.limits,
+    )
+    http = view_client(parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1)))
+    app = GatewayApp(pool, http, policy_wait=policy_wait)
+    with serve(app, lifespan=True, proxy_headers=False) as url:
+        deadline = time.monotonic() + 10
+        while httpx.get(f"{url}/healthz", timeout=5).status_code != 200:
+            if time.monotonic() > deadline:
+                raise RuntimeError("the gateway didn't become ready")
+            time.sleep(0.05)
+        yield Running(app, url)
+
+
+@asynccontextmanager
+async def agent(
+    running: Running,
+    client: str = CLIENTS[0],
+    mode: str = "auto",
+    *,
+    server: str = SERVER,
+    headers: dict[str, str] | None = None,
+    **options: Any,
+) -> AsyncIterator[Client]:
+    """An SDK client as an agent uses it, with the client's bearer token."""
+    headers = {"authorization": f"Bearer {token_for(client)}", **(headers or {})}
+    async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0)) as http:
+        transport = streamable_http_client(running.mcp(server), http_client=http)
+        async with Client(transport, mode=mode, cache=None, **options) as connected:
+            yield connected
