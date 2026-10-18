@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -42,6 +43,8 @@ MEDIA_TYPES = frozenset(
         "audio/ogg",
     }
 )
+
+_BASE64 = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 
 Outcome = Literal[
     "rpc_error",
@@ -97,6 +100,10 @@ def _was_revealed(original: str, cleaned: str) -> bool:
 
 
 def valid_base64(data: str) -> bool:
+    """Standard base64, padded, with nothing else: checked here, since how strict
+    ``b64decode(validate=True)`` is about padding differs between Python releases."""
+    if _BASE64.fullmatch(data) is None:
+        return False
     try:
         base64.b64decode(data, validate=True)
     except (binascii.Error, ValueError):

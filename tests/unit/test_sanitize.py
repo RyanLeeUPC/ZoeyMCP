@@ -159,7 +159,10 @@ def test_an_image_type_on_an_audio_block_is_omitted() -> None:
     assert texts(result) == ["[audio omitted by the gateway]"]
 
 
-@pytest.mark.parametrize("data", ["not base64!", "QUJD=", "QUJ", " QUJD"])
+@pytest.mark.parametrize(
+    "data",
+    ["not base64!", "QUJD=", "QUJD==", "QUJ", " QUJD", "QUJD" + chr(10), "QU=D", "QUJD-_", "Q==="],
+)
 def test_invalid_base64_is_omitted(data: str) -> None:
     result, _ = run(ImageContent(type="image", data=data, mime_type="image/png"))
     assert texts(result) == ["[image omitted by the gateway]"]
@@ -167,8 +170,12 @@ def test_invalid_base64_is_omitted(data: str) -> None:
 
 def test_valid_base64() -> None:
     assert sanitize.valid_base64("QUJD")
+    assert sanitize.valid_base64("QUI=")
+    assert sanitize.valid_base64("QQ==")
     assert sanitize.valid_base64("")
+    assert sanitize.valid_base64(PNG)
     assert not sanitize.valid_base64("QUJ")
+    assert not sanitize.valid_base64("QUJD=")
 
 
 def test_media_count_toward_the_budget() -> None:
