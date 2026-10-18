@@ -243,7 +243,11 @@ async def test_a_review_that_cant_run_exits_2(
     tmp_path: Path, cli: Callable[[Running], Cli]
 ) -> None:
     fake = McpFake(switches={Switch.UNSUPPORTED_VERSION})
-    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(McpFake()), "servers": TOOLKIT}
+    options: dict[str, Any] = {
+        "include": TOOLS,
+        "review": review_pins(McpFake()),
+        "servers": TOOLKIT,
+    }
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         run = cli(running)
         failed = run("review", SERVER)
