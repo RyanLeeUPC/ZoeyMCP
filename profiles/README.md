@@ -1,7 +1,7 @@
 # Provider profiles
 
 Each file is a ready-made `credentials:` + `routes:` fragment for one service shape (design
-§8.1). Copy the parts you need into your policy, then:
+§8.1); the MCP one has a `gateway:` part too. Copy the parts you need into your policy, then:
 
 - replace every `ph-replace-...` placeholder with a long random value
   (`python -c "import secrets; print(secrets.token_urlsafe(24))"`);
@@ -24,3 +24,4 @@ like the real provider where it matters, with only the upstream address swapped.
 | `spotify-pkce.yaml` | S6: OAuth, public client with PKCE, rotating refresh tokens | Spotify Web API |
 | `grist-document.yaml` | S7: one document, different methods per path | Grist |
 | `github-readonly.yaml` | S8: GET-only API | GitHub REST API |
+| `remote-mcp-static-key.yaml` | S10: a remote MCP server with a static key, behind the gateway (also a `gateway:` fragment) | any MCP server that takes an API key |

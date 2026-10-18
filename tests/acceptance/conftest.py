@@ -24,6 +24,8 @@ from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
+from zoeymcp.vault.peer import peer_checked
+from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
 from .tls import ProviderCA, make_ca
@@ -155,8 +157,13 @@ class Deployment:
         replace: dict[str, str] | None = None,
         environ: Mapping[str, str] | None = None,
         clock: Clock | None = None,
+        link_socket: Path | None = None,
+        link_uid: int | None = None,
     ) -> None:
         self.state = tmp_path
+        # The standard tier's link: the gateway's socket, and the uid allowed on it (Linux).
+        self.link_socket = link_socket
+        self.link_uid = link_uid
         self.ca = ca
         self.upstream = upstream
         self.clock = clock or Clock()
@@ -170,8 +177,9 @@ class Deployment:
         for name, value in secrets.items():
             store.put(name, value, derive_binding(self.policy, name))
         self._build(store)
+        # Empty for a route only the gateway may call.
         self.placeholder = next(
-            c.placeholder for c in self.policy.routes[0].callers if not isinstance(c, str)
+            (c.placeholder for c in self.policy.routes[0].callers if not isinstance(c, str)), ""
         )
         self.prefix = self.policy.routes[0].prefix
         self.admin_url: str | None = None
@@ -217,6 +225,7 @@ class Deployment:
             client=tls_client(self.ca),
             tokens=self.tokens,
             environ=self.environ,
+            gateway_link=self.link_socket is not None,
         )
         login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
         self.admin = AdminApp(
@@ -265,13 +274,25 @@ class Deployment:
             _Server(
                 uvicorn.Config(asgi, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
             )
-            for asgi in (counted, self.admin.app)
+            for asgi in (ListenerTag(counted, "tcp"), self.admin.app)
         ]
+        if self.link_socket is not None and self.link_uid is not None:
+            link = _Server(
+                uvicorn.Config(
+                    ListenerTag(counted, "gateway"),
+                    uds=str(self.link_socket),
+                    http=peer_checked(self.link_uid),
+                    log_level="warning",
+                    lifespan="off",
+                )
+            )
         loop = asyncio.new_event_loop()
+
+        everything = [*servers, link] if self.link_socket is not None else servers
 
         async def main() -> None:
             try:
-                await asyncio.gather(*(server.serve() for server in servers))
+                await asyncio.gather(*(server.serve() for server in everything))
             finally:
                 await app.aclose()
                 await token_client.aclose()
@@ -285,7 +306,7 @@ class Deployment:
             with httpx.Client(base_url=f"http://127.0.0.1:{vault_port}", timeout=60) as client:
                 yield client
         finally:
-            for server in servers:
+            for server in everything:
                 server.should_exit = True
             thread.join(STARTUP_TIMEOUT * 6)
             self._loop = None

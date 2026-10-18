@@ -1,0 +1,45 @@
+# S10: a remote MCP server that takes a static API key (design §8.1, M3).
+#
+# The gateway is the route's only caller. Agents never reach the route: they connect to the
+# gateway at /s/notes/mcp with their client token, and the vault adds the key on the way out.
+#
+#   1. Store the key in the vault: zoeymcp secret set notes-key
+#   2. Make a client token for each agent (zoeymcp client-token) and put its token_sha256 below.
+#   3. Review the server inside the gateway, then commit the snippet it prints:
+#        zoeymcp review notes --add <tool> --add <tool>
+#      and put each added tool under allow or approve. Nothing is served until then.
+#
+# Some servers want the key as "Authorization: Bearer <key>" instead: drop header and format,
+# which default to exactly that.
+
+credentials:
+  notes-key:
+    kind: header
+    header: X-API-Key
+    format: "{secret}"
+    secret: store:notes-key
+
+routes:
+  - name: notes-mcp
+    prefix: /notes
+    upstream: https://mcp.notes.example
+    credential: notes-key
+    callers: [gateway]
+    stream: true
+    rules:
+      # POST carries requests; GET and DELETE are a legacy session's stream and its end.
+      - methods: [POST, GET, DELETE]
+        paths: [/mcp]
+
+gateway:
+  clients:
+    agent1:
+      token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      servers: [notes]
+  servers:
+    notes:
+      kind: remote
+      route: notes-mcp
+      path: /mcp
+      tools: {include: [], allow: [], approve: []}
+      review: {}
