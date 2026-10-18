@@ -65,5 +65,5 @@ jobs:
         run: |
           tree="$(docker inspect zoeymcp:ci --format '{{ index .Config.Labels "io.zoeymcp.source-tree" }}')"
           test "$tree" = "$(git rev-parse 'HEAD^{tree}')"
-      - name: Smoke test, hardened
+      - name: Smoke test (hardened vault, standard tier)
         run: sh scripts/smoke-image.sh zoeymcp:ci

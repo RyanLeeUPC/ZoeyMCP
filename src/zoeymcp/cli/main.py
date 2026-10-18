@@ -165,6 +165,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="read HUP and TERM lines from this pipe; its end stops the gateway (the launcher's)",
     )
 
+    standard = commands.add_parser(
+        "standard",
+        help="run the standard tier: the vault and the gateway in one container, as two uids",
+        description=(
+            "The standard tier's entrypoint, PID 1 of a container started as root with "
+            "cap_drop: [ALL], cap_add: [SETUID, SETGID] and no-new-privileges. It starts the "
+            "vault as uid 10001 and the gateway as uid 10002, linked by a Unix socket, then "
+            "drops to uid 10003 with an empty environment and supervises them."
+        ),
+    )
+    standard.add_argument(
+        "--gateway-listen",
+        default="0.0.0.0:8090",
+        metavar="HOST:PORT",
+        help="the gateway's address (default 0.0.0.0:8090)",
+    )
+    standard.add_argument(
+        "--vault-listen",
+        action="append",
+        default=[],
+        metavar="HOST:PORT",
+        help="also a vault TCP listener, for direct routes (repeatable; default none)",
+    )
+    standard.add_argument(
+        "--unsafe-skip-checks",
+        action="store_true",
+        help="skip the NoNewPrivs and capability checks (development only)",
+    )
+    standard.add_argument("--supervise", action="append", default=[], help=argparse.SUPPRESS)
+
     secret = commands.add_parser(
         "secret",
         help="set, list or delete secrets in a running vault (run inside the vault container)",
@@ -367,6 +397,25 @@ def _cmd_gateway(args: argparse.Namespace, out: TextIO) -> int:
         out.write(f"zoeymcp gateway: {exc}\n")
         return EXIT_UNREADABLE
     return EXIT_OK
+
+
+def _cmd_standard(args: argparse.Namespace, err: TextIO) -> int:
+    from ..entrypoint import launcher
+
+    try:
+        if args.supervise:
+            return launcher.Supervisor(launcher.parse_supervised(args.supervise)).run()
+        launcher.launch(
+            launcher.Options(
+                gateway_listen=args.gateway_listen,
+                vault_listens=tuple(args.vault_listen),
+                unsafe_skip_checks=args.unsafe_skip_checks,
+            ),
+            os.environ,
+        )
+    except launcher.LaunchError as exc:
+        err.write(f"zoeymcp standard: {exc}\n")
+        return EXIT_UNREADABLE
 
 
 def _cmd_keygen(out: TextIO) -> int:
@@ -834,6 +883,8 @@ def main(
         return _cmd_vault(args, err)
     if args.command == "gateway":
         return _cmd_gateway(args, err)
+    if args.command == "standard":
+        return _cmd_standard(args, err)
     if args.command == "selftest":
         return _cmd_selftest(args, stdin, out)
     if args.command in ("secret", "setup-code", "gateway-key"):

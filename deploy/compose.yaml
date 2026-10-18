@@ -1,0 +1,86 @@
+# ZoeyMCP, standard tier (design §3.3, M3 design B.2).
+#
+# One container. Its launcher, PID 1, starts the vault as uid 10001 and the gateway as uid 10002,
+# linked by a Unix socket that only the gateway's uid may use, then drops to uid 10003 with an
+# empty environment. It refuses to start without no-new-privileges, or with any capability
+# beyond SETUID and SETGID: keep the settings below as they are.
+#
+#   ZOEYMCP_MASTER_KEY=...  docker compose -f deploy/compose.yaml up -d
+#
+# Agents connect to http://localhost:8090/s/<server>/mcp with "Authorization: Bearer <token>"
+# (zoeymcp client-token makes one). Admin commands run inside the container; started as root,
+# the CLI becomes the uid that owns the socket it needs:
+#
+#   printf '%s' "$KEY" | docker compose -f deploy/compose.yaml exec -T zoeymcp \
+#     zoeymcp secret set notes-key
+#   docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes
+#
+# What this tier gives up: the gateway shares the vault's network namespace, so it has egress
+# of its own. And a client token sent to a port without TLS is readable on the network, which is
+# why the port is published on loopback only. For agents on other hosts, move to the hardened
+# tier (compose.hardened.yaml), where the gateway has no egress.
+
+name: zoeymcp
+
+services:
+  zoeymcp:
+    # For a real deployment, pin by digest: ghcr.io/ryanleeupc/zoeymcp@sha256:...
+    image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
+    command: [standard, --gateway-listen, "0.0.0.0:8090"]
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    # The launcher gives the vault and the gateway 50 s to stop: OAuth refreshes in flight
+    # finish and are saved, and calls in flight get 10 s.
+    stop_grace_period: 60s
+    environment:
+      ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
+      # The policy, inline: no bind mounts needed. `docker compose kill -s HUP zoeymcp` reloads
+      # a file-based policy; for this inline one, recreate the container.
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+        admin:
+          listen: 127.0.0.1:8081
+          hosts: [localhost]
+        credentials:
+          notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+        routes:
+          - name: notes-mcp
+            prefix: /notes
+            upstream: https://mcp.notes.example
+            credential: notes-key
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+        gateway:
+          clients:
+            agent1:
+              # From `zoeymcp client-token`. This one matches no token anyone has.
+              token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              servers: [notes]
+          servers:
+            notes:
+              kind: remote
+              route: notes-mcp
+              path: /mcp
+              # Nothing is served until you review it: `zoeymcp review notes --add <tool>`,
+              # then classify each tool under allow or approve and commit the pins.
+              tools: {include: [], allow: [], approve: []}
+              review: {}
+    ports: ["127.0.0.1:8090:8090"]
+    tmpfs:
+      - /tmp:size=16m
+      - /run/zoeymcp:size=1m,mode=0700,uid=10001,gid=10001
+      - /run/zoeymcp-link:size=1m,mode=0750,uid=10001,gid=10002
+      - /run/zoeymcp-gateway:size=1m,mode=0700,uid=10002,gid=10002
+    volumes:
+      - vault-state:/state
+      - gateway-state:/state-gateway
+
+volumes:
+  vault-state: {}
+  gateway-state: {}

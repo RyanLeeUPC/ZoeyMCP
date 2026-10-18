@@ -1,24 +1,33 @@
 #!/bin/sh
-# Smoke-test a built image the way the hardened tier runs it: read-only, no capabilities,
-# no-new-privileges, non-root. Usage: scripts/smoke-image.sh IMAGE
+# Smoke-test a built image: the vault the way the hardened tier runs it (read-only, no capabilities,
+# no-new-privileges, non-root), then the standard tier from deploy/compose.yaml.
+# Usage: scripts/smoke-image.sh IMAGE
 set -eu
 
 image="${1:?usage: smoke-image.sh IMAGE}"
 name="zoeymcp-smoke-$$"
 volume="zoeymcp-smoke-state-$$"
+project="zoeymcp-smoke-$$"
 port=18080
 examples="$(cd "$(dirname "$0")/../examples" && pwd)"
+deploy="$(cd "$(dirname "$0")/../deploy" && pwd)"
 hardened="--read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:size=16m"
 
+# The standard tier, from deploy/compose.yaml as shipped.
+standard() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${key:-unset}"         docker compose -p "$project" -f "$deploy/compose.yaml" "$@"
+}
 cleanup() {
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker volume rm "$volume" >/dev/null 2>&1 || true
+    standard down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 fail() {
     echo "SMOKE FAIL: $*" >&2
     docker logs "$name" >&2 2>/dev/null || true
+    standard logs >&2 2>/dev/null || true
     exit 1
 }
 
@@ -231,5 +240,103 @@ if docker run --rm $hardened -v "$volume:/state" -e ZOEYMCP_MASTER_KEY="$other" 
     fail "the vault started with the wrong master key"
 fi
 grep -q "ZOEYMCP_MASTER_KEY_PREVIOUS" /tmp/zoeymcp-smoke-err || fail "unexpected startup error"
+
+step "standard tier: the launcher refuses a container that isn't its box"
+std_box="--read-only --tmpfs /tmp:size=16m -u 0:0"
+refused() {
+    # refused REASON DOCKER-RUN-OPTIONS...: the launcher must refuse, naming REASON.
+    reason="$1"
+    shift
+    # shellcheck disable=SC2068
+    if docker run --rm $@ "$image" standard >/dev/null 2>/tmp/zoeymcp-smoke-err; then
+        fail "the launcher started without: $reason"
+    fi
+    grep -q "$reason" /tmp/zoeymcp-smoke-err || fail "the refusal doesn't say: $reason"
+}
+refused "NoNewPrivs is not set" "$std_box --cap-drop ALL --cap-add SETUID --cap-add SETGID"
+refused "capabilities beyond SETUID and SETGID" "$std_box --security-opt no-new-privileges:true"
+refused "must start as root" "$hardened"
+
+step "standard tier: up, from deploy/compose.yaml"
+standard up -d
+i=0
+until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/healthz)" = "200" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "the standard tier's gateway didn't become ready"
+    sleep 0.3
+done
+std="$(standard ps -q zoeymcp)"
+[ -n "$std" ] || fail "no standard-tier container"
+
+step "standard tier: three uids, and PID 1 holds nothing"
+# pid uid CapEff role, for every process.
+processes='
+import os
+for pid in sorted(int(p) for p in os.listdir("/proc") if p.isdigit()):
+    try:
+        with open(f"/proc/{pid}/status") as handle:
+            status = dict(line.split(":", 1) for line in handle.read().splitlines() if ":" in line)
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            argv = handle.read().split(b"\0")
+    except OSError:
+        continue
+    role = next((w.decode() for w in (b"standard", b"vault", b"gateway") if w in argv), "-")
+    print(pid, status["Uid"].split()[0], status["CapEff"].strip(), role)
+'
+found="$(docker exec "$std" python -I -c "$processes")"
+echo "$found"
+echo "$found" | grep -qx "1 10003 0000000000000000 standard" \
+    || fail "PID 1 isn't the launcher as 10003 with no capabilities"
+vault_pid="$(echo "$found" | awk '$4 == "vault" && $2 == "10001" && $3 == "0000000000000000" {print $1}')"
+gateway_pid="$(echo "$found" | awk '$4 == "gateway" && $2 == "10002" && $3 == "0000000000000000" {print $1}')"
+[ -n "$vault_pid" ] || fail "no vault process as 10001 without capabilities"
+[ -n "$gateway_pid" ] || fail "no gateway process as 10002 without capabilities"
+[ "$(docker exec --privileged "$std" cat /proc/1/environ | wc -c)" -eq 0 ] \
+    || fail "PID 1 still has an environment"
+docker exec --privileged "$std" cat "/proc/$gateway_pid/environ" | tr '\0' '\n' \
+    | grep -q '^ZOEYMCP_MASTER_KEY=' && fail "the gateway has the master key"
+docker exec --privileged "$std" cat "/proc/$vault_pid/environ" | tr '\0' '\n' \
+    | grep -q '^ZOEYMCP_MASTER_KEY=' || fail "the vault has no master key"
+
+step "standard tier: the gateway's uid can't reach the vault's state, environment or admin socket"
+if docker exec -u 10002 "$std" ls /state >/dev/null 2>&1; then
+    fail "uid 10002 can list /state"
+fi
+if docker exec -u 10002 "$std" cat "/proc/$vault_pid/environ" >/dev/null 2>&1; then
+    fail "uid 10002 can read the vault's environment"
+fi
+if docker exec -u 10002 "$std" zoeymcp secret list >/dev/null 2>&1; then
+    fail "uid 10002 can use the vault's admin socket"
+fi
+
+step "standard tier: agents need a token; admin commands switch to the socket's owner"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+    -d '{}' http://127.0.0.1:8090/s/notes/mcp)" = "401" ] || fail "no token wasn't 401"
+out="$(printf 'notes-smoke-0123456789' | docker exec -i "$std" zoeymcp secret set notes-key)"
+echo "$out"
+echo "$out" | grep -q "^stored notes-key" || fail "secret set didn't reach the vault as root"
+out="$(docker exec "$std" zoeymcp review)" || fail "review (no server) didn't reach the gateway"
+echo "$out"
+echo "$out" | grep -q "^notes  " || fail "review lists no notes server"
+docker exec "$std" zoeymcp gateway-status | grep -q '^view sha256:' \
+    || fail "gateway-status didn't reach the gateway"
+
+step "standard tier: HUP reloads both, through the control pipes"
+docker kill -s HUP "$std" >/dev/null
+i=0
+until [ "$(standard logs zoeymcp | grep -c '"event":"control_received","command":"HUP"')" -ge 2 ]; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || fail "HUP didn't reach both children"
+    sleep 0.2
+done
+standard logs zoeymcp | grep -q '"event":"reload_ok"' || fail "the vault didn't reload"
+
+step "standard tier: a graceful stop"
+standard stop -t 60 zoeymcp
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$std")" = "0" ] || fail "the launcher exited non-zero"
+for child in vault gateway; do
+    standard logs zoeymcp | grep -q "\"event\":\"child_exited\",\"child\":\"$child\",\"status\":0" \
+        || fail "the $child didn't stop cleanly"
+done
 
 echo "SMOKE OK"

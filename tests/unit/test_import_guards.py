@@ -288,6 +288,23 @@ def test_gateway_code_never_imports_vault_code() -> None:
     assert violations(PACKAGE.parent, GATEWAY_SIDE, ["zoeymcp.vault"]) == []
 
 
+def test_the_launcher_uses_the_standard_library_only() -> None:
+    """PID 1 of the standard tier: nothing beyond the stdlib, the shared log writer and itself."""
+    allowed = ("zoeymcp.entrypoint", "zoeymcp.common.logs")
+    found = []
+    for path in sorted((PACKAGE / "entrypoint").rglob("*.py")):
+        for name in imported_modules(path, module_name(path, PACKAGE.parent)):
+            top = name.partition(".")[0]
+            if top == "zoeymcp":
+                if name != "zoeymcp.common" and not any(
+                    name == a or name.startswith(a + ".") for a in allowed
+                ):
+                    found.append(f"{path.name}: {name}")
+            elif top and top not in sys.stdlib_module_names and top != "__future__":
+                found.append(f"{path.name}: {name}")
+    assert found == []
+
+
 # --- what importing it loads --------------------------------------------------------------------
 
 # Imports every module of the named packages (a missing package is skipped) in a fresh

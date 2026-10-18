@@ -116,6 +116,7 @@ only_mutate = [
     "*zoeymcp/gateway/access.py",
     "*zoeymcp/gateway/connstate.py",
     "*zoeymcp/gateway/egressrules.py",
+    "*zoeymcp/entrypoint/env.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene and import-guard tests check the repository itself (the lock, the smoke script),
@@ -124,4 +125,4 @@ pytest_add_cli_args = [
     "--ignore=tests/unit/test_source_hygiene.py",
     "--ignore=tests/unit/test_import_guards.py",
 ]
-also_copy = ["examples", "profiles", "tests"]
+also_copy = ["deploy", "examples", "profiles", "tests"]
