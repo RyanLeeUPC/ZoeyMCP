@@ -425,6 +425,7 @@ class SmtpConnectors:
         audit = self.keys.audit_key
         req_hmac = audit.digest(request.canonical)
         now = self.clock_ms()
+        journal.forget_old_keys(now)  # keys are remembered for 30 days (J.3)
         decision = journal.decide(key, req_hmac, now, connector.max_per_day)
         if isinstance(decision, Replay):
             status, data = sendjournal.answer(decision.terminal, journal.sent_24h(now))

@@ -675,3 +675,19 @@ async def test_the_smtp_profiles_send(
         await r.app.aclose()
     assert response.status_code == 200
     assert fake.sessions[0].tls_at_auth == [True]
+
+
+async def test_a_key_is_remembered_for_thirty_days(
+    implicit: tuple[SmtpFake, int], ca: ProviderCA, tmp_path: Path
+) -> None:
+    fake, port = implicit
+    r = Rig(tmp_path, mail_policy(port), ca)
+    assert (await r.send()).status_code == 200
+    r.clock.now += sendjournal.KEY_DAYS * sendjournal.DAY_MS
+    again = await r.send()
+    assert again.headers[REPLAYED_HEADER] == "1"  # still within 30 days
+    r.clock.now += 1
+    fresh = await r.send()
+    assert REPLAYED_HEADER not in fresh.headers  # forgotten: a new send
+    assert len(fake.messages) == 2
+    await r.app.aclose()
