@@ -34,11 +34,11 @@ from mcp.types import CallToolResult, TextContent
 
 from ..common import canonical
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewRemoteServer
 from . import logs, schemas
 from .connstate import Era
 from .sanitize import map_upstream, sanitize_result
-from .upstream import NotAdmitted, Progress, UpstreamError, UpstreamPool
+from .toolsource import ServedServer, ToolSource
+from .upstream import NotAdmitted, Progress, UpstreamError
 
 MAX_ARGUMENT_DEPTH = 32
 UNKNOWN_TOOL = "Unknown tool"
@@ -85,7 +85,7 @@ class Call:
 
     client: str
     server: str
-    policy: ViewRemoteServer
+    policy: ServedServer
     limits: GatewayLimits
     era: Era  # the agent's
 
@@ -115,7 +115,7 @@ def _shape(arguments: Any, limits: GatewayLimits) -> dict[str, Any] | str:
 
 
 async def call_tool(
-    pool: UpstreamPool,
+    source: ToolSource,
     call: Call,
     name: str,
     arguments: Any,
@@ -145,12 +145,8 @@ async def call_tool(
 
     # 1. Admit
     try:
-        connection = pool.connection(call.server, call.policy, call.client)
-        pin = await pool.admit(connection, name)
-        evaluation = connection.state.evaluation
-        exposed = evaluation.exposed.get(name) if evaluation is not None else None
-        if exposed is None or exposed.pin != pin:
-            raise NotAdmitted("tool not exposed")
+        exposed = await source.admit(call.client, call.server, call.policy, name)
+        pin = exposed.pin
     except NotAdmitted as exc:
         log("refused", exc.reason)
         raise MCPError(mcp_types.INVALID_PARAMS, UNKNOWN_TOOL) from exc
@@ -188,8 +184,8 @@ async def call_tool(
     # 6. Call
     with (in_flight or InFlight()).track(call.client, call.server) as scope:
         try:
-            raw = await pool.call(
-                call.server, call.policy, call.client, name, shaped, pin=pin, progress=progress
+            raw = await source.forward(
+                call.client, call.server, call.policy, name, shaped, pin=pin, progress=progress
             )
         except NotAdmitted as exc:
             log("upstream_error", exc.reason)

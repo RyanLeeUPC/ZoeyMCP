@@ -55,6 +55,7 @@ from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier
 from .policyclient import PolicyClient, Snapshot
+from .toolsource import RemoteSource, ToolSource
 from .upstream import NotAdmitted, UpstreamError, UpstreamPool
 
 HEALTH_PATH = "/healthz"
@@ -220,6 +221,7 @@ class GatewayApp:
         self.sessions = access.SessionBindings(idle_timeout=1800)
         self.counters = access.ClientCounters()
         self.in_flight = pipeline.InFlight()
+        self.remote = RemoteSource(pool)
         # The approval ledger, opened and recovered before the listener (M4 design F.5).
         self.ledger: Ledger | None = None
         self.manager: StreamableHTTPSessionManager | None = None
@@ -638,8 +640,9 @@ class GatewayApp:
             raise MCPError(mcp_types.INVALID_PARAMS, "the listing has one page")
         self._register(ctx, request)
         try:
-            connection = self.pool.connection(request.server, request.policy, request.client)
-            evaluation = await self.pool.wait_ready(connection)
+            evaluation = await self.source(request.policy).exposed(
+                request.client, request.server, request.policy
+            )
         except (NotAdmitted, UpstreamError) as exc:
             ref = pipeline.new_ref()
             logs.event(
@@ -693,7 +696,7 @@ class GatewayApp:
             await ctx.session.report_progress(value, total)
 
         return await pipeline.call_tool(
-            self.pool,
+            self.source(request.policy),
             call,
             params.name,
             params.arguments,
@@ -714,18 +717,11 @@ class GatewayApp:
         request = CURRENT.get()
         if request is None:
             return None
-        for connection in self.pool.connections():
-            if connection.server != request.server or connection.key[1] not in (
-                request.client,
-                "*",
-            ):
-                continue
-            evaluation = connection.state.evaluation
-            exposed = evaluation.exposed.get(name) if evaluation is not None else None
-            if exposed is not None:
-                schema = exposed.definition.get("inputSchema")
-                return dict(schema) if isinstance(schema, dict) else None
-        return None
+        return self.source(request.policy).input_schema(request.client, request.server, name)
+
+    def source(self, policy: Any) -> ToolSource:
+        """Where a server's tools come from. Every served server is remote until M4 step 12."""
+        return self.remote
 
     def _register(self, ctx: ServerRequestContext[Any], request: RequestScope) -> None:
         if request.session_id is not None:
