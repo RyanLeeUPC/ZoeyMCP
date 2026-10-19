@@ -8,14 +8,29 @@ with the template's. DER is parsed strictly. ECDSA verification takes DER signat
 WebAuthn's are) and accepts a high-S one, which is harmless with single-use challenges. PKCS#1
 v1.5 and PSS are distinct schemes, an Ed25519 signature is exactly 64 bytes, and a point off the
 curve never becomes a key.
+
+37 and 39 pin what admission (design C.2) relies on in h11 0.16, uvicorn 0.54 and Starlette 1.7.
+A request with two ``Host`` headers never reaches the app: h11 refuses it and uvicorn answers its
+own plain-text 400 (design 0.5), so admission's "exactly one Host" is a pure case. One ``Host``
+reaches ``scope["headers"]`` as sent, whatever the request target says, and an absolute-form
+target becomes the path, which no portal route has. Starlette's ``request.cookies`` keeps one of
+two cookies of one name, so admission reads every value from the raw ``Cookie`` headers.
 """
 
 from __future__ import annotations
 
+import asyncio
+import socket
+import threading
+import time
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
+import h11
 import pytest
+import uvicorn
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import (
@@ -30,6 +45,8 @@ from cryptography.hazmat.primitives.asymmetric import (
     x25519,
 )
 from cryptography.utils import CryptographyDeprecationWarning
+from starlette.requests import Request
+from starlette.types import Receive, Scope, Send
 
 from tests.fakes.authenticator import PublicKey, spki
 
@@ -179,3 +196,117 @@ def test_a_point_off_the_curve_is_refused() -> None:
         ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), off_curve)
     with pytest.raises(ValueError, match="32 bytes long"):
         ed25519.Ed25519PublicKey.from_public_bytes(b"\x00" * 31)
+
+
+# --- 37. two Host headers never reach the app; one reaches it as sent -----------------------------
+
+STARTUP_TIMEOUT = 10.0
+CRLF = bytes((13, 10))
+
+
+class _Recorder:
+    """An ASGI app that keeps each scope and answers 200."""
+
+    def __init__(self) -> None:
+        self.scopes: list[Scope] = []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.scopes.append(scope)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+
+class _ThreadServer(uvicorn.Server):
+    def install_signal_handlers(self) -> None:
+        """Signals belong to the test runner."""
+
+
+@contextmanager
+def _h11_server(app: _Recorder) -> Iterator[int]:
+    """uvicorn with its h11 protocol, as the portal runs it, on a loopback port."""
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=0, http="h11", lifespan="off", log_level="critical"
+    )
+    server = _ThreadServer(config)
+    thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while not server.started:
+        assert thread.is_alive()
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    try:
+        yield server.servers[0].sockets[0].getsockname()[1]
+    finally:
+        server.should_exit = True
+        thread.join(STARTUP_TIMEOUT)
+
+
+def _exchange(port: int, raw: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=STARTUP_TIMEOUT) as connection:
+        connection.sendall(raw)
+        connection.shutdown(socket.SHUT_WR)
+        answer = b""
+        while chunk := connection.recv(65536):
+            answer += chunk
+    return answer
+
+
+def _head(*lines: bytes) -> bytes:
+    """A request head: the lines, each ended by CRLF, then the empty line."""
+    return b"".join(line + CRLF for line in (*lines, b""))
+
+
+def test_h11_refuses_two_host_headers() -> None:
+    connection = h11.Connection(h11.SERVER)
+    connection.receive_data(
+        _head(b"GET / HTTP/1.1", b"Host: localhost:8081", b"Host: evil.example")
+    )
+    with pytest.raises(h11.RemoteProtocolError, match="multiple Host"):
+        connection.next_event()
+
+
+def test_uvicorn_answers_two_host_headers_itself() -> None:
+    app = _Recorder()
+    with _h11_server(app) as port:
+        answer = _exchange(
+            port, _head(b"GET / HTTP/1.1", b"Host: localhost:8081", b"Host: localhost:8081")
+        )
+    head, _, body = answer.partition(CRLF + CRLF)
+    lines = head.split(CRLF)
+    assert lines[0] == b"HTTP/1.1 400 Bad Request"
+    assert b"content-type: text/plain; charset=utf-8" in lines
+    assert body == b"Invalid HTTP request received."
+    assert app.scopes == []
+
+
+@pytest.mark.parametrize(
+    ("target", "path"),
+    [
+        (b"/api/session?x=1", "/api/session"),
+        (b"http://evil.example/api/session", "http://evil.example/api/session"),
+    ],
+)
+def test_one_host_reaches_the_app_as_sent(target: bytes, path: str) -> None:
+    app = _Recorder()
+    with _h11_server(app) as port:
+        answer = _exchange(
+            port,
+            _head(b"GET " + target + b" HTTP/1.1", b"Host: LocalHost:8081", b"Connection: close"),
+        )
+    assert answer.startswith(b"HTTP/1.1 200 OK")
+    [scope] = app.scopes
+    assert scope["headers"] == [(b"host", b"LocalHost:8081"), (b"connection", b"close")]
+    assert scope["path"] == path
+
+
+# --- 39. a parsed cookie mapping keeps one cookie of a name ---------------------------------------
+
+
+def test_starlette_keeps_one_of_two_cookies_of_a_name() -> None:
+    headers = [(b"cookie", b"zoeymcp-8081-session=planted; zoeymcp-8081-session=ours")]
+    request = Request({"type": "http", "headers": headers})
+    assert request.cookies == {"zoeymcp-8081-session": "ours"}
+    # Across two Cookie headers, the last one wins too.
+    two = [(b"cookie", b"zoeymcp-8081-session=ours"), (b"cookie", b"zoeymcp-8081-session=planted")]
+    assert Request({"type": "http", "headers": two}).cookies == {"zoeymcp-8081-session": "planted"}
