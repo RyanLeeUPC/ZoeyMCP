@@ -238,7 +238,7 @@ class Show:
 
 
 def _label(label: str) -> str:
-    if not LABEL.match(label):
+    if not LABEL.fullmatch(label):
         raise LayoutError("a label is 1-32 ASCII letters, digits, spaces, '_' or '-'")
     return label
 

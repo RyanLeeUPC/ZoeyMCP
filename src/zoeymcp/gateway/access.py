@@ -374,10 +374,13 @@ class SessionBindings:
 
 @dataclass
 class ClientCounters:
-    """Requests and long-lived streams in flight, per client."""
+    """Requests and long-lived streams in flight, per client, and the reply slots in use per
+    session: each legacy prompt waiting on a session reserves one, so a client at its
+    concurrency cap can still deliver its operator's answer (M4 design D.3)."""
 
     requests: dict[str, int] = field(default_factory=dict)
     streams: dict[str, int] = field(default_factory=dict)
+    replies: dict[str, int] = field(default_factory=dict)
 
     def try_acquire(
         self, client: str, *, stream: bool, max_requests: int, max_streams: int
@@ -402,6 +405,20 @@ class ClientCounters:
         self.requests[client] = max(0, self.requests.get(client, 0) - 1)
         if stream:
             self.streams[client] = max(0, self.streams.get(client, 0) - 1)
+
+    def try_acquire_reply(self, session_sha256: str, *, waiting: int) -> bool:
+        """A reply slot of this session, if one of its ``waiting`` prompts' slots is free."""
+        if self.replies.get(session_sha256, 0) >= waiting:
+            return False
+        self.replies[session_sha256] = self.replies.get(session_sha256, 0) + 1
+        return True
+
+    def release_reply(self, session_sha256: str) -> None:
+        left = self.replies.get(session_sha256, 0) - 1
+        if left > 0:
+            self.replies[session_sha256] = left
+        else:
+            self.replies.pop(session_sha256, None)
 
 
 def too_many(reason: str) -> Refusal:
@@ -441,15 +458,36 @@ def parse_message(body: bytes, max_bytes: int) -> dict[str, Any] | Refusal:
     return message
 
 
-def check_rpc(message: Mapping[str, Any], version: VersionCheck, modern: bool) -> Refusal | None:
-    """Step 12: a request or notification this gateway serves.
+def is_response(message: Mapping[str, Any]) -> bool:
+    """A JSON-RPC response: no ``method``, an ``id``, and exactly one of ``result`` and
+    ``error``."""
+    request_id = message.get("id")
+    if "method" in message or isinstance(request_id, bool):
+        return False
+    if not isinstance(request_id, str | int):
+        return False
+    return ("result" in message) != ("error" in message)
 
-    A client response (no ``method``) is refused in M3. An unknown method gets ``-32601``, with
-    HTTP 404 on modern requests and 200 on legacy ones, as each era expects.
+
+def check_rpc(
+    message: Mapping[str, Any],
+    version: VersionCheck,
+    modern: bool,
+    *,
+    answer_expected: bool = False,
+) -> Refusal | None:
+    """Step 12: a request or notification this gateway serves, or an agent's answer.
+
+    A client response (no ``method``) is admitted only with ``answer_expected``: on a legacy
+    session bound to this client and server, with a prompt waiting on it, in a small body
+    (M4 design D.3). An unknown method gets ``-32601``, with HTTP 404 on modern requests and
+    200 on legacy ones, as each era expects.
     """
     method = message.get("method")
     if method is None:
-        return Refusal(400, "a client response, which this version never asks for")
+        if answer_expected and not modern and is_response(message):
+            return None
+        return Refusal(400, "a client response, and no prompt is waiting for one")
     if not isinstance(method, str) or method not in RPC_METHODS:
         return Refusal(404 if modern else 200, "method not served", rpc_code=-32601)
     if version == "needs_initialize" and method != "initialize":

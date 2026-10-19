@@ -75,7 +75,7 @@ def _count(value: Any) -> bool:
 
 
 def _name(value: Any) -> bool:
-    return isinstance(value, str) and bool(_NAME.match(value))
+    return isinstance(value, str) and bool(_NAME.fullmatch(value))
 
 
 def _member(options: frozenset[str]) -> Any:
@@ -87,7 +87,7 @@ def _optional(check: Any) -> Any:
 
 
 def _pattern(regex: re.Pattern[str]) -> Any:
-    return lambda value: isinstance(value, str) and bool(regex.match(value))
+    return lambda value: isinstance(value, str) and bool(regex.fullmatch(value))
 
 
 # The fields each kind carries, besides the common ones, and their checks.
@@ -211,7 +211,7 @@ def _check(value: Mapping[str, Any]) -> None:
     if kind in _NO_REF:
         if ref is not None:
             raise LedgerFormatError(f"a {kind} record has no ref")
-    elif not (isinstance(ref, str) and _REF.match(ref)):
+    elif not (isinstance(ref, str) and _REF.fullmatch(ref)):
         raise LedgerFormatError("bad ref")
     checks = FIELDS[kind]
     names = set(value) - set(_COMMON)

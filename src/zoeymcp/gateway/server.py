@@ -234,7 +234,7 @@ class AdminApp:
             except (canonical.JSONRejected, ValueError):
                 return 400, {"error": "the body must be a JSON object"}
             ref = request.get("ref") if isinstance(request, dict) else None
-            if not isinstance(ref, str) or not _LEDGER_REF.match(ref) or "args" not in request:
+            if not isinstance(ref, str) or not _LEDGER_REF.fullmatch(ref) or "args" not in request:
                 return 400, {"error": 'send {"ref": <16 hex>, "args": <the arguments>}'}
             args = request["args"]
             return 200, await anyio.to_thread.run_sync(lambda: ledger.check(ref, args))
@@ -270,7 +270,7 @@ def _ledger_query(query: str) -> dict[str, Any] | str:
                 return f"{name} must be a whole number"
             options[name] = int(value)
         elif name in ("client", "server", "tool"):
-            if not _LEDGER_NAME.match(value):
+            if not _LEDGER_NAME.fullmatch(value):
                 return f"{name} must be a policy name"
             options[name] = value
         else:

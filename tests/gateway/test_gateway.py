@@ -425,7 +425,8 @@ async def test_a_dollar_pattern_refuses_a_trailing_newline(tmp_path: Path) -> No
 # --- decisions ------------------------------------------------------------------------------------
 
 
-async def test_an_approve_tool_is_refused_in_this_version(tmp_path: Path) -> None:
+async def test_an_approve_tool_is_refused_for_an_unattended_client(tmp_path: Path) -> None:
+    # The rig's clients have no approvals block, so they are never asked (M4 design D1).
     fake = McpFake()
     with (
         deployment(
@@ -436,11 +437,10 @@ async def test_an_approve_tool_is_refused_in_this_version(tmp_path: Path) -> Non
         async with agent(running) as client:
             result = await client.call_tool("echo", {"text": "hi"})
     assert result.is_error
-    assert (
-        text(result) == "refused: this tool needs an approval, and this version can't ask for one"
-    )
+    assert text(result).startswith("refused: no approver for this client (ref ")
     assert fake.calls == []
-    assert deployed.events("approval_unavailable")
+    [refused] = deployed.events("approval_refused")
+    assert refused["reason"] == "unattended"
 
 
 # --- G10, G11: what comes back -----------------------------------------------------------------

@@ -97,6 +97,12 @@ def call_for(server_policy: ViewRemoteServer) -> pipeline.Call:
     return pipeline.Call("agent1", "notes", server_policy, GatewayLimits(), "modern")
 
 
+async def run_call(*args: Any, **kwargs: Any) -> CallToolResult:
+    result = await pipeline.call_tool(*args, **kwargs)
+    assert isinstance(result, CallToolResult)  # no approval context: never input_required
+    return result
+
+
 def text(result: CallToolResult) -> str:
     block = result.content[0]
     assert isinstance(block, TextContent)
@@ -105,7 +111,7 @@ def text(result: CallToolResult) -> str:
 
 async def test_an_allowed_call_goes_through_the_source() -> None:
     source = FakeSource()
-    result = await pipeline.call_tool(source, call_for(policy(["add"])), "add", {"b": 2, "a": 1})
+    result = await run_call(source, call_for(policy(["add"])), "add", {"b": 2, "a": 1})
     assert text(result) == "3"
     assert source.forwarded == [("agent1", "notes", "add", {"a": 1, "b": 2}, PIN, None)]
 
@@ -113,7 +119,7 @@ async def test_an_allowed_call_goes_through_the_source() -> None:
 async def test_an_unexposed_tool_is_unknown() -> None:
     for source, name in ((FakeSource(refuse_admit=True), "add"), (FakeSource(), "other")):
         with pytest.raises(MCPError) as raised:
-            await pipeline.call_tool(source, call_for(policy(["add"])), name, {})
+            await run_call(source, call_for(policy(["add"])), name, {})
         assert raised.value.error.code == mcp_types.INVALID_PARAMS
         assert raised.value.error.message == pipeline.UNKNOWN_TOOL
         assert source.forwarded == []
@@ -121,23 +127,21 @@ async def test_an_unexposed_tool_is_unknown() -> None:
 
 async def test_invalid_arguments_never_reach_the_source() -> None:
     source = FakeSource()
-    result = await pipeline.call_tool(source, call_for(policy(["add"])), "add", {"a": "x", "b": 1})
+    result = await run_call(source, call_for(policy(["add"])), "add", {"a": "x", "b": 1})
     assert result.is_error
     assert source.forwarded == []
 
 
-async def test_an_approve_tool_is_still_refused_in_this_step() -> None:
+async def test_an_approve_tool_without_an_approval_context_is_refused() -> None:
     source = FakeSource()
-    result = await pipeline.call_tool(
-        source, call_for(policy([], ["add"])), "add", {"a": 1, "b": 2}
-    )
+    result = await run_call(source, call_for(policy([], ["add"])), "add", {"a": 1, "b": 2})
     assert result.is_error
-    assert text(result) == pipeline.APPROVAL_UNAVAILABLE
+    assert text(result).startswith(pipeline.NO_APPROVALS + " (ref ")
     assert source.forwarded == []
 
 
 async def test_a_refusal_from_the_forward_is_an_upstream_error() -> None:
     source = FakeSource(refuse_forward=True)
-    result = await pipeline.call_tool(source, call_for(policy(["add"])), "add", {"a": 1, "b": 2})
+    result = await run_call(source, call_for(policy(["add"])), "add", {"a": 1, "b": 2})
     assert result.is_error
     assert "ref " in text(result)

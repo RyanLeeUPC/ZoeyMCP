@@ -217,6 +217,7 @@ def test_layouts_must_cover_the_write_exactly(body: Any, show: list[Show], messa
         (lambda: Show.line("1abc", "/a"), "a label"),
         (lambda: Show.line("A" * 33, "/a"), "a label"),
         (lambda: Show.line("Sub\nject", "/a"), "a label"),
+        (lambda: Show.line("Subject" + chr(10), "/a"), "a label"),
         (lambda: Show.line("A", "a"), "one top-level member"),
         (lambda: Show.line("A", "/a/b"), "one top-level member"),
         (lambda: Show.line("A", "/a~2"), "bad ~ escape"),

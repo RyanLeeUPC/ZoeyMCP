@@ -253,9 +253,14 @@ class Table:
 
     def legacy_waiting(self, session_sha256: str) -> bool:
         """Whether a legacy prompt is waiting for an answer on this session (D.3)."""
-        return any(
-            p.era == "legacy" and p.decision is None and p.session_sha256 == session_sha256
+        return self.legacy_waiting_count(session_sha256) > 0
+
+    def legacy_waiting_count(self, session_sha256: str) -> int:
+        """Legacy prompts waiting on this session: each reserves one reply slot (D.3)."""
+        return sum(
+            1
             for p in self._by_key.values()
+            if p.era == "legacy" and p.decision is None and p.session_sha256 == session_sha256
         )
 
     def lookup(self, handle_sha256: str, now: float) -> Pending | Tombstone | None:
@@ -483,7 +488,7 @@ def retry(
     now: float,
 ) -> RetryResult:
     """D.6 steps 1-6, in order. A foreign presentation never changes the record (step 3)."""
-    if not isinstance(request_state, str) or not HANDLE_PATTERN.match(request_state):
+    if not isinstance(request_state, str) or not HANDLE_PATTERN.fullmatch(request_state):
         return Unknown()
     digest = handle_sha256(request_state)
     found = table.lookup(digest, now)

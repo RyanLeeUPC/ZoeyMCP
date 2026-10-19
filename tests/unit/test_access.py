@@ -25,6 +25,7 @@ from zoeymcp.gateway.access import (
     host_name,
     identify,
     is_fresh,
+    is_response,
     method_allowed,
     origin_allowed,
     parse_message,
@@ -628,8 +629,59 @@ def test_unknown_methods_by_era() -> None:
 
 def test_a_client_response_is_refused() -> None:
     refusal = check_rpc({"id": 1, "result": {}}, "ok", modern=False)
-    assert isinstance(refusal, Refusal)
-    assert refusal.status == 400
+    assert refusal == Refusal(400, "a client response, and no prompt is waiting for one")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"jsonrpc": "2.0", "id": 3, "result": {"action": "accept"}},
+        {"jsonrpc": "2.0", "id": "a7", "result": {}},
+        {"jsonrpc": "2.0", "id": 3, "error": {"code": -1, "message": "no"}},
+    ],
+)
+def test_an_answer_is_admitted_only_where_a_prompt_waits(message: dict[str, Any]) -> None:
+    assert is_response(message)
+    assert check_rpc(message, "ok", modern=False, answer_expected=True) is None
+    assert isinstance(check_rpc(message, "ok", modern=False, answer_expected=False), Refusal)
+    # Modern requests never carry answers this way: they retry the call (M4 design D.6).
+    assert isinstance(check_rpc(message, "ok", modern=True, answer_expected=True), Refusal)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"id": 3},  # neither result nor error
+        {"id": 3, "result": {}, "error": {}},  # both
+        {"result": {}},  # no id
+        {"id": None, "result": {}},
+        {"id": True, "result": {}},
+        {"id": 1.5, "result": {}},
+        {"id": [1], "result": {}},
+        {"id": 3, "method": "tools/call", "result": {}},
+    ],
+)
+def test_what_isnt_an_answer(message: dict[str, Any]) -> None:
+    assert not is_response(message)
+    if "method" not in message:
+        assert isinstance(check_rpc(message, "ok", modern=False, answer_expected=True), Refusal)
+
+
+def test_reply_slots_are_per_session_and_carry_only_the_waiting_prompts() -> None:
+    counters = ClientCounters()
+    assert not counters.try_acquire_reply("s1", waiting=0)
+    assert counters.try_acquire_reply("s1", waiting=1)
+    assert not counters.try_acquire_reply("s1", waiting=1)  # its one slot is in use
+    assert counters.try_acquire_reply("s1", waiting=2)
+    assert counters.try_acquire_reply("s2", waiting=1)  # another session's own slot
+    counters.release_reply("s1")
+    assert counters.replies == {"s1": 1, "s2": 1}
+    counters.release_reply("s1")
+    counters.release_reply("s2")
+    counters.release_reply("s2")  # an extra release never goes negative
+    assert counters.replies == {}
+    # Reply slots don't touch the request counters.
+    assert counters.requests == {}
 
 
 def test_without_a_version_header_only_initialize() -> None:

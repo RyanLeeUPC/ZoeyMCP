@@ -304,8 +304,18 @@ def test_legacy_waiting() -> None:
     table = Table()
     begin(table, era="legacy", session="s1")
     assert table.legacy_waiting("s1")
+    assert table.legacy_waiting_count("s1") == 1
     assert not table.legacy_waiting("s2")
+    assert table.legacy_waiting_count("s2") == 0
+    wide = Settings(300, 60, 15, max_pending_per_client=2, max_prompts_per_hour=30)
+    begin(
+        table, Key("agent1", "mail", "other"), ref="r2", era="legacy", session="s1", settings=wide
+    )
+    begin(table, Key("agent1", "mail", "third"), ref="r3", handle=a_handle(), settings=wide)
+    assert table.legacy_waiting_count("s1") == 2  # a modern record has no session
     table.decide("r1", "accept", 1.0)
+    assert table.legacy_waiting_count("s1") == 1
+    table.decide("r2", "decline", 1.0)
     assert not table.legacy_waiting("s1")
 
 
@@ -322,7 +332,10 @@ def test_a_valid_retry_consumes_the_handle_once() -> None:
     assert retry(table, handle, key=KEY, args_digest=DIGEST, pin=PIN, now=11.0) == Buried("used")
 
 
-@pytest.mark.parametrize("state", [None, 1, "", "za1.short", "za2." + "a" * 43, "za1." + "!" * 43])
+@pytest.mark.parametrize(
+    "state",
+    [None, 1, "", "za1.short", "za2." + "a" * 43, "za1." + "!" * 43, "za1." + "a" * 43 + chr(10)],
+)
 def test_malformed_handles_are_unknown(state: object) -> None:
     table = Table()
     begin(table, handle=a_handle())

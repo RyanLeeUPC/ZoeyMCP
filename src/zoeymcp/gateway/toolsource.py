@@ -25,7 +25,7 @@ ServedServer = ViewRemoteServer
 @dataclass(frozen=True, repr=False)
 class Grant:
     """What an accepted approval hands the forward: the ref, and the stored arguments and plan
-    the human saw. Approvals arrive in M4 step 6c."""
+    the human saw."""
 
     ref: str
     args: dict[str, Any]
@@ -96,8 +96,18 @@ class RemoteSource:
         progress: Progress | None = None,
         grant: Grant | None = None,
     ) -> CallToolResult:
+        # An approved call is committed (a close waits for it) and never retried (B.6).
+        approved = grant is not None
         return await self.pool.call(
-            server, policy, client, tool, arguments, pin=pin, progress=progress
+            server,
+            policy,
+            client,
+            tool,
+            arguments,
+            pin=pin,
+            progress=progress,
+            committed=approved,
+            retry_expired=not approved,
         )
 
     def input_schema(self, client: str, server: str, tool: str) -> dict[str, Any] | None:

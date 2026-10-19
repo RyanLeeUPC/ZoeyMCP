@@ -143,7 +143,7 @@ class Ledger:
         return ledger, ledger._recover()
 
     def _files(self) -> list[Path]:
-        return sorted(p for p in self.dir.iterdir() if _FILE.match(p.name))
+        return sorted(p for p in self.dir.iterdir() if _FILE.fullmatch(p.name))
 
     def _recover(self) -> Recovery:
         report = Recovery()
@@ -163,7 +163,7 @@ class Ledger:
                 data = data[:-torn]
                 report.torn_bytes = torn
             lines = data.splitlines(keepends=True)
-            start_seq = int(_FILE.match(newest.name).group(1))  # type: ignore[union-attr]
+            start_seq = int(_FILE.fullmatch(newest.name).group(1))  # type: ignore[union-attr]
             start_prev = self._last_hash(found[-2]) if len(found) > 1 else None
             if start_prev is None:
                 start_prev = self._first_prev(lines)
@@ -330,7 +330,7 @@ class Ledger:
         for path in found[:-1]:
             if total <= self.max_bytes:
                 break
-            first = int(_FILE.match(path.name).group(1))  # type: ignore[union-attr]
+            first = int(_FILE.fullmatch(path.name).group(1))  # type: ignore[union-attr]
             last = self._last_seq(path)
             with contextlib.suppress(OSError):
                 path.unlink()

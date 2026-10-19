@@ -28,7 +28,7 @@ def since_ms(value: str | None, now: float | None = None) -> int | None:
     """``7d``, ``12h`` or ``30m`` before now, in epoch milliseconds."""
     if value is None:
         return None
-    match = _SINCE.match(value)
+    match = _SINCE.fullmatch(value)
     if match is None:
         raise UsageError("--since takes a number and m, h or d, like 7d")
     seconds = int(match.group(1)) * _UNIT_SECONDS[match.group(2)]

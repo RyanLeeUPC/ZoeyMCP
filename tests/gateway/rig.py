@@ -32,6 +32,7 @@ from zoeymcp.common.policy.view import GatewayView, ViewRemoteServer, build_view
 from zoeymcp.gateway import logs
 from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
+from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import project_and_pin
 from zoeymcp.gateway.server import AdminApp
@@ -72,6 +73,8 @@ def raw_policy(
     assigned: dict[str, list[str]] | None = None,
     hosts: list[str] | None = None,
     origins: list[str] | None = None,
+    approvals: dict[str, dict[str, Any]] | None = None,
+    gateway_approvals: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The rig's policy. ``servers`` adds gateway servers; ``assigned`` overrides a client's
     server list (each client gets ``[SERVER]`` otherwise)."""
@@ -83,6 +86,7 @@ def raw_policy(
                 "token_sha256": hash_token(f"zgc1-{name}-token"),
                 "servers": (assigned or {}).get(name, [SERVER]),
                 "sources": (sources or {}).get(name, []),
+                **({"approvals": (approvals or {})[name]} if name in (approvals or {}) else {}),
             }
             for name in clients
         },
@@ -105,6 +109,8 @@ def raw_policy(
             **(servers or {}),
         },
     }
+    if gateway_approvals is not None:
+        gateway["approvals"] = gateway_approvals
     if hosts is not None:
         gateway["hosts"] = hosts
     if origins is not None:
@@ -315,6 +321,9 @@ def gateway(deployed: Deployed, *, policy_wait: int = 1) -> Iterator[Running]:
     )
     http = view_client(parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1)))
     app = GatewayApp(pool, http, policy_wait=policy_wait)
+    app.ledger, _ = Ledger.open_at(
+        deployed.state, max_bytes=deployed.view.gateway.limits.ledger_max_bytes
+    )
     with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
         deadline = time.monotonic() + 10
         while httpx.get(f"{url}/healthz", timeout=5).status_code != 200:

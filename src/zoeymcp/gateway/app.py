@@ -21,12 +21,13 @@ import hashlib
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import anyio
 import httpx2
 import mcp_types
+import pydantic
 from mcp.server import Server
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -36,6 +37,7 @@ from mcp.server.models import InitializationOptions
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import MCPError
+from mcp.shared.message import ServerMessageMetadata
 from mcp.types import (
     CallToolRequestParams,
     CallToolResult,
@@ -51,6 +53,8 @@ from starlette.types import Message, Receive, Scope, Send
 
 from ..common.policy.view import ViewGateway, ViewRemoteServer
 from . import access, logs, pipeline
+from .approvals import HANDLE_PATTERN, handle_sha256
+from .approve import Approvals
 from .committed import Committed
 from .connstate import Era
 from .ledger import Ledger
@@ -74,6 +78,8 @@ class RequestScope:
     snapshot: Snapshot
     era: Era
     session_id: str | None
+    # Set when a POST's client hangs up while its handler runs (M4 design D.4).
+    disconnected: anyio.Event | None = None
 
 
 CURRENT: ContextVar[RequestScope | None] = ContextVar("zoeymcp_gateway_request", default=None)
@@ -172,7 +178,9 @@ async def _read_body(receive: Receive, limit: int) -> bytes:
             return b"".join(chunks)
 
 
-def _replay(body: bytes, receive: Receive) -> Receive:
+def _replay(body: bytes, receive: Receive, disconnected: anyio.Event | None = None) -> Receive:
+    """The body already read, then the rest of the request's messages; a disconnect sets
+    ``disconnected``, which a waiting legacy approval watches (M4 design D.4)."""
     sent = False
 
     async def replayed() -> Message:
@@ -180,12 +188,58 @@ def _replay(body: bytes, receive: Receive) -> Receive:
         if not sent:
             sent = True
             return {"type": "http.request", "body": body, "more_body": False}
-        return await receive()
+        message = await receive()
+        if message["type"] == "http.disconnect" and disconnected is not None:
+            disconnected.set()
+        return message
 
     return replayed
 
 
+class _AskSession:
+    """The agent's session, as an approval asks through it (M4 design D.1, D.2)."""
+
+    def __init__(self, ctx: ServerRequestContext[Any]) -> None:
+        self._ctx = ctx
+
+    @property
+    def protocol_version(self) -> str:
+        return self._ctx.session.protocol_version
+
+    @property
+    def can_send_request(self) -> bool:
+        return self._ctx.session.can_send_request
+
+    def elicitation(self) -> tuple[bool, bool, bool]:
+        capabilities = self._ctx.session.client_capabilities
+        found = capabilities.elicitation if capabilities is not None else None
+        if found is None:
+            return False, False, False
+        return True, found.form is not None, found.url is not None
+
+    async def elicit(self, text: str, schema: dict[str, Any], timeout: float) -> Any:
+        # 2025-06-18 has no mode: model_construct with mode=None, which the dump drops.
+        if self.protocol_version == "2025-06-18":
+            params: Any = mcp_types.ElicitRequestFormParams.model_construct(
+                mode=None,  # type: ignore[arg-type]  # deliberately: the dump then drops the key
+                message=text,
+                requested_schema=schema,
+            )
+        else:
+            params = mcp_types.ElicitRequestFormParams(message=text, requested_schema=schema)
+        request = mcp_types.ElicitRequest.model_construct(
+            method="elicitation/create", params=params
+        )
+        return await self._ctx.session.send_request(
+            request,
+            mcp_types.ElicitResult,
+            request_read_timeout_seconds=timeout,
+            metadata=ServerMessageMetadata(related_request_id=self._ctx.request_id),
+        )
+
+
 STALE_CHECK = 1.0  # seconds between staleness checks
+MAX_ANSWER_BYTES = 64 * 1024  # an agent's answer to a prompt (M4 design D.3)
 
 
 class GatewayApp:
@@ -218,7 +272,7 @@ class GatewayApp:
             on_subscriptions_listen=self._listen,
             get_tool_input_schema=self._input_schema,
         )
-        self.server.middleware = [server_info_from_path]
+        self.server.middleware = [server_info_from_path, self._approval_retry_guard]
         self.sessions = access.SessionBindings(idle_timeout=1800)
         self.counters = access.ClientCounters()
         self.in_flight = pipeline.InFlight()
@@ -228,11 +282,25 @@ class GatewayApp:
         # Set by the stop signal, before uvicorn starts draining: new approvals are refused.
         self.stop_requested = False
         self.stop_hooks: list[Callable[[], None]] = []
-        # The approval ledger, opened and recovered before the listener (M4 design F.5).
-        self.ledger: Ledger | None = None
+        self.approvals = Approvals(
+            ledger=None,
+            committed=self.committed,
+            fresh=self.policy.fresh,
+            stopping=lambda: self.stop_requested,
+            clock=clock,
+        )
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
+
+    @property
+    def ledger(self) -> Ledger | None:
+        """The approval ledger, opened and recovered before the listener (M4 design F.5)."""
+        return self.approvals.ledger
+
+    @ledger.setter
+    def ledger(self, ledger: Ledger | None) -> None:
+        self.approvals.ledger = ledger
 
     # --- the view ---------------------------------------------------------------------------
 
@@ -281,6 +349,10 @@ class GatewayApp:
                 if stopped:
                     logs.event("requests_stopped", client=client, server=server, count=stopped)
         self.pool.apply(gateway)
+        if previous is not None:
+            withdrawn = await self.approvals.withdraw_unallowed(gateway)
+            if withdrawn:
+                logs.event("approvals_withdrawn", count=withdrawn)
         if previous is None:
             keep = {
                 pin
@@ -367,6 +439,12 @@ class GatewayApp:
                     group.start_soon(self.ledger.retry_forever)
                 # Committed calls run in this group, out of reach of uvicorn's request cancels.
                 self.committed.attach(group)
+                group.start_soon(self.approvals.sweep_forever)
+
+                def withdraw_on_stop() -> None:
+                    group.start_soon(self.approvals.withdraw, lambda _: True, "shutdown")
+
+                self.stop_hooks.append(withdraw_on_stop)
                 await send({"type": "lifespan.startup.complete"})
                 await receive()  # lifespan.shutdown
                 # Approved calls finish, or reach their deadline, before anything else stops.
@@ -481,18 +559,28 @@ class GatewayApp:
             )
             return
         # 10. limits: the request counts before its body is read; a stream once it's known.
+        # At the cap, a POST on a session with a legacy prompt waiting may take that
+        # prompt's reply slot: step 12 admits only an answer through it (M4 design D.3).
         limits = gateway.limits
         stream = method == "GET"
+        reply: str | None = None
         if not self.counters.try_acquire(
             client,
             stream=stream,
             max_requests=limits.max_concurrent_per_client,
             max_streams=limits.max_streams_per_client,
         ):
-            await self._refuse(
-                send, access.too_many("concurrency"), "limit", server=name, client=client
-            )
-            return
+            waiting, session_sha256 = 0, ""
+            if method == "POST" and session_id is not None:
+                session_sha256 = handle_sha256(session_id)
+                waiting = self.approvals.table.legacy_waiting_count(session_sha256)
+            if waiting and self.counters.try_acquire_reply(session_sha256, waiting=waiting):
+                reply = session_sha256
+            else:
+                await self._refuse(
+                    send, access.too_many("concurrency"), "limit", server=name, client=client
+                )
+                return
         try:
             stream = await self._admitted(
                 manager,
@@ -507,9 +595,13 @@ class GatewayApp:
                 RequestScope(
                     client, name, server, snapshot, "modern" if modern else "legacy", session_id
                 ),
+                reply=reply is not None,
             )
         finally:
-            self.counters.release(client, stream=stream)
+            if reply is not None:
+                self.counters.release_reply(reply)
+            else:
+                self.counters.release(client, stream=stream)
 
     async def _admitted(
         self,
@@ -523,6 +615,8 @@ class GatewayApp:
         modern: bool,
         session_id: str | None,
         request: RequestScope,
+        *,
+        reply: bool = False,
     ) -> bool:
         """Steps 10 to 12 for a request whose client and server are known, then the SDK.
         Returns whether the request took a stream slot."""
@@ -550,9 +644,20 @@ class GatewayApp:
                 reason = "batch" if parsed.rpc_code == -32600 else "body"
                 await self._refuse(send, parsed, reason, server=name, client=client)
                 return stream
-            refusal = access.check_rpc(parsed, version, modern)
+            answer_expected = (
+                session_id is not None
+                and len(body) <= MAX_ANSWER_BYTES
+                and self.approvals.table.legacy_waiting(handle_sha256(session_id))
+            )
+            refusal = access.check_rpc(parsed, version, modern, answer_expected=answer_expected)
             if refusal is not None:
                 await self._refuse(send, refusal, "method", server=name, client=client)
+                return stream
+            if reply and not access.is_response(parsed):
+                # A reply slot carries only answers.
+                await self._refuse(
+                    send, access.too_many("concurrency"), "limit", server=name, client=client
+                )
                 return stream
             rpc = parsed.get("method")
             if rpc == "subscriptions/listen":
@@ -573,14 +678,11 @@ class GatewayApp:
                     send, access.too_many("sessions"), "limit", server=name, client=client
                 )
                 return stream
-        await self._serve(
-            manager,
-            scope,
-            _replay(body, receive) if method == "POST" else receive,
-            send,
-            request,
-            stream=stream,
-        )
+        if method == "POST":
+            disconnected = anyio.Event()
+            receive = _replay(body, receive, disconnected)
+            request = replace(request, disconnected=disconnected)
+        await self._serve(manager, scope, receive, send, request, stream=stream)
         return stream
 
     async def _serve(
@@ -702,7 +804,7 @@ class GatewayApp:
 
     async def _call_tool(
         self, ctx: ServerRequestContext[Any], params: CallToolRequestParams
-    ) -> CallToolResult:
+    ) -> CallToolResult | mcp_types.InputRequiredResult:
         request = _scope()
         self._register(ctx, request)
         call = pipeline.Call(
@@ -716,6 +818,17 @@ class GatewayApp:
         async def progress(value: float, total: float | None) -> None:
             await ctx.session.report_progress(value, total)
 
+        approval = pipeline.Approval(
+            approvals=self.approvals,
+            session=_AskSession(ctx),
+            gateway=request.snapshot.view.gateway,
+            request_state=params.request_state,
+            input_responses=params.input_responses,
+            session_sha256=(
+                handle_sha256(request.session_id) if request.session_id is not None else None
+            ),
+            disconnected=request.disconnected,
+        )
         return await pipeline.call_tool(
             self.source(request.policy),
             call,
@@ -723,7 +836,30 @@ class GatewayApp:
             params.arguments,
             progress=progress,
             in_flight=self.in_flight,
+            approval=approval,
         )
+
+    async def _approval_retry_guard(
+        self, ctx: ServerRequestContext[Any], call_next: CallNext
+    ) -> HandlerResult:
+        """A modern retry whose answers fail the SDK's typed parse never reaches the handler:
+        close its record, so the lock doesn't wait for expiry (M4 design D.7)."""
+        state = ctx.params.get("requestState") if isinstance(ctx.params, dict) else None
+        if (
+            ctx.method != "tools/call"
+            or not isinstance(state, str)
+            or not HANDLE_PATTERN.fullmatch(state)
+        ):
+            return await call_next(ctx)
+        try:
+            return await call_next(ctx)
+        except (pydantic.ValidationError, MCPError) as exc:
+            if isinstance(exc, MCPError) and exc.error.code != mcp_types.INVALID_PARAMS:
+                raise
+            request = CURRENT.get()
+            if request is not None:
+                await self.approvals.close_unparsable(state, request.client, request.server)
+            raise
 
     async def _listen(
         self, ctx: ServerRequestContext[Any], params: SubscriptionsListenRequestParams

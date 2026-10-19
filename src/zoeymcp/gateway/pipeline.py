@@ -7,8 +7,9 @@
 3. **Canonicalize** them, so the object validated is the object sent.
 4. **Validate** against the pinned schema. The answer names the agent's own key and the
    keyword, never a value.
-5. **Decide** from policy, never annotations: ``allow`` continues; ``approve`` is refused, since
-   this version can't ask for an approval; anything unclassified is refused too.
+5. **Decide** from policy, never annotations: ``allow`` continues; ``approve`` goes to the
+   approval decision point (:mod:`.approve`), which asks the human and runs the accepted call
+   itself; anything unclassified is refused.
 6. **Call** with the validated object, registered with the egress filter, under the pin it was
    validated under. A policy change that takes the client's access to the server away stops the
    call (M3 design D.3), which cancels it upstream too.
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 import secrets
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -34,16 +35,20 @@ from mcp.types import CallToolResult, TextContent
 
 from ..common import canonical
 from ..common.policy.schema import GatewayLimits
+from ..common.policy.view import ViewGateway
 from . import logs, schemas
+from .approve import Approvals, Asking, AskSession
 from .connstate import Era
 from .sanitize import map_upstream, sanitize_result
-from .toolsource import ServedServer, ToolSource
+from .toolsource import Grant, ServedServer, ToolSource
 from .upstream import NotAdmitted, Progress, UpstreamError
 
 MAX_ARGUMENT_DEPTH = 32
 UNKNOWN_TOOL = "Unknown tool"
-APPROVAL_UNAVAILABLE = "refused: this tool needs an approval, and this version can't ask for one"
 UNCLASSIFIED = "refused: this tool is not classified"
+UNEXPECTED_INPUT = "refused: unexpected input responses"
+STATE_REFUSED = "refused: approval expired or already used"
+NO_APPROVALS = "refused: no approver for this client"
 REVOKED = (
     "refused: this client's access to the server changed while the call ran; "
     "it may or may not have run"
@@ -77,6 +82,19 @@ class InFlight:
         for scope in scopes:
             scope.cancel()
         return len(scopes)
+
+
+@dataclass
+class Approval:
+    """What an ``approve`` call needs besides the call itself (M4 design B, D)."""
+
+    approvals: Approvals
+    session: AskSession
+    gateway: ViewGateway  # the view the request started with
+    request_state: object = None
+    input_responses: Mapping[str, Any] | None = None
+    session_sha256: str | None = None
+    disconnected: anyio.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -122,7 +140,8 @@ async def call_tool(
     *,
     progress: Progress | None = None,
     in_flight: InFlight | None = None,
-) -> CallToolResult:
+    approval: Approval | None = None,
+) -> CallToolResult | mcp_types.InputRequiredResult:
     started = time.monotonic()
     ref = new_ref()
     args_bytes = 0
@@ -174,10 +193,20 @@ async def call_tool(
         log("refused", "schema")
         return refused(f"arguments refused: at {errors[0]}")
     # 5. Decide, from policy only
+    request_state = approval.request_state if approval is not None else None
+    inputs = approval.input_responses if approval is not None else None
+    if call.era == "legacy" and (request_state is not None or inputs):
+        log("refused", "unexpected_input")
+        return refused(f"{UNEXPECTED_INPUT} (ref {ref})")
     if name in call.policy.tools.approve:
-        logs.event("approval_unavailable", client=call.client, server=call.server, tool=name)
-        log("refused", "approval_unavailable")
-        return refused(APPROVAL_UNAVAILABLE)
+        if approval is None:
+            log("refused", "unattended")
+            return refused(f"{NO_APPROVALS} (ref {ref})")
+        return await _approve(source, call, name, shaped, exposed, ref, progress, approval, log)
+    if request_state is not None:
+        # A handle is good only for the approve tool it was issued for (D.6).
+        log("refused", "unexpected_state")
+        return refused(STATE_REFUSED)
     if name not in call.policy.tools.allow:
         log("refused", "unclassified")
         return refused(UNCLASSIFIED)
@@ -197,6 +226,22 @@ async def call_tool(
         log("cancelled", "revoked")
         return refused(f"{REVOKED} (ref {ref})")
     # 7. Sanitize
+    result = _sanitized(raw, call, name, exposed, ref, budget)
+    result_bytes = sum(len(getattr(block, "text", "")) for block in result.content)
+    log("tool_error" if result.is_error else "ok", result_bytes=result_bytes)
+    return result
+
+
+def _sanitized(
+    raw: CallToolResult,
+    call: Call,
+    name: str,
+    exposed: Any,
+    ref: str,
+    budget: schemas.Budget,
+) -> CallToolResult:
+    """Step 7: the result rebuilt, checked against the pinned output schema, and wrapped."""
+    pin = exposed.pin
     output_schema = exposed.definition.get("outputSchema")
     output_check = None
     if isinstance(output_schema, dict):
@@ -229,6 +274,62 @@ async def call_tool(
     )
     if call.era == "modern":
         result.result_type = "complete"
-    result_bytes = sum(len(getattr(block, "text", "")) for block in result.content)
-    log("tool_error" if result.is_error else "ok", result_bytes=result_bytes)
+    return result
+
+
+async def _approve(
+    source: ToolSource,
+    call: Call,
+    name: str,
+    shaped: dict[str, Any],
+    exposed: Any,
+    ref: str,
+    progress: Progress | None,
+    approval: Approval,
+    log: Any,
+) -> CallToolResult | mcp_types.InputRequiredResult:
+    """Step 5 for an ``approve`` tool: the approval decision point asks, and on ``accept``
+    forwards the stored canonical object itself, committed (M4 design B.2, B.6)."""
+    budget = schemas.Budget.start()
+
+    async def forward(grant: Grant) -> CallToolResult:
+        raw = await source.forward(
+            call.client,
+            call.server,
+            call.policy,
+            name,
+            grant.args,
+            pin=exposed.pin,
+            progress=progress,
+            grant=grant,
+        )
+        return _sanitized(raw, call, name, exposed, ref, budget)
+
+    async def admit() -> str:
+        return (await source.admit(call.client, call.server, call.policy, name)).pin
+
+    result = await approval.approvals.handle(
+        Asking(
+            ref=ref,
+            client=call.client,
+            server=call.server,
+            tool=name,
+            era=call.era,
+            policy=call.policy,
+            gateway=approval.gateway,
+            args=shaped,
+            pin=exposed.pin,
+            session=approval.session,
+            forward=forward,
+            admit=admit,
+            request_state=approval.request_state,
+            input_responses=approval.input_responses,
+            session_sha256=approval.session_sha256,
+            disconnected=approval.disconnected,
+        )
+    )
+    if isinstance(result, mcp_types.InputRequiredResult):
+        log("input_required", "approval")
+    else:
+        log("tool_error" if result.is_error else "ok", "approval")
     return result

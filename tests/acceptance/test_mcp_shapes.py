@@ -167,9 +167,8 @@ async def test_s10_list_call_and_refusals(
     assert invalid.is_error
     assert text(invalid).startswith("arguments refused: at /a: ")
     assert approve.is_error
-    assert (
-        text(approve) == "refused: this tool needs an approval, and this version can't ask for one"
-    )
+    # The profile's client isn't attended, so it is never asked (M4 design D1).
+    assert text(approve).startswith("refused: no approver for this client (ref ")
     assert unknown.value.error.code == -32602
     # Only the validated calls went upstream, each with the vault's key, never the agent's token.
     assert [call.name for call in fake.calls] == ["echo", "add", "report", "slow"]

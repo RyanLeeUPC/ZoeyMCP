@@ -132,6 +132,10 @@ def test_the_vault_may_write_the_same_records() -> None:
         ("asked", REF, {**ASKED, "subject": "Hi"}, "wrong fields"),
         ("asked", REF, {k: v for k, v in ASKED.items() if k != "tool"}, "wrong fields"),
         ("asked", "XYZ", ASKED, "bad ref"),
+        # A trailing newline must not slip past an anchored pattern.
+        ("asked", REF + chr(10), ASKED, "bad ref"),
+        ("asked", REF, {**ASKED, "client": "agent1" + chr(10)}, "bad client"),
+        ("asked", REF, {**ASKED, "pin": PIN + chr(10)}, "bad pin"),
         ("asked", None, ASKED, "bad ref"),
         ("decided", REF, {"decision": "maybe", "waited_ms": 0}, "bad decision"),
         ("outcome", REF, {**OUTCOME, "outcome": "fine"}, "bad outcome"),
