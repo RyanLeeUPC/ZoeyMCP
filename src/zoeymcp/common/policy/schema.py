@@ -388,6 +388,10 @@ class SMTPConnector(_Model):
     from_: Annotated[str, Field(alias="from", max_length=320)]
     to: Annotated[list[Annotated[str, Field(max_length=320)]], Field(min_length=1, max_length=20)]
     max_per_day: Annotated[int, Field(ge=1, le=10000)] = 20
+    max_subject_chars: Annotated[int, Field(ge=1, le=998)] = 150
+    # 2,200 lets a full-length reply fit the default 3,000-character approval budget.
+    max_body_chars: Annotated[int, Field(ge=1, le=100_000)] = 2200
+    paused: bool = False  # refuses every send; outside the secret's binding
 
     @field_validator("host")
     @classmethod
@@ -505,6 +509,17 @@ class Route(_Model):
 # --- gateway -----------------------------------------------------------------------------------
 
 
+class ClientApprovals(_Model):
+    """Whether, and how, this client may be asked to approve a call."""
+
+    attended: bool  # the operator says a human watches this client
+    timeout: Annotated[int, Field(ge=1, le=600)] | None = None  # may only lower the gateway's
+    budget_chars: Annotated[int, Field(ge=200, le=20000)] | None = None  # likewise
+    confirm_code: bool = False
+    # How the client shows a prompt; plain text needs fewer markup rules.
+    renders: Literal["markdown", "plain"] = "markdown"
+
+
 class Client(_Model):
     """An agent. Its token is written as a hash (``zoeymcp client-token``), or literally, which
     ``check`` warns about. Source pins see the direct peer only, never ``X-Forwarded-For``."""
@@ -513,6 +528,7 @@ class Client(_Model):
     token_sha256: TokenHash | None = None
     servers: list[Name] = []
     sources: list[Network] = []
+    approvals: ClientApprovals | None = None  # None: this client is never asked
 
     @field_validator("sources")
     @classmethod
@@ -540,6 +556,9 @@ class Approvals(_Model):
     approver: Literal["elicitation", "telegram", "portal"] = "elicitation"
     timeout: Annotated[int, Field(ge=1, le=86400)] = 300
     budget_chars: Annotated[int, Field(ge=200, le=20000)] = 3000
+    cooldown: Annotated[int, Field(ge=0, le=3600)] = 15  # seconds after a decline-like decision
+    max_pending_per_client: Annotated[int, Field(ge=1, le=16)] = 1
+    max_prompts_per_hour: Annotated[int, Field(ge=1, le=1000)] = 30  # per client, rolling
 
 
 class Tools(_Model):
@@ -617,6 +636,7 @@ class GatewayLimits(_Model):
     max_schema_depth: Annotated[int, Field(ge=4, le=128)] = 32
     max_subschemas: Annotated[int, Field(ge=16, le=10000)] = 512
     policy_max_stale: Annotated[int, Field(ge=30, le=3600)] = 300
+    ledger_max_bytes: Annotated[int, Field(ge=2**20, le=2**30)] = 64 * 2**20
 
 
 Origin = Annotated[str, Field(min_length=8, max_length=300)]

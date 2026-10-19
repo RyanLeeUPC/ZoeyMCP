@@ -1374,6 +1374,7 @@ def test_any_client_assigns_a_server(example_raw: Raw) -> None:
     raw["gateway"]["clients"]["agent2"] = {
         "token_sha256": "sha256:" + "0" * 64,
         "servers": ["broker-trade"],
+        "approvals": {"attended": True},  # its approve tools would draw their own warning
     }
     assert not any("assigned" in f for f in listed(raw))
 
@@ -1724,6 +1725,7 @@ def test_gateway_defaults() -> None:
         "max_schema_depth": 32,
         "max_subschemas": 512,
         "policy_max_stale": 300,
+        "ledger_max_bytes": 64 * 2**20,
     }
 
 
@@ -1828,6 +1830,7 @@ LIMIT_BOUNDS = {
     "max_schema_depth": (4, 128),
     "max_subschemas": (16, 10000),
     "policy_max_stale": (30, 3600),
+    "ledger_max_bytes": (2**20, 2**30),
 }
 
 
@@ -1917,3 +1920,201 @@ def test_basic_usernames_from_env_are_injected_too() -> None:
         "credentials.b.username: env var B_USER has a line break, so an upstream's echo of it in "
         "a stream can't be scrubbed"
     ) in found
+
+
+# --- approvals and the SMTP connector (M4) -------------------------------------------------------
+
+
+def _agent1(raw: Raw) -> Raw:
+    client: Raw = raw["gateway"]["clients"]["agent1"]
+    return client
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (
+            lambda r: r["gateway"]["approvals"].update(approver="portal"),
+            "gateway.approvals.approver: telegram and portal approvers arrive in M8",
+        ),
+        (
+            lambda r: r["gateway"]["approvals"].update(approver="telegram"),
+            "gateway.approvals.approver: telegram and portal approvers arrive in M8",
+        ),
+        (
+            lambda r: r["gateway"]["approvals"].update(timeout=601),
+            "gateway.approvals.timeout: a prompt can't outlive the client's tool call",
+        ),
+        (
+            lambda r: (
+                r["gateway"]["approvals"].update(timeout=120),
+                r["gateway"].setdefault("limits", {}).update(session_idle_timeout=120),
+            ),
+            "gateway.approvals.timeout: must be below limits.session_idle_timeout (120)",
+        ),
+        (
+            lambda r: _agent1(r)["approvals"].update(timeout=301),
+            "gateway.clients.agent1.approvals.timeout: a client setting can only lower it",
+        ),
+        (
+            lambda r: _agent1(r)["approvals"].update(budget_chars=3001),
+            "gateway.clients.agent1.approvals.budget_chars: a client setting can only lower it",
+        ),
+        (
+            lambda r: r["connectors"]["mail-out"].update(password="env:MAIL_PASS"),
+            "connectors.mail-out.password: a connector password must come from the store",
+        ),
+        (
+            lambda r: route(r, "mail-send")["rules"][1].update(methods=["POST", "DELETE"]),
+            "routes[2].rules[1]: a connector answers only GET /config and POST /send, "
+            "not DELETE /send",
+        ),
+        (
+            lambda r: route(r, "mail-send")["rules"][0].update(paths=["/config", "/inbox"]),
+            "routes[2].rules[0]: a connector answers only GET /config and POST /send, "
+            "not GET /inbox",
+        ),
+    ],
+)
+def test_approval_and_connector_errors(
+    example_raw: Raw, mutate: Callable[[Raw], object], expected: str
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    mutate(raw)
+    found = errors(run(raw))
+    assert any(e.startswith(expected) for e in found), found
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (
+            lambda r: r["gateway"]["approvals"].update(timeout=301),
+            "gateway.approvals.timeout: some clients end a tool call sooner",
+        ),
+        (
+            lambda r: _agent1(r).pop("approvals"),
+            "gateway.clients.agent1: not attended, but assigned 'broker-trade' with approve "
+            "tools: they will always be refused",
+        ),
+        (
+            lambda r: _agent1(r)["approvals"].update(attended=False),
+            "gateway.clients.agent1: not attended, but assigned 'broker-trade'",
+        ),
+        (
+            lambda r: _agent1(r).pop("sources"),
+            "gateway.clients.agent1.sources: anyone holding this client's token can make calls",
+        ),
+        (
+            lambda r: r["connectors"]["mail-out"].update(tls="starttls"),
+            "connectors.mail-out.tls: port 465 usually speaks implicit TLS",
+        ),
+        (
+            lambda r: r["connectors"]["mail-out"].update(port=587),
+            "connectors.mail-out.tls: port 587 usually speaks STARTTLS",
+        ),
+        (
+            lambda r: r["connectors"]["mail-out"].update(paused=True),
+            "connectors.mail-out.paused: sends are paused",
+        ),
+        (
+            lambda r: r["gateway"].setdefault("limits", {}).update(call_timeout=301),
+            "gateway.limits.call_timeout: an approved call may run 301 s and a stop waits for it",
+        ),
+        (
+            lambda r: r["gateway"]["servers"]["broker-trade"].update(call_timeout=900),
+            "gateway.servers.broker-trade.call_timeout: an approved call may run 900 s",
+        ),
+    ],
+)
+def test_approval_and_connector_warnings(
+    example_raw: Raw, mutate: Callable[[Raw], object], expected: str
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    mutate(raw)
+    findings = run(raw)
+    assert errors(findings) == []
+    found = warnings(findings)
+    assert any(w.startswith(expected) for w in found), found
+
+
+def test_quiet_approval_settings(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["approvals"].update(timeout=300)
+    _agent1(raw)["approvals"].update(timeout=300, budget_chars=3000, renders="plain")
+    raw["connectors"]["mail-out"].update(port=587, tls="starttls")
+    # Only approve tools need the stop window, and only past 300 s.
+    raw["gateway"]["servers"]["broker-read"].update(call_timeout=900)
+    raw["gateway"]["servers"]["broker-trade"].update(call_timeout=300)
+    findings = run(raw)
+    assert errors(findings) == []
+    assert len(warnings(findings)) == 2  # the example's own two
+
+
+def test_an_env_connector_password_is_an_error_only(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["connectors"]["mail-out"]["password"] = "env:MAIL_PASS"
+    findings = run(raw, environ={})
+    on_password = [f for f in findings if f.path == "connectors.mail-out.password"]
+    assert [f.level for f in on_password] == ["error"]
+    # An env: username is still only a warning: the binding protects the password.
+    raw["connectors"]["mail-out"]["password"] = "store:mail-pass"
+    raw["connectors"]["mail-out"]["username"] = "env:MAIL_USER"
+    assert errors(run(raw)) == []
+
+
+def test_unattended_clients_without_approve_tools_are_quiet(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    del _agent1(raw)["approvals"]
+    _agent1(raw)["servers"] = ["broker-read", "mail"]
+    assert not any("not attended" in w for w in warnings(run(raw)))
+
+
+def test_approval_schema_bounds() -> None:
+    approvals = Gateway.model_validate({}).approvals
+    assert (approvals.cooldown, approvals.max_pending_per_client) == (15, 1)
+    assert approvals.max_prompts_per_hour == 30
+    for field, low, high in [
+        ("cooldown", 0, 3600),
+        ("max_pending_per_client", 1, 16),
+        ("max_prompts_per_hour", 1, 1000),
+    ]:
+        Gateway.model_validate({"approvals": {field: low}})
+        Gateway.model_validate({"approvals": {field: high}})
+        for bad in (low - 1, high + 1):
+            with pytest.raises(ValidationError):
+                Gateway.model_validate({"approvals": {field: bad}})
+
+
+def test_client_approvals_schema() -> None:
+    base = {"token_sha256": "sha256:" + "0" * 64}
+    assert Client.model_validate(base).approvals is None
+    client = Client.model_validate({**base, "approvals": {"attended": True}})
+    assert client.approvals is not None
+    assert (client.approvals.renders, client.approvals.confirm_code) == ("markdown", False)
+    assert (client.approvals.timeout, client.approvals.budget_chars) == (None, None)
+    for bad in (
+        {},  # attended is required: the operator must say
+        {"attended": True, "renders": "html"},
+        {"attended": True, "timeout": 601},
+        {"attended": True, "timeout": 0},
+        {"attended": True, "budget_chars": 199},
+        {"attended": True, "budget_chars": 20001},
+    ):
+        with pytest.raises(ValidationError):
+            Client.model_validate({**base, "approvals": bad})
+
+
+def test_smtp_connector_limits(example_raw: Raw) -> None:
+    policy = parse_policy(yaml.safe_dump(example_raw, sort_keys=False), "test")
+    conn = policy.connectors["mail-out"]
+    assert (conn.max_subject_chars, conn.max_body_chars, conn.paused) == (150, 2200, False)
+    for field, bad in [
+        ("max_subject_chars", 0),
+        ("max_subject_chars", 999),
+        ("max_body_chars", 0),
+        ("max_body_chars", 100_001),
+    ]:
+        broken = copy.deepcopy(example_raw)
+        broken["connectors"]["mail-out"][field] = bad
+        assert any(field in e for e in schema_errors(broken)), field

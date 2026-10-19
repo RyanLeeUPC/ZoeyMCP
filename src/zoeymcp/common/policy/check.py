@@ -89,6 +89,12 @@ _TOKEN_HEADERS = frozenset(
 # An absolute URI without a fragment (RFC 8707 section 2), in any scheme.
 _RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:[^#\x00-\x20\x7f]+$")
 _DEFAULT_PORTS = {"https": 443, "http": 80}
+# The two endpoints of an SMTP connector route, as (method, path).
+_CONNECTOR_ENDPOINTS = frozenset({("GET", "/config"), ("POST", "/send")})
+# The longest approval timeout an elicitation may use: clients end a tool call sooner (§6.1).
+MAX_ELICITATION_TIMEOUT = 600
+# A stop waits for approved calls already running; the shipped stop windows cover this long.
+STOP_WINDOW_CALL_TIMEOUT = 300
 
 
 class _Report:
@@ -149,6 +155,13 @@ def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, st
         if not ref.startswith("env:"):
             continue
         var = ref.removeprefix("env:")
+        if path.startswith("connectors.") and path.endswith(".password"):
+            report.error(
+                path,
+                "a connector password must come from the store, where it is bound to the "
+                "connector's host, port, from and to; enter it with zoeymcp secret set",
+            )
+            continue
         if is_seed:
             name = path.split(".")[1]
             cred = policy.credentials.get(name)
@@ -278,9 +291,15 @@ def _check_credentials(policy: Policy, report: _Report) -> None:
             upstreams = [r.upstream for r in policy.routes if r.credential == name and r.upstream]
             origins = {o for o in map(_origin, upstreams) if o is not None}
             _check_oauth(path, cred, origins, report)
-    for name in policy.connectors:
+    for name, conn in policy.connectors.items():
+        path = f"connectors.{name}"
         if name not in used_connectors:
-            report.warning(f"connectors.{name}", "not used by any route")
+            report.warning(path, "not used by any route")
+        if (conn.port, conn.tls) in ((465, "starttls"), (587, "implicit")):
+            usual = "implicit TLS" if conn.port == 465 else "STARTTLS"
+            report.warning(f"{path}.tls", f"port {conn.port} usually speaks {usual}")
+        if conn.paused:
+            report.warning(f"{path}.paused", "sends are paused")
 
 
 def _origin(url: str) -> str | None:
@@ -444,6 +463,8 @@ def _check_routes(policy: Policy, report: _Report) -> None:
         _check_route_target(policy, path, route, report)
         _check_route_callers(path, route, route.name in mcp_routes, report)
         _check_route_rules(path, route, report)
+        if route.connector is not None:
+            _check_connector_rules(path, route, report)
         _check_route_query(policy, path, route, report)
 
 
@@ -513,6 +534,21 @@ def _check_route_rules(path: str, route: Route, report: _Report) -> None:
             )
         if len(set(rule.methods)) != len(rule.methods):
             report.warning(f"{r_path}.methods", "a method is listed more than once")
+
+
+def _check_connector_rules(path: str, route: Route, report: _Report) -> None:
+    for r_index, rule in enumerate(route.rules):
+        extra = sorted(
+            f"{method} {pattern}"
+            for method in rule.methods
+            for pattern in rule.paths
+            if (method, pattern) not in _CONNECTOR_ENDPOINTS
+        )
+        if extra:
+            report.error(
+                f"{path}.rules[{r_index}]",
+                f"a connector answers only GET /config and POST /send, not {', '.join(extra)}",
+            )
 
 
 def _check_route_query(policy: Policy, path: str, route: Route, report: _Report) -> None:
@@ -585,6 +621,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
         return
     routes = {r.name: r for r in policy.routes}
     _check_clients(gateway, report)
+    _check_approvals(gateway, report)
     assigned = {s for client in gateway.clients.values() for s in client.servers}
     server_paths: dict[str, list[NormalizedPath]] = defaultdict(list)
     for server in gateway.servers.values():
@@ -604,6 +641,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
                 _check_mcp_route(path, server, route, server_paths[route.name], report)
         if isinstance(server, RemoteServer | BridgeServer):
             _check_upstream_server(path, server, report)
+            _check_stop_window(path, server, gateway.limits.call_timeout, report)
             _check_tools(
                 path, server.tools.include, server.tools.allow, server.tools.approve, report
             )
@@ -627,6 +665,19 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
         )
 
 
+def _check_stop_window(
+    path: str, server: RemoteServer | BridgeServer, default: int, report: _Report
+) -> None:
+    timeout = server.call_timeout or default
+    if server.tools.approve and timeout > STOP_WINDOW_CALL_TIMEOUT:
+        where = f"{path}.call_timeout" if server.call_timeout else "gateway.limits.call_timeout"
+        report.warning(
+            where,
+            f"an approved call may run {timeout} s and a stop waits for it, but the shipped "
+            f"stop windows cover {STOP_WINDOW_CALL_TIMEOUT} s; raise stop_grace_period",
+        )
+
+
 def _check_clients(gateway: Gateway, report: _Report) -> None:
     for name, client in gateway.clients.items():
         path = f"gateway.clients.{name}.servers"
@@ -640,6 +691,54 @@ def _check_clients(gateway: Gateway, report: _Report) -> None:
                 report.warning(
                     path, f"{server_name!r} is a {server.kind} server: not served by this version"
                 )
+
+
+def _check_approvals(gateway: Gateway, report: _Report) -> None:
+    approvals = gateway.approvals
+    path = "gateway.approvals"
+    if approvals.approver != "elicitation":
+        report.error(f"{path}.approver", "telegram and portal approvers arrive in M8")
+    elif approvals.timeout > MAX_ELICITATION_TIMEOUT:
+        report.error(f"{path}.timeout", "a prompt can't outlive the client's tool call (§6.1)")
+    elif approvals.timeout > 300:
+        report.warning(
+            f"{path}.timeout", "some clients end a tool call sooner; see the client notes"
+        )
+    if approvals.timeout >= gateway.limits.session_idle_timeout:
+        report.error(
+            f"{path}.timeout",
+            f"must be below limits.session_idle_timeout ({gateway.limits.session_idle_timeout})",
+        )
+    for name, client in gateway.clients.items():
+        c_path = f"gateway.clients.{name}"
+        own = client.approvals
+        if own is not None:
+            if own.timeout is not None and own.timeout > approvals.timeout:
+                report.error(f"{c_path}.approvals.timeout", "a client setting can only lower it")
+            if own.budget_chars is not None and own.budget_chars > approvals.budget_chars:
+                report.error(
+                    f"{c_path}.approvals.budget_chars", "a client setting can only lower it"
+                )
+        if own is not None and own.attended:
+            if not client.sources:
+                report.warning(
+                    f"{c_path}.sources",
+                    "anyone holding this client's token can make calls and answer their "
+                    "prompts, with or without confirm_code; keep the token out of the agent's "
+                    "sandbox and pin a source",
+                )
+            continue
+        asks = [
+            s
+            for s in client.servers
+            if (server := gateway.servers.get(s)) is not None and server.tools.approve
+        ]
+        if asks:
+            report.warning(
+                c_path,
+                f"not attended, but assigned {', '.join(repr(s) for s in asks)} with approve "
+                "tools: they will always be refused",
+            )
 
 
 def _request_path(path: str) -> NormalizedPath | None:

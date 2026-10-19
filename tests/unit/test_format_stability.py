@@ -206,13 +206,15 @@ VIEW_POLICY = {
         },
     },
 }
-VIEW_DIGEST = "sha256:5e83cfb6487f79f6d92f89d4b3f9305dcd20f9934a819389811ad10a32345661"
+VIEW_DIGEST = "sha256:2d15d1fd4e8b9849279283f2401fe4d8debb086512ac3c2d2fecc045af67c811"
 VIEW_BYTES = (
     b'{"digest":"' + VIEW_DIGEST.encode() + b'","gateway":{"approvals":{"approver":"elicitation",'
-    b'"budget_chars":3000,"timeout":300},"clients":{"agent1":{"servers":["notes-read"],'
+    b'"budget_chars":3000,"cooldown":15,"max_pending_per_client":1,"max_prompts_per_hour":30,'
+    b'"timeout":300},"clients":{"agent1":{"approvals":null,"servers":["notes-read"],'
     b'"sources":[],"token_sha256":"sha256:' + b"1" * 64 + b'"}},'
     b'"hosts":["localhost","127.0.0.1","gateway","zoeymcp.lan.example"],'
-    b'"limits":{"call_timeout":300,"list_timeout":30,"max_argument_bytes":262144,'
+    b'"limits":{"call_timeout":300,"ledger_max_bytes":67108864,"list_timeout":30,'
+    b'"max_argument_bytes":262144,'
     b'"max_concurrent_per_client":8,"max_list_bytes":4194304,"max_list_pages":32,'
     b'"max_request_bytes":1048576,"max_result_bytes":4194304,"max_schema_bytes":65536,'
     b'"max_schema_depth":32,"max_sessions_per_client":16,"max_streams_per_client":4,'

@@ -24,6 +24,7 @@ from .findings import format_location
 from .schema import (
     Approvals,
     Capability,
+    ClientApprovals,
     Gateway,
     GatewayLimits,
     Name,
@@ -61,6 +62,7 @@ class ViewClient(_Model):
     token_sha256: TokenHash
     servers: list[Name]
     sources: list[Network]
+    approvals: ClientApprovals | None
 
     @field_validator("sources")
     @classmethod
@@ -165,6 +167,7 @@ def build_view(policy: Policy) -> GatewayView:
                 token_sha256=client.token_hash,
                 servers=list(client.servers),
                 sources=list(client.sources),
+                approvals=client.approvals,
             )
             for name, client in gateway.clients.items()
         },

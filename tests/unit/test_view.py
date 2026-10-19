@@ -134,14 +134,28 @@ EXPECTED_GATEWAY: Raw = {
         "max_schema_depth": 32,
         "max_subschemas": 512,
         "policy_max_stale": 30,
+        "ledger_max_bytes": 67108864,
     },
-    "approvals": {"approver": "portal", "timeout": 60, "budget_chars": 200},
+    "approvals": {
+        "approver": "portal",
+        "timeout": 60,
+        "budget_chars": 200,
+        "cooldown": 15,
+        "max_pending_per_client": 1,
+        "max_prompts_per_hour": 30,
+    },
     "clients": {
-        "agent1": {"token_sha256": hash_token(TOKEN_1), "servers": ["notes-read"], "sources": []},
+        "agent1": {
+            "token_sha256": hash_token(TOKEN_1),
+            "servers": ["notes-read"],
+            "sources": [],
+            "approvals": None,
+        },
         "agent2": {
             "token_sha256": HASH_2,
             "servers": ["notes-read", "notes-write", "mail", "bridged"],
             "sources": ["10.0.0.0/8", "::1"],
+            "approvals": None,
         },
     },
     "servers": {
@@ -221,7 +235,14 @@ def test_without_a_gateway_section_the_view_has_the_defaults() -> None:
         "origins": [],
         "limits": EXPECTED_GATEWAY["limits"]
         | {"max_request_bytes": 1048576, "policy_max_stale": 300},
-        "approvals": {"approver": "elicitation", "timeout": 300, "budget_chars": 3000},
+        "approvals": {
+            "approver": "elicitation",
+            "timeout": 300,
+            "budget_chars": 3000,
+            "cooldown": 15,
+            "max_pending_per_client": 1,
+            "max_prompts_per_hour": 30,
+        },
         "clients": {},
         "servers": {},
     }
@@ -490,6 +511,19 @@ def test_the_models_are_strict_and_frozen() -> None:
         parse_view(reencode(raw))
 
 
+def test_client_approval_settings_reach_the_gateway() -> None:
+    raw = raw_policy()
+    settings = {"attended": True, "timeout": 30, "confirm_code": True, "renders": "plain"}
+    raw["gateway"]["clients"]["agent2"]["approvals"] = settings
+    view = built(raw)
+    assert as_raw(view)["gateway"]["clients"]["agent2"]["approvals"] == {
+        **settings,
+        "budget_chars": None,
+    }
+    assert parse_view(dump_view(view)) == view
+    assert view.gateway.clients["agent1"].approvals is None
+
+
 def test_hosts_bounds() -> None:
     raw = as_raw(built())
     raw["gateway"]["hosts"] = ["localhost"]
@@ -510,6 +544,7 @@ def test_every_vault_path_check_allows_builds_and_parses(prefix: str, path: str)
     raw["routes"][0]["rules"][0]["paths"] = [path]
     raw["gateway"]["servers"]["notes-read"]["path"] = path
     raw["gateway"]["servers"]["notes-write"]["path"] = path
+    raw["gateway"]["approvals"]["approver"] = "elicitation"  # check refuses others until M8
     policy = Policy.model_validate(raw)
     assert [f for f in check_policy(policy) if f.level == "error"] == []
     view = build_view(policy)

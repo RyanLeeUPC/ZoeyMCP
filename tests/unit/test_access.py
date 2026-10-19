@@ -63,13 +63,20 @@ def gateway(**changes: Any) -> ViewGateway:
                 "token_sha256": hash_token(TOKENS["alpha"]),
                 "servers": ["notes", "mail"],
                 "sources": [],
+                "approvals": None,
             },
             "beta": {
                 "token_sha256": hash_token(TOKENS["beta"]),
                 "servers": ["notes"],
                 "sources": ["10.0.0.0/8", "fd00::/8"],
+                "approvals": None,
             },
-            "gamma": {"token_sha256": hash_token(TOKENS["gamma"]), "servers": [], "sources": []},
+            "gamma": {
+                "token_sha256": hash_token(TOKENS["gamma"]),
+                "servers": [],
+                "sources": [],
+                "approvals": None,
+            },
         },
         "servers": {"notes": REMOTE, "mail": {"kind": "toolkit"}, "other": REMOTE},
     }

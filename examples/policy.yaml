@@ -82,6 +82,10 @@ gateway:
       # From `zoeymcp client-token`: the agent sends the token as Authorization: Bearer,
       # and the policy holds only its hash.
       token_sha256: sha256:8ca973db011281c88e678afeb86d1955579aed24fd7deeae43155fe7aabb0f43
+      # The agent's network as the gateway sees it (the direct peer, never X-Forwarded-For).
+      sources: [192.0.2.0/24]
+      # A human watches this client, so it may be asked to approve calls.
+      approvals: { attended: true }
       servers: [broker-read, broker-trade, mail]
 
   approvals:
