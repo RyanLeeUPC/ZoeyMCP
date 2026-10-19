@@ -345,7 +345,7 @@ def test_a_good_call() -> None:
         ({"subject": ""}, [("/subject", "text_rules")]),
         ({"subject": "a\nb"}, [("/subject", "text_rules")]),
         ({"subject": "x" * 151}, [("/subject", "text_rules")]),
-        ({"subject": "a‮b"}, [("/subject", "text_rules")]),
+        ({"subject": "a\u202eb"}, [("/subject", "text_rules")]),
         ({"body": "a\rb"}, [("/body", "text_rules")]),
         ({"urgent": 1}, [("/urgent", "type")]),
         ({"kind": "other"}, [("/kind", "enum")]),

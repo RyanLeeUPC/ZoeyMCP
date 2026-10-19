@@ -244,7 +244,7 @@ def test_load_problems_see_what_the_gateway_hides() -> None:
     odd = Toolkit("odd", slots={})
 
     @odd.tool(consequential=False)
-    async def pick(ctx: ToolContext, mode: Literal["a", "b‮"]) -> str:
+    async def pick(ctx: ToolContext, mode: Literal["a", "b\u202e"]) -> str:
         """Pick."""
         return ""
 

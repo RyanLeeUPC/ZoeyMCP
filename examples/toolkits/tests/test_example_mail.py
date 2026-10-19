@@ -126,7 +126,7 @@ async def test_a_leading_space_is_refused_before_asking() -> None:
 
 
 async def test_hidden_text_is_refused_not_shown() -> None:
-    out = await run(toolkit, "send_note", {"subject": "Hi", "body": "a‮b"}, slots={"mail": mail()})
+    out = await run(toolkit, "send_note", {"subject": "Hi", "body": "a\u202eb"}, slots={"mail": mail()})
     assert out.text == "arguments refused: at /body: text_rules"
 
 
