@@ -3,8 +3,9 @@
 Usage: gh run download RUN_ID --pattern 'mutation-shard-*' --dir DIR
        python scripts/mutation-weights.py DIR
 
-Each shard uploads mutmut's .meta files, which hold every mutant's test time. A module's weight
-is the sum over its mutants, from the shard that ran them.
+Each shard uploads mutmut's .meta files, which hold the test time of every mutant it ran. A
+module's weight is the sum over its mutants, from the shards that ran them: a module cut by last
+digit is run by several.
 """
 
 from __future__ import annotations
@@ -16,15 +17,18 @@ from pathlib import Path
 
 def weights(root: Path) -> dict[str, float]:
     found: dict[str, float] = {}
+    seen: set[str] = set()
     for meta in sorted(root.rglob("*.meta")):
         durations = json.loads(meta.read_text(encoding="utf-8")).get("durations_by_key", {})
         if not durations:
-            continue  # a module another shard ran
+            continue  # a module other shards ran
+        for key in durations:
+            if key in seen:
+                raise ValueError(f"two shards ran {key}")
+        seen.update(durations)
         src = next(parent for parent in meta.parents if parent.name == "src")
         module = ".".join(meta.relative_to(src).with_suffix("").with_suffix("").parts)
-        if module in found:
-            raise ValueError(f"two shards ran {module}")
-        found[module] = sum(durations.values())
+        found[module] = found.get(module, 0.0) + sum(durations.values())
     return found
 
 

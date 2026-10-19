@@ -1,5 +1,6 @@
-"""The mutation workflow's scripts: shards cover every mutated module once, and the merged stats
-fail the gate when a mutant ran in no shard or in two."""
+"""The mutation workflow's scripts: shards cover every mutated module once, the merge counts each
+mutant once from the shards' .meta files, and the gate fails a mutant no shard ran, a low overall
+score and a module below its floor."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from mutmut.stats import status_by_exit_code
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
@@ -87,41 +89,107 @@ def test_the_cli_prints_patterns(
     assert shard.main() == 2
 
 
+def write_meta(
+    root: Path,
+    shard_dir: str,
+    module: str,
+    codes: dict[str, int | None],
+    durations: dict[str, float] | None = None,
+) -> None:
+    """A .meta file where download-artifact puts it: SHARDS_DIR/<artifact>/mutants/src/..."""
+    path = root / shard_dir / "mutants" / "src" / (module.replace(".", "/") + ".py.meta")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"exit_code_by_key": codes, "durations_by_key": durations or {}}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
 def test_weights_come_from_the_shard_that_ran_each_module(tmp_path: Path) -> None:
     def meta(shard_dir: str, module: str, durations: dict[str, float]) -> None:
-        path = tmp_path / shard_dir / "mutants" / "src" / (module.replace(".", "/") + ".py.meta")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"durations_by_key": durations}), encoding="utf-8")
+        write_meta(tmp_path, shard_dir, module, dict.fromkeys(durations, 1), durations)
 
     meta("mutation-shard-0", "zoeymcp.vault.peer", {"a__mutmut_1": 1.5, "a__mutmut_2": 2.0})
-    meta("mutation-shard-0", "zoeymcp.vault.store", {})
+    meta("mutation-shard-0", "zoeymcp.vault.store", {"b__mutmut_2": 0.5})
     meta("mutation-shard-1", "zoeymcp.vault.store", {"b__mutmut_1": 4.0})
     meta("mutation-shard-1", "zoeymcp.vault.peer", {})
-    assert weights.weights(tmp_path) == {"zoeymcp.vault.peer": 3.5, "zoeymcp.vault.store": 4.0}
+    assert weights.weights(tmp_path) == {"zoeymcp.vault.peer": 3.5, "zoeymcp.vault.store": 4.5}
     meta("mutation-shard-2", "zoeymcp.vault.store", {"b__mutmut_1": 4.0})
-    with pytest.raises(ValueError, match="two shards ran"):
+    with pytest.raises(ValueError, match="two shards ran b__mutmut_1"):
         weights.weights(tmp_path)
 
 
-def stats(**counts: int) -> dict[str, Any]:
-    base = dict.fromkeys(merge.OUTCOMES, 0)
-    return {**base, "total": 10, **counts}
+def test_the_merge_has_mutmuts_exit_code_table() -> None:
+    assert dict(status_by_exit_code) == merge.STATUS_BY_EXIT_CODE
+    assert status_by_exit_code.default_factory is not None
+    assert status_by_exit_code.default_factory() == merge.OTHER_STATUS
+    assert set(merge.OUTCOMES) < {name.replace(" ", "_") for name in status_by_exit_code.values()}
 
 
-def test_merge_sums_and_finds_what_no_shard_ran() -> None:
-    merged = merge.merge([stats(killed=4, survived=1), stats(killed=3, timeout=1)])
-    assert (merged["killed"], merged["survived"], merged["timeout"]) == (7, 1, 1)
-    assert merged["not_checked"] == 1
-    merged = merge.merge([stats(killed=6), stats(killed=6)])
-    assert merged["not_checked"] == -2
-    with pytest.raises(ValueError, match="disagree"):
-        merge.merge([stats(), {**stats(), "total": 11}])
+def test_a_split_module_counts_each_mutant_once(tmp_path: Path) -> None:
+    key = [f"zoeymcp.vault.store.x_open__mutmut_{number}" for number in range(1, 5)]
+    first = {key[0]: 1, key[1]: 0, key[2]: None, key[3]: None}
+    write_meta(tmp_path, "mutation-shard-0", "zoeymcp.vault.store", first, {key[0]: 2, key[1]: 1})
+    second = {key[0]: None, key[1]: None, key[2]: -24, key[3]: 33}
+    write_meta(tmp_path, "mutation-shard-1", "zoeymcp.vault.store", second, {key[2]: 4.0})
+    write_meta(tmp_path, "mutation-shard-0", "zoeymcp.vault.peer", {"p__mutmut_1": None})
+    write_meta(tmp_path, "mutation-shard-1", "zoeymcp.vault.peer", {"p__mutmut_1": 1})
+    merged = merge.merge(tmp_path)
+    store = merged["modules"]["zoeymcp.vault.store"]
+    assert (store["killed"], store["survived"], store["timeout"], store["no_tests"]) == (1, 1, 1, 1)
+    assert (store["total"], store["not_checked"]) == (4, 0)
+    assert merged["modules"]["zoeymcp.vault.peer"]["killed"] == 1
+    assert (merged["killed"], merged["total"], merged["not_checked"]) == (2, 5, 0)
+    assert merged["seconds_by_shard"] == {"mutation-shard-0": 3.0, "mutation-shard-1": 4.0}
+    assert merged["shards"] == 2
 
 
-def run_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> int:
+def test_a_mutant_no_shard_ran_is_not_checked(tmp_path: Path) -> None:
+    write_meta(tmp_path, "mutation-shard-0", "zoeymcp.vault.peer", {"a": 1, "b": None})
+    write_meta(tmp_path, "mutation-shard-1", "zoeymcp.vault.peer", {"a": None, "b": None})
+    assert merge.merge(tmp_path)["not_checked"] == 1
+
+
+def test_a_mutant_two_shards_report_fails(tmp_path: Path) -> None:
+    write_meta(tmp_path, "mutation-shard-0", "zoeymcp.vault.peer", {"a": 1, "b": None})
+    write_meta(tmp_path, "mutation-shard-1", "zoeymcp.vault.peer", {"a": 0, "b": 1})
+    with pytest.raises(ValueError, match=r"two shards report a$"):
+        merge.merge(tmp_path)
+    with pytest.raises(ValueError, match=r"no \.meta files"):
+        merge.merge(tmp_path / "empty")
+
+
+def test_the_merge_cli_writes_the_stats(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_meta(tmp_path, "mutation-shard-0", "zoeymcp.vault.peer", {"a": 1}, {"a": 2.4})
+    out = tmp_path / "merged.json"
+    monkeypatch.setattr(sys, "argv", ["mutation-merge.py", str(out), str(tmp_path)])
+    assert merge.main() == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["modules"]["zoeymcp.vault.peer"]["killed"]
+    assert "mutation-shard-0: 2 s of test time" in capsys.readouterr().out
+    monkeypatch.setattr(sys, "argv", ["mutation-merge.py", str(out)])
+    assert merge.main() == 2
+
+
+def stats(**modules: dict[str, int]) -> dict[str, Any]:
+    """Merged stats of ten mutants a module, named with "_" for "."."""
+    by_module = {}
+    for name, counts in modules.items():
+        found = {**dict.fromkeys(merge.OUTCOMES, 0), "total": 10, **counts}
+        found["not_checked"] = found["total"] - sum(found[n] for n in merge.OUTCOMES)
+        by_module[name.replace("_", ".")] = found
+    columns = (*merge.OUTCOMES, "total", "not_checked")
+    return {**{n: sum(m[n] for m in by_module.values()) for n in columns}, "modules": by_module}
+
+
+def run_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: dict[str, Any], floors: str = ""
+) -> int:
     path = tmp_path / "merged.json"
     path.write_text(json.dumps(data), encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", ["mutation-gate.py", str(path), "--min-score", "89"])
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(f"[tool.zoeymcp.mutation-floors]\n{floors}\n", encoding="utf-8")
+    argv = ["mutation-gate.py", str(path), "--min-score", "89", "--pyproject", str(pyproject)]
+    monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     result: int = gate.main()
     return result
@@ -130,11 +198,28 @@ def run_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: dict[str, An
 def test_the_gate_needs_every_mutant_run_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    full = merge.merge([stats(killed=9, survived=1)])
+    full = stats(a_x={"killed": 9, "survived": 1})
     assert run_gate(tmp_path, monkeypatch, full) == 0
-    missing = merge.merge([stats(killed=8, survived=1)])
+    missing = stats(a_x={"killed": 8, "survived": 1})
     assert run_gate(tmp_path, monkeypatch, missing) == 1
-    twice = merge.merge([stats(killed=9, survived=1), stats(killed=1)])
-    assert run_gate(tmp_path, monkeypatch, twice) == 1
-    low = merge.merge([stats(killed=8, survived=2)])
+    low = stats(a_x={"killed": 8, "survived": 2})
     assert run_gate(tmp_path, monkeypatch, low) == 1
+    untested = stats(a_x={"no_tests": 10})
+    assert run_gate(tmp_path, monkeypatch, untested) == 1
+
+
+def test_a_module_below_its_floor_fails_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = stats(a_x={"killed": 10}, a_y={"killed": 10}, b_z={"killed": 8, "survived": 2})
+    assert run_gate(tmp_path, monkeypatch, data) == 0  # 93.3% overall
+    assert run_gate(tmp_path, monkeypatch, data, '"a.*" = 90') == 0
+    assert run_gate(tmp_path, monkeypatch, data, '"b.z" = 80') == 0
+    assert run_gate(tmp_path, monkeypatch, data, '"b.*" = 90') == 1
+    assert run_gate(tmp_path, monkeypatch, data, '"*" = 80\n"b.z" = 90') == 1
+    assert run_gate(tmp_path, monkeypatch, data, '"c.*" = 90') == 1  # matches no module
+
+
+def test_the_repository_floors_parse() -> None:
+    found = gate.floors(gate.ROOT / "pyproject.toml")
+    assert all(0 < percent <= 100 for percent in found.values())

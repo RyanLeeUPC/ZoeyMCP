@@ -57,7 +57,8 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutation-shard-${{ matrix.shard }}
-          # The .meta files hold each mutant's run time: the source for mutation-shard.py's weights.
+          # The .meta files hold each mutant's result and run time: the merge's source, and the
+          # source for mutation-shard.py's weights.
           path: |
             stats-${{ matrix.shard }}.json
             survivors.txt
@@ -84,6 +85,6 @@ jobs:
           pattern: mutation-shard-*
           path: shards
       - name: Merge
-        run: python3 scripts/mutation-merge.py merged.json shards/*/stats-*.json
+        run: python3 scripts/mutation-merge.py merged.json shards
       - name: Gate
         run: python3 scripts/mutation-gate.py merged.json --min-score 89
