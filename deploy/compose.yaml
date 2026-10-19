@@ -37,9 +37,11 @@ services:
     cap_add: [SETUID, SETGID]
     security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
-    # The launcher gives the vault and the gateway 50 s to stop: OAuth refreshes in flight
-    # finish and are saved, and calls in flight get 10 s.
-    stop_grace_period: 60s
+    # The launcher stops the gateway first and gives it up to 330 s: an approved call already
+    # running finishes (default call_timeout 300 s) and its outcome is recorded. Then the vault
+    # gets 75 s: OAuth refreshes and an SMTP send in flight finish. Other calls get 10 s. Raise
+    # this if an approve tool's call_timeout is longer (check warns).
+    stop_grace_period: 420s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
       # The policy, inline: no bind mounts needed. `docker compose kill -s HUP zoeymcp` reloads

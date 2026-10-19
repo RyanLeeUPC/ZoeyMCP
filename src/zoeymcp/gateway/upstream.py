@@ -18,7 +18,8 @@ module does the I/O around them:
   deadline. A legacy session that expired is re-opened, and the call that hit the 404 is retried
   once if the tool is still admitted with the same pin. Nothing else is ever retried;
 - **close** idle connections, the least recently used at the session limit, and those a policy
-  change affects.
+  change affects. A close cuts the connection's calls at once, except committed ones (approved
+  calls, M4 design B.6): the session ends only after they finish, each within its deadline.
 """
 
 from __future__ import annotations
@@ -159,6 +160,9 @@ class Connection:
         self.vault_refusal: tuple[int, str | None] | None = None
         self.in_flight = 0
         self.holds = 0  # downstream listeners that keep this connection open
+        # Each call's cancel scope, with its deadline if it is committed (None if not).
+        self._calls: dict[anyio.CancelScope, float | None] = {}
+        self.closing = False
         self.last_used = pool.clock()
         self.running = False
         self.done = anyio.Event()
@@ -187,7 +191,36 @@ class Connection:
     def idle(self, now: float, timeout: float) -> bool:
         return self.in_flight == 0 and self.holds == 0 and now - self.last_used > timeout
 
+    @property
+    def committed(self) -> int:
+        """Committed calls still running on this connection."""
+        return sum(1 for deadline in self._calls.values() if deadline is not None)
+
+    def committed_deadline(self) -> float | None:
+        deadlines = [d for d in self._calls.values() if d is not None]
+        return max(deadlines) if deadlines else None
+
     def request_close(self) -> None:
+        """End the session. Uncommitted calls are cut now; committed ones finish first."""
+        self.closing = True
+        for scope, deadline in list(self._calls.items()):
+            if deadline is None:
+                scope.cancel()
+        if self.committed:
+            logs.event(
+                "upstream_draining", server=self.server, key=self.label, committed=self.committed
+            )
+            return  # the last committed call ends the session
+        self._end()
+
+    def cancel_committed(self) -> int:
+        """Past every deadline (shutdown's backstop): cut the committed calls too."""
+        found = [scope for scope, deadline in self._calls.items() if deadline is not None]
+        for scope in found:
+            scope.cancel()
+        return len(found)
+
+    def _end(self) -> None:
         self._close.set()
         self._end_session.set()
         if not self.running:
@@ -267,6 +300,7 @@ class Connection:
             self.running = False
             if self._close.is_set() or self.state.phase is not Phase.FAILED:
                 self._set(on_closed(self.state))
+            self.pool.drained(self)
             self.done.set()
 
     async def _session(self) -> None:
@@ -491,28 +525,43 @@ class Connection:
         *,
         timeout: float,
         progress: Progress | None = None,
+        committed: bool = False,
     ) -> CallToolResult:
+        """One call. A committed call (an approved one) keeps the session open until it ends:
+        a close waits for it. Any other call is cut when the connection closes."""
         client = self.client
-        if client is None:
+        if client is None or self.closing:
             raise UpstreamError("unavailable", "not connected")
         digest = canonical.digest(arguments)
         self.registry.register(tool, digest)
         self.in_flight += 1
         self.last_used = self.pool.clock()
+        scope = anyio.CancelScope()
+        self._calls[scope] = anyio.current_time() + timeout if committed else None
         try:
-            with anyio.fail_after(timeout):
-                result = await client.call_tool(
-                    tool, arguments, progress_callback=_progress_relay(progress, self.pool.clock)
-                )
-        except BaseException as exc:
-            # A registration that never went out is withdrawn. If it did go out and the call
-            # then failed, this may withdraw a concurrent identical call's registration, which
-            # then fails closed.
-            self.registry.withdraw(tool, digest)
-            raise self._call_error(exc) from exc
+            with scope:
+                try:
+                    with anyio.fail_after(timeout):
+                        result = await client.call_tool(
+                            tool,
+                            arguments,
+                            progress_callback=_progress_relay(progress, self.pool.clock),
+                        )
+                except BaseException as exc:
+                    # A registration that never went out is withdrawn. If it did go out and
+                    # the call then failed, this may withdraw a concurrent identical call's
+                    # registration, which then fails closed.
+                    self.registry.withdraw(tool, digest)
+                    raise self._call_error(exc) from exc
         finally:
             self.in_flight -= 1
             self.last_used = self.pool.clock()
+            del self._calls[scope]
+            if self.closing and committed and not self.committed:
+                self._end()
+        if scope.cancelled_caught:
+            # The connection closed under the call: as M3 reported a session ended under it.
+            raise UpstreamError("connection_lost", "closed")
         if result.result_type not in (None, "complete"):
             raise UpstreamError("unsupported_result", str(result.result_type))
         return result
@@ -594,6 +643,8 @@ class UpstreamPool:
     transport_factory: Callable[[], Any] | None = None
     eras: dict[str, Era] = field(default_factory=dict)
     _connections: dict[tuple[str, str], Connection] = field(default_factory=dict)
+    # Closed connections whose committed calls are still running (M4 design B.6).
+    _draining: set[Connection] = field(default_factory=set)
     _group: TaskGroup | None = None
     _reported: set[tuple[str, str, str, str | None]] = field(default_factory=set)
 
@@ -614,13 +665,28 @@ class UpstreamPool:
             self._group = None
 
     async def aclose(self) -> None:
-        """Close every connection, each within its grace period."""
-        for connection in list(self._connections.values()):
+        """Close every connection, each within its grace period, after any committed calls
+        finish within their deadlines; past those, cut them too."""
+        connections = [*self._connections.values(), *self._draining]
+        for connection in connections:
             connection.request_close()
-        with anyio.move_on_after(CLOSE_GRACE + 1, shield=True):
-            for connection in list(self._connections.values()):
+        deadlines = [d for c in connections if (d := c.committed_deadline()) is not None]
+        wait = max([0.0, *(d - anyio.current_time() for d in deadlines)]) + CLOSE_GRACE + 1
+        with anyio.move_on_after(wait, shield=True):
+            for connection in connections:
                 await connection.done.wait()
+        overdue = sum(c.cancel_committed() for c in connections if not c.done.is_set())
+        if overdue:
+            logs.event("upstream_close_overdue", cancelled=overdue, level="error")
+            with anyio.move_on_after(CLOSE_GRACE + 1, shield=True):
+                for connection in connections:
+                    await connection.done.wait()
         self._connections.clear()
+        self._draining.clear()
+
+    def drained(self, connection: Connection) -> None:
+        """A connection's owner task ended."""
+        self._draining.discard(connection)
 
     # --- connections ---------------------------------------------------------------------------
 
@@ -656,7 +722,7 @@ class UpstreamPool:
 
     def _make_room(self, now: float) -> None:
         open_ = [c for c in self._connections.values() if c.state.phase is not Phase.CLOSED]
-        if len(open_) < self.limits.max_upstream_sessions:
+        if len(open_) + len(self._draining) < self.limits.max_upstream_sessions:
             return
         idle = sorted(
             (c for c in open_ if c.in_flight == 0 and c.holds == 0), key=lambda c: c.last_used
@@ -730,12 +796,16 @@ class UpstreamPool:
         *,
         pin: str | None = None,
         progress: Progress | None = None,
+        committed: bool = False,
+        retry_expired: bool = True,
     ) -> CallToolResult:
         """Admit and call. A legacy session that expired is re-opened and the call retried once,
         if the tool is still admitted with the same pin.
 
         ``pin`` is the one the arguments were validated under: if the tool is admitted under
-        another one now, nothing is sent.
+        another one now, nothing is sent. An approved call is ``committed`` (a close waits for
+        it) and never retried (``retry_expired=False``): only the upstream's 404 says the first
+        try never ran (M4 design B.6).
         """
         timeout = float(policy.call_timeout or self.limits.call_timeout)
         connection = self.connection(server, policy, client)
@@ -744,14 +814,19 @@ class UpstreamPool:
             raise NotAdmitted("pin changed after validation")
         pin = admitted
         try:
-            return await connection.call(tool, arguments, timeout=timeout, progress=progress)
-        except _SessionExpired:
-            pass
+            return await connection.call(
+                tool, arguments, timeout=timeout, progress=progress, committed=committed
+            )
+        except _SessionExpired as exc:
+            if not retry_expired:
+                raise UpstreamError("connection_lost", "session_expired") from exc
         connection = self.connection(server, policy, client)
         if await self.admit(connection, tool) != pin:
             raise NotAdmitted("pin changed after the session expired")
         try:
-            return await connection.call(tool, arguments, timeout=timeout, progress=progress)
+            return await connection.call(
+                tool, arguments, timeout=timeout, progress=progress, committed=committed
+            )
         except _SessionExpired as exc:
             raise UpstreamError("connection_lost", "session expired twice") from exc
 
@@ -838,6 +913,8 @@ class UpstreamPool:
         )
         connection.request_close()
         self._connections.pop(key, None)
+        if connection.committed:
+            self._draining.add(connection)
 
     def close_all(self, reason: str) -> None:
         for key, connection in list(self._connections.items()):

@@ -377,13 +377,13 @@ def run(sup: Supervisor, system: System, rounds: int = 1000) -> int:
     raise AssertionError("the supervisor didn't finish")
 
 
-def test_sigterm_stops_both_and_exits_0() -> None:
+def test_sigterm_stops_the_gateway_then_the_vault_and_exits_0() -> None:
     system = System()
     sup = supervisor(system)
     assert sup.step() is None
     sup.on_signal(signal.SIGTERM)
     assert run(sup, system) == 0
-    assert system.written == [(4, b"TERM\n"), (5, b"TERM\n")]
+    assert system.written == [(5, b"TERM\n"), (4, b"TERM\n")]
     assert [child.status for child in sup.children] == [0, 0]
 
 
@@ -409,8 +409,38 @@ def test_a_child_that_wont_stop_is_left_after_the_wait() -> None:
     system = System(obey=False)
     sup = supervisor(system)
     sup.on_signal(signal.SIGINT)
-    assert run(sup, system) == 1
+    assert run(sup, system, rounds=5000) == 1
     assert system.now == pytest.approx(launcher.STOP_WAIT + launcher.POLL, abs=launcher.POLL)
+    assert system.written == [(5, b"TERM\n"), (4, b"TERM\n")]
+
+
+def test_the_vault_outlives_the_gateway() -> None:
+    system = System(obey=False)
+    sup = supervisor(system)
+    sup.on_signal(signal.SIGTERM)
+    while system.now < 300:  # an approved call still runs in the gateway
+        assert sup.step() is None
+        system.sleep(launcher.POLL)
+    assert system.written == [(5, b"TERM\n")]
+    system.ended.append((105, 0))  # the gateway is done
+    assert sup.step() is None
+    assert system.written == [(5, b"TERM\n"), (4, b"TERM\n")]
+    # The vault is told once, however long it takes.
+    sup.stop("signal")
+    assert system.written == [(5, b"TERM\n"), (4, b"TERM\n")]
+
+
+def test_the_vault_is_told_after_the_gateways_wait() -> None:
+    system = System(obey=False)
+    sup = supervisor(system)
+    sup.stop("signal")
+    system.now = launcher.GATEWAY_STOP_WAIT
+    assert sup.step() is None
+    assert system.written == [(5, b"TERM\n")]
+    system.now = launcher.GATEWAY_STOP_WAIT + 0.1
+    assert sup.step() is None
+    assert system.written == [(5, b"TERM\n"), (4, b"TERM\n")]
+    assert launcher.STOP_WAIT == launcher.GATEWAY_STOP_WAIT + launcher.VAULT_STOP_WAIT
 
 
 def test_orphans_are_reaped_and_a_dead_childs_pipe_is_ignored() -> None:

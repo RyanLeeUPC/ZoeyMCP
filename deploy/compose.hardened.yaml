@@ -59,8 +59,9 @@ services:
     image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
     command: [vault, --listen, "0.0.0.0:8080"]
     user: "10001:10001"
-    # On stop, OAuth refreshes in flight finish and are saved (up to 45 s) before the vault exits.
-    stop_grace_period: 50s
+    # On stop, OAuth refreshes in flight finish and are saved (up to 45 s), and an SMTP send in
+    # flight finishes (up to 60 s), before the vault exits.
+    stop_grace_period: 75s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
       # The policy, inline: no bind mounts needed. Reload it with `docker compose kill -s HUP vault`
@@ -125,8 +126,12 @@ services:
     image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
     command: [gateway, --vault, "http://vault:8080", --listen, "0.0.0.0:8090"]
     user: "10002:10002"
-    # Calls in flight get 10 s.
-    stop_grace_period: 20s
+    # An approved call already running finishes (default call_timeout 300 s) and its outcome is
+    # recorded; other calls get 10 s. Raise this if an approve tool's call_timeout is longer.
+    stop_grace_period: 330s
+    # Compose stops the gateway first, so the vault outlives the calls it is still forwarding.
+    depends_on:
+      vault: {condition: service_started}
     environment:
       # Or ZOEYMCP_GATEWAY_KEY_FILE, a file the gateway re-reads on HUP (a Docker secret, say).
       ZOEYMCP_GATEWAY_KEY: ${ZOEYMCP_GATEWAY_KEY:?print it with `zoeymcp keygen` or `zoeymcp gateway-key`}

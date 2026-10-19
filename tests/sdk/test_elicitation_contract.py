@@ -11,7 +11,10 @@ supplies. Agents are raw ``httpx`` (to see which stream carries what) and the SD
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import threading
+import time
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
@@ -745,3 +748,75 @@ async def test_a_response_post_reaches_only_its_own_session() -> None:
             await answer(http, url, mine, request["id"], {"action": "accept"})
             final = await anext(stream)
     assert final["result"]["content"][0]["text"] == "accept"
+
+
+# --- 35. how a shutdown cancels a handler, both ways (M4 design B.6) ------------------------------
+
+
+class GracefulApp:
+    """An app whose one request handler shields a long wait, recording when things happen."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, float]] = []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            self.events.append(("lifespan_shutdown", time.monotonic()))
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        self.events.append(("started", time.monotonic()))
+        with anyio.CancelScope(shield=True):
+            await anyio.sleep(2.0)
+        self.events.append(("handler_done", time.monotonic()))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"done"})
+
+
+def _get(url: str) -> None:
+    with contextlib.suppress(httpx.HTTPError):
+        httpx.get(url, timeout=10)
+
+
+def test_uvicorns_graceful_cancel_is_native_and_goes_through_a_shield() -> None:
+    # uvicorn ends request tasks still running at timeout_graceful_shutdown with asyncio's own
+    # task.cancel(), which an anyio shield doesn't stop. So the gateway never runs a committed
+    # call in the request's task (M4 design B.6): it runs in a task the gateway owns.
+    app = GracefulApp()
+    with serve(app, lifespan=True) as base:  # timeout_graceful_shutdown is 1 s there
+        threading.Thread(target=_get, args=(base,), daemon=True).start()
+        deadline = time.monotonic() + 5
+        while not app.events and time.monotonic() < deadline:
+            time.sleep(0.01)
+    names = dict(app.events)
+    assert "started" in names
+    assert "handler_done" not in names  # cut inside its shield
+    assert names["lifespan_shutdown"] - names["started"] < 2.0  # right after the grace
+
+
+async def test_the_session_managers_exit_doesnt_reach_into_a_shield() -> None:
+    finished: list[float] = []
+
+    async def handler(ctx: ServerRequestContext[Any], params: types.CallToolRequestParams) -> Any:
+        with anyio.CancelScope(shield=True):
+            await anyio.sleep(1.5)
+            finished.append(time.monotonic())
+        return done("ok")
+
+    asker = Asker(handler)
+    with running(asker) as url:
+        session = legacy_session(url)
+
+        def call() -> None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.post(url, json=call_body(), headers=session_headers(session), timeout=10)
+
+        threading.Thread(target=call, daemon=True).start()
+        with anyio.fail_after(5):
+            while asker.events != ["started"]:
+                await anyio.sleep(0.02)
+    # Leaving the server ran the lifespan shutdown, whose manager.run() exit cancelled the
+    # session's tasks; the legacy handler still finished inside its shield.
+    assert len(finished) == 1

@@ -51,6 +51,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 from ..common.policy.view import ViewGateway, ViewRemoteServer
 from . import access, logs, pipeline
+from .committed import Committed
 from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier
@@ -222,6 +223,11 @@ class GatewayApp:
         self.counters = access.ClientCounters()
         self.in_flight = pipeline.InFlight()
         self.remote = RemoteSource(pool)
+        # Approved calls past their accept; a shutdown waits for them first (M4 design B.6).
+        self.committed = Committed()
+        # Set by the stop signal, before uvicorn starts draining: new approvals are refused.
+        self.stop_requested = False
+        self.stop_hooks: list[Callable[[], None]] = []
         # The approval ledger, opened and recovered before the listener (M4 design F.5).
         self.ledger: Ledger | None = None
         self.manager: StreamableHTTPSessionManager | None = None
@@ -338,6 +344,14 @@ class GatewayApp:
                 self.pool.close_all("policy_stale")
             stale = now_stale
 
+    def request_stop(self) -> None:
+        """The stop signal arrived. Runs in the signal callback, so hooks only schedule work."""
+        if self.stop_requested:
+            return
+        self.stop_requested = True
+        for hook in self.stop_hooks:
+            hook()
+
     async def lifespan(self, receive: Receive, send: Send) -> None:
         await receive()  # lifespan.startup
         self.first_view = first_view = anyio.Event()
@@ -351,12 +365,19 @@ class GatewayApp:
                 group.start_soon(self._watch_staleness)
                 if self.ledger is not None:
                     group.start_soon(self.ledger.retry_forever)
+                # Committed calls run in this group, out of reach of uvicorn's request cancels.
+                self.committed.attach(group)
                 await send({"type": "lifespan.startup.complete"})
                 await receive()  # lifespan.shutdown
+                # Approved calls finish, or reach their deadline, before anything else stops.
+                cancelled = await self.committed.drain()
+                if cancelled:
+                    logs.event("shutdown_deadline_passed", cancelled=len(cancelled), level="error")
                 stopping.set()
                 await self.pool.aclose()
                 group.cancel_scope.cancel()
         finally:
+            self.committed.attach(None)
             self.manager = None
         await send({"type": "lifespan.shutdown.complete"})
 

@@ -11,9 +11,12 @@
    --supervise`` with an empty environment: the master key is then gone from PID 1's memory and
    from ``/proc/1/environ``, and PID 1 holds no capability.
 5. **Supervise**. PID 1 can't signal other uids, so ``SIGTERM`` and ``SIGINT`` become ``TERM``
-   on both control pipes and ``SIGHUP`` becomes ``HUP``. If either child exits, the other is told
-   to stop; after at most :data:`STOP_WAIT` seconds the launcher exits non-zero, so the container
-   restarts. PID 1 reaps every process that ends, orphans included.
+   on the control pipes and ``SIGHUP`` becomes ``HUP`` on both. The gateway is told to stop
+   first: an approved call it is still forwarding goes through the vault (M4 design B.6). The
+   vault is told once the gateway has exited, or after :data:`GATEWAY_STOP_WAIT` seconds. If
+   either child exits on its own, the other is told to stop. After at most :data:`STOP_WAIT`
+   seconds the launcher exits non-zero, so the container restarts. PID 1 reaps every process
+   that ends, orphans included.
 
 The launcher uses the standard library only.
 """
@@ -37,7 +40,13 @@ from . import env
 
 # The image's second environment, the only one with the gateway's dependencies (B.5).
 GATEWAY_PYTHON = "/opt/zoeymcp-gateway/bin/python"
-STOP_WAIT = 50.0  # seconds the children get to stop; compose's stop_grace_period is 60
+# Seconds the gateway gets to stop: an approved call accepted just before may run for the default
+# call_timeout (300 s), and its outcome is written after (M4 design B.6).
+GATEWAY_STOP_WAIT = 330.0
+# Seconds the vault gets after that: more than an SMTP send's 60 s.
+VAULT_STOP_WAIT = 75.0
+# compose's stop_grace_period is 420 s.
+STOP_WAIT = GATEWAY_STOP_WAIT + VAULT_STOP_WAIT
 POLL = 0.2
 STATUS_FILE = "/proc/self/status"
 # POSIX constants, looked up so the module still imports (and type-checks) on Windows.
@@ -219,21 +228,35 @@ class Supervisor:
     pending: list[str] = field(default_factory=list)  # commands from signal handlers
     stopping_since: float | None = None
     failed: bool = False
+    vault_told: bool = False
 
     def on_signal(self, signum: int, _frame: object = None) -> None:
         self.pending.append("HUP" if signum == SIGHUP else "TERM")
 
-    def tell(self, command: str) -> None:
+    def tell(self, command: str, names: tuple[str, ...] = ("vault", "gateway")) -> None:
         for child in self.children:
-            if child.status is None:
+            if child.status is None and child.name in names:
                 with contextlib.suppress(OSError):  # a child that just ended
                     self.write(child.control, command.encode() + b"\n")
+
+    def _child(self, name: str) -> Child:
+        return next(child for child in self.children if child.name == name)
 
     def stop(self, reason: str) -> None:
         if self.stopping_since is None:
             self.stopping_since = self.clock()
             log("launcher_stopping", reason=reason)
-        self.tell("TERM")
+        self.tell("TERM", ("gateway",))
+        self._stop_vault_when_due()
+
+    def _stop_vault_when_due(self) -> None:
+        """The vault outlives the gateway, up to :data:`GATEWAY_STOP_WAIT`."""
+        if self.stopping_since is None or self.vault_told:
+            return
+        waited = self.clock() - self.stopping_since
+        if self._child("gateway").status is not None or waited > GATEWAY_STOP_WAIT:
+            self.vault_told = True
+            self.tell("TERM", ("vault",))
 
     def reap(self) -> None:
         while True:
@@ -261,6 +284,7 @@ class Supervisor:
             else:
                 self.stop("signal")
         self.reap()
+        self._stop_vault_when_due()
         if all(child.status is not None for child in self.children):
             return 1 if self.failed else 0
         if self.stopping_since is not None and self.clock() - self.stopping_since > STOP_WAIT:

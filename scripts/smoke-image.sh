@@ -352,7 +352,7 @@ done
 standard logs zoeymcp | grep -q '"event":"reload_ok"' || fail "the vault didn't reload"
 
 step "standard tier: a graceful stop"
-standard stop -t 60 zoeymcp
+standard stop -t 420 zoeymcp
 [ "$(docker inspect -f '{{.State.ExitCode}}' "$std")" = "0" ] || fail "the launcher exited non-zero"
 for child in vault gateway; do
     standard logs zoeymcp | grep -q "\"event\":\"child_exited\",\"child\":\"$child\",\"status\":0" \

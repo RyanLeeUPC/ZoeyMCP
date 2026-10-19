@@ -11,7 +11,8 @@ import pytest
 import yaml
 
 from zoeymcp.common.policy import check_policy, parse_policy
-from zoeymcp.entrypoint import env
+from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.entrypoint import env, launcher
 
 DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
 COMPOSE_FILES = sorted(DEPLOY.glob("compose*.yaml"))
@@ -129,3 +130,21 @@ def test_the_lan_profile(path: str, upstream: str) -> None:
         if "ZOEYMCP_CONFIG" in service.get("environment", {})
     )
     assert "zoeymcp.lan.example" in yaml.safe_load(policy)["gateway"]["hosts"]
+
+
+def _seconds(value: str) -> float:
+    match = re.fullmatch(r"([0-9]+)s", value)
+    assert match is not None, value
+    return float(match.group(1))
+
+
+def test_the_stop_windows_let_approved_calls_finish() -> None:
+    # M4 design B.6: a stop waits for an approved call already running, which goes through the
+    # vault, so the gateway stops first and the windows cover the default call_timeout.
+    standard = compose("compose.yaml")["services"]["zoeymcp"]
+    assert _seconds(standard["stop_grace_period"]) > launcher.STOP_WAIT
+    hardened = compose("compose.hardened.yaml")["services"]
+    assert _seconds(hardened["gateway"]["stop_grace_period"]) >= launcher.GATEWAY_STOP_WAIT
+    assert _seconds(hardened["vault"]["stop_grace_period"]) >= launcher.VAULT_STOP_WAIT
+    assert hardened["gateway"]["depends_on"] == {"vault": {"condition": "service_started"}}
+    assert GatewayLimits().call_timeout + 30 <= launcher.GATEWAY_STOP_WAIT

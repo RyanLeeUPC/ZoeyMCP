@@ -331,6 +331,8 @@ async def serve(gateway: Gateway, options: Options) -> None:
         )
 
     def stop() -> None:
+        # First, so new approvals are refused while uvicorn drains (M4 design B.6).
+        gateway.app.request_stop()
         for server in servers:
             server.should_exit = True
 
