@@ -12,7 +12,9 @@ state file can edit: it is shown, and no decision reads it. ``action`` is what t
 ``kind`` and the name it applies to, so the portal can offer a button and the CLI words its own
 command. The kinds are :func:`~.oauth.login.hint_action`'s (``connect``, ``reset``,
 ``set_secret`` and ``restart`` with the ``ref``, ``fix_policy``, ``wait``), plus
-``delete_secret``, ``check_volume`` and ``check_mailbox``.
+``delete_secret``, ``check_volume`` and ``check_mailbox``, and for the passkeys ``add_passkey``,
+``review_passkeys`` and ``reset_passkeys``, and for the reported ledger ``check_gateway`` and
+``read_ledger``.
 
 Stored bindings are judged by effect, not by equality (verifier V9), because the socket may store
 an explicit ``origins`` binding for any name: ``binding_changed`` means a use the policy makes now
@@ -50,6 +52,10 @@ _CODE: Final = re.compile(r"[a-z_]{1,64}")
 _FAILING: Final = frozenset({"backoff", "terminal"})
 # The status fields drawn from an entry's clear meta.
 DISPLAY_ONLY: Final = ("source", "consented_at", "rotations", "last_ok_ago")
+# A passkey counter that went back within this many days is a warning.
+REGRESSION_DAYS: Final = 30
+# The gateway asks for the copy's head at least every 60 s while it takes reports (J.3).
+STALE_SECONDS: Final = 300
 
 Action = dict[str, str]
 Finding = dict[str, Any]
@@ -66,6 +72,17 @@ class Sends:
 
 
 @dataclass(frozen=True)
+class PasskeyState:
+    """The portal's passkey file, summed up (D.4): never a key, an ID or a name."""
+
+    count: int
+    # The file failed to read, parse or verify: portal login is off.
+    unavailable: bool = False
+    # Seconds since the latest day a counter went back, or None.
+    regressed_ago: float | None = None
+
+
+@dataclass(frozen=True)
 class Inputs:
     policy: Policy
     entries: Sequence[EntryMeta]
@@ -77,6 +94,25 @@ class Inputs:
     sends: Mapping[str, Sends] = field(default_factory=dict)
     # False when the store holds changes its file doesn't (a failed write).
     persisted: bool = True
+    # The passkeys, or None without a portal: the report then has no passkeys section.
+    passkeys: PasskeyState | None = None
+    # The reported copy, or None without a gateway: the report then has no ledger_copy section.
+    ledger_copy: LedgerCopy | None = None
+
+
+@dataclass(frozen=True)
+class LedgerCopy:
+    """The vault's copy of the gateway's ledger, summed up (M5 design J.4): never a line."""
+
+    # ok, fork, gap, full, or unavailable (the directory can't be read).
+    state: str
+    head_seq: int | None
+    # Seconds since the gateway last asked for the head or reported, None if it hasn't since
+    # the vault started; and seconds since the vault started.
+    reported_ago: int | None
+    uptime: int
+    # Where the copy's files stop chaining, as recovery found it.
+    broken_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -112,15 +148,21 @@ def assess(inputs: Inputs) -> dict[str, Any]:
     ]
     store = _store(inputs)
     sections = [*credentials, *connectors, store]
-    summary = {
-        level: sum(f["level"] == level for s in sections for f in s["findings"]) for level in LEVELS
-    }
-    return {
-        "summary": summary,
+    report: dict[str, Any] = {
         "credentials": credentials,
         "connectors": connectors,
         "store": store,
     }
+    if inputs.passkeys is not None:
+        report["passkeys"] = _passkeys(inputs.passkeys)
+        sections.append(report["passkeys"])
+    if inputs.ledger_copy is not None:
+        report["ledger_copy"] = _ledger_copy(inputs.ledger_copy)
+        sections.append(report["ledger_copy"])
+    summary = {
+        level: sum(f["level"] == level for s in sections for f in s["findings"]) for level in LEVELS
+    }
+    return {"summary": summary, **report}
 
 
 # --- credentials -------------------------------------------------------------------------------
@@ -316,6 +358,70 @@ def _store(inputs: Inputs) -> dict[str, Any]:
         text = "degraded (not persisted): the store can't be written"
         findings.append(_finding("degraded", "error", text, {"kind": "check_volume"}))
     return {"entries": len(inputs.entries), "level": _level(findings), "findings": findings}
+
+
+def _passkeys(state: PasskeyState) -> dict[str, Any]:
+    """A file that can't be verified, a single passkey, a counter that went back (I.1)."""
+    findings: list[Finding] = []
+    if state.unavailable:
+        text = (
+            "the passkey file can't be verified (edited, or written under another master key); "
+            "portal login is off"
+        )
+        findings.append(_finding("passkeys_unavailable", "error", text, {"kind": "reset_passkeys"}))
+        return {"count": None, "level": _level(findings), "findings": findings}
+    if state.regressed_ago is not None and state.regressed_ago < REGRESSION_DAYS * DAY:
+        text = (
+            f"a passkey's signature counter went back in the last {REGRESSION_DAYS} days: "
+            "the authenticator may have been copied"
+        )
+        findings.append(_finding("passkey_counter", "warning", text, {"kind": "review_passkeys"}))
+    if state.count == 1:
+        text = "only one passkey is enrolled: add a second, so losing one doesn't lock you out"
+        findings.append(_finding("passkey_single", "info", text, {"kind": "add_passkey"}))
+    return {"count": state.count, "level": _level(findings), "findings": findings}
+
+
+_REFUSED_TEXT: Final = {
+    "fork": "the gateway's ledger no longer extends the copy (a fork)",
+    "gap": "the gateway's report skipped records the copy doesn't hold (a gap)",
+    "full": "the copy is full and holds nothing received long enough ago to prune",
+}
+
+
+def _ledger_copy(copy: LedgerCopy) -> dict[str, Any]:
+    """The reported copy (J.2, J.4): one that can't be read, a sticky refusal, a break in its
+    files, a gateway that stopped reporting, or none yet."""
+    findings: list[Finding] = []
+    read = {"kind": "read_ledger"}
+    gateway = {"kind": "check_gateway"}
+    quiet = copy.uptime if copy.reported_ago is None else copy.reported_ago
+    if copy.state == "unavailable":
+        text = "the vault can't read its copy of the gateway's ledger; reports are refused"
+        findings.append(
+            _finding("ledger_copy_unavailable", "error", text, {"kind": "check_volume"})
+        )
+    elif copy.state in _REFUSED_TEXT:
+        text = f"{_REFUSED_TEXT[copy.state]}: reports are refused until the chain is restarted"
+        findings.append(_finding("ledger_copy_refused", "error", text, read))
+    elif quiet > STALE_SECONDS:
+        text = f"no report from the gateway for {quiet // 60} min"
+        findings.append(_finding("ledger_copy_stale", "warning", text, gateway))
+    elif copy.head_seq is None:
+        findings.append(
+            _finding("ledger_copy_none", "info", "no report from the gateway yet", gateway)
+        )
+    if copy.broken_at is not None and copy.state != "unavailable":
+        text = f"the copy's files stop chaining at seq {copy.broken_at} (damaged or edited)"
+        findings.append(_finding("ledger_copy_broken", "error", text, read))
+    return {
+        "state": copy.state,
+        "head_seq": copy.head_seq,
+        "reported_ago": copy.reported_ago,
+        "broken_at": copy.broken_at,
+        "level": _level(findings),
+        "findings": findings,
+    }
 
 
 def sends(journal: Journal, now_ms: int) -> Sends:

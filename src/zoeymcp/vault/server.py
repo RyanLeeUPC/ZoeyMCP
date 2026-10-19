@@ -41,6 +41,7 @@ from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
 from .oauth.login import LoginService
 from .peer import link_supported, peer_checked
+from .reportstore import ReportStore
 from .store import SecretStore, StoreError
 
 if sys.platform != "win32":
@@ -402,6 +403,9 @@ def run(
     runtime = load_runtime(config, state_dir, environ)
     if gateway_socket is not None:
         check_link_dir(gateway_socket)
+    # Before any listener opens: a torn tail is cut and the head rebuilt from the lines (M5 J.4).
+    # A copy that can't be read is unavailable, and the proxy runs anyway.
+    reports = ReportStore.open(state_dir)
     app = VaultApp(
         runtime.policy,
         runtime.store,
@@ -409,6 +413,7 @@ def run(
         environ=environ,
         gateway_keys=runtime.gateway_keys,
         gateway_link=gateway_socket is not None,
+        reports=reports,
     )
     # Before any listener opens: a send cut by a SIGKILL is closed unknown, never re-sent (J.3).
     try:
@@ -433,6 +438,7 @@ def run(
             gateway_keys=runtime.gateway_keys,
             connectors=app.connectors,
             env_names=lambda: app.env_names,
+            reports=reports,
         )
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")

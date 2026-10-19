@@ -13,8 +13,9 @@ gateway, proved by the kernel; on TCP it is whoever presents a placeholder or a 
 when the link socket is configured TCP refuses gateway keys altogether (M3 design C.1).
 
 Paths under ``/_zoeymcp/`` are the vault's own and never reach a route (no route prefix can start
-with ``_``). The only one is the gateway's policy view, a long poll that a reload wakes (M3 design
-D.1, D.2); the rest are 404.
+with ``_``). There are two, both for the gateway only: its policy view, a long poll that a reload
+wakes (M3 design D.1, D.2), and the report path, where it pushes its ledger to the vault's copy
+(M5 design J.2); the rest are 404.
 
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
@@ -52,6 +53,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
+from ..common import canonical, ledgerreport
 from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
     BasicCredential,
@@ -73,6 +75,8 @@ from .keys import KeySet
 from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
 from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
 from .oauth.tokens import UPSTREAM_INSUFFICIENT_SCOPE, Grant, OAuthUnavailable, TokenManager
+from .reports import Refused as ReportRefused
+from .reportstore import CopyUnavailable, ReportStore
 from .request import (
     NDJSONScrubber,
     RequestRejected,
@@ -100,9 +104,12 @@ REFUSAL_MARKER = "refused"
 # The scope key the listener wrapper sets: "gateway" on the link socket, "tcp" elsewhere.
 LISTENER_SCOPE_KEY = "zoeymcp.listener"
 Listener = Literal["gateway", "tcp"]
-# The vault's own endpoints. The gateway's view is the only one (M3 design D.1).
+# The vault's own endpoints: the gateway's view (M3 design D.1) and its report path (M5 J.2).
 INTERNAL_SEGMENT = "_zoeymcp"
 VIEW_PATH = NormalizedPath((INTERNAL_SEGMENT, "gateway", "v1", "view"))
+REPORT_PATH = NormalizedPath((INTERNAL_SEGMENT, "gateway", "v1", "report", "ledger"))
+# A report's body is read within this many seconds (M5 design J.2).
+REPORT_DEADLINE = 10.0
 # The longest ``?wait=`` in seconds, and how many may wait at once (M3 design D.2).
 VIEW_MAX_WAIT = 25
 VIEW_MAX_WAITERS = 4
@@ -227,10 +234,14 @@ _PUBLIC_MESSAGES = {
     403: "forbidden",
     404: "not found",
     405: "method not allowed",
+    408: "request timeout",
+    411: "length required",
     413: "request too large",
+    415: "unsupported media type",
     429: "too many requests",
     501: "not implemented",
     502: "upstream unavailable",
+    503: "unavailable",
 }
 
 
@@ -326,6 +337,7 @@ class VaultApp:
         gateway_keys: GatewayKeys | None = None,
         gateway_link: bool = False,
         connectors: SmtpConnectors | None = None,
+        reports: ReportStore | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
@@ -339,6 +351,9 @@ class VaultApp:
 
         ``connectors`` replaces the SMTP connectors (tests inject a transport and a TLS context).
         By default their journals live beside the store.
+
+        ``reports`` is the copy of the gateway's ledger, recovered before the listeners open.
+        Without one, the report path answers 503.
         """
         self._gateway_link = gateway_link
         self._store = store
@@ -356,6 +371,7 @@ class VaultApp:
         self._serials: dict[str, int] = {}
         self._environ = os.environ if environ is None else environ
         self._connectors = connectors or SmtpConnectors(store.path.parent, keys)
+        self._reports = reports
         # Long polls of the view wait on this event. Each install sets it and puts a new one in
         # its place, so every waiter wakes and looks at the view again.
         self._view_changed = asyncio.Event()
@@ -392,6 +408,10 @@ class VaultApp:
     @property
     def connectors(self) -> SmtpConnectors:
         return self._connectors
+
+    @property
+    def reports(self) -> ReportStore | None:
+        return self._reports
 
     @property
     def env_names(self) -> frozenset[str]:
@@ -683,12 +703,15 @@ class VaultApp:
     async def _internal(
         self, request: Request, path: NormalizedPath, listener: Listener, log: dict[str, Any]
     ) -> Response:
-        """``GET /_zoeymcp/gateway/v1/view`` for the gateway only; every other path here is 404.
+        """``GET /_zoeymcp/gateway/v1/view`` and the report path (:meth:`_report`), for the
+        gateway only; every other path here is 404.
 
         The answer is the view with its digest as the ``ETag``, or 304 while the digest is one
         the caller named in ``If-None-Match``. With ``?wait=N`` a 304 waits up to N seconds for
         a reload that changes the view (M3 design D.2).
         """
+        if path == REPORT_PATH:
+            return await self._report(request, listener, log)
         if path != VIEW_PATH:
             raise Refused(404, "no such vault endpoint")
         log["endpoint"] = "gateway_view"
@@ -712,6 +735,54 @@ class VaultApp:
         waited_ms = round((time.monotonic() - started) * 1000)
         logs.event("gateway_view_served", digest=view.digest, waited_ms=waited_ms)
         return Response(view.body, media_type="application/json", headers=headers)
+
+    async def _report(self, request: Request, listener: Listener, log: dict[str, Any]) -> Response:
+        """``GET`` and ``POST`` of the report path (M5 design J.2), for the gateway only.
+
+        Before any body byte is read: the gateway's identity (403), the method (405), no query
+        (400), a copy that can be read (503), then for a ``POST`` exactly one ``Content-Type:
+        application/json`` (415) and one ``Content-Length`` (411) of at most 1 MiB (413). Then,
+        one report at a time (429 ``busy`` while one applies), the body is read within the cap
+        and :data:`REPORT_DEADLINE` (408), parsed strictly, and decided and applied by the
+        copy. ``GET`` answers the head; an accepted ``POST`` answers the same, a refused one its
+        ``code`` with the head.
+        """
+        log["endpoint"] = "gateway_report"
+        if listener != "gateway" and not self._gateway_key(request, accepted=True):
+            raise Refused(403, "the report path is for the gateway only")
+        log["caller"] = "gateway"
+        if request.method not in ("GET", "POST"):
+            raise Refused(405, "the report path takes GET or POST", allow="GET, POST")
+        if request.scope.get("query_string"):
+            raise Refused(400, "the report path takes no query")
+        copy = self._reports
+        if copy is None or not copy.available:
+            raise Refused(503, "the reported copy is unavailable", code="unavailable")
+        copy.contact()
+        if request.method == "GET":
+            return _head(copy)
+        _report_headers(request)
+        if copy.lock.locked():
+            raise Refused(429, "a report is being applied", code="busy", retry_after=1)
+        async with copy.lock:
+            body = await _read_report(request)
+            try:
+                report = canonical.loads_strict(body, max_bytes=ledgerreport.MAX_BODY_BYTES)
+            except ValueError as exc:
+                raise Refused(400, "the report isn't strict JSON", code="bad_body") from exc
+            try:
+                result = await asyncio.to_thread(copy.report, report)
+            except CopyUnavailable as exc:
+                raise Refused(503, "the reported copy is unavailable", code="unavailable") from exc
+        if isinstance(result, ReportRefused):
+            log.update(reason=result.reason, code=result.reason)
+            refusal: dict[str, Any] = {"error": result.message, "code": result.reason}
+            if result.index is not None:
+                refusal["index"] = result.index
+            refusal.update(copy.head().to_json())
+            headers = {REFUSAL_HEADER: REFUSAL_MARKER, "cache-control": "no-store"}
+            return JSONResponse(refusal, status_code=result.status, headers=headers)
+        return _head(copy)
 
     async def _wait_for_view(
         self, tags: frozenset[str], deadline: float, receive: Receive, log: dict[str, Any]
@@ -962,6 +1033,45 @@ class VaultApp:
             (b"content-length", str(len(content)).encode()),
         ]
         return response
+
+
+def _head(copy: ReportStore) -> Response:
+    return JSONResponse(copy.head().to_json(), headers={"cache-control": "no-store"})
+
+
+def _report_headers(request: Request) -> None:
+    """A report's ``Content-Type`` and ``Content-Length``, checked before its body is read."""
+    types = request.headers.getlist("content-type")
+    if len(types) != 1 or _media_type(types[0]) != "application/json":
+        raise Refused(415, "a report is application/json", code="content_type")
+    lengths = request.headers.getlist("content-length")
+    if (
+        request.headers.getlist("transfer-encoding")
+        or len(lengths) != 1
+        or not (lengths[0].isascii() and lengths[0].isdigit())
+        or len(lengths[0]) > 12
+    ):
+        raise Refused(411, "a report needs one Content-Length", code="length_required")
+    if int(lengths[0]) > ledgerreport.MAX_BODY_BYTES:
+        raise Refused(413, "a report is at most 1 MiB", code="too_large")
+
+
+async def _read_report(request: Request) -> bytes:
+    """The body, within the cap and :data:`REPORT_DEADLINE`, and as long as it said."""
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        async with asyncio.timeout(REPORT_DEADLINE):
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > ledgerreport.MAX_BODY_BYTES:
+                    raise Refused(413, "a report is at most 1 MiB", code="too_large")
+                chunks.append(chunk)
+    except TimeoutError as exc:
+        raise Refused(408, "the report came too slowly", code="too_slow") from exc
+    if size != int(request.headers["content-length"]):
+        raise Refused(400, "the report isn't as long as it said", code="bad_body")
+    return b"".join(chunks)
 
 
 def view_wait(params: list[tuple[str, str]]) -> int:

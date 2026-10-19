@@ -1080,3 +1080,249 @@ def test_main_moves_only_the_gateway_command(monkeypatch: pytest.MonkeyPatch) ->
     with pytest.raises(SystemExit):
         main([])
     assert moved == []
+
+
+# --- ledger --vault (M5 design J.4, J.5) ---------------------------------------------------------
+
+HEAD = "sha256:" + "a" * 64
+ARCHIVED = {
+    "name": "archive-1767276000000",
+    "first_seq": 0,
+    "head_seq": 9,
+    "head_hash": HEAD,
+    "received_ms": 1_767_276_000_000,
+    "size": 5450,
+}
+CALL_ROW = {
+    "kind": "call",
+    "seq": 12,
+    "ref": "3f9c0000000000aa",
+    "at": "2026-10-19T09:12:03Z",
+    "client": "agent1",
+    "server": "mail",
+    "tool": "send" + chr(27) + "[2J",
+    "era": "modern",
+    "decision": "accept",
+    "waited_ms": 8123,
+    "outcome": "ok",
+    "detail": "sent",
+    "writes": 1,
+    "writes_sent": 1,
+    "writes_unknown": 0,
+    "writers": {"asked": "gateway"},
+    "not_in_policy": ["client"],
+    "journal": [
+        {
+            "key": "3f9c0000000000aa.1",
+            "state": "sent",
+            "smtp_code": 250,
+            "at": "2026-10-19T09:12:05Z",
+        }
+    ],
+}
+LEDGER_ROW = {
+    "kind": "recovered",
+    "seq": 11,
+    "at": "2026-10-19T09:00:00Z",
+    "writer": "gateway",
+    "fields": {"abandoned": 1, "not_sent": 0, "unknown": 0},
+}
+PAGE = {
+    "state": {
+        "state": "ok",
+        "head_seq": 12,
+        "head_hash": HEAD,
+        "start_seq": 0,
+        "reported_ago": 12,
+        "broken_at": None,
+    },
+    "rows": [CALL_ROW, LEDGER_ROW],
+    "orphans": [
+        {
+            "connector": "mail",
+            "key": "a1b2000000000000.1",
+            "state": "sent",
+            "at": "2026-10-19T08:01:00Z",
+            "flag": "no_ledger_record",
+        }
+    ],
+    "next": 11,
+    "refused": None,
+    "archives": [{**ARCHIVED, "dropped": False}],
+}
+PAGE_LINES = [
+    f"copy: ok, head seq 12 ({HEAD}), chain from seq 0, head moved 12 s ago",
+    "2026-10-19T09:00:00Z ledger recovered abandoned=1 not_sent=0 unknown=0",
+    "2026-10-19T09:12:03Z 3f9c0000000000aa agent1 mail/send[U+001B][2J modern accept ok (sent)",
+    "  not in the current policy: client",
+    "  send 3f9c0000000000aa.1 sent 250 2026-10-19T09:12:05Z",
+    "orphan send a1b2000000000000.1 on mail: sent at 2026-10-19T08:01:00Z (no_ledger_record)",
+    f"archived archive-1767276000000: seq 0-9 (head {HEAD}), last received "
+    "2026-01-01 14:00:00Z, 5450 bytes",
+    "older rows: zoeymcp ledger --vault --before 11",
+    "each row is as reported by the gateway",
+]
+
+
+def test_ledger_vault_reads_the_copy(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/ledger/reported")] = (200, PAGE)
+    code, out, err = cli(["ledger", "--vault", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert out.splitlines() == PAGE_LINES
+    admin.answers[("GET", "/ledger/reported?before=11")] = (200, PAGE)
+    assert cli(["ledger", "--vault", "--before", "11", "--socket", "x"])[0] == EXIT_OK
+    assert [path for _, path, _ in admin.requests] == [
+        "/ledger/reported",
+        "/ledger/reported?before=11",
+    ]
+
+
+def test_ledger_vault_as_json(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/ledger/reported")] = (200, PAGE)
+    code, out, _ = cli(["ledger", "--vault", "--format", "json", "--socket", "x"])
+    assert code == EXIT_OK
+    assert json.loads(out) == PAGE
+
+
+def test_ledger_vault_says_what_is_wrong(admin: FakeAdmin) -> None:
+    refused = {"reason": "fork", "held_seq": 9, "offered_seq": 3, "at": 1_767_276_000_000}
+    state = {**PAGE["state"], "state": "fork", "head_seq": None, "broken_at": 4}  # type: ignore[dict-item]
+    page = {**PAGE, "state": state, "rows": [], "orphans": [], "next": None}
+    page |= {"refused": refused, "archives": [{**ARCHIVED, "dropped": True}]}
+    admin.answers[("GET", "/ledger/reported")] = (200, page)
+    code, out, _ = cli(["ledger", "--vault", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert out.splitlines() == [
+        "copy: fork, nothing reported yet",
+        "broken: the copy's files stop chaining at seq 4",
+        "refused: fork at seq 3 (held seq 9, 2026-01-01 14:00:00Z); after deciding why, run: "
+        "zoeymcp ledger --vault --restart-chain",
+        f"archived archive-1767276000000: seq 0-9 (head {HEAD}), last received "
+        "2026-01-01 14:00:00Z, 5450 bytes, files dropped",
+    ]
+
+
+def test_ledger_vault_when_the_vault_cant_be_asked(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/ledger/reported")] = (503, {"error": "no copy", "reason": "x"})
+    assert cli(["ledger", "--vault", "--socket", "x"]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp ledger: no copy\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--vault", "--verify"],
+        ["--vault", "--since", "1d"],
+        ["--vault", "--client", "agent1"],
+        ["--vault", "check", "ref", "file"],
+        ["--restart-chain"],
+        ["--before", "3"],
+    ],
+)
+def test_ledger_vault_flags_go_together(admin: FakeAdmin, argv: list[str]) -> None:
+    code, out, err = cli(["ledger", *argv, "--socket", "x"])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err.startswith("zoeymcp ledger: ")
+    assert admin.requests == []
+
+
+PLAN = {
+    "state": "fork",
+    "refused": {"reason": "fork", "held_seq": 9, "offered_seq": 3, "at": 1_767_276_000_000},
+    "archive": {**ARCHIVED, "name": None},
+    "drop": [{**ARCHIVED, "name": "archive-1767000000000"}],
+}
+PLAN_LINES = [
+    "the copy is fork: fork at seq 3 (held seq 9, 2026-01-01 14:00:00Z)",
+    f"archive: seq 0-9 (head {HEAD}), last received 2026-01-01 14:00:00Z, 5450 bytes",
+    f"delete archive-1767000000000: seq 0-9 (head {HEAD}), last received 2026-01-01 14:00:00Z, "
+    "5450 bytes; its head stays as an anchor",
+    "the next report from the gateway then starts a new chain, on trust",
+]
+RESTART = "/ledger/reported/restart"
+
+
+def test_restart_chain_shows_the_plan_and_asks(admin: FakeAdmin) -> None:
+    admin.answers[("POST", RESTART)] = (200, {"plan": PLAN})
+    code, out, err = cli(
+        ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("n\n")
+    )
+    assert (code, err) == (EXIT_FINDINGS, "zoeymcp ledger: not restarted\n")
+    assert out == "".join(f"{line}\n" for line in PLAN_LINES) + "Restart the chain? [y/N] "
+    assert admin.requests == [("POST", RESTART, {"dry_run": True})]
+
+
+def test_restart_chain_runs_exactly_the_plan_shown(admin: FakeAdmin) -> None:
+    done = {"restarted": {**PLAN, "archive": ARCHIVED}, "head": {}}
+    answers = iter([(200, {"plan": PLAN}), (200, done)])
+    admin.answers = InTurn(answers)
+    code, out, err = cli(
+        ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("yes\n")
+    )
+    assert (code, err) == (EXIT_OK, "")
+    assert out.endswith(
+        "restarted: archived as archive-1767276000000; the next report starts a new chain\n"
+    )
+    assert admin.requests[1] == ("POST", RESTART, {"plan": PLAN})
+
+
+def test_restart_chain_refuses_a_plan_that_changed(admin: FakeAdmin) -> None:
+    changed = {"error": "changed", "reason": "changed", "plan": PLAN}
+    admin.answers = InTurn(iter([(200, {"plan": PLAN}), (409, changed)]))
+    code, _, err = cli(
+        ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("y\n")
+    )
+    assert code == EXIT_FINDINGS
+    assert err == "zoeymcp ledger: the copy changed since this plan; nothing was done; run again\n"
+
+
+def test_restart_chain_when_nothing_is_refused(admin: FakeAdmin) -> None:
+    refused = {"error": "the copy takes reports", "reason": "not_restartable"}
+    admin.answers[("POST", RESTART)] = (409, refused)
+    code, out, err = cli(["ledger", "--vault", "--restart-chain", "--socket", "x"])
+    assert (code, out, err) == (EXIT_UNREADABLE, "", "zoeymcp ledger: the copy takes reports\n")
+
+
+class InTurn(dict[tuple[str, str], tuple[int, dict[str, Any]]]):
+    """Answers taken in turn, whatever the method and path."""
+
+    def __init__(self, answers: Any) -> None:
+        super().__init__()
+        self.answers = answers
+
+    def __getitem__(self, key: tuple[str, str]) -> tuple[int, dict[str, Any]]:
+        answer: tuple[int, dict[str, Any]] = next(self.answers)
+        return answer
+
+
+def test_health_shows_the_ledger_copy(admin: FakeAdmin) -> None:
+    finding = {
+        "code": "ledger_copy_refused",
+        "level": "error",
+        "advisory": False,
+        "text": "a fork",
+        "action": {"kind": "read_ledger"},
+    }
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    copy = {"state": "fork", "head_seq": 9, "reported_ago": 3, "broken_at": None}
+    report = {
+        "summary": {"error": 1, "warning": 0, "info": 0},
+        "credentials": [],
+        "connectors": [],
+        "store": empty,
+        "ledger_copy": {**copy, "level": "error", "findings": [finding]},
+    }
+    admin.answers[("GET", "/health")] = (200, report)
+    code, out, _ = cli(["health", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert out.splitlines()[1:4] == [
+        "ledger copy: error (fork, head seq 9)",
+        "  error   ledger_copy_refused: a fork",
+        "          run: zoeymcp ledger --vault",
+    ]
+    assert health_action({"kind": "check_gateway"}) == (
+        "check that the gateway runs and reaches the vault"
+    )

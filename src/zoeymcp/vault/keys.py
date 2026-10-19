@@ -31,6 +31,8 @@ CONTEXT_KEY_ID = "zoeymcp/key-id/v1"
 CONTEXT_GATEWAY = "zoeymcp/gateway/v1/gen-{generation}"
 # The SMTP connector's send journal keys its request digests with this (M4 design J.3).
 CONTEXT_AUDIT = "zoeymcp/audit/v1"
+# The portal's state files are MAC'd with this, and passkey fingerprints keyed (M5 design D.4, E.2).
+CONTEXT_PORTAL = "zoeymcp/portal/v1"
 
 
 class MasterKeyError(ValueError):
@@ -89,6 +91,27 @@ class AuditKey:
 refuse_type(AuditKey)
 
 
+class PortalKey:
+    """``K_portal``: the MAC key of the portal's state files, with the ID of the master key it
+    comes from. Its ``repr`` hides the key, and logging it raises."""
+
+    __slots__ = ("_key", "key_id")
+
+    def __init__(self, key: bytes, key_id: str) -> None:
+        self._key = key
+        self.key_id = key_id
+
+    def mac(self, data: bytes) -> bytes:
+        """HMAC-SHA256 of ``data``. Each use puts its own context line first."""
+        return hmac.new(self._key, data, hashlib.sha256).digest()
+
+    def __repr__(self) -> str:
+        return f"PortalKey(key_id={self.key_id}, <hidden>)"
+
+
+refuse_type(PortalKey)
+
+
 @dataclass(frozen=True)
 class KeySet:
     """The keys derived from one master key. ``repr`` never shows key material."""
@@ -117,6 +140,11 @@ class KeySet:
     def audit_key(self) -> AuditKey:
         """The key the SMTP connector's send journal digests requests under."""
         return AuditKey(derive(self._master, CONTEXT_AUDIT))
+
+    @property
+    def portal_key(self) -> PortalKey:
+        """The key the portal's passkey file and setup code record are MAC'd under."""
+        return PortalKey(derive(self._master, CONTEXT_PORTAL), self.key_id)
 
     def gateway_key(self, generation: int) -> str:
         """The gateway's credential for one key generation (hardened tier)."""

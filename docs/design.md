@@ -381,9 +381,14 @@ stack (`httpx2`), installed only in the gateway's environment.
 
 For each request, in order:
 
-1. Match a **route** by path prefix. No match → 404. `/_zoeymcp/gateway/v1/view`, the gateway's
-   view of the policy (§4.6), is handled first and only for gateway identity; other paths under
-   `/_zoeymcp/` are 404. Route prefixes can't start with `_`, so they never collide.
+1. Match a **route** by path prefix. No match → 404. Two paths of the vault's own are handled
+   first, each only for gateway identity (anyone else gets the bare 403): `GET
+   /_zoeymcp/gateway/v1/view`, the gateway's view of the policy, and `GET` and `POST
+   /_zoeymcp/gateway/v1/report/ledger`, where the gateway reports its ledger (§4.6). The report
+   path checks, before reading any body byte, the identity, the method (405), then `Content-Type:
+   application/json` (415) and one `Content-Length` (411) of at most 1 MiB (413); it reads the
+   body within 10 s (408) and applies one report at a time (429). Other paths under `/_zoeymcp/`
+   are 404. Route prefixes can't start with `_`, so they never collide.
 2. **Identify the caller:** the gateway (the link listener, or a gateway key on TCP when no link
    socket is configured), or a placeholder from where the route expects it (bearer header by
    default, or a named header or query parameter). On the link listener the caller is the
@@ -616,6 +621,20 @@ it with HKDF-SHA256, with a separate context for each purpose:
 | `K_store` | `zoeymcp/store/v1` | AES-256-GCM encryption of store entries |
 | `K_config` | `zoeymcp/config/v1` | HMAC over managed policy versions and their counter (§4.6) |
 | `K_gateway` | `zoeymcp/gateway/v1/gen-<N>` | the gateway key in the hardened tier. Rotated by bumping `gateway_key_generation` |
+| `K_audit` | `zoeymcp/audit/v1` | HMAC keying the request digests in an SMTP connector's send journal (§4.4) |
+| `K_portal` | `zoeymcp/portal/v1` | HMAC over the portal's passkey file and setup code record, and the keyed passkey fingerprints (below) |
+
+**Portal passkeys** live in `<state>/portal/passkeys.json`: the operator's user handle and each
+credential's ID, RP ID, algorithm, public key, counter, backup flags, transports, name, how and on
+which origin it was enrolled, and when it was created, last used and last seen with a counter that
+went back. The file is canonical JSON with a MAC under `K_portal`, written atomically **before** an
+enrolment, rename, removal or reset takes effect (a failed write changes nothing); a counter after a
+login is kept in memory if its write fails. Its `generation` rises on every write and is logged at
+start, so a restored older file shows. A file that fails to parse or verify turns portal login off
+(the proxy is unaffected) until an enrolment with a `zoeymcp setup-code --reset` code moves it aside
+and writes a fresh one. During a master-key rotation it verifies under the previous key and is
+sealed again under the new one. A passkey's fingerprint is the first 16 hex of an HMAC of its ID
+under `K_portal`, so no enroller can make one that shows as another's.
 
 **Gateway key rotation** (a ratchet, `vault/gatewaykeys.py`):
 - After `gateway_key_generation` is bumped to N, the vault still accepts generation N-1, but only
@@ -740,6 +759,24 @@ references, placeholders, upstream URLs or admin settings. A `digest` covers the
   `on_drift` re-evaluates every connection from its last listing; a changed `vault_path`, `era`,
   `shared_session` or timeout closes that server's connections, which reopen lazily. A view the
   gateway can't parse is refused (`policy_refused`), and the last good one stays.
+
+**The push and the copy.** The gateway's approval ledger lives on its own volume, which the vault
+can't read, and a vault → gateway channel would be a new trust direction. So the gateway
+**pushes** its records, once fsynced, byte for byte, over the link it already authenticates on
+(`/_zoeymcp/gateway/v1/report/ledger`, §4.1): `GET` answers the copy's head (`head_seq`,
+`head_hash`, `state`), and `POST {"v": 1, "lines": [...]}` (at most 256 lines and 1 MiB) is
+decided in order: the copy takes reports; each line is a canonical v1 record written by the
+gateway (never a vault record); the lines chain; then the first report is taken on trust, a
+report that extends the held head is appended, and a resend of held records is trimmed. A report
+that skips past the head (`gap`), doesn't extend it (`fork`), or can't fit the copy's 64 MiB after
+pruning only files the vault **received** more than 30 days ago (`full`) is refused, and so is
+every report after it until the operator restarts the chain over the admin socket. The vault
+keeps the copy in `/state/ledger-reported/`: the lines as received, appended and fsynced, then a
+`head.json` written atomically, and only then the answer; it recovers a torn tail and a stale
+`head.json` before it listens. So the gateway can't rewrite what the vault already holds, and the
+head is also in the vault's own logs. A restart of the chain archives the live chain and keeps
+each dropped epoch's head as an anchor. A copy that can't be read refuses reports (503) and the
+proxy runs anyway; nothing in the gateway's approval path waits for a report.
 
 | | **Managed** (default) | **Declarative** |
 | --- | --- | --- |

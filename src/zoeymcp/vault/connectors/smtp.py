@@ -374,6 +374,15 @@ class SmtpConnectors:
         """The connector's journal as rebuilt, for health. Raises ``OSError`` when unreadable."""
         return self._journal(name)[1]
 
+    def records(self, name: str) -> list[dict[str, Any]]:
+        """The connector's journal records as written, oldest first, for the ledger view (M5
+        design J.5); a line that doesn't parse is left out. Raises ``OSError`` when unreadable."""
+        found: list[dict[str, Any]] = []
+        for line in self._journal(name)[0].lines():
+            with contextlib.suppress(sendjournal.JournalError):
+                found.append(sendjournal.parse(line))
+        return found
+
     def config(self, name: str, connector: SMTPConnector) -> Answer:
         _, journal = self._journal(name)
         return Answer(

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import io
 
 import pytest
 
+from zoeymcp.common import logs
 from zoeymcp.vault.keys import (
+    CONTEXT_AUDIT,
     CONTEXT_CONFIG,
     CONTEXT_KEY_ID,
+    CONTEXT_PORTAL,
     CONTEXT_STORE,
     KeySet,
     MasterKeyError,
+    PortalKey,
     derive,
     generate_master_key,
     parse_master_key,
@@ -52,8 +59,10 @@ def test_contexts_give_independent_keys() -> None:
         bytes.fromhex(keys.key_id),
         keys.gateway_key(1).encode(),
         keys.gateway_key(2).encode(),
+        derive(MASTER, CONTEXT_AUDIT),
+        derive(MASTER, CONTEXT_PORTAL),
     }
-    assert len(derived) == 5
+    assert len(derived) == 7
     assert MASTER not in derived
     assert keys.store_key == derive(MASTER, CONTEXT_STORE)
     assert keys.config_key == derive(MASTER, CONTEXT_CONFIG)
@@ -80,3 +89,36 @@ def test_repr_hides_key_material() -> None:
     assert MASTER.hex() not in text
     assert "store_key" not in text
     assert "key_id=" in text
+
+
+def test_the_portal_key_is_its_own_and_pinned() -> None:
+    assert CONTEXT_PORTAL == "zoeymcp/portal/v1"
+    keys = KeySet.from_master(MASTER)
+    portal = keys.portal_key
+    assert isinstance(portal, PortalKey)
+    assert portal.key_id == keys.key_id
+    expected = hmac.new(derive(MASTER, CONTEXT_PORTAL), b"data", hashlib.sha256).digest()
+    assert portal.mac(b"data") == expected
+    assert derive(MASTER, CONTEXT_PORTAL).hex() == (
+        "54215fd5f0dc5b31cf630c373824d823c570331864074db90c0258742ca4d63f"
+    )
+    other = KeySet.from_master(bytes(32)).portal_key
+    assert other.mac(b"data") != expected
+    assert other.key_id != portal.key_id
+
+
+def test_the_portal_key_never_shows() -> None:
+    portal = KeySet.from_master(MASTER).portal_key
+    text = repr(portal)
+    assert text == f"PortalKey(key_id={portal.key_id}, <hidden>)"
+    assert derive(MASTER, CONTEXT_PORTAL).hex() not in text
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        for value in (portal, [portal], {"k": (portal,)}):
+            with pytest.raises(TypeError, match=r"refusing to log a secret \(PortalKey\)"):
+                logs.Log("vault").event("probe", key=value)
+    finally:
+        logs.set_stream(None)
+    assert buffer.getvalue() == ""
+    assert PortalKey in logs.refused_types()

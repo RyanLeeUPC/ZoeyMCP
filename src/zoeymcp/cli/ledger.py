@@ -4,6 +4,11 @@ The default output renders each ref's records, joined by :mod:`zoeymcp.common.le
 line: when it was asked, the ref, the client, ``server/tool``, the era, the decision and the
 outcome. ``--format json`` prints the records themselves, keyed digests included. Nothing here
 imports the gateway: the CLI may run in the vault's environment.
+
+``zoeymcp ledger --vault`` reads the vault's reported copy instead (M5 design J.5): the rows the
+vault's view makes, each with its sends, and the copy's state; :func:`vault_lines` renders them
+and :func:`restart_lines` a chain restart's plan. Their strings are the gateway's: the CLI writes
+them through ``review.write_lines``, which shows control characters as text.
 """
 
 from __future__ import annotations
@@ -89,3 +94,89 @@ def write(out: TextIO, rows: Iterable[str]) -> None:
 def write_json(out: TextIO, records: Iterable[dict[str, Any]]) -> None:
     for record in records:
         out.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+# --- the vault's reported copy (M5 design J.4, J.5) ----------------------------------------------
+
+RESTART_HINT = "after deciding why, run: zoeymcp ledger --vault --restart-chain"
+
+
+def vault_lines(page: dict[str, Any]) -> list[str]:
+    """The copy's state, then a page of rows oldest first, its orphan sends and archives."""
+    state = page["state"]
+    if state["head_seq"] is None:
+        out = [f"copy: {state['state']}, nothing reported yet"]
+    else:
+        moved = state["reported_ago"]
+        out = [
+            f"copy: {state['state']}, head seq {state['head_seq']} ({state['head_hash']}), "
+            f"chain from seq {state['start_seq']}"
+            + ("" if moved is None else f", head moved {moved} s ago")
+        ]
+    if state.get("broken_at") is not None:
+        out.append(f"broken: the copy's files stop chaining at seq {state['broken_at']}")
+    refused = page.get("refused")
+    if refused:
+        out.append(f"refused: {_refusal(refused)}; {RESTART_HINT}")
+    for row in reversed(page["rows"]):
+        out.extend(_row_lines(row))
+    for orphan in page["orphans"]:
+        out.append(
+            f"orphan send {orphan['key']} on {orphan['connector']}: {orphan['state']} at "
+            f"{orphan['at']} ({orphan['flag']})"
+        )
+    for epoch in page.get("archives", []):
+        line = f"archived {epoch['name']}: {_epoch(epoch)}"
+        out.append(line + (", files dropped" if epoch["dropped"] else ""))
+    if page["next"] is not None:
+        out.append(f"older rows: zoeymcp ledger --vault --before {page['next']}")
+    if page["rows"]:
+        out.append("each row is as reported by the gateway")
+    return out
+
+
+def _refusal(refused: dict[str, Any]) -> str:
+    return (
+        f"{refused['reason']} at seq {refused['offered_seq']} (held seq {refused['held_seq']}, "
+        f"{_when(refused['at'])})"
+    )
+
+
+def _row_lines(row: dict[str, Any]) -> list[str]:
+    if row["kind"] != "call":
+        detail = " ".join(f"{k}={v}" for k, v in sorted(row["fields"].items()))
+        return [f"{row['at']} ledger {row['kind']} {detail}".rstrip()]
+    result = row["outcome"] or "-"
+    if row["detail"]:
+        result += f" ({row['detail']})"
+    out = [
+        f"{row['at']} {row['ref']} {row['client']} {row['server']}/{row['tool']} {row['era']} "
+        f"{row['decision'] or '-'} {result}"
+    ]
+    if row["not_in_policy"]:
+        out.append(f"  not in the current policy: {', '.join(row['not_in_policy'])}")
+    for send in row["journal"]:
+        code = "-" if send["smtp_code"] is None else send["smtp_code"]
+        out.append(f"  send {send['key']} {send['state']} {code} {send['at']}")
+    return out
+
+
+def _epoch(epoch: dict[str, Any]) -> str:
+    return (
+        f"seq {epoch['first_seq']}-{epoch['head_seq']} (head {epoch['head_hash']}), last "
+        f"received {_when(epoch['received_ms'])}, {epoch['size']} bytes"
+    )
+
+
+def restart_lines(plan: dict[str, Any]) -> list[str]:
+    """What a restart of the chain does, for the operator to decide on."""
+    out = [f"the copy is {plan['state']}"]
+    if plan["refused"]:
+        out[0] += f": {_refusal(plan['refused'])}"
+    archive = plan["archive"]
+    out.append("archive: " + ("nothing (no live chain)" if archive is None else _epoch(archive)))
+    for epoch in plan["drop"]:
+        name = epoch["name"] or "the live chain"
+        out.append(f"delete {name}: {_epoch(epoch)}; its head stays as an anchor")
+    out.append("the next report from the gateway then starts a new chain, on trust")
+    return out

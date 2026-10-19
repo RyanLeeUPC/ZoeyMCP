@@ -12,14 +12,21 @@ import json
 import shutil
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from mcp.types import Tool
 
-from zoeymcp.common.canonical import dumps_canonical
+from tests.unit.report_model import asked_line
+from zoeymcp.common import ledgerreport
+from zoeymcp.common.canonical import dumps_canonical, loads_strict
+from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.gateway.pins import PIN_TAG, project, project_and_pin
+from zoeymcp.portal.passkeys import Passkey, PasskeyFile, fingerprint, seal, unseal
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.protocol import encode_envelope, parse_envelope
+from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.store import SecretStore, _aad, smtp_binding
 
 GOLDEN = Path(__file__).parent / "data" / "golden-store"
@@ -287,3 +294,124 @@ def test_the_tagged_pin_encoding_is_pinned() -> None:
         b'{"tool":{"inputSchema":{"type":"object"},"name":"ping"},"zoeymcp":"tool-pin/1"}'
     )
     assert "sha256:" + hashlib.sha256(encoded).hexdigest() == pin
+
+
+# --- the passkey file (M5 design D.4) ------------------------------------------------------------
+# Written by the passkey code under MASTER. If these fail, the format, the MAC or K_portal changed,
+# and every deployment's portal would refuse its passkey file as tampered.
+
+GOLDEN_PASSKEYS = Path(__file__).parent / "data" / "golden-passkeys.json"
+
+
+def _spki(key: ec.EllipticCurvePublicKey | ed25519.Ed25519PublicKey) -> bytes:
+    return key.public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+
+def golden_passkeys() -> PasskeyFile:
+    es256 = ec.derive_private_key(7, ec.SECP256R1()).public_key()
+    eddsa = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32))).public_key()
+    return PasskeyFile(
+        generation=7,
+        user_handle=bytes(range(32, 64)),
+        credentials=(
+            Passkey(
+                id=bytes(range(16)),
+                rp_id="localhost",
+                alg=-7,
+                spki=_spki(es256),
+                sign_count=0,
+                backup_eligible=True,
+                backup_state=True,
+                transports=("hybrid", "internal"),
+                name="laptop",
+                via="setup_code",
+                origin="http://localhost:8081",
+                created=1760000000,
+                last_used=1760054400,
+                last_regressed=None,
+            ),
+            Passkey(
+                id=bytes(range(100, 132)),
+                rp_id="zoeymcp.lan.example",
+                alg=-8,
+                spki=_spki(eddsa),
+                sign_count=41,
+                backup_eligible=False,
+                backup_state=False,
+                transports=("usb",),
+                name="security key \u00e9",
+                via="portal",
+                origin="https://zoeymcp.lan.example",
+                created=1760086400,
+                last_used=1760140800,
+                last_regressed=1760140800,
+            ),
+        ),
+    )
+
+
+def test_the_passkey_file_format_is_pinned() -> None:
+    key = KeySet.from_master(MASTER).portal_key
+    assert seal(golden_passkeys(), key) == GOLDEN_PASSKEYS.read_bytes()
+
+
+def test_the_golden_passkey_file_still_verifies() -> None:
+    key = KeySet.from_master(MASTER).portal_key
+    assert unseal(GOLDEN_PASSKEYS.read_bytes(), key) == (golden_passkeys(), False)
+    assert fingerprint(key, bytes(range(16))) == "06b228ec0ef3c431"
+
+
+# --- the reported copy's head.json (M5 design J.4) -----------------------------------------------
+# Written by the report store. If these fail, head.json's format changed, and every vault would
+# rebuild its copy's head on its next start, losing a sticky refusal and dropped epochs' anchors.
+
+GOLDEN_REPORTED_HEAD = Path(__file__).parent / "data" / "golden-reported-head.json"
+
+
+def golden_copy(state_dir: Path) -> ReportStore:
+    """A copy that took a chain and forked three times, restarted twice, the second restart
+    dropping the first epoch."""
+    clock = [1_767_276_000_000]
+    store = ReportStore.open(
+        state_dir, clock=lambda: clock[0], rotate_bytes=2 * 545, archive_max_bytes=4 * 545
+    )
+
+    def chain(count: int, tick: int) -> list[bytes]:
+        lines: list[bytes] = []
+        prev = GENESIS
+        for n in range(count):
+            lines.append(asked_line(n, prev, tick + n + 1))
+            prev = line_hash(lines[-1])
+        return lines
+
+    def report(lines: list[bytes]) -> None:
+        store.report(loads_strict(ledgerreport.encode(lines)))
+        clock[0] += 1000
+
+    report(chain(3, 0))
+    report(chain(3, 100)[1:])
+    store.restart()
+    report(chain(4, 200)[1:])
+    report(chain(3, 300)[2:])
+    store.restart()
+    report(chain(2, 400))
+    report(chain(2, 500)[1:])
+    return store
+
+
+def test_the_reported_head_is_pinned(tmp_path: Path) -> None:
+    golden_copy(tmp_path)
+    written = (tmp_path / "ledger-reported" / "head.json").read_bytes()
+    assert written == GOLDEN_REPORTED_HEAD.read_bytes()
+
+
+def test_the_pinned_reported_head_still_loads(tmp_path: Path) -> None:
+    store = golden_copy(tmp_path)
+    head = tmp_path / "ledger-reported" / "head.json"
+    head.write_bytes(GOLDEN_REPORTED_HEAD.read_bytes())
+    again = ReportStore.open(tmp_path)
+    assert head.read_bytes() == GOLDEN_REPORTED_HEAD.read_bytes()  # nothing rebuilt
+    assert (again.state, again.held, again.refused) == (store.state, store.held, store.refused)
+    assert again.archives() == store.archives()

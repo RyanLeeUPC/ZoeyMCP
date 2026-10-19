@@ -22,14 +22,20 @@ import pytest
 from starlette.types import Message
 
 from tests.fakes.harness import serve
+from tests.unit.report_model import asked_line
+from zoeymcp.common import ledgerreport
+from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import build_view, dump_view
-from zoeymcp.vault import logs
+from zoeymcp.vault import app as app_module
+from zoeymcp.vault import logs, reportstore
 from zoeymcp.vault.app import (
     GATEWAY_HEADER,
     LISTENER_SCOPE_KEY,
     REFUSAL_HEADER,
     REFUSAL_MARKER,
+    REPORT_DEADLINE,
+    REPORT_PATH,
     VIEW_MAX_WAIT,
     VIEW_MAX_WAITERS,
     VIEW_PATH,
@@ -40,6 +46,7 @@ from zoeymcp.vault.app import (
 )
 from zoeymcp.vault.gatewaykeys import GatewayKeyError
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.request import RequestRejected
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
@@ -115,11 +122,20 @@ def unreachable(request: httpx.Request) -> httpx.Response:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, pol: Policy, *, gateway_link: bool = False) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        pol: Policy,
+        *,
+        gateway_link: bool = False,
+        reports: ReportStore | None = None,
+    ) -> None:
         store = SecretStore(tmp_path, KEYS)
         store.load()
         client = httpx.AsyncClient(transport=httpx.MockTransport(unreachable))
-        self.app = VaultApp(pol, store, KEYS, client=client, environ={}, gateway_link=gateway_link)
+        self.app = VaultApp(
+            pol, store, KEYS, client=client, environ={}, gateway_link=gateway_link, reports=reports
+        )
 
     async def call(
         self,
@@ -128,11 +144,12 @@ class Rig:
         method: str = "GET",
         listener: str | None = "gateway",
         headers: dict[str, str] | list[tuple[str, str]] | None = None,
+        content: bytes | None = None,
     ) -> httpx.Response:
         app: Any = self.app if listener is None else ListenerTag(self.app, cast(Listener, listener))
         transport = httpx.ASGITransport(app=app, client=("172.30.4.10", 40000))
         async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
-            return await client.request(method, path, headers=headers)
+            return await client.request(method, path, headers=headers, content=content)
 
     def tag(self) -> dict[str, str]:
         return {"If-None-Match": f'"{self.app.view_digest}"'}
@@ -852,3 +869,342 @@ def test_a_closed_socket_frees_its_place(tmp_path: Path) -> None:
             assert time.monotonic() < deadline, "the wait outlived its caller"
             time.sleep(0.01)
     asyncio.run(app.aclose())
+
+
+# --- the report path (M5 design J.2) -------------------------------------------------------------
+
+REPORT = "/_zoeymcp/gateway/v1/report/ledger"
+JSON = {"Content-Type": "application/json"}
+
+
+def report_lines(count: int, *, tick: int = 0) -> list[bytes]:
+    lines: list[bytes] = []
+    prev = GENESIS
+    for n in range(count):
+        lines.append(asked_line(n, prev, tick + n + 1))
+        prev = line_hash(lines[-1])
+    return lines
+
+
+LEDGER = report_lines(6)
+FORKED = report_lines(6, tick=1000)
+
+
+@pytest.fixture
+async def copy_rig(tmp_path: Path) -> AsyncIterator[Rig]:
+    r = Rig(tmp_path, make_policy(), reports=ReportStore.open(tmp_path))
+    yield r
+    await r.app.aclose()
+
+
+def held(rig: Rig) -> ReportStore:
+    reports = rig.app.reports
+    assert reports is not None
+    return reports
+
+
+async def post(rig: Rig, lines: list[bytes], **kwargs: Any) -> httpx.Response:
+    headers = kwargs.pop("headers", JSON)
+    return await rig.call(
+        REPORT, method="POST", headers=headers, content=ledgerreport.encode(lines), **kwargs
+    )
+
+
+class Raw:
+    """A raw ASGI request to the report path, counting the times the app asks for the body."""
+
+    def __init__(self, *, hang: bool = False) -> None:
+        self.receives = 0
+        self.hang = hang
+        self.status = 0
+        self.headers: dict[bytes, bytes] = {}
+        self.body = b""
+
+    async def __call__(
+        self,
+        app: Any,
+        *,
+        method: str = "POST",
+        headers: list[tuple[bytes, bytes]],
+        chunks: list[bytes],
+        listener: str = "gateway",
+    ) -> Raw:
+        async def receive() -> Message:
+            self.receives += 1
+            if self.hang:
+                await asyncio.sleep(3600)
+            if chunks:
+                return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks)}
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                self.status = message["status"]
+                self.headers = dict(message["headers"])
+            else:
+                self.body += message.get("body", b"")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": REPORT,
+            "raw_path": REPORT.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("172.30.4.10", 40000),
+            "server": ("vault", 80),
+        }
+        await ListenerTag(app, cast(Listener, listener))(scope, receive, send)
+        return self
+
+
+def raw_headers(
+    length: int, content_type: bytes = b"application/json"
+) -> list[tuple[bytes, bytes]]:
+    return [(b"content-type", content_type), (b"content-length", str(length).encode())]
+
+
+def test_the_report_path() -> None:
+    # A contract with the gateway, which can't import vault code.
+    assert REPORT_PATH.text == REPORT == ledgerreport.PATH
+    assert REPORT_DEADLINE == 10.0
+
+
+async def test_the_gateway_reads_the_head(copy_rig: Rig, captured: io.StringIO) -> None:
+    response = await copy_rig.call(REPORT)
+    assert response.status_code == 200
+    assert response.json() == {"head_seq": None, "head_hash": None, "state": "ok"}
+    assert response.headers["cache-control"] == "no-store"
+    assert REFUSAL_HEADER not in response.headers
+    assert held(copy_rig).contact_ms is not None
+    [line] = lines(captured, "request")
+    assert (line["endpoint"], line["caller"], line["status"]) == ("gateway_report", "gateway", 200)
+
+
+async def test_the_gateway_reports_over_tcp_with_a_key(copy_rig: Rig) -> None:
+    response = await post(copy_rig, LEDGER[:3], listener="tcp", headers={**JSON, **key()})
+    assert response.status_code == 200
+    assert response.json() == {"head_seq": 2, "head_hash": line_hash(LEDGER[2]), "state": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("listener", "headers", "reason"),
+    [
+        ("tcp", {}, "the report path is for the gateway only"),
+        (None, {}, "the report path is for the gateway only"),
+        ("tcp", {"Authorization": f"Bearer {PH}"}, "the report path is for the gateway only"),
+        ("tcp", {GATEWAY_HEADER: "zgw1-wrong"}, "gateway key refused"),
+        ("tcp", {GATEWAY_HEADER: KEYS.gateway_key(2)}, "gateway key refused"),
+        ("link", {}, "the report path is for the gateway only"),
+    ],
+)
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_anyone_else_gets_the_bare_403_for_reports(
+    copy_rig: Rig,
+    captured: io.StringIO,
+    listener: str | None,
+    headers: dict[str, str],
+    reason: str,
+    method: str,
+) -> None:
+    content = ledgerreport.encode(LEDGER[:1]) if method == "POST" else None
+    response = await copy_rig.call(
+        REPORT, method=method, listener=listener, headers={**JSON, **headers}, content=content
+    )
+    assert response.status_code == 403
+    assert response.json() == {"error": "forbidden"}
+    assert response.headers.get_list(REFUSAL_HEADER) == [REFUSAL_MARKER]
+    [line] = lines(captured, "request")
+    assert (line["reason"], line["endpoint"]) == (reason, "gateway_report")
+    assert "caller" not in line
+    assert held(copy_rig).contact_ms is None
+    assert held(copy_rig).held.head_seq is None
+
+
+async def test_a_refused_identity_never_reads_the_body(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, make_policy(), gateway_link=True, reports=ReportStore.open(tmp_path))
+    body = ledgerreport.encode(LEDGER[:1])
+    for listener, extra in [("tcp", []), ("tcp", [(GATEWAY_HEADER.encode(), b"zgw1-x")])]:
+        raw = await Raw()(
+            rig.app, headers=raw_headers(len(body)) + extra, chunks=[body], listener=listener
+        )
+        assert (raw.status, raw.receives) == (403, 0)
+    await rig.app.aclose()
+
+
+async def test_two_keys_are_refused_for_reports(copy_rig: Rig) -> None:
+    good = KEYS.gateway_key(1)
+    response = await copy_rig.call(REPORT, listener="tcp", headers=[(GATEWAY_HEADER, good)] * 2)
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("method", ["PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def test_reports_take_get_or_post(copy_rig: Rig, captured: io.StringIO, method: str) -> None:
+    raw = await Raw()(copy_rig.app, method=method, headers=raw_headers(2), chunks=[b"{}"])
+    assert (raw.status, raw.receives) == (405, 0)
+    assert raw.headers[b"allow"] == b"GET, POST"
+    [line] = lines(captured, "request")
+    assert (line["caller"], line["reason"]) == ("gateway", "the report path takes GET or POST")
+
+
+async def test_another_method_from_anyone_else_is_403_on_the_report_path(copy_rig: Rig) -> None:
+    response = await copy_rig.call(REPORT, method="PUT", listener="tcp")
+    assert response.status_code == 403
+    assert "allow" not in response.headers
+
+
+async def test_the_report_path_takes_no_query(copy_rig: Rig) -> None:
+    assert (await copy_rig.call(REPORT + "?wait=1")).status_code == 400
+
+
+async def test_without_a_copy_reports_are_503(rig: Rig) -> None:
+    response = await rig.call(REPORT)
+    assert response.status_code == 503
+    assert response.json() == {"error": "unavailable", "code": "unavailable"}
+    assert (await rig.call(REPORT, listener="tcp")).status_code == 403
+
+
+async def test_an_unreadable_copy_is_503_and_the_proxy_is_unaffected(tmp_path: Path) -> None:
+    (tmp_path / "ledger-reported").write_bytes(b"not a directory")
+    rig = Rig(tmp_path, make_policy(), reports=ReportStore.open(tmp_path))
+    assert (await rig.call(REPORT)).status_code == 503
+    assert (await post(rig, LEDGER[:1])).status_code == 503
+    assert (await rig.call()).status_code == 200  # the view still serves
+    await rig.app.aclose()
+
+
+@pytest.mark.parametrize(
+    ("headers", "status", "code"),
+    [
+        ([], 415, "content_type"),
+        ([(b"content-type", b"text/plain")], 415, "content_type"),
+        ([(b"content-type", b"application/json")] * 2, 415, "content_type"),
+        ([(b"content-type", b"application/json")], 411, "length_required"),
+        (
+            [(b"content-type", b"application/json"), (b"transfer-encoding", b"chunked")],
+            411,
+            "length_required",
+        ),
+        ([*raw_headers(5), (b"content-length", b"5")], 411, "length_required"),
+        ([*raw_headers(5)[:1], (b"content-length", b"+5")], 411, "length_required"),
+        ([*raw_headers(5)[:1], (b"content-length", b"1" * 13)], 411, "length_required"),
+        (raw_headers(ledgerreport.MAX_BODY_BYTES + 1), 413, "too_large"),
+    ],
+)
+async def test_report_headers_are_checked_before_the_body(
+    copy_rig: Rig, headers: list[tuple[bytes, bytes]], status: int, code: str
+) -> None:
+    raw = await Raw()(copy_rig.app, headers=headers, chunks=[b"{}"])
+    assert (raw.status, raw.receives) == (status, 0)
+    assert json.loads(raw.body) == {"error": json.loads(raw.body)["error"], "code": code}
+    assert raw.headers[REFUSAL_HEADER.encode()] == REFUSAL_MARKER.encode()
+
+
+async def test_a_body_of_1_mib_is_read(copy_rig: Rig) -> None:
+    body = b" " * (ledgerreport.MAX_BODY_BYTES - 2) + b"{}"
+    raw = await Raw()(copy_rig.app, headers=raw_headers(len(body)), chunks=[body])
+    assert raw.status == 400  # read, then refused as a report: {} isn't one
+    assert json.loads(raw.body)["code"] == "bad_body"
+
+
+async def test_a_body_past_the_cap_is_cut_off(copy_rig: Rig) -> None:
+    chunk = b" " * (ledgerreport.MAX_BODY_BYTES // 2 + 1)
+    raw = await Raw()(copy_rig.app, headers=raw_headers(10), chunks=[chunk, chunk, chunk])
+    assert raw.status == 413
+    assert raw.receives == 2
+
+
+async def test_a_body_unlike_its_length_is_refused(copy_rig: Rig) -> None:
+    raw = await Raw()(copy_rig.app, headers=raw_headers(10), chunks=[b"{}"])
+    assert raw.status == 400
+    assert json.loads(raw.body)["code"] == "bad_body"
+
+
+async def test_a_slow_body_is_408(copy_rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_module, "REPORT_DEADLINE", 0.05)
+    raw = await Raw(hang=True)(copy_rig.app, headers=raw_headers(2), chunks=[b"{}"])
+    assert raw.status == 408
+    assert json.loads(raw.body) == {"error": "request timeout", "code": "too_slow"}
+    assert not held(copy_rig).lock.locked()
+
+
+async def test_one_report_at_a_time(copy_rig: Rig) -> None:
+    async with held(copy_rig).lock:
+        raw = await Raw()(copy_rig.app, headers=raw_headers(2), chunks=[b"{}"])
+    assert (raw.status, raw.receives) == (429, 0)
+    assert raw.headers[b"retry-after"] == b"1"
+    assert json.loads(raw.body) == {"error": "too many requests", "code": "busy"}
+    # A GET of the head doesn't wait for it.
+    async with held(copy_rig).lock:
+        assert (await copy_rig.call(REPORT)).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "body", [b"not json", b'{"v": 1, "v": 1, "lines": []}', b"\xff", b"[1e400]"]
+)
+async def test_a_body_that_isnt_strict_json_is_400(copy_rig: Rig, body: bytes) -> None:
+    response = await copy_rig.call(REPORT, method="POST", headers=JSON, content=body)
+    assert response.status_code == 400
+    assert response.json() == {"error": "bad request", "code": "bad_body"}
+
+
+async def test_a_report_is_kept_and_answered_with_the_head(
+    copy_rig: Rig, captured: io.StringIO, tmp_path: Path
+) -> None:
+    response = await post(copy_rig, LEDGER[:3])
+    assert response.status_code == 200
+    assert response.json() == {"head_seq": 2, "head_hash": line_hash(LEDGER[2]), "state": "ok"}
+    copied = (tmp_path / "ledger-reported" / "000000000000.jsonl").read_bytes()
+    assert copied == b"".join(line + b"\n" for line in LEDGER[:3])
+    charset = {"Content-Type": "application/json; charset=utf-8"}
+    assert (await post(copy_rig, LEDGER[2:5], headers=charset)).json()["head_seq"] == 4
+    [first, _second] = lines(captured, "request")
+    assert (first["endpoint"], first["status"]) == ("gateway_report", 200)
+    # No line of the ledger is ever logged.
+    for line in LEDGER:
+        assert line.decode() not in captured.getvalue()
+    assert "hmac-sha256" not in captured.getvalue()
+
+
+async def test_a_refused_report_names_its_code_and_the_head(
+    copy_rig: Rig, captured: io.StringIO
+) -> None:
+    await post(copy_rig, LEDGER[:3])
+    response = await post(copy_rig, FORKED[2:4])
+    assert response.status_code == 409
+    assert response.headers[REFUSAL_HEADER] == REFUSAL_MARKER
+    message = "the report starts at seq 2, which doesn't extend the held head"
+    assert response.json() == {
+        "error": message,
+        "code": "fork",
+        "head_seq": 2,
+        "head_hash": line_hash(LEDGER[2]),
+        "state": "fork",
+    }
+    request = lines(captured, "request")[-1]
+    assert (request["status"], request["reason"], request["code"]) == (409, "fork", "fork")
+    sticky = await post(copy_rig, LEDGER[3:4])
+    assert (sticky.status_code, sticky.json()["code"]) == (409, "refused_until_restart")
+    assert (await copy_rig.call(REPORT)).json()["state"] == "fork"
+
+
+async def test_a_bad_line_names_its_index(copy_rig: Rig) -> None:
+    content = json.dumps({"v": 1, "lines": [LEDGER[0].decode(), "x"]}).encode()
+    response = await copy_rig.call(REPORT, method="POST", headers=JSON, content=content)
+    assert response.status_code == 400
+    assert (response.json()["code"], response.json()["index"]) == ("bad_line", 1)
+
+
+async def test_a_failed_write_is_503(copy_rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(path: Path, data: bytes) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(reportstore, "_append", broken)
+    response = await post(copy_rig, LEDGER[:2])
+    assert response.status_code == 503
+    assert response.json()["code"] == "unavailable"
+    assert not held(copy_rig).lock.locked()

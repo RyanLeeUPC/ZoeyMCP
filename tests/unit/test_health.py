@@ -18,7 +18,11 @@ from zoeymcp.vault.bindings import BindingError, oauth_binding
 from zoeymcp.vault.connectors.sendjournal import DAY_MS, Journal
 from zoeymcp.vault.health import (
     DISPLAY_ONLY,
+    REGRESSION_DAYS,
+    STALE_SECONDS,
     Inputs,
+    LedgerCopy,
+    PasskeyState,
     Sends,
     assess,
     failure_text,
@@ -1094,3 +1098,199 @@ def test_idle_needs_a_limit_and_a_last_success() -> None:
 )
 def test_parse_time(value: object, expected: float | None) -> None:
     assert parse_time(value) == expected
+
+
+# --- passkeys (I.1) ------------------------------------------------------------------------------
+
+UNAVAILABLE_TEXT = (
+    "the passkey file can't be verified (edited, or written under another master key); "
+    "portal login is off"
+)
+SINGLE = finding(
+    "passkey_single",
+    "info",
+    "only one passkey is enrolled: add a second, so losing one doesn't lock you out",
+    {"kind": "add_passkey"},
+)
+COUNTER = finding(
+    "passkey_counter",
+    "warning",
+    "a passkey's signature counter went back in the last 30 days: the authenticator may have "
+    "been copied",
+    {"kind": "review_passkeys"},
+)
+
+
+def test_without_a_portal_there_is_no_passkeys_section() -> None:
+    assert "passkeys" not in report(make_policy({}))
+
+
+@pytest.mark.parametrize(
+    ("state", "level", "findings"),
+    [
+        (PasskeyState(0), "ok", []),
+        (PasskeyState(2), "ok", []),
+        (PasskeyState(1), "info", [SINGLE]),
+        (PasskeyState(2, regressed_ago=0), "warning", [COUNTER]),
+        (PasskeyState(2, regressed_ago=30 * DAY - 1), "warning", [COUNTER]),
+        (PasskeyState(2, regressed_ago=30 * DAY), "ok", []),
+        (PasskeyState(1, regressed_ago=DAY), "warning", [COUNTER, SINGLE]),
+    ],
+)
+def test_the_passkeys(state: PasskeyState, level: str, findings: list[dict[str, Any]]) -> None:
+    assert report(make_policy({}), passkeys=state)["passkeys"] == {
+        "count": state.count,
+        "level": level,
+        "findings": findings,
+    }
+    assert REGRESSION_DAYS == 30
+
+
+def test_an_unverifiable_passkey_file_hides_the_rest() -> None:
+    found = report(make_policy({}), passkeys=PasskeyState(1, unavailable=True, regressed_ago=0))
+    assert found["passkeys"] == {
+        "count": None,
+        "level": "error",
+        "findings": [
+            finding("passkeys_unavailable", "error", UNAVAILABLE_TEXT, {"kind": "reset_passkeys"})
+        ],
+    }
+    assert found["summary"] == {"error": 1, "warning": 0, "info": 0}
+
+
+def test_the_summary_counts_the_passkeys() -> None:
+    state = PasskeyState(1, regressed_ago=0)
+    found = report(make_policy({}), persisted=False, passkeys=state)
+    assert found["summary"] == {"error": 1, "warning": 1, "info": 1}
+    assert list(found) == ["summary", "credentials", "connectors", "store", "passkeys"]
+
+
+# --- the reported ledger's copy (M5 design J.4) --------------------------------------------------
+
+READ_LEDGER = {"kind": "read_ledger"}
+CHECK_GATEWAY = {"kind": "check_gateway"}
+REFUSED_TAIL = ": reports are refused until the chain is restarted"
+
+
+def copy(state: str = "ok", head_seq: int | None = 9, **fields: Any) -> LedgerCopy:
+    values: dict[str, Any] = {"reported_ago": 12, "uptime": 3600, **fields}
+    return LedgerCopy(state, head_seq, **values)
+
+
+@pytest.mark.parametrize(
+    ("state", "level", "findings"),
+    [
+        (copy(), "ok", []),
+        (copy(reported_ago=300), "ok", []),
+        (
+            copy(reported_ago=301),
+            "warning",
+            [
+                finding(
+                    "ledger_copy_stale",
+                    "warning",
+                    "no report from the gateway for 5 min",
+                    CHECK_GATEWAY,
+                )
+            ],
+        ),
+        # Never asked since the vault started: counted from the start.
+        (copy(reported_ago=None, uptime=300), "ok", []),
+        (
+            copy(reported_ago=None, uptime=3600),
+            "warning",
+            [
+                finding(
+                    "ledger_copy_stale",
+                    "warning",
+                    "no report from the gateway for 60 min",
+                    CHECK_GATEWAY,
+                )
+            ],
+        ),
+        (
+            copy(head_seq=None),
+            "info",
+            [finding("ledger_copy_none", "info", "no report from the gateway yet", CHECK_GATEWAY)],
+        ),
+        (
+            copy("fork", reported_ago=None),
+            "error",
+            [
+                finding(
+                    "ledger_copy_refused",
+                    "error",
+                    "the gateway's ledger no longer extends the copy (a fork)" + REFUSED_TAIL,
+                    READ_LEDGER,
+                )
+            ],
+        ),
+        (
+            copy("gap"),
+            "error",
+            [
+                finding(
+                    "ledger_copy_refused",
+                    "error",
+                    "the gateway's report skipped records the copy doesn't hold (a gap)"
+                    + REFUSED_TAIL,
+                    READ_LEDGER,
+                )
+            ],
+        ),
+        (
+            copy("full", head_seq=None),
+            "error",
+            [
+                finding(
+                    "ledger_copy_refused",
+                    "error",
+                    "the copy is full and holds nothing received long enough ago to prune"
+                    + REFUSED_TAIL,
+                    READ_LEDGER,
+                )
+            ],
+        ),
+        (
+            copy(broken_at=4),
+            "error",
+            [
+                finding(
+                    "ledger_copy_broken",
+                    "error",
+                    "the copy's files stop chaining at seq 4 (damaged or edited)",
+                    READ_LEDGER,
+                )
+            ],
+        ),
+        (
+            copy("unavailable", None, broken_at=4),
+            "error",
+            [
+                finding(
+                    "ledger_copy_unavailable",
+                    "error",
+                    "the vault can't read its copy of the gateway's ledger; reports are refused",
+                    {"kind": "check_volume"},
+                )
+            ],
+        ),
+    ],
+)
+def test_the_ledger_copy(state: LedgerCopy, level: str, findings: list[dict[str, Any]]) -> None:
+    assert report(make_policy({}), ledger_copy=state)["ledger_copy"] == {
+        "state": state.state,
+        "head_seq": state.head_seq,
+        "reported_ago": state.reported_ago,
+        "broken_at": state.broken_at,
+        "level": level,
+        "findings": findings,
+    }
+    assert STALE_SECONDS == 300
+
+
+def test_the_summary_counts_the_ledger_copy() -> None:
+    found = report(make_policy({}), ledger_copy=copy("fork", broken_at=2))
+    assert found["summary"] == {"error": 2, "warning": 0, "info": 0}
+    assert list(found)[-1] == "ledger_copy"
+    assert "ledger_copy" not in report(make_policy({}))

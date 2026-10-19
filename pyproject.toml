@@ -106,7 +106,12 @@ only_mutate = [
     "*zoeymcp/vault/health.py",
     "*zoeymcp/vault/reports.py",
     "*zoeymcp/vault/ledgerview.py",
-    "*zoeymcp/gateway/reporting.py",
+    "*zoeymcp/vault/oauth/protocol.py",
+    "*zoeymcp/vault/oauth/pkce.py",
+    "*zoeymcp/vault/oauth/tokens.py",
+    "*zoeymcp/vault/oauth/login.py",
+    "*zoeymcp/vault/gatewaykeys.py",
+    "*zoeymcp/vault/peer.py",
     "*zoeymcp/portal/webauthn.py",
     "*zoeymcp/portal/admission.py",
     "*zoeymcp/portal/display.py",
@@ -115,12 +120,7 @@ only_mutate = [
     "*zoeymcp/portal/sessions.py",
     "*zoeymcp/portal/limits.py",
     "*zoeymcp/portal/actions.py",
-    "*zoeymcp/vault/oauth/protocol.py",
-    "*zoeymcp/vault/oauth/pkce.py",
-    "*zoeymcp/vault/oauth/tokens.py",
-    "*zoeymcp/vault/oauth/login.py",
-    "*zoeymcp/vault/gatewaykeys.py",
-    "*zoeymcp/vault/peer.py",
+    "*zoeymcp/portal/passkeys.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/approvaltext.py",
@@ -138,6 +138,7 @@ only_mutate = [
     "*zoeymcp/gateway/connstate.py",
     "*zoeymcp/gateway/egressrules.py",
     "*zoeymcp/gateway/approvals.py",
+    "*zoeymcp/gateway/reporting.py",
     "*zoeymcp/vault/connectors/mailmsg.py",
     "*zoeymcp/vault/connectors/tunnel.py",
     "*zoeymcp/vault/connectors/smtpflow.py",
@@ -165,12 +166,13 @@ also_copy = ["deploy", "examples", "profiles", "tests"]
 "zoeymcp.vault.reports" = 90
 "zoeymcp.vault.ledgerview" = 90
 "zoeymcp.gateway.reporting" = 90
-"zoeymcp.portal.webauthn" = 90
 "zoeymcp.vault.health" = 90
-"zoeymcp.portal.sessions" = 90
-"zoeymcp.portal.limits" = 90
-"zoeymcp.portal.actions" = 90
+"zoeymcp.portal.webauthn" = 90
 "zoeymcp.portal.admission" = 90
 "zoeymcp.portal.display" = 90
 "zoeymcp.portal.routes" = 90
 "zoeymcp.portal.refusals" = 90
+"zoeymcp.portal.sessions" = 90
+"zoeymcp.portal.limits" = 90
+"zoeymcp.portal.actions" = 90
+"zoeymcp.portal.passkeys" = 90

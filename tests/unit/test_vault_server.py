@@ -16,6 +16,8 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from tests.unit.report_model import asked_line
+from zoeymcp.common.ledgerformat import GENESIS
 from zoeymcp.vault import gatewaykeys, logs, server
 from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
 from zoeymcp.vault.connectors import sendjournal
@@ -706,3 +708,47 @@ def test_run_stops_when_the_journal_cant_be_recovered(
     monkeypatch.setattr(SmtpConnectors, "recover", broken)
     with pytest.raises(StartupError, match="send journals"):
         server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), None)
+
+
+def test_run_recovers_the_reported_copy_before_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A torn tail is cut before any listener opens, and the proxy and the socket share the copy
+    (M5 design J.4)."""
+    copy = tmp_path / "ledger-reported"
+    copy.mkdir()
+    line = asked_line(0, GENESIS, 1)
+    (copy / "000000000000.jsonl").write_bytes(line + b"\n" + b'{"v":1,"se')
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(app=app, data=(copy / "000000000000.jsonl").read_bytes(), **kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
+    assert seen["data"] == line + b"\n"
+    reports = seen["app"].reports
+    assert (reports.state, reports.held.head_seq) == ("ok", 0)
+    assert seen["admin"]._reports is reports
+
+
+def test_run_serves_with_an_unreadable_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    (tmp_path / "ledger-reported").write_bytes(b"not a directory")
+    seen: list[str] = []
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        assert app.reports is not None
+        seen.append(app.reports.state)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), None)
+    assert seen == ["unavailable"]
+    assert '"event":"ledger_reported_unavailable"' in log_buffer.getvalue()

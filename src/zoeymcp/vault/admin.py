@@ -23,10 +23,16 @@ without the verifier the vault keeps.
 
 ``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
 design I).
+
+``zoeymcp ledger --vault`` uses ``GET /ledger/reported``: the vault's copy of the gateway's
+ledger, a page of :mod:`.ledgerview` rows with the send journals joined in, and the archived
+epochs. ``--restart-chain`` uses ``POST /ledger/reported/restart``: ``{"dry_run": true}`` answers
+the plan, and ``{"plan": ...}`` runs it if the copy hasn't changed since (M5 design J.4).
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import hmac
@@ -52,12 +58,13 @@ from starlette.routing import Route
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy.schema import Policy
-from . import health, logs, secretops, secretplan
+from . import health, ledgerview, logs, secretops, secretplan
 from .connectors.smtp import SmtpConnectors
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import KeySet
 from .oauth.login import LoginError, LoginService
 from .oauth.tokens import TokenManager
+from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
 from .secretplan import SecretRefusal
 from .store import SecretStore
@@ -193,13 +200,18 @@ class AdminApp:
         gateway_keys: GatewayKeys | None = None,
         connectors: SmtpConnectors | None = None,
         env_names: Callable[[], Collection[str]] | None = None,
+        reports: ReportStore | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
 
         ``connectors`` and ``env_names`` (the ``env:`` variables the vault found set) are for
-        ``GET /health``. Without them it shows no sends, and every ``env:`` reference unset."""
+        ``GET /health``. Without them it shows no sends, and every ``env:`` reference unset.
+
+        ``reports`` is the reported copy of the gateway's ledger, for ``/ledger/reported`` and
+        health. Without it, those routes answer 503 and health has no ``ledger_copy``."""
         self._store = store
+        self._reports = reports
         self._connectors = connectors
         self._env_names = env_names
         self._keys = keys
@@ -224,6 +236,8 @@ class AdminApp:
                 Route("/oauth/{credential}/complete", self._oauth_complete, methods=["POST"]),
                 Route("/oauth/{credential}/reset", self._oauth_reset, methods=["POST"]),
                 Route("/health", self._health, methods=["GET"]),
+                Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
+                Route("/ledger/reported/restart", self._ledger_restart, methods=["POST"]),
             ]
         )
 
@@ -346,8 +360,24 @@ class AdminApp:
             oauth=None if self._login is None else self._login.status(),
             sends=self._sends(policy),
             persisted=not self._store.dirty,
+            ledger_copy=self._ledger_copy(policy),
         )
         return JSONResponse(json_safe(health.assess(inputs)))
+
+    def _ledger_copy(self, policy: Policy) -> health.LedgerCopy | None:
+        """The reported copy for health; None without a copy or a gateway to report to it."""
+        copy = self._reports
+        if copy is None or policy.gateway is None:
+            return None
+        now = copy.clock()
+        contact = copy.contact_ms
+        return health.LedgerCopy(
+            state=copy.state,
+            head_seq=copy.held.head_seq,
+            reported_ago=None if contact is None else max(0, now - contact) // 1000,
+            uptime=max(0, now - copy.started_ms) // 1000,
+            broken_at=copy.broken_at,
+        )
 
     def _sends(self, policy: Policy) -> dict[str, health.Sends]:
         """Each connector's send journal, summed up. One that can't be read is left out."""
@@ -361,6 +391,106 @@ class AdminApp:
             except OSError:
                 continue
         return found
+
+    # --- the reported ledger (M5 design J.4, J.5) -----------------------------------------------
+
+    async def _ledger_reported(self, request: Request) -> Response:
+        """A page of the copy, newest first: ``?before=SEQ&limit=N`` (1 to 200)."""
+        copy = self._reports
+        if copy is None:
+            return _reason(503, "the vault keeps no reported copy", "unavailable")
+        query = dict(request.query_params)
+        if set(query) - {"before", "limit"} or len(request.query_params.multi_items()) != len(
+            query
+        ):
+            return _reason(400, "expected ?before=SEQ&limit=N", "bad_query")
+        try:
+            before, limit = _number(query.get("before")), _number(query.get("limit"))
+        except _BadNumber:
+            return _reason(400, "before and limit are numbers", "bad_query")
+        policy = self._policy()
+        journals = self._journals(policy)
+        try:
+            records = await asyncio.to_thread(copy.records)
+        except (CopyUnavailable, OSError):
+            view = ledgerview.state(copy.held, now=copy.clock())
+            view["state"] = "unavailable"
+            answer: dict[str, Any] = {"state": view, "rows": [], "orphans": [], "next": None}
+            answer |= {"refused": None, "archives": []}
+            return JSONResponse(answer)
+        page = ledgerview.page(
+            records,
+            held=copy.held,
+            journals=journals,
+            now=copy.clock(),
+            before=before,
+            limit=ledgerview.MAX_LIMIT if limit is None else limit,
+            broken_at=copy.broken_at,
+        )
+        return JSONResponse({**page, "refused": copy.refused, "archives": copy.archives()})
+
+    def _journals(self, policy: Policy) -> dict[str, list[dict[str, Any]]]:
+        """Each connector's journal records; one that can't be read is left out."""
+        found: dict[str, list[dict[str, Any]]] = {}
+        if self._connectors is None:
+            return found
+        for name in policy.connectors:
+            with contextlib.suppress(OSError):
+                found[name] = self._connectors.records(name)
+        return found
+
+    async def _ledger_restart(self, request: Request) -> Response:
+        """``{"dry_run": true}``: the restart's plan. ``{"plan": P}``: run it, unless the
+        plan is no longer ``P`` (409 ``changed``, with the plan now)."""
+        copy = self._reports
+        if copy is None:
+            return _reason(503, "the vault keeps no reported copy", "unavailable")
+        data = await _json_object(request, MAX_BODY)
+        if isinstance(data, Response):
+            return data
+        dry_run = data == {"dry_run": True}
+        if not dry_run and (set(data) != {"plan"} or not isinstance(data["plan"], dict)):
+            return _error(400, 'expected {"dry_run": true} or {"plan": ...}')
+        async with copy.lock:
+            try:
+                plan = copy.plan_restart()
+                if dry_run:
+                    return JSONResponse({"plan": plan.to_json()})
+                if plan.to_json() != data["plan"]:
+                    raise PlanChanged(plan)
+                done = await asyncio.to_thread(copy.restart, plan)
+            except NotRestartable:
+                message = "the copy takes reports; only a fork, gap or full is restarted"
+                return _reason(409, message, "not_restartable")
+            except CopyUnavailable:
+                return _reason(503, "the reported copy can't be read", "unavailable")
+            except PlanChanged as exc:
+                body = {
+                    "error": "the copy changed since the restart was planned",
+                    "reason": "changed",
+                    "plan": exc.plan.to_json(),
+                }
+                return JSONResponse(body, status_code=409)
+            except OSError:
+                return _reason(500, NOT_WRITTEN, "not_written")
+        return JSONResponse({"restarted": done.to_json(), "head": copy.head().to_json()})
+
+
+def _reason(status: int, message: str, reason: str) -> JSONResponse:
+    return JSONResponse({"error": message, "reason": reason}, status_code=status)
+
+
+class _BadNumber(ValueError):
+    pass
+
+
+def _number(value: str | None) -> int | None:
+    """A query number, None when absent. Raises :class:`_BadNumber` unless plain digits."""
+    if value is None:
+        return None
+    if not (value.isascii() and value.isdigit()) or len(value) > 15:
+        raise _BadNumber(value)
+    return int(value)
 
 
 def socket_supported() -> bool:

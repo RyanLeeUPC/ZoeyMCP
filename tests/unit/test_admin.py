@@ -18,7 +18,11 @@ import pytest
 import uvicorn
 
 from tests.fakes.oauth_server import FakeAuthServer
+from tests.unit.report_model import T0, asked_line
 from zoeymcp.cli.main import main
+from zoeymcp.common import canonical, ledgerreport
+from zoeymcp.common import files as common_files
+from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault import gatewaykeys, logs
@@ -33,6 +37,7 @@ from zoeymcp.vault.admin import (
     json_safe,
 )
 from zoeymcp.vault.app import VaultApp
+from zoeymcp.vault.connectors import sendjournal
 from zoeymcp.vault.connectors.smtp import SmtpConnectors
 from zoeymcp.vault.gatewaykeys import GatewayKeys
 from zoeymcp.vault.keys import KeySet
@@ -40,6 +45,7 @@ from zoeymcp.vault.oauth.login import LoginError, LoginService
 from zoeymcp.vault.oauth.pkce import CLI_OWNER
 from zoeymcp.vault.oauth.protocol import CREDENTIAL_UNAVAILABLE
 from zoeymcp.vault.oauth.tokens import OAuthUnavailable, TokenManager
+from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
@@ -1122,4 +1128,214 @@ async def test_health_without_the_token_manager(tmp_path: Path) -> None:
     response = await rig.call("GET", "/health")
     assert response.status_code == 200
     assert "oauth" not in response.json()["credentials"][1]
+    await rig.token_client.aclose()
+
+
+# --- the reported ledger (M5 design J.4, J.5) ----------------------------------------------------
+
+
+def reported_rig(tmp_path: Path, clock: list[int] | None = None) -> tuple[AdminRig, ReportStore]:
+    now = clock or [T0]
+    copy = ReportStore.open(tmp_path, clock=lambda: now[0])
+    connectors = SmtpConnectors(tmp_path, KEYS, clock_ms=lambda: now[0])
+    rig = AdminRig(tmp_path)
+    rig.admin = AdminApp(
+        rig.store,
+        KEYS,
+        lambda: rig.policy,
+        rig.setup,
+        rig.tokens,
+        connectors=connectors,
+        reports=copy,
+    )
+    return rig, copy
+
+
+def report(lines: list[bytes]) -> Any:
+    return canonical.loads_strict(ledgerreport.encode(lines))
+
+
+def chained(count: int, *, tick: int = 0) -> list[bytes]:
+    lines: list[bytes] = []
+    prev = GENESIS
+    for n in range(count):
+        lines.append(asked_line(n, prev, tick + n + 1))
+        prev = line_hash(lines[-1])
+    return lines
+
+
+@pytest.mark.anyio
+async def test_the_reported_copy_pages_newest_first(tmp_path: Path) -> None:
+    rig, copy = reported_rig(tmp_path)
+    copy.report(report(chained(5)))
+    first = (await rig.call("GET", "/ledger/reported?limit=2")).json()
+    assert [row["seq"] for row in first["rows"]] == [4, 3]
+    assert first["next"] == 3
+    assert (first["state"]["state"], first["state"]["head_seq"]) == ("ok", 4)
+    assert (first["refused"], first["archives"]) == (None, [])
+    rest = (await rig.call("GET", "/ledger/reported?before=3")).json()
+    assert [row["seq"] for row in rest["rows"]] == [2, 1, 0]
+    assert rest["next"] is None
+    # Never a keyed digest or a pin.
+    assert "hmac-sha256" not in json.dumps(first)
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_the_reported_copy_joins_the_send_journals(tmp_path: Path) -> None:
+    rig, copy = reported_rig(tmp_path)
+    journal = tmp_path / "connectors" / "mail-out"
+    journal.mkdir(parents=True)
+    sending = {
+        "ts": T0 - 1,
+        "key": "0000000000000001.1",
+        "req_hmac": "hmac-sha256:" + "0" * 64,
+        "key_id": "0" * 16,
+        "subject_chars": 1,
+        "body_chars": 1,
+    }
+    record = sendjournal.encode("sending", **sending)
+    (journal / "journal-0000000000001.jsonl").write_bytes(record + b"not a record\n")
+    copy.report(report(chained(2)))
+    page = (await rig.call("GET", "/ledger/reported")).json()
+    [row] = [row for row in page["rows"] if row["ref"] == "0000000000000001"]
+    assert row["journal"] == [
+        {
+            "key": "0000000000000001.1",
+            "state": "sending",
+            "smtp_code": None,
+            "at": row["journal"][0]["at"],
+        }
+    ]
+    assert page["orphans"] == []
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "query", ["?before=x", "?limit=-1", "?other=1", "?limit=1&limit=2", "?before=" + "9" * 16]
+)
+async def test_a_bad_page_query_is_400(tmp_path: Path, query: str) -> None:
+    rig, _ = reported_rig(tmp_path)
+    response = await rig.call("GET", "/ledger/reported" + query)
+    assert response.status_code == 400
+    assert response.json()["reason"] == "bad_query"
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_without_a_copy_the_ledger_routes_are_503(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    for method, path, body in [
+        ("GET", "/ledger/reported", None),
+        ("POST", "/ledger/reported/restart", {"dry_run": True}),
+    ]:
+        response = await rig.call(method, path, body)
+        assert (response.status_code, response.json()["reason"]) == (503, "unavailable")
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_an_unreadable_copy_shows_as_unavailable(tmp_path: Path) -> None:
+    (tmp_path / "ledger-reported").write_bytes(b"x")
+    rig, _ = reported_rig(tmp_path)
+    page = (await rig.call("GET", "/ledger/reported")).json()
+    assert (page["state"]["state"], page["rows"]) == ("unavailable", [])
+    restart = await rig.call("POST", "/ledger/reported/restart", {"dry_run": True})
+    assert (restart.status_code, restart.json()["reason"]) == (503, "unavailable")
+    health = (await rig.call("GET", "/health")).json()["ledger_copy"]
+    assert [f["code"] for f in health["findings"]] == ["ledger_copy_unavailable"]
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_chain_restart_over_the_socket(tmp_path: Path) -> None:
+    rig, copy = reported_rig(tmp_path)
+    refused = await rig.call("POST", "/ledger/reported/restart", {"dry_run": True})
+    assert (refused.status_code, refused.json()["reason"]) == (409, "not_restartable")
+    copy.report(report(chained(3)))
+    copy.report(report(chained(3, tick=100)[1:]))
+    planned = (await rig.call("POST", "/ledger/reported/restart", {"dry_run": True})).json()
+    plan = planned["plan"]
+    assert (plan["state"], plan["drop"], plan["archive"]["name"]) == ("fork", [], None)
+    assert copy.state == "fork"  # a dry run changes nothing
+
+    stale = {**plan, "archive": {**plan["archive"], "size": 1}}
+    changed = await rig.call("POST", "/ledger/reported/restart", {"plan": stale})
+    assert changed.status_code == 409
+    assert (changed.json()["reason"], changed.json()["plan"]) == ("changed", plan)
+
+    done = await rig.call("POST", "/ledger/reported/restart", {"plan": plan})
+    assert done.status_code == 200
+    answer = done.json()
+    assert answer["restarted"]["archive"]["name"] == f"archive-{T0:013d}"
+    assert answer["head"] == {"head_seq": None, "head_hash": None, "state": "ok"}
+    page = (await rig.call("GET", "/ledger/reported")).json()
+    assert [a["name"] for a in page["archives"]] == [f"archive-{T0:013d}"]
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("body", [{}, {"dry_run": False}, {"plan": 1}, {"plan": {}, "x": 1}])
+async def test_a_restart_body_is_checked(tmp_path: Path, body: Any) -> None:
+    rig, _ = reported_rig(tmp_path)
+    response = await rig.call("POST", "/ledger/reported/restart", body)
+    assert response.status_code == 400
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_restart_that_isnt_written_is_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig, copy = reported_rig(tmp_path)
+    copy.report(report(chained(3)))
+    copy.report(report(chained(3, tick=100)[1:]))
+    plan = (await rig.call("POST", "/ledger/reported/restart", {"dry_run": True})).json()["plan"]
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(common_files, "write_atomic", broken)
+    response = await rig.call("POST", "/ledger/reported/restart", {"plan": plan})
+    assert (response.status_code, response.json()["reason"]) == (500, "not_written")
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_health_shows_the_reported_copy(tmp_path: Path) -> None:
+    now = [T0]
+    rig, copy = reported_rig(tmp_path, now)
+    section = (await rig.call("GET", "/health")).json()["ledger_copy"]
+    assert section == {
+        "state": "ok",
+        "head_seq": None,
+        "reported_ago": None,
+        "broken_at": None,
+        "level": "info",
+        "findings": [
+            {
+                "code": "ledger_copy_none",
+                "level": "info",
+                "advisory": False,
+                "text": "no report from the gateway yet",
+                "action": {"kind": "check_gateway"},
+            }
+        ],
+    }
+    now[0] += 301_000
+    codes = (await rig.call("GET", "/health")).json()["ledger_copy"]["findings"]
+    assert [f["code"] for f in codes] == ["ledger_copy_stale"]
+    copy.contact()
+    copy.report(report(chained(2)))
+    now[0] += 12_000
+    section = (await rig.call("GET", "/health")).json()["ledger_copy"]
+    assert (section["head_seq"], section["reported_ago"], section["findings"]) == (1, 12, [])
+    copy.report(report(chained(2, tick=50)))
+    found = (await rig.call("GET", "/health")).json()
+    assert [f["code"] for f in found["ledger_copy"]["findings"]] == ["ledger_copy_refused"]
+    assert found["summary"]["error"] >= 1
+    # Without a gateway in the policy, nothing reports: no section.
+    rig.set_policy(rig.policy.model_copy(update={"gateway": None}))
+    assert "ledger_copy" not in (await rig.call("GET", "/health")).json()
     await rig.token_client.aclose()

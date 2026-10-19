@@ -26,7 +26,8 @@ The vault keeps its state in one directory (`/state`, the `vault-state` volume):
 
 - `store.json`: the encrypted secrets, written atomically (a temporary file, then a rename);
 - `vault.lock`: held with `flock` while the vault runs;
-- `setup.json`: the pending portal setup code.
+- `setup.json`: the pending portal setup code;
+- `ledger-reported/`: the vault's copy of the gateway's approval ledger (§21).
 
 **One vault per state volume.** A second vault on the same directory refuses to start ("another
 vault is using this state directory"). Network filesystems are unsupported: without `flock` the
@@ -163,8 +164,9 @@ health: ok (0 error(s), 1 warning(s), 1 info)
 It exits 0 with no error (with `--strict`, no warning either), 1 otherwise, and 2 when the vault
 can't be asked. `--json` prints the whole report, with a `summary` of counts per level and each
 finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
-`set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume` or
-`check_mailbox`, and the name it applies to). For a deployment's verify script:
+`set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
+`check_mailbox`, `check_gateway` or `read_ledger`, and the name it applies to). For a
+deployment's verify script:
 
 ```sh
 docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp health --json --strict > /dev/null
@@ -188,6 +190,8 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
 | `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
 | `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |
+| `ledger_copy_none`, `ledger_copy_stale` | info, warning | (with a `gateway` section) the gateway hasn't reported to the vault's copy of its ledger yet; it hasn't asked or reported for 5 minutes, since the vault started (§21) |
+| `ledger_copy_refused`, `ledger_copy_broken`, `ledger_copy_unavailable` | error | the copy refuses reports after a fork, gap or full; its files stop chaining at a seq; its directory can't be read (§21) |
 
 Findings marked `(from stored metadata)` (`advisory` in JSON) come from the store's clear
 metadata, which anyone with the state file can edit: they are shown, and nothing the vault
@@ -694,6 +698,54 @@ After a crash, the next start closes every call left open: a prompt that was wai
 `outcome unknown`, since it may have run. A torn last
 line is moved aside. To anchor the chain, copy the head hash `--verify` prints somewhere the
 gateway can't write.
+
+**The vault's copy.** The gateway pushes each record, once it is on disk, to the vault over the
+link it already uses, and the vault keeps an append-only copy in `/state/ledger-reported/`, where
+the gateway can't write: a held head the gateway can't rewrite afterwards, and in the vault's own
+logs (`ledger_report_accepted` carries `head_seq` and `head_hash`). Read it in the vault:
+
+```sh
+zoeymcp ledger --vault                    # the copy's state, then the newest 200 calls with their sends
+zoeymcp ledger --vault --before 980       # older ones
+zoeymcp ledger --vault --format json
+```
+
+Every row is as the gateway reported it. A send in a connector's journal whose call the copy
+doesn't hold is listed as an orphan: `no_ledger_record` once the copy has received a report since
+that send began (a caller other than the gateway, or a gateway that didn't record it), else
+`not_yet_reported`. No keyed digests are shown: check arguments with `zoeymcp ledger check` in the
+gateway. The command exits 1 when the copy isn't `ok` or its files don't chain.
+
+The first report after an empty copy is taken on trust; after that every report must extend the
+held head, and a resend of records the copy holds is trimmed. Otherwise the copy **refuses every
+report until you restart its chain**, logged once at `critical` (`ledger_report_refused`) and shown
+by `zoeymcp health` (`ledger_copy_refused`):
+
+| State | What happened | What to check |
+| --- | --- | --- |
+| `fork` | the gateway's ledger no longer extends the copy: its volume was lost or restored from a backup, or its ledger was rewritten | why the gateway's history changed. Approvals keep working |
+| `gap` | the gateway skipped records the copy doesn't hold: the vault's volume was restored, and the gateway pruned those records since | whether the vault's volume was restored |
+| `full` | the copy holds 64 MiB, and nothing received more than 30 days ago (by the vault's clock) can be pruned | a gateway sending more than an honest one would |
+
+Once you have decided why:
+
+```sh
+zoeymcp ledger --vault --restart-chain
+```
+
+It shows what happens and asks first: the live chain moves to `archive-<ms>/` (still on disk), and
+if the archives would pass 64 MiB, the oldest are deleted, each listed with its seq range, when it
+was received and its size. A deleted epoch's head seq and hash stay in `head.json` and in the
+`ledger_reported_restarted` log line as anchors. The next report starts a new chain, on trust. If
+the copy changed between the plan and your answer, nothing is done: run it again.
+
+At start, before it listens, the vault recovers the copy: a torn last line is moved to
+`torn-<ms>.bin` (`ledger_reported_repaired`), and a `head.json` that disagrees with the lines is
+rebuilt from them. A break inside the files (damage, or an edit) is logged at `critical`
+(`ledger_reported_broken`) and shown at its seq. A copy directory the vault can't read makes the
+copy unavailable (`ledger_reported_unavailable`): reports are refused with 503 and the proxy runs
+as before. Losing `ledger-reported/` loses the copy's history and its anchor; the gateway refills
+what it still holds, on trust.
 
 ## 22. The SMTP connector
 

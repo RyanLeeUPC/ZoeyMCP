@@ -225,6 +225,21 @@ def health(socket: str, transport: httpx.BaseTransport | None = None) -> dict[st
     return _request(socket, "GET", "/health", transport=transport)
 
 
+def vault_ledger(
+    socket: str, *, before: int | None = None, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """A page of the vault's reported copy of the gateway's ledger, newest first."""
+    path = "/ledger/reported" + ("" if before is None else f"?before={before}")
+    return _request(socket, "GET", path, transport=transport)
+
+
+def vault_ledger_restart(
+    socket: str, body: dict[str, Any], transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """``{"dry_run": true}`` for the restart's plan, ``{"plan": ...}`` to run it."""
+    return _request(socket, "POST", "/ledger/reported/restart", body, transport)
+
+
 def gateway_status(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
     return _request(socket, "GET", "/status", transport=transport, role="gateway")
 

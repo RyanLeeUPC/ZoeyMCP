@@ -53,6 +53,8 @@ HEALTH_ACTIONS = {
     "wait": "wait: it clears with time",
     "check_volume": "check the state volume",
     "check_mailbox": "check the mailbox for the sends with an unknown outcome",
+    "check_gateway": "check that the gateway runs and reaches the vault",
+    "read_ledger": "run: zoeymcp ledger --vault",
 }
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
@@ -327,7 +329,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "era, decision, outcome). --verify walks the hash chain and prints its head, to "
             "compare with the last anchor in the logs. 'ledger check REF FILE' proves whether "
             "FILE (JSON) holds the arguments that call was made with, without the key leaving "
-            "the gateway. Never argument values or prompt text."
+            "the gateway. Never argument values or prompt text. --vault reads the vault's "
+            "copy of the ledger instead (inside the vault), which the gateway reports to it; "
+            "--restart-chain archives that copy's chain after a fork, gap or full, once you "
+            "have decided why, and asks first."
         ),
     )
     ledger.add_argument("action", nargs="?", metavar="check")
@@ -341,13 +346,24 @@ def _build_parser() -> argparse.ArgumentParser:
     ledger.add_argument("--tool", metavar="TOOL")
     ledger.add_argument("--verify", action="store_true", help="check the hash chain")
     ledger.add_argument("--format", choices=("text", "json"), default="text")
+    ledger.add_argument(
+        "--vault", action="store_true", help="the vault's reported copy (inside the vault)"
+    )
+    ledger.add_argument(
+        "--restart-chain",
+        action="store_true",
+        help="with --vault: archive the copy's chain after a fork, gap or full (asks first)",
+    )
+    ledger.add_argument(
+        "--before", type=int, metavar="SEQ", help="with --vault: the rows before this seq"
+    )
     for sub in (review, gateway_status, ledger):
         sub.add_argument(
             "--socket",
             metavar="PATH",
             help=(
                 f"the gateway's admin socket (default ${admin_client.GATEWAY_SOCKET_ENV} or "
-                f"{admin_client.GATEWAY_SOCKET})"
+                f"{admin_client.GATEWAY_SOCKET}); with ledger --vault, the vault's"
             ),
         )
 
@@ -633,7 +649,12 @@ def _cmd_gateway_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> i
     return EXIT_OK
 
 
-def _cmd_ledger(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+def _cmd_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    if args.vault:
+        return _cmd_vault_ledger(args, stdin, out, err)
+    if args.restart_chain or args.before is not None:
+        err.write("zoeymcp ledger: --restart-chain and --before go with --vault\n")
+        return EXIT_UNREADABLE
     socket = admin_client.gateway_socket_path(args.socket)
     if args.action not in (None, "check"):
         err.write("zoeymcp ledger: the only action is 'check REF FILE'\n")
@@ -676,6 +697,50 @@ def _cmd_ledger(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         ledger_view.write_json(out, kept)
     else:
         ledger_view.write(out, ledger_view.lines(records, since=since))
+    return EXIT_OK
+
+
+def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    """``ledger --vault [--restart-chain] [--before SEQ]``: the vault's reported copy."""
+    gateway_only = (args.action, args.ref, args.since, args.client, args.server, args.tool)
+    if any(value is not None for value in gateway_only) or args.verify:
+        err.write("zoeymcp ledger: --vault takes only --restart-chain, --before and --format\n")
+        return EXIT_UNREADABLE
+    socket = admin_client.socket_path(args.socket)
+    try:
+        if args.restart_chain:
+            return _restart_chain(socket, stdin, out, err)
+        page = admin_client.vault_ledger(socket, before=args.before)
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp ledger: {exc}\n")
+        return EXIT_UNREADABLE
+    if args.format == "json":
+        review_view.write_json(page, out)
+    else:
+        review_view.write_lines(ledger_view.vault_lines(page), out)
+    state = page["state"]
+    return EXIT_OK if state["state"] == "ok" and state["broken_at"] is None else EXIT_FINDINGS
+
+
+def _restart_chain(socket: str, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    """Show the restart's plan, ask, then run exactly that plan."""
+    plan = admin_client.vault_ledger_restart(socket, {"dry_run": True})["plan"]
+    review_view.write_lines(ledger_view.restart_lines(plan), out)
+    out.write("Restart the chain? [y/N] ")
+    out.flush()
+    if stdin.readline().strip().lower() not in ("y", "yes"):
+        err.write("zoeymcp ledger: not restarted\n")
+        return EXIT_FINDINGS
+    try:
+        done = admin_client.vault_ledger_restart(socket, {"plan": plan})["restarted"]
+    except admin_client.AdminUnavailable as exc:
+        if exc.reason != "changed":
+            raise
+        err.write("zoeymcp ledger: the copy changed since this plan; nothing was done; run again\n")
+        return EXIT_FINDINGS
+    archive = done["archive"]
+    where = "nothing to archive" if archive is None else f"archived as {archive['name']}"
+    out.write(f"restarted: {where}; the next report starts a new chain\n")
     return EXIT_OK
 
 
@@ -897,6 +962,11 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
     store = report["store"]
     lines.append(f"store: {store['level']} ({store['entries']} entries)")
     lines += _finding_lines(store["findings"])
+    copy = report.get("ledger_copy")
+    if copy is not None:
+        head = "nothing reported" if copy["head_seq"] is None else f"head seq {copy['head_seq']}"
+        lines.append(f"ledger copy: {copy['level']} ({copy['state']}, {head})")
+        lines += _finding_lines(copy["findings"])
     counts = report["summary"]
     lines.append(
         f"health: {'ok' if ok else 'FAILED'} ({counts['error']} error(s), "
@@ -1085,7 +1155,7 @@ def main(
     if args.command == "gateway-status":
         return _cmd_gateway_status(args, out, err)
     if args.command == "ledger":
-        return _cmd_ledger(args, out, err)
+        return _cmd_ledger(args, stdin, out, err)
     if args.command == "login":
         return _cmd_login(args, stdin, out, err)
     if args.command == "oauth":

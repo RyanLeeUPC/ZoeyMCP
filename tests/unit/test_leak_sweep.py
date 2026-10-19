@@ -35,7 +35,10 @@ from tests.fakes.oauth_server import (
     google_style,
     spotify_style,
 )
+from tests.unit.report_model import DIGEST, PIN, asked_line
 from zoeymcp.cli.main import main
+from zoeymcp.common import ledgerreport
+from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
@@ -44,7 +47,9 @@ from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
+from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.request import oauth_client_variants
+from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
 from .test_oauth_tokens import KEYS, FakeClock
@@ -669,3 +674,58 @@ def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:
     assert hash_token(LITERAL_TOKEN) in served
     assert view.gateway.servers["srv-remote"].model_dump()["vault_path"] == "/mcp-a/mcp"
     assert parse_view(served.encode()) == view
+
+
+# --- the report path (M5 design J.2, J.4, M.4) ---------------------------------------------------
+
+
+async def test_no_ledger_line_reaches_the_vault_logs(tmp_path: Path) -> None:
+    """Reports accepted and refused, a torn tail, a broken chain and a restart: the log holds
+    seqs, hashes and reasons, never a record, a keyed digest, a pin or a name from one."""
+
+    def chain(count: int, tick: int) -> list[bytes]:
+        lines: list[bytes] = []
+        prev = GENESIS
+        for n in range(count):
+            lines.append(asked_line(n, prev, tick + n + 1, big=True))
+            prev = line_hash(lines[-1])
+        return lines
+
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        store = SecretStore(tmp_path, KEYS)
+        store.load()
+        copy = ReportStore.open(tmp_path, rotate_bytes=2000)
+        app = VaultApp(policy(), store, KEYS, environ={}, reports=copy)
+        transport = httpx.ASGITransport(app=ListenerTag(app, "gateway"))
+        good, forked = chain(5, 0), chain(5, 100)
+        async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
+            for lines in (good[:3], good[2:5], forked[1:3], good[:1]):
+                await client.post(
+                    ledgerreport.PATH,
+                    content=ledgerreport.encode(lines),
+                    headers={"content-type": "application/json"},
+                )
+            bad = json.dumps({"v": 1, "lines": [good[0].decode() + "x"]}).encode()
+            await client.post(
+                ledgerreport.PATH, content=bad, headers={"content-type": "application/json"}
+            )
+            await client.get(ledgerreport.PATH)
+        copy.restart()
+        copy.report({"v": 1, "lines": [line.decode() for line in good[:3]]})
+        newest = sorted((tmp_path / "ledger-reported").glob("*.jsonl"))[-1]
+        newest.write_bytes(newest.read_bytes() + good[3][:40])
+        ReportStore.open(tmp_path)
+        await app.aclose()
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    for event in ("ledger_report_accepted", "ledger_report_refused", "ledger_reported_restarted"):
+        assert f'"event":"{event}"' in text
+    assert '"event":"ledger_reported_repaired"' in text
+    for line in [*good, *forked]:
+        assert line.decode() not in text
+        assert line.decode()[:60] not in text
+    for secret in (DIGEST, PIN, "n" * 127 + "1", "hmac-sha256:"):
+        assert secret not in text
