@@ -73,7 +73,7 @@ def parse_path_pattern(pattern: str) -> PathPattern:
             segments.append(Segment("star"))
         elif part.startswith("{") and part.endswith("}"):
             name = part[1:-1]
-            if not CAPTURE_NAME.match(name):
+            if not CAPTURE_NAME.fullmatch(name):
                 raise PathPatternError(f"invalid capture name {name!r}")
             if name in seen:
                 raise PathPatternError(f"capture {{{name}}} appears twice")
@@ -81,7 +81,7 @@ def parse_path_pattern(pattern: str) -> PathPattern:
             segments.append(Segment("capture", name))
         elif part in (".", ".."):
             raise PathPatternError(f"'{part}' segments are not allowed")
-        elif SEGMENT_CHARS.match(part):
+        elif SEGMENT_CHARS.fullmatch(part):
             segments.append(Segment("literal", part))
         else:
             raise PathPatternError(

@@ -88,7 +88,7 @@ def normalize_path(raw: bytes) -> NormalizedPath:
             raise RequestRejected("double percent-encoding")
         if text in (".", ".."):
             raise RequestRejected("dot segment in path")
-        if not SEGMENT_CHARS.match(text):
+        if not SEGMENT_CHARS.fullmatch(text):
             raise RequestRejected("path segment has characters that aren't allowed")
         segments.append(text)
     return NormalizedPath(tuple(segments), trailing)

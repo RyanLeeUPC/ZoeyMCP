@@ -80,6 +80,12 @@ def test_invalid_names(name: str) -> None:
     assert plan_put(name, {"value": "v-123456"}, example_policy()) == expected
 
 
+def test_a_trailing_line_break_makes_a_name_invalid() -> None:
+    # "$" also matches before a final "\n", so the name is matched whole (PUT /secrets/a.b%0A).
+    assert check_name("a.b") is None
+    assert check_name("a.b\n") == refusal(400, "invalid_name", "invalid secret name")
+
+
 @pytest.mark.parametrize("name", ["oauth.", "oauth.anything", "oauth.broker-mcp.live"])
 def test_vault_managed_names(name: str) -> None:
     expected = refusal(409, "vault_managed", "managed by the vault; use zoeymcp login")

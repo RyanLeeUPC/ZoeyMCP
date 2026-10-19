@@ -240,6 +240,11 @@ async def test_bad_secret_names(tmp_path: Path) -> None:
     rig = AdminRig(tmp_path)
     assert (await rig.call("PUT", "/secrets/Bad Name", {"value": "v"})).status_code in (400, 404)
     assert (await rig.call("PUT", "/secrets/UPPER", {"value": "v"})).status_code == 400
+    # The path parameter is decoded: %0A is a trailing line break, never part of a name.
+    body = {"value": "lfm-123456"}
+    assert (await rig.call("PUT", "/secrets/music-stats%0A", body)).status_code == 400
+    assert rig.store.names() == []
+    assert (await rig.call("PUT", "/secrets/music-stats", body)).status_code == 200
 
 
 @pytest.mark.anyio

@@ -85,7 +85,7 @@ class DeletePlan:
 
 def check_name(name: str) -> SecretRefusal | None:
     """The checks on the name of a write, which the socket makes before it reads the body."""
-    if not NAME.match(name):
+    if not NAME.fullmatch(name):
         return SecretRefusal(400, "invalid_name", "invalid secret name")
     if name.startswith(VAULT_PREFIX):
         return SecretRefusal(409, "vault_managed", "managed by the vault; use zoeymcp login")

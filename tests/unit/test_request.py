@@ -69,6 +69,8 @@ def test_normalize_accepts(raw: bytes, segments: tuple[str, ...], trailing: bool
         (b"/a\x00b", "non-printable or non-ASCII"),
         (b"/a%00b", "characters that aren't allowed"),
         (b"/a%20b", "characters that aren't allowed"),
+        (b"/a%0A", "characters that aren't allowed"),  # "$" alone allows a final "\n"
+        (b"/a%0a/b", "characters that aren't allowed"),
         (b"/a%zz", "malformed percent-encoding"),
         (b"/a%4", "malformed percent-encoding"),
         (b"/a*b", "characters that aren't allowed"),

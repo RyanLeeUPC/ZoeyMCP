@@ -47,6 +47,7 @@ def test_literal_characters(literal: str) -> None:
         ("/**/x", "only allowed as the last segment"),
         ("/{Doc}", "invalid capture name"),
         ("/{}", "invalid capture name"),
+        ("/{doc\n}", "invalid capture name"),
         ("/{a}/{a}", "appears twice"),
         ("/a/../b", "'..' segments are not allowed"),
         ("/./b", "'.' segments are not allowed"),
@@ -55,6 +56,8 @@ def test_literal_characters(literal: str) -> None:
         ("/a{b}", "partial wildcards"),
         ("/café", "partial wildcards"),
         ("/a b", "partial wildcards"),
+        ("/v1\n", "partial wildcards"),
+        ("/v1\n/x", "partial wildcards"),
         ("/a\\b", "partial wildcards"),
     ],
 )

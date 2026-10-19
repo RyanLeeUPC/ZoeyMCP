@@ -336,9 +336,10 @@ def test_every_bad_path_pattern_is_reported() -> None:
     assert len(found) == 2, found
 
 
-def test_mcp_server_path_must_be_plain() -> None:
+@pytest.mark.parametrize("bad", ["mcp?x=1", "/mcp\n"])
+def test_mcp_server_path_must_be_plain(bad: str) -> None:
     def mutate(raw: dict[str, Any]) -> None:
-        raw["gateway"]["servers"]["broker-read"]["path"] = "mcp?x=1"
+        raw["gateway"]["servers"]["broker-read"]["path"] = bad
 
     assert "error gateway.servers.broker-read.path: must be a plain absolute path" in (
         _findings(mutate)

@@ -910,7 +910,7 @@ def _check_approvals(gateway: Gateway, report: _Report) -> None:
 
 def _request_path(path: str) -> NormalizedPath | None:
     """A gateway server's ``path`` as the vault matches it, or ``None`` if the vault refuses it."""
-    if not _MCP_SERVER_PATH.match(path):
+    if not _MCP_SERVER_PATH.fullmatch(path):
         return None
     try:
         # The pattern above leaves out '*' and braces, so every segment is a literal.

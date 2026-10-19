@@ -64,7 +64,7 @@ _DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 def is_secret_ref(value: str) -> bool:
-    return bool(_SECRET_REF.match(value))
+    return bool(_SECRET_REF.fullmatch(value))
 
 
 def hash_token(token: str) -> str:
@@ -147,7 +147,7 @@ def _check_host_port(value: str) -> str:
         host, sep, port = value.rpartition(":")
         if not sep or not host:
             raise ValueError("expected host:port")
-        if not _HOSTNAME.match(host):
+        if not _HOSTNAME.fullmatch(host):
             try:
                 ipaddress.IPv4Address(host)
             except ValueError as exc:
@@ -166,7 +166,7 @@ def _check_network(value: str) -> str:
 
 
 def _check_hostname(value: str) -> str:
-    if not _HOSTNAME.match(value):
+    if not _HOSTNAME.fullmatch(value):
         try:
             ipaddress.ip_address(value)
         except ValueError as exc:
@@ -368,7 +368,7 @@ class OAuth2Credential(_Model):
         if len(scopes) > MAX_SCOPES:
             raise ValueError(f"at most {MAX_SCOPES} scopes")
         for scope in scopes:
-            if not _SCOPE_TOKEN.match(scope):
+            if not _SCOPE_TOKEN.fullmatch(scope):
                 raise ValueError(
                     f"invalid scope {scope!r}: 1 to 256 printable ASCII characters, without "
                     "spaces, quotes or backslashes, separated by one scope_separator"

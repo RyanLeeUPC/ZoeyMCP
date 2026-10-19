@@ -23,6 +23,7 @@ from zoeymcp.common.policy.schema import (
     OAuth2Credential,
     RemoteServer,
     hash_token,
+    is_secret_ref,
     param_values,
     split_scope,
 )
@@ -149,6 +150,22 @@ def test_schema_rejects(example_raw: Raw, mutate: Callable[[Raw], object], expec
     mutate(raw)
     found = schema_errors(raw)
     assert any(e.startswith(expected) for e in found), found
+
+
+@pytest.mark.parametrize("ref", ["store:a.b", "env:A_B"])
+def test_a_secret_ref_is_matched_whole(ref: str) -> None:
+    # "$" also matches before a final "\n"; the SecretRef type doesn't, and neither may this.
+    assert is_secret_ref(ref)
+    assert not is_secret_ref(ref + "\n")
+
+
+def test_a_trailing_line_break_is_not_part_of_a_host(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["admin"]["listen"] = "localhost:8081"
+    assert errors(run(raw)) == []
+    raw["admin"]["listen"] = "localhost\n:8081"
+    expected = "admin.listen: Value error, invalid host 'localhost\\n'"
+    assert any(e.startswith(expected) for e in schema_errors(raw))
 
 
 def test_yaml_problems_are_policy_errors() -> None:
@@ -642,6 +659,7 @@ def test_scope_accepts(scope: str, separator: str) -> None:
         ('a"b', " ", "'a\"b'"),
         ("a\\b", " ", "'a\\\\b'"),
         ("a\tb", " ", "'a\\tb'"),
+        ("read write\n", " ", "'write\\n'"),
         ("a\x7fb", " ", "'a\\x7fb'"),
         ("\u00e9t\u00e9", " ", "'\u00e9t\u00e9'"),
         ("x" * 257, " ", "'" + "x" * 257 + "'"),
@@ -1908,6 +1926,7 @@ def test_gateway_hosts_accept(example_raw: Raw, host: str) -> None:
         (["gw.example:8080"], "gateway.hosts: Value error, invalid host name 'gw.example:8080'"),
         (["bad_host.example"], "gateway.hosts: Value error, invalid host name"),
         (["localhost", "-x"], "gateway.hosts: Value error, invalid host name '-x'"),
+        (["gw.example\n"], "gateway.hosts: Value error, invalid host name 'gw.example\\n'"),
     ],
 )
 def test_gateway_hosts_reject(example_raw: Raw, hosts: list[str], expected: str) -> None:
