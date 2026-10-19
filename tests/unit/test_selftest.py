@@ -284,7 +284,6 @@ def test_broker_mutants_are_killed(tmp_path: Path) -> None:
 OAUTH_POLICY = """
 version: 1
 mode: declarative
-admin: {listen: "0.0.0.0:8081", hosts: [localhost]}
 credentials:
   basic-form:
     kind: oauth2

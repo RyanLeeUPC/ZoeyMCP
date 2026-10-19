@@ -16,6 +16,7 @@ credentials:
     client_auth: post
     refresh_token: store:google-refresh
     rotates: false
+    idle_expiry_days: 180 # Google expires refresh tokens unused for six months
     # Without both, Google issues no refresh token.
     authorize_params: { access_type: offline, prompt: consent }
     scope: https://www.googleapis.com/auth/calendar.readonly

@@ -82,7 +82,6 @@ def make_policy(*routes: dict[str, Any]) -> Policy:
         {
             "version": 1,
             "mode": "declarative",
-            "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
             "routes": list(routes),
             "credentials": CRED,
         }
@@ -252,7 +251,6 @@ async def test_a_connector_route_is_marked(tmp_path: Path) -> None:
         {
             "version": 1,
             "mode": "declarative",
-            "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
             "routes": [connector],
             "connectors": {
                 "mail-out": {

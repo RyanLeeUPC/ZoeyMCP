@@ -45,7 +45,6 @@ SECRET = "sk-live-8f3c2a91d7e4"
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 
 

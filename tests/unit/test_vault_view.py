@@ -78,7 +78,6 @@ def raw_policy(*, hosts: list[str] | None = None, generation: int = 1) -> dict[s
         "version": 1,
         "mode": "declarative",
         "gateway_key_generation": generation,
-        "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
         "credentials": {"notes-key": {"kind": "header", "secret": "store:notes-key"}},
         "routes": [
             {

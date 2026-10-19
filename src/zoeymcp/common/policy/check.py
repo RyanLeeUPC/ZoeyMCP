@@ -6,6 +6,7 @@ probably aren't what was meant, or are weaker than they could be.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections import defaultdict
 from collections.abc import Mapping
@@ -16,6 +17,7 @@ from .findings import Finding
 from .match import NormalizedPath, path_matches
 from .paths import PathPatternError, parse_path_pattern
 from .schema import (
+    Admin,
     BasicCredential,
     BridgeServer,
     Gateway,
@@ -126,6 +128,8 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
     _check_routes(policy, report)
     _check_tokens(policy, report)
     _check_gateway(policy, report)
+    if policy.admin is not None:
+        _check_admin(policy.admin, report)
     return sorted(set(report.findings))
 
 
@@ -441,6 +445,8 @@ def _check_client_credentials(path: str, cred: OAuth2Credential, report: _Report
         report.error(f"{path}.client_auth", f"none can't be used with {grant}")
     if cred.grant_lifetime_days is not None:
         report.warning(f"{path}.grant_lifetime_days", f"not used by {grant}")
+    if cred.idle_expiry_days is not None:
+        report.error(f"{path}.idle_expiry_days", f"not used by {grant}")
 
 
 def _check_oauth_params(path: str, cred: OAuth2Credential, report: _Report) -> None:
@@ -677,6 +683,50 @@ def _check_tokens(policy: Policy, report: _Report) -> None:
         if len(paths) > 1:
             for p in paths:
                 report.error(p, "two clients share a token")
+
+
+# --- the portal --------------------------------------------------------------------------------
+
+
+def _check_admin(admin: Admin, report: _Report) -> None:
+    first: dict[str, int] = {}
+    for index, origin in enumerate(admin.origins):
+        # Origins are in browser form (schema), so equal origins are equal strings.
+        if origin in first:
+            report.error(
+                f"admin.origins[{index}]", f"duplicate origin (also admin.origins[{first[origin]}])"
+            )
+        first.setdefault(origin, index)
+    host, port = _split_host_port(admin.listen)
+    if not _loopback_or_wildcard(host):
+        return  # reached by its own address, perhaps through a proxy
+    ports: set[int] = set()
+    for origin in admin.origins:
+        parts = urlsplit(origin)
+        if parts.hostname == "localhost":
+            ports.add(parts.port or _DEFAULT_PORTS[parts.scheme])
+    if port not in ports:
+        report.warning(
+            "admin.origins",
+            f"no localhost origin uses admin.listen's port {port}: right only if the host "
+            "publishes the portal on another port",
+        )
+
+
+def _split_host_port(value: str) -> tuple[str, int]:
+    """``host:port`` or ``[ipv6]:port``, already checked by the schema."""
+    host, _, port = value.rpartition(":")
+    return host.removeprefix("[").removesuffix("]"), int(port)
+
+
+def _loopback_or_wildcard(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a name, such as a network alias
+    return address.is_loopback or address.is_unspecified
 
 
 # --- gateway -----------------------------------------------------------------------------------

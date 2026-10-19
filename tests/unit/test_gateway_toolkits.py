@@ -287,7 +287,6 @@ def view_with(module: str, **server: Any) -> GatewayView:
     raw: dict[str, Any] = {
         "version": 1,
         "mode": "declarative",
-        "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
         "gateway": {"servers": {"kit": {"kind": "toolkit", "module": module, **server}}},
     }
     return build_view(Policy.model_validate(raw))
@@ -327,7 +326,6 @@ def mail_view(*, servers: bool = True, pinning: str = "off") -> GatewayView:
     raw: dict[str, Any] = {
         "version": 1,
         "mode": "declarative",
-        "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
         "connectors": {
             "mail-out": {
                 "kind": "smtp",

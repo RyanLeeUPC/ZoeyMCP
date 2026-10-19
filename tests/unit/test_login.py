@@ -75,7 +75,6 @@ VERIFIER = "fake03" + "x" * 37
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 
 

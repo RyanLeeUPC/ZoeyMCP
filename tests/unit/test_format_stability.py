@@ -169,7 +169,6 @@ def test_meta_survives_a_load_with_the_previous_key(tmp_path: Path) -> None:
 VIEW_POLICY = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
     "credentials": {
         "notes-key": {
             "kind": "header",

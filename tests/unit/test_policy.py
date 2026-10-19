@@ -128,6 +128,11 @@ def test_example_policy_is_clean(example_text: str) -> None:
             "admin.listen: Value error, invalid port",
         ),
         (
+            lambda r: r["admin"].update(hosts=["localhost"]),
+            "admin: Value error, admin.hosts became admin.origins in M5: list full origins, "
+            "like http://localhost:8081",
+        ),
+        (
             lambda r: r["gateway"]["servers"]["broker-read"]["review"].update(
                 get_quote="sha256:abc"
             ),
@@ -436,7 +441,6 @@ def oauth_policy(
     return {
         "version": 1,
         "mode": "declarative",
-        "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
         "credentials": creds,
         "connectors": connectors or {},
         "routes": routes,
@@ -520,6 +524,8 @@ def test_scope_and_param_helpers() -> None:
         ({"default_expires_in": 86401}, ".default_expires_in: Input should be less than"),
         ({"grant_lifetime_days": 0}, ".grant_lifetime_days: Input should be greater than"),
         ({"grant_lifetime_days": 3651}, ".grant_lifetime_days: Input should be less than"),
+        ({"idle_expiry_days": 0}, ".idle_expiry_days: Input should be greater than"),
+        ({"idle_expiry_days": 3651}, ".idle_expiry_days: Input should be less than"),
         (
             {"extra_params": {"resource": []}},
             ".extra_params.resource.list[constrained-str]: List should",
@@ -722,6 +728,16 @@ def test_client_credentials_rules() -> None:
     assert found_for(client_credentials(refresh_token="store:o-seed")) == [
         "error credentials.o.refresh_token: not used by the client_credentials grant"
     ]
+    assert found_for(client_credentials(idle_expiry_days=180)) == [
+        "error credentials.o.idle_expiry_days: not used by the client_credentials grant"
+    ]
+
+
+def test_idle_expiry_days_on_a_refresh_grant() -> None:
+    assert found_for(oauth(idle_expiry_days=180)) == found_for(oauth())
+    assert parsed(oauth()).idle_expiry_days is None
+    assert parsed(oauth(idle_expiry_days=1)).idle_expiry_days == 1
+    assert parsed(oauth(idle_expiry_days=3650)).idle_expiry_days == 3650
 
 
 @pytest.mark.parametrize(
@@ -1702,6 +1718,147 @@ def test_era_values(example_raw: Raw) -> None:
         e.startswith("gateway.servers.broker-read.remote.era: Input should be")
         for e in schema_errors(raw)
     )
+
+
+# --- the portal ---------------------------------------------------------------------------------
+
+
+def admin_findings(raw: Raw) -> list[str]:
+    return [f"{f.level} {f.path}: {f.message}" for f in run(raw) if f.path.startswith("admin")]
+
+
+def test_the_portal_is_optional(example_raw: Raw, example_text: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    del raw["admin"]
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    assert policy.admin is None
+    assert check_policy(policy) == check_policy(parse_policy(example_text, "example"))
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:9000",
+        "http://localhost",
+        "https://localhost:8443",
+        "https://zoeymcp.tailnet.example",
+        "https://vault.example.net:8443",
+        "https://vault",
+        "https://1.2.3.example",
+    ],
+)
+def test_portal_origins_accept(example_raw: Raw, origin: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["admin"]["origins"] = ["http://localhost:8081", origin]
+    assert admin_findings(raw) == []
+
+
+IP_ORIGIN = "Value error, passkeys don't work on IP addresses; use http://localhost:<port>"
+PLAIN_HTTP = (
+    "Value error, plain http works only on localhost; use https with a certificate the "
+    "browser trusts"
+)
+UNDER_LOCALHOST = "Value error, a name under localhost can't be a portal origin"
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("http://127.0.0.1:8081", IP_ORIGIN),
+        ("https://127.0.0.1", IP_ORIGIN),
+        ("http://[::1]:8081", IP_ORIGIN),
+        ("https://[2001:db8::1]", IP_ORIGIN),
+        # Browsers read these as IPv4 addresses.
+        ("https://1.2.3", IP_ORIGIN),
+        ("https://vault.example.42", IP_ORIGIN),
+        ("https://vault.0x7f", IP_ORIGIN),
+        ("https://vault.0x", IP_ORIGIN),
+        ("http://vault.example", PLAIN_HTTP),
+        ("http://vault.example:8081", PLAIN_HTTP),
+        ("http://localhostx:8081", PLAIN_HTTP),
+        ("http://portal.localhost:8081", UNDER_LOCALHOST),
+        ("https://portal.localhost", UNDER_LOCALHOST),
+        ("http://localhost.:8081", "Value error, invalid host name 'localhost.'"),
+        # The browser-form rules every origin follows.
+        ("http://", "String should have at least 8 characters"),
+        ("https://" + "a" * 293, "String should have at most 300 characters"),
+        ("ftp://localhost", "Value error, scheme must be one of: http, https"),
+        ("http://localhost:8081/", "Value error, an origin is scheme://host[:port], with no path"),
+        ("http://Localhost:8081", "Value error, write origins in lower case"),
+        ("http://localhost:80", "Value error, leave out the default port 80; browsers do"),
+        ("https://vault.example:443", "Value error, leave out the default port 443; browsers do"),
+        ("http://localhost:99999", "Value error, invalid port"),
+    ],
+)
+def test_portal_origins_reject(example_raw: Raw, origin: str, expected: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["admin"]["origins"] = ["http://localhost:8081", origin]
+    found = schema_errors(raw)
+    assert any(e.startswith("admin.origins") and expected in e for e in found), found
+
+
+def test_portal_origin_count(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    for count, expected in [(0, "at least 1 item"), (9, "at most 8 items")]:
+        raw["admin"]["origins"] = [f"http://localhost:{9000 + i}" for i in range(count)]
+        assert f"admin.origins: List should have {expected}" in " ".join(schema_errors(raw))
+    raw["admin"]["origins"] = ["http://localhost:8081"] + [
+        f"http://localhost:{9000 + i}" for i in range(7)
+    ]
+    assert admin_findings(raw) == []
+    del raw["admin"]["origins"]
+    assert "admin.origins: Field required" in schema_errors(raw)
+
+
+def test_duplicate_portal_origins(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    one, two = "http://localhost:8081", "https://zoeymcp.tailnet.example"
+    raw["admin"]["origins"] = [one, two, one, two, one]
+    assert admin_findings(raw) == [
+        "error admin.origins[2]: duplicate origin (also admin.origins[0])",
+        "error admin.origins[3]: duplicate origin (also admin.origins[1])",
+        "error admin.origins[4]: duplicate origin (also admin.origins[0])",
+    ]
+    # Two localhost ports are two origins (sharing passkeys: the RP ID has no port).
+    raw["admin"]["origins"] = [one, "http://localhost:9000"]
+    assert admin_findings(raw) == []
+
+
+OTHER_PORT = (
+    "warning admin.origins: no localhost origin uses admin.listen's port 8081: right only if "
+    "the host publishes the portal on another port"
+)
+
+
+@pytest.mark.parametrize(
+    ("listen", "origins", "expected"),
+    [
+        # Loopback and wildcard addresses: the browser reaches this port, or a published one.
+        ("127.0.0.1:8081", ["http://localhost:9000"], [OTHER_PORT]),
+        ("127.0.0.2:8081", ["http://localhost:9000"], [OTHER_PORT]),
+        ("[::1]:8081", ["http://localhost:9000"], [OTHER_PORT]),
+        ("localhost:8081", ["http://localhost:9000"], [OTHER_PORT]),
+        ("0.0.0.0:8081", ["http://localhost:9000"], [OTHER_PORT]),
+        ("[::]:8081", ["http://localhost:9000"], [OTHER_PORT]),
+        ("0.0.0.0:8081", ["https://vault.example:8081"], [OTHER_PORT]),
+        ("0.0.0.0:8081", ["https://vault.example"], [OTHER_PORT]),
+        ("127.0.0.1:8081", ["http://localhost:8081"], []),
+        ("0.0.0.0:8081", ["https://vault.example", "http://localhost:8081"], []),
+        ("[::]:8081", ["http://localhost:9000", "https://localhost:8081"], []),
+        ("127.0.0.1:80", ["http://localhost"], []),
+        ("127.0.0.1:443", ["https://localhost"], []),
+        # Another address, or a name: the browser reaches it some other way.
+        ("10.0.0.5:8081", ["http://localhost:9000"], []),
+        ("[fd00::5]:8081", ["https://vault.example"], []),
+        ("vault-portal:8081", ["http://localhost:9000"], []),
+    ],
+)
+def test_the_listen_port_and_the_localhost_origins(
+    example_raw: Raw, listen: str, origins: list[str], expected: list[str]
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["admin"] = {"listen": listen, "origins": origins}
+    assert admin_findings(raw) == expected
 
 
 # --- gateway: hosts, origins and limits ---------------------------------------------------------

@@ -34,7 +34,6 @@ PROFILES = Path(__file__).resolve().parents[2] / "profiles"
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 STARTUP_TIMEOUT = 10.0
 # Responses still open when a server stops are cut after this many seconds.

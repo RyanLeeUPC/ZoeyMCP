@@ -100,7 +100,6 @@ def make_policy(**overrides: Any) -> Policy:
         {
             "version": 1,
             "mode": "declarative",
-            "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
             "credentials": CRED,
             "routes": [route],
         }

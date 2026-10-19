@@ -1126,7 +1126,6 @@ def test_in_memory_never_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
     "credentials": {"api-key": {"kind": "header", "secret": "store:api-key"}},
 }
 

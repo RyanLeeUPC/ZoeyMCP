@@ -70,7 +70,6 @@ def policy(
         {
             "version": 1,
             "mode": "declarative",
-            "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
             "credentials": {
                 n: {k: v for k, v in c.items() if v is not None} for n, c in credentials.items()
             },

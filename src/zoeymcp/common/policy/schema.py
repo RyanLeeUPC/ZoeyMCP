@@ -35,6 +35,8 @@ _HOSTNAME = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
+# A host label browsers parse as a number (WHATWG URL's "ends in a number").
+_NUMERIC_LABEL = re.compile(r"^(?:[0-9]+|0x[0-9a-f]*)$")
 _ADDRESS = re.compile(r"^[^@\s<>\"]{1,64}@[A-Za-z0-9.-]{1,253}$")
 # One scope token: RFC 6749 NQCHAR (printable ASCII without space, double quote or backslash).
 _SCOPE_TOKEN = re.compile(r"^[\x21\x23-\x5B\x5D-\x7E]{1,256}$")
@@ -197,6 +199,25 @@ def _check_origin(value: str) -> str:
     return value
 
 
+def _check_portal_origin(value: str) -> str:
+    """A portal origin: a browser origin whose host can be a WebAuthn RP ID, served over https,
+    or over http on ``localhost`` itself."""
+    _check_origin(value)
+    parts = urlsplit(value)
+    host = parts.hostname or ""
+    # IPv6 is the only host with a colon, and browsers read a host whose last label is a number
+    # as IPv4 (WHATWG URL: "1.2.3" and "0x7f.1" too).
+    if ":" in host or _NUMERIC_LABEL.match(host.rpartition(".")[2]):
+        raise ValueError("passkeys don't work on IP addresses; use http://localhost:<port>")
+    if host.endswith(".localhost"):
+        raise ValueError("a name under localhost can't be a portal origin; use localhost itself")
+    if parts.scheme == "http" and host != "localhost":
+        raise ValueError(
+            "plain http works only on localhost; use https with a certificate the browser trusts"
+        )
+    return value
+
+
 def _check_mailbox(value: str, *, allow_display_name: bool) -> str:
     _no_line_breaks(value)
     name, address = parseaddr(value)
@@ -294,6 +315,9 @@ class OAuth2Credential(_Model):
     refresh_skew: Annotated[int, Field(ge=0, le=3600)] = 120
     default_expires_in: Annotated[int, Field(ge=60, le=86400)] = 3600
     grant_lifetime_days: Annotated[int, Field(ge=1, le=3650)] | None = None
+    # The provider drops a grant unused this long (some providers: about 180 days). No effect
+    # on refresh.
+    idle_expiry_days: Annotated[int, Field(ge=1, le=3650)] | None = None
     # Interactive consent: zoeymcp login.
     authorize_url: str | None = None
     authorize_params: dict[QueryParam, ParamValue] = {}
@@ -697,20 +721,40 @@ class Gateway(_Model):
 # --- document ----------------------------------------------------------------------------------
 
 
+PortalOrigin = Annotated[str, Field(min_length=8, max_length=300)]
+
+
 class Admin(_Model):
+    """The portal. A policy without this block has no portal."""
+
+    # The portal's own TCP listener.
     listen: HostPort
-    hosts: Annotated[list[str], Field(min_length=1)]
+    # The exact origins the browser uses. Each is the WebAuthn RP ID of the passkeys enrolled
+    # through it, and the only Host and Origin values the portal accepts.
+    #   http://localhost:<port>   (http only with the host exactly "localhost")
+    #   https://<domain>[:port]   (a certificate the browser's machine trusts)
+    origins: Annotated[list[PortalOrigin], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hosts_moved(cls, data: object) -> object:
+        if isinstance(data, dict) and "hosts" in data:
+            raise ValueError(
+                "admin.hosts became admin.origins in M5: list full origins, like "
+                "http://localhost:8081"
+            )
+        return data
 
     @field_validator("listen")
     @classmethod
     def _valid_listen(cls, value: str) -> str:
         return _check_host_port(value)
 
-    @field_validator("hosts")
+    @field_validator("origins")
     @classmethod
-    def _valid_hosts(cls, value: list[str]) -> list[str]:
-        for host in value:
-            _check_hostname(host)
+    def _valid_origins(cls, value: list[str]) -> list[str]:
+        for origin in value:
+            _check_portal_origin(origin)
         return value
 
 
@@ -719,7 +763,7 @@ class Policy(_Model):
     mode: Literal["managed", "declarative"]
     egress_proxy: str | None = None
     gateway_key_generation: Annotated[int, Field(ge=1)] = 1
-    admin: Admin
+    admin: Admin | None = None  # no block: no portal
     credentials: dict[Name, Credential] = {}
     connectors: dict[Name, SMTPConnector] = {}
     routes: list[Route] = []

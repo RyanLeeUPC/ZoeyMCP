@@ -69,7 +69,10 @@ def test_inline_policies_pass_check(path: Path) -> None:
     ]
     assert policies
     for text in policies:
-        findings = check_policy(parse_policy(text, path.name))
+        policy = parse_policy(text, path.name)
+        # No portal until its listener, alias and published port come in together.
+        assert policy.admin is None
+        findings = check_policy(policy)
         assert [f for f in findings if f.level == "error"] == []
 
 

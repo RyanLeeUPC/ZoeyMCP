@@ -1560,9 +1560,9 @@ mode: declarative
 egress_proxy: http://egress-proxy:3128      # optional
 gateway_key_generation: 1
 
-admin:
-  listen: 0.0.0.0:8081
-  hosts: [localhost, 127.0.0.1, zoeymcp.tailnet.example]
+admin:                                      # optional: no block, no portal
+  listen: 127.0.0.1:8081                    # in a container: 0.0.0.0:8081
+  origins: [http://localhost:8081, https://zoeymcp.tailnet.example]
 
 credentials:
   example-api:  {kind: header, secret: "store:example-api"}
@@ -1576,6 +1576,7 @@ credentials:
     rotates: true
     extra_params: {resource: https://mcp.broker.example/}
     expected_scopes: [read, trade]
+    idle_expiry_days: 180                   # optional: the provider drops a grant unused this long
 
 connectors:
   mail-out:
@@ -1664,6 +1665,18 @@ server assigned to nobody, warns; a server's route must set `stream: true`, use 
 allow `POST <path>` (and warns without `GET` and `DELETE`); `enable` must be empty; two included
 tools may not differ only in case; `max_result_bytes` can't exceed
 `max_upstream_message_bytes`.
+
+M5's `admin` block is optional: without it there is no portal. `admin.origins` lists the exact
+origins the browser uses, 1 to 8 of them, each in browser form (lower case, no path, no default
+port). Each is the WebAuthn RP ID of the passkeys enrolled through it, so an IP address is
+refused (passkeys don't work on one), plain `http` is allowed only on `localhost` itself, and a
+name under `localhost` is refused. A policy that still has M4's `admin.hosts` is refused with a
+message pointing at `admin.origins`. `check` refuses a duplicate origin, and warns when
+`admin.listen` is a loopback or wildcard address and no `localhost` origin uses its port, which
+is right only if the host publishes the portal on another port. An `oauth2` credential's
+optional `idle_expiry_days` records how long the provider keeps a grant nobody uses (Google:
+six months); it has no effect on refresh, and `check` refuses it on a `client_credentials`
+grant.
 
 ## 10. Repository layout
 

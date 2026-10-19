@@ -81,7 +81,6 @@ def mail_policy(
     document: dict[str, Any] = {
         "version": 1,
         "mode": "declarative",
-        "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
         "connectors": {
             "mail-out": {
                 "kind": "smtp",
@@ -641,7 +640,6 @@ PROFILES = Path(__file__).resolve().parents[2] / "profiles"
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 
 

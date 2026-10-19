@@ -9,9 +9,11 @@ version: 1
 mode: declarative
 gateway_key_generation: 1
 
+# The portal. Leave this block out for no portal.
 admin:
-  listen: 0.0.0.0:8081
-  hosts: [localhost, 127.0.0.1, zoeymcp.tailnet.example]
+  listen: 127.0.0.1:8081 # in a container: 0.0.0.0:8081
+  # The exact origins the browser uses: http only on localhost, otherwise https.
+  origins: [http://localhost:8081, https://zoeymcp.tailnet.example]
 
 credentials:
   music-stats:

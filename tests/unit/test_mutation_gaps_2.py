@@ -123,7 +123,6 @@ def test_check_text_options() -> None:
 BASE = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 
 

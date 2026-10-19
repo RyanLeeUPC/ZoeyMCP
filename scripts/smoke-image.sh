@@ -482,9 +482,6 @@ services:
         version: 1
         mode: declarative
         gateway_key_generation: \${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
-        admin:
-          listen: 0.0.0.0:8081
-          hosts: [localhost, 127.0.0.1]
         credentials:
           notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
         routes:

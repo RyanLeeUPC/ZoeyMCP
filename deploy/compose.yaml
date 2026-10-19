@@ -49,9 +49,6 @@ services:
       ZOEYMCP_CONFIG: |
         version: 1
         mode: declarative
-        admin:
-          listen: 127.0.0.1:8081
-          hosts: [localhost]
         credentials:
           notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
         routes:

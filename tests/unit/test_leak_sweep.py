@@ -74,7 +74,6 @@ PRINTED_URL = re.compile(r"^  (https://\S+)$", re.MULTILINE)
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 
 
@@ -469,7 +468,8 @@ LITERAL_TOKEN = "leak-client-token-literal-0001"
 # Every value the vault holds that the gateway must not see, by where it sits in the policy.
 VAULT_SIDE = {
     "egress proxy": "leak-proxy.example",
-    "admin host": "leak-admin.example",
+    "admin origin": "https://leak-admin.example",
+    "idle expiry": '"idle_expiry_days":3333',
     "client token": LITERAL_TOKEN,
     "credential name": "leak-cred-",
     "secret reference": "leak-ref-",
@@ -525,6 +525,7 @@ def secret_heavy_policy() -> Policy:
         "extra_params": {"audience": "leak-extra-value"},
         "token_headers": {"X-Extra": "leak-token-header-value"},
         "authorize_params": {"prompt": "leak-authorize-value"},
+        "idle_expiry_days": 3333,
     }
     credentials = {
         "leak-cred-header": {
@@ -628,7 +629,7 @@ def secret_heavy_policy() -> Policy:
             "version": 1,
             "mode": "managed",
             "egress_proxy": "http://leak-proxy.example:3128",
-            "admin": {"listen": "127.0.0.1:8081", "hosts": ["leak-admin.example"]},
+            "admin": {"listen": "127.0.0.1:8081", "origins": ["https://leak-admin.example"]},
             "credentials": credentials,
             "connectors": {"leak-connector": connector},
             "routes": routes,

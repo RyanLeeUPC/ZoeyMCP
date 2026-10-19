@@ -444,7 +444,6 @@ def view_bytes(clients: int = 1, max_stale: int = 300) -> bytes:
     raw = {
         "version": 1,
         "mode": "declarative",
-        "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
         "gateway": {
             "limits": {"policy_max_stale": max_stale},
             "clients": {f"agent{n}": {"token_sha256": HASH} for n in range(clients)},

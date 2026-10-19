@@ -73,7 +73,6 @@ GOOGLE_SECRET = "fake-google-client-secret"
 BASE: dict[str, Any] = {
     "version": 1,
     "mode": "declarative",
-    "admin": {"listen": "0.0.0.0:8081", "hosts": ["localhost"]},
 }
 
 

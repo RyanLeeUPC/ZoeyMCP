@@ -159,7 +159,6 @@ def toolkit_policy(
         "version": 1,
         "mode": "declarative",
         "gateway_key_generation": 1,
-        "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
         "credentials": {
             "records-key": {"kind": "header", "secret": "store:records-key"},
         },

@@ -35,7 +35,7 @@ def raw_policy() -> Raw:
     return {
         "version": 1,
         "mode": "declarative",
-        "admin": {"listen": "127.0.0.1:8081", "hosts": ["localhost"]},
+        "admin": {"listen": "127.0.0.1:8081", "origins": ["http://localhost:8081"]},
         "credentials": {
             "notes-key": {"kind": "header", "header": "X-API-Key", "secret": "store:notes-key"}
         },
@@ -330,7 +330,7 @@ def test_secret_side_changes_leave_the_digest_alone() -> None:
     raw = raw_policy()
     raw["credentials"]["notes-key"]["secret"] = "store:other-key"
     raw["routes"][0]["upstream"] = "https://mcp2.notes.example"
-    raw["admin"]["hosts"] = ["admin.example"]
+    raw["admin"]["origins"] = ["https://admin.example"]
     assert built(raw).digest == built().digest
 
 
