@@ -83,6 +83,7 @@ class FakeSource:
         pin: str,
         progress: Progress | None = None,
         grant: Grant | None = None,
+        ref: str | None = None,
     ) -> CallToolResult:
         if self.refuse_forward:
             raise NotAdmitted("pin changed after validation")
