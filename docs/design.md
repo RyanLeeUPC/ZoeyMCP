@@ -185,8 +185,9 @@ gap: the vault itself holds the request until the operator approves it (§6.4).
 **The image matters as much as the process.** Python runs every `.pth` file in `site-packages` at
 interpreter start, before any ZoeyMCP code. If the vault ran an image with toolkit dependencies
 installed, those dependencies would run next to the master key. So the vault **always** runs the
-official image, unmodified, and `check` warns when the vault's image digest isn't an official
-release. Toolkits go into a derived image used **only** by the gateway.
+official image, unmodified. From M8, once official image digests are published, `check` will warn
+when the vault's image digest isn't an official release. Toolkits go into a derived image used
+**only** by the gateway.
 
 ### 3.2 Identity
 
@@ -1114,27 +1115,55 @@ authenticated content (e.g. mail) should verify the sender in code and say
 
 ### 6.1 `elicitation` (default)
 
-The gateway asks with the rendered text and an empty requested schema, in the agent's era:
+Only clients the operator marks `approvals.attended` are ever asked; any other client's `approve`
+call is refused at once, before anything is written to the ledger. The gateway asks in **form mode
+only**, with the rendered text and an empty requested schema (or the code field below), in the
+agent's era. URL mode is never used for approvals: it would hand the decision to a page the
+gateway doesn't serve.
 
 - **Legacy:** an `elicitation/create` request on the call's own stream (the gateway answers in
-  SSE for this reason).
-- **Modern:** an `InputRequiredResult` whose `requestState` is sealed under a gateway key and
-  bound to the client, server, tool, the canonical arguments' digest, an expiry and a single-use
-  nonce, so the retry can only complete this one call.
+  SSE for this reason). The answer is admitted only on the session that carried the prompt, which
+  is bound to the client and server. If the stream drops, the wait ends and nothing is sent.
+- **Modern:** an `InputRequiredResult` whose `requestState` is an opaque, single-use handle of
+  32 random bytes. It is not sealed or signed under any key: the gateway keeps only the handle's
+  SHA-256, as the key to a record in its own memory that names the client, server and tool, the
+  canonical arguments' digest, the pin and an expiry.
+  - A retry counts only through a live handle presented by the same client for the same server
+    and tool. Another client's presentation is refused and leaves the record alone.
+  - The handle is consumed before anything else, so it completes this one call. A retry whose
+    arguments or pin differ, or that arrives after the expiry, closes the approval and sends
+    nothing.
+  - A retry without an answer is asked again, with a new handle and the same ref, text and
+    expiry, at most three times in all. Answers sent without a live handle are ignored.
+  - The records live in one gateway process: a retry that reaches another process or a
+    restarted one is refused.
+- **`confirm_code`** (per client, off by default): the prompt shows a 4-character code, and the
+  form asks for it. An accept without the right code is declined. It stops a blind auto-accept
+  hook, not software that reads the message, and not a holder of the client's token (§6.2).
 
-Only `accept` counts. `decline`, `cancel`, a timeout, an error, or a client that didn't advertise
-elicitation support all mean declined.
+Only `accept` (with the right code, if one was asked for) counts. `decline`, `cancel`, a timeout,
+an error or a lost stream all send nothing, and the agent is told which. A client that can't show
+a form-mode prompt on this request (it declared no form elicitation, or a legacy session has no
+stream back to it) is refused before anyone is asked.
 
 Elicitation is **synchronous**: it is a request/response tied to the client's active tool call,
-and if the client times out the call, the prompt is orphaned anyway. Its timeout is therefore
-kept within what clients allow for a tool call (typically 60–300 s). Approvals that must wait
-longer use an out-of-band approver (§6.3), which supports `pending` + `check_approval`.
+and if the client times out the call, the prompt is orphaned anyway. Its timeout
+(`approvals.timeout`, 300 s by default; `check` refuses more than 600 s) is therefore kept within
+what clients allow for a tool call (typically 60–300 s). Approvals that must wait longer use an
+out-of-band approver (§6.3, from M8), which supports `pending` + `check_approval`.
 
 ### 6.2 What it trusts
 
 The client: that it shows the text whole, doesn't auto-accept, and doesn't let an "always allow"
-answer persist. Different clients behave differently; the docs keep a per-client notes page for
-clients that have been checked.
+answer persist. Different clients behave differently; [clients.md](clients.md) lists what to
+check in a client before marking it `attended`, and which clients have been checked.
+
+**The client token is the approval credential.** The prompt goes back to whoever made the call,
+so anyone holding an attended client's token can make calls and answer their own prompts, with or
+without `confirm_code`. Keep the token out of the agent's sandbox, and pin the client's source
+network where the gateway sees the client directly; behind the `lan` proxy it sees only the
+proxy. A compromised gateway or toolkit can also skip the gateway's approvals; the out-of-band
+approvers and vault-enforced approvals (§6.3, §6.4, M8) close both gaps.
 
 ### 6.3 Out-of-band approvers (hosted in the vault)
 
@@ -1467,6 +1496,29 @@ holds a raw control or format character.
   | G19 | **Bounded resources:** bodies, arguments, results, upstream messages, listings, schemas, regex time, deadlines, sessions and concurrency all have limits |
   | G20 | **Logs and terminals:** no client token or hash, gateway key, session id, argument value, result content, upstream error text, `instructions` or `Mcp-Param-*` value is logged; `review` output reveals hidden characters |
   | G21 | **The standard tier's box:** the launcher's refusals; no setuid files; the gateway uid can't read `/state`, the vault's environ or its admin socket; PID 1 ends unprivileged with an empty environment; the vault's environment has no gateway dependency |
+- **The approval invariants (M4)**, each with effect tests on real processes (`tests/gateway/`,
+  `tests/acceptance/`) or against the SMTP and toolkit fakes (`tests/unit/`). The stress tests for
+  H3 and H7, and a test of H16's toolkit-vault size caps, are still to come (§12.3: D-78, D-79).
+  "Refused" means nothing reaches the upstream, a toolkit body's writes or the connector.
+
+  | ID | Invariant |
+  | --- | --- |
+  | H1 | **No unapproved consequential call.** An `approve` call is forwarded (remote: to its upstream; toolkit: its body runs) only after an explicit `accept` for this call, on its own channel, before its deadline, from an attended client |
+  | H2 | **What you see is what runs.** A remote call forwards the canonical object the text was rendered from, checked on the wire by the egress filter (G9). A toolkit's `approved` writes are the frozen plan writes the text was rendered from, checked by `ToolkitVault` |
+  | H3 | **One approval, one call.** An approval is consumed before anything is forwarded. It never covers a second call, retry, session or process |
+  | H4 | **Gateway-made text only.** The prompt holds the frame (ref, client, server and tool names, deadline), the call's canonical arguments or the plan's writes under declared layouts, toolkit-literal titles and labels, and SMTP connector configuration. Never upstream text, tool descriptions or earlier results |
+  | H5 | **Nothing hidden.** The whole text passes R42's rules, the markup guard for the client's `renders` and the budget, or the call is refused before anyone is asked. Never truncated or cleaned |
+  | H6 | **Fail closed.** Anything but `accept` declines: decline, dismiss, timeout, withdrawal, a lost stream, a transport error, no form capability, no back channel, an unattended client, a wrong confirmation code, a ledger failure, a pin, policy or freshness change while waiting, a restart |
+  | H7 | **Locks.** One consequential call per (client, server, tool) from ask to outcome. At most `max_pending_per_client` undecided prompts per client, at most `max_prompts_per_hour`, and a cooldown after a decline-like decision. Every lock has an owner ref and a hard deadline |
+  | H8 | **Answers are bound to the question.** Legacy: on the session that carried the prompt, bound to client and server. Modern: a live handle whose record names this client, server, tool, argument digest and pin. `inputResponses` without a live handle are ignored |
+  | H9 | **Committed calls finish.** From the accept on, the re-check, the `decided accept` write and the forward are not cancelled by the agent, an unassignment or a stale view, and a shutdown waits for them; the forward runs to its own deadline and its outcome is recorded |
+  | H10 | **Ledger.** Write-ahead (the accept is fsynced before forwarding), append-only, hash-chained, keyed digests only. No ledger, no consequential call. Every `asked` gets exactly one `outcome` record (its closing record), by recovery if needed |
+  | H11 | **Toolkit containment.** A toolkit reaches only its slots' rules. An `approved` rule takes only a plan write of an accepted call, once. The plan step reads only SMTP connector configuration. A classification mismatch hides the tool |
+  | H12 | **Toolkit integrity.** Toolkits load only from registered entry points whose files the gateway uid can't write, inside the gateway environment. Their definitions are pinned, unless the server sets `pinning: off`. Their packages are absent from the vault environment |
+  | H13 | **Still no back channel.** Upstream sampling, elicitation and `input_required` stay refused, during approved calls too. Agent answers, `inputResponses` and `requestState` never go upstream |
+  | H14 | **Logs.** No prompt text, argument value, subject, body, recipient, handle, confirmation code, or ledger or audit key in any log line, admin answer or CLI output. No unkeyed digest of arguments or text (`canonical.digest(args)`, `Pending.args_digest`) leaves process memory. The keyed ledger HMACs (`args`, `text`) appear only in the ledger file, its admin endpoints and `zoeymcp ledger` output, never in a log line; log lines carry only `ledger_hash`, the hash of a whole record |
+  | H15 | **SMTP connector.** Fixed From and recipients (a request can only assert them). No caller headers or attachments. Verified TLS before AUTH. CONNECT when an egress proxy is set. All recipients or none. Each attempt journaled before connecting, at most one per key, never retried. A rolling limit and a pause |
+  | H16 | **Bounded.** Pending records, tombstones, the ledger, toolkit vault answers, plans, connector bodies and the journal all have limits |
 - **Portal security tests:**
   - a wrong `Host` (DNS rebinding) is refused;
   - a cross-origin `POST` is refused;
@@ -1714,4 +1766,198 @@ only declarative mode exists.
 
 ### 12.2 Open
 
-None at the moment. New questions go here as the build raises them.
+These questions belong to the project owner. Each stays with its item in the register (§12.3), and
+until it is answered the plan follows the default. New questions go there as the build raises
+them.
+
+| Key | Question | Default if unanswered |
+| --- | --- | --- |
+| D-17 | Should the vault revoke a token at the provider (RFC 7009), best effort, when its credential is deleted or replaced? | Yes, in M7, where discovery finds the endpoint |
+| D-44 | Should bare URLs in approval prompts be refused or defanged, for clients that render Markdown and for M8's approvers? | Decided in M8 |
+| D-54 | Is an example mailbox-reader toolkit part of "useful end to end", and in which milestone? | Unscheduled |
+| D-59 | R31's per-server `enable`: next to M6's review and re-pin, after M8, or R31 reworded so that "off, with `enable` reserved" meets it for v1? | M6 |
+| D-64 | R52's reproducible-build check: in M8, or an earlier build-twice CI job? | M8 |
+| D-71 | M4's remaining image-smoke rows (a stop during an accepted forward, approved sends in both tiers): closed early as M4 debt, or in M8? | M8 |
+| D-75 | Do M4's approval rows that need a multi-request fake client block the PR into main, or wait for M8? | M8 |
+| D-96 | Python dependency updates: Dependabot with a cooldown, or the manual process with a staleness reminder? | The manual process, with a reminder |
+| D-98 | Claim Python 3.14 support, or cap below 3.14 until it is tested? | Cap until tested |
+| D-108 | Which real MCP clients, and which versions, must be checked in [clients.md](clients.md) before the PR into main? | To be named |
+| D-110 | What is the bar for removing the README banner and opening the PR into main? Is a security review required before the first release? | After M8, with a review |
+| D-124 | Should a `SECURITY.md` point at GitHub's private vulnerability reporting? | Yes |
+
+### 12.3 Register of deferred work
+
+Everything deferred, left out or accepted as a limit, with the milestone that plans it or the
+event that brings it back. Keys are never reused or renumbered; an item that is done moves to
+"Closed" and keeps its key. The register is refreshed at the end of each milestone. The few keys
+not listed concern the maintainers' local setup, not ZoeyMCP.
+
+**M5 (Portal v1).**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-01 | Portal v1 as a whole: setup code, passkeys, step-up, browser hardening, write-only secrets, OAuth connect, credential health and the ledger view, with the portal's static files in the official image | M5 |
+| D-02 | The portal's TCP listener (`admin.listen`), and how each compose tier exposes it without putting it in reach of the gateway or of agent sandboxes | M5 |
+| D-03 | The setup code's lifecycle: redeemed in the portal, invalidated by the first passkey, and recovery after lost passkeys (R65) | M5 |
+| D-04 | Passkey login with our own WebAuthn verifier, and the passkeys area (R62) | M5 |
+| D-05 | Step-up (a fresh passkey assertion bound to the action) for security-relevant saves, built so M6 and M8 can reuse it | M5 |
+| D-06 | Browser hardening and CSRF defence (R63) | M5 |
+| D-07 | Write-only secret entry in the portal; no endpoint returns a secret (R61) | M5 |
+| D-08 | Credential health in the portal | M5 |
+| D-09 | A read-only policy view in the portal; the generated YAML diffs come with onboarding by URL | M5 (the view); M7 (the diffs) |
+| D-10 | Portal edits keep M2's OAuth binding protections | M5 |
+| D-11 | How an operator reaches the portal in a secure context, and the docs for it | M5 |
+| D-12 | The portal security tests listed in §8.2 | M5 |
+| D-14 | OAuth connect in the portal: pasting the redirected address, and the portal's callback route (D-129) | M5 |
+| D-16 | An upstream "insufficient scope" health finding is kept in memory only, so a restart loses it | M5 |
+| D-20 | Nothing refreshes an idle credential in the background: an "idle for N days" health warning | M5 |
+| D-22 | A credential stuck after a spurious `invalid_grant`: a "try again" action in the portal | M5 |
+| D-23 | A credential's last failure isn't shown after a restart | M5 |
+| D-24 | The portal's ledger view, and the authenticated path that carries the gateway's ledger records to the vault | M5 |
+| D-25 | The vault's SMTP send journal shown next to the ledger | M5 |
+| D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | M5 (the anchor); M8 (vault-side records, D-35) |
+| D-28 | The gateway's entry path still loads vault code | M5 |
+| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | M5, then standing through M7 and M8 |
+| D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | M5 (docs); detection is D-130 |
+| D-66 | The live OAuth smoke test has never been run against a real provider: run it once and record the result | M5 |
+| D-68 | No OAuth acceptance test runs the vault as a separate process | M5 |
+| D-74 | Image-smoke rows planned in M4 and not built: `review` of a toolkit through the uid switch, `ledger --verify`, and approved sends in both tiers | M5 (review, ledger); M8 (the sends, D-71) |
+| D-80 | The image smoke never reaches an upstream MCP server (S10 against a fake upstream) | M5 |
+| D-81 | The `lan` smoke checks one SSE event through Caddy, not that events arrive one by one | M5 |
+| D-87 | The mutation gate (89%) sits well below the score, and there are no per-module floors | M5 |
+| D-88 | Regenerate the mutation shard weights when new modules are mutated | M5 |
+| D-89 | Every new portal decision module is mutation-tested (the rest is D-131) | M5 |
+| D-93 | Linux-only tests are skipped on Windows: the portal tests must run there | M5 |
+| D-100 | design.md isn't fully updated for M4 as built (the CLI, layout, policy sketch and test lists) | M5 |
+| D-103 | The recovery table in [operations.md](operations.md) lacks the SMTP connector row | M5 |
+| D-104 | The README and the example policy describe unbuilt features as existing | M5 for the portal; M6 and M7 for theirs |
+| D-105 | R38's docs note on clients loading tools lazily | M5 |
+| D-106 | The `lan` profile's own-certificate and ACME alternatives are only mentioned | M5 |
+| D-109 | This public register | M5, then refreshed at the end of each milestone |
+| D-112 | Windows hosts' limits aren't recorded as a decision: Linux containers only, Windows and macOS for development | M5 |
+| D-115 | Two admin socket answers return a secret (the gateway key, a setup code): recorded as scoped exceptions to R61, absent from every portal route | M5 |
+| D-116 | No acceptance test or profile for an OAuth credential on a gateway-served remote MCP route | M5 |
+| D-117 | No leak-sweep test for setup codes (R56) or the portal's session material | M5 |
+| D-118 | [threat-model.md](threat-model.md) has no portal actors or limits | M5 |
+| D-119 | Bounds on the portal's unauthenticated endpoints against non-browser callers | M5 |
+| D-120 | The portal shows untrusted text as plain text, with hidden characters revealed | M5 |
+| D-121 | No machine-readable credential health output | M5 |
+| D-123 | How the portal's static UI is tested | M5 |
+| D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | M5 |
+
+**M6 (Portal v2).**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-13 | Tool-drift review and re-pin in the portal | M6 |
+| D-29 | Gateway status, drift and review data in the portal (the transport is D-24) | M6 |
+| D-46 | A modern upstream's tool-list change announced before the gateway's listen stream opens waits for the next timer check | M6 |
+| D-47 | The SDK session manager's limits are fixed at the first view, and its session cap at 1024 | M6 |
+| D-58 | Managed mode: versioned policy, history, rollback, export and import | M6 |
+| D-59 | R31: per-server enable of resources, prompts, completions, sampling, elicitation and roots | M6, or a named milestone after M8 (§12.2) |
+| D-61 | An `egress_proxy` change needs a restart | M6 (M7's egress profile touches it too) |
+| D-107 | Not every difference between Python's regex and ECMA-262 is listed in the docs | M6, or an earlier docs pass |
+| D-130 | Detect a restore of the state volume from an older backup | M6 (restated with versioned policy); the detection may stay in the backlog |
+
+**M7.**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-17 | No token revocation at the provider (RFC 7009) on delete or replace | M7, with onboarding by URL (§12.2) |
+| D-30 | The bridge for stdio MCP servers (R35, S11) | M7 |
+| D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | M7 |
+| D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML diffs | M7 |
+| D-33 | Provider profiles for S9 and S11 | M7 |
+| D-49 | Designed log events that are never emitted (`server_unsupported`, `vault_link_refused`, `approval_unavailable`) | M7 |
+| D-122 | No how-to for configuring the operator's own egress proxy (R5) | M7, with D-31 |
+| D-136 | No mix-up defence for pasted OAuth answers | M7, with onboarding by URL |
+
+**M8.**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-35 | Vault-enforced approvals (R48, `vault_approval`) | M8 |
+| D-36 | Out-of-band approvers (Telegram, the portal queue, `pending` and `check_approval`) | M8 |
+| D-37 | Closing the approval-bypass gaps: a holder of an attended client's token, and a compromised gateway or toolkit | M8 |
+| D-44 | Bare URLs in form-mode prompts | M8 (§12.2) |
+| D-64 | Image publishing: digests, SBOM, the official-image check and the reproducible-build check | M8 (§12.2) |
+| D-65 | The hardened and `lan` concessions (the gateway key in the environment, Caddy's bind capability, the Caddyfile through the environment) | M8, as a review |
+| D-71 | The image smoke's stop during an accepted forward, in both tiers, and the approved-send rows from D-74 | M8 (§12.2) |
+| D-72 | The approval acceptance tests over both vault links | M8 |
+| D-73 | The SMTP shapes (S13, S14) through the gateway in both tiers | M8 |
+| D-75 | A fake client that answers several back-channel requests, and the approval rows that need it | M8 (§12.2) |
+| D-78 | Stress effect tests for H3 and H7 | M8, against both enforcement points |
+| D-96 | Dependabot doesn't cover Python dependencies | M8, or earlier (§12.2) |
+| D-98 | Python 3.14 isn't in the test matrix | M8, or when 3.14 support is claimed (§12.2) |
+| D-127 | The SMTP send journal records no caller | M8, with D-35 |
+
+**Triggered by an event.**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-19 | DPoP and other non-Bearer tokens are unsupported (refused) | The first provider that needs them |
+| D-21 | Accepted re-consent windows, and no real-process OAuth crash test | The next change to the store's write path or the token persist step |
+| D-27 | Readable ledger summaries (decided against for now) | After the ledger view is in use, if it isn't useful without them |
+| D-42 | Modern approval records have no early idle expiry, and the docs don't state the cost yet | A modern client that drops approvals without retrying, or reports of blocked `approve` tools |
+| D-43 | Unverified: whether progress keeps a client's idle timer alive during an approval wait | The first non-SDK client checked for [clients.md](clients.md), and before M8's `pending` design is final |
+| D-45 | The protocol floor refuses 2025-03-26 and HTTP+SSE | An operator needs a 2025-03-26 agent or upstream |
+| D-53 | Plain HTTP endpoints (feeds) for toolkits, with capability URLs | The first mailbox-reader toolkit |
+| D-54 | No mailbox-reader toolkit ships | An OAuth read route for a mail API, or the owner's decision (§12.2) |
+| D-57 | Images in toolkit results; `outputSchema` for toolkit tools | The first toolkit that needs them |
+| D-60 | The policy's `extensions` field is left out | The first MCP extension worth supporting |
+| D-70 | A live SMTP smoke test (S13) | The release checklist before the PR into main, or M8 |
+| D-76 | Effect tests for a tool that changes while its call waits | The test-debt pass before the PR into main; else M6 |
+| D-77 | End-to-end refusal rows covered only by unit tests | The test-debt pass before the PR into main |
+| D-79 | H16's toolkit-vault size caps are untested | The test-debt pass, or the next change to the toolkit link |
+| D-85 | A recorded by-hand smoke test of a real mail-toolkit deployment | The release checklist |
+| D-86 | Re-check the surviving mutants left as equivalent | An accepted-survivor list |
+| D-95 | The SDK bump procedure, and two pinned SDK-behaviour expected failures | The next `mcp` SDK bump |
+| D-108 | Checks of real MCP clients for approvals | The release checklist (§12.2); revisit at M8 |
+| D-110 | Release readiness: a security review, the first release, versioning, the README banner, the PR into main | "Useful end to end" (§12.2) |
+| D-124 | No `SECURITY.md` or changelog | The release checklist (§12.2) |
+| D-126 | The image smoke can't probe the portal from a real LAN host | The release checklist: one by-hand probe of both tiers from another machine |
+| D-132 | M5's safe cuts, if any is taken | A cut recorded during M5 |
+
+**Backlog.**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-18 | Confirm-before-store of unexpected scopes (an alternative not taken) | Only if D-17 is built and an operator asks |
+| D-38 | More approver back ends (ntfy, Matrix, Web Push) | After M8's approver interface |
+| D-39 | Relaying upstream elicitation and other server-to-client requests | With R31's enable list (D-59) |
+| D-40 | Several gateway processes sharing approval state | Only if multi-replica deployment becomes a goal |
+| D-41 | A duplicate-call notice in approval prompts | With M8's approvers |
+| D-48 | A failed call's withdrawn egress registration can fail an identical concurrent call closed (accepted) | Backlog |
+| D-50 | Silent drift is caught only at the next timer check, with no re-list per call (accepted) | Backlog |
+| D-51 | Modern stateful upstreams see one principal for every client (accepted) | If per-client credential binding is ever added |
+| D-52 | Deliberate credential disclosure by an upstream; the standard tier's shared egress (accepted) | Backlog |
+| D-55 | Out-of-process toolkits | After M8's `vault_approval` |
+| D-56 | Toolkits' outbound network in the standard tier is only documented (accepted) | Backlog |
+| D-67 | No live rotation test for Spotify (deliberate) | Backlog |
+| D-69 | Optional live smoke tests for the other shapes | Backlog, or a by-hand check before the PR into main |
+| D-83 | The soak test doesn't check file descriptors | The next change to the upstream pool |
+| D-90 | Mutants are killed only by unit tests, and mutation testing runs only in CI (deliberate) | Backlog |
+| D-91 | No code coverage measurement | Backlog |
+| D-92 | CI runs only on Linux, so Windows-only tests never run there | Outside contributors developing on Windows |
+| D-94 | The image smoke runs only in CI | Backlog |
+| D-97 | No lint, type or shell checks on `scripts/` and the workflows | The next CI hygiene pass, before the PR into main |
+| D-111 | Markdown clients the prompt guard doesn't anticipate (accepted) | With the client checks (D-108) |
+| D-125 | In the standard tier, sibling containers and the gateway can reach the portal's unauthenticated routes (accepted; the hardened tier is the answer) | Backlog |
+| D-128 | Enrolment links for a second portal origin | With M8 |
+| D-131 | Mutation testing for the remaining security-relevant modules | Each module when it is next changed for security reasons |
+| D-133 | A liveness probe for static secrets and connectors | Backlog |
+| D-134 | A dev-only headless browser check of the portal's static UI | If the UI's script outgrows its bound, or the manual checks keep finding regressions |
+| D-135 | Other accepted limits of the portal, documented with it | Each when its mitigation changes |
+| D-137 | A leaked sign-in link and a page in the operator's browser can return an attacker's OAuth code first (accepted) | If a provider returns the account identity before the exchange |
+
+**Closed.**
+
+| Key | Item | Target or trigger |
+| --- | --- | --- |
+| D-15 | A fixed-port loopback redirect as the default `redirect_uri` | Declined (§12.1) |
+| D-63 | Network filesystems are unsupported for state | Done |
+| D-82 | The standard smoke's reload check can't assert `policy_applied` | Obsolete: the intent is covered |
+| D-84 | The derived gateway image and the standard tier's launcher checks | Done |
+| D-99 | The M4 invariants H1-H16 were missing from §8.2 | Done in M5 |
+| D-101 | §6.1 and §6.2 contradicted M4 as built | Done in M5 |
+| D-102 | §3.1 claimed an official-image warning that doesn't exist yet | Done in M5 |
