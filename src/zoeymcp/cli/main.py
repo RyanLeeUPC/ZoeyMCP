@@ -40,6 +40,20 @@ PASTE_PROMPT = "> "
 NOT_PERSISTED = (
     "kept in memory, not on disk; fix the state volume; zoeymcp oauth status shows when it is saved"
 )
+# After a line drawn from a store entry's clear meta, which anyone with the file can edit.
+FROM_META = "(from stored metadata)"
+# How the CLI words each health action (M5 design I.1).
+HEALTH_ACTIONS = {
+    "connect": "run: zoeymcp login {credential}",
+    "reset": "run: zoeymcp oauth reset {credential}",
+    "set_secret": "run: zoeymcp secret set {secret}",
+    "restart": "set env {var} and restart the vault",
+    "delete_secret": "run: zoeymcp secret delete {secret}",
+    "fix_policy": "fix the policy",
+    "wait": "wait: it clears with time",
+    "check_volume": "check the state volume",
+    "check_mailbox": "check the mailbox for the sends with an unknown outcome",
+}
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
 GATEWAY_ENVIRONMENT = Path("/opt/zoeymcp-gateway")
@@ -370,9 +384,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     oauth_reset.add_argument("credential")
 
+    health = commands.add_parser(
+        "health",
+        help="what needs you, per credential, connector and store entry (inside the vault)",
+        description=(
+            "Print what needs you, per credential, connector and store entry, with what to do "
+            "about it. From metadata only: nothing is decrypted and no request is sent. Exit 0 "
+            "with no error (with --strict, no warning either), 1 otherwise, 2 when the vault "
+            "can't be asked."
+        ),
+    )
+    health.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    health.add_argument("--strict", action="store_true", help="also exit 1 for a warning")
+
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")
-    for name in ("setup-code", "gateway-key", "login"):
+    for name in ("setup-code", "gateway-key", "login", "health"):
         commands.choices[name].add_argument("--socket", metavar="PATH", help="admin socket path")
     return parser
 
@@ -820,11 +847,90 @@ def format_status(entry: dict[str, Any]) -> list[str]:
     upstream = entry.get("upstream")
     if upstream:
         lines.append(f"  WARNING an upstream said {upstream['code']} at {upstream['at']}")
+    if entry.get("last_failure") or entry.get("idle"):
+        from ..vault.health import failure_text, idle_text
+
+        if entry.get("last_failure"):
+            text = failure_text(entry["last_failure"])
+            lines.append(f"  WARNING {text} {FROM_META}")
+        if entry.get("idle"):
+            lines.append(f"  WARNING {idle_text(entry['idle'])} {FROM_META}")
     if not entry["persisted"]:
         lines.append(
             "  degraded (not persisted): the store can't be written; check the state volume"
         )
     return lines
+
+
+# --- health ------------------------------------------------------------------------------------
+
+
+def _cmd_health(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    try:
+        report = admin_client.health(admin_client.socket_path(args.socket))
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp health: {exc}\n")
+        return EXIT_UNREADABLE
+    summary = report["summary"]
+    failed = summary["error"] or (args.strict and summary["warning"])
+    code = EXIT_FINDINGS if failed else EXIT_OK
+    if args.json:
+        review_view.write_json(report, out)
+    else:
+        review_view.write_lines(health_lines(report, ok=code == EXIT_OK), out)
+    return code
+
+
+def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
+    """The lines ``health`` prints: per credential, connector and the store, its findings, each
+    with what to do, then the counts."""
+    lines: list[str] = []
+    for item in report["credentials"]:
+        lines.append(f"{item['name']} ({item['kind']}): {item['level']}")
+        lines += _finding_lines(item["findings"])
+    for item in report["connectors"]:
+        head = f"connector {item['name']}: {item['level']}"
+        if item["sent_24h"] is not None:
+            head += f" ({item['sent_24h']} of {item['max_per_day']} sends in 24 h)"
+        lines.append(head)
+        lines += _finding_lines(item["findings"])
+    store = report["store"]
+    lines.append(f"store: {store['level']} ({store['entries']} entries)")
+    lines += _finding_lines(store["findings"])
+    counts = report["summary"]
+    lines.append(
+        f"health: {'ok' if ok else 'FAILED'} ({counts['error']} error(s), "
+        f"{counts['warning']} warning(s), {counts['info']} info)"
+    )
+    return lines
+
+
+def _finding_lines(findings: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for finding in findings:
+        line = f"  {finding['level']:<8}{finding['code']}: {finding['text']}"
+        if finding["advisory"]:
+            line += f" {FROM_META}"
+        lines.append(line)
+        action = health_action(finding["action"])
+        if action is not None:
+            lines.append(f"          {action}")
+    return lines
+
+
+def health_action(action: dict[str, str] | None) -> str | None:
+    """An action in the CLI's words: its own command, or what to do."""
+    if action is None:
+        return None
+    ref = action.get("ref", "")
+    fields = {
+        "secret": ref.removeprefix("store:"),
+        "var": ref.removeprefix("env:"),
+        **action,
+    }
+    template = HEALTH_ACTIONS.get(action["kind"])
+    # An action this CLI doesn't know (a newer vault's): its kind.
+    return action["kind"] if template is None else template.format_map(fields)
 
 
 def duration(seconds: float) -> str:
@@ -984,6 +1090,8 @@ def main(
         return _cmd_login(args, stdin, out, err)
     if args.command == "oauth":
         return _cmd_oauth(args, out, err)
+    if args.command == "health":
+        return _cmd_health(args, out, err)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 

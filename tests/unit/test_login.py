@@ -1519,6 +1519,22 @@ async def test_status_survives_a_tampered_meta(tmp_path: Path, clock: FakeClock)
     assert status["scopes"] is None
 
 
+async def test_status_shows_the_last_failure_and_idleness(tmp_path: Path, clock: FakeClock) -> None:
+    """After a restart no failure is in memory: meta remembers the last one (D-23). A grant
+    unused for long may be dropped by the provider (D-20)."""
+    rig = spotify_rig(tmp_path, clock, idle_expiry_days=59)
+    error = {"code": OAUTH_UNAVAILABLE, "error": None, "at": "2026-10-01T09:00:00Z"}
+    meta = {"last_ok": "2026-09-01T09:00:00Z", "last_error": error}
+    rig.store.put("music-refresh", "fake-rt", BINDING, meta={"oauth": meta})
+    [status] = rig.login.status()
+    assert status["state"] == "idle"
+    assert status["last_failure"] == {"code": OAUTH_UNAVAILABLE, "at": "2026-10-01T09:00:00Z"}
+    assert status["idle"] == {"days": 46, "limit": 59}
+    await rig.login_once()
+    [status] = rig.login.status()
+    assert (status["last_failure"], status["idle"]) == (None, None)
+
+
 def credential(**fields: Any) -> OAuth2Credential:
     found = make_policy({"music": spotify(**fields)}).credentials["music"]
     assert isinstance(found, OAuth2Credential)

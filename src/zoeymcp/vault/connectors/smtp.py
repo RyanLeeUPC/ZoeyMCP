@@ -370,6 +370,10 @@ class SmtpConnectors:
                 recovered[name] = len(unfinished)
         return recovered
 
+    def journal(self, name: str) -> Journal:
+        """The connector's journal as rebuilt, for health. Raises ``OSError`` when unreadable."""
+        return self._journal(name)[1]
+
     def config(self, name: str, connector: SMTPConnector) -> Answer:
         _, journal = self._journal(name)
         return Answer(

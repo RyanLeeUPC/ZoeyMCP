@@ -26,6 +26,7 @@ from zoeymcp.cli.main import (
     exec_gateway_environment,
     format_status,
     gateway_command,
+    health_action,
     main,
     new_client_token,
 )
@@ -614,6 +615,8 @@ STATUS: dict[str, Any] = {
     "last_ok_ago": 7200,
     "reconsent_due": "2026-10-20T09:00:00Z",
     "scopes": {"unexpected": ["admin", "root"], "missing": ["read"]},
+    "last_failure": {"code": None, "at": "2026-10-16T09:00:00Z"},
+    "idle": {"days": 171, "limit": 180},
 }
 QUIET: dict[str, Any] = {
     **STATUS,
@@ -628,6 +631,8 @@ QUIET: dict[str, Any] = {
     "last_ok_ago": None,
     "reconsent_due": None,
     "scopes": None,
+    "last_failure": None,
+    "idle": None,
 }
 
 
@@ -719,9 +724,21 @@ def test_format_status() -> None:
         "  UNEXPECTED scopes: admin root",
         "  missing scopes: read",
         "  WARNING an upstream said upstream_insufficient_scope at 2026-10-17T09:01:00Z",
+        "  WARNING last attempt failed: no code at 2026-10-16T09:00:00Z (from stored metadata)",
+        "  WARNING unused for 171 days; the provider drops unused grants after 180 "
+        "(from stored metadata)",
         "  degraded (not persisted): the store can't be written; check the state volume",
     ]
     assert format_status(QUIET) == ["music: ok"]
+    failed = {**QUIET, "last_failure": {"code": "oauth_unavailable", "at": "2026-10-16T09:00:00Z"}}
+    assert format_status(failed) == [
+        "music: ok",
+        "  WARNING last attempt failed: oauth_unavailable at 2026-10-16T09:00:00Z "
+        "(from stored metadata)",
+    ]
+    # An older vault's answer has neither.
+    older = {k: v for k, v in QUIET.items() if k not in ("last_failure", "idle")}
+    assert format_status(older) == ["music: ok"]
     assert format_status({**QUIET, "scopes": {"unexpected": [], "missing": []}}) == ["music: ok"]
     assert format_status({**QUIET, "last_ok_ago": 0}) == ["music: ok", "  last success 0 s ago"]
     assert format_status({**QUIET, "retry_in": 0.0, "access_expires_in": 0.0}) == [
@@ -781,6 +798,174 @@ def test_oauth_reset(admin: FakeAdmin) -> None:
         EXIT_FINDINGS,
         "",
         "zoeymcp oauth status: OAuth needs the vault's token manager\n",
+    )
+
+
+# --- health ------------------------------------------------------------------------------------
+
+
+def health_report(**changes: Any) -> dict[str, Any]:
+    """What the vault's GET /health answers for a small deployment, from :mod:`health` itself."""
+    from zoeymcp.vault.health import Inputs, Sends, assess
+    from zoeymcp.vault.store import origin_binding
+
+    from .test_health import (
+        API,
+        MAIL,
+        MAIL_BINDING,
+        OTHER,
+        SPOTIFY_ENTRIES,
+        entry,
+        header,
+        make_policy,
+        spotify,
+        status,
+    )
+
+    policy = make_policy({"notes": header(), "music": spotify()}, connectors={"mail": MAIL})
+    entries = [
+        entry("notes-key", origin_binding([API, OTHER])),
+        *SPOTIFY_ENTRIES[:2],
+        entry("mail-pass", MAIL_BINDING),
+        entry("old-key", origin_binding([API])),
+    ]
+    failure = {"code": "oauth_unavailable", "at": "2026-10-16T09:00:00Z"}
+    last = {"state": "sent", "at": "2026-10-17T08:00:00Z", "smtp_code": 250}
+    inputs = Inputs(
+        policy,
+        entries,
+        frozenset({"MAIL_USER"}),
+        [status(last_failure=failure)],
+        {"mail": Sends(17, 0, last)},
+    )
+    return {**assess(inputs), **changes}
+
+
+HEALTH_LINES = [
+    "notes (header): info",
+    "  info    binding_wider: store:notes-key is bound to more than the policy uses; it works",
+    "          run: zoeymcp secret set notes-key",
+    "music (oauth2): error",
+    "  error   missing: store:music-refresh has no entry",
+    "          run: zoeymcp login music",
+    "  warning last_failure: last attempt failed: oauth_unavailable at 2026-10-16T09:00:00Z "
+    "(from stored metadata)",
+    "          run: zoeymcp oauth reset music",
+    "connector mail: warning (17 of 20 sends in 24 h)",
+    "  warning near_limit: 17 of 20 sends in the last 24 hours",
+    "          wait: it clears with time",
+    "store: info (5 entries)",
+    "  info    unreferenced: nothing in the policy uses store:old-key",
+    "          run: zoeymcp secret delete old-key",
+    "health: FAILED (1 error(s), 2 warning(s), 2 info)",
+]
+
+
+def test_health_text(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/health")] = (200, health_report())
+    text = "".join(f"{line}\n" for line in HEALTH_LINES)
+    assert cli(["health", "--socket", "x"]) == (EXIT_FINDINGS, text, "")
+    assert admin.requests == [("GET", "/health", None)]
+    assert admin.timeouts == [10.0]
+
+
+def test_health_json(admin: FakeAdmin) -> None:
+    report = health_report()
+    admin.answers[("GET", "/health")] = (200, report)
+    code, out, err = cli(["health", "--json", "--socket", "x"])
+    assert (code, err) == (EXIT_FINDINGS, "")
+    assert out == json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("counts", "plain", "strict"),
+    [
+        ({"error": 0, "warning": 0, "info": 3}, EXIT_OK, EXIT_OK),
+        ({"error": 0, "warning": 1, "info": 0}, EXIT_OK, EXIT_FINDINGS),
+        ({"error": 1, "warning": 0, "info": 0}, EXIT_FINDINGS, EXIT_FINDINGS),
+    ],
+)
+def test_health_exit_codes(
+    admin: FakeAdmin, counts: dict[str, int], plain: int, strict: int
+) -> None:
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    report = {"summary": counts, "credentials": [], "connectors": [], "store": empty}
+    admin.answers[("GET", "/health")] = (200, report)
+    verdict = "ok" if plain == EXIT_OK else "FAILED"
+    tail = f"({counts['error']} error(s), {counts['warning']} warning(s), {counts['info']} info)"
+    assert cli(["health", "--socket", "x"]) == (
+        plain,
+        f"store: ok (0 entries)\nhealth: {verdict} {tail}\n",
+        "",
+    )
+    assert cli(["health", "--strict", "--socket", "x"])[0] == strict
+    assert cli(["health", "--strict", "--json", "--socket", "x"])[0] == strict
+
+
+def test_health_when_the_vault_cant_be_asked(admin: FakeAdmin, tmp_path: Path) -> None:
+    admin.answers[("GET", "/health")] = (503, {"error": "starting"})
+    assert cli(["health", "--socket", "x"]) == (EXIT_UNREADABLE, "", "zoeymcp health: starting\n")
+
+
+def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
+    code, out, err = cli(["health", "--socket", str(tmp_path / "admin.sock")])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err.startswith("zoeymcp health: can't reach the vault's admin socket at ")
+
+
+@pytest.mark.parametrize(
+    ("action", "text"),
+    [
+        (None, None),
+        ({"kind": "connect", "credential": "music"}, "run: zoeymcp login music"),
+        ({"kind": "reset", "credential": "music"}, "run: zoeymcp oauth reset music"),
+        (
+            {"kind": "set_secret", "credential": "music", "ref": "store:music-id"},
+            "run: zoeymcp secret set music-id",
+        ),
+        (
+            {"kind": "restart", "connector": "mail", "ref": "env:MAIL_USER"},
+            "set env MAIL_USER and restart the vault",
+        ),
+        ({"kind": "delete_secret", "secret": "old"}, "run: zoeymcp secret delete old"),
+        ({"kind": "fix_policy", "credential": "music"}, "fix the policy"),
+        ({"kind": "wait", "connector": "mail"}, "wait: it clears with time"),
+        ({"kind": "check_volume"}, "check the state volume"),
+        (
+            {"kind": "check_mailbox", "connector": "mail"},
+            "check the mailbox for the sends with an unknown outcome",
+        ),
+        # A newer vault's action: its kind.
+        ({"kind": "add_passkey"}, "add_passkey"),
+    ],
+)
+def test_health_actions_in_the_clis_words(action: dict[str, str] | None, text: str | None) -> None:
+    assert health_action(action) == text
+
+
+def test_health_shows_hidden_characters(admin: FakeAdmin) -> None:
+    """Store entry names and meta are shown as text, never as terminal controls."""
+    finding = {
+        "code": "unreferenced",
+        "level": "info",
+        "advisory": False,
+        "text": "nothing in the policy uses store:x" + chr(27) + "[2J",
+        "action": None,
+    }
+    store = {"entries": 1, "level": "info", "findings": [finding]}
+    report = {
+        "summary": {"error": 0, "warning": 0, "info": 1},
+        "credentials": [],
+        "connectors": [],
+        "store": store,
+    }
+    admin.answers[("GET", "/health")] = (200, report)
+    code, out, _ = cli(["health", "--socket", "x"])
+    assert code == EXIT_OK
+    assert chr(27) not in out
+    assert (
+        out.splitlines()[1]
+        == "  info    unreferenced: nothing in the policy uses store:x[U+001B][2J"
     )
 
 

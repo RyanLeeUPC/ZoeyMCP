@@ -20,6 +20,9 @@ retires the previous key at once (M3 design C.2).
 errors are ``{"error", "reason"}`` with a stable reason. No answer holds a token, code, verifier
 or secret; the authorization URL holds ``state`` and the PKCE challenge, which are useless
 without the verifier the vault keeps.
+
+``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
+design I).
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ import sys
 import tempfile
 import time
 from base64 import b32encode
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +52,8 @@ from starlette.routing import Route
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy.schema import Policy
-from . import logs, secretops, secretplan
+from . import health, logs, secretops, secretplan
+from .connectors.smtp import SmtpConnectors
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import KeySet
 from .oauth.login import LoginError, LoginService
@@ -187,10 +191,17 @@ class AdminApp:
         login: LoginService | None = None,
         *,
         gateway_keys: GatewayKeys | None = None,
+        connectors: SmtpConnectors | None = None,
+        env_names: Callable[[], Collection[str]] | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
-        the policy and the previous key can't be retired here."""
+        the policy and the previous key can't be retired here.
+
+        ``connectors`` and ``env_names`` (the ``env:`` variables the vault found set) are for
+        ``GET /health``. Without them it shows no sends, and every ``env:`` reference unset."""
         self._store = store
+        self._connectors = connectors
+        self._env_names = env_names
         self._keys = keys
         self._gateway_keys = gateway_keys
         self._policy = policy
@@ -212,6 +223,7 @@ class AdminApp:
                 Route("/oauth/{credential}/login", self._oauth_login, methods=["POST"]),
                 Route("/oauth/{credential}/complete", self._oauth_complete, methods=["POST"]),
                 Route("/oauth/{credential}/reset", self._oauth_reset, methods=["POST"]),
+                Route("/health", self._health, methods=["GET"]),
             ]
         )
 
@@ -322,6 +334,33 @@ class AdminApp:
         if not self._tokens.reset(name):
             return _login_error(LoginError("not_oauth", f"no oauth2 credential named {name!r}"))
         return JSONResponse({"credential": name, "reset": True})
+
+    # --- health (M5 design I) ------------------------------------------------------------------
+
+    async def _health(self, request: Request) -> Response:
+        policy = self._policy()
+        inputs = health.Inputs(
+            policy,
+            self._store.metadata(),
+            frozenset(() if self._env_names is None else self._env_names()),
+            oauth=None if self._login is None else self._login.status(),
+            sends=self._sends(policy),
+            persisted=not self._store.dirty,
+        )
+        return JSONResponse(json_safe(health.assess(inputs)))
+
+    def _sends(self, policy: Policy) -> dict[str, health.Sends]:
+        """Each connector's send journal, summed up. One that can't be read is left out."""
+        found: dict[str, health.Sends] = {}
+        if self._connectors is None:
+            return found
+        now = self._connectors.clock_ms()
+        for name in policy.connectors:
+            try:
+                found[name] = health.sends(self._connectors.journal(name), now)
+            except OSError:
+                continue
+        return found
 
 
 def socket_supported() -> bool:

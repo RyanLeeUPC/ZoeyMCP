@@ -142,7 +142,58 @@ these `reason` codes:
 | `exchange_failed:<code>` | the token endpoint refused the code; `<code>` is one of §4's codes | for `invalid_grant`, the code expired or was used: run `login` again |
 | `no_refresh_token` | the provider issued no refresh token | Google: keep `access_type: offline` and `prompt: consent`; other providers may need an `offline_access` scope |
 
-## 3. OAuth health: `oauth status` and `oauth reset`
+## 3. Credential health: `health`, `oauth status` and `oauth reset`
+
+**`zoeymcp health`** lists what needs you, per credential, connector and store entry, with what
+to do about each. It reads metadata only: nothing is decrypted and no request is sent.
+
+```text
+$ zoeymcp health
+notes (header): ok
+calendar (oauth2): warning
+  warning idle: unused for 171 days; the provider drops unused grants after 180 (from stored metadata)
+          run: zoeymcp login calendar
+connector mail: ok (3 of 20 sends in 24 h)
+store: info (4 entries)
+  info    unreferenced: nothing in the policy uses store:old-key
+          run: zoeymcp secret delete old-key
+health: ok (0 error(s), 1 warning(s), 1 info)
+```
+
+It exits 0 with no error (with `--strict`, no warning either), 1 otherwise, and 2 when the vault
+can't be asked. `--json` prints the whole report, with a `summary` of counts per level and each
+finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
+`set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume` or
+`check_mailbox`, and the name it applies to). For a deployment's verify script:
+
+```sh
+docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp health --json --strict > /dev/null
+```
+
+There is no unauthenticated health endpoint: health is the admin socket's `GET /health`.
+
+| Code | Level | When |
+| --- | --- | --- |
+| `missing` | error | a `store:` reference has no entry |
+| `env_unset` | error | an `env:` reference's variable wasn't set when the vault loaded the policy (an env seed only while there is no live token) |
+| `binding_changed` | error | the entry's binding doesn't cover a use the policy makes now (a route added, another connector constraint or token endpoint): the vault refuses that use until you enter it again |
+| `binding_wider` | info | the binding covers every use and more (an explicit `--origin`, or a route removed since): it works |
+| `no_route`, `binding_conflict` | error | the policy can't bind the name, as `secret set` would refuse it: fix the policy |
+| `seed_ignored` | info | an env seed is set while the live token is used (§5) |
+| `unreferenced`, `orphan_slot` | info | an entry nothing in the policy uses; a live slot no credential keeps its token in |
+| `degraded` | error | the store can't be written (§1) |
+| `terminal`, `backoff` | error, warning | as `oauth status` shows them, with the hint's action |
+| `reconsent_due`, `unexpected_scopes`, `missing_scopes` | warning | as `oauth status` shows them |
+| `insufficient_scope` | warning | an upstream said the token lacks a scope, **since the vault started**: a restart forgets it |
+| `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
+| `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
+| `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |
+
+Findings marked `(from stored metadata)` (`advisory` in JSON) come from the store's clear
+metadata, which anyone with the state file can edit: they are shown, and nothing the vault
+decides reads them.
+
+**`zoeymcp oauth status`** shows each OAuth credential in more detail:
 
 ```text
 $ zoeymcp oauth status
@@ -169,6 +220,11 @@ Each credential gets a line with its state, then details. Nothing in it is a sec
   ones.
 - `WARNING an upstream said upstream_insufficient_scope at ...`: an upstream answered that the
   token lacks a scope. A new token won't fix that; log in with more scopes, or narrow the rules.
+  Kept in memory since the vault started.
+- `WARNING last attempt failed: <code> at ... (from stored metadata)`: after a restart the state
+  is `idle`, but the last token call failed after the last success. `oauth reset` or the next
+  request tries again.
+- `WARNING unused for N days; ... (from stored metadata)`: see `idle` above.
 - `degraded (not persisted)`: see §1.
 
 **Hints.** The hint depends on why the credential failed, then on its code:

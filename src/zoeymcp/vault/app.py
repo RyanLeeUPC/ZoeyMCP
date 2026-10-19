@@ -394,6 +394,11 @@ class VaultApp:
         return self._connectors
 
     @property
+    def env_names(self) -> frozenset[str]:
+        """The ``env:`` variables found set when the policy was loaded: names only."""
+        return frozenset(self._env_secrets)
+
+    @property
     def gateway_keys(self) -> GatewayKeys:
         return self._gateway_keys
 

@@ -3,9 +3,9 @@
 One run through the OAuth effect scenarios: logins from the CLI and over the admin app, seed
 promotion, rotation, the upstream 401 path, a revoked grant whose token endpoint echoes the
 refresh token in ``error_description``, bad pastes, a provider error, a reused code, and a
-client_credentials test fetch with a rejected client. Every log line, admin answer, CLI output
-and proxied response is collected, and none may hold a token, code, verifier, ``state``,
-client secret or ``error_description`` text from the fakes.
+client_credentials test fetch with a rejected client, then the listings and health. Every log
+line, admin answer, CLI output and proxied response is collected, and none may hold a token,
+code, verifier, ``state``, client secret or ``error_description`` text from the fakes.
 
 Two things are shown by design and are taken out before the sweep: the authorization URL (it
 holds ``state`` and the PKCE challenge, useless without the verifier the vault keeps), and the
@@ -191,7 +191,14 @@ class World:
         )
         login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.time)
         self.admin_app = AdminApp(
-            self.store, KEYS, lambda: self.policy, SetupCodes(tmp_path), self.tokens, login
+            self.store,
+            KEYS,
+            lambda: self.policy,
+            SetupCodes(tmp_path),
+            self.tokens,
+            login,
+            connectors=self.vault.connectors,
+            env_names=lambda: self.vault.env_names,
         )
         self.monkeypatch = monkeypatch
         # Everything that leaves the vault, by where it went.
@@ -417,6 +424,9 @@ async def test_nothing_secret_leaves_the_vault(
     await world.admin("GET", "/secrets")
     await world.cli(["oauth", "status"])
     await world.cli(["secret", "list"])
+    await world.admin("GET", "/health")
+    assert (await world.cli(["health"]))[1]
+    assert (await world.cli(["health", "--json"]))[1]
 
     # --- the sweep -----------------------------------------------------------------------------
     log_text = log_lines.getvalue()

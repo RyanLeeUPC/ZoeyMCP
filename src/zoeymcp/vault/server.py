@@ -431,6 +431,8 @@ def run(
             app.tokens,
             login,
             gateway_keys=runtime.gateway_keys,
+            connectors=app.connectors,
+            env_names=lambda: app.env_names,
         )
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")

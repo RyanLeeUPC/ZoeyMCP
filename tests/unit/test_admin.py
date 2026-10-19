@@ -33,6 +33,7 @@ from zoeymcp.vault.admin import (
     json_safe,
 )
 from zoeymcp.vault.app import VaultApp
+from zoeymcp.vault.connectors.smtp import SmtpConnectors
 from zoeymcp.vault.gatewaykeys import GatewayKeys
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.login import LoginError, LoginService
@@ -1028,3 +1029,97 @@ async def test_oauth_status_is_json_safe(tmp_path: Path) -> None:
     assert "rt-123456" not in response.text
     await rig.token_client.aclose()
     await fresh.token_client.aclose()
+
+
+# --- health (M5 design I) ----------------------------------------------------------------------
+
+MAIL_BINDING = {
+    "smtp": {
+        "host": "smtp.mail.example",
+        "port": 465,
+        "from": "Agent <agent@mail.example>",
+        "to": ["partner@mail.example"],
+    }
+}
+
+
+def health_codes(report: dict[str, Any]) -> dict[str, list[str]]:
+    items = [*report["credentials"], *report["connectors"], {"name": "store", **report["store"]}]
+    return {item["name"]: [f["code"] for f in item["findings"]] for item in items}
+
+
+@pytest.mark.anyio
+async def test_health_reads_metadata_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = AdminRig(tmp_path)
+    await rig.call("PUT", "/secrets/music-stats", {"value": "lfm-123456"})
+    rig.store.put("broker-refresh", "rt-123456", BROKER_BINDING)
+    rig.store.put("mail-pass", "pw-123456", MAIL_BINDING)
+    rig.store.put("leftover", "old-123456", {"origins": ["https://old.example:443"]})
+
+    def refuse(*args: Any) -> None:
+        raise AssertionError("health decrypted a secret")
+
+    monkeypatch.setattr(SecretStore, "_decrypt", refuse)
+    response = await rig.call("GET", "/health")
+    assert response.status_code == 200
+    report = response.json()
+    for value in ("lfm-123456", "rt-123456", "pw-123456", "old-123456"):
+        assert value not in response.text
+    assert health_codes(report) == {
+        "music-stats": [],
+        "broker-mcp": ["missing"],
+        "mail-out": ["missing"],
+        "store": ["unreferenced"],
+    }
+    assert report["summary"] == {"error": 2, "warning": 0, "info": 1}
+    broker = report["credentials"][1]
+    assert broker["oauth"]["state"] == "idle"
+    # Without the connectors, no journal was read.
+    assert report["connectors"][0]["sent_24h"] is None
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_health_sums_up_each_connector_and_knows_the_env(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    connectors = SmtpConnectors(tmp_path, KEYS, clock_ms=lambda: 1_790_000_000_000)
+    policy = rig.policy.model_copy(
+        update={
+            "connectors": {
+                "mail-out": rig.policy.connectors["mail-out"].model_copy(
+                    update={"username": "env:MAIL_USER"}
+                )
+            }
+        }
+    )
+    rig.set_policy(policy)
+    rig.admin = AdminApp(
+        rig.store,
+        KEYS,
+        lambda: rig.policy,
+        rig.setup,
+        rig.tokens,
+        connectors=connectors,
+        env_names=lambda: {"MAIL_USER"},
+    )
+    rig.store.put("mail-pass", "pw-123456", MAIL_BINDING)
+    [mail] = (await rig.call("GET", "/health")).json()["connectors"]
+    assert (mail["sent_24h"], mail["last"], mail["findings"]) == (0, None, [])
+    assert mail["refs"][0] == {"ref": "env:MAIL_USER", "present": True, "binding": None}
+
+    def unreadable(name: str) -> Any:
+        raise PermissionError(13, "denied")
+
+    connectors.journal = unreadable  # type: ignore[method-assign]
+    [mail] = (await rig.call("GET", "/health")).json()["connectors"]
+    assert mail["sent_24h"] is None
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_health_without_the_token_manager(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path, tokens=False)
+    response = await rig.call("GET", "/health")
+    assert response.status_code == 200
+    assert "oauth" not in response.json()["credentials"][1]
+    await rig.token_client.aclose()

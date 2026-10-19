@@ -28,6 +28,7 @@ import httpx
 from ...common.policy.schema import OAuth2Credential, split_scope
 from .. import logs
 from ..bindings import BindingError, derive_binding, derive_oauth_binding, live_slot
+from ..health import idle, last_failure, parse_time
 from ..store import Secret
 from . import pkce
 from .pkce import (
@@ -352,7 +353,8 @@ class LoginService:
 
     def status(self) -> list[dict[str, Any]]:
         """The token manager's status, with a hint and its action, the time since the last
-        success, a re-consent warning and the scopes outside the expected set. Never a value.
+        success, a re-consent warning, the scopes outside the expected set, and the last failure
+        and idleness health reads from ``meta`` (M5 design I). Never a value.
 
         ``meta`` is clear text anyone with the state file can edit: it is shown, never trusted.
         """
@@ -365,7 +367,7 @@ class LoginService:
             # The manager lists only the oauth2 credentials of this policy.
             assert isinstance(cred, OAuth2Credential)  # noqa: S101
             meta = item["meta"] or {}
-            last_ok = _parse_iso(meta.get("last_ok"))
+            last_ok = parse_time(meta.get("last_ok"))
             result.append(
                 {
                     **item,
@@ -374,6 +376,8 @@ class LoginService:
                     "last_ok_ago": None if last_ok is None else max(0, round(wall - last_ok)),
                     "reconsent_due": reconsent_due(cred, meta, wall),
                     "scopes": scope_health(cred, meta),
+                    "last_failure": last_failure(item["state"], meta),
+                    "idle": idle(cred, meta, wall),
                 }
             )
         return result
@@ -616,10 +620,10 @@ def refresh_token_hint(name: str, cred: OAuth2Credential) -> str:
 def reconsent_due(cred: OAuth2Credential, meta: Mapping[str, Any], wall: float) -> str | None:
     """When the grant ends, if that is less than ``GRANT_WARN_DAYS`` away."""
     candidates = []
-    consented = _parse_iso(meta.get("consented_at"))
+    consented = parse_time(meta.get("consented_at"))
     if consented is not None and cred.grant_lifetime_days is not None:
         candidates.append(consented + cred.grant_lifetime_days * DAY)
-    refresh_expires = _parse_iso(meta.get("refresh_expires_at"))
+    refresh_expires = parse_time(meta.get("refresh_expires_at"))
     if refresh_expires is not None:
         candidates.append(refresh_expires)
     if not candidates:
@@ -639,21 +643,6 @@ def scope_health(cred: OAuth2Credential, meta: Mapping[str, Any]) -> dict[str, l
         [s for s in granted.split(cred.scope_separator) if s], cred.effective_expected_scopes
     )
     return {"unexpected": list(check.unexpected), "missing": list(check.missing)}
-
-
-def _parse_iso(value: object) -> float | None:
-    """A timestamp from ``meta``, or None for anything that isn't an aware ISO time."""
-    if not isinstance(value, str):
-        return None
-    try:
-        when = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if when.tzinfo is None:
-        return None
-    stamp = when.timestamp()
-    # The vault writes none before 1970, and some platforms can't format one.
-    return stamp if stamp >= 0 else None
 
 
 def _iso(wall: float) -> str:

@@ -221,6 +221,10 @@ def oauth_reset(
     return _request(socket, "POST", path, transport=transport)
 
 
+def health(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    return _request(socket, "GET", "/health", transport=transport)
+
+
 def gateway_status(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
     return _request(socket, "GET", "/status", transport=transport, role="gateway")
 
