@@ -118,6 +118,13 @@ async def test_a_message_at_the_limits_fits_the_default_budget() -> None:
     assert len(out.prompt) <= 3000
 
 
+async def test_a_leading_space_is_refused_before_asking() -> None:
+    """The mail header would lose it, so the message sent wouldn't be the one shown."""
+    out = await run(toolkit, "send_note", {"subject": " Hi", "body": "x"}, slots={"mail": mail()})
+    assert out.text == "arguments refused: at /subject: text_rules"
+    assert out.prompt is None
+
+
 async def test_hidden_text_is_refused_not_shown() -> None:
     out = await run(toolkit, "send_note", {"subject": "Hi", "body": "a‮b"}, slots={"mail": mail()})
     assert out.text == "arguments refused: at /body: text_rules"

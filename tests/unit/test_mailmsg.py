@@ -94,6 +94,8 @@ def test_a_good_request() -> None:
         (request(subject="tab\there"), "subject", "text_rules"),
         (request(subject="x" * 151), "subject", "text_rules"),
         (request(subject=f"hidden{ZWSP}"), "subject", "text_rules"),
+        (request(subject=" leading"), "subject", "leading_space"),
+        (request(subject=" "), "subject", "leading_space"),
         (request(body=""), "body", "text_rules"),
         (request(body="x" * 2201), "body", "text_rules"),
         (request(body=f"hidden{ZWSP}"), "body", "text_rules"),

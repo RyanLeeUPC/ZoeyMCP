@@ -29,7 +29,8 @@ toolkit = Toolkit(
     description="Send a note to the operator's configured recipients.",
 )
 
-Subject = Annotated[str, Text(min=1, max=150, single_line=True)]
+# A leading space is dropped when the header is read, so the vault refuses one.
+Subject = Annotated[str, Text(min=1, max=150, single_line=True, pattern=r"[^ ].*")]
 Body = Annotated[str, Text(min=1, max=2200)]  # the connector's default max_body_chars
 
 

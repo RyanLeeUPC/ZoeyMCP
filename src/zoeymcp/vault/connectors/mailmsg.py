@@ -90,6 +90,8 @@ def parse_send(body: bytes, connector: SMTPConnector) -> SendRequest | Rejection
         allow_tabs=False,
     ):
         return _bad("subject", "text_rules")
+    if subject.startswith(" "):
+        return _bad("subject", "leading_space")  # header unfolding drops it: not what was shown
     if not isinstance(text, str):
         return _bad("body", "type")
     if find_violations(text, min_chars=1, max_chars=connector.max_body_chars, allow_tabs=True):
