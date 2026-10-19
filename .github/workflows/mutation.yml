@@ -12,7 +12,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/mutation.yml"
-      - "scripts/mutation-gate.py"
+      - "scripts/mutation-*.py"
 
 permissions:
   contents: read
@@ -21,11 +21,20 @@ concurrency:
   group: mutation-${{ github.ref }}
   cancel-in-progress: true
 
+# The mutants are split by module across parallel shards (scripts/mutation-shard.py), each on its
+# own runner; "mutation testing" merges their stats and applies the gate. That job's name is the
+# required check on main.
 jobs:
-  mutmut:
-    name: mutation testing
+  shard:
+    name: mutation shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      SHARDS: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,17 +43,45 @@ jobs:
         with:
           version: "0.12.17"
       - run: uv sync --locked --all-extras --python 3.13
-      - name: Run mutmut
-        run: uv run --locked mutmut run --max-children 4 || true
-      - run: uv run --locked mutmut export-cicd-stats
-      - name: Surviving mutants
-        run: uv run --locked mutmut results
-      - name: Diffs of surviving mutants
+      - name: Run mutmut on this shard's modules
         run: |
-          uv run --locked mutmut results | awk -F: '/: survived$/ {gsub(/ /, "", $1); print $1}' > survivors.txt
-          while read -r name; do
-            echo "=== $name"
-            uv run --locked mutmut show "$name"
-          done < survivors.txt
+          patterns="$(uv run --locked python scripts/mutation-shard.py --shard "${{ matrix.shard }}" --of "$SHARDS")"
+          echo "modules: $patterns"
+          # shellcheck disable=SC2086
+          uv run --locked mutmut run --max-children 4 $patterns > mutmut.log 2>&1 || true
+          tail -c 4000 mutmut.log | tr '\r' '\n' | tail -20
+      - run: uv run --locked mutmut export-cicd-stats
+      - name: Diffs of surviving mutants
+        run: uv run --locked python scripts/mutation-diffs.py | tee survivors.txt
+      - run: cp mutants/mutmut-cicd-stats.json "stats-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-shard-${{ matrix.shard }}
+          path: |
+            stats-${{ matrix.shard }}.json
+            survivors.txt
+          retention-days: 14
+
+  gate:
+    name: mutation testing
+    needs: shard
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every shard finished
+        if: ${{ needs.shard.result != 'success' }}
+        run: |
+          echo "a mutation shard didn't finish: ${{ needs.shard.result }}" >&2
+          exit 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mutation-shard-*
+          path: shards
+      - name: Merge
+        run: python3 scripts/mutation-merge.py merged.json shards/*/stats-*.json
       - name: Gate
-        run: uv run --locked python scripts/mutation-gate.py mutants/mutmut-cicd-stats.json --min-score 89
+        run: python3 scripts/mutation-gate.py merged.json --min-score 89

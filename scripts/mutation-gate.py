@@ -39,6 +39,14 @@ def main() -> int:
     if tested == 0:
         print("no mutant was tested: the mutation run is broken", file=sys.stderr)
         return 1
+    not_checked = stats.get("not_checked", 0)
+    if not_checked:
+        side = "ran in no shard" if not_checked > 0 else "ran in two shards"
+        print(
+            f"{abs(not_checked)} mutant(s) {side}: the shards don't cover the modules",
+            file=sys.stderr,
+        )
+        return 1
     if stats.get("segfault"):
         print("mutation run had segfaults", file=sys.stderr)
         return 1
