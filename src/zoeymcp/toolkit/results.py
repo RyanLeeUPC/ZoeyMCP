@@ -30,7 +30,10 @@ class ItemResult:
     def data(self) -> dict[str, JSONValue]:
         if self.ok:
             return {"index": self.index, "ok": True, "value": self.value}
-        return {"index": self.index, "ok": False, "error": self.error}
+        found: dict[str, JSONValue] = {"index": self.index, "ok": False, "error": self.error}
+        if self.value is not None:  # a failure may still name what it concerns, like an id
+            found["value"] = self.value
+        return found
 
 
 @dataclass(frozen=True)

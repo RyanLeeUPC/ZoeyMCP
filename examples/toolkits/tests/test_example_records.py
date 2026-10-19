@@ -80,7 +80,7 @@ async def test_a_batch_is_one_prompt_and_each_record_is_read_back() -> None:
     assert json.loads(out.text)["items"] == [
         {"index": 0, "ok": True, "value": "r1"},
         {"index": 1, "ok": False, "error": "refused by the records API"},
-        {"index": 2, "ok": False, "error": "read-back differs"},
+        {"index": 2, "ok": False, "error": "read-back differs", "value": "r3"},
     ]
 
 

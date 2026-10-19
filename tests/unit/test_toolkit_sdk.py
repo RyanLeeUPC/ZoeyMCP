@@ -498,6 +498,15 @@ def test_failures_never_carry_a_message() -> None:
     assert failure(VaultError(502), "r1").text == "toolkit error: vault answered 502 (ref r1)"
 
 
+def test_a_failed_item_keeps_its_value() -> None:
+    from zoeymcp.toolkit import ItemResult
+
+    found = BatchResult((ItemResult(0, False, value="r3", error="read-back differs"),))
+    assert found.data()["items"] == [
+        {"index": 0, "ok": False, "error": "read-back differs", "value": "r3"}
+    ]
+
+
 def test_render() -> None:
     assert render("hi") == "hi"
     assert render(BatchResult()) == '{"failed":0,"items":[],"ok":0}'
