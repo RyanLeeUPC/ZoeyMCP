@@ -318,6 +318,9 @@ def test_a_removed_or_changed_client_is_revoked_everywhere() -> None:
     assert revoked(gateway(), gateway(clients=raw)) == {("alpha", "notes")}
     rekeyed = clients_with(alpha={"token_sha256": hash_token("zgc1-new-token")})
     assert revoked(gateway(), gateway(clients=rekeyed)) == {("alpha", "notes")}
+    # A toolkit server listed first doesn't hide the remote servers after it.
+    toolkit_first = clients_with(alpha={"servers": ["mail", "notes", "other"]})
+    assert revoked(gateway(clients=toolkit_first), gateway()) == {("alpha", "other")}
     repinned = clients_with(beta={"sources": ["10.0.0.0/8"]})
     assert revoked(gateway(), gateway(clients=repinned)) == {("beta", "notes")}
 
