@@ -4,7 +4,8 @@ The verifier, ``state`` and flow IDs come from an injected token function, and t
 from an injected monotonic clock. Only ``S256`` exists: there is no ``plain`` here.
 
 Flows live in the vault's memory only. A flow is removed when it's taken, so any failure while
-completing a login needs a new login.
+completing a login needs a new login. Each flow has an owner, the CLI or one portal session (M5
+design H.2): another owner's flow answers as an unknown one.
 """
 
 from __future__ import annotations
@@ -33,7 +34,11 @@ MAX_DESCRIPTION: Final = 200
 SECRET_BYTES: Final = 32
 FLOW_ID_BYTES: Final = 16
 
+# The owner of a flow the admin socket starts; a portal session's flows are "session:<hex id>".
+CLI_OWNER: Final = "cli"
+
 _VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+_SESSION_OWNER = re.compile(r"session:[0-9a-f]+")
 _CODE = re.compile(r"[\x21-\x7E]{1,2048}")
 # Parameters that must appear at most once in the redirect.
 _SINGLE = ("code", "state", "error", "iss")
@@ -198,6 +203,7 @@ class Flow:
     redirect_uri: str
     expires_at: float
     rebind: bool = False
+    owner: str = CLI_OWNER
 
     @property
     def challenge(self) -> str:
@@ -205,6 +211,11 @@ class Flow:
 
     def __repr__(self) -> str:
         return f"Flow(credential={self.credential!r})"
+
+
+def surface(owner: str) -> str:
+    """Where a flow's owner works: ``cli`` or ``portal``."""
+    return "cli" if owner == CLI_OWNER else "portal"
 
 
 class TooManyFlows(Exception):
@@ -225,8 +236,17 @@ class FlowTable:
         self._purge(self._clock())
         return len(self._flows)
 
-    def start(self, credential: str, redirect_uri: str, *, rebind: bool = False) -> Flow:
-        """A new flow. It replaces the credential's pending one."""
+    def start(
+        self,
+        credential: str,
+        redirect_uri: str,
+        *,
+        rebind: bool = False,
+        owner: str = CLI_OWNER,
+    ) -> Flow:
+        """A new flow. It replaces the credential's pending one, whoever owns that."""
+        if owner != CLI_OWNER and not _SESSION_OWNER.fullmatch(owner):
+            raise ValueError("a flow's owner is cli or session:<hex id>")
         now = self._clock()
         self._purge(now)
         for flow_id, flow in list(self._flows.items()):
@@ -242,20 +262,45 @@ class FlowTable:
             redirect_uri=redirect_uri,
             expires_at=now + FLOW_TTL,
             rebind=rebind,
+            owner=owner,
         )
         self._flows[flow.id] = flow
         return flow
 
-    def take(self, flow_id: str, credential: str) -> Flow | None:
-        """Remove the flow and return it, unless it's unknown, expired or another credential's.
-        All three get the same answer."""
-        flow = self._flows.pop(flow_id, None)
-        if flow is None or self._clock() >= flow.expires_at or flow.credential != credential:
+    def owner_of(self, credential: str) -> str | None:
+        """The owner of the credential's pending flow, the one a start would replace."""
+        self._purge(self._clock())
+        for flow in self._flows.values():
+            if flow.credential == credential:
+                return flow.owner
+        return None
+
+    def take(self, flow_id: str, credential: str, owner: str = CLI_OWNER) -> Flow | None:
+        """Remove the flow and return it, unless it's unknown, expired, another credential's or
+        another owner's. All four get the same answer; another owner's flow stays."""
+        flow = self._flows.get(flow_id)
+        if flow is None or flow.owner != owner:
+            return None
+        del self._flows[flow_id]
+        return flow if self._usable(flow, credential) else None
+
+    def peek(self, flow_id: str, credential: str, owner: str = CLI_OWNER) -> Flow | None:
+        """The flow, left in place, unless ``take`` would refuse it."""
+        flow = self._flows.get(flow_id)
+        if flow is None or flow.owner != owner or not self._usable(flow, credential):
             return None
         return flow
 
-    def cancel(self, flow_id: str) -> bool:
-        return self._flows.pop(flow_id, None) is not None
+    def cancel(self, flow_id: str, owner: str = CLI_OWNER) -> bool:
+        """Drop the flow. Another owner's flow stays, and answers as an unknown one."""
+        flow = self._flows.get(flow_id)
+        if flow is None or flow.owner != owner:
+            return False
+        del self._flows[flow_id]
+        return True
+
+    def _usable(self, flow: Flow, credential: str) -> bool:
+        return self._clock() < flow.expires_at and flow.credential == credential
 
     def _purge(self, now: float) -> None:
         for flow_id, flow in list(self._flows.items()):

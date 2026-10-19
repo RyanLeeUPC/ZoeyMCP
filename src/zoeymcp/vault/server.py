@@ -39,6 +39,7 @@ from .app import LISTENER_SCOPE_KEY, Listener, VaultApp
 from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
+from .oauth.login import LoginService
 from .peer import link_supported, peer_checked
 from .store import SecretStore, StoreError
 
@@ -414,6 +415,8 @@ def run(
         app.connectors.recover(connector_names(runtime.policy.connectors))
     except OSError as exc:
         raise StartupError(f"can't recover the SMTP connectors' send journals: {exc}") from exc
+    # One set of pending logins for every surface, so the flow limit is shared (M5 design H.2).
+    login = LoginService(app.tokens)
     admin = None
     if admin_socket is not None and socket_supported():
         try:
@@ -426,6 +429,7 @@ def run(
             lambda: app.policy,
             SetupCodes(state_dir),
             app.tokens,
+            login,
             gateway_keys=runtime.gateway_keys,
         )
     elif admin_socket is not None:

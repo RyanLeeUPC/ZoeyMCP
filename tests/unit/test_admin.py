@@ -36,6 +36,7 @@ from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.gatewaykeys import GatewayKeys
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.login import LoginError, LoginService
+from zoeymcp.vault.oauth.pkce import CLI_OWNER
 from zoeymcp.vault.oauth.protocol import CREDENTIAL_UNAVAILABLE
 from zoeymcp.vault.oauth.tokens import OAuthUnavailable, TokenManager
 from zoeymcp.vault.store import SecretStore
@@ -778,7 +779,9 @@ async def test_oauth_login_through_the_admin_app(tmp_path: Path) -> None:
         "rotates",
         "binding",
         "binding_change",
+        "replaced",
     }
+    assert data["replaced"] is None
     assert data["binding"] == BROKER_BINDING
     assert data["authorize_url"].startswith(BROKER_AUTHORIZE + "?response_type=code&")
     pasted = await browse(rig, data["authorize_url"])
@@ -918,10 +921,14 @@ class RefusingLogin(LoginService):
         super().__init__(tokens)
         self.error = error
 
-    async def start(self, credential: str, *, rebind: bool = False) -> dict[str, Any]:
+    async def start(
+        self, credential: str, *, rebind: bool = False, owner: str = CLI_OWNER
+    ) -> dict[str, Any]:
         raise self.error
 
-    async def complete(self, credential: str, flow_id: str, redirect_url: str) -> dict[str, Any]:
+    async def complete(
+        self, credential: str, flow_id: str, redirect_url: str, owner: str = CLI_OWNER
+    ) -> dict[str, Any]:
         raise self.error
 
 

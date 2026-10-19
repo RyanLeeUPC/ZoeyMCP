@@ -385,6 +385,20 @@ def test_login_shows_a_rebinding(admin: FakeAdmin) -> None:
     assert "Rebinding    was origins https://old.example:443\nScopes       read\n" in out
 
 
+@pytest.mark.parametrize(
+    ("replaced", "first"),
+    [("portal", "Replaced a login pending in the portal.\n"), ("cli", ""), (None, "")],
+)
+def test_login_says_it_replaced_a_portal_login(
+    admin: FakeAdmin, replaced: str | None, first: str
+) -> None:
+    admin.answers[("POST", "/oauth/music/login")] = (200, {**STARTED, "replaced": replaced})
+    code, out, err = cli(["login", "music", "--start", "--socket", "x"])
+    assert code == EXIT_OK
+    assert err == ""
+    assert out.startswith(first + HEADER)
+
+
 def test_login_describes_a_confidential_client_without_scopes(admin: FakeAdmin) -> None:
     started = {**STARTED, "client_auth": "post", "rotates": False, "requested_scopes": []}
     admin.answers[("POST", "/oauth/music/login")] = (200, started)

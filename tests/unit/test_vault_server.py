@@ -22,6 +22,7 @@ from zoeymcp.vault.connectors import sendjournal
 from zoeymcp.vault.connectors.smtp import SmtpConnectors
 from zoeymcp.vault.gatewaykeys import BACKWARDS, STATE_FILE, TAMPERED, State
 from zoeymcp.vault.keys import KeySet, generate_master_key
+from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.server import LOCK_FILE, StartupError, acquire_state_lock, load_runtime
 from zoeymcp.vault.store import SecretStore, origin_binding
 
@@ -387,6 +388,32 @@ def test_run_gives_the_admin_the_token_manager(
     monkeypatch.setattr(server, "serve", serve)
     server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
     assert seen["admin"]._tokens is seen["app"].tokens
+
+
+def test_run_shares_one_login_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every surface uses the one service run builds, so the pending logins and their limit are
+    shared (M5 design H.2)."""
+    built: list[LoginService] = []
+    seen: dict[str, Any] = {}
+
+    class Recorded(LoginService):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(app=app, **kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "LoginService", Recorded)
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
+    [login] = built
+    assert seen["admin"]._login is login
+    assert login._tokens is seen["app"].tokens
 
 
 # --- the gateway key ratchet (M3 design C.2) -----------------------------------------------------

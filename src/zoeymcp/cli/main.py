@@ -709,6 +709,10 @@ def _read_paste(socket: str, flow: str, stdin: TextIO, err: TextIO) -> str | Non
 
 
 def _describe_login(credential: str, started: dict[str, Any], out: TextIO) -> None:
+    # An older vault's answer has no "replaced". A login started here replaces any pending one
+    # silently, as before; only the portal's is worth a line.
+    if started.get("replaced") == "portal":
+        out.write("Replaced a login pending in the portal.\n")
     client = "public client" if started["client_auth"] == "none" else "confidential client"
     rotation = "rotating" if started["rotates"] else "non-rotating"
     oauth = started["binding"]["oauth"]

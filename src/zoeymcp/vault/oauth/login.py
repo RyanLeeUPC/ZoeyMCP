@@ -7,6 +7,10 @@ token through the token manager, which also caches the access token.
 
 The client_credentials grant has nothing to consent to: its login is a test fetch.
 
+Flows are owned (M5 design H.2): the admin socket's are the CLI's, the default, and the portal's
+belong to one session. The portal checks a paste with :meth:`LoginService.check_paste` before it
+asks for the passkey, and completes with :meth:`LoginService.complete` after.
+
 Nothing here logs or returns a token, code, verifier, ``state`` or client secret. A provider's
 ``error_description`` from the redirect goes back to the CLI only, and is never logged.
 """
@@ -26,7 +30,17 @@ from .. import logs
 from ..bindings import BindingError, derive_binding, derive_oauth_binding, live_slot
 from ..store import Secret
 from . import pkce
-from .pkce import FLOW_TTL, FlowTable, RedirectError, TokenFunction, TooManyFlows
+from .pkce import (
+    CLI_OWNER,
+    FLOW_TTL,
+    Flow,
+    FlowTable,
+    Redirect,
+    RedirectError,
+    TokenFunction,
+    TooManyFlows,
+    surface,
+)
 from .protocol import (
     CREDENTIAL_UNAVAILABLE,
     EXCHANGE_DEADLINE,
@@ -65,6 +79,8 @@ _CLIENT_REFS: Final = {
 }
 
 Clock = Callable[[], float]
+# What the operator can do about a failure, for the portal's button (M5 design H.4).
+Action = dict[str, str]
 
 
 class LoginError(Exception):
@@ -79,7 +95,8 @@ class LoginError(Exception):
 
 
 class LoginService:
-    """Pending logins and their completion, for the admin socket. Flows live in memory only."""
+    """Pending logins and their completion, for the admin socket and the portal, which share one
+    service (M5 design H.2). Flows live in memory only."""
 
     def __init__(
         self,
@@ -96,22 +113,30 @@ class LoginService:
 
     # --- start ---------------------------------------------------------------------------------
 
-    async def start(self, credential: str, *, rebind: bool = False) -> dict[str, Any]:
+    async def start(
+        self, credential: str, *, rebind: bool = False, owner: str = CLI_OWNER
+    ) -> dict[str, Any]:
         """Start a login: the authorization URL for a refresh grant, or a client_credentials
-        test fetch, whose answer has the shape of :meth:`complete`'s."""
+        test fetch, whose answer has the shape of :meth:`complete`'s.
+
+        A credential has one pending login, whoever started it: the answer's ``replaced`` says
+        where the one this start replaced was started (``cli`` or ``portal``), or is None.
+        """
         try:
             cred = self._credential(credential)
             if cred.grant == "client_credentials":
                 logs.event("oauth_login_started", credential=credential)
                 return await self._test_fetch(credential, cred)
-            answer = self._start(credential, cred, rebind)
+            answer = self._start(credential, cred, rebind, owner)
         except LoginError as exc:
             self._failed(credential, exc)
             raise
         logs.event("oauth_login_started", credential=credential)
         return answer
 
-    def _start(self, credential: str, cred: OAuth2Credential, rebind: bool) -> dict[str, Any]:
+    def _start(
+        self, credential: str, cred: OAuth2Credential, rebind: bool, owner: str
+    ) -> dict[str, Any]:
         if cred.authorize_url is None:
             raise LoginError(
                 "no_authorize_url",
@@ -129,15 +154,18 @@ class LoginService:
                     details={"old": existing.binding, "new": binding},
                 )
             change = {"old": existing.binding, "new": binding}
+        replaced = self._flows.owner_of(credential)
         try:
-            flow = self._flows.start(credential, cred.redirect_uri, rebind=rebind)
+            flow = self._flows.start(credential, cred.redirect_uri, rebind=rebind, owner=owner)
         except TooManyFlows as exc:
             raise LoginError("too_many_flows", str(exc)) from None
+        if replaced is not None:
+            logs.event("oauth_flow_replaced", credential=credential, by=surface(owner))
         try:
             url = pkce.authorize_url(cred, state=flow.state, challenge=flow.challenge)
         except ValueError as exc:
             # A client_id ref or a reserved authorize_params name: check refuses both.
-            self._flows.cancel(flow.id)
+            self._flows.cancel(flow.id, owner)
             raise LoginError("authorize_misconfigured", str(exc)) from None
         return {
             "flow": flow.id,
@@ -150,39 +178,31 @@ class LoginService:
             "rotates": cred.rotates,
             "binding": binding,
             "binding_change": change,
+            "replaced": None if replaced is None else surface(replaced),
         }
 
     # --- complete ------------------------------------------------------------------------------
 
-    async def complete(self, credential: str, flow_id: str, redirect_url: str) -> dict[str, Any]:
+    async def complete(
+        self, credential: str, flow_id: str, redirect_url: str, owner: str = CLI_OWNER
+    ) -> dict[str, Any]:
         """Check the pasted address, exchange its code and store the grant (design E.2, E.3).
 
         The flow is taken first, so any failure needs a new login.
         """
         try:
-            return await self._complete(credential, flow_id, redirect_url)
+            return await self._complete(credential, flow_id, redirect_url, owner)
         except LoginError as exc:
             self._failed(credential, exc)
             raise
 
-    async def _complete(self, credential: str, flow_id: str, redirect_url: str) -> dict[str, Any]:
-        flow = self._flows.take(flow_id, credential)
+    async def _complete(
+        self, credential: str, flow_id: str, redirect_url: str, owner: str
+    ) -> dict[str, Any]:
+        flow = self._flows.take(flow_id, credential, owner)
         if flow is None:
-            raise LoginError(
-                "flow_unknown", "no such login is pending (it expired or was used); run login again"
-            )
-        cred = self._credential(credential)
-        if cred.grant != "refresh_token":
-            raise LoginError("not_oauth", f"{credential!r} no longer uses the refresh grant")
-        try:
-            redirect = pkce.parse_redirect(
-                redirect_url, redirect_uri=flow.redirect_uri, state=flow.state, issuer=cred.issuer
-            )
-        except RedirectError as exc:
-            details = {}
-            if exc.reason == "provider_error":
-                details = {"provider_error": exc.error, "description": exc.description}
-            raise LoginError(exc.reason, str(exc), details=details) from None
+            raise _flow_unknown()
+        cred, redirect = self._parse(credential, flow, redirect_url)
         client = self._client(credential, cred)
         try:
             request = build_exchange(
@@ -243,9 +263,43 @@ class LoginService:
             "seed_note": seed_note(cred, commit.seed_present),
         }
 
-    def cancel(self, flow_id: str) -> bool:
+    def check_paste(
+        self, credential: str, flow_id: str, redirect_url: str, owner: str = CLI_OWNER
+    ) -> None:
+        """Check a pasted address against the flow without taking it (M5 design H.1), so a
+        mistyped paste can be fixed. A provider's error ends the flow: its answer is final."""
+        flow = self._flows.peek(flow_id, credential, owner)
+        if flow is None:
+            raise _flow_unknown()
+        try:
+            self._parse(credential, flow, redirect_url)
+        except LoginError as exc:
+            if exc.reason == "provider_error":
+                self._flows.cancel(flow_id, owner)
+                self._failed(credential, exc)
+            raise
+
+    def cancel(self, flow_id: str, owner: str = CLI_OWNER) -> bool:
         """Drop a pending flow (the CLI does on Ctrl-C)."""
-        return self._flows.cancel(flow_id)
+        return self._flows.cancel(flow_id, owner)
+
+    def _parse(
+        self, credential: str, flow: Flow, redirect_url: str
+    ) -> tuple[OAuth2Credential, Redirect]:
+        """The credential, and the code the pasted address carries for the flow."""
+        cred = self._credential(credential)
+        if cred.grant != "refresh_token":
+            raise LoginError("not_oauth", f"{credential!r} no longer uses the refresh grant")
+        try:
+            redirect = pkce.parse_redirect(
+                redirect_url, redirect_uri=flow.redirect_uri, state=flow.state, issuer=cred.issuer
+            )
+        except RedirectError as exc:
+            details = {}
+            if exc.reason == "provider_error":
+                details = {"provider_error": exc.error, "description": exc.description}
+            raise LoginError(exc.reason, str(exc), details=details) from None
+        return cred, redirect
 
     # --- client_credentials --------------------------------------------------------------------
 
@@ -297,8 +351,8 @@ class LoginService:
     # --- health --------------------------------------------------------------------------------
 
     def status(self) -> list[dict[str, Any]]:
-        """The token manager's status, with a hint, the time since the last success, a
-        re-consent warning and the scopes outside the expected set. Never a value.
+        """The token manager's status, with a hint and its action, the time since the last
+        success, a re-consent warning and the scopes outside the expected set. Never a value.
 
         ``meta`` is clear text anyone with the state file can edit: it is shown, never trusted.
         """
@@ -316,6 +370,7 @@ class LoginService:
                 {
                     **item,
                     "hint": hint(name, cred, item["code"], item["reason"]),
+                    "action": hint_action(name, cred, item["code"], item["reason"]),
                     "last_ok_ago": None if last_ok is None else max(0, round(wall - last_ok)),
                     "reconsent_due": reconsent_due(cred, meta, wall),
                     "scopes": scope_health(cred, meta),
@@ -437,6 +492,12 @@ class LoginService:
         logs.event("oauth_login_failed", credential=credential, reason=exc.reason)
 
 
+def _flow_unknown() -> LoginError:
+    return LoginError(
+        "flow_unknown", "no such login is pending (it expired or was used); run login again"
+    )
+
+
 def _unbuildable() -> LoginError:
     return LoginError(
         f"exchange_failed:{OAUTH_MISCONFIGURED}", "the token request can't be built from the policy"
@@ -471,29 +532,64 @@ def hint(
     name: str, cred: OAuth2Credential, code: str | None, reason: str | None = None
 ) -> str | None:
     """What the operator can do about a failure code and its reason."""
+    advice = _advice(name, cred, code, reason)
+    return None if advice is None else advice[0]
+
+
+def hint_action(
+    name: str, cred: OAuth2Credential, code: str | None, reason: str | None = None
+) -> Action | None:
+    """:func:`hint` as an action the portal offers (M5 design H.4): its ``kind`` is
+    ``connect``, ``reset``, ``set_secret`` or ``restart`` (both with the ``ref``),
+    ``fix_policy`` or ``wait``. None when there is nothing to do, or nothing the vault can."""
+    advice = _advice(name, cred, code, reason)
+    return None if advice is None else advice[1]
+
+
+def _advice(
+    name: str, cred: OAuth2Credential, code: str | None, reason: str | None
+) -> tuple[str, Action | None] | None:
+    """The hint and its action, decided once so the two always agree."""
     if code is None:
         return None
     what = _CLIENT_REFS.get(reason or "")
     if what is not None:
-        ref = cred.client_id if what == "client ID" else cred.client_secret
-        return f"{set_ref_hint(ref or '', what)}, then run: zoeymcp oauth reset {name}"
+        ref = (cred.client_id if what == "client ID" else cred.client_secret) or ""
+        return (
+            f"{set_ref_hint(ref, what)}, then run: zoeymcp oauth reset {name}",
+            _ref_action(name, ref),
+        )
     if reason == "no_route":
-        return f"no route uses {name}; fix the policy"
+        return f"no route uses {name}; fix the policy", _action("fix_policy", name)
+    reset = f"check the client ID and secret, then run: zoeymcp oauth reset {name}"
     if code in (OAUTH_RECONSENT_NEEDED, OAUTH_ROTATION_LOST, CREDENTIAL_UNAVAILABLE):
         if cred.grant == "client_credentials":
-            return f"check the client ID and secret, then run: zoeymcp oauth reset {name}"
+            return reset, _action("reset", name)
         if cred.authorize_url is not None:
-            return f"run: zoeymcp login {name}"
-        return refresh_token_hint(name, cred)
+            return f"run: zoeymcp login {name}", _action("connect", name)
+        return refresh_token_hint(name, cred), _ref_action(name, cred.refresh_token or "")
     if code == OAUTH_CLIENT_REJECTED:
-        return f"check the client ID and secret, then run: zoeymcp oauth reset {name}"
+        return reset, _action("reset", name)
     if code == OAUTH_MISCONFIGURED:
-        return f"fix the policy, then run: zoeymcp oauth reset {name}"
+        return f"fix the policy, then run: zoeymcp oauth reset {name}", _action("fix_policy", name)
     if code == OAUTH_UNSUPPORTED:
-        return "the provider's tokens aren't Bearer tokens the vault can use"
+        return "the provider's tokens aren't Bearer tokens the vault can use", None
     if code == OAUTH_UNAVAILABLE:
-        return "the token endpoint is unavailable; a request after the backoff tries again"
+        return (
+            "the token endpoint is unavailable; a request after the backoff tries again",
+            _action("wait", name),
+        )
     return None
+
+
+def _action(kind: str, name: str) -> Action:
+    return {"kind": kind, "credential": name}
+
+
+def _ref_action(name: str, ref: str) -> Action:
+    """A secret ref given a value: an env var by a restart, a store entry by setting it."""
+    kind = "restart" if ref.startswith("env:") else "set_secret"
+    return {**_action(kind, name), "ref": ref}
 
 
 def set_ref_hint(ref: str, what: str) -> str:

@@ -30,6 +30,7 @@ from zoeymcp.vault.oauth.login import (
     LoginError,
     LoginService,
     hint,
+    hint_action,
     reconsent_due,
     scope_health,
     seed_note,
@@ -316,6 +317,7 @@ async def test_start_answers_with_the_authorization_request(
         "rotates": True,
         "binding": BINDING,
         "binding_change": None,
+        "replaced": None,
     }
     assert rig.counter.issued == [FLOW_ID, STATE, VERIFIER]
     assert [
@@ -1128,6 +1130,181 @@ async def test_cancel(tmp_path: Path, clock: FakeClock) -> None:
     assert (await rig.refused(rig.login.complete("music", flow, pasted))).reason == "flow_unknown"
 
 
+# --- owners and the paste check (M5 design H.1, H.2) -------------------------------------------
+
+SESSION = "session:0123456789abcdef"
+UNKNOWN = "no such login is pending (it expired or was used); run login again"
+
+
+def checked(rig: Rig, *args: str) -> LoginError:
+    with pytest.raises(LoginError) as caught:
+        rig.login.check_paste(*args)
+    return caught.value
+
+
+async def test_a_flow_completes_only_for_its_owner(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved(owner=SESSION)
+    cli = await rig.refused(rig.login.complete("music", flow, pasted))
+    other = await rig.refused(rig.login.complete("music", flow, pasted, "session:00"))
+    assert {(e.reason, str(e)) for e in (cli, other)} == {("flow_unknown", UNKNOWN)}
+    assert rig.login.cancel(flow) is False
+    assert rig.server.calls == []
+    assert (await rig.login.complete("music", flow, pasted, SESSION))["persisted"] is True
+
+
+async def test_the_owner_cancels(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved(owner=SESSION)
+    assert rig.login.cancel(flow, SESSION) is True
+    assert rig.login.cancel(flow, SESSION) is False
+    refused = await rig.refused(rig.login.complete("music", flow, pasted, SESSION))
+    assert refused.reason == "flow_unknown"
+
+
+async def test_a_start_says_which_login_it_replaced(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    policy = make_policy(
+        {"music": spotify(), "files": spotify(refresh_token="store:files-refresh")}
+    )
+    rig = Rig(tmp_path, clock, policy)
+    assert (await rig.start("files", owner=SESSION))["replaced"] is None
+    first = await rig.start()
+    assert first["replaced"] is None
+    assert (await rig.start())["replaced"] == "cli"
+    assert (await rig.start(owner=SESSION))["replaced"] == "cli"
+    assert (await rig.start(owner="session:00"))["replaced"] == "portal"
+    assert (await rig.start())["replaced"] == "portal"
+    # One pending login per credential, whoever started it.
+    refused = await rig.refused(rig.login.complete("music", first["flow"], REDIRECT))
+    assert refused.reason == "flow_unknown"
+    clock.advance(600)
+    assert (await rig.start())["replaced"] is None
+    replaced = [
+        {k: v for k, v in e.items() if k not in ("ts", "role")}
+        for e in captured.events("oauth_flow_replaced")
+    ]
+    assert replaced == [
+        {"event": "oauth_flow_replaced", "credential": "music", "by": by}
+        for by in ("cli", "portal", "portal", "cli")
+    ]
+
+
+async def test_a_portal_start_the_policy_cannot_build_leaves_no_flow(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = spotify_rig(tmp_path, clock, authorize_params={"state": "x"})
+    refused = await rig.refused(rig.start(owner=SESSION))
+    assert refused.reason == "authorize_misconfigured"
+    assert len(rig.login._flows) == 0
+
+
+async def test_a_paste_check_takes_nothing(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved(owner=SESSION)
+    rig.login.check_paste("music", flow, pasted, SESSION)
+    rig.login.check_paste("music", flow, pasted, SESSION)
+    assert rig.server.calls == []
+    assert captured.events("oauth_login_failed") == []
+    assert (await rig.login.complete("music", flow, pasted, SESSION))["persisted"] is True
+
+
+async def test_a_paste_check_needs_the_owners_live_flow(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    policy = make_policy(
+        {"music": spotify(), "files": spotify(refresh_token="store:files-refresh")}
+    )
+    rig = Rig(tmp_path, clock, policy)
+    flow, pasted = await rig.approved(owner=SESSION)
+    for args in (
+        ("music", "nope", pasted, SESSION),
+        ("files", flow, pasted, SESSION),
+        ("music", flow, pasted),
+        ("music", flow, pasted, "session:00"),
+    ):
+        refused = checked(rig, *args)
+        assert (refused.reason, str(refused)) == ("flow_unknown", UNKNOWN)
+    # None of them touched the flow.
+    rig.login.check_paste("music", flow, pasted, SESSION)
+    clock.advance(600)
+    assert checked(rig, "music", flow, pasted, SESSION).reason == "flow_unknown"
+    assert captured.events("oauth_login_failed") == []
+
+
+@pytest.mark.parametrize(
+    ("change", "reason", "message"),
+    [
+        (
+            lambda u: with_query(u, state="wrong"),
+            "state_mismatch",
+            "the address is for a different login",
+        ),
+        (
+            lambda u: u.replace("127.0.0.1", "127.0.0.2"),
+            "redirect_mismatch",
+            "that isn't an address under http://127.0.0.1/callback; paste the full URL",
+        ),
+        (lambda u: u + "&code=again", "duplicate_param", "the address has more than one 'code'"),
+        (
+            lambda u: with_query(u, code=None),
+            "no_code",
+            "the address has no usable authorization code",
+        ),
+    ],
+    ids=["state", "redirect", "duplicate", "no-code"],
+)
+async def test_a_mistyped_paste_can_be_fixed(
+    tmp_path: Path,
+    clock: FakeClock,
+    captured: Captured,
+    change: Callable[[str], str],
+    reason: str,
+    message: str,
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved()
+    refused = checked(rig, "music", flow, change(pasted))
+    assert (refused.reason, str(refused), refused.details) == (reason, message, {})
+    assert captured.events("oauth_login_failed") == []
+    rig.login.check_paste("music", flow, pasted)
+    assert (await rig.login.complete("music", flow, pasted))["persisted"] is True
+
+
+async def test_a_paste_check_follows_the_policy(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved()
+    rig.reconfigure(make_policy({"music": machine()}))
+    refused = checked(rig, "music", flow, pasted)
+    assert (refused.reason, str(refused)) == (
+        "not_oauth",
+        "'music' no longer uses the refresh grant",
+    )
+    rig.reconfigure(make_policy({"music": spotify()}))
+    assert (await rig.login.complete("music", flow, pasted))["persisted"] is True
+
+
+async def test_a_provider_error_in_a_paste_ends_the_flow(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, _ = await rig.approved(owner=SESSION)
+    pasted = f"{REDIRECT}?" + urlencode(
+        {"error": "access_denied", "error_description": "The user said no", "state": STATE}
+    )
+    refused = checked(rig, "music", flow, pasted, SESSION)
+    assert refused.reason == "provider_error"
+    assert str(refused) == "the provider refused the authorization: access_denied"
+    assert refused.details == {"provider_error": "access_denied", "description": "The user said no"}
+    assert len(rig.login._flows) == 0
+    reasons = [(e["credential"], e["reason"]) for e in captured.events("oauth_login_failed")]
+    assert reasons == [("music", "provider_error")]
+    assert "The user said no" not in captured.text
+
+
 # --- client_credentials ------------------------------------------------------------------------
 
 
@@ -1448,6 +1625,98 @@ async def test_status_hints_from_the_failure_reason(tmp_path: Path, clock: FakeC
         "enter the client secret with zoeymcp secret set google-secret, "
         "then run: zoeymcp oauth reset music"
     )
+
+
+CONNECT = {"kind": "connect", "credential": "music"}
+RESET = {"kind": "reset", "credential": "music"}
+FIX_POLICY = {"kind": "fix_policy", "credential": "music"}
+
+
+@pytest.mark.parametrize(
+    ("code", "fields", "action"),
+    [
+        (None, {}, None),
+        (OAUTH_RECONSENT_NEEDED, {}, CONNECT),
+        (OAUTH_ROTATION_LOST, {}, CONNECT),
+        (CREDENTIAL_UNAVAILABLE, {}, CONNECT),
+        (
+            OAUTH_RECONSENT_NEEDED,
+            {"authorize_url": None},
+            {"kind": "set_secret", "credential": "music", "ref": "store:music-refresh"},
+        ),
+        (
+            OAUTH_ROTATION_LOST,
+            {"authorize_url": None, "refresh_token": "env:MUSIC_REFRESH"},
+            {"kind": "restart", "credential": "music", "ref": "env:MUSIC_REFRESH"},
+        ),
+        (
+            CREDENTIAL_UNAVAILABLE,
+            {"authorize_url": None, "refresh_token": "env:MUSIC_REFRESH", "reseed": "on-change"},
+            {"kind": "restart", "credential": "music", "ref": "env:MUSIC_REFRESH"},
+        ),
+        (OAUTH_CLIENT_REJECTED, {}, RESET),
+        (OAUTH_MISCONFIGURED, {}, FIX_POLICY),
+        (OAUTH_UNSUPPORTED, {}, None),
+        (OAUTH_UNAVAILABLE, {}, {"kind": "wait", "credential": "music"}),
+        ("something_new", {}, None),
+    ],
+)
+def test_hint_actions(code: str | None, fields: dict[str, Any], action: Any) -> None:
+    assert hint_action("music", credential(**fields), code) == action
+
+
+@pytest.mark.parametrize(
+    ("fields", "reason", "action"),
+    [
+        (
+            {"client_secret": "store:music-secret", "client_auth": "post"},
+            "client_secret_unavailable",
+            {"kind": "set_secret", "credential": "music", "ref": "store:music-secret"},
+        ),
+        (
+            {"client_secret": "env:MUSIC_SECRET", "client_auth": "post"},
+            "client_secret_unavailable",
+            {"kind": "restart", "credential": "music", "ref": "env:MUSIC_SECRET"},
+        ),
+        (
+            {"client_id": "env:MUSIC_ID", "authorize_url": None},
+            "client_id_unavailable",
+            {"kind": "restart", "credential": "music", "ref": "env:MUSIC_ID"},
+        ),
+        ({}, "no_route", FIX_POLICY),
+        ({}, "live_unusable", CONNECT),
+        ({}, None, CONNECT),
+    ],
+)
+def test_hint_actions_by_reason(fields: dict[str, Any], reason: str | None, action: Any) -> None:
+    assert hint_action("music", credential(**fields), CREDENTIAL_UNAVAILABLE, reason) == action
+
+
+def test_a_client_credentials_action_is_never_connect() -> None:
+    found = make_policy({"music": machine()}).credentials["music"]
+    assert isinstance(found, OAuth2Credential)
+    for code in (CREDENTIAL_UNAVAILABLE, OAUTH_RECONSENT_NEEDED):
+        assert hint_action("music", found, code) == RESET
+    assert hint_action("music", found, CREDENTIAL_UNAVAILABLE, "client_secret_unavailable") == {
+        "kind": "set_secret",
+        "credential": "music",
+        "ref": "store:google-secret",
+    }
+
+
+async def test_status_adds_the_action(tmp_path: Path, clock: FakeClock) -> None:
+    rig = Rig(tmp_path, clock, make_policy({"music": google()}), google_style(clock.time))
+    rig.store.put("music-refresh", "fake-rt-0001", BINDING)
+    [before] = rig.login.status()
+    assert before["action"] is None
+    with pytest.raises(Exception, match=CREDENTIAL_UNAVAILABLE):
+        await rig.manager.grant_for("music", API)
+    [status] = rig.login.status()
+    assert status["action"] == {
+        "kind": "set_secret",
+        "credential": "music",
+        "ref": "store:google-secret",
+    }
 
 
 DAY = 86400.0

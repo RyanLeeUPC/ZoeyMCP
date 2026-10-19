@@ -10,6 +10,7 @@ import pytest
 from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.vault.oauth import pkce
 from zoeymcp.vault.oauth.pkce import (
+    CLI_OWNER,
     FLOW_TTL,
     MAX_FLOWS,
     Flow,
@@ -21,6 +22,7 @@ from zoeymcp.vault.oauth.pkce import (
     code_challenge,
     new_verifier,
     parse_redirect,
+    surface,
 )
 from zoeymcp.vault.store import Secret
 
@@ -464,3 +466,130 @@ def test_redirects_and_flows_are_frozen() -> None:
     flow = Flow("id", "music", Secret("s"), Secret("v" * 43), REDIRECT, 1.0)
     with pytest.raises(FrozenInstanceError):
         flow.state = Secret("x")  # type: ignore[misc]
+
+
+# --- owners (M5 design H.2) --------------------------------------------------------------------
+
+SESSION = "session:0123456789abcdef"
+OTHER_SESSION = "session:fedcba9876543210"
+
+
+def test_a_flow_belongs_to_the_cli_by_default() -> None:
+    assert CLI_OWNER == "cli"
+    flow = Flow("id", "music", Secret("s"), Secret("v" * 43), REDIRECT, 1.0)
+    assert flow.owner == "cli"
+    flows, _, _ = table()
+    assert flows.start("music", REDIRECT).owner == "cli"
+    assert flows.start("calendar", REDIRECT, owner=SESSION).owner == SESSION
+
+
+@pytest.mark.parametrize("owner", ["cli", "session:0", SESSION])
+def test_good_owners(owner: str) -> None:
+    flows, _, _ = table()
+    assert flows.start("music", REDIRECT, owner=owner).owner == owner
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "",
+        "portal",
+        "CLI",
+        "cli ",
+        "session:",
+        "session:0A",
+        "session:0g",
+        "xsession:0",
+        "session:0\n",
+    ],
+)
+def test_bad_owners_are_refused(owner: str) -> None:
+    flows, _, tokens = table()
+    with pytest.raises(ValueError, match=r"^a flow's owner is cli or session:<hex id>$"):
+        flows.start("music", REDIRECT, owner=owner)
+    assert len(flows) == 0
+    assert tokens.count == 0
+
+
+def test_surface() -> None:
+    assert surface("cli") == "cli"
+    assert surface(SESSION) == "portal"
+
+
+def test_another_owners_flow_is_unknown_and_stays() -> None:
+    flows, _, _ = table()
+    flow = flows.start("music", REDIRECT, owner=SESSION)
+    assert flows.take(flow.id, "music") is None
+    assert flows.take(flow.id, "calendar") is None
+    assert flows.take(flow.id, "music", OTHER_SESSION) is None
+    assert flows.peek(flow.id, "music") is None
+    assert flows.cancel(flow.id) is False
+    assert flows.cancel(flow.id, OTHER_SESSION) is False
+    assert len(flows) == 1
+    assert flows.take(flow.id, "music", SESSION) is flow
+    assert len(flows) == 0
+
+
+def test_a_cli_flow_is_unknown_to_a_session() -> None:
+    flows, _, _ = table()
+    flow = flows.start("music", REDIRECT)
+    assert flows.take(flow.id, "music", SESSION) is None
+    assert flows.peek(flow.id, "music", SESSION) is None
+    assert flows.cancel(flow.id, SESSION) is False
+    assert flows.take(flow.id, "music", CLI_OWNER) is flow
+
+
+def test_the_owner_cancels() -> None:
+    flows, _, _ = table()
+    flow = flows.start("music", REDIRECT, owner=SESSION)
+    assert flows.cancel(flow.id, SESSION) is True
+    assert flows.cancel(flow.id, SESSION) is False
+    assert flows.take(flow.id, "music", SESSION) is None
+
+
+def test_peek_leaves_the_flow() -> None:
+    flows, _, _ = table()
+    flow = flows.start("music", REDIRECT, owner=SESSION)
+    assert flows.peek(flow.id, "music", SESSION) is flow
+    assert flows.peek(flow.id, "music", SESSION) is flow
+    assert len(flows) == 1
+    assert flows.take(flow.id, "music", SESSION) is flow
+    assert flows.peek(flow.id, "music", SESSION) is None
+
+
+def test_peek_refuses_what_take_refuses_and_removes_nothing() -> None:
+    flows, _, _ = table()
+    flow = flows.start("music", REDIRECT)
+    assert flows.peek("unknown", "music") is None
+    # Unlike take, a peek for another credential leaves the flow.
+    assert flows.peek(flow.id, "calendar") is None
+    assert flows.peek(flow.id, "music") is flow
+    assert flows.take(flow.id, "music") is flow
+
+
+def test_peek_sees_a_flow_until_exactly_the_ttl() -> None:
+    flows, clock, _ = table()
+    flow = flows.start("music", REDIRECT)
+    clock.now = flow.expires_at - 0.001
+    assert flows.peek(flow.id, "music") is flow
+    clock.now = flow.expires_at
+    assert flows.peek(flow.id, "music") is None
+
+
+def test_owner_of_names_the_flow_a_start_would_replace() -> None:
+    flows, clock, _ = table()
+    assert flows.owner_of("music") is None
+    flows.start("calendar", REDIRECT, owner=SESSION)
+    assert flows.owner_of("music") is None
+    first = flows.start("music", REDIRECT)
+    assert flows.owner_of("music") == "cli"
+    assert flows.owner_of("calendar") == SESSION
+    # One pending flow per credential, whoever owns it.
+    second = flows.start("music", REDIRECT, owner=SESSION)
+    assert flows.owner_of("music") == SESSION
+    assert flows.take(first.id, "music") is None
+    assert len(flows) == 2
+    clock.now = second.expires_at - 0.001
+    assert flows.owner_of("music") == SESSION
+    clock.now = second.expires_at
+    assert flows.owner_of("music") is None
