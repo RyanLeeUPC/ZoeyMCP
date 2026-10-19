@@ -1,0 +1,21 @@
+[project]
+name = "example-toolkits"
+version = "0.1.0"
+description = "Example ZoeyMCP toolkits: an approved mail sender and a records batch tool."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# Nothing beyond the standard library and zoeymcp.toolkit, which the gateway image already has.
+# zoeymcp isn't listed, so installing this into the image never changes the gateway's packages.
+dependencies = []
+
+[project.entry-points."zoeymcp.toolkits"]
+mail = "example_toolkits.mail:toolkit"
+records = "example_toolkits.records:toolkit"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/example_toolkits"]

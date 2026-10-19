@@ -75,11 +75,13 @@ select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF", "PT", "C4", "PIE", "
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106"]
+"examples/toolkits/tests/**" = ["S101"]
 
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "examples/toolkits/src", "examples/toolkits/tests"]
+mypy_path = "examples/toolkits/src"
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
@@ -87,7 +89,9 @@ module = ["hypothesis.*"]
 follow_untyped_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# The example toolkits are tested in place, not installed, so uv.lock stays as it is.
+testpaths = ["tests", "examples/toolkits/tests"]
+pythonpath = ["examples/toolkits/src"]
 addopts = ["-q", "--strict-markers", "--strict-config"]
 xfail_strict = true
 

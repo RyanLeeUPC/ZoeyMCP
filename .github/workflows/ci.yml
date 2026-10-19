@@ -27,8 +27,8 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
       - run: uv sync --locked --all-extras --python 3.13
-      - run: uv run --locked ruff check src tests
-      - run: uv run --locked ruff format --check src tests
+      - run: uv run --locked ruff check src tests examples/toolkits
+      - run: uv run --locked ruff format --check src tests examples/toolkits
       - run: uv run --locked mypy
 
   test:

@@ -314,6 +314,24 @@ def test_the_toolkit_sdk_uses_only_common_and_the_standard_library() -> None:
     assert found == []
 
 
+def test_the_example_toolkits_use_only_the_sdk_common_and_the_standard_library() -> None:
+    examples = ROOT / "examples" / "toolkits" / "src"
+    found = []
+    for path in sorted(examples.rglob("*.py")):
+        for name in imported_modules(path, module_name(path, examples)):
+            top = name.partition(".")[0]
+            if top == "zoeymcp":
+                allowed = name.startswith(("zoeymcp.toolkit", "zoeymcp.common"))
+                if not allowed or name.startswith("zoeymcp.toolkit.testing"):
+                    found.append(f"{path.name}: {name}")
+            elif (
+                top not in ("example_toolkits", "__future__") and top not in sys.stdlib_module_names
+            ):
+                found.append(f"{path.name}: {name}")
+    assert found == []
+    assert len(list(examples.rglob("*.py"))) >= 4
+
+
 def test_only_the_toolkit_test_helper_imports_the_gateway() -> None:
     found = violations(PACKAGE.parent, ["toolkit"], ["zoeymcp.gateway"])
     assert found
