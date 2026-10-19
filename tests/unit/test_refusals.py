@@ -152,7 +152,21 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
     """The first argument of every ``exception(...)`` call in ``module`` that is a string, and
     the literal start of every f-string one (``exchange_failed:``)."""
     found = set()
-    for node in ast.walk(ast.parse(inspect.getsource(module))):
+    tree = ast.parse(inspect.getsource(module))
+    # Under mutmut the source also holds every mutant of each function, named with
+    # ``__mutmut_``; their arguments aren't the module's reasons.
+    for parent in ast.walk(tree):
+        body = getattr(parent, "body", None)
+        if isinstance(body, list):
+            parent.body = [  # type: ignore[attr-defined]
+                child
+                for child in body
+                if not (
+                    isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and "__mutmut_" in child.name
+                )
+            ]
+    for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
             continue
         if node.func.id != exception or not node.args:
