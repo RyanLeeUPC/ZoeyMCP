@@ -11,70 +11,22 @@ import base64
 import json
 import re
 from collections.abc import Iterable, Sequence
-from urllib.parse import parse_qsl, quote, quote_plus, unquote_to_bytes, urlencode
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode
 
+# Path normalization lives beside rule matching, so the gateway checks toolkit paths the same way
+# (M4 design H.4); the vault's request API re-exports it.
+from ..common.policy.match import MAX_PATH_BYTES as MAX_PATH_BYTES
 from ..common.policy.match import NormalizedPath, rule_matches
-from ..common.policy.paths import SEGMENT_CHARS
+from ..common.policy.match import RequestRejected as RequestRejected
+from ..common.policy.match import normalize_path as normalize_path
 from ..common.policy.schema import QueryPolicy, Rule
 
-MAX_PATH_BYTES = 4096
 MAX_QUERY_BYTES = 8192
 MAX_QUERY_FIELDS = 100
 _PERCENT = re.compile(rb"%(?![0-9A-Fa-f]{2})")
 
 
-class RequestRejected(ValueError):
-    """A request ZoeyMCP refuses. ``reason`` is for logs, never for the response body."""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
-
-
 # --- paths -------------------------------------------------------------------------------------
-
-
-def normalize_path(raw: bytes) -> NormalizedPath:
-    """Normalize a raw (still percent-encoded) request path, or raise :class:`RequestRejected`.
-
-    The path is split on ``/`` *before* decoding, so an encoded slash can never become a segment
-    boundary. Each segment is then decoded exactly once, and anything ambiguous is refused:
-    encoded slashes or backslashes, ``%`` left after decoding (double encoding), ``.``/``..``,
-    empty segments, non-ASCII, and characters outside the allowed set.
-    """
-    if len(raw) > MAX_PATH_BYTES:
-        raise RequestRejected("path too long")
-    if not raw.startswith(b"/"):
-        raise RequestRejected("path must start with '/'")
-    if any(b < 0x21 or b > 0x7E for b in raw):
-        raise RequestRejected("path has raw non-printable or non-ASCII bytes")
-    if _PERCENT.search(raw):
-        raise RequestRejected("malformed percent-encoding")
-    if raw == b"/":
-        return NormalizedPath(())
-    body = raw[1:]
-    trailing = body.endswith(b"/")
-    if trailing:
-        body = body[:-1]
-    segments: list[str] = []
-    for part in body.split(b"/"):
-        if not part:
-            raise RequestRejected("empty path segment")
-        decoded = unquote_to_bytes(part)
-        try:
-            text = decoded.decode("ascii")
-        except UnicodeDecodeError as exc:
-            raise RequestRejected("non-ASCII path segment") from exc
-        if "/" in text or "\\" in text:
-            raise RequestRejected("slash or backslash inside a path segment")
-        if "%" in text:
-            raise RequestRejected("double percent-encoding")
-        if text in (".", ".."):
-            raise RequestRejected("dot segment in path")
-        if not SEGMENT_CHARS.match(text):
-            raise RequestRejected("path segment has characters that aren't allowed")
-        segments.append(text)
-    return NormalizedPath(tuple(segments), trailing)
 
 
 def find_rule(rules: Sequence[Rule], method: str, path: NormalizedPath) -> int | None:

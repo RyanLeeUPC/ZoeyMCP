@@ -141,19 +141,31 @@ def _utf16_key(key: str) -> bytes:
     return key.encode("utf-16-be", "surrogatepass")
 
 
-def _encode(value: Any, out: list[str], indent: str | None, level: int) -> None:
+def key_order(key: str) -> bytes:
+    """The sort key for object members in the canonical form (UTF-16 code units)."""
+    return _utf16_key(key)
+
+
+def encode_scalar(value: Any) -> str:
+    """One JSON scalar (null, a boolean, a number or a string) as the canonical form writes it."""
     if value is None:
-        out.append("null")
-    elif value is True:
-        out.append("true")
-    elif value is False:
-        out.append("false")
-    elif isinstance(value, int):
-        out.append(str(value))
-    elif isinstance(value, float):
-        out.append(repr(value))
-    elif isinstance(value, str):
-        out.append(json.dumps(value, ensure_ascii=False))
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    raise JSONRejected(f"{type(value).__name__} is not a JSON scalar")
+
+
+def _encode(value: Any, out: list[str], indent: str | None, level: int) -> None:
+    if value is None or isinstance(value, bool | int | float | str):
+        out.append(encode_scalar(value))
     elif isinstance(value, list):
         _encode_container("[", "]", [(None, child) for child in value], out, indent, level)
     elif isinstance(value, dict):

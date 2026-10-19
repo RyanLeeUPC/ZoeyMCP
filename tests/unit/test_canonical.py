@@ -12,6 +12,8 @@ from zoeymcp.common.canonical import (
     JSONRejected,
     digest,
     dumps_canonical,
+    encode_scalar,
+    key_order,
     loads_strict,
     render_for_approval,
 )
@@ -158,3 +160,35 @@ def test_property_canonical_matches_stdlib_parse(value: Any) -> None:
 @given(_json)
 def test_property_rendering_parses_to_the_same_value(value: Any) -> None:
     assert loads_strict(render_for_approval(value)) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "null"),
+        (True, "true"),
+        (False, "false"),
+        (0, "0"),
+        (-12, "-12"),
+        (1.5, "1.5"),
+        (1e20, "1e+20"),
+        ('a"b', '"a\\"b"'),
+        ("café", '"café"'),
+    ],
+)
+def test_encode_scalar(value: Any, expected: str) -> None:
+    assert encode_scalar(value) == expected
+    assert dumps_canonical(value).decode() == expected
+
+
+def test_encode_scalar_refuses_containers() -> None:
+    containers: list[Any] = [[], {}, (1,)]
+    for value in containers:
+        with pytest.raises(JSONRejected, match="not a JSON scalar"):
+            encode_scalar(value)
+
+
+def test_key_order_is_utf16() -> None:
+    # Above the BMP, UTF-16 surrogates (0xD83D...) sort before U+FF5E; code points wouldn't.
+    emoji, high = chr(0x1F600), chr(0xFF5E)
+    assert sorted([emoji, high, "b", "a"], key=key_order) == ["a", "b", emoji, high]
