@@ -25,16 +25,19 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl
 
 import anyio
 import uvicorn
 from starlette.types import Receive, Scope, Send
 
-from ..common import control
+from ..common import canonical, control
+from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewRemoteServer
 from . import logs, review
 from .app import GatewayApp
 from .defstore import DefinitionStore
+from .ledger import Ledger
 from .marks import DriftMarks, MarksError
 from .upstream import UpstreamPool
 from .vaultlink import (
@@ -51,6 +54,9 @@ STOP_GRACE = 10
 KEEP_ALIVE = 5
 VERSION = "1"
 _REVIEW_PATH = re.compile(r"/review/([a-z0-9][a-z0-9_-]{0,62})(/clear)?")
+_LEDGER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_LEDGER_REF = re.compile(r"^[0-9a-f]{16}$")
+MAX_ADMIN_BODY = 2**20
 
 
 class StartupError(RuntimeError):
@@ -129,6 +135,11 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
         raise StartupError(f"drift marks: {exc} (move the file aside to start over)") from exc
     pool = UpstreamPool(link, keys, marks, DefinitionStore(options.state))
     app = GatewayApp(pool, view_client(link, keys))
+    try:
+        # The view's limit applies once the first view arrives.
+        app.ledger, _ = Ledger.open_at(options.state, max_bytes=GatewayLimits().ledger_max_bytes)
+    except OSError as exc:
+        raise StartupError(f"the approval ledger: {exc.strerror or exc}") from exc
     return Gateway(app, link, keys)
 
 
@@ -172,15 +183,20 @@ def status(app: GatewayApp) -> dict[str, Any]:
 
 
 class AdminApp:
-    """The gateway's admin socket: ``GET /status``, and ``review`` (one at a time)."""
+    """The gateway's admin socket: ``GET /status``, ``review`` (one at a time), and the
+    ledger: ``GET /ledger``, ``POST /ledger/verify`` and ``POST /ledger/check``."""
 
     def __init__(self, app: GatewayApp) -> None:
         self.app = app
         self.reviewing = anyio.Lock()
 
-    async def answer(self, method: str, path: str) -> tuple[int, dict[str, Any]]:
+    async def answer(
+        self, method: str, path: str, query: str = "", body: bytes = b""
+    ) -> tuple[int, dict[str, Any]]:
         if (method, path) == ("GET", "/status"):
             return 200, status(self.app)
+        if path == "/ledger" or path.startswith("/ledger/"):
+            return await self._ledger(method, path, query, body)
         found = _REVIEW_PATH.fullmatch(path)
         if found is None:
             return 404, {"error": "not found"}
@@ -194,10 +210,48 @@ class AdminApp:
             except review.ReviewError as exc:
                 return exc.status, exc.answer()
 
+    async def _ledger(
+        self, method: str, path: str, query: str, body: bytes
+    ) -> tuple[int, dict[str, Any]]:
+        ledger = self.app.ledger
+        if ledger is None:
+            return 503, {"error": "no approval ledger"}
+        if path == "/ledger":
+            if method != "GET":
+                return 405, {"error": "use GET"}
+            options = _ledger_query(query)
+            if isinstance(options, str):
+                return 400, {"error": options}
+            found = await anyio.to_thread.run_sync(lambda: ledger.read(**options))
+            return 200, {"records": found, "head_seq": ledger.next_seq - 1}
+        if method != "POST":
+            return 405, {"error": "use POST"}
+        if path == "/ledger/verify":
+            return 200, await anyio.to_thread.run_sync(ledger.verify)
+        if path == "/ledger/check":
+            try:
+                request = canonical.loads_strict(body, max_bytes=MAX_ADMIN_BODY)
+            except (canonical.JSONRejected, ValueError):
+                return 400, {"error": "the body must be a JSON object"}
+            ref = request.get("ref") if isinstance(request, dict) else None
+            if not isinstance(ref, str) or not _LEDGER_REF.match(ref) or "args" not in request:
+                return 400, {"error": 'send {"ref": <16 hex>, "args": <the arguments>}'}
+            args = request["args"]
+            return 200, await anyio.to_thread.run_sync(lambda: ledger.check(ref, args))
+        return 404, {"error": "not found"}
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             return
-        code, data = await self.answer(scope["method"], scope["path"])
+        body = b""
+        if scope["method"] == "POST":
+            while True:
+                message = await receive()
+                body += message.get("body", b"")
+                if len(body) > MAX_ADMIN_BODY or not message.get("more_body"):
+                    break
+        query = scope.get("query_string", b"").decode("latin-1")
+        code, data = await self.answer(scope["method"], scope["path"], query, body)
         body = json.dumps(data).encode()
         headers = [
             (b"content-type", b"application/json"),
@@ -205,6 +259,23 @@ class AdminApp:
         ]
         await send({"type": "http.response.start", "status": code, "headers": headers})
         await send({"type": "http.response.body", "body": body})
+
+
+def _ledger_query(query: str) -> dict[str, Any] | str:
+    """``GET /ledger``'s options, or what's wrong with them."""
+    options: dict[str, Any] = {}
+    for name, value in parse_qsl(query, keep_blank_values=True):
+        if name in ("after", "limit"):
+            if not re.fullmatch(r"-?[0-9]{1,12}", value):
+                return f"{name} must be a whole number"
+            options[name] = int(value)
+        elif name in ("client", "server", "tool"):
+            if not _LEDGER_NAME.match(value):
+                return f"{name} must be a policy name"
+            options[name] = value
+        else:
+            return f"unknown option {name[:32]!r}"
+    return options
 
 
 class _Server(uvicorn.Server):

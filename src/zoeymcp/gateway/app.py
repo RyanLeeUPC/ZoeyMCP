@@ -52,6 +52,7 @@ from starlette.types import Message, Receive, Scope, Send
 from ..common.policy.view import ViewGateway, ViewRemoteServer
 from . import access, logs, pipeline
 from .connstate import Era
+from .ledger import Ledger
 from .notify import Notifier
 from .policyclient import PolicyClient, Snapshot
 from .upstream import NotAdmitted, UpstreamError, UpstreamPool
@@ -219,6 +220,8 @@ class GatewayApp:
         self.sessions = access.SessionBindings(idle_timeout=1800)
         self.counters = access.ClientCounters()
         self.in_flight = pipeline.InFlight()
+        # The approval ledger, opened and recovered before the listener (M4 design F.5).
+        self.ledger: Ledger | None = None
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
@@ -261,6 +264,8 @@ class GatewayApp:
         """The policy client applied a new view (D.3)."""
         gateway = snapshot.view.gateway
         self.apply_view(gateway)
+        if self.ledger is not None:
+            self.ledger.max_bytes = gateway.limits.ledger_max_bytes
         if previous is not None:
             # Revocation is immediate: requests in flight stop, as the next one would be refused.
             for client, server in sorted(access.revoked(previous.view.gateway, gateway)):
@@ -342,6 +347,8 @@ class GatewayApp:
                 group.start_soon(self.policy.run)
                 group.start_soon(self._run_manager, first_view, stopping)
                 group.start_soon(self._watch_staleness)
+                if self.ledger is not None:
+                    group.start_soon(self.ledger.retry_forever)
                 await send({"type": "lifespan.startup.complete"})
                 await receive()  # lifespan.shutdown
                 stopping.set()

@@ -236,6 +236,44 @@ def gateway_review(
     )
 
 
+LEDGER_PAGE: Final = 10_000
+
+
+def gateway_ledger(
+    socket: str,
+    *,
+    client: str | None = None,
+    server: str | None = None,
+    tool: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> list[dict[str, Any]]:
+    """Every ledger record, oldest first, a page at a time."""
+    found: list[dict[str, Any]] = []
+    after = -1
+    while True:
+        query = {"after": str(after), "limit": str(LEDGER_PAGE)}
+        query |= {k: v for k, v in (("client", client), ("server", server), ("tool", tool)) if v}
+        path = "/ledger?" + "&".join(f"{k}={quote(v, safe='')}" for k, v in query.items())
+        page = _request(socket, "GET", path, transport=transport, role="gateway")["records"]
+        found.extend(page)
+        if len(page) < LEDGER_PAGE:
+            return found
+        after = page[-1]["seq"]
+
+
+def gateway_ledger_verify(
+    socket: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    return _request(socket, "POST", "/ledger/verify", transport=transport, role="gateway")
+
+
+def gateway_ledger_check(
+    socket: str, ref: str, args: Any, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    body = {"ref": ref, "args": args}
+    return _request(socket, "POST", "/ledger/check", body, transport=transport, role="gateway")
+
+
 def describe_binding(binding: dict[str, Any]) -> str:
     if "origins" in binding:
         return "origins " + ", ".join(binding["origins"])

@@ -28,6 +28,7 @@ from ..vault.gatewaykeys import utc
 from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
 from ..vault.oauth.pkce import FLOW_TTL
 from . import admin_client
+from . import ledger as ledger_view
 from . import review as review_view
 
 EXIT_OK = 0
@@ -299,7 +300,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     gateway_status.add_argument("server", nargs="?")
     gateway_status.add_argument("--format", choices=("text", "json"), default="text")
-    for sub in (review, gateway_status):
+    ledger = commands.add_parser(
+        "ledger",
+        help="the approval ledger: list, verify, or check a call's arguments (inside the gateway)",
+        description=(
+            "List approval ledger records, one line per call (when, ref, client, server/tool, "
+            "era, decision, outcome). --verify walks the hash chain and prints its head, to "
+            "compare with the last anchor in the logs. 'ledger check REF FILE' proves whether "
+            "FILE (JSON) holds the arguments that call was made with, without the key leaving "
+            "the gateway. Never argument values or prompt text."
+        ),
+    )
+    ledger.add_argument("action", nargs="?", metavar="check")
+    ledger.add_argument("ref", nargs="?")
+    ledger.add_argument("file", nargs="?")
+    ledger.add_argument(
+        "--since", metavar="AGE", help="only calls asked within AGE, like 7d, 12h or 30m"
+    )
+    ledger.add_argument("--client", metavar="CLIENT")
+    ledger.add_argument("--server", metavar="SERVER")
+    ledger.add_argument("--tool", metavar="TOOL")
+    ledger.add_argument("--verify", action="store_true", help="check the hash chain")
+    ledger.add_argument("--format", choices=("text", "json"), default="text")
+    for sub in (review, gateway_status, ledger):
         sub.add_argument(
             "--socket",
             metavar="PATH",
@@ -570,6 +593,52 @@ def _cmd_gateway_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> i
         review_view.write_json(status, out)
     else:
         review_view.write_lines(review_view.status_lines(status, args.server), out)
+    return EXIT_OK
+
+
+def _cmd_ledger(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    socket = admin_client.gateway_socket_path(args.socket)
+    if args.action not in (None, "check"):
+        err.write("zoeymcp ledger: the only action is 'check REF FILE'\n")
+        return EXIT_UNREADABLE
+    try:
+        if args.action == "check":
+            if args.ref is None or args.file is None:
+                err.write("zoeymcp ledger: check takes REF FILE\n")
+                return EXIT_UNREADABLE
+            try:
+                arguments = json.loads(Path(args.file).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                err.write(f"zoeymcp ledger: can't read {args.file}: {exc}\n")
+                return EXIT_UNREADABLE
+            result = admin_client.gateway_ledger_check(socket, args.ref, arguments)
+            ledger_view.write(out, ledger_view.check_lines(result))
+            return EXIT_OK if result["matches"] else EXIT_FINDINGS
+        if args.ref is not None:
+            err.write("zoeymcp ledger: a REF goes with check\n")
+            return EXIT_UNREADABLE
+        if args.verify:
+            verified = admin_client.gateway_ledger_verify(socket)
+            if args.format == "json":
+                ledger_view.write_json(out, [verified])
+            else:
+                ledger_view.write(out, ledger_view.verify_lines(verified))
+            return EXIT_OK if verified["ok"] else EXIT_FINDINGS
+        since = ledger_view.since_ms(args.since)
+        records = admin_client.gateway_ledger(
+            socket, client=args.client, server=args.server, tool=args.tool
+        )
+    except ledger_view.UsageError as exc:
+        err.write(f"zoeymcp ledger: {exc}\n")
+        return EXIT_UNREADABLE
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp ledger: {exc}\n")
+        return EXIT_UNREADABLE
+    if args.format == "json":
+        kept = [r for r in records if since is None or r["ts"] >= since]
+        ledger_view.write_json(out, kept)
+    else:
+        ledger_view.write(out, ledger_view.lines(records, since=since))
     return EXIT_OK
 
 
@@ -893,6 +962,8 @@ def main(
         return _cmd_review(args, out, err)
     if args.command == "gateway-status":
         return _cmd_gateway_status(args, out, err)
+    if args.command == "ledger":
+        return _cmd_ledger(args, out, err)
     if args.command == "login":
         return _cmd_login(args, stdin, out, err)
     if args.command == "oauth":
