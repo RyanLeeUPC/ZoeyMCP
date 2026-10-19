@@ -1,0 +1,3 @@
+# Third-party dependencies of the toolkits this image adds, one per line, unpinned: lock.sh
+# compiles them against the official image's zoeymcp-constraints.txt, with hashes. The example
+# toolkits need only the standard library, so there are none. lock.sh adds the toolkit's own wheel.

@@ -18,19 +18,31 @@ DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
 COMPOSE_FILES = sorted(DEPLOY.glob("compose*.yaml"))
 
 
-_VARIABLE = re.compile(r"\$\{([A-Z_]+)(?::-([^}]*)|:\?[^}]*)?\}")
+# An innermost ${...}: its default holds no other variable.
+_VARIABLE = re.compile(r"\$\{([A-Z_]+)(?::-([^}$]*)|:\?[^}$]*)?\}")
 
 
-def interpolated(text: str) -> str:
-    """``text`` as compose would interpolate it with nothing set: ``${NAME:-default}`` is the
-    default, and every other variable is ``set-by-the-operator``."""
-    return _VARIABLE.sub(
-        lambda m: m.group(2) if m.group(2) is not None else "set-by-the-operator", text
-    )
+def interpolated(text: str, environ: dict[str, str] | None = None) -> str:
+    """``text`` as compose would interpolate it with ``environ`` set (nothing, by default):
+    ``${NAME:-default}`` is the default, and every other unset variable is
+    ``set-by-the-operator``. Nested defaults are resolved from the inside out."""
+    given = environ or {}
+
+    def value(match: re.Match[str]) -> str:
+        if match.group(1) in given:
+            return given[match.group(1)]
+        return match.group(2) if match.group(2) is not None else "set-by-the-operator"
+
+    while True:
+        replaced = _VARIABLE.sub(value, text)
+        if replaced == text:
+            return text
+        text = replaced
 
 
-def compose(name: str) -> dict[str, Any]:
-    document = yaml.safe_load(interpolated((DEPLOY / name).read_text(encoding="utf-8")))
+def compose(name: str, environ: dict[str, str] | None = None) -> dict[str, Any]:
+    text = (DEPLOY / name).read_text(encoding="utf-8")
+    document = yaml.safe_load(interpolated(text, environ))
     assert isinstance(document, dict)
     return document
 
@@ -148,3 +160,23 @@ def test_the_stop_windows_let_approved_calls_finish() -> None:
     assert _seconds(hardened["vault"]["stop_grace_period"]) >= launcher.VAULT_STOP_WAIT
     assert hardened["gateway"]["depends_on"] == {"vault": {"condition": "service_started"}}
     assert GatewayLimits().call_timeout + 30 <= launcher.GATEWAY_STOP_WAIT
+
+
+def test_a_derived_gateway_image_runs_beside_the_official_vault() -> None:
+    """M4 design I.3: the gateway's image can differ; unset, both run ZOEYMCP_IMAGE."""
+    services = compose("compose.hardened.yaml")["services"]
+    assert services["gateway"]["image"] == services["vault"]["image"] == "zoeymcp:local"
+    official = {"ZOEYMCP_IMAGE": "zoeymcp@sha256:" + "1" * 64}
+    services = compose("compose.hardened.yaml", official)["services"]
+    assert services["gateway"]["image"] == services["vault"]["image"] == official["ZOEYMCP_IMAGE"]
+    derived = {**official, "ZOEYMCP_GATEWAY_IMAGE": "zoeymcp-derived@sha256:" + "2" * 64}
+    services = compose("compose.hardened.yaml", derived)["services"]
+    assert services["vault"]["image"] == official["ZOEYMCP_IMAGE"]
+    assert services["gateway"]["image"] == derived["ZOEYMCP_GATEWAY_IMAGE"]
+
+
+def test_interpolation_resolves_nested_defaults() -> None:
+    assert interpolated("${A:-${B:-x}}") == "x"
+    assert interpolated("${A:-${B:-x}}", {"B": "b"}) == "b"
+    assert interpolated("${A:-${B:-x}}", {"A": "a"}) == "a"
+    assert interpolated("${A:?say so}") == "set-by-the-operator"

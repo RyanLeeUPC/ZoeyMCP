@@ -1,10 +1,17 @@
 #!/bin/sh
 # Smoke-test a built image: the vault the way the hardened tier runs it (read-only, no capabilities,
 # no-new-privileges, non-root), then the standard tier from deploy/compose.yaml.
-# Usage: scripts/smoke-image.sh IMAGE
+# With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
+# compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
+# Usage: scripts/smoke-image.sh [--derived OFFICIAL] IMAGE
 set -eu
 
-image="${1:?usage: smoke-image.sh IMAGE}"
+official=""
+if [ "${1:-}" = "--derived" ]; then
+    official="${2:?usage: smoke-image.sh [--derived OFFICIAL] IMAGE}"
+    shift 2
+fi
+image="${1:?usage: smoke-image.sh [--derived OFFICIAL] IMAGE}"
 name="zoeymcp-smoke-$$"
 volume="zoeymcp-smoke-state-$$"
 project="zoeymcp-smoke-$$"
@@ -65,6 +72,12 @@ in_env() {
     shift
     docker run --rm --network none --entrypoint "$env_dir/bin/python" "$image" -I "$@"
 }
+# The same, in the official image: in_official DIR ARGS...
+in_official() {
+    env_dir="$1"
+    shift
+    docker run --rm --network none --entrypoint "$env_dir/bin/python" "$official" -I "$@"
+}
 # Prints which of the modules named in its arguments can be imported.
 importable='
 import importlib, sys
@@ -115,9 +128,72 @@ gateway_only="$gateway_only rpds sse_starlette opentelemetry jwt multipart pytho
 gateway_only="$gateway_only truststore attr attrs"
 allowed_pth="_virtualenv.pth"
 
+# Prints name==version for every installed distribution.
+versions='
+import importlib.metadata as metadata, re
+found = {(re.sub(r"[-_.]+", "-", d.metadata["Name"]).lower(), d.version) for d in metadata.distributions()}
+print(" ".join(f"{n}=={v}" for n, v in sorted(found)))
+'
+# Prints the top-level modules of the named distributions that another distribution also has.
+shadowing='
+import importlib.metadata as metadata, re, sys
+mine = set(sys.argv[1:])
+owners = {}
+for top, dists in metadata.packages_distributions().items():
+    for dist in dists:
+        owners.setdefault(top, set()).add(re.sub(r"[-_.]+", "-", dist).lower())
+print(" ".join(sorted(t for t, o in owners.items() if o & mine and o - mine)))
+'
+
+if [ -n "$official" ]; then
+    step "derived: the vault's environment is the official one; the gateway's adds only toolkits"
+    [ "$(in_env /opt/zoeymcp -c "$versions")" = "$(in_official /opt/zoeymcp -c "$versions")" ] \
+        || fail "the vault's environment differs from the official image's"
+    official_gateway="$(in_official /opt/zoeymcp-gateway -c "$versions")"
+    derived_gateway="$(in_env /opt/zoeymcp-gateway -c "$versions")"
+    for pinned in $official_gateway; do
+        case " $derived_gateway " in
+            *" $pinned "*) ;;
+            *) fail "the gateway's environment lost or changed $pinned" ;;
+        esac
+    done
+    extras=""
+    for pinned in $derived_gateway; do
+        case " $official_gateway " in
+            *" $pinned "*) ;;
+            *) extras="$extras ${pinned%%==*}" ;;
+        esac
+    done
+    [ -n "$extras" ] || fail "the derived image adds no distribution"
+    vault_dists="$(in_env /opt/zoeymcp -c "$distributions")"
+    for dist in $extras; do
+        case " $vault_dists " in
+            *" $dist "*) fail "the vault's environment has the toolkit distribution $dist" ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    found="$(in_env /opt/zoeymcp-gateway -c "$shadowing" $extras)"
+    [ -z "$found" ] || fail "a toolkit distribution shadows an official module: $found"
+    found="$(in_env /opt/zoeymcp -c "$importable" example_toolkits)"
+    [ -z "$found" ] || fail "the vault's environment can import the example toolkits"
+    entry_points='
+import importlib.metadata as metadata
+print(" ".join(sorted(e.value for e in metadata.entry_points(group="zoeymcp.toolkits"))))
+'
+    [ "$(in_env /opt/zoeymcp-gateway -c "$entry_points")" \
+        = "example_toolkits.mail:toolkit example_toolkits.records:toolkit" ] \
+        || fail "the zoeymcp.toolkits entry points aren't the example toolkits"
+fi
+
 step "two environments: the vault's has none of the gateway's packages"
 vault_dists="$(in_env /opt/zoeymcp -c "$distributions")"
 gateway_dists="$(in_env /opt/zoeymcp-gateway -c "$distributions")"
+if [ -n "$official" ]; then
+    # The derived image's extra distributions are checked above, against the official image.
+    official_only="$(in_official /opt/zoeymcp-gateway -c "$distributions")"
+    gateway_dists=""
+    for dist in $official_only; do gateway_dists="$gateway_dists $dist"; done
+fi
 for dist in $gateway_only_dists; do
     case " $vault_dists " in
         *" $dist "*) fail "the vault's environment has $dist installed" ;;
@@ -170,6 +246,33 @@ for env in /opt/zoeymcp /opt/zoeymcp-gateway; do
 done
 found="$(in_env /opt/zoeymcp-gateway -c "$importable" opentelemetry.sdk)"
 [ -z "$found" ] || fail "the OpenTelemetry SDK can be imported"
+
+if [ -n "$official" ]; then
+    step "derived: the example toolkit loads as the gateway's uid, origin checked, pinned as committed"
+    load='
+import json
+from zoeymcp.common.policy import parse_policy
+from zoeymcp.common.policy.view import build_view
+from zoeymcp.gateway.marks import DriftMarks
+from zoeymcp.gateway.toolkits import Loaded, Toolkits
+from zoeymcp.gateway.vaultlink import parse_link
+import tempfile
+from pathlib import Path
+policy = parse_policy(open("/examples/policy.yaml").read(), "example")
+toolkits = Toolkits(parse_link("unix:/run/none.sock"), None, DriftMarks.load(Path(tempfile.mkdtemp())))
+toolkits.apply(build_view(policy).gateway)
+found = toolkits.get("mail")
+assert isinstance(found, Loaded), found
+print(json.dumps({n: e.pin for n, e in found.evaluation.exposed.items()}, sort_keys=True))
+'
+    found="$(docker run --rm --network none -u 10002:10002 -v "$examples:/examples:ro" \
+        --entrypoint /opt/zoeymcp-gateway/bin/python "$image" -I -c "$load")" \
+        || fail "the example mail toolkit didn't load in the derived gateway"
+    expected="$(sed -n 's/^ *send_note: \(sha256:[0-9a-f]*\)$/{"send_note": "\1"}/p' "$examples/policy.yaml")"
+    found="$(printf '%s
+' "$found" | tail -n 1)"  # after the toolkit_loaded log line
+    [ "$found" = "$expected" ] || fail "the loaded pins $found aren't the committed $expected"
+fi
 
 step "users, directories, and no setuid or setgid files"
 expected="$(printf '%s\n' \

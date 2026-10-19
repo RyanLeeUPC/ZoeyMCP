@@ -31,6 +31,10 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/zoeymcp \
     uv sync --locked --no-dev --no-editable \
  && UV_PROJECT_ENVIRONMENT=/opt/zoeymcp-gateway \
     uv sync --locked --no-dev --no-editable --extra gateway
+# What a derived image compiles its toolkits against, so a toolkit's dependency can never move one
+# of the gateway's (examples/derived-image).
+RUN uv pip freeze --python /opt/zoeymcp-gateway/bin/python \
+        > /opt/zoeymcp-gateway/zoeymcp-constraints.txt
 
 FROM base
 ARG SOURCE_REVISION=unknown

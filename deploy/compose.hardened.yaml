@@ -123,7 +123,8 @@ services:
 
   gateway:
     <<: *hardened
-    image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
+    # A derived image with toolkits (examples/derived-image) runs here; the vault stays official.
+    image: ${ZOEYMCP_GATEWAY_IMAGE:-${ZOEYMCP_IMAGE:-zoeymcp:local}}
     command: [gateway, --vault, "http://vault:8080", --listen, "0.0.0.0:8090"]
     user: "10002:10002"
     # An approved call already running finishes (default call_timeout 300 s) and its outcome is

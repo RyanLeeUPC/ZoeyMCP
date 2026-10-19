@@ -67,3 +67,13 @@ jobs:
           test "$tree" = "$(git rev-parse 'HEAD^{tree}')"
       - name: Smoke test (hardened vault, standard tier)
         run: sh scripts/smoke-image.sh zoeymcp:ci
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Derived image with the example toolkits, verified against the official one
+        run: |
+          sh examples/derived-image/lock.sh zoeymcp:ci
+          docker build -f examples/derived-image/Dockerfile \
+            --build-context toolkit=examples/toolkits/dist \
+            --build-arg OFFICIAL=zoeymcp:ci -t zoeymcp-derived:ci examples/derived-image
+          sh examples/derived-image/verify.sh zoeymcp:ci zoeymcp-derived:ci
