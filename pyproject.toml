@@ -112,6 +112,7 @@ only_mutate = [
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/approvaltext.py",
     "*zoeymcp/common/ledgerformat.py",
+    "*zoeymcp/common/ledgerjoin.py",
     "*zoeymcp/common/files.py",
     "*zoeymcp/common/policy/check.py",
     "*zoeymcp/common/policy/match.py",
@@ -146,3 +147,4 @@ also_copy = ["deploy", "examples", "profiles", "tests"]
 # Per-module minimum mutation scores, checked by scripts/mutation-gate.py on top of the overall
 # minimum: a glob over dotted module names to a percentage, like "zoeymcp.portal.*" = 90.
 [tool.zoeymcp.mutation-floors]
+"zoeymcp.common.ledgerjoin" = 90

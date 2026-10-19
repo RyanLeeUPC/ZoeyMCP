@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from tests.gateway.test_ledger import REF_A, REF_B, Clock, call
+from tests.unit import test_ledgerjoin as joined
 from zoeymcp.cli import admin_client
 from zoeymcp.cli import ledger as ledger_view
 from zoeymcp.cli.main import main
@@ -109,6 +110,36 @@ def test_one_line_per_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert first.endswith(f"{REF_A} agent1 mail/send_note legacy accept ok")
     assert second.endswith(f"{REF_B} agent2 mail/send_note legacy decline not_sent")
     assert first.startswith("2026-01-01 ")
+
+
+def test_the_text_output_is_pinned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert run(monkeypatch, admin_for(built(tmp_path))) == (
+        0,
+        f"2026-01-01 14:00:00Z {REF_A} agent1 mail/send_note legacy accept ok\n"
+        f"2026-01-01 14:00:00Z {REF_B} agent2 mail/send_note legacy decline not_sent\n",
+        "",
+    )
+
+
+# The CLI's text for every shape common/ledgerjoin.py meets, as it printed before the join moved
+# there (M5 step 4a): the output is unchanged byte for byte.
+GOLDEN = (
+    "2026-01-01 13:59:00Z ledger repaired torn_bytes=7\n"
+    "2026-01-01 14:00:00Z 000000000000000a agent1 mail/send_note legacy accept ok (sent)\n"
+    "2026-01-01 14:00:01Z 000000000000000b agent2 mail/send_note modern decline not_sent\n"
+    "2026-01-01 14:01:01Z 000000000000000c agent1 mail/list_notes legacy - -\n"
+    "2026-01-01 15:00:00Z 000000000000000d agent1 mail/send_note legacy approved_elsewhere -\n"
+    "2026-01-02 14:00:00Z ledger recovered abandoned=1 not_sent=1 unknown=0\n"
+)
+
+
+def test_the_joined_lines_are_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(admin_client, "gateway_ledger", lambda *_, **__: list(joined.RECORDS))
+    out, err = io.StringIO(), io.StringIO()
+    code = main(["ledger"], stdin=io.StringIO(), out=out, err=err)
+    assert (code, out.getvalue(), err.getvalue()) == (0, GOLDEN, "")
+    since = ledger_view.lines(joined.RECORDS, since=joined.T + 1)
+    assert since == GOLDEN.splitlines()[2:]
 
 
 def test_filters_go_to_the_gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

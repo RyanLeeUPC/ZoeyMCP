@@ -1,9 +1,9 @@
 """``zoeymcp ledger``: the approval ledger, read through the gateway's admin socket (M4 design F.4).
 
-The default output joins each ref's records into one line: when it was asked, the ref, the client,
-``server/tool``, the era, the decision and the outcome. ``--format json`` prints the records
-themselves, keyed digests included. Nothing here imports the gateway: the CLI may run in the
-vault's environment.
+The default output renders each ref's records, joined by :mod:`zoeymcp.common.ledgerjoin`, as one
+line: when it was asked, the ref, the client, ``server/tool``, the era, the decision and the
+outcome. ``--format json`` prints the records themselves, keyed digests included. Nothing here
+imports the gateway: the CLI may run in the vault's environment.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, TextIO
+
+from ..common import ledgerjoin
 
 _SINCE = re.compile(r"^([0-9]{1,6})([mhd])$")
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
@@ -42,29 +44,14 @@ def _when(ts: int) -> str:
 
 def lines(records: Iterable[dict[str, Any]], *, since: int | None = None) -> list[str]:
     """One line per ref, in the order each was asked, and one per ledger-level record."""
-    calls: dict[str, dict[str, Any]] = {}
-    order: list[tuple[str, Any]] = []
-    for record in records:
-        ref, kind = record.get("ref"), record.get("kind")
-        if ref is None:
-            if since is None or record["ts"] >= since:
-                order.append(("ledger", record))
-            continue
-        if kind == "asked":
-            if since is not None and record["ts"] < since:
-                continue
-            calls[ref] = {"asked": record}
-            order.append(("call", ref))
-        elif ref in calls and isinstance(kind, str):
-            calls[ref][kind] = record
     out = []
-    for what, item in order:
-        if what == "ledger":
-            fields = {k: v for k, v in item.items() if k not in _COMMON}
+    for entry in ledgerjoin.join(records, since=since):
+        if not isinstance(entry, ledgerjoin.Call):
+            fields = {k: v for k, v in entry.items() if k not in _COMMON}
             detail = " ".join(f"{k}={v}" for k, v in sorted(fields.items()))
-            out.append(f"{_when(item['ts'])} ledger {item['kind']} {detail}".rstrip())
+            out.append(f"{_when(entry['ts'])} ledger {entry['kind']} {detail}".rstrip())
             continue
-        call = calls[item]
+        call = entry.records
         asked = call["asked"]
         decided = call.get("decided", {}).get("decision", "-")
         outcome = call.get("outcome")
@@ -72,7 +59,7 @@ def lines(records: Iterable[dict[str, Any]], *, since: int | None = None) -> lis
         if outcome is not None and outcome.get("detail"):
             result += f" ({outcome['detail']})"
         out.append(
-            f"{_when(asked['ts'])} {item} {asked['client']} {asked['server']}/{asked['tool']} "
+            f"{_when(asked['ts'])} {entry.ref} {asked['client']} {asked['server']}/{asked['tool']} "
             f"{asked['era']} {decided} {result}"
         )
     return out
