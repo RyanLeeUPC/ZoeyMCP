@@ -17,7 +17,7 @@ tokens minted with it may go to.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from ..common.policy.schema import (
     BasicCredential,
@@ -33,8 +33,21 @@ from .store import canonical_origin, origin_binding, smtp_binding
 VAULT_PREFIX: Final = "oauth."
 
 
+BindingReason = Literal["unbound", "no_route", "orphan_slot", "conflict", "not_oauth"]
+
+
 class BindingError(ValueError):
-    """The policy doesn't say how a secret is used, or says two incompatible things."""
+    """The policy doesn't say how a secret is used, or says two incompatible things.
+
+    ``reason`` is stable, for callers that answer each case in their own words (M5 design G):
+    ``unbound`` (nothing uses ``store:NAME``), ``no_route`` (an OAuth secret or credential no route
+    uses), ``orphan_slot`` (a vault-managed name no credential keeps its live token in),
+    ``conflict`` (two incompatible uses) and ``not_oauth`` (not an oauth2 credential).
+    """
+
+    def __init__(self, message: str, reason: BindingReason) -> None:
+        super().__init__(message)
+        self.reason: BindingReason = reason
 
 
 def live_slot(credential: str) -> str:
@@ -68,12 +81,13 @@ def derive_oauth_binding(policy: Policy, credential: str) -> dict[str, Any]:
     """The binding of an oauth2 credential's grant: its token endpoint and its routes."""
     cred = policy.credentials.get(credential)
     if not isinstance(cred, OAuth2Credential):
-        raise BindingError(f"{credential!r} is not an oauth2 credential")
+        raise BindingError(f"{credential!r} is not an oauth2 credential", "not_oauth")
     resources = _route_origins(policy, credential)
     if not resources:
         raise BindingError(
             f"no route uses credential {credential!r}; there is nothing to bind its access "
-            "tokens to"
+            "tokens to",
+            "no_route",
         )
     return oauth_binding(cred.token_url, resources)
 
@@ -109,20 +123,26 @@ def derive_binding(policy: Policy, name: str) -> dict[str, Any]:
             raise BindingError(
                 f"{name!r} is an OAuth secret of {', '.join(oauth)} and is also used by another "
                 "credential or a connector; an OAuth secret must never be injectable as a "
-                "static secret"
+                "static secret",
+                "conflict",
             )
         return _shared_oauth_binding(policy, name, oauth)
     if smtp and origins:
-        raise BindingError(f"{name!r} is used both by a connector and by HTTP credentials")
+        raise BindingError(
+            f"{name!r} is used both by a connector and by HTTP credentials", "conflict"
+        )
     if smtp:
         if any(b != smtp[0] for b in smtp):
-            raise BindingError(f"{name!r} is used by connectors with different constraints")
+            raise BindingError(
+                f"{name!r} is used by connectors with different constraints", "conflict"
+            )
         return smtp[0]
     if origins:
         return origin_binding(sorted(origins))
     raise BindingError(
         f"the policy doesn't use store:{name} on any route or connector; "
-        "pass --origin to bind it explicitly"
+        "pass --origin to bind it explicitly",
+        "unbound",
     )
 
 
@@ -134,7 +154,8 @@ def _shared_oauth_binding(
     if len(tokens) > 1:
         raise BindingError(
             f"{name!r} would be sent to the token endpoints {', '.join(sorted(tokens))}; "
-            "an OAuth secret is bound to one"
+            "an OAuth secret is bound to one",
+            "conflict",
         )
     resources: set[str] = set()
     for cred_name in oauth:
@@ -142,7 +163,8 @@ def _shared_oauth_binding(
     if not resources:
         raise BindingError(
             f"no route uses {', '.join(oauth)}; there is nothing to bind the access tokens "
-            f"minted with {name!r} to"
+            f"minted with {name!r} to",
+            "no_route",
         )
     return oauth_binding(next(iter(oauth.values())).token_url, resources)
 
@@ -152,7 +174,8 @@ def _live_slot_owner(policy: Policy, name: str) -> str:
         if isinstance(cred, OAuth2Credential) and _is_seeded(cred) and live_slot(cred_name) == name:
             return cred_name
     raise BindingError(
-        f"{name!r} is managed by the vault, and no credential keeps its live refresh token there"
+        f"{name!r} is managed by the vault, and no credential keeps its live refresh token there",
+        "orphan_slot",
     )
 
 

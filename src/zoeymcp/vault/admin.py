@@ -7,9 +7,11 @@ uid (or root, which already has the host) can connect. The CLI reaches it with
 
 There is deliberately no endpoint that returns a secret value.
 
-Secrets an oauth2 credential uses are written and deleted through the token manager, which first
-waits for any refresh of that slot (design D.12). If the store can't write its file, the change
-is kept in memory and the answer is a 500 that says so (B.4).
+``PUT/DELETE /secrets/{name}`` decide with :mod:`.secretplan` and write with :mod:`.secretops`,
+which the portal shares (M5 design G). Secrets an oauth2 credential uses are written and deleted
+through the token manager, which first waits for any refresh of that slot (design D.12). If the
+store can't write its file, the change is kept in memory and the answer is a 500 that says so
+(B.4).
 
 ``zoeymcp gateway-key`` prints the gateway key and any rotation pending; ``--retire-previous``
 retires the previous key at once (M3 design C.2).
@@ -28,7 +30,6 @@ import hmac
 import json
 import math
 import os
-import re
 import secrets
 import stat
 import sys
@@ -48,23 +49,19 @@ from starlette.routing import Route
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy.schema import Policy
-from ..common.textrules import find_violations
-from . import logs
-from .bindings import VAULT_PREFIX, BindingError, derive_binding, oauth_secret_names
+from . import logs, secretops, secretplan
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import KeySet
 from .oauth.login import LoginError, LoginService
 from .oauth.tokens import TokenManager
-from .store import SecretStore, StoreWriteError, origin_binding
+from .secretplan import NOT_WRITTEN as NOT_WRITTEN
+from .secretplan import SecretRefusal
+from .store import SecretStore
 
 SETUP_FILE = "setup.json"
 SETUP_CODE_TTL = 15 * 60
 MAX_BODY = 128 * 1024
 MAX_COMPLETE_BODY = 8 * 1024
-
-# The same shape as the name in a store: reference.
-_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
-NOT_WRITTEN = "kept in memory, not written to disk; check the state volume"
 NO_TOKENS = "OAuth needs the vault's token manager"
 NO_GATEWAY_KEYS = "the vault keeps no gateway key state"
 # Login reasons answered with something other than 400.
@@ -137,6 +134,10 @@ class SetupCodes:
 
 def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
+
+
+def _refused(refusal: SecretRefusal) -> JSONResponse:
+    return _error(refusal.status, refusal.message)
 
 
 def _login_error(exc: LoginError) -> JSONResponse:
@@ -219,10 +220,10 @@ class AdminApp:
 
     async def _put(self, request: Request) -> Response:
         name = request.path_params["name"]
-        if not _NAME.match(name):
-            return _error(400, "invalid secret name")
-        if name.startswith(VAULT_PREFIX):
-            return _error(409, "managed by the vault; use zoeymcp login")
+        # The name first: a bad one is refused whatever the body.
+        refusal = secretplan.check_name(name)
+        if refusal is not None:
+            return _refused(refusal)
         body = await request.body()
         if len(body) > MAX_BODY:
             return _error(413, "body too large")
@@ -230,50 +231,20 @@ class AdminApp:
             data: Any = json.loads(body)
         except ValueError:
             return _error(400, "body must be JSON")
-        if not isinstance(data, dict) or not set(data) <= {"value", "origins"}:
-            return _error(400, "expected {value, origins?}")
-        value = data.get("value")
-        if not isinstance(value, str) or not value:
-            return _error(400, "value must be a non-empty string")
-        if find_violations(value, max_chars=65536, single_line=True, allow_tabs=False):
-            return _error(400, "value has line breaks, control or invisible characters")
-        origins = data.get("origins")
-        oauth = name in oauth_secret_names(self._policy())
-        try:
-            if origins is not None:
-                if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins):
-                    return _error(400, "origins must be a list of URLs")
-                if oauth:
-                    return _error(409, "OAuth secrets are bound by the policy; drop --origin")
-                binding = origin_binding(origins)
-                self._store.put(name, value, binding)
-            elif oauth and self._tokens is not None:
-                binding = await self._tokens.replace_secret(name, value)
-            else:
-                binding = derive_binding(self._policy(), name)
-                self._store.put(name, value, binding)
-        except StoreWriteError as exc:
-            logs.event("secret_set", name=name, persisted=False, error_type=type(exc).__name__)
-            return _error(500, NOT_WRITTEN)
-        except (BindingError, ValueError) as exc:
-            return _error(409, str(exc))
-        logs.event("secret_set", name=name, binding=binding)
+        plan = secretplan.plan_put(name, data, self._policy())
+        if isinstance(plan, SecretRefusal):
+            return _refused(plan)
+        binding = await secretops.put(self._store, self._tokens, plan, via="socket")
+        if isinstance(binding, SecretRefusal):
+            return _refused(binding)
         return JSONResponse({"name": name, "binding": binding})
 
     async def _delete(self, request: Request) -> Response:
-        name = request.path_params["name"]
-        try:
-            if name in oauth_secret_names(self._policy()) and self._tokens is not None:
-                existed = await self._tokens.forget(name)
-            else:
-                existed = self._store.delete(name)
-        except StoreWriteError as exc:
-            logs.event("secret_deleted", name=name, persisted=False, error_type=type(exc).__name__)
-            return _error(500, NOT_WRITTEN)
-        if not existed:
-            return _error(404, "no such secret")
-        logs.event("secret_deleted", name=name)
-        return JSONResponse({"name": name, "deleted": True})
+        plan = secretplan.plan_delete(request.path_params["name"], self._policy())
+        refusal = await secretops.delete(self._store, self._tokens, plan, via="socket")
+        if refusal is not None:
+            return _refused(refusal)
+        return JSONResponse({"name": plan.name, "deleted": True})
 
     async def _setup_code(self, request: Request) -> Response:
         code, expires = self._setup.issue()

@@ -89,9 +89,10 @@ def policy(
     )
 
 
-def binding_error(p: Policy, name: str) -> str:
+def binding_error(p: Policy, name: str, reason: str) -> str:
     with pytest.raises(BindingError) as info:
         derive_binding(p, name)
+    assert info.value.reason == reason
     return str(info.value)
 
 
@@ -160,11 +161,14 @@ def test_connectors_with_the_same_constraints_share_a_secret() -> None:
 
 def test_connectors_with_different_constraints_are_refused() -> None:
     p = policy({}, [], {"one": smtp("store:pass"), "two": smtp("store:pass", to="c@mail.example")})
-    assert binding_error(p, "pass") == "'pass' is used by connectors with different constraints"
+    assert (
+        binding_error(p, "pass", "conflict")
+        == "'pass' is used by connectors with different constraints"
+    )
 
 
 def test_unreferenced_secret_needs_an_explicit_origin() -> None:
-    assert binding_error(example_policy(), "nobody-uses-this") == (
+    assert binding_error(example_policy(), "nobody-uses-this", "unbound") == (
         "the policy doesn't use store:nobody-uses-this on any route or connector; "
         "pass --origin to bind it explicitly"
     )
@@ -173,7 +177,7 @@ def test_unreferenced_secret_needs_an_explicit_origin() -> None:
 def test_conflicting_uses_are_refused() -> None:
     raw = example_policy().model_dump(by_alias=True)
     raw["credentials"]["music-stats"]["secret"] = "store:mail-pass"
-    assert binding_error(Policy.model_validate(raw), "mail-pass") == (
+    assert binding_error(Policy.model_validate(raw), "mail-pass", "conflict") == (
         "'mail-pass' is used both by a connector and by HTTP credentials"
     )
 
@@ -273,7 +277,7 @@ def test_different_token_origins_are_refused(other_url: str, other: str) -> None
         },
         [("music", "https://api.example"), ("files", "https://api.example")],
     )
-    assert binding_error(p, "client") == (
+    assert binding_error(p, "client", "conflict") == (
         f"'client' would be sent to the token endpoints {TOKEN}, {other}; "
         "an OAuth secret is bound to one"
     )
@@ -303,7 +307,7 @@ def test_an_oauth_secret_is_never_also_a_static_secret(
         [("music", "https://api.example"), *static_routes],
         connectors,
     )
-    assert binding_error(p, "s") == (
+    assert binding_error(p, "s", "conflict") == (
         "'s' is an OAuth secret of music and is also used by another credential or a "
         "connector; an OAuth secret must never be injectable as a static secret"
     )
@@ -318,7 +322,7 @@ def test_a_mixed_use_names_every_oauth_user() -> None:
         },
         [("music", "https://api.example"), ("files", "https://files.example")],
     )
-    assert binding_error(p, "s") == (
+    assert binding_error(p, "s", "conflict") == (
         "'s' is an OAuth secret of music, files and is also used by another credential or a "
         "connector; an OAuth secret must never be injectable as a static secret"
     )
@@ -333,11 +337,11 @@ def test_an_oauth_secret_with_no_route_is_refused() -> None:
         },
         [("stats", "https://stats.example")],
     )
-    assert binding_error(p, "client") == (
+    assert binding_error(p, "client", "no_route") == (
         "no route uses music, files; there is nothing to bind the access tokens minted with "
         "'client' to"
     )
-    assert binding_error(p, "music-refresh") == (
+    assert binding_error(p, "music-refresh", "no_route") == (
         "no route uses music; there is nothing to bind the access tokens minted with "
         "'music-refresh' to"
     )
@@ -397,13 +401,13 @@ def test_a_live_slot_binds_like_its_credential() -> None:
     ],
 )
 def test_other_vault_managed_names_are_refused(name: str) -> None:
-    assert binding_error(seeded_policy(), name) == (
+    assert binding_error(seeded_policy(), name, "orphan_slot") == (
         f"{name!r} is managed by the vault, and no credential keeps its live refresh token there"
     )
 
 
 def test_a_live_slot_with_no_route_is_refused() -> None:
-    assert binding_error(seeded_policy(), "oauth.unrouted.live") == (
+    assert binding_error(seeded_policy(), "oauth.unrouted.live", "no_route") == (
         "no route uses credential 'unrouted'; there is nothing to bind its access tokens to"
     )
 
@@ -420,6 +424,7 @@ def test_derive_oauth_binding_per_credential() -> None:
         with pytest.raises(BindingError) as info:
             derive_oauth_binding(p, name)
         assert str(info.value) == f"{name!r} is not an oauth2 credential"
+        assert info.value.reason == "not_oauth"
 
 
 def test_oauth_binding_is_canonical() -> None:

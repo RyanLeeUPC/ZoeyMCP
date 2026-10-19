@@ -102,6 +102,7 @@ only_mutate = [
     "*zoeymcp/vault/request.py",
     "*zoeymcp/vault/store.py",
     "*zoeymcp/vault/bindings.py",
+    "*zoeymcp/vault/secretplan.py",
     "*zoeymcp/vault/oauth/protocol.py",
     "*zoeymcp/vault/oauth/pkce.py",
     "*zoeymcp/vault/oauth/tokens.py",
@@ -148,3 +149,4 @@ also_copy = ["deploy", "examples", "profiles", "tests"]
 # minimum: a glob over dotted module names to a percentage, like "zoeymcp.portal.*" = 90.
 [tool.zoeymcp.mutation-floors]
 "zoeymcp.common.ledgerjoin" = 90
+"zoeymcp.vault.secretplan" = 90

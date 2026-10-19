@@ -641,6 +641,7 @@ async def test_a_failed_write_is_a_500_and_kept_in_memory(
             "name": name,
             "persisted": False,
             "error_type": "StoreWriteError",
+            "via": "socket",
         },
         {
             "ts": failed[1]["ts"],
@@ -649,12 +650,39 @@ async def test_a_failed_write_is_a_500_and_kept_in_memory(
             "name": name,
             "persisted": False,
             "error_type": "StoreWriteError",
+            "via": "socket",
         },
     ]
     assert "v-123456" not in buffer.getvalue()
     failing_writes[0] = False
     rig.store.flush()
     assert not rig.store.dirty
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["music-stats", "broker-refresh"])
+async def test_secret_logs_say_the_socket_asked(tmp_path: Path, name: str) -> None:
+    rig = AdminRig(tmp_path)
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        put = await rig.call("PUT", f"/secrets/{name}", {"value": "v-123456"})
+        assert (await rig.call("DELETE", f"/secrets/{name}")).status_code == 200
+    finally:
+        logs.set_stream(None)
+    lines = [json.loads(line) for line in buffer.getvalue().splitlines()]
+    events = [line for line in lines if line["event"] in ("secret_set", "secret_deleted")]
+    assert [{k: v for k, v in line.items() if k != "ts"} for line in events] == [
+        {
+            "role": "vault",
+            "event": "secret_set",
+            "name": name,
+            "binding": put.json()["binding"],
+            "via": "socket",
+        },
+        {"role": "vault", "event": "secret_deleted", "name": name, "via": "socket"},
+    ]
     await rig.token_client.aclose()
 
 
