@@ -57,9 +57,11 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutation-shard-${{ matrix.shard }}
+          # The .meta files hold each mutant's run time: the source for mutation-shard.py's weights.
           path: |
             stats-${{ matrix.shard }}.json
             survivors.txt
+            mutants/src/**/*.meta
           retention-days: 14
 
   gate:
