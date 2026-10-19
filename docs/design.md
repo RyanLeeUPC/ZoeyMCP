@@ -1,8 +1,9 @@
 # ZoeyMCP design
 
-Status: **draft for review**. M1 (the vault core), M2 (OAuth in the vault, `zoeymcp login`) and
-M3 (the gateway for remote MCP servers, both deployment tiers, `zoeymcp review`) are built;
-everything else here is not yet. Operating the built parts is in [operations.md](operations.md),
+Status: **draft for review**. M1 (the vault core), M2 (OAuth in the vault, `zoeymcp login`), M3
+(the gateway for remote MCP servers, both deployment tiers, `zoeymcp review`) and M4 (approvals
+through elicitation, the approval ledger, the SMTP connector, toolkits and the derived image) are
+built; everything else here is not yet. Operating the built parts is in [operations.md](operations.md),
 and the threat model in [threat-model.md](threat-model.md).
 
 ZoeyMCP is a self-hosted proxy that lets AI agents use outside services and MCP servers **without
@@ -85,11 +86,11 @@ say so.
 | --- | --- | --- |
 | R40 | A tool marked **consequential** runs only after the operator approves the **exact arguments**, rendered by gateway code, not by text the model wrote | Must |
 | R41 | Approvals **fail closed**: no reply channel, timeout, error, or a client without elicitation support all mean declined. An approval covers **one call**, and nothing persists | Must |
-| R42 | The rendered approval **can't hide content**: plain text only, Unicode format characters (category Cf: zero-width, bidi overrides, tags) and control characters rejected, and the whole text under a configurable budget (default 3,000 characters). If it doesn't fit, the call is refused rather than truncated | Must |
+| R42 | The rendered approval **can't hide content**: plain text only, Unicode format characters (category Cf: zero-width, bidi overrides, tags) and control characters other than newline and tab rejected, as are wide runs of spaces, stacked combining marks and, for clients that render Markdown (per client `renders`), code fences, HTML and links; the whole text under a configurable budget (default 3,000 characters). If it doesn't fit, the call is refused rather than truncated | Must |
 | R43 | The arguments executed are **byte-identical** to the arguments shown | Must |
-| R44 | One pending approval per tool per client: a second call while one waits is refused, so prompts can't be merged or confused | Must |
+| R44 | One pending approval per tool per client: a second call while one waits is refused, so prompts can't be merged or confused. Also at most `max_pending_per_client` undecided prompts per client, at most `max_prompts_per_hour`, and a cooldown after a decline | Must |
 | R45 | Approver back ends: **MCP elicitation** (the default, synchronous; the prompt appears in the operator's own client) and **out-of-band approvers** hosted in the vault (Telegram, and an approval queue in the portal), for clients that shouldn't be trusted to relay approvals or for approvals that must wait | Should |
-| R46 | A **ledger** of consequential calls: time, client, tool, hash of the arguments, decision, result | Should |
+| R46 | A **ledger** of consequential calls: time, client, tool, keyed digest of the arguments and of the prompt, decision, result; hash-chained and written ahead of the call | Should |
 | R48 | **Vault-enforced approvals:** for routes marked `vault_approval`, the **vault** holds the request, renders the approval from the request itself, and forwards it only on approval, so even a fully compromised gateway can't skip it. Each approval happens in exactly one place: those routes skip the gateway's elicitation | Should |
 | R47 | Content from upstream is **data, not instructions**. The gateway can wrap results from a server in untrusted-content markers. Toolkits that need sender identity (e.g. mail) verify it in code and label failures | Should |
 
@@ -992,22 +993,23 @@ Each included tool has a policy: `allow` (no prompt) or `approve`.
      with an unescaped `$`, a string ending in `\n` is refused;
    - a failure answers `isError` `arguments refused: at <pointer>: <keyword>`, naming the
      agent's own keys and never a value.
-4. **Decide** from policy, never from annotations. `allow` goes on. In M3 an `approve` tool is
-   listed but refused with "refused: this tool needs an approval, and this version can't ask for
-   one" (`approval_unavailable`); M4 inserts the steps below here.
+4. **Decide** from policy, never from annotations. `allow` goes on; `approve` takes the steps
+   below.
 5. **Forward exactly the validated object.** The gateway registers the tool and the digest of the
    canonical arguments with its egress filter, which checks that the `tools/call` on the wire
    carries exactly that object, by value, and consumes the registration. The call runs under a
    hard deadline (`call_timeout`, 300 s).
 
-For an `approve` call (M4), after step 3:
+For an `approve` call, after step 3 (as built in M4: a client must be `attended`, and the
+operator's [operations.md](operations.md) §19 shows the prompt):
 
 1. **Validate** as above.
 2. **Canonicalize** as above: the object that will be forwarded.
 3. **Render** the approval text: `<server> → <tool>`, then the arguments as indented JSON. JSON
    escaping makes the rendering unambiguous: a newline inside a value appears as `\n` and can't fake
-   another field. Toolkit tools may supply their own renderer (e.g. a mail body shown as
-   paragraphs), as long as it follows the same rules.
+   another field. A toolkit tool shows a plan of exact writes under declared layouts (e.g. a mail
+   body shown as written), under the same rules; it can't supply free text. The frame (a per-call
+   ref, the client, an absolute deadline, a footer repeating the ref) is the gateway's.
 4. **Check the text:** no Cf or control characters (other than the renderer's own newlines), and
    under `budget_chars`. Otherwise the call is refused **before** anyone is asked.
 5. **Lock** the tool for this client. If it's already waiting, the call is refused as busy.
@@ -1015,43 +1017,57 @@ For an `approve` call (M4), after step 3:
    declined.
 7. On accept, forward **the canonical object from step 2**: it's the same object that was rendered,
    so it can't differ from the text shown.
-8. **Ledger:** time, client, server, tool, sha256 of the canonical arguments, decision, upstream
-   result status.
+8. **Ledger:** `asked`, `decided`, then exactly one `outcome`, hash-chained, with keyed digests
+   of the arguments and the text; the accept is on disk before the call goes out. An accepted call
+   then finishes even if the agent leaves or the gateway stops.
 9. **Return** the result, or a plain error: `declined by operator`, `no answer in time`,
    `refused: <reason>`.
 
 ### 5.3 Toolkits
 
 A toolkit is a Python module installed into a **derived gateway image** (`FROM` the official one,
-dependencies pinned with hashes). It is never loaded from a writable path, and never installed in
-the vault's image.
+one added layer, dependencies compiled against the official image's constraints with hashes;
+`examples/derived-image`). The gateway imports only modules registered as `zoeymcp.toolkits`
+entry points, never from a path its uid can write, and never in the vault's environment.
 
 ```python
-from zoeymcp.toolkit import Toolkit, approve, text
+toolkit = Toolkit("mail", slots={"mail": "smtp"})
 
-tk = Toolkit("mail")
+async def plan_send(ctx: PrepareContext, subject: str, body: str) -> Plan:
+    config = await ctx.vault("mail").get_object("/config")      # connector config only
+    request = {"expect_from": config["from"], "expect_to": config["to"],
+               "subject": subject, "body": body}
+    return Plan("Send an email", [Write.post("/send", request, show=[
+        Show.line("From", "/expect_from"), Show.line("To", "/expect_to"),
+        Show.line("Subject", "/subject"), Show.block("/body")])])
 
-@tk.tool(consequential=True)
-async def send_note(ctx, subject: text(max=150, single_line=True),
-                    body: text(max=2700)) -> str:
-    """Send a note to the configured recipient."""
-    cfg = await ctx.vault.get_json("/mail/config")
-    await approve(ctx, f"Send to {cfg['to']}?\nSubject: {subject}\n\n{body}")
-    sent = await ctx.vault.post_json("/mail/send", {"subject": subject, "body": body})
+@toolkit.tool(consequential=True, prepare=plan_send)
+async def send_note(ctx: ToolContext, subject: Subject, body: Body) -> str:
+    """Send a plain-text note to the configured recipients."""
+    sent = await ctx.vault("mail").send(ctx.plan.writes[0])
     return f"sent ({sent['message_id']})"
 ```
 
-- **`ctx.vault`** is an HTTP client already authenticated as the gateway. In the hardened tier it
-  is the only way out: the gateway has no other egress.
-- **`text(...)`** validators enforce the plain-text rules (no Cf/control characters, length,
-  single-line).
-- **`approve(ctx, message)`** runs steps 4–8 of §5.2 with the toolkit's own message. The toolkit is
-  responsible for sending exactly what it showed. Tests drive that property for each shipped
-  toolkit (§8).
-- **Plain HTTP endpoints:** toolkits can expose `GET` endpoints (e.g. a status feed for a scheduled
-  monitor that compares output hashes), restricted to configured clients.
+- **Slots, not a client.** A toolkit names slots; the policy maps each to a gateway-only route and
+  lists the methods and paths it may use there, each textually one of the route's own rules (so
+  the route's params constrain it), some marked `approved`. The gateway builds every request;
+  nothing from the agent is forwarded.
+- **Parameters** come from the signature, from a small type set (`Text`, `Range`, `bool`,
+  `Literal`, `Batch` lists, total `TypedDict`s, `T | None = None`): plain JSON, nothing filled in,
+  and the text rules checked in the gateway.
+- **Plans.** A consequential tool's `prepare` step (reading only an smtp connector's config) returns
+  the exact writes the prompt shows; after an accept the body may send each once, exactly as
+  frozen, and an `approved` rule takes nothing else. A tool the code marks consequential can't be
+  allowed by policy: it is hidden.
+- **Pins.** Definitions are pinned and drift like a remote server's, unless the server sets
+  `pinning: off`, which serves the definitions the image holds and logs their pins.
+- **Results** are wrapped (`wrap_results`) and sanitized like a remote server's; `ctx.untrusted`
+  marks text an outsider wrote. Errors become fixed texts.
+- **Plain HTTP endpoints** for toolkits are deferred to the first mailbox-reader toolkit, with
+  capability URLs.
 
-v1 ships example toolkits only. Real ones live in the operator's own repo and image.
+v1 ships example toolkits only (mail, records, and an offline sender verifier). Real ones live in
+the operator's own repo and image. A toolkit is as trusted as the gateway (threat model T6).
 
 ### 5.4 Untrusted content
 
@@ -1646,7 +1662,7 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | M7 | `bridge`; the `egress` role, the `egress-proxy` profile and `--emit-egress-allowlist`; MCP onboarding by URL (discovery + DCR) in the portal and CLI | S9, S11 |
 | M8 | **Vault-enforced approvals** (§6.4); out-of-band approvers in the vault (Telegram, the portal queue); image publishing with digests and SBOM | S3 end to end as the approver; S13/S15 again under `vault_approval` |
 
-Each milestone ships with its effect tests and its shapes' acceptance tests. Nothing merges with a
+M1 to M4 are built. Each milestone ships with its effect tests and its shapes' acceptance tests. Nothing merges with a
 failing mutation run on the policy modules. Managed mode is the default from M6 on; until then,
 only declarative mode exists.
 
@@ -1680,6 +1696,21 @@ only declarative mode exists.
 | Pins (M3) | projection v1 under a domain tag; served members are exactly the pinned ones; per-connection evaluation; sticky drift marks | §5.1 |
 | Schemas (M3) | `jsonschema` with an empty registry, `regex` with timeouts and budgets, `format` off, the `$` rule; `jsonschema-rs` was considered (it fetches refs by default, and mutmut can't see into it) | §5.2 |
 | Hardened gateway key (M3) | from `ZOEYMCP_GATEWAY_KEY` in compose (no bind mount, R51), or a key file re-read on `SIGHUP`; no handoff endpoint | §3.4, §4.5 |
+
+### 12.1.1 Decided for M4 (2026-10-18)
+
+| Question | Decision | Where |
+| --- | --- | --- |
+| Who may be asked | only clients the operator marks `approvals.attended`; others are refused at once | §5.2, §6.1 |
+| Elicitation modes | form mode only; URL mode is never used for approvals | §6.1 |
+| Toolkit pinning | per server: `pinning: required` (default) or `off`; the classification floor holds in both | §5.3 |
+| Markdown in prompts | per client `approvals.renders`: `markdown` (default, refuses fences, HTML and links) or `plain`; the whitespace and combining-mark rules always apply | §5.2, R42 |
+| Prompt brakes | one undecided prompt per client, 15 s cooldown after a decline-like answer, 30 prompts an hour | R44 |
+| Committed calls | from the accept on, the call isn't cancelled by the agent, an unassignment, a stale view or a stop; stops wait for it | §5.2 |
+| The daily send window | a rolling 24 hours of attempts, failures included, rebuilt from the journal | §4.4 |
+| `env:` connector passwords | a `check` error: the password must be in the store, bound to the connector | §4.4 |
+| Toolkit HTTP endpoints | deferred to the first mailbox-reader toolkit, with capability URLs | §5.3 |
+| Connector `tls` and the binding | not in the binding: both modes verify the server before AUTH | §4.5 |
 
 ### 12.2 Open
 

@@ -4,8 +4,9 @@ A self-hosted proxy that lets AI agents use outside APIs and MCP servers **witho
 real credential**, and that asks a human to approve the **exact arguments** of every consequential
 action.
 
-> **Not ready for use.** Early development: the vault and the gateway work, but approvals,
-> toolkits and the admin portal don't exist yet, and nothing has been reviewed or released.
+> **Not ready for use.** Early development: the vault, the gateway, approvals and toolkits work,
+> but the admin portal and out-of-band approvers don't exist yet, and nothing has been reviewed
+> or released.
 > Don't deploy it. See [docs/design.md](docs/design.md) for where it's going,
 > [docs/threat-model.md](docs/threat-model.md) for what it defends against, and
 > [docs/operations.md](docs/operations.md) for running what exists.
@@ -27,6 +28,16 @@ Built so far:
   roots from upstreams. `zoeymcp review` to onboard and re-pin; both deployment tiers (a
   privilege-dropping single container, and a hardened compose with gateway key rotation); a
   TLS `lan` profile.
+- **M4, approvals, mail and toolkits:** `approve` tools ask a human through the agent's own
+  client (MCP elicitation, both protocol eras) with a gateway-rendered prompt that shows the
+  exact call and can't hide text, then run that call once; a per-call lock, cooldown and hourly
+  cap; a hash-chained, HMAC-keyed approval ledger with `zoeymcp ledger --verify`; approved calls
+  that finish when the agent leaves or the gateway stops. The vault's SMTP connector sends with an
+  app password it alone holds, to fixed recipients, over verified TLS, optionally through CONNECT,
+  with idempotency keys, a rolling daily limit and a journal that never sends twice. Toolkits:
+  Python tools in the gateway that reach upstreams only through vault slots, show a plan of exact
+  writes and may send only those, once; an SDK with a test harness, example mail and records
+  toolkits, and a derived-image recipe with a verifier.
 
 ## Quickstart (standard tier)
 

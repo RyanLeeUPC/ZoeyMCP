@@ -1,8 +1,8 @@
 # ZoeyMCP threat model
 
 Who might attack a deployment, what each can reach, and the most each can gain once everything
-built so far (M1 to M3) holds. The mechanisms are in [design.md](design.md); the invariants the
-tests hold the gateway to are G1 to G21 there (§8.2).
+built so far (M1 to M4) holds. The mechanisms are in [design.md](design.md); the invariants the
+tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there (§8.2).
 
 ## Actors
 
@@ -38,7 +38,47 @@ tests hold the gateway to are G1 to G21 there (§8.2).
   gateway key (hardened), then rotate client tokens. In the standard tier it shares the vault's
   network namespace, so it has egress; the hardened tier has none.
 
-## The confused deputy
+## Approvals, mail and toolkits (M4)
+
+M4 sharpens T1 and adds four actors.
+
+| # | Actor | Controls | Wants |
+| --- | --- | --- | --- |
+| T1 | **A prompt-injected or compromised agent** | every argument, call timing and retries; `inputResponses`, `requestState`, `_meta`; maybe its own client token, if its sandbox can read it | a consequential call without informed consent: approve its own call, pre-answer, replay an accept, swap arguments between ask and run, flood or merge prompts, word arguments to mislead, reach a send route from a routine tool |
+| T1a | **A client that answers by itself** (an auto-accept hook, an LLM-backed callback, a remembered "always") | the answer | the same as T1 |
+| T6 | **A compromised toolkit or toolkit dependency** | code in the gateway process | send without approval, send other content, widen recipients, exfiltrate |
+| T7 | **A curious reader** of logs or the ledger | shipped logs, the ledger file | contents, recipients, argument values, prompt text |
+| T8 | **The mail path**: the egress proxy, a man in the middle, a hostile SMTP server | bytes on the path | the SMTP password, a downgraded session, a false outcome |
+| T9 | **A careless approver** | a phone and little time | to understand a prompt at a glance |
+
+At most:
+
+- **T1** can only *cause a prompt* for an `approve` tool: one at a time per client, within the
+  hourly cap, with a cooldown after each decline. It can't answer on a channel it doesn't own,
+  reuse an answer, or change the arguments after the human saw them, and its words reach the
+  human only as JSON-escaped values or inside a toolkit's declared layout, under the text rules.
+  **If it holds the token of an attended client, it can make the call and answer its own prompt**,
+  with or without `confirm_code`: the prompt goes back to whoever made the call. Keep the token
+  out of the sandbox and pin the client's source where the gateway sees it directly
+  ([clients.md](clients.md)); M8's out-of-band approver closes this.
+- **T1a** is a client that isn't attended, so it must not be marked `attended`. If it is, the
+  confirmation code defeats a blind hook, but not an LLM that reads the message.
+- **T2** gains nothing new: its text never enters a prompt, and its own elicitation or
+  `input_required` is refused during an approved call too.
+- **T6 is T4.** Code in the gateway process can skip the gateway's approvals and call
+  gateway-bound routes; toolkits aren't isolated from each other. What still holds is in the
+  vault: fixed sender and recipients, the expected-recipient check, the rolling limit, `paused`,
+  route allowlists, and the send journal, which the gateway can't edit. In the standard tier a
+  toolkit dependency also has the gateway's egress. The derived-image recipe lowers the chance of
+  T6; M8's vault-side approvals close the gap.
+- **T7** sees names, refs, outcomes, counts and keyed digests; never argument values, prompt
+  text, subjects, bodies, recipients, handles or secrets.
+- **T8** sees TLS only: certificates are verified against certifi's roots, AUTH never goes out
+  before TLS, and a break after the final dot is recorded as `unknown`, never retried.
+- **T9** sees a short fixed frame, plain text, a ref and a deadline. Keep routine calls in
+  `allow`, so prompts stay rare enough to read.
+
+
 
 ZoeyMCP issues no OAuth tokens to agents and has no dynamic client registration on the agent's
 side: client tokens are static and set by the operator. So the MCP specification's
@@ -54,3 +94,9 @@ Later milestones must keep it that way, or add per-client consent first.
 - **A restore of the whole state volume** from an older backup is not detected (the gateway-key
   ratchet and managed policy versions both assume the volume moves forward).
 - **Review findings are heuristics.** Reading the definition is the control.
+- **A client can auto-accept**, and a holder of an attended client's token can approve its own
+  calls (above). The gateway can't tell a human's answer from software's.
+- **A compromised gateway or toolkit can skip gateway approvals** until M8.
+- **Markdown clients** might render something the markup guard doesn't anticipate; `renders:
+  markdown`, the default, refuses the known constructs.
+

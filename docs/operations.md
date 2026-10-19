@@ -1,7 +1,8 @@
 # Operating ZoeyMCP
 
-How to run what is built so far: the vault (M1), OAuth in the vault (M2), and the gateway for
-remote MCP servers in both deployment tiers (M3, §9 onwards). The design and the reasons behind
+How to run what is built so far: the vault (M1), OAuth in the vault (M2), the gateway for
+remote MCP servers in both deployment tiers (M3, §9 onwards), and approvals, the SMTP connector
+and toolkits (M4, §19 onwards). The design and the reasons behind
 it are in [design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
@@ -434,8 +435,7 @@ agent that reads a JSON MCP config, typically:
    shown as `[U+XXXX]`. A tool with an error finding (hidden characters, an unsafe schema) gets no
    pin line at all.
 6. **Classify and commit:** put each added tool under `allow` or `approve`. `check` fails until
-   you do: there is no implicit default. In M3 an `approve` tool is listed but refused at call
-   time (approvals arrive in M4).
+   you do: there is no implicit default. An `approve` tool asks a human before each call (§19).
 7. **Reload** again. Agents see the tools at once (their clients are told the list changed).
 
 `review` exits 0 when every included tool matches its pin and nothing is marked, 1 when
@@ -563,3 +563,163 @@ session idle timeout takes a gateway restart (`limits_change_needs_restart`).
 
 Every log line is JSON with `role` (`vault`, `gateway` or `launcher`). No client token or hash,
 gateway key, session id, argument value, result content or upstream error text is ever logged.
+
+## 19. Approvals
+
+An `approve` tool asks a human before each call, through the agent's own MCP client (an
+elicitation in form mode; see [clients.md](clients.md) for what to check in a client). Only a
+client whose policy entry has `approvals: {attended: true}` is ever asked; every other client's
+`approve` calls are refused at once ("refused: no approver for this client").
+
+What the human sees, rendered by the gateway and nothing else:
+
+```text
+Approval request 3f9a2c41d07e8b15
+Client: agent1
+Tool: broker-trade → place_order
+Answer by 14:05 UTC. Accept runs this one call, exactly as shown.
+
+{
+  "quantity": 10,
+  "symbol": "ACME"
+}
+End of approval request 3f9a2c41d07e8b15
+```
+
+The ref heads and ends every prompt, is in the agent's answer and in the ledger, so one call can
+be followed from end to end. A toolkit shows a plan of exact writes instead of arguments (the
+mail toolkit: From, To, Subject, then the body as it will be sent).
+
+- **Accept** runs exactly the call shown, once. Anything else (decline, dismiss, no answer before
+  the deadline, the agent cancelling, the client losing the stream, a policy change, a stop)
+  sends nothing, and the agent is told which.
+- **Busy:** while one call of a tool waits or runs, a second call of the same tool by the same
+  client is refused with the first one's ref and when it frees. A client has at most
+  `max_pending_per_client` prompts waiting (1), at most `max_prompts_per_hour` (30), and a
+  `cooldown` (15 s) after a decline before the same tool may ask again.
+- **Timeouts:** `gateway.approvals.timeout` (300 s) must stay below the client's own tool-call
+  timeout, or the client gives up before the human answers; a client's `approvals.timeout` may
+  only lower it. `check` refuses more than 600 s.
+- **Nothing hidden:** a prompt holding hidden characters, wide runs of spaces, stacked combining
+  marks, or (for a client that renders Markdown, `renders: markdown`, the default) code fences,
+  HTML or links, is refused before anyone is asked, as is one over `budget_chars` (3000; a
+  client's may only be lower). It is never cut. Set `renders: plain` only for a client you have
+  checked shows prompts as plain text.
+- **`confirm_code: true`** adds a short code the human must type. It stops a blind auto-accept
+  hook, not software that reads the message, and not a holder of the client's token.
+- **Approve only what you read.** Keep routine calls in `allow`, so prompts stay rare enough to
+  read.
+
+## 20. Stopping with approved calls running
+
+A stop waits for approved calls that are already running: their outcome is recorded before the
+gateway exits. The gateway stops first, then the vault, so a send the gateway waits on isn't cut.
+The shipped windows cover a 300 s `call_timeout`: the standard container's `stop_grace_period` is
+420 s (the gateway gets 330 s, then the vault 75 s); in the hardened compose the gateway has 330 s
+and the vault 75 s. If an `approve` tool's `call_timeout` is longer, `check` warns: raise the
+stop windows to match. A new approval asked during a stop is refused ("the gateway is stopping").
+
+## 21. The approval ledger
+
+Every approval is in `/state-gateway/ledger/`: `asked`, `decided`, then exactly one `outcome`,
+each record hash-chained to the one before and holding only names, refs, decisions and keyed
+digests (an HMAC under `/state-gateway/ledger.key`) of the arguments and the prompt, never their
+values. A record is on disk before the next step: the accept before the call goes out. If the
+ledger can't be written, nothing is asked.
+
+```sh
+zoeymcp ledger --since 1d                 # recent calls: ref, client, tool, decision, outcome
+zoeymcp ledger --verify                   # walk the hash chain
+zoeymcp ledger check <ref> args.json      # were these the arguments that call was shown with?
+```
+
+After a crash, the next start closes every call left open: a prompt that was waiting gets
+`decided abandoned` and `outcome not_sent`; an accepted call whose result never came back gets
+`outcome unknown`, since it may have run. A torn last
+line is moved aside. To anchor the chain, copy the head hash `--verify` prints somewhere the
+gateway can't write.
+
+## 22. The SMTP connector
+
+The vault sends mail itself, with an app password only it holds, from a fixed sender to fixed
+recipients (`profiles/smtp-implicit-tls.yaml`, `profiles/smtp-starttls.yaml`). The route accepts
+only the gateway, and only `GET /config` and `POST /send`.
+
+- **`zoeymcp secret set mail-pass`** binds the password to the connector's host, port, sender
+  and recipients. Change any of them and sends answer `credential_unavailable` until you enter it
+  again: a changed recipient list needs your say-so. Use one app password per connector.
+- **TLS is verified before AUTH**, against the mail server's name, implicit or with STARTTLS;
+  STARTTLS is required, never optional. With `egress_proxy` set, the vault connects through it
+  with CONNECT.
+- **The rolling limit:** `max_per_day` attempts in any 24 hours, failures included, rebuilt from
+  the journal at start.
+- **Every attempt is journaled** under `/state/connectors/<connector>/` before connecting, keyed
+  by the caller's `Idempotency-Key` (a toolkit uses its call's ref). A key is sent at most once:
+  a repeat answers with the first result. A send cut after the final dot (or by a crash) is
+  recorded `unknown` and never retried: check the recipient's mailbox before sending again.
+- **Kill switches**, fastest first: `paused: true` and reload (sends refused at once, no password
+  needed to resume); drop the tool from the toolkit's `include`; revoke the app password at the
+  provider.
+
+| Code | Meaning |
+| --- | --- |
+| `connector_paused` | `paused: true` |
+| `daily_limit` | the rolling limit; `Retry-After` says when |
+| `credential_unavailable` | the password is missing, or its binding no longer matches: `secret set` |
+| `connector_constraints_differ` | the request expected another sender or recipient list |
+| `proxy_refused`, `smtp_unreachable`, `smtp_tls_failed`, `smtp_auth_failed`, `smtp_auth_unsupported`, `smtp_refused` | not sent |
+| `smtp_outcome_unknown` | the connection dropped after the message was handed over: it may have arrived |
+
+## 23. Toolkits
+
+A toolkit is Python running inside the gateway. It holds no credential or address: it declares
+named slots, and the policy maps each to a vault route and lists the methods and paths it may use
+there (`profiles/toolkit-mail.yaml`, `profiles/toolkit-records.yaml`). A consequential tool shows
+the human a plan of exact writes and may send only those, once. **A toolkit is as trusted as the
+gateway**: code in the gateway process can skip the gateway's approvals.
+
+- **Writing one:** `examples/toolkits` and `zoeymcp.toolkit` (`Toolkit`, `@toolkit.tool`,
+  `Text`, `Range`, `Batch`, `Plan`, `Write`, `Show`); test it with `zoeymcp.toolkit.testing.run`,
+  which applies the gateway's own checks and texts.
+- **Registering:** an entry point in the `zoeymcp.toolkits` group of your distribution. The
+  gateway imports only registered modules, never `zoeymcp` itself, and only from files inside its
+  environment that its uid can't write.
+- **Installing:** build a derived image (`examples/derived-image`: `lock.sh`, `docker build`,
+  `verify.sh`) and run its gateway, in the hardened tier with `ZOEYMCP_GATEWAY_IMAGE`.
+- **Reviewing:** `zoeymcp review <server>` prints each tool's definition, its classification
+  from the code and its pin; `--add TOOL` puts a tool the code declares consequential into
+  `approve`. A tool the code marks consequential can't be put in `allow`: it is hidden.
+- **`pinning: off`** serves the definitions the image holds, without pins: a rebuilt image can
+  change a tool without review (`check` warns; `toolkit_loaded` logs each tool's pin). Fine for a
+  toolkit you build yourself; keep `required` otherwise.
+- **Configuration** comes only from the policy (slots and rules) and what the vault answers: the
+  standard tier's launcher passes the gateway no other environment.
+
+## 24. What approvals can't do
+
+- **A client can auto-accept.** The gateway can't tell a human's answer from software's: check
+  each client ([clients.md](clients.md)) before marking it `attended`.
+- **A holder of an attended client's token can approve its own calls**, with or without a
+  confirmation code. Keep the token out of the agent's sandbox, and pin a source network where
+  the gateway sees the client directly; behind the `lan` proxy it sees only the proxy.
+- **A compromised gateway or toolkit can skip gateway approvals** until M8's out-of-band
+  approver. What the vault enforces still holds: fixed recipients, the limit, the pause, the
+  route allowlists, the send journal.
+- **The standard tier shares egress** between the vault and the gateway (and so toolkits): use
+  the hardened tier for toolkits with third-party dependencies.
+- **One gateway process:** approvals, locks and committed calls aren't shared between replicas.
+
+## 25. Troubleshooting approvals
+
+| The agent sees | Likely cause | Look at |
+| --- | --- | --- |
+| `refused: no approver for this client` | the client isn't `attended` | the client's `approvals` |
+| `refused: this client can't show approvals` | the client declared no form-mode elicitation, or has no back channel | the client's capabilities; [clients.md](clients.md) |
+| `refused: another call to this tool is waiting or running (ref ..., frees within N s)` | the same tool is already asking or running for this client | the first ref in the ledger |
+| `refused: an approval is already waiting for this client`, `... too many approval requests this hour`, `... declined moments ago` | `max_pending_per_client`, `max_prompts_per_hour`, `cooldown` | `gateway.approvals` |
+| `refused: ...` naming a rule (`markup`, `over budget`, ...) | the prompt would hide text, or is too long | the arguments; the client's `renders` and `budget_chars` |
+| `declined by operator`, `no answer in time` | the human's answer, or none | the ledger |
+| `refused: the approval ledger can't be written` | the ledger directory or disk | `ledger_write_failed` |
+| `refused: the tool or policy changed while waiting for approval` | a pin, policy or freshness change between ask and accept | `approval_decided`, the view |
+| `toolkit unavailable (ref ...)` | the module isn't registered, failed to import, or its slots don't match | `toolkit_unavailable` with `reason` |
+| `toolkit error: vault answered 403 blocked_<reason>` | the toolkit tried something its slots don't allow | `toolkit_vault_blocked` |
