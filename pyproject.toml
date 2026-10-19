@@ -118,6 +118,7 @@ only_mutate = [
     "*zoeymcp/gateway/access.py",
     "*zoeymcp/gateway/connstate.py",
     "*zoeymcp/gateway/egressrules.py",
+    "*zoeymcp/gateway/approvals.py",
     "*zoeymcp/entrypoint/env.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
