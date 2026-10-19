@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import os
 from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from ..common.logs import refuse_type
 
 MASTER_KEY_ENV = "ZOEYMCP_MASTER_KEY"
 PREVIOUS_MASTER_KEY_ENV = "ZOEYMCP_MASTER_KEY_PREVIOUS"
@@ -25,6 +29,8 @@ CONTEXT_STORE = "zoeymcp/store/v1"
 CONTEXT_CONFIG = "zoeymcp/config/v1"
 CONTEXT_KEY_ID = "zoeymcp/key-id/v1"
 CONTEXT_GATEWAY = "zoeymcp/gateway/v1/gen-{generation}"
+# The SMTP connector's send journal keys its request digests with this (M4 design J.3).
+CONTEXT_AUDIT = "zoeymcp/audit/v1"
 
 
 class MasterKeyError(ValueError):
@@ -65,6 +71,24 @@ def parse_master_key(text: str) -> bytes:
     return raw
 
 
+class AuditKey:
+    """The send journal's HMAC key. Its ``repr`` hides it, and logging it raises."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: bytes) -> None:
+        self._key = key
+
+    def digest(self, data: bytes) -> str:
+        return "hmac-sha256:" + hmac.new(self._key, data, hashlib.sha256).hexdigest()
+
+    def __repr__(self) -> str:
+        return "AuditKey(<hidden>)"
+
+
+refuse_type(AuditKey)
+
+
 @dataclass(frozen=True)
 class KeySet:
     """The keys derived from one master key. ``repr`` never shows key material."""
@@ -88,6 +112,11 @@ class KeySet:
     @classmethod
     def from_text(cls, text: str) -> KeySet:
         return cls.from_master(parse_master_key(text))
+
+    @property
+    def audit_key(self) -> AuditKey:
+        """The key the SMTP connector's send journal digests requests under."""
+        return AuditKey(derive(self._master, CONTEXT_AUDIT))
 
     def gateway_key(self, generation: int) -> str:
         """The gateway's credential for one key generation (hardened tier)."""
