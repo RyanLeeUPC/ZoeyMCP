@@ -198,6 +198,15 @@ async def call_tool(
         logs.event("schema_refused", server=call.server, tool=name, keyword=keyword, ref=ref)
         log("refused", "schema")
         return refused(f"arguments refused: at {errors[0]}")
+    if isinstance(source, ToolkitSource):
+        # A toolkit's own checks, which a JSON schema can't express: the text rules (G.2).
+        problem = source.argument_problem(call.server, name, shaped)
+        if problem is not None:
+            logs.event(
+                "schema_refused", server=call.server, tool=name, keyword=problem.rule, ref=ref
+            )
+            log("refused", "arguments")
+            return refused(f"arguments refused: at {problem}")
     # 5. Decide, from policy only
     request_state = approval.request_state if approval is not None else None
     inputs = approval.input_responses if approval is not None else None

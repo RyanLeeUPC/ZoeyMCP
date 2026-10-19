@@ -284,3 +284,16 @@ def test_the_entry_points_name_the_fixture_modules() -> None:
     assert importlib.metadata.EntryPoint("x", "y:z", GROUP).module == "y"
     assert records_server()["module"] == "example_toolkits.records"
     assert fixtures_server()["module"] == "tests.gateway.toolkit_fixtures"
+
+
+async def test_one_bad_item_refuses_the_batch_before_asking(tmp_path: Path, ca: ProviderCA) -> None:
+    """The toolkit's text rules run in the gateway, after the pinned schema (G.2)."""
+    rows = [{"title": f"t{i}", "amount": i, "day": "2026-01-01"} for i in range(3)]
+    rows[2]["title"] = "hidden" + chr(0x200B) + "text"
+    script = Script([ACCEPT])
+    with kit(tmp_path, ca) as deployed, toolkit_gateway(deployed) as running:
+        result = await call(running, "records", "add_records", {"records": rows}, script)
+    assert result.is_error
+    assert text(result) == "arguments refused: at /records/2/title: text_rules"
+    assert script.prompts == []
+    assert deployed.records.requests == []

@@ -20,6 +20,7 @@ from ..common.approvaltext import Plan
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewToolkitServer
 from ..toolkit.context import PrepareContext, ToolContext
+from ..toolkit.params import ArgumentProblem, check_arguments
 from ..toolkit.plan import SendLedger
 from ..toolkit.results import failure, render
 from ..toolkit.rules import Phase
@@ -66,6 +67,14 @@ class ToolkitSource:
         if exposed is None:
             raise NotAdmitted("tool not exposed")
         return exposed
+
+    def argument_problem(
+        self, server: str, tool: str, arguments: dict[str, Any]
+    ) -> ArgumentProblem | None:
+        """The first way the arguments break the tool's own parameter rules (G.2), after the
+        pinned schema passed: the text rules, which a JSON schema can't express."""
+        found = check_arguments(self._loaded(server).toolkit.tools[tool].params, arguments)
+        return found[0] if found else None
 
     def input_schema(self, client: str, server: str, tool: str) -> dict[str, Any] | None:
         found = self.toolkits.get(server)
