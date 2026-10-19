@@ -11,8 +11,9 @@ Each file is a ready-made `credentials:` + `routes:` fragment for one service sh
   refresh token with `docker exec -it <vault> zoeymcp login <credential>` (see
   [docs/operations.md](../docs/operations.md)).
 
-Every profile here is exercised end to end by `tests/acceptance` against a fake that behaves
-like the real provider where it matters, with only the upstream address swapped.
+Every profile here is exercised end to end against a fake that behaves like the real provider
+where it matters, with only the upstream address swapped: by `tests/acceptance`, and the SMTP
+ones by `tests/unit/test_smtp_connector.py`.
 
 | File | Shape | Example provider |
 | --- | --- | --- |
@@ -25,3 +26,5 @@ like the real provider where it matters, with only the upstream address swapped.
 | `grist-document.yaml` | S7: one document, different methods per path | Grist |
 | `github-readonly.yaml` | S8: GET-only API | GitHub REST API |
 | `remote-mcp-static-key.yaml` | S10: a remote MCP server with a static key, behind the gateway (also a `gateway:` fragment) | any MCP server that takes an API key |
+| `smtp-implicit-tls.yaml` | S13: send mail with an app password, implicit TLS on 465, fixed recipients, optionally through CONNECT | any mail provider with app passwords |
+| `smtp-starttls.yaml` | S14: the same with STARTTLS on 587, required, never optional | any mail provider with app passwords |

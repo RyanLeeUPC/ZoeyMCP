@@ -269,7 +269,7 @@ async def test_a_connector_route_is_marked(tmp_path: Path) -> None:
     )
     r = Rig(tmp_path, pol)
     response = await r.call("POST", "/mail/send", headers=bearer())
-    assert response.status_code == 501
+    assert response.status_code == 400  # no Idempotency-Key: the connector's own refusal
     assert response.headers[REFUSAL_HEADER] == REFUSAL_MARKER
     await r.app.aclose()
 

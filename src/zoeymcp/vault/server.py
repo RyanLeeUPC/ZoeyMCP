@@ -36,6 +36,7 @@ from ..common.policy import Policy, PolicyError, check_policy, parse_policy, rea
 from . import logs
 from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
 from .app import LISTENER_SCOPE_KEY, Listener, VaultApp
+from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
 from .peer import link_supported, peer_checked
@@ -408,6 +409,11 @@ def run(
         gateway_keys=runtime.gateway_keys,
         gateway_link=gateway_socket is not None,
     )
+    # Before any listener opens: a send cut by a SIGKILL is closed unknown, never re-sent (J.3).
+    try:
+        app.connectors.recover(connector_names(runtime.policy.connectors))
+    except OSError as exc:
+        raise StartupError(f"can't recover the SMTP connectors' send journals: {exc}") from exc
     admin = None
     if admin_socket is not None and socket_supported():
         try:

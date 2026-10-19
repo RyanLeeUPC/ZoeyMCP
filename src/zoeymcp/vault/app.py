@@ -25,6 +25,9 @@ Streams on stream routes are relayed as they arrive, scrubbed one SSE event or N
 time. Answers to the gateway are scrubbed at any size, and an upstream redirect becomes a 502 for
 it. Once the body is read the vault watches the caller: if it leaves while the vault waits for
 upstream headers or relays the answer, the upstream request is closed (M3 design F.6, J.2).
+
+A connector route has no upstream: after identity and a rule matched, the vault answers it
+itself through :mod:`.connectors.smtp`, and a send isn't cut when the caller leaves (M4 design J).
 """
 
 from __future__ import annotations
@@ -59,10 +62,12 @@ from ..common.policy.schema import (
     Policy,
     QueryCredential,
     Route,
+    SMTPConnector,
     is_secret_ref,
 )
 from ..common.policy.view import build_view, dump_view
 from . import logs
+from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
 from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
@@ -84,9 +89,11 @@ from .request import (
     scrub_headers,
     secret_variants,
 )
-from .store import Secret, SecretStore, SecretUnavailable
+from .store import Secret, SecretStore, SecretUnavailable, smtp_binding
 
 GATEWAY_HEADER = "x-zoeymcp-gateway"
+# Marks a connector's replayed answer: the key was seen, nothing was sent again (M4 design J.2).
+REPLAYED_HEADER = "x-zoeymcp-replayed"
 # Marks an answer the vault made itself, so the gateway can tell it from an upstream's (C.4).
 REFUSAL_HEADER = "x-zoeymcp-vault"
 REFUSAL_MARKER = "refused"
@@ -274,13 +281,32 @@ def _compile(policy: Policy) -> dict[str, _CompiledRoute]:
     return table
 
 
+def _connector_response(answer: Answer, log: dict[str, Any]) -> Response:
+    """A connector's answer. The vault makes every one, so all but a 200 carry the refusal
+    marker (C.4)."""
+    headers: dict[str, str] = {}
+    if answer.status != 200:
+        headers[REFUSAL_HEADER] = REFUSAL_MARKER
+        log["code"] = answer.body.get("code")
+    if answer.retry_after is not None:
+        headers["retry-after"] = str(answer.retry_after)
+    if answer.replayed:
+        headers[REPLAYED_HEADER] = "1"
+        log["replayed"] = True
+    return JSONResponse(answer.body, status_code=answer.status, headers=headers)
+
+
 def snapshot_env_secrets(policy: Policy, environ: Mapping[str, str]) -> dict[str, Secret]:
-    """Read every ``env:`` secret once at startup, so later env changes can't affect the vault."""
+    """Read every ``env:`` secret once at startup, so later env changes can't affect the vault.
+
+    A connector's username may come from the environment; its password never does (M4 Q12).
+    """
     refs: set[str] = set()
-    for cred in policy.credentials.values():
-        for value in vars(cred).values():
-            if isinstance(value, str) and value.startswith("env:") and is_secret_ref(value):
-                refs.add(value.removeprefix("env:"))
+    values = [v for cred in policy.credentials.values() for v in vars(cred).values()]
+    values += [connector.username for connector in policy.connectors.values()]
+    for value in values:
+        if isinstance(value, str) and value.startswith("env:") and is_secret_ref(value):
+            refs.add(value.removeprefix("env:"))
     return {name: Secret(environ[name]) for name in sorted(refs) if environ.get(name)}
 
 
@@ -299,6 +325,7 @@ class VaultApp:
         environ: Mapping[str, str] | None = None,
         gateway_keys: GatewayKeys | None = None,
         gateway_link: bool = False,
+        connectors: SmtpConnectors | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
@@ -309,6 +336,9 @@ class VaultApp:
 
         ``gateway_link`` says the link socket is configured: the gateway is then known by its
         socket only, and a gateway key on TCP is refused.
+
+        ``connectors`` replaces the SMTP connectors (tests inject a transport and a TLS context).
+        By default their journals live beside the store.
         """
         self._gateway_link = gateway_link
         self._store = store
@@ -325,6 +355,7 @@ class VaultApp:
         # The last access token serial seen per credential, for the request log.
         self._serials: dict[str, int] = {}
         self._environ = os.environ if environ is None else environ
+        self._connectors = connectors or SmtpConnectors(store.path.parent, keys)
         # Long polls of the view wait on this event. Each install sets it and puts a new one in
         # its place, so every waiter wakes and looks at the view again.
         self._view_changed = asyncio.Event()
@@ -357,6 +388,10 @@ class VaultApp:
     @property
     def tokens(self) -> TokenManager:
         return self._tokens
+
+    @property
+    def connectors(self) -> SmtpConnectors:
+        return self._connectors
 
     @property
     def gateway_keys(self) -> GatewayKeys:
@@ -461,7 +496,7 @@ class VaultApp:
         log["rule"] = rule_index
 
         if route.connector is not None:
-            raise Refused(501, "connectors arrive in M4")
+            return await self._connector(request, route.connector, rest, log)
         assert route.upstream is not None  # noqa: S101 - guaranteed by the schema
 
         body = await self._read_body(request)
@@ -702,6 +737,50 @@ class VaultApp:
             # On a task that has already failed, cancel() also marks its error as retrieved, so
             # asyncio doesn't report it as never retrieved.
             gone.cancel()
+
+    async def _connector(
+        self, request: Request, name: str, rest: NormalizedPath, log: dict[str, Any]
+    ) -> Response:
+        """``GET /config`` or ``POST /send`` of an SMTP connector (M4 design J). The policy check
+        allows a connector route no other rule, so anything else is a 404."""
+        connector = self._policy.connectors[name]
+        log["connector"] = name
+        endpoint = (request.method, rest.segments)
+        if endpoint == ("GET", ("config",)):
+            return _connector_response(self._connectors.config(name, connector), log)
+        if endpoint != ("POST", ("send",)):
+            raise Refused(404, "not a connector endpoint")
+        body = await self._read_body(request)
+        answer = await self._connectors.send(
+            name,
+            connector,
+            key=request.headers.get("idempotency-key"),
+            content_type=request.headers.get("content-type"),
+            body=body,
+            proxy=self._policy.egress_proxy,
+            credentials=lambda: self._connector_credentials(connector),
+        )
+        return _connector_response(answer, log)
+
+    def _connector_credentials(self, connector: SMTPConnector) -> tuple[str, str]:
+        """The username and password, if they were stored for exactly this connector's host,
+        port, sender and recipients (J.6). Raises :class:`SecretUnavailable`."""
+        binding = smtp_binding(connector.host, connector.port, connector.from_, connector.to)
+
+        def resolve(ref: str) -> str:
+            if ref.startswith("store:"):
+                return self._store.get_for_binding(ref.removeprefix("store:"), binding).reveal()
+            secret = self._env_secrets.get(ref.removeprefix("env:"))
+            if secret is None:
+                raise SecretUnavailable(ref, "env var not set when the policy was loaded")
+            return secret.reveal()
+
+        if not connector.password.startswith("store:"):
+            raise SecretUnavailable(connector.password, "a connector password must be in the store")
+        username = connector.username
+        if is_secret_ref(username):
+            username = resolve(username)
+        return username, resolve(connector.password)
 
     def _resolve(self, ref: str, upstream: str) -> Secret:
         try:

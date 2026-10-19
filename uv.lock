@@ -1643,6 +1643,7 @@ name = "zoeymcp"
 version = "0.0.1.dev0"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
     { name = "cryptography" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -1674,6 +1675,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2024.2.2" },
     { name = "cryptography", specifier = ">=43" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jsonschema", marker = "extra == 'gateway'", specifier = ">=4.23" },

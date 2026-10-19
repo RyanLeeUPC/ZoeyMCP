@@ -1,0 +1,42 @@
+# S13: send mail over SMTP with implicit TLS on port 465, to fixed recipients (M4).
+#
+# The vault holds the mail account's app password and sends itself: nothing else ever sees it.
+# The connector speaks only to its host and port, verifies the server's certificate and name
+# before AUTH, and sends only to the recipients listed here. The request names the subject and
+# body, and must repeat From and To exactly, so the recipients a human approved are the ones used.
+#
+#   1. Make an app password at the mail provider (never the account's own password).
+#   2. Store it: zoeymcp secret set mail-pass
+#      The secret is bound to host, port, from and to: change any of them and it must be entered
+#      again, so a changed recipient list can't use the password until the operator says so.
+#   3. Give the gateway a toolkit that sends through this route (profiles/toolkit-mail.yaml).
+#
+# To stop sending at once: set paused: true and reload. Then drop the tool from the toolkit's
+# include list, or revoke the app password at the provider.
+
+connectors:
+  mail-out:
+    kind: smtp
+    host: smtp.mail.example
+    port: 465
+    tls: implicit
+    username: agent@mail.example # or store:mail-user
+    password: store:mail-pass
+    from: "Agent <agent@mail.example>"
+    to: [partner@mail.example]
+    max_per_day: 20 # a rolling 24 hours; failed attempts count too
+    paused: false
+
+# Optional: send through the egress proxy, which then sees only a CONNECT to host:port.
+# egress_proxy: http://egress-proxy:3128
+
+routes:
+  - name: mail-send
+    prefix: /mail
+    connector: mail-out
+    callers: [gateway] # the gateway only: a sandbox script can never send
+    rules:
+      - methods: [GET]
+        paths: [/config]
+      - methods: [POST]
+        paths: [/send]

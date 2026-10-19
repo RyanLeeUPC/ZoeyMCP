@@ -4,7 +4,9 @@ The vault runs with the operator's **real** policy. Every upstream is replaced b
 server, and every secret by a generated dummy value, so a case can assert exactly what would
 have been sent (and that a refused request sent nothing). Token endpoints are played by
 :class:`TokenEcho`, through the same in-process transport: there is no network transport at all,
-so a self-test can never refresh a real token.
+so a self-test can never refresh a real token. SMTP connectors send to :class:`SendRecorder`,
+which opens no socket: a self-test never sends mail (M4 design J.8). Each run starts with an
+empty send journal, so the cases see the same keys and limits every time.
 
 ``--mutate`` then breaks the policy one rule at a time (wider methods, wider paths, a dropped
 constraint, pin or forced parameter, a deleted rule) and reruns the cases. A mutant no case
@@ -18,6 +20,7 @@ import contextlib
 import copy
 import hashlib
 import secrets
+import ssl
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,17 +40,44 @@ from ..common.policy.schema import (
     Policy,
     QueryCredential,
     Route,
+    SMTPConnector,
     is_secret_ref,
 )
 from ..vault import logs
-from ..vault.app import GATEWAY_HEADER, VaultApp
+from ..vault.app import GATEWAY_HEADER, REPLAYED_HEADER, VaultApp
 from ..vault.bindings import BindingError, derive_binding
+from ..vault.connectors.smtp import SendResult, SmtpConnectors
 from ..vault.keys import KeySet, generate_master_key
 from ..vault.store import SecretStore
 from .cases import Case, CaseFile, PlaceholderPresent
 from .echo import EchoUpstream, Received, TokenClient, TokenEcho
 
 ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+
+@dataclass
+class SendRecorder:
+    """The SMTP transport of a self-test: it records the send and answers 250."""
+
+    sends: list[tuple[str, list[str], bytes]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        connector: SMTPConnector,
+        *,
+        proxy: str | None,
+        username: str,
+        password: str,
+        sender: str,
+        recipients: list[str],
+        data: bytes,
+        tls: ssl.SSLContext,
+    ) -> SendResult:
+        self.sends.append((sender, recipients, data))
+        return SendResult("final_reply", final_dot_written=True, reply_code=250)
+
+    def message_id(self, connector: SMTPConnector) -> str:
+        return f"<selftest-{len(self.sends) + 1}@selftest.invalid>"
 
 
 @dataclass
@@ -76,6 +106,7 @@ class Rig:
     """Dummy secrets for every reference in the policy, in a throwaway store."""
 
     def __init__(self, policy: Policy, state_dir: Path) -> None:
+        self.state_dir = state_dir
         self.keys = KeySet.from_text(generate_master_key())
         self.store = SecretStore(state_dir, self.keys)
         self.store.load()
@@ -108,17 +139,32 @@ class Rig:
                 await echo(scope, receive, send)
 
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=dispatch))
+        recorder = SendRecorder()
+        journals = tempfile.TemporaryDirectory(prefix="journals-", dir=self.state_dir)
+        connectors = SmtpConnectors(
+            Path(journals.name), self.keys, transport=recorder, message_id=recorder.message_id
+        )
         app = VaultApp(
-            policy, self.store, self.keys, client=client, token_client=client, environ=self.environ
+            policy,
+            self.store,
+            self.keys,
+            client=client,
+            token_client=client,
+            environ=self.environ,
+            connectors=connectors,
         )
         results = []
-        with logs.quiet():
+        with logs.quiet(), journals:
             try:
                 for case in cases.cases:
-                    before = len(echo.received)
+                    before, sends_before = len(echo.received), len(recorder.sends)
                     response = await self._send(app, policy, case)
                     received = echo.received[before:]
-                    results.append(self._evaluate(policy, case, response, received, tokens))
+                    if _is_connector(policy, case.request.path):
+                        sends = len(recorder.sends) - sends_before
+                        results.append(_evaluate_connector(case, response, received, sends))
+                    else:
+                        results.append(self._evaluate(policy, case, response, received, tokens))
             finally:
                 await app.aclose()
         return results
@@ -243,6 +289,32 @@ class Rig:
     def _any_secret_in(self, got: Received, tokens: TokenEcho) -> bool:
         haystack = got.path + repr(got.query) + repr(got.headers) + got.body.decode("latin-1")
         return any(value in haystack for value in [*self.values.values(), *tokens.issued])
+
+
+def _is_connector(policy: Policy, path: str) -> bool:
+    route = _route_for(policy, path)
+    return route is not None and route.connector is not None
+
+
+def _evaluate_connector(
+    case: Case, response: httpx.Response, received: list[Received], sends: int
+) -> CaseResult:
+    """A connector has no upstream: a ``200`` to ``POST /send`` is exactly one recorded send,
+    and anything else is none."""
+    result = CaseResult(case.name)
+    expect = case.expect
+    if response.status_code != expect.status:
+        result.problems.append(f"status {response.status_code}, expected {expect.status}")
+    if received:
+        result.problems.append("a connector request reached an upstream")
+    sending = case.request.method == "POST" and case.request.path.split("?")[0].endswith("/send")
+    replayed = response.headers.get(REPLAYED_HEADER) == "1"
+    wanted = 1 if sending and response.status_code == 200 and not replayed else 0
+    if sends != wanted:
+        result.problems.append(f"{sends} message(s) sent, expected {wanted}")
+    if expect.upstream is not None:
+        result.problems.append("a connector route has no upstream to expect")
+    return result
 
 
 def _route_for(policy: Policy, path: str) -> Route | None:

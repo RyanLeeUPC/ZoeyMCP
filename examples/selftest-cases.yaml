@@ -6,8 +6,9 @@
 # --mutate, every rule in the policy is weakened in turn, and some case must notice each time.
 #
 # The broker route uses OAuth: the self-test plays its token endpoint with dummy values, so the
-# allowed request is forwarded with a dummy access token. The mail route uses a connector (M4),
-# so its allowed requests answer 501 for now. That still proves they got past identity and rules.
+# allowed request is forwarded with a dummy access token. The mail route uses a connector: its
+# sends go to a recorder that opens no socket, so a self-test never sends mail. Each run starts
+# with an empty send journal.
 
 cases:
   # --- stats: a sandbox script with a placeholder ----------------------------------------------
@@ -71,13 +72,53 @@ cases:
     expect: { status: 403 }
 
   # --- mail: a send connector, gateway only ------------------------------------------------------
-  - name: the gateway may read the mail config (connectors arrive in M4)
+  - name: the gateway may read the mail config
     request: { method: GET, path: /mail/config, caller: gateway }
-    expect: { status: 501 }
+    expect: { status: 200 }
 
-  - name: the gateway may send (connectors arrive in M4)
-    request: { method: POST, path: /mail/send, caller: gateway }
-    expect: { status: 501 }
+  - name: the gateway may send, with an idempotency key
+    request:
+      method: POST
+      path: /mail/send
+      caller: gateway
+      headers: { Idempotency-Key: selftest-key-0001, Content-Type: application/json }
+      body: >-
+        {"expect_from": "Agent <agent@mail.example>", "expect_to": ["partner@mail.example"],
+        "subject": "Self-test", "body": "Nothing is sent."}
+    expect: { status: 200 }
+
+  - name: a send can't name its own recipients
+    request:
+      method: POST
+      path: /mail/send
+      caller: gateway
+      headers: { Idempotency-Key: selftest-key-0002, Content-Type: application/json }
+      body: >-
+        {"expect_from": "Agent <agent@mail.example>", "expect_to": ["partner@mail.example"],
+        "subject": "Self-test", "body": "Nothing is sent.", "to": ["someone@else.example"]}
+    expect: { status: 400 }
+
+  - name: a send that expects other recipients is refused
+    request:
+      method: POST
+      path: /mail/send
+      caller: gateway
+      headers: { Idempotency-Key: selftest-key-0003, Content-Type: application/json }
+      body: >-
+        {"expect_from": "Agent <agent@mail.example>", "expect_to": ["someone@else.example"],
+        "subject": "Self-test", "body": "Nothing is sent."}
+    expect: { status: 409 }
+
+  - name: a key used for another message is refused
+    request:
+      method: POST
+      path: /mail/send
+      caller: gateway
+      headers: { Idempotency-Key: selftest-key-0001, Content-Type: application/json }
+      body: >-
+        {"expect_from": "Agent <agent@mail.example>", "expect_to": ["partner@mail.example"],
+        "subject": "Another subject", "body": "Nothing is sent."}
+    expect: { status: 409 }
 
   - name: config can't be posted to
     request: { method: POST, path: /mail/config, caller: gateway }

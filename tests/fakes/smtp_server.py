@@ -128,7 +128,7 @@ class SmtpFake:
                             return
                         if chunk == b".\r\n":
                             break
-                        data += chunk
+                        data += chunk[1:] if chunk.startswith(b"..") else chunk  # un-stuffed
                     session.data = data
                     if Switch.DROP_AFTER_DOT in self.switches:
                         return
@@ -207,8 +207,16 @@ def serve_smtp(fake: SmtpFake, directory: Path) -> Iterator[tuple[str, int]]:
         ssl_context = fake._context if fake.mode == "implicit" else None
         server = await asyncio.start_server(fake._handle, "127.0.0.1", 0, ssl=ssl_context)
         port.append(server.sockets[0].getsockname()[1])
+        # "localhost" may resolve to ::1 first; on Windows each refused attempt costs 2 s.
+        servers = [server]
+        with contextlib.suppress(OSError):
+            servers.append(
+                await asyncio.start_server(fake._handle, "::1", port[0], ssl=ssl_context)
+            )
         started.set()
-        async with server:
+        async with contextlib.AsyncExitStack() as stack:
+            for each in servers:
+                await stack.enter_async_context(each)
             await stop[0].wait()
 
     thread = threading.Thread(target=lambda: asyncio.run(main()), daemon=True)

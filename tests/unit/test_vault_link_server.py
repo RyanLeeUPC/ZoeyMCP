@@ -889,7 +889,7 @@ def test_the_real_link_and_control_pipe(
         await _wait_for(sock)
         transport = httpx.AsyncHTTPTransport(uds=str(sock))
         async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
-            # A gateway-only route: identity passes, then the connector answers 501.
+            # A gateway-only route: identity passes, then the connector shows its config.
             gateway = (await client.get("/mail/config")).status_code
             # A placeholder-only route: the link's caller is the gateway, so 403.
             placeholder = (
@@ -904,7 +904,7 @@ def test_the_real_link_and_control_pipe(
         return [gateway, placeholder]
 
     try:
-        assert asyncio.run(main()) == [501, 403]
+        assert asyncio.run(main()) == [200, 403]
     finally:
         os.close(write)
     assert len(reloads) == 1
@@ -912,7 +912,7 @@ def test_the_real_link_and_control_pipe(
     assert "gateway_socket_listening" in events
     assert events[-1] == "vault_stopped"
     requests = [line for line in log_lines(log_buffer) if line["event"] == "request"]
-    assert [(r["listener"], r["status"]) for r in requests] == [("gateway", 501), ("gateway", 403)]
+    assert [(r["listener"], r["status"]) for r in requests] == [("gateway", 200), ("gateway", 403)]
 
 
 @linux_only

@@ -18,6 +18,8 @@ import pytest
 
 from zoeymcp.vault import gatewaykeys, logs, server
 from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
+from zoeymcp.vault.connectors import sendjournal
+from zoeymcp.vault.connectors.smtp import SmtpConnectors
 from zoeymcp.vault.gatewaykeys import BACKWARDS, STATE_FILE, TAMPERED, State
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.server import LOCK_FILE, StartupError, acquire_state_lock, load_runtime
@@ -446,7 +448,7 @@ def test_load_runtime_reads_the_ratchet_under_the_previous_master(tmp_path: Path
 
 
 def _gateway_status(app: VaultApp, key: str) -> int:
-    """A gateway-only route of the example. Its connector answers 501 once identity passed."""
+    """A gateway-only route of the example. Its connector answers 200 once identity passed."""
 
     async def call() -> int:
         transport = httpx.ASGITransport(app=app)
@@ -472,8 +474,8 @@ def test_a_reload_starts_a_rotation(
     ]
     assert app.policy.gateway_key_generation == 2
     keys = runtime.keys
-    assert _gateway_status(app, keys.gateway_key(1)) == 501
-    assert _gateway_status(app, keys.gateway_key(2)) == 501
+    assert _gateway_status(app, keys.gateway_key(1)) == 200
+    assert _gateway_status(app, keys.gateway_key(2)) == 200
     assert _gateway_status(app, keys.gateway_key(1)) == 403
     asyncio.run(app.aclose())
 
@@ -487,7 +489,7 @@ def test_a_reload_starts_a_rotation(
         gateway_keys=restarted.gateway_keys,
     )
     assert _gateway_status(app, keys.gateway_key(1)) == 403
-    assert _gateway_status(app, keys.gateway_key(2)) == 501
+    assert _gateway_status(app, keys.gateway_key(2)) == 200
     asyncio.run(app.aclose())
 
 
@@ -637,3 +639,43 @@ def test_run_shares_the_ratchet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert (tmp_path / STATE_FILE).is_file()
     assert seen["gateway_keys"] is ratchet
     assert seen["admin"]._gateway_keys is ratchet
+
+
+def test_run_closes_unfinished_sends_before_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A send cut by a SIGKILL is closed unknown before any listener opens (M4 design J.3)."""
+    journal = tmp_path / "connectors" / "mail-out"
+    journal.mkdir(parents=True)
+    sending = {
+        "ts": 1,
+        "key": "key-0001-aaaaaaaaaaaa",
+        "req_hmac": "hmac-sha256:" + "0" * 64,
+        "key_id": "0" * 16,
+        "subject_chars": 1,
+        "body_chars": 1,
+    }
+    (journal / "journal-0000000000001.jsonl").write_bytes(sendjournal.encode("sending", **sending))
+    kinds: list[list[str]] = []
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        lines = (journal / "journal-0000000000001.jsonl").read_bytes().splitlines()
+        kinds.append([sendjournal.parse(line)["kind"] for line in lines])
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), None)
+    assert kinds == [["sending", "unknown"]]
+
+
+def test_run_stops_when_the_journal_cant_be_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: SmtpConnectors, names: list[str]) -> dict[str, int]:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(SmtpConnectors, "recover", broken)
+    with pytest.raises(StartupError, match="send journals"):
+        server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), None)

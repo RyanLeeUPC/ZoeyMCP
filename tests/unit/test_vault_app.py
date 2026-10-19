@@ -361,7 +361,8 @@ async def test_unauthenticated_upstream(tmp_path: Path) -> None:
     assert r.last.header("authorization") is None
 
 
-async def test_connectors_not_yet(tmp_path: Path) -> None:
+async def test_a_connector_route_answers_without_an_upstream(tmp_path: Path) -> None:
+    """The connector answers itself: without an Idempotency-Key, a 400 naming the header."""
     route = {
         "name": "mail",
         "prefix": "/mail",
@@ -388,8 +389,13 @@ async def test_connectors_not_yet(tmp_path: Path) -> None:
     )
     r = Rig(tmp_path, pol)
     response = await r.call("POST", "/mail/send", headers=bearer())
-    assert response.status_code == 501
-    assert response.json() == {"error": "not implemented"}
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "bad_request",
+        "code": "bad_request",
+        "field": "Idempotency-Key",
+        "rule": "format",
+    }
     assert r.echo.received == []
 
 

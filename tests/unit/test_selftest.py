@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import socket
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from zoeymcp.selftest.echo import TokenClient, TokenEcho, endpoint_key
 from zoeymcp.selftest.runner import Rig, generate_mutants, mutate
 from zoeymcp.vault import app as app_module
 from zoeymcp.vault.bindings import derive_binding
+from zoeymcp.vault.connectors.smtp import SendResult
 
 from .conftest import EXAMPLE_POLICY
 
@@ -132,7 +134,7 @@ def test_cli_selftest_with_mutation() -> None:
         ["selftest", "--config", str(EXAMPLE_POLICY), "--cases", str(EXAMPLE_CASES), "--mutate"]
     )
     assert code == EXIT_OK, out
-    assert "16/16 cases passed" in out
+    assert "19/19 cases passed" in out
     assert "SURVIVED" not in out
 
 
@@ -180,6 +182,62 @@ def test_the_oauth_case_passes_with_no_network_transport(
     assert echo.calls == 1
     assert list(echo.last_issued) == ["broker-mcp"]
     assert echo.issued[0].startswith("selftest-at-")
+
+
+SEND_CASE = "the gateway may send, with an idempotency key"
+
+
+def test_the_mail_cases_open_no_socket_and_record_one_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_socket(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a self-test opened a socket")
+
+    recorders: list[runner.SendRecorder] = []
+
+    class Recording(runner.SendRecorder):
+        def __init__(self) -> None:
+            super().__init__()
+            recorders.append(self)
+
+    monkeypatch.setattr(socket, "create_connection", no_socket)
+    monkeypatch.setattr(runner, "SendRecorder", Recording)
+    policy = example_policy()
+    rig = Rig(policy, tmp_path)
+    for _ in range(2):  # a fresh journal each run: the same key sends again
+        results = asyncio.run(rig.run(policy, example_cases()))
+        assert [(r.name, r.problems) for r in results if not r.ok] == []
+    assert [len(r.sends) for r in recorders] == [1, 1]
+    [(sender, recipients, data)] = recorders[0].sends
+    assert (sender, recipients) == ("agent@mail.example", ["partner@mail.example"])
+    assert b"Message-ID: <selftest-1@selftest.invalid>" in data
+    assert b"Subject: Self-test" in data
+
+
+def test_a_send_case_notices_a_send_that_didnt_happen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def sent_nothing(self: runner.SendRecorder, *args: object, **kwargs: object) -> object:
+        return SendResult("final_reply", final_dot_written=True, reply_code=250)
+
+    monkeypatch.setattr(runner.SendRecorder, "__call__", sent_nothing)
+    policy = example_policy()
+    [result] = asyncio.run(Rig(policy, tmp_path).run(policy, only(example_cases(), SEND_CASE)))
+    assert result.problems == ["0 message(s) sent, expected 1"]
+
+
+def test_a_connector_case_cant_expect_an_upstream(tmp_path: Path) -> None:
+    [case] = only(example_cases(), "the gateway may read the mail config").cases
+    case = case.model_copy(
+        update={
+            "expect": case.expect.model_copy(
+                update={"upstream": UpstreamExpectation(path="/config")}
+            )
+        }
+    )
+    policy = example_policy()
+    [result] = asyncio.run(Rig(policy, tmp_path).run(policy, CaseFile(cases=[case])))
+    assert result.problems == ["a connector route has no upstream to expect"]
 
 
 def test_a_broken_injection_fails_the_oauth_case(
