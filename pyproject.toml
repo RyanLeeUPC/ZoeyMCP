@@ -103,6 +103,9 @@ only_mutate = [
     "*zoeymcp/vault/store.py",
     "*zoeymcp/vault/bindings.py",
     "*zoeymcp/vault/secretplan.py",
+    "*zoeymcp/vault/reports.py",
+    "*zoeymcp/vault/ledgerview.py",
+    "*zoeymcp/gateway/reporting.py",
     "*zoeymcp/vault/oauth/protocol.py",
     "*zoeymcp/vault/oauth/pkce.py",
     "*zoeymcp/vault/oauth/tokens.py",
@@ -150,3 +153,6 @@ also_copy = ["deploy", "examples", "profiles", "tests"]
 [tool.zoeymcp.mutation-floors]
 "zoeymcp.common.ledgerjoin" = 90
 "zoeymcp.vault.secretplan" = 90
+"zoeymcp.vault.reports" = 90
+"zoeymcp.vault.ledgerview" = 90
+"zoeymcp.gateway.reporting" = 90
