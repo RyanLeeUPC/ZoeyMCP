@@ -7,6 +7,7 @@ test's loop, so each request crosses the egress filter, the vault's route and it
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
 import anyio
@@ -79,6 +80,22 @@ async def test_connect_list_and_call(tmp_path: Path, era: str) -> None:
 # --- drift (G8) ------------------------------------------------------------------------------
 
 
+async def announced_until(fake: McpFake, condition: Callable[[], object]) -> None:
+    """Wait for ``condition``, announcing ``list_changed`` again every 2 s until it holds.
+
+    The fake announces a drift once, 50 ms after the listing. A modern connection's listen stream
+    (or a legacy one's GET stream) that a slow runner opens later misses it, and the next timer
+    listing is minutes away. A received announcement is acted on in milliseconds, so a repeat only
+    stands in for a lost one.
+    """
+    with anyio.fail_after(10):
+        while not condition():
+            with anyio.move_on_after(2):
+                await until(condition, timeout=3)
+            if not condition():
+                await anyio.to_thread.run_sync(fake.announce)
+
+
 @pytest.fixture
 def quick(monkeypatch: pytest.MonkeyPatch) -> None:
     """Listings may follow each other at once."""
@@ -94,7 +111,7 @@ async def test_drift_announced_by_list_changed_hides_and_marks(
         async with pool_for(deployed) as pool:
             connection = pool.connection(SERVER, deployed.server, CLIENTS[0])
             await pool.wait_ready(connection)
-            await until(lambda: pool.marks.for_server(SERVER))
+            await announced_until(fake, lambda: pool.marks.for_server(SERVER))
             assert pool.marks.for_server(SERVER) == {("echo", pin_of_fake(fake, "echo"))}
             with pytest.raises(NotAdmitted):
                 await pool.call(SERVER, deployed.server, CLIENTS[0], "echo", {"text": "hi"})
