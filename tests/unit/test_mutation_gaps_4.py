@@ -402,7 +402,7 @@ def test_problems_name_their_rule_pointer_and_reason() -> None:
     assert problem_tuples(body("a\tb")) == []  # one tab is fine in a block
     found = problem_tuples(body("a" + " " * 9 + "b"))
     assert found[0][:2] == ("wide_space", "/b")
-    [(rule, pointer, reason)] = problem_tuples(body("a​b"))
+    [(rule, pointer, reason)] = problem_tuples(body("a\u200bb"))
     assert (rule, pointer) == ("text_rules", "/b")
     assert reason
 
