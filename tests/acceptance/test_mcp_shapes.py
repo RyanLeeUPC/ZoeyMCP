@@ -77,7 +77,7 @@ def deployed(
             tmp_path,
             upstream,
             ca,
-            key=KEY,
+            secrets={"notes-key": KEY},
             tools=options.pop("tools", TOOLS),
             pins=options.pop("pins") if "pins" in options else pins(fake),
             link=link,  # type: ignore[arg-type]
@@ -258,7 +258,7 @@ async def test_s10_another_uid_on_the_link_socket_is_cut(tmp_path: Path, ca: Pro
     fake = McpFake(key=KEY, key_header="x-api-key")
     with serve_tls(fake.app(), ca, lifespan=True) as upstream:
         gateway = GatewayDeployment(
-            tmp_path, upstream, ca, key=KEY, link="unix", link_uid=own_uid() + 1
+            tmp_path, upstream, ca, secrets={"notes-key": KEY}, link="unix", link_uid=own_uid() + 1
         )
         with gateway.running(ready=False) as running:
             await anyio.sleep(2)

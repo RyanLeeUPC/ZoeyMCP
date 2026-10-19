@@ -1,7 +1,7 @@
 # Provider profiles
 
 Each file is a ready-made `credentials:` + `routes:` fragment for one service shape (design
-§8.1); the MCP one has a `gateway:` part too. Copy the parts you need into your policy, then:
+§8.1); the MCP ones have a `gateway:` part too. Copy the parts you need into your policy, then:
 
 - replace every `ph-replace-...` placeholder with a long random value
   (`python -c "import secrets; print(secrets.token_urlsafe(24))"`);
@@ -26,6 +26,7 @@ ones by `tests/unit/test_smtp_connector.py`.
 | `grist-document.yaml` | S7: one document, different methods per path | Grist |
 | `github-readonly.yaml` | S8: GET-only API | GitHub REST API |
 | `remote-mcp-static-key.yaml` | S10: a remote MCP server with a static key, behind the gateway (also a `gateway:` fragment) | any MCP server that takes an API key |
+| `remote-mcp-oauth.yaml` | S6 x S10: a remote MCP server with OAuth behind the gateway: a client registered by hand, PKCE, rotating refresh tokens, the `resource` parameter, one allowed and one approved tool (also a `gateway:` fragment) | any MCP server whose OAuth client you register yourself (no discovery) |
 | `smtp-implicit-tls.yaml` | S13: send mail with an app password, implicit TLS on 465, fixed recipients, optionally through CONNECT | any mail provider with app passwords |
 | `smtp-starttls.yaml` | S14: the same with STARTTLS on 587, required, never optional | any mail provider with app passwords |
 | `toolkit-mail.yaml` | S15: the example mail toolkit, each message approved as shown (with an SMTP profile; a `gateway:` fragment) | any of the SMTP profiles' providers |

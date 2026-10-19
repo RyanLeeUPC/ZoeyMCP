@@ -22,6 +22,9 @@ Secret-echo switches echo ``key``, the static key the fake expects (``DEFAULT_KE
 is set). The default key has characters that percent-encoding changes and a ``/``, which the
 JSON-escaped form writes as ``\\/`` (PHP's default), so each encoded form differs from the raw key.
 
+With ``authorize`` set, the fake checks a bearer token with it instead of the fixed key: an OAuth
+resource server, whose tokens change as they are refreshed and rotated, and can be revoked.
+
 The fake runs on a uvicorn thread and needs the ASGI lifespan (``serve(..., lifespan=True)``),
 which runs the SDK's session manager.
 """
@@ -36,7 +39,7 @@ import json
 import threading
 import time
 from collections import Counter
-from collections.abc import Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal, get_args
 from urllib.parse import quote
@@ -452,6 +455,8 @@ class McpFake:
     # S10: the static key, and where it's presented.
     key: str | None = None
     key_header: Literal["authorization", "x-api-key"] = "authorization"
+    # S6 x S10: whether a bearer token is live (FakeAuthServer.access_ok), used instead of key.
+    authorize: Callable[[str], bool] | None = None
     # drift
     drift: Drift | None = None
     # back channel: what an echo call asks of the client first, and where (legacy era).
@@ -1059,7 +1064,7 @@ class _Wire:
 
     async def _mcp(self, record: Recorded, scope: Scope, receive: Receive, send: Send) -> None:
         fake = self.fake
-        if fake.key is not None:
+        if fake.key is not None or fake.authorize is not None:
             presented, authorized = self._presented(scope)
             if not authorized:
                 await self._unauthorized(presented, send)
@@ -1110,16 +1115,19 @@ class _Wire:
         """The value presented (for a 401 echo), and whether it's the key in the right form.
 
         ``Authorization`` must be exactly ``Bearer <key>``: a bare key or another scheme is
-        refused, as a real server would.
+        refused, as a real server would. With ``authorize`` set, the bearer token is whatever
+        it accepts, and ``key_header`` doesn't apply.
         """
-        key = self.fake.key
-        if self.fake.key_header == "x-api-key":
+        key, authorize = self.fake.key, self.fake.authorize
+        if authorize is None and self.fake.key_header == "x-api-key":
             value = _scope_header(scope, "x-api-key")
             return value, value == key
         value = _scope_header(scope, "authorization")
         authorized = value == f"Bearer {key}"
         if value is not None and value.startswith("Bearer "):
             value = value.removeprefix("Bearer ")
+            if authorize is not None:
+                authorized = authorize(value)
         return value, authorized
 
     async def _unauthorized(self, presented: str | None, send: Send) -> None:

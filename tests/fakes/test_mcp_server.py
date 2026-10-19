@@ -342,6 +342,31 @@ async def test_a_401_can_echo_the_presented_value() -> None:
     assert bare.json()["error_description"] == "Unknown key: fake-key-1"
 
 
+async def test_a_bearer_check_replaces_the_key() -> None:
+    """Whatever ``authorize`` accepts now, in the bearer form only; the key no longer counts."""
+    live = {"token-1"}
+    fake = McpFake(key="fake-key-1", key_header="x-api-key", authorize=live.__contains__)
+    with running(fake) as url:
+
+        def call(headers: dict[str, str]) -> int:
+            params = {"name": "echo", "arguments": {"text": "hi"}}
+            return modern_post(url, "tools/call", params, headers=headers).status_code
+
+        statuses = [
+            call({"authorization": "Bearer token-1"}),
+            call({"authorization": "token-1"}),
+            call({"x-api-key": "fake-key-1"}),
+            call({"authorization": "Bearer fake-key-1"}),
+        ]
+        live.clear()  # revoked
+        statuses.append(call({"authorization": "Bearer token-1"}))
+        live.add("token-2")  # refreshed
+        async with connect(url, headers={"authorization": "Bearer token-2"}) as client:
+            result = await client.call_tool("echo", {"text": "hi"})
+    assert statuses == [200, 401, 401, 401, 401]
+    assert text_of(result) == "hi"
+
+
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
 async def test_the_well_behaved_tools(mode: str) -> None:
     fake = McpFake()

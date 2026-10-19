@@ -1,5 +1,5 @@
-"""The gateway's acceptance rig: the shipped S10 profile, the real vault and the real gateway
-(M3 design L.3, L.4).
+"""The gateway's acceptance rig: a shipped remote MCP profile (S10 by default), the real vault
+and the real gateway (M3 design L.3, L.4).
 
 Agent (SDK client) -> gateway (real socket) -> vault (real socket) -> fake MCP server (real
 TLS, verified against the test CA). The gateway reaches the vault over TCP with the gateway key,
@@ -33,11 +33,12 @@ from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view
 from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
+from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import KeySource, parse_link, view_client
 
-from .conftest import Deployment, _HTTPTransport
+from .conftest import Clock, Deployment, _HTTPTransport
 from .tls import ProviderCA
 
 PROFILE = "remote-mcp-static-key.yaml"
@@ -106,8 +107,13 @@ class Seen:
 
 
 class GatewayDeployment:
-    """The S10 profile with its upstream swapped for the fake, its tools and pins set, and a
-    client per name in ``clients``."""
+    """``profile`` (S10 by default) with its upstream swapped for the fake, its tools and pins
+    set, and a client per name in ``clients``.
+
+    ``tools`` and ``pins`` fill in S10's empty lists; leave both out to keep a profile's own.
+    ``secrets`` go into the store before the vault starts, and the vault's token manager reads
+    ``clock``, which a test can move along with the fakes' clocks.
+    """
 
     def __init__(
         self,
@@ -115,13 +121,15 @@ class GatewayDeployment:
         upstream: str,
         ca: ProviderCA,
         *,
-        key: str,
+        profile: str = PROFILE,
+        secrets: Mapping[str, str] | None = None,
         tools: Mapping[str, str] | None = None,
         pins: Mapping[str, str] | None = None,
         clients: tuple[str, ...] = CLIENTS,
         link: Link = "tcp",
         link_uid: int | None = None,
         replace: Mapping[str, str] | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self.state = tmp_path / "gateway"
         self.link = link
@@ -130,19 +138,17 @@ class GatewayDeployment:
         socket = tmp_path / "link" / "vault.sock" if link == "unix" else None
         if socket is not None:
             socket.parent.mkdir(mode=0o700)
+        listed = {} if tools is None and pins is None else server_text(tools or {}, pins or {})
         self.vault = Deployment(
             tmp_path / "vault",
-            PROFILE,
+            profile,
             upstream,
             ca,
-            secrets={"notes-key": key},
-            replace={
-                **server_text(tools or {}, pins or {}),
-                **client_text(clients),
-                **(replace or {}),
-            },
+            secrets=dict(secrets or {}),
+            replace={**listed, **client_text(clients), **(replace or {})},
             link_socket=socket,
             link_uid=link_uid,
+            clock=clock,
         )
 
     @property
@@ -173,6 +179,7 @@ class GatewayDeployment:
                     limits=limits,
                 )  # fmt: skip
                 app = GatewayApp(pool, view_client(link, keys), policy_wait=1)
+                app.ledger, _ = Ledger.open_at(self.state, max_bytes=limits.ledger_max_bytes)
                 with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
                     running = Running(app, url)
                     if ready:

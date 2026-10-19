@@ -1,0 +1,66 @@
+# S6 x S10: a remote MCP server that takes OAuth access tokens, behind the gateway, with a client
+# registered by hand (no discovery and no dynamic registration).
+#
+# The gateway is the route's only caller, as in remote-mcp-static-key.yaml. The vault holds the
+# grant: it refreshes the access token, saves each rotated refresh token before using the new
+# access token, and adds the token on the way out. Neither token ever reaches an agent.
+#
+#   1. Register a public client with the server's authorization server, with the redirect URI
+#      http://127.0.0.1/callback exactly (no port; never localhost). Replace client_id, the two
+#      endpoints and scope with the server's.
+#   2. Set resource, in both places, to the server's MCP URL (RFC 8707), so the tokens are
+#      issued for this server only.
+#   3. Get the refresh token: zoeymcp login notes-oauth
+#   4. Make a client token for each agent (zoeymcp client-token) and put its token_sha256 below.
+#   5. Review the server inside the gateway (zoeymcp review notes --add <tool>), then replace
+#      the example tools and pins below with the ones it prints: start narrow, and put every
+#      tool that changes anything under approve.
+#
+# If the server refuses an access token mid-session (401), that one tool call fails: the vault
+# never sends a POST twice. It drops the token, and the next call gets a new one.
+
+credentials:
+  notes-oauth:
+    kind: oauth2
+    token_url: https://auth.notes.example/token
+    authorize_url: https://auth.notes.example/authorize
+    client_id: example-notes-client
+    client_auth: none
+    refresh_token: store:notes-refresh
+    rotates: true
+    scope: notes.read notes.write
+    # The audience of every token: sent on token requests (extra_params) and at login.
+    extra_params: { resource: https://mcp.notes.example/mcp }
+    authorize_params: { resource: https://mcp.notes.example/mcp }
+
+routes:
+  - name: notes-mcp
+    prefix: /notes
+    upstream: https://mcp.notes.example
+    credential: notes-oauth
+    callers: [gateway]
+    stream: true
+    rules:
+      # POST carries requests; GET and DELETE are a legacy session's stream and its end.
+      - methods: [POST, GET, DELETE]
+        paths: [/mcp]
+
+gateway:
+  clients:
+    agent1:
+      token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      servers: [notes]
+      sources: [192.0.2.0/24] # the agent's network as the gateway sees it
+      approvals: { attended: true } # a human answers this client's prompts
+  servers:
+    notes:
+      kind: remote
+      route: notes-mcp
+      path: /mcp
+      tools:
+        include: [search_notes, create_note]
+        allow: [search_notes]
+        approve: [create_note] # each call shown to the human first
+      review: # from `zoeymcp review notes`
+        search_notes: sha256:1111111111111111111111111111111111111111111111111111111111111111
+        create_note: sha256:2222222222222222222222222222222222222222222222222222222222222222
