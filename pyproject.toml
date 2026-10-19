@@ -106,6 +106,7 @@ only_mutate = [
     "*zoeymcp/vault/reports.py",
     "*zoeymcp/vault/ledgerview.py",
     "*zoeymcp/gateway/reporting.py",
+    "*zoeymcp/portal/webauthn.py",
     "*zoeymcp/vault/oauth/protocol.py",
     "*zoeymcp/vault/oauth/pkce.py",
     "*zoeymcp/vault/oauth/tokens.py",
@@ -156,3 +157,4 @@ also_copy = ["deploy", "examples", "profiles", "tests"]
 "zoeymcp.vault.reports" = 90
 "zoeymcp.vault.ledgerview" = 90
 "zoeymcp.gateway.reporting" = 90
+"zoeymcp.portal.webauthn" = 90

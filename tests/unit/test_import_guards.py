@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = Path(zoeymcp.__file__).resolve().parent
 
 # Code that runs in the vault's environment and never reaches the gateway's code.
-VAULT_SIDE = ("vault", "common", "selftest", "entrypoint")
+VAULT_SIDE = ("vault", "portal", "common", "selftest", "entrypoint")
 # The CLI runs in both environments. It may start the gateway's code, but never needs its packages.
 # The top-level package and ``python -m zoeymcp`` are its entry points.
 CLI = "cli"
