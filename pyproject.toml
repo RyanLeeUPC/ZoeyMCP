@@ -134,10 +134,11 @@ only_mutate = [
     "*zoeymcp/entrypoint/env.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
-# The hygiene and import-guard tests check the repository itself (the lock, the smoke script),
-# which mutmut only partly copies.
+# The hygiene, import-guard and mutation-script tests check the repository itself (the lock, the
+# smoke script, scripts/), which mutmut only partly copies.
 pytest_add_cli_args = [
     "--ignore=tests/unit/test_source_hygiene.py",
     "--ignore=tests/unit/test_import_guards.py",
+    "--ignore=tests/unit/test_mutation_scripts.py",
 ]
 also_copy = ["deploy", "examples", "profiles", "tests"]

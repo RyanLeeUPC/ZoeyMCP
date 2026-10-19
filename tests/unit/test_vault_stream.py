@@ -258,10 +258,17 @@ def cuts(variant: bytes) -> list[int]:
     return sorted({1, len(variant) // 2, len(variant) - 1})
 
 
+# Plain ids: pytest escapes the backslashes in a repr() id again on each collection in one process,
+# so mutmut's recorded test names stopped matching.
+SPLITS = [
+    pytest.param(v, c, id=f"form{i}-cut{c}")
+    for i, v in enumerate(sorted(VARIANTS))
+    for c in cuts(v)
+]
+
+
 @pytest.mark.parametrize("caller", ["agent", "gateway"])
-@pytest.mark.parametrize(
-    ("variant", "cut"), [(v, c) for v in VARIANTS for c in cuts(v)], ids=lambda x: repr(x)
-)
+@pytest.mark.parametrize(("variant", "cut"), SPLITS)
 async def test_an_sse_echo_split_across_chunks_is_scrubbed(
     tmp_path: Path, captured: io.StringIO, caller: Caller, variant: bytes, cut: int
 ) -> None:
@@ -282,9 +289,7 @@ async def test_an_sse_echo_split_across_chunks_is_scrubbed(
     assert closed["bytes"] == len(response.content)
 
 
-@pytest.mark.parametrize(
-    ("variant", "cut"), [(v, c) for v in VARIANTS for c in cuts(v)], ids=lambda x: repr(x)
-)
+@pytest.mark.parametrize(("variant", "cut"), SPLITS)
 async def test_an_ndjson_echo_split_across_chunks_is_scrubbed(
     tmp_path: Path, captured: io.StringIO, variant: bytes, cut: int
 ) -> None:
