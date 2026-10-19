@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from fnmatch import fnmatch
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -27,6 +28,7 @@ def load(name: str) -> ModuleType:
 shard = load("mutation-shard")
 merge = load("mutation-merge")
 gate = load("mutation-gate")
+weights = load("mutation-weights")
 
 
 def test_the_module_list_comes_from_pyproject() -> None:
@@ -36,13 +38,32 @@ def test_the_module_list_comes_from_pyproject() -> None:
     assert all(name.startswith("zoeymcp.") and "/" not in name for name in found)
 
 
+def mutant_names(module: str) -> list[str]:
+    """Names in mutmut's forms: functions, private functions and methods, numbered from 1."""
+    bar = chr(0x01C1)  # mutmut's separator in method names
+    stems = [f"{module}.x_send", f"{module}.x__reset", f"{module}.x{bar}Store{bar}open"]
+    return [f"{stem}__mutmut_{number}" for stem in stems for number in range(1, 125)]
+
+
 @pytest.mark.parametrize("count", [1, 2, 6, 8])
-def test_every_module_is_in_exactly_one_shard(count: int) -> None:
+def test_every_mutant_is_in_exactly_one_shard(count: int) -> None:
     groups = shard.shards(shard.modules(), count)
-    flat = [name for group in groups for name in group]
-    assert sorted(flat) == sorted(shard.modules())
-    assert len(flat) == len(set(flat))
+    patterns = [[part.pattern() for part in group] for group in groups]
+    for module in shard.modules():
+        for name in mutant_names(module):
+            hits = [i for i, group in enumerate(patterns) if any(fnmatch(name, p) for p in group)]
+            assert len(hits) == 1, (name, hits)
     assert shard.shards(shard.modules(), count) == groups  # deterministic
+
+
+def test_a_heavy_module_is_cut_by_last_digit() -> None:
+    cut = [p for p in shard.parts(shard.modules(), 6) if p.module == "zoeymcp.common.policy.check"]
+    assert len(cut) > 1
+    assert "".join(p.digits for p in cut) == shard.DIGITS
+    assert cut[0].pattern() == f"zoeymcp.common.policy.check.*__mutmut_*[{cut[0].digits}]"
+    assert sum(p.weight for p in cut) == pytest.approx(shard.WEIGHTS["zoeymcp.common.policy.check"])
+    whole = [p for p in shard.parts(shard.modules(), 6) if p.module == "zoeymcp.toolkit.plan"]
+    assert [p.pattern() for p in whole] == ["zoeymcp.toolkit.plan.*"]
 
 
 def test_the_weights_name_real_modules() -> None:
@@ -50,11 +71,8 @@ def test_the_weights_name_real_modules() -> None:
 
 
 def test_six_shards_are_balanced() -> None:
-    loads = [
-        sum(shard.WEIGHTS.get(n, shard.DEFAULT_WEIGHT) for n in group)
-        for group in shard.shards(shard.modules(), 6)
-    ]
-    assert max(loads) < 1.1 * min(loads)
+    loads = [sum(part.weight for part in group) for group in shard.shards(shard.modules(), 6)]
+    assert max(loads) < 1.05 * min(loads)
 
 
 def test_the_cli_prints_patterns(
@@ -64,9 +82,25 @@ def test_the_cli_prints_patterns(
     assert shard.main() == 0
     patterns = capsys.readouterr().out.split()
     assert patterns
-    assert all(p.endswith(".*") for p in patterns)
+    assert all(p.startswith("zoeymcp.") for p in patterns)
     monkeypatch.setattr(sys, "argv", ["mutation-shard.py", "--shard", "6", "--of", "6"])
     assert shard.main() == 2
+
+
+def test_weights_come_from_the_shard_that_ran_each_module(tmp_path: Path) -> None:
+    def meta(shard_dir: str, module: str, durations: dict[str, float]) -> None:
+        path = tmp_path / shard_dir / "mutants" / "src" / (module.replace(".", "/") + ".py.meta")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"durations_by_key": durations}), encoding="utf-8")
+
+    meta("mutation-shard-0", "zoeymcp.vault.peer", {"a__mutmut_1": 1.5, "a__mutmut_2": 2.0})
+    meta("mutation-shard-0", "zoeymcp.vault.store", {})
+    meta("mutation-shard-1", "zoeymcp.vault.store", {"b__mutmut_1": 4.0})
+    meta("mutation-shard-1", "zoeymcp.vault.peer", {})
+    assert weights.weights(tmp_path) == {"zoeymcp.vault.peer": 3.5, "zoeymcp.vault.store": 4.0}
+    meta("mutation-shard-2", "zoeymcp.vault.store", {"b__mutmut_1": 4.0})
+    with pytest.raises(ValueError, match="two shards ran"):
+        weights.weights(tmp_path)
 
 
 def stats(**counts: int) -> dict[str, Any]:
