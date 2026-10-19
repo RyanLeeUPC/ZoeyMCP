@@ -42,20 +42,20 @@ def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
 def test_check_example_file() -> None:
     code, out = run(["check", "--config", str(EXAMPLE_POLICY)])
     assert code == EXIT_OK
-    assert out.strip().endswith("ok (0 error(s), 2 warning(s))")
+    assert out.strip().endswith("ok (0 error(s), 1 warning(s))")
 
 
 def test_check_from_stdin(example_text: str) -> None:
     code, out = run(["check", "--config", "-"], stdin=example_text)
     assert code == EXIT_OK
-    assert out.splitlines()[-1] == "<stdin>: ok (0 error(s), 2 warning(s))"
+    assert out.splitlines()[-1] == "<stdin>: ok (0 error(s), 1 warning(s))"
 
 
 def test_check_from_env(example_text: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZOEYMCP_CONFIG", example_text)
     code, out = run(["check"])
     assert code == EXIT_OK
-    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 2 warning(s))"
+    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 1 warning(s))"
 
 
 def test_check_reports_errors_as_json(example_text: str) -> None:

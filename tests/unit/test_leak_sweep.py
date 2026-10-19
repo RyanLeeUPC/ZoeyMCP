@@ -503,7 +503,11 @@ VAULT_SIDE = {
     "rule param": "leak-rule-value",
     "bridge url": "leak-bridge.example",
     "bridge egress": "leak-egress.example",
-    "toolkit module": "leakmodule",
+}
+# What the gateway does need, though it sits beside vault-side values, and why.
+GATEWAY_NEEDS = {
+    "toolkit module": ("leakmodule", "the gateway imports it"),
+    "toolkit slot rule": ("/mail/send", "a toolkit's own rules, written in the gateway section"),
 }
 
 
@@ -607,7 +611,16 @@ def secret_heavy_policy() -> Policy:
                 "url": "http://leak-bridge.example:9000/mcp",
                 "egress": ["leak-egress.example:443"],
             },
-            "srv-toolkit": {"kind": "toolkit", "module": "zoeymcp.toolkits.leakmodule"},
+            "srv-toolkit": {
+                "kind": "toolkit",
+                "module": "zoeymcp.toolkits.leakmodule",
+                "slots": {
+                    "mail": {
+                        "route": "leak-route-mail",
+                        "rules": [{"methods": ["POST"], "paths": ["/send"], "approved": True}],
+                    }
+                },
+            },
         },
     }
     return Policy.model_validate(
@@ -636,6 +649,11 @@ def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:
         assert value not in served, where
     for marker in ("store:", "env:", "https://", "http://", "placeholder", "secret"):
         assert marker not in served, marker
+    for where, (value, _why) in GATEWAY_NEEDS.items():
+        assert value in served, where
+    # A slot names its connector's kind, never the connector.
+    slot = view.gateway.servers["srv-toolkit"].model_dump()["slots"]["mail"]
+    assert (slot["prefix"], slot["connector"]) == ("/mail", "smtp")
     # What the gateway does get: the token's hash and the vault path.
     assert hash_token(LITERAL_TOKEN) in served
     assert view.gateway.servers["srv-remote"].model_dump()["vault_path"] == "/mcp-a/mcp"

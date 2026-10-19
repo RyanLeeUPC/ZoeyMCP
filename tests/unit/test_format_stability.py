@@ -206,7 +206,7 @@ VIEW_POLICY = {
         },
     },
 }
-VIEW_DIGEST = "sha256:2d15d1fd4e8b9849279283f2401fe4d8debb086512ac3c2d2fecc045af67c811"
+VIEW_DIGEST = "sha256:406b556163888843ab4c0cabe22395f1175a6993f12dc0ada5045a78e6c37379"
 VIEW_BYTES = (
     b'{"digest":"' + VIEW_DIGEST.encode() + b'","gateway":{"approvals":{"approver":"elicitation",'
     b'"budget_chars":3000,"cooldown":15,"max_pending_per_client":1,"max_prompts_per_hour":30,'
@@ -220,7 +220,10 @@ VIEW_BYTES = (
     b'"max_schema_depth":32,"max_sessions_per_client":16,"max_streams_per_client":4,'
     b'"max_subschemas":512,"max_tools_per_server":512,"max_upstream_message_bytes":8388608,'
     b'"max_upstream_sessions":64,"policy_max_stale":300,"session_idle_timeout":1800,'
-    b'"upstream_idle_timeout":600},"origins":[],"servers":{"mail":{"kind":"toolkit"},'
+    b'"upstream_idle_timeout":600},"origins":[],"servers":{"mail":{"call_timeout":null,'
+    b'"kind":"toolkit","module":"zoeymcp.toolkits.mail","on_drift":"hide","pinning":"required",'
+    b'"review":{},"slots":{},"tools":{"allow":[],"approve":[],"include":[]},'
+    b'"wrap_results":false},'
     b'"notes-read":{"call_timeout":null,"drift_check_interval":300,"enable":[],"era":"modern",'
     b'"kind":"remote","on_drift":"hide","review":{"search_notes":"sha256:' + b"0" * 64 + b'"},'
     b'"shared_session":false,"tools":{"allow":["search_notes"],"approve":[],'

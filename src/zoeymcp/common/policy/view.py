@@ -4,7 +4,9 @@ The vault serves it to the gateway on ``/_zoeymcp/gateway/v1/view``. It holds wh
 needs and nothing secret: no routes, credentials, connectors, secret references, placeholders,
 upstream URLs or admin settings. Client tokens appear only as their ``token_sha256`` hashes. A
 remote server carries ``vault_path``, the vault path that reaches it (its route's prefix plus its
-path). Toolkit and bridge servers carry only their kind: this version doesn't serve them.
+path). A toolkit server carries its module, which the gateway imports, and its slots: each slot's
+route prefix, the connector's kind (never its name) and the toolkit's rules as full vault paths.
+Bridge servers carry only their kind: this version doesn't serve them.
 
 ``digest`` is the canonical digest of everything else, so it changes exactly when the view does.
 The module is pure and needs only pydantic, so the vault builds the view without the gateway's
@@ -27,6 +29,7 @@ from .schema import (
     ClientApprovals,
     Gateway,
     GatewayLimits,
+    ModulePath,
     Name,
     Network,
     Origin,
@@ -34,7 +37,10 @@ from .schema import (
     Policy,
     RemoteServer,
     Server,
+    SlotName,
     TokenHash,
+    ToolkitMethod,
+    ToolkitServer,
     ToolName,
     Tools,
     _check_gateway_host,
@@ -86,13 +92,39 @@ class ViewRemoteServer(_Model):
     call_timeout: Annotated[int, Field(ge=1, le=3600)] | None
 
 
+class ViewToolkitRule(_Model):
+    methods: list[ToolkitMethod]
+    paths: list[str]  # the route's prefix and the rule's path, as the vault sees them: /mail/send
+    approved: bool
+
+
+class ViewSlot(_Model):
+    prefix: Annotated[str, StringConstraints(pattern=r"^/[a-z0-9][a-z0-9_-]{0,62}$")]
+    connector: Literal["smtp"] | None  # the connector's kind, never its name
+    rules: list[ViewToolkitRule]
+
+
+class ViewToolkitServer(_Model):
+    kind: Literal["toolkit"]
+    module: ModulePath
+    tools: Tools
+    pinning: Literal["required", "off"]
+    review: dict[ToolName, Pin]
+    on_drift: Literal["hide", "fail"]
+    slots: dict[SlotName, ViewSlot]
+    wrap_results: bool
+    call_timeout: Annotated[int, Field(ge=1, le=3600)] | None
+
+
 class ViewOtherServer(_Model):
     """A server of a kind this version doesn't serve."""
 
-    kind: Literal["toolkit", "bridge"]
+    kind: Literal["bridge"]
 
 
-ViewServer = Annotated[ViewRemoteServer | ViewOtherServer, Field(discriminator="kind")]
+ViewServer = Annotated[
+    ViewRemoteServer | ViewToolkitServer | ViewOtherServer, Field(discriminator="kind")
+]
 
 
 class ViewGateway(_Model):
@@ -129,7 +161,42 @@ def view_digest(gateway: ViewGateway) -> str:
     return canonical.digest({"v": VIEW_VERSION, "gateway": gateway.model_dump()})
 
 
-def _server(name: str, server: Server, prefixes: dict[str, str]) -> ViewServer:
+def _toolkit(name: str, server: ToolkitServer, policy: Policy) -> ViewToolkitServer:
+    routes = {route.name: route for route in policy.routes}
+    slots = {}
+    for slot, binding in server.slots.items():
+        route = routes.get(binding.route)
+        if route is None:
+            raise ValueError(f"gateway server {name!r} names an unknown route")
+        connector = policy.connectors.get(route.connector) if route.connector else None
+        slots[slot] = ViewSlot(
+            prefix=route.prefix,
+            connector=connector.kind if connector is not None else None,
+            rules=[
+                ViewToolkitRule(
+                    methods=list(rule.methods),
+                    paths=[route.prefix + path for path in rule.paths],
+                    approved=rule.approved,
+                )
+                for rule in binding.rules
+            ],
+        )
+    return ViewToolkitServer(
+        kind="toolkit",
+        module=server.module,
+        tools=server.tools,
+        pinning=server.pinning,
+        review=dict(server.review),
+        on_drift=server.on_drift,
+        slots=slots,
+        wrap_results=server.wrap_results,
+        call_timeout=server.call_timeout,
+    )
+
+
+def _server(name: str, server: Server, policy: Policy, prefixes: dict[str, str]) -> ViewServer:
+    if isinstance(server, ToolkitServer):
+        return _toolkit(name, server, policy)
     if not isinstance(server, RemoteServer):
         return ViewOtherServer(kind=server.kind)
     prefix = prefixes.get(server.route)
@@ -153,7 +220,7 @@ def _server(name: str, server: Server, prefixes: dict[str, str]) -> ViewServer:
 def build_view(policy: Policy) -> GatewayView:
     """The gateway's view of ``policy``. A policy without a gateway section gives the defaults.
 
-    The policy must pass ``check``: a remote server whose route is missing raises ValueError.
+    The policy must pass ``check``: a server whose route is missing raises ValueError.
     """
     gateway = policy.gateway or Gateway()
     prefixes = {route.name: route.prefix for route in policy.routes}
@@ -171,7 +238,10 @@ def build_view(policy: Policy) -> GatewayView:
             )
             for name, client in gateway.clients.items()
         },
-        servers={name: _server(name, server, prefixes) for name, server in gateway.servers.items()},
+        servers={
+            name: _server(name, server, policy, prefixes)
+            for name, server in gateway.servers.items()
+        },
     )
     return GatewayView(v=VIEW_VERSION, digest=view_digest(body), gateway=body)
 

@@ -44,6 +44,7 @@ Name = Annotated[str, StringConstraints(pattern=NAME_PATTERN)]
 SecretRef = Annotated[str, StringConstraints(pattern=SECRET_REF_PATTERN)]
 Token = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._~-]{1,256}$")]
 ToolName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
+SlotName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,31}$")]
 Pin = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 TokenHash = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 HeaderName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9-]{1,64}$")]
@@ -605,10 +606,36 @@ class BridgeServer(_UpstreamServer):
         return value
 
 
+ToolkitMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+
+class ToolkitRule(_Model):
+    """What a toolkit may do through one slot, relative to the route's prefix. Each method and
+    path must be one of the route's own rules, textually (check)."""
+
+    methods: Annotated[list[ToolkitMethod], Field(min_length=1)]
+    paths: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=1024)]], Field(min_length=1)
+    ]
+    approved: bool = False  # only the writes of an accepted plan
+
+
+class ToolkitSlot(_Model):
+    route: Name
+    rules: Annotated[list[ToolkitRule], Field(min_length=1)]
+
+
 class ToolkitServer(_Model):
     kind: Literal["toolkit"]
     module: ModulePath
     tools: Tools = Tools()
+    # "off" serves the definitions the image holds; the classification floor still applies.
+    pinning: Literal["required", "off"] = "required"
+    review: dict[ToolName, Pin] = {}
+    on_drift: Literal["hide", "fail"] = "hide"  # treated as "hide" with pinning off
+    slots: dict[SlotName, ToolkitSlot] = {}
+    wrap_results: bool = False
+    call_timeout: Annotated[int, Field(ge=1, le=3600)] | None = None  # overrides limits
 
 
 Server = Annotated[RemoteServer | BridgeServer | ToolkitServer, Field(discriminator="kind")]

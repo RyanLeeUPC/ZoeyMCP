@@ -79,7 +79,7 @@ def gateway(**changes: Any) -> ViewGateway:
                 "approvals": None,
             },
         },
-        "servers": {"notes": REMOTE, "mail": {"kind": "toolkit"}, "other": REMOTE},
+        "servers": {"notes": REMOTE, "mail": {"kind": "bridge"}, "other": REMOTE},
     }
     raw.update(changes)
     return ViewGateway.model_validate(raw)
@@ -322,13 +322,13 @@ def test_an_unchanged_view_revokes_nothing() -> None:
 def test_a_removed_or_changed_client_is_revoked_everywhere() -> None:
     raw = gateway().model_dump()["clients"]
     del raw["alpha"]
-    # mail is a toolkit server, which this version never served: nothing to stop there.
+    # mail is a bridge server, which this version never serves: nothing to stop there.
     assert revoked(gateway(), gateway(clients=raw)) == {("alpha", "notes")}
     rekeyed = clients_with(alpha={"token_sha256": hash_token("zgc1-new-token")})
     assert revoked(gateway(), gateway(clients=rekeyed)) == {("alpha", "notes")}
-    # A toolkit server listed first doesn't hide the remote servers after it.
-    toolkit_first = clients_with(alpha={"servers": ["mail", "notes", "other"]})
-    assert revoked(gateway(clients=toolkit_first), gateway()) == {("alpha", "other")}
+    # An unserved server listed first doesn't hide the remote servers after it.
+    unserved_first = clients_with(alpha={"servers": ["mail", "notes", "other"]})
+    assert revoked(gateway(clients=unserved_first), gateway()) == {("alpha", "other")}
     repinned = clients_with(beta={"sources": ["10.0.0.0/8"]})
     assert revoked(gateway(), gateway(clients=repinned)) == {("beta", "notes")}
 
@@ -338,10 +338,10 @@ def test_an_unassigned_or_unserved_server_is_revoked() -> None:
     assert revoked(gateway(), gateway(clients=fewer)) == {("alpha", "notes")}
     both = clients_with(alpha={"servers": ["notes", "other"]})
     assert revoked(gateway(clients=both), gateway()) == {("alpha", "other")}
-    servers = {"mail": {"kind": "toolkit"}, "other": REMOTE}
+    servers = {"mail": {"kind": "bridge"}, "other": REMOTE}
     assert revoked(gateway(), gateway(servers=servers)) == {("alpha", "notes"), ("beta", "notes")}
-    toolkit = {"notes": {"kind": "toolkit"}, "mail": {"kind": "toolkit"}, "other": REMOTE}
-    assert revoked(gateway(), gateway(servers=toolkit)) == {("alpha", "notes"), ("beta", "notes")}
+    bridged = {"notes": {"kind": "bridge"}, "mail": {"kind": "bridge"}, "other": REMOTE}
+    assert revoked(gateway(), gateway(servers=bridged)) == {("alpha", "notes"), ("beta", "notes")}
 
 
 def test_server_for() -> None:
@@ -357,7 +357,7 @@ def test_server_for() -> None:
         ("alpha", "missing", "server not assigned"),
         ("alpha", "other", "server not assigned"),  # exists, not assigned
         ("gamma", "notes", "server not assigned"),
-        ("alpha", "mail", "server kind not served"),  # assigned, a toolkit
+        ("alpha", "mail", "server kind not served"),  # assigned, a bridge
     ],
 )
 def test_server_refusals_are_one_404(client: str, name: str, reason: str) -> None:

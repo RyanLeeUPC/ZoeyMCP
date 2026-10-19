@@ -118,7 +118,19 @@ gateway:
         cancel_order: sha256:26c3ac15931603b2f20397630050036633fd11d56ea08bd91e52895e92313ac7
       on_drift: fail
 
-    # Toolkits run from M4: until then check warns, and the gateway serves the other servers.
+    # A toolkit runs inside the gateway (examples/toolkits): it reaches the vault only through
+    # its slots, with the rules listed here, and shows the human the exact message to send.
     mail:
       kind: toolkit
-      module: my_toolkits.mail
+      module: example_toolkits.mail
+      tools:
+        include: [send_note]
+        approve: [send_note]
+      review: # from `zoeymcp review mail`
+        send_note: sha256:34aecee572ddd193955a4678774a9dc8cdd8c3a08f05f84c89e38b1c3631db32
+      slots:
+        mail:
+          route: mail-send
+          rules:
+            - { methods: [GET], paths: [/config] }
+            - { methods: [POST], paths: [/send], approved: true }

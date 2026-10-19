@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from urllib.parse import urlsplit
 
+from .. import canonical
 from .findings import Finding
 from .match import NormalizedPath, path_matches
 from .paths import PathPatternError, parse_path_pattern
@@ -27,6 +28,8 @@ from .schema import (
     RemoteServer,
     Route,
     Rule,
+    ToolkitRule,
+    ToolkitServer,
     hash_token,
     is_secret_ref,
     param_values,
@@ -95,6 +98,11 @@ _CONNECTOR_ENDPOINTS = frozenset({("GET", "/config"), ("POST", "/send")})
 MAX_ELICITATION_TIMEOUT = 600
 # A stop waits for approved calls already running; the shipped stop windows cover this long.
 STOP_WINDOW_CALL_TIMEOUT = 300
+# A.2's estimate of a mail prompt's size beyond its values: C.2's fixed frame with the example's
+# title and labels, the longest "In reply to" line (a MessageId is at most 250) and C.4's code line.
+PROMPT_FRAME_CHARS = 200
+PROMPT_REPLY_LINE_CHARS = 264
+PROMPT_CODE_LINE_CHARS = 44
 
 
 class _Report:
@@ -300,6 +308,64 @@ def _check_credentials(policy: Policy, report: _Report) -> None:
             report.warning(f"{path}.tls", f"port {conn.port} usually speaks {usual}")
         if conn.paused:
             report.warning(f"{path}.paused", "sends are paused")
+    _check_connector_use(policy, report)
+
+
+def _connector_slots(policy: Policy) -> dict[str, list[tuple[str, ToolkitServer]]]:
+    """Per connector, the toolkit servers (by name) with a slot routed to it."""
+    routes = {r.name: r for r in policy.routes}
+    found: dict[str, list[tuple[str, ToolkitServer]]] = defaultdict(list)
+    for name, server in policy.gateway.servers.items() if policy.gateway else ():
+        if not isinstance(server, ToolkitServer):
+            continue
+        for binding in server.slots.values():
+            route = routes.get(binding.route)
+            if route is not None and route.connector is not None:
+                found[route.connector].append((name, server))
+    return found
+
+
+def _check_connector_use(policy: Policy, report: _Report) -> None:
+    slots = _connector_slots(policy)
+    gateway = policy.gateway
+    for name, conn in policy.connectors.items():
+        path = f"connectors.{name}"
+        if not slots.get(name):
+            report.warning(path, "no toolkit slot maps a route to it")
+            continue
+        if gateway is None:
+            continue
+        values = (
+            conn.max_subject_chars
+            + conn.max_body_chars
+            + len(conn.from_)
+            + len(canonical.dumps_canonical(list(conn.to)))
+        )
+        for client_name, client in sorted(gateway.clients.items()):
+            if client.approvals is None:
+                continue
+            budget = client.approvals.budget_chars or gateway.approvals.budget_chars
+            code = PROMPT_CODE_LINE_CHARS if client.approvals.confirm_code else 0
+            for server_name, server in slots[name]:
+                if server_name not in client.servers:
+                    continue
+                for tool in server.tools.approve:
+                    size = (
+                        PROMPT_FRAME_CHARS
+                        + len(client_name)
+                        + len(server_name)
+                        + len(tool)
+                        + PROMPT_REPLY_LINE_CHARS
+                        + code
+                        + values
+                    )
+                    if size > budget:
+                        report.warning(
+                            path,
+                            f"a message near these limits can't be approved by {client_name!r} "
+                            f"(about {size} characters, budget {budget}); lower max_body_chars",
+                        )
+                        return
 
 
 def _origin(url: str) -> str | None:
@@ -445,11 +511,7 @@ def _check_resources(path: str, cred: OAuth2Credential, origins: set[str], repor
 def _check_routes(policy: Policy, report: _Report) -> None:
     names: dict[str, int] = {}
     prefixes: dict[str, int] = {}
-    mcp_routes = {
-        s.route
-        for s in (policy.gateway.servers.values() if policy.gateway else ())
-        if isinstance(s, RemoteServer)
-    }
+    mcp_routes = _remote_routes(policy)
     for index, route in enumerate(policy.routes):
         path = f"routes[{index}]"
         if route.name in names:
@@ -466,6 +528,15 @@ def _check_routes(policy: Policy, report: _Report) -> None:
         if route.connector is not None:
             _check_connector_rules(path, route, report)
         _check_route_query(policy, path, route, report)
+
+
+def _remote_routes(policy: Policy) -> set[str]:
+    """The routes remote gateway servers speak MCP through."""
+    return {
+        s.route
+        for s in (policy.gateway.servers.values() if policy.gateway else ())
+        if isinstance(s, RemoteServer)
+    }
 
 
 def _check_route_target(policy: Policy, path: str, route: Route, report: _Report) -> None:
@@ -620,6 +691,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
     if gateway is None:
         return
     routes = {r.name: r for r in policy.routes}
+    remote_routes = _remote_routes(policy)
     _check_clients(gateway, report)
     _check_approvals(gateway, report)
     assigned = {s for client in gateway.clients.values() for s in client.servers}
@@ -639,22 +711,15 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
                 report.error(f"{path}.route", f"unknown route {server.route!r}")
             else:
                 _check_mcp_route(path, server, route, server_paths[route.name], report)
+        _check_stop_window(path, server, gateway.limits.call_timeout, report)
         if isinstance(server, RemoteServer | BridgeServer):
             _check_upstream_server(path, server, report)
-            _check_stop_window(path, server, gateway.limits.call_timeout, report)
             _check_tools(
                 path, server.tools.include, server.tools.allow, server.tools.approve, report
             )
             _check_pins(path, server.tools.include, server.review, report)
         else:
-            _check_tools(
-                path,
-                server.tools.include,
-                server.tools.allow,
-                server.tools.approve,
-                report,
-                require_classification=False,
-            )
+            _check_toolkit(path, server, routes, remote_routes, report)
     limits = gateway.limits
     if limits.max_result_bytes > limits.max_upstream_message_bytes:
         report.error(
@@ -665,8 +730,60 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
         )
 
 
+def _check_toolkit(
+    path: str,
+    server: ToolkitServer,
+    routes: Mapping[str, Route],
+    remote_routes: set[str],
+    report: _Report,
+) -> None:
+    _check_tools(path, server.tools.include, server.tools.allow, server.tools.approve, report)
+    if server.pinning == "required":
+        _check_pins(path, server.tools.include, server.review, report)
+    else:  # off: pins would be ignored, so giving any is a mistake
+        if server.review:
+            report.error(f"{path}.review", "pins are given but pinning is off")
+        report.warning(
+            f"{path}.pinning",
+            "definitions follow the image; a rebuild can change a tool without review",
+        )
+    for slot, binding in sorted(server.slots.items()):
+        s_path = f"{path}.slots.{slot}"
+        route = routes.get(binding.route)
+        if route is None:
+            report.error(f"{s_path}.route", f"unknown route {binding.route!r}")
+            continue
+        if any(c != "gateway" for c in route.callers):
+            report.error(f"{s_path}.route", "a route a toolkit uses must accept only the gateway")
+        if route.name in remote_routes:
+            report.error(f"{s_path}.route", "a toolkit must not speak raw MCP to a reviewed server")
+        for index, rule in enumerate(binding.rules):
+            _check_toolkit_rule(f"{s_path}.rules[{index}]", rule, route, report)
+
+
+def _check_toolkit_rule(path: str, rule: ToolkitRule, route: Route, report: _Report) -> None:
+    for index, pattern in enumerate(rule.paths):
+        try:
+            parse_path_pattern(pattern)
+        except PathPatternError as exc:
+            report.error(f"{path}.paths[{index}]", f"{pattern!r}: {exc}")
+    # Textual equality with one of the route's own rules: that rule's params then constrain
+    # the captures. No containment between patterns is computed.
+    for method in rule.methods:
+        for pattern in rule.paths:
+            if not any(method in r.methods and pattern in r.paths for r in route.rules):
+                report.error(path, f"{method} {pattern}: the vault has no rule for this")
+    if route.connector is not None:
+        if "POST" in rule.methods and "/send" in rule.paths and not rule.approved:
+            report.error(f"{path}.approved", "POST /send through a connector needs approved: true")
+    elif any(m != "GET" for m in rule.methods) and not rule.approved:
+        report.warning(path, "every tool of this toolkit can make this write without a prompt")
+    if rule.approved and set(rule.methods) == {"GET"}:
+        report.warning(f"{path}.approved", "has no effect on a GET")
+
+
 def _check_stop_window(
-    path: str, server: RemoteServer | BridgeServer, default: int, report: _Report
+    path: str, server: RemoteServer | BridgeServer | ToolkitServer, default: int, report: _Report
 ) -> None:
     timeout = server.call_timeout or default
     if server.tools.approve and timeout > STOP_WINDOW_CALL_TIMEOUT:
@@ -687,7 +804,7 @@ def _check_clients(gateway: Gateway, report: _Report) -> None:
             server = gateway.servers.get(server_name)
             if server is None:
                 report.error(path, f"unknown server {server_name!r}")
-            elif not isinstance(server, RemoteServer):
+            elif isinstance(server, BridgeServer):
                 report.warning(
                     path, f"{server_name!r} is a {server.kind} server: not served by this version"
                 )

@@ -185,7 +185,17 @@ EXPECTED_GATEWAY: Raw = {
             "drift_check_interval": 60,
             "call_timeout": 3600,
         },
-        "mail": {"kind": "toolkit"},
+        "mail": {
+            "kind": "toolkit",
+            "module": "zoeymcp.toolkits.mail",
+            "tools": {"include": [], "allow": [], "approve": []},
+            "pinning": "required",
+            "review": {},
+            "on_drift": "hide",
+            "slots": {},
+            "wrap_results": False,
+            "call_timeout": None,
+        },
         "bridged": {"kind": "bridge"},
     },
 }
@@ -321,8 +331,14 @@ def test_secret_side_changes_leave_the_digest_alone() -> None:
     raw["credentials"]["notes-key"]["secret"] = "store:other-key"
     raw["routes"][0]["upstream"] = "https://mcp2.notes.example"
     raw["admin"]["hosts"] = ["admin.example"]
-    raw["gateway"]["servers"]["mail"]["module"] = "zoeymcp.toolkits.other"
     assert built(raw).digest == built().digest
+
+
+def test_a_toolkit_module_is_gateway_side() -> None:
+    """The gateway imports the module, so a new one is a new view."""
+    raw = raw_policy()
+    raw["gateway"]["servers"]["mail"]["module"] = "zoeymcp.toolkits.other"
+    assert built(raw).digest != built().digest
 
 
 # --- serving and parsing -----------------------------------------------------------------------
@@ -416,7 +432,8 @@ REMOTE = "gateway/servers/notes-read"
         (_set("gateway/clients/agent1/sources", ["not-a-net"]), "gateway.clients.agent1.sources"),
         (_drop("gateway/clients/agent1/sources"), "gateway.clients.agent1.sources"),
         (_copy("gateway/clients/agent1", "Agent"), "gateway.clients.Agent.[key]"),
-        (_set("gateway/servers/mail/module", "x.y"), "gateway.servers.mail.toolkit.module"),
+        (_set("gateway/servers/mail/module", "1x"), "gateway.servers.mail.toolkit.module"),
+        (_drop("gateway/servers/mail/slots"), "gateway.servers.mail.toolkit.slots"),
         (_set("gateway/servers/mail/kind", "local"), "gateway.servers.mail"),
         (_set(f"{REMOTE}/route", "notes-route"), "gateway.servers.notes-read.remote.route"),
         (_drop(f"{REMOTE}/vault_path"), "gateway.servers.notes-read.remote.vault_path"),

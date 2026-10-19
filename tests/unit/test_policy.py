@@ -59,7 +59,6 @@ def test_example_policy_is_clean(example_text: str) -> None:
     findings = check_policy(parse_policy(example_text, "example"))
     assert [f"{f.level} {f.path}" for f in findings] == [
         "warning credentials.broker-mcp.authorize_url",
-        "warning gateway.clients.agent1.servers",
     ]
 
 
@@ -367,10 +366,13 @@ def test_resolve_env(example_raw: Raw) -> None:
     assert errors(run(raw)) == []
 
 
-def test_toolkit_tools_need_no_classification(example_raw: Raw) -> None:
+def test_toolkit_tools_need_classification(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["servers"]["mail"]["tools"] = {"include": ["send_note"]}
-    assert errors(run(raw)) == []
+    assert errors(run(raw)) == [
+        "gateway.servers.mail.tools: 'send_note' is included but in neither allow nor approve; "
+        "every tool must be classified explicitly"
+    ]
 
 
 # --- OAuth: schema ----------------------------------------------------------------------------
@@ -1355,8 +1357,6 @@ def test_servers_this_version_does_not_serve(example_raw: Raw) -> None:
     assert found == [
         "warning gateway.clients.agent1.servers: 'bridge1' is a bridge server: "
         "not served by this version",
-        "warning gateway.clients.agent1.servers: 'mail' is a toolkit server: "
-        "not served by this version",
     ]
 
 
@@ -1651,7 +1651,14 @@ def test_a_repeated_tool_is_not_a_case_clash(example_raw: Raw) -> None:
 
 def test_toolkit_tools_that_differ_only_in_case(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
-    raw["gateway"]["servers"]["mail"]["tools"] = {"include": ["send", "Send"]}
+    raw["gateway"]["servers"]["mail"]["tools"] = {
+        "include": ["send", "Send"],
+        "approve": ["send", "Send"],
+    }
+    raw["gateway"]["servers"]["mail"]["review"] = {
+        "send": "sha256:" + "0" * 64,
+        "Send": "sha256:" + "1" * 64,
+    }
     assert errors(run(raw)) == ["gateway.servers.mail.tools: 'Send', 'send' differ only in case"]
 
 
@@ -1994,8 +2001,8 @@ def test_approval_and_connector_errors(
         ),
         (
             lambda r: _agent1(r).pop("approvals"),
-            "gateway.clients.agent1: not attended, but assigned 'broker-trade' with approve "
-            "tools: they will always be refused",
+            "gateway.clients.agent1: not attended, but assigned 'broker-trade', 'mail' with "
+            "approve tools: they will always be refused",
         ),
         (
             lambda r: _agent1(r)["approvals"].update(attended=False),
@@ -2048,7 +2055,7 @@ def test_quiet_approval_settings(example_raw: Raw) -> None:
     raw["gateway"]["servers"]["broker-trade"].update(call_timeout=300)
     findings = run(raw)
     assert errors(findings) == []
-    assert len(warnings(findings)) == 2  # the example's own two
+    assert len(warnings(findings)) == 1  # the example's own one
 
 
 def test_an_env_connector_password_is_an_error_only(example_raw: Raw) -> None:
@@ -2066,7 +2073,7 @@ def test_an_env_connector_password_is_an_error_only(example_raw: Raw) -> None:
 def test_unattended_clients_without_approve_tools_are_quiet(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     del _agent1(raw)["approvals"]
-    _agent1(raw)["servers"] = ["broker-read", "mail"]
+    _agent1(raw)["servers"] = ["broker-read"]
     assert not any("not attended" in w for w in warnings(run(raw)))
 
 
