@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 
 from zoeymcp.common import logs as common_logs
+from zoeymcp.portal.actions import Action, Actions, HeldData
+from zoeymcp.portal.sessions import Ceremonies, Ceremony, SessionToken
 from zoeymcp.vault import logs
 from zoeymcp.vault.store import Secret
 
@@ -116,6 +118,31 @@ def test_refuses_to_log_a_secret(lines: io.StringIO) -> None:
 def test_refuses_a_secret_inside_a_container(value: Any, lines: io.StringIO) -> None:
     with pytest.raises(TypeError, match=r"^refusing to log a secret \(Secret\) in field 'f'$"):
         logs.event("oops", f=value)
+    assert lines.getvalue() == ""
+
+
+def _portal_values() -> list[Any]:
+    ceremony = Ceremonies().begin_login(origin="http://localhost:8081", peer="p", now=0.0)
+    assert isinstance(ceremony, Ceremony)
+    action = Actions().prepare(
+        kind="secret.delete",
+        data={"name": "notes-key"},
+        plan=None,
+        session="ab" * 16,
+        origin="http://localhost:8081",
+        now=0.0,
+    )
+    return [SessionToken("fake-session-half"), ceremony, HeldData({"value": "x"}), action]
+
+
+@pytest.mark.parametrize("value", _portal_values(), ids=lambda v: type(v).__name__)
+def test_the_portals_secret_types_are_refused_nested(value: Any, lines: io.StringIO) -> None:
+    # Each registers itself where it is defined (M.4).
+    message = rf"^refusing to log a secret \({type(value).__name__}\) in field 'f'$"
+    for wrapped in (value, [value], {"outer": [{"inner": (value,)}]}, {value: 1}):
+        with pytest.raises(TypeError, match=message):
+            logs.event("oops", f=wrapped)
+    assert {SessionToken, Ceremony, HeldData, Action} <= set(common_logs.refused_types())
     assert lines.getvalue() == ""
 
 
