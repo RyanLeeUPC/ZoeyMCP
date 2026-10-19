@@ -34,7 +34,9 @@ VAULT_SIDE = ("vault", "common", "selftest", "entrypoint")
 CLI = "cli"
 ENTRY_POINTS = ("__init__.py", "__main__.py")
 # Code the gateway's process runs (common is shared) and that never reaches the vault's code.
-GATEWAY_SIDE = ("gateway", "common")
+GATEWAY_SIDE = ("gateway", "common", "toolkit")
+# The one toolkit module that may use the gateway's code: a test helper (M4 design G.1).
+TOOLKIT_TESTING = "toolkit/testing.py"
 # The gateway extra's own packages, named here so that no guard can pass vacuously.
 ALWAYS_GATEWAY_ONLY = frozenset({"mcp", "mcp_types", "httpx2", "httpcore2", "jsonschema", "regex"})
 # Every distribution only the gateway's environment has, on any platform, by normalized name.
@@ -286,6 +288,36 @@ def test_the_cli_never_imports_gateway_packages() -> None:
 
 def test_gateway_code_never_imports_vault_code() -> None:
     assert violations(PACKAGE.parent, GATEWAY_SIDE, ["zoeymcp.vault"]) == []
+
+
+def test_every_subpackage_has_a_side() -> None:
+    """A new subpackage must be placed, so no guard misses it."""
+    placed = {*VAULT_SIDE, *GATEWAY_SIDE, CLI}
+    found = {p.parent.name for p in PACKAGE.glob("*/__init__.py")}
+    assert found - placed == set()
+    assert placed - found == set()
+
+
+def test_the_toolkit_sdk_uses_only_common_and_the_standard_library() -> None:
+    """A toolkit author imports ``zoeymcp.toolkit``; only its test helper needs the gateway."""
+    found = []
+    for path in sorted((PACKAGE / "toolkit").rglob("*.py")):
+        if path.relative_to(PACKAGE).as_posix() == TOOLKIT_TESTING:
+            continue
+        for name in imported_modules(path, module_name(path, PACKAGE.parent)):
+            top = name.partition(".")[0]
+            if top == "zoeymcp":
+                if name != "zoeymcp" and not name.startswith(("zoeymcp.common", "zoeymcp.toolkit")):
+                    found.append(f"{path.name}: {name}")
+            elif top and top not in sys.stdlib_module_names and top != "__future__":
+                found.append(f"{path.name}: {name}")
+    assert found == []
+
+
+def test_only_the_toolkit_test_helper_imports_the_gateway() -> None:
+    found = violations(PACKAGE.parent, ["toolkit"], ["zoeymcp.gateway"])
+    assert found
+    assert {f.partition(":")[0] for f in found} == {f"zoeymcp/{TOOLKIT_TESTING}"}
 
 
 def test_the_launcher_uses_the_standard_library_only() -> None:
