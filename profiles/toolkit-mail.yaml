@@ -1,0 +1,37 @@
+# S15: an agent sends mail through the example mail toolkit; the operator approves each message
+# (M4). Use it with smtp-implicit-tls.yaml or smtp-starttls.yaml, which define the mail-out
+# connector and the mail-send route this toolkit's slot uses.
+#
+# The toolkit runs inside the gateway (a derived image: examples/derived-image). It reads the
+# connector's sender and recipients from the vault, shows the human the exact message, and after
+# an accept sends it once. The vault fixes the recipients; the toolkit can't change them.
+#
+#   1. Build and verify the derived image, and run its gateway (ZOEYMCP_GATEWAY_IMAGE).
+#   2. Make a client token for the agent (zoeymcp client-token) and put its hash below. The
+#      client must be attended: a human answers its prompts.
+#   3. Review the toolkit and commit the pin it prints: zoeymcp review mail
+#
+# To stop sending at once, pause the connector (paused: true) and reload the vault.
+
+gateway:
+  clients:
+    agent1:
+      token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      sources: [192.0.2.0/24] # the agent's network as the gateway sees it
+      approvals: { attended: true }
+      servers: [mail]
+  servers:
+    mail:
+      kind: toolkit
+      module: example_toolkits.mail
+      tools:
+        include: [send_note]
+        approve: [send_note] # consequential in the code: it can't be allowed
+      review: # from `zoeymcp review mail`
+        send_note: sha256:34aecee572ddd193955a4678774a9dc8cdd8c3a08f05f84c89e38b1c3631db32
+      slots:
+        mail:
+          route: mail-send
+          rules:
+            - { methods: [GET], paths: [/config] }
+            - { methods: [POST], paths: [/send], approved: true }

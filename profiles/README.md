@@ -28,3 +28,5 @@ ones by `tests/unit/test_smtp_connector.py`.
 | `remote-mcp-static-key.yaml` | S10: a remote MCP server with a static key, behind the gateway (also a `gateway:` fragment) | any MCP server that takes an API key |
 | `smtp-implicit-tls.yaml` | S13: send mail with an app password, implicit TLS on 465, fixed recipients, optionally through CONNECT | any mail provider with app passwords |
 | `smtp-starttls.yaml` | S14: the same with STARTTLS on 587, required, never optional | any mail provider with app passwords |
+| `toolkit-mail.yaml` | S15: the example mail toolkit, each message approved as shown (with an SMTP profile; a `gateway:` fragment) | any of the SMTP profiles' providers |
+| `toolkit-records.yaml` | S16: the example records toolkit, batch reads and approved batch writes, no delete (also a `gateway:` fragment) | any JSON records API with a key |

@@ -1,0 +1,58 @@
+# S16: batch tools against an HTTP records API, through the example records toolkit (M4).
+#
+# A sandbox that can't loop over MCP calls makes one call per batch. Reading is routine; adding
+# and archiving are consequential, so each batch is one plan in one prompt, with per-item results
+# and every added record read back. "Archive, never delete" is the vault's to enforce: the route
+# has no DELETE rule, so neither can the slot.
+#
+#   1. Store the API key: zoeymcp secret set records-key
+#   2. Build and verify the derived image (examples/derived-image) and run its gateway.
+#   3. Put the agent's client token hash below, and review: zoeymcp review records
+#
+# Each slot rule must be textually one of the route's rules, so the route's params constrain
+# the toolkit's paths too: here {id} is one plain segment.
+
+credentials:
+  records-key:
+    kind: header
+    secret: store:records-key # sent as Authorization: Bearer <key>
+
+routes:
+  - name: records
+    prefix: /records
+    upstream: https://api.records.example
+    credential: records-key
+    callers: [gateway] # the gateway only: a sandbox script can't write
+    rules:
+      - methods: [GET]
+        paths: ["/v1/records/{id}"]
+        params: { id: { regex: "[A-Za-z0-9_-]{1,64}" } }
+      - methods: [POST]
+        paths: [/v1/records/batch, /v1/records/archive]
+
+gateway:
+  clients:
+    agent1:
+      token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      sources: [192.0.2.0/24]
+      approvals: { attended: true }
+      servers: [records]
+  servers:
+    records:
+      kind: toolkit
+      module: example_toolkits.records
+      tools:
+        include: [get_records, add_records, archive_records]
+        allow: [get_records]
+        approve: [add_records, archive_records]
+      review: # from `zoeymcp review records`
+        add_records: sha256:3b939b2e0fcb65730afa149029399c2dca17578a98b76e7984235636aa017e32
+        archive_records: sha256:6de0b9d74c65970de98ff17e7f4f03d61eb87f2080758c771f4431ef6d497579
+        get_records: sha256:f594a4bb57420a1b4b39290be9cef12d2d515011e9003d4bf831314da2fa226e
+      slots:
+        db:
+          route: records
+          rules:
+            - { methods: [GET], paths: ["/v1/records/{id}"] }
+            - { methods: [POST], paths: [/v1/records/batch], approved: true }
+            - { methods: [POST], paths: [/v1/records/archive], approved: true }
