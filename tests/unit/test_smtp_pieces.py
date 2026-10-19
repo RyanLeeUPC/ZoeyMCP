@@ -178,8 +178,9 @@ def test_records_round_trip_and_hold_no_values() -> None:
     ],
 )
 def test_bad_records(record: dict[str, Any]) -> None:
+    fields = dict(record)  # a copy: the parameter is shared between runs
     with pytest.raises(JournalError):
-        sendjournal.encode(record.pop("kind"), **record)
+        sendjournal.encode(fields.pop("kind"), **fields)
 
 
 def test_parse_refuses_garbage() -> None:
