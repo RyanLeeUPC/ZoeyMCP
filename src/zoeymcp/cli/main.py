@@ -160,6 +160,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-root", action="store_true", help="run as root anyway (development only)"
     )
     gateway.add_argument(
+        "--allow-writable-toolkits",
+        action="store_true",
+        help="load toolkits from paths the gateway could write (development only; logged)",
+    )
+    gateway.add_argument(
         "--control-fd",
         type=int,
         metavar="FD",
@@ -413,6 +418,7 @@ def _cmd_gateway(args: argparse.Namespace, out: TextIO) -> int:
         admin_socket=admin_socket,
         allow_root=args.allow_root,
         control_fd=args.control_fd,
+        allow_writable_toolkits=args.allow_writable_toolkits,
     )
     try:
         run(options, os.environ)

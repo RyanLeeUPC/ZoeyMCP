@@ -13,6 +13,11 @@ refreshes ``era`` and keeps every pin, so a drifted tool stays hidden. ``--repin
 drifted tool's new pin, and ``--add TOOL`` includes a tool, leaving its classification to the
 operator: ``check`` fails until it is in ``allow`` or ``approve`` (nothing is implied). No pin
 line is ever written for a tool with an error finding.
+
+For a toolkit server (M4 design H.6), ``--add TOOL`` puts a tool its code declares consequential
+into ``approve`` ("declared by the toolkit") and leaves a routine one to the operator, as for a
+remote tool. With ``pinning: off`` the snippet has no pins, and every definition is printed, so an
+image change can be read before or after it is deployed.
 """
 
 from __future__ import annotations
@@ -137,18 +142,26 @@ def snippet(review: dict[str, Any], choices: Choices) -> list[str]:
     era = review.get("era")
     if era in ("modern", "legacy"):
         lines.append(f"      era: {era}")
+    toolkit = review.get("kind") == "toolkit"
     added = [name for name in choices.add if TOOL_NAME.fullmatch(name)]
     if added:
+        by_name = {entry["name"]: entry for entry in entries}
+        declared = [n for n in added if toolkit and by_name.get(n, {}).get("consequential")]
         include = [*policy_tools.get("include", []), *added]
         lines += [
             "      tools:",
             f"        include: {yaml_list(include)}",
             f"        allow: {yaml_list(policy_tools.get('allow', []))}",
-            f"        approve: {yaml_list(policy_tools.get('approve', []))}",
+            f"        approve: {yaml_list([*policy_tools.get('approve', []), *declared])}",
         ]
+        lines += [f"        # {name}: approve, declared by the toolkit" for name in declared]
         lines += [
-            f"        # {name}: put it in allow or approve; nothing is implied" for name in added
+            f"        # {name}: put it in allow or approve; nothing is implied"
+            for name in added
+            if name not in declared
         ]
+    if toolkit and review.get("pinning") == "off":
+        return [*lines, "      review: {}  # pinning: off: definitions follow the image"]
     pin_lines: list[str] = []
     comments: list[str] = []
     for entry in sorted(entries, key=lambda entry: entry["name"]):
@@ -190,6 +203,8 @@ def _tool_line(entry: dict[str, Any], width: int) -> str:
         what = "changed: " + ", ".join(changed) if changed else "changed (no reviewed copy kept)"
         return f"  {name}  {label:<10}  {what}    hidden, marked"
     detail = short_pin(entry["pin"])
+    if entry.get("consequential"):
+        detail += "  consequential"
     if not entry["included"] and state == "unreviewed":
         detail += "  not included"
     elif state == "marked":
@@ -206,7 +221,17 @@ def render(review: dict[str, Any], choices: Choices) -> list[str]:
         for part in (review.get("era") or "era unknown", review.get("protocol_version"))
         if part
     )
-    lines = [f"server {review['server']}  (remote, vault path {review['vault_path']}, {era})"]
+    if review.get("kind") == "toolkit":
+        version = f" {review['version']}" if review.get("version") else ""
+        lines = [
+            f"server {review['server']}  (toolkit {review['module']}, "
+            f"{review.get('distribution') or 'unknown distribution'}{version}, "
+            f"pinning {review['pinning']})"
+        ]
+        if review.get("pinning") == "off":
+            choices = Choices(choices.tools, choices.show, True, choices.add, choices.repin)
+    else:
+        lines = [f"server {review['server']}  (remote, vault path {review['vault_path']}, {era})"]
     info = review.get("server_info")
     if info:
         described = " ".join(f'{key} "{untrusted(value, 200)}"' for key, value in info.items())

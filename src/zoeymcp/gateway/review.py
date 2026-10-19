@@ -13,6 +13,10 @@ only; they are never forwarded to an agent.
 ``--clear`` lists again and, only if every included tool matches its pin, clears the server's
 drift marks and re-evaluates the server's live connections, so the tools come back for agents.
 A connection whose own last listing still shows drift marks the tool again.
+
+A toolkit server is reviewed without any upstream call (M4 design H.6): its definitions are the
+ones the loaded module generates, and the answer adds the distribution, its version, and each
+tool's classification as the code declares it.
 """
 
 from __future__ import annotations
@@ -24,11 +28,12 @@ import anyio
 from mcp.types import Implementation, Tool
 
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewRemoteServer
+from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from . import logs, pins
 from .connstate import WAITING, Phase
 from .defstore import changed_members, diff
 from .findings import tool_findings
+from .toolkits import Loaded, SelfPinned
 from .upstream import CLOSE_GRACE, Connection, UpstreamError
 
 MAX_INSTRUCTIONS_CHARS = 16_384
@@ -55,7 +60,7 @@ class ReviewError(Exception):
         return {"error": str(self), "reason": self.reason, **self.data}
 
 
-def classification(policy: ViewRemoteServer, tool: str) -> str | None:
+def classification(policy: pins.Reviewed, tool: str) -> str | None:
     if tool in policy.tools.allow:
         return "allow"
     if tool in policy.tools.approve:
@@ -68,7 +73,7 @@ def _state(
     evaluation: pins.Evaluation,
     reports: Sequence[pins.Report],
     pin: str | None,
-    policy: ViewRemoteServer,
+    policy: pins.Reviewed,
     marked: Set[str],
 ) -> ToolState:
     if name in evaluation.exposed:
@@ -89,7 +94,7 @@ def _tool_entry(
     name: str,
     tool: Tool | None,
     state: ToolState,
-    policy: ViewRemoteServer,
+    policy: pins.Reviewed,
     defs: Callable[[str], Mapping[str, Any] | None],
     limits: GatewayLimits,
 ) -> dict[str, Any]:
@@ -201,10 +206,10 @@ def report(
     }
 
 
-# --- running a review ----------------------------------------------------------------------------
+# --- running a review ---------------------------------------------------------------------------
 
 
-def _policy(app: Any, server: str) -> tuple[ViewRemoteServer, GatewayLimits]:
+def _policy(app: Any, server: str) -> tuple[ViewRemoteServer | ViewToolkitServer, GatewayLimits]:
     snapshot = app.policy.fresh()
     if snapshot is None:
         raise ReviewError(503, "no_view", "the gateway has no fresh view of the policy")
@@ -212,7 +217,7 @@ def _policy(app: Any, server: str) -> tuple[ViewRemoteServer, GatewayLimits]:
     policy = gateway.servers.get(server)
     if policy is None:
         raise ReviewError(404, "unknown_server", f"no gateway server named {server!r}")
-    if not isinstance(policy, ViewRemoteServer):
+    if not isinstance(policy, ViewRemoteServer | ViewToolkitServer):
         raise ReviewError(
             409, "unsupported", f"{server!r} is a {policy.kind} server; this version can't serve it"
         )
@@ -246,6 +251,8 @@ async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any
     """Review ``server`` on a fresh connection; with ``clear``, also clear its drift marks if
     every included tool matches. Raises :class:`ReviewError`."""
     policy, limits = _policy(app, server)
+    if isinstance(policy, ViewToolkitServer):
+        return review_toolkit(app, server, policy, limits, clear=clear)
     pool = app.pool
     try:
         connection = pool.review_connection(server, policy)
@@ -300,5 +307,119 @@ async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any
             live.reevaluate(live.policy)
     # The review's own listing, as it evaluates with the marks gone.
     answer = build(pins.evaluate(tools, policy, pool.marks.for_server(server), limits))
+    answer["cleared"] = sorted(tool for tool, _ in removed)
+    return answer
+
+
+# --- toolkits (M4 design H.6) -------------------------------------------------------------------
+
+
+def _no_reviewed_copy(pin: str) -> Mapping[str, Any] | None:
+    return None
+
+
+def toolkit_report(
+    server: str,
+    loaded: Loaded,
+    policy: ViewToolkitServer,
+    *,
+    marks: Set[pins.Mark],
+    limits: GatewayLimits,
+) -> dict[str, Any]:
+    """The review of a loaded toolkit: its own definitions, no upstream involved."""
+    marked = {tool for tool, _ in marks}
+    evaluation: pins.Evaluation = loaded.evaluation
+    reviewed: pins.Reviewed = policy
+    if policy.pinning == "off":
+        reviewed = SelfPinned(policy.tools, {n: e.pin for n, e in evaluation.exposed.items()})
+    entries = []
+    for name, spec in sorted(loaded.toolkit.tools.items()):
+        tool = Tool.model_validate(spec.definition())
+        reports = [r for r in evaluation.reports if r.tool == name]
+        try:
+            pin = pins.project_and_pin(tool).pin
+        except pins.ProjectionError:
+            pin = None
+        floor = spec.consequential and name in policy.tools.allow
+        state = _state(name, evaluation, reports, pin, reviewed, marked)
+        if floor and name not in evaluation.exposed and not reports:
+            state = "invalid"  # hidden by the classification floor (H.2 step 7)
+        entry = _tool_entry(name, tool, state, reviewed, _no_reviewed_copy, limits)
+        entry["consequential"] = spec.consequential
+        if floor:
+            entry["findings"].append(
+                {
+                    "level": "error",
+                    "pointer": "",
+                    "message": "consequential in the toolkit's code, so it can't be in allow",
+                }
+            )
+        entries.append(entry)
+    for name in sorted(set(policy.tools.include) - set(loaded.toolkit.tools)):
+        entries.append(_tool_entry(name, None, "missing", reviewed, _no_reviewed_copy, limits))
+    included = [entry for entry in entries if entry["included"]]
+    return {
+        "server": server,
+        "kind": "toolkit",
+        "module": loaded.module,
+        "distribution": loaded.distribution,
+        "version": loaded.version,
+        "pinning": policy.pinning,
+        "slots": sorted(loaded.toolkit.slots),
+        "policy": {
+            "include": list(policy.tools.include),
+            "allow": list(policy.tools.allow),
+            "approve": list(policy.tools.approve),
+            "on_drift": policy.on_drift,
+        },
+        "blocked": evaluation.blocked,
+        "marked": sorted(marked),
+        "tools": entries,
+        "clean": not marked and all(entry["state"] == "ok" for entry in included),
+    }
+
+
+def review_toolkit(
+    app: Any, server: str, policy: ViewToolkitServer, limits: GatewayLimits, *, clear: bool
+) -> dict[str, Any]:
+    """Review a toolkit server; with ``clear``, clear its drift marks if every included tool
+    matches, and evaluate it again. Raises :class:`ReviewError`."""
+    found = app.toolkits.get(server)
+    if not isinstance(found, Loaded):
+        reason = found.reason if found is not None else "not_loaded"
+        raise ReviewError(
+            409, "toolkit_unavailable", f"the toolkit isn't loaded ({reason})", unavailable=reason
+        )
+    marks = app.pool.marks
+    answer = toolkit_report(server, found, policy, marks=marks.for_server(server), limits=limits)
+    logs.event(
+        "review", server=server, tools=len(found.toolkit.tools), clean=answer["clean"], clear=clear
+    )
+    if not clear:
+        return answer
+    unmatched = [
+        entry["name"]
+        for entry in answer["tools"]
+        if entry["included"] and entry["state"] not in MATCHING
+    ]
+    if unmatched:
+        raise ReviewError(
+            409,
+            "not_clean",
+            "not every included tool matches its pin: " + ", ".join(unmatched),
+            tools=unmatched,
+            review=answer,
+        )
+    removed = marks.replace(server, frozenset())[1]
+    if removed:
+        logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by="review")
+    snapshot = app.policy.fresh()
+    if snapshot is not None:
+        app.toolkits.apply(snapshot.view.gateway)
+    reloaded = app.toolkits.get(server)
+    if isinstance(reloaded, Loaded):
+        answer = toolkit_report(
+            server, reloaded, policy, marks=marks.for_server(server), limits=limits
+        )
     answer["cleared"] = sorted(tool for tool, _ in removed)
     return answer

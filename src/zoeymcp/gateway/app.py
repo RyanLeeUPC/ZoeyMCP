@@ -51,7 +51,8 @@ from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
-from ..common.policy.view import ViewGateway, ViewRemoteServer
+from ..common.policy.schema import GatewayLimits
+from ..common.policy.view import ViewGateway, ViewRemoteServer, ViewToolkitServer
 from . import access, logs, pipeline
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
@@ -60,7 +61,9 @@ from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier
 from .policyclient import PolicyClient, Snapshot
-from .toolsource import RemoteSource, ToolSource
+from .toolkits import Toolkits
+from .toolkitsource import ToolkitSource, ToolkitUnavailable
+from .toolsource import RemoteSource, ServedServer, ToolSource
 from .upstream import NotAdmitted, UpstreamError, UpstreamPool
 
 HEALTH_PATH = "/healthz"
@@ -74,7 +77,7 @@ class RequestScope:
 
     client: str
     server: str
-    policy: ViewRemoteServer
+    policy: ServedServer
     snapshot: Snapshot
     era: Era
     session_id: str | None
@@ -254,8 +257,10 @@ class GatewayApp:
         notifier: Notifier | None = None,
         clock: Callable[[], float] = time.monotonic,
         policy_wait: int | None = None,
+        toolkits: Toolkits | None = None,
     ) -> None:
         self.pool = pool
+        self.toolkits = toolkits or Toolkits(pool.link, pool.keys, pool.marks)
         self.notifier = notifier if notifier is not None else Notifier()
         self.clock = clock
         options = {"wait": policy_wait} if policy_wait is not None else {}
@@ -277,6 +282,7 @@ class GatewayApp:
         self.counters = access.ClientCounters()
         self.in_flight = pipeline.InFlight()
         self.remote = RemoteSource(pool)
+        self.toolkit_source = ToolkitSource(self.toolkits, self._limits)
         # Approved calls past their accept; a shutdown waits for them first (M4 design B.6).
         self.committed = Committed()
         # Set by the stop signal, before uvicorn starts draining: new approvals are refused.
@@ -292,6 +298,10 @@ class GatewayApp:
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
+
+    def _limits(self) -> GatewayLimits:
+        snapshot = self.policy.snapshot
+        return snapshot.view.gateway.limits if snapshot is not None else GatewayLimits()
 
     @property
     def ledger(self) -> Ledger | None:
@@ -349,6 +359,7 @@ class GatewayApp:
                 if stopped:
                     logs.event("requests_stopped", client=client, server=server, count=stopped)
         self.pool.apply(gateway)
+        self.toolkits.apply(gateway)
         if previous is not None:
             withdrawn = await self.approvals.withdraw_unallowed(gateway)
             if withdrawn:
@@ -357,7 +368,7 @@ class GatewayApp:
             keep = {
                 pin
                 for server in gateway.servers.values()
-                if isinstance(server, ViewRemoteServer)
+                if isinstance(server, ViewRemoteServer | ViewToolkitServer)
                 for pin in server.review.values()
             }
             for server_name in self.pool.marks.servers():
@@ -453,6 +464,7 @@ class GatewayApp:
                     logs.event("shutdown_deadline_passed", cancelled=len(cancelled), level="error")
                 stopping.set()
                 await self.pool.aclose()
+                await self.toolkits.aclose()
                 group.cancel_scope.cancel()
         finally:
             self.committed.attach(None)
@@ -766,6 +778,18 @@ class GatewayApp:
             evaluation = await self.source(request.policy).exposed(
                 request.client, request.server, request.policy
             )
+        except ToolkitUnavailable as exc:
+            ref = pipeline.new_ref()
+            logs.event(
+                "request",
+                client=request.client,
+                server=request.server,
+                rpc="tools/list",
+                outcome="toolkit_unavailable",
+                reason=exc.reason,
+                ref=ref,
+            )
+            raise MCPError(mcp_types.INTERNAL_ERROR, f"toolkit unavailable (ref {ref})") from exc
         except (NotAdmitted, UpstreamError) as exc:
             ref = pipeline.new_ref()
             logs.event(
@@ -876,8 +900,10 @@ class GatewayApp:
             return None
         return self.source(request.policy).input_schema(request.client, request.server, name)
 
-    def source(self, policy: Any) -> ToolSource:
-        """Where a server's tools come from. Every served server is remote until M4 step 12."""
+    def source(self, policy: ServedServer) -> ToolSource:
+        """Where a server's tools come from: its kind's source."""
+        if isinstance(policy, ViewToolkitServer):
+            return self.toolkit_source
         return self.remote
 
     def _register(self, ctx: ServerRequestContext[Any], request: RequestScope) -> None:

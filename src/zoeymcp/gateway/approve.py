@@ -36,7 +36,7 @@ from mcp.shared.exceptions import MCPError, NoBackChannelError
 from mcp.types import CallToolResult, TextContent
 
 from ..common import approvaltext, canonical
-from ..common.approvaltext import ApprovalText, Header
+from ..common.approvaltext import ApprovalText, Header, Plan
 from ..common.policy.schema import ClientApprovals
 from ..common.policy.view import ViewGateway
 from . import approvals, logs
@@ -133,6 +133,8 @@ class Asking:
     input_responses: Mapping[str, Any] | None = None
     session_sha256: str | None = None
     disconnected: anyio.Event | None = None  # the legacy POST stream dropped (D.4)
+    # A toolkit tool's prepare step (G.3): its plan, None without one, or the agent's failure.
+    prepare: Callable[[], Awaitable[Plan | CallToolResult | None]] | None = None
 
     @property
     def key(self) -> Key:
@@ -188,14 +190,21 @@ class Approvals:
         refusal = self._gate(asking)
         if refusal is not None:
             return refusal
+        plan = None
+        if asking.prepare is not None:  # step 5.5, before the lock (G.3)
+            prepared = await asking.prepare()
+            if isinstance(prepared, CallToolResult):
+                return prepared
+            plan = prepared
         settings = _settings(asking.gateway, own, asking.policy)
         code = approvals.new_code() if own.confirm_code else None
         asked_wall = self.wall()
-        text = approvaltext.render_call(
-            _header(asking, asked_wall + settings.timeout),
-            asking.args,
-            code=code.reveal() if code is not None else None,
-        )
+        header = _header(asking, asked_wall + settings.timeout)
+        shown_code = code.reveal() if code is not None else None
+        if plan is not None:
+            text = approvaltext.render_plan(header, plan, code=shown_code)
+        else:
+            text = approvaltext.render_call(header, asking.args, code=shown_code)
         found = approvaltext.problems(
             text, budget=_budget(asking.gateway, own), renders=own.renders
         )
@@ -218,6 +227,7 @@ class Approvals:
             args_digest=canonical.digest(asking.args),
             pin=asking.pin,
             text_sha256=hashlib.sha256(text.value.encode()).hexdigest(),
+            plan=plan,
             code=code,
             session_sha256=asking.session_sha256,
             handle_sha256=handle.sha256() if handle is not None else None,
@@ -240,7 +250,7 @@ class Approvals:
                 pin=asking.pin,
                 text=self.ledger.text_digest(text.value),
                 chars=len(text.value),
-                writes=0,
+                writes=len(plan.writes) if plan is not None else 0,
                 expires=int((asked_wall + settings.timeout) * 1000),
             )
         except LedgerUnavailable:
@@ -254,7 +264,7 @@ class Approvals:
             ref=asking.ref,
             era=asking.era,
             chars=len(text.value),
-            writes=0,
+            writes=len(plan.writes) if plan is not None else 0,
             timeout_s=settings.timeout,
             code=code is not None,
         )
@@ -456,7 +466,7 @@ class Approvals:
                 return with_ref(LEDGER_DOWN, record.ref)
             self._log_decided(record, "accept", anchor)
             try:
-                result = await asking.forward(Grant(record.ref, asking.args))
+                result = await asking.forward(Grant(record.ref, asking.args, record.plan))
             except NotAdmitted:
                 outcome = {"outcome": "not_sent", "detail": "changed"}
                 return with_ref(CHANGED, record.ref)

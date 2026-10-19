@@ -191,24 +191,40 @@ async def test_only_the_mcp_path_and_health(tmp_path: Path) -> None:
 # --- G5: servers and sessions -------------------------------------------------------------------
 
 TOOLKIT = {"mail": {"kind": "toolkit", "module": "example_toolkits.mail"}}
+BRIDGE = {"bridged": {"kind": "bridge", "url": "https://bridge.example/mcp"}}
 
 
-async def test_unknown_unassigned_and_toolkit_servers_are_one_404(tmp_path: Path) -> None:
+async def test_unknown_unassigned_and_bridge_servers_are_one_404(tmp_path: Path) -> None:
     fake = McpFake()
     options = {
         "include": TOOLS,
         "review": review(fake),
         "clients": ("agent1", "agent2"),
-        "servers": TOOLKIT,
-        "assigned": {"agent1": [SERVER, "mail"], "agent2": []},
+        "servers": BRIDGE,
+        "assigned": {"agent1": [SERVER, "bridged"], "agent2": []},
     }
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         unknown = post(running, server="nowhere")
         unassigned = post(running, client="agent2")
-        toolkit = post(running, server="mail")
-    assert {unknown.status_code, unassigned.status_code, toolkit.status_code} == {404}
-    assert len({unknown.content, unassigned.content, toolkit.content}) == 1
+        bridged = post(running, server="bridged")
+    assert {unknown.status_code, unassigned.status_code, bridged.status_code} == {404}
+    assert len({unknown.content, unassigned.content, bridged.content}) == 1
     assert fake.received == []
+
+
+async def test_a_toolkit_server_that_didnt_load_answers_in_the_protocol(tmp_path: Path) -> None:
+    """Assigned toolkit servers are admitted, loaded or not, so clients retry (M4 design H.2)."""
+    fake = McpFake()
+    options = {
+        "include": TOOLS,
+        "review": review(fake),
+        "servers": TOOLKIT,
+        "assigned": {"agent1": [SERVER, "mail"], "agent2": []},
+    }
+    with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
+        answer = post(running, server="mail")
+    assert answer.status_code == 200
+    assert [e["reason"] for e in deployed.events("toolkit_unavailable")] == ["not_registered"]
 
 
 async def test_a_session_works_only_for_its_client_and_server(tmp_path: Path) -> None:
@@ -804,7 +820,11 @@ async def test_the_status_names_servers_and_counts_never_secrets(tmp_path: Path)
         3,
         [],
     )
-    assert report["servers"]["mail"] == {"kind": "toolkit", "state": "unsupported"}
+    assert report["servers"]["mail"] == {
+        "kind": "toolkit",
+        "state": "unavailable",
+        "reason": "not_registered",  # the examples aren't installed in the test environment
+    }
     assert report["fresh"] is True
     dumped = json.dumps(report)
     assert "sha256:" not in dumped.replace(report["view"], "")

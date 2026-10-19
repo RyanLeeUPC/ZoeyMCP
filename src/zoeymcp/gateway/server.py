@@ -33,12 +33,13 @@ from starlette.types import Receive, Scope, Send
 
 from ..common import canonical, control
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewRemoteServer
+from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from . import logs, review
 from .app import GatewayApp
 from .defstore import DefinitionStore
 from .ledger import Ledger
 from .marks import DriftMarks, MarksError
+from .toolkits import Loaded, Toolkits
 from .upstream import UpstreamPool
 from .vaultlink import (
     KeySource,
@@ -71,6 +72,7 @@ class Options:
     admin_socket: Path | None = Path("/run/zoeymcp-gateway/admin.sock")
     allow_root: bool = False
     control_fd: int | None = None
+    allow_writable_toolkits: bool = False  # development and tests: skips H.2's origin check
 
 
 def quiet_sdk_loggers() -> None:
@@ -134,7 +136,8 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
     except MarksError as exc:
         raise StartupError(f"drift marks: {exc} (move the file aside to start over)") from exc
     pool = UpstreamPool(link, keys, marks, DefinitionStore(options.state))
-    app = GatewayApp(pool, view_client(link, keys))
+    toolkits = Toolkits(link, keys, marks, allow_writable=options.allow_writable_toolkits)
+    app = GatewayApp(pool, view_client(link, keys), toolkits=toolkits)
     try:
         # The view's limit applies once the first view arrives.
         app.ledger, _ = Ledger.open_at(options.state, max_bytes=GatewayLimits().ledger_max_bytes)
@@ -149,6 +152,9 @@ def status(app: GatewayApp) -> dict[str, Any]:
     servers: dict[str, Any] = {}
     if snapshot is not None:
         for name, server in snapshot.view.gateway.servers.items():
+            if isinstance(server, ViewToolkitServer):
+                servers[name] = _toolkit_status(app, name, server)
+                continue
             if not isinstance(server, ViewRemoteServer):
                 servers[name] = {"kind": server.kind, "state": "unsupported"}
                 continue
@@ -179,6 +185,31 @@ def status(app: GatewayApp) -> dict[str, Any]:
         "view": snapshot.view.digest if snapshot is not None else None,
         "fresh": app.policy.fresh() is not None,
         "servers": servers,
+    }
+
+
+def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> dict[str, Any]:
+    found = app.toolkits.get(name)
+    if not isinstance(found, Loaded):
+        return {
+            "kind": "toolkit",
+            "state": "unavailable",
+            "reason": found.reason if found is not None else "not_loaded",
+        }
+    reports: dict[str, set[str]] = {}
+    for report in found.evaluation.reports:
+        reports.setdefault(report.kind, set()).add(report.tool)
+    return {
+        "kind": "toolkit",
+        "state": "loaded",
+        "module": found.module,
+        "distribution": found.distribution,
+        "version": found.version,
+        "pinning": server.pinning,
+        "included": len(server.tools.include),
+        "exposed": len(found.evaluation.exposed),
+        "marked": sorted(tool for tool, _ in app.pool.marks.for_server(name)),
+        "reports": {kind: sorted(tools) for kind, tools in sorted(reports.items())},
     }
 
 

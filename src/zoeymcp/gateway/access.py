@@ -25,7 +25,7 @@ from typing import Any, Literal
 from ..common import canonical
 from ..common.logs import refuse_type
 from ..common.policy.schema import NAME_PATTERN
-from ..common.policy.view import ViewClient, ViewGateway, ViewRemoteServer
+from ..common.policy.view import ViewClient, ViewGateway, ViewRemoteServer, ViewToolkitServer
 
 MODERN_VERSION = "2026-07-28"
 SUPPORTED_VERSIONS = frozenset({MODERN_VERSION, "2025-11-25", "2025-06-18"})
@@ -90,6 +90,9 @@ def refusal_headers(refusal: Refusal) -> list[tuple[str, str]]:
         headers.append(("retry-after", "1"))
     return headers
 
+
+# The server kinds this version serves.
+SERVED = (ViewRemoteServer, ViewToolkitServer)
 
 # --- steps 1-5: path, freshness, Host, Origin, method -----------------------------------------
 
@@ -248,13 +251,13 @@ def revoked(old: ViewGateway, new: ViewGateway) -> frozenset[tuple[str, str]]:
             and now.sources == client.sources
         )
         for server in client.servers:
-            if not isinstance(old.servers.get(server), ViewRemoteServer):
+            if not isinstance(old.servers.get(server), SERVED):
                 continue  # never served, so nothing can be in flight
             kept = (
                 same
                 and now is not None
                 and server in now.servers
-                and isinstance(new.servers.get(server), ViewRemoteServer)
+                and isinstance(new.servers.get(server), SERVED)
             )
             if not kept:
                 gone.add((name, server))
@@ -264,15 +267,19 @@ def revoked(old: ViewGateway, new: ViewGateway) -> frozenset[tuple[str, str]]:
 # --- steps 7-8: server and protocol version -------------------------------------------------------
 
 
-def server_for(gateway: ViewGateway, client: str, name: str) -> ViewRemoteServer | Refusal:
-    """Step 7: the server, if it exists, is remote, and is assigned to the client.
+def server_for(
+    gateway: ViewGateway, client: str, name: str
+) -> ViewRemoteServer | ViewToolkitServer | Refusal:
+    """Step 7: the server, if it exists, is of a kind served (remote or toolkit), and is assigned
+    to the client. A toolkit server is admitted whether or not its toolkit loaded: a failed load
+    answers in the protocol, so clients retry instead of caching nothing (M4 design H.2).
 
     The same 404 for all three, so a client learns nothing about servers it isn't given.
     """
     server = gateway.servers.get(name)
     if server is None or name not in gateway.clients[client].servers:
         return Refusal(404, "server not assigned")
-    if not isinstance(server, ViewRemoteServer):
+    if not isinstance(server, SERVED):
         return Refusal(404, "server kind not served")
     return server
 

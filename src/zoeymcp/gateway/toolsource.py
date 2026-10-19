@@ -14,12 +14,12 @@ from typing import Any, Protocol
 
 from mcp.types import CallToolResult
 
-from ..common.policy.view import ViewRemoteServer
+from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from .pins import Evaluation, ExposedTool
 from .upstream import NotAdmitted, Progress, UpstreamPool
 
-# The server kinds a source serves. Toolkit servers join in M4 step 12.
-ServedServer = ViewRemoteServer
+# The server kinds a source serves.
+ServedServer = ViewRemoteServer | ViewToolkitServer
 
 
 @dataclass(frozen=True, repr=False)
@@ -55,9 +55,10 @@ class ToolSource(Protocol):
         pin: str,
         progress: Progress | None = None,
         grant: Grant | None = None,
+        ref: str | None = None,
     ) -> CallToolResult:
         """Run the call, refusing (:class:`NotAdmitted`) if ``tool`` is no longer admitted under
-        ``pin``."""
+        ``pin``. ``ref`` is the call's log reference (a toolkit's ``ctx.ref``)."""
         ...
 
     def input_schema(self, client: str, server: str, tool: str) -> dict[str, Any] | None:
@@ -72,10 +73,12 @@ class RemoteSource:
         self.pool = pool
 
     async def exposed(self, client: str, server: str, policy: ServedServer) -> Evaluation:
+        assert isinstance(policy, ViewRemoteServer)  # noqa: S101 - this source serves remotes
         connection = self.pool.connection(server, policy, client)
         return await self.pool.wait_ready(connection)
 
     async def admit(self, client: str, server: str, policy: ServedServer, tool: str) -> ExposedTool:
+        assert isinstance(policy, ViewRemoteServer)  # noqa: S101 - this source serves remotes
         connection = self.pool.connection(server, policy, client)
         pin = await self.pool.admit(connection, tool)
         evaluation = connection.state.evaluation
@@ -95,7 +98,9 @@ class RemoteSource:
         pin: str,
         progress: Progress | None = None,
         grant: Grant | None = None,
+        ref: str | None = None,
     ) -> CallToolResult:
+        assert isinstance(policy, ViewRemoteServer)  # noqa: S101 - this source serves remotes
         # An approved call is committed (a close waits for it) and never retried (B.6).
         approved = grant is not None
         return await self.pool.call(

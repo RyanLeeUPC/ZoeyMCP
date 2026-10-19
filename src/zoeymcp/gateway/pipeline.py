@@ -34,12 +34,14 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent
 
 from ..common import canonical
+from ..common.approvaltext import Plan
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway
 from . import logs, schemas
 from .approve import Approvals, Asking, AskSession
 from .connstate import Era
 from .sanitize import map_upstream, sanitize_result
+from .toolkitsource import ToolkitSource, ToolkitUnavailable
 from .toolsource import Grant, ServedServer, ToolSource
 from .upstream import NotAdmitted, Progress, UpstreamError
 
@@ -49,6 +51,7 @@ UNCLASSIFIED = "refused: this tool is not classified"
 UNEXPECTED_INPUT = "refused: unexpected input responses"
 STATE_REFUSED = "refused: approval expired or already used"
 NO_APPROVALS = "refused: no approver for this client"
+TOOLKIT_UNAVAILABLE = "toolkit unavailable"
 REVOKED = (
     "refused: this client's access to the server changed while the call ran; "
     "it may or may not have run"
@@ -172,6 +175,9 @@ async def call_tool(
     except UpstreamError as exc:
         log("upstream_error", exc.detail or exc.outcome)
         return map_upstream(exc.outcome, ref)
+    except ToolkitUnavailable as exc:
+        log("toolkit_unavailable", exc.reason)
+        return refused(f"{TOOLKIT_UNAVAILABLE} (ref {ref})")
     # 2, 3. Shape and canonicalize
     shaped = _shape(arguments, call.limits)
     if isinstance(shaped, str):
@@ -214,7 +220,14 @@ async def call_tool(
     with (in_flight or InFlight()).track(call.client, call.server) as scope:
         try:
             raw = await source.forward(
-                call.client, call.server, call.policy, name, shaped, pin=pin, progress=progress
+                call.client,
+                call.server,
+                call.policy,
+                name,
+                shaped,
+                pin=pin,
+                progress=progress,
+                ref=ref,
             )
         except NotAdmitted as exc:
             log("upstream_error", exc.reason)
@@ -222,6 +235,9 @@ async def call_tool(
         except UpstreamError as exc:
             log("timeout" if exc.outcome == "timeout" else "upstream_error", exc.outcome)
             return map_upstream(exc.outcome, ref)
+        except ToolkitUnavailable as exc:
+            log("toolkit_unavailable", exc.reason)
+            return refused(f"{TOOLKIT_UNAVAILABLE} (ref {ref})")
     if scope.cancelled_caught:
         log("cancelled", "revoked")
         return refused(f"{REVOKED} (ref {ref})")
@@ -302,11 +318,19 @@ async def _approve(
             pin=exposed.pin,
             progress=progress,
             grant=grant,
+            ref=ref,
         )
         return _sanitized(raw, call, name, exposed, ref, budget)
 
     async def admit() -> str:
         return (await source.admit(call.client, call.server, call.policy, name)).pin
+
+    prepare = None
+    if isinstance(source, ToolkitSource):
+        toolkits = source
+
+        async def prepare() -> Plan | CallToolResult | None:
+            return await toolkits.prepare(call.client, call.server, name, shaped, ref)
 
     result = await approval.approvals.handle(
         Asking(
@@ -326,6 +350,7 @@ async def _approve(
             input_responses=approval.input_responses,
             session_sha256=approval.session_sha256,
             disconnected=approval.disconnected,
+            prepare=prepare,
         )
     )
     if isinstance(result, mcp_types.InputRequiredResult):

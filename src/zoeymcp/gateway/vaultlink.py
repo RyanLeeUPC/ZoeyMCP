@@ -91,7 +91,7 @@ def parse_link(spec: str) -> Link:
     return Link("http", f"http://{netloc}", "http", host, port)
 
 
-# --- the gateway key ---------------------------------------------------------------------------
+# --- the gateway key ----------------------------------------------------------------------------
 
 
 class GatewayKey:
@@ -180,7 +180,7 @@ class KeySource:
         return self.reload()
 
 
-# --- the egress filter -----------------------------------------------------------------------
+# --- the egress filter --------------------------------------------------------------------------
 
 
 class UpstreamBlocked(Exception):
@@ -427,3 +427,132 @@ def environ_has_no_secrets(environ: Mapping[str, str]) -> str | None:
 
 def running_as_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+# --- toolkits (M4 design H.4) -------------------------------------------------------------------
+
+TOOLKIT_MAX_REQUEST_BYTES = 2**20
+TOOLKIT_MAX_ANSWER_BYTES = 4 * 2**20
+# The SDK sets the first three; httpx adds the rest. Nothing else reaches the vault (G12).
+_TOOLKIT_HEADERS = frozenset(
+    {
+        "content-type",
+        "accept",
+        "idempotency-key",
+        "content-length",
+        "accept-encoding",
+        "connection",
+        "user-agent",
+        "host",
+        GATEWAY_HEADER,
+    }
+)
+ToolkitCheck = Callable[[str, str], str | None]
+
+
+class ToolkitTransport(httpx2.AsyncBaseTransport):
+    """A toolkit's requests to the vault: only to the link, only what ``check`` allows, with no
+    header from anywhere but the gateway itself. Redirects end the request; a JSON answer is cut
+    off past 4 MiB; a vault refusal reloads the gateway key, as for upstream connections."""
+
+    def __init__(
+        self,
+        inner: httpx2.AsyncBaseTransport,
+        link: Link,
+        *,
+        server: str,
+        check: ToolkitCheck,
+        keys: KeySource | None = None,
+    ) -> None:
+        self._inner = inner
+        self._link = link
+        self._server = server
+        self._check = check
+        self._keys = keys
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        url = request.url
+        raw_path, _, _ = url.raw_path.partition(b"?")
+        path = raw_path.decode("ascii", "replace")
+        reason = None
+        if (url.scheme, url.host, url.port) != (
+            self._link.scheme,
+            self._link.host,
+            self._link.port,
+        ):
+            reason = "target"
+        elif any(name.lower() not in _TOOLKIT_HEADERS for name in request.headers):
+            reason = "header"
+        else:
+            body = await request.aread()
+            if len(body) > TOOLKIT_MAX_REQUEST_BYTES:
+                reason = "too_large"
+            else:
+                reason = self._check(request.method, path)
+        if reason is not None:
+            logs.event("toolkit_request_blocked", server=self._server, reason=reason)
+            raise UpstreamBlocked(reason)
+        response = await self._inner.handle_async_request(request)
+        if is_redirect(response.status_code):
+            await response.aclose()
+            logs.event(
+                "upstream_redirect_refused", server=self._server, status=response.status_code
+            )
+            raise UpstreamRedirect(str(response.status_code))
+        if "set-cookie" in response.headers:
+            del response.headers["set-cookie"]
+        if response.headers.get(REFUSAL_HEADER) == "refused":
+            body = await response.aread()
+            await response.aclose()
+            logs.event(
+                "vault_refused",
+                server=self._server,
+                status=response.status_code,
+                code=vault_refusal_code(body),
+            )
+            if response.status_code == 403 and self._keys is not None:
+                self._keys.after_refusal()
+            return httpx2.Response(
+                response.status_code,
+                headers=response.headers,
+                content=body,
+                extensions=response.extensions,
+                request=request,
+            )
+        return httpx2.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=_Capped(response.stream, TOOLKIT_MAX_ANSWER_BYTES),  # type: ignore[arg-type]
+            extensions=response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def toolkit_client(
+    link: Link,
+    keys: KeySource | None,
+    *,
+    server: str,
+    check: ToolkitCheck,
+    inner: httpx2.AsyncBaseTransport | None = None,
+) -> httpx2.AsyncClient:
+    """The HTTP client of one toolkit server: M3's link, key hook, redirect refusal and refusal
+    handling, with ``check`` in place of the MCP egress rules (M4 design H.4)."""
+    return httpx2.AsyncClient(
+        transport=ToolkitTransport(
+            inner if inner is not None else _inner_transport(link),
+            link,
+            server=server,
+            check=check,
+            keys=keys,
+        ),
+        base_url=link.base_url,
+        follow_redirects=False,
+        max_redirects=0,
+        trust_env=False,
+        timeout=UPSTREAM_TIMEOUT,
+        event_hooks=_hooks(link, keys),
+    )

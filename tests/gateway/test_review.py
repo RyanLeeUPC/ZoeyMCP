@@ -257,7 +257,7 @@ async def test_a_review_that_cant_run_exits_2(
     assert "the review couldn't list the server's tools (" in failed[2]
     assert (unknown[0], unknown[2]) == (2, "zoeymcp review: no gateway server named 'nothing'\n")
     assert toolkit[0] == 2
-    assert "toolkit server" in toolkit[2]
+    assert toolkit[2] == "zoeymcp review: the toolkit isn't loaded (not_registered)\n"
 
 
 async def test_an_unassigned_server_can_be_reviewed_first(

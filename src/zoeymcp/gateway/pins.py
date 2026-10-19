@@ -20,13 +20,12 @@ from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence, Set
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from mcp.types import Tool
 
 from ..common import canonical, textrules
-from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewRemoteServer
+from ..common.policy.schema import GatewayLimits, Tools
 from . import schemas
 
 PIN_TAG = "tool-pin/1"
@@ -224,9 +223,22 @@ def _name(tool: Tool) -> str:
     return tool.name if isinstance(tool.name, str) else ""
 
 
+class Reviewed(Protocol):
+    """What :func:`evaluate` reads of a server: a remote one, or a toolkit (M4 design H.2)."""
+
+    @property
+    def tools(self) -> Tools: ...
+
+    @property
+    def review(self) -> Mapping[str, str]: ...
+
+    @property
+    def on_drift(self) -> Literal["hide", "fail"]: ...
+
+
 def evaluate(
     listing: Sequence[Tool],
-    server: ViewRemoteServer,
+    server: Reviewed,
     marks: Set[Mark],
     limits: GatewayLimits,
 ) -> Evaluation:
