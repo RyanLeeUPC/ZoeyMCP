@@ -20,8 +20,6 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 import zoeymcp
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +33,8 @@ CLI = "cli"
 ENTRY_POINTS = ("__init__.py", "__main__.py")
 # Code the gateway's process runs (common is shared) and that never reaches the vault's code.
 GATEWAY_SIDE = ("gateway", "common", "toolkit")
+# What the gateway's code and its entry path must never load: the vault side without common.
+VAULT_ONLY = ("zoeymcp.vault", "zoeymcp.portal", "zoeymcp.selftest", "zoeymcp.entrypoint")
 # The one toolkit module that may use the gateway's code: a test helper (M4 design G.1).
 TOOLKIT_TESTING = "toolkit/testing.py"
 # The gateway extra's own packages, named here so that no guard can pass vacuously.
@@ -287,7 +287,7 @@ def test_the_cli_never_imports_gateway_packages() -> None:
 
 
 def test_gateway_code_never_imports_vault_code() -> None:
-    assert violations(PACKAGE.parent, GATEWAY_SIDE, ["zoeymcp.vault"]) == []
+    assert violations(PACKAGE.parent, GATEWAY_SIDE, VAULT_ONLY) == []
 
 
 def test_every_subpackage_has_a_side() -> None:
@@ -452,10 +452,6 @@ print(json.dumps({"status": status, "modules": sorted(sys.modules)}))
 """
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="step 13: python -m zoeymcp gateway goes through cli/main.py, which imports vault code",
-)
 def test_the_gateway_entry_path_loads_no_vault_code() -> None:
     result = subprocess.run(  # noqa: S603 - this interpreter, a fixed script
         [sys.executable, "-I", "-c", ENTRY_PROBE],
@@ -466,6 +462,8 @@ def test_the_gateway_entry_path_loads_no_vault_code() -> None:
     )
     assert result.returncode == 0, result.stderr
     probe = json.loads(result.stdout)
-    # The entry point ran to its exit: argparse's error for now, the gateway's help in step 13.
-    assert isinstance(probe["status"], int)
-    assert not _within(set(probe["modules"]), "zoeymcp.vault")
+    # The entry point ran to its exit: the gateway's help.
+    assert probe["status"] == 0
+    loaded = set(probe["modules"])
+    assert "zoeymcp.cli.main" in loaded
+    assert not any(_within(loaded, package) for package in VAULT_ONLY)

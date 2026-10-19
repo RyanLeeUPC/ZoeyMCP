@@ -19,8 +19,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ..vault.admin import DEFAULT_SOCKET, SOCKET_ENV
-from ..vault.oauth.protocol import EXCHANGE_DEADLINE, REFRESH_BUDGET
+from ..common.adminsocket import DEFAULT_SOCKET, EXCHANGE_DEADLINE, REFRESH_BUDGET, SOCKET_ENV
 
 GATEWAY_SOCKET: Final = "/run/zoeymcp-gateway/admin.sock"
 GATEWAY_SOCKET_ENV: Final = "ZOEYMCP_GATEWAY_ADMIN_SOCKET"

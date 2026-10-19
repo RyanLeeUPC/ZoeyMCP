@@ -20,6 +20,11 @@ from typing import Any, Final, Literal
 from urllib.parse import parse_qsl, urlencode
 
 from ... import __version__
+
+# The CLI's admin timeouts derive from these two, so they live in common, where it reads them
+# without loading the vault's code.
+from ...common.adminsocket import EXCHANGE_DEADLINE as EXCHANGE_DEADLINE
+from ...common.adminsocket import REFRESH_BUDGET as REFRESH_BUDGET
 from ...common.canonical import JSONRejected, dumps_canonical, loads_strict
 from ...common.policy.schema import OAuth2Credential, param_values
 from ..request import oauth_basic_credentials
@@ -30,8 +35,6 @@ from ..store import Secret
 ATTEMPT_DEADLINE: Final = 20.0
 CONNECT_TIMEOUT: Final = 5.0
 REPLAY_DELAY: Final = 1.0
-REFRESH_BUDGET: Final = 41.0
-EXCHANGE_DEADLINE: Final = 20.0
 DRAIN_TIMEOUT: Final = 45.0
 MAX_TOKEN_BODY: Final = 64 * 1024
 MIN_LIFETIME: Final = 60

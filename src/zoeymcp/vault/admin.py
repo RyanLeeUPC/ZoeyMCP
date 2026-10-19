@@ -44,6 +44,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+# The CLI reads these from common, so the gateway's entry path loads no vault code.
+from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
+from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy.schema import Policy
 from ..common.textrules import find_violations
 from . import logs
@@ -54,8 +57,6 @@ from .oauth.login import LoginError, LoginService
 from .oauth.tokens import TokenManager
 from .store import SecretStore, StoreWriteError, origin_binding
 
-DEFAULT_SOCKET = "/run/zoeymcp/admin.sock"
-SOCKET_ENV = "ZOEYMCP_ADMIN_SOCKET"
 SETUP_FILE = "setup.json"
 SETUP_CODE_TTL = 15 * 60
 MAX_BODY = 128 * 1024

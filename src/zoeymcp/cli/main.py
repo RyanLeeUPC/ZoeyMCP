@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .. import __version__
+from ..common.adminsocket import DEFAULT_SOCKET, SOCKET_ENV
 from ..common.policy import (
     CONFIG_ENV,
     Finding,
@@ -23,10 +24,9 @@ from ..common.policy import (
     read_source,
 )
 from ..common.policy.schema import hash_token
-from ..vault.admin import DEFAULT_SOCKET, SOCKET_ENV
-from ..vault.gatewaykeys import utc
-from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
-from ..vault.oauth.pkce import FLOW_TTL
+
+# The vault's code is imported in the handlers that use it: ``python -m zoeymcp gateway`` runs
+# this module in the gateway's process, which loads none of it.
 from . import admin_client
 from . import ledger as ledger_view
 from . import review as review_view
@@ -448,6 +448,8 @@ def _cmd_standard(args: argparse.Namespace, err: TextIO) -> int:
 
 
 def _cmd_keygen(out: TextIO) -> int:
+    from ..vault.keys import MASTER_KEY_ENV, KeySet, generate_master_key
+
     master = generate_master_key()
     keys = KeySet.from_text(master)
     out.write(f"{MASTER_KEY_ENV}={master}\n")
@@ -504,6 +506,8 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
 
 
 def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -> None:
+    from ..vault.gatewaykeys import utc
+
     if retire_previous:
         result = admin_client.gateway_key_retire_previous(socket)
     else:
@@ -652,6 +656,8 @@ def _cmd_ledger(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 
 
 def _cmd_login(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    from ..vault.oauth.pkce import FLOW_TTL
+
     socket = admin_client.socket_path(args.socket)
     try:
         if args.flow is not None:
