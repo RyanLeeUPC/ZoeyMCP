@@ -290,6 +290,12 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
     lines: list[str] = []
     code = EXIT_CLEAN
     for name, server in sorted(status["servers"].items()):
+        if server["kind"] == "toolkit":
+            line, needs_operator = _toolkit_summary(name, server)
+            lines.append(line)
+            if needs_operator:
+                code = EXIT_NEEDS_OPERATOR
+            continue
         if server["kind"] != "remote":
             lines.append(f"{name}  {server['kind']}: not served by this version")
             continue
@@ -315,6 +321,39 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
     return lines, code
 
 
+def _toolkit_summary(name: str, server: dict[str, Any]) -> tuple[str, bool]:
+    """One summary line for a toolkit server, and whether it needs the operator."""
+    if server["state"] != "loaded":
+        return f"{name}  toolkit unavailable ({server.get('reason', 'unknown')})", True
+    reports = server.get("reports", {})
+    counts = {kind: len(reports.get(kind, [])) for kind in ("drift", "missing", "invalid")}
+    marked = len(server["marked"])
+    line = (
+        f"{name}  toolkit {server['module']}  exposed {server['exposed']}/{server['included']}  "
+        f"drift {counts['drift']}  marked {marked}  missing {counts['missing']}  "
+        f"invalid {counts['invalid']}  pinning {server['pinning']}"
+    )
+    return line, bool(marked or any(counts.values()))
+
+
+def _status_head(name: str, entry: dict[str, Any]) -> str | None:
+    """A server's first ``gateway-status`` line; ``None`` if nothing more follows it."""
+    if entry["kind"] == "toolkit":
+        if entry["state"] != "loaded":
+            return None
+        version = f" {entry['version']}" if entry.get("version") else ""
+        return (
+            f"{name}  toolkit  {entry['module']}{version}  pinning {entry['pinning']}  "
+            f"exposed {entry['exposed']}/{entry['included']}"
+        )
+    if entry["kind"] != "remote":
+        return None
+    return (
+        f"{name}  remote  {','.join(entry['state'])}  era {entry['era'] or 'unknown'}  "
+        f"connections {entry['connections']}  exposed {entry['exposed']}/{entry['included']}"
+    )
+
+
 def status_lines(status: dict[str, Any], server: str | None) -> list[str]:
     """``gateway-status``: the view, then each server's state and counts."""
     view = status["view"] or "none yet"
@@ -322,19 +361,19 @@ def status_lines(status: dict[str, Any], server: str | None) -> list[str]:
     for name, entry in sorted(status["servers"].items()):
         if server is not None and name != server:
             continue
-        if entry["kind"] != "remote":
-            lines.append(f"{name}  {entry['kind']}  unsupported")
+        head = _status_head(name, entry)
+        if head is None:
+            if entry["kind"] == "toolkit":
+                lines.append(f"{name}  toolkit  unavailable ({entry.get('reason', 'unknown')})")
+            else:
+                lines.append(f"{name}  {entry['kind']}  unsupported")
             continue
-        state = ",".join(entry["state"])
-        lines.append(
-            f"{name}  remote  {state}  era {entry['era'] or 'unknown'}  connections "
-            f"{entry['connections']}  exposed {entry['exposed']}/{entry['included']}"
-        )
+        lines.append(head)
         if entry["marked"]:
             lines.append(f"  marked: {', '.join(entry['marked'])}")
         for kind, tools in sorted(entry.get("reports", {}).items()):
             if tools:
                 lines.append(f"  {kind}: {', '.join(tools)}")
-        if entry["listed_s_ago"] is not None:
+        if entry.get("listed_s_ago") is not None:
             lines.append(f"  last listing {round(entry['listed_s_ago'])} s ago")
     return lines

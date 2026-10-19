@@ -327,10 +327,10 @@ REMOTE = {
 
 
 def test_the_summary() -> None:
-    lines, code = view.summary(status(notes=REMOTE, mail={"kind": "toolkit", "state": "x"}))
+    lines, code = view.summary(status(notes=REMOTE, bridged={"kind": "bridge"}))
     assert code == 0
     assert lines == [
-        "mail  toolkit: not served by this version",
+        "bridged  bridge: not served by this version",
         "notes  modern  exposed 2/2  drift 0  marked 0  missing 0  unreviewed 1  invalid 0  "
         "listed 12 s ago",
     ]
@@ -350,10 +350,10 @@ def test_the_summary() -> None:
 
 def test_status_lines() -> None:
     marked = {**REMOTE, "marked": ["a"], "reports": {"drift": ["a"], "missing": []}}
-    lines = view.status_lines(status(notes=marked, mail={"kind": "toolkit"}), None)
+    lines = view.status_lines(status(notes=marked, bridged={"kind": "bridge"}), None)
     assert lines == [
         f"view sha256:{'0' * 64}  fresh",
-        "mail  toolkit  unsupported",
+        "bridged  bridge  unsupported",
         "notes  remote  ready  era modern  connections 1  exposed 2/2",
         "  marked: a",
         "  drift: a",
@@ -527,3 +527,41 @@ def test_the_switch_happens_before_connecting(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(httpx, "HTTPTransport", transport)
     admin_client.gateway_status("/run/zoeymcp-gateway/admin.sock")
     assert order == ["/run/zoeymcp-gateway/admin.sock", "connect"]
+
+
+TOOLKIT = {
+    "kind": "toolkit",
+    "state": "loaded",
+    "module": "example_toolkits.mail",
+    "distribution": "example-toolkits",
+    "version": "0.1.0",
+    "pinning": "required",
+    "included": 1,
+    "exposed": 1,
+    "marked": [],
+    "reports": {},
+}
+
+
+def test_toolkit_servers_in_the_summary_and_status() -> None:
+    lines, code = view.summary(status(mail=TOOLKIT))
+    assert (lines, code) == (
+        [
+            "mail  toolkit example_toolkits.mail  exposed 1/1  drift 0  marked 0  missing 0  "
+            "invalid 0  pinning required"
+        ],
+        0,
+    )
+    unavailable = {"kind": "toolkit", "state": "unavailable", "reason": "not_registered"}
+    assert view.summary(status(mail=unavailable)) == (
+        ["mail  toolkit unavailable (not_registered)"],
+        1,
+    )
+    marked = {**TOOLKIT, "marked": ["send_note"], "reports": {"drift": ["send_note"]}}
+    assert view.summary(status(mail=marked))[1] == 1
+    assert view.status_lines(status(mail=marked, odd=unavailable), None)[1:] == [
+        "mail  toolkit  example_toolkits.mail 0.1.0  pinning required  exposed 1/1",
+        "  marked: send_note",
+        "  drift: send_note",
+        "odd  toolkit  unavailable (not_registered)",
+    ]
