@@ -293,12 +293,12 @@ async def test_the_summary_and_status_make_no_upstream_call(
         missing = run("gateway-status", "nothing")
         bad = run("review", "--clear")
         assert fake.lists == listed
-    assert summary[0] == 0
+    assert summary[0] == 1  # the toolkit isn't installed here, which needs the operator
     [notes] = [line for line in summary[1].splitlines() if line.startswith(SERVER)]
     assert "exposed 3/3" in notes
     assert "marked 0" in notes
     assert "unreviewed 3" in notes
-    assert "mail  toolkit: not served by this version" in summary[1]
+    assert "mail  toolkit unavailable (not_registered)" in summary[1]
     assert status[0] == 0
     assert status[1].startswith("view sha256:")
     assert f"{SERVER}  remote  ready" in status[1]
