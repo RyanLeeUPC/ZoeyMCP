@@ -1023,8 +1023,9 @@ finds about it (`binding_changed` when a use the policy makes now would be refus
 `unreferenced` when nothing uses it, `orphan_slot` for a live token no credential keeps). It
 never shows a value, its length or a hash of one, and no portal answer carries one. **Set the
 secret** writes one: give the name
-(the `NAME` of `store:NAME` in the policy) and the value, which is a password field the page
-empties as soon as it is sent, whatever the answer. The vault checks it and shows, before the
+(the `NAME` of `store:NAME` in the policy) and the value, which the page empties as soon as it
+is sent, whatever the answer. The value field is masked where the browser supports it, and
+isn't offered to password managers. The vault checks it and shows, before the
 passkey prompt, the binding it will be stored with and what it replaces (and the binding until
 now, when that changes); the checks and bindings are exactly `zoeymcp secret set`'s. A name no
 route or connector uses needs **Origins** (the https addresses it may be sent to); an OAuth

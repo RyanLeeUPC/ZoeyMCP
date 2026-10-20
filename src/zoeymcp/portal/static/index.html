@@ -120,7 +120,7 @@ first. A credential's tokens from Connect are the vault's own and aren't changed
 <label for="secret-name">Name (NAME in the policy's store:NAME)</label>
 <input id="secret-name" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="128">
 <label for="secret-value">Value (cleared from this page once sent, whatever the answer)</label>
-<input id="secret-value" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="65536" data-1p-ignore data-lpignore="true" data-bwignore>
+<textarea id="secret-value" class="masked" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="65536" data-1p-ignore data-lpignore="true" data-bwignore></textarea>
 <label for="secret-origins">Origins it may be sent to, only for a name no route or connector uses
 (https URLs, separated by spaces)</label>
 <input id="secret-origins" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">

@@ -276,7 +276,7 @@ def test_the_authorization_link_opens_alone() -> None:
 
 
 class Inputs(HTMLParser):
-    """Every <input>'s attributes, by its id."""
+    """Every <input>'s and <textarea>'s attributes, by its id, with the tag as "tag"."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -284,19 +284,34 @@ class Inputs(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         found = dict(attrs)
-        if tag == "input" and found.get("id"):
-            self.inputs[str(found["id"])] = found
+        if tag in ("input", "textarea") and found.get("id"):
+            self.inputs[str(found["id"])] = {**found, "tag": tag}
 
 
 def test_a_secret_value_is_write_only_in_the_page() -> None:
-    """G, P1: the value field is a password field the browser isn't asked to fill or remember,
-    read once, into the prepare's body, and emptied as soon as that request is made; the page
-    never writes anything else into it, and leaving the Secrets page empties it too."""
+    """G, P1: the value field is a text area, masked by the stylesheet where the browser can,
+    because Chrome offered to save a password field's value despite autocomplete="off" (manual
+    check 15) and password managers don't save or fill a text area. It is read once, into the
+    prepare's body, and emptied as soon as that request is made; the page never writes anything
+    else into it, and leaving the Secrets page empties it too."""
     parser = Inputs()
     parser.feed(read("index.html"))
     value = parser.inputs["secret-value"]
-    assert (value["type"], value["autocomplete"]) == ("password", "off")
+    assert (value["tag"], value["autocomplete"]) == ("textarea", "off")
+    assert "type" not in value
     assert "name" not in value  # nothing a form or a password manager keys on
+    for attribute, wanted in (
+        ("spellcheck", "false"),
+        ("autocapitalize", "off"),
+        ("autocorrect", "off"),
+    ):
+        assert value[attribute] == wanted, attribute
+    for hint in ("data-1p-ignore", "data-lpignore", "data-bwignore"):
+        assert hint in value, hint  # 1Password, LastPass and Bitwarden leave it alone
+    assert "masked" in str(value["class"]).split()
+    css = read("app.css")
+    masked = css[css.index("textarea.masked {") : css.index("}", css.index("textarea.masked {"))]
+    assert "-webkit-text-security: disc;" in masked
     for field in ("secret-name", "secret-origins"):
         assert parser.inputs[field]["type"] == "text", field
     code = code_of(read("app.js"))

@@ -38,11 +38,20 @@ label {
   margin-top: 1rem;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   max-width: 24rem;
   font: inherit;
   margin-bottom: 0.5rem;
+}
+
+/* A secret's value: a text area, which password managers don't offer to save or fill (a password
+   field is, whatever its autocomplete says), masked where the browser supports it (Chrome, Edge,
+   Safari); elsewhere the value shows as typed. */
+textarea.masked {
+  -webkit-text-security: disc;
+  resize: vertical;
 }
 
 button {
