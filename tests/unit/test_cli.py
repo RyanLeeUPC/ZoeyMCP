@@ -935,8 +935,17 @@ def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
             {"kind": "check_mailbox", "connector": "mail"},
             "check the mailbox for the sends with an unknown outcome",
         ),
+        (
+            {"kind": "add_passkey"},
+            "run: zoeymcp setup-code, and enrol a second passkey with it",
+        ),
+        (
+            {"kind": "review_passkeys"},
+            "run: zoeymcp passkeys, and remove any you don't recognize",
+        ),
+        ({"kind": "reset_passkeys"}, "run: zoeymcp setup-code --reset"),
         # A newer vault's action: its kind.
-        ({"kind": "add_passkey"}, "add_passkey"),
+        ({"kind": "enrol_elsewhere"}, "enrol_elsewhere"),
     ],
 )
 def test_health_actions_in_the_clis_words(action: dict[str, str] | None, text: str | None) -> None:
@@ -1325,4 +1334,454 @@ def test_health_shows_the_ledger_copy(admin: FakeAdmin) -> None:
     ]
     assert health_action({"kind": "check_gateway"}) == (
         "check that the gateway runs and reaches the vault"
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "lines"),
+    [
+        (
+            {"count": 1},
+            [
+                "passkeys: info (1 enrolled)",
+                "  info    passkey_single: only one passkey is enrolled: add a second, so losing "
+                "one doesn't lock you out",
+                "          run: zoeymcp setup-code, and enrol a second passkey with it",
+            ],
+        ),
+        (
+            {"count": 2, "regressed_ago": 0.0},
+            [
+                "passkeys: warning (2 enrolled)",
+                "  warning passkey_counter: a passkey's signature counter went back in the last "
+                "30 days: the authenticator may have been copied",
+                "          run: zoeymcp passkeys, and remove any you don't recognize",
+            ],
+        ),
+        (
+            {"count": 0, "unavailable": True},
+            [
+                "passkeys: error (can't be verified)",
+                "  error   passkeys_unavailable: the passkey file can't be verified (edited, or "
+                "written under another master key); portal login is off",
+                "          run: zoeymcp setup-code --reset",
+            ],
+        ),
+        ({"count": 3}, ["passkeys: ok (3 enrolled)"]),
+    ],
+)
+def test_health_shows_the_passkeys(
+    admin: FakeAdmin, state: dict[str, Any], lines: list[str]
+) -> None:
+    from zoeymcp.vault.health import PasskeyState, _passkeys
+
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    report = {
+        "summary": {"error": 0, "warning": 0, "info": 0},
+        "credentials": [],
+        "connectors": [],
+        "store": empty,
+        "passkeys": _passkeys(PasskeyState(**state)),
+    }
+    admin.answers[("GET", "/health")] = (200, report)
+    _, out, _ = cli(["health", "--socket", "x"])
+    assert out.splitlines()[1:-1] == lines
+
+
+# --- setup-code, passkeys and sessions (M5 design E) -------------------------------------------
+
+ORIGINS = ["http://localhost:8081", "https://zoeymcp.tailnet.example"]
+SETUP_CODE = "AAAQEA-YEAUDA-OCAJBI-FQYDIO"
+ISSUED: dict[str, Any] = {
+    "code": SETUP_CODE,
+    "expires": 1_760_000_900,
+    "reset": False,
+    "passkeys": 0,
+    "origins": ORIGINS,
+}
+FIRST_LINE = (
+    "One-time code, valid for 15 minutes. Open http://localhost:8081 or "
+    "https://zoeymcp.tailnet.example and choose Set up.\n"
+)
+REFUSED_LINE = (
+    "If the portal refuses this code before you have used it, someone else has: run zoeymcp "
+    "setup-code --reset.\n"
+)
+TEST_MASTER = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"  # bytes(range(32))
+
+
+def test_setup_code_prints_the_code_and_where_to_use_it(admin: FakeAdmin) -> None:
+    admin.answers[("POST", "/setup-code")] = (200, ISSUED)
+    assert cli(["setup-code", "--socket", "x"]) == (
+        EXIT_OK,
+        f"{SETUP_CODE}\n",
+        FIRST_LINE + REFUSED_LINE,
+    )
+    assert admin.requests == [("POST", "/setup-code", {"reset": False})]
+    assert admin.timeouts == [10.0]
+    cli(["setup-code", "--reset", "--socket", "x"])
+    assert admin.requests[-1] == ("POST", "/setup-code", {"reset": True})
+
+
+@pytest.mark.parametrize(
+    ("changes", "line"),
+    [
+        ({"passkeys": 1}, "1 passkey is enrolled; enrolling with this code adds one.\n"),
+        ({"passkeys": 3}, "3 passkeys are enrolled; enrolling with this code adds one.\n"),
+        (
+            {"passkeys": 1, "reset": True},
+            "1 passkey is enrolled; enrolling with this code removes all of them and ends every "
+            "session.\n",
+        ),
+        (
+            {"passkeys": 2, "reset": True},
+            "2 passkeys are enrolled; enrolling with this code removes all of them and ends every "
+            "session.\n",
+        ),
+        ({"passkeys": 0, "reset": True}, ""),
+        (
+            {"passkeys": None},
+            "The passkey file can't be verified: only a code issued with --reset can enrol; run "
+            "zoeymcp setup-code --reset.\n",
+        ),
+        (
+            {"passkeys": None, "reset": True},
+            "The passkey file can't be verified: enrolling with this code moves it aside, removes "
+            "every passkey and ends every session.\n",
+        ),
+    ],
+)
+def test_setup_code_says_what_enrolling_does(
+    admin: FakeAdmin, changes: dict[str, Any], line: str
+) -> None:
+    admin.answers[("POST", "/setup-code")] = (200, {**ISSUED, **changes})
+    _, _, err = cli(["setup-code", "--socket", "x"])
+    assert err == FIRST_LINE + line + REFUSED_LINE
+
+
+@pytest.mark.parametrize(
+    ("origins", "line"),
+    [
+        (["http://localhost:8081"], "Open http://localhost:8081 and choose Set up."),
+        ([], "The policy has no admin block, so no portal takes it yet."),
+    ],
+)
+def test_setup_code_names_the_origins(admin: FakeAdmin, origins: list[str], line: str) -> None:
+    admin.answers[("POST", "/setup-code")] = (200, {**ISSUED, "origins": origins})
+    _, _, err = cli(["setup-code", "--socket", "x"])
+    assert err.splitlines()[0] == f"One-time code, valid for 15 minutes. {line}"
+
+
+def test_setup_code_errors(admin: FakeAdmin) -> None:
+    refusal = {"error": "the setup code couldn't be written", "reason": "not_written"}
+    admin.answers[("POST", "/setup-code")] = (500, refusal)
+    assert cli(["setup-code", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp setup-code: the setup code couldn't be written\n",
+    )
+
+
+STATUS_PATH = "/setup-code/status?wait=30"
+WAITING = "Waiting until a passkey is enrolled with this code (Ctrl-C stops waiting).\n"
+ENROLLED = {
+    "fingerprint": "3f9a1c0e52d4b7a8",
+    "origin": "http://localhost:8081",
+    "name": "laptop",
+    "created": 1_760_000_043,
+}
+
+
+def status_answer(state: str, **changes: Any) -> tuple[int, dict[str, Any]]:
+    answer = {"state": state, "expires": 1_760_000_900, "reset": False, "origin": None}
+    return 200, {**answer, "passkey": None, **changes}
+
+
+def test_setup_code_wait_shows_the_enrolled_passkey(admin: FakeAdmin) -> None:
+    origin = "http://localhost:8081"
+    admin.answers = InTurn(
+        iter(
+            [
+                (200, ISSUED),
+                status_answer("pending"),
+                status_answer("redeemed", origin=origin),
+                status_answer("redeemed", origin=origin),
+                status_answer("enrolled", origin=origin, passkey=ENROLLED),
+            ]
+        )
+    )
+    code, out, err = cli(["setup-code", "--wait", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out == (
+        f"{SETUP_CODE}\n"
+        "enrolled: 3f9a1c0e52d4b7a8 on http://localhost:8081 as laptop at 08:54:03 UTC\n"
+    )
+    assert err == (
+        FIRST_LINE
+        + REFUSED_LINE
+        + WAITING
+        + "Redeemed on http://localhost:8081; waiting for the enrolment.\n"
+    )
+    assert [request[:2] for request in admin.requests[1:]] == [("GET", STATUS_PATH)] * 4
+    assert admin.timeouts[1:] == [40.0] * 4
+
+
+@pytest.mark.parametrize(
+    ("answer", "line"),
+    [
+        (status_answer("expired"), "the code expired, or was withdrawn, unused; issue a new code"),
+        (
+            status_answer("expired", origin="http://localhost:8081"),
+            "redeemed on http://localhost:8081, but no passkey was enrolled in time; issue a new "
+            "code",
+        ),
+        (
+            status_answer("none", expires=None),
+            "the vault has a newer code, or restarted: nothing to wait for",
+        ),
+        (
+            status_answer("pending", expires=1_760_000_901),
+            "the vault has a newer code, or restarted: nothing to wait for",
+        ),
+        (
+            status_answer("enrolled", expires=1_760_000_901, passkey=ENROLLED),
+            "the vault has a newer code, or restarted: nothing to wait for",
+        ),
+    ],
+)
+def test_setup_code_wait_ends_without_an_enrolment(
+    admin: FakeAdmin, answer: tuple[int, dict[str, Any]], line: str
+) -> None:
+    admin.answers = InTurn(iter([(200, ISSUED), status_answer("pending"), answer]))
+    code, out, err = cli(["setup-code", "--wait", "--socket", "x"])
+    assert (code, out) == (EXIT_FINDINGS, f"{SETUP_CODE}\n")
+    assert err == FIRST_LINE + REFUSED_LINE + WAITING + f"zoeymcp setup-code: {line}\n"
+
+
+def test_setup_code_wait_stops_on_ctrl_c(admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch) -> None:
+    admin.answers[("POST", "/setup-code")] = (200, ISSUED)
+
+    def interrupted(socket: str, *, wait: int) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(admin_client, "setup_code_status", interrupted)
+    code, _, err = cli(["setup-code", "--wait", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert err.endswith(
+        WAITING + "zoeymcp setup-code: stopped waiting; the code still works until it expires\n"
+    )
+
+
+def test_setup_code_wait_when_the_vault_goes_away(admin: FakeAdmin) -> None:
+    admin.answers = InTurn(iter([(200, ISSUED), (503, {"error": "stopping"})]))
+    code, _, err = cli(["setup-code", "--wait", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert err.endswith(WAITING + "zoeymcp setup-code: stopping\n")
+
+
+@pytest.fixture
+def offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``setup-code --state`` as the vault's user, with the test master key."""
+    monkeypatch.setenv("ZOEYMCP_MASTER_KEY", TEST_MASTER)
+    monkeypatch.delenv("ZOEYMCP_MASTER_KEY_PREVIOUS", raising=False)
+    monkeypatch.setattr(main_module, "running_as_root", lambda: False)
+
+
+def test_setup_code_offline_writes_a_record_the_vault_redeems(
+    tmp_path: Path, offline: None
+) -> None:
+    import asyncio
+
+    from zoeymcp.portal import setupcode
+    from zoeymcp.vault.admin import SetupCodes
+    from zoeymcp.vault.keys import KeySet
+
+    code, out, err = cli(["setup-code", "--state", str(tmp_path), "--reset"])
+    assert code == EXIT_OK
+    assert err == "One-time code, valid for 15 minutes. Open the portal and choose Set up.\n" + (
+        REFUSED_LINE
+    )
+    typed = out.strip()
+    key = KeySet.from_text(TEST_MASTER).portal_key
+    record = setupcode.unseal((tmp_path / "setup.json").read_bytes(), key)
+    assert record is not None
+    assert (record.sha256, record.reset) == (setupcode.digest(typed), True)
+    redeemed = asyncio.run(SetupCodes(tmp_path, key).redeem(typed, origin="http://localhost:8081"))
+    assert redeemed == setupcode.Redeemed(record.expires, True)
+
+
+def test_setup_code_offline_counts_the_passkeys(
+    tmp_path: Path, offline: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zoeymcp.portal.passkeys import seal
+
+    from .test_passkeys import KEY, OLD, made
+
+    portal = tmp_path / "portal"
+    portal.mkdir(mode=0o700)
+    (portal / "passkeys.json").write_bytes(seal(made(1, 2), KEY))
+    _, _, err = cli(["setup-code", "--state", str(tmp_path)])
+    assert err.splitlines()[1] == "2 passkeys are enrolled; enrolling with this code adds one."
+    # Under the previous master key during a rotation.
+    (portal / "passkeys.json").write_bytes(seal(made(1), OLD))
+    _, _, err = cli(["setup-code", "--state", str(tmp_path)])
+    assert err.splitlines()[1].startswith("The passkey file can't be verified")
+    old_master = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"  # bytes(range(1, 33))
+    monkeypatch.setenv("ZOEYMCP_MASTER_KEY_PREVIOUS", old_master)
+    _, _, err = cli(["setup-code", "--state", str(tmp_path)])
+    assert err.splitlines()[1] == "1 passkey is enrolled; enrolling with this code adds one."
+    (portal / "passkeys.json").write_bytes(b"edited")
+    _, _, err = cli(["setup-code", "--state", str(tmp_path), "--reset"])
+    assert err.splitlines()[1].startswith("The passkey file can't be verified: enrolling")
+    (portal / "passkeys.json").unlink()
+    (portal / "passkeys.json").mkdir(mode=0o700)
+    _, _, err = cli(["setup-code", "--state", str(tmp_path)])
+    assert err.splitlines()[1].startswith("The passkey file can't be verified")
+
+
+def test_setup_code_offline_refusals(
+    tmp_path: Path, offline: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = str(tmp_path / "state")
+    assert cli(["setup-code", "--state", state, "--wait"]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp setup-code: --wait asks the vault, so it can't go with --state\n",
+    )
+    monkeypatch.setenv("ZOEYMCP_MASTER_KEY", "")
+    assert cli(["setup-code", "--state", state]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp setup-code: --state needs the vault's master key in ZOEYMCP_MASTER_KEY\n",
+    )
+    monkeypatch.setenv("ZOEYMCP_MASTER_KEY", "too-short")
+    code, out, err = cli(["setup-code", "--state", state])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err == "zoeymcp setup-code: the master key isn't valid base64url\n"
+    monkeypatch.setenv("ZOEYMCP_MASTER_KEY", TEST_MASTER)
+    monkeypatch.setenv("ZOEYMCP_MASTER_KEY_PREVIOUS", "too-short")
+    assert cli(["setup-code", "--state", state])[0] == EXIT_UNREADABLE
+    monkeypatch.delenv("ZOEYMCP_MASTER_KEY_PREVIOUS")
+    monkeypatch.setattr(main_module, "running_as_root", lambda: True)
+    assert cli(["setup-code", "--state", state]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp setup-code: --state won't run as root: the vault's uid couldn't read the file. "
+        "Run it as the vault's user.\n",
+    )
+    assert not (tmp_path / "state").exists()
+    monkeypatch.setattr(main_module, "running_as_root", lambda: False)
+    (tmp_path / "file").write_bytes(b"")
+    code, out, err = cli(["setup-code", "--state", str(tmp_path / "file")])
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err.startswith(f"zoeymcp setup-code: can't write {tmp_path / 'file' / 'setup.json'}: ")
+
+
+@pytest.mark.parametrize(("uid", "root"), [(0, True), (10001, False), (None, False)])
+def test_running_as_root(monkeypatch: pytest.MonkeyPatch, uid: int | None, root: bool) -> None:
+    if uid is None:
+        monkeypatch.delattr(os, "geteuid", raising=False)
+    else:
+        monkeypatch.setattr(os, "geteuid", lambda: uid, raising=False)
+    assert main_module.running_as_root() is root
+
+
+LISTED: list[dict[str, Any]] = [
+    {
+        "fingerprint": "3f9a1c0e52d4b7a8",
+        "name": "laptop",
+        "rp_id": "localhost",
+        "alg": "ES256",
+        "synced": True,
+        "transports": ["hybrid", "internal"],
+        "via": "setup_code",
+        "origin": "http://localhost:8081",
+        "created": 1_760_000_043,
+        "last_used": 1_760_054_400,
+    },
+    {
+        "fingerprint": "0123456789abcdef",
+        "name": "security key",
+        "rp_id": "zoeymcp.tailnet.example",
+        "alg": "EdDSA",
+        "synced": False,
+        "transports": ["usb"],
+        "via": "portal",
+        "origin": "https://zoeymcp.tailnet.example",
+        "created": 1_759_000_000,
+        "last_used": None,
+    },
+]
+LISTED_LINES = [
+    "3f9a1c0e52d4b7a8  laptop",
+    "  ES256, synced, for localhost; enrolled 2025-10-09T08:54:03Z via setup_code on "
+    "http://localhost:8081; last used 2025-10-10",
+    "0123456789abcdef  security key",
+    "  EdDSA, device-bound, for zoeymcp.tailnet.example; enrolled 2025-09-27T19:06:40Z via "
+    "portal on https://zoeymcp.tailnet.example; never used",
+]
+
+
+def test_passkeys_are_listed(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/passkeys")] = (200, {"passkeys": LISTED})
+    text = "".join(f"{line}\n" for line in LISTED_LINES)
+    assert cli(["passkeys", "--socket", "x"]) == (EXIT_OK, text, "")
+    admin.answers[("GET", "/passkeys")] = (200, {"passkeys": []})
+    assert cli(["passkeys", "--socket", "x"]) == (EXIT_OK, "no passkeys\n", "")
+    unavailable = {"error": "the passkey file can't be verified", "reason": "unavailable"}
+    admin.answers[("GET", "/passkeys")] = (503, unavailable)
+    assert cli(["passkeys", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp passkeys: the passkey file can't be verified\n",
+    )
+
+
+def test_a_passkey_is_removed(admin: FakeAdmin) -> None:
+    path = "/passkeys/3f9a1c0e52d4b7a8"
+    removed = {"removed": LISTED[0], "sessions_ended": 2, "remaining": 1}
+    admin.answers[("DELETE", path)] = (200, removed)
+    assert cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"]) == (
+        EXIT_OK,
+        f"removed {LISTED_LINES[0]}\n{LISTED_LINES[1]}\n2 session(s) ended; 1 passkey(s) left\n",
+        "",
+    )
+    admin.answers[("DELETE", path)] = (200, {**removed, "remaining": 0})
+    code, out, err = cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"])
+    assert (code, out.splitlines()[-1]) == (EXIT_OK, "2 session(s) ended; 0 passkey(s) left")
+    assert err == "No passkey is left: the portal waits for a setup code (zoeymcp setup-code).\n"
+    admin.answers[("DELETE", "/passkeys/0000000000000000")] = (
+        404,
+        {"error": "no passkey has that fingerprint", "reason": "not_found"},
+    )
+    assert cli(["passkeys", "--remove", "0000000000000000", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp passkeys: no passkey has that fingerprint\n",
+    )
+    admin.answers[("DELETE", "/passkeys/a%2Fb")] = (400, {"error": "bad", "reason": "x"})
+    assert cli(["passkeys", "--remove", "a/b", "--socket", "x"])[0] == EXIT_FINDINGS
+
+
+def test_sessions_are_listed_and_ended(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/sessions")] = (200, {"sessions": []})
+    assert cli(["sessions", "--socket", "x"]) == (EXIT_OK, "no portal sessions\n", "")
+    session = {"session": "ab12", "scope": "full"}
+    admin.answers[("GET", "/sessions")] = (200, {"sessions": [session]})
+    assert cli(["sessions", "--socket", "x"]) == (
+        EXIT_OK,
+        '{"scope": "full", "session": "ab12"}\n',
+        "",
+    )
+    admin.answers[("DELETE", "/sessions")] = (200, {"ended": 3})
+    assert cli(["sessions", "--end-all", "--socket", "x"]) == (
+        EXIT_OK,
+        "ended 3 portal session(s)\n",
+        "",
+    )
+    admin.answers[("DELETE", "/sessions")] = (503, {"error": "stopping"})
+    assert cli(["sessions", "--end-all", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp sessions: stopping\n",
     )

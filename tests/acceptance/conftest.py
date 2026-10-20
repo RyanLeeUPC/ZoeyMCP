@@ -228,7 +228,12 @@ class Deployment:
         )
         login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
         self.admin = AdminApp(
-            store, self.keys, lambda: self.app.policy, SetupCodes(self.state), self.tokens, login
+            store,
+            self.keys,
+            lambda: self.app.policy,
+            SetupCodes(self.state, self.keys.portal_key),
+            self.tokens,
+            login,
         )
 
     def restart(

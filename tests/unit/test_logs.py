@@ -10,6 +10,7 @@ import pytest
 from zoeymcp.common import logs as common_logs
 from zoeymcp.portal.actions import Action, Actions, HeldData
 from zoeymcp.portal.sessions import Ceremonies, Ceremony, SessionToken
+from zoeymcp.portal.setupcode import SetupCode
 from zoeymcp.vault import logs
 from zoeymcp.vault.store import Secret
 
@@ -132,7 +133,13 @@ def _portal_values() -> list[Any]:
         origin="http://localhost:8081",
         now=0.0,
     )
-    return [SessionToken("fake-session-half"), ceremony, HeldData({"value": "x"}), action]
+    return [
+        SessionToken("fake-session-half"),
+        ceremony,
+        HeldData({"value": "x"}),
+        action,
+        SetupCode("AAAAAA-AAAAAA-AAAAAA-AAAAAA"),
+    ]
 
 
 @pytest.mark.parametrize("value", _portal_values(), ids=lambda v: type(v).__name__)
@@ -142,7 +149,8 @@ def test_the_portals_secret_types_are_refused_nested(value: Any, lines: io.Strin
     for wrapped in (value, [value], {"outer": [{"inner": (value,)}]}, {value: 1}):
         with pytest.raises(TypeError, match=message):
             logs.event("oops", f=wrapped)
-    assert {SessionToken, Ceremony, HeldData, Action} <= set(common_logs.refused_types())
+    refused = {SessionToken, Ceremony, HeldData, Action, SetupCode}
+    assert refused <= set(common_logs.refused_types())
     assert lines.getvalue() == ""
 
 

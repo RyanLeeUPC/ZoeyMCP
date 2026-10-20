@@ -19,6 +19,7 @@ import pytest
 from tests.unit.report_model import asked_line
 from zoeymcp.common.ledgerformat import GENESIS
 from zoeymcp.vault import gatewaykeys, logs, server
+from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
 from zoeymcp.vault.connectors import sendjournal
 from zoeymcp.vault.connectors.smtp import SmtpConnectors
@@ -390,6 +391,92 @@ def test_run_gives_the_admin_the_token_manager(
     monkeypatch.setattr(server, "serve", serve)
     server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), tmp_path / "admin.sock")
     assert seen["admin"]._tokens is seen["app"].tokens
+
+
+def test_run_builds_the_setup_codes_without_a_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows, or with --admin-socket none, the portal still redeems a code issued offline,
+    so run builds its one SetupCodes outside the socket branch (M5 design E.2, verifier V12)."""
+    built: list[SetupCodes] = []
+    seen: dict[str, Any] = {}
+
+    class Recorded(SetupCodes):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        await app.aclose()
+
+    environ = env()
+    monkeypatch.setattr(server, "SetupCodes", Recorded)
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: False)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, environ, tmp_path / "admin.sock")
+    assert seen["admin"] is None
+    [setup] = built
+    assert setup.path == tmp_path / "setup.json"
+    # Under the master key's portal key: a code the CLI writes offline is one it reads.
+    key = KeySet.from_text(environ["ZOEYMCP_MASTER_KEY"]).portal_key
+    _, record = SetupCodes(tmp_path, key).issue()
+    assert setup.record() == record
+
+
+def test_run_gives_the_admin_the_setup_codes_and_passkeys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        await app.aclose()
+
+    environ = env()
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, environ, tmp_path / "admin.sock")
+    admin = seen["admin"]
+    assert admin._setup.path == tmp_path / "setup.json"
+    holder = admin._passkeys
+    assert holder.document.credentials == ()
+    assert not holder.unavailable
+    lines = [line for line in _log_lines(log_buffer) if line["event"] == "passkeys_loaded"]
+    assert [(line["count"], line["generation"]) for line in lines] == [(0, 0)]
+
+
+def test_run_reseals_the_passkeys_under_the_new_master_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zoeymcp.portal.passkeys import Passkeys, seal, unseal
+
+    from .test_passkeys import made
+
+    old, new = generate_master_key(), generate_master_key()
+    old_key = KeySet.from_text(old).portal_key
+    path = tmp_path / "portal" / "passkeys.json"
+    path.parent.mkdir(mode=0o700)
+    path.write_bytes(seal(made(1), old_key))
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    environ = {"ZOEYMCP_MASTER_KEY": new, "ZOEYMCP_MASTER_KEY_PREVIOUS": old}
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, environ, tmp_path / "admin.sock")
+    holder: Passkeys = seen["admin"]._passkeys
+    assert len(holder.document.credentials) == 1
+    document, resealed = unseal(path.read_bytes(), KeySet.from_text(new).portal_key)
+    assert (len(document.credentials), resealed) == (1, False)
 
 
 def test_run_shares_one_login_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

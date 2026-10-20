@@ -169,8 +169,38 @@ def secret_delete(
     )
 
 
-def setup_code(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
-    return _request(socket, "POST", "/setup-code", transport=transport)
+def setup_code(
+    socket: str, *, reset: bool = False, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """A new setup code: ``{code, expires, reset, passkeys, origins}``."""
+    return _request(socket, "POST", "/setup-code", {"reset": reset}, transport)
+
+
+def setup_code_status(
+    socket: str, *, wait: int, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """What became of the last code, once it changes or ``wait`` seconds pass; never the code."""
+    path = f"/setup-code/status?wait={wait}"
+    return _request(socket, "GET", path, transport=transport, timeout=wait + DEFAULT_TIMEOUT)
+
+
+def passkeys(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    return _request(socket, "GET", "/passkeys", transport=transport)
+
+
+def passkey_remove(
+    socket: str, fingerprint: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    path = f"/passkeys/{quote(fingerprint, safe='')}"
+    return _request(socket, "DELETE", path, transport=transport)
+
+
+def sessions(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    return _request(socket, "GET", "/sessions", transport=transport)
+
+
+def sessions_end_all(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    return _request(socket, "DELETE", "/sessions", transport=transport)
 
 
 def gateway_key(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:

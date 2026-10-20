@@ -55,6 +55,9 @@ HEALTH_ACTIONS = {
     "check_mailbox": "check the mailbox for the sends with an unknown outcome",
     "check_gateway": "check that the gateway runs and reaches the vault",
     "read_ledger": "run: zoeymcp ledger --vault",
+    "add_passkey": "run: zoeymcp setup-code, and enrol a second passkey with it",
+    "review_passkeys": "run: zoeymcp passkeys, and remove any you don't recognize",
+    "reset_passkeys": "run: zoeymcp setup-code --reset",
 }
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
@@ -252,7 +255,46 @@ def _build_parser() -> argparse.ArgumentParser:
     selftest.add_argument("--cases", metavar="FILE", required=True, help="cases file (YAML)")
     selftest.add_argument("--mutate", action="store_true", help="also mutation-test the cases")
 
-    commands.add_parser("setup-code", help="issue a one-time portal setup code (15 minutes)")
+    setup_code = commands.add_parser(
+        "setup-code",
+        help="issue a one-time portal setup code, valid for 15 minutes (inside the vault)",
+        description=(
+            "Print a one-time code that enrols a passkey in the portal: it works once, for 15 "
+            "minutes, and replaces any earlier one. Enrolling with it adds a passkey; with "
+            "--reset, it removes every other passkey and ends every session. --state writes "
+            "the code into a state directory instead, for hosts without the admin socket: it "
+            "needs ZOEYMCP_MASTER_KEY and refuses to run as root."
+        ),
+    )
+    setup_code.add_argument(
+        "--reset",
+        action="store_true",
+        help="enrolling with this code removes every other passkey and ends every session",
+    )
+    setup_code.add_argument(
+        "--wait",
+        action="store_true",
+        help="wait until a passkey is enrolled with the code, or it expires, and show which",
+    )
+    setup_code.add_argument(
+        "--state",
+        metavar="DIR",
+        help="write the code into this state directory, without the admin socket",
+    )
+    passkeys = commands.add_parser(
+        "passkeys",
+        help="list the portal's passkeys, or remove one (inside the vault)",
+        description=(
+            "List each passkey with its fingerprint, how and where it was enrolled, and when it "
+            "was last used, or remove one by its fingerprint. The last passkey may be removed "
+            "here: the portal then waits for a setup code."
+        ),
+    )
+    passkeys.add_argument("--remove", metavar="FINGERPRINT", help="remove this passkey")
+    sessions = commands.add_parser(
+        "sessions", help="list the portal's sessions, or end them all (inside the vault)"
+    )
+    sessions.add_argument("--end-all", action="store_true", help="end every portal session")
     gateway_key = commands.add_parser(
         "gateway-key",
         help="print the gateway key for the current generation",
@@ -415,7 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")
-    for name in ("setup-code", "gateway-key", "login", "health"):
+    for name in ("setup-code", "passkeys", "sessions", "gateway-key", "login", "health"):
         commands.choices[name].add_argument("--socket", metavar="PATH", help="admin socket path")
     return parser
 
@@ -520,11 +562,7 @@ def _cmd_client_token(out: TextIO, err: TextIO) -> int:
 def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
     socket = admin_client.socket_path(getattr(args, "socket", None))
     try:
-        if args.command == "setup-code":
-            result = admin_client.setup_code(socket)
-            out.write(f"{result['code']}\n")
-            err.write("One-time code, valid for 15 minutes.\n")
-        elif args.command == "gateway-key":
+        if args.command == "gateway-key":
             _gateway_key(socket, args.retire_previous, out, err)
         elif args.action == "set":
             value = admin_client.read_secret_value(stdin)
@@ -574,6 +612,235 @@ def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -
         err.write(
             f"rotation pending: {generations}{master} accepted until {utc(previous['until'])}\n"
         )
+
+
+# --- setup codes, passkeys and sessions (M5 design E) ------------------------------------------
+
+
+def _cmd_setup_code(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    if args.state is not None:
+        if args.wait:
+            err.write("zoeymcp setup-code: --wait asks the vault, so it can't go with --state\n")
+            return EXIT_UNREADABLE
+        return _offline_setup_code(Path(args.state), args.reset, out, err)
+    socket = admin_client.socket_path(args.socket)
+    try:
+        result = admin_client.setup_code(socket, reset=args.reset)
+        out.write(f"{result['code']}\n")
+        out.flush()
+        err.write("".join(f"{line}\n" for line in setup_code_lines(result)))
+        if args.wait:
+            return _wait_for_enrolment(socket, result, out, err)
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp setup-code: {exc}\n")
+        return EXIT_FINDINGS
+    return EXIT_OK
+
+
+def running_as_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _offline_setup_code(state: Path, reset: bool, out: TextIO, err: TextIO) -> int:
+    """``setup-code --state DIR``: write the MAC'd record with the master key from the
+    environment, for hosts without the admin socket (M5 design E.2)."""
+    from ..portal.setupcode import FILE
+    from ..vault.admin import SetupCodes
+    from ..vault.keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
+
+    if running_as_root():
+        err.write(
+            "zoeymcp setup-code: --state won't run as root: the vault's uid couldn't read the "
+            "file. Run it as the vault's user.\n"
+        )
+        return EXIT_UNREADABLE
+    text = os.environ.get(MASTER_KEY_ENV)
+    if not text:
+        err.write(f"zoeymcp setup-code: --state needs the vault's master key in {MASTER_KEY_ENV}\n")
+        return EXIT_UNREADABLE
+    try:
+        keys = KeySet.from_text(text)
+        previous_text = os.environ.get(PREVIOUS_MASTER_KEY_ENV)
+        previous = KeySet.from_text(previous_text) if previous_text else None
+    except MasterKeyError as exc:
+        err.write(f"zoeymcp setup-code: {exc}\n")
+        return EXIT_UNREADABLE
+    try:
+        code, record = SetupCodes(state, keys.portal_key).issue(reset=reset)
+    except OSError as exc:
+        err.write(f"zoeymcp setup-code: can't write {state / FILE}: {exc}\n")
+        return EXIT_FINDINGS
+    out.write(f"{code.reveal()}\n")
+    result = {
+        "expires": record.expires,
+        "reset": record.reset,
+        "passkeys": _passkey_count(state, keys, previous),
+        "origins": None,
+    }
+    err.write("".join(f"{line}\n" for line in setup_code_lines(result)))
+    return EXIT_OK
+
+
+def _passkey_count(state: Path, keys: Any, previous: Any) -> int | None:
+    """How many passkeys the state directory holds; None when the file can't be verified."""
+    from ..portal import passkeys
+
+    path = state / passkeys.DIRECTORY / passkeys.FILE
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(passkeys.MAX_FILE_BYTES + 1)
+        document, _ = passkeys.unseal(
+            data, keys.portal_key, None if previous is None else previous.portal_key
+        )
+    except FileNotFoundError:
+        return 0
+    except (OSError, passkeys.PasskeyFileError):
+        return None
+    return len(document.credentials)
+
+
+def setup_code_lines(result: dict[str, Any]) -> list[str]:
+    """What ``setup-code`` tells the operator on stderr: where to use the code, what enrolling
+    with it does, and what a refusal of an unused code means (E.1, E.4). ``origins`` is None
+    when the code was written offline, without the policy."""
+    from ..portal.setupcode import TTL
+
+    origins = result["origins"]
+    if origins is None:
+        where = "Open the portal and choose Set up."
+    elif origins:
+        where = f"Open {' or '.join(origins)} and choose Set up."
+    else:
+        where = "The policy has no admin block, so no portal takes it yet."
+    lines = [f"One-time code, valid for {TTL // 60} minutes. {where}"]
+    count, reset = result["passkeys"], result["reset"]
+    if count is None and reset:
+        lines.append(
+            "The passkey file can't be verified: enrolling with this code moves it aside, "
+            "removes every passkey and ends every session."
+        )
+    elif count is None:
+        lines.append(
+            "The passkey file can't be verified: only a code issued with --reset can enrol; "
+            "run zoeymcp setup-code --reset."
+        )
+    elif count:
+        enrolled = "1 passkey is enrolled" if count == 1 else f"{count} passkeys are enrolled"
+        effect = "removes all of them and ends every session" if reset else "adds one"
+        lines.append(f"{enrolled}; enrolling with this code {effect}.")
+    lines.append(
+        "If the portal refuses this code before you have used it, someone else has: run "
+        "zoeymcp setup-code --reset."
+    )
+    return lines
+
+
+# Each status request of setup-code --wait waits up to this many seconds for a change.
+SETUP_WAIT_POLL = 30
+
+
+def _wait_for_enrolment(socket: str, issued: dict[str, Any], out: TextIO, err: TextIO) -> int:
+    """Ask until a passkey is enrolled with the code, or it can't be any more (E.4)."""
+    err.write("Waiting until a passkey is enrolled with this code (Ctrl-C stops waiting).\n")
+    err.flush()
+    announced = False
+    while True:
+        try:
+            status = admin_client.setup_code_status(socket, wait=SETUP_WAIT_POLL)
+        except KeyboardInterrupt:
+            err.write(
+                "zoeymcp setup-code: stopped waiting; the code still works until it expires\n"
+            )
+            return EXIT_FINDINGS
+        state = status["state"]
+        if state == "none" or status["expires"] != issued["expires"]:
+            err.write(
+                "zoeymcp setup-code: the vault has a newer code, or restarted: nothing to wait "
+                "for\n"
+            )
+            return EXIT_FINDINGS
+        if state == "enrolled":
+            out.write(f"{enrolled_line(status['passkey'])}\n")
+            return EXIT_OK
+        if state == "expired":
+            if status["origin"] is None:
+                text = "the code expired, or was withdrawn, unused"
+            else:
+                text = f"redeemed on {status['origin']}, but no passkey was enrolled in time"
+            err.write(f"zoeymcp setup-code: {text}; issue a new code\n")
+            return EXIT_FINDINGS
+        if state == "redeemed" and not announced:
+            announced = True
+            err.write(f"Redeemed on {status['origin']}; waiting for the enrolment.\n")
+            err.flush()
+
+
+def enrolled_line(passkey: dict[str, Any]) -> str:
+    """The passkey a setup code enrolled, to compare with what the portal showed (E.4)."""
+    from ..vault.gatewaykeys import utc
+
+    at = utc(passkey["created"]).partition("T")[2].removesuffix("Z")
+    return (
+        f"enrolled: {passkey['fingerprint']} on {passkey['origin']} as {passkey['name']} "
+        f"at {at} UTC"
+    )
+
+
+def passkey_lines(passkey: dict[str, Any]) -> list[str]:
+    """Two lines per passkey: its fingerprint and name, then how and where it was enrolled."""
+    from ..vault.gatewaykeys import utc
+
+    kind = "synced" if passkey["synced"] else "device-bound"
+    used = passkey["last_used"]
+    last = "never used" if used is None else f"last used {utc(used).partition('T')[0]}"
+    return [
+        f"{passkey['fingerprint']}  {passkey['name']}",
+        f"  {passkey['alg']}, {kind}, for {passkey['rp_id']}; enrolled {utc(passkey['created'])} "
+        f"via {passkey['via']} on {passkey['origin']}; {last}",
+    ]
+
+
+def _cmd_passkeys(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    socket = admin_client.socket_path(args.socket)
+    try:
+        if args.remove is not None:
+            result = admin_client.passkey_remove(socket, args.remove)
+            lines = passkey_lines(result["removed"])
+            out.write(f"removed {lines[0]}\n{lines[1]}\n")
+            remaining = result["remaining"]
+            out.write(f"{result['sessions_ended']} session(s) ended; {remaining} passkey(s) left\n")
+            if remaining == 0:
+                err.write(
+                    "No passkey is left: the portal waits for a setup code (zoeymcp setup-code).\n"
+                )
+            return EXIT_OK
+        listed = admin_client.passkeys(socket)["passkeys"]
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp passkeys: {exc}\n")
+        return EXIT_FINDINGS
+    if not listed:
+        out.write("no passkeys\n")
+    for passkey in listed:
+        out.write("".join(f"{line}\n" for line in passkey_lines(passkey)))
+    return EXIT_OK
+
+
+def _cmd_sessions(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    socket = admin_client.socket_path(args.socket)
+    try:
+        if args.end_all:
+            ended = admin_client.sessions_end_all(socket)["ended"]
+            out.write(f"ended {ended} portal session(s)\n")
+            return EXIT_OK
+        listed = admin_client.sessions(socket)["sessions"]
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp sessions: {exc}\n")
+        return EXIT_FINDINGS
+    if not listed:
+        out.write("no portal sessions\n")
+    for session in listed:
+        out.write(f"{json.dumps(session, sort_keys=True)}\n")
+    return EXIT_OK
 
 
 # --- review and gateway-status ----------------------------------------------------------------
@@ -962,6 +1229,13 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
     store = report["store"]
     lines.append(f"store: {store['level']} ({store['entries']} entries)")
     lines += _finding_lines(store["findings"])
+    passkeys = report.get("passkeys")
+    if passkeys is not None:
+        count = (
+            "can't be verified" if passkeys["count"] is None else f"{passkeys['count']} enrolled"
+        )
+        lines.append(f"passkeys: {passkeys['level']} ({count})")
+        lines += _finding_lines(passkeys["findings"])
     copy = report.get("ledger_copy")
     if copy is not None:
         head = "nothing reported" if copy["head_seq"] is None else f"head seq {copy['head_seq']}"
@@ -1148,8 +1422,14 @@ def main(
         return _cmd_standard(args, err)
     if args.command == "selftest":
         return _cmd_selftest(args, stdin, out)
-    if args.command in ("secret", "setup-code", "gateway-key"):
+    if args.command in ("secret", "gateway-key"):
         return _cmd_admin(args, stdin, out, err)
+    if args.command == "setup-code":
+        return _cmd_setup_code(args, out, err)
+    if args.command == "passkeys":
+        return _cmd_passkeys(args, out, err)
+    if args.command == "sessions":
+        return _cmd_sessions(args, out, err)
     if args.command == "review":
         return _cmd_review(args, out, err)
     if args.command == "gateway-status":

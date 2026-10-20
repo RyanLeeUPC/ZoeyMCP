@@ -33,6 +33,7 @@ from ..common.control import CONTROL_RELOAD as CONTROL_RELOAD
 from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
+from ..portal.passkeys import Passkeys
 from . import logs
 from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
 from .app import LISTENER_SCOPE_KEY, Listener, VaultApp
@@ -170,6 +171,8 @@ class Runtime:
     store: SecretStore
     keys: KeySet
     gateway_keys: GatewayKeys
+    # The previous master key's, during a master-key rotation.
+    previous: KeySet | None = None
 
 
 def load_keys(environ: Mapping[str, str]) -> tuple[KeySet, KeySet | None]:
@@ -215,7 +218,7 @@ def load_runtime(config: str | None, state_dir: Path, environ: Mapping[str, str]
         gateway_keys = GatewayKeys.load(state_dir, keys, previous, policy.gateway_key_generation)
     except GatewayKeyError as exc:
         raise StartupError(str(exc)) from exc
-    return Runtime(policy, store, keys, gateway_keys)
+    return Runtime(policy, store, keys, gateway_keys, previous)
 
 
 class _Server(uvicorn.Server):
@@ -422,6 +425,13 @@ def run(
         raise StartupError(f"can't recover the SMTP connectors' send journals: {exc}") from exc
     # One set of pending logins for every surface, so the flow limit is shared (M5 design H.2).
     login = LoginService(app.tokens)
+    # The portal's state files, one holder each for the socket and the portal. Built on every
+    # platform: on Windows, or with --admin-socket none, the portal still redeems a code issued
+    # offline with zoeymcp setup-code --state (M5 design E.2, verifier V12).
+    portal_key = runtime.keys.portal_key
+    previous = None if runtime.previous is None else runtime.previous.portal_key
+    passkeys = Passkeys.load(state_dir, portal_key, previous)
+    setup = SetupCodes(state_dir, portal_key)
     admin = None
     if admin_socket is not None and socket_supported():
         try:
@@ -432,13 +442,14 @@ def run(
             runtime.store,
             runtime.keys,
             lambda: app.policy,
-            SetupCodes(state_dir),
+            setup,
             app.tokens,
             login,
             gateway_keys=runtime.gateway_keys,
             connectors=app.connectors,
             env_names=lambda: app.env_names,
             reports=reports,
+            passkeys=passkeys,
         )
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")

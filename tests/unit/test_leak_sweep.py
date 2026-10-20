@@ -199,7 +199,7 @@ class World:
             self.store,
             KEYS,
             lambda: self.policy,
-            SetupCodes(tmp_path),
+            SetupCodes(tmp_path, KEYS.portal_key),
             self.tokens,
             login,
             connectors=self.vault.connectors,
@@ -424,6 +424,13 @@ async def test_nothing_secret_leaves_the_vault(
     assert (await world.proxy("machine")).status_code == 502
     assert (await world.cli(["oauth", "reset", "machine"]))[0] == 0
 
+    # Setup codes over the socket and from the CLI: shown to the operator, never logged.
+    issued = (await world.admin("POST", "/setup-code", {"reset": True})).json()["code"]
+    code, out, _ = await world.cli(["setup-code"])
+    assert code == 0
+    setup_codes = [issued, out.strip()]
+    await world.admin("GET", "/setup-code/status")
+
     # Listings.
     await world.admin("GET", "/oauth")
     await world.admin("GET", "/secrets")
@@ -465,6 +472,12 @@ async def test_nothing_secret_leaves_the_vault(
     # Logs carry no flow ID, authorization URL or provider description at all.
     for value in [*world.flows, *world.authorize_urls, SENTINEL, flow]:
         assert value not in log_text
+    # Nor a setup code, in any form the portal would take (M5 design E, M.4).
+    assert '"event":"setup_code_issued"' in log_text
+    for setup_code in setup_codes:
+        raw = setup_code.replace("-", "")
+        for form in (setup_code, raw, raw.lower(), *setup_code.split("-")):
+            assert form not in log_text
     # The description reached the operator, and only through the failed completion.
     assert sum(SENTINEL in text for text in world.admin_answers) == 1
     assert world.authorize_urls

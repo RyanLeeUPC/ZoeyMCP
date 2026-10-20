@@ -5,7 +5,13 @@ socket's directory must be owned by the vault's uid and closed to everyone else,
 uid (or root, which already has the host) can connect. The CLI reaches it with
 ``docker exec <vault> zoeymcp secret ...``.
 
-There is deliberately no endpoint that returns a secret value.
+There is deliberately no endpoint that returns a secret value. Two answers carry a credential, as
+recorded exceptions to R61 (M5 design D16): ``POST /setup-code`` the new setup code, and
+``GET /gateway-key`` the gateway key.
+
+``zoeymcp setup-code [--reset] [--wait]`` uses ``POST /setup-code`` and ``GET /setup-code/status``;
+``zoeymcp passkeys`` and ``sessions`` list and remove the portal's passkeys and sessions, with no
+step-up: host access is the recovery path (M5 design E).
 
 ``PUT/DELETE /secrets/{name}`` decide with :mod:`.secretplan` and write with :mod:`.secretops`,
 which the portal shares (M5 design G). Secrets an oauth2 credential uses are written and deleted
@@ -34,34 +40,39 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
-import hmac
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import sys
-import tempfile
 import time
-from base64 import b32encode
 from collections.abc import Callable, Collection
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Final, Literal
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from ..common import files
+
 # The CLI reads these from common, so the gateway's entry path loads no vault code.
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy.schema import Policy
+from ..portal import passkeys as passkey_file
+from ..portal import setupcode
+from ..portal.passkeys import PasskeyError, Passkeys
+from ..portal.sessions import SETUP_SESSION_MAX
+from ..portal.setupcode import Record, Redeemed, Refused, SetupCode
 from . import health, ledgerview, logs, secretops, secretplan
 from .connectors.smtp import SmtpConnectors
 from .gatewaykeys import GatewayKeyError, GatewayKeys
-from .keys import KeySet
+from .keys import KeySet, PortalKey
 from .oauth.login import LoginError, LoginService
 from .oauth.tokens import TokenManager
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
@@ -69,12 +80,27 @@ from .secretplan import NOT_WRITTEN as NOT_WRITTEN
 from .secretplan import SecretRefusal
 from .store import SecretStore
 
-SETUP_FILE = "setup.json"
-SETUP_CODE_TTL = 15 * 60
 MAX_BODY = 128 * 1024
 MAX_COMPLETE_BODY = 8 * 1024
 NO_TOKENS = "OAuth needs the vault's token manager"
 NO_GATEWAY_KEYS = "the vault keeps no gateway key state"
+# POST /setup-code takes {reset?}.
+MAX_SETUP_BODY: Final = 4 * 1024
+# The longest GET /setup-code/status?wait=N waits, in seconds.
+MAX_STATUS_WAIT: Final = 60
+NO_PASSKEYS: Final = "the vault keeps no passkey state"
+PASSKEYS_UNAVAILABLE: Final = (
+    "the passkey file can't be verified (edited, or written under another master key); "
+    "run zoeymcp setup-code --reset"
+)
+_FINGERPRINT: Final = re.compile(r"[0-9a-f]{16}")
+# Passkey refusals over the socket: status and text.
+_PASSKEY_REFUSALS: Final = {
+    "unavailable": (503, PASSKEYS_UNAVAILABLE),
+    "not_found": (404, "no passkey has that fingerprint"),
+    "ambiguous_fingerprint": (409, "more than one passkey has that fingerprint; nothing removed"),
+    "not_written": (500, "not written to disk; nothing changed; check the state volume"),
+}
 # Login reasons answered with something other than 400.
 _LOGIN_STATUS = {
     "not_oauth": 404,
@@ -106,41 +132,157 @@ def check_socket_dir(path: Path) -> None:
         path.unlink()
 
 
+@dataclass
+class _Tracked:
+    """The code this vault last issued or redeemed, as ``GET /setup-code/status`` tells it."""
+
+    record: Record
+    state: Literal["pending", "redeemed", "enrolled", "expired"] = "pending"
+    # When it was redeemed, and on which origin.
+    redeemed_at: float | None = None
+    origin: str | None = None
+    # The passkey its setup session enrolled (passkeys.describe), once it has.
+    passkey: dict[str, Any] | None = None
+
+
 class SetupCodes:
-    """One-time setup codes for the portal (consumed in M5). Only a hash is kept."""
+    """One-time setup codes for the portal (M5 design E), kept in ``<state>/setup.json`` as a
+    record MAC'd under ``key`` (:mod:`..portal.setupcode`). The socket issues them, and so does
+    ``zoeymcp setup-code --state DIR`` with the vault stopped or without a socket; the portal
+    redeems them, one at a time.
 
-    def __init__(self, state_dir: Path, clock: Callable[[], float] = time.time) -> None:
-        self._path = state_dir / SETUP_FILE
+    What happened to the code this vault last issued or redeemed is kept in memory for
+    ``zoeymcp setup-code --wait``: never the code itself.
+    """
+
+    def __init__(
+        self,
+        state_dir: Path,
+        key: PortalKey,
+        clock: Callable[[], float] = time.time,
+        *,
+        random: Callable[[int], bytes] = secrets.token_bytes,
+    ) -> None:
+        self._path = state_dir / setupcode.FILE
+        self._key = key
         self._clock = clock
+        self._random = random
+        self._lock = asyncio.Lock()
+        self._tracked: _Tracked | None = None
+        # Set, and replaced, on every change, to wake the status's long polls.
+        self._changed = asyncio.Event()
 
-    def issue(self) -> tuple[str, int]:
-        raw = b32encode(secrets.token_bytes(15)).decode("ascii")
-        code = "-".join(raw[i : i + 6] for i in range(0, 24, 6))
-        expires = int(self._clock()) + SETUP_CODE_TTL
-        record = {"sha256": hashlib.sha256(code.encode()).hexdigest(), "expires": expires}
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".setup-", dir=self._path.parent)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(record, handle)
-        os.replace(tmp, self._path)
-        return code, expires
+    @property
+    def path(self) -> Path:
+        return self._path
 
-    def consume(self, code: str) -> bool:
-        """True once for a valid, unexpired code; the code is then gone."""
+    def issue(self, *, reset: bool = False) -> tuple[SetupCode, Record]:
+        """A new code, replacing any earlier one. Raises :class:`OSError` if the record can't be
+        written, and the earlier code then still works."""
+        code = setupcode.new_code(self._random)
+        record = setupcode.new_record(code, now=self._clock(), reset=reset)
+        files.write_atomic(self._path, setupcode.seal(record, self._key), prefix=".setup-")
+        self._track(_Tracked(record))
+        return code, record
+
+    def record(self) -> Record | None:
+        """The pending code's record; None when there is none, or it doesn't verify."""
         try:
-            record = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
-        valid = (
-            isinstance(record, dict)
-            and self._clock() < record.get("expires", 0)
-            and hmac.compare_digest(
-                hashlib.sha256(code.encode()).hexdigest(), str(record.get("sha256", ""))
-            )
-        )
-        if valid:
-            self._path.unlink(missing_ok=True)
-        return bool(valid)
+            with self._path.open("rb") as handle:
+                data = handle.read(setupcode.MAX_FILE_BYTES + 1)
+        except OSError:
+            return None
+        return setupcode.unseal(data, self._key)
+
+    async def redeem(self, typed: object, *, origin: str) -> Redeemed | Refused:
+        """Spend the code ``typed`` is, typed on ``origin``. The record is removed, and its
+        directory synced, before :class:`Redeemed` is returned, so a code works once even across
+        a crash. Raises :class:`OSError` if it can't be removed: the code then isn't spent and
+        no setup session may open."""
+        async with self._lock:
+            record = self.record()
+            decision = setupcode.decide(record, typed, self._clock())
+            if record is None or isinstance(decision, Refused):
+                return decision
+            _remove_synced(self._path)
+            self._track(_Tracked(record, "redeemed", self._clock(), origin))
+            return decision
+
+    def enrolled(self, passkey: dict[str, Any]) -> None:
+        """The setup session the last redeemed code opened enrolled ``passkey``."""
+        tracked = self._tracked
+        if tracked is not None and tracked.state == "redeemed":
+            self._track(replace(tracked, state="enrolled", passkey=passkey))
+
+    def discard(self) -> None:
+        """Remove any pending code: the first passkey was enrolled, by whatever path (E.1)."""
+        with contextlib.suppress(FileNotFoundError):
+            _remove_synced(self._path)
+        tracked = self._tracked
+        if tracked is not None and tracked.state == "pending":
+            self._track(replace(tracked, state="expired"))
+
+    def status(self) -> dict[str, Any]:
+        """``{state, expires, reset, origin, passkey}`` of the code this vault last issued or
+        redeemed, never the code. ``state`` is ``none`` (none since the vault started),
+        ``pending``, ``redeemed``, ``enrolled``, or ``expired``: unused in time, discarded, or
+        redeemed by a setup session that ended without an enrolment."""
+        tracked = self._tracked
+        if tracked is None:
+            return {
+                "state": "none",
+                "expires": None,
+                "reset": None,
+                "origin": None,
+                "passkey": None,
+            }
+        state = tracked.state
+        if self._until_change(tracked) <= 0:
+            state = "expired"
+        return {
+            "state": state,
+            "expires": tracked.record.expires,
+            "reset": tracked.record.reset,
+            "origin": tracked.origin,
+            "passkey": tracked.passkey,
+        }
+
+    async def wait_status(self, seconds: float) -> dict[str, Any]:
+        """:meth:`status`, once it changes or ``seconds`` pass, whichever is first; at once when
+        nothing can change it any more (``none``, ``enrolled``, ``expired``)."""
+        tracked, changed = self._tracked, self._changed
+        if tracked is not None and self.status()["state"] in ("pending", "redeemed"):
+            timeout = min(seconds, self._until_change(tracked))
+            if timeout > 0:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(changed.wait(), timeout)
+        return self.status()
+
+    def _until_change(self, tracked: _Tracked) -> float:
+        """Seconds until time alone changes the state: a pending code expires, a redeemed one's
+        setup session ends. Infinite for the other states."""
+        now = self._clock()
+        if tracked.state == "pending":
+            return tracked.record.expires - now
+        if tracked.state == "redeemed" and tracked.redeemed_at is not None:
+            return tracked.redeemed_at + SETUP_SESSION_MAX - now
+        return math.inf
+
+    def _track(self, tracked: _Tracked) -> None:
+        self._tracked = tracked
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+
+def _remove_synced(path: Path) -> None:
+    """Remove ``path`` and, on POSIX, sync its directory, so the removal survives a crash."""
+    path.unlink()
+    if hasattr(os, "O_DIRECTORY"):
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -201,6 +343,7 @@ class AdminApp:
         connectors: SmtpConnectors | None = None,
         env_names: Callable[[], Collection[str]] | None = None,
         reports: ReportStore | None = None,
+        passkeys: Passkeys | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -209,8 +352,12 @@ class AdminApp:
         ``GET /health``. Without them it shows no sends, and every ``env:`` reference unset.
 
         ``reports`` is the reported copy of the gateway's ledger, for ``/ledger/reported`` and
-        health. Without it, those routes answer 503 and health has no ``ledger_copy``."""
+        health. Without it, those routes answer 503 and health has no ``ledger_copy``.
+
+        ``passkeys`` is the portal's passkey file, shared with the portal. Without it,
+        ``/passkeys`` answers 503 and health has no ``passkeys``."""
         self._store = store
+        self._passkeys = passkeys
         self._reports = reports
         self._connectors = connectors
         self._env_names = env_names
@@ -228,6 +375,11 @@ class AdminApp:
                 Route("/secrets/{name}", self._put, methods=["PUT"]),
                 Route("/secrets/{name}", self._delete, methods=["DELETE"]),
                 Route("/setup-code", self._setup_code, methods=["POST"]),
+                Route("/setup-code/status", self._setup_code_status, methods=["GET"]),
+                Route("/passkeys", self._passkey_list, methods=["GET"]),
+                Route("/passkeys/{fingerprint}", self._passkey_remove, methods=["DELETE"]),
+                Route("/sessions", self._session_list, methods=["GET"]),
+                Route("/sessions", self._session_end_all, methods=["DELETE"]),
                 Route("/gateway-key", self._gateway_key, methods=["GET"]),
                 Route("/gateway-key/retire-previous", self._retire_previous, methods=["POST"]),
                 Route("/oauth", self._oauth_status, methods=["GET"]),
@@ -272,10 +424,115 @@ class AdminApp:
             return _refused(refusal)
         return JSONResponse({"name": plan.name, "deleted": True})
 
+    # --- setup codes, passkeys and sessions (M5 design E, D.5, F.2) ----------------------------
+
     async def _setup_code(self, request: Request) -> Response:
-        code, expires = self._setup.issue()
-        logs.event("setup_code_issued", expires=expires)
-        return JSONResponse({"code": code, "expires": expires})
+        """``{reset?}``: a new code, which only this answer carries (R61's recorded exception,
+        D16), with how many passkeys are enrolled (null when the file can't be verified) and
+        the origins to redeem it on."""
+        data = await _json_object(request, MAX_SETUP_BODY)
+        if isinstance(data, Response):
+            return data
+        reset = data.get("reset", False)
+        if not set(data) <= {"reset"} or not isinstance(reset, bool):
+            return _error(400, "expected {reset?: bool}")
+        try:
+            code, record = self._setup.issue(reset=reset)
+        except OSError:
+            message = (
+                "the setup code couldn't be written, so none was issued; check the state volume"
+            )
+            return _reason(500, message, "not_written")
+        logs.event("setup_code_issued", expires=record.expires, reset=record.reset)
+        admin = self._policy().admin
+        answer = {
+            "code": code.reveal(),
+            "expires": record.expires,
+            "reset": record.reset,
+            "passkeys": self._passkey_count(),
+            "origins": [] if admin is None else list(admin.origins),
+        }
+        return JSONResponse(answer)
+
+    async def _setup_code_status(self, request: Request) -> Response:
+        """``?wait=N``: what became of the code this vault last issued or redeemed, once it
+        changes or N seconds (at most 60) pass. Never the code (E.4)."""
+        query = dict(request.query_params)
+        if set(query) - {"wait"} or len(request.query_params.multi_items()) != len(query):
+            return _reason(400, "expected ?wait=N", "bad_query")
+        try:
+            wait = _number(query.get("wait"))
+        except _BadNumber:
+            return _reason(400, "wait is a number of seconds", "bad_query")
+        seconds = min(wait or 0, MAX_STATUS_WAIT)
+        return JSONResponse(await self._setup.wait_status(seconds))
+
+    def _passkey_count(self) -> int | None:
+        """How many passkeys are enrolled: None when the file can't be verified, 0 without a
+        passkey holder."""
+        holder = self._passkeys
+        if holder is None:
+            return 0
+        return None if holder.unavailable else len(holder.document.credentials)
+
+    def _holder(self) -> Passkeys | Response:
+        holder = self._passkeys
+        if holder is None:
+            return _reason(503, NO_PASSKEYS, "unavailable")
+        if holder.unavailable:
+            return _reason(503, PASSKEYS_UNAVAILABLE, "unavailable")
+        return holder
+
+    async def _passkey_list(self, request: Request) -> Response:
+        """Every passkey as D.5 shows it: never a key, a full ID or the user handle."""
+        holder = self._holder()
+        if isinstance(holder, Response):
+            return holder
+        listed = [
+            passkey_file.describe(passkey, holder.fingerprint(passkey.id))
+            for passkey in holder.document.credentials
+        ]
+        return JSONResponse({"passkeys": listed})
+
+    async def _passkey_remove(self, request: Request) -> Response:
+        """Remove a passkey by its fingerprint, the last one too: host access is the recovery
+        path (Q26). Written before it takes effect."""
+        holder = self._holder()
+        if isinstance(holder, Response):
+            return holder
+        wanted = request.path_params["fingerprint"]
+        if not _FINGERPRINT.fullmatch(wanted):
+            message = "a fingerprint is 16 hex digits, as zoeymcp passkeys lists them"
+            return _reason(400, message, "bad_fingerprint")
+        try:
+            removed = holder.remove(wanted, allow_last=True)
+        except PasskeyError as exc:
+            status, message = _PASSKEY_REFUSALS[exc.reason]
+            return _reason(status, message, exc.reason)
+        # The portal's sessions arrive with it (step 11): until then none was made with it.
+        ended = 0
+        remaining = len(holder.document.credentials)
+        logs.event(
+            "passkey_removed",
+            credential=wanted,
+            rp_id=removed.rp_id,
+            origin=removed.origin,
+            sessions_ended=ended,
+            remaining=remaining,
+        )
+        answer = {
+            "removed": passkey_file.describe(removed, wanted),
+            "sessions_ended": ended,
+            "remaining": remaining,
+        }
+        return JSONResponse(answer)
+
+    async def _session_list(self, request: Request) -> Response:
+        # The portal's sessions arrive with it (step 11): until then there are none.
+        return JSONResponse({"sessions": []})
+
+    async def _session_end_all(self, request: Request) -> Response:
+        return JSONResponse({"ended": 0})
 
     async def _gateway_key(self, request: Request) -> Response:
         if self._gateway_keys is None:
@@ -360,9 +617,23 @@ class AdminApp:
             oauth=None if self._login is None else self._login.status(),
             sends=self._sends(policy),
             persisted=not self._store.dirty,
+            passkeys=self._passkey_state(policy),
             ledger_copy=self._ledger_copy(policy),
         )
         return JSONResponse(json_safe(health.assess(inputs)))
+
+    def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
+        """The passkey file for health; None without one, or without a portal to use it."""
+        holder = self._passkeys
+        if holder is None or policy.admin is None:
+            return None
+        document = holder.document
+        last = document.last_regressed
+        return health.PasskeyState(
+            count=len(document.credentials),
+            unavailable=holder.unavailable,
+            regressed_ago=None if last is None else holder.clock() - last,
+        )
 
     def _ledger_copy(self, policy: Policy) -> health.LedgerCopy | None:
         """The reported copy for health; None without a copy or a gateway to report to it."""

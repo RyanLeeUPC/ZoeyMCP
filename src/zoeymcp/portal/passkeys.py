@@ -35,9 +35,12 @@ from ..vault import logs
 from ..vault.keys import PortalKey
 from .webauthn import (
     ALGORITHMS,
+    EDDSA,
+    ES256,
     MAX_CREDENTIAL_ID,
     MAX_PASSKEYS,
     MAX_PUBLIC_KEY,
+    RS256,
     TRANSPORTS,
     Asserted,
     NewCredential,
@@ -60,6 +63,8 @@ MAX_SIGN_COUNT: Final = 2**32 - 1
 _MAC_CONTEXT: Final = b"zoeymcp/passkeys/v1\n"
 _FINGERPRINT_CONTEXT: Final = b"zoeymcp/passkey-fp/v1\n"
 _KEY_ID: Final = re.compile(r"[0-9a-f]{16}")
+# How a passkey list names each algorithm (D.5).
+ALGORITHM_NAMES: Final = {ES256: "ES256", EDDSA: "EdDSA", RS256: "RS256"}
 _FIELDS: Final = frozenset({"v", "key_id", "generation", "user_handle", "credentials", "mac"})
 _RECORD_FIELDS: Final = frozenset(
     {
@@ -183,6 +188,24 @@ def find(document: PasskeyFile, key: PortalKey, wanted: str) -> Passkey | Refusa
     if len(found) > 1:
         return Refusal("ambiguous_fingerprint")
     return found[0]
+
+
+def describe(passkey: Passkey, shown_as: str) -> dict[str, Any]:
+    """What a passkey list shows of one credential, ``shown_as`` its fingerprint (D.5): how and
+    where it was enrolled, never its key, its full ID or the user handle. ``synced`` is backup
+    eligibility: false is a device-bound passkey."""
+    return {
+        "fingerprint": shown_as,
+        "name": passkey.name,
+        "rp_id": passkey.rp_id,
+        "alg": ALGORITHM_NAMES[passkey.alg],
+        "synced": passkey.backup_eligible,
+        "transports": list(passkey.transports),
+        "via": passkey.via,
+        "origin": passkey.origin,
+        "created": passkey.created,
+        "last_used": passkey.last_used,
+    }
 
 
 # --- the transitions ----------------------------------------------------------------------------
@@ -553,6 +576,11 @@ class Passkeys:
     def unavailable(self) -> bool:
         """The file failed to read or verify: nothing but a reset enrolment is allowed."""
         return self._unavailable
+
+    @property
+    def clock(self) -> Callable[[], float]:
+        """The wall clock the holder dates its changes by."""
+        return self._clock
 
     @property
     def dirty(self) -> bool:

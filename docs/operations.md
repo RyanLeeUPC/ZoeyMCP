@@ -26,8 +26,42 @@ The vault keeps its state in one directory (`/state`, the `vault-state` volume):
 
 - `store.json`: the encrypted secrets, written atomically (a temporary file, then a rename);
 - `vault.lock`: held with `flock` while the vault runs;
-- `setup.json`: the pending portal setup code;
+- `setup.json`: the pending portal setup code, as a hash with its expiry, MAC'd under a key
+  derived from the master key (the code itself is never stored);
+- `portal/passkeys.json`: the portal's passkeys, MAC'd the same way, and any
+  `portal/passkeys.rejected-<ms>.json` a `--reset` enrolment moved aside;
 - `ledger-reported/`: the vault's copy of the gateway's approval ledger (§21).
+
+**Setup codes.** `zoeymcp setup-code` prints a one-time code that enrols a passkey in the portal.
+It works once, for 15 minutes, and a new one replaces the last. Enrolling with it adds a passkey;
+with `--reset` it removes every other passkey and ends every session (for a lost or stolen
+passkey, or a passkey file that can't be verified). Its stderr names the origins to open, and says
+what enrolling will do. **If the portal refuses a code you haven't used, someone else used it
+first:** run `zoeymcp passkeys` to see what they enrolled, then `zoeymcp setup-code --reset`.
+`--wait` keeps the command running until a passkey is enrolled with the code, then prints that
+passkey's fingerprint, origin, name and time, to compare with what the portal showed you. The
+code is never logged; `setup_code_issued` records only its expiry and `reset`.
+
+`zoeymcp passkeys` lists every passkey with its fingerprint, how and where it was enrolled
+(`via` is `setup_code`, `setup_code_reset` or `portal`) and when it was last used;
+`zoeymcp passkeys --remove FINGERPRINT` removes one, the last one too. `zoeymcp sessions` lists
+the portal's sessions and `--end-all` ends them. None of these need a passkey: host access is the
+recovery path.
+
+On a host without the admin socket (Windows, or `--admin-socket none`),
+`zoeymcp setup-code --state DIR [--reset]` writes the code into the state directory itself. It
+needs the vault's `ZOEYMCP_MASTER_KEY` in its environment, and refuses to run as root, which would
+leave a file the vault's uid can't read. A running vault reads the file at the next redemption.
+
+**Backups.** Back up `store.json`, `gateway-key.json` and `portal/passkeys.json` together: they
+are all sealed under the same master key, and none is any use without it. A backup restored with
+an older passkey file brings back passkeys removed since, so after any restore run
+`zoeymcp passkeys` and remove what shouldn't be there. Safe to drop: `setup.json` (issue a new
+code), `portal/passkeys.rejected-*.json`, and the `torn-*.bin` files the reported copy keeps
+aside. Drop with care: `ledger-reported/` (the gateway refills what it still holds; older history
+is lost) and the connectors' send journals (the daily limit and the record of what was sent).
+Back up the gateway's `/state-gateway` separately; restoring one volume and not the other shows
+as a fork in the reported copy (§21).
 
 **One vault per state volume.** A second vault on the same directory refuses to start ("another
 vault is using this state directory"). Network filesystems are unsupported: without `flock` the

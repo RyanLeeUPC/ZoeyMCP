@@ -21,6 +21,7 @@ from zoeymcp.common import files
 from zoeymcp.common.canonical import dumps_canonical
 from zoeymcp.portal import passkeys
 from zoeymcp.portal.passkeys import (
+    ALGORITHM_NAMES,
     DAY,
     DIRECTORY,
     FILE,
@@ -36,6 +37,7 @@ from zoeymcp.portal.passkeys import (
     Refusal,
     add,
     check_name,
+    describe,
     find,
     fingerprint,
     new_file,
@@ -181,6 +183,43 @@ def test_find_by_fingerprint() -> None:
     assert find(document, KEY, fingerprint(OTHER, second.id)) == Refusal("not_found")
     assert find(document, KEY, "") == Refusal("not_found")
     assert find(new_file(HANDLE), KEY, fingerprint(KEY, second.id)) == Refusal("not_found")
+
+
+def test_describe_shows_how_and_where_never_the_key() -> None:
+    document = add(
+        made(1),
+        credential(2, alg=-8, backup_eligible=False, backup_state=False, transports=("usb",)),
+        name="security key",
+        via="setup_code",
+        origin="https://zoeymcp.tailnet.example",
+        now=NOW + 5,
+    )
+    assert isinstance(document, PasskeyFile)
+    first, second = document.credentials
+    assert describe(first, "f" * 16) == {
+        "fingerprint": "f" * 16,
+        "name": "key 1",
+        "rp_id": RP_ID,
+        "alg": "ES256",
+        "synced": True,
+        "transports": ["hybrid", "internal"],
+        "via": "portal",
+        "origin": ORIGIN,
+        "created": int(NOW),
+        "last_used": None,
+    }
+    shown = describe(second, "0" * 16)
+    assert (shown["alg"], shown["synced"], shown["transports"]) == ("EdDSA", False, ["usb"])
+    assert (shown["via"], shown["origin"], shown["created"]) == (
+        "setup_code",
+        "https://zoeymcp.tailnet.example",
+        int(NOW) + 5,
+    )
+    used = touch(document, asserted(1, 3), NOW + DAY)
+    assert describe(used.credentials[0], "f" * 16)["last_used"] == int(NOW) // DAY * DAY + DAY
+    rsa = replace(first, alg=-257)
+    assert describe(rsa, "f" * 16)["alg"] == "RS256"
+    assert ALGORITHM_NAMES == {-7: "ES256", -8: "EdDSA", -257: "RS256"}
 
 
 def test_an_ambiguous_fingerprint_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -807,6 +846,8 @@ def test_a_missing_file_is_no_passkeys(tmp_path: Path, log_buffer: io.StringIO) 
     assert holder.dirty is False
     assert not path_in(tmp_path).exists()
     assert events(log_buffer) == [{"event": "passkeys_loaded", "count": 0, "generation": 0}]
+    clock = Clock()
+    assert load(tmp_path, clock=clock).clock is clock
 
 
 def test_load_reads_the_file(tmp_path: Path, log_buffer: io.StringIO) -> None:

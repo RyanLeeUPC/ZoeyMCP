@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -11,7 +14,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -25,6 +28,12 @@ from zoeymcp.common import files as common_files
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.portal import passkeys as passkey_module
+from zoeymcp.portal import setupcode
+from zoeymcp.portal.passkeys import Passkeys, new_file
+from zoeymcp.portal.setupcode import Redeemed, Refused
+from zoeymcp.portal.webauthn import Asserted
+from zoeymcp.vault import admin as admin_module
 from zoeymcp.vault import gatewaykeys, logs
 from zoeymcp.vault.admin import (
     NO_GATEWAY_KEYS,
@@ -49,8 +58,10 @@ from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
+from .test_passkeys import NOW, credential
 
 KEYS = KeySet.from_master(bytes(range(32)))
+PORTAL = KEYS.portal_key
 ZWSP = chr(0x200B)
 BROKER_BINDING = {
     "oauth": {
@@ -89,19 +100,29 @@ class AdminRig:
     """The admin app with the example policy and, as in the vault, a token manager."""
 
     def __init__(
-        self, tmp_path: Path, clock: list[float] | None = None, *, tokens: bool = True
+        self,
+        tmp_path: Path,
+        clock: list[float] | None = None,
+        *,
+        tokens: bool = True,
+        passkeys: Passkeys | None = None,
     ) -> None:
         self.policy = example_policy()
         self.store = SecretStore(tmp_path, KEYS)
         self.store.load()
         self.clock = clock or [1_000_000.0]
-        self.setup = SetupCodes(tmp_path, clock=lambda: self.clock[0])
+        self.setup = SetupCodes(tmp_path, PORTAL, clock=lambda: self.clock[0])
         self.server, token_app = broker_server()
         self.token_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=token_app))
         self.tokens = TokenManager(self.store, self.token_client)
         self.tokens.configure(self.policy, {})
         self.admin = AdminApp(
-            self.store, KEYS, lambda: self.policy, self.setup, self.tokens if tokens else None
+            self.store,
+            KEYS,
+            lambda: self.policy,
+            self.setup,
+            self.tokens if tokens else None,
+            passkeys=passkeys,
         )
 
     def set_policy(self, policy: Policy) -> None:
@@ -382,29 +403,528 @@ async def test_retire_previous_needs_the_ratchet(tmp_path: Path) -> None:
     assert NO_GATEWAY_KEYS == "the vault keeps no gateway key state"
 
 
-# --- setup codes -------------------------------------------------------------------------------
+# --- setup codes (M5 design E) ------------------------------------------------------------------
+
+ORIGIN = "http://localhost:8081"
+
+
+def redeem(codes: SetupCodes, typed: object, origin: str = ORIGIN) -> Redeemed | Refused:
+    return asyncio.run(codes.redeem(typed, origin=origin))
 
 
 def test_setup_codes_are_one_time_and_expire(tmp_path: Path) -> None:
     clock = [1_000_000.0]
-    codes = SetupCodes(tmp_path, clock=lambda: clock[0])
-    code, expires = codes.issue()
-    assert expires == 1_000_000 + 15 * 60
-    assert code.encode() not in (tmp_path / "setup.json").read_bytes()
-    assert codes.consume("WRONG-CODE") is False
-    assert codes.consume(code) is True
-    assert codes.consume(code) is False
-    late, _ = codes.issue()
-    clock[0] += 15 * 60 + 1
-    assert codes.consume(late) is False
+    codes = SetupCodes(tmp_path, PORTAL, clock=lambda: clock[0])
+    code, record = codes.issue()
+    assert (record.expires, record.reset) == (1_000_000 + 15 * 60, False)
+    assert code.reveal().encode() not in (tmp_path / "setup.json").read_bytes()
+    assert redeem(codes, "WRONG-CODE") == Refused("wrong")
+    assert redeem(codes, code.reveal().lower()) == Redeemed(record.expires, False)
+    assert not (tmp_path / "setup.json").exists()
+    assert redeem(codes, code.reveal()) == Refused("no_code")
+    late, record = codes.issue()
+    clock[0] = record.expires - 0.001
+    assert codes.record() == record
+    clock[0] = record.expires
+    assert redeem(codes, late.reveal()) == Refused("expired")
+    # Kept: only a redemption, a new code or the first passkey removes it.
+    assert codes.record() == record
 
 
 def test_a_new_code_replaces_the_old(tmp_path: Path) -> None:
-    codes = SetupCodes(tmp_path)
+    codes = SetupCodes(tmp_path, PORTAL)
     first, _ = codes.issue()
-    second, _ = codes.issue()
-    assert codes.consume(first) is False
-    assert codes.consume(second) is True
+    second, record = codes.issue(reset=True)
+    assert redeem(codes, first.reveal()) == Refused("wrong")
+    assert redeem(codes, second.reveal()) == Redeemed(record.expires, True)
+
+
+def test_setup_file_is_json(tmp_path: Path) -> None:
+    _, record = SetupCodes(tmp_path, PORTAL).issue(reset=True)
+    data = (tmp_path / "setup.json").read_bytes()
+    stored = json.loads(data)
+    assert set(stored) == {"v", "key_id", "sha256", "expires", "reset", "mac"}
+    assert (stored["v"], stored["key_id"], stored["reset"]) == (1, KEYS.key_id, True)
+    assert data == setupcode.seal(record, PORTAL)
+    if sys.platform != "win32":
+        assert stat.S_IMODE((tmp_path / "setup.json").stat().st_mode) == 0o600
+
+
+def test_a_code_is_written_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[Path, str]] = []
+
+    def recorded(path: Path, data: bytes, *, prefix: str) -> None:
+        calls.append((path, prefix))
+
+    monkeypatch.setattr(common_files, "write_atomic", recorded)
+    SetupCodes(tmp_path, PORTAL).issue()
+    assert calls == [(tmp_path / "setup.json", ".setup-")]
+
+
+def test_a_record_that_doesnt_verify_is_no_code(tmp_path: Path) -> None:
+    other = KeySet.from_master(bytes(range(1, 33))).portal_key
+    code, _ = SetupCodes(tmp_path, other).issue()
+    codes = SetupCodes(tmp_path, PORTAL)
+    assert codes.record() is None
+    assert redeem(codes, code.reveal()) == Refused("no_code")
+    # An M1-era record (no MAC) and a directory in its place are no code either.
+    digest = hashlib.sha256(code.reveal().encode()).hexdigest()
+    old = '{"sha256":"' + digest + '","expires":2000000000}'
+    (tmp_path / "setup.json").write_bytes(old.encode())
+    assert codes.record() is None
+    assert redeem(codes, code.reveal()) == Refused("no_code")
+    (tmp_path / "setup.json").unlink()
+    (tmp_path / "setup.json").mkdir(mode=0o700)
+    assert codes.record() is None
+    assert redeem(codes, code.reveal()) == Refused("no_code")
+
+
+def test_a_redeemed_code_is_removed_before_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codes = SetupCodes(tmp_path, PORTAL)
+    code, record = codes.issue()
+    removed: list[Path] = []
+    real = admin_module._remove_synced
+
+    def recorded(path: Path) -> None:
+        real(path)
+        removed.append(path)
+
+    monkeypatch.setattr(admin_module, "_remove_synced", recorded)
+    assert redeem(codes, code.reveal()) == Redeemed(record.expires, False)
+    assert removed == [tmp_path / "setup.json"]
+    # A refusal removes nothing.
+    codes.issue()
+    assert redeem(codes, code.reveal()) == Refused("wrong")
+    assert removed == [tmp_path / "setup.json"]
+
+
+def test_a_code_that_cant_be_removed_isnt_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codes = SetupCodes(tmp_path, PORTAL)
+    code, record = codes.issue()
+
+    def broken(path: Path) -> None:
+        raise OSError("read-only")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(admin_module, "_remove_synced", broken)
+        with pytest.raises(OSError, match="read-only"):
+            redeem(codes, code.reveal())
+    assert codes.status()["state"] == "pending"
+    assert redeem(codes, code.reveal()) == Redeemed(record.expires, False)
+
+
+PASSKEY = {"fingerprint": "ab" * 8, "origin": ORIGIN, "name": "laptop", "created": 1}
+
+
+def test_the_status_follows_the_code(tmp_path: Path) -> None:
+    clock = [1_000_000.0]
+    codes = SetupCodes(tmp_path, PORTAL, clock=lambda: clock[0])
+    nothing = {"state": "none", "expires": None, "reset": None, "origin": None, "passkey": None}
+    assert codes.status() == nothing
+    code, record = codes.issue(reset=True)
+    pending = {
+        "state": "pending",
+        "expires": record.expires,
+        "reset": True,
+        "origin": None,
+        "passkey": None,
+    }
+    assert codes.status() == pending
+    codes.enrolled(PASSKEY)  # nothing redeemed yet
+    assert codes.status() == pending
+    redeem(codes, code.reveal(), "https://zoeymcp.tailnet.example")
+    redeemed = {**pending, "state": "redeemed", "origin": "https://zoeymcp.tailnet.example"}
+    assert codes.status() == redeemed
+    # Past the code's own expiry: the setup session runs for 10 minutes from redemption.
+    clock[0] += 599.9
+    assert codes.status() == redeemed
+    codes.enrolled(PASSKEY)
+    assert codes.status() == {**redeemed, "state": "enrolled", "passkey": PASSKEY}
+    clock[0] += 10**6
+    assert codes.status()["state"] == "enrolled"
+    codes.enrolled({**PASSKEY, "name": "again"})
+    assert codes.status()["passkey"] == PASSKEY
+
+
+def test_a_code_unused_in_time_expires(tmp_path: Path) -> None:
+    clock = [1_000_000.0]
+    codes = SetupCodes(tmp_path, PORTAL, clock=lambda: clock[0])
+    _, record = codes.issue()
+    clock[0] = record.expires - 0.001
+    assert codes.status()["state"] == "pending"
+    clock[0] = record.expires
+    assert codes.status() == {
+        "state": "expired",
+        "expires": record.expires,
+        "reset": False,
+        "origin": None,
+        "passkey": None,
+    }
+
+
+def test_a_setup_session_that_enrols_nothing_expires(tmp_path: Path) -> None:
+    clock = [1_000_000.0]
+    codes = SetupCodes(tmp_path, PORTAL, clock=lambda: clock[0])
+    code, _ = codes.issue()
+    clock[0] += 100
+    redeem(codes, code.reveal())
+    clock[0] += 599.999
+    assert codes.status()["state"] == "redeemed"
+    clock[0] += 0.001
+    assert (codes.status()["state"], codes.status()["origin"]) == ("expired", ORIGIN)
+
+
+def test_discard_removes_a_pending_code(tmp_path: Path) -> None:
+    codes = SetupCodes(tmp_path, PORTAL)
+    codes.discard()  # nothing to remove
+    assert codes.status()["state"] == "none"
+    code, _ = codes.issue()
+    codes.discard()
+    assert not (tmp_path / "setup.json").exists()
+    assert codes.status()["state"] == "expired"
+    assert redeem(codes, code.reveal()) == Refused("no_code")
+    # A redeemed code's state is kept.
+    code, _ = codes.issue()
+    redeem(codes, code.reveal())
+    codes.discard()
+    assert codes.status()["state"] == "redeemed"
+
+
+@pytest.mark.anyio
+async def test_the_status_waits_for_a_change(tmp_path: Path) -> None:
+    codes = SetupCodes(tmp_path, PORTAL)
+    assert (await codes.wait_status(30))["state"] == "none"
+    code, _ = codes.issue()
+    assert (await codes.wait_status(0))["state"] == "pending"
+    waiting = asyncio.create_task(codes.wait_status(30))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not waiting.done()
+    assert isinstance(await codes.redeem(code.reveal(), origin=ORIGIN), Redeemed)
+    assert (await asyncio.wait_for(waiting, 5))["state"] == "redeemed"
+    waiting = asyncio.create_task(codes.wait_status(30))
+    await asyncio.sleep(0)
+    codes.enrolled(PASSKEY)
+    assert (await asyncio.wait_for(waiting, 5))["passkey"] == PASSKEY
+    # Nothing left to change: at once.
+    assert (await asyncio.wait_for(codes.wait_status(30), 5))["state"] == "enrolled"
+
+
+@pytest.mark.anyio
+async def test_the_status_wait_ends_when_time_changes_it(tmp_path: Path) -> None:
+    now = [1_000_000.0]
+    codes = SetupCodes(tmp_path, PORTAL, clock=lambda: now[0])
+    _, record = codes.issue()
+    now[0] = record.expires - 0.05
+    started = time.monotonic()
+    await asyncio.wait_for(codes.wait_status(30), 5)
+    assert time.monotonic() - started < 5
+    now[0] = record.expires
+    assert (await asyncio.wait_for(codes.wait_status(30), 5))["state"] == "expired"
+
+
+@pytest.fixture
+def log_buffer() -> Iterator[io.StringIO]:
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        yield buffer
+    finally:
+        logs.set_stream(None)
+
+
+def log_events(buffer: io.StringIO, event: str) -> list[dict[str, Any]]:
+    found = [json.loads(line) for line in buffer.getvalue().splitlines()]
+    return [line for line in found if line["event"] == event]
+
+
+def without_ts(line: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in line.items() if key != "ts"}
+
+
+@pytest.mark.anyio
+async def test_the_setup_code_route(tmp_path: Path, log_buffer: io.StringIO) -> None:
+    rig = AdminRig(tmp_path)
+    response = await rig.call("POST", "/setup-code")
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {
+        "code": data["code"],
+        "expires": 1_000_000 + 900,
+        "reset": False,
+        "passkeys": 0,
+        "origins": ["http://localhost:8081", "https://zoeymcp.tailnet.example"],
+    }
+    redeemed = await rig.setup.redeem(data["code"], origin=ORIGIN)
+    assert redeemed == Redeemed(1_000_900, False)
+    data = (await rig.call("POST", "/setup-code", {"reset": True})).json()
+    record = rig.setup.record()
+    assert record is not None
+    assert (data["reset"], record.reset) == (True, True)
+    data = (await rig.call("POST", "/setup-code", {"reset": False})).json()
+    assert data["reset"] is False
+    [*_, last] = log_events(log_buffer, "setup_code_issued")
+    assert without_ts(last) == {
+        "role": "vault",
+        "event": "setup_code_issued",
+        "expires": 1_000_900,
+        "reset": False,
+    }
+    assert data["code"] not in log_buffer.getvalue()
+    # Without an admin block there is no portal to name.
+    rig.policy = rig.policy.model_copy(update={"admin": None})
+    assert (await rig.call("POST", "/setup-code")).json()["origins"] == []
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("body", [{"reset": "yes"}, {"reset": 1}, {"other": True}, [True], "x"])
+async def test_the_setup_code_route_refuses_a_bad_body(tmp_path: Path, body: Any) -> None:
+    rig = AdminRig(tmp_path)
+    response = await rig.call("POST", "/setup-code", body)
+    assert response.status_code == 400
+    assert not (tmp_path / "setup.json").exists()
+    big = await rig.call("POST", "/setup-code", {"reset": False, "x": "y" * 5000})
+    assert big.status_code == 413
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_setup_code_that_cant_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    rig = AdminRig(tmp_path)
+    code = (await rig.call("POST", "/setup-code")).json()["code"]
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(common_files, "write_atomic", broken)
+    response = await rig.call("POST", "/setup-code", {"reset": True})
+    assert (response.status_code, response.json()["reason"]) == (500, "not_written")
+    assert "code" not in response.json()
+    assert len(log_events(log_buffer, "setup_code_issued")) == 1
+    # The earlier code still works.
+    assert isinstance(await rig.setup.redeem(code, origin=ORIGIN), Redeemed)
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_the_setup_code_status_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = AdminRig(tmp_path)
+    response = await rig.call("GET", "/setup-code/status")
+    assert response.json() == {
+        "state": "none",
+        "expires": None,
+        "reset": None,
+        "origin": None,
+        "passkey": None,
+    }
+    code = (await rig.call("POST", "/setup-code")).json()["code"]
+    response = await rig.call("GET", "/setup-code/status?wait=0")
+    assert response.json()["state"] == "pending"
+    assert code not in response.text
+    assert code.replace("-", "") not in response.text
+    for query in ("wait=x", "wait=-1", "wait=1.5", "wait=1&wait=2", "other=1", "wait=" + "9" * 16):
+        response = await rig.call("GET", f"/setup-code/status?{query}")
+        assert (response.status_code, response.json()["reason"]) == (400, "bad_query"), query
+    waits: list[float] = []
+
+    async def recorded(seconds: float) -> dict[str, Any]:
+        waits.append(seconds)
+        return {"state": "pending"}
+
+    monkeypatch.setattr(rig.setup, "wait_status", recorded)
+    for query in ("", "?wait=0", "?wait=59", "?wait=60", "?wait=61", "?wait=86400"):
+        await rig.call("GET", f"/setup-code/status{query}")
+    assert waits == [0, 0, 59, 60, 60, 60]
+    await rig.token_client.aclose()
+
+
+# --- passkeys and sessions over the socket (M5 design D.5, E.3, F.2) ----------------------------
+
+
+def holder_with(tmp_path: Path, *ids: int) -> Passkeys:
+    path = tmp_path / "portal" / "passkeys.json"
+    holder = Passkeys(new_file(bytes(32)), PORTAL, path, clock=lambda: NOW)
+    for n in ids:
+        via: Literal["setup_code", "portal"] = "setup_code" if n == 1 else "portal"
+        holder.add(credential(n), name=f"key {n}", via=via, origin=ORIGIN)
+    return holder
+
+
+def listed(holder: Passkeys, n: int) -> dict[str, Any]:
+    return {
+        "fingerprint": holder.fingerprint(credential(n).id),
+        "name": f"key {n}",
+        "rp_id": "localhost",
+        "alg": "ES256",
+        "synced": True,
+        "transports": ["hybrid", "internal"],
+        "via": "setup_code" if n == 1 else "portal",
+        "origin": ORIGIN,
+        "created": int(NOW),
+        "last_used": None,
+    }
+
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+@pytest.mark.anyio
+async def test_the_passkeys_are_listed(tmp_path: Path) -> None:
+    holder = holder_with(tmp_path, 1, 2)
+    rig = AdminRig(tmp_path, passkeys=holder)
+    response = await rig.call("GET", "/passkeys")
+    assert response.status_code == 200
+    assert response.json() == {"passkeys": [listed(holder, 1), listed(holder, 2)]}
+    for n in (1, 2):
+        assert b64(credential(n).id) not in response.text
+        assert b64(credential(n).spki) not in response.text
+    assert b64(bytes(32)) not in response.text
+    assert (await rig.call("POST", "/setup-code")).json()["passkeys"] == 2
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_passkey_is_removed_by_its_fingerprint(
+    tmp_path: Path, log_buffer: io.StringIO
+) -> None:
+    holder = holder_with(tmp_path, 1, 2)
+    rig = AdminRig(tmp_path, passkeys=holder)
+    first = holder.fingerprint(credential(1).id)
+    response = await rig.call("DELETE", f"/passkeys/{first}")
+    assert response.status_code == 200
+    assert response.json() == {"removed": listed(holder, 1), "sessions_ended": 0, "remaining": 1}
+    data = (tmp_path / "portal" / "passkeys.json").read_bytes()
+    on_disk, _ = passkey_module.unseal(data, PORTAL)
+    assert [c.id for c in on_disk.credentials] == [credential(2).id]
+    [line] = log_events(log_buffer, "passkey_removed")
+    assert without_ts(line) == {
+        "role": "vault",
+        "event": "passkey_removed",
+        "credential": first,
+        "rp_id": "localhost",
+        "origin": ORIGIN,
+        "sessions_ended": 0,
+        "remaining": 1,
+    }
+    again = await rig.call("DELETE", f"/passkeys/{first}")
+    assert (again.status_code, again.json()["reason"]) == (404, "not_found")
+    # The last one too: host access is the recovery path.
+    last = await rig.call("DELETE", f"/passkeys/{holder.fingerprint(credential(2).id)}")
+    assert (last.status_code, last.json()["remaining"]) == (200, 0)
+    assert holder.document.credentials == ()
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("wanted", ["ABABABABABABABAB", "abab", "ab" * 9, "zz" * 8, "%20" * 4])
+async def test_a_removal_needs_a_fingerprint(tmp_path: Path, wanted: str) -> None:
+    holder = holder_with(tmp_path, 1)
+    rig = AdminRig(tmp_path, passkeys=holder)
+    response = await rig.call("DELETE", f"/passkeys/{wanted}")
+    assert (response.status_code, response.json()["reason"]) == (400, "bad_fingerprint")
+    assert len(holder.document.credentials) == 1
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_removal_that_cant_be_written_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    holder = holder_with(tmp_path, 1, 2)
+    rig = AdminRig(tmp_path, passkeys=holder)
+
+    def broken(path: Path, data: bytes) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(passkey_module, "write_atomic", broken)
+    response = await rig.call("DELETE", f"/passkeys/{holder.fingerprint(credential(1).id)}")
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": "not written to disk; nothing changed; check the state volume",
+        "reason": "not_written",
+    }
+    assert len(holder.document.credentials) == 2
+    assert log_events(log_buffer, "passkey_removed") == []
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_an_ambiguous_fingerprint_removes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    holder = holder_with(tmp_path, 1, 2)
+    rig = AdminRig(tmp_path, passkeys=holder)
+    monkeypatch.setattr(passkey_module, "fingerprint", lambda key, credential_id: "0" * 16)
+    response = await rig.call("DELETE", "/passkeys/" + "0" * 16)
+    assert (response.status_code, response.json()["reason"]) == (409, "ambiguous_fingerprint")
+    assert len(holder.document.credentials) == 2
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_passkeys_without_a_usable_file(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    for method, path in (("GET", "/passkeys"), ("DELETE", "/passkeys/" + "0" * 16)):
+        response = await rig.call(method, path)
+        assert (response.status_code, response.json()) == (
+            503,
+            {"error": "the vault keeps no passkey state", "reason": "unavailable"},
+        )
+    await rig.token_client.aclose()
+    unavailable = Passkeys(new_file(bytes(32)), PORTAL, tmp_path / "p.json", unavailable=True)
+    rig = AdminRig(tmp_path, passkeys=unavailable)
+    for method, path in (("GET", "/passkeys"), ("DELETE", "/passkeys/" + "0" * 16)):
+        response = await rig.call(method, path)
+        assert (response.status_code, response.json()) == (
+            503,
+            {
+                "error": "the passkey file can't be verified (edited, or written under another "
+                "master key); run zoeymcp setup-code --reset",
+                "reason": "unavailable",
+            },
+        )
+    assert (await rig.call("POST", "/setup-code")).json()["passkeys"] is None
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_sessions_are_stubs_until_the_portal_serves(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    assert (await rig.call("GET", "/sessions")).json() == {"sessions": []}
+    assert (await rig.call("DELETE", "/sessions")).json() == {"ended": 0}
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_health_shows_the_passkeys(tmp_path: Path) -> None:
+    holder = holder_with(tmp_path, 1)
+    rig = AdminRig(tmp_path, passkeys=holder)
+    section = (await rig.call("GET", "/health")).json()["passkeys"]
+    assert (section["count"], [f["code"] for f in section["findings"]]) == (1, ["passkey_single"])
+    holder.add(credential(2), name="key 2", via="portal", origin=ORIGIN)
+    holder.touch(Asserted(credential(2).id, 0, True, True))
+    section = (await rig.call("GET", "/health")).json()["passkeys"]
+    assert (section["count"], [f["code"] for f in section["findings"]]) == (2, ["passkey_counter"])
+    # Without an admin block there is no portal: no section.
+    rig.policy = rig.policy.model_copy(update={"admin": None})
+    assert "passkeys" not in (await rig.call("GET", "/health")).json()
+    await rig.token_client.aclose()
+    unavailable = Passkeys(new_file(bytes(32)), PORTAL, tmp_path / "p.json", unavailable=True)
+    rig = AdminRig(tmp_path, passkeys=unavailable)
+    section = (await rig.call("GET", "/health")).json()["passkeys"]
+    assert (section["count"], [f["code"] for f in section["findings"]]) == (
+        None,
+        ["passkeys_unavailable"],
+    )
+    await rig.token_client.aclose()
 
 
 # --- the real socket (POSIX) -------------------------------------------------------------------
@@ -464,8 +984,13 @@ def test_cli_over_the_socket(tmp_path: Path, socket_dir: Path) -> None:
         assert "lfm-9876" not in out
         code, out, _ = cli(["gateway-key", "--socket", sock])
         assert out.strip() == f"ZOEYMCP_GATEWAY_KEY={KEYS.gateway_key(1)}"
-        code, out, _ = cli(["setup-code", "--socket", sock])
-        assert rig.setup.consume(out.strip()) is True
+        code, out, err = cli(["setup-code", "--socket", sock])
+        assert code == 0
+        assert "Open http://localhost:8081 or https://zoeymcp.tailnet.example and choose" in err
+        assert redeem(rig.setup, out.strip()) == Redeemed(int(rig.clock[0]) + 900, False)
+        code, out, err = cli(["setup-code", "--reset", "--socket", sock])
+        assert code == 0
+        assert redeem(rig.setup, out.strip()) == Redeemed(int(rig.clock[0]) + 900, True)
         code, _, err = cli(["secret", "set", "nobody-uses", "--socket", sock], stdin="v-123456")
         assert code == 1
         assert "pass --origin" in err
@@ -521,12 +1046,6 @@ def test_socket_dir_must_be_private(tmp_path: Path) -> None:
     private = tmp_path / "private"
     check_socket_dir(private / "admin.sock")
     assert (private.stat().st_mode & 0o777) == 0o700
-
-
-def test_setup_file_is_json(tmp_path: Path) -> None:
-    SetupCodes(tmp_path).issue()
-    record = json.loads((tmp_path / "setup.json").read_text(encoding="utf-8"))
-    assert set(record) == {"sha256", "expires"}
 
 
 # --- OAuth secrets go through the token manager (design D.12) ----------------------------------
