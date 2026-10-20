@@ -1,9 +1,9 @@
 # Operating ZoeyMCP
 
 How to run what is built so far: the vault (M1), OAuth in the vault (M2), the gateway for
-remote MCP servers in both deployment tiers (M3, §9 onwards), and approvals, the SMTP connector
-and toolkits (M4, §19 onwards). The design and the reasons behind
-it are in [design.md](design.md); this page is the how-to.
+remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
+and toolkits (M4, §19 onwards), and the admin portal as far as it is built (M5, §26). The design
+and the reasons behind it are in [design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -873,3 +873,181 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 | `refused: the tool or policy changed while waiting for approval` | a pin, policy or freshness change between ask and accept | `approval_decided`, the view |
 | `toolkit unavailable (ref ...)` | the module isn't registered, failed to import, or its slots don't match | `toolkit_unavailable` with `reason` |
 | `toolkit error: vault answered 403 blocked_<reason>` | the toolkit tried something its slots don't allow | `toolkit_vault_blocked` |
+
+## 26. The portal
+
+A draft, filled in as the portal is built: signing in, setup and sessions so far. Everything
+here can also be done with the CLI (§1).
+
+**Before the first start.** The portal is on only when the policy has an `admin` block:
+
+```yaml
+admin:
+  listen: 127.0.0.1:8081
+  origins: [http://localhost:8081]
+```
+
+`listen` is where the vault binds its own listener for the portal (never a `--listen` address of
+the proxy); `origins` lists every exact address a browser will use. A passkey belongs to the
+origin's host name (its RP ID): one enrolled on `http://localhost:8081` also works on
+`http://localhost:9000` if that is listed, since `localhost` has no port, but not on
+`https://zoeymcp.tailnet.example`. Plain HTTP works only on `localhost`; anything else needs
+HTTPS with a certificate the browser trusts, since browsers refuse passkeys elsewhere.
+
+**The first start.** The log has `portal_listening` with the address, then, while no passkey can
+sign in, `setup_pending` ("run zoeymcp setup-code in the vault's container", or with `--reset`
+when the passkey file can't be verified). No code exists until you issue one. Without an `admin`
+block the log has `portal_disabled`.
+
+**Reaching it.** Open one of the listed origins exactly as written. An IP address such as
+`http://127.0.0.1:8081/` is sent on to `http://localhost:8081/` when that origin is listed;
+any other address gets 421. Through an SSH tunnel, forward the same port number
+(`ssh -L 8081:127.0.0.1:8081 host`): the browser's address must be a listed origin, port
+included. The compose files don't publish the portal yet.
+
+**The first passkey.**
+
+1. Run `zoeymcp setup-code` (add `--wait` to see the enrolment from the host).
+2. Open the portal, choose **I have a setup code**, and type the code. Case, spaces and dashes
+   don't matter. The code is spent at once: if anything fails from here, issue a new one.
+3. Name the passkey (the device it is on, say) and choose **Create the passkey**. The browser
+   asks your authenticator; the vault requires user verification (a PIN or biometrics).
+4. The page shows the new passkey's fingerprint, then signs in with it, so you leave setup with
+   a passkey that is proven to work. Compare the fingerprint with `zoeymcp passkeys`, or with
+   the line `--wait` prints.
+
+A setup session lasts 10 minutes and enrols one passkey. A code relayed to someone else works for
+whoever uses it first, so watch for it: `passkey_enrolled` with `via: setup_code` (or
+`setup_code_reset`) is logged at level `warning`, and `--wait` prints the passkey's
+fingerprint, origin and name. A portal that refuses a code you haven't used means someone else
+used it: see §1.
+
+**Daily use.** **Sign in with a passkey** asks for any passkey of this address; the browser
+offers the ones it holds. A session has two halves: an `HttpOnly` cookie whose name carries the
+port, and a token the page keeps in the tab's `sessionStorage`. Neither works alone. A session
+ends after 15 minutes without use, 4 hours after sign-in, at **Sign out**, when the vault
+restarts, and when the passkey that made it is removed. Closing the tab doesn't end it: browsers
+restore a closed tab with its session, so sign out on a shared machine. Signing out also clears
+the page's storage (`Clear-Site-Data: "storage"`).
+
+**Sessions.** The Sessions page lists every signed-in browser, by fingerprint, with its origin,
+the passkey it signed in with, and when it was made and last used; **End the other sessions**
+ends every one but yours. `zoeymcp sessions` lists the same from the host, and
+`zoeymcp sessions --end-all` ends them all. At most 8 sessions are kept; a ninth sign-in ends the
+one used least recently.
+
+**A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
+removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A
+different host name has its own: issue a setup code and redeem it **on the new origin**.
+
+**Recovery.** One passkey lost while another works: sign in with the other and remove the lost
+one (from the CLI until the Passkeys page is built: `zoeymcp passkeys --remove FINGERPRINT`).
+Every passkey lost: `zoeymcp setup-code` adds one, or `--reset` replaces them all. A passkey or
+device that may be stolen, or a passkey file reported tampered (`passkey_store_tampered`, and
+the portal answering "can't be verified"): `zoeymcp setup-code --reset`. A reset enrolment
+removes every other passkey and ends every session; the old authenticator may be the one you
+enrol again.
+
+**What a stolen session can do.** A session is the cookie and the tab's token together; a page
+on another `localhost` port receives the cookie (cookies ignore ports) but not the token, and
+gets 401. Someone holding both halves, within the session's limits, can read what the portal
+shows and end other sessions; changes that matter will each need a fresh passkey prompt.
+
+**When something fails.** The portal shows the vault's own sentence for every refusal; the
+reason is in the vault's log line `portal_request` (or `portal_refused`, at most once per 10
+seconds per reason). What the browser itself refuses (an IP address, a page that isn't a secure
+context, no passkey support, a cancelled prompt) is worded by the page.
+
+<!-- refusals: generated from portal/refusals.py; tests/unit/test_refusal_doc.py -->
+| Status | Reason | What the portal says |
+| --- | --- | --- |
+| 421 | `wrong_host` | This portal doesn't answer to that address. Use one listed in admin.origins; behind a proxy, pass the original Host header. |
+| 405 | `method` | The portal doesn't answer that method. |
+| 404 | `not_found` | Nothing by that name exists here. |
+| 403 | `cross_site` | Refused: this request didn't come from the portal's own page. |
+| 403 | `bad_origin` | Refused: this request didn't come from the portal's own page. |
+| 415 | `content_type` | The request wasn't JSON. |
+| 411 | `length_required` | The request didn't say how long its body is. |
+| 413 | `too_large` | The request was too large. |
+| 503 | `busy` | Too many requests right now. Wait a moment and try again. |
+| 429 | `rate_limited` | Too many requests right now. Wait a moment and try again. |
+| 401 | `no_session` | You're signed out (the session ended, or the vault restarted). Sign in again. |
+| 403 | `scope` | A setup session can only enrol a passkey. Sign in with your passkey first. |
+| 408 | `too_slow` | The request was too slow. |
+| 400 | `bad_json` | The request wasn't valid JSON. |
+| 400 | `bad_body` | The request didn't have the expected fields. |
+| 401 | `setup_code_refused` | That setup code isn't valid. Codes work once, for 15 minutes. If you haven't used it, someone else may have: run zoeymcp setup-code --reset. |
+| 401 | `passkey_refused` | That passkey wasn't accepted here. Passkeys belong to one address: use the one you enrolled it on, or a setup code. |
+| 401 | `step_up_refused` | The passkey didn't confirm this. Nothing changed; prepare it again. |
+| 503 | `unavailable` | The passkey file can't be verified (edited, or written under another master key). Run zoeymcp setup-code --reset with host access. |
+| 409 | `changed` | Something changed since you prepared this (shown below). Check it and prepare it again. |
+| 404 | `action_unknown` | That confirmation, login or passkey prompt expired or was already used. Start again. |
+| 404 | `ceremony_unknown` | That confirmation, login or passkey prompt expired or was already used. Start again. |
+| 409 | `last_passkey` | This is the only passkey. Enrol another first, or use zoeymcp setup-code --reset. |
+| 400 | `bad_name` | A passkey name is 1 to 64 characters on one line, with no hidden characters. |
+| 500 | `not_written` | Not written to disk; nothing changed; check the state volume. |
+| 500 | `internal` | The portal failed to answer that; the vault's log has the cause. |
+| 400 | `invalid_name` | Names are lower case letters, digits and _ . -, up to 128, starting with a letter or a digit. |
+| 409 | `vault_managed` | Tokens for this credential come from Connect, on the Credentials page. |
+| 400 | `empty_value` | Enter a value. |
+| 400 | `bad_value` | The value has line breaks, control or invisible characters. |
+| 409 | `value_too_large` | A secret can't be larger than 65536 bytes. |
+| 400 | `origins_type` | Origins are a list of https URLs. |
+| 409 | `origins_on_oauth` | OAuth secrets take the policy's binding. |
+| 409 | `bad_origins` | That origin can't be used: `<detail>`. |
+| 409 | `unbound` | No route or connector uses store:`<name>`, so give the origins it may be sent to. |
+| 409 | `no_route` | The policy can't bind it: `<detail>`. Fix the policy. |
+| 409 | `orphan_slot` | The policy can't bind it: `<detail>`. Fix the policy. |
+| 409 | `binding_conflict` | The policy can't bind it: `<detail>`. Fix the policy. |
+| 404 | `not_oauth` | That isn't an OAuth credential in the policy. |
+| 404 | `flow_unknown` | That confirmation, login or passkey prompt expired or was already used. Start again. |
+| 409 | `no_authorize_url` | This credential has no authorize_url, so it can't connect in a browser. |
+| 409 | `authorize_misconfigured` | The policy's authorization settings can't make a sign-in link. Fix the policy. |
+| 409 | `binding_changed` | The policy now binds this grant differently (shown below). Connect again and accept the new binding. |
+| 409 | `client_id_unavailable` | The client ID isn't set, or isn't bound to the token endpoint. Set it on the Secrets page. |
+| 409 | `client_secret_unavailable` | The client secret isn't set, or isn't bound to the token endpoint. Set it on the Secrets page. |
+| 400 | `not_configured` | The vault has no token settings for this credential. |
+| 429 | `too_many_flows` | Too many sign-ins are pending. Finish or cancel one, or wait 10 minutes. |
+| 400 | `redirect_mismatch` | That isn't the address the provider sent you to; it starts with `<redirect_uri>`. |
+| 400 | `state_mismatch` | That address belongs to another login; use the tab this login opened. |
+| 400 | `duplicate_param` | That address has a parameter twice. Copy it again from the address bar. |
+| 400 | `provider_error` | The answer said the provider refused: `<error>` |
+| 400 | `iss_mismatch` | The answer came from a different issuer; nothing was stored. Connect again. |
+| 400 | `no_code` | The provider's answer had no usable code. Connect again. |
+| 400 | `exchange_failed` | The provider's token endpoint didn't take the sign-in (`<code>`). Connect again. |
+| 400 | `no_refresh_token` | The provider issued no refresh token. For Google keep access_type: offline and prompt: consent; some providers need an offline_access scope. |
+| 409 | `flow_returned` | The provider already sent this sign-in back to the portal; confirm it here. |
+| 409 | `flow_conflict` | Two different answers came back for this sign-in. Nothing was stored. Connect again. |
+| 400 | `callback_not_taken` | The portal didn't take this sign-in. Copy this tab's address and paste it into the portal's Connect dialog, or into zoeymcp login if you started it there. |
+| 403 | `not_navigation` | The portal didn't take this sign-in. Copy this tab's address and paste it into the portal's Connect dialog, or into zoeymcp login if you started it there. |
+| 400 | `bad_query` | The portal didn't take this sign-in. Copy this tab's address and paste it into the portal's Connect dialog, or into zoeymcp login if you started it there. |
+| 409 | `not_restartable` | The reported ledger isn't stuck, so there's nothing to restart. |
+| 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
+| 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
+| 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |
+| 400 | `wrong_type` (enrolling a passkey) | The browser answered a different kind of passkey prompt. Start again. |
+| 400 | `wrong_challenge` (enrolling a passkey) | That passkey answer was for another prompt. Start again. |
+| 400 | `wrong_origin` (enrolling a passkey) | The passkey answer names another address. Use the portal at the address you opened. |
+| 400 | `cross_origin` (enrolling a passkey) | The passkey prompt ran inside another page. Open the portal directly. |
+| 400 | `top_origin` (enrolling a passkey) | The passkey prompt ran inside another page. Open the portal directly. |
+| 400 | `no_attested_data` (enrolling a passkey) | The authenticator didn't give a new key. Try again, or another authenticator. |
+| 400 | `wrong_rp` (enrolling a passkey) | The passkey was made for another address. Use the one you enrolled it on. |
+| 400 | `not_present` (enrolling a passkey) | The authenticator didn't confirm you were there. Try again. |
+| 400 | `not_verified` (enrolling a passkey) | The passkey didn't verify you with a PIN or biometrics; the vault requires it. |
+| 400 | `backup_flags` (enrolling a passkey) | The authenticator's backup flags contradict each other. Try another authenticator. |
+| 400 | `credential_id` (enrolling a passkey) | The authenticator's credential ID can't be used. Try another authenticator. |
+| 400 | `raw_id_mismatch` (enrolling a passkey) | The browser's credential ID doesn't match the authenticator's. Try another browser. |
+| 400 | `key_encoding` (enrolling a passkey) | This authenticator's key encoding isn't supported. |
+| 400 | `algorithm` (enrolling a passkey) | The browser reported another key type than the authenticator made. Try another browser. |
+| 400 | `public_key` (enrolling a passkey) | The authenticator's key can't be used (ES256, Ed25519, or RSA of 2048 to 4096 bits). |
+| 400 | `key_mismatch` (enrolling a passkey) | The browser's copy of the new key doesn't match the authenticator's. Try another browser. |
+| 409 | `duplicate_credential` (enrolling a passkey) | This passkey is already enrolled. |
+| 409 | `too_many_passkeys` (enrolling a passkey) | There are 32 passkeys already. Remove one first. |
+| 400 | `not_allowed` (enrolling a passkey) | That passkey isn't one this prompt asked for. |
+| 400 | `unknown_credential` (enrolling a passkey) | That passkey isn't enrolled here. |
+| 400 | `user_handle` (enrolling a passkey) | That passkey belongs to another account. |
+| 400 | `at_flag` (enrolling a passkey) | The authenticator's answer carried key data it shouldn't. Try again. |
+| 400 | `trailing_bytes` (enrolling a passkey) | The authenticator's answer had bytes it shouldn't. Try again. |
+| 400 | `backup_eligibility_changed` (enrolling a passkey) | This passkey's backup setting changed since it was enrolled. Enrol it again. |
+| 400 | `signature` (enrolling a passkey) | The passkey's signature didn't verify. |
+<!-- end of refusals -->

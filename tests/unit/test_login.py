@@ -1162,6 +1162,14 @@ async def test_the_owner_cancels(tmp_path: Path, clock: FakeClock) -> None:
     assert refused.reason == "flow_unknown"
 
 
+async def test_an_ended_session_cancels_its_flows(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved(owner=SESSION)
+    assert rig.login.cancel_owner(SESSION) == 1
+    refused = await rig.refused(rig.login.complete("music", flow, pasted, SESSION))
+    assert refused.reason == "flow_unknown"
+
+
 async def test_a_start_says_which_login_it_replaced(
     tmp_path: Path, clock: FakeClock, captured: Captured
 ) -> None:

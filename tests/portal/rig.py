@@ -7,8 +7,9 @@ listeners' sockets are bound here first and handed to ``serve`` by its binder, s
 raced for and the policy names the portal's real port. The fake browser connects to that IP
 literal and sends ``Host: localhost:<port>`` itself (verifier V49).
 
-A test may give the portal routes and handlers of its own (the API is built from step 11 on), and
-shorter head and body deadlines, so the slowloris cases take a second, not ten.
+A test may give the portal routes and handlers of its own, shorter head and body deadlines, so
+the slowloris cases take a second, not ten, and a :class:`Clock` it can move forward, so the
+idle limit or the rate bucket's refill takes no waiting.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from tests.fakes.browser import Browser, Engine, Slowloris
+from tests.fakes.browser import Browser, Engine, Slowloris, loopback
 from zoeymcp.common import logs as common_logs
 from zoeymcp.portal.app import BODY_DEADLINE, Handler, PortalApp, load_static
 from zoeymcp.portal.routes import ROUTES, Route
@@ -34,6 +35,23 @@ from zoeymcp.vault import server
 from zoeymcp.vault.keys import generate_master_key
 
 STARTUP_TIMEOUT = 10.0
+
+
+class Clock:
+    """The portal's two clocks with an offset a test moves: the limits' monotonic one and the
+    sessions' and ceremonies' wall clock."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.offset
+
+    def wall(self) -> float:
+        return time.time() + self.offset
 
 
 class _Lines(io.StringIO):
@@ -68,8 +86,11 @@ class PortalRig:
     def app(self) -> PortalApp:
         return self.portal.app
 
-    def browser(self, engine: Engine = "chrome") -> Browser:
-        browser = Browser(engine=engine)
+    def browser(self, engine: Engine = "chrome", *, every_name: bool = False) -> Browser:
+        """A browser profile. ``every_name``: every host and port it opens is the portal, as
+        another origin on the same listener or a TLS proxy in front of it would be (C.5)."""
+        address = (lambda host, port: self.address) if every_name else loopback
+        browser = Browser(engine=engine, address=address)
         self.browsers.append(browser)
         return browser
 
@@ -126,6 +147,7 @@ def running(
     header_deadline: float = HEADER_DEADLINE,
     body_deadline: float = BODY_DEADLINE,
     before_start: Callable[[Path], None] | None = None,
+    clock: Clock | None = None,
 ) -> Iterator[PortalRig]:
     """The vault serving its proxy and portal until the block ends. ``policy`` adds to the rig's
     policy (routes, say); ``before_start`` may change the state directory first."""
@@ -148,7 +170,11 @@ def running(
         vault = server.build(str(policy_file), listens, state, environ, None)
         assert vault.portal is not None
         app = vault.portal.app
-        if routes is not ROUTES or handlers is not None or body_deadline != BODY_DEADLINE:
+        rebuilt = routes is not ROUTES or handlers is not None or body_deadline != BODY_DEADLINE
+        if rebuilt or clock is not None:
+            clocks: dict[str, Callable[[], float]] = (
+                {} if clock is None else {"clock": clock.monotonic, "wall": clock.wall}
+            )
             app = PortalApp(
                 app.origins,
                 static=load_static(),
@@ -158,6 +184,7 @@ def running(
                 routes=routes,
                 handlers=handlers,
                 body_deadline=body_deadline,
+                **clocks,
             )
         portal = replace(vault.portal, app=app, header_deadline=header_deadline)
         stops: list[Callable[[], None]] = []

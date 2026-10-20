@@ -19,12 +19,18 @@ refused unread is dropped by h11 as it arrives, within the head deadline, or, if
 any route takes, closes the connection.
 
 The static files are loaded once, at start, into a fixed map (:func:`load_static`); a missing
-one stops the start. The API's routes and their handlers are given by the steps that build them
-(none yet: every ``/api/`` path is 404).
+one stops the start. The API's routes are ``routes.ROUTES``, each answered by a handler here
+(M.1): logging in with a passkey, redeeming a setup code and enrolling with it (E, F.2), the
+session and the session list, logout and ending the other sessions. Before any session lookup
+the expired sessions are ended and logged, and however a session ends, its ceremony and action
+are dropped and its OAuth flows cancelled (H.2).
 
 Logs (M.4): ``portal_request`` for each answer a handler gives; ``portal_refused`` for a refusal
 before one, at most once per 10 s per reason with a count, never the refused ``Host`` or
-``Origin``; a static file or the 308 as ``portal_request``, at most once per 10 s per path.
+``Origin``; a static file or the 308 as ``portal_request``, at most once per 10 s per path. The
+handlers log ``portal_login``, ``portal_login_failed``, ``setup_code_redeemed``,
+``setup_code_refused`` (at most once a minute, with a count), ``passkey_enrolled`` (a warning when
+a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout`` and ``portal_session_ended``.
 """
 
 from __future__ import annotations
@@ -37,11 +43,14 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib.resources.abc import Traversable
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from starlette.types import Receive, Scope, Send
 
 from ..vault import logs
+from . import passkeys as passkey_file
+from . import routes as api
+from .actions import Actions
 from .admission import (
     Admitted,
     Origin,
@@ -55,10 +64,32 @@ from .admission import (
     parse_body,
     values,
 )
+from .display import NAME_LIMIT, shown
 from .limits import Bucket, InFlight, Sparse, Ticket
-from .refusals import Refusal, refusal
+from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
+from .refusals import Refusal, enrolment, refusal
 from .routes import ROUTES, STATIC, Route
-from .sessions import Session, Sessions, SessionToken
+from .sessions import (
+    SESSION_IDLE,
+    Ceremonies,
+    Ceremony,
+    CeremonyKind,
+    Ended,
+    Full,
+    Minted,
+    Session,
+    Sessions,
+    SessionToken,
+)
+from .setupcode import Redeemed
+from .webauthn import (
+    MAX_PASSKEYS,
+    WebAuthnError,
+    creation_options,
+    request_options,
+    verify_assertion,
+    verify_registration,
+)
 
 if TYPE_CHECKING:
     from ..vault.admin import SetupCodes
@@ -74,6 +105,16 @@ SERVED_LOG_EVERY: Final = 10.0
 RETRY_AFTER: Final[Mapping[str, bytes]] = MappingProxyType({"busy": b"1", "rate_limited": b"2"})
 SETUP_HINT: Final = "run zoeymcp setup-code in the vault's container"
 RESET_HINT: Final = "run zoeymcp setup-code --reset in the vault's container"
+# setup_code_refused is logged at most once a minute, with a count (M.4).
+SETUP_REFUSED_LOG_EVERY: Final = 60.0
+# M5 refuses a managed policy at start (P9), so every portal is declarative for now.
+MODE: Final = "declarative"
+# A counter that went back shows as a banner for this long (I.1's passkey_counter).
+REGRESSED_FOR: Final = 30 * 86_400
+COUNTER_BANNER: Final = (
+    "A passkey's signature counter went back in the last 30 days: the authenticator may have "
+    "been copied. Check the passkeys with zoeymcp passkeys."
+)
 
 CSP: Final = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
@@ -118,8 +159,8 @@ def load_static(root: Traversable | None = None) -> dict[str, bytes]:
 @dataclass(frozen=True)
 class Call:
     """An admitted API request, as a handler sees it: its origin entry, route and path
-    parameters, its raw query, the parsed body (None for a route without one), and the session
-    both halves found (None on an unauthenticated route)."""
+    parameters, its raw query, the parsed body (None for a route without one), the session both
+    halves found (None on an unauthenticated route), and the connecting address."""
 
     entry: Origin
     route: Route
@@ -127,6 +168,7 @@ class Call:
     query: bytes
     body: Mapping[str, Any] | None
     session: Session | None
+    peer: str = ""  # for the login ceremonies' quota per peer (F.1)
 
 
 @dataclass(frozen=True)
@@ -179,9 +221,13 @@ class PortalApp:
     """The portal on its listener. ``origins`` is ``admin.origins``; :meth:`reload` swaps them.
 
     ``setup``, ``passkeys`` and ``login`` are the ones the vault shares with the admin socket.
-    ``routes`` and ``handlers`` are the API (M.1): a route without a handler answers 404.
-    ``clock`` is monotonic (the limits); ``wall`` is the sessions' clock. ``body_deadline`` is
-    :data:`BODY_DEADLINE` but for tests.
+    ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
+    class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
+    limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
+    tests.
+
+    The admin socket lists and ends the sessions through :meth:`session_list`, :meth:`end_all`
+    and :meth:`end_credential`, on the same event loop.
     """
 
     def __init__(
@@ -204,15 +250,18 @@ class PortalApp:
         self.passkeys = passkeys
         self.login = login
         self._routes = tuple(routes)
-        self._handlers = dict(handlers or {})
+        self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
         self._wall = wall
         self.body_deadline = body_deadline
         self.sessions = Sessions()
+        self.ceremonies = Ceremonies()
+        self.actions = Actions()
         self._gate = InFlight()
         self._bucket = Bucket()
         self._refused: Sparse[str] = Sparse(REFUSED_LOG_EVERY)
         self._served: Sparse[str] = Sparse(SERVED_LOG_EVERY)
+        self._codes_refused: Sparse[str] = Sparse(SETUP_REFUSED_LOG_EVERY)
 
     @property
     def origins(self) -> tuple[str, ...]:
@@ -227,8 +276,7 @@ class PortalApp:
         """``SIGHUP`` with ``admin.origins`` changed: the new list takes effect at once, and the
         sessions of an origin no longer listed end (B.3)."""
         self._entries = origin_entries(origins)
-        for ended in self.sessions.end_origins(self.origins):
-            logs.event("portal_session_ended", session=ended.session.fingerprint, why=ended.why)
+        self._finish(self.sessions.end_origins(self.origins))
 
     def setup_hint(self) -> str | None:
         """What ``setup_pending`` says at start when no passkey can sign in (E.1), or None."""
@@ -294,6 +342,8 @@ class PortalApp:
             await self._refuse(exchange, refusal("not_found"))
             return
         session = None
+        # Expired sessions end here, logged, before any lookup could find one (6b's sweep).
+        self._finish(self.sessions.sweep(self._wall()))
         if route.unauthenticated:
             slot = self._gate.enter_unauthenticated(ticket)
             refused = admit_unauthenticated(slot=slot, token=slot and self._bucket.take(started))
@@ -314,7 +364,10 @@ class PortalApp:
         if session is not None:
             session = self.sessions.touch(session.id, self._wall()) or session
         query = exchange.scope.get("query_string", b"")
-        answer = await handler(Call(admitted.entry, route, admitted.params, query, body, session))
+        client = exchange.scope.get("client")
+        peer = str(client[0]) if client else ""
+        call = Call(admitted.entry, route, admitted.params, query, body, session, peer)
+        answer = await handler(call)
         if isinstance(answer, Refusal):
             status, reason = answer.status, answer.reason
             await self._send_json(exchange, status, answer.body(), _refusal_headers(answer))
@@ -360,6 +413,333 @@ class PortalApp:
                         return bytes(body)
         except TimeoutError:
             return refusal("too_slow")
+
+    # --- the admin socket's view of the sessions (M.3) -------------------------------------------
+
+    def session_list(self) -> list[dict[str, Any]]:
+        """Every live session, as ``zoeymcp sessions`` lists them."""
+        return [_listed(session) for session in self.sessions.live(self._wall())]
+
+    def end_all(self) -> int:
+        """End every session (``zoeymcp sessions --end-all``). How many were live."""
+        self._finish(self.sessions.sweep(self._wall()))
+        ended = self.sessions.end_where(lambda session: True, "end_all")
+        self._finish(ended)
+        return len(ended)
+
+    def end_credential(self, fingerprint: str) -> int:
+        """End the sessions the removed passkey's logins made. How many."""
+        ended = self.sessions.end_credential(fingerprint)
+        self._finish(ended)
+        return len(ended)
+
+    def _finish(self, ended: Iterable[Ended]) -> None:
+        """What every ending of a session needs: its enrolment ceremony and pending action go,
+        its OAuth flows are cancelled (H.2), and the end is logged (M.4)."""
+        for item in ended:
+            session = item.session
+            self.ceremonies.drop_session(session.id)
+            self.actions.drop_session(session.id)
+            if self.login is not None:
+                self.login.cancel_owner(session.owner)
+            kind = "portal_logout" if item.why == "logout" else "portal_session_ended"
+            logs.event(kind, session=session.fingerprint, why=item.why)
+
+    # --- the API (M.1) ---------------------------------------------------------------------------
+
+    def _own_handlers(self) -> dict[Route, Handler]:
+        return {
+            api.LOGIN_BEGIN: self._login_begin,
+            api.LOGIN_FINISH: self._login_finish,
+            api.SETUP_REDEEM: self._setup_redeem,
+            api.SESSION: self._session_answer,
+            api.LOGOUT: self._logout,
+            api.SESSIONS: self._sessions,
+            api.END_OTHERS: self._end_others,
+            api.ENROL_BEGIN: self._enrol_begin,
+            api.ENROL_FINISH: self._enrol_finish,
+        }
+
+    async def _login_begin(self, call: Call) -> Reply | Refusal:
+        """A login ceremony (D.1): no credential is listed, so nothing about them reaches a
+        caller without a session."""
+        holder = self._holder()
+        if isinstance(holder, Refusal):
+            return holder
+        entry = call.entry
+        ceremony = self.ceremonies.begin_login(
+            origin=entry.origin, peer=call.peer, now=self._wall()
+        )
+        if isinstance(ceremony, Full):
+            # F.1 and P16 say 429 for a table full of other peers' ceremonies; M.2's reason for
+            # 429 is rate_limited (busy is its 503).
+            return refusal("rate_limited")
+        options = request_options(challenge=ceremony.challenge, rp_id=entry.rp_id)
+        return Reply({"ceremony": ceremony.id, "options": options})
+
+    async def _login_finish(self, call: Call) -> Reply | Refusal:
+        """Verify the assertion against a passkey of this origin's RP ID and mint a full session
+        (F.2). Any refusal of the assertion is one answer, ``passkey_refused``; the log has the
+        verifier's reason."""
+        holder = self._holder()
+        if isinstance(holder, Refusal):
+            return holder
+        ceremony = self._take(call, "login", None)
+        if isinstance(ceremony, Refusal):
+            return ceremony
+        entry = call.entry
+        try:
+            asserted = verify_assertion(
+                _body(call)["credential"],
+                challenge=ceremony.challenge,
+                origin=entry.origin,
+                rp_id=entry.rp_id,
+                credentials=holder.document.credentials,
+                user_handle=holder.user_handle,
+                login=True,
+            )
+        except WebAuthnError as exc:
+            logs.event("portal_login_failed", rp_id=entry.rp_id, reason=exc.reason)
+            return refusal("passkey_refused")
+        holder.touch(asserted)
+        fingerprint = holder.fingerprint(asserted.credential_id)
+        minted = self.sessions.mint(
+            origin=entry.origin,
+            rp_id=entry.rp_id,
+            scope="full",
+            now=self._wall(),
+            credential=fingerprint,
+        )
+        self._finish(minted.ended)
+        logs.event(
+            "portal_login",
+            credential=fingerprint,
+            rp_id=entry.rp_id,
+            session=minted.session.fingerprint,
+        )
+        return _minted(entry, minted, {"scope": "full", "idle": int(SESSION_IDLE)})
+
+    async def _setup_redeem(self, call: Call) -> Reply | Refusal:
+        """Spend a setup code and mint a setup session (E.1): one answer for every refusal."""
+        entry = call.entry
+        if self.setup is None:
+            return self._setup_refused()
+        try:
+            decision = await self.setup.redeem(_body(call)["code"], origin=entry.origin)
+        except OSError:
+            # The record couldn't be removed, so the code isn't spent and no session opens.
+            return refusal("not_written")
+        if not isinstance(decision, Redeemed):
+            return self._setup_refused()
+        minted = self.sessions.mint(
+            origin=entry.origin,
+            rp_id=entry.rp_id,
+            scope="setup",
+            now=self._wall(),
+            reset=decision.reset,
+        )
+        self._finish(minted.ended)
+        logs.event(
+            "setup_code_redeemed",
+            origin=entry.origin,
+            reset=decision.reset,
+            session=minted.session.fingerprint,
+        )
+        return _minted(entry, minted, {"scope": "setup", "reset": decision.reset})
+
+    def _setup_refused(self) -> Refusal:
+        count = self._codes_refused.note("setup_code_refused", self._clock())
+        if count is not None:
+            logs.event("setup_code_refused", count=count)
+        return refusal("setup_code_refused")
+
+    async def _session_answer(self, call: Call) -> Reply | Refusal:
+        """What the page's header and banners show (K.3): never a token, a key or a full ID."""
+        session = _session(call)
+        holder = self.passkeys
+        usable = holder is not None and not holder.unavailable
+        signed_with = self._signed_with(session)
+        here = 0
+        if holder is not None and usable:
+            here = sum(1 for c in holder.document.credentials if c.rp_id == session.rp_id)
+        answer = {
+            "scope": session.scope,
+            "origin": session.origin,
+            "rp_id": session.rp_id,
+            "mode": MODE,
+            "idle": int(SESSION_IDLE) if session.scope == "full" else None,
+            "expires_at": int(session.expires_at),
+            "session": session.fingerprint,
+            "credential": session.credential,
+            "credential_name_shown": None
+            if signed_with is None
+            else shown(signed_with.name, NAME_LIMIT),
+            "reset": session.reset,
+            "passkeys_here": here,
+            "banners": self._banners(),
+            # The health checklist comes with the Home page (step 14a).
+            "health_summary": None,
+        }
+        return Reply(answer)
+
+    async def _logout(self, call: Call) -> Reply | Refusal:
+        """End this session, expire the cookie and clear the origin's ``sessionStorage``; never
+        ``"cookies"``, which on ``localhost`` would clear every port's (F.2)."""
+        session = _session(call)
+        ended = self.sessions.end(session.id, "logout")
+        self._finish(() if ended is None else (ended,))
+        headers = (
+            session_cookie(call.entry, "", expire=True),
+            (b"clear-site-data", b'"storage"'),
+        )
+        return Reply({}, headers=headers)
+
+    async def _sessions(self, call: Call) -> Reply | Refusal:
+        """Every live session (F.2), this one marked."""
+        this = _session(call).id
+        listed = [_listed(s, this=this) for s in self.sessions.live(self._wall())]
+        return Reply({"sessions": listed})
+
+    async def _end_others(self, call: Call) -> Reply | Refusal:
+        """End every other session: it only removes privilege, so no step-up (F.4)."""
+        ended = self.sessions.end_others(_session(call).id)
+        self._finish(ended)
+        return Reply({"ended": len(ended)})
+
+    async def _enrol_begin(self, call: Call) -> Reply | Refusal:
+        """A setup session's one enrolment (the code was its step-up): the creation options,
+        listing every credential of this RP ID unless the code was a ``--reset`` one (D.1)."""
+        session = _session(call)
+        name = _body(call)["name"]
+        if not passkey_file.check_name(name):
+            return refusal("bad_name")
+        holder = self._enrolling(session)
+        if isinstance(holder, Refusal):
+            return holder
+        existing = () if session.reset else holder.document.credentials
+        if len(existing) >= MAX_PASSKEYS:
+            return enrolment("too_many_passkeys")
+        entry = call.entry
+        ceremony = self.ceremonies.begin_enrol(
+            origin=entry.origin, session=session.id, name=name, now=self._wall()
+        )
+        options = creation_options(
+            challenge=ceremony.challenge,
+            user_handle=holder.user_handle,
+            rp_id=entry.rp_id,
+            exclude=existing,
+        )
+        return Reply({"ceremony": ceremony.id, "options": options})
+
+    async def _enrol_finish(self, call: Call) -> Reply | Refusal:
+        """Verify the new credential and add it, written before it takes effect (D.4). A setup
+        session ends after its one enrolment; with ``reset``, every other passkey and session
+        goes first (E.1). The page then signs in with the new passkey."""
+        session = _session(call)
+        holder = self._enrolling(session)
+        if isinstance(holder, Refusal):
+            return holder
+        ceremony = self._take(call, "enrol", session.id)
+        if isinstance(ceremony, Refusal):
+            return ceremony
+        entry = call.entry
+        reset = session.scope == "setup" and session.reset
+        try:
+            new = verify_registration(
+                _body(call)["credential"],
+                challenge=ceremony.challenge,
+                origin=entry.origin,
+                rp_id=entry.rp_id,
+                enrolled=() if reset else holder.document.credentials,
+            )
+        except WebAuthnError as exc:
+            return enrolment(exc.reason)
+        name = ceremony.name or ""
+        removed: tuple[Passkey, ...] = ()
+        try:
+            if reset:
+                removed = holder.reset_with(new, name=name, origin=entry.origin)
+                passkey = holder.document.credentials[-1]
+            else:
+                via: Literal["setup_code", "portal"] = (
+                    "setup_code" if session.scope == "setup" else "portal"
+                )
+                passkey = holder.add(new, name=name, via=via, origin=entry.origin)
+        except PasskeyError as exc:
+            reason = exc.reason
+            if reason == "duplicate_credential" or reason == "too_many_passkeys":
+                return enrolment(reason)  # checked again against the file as it is now
+            return refusal(reason)
+        fingerprint = holder.fingerprint(passkey.id)
+        level = {"level": "warning"} if passkey.via != "portal" else {}
+        logs.event(
+            "passkey_enrolled",
+            **level,
+            credential=fingerprint,
+            rp_id=passkey.rp_id,
+            alg=ALGORITHM_NAMES[passkey.alg],
+            synced=passkey.backup_eligible,
+            via=passkey.via,
+            origin=passkey.origin,
+        )
+        if reset:
+            logs.event("passkeys_reset", removed=len(removed))
+            self._finish(self.sessions.end_where(lambda s: s.id != session.id, "reset"))
+        if session.scope == "setup":
+            ended = self.sessions.end(session.id, "enrolled")
+            self._finish(() if ended is None else (ended,))
+            if self.setup is not None:
+                self.setup.enrolled(passkey_file.describe(passkey, fingerprint))
+        if self.setup is not None and len(holder.document.credentials) == 1:
+            self.setup.discard()  # the first passkey, by whatever path (E.1)
+        return Reply({"passkey": _passkey_view(passkey, fingerprint)})
+
+    def _holder(self) -> Passkeys | Refusal:
+        """The passkey file, unless it can't be verified (P19: 503 until a reset)."""
+        holder = self.passkeys
+        if holder is None or holder.unavailable:
+            return refusal("unavailable")
+        return holder
+
+    def _enrolling(self, session: Session) -> Passkeys | Refusal:
+        """The passkey file for an enrolment: a ``--reset`` setup session may replace one that
+        can't be verified, which is the way out of that state."""
+        holder = self.passkeys
+        if holder is None or (holder.unavailable and not session.reset):
+            return refusal("unavailable")
+        return holder
+
+    def _take(self, call: Call, kind: CeremonyKind, session: str | None) -> Ceremony | Refusal:
+        """The ceremony the body names, taken out of the table before its answer is checked."""
+        wanted = _body(call)["ceremony"]
+        if not isinstance(wanted, str):
+            return refusal("bad_body")
+        ceremony = self.ceremonies.take(
+            wanted, kind=kind, origin=call.entry.origin, now=self._wall(), session=session
+        )
+        return refusal("ceremony_unknown") if ceremony is None else ceremony
+
+    def _signed_with(self, session: Session) -> Passkey | None:
+        holder = self.passkeys
+        if holder is None or session.credential is None:
+            return None
+        try:
+            return holder.find(session.credential)
+        except PasskeyError:
+            return None  # removed since, or the file can't be verified
+
+    def _banners(self) -> list[dict[str, str]]:
+        """The banner lines every page shows (K.3); the ledger's and health's come in steps 14a
+        and 15."""
+        holder = self.passkeys
+        if holder is None:
+            return []
+        if holder.unavailable:
+            return [{"code": "passkeys_unavailable", "text": refusal("unavailable").error}]
+        regressed = holder.document.last_regressed
+        if regressed is not None and self._wall() - regressed < REGRESSED_FOR:
+            return [{"code": "passkey_counter_regressed", "text": COUNTER_BANNER}]
+        return []
 
     # --- answers ---------------------------------------------------------------------------------
 
@@ -424,6 +804,61 @@ class PortalApp:
 
     def _ms(self, started: float) -> float:
         return round((self._clock() - started) * 1000, 1)
+
+
+def session_cookie(entry: Origin, value: str, *, expire: bool = False) -> Header:
+    """C.1's session cookie for ``entry``: ``HttpOnly``, ``SameSite=Strict``, ``Path=/``, and
+    ``Secure`` on https; no ``Domain`` and no lifetime, so the server decides when it ends. At
+    logout, the same name with ``Max-Age=0``."""
+    parts = [f"{entry.cookie_name}={value}"]
+    if entry.secure:
+        parts.append("Secure")
+    parts += ["HttpOnly", "SameSite=Strict", "Path=/"]
+    if expire:
+        parts.append("Max-Age=0")
+    return b"set-cookie", "; ".join(parts).encode("latin-1")
+
+
+def _minted(entry: Origin, minted: Minted, fields: Mapping[str, Any]) -> Reply:
+    """The answer that mints a session: the header half in the body, the cookie half set; each
+    is sent this once (F.2)."""
+    body = {"token": minted.header.reveal(), **fields, "expires_at": int(minted.session.expires_at)}
+    return Reply(body, headers=(session_cookie(entry, minted.cookie.reveal()),))
+
+
+def _listed(session: Session, *, this: str | None = None) -> dict[str, Any]:
+    """A session as the lists show it (F.2): its fingerprint, never its ID or either half."""
+    listed: dict[str, Any] = {
+        "fingerprint": session.fingerprint,
+        "origin": session.origin,
+        "scope": session.scope,
+        "credential": session.credential,
+        "created": int(session.created),
+        "last_seen": int(session.last_seen),
+        "expires_at": int(min(session.expires_at, session.idle_until)),
+    }
+    if this is not None:
+        listed["this"] = session.id == this
+    return listed
+
+
+def _passkey_view(passkey: Passkey, fingerprint: str) -> dict[str, Any]:
+    """D.5's fields of one passkey, its name as text the page may show (K.1)."""
+    view = passkey_file.describe(passkey, fingerprint)
+    view["name_shown"] = shown(view.pop("name"), NAME_LIMIT)
+    return view
+
+
+def _session(call: Call) -> Session:
+    if call.session is None:
+        raise RuntimeError(f"{call.route.path} needs a session")
+    return call.session
+
+
+def _body(call: Call) -> Mapping[str, Any]:
+    if call.body is None:
+        raise RuntimeError(f"{call.route.path} needs a body")
+    return call.body
 
 
 def _refusal_headers(refused: Refusal) -> tuple[Header, ...]:

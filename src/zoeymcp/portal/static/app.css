@@ -14,3 +14,63 @@ main {
   margin: 0 auto;
   padding: 1.5rem;
 }
+
+[hidden] {
+  display: none !important;
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  padding: 0.5rem 1.5rem;
+  border-bottom: 1px solid GrayText;
+}
+
+nav {
+  display: flex;
+  gap: 0.5rem;
+}
+
+label {
+  display: block;
+  margin-top: 1rem;
+}
+
+input {
+  width: 100%;
+  max-width: 24rem;
+  font: inherit;
+  margin-bottom: 0.5rem;
+}
+
+button {
+  font: inherit;
+  margin: 0.25rem 0.5rem 0.25rem 0;
+}
+
+code {
+  overflow-wrap: anywhere;
+}
+
+#error {
+  border-left: 0.25rem solid #c62828;
+  padding-left: 0.75rem;
+}
+
+#banners {
+  list-style: none;
+  padding: 0;
+}
+
+.banner {
+  border-left: 0.25rem solid #ef6c00;
+  padding-left: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+#session-list li {
+  margin-bottom: 0.5rem;
+  overflow-wrap: anywhere;
+}

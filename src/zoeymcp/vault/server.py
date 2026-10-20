@@ -714,12 +714,19 @@ def build(
     previous = None if runtime.previous is None else runtime.previous.portal_key
     passkeys = Passkeys.load(state_dir, portal_key, previous)
     setup = SetupCodes(state_dir, portal_key)
-    admin = None
     if admin_socket is not None and socket_supported():
         try:
             check_socket_dir(admin_socket)
         except AdminSocketError as exc:
             raise StartupError(str(exc)) from exc
+    elif admin_socket is not None:
+        logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
+        admin_socket = None
+    # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2).
+    portal = build_portal(runtime.policy, listens, setup=setup, passkeys=passkeys, login=login)
+    admin = None
+    if admin_socket is not None:
+        # The socket lists and ends the portal's sessions (zoeymcp sessions, passkeys --remove).
         admin = AdminApp(
             runtime.store,
             runtime.keys,
@@ -732,10 +739,6 @@ def build(
             env_names=lambda: app.env_names,
             reports=reports,
             passkeys=passkeys,
+            portal=None if portal is None else portal.app,
         )
-    elif admin_socket is not None:
-        logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
-        admin_socket = None
-    # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2).
-    portal = build_portal(runtime.policy, listens, setup=setup, passkeys=passkeys, login=login)
     return Vault(app, runtime.gateway_keys, login, setup, passkeys, admin, admin_socket, portal)

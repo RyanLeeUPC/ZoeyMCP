@@ -9,10 +9,71 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
+<header id="bar" hidden>
+<span id="bar-origin"></span>
+<span id="bar-passkey"></span>
+<span id="bar-ends"></span>
+<nav id="nav">
+<button type="button" id="nav-home">Home</button>
+<button type="button" id="nav-sessions">Sessions</button>
+</nav>
+<button type="button" id="sign-out">Sign out</button>
+</header>
 <main id="page">
 <h1>ZoeyMCP</h1>
-<p id="status">The portal's pages aren't built yet. Until they are, use the zoeymcp CLI in the
-vault's container.</p>
+<p id="status" role="status">Loading the portal.</p>
+<ul id="banners"></ul>
+<p id="error" role="alert" hidden></p>
+
+<section id="blocked" hidden>
+<p id="blocked-text"></p>
+</section>
+
+<section id="login" hidden>
+<h2>Sign in</h2>
+<p>Sign in with a passkey you enrolled on this address.</p>
+<button type="button" id="login-passkey">Sign in with a passkey</button>
+<button type="button" id="login-setup">I have a setup code</button>
+</section>
+
+<section id="setup" hidden>
+<h2>Set up a passkey</h2>
+<div id="setup-code-step">
+<p>Run <code>zoeymcp setup-code</code> in the vault's container and type the code it prints.
+A code works once, for 15 minutes.</p>
+<label for="setup-code">Setup code</label>
+<input id="setup-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="64">
+<button type="button" id="setup-redeem">Use this code</button>
+<button type="button" id="setup-back">Back</button>
+</div>
+<div id="setup-name-step" hidden>
+<p id="setup-reset" hidden>This code is a reset: enrolling removes every other passkey and ends
+every session.</p>
+<label for="setup-name">Name for this passkey (for example, the device it is on)</label>
+<input id="setup-name" type="text" autocomplete="off" maxlength="64">
+<button type="button" id="setup-enrol">Create the passkey</button>
+</div>
+<div id="setup-done-step" hidden>
+<p>Passkey enrolled. Its fingerprint is <code id="setup-fingerprint"></code>.</p>
+<p>Compare it with what <code>zoeymcp passkeys</code> or <code>zoeymcp setup-code --wait</code>
+shows. Now sign in with it, to check that it works.</p>
+<button type="button" id="setup-login">Sign in with the new passkey</button>
+</div>
+</section>
+
+<section id="home" hidden>
+<h2>Home</h2>
+<p id="home-text"></p>
+<p>This deployment's policy is declarative: the portal can't change it.</p>
+</section>
+
+<section id="sessions" hidden>
+<h2>Sessions</h2>
+<p>Every signed-in browser. A session ends after 15 idle minutes, 4 hours in all, at sign-out,
+or when the vault restarts.</p>
+<ul id="session-list"></ul>
+<button type="button" id="end-others">End the other sessions</button>
+</section>
 </main>
 </body>
 </html>

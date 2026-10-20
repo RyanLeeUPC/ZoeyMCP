@@ -30,6 +30,7 @@ from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.portal import passkeys as passkey_module
 from zoeymcp.portal import setupcode
+from zoeymcp.portal.app import PortalApp, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.setupcode import Redeemed, Refused
 from zoeymcp.portal.webauthn import Asserted
@@ -106,6 +107,7 @@ class AdminRig:
         *,
         tokens: bool = True,
         passkeys: Passkeys | None = None,
+        portal: PortalApp | None = None,
     ) -> None:
         self.policy = example_policy()
         self.store = SecretStore(tmp_path, KEYS)
@@ -123,6 +125,7 @@ class AdminRig:
             self.setup,
             self.tokens if tokens else None,
             passkeys=passkeys,
+            portal=portal,
         )
 
     def set_policy(self, policy: Policy) -> None:
@@ -896,10 +899,64 @@ async def test_passkeys_without_a_usable_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_sessions_are_stubs_until_the_portal_serves(tmp_path: Path) -> None:
+async def test_without_a_portal_there_are_no_sessions(tmp_path: Path) -> None:
     rig = AdminRig(tmp_path)
     assert (await rig.call("GET", "/sessions")).json() == {"sessions": []}
     assert (await rig.call("DELETE", "/sessions")).json() == {"ended": 0}
+    await rig.token_client.aclose()
+
+
+def portal_with_sessions(*credentials: str | None) -> PortalApp:
+    portal = PortalApp([ORIGIN], static=load_static())
+    for credential_fp in credentials:
+        portal.sessions.mint(
+            origin=ORIGIN,
+            rp_id="localhost",
+            scope="full",
+            now=time.time(),
+            credential=credential_fp,
+        )
+    return portal
+
+
+@pytest.mark.anyio
+async def test_the_portals_sessions_are_listed_and_ended(
+    tmp_path: Path, log_buffer: io.StringIO
+) -> None:
+    """``zoeymcp sessions [--end-all]``: fingerprints, never an ID or either half (F.2)."""
+    portal = portal_with_sessions("a" * 16, None)
+    rig = AdminRig(tmp_path, portal=portal)
+    listed = (await rig.call("GET", "/sessions")).json()["sessions"]
+    live = portal.sessions.live(time.time())
+    assert [s["fingerprint"] for s in listed] == [s.fingerprint for s in live]
+    assert [s["credential"] for s in listed] == ["a" * 16, None]
+    assert set(listed[0]) == {
+        "fingerprint",
+        "origin",
+        "scope",
+        "credential",
+        "created",
+        "last_seen",
+        "expires_at",
+    }
+    response = await rig.call("DELETE", "/sessions")
+    assert response.json() == {"ended": 2}
+    assert len(portal.sessions) == 0
+    ended = log_events(log_buffer, "portal_session_ended")
+    assert [line["why"] for line in ended] == ["end_all", "end_all"]
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_removing_a_passkey_ends_the_sessions_it_made(tmp_path: Path) -> None:
+    holder = holder_with(tmp_path, 1, 2)
+    first = holder.fingerprint(credential(1).id)
+    second = holder.fingerprint(credential(2).id)
+    portal = portal_with_sessions(first, first, second)
+    rig = AdminRig(tmp_path, passkeys=holder, portal=portal)
+    response = await rig.call("DELETE", f"/passkeys/{first}")
+    assert (response.json()["sessions_ended"], response.json()["remaining"]) == (2, 1)
+    assert [s.credential for s in portal.sessions.live(time.time())] == [second]
     await rig.token_client.aclose()
 
 

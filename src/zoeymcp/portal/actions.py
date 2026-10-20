@@ -21,6 +21,7 @@ from typing import Any, Final, Literal
 
 from ..common.canonical import digest
 from ..common.logs import refuse_type
+from .routes import BODY_DEFAULT
 from .sessions import NONCE_BYTES, RandomBytes, challenge, new_id
 
 ACTION_TTL: Final = 300.0
@@ -43,7 +44,7 @@ class Kind:
     optional: frozenset[str] = frozenset()
 
 
-_DEFAULT_CAP: Final = 4 * 1024
+_DEFAULT_CAP: Final = BODY_DEFAULT  # one definition of M.1's 4 KiB, in routes.py
 KINDS: Final[dict[str, Kind]] = {
     kind.name: kind
     for kind in (

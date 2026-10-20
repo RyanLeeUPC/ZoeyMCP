@@ -299,6 +299,13 @@ class FlowTable:
         del self._flows[flow_id]
         return True
 
+    def cancel_owner(self, owner: str) -> int:
+        """Drop every flow ``owner`` has: its portal session ended (H.2). How many went."""
+        owned = [flow_id for flow_id, flow in self._flows.items() if flow.owner == owner]
+        for flow_id in owned:
+            del self._flows[flow_id]
+        return len(owned)
+
     def _usable(self, flow: Flow, credential: str) -> bool:
         return self._clock() < flow.expires_at and flow.credential == credential
 

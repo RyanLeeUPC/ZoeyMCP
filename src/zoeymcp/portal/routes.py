@@ -79,7 +79,42 @@ PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
     }
 )
 
-ROUTES: Final[tuple[Route, ...]] = ()
+# Body caps in bytes (F.1, M.1): an empty object, the default, and a passkey's answer.
+BODY_EMPTY: Final = 64
+BODY_DEFAULT: Final = 4 * 1024
+BODY_WEBAUTHN: Final = 16 * 1024
+
+NONE: Final[frozenset[Scope]] = frozenset()
+SETUP: Final[frozenset[Scope]] = frozenset({"setup"})
+FULL: Final[frozenset[Scope]] = frozenset({"full"})
+BOTH: Final[frozenset[Scope]] = frozenset({"setup", "full"})
+_CEREMONY: Final = frozenset({"ceremony", "credential"})
+
+# Step 11: the three unauthenticated routes, the session, enrolment by a setup session, logout
+# and the session list. An enrolment a full session begins comes with step 12's passkey.enrol.
+LOGIN_BEGIN: Final = Route("POST", "/api/login/begin", NONE, BODY_EMPTY)
+LOGIN_FINISH: Final = Route("POST", "/api/login/finish", NONE, BODY_WEBAUTHN, _CEREMONY)
+SETUP_REDEEM: Final = Route("POST", "/api/setup/redeem", NONE, BODY_DEFAULT, frozenset({"code"}))
+SESSION: Final = Route("GET", "/api/session", BOTH)
+LOGOUT: Final = Route("POST", "/api/logout", BOTH, BODY_EMPTY)
+SESSIONS: Final = Route("GET", "/api/sessions", FULL)
+END_OTHERS: Final = Route("POST", "/api/sessions/end-others", FULL, BODY_EMPTY)
+ENROL_BEGIN: Final = Route(
+    "POST", "/api/passkeys/enrol/begin", SETUP, BODY_DEFAULT, frozenset({"name"})
+)
+ENROL_FINISH: Final = Route("POST", "/api/passkeys/enrol/finish", BOTH, BODY_WEBAUTHN, _CEREMONY)
+
+ROUTES: Final[tuple[Route, ...]] = (
+    LOGIN_BEGIN,
+    LOGIN_FINISH,
+    SETUP_REDEEM,
+    SESSION,
+    LOGOUT,
+    SESSIONS,
+    END_OTHERS,
+    ENROL_BEGIN,
+    ENROL_FINISH,
+)
 
 
 def match(routes: Iterable[Route], method: str, path: str) -> tuple[Route, dict[str, str]] | None:

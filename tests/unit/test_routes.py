@@ -14,6 +14,9 @@ from typing import get_args
 import pytest
 
 from zoeymcp.portal.routes import (
+    BODY_DEFAULT,
+    BODY_EMPTY,
+    BODY_WEBAUTHN,
     CSS,
     HTML,
     JAVASCRIPT,
@@ -81,8 +84,14 @@ def test_the_static_map_is_fixed() -> None:
 
 
 def test_the_table_holds_only_built_routes() -> None:
-    # Step 6a: the shape only. Each of steps 11 to 15 adds the rows it builds here.
-    assert ROUTES == ()
+    # Each of steps 11 to 15 adds the rows it builds: step 11's are M.1's first nine.
+    assert M1[:9] == ROUTES
+    assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
+        "/api/login/begin",
+        "/api/logout",
+        "/api/sessions/end-others",
+    ]
+    assert (BODY_EMPTY, BODY_DEFAULT, BODY_WEBAUTHN) == (64, 4 * KIB, 16 * KIB)
 
 
 def test_the_methods_and_scopes() -> None:
@@ -130,7 +139,8 @@ def test_the_route_defaults() -> None:
 
 def test_nothing_matches_an_empty_table() -> None:
     assert match((), "GET", "/api/session") is None
-    assert match(ROUTES, "GET", "/api/session") is None
+    assert match(ROUTES, "GET", "/api/session") == (ROUTES[3], {})
+    assert match(ROUTES, "GET", "/api/passkeys") is None  # step 12's
 
 
 @pytest.mark.parametrize(

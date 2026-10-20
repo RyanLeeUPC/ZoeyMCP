@@ -284,6 +284,10 @@ class LoginService:
         """Drop a pending flow (the CLI does on Ctrl-C)."""
         return self._flows.cancel(flow_id, owner)
 
+    def cancel_owner(self, owner: str) -> int:
+        """Drop every flow a portal session started, when it ends (M5 design H.2)."""
+        return self._flows.cancel_owner(owner)
+
     def _parse(
         self, credential: str, flow: Flow, redirect_url: str
     ) -> tuple[OAuth2Credential, Redirect]:

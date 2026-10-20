@@ -51,7 +51,7 @@ import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Protocol
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -113,6 +113,17 @@ _LOGIN_STATUS = {
     "client_secret_unavailable": 409,
     "too_many_flows": 429,
 }
+
+
+class PortalSessions(Protocol):
+    """The portal's sessions as the socket reaches them (``portal.app.PortalApp``), on the loop
+    both serve from."""
+
+    def session_list(self) -> list[dict[str, Any]]: ...
+
+    def end_all(self) -> int: ...
+
+    def end_credential(self, fingerprint: str) -> int: ...
 
 
 class AdminSocketError(Exception):
@@ -344,6 +355,7 @@ class AdminApp:
         env_names: Callable[[], Collection[str]] | None = None,
         reports: ReportStore | None = None,
         passkeys: Passkeys | None = None,
+        portal: PortalSessions | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -355,8 +367,12 @@ class AdminApp:
         health. Without it, those routes answer 503 and health has no ``ledger_copy``.
 
         ``passkeys`` is the portal's passkey file, shared with the portal. Without it,
-        ``/passkeys`` answers 503 and health has no ``passkeys``."""
+        ``/passkeys`` answers 503 and health has no ``passkeys``.
+
+        ``portal`` holds the portal's sessions: ``/sessions`` lists and ends them, and removing
+        a passkey ends the sessions it made. Without a portal there are none."""
         self._store = store
+        self._portal = portal
         self._passkeys = passkeys
         self._reports = reports
         self._connectors = connectors
@@ -509,8 +525,7 @@ class AdminApp:
         except PasskeyError as exc:
             status, message = _PASSKEY_REFUSALS[exc.reason]
             return _reason(status, message, exc.reason)
-        # The portal's sessions arrive with it (step 11): until then none was made with it.
-        ended = 0
+        ended = 0 if self._portal is None else self._portal.end_credential(wanted)
         remaining = len(holder.document.credentials)
         logs.event(
             "passkey_removed",
@@ -528,11 +543,14 @@ class AdminApp:
         return JSONResponse(answer)
 
     async def _session_list(self, request: Request) -> Response:
-        # The portal's sessions arrive with it (step 11): until then there are none.
-        return JSONResponse({"sessions": []})
+        """Every live portal session (F.2): fingerprints, never an ID or either half."""
+        listed = [] if self._portal is None else self._portal.session_list()
+        return JSONResponse({"sessions": listed})
 
     async def _session_end_all(self, request: Request) -> Response:
-        return JSONResponse({"ended": 0})
+        """End every portal session, with no step-up: host access is the recovery path."""
+        ended = 0 if self._portal is None else self._portal.end_all()
+        return JSONResponse({"ended": ended})
 
     async def _gateway_key(self, request: Request) -> Response:
         if self._gateway_keys is None:

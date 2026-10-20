@@ -547,6 +547,19 @@ def test_the_owner_cancels() -> None:
     assert flows.take(flow.id, "music", SESSION) is None
 
 
+def test_an_ended_session_cancels_only_its_own_flows() -> None:
+    """M5 design H.2: ending a portal session drops every flow it started, and no other."""
+    flows, _, _ = table()
+    mine = flows.start("music", REDIRECT, owner=SESSION)
+    other = flows.start("files", REDIRECT, owner="session:" + "f" * 32)
+    cli = flows.start("mail", REDIRECT)
+    assert flows.cancel_owner(SESSION) == 1
+    assert flows.cancel_owner(SESSION) == 0
+    assert flows.peek(mine.id, "music", SESSION) is None
+    assert flows.peek(other.id, "files", "session:" + "f" * 32) is other
+    assert flows.peek(cli.id, "mail") is cli
+
+
 def test_peek_leaves_the_flow() -> None:
     flows, _, _ = table()
     flow = flows.start("music", REDIRECT, owner=SESSION)

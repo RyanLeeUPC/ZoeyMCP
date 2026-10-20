@@ -3,7 +3,8 @@
 P3's ``Host`` rows and browser modes, the 308, P15's headers on every status the shell makes,
 P16's connection and body rows (contract 40's cases through the real vault), P21, and P12's 404s
 for ``/callback``, ``/oauth/callback`` and ``/oauth/callback/<name>`` (the last until step 14b).
-The API has no routes yet, so the body, session and gate rows run on routes the tests add.
+The body, session and gate rows run on routes the tests add, so each row is shown on its own;
+the API's own routes are tested in ``test_login.py``, ``test_setup.py`` and ``test_sessions.py``.
 """
 
 from __future__ import annotations
@@ -187,9 +188,9 @@ def test_two_host_headers_never_reach_the_portal(rig: PortalRig) -> None:
 def test_the_browser_modes_are_refused_before_any_session_lookup(rig: PortalRig) -> None:
     browser = rig.browser()
     own = browser.page(rig.origin)
-    # The portal's own page reaches the route table, which has no routes yet.
-    refused(own.fetch("GET", "/api/session"), 404, "not_found")
-    refused(own.fetch("POST", "/api/logout", json={}), 404, "not_found")
+    # The portal's own page reaches the session check, and has no session.
+    refused(own.fetch("GET", "/api/session"), 401, "no_session")
+    refused(own.fetch("POST", "/api/logout", json={}), 401, "no_session")
     # A cross-site page, and a neighbour on another localhost port (same-site, not same-origin).
     for other in ("https://evil.example", f"http://localhost:{rig.portal_port + 1}"):
         page = browser.page(other)
@@ -204,9 +205,14 @@ def test_the_browser_modes_are_refused_before_any_session_lookup(rig: PortalRig)
     refused(browser.navigate(rig.origin + "/api/session"), 403, "cross_site")
     # Another Origin on a GET that carries one; the Origin doubled.
     refused(own.fetch("GET", "/api/session", headers=[("Origin", "null")]), 403, "bad_origin")
-    # A non-browser forging every header gets as far as the route table.
-    forged = [("Sec-Fetch-Site", "same-origin"), ("Origin", rig.origin)]
-    refused(browser.forge("POST", rig.origin + "/api/logout", forged), 404, "not_found")
+    # A non-browser forging every header gets as far as the session check.
+    forged = [
+        ("Sec-Fetch-Site", "same-origin"),
+        ("Origin", rig.origin),
+        ("Content-Type", "application/json"),
+    ]
+    refused(browser.forge("POST", rig.origin + "/api/logout", forged, b"{}"), 401, "no_session")
+    assert len(rig.app.sessions) == 0
 
 
 @pytest.mark.parametrize("method", ["OPTIONS", "HEAD", "PUT", "PATCH", "TRACE"])

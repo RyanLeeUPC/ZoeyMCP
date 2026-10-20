@@ -410,9 +410,12 @@ def test_an_unknown_api_route_is_404(method: str, path: str) -> None:
     assert decide(request(method, path)) == refusal("not_found")
 
 
-def test_until_step_11_no_api_route_is_built() -> None:
-    assert admit(request(), ENTRIES) == refusal("not_found")
-    assert ROUTES == ()
+def test_the_default_table_is_the_built_routes() -> None:
+    admitted = admit(request(), ENTRIES)
+    assert isinstance(admitted, Admitted)
+    assert admitted.route == ROUTES[0] == BEGIN
+    # A route a later step builds is 404 until then.
+    assert admit(request("GET", "/api/passkeys"), ENTRIES) == refusal("not_found")
 
 
 # --- row 7: body headers ------------------------------------------------------------------------

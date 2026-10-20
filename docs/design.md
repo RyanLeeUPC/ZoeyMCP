@@ -1269,42 +1269,76 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
 
 ### 7.2 Authentication and bootstrap
 
-- **First start:** the vault creates a random **setup code** and logs only `setup pending: run
-  zoeymcp setup-code`.
-- **Getting the code:** `docker exec <vault> zoeymcp setup-code` prints it, over a local admin
-  socket that only the vault's uid can open. It is valid for 15 minutes, works once, and is
-  invalidated when the first passkey is enrolled.
-- **Login:** a passkey (WebAuthn, `userVerification: required`). Several passkeys can be enrolled.
-  Sessions are short-lived, with `SameSite=Strict` cookies.
+- **Origins and RP IDs:** `admin.origins` lists every exact address a browser uses. A passkey
+  belongs to its origin's host name, the RP ID, which has no port: one enrolled on
+  `http://localhost:8081` works on any listed `http://localhost` port, but a different host name
+  needs its own. Passkeys don't work on IP addresses, so a `GET /` to a loopback IP literal is
+  redirected to the listed `http://localhost` origin with the same port. WebAuthn needs a secure
+  context: `localhost`, or HTTPS with a certificate the browser trusts (a reverse proxy, a
+  tailnet's certificates, or a private CA installed on the browser's machine). Browsers refuse
+  passkeys on pages with certificate errors, and plain HTTP over the LAN doesn't work, by design.
+- **First start:** no code exists. While no passkey can sign in, the vault logs `setup_pending`
+  ("run zoeymcp setup-code in the vault's container").
+- **The setup code:** `docker exec <vault> zoeymcp setup-code` issues one over a local admin socket
+  that only the vault's uid can open (or `--state DIR` writes it on a host without the socket).
+  The code is 120 random bits, valid for 15 minutes, and a new one replaces the last. Only its
+  hash is stored, with a MAC under a key derived from the master key, so a writer of the state
+  volume can't plant a code. Redeeming it spends it at once (the record is deleted before the
+  session opens) and opens a **setup session** of 10 minutes that can enrol one passkey and
+  nothing else. Every refusal is one answer, and there is no attempt counter: guessing 120 bits
+  is pointless, and a counter would let anyone burn the operator's codes. The first passkey
+  enrolled, by any path, deletes any pending code. After enrolling, the page signs in with the
+  new passkey at once and shows its fingerprint, so the operator leaves setup with a passkey
+  proven to work.
+- **Relayed codes:** a code works for whoever redeems it first. The CLI says that a refusal of an
+  unused code means someone else used it; `passkey_enrolled` is logged at `warning` when a setup
+  code enrolled it; `zoeymcp passkeys` lists how and where each passkey was enrolled; and
+  `zoeymcp setup-code --wait` prints the enrolled passkey's fingerprint, to compare with the
+  portal's.
+- **Recovery:** `zoeymcp setup-code` adds a passkey. `zoeymcp setup-code --reset` issues a code
+  whose enrolment removes every other passkey and ends every session; its creation options list
+  no credential, so the authenticator being recovered may answer. It is also the way out of a
+  passkey file that can't be verified, which is moved aside, never overwritten. `zoeymcp passkeys
+  --remove` removes one passkey and ends its sessions. Recovery needs host access, which is the
+  right bar.
+- **Login:** a discoverable passkey (WebAuthn, `userVerification: required`). The login options
+  list no credential, so nothing about the passkeys reaches a caller without a session. Several
+  passkeys can be enrolled, at most 32.
+- **Sessions:** two halves, both needed: an `HttpOnly`, `SameSite=Strict` cookie whose name
+  carries the port (cookies ignore ports, so any server on another `localhost` port receives it),
+  and a token the page keeps in `sessionStorage` and sends as a header, which is also the CSRF
+  token. The vault keeps only their hashes. A session ends after 15 idle minutes, 4 hours after
+  sign-in, at logout (which also sends `Clear-Site-Data: "storage"`), when the vault restarts,
+  when the passkey that made it is removed, at a reset enrolment, and when its origin is removed;
+  ending other sessions needs no step-up. At most 8 are kept, the least recently used giving way.
+  Closing a tab doesn't end a session: browsers restore it.
 - **Verifier:** our own, strict and small, using only `cryptography`, with **no CBOR library** in
   the vault.
-  - **Enrolment:** it requests `attestation: "none"`. The browser's `getPublicKey()` supplies the
-    key in standard DER form, and `getPublicKeyAlgorithm()` the algorithm. The credential ID is
-    read from fixed offsets in `authenticatorData`. If the browser returns no key, enrolment is
-    refused with a clear message. Trust in the new key comes from the session that started the
-    enrolment (setup code or step-up), not from attestation.
+  - **Enrolment:** it requests `attestation: "none"` and offers ES256, EdDSA and RS256, in that
+    order. The public key is read from `authenticatorData` by fixed byte templates for the three
+    algorithms' canonical COSE keys, so no CBOR is parsed; a key in any other encoding is refused
+    ("this authenticator's key encoding isn't supported"). The browser's `getPublicKey()`, when
+    it gives one, must be the same key; Safari's is null for EdDSA and RS256, and the template's
+    key stands. The credential ID is read from fixed offsets and must equal `rawId`. Trust in the
+    new key comes from the session that started the enrolment (a setup code, or step-up), not
+    from attestation.
   - **Assertions:** `authenticatorData` has a fixed layout (site-ID hash, flags, counter). The
     signature covers `authenticatorData` followed by the SHA-256 of `clientDataJSON`, which is
     plain JSON. If the extensions flag is set, the signature still covers the whole byte string,
     but extensions are never parsed.
-  - **Checks:** the request type, a single-use server-side challenge, the exact origin, the
-    site-ID hash, and the user-present and user-verified flags. The signature counter is checked
-    for regressions as a warning only, because many passkeys always report 0.
-  - **Algorithms:** ES256 (`-7`), EdDSA (`-8`), and RS256 (`-257`, for Windows Hello on some
-    TPMs). Nothing else.
+  - **Checks:** the request type, a single-use server-side challenge that commits to the
+    ceremony and its origin, the exact origin, no `crossOrigin` or `topOrigin`, the site-ID hash,
+    the user-present and user-verified flags, the backup flags (a passkey's backup eligibility
+    can't change), and the credential belonging to this origin's RP ID. A counter that goes back
+    is accepted, since many passkeys always report 0, but logged as `critical` and shown as a
+    banner, and the stored value never goes down.
+  - **Algorithms:** ES256 (`-7`), EdDSA (`-8`, Ed25519), and RS256 (`-257`, 2048 to 4096 bits,
+    for Windows Hello on some TPMs). Nothing else.
   - This is the subset of WebAuthn we need, not full spec coverage (no attestation formats, no
     extensions), and the docs say so.
 - **Step-up:** each security-relevant save (the table in §7.1) needs a fresh passkey assertion,
   bound to that request. A stolen session cookie can browse, but it can't change anything that
   matters.
-- **Recovery:** if all passkeys are lost, `docker exec … zoeymcp setup-code` issues a new code,
-  which allows enrolling a new passkey. Recovery therefore needs host access, which is the right
-  bar.
-- **Secure context:** WebAuthn works only on `localhost` or over HTTPS with a valid certificate.
-  Browsers refuse passkeys on pages with certificate errors. So the portal is used through
-  `localhost` (on the host, or via an SSH tunnel), or behind HTTPS with a real certificate (a
-  reverse proxy, or a tailnet's HTTPS certificates). Plain HTTP over the LAN doesn't work, by
-  design.
 
 ### 7.3 Browser hardening
 
