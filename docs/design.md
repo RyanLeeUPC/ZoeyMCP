@@ -2177,54 +2177,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-01 | Portal v1 as a whole: setup code, passkeys, step-up, browser hardening, write-only secrets, OAuth connect, credential health and the ledger view, with the portal's static files in the official image | M5 |
-| D-02 | The portal's TCP listener (`admin.listen`), and how each compose tier exposes it without putting it in reach of the gateway or of agent sandboxes | M5 |
-| D-03 | The setup code's lifecycle: redeemed in the portal, invalidated by the first passkey, and recovery after lost passkeys (R65) | M5 |
-| D-04 | Passkey login with our own WebAuthn verifier, and the passkeys area (R62) | M5 |
-| D-05 | Step-up (a fresh passkey assertion bound to the action) for security-relevant saves, built so M6 and M8 can reuse it | M5 |
-| D-06 | Browser hardening and CSRF defence (R63) | M5 |
-| D-07 | Write-only secret entry in the portal; no endpoint returns a secret (R61) | M5 |
-| D-08 | Credential health in the portal | M5 |
-| D-09 | A read-only policy view in the portal; the generated YAML diffs come with onboarding by URL | M5 (the view); M7 (the diffs) |
-| D-10 | Portal edits keep M2's OAuth binding protections | M5 |
-| D-11 | How an operator reaches the portal in a secure context, and the docs for it | M5 |
-| D-12 | The portal security tests listed in §8.2 | M5 |
-| D-14 | OAuth connect in the portal: pasting the redirected address, and the portal's callback route (D-129) | M5 |
-| D-16 | An upstream "insufficient scope" health finding is kept in memory only, so a restart loses it | M5 |
-| D-20 | Nothing refreshes an idle credential in the background: an "idle for N days" health warning | M5 |
-| D-22 | A credential stuck after a spurious `invalid_grant`: a "try again" action in the portal | M5 |
-| D-23 | A credential's last failure isn't shown after a restart | M5 |
-| D-24 | The portal's ledger view, and the authenticated path that carries the gateway's ledger records to the vault | M5 |
-| D-25 | The vault's SMTP send journal shown next to the ledger | M5 |
-| D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | M5 (the anchor); M8 (vault-side records, D-35) |
-| D-28 | The gateway's entry path still loads vault code | M5 |
-| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | M5, then standing through M7 and M8 |
-| D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | M5 (docs); detection is D-130 |
-| D-66 | The live OAuth smoke test has never been run against a real provider: run it once and record the result | M5 |
-| D-68 | No OAuth acceptance test runs the vault as a separate process | M5 |
-| D-74 | Image-smoke rows planned in M4 and not built: `review` of a toolkit through the uid switch, `ledger --verify`, and approved sends in both tiers | M5 (review, ledger); M8 (the sends, D-71) |
-| D-80 | The image smoke never reaches an upstream MCP server (S10 against a fake upstream) | M5 |
-| D-81 | The `lan` smoke checks one SSE event through Caddy, not that events arrive one by one | M5 |
-| D-87 | The mutation gate (89%) sits well below the score, and there are no per-module floors | M5 |
-| D-88 | Regenerate the mutation shard weights when new modules are mutated | M5 |
-| D-89 | Every new portal decision module is mutation-tested (the rest is D-131) | M5 |
-| D-93 | Linux-only tests are skipped on Windows: the portal tests must run there | M5 |
-| D-100 | design.md isn't fully updated for M4 as built (the CLI, layout, policy sketch and test lists) | M5 |
-| D-103 | The recovery table in [operations.md](operations.md) lacks the SMTP connector row | M5 |
-| D-104 | The README and the example policy describe unbuilt features as existing | M5 for the portal; M6 and M7 for theirs |
-| D-105 | R38's docs note on clients loading tools lazily | M5 |
-| D-106 | The `lan` profile's own-certificate and ACME alternatives are only mentioned | M5 |
-| D-109 | This public register | M5, then refreshed at the end of each milestone |
-| D-112 | Windows hosts' limits aren't recorded as a decision: Linux containers only, Windows and macOS for development | M5 |
-| D-115 | Two admin socket answers return a secret (the gateway key, a setup code): recorded as scoped exceptions to R61, absent from every portal route | M5 |
-| D-116 | No acceptance test or profile for an OAuth credential on a gateway-served remote MCP route | M5 |
-| D-117 | No leak-sweep test for setup codes (R56) or the portal's session material | M5 |
-| D-118 | [threat-model.md](threat-model.md) has no portal actors or limits | M5 |
-| D-119 | Bounds on the portal's unauthenticated endpoints against non-browser callers | M5 |
-| D-120 | The portal shows untrusted text as plain text, with hidden characters revealed | M5 |
-| D-121 | No machine-readable credential health output | M5 |
-| D-123 | How the portal's static UI is tested | M5 |
-| D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | M5 |
+| D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | M5 (open): built; its by-hand checks in [manual-checks.md](manual-checks.md) are still to run |
 
 **M6 (Portal v2).**
 
@@ -2297,7 +2250,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-110 | Release readiness: a security review, the first release, versioning, the README banner, the PR into main | "Useful end to end" (§12.2) |
 | D-124 | No `SECURITY.md` or changelog | The release checklist (§12.2) |
 | D-126 | The image smoke can't probe the portal from a real LAN host | The release checklist: one by-hand probe of both tiers from another machine |
-| D-132 | M5's safe cuts, if any is taken | A cut recorded during M5 |
+| D-144 | Browser checks of the portal not yet run by hand: Safari, an https origin, the OAuth callback and a security key ([manual-checks.md](manual-checks.md)) | Before the first release |
 
 **Backlog.**
 
@@ -2330,15 +2283,69 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-134 | A dev-only headless browser check of the portal's static UI | If the UI's script outgrows its bound, or the manual checks keep finding regressions |
 | D-135 | Other accepted limits of the portal, documented with it | Each when its mitigation changes |
 | D-137 | A leaked sign-in link and a page in the operator's browser can return an attacker's OAuth code first (accepted) | If a provider returns the account identity before the exchange |
+| D-139 | Two portal origins can share one host and port (`http://` and `https://`); the second is unreachable, and `check` doesn't warn | Backlog: a small `check` warning |
+| D-140 | Cookies planted at longer paths from another `localhost` port can lock the operator out of the portal; a denial only (accepted for now) | Backlog |
+| D-142 | On Windows, asyncio prints connection-reset tracebacks to stderr, outside the JSON log | Backlog: Windows is a development host only |
 
 **Closed.**
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
+| D-01 | Portal v1 as a whole: setup code, passkeys, step-up, browser hardening, write-only secrets, OAuth connect, credential health and the ledger view, with the portal's static files in the official image | Done in M5: the portal, with its static files in the official image and checked by the image smoke |
+| D-02 | The portal's TCP listener (`admin.listen`), and how each compose tier exposes it without putting it in reach of the gateway or of agent sandboxes | Done in M5: an egress-only network alias in the hardened tier, loopback publishes in both tiers, and reach checks in the image smoke |
+| D-03 | The setup code's lifecycle: redeemed in the portal, invalidated by the first passkey, and recovery after lost passkeys (R65) | Done in M5: codes issued on the socket or offline, redeemed in the portal, discarded at the first passkey, and a reset code for recovery |
+| D-04 | Passkey login with our own WebAuthn verifier, and the passkeys area (R62) | Done in M5: the verifier, passkey login and the passkeys area |
+| D-05 | Step-up (a fresh passkey assertion bound to the action) for security-relevant saves, built so M6 and M8 can reuse it | Done in M5: a generic registry of step-up actions |
+| D-06 | Browser hardening and CSRF defence (R63) | Done in M5: admission checks, security headers and two-half sessions, also checked in a browser |
+| D-07 | Write-only secret entry in the portal; no endpoint returns a secret (R61) | Done in M5: write-only secrets, with a test that walks every route |
+| D-08 | Credential health in the portal | Done in M5: health in the portal and the CLI |
+| D-09 | A read-only policy view in the portal; the generated YAML diffs come with onboarding by URL | Done in M5 (the view); the diffs come with onboarding by URL (D-32) |
+| D-10 | Portal edits keep M2's OAuth binding protections | Done in M5: portal writes share the CLI's code path; a changed binding needs a rebind |
+| D-11 | How an operator reaches the portal in a secure context, and the docs for it | Done in M5: both tiers publish the portal on host loopback, and operations.md says how to reach it |
+| D-12 | The portal security tests listed in §8.2 | Done in M5: every listed test exists |
+| D-14 | OAuth connect in the portal: pasting the redirected address, and the portal's callback route (D-129) | Done in M5: paste, checked against a real provider, and the callback route (D-129) |
 | D-15 | A fixed-port loopback redirect as the default `redirect_uri` | Declined (§12.1) |
+| D-16 | An upstream "insufficient scope" health finding is kept in memory only, so a restart loses it | Done in M5: labelled "since the vault started" |
+| D-20 | Nothing refreshes an idle credential in the background: an "idle for N days" health warning | Done in M5: an idle finding in health |
+| D-22 | A credential stuck after a spurious `invalid_grant`: a "try again" action in the portal | Done in M5: a reset action behind step-up |
+| D-23 | A credential's last failure isn't shown after a restart | Done in M5: the last failure is read from stored metadata |
+| D-24 | The portal's ledger view, and the authenticated path that carries the gateway's ledger records to the vault | Done in M5: the gateway pushes its records, and the vault keeps a bounded copy that the portal shows |
+| D-25 | The vault's SMTP send journal shown next to the ledger | Done in M5: the ledger view joins the journal and flags sends with no ledger record |
+| D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records are M8 (D-35) |
+| D-28 | The gateway's entry path still loads vault code | Done in M5 |
+| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | Done in M5: stated, with a test that no listener offers them; the constraint stands through M7 and M8 |
+| D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | Done in M5 (the docs); detection is D-130 |
 | D-63 | Network filesystems are unsupported for state | Done |
+| D-66 | The live OAuth smoke test has never been run against a real provider: run it once and record the result | Done in M5: the portless redirect works with a real provider, recorded in [manual-checks.md](manual-checks.md) |
+| D-68 | No OAuth acceptance test runs the vault as a separate process | Done in M5: a test runs a real vault process through the portal's connect |
+| D-74 | Image-smoke rows planned in M4 and not built: `review` of a toolkit through the uid switch, `ledger --verify`, and approved sends in both tiers | Done in M5 (review, ledger); the sends are D-71 |
+| D-80 | The image smoke never reaches an upstream MCP server (S10 against a fake upstream) | Done in M5: a fake upstream over HTTPS in both tiers |
+| D-81 | The `lan` smoke checks one SSE event through Caddy, not that events arrive one by one | Done in M5: the events are checked one by one |
 | D-82 | The standard smoke's reload check can't assert `policy_applied` | Obsolete: the intent is covered |
 | D-84 | The derived gateway image and the standard tier's launcher checks | Done |
+| D-87 | The mutation gate (89%) sits well below the score, and there are no per-module floors | Done in M5: 95% overall, and 95% for each module M5 added |
+| D-88 | Regenerate the mutation shard weights when new modules are mutated | Done in M5: regenerated from a full run with M5's modules |
+| D-89 | Every new portal decision module is mutation-tested (the rest is D-131) | Done in M5; the rest is D-131 |
+| D-93 | Linux-only tests are skipped on Windows: the portal tests must run there | Done in M5: the portal tests run on Windows, with a CI job for them |
 | D-99 | The M4 invariants H1-H16 were missing from §8.2 | Done in M5 |
+| D-100 | design.md isn't fully updated for M4 as built (the CLI, layout, policy sketch and test lists) | Done in M5 |
 | D-101 | §6.1 and §6.2 contradicted M4 as built | Done in M5 |
 | D-102 | §3.1 claimed an official-image warning that doesn't exist yet | Done in M5 |
+| D-103 | The recovery table in [operations.md](operations.md) lacks the SMTP connector row | Done in M5 |
+| D-104 | The README and the example policy describe unbuilt features as existing | Done in M5: the README says what exists, and M6 and M7 features are marked as planned |
+| D-105 | R38's docs note on clients loading tools lazily | Done in M5 |
+| D-106 | The `lan` profile's own-certificate and ACME alternatives are only mentioned | Done in M5: documented in [operations.md](operations.md) |
+| D-109 | This public register | Done in M5; refreshed at the end of each milestone |
+| D-112 | Windows hosts' limits aren't recorded as a decision: Linux containers only, Windows and macOS for development | Done in M5: [operations.md](operations.md) lists the supported platforms |
+| D-115 | Two admin socket answers return a secret (the gateway key, a setup code): recorded as scoped exceptions to R61, absent from every portal route | Done in M5: R61 names the two exceptions |
+| D-116 | No acceptance test or profile for an OAuth credential on a gateway-served remote MCP route | Done in M5: a profile and acceptance tests, by CLI paste and by portal paste |
+| D-117 | No leak-sweep test for setup codes (R56) or the portal's session material | Done in M5: the leak sweep covers every portal answer |
+| D-118 | [threat-model.md](threat-model.md) has no portal actors or limits | Done in M5 |
+| D-119 | Bounds on the portal's unauthenticated endpoints against non-browser callers | Done in M5: caps on unauthenticated requests, rate, connections and bodies |
+| D-120 | The portal shows untrusted text as plain text, with hidden characters revealed | Done in M5 |
+| D-121 | No machine-readable credential health output | Done in M5: `zoeymcp health --json` |
+| D-123 | How the portal's static UI is tested | Done in M5: a thin script tested through the API, static checks of the files, and a recorded by-hand checklist |
+| D-138 | A trailing line break passed checks that must match a whole value | Done in M5: every such check matches the whole value, with a refusal test for each |
+| D-141 | A failed reload stopped the reader of the launcher's control pipe, so a later stop request was lost | Done in M5: the reader logs the failure and goes on |
+| D-143 | The docs didn't say that a phone's passkey provider can report an error after a successful enrolment or sign-in | Done in M5: [operations.md](operations.md) says so |
+| D-132 | M5's safe cuts, if any was taken | Closed in M5: no cut was taken |
