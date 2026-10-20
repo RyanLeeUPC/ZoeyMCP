@@ -1,6 +1,7 @@
 #!/bin/sh
 # Smoke-test a built image: the vault the way the hardened tier runs it (read-only, no capabilities,
-# no-new-privileges, non-root), then the standard tier from deploy/compose.yaml.
+# no-new-privileges, non-root), then the standard tier from deploy/compose.yaml. Both tiers reach
+# a fake upstream (tests/fakes/run_mcp_server.py) with one tools/list and one tools/call.
 # With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
 # compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
 # Usage: scripts/smoke-image.sh [--derived OFFICIAL] IMAGE
@@ -20,14 +21,19 @@ work="$(mktemp -d)"
 port=18080
 examples="$(cd "$(dirname "$0")/../examples" && pwd)"
 deploy="$(cd "$(dirname "$0")/../deploy" && pwd)"
+tests="$(cd "$(dirname "$0")/../tests" && pwd)"
 hardened="--read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:size=16m"
 
-# The standard tier, from deploy/compose.yaml as shipped.
+# The standard tier, from deploy/compose.yaml; once written, standard.yaml swaps in a policy
+# with a real client token and adds the fake upstream.
 standard() {
+    if [ -f "$work/standard.yaml" ]; then
+        set -- -f "$work/standard.yaml" "$@"
+    fi
     ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${key:-unset}"         docker compose -p "$project" -f "$deploy/compose.yaml" "$@"
 }
 # The hardened tier with the lan profile; override.yaml holds a policy with a real client
-# token.
+# token, and the fake upstream.
 hardened_tier() {
     ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${hardened_master:-unset}" \
         ZOEYMCP_GATEWAY_KEY="${gateway_key:-unset}" \
@@ -380,7 +386,149 @@ refused "NoNewPrivs is not set" "$std_box --cap-drop ALL --cap-add SETUID --cap-
 refused "capabilities beyond SETUID and SETGID" "$std_box --security-opt no-new-privileges:true"
 refused "must start as root" "$hardened"
 
-step "standard tier: up, from deploy/compose.yaml"
+step "a client token, and the fake upstream's pins and certificate"
+client="$(docker run --rm "$image" client-token 2>/dev/null)"
+token="$(echo "$client" | sed -n 's/^client_token: //p')"
+token_hash="$(echo "$client" | sed -n 's/^token_sha256: //p')"
+[ -n "$token" ] && [ -n "$token_hash" ] || fail "client-token printed no token"
+# The fake upstream is tests/fakes/run_mcp_server.py, run by the official image's gateway
+# interpreter, the only one with the MCP SDK. .dockerignore keeps tests/ out of the image, so
+# the repository's is mounted. Check refuses MCP over plain http, so the fake serves HTTPS from
+# a throwaway CA, which the vault trusts through certifi's bundle with the CA added, mounted
+# over the bundle its HTTP client reads.
+fake_image="${official:-$image}"
+fake_setup='
+import sys
+from pathlib import Path
+import certifi
+import mcp_types
+from tests.acceptance.tls import issue_cert, make_ca
+from tests.fakes.mcp_server import base_tools
+from zoeymcp.gateway.pins import project_and_pin
+out = Path(sys.argv[1])
+ca = make_ca(out)
+issue_cert(ca, "fake-upstream", out)
+(out / "bundle.pem").write_text(Path(certifi.where()).read_text() + ca.ca_file.read_text())
+for tool in base_tools():
+    if tool["name"] in ("echo", "slow"):
+        print(tool["name"], project_and_pin(mcp_types.Tool.model_validate(tool)).pin)
+'
+mkdir "$work/tls"
+pins="$(docker run --rm --network none -u "$(id -u):$(id -g)" -e PYTHONPATH=/opt/src \
+    -v "$tests:/opt/src/tests:ro" -v "$work/tls:/tls" \
+    --entrypoint /opt/zoeymcp-gateway/bin/python "$fake_image" -c "$fake_setup" /tls)" \
+    || fail "the fake upstream's pins and certificate couldn't be made"
+chmod 0644 "$work/tls/"*
+echo_pin="$(echo "$pins" | sed -n 's/^echo //p')"
+slow_pin="$(echo "$pins" | sed -n 's/^slow //p')"
+[ -n "$echo_pin" ] && [ -n "$slow_pin" ] || fail "no pins for echo and slow: $pins"
+certifi_bundle="$(in_env /opt/zoeymcp -c 'import certifi; print(certifi.where())')"
+[ -n "$certifi_bundle" ] || fail "the vault's environment has no certifi bundle"
+# The smoke's policy after its first lines, indented for ZOEYMCP_CONFIG: the shipped notes
+# server, and a fake server routed to the fake upstream, with echo and slow pinned and allowed.
+smoke_policy() {
+    cat <<EOF
+        credentials:
+          notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+        routes:
+          - name: notes-mcp
+            prefix: /notes
+            upstream: https://mcp.notes.example
+            credential: notes-key
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+          - name: fake-mcp
+            prefix: /fake
+            upstream: https://fake-upstream:9000
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+        gateway:
+          hosts: [gateway, localhost, 127.0.0.1, zoeymcp.lan.example]
+          clients:
+            agent1: {token_sha256: "$token_hash", servers: [notes, fake]}
+          servers:
+            notes: {kind: remote, route: notes-mcp, path: /mcp}
+            fake:
+              kind: remote
+              route: fake-mcp
+              path: /mcp
+              tools: {include: [echo, slow], allow: [echo, slow]}
+              review: {echo: "$echo_pin", slow: "$slow_pin"}
+EOF
+}
+# The vault's volume line that adds the fake upstream's CA to what it trusts.
+vault_trust() {
+    echo "    volumes: [\"$work/tls/bundle.pem:$certifi_bundle:ro\"]"
+}
+# The fake upstream's compose service, on the project's default network unless a networks
+# line follows.
+fake_service() {
+    cat <<EOF
+  fake-upstream:
+    image: $fake_image
+    entrypoint: [/opt/zoeymcp-gateway/bin/python]
+    command: [-m, tests.fakes.run_mcp_server, /tls/fake-upstream.pem, /tls/fake-upstream.key]
+    environment:
+      PYTHONPATH: /opt/src
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp:size=16m]
+    volumes: ["$tests:/opt/src/tests:ro", "$work/tls:/tls:ro"]
+EOF
+}
+# Modern-era requests to the fake server: one tools/list and one tools/call.
+modern=2026-07-28
+meta_keys='"io.modelcontextprotocol/protocolVersion":"'"$modern"'"'
+meta_keys="$meta_keys"',"io.modelcontextprotocol/clientCapabilities":{}'
+list_tools='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{'"$meta_keys"'}}}'
+call_echo='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo",'
+call_echo="$call_echo"'"arguments":{"text":"smoke-echo"},"_meta":{'"$meta_keys"'}}}'
+# fake_mcp BASE BODY CURL-OPTIONS...: a POST of BODY to BASE/s/fake/mcp with the client token;
+# prints the status, and the answer lands in $work/body.
+fake_mcp() {
+    fake_base="$1"
+    fake_body="$2"
+    shift 2
+    curl -s -o "$work/body" -w '%{http_code}' -X POST -H 'content-type: application/json' \
+        -H 'accept: application/json, text/event-stream' -H "authorization: Bearer $token" \
+        -H "mcp-protocol-version: $modern" -d "$fake_body" "$@" "$fake_base/s/fake/mcp" || true
+}
+# fake_round BASE CURL-OPTIONS...: tools/list shows echo and slow but no tool the policy leaves
+# out, and tools/call echo answers, through the vault and the fake upstream.
+fake_round() {
+    round_base="$1"
+    shift
+    i=0
+    until [ "$(fake_mcp "$round_base" "$list_tools" -H 'mcp-method: tools/list' "$@")" = "200" ] \
+        && grep -q '"name":"echo"' "$work/body"; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || fail "tools/list never showed the fake upstream's echo tool"
+        sleep 0.3
+    done
+    grep -q '"name":"slow"' "$work/body" || fail "tools/list doesn't show the fake upstream's slow tool"
+    if grep -q '"name":"add"' "$work/body"; then
+        fail "tools/list shows the fake upstream's add tool, which the policy leaves out"
+    fi
+    [ "$(fake_mcp "$round_base" "$call_echo" -H 'mcp-method: tools/call' -H 'mcp-name: echo' "$@")" \
+        = "200" ] || fail "tools/call echo failed"
+    grep -q '"text":"smoke-echo"' "$work/body" || fail "tools/call echo didn't answer with its text"
+}
+
+step "standard tier: up, from deploy/compose.yaml, with the smoke's policy and the fake upstream"
+cat >"$work/standard.yaml" <<EOF
+services:
+  zoeymcp:
+$(vault_trust)
+    environment:
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+$(smoke_policy)
+$(fake_service)
+EOF
 standard up -d
 i=0
 until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/healthz)" = "200" ]; do
@@ -444,6 +592,9 @@ echo "$out" | grep -q "^notes  " || fail "review lists no notes server"
 docker exec "$std" zoeymcp gateway-status | grep -q '^view sha256:' \
     || fail "gateway-status didn't reach the gateway"
 
+step "standard tier: tools/list and tools/call through the vault to the fake upstream"
+fake_round http://127.0.0.1:8090
+
 step "standard tier: HUP reloads both, through the control pipes"
 docker kill -s HUP "$std" >/dev/null
 i=0
@@ -468,36 +619,21 @@ hardened_master="$(echo "$keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
 gateway_key="$(echo "$keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
 first_key="$gateway_key"
 generation=1
-client="$(docker run --rm "$image" client-token 2>/dev/null)"
-token="$(echo "$client" | sed -n 's/^client_token: //p')"
-token_hash="$(echo "$client" | sed -n 's/^token_sha256: //p')"
-[ -n "$token" ] && [ -n "$token_hash" ] || fail "client-token printed no token"
-# The shipped policy's MCP part, with this run's client token. Compose interpolates the
-# generation.
+# The smoke's policy, with this run's client token, and the vault trusting the fake upstream's
+# CA; compose interpolates the generation. The fake upstream joins egress, the vault's way out,
+# for this run only.
 cat >"$work/override.yaml" <<EOF
 services:
   vault:
+$(vault_trust)
     environment:
       ZOEYMCP_CONFIG: |
         version: 1
         mode: declarative
         gateway_key_generation: \${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
-        credentials:
-          notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
-        routes:
-          - name: notes-mcp
-            prefix: /notes
-            upstream: https://mcp.notes.example
-            credential: notes-key
-            callers: [gateway]
-            stream: true
-            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
-        gateway:
-          hosts: [gateway, localhost, 127.0.0.1, zoeymcp.lan.example]
-          clients:
-            agent1: {token_sha256: "$token_hash", servers: [notes]}
-          servers:
-            notes: {kind: remote, route: notes-mcp, path: /mcp}
+$(smoke_policy)
+$(fake_service)
+    networks: [egress]
 EOF
 hardened_tier up -d
 gateway_fresh() {
@@ -563,6 +699,41 @@ initialize="$initialize"'"capabilities":{},"clientInfo":{"name":"smoke","version
 grep -qi '^content-type: text/event-stream' "$work/headers" || fail "the answer isn't an SSE stream"
 grep -q '^event: message' "$work/body" || fail "no SSE event came through"
 grep -q '"name":"zoeymcp/notes"' "$work/body" || fail "the gateway's serverInfo didn't come through"
+
+step "lan: tools/list and tools/call to the fake upstream, and slow's events one by one"
+lan_base="https://zoeymcp.lan.example:8443"
+fake_round "$lan_base" --cacert "$work/root.crt" --resolve zoeymcp.lan.example:8443:127.0.0.1
+# Four progress events a second apart, then the result. Each must come through Caddy on its
+# own, not held until the call ends.
+call_slow='{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"slow",'
+call_slow="$call_slow"'"arguments":{"steps":4,"interval":1},"_meta":{"progressToken":"smoke",'
+call_slow="$call_slow$meta_keys"'}}}'
+curl -s -N -o "$work/slow" -w '%{http_code}' --cacert "$work/root.crt" \
+    --resolve zoeymcp.lan.example:8443:127.0.0.1 -X POST -H 'content-type: application/json' \
+    -H 'accept: application/json, text/event-stream' -H "authorization: Bearer $token" \
+    -H "mcp-protocol-version: $modern" -H 'mcp-method: tools/call' -H 'mcp-name: slow' \
+    -d "$call_slow" "$lan_base/s/fake/mcp" >"$work/slow-status" &
+slow_pid=$!
+# slow_events PATTERN: how many lines of the slow call's answer so far match PATTERN.
+slow_events() {
+    count="$(grep -c "$1" "$work/slow" 2>/dev/null)" || true
+    echo "${count:-0}"
+}
+for seen in 1 2; do
+    i=0
+    until [ "$(slow_events '"method":"notifications/progress"')" -ge "$seen" ]; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || fail "progress event $seen of the slow call never came through the lan proxy"
+        sleep 0.1
+    done
+    [ "$(slow_events '"result":')" = "0" ] \
+        || fail "progress event $seen came with the result: the lan proxy held the stream back"
+done
+wait "$slow_pid" || fail "the slow call through the lan proxy failed"
+[ "$(cat "$work/slow-status")" = "200" ] || fail "the slow call through the lan proxy wasn't 200"
+grep -q 'done after 4 steps' "$work/slow" || fail "the slow call's result didn't come through"
+
+step "lan: a name missing from gateway.hosts gets 421"
 lan_host=other.lan.example
 hardened_tier up -d lan
 i=0
