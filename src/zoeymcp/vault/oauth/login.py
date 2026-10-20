@@ -266,19 +266,42 @@ class LoginService:
 
     def check_paste(
         self, credential: str, flow_id: str, redirect_url: str, owner: str = CLI_OWNER
-    ) -> None:
+    ) -> dict[str, Any]:
         """Check a pasted address against the flow without taking it (M5 design H.1), so a
-        mistyped paste can be fixed. A provider's error ends the flow: its answer is final."""
+        mistyped paste can be fixed before the portal asks for a passkey. A provider's error
+        ends the flow: its answer is final.
+
+        Then what completing would store: the binding the grant gets, the change from the stored
+        one (refused as ``binding_changed`` unless the login was started with ``rebind``, as
+        the commit would refuse it after spending the code), and the scopes asked for."""
         flow = self._flows.peek(flow_id, credential, owner)
         if flow is None:
             raise _flow_unknown()
         try:
-            self._parse(credential, flow, redirect_url)
+            cred, _ = self._parse(credential, flow, redirect_url)
         except LoginError as exc:
             if exc.reason == "provider_error":
                 self._flows.cancel(flow_id, owner)
                 self._failed(credential, exc)
             raise
+        binding = self._binding(credential, cred)
+        change = None
+        existing = self._tokens.store.entry(slot_key(credential, cred))
+        if existing is not None and existing.binding != binding:
+            if not flow.rebind:
+                raise LoginError(
+                    "binding_changed",
+                    "the policy binds this grant differently; start again with rebind",
+                    details={"old": existing.binding, "new": binding},
+                )
+            change = {"old": existing.binding, "new": binding}
+        return {
+            "rebind": flow.rebind,
+            "binding": binding,
+            "binding_change": change,
+            "requested_scopes": split_scope(cred.scope, cred.scope_separator),
+            "expected_scopes": cred.effective_expected_scopes,
+        }
 
     def cancel(self, flow_id: str, owner: str = CLI_OWNER) -> bool:
         """Drop a pending flow (the CLI does on Ctrl-C)."""

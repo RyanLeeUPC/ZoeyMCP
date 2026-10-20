@@ -186,6 +186,8 @@ def test_the_list_shows_names_and_metadata_never_a_value(
         (
             "binding_shown",
             "created",
+            "health",
+            "health_shown",
             "key_id",
             "live_slot",
             "name",
@@ -193,6 +195,13 @@ def test_the_list_shows_names_and_metadata_never_a_value(
             "updated",
         )
     }
+    # Health per entry (G, I.1): the two the policy uses are bound as it uses them; the live
+    # slot is one no credential keeps (broker-mcp's refresh token is a store entry, not a seed).
+    assert [(s["health"], s["health_shown"]) for s in listed] == [
+        ([], "ok"),
+        ([], "ok"),
+        ([{"code": "orphan_slot", "level": "info"}], "orphan_slot (info)"),
+    ]
     stats = listed[1]
     assert stats["binding_shown"] == "sent to https://api.stats.example:443"
     assert stats["created"].endswith(" UTC")

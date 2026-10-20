@@ -196,8 +196,8 @@ def test_no_sink_and_no_absolute_url(name: str) -> None:
     text = read(name)
     code = code_of(text) if name.endswith(".js") else text
     assert sinks_in(code) == []
-    # The one absolute URL the page may hold is the https check of an authorization link
-    # (C.4), which step 14a adds; none yet.
+    # The https check of the authorization link (C.4) compares the protocol only, so the page
+    # holds no absolute URL at all.
     assert ABSOLUTE_URL.findall(code) == []
     if name.endswith(".css"):
         assert "@import" not in text
@@ -240,6 +240,39 @@ def test_every_button_runs_its_handler_once_at_a_time() -> None:
     assert re.search(r"function button\(label, handler\) \{[^}]*guard\(element, handler\);", code)
     # Every other listener is the dialog's Escape, which no click can repeat.
     assert re.findall(r"addEventListener\(\"(\w+)\"", code) == ["click", "cancel"]
+
+
+class Anchors(HTMLParser):
+    """Every <a>'s attributes, by its id."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.anchors: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        found = dict(attrs)
+        if tag == "a" and found.get("id"):
+            self.anchors[str(found["id"])] = found
+
+
+def test_the_authorization_link_opens_alone() -> None:
+    """C.4, O.6 item 9: the provider's sign-in page opens from a link to a new tab with no
+    opener and no referrer; the page sets its address by property, and only to an https URL
+    the vault sent, never through a redirect or window.open."""
+    parser = Anchors()
+    parser.feed(read("index.html"))
+    assert parser.anchors == {
+        "connect-link": {
+            "id": "connect-link",
+            "target": "_blank",
+            "rel": "noopener noreferrer",
+        }
+    }
+    code = code_of(read("app.js"))
+    check = code.index('const https = new URL(started.authorize_url).protocol === "https:";')
+    assigned = code.index('$("connect-link").href = https ? started.authorize_url : "";')
+    assert check < assigned
+    assert code.count(".href =") == 1
 
 
 class Inputs(HTMLParser):

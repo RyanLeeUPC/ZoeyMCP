@@ -117,6 +117,14 @@ CONFIRM: Final = Route(
 CANCEL: Final = Route("DELETE", "/api/actions/{action}", FULL)
 # Step 13: the secret list, names and metadata only (G). Writing and deleting are actions.
 SECRETS: Final = Route("GET", "/api/secrets", FULL)
+# Step 14a: health (I), the OAuth credentials and connect by paste (H.1). A start writes no
+# grant (a client_credentials start is a test fetch); completing and resetting are actions.
+HEALTH: Final = Route("GET", "/api/health", FULL)
+OAUTH: Final = Route("GET", "/api/oauth", FULL)
+OAUTH_START: Final = Route(
+    "POST", "/api/oauth/{credential}/start", FULL, BODY_EMPTY, optional=frozenset({"rebind"})
+)
+FLOW_CANCEL: Final = Route("DELETE", "/api/oauth/flows/{flow}", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -130,6 +138,10 @@ ROUTES: Final[tuple[Route, ...]] = (
     ENROL_FINISH,
     PASSKEYS,
     SECRETS,
+    HEALTH,
+    OAUTH,
+    OAUTH_START,
+    FLOW_CANCEL,
     ACTIONS,
     CONFIRM,
     CANCEL,

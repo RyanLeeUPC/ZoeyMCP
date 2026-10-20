@@ -10,7 +10,9 @@
 (function () {
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
-  const PAGES = ["blocked", "login", "setup", "home", "sessions", "passkeys", "secrets"];
+  const PAGES = [
+    "blocked", "login", "setup", "home", "credentials", "sessions", "passkeys", "secrets",
+  ];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
@@ -50,9 +52,17 @@
     portal: "from a signed-in session",
   };
 
+  // The buttons for health's actions (I.1); the vault words every other action (todo).
+  const ACTION_TEXT = { connect: "Connect", reset: "Try again", add_passkey: "Add a passkey",
+    set_secret: "Set it on the Secrets page", delete_secret: "See the Secrets page",
+    review_passkeys: "Review the passkeys" };
+  const SECTION = { credential: "Credential", connector: "Connector", store: "The store",
+    passkeys: "Passkeys", ledger_copy: "The reported ledger" };
+
   let pending = null; // the action being confirmed: its ID, step-up options and what follows
   let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created
   let renaming = null; // the fingerprint the rename form is for
+  let connecting = null; // the connect dialog's credential and, once started, its flow
 
   function $(id) {
     return document.getElementById(id);
@@ -174,6 +184,9 @@
         "(" + session.credential + ")";
     $("bar-ends").textContent =
       "Session ends by " + when(session.expires_at) + ", or after 15 idle minutes";
+    const counts = session.health_summary;
+    $("bar-health").textContent = counts === null ? "" :
+      "Health: " + counts.error + " error(s), " + counts.warning + " warning(s)";
   }
 
   function renderBanners(banners) {
@@ -220,7 +233,176 @@
     $("home-text").textContent =
       "Signed in on " + session.origin + ". Passkeys enrolled for " + session.rp_id + ": " +
       session.passkeys_here + ".";
-    show("home");
+    try {
+      const health = await api("GET", "/api/health");
+      $("home-ready").textContent = health.summary.error + health.summary.warning ?
+        "What needs you, errors first:" : "Everything is ready.";
+      renderFindings($("checklist"), health.checklist);
+      show("home");
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
+  // --- health and credentials (I, H) ----------------------------------------------------------
+
+  function actionControl(action) {
+    const runs = {
+      connect: () => connect(action.credential, false),
+      reset: () => prepare("oauth.reset", { credential: action.credential }, afterReset),
+      set_secret: () => showSecrets(String(action.ref).replace(/^store:/, "")),
+      delete_secret: () => showSecrets(action.secret),
+      add_passkey: showPasskeys,
+      review_passkeys: showPasskeys,
+    };
+    const run = action ? runs[action.kind] : undefined;
+    return run === undefined ? "" : button(ACTION_TEXT[action.kind], run);
+  }
+
+  function renderFindings(list, findings) {
+    list.replaceChildren();
+    for (const finding of findings) {
+      const item = document.createElement("li");
+      item.textContent = finding.level + ", " + SECTION[finding.section] +
+        (finding.name_shown === null ? "" : " " + finding.name_shown) + ": " +
+        finding.text_shown + (finding.advisory ? " (from stored metadata). " : ". ") +
+        (finding.todo === null ? "" : finding.todo + " ");
+      item.append(actionControl(finding.action));
+      list.append(item);
+    }
+  }
+
+  async function showCredentials() {
+    clearError();
+    try {
+      const health = await api("GET", "/api/health");
+      const oauth = await api("GET", "/api/oauth");
+      const list = $("credential-list");
+      list.replaceChildren();
+      for (const credential of health.credentials) {
+        const entry = oauth.credentials.find((one) => one.credential === credential.name);
+        const item = document.createElement("li");
+        item.textContent = credential.name_shown + " (" + credential.kind + "): " +
+          credential.level + "; used by " + (credential.routes.join(", ") || "no route") + "." +
+          (entry === undefined ? " " : " " + entry.text_shown + " ");
+        if (entry !== undefined && entry.connect !== null) {
+          item.append(button(entry.connect === "test" ? "Test it" : "Connect",
+            () => connect(entry.credential, false)));
+        }
+        const findings = document.createElement("ul");
+        renderFindings(findings, credential.findings);
+        item.append(findings);
+        list.append(item);
+      }
+      show("credentials");
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
+  // H.1: start a sign-in this session owns; for client_credentials, the start is a test fetch.
+  async function connect(name, rebind) {
+    clearError();
+    closeConnect();
+    let started;
+    try {
+      started = await api(
+        "POST", fill("/api/oauth/{credential}/start", { credential: name }), { rebind: rebind }
+      );
+    } catch (error) {
+      const moved = error instanceof Refused && error.reason === "binding_changed";
+      return moved ? openConnect(name, null, error) : afterFailure(error);
+    }
+    if (started.flow === undefined) {
+      await showCredentials();
+      $("status").textContent = "The client credentials work: " + started.text_shown;
+      return;
+    }
+    openConnect(name, started, null);
+  }
+
+  // The link opens in a new tab with no opener, its address set only if it is https (C.4).
+  function openConnect(name, started, refused) {
+    connecting = { credential: name, flow: started === null ? null : started.flow };
+    $("connect-steps").hidden = started === null;
+    $("connect-rebind").hidden = started !== null;
+    connectError(refused === null ? "" : refused.message);
+    if (started === null) {
+      renderSummary("connect-summary", [["Bound until now", refused.answer.old_shown],
+        ["The policy now binds it to", refused.answer.new_shown]]);
+    } else {
+      const change = started.binding_change_shown;
+      renderSummary("connect-summary", [
+        ["Connect", started.name_shown],
+        ["Scopes asked for", started.requested_scopes_shown.join(" ") || "none"],
+        ["Scopes expected", started.expected_scopes_shown.join(" ") || "none"],
+        ["Its tokens go to", started.binding_shown],
+      ].concat(change === null ? [] : [["Bound until now", change.old]]));
+      const https = new URL(started.authorize_url).protocol === "https:";
+      $("connect-link").hidden = !https;
+      $("connect-link").href = https ? started.authorize_url : "";
+      $("connect-replaced").textContent = started.replaced === null ? "" :
+        "This replaced a sign-in pending in " +
+        (started.replaced === "cli" ? "zoeymcp login." : "the portal.");
+      $("connect-redirect").textContent = started.redirect_uri_shown;
+      $("connect-by").textContent = when(started.expires);
+    }
+    $("connect").showModal();
+  }
+
+  function connectError(text) {
+    $("connect-error").textContent = text;
+    $("connect-error").hidden = text === "";
+  }
+
+  // The paste is the oauth.complete action's data: the vault checks it before any prompt.
+  async function checkPaste() {
+    const held = connecting;
+    connectError("");
+    const pasted = $("connect-paste").value.trim();
+    const data = { credential: held.credential, flow: held.flow, redirect_url: pasted };
+    try {
+      const prepared = await api("POST", "/api/actions", { kind: "oauth.complete", data: data });
+      closeConnect();
+      openConfirm(prepared, afterConnected, "Exchanging the code with the provider...");
+    } catch (error) {
+      if (signedOut(error)) {
+        closeConnect();
+        return afterFailure(error);
+      }
+      const said = error.answer && error.answer.description_shown; // provider_error's (H.3)
+      connectError(textOf(error) + (said ? " The answer carried this text: " + said : ""));
+    }
+  }
+
+  async function cancelConnect() {
+    const held = connecting;
+    closeConnect();
+    if (held !== null && held.flow !== null) {
+      // A refusal other than a signed-out one means the sign-in had already ended.
+      await api("DELETE", fill("/api/oauth/flows/{flow}", { flow: held.flow })).catch(
+        (error) => signedOut(error) && afterFailure(error));
+    }
+  }
+
+  function closeConnect() {
+    connecting = null;
+    $("connect-paste").value = "";
+    if ($("connect").open) {
+      $("connect").close();
+    }
+  }
+
+  async function afterConnected(result) {
+    closeConfirm();
+    await showCredentials();
+    $("status").textContent = "Connected " + result.name_shown + ": " + result.text_shown;
+  }
+
+  async function afterReset() {
+    closeConfirm();
+    await showCredentials();
+    $("status").textContent = "Failures cleared: the next request that needs a token tries once.";
   }
 
   // --- login and setup (E, F.2) ---------------------------------------------------------------
@@ -458,8 +640,12 @@
 
   // --- secrets (G): names and metadata only; a value is entered, never shown ------------------
 
-  async function showSecrets() {
+  // From a health action, the name its finding is about goes in the name field.
+  async function showSecrets(name) {
     clearError();
+    if (typeof name === "string") {
+      $("secret-name").value = name;
+    }
     try {
       const answer = await api("GET", "/api/secrets");
       const list = $("secret-list");
@@ -470,7 +656,8 @@
         text.textContent =
           secret.name_shown + ": " + secret.binding_shown + "; set " + secret.created +
           ", last replaced " + secret.updated + ", under key " + secret.key_id +
-          (secret.live_slot ? "; the vault keeps a credential's live token here" : "") + ".";
+          (secret.live_slot ? "; the vault keeps a credential's live token here" : "") +
+          (secret.health_shown === null ? "" : "; health: " + secret.health_shown) + ".";
         item.append(text);
         if (!secret.live_slot) {
           item.append(
@@ -544,20 +731,24 @@
   async function prepare(kind, data, done) {
     clearError();
     try {
-      const prepared = await api("POST", "/api/actions", { kind: kind, data: data });
-      pending = { action: prepared.action, options: prepared.options, done: done };
-      creating = null;
-      renderSummary("confirm-summary", prepared.summary);
-      renderSummary("confirm-now", []);
-      $("confirm-now-label").hidden = true;
-      $("confirm-expires").textContent = "Confirm by " + when(prepared.expires) + ".";
-      confirmError("");
-      $("confirm-passkey").hidden = false;
-      $("confirm-create").hidden = true;
-      $("confirm").showModal();
+      openConfirm(await api("POST", "/api/actions", { kind: kind, data: data }), done, "");
     } catch (error) {
       afterFailure(error);
     }
+  }
+
+  // ``working`` is what the dialog says while a slow confirm runs (an exchange: up to 76 s).
+  function openConfirm(prepared, done, working) {
+    pending = { action: prepared.action, options: prepared.options, done: done, working: working };
+    creating = null;
+    renderSummary("confirm-summary", prepared.summary);
+    renderSummary("confirm-now", []);
+    $("confirm-now-label").hidden = true;
+    $("confirm-expires").textContent = "Confirm by " + when(prepared.expires) + ".";
+    confirmError("");
+    $("confirm-passkey").hidden = false;
+    $("confirm-create").hidden = true;
+    $("confirm").showModal();
   }
 
   function renderSummary(id, summary) {
@@ -594,6 +785,9 @@
     }
     pending = null; // the confirm spends the action, whatever it answers
     $("confirm-passkey").hidden = true;
+    if (held.working) {
+      $("confirm-expires").textContent = held.working;
+    }
     try {
       const result = await api(
         "POST",
@@ -693,6 +887,7 @@
     on("setup-enrol", enrol);
     on("setup-login", signIn);
     on("nav-home", enter);
+    on("nav-credentials", showCredentials);
     on("nav-sessions", showSessions);
     on("nav-passkeys", showPasskeys);
     on("nav-secrets", showSecrets);
@@ -704,11 +899,16 @@
     on("confirm-passkey", confirmAction);
     on("confirm-create", createPasskey);
     on("confirm-cancel", cancelAction);
-    // Escape closes the dialog: the held action is dropped too.
-    $("confirm").addEventListener("cancel", function (event) {
-      event.preventDefault();
-      cancelAction();
-    });
+    on("connect-check", checkPaste);
+    on("connect-close", cancelConnect);
+    on("connect-rebind", () => connect(connecting.credential, true));
+    // Escape closes a dialog: the held action, or the pending sign-in, is dropped too.
+    for (const [id, close] of [["confirm", cancelAction], ["connect", cancelConnect]]) {
+      $(id).addEventListener("cancel", function (event) {
+        event.preventDefault();
+        close();
+      });
+    }
     on("sign-out", signOut);
     enter();
   }

@@ -17,6 +17,7 @@ fail. Record no account names, addresses or other personal details.
 | --- | --- |
 | 1-7, 10, 11 | step 11 (setup, enrolment, login, logout and sessions) |
 | 8, 9 | step 14a (OAuth connect by paste) |
+| D-66 | step 14a: the live OAuth test against a real provider (its own section below) |
 | 13, 14 | step 14b (the OAuth callback) |
 | 12 | no step waits on it (the portal tests cover it); run it with 1-7 |
 | 15 | step 13 (secrets) |
@@ -77,10 +78,39 @@ view.
    open `https://zoeymcp.tailnet.example/` and choose **Sign in with a passkey**. Pass: the
    browser doesn't offer the `localhost` passkey (it offers none, or only ones enrolled on that
    name).
-8. **Step-up shows the summary first** (step 14a). Prepare a change that needs a passkey. Pass:
-   the summary shows before the passkey prompt; cancelling the prompt changes nothing.
-9. **The authorization link** (step 14a). Start a connect. Pass: the link opens a new tab, and
-   in it `window.opener` is `null` (the console of the new tab).
+8. **Step-up shows the summary first** (step 14a). With two passkeys enrolled, open
+   **Passkeys**, choose **Rename** on one and give a new name. Pass: the dialog shows what the
+   vault will do (the passkey, its name now, the new name) before any passkey prompt; choose
+   **Confirm with your passkey** and cancel the browser's prompt: the dialog says the prompt was
+   cancelled, **Close** it, and the passkey keeps its name (no `passkey_renamed` in the log).
+   Then, with the policy below, open **Credentials**, choose **Connect** on `demo`, paste
+   `http://127.0.0.1/callback?code=x&state=wrong` and choose **Check the address**. Pass: the
+   dialog says the address belongs to another login, and no passkey prompt opens.
+9. **The authorization link** (step 14a). Add the policy below to `portal.yaml`, restart the
+   vault and sign in. Open **Credentials** and choose **Connect** on `demo`, then the dialog's
+   link. Pass: it opens example.com in a new tab, and in that tab's console `window.opener` is
+   `null`; the Network panel shows the request to example.com without a `Referer` header. Close
+   the tab and choose **Cancel** in the dialog.
+
+   ```yaml
+   credentials:
+     demo:
+       kind: oauth2
+       token_url: https://example.com/token
+       authorize_url: https://example.com/authorize
+       client_id: manual-check-client
+       client_auth: none
+       rotates: true
+       scope: read
+       refresh_token: store:demo-refresh
+   routes:
+     - name: demo
+       prefix: /demo
+       upstream: https://example.com
+       credential: demo
+       callers: [{placeholder: ph-manual-demo-0001}]
+       rules: [{methods: [GET], paths: ["/**"]}]
+   ```
 10. **A neighbour on another `localhost` port.** Serve a page on another port: put this in
     `neighbour.html` and run `python -m http.server 9000` in its directory, then open
     `http://localhost:9000/neighbour.html` in the browser that is signed in to the portal:
@@ -118,6 +148,51 @@ view.
     value, choose **Store**, confirm with the passkey. Pass: the browser doesn't offer to save the
     value as a password (and no password manager fills or stores it); after the confirm the value
     field is empty; the page's elements (developer tools, Elements) hold no copy of the value.
+
+## D-66: the live OAuth test against a real provider
+
+Run once before step 14a's acceptance, with a provider client of your own; CI never runs it.
+Record it in the results table as item `D-66`: the commit, the date, the provider and client
+type (for example "Google, Desktop app client"), pass or fail per part, and what the provider
+showed when something failed. Record no account name, email address, client ID or secret, and
+keep no token: everything below runs in a temporary directory.
+
+1. **The authorization request.** Register a Desktop app OAuth client with Google (the client
+   type `profiles/google-oauth.yaml` names); the vault sends the default redirect URI
+   `http://127.0.0.1/callback`, with no port, which a Desktop client is expected to accept
+   without registering it. Then:
+
+   ```sh
+   ZOEYMCP_LIVE_GOOGLE_CLIENT_ID=<the client ID> \
+     pytest tests/acceptance/test_oauth_live.py -v -k portless
+   ```
+
+   Pass: `test_google_accepts_the_portless_loopback_redirect` passes (the sign-in page loads,
+   with no `redirect_uri_mismatch`). With a Spotify app whose redirect URI is
+   `http://127.0.0.1/callback`, `ZOEYMCP_LIVE_SPOTIFY_CLIENT_ID` runs the Spotify test too.
+2. **A connect by paste.** Run a vault with `profiles/google-oauth.yaml` (its `client_id`
+   replaced by yours, the route's placeholder by any value) and the `admin` block of the setup
+   above, sign in to the portal, and set `google-client-secret` on the **Secrets** page. On
+   **Credentials**, choose **Connect** on `google-calendar`, open the link, approve, copy the
+   address the tab lands on (it doesn't load) and paste it. Pass: the dialog shows the summary,
+   the passkey confirms it, and the result says granted
+   `https://www.googleapis.com/auth/calendar.readonly`; **Credentials** shows the credential
+   `ok`; `zoeymcp oauth status google-calendar` agrees; the vault's log has
+   `oauth_login_completed` and no code, token or pasted address.
+3. **A refresh.** With the client secret and a refresh token of a throwaway grant:
+
+   ```sh
+   ZOEYMCP_LIVE_GOOGLE_CLIENT_ID=<the client ID> \
+   ZOEYMCP_LIVE_GOOGLE_CLIENT_SECRET=<the client secret> \
+   ZOEYMCP_LIVE_GOOGLE_REFRESH_TOKEN=<the refresh token> \
+     pytest tests/acceptance/test_oauth_live.py -v -k refresh
+   ```
+
+   Pass: `test_google_refresh_and_calendar_list` passes. Revoke the grant in the Google account
+   afterwards.
+
+If the provider refuses the portless redirect, record what it showed and stop: a profile override
+with a fixed `redirect_uri` is the fallback, decided then.
 
 ## Results
 

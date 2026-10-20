@@ -29,6 +29,7 @@ from zoeymcp.portal.refusals import (
     secret,
     wrong_host_literal,
 )
+from zoeymcp.portal.refusals import login as login_refusal
 from zoeymcp.vault import admin, secretplan, store
 from zoeymcp.vault.oauth import login, pkce
 from zoeymcp.vault.secretplan import SecretRefusal
@@ -350,6 +351,55 @@ def test_exchange_failed_takes_its_code() -> None:
     # Only exchange_failed carries a code.
     with pytest.raises(ValueError, match="code"):
         refusal("flow_unknown:x")
+
+
+def test_more_fields_go_beside_the_text() -> None:
+    made = Refusal(409, "binding_changed", "text", (("old_shown", "a"), ("new_shown", "b")))
+    assert made.body() == {
+        "old_shown": "a",
+        "new_shown": "b",
+        "error": "text",
+        "reason": made.reason,
+    }
+    # They can't replace the text or the reason.
+    clash = Refusal(400, "bad_body", "text", (("error", "x"), ("reason", "y")))
+    assert clash.body() == {"error": "text", "reason": "bad_body"}
+    assert refusal("busy").more == ()
+
+
+@pytest.mark.parametrize(
+    ("reason", "text"),
+    [
+        ("no_route", "The policy can't bind it: no route uses x. Fix the policy."),
+        ("provider_error", "The answer said the provider refused: access_denied"),
+        (
+            "redirect_mismatch",
+            "That isn't the address the provider sent you to; it starts with "
+            "http://127.0.0.1/callback.",
+        ),
+        (
+            "exchange_failed:oauth_client_rejected",
+            "The provider's token endpoint didn't take the sign-in (oauth_client_rejected). "
+            "Connect again.",
+        ),
+        ("flow_unknown", TEXTS["flow_unknown"]),
+        ("too_many_flows", CATALOGUE["too_many_flows"].text),
+    ],
+)
+def test_a_login_refusal_fills_what_its_text_names(reason: str, text: str) -> None:
+    made = login_refusal(
+        reason,
+        detail="no route uses x",
+        error="access_denied",
+        redirect_uri="http://127.0.0.1/callback",
+    )
+    assert made == Refusal(CATALOGUE[reason.partition(":")[0]].status, reason, text)
+
+
+def test_a_provider_error_without_a_code() -> None:
+    made = login_refusal("provider_error", detail="the provider refused")
+    assert made.error == "The answer said the provider refused: no error code"
+    assert login_refusal("redirect_mismatch", detail="x").error.endswith("it starts with .")
 
 
 def test_an_enrolment_refusal() -> None:

@@ -194,6 +194,7 @@ def running(
                 passkeys=vault.passkeys,
                 login=vault.login,
                 secrets=app.secrets,
+                health=app.health,
                 routes=routes,
                 handlers=handlers,
                 body_deadline=body_deadline,

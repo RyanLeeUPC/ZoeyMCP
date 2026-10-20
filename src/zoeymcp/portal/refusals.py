@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from string import Formatter
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from .display import SUMMARY_LIMIT, shown
 from .webauthn import MAX_PASSKEYS, Reason
@@ -28,14 +28,16 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class Refusal:
     """An answer the portal refuses with: its status, and :meth:`body`, sent with C.3's
-    headers."""
+    headers. ``more`` adds fields beside the text, each already fit to show (a provider's
+    description, the bindings a ``binding_changed`` compares)."""
 
     status: int
     reason: str
     error: str
+    more: tuple[tuple[str, Any], ...] = ()
 
-    def body(self) -> dict[str, str]:
-        return {"error": self.error, "reason": self.reason}
+    def body(self) -> dict[str, Any]:
+        return {**dict(self.more), "error": self.error, "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -291,6 +293,17 @@ def secret(plan: SecretRefusal, *, name: str) -> Refusal:
     return Refusal(
         plan.status, plan.reason, _filled(text, {k: v for k, v in offered.items() if k in wanted})
     )
+
+
+def login(reason: str, *, detail: str, error: str | None = None, redirect_uri: str = "") -> Refusal:
+    """A refused OAuth start, paste check or completion (H.3): the reason and status the socket
+    answers (operations.md §2), and the portal's text, filled with what it names: ``detail``
+    (the vault's own message, for a policy that can't bind the grant), the provider's filtered
+    ``error`` code, or the credential's ``redirect_uri``. ``exchange_failed:<code>`` takes its
+    code as :func:`refusal` does."""
+    offered = {"detail": detail, "error": error or "no error code", "redirect_uri": redirect_uri}
+    wanted = _names(CATALOGUE[reason.partition(":")[0]].text) - {"code"}
+    return refusal(reason, **{k: v for k, v in offered.items() if k in wanted})
 
 
 def wrong_host_literal(authority: str) -> Refusal:

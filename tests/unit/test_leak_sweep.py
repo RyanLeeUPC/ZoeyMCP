@@ -5,13 +5,16 @@ promotion, rotation, the upstream 401 path, a revoked grant whose token endpoint
 refresh token in ``error_description``, bad pastes, a provider error, a reused code, and a
 client_credentials test fetch with a rejected client, then the listings and health. Secrets are
 written over the admin socket and through the portal's Secrets actions (M5 design G), one
-refused and one left held by a pending action. Every log line, admin answer, portal answer, CLI
+refused and one left held by a pending action. The portal connects by paste too (M5 design H.1):
+a paste for another login, a provider's refusal, and a connect confirmed with a passkey, then
+its credential list and health. Every log line, admin answer, portal answer, CLI
 output and proxied response is collected, and none may hold a token, code, verifier, ``state``,
 client secret or ``error_description`` text from the fakes.
 
 Two things are shown by design and are taken out before the sweep: the authorization URL (it
 holds ``state`` and the PKCE challenge, useless without the verifier the vault keeps), and the
-``error_description`` of a provider's redirect, which goes back to the operator's CLI only.
+``error_description`` of a provider's redirect, which goes back to the operator only (the CLI,
+or the portal's refused ``oauth.complete``).
 
 The gateway's view of the policy gets its own sweep: built from a policy with every vault-side
 value filled in, it may hold none of them (M3 design D.1, invariant G1).
@@ -48,7 +51,7 @@ from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.portal.app import PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.vault import logs
-from zoeymcp.vault.admin import AdminApp, SetupCodes
+from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
@@ -222,6 +225,12 @@ class World:
             passkeys=Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json"),
             login=login,
             secrets=Secrets(self.store, self.tokens, lambda: self.policy),
+            health=HealthReader(
+                self.store,
+                lambda: self.policy,
+                login,
+                env_names=lambda: self.vault.env_names,
+            ).report,
         )
         self.passkey = SoftAuthenticator()
         self.page: Recording | None = None
@@ -258,6 +267,16 @@ class World:
     async def portal(self, kind: str, data: dict[str, Any]) -> httpx.Response:
         """A step-up action, prepared and confirmed as the Secrets page does."""
         return await step_up(await self.portal_page(), self.passkey, kind, data)
+
+    async def portal_start(self, credential: str) -> dict[str, Any]:
+        """A connect started in the portal (H.1); its URL and flow are kept, as the admin's."""
+        page = await self.portal_page()
+        started = await page.call("POST", f"/api/oauth/{credential}/start", {})
+        assert started.status_code == 200, started.text
+        answer: dict[str, Any] = started.json()
+        self.authorize_urls.append(answer["authorize_url"])
+        self.flows.append(answer["flow"])
+        return answer
 
     async def browse(self, url: str) -> str:
         """Play the browser: approve, and return the address the browser is sent to."""
@@ -431,6 +450,27 @@ async def test_nothing_secret_leaves_the_vault(
     # The code itself is the sentinel: it matches ISSUED wherever it shows up.
     assert world.spotify.calls[-1].params["code"] == dict(parse_qsl(urlsplit(used).query))["code"]
 
+    # music through the portal (M5 design H.1): a paste for another login and a provider's
+    # refusal, both refused before any prompt, then a connect by paste after a step-up.
+    page = await world.portal_page()
+    begun = await world.portal_start("music")
+    pasted = await world.browse(begun["authorize_url"])
+    data = {"credential": "music", "flow": begun["flow"]}
+    wrong = {**data, "redirect_url": with_query(pasted, state="another-login")}
+    other = await page.call("POST", "/api/actions", {"kind": "oauth.complete", "data": wrong})
+    assert other.json()["reason"] == "state_mismatch"
+    connected = await world.portal("oauth.complete", {**data, "redirect_url": pasted})
+    assert connected.status_code == 200, connected.text
+    begun = await world.portal_start("music")
+    state = dict(parse_qsl(urlsplit(begun["authorize_url"]).query))["state"]
+    refused = f"{REDIRECT}?" + urlencode(
+        {"error": "access_denied", "error_description": SENTINEL, "state": state}
+    )
+    data = {"credential": "music", "flow": begun["flow"], "redirect_url": refused}
+    denied = await page.call("POST", "/api/actions", {"kind": "oauth.complete", "data": data})
+    assert denied.json()["description_shown"] == SENTINEL
+    await page.call("GET", "/api/oauth")
+
     # calendar: the env seed is promoted, then superseded by a login.
     assert (await world.proxy("calendar")).status_code == 200
     done = await world.login("calendar")
@@ -489,6 +529,8 @@ async def test_nothing_secret_leaves_the_vault(
     await world.cli(["oauth", "status"])
     await world.cli(["secret", "list"])
     await world.admin("GET", "/health")
+    await page.call("GET", "/api/health")
+    await page.call("GET", "/api/oauth")
     assert (await world.cli(["health"]))[1]
     assert (await world.cli(["health", "--json"]))[1]
 
@@ -496,10 +538,10 @@ async def test_nothing_secret_leaves_the_vault(
     log_text = log_lines.getvalue()
     assert log_text
     secrets = world.secrets()
-    # Every kind of value was really in play: five code exchanges (one with a used code), and
-    # codes and refresh tokens from all three kinds of grant.
-    assert len(set(world.verifiers())) == 5
-    assert len(set(world.states())) == len(world.authorize_urls) == 7
+    # Every kind of value was really in play: six code exchanges (one with a used code, one
+    # from the portal), and codes and refresh tokens from all three kinds of grant.
+    assert len(set(world.verifiers())) == 6
+    assert len(set(world.states())) == len(world.authorize_urls) == 9
     kinds = {value.rsplit("-", 2)[1] for value in world.issued()}
     assert kinds == {"code", "rt"}
     assert any(c.status == 400 for c in world.google.calls if c.grant_type == "refresh_token")
@@ -532,8 +574,10 @@ async def test_nothing_secret_leaves_the_vault(
         raw = setup_code.replace("-", "")
         for form in (setup_code, raw, raw.lower(), *setup_code.split("-")):
             assert form not in log_text
-    # The description reached the operator, and only through the failed completion.
+    # The description reached the operator, and only through the failed completion: one admin
+    # answer and one portal answer.
     assert sum(SENTINEL in text for text in world.admin_answers) == 1
+    assert sum(SENTINEL in text for text in world.portal_answers) == 1
     assert world.authorize_urls
     for url in world.authorize_urls:
         query = dict(parse_qsl(urlsplit(url).query))

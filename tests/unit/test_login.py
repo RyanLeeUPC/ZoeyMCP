@@ -1313,6 +1313,55 @@ async def test_a_provider_error_in_a_paste_ends_the_flow(
     assert "The user said no" not in captured.text
 
 
+async def test_a_paste_check_says_what_completing_stores(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock, expected_scopes=["user-top-read"])
+    flow, pasted = await rig.approved(owner=SESSION)
+    assert rig.login.check_paste("music", flow, pasted, SESSION) == {
+        "rebind": False,
+        "binding": BINDING,
+        "binding_change": None,
+        "requested_scopes": SPOTIFY_SCOPES,
+        "expected_scopes": ["user-top-read"],
+    }
+
+
+async def test_a_paste_check_refuses_a_changed_binding_without_rebind(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    """The policy moved after the start: refused before any prompt, the flow left for a start
+    with rebind; the commit would refuse it only after spending the code."""
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved()
+    rig.store.put("music-refresh", "fake-rt-old", OTHER_BINDING)
+    refused = checked(rig, "music", flow, pasted)
+    assert (refused.reason, str(refused), refused.details) == (
+        "binding_changed",
+        "the policy binds this grant differently; start again with rebind",
+        {"old": OTHER_BINDING, "new": BINDING},
+    )
+    assert len(rig.login._flows) == 1
+    assert captured.events("oauth_login_failed") == []
+    # An unchanged binding is no change, rebind or not.
+    rig.store.put("music-refresh", "fake-rt-old", BINDING)
+    assert rig.login.check_paste("music", flow, pasted)["binding_change"] is None
+    started = await rig.start(rebind=True)
+    rig.store.put("music-refresh", "fake-rt-old", OTHER_BINDING)
+    again = await rig.browse(started["authorize_url"])
+    plan = rig.login.check_paste("music", started["flow"], again)
+    assert (plan["rebind"], plan["binding_change"]) == (
+        True,
+        {"old": OTHER_BINDING, "new": BINDING},
+    )
+    assert rig.server.calls == []
+
+
+async def test_a_paste_check_needs_a_route(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    flow, pasted = await rig.approved()
+    rig.reconfigure(make_policy({"music": spotify()}, routes={"music": ()}))
+    assert checked(rig, "music", flow, pasted).reason == "no_route"
+
+
 # --- client_credentials ------------------------------------------------------------------------
 
 

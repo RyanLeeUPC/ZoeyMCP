@@ -18,7 +18,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from zoeymcp.common.policy import Policy, check_policy
 from zoeymcp.common.yamlload import load_mapping
-from zoeymcp.vault.admin import AdminApp, SetupCodes
+from zoeymcp.portal.app import PortalApp, Secrets, load_static
+from zoeymcp.portal.passkeys import Passkeys
+from zoeymcp.portal.server import HEAD_LIMIT, portal_protocol
+from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp, without_cookies
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet, generate_master_key
@@ -28,6 +31,7 @@ from zoeymcp.vault.peer import peer_checked
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
+from .procs import free_port
 from .tls import ProviderCA, make_ca
 
 PROFILES = Path(__file__).resolve().parents[2] / "profiles"
@@ -143,6 +147,10 @@ class Deployment:
     ``zoeymcp vault``. Its token client trusts the test CA, and its clocks are ``clock``.
     ``replace`` stays applied to every later ``load`` and ``restart``, so a profile's real
     provider endpoints never come back.
+
+    With ``portal``, the vault also serves its portal (M5 design B) on a loopback port of its
+    own, at :attr:`portal_origin`, sharing the admin app's setup codes, logins, store and token
+    manager, as ``zoeymcp vault`` shares them; the sessions keep the real clock.
     """
 
     def __init__(
@@ -158,8 +166,10 @@ class Deployment:
         clock: Clock | None = None,
         link_socket: Path | None = None,
         link_uid: int | None = None,
+        portal: bool = False,
     ) -> None:
         self.state = tmp_path
+        self.portal_port = free_port() if portal else None
         # The standard tier's link: the gateway's socket, and the uid allowed on it (Linux).
         self.link_socket = link_socket
         self.link_uid = link_uid
@@ -226,15 +236,35 @@ class Deployment:
             environ=self.environ,
             gateway_link=self.link_socket is not None,
         )
-        login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
+        self.login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
+        self.setup = SetupCodes(self.state, self.keys.portal_key)
         self.admin = AdminApp(
             store,
             self.keys,
             lambda: self.app.policy,
-            SetupCodes(self.state, self.keys.portal_key),
+            self.setup,
             self.tokens,
-            login,
+            self.login,
         )
+        self.portal: PortalApp | None = None
+        if self.portal_port is not None:
+            passkeys = Passkeys.load(self.state, self.keys.portal_key)
+            self.portal = PortalApp(
+                [self.portal_origin],
+                static=load_static(),
+                setup=self.setup,
+                passkeys=passkeys,
+                login=self.login,
+                secrets=Secrets(store, self.tokens, lambda: self.app.policy),
+                health=HealthReader(
+                    store, lambda: self.app.policy, self.login, passkeys=passkeys
+                ).report,
+            )
+
+    @property
+    def portal_origin(self) -> str:
+        assert self.portal_port is not None, "this vault has no portal"
+        return f"http://localhost:{self.portal_port}"
 
     def restart(
         self, *, environ: Mapping[str, str] | None = None, replace: dict[str, str] | None = None
@@ -290,9 +320,26 @@ class Deployment:
                     lifespan="off",
                 )
             )
+        portals = []
+        if self.portal is not None:
+            portals.append(
+                _Server(
+                    uvicorn.Config(
+                        self.portal,
+                        host="127.0.0.1",
+                        port=self.portal_port or 0,
+                        log_level="warning",
+                        lifespan="off",
+                        http=portal_protocol(),
+                        h11_max_incomplete_event_size=HEAD_LIMIT,
+                        proxy_headers=False,
+                    )
+                )
+            )
         loop = asyncio.new_event_loop()
 
-        everything = [*servers, link] if self.link_socket is not None else servers
+        everything = [*servers, link] if self.link_socket is not None else [*servers]
+        everything += portals
 
         async def main() -> None:
             try:
@@ -304,6 +351,7 @@ class Deployment:
         thread = threading.Thread(target=loop.run_until_complete, args=(main(),), daemon=True)
         thread.start()
         vault_port, admin_port = _wait_started(servers, thread)
+        _wait_started(portals, thread)
         self._loop = loop
         self.admin_url = f"http://127.0.0.1:{admin_port}"
         try:

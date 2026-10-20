@@ -28,7 +28,7 @@ or secret; the authorization URL holds ``state`` and the PKCE challenge, which a
 without the verifier the vault keeps.
 
 ``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
-design I).
+design I), gathered by :class:`HealthReader`, which the portal's ``GET /api/health`` shares.
 
 ``zoeymcp ledger --vault`` uses ``GET /ledger/reported``: the vault's copy of the gateway's
 ledger, a page of :mod:`.ledgerview` rows with the send journals joined in, and the archived
@@ -340,6 +340,81 @@ def json_safe(value: Any) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class HealthReader:
+    """What credential health is read from (M5 design I.1), for the socket's ``GET /health``
+    and the portal's ``GET /api/health``, which share one reader per vault: the store's clear
+    entries, the running policy, the logins' status, the connectors' send journals, the ``env:``
+    variables found set, the reported copy and the passkey file. Without ``connectors`` it shows
+    no sends; without ``env_names`` every ``env:`` reference is unset; without ``reports`` or
+    ``passkeys`` the report has no ``ledger_copy`` or ``passkeys`` section."""
+
+    store: SecretStore
+    policy: Callable[[], Policy]
+    login: LoginService | None = None
+    connectors: SmtpConnectors | None = None
+    env_names: Callable[[], Collection[str]] | None = None
+    reports: ReportStore | None = None
+    passkeys: Passkeys | None = None
+
+    def report(self) -> dict[str, Any]:
+        """:func:`.health.assess` now, with no number JSON can't carry."""
+        policy = self.policy()
+        inputs = health.Inputs(
+            policy,
+            self.store.metadata(),
+            frozenset(() if self.env_names is None else self.env_names()),
+            oauth=None if self.login is None else self.login.status(),
+            sends=self._sends(policy),
+            persisted=not self.store.dirty,
+            passkeys=self._passkey_state(policy),
+            ledger_copy=self._ledger_copy(policy),
+        )
+        report: dict[str, Any] = json_safe(health.assess(inputs))
+        return report
+
+    def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
+        """The passkey file for health; None without one, or without a portal to use it."""
+        holder = self.passkeys
+        if holder is None or policy.admin is None:
+            return None
+        document = holder.document
+        last = document.last_regressed
+        return health.PasskeyState(
+            count=len(document.credentials),
+            unavailable=holder.unavailable,
+            regressed_ago=None if last is None else holder.clock() - last,
+        )
+
+    def _ledger_copy(self, policy: Policy) -> health.LedgerCopy | None:
+        """The reported copy for health; None without a copy or a gateway to report to it."""
+        copy = self.reports
+        if copy is None or policy.gateway is None:
+            return None
+        now = copy.clock()
+        contact = copy.contact_ms
+        return health.LedgerCopy(
+            state=copy.state,
+            head_seq=copy.held.head_seq,
+            reported_ago=None if contact is None else max(0, now - contact) // 1000,
+            uptime=max(0, now - copy.started_ms) // 1000,
+            broken_at=copy.broken_at,
+        )
+
+    def _sends(self, policy: Policy) -> dict[str, health.Sends]:
+        """Each connector's send journal, summed up. One that can't be read is left out."""
+        found: dict[str, health.Sends] = {}
+        if self.connectors is None:
+            return found
+        now = self.connectors.clock_ms()
+        for name in policy.connectors:
+            try:
+                found[name] = health.sends(self.connectors.journal(name), now)
+            except OSError:
+                continue
+        return found
+
+
 class AdminApp:
     def __init__(
         self,
@@ -376,7 +451,6 @@ class AdminApp:
         self._passkeys = passkeys
         self._reports = reports
         self._connectors = connectors
-        self._env_names = env_names
         self._keys = keys
         self._gateway_keys = gateway_keys
         self._policy = policy
@@ -385,6 +459,15 @@ class AdminApp:
         if login is None and tokens is not None:
             login = LoginService(tokens)
         self._login = login
+        self._health_reader = HealthReader(
+            store,
+            policy,
+            login,
+            connectors=connectors,
+            env_names=env_names,
+            reports=reports,
+            passkeys=passkeys,
+        )
         self.app = Starlette(
             routes=[
                 Route("/secrets", self._list, methods=["GET"]),
@@ -627,59 +710,7 @@ class AdminApp:
     # --- health (M5 design I) ------------------------------------------------------------------
 
     async def _health(self, request: Request) -> Response:
-        policy = self._policy()
-        inputs = health.Inputs(
-            policy,
-            self._store.metadata(),
-            frozenset(() if self._env_names is None else self._env_names()),
-            oauth=None if self._login is None else self._login.status(),
-            sends=self._sends(policy),
-            persisted=not self._store.dirty,
-            passkeys=self._passkey_state(policy),
-            ledger_copy=self._ledger_copy(policy),
-        )
-        return JSONResponse(json_safe(health.assess(inputs)))
-
-    def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
-        """The passkey file for health; None without one, or without a portal to use it."""
-        holder = self._passkeys
-        if holder is None or policy.admin is None:
-            return None
-        document = holder.document
-        last = document.last_regressed
-        return health.PasskeyState(
-            count=len(document.credentials),
-            unavailable=holder.unavailable,
-            regressed_ago=None if last is None else holder.clock() - last,
-        )
-
-    def _ledger_copy(self, policy: Policy) -> health.LedgerCopy | None:
-        """The reported copy for health; None without a copy or a gateway to report to it."""
-        copy = self._reports
-        if copy is None or policy.gateway is None:
-            return None
-        now = copy.clock()
-        contact = copy.contact_ms
-        return health.LedgerCopy(
-            state=copy.state,
-            head_seq=copy.held.head_seq,
-            reported_ago=None if contact is None else max(0, now - contact) // 1000,
-            uptime=max(0, now - copy.started_ms) // 1000,
-            broken_at=copy.broken_at,
-        )
-
-    def _sends(self, policy: Policy) -> dict[str, health.Sends]:
-        """Each connector's send journal, summed up. One that can't be read is left out."""
-        found: dict[str, health.Sends] = {}
-        if self._connectors is None:
-            return found
-        now = self._connectors.clock_ms()
-        for name in policy.connectors:
-            try:
-                found[name] = health.sends(self._connectors.journal(name), now)
-            except OSError:
-                continue
-        return found
+        return JSONResponse(self._health_reader.report())
 
     # --- the reported ledger (M5 design J.4, J.5) -----------------------------------------------
 

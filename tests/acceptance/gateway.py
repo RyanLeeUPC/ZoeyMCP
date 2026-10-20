@@ -112,7 +112,8 @@ class GatewayDeployment:
 
     ``tools`` and ``pins`` fill in S10's empty lists; leave both out to keep a profile's own.
     ``secrets`` go into the store before the vault starts, and the vault's token manager reads
-    ``clock``, which a test can move along with the fakes' clocks.
+    ``clock``, which a test can move along with the fakes' clocks. With ``portal`` the vault
+    serves its portal too, over either link (M5 design O.1, review finding R9).
     """
 
     def __init__(
@@ -130,6 +131,7 @@ class GatewayDeployment:
         link_uid: int | None = None,
         replace: Mapping[str, str] | None = None,
         clock: Clock | None = None,
+        portal: bool = False,
     ) -> None:
         self.state = tmp_path / "gateway"
         self.link = link
@@ -149,6 +151,7 @@ class GatewayDeployment:
             link_socket=socket,
             link_uid=link_uid,
             clock=clock,
+            portal=portal,
         )
 
     @property

@@ -377,7 +377,7 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("passkey.enrol", {"name": "x", "extra": 1}) == (400, "bad_body")
     assert refused("passkey.rename", {"name": "x"}) == (400, "bad_body")
     # A registered kind a later step builds.
-    assert refused("oauth.reset", {"credential": "x"}) == (400, "bad_body")
+    assert refused("ledger.restart", {}) == (400, "bad_body")
     # Each kind's cap: 4 KiB for a passkey's (M.1), within the route's 128 KiB.
     assert refused("passkey.enrol", {"name": "x" * 5000}) == (413, "too_large")
     assert refused("passkey.enrol", {"name": "a\tb"}) == (400, "bad_name")
@@ -572,23 +572,56 @@ SESSION_LIFECYCLE = {
 AUTHORIZED_ENROLMENT = {("POST", ENROL_BEGIN), ("POST", ENROL_FINISH)}
 # The action's own routes: prepare (holds, changes nothing) and confirm (the step-up).
 ACTION_ROUTES = {("POST", ACTIONS), ("POST", "/api/actions/{action}/confirm")}
-FLOW_STARTS: set[tuple[str, str]] = set()  # step 14a's POST /api/oauth/{credential}/start
-CANCELS = {("DELETE", "/api/actions/{action}")}
+# A flow start writes no grant. The client_credentials start, a test fetch, is the one such
+# route that can clear a failure state, and only after a fetch that worked (F.4, H.1).
+FLOW_STARTS = {("POST", "/api/oauth/{credential}/start")}
+CANCELS = {("DELETE", "/api/actions/{action}"), ("DELETE", "/api/oauth/flows/{flow}")}
+# An OAuth credential whose sign-in a session can start (no token call until a confirm).
+OAUTH_POLICY: dict[str, Any] = {
+    "credentials": {
+        "notes": {
+            "kind": "oauth2",
+            "token_url": "https://auth.notes.example/token",
+            "authorize_url": "https://auth.notes.example/authorize",
+            "client_id": "example-notes-client",
+            "client_auth": "none",
+            "refresh_token": "store:notes-refresh",
+        }
+    },
+    "routes": [
+        {
+            "name": "notes",
+            "prefix": "/notes",
+            "upstream": "https://api.notes.example",
+            "credential": "notes",
+            "callers": [{"placeholder": "ph-agent1-notes-0001"}],
+            "rules": [{"methods": ["GET"], "paths": ["/**"]}],
+        }
+    ],
+}
 
 
-def test_every_change_is_an_action(rig: PortalRig) -> None:
+def test_every_change_is_an_action(tmp_path: Path) -> None:
     allowed = SESSION_LIFECYCLE | AUTHORIZED_ENROLMENT | ACTION_ROUTES | FLOW_STARTS | CANCELS
     unsafe = {(r.method, r.path) for r in ROUTES if r.method != "GET"}
     assert unsafe <= allowed, sorted(unsafe - allowed)
     assert allowed <= unsafe, sorted(allowed - unsafe)  # the lists name only built routes
-    # Every GET, with a session of each scope it takes, leaves every table as it was (a
-    # session's idle clock aside): with an action pending, an enrolment and a login under way.
+    with running(tmp_path, policy=OAUTH_POLICY) as rig:
+        every_get_leaves_the_tables(rig)
+
+
+def every_get_leaves_the_tables(rig: PortalRig) -> None:
+    """Every GET, with a session of each scope it takes, leaves every table as it was (a
+    session's idle clock aside): with an action pending, an enrolment, a login and an OAuth
+    sign-in under way."""
     world = two(rig)
     setup = rig.browser().page(rig.origin)
     assert redeem(setup, issue(rig)).status_code == 200
     setup.fetch("POST", ENROL_BEGIN, json={"name": "x"})
     begin_login(rig.browser().page(rig.origin))
     prepared(world.first, "passkey.rename", {"credential": world.b, "name": "desk"})
+    started = world.second.fetch("POST", "/api/oauth/notes/start", json={})
+    assert started.status_code == 200, started.text
 
     def tables() -> object:
         app = rig.app
@@ -597,7 +630,9 @@ def test_every_change_is_an_action(rig: PortalRig) -> None:
         sessions = sorted((s.id, s.scope, s.origin, s.credential, s.created) for s in live)
         pending = sorted(a.id for s in live if (a := app.actions.pending(s.id, now)) is not None)
         counts = (len(app.sessions), len(app.ceremonies), len(app.actions))
-        return sessions, pending, counts, rig.vault.passkeys.document
+        flows = rig.vault.login._flows._flows
+        signing_in = sorted((f.id, f.credential, f.owner, f.expires_at) for f in flows.values())
+        return sessions, pending, counts, signing_in, rig.vault.passkeys.document
 
     before = tables()
     gets = [r for r in ROUTES if r.method == "GET"]

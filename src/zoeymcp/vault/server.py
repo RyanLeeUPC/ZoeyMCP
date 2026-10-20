@@ -52,7 +52,14 @@ from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
 from ..portal.passkeys import Passkeys
 from ..portal.server import HEAD_LIMIT, HEADER_DEADLINE, portal_protocol
 from . import logs
-from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
+from .admin import (
+    AdminApp,
+    AdminSocketError,
+    HealthReader,
+    SetupCodes,
+    check_socket_dir,
+    socket_supported,
+)
 from .app import LISTENER_SCOPE_KEY, Listener, VaultApp
 from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
@@ -382,13 +389,15 @@ def build_portal(
     passkeys: Passkeys,
     login: LoginService,
     secrets: Secrets | None = None,
+    health: HealthReader | None = None,
     lookup: Lookup = lookup_addresses,
 ) -> Portal | None:
     """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
     at start (B.3): a name that doesn't resolve to exactly one address, an address a ``--listen``
     has (or its port, with a wildcard on either side), a static file missing. A wildcard beside
     any ``--listen`` is warned about (``admin_listener_shared``). ``secrets`` is what its Secrets
-    area writes through, the admin socket's store, token manager and policy."""
+    area writes through, the admin socket's store, token manager and policy; ``health`` what
+    its health checklist reads, as the socket's ``GET /health`` does."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -410,6 +419,7 @@ def build_portal(
         passkeys=passkeys,
         login=login,
         secrets=secrets,
+        health=None if health is None else health.report,
     )
     return Portal(app, address)
 
@@ -734,8 +744,24 @@ def build(
     # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2), and
     # the same store, token manager and running policy for secrets (M5 design G, P10).
     secrets = Secrets(runtime.store, app.tokens, lambda: app.policy)
+    # Health from the same sources as the socket's GET /health (M5 design I.2).
+    health = HealthReader(
+        runtime.store,
+        lambda: app.policy,
+        login,
+        connectors=app.connectors,
+        env_names=lambda: app.env_names,
+        reports=reports,
+        passkeys=passkeys,
+    )
     portal = build_portal(
-        runtime.policy, listens, setup=setup, passkeys=passkeys, login=login, secrets=secrets
+        runtime.policy,
+        listens,
+        setup=setup,
+        passkeys=passkeys,
+        login=login,
+        secrets=secrets,
+        health=health,
     )
     admin = None
     if admin_socket is not None:

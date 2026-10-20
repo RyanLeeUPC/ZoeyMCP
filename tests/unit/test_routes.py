@@ -87,12 +87,14 @@ def test_the_static_map_is_fixed() -> None:
 
 def test_the_table_holds_only_built_routes() -> None:
     # Each of steps 11 to 15 adds the rows it builds: step 11's are M.1's first nine, step
-    # 12's the passkey list and the three action routes, and step 13's the secret list.
-    assert (*M1[:11], *M1[18:]) == ROUTES
+    # 12's the passkey list and the three action routes, step 13's the secret list, and step
+    # 14a's health, the OAuth list, a flow's start and its cancel (14b adds the flow's status).
+    assert (*M1[:12], *M1[13:15], M1[16], *M1[18:]) == ROUTES
     assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
         "/api/login/begin",
         "/api/logout",
         "/api/sessions/end-others",
+        "/api/oauth/{credential}/start",
     ]
     assert (BODY_EMPTY, BODY_DEFAULT, BODY_WEBAUTHN) == (64, 4 * KIB, 16 * KIB)
     assert (BODY_SECRET, BODY_PASTE) == (128 * KIB, 8 * KIB)
@@ -145,7 +147,8 @@ def test_nothing_matches_an_empty_table() -> None:
     assert match((), "GET", "/api/session") is None
     assert match(ROUTES, "GET", "/api/session") == (ROUTES[3], {})
     assert match(ROUTES, "GET", "/api/secrets") == (ROUTES[10], {})
-    assert match(ROUTES, "GET", "/api/health") is None  # step 14a's
+    assert match(ROUTES, "GET", "/api/health") == (ROUTES[11], {})
+    assert match(ROUTES, "GET", "/api/ledger") is None  # step 15's
 
 
 @pytest.mark.parametrize(

@@ -36,6 +36,11 @@ POSTED = re.compile(
 )
 # prepare("kind", { key: value, ... }, ...) in app.js: an action's data.
 PREPARED = re.compile(r"prepare\(\s*\"([a-z.]+)\",\s*\{([^}]*)\}", re.DOTALL)
+# The connect dialog's paste: its data built first, then posted as the action's (H.1).
+CHECKED = re.compile(
+    r"const data = \{([^}]*)\};\s*try \{\s*const prepared = await api\(\"POST\", "
+    r"\"/api/actions\", \{ kind: \"([a-z.]+)\", data: data \}\)"
+)
 
 
 @pytest.fixture
@@ -95,6 +100,9 @@ def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
     script = (STATIC_DIR / "app.js").read_bytes().decode("utf-8")
     prepared = PREPARED.findall(script)
     assert prepared
+    checked = [(kind, keys) for keys, kind in CHECKED.findall(script)]
+    assert [kind for kind, _ in checked] == ["oauth.complete"]
+    prepared += checked
     for kind, keys in prepared:
         data = set(re.findall(r"(\w+):", keys))
         assert KINDS[kind].required <= data <= KINDS[kind].required | KINDS[kind].optional, kind

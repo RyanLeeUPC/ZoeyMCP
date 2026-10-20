@@ -44,6 +44,17 @@ lists names and metadata, and no answer, summary or log line carries a value (P1
 waits for its confirm in the action's held data, which hides it from ``repr`` and refuses to be
 logged.
 
+Health and OAuth connect (I, H): ``GET /api/health`` is the socket's ``GET /health`` report, fit
+to show, with one checklist of every finding; ``GET /api/session`` carries its counts. ``GET
+/api/oauth`` lists the oauth2 credentials. Connect is paste first (H.1): ``POST
+/api/oauth/{credential}/start`` starts a login this session owns (a client_credentials start is
+the test fetch), the operator approves in a new tab and pastes the address it lands on, and the
+``oauth.complete`` action's plan checks the paste with ``LoginService.check_paste`` before any
+passkey prompt; its confirm exchanges the code once and stores the grant. ``DELETE
+/api/oauth/flows/{flow}`` cancels the session's own login, and ``oauth.reset`` clears a
+credential's failure state. Flows are owned (H.2): another owner's flow answers as an unknown
+one.
+
 Logs (M.4): ``portal_request`` for each answer a handler gives; ``portal_refused`` for a refusal
 before one, at most once per 10 s per reason with a count, never the refused ``Host`` or
 ``Origin``; a static file or the 308 as ``portal_request``, at most once per 10 s per path. The
@@ -52,7 +63,8 @@ handlers log ``portal_login``, ``portal_login_failed``, ``setup_code_redeemed``,
 a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout``, ``portal_session_ended``,
 ``step_up_confirmed``, ``step_up_refused``, ``action_changed``, ``passkey_renamed`` and
 ``passkey_removed``; ``secretops`` logs ``secret_set`` and ``secret_deleted`` with
-``via: "portal"``.
+``via: "portal"``; the logins log ``oauth_login_started``, ``oauth_login_completed``,
+``oauth_login_failed`` and ``oauth_flow_replaced``, and a reset ``oauth_cache_reset``.
 """
 
 from __future__ import annotations
@@ -62,7 +74,7 @@ import importlib.resources
 import json
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
 from types import MappingProxyType
@@ -70,8 +82,10 @@ from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard
 
 from starlette.types import Receive, Scope, Send
 
+from ..common.policy.schema import OAuth2Credential, split_scope
 from ..vault import logs, secretops, secretplan
 from ..vault.bindings import VAULT_PREFIX
+from ..vault.oauth.login import LoginError
 from ..vault.secretplan import PutPlan, SecretRefusal
 from . import passkeys as passkey_file
 from . import routes as api
@@ -93,6 +107,7 @@ from .display import NAME_LIMIT, SUMMARY_LIMIT, shown
 from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
 from .refusals import Refusal, enrolment, refusal, secret
+from .refusals import login as login_refusal
 from .routes import ROUTES, STATIC, Route
 from .sessions import (
     SESSION_IDLE,
@@ -142,6 +157,25 @@ REGRESSED_FOR: Final = 30 * 86_400
 COUNTER_BANNER: Final = (
     "A passkey's signature counter went back in the last 30 days: the authenticator may have "
     "been copied. Check the passkeys with zoeymcp passkeys."
+)
+HEALTH_BANNER: Final = "{count} problem(s) need you: see the checklist on Home."
+# How a credential gets a grant in the portal (H.1): a sign-in in the browser completed by
+# paste, or for client_credentials a test fetch; neither for a refresh token set by other means.
+CONNECT_BROWSER: Final = "browser"
+CONNECT_TEST: Final = "test"
+# What a health finding's action asks of the operator when the page has no button for it (I.1;
+# the page's buttons: connect, reset, set_secret, delete_secret, add_passkey, review_passkeys).
+ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "restart": "Set the environment variable, then restart the vault.",
+        "fix_policy": "Fix the policy.",
+        "wait": "Wait: the vault tries again after the backoff.",
+        "check_volume": "Check the state volume: the vault can't write its files.",
+        "check_mailbox": "Check the mailbox before sending again.",
+        "reset_passkeys": "Run zoeymcp setup-code --reset with host access.",
+        "check_gateway": "Check that the gateway is running and reporting.",
+        "read_ledger": "Read it with zoeymcp ledger --vault.",
+    }
 )
 
 CSP: Final = (
@@ -298,7 +332,10 @@ class PortalApp:
     """The portal on its listener. ``origins`` is ``admin.origins``; :meth:`reload` swaps them.
 
     ``setup``, ``passkeys``, ``login`` and ``secrets`` are the ones the vault shares with the
-    admin socket; a secret route or action of a portal without ``secrets`` is a 500.
+    admin socket; a secret route or action of a portal without ``secrets`` is a 500, and so is
+    an OAuth route or action without ``login`` or ``secrets`` (whose policy and token manager it
+    reads). ``health`` gives the report the socket's ``GET /health`` answers (I.1); without it,
+    ``GET /api/health`` is a 500 and the session answer has no counts.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
     class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
     limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
@@ -317,6 +354,7 @@ class PortalApp:
         passkeys: Passkeys | None = None,
         login: LoginService | None = None,
         secrets: Secrets | None = None,
+        health: Callable[[], dict[str, Any]] | None = None,
         routes: Sequence[Route] = ROUTES,
         handlers: Mapping[Route, Handler] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -329,6 +367,7 @@ class PortalApp:
         self.passkeys = passkeys
         self.login = login
         self.secrets = secrets
+        self.health = health
         self._routes = tuple(routes)
         self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
@@ -568,6 +607,10 @@ class PortalApp:
             api.ENROL_FINISH: self._enrol_finish,
             api.PASSKEYS: self._passkeys,
             api.SECRETS: self._secret_list,
+            api.HEALTH: self._health,
+            api.OAUTH: self._oauth_list,
+            api.OAUTH_START: self._oauth_start,
+            api.FLOW_CANCEL: self._flow_cancel,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -686,6 +729,14 @@ class PortalApp:
         here = 0
         if holder is not None and usable:
             here = sum(1 for c in holder.document.credentials if c.rp_id == session.rp_id)
+        # Health's counts, shown on every page, and a banner for its errors: a full session's.
+        counts = None
+        if session.scope == "full" and self.health is not None:
+            counts = dict(self.health()["summary"])
+        banners = self._banners()
+        if counts is not None and counts["error"]:
+            text = HEALTH_BANNER.format(count=counts["error"])
+            banners.append({"code": "health_errors", "text": text})
         answer = {
             "scope": session.scope,
             "origin": session.origin,
@@ -700,9 +751,8 @@ class PortalApp:
             else shown(signed_with.name, NAME_LIMIT),
             "reset": session.reset,
             "passkeys_here": here,
-            "banners": self._banners(),
-            # The health checklist comes with the Home page (step 14a).
-            "health_summary": None,
+            "banners": banners,
+            "health_summary": counts,
         }
         return Reply(answer)
 
@@ -935,6 +985,8 @@ class PortalApp:
             "passkey.remove": ActionKind(self._plan_remove, self._run_remove),
             "secret.put": ActionKind(self._plan_put, self._run_put),
             "secret.delete": ActionKind(self._plan_delete, self._run_delete),
+            "oauth.complete": ActionKind(self._plan_complete, self._run_complete),
+            "oauth.reset": ActionKind(self._plan_reset, self._run_reset),
         }
 
     def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1052,7 +1104,18 @@ class PortalApp:
         """Every store entry by name, with its metadata: never a value, a length or a hash of
         one, and none of the clear ``meta`` anyone with the file can edit."""
         entries = self._secret_store().store.metadata()
-        return Reply({"secrets": [_secret_view(entry) for entry in entries]})
+        found = None if self.health is None else _secret_health(self.health())
+        listed = []
+        for entry in entries:
+            view = _secret_view(entry)
+            view["health"] = view["health_shown"] = None
+            if found is not None:
+                codes = found.get(entry.name, [])
+                view["health"] = [{"code": code, "level": level} for code, level in codes]
+                words = ", ".join(f"{code} ({level})" for code, level in codes)
+                view["health_shown"] = words or "ok"
+            listed.append(view)
+        return Reply({"secrets": listed})
 
     def _plan_put(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
         """``secret.put``: ``secretplan.plan_put``, the socket's checks and binding (P10, D-10:
@@ -1117,6 +1180,173 @@ class PortalApp:
         if refused is not None:
             return secret(refused, name=name)
         return Reply({"name": name, "deleted": True})
+
+    # --- health (I) and OAuth connect by paste (H) -----------------------------------------------
+
+    async def _health(self, call: Call) -> Reply | Refusal:
+        """The I.1 report, fit to show (K.1): every finding's text and every name the policy gave
+        passes :func:`~.display.shown`; each action stays structured, for the page's button."""
+        if self.health is None:
+            raise RuntimeError("this portal has no health reader")
+        return Reply(_health_view(self.health()))
+
+    async def _oauth_list(self, call: Call) -> Reply | Refusal:
+        """Every oauth2 credential as the logins see it (``LoginService.status``), and what the
+        operator can do about it: how it connects, the scopes asked for and expected, where its
+        tokens go. The clear ``meta`` it shows is text anyone with the state file can edit."""
+        policy = self._policy()
+        listed = []
+        for item in self._login_service().status():
+            cred = policy.credentials.get(item["credential"])
+            if isinstance(cred, OAuth2Credential):
+                listed.append(_oauth_view(item, cred, policy))
+        return Reply({"credentials": listed})
+
+    async def _oauth_start(self, call: Call) -> Reply | Refusal:
+        """H.1 step 1: a login owned by this session. The answer is the socket's, with the
+        fields the dialog shows and ``replaced`` (where a login it replaced was started). For
+        client_credentials it is the test fetch: it writes no grant and, when it works, clears
+        the credential's failure state, the one route besides an action's confirm with that
+        effect, and only after a fetch that just worked (F.4)."""
+        session = _session(call)
+        rebind = _body(call).get("rebind", False)
+        if not isinstance(rebind, bool):
+            return refusal("bad_body")
+        credential = call.params["credential"]
+        try:
+            started = await self._login_service().start(
+                credential, rebind=rebind, owner=session.owner
+            )
+        except LoginError as exc:
+            return self._login_refused(exc, credential)
+        if "flow" not in started:
+            return Reply(_completed(credential, started))
+        change = started["binding_change"]
+        change_shown = None
+        if change is not None:
+            change_shown = {
+                "old": _binding_words(change["old"]),
+                "new": _binding_words(change["new"]),
+            }
+        answer = {
+            **started,
+            "credential": credential,
+            "name_shown": shown(credential, NAME_LIMIT),
+            "redirect_uri_shown": shown(started["redirect_uri"], SUMMARY_LIMIT),
+            "requested_scopes_shown": _scopes(started["requested_scopes"]),
+            "expected_scopes_shown": _scopes(started["expected_scopes"]),
+            "binding_shown": _binding_words(started["binding"]),
+            "binding_change_shown": change_shown,
+        }
+        return Reply(answer)
+
+    async def _flow_cancel(self, call: Call) -> Reply | Refusal:
+        """H.1 step 4: drop this session's pending login. Another owner's, or none, answers
+        ``flow_unknown``, as an unknown one does, and that flow stays (P11)."""
+        if not self._login_service().cancel(call.params["flow"], _session(call).owner):
+            return refusal("flow_unknown")
+        return Reply({"cancelled": True})
+
+    def _plan_complete(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``oauth.complete`` by paste: ``check_paste`` reads the address against this
+        session's flow for the credential without taking it, so a mistyped paste is refused
+        here, before the passkey prompt, and can be fixed (a provider's error ends the flow).
+        Then what completing stores: the binding, the one it replaces (which needs a start with
+        rebind), and the scopes asked for and expected."""
+        credential, flow, pasted = data["credential"], data["flow"], data["redirect_url"]
+        if not all(isinstance(value, str) for value in (credential, flow, pasted)):
+            return refusal("bad_body")
+        try:
+            checked = self._login_service().check_paste(
+                credential, flow, pasted, step.session.owner
+            )
+        except LoginError as exc:
+            return self._login_refused(exc, credential)
+        change = checked["binding_change"]
+        summary = [
+            ("Connect", shown(credential, NAME_LIMIT)),
+            ("With", "the address you pasted, checked: it is this sign-in's answer"),
+            ("Its tokens go to", _binding_words(checked["binding"])),
+        ]
+        if change is not None:
+            summary.append(("Bound until now", _binding_words(change["old"])))
+        summary += [
+            ("Scopes asked for", _scope_words(checked["requested_scopes"])),
+            ("Scopes expected", _scope_words(checked["expected_scopes"])),
+        ]
+        return Plan(tuple(summary), (credential, flow, checked))
+
+    async def _run_complete(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """The exchange: ``LoginService.complete`` takes the flow (so any failure from here
+        needs a new connect), exchanges the code once and stores the grant. Scopes outside the
+        expected set are flagged, never refused."""
+        credential = data["credential"]
+        try:
+            done = await self._login_service().complete(
+                credential, data["flow"], data["redirect_url"], step.session.owner
+            )
+        except LoginError as exc:
+            return self._login_refused(exc, credential)
+        return Reply(_completed(credential, done))
+
+    def _plan_reset(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``oauth.reset`` (D-22): an oauth2 credential the logins know, and its state now. The
+        reset clears its failure state, so the next request that needs a token tries once."""
+        credential = data["credential"]
+        if not isinstance(credential, str):
+            return refusal("bad_body")
+        found = [i for i in self._login_service().status() if i["credential"] == credential]
+        if not found:
+            return refusal("not_oauth")
+        state, code = found[0]["state"], found[0]["code"]
+        summary = (
+            ("Clear the failure state of", shown(credential, NAME_LIMIT)),
+            ("Its state now", state if code is None else f"{state} ({code})"),
+            ("Then", "the next request that needs a token tries once"),
+        )
+        return Plan(summary, (credential, state, code, found[0]["reason"]))
+
+    async def _run_reset(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """``TokenManager.reset``, as ``zoeymcp oauth reset`` runs it (it logs
+        ``oauth_cache_reset``); the answer is the socket's."""
+        tokens = self._secret_store().tokens
+        credential = data["credential"]
+        if tokens is None or not tokens.reset(credential):
+            return refusal("not_oauth")
+        return Reply({"credential": credential, "reset": True})
+
+    def _login_refused(self, exc: LoginError, credential: str) -> Refusal:
+        """A refused start, paste or exchange in the portal's words (H.3), with the status and
+        reason the socket answers. A provider's description (cleaned and capped by the vault,
+        then shown) and a ``binding_changed``'s two bindings go beside the text."""
+        cred = self._policy().credentials.get(credential)
+        redirect_uri = cred.redirect_uri if isinstance(cred, OAuth2Credential) else ""
+        details = exc.details
+        made = login_refusal(
+            exc.reason,
+            detail=str(exc),
+            error=details.get("provider_error"),
+            redirect_uri=redirect_uri,
+        )
+        more: tuple[tuple[str, Any], ...] = ()
+        if exc.reason == "provider_error":
+            description = details.get("description")
+            more = (("description_shown", None if description is None else shown(description)),)
+        elif exc.reason == "binding_changed":
+            more = (
+                ("old_shown", _binding_words(details.get("old"))),
+                ("new_shown", _binding_words(details.get("new"))),
+            )
+        return replace(made, more=more)
+
+    def _login_service(self) -> LoginService:
+        if self.login is None:
+            raise RuntimeError("this portal has no login service")
+        return self.login
+
+    def _policy(self) -> Policy:
+        """The running policy, as the Secrets area reads it."""
+        return self._secret_store().policy()
 
     def _secret_store(self) -> Secrets:
         if self.secrets is None:
@@ -1334,6 +1564,30 @@ def _secret_view(entry: EntryMeta) -> dict[str, Any]:
     }
 
 
+# A stored binding's verdict where the policy uses the secret (``health.judge``), as a finding.
+_VERDICTS: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
+    {"changed": ("binding_changed", "error"), "wider": ("binding_wider", "info")}
+)
+
+
+def _secret_health(report: Mapping[str, Any]) -> dict[str, list[tuple[str, str]]]:
+    """Each store entry's health for the Secrets list (G, I.1), as codes and levels: the verdict
+    on its binding wherever the policy uses it, a reason the policy can't bind it, and the
+    store's own findings about it (nothing uses it; a live slot no credential keeps)."""
+    found: dict[str, dict[tuple[str, str], None]] = {}
+    for section in (*report["credentials"], *report["connectors"]):
+        for row in section["refs"]:
+            ref, verdict = row["ref"], row["binding"]
+            if ref.startswith("store:") and verdict not in (None, "ok"):
+                code = _VERDICTS.get(verdict, (verdict, "error"))
+                found.setdefault(ref.removeprefix("store:"), {})[code] = None
+    for finding in report["store"]["findings"]:
+        name = (finding["action"] or {}).get("secret")
+        if isinstance(name, str):
+            found.setdefault(name, {})[(finding["code"], finding["level"])] = None
+    return {name: list(codes) for name, codes in found.items()}
+
+
 def _binding_words(binding: object) -> str:
     """What a binding lets the vault do with the secret, in words, every origin and host shown
     as text (K.1): "sent to https://api.example:443"; "token endpoint https://auth.example:443,
@@ -1371,6 +1625,140 @@ def _when(value: object) -> str:
         if moment is not None and moment.tzinfo is not None:
             return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
     return "an unknown time"
+
+
+def _health_view(report: Mapping[str, Any]) -> dict[str, Any]:
+    """The I.1 report as the page shows it (K.1): each section with its findings' text shown and
+    each credential's and connector's name shown, and every finding again in one checklist,
+    errors first, then warnings, then information (I.2). A finding keeps its ``action``."""
+    checklist: list[dict[str, Any]] = []
+    view: dict[str, Any] = {"summary": report["summary"]}
+    for key, kind in (("credentials", "credential"), ("connectors", "connector")):
+        view[key] = [_health_section(kind, item, checklist) for item in report[key]]
+    for key in ("store", "passkeys", "ledger_copy"):
+        if key in report:
+            view[key] = _health_section(key, report[key], checklist)
+    rank = {"error": 0, "warning": 1, "info": 2}
+    view["checklist"] = sorted(checklist, key=lambda finding: rank[finding["level"]])
+    return view
+
+
+def _health_section(
+    kind: str, section: Mapping[str, Any], checklist: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """One section of the report fit to show, its findings added to ``checklist``. A secret
+    reference's row stays out: the finding's text names it."""
+    view = {key: value for key, value in section.items() if key not in ("findings", "refs")}
+    name = section.get("name")
+    name_shown = shown(name, NAME_LIMIT) if isinstance(name, str) else None
+    if name_shown is not None:
+        view["name_shown"] = name_shown
+    if "routes" in section:
+        view["routes"] = [shown(route, NAME_LIMIT) for route in section["routes"]]
+    findings = []
+    for finding in section["findings"]:
+        shown_finding = {key: value for key, value in finding.items() if key != "text"}
+        shown_finding["text_shown"] = shown(finding["text"], SUMMARY_LIMIT)
+        action = finding["action"]
+        shown_finding["todo"] = None if action is None else ACTION_WORDS.get(action["kind"])
+        shown_finding["section"] = kind
+        shown_finding["name_shown"] = name_shown
+        findings.append(shown_finding)
+    view["findings"] = findings
+    checklist.extend(findings)
+    return view
+
+
+def _oauth_view(item: Mapping[str, Any], cred: OAuth2Credential, policy: Policy) -> dict[str, Any]:
+    """One credential of ``GET /api/oauth``: the vault's own states, codes and times as they
+    are; the provider's error code, the scopes, the upstreams and the clear ``meta`` shown."""
+    name = item["credential"]
+    meta = item["meta"] or {}
+    consented = meta.get("consented_at")
+    scopes = item["scopes"]
+    connect = None
+    if cred.grant == "client_credentials":
+        connect = CONNECT_TEST
+    elif cred.authorize_url is not None:
+        connect = CONNECT_BROWSER
+    used_at = sorted({r.upstream for r in policy.routes if r.credential == name and r.upstream})
+    requested = split_scope(cred.scope, cred.scope_separator)
+    error = None if item["error"] is None else shown(str(item["error"]))
+    ago = item["last_ok_ago"]
+    text = (
+        f"OAuth: {item['state']}"
+        + ("" if item["code"] is None else f" ({item['code']})")
+        + ("" if error is None else f", the provider said {error}")
+        + "; last worked "
+        + ("not since the vault started" if ago is None else f"{round(ago / 60)} min ago")
+        + f"; asks for {_scope_words(requested)}; its tokens go to "
+        + (shown(", ".join(used_at), SUMMARY_LIMIT) or "no route")
+        + "."
+    )
+    return {
+        "credential": name,
+        "name_shown": shown(name, NAME_LIMIT),
+        "grant": item["grant"],
+        "state": item["state"],
+        "code": item["code"],
+        "reason": item["reason"],
+        "error_shown": error,
+        "retry_in": item["retry_in"],
+        "action": item["action"],
+        "last_ok_ago": item["last_ok_ago"],
+        "consented_at_shown": shown(consented) if isinstance(consented, str) else None,
+        "reconsent_due": item["reconsent_due"],
+        "last_failure": item["last_failure"],
+        "idle": item["idle"],
+        "unexpected_scopes_shown": None if scopes is None else _scopes(scopes["unexpected"]),
+        "missing_scopes_shown": None if scopes is None else _scopes(scopes["missing"]),
+        "persisted": item["persisted"],
+        "connect": connect,
+        "requested_scopes_shown": _scopes(requested),
+        "expected_scopes_shown": _scopes(cred.effective_expected_scopes),
+        "used_at_shown": [shown(upstream, SUMMARY_LIMIT) for upstream in used_at],
+        "text_shown": text,
+    }
+
+
+def _completed(credential: str, done: Mapping[str, Any]) -> dict[str, Any]:
+    """A completed connect or test fetch (H.1 step 3): the socket's answer, with the scopes, the
+    binding and the seed note shown. Scopes outside the expected set are flagged, not refused."""
+    note = None if done["seed_note"] is None else shown(done["seed_note"], SUMMARY_LIMIT)
+    unexpected, missing = done["unexpected_scopes"], done["missing_scopes"]
+    text = f"granted {_scope_words(done['granted_scopes'])}."
+    if unexpected:
+        text += f" Not expected: {_scope_words(unexpected)}."
+    if missing:
+        text += f" Expected, not granted: {_scope_words(missing)}."
+    if done["grant_expires_at"] is not None:
+        text += f" The grant ends at {done['grant_expires_at']}: connect again before then."
+    if done["refresh_expires_at"] is not None:
+        text += f" The refresh token expires at {done['refresh_expires_at']}."
+    if not done["persisted"]:
+        text += " Kept in memory, not written to disk: check the state volume."
+    if note is not None:
+        text += f" {note}"
+    return {
+        **done,
+        "credential": credential,
+        "name_shown": shown(credential, NAME_LIMIT),
+        "binding_shown": _binding_words(done["binding"]),
+        "granted_scopes_shown": _scopes(done["granted_scopes"]),
+        "unexpected_scopes_shown": _scopes(unexpected),
+        "missing_scopes_shown": _scopes(missing),
+        "seed_note_shown": note,
+        "text_shown": text,
+    }
+
+
+def _scopes(scopes: Iterable[str]) -> list[str]:
+    return [shown(scope) for scope in scopes]
+
+
+def _scope_words(scopes: Sequence[str]) -> str:
+    """Scopes for a summary line, each shown, or ``none``."""
+    return " ".join(_scopes(scopes)) if scopes else "none"
 
 
 def _session(call: Call) -> Session:

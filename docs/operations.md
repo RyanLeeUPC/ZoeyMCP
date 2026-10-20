@@ -141,9 +141,31 @@ $ zoeymcp login spotify --flow=<ID>
 The second command reads the address the same way (a hidden prompt, or one line piped in with
 `exec -T`). Keep the `=`: a flow ID can start with a dash.
 
+**In the portal.** **Connect**, on the Credentials page (§26), is the same login from a
+browser, and pasting is its primary path too. The dialog shows the scopes asked for and expected,
+where the tokens will go, and a link that opens the provider's sign-in page in a new tab. After
+you approve, that tab is sent to the credential's `redirect_uri` and fails to load, as above:
+copy its whole address from that tab's address bar and paste it into the dialog, within the
+login's 10 minutes. The vault checks the paste at once, before any passkey prompt: a mistyped or
+wrong address is refused with its reason and can be pasted again, while a provider's refusal
+ends the login and shows the description the answer carried. Then it shows what it will store
+(the binding, the one it replaces, the scopes), and exchanges the code only after you confirm
+with your passkey; the exchange can take up to 76 s. **Connect and rebind** is `--rebind`. For
+`client_credentials` the button is **Test it**, the test fetch; one that works clears the
+credential's failure state, as `oauth reset` would. **Try again** is `oauth reset`, after a
+passkey prompt.
+
+Logins are owned: one started in the portal can't be completed or cancelled from the CLI or from
+another session, nor one started in the CLI from the portal; each gets `flow_unknown`, as an
+unknown login would. A credential still has one pending login, whoever started it: a new start
+replaces it and says so (the CLI prints "Replaced a login pending in the portal."; the portal's
+dialog says where the replaced one was pending). A portal session that ends cancels its logins.
+
 **`--rebind`.** A login is refused when the policy now binds the grant differently from the
 stored one, for example after a route moved to a new upstream origin. The CLI prints the old and
-the new binding; run the login again with `--rebind` to accept the new one.
+the new binding; run the login again with `--rebind` to accept the new one. The portal checks the
+binding again when it checks the paste, so a policy reloaded meanwhile is refused there, before
+the code is spent.
 
 **`client_credentials`.** There is nothing to consent to: `login` makes one token call, prints
 "The client credentials of <name> work: ...", stores nothing, and clears the credential's failure
@@ -156,7 +178,8 @@ flight), and 10 s for everything else. After a timeout, check `oauth status` bef
 trying again: the vault may have finished.
 
 **Why a login is refused.** The CLI prints a message; the admin answer also carries one of
-these `reason` codes:
+these `reason` codes, and the portal answers with the same reason and status, in its own words
+(the table at the end of §26):
 
 | Reason | Meaning | What to do |
 | --- | --- | --- |
@@ -876,8 +899,8 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 
 ## 26. The portal
 
-A draft, filled in as the portal is built: signing in, setup, sessions, passkeys, step-up and
-secrets so far. Everything here can also be done with the CLI (§1).
+A draft, filled in as the portal is built: signing in, setup, sessions, passkeys, step-up,
+secrets, health and OAuth connect so far. Everything here can also be done with the CLI (§1).
 
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
@@ -941,6 +964,9 @@ proxy sees every secret typed into the portal.
    a passkey that is proven to work. Compare the fingerprint with `zoeymcp passkeys`, or with
    the line `--wait` prints.
 
+A phone's passkey provider may report an error even when the enrolment or the sign-in worked: if
+the portal shows the new passkey's fingerprint, or signs you in, it worked.
+
 A setup session lasts 10 minutes and enrols one passkey. A code relayed to someone else works for
 whoever uses it first, so watch for it: `passkey_enrolled` with `via: setup_code` (or
 `setup_code_reset`) is logged at level `warning`, and `--wait` prints the passkey's
@@ -992,8 +1018,11 @@ the passkey that confirmed it), `step_up_refused` (the reason), `action_changed`
 **Secrets.** The Secrets page lists every secret in the store by name: what it may be used for
 (the origins it is sent to; for an OAuth secret, its token endpoint and where its access tokens
 go; for an SMTP password, the server, sender and recipients), when it was set and last
-replaced, and the master key it is encrypted under. It never shows a value, its length or a
-hash of one, and no portal answer carries one. **Set the secret** writes one: give the name
+replaced, the master key it is encrypted under, and its health: `ok`, or what `zoeymcp health`
+finds about it (`binding_changed` when a use the policy makes now would be refused,
+`unreferenced` when nothing uses it, `orphan_slot` for a live token no credential keeps). It
+never shows a value, its length or a hash of one, and no portal answer carries one. **Set the
+secret** writes one: give the name
 (the `NAME` of `store:NAME` in the policy) and the value, which is a password field the page
 empties as soon as it is sent, whatever the answer. The vault checks it and shows, before the
 passkey prompt, the binding it will be stored with and what it replaces (and the binding until
@@ -1007,6 +1036,31 @@ can from the host). If the policy is reloaded between the summary and the passke
 the binding moves, the vault refuses with what it finds now. A write the state volume refuses is
 kept in memory and said so, as with the CLI. Logs: `secret_set` and `secret_deleted` with `via:
 "portal"` (or `"socket"`), never the value.
+
+**Home and health.** Home is the checklist of what needs you: every finding `zoeymcp health`
+reports (§3), errors first, then warnings, then information, each with what to do: a button
+where the portal can do it (**Connect**, **Try again**, **Set it on the Secrets page**, **Add a
+passkey**), or the words for what only the host can do (restart with an environment variable
+set, fix the policy, check the state volume). With no error or warning it says "Everything is
+ready". Findings marked "(from stored metadata)" come from the store file's clear metadata,
+which anyone with the file can edit: they are shown, never acted on. Every page shows the counts
+of errors and warnings beside the session, and a banner while there is an error. Health is read
+from metadata only, as `zoeymcp health` reads it: nothing is decrypted and no request is sent.
+
+**Credentials.** The Credentials page lists every credential in the policy with the routes that
+use it, its health findings, and for an OAuth credential its state (`ok`, `idle`, `backoff`,
+`terminal`), its failure code, when it last worked, the scopes it asks for and where its tokens
+go. **Connect** signs in with the provider by paste (§2); **Test it**, for a `client_credentials`
+credential, makes one token call and, if it works, clears the failure state. **Try again** clears
+a failure state after a passkey prompt, as `zoeymcp oauth reset` does, so the next request that
+needs a token tries once. A credential whose refresh token is given another way (an `env:` seed,
+or a store entry set on the Secrets page) has no Connect: its findings say how to renew it.
+The Credentials page never shows a token, a code or a client secret, and neither does any portal
+answer: the authorization link holds the login's `state` and the PKCE challenge, useless without
+the verifier the vault keeps. Logs: `oauth_login_started`, `oauth_login_completed` or
+`oauth_login_failed` (the reason), `oauth_flow_replaced`, `step_up_confirmed` with the action
+`oauth.complete` or `oauth.reset`, and `oauth_cache_reset`; never a pasted address, a flow ID or
+a provider's description.
 
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A

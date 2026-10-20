@@ -7,7 +7,8 @@ Each walk takes its routes from the route table, so a route added later is walke
   may carry a credential, each only its own: the two exceptions R61 records (Q23).
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
-  a live slot, and a value held by a pending ``secret.put``. No answer carries a value, a setup
+  a live slot, and a value held by a pending ``secret.put``. Its health, OAuth list and connect
+  routes read the same store, token manager and logins. No answer carries a value, a setup
   code, the gateway key, or a session half beyond the one answer that mints it.
 - **The portal's code**: an AST check finds no reference to ``SetupCodes.issue``, the gateway key
   or a store read of a value anywhere in ``portal/``, so no portal route can reach either
@@ -34,6 +35,8 @@ from tests.fakes.authenticator import SoftAuthenticator
 from zoeymcp.portal.app import PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES, STATIC, Route
+from zoeymcp.vault.admin import HealthReader
+from zoeymcp.vault.oauth.login import LoginService
 
 from .test_admin import BROKER_BINDING, KEYS, AdminRig
 from .test_portal_wire import ORIGIN, Page
@@ -202,8 +205,9 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
         static=load_static(),
         setup=rig.setup,
         passkeys=passkeys,
-        login=None,
+        login=LoginService(rig.tokens),
         secrets=Secrets(rig.store, rig.tokens, lambda: rig.policy),
+        health=HealthReader(rig.store, lambda: rig.policy, passkeys=passkeys).report,
     )
     answers: list[str] = []
     transport = httpx.ASGITransport(app=app)

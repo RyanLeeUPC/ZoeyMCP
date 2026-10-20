@@ -5,8 +5,10 @@ Agent (the SDK client) -> gateway -> vault -> the fake MCP server, which takes t
 authorization server's live access tokens only. The shipped ``remote-mcp-oauth.yaml`` is used
 with only its endpoints, upstream, client token, source and example tools swapped. The operator
 logs in with the real CLI (``zoeymcp login``, the test playing the browser and pasting the
-address). The vault, the authorization server and the MCP server read one clock, so a test can
-let an access token expire.
+address), or through the portal (M5 design H.1, step 14a): a setup code, a passkey, Connect, the
+approval in the browser, the paste, and its confirm with the passkey. Then the same calls. The
+vault, the authorization server and the MCP server read one clock, so a test can let an access
+token expire.
 """
 
 from __future__ import annotations
@@ -24,9 +26,13 @@ import httpx
 import pytest
 
 from tests.fakes.agent import ACCEPT, Script, agent
+from tests.fakes.authenticator import SoftAuthenticator
+from tests.fakes.browser import Browser as PortalBrowser
 from tests.fakes.mcp_server import McpFake
 from tests.fakes.oauth_server import FakeAuthServer
-from tests.gateway.rig import pin_of_fake, token_for
+from tests.gateway.rig import Running, pin_of_fake, token_for
+from tests.portal.flows import enrol, redeem
+from tests.portal.flows import login as sign_in
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import OAuth2Credential, RemoteServer, hash_token
@@ -37,7 +43,7 @@ from zoeymcp.vault.store import STORE_FILE
 from .conftest import BASE, PROFILES, Clock, serve_tls
 from .gateway import GatewayDeployment, Seen
 from .test_mcp_shapes import LINKS, own_uid, text
-from .test_oauth_shapes import PRINTED_URL, REDIRECT, Browser
+from .test_oauth_shapes import PRINTED_URL, REDIRECT, Browser, browse
 from .tls import ProviderCA
 
 pytestmark = pytest.mark.anyio
@@ -124,7 +130,14 @@ def as_fake(fake: McpFake) -> dict[str, str]:
 
 @contextmanager
 def deployed(
-    tmp_path: Path, ca: ProviderCA, auth: FakeAuthServer, fake: McpFake, clock: Clock, link: str
+    tmp_path: Path,
+    ca: ProviderCA,
+    auth: FakeAuthServer,
+    fake: McpFake,
+    clock: Clock,
+    link: str,
+    *,
+    portal: bool = False,
 ) -> Iterator[GatewayDeployment]:
     with (
         serve_tls(auth.app(), ca) as auth_url,
@@ -143,6 +156,7 @@ def deployed(
             link_uid=own_uid() if link == "unix" else None,
             replace=replace,
             clock=clock,
+            portal=portal,
         )
         yield gateway
     store_file = gateway.vault.state / STORE_FILE
@@ -173,6 +187,57 @@ def login(gateway: GatewayDeployment, ca: ProviderCA) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
+def portal_login(gateway: GatewayDeployment, ca: ProviderCA) -> str:
+    """Connect through the portal by paste (H.1): a setup code issued as the socket issues one, a
+    passkey enrolled with it and signed in with, then Connect, the approval in the browser's new
+    tab, the paste, and its confirm with the passkey. Every portal answer is kept for the sweep.
+    Returns the authorization URL."""
+    vault = gateway.vault
+    code, _ = vault.call(lambda: vault.setup.issue())
+    passkey = SoftAuthenticator()
+    with PortalBrowser() as browser:
+        page = browser.page(vault.portal_origin)
+        assert redeem(page, code.reveal()).status_code == 200
+        assert enrol(page, passkey).status_code == 200
+        assert sign_in(page, passkey).status_code == 200
+        started = page.fetch("POST", f"/api/oauth/{CREDENTIAL}/start", json={})
+        assert started.status_code == 200, started.text
+        url: str = started.json()["authorize_url"]
+        pasted = browse(url, ca)
+        data = {"credential": CREDENTIAL, "flow": started.json()["flow"], "redirect_url": pasted}
+        held = page.fetch("POST", "/api/actions", json={"kind": "oauth.complete", "data": data})
+        assert held.status_code == 200, held.text
+        assert auth_calls(gateway) == 0  # nothing exchanged before the passkey
+        assertion = passkey.get(held.json()["options"], page.origin).body()
+        path = f"/api/actions/{held.json()['action']}/confirm"
+        done = page.fetch("POST", path, json={"credential": assertion})
+        assert done.status_code == 200, done.text
+        assert (done.json()["slot"], done.json()["persisted"]) == (SLOT, True)
+        listed = page.fetch("GET", "/api/oauth")
+        assert [entry["state"] for entry in listed.json()["credentials"]] == ["ok"]
+        gateway.seen.outputs += [r.text for r in (started, held, done, listed)]
+    return url
+
+
+def auth_calls(gateway: GatewayDeployment) -> int:
+    """How many token calls the vault has logged."""
+    return len(gateway.seen.events("oauth_refresh"))
+
+
+def check_the_login(auth: FakeAuthServer, url: str) -> None:
+    """A PKCE login that asked for the server as the token's audience, and one exchange."""
+    query = dict(parse_qsl(urlsplit(url).query))
+    assert (query["code_challenge_method"], query["resource"]) == ("S256", RESOURCE)
+    [exchange] = auth.calls
+    assert (exchange.grant_type, exchange.auth, exchange.status) == (
+        "authorization_code",
+        "body",
+        200,
+    )
+    assert exchange.params["resource"] == RESOURCE
+    assert "client_secret" not in exchange.params
+
+
 def mcp_headers() -> dict[str, str]:
     return {"authorization": f"Bearer {token_for(CLIENT)}"}
 
@@ -184,12 +249,8 @@ def refresh_triggers(seen: Seen) -> list[str]:
 # --- S6 x S10 ------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("link", LINKS)
-async def test_login_calls_refreshes_a_refused_token_and_an_approval(
-    tmp_path: Path, ca: ProviderCA, link: str
-) -> None:
-    clock = Clock()
-    auth = FakeAuthServer(
+def notes_server(clock: Clock) -> FakeAuthServer:
+    return FakeAuthServer(
         clock.wall,
         client_id=CLIENT_ID,
         auth="none",
@@ -197,6 +258,14 @@ async def test_login_calls_refreshes_a_refused_token_and_an_approval(
         scopes=SCOPES,
         prefix="fake-notes",
     )
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_login_calls_refreshes_a_refused_token_and_an_approval(
+    tmp_path: Path, ca: ProviderCA, link: str
+) -> None:
+    clock = Clock()
+    auth = notes_server(clock)
     fake = McpFake(authorize=auth.access_ok)
     script = Script([ACCEPT])
     with deployed(tmp_path, ca, auth, fake, clock, link) as gateway, gateway.running() as running:
@@ -205,52 +274,77 @@ async def test_login_calls_refreshes_a_refused_token_and_an_approval(
         assert (code, err) == (0, "")
         assert f"Stored the refresh token for {CREDENTIAL} as {SLOT}.\n" in out
         [url] = PRINTED_URL.findall(out)
-        query = dict(parse_qsl(urlsplit(url).query))
-        assert (query["code_challenge_method"], query["resource"]) == ("S256", RESOURCE)
-        [exchange] = auth.calls
-        assert (exchange.grant_type, exchange.auth, exchange.status) == (
-            "authorization_code",
-            "body",
-            200,
-        )
-        assert exchange.params["resource"] == RESOURCE
-        assert "client_secret" not in exchange.params
-        first = auth.active_refresh_token()
+        check_the_login(auth, url)
+        await the_calls(gateway, running, auth, clock, script)
+    check_the_calls(gateway, fake, script)
 
-        async with agent(running.mcp(), script=script, headers=mcp_headers()) as client:
-            listed = await client.list_tools()
-            assert sorted(tool.name for tool in listed.tools) == sorted(TOOLS.values())
-            assert text(await client.call_tool("echo", {"text": "before"})) == "before"
-            assert len(auth.calls) == 1  # the login's access token is used
 
-            # The access token expires between calls, twice: each refresh rotates, and the
-            # next one presents the new refresh token.
-            clock.advance(HOUR)
-            assert text(await client.call_tool("echo", {"text": "refreshed"})) == "refreshed"
-            rotated = auth.active_refresh_token()
-            assert rotated not in (None, first)
-            clock.advance(HOUR)
-            assert text(await client.call_tool("echo", {"text": "rotated"})) == "rotated"
-            presented = [(c.refresh_token, c.params["resource"]) for c in auth.refresh_calls]
-            assert presented == [(first, RESOURCE), (rotated, RESOURCE)]
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_portal_connect_by_paste_then_the_same_calls(
+    tmp_path: Path, ca: ProviderCA, link: str
+) -> None:
+    """D-116's portal variant (M5 design step 14a): the operator connects in the portal."""
+    clock = Clock()
+    auth = notes_server(clock)
+    fake = McpFake(authorize=auth.access_ok)
+    script = Script([ACCEPT])
+    with (
+        deployed(tmp_path, ca, auth, fake, clock, link, portal=True) as gateway,
+        gateway.running() as running,
+    ):
+        url = portal_login(gateway, ca)
+        check_the_login(auth, url)
+        await the_calls(gateway, running, auth, clock, script)
+    check_the_calls(gateway, fake, script)
+    confirmed = gateway.seen.events("step_up_confirmed")
+    assert [line["action"] for line in confirmed] == ["oauth.complete"]
 
-            # The server refuses a token that hasn't expired: the call fails as an upstream
-            # error, and the vault doesn't send the POST again.
-            clock.advance(MIN_401_AGE)
-            auth.drop_access_tokens()
-            refused = await client.call_tool("echo", {"text": "refused"})
-            assert refused.is_error
-            assert text(refused).startswith("upstream error (ref ")
-            assert len(auth.refresh_calls) == 2
-            # The vault dropped the token, so the next call gets a new one.
-            assert text(await client.call_tool("echo", {"text": "after"})) == "after"
-            assert len(auth.refresh_calls) == 3
 
-            # The approve tool: the agent's human is asked, accepts, and the call runs.
-            added = await client.call_tool("add", {"a": 2, "b": 3})
-            assert (added.is_error, text(added)) == (False, "5")
-        gateway.seen.outputs += [text(refused), text(added)]
+async def the_calls(
+    gateway: GatewayDeployment,
+    running: Running,
+    auth: FakeAuthServer,
+    clock: Clock,
+    script: Script,
+) -> None:
+    """With the grant stored: calls, two refreshes that rotate, a refused token, an approval."""
+    first = auth.active_refresh_token()
+    async with agent(running.mcp(), script=script, headers=mcp_headers()) as client:
+        listed = await client.list_tools()
+        assert sorted(tool.name for tool in listed.tools) == sorted(TOOLS.values())
+        assert text(await client.call_tool("echo", {"text": "before"})) == "before"
+        assert len(auth.calls) == 1  # the login's access token is used
 
+        # The access token expires between calls, twice: each refresh rotates, and the
+        # next one presents the new refresh token.
+        clock.advance(HOUR)
+        assert text(await client.call_tool("echo", {"text": "refreshed"})) == "refreshed"
+        rotated = auth.active_refresh_token()
+        assert rotated not in (None, first)
+        clock.advance(HOUR)
+        assert text(await client.call_tool("echo", {"text": "rotated"})) == "rotated"
+        presented = [(c.refresh_token, c.params["resource"]) for c in auth.refresh_calls]
+        assert presented == [(first, RESOURCE), (rotated, RESOURCE)]
+
+        # The server refuses a token that hasn't expired: the call fails as an upstream
+        # error, and the vault doesn't send the POST again.
+        clock.advance(MIN_401_AGE)
+        auth.drop_access_tokens()
+        refused = await client.call_tool("echo", {"text": "refused"})
+        assert refused.is_error
+        assert text(refused).startswith("upstream error (ref ")
+        assert len(auth.refresh_calls) == 2
+        # The vault dropped the token, so the next call gets a new one.
+        assert text(await client.call_tool("echo", {"text": "after"})) == "after"
+        assert len(auth.refresh_calls) == 3
+
+        # The approve tool: the agent's human is asked, accepts, and the call runs.
+        added = await client.call_tool("add", {"a": 2, "b": 3})
+        assert (added.is_error, text(added)) == (False, "5")
+    gateway.seen.outputs += [text(refused), text(added)]
+
+
+def check_the_calls(gateway: GatewayDeployment, fake: McpFake, script: Script) -> None:
     [prompt] = script.prompts
     assert "Tool: notes \N{RIGHTWARDS ARROW} add" in prompt.message
     assert [(call.name, call.arguments) for call in fake.calls] == [

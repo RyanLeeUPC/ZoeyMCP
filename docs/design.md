@@ -1449,8 +1449,20 @@ have passed:
     accepts the new one.
   - An answer with no refresh token is refused, with a hint: Google needs `access_type: offline`
     and `prompt: consent`; some providers need an `offline_access` scope.
-  - In the portal (M5) the modal will say: *after approving, copy the `http://127.0.0.1…` URL
-    from the address bar and paste it here.* The PKCE verifier never leaves the vault.
+  - **In the portal (M5), paste is the primary path too, for every credential.** Connect shows
+    the scopes asked for and expected and where the tokens will go, then the authorization URL as
+    a link to a new tab (no opener, no referrer, followed only if it is `https`) and the modal's
+    text: *after approving, copy the `http://127.0.0.1…` address from that tab's address bar (the
+    page won't load; that's expected) and paste it here*, with the credential's actual
+    `redirect_uri` and the deadline. The paste is the data of the `oauth.complete` step-up
+    action, and its plan runs every check of step 3 against the flow without spending it, so a
+    mistyped paste is refused **before** the passkey prompt and can be pasted again; a provider
+    `error` ends the flow. The plan also checks the binding, so a policy reloaded since the start
+    is refused there until a start with rebind. Only the confirm, after the passkey, takes the
+    flow and exchanges the code (step 4). Flows are **owned**: by the CLI or by one portal
+    session; another owner's flow answers as an unknown one, a credential keeps one pending flow
+    whoever started it (a start replaces the other's and says so), and a session that ends
+    cancels its flows. The PKCE verifier never leaves the vault.
 - **MCP server by URL:**
   1. The vault reads the server's protected-resource metadata, then its authorization server's
      metadata.
@@ -1669,7 +1681,9 @@ holds a raw control or format character.
   - a wrong `Host` (DNS rebinding) is refused;
   - a cross-origin `POST` is refused;
   - a save without step-up is refused;
-  - an OAuth callback with a reused, expired or foreign `state` is refused;
+  - an OAuth callback with a reused, expired or foreign `state` is refused; and its paste
+    reading: a paste for a reused, expired or foreign flow, or another session's, is refused
+    before any passkey prompt, and so is a mistyped one, which can then be pasted again;
   - a setup code is single-use and expires;
   - the WebAuthn verifier's test vectors pass: truncated `authenticatorData`, flags missing
     user-verified, a wrong origin, a wrong site-ID hash, a reused challenge, an unsupported
