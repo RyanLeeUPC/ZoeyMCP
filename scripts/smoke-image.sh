@@ -1,7 +1,8 @@
 #!/bin/sh
 # Smoke-test a built image: the vault the way the hardened tier runs it (read-only, no capabilities,
 # no-new-privileges, non-root), then the standard tier from deploy/compose.yaml. Both tiers reach
-# a fake upstream (tests/fakes/run_mcp_server.py) with one tools/list and one tools/call.
+# a fake upstream (tests/fakes/run_mcp_server.py) with one tools/list and one tools/call. Both
+# serve the portal on the host's loopback, and the probes show who else can reach it.
 # With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
 # compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
 # Usage: scripts/smoke-image.sh [--derived OFFICIAL] IMAGE
@@ -17,6 +18,7 @@ name="zoeymcp-smoke-$$"
 volume="zoeymcp-smoke-state-$$"
 project="zoeymcp-smoke-$$"
 hardened_project="zoeymcp-smoke-hardened-$$"
+probe_net="zoeymcp-smoke-probe-$$"
 work="$(mktemp -d)"
 port=18080
 examples="$(cd "$(dirname "$0")/../examples" && pwd)"
@@ -50,6 +52,7 @@ cleanup() {
     if [ -f "$work/override.yaml" ]; then
         hardened_tier down -v >/dev/null 2>&1 || true
     fi
+    docker network rm "$probe_net" >/dev/null 2>&1 || true
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -71,6 +74,15 @@ docker run --rm "$image" --version
 [ "$(docker run --rm --entrypoint id "$image" -u)" = "10001" ] || fail "image doesn't run as uid 10001"
 [ "$(docker run --rm --entrypoint sh "$image" -c 'command -v zoeymcp')" = "/opt/zoeymcp/bin/zoeymcp" ] \
     || fail "zoeymcp on PATH isn't the vault's environment"
+
+step "Docker Engine 28.0 or later (contract 44)"
+# Before 28.0, hosts on the same L2 segment could reach ports published on a loopback address.
+engine="$(docker version -f '{{.Server.Version}}')"
+echo "Docker Engine $engine"
+case "${engine%%.*}" in
+    "" | *[!0-9]*) fail "can't read the Docker server's version: $engine" ;;
+esac
+[ "${engine%%.*}" -ge 28 ] || fail "Docker Engine $engine is older than 28.0"
 
 # Runs one environment's interpreter in isolated mode: in_env DIR ARGS...
 in_env() {
@@ -253,6 +265,24 @@ done
 found="$(in_env /opt/zoeymcp-gateway -c "$importable" opentelemetry.sdk)"
 [ -z "$found" ] || fail "the OpenTelemetry SDK can be imported"
 
+step "the portal's static files are installed in the vault's environment (contract 42)"
+# Prints path, sha256 and content type of each file the portal serves (its static map), read
+# from where the package is installed: site-packages, not an editable install's source tree.
+static_files='
+import hashlib, importlib.resources, sys
+from zoeymcp.portal.routes import STATIC
+folder = importlib.resources.files("zoeymcp.portal") / "static"
+if not str(folder).startswith(sys.prefix + "/lib/") or "/site-packages/" not in str(folder):
+    sys.exit(f"the portal is not installed in site-packages: {folder}")
+for path, file in sorted(STATIC.items()):
+    print(path, hashlib.sha256((folder / file.name).read_bytes()).hexdigest(), file.content_type)
+'
+in_env /opt/zoeymcp -c "$static_files" >"$work/static" \
+    || fail "the vault's environment lacks the portal's static files"
+cat "$work/static"
+grep -q '^/ [0-9a-f]\{64\} text/html; charset=utf-8$' "$work/static" \
+    || fail "the portal's static map has no HTML shell at /"
+
 if [ -n "$official" ]; then
     step "derived: the example toolkit loads as the gateway's uid, origin checked, pinned as committed"
     load='
@@ -424,12 +454,48 @@ slow_pin="$(echo "$pins" | sed -n 's/^slow //p')"
 [ -n "$echo_pin" ] && [ -n "$slow_pin" ] || fail "no pins for echo and slow: $pins"
 certifi_bundle="$(in_env /opt/zoeymcp -c 'import certifi; print(certifi.where())')"
 [ -n "$certifi_bundle" ] || fail "the vault's environment has no certifi bundle"
+# With --derived, the example mail toolkit as a server, with the connector and route its slot
+# uses, so that review can be asked about a toolkit: mail_toolkit connectors|routes|servers.
+mail_pin="$(sed -n 's/^ *send_note: \(sha256:[0-9a-f]*\)$/\1/p' "$examples/policy.yaml")"
+mail_toolkit() {
+    [ -n "$official" ] || return 0
+    case "$1" in
+        connectors)
+            echo "        connectors:"
+            echo "          mail-out:"
+            echo "            {kind: smtp, host: smtp.mail.example, port: 465, from: agent@mail.example,"
+            echo "             to: [partner@mail.example], username: store:mail-user,"
+            echo "             password: store:mail-pass}"
+            ;;
+        routes)
+            echo "          - name: mail-send"
+            echo "            prefix: /mail"
+            echo "            connector: mail-out"
+            echo "            callers: [gateway]"
+            echo "            rules: [{methods: [GET], paths: [/config]}, {methods: [POST], paths: [/send]}]"
+            ;;
+        servers)
+            echo "            mail:"
+            echo "              kind: toolkit"
+            echo "              module: example_toolkits.mail"
+            echo "              tools: {include: [send_note], approve: [send_note]}"
+            echo "              review: {send_note: \"$mail_pin\"}"
+            echo "              slots:"
+            echo "                mail:"
+            echo "                  route: mail-send"
+            echo "                  rules:"
+            echo "                    - {methods: [GET], paths: [/config]}"
+            echo "                    - {methods: [POST], paths: [/send], approved: true}"
+            ;;
+    esac
+}
 # The smoke's policy after its first lines, indented for ZOEYMCP_CONFIG: the shipped notes
 # server, and a fake server routed to the fake upstream, with echo and slow pinned and allowed.
 smoke_policy() {
     cat <<EOF
         credentials:
           notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+$(mail_toolkit connectors)
         routes:
           - name: notes-mcp
             prefix: /notes
@@ -444,6 +510,7 @@ smoke_policy() {
             callers: [gateway]
             stream: true
             rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+$(mail_toolkit routes)
         gateway:
           hosts: [gateway, localhost, 127.0.0.1, zoeymcp.lan.example]
           clients:
@@ -456,6 +523,7 @@ smoke_policy() {
               path: /mcp
               tools: {include: [echo, slow], allow: [echo, slow]}
               review: {echo: "$echo_pin", slow: "$slow_pin"}
+$(mail_toolkit servers)
 EOF
 }
 # The vault's volume line that adds the fake upstream's CA to what it trusts.
@@ -515,6 +583,129 @@ fake_round() {
     [ "$(fake_mcp "$round_base" "$call_echo" -H 'mcp-method: tools/call' -H 'mcp-name: echo' "$@")" \
         = "200" ] || fail "tools/call echo failed"
     grep -q '"text":"smoke-echo"' "$work/body" || fail "tools/call echo didn't answer with its text"
+}
+
+# C.3's headers, names lower-cased: every portal answer carries each exactly once.
+csp="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self';"
+csp="$csp object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+csp="$csp require-trusted-types-for 'script'; trusted-types 'none'"
+printf '%s\n' "content-security-policy: $csp" "x-content-type-options: nosniff" \
+    "referrer-policy: no-referrer" "cache-control: no-store" \
+    "cross-origin-opener-policy: same-origin" "cross-origin-resource-policy: same-origin" \
+    "x-frame-options: DENY" "x-zoeymcp-vault: portal" >"$work/c3"
+# portal HOST PATH CURL-OPTIONS...: a request to the portal published on the host's loopback,
+# with HOST as its Host header; prints the status, and the body and the headers (names
+# lower-cased) land in $work.
+portal() {
+    portal_host="$1"
+    portal_path="$2"
+    shift 2
+    : >"$work/raw-headers"
+    curl -s -o "$work/body" -D "$work/raw-headers" -w '%{http_code}' -H "Host: $portal_host" \
+        "$@" "http://127.0.0.1:8081$portal_path" || true
+    tr -d '\r' <"$work/raw-headers" \
+        | awk '{ i = index($0, ":"); print (i ? tolower(substr($0, 1, i - 1)) substr($0, i) : $0) }' \
+        >"$work/headers"
+}
+# portal_post HOST PATH BODY: a JSON POST as the portal's own page sends it.
+portal_post() {
+    portal "$1" "$2" -X POST -H 'sec-fetch-site: same-origin' -H 'origin: http://localhost:8081' \
+        -H 'content-type: application/json' -d "$3"
+}
+# c3 WHAT: the answer in $work carries each C.3 header exactly once, and no CORS header or ETag.
+c3() {
+    while IFS= read -r header; do
+        [ "$(grep -cFx "$header" "$work/headers")" = "1" ] \
+            || fail "$1 doesn't carry exactly one ${header%%:*} header as C.3 has it"
+    done <"$work/c3"
+    if grep -qE '^(access-control-|etag:)' "$work/headers"; then
+        fail "$1 carries a CORS header or an ETag"
+    fi
+}
+# portal_shell TIER: from the host's loopback, each static file with C.3's headers, its content
+# type and the bytes the image installed (contract 42); a loopback IP literal as the Host gets
+# the 308 to localhost for GET /, and 421 otherwise.
+portal_shell() {
+    i=0
+    until [ "$(portal localhost:8081 /)" = "200" ]; do
+        i=$((i + 1))
+        [ "$i" -lt 50 ] || fail "$1: the portal didn't serve its shell on 127.0.0.1:8081"
+        sleep 0.2
+    done
+    while read -r static_path static_hash static_type; do
+        [ "$(portal localhost:8081 "$static_path")" = "200" ] || fail "$1: GET $static_path wasn't 200"
+        c3 "$1: GET $static_path"
+        grep -qFx "content-type: $static_type" "$work/headers" \
+            || fail "$1: GET $static_path isn't served as $static_type"
+        [ "$(sha256sum "$work/body" | cut -d ' ' -f 1)" = "$static_hash" ] \
+            || fail "$1: GET $static_path isn't the file the image installed"
+    done <"$work/static"
+    [ "$(portal 127.0.0.1:8081 /)" = "308" ] || fail "$1: GET / with Host 127.0.0.1:8081 wasn't 308"
+    c3 "$1: the 308"
+    grep -qFx 'location: http://localhost:8081/' "$work/headers" \
+        || fail "$1: the 308 doesn't send the browser to http://localhost:8081/"
+    [ "$(portal 127.0.0.1:8081 /app.js)" = "421" ] \
+        || fail "$1: GET /app.js with Host 127.0.0.1:8081 wasn't 421"
+    c3 "$1: the 421"
+    grep -qF 'http://localhost:8081/' "$work/body" || fail "$1: the 421 doesn't name http://localhost:8081/"
+    [ "$(portal_post 127.0.0.1:8081 /api/setup/redeem '{"code":"x"}')" = "421" ] \
+        || fail "$1: POST /api/setup/redeem with Host 127.0.0.1:8081 wasn't 421"
+}
+# portal_code TIER CODE LOGS-COMMAND...: CODE is a setup code just issued through the admin
+# socket; a bad code gets 401 from the host's loopback, and CODE isn't in the tier's logs.
+portal_code() {
+    code_tier="$1"
+    code="$2"
+    shift 2
+    case "$code" in
+        ??????-??????-??????-??????) ;;
+        *) fail "$code_tier: setup-code printed no code" ;;
+    esac
+    [ "$(portal_post localhost:8081 /api/setup/redeem '{"code":"AAAAAA-AAAAAA-AAAAAA-AAAAAA"}')" \
+        = "401" ] || fail "$code_tier: a bad setup code wasn't refused with 401"
+    c3 "$code_tier: the refused setup code"
+    grep -q '"reason": *"setup_code_refused"' "$work/body" \
+        || fail "$code_tier: a bad setup code wasn't refused as setup_code_refused"
+    "$@" >"$work/logs" 2>&1
+    grep -q '"event":"setup_code_issued"' "$work/logs" || fail "$code_tier: no setup_code_issued line"
+    if grep -qiF -e "$code" -e "$(echo "$code" | tr -d -)" "$work/logs"; then
+        fail "$code_tier: the setup code is in the container's logs"
+    fi
+}
+# Exits non-zero naming each address that takes a connection on 8081 within 2 s.
+unreachable='
+import socket, sys
+reached = []
+for address in sys.argv[1:]:
+    try:
+        socket.create_connection((address, 8081), timeout=2).close()
+    except OSError:
+        continue
+    reached.append(address)
+if reached:
+    sys.exit("reached port 8081 at " + ", ".join(reached))
+print("8081 unreachable at", " ".join(sys.argv[1:]))
+'
+# probe NETWORK ARGS...: the vault's interpreter in a container on NETWORK, run as the hardened
+# tier runs it.
+probe() {
+    probe_network="$1"
+    shift
+    # shellcheck disable=SC2086
+    docker run --rm $hardened --network "$probe_network" --entrypoint /opt/zoeymcp/bin/python \
+        "$image" -I "$@"
+}
+# unrelated TIER CONTAINER: a probe on a network of its own can't reach the loopback-published
+# portal through the host's bridge addresses or any of CONTAINER's addresses (contract 44).
+unrelated() {
+    docker network inspect "$probe_net" >/dev/null 2>&1 || docker network create "$probe_net" >/dev/null
+    bridges="$(docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' "$probe_net" bridge)"
+    addresses="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$2")"
+    echo "$bridges" | grep -q '[0-9]' || fail "$1: no bridge address to probe"
+    echo "$addresses" | grep -q '[0-9]' || fail "$1: no container address to probe"
+    # shellcheck disable=SC2086
+    probe "$probe_net" -c "$unreachable" $bridges $addresses \
+        || fail "$1: a container on an unrelated network reached the portal"
 }
 
 step "standard tier: up, from deploy/compose.yaml, with the smoke's policy and the fake upstream"
@@ -596,6 +787,78 @@ echo "$out" | grep -q "^notes  " || fail "review lists no notes server"
 docker exec "$std" zoeymcp gateway-status | grep -q '^view sha256:' \
     || fail "gateway-status didn't reach the gateway"
 
+step "standard tier: ledger --verify and ledger --vault exit 0 on an empty ledger, as root (D-74)"
+docker exec "$std" zoeymcp ledger --verify || fail "ledger --verify failed on an empty ledger"
+docker exec "$std" zoeymcp ledger --vault || fail "ledger --vault failed on an empty ledger"
+
+if [ -n "$official" ]; then
+    step "derived: review of the mail toolkit, as root (D-74)"
+    out="$(docker exec "$std" zoeymcp review mail)" || fail "review mail didn't reach the gateway"
+    echo "$out"
+    echo "$out" | grep -qF "send_note: $mail_pin" || fail "review mail doesn't show the committed pin"
+fi
+
+step "standard tier: the portal's shell from the host's loopback, with C.3's headers (contract 42)"
+portal_shell "standard tier"
+
+step "standard tier: a bad setup code gets 401; one issued as root isn't in the logs"
+code="$(docker exec "$std" zoeymcp setup-code)" || fail "setup-code as root didn't reach the vault"
+portal_code "standard tier" "$code" standard logs zoeymcp
+
+step "standard tier: a container on the compose network gets only the shell and 401/429 (Q29)"
+# A sibling container on the compose network reaches the portal, as the gateway does in the
+# standard tier: it gets the static shell, a login ceremony that names no passkey, and 401 or
+# 429 from every route that holds anything, with the Host, Origin and Sec-Fetch-Site a browser
+# on the operator's origin would send.
+sibling='
+import http.client, json, sys
+from zoeymcp.portal.routes import ROUTES, STATIC
+def ask(method, path, body=None):
+    headers = {"Host": "localhost:8081", "Origin": "http://localhost:8081",
+               "Sec-Fetch-Site": "same-origin"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    connection = http.client.HTTPConnection("zoeymcp", 8081, timeout=10)
+    connection.request(method, path, body=data, headers=headers)
+    answer = connection.getresponse()
+    status, text = answer.status, answer.read()
+    connection.close()
+    print(method, path, status)
+    return status, text
+problems = []
+for path in STATIC:
+    if ask("GET", path)[0] != 200:
+        problems.append(f"GET {path} is not the shell")
+bodies = {"/api/setup/redeem": {"code": "AAAAAA-AAAAAA-AAAAAA-AAAAAA"}}
+status, text = ask("POST", "/api/login/begin", {})
+if status == 200:
+    begun = json.loads(text)
+    if set(begun) != {"ceremony", "options"} or begun["options"].get("allowCredentials"):
+        problems.append(f"login/begin answered more than a ceremony: {sorted(begun)}")
+    forged = {"id": "AAAA", "rawId": "AAAA", "type": "public-key", "response": {}}
+    bodies["/api/login/finish"] = {"ceremony": begun["ceremony"], "credential": forged}
+elif status != 429:
+    problems.append(f"POST /api/login/begin: {status}")
+for route in ROUTES:
+    if route.path == "/api/login/begin":
+        continue
+    path = route.path.format(credential="x", flow="x", action="x")
+    body = None
+    if route.method == "POST":
+        body = bodies.get(route.path, {key: "x" for key in route.body})
+    status = ask(route.method, path, body)[0]
+    if status not in (401, 429):
+        problems.append(f"{route.method} {path}: {status}")
+if problems:
+    sys.exit("; ".join(problems))
+'
+probe "${project}_default" -c "$sibling" || fail "a container on the compose network got more"
+
+step "standard tier: a container on an unrelated network can't reach the portal (contract 44)"
+unrelated "standard tier" "$std"
+
 step "standard tier: tools/list and tools/call through the vault to the fake upstream"
 fake_round http://127.0.0.1:8090
 
@@ -668,6 +931,39 @@ for target in (("1.1.1.1", 443), ("example.com", 443)):
 hardened_tier exec -T gateway python -I -c "$no_route" || fail "the gateway reached the internet"
 out="$(hardened_tier exec -T gateway zoeymcp review)" || fail "review didn't reach the gateway"
 echo "$out" | grep -q "^notes  " || fail "review lists no notes server"
+
+step "hardened tier: the portal's shell from the host's loopback, with C.3's headers (contract 42)"
+portal_shell "hardened tier"
+
+step "hardened tier: a bad setup code gets 401; one issued through the socket isn't in the logs"
+code="$(hardened_tier exec -T vault zoeymcp setup-code)" || fail "setup-code didn't reach the vault"
+portal_code "hardened tier" "$code" hardened_tier logs vault
+
+step "hardened tier: vault-portal is the vault's egress address, the only one on 8081 (contract 43)"
+vault_id="$(hardened_tier ps -q vault)"
+egress="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${hardened_project}_egress\").IPAddress}}" \
+    "$vault_id")"
+addresses="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$vault_id")"
+echo "the vault's addresses: $addresses; egress: $egress"
+resolve='
+import socket, sys
+print(" ".join(sorted({a[4][0] for a in socket.getaddrinfo(sys.argv[1], 8081)})))
+'
+found="$(hardened_tier exec -T vault python -I -c "$resolve" vault-portal)" \
+    || fail "the vault can't resolve vault-portal"
+[ -n "$egress" ] && [ "$found" = "$egress" ] \
+    || fail "vault-portal resolves to $found in the vault, not its egress address $egress"
+# shellcheck disable=SC2086
+hardened_tier exec -T gateway python -I -c "$unreachable" vault vault-portal $addresses \
+    || fail "the gateway reached the portal"
+for network in internal direct agents; do
+    # shellcheck disable=SC2086
+    probe "${hardened_project}_$network" -c "$unreachable" vault vault-portal $addresses \
+        || fail "a container on $network reached the portal"
+done
+
+step "hardened tier: a container on an unrelated network can't reach the portal (contract 44)"
+unrelated "hardened tier" "$vault_id"
 
 step "lan: TLS from Caddy's own CA, and the gateway's checks behind it"
 i=0

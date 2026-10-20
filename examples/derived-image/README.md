@@ -36,12 +36,15 @@ from files it can't write, inside its environment, and only if an entry point in
 3. The added layer touches nothing outside `/opt/zoeymcp-gateway`.
 4. Every official file there is unchanged; new files sit only under `site-packages` and `bin`;
    none is a `.pth`, setuid, setgid or world-writable file.
-5. `scripts/smoke-image.sh --derived OFFICIAL DERIVED` passes on the derived image: the standard
+5. The portal's static files are present in the vault's environment, byte for byte as the
+   official image has them.
+6. `scripts/smoke-image.sh --derived OFFICIAL DERIVED` passes on the derived image: the standard
    tier's isolation checks; the vault's environment equals the official one and can't import the
    toolkits; the gateway's holds every official distribution at its official version, and the
-   added ones shadow no official module; the entry points are the expected ones; and the example
+   added ones shadow no official module; the entry points are the expected ones; the example
    mail toolkit loads as the gateway's uid, with the origin check on, under the pin the example
-   policy commits.
+   policy commits, and `zoeymcp review mail` shows that pin; and both tiers serve the portal's
+   files.
 
 Checks 3 and 4 only read files, so nothing the new layer holds runs before it is checked.
 

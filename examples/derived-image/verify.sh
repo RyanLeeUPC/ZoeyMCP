@@ -6,8 +6,10 @@
 #   3. the added layer touches only /opt/zoeymcp-gateway;
 #   4. every official file there is unchanged, new files sit only under site-packages and bin,
 #      and none is a .pth, setuid, setgid or world-writable;
-#   5. scripts/smoke-image.sh --derived OFFICIAL DERIVED passes, which also reviews the example's
-#      mail toolkit in the derived gateway.
+#   5. the portal's static files are present in the vault's environment, as the official image
+#      has them;
+#   6. scripts/smoke-image.sh --derived OFFICIAL DERIVED passes, which also reviews the example's
+#      mail toolkit in the derived gateway, and serves the portal's files from both tiers.
 # Checks 3 and 4 read files without running them, so no .pth runs before it is checked.
 # Usage: examples/derived-image/verify.sh OFFICIAL DERIVED
 set -eu
@@ -101,6 +103,22 @@ if problems:
     sys.exit("\n".join(problems[:30]))
 PY
 
-step "5: the image smoke test, against the official image"
+step "5: the portal's static files are present, as the official image has them"
+static='
+import hashlib, importlib.resources
+from zoeymcp.portal.routes import STATIC
+folder = importlib.resources.files("zoeymcp.portal") / "static"
+for path, file in sorted(STATIC.items()):
+    print(path, hashlib.sha256((folder / file.name).read_bytes()).hexdigest())
+'
+docker run --rm --network none --entrypoint /opt/zoeymcp/bin/python "$official" -I -c "$static" \
+    > "$work/official-static.txt" || fail "the official image lacks the portal's static files"
+docker run --rm --network none --entrypoint /opt/zoeymcp/bin/python "$derived" -I -c "$static" \
+    > "$work/derived-static.txt" || fail "the derived image lacks the portal's static files"
+grep -q '^/ ' "$work/official-static.txt" || fail "the official image's portal has no shell at /"
+cmp -s "$work/official-static.txt" "$work/derived-static.txt" \
+    || fail "the derived image's portal files differ from the official image's"
+
+step "6: the image smoke test, against the official image"
 sh "$here/../../scripts/smoke-image.sh" --derived "$official" "$derived"
 echo "derived image verified: $derived"
