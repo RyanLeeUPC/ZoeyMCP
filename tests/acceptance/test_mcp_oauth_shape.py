@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+import anyio
 import httpx
 import pytest
 
@@ -275,7 +276,7 @@ async def test_login_calls_refreshes_a_refused_token_and_an_approval(
         assert f"Stored the refresh token for {CREDENTIAL} as {SLOT}.\n" in out
         [url] = PRINTED_URL.findall(out)
         check_the_login(auth, url)
-        await the_calls(gateway, running, auth, clock, script)
+        await the_calls(gateway, running, auth, fake, clock, script)
     check_the_calls(gateway, fake, script)
 
 
@@ -294,16 +295,40 @@ async def test_a_portal_connect_by_paste_then_the_same_calls(
     ):
         url = portal_login(gateway, ca)
         check_the_login(auth, url)
-        await the_calls(gateway, running, auth, clock, script)
+        await the_calls(gateway, running, auth, fake, clock, script)
     check_the_calls(gateway, fake, script)
     confirmed = gateway.seen.events("step_up_confirmed")
     assert [line["action"] for line in confirmed] == ["oauth.complete"]
+
+
+async def listening(gateway: GatewayDeployment, fake: McpFake) -> None:
+    """Wait until the server has answered every upstream connection's ``subscriptions/listen``.
+
+    A connection opens that stream in the background once it has listed, while the agent's
+    first calls go on. Until the server has answered it, its POST carries the access token the
+    vault picked for it: a token the test may expire (moving the clock) or drop meanwhile. The
+    server then answers 401, the vault drops the token or sees a newer one, and the gateway
+    takes the stream as lost and lists again, COALESCE (5 s) after its last listing, its calls
+    waiting for that. Once the streams are open, no request is on its way when the test moves
+    the clock or drops the tokens.
+    """
+    deadline = anyio.current_time() + 10
+    while True:
+        connected = len(gateway.seen.events("upstream_connected"))
+        answered = [item.status for item in fake.requests("subscriptions/listen") if item.status]
+        if connected and answered.count(200) >= connected:
+            break
+        if anyio.current_time() > deadline:
+            raise AssertionError(json.dumps({"connected": connected, "listens": answered}))
+        await anyio.sleep(0.01)
+    assert answered == [200] * len(answered), answered
 
 
 async def the_calls(
     gateway: GatewayDeployment,
     running: Running,
     auth: FakeAuthServer,
+    fake: McpFake,
     clock: Clock,
     script: Script,
 ) -> None:
@@ -314,6 +339,7 @@ async def the_calls(
         assert sorted(tool.name for tool in listed.tools) == sorted(TOOLS.values())
         assert text(await client.call_tool("echo", {"text": "before"})) == "before"
         assert len(auth.calls) == 1  # the login's access token is used
+        await listening(gateway, fake)
 
         # The access token expires between calls, twice: each refresh rotates, and the
         # next one presents the new refresh token.
@@ -351,23 +377,36 @@ def check_the_calls(gateway: GatewayDeployment, fake: McpFake, script: Script) -
         *(("echo", {"text": word}) for word in ("before", "refreshed", "rotated", "after")),
         ("add", {"a": 2, "b": 3}),
     ]
-    # The refused call reached the server once. Every call carried an access token from the
-    # authorization server, a new one after each refresh.
+    # The refused call reached the server once, and was never sent again. Every call carried an
+    # access token from the authorization server, a new one after each refresh.
     calls = fake.requests("tools/call")
+    arguments = [item.params["arguments"] for item in calls]
+    assert arguments.count({"text": "refused"}) == 1
     assert [item.params["arguments"] for item in calls if item.status == 401] == [
         {"text": "refused"}
     ]
     tokens = [str(item.header("authorization")).removeprefix("Bearer ") for item in calls]
     assert all(ISSUED.fullmatch(token) for token in tokens)
     assert len(set(tokens)) == 4
-    # The gateway's own GET (its event stream) may meet the dropped token too, depending on timing;
-    # the refused POST is the one the vault answers for, once.
+    # Nothing else met a dropped or expired token (see listening()): the server refused the one
+    # POST, which the vault answered for once, dropping the token, and only the next request
+    # refreshed because of it.
     rejections = gateway.seen.events("oauth_upstream_401")
-    posts = [event for event in rejections if event["method"] == "POST"]
-    assert [event["action"] for event in posts] == ["invalidated"], rejections
-    assert {event["method"] for event in rejections} <= {"POST", "GET"}, rejections
+    refused = [
+        {"method": item.method, "rpc": item.rpc_method, "id": rpc_id(item.message)}
+        for item in fake.received
+        if item.status == 401
+    ]
     triggers = refresh_triggers(gateway.seen)
-    assert triggers == ["expiry", "expiry", "upstream_401"], (triggers, rejections)
+    detail = json.dumps({"vault": rejections, "server": refused, "triggers": triggers}, indent=1)
+    answered = [(line["method"], line["action"]) for line in rejections]
+    assert answered == [("POST", "invalidated")], detail
+    assert [(item["method"], item["rpc"]) for item in refused] == [("POST", "tools/call")], detail
+    assert triggers == ["expiry", "expiry", "upstream_401"], detail
+
+
+def rpc_id(message: Any) -> Any:
+    return message.get("id") if isinstance(message, dict) else None
 
 
 @pytest.mark.parametrize(
