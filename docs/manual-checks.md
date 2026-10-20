@@ -142,8 +142,49 @@ view.
     the vault, then forward that port to the portal's listener, keeping the browser's `Host`:
     `ssh -N -L 8082:127.0.0.1:8081 localhost`. Pass: a passkey enrolled through
     `http://localhost:8081` is offered and accepted on `http://localhost:8082`.
-13. **The callback** (step 14b): the steps come with the callback.
-14. **A stale callback address** (step 14b): the steps come with the callback.
+13. **The callback** (step 14b). Stop the vault of the setup above. From the repository root,
+    in the development environment, start the fake provider, which makes a throwaway CA, serves
+    a fake OAuth server at `https://localhost:9443` whose registered redirect is
+    `http://localhost:8081/oauth/callback/notes`, and writes a policy for it:
+
+    ```sh
+    python -m tests.fakes.run_oauth_server --dir ./callback-check
+    ```
+
+    Start a vault the way it prints (the policy `./callback-check/policy.json`, trusting
+    `./callback-check/ca.pem` for the token exchange), set up a passkey with a setup code as
+    above, and sign in at `http://localhost:8081/`. In the browser, trust `ca.pem` (a throwaway
+    browser profile with the CA imported), or accept the certificate warning for
+    `https://localhost:9443` once. On **Credentials**, choose **Connect** on `notes`: the dialog
+    says the provider sends the tab back to the portal. Open the link and approve. Pass:
+    - in the Network panel, the request to `/oauth/callback/notes` carries
+      `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`,
+      the cookie `zoeymcp-8081-cb` (shown `SameSite=Lax`) and no `zoeymcp-8081-session` cookie;
+    - the tab ends on `/callback/received`, and the back button doesn't return to the address
+      that held the code; record what the browser's history list shows for that address;
+    - within a few seconds the portal's tab asks for the passkey, its summary saying where and
+      when the sign-in came back and "Confirm only if you have just finished approving in the
+      provider's tab; if you haven't, cancel."; confirm, and **Credentials** shows `notes`
+      connected.
+
+    Then **Connect** again, approve, and before the tab is redirected copy the callback address
+    from the Network panel (or block `localhost:8081` there first); open that address in a
+    second browser profile. Pass: the refused page ("The portal didn't take this sign-in."), the
+    address intact in that profile's address bar, and the first browser's dialog still waiting.
+
+    For an `https` callback address: the fake registers only the `localhost` address, so this
+    part needs a provider client of your own registered with an `https` callback address (a
+    Web-application client, the optional live run of the callback). Put your own TLS proxy in
+    front of the portal for a name listed in `admin.origins`, set the credential's
+    `redirect_uri` to that origin's `/oauth/callback/<credential>`, reload, and repeat the first
+    part from a session on that origin; the cookie is then `__Secure-zoeymcp-cb`, with `Secure`.
+    Without such a client, record this part as not run.
+14. **A stale callback address** (step 14b). Take a callback address from item 13 whose login
+    has ended (confirmed, cancelled or more than 10 minutes old) and type or paste it into the
+    address bar. Pass: the request carries `Sec-Fetch-Site: none`; the refused page shows, with
+    the address intact. Start a new **Connect** and paste that address into its dialog. Pass:
+    refused as belonging to another login (`state_mismatch`) or as expired (`flow_unknown`),
+    with no passkey prompt.
 15. **The secret field isn't saved** (step 13). Sign in, open **Secrets**, enter a name and a
     value, choose **Set the secret**, confirm with the passkey. Pass: the value shows as dots while
     typed (in Chrome, Edge and Safari; other browsers may show it as typed); the browser doesn't

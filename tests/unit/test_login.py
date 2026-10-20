@@ -8,8 +8,10 @@ redirected to. Flow IDs, ``state`` and verifiers come from a counter, so every v
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
+import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,9 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 import pytest
+from hypothesis import settings
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 from tests.fakes.oauth_server import FakeAuthServer, google_style, spotify_style
 from zoeymcp.common.policy import Policy
@@ -35,7 +40,16 @@ from zoeymcp.vault.oauth.login import (
     scope_health,
     seed_note,
 )
-from zoeymcp.vault.oauth.pkce import MAX_FLOWS, authorize_url, code_challenge
+from zoeymcp.vault.oauth.pkce import (
+    CLI_OWNER,
+    FLOW_TTL,
+    MAX_FLOWS,
+    CallbackBinder,
+    Failure,
+    Flow,
+    authorize_url,
+    code_challenge,
+)
 from zoeymcp.vault.oauth.protocol import (
     CREDENTIAL_UNAVAILABLE,
     OAUTH_CLIENT_REJECTED,
@@ -119,8 +133,10 @@ class Counter:
 def make_policy(
     credentials: Mapping[str, Mapping[str, Any]],
     routes: Mapping[str, tuple[str, ...]] | None = None,
+    admin: Mapping[str, Any] | None = None,
 ) -> Policy:
-    """Each credential gets a route per upstream; by default one, to ``API``."""
+    """Each credential gets a route per upstream; by default one, to ``API``. ``admin`` is the
+    portal's block, for a credential registered with its callback address."""
     route_list: list[dict[str, Any]] = []
     for name in credentials:
         for upstream in (routes or {}).get(name, (API,)):
@@ -135,7 +151,10 @@ def make_policy(
                     "rules": [{"methods": ["GET"], "paths": ["/**"]}],
                 }
             )
-    return Policy.model_validate({**BASE, "routes": route_list, "credentials": dict(credentials)})
+    document = {**BASE, "routes": route_list, "credentials": dict(credentials)}
+    if admin is not None:
+        document["admin"] = dict(admin)
+    return Policy.model_validate(document)
 
 
 def spotify(**fields: Any) -> dict[str, Any]:
@@ -318,6 +337,8 @@ async def test_start_answers_with_the_authorization_request(
         "binding": BINDING,
         "binding_change": None,
         "replaced": None,
+        "callback": None,
+        "callback_address": False,
     }
     assert rig.counter.issued == [FLOW_ID, STATE, VERIFIER]
     assert [
@@ -1317,6 +1338,7 @@ async def test_a_paste_check_says_what_completing_stores(tmp_path: Path, clock: 
     rig = spotify_rig(tmp_path, clock, expected_scopes=["user-top-read"])
     flow, pasted = await rig.approved(owner=SESSION)
     assert rig.login.check_paste("music", flow, pasted, SESSION) == {
+        "stage": "pending",
         "rebind": False,
         "binding": BINDING,
         "binding_change": None,
@@ -1998,3 +2020,581 @@ async def test_an_exchange_line_keeps_a_tenth_of_a_millisecond(
     await rig.login.complete("music", flow, pasted)
     [call] = captured.events("oauth_refresh")
     assert call["duration_ms"] == 12.3
+
+
+# --- the portal's callback (M5 design H.6) -----------------------------------------------------
+
+PORTAL = "http://localhost:8081"
+ADDRESS = PORTAL + "/oauth/callback/music"
+ADMIN = {"listen": "127.0.0.1:8081", "origins": [PORTAL, "http://localhost:9000"]}
+ISSUER = "https://accounts.example"
+
+
+def callback_policy(**fields: Any) -> Policy:
+    return make_policy({"music": spotify(**{"redirect_uri": ADDRESS, **fields})}, admin=ADMIN)
+
+
+def callback_rig(tmp_path: Path, clock: FakeClock, **fields: Any) -> Rig:
+    rig = Rig(tmp_path, clock, callback_policy(**fields))
+    rig.server.registered_redirect = ADDRESS
+    return rig
+
+
+async def portal_start(rig: Rig, owner: str = SESSION) -> dict[str, Any]:
+    return await rig.start(owner=owner, origin=PORTAL)
+
+
+def query_of(url: str) -> str:
+    return urlsplit(url).query
+
+
+def received(rig: Rig, url: str, binder: CallbackBinder | None, *, origin: str = PORTAL) -> str:
+    """The callback route's call, with the binding cookie the browser holds (or none)."""
+    binders = [] if binder is None else [binder]
+    return rig.login.receive_callback(origin, "music", query_of(url), binders)
+
+
+def not_taken(rig: Rig, url: str, binder: CallbackBinder | None, **kwargs: Any) -> LoginError:
+    with pytest.raises(LoginError) as caught:
+        received(rig, url, binder, **kwargs)
+    return caught.value
+
+
+def the_flow(rig: Rig, flow: str) -> Flow:
+    found = rig.login._flows._flows.get(flow)
+    assert found is not None
+    return found
+
+
+class OnlyPolicy:
+    """A token manager that has a policy and nothing else: any other use raises."""
+
+    def __init__(self, policy: Policy) -> None:
+        self.policy = policy
+
+
+async def test_a_portal_start_mints_the_binder(tmp_path: Path, clock: FakeClock) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    binder = started["binder"]
+    assert isinstance(binder, CallbackBinder)
+    assert (started["callback"], started["callback_address"]) == (PORTAL, True)
+    # The binder comes first, then the flow ID, state and verifier; the flow keeps its hash.
+    assert rig.counter.issued[0] == binder.reveal()
+    flow = the_flow(rig, started["flow"])
+    assert (flow.callback, flow.binder_hash) == (PORTAL, binder.sha256())
+    assert binder.reveal() not in json.dumps({k: v for k, v in started.items() if k != "binder"})
+
+
+@pytest.mark.parametrize(
+    ("owner", "origin", "callback"),
+    [
+        (CLI_OWNER, None, None),  # the CLI pastes
+        (CLI_OWNER, PORTAL, None),
+        (SESSION, None, None),
+        (SESSION, "http://localhost:9000", None),  # the cookie would never reach the address
+    ],
+)
+async def test_a_start_that_cant_take_the_callback_has_no_binder(
+    tmp_path: Path, clock: FakeClock, owner: str, origin: str | None, callback: str | None
+) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await rig.start(owner=owner, origin=origin)
+    assert (started["callback"], started["callback_address"]) == (callback, True)
+    assert "binder" not in started
+    assert the_flow(rig, started["flow"]).binder_hash is None
+
+
+async def test_callback_address_is_false_for_a_paste_only_credential(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = spotify_rig(tmp_path, clock)  # no admin block at all
+    started = await rig.start(owner=SESSION, origin=PORTAL)
+    assert (started["callback"], started["callback_address"]) == (None, False)
+    (tmp_path / "b").mkdir()
+    listed = {**make_policy({"music": spotify()}).model_dump(by_alias=True), "admin": ADMIN}
+    rig = Rig(tmp_path / "b", clock, Policy.model_validate(listed))
+    started = await rig.start(owner=SESSION, origin=PORTAL)
+    assert (started["callback"], started["callback_address"]) == (None, False)
+
+
+async def test_a_callback_holds_the_code_and_calls_nothing_else(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    manager = rig.login._tokens
+    rig.login._tokens = OnlyPolicy(rig.policy)  # type: ignore[assignment]
+    assert received(rig, url, started["binder"]) == "returned"
+    rig.login._tokens = manager
+    flow = the_flow(rig, started["flow"])
+    assert flow.stage == "returned"
+    assert flow.returned is not None
+    assert flow.returned.code.reveal() == dict(parse_qsl(query_of(url)))["code"]
+    assert flow.returned.at == clock.wall
+    assert rig.server.calls == []
+    assert [
+        {k: v for k, v in e.items() if k not in ("ts", "role")}
+        for e in captured.events("oauth_callback_returned")
+    ] == [{"event": "oauth_callback_returned", "credential": "music"}]
+    assert flow.returned.code.reveal() not in captured.stream.getvalue()
+    # The same answer again changes nothing.
+    assert not_taken(rig, url, started["binder"]).reason == "callback_not_taken"
+    assert the_flow(rig, started["flow"]) == flow
+
+
+async def test_a_leaked_state_without_the_binder_touches_nothing(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    for binder in (None, CallbackBinder("x" * 43)):
+        refused = not_taken(rig, url, binder)
+        assert (refused.reason, str(refused)) == (
+            "callback_not_taken",
+            "no pending login takes this callback",
+        )
+    assert the_flow(rig, started["flow"]).stage == "pending"
+    # The operator's own answer, from their browser, then is taken.
+    assert received(rig, await rig.browse(started["authorize_url"]), started["binder"]) == (
+        "returned"
+    )
+
+
+async def test_a_callback_refused_before_any_flow(tmp_path: Path, clock: FakeClock) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    binder = started["binder"]
+    with pytest.raises(LoginError) as caught:
+        rig.login.receive_callback(PORTAL, "music", query_of(url) + "&code=x", [binder])
+    assert caught.value.reason == "duplicate_param"
+    for query in ("", "code=x", "state=%C3%A9", query_of(url).replace("state=", "state=x")):
+        with pytest.raises(LoginError) as caught:
+            rig.login.receive_callback(PORTAL, "music", query, [binder])
+        assert caught.value.reason == "callback_not_taken"
+    # Another origin's address, another credential's: no flow is this one's.
+    assert not_taken(rig, url, binder, origin="http://localhost:9000").reason == (
+        "callback_not_taken"
+    )
+    with pytest.raises(LoginError):
+        rig.login.receive_callback(PORTAL, "other", query_of(url), [binder])
+    assert the_flow(rig, started["flow"]).stage == "pending"
+
+
+@pytest.mark.parametrize(
+    ("answer", "reason", "error", "description"),
+    [
+        ("error", "provider_error", "access_denied", "The user denied the request"),
+        ("wrong_iss", "iss_mismatch", None, None),
+        ("no_code", "no_code", None, None),
+    ],
+)
+async def test_a_failed_answer_fails_the_flow_for_its_owner_to_read(
+    tmp_path: Path,
+    clock: FakeClock,
+    captured: Captured,
+    answer: Any,
+    reason: str,
+    error: str | None,
+    description: str | None,
+) -> None:
+    rig = callback_rig(tmp_path, clock, issuer=ISSUER)
+    rig.server.issuer = ISSUER
+    rig.server.answer = answer
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "failed"
+    flow = the_flow(rig, started["flow"])
+    assert (flow.stage, flow.returned, flow.failure) == (
+        "failed",
+        None,
+        Failure(reason, error, description),
+    )
+    [line] = captured.events("oauth_callback_failed")
+    assert (line["credential"], line["reason"], line["error"]) == ("music", reason, error)
+    assert "denied the request" not in captured.stream.getvalue()
+    status = rig.login.flow_status(started["flow"], SESSION)
+    assert status["failure"] == {"reason": reason, "error": error, "description": description}
+    # A failed flow takes nothing more: no callback, no paste, no returned confirm.
+    assert not_taken(rig, url, started["binder"]).reason == "callback_not_taken"
+    assert checked(rig, "music", started["flow"], url, SESSION).reason == "flow_unknown"
+    refused = await rig.refused(rig.login.complete_returned("music", started["flow"], SESSION))
+    assert refused.reason == "flow_unknown"
+
+
+async def test_a_second_different_answer_fails_a_returned_flow(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    for second in ("code", "error"):
+        (tmp_path / second).mkdir()
+        rig = callback_rig(tmp_path / second, clock)
+        started = await portal_start(rig)
+        first = await rig.browse(started["authorize_url"])
+        assert received(rig, first, started["binder"]) == "returned"
+        rig.server.answer = second
+        other = await rig.browse(started["authorize_url"])
+        assert received(rig, other, started["binder"]) == "conflict"
+        flow = the_flow(rig, started["flow"])
+        assert (flow.stage, flow.returned, flow.failure) == ("failed", None, Failure("conflict"))
+        refused = await rig.refused(rig.login.complete_returned("music", started["flow"], SESSION))
+        assert refused.reason == "flow_unknown"
+        assert rig.server.calls == []
+    assert [line["reason"] for line in captured.events("oauth_callback_failed")] == [
+        "conflict",
+        "conflict",
+    ]
+
+
+async def test_a_reload_that_moves_the_address_ends_the_callback(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """A.5: checked again against the policy now in force; the flow still completes by paste."""
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    rig.reconfigure(callback_policy(redirect_uri=REDIRECT))
+    assert not_taken(rig, url, started["binder"]).reason == "callback_not_taken"
+    assert the_flow(rig, started["flow"]).stage == "pending"
+    assert (await rig.login.complete("music", started["flow"], url, SESSION))["persisted"]
+
+
+async def test_a_reload_that_drops_the_origin_ends_the_callback(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    named = "https://vault.example.net"
+    address = named + "/oauth/callback/music"
+    listed = {**ADMIN, "origins": [PORTAL, named]}
+    policy = make_policy({"music": spotify(redirect_uri=address)})
+    document = policy.model_dump(by_alias=True)
+    rig = Rig(tmp_path, clock, Policy.model_validate({**document, "admin": listed}))
+    rig.server.registered_redirect = address
+    started = await rig.start(owner=SESSION, origin=named)
+    assert started["callback"] == named
+    url = await rig.browse(started["authorize_url"])
+    rig.reconfigure(Policy.model_validate({**document, "admin": ADMIN}))
+    assert not_taken(rig, url, started["binder"], origin=named).reason == "callback_not_taken"
+    assert the_flow(rig, started["flow"]).stage == "pending"
+
+
+async def test_a_paste_for_a_returned_flow(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    """H.6's table: the same code is flow_returned; a paste that isn't this flow's answer is
+    refused as for a pending flow, and changes nothing; another answer carrying its state fails
+    it (flow_conflict)."""
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    flow_id = started["flow"]
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "returned"
+    held = the_flow(rig, flow_id)
+    same = checked(rig, "music", flow_id, url, SESSION)
+    assert (same.reason, str(same)) == (
+        "flow_returned",
+        "the provider already sent this sign-in back to the portal; confirm it there",
+    )
+    for pasted, reason in (
+        (with_query(url, state="another"), "state_mismatch"),
+        (url.replace("localhost:8081", "localhost:9000"), "redirect_mismatch"),
+        (url + "&code=again", "duplicate_param"),
+    ):
+        assert checked(rig, "music", flow_id, pasted, SESSION).reason == reason
+        assert the_flow(rig, flow_id) == held
+    assert captured.events("oauth_login_failed") == []
+    other = await rig.browse(started["authorize_url"])
+    conflict = checked(rig, "music", flow_id, other, SESSION)
+    assert (conflict.reason, str(conflict)) == (
+        "flow_conflict",
+        "two different answers came back for this sign-in; connect again",
+    )
+    assert the_flow(rig, flow_id).failure == Failure("conflict")
+    assert [e["reason"] for e in captured.events("oauth_login_failed")] == ["flow_conflict"]
+    assert checked(rig, "music", flow_id, url, SESSION).reason == "flow_unknown"
+
+
+@pytest.mark.parametrize(
+    ("change", "kind"),
+    [
+        ({"error": "access_denied"}, "provider_error"),
+        ({"code": None}, "no_code"),
+        ({"iss": "https://other-issuer.example"}, "iss_mismatch"),
+    ],
+)
+async def test_any_other_answer_pasted_for_a_returned_flow_is_a_conflict(
+    tmp_path: Path, clock: FakeClock, change: dict[str, str | None], kind: str
+) -> None:
+    rig = callback_rig(tmp_path, clock, issuer=ISSUER)
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "returned"
+    refused = checked(rig, "music", started["flow"], with_query(url, **change), SESSION)
+    assert refused.reason == "flow_conflict", kind
+    assert the_flow(rig, started["flow"]).stage == "failed"
+
+
+async def test_check_returned_says_where_and_when(tmp_path: Path, clock: FakeClock) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    flow = started["flow"]
+    with pytest.raises(LoginError) as caught:
+        rig.login.check_returned("music", flow, SESSION)  # still pending
+    assert caught.value.reason == "flow_unknown"
+    url = await rig.browse(started["authorize_url"])
+    clock.advance(5)
+    assert received(rig, url, started["binder"]) == "returned"
+    assert rig.login.check_returned("music", flow, SESSION) == {
+        "stage": "returned",
+        "rebind": False,
+        "binding": BINDING,
+        "binding_change": None,
+        "requested_scopes": SPOTIFY_SCOPES,
+        "expected_scopes": SPOTIFY_SCOPES,
+        "origin": PORTAL,
+        "returned_at": int(clock.wall),
+    }
+    for owner, credential in ((CLI_OWNER, "music"), ("session:00", "music"), (SESSION, "x")):
+        with pytest.raises(LoginError) as caught:
+            rig.login.check_returned(credential, flow, owner)
+        assert caught.value.reason in ("flow_unknown", "not_oauth")
+
+
+async def test_complete_returned_exchanges_the_held_code_once(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    flow = started["flow"]
+    for owner, credential in ((SESSION, "music"), (CLI_OWNER, "music")):
+        refused = await rig.refused(rig.login.complete_returned(credential, flow, owner))
+        assert refused.reason == "flow_unknown"  # pending, or the CLI's view
+    assert len(rig.login._flows) == 1  # a refused take leaves the flow
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "returned"
+    # The paste's own completion never takes a returned code.
+    refused = await rig.refused(rig.login.complete("music", flow, url, SESSION))
+    assert refused.reason == "flow_unknown"
+    assert len(rig.login._flows) == 1
+    refused = await rig.refused(rig.login.complete_returned("music", flow, "session:00"))
+    assert refused.reason == "flow_unknown"
+    done = await rig.login.complete_returned("music", flow, SESSION)
+    assert (done["slot"], done["persisted"]) == ("music-refresh", True)
+    [exchange] = rig.server.calls
+    assert exchange.params["code"] == dict(parse_qsl(query_of(url)))["code"]
+    assert exchange.params["redirect_uri"] == ADDRESS
+    assert rig.stored() == rig.server.active_refresh_token()
+    again = await rig.refused(rig.login.complete_returned("music", flow, SESSION))
+    assert again.reason == "flow_unknown"
+    assert len(rig.server.calls) == 1
+
+
+async def test_the_owners_poll(tmp_path: Path, clock: FakeClock) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await portal_start(rig)
+    flow = started["flow"]
+    assert rig.login.flow_status(flow, SESSION) == {
+        "credential": "music",
+        "stage": "pending",
+        "expires": int(clock.wall + 600),
+        "origin": PORTAL,
+        "returned_at": None,
+        "failure": None,
+    }
+    for owner in (CLI_OWNER, "session:00"):
+        with pytest.raises(LoginError) as caught:
+            rig.login.flow_status(flow, owner)
+        assert caught.value.reason == "flow_unknown"
+    clock.advance(100)
+    assert received(rig, await rig.browse(started["authorize_url"]), started["binder"]) == (
+        "returned"
+    )
+    status = rig.login.flow_status(flow, SESSION)
+    assert (status["stage"], status["returned_at"], status["expires"]) == (
+        "returned",
+        int(clock.wall),
+        int(clock.wall + 500),
+    )
+    clock.advance(500)
+    with pytest.raises(LoginError):
+        rig.login.flow_status(flow, SESSION)
+    # Nothing matches after expiry either.
+    late = await rig.browse(started["authorize_url"])
+    assert not_taken(rig, late, started["binder"]).reason == "callback_not_taken"
+
+
+async def test_a_cli_flow_never_takes_a_callback(tmp_path: Path, clock: FakeClock) -> None:
+    rig = callback_rig(tmp_path, clock)
+    started = await rig.start()
+    url = await rig.browse(started["authorize_url"])
+    planted = CallbackBinder("x" * 43)
+    assert not_taken(rig, url, planted).reason == "callback_not_taken"
+    assert the_flow(rig, started["flow"]).stage == "pending"
+    assert (await rig.login.complete("music", started["flow"], url))["persisted"] is True
+
+
+# --- the stateful machine (O.2) -------------------------------------------------------------
+
+
+class CallbackMachine(RuleBasedStateMachine):
+    """Starts by the CLI or a session, callbacks with the right, a wrong or a replayed state, with
+    or without the binder, the operator's code or another; paste plans, confirms, cancels, the
+    session ending and the clock. The exchange is replaced by a counter, so the machine checks
+    the table's rules and nothing else."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FakeClock()
+        self.rig = callback_rig(Path(self.directory.name), self.clock)
+        self.exchanged: dict[str, int] = {}
+        self.held: dict[str, str] = {}  # the first code each flow held
+        self.answers: dict[str, set[str]] = {}  # the codes each flow was answered with
+        self.left_pending: dict[str, int] = {}
+        self.flow: dict[str, Any] | None = None
+        self.owner = CLI_OWNER
+        self.urls: list[str] = []
+
+        async def redeem(credential: str, cred: Any, flow: Flow, code: Secret) -> dict[str, Any]:
+            self.exchanged[flow.id] = self.exchanged.get(flow.id, 0) + 1
+            return {}
+
+        self.rig.login._redeem = redeem  # type: ignore[method-assign]
+
+    def teardown(self) -> None:
+        self.directory.cleanup()
+
+    def table(self) -> dict[str, Flow]:
+        return self.rig.login._flows._flows
+
+    def current(self) -> Flow | None:
+        if self.flow is None:
+            return None
+        return self.table().get(self.flow["flow"])
+
+    @rule(by_session=st.booleans())
+    def start(self, by_session: bool) -> None:
+        self.owner = SESSION if by_session else CLI_OWNER
+        self.flow = asyncio.run(self.rig.start(owner=self.owner, origin=PORTAL))
+        self.urls = []
+
+    @rule()
+    def approve(self) -> None:
+        if self.flow is not None:
+            self.urls.append(asyncio.run(self.rig.browse(self.flow["authorize_url"])))
+
+    @rule(pick=st.integers(0, 9), binder=st.sampled_from(["right", "none", "planted"]))
+    def callback(self, pick: int, binder: str) -> None:
+        if self.flow is None or not self.urls:
+            return
+        url = self.urls[pick % len(self.urls)]
+        before = self.current()
+        cookie = {
+            "right": self.flow.get("binder"),
+            "none": None,
+            "planted": CallbackBinder("p" * 43),
+        }[binder]
+        try:
+            outcome = received(self.rig, url, cookie)
+        except LoginError:
+            outcome = None
+        after = self.current()
+        if outcome is None:
+            assert after == before  # a refused callback touches nothing
+            return
+        assert binder == "right"
+        assert self.owner == SESSION
+        assert before is not None
+        assert after is not None
+        self._answered(after.id, url)
+        if before.stage == "pending":
+            self.left_pending[after.id] = self.left_pending.get(after.id, 0) + 1
+
+    @rule(pick=st.integers(0, 9))
+    def paste_plan(self, pick: int) -> None:
+        if self.flow is None or not self.urls:
+            return
+        url = self.urls[pick % len(self.urls)]
+        before = self.current()
+        try:
+            self.rig.login.check_paste("music", self.flow["flow"], url, self.owner)
+        except LoginError as exc:
+            if exc.reason == "flow_conflict":
+                assert before is not None
+                self._answered(before.id, url)
+            return
+        assert before is not None
+        assert before.stage == "pending"
+
+    @rule(pick=st.integers(0, 9))
+    def confirm_paste(self, pick: int) -> None:
+        if self.flow is None or not self.urls:
+            return
+        url = self.urls[pick % len(self.urls)]
+        flow = self.flow["flow"]
+        with contextlib.suppress(LoginError):
+            asyncio.run(self.rig.login.complete("music", flow, url, self.owner))
+
+    @rule()
+    def confirm_returned(self) -> None:
+        if self.flow is None:
+            return
+        before = self.current()
+        try:
+            asyncio.run(self.rig.login.complete_returned("music", self.flow["flow"], self.owner))
+        except LoginError:
+            expired = before is not None and self.clock.monotonic() >= before.expires_at
+            assert before is None or before.stage != "returned" or expired
+            return
+        assert before is not None
+        assert before.stage == "returned"
+        assert len(self.answers.get(before.id, set())) == 1  # never after two answers
+
+    @rule()
+    def cancel(self) -> None:
+        if self.flow is not None:
+            self.rig.login.cancel(self.flow["flow"], self.owner)
+
+    @rule()
+    def session_ends(self) -> None:
+        self.rig.login.cancel_owner(SESSION)
+
+    @rule(seconds=st.sampled_from([1.0, 300.0, FLOW_TTL]))
+    def time_passes(self, seconds: float) -> None:
+        self.clock.advance(seconds)
+
+    def _answered(self, flow_id: str, url: str) -> None:
+        code = dict(parse_qsl(query_of(url))).get("code", "")
+        self.answers.setdefault(flow_id, set()).add(code)
+
+    @invariant()
+    def at_most_one_exchange_per_flow(self) -> None:
+        assert all(count <= 1 for count in self.exchanged.values())
+
+    @invariant()
+    def a_state_is_consumed_at_most_once(self) -> None:
+        assert all(count <= 1 for count in self.left_pending.values())
+
+    @invariant()
+    def a_held_code_never_changes_and_two_answers_never_hold_one(self) -> None:
+        for flow in self.table().values():
+            if flow.owner == CLI_OWNER:
+                assert flow.stage == "pending"  # a CLI flow never leaves pending by callback
+            if flow.returned is not None:
+                code = flow.returned.code.reveal()
+                assert self.held.setdefault(flow.id, code) == code
+                assert len(self.answers.get(flow.id, set())) == 1
+
+    @invariant()
+    def nothing_matches_after_expiry(self) -> None:
+        flow = self.current()
+        binder = None if self.flow is None else self.flow.get("binder")
+        if flow is None or binder is None or self.clock.monotonic() < flow.expires_at:
+            return
+        flows = self.rig.login._flows
+        assert flows.match_callback("music", flow.state, [binder], flow.redirect_uri) is None
+
+
+CallbackMachine.TestCase.settings = settings(max_examples=50, stateful_step_count=20, deadline=None)
+TestCallbackMachine = CallbackMachine.TestCase

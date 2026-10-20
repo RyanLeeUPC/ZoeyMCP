@@ -11,20 +11,29 @@ Flows are owned (M5 design H.2): the admin socket's are the CLI's, the default, 
 belong to one session. The portal checks a paste with :meth:`LoginService.check_paste` before it
 asks for the passkey, and completes with :meth:`LoginService.complete` after.
 
+A portal session's flow for a credential whose ``redirect_uri`` is its portal callback address
+(``common/policy/callback.py``) can take the provider's redirect instead (H.6): the start mints
+the flow's binder, which the portal sets as the binding cookie; the callback route's
+:meth:`LoginService.receive_callback` consumes the flow's ``state`` and holds the code, and only
+the owner's stepped-up :meth:`LoginService.complete_returned` exchanges it. Two different answers
+for one flow, by callback or paste, fail it. A CLI flow never takes a callback.
+
 Nothing here logs or returns a token, code, verifier, ``state`` or client secret. A provider's
 ``error_description`` from the redirect goes back to the CLI only, and is never logged.
 """
 
 from __future__ import annotations
 
+import hmac
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Final
 
 import httpx
 
+from ...common.policy.callback import callback_address, callback_origin
 from ...common.policy.schema import OAuth2Credential, split_scope
 from .. import logs
 from ..bindings import BindingError, derive_binding, derive_oauth_binding, live_slot
@@ -34,10 +43,12 @@ from . import pkce
 from .pkce import (
     CLI_OWNER,
     FLOW_TTL,
+    CallbackBinder,
     Flow,
     FlowTable,
     Redirect,
     RedirectError,
+    Returned,
     TokenFunction,
     TooManyFlows,
     surface,
@@ -73,6 +84,9 @@ NO_REFRESH_HINT: Final = (
     "for Google keep access_type: offline and prompt: consent; "
     "some providers need an offline_access scope"
 )
+# A paste's refusals after its state matched: an answer for the flow, so for a flow holding a
+# returned code, a different answer (H.6's conflict rule). The others aren't answers for it.
+_ANSWERS: Final = frozenset({"provider_error", "iss_mismatch", "no_code"})
 # The failure reasons of a client ref, and what the ref holds.
 _CLIENT_REFS: Final = {
     "client_id_unavailable": "client ID",
@@ -110,25 +124,39 @@ class LoginService:
         self._tokens = tokens
         self._clock = clock
         self._wall = wall
+        self._token = token
         self._flows = FlowTable(clock, token=token)
 
     # --- start ---------------------------------------------------------------------------------
 
     async def start(
-        self, credential: str, *, rebind: bool = False, owner: str = CLI_OWNER
+        self,
+        credential: str,
+        *,
+        rebind: bool = False,
+        owner: str = CLI_OWNER,
+        origin: str | None = None,
     ) -> dict[str, Any]:
         """Start a login: the authorization URL for a refresh grant, or a client_credentials
         test fetch, whose answer has the shape of :meth:`complete`'s.
 
         A credential has one pending login, whoever started it: the answer's ``replaced`` says
         where the one this start replaced was started (``cli`` or ``portal``), or is None.
+
+        ``callback_address`` says whether the credential's ``redirect_uri`` is its callback
+        address on a listed portal origin, whoever starts; ``callback`` is that origin when this
+        flow can take the callback (H.6): only a portal session's can, and only when the address
+        is on ``origin``, the origin the session is on, since the binding cookie the start sets
+        reaches that origin alone. Such a start mints the flow's binder: the answer then carries
+        it as ``binder``, a :class:`CallbackBinder` that is never JSON, for the portal to set as
+        the binding cookie and take out.
         """
         try:
             cred = self._credential(credential)
             if cred.grant == "client_credentials":
                 logs.event("oauth_login_started", credential=credential)
                 return await self._test_fetch(credential, cred)
-            answer = self._start(credential, cred, rebind, owner)
+            answer = self._start(credential, cred, rebind, owner, origin)
         except LoginError as exc:
             self._failed(credential, exc)
             raise
@@ -136,7 +164,12 @@ class LoginService:
         return answer
 
     def _start(
-        self, credential: str, cred: OAuth2Credential, rebind: bool, owner: str
+        self,
+        credential: str,
+        cred: OAuth2Credential,
+        rebind: bool,
+        owner: str,
+        portal_origin: str | None,
     ) -> dict[str, Any]:
         if cred.authorize_url is None:
             raise LoginError(
@@ -156,8 +189,19 @@ class LoginService:
                 )
             change = {"old": existing.binding, "new": binding}
         replaced = self._flows.owner_of(credential)
+        origin = callback_origin(cred.redirect_uri, credential, self._origins())
+        binder = None
+        if origin is not None and owner != CLI_OWNER and origin == portal_origin:
+            binder = CallbackBinder.new(self._token)
         try:
-            flow = self._flows.start(credential, cred.redirect_uri, rebind=rebind, owner=owner)
+            flow = self._flows.start(
+                credential,
+                cred.redirect_uri,
+                rebind=rebind,
+                owner=owner,
+                callback=None if binder is None else origin,
+                binder_hash=None if binder is None else binder.sha256(),
+            )
         except TooManyFlows as exc:
             raise LoginError("too_many_flows", str(exc)) from None
         if replaced is not None:
@@ -168,7 +212,7 @@ class LoginService:
             # A client_id ref or a reserved authorize_params name: check refuses both.
             self._flows.cancel(flow.id, owner)
             raise LoginError("authorize_misconfigured", str(exc)) from None
-        return {
+        answer: dict[str, Any] = {
             "flow": flow.id,
             "authorize_url": url,
             "redirect_uri": flow.redirect_uri,
@@ -180,7 +224,12 @@ class LoginService:
             "binding": binding,
             "binding_change": change,
             "replaced": None if replaced is None else surface(replaced),
+            "callback": flow.callback,
+            "callback_address": origin is not None,
         }
+        if binder is not None:
+            answer["binder"] = binder
+        return answer
 
     # --- complete ------------------------------------------------------------------------------
 
@@ -204,12 +253,19 @@ class LoginService:
         if flow is None:
             raise _flow_unknown()
         cred, redirect = self._parse(credential, flow, redirect_url)
+        return await self._redeem(credential, cred, flow, redirect.code)
+
+    async def _redeem(
+        self, credential: str, cred: OAuth2Credential, flow: Flow, code: Secret
+    ) -> dict[str, Any]:
+        """The one exchange of a taken flow's code, then the commit (design E.2, E.3): the same
+        for a pasted code and one a callback returned."""
         client = self._client(credential, cred)
         try:
             request = build_exchange(
                 cred,
                 client,
-                code=redirect.code,
+                code=code,
                 verifier=flow.verifier,
                 redirect_uri=flow.redirect_uri,
             )
@@ -273,17 +329,50 @@ class LoginService:
 
         Then what completing would store: the binding the grant gets, the change from the stored
         one (refused as ``binding_changed`` unless the login was started with ``rebind``, as
-        the commit would refuse it after spending the code), and the scopes asked for."""
+        the commit would refuse it after spending the code), and the scopes asked for.
+
+        For a flow whose callback returned a code (H.6), a paste that isn't an answer for it
+        (another address, ``state`` or a duplicate parameter) is refused as for a pending flow
+        and changes nothing; the same code again is ``flow_returned`` (confirm the returned
+        one); any other answer fails the flow, ``flow_conflict``. A failed flow is unknown."""
         flow = self._flows.peek(flow_id, credential, owner)
-        if flow is None:
+        if flow is None or flow.stage == "failed":
             raise _flow_unknown()
         try:
-            cred, _ = self._parse(credential, flow, redirect_url)
+            cred, redirect = self._parse(credential, flow, redirect_url)
         except LoginError as exc:
+            if flow.stage == "returned" and exc.reason in _ANSWERS:
+                raise self._conflict(credential, flow) from None
             if exc.reason == "provider_error":
                 self._flows.cancel(flow_id, owner)
                 self._failed(credential, exc)
             raise
+        if flow.returned is not None:
+            if _same_code(redirect.code, flow.returned.code):
+                raise LoginError(
+                    "flow_returned",
+                    "the provider already sent this sign-in back to the portal; confirm it there",
+                )
+            raise self._conflict(credential, flow)
+        return self._plan(credential, cred, flow)
+
+    def check_returned(self, credential: str, flow_id: str, owner: str) -> dict[str, Any]:
+        """What completing a flow whose callback returned a code would store, as
+        :meth:`check_paste` answers it, with where and when the code came back (F.4). Any other
+        flow, a pending one included, is ``flow_unknown``."""
+        flow = self._flows.peek(flow_id, credential, owner)
+        if flow is None or flow.returned is None:
+            raise _flow_unknown()
+        cred = self._refresh_credential(credential)
+        return {
+            **self._plan(credential, cred, flow),
+            "origin": flow.callback,
+            "returned_at": int(flow.returned.at),
+        }
+
+    def _plan(self, credential: str, cred: OAuth2Credential, flow: Flow) -> dict[str, Any]:
+        """The facts a completion's plan shows: the flow's stage, its rebind, the binding the
+        grant gets and any change from the stored one, and the scopes."""
         binding = self._binding(credential, cred)
         change = None
         existing = self._tokens.store.entry(slot_key(credential, cred))
@@ -296,6 +385,7 @@ class LoginService:
                 )
             change = {"old": existing.binding, "new": binding}
         return {
+            "stage": flow.stage,
             "rebind": flow.rebind,
             "binding": binding,
             "binding_change": change,
@@ -303,8 +393,122 @@ class LoginService:
             "expected_scopes": cred.effective_expected_scopes,
         }
 
+    def _conflict(self, credential: str, flow: Flow) -> LoginError:
+        """Two different answers for one flow: it fails, its held code dropped (H.6)."""
+        self._flows.settle(flow.id, pkce.Failure("conflict"))
+        exc = LoginError(
+            "flow_conflict", "two different answers came back for this sign-in; connect again"
+        )
+        self._failed(credential, exc)
+        return exc
+
+    async def complete_returned(self, credential: str, flow_id: str, owner: str) -> dict[str, Any]:
+        """Exchange the code a callback returned and store the grant, as :meth:`complete` does
+        after its parse (H.6). The flow is taken first, in stage ``returned`` only; any other is
+        ``flow_unknown``."""
+        try:
+            flow = self._flows.take(flow_id, credential, owner, stage="returned")
+            if flow is None or flow.returned is None:
+                raise _flow_unknown()
+            cred = self._refresh_credential(credential)
+            return await self._redeem(credential, cred, flow, flow.returned.code)
+        except LoginError as exc:
+            self._failed(credential, exc)
+            raise
+
+    def receive_callback(
+        self, origin: str, credential: str, raw_query: str, binders: Sequence[CallbackBinder]
+    ) -> str:
+        """The callback route's one effect (H.6), after admission (C.7): find the flow the
+        ``state`` and a binding cookie name, consume its ``state``, run the paste's own checks
+        on the address rebuilt from its ``redirect_uri`` and the raw query, and hold the code
+        (``returned``) or fail the flow (``failed``); a different second answer for a returned
+        flow fails it (``conflict``). Answers which of the three. Nothing is exchanged or
+        stored, and there is no ``await``, so two callbacks are ordered.
+
+        Raises :class:`LoginError` ``duplicate_param``, or ``callback_not_taken`` for every
+        other cause (no such flow, expired, failed, the CLI's, no or a wrong binding cookie,
+        the address no longer this credential's callback, the same answer again), with no flow
+        touched."""
+        try:
+            state = pkce.callback_state(raw_query)
+        except RedirectError as exc:
+            raise LoginError(exc.reason, str(exc)) from None
+        address = callback_address(origin, credential)
+        flow = self._flows.match_callback(credential, state, binders, address)
+        cred = self._tokens.policy.credentials.get(credential)
+        if (
+            flow is None
+            or not isinstance(cred, OAuth2Credential)
+            or cred.grant != "refresh_token"
+            # The policy now in force must still make this the credential's callback address
+            # on this origin (A.5): a reload that moves either ends the callback, not the paste.
+            or cred.redirect_uri != flow.redirect_uri
+            or callback_origin(cred.redirect_uri, credential, self._origins()) != origin
+        ):
+            raise _not_taken()
+        try:
+            redirect: Redirect | None = pkce.parse_redirect(
+                flow.redirect_uri + "?" + raw_query,
+                redirect_uri=flow.redirect_uri,
+                state=flow.state,
+                issuer=cred.issuer,
+            )
+            refused = None
+        except RedirectError as exc:
+            redirect, refused = None, exc
+        if flow.returned is not None:
+            if redirect is not None and _same_code(redirect.code, flow.returned.code):
+                raise _not_taken()  # the same answer again: nothing changes
+            outcome = "conflict"
+            self._flows.settle(flow.id, pkce.Failure("conflict"))
+            logs.event(
+                "oauth_callback_failed", credential=credential, reason="conflict", error=None
+            )
+        elif refused is not None:
+            outcome = "failed"
+            failure = pkce.Failure(refused.reason, refused.error, refused.description)
+            self._flows.settle(flow.id, failure)
+            logs.event(
+                "oauth_callback_failed",
+                credential=credential,
+                reason=refused.reason,
+                error=refused.error,
+            )
+        else:
+            assert redirect is not None  # noqa: S101 - parse_redirect returns or raises
+            outcome = "returned"
+            self._flows.settle(flow.id, Returned(redirect.code, redirect.iss, self._wall()))
+            logs.event("oauth_callback_returned", credential=credential)
+        return outcome
+
+    def flow_status(self, flow_id: str, owner: str) -> dict[str, Any]:
+        """A flow as its owner's poll reads it (H.6): its credential, stage, when it expires,
+        the origin whose callback it can take, when a code came back, and why it failed (the
+        provider's cleaned, capped description included, for the owner alone). Never the code,
+        ``state``, binder or verifier. Another owner's, an expired or an unknown flow is
+        ``flow_unknown``."""
+        flow = self._flows.owned(flow_id, owner)
+        if flow is None:
+            raise _flow_unknown()
+        failure = flow.failure
+        return {
+            "credential": flow.credential,
+            "stage": flow.stage,
+            "expires": int(self._wall() + flow.expires_at - self._clock()),
+            "origin": flow.callback,
+            "returned_at": None if flow.returned is None else int(flow.returned.at),
+            "failure": None
+            if failure is None
+            else {
+                "reason": failure.reason,
+                "error": failure.error,
+                "description": failure.description,
+            },
+        }
+
     def cancel(self, flow_id: str, owner: str = CLI_OWNER) -> bool:
-        """Drop a pending flow (the CLI does on Ctrl-C)."""
+        """Drop a flow (the CLI does on Ctrl-C), in whatever stage."""
         return self._flows.cancel(flow_id, owner)
 
     def cancel_owner(self, owner: str) -> int:
@@ -315,9 +519,7 @@ class LoginService:
         self, credential: str, flow: Flow, redirect_url: str
     ) -> tuple[OAuth2Credential, Redirect]:
         """The credential, and the code the pasted address carries for the flow."""
-        cred = self._credential(credential)
-        if cred.grant != "refresh_token":
-            raise LoginError("not_oauth", f"{credential!r} no longer uses the refresh grant")
+        cred = self._refresh_credential(credential)
         try:
             redirect = pkce.parse_redirect(
                 redirect_url, redirect_uri=flow.redirect_uri, state=flow.state, issuer=cred.issuer
@@ -416,6 +618,17 @@ class LoginService:
         if not isinstance(cred, OAuth2Credential):
             raise LoginError("not_oauth", f"no oauth2 credential named {name!r}")
         return cred
+
+    def _refresh_credential(self, name: str) -> OAuth2Credential:
+        cred = self._credential(name)
+        if cred.grant != "refresh_token":
+            raise LoginError("not_oauth", f"{name!r} no longer uses the refresh grant")
+        return cred
+
+    def _origins(self) -> list[str]:
+        """The portal origins of the policy in force, none without an ``admin`` block."""
+        admin = self._tokens.policy.admin
+        return [] if admin is None else admin.origins
 
     def _binding(self, credential: str, cred: OAuth2Credential) -> dict[str, Any]:
         """The binding the grant gets: the same one commit_login derives."""
@@ -527,6 +740,14 @@ def _flow_unknown() -> LoginError:
     return LoginError(
         "flow_unknown", "no such login is pending (it expired or was used); run login again"
     )
+
+
+def _not_taken() -> LoginError:
+    return LoginError("callback_not_taken", "no pending login takes this callback")
+
+
+def _same_code(one: Secret, other: Secret) -> bool:
+    return hmac.compare_digest(one.reveal().encode("utf-8"), other.reveal().encode("utf-8"))
 
 
 def _unbuildable() -> LoginError:

@@ -120,6 +120,46 @@ def set_up(
     return passkey
 
 
+def prepared_action(page: Page, kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    """``POST /api/actions``: the plan's summary and the step-up options."""
+    answer = page.fetch("POST", "/api/actions", json={"kind": kind, "data": data})
+    assert answer.status_code == 200, answer.text
+    held: dict[str, Any] = answer.json()
+    return held
+
+
+def step_up(
+    page: Page, authenticator: SoftAuthenticator, kind: str, data: dict[str, Any]
+) -> httpx.Response:
+    """Prepare an action, answer its passkey prompt and confirm it, as the page's dialog does."""
+    held = prepared_action(page, kind, data)
+    assertion = authenticator.get(held["options"], page.origin).body()
+    body = {"credential": assertion}
+    return page.fetch("POST", f"/api/actions/{held['action']}/confirm", json=body)
+
+
+def connect_by_callback(
+    page: Page, authenticator: SoftAuthenticator, credential: str
+) -> tuple[dict[str, Any], httpx.Response]:
+    """Connect through the portal's callback (M5 design H.6), as the operator's browser does it:
+    start (the browser keeps the binding cookie), open the authorization link from the page,
+    which the provider sends back to the callback as one cross-site navigation, then the poll
+    sees the code returned and the returned confirmation runs with a passkey. The page's
+    browser must reach the provider as one of its ``remote`` origins. Returns the start's
+    answer and the confirm's."""
+    started = page.fetch("POST", f"/api/oauth/{credential}/start", json={})
+    assert started.status_code == 200, started.text
+    begun: dict[str, Any] = started.json()
+    assert begun["callback"] == page.origin, begun
+    landed = page.browser.navigate(begun["authorize_url"], initiator=page.origin)
+    assert landed.status_code == 200, landed.text
+    assert str(landed.request.url).endswith("/callback/received")
+    status = page.fetch("GET", f"/api/oauth/flows/{begun['flow']}")
+    assert status.json()["stage"] == "returned", status.text
+    data = {"credential": credential, "flow": begun["flow"], "returned": True}
+    return begun, step_up(page, authenticator, "oauth.complete", data)
+
+
 def filled(route: Route) -> str:
     """The route's path with a sample value for each parameter."""
     return route.path.format(**SAMPLE_PARAMS)

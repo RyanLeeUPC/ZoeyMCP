@@ -146,6 +146,29 @@ def test_index_html() -> None:
     assert set(page.assets) <= set(STATIC)
 
 
+@pytest.mark.parametrize("name", ["callback-received.html", "callback-refused.html"])
+def test_the_callback_pages_run_no_script(name: str) -> None:
+    """C.7, K.4: where the callback sends the tab, and the page a refusal answers in place.
+    Fixed bytes with no script at all and no text from the query, the flow or the provider, so
+    P14 holds without escaping; they load only the stylesheet."""
+    html = read(name)
+    page = parsed(html)
+    assert page.problems == []
+    assert page.assets == ["/app.css"]
+    assert "<script" not in html.lower()
+    path = "/callback/" + name.removeprefix("callback-").removesuffix(".html")
+    assert STATIC[path].name == name
+
+
+def test_the_refused_page_says_what_the_catalogue_says() -> None:
+    """One page for every refusal of the callback, never naming the cause (M.2): its sentence
+    is the catalogue's, so operations.md's table and the page agree."""
+    text = CATALOGUE["callback_not_taken"].text
+    assert {CATALOGUE[r].text for r in ("not_navigation", "bad_query")} == {text}
+    assert f"<p>{text}</p>" in read("callback-refused.html")
+    assert text not in read("callback-received.html")
+
+
 def test_every_element_the_script_names_exists() -> None:
     ids = parsed(read("index.html")).ids
     named = set(re.findall(r"\$\(\"([a-z-]+)\"\)", read("app.js")))
@@ -238,8 +261,13 @@ def test_every_button_runs_its_handler_once_at_a_time() -> None:
     assert body.index("await handler(event);") < body.index("} finally {")
     assert re.search(r"function on\(id, handler\) \{\s*guard\(\$\(id\), handler\);\s*\}", code)
     assert re.search(r"function button\(label, handler\) \{[^}]*guard\(element, handler\);", code)
-    # Every other listener is the dialog's Escape, which no click can repeat.
-    assert re.findall(r"addEventListener\(\"(\w+)\"", code) == ["click", "cancel"]
+    # The others are the dialogs' Escape, which no click can repeat, and the connect dialog's
+    # poll when the tab is shown again (C.4), which sends nothing while one is in flight.
+    assert re.findall(r"addEventListener\(\"(\w+)\"", code) == [
+        "click",
+        "cancel",
+        "visibilitychange",
+    ]
 
 
 class Anchors(HTMLParser):

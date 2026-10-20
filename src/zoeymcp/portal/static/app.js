@@ -4,53 +4,41 @@
 // the one thing kept in sessionStorage (F.2). Passkey prompts open only from click handlers.
 // A full session changes things only through actions (F.4): prepare, show the vault's summary,
 // then confirm with a passkey. Secrets are write-only (G): a value typed here is sent once, in
-// its prepare, and the field is emptied as soon as the request is made.
+// its prepare, and the field is emptied as soon as the request is made. A connect whose login
+// can take the portal's callback (H.6) polls its login until the provider sends it back.
 "use strict";
 
 (function () {
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
-  const PAGES = [
-    "blocked", "login", "setup", "home", "credentials", "sessions", "passkeys", "secrets",
-  ];
+  const PAGES = ["blocked", "login", "setup", "home", "credentials", "sessions", "passkeys",
+    "secrets"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
   const BROWSER_TEXT = {
-    ip_literal:
-      "Passkeys don't work on IP addresses. Open the portal at the name listed in " +
+    ip_literal: "Passkeys don't work on IP addresses. Open the portal at the name listed in " +
       "admin.origins, such as localhost with its port.",
-    insecure:
-      "This page isn't a secure context, so the browser won't use passkeys here. Use " +
+    insecure: "This page isn't a secure context, so the browser won't use passkeys here. Use " +
       "localhost, or https with a certificate this browser trusts.",
     no_webauthn:
       "This browser doesn't support passkeys. Use a current Chrome, Edge, Firefox or Safari.",
     no_get_public_key:
       "This browser can't hand the vault a new passkey's key. Update it, or use another browser.",
-    NotAllowedError:
-      "The passkey prompt was cancelled or timed out, or no passkey for this address was " +
-      "chosen. Try again.",
-    InvalidStateError:
-      "This authenticator already holds a passkey enrolled here. Use another authenticator, or " +
-      "a setup code issued with --reset to replace it.",
-    SecurityError:
-      "The browser refused a passkey on this address. Open the portal at an address listed in " +
-      "admin.origins.",
+    NotAllowedError: "The passkey prompt was cancelled or timed out, or no passkey for this " +
+      "address was chosen. Try again.",
+    InvalidStateError: "This authenticator already holds a passkey enrolled here. Use another " +
+      "authenticator, or a setup code issued with --reset to replace it.",
+    SecurityError: "The browser refused a passkey on this address. Open the portal at an " +
+      "address listed in admin.origins.",
     NotSupportedError:
       "This authenticator supports none of the vault's key types (ES256, Ed25519, RS256).",
     network: "The vault didn't answer. Check that it is running, then try again.",
   };
-  const PROMPT_ERRORS = [
-    "NotAllowedError",
-    "InvalidStateError",
-    "SecurityError",
-    "NotSupportedError",
-  ];
-  const VIA = {
-    setup_code: "with a setup code",
-    setup_code_reset: "with a reset setup code",
-    portal: "from a signed-in session",
-  };
+  const PROMPT_ERRORS = ["NotAllowedError", "InvalidStateError", "SecurityError",
+    "NotSupportedError"];
+  const VIA = { setup_code: "with a setup code", setup_code_reset: "with a reset setup code",
+    portal: "from a signed-in session" };
 
   // The buttons for health's actions (I.1); the vault words every other action (todo).
   const ACTION_TEXT = { connect: "Connect", reset: "Try again", add_passkey: "Add a passkey",
@@ -62,7 +50,7 @@
   let pending = null; // the action being confirmed: its ID, step-up options and what follows
   let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created
   let renaming = null; // the fingerprint the rename form is for
-  let connecting = null; // the connect dialog's credential and, once started, its flow
+  let connecting = null; // the connect dialog's credential, its flow and whether to poll it
 
   function $(id) {
     return document.getElementById(id);
@@ -79,9 +67,7 @@
 
   // A route's path with its parameters filled in, each one encoded (M.1's templates).
   function fill(template, values) {
-    return template.replace(/\{([a-z]+)\}/g, function (match, name) {
-      return encodeURIComponent(values[name]);
-    });
+    return template.replace(/\{([a-z]+)\}/g, (match, name) => encodeURIComponent(values[name]));
   }
 
   // --- the API --------------------------------------------------------------------------------
@@ -109,12 +95,7 @@
     } catch (error) {
       throw new Refused(BROWSER_TEXT.network, "network", 0);
     }
-    let answer = null;
-    try {
-      answer = await response.json();
-    } catch (error) {
-      answer = null;
-    }
+    const answer = await response.json().catch(() => null);
     if (response.ok) {
       return answer;
     }
@@ -161,14 +142,19 @@
     }
   }
 
-  function fail(text) {
-    $("error").textContent = text;
-    $("error").hidden = false;
+  // An error line: its text, hidden when there is none.
+  function say(id, text) {
+    $(id).textContent = text;
+    $(id).hidden = text === "";
   }
+  const fail = (text) => say("error", text);
+  const clearError = () => say("error", "");
+  const connectError = (text) => say("connect-error", text);
+  const confirmError = (text) => say("confirm-error", text);
 
-  function clearError() {
-    $("error").textContent = "";
-    $("error").hidden = true;
+  // A refusal's text, and the text the provider's answer carried, labelled as such (H.3).
+  function carried(text, said) {
+    return text + (said ? " The answer carried this text: " + said : "");
   }
 
   function when(seconds) {
@@ -323,7 +309,8 @@
 
   // The link opens in a new tab with no opener, its address set only if it is https (C.4).
   function openConnect(name, started, refused) {
-    connecting = { credential: name, flow: started === null ? null : started.flow };
+    connecting = { credential: name, flow: started && started.flow,
+      callback: started && started.callback };
     $("connect-steps").hidden = started === null;
     $("connect-rebind").hidden = started !== null;
     connectError(refused === null ? "" : refused.message);
@@ -345,33 +332,65 @@
         "This replaced a sign-in pending in " +
         (started.replaced === "cli" ? "zoeymcp login." : "the portal.");
       $("connect-redirect").textContent = started.redirect_uri_shown;
-      $("connect-by").textContent = when(started.expires);
+      $("connect-by").textContent = $("connect-by-callback").textContent = when(started.expires);
+      $("connect-paste-text").hidden = started.callback !== null;
+      $("connect-callback-text").hidden = started.callback === null;
     }
     $("connect").showModal();
   }
 
-  function connectError(text) {
-    $("connect-error").textContent = text;
-    $("connect-error").hidden = text === "";
-  }
-
   // The paste is the oauth.complete action's data: the vault checks it before any prompt.
-  async function checkPaste() {
+  function checkPaste() {
     const held = connecting;
     connectError("");
     const pasted = $("connect-paste").value.trim();
-    const data = { credential: held.credential, flow: held.flow, redirect_url: pasted };
+    return prepareConnect({ credential: held.credential, flow: held.flow, redirect_url: pasted });
+  }
+
+  // oauth.complete with a paste, or with returned: true once the callback holds the code. When
+  // the callback already holds what was pasted, the vault says so: confirm that one instead.
+  async function prepareConnect(data) {
+    let prepared;
     try {
-      const prepared = await api("POST", "/api/actions", { kind: "oauth.complete", data: data });
-      closeConnect();
-      openConfirm(prepared, afterConnected, "Exchanging the code with the provider...");
+      prepared = await api("POST", "/api/actions", { kind: "oauth.complete", data: data });
     } catch (error) {
-      if (signedOut(error)) {
+      if (error.reason === "flow_returned") {
+        return prepareConnect({ credential: data.credential, flow: data.flow, returned: true });
+      }
+      if (signedOut(error) || !$("connect").open) {
         closeConnect();
         return afterFailure(error);
       }
-      const said = error.answer && error.answer.description_shown; // provider_error's (H.3)
-      connectError(textOf(error) + (said ? " The answer carried this text: " + said : ""));
+      return connectError(carried(textOf(error), error.answer && error.answer.description_shown));
+    }
+    closeConnect();
+    openConfirm(prepared, afterConnected, "Exchanging the code with the provider...", data);
+  }
+
+  // H.6: while the dialog of a login that can take the callback is open and the tab visible, ask
+  // every 2 s, and at once when the tab is shown again, until the provider has sent it back, it
+  // failed or it is gone. The callback's own tab runs no script.
+  async function poll() {
+    const held = connecting;
+    if (held === null || !held.callback || held.asking || document.visibilityState !== "visible") {
+      return;
+    }
+    held.asking = true;
+    try {
+      const status = await api("GET", fill("/api/oauth/flows/{flow}", { flow: held.flow }));
+      if (status.stage !== "pending" && connecting === held) {
+        held.callback = null;
+        if (status.stage === "returned") {
+          await prepareConnect({ credential: held.credential, flow: held.flow, returned: true });
+        } else {
+          connectError(carried(status.failure.text_shown, status.failure.description_shown));
+        }
+      }
+    } catch (error) {
+      held.callback = null; // the login is gone: say why, and stop asking
+      return signedOut(error) ? afterFailure(error) : connectError(textOf(error));
+    } finally {
+      held.asking = false;
     }
   }
 
@@ -386,7 +405,7 @@
   }
 
   function closeConnect() {
-    connecting = null;
+    connecting = null; // and the poll stops
     $("connect-paste").value = "";
     if ($("connect").open) {
       $("connect").close();
@@ -412,10 +431,8 @@
     try {
       const begun = await api("POST", "/api/login/begin", {});
       const credential = await zoeyWebAuthn.get(begun.options);
-      const minted = await api("POST", "/api/login/finish", {
-        ceremony: begun.ceremony,
-        credential: credential,
-      });
+      const minted = await api("POST", "/api/login/finish",
+        { ceremony: begun.ceremony, credential: credential });
       sessionStorage.setItem(TOKEN, minted.token);
       await enter();
     } catch (error) {
@@ -441,10 +458,8 @@
     try {
       const begun = await api("POST", "/api/passkeys/enrol/begin", { name: $("setup-name").value });
       const credential = await zoeyWebAuthn.create(begun.options);
-      const done = await api("POST", "/api/passkeys/enrol/finish", {
-        ceremony: begun.ceremony,
-        credential: credential,
-      });
+      const done = await api("POST", "/api/passkeys/enrol/finish",
+        { ceremony: begun.ceremony, credential: credential });
       // The setup session ended with its enrolment: sign in with the new passkey next (E.1).
       sessionStorage.removeItem(TOKEN);
       $("setup-fingerprint").textContent = done.passkey.fingerprint;
@@ -514,10 +529,6 @@
 
   // --- passkeys (D.5) -------------------------------------------------------------------------
 
-  function day(seconds) {
-    return new Date(seconds * 1000).toLocaleDateString();
-  }
-
   function button(label, handler) {
     const element = document.createElement("button");
     element.type = "button";
@@ -542,15 +553,13 @@
           ", " + passkey.alg + ", " + (passkey.synced ? "synced" : "device-bound") + transports +
           "; enrolled " + VIA[passkey.via] + " on " + passkey.origin + " at " +
           when(passkey.created) + "; last used " +
-          (passkey.last_used === null ? "never" : day(passkey.last_used)) + ".";
+          (passkey.last_used === null ? "never" :
+            new Date(passkey.last_used * 1000).toLocaleDateString()) + ".";
         item.append(
           text,
-          button("Rename", function () {
-            openRename(passkey);
-          }),
-          button("Remove", function () {
-            prepare("passkey.remove", { credential: passkey.fingerprint }, afterRemove);
-          })
+          button("Rename", () => openRename(passkey)),
+          button("Remove", () => prepare("passkey.remove", { credential: passkey.fingerprint },
+            afterRemove))
         );
         list.append(item);
       }
@@ -620,10 +629,8 @@
       const credential = await zoeyWebAuthn.create(begun.options);
       creating = null; // the finish spends the ceremony, whatever it answers
       $("confirm-create").hidden = true;
-      const done = await api("POST", "/api/passkeys/enrol/finish", {
-        ceremony: begun.ceremony,
-        credential: credential,
-      });
+      const done = await api("POST", "/api/passkeys/enrol/finish",
+        { ceremony: begun.ceremony, credential: credential });
       closeConfirm();
       $("passkey-name").value = "";
       await showPasskeys();
@@ -631,8 +638,7 @@
         "Passkey enrolled. Its fingerprint is " + done.passkey.fingerprint + ".";
     } catch (error) {
       if (signedOut(error)) {
-        afterFailure(error);
-        return;
+        return afterFailure(error);
       }
       confirmError(textOf(error));
     }
@@ -661,12 +667,9 @@
         item.append(text);
         if (!secret.live_slot) {
           item.append(
-            button("Replace", function () {
-              replaceSecret(secret);
-            }),
-            button("Delete", function () {
-              prepare("secret.delete", { name: secret.name }, afterSecretDeleted);
-            })
+            button("Replace", () => replaceSecret(secret)),
+            button("Delete",
+              () => prepare("secret.delete", { name: secret.name }, afterSecretDeleted))
           );
         }
         list.append(item);
@@ -691,9 +694,7 @@
 
   // The origins field, as a list, or nothing when it is empty (JSON leaves undefined out).
   function originsGiven() {
-    const words = $("secret-origins").value.split(/[\s,]+/).filter(function (word) {
-      return word !== "";
-    });
+    const words = $("secret-origins").value.split(/[\s,]+/).filter((word) => word !== "");
     return words.length ? words : undefined;
   }
 
@@ -737,9 +738,11 @@
     }
   }
 
-  // ``working`` is what the dialog says while a slow confirm runs (an exchange: up to 76 s).
-  function openConfirm(prepared, done, working) {
-    pending = { action: prepared.action, options: prepared.options, done: done, working: working };
+  // ``working`` is what the dialog says while a slow confirm runs (an exchange: up to 76 s);
+  // ``data`` is a connect's, for when the callback took its sign-in meanwhile.
+  function openConfirm(prepared, done, working, data) {
+    pending = { action: prepared.action, options: prepared.options, done: done, working: working,
+      data: data };
     creating = null;
     renderSummary("confirm-summary", prepared.summary);
     renderSummary("confirm-now", []);
@@ -761,11 +764,6 @@
       value.textContent = pair[1];
       list.append(term, value);
     }
-  }
-
-  function confirmError(text) {
-    $("confirm-error").textContent = text;
-    $("confirm-error").hidden = text === "";
   }
 
   // Confirm: the assertion is bound to this action, session and origin, and the vault runs
@@ -797,8 +795,11 @@
       await held.done(result);
     } catch (error) {
       if (signedOut(error)) {
-        afterFailure(error);
-        return;
+        return afterFailure(error);
+      }
+      if (error.reason === "flow_returned" && held.data) {
+        closeConfirm();
+        return prepareConnect(held.data); // the vault answers it with the returned code's
       }
       if (error instanceof Refused && error.reason === "changed" && error.answer) {
         renderSummary("confirm-now", error.answer.now);
@@ -814,11 +815,7 @@
     if (held === null) {
       return;
     }
-    try {
-      await api("DELETE", fill("/api/actions/{action}", { action: held.action }));
-    } catch (error) {
-      afterFailure(error);
-    }
+    await api("DELETE", fill("/api/actions/{action}", { action: held.action })).catch(afterFailure);
   }
 
   function closeConfirm() {
@@ -910,6 +907,8 @@
       });
     }
     on("sign-out", signOut);
+    setInterval(poll, 2000);
+    document.addEventListener("visibilitychange", poll);
     enter();
   }
 

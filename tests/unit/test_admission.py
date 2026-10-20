@@ -3,7 +3,7 @@
 Requests are built as the ASGI scope gives them: raw header pairs, so a header can be missing or
 doubled. Two ``Host`` headers never reach the app over the wire (h11 refuses them, contract 37);
 here they are a pure case. A reference predicate written from C.2's table checks the order over
-generated requests. C.7's callback rows are step 14b's.
+generated requests. C.7's rows for the callback, c1 to c5, are at the end.
 """
 
 from __future__ import annotations
@@ -17,16 +17,21 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from zoeymcp.portal.admission import (
+    NAVIGATION_SITES,
     SESSION_HEADER,
     Admitted,
+    Callback,
     Decision,
     Origin,
     Redirect,
     Request,
     Static,
     admit,
+    admit_callback,
     admit_session,
     admit_unauthenticated,
+    binder_values,
+    callback_query,
     cookie_values,
     origin_entries,
     origin_entry,
@@ -116,6 +121,7 @@ def test_the_c1_entries() -> None:
             rp_id="localhost",
             cookie_name="zoeymcp-8081-session",
             secure=False,
+            binder_cookie="zoeymcp-8081-cb",
         ),
         Origin(
             origin=TAILNET,
@@ -126,6 +132,7 @@ def test_the_c1_entries() -> None:
             rp_id="zoeymcp.tailnet.example",
             cookie_name="__Host-zoeymcp-session",
             secure=True,
+            binder_cookie="__Secure-zoeymcp-cb",
         ),
         Origin(
             origin=PORTED,
@@ -136,6 +143,7 @@ def test_the_c1_entries() -> None:
             rp_id="vault.example.net",
             cookie_name="__Host-zoeymcp-8443-session",
             secure=True,
+            binder_cookie="__Secure-zoeymcp-8443-cb",
         ),
     )
 
@@ -319,7 +327,6 @@ def test_a_static_file_is_served_on_each_entry() -> None:
         ("POST", "/app.css"),
         ("GET", "/callback"),
         ("GET", "/oauth/callback"),
-        ("GET", "/oauth/callback/github"),  # until step 14b
         ("POST", "/oauth/callback/github"),
         ("GET", "http://evil.example/x"),  # an absolute-form target (contract 37)
         ("GET", "/_zoeymcp/gateway/v1/view"),
@@ -798,3 +805,160 @@ def requests(draw: st.DrawFn) -> Request:
 @given(requests())
 def test_admission_matches_the_reference(req: Request) -> None:
     assert kind(admit(req, ENTRIES, TABLE)) == reference(req, ENTRIES, TABLE)
+
+
+# --- C.7: the callback's own rows ---------------------------------------------------------------
+
+CALLBACK_PATH = "/oauth/callback/github"
+
+
+def navigation(
+    *,
+    site: Value = "cross-site",
+    mode: Value = "navigate",
+    dest: Value = "document",
+    extra: Sequence[tuple[bytes, bytes]] = (),
+    method: str = "GET",
+    path: str = CALLBACK_PATH,
+    host: Value = "localhost:8081",
+) -> Request:
+    """A top-level navigation to the callback, as a provider's redirect arrives (no Origin, no
+    body), unless told otherwise."""
+    headers: list[tuple[bytes, bytes]] = []
+    for name, value in (
+        (b"host", host),
+        (b"sec-fetch-site", site),
+        (b"sec-fetch-mode", mode),
+        (b"sec-fetch-dest", dest),
+    ):
+        for one in [value] if isinstance(value, str) else value or []:
+            headers.append((name, one.encode("latin-1")))
+    headers.extend(extra)
+    return Request(method, path, headers)
+
+
+def test_row_3_hands_the_callback_to_c7() -> None:
+    assert decide(navigation()) == Callback(ENTRIES[0], "github")
+    assert decide(navigation(host="vault.example.net:8443")) == Callback(ENTRIES[2], "github")
+    # Whatever Fetch metadata says: row 3 only routes it, C.7 decides.
+    assert decide(request("GET", CALLBACK_PATH, site=None)) == Callback(ENTRIES[0], "github")
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", CALLBACK_PATH),  # a form post (C.2 row 3)
+        ("DELETE", CALLBACK_PATH),
+        ("GET", "/oauth/callback"),
+        ("GET", "/oauth/callback/"),
+        ("GET", "/oauth/callback/GitHub"),  # outside NAME_PATTERN
+        ("GET", "/oauth/callback/git%68ub"),  # the raw path, never decoded
+        ("GET", "/oauth/callback/github/"),
+        ("GET", "/oauth/callback/github/x"),
+        ("GET", "/callback"),
+    ],
+)
+def test_any_other_callback_path_or_method_is_404(method: str, path: str) -> None:
+    assert decide(navigation(method=method, path=path)) == refusal("not_found")
+
+
+def test_a_loopback_literal_callback_is_row_1s_421() -> None:
+    assert decide(navigation(host="127.0.0.1:8081")) == wrong_host_literal("localhost:8081")
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site", "none"])
+def test_c1_takes_a_navigation_from_anywhere(site: str) -> None:
+    assert admit_callback(navigation(site=site)) is None
+    assert frozenset({"cross-site", "same-site", "none"}) == NAVIGATION_SITES
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"site": None},
+        {"site": "same-origin"},  # the portal's page never navigates there
+        {"site": ["cross-site", "cross-site"]},
+        {"site": "Cross-Site"},
+        {"mode": None},
+        {"mode": "cors"},  # a fetch
+        {"mode": "no-cors"},  # an image or an embed
+        {"mode": "same-origin"},
+        {"mode": ["navigate", "navigate"]},
+        {"dest": None},
+        {"dest": "iframe"},  # a frame
+        {"dest": "embed"},
+        {"dest": "image"},
+        {"dest": "empty"},
+        {"dest": ["document", "document"]},
+    ],
+)
+def test_c1_refuses_anything_but_one_top_level_navigation(changes: dict[str, Any]) -> None:
+    assert admit_callback(navigation(**changes)) == refusal("not_navigation")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        [(b"origin", b"https://evil.example")],  # a cross-origin fetch would send one
+        [(b"origin", b"null")],
+        [(b"origin", LOCAL.encode())],
+        [(b"content-length", b"1")],
+        [(b"content-length", b"0"), (b"content-length", b"0")],
+        [(b"transfer-encoding", b"chunked")],
+    ],
+)
+def test_c2_refuses_an_origin_or_a_body(extra: list[tuple[bytes, bytes]]) -> None:
+    assert admit_callback(navigation(extra=extra)) == refusal("not_navigation")
+
+
+def test_c2_takes_a_zero_length() -> None:
+    assert admit_callback(navigation(extra=[(b"content-length", b"0")])) is None
+    # Sec-Fetch-User is never read: present or not, the same answer.
+    assert admit_callback(navigation(extra=[(b"sec-fetch-user", b"?1")])) is None
+    assert admit_callback(navigation(extra=[(b"sec-fetch-user", b"?0")])) is None
+
+
+def test_c3_is_row_8() -> None:
+    assert admit_unauthenticated(slot=False, token=True) == refusal("busy")
+    assert admit_unauthenticated(slot=True, token=False) == refusal("rate_limited")
+
+
+@pytest.mark.parametrize(
+    ("raw", "ok"),
+    [
+        (b"", True),
+        (b"code=c&state=s", True),
+        (b"a" * 4096, True),
+        (b"a" * 4097, False),
+        (b"state=%C3%A9", True),  # percent-encoded: ASCII as sent; the flow check decides
+        (b"state=\xc3\xa9", False),  # a raw non-ASCII byte
+        (b"state=\x80", False),
+        (b"state=\x7f", True),
+    ],
+)
+def test_c4_takes_the_raw_query_ascii_and_capped(raw: bytes, ok: bool) -> None:
+    decided = callback_query(raw)
+    if ok:
+        assert decided == raw.decode("ascii")
+    else:
+        assert decided == refusal("bad_query")
+
+
+def test_c5_gathers_the_binding_cookie_and_nothing_else() -> None:
+    entry = ENTRIES[0]
+    assert entry.binder_cookie == "zoeymcp-8081-cb"
+
+    def cookies(*headers: str) -> tuple[str, ...]:
+        return binder_values([(b"cookie", h.encode()) for h in headers], entry)
+
+    assert cookies() == ()
+    assert cookies("zoeymcp-8081-session=s") == ()  # no session is read here
+    assert cookies("zoeymcp-8081-cb=b1") == ("b1",)
+    assert cookies("zoeymcp-9000-cb=other; zoeymcp-8081-cb= b1 ") == ("b1",)
+    five = "; ".join(f"zoeymcp-8081-cb=v{n}" for n in range(5))
+    assert cookies(five) == ("v0", "v1", "v2", "v3")  # MAX_SESSION_COOKIES, in order
+    assert cookies("zoeymcp-8081-cb=a", "zoeymcp-8081-cb=b") == ("a", "b")
+    assert binder_values([], ENTRIES[1]) == ()
+    assert ENTRIES[1].binder_cookie == "__Secure-zoeymcp-cb"
+    assert ENTRIES[2].binder_cookie == "__Secure-zoeymcp-8443-cb"
+    assert origin_entry("http://localhost").binder_cookie == "zoeymcp-cb"

@@ -83,7 +83,10 @@ DESCRIPTIONS = (
     "redirect_uri doesn't match",
     "PKCE verification failed",
 )
-ISSUED = re.compile(r"fake-(?:spotify|google|machine)-(?:at|rt|code)-\d+")
+ISSUED = re.compile(r"fake-(?:spotify|google|machine|notes)-(?:at|rt|code)-\d+")
+# A credential registered with the portal's callback address (M5 design A.5, H.6).
+NOTES_ID = "example-notes-client"
+CALLBACK = "http://localhost:8081/oauth/callback/notes"
 PRINTED_URL = re.compile(r"^  (https://\S+)$", re.MULTILINE)
 
 BASE: dict[str, Any] = {
@@ -139,13 +142,26 @@ def policy() -> Policy:
             "client_secret": "store:machine-secret",
             "scope": "read",
         },
+        "notes": {
+            "kind": "oauth2",
+            "token_url": "https://accounts.notes.example/token",
+            "authorize_url": "https://accounts.notes.example/authorize",
+            "client_id": NOTES_ID,
+            "client_auth": "none",
+            "rotates": True,
+            "refresh_token": "store:notes-refresh",
+            "redirect_uri": CALLBACK,
+        },
     }
     routes = [
         route("music", "https://api.spotify.example/v1"),
         route("calendar", "https://api.google.example/v1"),
         route("machine", "https://api.machine.example/v1"),
+        route("notes", "https://api.notes.example/v1"),
     ]
-    return Policy.model_validate({**BASE, "routes": routes, "credentials": credentials})
+    admin = {"listen": "127.0.0.1:8081", "origins": ["http://localhost:8081"]}
+    document = {**BASE, "admin": admin, "routes": routes, "credentials": credentials}
+    return Policy.model_validate(document)
 
 
 def by_host(apps: dict[str, Any]) -> Any:
@@ -171,10 +187,19 @@ class World:
             client_secret=MACHINE_SECRET,
             prefix="fake-machine",
         )
+        self.notes = FakeAuthServer(
+            self.clock.time,
+            client_id=NOTES_ID,
+            auth="none",
+            rotate=True,
+            prefix="fake-notes",
+            registered_redirect=CALLBACK,
+        )
         self.servers = {
             "accounts.spotify.example": self.spotify,
             "accounts.google.example": self.google,
             "auth.machine.example": self.machine,
+            "accounts.notes.example": self.notes,
         }
         self.apis = {
             "api.spotify.example": FakeResourceServer(self.spotify),
@@ -841,3 +866,89 @@ async def test_no_ledger_line_reaches_the_vault_logs(tmp_path: Path) -> None:
         assert line.decode()[:60] not in text
     for secret in (DIGEST, PIN, "n" * 127 + "1", "hmac-sha256:"):
         assert secret not in text
+
+
+async def callback(world: World, url: str, binder: str | None) -> httpx.Response:
+    """The provider's redirect, as the operator's browser follows it to the portal's callback (M5
+    design C.7): a cross-site top-level GET, with the flow's binding cookie when given. The
+    answer is kept with the portal's."""
+    headers = {
+        "Host": "localhost:8081",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+    }
+    if binder is not None:
+        headers["Cookie"] = f"zoeymcp-8081-cb={binder}"
+    transport = httpx.ASGITransport(app=world.portal_app)
+    async with httpx.AsyncClient(transport=transport, base_url=ORIGIN) as client:
+        response = await client.get(url, headers=headers)
+    world.portal_answers.append(response.text + repr(response.headers.multi_items()))
+    return response
+
+
+async def test_the_callback_shows_no_query_and_its_binder_only_in_its_cookie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_lines: io.StringIO
+) -> None:
+    """The callback's query (code, state, error_description) reaches no answer and no log line;
+    the binder is in its start answer's Set-Cookie and nowhere else (M5 design O.5, P1, P17). The
+    one description shown is a failed callback's, to its owner's poll."""
+    world = World(tmp_path, monkeypatch)
+    page = await world.portal_page()
+    binders = []
+    for _ in range(2):
+        started = await page.call("POST", "/api/oauth/notes/start", {})
+        assert started.status_code == 200, started.text
+        begun = started.json()
+        world.authorize_urls.append(begun["authorize_url"])
+        world.flows.append(begun["flow"])
+        binders.append(started.headers["set-cookie"].split(";")[0].split("=", 1)[1])
+        if len(binders) == 1:
+            first = begun
+            # Taken: the code is held, out of the address bar (303).
+            location = await world.browse(begun["authorize_url"])
+            assert (await callback(world, location, binders[0])).status_code == 303
+            # Refused in place: no binder, with a provider's text in the query.
+            state = dict(parse_qsl(urlsplit(location).query))["state"]
+            hostile = f"{ORIGIN}/oauth/callback/notes?" + urlencode(
+                {"error": "access_denied", "error_description": SENTINEL + "-x", "state": state}
+            )
+            assert (await callback(world, hostile, None)).status_code == 400
+            status = await page.call("GET", f"/api/oauth/flows/{begun['flow']}")
+            assert status.json()["stage"] == "returned"
+            held = await world.portal("oauth.complete", {"credential": "notes", **_flow(begun)})
+            assert held.status_code == 200, held.text
+    # A provider's refusal through the callback: the flow fails, its text for the owner.
+    world.notes.answer = "error"
+    world.notes.error_description = SENTINEL
+    location = await world.browse(world.authorize_urls[-1])
+    assert (await callback(world, location, binders[1])).status_code == 303
+    failed = await page.call("GET", f"/api/oauth/flows/{world.flows[-1]}")
+    assert failed.json()["failure"]["description_shown"] == SENTINEL
+
+    log_text = log_lines.getvalue()
+    assert '"event":"oauth_callback_returned"' in log_text
+    assert '"event":"oauth_callback_failed"' in log_text
+    [code] = [c.params["code"] for c in world.notes.calls]
+    for text in [*world.portal_answers, log_text]:
+        shown = text
+        for url in world.authorize_urls:
+            shown = shown.replace(url, "<authorize-url>")
+        for value in (code, SENTINEL + "-x", *world.states(), *world.verifiers()):
+            assert value not in shown
+    # The binder: once, in its start answer's Set-Cookie.
+    for binder in binders:
+        [where] = [text for text in world.portal_answers if binder in text]
+        assert f"zoeymcp-8081-cb={binder}; Path=/oauth/callback/notes" in where
+        assert binder not in log_text
+    # The description, to the owner's poll only, and never logged.
+    assert sum(SENTINEL in text for text in world.portal_answers) == 1
+    assert SENTINEL not in log_text
+    assert first["callback"] == ORIGIN
+    await page.client.aclose()
+    await world.vault.aclose()
+    await world.token_client.aclose()
+
+
+def _flow(begun: dict[str, Any]) -> dict[str, Any]:
+    return {"flow": begun["flow"], "returned": True}

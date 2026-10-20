@@ -20,7 +20,12 @@ credentials:
     # Without both, Google issues no refresh token.
     authorize_params: { access_type: offline, prompt: consent }
     scope: https://www.googleapis.com/auth/calendar.readonly
-    # redirect_uri is left at the default http://127.0.0.1/callback.
+    # redirect_uri is left at the default http://127.0.0.1/callback: keep it with a Desktop app
+    # client, and paste the address the browser lands on. To use the portal's callback instead,
+    # register a Web application client with the exact address
+    # https://<name>/oauth/callback/google-calendar (or, for a testing or unverified client,
+    # http://localhost:<port>/oauth/callback/google-calendar), list that origin in
+    # admin.origins, and set redirect_uri to it.
 
 routes:
   - name: google-calendar

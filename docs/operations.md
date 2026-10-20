@@ -155,6 +155,40 @@ with your passkey; the exchange can take up to 76 s. **Connect and rebind** is `
 credential's failure state, as `oauth reset` would. **Try again** is `oauth reset`, after a
 passkey prompt.
 
+**The portal's callback.** A credential can skip the paste when its `redirect_uri` is its own
+callback address on a listed origin: the origin, `/oauth/callback/`, and the credential's name,
+exactly, such as `https://vault.example.net/oauth/callback/calendar` for a credential named
+`calendar` with `https://vault.example.net` in `admin.origins`. Each credential has its own
+address. A trailing slash, a query, a default port written out or another credential's name is
+paste only, and `check` warns with the exact form. The one `localhost` address allowed is
+`http://localhost:<port>/oauth/callback/<credential>`, and only when `http://localhost:<port>`
+is listed and the name is the credential's own; otherwise the policy doesn't load. The port is
+the browser's, the origin's: the published or tunnelled one. The default
+`http://127.0.0.1/callback`, and any `127.0.0.1` address, stays paste only.
+
+Register the exact address with the provider. At Google that needs a **Web application**
+client: an `https://<name>` origin is the durable route; a `localhost` address suits a testing
+or unverified client, since Google offers local addresses on a web client "for testing" and its
+verification may ask for them to go. If the provider refuses the address, keep the default and
+paste. The shipped `profiles/google-oauth.yaml` uses a Desktop client and pastes.
+
+Approve in the same browser that started **Connect**, from a session on the callback address's
+own origin: the start sets a binding cookie there, and the callback takes the sign-in only
+with it. The provider sends the tab to `/oauth/callback/<credential>`, which holds the code and
+moves the tab to a page saying so; the dialog notices within a few seconds and asks for your
+passkey, with "Confirm only if you have just finished approving in the provider's tab; if you
+haven't, cancel." Nothing is stored before that confirm. Approving in another browser or on
+another machine lands on a page saying "The portal didn't take this sign-in": copy that tab's
+address and paste it into the dialog, as without the callback. "Two different answers came back
+for this sign-in. Nothing was stored. Connect again." means what it says: something other than
+your approval answered too. A login started with `zoeymcp login` never takes the callback; for a
+callback address it prints "Your browser will land on the portal's callback, which doesn't take
+a command-line login: copy the full address from that tab's address bar and paste it here".
+Logs: `portal_request` for the callback's answer, with the route `/oauth/callback/{credential}`
+and never the query; `oauth_callback_returned{credential}`;
+`oauth_callback_failed{credential, reason, error}`; and for a refused callback
+`oauth_callback_refused{reason, count}`, at most once per 10 seconds per reason.
+
 Logins are owned: one started in the portal can't be completed or cancelled from the CLI or from
 another session, nor one started in the CLI from the portal; each gets `flow_unknown`, as an
 unknown login would. A credential still has one pending login, whoever started it: a new start
@@ -199,6 +233,10 @@ these `reason` codes, and the portal answers with the same reason and status, in
 | `provider_error` | the provider refused (for example, consent was denied); its description is shown, never logged | act on the description |
 | `exchange_failed:<code>` | the token endpoint refused the code; `<code>` is one of §4's codes | for `invalid_grant`, the code expired or was used: run `login` again |
 | `no_refresh_token` | the provider issued no refresh token | Google: keep `access_type: offline` and `prompt: consent`; other providers may need an `offline_access` scope |
+
+In the portal only, after the callback: `flow_returned` (409) means the callback already holds
+the answer you pasted, so confirm that one; `flow_conflict` (409) means two different answers
+came back for one sign-in and the login ended with nothing stored: connect again.
 
 ## 3. Credential health: `health`, `oauth status` and `oauth reset`
 
@@ -406,6 +444,8 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
 **Google** (`profiles/google-oauth.yaml`):
 
 - Register a **Desktop app** client: it accepts the loopback redirect.
+- To skip the paste in the portal, register a **Web application** client with the credential's
+  exact callback address instead, and set `redirect_uri` to it (§2, "The portal's callback").
 - Keep `authorize_params: {access_type: offline, prompt: consent}`, or no refresh token is
   issued.
 - While the consent screen is in **Testing** status, a grant lasts 7 days.
@@ -952,6 +992,20 @@ the SSH tunnel above, or an HTTPS reverse proxy of your own with a certificate t
 trusts: list its `https://<name>` origin, and have it pass `Host` unchanged, port included
 (nginx's `$host` drops the port: use `$http_host`). The vault ignores `X-Forwarded-*`, and the
 proxy sees every secret typed into the portal.
+
+Such a proxy must also keep the OAuth callback's query out of its access log: the address
+`/oauth/callback/<credential>?code=...&state=...` carries the provider's code and the login's
+`state`. nginx's default log format logs `$request`, query included; for the portal use a format
+that logs `$uri`, the path alone:
+
+```nginx
+log_format portal '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status';
+access_log /var/log/nginx/portal.log portal;
+```
+
+Caddy writes no access log unless the site has a `log` directive. If you enable one, keep the
+query of `/oauth/callback/` paths out of it; check how your Caddy version filters fields before
+relying on it.
 
 **The first passkey.**
 

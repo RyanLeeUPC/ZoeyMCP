@@ -19,6 +19,9 @@ from zoeymcp.portal.routes import (
     BODY_PASTE,
     BODY_SECRET,
     BODY_WEBAUTHN,
+    CALLBACK,
+    CALLBACK_RECEIVED,
+    CALLBACK_REFUSED,
     CSS,
     HTML,
     JAVASCRIPT,
@@ -30,6 +33,7 @@ from zoeymcp.portal.routes import (
     Route,
     Scope,
     StaticFile,
+    callback_credential,
     match,
 )
 
@@ -75,7 +79,10 @@ def test_the_static_map_is_fixed() -> None:
         "/app.js": StaticFile("app.js", "text/javascript; charset=utf-8"),
         "/webauthn.js": StaticFile("webauthn.js", "text/javascript; charset=utf-8"),
         "/app.css": StaticFile("app.css", "text/css; charset=utf-8"),
+        "/callback/received": StaticFile("callback-received.html", "text/html; charset=utf-8"),
+        "/callback/refused": StaticFile("callback-refused.html", "text/html; charset=utf-8"),
     }
+    assert (CALLBACK_RECEIVED, CALLBACK_REFUSED) == ("/callback/received", "/callback/refused")
     assert (HTML, JAVASCRIPT, CSS) == (
         "text/html; charset=utf-8",
         "text/javascript; charset=utf-8",
@@ -87,9 +94,9 @@ def test_the_static_map_is_fixed() -> None:
 
 def test_the_table_holds_only_built_routes() -> None:
     # Each of steps 11 to 15 adds the rows it builds: step 11's are M.1's first nine, step
-    # 12's the passkey list and the three action routes, step 13's the secret list, and step
-    # 14a's health, the OAuth list, a flow's start and its cancel (14b adds the flow's status).
-    assert (*M1[:12], *M1[13:15], M1[16], *M1[18:]) == ROUTES
+    # 12's the passkey list and the three action routes, step 13's the secret list, step 14a's
+    # health, the OAuth list, a flow's start and its cancel, and step 14b's the flow's status.
+    assert (*M1[:12], *M1[13:17], *M1[18:]) == ROUTES
     assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
         "/api/login/begin",
         "/api/logout",
@@ -221,6 +228,44 @@ def test_the_first_route_that_matches_wins() -> None:
     # A route of another method is passed over, not taken.
     post = Route("POST", "/api/oauth/{credential}", FULL)
     assert match((post, second), "GET", "/api/oauth/github") == (second, {"credential": "github"})
+
+
+# --- the callback, beside the static map (C.7) ----------------------------------------------------
+
+
+def test_the_callback_route_is_outside_the_api_table() -> None:
+    """A provider's redirect target that no page script names, so it isn't in ROUTES; its
+    template is what the log names, never the path or the query (M.4)."""
+    assert CALLBACK == "/oauth/callback/{credential}"
+    assert not any(route.path.startswith("/oauth/") for route in ROUTES)
+    assert CALLBACK_RECEIVED in STATIC
+    assert CALLBACK_REFUSED in STATIC
+
+
+@pytest.mark.parametrize(
+    ("path", "credential"),
+    [
+        ("/oauth/callback/github", "github"),
+        ("/oauth/callback/a", "a"),
+        ("/oauth/callback/0-mail_box", "0-mail_box"),
+        ("/oauth/callback/" + "a" * 63, "a" * 63),
+        ("/oauth/callback/" + "a" * 64, None),
+        ("/oauth/callback/GitHub", None),
+        ("/oauth/callback/-github", None),
+        ("/oauth/callback/git.hub", None),
+        ("/oauth/callback/github/", None),
+        ("/oauth/callback/github/x", None),
+        ("/oauth/callback/github\n", None),
+        ("/oauth/callback/git%68ub", None),  # the raw path: never decoded
+        ("/oauth/callback/", None),
+        ("/oauth/callback", None),
+        ("/callback", None),
+        ("/x/oauth/callback/github", None),
+        ("/OAUTH/callback/github", None),
+    ],
+)
+def test_a_callback_path_names_one_credential(path: str, credential: str | None) -> None:
+    assert callback_credential(path) == credential
 
 
 def test_a_segment_is_a_parameter_only_in_braces() -> None:

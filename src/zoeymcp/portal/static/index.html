@@ -76,9 +76,10 @@ shows. Now sign in with it, to check that it works.</p>
 <section id="credentials" hidden>
 <h2>Credentials</h2>
 <p>Every credential in the policy, the routes that use it, and what needs you. <b>Connect</b>
-signs in with an OAuth provider in a new tab, and you paste back the address it lands on; the
-vault stores the grant after you confirm with your passkey. Nothing here shows a secret or a
-token.</p>
+signs in with an OAuth provider in a new tab, and you paste back the address it lands on (or,
+for a credential registered with the portal's callback address, the provider sends it back
+itself); the vault stores the grant after you confirm with your passkey. Nothing here shows a
+secret or a token.</p>
 <ul id="credential-list"></ul>
 <p>This deployment's policy is declarative: the portal can't change it.</p>
 </section>
@@ -148,9 +149,13 @@ first. A credential's tokens from Connect are the vault's own and aren't changed
 <div id="connect-steps">
 <p>1. <a id="connect-link" target="_blank" rel="noopener noreferrer">Open the provider's sign-in
 page in a new tab</a>, and approve there.</p>
-<p>The provider then sends that tab to an address starting with <code id="connect-redirect"></code>.
-That page won't load, which is expected: copy the whole address from that tab's address bar and
-paste it here, by <span id="connect-by"></span>.</p>
+<p id="connect-paste-text">The provider then sends that tab to an address starting with
+<code id="connect-redirect"></code>. That page won't load, which is expected: copy the whole
+address from that tab's address bar and paste it here, by <span id="connect-by"></span>.</p>
+<p id="connect-callback-text" hidden>The provider then sends that tab back to the portal, and
+this dialog asks for your passkey. If that page doesn't load, or says the portal didn't take the
+sign-in, copy its whole address from that tab's address bar and paste it here, by
+<span id="connect-by-callback"></span>.</p>
 <label for="connect-paste">2. The address from that tab's address bar</label>
 <input id="connect-paste" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="8000">
 <button type="button" id="connect-check">Check the address</button>

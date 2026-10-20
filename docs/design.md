@@ -60,10 +60,10 @@ say so.
 
 | ID | Requirement | Kind |
 | --- | --- | --- |
-| R20 | OAuth consent can run **in the admin portal** (the primary flow) or from the **CLI** (headless). Either way, the granted scopes are shown, scopes beyond the expected ones are flagged, and tokens go **straight into the store**: nothing is written to the operator's disk or printed | Must |
+| R20 | OAuth consent can run **in the admin portal** (the primary flow) or from the **CLI** (headless). In the portal, pasting the redirected address is the primary path; a credential registered with the portal's own callback address can skip the paste (§7.4). Either way, completing needs a step-up, the granted scopes are shown, scopes beyond the expected ones are flagged, and tokens go **straight into the store**: nothing is written to the operator's disk or printed | Must |
 | R21 | **One generic onboarding for MCP servers:** protected-resource metadata (RFC 9728) → authorization-server metadata (RFC 8414) → dynamic client registration where offered (RFC 7591) → PKCE (RFC 8252) | Should |
 | R22 | Onboarding fetches the server's tool list for **review**: the operator picks the tools, classifies each as `allow` or `approve`, and the definitions are pinned (R33) | Should |
-| R23 | OAuth works when the portal is used from **another machine**: if the loopback redirect can't reach the vault, the operator pastes the redirected URL into the portal, and the vault completes the exchange | Should |
+| R23 | OAuth works when the portal is used from **another machine**: if the loopback redirect can't reach the vault, the operator pastes the redirected URL into the portal, and the vault completes the exchange. The vault listens for a provider's redirect only on the portal's one callback route (§7.3) | Should |
 
 ### 2.4 Gateway and tools
 
@@ -1415,11 +1415,24 @@ have passed:
 - **Reverse proxies:** the vault never reads `X-Forwarded-*` or `Forwarded`. A TLS proxy in front
   must pass the original `Host` (Caddy does by default). nginx's `proxy_set_header Host $host`
   drops the port, so an origin with a non-default port needs `proxy_set_header Host $http_host`.
-- **The OAuth callback is the one exception.** It arrives as a cross-site, top-level navigation,
-  so the same-origin rule and the strict cookie don't apply to it. It accepts only a top-level
-  `GET`, and it is validated by a **single-use, server-side `state`**: tied to the portal session
-  that started the flow, expiring in 10 minutes, and not dependent on the session cookie arriving.
-  It does nothing except complete that one exchange.
+- **The OAuth callback is the one exception.** A provider's redirect arrives as a cross-site,
+  top-level navigation, so the same-origin rule and the strict cookie don't apply to it. The
+  route is a credential's own callback address, `GET /oauth/callback/<credential>`, and nothing
+  else: exactly one `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`, no `Origin`, no
+  body, the `Host` check as everywhere, one of the unauthenticated slots and a token from the
+  rate bucket, and a raw ASCII query of at most 4 KiB. A fetch, frame, embed or image is
+  refused before any flow is looked at; a form post is `404`. It is validated by a
+  **single-use, server-side `state`**, owned by the portal session that started the flow and
+  expiring with it in 10 minutes, together with that flow's **binding cookie**, which the start
+  set in the browser that started it (`SameSite=Lax`, `HttpOnly`, `Path` the callback address,
+  `Max-Age=600`, `Secure` and the `__Secure-` prefix on https; expired by the confirm and by a
+  cancel). It reads no session cookie. A callback with a leaked `state` from any other browser
+  touches nothing. A second, different answer for the same flow, by callback or paste, fails it.
+  It does nothing except hold that one code for its owner to confirm: the exchange waits for
+  that session's step-up. A callback that consumed the `state` answers `303` to
+  `/callback/received`, so the code leaves the address bar; one refused answers the fixed page
+  `/callback/refused` in place, so the address can still be pasted. Both pages are static, run
+  no script and load only `/app.css`.
 
 ### 7.4 OAuth and MCP onboarding
 
@@ -1463,6 +1476,30 @@ have passed:
     session; another owner's flow answers as an unknown one, a credential keeps one pending flow
     whoever started it (a start replaces the other's and says so), and a session that ends
     cancels its flows. The PKCE verifier never leaves the vault.
+  - **The portal's callback (M5), beside paste.** A credential takes it only when its
+    `redirect_uri` is exactly a listed portal origin plus `/oauth/callback/` and its own name,
+    such as `https://vault.example.net/oauth/callback/calendar`: one address per credential, so
+    an answer can only reach the flow it was registered for (RFC 9700 §4.4.2). One `localhost`
+    form is allowed in `redirect_uri`, `http://localhost:<port>/oauth/callback/<credential>`,
+    and only when `http://localhost:<port>` is in `admin.origins` and the name is the
+    credential's own; otherwise the policy doesn't load. The portless default and every
+    `127.0.0.1` address stay paste only, and `check` warns about an address that only resembles
+    a callback address. Register a provider's web client type with the exact address. Only a
+    portal session's flow takes the callback, and only when the address is on the origin that
+    session is on, where the start sets the binding cookie; the start answer says so
+    (`callback`), and also whether the address is a callback address at all
+    (`callback_address`). The dialog's text is then *after approving, the provider sends that
+    tab back to the portal, and this dialog asks for your passkey; if that page doesn't load or
+    says the portal didn't take it, copy its address and paste it here*; the paste box stays.
+    While the dialog is open it polls `GET /api/oauth/flows/{flow}` every 2 seconds and when the
+    tab is shown again. When the code is back it prepares `oauth.complete` with
+    `returned: true`, whose summary says where and when the sign-in came back and "Confirm only
+    if you have just finished approving in the provider's tab; if you haven't, cancel."; only the
+    confirm exchanges the code. A paste of the same answer is told to confirm the returned one; a
+    different answer, by callback or paste, fails the flow: "Two different answers came back
+    for this sign-in. Nothing was stored. Connect again." A CLI flow never takes a callback;
+    `zoeymcp login` says to paste the address from that tab when the credential's
+    `redirect_uri` is a callback address.
 - **MCP server by URL:**
   1. The vault reads the server's protected-resource metadata, then its authorization server's
      metadata.

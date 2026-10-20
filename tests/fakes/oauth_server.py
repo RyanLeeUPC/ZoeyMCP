@@ -8,6 +8,13 @@ providers do.
 
 Every value it issues is a deterministic fake (``<prefix>-at-1``, ``<prefix>-rt-2``), so tests can
 look for them in logs and responses.
+
+For the portal's OAuth callback (M5 design O.1), ``answer`` sets how ``/authorize`` answers an
+approval: ``code`` (the default), ``error`` (``access_denied`` with ``error_description``, which
+a test may make hostile), ``wrong_iss``, ``two_codes``, ``no_code`` or ``fragment`` (the answer
+after a ``#``). Approving the same authorization URL again issues a second code for it, as an
+attacker who consents there with their own account would get; :attr:`FakeAuthServer.exchanges`
+counts the codes presented at ``/token``, so a test can show the callback exchanged nothing.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from starlette.types import Receive, Scope, Send
 Clock = Callable[[], float]
 ClientAuth = Literal["basic", "post", "none"]
 ErrorShape = Literal["rfc", "status_403", "status_200", "ok_false", "html", "form", "echo"]
+Answer = Literal["code", "error", "wrong_iss", "two_codes", "no_code", "fragment"]
 
 
 class _Missing(enum.Enum):
@@ -44,6 +52,7 @@ MISSING: Final = _Missing.MISSING
 """A knob set to this leaves the field out of the token response."""
 
 DEFAULT_REDIRECT: Final = "http://127.0.0.1/callback"
+OTHER_ISSUER: Final = "https://other-issuer.example"
 LATCH_TIMEOUT: Final = 30.0
 INSUFFICIENT_SCOPE_PATH: Final = "/forbidden"
 
@@ -167,6 +176,9 @@ class FakeAuthServer:
         self.registered_redirect = registered_redirect
         self.issuer = issuer
         self.prefix = prefix
+        # How /authorize answers an approval (the callback's cases).
+        self.answer: Answer = "code"
+        self.error_description = "The user denied the request"
         # Hostile and flaky behavior.
         self.drop_after_processing = 0
         self.redirect_token: str | None = None
@@ -262,6 +274,11 @@ class FakeAuthServer:
     def refresh_calls(self) -> list[TokenCall]:
         return [c for c in self.calls if c.grant_type == "refresh_token"]
 
+    @property
+    def exchanges(self) -> int:
+        """How many codes were presented at ``/token``."""
+        return sum(1 for c in self.calls if c.grant_type == "authorization_code")
+
     # --- /authorize ----------------------------------------------------------------------------
 
     async def _authorize(self, request: Request) -> Response:
@@ -283,6 +300,29 @@ class FakeAuthServer:
             if state:
                 back["state"] = state
             return RedirectResponse(f"{redirect_uri}?{urlencode(back)}", status_code=302)
+        if self.answer == "error":
+            back = {
+                "error": "access_denied",
+                "error_description": self.error_description,
+                "state": state or "",
+            }
+            return RedirectResponse(f"{redirect_uri}?{urlencode(back)}", status_code=302)
+        codes = [self._code(params, redirect_uri)]
+        if self.answer == "two_codes":
+            codes.append(self._code(params, redirect_uri))
+        answer: list[tuple[str, str]] = []
+        if self.answer != "no_code":
+            answer += [("code", code) for code in codes]
+        answer.append(("state", state or ""))
+        if self.issuer is not None or self.answer == "wrong_iss":
+            answer.append(
+                ("iss", OTHER_ISSUER if self.answer == "wrong_iss" else self.issuer or "")
+            )
+        separator = "#" if self.answer == "fragment" else "?"
+        return RedirectResponse(f"{redirect_uri}{separator}{urlencode(answer)}", status_code=302)
+
+    def _code(self, params: dict[str, str], redirect_uri: str) -> str:
+        """A new code for the approved authorization request."""
         offline = params.get("access_type") == "offline" and params.get("prompt") == "consent"
         scope = params.get("scope")
         code = self._new("code")
@@ -293,10 +333,7 @@ class FakeAuthServer:
             scopes=tuple(scope.split(" ")) if scope else self.scopes,
             offline=offline,
         )
-        answer = {"code": code, "state": state or ""}
-        if self.issuer is not None:
-            answer["iss"] = self.issuer
-        return RedirectResponse(f"{redirect_uri}?{urlencode(answer)}", status_code=302)
+        return code
 
     def _redirect_allowed(self, redirect_uri: str) -> bool:
         if redirect_uri == self.registered_redirect:

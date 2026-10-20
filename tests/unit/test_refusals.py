@@ -273,6 +273,7 @@ def test_every_redirect_reason_is_catalogued() -> None:
         "provider_error",
         "iss_mismatch",
         "no_code",
+        "callback_not_taken",  # callback_state's (H.6)
     }
     assert found <= set(CATALOGUE)
 

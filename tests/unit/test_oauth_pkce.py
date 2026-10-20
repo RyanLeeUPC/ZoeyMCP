@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -7,7 +9,9 @@ from typing import Any
 
 import pytest
 
+from zoeymcp.common import logs as common_logs
 from zoeymcp.common.policy.schema import OAuth2Credential
+from zoeymcp.vault import logs
 from zoeymcp.vault.oauth import pkce
 from zoeymcp.vault.oauth.pkce import (
     CLI_OWNER,
@@ -606,3 +610,217 @@ def test_owner_of_names_the_flow_a_start_would_replace() -> None:
     assert flows.owner_of("music") == SESSION
     clock.now = second.expires_at
     assert flows.owner_of("music") is None
+
+
+# --- the callback (M5 design H.6) ----------------------------------------------------------------
+
+SESSION = "session:" + "ab" * 16
+PORTAL = "http://localhost:8081"
+ADDRESS = PORTAL + "/oauth/callback/music"
+
+
+def binder(value: str = "b" * 43) -> pkce.CallbackBinder:
+    return pkce.CallbackBinder(value)
+
+
+def callback_flow(flows: FlowTable, *, value: str = "b" * 43, owner: str = SESSION) -> Flow:
+    return flows.start(
+        "music", ADDRESS, owner=owner, callback=PORTAL, binder_hash=binder(value).sha256()
+    )
+
+
+def test_a_binder_never_shows_and_is_never_logged() -> None:
+    sizes: list[int] = []
+
+    def token(size: int) -> str:
+        sizes.append(size)
+        return "c" * 43
+
+    made = pkce.CallbackBinder.new(token)
+    assert sizes == [32]
+    assert made.reveal() == "c" * 43
+    assert made.sha256() == hashlib.sha256(b"c" * 43).digest()
+    assert repr(made) == str(made) == "CallbackBinder(<hidden>)"
+    assert pkce.CallbackBinder in common_logs.refused_types()
+    with pytest.raises(TypeError):
+        logs.event("x", binder=made)
+    assert len(pkce.CallbackBinder.new().reveal()) == 43
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        f"code=a&code=b&state={STATE}",
+        f"state={STATE}&state={STATE}",
+        f"error=a&error=b&state={STATE}",
+        f"iss=a&iss=b&state={STATE}&code=c",
+        f"code=&code=&state={STATE}",
+    ],
+)
+def test_a_callbacks_duplicate_parameter(query: str) -> None:
+    with pytest.raises(RedirectError) as caught:
+        pkce.callback_state(query)
+    assert caught.value.reason == "duplicate_param"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "code=c",  # no state
+        "",
+        "state=",
+        "state=%C3%A9",  # decodes to a non-ASCII character
+        "state=%00",
+        "state=" + "a" * 129,
+        "state=a.b",  # outside [A-Za-z0-9_-]
+        "state=a~b",
+        "state=a+b",  # a space
+        "state=%FF",  # can't be decoded at all
+        "code=c&state=a%0A",
+    ],
+)
+def test_a_callback_state_that_isnt_url_safe_ascii_is_not_taken(query: str) -> None:
+    with pytest.raises(RedirectError) as caught:
+        pkce.callback_state(query)
+    assert (caught.value.reason, str(caught.value)) == (
+        "callback_not_taken",
+        "no pending login takes this callback",
+    )
+
+
+@pytest.mark.parametrize("state", ["a", "a" * 128, "Az09_-", STATE.replace("-", "_")])
+def test_a_callback_state(state: str) -> None:
+    assert pkce.callback_state(f"code=c&state={state}&x=1&x=2").reveal() == state
+
+
+def test_a_callback_flow_needs_its_origin_its_binder_and_a_portal_owner() -> None:
+    flows, _, _ = table()
+    flow = callback_flow(flows)
+    assert (flow.callback, flow.binder_hash, flow.stage) == (
+        PORTAL,
+        binder().sha256(),
+        "pending",
+    )
+    assert (flow.returned, flow.failure) == (None, None)
+    for wrong in (
+        {"callback": PORTAL, "owner": SESSION},
+        {"binder_hash": b"x", "owner": SESSION},
+        {"callback": PORTAL, "binder_hash": b"x"},  # the CLI's
+    ):
+        with pytest.raises(ValueError, match="a callback flow has an origin and a binder"):
+            flows.start("music", ADDRESS, **wrong)
+    plain = flows.start("music", REDIRECT)
+    assert (plain.callback, plain.binder_hash, plain.stage) == (None, None, "pending")
+    assert repr(callback_flow(flows)) == "Flow(credential='music')"
+
+
+def test_the_callbacks_match() -> None:
+    flows, clock, _ = table()
+    flow = callback_flow(flows)
+    state = flow.state
+    assert flows.match_callback("music", state, [binder()], ADDRESS) is flow
+    # Each part wrong, one at a time.
+    assert flows.match_callback("music", Secret("x" + state.reveal()), [binder()], ADDRESS) is None
+    assert flows.match_callback("music", state, [binder("x" * 43)], ADDRESS) is None
+    assert flows.match_callback("music", state, [], ADDRESS) is None
+    assert flows.match_callback("music", state, [binder()], ADDRESS + "/") is None
+    assert flows.match_callback("music", state, [binder()], PORTAL + "/oauth/callback/x") is None
+    assert flows.match_callback("calendar", state, [binder()], ADDRESS) is None
+    # The matching value among planted ones, anywhere among them.
+    planted = [binder(c * 43) for c in "wxy"]
+    for at in range(4):
+        values = [*planted[:at], binder(), *planted[at:]]
+        assert flows.match_callback("music", state, values, ADDRESS) is flow
+    # A returned flow matches too (a second answer); a failed one doesn't.
+    returned = flows.settle(flow.id, pkce.Returned(Secret(CODE), None, 1.0))
+    assert flows.match_callback("music", state, [binder()], ADDRESS) is returned
+    flows.settle(flow.id, pkce.Failure("conflict"))
+    assert flows.match_callback("music", state, [binder()], ADDRESS) is None
+    # Expired, exactly at the TTL.
+    late = callback_flow(flows)
+    clock.now = late.expires_at - 0.001
+    assert flows.match_callback("music", late.state, [binder()], ADDRESS) is late
+    clock.now = late.expires_at
+    assert flows.match_callback("music", late.state, [binder()], ADDRESS) is None
+
+
+def test_a_cli_flow_never_matches_a_callback() -> None:
+    flows, _, _ = table()
+    cli = flows.start("music", ADDRESS)  # its redirect_uri the callback address, all the same
+    assert flows.match_callback("music", cli.state, [binder()], ADDRESS) is None
+    session = flows.start("music", ADDRESS, owner=SESSION)  # a session's, without a binder
+    assert flows.match_callback("music", session.state, [binder()], ADDRESS) is None
+
+
+def test_every_binder_is_compared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No early exit: the state and every gathered value are compared, whatever matches."""
+    flows, _, _ = table()
+    flow = callback_flow(flows)
+    calls: list[int] = []
+    real = hmac.compare_digest
+
+    def counting(a: bytes, b: bytes) -> bool:
+        calls.append(1)
+        return bool(real(a, b))
+
+    monkeypatch.setattr(hmac, "compare_digest", counting)
+    values = [binder(), binder("x" * 43), binder("y" * 43), binder("z" * 43)]
+    assert flows.match_callback("music", flow.state, values, ADDRESS) is flow
+    assert len(calls) == 1 + 4
+    calls.clear()
+    assert flows.match_callback("music", Secret("wrong"), values, ADDRESS) is None
+    assert len(calls) == 1 + 4
+
+
+def test_settle() -> None:
+    flows, _, _ = table()
+    flow = callback_flow(flows)
+    held = pkce.Returned(Secret(CODE), "https://issuer.example", 1234.0)
+    returned = flows.settle(flow.id, held)
+    assert returned is not None
+    assert (returned.stage, returned.returned, returned.failure) == ("returned", held, None)
+    assert returned.expires_at == flow.expires_at
+    assert (returned.state, returned.verifier) == (flow.state, flow.verifier)
+    failure = pkce.Failure("provider_error", "access_denied", "No thanks")
+    failed = flows.settle(flow.id, failure)
+    assert failed is not None
+    assert (failed.stage, failed.returned, failed.failure) == ("failed", None, failure)
+    assert failed.expires_at == flow.expires_at
+    assert flows.settle("unknown", held) is None
+    assert "No thanks" not in repr(failure)
+    assert pkce.Failure("conflict") == pkce.Failure("conflict", None, None)
+    assert CODE not in repr(held) + repr(failed)
+
+
+def test_take_needs_the_stage_the_caller_needs() -> None:
+    flows, _, _ = table()
+    flow = callback_flow(flows)
+    flows.settle(flow.id, pkce.Returned(Secret(CODE), None, 1.0))
+    assert flows.take(flow.id, "music", SESSION) is None  # a paste's take: pending only
+    assert len(flows) == 1
+    assert flows.take(flow.id, "music", SESSION, stage="returned") is not None
+    assert len(flows) == 0
+    pending = callback_flow(flows)
+    assert flows.take(pending.id, "music", SESSION, stage="returned") is None
+    assert flows.take(pending.id, "music", SESSION) is pending
+    failed = callback_flow(flows)
+    flows.settle(failed.id, pkce.Failure("conflict"))
+    for stage in ("pending", "returned"):
+        assert flows.take(failed.id, "music", SESSION, stage=stage) is None
+    assert flows.cancel(failed.id, SESSION) is True
+
+
+def test_peek_and_the_owners_view_see_every_stage() -> None:
+    flows, clock, _ = table()
+    flow = callback_flow(flows)
+    for outcome in (pkce.Returned(Secret(CODE), None, 1.0), pkce.Failure("no_code")):
+        settled = flows.settle(flow.id, outcome)
+        assert flows.peek(flow.id, "music", SESSION) is settled
+        assert flows.owned(flow.id, SESSION) is settled
+    assert flows.owned(flow.id, CLI_OWNER) is None
+    assert flows.owned(flow.id, "session:" + "cd" * 16) is None
+    assert flows.owned("unknown", SESSION) is None
+    clock.now = flow.expires_at - 0.001
+    assert flows.owned(flow.id, SESSION) is not None
+    clock.now = flow.expires_at
+    assert flows.owned(flow.id, SESSION) is None

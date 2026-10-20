@@ -2,8 +2,9 @@
 
 Begun in step 11: the first visit (a setup code issued with ``zoeymcp setup-code``, redeemed,
 a passkey enrolled, the login with it), the session list and logout, and a restart, which ends
-every session while the passkey still signs in. Later steps add a secret, a connect and the
-ledger view, over both links.
+every session while the passkey still signs in. Step 14b adds the S5 shape connected through
+the portal's callback. Later steps add the rest of the journey and the ledger view, over both
+links.
 """
 
 from __future__ import annotations
@@ -16,14 +17,23 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+
+import httpx
 
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import SESSION_KEY, Browser, Page
+from tests.fakes.oauth_server import google_style
+from tests.portal.flows import connect_by_callback, enrol, login, redeem, step_up
+from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault.keys import generate_master_key
 
+from .conftest import serve_tls
 from .procs import PASSED, Process, free_port, start, wait_port
+from .tls import ProviderCA
 
 STARTUP_TIMEOUT = 30.0
+PROFILES = Path(__file__).resolve().parents[2] / "profiles"
 
 
 @contextmanager
@@ -141,3 +151,62 @@ def test_the_first_visit_and_a_restart(tmp_path: Path) -> None:
         out = page.fetch("POST", "/api/logout", json={})
         assert out.headers["clear-site-data"] == '"storage"'
         assert page.fetch("GET", "/api/session").status_code == 401
+
+
+def test_an_s5_connect_through_the_callback(tmp_path: Path, ca: ProviderCA) -> None:
+    """The S5 shape from the shipped Google profile, its redirect_uri set to the portal's
+    callback address (a Web-application client, A.4): the client secret entered in the portal
+    with a step-up, then a connect through the callback against the fake provider over TLS, the
+    code held until the passkey confirms, and exchanged once with the posted secret (M5 step
+    14b)."""
+    fragment = load_mapping((PROFILES / "google-oauth.yaml").read_text(encoding="utf-8"))
+    auth = google_style(time.time)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    port, proxy = free_port(), free_port()
+    origin = f"http://localhost:{port}"
+    address = f"{origin}/oauth/callback/google-calendar"
+    auth.registered_redirect = address
+    env = {"ZOEYMCP_MASTER_KEY": generate_master_key()}
+    with serve_tls(auth.app(), ca) as auth_url:
+        cred = fragment["credentials"]["google-calendar"]
+        cred.update(
+            token_url=f"{auth_url}/token",
+            authorize_url=f"{auth_url}/authorize",
+            redirect_uri=address,
+        )
+        document = {
+            "version": 1,
+            "mode": "declarative",
+            "admin": {"listen": f"127.0.0.1:{port}", "origins": [origin]},
+            **fragment,
+        }
+        config = tmp_path / "policy.json"
+        config.write_text(json.dumps(document), encoding="utf-8")
+        argv = ["vault", "--config", str(config), "--listen", f"127.0.0.1:{proxy}"]
+        argv += ["--state", str(state), "--admin-socket", "none"]
+        vault = start(argv, env=env, log=tmp_path / "vault.log", ca=ca.ca_file)
+        provider = httpx.Client(verify=ca.client_context(), trust_env=False)
+        try:
+            wait_port(port, vault, STARTUP_TIMEOUT)
+            passkey = SoftAuthenticator()
+            with Browser(remote={auth_url: provider}) as browser:
+                page = browser.page(origin)
+                assert redeem(page, setup_code(state, env)).status_code == 200
+                assert enrol(page, passkey).status_code == 200
+                assert login(page, passkey).status_code == 200
+                secret = {"name": "google-client-secret", "value": "fake-google-client-secret"}
+                assert step_up(page, passkey, "secret.put", secret).status_code == 200
+                begun, done = connect_by_callback(page, passkey, "google-calendar")
+                assert done.status_code == 200, done.text
+                assert (done.json()["slot"], done.json()["persisted"]) == ("google-refresh", True)
+            [exchange] = auth.calls
+            assert exchange.params["client_secret"] == "fake-google-client-secret"
+            assert exchange.params["redirect_uri"] == address
+        finally:
+            provider.close()
+            vault.stop()
+    output = vault.output()
+    query = dict(parse_qsl(urlsplit(begun["authorize_url"]).query))
+    for value in (query["state"], "fake-google-code-", "fake-google-rt-", begun["flow"]):
+        assert value not in output

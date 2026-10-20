@@ -50,7 +50,13 @@ KINDS: Final[dict[str, Kind]] = {
     for kind in (
         Kind("secret.put", BODY_SECRET, frozenset({"name", "value"}), frozenset({"origins"})),
         Kind("secret.delete", _DEFAULT_CAP, frozenset({"name"})),
-        Kind("oauth.complete", BODY_PASTE, frozenset({"credential", "flow", "redirect_url"})),
+        # A paste (redirect_url), or returned: true after a callback (H.6); the plan takes one.
+        Kind(
+            "oauth.complete",
+            BODY_PASTE,
+            frozenset({"credential", "flow"}),
+            frozenset({"redirect_url", "returned"}),
+        ),
         Kind("oauth.reset", _DEFAULT_CAP, frozenset({"credential"})),
         Kind("passkey.enrol", _DEFAULT_CAP, frozenset({"name"})),
         Kind("passkey.rename", _DEFAULT_CAP, frozenset({"credential", "name"})),

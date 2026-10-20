@@ -1,7 +1,9 @@
 """The portal's routes (M5 design M.1). Pure data, read by the app, the sweeps and the drift checks.
 
 The static files are a fixed map from path to file, loaded once at start: no listing, no path
-joining. Every other path outside ``/api/`` is 404 (C.2 row 3).
+joining. Beside them, outside ``/api/`` and outside the map, is the one other route: the OAuth
+callback, ``GET /oauth/callback/<credential>`` (C.7), a provider's redirect target that no page
+script names. Every other path outside ``/api/`` is 404 (C.2 row 3).
 
 The API table grows with the build: each of steps 11 to 15 adds the rows it builds, so a walk of
 the table or a drift check against the page never meets a route that isn't built (verifier V40),
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal
 
+from ..common.policy.callback import CALLBACK_PREFIX
 from ..common.policy.schema import NAME_PATTERN
 
 Method = Literal["GET", "POST", "DELETE"]
@@ -43,8 +46,27 @@ STATIC: Final[Mapping[str, StaticFile]] = MappingProxyType(
         "/app.js": StaticFile("app.js", JAVASCRIPT),
         "/webauthn.js": StaticFile("webauthn.js", JAVASCRIPT),
         "/app.css": StaticFile("app.css", CSS),
+        # Step 14b: where the callback sends the tab (C.7). No script, no text from the query.
+        "/callback/received": StaticFile("callback-received.html", HTML),
+        "/callback/refused": StaticFile("callback-refused.html", HTML),
     }
 )
+# The callback's two answers: the 303's target once the flow changed, and the page a refusal
+# answers in place, so the code-bearing address stays in the bar for a paste.
+CALLBACK_RECEIVED: Final = "/callback/received"
+CALLBACK_REFUSED: Final = "/callback/refused"
+# The callback route's template, for the log (M.4): the path never shows there, nor the query.
+CALLBACK: Final = CALLBACK_PREFIX + "{credential}"
+_CREDENTIAL: Final = re.compile(NAME_PATTERN)
+
+
+def callback_credential(path: str) -> str | None:
+    """The credential a callback path names: ``/oauth/callback/`` and one segment matching
+    ``NAME_PATTERN``, else None."""
+    if not path.startswith(CALLBACK_PREFIX):
+        return None
+    name = path.removeprefix(CALLBACK_PREFIX)
+    return name if _CREDENTIAL.fullmatch(name) else None
 
 
 @dataclass(frozen=True)
@@ -125,6 +147,9 @@ OAUTH_START: Final = Route(
     "POST", "/api/oauth/{credential}/start", FULL, BODY_EMPTY, optional=frozenset({"rebind"})
 )
 FLOW_CANCEL: Final = Route("DELETE", "/api/oauth/flows/{flow}", FULL)
+# Step 14b: a flow as its owner's connect dialog polls it, for a flow that can take the
+# callback (H.6). The callback itself is outside this table (CALLBACK).
+FLOW_STATUS: Final = Route("GET", "/api/oauth/flows/{flow}", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -141,6 +166,7 @@ ROUTES: Final[tuple[Route, ...]] = (
     HEALTH,
     OAUTH,
     OAUTH_START,
+    FLOW_STATUS,
     FLOW_CANCEL,
     ACTIONS,
     CONFIRM,

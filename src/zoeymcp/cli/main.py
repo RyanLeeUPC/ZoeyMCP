@@ -1037,11 +1037,20 @@ def _cmd_login(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
             )
             return EXIT_OK
         how = "input hidden" if stdin.isatty() else "one line on stdin"
-        out.write(
-            f"\nYour browser will then try to open {started['redirect_uri']}?... and fail to "
-            "load. That is\nexpected. Copy the full address from the address bar and paste it "
-            f"here ({how}, {minutes} minutes):\n"
-        )
+        if started.get("callback_address"):
+            # The redirect_uri is the portal's callback address (M5 design H.6), which takes
+            # only a login started in the portal, so the tab lands on its refused page.
+            out.write(
+                "\nYour browser will land on the portal's callback, which doesn't take a "
+                "command-line login:\ncopy the full address from that tab's address bar and "
+                f"paste it here ({how}, {minutes} minutes):\n"
+            )
+        else:
+            out.write(
+                f"\nYour browser will then try to open {started['redirect_uri']}?... and fail to "
+                "load. That is\nexpected. Copy the full address from the address bar and paste "
+                f"it here ({how}, {minutes} minutes):\n"
+            )
         out.flush()
         url = _read_paste(socket, started["flow"], stdin, err)
         if url is None:

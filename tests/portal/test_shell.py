@@ -2,7 +2,8 @@
 
 P3's ``Host`` rows and browser modes, the 308, P15's headers on every status the shell makes,
 P16's connection and body rows (contract 40's cases through the real vault), P21, and P12's 404s
-for ``/callback``, ``/oauth/callback`` and ``/oauth/callback/<name>`` (the last until step 14b).
+for ``/callback`` and ``/oauth/callback``; ``/oauth/callback/<name>`` is the callback, tested in
+``test_callback.py``.
 The body, session and gate rows run on routes the tests add, so each row is shown on its own;
 the API's own routes are tested in ``test_login.py``, ``test_setup.py`` and ``test_sessions.py``.
 """
@@ -80,6 +81,8 @@ def test_the_portal_says_where_it_listens_and_that_setup_is_pending(rig: PortalR
         ("/app.js", "app.js", "text/javascript; charset=utf-8"),
         ("/webauthn.js", "webauthn.js", "text/javascript; charset=utf-8"),
         ("/app.css", "app.css", "text/css; charset=utf-8"),
+        ("/callback/received", "callback-received.html", "text/html; charset=utf-8"),
+        ("/callback/refused", "callback-refused.html", "text/html; charset=utf-8"),
     ],
 )
 def test_the_static_files(rig: PortalRig, path: str, name: str, content_type: str) -> None:
@@ -110,10 +113,10 @@ def test_no_other_path_and_no_percent_encoded_one(rig: PortalRig) -> None:
         refused(browser.navigate(rig.origin + path), 404, "not_found")
 
 
-@pytest.mark.parametrize("path", ["/callback", "/oauth/callback", "/oauth/callback/google"])
-def test_the_callback_paths_are_404_until_the_callback_is_built(rig: PortalRig, path: str) -> None:
-    """P12: M2's default path and the callback without a name, on every origin; the named one
-    until step 14b builds it. A form post to it is 404 too (C.2 row 3)."""
+@pytest.mark.parametrize("path", ["/callback", "/oauth/callback", "/oauth/callback/"])
+def test_the_callback_paths_without_a_name_are_404(rig: PortalRig, path: str) -> None:
+    """P12: M2's default path and the callback without a name, on every origin (the named one is
+    ``test_callback.py``'s). A form post to them is 404 too (C.2 row 3)."""
     browser = rig.browser()
     query = "?code=c0de&state=s7a7e"
     refused(

@@ -55,6 +55,17 @@ passkey prompt; its confirm exchanges the code once and stores the grant. ``DELE
 credential's failure state. Flows are owned (H.2): another owner's flow answers as an unknown
 one.
 
+The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
+a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
+origin. A start for one sets the flow's binding cookie (``SameSite=Lax``, its ``Path`` the
+callback address); the callback, admitted by its own rows, hands the raw query and the binding
+cookie's values to ``LoginService.receive_callback``, which consumes the flow's ``state`` and
+holds the code, or fails the flow. Then a 303 to ``/callback/received`` takes the code out of
+the address bar; a refusal answers ``callback-refused.html`` in place, so the address can still
+be pasted. The callback reads no session and exchanges nothing: the owner's dialog polls
+``GET /api/oauth/flows/{flow}`` and, once the code is back, confirms ``oauth.complete`` with
+``returned: true`` after a passkey, as for a paste. Confirming and cancelling expire the cookie.
+
 Logs (M.4): ``portal_request`` for each answer a handler gives; ``portal_refused`` for a refusal
 before one, at most once per 10 s per reason with a count, never the refused ``Host`` or
 ``Origin``; a static file or the 308 as ``portal_request``, at most once per 10 s per path. The
@@ -64,7 +75,12 @@ a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout``, ``portal_
 ``step_up_confirmed``, ``step_up_refused``, ``action_changed``, ``passkey_renamed`` and
 ``passkey_removed``; ``secretops`` logs ``secret_set`` and ``secret_deleted`` with
 ``via: "portal"``; the logins log ``oauth_login_started``, ``oauth_login_completed``,
-``oauth_login_failed`` and ``oauth_flow_replaced``, and a reset ``oauth_cache_reset``.
+``oauth_login_failed`` and ``oauth_flow_replaced``, and a reset ``oauth_cache_reset``. The
+callback logs ``portal_request`` for its 303 with the route's template only, never its query;
+``oauth_callback_returned`` or ``oauth_callback_failed`` (the logins'); and for a refusal
+``oauth_callback_refused`` (``callback_not_taken``, ``not_navigation``, ``bad_query``,
+``duplicate_param``), at most once per 10 s per reason with a count, or ``portal_refused`` for
+``busy`` and ``rate_limited``.
 """
 
 from __future__ import annotations
@@ -82,23 +98,29 @@ from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard
 
 from starlette.types import Receive, Scope, Send
 
+from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
 from ..common.policy.schema import OAuth2Credential, split_scope
 from ..vault import logs, secretops, secretplan
 from ..vault.bindings import VAULT_PREFIX
 from ..vault.oauth.login import LoginError
+from ..vault.oauth.pkce import FLOW_TTL, CallbackBinder
 from ..vault.secretplan import PutPlan, SecretRefusal
 from . import passkeys as passkey_file
 from . import routes as api
 from .actions import Action, ActionRefusal, Actions, changed, parse_request
 from .admission import (
     Admitted,
+    Callback,
     Origin,
     Redirect,
     Request,
     Static,
     admit,
+    admit_callback,
     admit_session,
     admit_unauthenticated,
+    binder_values,
+    callback_query,
     origin_entries,
     parse_body,
     values,
@@ -108,7 +130,15 @@ from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
 from .refusals import Refusal, enrolment, refusal, secret
 from .refusals import login as login_refusal
-from .routes import ROUTES, STATIC, Route
+from .routes import (
+    CALLBACK,
+    CALLBACK_RECEIVED,
+    CALLBACK_REFUSED,
+    HTML,
+    ROUTES,
+    STATIC,
+    Route,
+)
 from .sessions import (
     SESSION_IDLE,
     Ceremonies,
@@ -159,6 +189,18 @@ COUNTER_BANNER: Final = (
     "been copied. Check the passkeys with zoeymcp passkeys."
 )
 HEALTH_BANNER: Final = "{count} problem(s) need you: see the checklist on Home."
+# The callback's refusals logged as oauth_callback_refused (M.4); busy and rate_limited there
+# are portal_refused, as on any route.
+CALLBACK_REFUSALS: Final = frozenset(
+    {"callback_not_taken", "not_navigation", "bad_query", "duplicate_param"}
+)
+# What the confirmation of a code the callback returned asks (H.6): the vault can't show whose
+# account the code is for, so this is the operator's check against a code delivered through
+# their own browser by someone else.
+RETURNED_CHECK: Final = (
+    "Confirm only if you have just finished approving in the provider's tab; if you haven't, "
+    "cancel."
+)
 # How a credential gets a grant in the portal (H.1): a sign-in in the browser completed by
 # paste, or for client_credentials a test fetch; neither for a refresh token set by other means.
 CONNECT_BROWSER: Final = "browser"
@@ -382,6 +424,7 @@ class PortalApp:
         self._refused: Sparse[str] = Sparse(REFUSED_LOG_EVERY)
         self._served: Sparse[str] = Sparse(SERVED_LOG_EVERY)
         self._codes_refused: Sparse[str] = Sparse(SETUP_REFUSED_LOG_EVERY)
+        self._callbacks_refused: Sparse[str] = Sparse(REFUSED_LOG_EVERY)
 
     @property
     def origins(self) -> tuple[str, ...]:
@@ -441,9 +484,8 @@ class PortalApp:
         scope = exchange.scope
         # The raw path, so a percent-encoded name never reaches a route or the static map.
         path = (scope.get("raw_path") or scope["path"].encode()).decode("latin-1")
-        decision = admit(
-            Request(scope["method"], path, scope["headers"]), self._entries, self._routes
-        )
+        request = Request(scope["method"], path, scope["headers"])
+        decision = admit(request, self._entries, self._routes)
         if isinstance(decision, Refusal):
             await self._refuse(exchange, decision)
         elif isinstance(decision, Redirect):
@@ -453,8 +495,64 @@ class PortalApp:
             file = decision.file
             await self._send(exchange, 200, self._static[path], file.content_type.encode())
             self._served_line(scope["method"], path, 200, started)
+        elif isinstance(decision, Callback):
+            await self._callback(exchange, ticket, request, decision, started)
         else:
             await self._api(exchange, ticket, decision, started)
+
+    async def _callback(
+        self,
+        exchange: _Exchange,
+        ticket: Ticket,
+        request: Request,
+        decision: Callback,
+        started: float,
+    ) -> None:
+        """C.7 and H.6: a provider's redirect, a top-level ``GET``. Rows c1 and c2 (a
+        navigation), c3 (an unauthenticated slot and a bucket token), c4 (the raw query) and c5
+        (the binding cookie's values, no session), then ``receive_callback``, which holds the
+        code or fails the flow. A changed flow answers 303 to ``/callback/received``; anything
+        refused answers the fixed refused page in place, the address left for a paste."""
+        exchange.route = CALLBACK
+        refused = admit_callback(request)
+        if refused is None:
+            slot = self._gate.enter_unauthenticated(ticket)
+            refused = admit_unauthenticated(slot=slot, token=slot and self._bucket.take(started))
+        query = None
+        if refused is None:
+            query = callback_query(exchange.scope.get("query_string", b""))
+            refused = query if isinstance(query, Refusal) else None
+        if refused is None and isinstance(query, str):
+            binders = [CallbackBinder(v) for v in binder_values(request.headers, decision.entry)]
+            try:
+                self._login_service().receive_callback(
+                    decision.entry.origin, decision.credential, query, binders
+                )
+            except LoginError as exc:
+                refused = refusal(exc.reason)
+        if refused is not None:
+            page = self._static[CALLBACK_REFUSED]
+            await self._send(
+                exchange, refused.status, page, HTML.encode(), _refusal_headers(refused)
+            )
+            if refused.reason not in CALLBACK_REFUSALS:
+                self._refused_line(refused)
+                return
+            count = self._callbacks_refused.note(refused.reason, self._clock())
+            if count is not None:
+                logs.event("oauth_callback_refused", reason=refused.reason, count=count)
+            return
+        location = ((b"location", CALLBACK_RECEIVED.encode()),)
+        await self._send(exchange, 303, b"", None, location)
+        logs.event(
+            "portal_request",
+            method="GET",
+            route=CALLBACK,
+            status=303,
+            reason=None,
+            session=None,
+            ms=self._ms(started),
+        )
 
     async def _api(
         self, exchange: _Exchange, ticket: Ticket, admitted: Admitted, started: float
@@ -610,6 +708,7 @@ class PortalApp:
             api.HEALTH: self._health,
             api.OAUTH: self._oauth_list,
             api.OAUTH_START: self._oauth_start,
+            api.FLOW_STATUS: self._flow_status,
             api.FLOW_CANCEL: self._flow_cancel,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
@@ -1207,7 +1306,10 @@ class PortalApp:
         fields the dialog shows and ``replaced`` (where a login it replaced was started). For
         client_credentials it is the test fetch: it writes no grant and, when it works, clears
         the credential's failure state, the one route besides an action's confirm with that
-        effect, and only after a fetch that just worked (F.4)."""
+        effect, and only after a fetch that just worked (F.4).
+
+        A login that can take the callback (``callback`` set, H.6) gets its binding cookie here,
+        the one place its binder is ever sent (P1)."""
         session = _session(call)
         rebind = _body(call).get("rebind", False)
         if not isinstance(rebind, bool):
@@ -1215,12 +1317,16 @@ class PortalApp:
         credential = call.params["credential"]
         try:
             started = await self._login_service().start(
-                credential, rebind=rebind, owner=session.owner
+                credential, rebind=rebind, owner=session.owner, origin=call.entry.origin
             )
         except LoginError as exc:
             return self._login_refused(exc, credential)
         if "flow" not in started:
             return Reply(_completed(credential, started))
+        binder = started.pop("binder", None)
+        headers: tuple[Header, ...] = ()
+        if isinstance(binder, CallbackBinder):
+            headers = (binding_cookie(call.entry, credential, binder.reveal()),)
         change = started["binding_change"]
         change_shown = None
         if change is not None:
@@ -1238,56 +1344,127 @@ class PortalApp:
             "binding_shown": _binding_words(started["binding"]),
             "binding_change_shown": change_shown,
         }
+        return Reply(answer, headers=headers)
+
+    async def _flow_status(self, call: Call) -> Reply | Refusal:
+        """H.6: this session's login as its dialog polls it, for one that can take the callback:
+        its stage, when it expires, the origin, when a code came back, and why it failed (the
+        reason's text, and the answer's own text shown, labelled by the page). Never the code,
+        ``state``, binder or verifier. Another owner's or an unknown login is ``flow_unknown``
+        (P11)."""
+        try:
+            status = self._login_service().flow_status(call.params["flow"], _session(call).owner)
+        except LoginError as exc:
+            return refusal(exc.reason)
+        failure = status["failure"]
+        failure_shown = None
+        if failure is not None:
+            reason = "flow_conflict" if failure["reason"] == "conflict" else failure["reason"]
+            details = {"provider_error": failure["error"]}
+            said = failure["description"]
+            failure_shown = {
+                "reason": failure["reason"],
+                "error_shown": None if failure["error"] is None else shown(failure["error"]),
+                "text_shown": self._login_refused(
+                    LoginError(reason, "", details=details), status["credential"]
+                ).error,
+                "description_shown": None if said is None else shown(said),
+            }
+        answer = {
+            "stage": status["stage"],
+            "expires": status["expires"],
+            "origin": status["origin"],
+            "returned_at": status["returned_at"],
+            "failure": failure_shown,
+        }
         return Reply(answer)
 
     async def _flow_cancel(self, call: Call) -> Reply | Refusal:
-        """H.1 step 4: drop this session's pending login. Another owner's, or none, answers
+        """H.1 step 4: drop this session's login, in whatever stage, and expire the binding
+        cookie of one that could take the callback. Another owner's, or none, answers
         ``flow_unknown``, as an unknown one does, and that flow stays (P11)."""
-        if not self._login_service().cancel(call.params["flow"], _session(call).owner):
+        login, owner, flow = self._login_service(), _session(call).owner, call.params["flow"]
+        try:
+            status = login.flow_status(flow, owner)
+        except LoginError:
+            status = None
+        if not login.cancel(flow, owner):
             return refusal("flow_unknown")
-        return Reply({"cancelled": True})
+        headers: tuple[Header, ...] = ()
+        if status is not None and status["origin"] == call.entry.origin:
+            headers = (binding_cookie(call.entry, status["credential"], "", expire=True),)
+        return Reply({"cancelled": True}, headers=headers)
 
     def _plan_complete(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
         """``oauth.complete`` by paste: ``check_paste`` reads the address against this
         session's flow for the credential without taking it, so a mistyped paste is refused
-        here, before the passkey prompt, and can be fixed (a provider's error ends the flow).
-        Then what completing stores: the binding, the one it replaces (which needs a start with
-        rebind), and the scopes asked for and expected."""
-        credential, flow, pasted = data["credential"], data["flow"], data["redirect_url"]
-        if not all(isinstance(value, str) for value in (credential, flow, pasted)):
+        here, before the passkey prompt, and can be fixed (a provider's error ends the flow; for
+        a flow whose callback returned a code, the same code is ``flow_returned`` and another
+        answer fails the flow, ``flow_conflict``). With ``returned: true`` instead (H.6), the
+        flow must hold a code its callback returned, and the summary says where and when it came
+        back, and to confirm only after approving. Then what completing stores: the binding,
+        the one it replaces (which needs a start with rebind), and the scopes asked for and
+        expected. The facts hold the flow's stage, so a callback between the plan and the
+        confirm is never confirmed unseen."""
+        credential, flow = data["credential"], data["flow"]
+        pasted, returned = data.get("redirect_url"), data.get("returned")
+        if (
+            not isinstance(credential, str)
+            or not isinstance(flow, str)
+            or (pasted is None) == (returned is None)
+            or (pasted is not None and not isinstance(pasted, str))
+            or (returned is not None and returned is not True)
+        ):
             return refusal("bad_body")
+        owner = step.session.owner
         try:
-            checked = self._login_service().check_paste(
-                credential, flow, pasted, step.session.owner
-            )
+            if pasted is None:
+                checked = self._login_service().check_returned(credential, flow, owner)
+            else:
+                checked = self._login_service().check_paste(credential, flow, pasted, owner)
         except LoginError as exc:
             return self._login_refused(exc, credential)
         change = checked["binding_change"]
-        summary = [
-            ("Connect", shown(credential, NAME_LIMIT)),
-            ("With", "the address you pasted, checked: it is this sign-in's answer"),
-            ("Its tokens go to", _binding_words(checked["binding"])),
-        ]
+        summary = [("Connect", shown(credential, NAME_LIMIT))]
+        if pasted is None:
+            back = f"{shown(checked['origin'])} at {_moment(checked['returned_at'])}"
+            summary.append(("With", "the sign-in the provider sent back to the portal"))
+            summary.append(("It came back to", back))
+        else:
+            summary.append(("With", "the address you pasted, checked: it is this sign-in's answer"))
+        summary.append(("Its tokens go to", _binding_words(checked["binding"])))
         if change is not None:
             summary.append(("Bound until now", _binding_words(change["old"])))
         summary += [
             ("Scopes asked for", _scope_words(checked["requested_scopes"])),
             ("Scopes expected", _scope_words(checked["expected_scopes"])),
         ]
+        if pasted is None:
+            summary.append(("Before you confirm", RETURNED_CHECK))
         return Plan(tuple(summary), (credential, flow, checked))
 
     async def _run_complete(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
-        """The exchange: ``LoginService.complete`` takes the flow (so any failure from here
-        needs a new connect), exchanges the code once and stores the grant. Scopes outside the
-        expected set are flagged, never refused."""
-        credential = data["credential"]
+        """The exchange: ``LoginService.complete`` (a paste) or ``complete_returned`` (a code
+        the callback returned) takes the flow, so any failure from here needs a new connect,
+        exchanges the code once and stores the grant. Scopes outside the expected set are
+        flagged, never refused. The answer expires the binding cookie of a callback login."""
+        credential, flow, owner = data["credential"], data["flow"], step.session.owner
+        login = self._login_service()
         try:
-            done = await self._login_service().complete(
-                credential, data["flow"], data["redirect_url"], step.session.owner
-            )
+            if data.get("returned") is True:
+                done = await login.complete_returned(credential, flow, owner)
+            else:
+                done = await login.complete(credential, flow, data["redirect_url"], owner)
         except LoginError as exc:
             return self._login_refused(exc, credential)
-        return Reply(_completed(credential, done))
+        headers: tuple[Header, ...] = ()
+        cred = self._policy().credentials.get(credential)
+        entry = step.entry
+        if isinstance(cred, OAuth2Credential) and callback_origin(
+            cred.redirect_uri, credential, (entry.origin,)
+        ):
+            headers = (binding_cookie(entry, credential, "", expire=True),)
+        return Reply(_completed(credential, done), headers=headers)
 
     def _plan_reset(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
         """``oauth.reset`` (D-22): an oauth2 credential the logins know, and its state now. The
@@ -1404,6 +1581,9 @@ class PortalApp:
 
     async def _refuse(self, exchange: _Exchange, refused: Refusal) -> None:
         await self._send_json(exchange, refused.status, refused.body(), _refusal_headers(refused))
+        self._refused_line(refused)
+
+    def _refused_line(self, refused: Refusal) -> None:
         count = self._refused.note(refused.reason, self._clock())
         if count is not None:
             logs.event("portal_refused", reason=refused.reason, status=refused.status, count=count)
@@ -1476,6 +1656,24 @@ def session_cookie(entry: Origin, value: str, *, expire: bool = False) -> Header
     if expire:
         parts.append("Max-Age=0")
     return b"set-cookie", "; ".join(parts).encode("latin-1")
+
+
+def binding_cookie(entry: Origin, credential: str, value: str, *, expire: bool = False) -> Header:
+    """C.7's binding cookie of a callback login for ``credential`` on ``entry``: ``SameSite=Lax``,
+    since a provider's redirect is a cross-site top-level ``GET``, which carries ``Lax`` cookies
+    and no ``Strict`` ones; ``Path`` the credential's callback address, so it goes nowhere else
+    and each credential's login has its own; ``HttpOnly``, ``Secure`` on https; ``Max-Age`` the
+    login's 10 minutes, or 0 to expire it."""
+    parts = [f"{entry.binder_cookie}={value}", f"Path={CALLBACK_PREFIX}{credential}"]
+    if entry.secure:
+        parts.append("Secure")
+    parts += ["HttpOnly", "SameSite=Lax", f"Max-Age={0 if expire else int(FLOW_TTL)}"]
+    return b"set-cookie", "; ".join(parts).encode("latin-1")
+
+
+def _moment(wall: int) -> str:
+    """A time the vault took itself, for a summary: ``2026-10-19 09:00:05 UTC``."""
+    return datetime.fromtimestamp(wall, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _minted(entry: Origin, minted: Minted, fields: Mapping[str, Any]) -> Reply:

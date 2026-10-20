@@ -130,6 +130,7 @@ only_mutate = [
     "*zoeymcp/common/ledgerjoin.py",
     "*zoeymcp/common/files.py",
     "*zoeymcp/common/policy/check.py",
+    "*zoeymcp/common/policy/callback.py",
     "*zoeymcp/common/policy/match.py",
     "*zoeymcp/common/policy/view.py",
     "*zoeymcp/gateway/pins.py",
@@ -181,3 +182,4 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.portal.passkeys" = 90
 "zoeymcp.portal.setupcode" = 90
 "zoeymcp.portal.listen" = 90
+"zoeymcp.common.policy.callback" = 90

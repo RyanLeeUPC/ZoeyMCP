@@ -6,6 +6,7 @@ needs the portal."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from .browser import (
     Browser,
     Cookie,
+    asgi_client,
     chain_relation,
     head,
     loopback,
@@ -227,3 +229,32 @@ def test_a_forged_request_sends_exactly_its_headers() -> None:
 
 def test_head_builds_a_request_head() -> None:
     assert head("GET / HTTP/1.1", "Host: x") == b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+
+
+def test_a_remote_origin_is_served_by_its_own_client() -> None:
+    """A fake provider in process: its URL kept, no Host forced, and its redirect followed into
+    the portal as one cross-site chain, Lax cookies sent and Strict ones not (C.7)."""
+    provider = Recorder(
+        lambda request: httpx.Response(302, headers={"location": PORTAL + "/oauth/callback/x?c=1"})
+    )
+    portal = Recorder()
+    remote = httpx.Client(transport=httpx.MockTransport(provider))
+    b = Browser(transport=httpx.MockTransport(portal), remote={"https://idp.example": remote})
+    b.plant(Cookie("lax", "1", "localhost", "/oauth/callback/x", False, True, "lax"))
+    b.plant(Cookie("strict", "1", "localhost", "/", False, True, "strict"))
+    b.navigate("https://idp.example/authorize?s=1", initiator=PORTAL)
+    assert str(provider.last.url) == "https://idp.example/authorize?s=1"
+    assert portal.last.headers["sec-fetch-site"] == "cross-site"
+    assert portal.last.headers["cookie"] == "lax=1"
+    b.close()
+    remote.close()
+
+
+def test_an_asgi_client_runs_the_app_in_process() -> None:
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 201, "headers": [(b"x-a", b"1")]})
+        await send({"type": "http.response.body", "body": scope["path"].encode()})
+
+    with asgi_client(app, "https://idp.example") as client:
+        answer = client.get("/authorize")
+    assert (answer.status_code, answer.headers["x-a"], answer.text) == (201, "1", "/authorize")

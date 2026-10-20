@@ -75,7 +75,7 @@ def test_the_registry_holds_f4s_kinds() -> None:
     assert shapes == {
         "secret.put": (131072, ["name", "value"], ["origins"]),
         "secret.delete": (4096, ["name"], []),
-        "oauth.complete": (8192, ["credential", "flow", "redirect_url"], []),
+        "oauth.complete": (8192, ["credential", "flow"], ["redirect_url", "returned"]),
         "oauth.reset": (4096, ["credential"], []),
         "passkey.enrol": (4096, ["name"], []),
         "passkey.rename": (4096, ["credential", "name"], []),

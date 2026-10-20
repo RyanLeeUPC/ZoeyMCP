@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 from .. import canonical
+from .callback import callback_address, callback_origin
 from .findings import Finding
 from .match import NormalizedPath, path_matches
 from .paths import PathPatternError, parse_path_pattern
@@ -303,6 +304,8 @@ def _check_credentials(policy: Policy, report: _Report) -> None:
             upstreams = [r.upstream for r in policy.routes if r.credential == name and r.upstream]
             origins = {o for o in map(_origin, upstreams) if o is not None}
             _check_oauth(path, cred, origins, report)
+            if policy.admin is not None:
+                _check_callback(path, name, cred, policy.admin, report)
     for name, conn in policy.connectors.items():
         path = f"connectors.{name}"
         if name not in used_connectors:
@@ -403,6 +406,46 @@ def _check_oauth(path: str, cred: OAuth2Credential, origins: set[str], report: _
     _check_oauth_params(path, cred, report)
     _check_oauth_scopes(path, cred, report)
     _check_resources(path, cred, origins, report)
+
+
+def _check_callback(
+    path: str, name: str, cred: OAuth2Credential, admin: Admin, report: _Report
+) -> None:
+    """A.2's callback warnings: a ``redirect_uri`` on a portal origin that isn't exactly this
+    credential's callback address there (it would get 404, or belong to another credential),
+    and a loopback IP literal on a listed ``http://localhost`` origin's port (the portal answers
+    only the name). Either is paste only, which works; the warning names the exact address. The
+    ``localhost`` form's load error is the schema's."""
+    uri = cred.redirect_uri
+    if callback_origin(uri, name, admin.origins) is not None:
+        return
+    # Compared as origins, so a default port written out still counts as the origin.
+    listed = {_origin(origin): origin for origin in admin.origins}
+    near = listed.get(_origin(uri))
+    if near is not None:
+        report.warning(
+            f"{path}.redirect_uri",
+            f"this credential's portal callback is exactly {callback_address(near, name)}; this "
+            "address gets 404 there or belongs to another credential, so you'd paste it",
+        )
+        return
+    parts = urlsplit(uri)
+    try:
+        loopback = ipaddress.ip_address(parts.hostname or "").is_loopback
+        port = parts.port
+    except ValueError:
+        return
+    if parts.scheme != "http" or not loopback or port is None:
+        return
+    for origin in admin.origins:
+        local = urlsplit(origin)
+        if (local.scheme, local.hostname, local.port) == ("http", "localhost", port):
+            report.warning(
+                f"{path}.redirect_uri",
+                "the portal doesn't answer 127.0.0.1 (passkeys need a name); to use its callback, "
+                f"register {callback_address(origin, name)} and set that, or keep pasting",
+            )
+            return
 
 
 def _env_seeded(cred: OAuth2Credential) -> bool:

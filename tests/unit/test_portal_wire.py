@@ -36,10 +36,13 @@ POSTED = re.compile(
 )
 # prepare("kind", { key: value, ... }, ...) in app.js: an action's data.
 PREPARED = re.compile(r"prepare\(\s*\"([a-z.]+)\",\s*\{([^}]*)\}", re.DOTALL)
-# The connect dialog's paste: its data built first, then posted as the action's (H.1).
-CHECKED = re.compile(
-    r"const data = \{([^}]*)\};\s*try \{\s*const prepared = await api\(\"POST\", "
-    r"\"/api/actions\", \{ kind: \"([a-z.]+)\", data: data \}\)"
+# The connect dialog's data, a paste (H.1) or a code the callback returned (H.6), handed to
+# prepareConnect(), which posts it as one kind's.
+CONNECTED = re.compile(r"prepareConnect\(\{([^}]*)\}\)")
+CONNECT_KIND = re.compile(
+    r"async function prepareConnect\(data\) \{.*?api\(\"POST\", \"/api/actions\", "
+    r"\{ kind: \"([a-z.]+)\", data: data \}\)",
+    re.DOTALL,
 )
 
 
@@ -100,8 +103,13 @@ def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
     script = (STATIC_DIR / "app.js").read_bytes().decode("utf-8")
     prepared = PREPARED.findall(script)
     assert prepared
-    checked = [(kind, keys) for keys, kind in CHECKED.findall(script)]
-    assert [kind for kind, _ in checked] == ["oauth.complete"]
+    assert CONNECT_KIND.findall(script) == ["oauth.complete"]
+    checked = [("oauth.complete", keys) for keys in CONNECTED.findall(script)]
+    shapes = {frozenset(re.findall(r"(\w+):", keys)) for _, keys in checked}
+    assert shapes == {
+        frozenset({"credential", "flow", "redirect_url"}),
+        frozenset({"credential", "flow", "returned"}),
+    }
     prepared += checked
     for kind, keys in prepared:
         data = set(re.findall(r"(\w+):", keys))

@@ -24,10 +24,18 @@ resolving to the portal's address); a form post (:meth:`Page.form_post`); a top-
 (:meth:`Page.load`); a second browser (another :class:`Browser`); and a non-browser that forges
 every header (:meth:`Browser.forge`). :class:`Slowloris` holds connections idle, trickles a head
 or sends a body slowly, on raw sockets.
+
+For the OAuth callback (C.7): ``remote`` maps an origin, such as a fake provider's, to a client
+of its own (its own TLS, or an app in process), so a navigation to the provider's
+``/authorize`` follows its real redirect to the portal's callback as one cross-site chain, every
+``SameSite=Lax`` cookie for the callback's path sent and no ``Strict`` one. A ``GET`` form at
+top level is :meth:`Page.link` (a navigation like a link); the fragment of an address never
+leaves the browser, as httpx doesn't send it either.
 """
 
 from __future__ import annotations
 
+import asyncio
 import email.utils
 import http.cookiejar
 import json as jsonlib
@@ -62,6 +70,27 @@ class _NoJar(http.cookiejar.CookieJar):
 
     def set_cookie(self, cookie: http.cookiejar.Cookie) -> None:
         pass
+
+
+def asgi_client(app: Any, base_url: str) -> httpx.Client:
+    """A client for an ASGI app in this process, for :class:`Browser`'s ``remote``: each request
+    runs the app to its answer on a loop of its own, so the caller's thread needs none."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        async def send() -> httpx.Response:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport) as client:
+                sent = httpx.Request(
+                    request.method, request.url, headers=request.headers, content=request.content
+                )
+                answer = await client.send(sent)
+                await answer.aread()
+                return answer
+
+        answer = asyncio.run(send())
+        return httpx.Response(answer.status_code, headers=answer.headers, content=answer.content)
+
+    return httpx.Client(transport=httpx.MockTransport(handle), base_url=base_url)
 
 
 def loopback(host: str, port: int) -> tuple[str, int]:
@@ -152,9 +181,12 @@ class Browser:
         address: Address = loopback,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 10.0,
+        remote: Mapping[str, httpx.Client] | None = None,
     ) -> None:
         self.engine = engine
         self.address = address
+        # Origins served by their own client, URL and Host as given (a fake provider).
+        self.remote = dict(remote or {})
         self.cookies: list[Cookie] = []
         self.session_storage: dict[str, dict[str, str]] = {}
         # Each navigation's requests, last one last: (method, url, the headers sent).
@@ -266,6 +298,11 @@ class Browser:
         headers: list[tuple[str, str]],
         content: bytes | None,
     ) -> httpx.Response:
+        remote = self.remote.get(origin_of(url))
+        if remote is not None:
+            return remote.request(
+                method, url, headers=headers, content=content, follow_redirects=False
+            )
         parts = urlsplit(url)
         host = parts.hostname or ""
         port = parts.port or DEFAULT_PORTS[parts.scheme]

@@ -1363,8 +1363,10 @@ async def test_oauth_login_through_the_admin_app(tmp_path: Path) -> None:
         "binding",
         "binding_change",
         "replaced",
+        "callback",
+        "callback_address",
     }
-    assert data["replaced"] is None
+    assert (data["replaced"], data["callback"], data["callback_address"]) == (None, None, False)
     assert data["binding"] == BROKER_BINDING
     assert data["authorize_url"].startswith(BROKER_AUTHORIZE + "?response_type=code&")
     pasted = await browse(rig, data["authorize_url"])
@@ -1505,7 +1507,12 @@ class RefusingLogin(LoginService):
         self.error = error
 
     async def start(
-        self, credential: str, *, rebind: bool = False, owner: str = CLI_OWNER
+        self,
+        credential: str,
+        *,
+        rebind: bool = False,
+        owner: str = CLI_OWNER,
+        origin: str | None = None,
     ) -> dict[str, Any]:
         raise self.error
 

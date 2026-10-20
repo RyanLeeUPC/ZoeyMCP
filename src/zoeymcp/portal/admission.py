@@ -8,6 +8,13 @@ tables (:func:`admit_unauthenticated`, :func:`admit_session`), and row 12 is :fu
 on the bytes the shell read under row 11's cap and deadline. **No body byte is read before row 8
 or row 9 has passed.**
 
+The OAuth callback (C.7) leaves C.2's table at row 3: a ``GET`` of ``/oauth/callback/<name>``
+is a :class:`Callback`, and its own rows follow. :func:`admit_callback` is c1 and c2 (a
+top-level navigation: ``navigate``, ``document``, no ``Origin``, no body); c3 is row 8's slot and
+bucket token (:func:`admit_unauthenticated`); :func:`callback_query` is c4 (the raw query, ASCII
+and capped); and :func:`binder_values` is c5, the flow's binding cookie gathered from the raw
+``Cookie`` header. No session is read there: a provider's redirect carries no ``Strict`` cookie.
+
 What each row stops (spec brief §7): a browser sends ``Sec-Fetch-Site`` to every potentially
 trustworthy origin, ``same-origin`` only from the portal's own page (a page on another localhost
 port is ``same-site``); a ``fetch()`` with ``POST`` or ``DELETE`` sends the page's ``Origin``,
@@ -26,8 +33,10 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 
 from ..common.canonical import JSONRejected, loads_strict
+from ..vault.oauth.pkce import MAX_REDIRECT_QUERY
 from .refusals import Refusal, refusal, wrong_host_literal
-from .routes import METHODS, ROUTES, STATIC, Route, Scope, StaticFile, match
+from .routes import METHODS, ROUTES, STATIC, Route, Scope, StaticFile, callback_credential, match
+from .sessions import MAX_SESSION_COOKIES
 
 SESSION_HEADER: Final = b"x-zoeymcp-session"
 JSON: Final = "application/json"
@@ -35,6 +44,9 @@ JSON: Final = "application/json"
 _LENGTH: Final = re.compile(r"[0-9]{1,12}")
 # A Host that is an IP literal: IPv6 in brackets, IPv4 bare; an optional port.
 _LITERAL: Final = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[0-9.]+)(?::([0-9]{1,5}))?")
+# c1: where a navigation to the callback may come from. Typing or pasting the address is "none";
+# the portal's own page never navigates there, so never "same-origin".
+NAVIGATION_SITES: Final = frozenset({"cross-site", "same-site", "none"})
 
 Headers = Sequence[tuple[bytes, bytes]]
 
@@ -44,7 +56,10 @@ class Origin:
     """One ``admin.origins`` value, as admission uses it (C.1). ``authority`` is the one ``Host``
     it accepts; ``port`` is None for the scheme's default. The session cookie follows the public
     scheme: ``__Host-`` and ``Secure`` on https only, since Safari won't send a ``Secure`` cookie
-    to ``http://localhost`` and Chrome refuses ``__Host-`` there (spec brief §7.4)."""
+    to ``http://localhost`` and Chrome refuses ``__Host-`` there (spec brief §7.4).
+    ``binder_cookie`` is the name of a callback flow's binding cookie (C.7): ``__Secure-`` on
+    https, since ``__Host-`` needs ``Path=/`` and the binding cookie's path is the credential's
+    callback address."""
 
     origin: str
     scheme: str
@@ -54,6 +69,7 @@ class Origin:
     rp_id: str
     cookie_name: str
     secure: bool
+    binder_cookie: str
 
 
 def origin_entry(origin: str) -> Origin:
@@ -72,6 +88,7 @@ def origin_entry(origin: str) -> Origin:
         rp_id=host,
         cookie_name=f"__Host-zoeymcp{suffix}-session" if secure else f"zoeymcp{suffix}-session",
         secure=secure,
+        binder_cookie=f"__Secure-zoeymcp{suffix}-cb" if secure else f"zoeymcp{suffix}-cb",
     )
 
 
@@ -104,6 +121,14 @@ class Static:
 
 
 @dataclass(frozen=True)
+class Callback:
+    """Row 3, for ``GET /oauth/callback/<credential>``: C.7's rows decide next."""
+
+    entry: Origin
+    credential: str
+
+
+@dataclass(frozen=True)
 class Admitted:
     """An API request that passed rows 1 to 7. ``cookies``: every value of the entry's session
     cookie, in the order the request carries them; ``token``: the one ``X-ZoeyMCP-Session``, or
@@ -116,7 +141,7 @@ class Admitted:
     token: str | None = field(repr=False)
 
 
-Decision = Refusal | Redirect | Static | Admitted
+Decision = Refusal | Redirect | Static | Callback | Admitted
 
 
 def admit(
@@ -134,7 +159,10 @@ def admit(
         file = STATIC.get(request.path)
         if request.method == "GET" and file is not None:
             return Static(entry, file)
-        return refusal("not_found")
+        credential = callback_credential(request.path)
+        if request.method == "GET" and credential is not None:
+            return Callback(entry, credential)
+        return refusal("not_found")  # a form post to the callback too
     if values(headers, b"sec-fetch-site") != ["same-origin"]:
         return refusal("cross_site")
     origins = values(headers, b"origin")
@@ -157,9 +185,50 @@ def admit(
     )
 
 
+def admit_callback(request: Request) -> Refusal | None:
+    """C.7 c1 and c2: exactly one ``Sec-Fetch-Mode: navigate``, one ``Sec-Fetch-Dest:
+    document`` and one ``Sec-Fetch-Site`` of :data:`NAVIGATION_SITES`; no ``Origin``; no body.
+    These stop a fetch, a frame, an embed or an image, never a top-level navigation: a link, a
+    redirect and a ``GET`` form all pass, and their flow is decided by its ``state`` and binding
+    cookie. ``Sec-Fetch-User`` isn't read: a redirect after the provider's consent click may or
+    may not carry it."""
+    headers = request.headers
+    sites = values(headers, b"sec-fetch-site")
+    if (
+        values(headers, b"sec-fetch-mode") != ["navigate"]
+        or values(headers, b"sec-fetch-dest") != ["document"]
+        or len(sites) != 1
+        or sites[0] not in NAVIGATION_SITES
+    ):
+        return refusal("not_navigation")
+    if (
+        values(headers, b"origin")
+        or values(headers, b"content-length") not in ([], ["0"])
+        or values(headers, b"transfer-encoding")
+    ):
+        return refusal("not_navigation")
+    return None
+
+
+def callback_query(raw: bytes) -> str | Refusal:
+    """C.7 c4: the raw query from the request target, never a re-encoded one: ASCII only, at
+    most :data:`~zoeymcp.vault.oauth.pkce.MAX_REDIRECT_QUERY` bytes."""
+    if len(raw) > MAX_REDIRECT_QUERY or not raw.isascii():
+        return refusal("bad_query")
+    return raw.decode("ascii")
+
+
+def binder_values(headers: Headers, entry: Origin) -> tuple[str, ...]:
+    """C.7 c5: the values of the entry's binding cookie in the raw ``Cookie`` headers, the first
+    ``MAX_SESSION_COOKIES``, as row 9 gathers session cookies. None is not a refusal here: the
+    flow decides. Bearer values, so the shell wraps each before anything could log it."""
+    return cookie_values(headers, entry.binder_cookie)[:MAX_SESSION_COOKIES]
+
+
 def admit_unauthenticated(*, slot: bool, token: bool) -> Refusal | None:
-    """Row 8, for an unauthenticated route: the shell took one of the unauthenticated in-flight
-    slots (``slot``), then a token from the global bucket (``token``)."""
+    """Row 8, for an unauthenticated route and the callback's c3: the shell took one of the
+    unauthenticated in-flight slots (``slot``), then a token from the global bucket
+    (``token``)."""
     if not slot:
         return refusal("busy")
     if not token:

@@ -310,6 +310,33 @@ def test_login_reads_one_stdin_line_off_a_terminal(admin: FakeAdmin) -> None:
     assert "fake-state-1" not in out + err
 
 
+def test_login_says_where_a_callback_address_lands(admin: FakeAdmin) -> None:
+    """M5 H.6, review finding R16: a credential registered with the portal's callback address
+    sends the browser there, and the callback takes no command-line login, so the CLI says to
+    paste the address from that tab. ``callback`` is null on every CLI start."""
+    callback = "http://localhost:8081/oauth/callback/music"
+    started = {**STARTED, "redirect_uri": callback, "callback": None, "callback_address": True}
+    admin.answers[("POST", "/oauth/music/login")] = (200, started)
+    code, out, _ = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\n"))
+    assert code == EXIT_OK
+    assert (
+        out
+        == HEADER
+        + (
+            "\nYour browser will land on the portal's callback, which doesn't take a command-line "
+            "login:\ncopy the full address from that tab's address bar and paste it here (one line "
+            "on stdin, 10 minutes):\n"
+        )
+        + STORED
+    )
+    # Without the key (an older vault) or with it false, the loopback text as before.
+    for value in (False, None):
+        started = {**STARTED, "callback": None, "callback_address": value}
+        admin.answers[("POST", "/oauth/music/login")] = (200, started)
+        _, out, _ = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\n"))
+        assert out == HEADER + paste_text("one line on stdin") + STORED
+
+
 def test_login_reads_the_paste_hidden_on_a_terminal(
     admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch
 ) -> None:

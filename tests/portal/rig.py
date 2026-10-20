@@ -153,7 +153,7 @@ def running(
     tmp_path: Path,
     *,
     extra_origins: Sequence[str] = (),
-    policy: Mapping[str, Any] | None = None,
+    policy: Mapping[str, Any] | Callable[[str], Mapping[str, Any]] | None = None,
     routes: Sequence[Route] = ROUTES,
     handlers: Mapping[Route, Handler] | None = None,
     header_deadline: float = HEADER_DEADLINE,
@@ -162,14 +162,17 @@ def running(
     clock: Clock | None = None,
 ) -> Iterator[PortalRig]:
     """The vault serving its proxy and portal until the block ends. ``policy`` adds to the rig's
-    policy (routes, say); ``before_start`` may change the state directory first."""
+    policy (routes, say), or makes what it adds from the portal's origin (a credential whose
+    ``redirect_uri`` is a callback address there); ``before_start`` may change the state
+    directory first."""
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     portal_sock, proxy_sock = _bound(), _bound()
     portal_port = portal_sock.getsockname()[1]
     proxy_port = proxy_sock.getsockname()[1]
     policy_file = tmp_path / "policy.json"
-    document = rig_policy(portal_port, extra_origins=extra_origins, **(policy or {}))
+    more = policy(f"http://localhost:{portal_port}") if callable(policy) else policy
+    document = rig_policy(portal_port, extra_origins=extra_origins, **(more or {}))
     policy_file.write_text(json.dumps(document), encoding="utf-8")
     environ = {"ZOEYMCP_MASTER_KEY": generate_master_key()}
     if before_start is not None:

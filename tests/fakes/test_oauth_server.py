@@ -277,3 +277,48 @@ async def test_revocation_and_the_resource_server() -> None:
         assert denied.status_code == 401
         assert denied.headers["www-authenticate"] == 'Bearer error="invalid_token"'
     assert len(resource.received) == 4
+
+
+async def test_the_callbacks_answers() -> None:
+    """The answer switches for the portal's callback tests (M5 design O.1)."""
+    server = FakeAuthServer(Clock(), client_id="app", issuer="https://accounts.example")
+    plain = location_params(await authorize(server))
+    assert set(plain) == {"code", "state", "iss"}
+    server.answer = "error"
+    server.error_description = "No" + chr(0x202E) + " thanks"
+    denied = location_params(await authorize(server))
+    assert denied == {
+        "error": "access_denied",
+        "error_description": "No" + chr(0x202E) + " thanks",
+        "state": "fake-state",
+    }
+    server.answer = "wrong_iss"
+    assert location_params(await authorize(server))["iss"] == "https://other-issuer.example"
+    server.answer = "no_code"
+    assert set(location_params(await authorize(server))) == {"state", "iss"}
+    server.answer = "two_codes"
+    response = await authorize(server)
+    assert len(parse_qs(urlsplit(response.headers["location"]).query)["code"]) == 2
+    server.answer = "fragment"
+    location = (await authorize(server)).headers["location"]
+    assert "?" not in location
+    assert "#code=" in location
+    # A second approval of the same request is another code for it; exchanges counts the codes
+    # presented at /token.
+    server.answer = "code"
+    first = location_params(await authorize(server))["code"]
+    second = location_params(await authorize(server))["code"]
+    assert first != second
+    assert server.exchanges == 0
+    async with client(server) as http:
+        await http.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": first,
+                "redirect_uri": "http://127.0.0.1:8976/callback",
+                "code_verifier": VERIFIER,
+                "client_id": "app",
+            },
+        )
+    assert server.exchanges == 1

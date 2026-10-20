@@ -26,6 +26,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails, PydanticCustomError, ValidationError
+
+from .callback import CALLBACK_PREFIX, callback_address
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 # A reference to a secret, never a secret itself.
@@ -41,6 +44,13 @@ _ADDRESS = re.compile(r"^[^@\s<>\"]{1,64}@[A-Za-z0-9.-]{1,253}$")
 # One scope token: RFC 6749 NQCHAR (printable ASCII without space, double quote or backslash).
 _SCOPE_TOKEN = re.compile(r"^[\x21\x23-\x5B\x5D-\x7E]{1,256}$")
 MAX_SCOPES = 64
+# The one localhost form a redirect_uri may take: a portal origin's callback address for a
+# credential (M5 design A.5), with an explicit port and a NAME_PATTERN name.
+_LOCALHOST_CALLBACK = re.compile(
+    r"http://localhost:([1-9][0-9]{0,4})"
+    + re.escape(CALLBACK_PREFIX)
+    + r"([a-z0-9][a-z0-9_-]{0,62})"
+)
 
 Name = Annotated[str, StringConstraints(pattern=NAME_PATTERN)]
 SecretRef = Annotated[str, StringConstraints(pattern=SECRET_REF_PATTERN)]
@@ -101,6 +111,11 @@ def _check_url(value: str, *, schemes: tuple[str, ...], allow_path: bool) -> str
 
 def _check_redirect_uri(value: str) -> str:
     _check_url(value, schemes=("https", "http"), allow_path=True)
+    if _LOCALHOST_CALLBACK.fullmatch(value):
+        # The portal is a web origin the browser reaches by the name localhost, and it can't
+        # answer an IP literal (passkeys), so its callback needs the name. The Policy checks that
+        # the origin is listed and the name is the credential's own.
+        return value
     parts = urlsplit(value)
     host = parts.hostname or ""
     name = host.rstrip(".")  # a trailing dot names the same host
@@ -768,6 +783,39 @@ class Policy(_Model):
     connectors: dict[Name, SMTPConnector] = {}
     routes: list[Route] = []
     gateway: Gateway | None = None
+
+    @model_validator(mode="after")
+    def _callback_addresses(self) -> Policy:
+        """A ``redirect_uri`` in the one ``localhost`` form is a portal callback address: its
+        origin must be listed in ``admin.origins`` and its name must be the credential's own
+        (A.5). Reported at each credential's ``redirect_uri``."""
+        origins = [] if self.admin is None else self.admin.origins
+        problems = []
+        for name, cred in self.credentials.items():
+            if not isinstance(cred, OAuth2Credential):
+                continue
+            found = _LOCALHOST_CALLBACK.fullmatch(cred.redirect_uri)
+            if found is None:
+                continue
+            origin = f"http://localhost:{found.group(1)}"
+            if origin in origins and cred.redirect_uri == callback_address(origin, name):
+                continue
+            message = (
+                f"{cred.redirect_uri} is the portal's callback address for credential "
+                f"{found.group(2)}; list {origin} in admin.origins and use this credential's own "
+                "name, or keep the default http://127.0.0.1/callback and paste"
+            )
+            problems.append(
+                InitErrorDetails(
+                    type=PydanticCustomError("callback_address", message),
+                    loc=("credentials", name, "redirect_uri"),
+                    input=cred.redirect_uri,
+                )
+            )
+        if problems:
+            # A ValidationError raised here keeps each error's own path.
+            raise ValidationError.from_exception_data("Policy", problems)
+        return self
 
     @field_validator("egress_proxy")
     @classmethod

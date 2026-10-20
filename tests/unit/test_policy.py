@@ -2301,3 +2301,155 @@ def test_smtp_connector_limits(example_raw: Raw) -> None:
         broken = copy.deepcopy(example_raw)
         broken["connectors"]["mail-out"][field] = bad
         assert any(field in e for e in schema_errors(broken)), field
+
+
+# --- the portal's callback address (M5 design A.2, A.5) -----------------------------------------
+
+
+def callback_raw(redirect_uri: str, *, name: str = "calendar", origins: Any = ("8081",)) -> Raw:
+    """One refresh-grant credential with ``redirect_uri``, and an ``admin`` block listing
+    ``http://localhost:<port>`` for each port in ``origins``, or full origins; None: no block."""
+    raw = oauth_policy({name: oauth(redirect_uri=redirect_uri)})
+    if origins is not None:
+        listed = [o if "://" in o else f"http://localhost:{o}" for o in origins]
+        raw["admin"] = {"listen": "127.0.0.1:8081", "origins": listed}
+    return raw
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://localhost:8081/oauth/callback/calendar",
+        "http://localhost:1/oauth/callback/calendar",
+        "http://localhost:65535/oauth/callback/calendar",
+    ],
+)
+def test_the_one_localhost_form_passes_the_field(uri: str) -> None:
+    port = uri.split(":")[2].split("/")[0]
+    policy = parse_policy(yaml.safe_dump(callback_raw(uri, origins=(port,))), "test")
+    cred = policy.credentials["calendar"]
+    assert isinstance(cred, OAuth2Credential)
+    assert cred.redirect_uri == uri
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://localhost:8081/callback",
+        "http://localhost:8081/oauth/callback",
+        "http://localhost:8081/oauth/callback/",
+        "http://localhost/oauth/callback/calendar",  # no port
+        "http://localhost:08081/oauth/callback/calendar",
+        "http://localhost:8081/oauth/callback/calendar/",
+        "http://localhost:8081/oauth/callback/Calendar",
+        "http://localhost:8081/oauth/callback/cal.endar",
+        "http://localhost:8081/oauth/callback/calendar/x",
+        "http://LOCALHOST:8081/oauth/callback/calendar",
+        "http://localhost.:8081/oauth/callback/calendar",
+        "http://app.localhost:8081/oauth/callback/calendar",
+        "https://localhost:8081/oauth/callback/calendar",
+    ],
+)
+def test_every_other_localhost_address_keeps_m2s_message(uri: str) -> None:
+    assert schema_errors(callback_raw(uri)) == [
+        "credentials.calendar.oauth2.redirect_uri: Value error, use 127.0.0.1; RFC 8252 "
+        "section 8.3 and some providers refuse localhost"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("uri", "origins", "name"),
+    [
+        ("http://localhost:8081/oauth/callback/calendar", ("9000",), "calendar"),
+        ("http://localhost:8081/oauth/callback/calendar", None, "calendar"),
+        (
+            "http://localhost:8081/oauth/callback/calendar",
+            ("https://vault.example.net",),
+            "calendar",
+        ),
+        ("http://localhost:8081/oauth/callback/mail", ("8081",), "mail"),  # another's name
+    ],
+)
+def test_the_localhost_form_needs_its_origin_and_its_own_name(
+    uri: str, origins: Any, name: str
+) -> None:
+    """A.5's model validator: refused at load, at the credential's own path, with what to do."""
+    assert schema_errors(callback_raw(uri, origins=origins)) == [
+        f"credentials.calendar.redirect_uri: {uri} is the portal's callback address for "
+        f"credential {name}; list http://localhost:8081 in admin.origins and use this "
+        "credential's own name, or keep the default http://127.0.0.1/callback and paste"
+    ]
+
+
+def test_each_credential_with_a_wrong_localhost_form_is_reported() -> None:
+    raw = callback_raw("http://localhost:8081/oauth/callback/x", origins=("9000",))
+    raw["credentials"]["other"] = oauth(redirect_uri="http://localhost:9000/oauth/callback/other")
+    raw["credentials"]["third"] = oauth(redirect_uri="http://localhost:9000/oauth/callback/y")
+    paths = [error.split(":")[0] for error in schema_errors(raw)]
+    assert paths == ["credentials.calendar.redirect_uri", "credentials.third.redirect_uri"]
+    # A client_credentials credential's redirect_uri is checked the same way.
+    raw = callback_raw("http://127.0.0.1/callback")
+    raw["credentials"]["machine"] = client_credentials(
+        redirect_uri="http://localhost:9000/oauth/callback/machine"
+    )
+    assert [e.split(":")[0] for e in schema_errors(raw)] == ["credentials.machine.redirect_uri"]
+
+
+def callback_findings(uri: str, origins: Any = ("8081",)) -> list[str]:
+    return [line for line in found(callback_raw(uri, origins=origins)) if "redirect_uri" in line]
+
+
+@pytest.mark.parametrize(
+    ("uri", "origins"),
+    [
+        ("http://127.0.0.1/callback", ("8081",)),  # the default draws no rule
+        ("http://127.0.0.1/callback", None),
+        ("http://localhost:8081/oauth/callback/calendar", ("8081",)),
+        ("https://vault.example.net/oauth/callback/calendar", ("https://vault.example.net",)),
+        ("https://vault.example.net/oauth/callback/calendar", ("8081",)),  # another server's
+        ("http://127.0.0.1:9000/oauth/callback/calendar", ("8081",)),  # no origin on that port
+        ("http://127.0.0.1:8081/oauth/callback/calendar", ("https://localhost:8081",)),
+        ("https://127.0.0.1:8081/oauth/callback/calendar", ("8081",)),  # https: not the portal
+        ("http://127.0.0.1:8081/oauth/callback/calendar", None),
+        ("https://vault.example.net/oauth/callback/calendar/", None),
+    ],
+)
+def test_no_callback_warning(uri: str, origins: Any) -> None:
+    assert callback_findings(uri, origins) == []
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://vault.example.net/oauth/callback/calendar/",
+        "https://vault.example.net/oauth/callback",
+        "https://vault.example.net/oauth/callback/mail",
+        "https://vault.example.net:443/oauth/callback/calendar",
+        "https://VAULT.example.net/oauth/callback/calendar",
+        "https://vault.example.net/callback",
+        "https://vault.example.net/",
+    ],
+)
+def test_the_near_miss_warning(uri: str) -> None:
+    assert callback_findings(uri, ("https://vault.example.net",)) == [
+        "warning credentials.calendar.redirect_uri: this credential's portal callback is exactly "
+        "https://vault.example.net/oauth/callback/calendar; this address gets 404 there or "
+        "belongs to another credential, so you'd paste it"
+    ]
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://127.0.0.1:8081/oauth/callback/calendar",
+        "http://127.0.0.1:8081/callback",
+        "http://127.0.0.2:8081/x",
+        "http://[::1]:8081/oauth/callback/calendar",
+    ],
+)
+def test_the_loopback_literal_warning(uri: str) -> None:
+    assert callback_findings(uri, ("9000", "8081")) == [
+        "warning credentials.calendar.redirect_uri: the portal doesn't answer 127.0.0.1 "
+        "(passkeys need a name); to use its callback, register "
+        "http://localhost:8081/oauth/callback/calendar and set that, or keep pasting"
+    ]
