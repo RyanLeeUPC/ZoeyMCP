@@ -415,7 +415,7 @@ def test_the_default_table_is_the_built_routes() -> None:
     assert isinstance(admitted, Admitted)
     assert admitted.route == ROUTES[0] == BEGIN
     # A route a later step builds is 404 until then.
-    assert admit(request("GET", "/api/secrets"), ENTRIES) == refusal("not_found")
+    assert admit(request("GET", "/api/health"), ENTRIES) == refusal("not_found")
 
 
 # --- row 7: body headers ------------------------------------------------------------------------

@@ -47,7 +47,7 @@ from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
 from ..portal import listen as portal_listen
-from ..portal.app import PortalApp, StaticMissing, load_static
+from ..portal.app import PortalApp, Secrets, StaticMissing, load_static
 from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
 from ..portal.passkeys import Passkeys
 from ..portal.server import HEAD_LIMIT, HEADER_DEADLINE, portal_protocol
@@ -381,12 +381,14 @@ def build_portal(
     setup: SetupCodes,
     passkeys: Passkeys,
     login: LoginService,
+    secrets: Secrets | None = None,
     lookup: Lookup = lookup_addresses,
 ) -> Portal | None:
     """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
     at start (B.3): a name that doesn't resolve to exactly one address, an address a ``--listen``
     has (or its port, with a wildcard on either side), a static file missing. A wildcard beside
-    any ``--listen`` is warned about (``admin_listener_shared``)."""
+    any ``--listen`` is warned about (``admin_listener_shared``). ``secrets`` is what its Secrets
+    area writes through, the admin socket's store, token manager and policy."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -401,7 +403,14 @@ def build_portal(
         static = load_static()
     except StaticMissing as exc:
         raise StartupError(str(exc)) from exc
-    app = PortalApp(admin.origins, static=static, setup=setup, passkeys=passkeys, login=login)
+    app = PortalApp(
+        admin.origins,
+        static=static,
+        setup=setup,
+        passkeys=passkeys,
+        login=login,
+        secrets=secrets,
+    )
     return Portal(app, address)
 
 
@@ -722,8 +731,12 @@ def build(
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
         admin_socket = None
-    # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2).
-    portal = build_portal(runtime.policy, listens, setup=setup, passkeys=passkeys, login=login)
+    # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2), and
+    # the same store, token manager and running policy for secrets (M5 design G, P10).
+    secrets = Secrets(runtime.store, app.tokens, lambda: app.policy)
+    portal = build_portal(
+        runtime.policy, listens, setup=setup, passkeys=passkeys, login=login, secrets=secrets
+    )
     admin = None
     if admin_socket is not None:
         # The socket lists and ends the portal's sessions (zoeymcp sessions, passkeys --remove).

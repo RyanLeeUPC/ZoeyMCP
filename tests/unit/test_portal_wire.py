@@ -35,7 +35,7 @@ POSTED = re.compile(
     re.DOTALL,
 )
 # prepare("kind", { key: value, ... }, ...) in app.js: an action's data.
-PREPARED = re.compile(r"prepare\(\"([a-z.]+)\",\s*\{([^}]*)\}", re.DOTALL)
+PREPARED = re.compile(r"prepare\(\s*\"([a-z.]+)\",\s*\{([^}]*)\}", re.DOTALL)
 
 
 @pytest.fixture

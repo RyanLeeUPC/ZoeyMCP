@@ -377,7 +377,7 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("passkey.enrol", {"name": "x", "extra": 1}) == (400, "bad_body")
     assert refused("passkey.rename", {"name": "x"}) == (400, "bad_body")
     # A registered kind a later step builds.
-    assert refused("secret.delete", {"name": "x"}) == (400, "bad_body")
+    assert refused("oauth.reset", {"credential": "x"}) == (400, "bad_body")
     # Each kind's cap: 4 KiB for a passkey's (M.1), within the route's 128 KiB.
     assert refused("passkey.enrol", {"name": "x" * 5000}) == (413, "too_large")
     assert refused("passkey.enrol", {"name": "a\tb"}) == (400, "bad_name")

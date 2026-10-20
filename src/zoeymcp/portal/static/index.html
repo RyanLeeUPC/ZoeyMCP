@@ -17,6 +17,7 @@
 <button type="button" id="nav-home">Home</button>
 <button type="button" id="nav-sessions">Sessions</button>
 <button type="button" id="nav-passkeys">Passkeys</button>
+<button type="button" id="nav-secrets">Secrets</button>
 </nav>
 <button type="button" id="sign-out">Sign out</button>
 </header>
@@ -93,6 +94,23 @@ first, or use <code>zoeymcp setup-code --reset</code>.</p>
 <label for="passkey-name">Name for the new passkey (for example, the device it is on)</label>
 <input id="passkey-name" type="text" autocomplete="off" maxlength="64">
 <button type="button" id="passkey-enrol">Enrol a passkey</button>
+</section>
+
+<section id="secrets" hidden>
+<h2>Secrets</h2>
+<p>Every secret in the vault's store, by name, and what it may be used for. The vault never shows
+a value, here or anywhere else: to change one, enter it again. Each change asks for a passkey
+first. A credential's tokens from Connect are the vault's own and aren't changed here.</p>
+<ul id="secret-list"></ul>
+<h3>Set or replace a secret</h3>
+<label for="secret-name">Name (NAME in the policy's store:NAME)</label>
+<input id="secret-name" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="128">
+<label for="secret-value">Value (cleared from this page once sent, whatever the answer)</label>
+<input id="secret-value" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="65536" data-1p-ignore data-lpignore="true" data-bwignore>
+<label for="secret-origins">Origins it may be sent to, only for a name no route or connector uses
+(https URLs, separated by spaces)</label>
+<input id="secret-origins" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+<button type="button" id="secret-prepare">Set the secret</button>
 </section>
 </main>
 

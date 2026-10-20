@@ -3,9 +3,11 @@
 One run through the OAuth effect scenarios: logins from the CLI and over the admin app, seed
 promotion, rotation, the upstream 401 path, a revoked grant whose token endpoint echoes the
 refresh token in ``error_description``, bad pastes, a provider error, a reused code, and a
-client_credentials test fetch with a rejected client, then the listings and health. Every log
-line, admin answer, CLI output and proxied response is collected, and none may hold a token,
-code, verifier, ``state``, client secret or ``error_description`` text from the fakes.
+client_credentials test fetch with a rejected client, then the listings and health. Secrets are
+written over the admin socket and through the portal's Secrets actions (M5 design G), one
+refused and one left held by a pending action. Every log line, admin answer, portal answer, CLI
+output and proxied response is collected, and none may hold a token, code, verifier, ``state``,
+client secret or ``error_description`` text from the fakes.
 
 Two things are shown by design and are taken out before the sweep: the authorization URL (it
 holds ``state`` and the PKCE challenge, useless without the verifier the vault keeps), and the
@@ -29,6 +31,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 import pytest
 
+from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.oauth_server import (
     FakeAuthServer,
     FakeResourceServer,
@@ -42,6 +45,8 @@ from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
+from zoeymcp.portal.app import PortalApp, Secrets, load_static
+from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.vault import logs
 from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.app import VaultApp
@@ -52,7 +57,9 @@ from zoeymcp.vault.request import oauth_client_variants
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
+from .test_no_secret_answers import Recording, signed_in, step_up
 from .test_oauth_tokens import KEYS, FakeClock
+from .test_portal_wire import ORIGIN
 
 pytestmark = pytest.mark.anyio
 
@@ -195,19 +202,33 @@ class World:
             environ={"CALENDAR_REFRESH": self.seed},
         )
         login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.time)
+        setup = SetupCodes(tmp_path, KEYS.portal_key)
         self.admin_app = AdminApp(
             self.store,
             KEYS,
             lambda: self.policy,
-            SetupCodes(tmp_path, KEYS.portal_key),
+            setup,
             self.tokens,
             login,
             connectors=self.vault.connectors,
             env_names=lambda: self.vault.env_names,
         )
+        # The portal, sharing the socket's store, token manager, policy and logins (M5 G).
+        (tmp_path / "portal").mkdir(mode=0o700)
+        self.portal_app = PortalApp(
+            [ORIGIN],
+            static=load_static(),
+            setup=setup,
+            passkeys=Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json"),
+            login=login,
+            secrets=Secrets(self.store, self.tokens, lambda: self.policy),
+        )
+        self.passkey = SoftAuthenticator()
+        self.page: Recording | None = None
         self.monkeypatch = monkeypatch
         # Everything that leaves the vault, by where it went.
         self.admin_answers: list[str] = []
+        self.portal_answers: list[str] = []
         self.cli_outputs: list[str] = []
         self.proxied: list[str] = []
         self.authorize_urls: list[str] = []
@@ -224,6 +245,19 @@ class World:
             self.authorize_urls.append(response.json()["authorize_url"])
             self.flows.append(response.json()["flow"])
         return response
+
+    async def portal_page(self) -> Recording:
+        """The portal's page, signed in with a passkey on first use; every answer is kept."""
+        if self.page is None:
+            transport = httpx.ASGITransport(app=self.portal_app)
+            client = httpx.AsyncClient(transport=transport, base_url=ORIGIN)
+            self.page = Recording(client, self.portal_answers)
+            await signed_in(self.page, self.portal_app, self.passkey)
+        return self.page
+
+    async def portal(self, kind: str, data: dict[str, Any]) -> httpx.Response:
+        """A step-up action, prepared and confirmed as the Secrets page does."""
+        return await step_up(await self.portal_page(), self.passkey, kind, data)
 
     async def browse(self, url: str) -> str:
         """Play the browser: approve, and return the address the browser is sent to."""
@@ -340,8 +374,11 @@ async def test_nothing_secret_leaves_the_vault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_lines: io.StringIO
 ) -> None:
     world = World(tmp_path, monkeypatch)
-    for name, value in (("google-secret", GOOGLE_SECRET), ("machine-secret", MACHINE_SECRET)):
-        assert (await world.admin("PUT", f"/secrets/{name}", {"value": value})).status_code == 200
+    put = await world.admin("PUT", "/secrets/google-secret", {"value": GOOGLE_SECRET})
+    assert put.status_code == 200
+    # The OAuth client secret through the portal (M5 design G): the token manager writes it.
+    put = await world.portal("secret.put", {"name": "machine-secret", "value": MACHINE_SECRET})
+    assert put.status_code == 200, put.text
 
     # music: an interactive CLI login, then use, rotation and the upstream 401 path.
     code, out, err = await world.cli(["login", "music"], browse=True)
@@ -431,6 +468,21 @@ async def test_nothing_secret_leaves_the_vault(
     setup_codes = [issued, out.strip()]
     await world.admin("GET", "/setup-code/status")
 
+    # The portal: a refused write, a value left held by a pending action, and its list.
+    page = await world.portal_page()
+    data = {"name": "unreferenced", "value": GOOGLE_SECRET}
+    unbound = await page.call("POST", "/api/actions", {"kind": "secret.put", "data": data})
+    assert unbound.json()["reason"] == "unbound"
+    data = {"name": "google-secret", "value": WRONG_SECRET}
+    held = await page.call("POST", "/api/actions", {"kind": "secret.put", "data": data})
+    assert held.status_code == 200, held.text
+    assert [s["name"] for s in (await page.call("GET", "/api/secrets")).json()["secrets"]] == [
+        "google-secret",
+        "machine-secret",
+        "music-refresh",
+        "oauth.calendar.live",
+    ]
+
     # Listings.
     await world.admin("GET", "/oauth")
     await world.admin("GET", "/secrets")
@@ -451,8 +503,10 @@ async def test_nothing_secret_leaves_the_vault(
     kinds = {value.rsplit("-", 2)[1] for value in world.issued()}
     assert kinds == {"code", "rt"}
     assert any(c.status == 400 for c in world.google.calls if c.grant_type == "refresh_token")
+    assert world.portal_answers
     outputs = {
         "admin": world.admin_answers,
+        "portal": world.portal_answers,
         "cli": world.cli_outputs,
         "proxied": world.proxied,
         "logs": [log_text],
@@ -486,6 +540,7 @@ async def test_nothing_secret_leaves_the_vault(
         assert query["code_challenge_method"] == "S256"
         assert "client_secret" not in query
 
+    await page.client.aclose()
     await world.vault.aclose()
     await world.token_client.aclose()
 

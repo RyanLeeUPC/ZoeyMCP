@@ -37,7 +37,12 @@ summaries if the plan moved; otherwise it applies the counter, runs what was hel
 its result. The kinds built so far are the passkeys': ``passkey.enrol`` (its run begins an
 enrolment ceremony for this session, finished at ``/api/passkeys/enrol/finish``),
 ``passkey.rename`` and ``passkey.remove`` (never the last passkey: host access is the recovery
-path, Q26).
+path, Q26); and the secrets': ``secret.put`` and ``secret.delete``, which decide with
+``vault/secretplan.py`` and write with ``vault/secretops.py``, as the admin socket's
+``PUT/DELETE /secrets/{name}`` do (G, P10). The Secrets area is write-only: ``GET /api/secrets``
+lists names and metadata, and no answer, summary or log line carries a value (P1, R61). A value
+waits for its confirm in the action's held data, which hides it from ``repr`` and refuses to be
+logged.
 
 Logs (M.4): ``portal_request`` for each answer a handler gives; ``portal_refused`` for a refusal
 before one, at most once per 10 s per reason with a count, never the refused ``Host`` or
@@ -46,7 +51,8 @@ handlers log ``portal_login``, ``portal_login_failed``, ``setup_code_redeemed``,
 ``setup_code_refused`` (at most once a minute, with a count), ``passkey_enrolled`` (a warning when
 a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout``, ``portal_session_ended``,
 ``step_up_confirmed``, ``step_up_refused``, ``action_changed``, ``passkey_renamed`` and
-``passkey_removed``.
+``passkey_removed``; ``secretops`` logs ``secret_set`` and ``secret_deleted`` with
+``via: "portal"``.
 """
 
 from __future__ import annotations
@@ -57,13 +63,16 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard
 
 from starlette.types import Receive, Scope, Send
 
-from ..vault import logs
+from ..vault import logs, secretops, secretplan
+from ..vault.bindings import VAULT_PREFIX
+from ..vault.secretplan import PutPlan, SecretRefusal
 from . import passkeys as passkey_file
 from . import routes as api
 from .actions import Action, ActionRefusal, Actions, changed, parse_request
@@ -80,10 +89,10 @@ from .admission import (
     parse_body,
     values,
 )
-from .display import NAME_LIMIT, shown
+from .display import NAME_LIMIT, SUMMARY_LIMIT, shown
 from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
-from .refusals import Refusal, enrolment, refusal
+from .refusals import Refusal, enrolment, refusal, secret
 from .routes import ROUTES, STATIC, Route
 from .sessions import (
     SESSION_IDLE,
@@ -108,8 +117,11 @@ from .webauthn import (
 )
 
 if TYPE_CHECKING:
+    from ..common.policy.schema import Policy
     from ..vault.admin import SetupCodes
     from ..vault.oauth.login import LoginService
+    from ..vault.oauth.tokens import TokenManager
+    from ..vault.store import EntryMeta, SecretStore
     from .passkeys import Passkeys
 
 BODY_DEADLINE: Final = 10.0  # seconds to receive a body, once the app starts reading it
@@ -227,6 +239,19 @@ class Step:
 
 
 @dataclass(frozen=True)
+class Secrets:
+    """What the Secrets area works on (G), the same three the admin socket's ``/secrets`` does:
+    the vault's store; its token manager, which writes and deletes a name an oauth2 credential
+    uses once any refresh of it is done (None writes the store directly, as the socket without
+    one); and the running policy, read at every plan, so a reload between prepare and confirm
+    that moves a binding is ``409 changed``."""
+
+    store: SecretStore
+    tokens: TokenManager | None
+    policy: Callable[[], Policy]
+
+
+@dataclass(frozen=True)
 class ActionKind:
     """One kind of action as the portal runs it: its plan, which changes nothing, and its run,
     given the data the vault held. The registry's shape checks (``actions.KINDS``) come first."""
@@ -272,7 +297,8 @@ class _Exchange:
 class PortalApp:
     """The portal on its listener. ``origins`` is ``admin.origins``; :meth:`reload` swaps them.
 
-    ``setup``, ``passkeys`` and ``login`` are the ones the vault shares with the admin socket.
+    ``setup``, ``passkeys``, ``login`` and ``secrets`` are the ones the vault shares with the
+    admin socket; a secret route or action of a portal without ``secrets`` is a 500.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
     class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
     limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
@@ -290,6 +316,7 @@ class PortalApp:
         setup: SetupCodes | None = None,
         passkeys: Passkeys | None = None,
         login: LoginService | None = None,
+        secrets: Secrets | None = None,
         routes: Sequence[Route] = ROUTES,
         handlers: Mapping[Route, Handler] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -301,6 +328,7 @@ class PortalApp:
         self.setup = setup
         self.passkeys = passkeys
         self.login = login
+        self.secrets = secrets
         self._routes = tuple(routes)
         self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
@@ -539,6 +567,7 @@ class PortalApp:
             api.ENROL_BEGIN: self._enrol_begin,
             api.ENROL_FINISH: self._enrol_finish,
             api.PASSKEYS: self._passkeys,
+            api.SECRETS: self._secret_list,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -904,6 +933,8 @@ class PortalApp:
             "passkey.enrol": ActionKind(self._plan_enrol, self._run_enrol),
             "passkey.rename": ActionKind(self._plan_rename, self._run_rename),
             "passkey.remove": ActionKind(self._plan_remove, self._run_remove),
+            "secret.put": ActionKind(self._plan_put, self._run_put),
+            "secret.delete": ActionKind(self._plan_delete, self._run_delete),
         }
 
     def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1014,6 +1045,83 @@ class PortalApp:
             "signed_out": step.session.credential == fingerprint,
         }
         return Reply(answer)
+
+    # --- secrets (G): write-only ------------------------------------------------------------------
+
+    async def _secret_list(self, call: Call) -> Reply | Refusal:
+        """Every store entry by name, with its metadata: never a value, a length or a hash of
+        one, and none of the clear ``meta`` anyone with the file can edit."""
+        entries = self._secret_store().store.metadata()
+        return Reply({"secrets": [_secret_view(entry) for entry in entries]})
+
+    def _plan_put(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``secret.put``: ``secretplan.plan_put``, the socket's checks and binding (P10, D-10:
+        an OAuth secret takes the policy's binding and refuses origins), then what the write
+        replaces, and the binding until now when it moves. The value is in the facts, so a
+        confirm compares it, and never in the summary."""
+        place = self._secret_store()
+        plan = _put_plan(data, place)
+        if isinstance(plan, Refusal):
+            return plan
+        name = plan.name
+        entry = place.store.entry(name)
+        summary = [("Store", shown(name, NAME_LIMIT)), ("Bound to", _binding_words(plan.binding))]
+        if entry is None:
+            summary.append(("Replaces", "nothing: no secret has this name yet"))
+            return Plan(tuple(summary), (plan, None))
+        summary.append(("Replaces", f"the value set at {_when(entry.updated)}"))
+        if entry.binding != plan.binding:
+            summary.append(("Bound until now", _binding_words(entry.binding)))
+        return Plan(tuple(summary), (plan, entry.binding, entry.updated))
+
+    async def _run_put(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """The write, as the socket's: through the token manager for a name an oauth2 credential
+        uses. A failed file write is kept in memory and answered ``not_written``."""
+        place = self._secret_store()
+        plan = _put_plan(data, place)  # the confirm planned the same a moment ago
+        if isinstance(plan, Refusal):
+            return plan
+        written = await secretops.put(place.store, place.tokens, plan, via="portal")
+        if isinstance(written, SecretRefusal):
+            return secret(written, name=plan.name)
+        entry = place.store.entry(plan.name)
+        return Reply({"secret": None if entry is None else _secret_view(entry)})
+
+    def _plan_delete(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``secret.delete``: a valid name, and not one the vault manages, so the portal never
+        deletes a live slot (the socket may); then ``secretplan.plan_delete``, and the secret
+        must exist."""
+        place = self._secret_store()
+        name = data["name"]
+        if not isinstance(name, str):
+            return refusal("bad_body")
+        refused = secretplan.check_name(name)
+        if refused is not None:
+            return secret(refused, name=name)
+        plan = secretplan.plan_delete(name, place.policy())
+        entry = place.store.entry(name)
+        if entry is None:
+            return secret(secretplan.NOT_FOUND, name=name)
+        summary = (
+            ("Delete", shown(name, NAME_LIMIT)),
+            ("Bound to", _binding_words(entry.binding)),
+            ("Set at", _when(entry.updated)),
+        )
+        return Plan(summary, (plan, entry.binding, entry.updated))
+
+    async def _run_delete(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        place = self._secret_store()
+        name = data["name"]
+        plan = secretplan.plan_delete(name, place.policy())
+        refused = await secretops.delete(place.store, place.tokens, plan, via="portal")
+        if refused is not None:
+            return secret(refused, name=name)
+        return Reply({"name": name, "deleted": True})
+
+    def _secret_store(self) -> Secrets:
+        if self.secrets is None:
+            raise RuntimeError("this portal has no secret store")
+        return self.secrets
 
     def _holder(self) -> Passkeys | Refusal:
         """The passkey file, unless it can't be verified (P19: 503 until a reset)."""
@@ -1198,6 +1306,71 @@ def _ending(count: int, this: bool) -> str:
     if count == 0:
         return "none"
     return f"{count}, this one included" if this else str(count)
+
+
+def _put_plan(data: Mapping[str, Any], place: Secrets) -> PutPlan | Refusal:
+    """``secretplan.plan_put`` over a ``secret.put``'s data (its keys checked by the registry),
+    each refusal in the portal's words with the plan's status (G)."""
+    name = data["name"]
+    if not isinstance(name, str):
+        return refusal("bad_body")
+    body = {key: data[key] for key in ("value", "origins") if key in data}
+    plan = secretplan.plan_put(name, body, place.policy())
+    return secret(plan, name=name) if isinstance(plan, SecretRefusal) else plan
+
+
+def _secret_view(entry: EntryMeta) -> dict[str, Any]:
+    """A store entry as the Secrets list shows it (G). Only the name is checked by the store, so
+    every other field, which anyone with the file can edit, is shown as text the page may show
+    (K.1); the binding in words."""
+    return {
+        "name": entry.name,
+        "name_shown": shown(entry.name, NAME_LIMIT),
+        "binding_shown": _binding_words(entry.binding),
+        "key_id": shown(str(entry.key_id), NAME_LIMIT),
+        "created": _when(entry.created),
+        "updated": _when(entry.updated),
+        "live_slot": entry.name.startswith(VAULT_PREFIX),
+    }
+
+
+def _binding_words(binding: object) -> str:
+    """What a binding lets the vault do with the secret, in words, every origin and host shown
+    as text (K.1): "sent to https://api.example:443"; "token endpoint https://auth.example:443,
+    its access tokens used at https://api.example:443"; "SMTP mail.example:465 from a@x to
+    b@y"."""
+    words = "a binding the vault doesn't recognize"
+    if isinstance(binding, dict):
+        origins, oauth, smtp = binding.get("origins"), binding.get("oauth"), binding.get("smtp")
+        if _strings(origins):
+            words = f"sent to {', '.join(origins)}"
+        elif isinstance(oauth, dict) and isinstance(oauth.get("token"), str):
+            resources = oauth.get("resources")
+            used = (
+                f", its access tokens used at {', '.join(resources)}" if _strings(resources) else ""
+            )
+            words = f"token endpoint {oauth['token']}{used}"
+        elif isinstance(smtp, dict) and _strings(smtp.get("to")):
+            words = f"SMTP {smtp.get('host')}:{smtp.get('port')} from {smtp.get('from')} to "
+            words += ", ".join(smtp["to"])
+    return shown(words, SUMMARY_LIMIT)
+
+
+def _strings(value: object) -> TypeGuard[list[str]]:
+    """A non-empty list of strings."""
+    return isinstance(value, list) and bool(value) and all(isinstance(v, str) for v in value)
+
+
+def _when(value: object) -> str:
+    """A store time (ISO 8601, UTC) as the page shows it: ``2026-10-01 09:00 UTC``."""
+    if isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            moment = None
+        if moment is not None and moment.tzinfo is not None:
+            return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    return "an unknown time"
 
 
 def _session(call: Call) -> Session:

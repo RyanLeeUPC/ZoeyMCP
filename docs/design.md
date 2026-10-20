@@ -99,7 +99,7 @@ say so.
 | ID | Requirement | Kind |
 | --- | --- | --- |
 | R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, and (in managed mode) policy editing | Must |
-| R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only | Must |
+| R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only, and its secret entry is write-only. Two scoped exceptions, on the admin socket only and reached by no portal route: `POST /setup-code` answers the new setup code (R65), and `GET /gateway-key` the gateway key (§7.5) | Must |
 | R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion, bound to the one change it confirms) for every security-relevant change; the step-up column of §7.1's table is the list: writing or deleting a secret, completing or resetting an OAuth connection, enrolling, renaming or removing a passkey, and, as they are built, changing policy, re-pinning a tool, moving a tool from `approve` to `allow` and changing a connector's constraints | Must |
 | R63 | **Browser hardening:** the exact origins the operator lists drive the `Host` and `Origin` checks (stopping DNS rebinding); every API request needs `Sec-Fetch-Site: same-origin`, and every state change is a `fetch()` with `POST` or `DELETE` carrying the page's own `Origin` (no forms); every answer carries a CSP with no inline script or style, `form-action 'none'`, `frame-ancestors 'none'` and Trusted Types, plus `nosniff`, `no-referrer`, `no-store`, COOP, CORP and `X-Frame-Options: DENY`; `SameSite=Strict` session cookies; no third-party assets. The OAuth callback is the only exception (§7.3) | Must |
 | R64 | **One source of truth for policy**, chosen per deployment: **managed** (the portal is the source; export/import YAML) or **declarative** (a config file or env var is the source; the portal can't edit policy and produces diffs to commit instead). Never both | Must |
@@ -1589,7 +1589,9 @@ holds a raw control or format character.
   - the egress role refuses a host outside the listener's allowlist, a plain-HTTP request, a name
     that resolves to a private or metadata address (including after a DNS change between two
     lookups), and one source's destinations on another source's listener;
-  - no admin endpoint returns a secret;
+  - no admin endpoint returns a secret: a walk of every portal and admin socket route, where only
+    the socket's `POST /setup-code` and `GET /gateway-key` may carry a credential (R61's two
+    exceptions), and no portal code reaches either;
   - in the **standard tier**, the gateway uid can't read `/state`, the vault's environ or its
     admin socket (the image smoke test);
   - in the **hardened tier**, the gateway can't reach the internet or the admin listener (the

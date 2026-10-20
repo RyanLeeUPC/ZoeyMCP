@@ -876,8 +876,8 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 
 ## 26. The portal
 
-A draft, filled in as the portal is built: signing in, setup, sessions, passkeys and step-up so
-far. Everything here can also be done with the CLI (§1).
+A draft, filled in as the portal is built: signing in, setup, sessions, passkeys, step-up and
+secrets so far. Everything here can also be done with the CLI (§1).
 
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
@@ -963,6 +963,25 @@ If something it showed changed in between (another session renamed the same pass
 refuses with what it finds now, and you prepare again. Logs: `step_up_confirmed` (the kind and
 the passkey that confirmed it), `step_up_refused` (the reason), `action_changed`,
 `passkey_renamed` and `passkey_removed`; names are never logged.
+
+**Secrets.** The Secrets page lists every secret in the store by name: what it may be used for
+(the origins it is sent to; for an OAuth secret, its token endpoint and where its access tokens
+go; for an SMTP password, the server, sender and recipients), when it was set and last
+replaced, and the master key it is encrypted under. It never shows a value, its length or a
+hash of one, and no portal answer carries one. **Set the secret** writes one: give the name
+(the `NAME` of `store:NAME` in the policy) and the value, which is a password field the page
+empties as soon as it is sent, whatever the answer. The vault checks it and shows, before the
+passkey prompt, the binding it will be stored with and what it replaces (and the binding until
+now, when that changes); the checks and bindings are exactly `zoeymcp secret set`'s. A name no
+route or connector uses needs **Origins** (the https addresses it may be sent to); an OAuth
+secret (a client ID, client secret or refresh token in the policy) always takes the policy's
+binding and refuses origins. **Replace** fills in the name for a new value; **Delete** removes
+one. Names starting `oauth.` are the vault's own (a credential's live tokens): the portal
+neither writes nor deletes them (Connect does, on the Credentials page; `zoeymcp secret delete`
+can from the host). If the policy is reloaded between the summary and the passkey prompt and
+the binding moves, the vault refuses with what it finds now. A write the state volume refuses is
+kept in memory and said so, as with the CLI. Logs: `secret_set` and `secret_deleted` with `via:
+"portal"` (or `"socket"`), never the value.
 
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A

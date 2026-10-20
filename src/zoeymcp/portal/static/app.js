@@ -3,13 +3,14 @@
 // itself refuses. Every change is a fetch() with POST or DELETE and the session's header half,
 // the one thing kept in sessionStorage (F.2). Passkey prompts open only from click handlers.
 // A full session changes things only through actions (F.4): prepare, show the vault's summary,
-// then confirm with a passkey.
+// then confirm with a passkey. Secrets are write-only (G): a value typed here is sent once, in
+// its prepare, and the field is emptied as soon as the request is made.
 "use strict";
 
 (function () {
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
-  const PAGES = ["blocked", "login", "setup", "home", "sessions", "passkeys"];
+  const PAGES = ["blocked", "login", "setup", "home", "sessions", "passkeys", "secrets"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
@@ -137,6 +138,9 @@
   function show(page) {
     for (const id of PAGES) {
       $(id).hidden = id !== page;
+    }
+    if (page !== "secrets") {
+      $("secret-value").value = ""; // a value typed but not sent doesn't stay in the page
     }
     $("status").textContent = "";
   }
@@ -452,6 +456,88 @@
     }
   }
 
+  // --- secrets (G): names and metadata only; a value is entered, never shown ------------------
+
+  async function showSecrets() {
+    clearError();
+    try {
+      const answer = await api("GET", "/api/secrets");
+      const list = $("secret-list");
+      list.replaceChildren();
+      for (const secret of answer.secrets) {
+        const item = document.createElement("li");
+        const text = document.createElement("span");
+        text.textContent =
+          secret.name_shown + ": " + secret.binding_shown + "; set " + secret.created +
+          ", last replaced " + secret.updated + ", under key " + secret.key_id +
+          (secret.live_slot ? "; the vault keeps a credential's live token here" : "") + ".";
+        item.append(text);
+        if (!secret.live_slot) {
+          item.append(
+            button("Replace", function () {
+              replaceSecret(secret);
+            }),
+            button("Delete", function () {
+              prepare("secret.delete", { name: secret.name }, afterSecretDeleted);
+            })
+          );
+        }
+        list.append(item);
+      }
+      if (answer.secrets.length === 0) {
+        const item = document.createElement("li");
+        item.textContent = "No secrets are stored yet.";
+        list.append(item);
+      }
+      show("secrets");
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
+  function replaceSecret(secret) {
+    $("secret-name").value = secret.name;
+    $("secret-value").value = "";
+    $("secret-origins").value = "";
+    $("secret-value").focus();
+  }
+
+  // The origins field, as a list, or nothing when it is empty (JSON leaves undefined out).
+  function originsGiven() {
+    const words = $("secret-origins").value.split(/[\s,]+/).filter(function (word) {
+      return word !== "";
+    });
+    return words.length ? words : undefined;
+  }
+
+  // The value goes into the prepare's body, and the field is emptied as soon as that request
+  // is made: whatever the vault answers, the page no longer holds it (G).
+  async function prepareSecret() {
+    const sent = prepare(
+      "secret.put",
+      { name: $("secret-name").value, value: $("secret-value").value, origins: originsGiven() },
+      afterSecretSet
+    );
+    $("secret-value").value = "";
+    await sent;
+  }
+
+  async function afterSecretSet(result) {
+    closeConfirm();
+    $("secret-name").value = "";
+    $("secret-origins").value = "";
+    await showSecrets();
+    const secret = result.secret;
+    $("status").textContent =
+      secret === null ? "Secret stored." : "Secret stored, " + secret.binding_shown + ".";
+  }
+
+  async function afterSecretDeleted() {
+    closeConfirm();
+    await showSecrets();
+    $("status").textContent = "Secret deleted.";
+  }
+
   // --- step-up (F.4) --------------------------------------------------------------------------
 
   // Prepare: the vault checks everything now and answers what it will do, before any prompt.
@@ -609,10 +695,12 @@
     on("nav-home", enter);
     on("nav-sessions", showSessions);
     on("nav-passkeys", showPasskeys);
+    on("nav-secrets", showSecrets);
     on("end-others", endOthers);
     on("passkey-enrol", prepareEnrol);
     on("rename-prepare", prepareRename);
     on("rename-close", closeRename);
+    on("secret-prepare", prepareSecret);
     on("confirm-passkey", confirmAction);
     on("confirm-create", createPasskey);
     on("confirm-cancel", cancelAction);

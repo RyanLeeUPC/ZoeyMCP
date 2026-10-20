@@ -19,6 +19,7 @@ fail. Record no account names, addresses or other personal details.
 | 8, 9 | step 14a (OAuth connect by paste) |
 | 13, 14 | step 14b (the OAuth callback) |
 | 12 | no step waits on it (the portal tests cover it); run it with 1-7 |
+| 15 | step 13 (secrets) |
 
 ## The setup for every item
 
@@ -113,6 +114,10 @@ view.
     `http://localhost:8081` is offered and accepted on `http://localhost:8082`.
 13. **The callback** (step 14b): the steps come with the callback.
 14. **A stale callback address** (step 14b): the steps come with the callback.
+15. **The secret field isn't saved** (step 13). Sign in, open **Secrets**, enter a name and a
+    value, choose **Store**, confirm with the passkey. Pass: the browser doesn't offer to save the
+    value as a password (and no password manager fills or stores it); after the confirm the value
+    field is empty; the page's elements (developer tools, Elements) hold no copy of the value.
 
 ## Results
 

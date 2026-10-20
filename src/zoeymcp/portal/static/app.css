@@ -72,7 +72,8 @@ code {
 }
 
 #session-list li,
-#passkey-list li {
+#passkey-list li,
+#secret-list li {
   margin-bottom: 0.5rem;
   overflow-wrap: anywhere;
 }

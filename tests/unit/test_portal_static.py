@@ -242,6 +242,44 @@ def test_every_button_runs_its_handler_once_at_a_time() -> None:
     assert re.findall(r"addEventListener\(\"(\w+)\"", code) == ["click", "cancel"]
 
 
+class Inputs(HTMLParser):
+    """Every <input>'s attributes, by its id."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.inputs: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        found = dict(attrs)
+        if tag == "input" and found.get("id"):
+            self.inputs[str(found["id"])] = found
+
+
+def test_a_secret_value_is_write_only_in_the_page() -> None:
+    """G, P1: the value field is a password field the browser isn't asked to fill or remember,
+    read once, into the prepare's body, and emptied as soon as that request is made; the page
+    never writes anything else into it, and leaving the Secrets page empties it too."""
+    parser = Inputs()
+    parser.feed(read("index.html"))
+    value = parser.inputs["secret-value"]
+    assert (value["type"], value["autocomplete"]) == ("password", "off")
+    assert "name" not in value  # nothing a form or a password manager keys on
+    for field in ("secret-name", "secret-origins"):
+        assert parser.inputs[field]["type"] == "text", field
+    code = code_of(read("app.js"))
+    field = '$("secret-value").value'
+    assert code.count(field) == 4
+    assert re.findall(re.escape(field) + r" = (.*);", code) == ['""', '""', '""']
+    start = code.index("async function prepareSecret() {")
+    body = code[start : code.index("\n  }\n", start)]
+    sent = body.index('prepare(\n      "secret.put",')
+    assert sent < body.index(f"value: {field}") < body.index(f'{field} = "";')
+    assert body.index(f'{field} = "";') < body.index("await sent;")
+    assert re.search(r'if \(page !== "secrets"\) \{\s*\$\("secret-value"\)\.value = "";', code)
+    # Nothing the vault answers is put back into a field: the list shows names and metadata.
+    assert "secret.value" not in code
+
+
 def test_session_storage_holds_one_key() -> None:
     """The header half under one key; no other storage, no cookie access from script (K.2)."""
     uses = STORAGE.findall(code_of(read("app.js")))

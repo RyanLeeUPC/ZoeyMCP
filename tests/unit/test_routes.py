@@ -86,9 +86,9 @@ def test_the_static_map_is_fixed() -> None:
 
 
 def test_the_table_holds_only_built_routes() -> None:
-    # Each of steps 11 to 15 adds the rows it builds: step 11's are M.1's first nine, and step
-    # 12's the passkey list and the three action routes.
-    assert (*M1[:10], *M1[18:]) == ROUTES
+    # Each of steps 11 to 15 adds the rows it builds: step 11's are M.1's first nine, step
+    # 12's the passkey list and the three action routes, and step 13's the secret list.
+    assert (*M1[:11], *M1[18:]) == ROUTES
     assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
         "/api/login/begin",
         "/api/logout",
@@ -144,7 +144,8 @@ def test_the_route_defaults() -> None:
 def test_nothing_matches_an_empty_table() -> None:
     assert match((), "GET", "/api/session") is None
     assert match(ROUTES, "GET", "/api/session") == (ROUTES[3], {})
-    assert match(ROUTES, "GET", "/api/secrets") is None  # step 13's
+    assert match(ROUTES, "GET", "/api/secrets") == (ROUTES[10], {})
+    assert match(ROUTES, "GET", "/api/health") is None  # step 14a's
 
 
 @pytest.mark.parametrize(

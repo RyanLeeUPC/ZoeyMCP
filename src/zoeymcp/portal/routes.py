@@ -115,6 +115,8 @@ CONFIRM: Final = Route(
     "POST", "/api/actions/{action}/confirm", FULL, BODY_WEBAUTHN, frozenset({"credential"})
 )
 CANCEL: Final = Route("DELETE", "/api/actions/{action}", FULL)
+# Step 13: the secret list, names and metadata only (G). Writing and deleting are actions.
+SECRETS: Final = Route("GET", "/api/secrets", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -127,6 +129,7 @@ ROUTES: Final[tuple[Route, ...]] = (
     ENROL_BEGIN,
     ENROL_FINISH,
     PASSKEYS,
+    SECRETS,
     ACTIONS,
     CONFIRM,
     CANCEL,
