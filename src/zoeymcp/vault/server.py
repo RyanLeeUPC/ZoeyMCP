@@ -14,6 +14,12 @@ instead; the end of that pipe stops the vault too.
 Every TCP listener's sockets are bound before any server starts (M5 design B.3, D17), so an
 address in use is a ``StartupError`` that names it; uvicorn would otherwise call ``sys.exit``
 inside the servers' gather, with no line of the vault's.
+
+A policy with an ``admin`` block has a portal (M5 design B): its own listener on ``admin.listen``,
+resolved to one address (:mod:`zoeymcp.portal.listen`) and bound with the others. The start is
+refused when that address can't be resolved, clashes with a ``--listen`` address, or can't be
+bound, and when a static file is missing; a portal state file that can't be read is logged and
+shown in the portal, never a reason to refuse (P21).
 """
 
 from __future__ import annotations
@@ -26,7 +32,8 @@ import signal
 import socket
 import stat
 import sys
-from collections.abc import Callable, Iterator, Mapping
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,7 +46,11 @@ from ..common.control import CONTROL_RELOAD as CONTROL_RELOAD
 from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
+from ..portal import listen as portal_listen
+from ..portal.app import PortalApp, StaticMissing, load_static
+from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
 from ..portal.passkeys import Passkeys
+from ..portal.server import HEAD_LIMIT, HEADER_DEADLINE, portal_protocol
 from . import logs
 from .admin import AdminApp, AdminSocketError, SetupCodes, check_socket_dir, socket_supported
 from .app import LISTENER_SCOPE_KEY, Listener, VaultApp
@@ -57,6 +68,8 @@ if sys.platform != "win32":
 LOCK_FILE = "vault.lock"
 # Binds a listen address's host and port: its sockets, bound and not yet listening.
 Binder = Callable[[str, int], list[socket.socket]]
+# A name's addresses (portal.listen.Lookup); raises OSError when it doesn't resolve.
+Lookup = Callable[[str], Sequence[str]]
 # How often the timer retires an expired previous gateway key, in seconds.
 GATEWAY_KEY_TICK = 5.0
 # The launcher's control pipe: one command per line.
@@ -240,6 +253,30 @@ class _Server(uvicorn.Server):
         yield
 
 
+class _PortalServer(_Server):
+    """The portal's server: says it listens once it does, and then whether setup is pending."""
+
+    def __init__(self, config: uvicorn.Config, portal: Portal) -> None:
+        super().__init__(config)
+        self.portal = portal
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets)
+        if not self.started:
+            return
+        portal = self.portal
+        logs.event(
+            "portal_listening",
+            listen=portal.address.listen,
+            address=portal.bound,
+            origins=list(portal.app.origins),
+        )
+        hint = portal.app.setup_hint()
+        if hint is not None:
+            # Once per start, and never a code (E.1).
+            logs.event("setup_pending", hint=hint)
+
+
 def _split_listen(listen: str) -> tuple[str, int]:
     host, _, port = listen.rpartition(":")
     return host.strip("[]"), int(port)
@@ -282,6 +319,92 @@ def _close(sockets: list[socket.socket]) -> None:
         sock.close()
 
 
+def lookup_addresses(host: str) -> list[str]:
+    """Every address ``host`` resolves to for a stream socket, as the binder would bind."""
+    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return [str(info[4][0]) for info in infos]
+
+
+def resolve_admin_listen(
+    listen: str,
+    lookup: Lookup = lookup_addresses,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Address:
+    """``admin.listen`` as the one address the portal binds (B.2). A name that doesn't resolve
+    yet is tried again for ``RESOLVE_FOR`` seconds (a network alias appears once the container
+    is on its network); one that resolves to no address or to several is refused at once."""
+    deadline = clock() + RESOLVE_FOR
+    while True:
+        try:
+            return portal_listen.resolve(listen, lookup)
+        except ListenError as exc:
+            raise StartupError(str(exc)) from exc
+        except OSError as exc:
+            if clock() >= deadline:
+                host, _ = portal_listen.split(listen)
+                raise StartupError(f"admin.listen's name {host} doesn't resolve: {exc}") from exc
+        sleep(RESOLVE_EVERY)
+
+
+def _quiet_lookup(lookup: Lookup) -> Lookup:
+    def quiet(host: str) -> Sequence[str]:
+        try:
+            return lookup(host)
+        except OSError:
+            return []  # left to the proxy's own bind, which names it
+
+    return quiet
+
+
+@dataclass(frozen=True)
+class Portal:
+    """The portal to serve: its app, and the address ``admin.listen`` resolved to.
+    ``header_deadline`` is :data:`~zoeymcp.portal.server.HEADER_DEADLINE` but for tests."""
+
+    app: PortalApp
+    address: Address
+    header_deadline: float = HEADER_DEADLINE
+
+    @property
+    def bound(self) -> str:
+        """The address it listens on, as a log line or a refusal names it."""
+        host = self.address.address
+        return f"[{host}]:{self.address.port}" if ":" in host else f"{host}:{self.address.port}"
+
+
+def build_portal(
+    policy: Policy,
+    listens: Sequence[str],
+    *,
+    setup: SetupCodes,
+    passkeys: Passkeys,
+    login: LoginService,
+    lookup: Lookup = lookup_addresses,
+) -> Portal | None:
+    """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
+    at start (B.3): a name that doesn't resolve to exactly one address, an address a ``--listen``
+    has (or its port, with a wildcard on either side), a static file missing. A wildcard beside
+    any ``--listen`` is warned about (``admin_listener_shared``)."""
+    admin = policy.admin
+    if admin is None:
+        logs.event("portal_disabled")
+        return None
+    address = resolve_admin_listen(admin.listen, lookup)
+    clash = portal_listen.conflict(address, listens, _quiet_lookup(lookup))
+    if clash is not None:
+        raise StartupError(f"can't listen on {admin.listen} for the portal: {clash}")
+    if portal_listen.shared(address, listens):
+        logs.event("admin_listener_shared", level="warning", listen=admin.listen, proxy=listens)
+    try:
+        static = load_static()
+    except StaticMissing as exc:
+        raise StartupError(str(exc)) from exc
+    app = PortalApp(admin.origins, static=static, setup=setup, passkeys=passkeys, login=login)
+    return Portal(app, address)
+
+
 def bind_listens(listens: list[str], binder: Binder) -> list[list[socket.socket]]:
     """Bind each ``--listen`` address with ``binder``; one that can't be bound closes the ones
     already bound and is a ``StartupError`` naming it."""
@@ -309,10 +432,22 @@ async def serve(
     gateway_socket: Path | None = None,
     gateway_uid: int | None = None,
     control_fd: int | None = None,
+    portal: Portal | None = None,
     binder: Binder = bind_tcp,
+    stopper: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
+    """Serve every listener until a stop. ``stopper`` is for a caller off the main thread (tests):
+    it is handed the stop function, and no signal handler is installed."""
     # Before any server starts, so an address in use stops the start with its name (B.3).
     bound = bind_listens(listens, binder)
+    portal_sockets: list[socket.socket] | None = None
+    if portal is not None:
+        try:
+            portal_sockets = binder(portal.address.address, portal.address.port)
+        except OSError as exc:
+            for sockets in bound:
+                _close(sockets)
+            raise StartupError(f"can't listen on {portal.bound} for the portal: {exc}") from exc
     servers: list[_Server] = []
     # Each TCP server's bound sockets; uvicorn serves them, and closes them when it stops.
     listening: dict[_Server, list[socket.socket]] = {}
@@ -366,6 +501,27 @@ async def serve(
             )
         )
 
+    if portal is not None and portal_sockets is not None:
+        web = _PortalServer(
+            uvicorn.Config(
+                portal.app,
+                host=portal.address.address,  # unused with sockets given, as for the proxy
+                port=portal.address.port,
+                http=portal_protocol(header_deadline=portal.header_deadline),
+                h11_max_incomplete_event_size=HEAD_LIMIT,
+                ws="none",
+                proxy_headers=False,  # the portal never reads X-Forwarded-* (C.5)
+                server_header=False,
+                date_header=False,
+                access_log=False,
+                log_level="warning",
+                lifespan="off",
+            ),
+            portal,
+        )
+        servers.append(web)
+        listening[web] = portal_sockets
+
     def stop() -> None:
         # Long polls first: the servers wait for every request in flight before they stop.
         app.stop_view_waits()
@@ -373,10 +529,12 @@ async def serve(
             server.should_exit = True
 
     def reload() -> None:
-        reload_policy(app, config, environ)
+        reload_policy(app, config, environ, portal=portal)
 
     loop = asyncio.get_running_loop()
-    if sys.platform != "win32":
+    if stopper is not None:
+        stopper(stop)
+    elif sys.platform != "win32":
         loop.add_signal_handler(signal.SIGTERM, stop)
         loop.add_signal_handler(signal.SIGINT, stop)
         loop.add_signal_handler(signal.SIGHUP, reload)
@@ -427,12 +585,17 @@ async def read_control(
     await control_pipe.read_control(reader, reload=reload, stop=stop, event=logs.event)
 
 
-def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str]) -> None:
+def reload_policy(
+    app: VaultApp, config: str | None, environ: Mapping[str, str], *, portal: Portal | None = None
+) -> None:
     """``SIGHUP``: load and check the policy again, and swap it in if it passes.
 
     Synchronous, like every writer of OAuth state: the token manager keeps its slots and tasks,
     so a reload never starts a second refresh (design D.13). A reload that takes effect wakes the
     gateway's long polls of the view (M3 design D.2).
+
+    The portal takes a changed ``admin.origins`` at once, ending the sessions of an origin that
+    went away; its listener stays where it is until a restart (M5 design B.3).
     """
     try:
         policy = load_policy(config, environ)
@@ -440,6 +603,9 @@ def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str])
         logs.event("reload_refused", reason=str(exc))
         return
     egress_changed = policy.egress_proxy != app.policy.egress_proxy
+    # Where the portal listens: its listener's address, else the running policy's (none).
+    before = app.policy.admin
+    listening = portal.address.listen if portal is not None else before and before.listen
     try:
         # The gateway key generation moves first, and is written before the policy is used.
         reset = app.reload(policy)
@@ -449,7 +615,25 @@ def reload_policy(app: VaultApp, config: str | None, environ: Mapping[str, str])
     if egress_changed:
         # The HTTP clients were built with the old proxy.
         logs.event("egress_proxy_change_needs_restart")
+    if listening != (policy.admin and policy.admin.listen):
+        logs.event("admin_listen_change_needs_restart")
+    if portal is not None and policy.admin is not None:
+        portal.app.reload(policy.admin.origins)
     logs.event("reload_ok", oauth_reset=reset)
+
+
+@dataclass(frozen=True)
+class Vault:
+    """Everything :func:`run` serves, built in the start-up order of M5 design B.4."""
+
+    app: VaultApp
+    gateway_keys: GatewayKeys
+    login: LoginService
+    setup: SetupCodes
+    passkeys: Passkeys
+    admin: AdminApp | None
+    admin_socket: Path | None
+    portal: Portal | None
 
 
 def run(
@@ -471,6 +655,36 @@ def run(
     # Before loading the store, which may rewrite it (key rotation). Not in load_runtime: tests
     # call that twice on one directory in one process.
     acquire_state_lock(state_dir)
+    vault = build(config, listens, state_dir, environ, admin_socket, gateway_socket=gateway_socket)
+    asyncio.run(
+        serve(
+            vault.app,
+            listens,
+            config=config,
+            environ=environ,
+            admin=vault.admin,
+            admin_socket=vault.admin_socket,
+            gateway_keys=vault.gateway_keys,
+            gateway_socket=gateway_socket,
+            gateway_uid=gateway_uid,
+            control_fd=control_fd,
+            portal=vault.portal,
+        )
+    )
+
+
+def build(
+    config: str | None,
+    listens: list[str],
+    state_dir: Path,
+    environ: Mapping[str, str],
+    admin_socket: Path | None,
+    *,
+    gateway_socket: Path | None = None,
+) -> Vault:
+    """With the state lock held: keys, policy, store, gateway keys, the link directory, the
+    journals and the copy, the portal's state files, then the portal (M5 design B.4). Nothing
+    listens yet."""
     runtime = load_runtime(config, state_dir, environ)
     if gateway_socket is not None:
         check_link_dir(gateway_socket)
@@ -522,17 +736,6 @@ def run(
     elif admin_socket is not None:
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
         admin_socket = None
-    asyncio.run(
-        serve(
-            app,
-            listens,
-            config=config,
-            environ=environ,
-            admin=admin,
-            admin_socket=admin_socket,
-            gateway_keys=runtime.gateway_keys,
-            gateway_socket=gateway_socket,
-            gateway_uid=gateway_uid,
-            control_fd=control_fd,
-        )
-    )
+    # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2).
+    portal = build_portal(runtime.policy, listens, setup=setup, passkeys=passkeys, login=login)
+    return Vault(app, runtime.gateway_keys, login, setup, passkeys, admin, admin_socket, portal)

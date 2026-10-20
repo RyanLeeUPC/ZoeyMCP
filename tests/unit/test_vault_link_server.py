@@ -589,7 +589,7 @@ def _serve_with_control(
         return reader, pipe
 
     monkeypatch.setattr(server, "open_control", open_control)
-    monkeypatch.setattr(server, "reload_policy", lambda *args: reloads.append(args))
+    monkeypatch.setattr(server, "reload_policy", lambda *args, **kw: reloads.append(args))
 
     async def main() -> list[asyncio.Task[Any]]:
         await server.serve(
@@ -915,7 +915,7 @@ def test_the_real_link_and_control_pipe(
     check_link_dir(sock)
     app = _link_vault(tmp_path)
     reloads: list[Any] = []
-    monkeypatch.setattr(server, "reload_policy", lambda *args: reloads.append(args))
+    monkeypatch.setattr(server, "reload_policy", lambda *args, **kw: reloads.append(args))
     read, write = os.pipe()
 
     async def main() -> list[int]:

@@ -89,8 +89,9 @@ STATUSES = {
     500: ["not_written"],
     503: ["busy", "unavailable"],
 }
-# Beyond M.2's list: the store's byte limit (step 4b) and the token manager's unknown credential.
-EXTRA = {"value_too_large": 409, "not_configured": 400}
+# Beyond M.2's list: the store's byte limit (step 4b), the token manager's unknown credential, and
+# the shell's answer when a handler fails (step 10b).
+EXTRA = {"value_too_large": 409, "not_configured": 400, "internal": 500}
 
 # M.2's quoted texts, exactly.
 TEXTS = {

@@ -101,7 +101,7 @@ say so.
 | R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, and (in managed mode) policy editing | Must |
 | R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only | Must |
 | R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion) for every security-relevant save: writing a secret, changing policy, re-pinning a tool, moving a tool from `approve` to `allow`, changing a connector's constraints | Must |
-| R63 | **Browser hardening:** strict `Host` and `Origin` allowlists (stopping DNS rebinding), `Sec-Fetch-Site: same-origin` on state-changing requests, `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `SameSite=Strict` session cookies, no third-party assets. The OAuth callback is the only exception (§7.3) | Must |
+| R63 | **Browser hardening:** the exact origins the operator lists drive the `Host` and `Origin` checks (stopping DNS rebinding); every API request needs `Sec-Fetch-Site: same-origin`, and every state change is a `fetch()` with `POST` or `DELETE` carrying the page's own `Origin` (no forms); every answer carries a CSP with no inline script or style, `form-action 'none'`, `frame-ancestors 'none'` and Trusted Types, plus `nosniff`, `no-referrer`, `no-store`, COOP, CORP and `X-Frame-Options: DENY`; `SameSite=Strict` session cookies; no third-party assets. The OAuth callback is the only exception (§7.3) | Must |
 | R64 | **One source of truth for policy**, chosen per deployment: **managed** (the portal is the source; export/import YAML) or **declarative** (a config file or env var is the source; the portal can't edit policy and produces diffs to commit instead). Never both | Must |
 | R65 | **Bootstrap:** a random **one-time setup code**, issued on demand with `docker exec` (none exists until then), never logged, valid for 15 minutes, spent when it is redeemed, and invalidated when the first passkey is enrolled. Whether enrolling with it replaces every passkey is decided when it is issued (`--reset`). Recovery from lost passkeys follows the same path, so it needs host access | Must |
 | R66 | Managed policy is **versioned**: every save is a new version with its diff, authenticated with a config key (§4.5) and a monotonic counter, so a replayed older version is refused. One-click rollback creates a new version | Must |
@@ -1308,13 +1308,45 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
 
 ### 7.3 Browser hardening
 
-- `Host` must be in the configured allowlist (by default `localhost`, `127.0.0.1` and the
-  configured public name). This stops DNS-rebinding attacks against the loopback listener.
-- State-changing requests need `Origin` in the allowlist and `Sec-Fetch-Site: same-origin`, plus a
-  CSRF token.
-- On every response: `Content-Security-Policy: default-src 'self'; frame-ancestors 'none';
-  base-uri 'none'; form-action 'self'`, `X-Content-Type-Options: nosniff`,
-  `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on API responses.
+The portal has its own listener (`admin.listen`), and `admin.origins` lists the exact origins the
+browser uses, such as `http://localhost:8081` or `https://zoeymcp.tailnet.example`. Each request
+is checked in a fixed order, and nothing is read from a body before the checks that need no body
+have passed:
+
+- **In flight:** at most 32 requests at once, at most 8 of them on the routes that need no
+  session; beyond that, `503` with `Retry-After`.
+- **`Host`:** exactly one, equal to a listed origin's host and port. This stops DNS rebinding:
+  an attacker's name stays in `Host`. A `GET /` to a loopback IP literal is redirected to the
+  listed `http://localhost` origin with the same port, since passkeys don't work on IP addresses;
+  any other request with a wrong `Host` gets `421`.
+- **Methods:** `GET`, `POST` and `DELETE` only. No preflight is answered and no
+  `Access-Control-*` header is ever sent.
+- **Paths:** the static files (the page, its script and its stylesheet) are served to any
+  navigation; every other path outside `/api/` is `404`.
+- **`/api/`:** exactly one `Sec-Fetch-Site: same-origin` (a page on another localhost port is
+  `same-site`, and refused). A `POST` or `DELETE` needs exactly one `Origin`, equal to the
+  request's own origin; a form post under `no-referrer` sends `null`, which never matches.
+- **Bodies:** `Content-Type: application/json` and a `Content-Length` within the route's cap, then
+  a session (or, on the routes before login, a token from a rate bucket), and only then the body,
+  read within a deadline and parsed strictly.
+- **Sessions:** two halves: an `HttpOnly`, `SameSite=Strict` cookie whose name carries the port,
+  and a header token the page keeps in `sessionStorage`. The header token is the CSRF token.
+- **Every answer** carries:
+  `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self';
+  img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none';
+  frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin` and
+  `X-Frame-Options: DENY`. The CSP is a header, never a `<meta>`, because `frame-ancestors` is
+  ignored there. The page loads its script and stylesheet from the vault only, with no inline
+  script, style or event handler, and every state change is a `fetch()` with
+  `redirect: "error"`; there are no forms.
+- **Connections:** a request head must arrive within 10 seconds of the connection opening or of
+  the previous answer, and at most 64 connections are open; a new one beyond that closes the one
+  idle longest.
+- **Reverse proxies:** the vault never reads `X-Forwarded-*` or `Forwarded`. A TLS proxy in front
+  must pass the original `Host` (Caddy does by default). nginx's `proxy_set_header Host $host`
+  drops the port, so an origin with a non-default port needs `proxy_set_header Host $http_host`.
 - **The OAuth callback is the one exception.** It arrives as a cross-site, top-level navigation,
   so the same-origin rule and the strict cookie don't apply to it. It accepts only a top-level
   `GET`, and it is validated by a **single-use, server-side `state`**: tied to the portal session

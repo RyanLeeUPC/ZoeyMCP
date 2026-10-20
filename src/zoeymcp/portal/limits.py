@@ -11,6 +11,8 @@ clock), and the shell applies the answers.
   body is read).
 - **The connection table**: at most :data:`ADMIN_CONNECTIONS` open; a new one beyond it closes
   the one idle longest, or is closed itself when every one has a request in flight.
+- **Sparse log lines**: a refusal or an eviction is logged at most once per interval per kind,
+  with a count (M.4).
 """
 
 from __future__ import annotations
@@ -136,3 +138,26 @@ class Connections[K: Hashable]:
 
     def close(self, conn: K) -> None:
         self._idle_since.pop(conn, None)
+
+
+class Sparse[K: Hashable]:
+    """At most one log line per key every ``interval`` seconds (M.4: ``portal_refused``,
+    ``portal_connection_evicted``), each counting the events since the last line, so a flood
+    can't flood the log. The first event of a key is logged at once."""
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._last: dict[K, float] = {}
+        self._held: dict[K, int] = {}
+
+    def note(self, key: K, now: float) -> int | None:
+        """Count one event of ``key``: the count to log with it (this one and those held back
+        since the last line), or None to hold it back."""
+        held = self._held.get(key, 0) + 1
+        last = self._last.get(key)
+        if last is not None and now - last < self._interval:
+            self._held[key] = held
+            return None
+        self._last[key] = now
+        self._held[key] = 0
+        return held

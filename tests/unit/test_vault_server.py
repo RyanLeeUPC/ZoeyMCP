@@ -927,3 +927,291 @@ def test_run_serves_with_an_unreadable_copy(
     server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path, env(), None)
     assert seen == ["unavailable"]
     assert '"event":"ledger_reported_unavailable"' in log_buffer.getvalue()
+
+
+# --- the portal's listener (M5 design B.2-B.4) ----------------------------------------------------
+
+
+def _portal_pieces(tmp_path: Path) -> dict[str, Any]:
+    from zoeymcp.portal.passkeys import Passkeys
+
+    keys = KeySet.from_text(generate_master_key())
+    return {
+        "setup": SetupCodes(tmp_path, keys.portal_key),
+        "passkeys": Passkeys.load(tmp_path, keys.portal_key),
+        "login": LoginService(cast(Any, None)),
+    }
+
+
+def _admin_policy(example_text: str, listen: str) -> Any:
+    from zoeymcp.common.policy import parse_policy
+
+    return parse_policy(example_text.replace("listen: 127.0.0.1:8081", f"listen: {listen}"), "t")
+
+
+def _without_admin(example_text: str) -> str:
+    lines = example_text.splitlines(keepends=True)
+    start = lines.index("admin:\n")
+    text = "".join(lines[:start] + lines[start + 4 :])
+    assert "admin" not in text.split("credentials:")[0]
+    return text
+
+
+def test_no_admin_block_no_portal(tmp_path: Path, log_buffer: io.StringIO) -> None:
+    from zoeymcp.common.policy import Policy
+
+    policy = Policy.model_validate({"version": 1, "mode": "declarative"})
+    assert server.build_portal(policy, [], **_portal_pieces(tmp_path)) is None
+    assert [line["event"] for line in _log_lines(log_buffer)][-1] == "portal_disabled"
+
+
+def test_the_portal_shares_the_sockets_setup_codes_passkeys_and_logins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:8080"], tmp_path, env(), tmp_path / "admin.sock")
+    portal, admin = seen["portal"], seen["admin"]
+    assert portal.app.setup is admin._setup
+    assert portal.app.passkeys is admin._passkeys
+    assert portal.app.login is admin._login
+    assert (portal.address.address, portal.address.port) == ("127.0.0.1", 8081)
+    assert portal.app.origins == ("http://localhost:8081", "https://zoeymcp.tailnet.example")
+
+
+def test_the_portal_is_built_without_the_socket_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: False)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:8080"], tmp_path, env(), None)
+    assert seen["admin"] is None
+    assert seen["portal"].app.setup.path == tmp_path / "setup.json"
+
+
+@pytest.mark.parametrize(
+    ("listen", "listens", "reason"),
+    [
+        ("127.0.0.1:8081", ["127.0.0.1:8081"], "is --listen 127.0.0.1:8081's address"),
+        ("127.0.0.1:8080", ["0.0.0.0:8080", "[::]:8080"], "and --listen 0.0.0.0:8080 share"),
+        ("0.0.0.0:8080", ["127.0.0.1:8080"], "and --listen 127.0.0.1:8080 share port 8080"),
+    ],
+)
+def test_a_portal_on_the_proxys_address_is_refused(
+    tmp_path: Path, example_text: str, listen: str, listens: list[str], reason: str
+) -> None:
+    policy = _admin_policy(example_text, listen)
+    refused = f"^can't listen on {re.escape(listen)} for the portal: admin.listen "
+    with pytest.raises(StartupError, match=refused + re.escape(f"{listen} {reason}")):
+        server.build_portal(policy, listens, **_portal_pieces(tmp_path))
+
+
+def test_a_wildcard_portal_beside_the_proxy_is_warned_about(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    policy = _admin_policy(example_text, "0.0.0.0:8081")
+    portal = server.build_portal(policy, ["127.0.0.1:8080"], **_portal_pieces(tmp_path))
+    assert portal is not None
+    assert portal.address.wildcard
+    shared = [x for x in _log_lines(log_buffer) if x["event"] == "admin_listener_shared"]
+    assert [(x["level"], x["listen"], x["proxy"]) for x in shared] == [
+        ("warning", "0.0.0.0:8081", ["127.0.0.1:8080"])
+    ]
+    assert server.build_portal(policy, [], **_portal_pieces(tmp_path / "b")) is not None
+    shared = [x for x in _log_lines(log_buffer) if x["event"] == "admin_listener_shared"]
+    assert len(shared) == 1
+
+
+def test_a_portal_name_must_resolve_to_one_address(tmp_path: Path, example_text: str) -> None:
+    policy = _admin_policy(example_text, "vault-portal:8081")
+
+    def two(host: str) -> list[str]:
+        assert host == "vault-portal"
+        return ["172.20.0.3", "172.21.0.3"]
+
+    with pytest.raises(StartupError, match=r"^admin\.listen's name vault-portal resolves to 2 "):
+        server.build_portal(policy, [], lookup=two, **_portal_pieces(tmp_path))
+    portal = server.build_portal(
+        policy, [], lookup=lambda host: ["172.20.0.3"], **_portal_pieces(tmp_path / "b")
+    )
+    assert portal is not None
+    assert portal.bound == "172.20.0.3:8081"
+
+
+def test_a_name_that_doesnt_resolve_yet_is_retried_for_ten_seconds() -> None:
+    now = [0.0]
+    slept: list[float] = []
+    answers: list[list[str] | None] = [None, None, ["172.20.0.3"]]
+
+    def lookup(host: str) -> list[str]:
+        answer = answers.pop(0)
+        if answer is None:
+            raise socket.gaierror(-2, "Name or service not known")
+        return answer
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += seconds
+
+    found = server.resolve_admin_listen(
+        "vault-portal:8081", lookup, sleep=sleep, clock=lambda: now[0]
+    )
+    assert (found.address, slept) == ("172.20.0.3", [0.5, 0.5])
+
+    def never(host: str) -> list[str]:
+        raise socket.gaierror(-2, "Name or service not known")
+
+    slept.clear()
+    now[0] = 0.0
+    with pytest.raises(StartupError, match=r"^admin\.listen's name vault-portal doesn't resolve: "):
+        server.resolve_admin_listen("vault-portal:8081", never, sleep=sleep, clock=lambda: now[0])
+    assert len(slept) == 20
+    assert now[0] == 10.0
+
+
+def test_a_name_with_several_addresses_is_refused_at_once() -> None:
+    slept: list[float] = []
+    with pytest.raises(StartupError, match="resolves to 2 addresses"):
+        server.resolve_admin_listen(
+            "vault-portal:8081", lambda host: ["10.0.0.1", "10.0.0.2"], sleep=slept.append
+        )
+    assert slept == []
+
+
+def test_the_real_lookup_answers_a_literal() -> None:
+    assert set(server.lookup_addresses("127.0.0.1")) == {"127.0.0.1"}
+
+
+def test_a_missing_static_file_stops_the_start(
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zoeymcp.portal import app as portal_app
+
+    static = tmp_path / "static"
+    static.mkdir(mode=0o700)
+    for name in ("index.html", "app.js", "app.css"):
+        (static / name).write_bytes(b"")
+    monkeypatch.setattr(server, "load_static", lambda: portal_app.load_static(static))
+    policy = _admin_policy(example_text, "127.0.0.1:8081")
+    with pytest.raises(
+        StartupError, match=r"^the portal's static file webauthn\.js can't be read$"
+    ):
+        server.build_portal(policy, [], **_portal_pieces(tmp_path))
+
+
+def test_the_packaged_static_files_load() -> None:
+    from zoeymcp.portal.app import load_static
+    from zoeymcp.portal.routes import STATIC
+
+    loaded = load_static()
+    assert set(loaded) == set(STATIC)
+    assert loaded["/"].startswith(b"<!doctype html>")
+
+
+def test_a_portal_address_in_use_is_a_startup_error(
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    bound: list[socket.socket] = []
+
+    def binder(host: str, port: int) -> list[socket.socket]:
+        sockets = server.bind_tcp(host, port)
+        bound.extend(sockets)
+        return sockets
+
+    def no_server(*args: Any) -> None:
+        raise AssertionError("a server was built before every address was bound")
+
+    class App:
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(server, "_Server", no_server)
+    monkeypatch.setattr(server, "_PortalServer", no_server)
+    with _occupied() as occupied:
+        port = occupied.getsockname()[1]
+        policy = _admin_policy(example_text, f"127.0.0.1:{port}")
+        portal = server.build_portal(policy, ["127.0.0.1:0"], **_portal_pieces(tmp_path))
+        refused = f"^can't listen on 127.0.0.1:{port} for the portal: {IN_USE}"
+        with pytest.raises(StartupError, match=refused):
+            asyncio.run(
+                server.serve(
+                    cast(VaultApp, App()),
+                    ["127.0.0.1:0"],
+                    config=None,
+                    environ={},
+                    portal=portal,
+                    binder=binder,
+                )
+            )
+    # The proxy's socket, bound first, is closed again, and the vault never started.
+    assert len(bound) == 1
+    assert bound[0].fileno() == -1
+    assert "vault_started" not in log_buffer.getvalue()
+
+
+def test_the_portal_bound_address_is_bracketed_for_ipv6() -> None:
+    from zoeymcp.portal.listen import resolve
+
+    portal = server.Portal(cast(Any, None), resolve("[::1]:8081", lambda host: []))
+    assert portal.bound == "[::1]:8081"
+    assert portal.header_deadline == 10.0
+
+
+def test_a_reload_moves_the_origins_and_names_a_listen_change(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    app = _app(tmp_path)
+    portal = server.build_portal(app.policy, [], **_portal_pieces(tmp_path))
+    assert portal is not None
+
+    def reload(text: str) -> list[str]:
+        path = tmp_path / "next.yaml"
+        path.write_text(text, encoding="utf-8")
+        start = len(_log_lines(log_buffer))
+        server.reload_policy(app, str(path), env(), portal=portal)
+        return [line["event"] for line in _log_lines(log_buffer)[start:]]
+
+    fewer = example_text.replace(", https://zoeymcp.tailnet.example]", "]")
+    assert reload(fewer) == ["reload_ok"]
+    assert portal.app.origins == ("http://localhost:8081",)
+    moved = fewer.replace("listen: 127.0.0.1:8081", "listen: 127.0.0.1:8082")
+    assert reload(moved) == ["admin_listen_change_needs_restart", "reload_ok"]
+    # Removed: the listener stays, with the origins it had, until a restart.
+    assert reload(_without_admin(example_text)) == [
+        "admin_listen_change_needs_restart",
+        "reload_ok",
+    ]
+    assert portal.app.origins == ("http://localhost:8081",)
+    asyncio.run(app.aclose())
+
+
+def test_a_reload_without_a_portal_names_an_added_block(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    without = tmp_path / "without.yaml"
+    without.write_text(_without_admin(example_text), encoding="utf-8")
+    runtime = load_runtime(str(without), tmp_path / "state", env())
+    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+    server.reload_policy(app, str(without), env())
+    assert "admin_listen_change_needs_restart" not in log_buffer.getvalue()
+    added = tmp_path / "added.yaml"
+    added.write_text(example_text, encoding="utf-8")
+    server.reload_policy(app, str(added), env())
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert events[-2:] == ["admin_listen_change_needs_restart", "reload_ok"]
+    asyncio.run(app.aclose())

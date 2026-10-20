@@ -19,6 +19,7 @@ from zoeymcp.portal.limits import (
     Connections,
     InFlight,
     Opened,
+    Sparse,
     Ticket,
 )
 
@@ -314,3 +315,26 @@ TestLimitsMachine = LimitsMachine.TestCase
 TestLimitsMachine.settings = hypothesis_settings(
     max_examples=50, stateful_step_count=20, deadline=None
 )
+
+
+# --- sparse log lines (M.4) -----------------------------------------------------------------------
+
+
+def test_sparse_logs_the_first_at_once_then_counts_what_it_held() -> None:
+    sparse: Sparse[str] = Sparse(10.0)
+    assert sparse.note("wrong_host", T0) == 1
+    assert [sparse.note("wrong_host", T0 + s) for s in (1, 5, 9.999)] == [None] * 3
+    # Each key on its own clock.
+    assert sparse.note("cross_site", T0 + 2) == 1
+    # At the interval: this one and the three held back.
+    assert sparse.note("wrong_host", T0 + 10) == 4
+    assert sparse.note("wrong_host", T0 + 11) is None
+    assert sparse.note("wrong_host", T0 + 30) == 2
+    assert sparse.note("cross_site", T0 + 12) == 1
+
+
+def test_sparse_holds_back_when_the_clock_steps_back() -> None:
+    sparse: Sparse[str] = Sparse(60.0)
+    assert sparse.note("evicted", T0) == 1
+    assert sparse.note("evicted", T0 - 100) is None
+    assert sparse.note("evicted", T0 + 60) == 2

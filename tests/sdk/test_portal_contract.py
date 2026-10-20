@@ -16,21 +16,34 @@ reaches ``scope["headers"]`` as sent, whatever the request target says, and an a
 target becomes the path, which no portal route has. Starlette's ``request.cookies`` keeps one of
 two cookies of one name, so admission reads every value from the raw ``Cookie`` headers.
 
+38 and 40 pin what the portal's listener relies on in uvicorn 0.54 (design B.3). uvicorn's own
+answers (a request it can't parse, a head over the cap) are plain text with none of the portal's
+headers, so nothing a browser renders comes from them. Its keep-alive timer starts only after a
+response and dies at the next byte, so it can't bound a trickled head; ``PortalH11`` keeps a
+deadline of its own and a connection cap, given to uvicorn as ``Config(http=<class>)``.
+
 41 pins why the vault binds its TCP sockets itself (design B.3, D17). uvicorn 0.54's
 ``Server.startup`` calls ``sys.exit`` when it can't bind a host and port, which would end the
 vault inside its servers' gather with no line of its own. Given sockets already bound, it listens
 on them and serves them, and closes them when it stops.
+
+42's offline half checks what a unit test can: the dev venv is an editable install, so it can't
+see a wheel, but the build config and the ignore files show the static files aren't dropped. The
+image smoke checks the installed package (from step 17a).
 """
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import socket
 import threading
 import time
+import tomllib
 import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import h11
@@ -53,8 +66,14 @@ from cryptography.utils import CryptographyDeprecationWarning
 from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
 from uvicorn.config import STARTUP_FAILURE
+from uvicorn.protocols.http.h11_impl import H11Protocol
+from uvicorn.server import ServerState
 
 from tests.fakes.authenticator import PublicKey, spki
+from zoeymcp.portal.app import PortalApp, load_static
+from zoeymcp.portal.limits import ADMIN_CONNECTIONS
+from zoeymcp.portal.routes import STATIC
+from zoeymcp.portal.server import HEAD_LIMIT, portal_protocol
 
 MESSAGE = b"authenticator data and the client data hash"
 P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -347,3 +366,262 @@ def test_uvicorn_serves_a_socket_bound_beforehand() -> None:
     assert answer.startswith(b"HTTP/1.1 200 OK")
     assert len(app.scopes) == 1
     assert sock.fileno() == -1  # closed when the server stopped
+
+
+# --- 38. uvicorn's own answers carry none of the portal's headers ---------------------------------
+
+
+@contextmanager
+def _portal_server(app: Any, *, header_deadline: float = 10.0) -> Iterator[int]:
+    """uvicorn with ``PortalH11``, configured as the vault configures the portal's listener."""
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=0,
+        http=portal_protocol(header_deadline=header_deadline),
+        h11_max_incomplete_event_size=HEAD_LIMIT,
+        ws="none",
+        lifespan="off",
+        log_level="critical",
+        server_header=False,
+        date_header=False,
+    )
+    server = _ThreadServer(config)
+    thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while not server.started:
+        assert thread.is_alive()
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    try:
+        yield server.servers[0].sockets[0].getsockname()[1]
+    finally:
+        server.should_exit = True
+        thread.join(STARTUP_TIMEOUT)
+
+
+def _shell() -> PortalApp:
+    return PortalApp(["http://localhost:8081"], static=load_static())
+
+
+def _assert_uvicorns_400(answer: bytes) -> None:
+    head, _, body = answer.partition(CRLF + CRLF)
+    lines = head.lower().split(CRLF)
+    assert lines[0] == b"http/1.1 400 bad request"
+    assert b"content-type: text/plain; charset=utf-8" in lines
+    assert body == b"Invalid HTTP request received."
+    assert not [line for line in lines if line.startswith((b"content-security", b"x-zoeymcp"))]
+
+
+def test_uvicorns_own_answers_are_plain_text_without_the_portals_headers() -> None:
+    with _portal_server(_shell()) as port:
+        _assert_uvicorns_400(_exchange(port, b"garbage" + CRLF + CRLF))
+
+
+def test_a_head_over_the_cap_is_refused_while_it_is_still_coming() -> None:
+    """h11 checks ``max_incomplete_event_size`` only while a head is incomplete: a head over it
+    is refused once its buffered part passes the cap. (One that arrives whole in a single read
+    is parsed whatever its size, up to the transport's read size: the cap bounds what a slow
+    head can make the vault hold, not every head.)"""
+    pad = b"X-Pad: " + b"a" * (HEAD_LIMIT + 1)
+    app = _Recorder()
+    with (
+        _portal_server(app) as port,
+        socket.create_connection(("127.0.0.1", port), timeout=STARTUP_TIMEOUT) as sock,
+    ):
+        sock.sendall(b"GET / HTTP/1.1" + CRLF + b"Host: localhost:8081" + CRLF)
+        time.sleep(0.1)
+        sock.sendall(pad)  # still no end to the head; nothing more is sent
+        answer = b""
+        while chunk := sock.recv(65536):
+            answer += chunk
+    assert app.scopes == []
+    _assert_uvicorns_400(answer)
+
+
+# --- 40. the keep-alive timer can't carry a head deadline; PortalH11's own timer does ----------
+
+
+class _Transport:
+    """Enough of an asyncio transport for uvicorn's protocol to run on."""
+
+    def __init__(self) -> None:
+        self.written = b""
+        self.closing = False
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        return {"peername": ("127.0.0.1", 50000), "sockname": ("127.0.0.1", 8081)}.get(name)
+
+    def write(self, data: bytes) -> None:
+        self.written += data
+
+    def is_closing(self) -> bool:
+        return self.closing
+
+    def close(self) -> None:
+        self.closing = True
+
+    def pause_reading(self) -> None:
+        pass
+
+    def resume_reading(self) -> None:
+        pass
+
+
+def test_uvicorns_keep_alive_timer_starts_after_a_response_and_dies_at_any_byte() -> None:
+    async def main() -> list[bool]:
+        config = uvicorn.Config(_Recorder(), http="h11", lifespan="off", log_level="critical")
+        config.load()
+        protocol = H11Protocol(config, ServerState(), {}, _loop=asyncio.get_running_loop())
+        transport = _Transport()
+        protocol.connection_made(transport)  # type: ignore[arg-type]
+        armed_at_start = protocol.timeout_keep_alive_task is not None
+        protocol.data_received(_head(b"GET / HTTP/1.1", b"Host: localhost:8081"))
+        for _ in range(100):
+            if protocol.timeout_keep_alive_task is not None:
+                break
+            await asyncio.sleep(0.01)
+        armed_after_response = protocol.timeout_keep_alive_task is not None
+        protocol.data_received(b"G")  # one byte of a next head, nowhere near a request
+        armed_after_a_byte = protocol.timeout_keep_alive_task is not None
+        protocol.connection_lost(None)
+        return [armed_at_start, armed_after_response, armed_after_a_byte]
+
+    assert asyncio.run(main()) == [False, True, False]
+
+
+def test_a_protocol_subclass_is_taken_as_the_http_class() -> None:
+    protocol = portal_protocol()
+    config = uvicorn.Config(_Recorder(), http=protocol, lifespan="off")
+    config.load()
+    assert config.http_protocol_class is protocol
+    assert issubclass(protocol, H11Protocol)
+    # Each listener has its own table.
+    assert protocol.listener.connections is not portal_protocol().listener.connections
+
+
+SHORT = 0.5
+
+
+def _closed(sock: socket.socket, within: float) -> bool:
+    sock.settimeout(within)
+    try:
+        while sock.recv(65536):
+            pass
+    except TimeoutError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _trickle(sock: socket.socket, data: bytes) -> bool:
+    """A byte every 20 ms; False if the server closed first."""
+    for index in range(len(data)):
+        try:
+            sock.sendall(data[index : index + 1])
+        except OSError:
+            return False
+        if _closed(sock, 0.02):
+            return False
+    return True
+
+
+def test_portal_h11_closes_a_silent_connection_at_the_deadline() -> None:
+    with (
+        _portal_server(_Recorder(), header_deadline=SHORT) as port,
+        socket.create_connection(("127.0.0.1", port)) as sock,
+    ):
+        assert not _closed(sock, SHORT / 2)
+        assert _closed(sock, SHORT + 2)
+
+
+def test_portal_h11_closes_a_trickled_first_head_at_the_deadline() -> None:
+    app = _Recorder()
+    with (
+        _portal_server(app, header_deadline=SHORT) as port,
+        socket.create_connection(("127.0.0.1", port)) as sock,
+    ):
+        started = time.monotonic()
+        assert not _trickle(sock, _head(b"GET / HTTP/1.1", b"X-Pad: " + b"a" * 300))
+        assert SHORT - 0.1 <= time.monotonic() - started < SHORT + 2
+    assert app.scopes == []
+
+
+def test_portal_h11_closes_a_second_head_trickled_after_a_response() -> None:
+    app = _Recorder()
+    with (
+        _portal_server(app, header_deadline=SHORT) as port,
+        socket.create_connection(("127.0.0.1", port)) as sock,
+    ):
+        sock.sendall(_head(b"GET / HTTP/1.1", b"Host: localhost"))
+        answer = b""
+        while not answer.endswith(b"0" + CRLF + CRLF):  # the recorder's answer is chunked
+            answer += sock.recv(65536)
+        started = time.monotonic()
+        assert not _trickle(sock, _head(b"GET / HTTP/1.1", b"X-Pad: " + b"a" * 300))
+        # Well before uvicorn's own keep-alive of 5 s, which every byte put off.
+        assert time.monotonic() - started < SHORT + 2
+    assert len(app.scopes) == 1
+
+
+def test_portal_h11_evicts_the_longest_idle_and_lets_an_operator_in() -> None:
+    with _portal_server(_Recorder(), header_deadline=60) as port:
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(ADMIN_CONNECTIONS)]
+        try:
+            time.sleep(0.2)  # every one accepted, in order
+            answer = _exchange(port, _head(b"GET / HTTP/1.1", b"Host: localhost"))
+            assert answer.startswith(b"HTTP/1.1 200 OK")
+            assert _closed(idle[0], 5)
+            assert not _closed(idle[1], 0.2)
+            # The operator's connection closed with its answer, so one more fits; the next
+            # evicts the longest idle again.
+            with (
+                socket.create_connection(("127.0.0.1", port)) as refill,
+                socket.create_connection(("127.0.0.1", port)) as extra,
+            ):
+                assert _closed(idle[1], 5)
+                assert not _closed(idle[2], 0.2)
+                assert not _closed(refill, 0.2)
+                assert not _closed(extra, 0.2)
+        finally:
+            for sock in idle:
+                sock.close()
+
+
+# --- 42 (offline half). The static files ship ---------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[2]
+STATIC_DIR = ROOT / "src" / "zoeymcp" / "portal" / "static"
+
+
+def test_the_wheel_takes_the_whole_package() -> None:
+    """hatchling ships every file under the package that git doesn't ignore: no exclude, no
+    include list, no artifacts filter can drop the static files."""
+    with (ROOT / "pyproject.toml").open("rb") as file:
+        build = tomllib.load(file)["tool"]["hatch"]["build"]
+    assert build == {"targets": {"wheel": {"packages": ["src/zoeymcp"]}}}
+
+
+@pytest.mark.parametrize("ignore", [".gitignore", ".dockerignore"])
+def test_no_ignore_file_drops_the_static_files(ignore: str) -> None:
+    patterns = [
+        line.strip()
+        for line in (ROOT / ignore).read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    for file in STATIC.values():
+        relative = (STATIC_DIR / file.name).relative_to(ROOT).as_posix()
+        parts = relative.split("/")
+        # Every pattern against the whole path, each of its prefixes and each component, so a
+        # gitignore pattern (any depth) and a dockerignore one (from the root) are both covered.
+        candidates = {relative, *parts, *("/".join(parts[:n]) for n in range(1, len(parts)))}
+        matched = [p for p in patterns if any(fnmatch.fnmatch(c, p.strip("/")) for c in candidates)]
+        assert matched == [], (relative, matched)
+
+
+def test_every_static_file_is_in_the_source_tree() -> None:
+    assert sorted(path.name for path in STATIC_DIR.iterdir()) == sorted(
+        file.name for file in STATIC.values()
+    )

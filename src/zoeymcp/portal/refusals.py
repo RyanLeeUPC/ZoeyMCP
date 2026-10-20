@@ -116,6 +116,7 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             400, "A passkey name is 1 to 64 characters on one line, with no hidden characters."
         ),
         "not_written": Entry(500, "Not written to disk; nothing changed; check the state volume."),
+        "internal": Entry(500, "The portal failed to answer that; the vault's log has the cause."),
         # Secrets (G); the socket keeps its own texts.
         "invalid_name": Entry(
             400,
