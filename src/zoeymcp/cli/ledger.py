@@ -99,6 +99,12 @@ def write_json(out: TextIO, records: Iterable[dict[str, Any]]) -> None:
 # --- the vault's reported copy (M5 design J.4, J.5) ----------------------------------------------
 
 RESTART_HINT = "after deciding why, run: zoeymcp ledger --vault --restart-chain"
+# An orphan send's flag (J.5), in words; one this CLI doesn't know is printed as it is.
+ORPHAN_WORDS = {
+    "no_ledger_record": "no ledger record holds its call",
+    "not_yet_reported": "not reported yet",
+    "older_than_copy": "older than the ledger copy: can't be checked",
+}
 
 
 def vault_lines(page: dict[str, Any]) -> list[str]:
@@ -121,9 +127,11 @@ def vault_lines(page: dict[str, Any]) -> list[str]:
     for row in reversed(page["rows"]):
         out.extend(_row_lines(row))
     for orphan in page["orphans"]:
+        flag = orphan["flag"]
+        words = f"{flag}: {ORPHAN_WORDS[flag]}" if flag in ORPHAN_WORDS else flag
         out.append(
             f"orphan send {orphan['key']} on {orphan['connector']}: {orphan['state']} at "
-            f"{orphan['at']} ({orphan['flag']})"
+            f"{orphan['at']} ({words})"
         )
     for epoch in page.get("archives", []):
         line = f"archived {epoch['name']}: {_epoch(epoch)}"

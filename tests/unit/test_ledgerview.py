@@ -1,7 +1,9 @@
 """The ledger view: rows, pages, flags and the journal join (M5 design J.5, J.6).
 
 The records are ``test_ledgerjoin``'s, which ``zoeymcp ledger`` is pinned against too: a vault
-written ``approved_elsewhere`` and a ``pending`` decision are among them.
+written ``approved_elsewhere`` and a ``pending`` decision are among them. An orphan is judged
+against the live chain and the kept archived epochs (their :class:`Coverage`), each flag at its
+boundaries.
 """
 
 from __future__ import annotations
@@ -11,12 +13,14 @@ from typing import Any
 
 import pytest
 
-from tests.unit.test_ledgerjoin import RECORDS, REF_A, REF_B, REF_C, REF_D, T, asked, record
+from tests.unit.test_ledgerjoin import RECORDS, REF_A, REF_B, REF_C, REF_D, REF_E, T, asked, record
 from zoeymcp.common.policy.schema import Policy
 from zoeymcp.vault.ledgerview import (
     MAX_LIMIT,
     NAMED,
+    Coverage,
     Send,
+    coverage,
     known,
     orphans,
     page,
@@ -313,7 +317,7 @@ def test_orphans() -> None:
         Send("mail", "3333333333333333.1", "unknown", None, received + 1, received + 1),
         Send("mail", f"{REF_A}.1", "sent", 250, received - 9, received - 9),
     ]
-    assert orphans(found, {REF_A}, received) == [
+    assert orphans(found, Coverage(frozenset({REF_A})), received) == [
         {
             "connector": "mail",
             "key": "3333333333333333.1",
@@ -336,7 +340,103 @@ def test_orphans() -> None:
             "flag": "no_ledger_record",  # the copy received a report after it began
         },
     ]
-    assert [o["flag"] for o in orphans(found, set(), None)] == ["not_yet_reported"] * 4
+    assert [o["flag"] for o in orphans(found, Coverage(), None)] == ["not_yet_reported"] * 4
+
+
+def test_a_send_older_than_the_copy_cant_be_checked() -> None:
+    """``older_than_copy``: reported since, but begun before the copy's earliest record (its
+    call pruned, or its epoch dropped); one begun exactly then is in the span, and an orphan."""
+    received = HELD.received_ms
+    assert received is not None
+    first = received - 100
+    found = [
+        Send("mail", "1111111111111111.1", "sent", 250, first, first + 1),
+        Send("mail", "2222222222222222.1", "sent", 250, first - 1, first + 2),
+        Send("mail", "3333333333333333.1", "failed", 554, first - 99, first - 98),
+        Send("mail", f"{REF_A}.1", "sent", 250, first - 50, first - 49),  # its call is held
+    ]
+    covered = Coverage(frozenset({REF_A}), first)
+    assert orphans(found, covered, received) == [
+        {
+            "connector": "mail",
+            "key": "1111111111111111.1",
+            "state": "sent",
+            "at": when(first + 1),
+            "flag": "no_ledger_record",  # exactly at the earliest record: checked
+        },
+        {
+            "connector": "mail",
+            "key": "2222222222222222.1",
+            "state": "sent",
+            "at": when(first + 2),
+            "flag": "older_than_copy",
+        },
+        {
+            "connector": "mail",
+            "key": "3333333333333333.1",
+            "state": "failed",
+            "at": when(first - 98),
+            "flag": "older_than_copy",
+        },
+    ]
+    # Not reported since: not_yet_reported, however old.
+    flags = [o["flag"] for o in orphans(found, covered, first - 1)]
+    assert flags == ["not_yet_reported", "not_yet_reported", "older_than_copy"]
+    assert [o["flag"] for o in orphans(found, covered, None)] == ["not_yet_reported"] * 3
+    # A copy that holds no record has no span to be older than.
+    assert [o["flag"] for o in orphans(found, Coverage(), received)] == ["no_ledger_record"] * 4
+
+
+def test_coverage_is_the_refs_and_the_earliest_record() -> None:
+    assert Coverage() == Coverage(frozenset(), None)
+    assert coverage([]) == Coverage()
+    records = [
+        record(0, T + 5, None, "repaired", torn_bytes=1),
+        asked(1, T + 2, REF_A),
+        asked(2, T + 9, REF_B),
+        record(3, T + 3, REF_A, "decided", decision="accept", waited_ms=1),
+    ]
+    assert coverage(records) == Coverage(frozenset({REF_A, REF_B}), T + 2)
+    assert coverage(records[:1]) == Coverage(frozenset(), T + 5)  # a ledger-level record only
+    assert coverage(RECORDS) == Coverage(frozenset({REF_A, REF_B, REF_C, REF_D, REF_E}), T - 60_000)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "both"),
+    [
+        (Coverage(), Coverage(), Coverage()),
+        (Coverage(frozenset("a"), 5), Coverage(), Coverage(frozenset("a"), 5)),
+        (Coverage(), Coverage(frozenset("b"), 3), Coverage(frozenset("b"), 3)),
+        (Coverage(frozenset("a"), 5), Coverage(frozenset("b"), 3), Coverage(frozenset("ab"), 3)),
+        (Coverage(frozenset("a"), 3), Coverage(frozenset("ab"), 5), Coverage(frozenset("ab"), 3)),
+    ],
+)
+def test_coverages_join(left: Coverage, right: Coverage, both: Coverage) -> None:
+    assert left | right == both
+    assert right | left == both
+
+
+def test_the_archives_are_part_of_the_copy() -> None:
+    """A send whose call only an archived epoch holds isn't an orphan; the span starts at the
+    earliest record of the live chain and the archives together."""
+    archived, older, inside = "a" * 16, "b" * 16, "c" * 16
+    journals = {
+        "mail": [
+            sending(T - 90_000, f"{archived}.1"),
+            sending(T - 70_001, f"{older}.1"),
+            sending(T - 70_000, f"{inside}.1"),
+        ]
+    }
+    flags = {o["key"]: o["flag"] for o in view(journals=journals)["orphans"]}
+    assert flags == {f"{key}.1": "older_than_copy" for key in (archived, older, inside)}
+    held = Coverage(frozenset({archived}), T - 70_000)
+    flags = {o["key"]: o["flag"] for o in view(journals=journals, archived=held)["orphans"]}
+    assert flags == {f"{older}.1": "older_than_copy", f"{inside}.1": "no_ledger_record"}
+    # The live chain's earliest record starts the span when it is the earlier one.
+    later = Coverage(frozenset({archived}), T)
+    flags = {o["key"]: o["flag"] for o in view(journals=journals, archived=later)["orphans"]}
+    assert flags == {f"{older}.1": "older_than_copy", f"{inside}.1": "older_than_copy"}
+    assert view(journals=journals, archived=held, before=8)["orphans"] == []
 
 
 def test_any_record_of_a_ref_holds_it() -> None:

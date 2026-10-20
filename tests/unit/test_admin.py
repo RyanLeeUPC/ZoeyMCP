@@ -1795,6 +1795,37 @@ async def test_the_reported_copy_joins_the_send_journals(tmp_path: Path) -> None
 
 
 @pytest.mark.anyio
+async def test_the_orphans_are_judged_against_the_kept_archives(tmp_path: Path) -> None:
+    """J.5: after a restart, a send whose call is archived isn't an orphan; one begun before the
+    earliest record kept is ``older_than_copy``; one inside that span no call explains is
+    ``no_ledger_record``. Only the first page has orphans."""
+    rig, copy = reported_rig(tmp_path, [T0 + 10_000])
+    copy.report(report(chained(3)))
+    copy.report(report(chained(3, tick=100)[1:]))
+    copy.restart()
+    copy.report(report(chained(2, tick=200)))
+    journal = tmp_path / "connectors" / "mail-out"
+    journal.mkdir(parents=True)
+    common = {
+        "req_hmac": "hmac-sha256:" + "0" * 64,
+        "key_id": "0" * 16,
+        "subject_chars": 1,
+        "body_chars": 1,
+    }
+    sends = [("0000000000000001.1", T0 + 1), (f"{0xA1:016x}.1", T0), (f"{0xA2:016x}.1", T0 + 1)]
+    lines = [sendjournal.encode("sending", ts=ts, key=key, **common) for key, ts in sends]
+    (journal / "journal-0000000000001.jsonl").write_bytes(b"".join(lines))
+    page = (await rig.call("GET", "/ledger/reported")).json()
+    assert [(o["key"], o["flag"]) for o in page["orphans"]] == [
+        (f"{0xA2:016x}.1", "no_ledger_record"),
+        (f"{0xA1:016x}.1", "older_than_copy"),
+    ]
+    assert [row["seq"] for row in page["rows"]] == [1, 0]  # the live chain's rows only
+    assert (await rig.call("GET", "/ledger/reported?before=1")).json()["orphans"] == []
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "query", ["?before=x", "?limit=-1", "?other=1", "?limit=1&limit=2", "?before=" + "9" * 16]
 )

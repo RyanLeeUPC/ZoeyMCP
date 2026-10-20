@@ -10,10 +10,13 @@ code ``zoeymcp ledger`` prints with, and flattened into rows, newest first, a pa
   ``pending``). A row is a claim the gateway made, and the page says so.
 - **The journal join (D-25).** A send's ``Idempotency-Key`` up to its last dot is the call's ref.
   A row shows its sends' state, SMTP code and time, never the Message-ID or ``req_hmac``. A send
-  whose ref the copy doesn't hold is an orphan: ``no_ledger_record`` once the copy has received a
-  report since that send began, else ``not_yet_reported``. It shows a send by a caller that can't
-  write the gateway's ledger; a compromised gateway can cover its own sends with records it makes
-  up (threat T4).
+  whose ref the copy doesn't hold is an orphan, flagged ``not_yet_reported`` until the live chain
+  receives a report after that send began. The copy here is the live chain and every archived
+  epoch a restart kept (J.4), so a send whose call is archived isn't an orphan. A send that began
+  before the earliest record they hold, its call pruned or its epoch dropped, can't be checked:
+  ``older_than_copy``. Any other is ``no_ledger_record``, however old. An orphan shows a send by
+  a caller that can't write the gateway's ledger; a compromised gateway can cover its own sends
+  with records it makes up (threat T4).
 - **Names the current policy lacks** are listed in a row's ``not_in_policy``.
 
 Every string here is the gateway's or the journal's: the portal shows each through
@@ -35,12 +38,38 @@ MAX_LIMIT: Final = 200
 NAMED: Final = ("client", "server", "tool")  # the asked record's names a policy can lack
 _COMMON: Final = frozenset({"v", "seq", "prev", "ts", "ref", "kind", "writer"})
 
-Flag = Literal["no_ledger_record", "not_yet_reported"]
+Flag = Literal["no_ledger_record", "not_yet_reported", "older_than_copy"]
 
 
 def when(ts: int) -> str:
     """Epoch milliseconds as ``2026-10-19T09:12:03Z``."""
     return datetime.fromtimestamp(ts // 1000, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """What the copy holds, for the orphan check: the refs of its records, and the time of its
+    earliest record (None when it holds none), the start of the span it can check."""
+
+    refs: frozenset[str] = frozenset()
+    first_ms: int | None = None
+
+    def __or__(self, other: Coverage) -> Coverage:
+        firsts = [ms for ms in (self.first_ms, other.first_ms) if ms is not None]
+        return Coverage(self.refs | other.refs, min(firsts, default=None))
+
+
+def coverage(records: Iterable[Mapping[str, Any]]) -> Coverage:
+    """The refs ``records`` hold and their earliest ``ts``, in one pass, so an archived epoch can
+    be read a record at a time."""
+    refs: set[str] = set()
+    first: int | None = None
+    for record in records:
+        ref = record.get("ref")
+        if ref is not None:
+            refs.add(ref)
+        first = record["ts"] if first is None else min(first, record["ts"])
+    return Coverage(frozenset(refs), first)
 
 
 @dataclass
@@ -116,11 +145,13 @@ def page(
     limit: int = MAX_LIMIT,
     known: Mapping[str, Collection[str]] | None = None,
     broken_at: int | None = None,
+    archived: Coverage | None = None,
 ) -> dict[str, Any]:
     """One page of the view: the rows whose seq is below ``before``, newest first, at most
     ``limit`` (1 to :data:`MAX_LIMIT`), and ``next``, the ``before`` of the page after it (None at
-    the end). Orphans are on the first page. ``known``: the current policy's names by field
-    (``client``, ``server``, ``tool``); a field it doesn't list isn't checked.
+    the end). Orphans are on the first page, judged against ``records`` and ``archived``, what
+    the kept archived epochs hold. ``known``: the current policy's names by field (``client``,
+    ``server``, ``tool``); a field it doesn't list isn't checked.
     """
     limit = max(1, min(limit, MAX_LIMIT))
     records = list(records)
@@ -142,25 +173,31 @@ def page(
     if before is not None:
         rows = [row for row in rows if row["seq"] < before]
     shown = rows[:limit]
-    refs = {record["ref"] for record in records if record.get("ref") is not None}
+    held_now = coverage(records) | (Coverage() if archived is None else archived)
     return {
         "state": state(held, now=now, broken_at=broken_at),
         "rows": shown,
-        "orphans": [] if before is not None else orphans(found, refs, held.received_ms),
+        "orphans": [] if before is not None else orphans(found, held_now, held.received_ms),
         "next": shown[-1]["seq"] if len(rows) > limit else None,
     }
 
 
 def orphans(
-    found: Iterable[Send], refs: Collection[str], received_ms: int | None
+    found: Iterable[Send], covered: Coverage, received_ms: int | None
 ) -> list[dict[str, Any]]:
-    """The sends whose ref the copy doesn't hold, newest first, each flagged."""
+    """The sends whose ref the copy doesn't hold, newest first, each flagged:
+    ``not_yet_reported`` unless the live chain received a report after the send began, then
+    ``older_than_copy`` if it began before the copy's earliest record, else
+    ``no_ledger_record``."""
     out = []
     for send in sorted(found, key=lambda s: s.started_ms, reverse=True):
-        if send.ref in refs:
+        if send.ref in covered.refs:
             continue
-        reported = received_ms is not None and received_ms > send.started_ms
-        flag: Flag = "no_ledger_record" if reported else "not_yet_reported"
+        flag: Flag = "no_ledger_record"
+        if received_ms is None or received_ms <= send.started_ms:
+            flag = "not_yet_reported"
+        elif covered.first_ms is not None and send.started_ms < covered.first_ms:
+            flag = "older_than_copy"
         out.append(
             {
                 "connector": send.connector,

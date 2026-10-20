@@ -1180,7 +1180,28 @@ PAGE = {
             "state": "sent",
             "at": "2026-10-19T08:01:00Z",
             "flag": "no_ledger_record",
-        }
+        },
+        {
+            "connector": "mail",
+            "key": "a1b3000000000000.1",
+            "state": "sent",
+            "at": "2026-10-19T07:01:00Z",
+            "flag": "older_than_copy",
+        },
+        {
+            "connector": "mail",
+            "key": "a1b4000000000000.1",
+            "state": "sending",
+            "at": "2026-10-19T06:01:00Z",
+            "flag": "not_yet_reported",
+        },
+        {
+            "connector": "mail",
+            "key": "a1b5000000000000.1",
+            "state": "sent",
+            "at": "2026-10-19T05:01:00Z",
+            "flag": "a_later_flag",
+        },
     ],
     "next": 11,
     "refused": None,
@@ -1192,7 +1213,13 @@ PAGE_LINES = [
     "2026-10-19T09:12:03Z 3f9c0000000000aa agent1 mail/send[U+001B][2J modern accept ok (sent)",
     "  not in the current policy: client",
     "  send 3f9c0000000000aa.1 sent 250 2026-10-19T09:12:05Z",
-    "orphan send a1b2000000000000.1 on mail: sent at 2026-10-19T08:01:00Z (no_ledger_record)",
+    "orphan send a1b2000000000000.1 on mail: sent at 2026-10-19T08:01:00Z "
+    "(no_ledger_record: no ledger record holds its call)",
+    "orphan send a1b3000000000000.1 on mail: sent at 2026-10-19T07:01:00Z "
+    "(older_than_copy: older than the ledger copy: can't be checked)",
+    "orphan send a1b4000000000000.1 on mail: sending at 2026-10-19T06:01:00Z "
+    "(not_yet_reported: not reported yet)",
+    "orphan send a1b5000000000000.1 on mail: sent at 2026-10-19T05:01:00Z (a_later_flag)",
     f"archived archive-1767276000000: seq 0-9 (head {HEAD}), last received "
     "2026-01-01 14:00:00Z, 5450 bytes",
     "older rows: zoeymcp ledger --vault --before 11",

@@ -271,11 +271,11 @@ def test_the_sends_are_joined_and_an_orphan_is_flagged(
         rig,
         sending(joined, ts - 2000),
         sent(joined, ts - 1000),
-        sending(orphan, ts - 60_000),  # a send no call explains, before the report
+        sending(orphan, ts - 60_000),  # a send no call explains, in the copy's span
         sent(orphan, ts - 59_000),
         sending(later, ts + 3_600_000),  # after the copy's latest report
     )
-    report(rig, chain([asked(REFS[0]), decided(REFS[0]), outcome(REFS[0])], ts=ts))
+    report(rig, chain([asked(REFS[0]), decided(REFS[0]), outcome(REFS[0])], ts=ts - 120_000))
     answer = ledger(page)
     [row] = answer["rows"]
     assert row["journal"] == [
@@ -524,6 +524,80 @@ def test_the_chain_restarts_with_a_passkey(
     assert rows["orphans"] == []
     # The next report starts a new chain, on trust: the forked history is taken.
     assert report(rig, chain([asked(REFS[1]), decided(REFS[1])], ts=ts + 500)).head.seq == 1
+
+
+def test_orphans_are_judged_against_the_kept_archives_too(
+    rig: PortalRig, signed_in: tuple[Page, SoftAuthenticator], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """J.4, J.5: after a restart, a send whose call is in the archived epoch isn't an orphan; one
+    begun before the earliest record the copy keeps can't be checked (``older_than_copy``); a
+    send no call explains inside that span is still ``no_ledger_record``, however old. Once a
+    restart deletes the epoch, its sends are older than the copy. The archives are read for the
+    first page only, and an archive that can't be read is a copy that can't be."""
+    page, _ = signed_in
+    copy = copy_of(rig)
+    ts = now_ms() - 3_600_000
+    report(rig, chain([asked(REFS[0]), decided(REFS[0]), outcome(REFS[0])], ts=ts))
+    assert report(rig, chain([asked(REFS[1])], ts=ts + 500)).reason == "fork"
+    rig.call(lambda: copy.restart())
+    report(rig, chain([asked(REFS[1]), decided(REFS[1])], ts=ts + 500))  # a new chain
+    archived, live, older, inside, later = (f"{REFS[n]}.1" for n in (0, 1, 5, 6, 7))
+    journal(
+        rig,
+        sending(older, ts - 1),  # a millisecond before the earliest record kept
+        sending(inside, ts),  # exactly at it: inside the span, and no call explains it
+        sending(archived, ts + 1),
+        sent(archived, ts + 2),
+        sending(live, ts + 600),
+        sending(later, ts + 700),
+    )
+    reads: list[str] = []
+    real = copy.archived_coverage
+
+    def counted() -> ledgerview.Coverage:
+        reads.append("archives")
+        return real()
+
+    monkeypatch.setattr(copy, "archived_coverage", counted)
+    answer = ledger(page)
+    assert [(o["key_shown"], o["flag"]) for o in answer["orphans"]] == [
+        (later, "no_ledger_record"),
+        (inside, "no_ledger_record"),
+        (older, "older_than_copy"),
+    ]
+    assert answer["orphans"][2]["text_shown"] == (
+        f"{ledgerview.when(ts - 1)} send {older} on mail-out: sending; "
+        f"{ORPHAN_FLAGS['older_than_copy']}."
+    )
+    assert ORPHAN_FLAGS["older_than_copy"].startswith(
+        "older than the ledger copy: can't be checked"
+    )
+    assert reads == ["archives"]
+    [epoch] = answer["archives"]
+    assert ledger(page, "?archive=" + epoch["name"])["orphans"] == []
+    assert ledger(page, "?before=1")["orphans"] == []
+    assert reads == ["archives"]  # only the live chain's first page reads them
+
+    # A restart that deletes the archived epoch: its sends are older than the copy now.
+    copy.archive_max_bytes = 1
+    assert report(rig, chain([asked(REFS[2])], ts=ts + 900)).reason == "fork"
+    rig.call(lambda: copy.restart())
+    report(rig, chain([asked(REFS[3])], ts=ts + 650))
+    flags = [(o["key_shown"], o["flag"]) for o in ledger(page)["orphans"]]
+    assert flags == [
+        (later, "no_ledger_record"),
+        (live, "older_than_copy"),
+        (archived, "older_than_copy"),
+        (inside, "older_than_copy"),
+        (older, "older_than_copy"),
+    ]
+
+    def unreadable() -> ledgerview.Coverage:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(copy, "archived_coverage", unreadable)
+    assert ledger(page)["state"]["state"] == "unavailable"
+    assert [row["seq"] for row in ledger(page, "?before=1")["rows"]] == [0]
 
 
 def test_a_restart_that_deletes_lists_each_epoch(

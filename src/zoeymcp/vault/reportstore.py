@@ -24,6 +24,10 @@ trims. A write that fails runs recovery again, which reconciles memory with what
 disagrees with the lines is rebuilt from them. A directory that can't be read makes the copy
 ``unavailable``: the report path answers 503 and the proxy is unaffected.
 
+**Reading** (:meth:`ReportStore.records`) is the live chain, or a kept archived epoch by name;
+:meth:`ReportStore.archived_coverage` reads every kept epoch a record at a time for the view's
+orphan check (J.5), so it costs at most the archives' bound.
+
 **Pruning** is by when the vault received a file's last line, on its own clock, never the
 records' ``ts`` (``decide`` plans it). **A restart** (:meth:`ReportStore.restart`) archives the
 live chain and drops the oldest archives beyond their bound, as :func:`.reports.plan_restart`
@@ -41,7 +45,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Literal, cast
@@ -49,7 +53,7 @@ from typing import Any, Final, Literal, cast
 from ..common import canonical, files, ledgerformat
 from ..common.ledgerformat import LedgerFormatError, Record
 from ..common.ledgerreport import STATES, Head, State
-from . import logs, reports
+from . import ledgerview, logs, reports
 from .reports import (
     KEEP_MS,
     REPORTED_ARCHIVE_MAX_BYTES,
@@ -502,14 +506,37 @@ class ReportStore:
         kept = {item.epoch.name for item in self.archived if not item.dropped}
         if name not in kept:
             raise KeyError(name)
-        found: list[dict[str, Any]] = []
+        return [json.loads(record.line) for record in self._epoch_records(name)]
+
+    def archived_coverage(self) -> ledgerview.Coverage:
+        """What every kept archived epoch holds, for the view's orphan check (J.5): the refs of
+        its records and the earliest record's ``ts``. Read-only and a record at a time, so it
+        costs at most the archives' bound. An epoch a restart drops meanwhile is left out; any
+        other ``OSError`` is raised, since an orphan judged without it could be a false one."""
+        if not self.available:
+            raise CopyUnavailable
+        covered = ledgerview.Coverage()
+        for item in list(self.archived):
+            if item.dropped:
+                continue
+            held = (
+                {"ref": record.ref, "ts": record.ts}
+                for record in self._epoch_records(item.epoch.name)
+            )
+            try:
+                covered |= ledgerview.coverage(held)
+            except FileNotFoundError:
+                continue  # dropped by a restart since the list was read
+        return covered
+
+    def _epoch_records(self, name: str) -> Iterator[Record]:
+        """An archived epoch's records, oldest first; a line that doesn't parse is left out."""
         directory = self.directory / name
         for path in sorted(p for p in directory.iterdir() if _FILE.fullmatch(p.name)):
             for line in path.read_bytes().splitlines():
                 record = _parse(line)
                 if record is not None:
-                    found.append(json.loads(record.line))
-        return found
+                    yield record
 
     def archives(self) -> list[dict[str, Any]]:
         """Every archived epoch, oldest first, a dropped one as its anchor."""

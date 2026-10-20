@@ -263,6 +263,9 @@ ORPHAN_FLAGS: Final[Mapping[str, str]] = MappingProxyType(
         "record it)",
         "not_yet_reported": "not reported yet: no report has reached the copy since this send "
         "began",
+        "older_than_copy": "older than the ledger copy: can't be checked, since the send began "
+        "before the earliest record the copy still holds (older files pruned, or an archived "
+        "chain deleted at a restart)",
     }
 )
 # The ledger page's query (J.5): each at most once, all optional.
@@ -1572,7 +1575,8 @@ class PortalApp:
         """J.5: a page of the vault's copy, newest first, ``?before=SEQ&limit=N``; with
         ``archive=NAME``, an archived epoch's (J.4). Each call is one row joined with its sends,
         and the sends whose call the copy doesn't hold are orphans (D-25), on the live chain's
-        first page. No keyed digest or pin is in a row (Q12), and every string from the gateway
+        first page, judged against the live chain and every kept archived epoch, which that page
+        reads too. No keyed digest or pin is in a row (Q12), and every string from the gateway
         or a journal is shown (K.1). A copy that can't be read is a page that says so."""
         query = _ledger_query(call.query)
         if isinstance(query, Refusal):
@@ -1582,8 +1586,14 @@ class PortalApp:
         copy = ledger.copy
         policy = self._policy()
         journals = _journals(ledger.connectors, policy)
+
+        def read() -> tuple[list[dict[str, Any]], ledgerview.Coverage | None]:
+            records = copy.records(archive)
+            first = archive is None and before is None  # the page with the orphans
+            return records, copy.archived_coverage() if first else None
+
         try:
-            records = await asyncio.to_thread(copy.records, archive)
+            records, archived = await asyncio.to_thread(read)
         except KeyError:
             return refusal("not_found")  # not an archive the copy lists, or one dropped
         except (CopyUnavailable, OSError):
@@ -1607,9 +1617,10 @@ class PortalApp:
                 limit=ledgerview.MAX_LIMIT if limit is None else limit,
                 known=ledgerview.known(policy),
                 broken_at=copy.broken_at,
+                archived=archived,
             )
             if archive is not None:
-                page["orphans"] = []  # an orphan is judged against the live chain only
+                page["orphans"] = []  # orphans are on the live chain's first page only
         return Reply(_ledger_view(page, copy.refused, copy.archives(), archive))
 
     def _plan_restart(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:

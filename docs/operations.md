@@ -816,10 +816,18 @@ zoeymcp ledger --vault --format json
 ```
 
 Every row is as the gateway reported it. A send in a connector's journal whose call the copy
-doesn't hold is listed as an orphan: `no_ledger_record` once the copy has received a report since
-that send began (a caller other than the gateway, or a gateway that didn't record it), else
-`not_yet_reported`. No keyed digests are shown: check arguments with `zoeymcp ledger check` in the
-gateway. The command exits 1 when the copy isn't `ok` or its files don't chain.
+doesn't hold is listed as an orphan. The copy here is the live chain and every archived chain a
+restart kept (below), so a send whose call was archived is no orphan. Each orphan has a flag:
+
+| Flag | What it means |
+| --- | --- |
+| `not_yet_reported` | no report has reached the live chain since the send began: look again after the next one |
+| `older_than_copy` | the send began before the earliest record the copy still holds (the files holding its call were pruned after 30 days, or a restart deleted its archived chain), so it can't be checked |
+| `no_ledger_record` | the copy has had a report since the send began, covers its time, and holds no record of its call: a caller other than the gateway, or a gateway that didn't record it. However old the send, this stands |
+
+The journal keeps sends for 400 days and the copy may keep less, so `older_than_copy` is
+expected for old sends. No keyed digests are shown: check arguments with `zoeymcp ledger check` in the gateway.
+The command exits 1 when the copy isn't `ok` or its files don't chain.
 
 The first report after an empty copy is taken on trust; after that every report must extend the
 held head, and a resend of records the copy holds is trimmed. Otherwise the copy **refuses every
@@ -1124,9 +1132,13 @@ server and tool, the decision, the outcome and how many writes it asked for and 
 it each of its sends from the SMTP connectors' journals: the state, the SMTP code and the time,
 never the Message-ID or the message's digest. Every row is as the gateway reported it; a record
 the vault wrote itself (from M8) says so. A client or server the current policy doesn't name is
-marked "Not in the current policy". Below the rows are the sends whose call the copy doesn't
-hold: `no_ledger_record` once the copy has had a report since the send began (a caller other
-than the gateway, or a gateway that didn't record it), else `not_yet_reported`. No keyed digest
+marked "Not in the current policy". Below the rows, on the first page, are the sends whose
+call neither the live chain nor a kept archived chain holds, each flagged in words (§21's
+table): "no ledger record" when the copy has had a report since the send began and covers its
+time (a caller other than the gateway, or a gateway that didn't record it), "not reported yet"
+when no report has reached it since, and "older than the ledger copy: can't be checked" when the
+send began before the earliest record the copy still holds. To judge them, the first page reads
+every kept archived chain too, at most 64 MiB. No keyed digest
 of a call's arguments or prompt is shown: check arguments with `zoeymcp ledger check REF FILE` in
 the gateway's container. The state line says where the copy's head is, when it last moved, and
 whether its files stop chaining. While the copy refuses reports (`fork`, `gap` or `full`, §21),

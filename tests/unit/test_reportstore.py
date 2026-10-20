@@ -23,6 +23,7 @@ from zoeymcp.common import files as common_files
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.gateway import reporting
 from zoeymcp.vault import logs, reportstore
+from zoeymcp.vault.ledgerview import Coverage
 from zoeymcp.vault.reports import DAY_MS, KEEP_MS, Accepted, Epoch, Held, LiveFile, Refused
 from zoeymcp.vault.reportstore import (
     HEAD_FILE,
@@ -539,6 +540,45 @@ def test_an_archived_epoch_is_still_readable(tmp_path: Path) -> None:
         store.records(name)  # dropped: its anchor is listed, its files are gone
     assert second.archive is not None
     assert store.records(second.archive.name) == [json.loads(line) for line in LINES[:2]]
+
+
+def refs(*ticks: int) -> frozenset[str]:
+    return frozenset(f"{tick:016x}" for tick in ticks)
+
+
+def test_the_kept_archives_coverage(tmp_path: Path) -> None:
+    """J.5's orphan check: every kept archived epoch's refs and earliest record, read from its
+    files; a dropped epoch's anchor holds neither, and one dropped meanwhile is left out."""
+    clock = Clock()
+    store = forked(tmp_path, clock, rotate_bytes=2 * SIZE, archive_max_bytes=5 * SIZE)
+    assert store.archived_coverage() == Coverage()  # nothing archived yet
+    first = store.restart()
+    assert first.archive is not None
+    assert store.archived_coverage() == Coverage(refs(1, 2, 3, 4), T0 + 1)
+    store.report(body(LINES[2:4]))  # the new chain, on trust: not an archive
+    assert store.archived_coverage() == Coverage(refs(1, 2, 3, 4), T0 + 1)
+    store.report(body(OTHER[3:4]))
+    clock.now += 1
+    second = store.restart()
+    assert second.archive is not None
+    assert [epoch.name for epoch in second.drop] == [first.archive.name]
+    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 3)  # the first is dropped
+    # A line that doesn't parse is left out, as the archive's page leaves it.
+    target = copy_dir(tmp_path) / second.archive.name
+    [path] = sorted(target.iterdir())
+    path.write_bytes(b"not a record\n" + path.read_bytes())
+    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 3)
+    # Gone since the list was read (a restart dropping it meanwhile): left out.
+    path.unlink()
+    target.rmdir()
+    assert store.archived_coverage() == Coverage()
+    assert opened(tmp_path).archived_coverage() == Coverage()  # recovery marks it dropped
+
+
+def test_an_unreadable_copy_has_no_coverage(tmp_path: Path) -> None:
+    copy_dir(tmp_path).write_bytes(b"not a directory")
+    with pytest.raises(CopyUnavailable):
+        opened(tmp_path).archived_coverage()
 
 
 def test_archive_names_never_repeat(tmp_path: Path) -> None:

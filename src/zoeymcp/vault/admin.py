@@ -715,7 +715,8 @@ class AdminApp:
     # --- the reported ledger (M5 design J.4, J.5) -----------------------------------------------
 
     async def _ledger_reported(self, request: Request) -> Response:
-        """A page of the copy, newest first: ``?before=SEQ&limit=N`` (1 to 200)."""
+        """A page of the copy, newest first: ``?before=SEQ&limit=N`` (1 to 200). The first
+        page's orphans are judged against the live chain and every kept archived epoch."""
         copy = self._reports
         if copy is None:
             return _reason(503, "the vault keeps no reported copy", "unavailable")
@@ -730,8 +731,12 @@ class AdminApp:
             return _reason(400, "before and limit are numbers", "bad_query")
         policy = self._policy()
         journals = self._journals(policy)
+
+        def read() -> tuple[list[dict[str, Any]], ledgerview.Coverage | None]:
+            return copy.records(), None if before is not None else copy.archived_coverage()
+
         try:
-            records = await asyncio.to_thread(copy.records)
+            records, archived = await asyncio.to_thread(read)
         except (CopyUnavailable, OSError):
             view = ledgerview.state(copy.held, now=copy.clock())
             view["state"] = "unavailable"
@@ -746,6 +751,7 @@ class AdminApp:
             before=before,
             limit=ledgerview.MAX_LIMIT if limit is None else limit,
             broken_at=copy.broken_at,
+            archived=archived,
         )
         return JSONResponse({**page, "refused": copy.refused, "archives": copy.archives()})
 
