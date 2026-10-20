@@ -521,18 +521,43 @@ async def _until(condition: Callable[[], object], what: str) -> None:
 
 
 class FakeServer:
-    """Serves until told to exit, and keeps its config."""
+    """Serves until told to exit, and keeps its config and the sockets it was given."""
 
     made: ClassVar[list[FakeServer]] = []
 
     def __init__(self, config: Any) -> None:
         self.config = config
         self.should_exit = False
+        self.sockets: list[socket.socket] | None = None
         FakeServer.made.append(self)
 
-    async def serve(self) -> None:
+    async def serve(self, sockets: list[socket.socket] | None = None) -> None:
+        self.sockets = sockets
         while not self.should_exit:
             await asyncio.sleep(0.001)
+
+
+class Bound:
+    """Stands in for a bound socket: names its address and counts its closes."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.address = (host, port)
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def bind_nothing(host: str, port: int) -> list[socket.socket]:
+    """A binder that binds nothing, so no test opens a real port: one stand-in per address."""
+    return [cast(socket.socket, Bound(host, port))]
+
+
+def _bound(sockets: list[socket.socket] | None) -> list[tuple[tuple[str, int], int]] | None:
+    """The addresses of the stand-ins a fake server was given, and how often each was closed."""
+    if sockets is None:
+        return None
+    return [(cast(Bound, each).address, cast(Bound, each).closed) for each in sockets]
 
 
 @pytest.fixture
@@ -568,7 +593,12 @@ def _serve_with_control(
 
     async def main() -> list[asyncio.Task[Any]]:
         await server.serve(
-            cast(VaultApp, app), ["127.0.0.1:0"], config="p.yaml", environ={"A": "1"}, control_fd=7
+            cast(VaultApp, app),
+            ["127.0.0.1:0"],
+            config="p.yaml",
+            environ={"A": "1"},
+            control_fd=7,
+            binder=bind_nothing,
         )
         return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
@@ -631,6 +661,7 @@ def test_serve_listens_on_the_link(
                 environ={},
                 gateway_socket=Path("/run/zoeymcp-link/vault.sock"),
                 gateway_uid=10002,
+                binder=bind_nothing,
             )
         )
         await _until(
@@ -638,6 +669,9 @@ def test_serve_listens_on_the_link(
             "serve never started both listeners",
         )
         tcp, link = fake_servers
+        # The TCP server serves the sockets bound for it; the link's uvicorn binds its own.
+        assert _bound(tcp.sockets) == [(("127.0.0.1", 8080), 0)]
+        assert link.sockets is None
         assert isinstance(tcp.config.app, ListenerTag)
         assert tcp.config.app.app is cast(Any, app)
         assert tcp.config.app.listener == "tcp"
@@ -662,6 +696,8 @@ def test_serve_listens_on_the_link(
         for each in fake_servers:
             each.should_exit = True
         await task
+        # serve closes them on the way out, whether or not a server started.
+        assert _bound(tcp.sockets) == [(("127.0.0.1", 8080), 1)]
 
     asyncio.run(main())
     lines = log_lines(log_buffer)
@@ -690,6 +726,7 @@ def test_serve_needs_both_for_the_link(
                 environ={},
                 gateway_socket=path,
                 gateway_uid=uid,
+                binder=bind_nothing,
             )
         )
         await _until(lambda: "vault_started" in log_buffer.getvalue(), "serve never started")
@@ -707,7 +744,13 @@ def test_serve_without_the_link_has_one_listener_each(
 ) -> None:
     async def main() -> None:
         task = asyncio.create_task(
-            server.serve(cast(VaultApp, _App()), ["127.0.0.1:8080"], config=None, environ={})
+            server.serve(
+                cast(VaultApp, _App()),
+                ["127.0.0.1:8080"],
+                config=None,
+                environ={},
+                binder=bind_nothing,
+            )
         )
         await _until(lambda: fake_servers, "serve never started")
         fake_servers[0].should_exit = True
@@ -716,6 +759,7 @@ def test_serve_without_the_link_has_one_listener_each(
     asyncio.run(main())
     assert len(fake_servers) == 1
     assert fake_servers[0].config.app.listener == "tcp"
+    assert _bound(fake_servers[0].sockets) == [(("127.0.0.1", 8080), 1)]
     assert "gateway_socket_listening" not in log_buffer.getvalue()
 
 

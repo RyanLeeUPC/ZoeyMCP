@@ -15,6 +15,11 @@ own plain-text 400 (design 0.5), so admission's "exactly one Host" is a pure cas
 reaches ``scope["headers"]`` as sent, whatever the request target says, and an absolute-form
 target becomes the path, which no portal route has. Starlette's ``request.cookies`` keeps one of
 two cookies of one name, so admission reads every value from the raw ``Cookie`` headers.
+
+41 pins why the vault binds its TCP sockets itself (design B.3, D17). uvicorn 0.54's
+``Server.startup`` calls ``sys.exit`` when it can't bind a host and port, which would end the
+vault inside its servers' gather with no line of its own. Given sockets already bound, it listens
+on them and serves them, and closes them when it stops.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from cryptography.hazmat.primitives.asymmetric import (
 from cryptography.utils import CryptographyDeprecationWarning
 from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
+from uvicorn.config import STARTUP_FAILURE
 
 from tests.fakes.authenticator import PublicKey, spki
 
@@ -222,13 +228,16 @@ class _ThreadServer(uvicorn.Server):
 
 
 @contextmanager
-def _h11_server(app: _Recorder) -> Iterator[int]:
-    """uvicorn with its h11 protocol, as the portal runs it, on a loopback port."""
+def _h11_server(app: _Recorder, sockets: list[socket.socket] | None = None) -> Iterator[int]:
+    """uvicorn with its h11 protocol, as the portal runs it, on a loopback port (or on
+    ``sockets``, which it then binds no socket of its own for)."""
     config = uvicorn.Config(
         app, host="127.0.0.1", port=0, http="h11", lifespan="off", log_level="critical"
     )
     server = _ThreadServer(config)
-    thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    thread = threading.Thread(
+        target=lambda: asyncio.run(server.serve(sockets=sockets)), daemon=True
+    )
     thread.start()
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while not server.started:
@@ -310,3 +319,31 @@ def test_starlette_keeps_one_of_two_cookies_of_a_name() -> None:
     # Across two Cookie headers, the last one wins too.
     two = [(b"cookie", b"zoeymcp-8081-session=ours"), (b"cookie", b"zoeymcp-8081-session=planted")]
     assert Request({"type": "http", "headers": two}).cookies == {"zoeymcp-8081-session": "planted"}
+
+
+# --- 41. a bind failure exits the process; a socket bound beforehand is served ------------------
+
+
+def test_uvicorn_exits_when_it_cant_bind() -> None:
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        port = occupied.getsockname()[1]
+        config = uvicorn.Config(
+            _Recorder(), host="127.0.0.1", port=port, lifespan="off", log_level="critical"
+        )
+        with pytest.raises(SystemExit) as exited:
+            asyncio.run(_ThreadServer(config).serve())
+    assert exited.value.code == STARTUP_FAILURE
+
+
+def test_uvicorn_serves_a_socket_bound_beforehand() -> None:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))  # bound only: uvicorn's create_server listens
+    app = _Recorder()
+    with _h11_server(app, [sock]) as port:
+        assert port == sock.getsockname()[1]
+        answer = _exchange(port, _head(b"GET / HTTP/1.1", b"Host: localhost", b"Connection: close"))
+    assert answer.startswith(b"HTTP/1.1 200 OK")
+    assert len(app.scopes) == 1
+    assert sock.fileno() == -1  # closed when the server stopped

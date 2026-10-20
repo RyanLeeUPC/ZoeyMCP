@@ -10,14 +10,20 @@ In the standard tier (M3 design B.2, C.1) the vault also listens on the link soc
 the gateway's uid may connect, and may have no TCP listener at all (``--listen none``). The
 launcher can't signal the vault's uid, so it writes ``HUP`` and ``TERM`` to a control pipe
 instead; the end of that pipe stops the vault too.
+
+Every TCP listener's sockets are bound before any server starts (M5 design B.3, D17), so an
+address in use is a ``StartupError`` that names it; uvicorn would otherwise call ``sys.exit``
+inside the servers' gather, with no line of the vault's.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import os
 import signal
+import socket
 import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -49,6 +55,8 @@ if sys.platform != "win32":
     import fcntl
 
 LOCK_FILE = "vault.lock"
+# Binds a listen address's host and port: its sockets, bound and not yet listening.
+Binder = Callable[[str, int], list[socket.socket]]
 # How often the timer retires an expired previous gateway key, in seconds.
 GATEWAY_KEY_TICK = 5.0
 # The launcher's control pipe: one command per line.
@@ -237,6 +245,58 @@ def _split_listen(listen: str) -> tuple[str, int]:
     return host.strip("[]"), int(port)
 
 
+def bind_tcp(host: str, port: int) -> list[socket.socket]:
+    """Bind every address ``host`` resolves to, as asyncio's ``create_server`` does when uvicorn
+    binds: a socket each, IPv6 ones ``IPV6_V6ONLY``, an address whose family isn't enabled
+    skipped. ``SO_REUSEADDR`` is set on POSIX only, as asyncio does: on Windows it lets a socket
+    share a port another one holds, rather than reuse a closed one's."""
+    infos = socket.getaddrinfo(host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    bound: list[socket.socket] = []
+    try:
+        for family, kind, proto, _, address in dict.fromkeys(infos):
+            try:
+                sock = socket.socket(family, kind, proto)
+            except OSError:
+                continue  # a family this host can't make sockets of
+            bound.append(sock)
+            if sys.platform != "win32":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                sock.bind(address)
+            except OSError as exc:
+                if exc.errno != errno.EADDRNOTAVAIL:
+                    raise
+                bound.pop().close()  # the family isn't enabled, as asyncio assumes
+        if not bound:
+            raise OSError(f"no address {host} resolves to can be bound")
+    except BaseException:
+        _close(bound)
+        raise
+    return bound
+
+
+def _close(sockets: list[socket.socket]) -> None:
+    for sock in sockets:
+        sock.close()
+
+
+def bind_listens(listens: list[str], binder: Binder) -> list[list[socket.socket]]:
+    """Bind each ``--listen`` address with ``binder``; one that can't be bound closes the ones
+    already bound and is a ``StartupError`` naming it."""
+    bound: list[list[socket.socket]] = []
+    for listen in listens:
+        host, port = _split_listen(listen)
+        try:
+            bound.append(binder(host, port))
+        except OSError as exc:
+            for sockets in bound:
+                _close(sockets)
+            raise StartupError(f"can't listen on {listen} for the proxy: {exc}") from exc
+    return bound
+
+
 async def serve(
     app: VaultApp,
     listens: list[str],
@@ -249,25 +309,30 @@ async def serve(
     gateway_socket: Path | None = None,
     gateway_uid: int | None = None,
     control_fd: int | None = None,
+    binder: Binder = bind_tcp,
 ) -> None:
-    servers = []
-    for listen in listens:
+    # Before any server starts, so an address in use stops the start with its name (B.3).
+    bound = bind_listens(listens, binder)
+    servers: list[_Server] = []
+    # Each TCP server's bound sockets; uvicorn serves them, and closes them when it stops.
+    listening: dict[_Server, list[socket.socket]] = {}
+    for listen, sockets in zip(listens, bound, strict=True):
         host, port = _split_listen(listen)
-        servers.append(
-            _Server(
-                uvicorn.Config(
-                    ListenerTag(app, "tcp"),
-                    host=host,
-                    port=port,
-                    proxy_headers=False,  # never trust X-Forwarded-For: callers can't spoof
-                    server_header=False,
-                    date_header=False,
-                    access_log=False,
-                    log_level="warning",
-                    lifespan="off",
-                )
+        tcp = _Server(
+            uvicorn.Config(
+                ListenerTag(app, "tcp"),
+                host=host,  # unused with sockets given; kept so the config names its address
+                port=port,
+                proxy_headers=False,  # never trust X-Forwarded-For: callers can't spoof
+                server_header=False,
+                date_header=False,
+                access_log=False,
+                log_level="warning",
+                lifespan="off",
             )
         )
+        servers.append(tcp)
+        listening[tcp] = sockets
 
     if gateway_socket is not None and gateway_uid is not None:
         servers.append(
@@ -330,8 +395,11 @@ async def serve(
         )
         if gateway_socket is not None and gateway_uid is not None:
             logs.event("gateway_socket_listening", path=str(gateway_socket), uid=gateway_uid)
-        await asyncio.gather(*(server.serve() for server in servers))
+        await asyncio.gather(*(server.serve(sockets=listening.get(server)) for server in servers))
     finally:
+        # uvicorn closes a started server's sockets; these are the ones of a start cut short.
+        for sockets in listening.values():
+            _close(sockets)
         for task in tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

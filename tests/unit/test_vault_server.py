@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import socket
 import stat
 import sys
 import types
@@ -376,6 +377,92 @@ def test_serve_closes_the_app_on_the_way_out(log_buffer: io.StringIO) -> None:
     assert _log_lines(log_buffer)[-1]["event"] == "vault_stopped"
 
 
+# --- pre-bound listeners (M5 design B.3, D17) -----------------------------------------------------
+
+
+# How the OS words "address already in use": WinError on Windows, where the errno is WSA's.
+IN_USE = rf"\[(Errno|WinError) {errno.EADDRINUSE}\] "
+
+
+def _occupied() -> socket.socket:
+    """A loopback socket listening on a free port, as another process's would."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    return sock
+
+
+def test_a_listen_address_in_use_is_a_startup_error(
+    monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    bound: list[socket.socket] = []
+
+    def binder(host: str, port: int) -> list[socket.socket]:
+        sockets = server.bind_tcp(host, port)
+        bound.extend(sockets)
+        return sockets
+
+    def no_server(config: Any) -> None:
+        raise AssertionError("a server was built before every address was bound")
+
+    class App:
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(server, "_Server", no_server)
+    with _occupied() as occupied:
+        port = occupied.getsockname()[1]
+        listens = ["127.0.0.1:0", f"127.0.0.1:{port}"]
+        refused = f"^can't listen on 127.0.0.1:{port} for the proxy: {IN_USE}"
+        with pytest.raises(StartupError, match=refused):
+            asyncio.run(
+                server.serve(cast(VaultApp, App()), listens, config=None, environ={}, binder=binder)
+            )
+    # The address bound before the one in use is closed again, and the vault never started.
+    assert len(bound) == 1
+    assert bound[0].fileno() == -1
+    assert "vault_started" not in log_buffer.getvalue()
+
+
+def test_the_binder_sets_so_reuseaddr_on_posix_only() -> None:
+    # As asyncio does: on Windows the option shares a port rather than reusing a closed one's.
+    with _occupied() as occupied:
+        port = occupied.getsockname()[1]
+        with pytest.raises(OSError, match=f"^{IN_USE}"):
+            server.bind_tcp("127.0.0.1", port)
+    [sock] = server.bind_tcp("127.0.0.1", 0)
+    with sock:
+        assert sock.getsockname()[0] == "127.0.0.1"
+        assert (sock.family, sock.type) == (socket.AF_INET, socket.SOCK_STREAM)
+        reuse = sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+        assert bool(reuse) is (sys.platform != "win32")
+
+
+def test_the_binder_keeps_ipv6_sockets_to_ipv6() -> None:
+    try:
+        sockets = server.bind_tcp("::1", 0)
+    except OSError:
+        pytest.skip("no IPv6 loopback here")
+    [sock] = sockets
+    with sock:
+        assert sock.family == socket.AF_INET6
+        assert sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+
+
+def test_the_binder_skips_what_asyncio_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    unmakeable = (cast(socket.AddressFamily, 12345), socket.SOCK_STREAM, 0, "", ("x", 0))
+    unavailable = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 0))  # TEST-NET-1
+    loopback = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))
+    infos = [unmakeable, unavailable, unavailable, loopback]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: infos)
+    [sock] = server.bind_tcp("vault.example", 0)
+    with sock:
+        assert sock.getsockname()[0] == "127.0.0.1"
+    infos = [unmakeable, unavailable]
+    with pytest.raises(OSError, match=r"^no address vault\.example resolves to can be bound$"):
+        server.bind_tcp("vault.example", 0)
+
+
 def test_run_gives_the_admin_the_token_manager(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -708,7 +795,7 @@ def test_serve_runs_and_stops_the_gateway_key_timer(
             def __init__(self, config: Any) -> None:
                 pass
 
-            async def serve(self) -> None:
+            async def serve(self, sockets: list[socket.socket] | None = None) -> None:
                 await running.wait()
 
         monkeypatch.setattr(server, "gateway_key_timer", timer)
@@ -719,6 +806,7 @@ def test_serve_runs_and_stops_the_gateway_key_timer(
             config=None,
             environ={},
             gateway_keys=ratchet,
+            binder=lambda host, port: [],  # binds nothing
         )
         return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
