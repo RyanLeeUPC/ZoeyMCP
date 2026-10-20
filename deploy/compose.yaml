@@ -15,11 +15,23 @@
 #     zoeymcp secret set notes-key
 #   docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes
 #
+# The portal (docs/operations.md, "The portal") is at http://localhost:8081 in a browser on this
+# host; ZOEYMCP_ADMIN_PORT=9000 moves it to http://localhost:9000 (the origin below follows).
+# Issue the first setup code with:
+#
+#   docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp setup-code
+#
+# From another machine, tunnel the same port number (ssh -N -L 8081:127.0.0.1:8081 host), or put
+# an HTTPS proxy of your own in front (operations.md); leave the admin block out for no portal.
+#
 # What this tier gives up: the gateway shares the vault's network namespace, so it has egress
-# of its own. And a client token sent to a port without TLS is readable on the network, which is
-# why the port is published on loopback only. For agents on other hosts, add the lan profile
-# (`--profile lan`, TLS; see below), or move to the hardened tier (compose.hardened.yaml), where
-# the gateway has no egress.
+# of its own, and it reaches the portal's listener, as does any container on this project's
+# network: passkeys and single-use setup codes protect the portal there, not reachability. And
+# a client token sent to a port without TLS is readable on the network, which is why both ports
+# are published on loopback only (which keeps them off the LAN on Docker Engine 28 or later).
+# For agents on other hosts, add the lan profile (`--profile lan`, TLS; see below), or move to
+# the hardened tier (compose.hardened.yaml), where the gateway has no egress and can't reach
+# the portal.
 
 name: zoeymcp
 
@@ -49,6 +61,14 @@ services:
       ZOEYMCP_CONFIG: |
         version: 1
         mode: declarative
+        # The portal. Leave this block out for no portal.
+        admin:
+          # Every address in the container, since a container's loopback can't be published;
+          # the ports line below publishes it on the host's loopback only.
+          listen: 0.0.0.0:8081
+          # The exact addresses a browser uses, the published port included. Add a tunnel's
+          # other local port, or your HTTPS proxy's https://<name>, here.
+          origins: ["http://localhost:${ZOEYMCP_ADMIN_PORT:-8081}"]
         credentials:
           notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
         routes:
@@ -76,7 +96,8 @@ services:
               # then classify each tool under allow or approve and commit the pins.
               tools: {include: [], allow: [], approve: []}
               review: {}
-    ports: ["127.0.0.1:8090:8090"]
+    # Loopback only: agents on 8090, and the portal (container port 8081, the listen above).
+    ports: ["127.0.0.1:8090:8090", "127.0.0.1:${ZOEYMCP_ADMIN_PORT:-8081}:8081"]
     tmpfs:
       - /tmp:size=16m
       - /run/zoeymcp:size=1m,mode=0700,uid=10001,gid=10001

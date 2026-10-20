@@ -518,6 +518,7 @@ fake_round() {
 }
 
 step "standard tier: up, from deploy/compose.yaml, with the smoke's policy and the fake upstream"
+# The portal as the compose file has it, on every address in the container.
 cat >"$work/standard.yaml" <<EOF
 services:
   zoeymcp:
@@ -526,6 +527,9 @@ $(vault_trust)
       ZOEYMCP_CONFIG: |
         version: 1
         mode: declarative
+        admin:
+          listen: 0.0.0.0:8081
+          origins: [http://localhost:8081]
 $(smoke_policy)
 $(fake_service)
 EOF
@@ -619,9 +623,10 @@ hardened_master="$(echo "$keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
 gateway_key="$(echo "$keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
 first_key="$gateway_key"
 generation=1
-# The smoke's policy, with this run's client token, and the vault trusting the fake upstream's
-# CA; compose interpolates the generation. The fake upstream joins egress, the vault's way out,
-# for this run only.
+# The smoke's policy, with this run's client token and the portal as the compose file has it
+# (on the vault's egress alias), and the vault trusting the fake upstream's CA; compose
+# interpolates the generation. The fake upstream joins egress, the vault's way out, for this run
+# only (so it could reach the portal, as anything on egress could).
 cat >"$work/override.yaml" <<EOF
 services:
   vault:
@@ -631,6 +636,9 @@ $(vault_trust)
         version: 1
         mode: declarative
         gateway_key_generation: \${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
+        admin:
+          listen: vault-portal:8081
+          origins: [http://localhost:8081]
 $(smoke_policy)
 $(fake_service)
     networks: [egress]

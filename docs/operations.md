@@ -902,8 +902,33 @@ block the log has `portal_disabled`.
 **Reaching it.** Open one of the listed origins exactly as written. An IP address such as
 `http://127.0.0.1:8081/` is sent on to `http://localhost:8081/` when that origin is listed;
 any other address gets 421. Through an SSH tunnel, forward the same port number
-(`ssh -L 8081:127.0.0.1:8081 host`): the browser's address must be a listed origin, port
-included. The compose files don't publish the portal yet.
+(`ssh -N -L 8081:127.0.0.1:8081 host`): the browser's address must be a listed origin, port
+included, so another local port (`-L 9000:...`, `http://localhost:9000`) must be added to
+`admin.origins`; it takes the same passkeys and needs no new setup code.
+
+Both compose files turn the portal on and publish it on the host's loopback only, at
+`http://localhost:8081`; set `ZOEYMCP_ADMIN_PORT` to publish it on another port, and the
+compose file's origin follows. Remove the `admin` block for no portal.
+
+- **Standard tier:** the vault listens on `0.0.0.0:8081` inside the container (a container's
+  loopback can't be published). The gateway shares that network namespace, and any container on
+  the compose project's network (the `lan` proxy, an agent joined to reach port 8090) can reach
+  the listener too. Without a session they can only load the page and try to sign in or redeem
+  a setup code: passkeys and single-use setup codes are what protect it there.
+- **Hardened tier:** `admin.listen` is `vault-portal:8081`, a network alias the vault has on
+  `egress` only, and the vault refuses to start unless it resolves to exactly one address. Only
+  the host's loopback reaches it: not the gateway, nor anything on `internal`, `direct` or
+  `agents`. Keep `egress` to the vault alone, since whatever joins it reaches the portal (an
+  egress proxy gets a network of its own). If `egress` must become an internal network to your
+  own proxy, nothing can be published: give the vault a separate non-internal network with its
+  own alias for the portal, or run without one.
+
+A port published on `127.0.0.1` stays off the LAN only on Docker Engine 28.0 or later; older
+engines let hosts on the same network segment reach it. For a browser on another machine, use
+the SSH tunnel above, or an HTTPS reverse proxy of your own with a certificate that machine
+trusts: list its `https://<name>` origin, and have it pass `Host` unchanged, port included
+(nginx's `$host` drops the port: use `$http_host`). The vault ignores `X-Forwarded-*`, and the
+proxy sees every secret typed into the portal.
 
 **The first passkey.**
 

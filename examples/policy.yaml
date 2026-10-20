@@ -11,7 +11,7 @@ gateway_key_generation: 1
 
 # The portal. Leave this block out for no portal.
 admin:
-  listen: 127.0.0.1:8081 # in a container: 0.0.0.0:8081
+  listen: 127.0.0.1:8081 # the compose files set their own
   # The exact origins the browser uses: http only on localhost, otherwise https.
   origins: [http://localhost:8081, https://zoeymcp.tailnet.example]
 

@@ -1,5 +1,6 @@
-"""The compose files: their inline policies pass ``check``, and the standard tier's container is
-the box its launcher insists on (M3 design B.2, B.3)."""
+"""The compose files: their inline policies pass ``check``, the standard tier's container is the
+box its launcher insists on (M3 design B.2, B.3), and the portal is published on the host's
+loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2)."""
 
 from __future__ import annotations
 
@@ -11,8 +12,9 @@ import pytest
 import yaml
 
 from zoeymcp.common.policy import check_policy, parse_policy
-from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.common.policy.schema import GatewayLimits, Policy
 from zoeymcp.entrypoint import env, launcher
+from zoeymcp.portal import listen
 
 DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
 COMPOSE_FILES = sorted(DEPLOY.glob("compose*.yaml"))
@@ -55,6 +57,23 @@ def unprivileged(service: dict[str, Any], cap_add: list[str] | None = None) -> N
     assert not service["user"].startswith("0:")
 
 
+def inline_policy(document: dict[str, Any], name: str) -> Policy:
+    """The one inline policy in a compose ``document``."""
+    policies = [
+        service["environment"]["ZOEYMCP_CONFIG"]
+        for service in document["services"].values()
+        if "ZOEYMCP_CONFIG" in service.get("environment", {})
+    ]
+    assert len(policies) == 1
+    return parse_policy(policies[0], name)
+
+
+def published(entry: str) -> tuple[str, int, int]:
+    """A ``ports`` entry, ``ip:host_port:container_port``, as its three parts."""
+    ip, host_port, container_port = entry.rsplit(":", 2)
+    return ip, int(host_port), int(container_port)
+
+
 def test_there_are_both_tiers() -> None:
     assert [path.name for path in COMPOSE_FILES] == ["compose.hardened.yaml", "compose.yaml"]
 
@@ -69,10 +88,7 @@ def test_inline_policies_pass_check(path: Path) -> None:
     ]
     assert policies
     for text in policies:
-        policy = parse_policy(text, path.name)
-        # No portal until its listener, alias and published port come in together.
-        assert policy.admin is None
-        findings = check_policy(policy)
+        findings = check_policy(parse_policy(text, path.name))
         assert [f for f in findings if f.level == "error"] == []
 
 
@@ -84,8 +100,9 @@ def test_the_standard_container_is_the_launchers_box() -> None:
     assert service["cap_drop"] == ["ALL"]
     assert sorted(service["cap_add"]) == ["SETGID", "SETUID"]
     assert service["security_opt"] == ["no-new-privileges:true"]
-    # Loopback only: a client token on a port without TLS is readable on the network.
-    assert service["ports"] == ["127.0.0.1:8090:8090"]
+    # Loopback only: a client token on a port without TLS is readable on the network, and the
+    # portal is for a browser on the host (or at the end of a tunnel to it).
+    assert service["ports"] == ["127.0.0.1:8090:8090", "127.0.0.1:8081:8081"]
     tmpfs = {entry.split(":")[0]: entry.split(":", 1)[1] for entry in service["tmpfs"]}
     for directory in env.DIRECTORIES:
         if not directory.path.startswith("/run/"):
@@ -115,6 +132,70 @@ def test_the_hardened_gateway_has_no_egress() -> None:
     assert "ZOEYMCP_MASTER_KEY" not in gateway["environment"]
     assert "ZOEYMCP_CONFIG" not in gateway["environment"]
     assert "egress" in document["services"]["vault"]["networks"]
+
+
+PORTAL_SERVICES = [("compose.yaml", "zoeymcp"), ("compose.hardened.yaml", "vault")]
+
+
+@pytest.mark.parametrize(("path", "name"), PORTAL_SERVICES)
+@pytest.mark.parametrize("admin_port", [None, "9000"])
+def test_the_portal_is_published_on_the_hosts_loopback_only(
+    path: str, name: str, admin_port: str | None
+) -> None:
+    environ = {} if admin_port is None else {"ZOEYMCP_ADMIN_PORT": admin_port}
+    document = compose(path, environ)
+    policy = inline_policy(document, path)
+    assert policy.admin is not None
+    port = listen.split(policy.admin.listen)[1]
+    host_port = int(admin_port or port)
+    # The browser's origin carries the port the host publishes, not the container's.
+    assert policy.admin.origins == [f"http://localhost:{host_port}"]
+    portal = [
+        published(entry)
+        for service in document["services"].values()
+        for entry in service.get("ports", [])
+        if published(entry)[2] == port
+    ]
+    assert portal == [("127.0.0.1", host_port, port)]
+    assert f"127.0.0.1:{host_port}:{port}" in document["services"][name]["ports"]
+    # Every port of the container holding the vault is on the host's loopback.
+    assert all(published(entry)[0] == "127.0.0.1" for entry in document["services"][name]["ports"])
+
+
+def test_the_standard_portal_listens_on_every_address_in_its_container() -> None:
+    policy = inline_policy(compose("compose.yaml"), "compose.yaml")
+    assert policy.admin is not None
+    # A container's loopback can't be published, so the listener takes every address there.
+    assert policy.admin.listen == "0.0.0.0:8081"
+
+
+def test_the_hardened_portal_listens_on_egress_alone() -> None:
+    document = compose("compose.hardened.yaml")
+    networks, services = document["networks"], document["services"]
+    policy = inline_policy(document, "compose.hardened.yaml")
+    assert policy.admin is not None
+    host, port = listen.split(policy.admin.listen)
+    # A name, resolved at start to exactly one address, never a literal or a wildcard.
+    assert listen.literal(host) is None
+    assert (host, port) == ("vault-portal", 8081)
+    vault = services["vault"]["networks"]
+    assert isinstance(vault, dict)
+    aliases = {network: (vault[network] or {}).get("aliases", []) for network in vault}
+    assert aliases == {"internal": [], "direct": [], "egress": ["vault-portal"]}
+    # Docker publishes a port only through a non-internal network: egress must be the vault's
+    # only one, so the published port lands on the address the portal listens on.
+    assert [n for n in vault if networks[n].get("internal") is not True] == ["egress"]
+    # Whatever joins egress reaches the portal: it holds the vault alone (an egress proxy gets
+    # a network of its own).
+    joined = {name for name, service in services.items() if "egress" in service.get("networks", [])}
+    assert joined == {"vault"}
+    # Nor does anything share a network namespace with the vault.
+    assert all(service.get("network_mode", "none") == "none" for service in services.values())
+    # No other service answers to the alias.
+    for name, service in services.items():
+        if name != "vault" and isinstance(service.get("networks"), dict):
+            for settings in service["networks"].values():
+                assert "vault-portal" not in (settings or {}).get("aliases", [])
 
 
 @pytest.mark.parametrize(

@@ -223,8 +223,8 @@ when the vault's image digest isn't an official release. Toolkits go into a deri
 | Secrets | the master key only in the vault process's env; the gateway gets an allowlisted environment, and PID 1 none. `/state` is `0700`, owned by the vault uid. The gateway can't read the vault's state, its `/proc/<pid>/environ` or its admin socket | the master key only in the vault container |
 | Gateway → vault | Unix socket, peer uid checked | gateway key over the `internal` network |
 | Gateway egress | **yes**: it shares the vault's network namespace, so a compromised gateway can send tool results anywhere | **none**: the gateway's only network peers are agents and the vault |
-| Admin listener | in the gateway's network namespace; protected by passkey auth, not by reachability | on the vault's `egress` address only; the gateway can't reach it |
-| Publishing ports | works | the gateway is on internal networks only; LAN access uses the `lan` profile (§3.4) |
+| Admin listener (the portal, if the policy has an `admin` block) | `0.0.0.0:8081` in the one container (its loopback can't be published), published on `127.0.0.1:${ZOEYMCP_ADMIN_PORT:-8081}`; the host's loopback reaches it, and so do the gateway (same namespace) and every container on the compose network: passkeys and single-use setup codes protect it, not reachability | `vault-portal:8081`, a network alias the vault has on `egress` only, resolved at start to exactly one address and published on `127.0.0.1:${ZOEYMCP_ADMIN_PORT:-8081}`; only the host's loopback reaches it, not the gateway or anything on `internal`, `direct` or `agents` |
+| Publishing ports | works; both ports on the host's loopback only | the gateway is on internal networks only; LAN access uses the `lan` profile (§3.4); the portal is published from `egress` |
 | Use for | evaluation, desktop clients, low-stakes setups | **anything that moves money, sends mail or touches personal data** |
 
 The README quickstart uses the standard tier, and says on the same page when to move to the
@@ -286,7 +286,7 @@ packages installed at all. `zoeymcp gateway` execs into the second environment; 
 | --- | --- | --- | --- |
 | `agents` | yes | agents, gateway, the `lan` proxy | agents → gateway on port 8090 |
 | `internal` | yes | gateway, vault, bridges | gateway → vault (gateway key); gateway → bridges; bridges → vault (their placeholders) |
-| `egress` | no | vault only | vault → internet or an egress proxy; the admin listener |
+| `egress` | no | vault only (alias `vault-portal`) | vault → internet (an egress proxy gets a network of its own); the admin listener, published on the host's loopback |
 | `direct` (opt-in) | yes | agent sandboxes, vault | plain API routes for scripts |
 | `lan` (profile) | no | the `lan` proxy | its published port |
 
@@ -313,8 +313,15 @@ services:
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?run zoeymcp keygen}
       ZOEYMCP_CONFIG: |                                  # gateway_key_generation from the env
+        admin:
+          listen: vault-portal:8081
+          origins: ["http://localhost:${ZOEYMCP_ADMIN_PORT:-8081}"]
         ...
-    networks: [internal, direct, egress]
+    networks:
+      internal: {}
+      direct: {}
+      egress: {aliases: [vault-portal]}                  # the vault's only non-internal network
+    ports: ["127.0.0.1:${ZOEYMCP_ADMIN_PORT:-8081}:8081"]
     volumes: [vault-state:/state]
 
   gateway:
@@ -338,6 +345,18 @@ authenticated by the old key would hand the new key to whoever stole the old one
 - **`agents` must be internal too.** A non-internal network would give the gateway internet egress
   through the back door. Docker doesn't publish ports from internal-only networks, so LAN access
   goes through the `lan` profile (below).
+- **The portal listens on `egress` alone.** Docker publishes a port only through a container's
+  non-internal network, so the vault's published port lands on its `egress` address, and the
+  listener binds that address only: `admin.listen` names the `vault-portal` alias, which the vault
+  has on `egress` alone, and the vault refuses to start when the name resolves to no address or
+  to several (it retries for 10 s while the alias appears). Nothing listens on 8081 on the
+  vault's `internal` and `direct` addresses, so the gateway, bridges and agent sandboxes can't
+  reach it. `egress` must therefore stay the vault's only non-internal network and hold no other
+  container, since whatever joins it reaches the portal: an egress proxy gets a network of its
+  own. `tests/unit/test_deploy.py` pins both. If `egress` is replaced by an internal network to
+  the operator's own proxy, nothing can be published: give the vault a separate non-internal
+  network with its own alias, or run without a portal. A port published on `127.0.0.1` stays off
+  the LAN on Docker Engine 28.0 or later only.
 - **Subnets are left to Docker** unless the operator pins addresses for defense in depth;
   identity doesn't depend on them (§3.2).
 - **Bridges** reach the outside through vault routes where the server takes a base-URL override.
