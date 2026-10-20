@@ -505,7 +505,7 @@ def test_a_plan_that_moved_is_changed(rig: PortalRig) -> None:
         "credential": world.a,
         "reason": "changed",
     }
-    assert rig.lines("portal_request")[-1]["reason"] == "changed"
+    assert rig.logged("portal_request", lambda line: line["reason"] == "changed")
     # A removal whose sessions changed: another sign-in with that passkey in between.
     held = prepared(world.first, "passkey.remove", {"credential": world.b})
     assert login(rig.browser().page(rig.origin), world.beta).status_code == 200

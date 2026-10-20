@@ -100,6 +100,18 @@ class PortalRig:
     def lines(self, event: str | None = None) -> list[dict[str, Any]]:
         return [line for line in self.log.lines() if event is None or line["event"] == event]
 
+    def logged(
+        self, event: str, where: Callable[[dict[str, Any]], bool], timeout: float = 10.0
+    ) -> list[dict[str, Any]]:
+        """The ``event`` lines ``where`` picks, waiting until there is one. A request is logged
+        once its answer is sent, so the client can read the answer before the line is written."""
+        deadline = time.monotonic() + timeout
+        while True:
+            found = [line for line in self.lines(event) if where(line)]
+            if found or time.monotonic() > deadline:
+                return found
+            time.sleep(0.01)
+
     def call(self, function: Callable[[], Any]) -> Any:
         """Run ``function`` on the vault's loop, as a signal handler would."""
 
@@ -181,6 +193,7 @@ def running(
                 setup=vault.setup,
                 passkeys=vault.passkeys,
                 login=vault.login,
+                secrets=app.secrets,
                 routes=routes,
                 handlers=handlers,
                 body_deadline=body_deadline,

@@ -362,7 +362,7 @@ def test_a_session_route_needs_both_halves(tmp_path: Path, handlers: Handlers) -
         refused(browser.forge("GET", rig.origin + "/api/test/who", alone), 401, "no_session")
         # A setup session reaches only its own routes.
         refused(page.fetch("GET", "/api/test/setup"), 403, "scope")
-        [request] = [line for line in rig.lines("portal_request") if line["route"] == WHO.path]
+        [request] = rig.logged("portal_request", lambda line: line["route"] == WHO.path)
         assert request["session"] == minted.session.fingerprint
         assert request["status"] == 200
         assert minted.cookie.reveal() not in rig.log.getvalue()
@@ -488,13 +488,7 @@ def test_a_handler_that_fails_is_a_500_with_every_header(
         browser = rig.browser()
         signed_in(rig, browser)
         refused(browser.page(rig.origin).fetch("GET", BOOM.path), 500, "internal")
-
-        # The request is logged once the answer is sent: the client can see it first.
-        def failures() -> list[dict[str, Any]]:
-            return [line for line in rig.lines("portal_request") if line["status"] == 500]
-
-        wait_until(lambda: bool(failures()))
-        [line] = failures()
+        [line] = rig.logged("portal_request", lambda line: line["status"] == 500)
         assert (line["route"], line["error_type"]) == (BOOM.path, "RuntimeError")
         assert "a handler's bug" not in rig.log.getvalue()
 
