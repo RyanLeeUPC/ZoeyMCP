@@ -100,7 +100,7 @@ say so.
 | --- | --- | --- |
 | R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, and (in managed mode) policy editing | Must |
 | R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only | Must |
-| R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion) for every security-relevant save: writing a secret, changing policy, re-pinning a tool, moving a tool from `approve` to `allow`, changing a connector's constraints | Must |
+| R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion, bound to the one change it confirms) for every security-relevant change; the step-up column of §7.1's table is the list: writing or deleting a secret, completing or resetting an OAuth connection, enrolling, renaming or removing a passkey, and, as they are built, changing policy, re-pinning a tool, moving a tool from `approve` to `allow` and changing a connector's constraints | Must |
 | R63 | **Browser hardening:** the exact origins the operator lists drive the `Host` and `Origin` checks (stopping DNS rebinding); every API request needs `Sec-Fetch-Site: same-origin`, and every state change is a `fetch()` with `POST` or `DELETE` carrying the page's own `Origin` (no forms); every answer carries a CSP with no inline script or style, `form-action 'none'`, `frame-ancestors 'none'` and Trusted Types, plus `nosniff`, `no-referrer`, `no-store`, COOP, CORP and `X-Frame-Options: DENY`; `SameSite=Strict` session cookies; no third-party assets. The OAuth callback is the only exception (§7.3) | Must |
 | R64 | **One source of truth for policy**, chosen per deployment: **managed** (the portal is the source; export/import YAML) or **declarative** (a config file or env var is the source; the portal can't edit policy and produces diffs to commit instead). Never both | Must |
 | R65 | **Bootstrap:** a random **one-time setup code**, issued on demand with `docker exec` (none exists until then), never logged, valid for 15 minutes, spent when it is redeemed, and invalidated when the first passkey is enrolled. Whether enrolling with it replaces every passkey is decided when it is issued (`--reset`). Recovery from lost passkeys follows the same path, so it needs host access | Must |
@@ -1336,9 +1336,21 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
     for Windows Hello on some TPMs). Nothing else.
   - This is the subset of WebAuthn we need, not full spec coverage (no attestation formats, no
     extensions), and the docs say so.
-- **Step-up:** each security-relevant save (the table in §7.1) needs a fresh passkey assertion,
-  bound to that request. A stolen session cookie can browse, but it can't change anything that
-  matters.
+- **Step-up:** each security-relevant change (the table in §7.1) is an action, in two requests.
+  The page first sends the change; the vault makes every check the change will make, changes
+  nothing, and holds the action for 5 minutes (one per session; a new one replaces it),
+  answering a summary of exactly what it will do and the options for a passkey prompt. A mistake
+  shows here, before any prompt. The operator reads the summary and confirms with a passkey of
+  this address. The prompt's challenge commits to the action, its kind, the session, the origin
+  and a hash of the held data, so an assertion confirms that one action and nothing else; the
+  confirm sends only the assertion, and the vault runs what it held, never anything the page sends
+  then. It takes the action out of its table first, so every action is used once, and checks
+  everything again: if anything shown has changed in between, it refuses with both summaries
+  and the operator prepares again. Logging out, ending other sessions and reading anything need
+  no step-up; a setup session's one enrolment has none either, since the code was its step-up.
+  The portal never removes the last passkey (`zoeymcp passkeys --remove` may, since host access is
+  the recovery path). A stolen session, both halves of it, can browse and end sessions, but it
+  can't change anything that matters without the operator's passkey.
 
 ### 7.3 Browser hardening
 

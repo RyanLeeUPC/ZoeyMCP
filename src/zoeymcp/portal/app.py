@@ -21,16 +21,30 @@ any route takes, closes the connection.
 The static files are loaded once, at start, into a fixed map (:func:`load_static`); a missing
 one stops the start. The API's routes are ``routes.ROUTES``, each answered by a handler here
 (M.1): logging in with a passkey, redeeming a setup code and enrolling with it (E, F.2), the
-session and the session list, logout and ending the other sessions. Before any session lookup
-the expired sessions are ended and logged, and however a session ends, its ceremony and action
-are dropped and its OAuth flows cancelled (H.2).
+session and the session list, logout and ending the other sessions, the passkey list, and the
+step-up path (F.4). Before any session lookup the expired sessions are ended and logged, and
+however a session ends, its ceremony and action are dropped and its OAuth flows cancelled (H.2).
+
+**Every change a full session makes is an action** (P6): ``POST /api/actions`` checks the body
+against the registry (``actions.KINDS``) and runs the kind's plan (:meth:`PortalApp._kinds`),
+which checks everything the change will check and changes nothing, so a mistake shows before the
+passkey prompt; the vault holds the action with its plan and answers the summary and the step-up
+options. ``POST /api/actions/{action}/confirm`` takes the action out of the table, verifies the
+assertion against the action's challenge, plans again and answers ``409 changed`` with both
+summaries if the plan moved; otherwise it applies the counter, runs what was held and answers
+its result. The kinds built so far are the passkeys': ``passkey.enrol`` (its run begins an
+enrolment ceremony for this session, finished at ``/api/passkeys/enrol/finish``),
+``passkey.rename`` and ``passkey.remove`` (never the last passkey: host access is the recovery
+path, Q26).
 
 Logs (M.4): ``portal_request`` for each answer a handler gives; ``portal_refused`` for a refusal
 before one, at most once per 10 s per reason with a count, never the refused ``Host`` or
 ``Origin``; a static file or the 308 as ``portal_request``, at most once per 10 s per path. The
 handlers log ``portal_login``, ``portal_login_failed``, ``setup_code_redeemed``,
 ``setup_code_refused`` (at most once a minute, with a count), ``passkey_enrolled`` (a warning when
-a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout`` and ``portal_session_ended``.
+a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout``, ``portal_session_ended``,
+``step_up_confirmed``, ``step_up_refused``, ``action_changed``, ``passkey_renamed`` and
+``passkey_removed``.
 """
 
 from __future__ import annotations
@@ -50,7 +64,7 @@ from starlette.types import Receive, Scope, Send
 from ..vault import logs
 from . import passkeys as passkey_file
 from . import routes as api
-from .actions import Actions
+from .actions import Action, ActionRefusal, Actions, changed, parse_request
 from .admission import (
     Admitted,
     Origin,
@@ -169,18 +183,52 @@ class Call:
     body: Mapping[str, Any] | None
     session: Session | None
     peer: str = ""  # for the login ceremonies' quota per peer (F.1)
+    size: int = 0  # the body's length in bytes: an action's cap depends on its kind (M.1)
 
 
 @dataclass(frozen=True)
 class Reply:
-    """A handler's answer: a JSON object, its status, and any extra headers (``Set-Cookie``)."""
+    """A handler's answer: a JSON object, its status, and any extra headers (``Set-Cookie``).
+    ``reason`` is for the log, when the answer is a refusal with more than a refusal's fields
+    (``409 changed`` shows both plans)."""
 
     body: Mapping[str, Any]
     status: int = 200
     headers: tuple[Header, ...] = field(default=(), repr=False)
+    reason: str | None = None
 
 
 Handler = Callable[[Call], Awaitable[Reply | Refusal]]
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What a kind's plan found (F.4): the summary the operator confirms, as label and value
+    pairs (each value the vault's own text, or passed through :func:`~.display.shown`), and the
+    facts it was made from. A confirm plans again and compares the two (``actions.changed``): a
+    different summary or different facts is ``409 changed``. The facts leave out what moves
+    without mattering to the change, such as a passkey's last-used day."""
+
+    summary: tuple[tuple[str, str], ...]
+    facts: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class Step:
+    """Where an action is planned and run: the origin entry, the session and the passkey file."""
+
+    entry: Origin
+    session: Session
+    holder: Passkeys
+
+
+@dataclass(frozen=True)
+class ActionKind:
+    """One kind of action as the portal runs it: its plan, which changes nothing, and its run,
+    given the data the vault held. The registry's shape checks (``actions.KINDS``) come first."""
+
+    plan: Callable[[Mapping[str, Any], Step], Plan | Refusal]
+    run: Callable[[Mapping[str, Any], Step], Awaitable[Reply | Refusal]]
 
 
 class _Gone(Exception):
@@ -257,6 +305,7 @@ class PortalApp:
         self.sessions = Sessions()
         self.ceremonies = Ceremonies()
         self.actions = Actions()
+        self._kinds = self._own_kinds()
         self._gate = InFlight()
         self._bucket = Bucket()
         self._refused: Sparse[str] = Sparse(REFUSED_LOG_EVERY)
@@ -266,6 +315,11 @@ class PortalApp:
     @property
     def origins(self) -> tuple[str, ...]:
         return tuple(entry.origin for entry in self._entries)
+
+    @property
+    def action_kinds(self) -> frozenset[str]:
+        """The kinds of action this portal plans and runs, each one in ``actions.KINDS``."""
+        return frozenset(self._kinds)
 
     @property
     def in_flight(self) -> tuple[int, int]:
@@ -342,8 +396,10 @@ class PortalApp:
             await self._refuse(exchange, refusal("not_found"))
             return
         session = None
-        # Expired sessions end here, logged, before any lookup could find one (6b's sweep).
+        # Expired sessions end here, logged, before any lookup could find one (6b's sweep), and
+        # expired actions drop the data they hold.
         self._finish(self.sessions.sweep(self._wall()))
+        self.actions.sweep(self._wall())
         if route.unauthenticated:
             slot = self._gate.enter_unauthenticated(ticket)
             refused = admit_unauthenticated(slot=slot, token=slot and self._bucket.take(started))
@@ -354,6 +410,7 @@ class PortalApp:
             await self._refuse(exchange, refused)
             return
         body = None
+        size = 0
         if route.cap:
             raw = await self._read_body(exchange, route.cap)
             parsed = raw if isinstance(raw, Refusal) else parse_body(route, raw)
@@ -361,18 +418,20 @@ class PortalApp:
                 await self._refuse(exchange, parsed)
                 return
             body = parsed
+            size = len(raw) if isinstance(raw, bytes) else 0  # always bytes here
         if session is not None:
             session = self.sessions.touch(session.id, self._wall()) or session
         query = exchange.scope.get("query_string", b"")
         client = exchange.scope.get("client")
         peer = str(client[0]) if client else ""
-        call = Call(admitted.entry, route, admitted.params, query, body, session, peer)
+        call = Call(admitted.entry, route, admitted.params, query, body, session, peer, size)
         answer = await handler(call)
+        reason: str | None
         if isinstance(answer, Refusal):
             status, reason = answer.status, answer.reason
             await self._send_json(exchange, status, answer.body(), _refusal_headers(answer))
         else:
-            status, reason = answer.status, None
+            status, reason = answer.status, answer.reason
             await self._send_json(exchange, status, answer.body, answer.headers)
         logs.event(
             "portal_request",
@@ -458,6 +517,10 @@ class PortalApp:
             api.END_OTHERS: self._end_others,
             api.ENROL_BEGIN: self._enrol_begin,
             api.ENROL_FINISH: self._enrol_finish,
+            api.PASSKEYS: self._passkeys,
+            api.ACTIONS: self._prepare,
+            api.CONFIRM: self._confirm,
+            api.CANCEL: self._cancel,
         }
 
     async def _login_begin(self, call: Call) -> Reply | Refusal:
@@ -694,6 +757,231 @@ class PortalApp:
             self.setup.discard()  # the first passkey, by whatever path (E.1)
         return Reply({"passkey": _passkey_view(passkey, fingerprint)})
 
+    # --- passkeys and the step-up path (D.5, F.4) ------------------------------------------------
+
+    async def _passkeys(self, call: Call) -> Reply | Refusal:
+        """Every passkey as D.5 shows it, with the one this session signed in with marked: never
+        a key, a full ID or the user handle."""
+        session = _session(call)
+        holder = self._holder()
+        if isinstance(holder, Refusal):
+            return holder
+        listed = []
+        for passkey in holder.document.credentials:
+            fingerprint = holder.fingerprint(passkey.id)
+            view = _passkey_view(passkey, fingerprint)
+            view["this"] = fingerprint == session.credential
+            listed.append(view)
+        return Reply({"passkeys": listed})
+
+    async def _prepare(self, call: Call) -> Reply | Refusal:
+        """F.4 step 1: check the request against the registry, run the kind's plan, and hold the
+        action, replacing this session's earlier one. Nothing changes, and a refusal shows
+        before any passkey prompt. The step-up options list this RP ID's passkeys."""
+        session = _session(call)
+        holder = self._holder()
+        if isinstance(holder, Refusal):
+            return holder
+        request = parse_request(dict(_body(call)), call.size)
+        if isinstance(request, ActionRefusal):
+            return refusal(request.reason)
+        kind = self._kinds.get(request.kind.name)
+        if kind is None:
+            return refusal("bad_body")  # a kind a later step builds
+        entry = call.entry
+        plan = kind.plan(request.data, Step(entry, session, holder))
+        if isinstance(plan, Refusal):
+            return plan
+        action = self.actions.prepare(
+            kind=request.kind.name,
+            data=request.data,
+            plan=plan,
+            session=session.id,
+            origin=entry.origin,
+            now=self._wall(),
+        )
+        options = request_options(
+            challenge=action.challenge, rp_id=entry.rp_id, allow=holder.document.credentials
+        )
+        answer = {
+            "action": action.id,
+            "kind": action.kind,
+            "expires": int(action.expires),
+            "summary": _summary(plan),
+            "options": options,
+        }
+        return Reply(answer)
+
+    async def _confirm(self, call: Call) -> Reply | Refusal:
+        """F.4 step 3: take the action out of the table, verify the assertion against its
+        challenge, plan again, and run exactly what was held. The action is spent whatever
+        happens. Any refusal of the assertion is one answer, ``step_up_refused``, with the
+        verifier's reason in the log; a plan that moved is ``409 changed`` with both summaries,
+        and one that now refuses answers that refusal. The counter is applied only then (L3
+        §7.2 step 24): a regression is flagged and the stored value never goes down (D10)."""
+        session = _session(call)
+        holder = self._holder()
+        if isinstance(holder, Refusal):
+            return holder
+        entry = call.entry
+        action = self.actions.take(
+            call.params["action"], session=session.id, origin=entry.origin, now=self._wall()
+        )
+        if action is None:
+            return refusal("action_unknown")
+        try:
+            asserted = verify_assertion(
+                _body(call)["credential"],
+                challenge=action.challenge,
+                origin=entry.origin,
+                rp_id=entry.rp_id,
+                credentials=holder.document.credentials,
+                user_handle=holder.user_handle,
+                login=False,
+            )
+        except WebAuthnError as exc:
+            logs.event("step_up_refused", action=action.kind, reason=exc.reason)
+            return refusal("step_up_refused")
+        credential = holder.fingerprint(asserted.credential_id)
+        kind = self._kinds[action.kind]
+        data = action.data.reveal()
+        step = Step(entry, session, holder)
+        plan = kind.plan(data, step)
+        if isinstance(plan, Refusal) or changed(action, plan):
+            reason = plan.reason if isinstance(plan, Refusal) else "changed"
+            logs.event("action_changed", action=action.kind, credential=credential, reason=reason)
+            return plan if isinstance(plan, Refusal) else _changed(action, plan)
+        holder.touch(asserted)
+        logs.event("step_up_confirmed", action=action.kind, credential=credential)
+        return await kind.run(data, step)
+
+    async def _cancel(self, call: Call) -> Reply | Refusal:
+        """F.4 step 4: drop this session's pending action and the data it holds."""
+        cancelled = self.actions.cancel(
+            call.params["action"],
+            session=_session(call).id,
+            origin=call.entry.origin,
+            now=self._wall(),
+        )
+        return Reply({"cancelled": cancelled})
+
+    def _own_kinds(self) -> dict[str, ActionKind]:
+        """The kinds this portal runs, each in ``actions.KINDS``; M6 and M8 add theirs here."""
+        return {
+            "passkey.enrol": ActionKind(self._plan_enrol, self._run_enrol),
+            "passkey.rename": ActionKind(self._plan_rename, self._run_rename),
+            "passkey.remove": ActionKind(self._plan_remove, self._run_remove),
+        }
+
+    def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``passkey.enrol``: the name, the count, and the RP ID the new passkey will work on."""
+        name = data["name"]
+        if not passkey_file.check_name(name):
+            return refusal("bad_name")
+        count = len(step.holder.document.credentials)
+        if count >= MAX_PASSKEYS:
+            return enrolment("too_many_passkeys")
+        rp_id = step.entry.rp_id
+        summary = (
+            ("Enrol a new passkey named", shown(name, NAME_LIMIT)),
+            ("It works on", rp_id),
+            ("Passkeys enrolled now", f"{count} of at most {MAX_PASSKEYS}"),
+        )
+        return Plan(summary, (name, rp_id, count))
+
+    async def _run_enrol(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """An enrolment ceremony for this session, as a setup code's would be: the page creates
+        the passkey and finishes at ``/api/passkeys/enrol/finish``, which checks again."""
+        entry, holder = step.entry, step.holder
+        ceremony = self.ceremonies.begin_enrol(
+            origin=entry.origin, session=step.session.id, name=data["name"], now=self._wall()
+        )
+        options = creation_options(
+            challenge=ceremony.challenge,
+            user_handle=holder.user_handle,
+            rp_id=entry.rp_id,
+            exclude=holder.document.credentials,
+        )
+        return Reply({"ceremony": ceremony.id, "options": options})
+
+    def _plan_rename(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``passkey.rename``: the passkey exists, on any RP ID, and the name follows D.4's
+        rules."""
+        target = _target(step.holder, data["credential"])
+        if isinstance(target, Refusal):
+            return target
+        fingerprint, passkey = target
+        name = data["name"]
+        if not passkey_file.check_name(name):
+            return refusal("bad_name")
+        summary = (
+            ("Rename the passkey", fingerprint),
+            ("Named now", shown(passkey.name, NAME_LIMIT)),
+            ("New name", shown(name, NAME_LIMIT)),
+            ("It works on", passkey.rp_id),
+        )
+        return Plan(summary, (fingerprint, passkey.name, name))
+
+    async def _run_rename(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        fingerprint = data["credential"]
+        try:
+            renamed = step.holder.rename(fingerprint, data["name"])
+        except PasskeyError as exc:
+            return refusal(exc.reason)
+        logs.event("passkey_renamed", credential=fingerprint, rp_id=renamed.rp_id)
+        return Reply({"passkey": _passkey_view(renamed, fingerprint)})
+
+    def _plan_remove(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``passkey.remove``: the passkey exists, it isn't the last (the portal never removes
+        that one; the admin socket may, Q26), and which sessions end with it."""
+        holder = step.holder
+        target = _target(holder, data["credential"])
+        if isinstance(target, Refusal):
+            return target
+        fingerprint, passkey = target
+        if len(holder.document.credentials) == 1:
+            return refusal("last_passkey")
+        ending = tuple(
+            sorted(
+                session.fingerprint
+                for session in self.sessions.live(self._wall())
+                if session.credential == fingerprint
+            )
+        )
+        summary = (
+            ("Remove the passkey", fingerprint),
+            ("Named", shown(passkey.name, NAME_LIMIT)),
+            ("It works on", passkey.rp_id),
+            ("Sessions that end", _ending(len(ending), step.session.credential == fingerprint)),
+        )
+        return Plan(summary, (fingerprint, passkey.name, ending))
+
+    async def _run_remove(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """Written before it takes effect; then the sessions its logins made end, this one too
+        if it was one of them."""
+        fingerprint = data["credential"]
+        try:
+            removed = step.holder.remove(fingerprint)  # allow_last stays False (Q26)
+        except PasskeyError as exc:
+            return refusal(exc.reason)
+        ended = self.end_credential(fingerprint)
+        remaining = len(step.holder.document.credentials)
+        logs.event(
+            "passkey_removed",
+            credential=fingerprint,
+            rp_id=removed.rp_id,
+            origin=removed.origin,
+            sessions_ended=ended,
+            remaining=remaining,
+        )
+        answer = {
+            "removed": _passkey_view(removed, fingerprint),
+            "sessions_ended": ended,
+            "remaining": remaining,
+            "signed_out": step.session.credential == fingerprint,
+        }
+        return Reply(answer)
+
     def _holder(self) -> Passkeys | Refusal:
         """The passkey file, unless it can't be verified (P19: 503 until a reset)."""
         holder = self.passkeys
@@ -847,6 +1135,36 @@ def _passkey_view(passkey: Passkey, fingerprint: str) -> dict[str, Any]:
     view = passkey_file.describe(passkey, fingerprint)
     view["name_shown"] = shown(view.pop("name"), NAME_LIMIT)
     return view
+
+
+def _target(holder: Passkeys, wanted: object) -> tuple[str, Passkey] | Refusal:
+    """The passkey an action names by its fingerprint, on any RP ID: 404 ``not_found``, or 409
+    ``ambiguous_fingerprint`` when two share it, so a change never takes another than the one
+    shown."""
+    if not isinstance(wanted, str):
+        return refusal("bad_body")
+    try:
+        return wanted, holder.find(wanted)
+    except PasskeyError as exc:
+        return refusal(exc.reason)
+
+
+def _summary(plan: Plan) -> list[list[str]]:
+    """A plan's summary as the answer carries it: ``[label, value]`` pairs, in order."""
+    return [[label, value] for label, value in plan.summary]
+
+
+def _changed(action: Action, plan: Plan) -> Reply:
+    """409 ``changed``: the refusal, and the plan as prepared beside the plan as it is now."""
+    body = {**refusal("changed").body(), "was": _summary(action.plan), "now": _summary(plan)}
+    return Reply(body, status=409, reason="changed")
+
+
+def _ending(count: int, this: bool) -> str:
+    """How many sessions a removal ends, for its summary."""
+    if count == 0:
+        return "none"
+    return f"{count}, this one included" if this else str(count)
 
 
 def _session(call: Call) -> Session:

@@ -79,10 +79,13 @@ PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
     }
 )
 
-# Body caps in bytes (F.1, M.1): an empty object, the default, and a passkey's answer.
+# Body caps in bytes (F.1, M.1): an empty object, the default, a passkey's answer, a secret
+# (M1's MAX_BODY, and what POST /api/actions reads before it knows the kind) and a paste.
 BODY_EMPTY: Final = 64
 BODY_DEFAULT: Final = 4 * 1024
 BODY_WEBAUTHN: Final = 16 * 1024
+BODY_SECRET: Final = 128 * 1024
+BODY_PASTE: Final = 8 * 1024
 
 NONE: Final[frozenset[Scope]] = frozenset()
 SETUP: Final[frozenset[Scope]] = frozenset({"setup"})
@@ -91,7 +94,8 @@ BOTH: Final[frozenset[Scope]] = frozenset({"setup", "full"})
 _CEREMONY: Final = frozenset({"ceremony", "credential"})
 
 # Step 11: the three unauthenticated routes, the session, enrolment by a setup session, logout
-# and the session list. An enrolment a full session begins comes with step 12's passkey.enrol.
+# and the session list. A full session's enrolment begins with the passkey.enrol action and
+# finishes here.
 LOGIN_BEGIN: Final = Route("POST", "/api/login/begin", NONE, BODY_EMPTY)
 LOGIN_FINISH: Final = Route("POST", "/api/login/finish", NONE, BODY_WEBAUTHN, _CEREMONY)
 SETUP_REDEEM: Final = Route("POST", "/api/setup/redeem", NONE, BODY_DEFAULT, frozenset({"code"}))
@@ -103,6 +107,14 @@ ENROL_BEGIN: Final = Route(
     "POST", "/api/passkeys/enrol/begin", SETUP, BODY_DEFAULT, frozenset({"name"})
 )
 ENROL_FINISH: Final = Route("POST", "/api/passkeys/enrol/finish", BOTH, BODY_WEBAUTHN, _CEREMONY)
+# Step 12: the passkey list and the step-up path (F.4). Every change a full session makes is an
+# action: prepared, then confirmed with a passkey; the confirm takes only the assertion.
+PASSKEYS: Final = Route("GET", "/api/passkeys", FULL)
+ACTIONS: Final = Route("POST", "/api/actions", FULL, BODY_SECRET, frozenset({"kind", "data"}))
+CONFIRM: Final = Route(
+    "POST", "/api/actions/{action}/confirm", FULL, BODY_WEBAUTHN, frozenset({"credential"})
+)
+CANCEL: Final = Route("DELETE", "/api/actions/{action}", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -114,6 +126,10 @@ ROUTES: Final[tuple[Route, ...]] = (
     END_OTHERS,
     ENROL_BEGIN,
     ENROL_FINISH,
+    PASSKEYS,
+    ACTIONS,
+    CONFIRM,
+    CANCEL,
 )
 
 

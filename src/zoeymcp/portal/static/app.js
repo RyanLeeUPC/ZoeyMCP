@@ -2,12 +2,14 @@
 // text the vault sends is shown as it is, through textContent. It words only what the browser
 // itself refuses. Every change is a fetch() with POST or DELETE and the session's header half,
 // the one thing kept in sessionStorage (F.2). Passkey prompts open only from click handlers.
+// A full session changes things only through actions (F.4): prepare, show the vault's summary,
+// then confirm with a passkey.
 "use strict";
 
 (function () {
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
-  const PAGES = ["blocked", "login", "setup", "home", "sessions"];
+  const PAGES = ["blocked", "login", "setup", "home", "sessions", "passkeys"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
@@ -41,17 +43,34 @@
     "SecurityError",
     "NotSupportedError",
   ];
+  const VIA = {
+    setup_code: "with a setup code",
+    setup_code_reset: "with a reset setup code",
+    portal: "from a signed-in session",
+  };
+
+  let pending = null; // the action being confirmed: its ID, step-up options and what follows
+  let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created
+  let renaming = null; // the fingerprint the rename form is for
 
   function $(id) {
     return document.getElementById(id);
   }
 
   class Refused extends Error {
-    constructor(text, reason, status) {
+    constructor(text, reason, status, answer) {
       super(text);
       this.reason = reason;
       this.status = status;
+      this.answer = answer;
     }
+  }
+
+  // A route's path with its parameters filled in, each one encoded (M.1's templates).
+  function fill(template, values) {
+    return template.replace(/\{([a-z]+)\}/g, function (match, name) {
+      return encodeURIComponent(values[name]);
+    });
   }
 
   // --- the API --------------------------------------------------------------------------------
@@ -96,7 +115,7 @@
     if (response.status === 401) {
       sessionStorage.removeItem(TOKEN); // whatever the cause, this session is gone (F.2)
     }
-    throw new Refused(text, reason, response.status);
+    throw new Refused(text, reason, response.status, answer);
   }
 
   function signedOut(error) {
@@ -301,9 +320,233 @@
 
   function afterFailure(error) {
     if (signedOut(error)) {
+      closeConfirm();
       showLogin();
     }
     fail(textOf(error));
+  }
+
+  // --- passkeys (D.5) -------------------------------------------------------------------------
+
+  function day(seconds) {
+    return new Date(seconds * 1000).toLocaleDateString();
+  }
+
+  function button(label, handler) {
+    const element = document.createElement("button");
+    element.type = "button";
+    element.textContent = label;
+    guard(element, handler);
+    return element;
+  }
+
+  async function showPasskeys() {
+    clearError();
+    try {
+      const answer = await api("GET", "/api/passkeys");
+      const list = $("passkey-list");
+      list.replaceChildren();
+      for (const passkey of answer.passkeys) {
+        const item = document.createElement("li");
+        const text = document.createElement("span");
+        const transports = passkey.transports.length ? ", " + passkey.transports.join(" ") : "";
+        text.textContent =
+          passkey.name_shown + " (" + passkey.fingerprint + ")" +
+          (passkey.this ? ", signed in this session" : "") + ": works on " + passkey.rp_id +
+          ", " + passkey.alg + ", " + (passkey.synced ? "synced" : "device-bound") + transports +
+          "; enrolled " + VIA[passkey.via] + " on " + passkey.origin + " at " +
+          when(passkey.created) + "; last used " +
+          (passkey.last_used === null ? "never" : day(passkey.last_used)) + ".";
+        item.append(
+          text,
+          button("Rename", function () {
+            openRename(passkey);
+          }),
+          button("Remove", function () {
+            prepare("passkey.remove", { credential: passkey.fingerprint }, afterRemove);
+          })
+        );
+        list.append(item);
+      }
+      closeRename();
+      show("passkeys");
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
+  function openRename(passkey) {
+    renaming = passkey.fingerprint;
+    $("rename-which").textContent = "Rename " + passkey.name_shown + " (" + passkey.fingerprint + ")";
+    $("rename-name").value = "";
+    $("rename").hidden = false;
+  }
+
+  function closeRename() {
+    renaming = null;
+    $("rename").hidden = true;
+  }
+
+  function prepareRename() {
+    prepare("passkey.rename", { credential: renaming, name: $("rename-name").value }, afterRename);
+  }
+
+  function prepareEnrol() {
+    prepare("passkey.enrol", { name: $("passkey-name").value }, afterEnrolConfirmed);
+  }
+
+  async function afterRename() {
+    closeConfirm();
+    await showPasskeys();
+    $("status").textContent = "Passkey renamed.";
+  }
+
+  async function afterRemove(result) {
+    closeConfirm();
+    if (result.signed_out) {
+      // This session was made with the passkey removed, so it ended with it (F.2).
+      sessionStorage.removeItem(TOKEN);
+      showLogin();
+      $("status").textContent = "Passkey removed. This session used it, so sign in again.";
+      return;
+    }
+    await showPasskeys();
+    $("status").textContent =
+      "Passkey removed; " + result.sessions_ended + " session(s) ended with it.";
+  }
+
+  // passkey.enrol's run begins an enrolment: the new passkey is created from a second click,
+  // so each passkey prompt opens from a click of its own.
+  function afterEnrolConfirmed(result) {
+    creating = result;
+    $("confirm-expires").textContent =
+      "Confirmed. Now create the new passkey with the authenticator it will live on.";
+    $("confirm-create").hidden = false;
+  }
+
+  async function createPasskey() {
+    const begun = creating;
+    if (begun === null) {
+      return;
+    }
+    confirmError("");
+    try {
+      const credential = await zoeyWebAuthn.create(begun.options);
+      creating = null; // the finish spends the ceremony, whatever it answers
+      $("confirm-create").hidden = true;
+      const done = await api("POST", "/api/passkeys/enrol/finish", {
+        ceremony: begun.ceremony,
+        credential: credential,
+      });
+      closeConfirm();
+      $("passkey-name").value = "";
+      await showPasskeys();
+      $("status").textContent =
+        "Passkey enrolled. Its fingerprint is " + done.passkey.fingerprint + ".";
+    } catch (error) {
+      if (signedOut(error)) {
+        afterFailure(error);
+        return;
+      }
+      confirmError(textOf(error));
+    }
+  }
+
+  // --- step-up (F.4) --------------------------------------------------------------------------
+
+  // Prepare: the vault checks everything now and answers what it will do, before any prompt.
+  async function prepare(kind, data, done) {
+    clearError();
+    try {
+      const prepared = await api("POST", "/api/actions", { kind: kind, data: data });
+      pending = { action: prepared.action, options: prepared.options, done: done };
+      creating = null;
+      renderSummary("confirm-summary", prepared.summary);
+      renderSummary("confirm-now", []);
+      $("confirm-now-label").hidden = true;
+      $("confirm-expires").textContent = "Confirm by " + when(prepared.expires) + ".";
+      confirmError("");
+      $("confirm-passkey").hidden = false;
+      $("confirm-create").hidden = true;
+      $("confirm").showModal();
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
+  function renderSummary(id, summary) {
+    const list = $(id);
+    list.replaceChildren();
+    for (const pair of summary) {
+      const term = document.createElement("dt");
+      term.textContent = pair[0];
+      const value = document.createElement("dd");
+      value.textContent = pair[1];
+      list.append(term, value);
+    }
+  }
+
+  function confirmError(text) {
+    $("confirm-error").textContent = text;
+    $("confirm-error").hidden = text === "";
+  }
+
+  // Confirm: the assertion is bound to this action, session and origin, and the vault runs
+  // what it held, after checking that nothing it showed has changed.
+  async function confirmAction() {
+    const held = pending;
+    if (held === null) {
+      return;
+    }
+    confirmError("");
+    let credential;
+    try {
+      credential = await zoeyWebAuthn.get(held.options);
+    } catch (error) {
+      confirmError(textOf(error)); // still held: confirm again, or cancel
+      return;
+    }
+    pending = null; // the confirm spends the action, whatever it answers
+    $("confirm-passkey").hidden = true;
+    try {
+      const result = await api(
+        "POST",
+        fill("/api/actions/{action}/confirm", { action: held.action }),
+        { credential: credential }
+      );
+      await held.done(result);
+    } catch (error) {
+      if (signedOut(error)) {
+        afterFailure(error);
+        return;
+      }
+      if (error instanceof Refused && error.reason === "changed" && error.answer) {
+        renderSummary("confirm-now", error.answer.now);
+        $("confirm-now-label").hidden = false;
+      }
+      confirmError(textOf(error));
+    }
+  }
+
+  async function cancelAction() {
+    const held = pending;
+    closeConfirm();
+    if (held === null) {
+      return;
+    }
+    try {
+      await api("DELETE", fill("/api/actions/{action}", { action: held.action }));
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
+  function closeConfirm() {
+    pending = null;
+    creating = null;
+    if ($("confirm").open) {
+      $("confirm").close();
+    }
   }
 
   // --- start (K.2: the checks, in order, before any page) -------------------------------------
@@ -319,8 +562,28 @@
     return zoeyWebAuthn.missing();
   }
 
+  // Every button's click: while its handler runs, the button is disabled and a second click
+  // does nothing, so a double click never sends a request twice. The handler is called within
+  // the click itself, so a passkey prompt it opens still has the click's user activation.
+  function guard(element, handler) {
+    let busy = false;
+    element.addEventListener("click", async function (event) {
+      if (busy) {
+        return;
+      }
+      busy = true;
+      element.disabled = true;
+      try {
+        await handler(event);
+      } finally {
+        busy = false;
+        element.disabled = false;
+      }
+    });
+  }
+
   function on(id, handler) {
-    $(id).addEventListener("click", handler);
+    guard($(id), handler);
   }
 
   function start() {
@@ -345,7 +608,19 @@
     on("setup-login", signIn);
     on("nav-home", enter);
     on("nav-sessions", showSessions);
+    on("nav-passkeys", showPasskeys);
     on("end-others", endOthers);
+    on("passkey-enrol", prepareEnrol);
+    on("rename-prepare", prepareRename);
+    on("rename-close", closeRename);
+    on("confirm-passkey", confirmAction);
+    on("confirm-create", createPasskey);
+    on("confirm-cancel", cancelAction);
+    // Escape closes the dialog: the held action is dropped too.
+    $("confirm").addEventListener("cancel", function (event) {
+      event.preventDefault();
+      cancelAction();
+    });
     on("sign-out", signOut);
     enter();
   }

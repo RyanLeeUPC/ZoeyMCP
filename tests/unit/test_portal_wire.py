@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from tests.fakes.authenticator import Assertion, Attestation, SoftAuthenticator
+from zoeymcp.portal.actions import KINDS
 from zoeymcp.portal.app import PortalApp, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES
@@ -27,8 +28,14 @@ from zoeymcp.vault.keys import KeySet
 ORIGIN = "http://localhost:8081"
 KEYS = KeySet.from_master(bytes(range(32)))
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
-# api("POST", "/api/...", { key: value, ... }) in app.js.
-POSTED = re.compile(r"api\(\"POST\",\s*\"(/api/[^\"]+)\",\s*\{([^}]*)\}", re.DOTALL)
+# api("POST", "/api/...", { key: value, ... }) in app.js, the path a literal or a template
+# filled in by fill("/api/...", { ... }).
+POSTED = re.compile(
+    r"api\(\s*\"POST\",\s*(?:fill\()?\"(/api/[^\"]+)\"(?:,\s*\{[^}]*\}\))?,\s*\{([^}]*)\}",
+    re.DOTALL,
+)
+# prepare("kind", { key: value, ... }, ...) in app.js: an action's data.
+PREPARED = re.compile(r"prepare\(\"([a-z.]+)\",\s*\{([^}]*)\}", re.DOTALL)
 
 
 @pytest.fixture
@@ -82,6 +89,20 @@ def test_the_page_posts_exactly_each_routes_body() -> None:
         assert route.body <= keys <= route.body | route.optional, path
 
 
+def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
+    """Every action app.js prepares is a kind the portal runs, with the data keys the registry
+    takes; and the page prepares every kind the portal runs."""
+    script = (STATIC_DIR / "app.js").read_bytes().decode("utf-8")
+    prepared = PREPARED.findall(script)
+    assert prepared
+    for kind, keys in prepared:
+        data = set(re.findall(r"(\w+):", keys))
+        assert KINDS[kind].required <= data <= KINDS[kind].required | KINDS[kind].optional, kind
+    app = PortalApp([ORIGIN], static=load_static())
+    assert {kind for kind, _ in prepared} == app.action_kinds
+    assert app.action_kinds <= set(KINDS)
+
+
 def test_the_fake_answers_with_the_fields_the_page_posts() -> None:
     authenticator = SoftAuthenticator()
     options = {
@@ -123,7 +144,23 @@ async def test_the_journey_over_the_wire(page: tuple[Page, PortalApp]) -> None:
     signed_in = await client.call("POST", "/api/login/finish", body)
     assert signed_in.status_code == 200
     session = (await client.call("GET", "/api/session")).json()
-    assert session["credential"] == enrolled.json()["passkey"]["fingerprint"]
+    fingerprint = enrolled.json()["passkey"]["fingerprint"]
+    assert session["credential"] == fingerprint
+    listed = (await client.call("GET", "/api/passkeys")).json()["passkeys"]
+    assert [(p["fingerprint"], p["this"]) for p in listed] == [(fingerprint, True)]
+    # A step-up: prepare, confirm with the assertion only, and cancel another.
+    data = {"credential": fingerprint, "name": "desk"}
+    prepared = await client.call("POST", "/api/actions", {"kind": "passkey.rename", "data": data})
+    assert prepared.status_code == 200, prepared.text
+    action = prepared.json()
+    assertion = authenticator.get(action["options"], ORIGIN)
+    path = f"/api/actions/{action['action']}/confirm"
+    confirmed = await client.call("POST", path, {"credential": assertion.body()})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["passkey"]["name_shown"] == "desk"
+    again = await client.call("POST", "/api/actions", {"kind": "passkey.rename", "data": data})
+    cancelled = await client.call("DELETE", f"/api/actions/{again.json()['action']}")
+    assert cancelled.json() == {"cancelled": True}
     listed = (await client.call("GET", "/api/sessions")).json()["sessions"]
     assert [s["this"] for s in listed] == [True]
     ended = await client.call("POST", "/api/sessions/end-others", {})

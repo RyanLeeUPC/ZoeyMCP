@@ -17,7 +17,7 @@ from typing import get_args
 import pytest
 
 from zoeymcp.common.textrules import find_violations
-from zoeymcp.portal import webauthn
+from zoeymcp.portal import passkeys, webauthn
 from zoeymcp.portal.refusals import (
     CATALOGUE,
     KEPT_IN_MEMORY,
@@ -89,9 +89,15 @@ STATUSES = {
     500: ["not_written"],
     503: ["busy", "unavailable"],
 }
-# Beyond M.2's list: the store's byte limit (step 4b), the token manager's unknown credential, and
-# the shell's answer when a handler fails (step 10b).
-EXTRA = {"value_too_large": 409, "not_configured": 400, "internal": 500}
+# Beyond M.2's list: the store's byte limit (step 4b), the token manager's unknown credential,
+# the shell's answer when a handler fails (step 10b), and two passkeys sharing a fingerprint
+# (step 7a's holder, answered from step 12).
+EXTRA = {
+    "value_too_large": 409,
+    "not_configured": 400,
+    "internal": 500,
+    "ambiguous_fingerprint": 409,
+}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -245,6 +251,12 @@ def test_the_catalogue_cannot_be_changed() -> None:
 
 def test_every_webauthn_reason_has_a_text() -> None:
     assert set(WEBAUTHN) == set(get_args(webauthn.Reason))
+
+
+def test_every_passkey_reason_has_a_text() -> None:
+    """The holder's refusals reach the portal as they are; an enrolment's two conflicts have
+    their own sentences (D.3)."""
+    assert set(get_args(passkeys.Reason)) <= reasons()
 
 
 def test_every_secret_reason_is_catalogued() -> None:

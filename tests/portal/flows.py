@@ -15,9 +15,12 @@ import httpx
 
 from tests.fakes.authenticator import Kind, SoftAuthenticator, Switch
 from tests.fakes.browser import SESSION_KEY, Page
+from zoeymcp.portal.routes import Route
 
 from .rig import PortalRig
 
+# A value for each path parameter, so a walk of the route table can send every route.
+SAMPLE_PARAMS = {"credential": "github", "flow": "0123456789abcdef", "action": "0123456789abcdef"}
 LOGIN_BEGIN = "/api/login/begin"
 LOGIN_FINISH = "/api/login/finish"
 REDEEM = "/api/setup/redeem"
@@ -115,6 +118,11 @@ def set_up(
     assert signed_in.status_code == 200, signed_in.text
     passkey: dict[str, Any] = enrolled.json()["passkey"]
     return passkey
+
+
+def filled(route: Route) -> str:
+    """The route's path with a sample value for each parameter."""
+    return route.path.format(**SAMPLE_PARAMS)
 
 
 def status_reason(response: httpx.Response) -> tuple[int, str]:

@@ -21,12 +21,12 @@ from typing import Any, Final, Literal
 
 from ..common.canonical import digest
 from ..common.logs import refuse_type
-from .routes import BODY_DEFAULT
+from .routes import BODY_DEFAULT, BODY_PASTE, BODY_SECRET
 from .sessions import NONCE_BYTES, RandomBytes, challenge, new_id
 
 ACTION_TTL: Final = 300.0
 MAX_ACTIONS_PER_SESSION: Final = 1
-MAX_ACTIONS_BODY: Final = 128 * 1024  # read before the kind is known (M.1)
+MAX_ACTIONS_BODY: Final = BODY_SECRET  # read before the kind is known (M.1)
 STEP_UP_TAG: Final = b"zoeymcp/webauthn/step-up/v1\n"
 
 
@@ -44,13 +44,13 @@ class Kind:
     optional: frozenset[str] = frozenset()
 
 
-_DEFAULT_CAP: Final = BODY_DEFAULT  # one definition of M.1's 4 KiB, in routes.py
+_DEFAULT_CAP: Final = BODY_DEFAULT  # one definition of each of M.1's caps, in routes.py
 KINDS: Final[dict[str, Kind]] = {
     kind.name: kind
     for kind in (
-        Kind("secret.put", 128 * 1024, frozenset({"name", "value"}), frozenset({"origins"})),
+        Kind("secret.put", BODY_SECRET, frozenset({"name", "value"}), frozenset({"origins"})),
         Kind("secret.delete", _DEFAULT_CAP, frozenset({"name"})),
-        Kind("oauth.complete", 8 * 1024, frozenset({"credential", "flow", "redirect_url"})),
+        Kind("oauth.complete", BODY_PASTE, frozenset({"credential", "flow", "redirect_url"})),
         Kind("oauth.reset", _DEFAULT_CAP, frozenset({"credential"})),
         Kind("passkey.enrol", _DEFAULT_CAP, frozenset({"name"})),
         Kind("passkey.rename", _DEFAULT_CAP, frozenset({"credential", "name"})),

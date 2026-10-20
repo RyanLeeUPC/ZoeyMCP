@@ -22,7 +22,7 @@ from zoeymcp.portal.routes import ROUTES
 from zoeymcp.portal.sessions import SESSION_IDLE, SESSION_MAX
 from zoeymcp.vault.oauth.login import LoginService
 
-from .flows import begin_enrol, issue, login, redeem, set_up, status_reason
+from .flows import begin_enrol, filled, issue, login, redeem, set_up, status_reason
 from .rig import Clock, PortalRig, running
 
 
@@ -162,7 +162,7 @@ def test_a_cookie_alone_is_no_session_anywhere(rig: PortalRig) -> None:
         if route.cap:
             headers.append(("Content-Type", "application/json"))
             body = b"{}"
-        answer = neighbour.forge(route.method, rig.origin + route.path, headers, body)
+        answer = neighbour.forge(route.method, rig.origin + filled(route), headers, body)
         assert status_reason(answer) == (401, "no_session"), route.path
     assert [s.last_seen for s in rig.app.sessions.live(time.time())] == [before]
     # Its own page's fetch is same-site, refused before any lookup.

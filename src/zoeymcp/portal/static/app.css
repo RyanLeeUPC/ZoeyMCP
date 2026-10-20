@@ -54,7 +54,8 @@ code {
   overflow-wrap: anywhere;
 }
 
-#error {
+#error,
+#confirm-error {
   border-left: 0.25rem solid #c62828;
   padding-left: 0.75rem;
 }
@@ -70,7 +71,27 @@ code {
   margin-bottom: 0.5rem;
 }
 
-#session-list li {
+#session-list li,
+#passkey-list li {
   margin-bottom: 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+dialog {
+  max-width: 40rem;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+
+dt {
+  font-weight: bold;
+}
+
+dd {
+  margin: 0;
   overflow-wrap: anywhere;
 }

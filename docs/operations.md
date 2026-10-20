@@ -876,8 +876,8 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 
 ## 26. The portal
 
-A draft, filled in as the portal is built: signing in, setup and sessions so far. Everything
-here can also be done with the CLI (§1).
+A draft, filled in as the portal is built: signing in, setup, sessions, passkeys and step-up so
+far. Everything here can also be done with the CLI (§1).
 
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
@@ -936,12 +936,33 @@ ends every one but yours. `zoeymcp sessions` lists the same from the host, and
 `zoeymcp sessions --end-all` ends them all. At most 8 sessions are kept; a ninth sign-in ends the
 one used least recently.
 
+**Passkeys.** The Passkeys page lists every passkey that can sign in, by name and fingerprint:
+the host name it works on (its RP ID), its key type, whether it is synced (a passkey provider
+copies it between devices) or device-bound, how and on which origin it was enrolled, when, and
+the day it was last used; the one this session signed in with is marked. **Enrol a passkey**
+adds one from a signed-in session (after the step-up below, the browser asks the new
+authenticator to create it; an authenticator that already holds one of this address's passkeys
+is refused by the browser). **Rename** and **Remove** act on one. Removing a passkey ends every
+session it signed in, yours too if it was the one; the portal never removes the last passkey
+(enrol another first, or use `zoeymcp passkeys --remove` or `zoeymcp setup-code --reset` from
+the host). `zoeymcp passkeys` lists the same from the host.
+
+**Step-up.** Every change in the portal asks for a passkey first, in two steps. The vault checks
+the change and shows what it will do (for a removal, which passkey and how many sessions end)
+before any prompt, so a mistake shows there. **Confirm with your passkey** answers a prompt that
+is bound to that one change, from this session and this address; the vault then runs exactly
+what it showed. It holds a prepared change for 5 minutes, one per session; **Close** drops it.
+If something it showed changed in between (another session renamed the same passkey, say), it
+refuses with what it finds now, and you prepare again. Logs: `step_up_confirmed` (the kind and
+the passkey that confirmed it), `step_up_refused` (the reason), `action_changed`,
+`passkey_renamed` and `passkey_removed`; names are never logged.
+
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A
 different host name has its own: issue a setup code and redeem it **on the new origin**.
 
 **Recovery.** One passkey lost while another works: sign in with the other and remove the lost
-one (from the CLI until the Passkeys page is built: `zoeymcp passkeys --remove FINGERPRINT`).
+one on the Passkeys page (or `zoeymcp passkeys --remove FINGERPRINT` from the host).
 Every passkey lost: `zoeymcp setup-code` adds one, or `--reset` replaces them all. A passkey or
 device that may be stolen, or a passkey file reported tampered (`passkey_store_tampered`, and
 the portal answering "can't be verified"): `zoeymcp setup-code --reset`. A reset enrolment
@@ -951,7 +972,7 @@ enrol again.
 **What a stolen session can do.** A session is the cookie and the tab's token together; a page
 on another `localhost` port receives the cookie (cookies ignore ports) but not the token, and
 gets 401. Someone holding both halves, within the session's limits, can read what the portal
-shows and end other sessions; changes that matter will each need a fresh passkey prompt.
+shows and end other sessions; every change needs a fresh passkey prompt bound to that change.
 
 **When something fails.** The portal shows the vault's own sentence for every refusal; the
 reason is in the vault's log line `portal_request` (or `portal_refused`, at most once per 10
@@ -984,6 +1005,7 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 404 | `action_unknown` | That confirmation, login or passkey prompt expired or was already used. Start again. |
 | 404 | `ceremony_unknown` | That confirmation, login or passkey prompt expired or was already used. Start again. |
 | 409 | `last_passkey` | This is the only passkey. Enrol another first, or use zoeymcp setup-code --reset. |
+| 409 | `ambiguous_fingerprint` | More than one passkey has that fingerprint, so nothing changed. Run zoeymcp setup-code --reset with host access. |
 | 400 | `bad_name` | A passkey name is 1 to 64 characters on one line, with no hidden characters. |
 | 500 | `not_written` | Not written to disk; nothing changed; check the state volume. |
 | 500 | `internal` | The portal failed to answer that; the vault's log has the cause. |

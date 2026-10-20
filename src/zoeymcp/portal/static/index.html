@@ -16,6 +16,7 @@
 <nav id="nav">
 <button type="button" id="nav-home">Home</button>
 <button type="button" id="nav-sessions">Sessions</button>
+<button type="button" id="nav-passkeys">Passkeys</button>
 </nav>
 <button type="button" id="sign-out">Sign out</button>
 </header>
@@ -74,6 +75,38 @@ or when the vault restarts.</p>
 <ul id="session-list"></ul>
 <button type="button" id="end-others">End the other sessions</button>
 </section>
+
+<section id="passkeys" hidden>
+<h2>Passkeys</h2>
+<p>Every passkey that can sign in to this vault. A passkey works on the host name it was enrolled
+on. Each change asks for a passkey first. The last passkey can't be removed here: enrol another
+first, or use <code>zoeymcp setup-code --reset</code>.</p>
+<ul id="passkey-list"></ul>
+<div id="rename" hidden>
+<p id="rename-which"></p>
+<label for="rename-name">New name</label>
+<input id="rename-name" type="text" autocomplete="off" maxlength="64">
+<button type="button" id="rename-prepare">Rename</button>
+<button type="button" id="rename-close">Cancel</button>
+</div>
+<h3>Enrol another passkey</h3>
+<label for="passkey-name">Name for the new passkey (for example, the device it is on)</label>
+<input id="passkey-name" type="text" autocomplete="off" maxlength="64">
+<button type="button" id="passkey-enrol">Enrol a passkey</button>
+</section>
 </main>
+
+<dialog id="confirm" aria-labelledby="confirm-title">
+<h2 id="confirm-title">Confirm with your passkey</h2>
+<p>The vault will do this, and nothing else:</p>
+<dl id="confirm-summary"></dl>
+<p id="confirm-now-label" hidden>What the vault finds now:</p>
+<dl id="confirm-now"></dl>
+<p id="confirm-expires"></p>
+<p id="confirm-error" role="alert" hidden></p>
+<button type="button" id="confirm-passkey">Confirm with your passkey</button>
+<button type="button" id="confirm-create" hidden>Create the new passkey</button>
+<button type="button" id="confirm-cancel">Close</button>
+</dialog>
 </body>
 </html>

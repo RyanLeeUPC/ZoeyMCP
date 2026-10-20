@@ -112,6 +112,12 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "last_passkey": Entry(
             409, "This is the only passkey. Enrol another first, or use zoeymcp setup-code --reset."
         ),
+        # Two credentials whose keyed fingerprints collide (D.4): neither is chosen.
+        "ambiguous_fingerprint": Entry(
+            409,
+            "More than one passkey has that fingerprint, so nothing changed. Run zoeymcp "
+            "setup-code --reset with host access.",
+        ),
         "bad_name": Entry(
             400, "A passkey name is 1 to 64 characters on one line, with no hidden characters."
         ),
