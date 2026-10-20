@@ -266,9 +266,14 @@ async def test_login_calls_refreshes_a_refused_token_and_an_approval(
     tokens = [str(item.header("authorization")).removeprefix("Bearer ") for item in calls]
     assert all(ISSUED.fullmatch(token) for token in tokens)
     assert len(set(tokens)) == 4
-    [rejected] = gateway.seen.events("oauth_upstream_401")
-    assert (rejected["method"], rejected["action"]) == ("POST", "invalidated")
-    assert refresh_triggers(gateway.seen) == ["expiry", "expiry", "upstream_401"]
+    # The gateway's own GET (its event stream) may meet the dropped token too, depending on timing;
+    # the refused POST is the one the vault answers for, once.
+    rejections = gateway.seen.events("oauth_upstream_401")
+    posts = [event for event in rejections if event["method"] == "POST"]
+    assert [event["action"] for event in posts] == ["invalidated"], rejections
+    assert {event["method"] for event in rejections} <= {"POST", "GET"}, rejections
+    triggers = refresh_triggers(gateway.seen)
+    assert triggers == ["expiry", "expiry", "upstream_401"], (triggers, rejections)
 
 
 @pytest.mark.parametrize(
