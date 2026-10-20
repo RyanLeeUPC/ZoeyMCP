@@ -26,6 +26,7 @@ import httpx
 
 from tests.fakes.harness import serve
 from tests.gateway.rig import Running, WithAdmin, token_for
+from tests.gateway.toolkit_rig import ENTRY_POINTS
 from zoeymcp.cli.main import main
 from zoeymcp.common import logs
 from zoeymcp.common.policy import Policy
@@ -35,8 +36,9 @@ from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
+from zoeymcp.gateway.toolkits import Toolkits
 from zoeymcp.gateway.upstream import UpstreamPool
-from zoeymcp.gateway.vaultlink import KeySource, parse_link, view_client
+from zoeymcp.gateway.vaultlink import KeySource, parse_link, report_client, view_client
 
 from .conftest import Clock, Deployment, _HTTPTransport
 from .tls import ProviderCA
@@ -114,6 +116,11 @@ class GatewayDeployment:
     ``secrets`` go into the store before the vault starts, and the vault's token manager reads
     ``clock``, which a test can move along with the fakes' clocks. With ``portal`` the vault
     serves its portal too, over either link (M5 design O.1, review finding R9).
+
+    With ``reporter`` the gateway reports its ledger to the vault's copy over the link, as
+    ``zoeymcp gateway`` does (M5 design J.3), and the portal's Ledger page reads it. ``extra``
+    merges another fragment into the profile's (``Deployment``); with ``toolkits`` the gateway
+    loads the example toolkits from their entry points, as the toolkit rig does.
     """
 
     def __init__(
@@ -132,9 +139,14 @@ class GatewayDeployment:
         replace: Mapping[str, str] | None = None,
         clock: Clock | None = None,
         portal: bool = False,
+        reporter: bool = False,
+        extra: Mapping[str, Any] | None = None,
+        toolkits: bool = False,
     ) -> None:
         self.state = tmp_path / "gateway"
         self.link = link
+        self.reporter = reporter
+        self.toolkits = toolkits
         self.clients = clients
         self.seen = Seen()
         socket = tmp_path / "link" / "vault.sock" if link == "unix" else None
@@ -152,6 +164,8 @@ class GatewayDeployment:
             link_uid=link_uid,
             clock=clock,
             portal=portal,
+            reports=reporter,
+            extra=extra,
         )
 
     @property
@@ -177,11 +191,22 @@ class GatewayDeployment:
                     link = parse_link(str(vault.base_url).rstrip("/"))
                     keys = KeySource(self.vault.keys.gateway_key(1))
                 limits = build_view(self.vault.policy).gateway.limits
+                marks = DriftMarks.load(self.state)
                 pool = UpstreamPool(
-                    link, keys, DriftMarks.load(self.state), DefinitionStore(self.state),
-                    limits=limits,
+                    link, keys, marks, DefinitionStore(self.state), limits=limits,
                 )  # fmt: skip
-                app = GatewayApp(pool, view_client(link, keys), policy_wait=1)
+                toolkits = None
+                if self.toolkits:
+                    toolkits = Toolkits(
+                        link, keys, marks, entry_points=lambda: ENTRY_POINTS, allow_writable=True
+                    )
+                app = GatewayApp(
+                    pool,
+                    view_client(link, keys),
+                    policy_wait=1,
+                    toolkits=toolkits,
+                    report_http=report_client(link, keys) if self.reporter else None,
+                )
                 app.ledger, _ = Ledger.open_at(self.state, max_bytes=limits.ledger_max_bytes)
                 with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
                     running = Running(app, url)

@@ -48,6 +48,32 @@ jobs:
       - run: uv sync --locked --all-extras --python ${{ matrix.python }}
       - run: uv run --locked pytest
 
+  # The portal on Windows, a development host (M5 design B.5): its effect tests and its unit
+  # files only, since other Windows-only failures are known (register D-92). Not a required
+  # check: branch protection lists the required jobs by name, and this one joins them once it
+  # has stayed green.
+  portal-windows:
+    name: portal tests on Windows (not required yet)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --locked --all-extras --python 3.13
+      - run: >-
+          uv run --locked pytest tests/portal
+          tests/unit/test_actions.py tests/unit/test_admission.py tests/unit/test_display.py
+          tests/unit/test_limits.py tests/unit/test_listen.py tests/unit/test_no_secret_answers.py
+          tests/unit/test_passkeys.py tests/unit/test_policy_callback.py
+          tests/unit/test_policyview.py tests/unit/test_portal_static.py
+          tests/unit/test_portal_wire.py tests/unit/test_refusal_doc.py tests/unit/test_refusals.py
+          tests/unit/test_routes.py tests/unit/test_sessions.py tests/unit/test_setupcode.py
+          tests/unit/test_webauthn.py tests/fakes/test_authenticator.py tests/fakes/test_browser.py
+
   image:
     name: image build and smoke test
     runs-on: ubuntu-24.04

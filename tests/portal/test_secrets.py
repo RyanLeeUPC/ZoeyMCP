@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
-from tests.fakes.authenticator import SoftAuthenticator
+from tests.fakes.authenticator import SoftAuthenticator, Switch
 from tests.fakes.browser import Page
 from zoeymcp.portal.refusals import KEPT_IN_MEMORY
 from zoeymcp.vault.admin import AdminApp
@@ -296,7 +296,32 @@ def test_the_value_is_bound_to_the_confirm(
     assert VALUE not in rig.log.getvalue()
 
 
-# --- the same rules as the socket (P10) ---------------------------------------------------------
+def test_a_save_without_a_passkey_is_refused(
+    rig: PortalRig, signed_in: tuple[Page, SoftAuthenticator]
+) -> None:
+    """design.md §8.2: no route writes a secret without a step-up. A confirm with no assertion,
+    a malformed one or a forged signature is refused, as is a write sent to the list's path."""
+    page, authenticator = signed_in
+    data = {"name": "music-stats", "value": VALUE}
+    bodies: list[dict[str, Any]] = [{}, {"credential": None}, {"credential": {}}]
+    bodies.append({"credential": "x"})
+    for body in bodies:
+        held = prepared(page, "secret.put", data)
+        answer = page.fetch("POST", f"/api/actions/{held['action']}/confirm", json=body)
+        assert status_reason(answer) in {(400, "bad_body"), (401, "step_up_refused")}, body
+    held = prepared(page, "secret.put", data)
+    forged = authenticator.get(held["options"], page.origin, switches={Switch.FLIP_SIGNATURE})
+    assert status_reason(confirm(page, held["action"], forged.body())) == (
+        401,
+        "step_up_refused",
+    )
+    for method in ("POST", "DELETE"):
+        assert page.fetch(method, "/api/secrets", json=data).status_code in (404, 405)
+    assert store(rig).names() == []
+    assert rig.lines("step_up_confirmed") == []
+
+
+# --- the same rules as the socket (P10)---------------------------------------------------------
 
 CASES = [
     ("music-stats", {"value": VALUE}, 200),

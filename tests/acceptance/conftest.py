@@ -18,16 +18,18 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from zoeymcp.common.policy import Policy, check_policy
 from zoeymcp.common.yamlload import load_mapping
-from zoeymcp.portal.app import PortalApp, Secrets, load_static
+from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys
 from zoeymcp.portal.server import HEAD_LIMIT, portal_protocol
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp, without_cookies
 from zoeymcp.vault.bindings import derive_binding
+from zoeymcp.vault.connectors.smtp import SmtpConnectors
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.peer import peer_checked
+from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
@@ -151,6 +153,12 @@ class Deployment:
     With ``portal``, the vault also serves its portal (M5 design B) on a loopback port of its
     own, at :attr:`portal_origin`, sharing the admin app's setup codes, logins, store and token
     manager, as ``zoeymcp vault`` shares them; the sessions keep the real clock.
+
+    With ``reports``, the vault keeps a copy of the gateway's ledger, which its report path
+    writes and the portal's Ledger page and health read with the SMTP connectors' journals (M5
+    design J). ``extra`` is a policy fragment merged into the profile's, its routes keeping
+    their own upstreams (another profile, say). A policy with SMTP connectors gets connectors
+    that trust the test CA.
     """
 
     def __init__(
@@ -167,8 +175,12 @@ class Deployment:
         link_socket: Path | None = None,
         link_uid: int | None = None,
         portal: bool = False,
+        reports: bool = False,
+        extra: Mapping[str, Any] | None = None,
     ) -> None:
         self.state = tmp_path
+        self.with_reports = reports
+        self.extra = dict(extra or {})
         self.portal_port = free_port() if portal else None
         # The standard tier's link: the gateway's socket, and the uid allowed on it (Linux).
         self.link_socket = link_socket
@@ -214,6 +226,10 @@ class Deployment:
         fragment = load_mapping(text)
         for route in fragment["routes"]:
             route["upstream"] = upstream or self.upstream
+        if self.extra:
+            from .toolkits import _merge  # here: toolkits imports this module
+
+            fragment = _merge(fragment, self.extra)
         self.document = json.dumps({**BASE, **fragment})
         policy = Policy.model_validate({**BASE, **fragment})
         findings = check_policy(policy, environ=self.environ if check_env else None)
@@ -223,6 +239,11 @@ class Deployment:
 
     def _build(self, store: SecretStore) -> None:
         self.store = store
+        # Recovered before anything listens, as ``zoeymcp vault`` does (M5 design J.4).
+        self.reports = ReportStore.open(self.state) if self.with_reports else None
+        connectors = None
+        if self.policy.connectors:
+            connectors = SmtpConnectors(self.state, self.keys, tls=self.ca.client_context())
         self.token_client = without_cookies(tls_client(self.ca))
         self.tokens = TokenManager(
             store, self.token_client, clock=self.clock.monotonic, wall=self.clock.wall
@@ -235,6 +256,8 @@ class Deployment:
             tokens=self.tokens,
             environ=self.environ,
             gateway_link=self.link_socket is not None,
+            connectors=connectors,
+            reports=self.reports,
         )
         self.login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
         self.setup = SetupCodes(self.state, self.keys.portal_key)
@@ -249,6 +272,11 @@ class Deployment:
         self.portal: PortalApp | None = None
         if self.portal_port is not None:
             passkeys = Passkeys.load(self.state, self.keys.portal_key)
+            copy: dict[str, Any] = {}
+            ledger = None
+            if self.reports is not None:
+                copy = {"reports": self.reports, "connectors": self.app.connectors}
+                ledger = Ledger(self.reports, self.app.connectors)
             self.portal = PortalApp(
                 [self.portal_origin],
                 static=load_static(),
@@ -257,8 +285,9 @@ class Deployment:
                 login=self.login,
                 secrets=Secrets(store, self.tokens, lambda: self.app.policy),
                 health=HealthReader(
-                    store, lambda: self.app.policy, self.login, passkeys=passkeys
+                    store, lambda: self.app.policy, self.login, passkeys=passkeys, **copy
                 ).report,
+                ledger=ledger,
             )
 
     @property

@@ -16,6 +16,13 @@ holds ``state`` and the PKCE challenge, useless without the verifier the vault k
 ``error_description`` of a provider's redirect, which goes back to the operator only (the CLI,
 or the portal's refused ``oauth.complete``).
 
+The portal's own material is swept too (M5 design O.5, D-117, R56): its pages, every answer with
+its ``Set-Cookie``, and every log line. A setup code redeemed in the portal, every challenge
+(base64url and hex), every field an authenticator returned, the user handle, every pasted address
+and both session halves never show, except where the design puts them: a challenge in the answer
+that begins its ceremony, the user handle in the enrolment's options, and each session half in
+the one answer that mints it.
+
 The gateway's view of the policy gets its own sweep: built from a policy with every vault-side
 value filled in, it may hold none of them (M3 design D.1, invariant G1).
 """
@@ -27,6 +34,7 @@ import io
 import json
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -34,7 +42,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 import pytest
 
-from tests.fakes.authenticator import SoftAuthenticator
+from tests.fakes.authenticator import Assertion, Attestation, SoftAuthenticator, b64url_decode
 from tests.fakes.oauth_server import (
     FakeAuthServer,
     FakeResourceServer,
@@ -51,6 +59,7 @@ from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
+from zoeymcp.portal.routes import STATIC
 from zoeymcp.vault import logs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp
@@ -61,7 +70,7 @@ from zoeymcp.vault.request import oauth_client_variants
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
-from .test_no_secret_answers import Recording, signed_in, step_up
+from .test_no_secret_answers import Recording, step_up
 from .test_oauth_tokens import KEYS, FakeClock
 from .test_portal_wire import ORIGIN
 
@@ -175,6 +184,38 @@ def by_host(apps: dict[str, Any]) -> Any:
     return app
 
 
+@dataclass
+class KeptAuthenticator(SoftAuthenticator):
+    """The operator's passkey, keeping everything it returned to the page."""
+
+    made: list[Attestation | Assertion] = field(default_factory=list)
+
+    def create(self, *args: Any, **kwargs: Any) -> Attestation:
+        made = super().create(*args, **kwargs)
+        self.made.append(made)
+        return made
+
+    def get(self, *args: Any, **kwargs: Any) -> Assertion:
+        made = super().get(*args, **kwargs)
+        self.made.append(made)
+        return made
+
+
+class Kept(Recording):
+    """The portal's page, keeping each answer whole as well, for the halves and challenges."""
+
+    def __init__(
+        self, client: httpx.AsyncClient, answers: list[str], whole: list[httpx.Response]
+    ) -> None:
+        super().__init__(client, answers)
+        self.whole = whole
+
+    async def call(self, method: str, path: str, body: Any = None) -> httpx.Response:
+        response = await super().call(method, path, body)
+        self.whole.append(response)
+        return response
+
+
 class World:
     """The vault, its admin app and the CLI, against fake providers. Records every output."""
 
@@ -261,12 +302,15 @@ class World:
             ).report,
             ledger=Ledger(self.copy, self.vault.connectors),
         )
-        self.passkey = SoftAuthenticator()
-        self.page: Recording | None = None
+        self.passkey = KeptAuthenticator()
+        self.page: Kept | None = None
         self.monkeypatch = monkeypatch
         # Everything that leaves the vault, by where it went.
         self.admin_answers: list[str] = []
         self.portal_answers: list[str] = []
+        self.portal_whole: list[httpx.Response] = []
+        self.portal_codes: list[str] = []  # setup codes redeemed in the portal
+        self.pasted: list[str] = []  # every address pasted back, by any surface
         self.cli_outputs: list[str] = []
         self.proxied: list[str] = []
         self.authorize_urls: list[str] = []
@@ -284,13 +328,32 @@ class World:
             self.flows.append(response.json()["flow"])
         return response
 
-    async def portal_page(self) -> Recording:
-        """The portal's page, signed in with a passkey on first use; every answer is kept."""
+    async def portal_page(self) -> Kept:
+        """The portal's page, signed in on first use as the page does it: a setup code, the
+        enrolment, the login with the new passkey. Every answer is kept."""
         if self.page is None:
             transport = httpx.ASGITransport(app=self.portal_app)
             client = httpx.AsyncClient(transport=transport, base_url=ORIGIN)
-            self.page = Recording(client, self.portal_answers)
-            await signed_in(self.page, self.portal_app, self.passkey)
+            self.page = page = Kept(client, self.portal_answers, self.portal_whole)
+            assert self.portal_app.setup is not None
+            code, _ = self.portal_app.setup.issue()
+            self.portal_codes.append(code.reveal())
+            redeemed = await page.call("POST", "/api/setup/redeem", {"code": code.reveal()})
+            assert redeemed.is_success, redeemed.text
+            enrol = await page.call("POST", "/api/passkeys/enrol/begin", {"name": "laptop"})
+            begun = enrol.json()
+            body = {
+                "ceremony": begun["ceremony"],
+                "credential": self.passkey.create(begun["options"], ORIGIN).body(),
+            }
+            assert (await page.call("POST", "/api/passkeys/enrol/finish", body)).is_success
+            page.token = page.cookie = None
+            begun = (await page.call("POST", "/api/login/begin", {})).json()
+            body = {
+                "ceremony": begun["ceremony"],
+                "credential": self.passkey.get(begun["options"], ORIGIN).body(),
+            }
+            assert (await page.call("POST", "/api/login/finish", body)).is_success
         return self.page
 
     async def portal(self, kind: str, data: dict[str, Any]) -> httpx.Response:
@@ -314,6 +377,7 @@ class World:
             response = await browser.get(url)
         assert response.status_code == 302
         location: str = response.headers["location"]
+        self.pasted.append(location)
         return location
 
     async def login(self, credential: str) -> dict[str, Any]:
@@ -401,6 +465,55 @@ class World:
         return [*values, *self.verifiers(), *self.states()]
 
 
+def assert_portal_material(world: World, outputs: dict[str, list[str]]) -> None:
+    """The portal's session halves, challenges, user handle, authenticator output and pasted
+    addresses (M5 design O.5's "never appears", with its exceptions)."""
+    answers = [r.json() for r in world.portal_whole if r.text.startswith("{")]
+    tokens = [a["token"] for a in answers if "token" in a]
+    cookies = [
+        value
+        for r in world.portal_whole
+        for header in r.headers.get_list("set-cookie")
+        if (value := header.split(";")[0].split("=", 1)[1])
+    ]
+    challenges = [a["options"]["challenge"] for a in answers if "options" in a]
+    handles = {a["options"]["user"]["id"] for a in answers if "user" in a.get("options", {})}
+    # Two sessions (the setup session and the login), and every ceremony and step-up.
+    assert (len(tokens), len(cookies)) == (2, 2)
+    assert len(challenges) == 5  # enrolment, login, three step-ups
+    portal = outputs["portal"]
+    elsewhere = [text for where, texts in outputs.items() if where != "portal" for text in texts]
+    # A session half shows once, in the answer that mints it (the token in its body, the cookie
+    # in its Set-Cookie); a challenge once, in the answer that begins its ceremony or step-up.
+    for value in [*tokens, *cookies, *challenges]:
+        assert sum(value in text for text in portal) == 1, value
+        assert not any(value in text for text in elsewhere), value
+    for challenge in challenges:
+        hexed = b64url_decode(challenge).hex()
+        assert not any(hexed in text for text in [*portal, *elsewhere]), hexed
+    # The user handle, only in the enrolment's options: the authenticator's answer carries it
+    # back, and nothing echoes it.
+    [handle] = handles
+    enrolments = [a for a in answers if "user" in a.get("options", {})]
+    assert sum(handle in text for text in portal) == len(enrolments)
+    assert not any(handle in text for text in elsewhere)
+    # What the authenticator returned is sent, never echoed: client data, authenticator data
+    # and signatures (credential IDs are named in the options' lists by design).
+    sent = [
+        value
+        for made in world.passkey.made
+        for name, value in made.body().items()
+        if name in ("client_data_json", "authenticator_data", "signature")
+    ]
+    assert len(world.passkey.made) == len(challenges) - 1  # one step-up left held
+    for value in sent:
+        assert not any(value in text for text in [*portal, *elsewhere]), value
+    # Every address pasted back, through the CLI, the socket or the portal.
+    assert len(world.pasted) >= 10
+    for address in world.pasted:
+        assert not any(address in text for text in [*portal, *elsewhere]), address
+
+
 def with_query(url: str, **changes: str) -> str:
     parts = urlsplit(url)
     pairs = dict(parse_qsl(parts.query))
@@ -449,7 +562,8 @@ async def test_nothing_secret_leaves_the_vault(
     flow = re.findall(r"--flow=(\S+)", out)[0]
     pasted = await world.browse(url)
     argv = ["login", "music", f"--flow={flow}"]
-    code, _, err = await world.cli(argv, with_query(pasted, state="another-login") + "\n")
+    world.pasted.append(with_query(pasted, state="another-login"))
+    code, _, err = await world.cli(argv, world.pasted[-1] + "\n")
     assert (code, err) == (1, "zoeymcp login: the address is for a different login\n")
 
     # music: the provider refuses, with a description for the operator.
@@ -458,6 +572,7 @@ async def test_nothing_secret_leaves_the_vault(
     refused = f"{REDIRECT}?" + urlencode(
         {"error": "access_denied", "error_description": SENTINEL, "state": state}
     )
+    world.pasted.append(refused)
     code, _, err = await world.cli(["login", "music", f"--flow={started['flow']}"], refused)
     assert code == 1
     assert f"the provider says: {SENTINEL}" in err
@@ -470,6 +585,7 @@ async def test_nothing_secret_leaves_the_vault(
     second = (await world.admin("POST", "/oauth/music/login", {})).json()
     second_state = dict(parse_qsl(urlsplit(second["authorize_url"]).query))["state"]
     body = {"flow": second["flow"], "redirect_url": with_query(used, state=second_state)}
+    world.pasted.append(body["redirect_url"])
     # The token endpoint echoes the used code in error_description.
     world.spotify.error_shape = "echo"
     again = await world.admin("POST", "/oauth/music/complete", body)
@@ -486,6 +602,7 @@ async def test_nothing_secret_leaves_the_vault(
     pasted = await world.browse(begun["authorize_url"])
     data = {"credential": "music", "flow": begun["flow"]}
     wrong = {**data, "redirect_url": with_query(pasted, state="another-login")}
+    world.pasted.append(wrong["redirect_url"])
     other = await page.call("POST", "/api/actions", {"kind": "oauth.complete", "data": wrong})
     assert other.json()["reason"] == "state_mismatch"
     connected = await world.portal("oauth.complete", {**data, "redirect_url": pasted})
@@ -495,6 +612,7 @@ async def test_nothing_secret_leaves_the_vault(
     refused = f"{REDIRECT}?" + urlencode(
         {"error": "access_denied", "error_description": SENTINEL, "state": state}
     )
+    world.pasted.append(refused)
     data = {"credential": "music", "flow": begun["flow"], "redirect_url": refused}
     denied = await page.call("POST", "/api/actions", {"kind": "oauth.complete", "data": data})
     assert denied.json()["description_shown"] == SENTINEL
@@ -560,6 +678,11 @@ async def test_nothing_secret_leaves_the_vault(
     await world.admin("GET", "/health")
     await page.call("GET", "/api/health")
     await page.call("GET", "/api/oauth")
+    await page.call("GET", "/api/sessions")
+    await page.call("GET", "/api/passkeys")
+    for path in STATIC:  # the pages themselves
+        response = await page.client.get(path, headers={"Host": "localhost:8081"})
+        world.portal_answers.append(response.text + repr(response.headers.multi_items()))
     # The policy and the ledger pages (M5 L, J.5): the reported records' keyed digests and pins
     # stay in the gateway's ledger (Q12).
     reported, prev = [], GENESIS
@@ -616,6 +739,14 @@ async def test_nothing_secret_leaves_the_vault(
         raw = setup_code.replace("-", "")
         for form in (setup_code, raw, raw.lower(), *setup_code.split("-")):
             assert form not in log_text
+    # Nor one redeemed in the portal, in any answer it made (R56, D-117).
+    assert world.portal_codes
+    for setup_code in [*world.portal_codes, *setup_codes]:
+        raw = setup_code.replace("-", "")
+        for form in (setup_code, raw, raw.lower(), *setup_code.split("-")):
+            for text in world.portal_answers:
+                assert form not in text
+    assert_portal_material(world, outputs)
     # The description reached the operator, and only through the failed completion: one admin
     # answer and one portal answer.
     assert sum(SENTINEL in text for text in world.admin_answers) == 1

@@ -1,9 +1,9 @@
 """The portal's listener and shell over real sockets (M5 design B.3, C.2, C.3, O.4).
 
 P3's ``Host`` rows and browser modes, the 308, P15's headers on every status the shell makes,
-P16's connection and body rows (contract 40's cases through the real vault), P21, and P12's 404s
-for ``/callback`` and ``/oauth/callback``; ``/oauth/callback/<name>`` is the callback, tested in
-``test_callback.py``.
+P16's connection and body rows (contract 40's cases through the real vault), P21, P12's 404s
+for ``/callback`` and ``/oauth/callback`` (``/oauth/callback/<name>`` is the callback, tested in
+``test_callback.py``), and P20's portal half: no OAuth endpoint for agents on either listener.
 The body, session and gate rows run on routes the tests add, so each row is shown on its own;
 the API's own routes are tested in ``test_login.py``, ``test_setup.py`` and ``test_sessions.py``.
 """
@@ -56,6 +56,26 @@ def refused(response: httpx.Response, status: int, reason: str) -> None:
 def rig(tmp_path: Path) -> Iterator[PortalRig]:
     with running(tmp_path) as portal:
         yield portal
+
+
+def test_the_headers_are_c3s_as_written() -> None:
+    """The values ``assert_portal_headers`` checks against, pinned to C.3's text, so a weakened
+    CSP or a dropped header can't pass by changing the app's own table (design.md §8.2)."""
+    csp = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
+        "frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'"
+    )
+    assert [(name.decode(), value.decode()) for name, value in HEADERS] == [
+        ("content-security-policy", csp),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("cache-control", "no-store"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("x-frame-options", "DENY"),
+        ("x-zoeymcp-vault", "portal"),
+    ]
 
 
 # --- the start (B.3, E.1) -----------------------------------------------------------------------
@@ -239,6 +259,44 @@ def test_each_listener_answers_as_itself(rig: PortalRig) -> None:
     for path in ("/_zoeymcp/gateway/v1/view", "/_zoeymcp/gateway/v1/ledger"):
         refused(browser.navigate(rig.origin + path), 404, "not_found")
     refused(page.fetch("GET", "/_zoeymcp/gateway/v1/view"), 404, "not_found")
+
+
+# Where an agent would look for OAuth (the same list as tests/gateway/test_gateway.py's).
+OAUTH_PATHS = (
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-protected-resource",
+    "/register",
+    "/token",
+    "/authorize",
+    "/api/token",
+    "/api/register",
+)
+
+
+def test_no_listener_offers_agents_oauth(rig: PortalRig) -> None:
+    """P20 (D-34): the portal is the operator's, and neither it nor the proxy listener beside it
+    answers OAuth metadata, a client registration, a token or an authorization endpoint: as a
+    navigation, a script's ``GET`` or ``POST``, or a non-browser's. The gateway's half is in
+    ``tests/gateway/test_gateway.py``."""
+    browser = rig.browser()
+    page = browser.page(rig.origin)
+    # A non-browser that forges a same-origin script's headers reaches the route lookup.
+    forged = [
+        ("Host", f"localhost:{rig.portal_port}"),
+        ("Sec-Fetch-Site", "same-origin"),
+        ("Origin", rig.origin),
+        ("Content-Type", "application/json"),
+    ]
+    for path in OAUTH_PATHS:
+        if not path.startswith("/api/"):  # a navigation to the API is refused before its paths
+            refused(browser.navigate(rig.origin + path), 404, "not_found")
+        refused(page.fetch("GET", path), 404, "not_found")
+        refused(page.fetch("POST", path, json={}), 404, "not_found")
+        refused(browser.forge("POST", rig.origin + path, forged, b"{}"), 404, "not_found")
+        for method in ("GET", "POST"):
+            proxy = browser.forge(method, f"http://127.0.0.1:{rig.proxy_port}{path}")
+            assert (proxy.status_code, proxy.headers["x-zoeymcp-vault"]) == (404, "refused")
 
 
 def test_refusals_are_logged_sparsely_and_without_the_callers_headers(rig: PortalRig) -> None:

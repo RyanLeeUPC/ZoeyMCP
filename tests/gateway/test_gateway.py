@@ -188,6 +188,50 @@ async def test_only_the_mcp_path_and_health(tmp_path: Path) -> None:
     assert (discovery.status_code, other.status_code, put.status_code) == (404, 404, 405)
 
 
+# Where an agent would look for OAuth: authorization-server and resource metadata (RFC 8414,
+# OpenID discovery, RFC 9728, also suffixed with the server's path), registration (RFC 7591), and
+# the token and authorization endpoints.
+OAUTH_PATHS = (
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-authorization-server/s/notes/mcp",
+    "/.well-known/oauth-protected-resource/s/notes/mcp",
+    "/s/notes/.well-known/openid-configuration",
+    "/register",
+    "/token",
+    "/authorize",
+)
+
+
+async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
+    """P20 (D-34): agents get no OAuth from ZoeyMCP. Neither the gateway nor the vault's proxy
+    answers metadata, a client registration, a token or an authorization endpoint, with or
+    without a client token, and the gateway's 401 names no resource metadata. The portal's half
+    is ``tests/portal/test_shell.py``."""
+    fake = McpFake()
+    with (
+        deployment(tmp_path, fake, include=TOOLS, review=review(fake)) as deployed,
+        gateway(deployed) as running,
+    ):
+        bearer = {"authorization": f"Bearer {token_for(CLIENTS[0])}"}
+        answers = {
+            (base, method, path, bool(headers)): httpx.request(
+                method, f"{base}{path}", headers=headers, timeout=10
+            )
+            for base in (running.url, deployed.vault_url)
+            for path in OAUTH_PATHS
+            for method in ("GET", "POST")
+            for headers in ({}, bearer)
+        }
+        unauthenticated = post(running, client=None)
+    assert {key: a.status_code for key, a in answers.items() if a.status_code != 404} == {}
+    for answer in answers.values():
+        assert "www-authenticate" not in answer.headers
+    assert unauthenticated.headers["www-authenticate"] == 'Bearer realm="zoeymcp"'
+    assert fake.received == []
+
+
 # --- G5: servers and sessions -------------------------------------------------------------------
 
 TOOLKIT = {"mail": {"kind": "toolkit", "module": "example_toolkits.mail"}}
