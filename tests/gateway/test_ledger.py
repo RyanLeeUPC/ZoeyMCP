@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 
 from zoeymcp.common import canonical, ledgerformat, logs
@@ -407,3 +408,97 @@ async def test_read_filters_by_the_asked_record(tmp_path: Path) -> None:
     assert [r["seq"] for r in ledger.read(limit=2)] == [0, 1]
     assert ledger.read(tool="other") == []
     assert ledger.read(server="mail", tool="send_note", client="agent1")[0]["ref"] == REF_A
+
+
+# --- the report's reads and wake-up (M5 design J.3) ---------------------------------------------
+
+
+def stored_lines(state: Path) -> list[bytes]:
+    found: list[bytes] = []
+    for path in sorted((state / LEDGER_DIR).glob("*.jsonl")):
+        found.extend(path.read_bytes().splitlines())
+    return found
+
+
+async def test_lines_are_the_stored_bytes_after_a_seq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ledger_module, "ROTATE_BYTES", 1200)
+    ledger, _ = opened(tmp_path)
+    for index in range(4):
+        await call(ledger, f"{index:016x}")
+    stored = stored_lines(tmp_path)
+    assert len(list((tmp_path / LEDGER_DIR).glob("*.jsonl"))) > 2  # reads cross the files
+    assert ledger.lines(-1, 256) == stored
+    assert ledger.lines(4, 256) == stored[5:]
+    assert ledger.lines(4, 3) == stored[5:8]
+    assert ledger.lines(10, 256) == [stored[11]]
+    assert ledger.lines(11, 256) == []
+    assert ledger.lines(-1, 1) == [stored[0]]
+    assert all(not line.endswith(b"\n") for line in stored)
+
+
+async def test_lines_skip_pruned_files_and_lines_that_dont_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ledger_module, "ROTATE_BYTES", 1200)
+    ledger, _ = opened(tmp_path, max_bytes=3000)
+    for index in range(10):
+        await call(ledger, f"{index:016x}")
+    stored = stored_lines(tmp_path)
+    first = ledgerformat.parse(stored[0]).seq
+    assert first > 0  # the oldest files were pruned
+    assert ledger.lines(-1, 256) == stored
+    newest = sorted((tmp_path / LEDGER_DIR).glob("*.jsonl"))[-1]
+    newest.write_bytes(newest.read_bytes() + b"not a record\n")
+    assert ledger.lines(-1, 256) == stored
+
+
+async def test_lines_leave_out_a_record_whose_append_hasnt_returned(tmp_path: Path) -> None:
+    ledger, _ = opened(tmp_path)
+    await call(ledger, REF_A)
+    stored = stored_lines(tmp_path)
+    # A record on disk past next_seq: an append in the worker thread, before it returns.
+    ledger.next_seq -= 1
+    assert ledger.lines(-1, 256) == stored[:-1]
+
+
+async def test_wait_appended_wakes_on_an_append_after_the_count_taken(tmp_path: Path) -> None:
+    ledger, _ = opened(tmp_path)
+    assert ledger.appended == 0
+    assert await ledger.wait_appended(0, 0.01) is False
+    seen = ledger.appended
+    await call(ledger, REF_A, decision=None, outcome=None)  # between a read and the wait
+    assert ledger.appended == seen + 1
+    with anyio.fail_after(5):
+        assert await ledger.wait_appended(seen, 60) is True  # not missed
+    woke: list[bool] = []
+    async with anyio.create_task_group() as group:
+
+        async def waiter() -> None:
+            woke.append(await ledger.wait_appended(ledger.appended, 60))
+
+        group.start_soon(waiter)
+        await anyio.sleep(0.05)
+        assert woke == []
+        with anyio.fail_after(5):
+            await ledger.write("decided", REF_A, critical=True, decision="accept", waited_ms=1)
+            while not woke:
+                await anyio.sleep(0.01)
+    assert woke == [True]
+
+
+async def test_a_failed_append_wakes_nobody_and_a_flush_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger, _ = opened(tmp_path)
+    await ledger.write("asked", REF_A, critical=True, **asked_fields(ledger, {}))
+    seen = ledger.appended
+    with monkeypatch.context() as patched:
+        broken_disk(patched)
+        await ledger.write("decided", REF_A, critical=False, decision="timeout", waited_ms=1)
+        assert await ledger.flush_queue() == 1
+    assert ledger.appended == seen
+    assert await ledger.flush_queue() == 0
+    assert ledger.appended == seen + 1
+    assert await ledger.wait_appended(seen, 0.01) is True

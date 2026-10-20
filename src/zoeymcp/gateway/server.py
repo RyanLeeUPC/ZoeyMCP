@@ -47,6 +47,7 @@ from .vaultlink import (
     LinkError,
     environ_has_no_secrets,
     parse_link,
+    report_client,
     running_as_root,
     view_client,
 )
@@ -137,7 +138,9 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
         raise StartupError(f"drift marks: {exc} (move the file aside to start over)") from exc
     pool = UpstreamPool(link, keys, marks, DefinitionStore(options.state))
     toolkits = Toolkits(link, keys, marks, allow_writable=options.allow_writable_toolkits)
-    app = GatewayApp(pool, view_client(link, keys), toolkits=toolkits)
+    app = GatewayApp(
+        pool, view_client(link, keys), toolkits=toolkits, report_http=report_client(link, keys)
+    )
     try:
         # The view's limit applies once the first view arrives.
         app.ledger, _ = Ledger.open_at(options.state, max_bytes=GatewayLimits().ledger_max_bytes)

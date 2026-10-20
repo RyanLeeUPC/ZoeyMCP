@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 import httpx2
 
 from ..common import canonical
+from ..common.ledgerreport import PATH as REPORT_PATH
 from ..common.logs import refuse_type
 from . import logs
 from .egressrules import CallRegistry, Outgoing, Target, check
@@ -413,6 +414,61 @@ def view_client(
         max_redirects=0,
         trust_env=False,
         timeout=VIEW_TIMEOUT,
+        event_hooks=_hooks(link, keys),
+    )
+
+
+REPORT_MAX_ANSWER_BYTES = 4096  # the copy's head, or a refusal with it (M5 design J.3)
+
+
+class _ReportOnly(httpx2.AsyncBaseTransport):
+    """The reporter's transport: a GET or POST of exactly the report path, and nothing else.
+    An answer is cut off past :data:`REPORT_MAX_ANSWER_BYTES`."""
+
+    def __init__(self, inner: httpx2.AsyncBaseTransport, link: Link) -> None:
+        self._inner = inner
+        self._link = link
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        url = request.url
+        if (
+            request.method not in ("GET", "POST")
+            or (url.scheme, url.host, url.port)
+            != (self._link.scheme, self._link.host, self._link.port)
+            or url.raw_path != REPORT_PATH.encode()
+        ):
+            raise UpstreamBlocked("the reporter only reaches the report path")
+        response = await self._inner.handle_async_request(request)
+        if is_redirect(response.status_code):
+            await response.aclose()
+            raise UpstreamRedirect(str(response.status_code))
+        return httpx2.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=_Capped(response.stream, REPORT_MAX_ANSWER_BYTES),  # type: ignore[arg-type]
+            extensions=response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+# A report's body is read within 10 s by the vault; its answer is small.
+REPORT_TIMEOUT = httpx2.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+
+
+def report_client(
+    link: Link, keys: KeySource | None, inner: httpx2.AsyncBaseTransport | None = None
+) -> httpx2.AsyncClient:
+    """The HTTP client that reports the ledger to the vault's copy (M5 design J.3)."""
+    return httpx2.AsyncClient(
+        transport=_ReportOnly(inner if inner is not None else _inner_transport(link), link),
+        base_url=link.base_url,
+        follow_redirects=False,
+        max_redirects=0,
+        trust_env=False,
+        timeout=REPORT_TIMEOUT,
         event_hooks=_hooks(link, keys),
     )
 

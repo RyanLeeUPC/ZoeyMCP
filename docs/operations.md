@@ -702,7 +702,13 @@ gateway can't write.
 **The vault's copy.** The gateway pushes each record, once it is on disk, to the vault over the
 link it already uses, and the vault keeps an append-only copy in `/state/ledger-reported/`, where
 the gateway can't write: a held head the gateway can't rewrite afterwards, and in the vault's own
-logs (`ledger_report_accepted` carries `head_seq` and `head_hash`). Read it in the vault:
+logs (`ledger_report_accepted` carries `head_seq` and `head_hash`). The gateway asks for the
+copy's head at least once a minute, and as soon as a record is written, and sends what the copy
+lacks, at most 256 records per report. While the copy refuses reports (below) it asks every 5
+minutes; while the vault can't be reached it retries, backing off up to 5 minutes. The gateway
+logs `ledger_report_failed` with a `reason` (a vault code such as `unavailable` or `fork`, or the
+error's type) at most once per 5 minutes. Approvals never wait for a report. Read the copy in the
+vault:
 
 ```sh
 zoeymcp ledger --vault                    # the copy's state, then the newest 200 calls with their sends

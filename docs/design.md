@@ -776,7 +776,12 @@ keeps the copy in `/state/ledger-reported/`: the lines as received, appended and
 `head.json` before it listens. So the gateway can't rewrite what the vault already holds, and the
 head is also in the vault's own logs. A restart of the chain archives the live chain and keeps
 each dropped epoch's head as an anchor. A copy that can't be read refuses reports (503) and the
-proxy runs anyway; nothing in the gateway's approval path waits for a report.
+proxy runs anyway; nothing in the gateway's approval path waits for a report. The gateway's
+reporter runs beside the policy client: it asks for the head at least once a minute and as soon as
+a record is fsynced, reads its stored lines from the copy's head itself (so a restored or lost
+gateway volume shows as a fork on the next report), and sends what the copy lacks in batches under
+1 MiB, over a link client that reaches only the report path. While the copy refuses it asks every
+5 minutes; other failures back off up to 5 minutes, logged at most once per 5 minutes.
 
 | | **Managed** (default) | **Declarative** |
 | --- | --- | --- |

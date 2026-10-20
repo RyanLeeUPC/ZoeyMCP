@@ -37,10 +37,11 @@ from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import project_and_pin
 from zoeymcp.gateway.server import AdminApp
 from zoeymcp.gateway.upstream import UpstreamPool
-from zoeymcp.gateway.vaultlink import KeySource, parse_link, view_client
+from zoeymcp.gateway.vaultlink import KeySource, parse_link, report_client, view_client
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.store import SecretStore
 
 KEYS = KeySet.from_master(bytes(range(64, 96)))
@@ -199,6 +200,22 @@ class Reloadable:
 @contextmanager
 def deployment(tmp_path: Path, fake: McpFake, **options: Any) -> Iterator[Deployed]:
     """The fake, and a real vault routing ``/notes`` to it for the gateway only."""
+    with deployment_with(tmp_path, fake, options) as deployed:
+        yield deployed
+
+
+@contextmanager
+def deployment_with(
+    tmp_path: Path,
+    fake: McpFake,
+    options: dict[str, Any],
+    *,
+    reports: ReportStore | None = None,
+    wrap: Callable[[ASGIApp], ASGIApp] | None = None,
+) -> Iterator[Deployed]:
+    """:func:`deployment` with ``raw_policy`` ``options``, where ``reports`` is the vault's copy
+    of the gateway's ledger (the report path answers 503 without one) and ``wrap`` wraps the
+    vault's app, for a test that changes how it answers."""
     log = io.StringIO()
     logs.set_stream(log)
     try:
@@ -207,8 +224,11 @@ def deployment(tmp_path: Path, fake: McpFake, **options: Any) -> Iterator[Deploy
             store = SecretStore(tmp_path / "vault", KEYS)
             store.load()
             store.put("notes-key", fake.secret, derive_binding(policy, "notes-key"))
-            app = VaultApp(policy, store, KEYS, client=httpx.AsyncClient(), environ={})
-            with serve(Reloadable(app)) as vault_url:
+            app = VaultApp(
+                policy, store, KEYS, client=httpx.AsyncClient(), environ={}, reports=reports
+            )
+            served: ASGIApp = Reloadable(app)
+            with serve(wrap(served) if wrap is not None else served) as vault_url:
                 yield Deployed(
                     fake,
                     vault_url,
@@ -309,8 +329,9 @@ class Running:
 
 
 @contextmanager
-def gateway(deployed: Deployed, *, policy_wait: int = 1) -> Iterator[Running]:
-    """The gateway app on a uvicorn thread, on the deployment's vault, once it is ready."""
+def gateway(deployed: Deployed, *, policy_wait: int = 1, report: bool = False) -> Iterator[Running]:
+    """The gateway app on a uvicorn thread, on the deployment's vault, once it is ready.
+    With ``report``, it reports its ledger to the vault, as ``zoeymcp gateway`` does."""
     pool = UpstreamPool(
         parse_link(deployed.vault_url),
         KeySource(KEYS.gateway_key(1)),
@@ -318,8 +339,9 @@ def gateway(deployed: Deployed, *, policy_wait: int = 1) -> Iterator[Running]:
         DefinitionStore(deployed.state),
         limits=deployed.view.gateway.limits,
     )
-    http = view_client(parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1)))
-    app = GatewayApp(pool, http, policy_wait=policy_wait)
+    link, keys = parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1))
+    reporting = report_client(link, keys) if report else None
+    app = GatewayApp(pool, view_client(link, keys), policy_wait=policy_wait, report_http=reporting)
     app.ledger, _ = Ledger.open_at(
         deployed.state, max_bytes=deployed.view.gateway.limits.ledger_max_bytes
     )

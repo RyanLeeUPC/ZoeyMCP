@@ -28,6 +28,7 @@ from zoeymcp.gateway.vaultlink import (
     environ_has_no_secrets,
     is_redirect,
     parse_link,
+    report_client,
     upstream_client,
     vault_refusal_code,
     view_client,
@@ -635,6 +636,85 @@ async def test_the_view_client_refuses_redirects() -> None:
     ) as http:
         with pytest.raises(UpstreamRedirect):
             await http.get("/_zoeymcp/gateway/v1/view")
+
+
+REPORT = "/_zoeymcp/gateway/v1/report/ledger"
+
+
+@pytest.mark.parametrize("spec", ["unix:/run/v.sock", "http://vault:8080"])
+async def test_the_report_client_reaches_only_the_report_path(spec: str) -> None:
+    """``_ReportOnly`` (M5 design J.3): a GET or POST of exactly the report path on the link;
+    every other method, path, query or host is refused before anything is sent."""
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json={"head_seq": None, "head_hash": None, "state": "ok"})
+
+    link = parse_link(spec)
+    async with report_client(link, None, inner=httpx2.MockTransport(handler)) as http:
+        assert (await http.get(REPORT)).status_code == 200
+        assert (await http.post(REPORT, content=b"{}")).status_code == 200
+        refused = [
+            http.put(REPORT, content=b"{}"),
+            http.delete(REPORT),
+            http.head(REPORT),
+            http.patch(REPORT, content=b"{}"),
+            http.request("OPTIONS", REPORT),
+            http.get("/_zoeymcp/gateway/v1/view"),
+            http.post("/_zoeymcp/gateway/v1/report/other", content=b"{}"),
+            http.get(REPORT + "/"),
+            http.get(REPORT + "?x=1"),
+            http.get(REPORT, params={"wait": "25"}),
+            http.get("/_zoeymcp/gateway/v1/report/%6Cedger"),
+            http.get("/notes/mcp"),
+            http.get("http://elsewhere.example" + REPORT),
+            http.get(f"https://{link.host}" + REPORT),
+            http.get(f"http://{link.host}:9999" + REPORT),
+        ]
+        for request in refused:
+            with pytest.raises(UpstreamBlocked):
+                await request
+    assert [(r.method, r.url.raw_path) for r in seen] == [
+        ("GET", REPORT.encode()),
+        ("POST", REPORT.encode()),
+    ]
+
+
+async def test_the_report_client_refuses_redirects_and_large_answers() -> None:
+    answers = [
+        httpx2.Response(307, headers={"location": REPORT}),
+        httpx2.Response(200, content=b" " * 4097),
+        httpx2.Response(409, content=b" " * 4096),
+    ]
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return answers.pop(0)
+
+    async with report_client(
+        parse_link("unix:/run/v.sock"), None, inner=httpx2.MockTransport(handler)
+    ) as http:
+        with pytest.raises(UpstreamRedirect):
+            await http.get(REPORT)
+        with pytest.raises(ResponseTooLarge):
+            await http.get(REPORT)
+        assert len((await http.post(REPORT, content=b"{}")).content) == 4096
+
+
+async def test_the_report_client_sends_the_key_on_the_hardened_link_only() -> None:
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200)
+
+    for spec, keys in (("http://vault:8080", KeySource(KEY)), ("unix:/run/v.sock", None)):
+        async with report_client(
+            parse_link(spec), keys, inner=httpx2.MockTransport(handler)
+        ) as http:
+            await http.get(REPORT)
+    assert seen[0].headers[GATEWAY_HEADER] == KEY
+    assert GATEWAY_HEADER not in seen[1].headers
 
 
 async def test_refresh_wakes_the_backoff() -> None:

@@ -15,6 +15,8 @@ Records come from :mod:`zoeymcp.common.ledgerformat`; this module does the file 
   :class:`LedgerUnavailable`, so nothing is asked or forwarded. Other records are queued in memory
   and retried every 5 s; with 1,024 queued, :attr:`Ledger.accepting` is false and new approvals
   are refused.
+- **The report** (M5 design J.3): :meth:`Ledger.lines` reads stored lines back for the reporter,
+  and :meth:`Ledger.wait_appended` wakes it after an append. Nothing here waits for it.
 """
 
 from __future__ import annotations
@@ -130,6 +132,10 @@ class Ledger:
         self._lock = anyio.Lock()
         self._current: Path | None = None
         self._current_size = 0
+        # Appends seen on the event loop, and the event the reporter waits on for the next one.
+        # Both change only on the loop, after the worker thread's append returns (J.3).
+        self.appended = 0
+        self._appended_event: anyio.Event | None = None
 
     # --- start-up ----------------------------------------------------------------------------
 
@@ -258,6 +264,7 @@ class Ledger:
             if not critical and self.queue:
                 self.queue.append(_Queued(kind, ref, fields))  # keep the order
                 return None
+            written = self.next_seq
             try:
                 return await anyio.to_thread.run_sync(self._append, kind, ref, fields)
             except (OSError, LedgerFormatError) as exc:
@@ -272,18 +279,48 @@ class Ledger:
                     raise LedgerUnavailable(kind) from exc
                 self.queue.append(_Queued(kind, ref, fields))
                 return None
+            finally:
+                self._notify(written)
 
     async def flush_queue(self) -> int:
         """Retry queued records in order; returns how many are still queued."""
         async with self._lock:
-            while self.queue:
-                item = self.queue[0]
-                try:
-                    await anyio.to_thread.run_sync(self._append, item.kind, item.ref, item.fields)
-                except OSError:
-                    break
-                self.queue.pop(0)
-            return len(self.queue)
+            written = self.next_seq
+            try:
+                while self.queue:
+                    item = self.queue[0]
+                    try:
+                        await anyio.to_thread.run_sync(
+                            self._append, item.kind, item.ref, item.fields
+                        )
+                    except OSError:
+                        break
+                    self.queue.pop(0)
+                return len(self.queue)
+            finally:
+                self._notify(written)
+
+    def _notify(self, written: int) -> None:
+        """Wake the reporter if records reached the disk since ``next_seq`` was ``written``.
+        Called on the event loop only: ``_append`` runs in a worker thread and never touches the
+        event (J.3)."""
+        if self.next_seq == written:
+            return
+        self.appended += 1
+        event, self._appended_event = self._appended_event, None
+        if event is not None:
+            event.set()
+
+    async def wait_appended(self, seen: int, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for an append after :attr:`appended` was ``seen``.
+        Take ``seen`` before reading, so an append between the read and the wait isn't missed.
+        Returns whether one came."""
+        with anyio.move_on_after(timeout):
+            while self.appended == seen:
+                if self._appended_event is None:
+                    self._appended_event = anyio.Event()
+                await self._appended_event.wait()
+        return self.appended != seen
 
     async def retry_forever(self) -> None:
         while True:
@@ -354,6 +391,35 @@ class Ledger:
                     yield ledgerformat.parse(line)
                 except LedgerFormatError:
                     continue
+
+    def lines(self, after: int, limit: int) -> list[bytes]:
+        """Up to ``limit`` stored lines with a seq above ``after``, oldest first, each as it is
+        on disk without its newline: what the reporter sends (J.3). Only records whose append had
+        returned when the read began are read, so each is whole and fsynced; a line that doesn't
+        parse is left out, as :meth:`read` leaves it."""
+        below = self.next_seq  # an append under way writes this seq, and is left for next time
+        found: list[bytes] = []
+        paths = self._files()
+        starts = [int(_FILE.fullmatch(p.name).group(1)) for p in paths]  # type: ignore[union-attr]
+        for index, path in enumerate(paths):
+            if index + 1 < len(paths) and starts[index + 1] - 1 <= after:
+                continue  # every record in this file is at or below ``after``
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                continue  # pruned since it was listed
+            for line in data.splitlines():
+                try:
+                    record = ledgerformat.parse(line)
+                except LedgerFormatError:
+                    continue
+                if record.seq >= below:
+                    return found
+                if record.seq > after:
+                    found.append(record.line)
+                    if len(found) >= limit:
+                        return found
+        return found
 
     def read(
         self,

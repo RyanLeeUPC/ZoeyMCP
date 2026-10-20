@@ -61,6 +61,7 @@ from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier
 from .policyclient import PolicyClient, Snapshot
+from .reporter import Reporter
 from .toolkits import Toolkits
 from .toolkitsource import ToolkitSource, ToolkitUnavailable
 from .toolsource import RemoteSource, ServedServer, ToolSource
@@ -246,8 +247,9 @@ MAX_ANSWER_BYTES = 64 * 1024  # an agent's answer to a prompt (M4 design D.3)
 
 
 class GatewayApp:
-    """The gateway as one ASGI app. Its lifespan runs the pool, the notifier, the policy client
-    and, once the first view has arrived, the SDK's session manager."""
+    """The gateway as one ASGI app. Its lifespan runs the pool, the notifier, the policy client,
+    the ledger's reporter (with ``report_http``) and, once the first view has arrived, the SDK's
+    session manager."""
 
     def __init__(
         self,
@@ -258,8 +260,12 @@ class GatewayApp:
         clock: Callable[[], float] = time.monotonic,
         policy_wait: int | None = None,
         toolkits: Toolkits | None = None,
+        report_http: httpx2.AsyncClient | None = None,
     ) -> None:
         self.pool = pool
+        # The ledger's reporter, made in the lifespan once the ledger is open (M5 design J.3).
+        self.report_http = report_http
+        self.reporter: Reporter | None = None
         self.toolkits = toolkits or Toolkits(pool.link, pool.keys, pool.marks)
         self.notifier = notifier if notifier is not None else Notifier()
         self.clock = clock
@@ -448,6 +454,10 @@ class GatewayApp:
                 group.start_soon(self._watch_staleness)
                 if self.ledger is not None:
                     group.start_soon(self.ledger.retry_forever)
+                    if self.report_http is not None:
+                        # Apart from approvals: nothing they do waits for it (M5 design J.3).
+                        self.reporter = Reporter(self.report_http, self.ledger)
+                        group.start_soon(self.reporter.run)
                 # Committed calls run in this group, out of reach of uvicorn's request cancels.
                 self.committed.attach(group)
                 group.start_soon(self.approvals.sweep_forever)
