@@ -403,6 +403,77 @@ def test_a_reset_ends_every_session() -> None:
     assert table.end_where(lambda s: True, "end_all") == []
 
 
+# --- one signed-in tab per browser ----------------------------------------------------------------
+
+
+def test_by_cookie_finds_what_the_cookies_name_and_changes_nothing() -> None:
+    table = Sessions(counting())
+    first, other, third = mint(table), mint(table, origin=OTHER), mint(table)
+    # Whatever the header half or the origin, oldest first, whatever the cookies' order.
+    found = table.by_cookie([third.cookie, first.cookie, other.cookie], T0 + 100)
+    assert found == [first.session, other.session, third.session]
+    assert table.by_cookie([third.cookie], T0) == [third.session]
+    assert len(table) == 3
+    assert [s.last_seen for s in table.live(T0)] == [T0, T0, T0]
+
+
+def test_by_cookie_names_nothing_without_a_cookie_of_its_own() -> None:
+    table = Sessions(counting())
+    minted = mint(table)
+    assert table.by_cookie([], T0) == []
+    assert table.by_cookie([SessionToken("planted")], T0) == []
+    # The header half, or a session's ID, is not its cookie.
+    assert table.by_cookie([minted.header], T0) == []
+    assert table.by_cookie([SessionToken(minted.session.id)], T0) == []
+
+
+def test_by_cookie_tries_every_value() -> None:
+    # Unlike lookup, which tries the first four: a planted cookie can't shield ours.
+    table = Sessions(counting())
+    minted = mint(table)
+    planted = [SessionToken(f"planted-{i}") for i in range(2 * MAX_SESSION_COOKIES)]
+    assert table.by_cookie([*planted, minted.cookie], T0) == [minted.session]
+
+
+def test_by_cookie_finds_only_live_sessions() -> None:
+    table = Sessions(counting())
+    full = mint(table)
+    setup = mint(table, T0 + 1, scope="setup", credential=None)
+    cookies = [full.cookie, setup.cookie]
+    assert table.by_cookie(cookies, T0 + SETUP_SESSION_MAX) == [full.session, setup.session]
+    assert table.by_cookie(cookies, T0 + 1 + SETUP_SESSION_MAX) == [full.session]
+    assert table.by_cookie(cookies, T0 + SESSION_IDLE) == []
+    assert len(table) == 2  # left for sweep, which logs why
+
+
+def test_a_new_sessions_cookie_ends_the_ones_it_replaces() -> None:
+    table = Sessions(counting())
+    first, second, kept = mint(table), mint(table, origin=OTHER), mint(table)
+    ended = table.end_replaced([SessionToken("planted"), second.cookie, first.cookie], T0)
+    assert [(e.session.id, e.why) for e in ended] == [
+        (first.session.id, "replaced"),
+        (second.session.id, "replaced"),
+    ]
+    assert [s.id for s in table.live(T0)] == [kept.session.id]
+    assert find(table, first, T0) is None
+    assert find(table, kept, T0) == kept.session
+    # Once ended, the same cookies end nothing more.
+    assert table.end_replaced([first.cookie, second.cookie], T0) == []
+
+
+def test_a_cookie_of_no_live_session_ends_nothing() -> None:
+    table = Sessions(counting())
+    minted = mint(table)
+    assert table.end_replaced([], T0) == []
+    assert table.end_replaced([SessionToken("planted"), minted.header], T0) == []
+    assert [s.id for s in table.live(T0)] == [minted.session.id]
+    # An expired one stays for sweep, which ends it as idle, not replaced.
+    assert table.end_replaced([minted.cookie], T0 + SESSION_IDLE) == []
+    assert [(e.session.id, e.why) for e in table.sweep(T0 + SESSION_IDLE)] == [
+        (minted.session.id, "idle")
+    ]
+
+
 # --- the challenge --------------------------------------------------------------------------------
 
 
@@ -704,6 +775,23 @@ class SessionMachine(RuleBasedStateMachine):
         for item in ended:
             assert item is not None
             self._end(item.session.id)
+
+    @rule(data=st.data())
+    def replace(self, data: st.DataObject) -> None:
+        # A mint's request carries some cookies, of sessions live, ended or never minted.
+        known = [h.minted for h in self.held.values()] + self.ended
+        named = data.draw(st.lists(st.sampled_from(known), unique_by=id) if known else st.just([]))
+        cookies = [m.cookie for m in named] + [SessionToken("planted")]
+        wanted = {
+            m.session.id
+            for m in named
+            if m.session.id in self.held and self.held[m.session.id].alive(self.now)
+        }
+        ended = self.table.end_replaced(cookies, self.now)
+        assert [e.why for e in ended] == ["replaced"] * len(wanted)
+        assert {e.session.id for e in ended} == wanted
+        for session_id in wanted:
+            self._end(session_id)
 
     @rule()
     def sweep(self) -> None:

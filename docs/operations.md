@@ -930,6 +930,13 @@ restarts, and when the passkey that made it is removed. Closing the tab doesn't 
 restore a closed tab with its session, so sign out on a shared machine. Signing out also clears
 the page's storage (`Clear-Site-Data: "storage"`).
 
+**One signed-in tab per browser.** Each tab has its own token, but the browser holds one cookie
+for the portal, so signing in from a second tab (or redeeming a setup code there) signs the first
+tab out: its session ends at once, logged `portal_session_ended` with `why: replaced`, and the
+first tab is told it is signed out at its next request. Signing in there again signs the second
+tab out in turn. Only the browser holding a session's cookie can end it this way; other browsers'
+sessions stay.
+
 **Sessions.** The Sessions page lists every signed-in browser, by fingerprint, with its origin,
 the passkey it signed in with, and when it was made and last used; **End the other sessions**
 ends every one but yours. `zoeymcp sessions` lists the same from the host, and

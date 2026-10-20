@@ -15,8 +15,8 @@ from typing import Any, cast
 
 import pytest
 
-from tests.fakes.authenticator import SoftAuthenticator
-from tests.fakes.browser import SESSION_KEY, Cookie
+from tests.fakes.authenticator import SoftAuthenticator, Switch
+from tests.fakes.browser import SESSION_KEY, Cookie, Page, head
 from zoeymcp.portal.app import PortalApp, load_static
 from zoeymcp.portal.routes import ROUTES
 from zoeymcp.portal.sessions import SESSION_IDLE, SESSION_MAX
@@ -105,6 +105,42 @@ def test_logout(rig: PortalRig) -> None:
     assert line["why"] == "logout"
     page.storage[SESSION_KEY] = token
     assert status_reason(page.fetch("GET", "/api/session")) == (401, "no_session")
+    assert len(rig.app.sessions) == 0
+
+
+def test_two_logouts_at_once_end_the_session_once(rig: PortalRig) -> None:
+    """The first logout has passed the lookup and waits for its body when the second ends the
+    session: only the request that ended it answers 200 and logs it; the other finds it gone and
+    answers as a later one would, 401 no_session."""
+    browser = rig.browser()
+    page = browser.page(rig.origin)
+    set_up(rig, page, SoftAuthenticator())
+    [cookie] = [c for c in browser.cookies if c.name == cookie_name(rig)]
+    request = head(
+        "POST /api/logout HTTP/1.1",
+        f"Host: localhost:{rig.portal_port}",
+        "Sec-Fetch-Site: same-origin",
+        f"Origin: {rig.origin}",
+        f"Cookie: {cookie.name}={cookie.value}",
+        f"X-ZoeyMCP-Session: {page.storage[SESSION_KEY]}",
+        "Content-Type: application/json",
+        "Content-Length: 2",
+        "Connection: close",
+    )
+    with rig.slowloris() as raw:
+        first = raw.connect()
+        first.sendall(request)  # the head alone: admitted, then waiting for the body
+        deadline = time.monotonic() + 10
+        while rig.call(lambda: rig.app.in_flight) != (1, 0):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        second = page.fetch("POST", "/api/logout", json={})
+        first.sendall(b"{}")
+        answer = raw.answer(first)
+    assert len(rig.lines("portal_logout")) == 1
+    assert second.status_code == 200
+    assert answer.startswith(b"HTTP/1.1 401 "), answer
+    assert b'"reason":"no_session"' in answer
     assert len(rig.app.sessions) == 0
 
 
@@ -197,6 +233,91 @@ def test_removing_a_passkey_ends_its_sessions(rig: PortalRig) -> None:
     assert rig.call(rig.app.end_all) == 1
     assert status_reason(second.fetch("GET", "/api/session")) == (401, "no_session")
     assert rig.lines("portal_session_ended")[-1]["why"] == "end_all"
+
+
+def ended_lines(rig: PortalRig) -> list[tuple[str, str]]:
+    return [(line["session"], line["why"]) for line in rig.lines("portal_session_ended")]
+
+
+def this_session(page: Page) -> str:
+    answer = page.fetch("GET", "/api/session")
+    assert answer.status_code == 200, answer.text
+    fingerprint: str = answer.json()["session"]
+    return fingerprint
+
+
+def test_one_signed_in_tab_per_browser(rig: PortalRig) -> None:
+    """Each tab keeps its own header half, but the browser holds one cookie: a sign-in in a second
+    tab replaces it, so the first tab's session ends at once (why: replaced), with its action,
+    rather than idling out unusable. Signing in there again ends the second's in turn."""
+    authenticator = SoftAuthenticator()
+    browser = rig.browser()
+    tab_a, tab_b = browser.tab(rig.origin), browser.tab(rig.origin)
+    set_up(rig, tab_a, authenticator)
+    # The setup session ended with its enrolment, so its cookie replaced nothing at the login.
+    assert [why for _, why in ended_lines(rig)] == ["enrolled"]
+    first = this_session(tab_a)
+    held = tab_a.fetch(
+        "POST", "/api/actions", json={"kind": "passkey.enrol", "data": {"name": "x"}}
+    )
+    assert held.status_code == 200, held.text
+    assert len(rig.app.actions) == 1
+
+    assert login(tab_b, authenticator).status_code == 200
+    assert tab_a.storage[SESSION_KEY] != tab_b.storage[SESSION_KEY]
+    assert ended_lines(rig)[-1] == (first, "replaced")
+    assert len(rig.app.actions) == 0  # its action went with it
+    assert status_reason(tab_a.fetch("GET", "/api/session")) == (401, "no_session")
+    second = this_session(tab_b)
+    listed = tab_b.fetch("GET", "/api/sessions").json()["sessions"]
+    assert [(s["fingerprint"], s["this"]) for s in listed] == [(second, True)]
+
+    assert login(tab_a, authenticator).status_code == 200
+    assert ended_lines(rig)[-1] == (second, "replaced")
+    assert status_reason(tab_b.fetch("GET", "/api/session")) == (401, "no_session")
+    listed = tab_a.fetch("GET", "/api/sessions").json()["sessions"]
+    assert [(s["fingerprint"], s["this"]) for s in listed] == [(this_session(tab_a), True)]
+    assert [why for _, why in ended_lines(rig)] == ["enrolled", "replaced", "replaced"]
+
+
+def test_a_redeemed_code_replaces_the_browsers_full_session(rig: PortalRig) -> None:
+    authenticator = SoftAuthenticator()
+    elsewhere = rig.browser().page(rig.origin)
+    set_up(rig, elsewhere, authenticator)
+    browser = rig.browser()
+    tab_a, tab_b = browser.tab(rig.origin), browser.tab(rig.origin)
+    assert login(tab_a, authenticator).status_code == 200
+    full = this_session(tab_a)
+    # A refused code and a refused assertion mint nothing, so they end nothing.
+    assert status_reason(redeem(tab_b, "wrong")) == (401, "setup_code_refused")
+    assert login(tab_b, authenticator, switches={Switch.FLIP_SIGNATURE}).status_code == 401
+    assert this_session(tab_a) == full
+    assert redeem(tab_b, issue(rig)).status_code == 200
+    assert ended_lines(rig)[-1] == (full, "replaced")
+    assert status_reason(tab_a.fetch("GET", "/api/session")) == (401, "no_session")
+    assert tab_b.fetch("GET", "/api/session").json()["scope"] == "setup"
+    # The other browser's session is not this browser's to end.
+    assert elsewhere.fetch("GET", "/api/session").status_code == 200
+    assert len(rig.app.sessions) == 2
+
+
+def test_a_cookie_of_no_live_session_ends_nothing(rig: PortalRig) -> None:
+    authenticator = SoftAuthenticator()
+    elsewhere = rig.browser().page(rig.origin)
+    set_up(rig, elsewhere, authenticator)
+    browser = rig.browser()
+    page = browser.page(rig.origin)
+    assert login(page, authenticator).status_code == 200
+    assert elsewhere.fetch("POST", "/api/sessions/end-others", json={}).json() == {"ended": 1}
+    # The browser still holds the ended session's cookie, and a planted one besides.
+    browser.plant(Cookie(cookie_name(rig), "planted", "localhost", "/api", False, False, "lax"))
+    assert len([c for c in browser.cookies if c.name == cookie_name(rig)]) == 2
+    before = ended_lines(rig)
+    assert login(page, authenticator).status_code == 200
+    assert ended_lines(rig) == before
+    assert elsewhere.fetch("GET", "/api/session").status_code == 200
+    assert page.fetch("GET", "/api/session").status_code == 200
+    assert len(rig.app.sessions) == 2
 
 
 class FlowsSeen:

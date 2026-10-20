@@ -1311,7 +1311,10 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
   sign-in, at logout (which also sends `Clear-Site-Data: "storage"`), when the vault restarts,
   when the passkey that made it is removed, at a reset enrolment, and when its origin is removed;
   ending other sessions needs no step-up. At most 8 are kept, the least recently used giving way.
-  Closing a tab doesn't end a session: browsers restore it.
+  One signed-in tab per browser: the browser holds one cookie, so a sign-in elsewhere in the same
+  browser (a login or a redeemed setup code, in another tab) signs the other tab out and ends its
+  session at once (`why: replaced`). Only a request carrying a session's own cookie can end it
+  this way, so it gives no new power. Closing a tab doesn't end a session: browsers restore it.
 - **Verifier:** our own, strict and small, using only `cryptography`, with **no CBOR library** in
   the vault.
   - **Enrolment:** it requests `attestation: "none"` and offers ES256, EdDSA and RS256, in that

@@ -22,8 +22,10 @@ The static files are loaded once, at start, into a fixed map (:func:`load_static
 one stops the start. The API's routes are ``routes.ROUTES``, each answered by a handler here
 (M.1): logging in with a passkey, redeeming a setup code and enrolling with it (E, F.2), the
 session and the session list, logout and ending the other sessions, the passkey list, and the
-step-up path (F.4). Before any session lookup the expired sessions are ended and logged, and
-however a session ends, its ceremony and action are dropped and its OAuth flows cancelled (H.2).
+step-up path (F.4). Before any session lookup the expired sessions are ended and logged; a
+login or a redeemed code ends the sessions whose cookie it replaces in that browser (one
+signed-in tab per browser); and however a session ends, its ceremony and action are dropped and
+its OAuth flows cancelled (H.2).
 
 **Every change a full session makes is an action** (P6): ``POST /api/actions`` checks the body
 against the registry (``actions.KINDS``) and runs the kind's plan (:meth:`PortalApp._kinds`),
@@ -174,7 +176,8 @@ def load_static(root: Traversable | None = None) -> dict[str, bytes]:
 class Call:
     """An admitted API request, as a handler sees it: its origin entry, route and path
     parameters, its raw query, the parsed body (None for a route without one), the session both
-    halves found (None on an unauthenticated route), and the connecting address."""
+    halves found (None on an unauthenticated route), the connecting address, and every value of
+    the session cookie the request carries (for :meth:`PortalApp._replace`)."""
 
     entry: Origin
     route: Route
@@ -184,6 +187,7 @@ class Call:
     session: Session | None
     peer: str = ""  # for the login ceremonies' quota per peer (F.1)
     size: int = 0  # the body's length in bytes: an action's cap depends on its kind (M.1)
+    cookies: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -420,11 +424,26 @@ class PortalApp:
             body = parsed
             size = len(raw) if isinstance(raw, bytes) else 0  # always bytes here
         if session is not None:
-            session = self.sessions.touch(session.id, self._wall()) or session
+            # The session may have ended while its body arrived (a second logout, end-others
+            # from another tab): then this request is as one that came after, 401.
+            session = self.sessions.touch(session.id, self._wall())
+            if session is None:
+                await self._refuse(exchange, refusal("no_session"))
+                return
         query = exchange.scope.get("query_string", b"")
         client = exchange.scope.get("client")
         peer = str(client[0]) if client else ""
-        call = Call(admitted.entry, route, admitted.params, query, body, session, peer, size)
+        call = Call(
+            admitted.entry,
+            route,
+            admitted.params,
+            query,
+            body,
+            session,
+            peer,
+            size,
+            admitted.cookies,
+        )
         answer = await handler(call)
         reason: str | None
         if isinstance(answer, Refusal):
@@ -494,7 +513,9 @@ class PortalApp:
 
     def _finish(self, ended: Iterable[Ended]) -> None:
         """What every ending of a session needs: its enrolment ceremony and pending action go,
-        its OAuth flows are cancelled (H.2), and the end is logged (M.4)."""
+        its OAuth flows are cancelled (H.2), and the end is logged (M.4). ``ended`` is only what
+        the table removed (``Sessions.end`` answers None for a session already gone), so each
+        session's end is finished and logged once, by the request that ended it."""
         for item in ended:
             session = item.session
             self.ceremonies.drop_session(session.id)
@@ -566,6 +587,7 @@ class PortalApp:
             return refusal("passkey_refused")
         holder.touch(asserted)
         fingerprint = holder.fingerprint(asserted.credential_id)
+        self._replace(call)
         minted = self.sessions.mint(
             origin=entry.origin,
             rp_id=entry.rp_id,
@@ -594,6 +616,7 @@ class PortalApp:
             return refusal("not_written")
         if not isinstance(decision, Redeemed):
             return self._setup_refused()
+        self._replace(call)
         minted = self.sessions.mint(
             origin=entry.origin,
             rp_id=entry.rp_id,
@@ -609,6 +632,15 @@ class PortalApp:
             session=minted.session.fingerprint,
         )
         return _minted(entry, minted, {"scope": "setup", "reset": decision.reset})
+
+    def _replace(self, call: Call) -> None:
+        """Before a mint: one signed-in tab per browser (F.2). The answer's cookie replaces the
+        one this browser holds, leaving its session unusable, so the sessions the request's
+        cookies name end now, logged ``why: replaced``, instead of idling out. Only a browser
+        holding a session's cookie can name it; ending first frees a place rather than evicting
+        another browser's session."""
+        cookies = [SessionToken(cookie) for cookie in call.cookies]
+        self._finish(self.sessions.end_replaced(cookies, self._wall()))
 
     def _setup_refused(self) -> Refusal:
         count = self._codes_refused.note("setup_code_refused", self._clock())
@@ -648,9 +680,10 @@ class PortalApp:
     async def _logout(self, call: Call) -> Reply | Refusal:
         """End this session, expire the cookie and clear the origin's ``sessionStorage``; never
         ``"cookies"``, which on ``localhost`` would clear every port's (F.2)."""
-        session = _session(call)
-        ended = self.sessions.end(session.id, "logout")
-        self._finish(() if ended is None else (ended,))
+        ended = self.sessions.end(_session(call).id, "logout")
+        if ended is None:
+            return refusal("no_session")  # another request ended it first, and logged it
+        self._finish((ended,))
         headers = (
             session_cookie(call.entry, "", expire=True),
             (b"clear-site-data", b'"storage"'),

@@ -182,6 +182,13 @@ class Browser:
         """A page this browser has loaded from ``origin``."""
         return Page(self, origin_of(origin))
 
+    def tab(self, origin: str) -> Page:
+        """A page of ``origin`` in a tab of its own: the same cookie jar, but its own
+        ``sessionStorage``, as each tab has."""
+        page = Page(self, origin_of(origin))
+        page.storage = {}
+        return page
+
     # --- navigation ---------------------------------------------------------------------------
 
     def navigate(

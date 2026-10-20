@@ -9,6 +9,9 @@ and the random bytes come from an injected function, so nothing here reads a clo
   all; a setup session 10 minutes). Of several cookies of our name, at most
   :data:`MAX_SESSION_COOKIES` are tried, and only the one that pairs with the header counts, so a
   planted cookie changes nothing. A full table evicts the session used least recently.
+- **One signed-in tab per browser.** The answer that mints a session sets its cookie, which
+  replaces the one the browser held, so the sessions the request's cookies name end then
+  (:meth:`Sessions.end_replaced`). Only a browser that holds a session's cookie can name it.
 - **A ceremony** is a login or an enrolment in progress. Its nonce never leaves the vault, and its
   challenge commits to what it is for (F.3). Login ceremonies are unauthenticated, so their table
   is bounded per peer and in all, and a full table refuses rather than evict another peer's.
@@ -50,7 +53,8 @@ ENROL_TAG: Final = b"zoeymcp/webauthn/enrol/v1\n"
 Scope = Literal["setup", "full"]
 # Why a session ended, as portal_session_ended logs it (M.4). "evicted": a new session took the
 # least recently used one's place; "enrolled": a setup session after its one enrolment;
-# "end_all": the admin socket's DELETE /sessions.
+# "end_all": the admin socket's DELETE /sessions; "replaced": a new session's cookie took its
+# place in the same browser.
 Why = Literal[
     "logout",
     "idle",
@@ -62,6 +66,7 @@ Why = Literal[
     "evicted",
     "enrolled",
     "end_all",
+    "replaced",
 ]
 CeremonyKind = Literal["login", "enrol"]
 
@@ -257,6 +262,28 @@ class Sessions:
             return session
         return None
 
+    def by_cookie(self, cookies: Sequence[SessionToken], now: float) -> list[Session]:
+        """The live sessions whose cookie half is one of ``cookies``, oldest first, whatever their
+        origin and header half. Every value is tried, and each hash compared in constant time.
+        Nothing changes.
+
+        Only a browser holding a session's cookie can name it here, so ending what this finds
+        (:meth:`end_replaced`) gives a request no power over any other session.
+        """
+        tried = [cookie.sha256() for cookie in cookies]
+        return [
+            session
+            for session in self._by_id.values()
+            if any(hmac.compare_digest(session.cookie_hash, h) for h in tried)
+            and session.ended_by(now) is None
+        ]
+
+    def end_replaced(self, cookies: Sequence[SessionToken], now: float) -> list[Ended]:
+        """At a new session's mint: the live sessions the request's cookies name, whose cookie
+        the new one replaces in that browser, so they could only idle out unusable."""
+        found = {session.id for session in self.by_cookie(cookies, now)}
+        return self.end_where(lambda s: s.id in found, "replaced")
+
     def touch(self, session_id: str, now: float) -> Session | None:
         """Move a live session's idle clock to ``now`` (after C.2 row 12)."""
         session = self._by_id.get(session_id)
@@ -267,7 +294,9 @@ class Sessions:
         return session
 
     def end(self, session_id: str, why: Why) -> Ended | None:
-        """End one session: at logout, or a setup session after its enrolment."""
+        """End one session: at logout, or a setup session after its enrolment. None if it was
+        already gone, so only the caller that removed it finishes and logs its end; the other
+        ways of ending return only what they removed."""
         session = self._by_id.pop(session_id, None)
         return None if session is None else Ended(session, why)
 
