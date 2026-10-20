@@ -2,8 +2,9 @@
 
 How to run what is built so far: the vault (M1), OAuth in the vault (M2), the gateway for
 remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
-and toolkits (M4, §19 onwards), and the admin portal as far as it is built (M5, §26). The design
-and the reasons behind it are in [design.md](design.md); this page is the how-to.
+and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
+supported. The design and the reasons behind it are in [design.md](design.md); this page is the
+how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -26,6 +27,9 @@ The vault keeps its state in one directory (`/state`, the `vault-state` volume):
 
 - `store.json`: the encrypted secrets, written atomically (a temporary file, then a rename);
 - `vault.lock`: held with `flock` while the vault runs;
+- `gateway-key.json`: the gateway key's generations and when the previous one retires (hardened
+  tier, §14), MAC'd;
+- `connectors/<connector>/`: each SMTP connector's send journal (§22);
 - `setup.json`: the pending portal setup code, as a hash with its expiry, MAC'd under a key
   derived from the master key (the code itself is never stored);
 - `portal/passkeys.json`: the portal's passkeys, MAC'd the same way, and any
@@ -260,7 +264,8 @@ It exits 0 with no error (with `--strict`, no warning either), 1 otherwise, and 
 can't be asked. `--json` prints the whole report, with a `summary` of counts per level and each
 finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
 `set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
-`check_mailbox`, `check_gateway` or `read_ledger`, and the name it applies to). For a
+`check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys` or
+`reset_passkeys`, and the name it applies to). For a
 deployment's verify script:
 
 ```sh
@@ -287,6 +292,8 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |
 | `ledger_copy_none`, `ledger_copy_stale` | info, warning | (with a `gateway` section) the gateway hasn't reported to the vault's copy of its ledger yet; it hasn't asked or reported for 5 minutes, since the vault started (§21) |
 | `ledger_copy_refused`, `ledger_copy_broken`, `ledger_copy_unavailable` | error | the copy refuses reports after a fork, gap or full; its files stop chaining at a seq; its directory can't be read (§21) |
+| `passkeys_unavailable` | error | (with an `admin` block) the passkey file can't be verified, so portal sign-in is off: `zoeymcp setup-code --reset` (§26) |
+| `passkey_counter`, `passkey_single` | warning, info | a passkey's signature counter went back in the last 30 days (the authenticator may have been copied: check `zoeymcp passkeys`); only one passkey is enrolled, so losing it means a reset |
 
 Findings marked `(from stored metadata)` (`advisory` in JSON) come from the store's clear
 metadata, which anyone with the state file can edit: they are shown, and nothing the vault
@@ -403,6 +410,9 @@ seed may be removed once it has been promoted.
 
 ## 6. Recovery per kind
 
+Where the table says `secret set` or `zoeymcp login`, the portal's **Set the secret** (Secrets
+page) or **Connect** (Credentials page) does the same (§26).
+
 | Credential | Lost master key or state volume | Lost rotation |
 | --- | --- | --- |
 | `header`, `query`, `path`, `basic` | `secret set` again | — |
@@ -410,6 +420,19 @@ seed may be removed once it has been promoted.
 | OAuth env seed, not rotating | automatic: the seed is promoted again | — |
 | OAuth env seed, rotating | `zoeymcp login` | `zoeymcp login` |
 | `client_credentials` | `secret set` the client secret | — |
+| SMTP connector | a new app password at the provider, then `secret set` it; after a change of recipient, host, port or From, `secret set` again (the old binding no longer matches) | — |
+
+The portal's own state recovers from the host, never from the portal:
+
+| What happened | Recovery |
+| --- | --- |
+| one passkey lost, another still works | sign in with the other and remove the lost one (or `zoeymcp passkeys --remove FINGERPRINT`) |
+| every passkey lost | `zoeymcp setup-code` adds one; `--reset` replaces them all |
+| a passkey or its device may be stolen | `zoeymcp setup-code --reset`: its enrolment removes every other passkey and ends every session |
+| the passkey file can't be verified (`passkey_store_tampered`, `passkeys_unavailable`) | `zoeymcp setup-code --reset`: the file is moved aside as `portal/passkeys.rejected-<ms>.json`, never overwritten |
+| the state volume lost | the store's recovery above, then `zoeymcp setup-code` for a first passkey |
+| the master key lost (or replaced without `ZOEYMCP_MASTER_KEY_PREVIOUS`), the volume kept | the store's recovery above, then `zoeymcp setup-code --reset`: the passkey file can't be verified under another key |
+| the state volume restored from a backup | `zoeymcp passkeys`, and remove every passkey that shouldn't be there: the backup brings back passkeys removed since (§1) |
 
 A rotation is lost when the vault never saved the newest refresh token: a crash between the
 token answer and the write, a store that couldn't be written followed by a restart, or an answer
@@ -433,6 +456,10 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
   settings or route origins changed. Their cached access tokens are dropped and their failure
   states cleared. A refresh in flight still saves its new refresh token.
 - A changed `egress_proxy` needs a restart (`egress_proxy_change_needs_restart`).
+- A changed, added or removed `admin.listen` needs a restart (`admin_listen_change_needs_restart`):
+  the portal stays where it listens. A changed `admin.origins` takes effect at once, and the
+  sessions of a removed origin end. Removing the whole `admin` block keeps the portal on its old
+  origins until the restart.
 - A route moved to a new upstream origin can't use its stored grant until
   `zoeymcp login <credential> --rebind`.
 - The environment is read once, at startup: a new env value (a seed, a client secret) needs a
@@ -602,6 +629,12 @@ something needs you, and 2 when it couldn't run (the gateway is down, the server
 not a remote one, the vault refused, the upstream failed or a listing limit was hit). The
 message says which. `--format json` prints the same, with the snippet as a list of lines.
 
+**Keep the tool list small.** Every tool an agent is given takes room in the model's context, on
+every turn. Include only the tools each agent needs, and assign each agent only the servers it
+uses. Where a client can load tools lazily (a tool search that fetches a definition only when the
+model asks for it), turn that on: the gateway serves the same pinned definitions either way, and
+tells clients when a list changes, so a lazy client fetches the new one.
+
 ## 12. Drift
 
 When an included tool's definition changes, the gateway hides it from every client of the
@@ -682,6 +715,55 @@ docker compose -f deploy/compose.yaml cp \
   from the gateway means it isn't listed.
 - `ZOEYMCP_LAN_BIND` (default `0.0.0.0`) picks the host address to publish on.
 - Caddy sees client tokens (it terminates TLS) and holds no other secret.
+- The `lan` proxy forwards only `/s/*` to the gateway: it doesn't front the portal (§26).
+
+**Your own certificate.** Instead of Caddy's CA, give it a certificate your clients already trust
+(from your own CA, or a tailnet's). Replace the Caddyfile in a compose override file, with the
+certificate and key as compose secrets, and run with both files
+(`docker compose -f deploy/compose.yaml -f lan-cert.yaml --profile lan up -d`):
+
+```yaml
+# lan-cert.yaml
+services:
+  lan:
+    secrets: [lan-cert, lan-key]
+    environment:
+      ZOEYMCP_CADDYFILE: |
+        {
+          admin off
+          auto_https disable_redirects
+        }
+        https://${ZOEYMCP_LAN_HOST:-zoeymcp.lan.example}:8443 {
+          tls /run/secrets/lan-cert /run/secrets/lan-key
+          request_body {
+            max_size 16MB
+          }
+          @mcp path /s/*
+          handle @mcp {
+            reverse_proxy ${ZOEYMCP_LAN_UPSTREAM:-zoeymcp:8090} {
+              flush_interval -1
+            }
+          }
+          handle {
+            respond 404
+          }
+        }
+secrets:
+  lan-cert: {file: ./zoeymcp-lan.crt}   # the certificate, then any intermediates
+  lan-key: {file: ./zoeymcp-lan.key}
+```
+
+This is the shipped Caddyfile with `tls internal` replaced; with `compose.hardened.yaml`, write
+`gateway:8090` as the upstream's default. Outside Swarm, compose mounts a file secret as it is on
+the host, so the key file must be readable by Caddy's uid, 10004, and by nobody else who
+shouldn't have it. Clients then need no `zoeymcp-lan-root.crt`.
+
+**ACME** (a certificate from a public CA such as Let's Encrypt) needs a name in public DNS, and a
+challenge the CA can complete: Caddy answers the HTTP and TLS-ALPN challenges on ports 80 and 443,
+which the profile doesn't publish, and the DNS challenge needs a Caddy build with your DNS
+provider's module, which the pinned image doesn't have. Where both hold, the same override
+without the `tls` line (and without the secrets) makes Caddy obtain and renew one, kept in the
+`lan-data` volume. For a host on a private network, your own certificate is the simpler path.
 
 ## 16. Limits
 
@@ -948,8 +1030,9 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 
 ## 26. The portal
 
-A draft, filled in as the portal is built: signing in, setup, sessions, passkeys, step-up,
-secrets, health, OAuth connect, the ledger and the policy so far. Everything here can also be done with the CLI (§1).
+The admin portal is the vault's own web page for what needs a person: the first passkey,
+secrets, OAuth connect, health, the ledger and the policy, in that order below. Everything here
+can also be done with the CLI (§1, §2, §3, §21), and recovery is done only from the host.
 
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
@@ -996,25 +1079,73 @@ compose file's origin follows. Remove the `admin` block for no portal.
   own alias for the portal, or run without one.
 
 A port published on `127.0.0.1` stays off the LAN only on Docker Engine 28.0 or later; older
-engines let hosts on the same network segment reach it. For a browser on another machine, use
-the SSH tunnel above, or an HTTPS reverse proxy of your own with a certificate that machine
-trusts: list its `https://<name>` origin, and have it pass `Host` unchanged, port included
-(nginx's `$host` drops the port: use `$http_host`). The vault ignores `X-Forwarded-*`, and the
-proxy sees every secret typed into the portal.
+engines let hosts on the same network segment reach it (§27).
 
-Such a proxy must also keep the OAuth callback's query out of its access log: the address
-`/oauth/callback/<credential>?code=...&state=...` carries the provider's code and the login's
-`state`. nginx's default log format logs `$request`, query included; for the portal use a format
-that logs `$uri`, the path alone:
+**From another machine,** use the SSH tunnel above, or an HTTPS reverse proxy of your own with a
+certificate that machine's browser trusts (a public CA's, a tailnet's, or your own CA installed
+on that machine): browsers refuse passkeys on a page with a certificate error. List its origin,
+`https://<name>`, in `admin.origins`. The proxy must:
+
+- **pass `Host` unchanged**, port included: Caddy does by default; nginx's `$host` drops the
+  port, so use `$http_host`. A 421 means the `Host` the vault got isn't a listed origin;
+- **expect `X-Forwarded-*` to be ignored:** the vault never reads them, nor `Forwarded`;
+- **keep the OAuth callback's query out of its access log:** the address
+  `/oauth/callback/<credential>?code=...&state=...` carries the provider's code and the
+  login's `state`;
+- **keep the session's header half out of its log** too, if it logs request headers: the page
+  sends it as `X-ZoeyMCP-Session`.
+
+The proxy sees every secret typed into the portal and both halves of every session: run it on a
+machine you trust as much as the vault's host. The `localhost` and SSH-tunnel paths have none.
+
+nginx, whose default log format logs `$request`, query included, and no request headers but the
+referrer and user agent:
 
 ```nginx
 log_format portal '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status';
-access_log /var/log/nginx/portal.log portal;
+
+server {
+    listen 443 ssl;
+    server_name zoeymcp.example.com;
+    ssl_certificate     /etc/nginx/tls/zoeymcp.crt;
+    ssl_certificate_key /etc/nginx/tls/zoeymcp.key;
+    access_log /var/log/nginx/portal.log portal;    # $uri: the path alone, no query
+
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host $http_host;          # not $host, which drops a port
+    }
+}
 ```
 
-Caddy writes no access log unless the site has a `log` directive. If you enable one, keep the
-query of `/oauth/callback/` paths out of it; check how your Caddy version filters fields before
-relying on it.
+Caddy, which writes no access log unless the site has a `log` directive, and then logs the full
+URI and every request header (the values of `Cookie` and `Authorization` redacted, other
+headers not), so the filter removes both secrets:
+
+```caddyfile
+zoeymcp.example.com {
+	reverse_proxy 127.0.0.1:8081
+	log {
+		output file /var/log/caddy/portal.log
+		format filter {
+			request>uri query {
+				delete code
+				delete state
+			}
+			request>headers>X-Zoeymcp-Session delete
+		}
+	}
+}
+```
+
+With a public name Caddy obtains the certificate itself; for your own, add
+`tls /path/to/cert.pem /path/to/key.pem` to the site. Caddy writes header names as
+`X-Zoeymcp-Session`, the form the filter names. The `filter` syntax is that of Caddy's current
+documentation: check it against your version's, and look at a log line before relying on it.
+
+Both snippets assume the proxy runs on the vault's host and reaches the published port. With
+`admin.origins` set to `[http://localhost:8081, https://zoeymcp.example.com]`, both addresses
+work, each with its own passkeys.
 
 **The first passkey.**
 
@@ -1114,7 +1245,8 @@ from metadata only, as `zoeymcp health` reads it: nothing is decrypted and no re
 **Credentials.** The Credentials page lists every credential in the policy with the routes that
 use it, its health findings, and for an OAuth credential its state (`ok`, `idle`, `backoff`,
 `terminal`), its failure code, when it last worked, the scopes it asks for and where its tokens
-go. **Connect** signs in with the provider by paste (§2); **Test it**, for a `client_credentials`
+go. **Connect** signs in with the provider by paste, or through the portal's callback for a
+credential registered with its own callback address (§2); **Test it**, for a `client_credentials`
 credential, makes one token call and, if it works, clears the failure state. **Try again** clears
 a failure state after a passkey prompt, as `zoeymcp oauth reset` does, so the next request that
 needs a token tries once. A credential whose refresh token is given another way (an `env:` seed,
@@ -1171,12 +1303,31 @@ Every passkey lost: `zoeymcp setup-code` adds one, or `--reset` replaces them al
 device that may be stolen, or a passkey file reported tampered (`passkey_store_tampered`, and
 the portal answering "can't be verified"): `zoeymcp setup-code --reset`. A reset enrolment
 removes every other passkey and ends every session; the old authenticator may be the one you
-enrol again.
+enrol again. After restoring the state volume from a backup, check `zoeymcp passkeys`: a passkey
+removed since the backup is back, and works (§1, §6).
 
-**What a stolen session can do.** A session is the cookie and the tab's token together; a page
-on another `localhost` port receives the cookie (cookies ignore ports) but not the token, and
-gets 401. Someone holding both halves, within the session's limits, can read what the portal
-shows and end other sessions; every change needs a fresh passkey prompt bound to that change.
+**What a stolen session can and can't do.** A session is the cookie and the tab's token
+together; a page on another `localhost` port receives the cookie (cookies ignore ports) but not
+the token, and gets 401. Someone holding both halves, within the session's limits, can read what
+the portal shows (names, bindings, health, the policy view, the ledger, the passkey and session
+lists), start an OAuth sign-in, and end other sessions. They can't write or delete a secret,
+complete a connect, reset a credential, enrol, rename or remove a passkey, or restart the ledger
+chain: each needs a fresh passkey prompt bound to that change. If you think a session was taken,
+**End the other sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
+([threat-model.md](threat-model.md)) has the rest.
+
+**Checks for a verify script.** None of these changes anything:
+
+```sh
+docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp health --json --strict > /dev/null
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: wrong.example' http://127.0.0.1:8081/   # 421
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Sec-Fetch-Site: cross-site' \
+  -H 'Origin: https://evil.example' http://localhost:8081/api/logout                   # 403
+```
+
+The first exits non-zero on any error or warning (§3). The second shows that a name the policy
+doesn't list (a DNS-rebinding page's) gets nothing. The third shows that a cross-origin request
+is refused before any session is looked at.
 
 **When something fails.** The portal shows the vault's own sentence for every refusal; the
 reason is in the vault's log line `portal_request` (or `portal_refused`, at most once per 10
@@ -1278,3 +1429,27 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 400 | `backup_eligibility_changed` (enrolling a passkey) | This passkey's backup setting changed since it was enrolled. Enrol it again. |
 | 400 | `signature` (enrolling a passkey) | The passkey's signature didn't verify. |
 <!-- end of refusals -->
+
+## 27. Supported platforms
+
+**Deployments run in Linux containers**, from the official image, on Docker Engine 28.0 or later
+in both tiers. Older engines let other hosts on the same network segment reach ports published
+on `127.0.0.1`, and connect to a container's published ports directly, which would put the
+portal and the standard tier's gateway on the LAN. The image smoke test refuses an older engine,
+but ZoeyMCP can't check the host's engine at run time: check `docker version` yourself.
+
+**Windows and macOS hosts are for development and tests only.** Running the vault or the gateway
+outside a container there works for trying things out, with these differences:
+
+| On | What differs |
+| --- | --- |
+| Windows | no admin socket, so no admin CLI against a running vault: issue a setup code with `zoeymcp setup-code --state DIR` (§1), and use the portal for the rest |
+| Windows | no state lock (`state_lock_unavailable` in the log): nothing stops two vaults sharing a state directory |
+| Windows | toolkits are refused (`no_ownership_on_this_platform`): file ownership can't be checked |
+| Windows | no `SIGTERM`, `SIGINT` or `SIGHUP` handlers: stop with Ctrl-C, and restart to reload the policy |
+| Windows | when a browser drops a connection, Python's event loop may print `ConnectionResetError` tracebacks to stderr, outside the JSON log; they are noise |
+| Windows, macOS | the standard tier's launcher (`zoeymcp standard`) refuses to run: it needs a Linux container |
+| Windows, macOS | the link socket's peer check needs Linux: the gateway uses a gateway key over TCP |
+
+On a development host, `localhost` may resolve to `::1` first; bind the portal to
+`127.0.0.1:8081` and browsers fall back to it.

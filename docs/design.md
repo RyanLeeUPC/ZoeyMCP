@@ -1,9 +1,11 @@
 # ZoeyMCP design
 
 Status: **draft for review**. M1 (the vault core), M2 (OAuth in the vault, `zoeymcp login`), M3
-(the gateway for remote MCP servers, both deployment tiers, `zoeymcp review`) and M4 (approvals
-through elicitation, the approval ledger, the SMTP connector, toolkits and the derived image) are
-built; everything else here is not yet. Operating the built parts is in [operations.md](operations.md),
+(the gateway for remote MCP servers, both deployment tiers, `zoeymcp review`), M4 (approvals
+through elicitation, the approval ledger, the SMTP connector, toolkits and the derived image) and
+M5 (the admin portal v1: passkeys, step-up, write-only secrets, OAuth connect, credential health,
+the ledger view and the read-only policy view) are built; everything else here is not yet (§11
+says which milestone plans it). Operating the built parts is in [operations.md](operations.md),
 and the threat model in [threat-model.md](threat-model.md).
 
 ZoeyMCP is a self-hosted proxy that lets AI agents use outside services and MCP servers **without
@@ -72,8 +74,8 @@ say so.
 | R30 | Agents reach upstream MCP servers only through the gateway, and the gateway reaches them only through the vault. Vault routes for upstream MCP servers accept only the **gateway's identity**, so the tool filter can't be bypassed | Must |
 | R31 | Each server has an explicit **tool allowlist**. Resources, prompts, sampling and server-initiated elicitation are **off** unless enabled per server | Must |
 | R32 | **Per-client scoping:** each client (agent) sees only the servers and tools assigned to it | Must |
-| R33 | **Tool pinning:** the gateway records a hash of each reviewed tool definition (name, title, description, input and output schemas, annotations). A new or changed tool is hidden and reported until re-reviewed; this blocks "rug pull" changes and description poisoning. Members that aren't pinned are never served | Must |
-| R34 | **Native toolkits:** the operator's own Python tools run in the gateway, with no secrets, calling the vault with placeholders. They are installed in a **gateway-only image**; the vault always runs the official image, unmodified (§3.1) | Must |
+| R33 | **Tool pinning:** the gateway records a hash of each reviewed tool definition (name, title, description, input and output schemas, annotations). A new or changed tool is hidden and reported until re-reviewed; this blocks "rug pull" changes and description poisoning. Members that aren't pinned are never served. A toolkit server may set `pinning: off` (the default is `required`), serving the definitions its image holds and logging their pins; `check` warns (§5.3) | Must |
+| R34 | **Native toolkits:** the operator's own Python tools run in the gateway, with no secrets, reaching the vault only through named slots, each mapped by the policy to a gateway-only route with the methods and paths listed per toolkit (§5.3). They are installed in a **gateway-only image**; the vault always runs the official image, unmodified (§3.1) | Must |
 | R35 | **stdio-only MCP servers** run in their own container behind a stdio-to-HTTP bridge. No third-party server code runs in an agent's container or in the vault. A bridge reaches the outside through vault routes, or, if the server can't be pointed at the vault, through the egress proxy with its own allowlist. A bridge that must hold a **real secret itself** is a flagged exception to R2: `check` warns, the docs state the cost, and its allowlist is narrowed to that provider | Must |
 | R36 | Server-side streaming (SSE / streamable HTTP) passes through without buffering | Must |
 | R37 | Batch-shaped tools are easy to write, for clients whose code sandboxes can't call MCP tools in a loop | Should |
@@ -153,12 +155,12 @@ say so.
 
 | Role | Command | Holds secrets | State | Image |
 | --- | --- | --- | --- | --- |
-| **vault** | `zoeymcp vault` | yes (store + master key) | store, policy versions, portal accounts | official, unmodified |
-| **gateway** | `zoeymcp gateway` | no | drift marks, reviewed definitions; the ledger from M4 | official, or a derived gateway-only image with toolkits |
+| **vault** | `zoeymcp vault` | yes (store + master key) | the store, gateway-key state, the connectors' send journals, the portal's passkeys and setup code (MAC'd), the reported copy of the gateway's ledger; policy versions from M6 | official, unmodified |
+| **gateway** | `zoeymcp gateway` | no | drift marks, reviewed definitions, the approval ledger | official, or a derived gateway-only image with toolkits |
 | **bridge** | `zoeymcp bridge -- <cmd> …` | no (placeholders) | none | derived per stdio server |
 | **egress** (optional) | `zoeymcp egress` | no; it only tunnels TLS and never sees plaintext | none | official |
 | **launcher** | `zoeymcp standard` | no, once both roles are started | none | official |
-| **CLI** | `zoeymcp keygen / client-token / setup-code / secret / login / review / gateway-status / check / selftest` | only while running, never written | none | official, or installed with `pip` |
+| **CLI** | `zoeymcp keygen / client-token / gateway-key / setup-code / passkeys / sessions / secret set / secret list / secret delete / login / oauth / health / review / gateway-status / ledger / ledger --vault / check / selftest` | only while running, never written | none | official, or installed with `pip` |
 
 ### 3.1 Why the vault is separate from the gateway
 
@@ -213,7 +215,12 @@ when the vault's image digest isn't an official release. Toolkits go into a deri
   drop `NET_RAW`.
 - **The approval channel is only as trustworthy as the client that renders it.** With elicitation,
   a compromised agent runtime could auto-accept. For that threat, use the out-of-band approver
-  (§6.3), which trusts no agent code.
+  (§6.3, M8), which trusts no agent code.
+- **The client token is the approval credential.** An elicitation goes back to whoever made the
+  call, so anyone holding an attended client's token can make calls and answer their own prompts
+  (§6.2). Keep it out of the agent's sandbox.
+- **Operator → portal:** a passkey (§7.2), and a fresh assertion for every change; host access
+  (the admin socket) is the recovery path.
 
 ### 3.3 Deployment tiers
 
@@ -228,7 +235,9 @@ when the vault's image digest isn't an official release. Toolkits go into a deri
 | Use for | evaluation, desktop clients, low-stakes setups | **anything that moves money, sends mail or touches personal data** |
 
 The README quickstart uses the standard tier, and says on the same page when to move to the
-hardened one.
+hardened one. Both tiers are Linux containers on Docker Engine 28.0 or later; Windows and macOS
+hosts are for development and tests, and on Windows the admin socket, the state lock and toolkits
+are off ([operations.md](operations.md) §27).
 
 **The standard tier's launcher** (`zoeymcp standard`, `deploy/compose.yaml`). The container runs
 as `user: "0:0"` with `cap_drop: [ALL]`, `cap_add: [SETUID, SETGID]`, `no-new-privileges`, a
@@ -740,10 +749,14 @@ step-up (R62) and versioning (R66).
 **Key rotation:**
 
 1. Set `ZOEYMCP_MASTER_KEY_PREVIOUS` to the old key and `ZOEYMCP_MASTER_KEY` to the new one.
-2. On start, the vault re-encrypts every entry and re-authenticates the policy versions. The
-   gateway key changes too, so update it at the same time; the old one follows the same
-   ratchet-or-5-minutes rule as a generation bump.
-3. Remove the old key afterwards.
+2. On start, the vault re-encrypts every entry and re-authenticates the gateway-key state (and,
+   from M6, the policy versions). The portal's passkey file is verified under the previous key
+   and sealed again under the new one; a pending setup code sealed under the old key counts as no
+   code, so issue a new one. The gateway key changes too, so update it at the same time; the old
+   one follows the same ratchet-or-5-minutes rule as a generation bump.
+3. Remove the old key afterwards. A passkey file that is still sealed under it (the vault didn't
+   start with both keys set) can't be verified: portal login is off until
+   `zoeymcp setup-code --reset`.
 
 **Losing the key or the volume:** every secret must be entered again, and every OAuth grant held
 in the store consented again with `zoeymcp login`; only a non-rotating env seed recovers on its
@@ -1275,27 +1288,33 @@ operator sees and denies.
 
 ### 7.1 Portal
 
-Served by the vault on `admin_listen`, from static files in the official image. It is plain
-HTML/JS with no third-party assets, calling a JSON API on the same origin.
+Served by the vault on its own listener (`admin.listen`), from static files in the official
+image. It is plain HTML/JS with no third-party assets, calling a JSON API on the same origin. The
+step-up column is the list of R62's security-relevant changes: each runs only after a fresh
+passkey assertion bound to it (§7.2). Reading anything, starting an OAuth connect, signing out and
+ending other sessions need none.
 
-| Area | What it does | Step-up |
-| --- | --- | --- |
-| Secrets | list names and metadata, enter, replace, delete. **Never shows a value** | write, delete |
-| Credentials | health (expiry, last refresh, re-consent needed), OAuth connect | connect |
-| MCP servers | onboard by URL (§7.4), review tools, classify `allow`/`approve`, re-pin drifted tools with a side-by-side diff | save (managed) |
-| Policy (managed) | edit routes, connectors, clients and approvals; history with diffs; rollback; export/import YAML | every save |
-| Policy (declarative) | read-only view, built from a list of the fields it may show (no client token, placeholder, account detail or recipient); generated YAML diffs to commit | — |
-| Approvals | the queue of pending vault-held and out-of-band approvals (§6.3, §6.4) | approve |
-| Ledger | the vault's copy of the gateway's ledger: each call's decision and result with its sends, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain |
-| Passkeys | enrol, name and remove passkeys | every change |
+| Area | What it does | Step-up | Milestone |
+| --- | --- | --- | --- |
+| Home | what needs the operator: every health finding, errors first, with the action for each | — | M5 |
+| Secrets | list names, bindings and health, enter, replace, delete. **Never shows a value** | write, delete | M5 |
+| Credentials | per credential its routes, health and OAuth state; connect (paste, or the portal's callback), test a `client_credentials` grant, reset a failure state ("Try again") | complete a connect, reset | M5 |
+| Passkeys | enrol, rename and remove passkeys; the portal never removes the last one | enrol, rename, remove (a setup session's one enrolment has the setup code as its step-up) | M5 |
+| Sessions | list the signed-in browsers; end the others | — | M5 |
+| Ledger | the vault's copy of the gateway's ledger: each call's decision and result with its sends, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain | M5 |
+| Policy (declarative) | read-only view, built from a list of the fields it may show (no client token, placeholder, account detail or recipient) | — | M5; generated YAML diffs to commit in M7 |
+| MCP servers | onboard by URL (§7.4), first-time tool review, classify `allow`/`approve`; re-pin drifted tools with a side-by-side diff | save (managed) | M7 (onboarding and review), M6 (drift review and re-pin) |
+| Policy (managed) | edit routes, connectors, clients and approvals; history with diffs; rollback; export/import YAML | every save, moving a tool from `approve` to `allow`, a connector's constraints | M6 |
+| Approvals | the queue of pending vault-held and out-of-band approvals (§6.3, §6.4) | approve | M8 |
 
 ### 7.2 Authentication and bootstrap
 
 - **Origins and RP IDs:** `admin.origins` lists every exact address a browser uses. A passkey
   belongs to its origin's host name, the RP ID, which has no port: one enrolled on
   `http://localhost:8081` works on any listed `http://localhost` port, but a different host name
-  needs its own. Passkeys don't work on IP addresses, so a `GET /` to a loopback IP literal is
-  redirected to the listed `http://localhost` origin with the same port. WebAuthn needs a secure
+  needs its own, enrolled with a setup code redeemed on that origin. Passkeys don't work on IP
+  addresses, so a `GET /` to a loopback IP literal is redirected to the listed
+  `http://localhost` origin with the same port. WebAuthn needs a secure
   context: `localhost`, or HTTPS with a certificate the browser trusts (a reverse proxy, a
   tailnet's certificates, or a private CA installed on the browser's machine). Browsers refuse
   passkeys on pages with certificate errors, and plain HTTP over the LAN doesn't work, by design.
@@ -1527,13 +1546,17 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp setup-code [--reset] [--wait] [--state DIR]` | `docker exec` in the vault | prints a one-time setup code, and on stderr the origins to open and what enrolling with it does; `--reset` makes that enrolment remove every other passkey and end every session; `--wait` waits until a passkey is enrolled with it and prints that passkey's fingerprint, origin, name and time; `--state DIR` writes the code into a state directory without the admin socket, with the master key from the environment, and refuses to run as root |
 | `zoeymcp passkeys [--remove FINGERPRINT]` | `docker exec` in the vault | lists the portal's passkeys (fingerprint, name, algorithm, synced or device-bound, how and where enrolled, last used), never a key; `--remove` removes one, the last one too |
 | `zoeymcp sessions [--end-all]` | `docker exec` in the vault | lists the portal's sessions; `--end-all` ends every one |
-| `zoeymcp secret set NAME --origin …` | `docker exec` in the vault | reads the value from a prompt or stdin (never argv), stores it with its binding |
+| `zoeymcp secret set NAME [--origin URL …]` | `docker exec` in the vault | reads the value from a prompt or stdin (never argv), stores it with its binding: the policy's, or the given origins for a name no route or connector uses |
+| `zoeymcp secret list` / `secret delete NAME` | `docker exec` in the vault | lists each name, when it was last updated and its binding, never a value; deletes one entry (a live slot `oauth.<credential>.live` too, which forces a re-seed) |
+| `zoeymcp health [--json] [--strict]` | `docker exec` in the vault | what needs the operator, per credential, connector, store entry, the passkeys and the reported ledger copy, from metadata only; exit 0 with no error (`--strict`: no warning either), 1 otherwise, 2 when the vault can't be asked |
 | `zoeymcp login <credential> [--rebind] [--start \| --flow ID]` | `docker exec` in the vault | the OAuth onboarding of §7.4; tokens go straight into the store. `--start` prints the URL and the flow ID and exits, and `--flow ID` completes that flow from stdin. For `client_credentials`, a test fetch that stores nothing |
 | `zoeymcp oauth status [<credential>]` / `oauth reset <credential>` | `docker exec` in the vault | per credential: state, code, a hint, time since the last success, re-consent and scope warnings, never a value; `reset` clears a failure state so the next request tries once |
 | `zoeymcp login --mcp <url>` | `docker exec` in the vault | MCP onboarding by URL (§7.4, M7) |
 | `zoeymcp review [<server>]` | `docker exec` in the gateway | with no server, one line per server from the gateway's status, with no upstream call. With one, the running gateway lists it on a fresh connection and shows per tool its state, pin and findings, a diff for drift, the upstream's `instructions` and `serverInfo` marked "never forwarded", and a YAML snippet to commit. `--tool T` shows only T, `--show T` / `--all` print definitions, `--add T` includes a tool (you still classify it), `--repin T` takes a drifted tool's new pin, `--clear` clears the drift marks if every included tool matches, `--format json`. Exit 0 when every included tool matches and nothing is marked, 1 when something needs you, 2 when the review couldn't run |
 | `zoeymcp gateway-status [<server>]` | `docker exec` in the gateway | the view's digest and freshness, and per server its connections, era, exposed and included tools, reports and marks; never definitions or token hashes |
-| `zoeymcp policy export / import` | `docker exec` | managed-mode YAML round trip |
+| `zoeymcp ledger [--since AGE] [--client C] [--server S] [--tool T] [--verify]` / `ledger check REF FILE` | `docker exec` in the gateway | one line per call in the gateway's ledger (when, ref, client, server and tool, era, decision, outcome), never a value; `--verify` walks the hash chain and prints its head; `check` says whether FILE holds the arguments that call was shown with, without the key leaving the gateway |
+| `zoeymcp ledger --vault [--before SEQ] [--restart-chain]` | `docker exec` in the vault | the vault's reported copy (§4.6): its state, then the newest calls with their sends and the orphan sends; `--restart-chain` shows the plan and asks before archiving a refused chain |
+| `zoeymcp policy export / import` | `docker exec` | managed-mode YAML round trip (M6) |
 | `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --emit-egress-allowlist` prints the per-source allowlists (plain `host:port` lists and a Squid snippet) for operators who run their own proxy |
 
 Admin commands run inside the vault's or the gateway's container and use its local admin socket,
@@ -1617,6 +1640,28 @@ admin answers, CLI output and agents' answers contain no client token or its has
 key, no upstream session id and the upstream key in no encoding, and no CLI output or answer
 holds a raw control or format character.
 
+**S12 to S16 as built (M4).** S12's approval rows: an upstream's sampling, elicitation or
+`input_required` is refused during an approved call too, and none of its text reaches a prompt
+(`tests/gateway/test_approvals_remote.py`, in all three protocol versions). S13 and S14 run the
+SMTP profiles against a fake mail server with its own CA, implicit TLS and STARTTLS, directly and
+through a CONNECT proxy (`tests/unit/test_smtp_connector.py`): what the server, the proxy and the
+journal saw, AUTH never before TLS, an outcome after the final dot recorded `unknown` and never
+retried. S15 sends through the example mail toolkit to that fake, in all three protocol
+versions: the message delivered is the one shown, and a decline sends nothing. S16 runs the
+example records toolkit's batch reads and approved batch writes over real TLS
+(`tests/acceptance/test_toolkit_shapes.py`). Both end with H14's sweep.
+
+**M5's shapes.** An OAuth credential on a gateway-served remote MCP route, without discovery
+(S6 on S10, `profiles/remote-mcp-oauth.yaml`: a client registered by hand, PKCE, rotating refresh
+tokens, the `resource` parameter), consented with `zoeymcp login` and with the portal's Connect
+(`tests/acceptance/test_mcp_oauth_shape.py`); S9 adds discovery and registration in M7. The
+portal's journey runs against a real vault process (`tests/acceptance/test_portal_shapes.py`):
+the first visit with a setup code, a restart that ends every session, secrets, S5 and S6
+connected by paste and S5 through the callback, health before and after, S10 and S15 through the
+gateway, and the Ledger page with a send and an orphan; then the sweep, which also finds no
+setup code and no issued token. The unit leak sweep (`tests/unit/test_leak_sweep.py`) adds the
+portal's session halves, the callback's query and binding cookie, and the policy view.
+
 ### 8.2 Other tests
 
 - **Unit and property tests:**
@@ -1694,6 +1739,11 @@ holds a raw control or format character.
   | G19 | **Bounded resources:** bodies, arguments, results, upstream messages, listings, schemas, regex time, deadlines, sessions and concurrency all have limits |
   | G20 | **Logs and terminals:** no client token or hash, gateway key, session id, argument value, result content, upstream error text, `instructions` or `Mcp-Param-*` value is logged; `review` output reveals hidden characters |
   | G21 | **The standard tier's box:** the launcher's refusals; no setuid files; the gateway uid can't read `/state`, the vault's environ or its admin socket; PID 1 ends unprivileged with an empty environment; the vault's environment has no gateway dependency |
+
+  M5 restates two of them: **G2**, the gateway has one more vault path, the ledger report
+  (§4.1), through its own pinned transport that carries ledger lines and reaches nothing else;
+  **G17**, the gateway still can't write policy, and the only thing it writes in the vault is its
+  reported copy of the ledger.
 - **The approval invariants (M4)**, each with effect tests on real processes (`tests/gateway/`,
   `tests/acceptance/`) or against the SMTP and toolkit fakes (`tests/unit/`). The stress tests for
   H3 and H7, and a test of H16's toolkit-vault size caps, are still to come (§12.3: D-78, D-79).
@@ -1714,21 +1764,65 @@ holds a raw control or format character.
   | H11 | **Toolkit containment.** A toolkit reaches only its slots' rules. An `approved` rule takes only a plan write of an accepted call, once. The plan step reads only SMTP connector configuration. A classification mismatch hides the tool |
   | H12 | **Toolkit integrity.** Toolkits load only from registered entry points whose files the gateway uid can't write, inside the gateway environment. Their definitions are pinned, unless the server sets `pinning: off`. Their packages are absent from the vault environment |
   | H13 | **Still no back channel.** Upstream sampling, elicitation and `input_required` stay refused, during approved calls too. Agent answers, `inputResponses` and `requestState` never go upstream |
-  | H14 | **Logs.** No prompt text, argument value, subject, body, recipient, handle, confirmation code, or ledger or audit key in any log line, admin answer or CLI output. No unkeyed digest of arguments or text (`canonical.digest(args)`, `Pending.args_digest`) leaves process memory. The keyed ledger HMACs (`args`, `text`) appear only in the ledger file, its admin endpoints and `zoeymcp ledger` output, never in a log line; log lines carry only `ledger_hash`, the hash of a whole record |
+  | H14 | **Logs.** No prompt text, argument value, subject, body, recipient, handle, confirmation code, or ledger or audit key in any log line, admin answer or CLI output. No unkeyed digest of arguments or text (`canonical.digest(args)`, `Pending.args_digest`) leaves process memory. The keyed ledger HMACs (`args`, `text`) appear only in the ledger file, its admin endpoints and `zoeymcp ledger` output, and from M5 in the vault's reported copy files (`/state/ledger-reported/`); never in a portal answer, `zoeymcp ledger --vault` output or a log line; log lines carry only `ledger_hash`, the hash of a whole record |
   | H15 | **SMTP connector.** Fixed From and recipients (a request can only assert them). No caller headers or attachments. Verified TLS before AUTH. CONNECT when an egress proxy is set. All recipients or none. Each attempt journaled before connecting, at most one per key, never retried. A rolling limit and a pause |
   | H16 | **Bounded.** Pending records, tombstones, the ledger, toolkit vault answers, plans, connector bodies and the journal all have limits |
-- **Portal security tests:**
-  - a wrong `Host` (DNS rebinding) is refused;
-  - a cross-origin `POST` is refused;
-  - a save without step-up is refused;
-  - an OAuth callback with a reused, expired or foreign `state` is refused; and its paste
-    reading: a paste for a reused, expired or foreign flow, or another session's, is refused
-    before any passkey prompt, and so is a mistyped one, which can then be pasted again;
-  - a setup code is single-use and expires;
-  - the WebAuthn verifier's test vectors pass: truncated `authenticatorData`, flags missing
-    user-verified, a wrong origin, a wrong site-ID hash, a reused challenge, an unsupported
-    algorithm, and a signature over altered bytes are all refused;
-  - the CSP and the other headers are present on every response.
+- **Portal security tests (M5)**, as built, against the real portal app over real sockets
+  (`tests/portal/`), the real vault process (`tests/acceptance/`), and unit and property tests
+  of the pure modules:
+  - a wrong `Host` (DNS rebinding) gets 421, and a loopback IP literal only a redirect to the
+    listed `localhost` origin;
+  - a cross-origin `POST` is refused (403), as are a missing or `null` `Origin`, a
+    `Sec-Fetch-Site` other than `same-origin`, a form's content type and a preflight;
+  - a save without step-up is refused: no write, delete, connect, reset, passkey change or chain
+    restart runs from a confirm without a fresh assertion bound to it, and a re-plan that differs
+    answers `409 changed`;
+  - an OAuth callback with a reused, expired or foreign `state`, or without the flow's binding
+    cookie, is refused; and its paste reading: a paste for a reused, expired or foreign flow, or
+    another session's, is refused before any passkey prompt, and so is a mistyped one, which can
+    then be pasted again; two different answers fail the flow;
+  - a setup code is single-use and expires, and a `--reset` code's enrolment removes every other
+    passkey and ends every session;
+  - the WebAuthn verifier's test vectors pass, the specification's own among them: truncated
+    `authenticatorData`, flags missing user-verified, a wrong origin, a wrong site-ID hash, a
+    reused challenge, an unsupported algorithm, a key outside the templates, and a signature over
+    altered bytes are all refused;
+  - the CSP and the other headers are present on every response the portal app makes, errors,
+    421s and 503s included, pinned literally;
+  - a tampered passkey or setup file turns portal login off while the proxy keeps serving; an
+    older, validly sealed passkey file brings a removed passkey back (an accepted limit,
+    threat-model.md);
+  - neither listener serves authorization-server metadata, a registration or a token endpoint;
+  - the static files hold no HTML sink, inline script or style, or external URL, and every
+    string the portal didn't write reaches the page through `textContent` only (static checks;
+    what only a browser shows is on the by-hand checklist, [manual-checks.md](manual-checks.md)).
+
+  Each of the portal's invariants has an effect test. "Refused" means the vault changed nothing.
+
+  | ID | Invariant |
+  | --- | --- |
+  | P1 | **No secret out.** No portal answer, page or header carries a secret value, token, code, verifier, `state`, client secret, setup code, gateway key, placeholder, client token or hash, or passkey private material. The one bearer it hands out is a new session's own header half, in the answer that mints it; a callback flow's binding cookie goes only in that flow's start answer, as an HttpOnly cookie. The socket's `POST /setup-code` and `GET /gateway-key` are the only endpoints anywhere that return a credential |
+  | P2 | **Minimal unauthenticated surface.** Without a session the portal answers only its static files, login, setup redemption and the OAuth callback; every other route gives one 401 before its body is read |
+  | P3 | **Admission before routing:** one `Host` naming a listed origin; on `/api/`, `Sec-Fetch-Site: same-origin`; on `POST` and `DELETE`, an `Origin` equal to that origin; method and body within the route's caps. The callback is the one route under other rules (§7.3). The proxy listener never serves the portal |
+  | P4 | **Passkeys are the only way in:** a full session comes only from a verified assertion with user verification, or from the enrolment a redeemed setup code allowed |
+  | P5 | **The verifier is strict** (§7.2) |
+  | P6 | **Step-up runs what it confirmed:** every change runs only from an action the vault holds, after a fresh assertion whose challenge commits to session, action, kind, origin and the held data; single use, 300 s, re-planned before it runs |
+  | P7 | **Sessions:** in memory, bound to one origin, both halves needed, minted fresh, bounded in time, ended by logout, restart, "end other sessions", removal of their passkey, a reset enrolment or their origin leaving the policy |
+  | P8 | **Setup codes:** only a MAC'd hash stored; 15 minutes; spent when redeemed, before the setup session opens; never logged or shown by the portal |
+  | P9 | **Declarative policy:** no portal or socket route writes policy |
+  | P10 | **Same rules as the CLI:** secret writes and deletes and OAuth starts and completions go through the socket's own functions |
+  | P11 | **Flows are owned:** a flow completes or cancels only for its owner; the callback only holds a code for a portal session's flow |
+  | P12 | **One callback, and it only holds:** the only route that takes a provider's redirect is `/oauth/callback/<credential>` on a listed origin, for that credential's own address; it exchanges nothing, and a second, different answer fails the flow |
+  | P13 | **The reported ledger is a claim:** only the gateway reaches the report path, it writes only the copy, forks and gaps are refused until a stepped-up restart, and nothing received in the last 30 days is pruned |
+  | P14 | **Untrusted text is text:** cleaned and capped on the server, shown with `textContent` only |
+  | P15 | **Headers on every response** the portal app makes; no CORS header, ever |
+  | P16 | **Bounded:** connections, requests in flight, sessions, ceremonies, actions, flows, passkeys, the unauthenticated rate, bodies, the copy and report batches |
+  | P17 | **Logs:** no setup code, session half, binding cookie, challenge, assertion, key, user handle, full credential ID, flow ID, `state`, pasted address, passkey name or query string |
+  | P18 | **Reachability:** hardened, only the host's loopback reaches the admin listener; standard, the gateway and sibling containers can, and the docs say so |
+  | P19 | **Portal state is authenticated and written before it acts;** a file whose MAC fails turns portal login off |
+  | P20 | **No agent-facing OAuth** on either listener |
+  | P21 | **Portal state never stops the proxy;** only an unusable configured listener refuses the start |
+  | P22 | **Restart is clean:** sessions, ceremonies, actions and flows are memory only; files are recovered before any listener opens |
 - **`zoeymcp selftest --cases cases.yaml`** starts the vault with the operator's **real** policy,
   with every upstream (and the egress proxy) replaced by an echo server that reports what it
   received.
@@ -1736,16 +1830,33 @@ holds a raw control or format character.
     present, credential injected, caller refused.
   - It is meant to run in CI and before every deploy, and to be **mutation-tested**: flip a rule,
     and the suite must fail.
-- **The project's own CI** mutation-tests the security-relevant modules with `mutmut`, gated at
-  89%: the vault's request handling, store, bindings, OAuth, gateway keys and peer check; the
-  text rules, canonical JSON, policy checks, matching and the gateway's view; the gateway's
-  pins, findings, schemas, sanitizing, admission, connection states and egress rules; and the
-  launcher's checks.
+- **The project's own CI** mutation-tests the security-relevant modules with `mutmut` (the list
+  is `only_mutate` in `pyproject.toml`), gated at 89% overall, with per-module floors under
+  `[tool.zoeymcp.mutation-floors]`:
+  - **M1 to M3:** the vault's request handling, store, bindings, OAuth (protocol, PKCE and
+    flows, the token manager, login), gateway keys and peer check; the text rules, canonical
+    JSON, atomic file writes, policy checks, matching and the gateway's view; the gateway's pins,
+    findings, schemas, sanitizing, admission, connection states and egress rules; and the
+    launcher's checks;
+  - **M4:** the approval text, the ledger format, the gateway's approval core (pending prompts,
+    locks, limits, answer handles), the SMTP connector's message builder, CONNECT tunnel, session
+    flow and send journal, and the toolkit SDK's parameters, plans and slot rules;
+  - **M5:** the secret-write plan, credential health, the reported copy's rules and its view, the
+    ledger join, the callback-address rule, the gateway's reporting rules, and the portal's
+    WebAuthn verifier, admission, display, routes, refusals, sessions, limits, actions, passkey
+    file, setup codes, listener resolution and policy view.
+
+  Security-relevant modules that hold mostly I/O (the vault's and gateway's apps and servers, the
+  admin socket, the upstream pool, the toolkit loader, the CLI) are covered by effect tests
+  instead.
 - **SDK contract tests** (`tests/sdk/`) pin what the gateway relies on in the MCP SDK (no
   capability declared without a callback, server → client requests answered with errors,
   cancellation, concurrent calls, session expiry, parsed schemas, golden wire output, session
   binding, limits, notifications, the same-origin redirect it follows, no extra `_meta`). They
-  run on every SDK bump.
+  run on every SDK bump. The same directory pins what the SMTP connector relies on in `smtplib`
+  (M4), and what the portal relies on in `cryptography` (key loading and signature checks for the
+  verifier), h11, uvicorn and Starlette (one `Host`, raw cookies, uvicorn's own answers, the
+  header deadline and connection cap, pre-bound sockets) (M5).
 - **Release checks:** dependency hashes, image content-hash label, SBOM, and a reproducible-build
   check.
 
@@ -1761,7 +1872,7 @@ egress_proxy: http://egress-proxy:3128      # optional
 gateway_key_generation: 1
 
 admin:                                      # optional: no block, no portal
-  listen: 127.0.0.1:8081                    # in a container: 0.0.0.0:8081
+  listen: 127.0.0.1:8081                    # standard 0.0.0.0:8081, hardened vault-portal:8081
   origins: [http://localhost:8081, https://zoeymcp.tailnet.example]
 
 credentials:
@@ -1822,6 +1933,7 @@ gateway:
       token_sha256: "sha256:…"              # from `zoeymcp client-token`; a literal `token` warns
       servers: [broker-read, broker-trade, mail]
       sources: []                           # optional pins on the direct peer address
+      approvals: {attended: true}           # a human watches it, so it may be asked (§6.1)
 
   approvals:
     approver: elicitation
@@ -1851,12 +1963,24 @@ gateway:
 
     mail:
       kind: toolkit
-      module: my_toolkits.mail
+      module: my_toolkits.mail              # a registered entry point in the gateway's image
+      pinning: required                     # the default; `off` serves the image's definitions
+      tools:
+        include: [send_note]
+        approve: [send_note]                # consequential in the code: it can't be allowed
+      review: {send_note: "sha256:…"}
+      slots:
+        mail:                               # the slot the code names
+          route: mail-send
+          rules:
+            - {methods: [GET], paths: [/config]}
+            - {methods: [POST], paths: [/send], approved: true}   # only an accepted plan's writes
 ```
 
 Unknown keys are errors. Source-address pins, where wanted, are an optional `sources:` list on a
 caller or client. A remote server also takes `on_drift`, `shared_session`, `wrap_results`,
-`drift_check_interval`, `call_timeout` and `enable` (which must stay empty in M3).
+`drift_check_interval`, `call_timeout` and `enable` (which must stay empty: resources, prompts
+and the rest stay off until a later milestone).
 
 M3's `check` rules for the gateway, beyond the classification and pin rules: a client has
 `token` or `token_sha256`, not both and not neither, and no two clients share one (a literal
@@ -1887,29 +2011,41 @@ deploy/
   compose.yaml            standard tier (single container), with the lan profile
   compose.hardened.yaml   hardened tier (§3.4), with the lan profile
 src/zoeymcp/
-  common/       policy schema, checks, the gateway's view, text rules, canonical JSON, logging,
-                the control pipe
-  vault/        app, routing, path rules, credentials, store + keys, gateway keys, the link
-                socket's peer check, admin socket
+  common/       policy schema, checks, the gateway's view, the callback-address rule, text
+                rules, canonical JSON, the approval text, the ledger format, its report wire
+                format and the per-call join, logging, the control pipe, admin socket names
+  vault/        app, request handling, credentials, store + keys, bindings, gateway keys, the
+                link socket's peer check, admin socket, secret writes (plan, then run), health, the
+                reported ledger copy (reports, reportstore) and its view, server (start-up and
+                listeners)
     oauth/      OAuth: protocol (pure), PKCE and flows, the token manager, login
+    connectors/ the SMTP connector: message, CONNECT tunnel, session flow, send journal
   gateway/      app (admission), pipeline, access, pins, schemas, findings, sanitize, connstate,
                 egressrules, upstream (pool and connections), vaultlink, policyclient, notify,
-                marks, defstore, review, server
+                marks, defstore, review, approvals and approve, committed calls, the ledger and
+                its reporter, toolkits (loader, source, vault client), server
+  portal/       the admin portal, served by the vault: admission, routes, refusals, display,
+                sessions, limits, actions (step-up), WebAuthn, passkeys, setup codes, the
+                listener, the policy view, the app, and static/ (the page, its scripts and
+                stylesheet, the callback pages)
+  toolkit/      the toolkit SDK: parameters, plans, slot rules, results, context, testing
+  selftest/     the route self-test: cases, echo server, runner
   entrypoint/   the standard tier's launcher (env: pure checks; launcher: I/O)
-  cli/          keygen, client-token, setup-code, secret, login, review, gateway-status, check,
-                selftest
-  portal/       admin API, WebAuthn, sessions, static UI (planned)
-  bridge/       stdio ↔ streamable HTTP (planned)
-  egress/       CONNECT-only allowlist proxy (planned)
+  cli/          every command (main), the admin-socket client, review and ledger rendering
+  bridge/       stdio ↔ streamable HTTP (planned, M7)
+  egress/       CONNECT-only allowlist proxy (planned, M7)
 profiles/       provider profiles, one per acceptance shape
 tests/
-  fakes/        fake providers, one per shape; the fake MCP server
-  acceptance/   end-to-end shape tests over real TLS
+  fakes/        fake providers, one per shape; the fake MCP server, SMTP server, CONNECT proxy,
+                authenticator and browser
+  acceptance/   end-to-end shape tests over real TLS, the portal's journey, crash tests
   gateway/      the gateway's effect tests (fake, real vault, real gateway)
-  sdk/          MCP SDK contract tests
+  portal/       the portal's effect tests (real sockets)
+  sdk/          library contract tests (MCP SDK, smtplib, cryptography, h11, uvicorn, Starlette)
   unit/
-examples/       example policies, example toolkits, a derived gateway image
-docs/           design.md (this), threat-model.md, operations.md (login, OAuth health, recovery, seed vs live)
+examples/       an example policy, example toolkits, a derived gateway image
+docs/           design.md (this), threat-model.md, operations.md, clients.md (checking an MCP
+                client before trusting it with approvals), manual-checks.md (the by-hand runs)
 Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 ```
 
@@ -1922,14 +2058,16 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | M2 | **OAuth:** refresh, rotation in the store, seed vs live; CLI `login <credential>` | S5, S6 |
 | M3 | **Gateway:** `remote` servers through the vault, the **standard tier's entrypoint** (two uids, Unix socket; moved from M1, since it only separates the vault from the gateway), gateway identity and key rotation, policy fetch, per-client scoping, per-client upstream sessions, include + pins, schema validation, `review`; the `lan` compose profile | S10, S12 (drift, injection) |
 | M4 | **Approvals:** elicitation back end, locks, ledger; toolkit SDK and the derived-image example; SMTP connector + example toolkits | S12 (sampling, elicitation), S13–S16 |
-| M5 | **Portal v1:** setup code, passkeys, step-up, hardening, write-only secrets, OAuth connect (including pasting the redirect URL), credential health, ledger view | portal tests |
-| M6 | **Portal v2:** tool-drift review and re-pin; **managed mode** with versioning, history, rollback, export/import | portal tests |
-| M7 | `bridge`; the `egress` role, the `egress-proxy` profile and `--emit-egress-allowlist`; MCP onboarding by URL (discovery + DCR) in the portal and CLI | S9, S11 |
+| M5 | **Portal v1:** the admin listener (opt-in `admin` block, exact origins), setup codes issued from the host, passkeys with our own verifier, two-half sessions, step-up actions, browser hardening, write-only secrets, OAuth connect by paste and by the portal's callback (owned flows, completed with a passkey), credential health (`zoeymcp health` and the Home page), the gateway's ledger pushed to an append-only copy in the vault and its Ledger page, the read-only declarative policy view; an OAuth credential on a gateway-served remote MCP route without discovery; the image smoke's portal checks, one `tools/list` and `tools/call` per tier and SSE through the `lan` proxy | portal tests; S6 on S10 (`remote-mcp-oauth.yaml`) |
+| M7 | `bridge`; the `egress` role, the `egress-proxy` profile and `--emit-egress-allowlist`; MCP onboarding by URL (discovery + DCR) in the portal and CLI, ending in the first-time tool review (pick, classify, pin) and, in declarative mode, the YAML diff to commit | S9, S11 |
+| M6 | **Portal v2:** tool-drift review and re-pin, reusing M7's review screen and YAML diffs; moving a tool from `approve` to `allow`; **managed mode** with versioning, history, rollback, export/import | portal tests |
 | M8 | **Vault-enforced approvals** (§6.4); out-of-band approvers in the vault (Telegram, the portal queue); image publishing with digests and SBOM | S3 end to end as the approver; S13/S15 again under `vault_approval` |
 
-M1 to M4 are built. Each milestone ships with its effect tests and its shapes' acceptance tests. Nothing merges with a
-failing mutation run on the policy modules. Managed mode is the default from M6 on; until then,
-only declarative mode exists.
+M1 to M5 are built. After M5 the order is **M7, then M6, then M8**: an OAuth-protected remote MCP
+server matters more to a declarative deployment than managed mode, and M7's first-time review
+and YAML diffs are what M6's drift review and re-pin reuse. Each milestone ships with its effect
+tests and its shapes' acceptance tests. Nothing merges with a failing mutation run on the policy
+modules. Managed mode is the default from M6 on; until then, only declarative mode exists.
 
 ## 12. Decisions and open questions
 
@@ -1976,6 +2114,35 @@ only declarative mode exists.
 | `env:` connector passwords | a `check` error: the password must be in the store, bound to the connector | §4.4 |
 | Toolkit HTTP endpoints | deferred to the first mailbox-reader toolkit, with capability URLs | §5.3 |
 | Connector `tls` and the binding | not in the binding: both modes verify the server before AUTH | §4.5 |
+
+### 12.1.2 Decided for M5 (2026-10-19)
+
+The project owner took the recommended option on every M5 question but one: the OAuth callback
+is built beside paste, not left out.
+
+| Question | Decision | Where |
+| --- | --- | --- |
+| The OAuth callback | paste is the primary path; a credential whose `redirect_uri` is its own portal callback address can also take the callback, which only holds the code: the exchange waits for the owning session's step-up. One address per credential, and a per-flow binding cookie in the browser that started it | §7.3, §7.4 |
+| Is the portal opt-in | yes: no `admin` block, no listener | §9 |
+| Hosts and origins | `admin.origins`, exact origins, replaces `admin.hosts` and drives `Host`, `Origin` and the RP ID; IP literals refused, a loopback IP redirected to `localhost` | §7.2, §7.3 |
+| Bootstrap and recovery | no code exists until `zoeymcp setup-code` issues one; `--reset` decides at issue whether the enrolment replaces every passkey; no attempt counter; a relayed code is made visible (`--wait`, a `warning` log line, `zoeymcp passkeys`), not blocked | §7.2 |
+| Where a passkey's key comes from | `authenticatorData`, by fixed byte templates for ES256, EdDSA and RS256; `getPublicKey()` is a cross-check; any other encoding is refused | §7.2 |
+| A counter that goes back | accepted, logged `critical`, shown as a banner; the stored value never goes down | §7.2 |
+| Discoverable credentials | required; login lists no credential | §7.2 |
+| Sessions | two halves (an HttpOnly cookie whose name carries the port, a `sessionStorage` header token); 15 minutes idle, 4 hours in all; one signed-in tab per browser | §7.2 |
+| The last passkey | the portal never removes it; `zoeymcp passkeys --remove` may | §7.2 |
+| A second origin | a setup code redeemed on it, no enrolment links | §7.2 |
+| The hardened listener | a network alias on `egress` only, resolved at start to exactly one address, published on the host's loopback | §3.3, §3.4 |
+| Standard-tier siblings | accepted and documented: passkeys and single-use codes protect the listener there; the image smoke probes it | §3.3, threat-model.md |
+| HTTPS to the portal | documented only: the operator's own proxy with a certificate the browser trusts | operations.md |
+| The ledger in the vault | the gateway pushes its records; the vault keeps an append-only, bounded copy, refuses forks and gaps until a stepped-up restart, and shows no keyed digest | §4.6, §7.1 |
+| The policy view | in M5, read-only, from a list of the fields it may show; the YAML diffs come with M7 | §7.1 |
+| Health | metadata only, no test fetch; `zoeymcp health --json --strict` over the socket, no unauthenticated endpoint | §7.5 |
+| The two socket answers that carry a credential | `POST /setup-code` and `GET /gateway-key`, recorded as R61's scoped exceptions | R61 |
+| Explicit bindings for names the policy uses | allowed; health judges a binding by its effect | operations.md §3 |
+| The static UI's tests | thin script tested through the API, static checks of the files, and a recorded by-hand checklist | §8.2 |
+| Mutation floors | 95% overall and per M5 module once M5's survivors are triaged; 90% per module until then | §8.2 |
+| Order after M5 | an OAuth credential on a remote MCP route without discovery inside M5; then M7, M6, M8 | §11 |
 
 ### 12.2 Open
 
