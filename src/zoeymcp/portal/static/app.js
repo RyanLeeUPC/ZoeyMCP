@@ -12,7 +12,7 @@
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
   const PAGES = ["blocked", "login", "setup", "home", "credentials", "sessions", "passkeys",
-    "secrets"];
+    "secrets", "ledger", "policy"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
@@ -51,6 +51,7 @@
   let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created
   let renaming = null; // the fingerprint the rename form is for
   let connecting = null; // the connect dialog's credential, its flow and whether to poll it
+  let older = null; // the ledger's next page: its archive, if any, and the seq it ends below
 
   function $(id) {
     return document.getElementById(id);
@@ -78,13 +79,8 @@
     if (saved !== null) {
       headers[HEADER] = saved;
     }
-    const init = {
-      method: method,
-      headers: headers,
-      credentials: "same-origin",
-      redirect: "error",
-      cache: "no-store",
-    };
+    const init = { method: method, headers: headers, credentials: "same-origin",
+      redirect: "error", cache: "no-store" };
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(body);
@@ -100,10 +96,8 @@
       return answer;
     }
     const reason = answer && typeof answer.reason === "string" ? answer.reason : "";
-    const text =
-      answer && typeof answer.error === "string"
-        ? answer.error
-        : "The vault refused that (HTTP " + response.status + ").";
+    const text = answer && typeof answer.error === "string" ? answer.error :
+      "The vault refused that (HTTP " + response.status + ").";
     if (response.status === 401) {
       sessionStorage.removeItem(TOKEN); // whatever the cause, this session is gone (F.2)
     }
@@ -186,6 +180,17 @@
     }
   }
 
+  // A page from the vault: what it shows is filled in, then it appears; a refusal is said.
+  async function visit(page, fill) {
+    clearError();
+    try {
+      await fill();
+      show(page);
+    } catch (error) {
+      afterFailure(error);
+    }
+  }
+
   function showLogin() {
     $("bar").hidden = true;
     renderBanners([]);
@@ -259,8 +264,7 @@
   }
 
   async function showCredentials() {
-    clearError();
-    try {
+    await visit("credentials", async () => {
       const health = await api("GET", "/api/health");
       const oauth = await api("GET", "/api/oauth");
       const list = $("credential-list");
@@ -280,10 +284,7 @@
         item.append(findings);
         list.append(item);
       }
-      show("credentials");
-    } catch (error) {
-      afterFailure(error);
-    }
+    });
   }
 
   // H.1: start a sign-in this session owns; for client_credentials, the start is a test fetch.
@@ -475,8 +476,7 @@
   // --- sessions (F.2) -------------------------------------------------------------------------
 
   async function showSessions() {
-    clearError();
-    try {
+    await visit("sessions", async () => {
       const answer = await api("GET", "/api/sessions");
       const list = $("session-list");
       list.replaceChildren();
@@ -489,10 +489,7 @@
           when(session.last_seen);
         list.append(item);
       }
-      show("sessions");
-    } catch (error) {
-      afterFailure(error);
-    }
+    });
   }
 
   async function endOthers() {
@@ -538,8 +535,7 @@
   }
 
   async function showPasskeys() {
-    clearError();
-    try {
+    await visit("passkeys", async () => {
       const answer = await api("GET", "/api/passkeys");
       const list = $("passkey-list");
       list.replaceChildren();
@@ -564,10 +560,7 @@
         list.append(item);
       }
       closeRename();
-      show("passkeys");
-    } catch (error) {
-      afterFailure(error);
-    }
+    });
   }
 
   function openRename(passkey) {
@@ -648,11 +641,10 @@
 
   // From a health action, the name its finding is about goes in the name field.
   async function showSecrets(name) {
-    clearError();
     if (typeof name === "string") {
       $("secret-name").value = name;
     }
-    try {
+    await visit("secrets", async () => {
       const answer = await api("GET", "/api/secrets");
       const list = $("secret-list");
       list.replaceChildren();
@@ -679,10 +671,7 @@
         item.textContent = "No secrets are stored yet.";
         list.append(item);
       }
-      show("secrets");
-    } catch (error) {
-      afterFailure(error);
-    }
+    });
   }
 
   function replaceSecret(secret) {
@@ -724,6 +713,56 @@
     closeConfirm();
     await showSecrets();
     $("status").textContent = "Secret deleted.";
+  }
+
+  // --- the ledger (J.5) and the policy (L): the vault words every line ------------------------
+
+  // Each item's text, with the lines the vault made for it below (the stylesheet keeps the line
+  // breaks), and its button, if any.
+  function renderLines(list, items, control) {
+    list.replaceChildren();
+    for (const item of items) {
+      const entry = document.createElement("li");
+      entry.textContent = [item.text_shown].concat(item.lines_shown || []).join("\n");
+      entry.append(control ? control(item) : "");
+      list.append(entry);
+    }
+  }
+
+  // The live chain's newest rows, or an archived chain's (its name), or the rows below a seq.
+  async function showLedger(archive, before) {
+    const query = new URLSearchParams(typeof archive === "string" ? { archive: archive } : {});
+    if (before !== undefined) {
+      query.set("before", before);
+    }
+    await visit("ledger", async () => {
+      const page = await api("GET", "/api/ledger" + (String(query) && "?" + query));
+      $("ledger-state").textContent =
+        (page.archive === null ? "" : "Archived chain " + page.archive + ". ") + page.state_shown;
+      $("ledger-restart").hidden = !page.restartable;
+      $("ledger-older").hidden = page.next === null;
+      older = { archive: page.archive === null ? undefined : page.archive, before: page.next };
+      renderLines($("ledger-rows"), page.rows);
+      renderLines($("ledger-orphans"), page.orphans);
+      renderLines($("ledger-archives"), page.archives,
+        (epoch) => epoch.dropped ? "" : button("Show its rows", () => showLedger(epoch.name)));
+    });
+  }
+
+  async function afterRestart() {
+    closeConfirm();
+    await showLedger();
+    $("status").textContent = "Chain restarted: the gateway's next report starts a new one.";
+  }
+
+  async function showPolicy() {
+    await visit("policy", async () => {
+      const answer = await api("GET", "/api/policy");
+      $("policy-source").textContent = answer.source_shown;
+      $("policy-hidden").textContent = answer.hidden.length === 0 ? "" :
+        "Shown only as set, never their values: " + answer.hidden.join(", ") + ".";
+      $("policy-text").textContent = JSON.stringify(answer.policy, null, 2);
+    });
   }
 
   // --- step-up (F.4) --------------------------------------------------------------------------
@@ -888,6 +927,10 @@
     on("nav-sessions", showSessions);
     on("nav-passkeys", showPasskeys);
     on("nav-secrets", showSecrets);
+    on("nav-ledger", showLedger);
+    on("nav-policy", showPolicy);
+    on("ledger-older", () => showLedger(older.archive, older.before));
+    on("ledger-restart", () => prepare("ledger.restart", {}, afterRestart));
     on("end-others", endOthers);
     on("passkey-enrol", prepareEnrol);
     on("rename-prepare", prepareRename);

@@ -5,10 +5,12 @@ joining. Beside them, outside ``/api/`` and outside the map, is the one other ro
 callback, ``GET /oauth/callback/<credential>`` (C.7), a provider's redirect target that no page
 script names. Every other path outside ``/api/`` is 404 (C.2 row 3).
 
-The API table grows with the build: each of steps 11 to 15 adds the rows it builds, so a walk of
-the table or a drift check against the page never meets a route that isn't built (verifier V40),
-and from step 15 a test checks it equals M.1. A path parameter is checked against its pattern
-before a route matches, so a handler never sees a name the policy couldn't hold.
+The API table grew with the build: each of steps 11 to 15 added the rows it built, so a walk of
+the table or a drift check against the page never met a route that wasn't built (verifier V40);
+from step 15 it is M.1's whole table, and a test checks that it equals M.1. A path parameter is
+checked against its pattern before a route matches, so a handler never sees a name the policy
+couldn't hold. A query string isn't part of a route: the one route that reads one, the ledger,
+checks it itself.
 """
 
 from __future__ import annotations
@@ -150,6 +152,10 @@ FLOW_CANCEL: Final = Route("DELETE", "/api/oauth/flows/{flow}", FULL)
 # Step 14b: a flow as its owner's connect dialog polls it, for a flow that can take the
 # callback (H.6). The callback itself is outside this table (CALLBACK).
 FLOW_STATUS: Final = Route("GET", "/api/oauth/flows/{flow}", FULL)
+# Step 15: the declarative policy, read-only (L), and the vault's copy of the gateway's ledger
+# with the send journals (J.5), paged by its query. Restarting the copy's chain is an action.
+POLICY: Final = Route("GET", "/api/policy", FULL)
+LEDGER: Final = Route("GET", "/api/ledger", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -164,10 +170,12 @@ ROUTES: Final[tuple[Route, ...]] = (
     PASSKEYS,
     SECRETS,
     HEALTH,
+    POLICY,
     OAUTH,
     OAUTH_START,
     FLOW_STATUS,
     FLOW_CANCEL,
+    LEDGER,
     ACTIONS,
     CONFIRM,
     CANCEL,

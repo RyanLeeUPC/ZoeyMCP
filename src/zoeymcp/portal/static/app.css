@@ -82,9 +82,19 @@ code {
 
 #session-list li,
 #passkey-list li,
-#secret-list li {
+#secret-list li,
+#ledger li {
   margin-bottom: 0.5rem;
   overflow-wrap: anywhere;
+}
+
+/* A ledger row's sends go on lines of their own under it. */
+#ledger li {
+  white-space: pre-line;
+}
+
+pre {
+  overflow-x: auto;
 }
 
 dialog {

@@ -23,7 +23,7 @@ import pytest
 from tests.fakes.authenticator import InvalidStateError, SoftAuthenticator, Switch
 from tests.fakes.browser import Page
 from zoeymcp.portal import passkeys as passkey_file
-from zoeymcp.portal.actions import ACTION_TTL
+from zoeymcp.portal.actions import ACTION_TTL, KINDS
 from zoeymcp.portal.routes import ROUTES, STATIC
 from zoeymcp.portal.webauthn import b64url
 
@@ -376,8 +376,10 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("passkey.enrol", ["x"]) == (400, "bad_body")
     assert refused("passkey.enrol", {"name": "x", "extra": 1}) == (400, "bad_body")
     assert refused("passkey.rename", {"name": "x"}) == (400, "bad_body")
-    # A registered kind a later step builds.
-    assert refused("ledger.restart", {}) == (400, "bad_body")
+    # Every registered kind is built from step 15 (ledger.restart was the last), so none
+    # answers bad_body for being a later step's.
+    assert rig.app.action_kinds == set(KINDS)
+    assert refused("ledger.restart", {"x": 1}) == (400, "bad_body")
     # Each kind's cap: 4 KiB for a passkey's (M.1), within the route's 128 KiB.
     assert refused("passkey.enrol", {"name": "x" * 5000}) == (413, "too_large")
     assert refused("passkey.enrol", {"name": "a\tb"}) == (400, "bad_name")

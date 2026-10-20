@@ -48,8 +48,9 @@ from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
-from zoeymcp.portal.app import PortalApp, Secrets, load_static
+from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
+from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.vault import logs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp
@@ -241,7 +242,9 @@ class World:
             connectors=self.vault.connectors,
             env_names=lambda: self.vault.env_names,
         )
-        # The portal, sharing the socket's store, token manager, policy and logins (M5 G).
+        # The portal, sharing the socket's store, token manager, policy and logins (M5 G), and
+        # reading a copy of the gateway's ledger whose records carry keyed digests (M5 J.5).
+        self.copy = ReportStore.open(tmp_path)
         (tmp_path / "portal").mkdir(mode=0o700)
         self.portal_app = PortalApp(
             [ORIGIN],
@@ -256,6 +259,7 @@ class World:
                 login,
                 env_names=lambda: self.vault.env_names,
             ).report,
+            ledger=Ledger(self.copy, self.vault.connectors),
         )
         self.passkey = SoftAuthenticator()
         self.page: Recording | None = None
@@ -556,6 +560,19 @@ async def test_nothing_secret_leaves_the_vault(
     await world.admin("GET", "/health")
     await page.call("GET", "/api/health")
     await page.call("GET", "/api/oauth")
+    # The policy and the ledger pages (M5 L, J.5): the reported records' keyed digests and pins
+    # stay in the gateway's ledger (Q12).
+    reported, prev = [], GENESIS
+    for n in range(3):
+        reported.append(asked_line(n, prev, n + 1))
+        prev = line_hash(reported[-1])
+    world.copy.report({"v": 1, "lines": [line.decode() for line in reported]})
+    assert (await page.call("GET", "/api/policy")).is_success
+    ledger = await page.call("GET", "/api/ledger")
+    assert [row["seq"] for row in ledger.json()["rows"]] == [2, 1, 0]
+    for text in world.portal_answers:
+        for digest in (DIGEST, PIN, "hmac-sha256:"):
+            assert digest not in text
     assert (await world.cli(["health"]))[1]
     assert (await world.cli(["health", "--json"]))[1]
 
@@ -788,6 +805,31 @@ def secret_heavy_policy() -> Policy:
             "gateway": gateway,
         }
     )
+
+
+# What the portal's policy view hides of the same policy (M5 design L): the client token and its
+# hash, every placeholder, account details and recipients, and the free text sent upstream.
+POLICY_VIEW_HIDES = (
+    "client token",
+    "placeholder",
+    "basic username",
+    "smtp user",
+    "smtp from",
+    "smtp to",
+    "token header",
+    "forced query",
+)
+
+
+def test_the_portals_policy_view_hides_what_it_must() -> None:
+    policy = secret_heavy_policy()
+    served = json.dumps(policy_view(policy, "env"))
+    for where in POLICY_VIEW_HIDES:
+        assert VAULT_SIDE[where] not in served, where
+    assert "sha256:" + "3" * 64 not in served  # nor the other client's token hash
+    assert hash_token(LITERAL_TOKEN) not in served
+    # Secret references show as written: they name a secret, never hold one.
+    assert "store:leak-ref-oauth-client" in served
 
 
 def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:

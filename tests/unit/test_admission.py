@@ -39,7 +39,7 @@ from zoeymcp.portal.admission import (
     values,
 )
 from zoeymcp.portal.refusals import Refusal, refusal, wrong_host_literal
-from zoeymcp.portal.routes import ROUTES, STATIC, Route, Scope
+from zoeymcp.portal.routes import LEDGER, ROUTES, STATIC, Route, Scope
 
 LOCAL = "http://localhost:8081"
 TAILNET = "https://zoeymcp.tailnet.example"
@@ -421,8 +421,10 @@ def test_the_default_table_is_the_built_routes() -> None:
     admitted = admit(request(), ENTRIES)
     assert isinstance(admitted, Admitted)
     assert admitted.route == ROUTES[0] == BEGIN
-    # A route a later step builds is 404 until then.
-    assert admit(request("GET", "/api/ledger"), ENTRIES) == refusal("not_found")
+    # Every route of M.1 is built from step 15, which added the ledger, the last of them.
+    ledger = admit(request("GET", "/api/ledger"), ENTRIES)
+    assert isinstance(ledger, Admitted)
+    assert ledger.route == LEDGER
 
 
 # --- row 7: body headers ------------------------------------------------------------------------

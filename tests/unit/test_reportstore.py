@@ -318,6 +318,8 @@ def test_an_unreadable_directory_makes_the_copy_unavailable(
     with pytest.raises(CopyUnavailable):
         store.records()
     with pytest.raises(CopyUnavailable):
+        store.records(f"archive-{T0:013d}")
+    with pytest.raises(CopyUnavailable):
         store.plan_restart()
     [line] = events(captured, "ledger_reported_unavailable")
     assert line["level"] == "critical"
@@ -511,6 +513,32 @@ def test_an_archive_a_cut_restart_left_unlisted_is_found(tmp_path: Path) -> None
     ]
     assert again.restart().archive is None
     assert store  # the first store is stale now
+
+
+def test_an_archived_epoch_is_still_readable(tmp_path: Path) -> None:
+    """J.4: the view reads an archived epoch's records, all of them, oldest first; a dropped one
+    has only its anchor left, and a name the copy doesn't list is refused."""
+    clock = Clock()
+    store = forked(tmp_path, clock, rotate_bytes=2 * SIZE, archive_max_bytes=5 * SIZE)
+    first = store.restart()
+    assert first.archive is not None
+    name = first.archive.name
+    assert store.records(name) == [json.loads(line) for line in LINES[:4]]
+    assert store.records() == []  # the live chain starts again
+    store.report(body(LINES[:2]))
+    (copy_dir(tmp_path) / name / "notes.txt").write_bytes(b"not a chain file")
+    assert store.records(name) == [json.loads(line) for line in LINES[:4]]
+    for unknown in ("archive-0000000000000", "000000000000.jsonl", "..", ""):
+        with pytest.raises(KeyError):
+            store.records(unknown)
+    store.report(body(OTHER[1:2]))
+    clock.now += 1
+    second = store.restart()
+    assert [epoch.name for epoch in second.drop] == [name]
+    with pytest.raises(KeyError):
+        store.records(name)  # dropped: its anchor is listed, its files are gone
+    assert second.archive is not None
+    assert store.records(second.archive.name) == [json.loads(line) for line in LINES[:2]]
 
 
 def test_archive_names_never_repeat(tmp_path: Path) -> None:

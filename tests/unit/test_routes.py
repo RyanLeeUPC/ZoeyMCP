@@ -1,8 +1,8 @@
 """The portal's route table and static map (M5 design M.1, O.2 ``routes``).
 
-Step 6a builds the static map and the route shape; each of steps 11 to 15 adds the rows it builds,
-and step 15 checks the table equals M.1. Until then M.1's table, written here in the shape, shows
-the shape can hold every row and that matching finds each one.
+Step 6a built the static map and the route shape, and each of steps 11 to 15 added the rows it
+built. From step 15 the table is M.1's, written here in the shape: the table equals it, and
+matching finds each row.
 """
 
 from __future__ import annotations
@@ -92,11 +92,10 @@ def test_the_static_map_is_fixed() -> None:
         STATIC["/x"] = StaticFile("x", HTML)  # type: ignore[index]
 
 
-def test_the_table_holds_only_built_routes() -> None:
-    # Each of steps 11 to 15 adds the rows it builds: step 11's are M.1's first nine, step
-    # 12's the passkey list and the three action routes, step 13's the secret list, step 14a's
-    # health, the OAuth list, a flow's start and its cancel, and step 14b's the flow's status.
-    assert (*M1[:12], *M1[13:17], *M1[18:]) == ROUTES
+def test_the_table_is_m1s() -> None:
+    # Steps 11 to 15 each added the rows they built (verifier V40); step 15's were the policy
+    # view and the ledger, the last of M.1's.
+    assert ROUTES == M1
     assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
         "/api/login/begin",
         "/api/logout",
@@ -155,7 +154,8 @@ def test_nothing_matches_an_empty_table() -> None:
     assert match(ROUTES, "GET", "/api/session") == (ROUTES[3], {})
     assert match(ROUTES, "GET", "/api/secrets") == (ROUTES[10], {})
     assert match(ROUTES, "GET", "/api/health") == (ROUTES[11], {})
-    assert match(ROUTES, "GET", "/api/ledger") is None  # step 15's
+    assert match(ROUTES, "GET", "/api/policy") == (ROUTES[12], {})
+    assert match(ROUTES, "GET", "/api/ledger") == (ROUTES[17], {})
 
 
 @pytest.mark.parametrize(

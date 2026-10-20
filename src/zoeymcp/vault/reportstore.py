@@ -472,11 +472,17 @@ class ReportStore:
 
     # --- reading -------------------------------------------------------------------------------
 
-    def records(self) -> list[dict[str, Any]]:
+    def records(self, archive: str | None = None) -> list[dict[str, Any]]:
         """The live chain's records up to the head, oldest first, as JSON objects (the view's
-        input). A line that doesn't parse is left out; the view marks the break."""
+        input). A line that doesn't parse is left out; the view marks the break.
+
+        ``archive``: an archived epoch's records instead, by its name (J.4: still readable in
+        the view). Raises ``KeyError`` for a name the copy doesn't list, or whose files a
+        restart dropped (only its anchor is left)."""
         if not self.available:
             raise CopyUnavailable
+        if archive is not None:
+            return self._archived_records(archive)
         head = self.held.head_seq
         found: list[dict[str, Any]] = []
         if head is None:
@@ -489,6 +495,19 @@ class ReportStore:
             for line in data.splitlines():
                 record = _parse(line)
                 if record is not None and record.seq <= head:
+                    found.append(json.loads(record.line))
+        return found
+
+    def _archived_records(self, name: str) -> list[dict[str, Any]]:
+        kept = {item.epoch.name for item in self.archived if not item.dropped}
+        if name not in kept:
+            raise KeyError(name)
+        found: list[dict[str, Any]] = []
+        directory = self.directory / name
+        for path in sorted(p for p in directory.iterdir() if _FILE.fullmatch(p.name)):
+            for line in path.read_bytes().splitlines():
+                record = _parse(line)
+                if record is not None:
                     found.append(json.loads(record.line))
         return found
 

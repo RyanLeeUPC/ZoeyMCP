@@ -20,6 +20,8 @@
 <button type="button" id="nav-sessions">Sessions</button>
 <button type="button" id="nav-passkeys">Passkeys</button>
 <button type="button" id="nav-secrets">Secrets</button>
+<button type="button" id="nav-ledger">Ledger</button>
+<button type="button" id="nav-policy">Policy</button>
 </nav>
 <button type="button" id="sign-out">Sign out</button>
 </header>
@@ -126,6 +128,32 @@ first. A credential's tokens from Connect are the vault's own and aren't changed
 (https URLs, separated by spaces)</label>
 <input id="secret-origins" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
 <button type="button" id="secret-prepare">Set the secret</button>
+</section>
+
+<section id="ledger" hidden>
+<h2>Ledger</h2>
+<p>The vault's copy of the gateway's approval ledger, newest first. Every row is as the gateway
+reported it. A call shows its sends from the SMTP connectors' journals, and a send whose call the
+copy doesn't hold is listed below it. A call's arguments are only in the gateway's own ledger, as
+a keyed digest: check them with <code>zoeymcp ledger check REF FILE</code> in the gateway's
+container.</p>
+<p id="ledger-state"></p>
+<button type="button" id="ledger-restart" hidden>Restart the chain</button>
+<ul id="ledger-rows"></ul>
+<button type="button" id="ledger-older" hidden>Older rows</button>
+<h3>Sends with no call in the copy</h3>
+<ul id="ledger-orphans"></ul>
+<h3>Archived chains</h3>
+<ul id="ledger-archives"></ul>
+<p>This deployment's policy is declarative: the portal can't change it.</p>
+</section>
+
+<section id="policy" hidden>
+<h2>Policy</h2>
+<p>This deployment's policy is declarative: change it in its source and reload. The portal can't
+change it. It was read from <span id="policy-source"></span>.</p>
+<p id="policy-hidden"></p>
+<pre id="policy-text"></pre>
 </section>
 </main>
 

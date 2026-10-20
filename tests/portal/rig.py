@@ -198,6 +198,8 @@ def running(
                 login=vault.login,
                 secrets=app.secrets,
                 health=app.health,
+                ledger=app.ledger,
+                source=app.source,
                 routes=routes,
                 handlers=handlers,
                 body_deadline=body_deadline,

@@ -47,9 +47,10 @@ from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
 from ..portal import listen as portal_listen
-from ..portal.app import PortalApp, Secrets, StaticMissing, load_static
+from ..portal.app import Ledger, PortalApp, Secrets, StaticMissing, load_static
 from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
 from ..portal.passkeys import Passkeys
+from ..portal.policyview import Source
 from ..portal.server import HEAD_LIMIT, HEADER_DEADLINE, portal_protocol
 from . import logs
 from .admin import (
@@ -390,6 +391,8 @@ def build_portal(
     login: LoginService,
     secrets: Secrets | None = None,
     health: HealthReader | None = None,
+    ledger: Ledger | None = None,
+    source: Source = "file",
     lookup: Lookup = lookup_addresses,
 ) -> Portal | None:
     """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
@@ -397,7 +400,9 @@ def build_portal(
     has (or its port, with a wildcard on either side), a static file missing. A wildcard beside
     any ``--listen`` is warned about (``admin_listener_shared``). ``secrets`` is what its Secrets
     area writes through, the admin socket's store, token manager and policy; ``health`` what
-    its health checklist reads, as the socket's ``GET /health`` does."""
+    its health checklist reads, as the socket's ``GET /health`` does; ``ledger`` the reported
+    copy and the send journals its Ledger page reads, as ``zoeymcp ledger --vault`` does; and
+    ``source`` where the policy came from, for its policy view."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -420,6 +425,8 @@ def build_portal(
         login=login,
         secrets=secrets,
         health=None if health is None else health.report,
+        ledger=ledger,
+        source=source,
     )
     return Portal(app, address)
 
@@ -754,6 +761,9 @@ def build(
         reports=reports,
         passkeys=passkeys,
     )
+    # The Ledger page reads the copy the report path writes, with the connectors' journals
+    # (M5 design J.5); the policy view says where the policy came from (L).
+    source: Source = "stdin" if config == "-" else "env" if config is None else "file"
     portal = build_portal(
         runtime.policy,
         listens,
@@ -762,6 +772,8 @@ def build(
         login=login,
         secrets=secrets,
         health=health,
+        ledger=Ledger(reports, app.connectors),
+        source=source,
     )
     admin = None
     if admin_socket is not None:

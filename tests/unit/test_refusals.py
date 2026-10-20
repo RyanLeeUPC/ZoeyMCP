@@ -91,13 +91,15 @@ STATUSES = {
     503: ["busy", "unavailable"],
 }
 # Beyond M.2's list: the store's byte limit (step 4b), the token manager's unknown credential,
-# the shell's answer when a handler fails (step 10b), and two passkeys sharing a fingerprint
-# (step 7a's holder, answered from step 12).
+# the shell's answer when a handler fails (step 10b), two passkeys sharing a fingerprint (step
+# 7a's holder, answered from step 12), and a reported copy that can't be read (step 15: M.2's
+# 503 unavailable has the passkey file's text).
 EXTRA = {
     "value_too_large": 409,
     "not_configured": 400,
     "internal": 500,
     "ambiguous_fingerprint": 409,
+    "copy_unavailable": 503,
 }
 
 # M.2's quoted texts, exactly.

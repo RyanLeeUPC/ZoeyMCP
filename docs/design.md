@@ -789,12 +789,15 @@ gateway (never a vault record); the lines chain; then the first report is taken 
 report that extends the held head is appended, and a resend of held records is trimmed. A report
 that skips past the head (`gap`), doesn't extend it (`fork`), or can't fit the copy's 64 MiB after
 pruning only files the vault **received** more than 30 days ago (`full`) is refused, and so is
-every report after it until the operator restarts the chain over the admin socket. The vault
-keeps the copy in `/state/ledger-reported/`: the lines as received, appended and fsynced, then a
-`head.json` written atomically, and only then the answer; it recovers a torn tail and a stale
-`head.json` before it listens. So the gateway can't rewrite what the vault already holds, and the
-head is also in the vault's own logs. A restart of the chain archives the live chain and keeps
-each dropped epoch's head as an anchor. A copy that can't be read refuses reports (503) and the
+every report after it until the operator restarts the chain, over the admin socket or on the
+portal's Ledger page with a passkey. The vault keeps the copy in `/state/ledger-reported/`: the
+lines as received, appended and fsynced, then a `head.json` written atomically, and only then the
+answer; it recovers a torn tail and a stale `head.json` before it listens. So the gateway can't
+rewrite what the vault already holds, and the head is also in the vault's own logs. A restart of
+the chain archives the live chain, still readable on the Ledger page, and keeps each dropped
+epoch's head as an anchor. The Ledger page shows the copy newest first, each call with its SMTP
+sends and the sends no call explains, never a keyed digest; the Policy page shows the declarative
+policy read-only, from a list of the fields it may show. A copy that can't be read refuses reports (503) and the
 proxy runs anyway; nothing in the gateway's approval path waits for a report. The gateway's
 reporter runs beside the policy client: it asks for the head at least once a minute and as soon as
 a record is fsynced, reads its stored lines from the copy's head itself (so a restored or lost
@@ -1281,9 +1284,9 @@ HTML/JS with no third-party assets, calling a JSON API on the same origin.
 | Credentials | health (expiry, last refresh, re-consent needed), OAuth connect | connect |
 | MCP servers | onboard by URL (§7.4), review tools, classify `allow`/`approve`, re-pin drifted tools with a side-by-side diff | save (managed) |
 | Policy (managed) | edit routes, connectors, clients and approvals; history with diffs; rollback; export/import YAML | every save |
-| Policy (declarative) | read-only view; generated YAML diffs to commit | — |
+| Policy (declarative) | read-only view, built from a list of the fields it may show (no client token, placeholder, account detail or recipient); generated YAML diffs to commit | — |
 | Approvals | the queue of pending vault-held and out-of-band approvals (§6.3, §6.4) | approve |
-| Ledger | consequential calls: decision, argument hash, result | — |
+| Ledger | the vault's copy of the gateway's ledger: each call's decision and result with its sends, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain |
 | Passkeys | enrol, name and remove passkeys | every change |
 
 ### 7.2 Authentication and bootstrap

@@ -213,6 +213,12 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "not_restartable": Entry(
             409, "The reported ledger isn't stuck, so there's nothing to restart."
         ),
+        # M.2's 503 unavailable is the passkey file's: the copy has its own sentence.
+        "copy_unavailable": Entry(
+            503,
+            "The vault's copy of the gateway's ledger can't be read: check the state volume. "
+            "The proxy runs as before.",
+        ),
     }
 )
 

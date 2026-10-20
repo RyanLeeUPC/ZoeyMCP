@@ -807,7 +807,7 @@ lacks, at most 256 records per report. While the copy refuses reports (below) it
 minutes; while the vault can't be reached it retries, backing off up to 5 minutes. The gateway
 logs `ledger_report_failed` with a `reason` (a vault code such as `unavailable` or `fork`, or the
 error's type) at most once per 5 minutes. Approvals never wait for a report. Read the copy in the
-vault:
+vault, or on the portal's Ledger page (§26):
 
 ```sh
 zoeymcp ledger --vault                    # the copy's state, then the newest 200 calls with their sends
@@ -838,9 +838,10 @@ Once you have decided why:
 zoeymcp ledger --vault --restart-chain
 ```
 
-It shows what happens and asks first: the live chain moves to `archive-<ms>/` (still on disk), and
-if the archives would pass 64 MiB, the oldest are deleted, each listed with its seq range, when it
-was received and its size. A deleted epoch's head seq and hash stay in `head.json` and in the
+or **Restart the chain** on the portal's Ledger page, confirmed with a passkey. Either shows what
+happens and asks first: the live chain moves to `archive-<ms>/` (still on disk, and readable on
+the Ledger page), and if the archives would pass 64 MiB, the oldest are deleted, each listed with
+its seq range, when it was received and its size. A deleted epoch's head seq and hash stay in `head.json` and in the
 `ledger_reported_restarted` log line as anchors. The next report starts a new chain, on trust. If
 the copy changed between the plan and your answer, nothing is done: run it again.
 
@@ -940,7 +941,7 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 ## 26. The portal
 
 A draft, filled in as the portal is built: signing in, setup, sessions, passkeys, step-up,
-secrets, health and OAuth connect so far. Everything here can also be done with the CLI (§1).
+secrets, health, OAuth connect, the ledger and the policy so far. Everything here can also be done with the CLI (§1).
 
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
@@ -1117,6 +1118,37 @@ the verifier the vault keeps. Logs: `oauth_login_started`, `oauth_login_complete
 `oauth.complete` or `oauth.reset`, and `oauth_cache_reset`; never a pasted address, a flow ID or
 a provider's description.
 
+**Ledger.** The Ledger page is the vault's copy of the gateway's approval ledger (§21), newest
+first, 200 rows a page (**Older rows** for more). Each call shows when it was asked, its client,
+server and tool, the decision, the outcome and how many writes it asked for and sent, and under
+it each of its sends from the SMTP connectors' journals: the state, the SMTP code and the time,
+never the Message-ID or the message's digest. Every row is as the gateway reported it; a record
+the vault wrote itself (from M8) says so. A client or server the current policy doesn't name is
+marked "Not in the current policy". Below the rows are the sends whose call the copy doesn't
+hold: `no_ledger_record` once the copy has had a report since the send began (a caller other
+than the gateway, or a gateway that didn't record it), else `not_yet_reported`. No keyed digest
+of a call's arguments or prompt is shown: check arguments with `zoeymcp ledger check REF FILE` in
+the gateway's container. The state line says where the copy's head is, when it last moved, and
+whether its files stop chaining. While the copy refuses reports (`fork`, `gap` or `full`, §21),
+every page has a banner, and **Restart the chain** shows, before the passkey prompt, the state
+it lifts, the live chain it archives and every archived chain it deletes to stay within 64 MiB,
+each with its seq range, when it was received and its size; it does what `zoeymcp ledger --vault
+--restart-chain` does. If the copy changes between the summary and the prompt (a restart from the
+host, say), the vault refuses with what it finds now. Archived chains are listed at the bottom,
+each with **Show its rows**; a deleted one keeps only its head, as an anchor. A copy the vault
+can't read is shown as such, and can't be restarted until the state volume is fixed. Logs:
+`step_up_confirmed` with the action `ledger.restart`, then `ledger_reported_restarted`.
+
+**Policy.** The Policy page shows the running policy, read-only: this deployment's policy is
+declarative, so change it in its source (the file given with `--config`, `ZOEYMCP_CONFIG`, or
+standard input) and reload (§7); the page shows the reloaded policy at once. It is built field by
+field from a list of what may be shown, so a field a later version adds stays out until that
+version decides. Shown only as `(set)`, and listed by where they are: a client's token or token
+hash, every placeholder, a basic credential's username, a connector's username and sender (its
+recipients as a count), and the values of an OAuth credential's `token_headers` and of a route's
+forced query parameters, which could hold a literal credential. Secret references (`store:x`,
+`env:X`) show as written; the policy never holds a secret value.
+
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A
 different host name has its own: issue a setup code and redeem it **on the new origin**.
@@ -1204,6 +1236,7 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 403 | `not_navigation` | The portal didn't take this sign-in. Copy this tab's address and paste it into the portal's Connect dialog, or into zoeymcp login if you started it there. |
 | 400 | `bad_query` | The portal didn't take this sign-in. Copy this tab's address and paste it into the portal's Connect dialog, or into zoeymcp login if you started it there. |
 | 409 | `not_restartable` | The reported ledger isn't stuck, so there's nothing to restart. |
+| 503 | `copy_unavailable` | The vault's copy of the gateway's ledger can't be read: check the state volume. The proxy runs as before. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

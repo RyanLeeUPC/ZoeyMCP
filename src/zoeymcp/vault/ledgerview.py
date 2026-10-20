@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
 from ..common import ledgerjoin
+from ..common.policy.schema import Policy
 from .reports import Held
 
 MAX_LIMIT: Final = 200
@@ -79,6 +80,16 @@ def sends(journals: Mapping[str, Iterable[Mapping[str, Any]]]) -> list[Send]:
             elif send.state == "sending":
                 send.state, send.smtp_code, send.at_ms = kind, record.get("smtp_code"), ts
     return list(found.values())
+
+
+def known(policy: Policy) -> dict[str, frozenset[str]]:
+    """The names a row's client and server have in ``policy``, for :func:`page`'s ``known``.
+    Tools aren't checked: a server's tools needn't be listed. Without a gateway section no name
+    is in the policy."""
+    section = policy.gateway
+    if section is None:
+        return {"client": frozenset(), "server": frozenset()}
+    return {"client": frozenset(section.clients), "server": frozenset(section.servers)}
 
 
 def state(held: Held, *, now: int, broken_at: int | None = None) -> dict[str, Any]:

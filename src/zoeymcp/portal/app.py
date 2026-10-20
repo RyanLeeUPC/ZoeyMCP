@@ -37,12 +37,13 @@ summaries if the plan moved; otherwise it applies the counter, runs what was hel
 its result. The kinds built so far are the passkeys': ``passkey.enrol`` (its run begins an
 enrolment ceremony for this session, finished at ``/api/passkeys/enrol/finish``),
 ``passkey.rename`` and ``passkey.remove`` (never the last passkey: host access is the recovery
-path, Q26); and the secrets': ``secret.put`` and ``secret.delete``, which decide with
+path, Q26); the secrets': ``secret.put`` and ``secret.delete``, which decide with
 ``vault/secretplan.py`` and write with ``vault/secretops.py``, as the admin socket's
 ``PUT/DELETE /secrets/{name}`` do (G, P10). The Secrets area is write-only: ``GET /api/secrets``
 lists names and metadata, and no answer, summary or log line carries a value (P1, R61). A value
 waits for its confirm in the action's held data, which hides it from ``repr`` and refuses to be
-logged.
+logged. ``oauth.complete`` and ``oauth.reset`` are below, and ``ledger.restart`` restarts the
+chain of the reported copy (J.4).
 
 Health and OAuth connect (I, H): ``GET /api/health`` is the socket's ``GET /health`` report, fit
 to show, with one checklist of every finding; ``GET /api/session`` carries its counts. ``GET
@@ -54,6 +55,13 @@ passkey prompt; its confirm exchanges the code once and stores the grant. ``DELE
 /api/oauth/flows/{flow}`` cancels the session's own login, and ``oauth.reset`` clears a
 credential's failure state. Flows are owned (H.2): another owner's flow answers as an unknown
 one.
+
+The policy and the ledger (L, J.5): ``GET /api/policy`` shows the running policy, read-only,
+built from an allowlist of its fields (``portal/policyview.py``). ``GET /api/ledger`` pages the
+vault's copy of the gateway's ledger, or an archived epoch of it, with each call's sends from the
+connectors' journals and the sends no call explains; no keyed digest or pin is in it. While the
+copy refuses every report, each page has its banner, and ``ledger.restart``, planned with every
+epoch it deletes, restarts the chain once the operator has decided why.
 
 The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
 a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
@@ -75,12 +83,12 @@ a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout``, ``portal_
 ``step_up_confirmed``, ``step_up_refused``, ``action_changed``, ``passkey_renamed`` and
 ``passkey_removed``; ``secretops`` logs ``secret_set`` and ``secret_deleted`` with
 ``via: "portal"``; the logins log ``oauth_login_started``, ``oauth_login_completed``,
-``oauth_login_failed`` and ``oauth_flow_replaced``, and a reset ``oauth_cache_reset``. The
-callback logs ``portal_request`` for its 303 with the route's template only, never its query;
-``oauth_callback_returned`` or ``oauth_callback_failed`` (the logins'); and for a refusal
-``oauth_callback_refused`` (``callback_not_taken``, ``not_navigation``, ``bad_query``,
-``duplicate_param``), at most once per 10 s per reason with a count, or ``portal_refused`` for
-``busy`` and ``rate_limited``.
+``oauth_login_failed`` and ``oauth_flow_replaced``, a reset ``oauth_cache_reset``, and the
+copy ``ledger_reported_restarted``. The callback logs ``portal_request`` for its 303 with the
+route's template only, never its query; ``oauth_callback_returned`` or ``oauth_callback_failed``
+(the logins'); and for a refusal ``oauth_callback_refused`` (``callback_not_taken``,
+``not_navigation``, ``bad_query``, ``duplicate_param``), at most once per 10 s per reason with a
+count, or ``portal_refused`` for ``busy`` and ``rate_limited``.
 """
 
 from __future__ import annotations
@@ -95,15 +103,23 @@ from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard
+from urllib.parse import parse_qsl
 
 from starlette.types import Receive, Scope, Send
 
 from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
 from ..common.policy.schema import OAuth2Credential, split_scope
-from ..vault import logs, secretops, secretplan
+from ..vault import ledgerview, logs, secretops, secretplan
 from ..vault.bindings import VAULT_PREFIX
 from ..vault.oauth.login import LoginError
 from ..vault.oauth.pkce import FLOW_TTL, CallbackBinder
+from ..vault.reportstore import (
+    CopyUnavailable,
+    NotRestartable,
+    PlanChanged,
+    RestartPlan,
+    epoch_json,
+)
 from ..vault.secretplan import PutPlan, SecretRefusal
 from . import passkeys as passkey_file
 from . import routes as api
@@ -128,6 +144,8 @@ from .admission import (
 from .display import NAME_LIMIT, SUMMARY_LIMIT, shown
 from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
+from .policyview import Source
+from .policyview import view as policy_view
 from .refusals import Refusal, enrolment, refusal, secret
 from .refusals import login as login_refusal
 from .routes import (
@@ -164,8 +182,10 @@ from .webauthn import (
 if TYPE_CHECKING:
     from ..common.policy.schema import Policy
     from ..vault.admin import SetupCodes
+    from ..vault.connectors.smtp import SmtpConnectors
     from ..vault.oauth.login import LoginService
     from ..vault.oauth.tokens import TokenManager
+    from ..vault.reportstore import ReportStore
     from ..vault.store import EntryMeta, SecretStore
     from .passkeys import Passkeys
 
@@ -216,9 +236,37 @@ ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
         "check_mailbox": "Check the mailbox before sending again.",
         "reset_passkeys": "Run zoeymcp setup-code --reset with host access.",
         "check_gateway": "Check that the gateway is running and reporting.",
-        "read_ledger": "Read it with zoeymcp ledger --vault.",
+        "read_ledger": "Read it on the Ledger page, or with zoeymcp ledger --vault.",
     }
 )
+# The banner while the reported copy refuses reports (K.3), by its state (J.2 rows 8-10).
+_LEDGER_REFUSES: Final = "The vault refuses the gateway's ledger reports: "
+_LEDGER_RESTART: Final = " Decide why, then restart the chain on the Ledger page."
+LEDGER_BANNERS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "fork": _LEDGER_REFUSES
+        + "the gateway's ledger no longer extends the vault's copy (a fork)."
+        + _LEDGER_RESTART,
+        "gap": _LEDGER_REFUSES
+        + "a report skipped records the copy doesn't hold (a gap)."
+        + _LEDGER_RESTART,
+        "full": _LEDGER_REFUSES
+        + "the copy is full, and nothing it received more than 30 days ago can be pruned."
+        + _LEDGER_RESTART,
+    }
+)
+# An orphan send's flag (J.5, D-25), in words.
+ORPHAN_FLAGS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "no_ledger_record": "no ledger record: the copy has had reports since this send began, "
+        "and none holds its call (a caller other than the gateway, or a gateway that didn't "
+        "record it)",
+        "not_yet_reported": "not reported yet: no report has reached the copy since this send "
+        "began",
+    }
+)
+# The ledger page's query (J.5): each at most once, all optional.
+LEDGER_QUERY: Final = frozenset({"archive", "before", "limit"})
 
 CSP: Final = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
@@ -328,6 +376,16 @@ class Secrets:
 
 
 @dataclass(frozen=True)
+class Ledger:
+    """What the Ledger page reads (J.5): the vault's copy of the gateway's ledger, the one the
+    report path writes and ``zoeymcp ledger --vault`` reads, and the SMTP connectors whose send
+    journals it joins by ref (D-25; without them it shows no sends)."""
+
+    copy: ReportStore
+    connectors: SmtpConnectors | None = None
+
+
+@dataclass(frozen=True)
 class ActionKind:
     """One kind of action as the portal runs it: its plan, which changes nothing, and its run,
     given the data the vault held. The registry's shape checks (``actions.KINDS``) come first."""
@@ -377,7 +435,10 @@ class PortalApp:
     admin socket; a secret route or action of a portal without ``secrets`` is a 500, and so is
     an OAuth route or action without ``login`` or ``secrets`` (whose policy and token manager it
     reads). ``health`` gives the report the socket's ``GET /health`` answers (I.1); without it,
-    ``GET /api/health`` is a 500 and the session answer has no counts.
+    ``GET /api/health`` is a 500 and the session answer has no counts. ``ledger`` is what the
+    Ledger page reads and ``ledger.restart`` restarts (J); without it, those are a 500 and no
+    page shows the copy's banner. ``source`` is where the running policy came from, for the
+    policy view (L), which reads the policy through ``secrets``.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
     class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
     limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
@@ -397,6 +458,8 @@ class PortalApp:
         login: LoginService | None = None,
         secrets: Secrets | None = None,
         health: Callable[[], dict[str, Any]] | None = None,
+        ledger: Ledger | None = None,
+        source: Source = "file",
         routes: Sequence[Route] = ROUTES,
         handlers: Mapping[Route, Handler] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -410,6 +473,8 @@ class PortalApp:
         self.login = login
         self.secrets = secrets
         self.health = health
+        self.ledger = ledger
+        self.source: Source = source
         self._routes = tuple(routes)
         self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
@@ -706,10 +771,12 @@ class PortalApp:
             api.PASSKEYS: self._passkeys,
             api.SECRETS: self._secret_list,
             api.HEALTH: self._health,
+            api.POLICY: self._policy_view,
             api.OAUTH: self._oauth_list,
             api.OAUTH_START: self._oauth_start,
             api.FLOW_STATUS: self._flow_status,
             api.FLOW_CANCEL: self._flow_cancel,
+            api.LEDGER: self._ledger_page,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -1086,6 +1153,7 @@ class PortalApp:
             "secret.delete": ActionKind(self._plan_delete, self._run_delete),
             "oauth.complete": ActionKind(self._plan_complete, self._run_complete),
             "oauth.reset": ActionKind(self._plan_reset, self._run_reset),
+            "ledger.restart": ActionKind(self._plan_restart, self._run_restart),
         }
 
     def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1492,6 +1560,107 @@ class PortalApp:
             return refusal("not_oauth")
         return Reply({"credential": credential, "reset": True})
 
+    # --- the policy (L) and the ledger (J.5) ----------------------------------------------------
+
+    async def _policy_view(self, call: Call) -> Reply | Refusal:
+        """The running policy, read-only: built from an allowlist of the schema's fields, every
+        string shown, and no token, token hash, placeholder, account detail or recipient
+        (``portal/policyview.py``). The portal can't change it: it is declarative (P9)."""
+        return Reply(policy_view(self._policy(), self.source))
+
+    async def _ledger_page(self, call: Call) -> Reply | Refusal:
+        """J.5: a page of the vault's copy, newest first, ``?before=SEQ&limit=N``; with
+        ``archive=NAME``, an archived epoch's (J.4). Each call is one row joined with its sends,
+        and the sends whose call the copy doesn't hold are orphans (D-25), on the live chain's
+        first page. No keyed digest or pin is in a row (Q12), and every string from the gateway
+        or a journal is shown (K.1). A copy that can't be read is a page that says so."""
+        query = _ledger_query(call.query)
+        if isinstance(query, Refusal):
+            return query
+        archive, before, limit = query
+        ledger = self._ledger()
+        copy = ledger.copy
+        policy = self._policy()
+        journals = _journals(ledger.connectors, policy)
+        try:
+            records = await asyncio.to_thread(copy.records, archive)
+        except KeyError:
+            return refusal("not_found")  # not an archive the copy lists, or one dropped
+        except (CopyUnavailable, OSError):
+            records = None
+        now = copy.clock()
+        if records is None:
+            state = ledgerview.state(copy.held, now=now)
+            page: dict[str, Any] = {
+                "state": {**state, "state": "unavailable"},
+                "rows": [],
+                "orphans": [],
+                "next": None,
+            }
+        else:
+            page = ledgerview.page(
+                records,
+                held=copy.held,
+                journals=journals,
+                now=now,
+                before=before,
+                limit=ledgerview.MAX_LIMIT if limit is None else limit,
+                known=ledgerview.known(policy),
+                broken_at=copy.broken_at,
+            )
+            if archive is not None:
+                page["orphans"] = []  # an orphan is judged against the live chain only
+        return Reply(_ledger_view(page, copy.refused, copy.archives(), archive))
+
+    def _plan_restart(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``ledger.restart`` (J.4, Q3): the copy refuses every report (a fork, a gap, or full),
+        and the plan says which state it lifts, the live chain it archives and every archived
+        epoch it deletes to stay in bounds, each with its seq range, when it was received and
+        its size, so the operator decides it. The plan leaves out the archive's name, which is
+        the time the restart runs, so an unchanged copy plans the same at confirm (F.4)."""
+        try:
+            plan = self._ledger().copy.plan_restart()
+        except NotRestartable:
+            return refusal("not_restartable")
+        except CopyUnavailable:
+            return refusal("copy_unavailable")
+        return Plan(_restart_summary(plan), (plan,))
+
+    async def _run_restart(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """The restart, as ``zoeymcp ledger --vault --restart-chain`` runs it, under the copy's
+        lock, so no report applies meanwhile. The confirm planned it a moment ago, with nothing
+        awaited since, so the plan taken here is the one confirmed; the store refuses to run it
+        if the copy moved while the lock was awaited (``409 changed``, with both plans)."""
+        copy = self._ledger().copy
+        try:
+            expected = copy.plan_restart()
+        except NotRestartable:
+            return refusal("not_restartable")
+        except CopyUnavailable:
+            return refusal("copy_unavailable")
+        try:
+            async with copy.lock:
+                done = await asyncio.to_thread(copy.restart, expected)
+        except NotRestartable:
+            return refusal("not_restartable")
+        except CopyUnavailable:
+            return refusal("copy_unavailable")
+        except PlanChanged as exc:
+            body = {
+                **refusal("changed").body(),
+                "was": [list(pair) for pair in _restart_summary(expected)],
+                "now": [list(pair) for pair in _restart_summary(exc.plan)],
+            }
+            return Reply(body, status=409, reason="changed")
+        except OSError:
+            return refusal("not_written")
+        return Reply({"restarted": done.to_json(), "head": copy.head().to_json()})
+
+    def _ledger(self) -> Ledger:
+        if self.ledger is None:
+            raise RuntimeError("this portal has no reported copy")
+        return self.ledger
+
     def _login_refused(self, exc: LoginError, credential: str) -> Refusal:
         """A refused start, paste or exchange in the portal's words (H.3), with the status and
         reason the socket answers. A provider's description (cleaned and capped by the vault,
@@ -1565,17 +1734,21 @@ class PortalApp:
             return None  # removed since, or the file can't be verified
 
     def _banners(self) -> list[dict[str, str]]:
-        """The banner lines every page shows (K.3); the ledger's and health's come in steps 14a
-        and 15."""
+        """The banner lines every page shows (K.3): the passkey file's, and the reported copy's
+        while it refuses every report (``ledger_fork``, ``ledger_gap``, ``ledger_full``); the
+        session answer adds health's."""
+        banners = []
         holder = self.passkeys
-        if holder is None:
-            return []
-        if holder.unavailable:
-            return [{"code": "passkeys_unavailable", "text": refusal("unavailable").error}]
-        regressed = holder.document.last_regressed
-        if regressed is not None and self._wall() - regressed < REGRESSED_FOR:
-            return [{"code": "passkey_counter_regressed", "text": COUNTER_BANNER}]
-        return []
+        if holder is not None and holder.unavailable:
+            banners.append({"code": "passkeys_unavailable", "text": refusal("unavailable").error})
+        elif holder is not None:
+            regressed = holder.document.last_regressed
+            if regressed is not None and self._wall() - regressed < REGRESSED_FOR:
+                banners.append({"code": "passkey_counter_regressed", "text": COUNTER_BANNER})
+        state = "" if self.ledger is None else self.ledger.copy.state
+        if state in LEDGER_BANNERS:
+            banners.append({"code": f"ledger_{state}", "text": LEDGER_BANNERS[state]})
+        return banners
 
     # --- answers ---------------------------------------------------------------------------------
 
@@ -1957,6 +2130,201 @@ def _scopes(scopes: Iterable[str]) -> list[str]:
 def _scope_words(scopes: Sequence[str]) -> str:
     """Scopes for a summary line, each shown, or ``none``."""
     return " ".join(_scopes(scopes)) if scopes else "none"
+
+
+# --- the ledger page (J.5) and the chain's restart (J.4) ------------------------------------------
+
+
+def _ledger_query(raw: bytes) -> tuple[str | None, int | None, int | None] | Refusal:
+    """``?archive=NAME&before=SEQ&limit=N``, each at most once and all optional: the archived
+    epoch to read (the copy checks the name against its list before it is used), and the
+    page's bounds as plain digits. Anything else is ``bad_body``."""
+    try:
+        pairs = parse_qsl(raw.decode("ascii"), keep_blank_values=True, strict_parsing=bool(raw))
+    except (UnicodeDecodeError, ValueError):
+        return refusal("bad_body")
+    found = dict(pairs)
+    if len(found) != len(pairs) or not found.keys() <= LEDGER_QUERY:
+        return refusal("bad_body")
+    numbers: list[int | None] = []
+    for key in ("before", "limit"):
+        value = found.get(key)
+        if value is not None and not (value.isascii() and value.isdigit() and len(value) <= 15):
+            return refusal("bad_body")
+        numbers.append(None if value is None else int(value))
+    return found.get("archive"), numbers[0], numbers[1]
+
+
+def _journals(connectors: SmtpConnectors | None, policy: Policy) -> dict[str, list[dict[str, Any]]]:
+    """Each connector's send journal records, for the join; one that can't be read is left
+    out, as the socket's ``GET /ledger/reported`` leaves it."""
+    found: dict[str, list[dict[str, Any]]] = {}
+    if connectors is None:
+        return found
+    for name in policy.connectors:
+        try:
+            found[name] = connectors.records(name)
+        except OSError:
+            continue
+    return found
+
+
+def _ledger_view(
+    page: Mapping[str, Any],
+    refused: Mapping[str, Any] | None,
+    archives: Sequence[Mapping[str, Any]],
+    archive: str | None,
+) -> dict[str, Any]:
+    """``ledgerview.page``'s answer fit to show (K.1): each row and orphan with its text and
+    every name from the gateway or a journal shown, the copy's state in words, whether it can
+    be restarted, and the archived epochs, each a dropped one's anchor."""
+    state = page["state"]
+    return {
+        "state": state,
+        "state_shown": _state_words(state, refused),
+        "restartable": state["state"] in LEDGER_BANNERS,
+        "archive": archive,
+        "rows": [_row_view(row) for row in page["rows"]],
+        "orphans": [_orphan_view(orphan) for orphan in page["orphans"]],
+        "next": page["next"],
+        "archives": [_archive_view(epoch) for epoch in archives],
+    }
+
+
+def _state_words(state: Mapping[str, Any], refused: Mapping[str, Any] | None) -> str:
+    """The copy's state line: its head, when the head last moved, a break in its files, and
+    why it refuses reports."""
+    if state["state"] == "unavailable":
+        return refusal("copy_unavailable").error
+    if state["head_seq"] is None:
+        words = f"The copy is {state['state']}: nothing reported yet."
+    else:
+        words = (
+            f"The copy is {state['state']}: head seq {state['head_seq']} ({state['head_hash']}), "
+            f"the chain from seq {state['start_seq']}"
+        )
+        ago = state["reported_ago"]
+        words += "." if ago is None else f"; the head last moved {ago} s ago."
+    if state["broken_at"] is not None:
+        words += f" Its files stop chaining at seq {state['broken_at']}: damage, or an edit."
+    if refused:
+        words += (
+            f" Every report is refused until the chain is restarted: {_refused_words(refused)}. "
+            "Decide why first: the gateway's volume lost or restored, the vault's restored, or "
+            "a gateway sending more than an honest one would."
+        )
+    return words
+
+
+def _refused_words(refused: Mapping[str, Any]) -> str:
+    """Why the copy refuses reports, from ``head.json``, which is checked only as an object, so
+    each field is shown."""
+    reason, offered, held = (shown(str(refused.get(key))) for key in REFUSED_FIELDS)
+    return f"{reason} at seq {offered}, the copy holding seq {held}, at {_at(refused.get('at'))}"
+
+
+REFUSED_FIELDS: Final = ("reason", "offered_seq", "held_seq")
+
+
+def _at(ms: object) -> str:
+    """The vault's own time in milliseconds, as the rows show times."""
+    if type(ms) is int and ms >= 0:
+        return ledgerview.when(ms)
+    return "an unknown time"
+
+
+def _writers(writers: Mapping[str, str]) -> str:
+    """Who wrote a row's records (J.6): the gateway reported them, unless M8's vault wrote one."""
+    if set(writers.values()) == {"gateway"}:
+        return "reported by the gateway"
+    return ", ".join(
+        f"{kind} "
+        + ("reported by the gateway" if writer == "gateway" else f"written by the {writer}")
+        for kind, writer in writers.items()
+    )
+
+
+def _row_view(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One row: a call with its sends, or a record about the ledger itself."""
+    if row["kind"] != "call":
+        fields = ", ".join(f"{key} {shown(str(value))}" for key, value in row["fields"].items())
+        text = f"{row['at']} ledger record {row['kind']} (seq {row['seq']})"
+        text += f": {fields}" if fields else ""
+        return {
+            **row,
+            "text_shown": f"{text}; {_writers({row['kind']: row['writer']})}.",
+            "lines_shown": [],
+        }
+    names = {f"{key}_shown": shown(row[key], NAME_LIMIT) for key in ledgerview.NAMED}
+    result = row["outcome"] or "none yet"
+    if row["detail"]:
+        result += f" ({row['detail']})"
+    writes = f"{row['writes']} write(s) asked"
+    if row["writes_sent"] is not None:
+        writes += f", {row['writes_sent']} sent, {row['writes_unknown']} unknown"
+    text = (
+        f"{row['at']} call {row['ref']} (seq {row['seq']}): {names['client_shown']} asked for "
+        f"{names['server_shown']}/{names['tool_shown']} ({row['era']}); decision "
+        f"{row['decision'] or 'none yet'}; outcome {result}; {writes}; "
+        f"{_writers(row['writers'])}."
+    )
+    lines = []
+    if row["not_in_policy"]:
+        missing = ", ".join(f"{key} {names[key + '_shown']}" for key in row["not_in_policy"])
+        lines.append(f"Not in the current policy: {missing}.")
+    journal = []
+    for send in row["journal"]:
+        key = shown(send["key"])
+        code = "" if send["smtp_code"] is None else f", SMTP {send['smtp_code']}"
+        lines.append(f"Send {key}: {send['state']}{code}, at {send['at']}.")
+        journal.append({**{k: v for k, v in send.items() if k != "key"}, "key_shown": key})
+    view = {key: value for key, value in row.items() if key not in (*ledgerview.NAMED, "journal")}
+    return {**view, **names, "journal": journal, "text_shown": text, "lines_shown": lines}
+
+
+def _orphan_view(orphan: Mapping[str, Any]) -> dict[str, Any]:
+    """A send whose call the copy doesn't hold (D-25), flagged."""
+    connector, key = shown(orphan["connector"], NAME_LIMIT), shown(orphan["key"])
+    text = (
+        f"{orphan['at']} send {key} on {connector}: {orphan['state']}; "
+        f"{ORPHAN_FLAGS[orphan['flag']]}."
+    )
+    view = {k: v for k, v in orphan.items() if k not in ("connector", "key")}
+    return {**view, "connector_shown": connector, "key_shown": key, "text_shown": text}
+
+
+def _epoch_words(epoch: Mapping[str, Any]) -> str:
+    return (
+        f"seq {epoch['first_seq']} to {epoch['head_seq']} (head {epoch['head_hash']}), last "
+        f"received {_at(epoch['received_ms'])}, {epoch['size']} bytes"
+    )
+
+
+def _archive_view(epoch: Mapping[str, Any]) -> dict[str, Any]:
+    """An archived epoch: readable on the page, or, once dropped, its anchor."""
+    text = f"{epoch['name']}: {_epoch_words(epoch)}"
+    if epoch["dropped"]:
+        text += "; its files were deleted, and its head is kept as an anchor"
+    return {**epoch, "text_shown": text + "."}
+
+
+def _restart_summary(plan: RestartPlan) -> tuple[tuple[str, str], ...]:
+    """What a restart does (J.4, Q3), for the operator to decide on: the state it lifts, the
+    live chain it archives, and each epoch it deletes, the live one too when the archives can't
+    keep it."""
+    lifted = f"the vault's copy, now {plan.state}"
+    if plan.refused:
+        lifted += f": {_refused_words(plan.refused)}"
+    archived = "nothing: the copy holds no chain"
+    if plan.archive is not None:
+        archived = f"the live chain, {_epoch_words(epoch_json(plan.archive))}"
+    summary = [("Restart the chain of", lifted), ("Archive", archived)]
+    for epoch in plan.drop:
+        name = epoch.name or "the live chain, once archived"
+        words = f"{name}: {_epoch_words(epoch_json(epoch))}; its head stays as an anchor"
+        summary.append(("Delete", words))
+    summary.append(("Then", "the next report from the gateway starts a new chain, on trust"))
+    return tuple(summary)
 
 
 def _session(call: Call) -> Session:

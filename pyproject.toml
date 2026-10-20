@@ -123,6 +123,7 @@ only_mutate = [
     "*zoeymcp/portal/passkeys.py",
     "*zoeymcp/portal/setupcode.py",
     "*zoeymcp/portal/listen.py",
+    "*zoeymcp/portal/policyview.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/approvaltext.py",
@@ -182,4 +183,5 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.portal.passkeys" = 90
 "zoeymcp.portal.setupcode" = 90
 "zoeymcp.portal.listen" = 90
+"zoeymcp.portal.policyview" = 90
 "zoeymcp.common.policy.callback" = 90

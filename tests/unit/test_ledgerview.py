@@ -12,7 +12,18 @@ from typing import Any
 import pytest
 
 from tests.unit.test_ledgerjoin import RECORDS, REF_A, REF_B, REF_C, REF_D, T, asked, record
-from zoeymcp.vault.ledgerview import MAX_LIMIT, NAMED, Send, orphans, page, sends, state, when
+from zoeymcp.common.policy.schema import Policy
+from zoeymcp.vault.ledgerview import (
+    MAX_LIMIT,
+    NAMED,
+    Send,
+    known,
+    orphans,
+    page,
+    sends,
+    state,
+    when,
+)
 from zoeymcp.vault.reports import Held, LiveFile
 
 HASH = "sha256:" + "f" * 64
@@ -194,6 +205,26 @@ def test_a_ref_asked_twice_is_one_row() -> None:
 def test_names_the_current_policy_lacks_are_listed(known: Any, missing: list[str]) -> None:
     assert NAMED == ("client", "server", "tool")
     assert view(known=known)["rows"][4]["not_in_policy"] == missing
+
+
+def test_the_names_a_policy_knows() -> None:
+    """Its clients and servers; never its tools, which a server needn't list."""
+    base: dict[str, Any] = {"version": 1, "mode": "declarative"}
+    assert known(Policy.model_validate(base)) == {"client": frozenset(), "server": frozenset()}
+    gateway = {
+        "clients": {
+            "agent1": {"token_sha256": "sha256:" + "3" * 64, "servers": ["mail"]},
+            "agent3": {"token_sha256": "sha256:" + "4" * 64},
+        },
+        "servers": {"mail": {"kind": "bridge", "url": "http://bridge.example:9000/mcp"}},
+    }
+    found = known(Policy.model_validate({**base, "gateway": gateway}))
+    assert found == {"client": frozenset({"agent1", "agent3"}), "server": frozenset({"mail"})}
+    rows = view(known=found)["rows"]
+    assert [(row["client"], row["not_in_policy"]) for row in rows[3:5]] == [
+        ("agent2", ["client"]),
+        ("agent1", []),
+    ]
 
 
 # --- pages ---------------------------------------------------------------------------------------
