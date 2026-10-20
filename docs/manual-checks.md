@@ -145,9 +145,10 @@ view.
 13. **The callback** (step 14b): the steps come with the callback.
 14. **A stale callback address** (step 14b): the steps come with the callback.
 15. **The secret field isn't saved** (step 13). Sign in, open **Secrets**, enter a name and a
-    value, choose **Store**, confirm with the passkey. Pass: the browser doesn't offer to save the
-    value as a password (and no password manager fills or stores it); after the confirm the value
-    field is empty; the page's elements (developer tools, Elements) hold no copy of the value.
+    value, choose **Set the secret**, confirm with the passkey. Pass: the value shows as dots while
+    typed (in Chrome, Edge and Safari; other browsers may show it as typed); the browser doesn't
+    offer to save it as a password (and no password manager fills or stores it); after the confirm
+    the value field is empty; the page's elements (developer tools, Elements) hold no copy of it.
 
 ## D-66: the live OAuth test against a real provider
 
@@ -205,3 +206,9 @@ with a fixed `redirect_uri` is the fallback, decided then.
 | 11 | bfbbcf7 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | No Trusted Types or Content Security Policy violation through setup, sign-in, Sessions, ending the other sessions and sign-out; the console showed only the double sign-out's 401 (item 3) |
 | 10 | bfbbcf7 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | The neighbour page's two requests were refused `cross_site` (403) and CORS blocked the read; the portal tab stayed signed in; the cookie replayed without the token got 401 `no_session` with every security header. On Windows the vault's console also printed asyncio `ConnectionResetError` tracebacks when Chrome reset the refused connections (a Windows event-loop quirk, outside the JSON log) |
 | 12 | bfbbcf7 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8082 | Pass | A byte-for-byte forwarder from port 8082 to the portal; the passkey enrolled on `localhost:8081` was offered and signed in; the two ports keep separate cookies |
+| D-66 (1) | 9575a87 | 2026-10-20 | Google, Desktop app client | `http://127.0.0.1/callback` (no port) | Pass | `test_google_accepts_the_portless_loopback_redirect` passed: the sign-in page loads with no `redirect_uri_mismatch`. Spotify not run |
+| D-66 (2) | 9575a87 | 2026-10-20 | Google, Desktop app client; Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | A connect by paste with `profiles/google-oauth.yaml`: the summary showed before the passkey prompt, the exchange answered 200, the grant is `calendar.readonly`, Credentials shows `ok`. The vault's log has `oauth_login_completed` and no code, token or pasted address |
+| D-66 (3) | 9575a87 | 2026-10-20 | Google, Desktop app client | `profiles/google-oauth.yaml`'s route | Pass (in place of the refresh test) | After a restart (access tokens are in memory only), the first call through the `google-calendar` route refreshed with the stored refresh token (`grant: refresh_token`, `trigger: first_use`, 200) and the Calendar API answered 200 through the vault. The refresh-token test itself wasn't run: the vault never hands a refresh token out. No token in the vault's log |
+| 8 | 9575a87 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Partial | The OAuth connect's summary showed before any passkey prompt. Not yet run: the rename cancelled at the prompt (needs two passkeys), and the mismatched paste |
+| 9 | 9575a87 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | The authorization link opened Google's page in a new tab with `window.opener` null |
+| 15 | 9575a87 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Fail | Chrome offered to save the secret's value as a password after the step-up confirm, despite `autocomplete="off"` and no `name`. The owner chose a text area, masked where the browser supports it; to be run again |
