@@ -390,6 +390,29 @@ def test_control_commands(log_buffer: io.StringIO) -> None:
     ]
 
 
+def test_a_failed_reload_keeps_the_reader(log_buffer: io.StringIO) -> None:
+    # A reload that raises is logged; the TERM after it still stops the process.
+    stops: list[str] = []
+
+    def reload() -> None:
+        raise RuntimeError("secret detail")
+
+    async def main() -> None:
+        reader = asyncio.StreamReader(limit=CONTROL_LINE_LIMIT)
+        reader.feed_data(b"HUP\nTERM\n")
+        reader.feed_eof()
+        await read_control(reader, reload=reload, stop=lambda: stops.append("stop"))
+
+    asyncio.run(main())
+    assert stops == ["stop", "stop"]
+    assert log_lines(log_buffer) == [
+        {"role": "vault", "event": "control_received", "command": "HUP"},
+        {"role": "vault", "event": "reload_failed", "error_type": "RuntimeError"},
+        {"role": "vault", "event": "control_received", "command": "TERM"},
+        {"role": "vault", "event": "control_received", "command": "EOF"},
+    ]
+
+
 def test_control_eof_stops(log_buffer: io.StringIO) -> None:
     assert _read(b"") == ["stop"]
     assert log_lines(log_buffer) == [

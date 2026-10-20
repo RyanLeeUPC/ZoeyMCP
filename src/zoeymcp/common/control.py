@@ -60,7 +60,10 @@ async def read_control(
         command = line.strip()
         if command == CONTROL_RELOAD:
             event("control_received", command="HUP")
-            reload()
+            try:
+                reload()
+            except Exception as exc:  # a failed reload must not end the reader, or TERM is lost
+                event("reload_failed", error_type=type(exc).__name__)
         elif command == CONTROL_STOP:
             event("control_received", command="TERM")
             stop()

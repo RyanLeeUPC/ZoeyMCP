@@ -366,6 +366,8 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
 `HUP` on to both. The vault:
 
 - A policy that fails is refused (`reload_refused` in the log), and the running one stays.
+- A reload that fails in some other way logs `reload_failed` with the error's type, and the
+  running policy stays. The launcher's `TERM` after it still stops the process.
 - On success the log has `reload_ok`, with `oauth_reset` listing the OAuth credentials whose
   settings or route origins changed. Their cached access tokens are dropped and their failure
   states cleared. A refresh in flight still saves its new refresh token.
