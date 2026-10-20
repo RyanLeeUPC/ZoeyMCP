@@ -134,7 +134,7 @@ shipped `profiles/`), the portal's effect tests over real sockets (`tests/portal
 contract tests for the MCP SDK and what the portal relies on (`tests/sdk`), a by-hand browser
 checklist ([docs/manual-checks.md](docs/manual-checks.md)), an image smoke test of both
 deployment tiers (`scripts/smoke-image.sh`), and mutation testing of the security-critical
-modules in CI (`.github/workflows/mutation.yml`, gated at 89%).
+modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and 95% for each module M5 added).
 
 ## License
 

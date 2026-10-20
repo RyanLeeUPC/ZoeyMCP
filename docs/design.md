@@ -1831,7 +1831,8 @@ portal's session halves, the callback's query and binding cookie, and the policy
   - It is meant to run in CI and before every deploy, and to be **mutation-tested**: flip a rule,
     and the suite must fail.
 - **The project's own CI** mutation-tests the security-relevant modules with `mutmut` (the list
-  is `only_mutate` in `pyproject.toml`), gated at 89% overall, with per-module floors under
+  is `only_mutate` in `pyproject.toml`), gated at 95% overall, with per-module floors (95% for each
+  module M5 added) under
   `[tool.zoeymcp.mutation-floors]`:
   - **M1 to M3:** the vault's request handling, store, bindings, OAuth (protocol, PKCE and
     flows, the token manager, login), gateway keys and peer check; the text rules, canonical
@@ -2141,7 +2142,7 @@ is built beside paste, not left out.
 | The two socket answers that carry a credential | `POST /setup-code` and `GET /gateway-key`, recorded as R61's scoped exceptions | R61 |
 | Explicit bindings for names the policy uses | allowed; health judges a binding by its effect | operations.md §3 |
 | The static UI's tests | thin script tested through the API, static checks of the files, and a recorded by-hand checklist | §8.2 |
-| Mutation floors | 95% overall and per M5 module once M5's survivors are triaged; 90% per module until then | §8.2 |
+| Mutation floors | 95% overall and per M5 module (M5 step 19b; survivors judged equivalent are listed in `tests/unit/test_mutation_gaps_5.py`) | §8.2 |
 | Order after M5 | an OAuth credential on a remote MCP route without discovery inside M5; then M7, M6, M8 | §11 |
 
 ### 12.2 Open

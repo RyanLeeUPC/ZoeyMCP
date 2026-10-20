@@ -87,4 +87,4 @@ jobs:
       - name: Merge
         run: python3 scripts/mutation-merge.py merged.json shards
       - name: Gate
-        run: python3 scripts/mutation-gate.py merged.json --min-score 89
+        run: python3 scripts/mutation-gate.py merged.json --min-score 95
