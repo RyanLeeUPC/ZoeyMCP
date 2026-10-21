@@ -23,11 +23,17 @@ from zoeymcp.vault import gatewaykeys, logs, server
 from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
 from zoeymcp.vault.connectors import sendjournal
-from zoeymcp.vault.connectors.smtp import SmtpConnectors
+from zoeymcp.vault.connectors.smtp import Answer, SmtpConnectors
 from zoeymcp.vault.gatewaykeys import BACKWARDS, STATE_FILE, TAMPERED, State
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.oauth.login import LoginService
-from zoeymcp.vault.server import LOCK_FILE, StartupError, acquire_state_lock, load_runtime
+from zoeymcp.vault.server import (
+    LOCK_FILE,
+    ListenerTag,
+    StartupError,
+    acquire_state_lock,
+    load_runtime,
+)
 from zoeymcp.vault.store import SecretStore, origin_binding
 
 from .conftest import EXAMPLE_POLICY
@@ -330,6 +336,18 @@ def _with_proxy(example_text: str, proxy: str | None) -> str:
     )
 
 
+class _RecordingConnectors(SmtpConnectors):
+    """Records the proxy each send is given, and sends nothing."""
+
+    def __init__(self, state_dir: Path, keys: KeySet) -> None:
+        super().__init__(state_dir, keys)
+        self.proxies: list[str | None] = []
+
+    async def send(self, name: str, connector: Any, **kwargs: Any) -> Answer:
+        self.proxies.append(kwargs["proxy"])
+        return Answer(200, {"status": "sent"})
+
+
 @pytest.mark.parametrize(
     ("before", "after", "restart"),
     [
@@ -349,12 +367,21 @@ def test_reload_says_an_egress_proxy_change_needs_a_restart(
     restart: bool,
 ) -> None:
     first = tmp_path / "first.yaml"
-    first.write_text(_with_proxy(example_text, before), encoding="utf-8")
+    first.write_bytes(_with_proxy(example_text, before).encode())
     runtime = load_runtime(str(first), tmp_path / "state", env())
-    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+    connectors = _RecordingConnectors(tmp_path / "state", runtime.keys)
+    app = VaultApp(
+        runtime.policy,
+        runtime.store,
+        runtime.keys,
+        environ={},
+        gateway_link=True,
+        connectors=connectors,
+    )
     assert app.policy.egress_proxy == before
+    onboarding = app.onboarding_client
     second = tmp_path / "second.yaml"
-    second.write_text(_with_proxy(example_text, after), encoding="utf-8")
+    second.write_bytes(_with_proxy(example_text, after).encode())
     server.reload_policy(app, str(second), env())
     events = [line["event"] for line in _log_lines(log_buffer)]
     assert events[-1] == "reload_ok"
@@ -362,6 +389,45 @@ def test_reload_says_an_egress_proxy_change_needs_a_restart(
     if restart:
         assert events[-2] == "egress_proxy_change_needs_restart"
     assert app.policy.egress_proxy == after
+    # The clients and the connector keep the startup proxy until the restart (D-61).
+    assert app.egress_proxy == before
+    assert app.onboarding_client is onboarding
+
+    async def send() -> httpx.Response:
+        transport = httpx.ASGITransport(app=ListenerTag(app, "gateway"))
+        async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
+            return await client.post(
+                "/mail/send",
+                headers={"idempotency-key": "k" * 32, "content-type": "application/json"},
+                content=b"{}",
+            )
+
+    assert asyncio.run(send()).status_code == 200
+    assert connectors.proxies == [before]
+    asyncio.run(app.aclose())
+
+
+def test_the_restart_note_compares_with_the_startup_proxy(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """The note compares the new policy with what the clients use, the startup value: it repeats
+    on every reload until the restart, the same changed proxy again included, and a reload back
+    to the startup value logs none."""
+    runtime = load_runtime(str(EXAMPLE_POLICY), tmp_path / "state", env())
+    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+    changed = tmp_path / "changed.yaml"
+    changed.write_bytes(_with_proxy(example_text, "http://proxy:3128").encode())
+    back = tmp_path / "back.yaml"
+    back.write_bytes(example_text.encode())
+    noted: list[bool] = []
+    for path in (changed, changed, back):
+        server.reload_policy(app, str(path), env())
+        events = [line["event"] for line in _log_lines(log_buffer)]
+        assert events[-1] == "reload_ok"
+        noted.append(events[-2] == "egress_proxy_change_needs_restart")
+    assert noted == [True, True, False]
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert events.count("egress_proxy_change_needs_restart") == 2
     asyncio.run(app.aclose())
 
 

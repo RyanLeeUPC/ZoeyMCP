@@ -628,7 +628,8 @@ def reload_policy(
     except StartupError as exc:
         logs.event("reload_refused", reason=str(exc))
         return
-    egress_changed = policy.egress_proxy != app.policy.egress_proxy
+    # Against the startup value, which every client and connector keeps (M7 design B.2, D-61).
+    egress_changed = policy.egress_proxy != app.egress_proxy
     # Where the portal listens: its listener's address, else the running policy's (none).
     before = app.policy.admin
     listening = portal.address.listen if portal is not None else before and before.listen
@@ -639,7 +640,7 @@ def reload_policy(
         logs.event("reload_refused", reason=str(exc))
         return
     if egress_changed:
-        # The HTTP clients were built with the old proxy.
+        # The HTTP clients were built with the startup proxy, and SMTP sends keep it too.
         logs.event("egress_proxy_change_needs_restart")
     if listening != (policy.admin and policy.admin.listen):
         logs.event("admin_listen_change_needs_restart")
@@ -717,6 +718,8 @@ def build(
     # Before any listener opens: a torn tail is cut and the head rebuilt from the lines (M5 J.4).
     # A copy that can't be read is unavailable, and the proxy runs anyway.
     reports = ReportStore.open(state_dir)
+    # Its HTTP clients, the guarded onboarding client among them, are built here from the startup
+    # policy and kept until the process ends; a reload changes none (M7 design B.2, D-61).
     app = VaultApp(
         runtime.policy,
         runtime.store,

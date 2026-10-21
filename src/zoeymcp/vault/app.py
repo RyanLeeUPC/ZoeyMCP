@@ -68,7 +68,7 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from ..common.policy.view import build_view, dump_view
-from . import logs
+from . import logs, netclient
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
@@ -332,6 +332,7 @@ class VaultApp:
         *,
         client: httpx.AsyncClient | None = None,
         token_client: httpx.AsyncClient | None = None,
+        onboarding_client: httpx.AsyncClient | None = None,
         tokens: TokenManager | None = None,
         environ: Mapping[str, str] | None = None,
         gateway_keys: GatewayKeys | None = None,
@@ -342,6 +343,12 @@ class VaultApp:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
         so ``token_client`` is then not used.
+
+        ``onboarding_client`` reaches hosts learned from the network (discovery, registration;
+        M7 design B.2), guarded by :mod:`.netclient`. When ``client`` is given and it isn't,
+        ``client`` serves that role too, so an injected client never falls back to a networked
+        one. Every client, and the SMTP connectors' proxy, stays on the ``egress_proxy`` of
+        ``policy``, the startup one: a reload never changes them (D-61).
 
         ``gateway_keys`` is the persisted ratchet the vault loaded at startup. Without one, the
         gateway keys are tracked in memory only (self-tests and unit tests).
@@ -362,6 +369,10 @@ class VaultApp:
             keys, policy.gateway_key_generation
         )
         self._client = without_cookies(client or _upstream_client(policy))
+        self._egress_proxy = policy.egress_proxy
+        if onboarding_client is None and client is None:
+            onboarding_client = netclient.onboarding_client(policy.egress_proxy)
+        self._onboarding_client = without_cookies(onboarding_client or self._client)
         self._token_client: httpx.AsyncClient | None = None
         if tokens is None:
             self._token_client = without_cookies(token_client or _token_client(policy))
@@ -414,6 +425,16 @@ class VaultApp:
         return self._reports
 
     @property
+    def egress_proxy(self) -> str | None:
+        """The startup policy's ``egress_proxy``, which every client and connector uses."""
+        return self._egress_proxy
+
+    @property
+    def onboarding_client(self) -> httpx.AsyncClient:
+        """The guarded client for hosts learned from the network (M7 design B.2)."""
+        return self._onboarding_client
+
+    @property
     def env_names(self) -> frozenset[str]:
         """The ``env:`` variables found set when the policy was loaded: names only."""
         return frozenset(self._env_secrets)
@@ -454,6 +475,8 @@ class VaultApp:
             await self._client.aclose()
             if self._token_client is not None and self._token_client is not self._client:
                 await self._token_client.aclose()
+            if self._onboarding_client is not self._client:
+                await self._onboarding_client.aclose()
 
     # --- ASGI ----------------------------------------------------------------------------------
 
@@ -833,7 +856,7 @@ class VaultApp:
             key=request.headers.get("idempotency-key"),
             content_type=request.headers.get("content-type"),
             body=body,
-            proxy=self._policy.egress_proxy,
+            proxy=self._egress_proxy,  # the startup one, as every HTTP client's (D-61)
             credentials=lambda: self._connector_credentials(connector),
         )
         return _connector_response(answer, log)

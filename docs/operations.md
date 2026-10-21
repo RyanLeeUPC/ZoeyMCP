@@ -456,7 +456,9 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
 - On success the log has `reload_ok`, with `oauth_reset` listing the OAuth credentials whose
   settings or route origins changed. Their cached access tokens are dropped and their failure
   states cleared. A refresh in flight still saves its new refresh token.
-- A changed `egress_proxy` needs a restart (`egress_proxy_change_needs_restart`).
+- A changed `egress_proxy` needs a restart: every HTTP client and the SMTP connectors keep the
+  proxy the vault started with until then. A reload whose `egress_proxy` differs from the one the
+  vault started with logs `egress_proxy_change_needs_restart`, on every reload until the restart.
 - A changed, added or removed `admin.listen` needs a restart (`admin_listen_change_needs_restart`):
   the portal stays where it listens. A changed `admin.origins` takes effect at once, and the
   sessions of a removed origin end. Removing the whole `admin` block keeps the portal on its old
@@ -1526,10 +1528,11 @@ routes:
   one goes to the proxy as a forwarded request, which a CONNECT-only proxy (the snippet below
   allows nothing else) refuses. The text form marks such a destination, and `check` warns about a
   credential-less `allow_insecure_upstream` route over plain http when `egress_proxy` is set.
-- **Changing it needs a restart.** `egress_proxy` is read when the vault starts. A reload that
-  changes it logs `egress_proxy_change_needs_restart` and keeps routes and token requests on the
-  old proxy, while SMTP sends already take the new one: recreate the vault right after changing
-  it (§7).
+- **Changing it needs a restart.** `egress_proxy` is read when the vault starts, and every vault
+  connection (routes, token requests, onboarding and SMTP sends) keeps that proxy. A reload whose
+  `egress_proxy` differs from the one the vault started with logs
+  `egress_proxy_change_needs_restart`, again on every reload until the restart: recreate the vault
+  right after changing it (§7).
 
 **Emitting the allowlist.** Run the image, which reads the service's own inline policy (add
 `--config FILE` for a policy file). The policy is checked first: its findings go to stderr, the
