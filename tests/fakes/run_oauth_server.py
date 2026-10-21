@@ -14,6 +14,14 @@ origin and whose credential uses the provider with that ``redirect_uri``. Then i
 start a vault with that policy, trusting the CA for the token exchange, and how to issue the
 setup code. The browser must trust ``DIR/ca.pem`` too (a throwaway profile with it imported), or
 accept the certificate warning for the provider once. Ctrl-C stops it; nothing it issues is real.
+
+``--consent`` (register D-183) puts an Approve page in front of the answer, as a real provider's
+consent screen, and serves the provider at ``https://127.0.0.1:<port>`` (the certificate covers
+it), a different site from the portal's ``localhost``, so the return navigation starts on another
+site. For onboarding by URL (M7 design O.1), ``--metadata`` publishes the provider's metadata with
+the provider (and ``--issuer-path``) as its issuer, ``--iss`` advertises RFC 9207's ``iss``,
+``--registration`` picks how ``/register`` answers, and ``--switch`` (repeatable) turns on a
+hostile or slow answer by its name in ``AuthSwitch``.
 """
 
 from __future__ import annotations
@@ -29,11 +37,20 @@ from typing import Any
 import uvicorn
 
 from tests.acceptance.tls import make_ca
-from tests.fakes.oauth_server import FakeAuthServer
+from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer, Registration
 
 CLIENT_ID = "example-notes-client"
 SCOPES = ("notes.read", "notes.write")
 PROXY_PORT = 8090
+REGISTRATIONS: tuple[Registration, ...] = (
+    "open",
+    "none",
+    "confidential_only",
+    "cimd_only",
+    "needs_initial_token",
+)
+# A stalled answer is cut this long after Ctrl-C.
+SHUTDOWN_GRACE = 1
 # The vault's token client trusts only certifi's bundle: for this check, the throwaway CA.
 LAUNCHER = (
     "import sys, certifi; certifi.where = lambda: sys.argv[1]; "
@@ -73,22 +90,31 @@ def policy(provider: str, portal_port: int, credential: str) -> dict[str, Any]:
     }
 
 
-def main(argv: Sequence[str]) -> None:
+def parse(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m tests.fakes.run_oauth_server")
     parser.add_argument("--dir", required=True, type=Path)
     parser.add_argument("--portal-port", type=int, default=8081)
     parser.add_argument("--port", type=int, default=9443)
     parser.add_argument("--credential", default="notes")
-    args = parser.parse_args(argv)
-    directory: Path = args.dir.resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "state").mkdir(mode=0o700, exist_ok=True)
-    ca = make_ca(directory)
-    provider = f"https://localhost:{args.port}"
-    document = policy(provider, args.portal_port, args.credential)
-    config = directory / "policy.json"
-    config.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    address = document["credentials"][args.credential]["redirect_uri"]
+    parser.add_argument("--consent", action="store_true")
+    parser.add_argument("--metadata", action="store_true")
+    parser.add_argument("--issuer-path", default="")
+    parser.add_argument("--iss", action="store_true")
+    parser.add_argument("--registration", choices=REGISTRATIONS, default="open")
+    parser.add_argument(
+        "--switch", action="append", default=[], choices=[s.value for s in AuthSwitch]
+    )
+    return parser.parse_args(argv)
+
+
+def provider_of(args: argparse.Namespace) -> str:
+    """The provider's origin: on ``127.0.0.1`` with a consent page, another site (D-183)."""
+    host = "127.0.0.1" if args.consent else "localhost"
+    return f"https://{host}:{args.port}"
+
+
+def fake_for(args: argparse.Namespace, address: str) -> FakeAuthServer:
+    """The fake provider the arguments describe, its registered redirect ``address``."""
     fake = FakeAuthServer(
         time.time,
         client_id=CLIENT_ID,
@@ -97,9 +123,34 @@ def main(argv: Sequence[str]) -> None:
         scopes=SCOPES,
         registered_redirect=address,
         prefix="fake-notes",
+        iss_supported=args.iss,
+        registration=args.registration,
+        consent=args.consent,
     )
+    if args.metadata:
+        fake.issuer = provider_of(args) + args.issuer_path
+    fake.switches = {AuthSwitch(name) for name in args.switch}
+    return fake
+
+
+def main(argv: Sequence[str]) -> None:
+    args = parse(argv)
+    directory: Path = args.dir.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "state").mkdir(mode=0o700, exist_ok=True)
+    ca = make_ca(directory)
+    provider = provider_of(args)
+    document = policy(provider, args.portal_port, args.credential)
+    config = directory / "policy.json"
+    config.write_bytes(json.dumps(document, indent=2).encode() + b"\n")
+    address = document["credentials"][args.credential]["redirect_uri"]
+    fake = fake_for(args, address)
     state = directory / "state"
     print(f"The fake provider: {provider}, its registered redirect {address}")
+    if fake.consent:
+        print("It shows an Approve page before it sends the tab back.")
+    if fake.issuer is not None:
+        print(f"Its metadata, for the issuer {fake.issuer}: {', '.join(fake.metadata_paths())}")
     print(f"The policy: {config}; the CA: {ca.ca_file}")
     print("In another shell, with ZOEYMCP_MASTER_KEY set (zoeymcp keygen), start the vault:")
     print(
@@ -118,6 +169,7 @@ def main(argv: Sequence[str]) -> None:
         ssl_keyfile=str(ca.key_file),
         log_level="warning",
         proxy_headers=False,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE,
     )
 
 

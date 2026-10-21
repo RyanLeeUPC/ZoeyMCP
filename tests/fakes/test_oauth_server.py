@@ -5,18 +5,38 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html
+import json
+import re
 import threading
-from typing import Any
+from pathlib import Path
+from typing import Any, get_args
 from urllib.parse import parse_qs, urlsplit
 
+import anyio
 import httpx
 import pytest
 
+from zoeymcp.common.policy.load import parse_policy
+
+from . import run_oauth_server
+from .harness import serve
 from .oauth_server import (
+    BIDI_OVERRIDE,
+    CHANGED_REDIRECT,
+    INJECTED_DESCRIPTION,
+    LOOPBACK_ENDPOINT,
+    METADATA_ELSEWHERE,
     MISSING,
+    OTHER_ISSUER,
+    REGISTRATION_ACCESS_TOKEN,
+    REGISTRATION_CLIENT_PATH,
+    SINGLE_LABEL_ENDPOINT,
+    AuthSwitch,
     DroppedConnection,
     FakeAuthServer,
     FakeResourceServer,
+    Registration,
     google_style,
     spotify_style,
 )
@@ -322,3 +342,458 @@ async def test_the_callbacks_answers() -> None:
             },
         )
     assert server.exchanges == 1
+
+
+# --- the consent page (D-183) -------------------------------------------------------------------
+
+HIDDEN = re.compile(r'<input type="hidden" name="([^"]*)" value="([^"]*)">')
+
+
+def form_fields(page: str) -> dict[str, str]:
+    return {html.unescape(name): html.unescape(value) for name, value in HIDDEN.findall(page)}
+
+
+async def test_a_consent_page_comes_before_the_answer() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer="https://accounts.example")
+    server.consent = True
+    hostile = 'fake"><script>alert(1)</script>'
+    page = await authorize(server, state=hostile, scope="notes.read")
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert page.headers["cache-control"] == "no-store"
+    assert '<form method="post" action="/authorize">' in page.text
+    assert "<script>" not in page.text
+    fields = form_fields(page.text)
+    assert (fields["client_id"], fields["state"], fields["scope"]) == ("app", hostile, "notes.read")
+    async with client(server) as http:
+        approved = await http.post("/authorize", data=fields)
+    assert approved.status_code == 302
+    assert approved.headers["location"].startswith("http://127.0.0.1:8976/callback?")
+    # The first value the fake issued: nothing was issued before the post.
+    assert location_params(approved) == {
+        "code": "fake-code-1",
+        "state": hostile,
+        "iss": "https://accounts.example",
+    }
+
+
+async def test_consent_is_off_by_default_and_the_checks_come_first() -> None:
+    server = FakeAuthServer(Clock(), client_id="app")
+    async with client(server) as http:
+        refused = await http.post("/authorize", data={"client_id": "app"})
+    assert refused.status_code == 405
+    assert (await authorize(server)).status_code == 302
+    server.consent = True
+    assert (await authorize(server, client_id="someone-else")).status_code == 400
+    invalid = await authorize(server, code_challenge_method="plain")
+    assert invalid.status_code == 302
+    assert location_params(invalid) == {"error": "invalid_request", "state": "fake-state"}
+
+
+def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> None:
+    address = "http://localhost:8081/oauth/callback/notes"
+    plain = run_oauth_server.parse(["--dir", str(tmp_path)])
+    assert run_oauth_server.provider_of(plain) == "https://localhost:9443"
+    fake = run_oauth_server.fake_for(plain, address)
+    assert (fake.consent, fake.issuer, fake.iss_supported) == (False, None, False)
+    assert (fake.registration, fake.switches, fake.registered_redirect) == ("open", set(), address)
+    argv = ["--dir", str(tmp_path), "--consent", "--metadata", "--issuer-path", "/tenant"]
+    argv += ["--iss", "--registration", "none", "--switch", "stall", "--switch", "wrong_issuer"]
+    args = run_oauth_server.parse(argv)
+    provider = run_oauth_server.provider_of(args)
+    assert provider == "https://127.0.0.1:9443"
+    fake = run_oauth_server.fake_for(args, address)
+    assert (fake.consent, fake.issuer, fake.iss_supported) == (True, f"{provider}/tenant", True)
+    assert fake.registration == "none"
+    assert fake.switches == {AuthSwitch.STALL, AuthSwitch.WRONG_ISSUER}
+    # The policy it writes for a provider on 127.0.0.1 loads.
+    document = run_oauth_server.policy(provider, 8081, "notes")
+    loaded = parse_policy(json.dumps(document), "policy.json")
+    assert loaded.credentials["notes"].token_url == f"{provider}/token"  # type: ignore[union-attr]
+
+
+# --- metadata (M7 design O.1) -------------------------------------------------------------------
+
+ISSUER = "https://accounts.example"
+PUBLIC_REQUEST: dict[str, Any] = {
+    "client_name": "ZoeyMCP (notes)",
+    "redirect_uris": ["http://127.0.0.1/callback/notes"],
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "token_endpoint_auth_method": "none",
+    "application_type": "native",
+    "scope": "notes.read offline_access",
+}
+CANDIDATES = [
+    "/.well-known/oauth-authorization-server/tenant",
+    "/.well-known/openid-configuration/tenant",
+    "/tenant/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
+]
+
+
+async def get(server: FakeAuthServer, path: str) -> httpx.Response:
+    async with client(server) as http:
+        return await http.get(path)
+
+
+async def register(
+    server: FakeAuthServer, body: Any, headers: dict[str, str] | None = None
+) -> httpx.Response:
+    content = body if isinstance(body, bytes) else json.dumps(body).encode()
+    async with client(server) as http:
+        return await http.post(
+            "/register",
+            content=content,
+            headers={"content-type": "application/json", **(headers or {})},
+        )
+
+
+async def test_metadata_at_the_root() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER, scopes=("notes.read",))
+    oauth = await get(server, "/.well-known/oauth-authorization-server")
+    oidc = await get(server, "/.well-known/openid-configuration")
+    assert (oauth.status_code, oidc.status_code) == (200, 200)
+    assert oauth.headers["content-type"] == "application/json"
+    assert oauth.json() == oidc.json() == server.metadata()
+    methods = ["none", "client_secret_basic", "client_secret_post"]
+    assert oauth.json() == {
+        "issuer": ISSUER,
+        "authorization_endpoint": f"{ISSUER}/authorize",
+        "token_endpoint": f"{ISSUER}/token",
+        "revocation_endpoint": f"{ISSUER}/revoke",
+        "registration_endpoint": f"{ISSUER}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": methods,
+        "revocation_endpoint_auth_methods_supported": methods,
+        "authorization_response_iss_parameter_supported": False,
+        "scopes_supported": ["notes.read"],
+    }
+    server.endpoint_base = "https://login.example"
+    moved = (await get(server, "/.well-known/oauth-authorization-server")).json()
+    assert (moved["issuer"], moved["token_endpoint"]) == (ISSUER, "https://login.example/token")
+
+
+@pytest.mark.parametrize(
+    ("forms", "answering"),
+    [
+        (("oauth", "oidc"), CANDIDATES[:2]),
+        (("oidc_appended",), CANDIDATES[2:3]),
+        (("oauth", "oidc", "oidc_appended"), CANDIDATES[:3]),
+    ],
+)
+async def test_metadata_at_a_path_suffixed_issuer(forms: Any, answering: list[str]) -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=f"{ISSUER}/tenant")
+    server.metadata_forms = forms
+    found = [path for path in CANDIDATES if (await get(server, path)).status_code == 200]
+    assert found == answering
+    assert (await get(server, answering[0])).json()["issuer"] == f"{ISSUER}/tenant"
+
+
+async def test_no_issuer_no_metadata() -> None:
+    server = FakeAuthServer(Clock(), client_id="app")
+    assert [(await get(server, path)).status_code for path in CANDIDATES] == [404] * 5
+    with pytest.raises(ValueError, match="no issuer"):
+        server.metadata()
+
+
+@pytest.mark.parametrize(
+    ("switch", "check"),
+    [
+        (AuthSwitch.WRONG_ISSUER, lambda d: d["issuer"] == OTHER_ISSUER),
+        (AuthSwitch.ENDPOINT_LOOPBACK, lambda d: d["token_endpoint"] == LOOPBACK_ENDPOINT),
+        (
+            AuthSwitch.ENDPOINT_SINGLE_LABEL,
+            lambda d: d["token_endpoint"] == SINGLE_LABEL_ENDPOINT,
+        ),
+        (AuthSwitch.PKCE_ABSENT, lambda d: "code_challenge_methods_supported" not in d),
+        (AuthSwitch.PKCE_PLAIN, lambda d: d["code_challenge_methods_supported"] == ["plain"]),
+        (AuthSwitch.DPOP_ALGS, lambda d: d["dpop_signing_alg_values_supported"] == ["ES256"]),
+    ],
+)
+async def test_hostile_metadata(switch: AuthSwitch, check: Any) -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    server.switches = {switch}
+    response = await get(server, "/.well-known/oauth-authorization-server")
+    assert response.status_code == 200
+    assert check(response.json())
+
+
+async def test_metadata_that_isnt_a_document() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    path = "/.well-known/oauth-authorization-server"
+    server.switches = {AuthSwitch.METADATA_NOT_JSON}
+    not_json = await get(server, path)
+    assert not_json.headers["content-type"] == "application/json"
+    with pytest.raises(ValueError):  # noqa: PT011
+        json.loads(not_json.content)
+    server.switches = {AuthSwitch.METADATA_ARRAY}
+    assert (await get(server, path)).json() == [server.metadata()]
+    server.switches = {AuthSwitch.METADATA_OVERSIZED}
+    assert len((await get(server, path)).content) > 64 * 1024
+    server.switches = {AuthSwitch.METADATA_REDIRECT}
+    moved = await get(server, path)
+    assert (moved.status_code, moved.headers["location"]) == (302, METADATA_ELSEWHERE)
+
+
+# --- registration (RFC 7591) --------------------------------------------------------------------
+
+
+MODE_ROWS: list[tuple[Registration, bool, int]] = [
+    ("open", True, 201),
+    ("none", False, 404),
+    ("confidential_only", True, 400),
+    ("cimd_only", False, 404),
+    ("needs_initial_token", True, 401),
+]
+
+
+@pytest.mark.parametrize(("mode", "endpoint", "status"), MODE_ROWS)
+async def test_registration_modes(mode: Registration, endpoint: bool, status: int) -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER, registration=mode)
+    document = server.metadata()
+    assert ("registration_endpoint" in document) is endpoint
+    assert ("client_id_metadata_document_supported" in document) is (mode == "cimd_only")
+    methods = document["token_endpoint_auth_methods_supported"]
+    assert ("none" in methods) is (mode != "confidential_only")
+    assert (await register(server, PUBLIC_REQUEST)).status_code == status
+
+
+def test_every_registration_mode_is_tested() -> None:
+    modes = {row[0] for row in MODE_ROWS}
+    assert modes == set(get_args(Registration)) == set(run_oauth_server.REGISTRATIONS)
+
+
+async def test_an_initial_token_or_a_confidential_client_registers() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    server.registration = "needs_initial_token"
+    bearer = {"authorization": "Bearer fake-initial-token"}
+    assert (await register(server, PUBLIC_REQUEST, bearer)).status_code == 201
+    server.registration = "confidential_only"
+    confidential = {**PUBLIC_REQUEST, "token_endpoint_auth_method": "client_secret_post"}
+    answer = (await register(server, confidential)).json()
+    assert answer["token_endpoint_auth_method"] == "client_secret_post"
+    assert answer["client_secret"].startswith("fake-secret-")
+    assert answer["client_secret_expires_at"] == 0
+
+
+async def test_a_registered_public_client_logs_in() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", auth="none", issuer=ISSUER)
+    answer = (await register(server, PUBLIC_REQUEST)).json()
+    assert answer == {
+        "client_id": "fake-client-1",
+        "client_id_issued_at": 1_000_000,
+        "redirect_uris": ["http://127.0.0.1/callback/notes"],
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "client_name": "ZoeyMCP (notes)",
+        "scope": "notes.read offline_access",
+        "application_type": "native",
+    }
+    redirect = "http://127.0.0.1:8976/callback/notes"
+    assert (await authorize(server, client_id="fake-client-1")).status_code == 400
+    form = {
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect,
+        "code_verifier": VERIFIER,
+        "client_id": "fake-client-1",
+    }
+    async with client(server) as http:
+        first = location_params(
+            await authorize(server, client_id="fake-client-1", redirect_uri=redirect)
+        )
+        # A code issued to one client isn't another client's.
+        other = await http.post("/token", data={**form, "code": first["code"], "client_id": "app"})
+        assert other.status_code == 400
+        second = location_params(
+            await authorize(server, client_id="fake-client-1", redirect_uri=redirect)
+        )
+        ok = await http.post("/token", data={**form, "code": second["code"]})
+    assert ok.status_code == 200
+    assert "refresh_token" in ok.json()
+
+
+async def test_a_registered_confidential_client_authenticates_its_way() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    asked = {**PUBLIC_REQUEST, "token_endpoint_auth_method": "client_secret_basic"}
+    answer = (await register(server, asked)).json()
+    client_id, secret = answer["client_id"], answer["client_secret"]
+    basic = base64.b64encode(f"{client_id}:{secret}".encode()).decode()
+    async with client(server) as http:
+        good = await http.post(
+            "/token",
+            data={"grant_type": "client_credentials"},
+            headers={"authorization": f"Basic {basic}"},
+        )
+        in_body = await http.post(
+            "/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": secret,
+            },
+        )
+    assert (good.status_code, in_body.status_code) == (200, 401)
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        (b"not json", "invalid_client_metadata"),
+        (b"[]", "invalid_client_metadata"),
+        ({**PUBLIC_REQUEST, "redirect_uris": []}, "invalid_redirect_uri"),
+        ({**PUBLIC_REQUEST, "redirect_uris": [7]}, "invalid_redirect_uri"),
+        (
+            {**PUBLIC_REQUEST, "token_endpoint_auth_method": "private_key_jwt"},
+            "invalid_client_metadata",
+        ),
+    ],
+)
+async def test_registration_refusals(body: Any, error: str) -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    response = await register(server, body)
+    assert response.status_code == 400
+    assert response.json()["error"] == error
+    assert server.registered == {}
+
+
+@pytest.mark.parametrize(
+    ("switch", "check"),
+    [
+        (AuthSwitch.DCR_REDIRECT_CHANGED, lambda a: a["redirect_uris"] == [CHANGED_REDIRECT]),
+        (
+            AuthSwitch.DCR_PRIVATE_KEY_JWT,
+            lambda a: a["token_endpoint_auth_method"] == "private_key_jwt",
+        ),
+        (AuthSwitch.DCR_SECRET_FOR_NONE, lambda a: a["client_secret"] == "fake-secret-2"),
+        (AuthSwitch.DCR_CLIENT_ID_SPACE, lambda a: a["client_id"] == "fake-client 1"),
+        (
+            AuthSwitch.DCR_CLIENT_ID_BIDI,
+            lambda a: a["client_id"] == "fake-client-1" + BIDI_OVERRIDE,
+        ),
+        (
+            AuthSwitch.DCR_ACCESS_TOKEN,
+            lambda a: (
+                (a["registration_access_token"], a["registration_client_uri"])
+                == (REGISTRATION_ACCESS_TOKEN, ISSUER + REGISTRATION_CLIENT_PATH)
+            ),
+        ),
+    ],
+)
+async def test_hostile_registration_answers(switch: AuthSwitch, check: Any) -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    server.switches = {switch}
+    response = await register(server, PUBLIC_REQUEST)
+    assert response.status_code == 201
+    assert check(response.json())
+
+
+async def test_a_registration_error_with_injected_text() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    server.switches = {AuthSwitch.DCR_ERROR_INJECTED}
+    response = await register(server, PUBLIC_REQUEST)
+    assert response.status_code == 400
+    description = response.json()["error_description"]
+    assert description == INJECTED_DESCRIPTION
+    assert "\r\n" in description
+    assert BIDI_OVERRIDE in description
+    assert "<b>" in description
+
+
+# --- iss on every answer (RFC 9207) -------------------------------------------------------------
+
+
+async def test_iss_on_error_answers_when_advertised() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER, iss_supported=True)
+    assert server.metadata()["authorization_response_iss_parameter_supported"] is True
+    assert location_params(await authorize(server))["iss"] == ISSUER
+    invalid = location_params(await authorize(server, code_challenge_method="plain"))
+    assert invalid["iss"] == ISSUER
+    server.answer = "error"
+    assert location_params(await authorize(server))["iss"] == ISSUER
+    server.switches = {AuthSwitch.ISS_WRONG_ON_ERROR}
+    assert location_params(await authorize(server))["iss"] == OTHER_ISSUER
+    server.switches = {AuthSwitch.ISS_MISSING}
+    assert "iss" not in location_params(await authorize(server))
+    server.answer = "code"
+    assert "iss" not in location_params(await authorize(server))
+    # Not advertised, an error answer carries no iss, as before.
+    quiet = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    quiet.answer = "error"
+    assert "iss" not in location_params(await authorize(quiet))
+
+
+# --- stall and trickle (FM-5, FM-6, FM-9) -------------------------------------------------------
+
+
+@pytest.mark.parametrize("switch", [AuthSwitch.STALL, AuthSwitch.STALL_REGISTER])
+async def test_a_stall_holds_only_its_own_answer(switch: AuthSwitch) -> None:
+    """STALL hangs the metadata (FM-5) and STALL_REGISTER the registration (FM-9); each
+    leaves the other answering."""
+    server = FakeAuthServer(Clock(), client_id="app", issuer="http://127.0.0.1")
+    server.switches = {switch}
+    timeout = httpx.Timeout(5.0, read=0.3)
+    metadata = "/.well-known/oauth-authorization-server"
+    with serve(server.app()) as base, anyio.fail_after(10):
+        async with httpx.AsyncClient(base_url=base, timeout=timeout) as http:
+            if switch == AuthSwitch.STALL:
+                with pytest.raises(httpx.ReadTimeout):
+                    await http.get(metadata)
+                answered = await http.post("/register", json=PUBLIC_REQUEST)
+                expected = 201
+            else:
+                with pytest.raises(httpx.ReadTimeout):
+                    await http.post("/register", json=PUBLIC_REQUEST)
+                answered = await http.get(metadata)
+                expected = 200
+            server.switches = set()
+            after = await http.get(metadata)
+    assert answered.status_code == expected
+    assert after.status_code == 200
+
+
+async def test_trickled_metadata_arrives_a_byte_at_a_time() -> None:
+    """Each read finishes well inside a per-read timeout; only a total deadline ends it."""
+    server = FakeAuthServer(Clock(), client_id="app", issuer="http://127.0.0.1")
+    server.switches = {AuthSwitch.TRICKLE}
+    server.trickle_interval = 0.05
+    expected = json.dumps(server.metadata()).encode()
+    chunks: list[bytes] = []
+    timeout = httpx.Timeout(5.0, read=1.0)
+    with serve(server.app()) as base, anyio.fail_after(10):
+        async with (
+            httpx.AsyncClient(base_url=base, timeout=timeout) as http,
+            http.stream("GET", "/.well-known/oauth-authorization-server") as response,
+        ):
+            assert response.status_code == 200
+            async for chunk in response.aiter_raw():
+                chunks.append(chunk)
+                if len(chunks) == 5:
+                    break
+    received = b"".join(chunks)
+    assert received == expected[: len(received)]
+    assert len(received) < 20 < len(expected)
+
+
+async def test_every_request_is_seen() -> None:
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    await get(server, "/.well-known/openid-configuration")
+    await register(server, PUBLIC_REQUEST)
+    await authorize(server)
+    async with client(server) as http:
+        await http.post("/nowhere", content=b"x")
+    assert [(s.method, s.path) for s in server.seen] == [
+        ("GET", "/.well-known/openid-configuration"),
+        ("POST", "/register"),
+        ("GET", "/authorize"),
+        ("POST", "/nowhere"),
+    ]
+    [registration] = server.registrations
+    assert json.loads(registration.body) == PUBLIC_REQUEST
+    assert registration.headers["content-type"] == "application/json"
+    assert "state=fake-state" in server.seen[2].query
+    assert server.seen[3].body == b"x"

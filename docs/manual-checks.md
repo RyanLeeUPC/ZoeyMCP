@@ -167,6 +167,20 @@ view.
       provider's tab; if you haven't, cancel."; confirm, and **Credentials** shows `notes`
       connected.
 
+    The fake as started above answers `/authorize` with an immediate redirect, so the navigation
+    starts and ends on the portal and the browser sends `zoeymcp-8081-session` anyway (register
+    D-183). For the no-session-cookie line, stop it and start it again with `--consent`:
+
+    ```sh
+    python -m tests.fakes.run_oauth_server --dir ./callback-check --consent
+    ```
+
+    It then serves at `https://127.0.0.1:9443`, a different site from the portal's `localhost`
+    (the certificate covers both; trust the new `ca.pem`, or accept the warning for that address
+    once), rewrites the policy to match, and shows an Approve page first, whose button posts and is
+    answered with the redirect, as a real provider's consent screen is. Restart the vault on the
+    new policy, choose **Connect**, open the link and choose **Approve**.
+
     Then **Connect** again, approve, and before the tab is redirected copy the callback address
     from the Network panel (or block `localhost:8081` there first); open that address in a
     second browser profile. Pass: the refused page ("The portal didn't take this sign-in."), the

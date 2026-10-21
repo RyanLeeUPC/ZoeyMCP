@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 from typing import Any, cast
 
 import anyio
@@ -19,12 +20,16 @@ from mcp.server.session import ServerSession
 from mcp.shared.exceptions import MCPError
 from starlette.types import Message
 
+from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.gateway.findings import tool_findings
 from zoeymcp.vault.request import MAX_STREAM_EVENT_BYTES, scrub, secret_variants
 
+from . import run_mcp_server
 from .harness import serve
 from .mcp_server import (
     ANNOUNCE_DELAY,
     ANSI,
+    AS_WELL_KNOWN,
     BACK_CHANNELS,
     BIDI_OVERRIDE,
     C1_CSI,
@@ -37,8 +42,13 @@ from .mcp_server import (
     HOSTILE_PARAMETER,
     IMPORTANT,
     INVALID_NAME,
+    LARGE_INVALID,
+    LARGE_WARNED,
     MIB,
     MODERN_VERSION,
+    OTHER_AS,
+    PRIVATE_METADATA,
+    PRM_WELL_KNOWN,
     REF_URL,
     REQUEST_STATE,
     SCHEMA_DEPTH,
@@ -1400,3 +1410,227 @@ async def test_a_schema_200_levels_deep(version: str) -> None:
     assert [tool["name"] for tool in tools] == [*BASE_NAMES, "schema_deep"]
     assert json_depth(tools[-1]["inputSchema"]) == SCHEMA_DEPTH
     assert fake.lists == 2
+
+
+# --- discovery (M7 design O.1) ------------------------------------------------------------------
+
+ISSUER = "https://accounts.example"
+
+
+def origin_of(url: str) -> str:
+    return url.removesuffix("/mcp")
+
+
+def legacy_probe(url: str, headers: dict[str, str] | None = None) -> httpx.Response:
+    """The vault's second probe (M7 design D.2): a fixed legacy ``initialize``."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": LEGACY_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "zoeymcp", "version": "0"},
+        },
+    }
+    wire = {**ACCEPT, "mcp-protocol-version": LEGACY_VERSION, **(headers or {})}
+    return httpx.post(url, json=body, headers=wire, timeout=30)
+
+
+@pytest.mark.parametrize("form", ["path", "root"])
+async def test_protected_resource_metadata_and_the_challenge(form: str) -> None:
+    fake = McpFake(key="fake-key-1", authorization_servers=[ISSUER], scopes=("notes.read",))
+    fake.prm = form  # type: ignore[assignment]
+    with running(fake) as url:
+        origin = origin_of(url)
+        path_form = httpx.get(f"{origin}{PRM_WELL_KNOWN}/mcp")
+        root_form = httpx.get(f"{origin}{PRM_WELL_KNOWN}")
+        bare = modern_post(url, "server/discover")
+        wrong = modern_post(url, "server/discover", headers={"authorization": "Bearer fake-no"})
+    served, absent = (path_form, root_form) if form == "path" else (root_form, path_form)
+    assert (served.status_code, absent.status_code) == (200, 404)
+    assert served.json() == {
+        "resource": url if form == "path" else origin,
+        "authorization_servers": [ISSUER],
+        "bearer_methods_supported": ["header"],
+        "resource_name": "Fake MCP server",
+        "scopes_supported": ["notes.read"],
+    }
+    where = f"{origin}{PRM_WELL_KNOWN}" + ("/mcp" if form == "path" else "")
+    assert bare.status_code == 401
+    assert bare.headers["www-authenticate"] == (
+        f'Bearer resource_metadata="{where}", scope="notes.read"'
+    )
+    assert wrong.headers["www-authenticate"] == (
+        f'Bearer error="invalid_token", resource_metadata="{where}", scope="notes.read"'
+    )
+
+
+async def test_a_challenge_without_the_metadata_address() -> None:
+    fake = McpFake(key="fake-key-1", prm="path", authorization_servers=[ISSUER])
+    fake.challenge_metadata = False
+    with running(fake) as url:
+        bare = modern_post(url, "server/discover")
+    assert bare.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize(
+    ("switch", "member", "value"),
+    [
+        (Switch.PRM_RESOURCE_MISMATCH, "resource", "{origin}/other"),
+        (Switch.PRM_TWO_SERVERS, "authorization_servers", [ISSUER, OTHER_AS]),
+        (Switch.PRM_DPOP, "dpop_bound_access_tokens_required", True),
+    ],
+)
+async def test_hostile_protected_resource_metadata(switch: Switch, member: str, value: Any) -> None:
+    fake = McpFake(prm="path", authorization_servers=[ISSUER], switches={switch})
+    with running(fake) as url:
+        document = httpx.get(f"{origin_of(url)}{PRM_WELL_KNOWN}/mcp").json()
+    if isinstance(value, str):
+        value = value.format(origin=origin_of(url))
+    assert document[member] == value
+
+
+async def test_hostile_challenges() -> None:
+    fake = McpFake(key="fake-key-1", prm="path", switches={Switch.PRIVATE_METADATA})
+    with running(fake) as url:
+        private = modern_post(url, "server/discover")
+        fake.switches = {Switch.TWO_BEARER}
+        two = modern_post(url, "server/discover")
+    origin = origin_of(url)
+    assert private.headers["www-authenticate"] == f'Bearer resource_metadata="{PRIVATE_METADATA}"'
+    assert two.headers.get_list("www-authenticate") == [
+        f'Bearer resource_metadata="{origin}{PRM_WELL_KNOWN}/mcp"',
+        f'Bearer resource_metadata="{origin}{PRM_WELL_KNOWN}/other"',
+    ]
+
+
+async def test_no_protected_resource_metadata_but_as_metadata_at_the_server_url() -> None:
+    """D.2a's case: the server URL itself is the issuer, with a path."""
+    fake = McpFake(key="fake-key-1")
+    with running(fake) as url:
+        fake.as_metadata = lambda: {"issuer": url}
+        origin = origin_of(url)
+        statuses = [
+            httpx.get(f"{origin}{PRM_WELL_KNOWN}/mcp").status_code,
+            httpx.get(f"{origin}{PRM_WELL_KNOWN}").status_code,
+            httpx.get(f"{origin}{AS_WELL_KNOWN}").status_code,
+        ]
+        found = httpx.get(f"{origin}{AS_WELL_KNOWN}/mcp")
+        bare = modern_post(url, "server/discover")
+    assert statuses == [404, 404, 404]
+    assert found.json() == {"issuer": url}
+    assert bare.headers["www-authenticate"] == 'Bearer error="invalid_token"'
+
+
+async def test_a_server_without_a_key_is_not_protected() -> None:
+    fake = McpFake()
+    with running(fake) as url:
+        probe = modern_post(url, "server/discover")
+        metadata = httpx.get(f"{origin_of(url)}{PRM_WELL_KNOWN}/mcp")
+    assert probe.status_code == 200
+    assert metadata.status_code == 404
+
+
+def probe_without_meta(url: str) -> httpx.Response:
+    body = {"jsonrpc": "2.0", "id": 0, "method": "server/discover", "params": {}}
+    wire = {**ACCEPT, "mcp-protocol-version": MODERN_VERSION, "mcp-method": "server/discover"}
+    return httpx.post(url, json=body, headers=wire, timeout=30)
+
+
+async def test_headers_checked_before_credentials() -> None:
+    fake = McpFake(key="fake-key-1")
+    with running(fake) as url:
+        no_meta = probe_without_meta(url)
+        fake.switches = {Switch.HEADERS_BEFORE_AUTH}
+        checked = probe_without_meta(url)
+        wrong_method = modern_post(url, "server/discover", headers={"mcp-method": "tools/list"})
+        good = modern_post(url, "server/discover")
+        legacy = legacy_probe(url)
+        notification = httpx.post(
+            url,
+            json={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}},
+            headers={**ACCEPT, "mcp-protocol-version": MODERN_VERSION},
+            timeout=30,
+        )
+    # Credentials first by default; with the switch, a mismatch is refused before them.
+    assert no_meta.status_code == 401
+    for refused in (checked, wrong_method):
+        assert refused.status_code == 400
+        assert refused.json()["error"]["code"] == types.HEADER_MISMATCH
+    assert (good.status_code, legacy.status_code) == (401, 401)
+    # A notification carries no _meta, and the SDK acknowledges one before that check.
+    assert notification.status_code == 401
+
+
+async def test_a_legacy_server_refuses_the_modern_header_before_credentials() -> None:
+    """SPEC-1: the modern probe earns a 400, and the legacy probe the 401."""
+    fake = McpFake(mode="legacy", key="fake-key-1")
+    with running(fake) as url:
+        after = modern_post(url, "server/discover")
+        fake.switches = {Switch.HEADERS_BEFORE_AUTH}
+        before = modern_post(url, "server/discover")
+        legacy = legacy_probe(url)
+    assert after.status_code == 401
+    assert (before.status_code, before.text) == (400, "unrecognized request")
+    assert legacy.status_code == 401
+
+
+async def test_server_discover_without_credentials() -> None:
+    fake = McpFake(key="fake-key-1", switches={Switch.DISCOVER_WITHOUT_AUTH})
+    with running(fake) as url:
+        discover = modern_post(url, "server/discover")
+        listing = modern_post(url, "tools/list")
+    assert discover.status_code == 200
+    assert "result" in discover.json()
+    assert listing.status_code == 401
+
+
+async def test_get_405_and_delete_400_in_any_mode() -> None:
+    fake = McpFake(switches={Switch.GET_405_DELETE_400})
+    with running(fake) as url:
+        get = httpx.get(url, headers={"accept": "text/event-stream"})
+        delete = httpx.delete(url, headers={"mcp-session-id": "fake-session"})
+        async with connect(url, mode="legacy") as client:
+            assert text_of(await client.call_tool("echo", {"text": "hi"})) == "hi"
+    assert (get.status_code, delete.status_code) == (405, 400)
+    deletes = [item for item in fake.received if item.method == "DELETE"]
+    assert all(item.status == 400 for item in deletes)
+
+
+async def test_large_lists_96_tools_for_review() -> None:
+    fake = McpFake(switches={Switch.LARGE})
+    with running(fake) as url:
+        async with connect(url) as client:
+            tools = (await client.list_tools()).tools
+            called = text_of(await client.call_tool("read_05", {"id": "1"}))
+    definitions = dumped(types.ListToolsResult(tools=tools))
+    assert len(definitions) == 96
+    read_only = [d for d in definitions if d.get("annotations", {}).get("readOnlyHint") is True]
+    unannotated = [d for d in definitions if "annotations" not in d]
+    assert (len(read_only), len(unannotated)) == (64, 32)
+    assert called == "read_05 done"
+    limits = GatewayLimits()
+    levels = {d["name"]: {f.level for f in tool_findings(d, limits)} for d in definitions}
+    assert [name for name, found in levels.items() if "error" in found] == [LARGE_INVALID]
+    warned = {name for name, found in levels.items() if "warning" in found}
+    assert set(LARGE_WARNED) <= warned
+    assert LARGE_INVALID in {d["name"] for d in unannotated}
+
+
+def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> None:
+    plain = run_mcp_server.fake_for(run_mcp_server.parse(["cert.pem", "key.pem"]))
+    assert (plain.mode, plain.switches, plain.key, plain.prm) == ("dual", set(), None, "none")
+    metadata = tmp_path / "as.json"
+    metadata.write_bytes(b'{"issuer": "https://mcp.example/mcp"}\n')
+    argv = ["cert.pem", "key.pem", "--mode", "legacy", "--static-key", "fake-key-1"]
+    argv += ["--prm", "root", "--authorization-server", ISSUER, "--scope", "notes.read"]
+    argv += ["--as-metadata", str(metadata), "--switch", "large", "--switch", "two_bearer"]
+    args = run_mcp_server.parse(argv)
+    fake = run_mcp_server.fake_for(args)
+    assert (args.cert, args.key, args.port) == ("cert.pem", "key.pem", 9000)
+    assert (fake.mode, fake.key, fake.prm) == ("legacy", "fake-key-1", "root")
+    assert (fake.authorization_servers, fake.scopes) == ([ISSUER], ("notes.read",))
+    assert fake.switches == {Switch.LARGE, Switch.TWO_BEARER}
+    assert fake.as_metadata is not None
+    assert fake.as_metadata() == {"issuer": "https://mcp.example/mcp"}

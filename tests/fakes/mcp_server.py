@@ -25,6 +25,14 @@ JSON-escaped form writes as ``\\/`` (PHP's default), so each encoded form differ
 With ``authorize`` set, the fake checks a bearer token with it instead of the fixed key: an OAuth
 resource server, whose tokens change as they are refreshed and rotated, and can be revoked.
 
+For onboarding by URL (M7 design O.1), ``prm`` publishes protected-resource metadata in its path
+or root form, naming ``authorization_servers``, and a 401 then carries ``resource_metadata`` and
+``scope``. ``prm="none"`` (the default) publishes none; with ``as_metadata`` set it serves that AS
+metadata at the server URL as a path-suffixed issuer instead (D.2a's case). A probe to a fake
+with no key is answered 2xx with no metadata (``not_protected``). The discovery switches make the
+metadata or the challenge hostile, check headers before credentials, answer ``server/discover``
+without them, give GET 405 and DELETE 400 in any mode, or list ``large``'s 96 tools.
+
 The fake runs on a uvicorn thread and needs the ASGI lifespan (``serve(..., lifespan=True)``),
 which runs the SDK's session manager.
 """
@@ -60,6 +68,7 @@ from starlette.types import Message, Receive, Scope, Send
 from zoeymcp.vault.request import MAX_STREAM_EVENT_BYTES
 
 Mode = Literal["dual", "legacy", "modern"]
+PrmForm = Literal["path", "root", "none"]
 DriftMember = Literal[
     "description",
     "parameter",
@@ -117,6 +126,19 @@ FILE_REF: Final = "file:///etc/passwd"
 REQUEST_STATE: Final = "fake-request-state"
 SCHEMA_DEPTH: Final = 200
 
+# Discovery (M7 design O.1).
+PRM_WELL_KNOWN: Final = "/.well-known/oauth-protected-resource"
+AS_WELL_KNOWN: Final = "/.well-known/oauth-authorization-server"
+OTHER_AS: Final = "https://other-issuer.example"
+PRIVATE_METADATA: Final = "https://10.0.0.1/.well-known/oauth-protected-resource"
+# GR-9's review at scale: 96 tools, 64 read-only and 32 unannotated. These count the tools
+# generated: with the six base tools (one read-only) and bad_tool, 63 read_ tools make the 64 and
+# 26 write_ tools the 32.
+LARGE_READ: Final = 63
+LARGE_WRITE: Final = 26
+LARGE_WARNED: Final = ("read_01", "read_02", "write_01")
+LARGE_INVALID: Final = "bad_tool"
+
 
 class Switch(enum.StrEnum):
     """One hostile or optional behaviour. Groups follow design L.1."""
@@ -163,6 +185,16 @@ class Switch(enum.StrEnum):
     SCHEMA_DEEP = "schema_deep"
     SCHEMA_REDOS = "schema_redos"
     SCHEMA_DOLLAR = "schema_dollar"
+    # discovery (M7 design O.1)
+    PRM_RESOURCE_MISMATCH = "prm_resource_mismatch"
+    PRM_TWO_SERVERS = "prm_two_servers"
+    PRM_DPOP = "prm_dpop"
+    PRIVATE_METADATA = "private_metadata"
+    TWO_BEARER = "two_bearer"
+    HEADERS_BEFORE_AUTH = "headers_before_auth"
+    DISCOVER_WITHOUT_AUTH = "discover_without_auth"
+    GET_405_DELETE_400 = "get_405_delete_400"
+    LARGE = "large"
 
 
 # The wire-level switches that answer an echo call themselves, in the order they're checked.
@@ -378,6 +410,44 @@ def apply_drift(tools: list[dict[str, Any]], member: DriftMember) -> list[dict[s
     return tools
 
 
+def large_tools() -> list[dict[str, Any]]:
+    """``large``'s 90 tools beyond the base six: read-only ones, unannotated ones, a few whose
+    descriptions earn a review warning (a URL), and one whose input schema isn't valid."""
+    schema = {"type": "object", "properties": {"id": {"type": "string"}}}
+    tools: list[dict[str, Any]] = []
+    for number in range(1, LARGE_READ + 1):
+        tools.append(
+            {
+                "name": f"read_{number:02d}",
+                "description": f"Reads record set {number}.",
+                "inputSchema": copy.deepcopy(schema),
+                "annotations": {"readOnlyHint": True},
+            }
+        )
+    for number in range(1, LARGE_WRITE + 1):
+        tools.append(
+            {
+                "name": f"write_{number:02d}",
+                "description": f"Writes record set {number}.",
+                "inputSchema": copy.deepcopy(schema),
+            }
+        )
+    for tool in tools:
+        if tool["name"] in LARGE_WARNED:
+            tool["description"] += " See https://docs.example/records."
+    tools.append(
+        {
+            "name": LARGE_INVALID,
+            "description": "Counts records.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"count": {"type": "integer", "minimum": "zero"}},
+            },
+        }
+    )
+    return tools
+
+
 def _deep_schema(depth: int) -> dict[str, Any]:
     """An input schema nested ``depth`` JSON levels deep (objects and arrays both count)."""
     schema: dict[str, Any] = {"type": "string"}
@@ -424,6 +494,20 @@ def _scope_header(scope: Scope, name: str) -> str | None:
         if key.lower() == wanted:
             return bytes(value).decode("latin-1")
     return None
+
+
+def _origin(scope: Scope) -> str:
+    """The origin the client addressed: its scheme and ``Host`` header."""
+    host = _scope_header(scope, "host")
+    if host is None:
+        server = scope.get("server") or ("127.0.0.1", 80)
+        host = f"{server[0]}:{server[1]}"
+    return f"{scope.get('scheme', 'http')}://{host}"
+
+
+async def _legacy_refusal(send: Send) -> None:
+    """A legacy server's answer to a protocol version it doesn't know."""
+    await _respond(send, 400, ((b"content-type", b"text/plain"),), [b"unrecognized request"])
 
 
 async def _respond(
@@ -473,6 +557,13 @@ class McpFake:
     big_event_bytes: int = EVENT_CAP + 1024
     # schemas
     ref_url: str = REF_URL
+    # discovery: the protected-resource metadata's form and contents, whether a 401 names it,
+    # and the AS metadata a server without one serves at its own URL (prm="none").
+    prm: PrmForm = "none"
+    authorization_servers: list[str] = field(default_factory=list)
+    scopes: tuple[str, ...] = ()
+    challenge_metadata: bool = True
+    as_metadata: Callable[[], Mapping[str, Any]] | None = None
 
     received: list[Recorded] = field(default_factory=list)
     calls: list[ToolCall] = field(default_factory=list)
@@ -523,6 +614,63 @@ class McpFake:
     def requests(self, rpc_method: str) -> list[Recorded]:
         return [item for item in self.received if item.rpc_method == rpc_method]
 
+    # --- discovery ---------------------------------------------------------------------------
+
+    def prm_path(self) -> str | None:
+        """Where the protected-resource metadata is (RFC 9728 3.1), or None."""
+        if self.prm == "none":
+            return None
+        return PRM_WELL_KNOWN + (self.path if self.prm == "path" else "")
+
+    def prm_document(self, origin: str) -> dict[str, Any]:
+        """The protected-resource metadata, for the server at ``origin``."""
+        resource = origin + self.path if self.prm == "path" else origin
+        if Switch.PRM_RESOURCE_MISMATCH in self.switches:
+            resource = f"{origin}/other"
+        servers = list(self.authorization_servers)
+        if Switch.PRM_TWO_SERVERS in self.switches:
+            servers.append(OTHER_AS)
+        document: dict[str, Any] = {
+            "resource": resource,
+            "authorization_servers": servers,
+            "bearer_methods_supported": ["header"],
+            "resource_name": "Fake MCP server",
+        }
+        if self.scopes:
+            document["scopes_supported"] = list(self.scopes)
+        if Switch.PRM_DPOP in self.switches:
+            document["dpop_bound_access_tokens_required"] = True
+        return document
+
+    def well_known(self, path: str, origin: str) -> dict[str, Any] | None:
+        """The document a GET of ``path`` serves, if any."""
+        if path == self.prm_path():
+            return self.prm_document(origin)
+        if (
+            self.prm == "none"
+            and self.as_metadata is not None
+            and path == AS_WELL_KNOWN + self.path
+        ):
+            return dict(self.as_metadata())
+        return None
+
+    def challenges(self, origin: str, presented: bool) -> list[str]:
+        """The ``WWW-Authenticate`` values of a 401. Without metadata to name, the original one;
+        with it, ``error`` only when a credential was presented (RFC 6750 3.1)."""
+        on = self.switches
+        parts = ['error="invalid_token"'] if presented or self.prm == "none" else []
+        prm_path = self.prm_path()
+        if Switch.PRIVATE_METADATA in on:
+            parts.append(f'resource_metadata="{PRIVATE_METADATA}"')
+        elif prm_path is not None and self.challenge_metadata:
+            parts.append(f'resource_metadata="{origin}{prm_path}"')
+        if self.scopes:
+            parts.append(f'scope="{" ".join(self.scopes)}"')
+        values = ["Bearer " + ", ".join(parts) if parts else "Bearer"]
+        if Switch.TWO_BEARER in on:
+            values.append(f'Bearer resource_metadata="{origin}{PRM_WELL_KNOWN}/other"')
+        return values
+
     # --- definitions -------------------------------------------------------------------------
 
     def tools_for(self, session_id: str | None, listing: int) -> list[dict[str, Any]]:
@@ -542,6 +690,8 @@ class McpFake:
             duplicate = copy.deepcopy(_tool(tools, "echo"))
             duplicate["description"] = "Returns the text it is given, louder."
             tools.append(duplicate)
+        if Switch.LARGE in self.switches:
+            tools.extend(large_tools())
         if Switch.TOOL_EXTRAS in self.switches:
             _tool(tools, "echo").update(
                 {
@@ -793,6 +943,8 @@ class McpFake:
         if name == "lookup":
             header = _header(ctx, "mcp-param-region")
             return _text_result(f"region={arguments.get('region')} header={header}")
+        if Switch.LARGE in self.switches and str(name).startswith(("read_", "write_")):
+            return _text_result(f"{name} done")
         raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {name}")
 
     async def _echo(
@@ -1021,9 +1173,14 @@ class _Wire:
         fake.received.append(record)
         replay = _replay(body, receive, record)
         watched = self._watch(record, send)
+        document = None
+        if scope["method"] == "GET":
+            document = fake.well_known(scope["path"], _origin(scope))
         if scope["path"] == SCHEMA_PATH:
             fake.schema_fetches += 1
             await _respond(watched, 200, JSON_HEADERS, [_dumps({"type": "string"})])
+        elif document is not None:
+            await _respond(watched, 200, JSON_HEADERS, [_dumps(document)])
         elif scope["path"] != fake.path:
             await _respond(watched, 404, JSON_HEADERS, [_dumps({"error": "not found"})])
         else:
@@ -1064,21 +1221,31 @@ class _Wire:
 
     async def _mcp(self, record: Recorded, scope: Scope, receive: Receive, send: Send) -> None:
         fake = self.fake
-        if fake.key is not None or fake.authorize is not None:
-            presented, authorized = self._presented(scope)
-            if not authorized:
-                await self._unauthorized(presented, send)
-                return
+        on = fake.switches
         version = _scope_header(scope, "mcp-protocol-version")
         method = record.method
+        if Switch.HEADERS_BEFORE_AUTH in on and await self._headers_refused(record, version, send):
+            return
+        open_discover = (
+            Switch.DISCOVER_WITHOUT_AUTH in on and record.rpc_method == "server/discover"
+        )
+        if (fake.key is not None or fake.authorize is not None) and not open_discover:
+            presented, authorized = self._presented(scope)
+            if not authorized:
+                await self._unauthorized(scope, presented, send)
+                return
+        if Switch.GET_405_DELETE_400 in on and method in ("GET", "DELETE"):
+            if method == "GET":
+                await _respond(send, 405, ((b"allow", b"POST, DELETE"),))
+            else:
+                await _respond(send, 400, ((b"content-type", b"text/plain"),), [b"bad request"])
+            return
         if (
             fake.mode == "legacy"
             and version is not None
             and version not in HANDSHAKE_PROTOCOL_VERSIONS
         ):
-            await _respond(
-                send, 400, ((b"content-type", b"text/plain"),), [b"unrecognized request"]
-            )
+            await _legacy_refusal(send)
             return
         if fake.mode == "modern":
             if method in ("GET", "DELETE"):
@@ -1130,12 +1297,43 @@ class _Wire:
                 authorized = authorize(value)
         return value, authorized
 
-    async def _unauthorized(self, presented: str | None, send: Send) -> None:
+    async def _unauthorized(self, scope: Scope, presented: str | None, send: Send) -> None:
         body: dict[str, Any] = {"error": "invalid_token"}
         if Switch.ECHO_401 in self.fake.switches and presented is not None:
             body["error_description"] = f"Unknown key: {presented}"
-        headers = (*JSON_HEADERS, (b"www-authenticate", b'Bearer error="invalid_token"'))
+        challenges = self.fake.challenges(_origin(scope), presented is not None)
+        headers = (
+            *JSON_HEADERS,
+            *((b"www-authenticate", value.encode()) for value in challenges),
+        )
         await _respond(send, 401, headers, [_dumps(body)])
+
+    async def _headers_refused(self, record: Recorded, version: str | None, send: Send) -> bool:
+        """HEADERS_BEFORE_AUTH: refuse what a server may refuse before it reads credentials. A
+        legacy server refuses a version it doesn't know (SPEC-1); a modern one, a request whose
+        ``_meta`` version or ``Mcp-Method`` disagrees with its headers (HeaderMismatch). A
+        notification is let through, as the SDK acknowledges one before that check."""
+        if record.method != "POST" or version is None:
+            return False
+        if self.fake.mode == "legacy":
+            if version in HANDSHAKE_PROTOCOL_VERSIONS:
+                return False
+            await _legacy_refusal(send)
+            return True
+        notification = isinstance(record.message, dict) and "id" not in record.message
+        if version not in MODERN_PROTOCOL_VERSIONS or notification:
+            return False
+        meta = record.params.get("_meta")
+        meta = meta if isinstance(meta, dict) else {}
+        if (
+            meta.get(types.PROTOCOL_VERSION_META_KEY) == version
+            and record.header("mcp-method") == record.rpc_method
+        ):
+            return False
+        rpc_id = record.message.get("id") if isinstance(record.message, dict) else None
+        error = _rpc_error(rpc_id, types.HEADER_MISMATCH, "Header mismatch")
+        await _respond(send, 400, JSON_HEADERS, [_dumps(error)])
+        return True
 
     async def _unsupported(self, record: Recorded, version: str | None, send: Send) -> None:
         requested = version or str(record.params.get("protocolVersion", ""))
