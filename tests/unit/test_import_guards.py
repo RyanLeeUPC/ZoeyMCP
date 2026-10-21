@@ -355,6 +355,20 @@ def test_the_launcher_uses_the_standard_library_only() -> None:
     assert found == []
 
 
+def test_netguard_uses_the_standard_library_only() -> None:
+    """The egress role imports it and nothing else (M7 design B.1). Checked here, not in
+    test_netguard.py, because mutmut runs that file against a mutated copy that imports mutmut."""
+    path = PACKAGE / "common" / "netguard.py"
+    names = list(imported_modules(path, module_name(path, PACKAGE.parent)))
+    assert names
+    found = [
+        name
+        for name in names
+        if (top := name.partition(".")[0]) not in sys.stdlib_module_names and top != "__future__"
+    ]
+    assert found == []
+
+
 # --- what importing it loads --------------------------------------------------------------------
 
 # Imports every module of the named packages (a missing package is skipped) in a fresh

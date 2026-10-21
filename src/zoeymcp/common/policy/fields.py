@@ -4,6 +4,9 @@ decisions M7 adds to the schema are tested without putting all of ``schema.py`` 
 - :func:`host_port_lower`: an ``egress_private`` entry is in lower case, since the egress role
   and the address guard compare entries as written (CR-13).
 - :func:`is_squid_acl_name`: a Squid source ACL name in ``egress_proxy_acls`` (OPS-7).
+- :func:`is_numeric_label` and :func:`is_mail_address`: the portal origin's last-label rule and a
+  connector's mail address, moved here so they are mutation-tested (COV-2) and whole-value
+  (D-138: ``$`` also matches before a final line break, so ``.match`` let one through).
 - :func:`endpoint_query` and :func:`check_endpoint_query`: the query a ``token_url`` or an
   ``authorize_url`` may carry (Q41). RFC 6749 3.1-3.2 say such a query MUST be kept when the
   client adds its parameters, so the vault keeps it byte for byte and puts its own after it; the
@@ -32,6 +35,10 @@ _QUERY = re.compile(r"(?:[A-Za-z0-9._~!()*+,=&:@/?-]|%[0-9A-Fa-f]{2})+")
 # The schema's QueryParam. A name is checked as written, so no escape can spell a reserved one.
 _QUERY_NAME = re.compile(r"[A-Za-z0-9._~-]{1,128}")
 _SQUID_ACL_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
+# A host label browsers parse as a number (WHATWG URL's "ends in a number"). netguard keeps a copy,
+# since the egress role may import only the standard library; test_netguard.py pins them equal.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+_ADDRESS = re.compile(r"[^@\s<>\"]{1,64}@[A-Za-z0-9.-]{1,253}")
 
 # The names the vault sets on a token request (protocol._build), resource (which onboarding sets),
 # and those that compete with the client authentication the vault sends (RFC 7521, RFC 7523).
@@ -80,6 +87,16 @@ def host_port_lower(value: str) -> str:
 
 def is_squid_acl_name(value: str) -> bool:
     return _SQUID_ACL_NAME.fullmatch(value) is not None
+
+
+def is_numeric_label(label: str) -> bool:
+    """Whether a host's label is one browsers read as a number (so the host is an IPv4 address)."""
+    return _NUMERIC_LABEL.fullmatch(label) is not None
+
+
+def is_mail_address(address: str) -> bool:
+    """The address part of a mailbox, as ``email.utils.parseaddr`` returns it."""
+    return _ADDRESS.fullmatch(address) is not None
 
 
 def endpoint_query(query: str) -> tuple[tuple[str, str], ...]:

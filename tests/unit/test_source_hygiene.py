@@ -77,3 +77,16 @@ def test_no_hidden_characters_in_the_repository() -> None:
                 name = unicodedata.name(char, "unnamed")
                 problems.append(f"{path.relative_to(ROOT)}:{line}: U+{ord(char):04X} {name}")
     assert problems == []
+
+
+def test_source_uses_fullmatch_not_match() -> None:
+    # "$" also matches before a final line break, so a whole-value check written with .match lets
+    # one through (register D-138). Every pattern under src/zoeymcp is used with fullmatch; this
+    # catches re.match( too. netguard's lookup is named listed for this reason (M7 design B.1).
+    package = ROOT / "src" / "zoeymcp"
+    found = []
+    for path in sorted(package.rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if ".match(" in line:
+                found.append(f"{path.relative_to(ROOT).as_posix()}:{number}")
+    assert found == []

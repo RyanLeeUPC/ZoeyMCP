@@ -40,9 +40,6 @@ _HOSTNAME = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
-# A host label browsers parse as a number (WHATWG URL's "ends in a number").
-_NUMERIC_LABEL = re.compile(r"^(?:[0-9]+|0x[0-9a-f]*)$")
-_ADDRESS = re.compile(r"^[^@\s<>\"]{1,64}@[A-Za-z0-9.-]{1,253}$")
 # One scope token: RFC 6749 NQCHAR (printable ASCII without space, double quote or backslash).
 _SCOPE_TOKEN = re.compile(r"^[\x21\x23-\x5B\x5D-\x7E]{1,256}$")
 MAX_SCOPES = 64
@@ -239,7 +236,7 @@ def _check_portal_origin(value: str) -> str:
     host = parts.hostname or ""
     # IPv6 is the only host with a colon, and browsers read a host whose last label is a number
     # as IPv4 (WHATWG URL: "1.2.3" and "0x7f.1" too).
-    if ":" in host or _NUMERIC_LABEL.match(host.rpartition(".")[2]):
+    if ":" in host or fields.is_numeric_label(host.rpartition(".")[2]):
         raise ValueError("passkeys don't work on IP addresses; use http://localhost:<port>")
     if host.endswith(".localhost"):
         raise ValueError("a name under localhost can't be a portal origin; use localhost itself")
@@ -253,7 +250,7 @@ def _check_portal_origin(value: str) -> str:
 def _check_mailbox(value: str, *, allow_display_name: bool) -> str:
     _no_line_breaks(value)
     name, address = parseaddr(value)
-    if not address or not _ADDRESS.match(address):
+    if not address or not fields.is_mail_address(address):
         raise ValueError(f"invalid email address {value!r}")
     if not allow_display_name and (name or value.strip() != address):
         raise ValueError("a bare address is required here, without a display name")

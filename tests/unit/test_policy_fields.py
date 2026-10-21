@@ -22,6 +22,8 @@ from zoeymcp.common.policy.fields import (
     check_endpoint_query,
     endpoint_query,
     host_port_lower,
+    is_mail_address,
+    is_numeric_label,
     is_squid_acl_name,
 )
 
@@ -102,6 +104,46 @@ def test_squid_acl_names(value: str, valid: bool) -> None:
 
 
 # --- the endpoint query ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("label", ["0", "42", "0177", "0x", "0x7f", "0xdeadbeef"])
+def test_a_numeric_label(label: str) -> None:
+    assert is_numeric_label(label)
+
+
+# Whole labels only: "42\n" is no number (the host syntax refuses the line break before this
+# rule runs, D-138), and neither is a label with a letter beside the digits.
+@pytest.mark.parametrize("label", ["", "42\n", "42a", "a42", "0x7g", "0X7f", "x7f", "example"])
+def test_not_a_numeric_label(label: str) -> None:
+    assert not is_numeric_label(label)
+
+
+@pytest.mark.parametrize(
+    "address", ["p@x.example", "a.b+c@x.example", "a" * 64 + "@x.example", "p@" + "x" * 253]
+)
+def test_a_mail_address(address: str) -> None:
+    assert is_mail_address(address)
+
+
+# A trailing line break is refused whole (D-138): $ also matches before a final "\n".
+@pytest.mark.parametrize(
+    "address",
+    [
+        "p@x.example\n",
+        "",
+        "@x.example",
+        "p@",
+        "p@@x.example",
+        "a" * 65 + "@x.example",
+        "p@" + "x" * 254,
+        "p q@x.example",
+        "<p>@x.example",
+        '"p"@x.example',
+        "p@x_y.example",
+    ],
+)
+def test_not_a_mail_address(address: str) -> None:
+    assert not is_mail_address(address)
 
 
 @pytest.mark.parametrize(

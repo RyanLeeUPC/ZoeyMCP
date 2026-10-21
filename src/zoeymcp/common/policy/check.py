@@ -94,7 +94,7 @@ _TOKEN_HEADERS = frozenset(
     }
 )
 # An absolute URI without a fragment (RFC 8707 section 2), in any scheme.
-_RESOURCE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:[^#\x00-\x20\x7f]+$")
+_RESOURCE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:[^#\x00-\x20\x7f]+")
 _DEFAULT_PORTS = {"https": 443, "http": 80}
 # The two endpoints of an SMTP connector route, as (method, path).
 _CONNECTOR_ENDPOINTS = frozenset({("GET", "/config"), ("POST", "/send")})
@@ -560,7 +560,7 @@ def _check_resources(path: str, cred: OAuth2Credential, origins: set[str], repor
         ("authorize_params", cred.authorize_params),
     ):
         for value in param_values(params.get("resource", [])):
-            if not _RESOURCE.match(value):
+            if not _RESOURCE.fullmatch(value):
                 report.error(
                     f"{path}.{field}.resource",
                     f"{value!r} must be an absolute URI without a fragment (RFC 8707)",

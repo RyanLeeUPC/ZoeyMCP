@@ -168,6 +168,60 @@ def test_a_trailing_line_break_is_not_part_of_a_host(example_raw: Raw) -> None:
     assert any(e.startswith(expected) for e in schema_errors(raw))
 
 
+# D-138's forward rule (M7 step 2, BP-11): every whole-value pattern is used with fullmatch, so a
+# trailing line break, which "$" lets through to .match, is refused. The schema refuses line
+# breaks first today, so each row is refused at the schema and the last test reaches check's rule
+# past it.
+LINE_BREAK_RESOURCE = "https://api.example/mcp"
+
+
+def test_a_trailing_line_break_in_a_connector_address(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["connectors"]["mail-out"]["to"] = ["partner@x.example"]
+    assert errors(run(raw)) == []
+    raw["connectors"]["mail-out"]["to"] = ["partner@x.example\n"]
+    expected = "connectors.mail-out.to: Value error, line breaks and NUL are not allowed"
+    assert any(e.startswith(expected) for e in schema_errors(raw))
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://vault.42", "passkeys don't work on IP addresses"),
+        ("https://vault.42\n", "line breaks and NUL are not allowed"),
+    ],
+)
+def test_a_numeric_last_label_in_a_portal_origin(
+    example_raw: Raw, origin: str, expected: str
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["admin"]["origins"] = ["http://localhost:8081", "https://vault.example"]
+    assert admin_findings(raw) == []
+    raw["admin"]["origins"] = ["http://localhost:8081", origin]
+    found = schema_errors(raw)
+    assert any(e.startswith(f"admin.origins: Value error, {expected}") for e in found), found
+
+
+def test_a_trailing_line_break_in_an_extra_params_resource() -> None:
+    accepted = oauth_policy({"o": oauth(extra_params={"resource": LINE_BREAK_RESOURCE})})
+    assert errors(run(accepted)) == []
+    raw = oauth_policy({"o": oauth(extra_params={"resource": LINE_BREAK_RESOURCE + "\n"})})
+    expected = "credentials.o.oauth2.extra_params: Value error, line breaks and NUL are not allowed"
+    assert any(e.startswith(expected) for e in schema_errors(raw))
+
+
+def test_check_refuses_a_trailing_line_break_in_a_resource_past_the_schema() -> None:
+    policy = parse_policy(yaml.safe_dump(oauth_policy({"o": oauth()})), "test")
+    cred = policy.credentials["o"]
+    assert isinstance(cred, OAuth2Credential)
+    for value, refused in ((LINE_BREAK_RESOURCE, False), (LINE_BREAK_RESOURCE + "\n", True)):
+        bad = cred.model_copy(update={"extra_params": {"resource": value}})
+        found = check_policy(policy.model_copy(update={"credentials": {"o": bad}}))
+        message = f"{value!r} must be an absolute URI without a fragment (RFC 8707)"
+        finding = Finding("credentials.o.extra_params.resource", "error", message)
+        assert (finding in found) is refused
+
+
 def test_yaml_problems_are_policy_errors() -> None:
     with pytest.raises(PolicyError) as info:
         parse_policy("version: 1\nversion: 1\n", "test")
