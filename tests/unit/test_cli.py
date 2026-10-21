@@ -22,18 +22,26 @@ from zoeymcp.cli.main import (
     EXIT_UNREADABLE,
     GATEWAY_ENVIRONMENT,
     NOT_PERSISTED,
+    counted,
+    dollar_flags,
     duration,
     exec_gateway_environment,
     format_status,
     gateway_command,
     health_action,
+    listed,
     main,
+    merge_summary,
     new_client_token,
 )
 from zoeymcp.common import egresslist, netguard
-from zoeymcp.common.policy import parse_policy
+from zoeymcp.common.policy import Finding, parse_policy
+from zoeymcp.common.policy import change as policy_change
+from zoeymcp.common.policy import emit as policy_emit
+from zoeymcp.common.yamlload import load_mapping
 
 from .conftest import EXAMPLE_POLICY
+from .test_policy_change import notes_change, review_change
 
 
 def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
@@ -357,6 +365,327 @@ def test_emit_the_example_policy() -> None:
         "vault mcp.broker.example:443",
         "vault smtp.mail.example:465",
     ]
+
+
+# --- check --with (M7 design H.4, E.5; GR-1, OPS-6, OPS-17, TI-1) -------------------------------
+
+PIN_C = "sha256:" + "c" * 64
+
+
+def fragment_file(tmp_path: Path, text: str, name: str = "onboard-notes-1.yaml") -> str:
+    path = tmp_path / name
+    path.write_bytes(text.encode("utf-8"))
+    return str(path)
+
+
+def notes_fragment(tmp_path: Path) -> str:
+    return fragment_file(tmp_path, policy_emit.emit(notes_change(private=False)))
+
+
+ADDS_NOTES = (
+    "with onboard-notes-1.yaml merged: 0 errors, 2 warnings; it adds credentials.notes, routes "
+    "notes and gateway.servers.notes and changes nothing that exists"
+)
+
+
+def test_check_with_a_policy_file(tmp_path: Path) -> None:
+    fragment = notes_fragment(tmp_path)
+    code, out, err = cli(["check", "--config", str(EXAMPLE_POLICY), "--with", fragment])
+    assert (code, err) == (EXIT_OK, "")
+    size = len(EXAMPLE_POLICY.read_bytes())
+    lines = out.splitlines()
+    assert lines[0] == f"policy from {EXAMPLE_POLICY}, {size:,} bytes"
+    assert lines[1] == ADDS_NOTES
+    assert lines[-1] == (
+        f"{EXAMPLE_POLICY} with onboard-notes-1.yaml merged: ok (0 error(s), 2 warning(s))"
+    )
+    assert "warning gateway.servers.notes: not assigned to any client" in lines
+
+
+def test_check_with_stdin(tmp_path: Path, example_text: str) -> None:
+    fragment = notes_fragment(tmp_path)
+    code, out, _ = cli(["check", "--config", "-", "--with", fragment], io.StringIO(example_text))
+    assert code == EXIT_OK
+    assert out.splitlines()[0] == f"policy from <stdin>, {len(example_text.encode()):,} bytes"
+    assert out.splitlines()[1] == ADDS_NOTES
+
+
+def test_check_with_the_inline_policy(
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """J1's line: the one-off run reads the service's own ZOEYMCP_CONFIG."""
+    monkeypatch.setenv("ZOEYMCP_CONFIG", example_text)
+    code, out, _ = cli(["check", "--with", notes_fragment(tmp_path)])
+    assert code == EXIT_OK
+    lines = out.splitlines()
+    assert lines[0] == f"policy from ZOEYMCP_CONFIG, {len(example_text.encode()):,} bytes"
+    assert lines[1] == ADDS_NOTES
+    assert lines[-1] == (
+        "$ZOEYMCP_CONFIG with onboard-notes-1.yaml merged: ok (0 error(s), 2 warning(s))"
+    )
+
+
+INLINE_NOTE = (
+    "zoeymcp check: ZOEYMCP_CONFIG is read as compose substituted it, so a value it took from a "
+    "variable (gateway_key_generation, the portal's origin port) is printed as its current "
+    "value; restore each ${...} reference before replacing the block"
+)
+
+
+def test_print_merged_of_the_inline_policy_says_compose_substituted_it(
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E.5's "replace the whole block": compose has already written its variables' values, so
+    stderr says to restore the ${...} references (operations.md's gateway-key rotation)."""
+    monkeypatch.setenv("ZOEYMCP_CONFIG", example_text)
+    code, out, err = cli(["check", "--with", notes_fragment(tmp_path), "--print-merged"])
+    assert code == EXIT_OK
+    assert out
+    assert err.splitlines()[-1] == INLINE_NOTE
+    # A file or stdin is the operator's own text, read as written: no such note.
+    fragment = notes_fragment(tmp_path)
+    code, _, err = cli(
+        ["check", "--config", str(EXAMPLE_POLICY), "--with", fragment, "--print-merged"]
+    )
+    assert code == EXIT_OK
+    assert INLINE_NOTE not in err
+
+
+def test_check_with_two_fragments_lists_what_each_replaces(tmp_path: Path) -> None:
+    first = notes_fragment(tmp_path)
+    second = fragment_file(tmp_path, policy_emit.emit(review_change()), "review-2.yaml")
+    code, out, _ = cli(
+        ["check", "--config", str(EXAMPLE_POLICY), "--with", first, "--with", second]
+    )
+    assert code == EXIT_OK
+    assert out.splitlines()[1] == (
+        "with onboard-notes-1.yaml and review-2.yaml merged: 0 errors, 2 warnings; it adds "
+        "credentials.notes, routes notes and gateway.servers.notes and replaces "
+        "gateway.servers.broker-read.tools and gateway.servers.broker-read.review"
+    )
+
+
+def test_check_with_merges_a_review_as_the_vault_does(tmp_path: Path) -> None:
+    """The header's replace paths: the dropped tool's pin goes (CR-14), so --print-merged holds
+    exactly the vault's merged policy."""
+    fragment = fragment_file(tmp_path, policy_emit.emit(review_change()), "review-2.yaml")
+    code, out, err = cli(
+        ["check", "--config", str(EXAMPLE_POLICY), "--with", fragment, "--print-merged"]
+    )
+    assert code == EXIT_OK
+    assert "list_positions" not in out
+    merged = parse_policy(out, "merged")
+    assert merged == policy_change.apply(
+        parse_policy(EXAMPLE_POLICY.read_text(), "x"), review_change()
+    )
+    assert err.splitlines()[1] == (
+        "with review-2.yaml merged: 0 errors, 1 warning; it adds nothing and replaces "
+        "gateway.servers.broker-read.tools and gateway.servers.broker-read.review"
+    )
+    assert err.splitlines()[-1] == (
+        "zoeymcp check: the merged policy is printed whole, so the comments of the policy and "
+        "the fragments are dropped"
+    )
+
+
+def test_print_merged_writes_the_whole_merged_policy(tmp_path: Path, example_raw: Any) -> None:
+    code, out, err = cli(
+        [
+            "check",
+            "--config",
+            str(EXAMPLE_POLICY),
+            "--with",
+            notes_fragment(tmp_path),
+            "--print-merged",
+        ]
+    )
+    assert code == EXIT_OK
+    assert out == policy_emit.document(load_mapping(out))
+    loaded = load_mapping(out)
+    assert loaded["credentials"]["music-stats"] == example_raw["credentials"]["music-stats"]
+    assert loaded["credentials"]["notes"] == notes_change().data()["credentials"]["notes"]
+    assert ADDS_NOTES in err
+    assert err.splitlines()[0].startswith("policy from ")
+
+
+@pytest.mark.parametrize(
+    ("flags", "spaces"), [(["--indent", "4"], 4), (["--for", "compose"], 8), ([], 0)]
+)
+def test_print_merged_indents_and_takes_the_compose_form(
+    tmp_path: Path, flags: list[str], spaces: int
+) -> None:
+    policy = (
+        "version: 1\nmode: declarative\ncredentials:\n"
+        '  a: {kind: header, secret: "store:a", format: "Bearer {secret} $X"}\n'
+    )
+    fragment = fragment_file(tmp_path, "{}\n")
+    code, out, _ = cli(
+        ["check", "--config", "-", "--with", fragment, "--print-merged", *flags],
+        io.StringIO(policy),
+    )
+    assert code == EXIT_OK
+    assert out.splitlines()[0] == " " * spaces + "version: 1"
+    dollar = "$$X" if flags == ["--for", "compose"] else "$X"
+    assert f'format: "Bearer {{secret}} {dollar}"' in out
+
+
+def test_a_dollar_in_a_fragment_is_a_warning_with_its_line(tmp_path: Path) -> None:
+    fragment = fragment_file(
+        tmp_path, '# zoeymcp: t\negress_private: ["a.lan.example:443"]\n# $ZOEYMCP_MASTER_KEY\n'
+    )
+    code, out, _ = cli(["check", "--config", str(EXAMPLE_POLICY), "--with", fragment])
+    assert code == EXIT_OK
+    assert (
+        f"warning {fragment} line 3: holds a $, which compose reads as a variable in an inline "
+        "ZOEYMCP_CONFIG; merge the compose form (--for compose) there"
+    ) in out.splitlines()
+    assert dollar_flags("f", "a\nb$\n$c$") == [
+        Finding("f line 2", "warning", dollar_flags("f", "$")[0].message),
+        Finding("f line 3", "warning", dollar_flags("f", "$")[0].message),
+    ]
+
+
+def test_check_with_errors_in_the_merged_policy_exits_1(tmp_path: Path) -> None:
+    # A server on a route that doesn't exist: a check error.
+    server = '{"gateway": {"servers": {"orphan": {"kind": "remote", "route": "absent"}}}}\n'
+    code, out, _ = cli(
+        ["check", "--config", str(EXAMPLE_POLICY), "--with", fragment_file(tmp_path, server)]
+    )
+    assert code == EXIT_FINDINGS
+    assert out.splitlines()[1].startswith("with onboard-notes-1.yaml merged: 1 error, ")
+    assert out.splitlines()[-1].endswith("merged: FAILED (1 error(s), 2 warning(s))")
+
+
+def test_print_merged_prints_nothing_for_a_merged_policy_with_errors(tmp_path: Path) -> None:
+    server = '{"gateway": {"servers": {"orphan": {"kind": "remote", "route": "absent"}}}}\n'
+    fragment = fragment_file(tmp_path, server)
+    code, out, err = cli(
+        ["check", "--config", str(EXAMPLE_POLICY), "--with", fragment, "--print-merged"]
+    )
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert "FAILED" in err
+
+
+def test_check_with_a_schema_error_exits_1(tmp_path: Path) -> None:
+    fragment = fragment_file(tmp_path, "credentials: {notes: {kind: oauth2}}\n")
+    code, out, _ = cli(["check", "--config", str(EXAMPLE_POLICY), "--with", fragment])
+    assert code == EXIT_FINDINGS
+    # What the fragment added is said before the schema's findings too (H.4).
+    lines = out.splitlines()
+    assert lines[1] == (
+        "with onboard-notes-1.yaml merged: 2 errors, 0 warnings; it adds credentials.notes and "
+        "changes nothing that exists"
+    )
+    assert "error   credentials.notes.oauth2.token_url: Field required" in out
+    assert lines[-1].startswith(f"{EXAMPLE_POLICY} with onboard-notes-1.yaml merged: ")
+
+
+def test_check_with_a_conflicting_route_exits_1(tmp_path: Path) -> None:
+    route = '{"routes": [{"name": "stats", "prefix": "/other"}]}\n'
+    code, out, _ = cli(
+        ["check", "--config", str(EXAMPLE_POLICY), "--with", fragment_file(tmp_path, route)]
+    )
+    assert code == EXIT_FINDINGS
+    assert "error   routes stats: route stats is in the policy already" in out
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("a: 1\na: 2\n", "duplicate key 'a'"),
+        ("[1]\n", "the top level must be a mapping"),
+        ("# zoeymcp replace: routes\n{}\n", "the header names routes, which a fragment can't"),
+    ],
+)
+def test_check_with_a_fragment_that_wont_load_exits_1(
+    tmp_path: Path, text: str, message: str
+) -> None:
+    fragment = fragment_file(tmp_path, text)
+    code, out, _ = cli(["check", "--config", str(EXAMPLE_POLICY), "--with", fragment])
+    assert code == EXIT_FINDINGS
+    assert message in out
+    assert out.splitlines()[-1].startswith(f"{fragment}: FAILED")
+
+
+def test_check_with_a_base_that_wont_load_exits_1(tmp_path: Path) -> None:
+    code, out, _ = cli(
+        ["check", "--config", "-", "--with", notes_fragment(tmp_path)], io.StringIO("a: [\n")
+    )
+    assert code == EXIT_FINDINGS
+    assert out.splitlines()[-1] == "<stdin>: FAILED (1 error(s), 0 warning(s))"
+
+
+def test_check_with_unreadable_files_exits_2(tmp_path: Path) -> None:
+    code, out, err = cli(["check", "--config", str(EXAMPLE_POLICY), "--with", str(tmp_path / "x")])
+    assert code == EXIT_UNREADABLE
+    assert err.startswith(f"zoeymcp check: can't read {tmp_path / 'x'}: ")
+    code, out, _ = cli(["check", "--config", str(tmp_path / "x"), "--with", str(tmp_path / "y")])
+    assert code == EXIT_UNREADABLE
+    assert "can't read" in out
+
+
+def test_check_with_as_json_keeps_stdout_one_document(tmp_path: Path) -> None:
+    code, out, err = cli(
+        [
+            "check",
+            "--config",
+            str(EXAMPLE_POLICY),
+            "--with",
+            notes_fragment(tmp_path),
+            "--format",
+            "json",
+        ]
+    )
+    assert code == EXIT_OK
+    report = json.loads(out)
+    assert (report["ok"], report["errors"], report["warnings"]) == (True, 0, 2)
+    assert err.splitlines()[1] == ADDS_NOTES
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (["--print-merged"], "--print-merged goes with --with"),
+        (["--indent", "2"], "--indent and --for go with --print-merged"),
+        (["--for", "compose"], "--indent and --for go with --print-merged"),
+        (
+            ["--with", "f", "--emit-egress-allowlist"],
+            "--with and --emit-egress-allowlist are separate",
+        ),
+        (["--with", "f", "--print-merged", "--indent", "17"], "--indent is 0 to 16"),
+        (["--with", "f", "--print-merged", "--indent", "-1"], "--indent is 0 to 16"),
+    ],
+)
+def test_check_with_usage_errors(flags: list[str], message: str) -> None:
+    code, out, err = cli(["check", "--config", str(EXAMPLE_POLICY), *flags])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err == f"zoeymcp check: {message}\n" or message in err
+
+
+def test_indent_and_for_compose_exclude_each_other() -> None:
+    with pytest.raises(SystemExit) as info:
+        cli(["check", "--with", "f", "--print-merged", "--indent", "2", "--for", "compose"])
+    assert info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("items", "said"),
+    [([], ""), (["a"], "a"), (["a", "b"], "a and b"), (["a", "b", "c"], "a, b and c")],
+)
+def test_listed(items: list[str], said: str) -> None:
+    assert listed(items) == said
+
+
+def test_counted_and_merge_summary() -> None:
+    assert (counted(0, "error"), counted(1, "error"), counted(2, "warning")) == (
+        "0 errors",
+        "1 error",
+        "2 warnings",
+    )
+    assert merge_summary([], []) == "it adds nothing and changes nothing that exists"
+    assert merge_summary([("routes", "a")], [("credentials", "b")]) == (
+        "it adds routes a and replaces credentials.b"
+    )
 
 
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:

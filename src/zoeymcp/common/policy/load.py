@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from pydantic import ValidationError
 
@@ -59,6 +59,11 @@ def parse_policy(text: str, source: str) -> Policy:
         raw = load_mapping(text)
     except YAMLRejected as exc:
         raise PolicyError(source, [Finding("(document)", "error", str(exc))]) from exc
+    return validate_policy(raw, source)
+
+
+def validate_policy(raw: Mapping[str, Any], source: str) -> Policy:
+    """Schema-validate a policy document already loaded (``check --with``'s merged one)."""
     try:
         return Policy.model_validate(raw)
     except ValidationError as exc:

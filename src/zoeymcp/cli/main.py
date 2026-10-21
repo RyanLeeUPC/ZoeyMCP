@@ -26,7 +26,11 @@ from ..common.policy import (
     parse_policy,
     read_source,
 )
+from ..common.policy import emit as policy_emit
+from ..common.policy import merge as policy_merge
+from ..common.policy.load import validate_policy
 from ..common.policy.schema import hash_token
+from ..common.yamlload import load_mapping
 
 # The vault's code is imported in the handlers that use it: ``python -m zoeymcp gateway`` runs
 # this module in the gateway's process, which loads none of it.
@@ -81,7 +85,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Validate a policy document: its schema, cross-references and security rules. "
             f"Reads --config <file>, --config - (stdin) or ${CONFIG_ENV}. With "
             "--emit-egress-allowlist, print the destinations an egress proxy must allow for it "
-            "instead, and the findings on stderr."
+            "instead, and the findings on stderr. With --with, check the policy with each "
+            "fragment merged as the vault merges it."
         ),
     )
     check.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
@@ -113,6 +118,32 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="compare",
         metavar="FILE",
         help="with --emit-egress-allowlist: compare FILE with the output; exit 1 if it differs",
+    )
+    check.add_argument(
+        "--with",
+        dest="fragments",
+        action="append",
+        default=[],
+        metavar="FRAGMENT",
+        help="merge this fragment file into the policy first (repeatable)",
+    )
+    check.add_argument(
+        "--print-merged",
+        action="store_true",
+        help="with --with: print the merged policy as YAML (comments dropped), findings on stderr",
+    )
+    layout = check.add_mutually_exclusive_group()
+    layout.add_argument(
+        "--indent",
+        type=int,
+        metavar="N",
+        help=f"with --print-merged: indent every line N spaces (0 to {policy_emit.INDENT_MAX})",
+    )
+    layout.add_argument(
+        "--for",
+        dest="target",
+        choices=("compose",),
+        help="with --print-merged: the compose form, indented 8 with every $ written $$",
     )
 
     commands.add_parser(
@@ -1410,6 +1441,20 @@ def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     if args.squid_src and (args.allowlist_format or "text") != "squid":
         err.write("zoeymcp check: --squid-src goes with --allowlist-format squid\n")
         return EXIT_UNREADABLE
+    if (args.indent is not None or args.target) and not args.print_merged:
+        err.write("zoeymcp check: --indent and --for go with --print-merged\n")
+        return EXIT_UNREADABLE
+    if args.print_merged and not args.fragments:
+        err.write("zoeymcp check: --print-merged goes with --with\n")
+        return EXIT_UNREADABLE
+    if args.fragments and emit:
+        err.write("zoeymcp check: --with and --emit-egress-allowlist are separate runs\n")
+        return EXIT_UNREADABLE
+    if args.indent is not None and not 0 <= args.indent <= policy_emit.INDENT_MAX:
+        err.write(f"zoeymcp check: --indent is 0 to {policy_emit.INDENT_MAX}\n")
+        return EXIT_UNREADABLE
+    if args.fragments:
+        return _check_with(args, stdin, out, err)
     # A value's shape is a usage error whatever the policy holds, so it is checked before the
     # policy is read; whether SOURCE is one of the policy's sources waits for derive's lists.
     for item in args.squid_src:
@@ -1433,6 +1478,130 @@ def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     if any(f.level == "error" for f in findings):
         return EXIT_FINDINGS
     return _emit_egress_allowlist(args, policy, out, err) if emit else EXIT_OK
+
+
+def _check_with(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    """``check --with`` (M7 design H.4, GR-1): the policy with each fragment merged by the
+    function the vault runs, then checked; with ``--print-merged``, the merged policy."""
+    # stdout holds the merged policy with --print-merged, and one JSON document with --format
+    # json; the findings, and the lines about the source and the merge, go to stderr then.
+    findings_out = err if args.print_merged else out
+    notes = err if args.print_merged or args.format == "json" else out
+    try:
+        text, source = read_source(args.config, os.environ, stdin)
+    except PolicyError as exc:
+        _report(exc.source, exc.findings, args.format, findings_out, readable=exc.readable)
+        return EXIT_UNREADABLE
+    # Which policy was read, so a check against the wrong base shows (OPS-17).
+    notes.write(f"policy from {source.removeprefix('$')}, {len(text.encode()):,} bytes\n")
+    try:
+        data = load_mapping(text)
+    except ValueError as exc:
+        _report(source, [Finding("(document)", "error", str(exc))], args.format, findings_out)
+        return EXIT_FINDINGS
+    flags: list[Finding] = []
+    added: list[policy_merge.Path] = []
+    replaced: list[policy_merge.Path] = []
+    for name in args.fragments:
+        try:
+            fragment_text = Path(name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            err.write(f"zoeymcp check: can't read {name}: {exc}\n")
+            return EXIT_UNREADABLE
+        flags += dollar_flags(name, fragment_text)
+        try:
+            fragment = load_mapping(fragment_text)
+            replace = policy_merge.replace_paths(fragment_text)
+        except ValueError as exc:
+            _report(name, [Finding("(document)", "error", str(exc))], args.format, findings_out)
+            return EXIT_FINDINGS
+        merged = policy_merge.merge(data, fragment, replace=replace)
+        if isinstance(merged, policy_merge.MergeConflict):
+            found = Finding(policy_merge.describe(merged.path), "error", merged.message)
+            _report(name, [found], args.format, findings_out)
+            return EXIT_FINDINGS
+        data = merged.data
+        added += merged.added
+        replaced += merged.replaced
+    names = listed([Path(name).name for name in args.fragments])
+    label = f"{source} with {names} merged"
+    try:
+        policy = validate_policy(data, label)
+    except PolicyError as exc:
+        # What the fragments added or replaced helps most when the result doesn't load.
+        findings = flags + exc.findings
+        notes.write(merge_line(names, findings, added, replaced))
+        _report(exc.source, findings, args.format, findings_out)
+        return EXIT_FINDINGS
+    findings = flags + check_policy(policy, environ=os.environ if args.resolve_env else None)
+    notes.write(merge_line(names, findings, added, replaced))
+    _report(label, findings, args.format, findings_out)
+    if any(f.level == "error" for f in findings):
+        return EXIT_FINDINGS
+    if args.print_merged:
+        err.write(
+            "zoeymcp check: the merged policy is printed whole, so the comments of the policy "
+            "and the fragments are dropped\n"
+        )
+        if args.config is None:
+            # Compose substituted the inline policy's variables before the vault read it.
+            err.write(
+                f"zoeymcp check: {CONFIG_ENV} is read as compose substituted it, so a value it "
+                "took from a variable (gateway_key_generation, the portal's origin port) is "
+                "printed as its current value; restore each ${...} reference before replacing "
+                "the block\n"
+            )
+        target: policy_emit.Target = args.target or "plain"
+        out.write(policy_emit.document(data, indent=args.indent or 0, target=target))
+    return EXIT_OK
+
+
+def dollar_flags(name: str, text: str) -> list[Finding]:
+    """A warning for each line of a fragment holding a ``$``, which compose would read as a
+    variable in an inline ``ZOEYMCP_CONFIG`` (TI-1)."""
+    return [
+        Finding(
+            f"{name} line {number}",
+            "warning",
+            "holds a $, which compose reads as a variable in an inline ZOEYMCP_CONFIG; merge "
+            "the compose form (--for compose) there",
+        )
+        for number, line in enumerate(text.splitlines(), start=1)
+        if "$" in line
+    ]
+
+
+def merge_line(
+    names: str,
+    findings: Sequence[Finding],
+    added: Sequence[policy_merge.Path],
+    replaced: Sequence[policy_merge.Path],
+) -> str:
+    """``check --with``'s line before the findings: their counts, and what the fragments did."""
+    errors = sum(1 for f in findings if f.level == "error")
+    return (
+        f"with {names} merged: {counted(errors, 'error')}, "
+        f"{counted(len(findings) - errors, 'warning')}; {merge_summary(added, replaced)}\n"
+    )
+
+
+def merge_summary(added: Sequence[policy_merge.Path], replaced: Sequence[policy_merge.Path]) -> str:
+    """What the fragments add and replace, as ``check --with`` says it."""
+    adds = listed([policy_merge.describe(path) for path in added]) or "nothing"
+    if not replaced:
+        return f"it adds {adds} and changes nothing that exists"
+    return f"it adds {adds} and replaces {listed([policy_merge.describe(p) for p in replaced])}"
+
+
+def listed(items: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``; nothing for no items."""
+    if len(items) < 2:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def counted(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def _emit_egress_allowlist(

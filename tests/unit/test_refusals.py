@@ -2,7 +2,8 @@
 
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
 ``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
-literal discovery ``Refusal`` reason), so a reason added there without a sentence here fails.
+literal discovery ``Refusal`` and policy ``ChangeRefused`` reason), so a reason added there without
+a sentence here fails.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import get_args
 
 import pytest
 
+from zoeymcp.common.policy import change
 from zoeymcp.common.textrules import find_violations
 from zoeymcp.portal import passkeys, webauthn
 from zoeymcp.portal.refusals import (
@@ -121,6 +123,8 @@ DISCOVERY = {
     "pkce_unsupported": 502,
     "code_flow_unsupported": 502,
 }
+# M7's M.2: a policy change's refusals (M7 step 7).
+CHANGE = {"name_taken": 409, "diff_invalid": 422}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -179,6 +183,8 @@ FIELDS = {
     "as_choice_needed": {"issuers"},
     "as_unknown": {"issuers"},
     "as_metadata_invalid": {"detail"},
+    "name_taken": {"name"},
+    "diff_invalid": {"detail"},
 }
 
 
@@ -225,7 +231,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
-    expected |= EXTRA | DISCOVERY
+    expected |= EXTRA | DISCOVERY | CHANGE
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -322,6 +328,14 @@ def test_every_discovery_reason_is_catalogued() -> None:
     found = literal_reasons(discovery, "Refusal")
     assert found == set(get_args(discovery.Reason))
     assert found == set(DISCOVERY)
+    assert found <= set(CATALOGUE)
+
+
+def test_every_change_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to a policy change's refusals (H.1)."""
+    found = literal_reasons(change, "ChangeRefused")
+    assert found == set(get_args(change.Reason))
+    assert found == set(CHANGE)
     assert found <= set(CATALOGUE)
 
 

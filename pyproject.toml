@@ -141,6 +141,9 @@ only_mutate = [
     "*zoeymcp/common/policy/callback.py",
     "*zoeymcp/common/policy/match.py",
     "*zoeymcp/common/policy/view.py",
+    "*zoeymcp/common/policy/change.py",
+    "*zoeymcp/common/policy/emit.py",
+    "*zoeymcp/common/policy/merge.py",
     "*zoeymcp/gateway/pins.py",
     "*zoeymcp/gateway/findings.py",
     "*zoeymcp/gateway/schemas.py",
@@ -195,3 +198,4 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.common.policy.fields" = 95
 "zoeymcp.common.netguard" = 95
 "zoeymcp.common.egresslist" = 95
+"zoeymcp.vault.oauth.discovery" = 95

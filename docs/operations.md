@@ -1441,6 +1441,8 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 502 | `as_issuer_mismatch` | The authorization server's metadata names another issuer than the one it was fetched for, so it isn't used (RFC 8414). |
 | 502 | `pkce_unsupported` | The authorization server doesn't advertise PKCE with S256, which MCP requires. |
 | 502 | `code_flow_unsupported` | The authorization server doesn't advertise the authorization code flow. |
+| 409 | `name_taken` | The policy or the vault's store already has `<name>`. Choose another name. |
+| 422 | `diff_invalid` | The running policy with this change merged fails check (`<detail>`), so no fragment is shown. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

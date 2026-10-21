@@ -289,6 +289,15 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "code_flow_unsupported": Entry(
             502, "The authorization server doesn't advertise the authorization code flow."
         ),
+        # A change to the policy (M7 H.1; common/policy/change.py).
+        "name_taken": Entry(
+            409, "The policy or the vault's store already has {name}. Choose another name."
+        ),
+        "diff_invalid": Entry(
+            422,
+            "The running policy with this change merged fails check ({detail}), so no fragment "
+            "is shown.",
+        ),
     }
 )
 
