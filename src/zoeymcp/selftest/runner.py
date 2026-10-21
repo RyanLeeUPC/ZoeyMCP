@@ -6,7 +6,9 @@ have been sent (and that a refused request sent nothing). Token endpoints are pl
 :class:`TokenEcho`, through the same in-process transport: there is no network transport at all,
 so a self-test can never refresh a real token. SMTP connectors send to :class:`SendRecorder`,
 which opens no socket: a self-test never sends mail (M4 design J.8). Each run starts with an
-empty send journal, so the cases see the same keys and limits every time.
+empty send journal, so the cases see the same keys and limits every time. Every destination the
+vault reaches in a case, upstream, token endpoint or mail server, must be in the vault's list
+from ``egresslist.derive``, the one an egress proxy is given (M7 design I.2, fold-in C32).
 
 ``--mutate`` then breaks the policy one rule at a time (wider methods, wider paths, a dropped
 constraint, pin or forced parameter, a deleted rule) and reruns the cases. A mutant no case
@@ -30,6 +32,7 @@ import httpx
 from pydantic import ValidationError
 from starlette.types import Receive, Scope, Send
 
+from ..common import egresslist, netguard
 from ..common.policy.check import secret_references
 from ..common.policy.schema import (
     BasicCredential,
@@ -53,6 +56,7 @@ from .cases import Case, CaseFile, PlaceholderPresent
 from .echo import EchoUpstream, Received, TokenClient, TokenEcho
 
 ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 @dataclass
@@ -60,6 +64,8 @@ class SendRecorder:
     """The SMTP transport of a self-test: it records the send and answers 250."""
 
     sends: list[tuple[str, list[str], bytes]] = field(default_factory=list)
+    # The host:port of every connection a send would open.
+    reached: list[str] = field(default_factory=list)
 
     def __call__(
         self,
@@ -73,6 +79,7 @@ class SendRecorder:
         data: bytes,
         tls: ssl.SSLContext,
     ) -> SendResult:
+        self.reached.append(netguard.entry_key(connector.host, connector.port))
         self.sends.append((sender, recipients, data))
         return SendResult("final_reply", final_dot_written=True, reply_code=250)
 
@@ -130,8 +137,14 @@ class Rig:
     async def run(self, policy: Policy, cases: CaseFile) -> list[CaseResult]:
         echo = EchoUpstream()
         tokens = TokenEcho(self.token_clients(policy))
+        allowed = {
+            netguard.entry_key(d.host, d.port) for d in egresslist.derive(policy)[egresslist.VAULT]
+        }
+        reached: list[str] = []
 
         async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] == "http":
+                reached.append(_destination(scope))
             # Token calls never show in echo.received, so "1 upstream request" still holds.
             if scope["type"] == "http" and tokens.handles(scope):
                 await tokens(scope, receive, send)
@@ -158,13 +171,22 @@ class Rig:
             try:
                 for case in cases.cases:
                     before, sends_before = len(echo.received), len(recorder.sends)
+                    reached_before, mailed_before = len(reached), len(recorder.reached)
                     response = await self._send(app, policy, case)
                     received = echo.received[before:]
                     if _is_connector(policy, case.request.path):
                         sends = len(recorder.sends) - sends_before
-                        results.append(_evaluate_connector(case, response, received, sends))
+                        result = _evaluate_connector(case, response, received, sends)
                     else:
-                        results.append(self._evaluate(policy, case, response, received, tokens))
+                        result = self._evaluate(policy, case, response, received, tokens)
+                    connected = reached[reached_before:] + recorder.reached[mailed_before:]
+                    result.problems += [
+                        f"the vault connected to {key}, which the egress allowlist derived "
+                        "from the policy doesn't name"
+                        for key in dict.fromkeys(connected)
+                        if key not in allowed
+                    ]
+                    results.append(result)
             finally:
                 await app.aclose()
         return results
@@ -289,6 +311,12 @@ class Rig:
     def _any_secret_in(self, got: Received, tokens: TokenEcho) -> bool:
         haystack = got.path + repr(got.query) + repr(got.headers) + got.body.decode("latin-1")
         return any(value in haystack for value in [*self.values.values(), *tokens.issued])
+
+
+def _destination(scope: Scope) -> str:
+    """The ``host:port`` an ASGI request was sent to, the default port written out."""
+    host, port = scope["server"]
+    return netguard.entry_key(host, port or _DEFAULT_PORTS[scope["scheme"]])
 
 
 def _is_connector(policy: Policy, path: str) -> bool:

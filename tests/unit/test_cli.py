@@ -30,6 +30,8 @@ from zoeymcp.cli.main import (
     main,
     new_client_token,
 )
+from zoeymcp.common import egresslist, netguard
+from zoeymcp.common.policy import parse_policy
 
 from .conftest import EXAMPLE_POLICY
 
@@ -99,6 +101,262 @@ def test_no_policy_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
     code, out = run(["check"])
     assert code == EXIT_UNREADABLE
     assert "no policy given" in out
+
+
+# --- check --emit-egress-allowlist (M7 design I.6, J5) ------------------------------------------
+
+EMIT_POLICY = """\
+version: 1
+mode: declarative
+egress_private: ["files.lan.example:8080"]
+routes:
+  - name: zeta
+    prefix: /zeta
+    upstream: https://zeta.example
+    callers: [{placeholder: ph-zeta-0123456789abcdef}]
+    rules: [{methods: [GET], paths: [/v1/**]}]
+  - name: files
+    prefix: /files
+    upstream: http://files.lan.example:8080
+    allow_insecure_upstream: true
+    callers: [{placeholder: ph-files-0123456789abcdef}]
+    rules: [{methods: [GET], paths: [/v1/**]}]
+  - name: alpha
+    prefix: /alpha
+    upstream: https://Alpha.example:8443
+    callers: [{placeholder: ph-alpha-0123456789abcdef}]
+    rules: [{methods: [GET], paths: [/v1/**]}]
+"""
+EMIT_FINDINGS = [
+    "warning routes[1].upstream: plain http upstream",
+    "<stdin>: ok (0 error(s), 1 warning(s))",
+]
+
+
+def emit(*flags: str, policy: str = EMIT_POLICY) -> tuple[int, str, str]:
+    return cli(["check", "--config", "-", "--emit-egress-allowlist", *flags], io.StringIO(policy))
+
+
+def lists_digest(policy: str = EMIT_POLICY) -> str:
+    return egresslist.digest(egresslist.derive(parse_policy(policy, "test")))
+
+
+def test_emit_text_byte_for_byte_and_sorted() -> None:
+    code, out, err = emit()
+    assert code == EXIT_OK
+    # Sorted by host then port, whatever the policy's order; host names in lower case.
+    assert out == (
+        f"# zoeymcp egress allowlist, lists {lists_digest()}\n"
+        "vault alpha.example:8443\n"
+        "vault files.lan.example:8080  # plain http: refused by a CONNECT-only proxy\n"
+        "vault zeta.example:443\n"
+    )
+    # Findings on stderr only, so stdout can be redirected into the proxy's configuration.
+    assert err.splitlines() == EMIT_FINDINGS
+    assert emit("--allowlist-format", "text")[1] == out
+
+
+def test_emit_json_byte_for_byte() -> None:
+    code, out, err = emit("--allowlist-format", "json")
+    assert code == EXIT_OK
+    assert out == (
+        "{\n"
+        '  "v": 1,\n'
+        f'  "digest": "{lists_digest()}",\n'
+        '  "sources": {\n'
+        '    "vault": [\n'
+        "      {\n"
+        '        "host": "alpha.example",\n'
+        '        "port": 8443,\n'
+        '        "private": false\n'
+        "      },\n"
+        "      {\n"
+        '        "host": "files.lan.example",\n'
+        '        "port": 8080,\n'
+        '        "private": true\n'
+        "      },\n"
+        "      {\n"
+        '        "host": "zeta.example",\n'
+        '        "port": 443,\n'
+        '        "private": false\n'
+        "      }\n"
+        "    ]\n"
+        "  }\n"
+        "}\n"
+    )
+    assert err.splitlines() == EMIT_FINDINGS
+
+
+def squid_text(src: str = "zoeymcp_src_vault") -> str:
+    return (
+        f"# zoeymcp egress allowlist, lists {lists_digest()}; regenerate with zoeymcp check "
+        "--emit-egress-allowlist; keep your own final deny\n"
+        "# expects your squid.conf to define: acl CONNECT method CONNECT, and "
+        f"acl {src} src <the vault's network>\n"
+        f"acl zoeymcp_private_dst dst {' '.join(netguard.squid_private_dst())}\n"
+        "acl zoeymcp_port_443 port 443\n"
+        "acl zoeymcp_port_8080 port 8080\n"
+        "acl zoeymcp_port_8443 port 8443\n"
+        "acl zoeymcp_vault_1 dstdomain -n alpha.example\n"
+        f"http_access allow {src} CONNECT zoeymcp_vault_1 zoeymcp_port_8443 !zoeymcp_private_dst\n"
+        "acl zoeymcp_vault_2 dstdomain -n files.lan.example\n"
+        f"http_access allow {src} CONNECT zoeymcp_vault_2 zoeymcp_port_8080\n"
+        "acl zoeymcp_vault_3 dstdomain -n zeta.example\n"
+        f"http_access allow {src} CONNECT zoeymcp_vault_3 zoeymcp_port_443 !zoeymcp_private_dst\n"
+    )
+
+
+def test_emit_squid_byte_for_byte() -> None:
+    code, out, err = emit("--allowlist-format", "squid")
+    assert code == EXIT_OK
+    assert out == squid_text()
+    assert err.splitlines() == EMIT_FINDINGS
+
+
+def test_emit_squid_names_the_policys_acl_and_squid_src_overrides_it() -> None:
+    policy = EMIT_POLICY + "egress_proxy_acls: {vault: stack_vault_net}\n"
+    assert emit("--allowlist-format", "squid", policy=policy)[1] == squid_text("stack_vault_net")
+    code, out, _ = emit(
+        "--allowlist-format", "squid", "--squid-src", "vault=other_net", policy=policy
+    )
+    assert code == EXIT_OK
+    assert out == squid_text("other_net")
+    assert emit("--allowlist-format", "squid", "--squid-src", "vault=x1")[1] == squid_text("x1")
+
+
+@pytest.mark.parametrize("value", ["vault", "vault=", "vault=a-b", "=net"])
+def test_a_bad_squid_src_is_a_usage_error(value: str) -> None:
+    code, out, err = emit("--allowlist-format", "squid", "--squid-src", value)
+    assert code == EXIT_UNREADABLE
+    assert out == ""
+    assert f"--squid-src {value}: write SOURCE=ACL, ACL 1 to 64 letters" in err
+    # Checked before the policy is read: still a usage error, and the only line, when the
+    # policy has errors or can't be parsed.
+    for policy in (EMIT_POLICY.replace("allow_insecure_upstream: true\n", ""), "version: 1\n"):
+        code, out, err = emit("--allowlist-format", "squid", "--squid-src", value, policy=policy)
+        assert (code, out) == (EXIT_UNREADABLE, "")
+        assert err.splitlines() == [
+            f"zoeymcp check: --squid-src {value}: write SOURCE=ACL, ACL 1 to 64 letters, "
+            "digits or underscores"
+        ]
+
+
+def test_a_squid_src_naming_no_source_is_a_usage_error() -> None:
+    code, out, err = emit("--allowlist-format", "squid", "--squid-src", "bridge-fetch=net")
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert (
+        err.splitlines()[-1]
+        == "zoeymcp check: --squid-src bridge-fetch=net: SOURCE is one of vault"
+    )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--allowlist-format", "json"],
+        ["--allowlist-format", "squid"],
+        ["--squid-src", "vault=net"],
+        ["--check", "zoeymcp.conf"],
+    ],
+)
+def test_emitter_flags_without_emit_are_a_usage_error(flags: list[str]) -> None:
+    code, out, err = cli(["check", "--config", "-", *flags], io.StringIO(EMIT_POLICY))
+    assert code == EXIT_UNREADABLE
+    assert out == ""
+    assert err == (
+        "zoeymcp check: --allowlist-format, --squid-src and --check go with "
+        "--emit-egress-allowlist\n"
+    )
+
+
+@pytest.mark.parametrize("flags", [[], ["--allowlist-format", "json"]])
+def test_squid_src_without_the_squid_form_is_a_usage_error(flags: list[str]) -> None:
+    code, out, err = emit(*flags, "--squid-src", "vault=net")
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err == "zoeymcp check: --squid-src goes with --allowlist-format squid\n"
+
+
+def test_emit_check_exits_0_when_equal_and_1_listing_the_differences(tmp_path: Path) -> None:
+    conf = tmp_path / "zoeymcp.conf"
+    conf.write_bytes(squid_text().replace("\n", "\r\n").encode())  # line endings aside
+    code, out, err = emit("--allowlist-format", "squid", "--check", str(conf))
+    assert code == EXIT_OK
+    assert out == f"{conf}: matches the policy's egress allowlist\n"
+    assert err.splitlines() == EMIT_FINDINGS
+    stale = squid_text().replace("zoeymcp_vault_3 dstdomain -n zeta.example", "zoeymcp_vault_3 x")
+    conf.write_bytes(stale.encode())
+    code, out, _ = emit("--allowlist-format", "squid", "--check", str(conf))
+    assert code == EXIT_FINDINGS
+    assert out.splitlines() == [
+        "missing: acl zoeymcp_vault_3 dstdomain -n zeta.example",
+        "unexpected: acl zoeymcp_vault_3 x",
+        f"{conf}: out of date (2 difference(s)); regenerate it with check --emit-egress-allowlist",
+    ]
+    # The source ACL name is part of the comparison: --squid-src changes what is expected.
+    conf.write_bytes(squid_text().encode())
+    code, out, _ = emit(
+        "--allowlist-format", "squid", "--squid-src", "vault=n", "--check", str(conf)
+    )
+    assert code == EXIT_FINDINGS
+    # The header's expects line and the three rules, each missing once and unexpected once.
+    assert len(out.splitlines()) == 9
+    assert "missing: http_access allow n CONNECT zoeymcp_vault_3 zoeymcp_port_443" in out
+
+
+def test_emit_check_of_a_missing_file_is_unreadable(tmp_path: Path) -> None:
+    code, out, err = emit("--check", str(tmp_path / "absent.conf"))
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert f"zoeymcp check: can't read {tmp_path / 'absent.conf'}" in err
+
+
+def test_emit_prints_nothing_for_a_policy_with_errors() -> None:
+    bad = EMIT_POLICY.replace("allow_insecure_upstream: true\n", "")
+    code, out, err = emit(policy=bad)
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert "FAILED" in err
+    code, out, err = emit(policy="version: 1\n")
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert "mode: Field required" in err
+
+
+def test_emit_findings_on_stderr_as_json() -> None:
+    code, out, err = emit("--format", "json", "--allowlist-format", "squid")
+    assert code == EXIT_OK
+    assert out == squid_text()
+    assert json.loads(err)["warnings"] == 1
+
+
+def test_emit_output_is_unchanged_by_an_unrelated_edit() -> None:
+    # GR-20: the digest covers the lists alone, so --check keeps passing.
+    edited = EMIT_POLICY.replace("paths: [/v1/**]", "paths: [/v2/**]").replace(
+        "ph-zeta-0123456789abcdef", "ph-zeta-fedcba9876543210"
+    )
+    for fmt in ("text", "json", "squid"):
+        assert (
+            emit("--allowlist-format", fmt, policy=edited)[1] == emit("--allowlist-format", fmt)[1]
+        )
+    moved = EMIT_POLICY.replace("https://zeta.example", "https://zeta.example:9443")
+    assert emit(policy=moved)[1] != emit()[1]
+
+
+def test_emit_reads_the_policy_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # OPS-9: the container forms of J5 read the service's inline policy; --config is optional.
+    monkeypatch.setenv("ZOEYMCP_CONFIG", EMIT_POLICY)
+    code, out, err = cli(["check", "--emit-egress-allowlist", "--allowlist-format", "squid"])
+    assert code == EXIT_OK
+    assert out == squid_text()
+    assert err.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 1 warning(s))"
+
+
+def test_emit_the_example_policy() -> None:
+    code, out, _ = cli(["check", "--config", str(EXAMPLE_POLICY), "--emit-egress-allowlist"])
+    assert code == EXIT_OK
+    assert out.splitlines()[1:] == [
+        "vault api.stats.example:443",
+        "vault auth.broker.example:443",
+        "vault mcp.broker.example:443",
+        "vault smtp.mail.example:465",
+    ]
 
 
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:

@@ -60,8 +60,9 @@ _V4_CLASSES: Final[tuple[tuple[str, AddressClass], ...]] = (
     ("240.0.0.0/4", "reserved"),
     ("255.255.255.255/32", "reserved"),
 )
-# The mapped and compatible rows are judged by their IPv4 address before this table is read; they
-# are here for the emitted Squid rule, which refuses them whole.
+# The mapped and compatible rows are judged by their IPv4 address before this table is read. The
+# compatible row is here for the emitted Squid rule, which refuses it whole; that rule leaves the
+# mapped row out, since Squid holds every IPv4 address in that form (squid_private_dst).
 _V6_CLASSES: Final[tuple[tuple[str, AddressClass], ...]] = (
     ("::/128", "unspecified"),
     ("::1/128", "loopback"),
@@ -82,7 +83,14 @@ DENIED_V6: Final = tuple(net for net, _ in _V6_CLASSES)
 _V4_NETS: Final = tuple((ipaddress.IPv4Network(net), kind) for net, kind in _V4_CLASSES)
 _V6_NETS: Final = tuple((ipaddress.IPv6Network(net), kind) for net, kind in _V6_CLASSES)
 _COMPATIBLE: Final = ipaddress.IPv6Network("::/96")
+_MAPPED: Final = ipaddress.IPv6Network("::ffff:0:0/96")
 _NAT64: Final = ipaddress.IPv6Network("64:ff9b::/96")
+# The (row, network) pairs squid_private_dst reads, built here so its body holds no `zip`
+# whose `strict` a mutant could drop unseen: the tables always pair up. The mapped row is out.
+_SQUID_V4_ROWS: Final = tuple((t, n) for t, (n, _) in zip(DENIED_V4, _V4_NETS, strict=True))
+_SQUID_V6_ROWS: Final = tuple(
+    (t, n) for t, (n, _) in zip(DENIED_V6, _V6_NETS, strict=True) if n != _MAPPED
+)
 
 # Names that only mean something inside a network (X2), each matched as the whole name or a
 # suffix after a dot. Single-label names are refused on their own.
@@ -225,14 +233,19 @@ def listed(entries: Collection[str], host: str, port: int) -> bool:
 
 
 def squid_private_dst() -> tuple[str, ...]:
-    """The entries of the emitted ``zoeymcp_private_dst`` ACL: both tables, then each IPv4 row's
-    IPv4-mapped and IPv4-compatible forms written out. They are in hex, never Python's dotted
-    form for a mapped address, so no parser reads one as IPv4 with a mask over 32."""
-    mapped = []
-    compatible = []
-    for net, _ in _V4_NETS:
-        base = int(net.network_address)
-        words = f"{base >> 16:x}:{base & 0xFFFF:x}"
-        mapped.append(f"::ffff:{words}/{net.prefixlen + 96}")
-        compatible.append(f"::{words}/{net.prefixlen + 96}")
-    return (*DENIED_V4, *DENIED_V6, *mapped, *compatible)
+    """The entries of the emitted ``zoeymcp_private_dst`` ACL: both tables' rows as written, in
+    table order, less two kinds. Squid holds an IPv4 address as IPv4-mapped (``::ffff:a.b.c.d``),
+    so a ``dst`` entry for ``::ffff:0:0/96`` would match every IPv4 destination: it is left out,
+    and the IPv4 rows, which Squid holds in that same form, judge a mapped answer by the IPv4
+    address it carries, as :func:`classify` does. A row inside another row (``::1/128`` inside
+    ``::/96``) is left out too: Squid would warn about it and ignore it. Those two rules are why
+    no mapped or compatible form of an IPv4 row is written out either: Squid holds the first as
+    the row itself, and ``::/96`` holds every one of the second."""
+    return (*_outermost(_SQUID_V4_ROWS), *_outermost(_SQUID_V6_ROWS))
+
+
+def _outermost[Net: (ipaddress.IPv4Network, ipaddress.IPv6Network)](
+    rows: Sequence[tuple[str, Net]],
+) -> list[str]:
+    """The rows no other row holds."""
+    return [text for text, net in rows if not any(o != net and net.subnet_of(o) for _, o in rows)]

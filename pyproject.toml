@@ -192,3 +192,5 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.portal.policyview" = 95
 "zoeymcp.common.policy.callback" = 95
 "zoeymcp.common.policy.fields" = 95
+"zoeymcp.common.netguard" = 95
+"zoeymcp.common.egresslist" = 95

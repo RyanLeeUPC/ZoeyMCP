@@ -3,8 +3,9 @@
 How to run what is built so far: the vault (M1), OAuth in the vault (M2), the gateway for
 remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
 and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
-supported. The design and the reasons behind it are in [design.md](design.md); this page is the
-how-to.
+supported. §28 and §29 are M7's so far: your own egress proxy, and fitting ZoeyMCP into a stack
+that already has one. The design and the reasons behind it are in [design.md](design.md); this
+page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -1471,3 +1472,287 @@ outside a container there works for trying things out, with these differences:
 
 On a development host, `localhost` may resolve to `::1` first; bind the portal to
 `127.0.0.1:8081` and browsers fall back to it.
+
+## 28. Your own egress proxy
+
+With `egress_proxy` set, the vault sends what it sends out through your proxy, and the proxy's
+allowlist decides where that may go. `zoeymcp check --emit-egress-allowlist` prints that
+allowlist from the policy, as a Squid snippet or as plain lists, and compares a file with it, so
+a verify script notices when the proxy's configuration and the policy part.
+
+**What goes through it.** Every HTTP request the vault makes: each route's upstream (so every
+`tools/list`, `tools/call` and the rest that the gateway sends to a remote server, and every call
+on a direct route), and every OAuth token request (`zoeymcp login`, the portal's connect, and each
+refresh). Each SMTP connector connects through it too, with `CONNECT host:port`. As M7's
+onboarding by URL lands, its discovery and registration requests, and the revocation of a deleted
+credential's grant, go the same way. The vault ignores `HTTP_PROXY`, `HTTPS_PROXY` and the rest:
+only `egress_proxy` counts. Nothing inbound goes through it: agents, the gateway's link and the
+portal reach the vault directly.
+
+**Setting it.** `egress_proxy` is `http://host:port`, with no path:
+
+```yaml policy
+version: 1
+mode: declarative
+# Every vault connection goes to your proxy, as CONNECT host:port.
+egress_proxy: http://proxy.stack.example:3128
+# The src ACL your squid.conf defines for the vault's address.
+egress_proxy_acls: {vault: stack_vault_net}
+# A destination on your own network: it may resolve to a private address.
+egress_private: ["files.lan.example:443"]
+credentials:
+  notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+  files-key: {kind: header, header: Authorization, format: "Bearer {secret}", secret: "store:files-key"}
+routes:
+  - name: notes-mcp
+    prefix: /notes
+    upstream: https://mcp.notes.example
+    credential: notes-key
+    callers: [gateway]
+    stream: true
+    rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+  - name: files
+    prefix: /files
+    upstream: https://files.lan.example
+    credential: files-key
+    callers: [{placeholder: ph-files-replace-me-with-a-long-random-value}]
+    rules: [{methods: [GET], paths: [/v1/**]}]
+```
+
+- **CONNECT-only means https-only.** An `https` upstream is a `CONNECT` tunnel; a plain `http`
+  one goes to the proxy as a forwarded request, which a CONNECT-only proxy (the snippet below
+  allows nothing else) refuses. The text form marks such a destination, and `check` warns about a
+  credential-less `allow_insecure_upstream` route over plain http when `egress_proxy` is set.
+- **Changing it needs a restart.** `egress_proxy` is read when the vault starts. A reload that
+  changes it logs `egress_proxy_change_needs_restart` and keeps routes and token requests on the
+  old proxy, while SMTP sends already take the new one: recreate the vault right after changing
+  it (§7).
+
+**Emitting the allowlist.** Run the image, which reads the service's own inline policy (add
+`--config FILE` for a policy file). The policy is checked first: its findings go to stderr, the
+allowlist to stdout, and a policy with errors prints no allowlist and exits 1.
+
+```sh
+# hardened tier
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault \
+    check --emit-egress-allowlist --allowlist-format squid > proxy/zoeymcp.conf
+# standard tier
+docker compose -f deploy/compose.yaml run --rm --no-deps -T zoeymcp \
+    check --emit-egress-allowlist --allowlist-format squid > proxy/zoeymcp.conf
+```
+
+**Comparing.** `--check FILE` compares FILE with what would be emitted, line endings aside: exit 0
+when they match, 1 with each difference listed (`missing:`, `unexpected:`, or `order:` for the
+first line out of place), 2 when FILE can't be read. Put it in your verify script:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T -v "$PWD/proxy:/p:ro" vault \
+    check --emit-egress-allowlist --allowlist-format squid --check /p/zoeymcp.conf \
+  || echo "proxy configuration is out of date"
+```
+
+The standard tier's form swaps the prefix, as above. Each form's header names a digest of the
+lists alone (hosts, ports and which are private), so an edit that changes no destination changes
+no output, and `--check` stays clean.
+
+**The forms** (`--allowlist-format`, default `text`):
+
+- `text`: the header, then one `source host:port` line per destination, sorted by source, host
+  and port. For the policy above:
+
+  ```text
+  # zoeymcp egress allowlist, lists sha256:2a54ff25a28967d36d1138d58af2ed4689f06e9aefcf3e07e730af498181f314
+  vault files.lan.example:443
+  vault mcp.notes.example:443
+  ```
+
+  The vault's source is `vault`; a plain-http destination's line ends with
+  `# plain http: refused by a CONNECT-only proxy`.
+- `json`: `{"v": 1, "digest": ..., "sources": {"vault": [{"host", "port", "private"}, ...]}}`.
+- `squid`: a snippet to `include` from your `squid.conf`:
+
+  ```text
+  # zoeymcp egress allowlist, lists sha256:2a54ff25a28967d36d1138d58af2ed4689f06e9aefcf3e07e730af498181f314; regenerate with zoeymcp check --emit-egress-allowlist; keep your own final deny
+  # expects your squid.conf to define: acl CONNECT method CONNECT, and acl stack_vault_net src <the vault's network>
+  acl zoeymcp_private_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 ::/96 64:ff9b:1::/48 100::/64 2001::/32 2001:db8::/32 2002::/16 fc00::/7 fe80::/10 fec0::/10 ff00::/8
+  acl zoeymcp_port_443 port 443
+  acl zoeymcp_vault_1 dstdomain -n files.lan.example
+  http_access allow stack_vault_net CONNECT zoeymcp_vault_1 zoeymcp_port_443
+  acl zoeymcp_vault_2 dstdomain -n mcp.notes.example
+  http_access allow stack_vault_net CONNECT zoeymcp_vault_2 zoeymcp_port_443 !zoeymcp_private_dst
+  ```
+
+**What the snippet expects of your `squid.conf`.** It defines none of the ACLs its header names,
+and it never ends with a deny: your file defines `acl CONNECT method CONNECT` and one `src` ACL
+for the vault's address, includes the snippet, and denies everything else after it. Squid stops
+at an ACL that isn't defined, so a missing one shows on `squid -k parse`:
+
+```text
+http_port 3128
+acl CONNECT method CONNECT
+acl stack_vault_net src 172.30.5.0/24              # the network the vault reaches the proxy on
+include /etc/squid/zoeymcp.conf                    # emitted; never edited by hand
+include /etc/squid/zoeymcp-onboarding.conf         # onboarding lines only; empty otherwise
+http_access deny all
+```
+
+The `src` ACL's name comes from the policy's `egress_proxy_acls` (`{vault: stack_vault_net}`), so
+every command and the portal print the same lines; `--squid-src vault=NAME` overrides it for one
+run, and with neither the snippet uses `zoeymcp_src_vault`. A name is 1 to 64 letters, digits or
+underscores.
+
+**How the snippet's rules work.** Each destination gets its own rule, so a host and its port
+stay paired. The rule tests the source, `CONNECT`, the exact name (`dstdomain -n`, so a subdomain
+doesn't match; an IP-literal destination uses `dst -n`) and the port first. With `-n` Squid looks
+nothing up for that test: a name the policy doesn't list is refused by your final deny before any
+DNS lookup, and a `CONNECT` to an address is never matched through its reverse (PTR) name, which
+whoever controls that address chooses. Only after a name matched does
+`!zoeymcp_private_dst` make Squid resolve it, and if any address in the answer is private,
+loopback, link-local or otherwise non-global, the tunnel is refused, a mixed answer included. That
+rule is rendered from the vault's own address tables, so keep it, and regenerate rather than edit.
+A destination in `egress_private` has no private-destination test: it is on your network by
+design. Squid holds an IPv4 address in its IPv4-mapped form (`::ffff:a.b.c.d`), so the rule
+leaves out the mapped range itself, which would refuse every IPv4 destination; an AAAA answer of
+`::ffff:10.0.0.1` still meets `10.0.0.0/8`. The image's smoke test runs a pinned Squid against an
+emitted snippet: it parses it, refuses a listed name answering `10.x`, `::ffff:127.0.0.1` or a mix
+of public and private, and an address whose PTR name is listed, and lets a listed public name
+through.
+
+**Onboarding through it.** With onboarding by URL (`zoeymcp login --mcp`, as M7 lands), the
+proxy refuses the hosts the policy doesn't name yet. The vault then stops, keeps what it has
+fetched, and answers `proxy_refused` with every host it has learned so far and the Squid lines
+that allow them, in the snippet's shape, reusing its `zoeymcp_port_<n>` and
+`zoeymcp_private_dst`; run the same command again after adding them and it resumes where it
+stopped. Usually two rounds suffice: the server's host, then its authorization server's. Keep
+those lines in their own included file (`zoeymcp-onboarding.conf` above), so `--check` on the
+emitted file stays clean meanwhile. Once the policy names the credential and the route, the
+emitted list covers the hosts the vault needs from then on: regenerate it, reload the proxy, and
+empty the onboarding file.
+
+**What it doesn't do.**
+
+- **A NAT64 answer slips through.** A Squid `dst` ACL can't see the IPv4 address inside a NAT64
+  answer (`64:ff9b::/96`), so where your resolver synthesizes them, a listed name can steer the
+  proxy to a private IPv4 address that way. Only a proxy that judges the address it connects to
+  catches it, as ZoeyMCP's own egress role (hardened tier, later in M7) does; Squid doesn't.
+- **It doesn't confine the gateway or toolkits in the standard tier.** They share the vault's
+  network namespace there and don't use `egress_proxy`: the standard tier shares egress (§24).
+  Neither your proxy nor ZoeyMCP's own egress role changes that; the hardened tier, whose gateway
+  has no route out, does.
+
+## 29. Fitting ZoeyMCP into an existing stack
+
+A stack that already runs agents, an egress proxy and its own networks takes ZoeyMCP's hardened
+tier as two more services: the gateway beside the agents, the vault behind the stack's proxy,
+and no new route out for either. `examples/existing-stack/` (next in M7) holds a compose file that
+is tested end to end; this is the shape.
+
+- **The gateway** joins the stack's agent network in place of `agents`, plus `internal` to the
+  vault, and nothing else; no `lan` profile. **The agent network must be `internal: true`**: if it
+  isn't, the gateway, and the toolkits that run inside it, have a route out beside the proxy.
+- **The vault** is on `internal` and on one network it shares with the stack's proxy, and no other.
+  **That network must be `internal: true`** too, so the proxy is the vault's only way out (the
+  proxy reaches the internet on a network of its own): if it isn't, the vault has a direct route
+  out beside the proxy, and the allowlist confines nothing. `egress_proxy` names the proxy's
+  address on that network, and the emitted snippet (§28) goes into the proxy's configuration,
+  with the vault's address on that network as its `src` ACL.
+- **The agents** get one entry per server in the runtime's configuration: the URL
+  `http://gateway:8090/s/<server>/mcp`, the header `Authorization: Bearer <client token>` (§10),
+  and the runtime's own approval setting for that server at its least-prompting level, so the
+  gateway's approval (§19) is the one prompt.
+- **Your own compose files.** As M7's onboarding by URL lands, the commands ZoeyMCP prints for you
+  are prefixed with `ZOEYMCP_COMPOSE_CMD`. Set it in `.env` to your stack's command (its `-f`
+  files, `--project-directory` or `-p`), or they name `deploy/compose.hardened.yaml` alone.
+
+The vault's policy, inline in its `ZOEYMCP_CONFIG` as in `deploy/compose.hardened.yaml`, here
+with no portal (no `admin` block: see "The portal" below for adding one):
+
+```yaml policy
+version: 1
+mode: declarative
+egress_proxy: http://stack-proxy:3128
+egress_proxy_acls: {vault: stack_vault_net}
+credentials:
+  notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+routes:
+  - name: notes-mcp
+    prefix: /notes
+    upstream: https://mcp.notes.example
+    credential: notes-key
+    callers: [gateway]
+    stream: true
+    rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+gateway:
+  hosts: [gateway]
+  clients:
+    agent1:
+      token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      servers: [notes]
+  servers:
+    notes:
+      kind: remote
+      route: notes-mcp
+      path: /mcp
+      tools: {include: [], allow: [], approve: []}
+      review: {}
+```
+
+An override beside the stack's own compose files moves both services onto those networks
+(`!override` replaces a list instead of adding to it, and `!reset` empties one; Compose 2.24.4 or
+later), and sets the vault's `ZOEYMCP_CONFIG` to the policy above:
+
+```yaml
+# compose.zoeymcp.yaml
+networks:
+  stack-agents: {external: true}      # the stack's agent network, internal: true
+  stack-proxy: {external: true}       # the network the stack's proxy listens on, internal: true
+services:
+  vault:
+    networks: !override
+      internal: {}
+      stack-proxy: {}
+    ports: !reset []                  # nothing to publish through: see "The portal" below
+    environment:
+      ZOEYMCP_CONFIG: |
+        # the policy above
+  gateway:
+    networks: !override [internal, stack-agents]
+```
+
+**The portal.** Docker publishes a port only through a non-internal network, so a vault with
+none can't publish the portal, and giving it one (§26's paragraph on an internal `egress`) also
+gives it a direct route out beside the proxy. The answers, best first:
+
+- **A relay on networks of its own:** a small reverse proxy on an internal network shared with
+  the vault alone (the vault's `vault-portal` alias is there) and on a second network that
+  publishes `127.0.0.1:8081`. The vault keeps no non-internal network; the relay holds no secret
+  and keeps no access log. `examples/existing-stack/` ships this.
+- **The stack's own reverse proxy** joins that internal network instead, and follows §26's rules
+  for a proxy in front of the portal.
+- **A separate non-internal network** for the vault's portal, with a host firewall rule that drops
+  that network's outbound traffic. The weakest: the route out exists, and only a rule outside
+  Docker's view stops it.
+- **No portal:** leave the `admin` block out. Everything the portal does, the CLI does too.
+
+**Verify probes** for the stack's verify script, none of which changes anything (`$c` is your
+stack's compose command):
+
+```sh
+c="docker compose -f deploy/compose.hardened.yaml -f compose.zoeymcp.yaml"
+$c run --rm --no-deps -T -v "$PWD/proxy:/p:ro" vault \
+    check --emit-egress-allowlist --allowlist-format squid --check /p/zoeymcp.conf
+$c exec -T gateway zoeymcp review notes            # exit 0 for each server
+$c exec -T vault zoeymcp health --json --strict > /dev/null
+$c exec -T gateway zoeymcp gateway-status
+# Neither the vault nor the gateway has a network with a route out.
+for service in vault gateway; do
+  id="$($c ps -q "$service")"
+  for net in $(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' "$id"); do
+    [ "$(docker network inspect -f '{{.Internal}}' "$net")" = true ] \
+      || { echo "$service is on $net, which isn't internal"; exit 1; }
+  done
+done
+```
+
+Add the portal's probes from §26 ("Checks for a verify script") against the address you publish
+it on, if you do.

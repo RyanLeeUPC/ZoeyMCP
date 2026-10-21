@@ -2,7 +2,8 @@
 # Smoke-test a built image: the vault the way the hardened tier runs it (read-only, no capabilities,
 # no-new-privileges, non-root), then the standard tier from deploy/compose.yaml. Both tiers reach
 # a fake upstream (tests/fakes/run_mcp_server.py) with one tools/list and one tools/call. Both
-# serve the portal on the host's loopback, and the probes show who else can reach it.
+# serve the portal on the host's loopback, and the probes show who else can reach it. A Squid
+# pinned by digest parses the emitted egress allowlist and is probed against it (contract 51).
 # With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
 # compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
 # Usage: scripts/smoke-image.sh [--derived OFFICIAL] IMAGE
@@ -25,6 +26,10 @@ examples="$(cd "$(dirname "$0")/../examples" && pwd)"
 deploy="$(cd "$(dirname "$0")/../deploy" && pwd)"
 tests="$(cd "$(dirname "$0")/../tests" && pwd)"
 hardened="--read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:size=16m"
+# Contract 51's Squid, pinned by digest (ci.yml pulls this line's image first).
+squid_image=ubuntu/squid:6.6-24.04_edge@sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c
+squid_net="zoeymcp-smoke-squid-$$"
+j5_project="zoeymcp-smoke-j5-$$"
 
 # The standard tier, from deploy/compose.yaml; once written, standard.yaml swaps in a policy
 # with a real client token and adds the fake upstream.
@@ -53,6 +58,12 @@ cleanup() {
         hardened_tier down -v >/dev/null 2>&1 || true
     fi
     docker network rm "$probe_net" >/dev/null 2>&1 || true
+    docker rm -f "$name-dns" "$name-squid" "$name-squid-mapped" "$name-squid-lookup" \
+        >/dev/null 2>&1 || true
+    docker network rm "$squid_net" >/dev/null 2>&1 || true
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY=unset ZOEYMCP_GATEWAY_KEY=unset \
+        docker compose -p "$j5_project" -f "$deploy/compose.hardened.yaml" down -v >/dev/null 2>&1 \
+        || true
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -60,6 +71,7 @@ trap cleanup EXIT
 fail() {
     echo "SMOKE FAIL: $*" >&2
     docker logs "$name" >&2 2>/dev/null || true
+    docker logs "$name-squid" >&2 2>/dev/null || true
     standard logs >&2 2>/dev/null || true
     if [ -f "$work/override.yaml" ]; then
         hardened_tier logs >&2 2>/dev/null || true
@@ -335,6 +347,215 @@ docker run --rm $hardened -v "$examples:/examples:ro" "$image" check --config /e
 # shellcheck disable=SC2086
 docker run --rm $hardened -v "$examples:/examples:ro" "$image" \
     selftest --config /examples/policy.yaml --cases /examples/selftest-cases.yaml --mutate
+
+step "J5: the egress allowlist emitted and compared from the hardened tier's inline policy"
+# The two container commands of M7 design J5, as operations.md gives them: no --config, so the
+# vault service's own ZOEYMCP_CONFIG is read; the findings go to stderr, the snippet to stdout.
+j5_compose() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY=unset ZOEYMCP_GATEWAY_KEY=unset \
+        docker compose -p "$j5_project" -f "$deploy/compose.hardened.yaml" "$@"
+}
+mkdir "$work/proxy"
+j5_compose run --rm --no-deps -T vault \
+    check --emit-egress-allowlist --allowlist-format squid >"$work/proxy/zoeymcp.conf" \
+    || fail "check --emit-egress-allowlist failed on the hardened tier's inline policy"
+grep -qx 'acl zoeymcp_vault_1 dstdomain -n mcp.notes.example' "$work/proxy/zoeymcp.conf" \
+    || fail "the emitted snippet doesn't allow the inline policy's notes route"
+chmod 0755 "$work/proxy"
+chmod 0644 "$work/proxy/zoeymcp.conf"
+j5_compose run --rm --no-deps -T -v "$work/proxy:/p:ro" vault \
+    check --emit-egress-allowlist --allowlist-format squid --check /p/zoeymcp.conf \
+    || fail "check --check refused the snippet it had just emitted"
+sed 's/mcp\.notes\.example/mcp.other.example/' "$work/proxy/zoeymcp.conf" >"$work/proxy/stale.conf"
+chmod 0644 "$work/proxy/stale.conf"
+# Exit 1, with the differences listed: 2 (unreadable, a usage error) would show nothing.
+status=0
+j5_compose run --rm --no-deps -T -v "$work/proxy:/p:ro" vault \
+    check --emit-egress-allowlist --allowlist-format squid --check /p/stale.conf \
+    >"$work/proxy/stale.out" || status=$?
+[ "$status" = 1 ] || fail "check --check on a stale snippet exited $status, not 1"
+grep -qx 'missing: acl zoeymcp_vault_1 dstdomain -n mcp.notes.example' "$work/proxy/stale.out" \
+    || fail "check --check didn't list the stale snippet's difference"
+j5_compose down -v >/dev/null 2>&1
+
+step "Squid parses the emitted snippet, and refuses private answers to listed names (contract 51)"
+# The snippet for a test policy, inside the minimal squid.conf of M7 design I.6: it defines only
+# what the snippet's header asks for, then the final deny. A fake DNS server on an internal
+# network answers for the test names, so nothing leaves the host: a name the snippet lets
+# through gets ERR_CONNECT_FAIL (no route), one it refuses ERR_ACCESS_DENIED. Every Squid here
+# gets a working IPv6 loopback: without one Squid turns IPv6 off ("BCP 177"), drops the IPv6
+# entries of zoeymcp_private_dst and ignores AAAA answers.
+mkdir "$work/squid"
+cat >"$work/squid/policy.yaml" <<'EOF'
+version: 1
+mode: declarative
+routes:
+  - {name: listed, prefix: /listed, upstream: "https://listed.squid.example",
+     callers: [{placeholder: ph-squid-listed-0123456789}], rules: [{methods: [GET], paths: [/v1/**]}]}
+  - {name: private, prefix: /private, upstream: "https://private.squid.example",
+     callers: [{placeholder: ph-squid-private-0123456789}], rules: [{methods: [GET], paths: [/v1/**]}]}
+  - {name: mapped, prefix: /mapped, upstream: "https://mapped.squid.example",
+     callers: [{placeholder: ph-squid-mapped-0123456789}], rules: [{methods: [GET], paths: [/v1/**]}]}
+  - {name: mixed, prefix: /mixed, upstream: "https://mixed.squid.example",
+     callers: [{placeholder: ph-squid-mixed-0123456789}], rules: [{methods: [GET], paths: [/v1/**]}]}
+EOF
+squid_subnet=10.231.79.0/24
+cat >"$work/squid/squid.conf" <<EOF
+http_port 3128
+acl CONNECT method CONNECT
+acl zoeymcp_src_vault src $squid_subnet
+include /etc/squid/zoeymcp.conf
+http_access deny all
+EOF
+echo "nameserver 10.231.79.53" >"$work/squid/resolv.conf"
+chmod 0755 "$work/squid"
+chmod 0644 "$work/squid/policy.yaml" "$work/squid/squid.conf" "$work/squid/resolv.conf"
+# shellcheck disable=SC2086
+docker run --rm --network none $hardened -v "$work/squid:/w:ro" "$image" \
+    check --config /w/policy.yaml --emit-egress-allowlist --allowlist-format squid \
+    >"$work/squid/zoeymcp.conf" || fail "check --emit-egress-allowlist failed on the test policy"
+chmod 0644 "$work/squid/zoeymcp.conf"
+grep -q '^acl zoeymcp_private_dst dst .*127\.0\.0\.0/8' "$work/squid/zoeymcp.conf" \
+    || fail "the snippet has no private-destination rule"
+if grep -q '::ffff:0:0/96' "$work/squid/zoeymcp.conf"; then
+    fail "the snippet refuses ::ffff:0:0/96, which Squid holds every IPv4 address in"
+fi
+# squid_conf SNIPPET: the docker run options that give Squid the minimal squid.conf with SNIPPET.
+squid_conf() {
+    echo "-v $work/squid/squid.conf:/etc/squid/squid.conf:ro -v $1:/etc/squid/zoeymcp.conf:ro" \
+        "--sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv6.conf.lo.disable_ipv6=0"
+}
+# squid_parse SNIPPET OUT: squid -k parse of the minimal squid.conf with SNIPPET, its log in OUT.
+squid_parse() {
+    # shellcheck disable=SC2046
+    docker run --rm --network none --hostname squid.smoke.example $(squid_conf "$1") \
+        --entrypoint squid "$squid_image" -k parse -f /etc/squid/squid.conf >"$2" 2>&1 \
+        || { cat "$2"; fail "squid -k parse refused $1"; }
+}
+# What Squid logs when it keeps an ACL value only in part: an overlapping one ignored (6.6's
+# wording first, then 7's) or every IPv6 one dropped because IPv6 is off. -k parse exits 0.
+squid_dropped='is a subnetwork of|is ignored to keep splay|from the ACL named|Ignoring|Merging overlapping'
+squid_dropped="$squid_dropped|IPv6 has not been enabled|BCP 177"
+squid_parse "$work/squid/zoeymcp.conf" "$work/squid/parse"
+if grep -E "$squid_dropped" "$work/squid/parse"; then
+    fail "Squid didn't load every value of the emitted ACLs"
+fi
+# The control: ::ffff:0:0/96 holds every IPv4 row as Squid stores it, so Squid must say so.
+sed 's|^acl zoeymcp_private_dst dst |&::ffff:0:0/96 |' "$work/squid/zoeymcp.conf" \
+    >"$work/squid/mapped.conf"
+chmod 0644 "$work/squid/mapped.conf"
+squid_parse "$work/squid/mapped.conf" "$work/squid/parse-mapped"
+grep -qE "$squid_dropped" "$work/squid/parse-mapped" \
+    || { cat "$work/squid/parse-mapped"; fail "Squid printed no overlap warning for ::ffff:0:0/96"; }
+# Fixed addresses below .128; the probes take theirs from the range above.
+docker network create --internal --subnet "$squid_subnet" --ip-range 10.231.79.128/25 "$squid_net" \
+    >/dev/null
+# A DNS server for the test names: listed is public, private 10.x, mapped an AAAA answer
+# ::ffff:127.0.0.1, mixed one public and one private address; unlisted isn't in the policy.
+# 1.1.1.1's PTR name is the listed one, as that address's owner could make it.
+fake_dns='
+import socket, struct
+v4 = lambda text: (1, socket.inet_pton(socket.AF_INET, text))
+v6 = lambda text: (28, socket.inet_pton(socket.AF_INET6, text))
+ptr = lambda text: (12, b"".join(bytes([len(x)]) + x.encode() for x in text.split(".")) + b"\0")
+records = {
+    "1.1.1.1.in-addr.arpa": [ptr("listed.squid.example")],
+    "listed.squid.example": [v4("1.1.1.1")],
+    "private.squid.example": [v4("10.0.0.9")],
+    "mapped.squid.example": [v6("::ffff:127.0.0.1")],
+    "mixed.squid.example": [v4("1.1.1.1"), v4("10.0.0.9")],
+    "unlisted.squid.example": [v4("1.1.1.1")],
+}
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(("0.0.0.0", 53))
+while True:
+    query, peer = server.recvfrom(4096)
+    end, labels = 12, []
+    while query[end]:
+        labels.append(query[end + 1 : end + 1 + query[end]].decode().lower())
+        end += 1 + query[end]
+    qtype = struct.unpack("!H", query[end + 1 : end + 3])[0]
+    name = ".".join(labels)
+    found = [data for kind, data in records.get(name, []) if kind == qtype]
+    flags = 0x8180 | (0 if name in records else 3)
+    answer = struct.pack("!6H", struct.unpack("!H", query[:2])[0], flags, 1, len(found), 0, 0)
+    answer += query[12 : end + 5]
+    for data in found:
+        answer += b"\xc0\x0c" + struct.pack("!HHIH", qtype, 1, 60, len(data)) + data
+    server.sendto(answer, peer)
+'
+# shellcheck disable=SC2086
+docker run -d --name "$name-dns" $hardened --network "$squid_net" --ip 10.231.79.53 \
+    --sysctl net.ipv4.ip_unprivileged_port_start=0 --entrypoint /opt/zoeymcp/bin/python \
+    "$image" -I -c "$fake_dns" >/dev/null
+# Prints the status and X-Squid-Error of a CONNECT to TARGET through the Squid at PROXY.
+connect_through='
+import socket, sys
+proxy, target = sys.argv[1], sys.argv[2]
+with socket.create_connection((proxy, 3128), timeout=30) as conn:
+    conn.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+lines = head.decode("latin-1").split("\r\n")
+errors = [l.split(":", 1)[1].split()[0] for l in lines[1:] if l.lower().startswith("x-squid-error:")]
+print(lines[0].split(" ")[1], errors[0] if errors else "-")
+'
+# squid_client PROXY TARGET: connect_through, from a container on the Squid's network.
+squid_client() {
+    # shellcheck disable=SC2086
+    docker run --rm $hardened --network "$squid_net" --entrypoint /opt/zoeymcp/bin/python \
+        "$image" -I -c "$connect_through" "$@"
+}
+# squid_up NAME IP SNIPPET: a Squid with the minimal squid.conf and SNIPPET, answering on IP.
+squid_up() {
+    # shellcheck disable=SC2046
+    docker run -d --name "$1" -u 0:0 --hostname squid.smoke.example --network "$squid_net" \
+        --ip "$2" $(squid_conf "$3") \
+        -v "$work/squid/resolv.conf:/etc/resolv.conf:ro" --entrypoint squid "$squid_image" \
+        -N -d 1 -f /etc/squid/squid.conf >/dev/null
+    i=0
+    until squid_client "$2" unlisted.squid.example:443 >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || fail "Squid didn't start with the snippet"
+        sleep 0.2
+    done
+}
+# through IP TARGET: the answer of the Squid on IP to a CONNECT to TARGET.
+through() {
+    squid_client "$1" "$2" || fail "no answer from Squid for $2"
+}
+squid_up "$name-squid" 10.231.79.10 "$work/squid/zoeymcp.conf"
+# 1.1.1.1 is public, unlisted, and its PTR name is listed: -n keeps dstdomain from using it.
+for refused in private.squid.example mapped.squid.example mixed.squid.example \
+    unlisted.squid.example 1.1.1.1; do
+    found="$(through 10.231.79.10 "$refused:443")"
+    echo "$refused: $found"
+    [ "$found" = "403 ERR_ACCESS_DENIED" ] || fail "Squid didn't refuse $refused: $found"
+done
+found="$(through 10.231.79.10 listed.squid.example:443)"
+echo "listed: $found"
+case "$found" in
+    403\ * | *\ ERR_ACCESS_DENIED | *\ ERR_DNS_FAIL) fail "Squid refused the listed public name: $found" ;;
+esac
+# The concern this settles: with ::ffff:0:0/96 in the rule, Squid refuses the public name too.
+squid_up "$name-squid-mapped" 10.231.79.11 "$work/squid/mapped.conf"
+[ "$(through 10.231.79.11 listed.squid.example:443)" = "403 ERR_ACCESS_DENIED" ] \
+    || fail "Squid let a public IPv4 answer past ::ffff:0:0/96: the snippet's premise is wrong"
+# The control for the PTR row: without -n, dstdomain matches 1.1.1.1 by its PTR name.
+sed 's/ dstdomain -n / dstdomain /' "$work/squid/zoeymcp.conf" >"$work/squid/lookup.conf"
+chmod 0644 "$work/squid/lookup.conf"
+squid_up "$name-squid-lookup" 10.231.79.12 "$work/squid/lookup.conf"
+found="$(through 10.231.79.12 1.1.1.1:443)"
+echo "1.1.1.1 without -n: $found"
+case "$found" in
+    403\ * | *\ ERR_ACCESS_DENIED) fail "Squid without -n refused 1.1.1.1 too: the PTR row shows nothing" ;;
+esac
+docker rm -f "$name-dns" "$name-squid" "$name-squid-mapped" "$name-squid-lookup" >/dev/null
+docker network rm "$squid_net" >/dev/null
 
 step "start the vault, hardened"
 key="$(docker run --rm "$image" keygen | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"

@@ -169,8 +169,10 @@ def _render_squid(lists: Lists, acl_names: Mapping[str, str]) -> list[str]:
         src = _acl_name(source, acl_names)
         for index, dest in enumerate(lists[source], start=1):
             name = f"zoeymcp_{source}_{index}"
+            # -n: no lookup. Without it a dstdomain ACL matches an IP's PTR name, and a dst ACL
+            # resolves a name, both before the final deny; zoeymcp_private_dst resolves, after.
             kind = "dst" if _is_literal(dest.host) else "dstdomain"
-            lines.append(f"acl {name} {kind} {dest.host}")
+            lines.append(f"acl {name} {kind} -n {dest.host}")
             rule = f"http_access allow {src} CONNECT {name} zoeymcp_port_{dest.port}"
             lines.append(rule if dest.private else rule + " !zoeymcp_private_dst")
     return lines

@@ -279,15 +279,15 @@ def test_the_squid_form() -> None:
         "acl zoeymcp_port_80 port 80",
         "acl zoeymcp_port_443 port 443",
         "acl zoeymcp_port_587 port 587",
-        "acl zoeymcp_vault_1 dst 10.0.0.9",
+        "acl zoeymcp_vault_1 dst -n 10.0.0.9",
         "http_access allow zoeymcp_src_vault CONNECT zoeymcp_vault_1 zoeymcp_port_587",
-        "acl zoeymcp_vault_2 dst 2001:db8::5",
+        "acl zoeymcp_vault_2 dst -n 2001:db8::5",
         "http_access allow zoeymcp_src_vault CONNECT zoeymcp_vault_2 zoeymcp_port_443 "
         "!zoeymcp_private_dst",
-        "acl zoeymcp_vault_3 dstdomain auth.notes.example",
+        "acl zoeymcp_vault_3 dstdomain -n auth.notes.example",
         "http_access allow zoeymcp_src_vault CONNECT zoeymcp_vault_3 zoeymcp_port_443 "
         "!zoeymcp_private_dst",
-        "acl zoeymcp_vault_4 dstdomain lan.example",
+        "acl zoeymcp_vault_4 dstdomain -n lan.example",
         "http_access allow zoeymcp_src_vault CONNECT zoeymcp_vault_4 zoeymcp_port_80",
     ]
     assert render(SMALL, "squid").endswith("zoeymcp_port_80\n")
@@ -298,7 +298,9 @@ def test_the_squid_private_rule_is_netguards_tables() -> None:
     line = next(x for x in render(SMALL, "squid").splitlines() if "zoeymcp_private_dst dst" in x)
     entries = line.removeprefix("acl zoeymcp_private_dst dst ").split(" ")
     assert tuple(entries) == netguard.squid_private_dst()
-    assert set(netguard.DENIED_V4) | set(netguard.DENIED_V6) <= set(entries)
+    assert set(entries) <= set(netguard.DENIED_V4) | set(netguard.DENIED_V6)
+    # Squid holds IPv4 as IPv4-mapped: this row would refuse every IPv4 destination.
+    assert "::ffff:0:0/96" not in entries
 
 
 def test_the_squid_form_names_the_operators_acls() -> None:
@@ -314,10 +316,10 @@ def test_the_squid_form_names_the_operators_acls() -> None:
     )
     assert lines[3:] == [
         "acl zoeymcp_port_443 port 443",
-        "acl zoeymcp_bridge-fetch_1 dstdomain docs.example.org",
+        "acl zoeymcp_bridge-fetch_1 dstdomain -n docs.example.org",
         "http_access allow zoeymcp_src_bridge-fetch CONNECT zoeymcp_bridge-fetch_1 "
         "zoeymcp_port_443 !zoeymcp_private_dst",
-        "acl zoeymcp_vault_1 dstdomain auth.notes.example",
+        "acl zoeymcp_vault_1 dstdomain -n auth.notes.example",
         "http_access allow stack_vault_net CONNECT zoeymcp_vault_1 zoeymcp_port_443 "
         "!zoeymcp_private_dst",
     ]

@@ -14,12 +14,15 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .. import __version__
+from ..common import egresslist
 from ..common.adminsocket import DEFAULT_SOCKET, SOCKET_ENV
 from ..common.policy import (
     CONFIG_ENV,
     Finding,
+    Policy,
     PolicyError,
     check_policy,
+    fields,
     parse_policy,
     read_source,
 )
@@ -76,7 +79,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="validate a policy document",
         description=(
             "Validate a policy document: its schema, cross-references and security rules. "
-            f"Reads --config <file>, --config - (stdin) or ${CONFIG_ENV}."
+            f"Reads --config <file>, --config - (stdin) or ${CONFIG_ENV}. With "
+            "--emit-egress-allowlist, print the destinations an egress proxy must allow for it "
+            "instead, and the findings on stderr."
         ),
     )
     check.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
@@ -85,6 +90,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resolve-env",
         action="store_true",
         help="also fail if an env: secret reference names a variable that isn't set",
+    )
+    check.add_argument(
+        "--emit-egress-allowlist",
+        action="store_true",
+        help="print the egress allowlists the policy implies, sorted (nothing if it has errors)",
+    )
+    check.add_argument(
+        "--allowlist-format",
+        choices=("text", "json", "squid"),
+        help="with --emit-egress-allowlist: text (the default), json, or a Squid snippet",
+    )
+    check.add_argument(
+        "--squid-src",
+        action="append",
+        default=[],
+        metavar="SOURCE=ACL",
+        help="the Squid src ACL naming SOURCE's network, over the policy's egress_proxy_acls",
+    )
+    check.add_argument(
+        "--check",
+        dest="compare",
+        metavar="FILE",
+        help="with --emit-egress-allowlist: compare FILE with the output; exit 1 if it differs",
     )
 
     commands.add_parser(
@@ -1371,16 +1399,77 @@ def _report(
     out.write(f"{source}: {verdict} ({errors} error(s), {warnings} warning(s))\n")
 
 
-def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO) -> int:
+def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    emit = args.emit_egress_allowlist
+    if not emit and (args.allowlist_format or args.squid_src or args.compare):
+        err.write(
+            "zoeymcp check: --allowlist-format, --squid-src and --check go with "
+            "--emit-egress-allowlist\n"
+        )
+        return EXIT_UNREADABLE
+    if args.squid_src and (args.allowlist_format or "text") != "squid":
+        err.write("zoeymcp check: --squid-src goes with --allowlist-format squid\n")
+        return EXIT_UNREADABLE
+    # A value's shape is a usage error whatever the policy holds, so it is checked before the
+    # policy is read; whether SOURCE is one of the policy's sources waits for derive's lists.
+    for item in args.squid_src:
+        source, equals, acl = item.partition("=")
+        if not equals or not source or not fields.is_squid_acl_name(acl):
+            err.write(
+                f"zoeymcp check: --squid-src {item}: write SOURCE=ACL, ACL 1 to 64 letters, "
+                "digits or underscores\n"
+            )
+            return EXIT_UNREADABLE
+    # The allowlist goes to stdout, so the findings go to stderr (I.6).
+    findings_out = err if emit else out
     try:
         text, source = read_source(args.config, os.environ, stdin)
         policy = parse_policy(text, source)
     except PolicyError as exc:
-        _report(exc.source, exc.findings, args.format, out, readable=exc.readable)
+        _report(exc.source, exc.findings, args.format, findings_out, readable=exc.readable)
         return EXIT_FINDINGS if exc.readable else EXIT_UNREADABLE
     findings = check_policy(policy, environ=os.environ if args.resolve_env else None)
-    _report(source, findings, args.format, out)
-    return EXIT_FINDINGS if any(f.level == "error" for f in findings) else EXIT_OK
+    _report(source, findings, args.format, findings_out)
+    if any(f.level == "error" for f in findings):
+        return EXIT_FINDINGS
+    return _emit_egress_allowlist(args, policy, out, err) if emit else EXIT_OK
+
+
+def _emit_egress_allowlist(
+    args: argparse.Namespace, policy: Policy, out: TextIO, err: TextIO
+) -> int:
+    """``check --emit-egress-allowlist`` (M7 design I.6): the lists ``egresslist.derive`` gives
+    the egress role, in one form, or with ``--check FILE`` how FILE differs from that form."""
+    fmt: egresslist.Format = args.allowlist_format or "text"
+    lists = egresslist.derive(policy)
+    acl_names = dict(policy.egress_proxy_acls)
+    for item in args.squid_src:
+        source, _, acl = item.partition("=")
+        if source not in lists:
+            err.write(
+                f"zoeymcp check: --squid-src {item}: SOURCE is one of {', '.join(sorted(lists))}\n"
+            )
+            return EXIT_UNREADABLE
+        acl_names[source] = acl
+    if args.compare is None:
+        out.write(egresslist.render(lists, fmt, acl_names=acl_names))
+        return EXIT_OK
+    try:
+        found = Path(args.compare).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        err.write(f"zoeymcp check: can't read {args.compare}: {exc}\n")
+        return EXIT_UNREADABLE
+    differences = egresslist.compare(lists, found, fmt, acl_names=acl_names)
+    for line in differences:
+        out.write(line + "\n")
+    if differences:
+        out.write(
+            f"{args.compare}: out of date ({len(differences)} difference(s)); regenerate it "
+            "with check --emit-egress-allowlist\n"
+        )
+        return EXIT_FINDINGS
+    out.write(f"{args.compare}: matches the policy's egress allowlist\n")
+    return EXIT_OK
 
 
 def gateway_command(
@@ -1418,7 +1507,7 @@ def main(
     args = _build_parser().parse_args(argv)
     stdin, out, err = stdin or sys.stdin, out or sys.stdout, err or sys.stderr
     if args.command == "check":
-        return _cmd_check(args, stdin, out)
+        return _cmd_check(args, stdin, out, err)
     if args.command == "keygen":
         return _cmd_keygen(out)
     if args.command == "client-token":

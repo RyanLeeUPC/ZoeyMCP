@@ -2,7 +2,9 @@
 
 Every row of both tables, both sides of each boundary, every mapped, compatible, 6to4, Teredo and
 NAT64 form of three private addresses, the host-name rules, the egress-list key, the Squid
-entries, and a property: no address the standard library calls non-global is ever allowed.
+entries (against a model of how Squid holds addresses: IPv4 as IPv4-mapped), and two properties:
+no address the standard library calls non-global is ever allowed, and the Squid rule refuses an
+IPv4 address, or its mapped form, exactly when the guard does.
 """
 
 from __future__ import annotations
@@ -416,21 +418,109 @@ def test_listed_compares_as_written() -> None:
 # --- squid_private_dst -------------------------------------------------------------------------
 
 
-def test_squid_private_dst_is_the_tables_with_mapped_and_compatible_forms() -> None:
+# Squid holds every address as IPv6, an IPv4 one in its IPv4-mapped form (Ip::Address), and a dst
+# entry likewise: an IPv4 row a.b.c.d/n is ::ffff:a.b.c.d/(n + 96). These model that.
+MAPPED_PREFIX = 0xFFFF << 32
+
+
+def squid_holds(address: str) -> ipaddress.IPv6Address:
+    ip = ipaddress.ip_address(address)
+    return ipaddress.IPv6Address(MAPPED_PREFIX | int(ip)) if ip.version == 4 else ip
+
+
+def squid_entry(entry: str) -> ipaddress.IPv6Network:
+    net = ipaddress.ip_network(entry)
+    if isinstance(net, ipaddress.IPv4Network):
+        return ipaddress.IPv6Network((MAPPED_PREFIX | int(net.network_address), net.prefixlen + 96))
+    return net
+
+
+def squid_refuses(address: str, entries: tuple[str, ...] | None = None) -> bool:
+    """Whether a Squid ``dst`` ACL of ``entries`` (the emitted rule's) matches ``address``."""
+    held = squid_holds(address)
+    return any(held in squid_entry(e) for e in entries or squid_private_dst())
+
+
+def test_squid_private_dst_is_the_tables_less_the_mapped_row_and_covered_rows() -> None:
+    assert squid_private_dst() == (
+        *DENIED_V4[:-1],  # 255.255.255.255/32 is inside 240.0.0.0/4
+        # ::/128 and ::1/128 are inside ::/96; ::ffff:0:0/96 is Squid's form of all of IPv4.
+        "::/96",
+        "64:ff9b:1::/48",
+        "100::/64",
+        "2001::/32",
+        "2001:db8::/32",
+        "2002::/16",
+        "fc00::/7",
+        "fe80::/10",
+        "fec0::/10",
+        "ff00::/8",
+    )
     entries = squid_private_dst()
-    assert entries[: len(DENIED_V4) + len(DENIED_V6)] == DENIED_V4 + DENIED_V6
-    rest = entries[len(DENIED_V4) + len(DENIED_V6) :]
-    assert len(rest) == 2 * len(DENIED_V4)
-    expected = []
-    for prefix in (0xFFFF << 32, 0):
-        for net in DENIED_V4:
-            v4 = ipaddress.IPv4Network(net)
-            base = prefix | int(v4.network_address)
-            expected.append(ipaddress.IPv6Network((base, v4.prefixlen + 96)))
-    assert [ipaddress.IPv6Network(entry) for entry in rest] == expected
-    # Hex words, never Python's dotted form for a mapped address.
-    assert all("." not in entry for entry in rest)
-    assert rest[1] == "::ffff:a00:0/104"
-    assert rest[len(DENIED_V4) + 1] == "::a00:0/104"
-    for entry in entries:
-        ipaddress.ip_network(entry)  # each is a network as written, host bits clear
+    for row in DENIED_V4 + DENIED_V6:
+        if row in entries or row == "::ffff:0:0/96":
+            continue
+        # Every other row left out is inside one kept, so Squid still refuses all of it.
+        assert any(squid_entry(row).subnet_of(squid_entry(e)) for e in entries), row
+    # As Squid holds them, no two entries overlap: it would warn and merge or drop one.
+    held = [squid_entry(e) for e in entries]
+    assert not [(a, b) for a in held for b in held if a != b and a.overlaps(b)]
+
+
+def test_the_mapped_row_would_refuse_every_ipv4_destination_in_squid() -> None:
+    # Why ::ffff:0:0/96 is left out: Squid would hold 1.1.1.1 inside it.
+    assert squid_refuses("1.1.1.1", ("::ffff:0:0/96",))
+    assert squid_refuses("1.1.1.1", DENIED_V6)
+
+
+@pytest.mark.parametrize(
+    "address", ["1.1.1.1", "8.8.8.8", "93.184.216.34", "::ffff:1.1.1.1", "2606:4700:4700::1111"]
+)
+def test_squid_lets_a_public_address_through(address: str) -> None:
+    assert classify(address) == "global"
+    assert not squid_refuses(address)
+
+
+def test_squid_refuses_both_ends_of_every_row_it_keeps_or_covers() -> None:
+    for row in DENIED_V4 + DENIED_V6:
+        if row == "::ffff:0:0/96":
+            continue
+        net = ipaddress.ip_network(row)
+        for address in (net[0], net[-1]):
+            assert squid_refuses(str(address)), (row, address)
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "::ffff:127.0.0.1",  # an AAAA answer Squid holds as 127.0.0.1 (contract 51)
+        "::ffff:10.0.0.9",
+        "::ffff:169.254.169.254",
+        "::a00:9",  # compatible: inside ::/96
+        "::7f00:1",
+    ],
+)
+def test_squid_refuses_a_mapped_or_compatible_private_address(address: str) -> None:
+    assert classify(address) != "global"
+    assert squid_refuses(address)
+
+
+def test_squid_lets_a_nat64_private_address_through() -> None:
+    # The recorded limit (M7 design 0.5): only the guard sees the IPv4 address in 64:ff9b::/96.
+    assert classify("64:ff9b::a00:9") == "private"
+    assert not squid_refuses("64:ff9b::a00:9")
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.integers(min_value=0, max_value=2**32 - 1))
+def test_squid_and_the_guard_agree_on_every_ipv4_address(value: int) -> None:
+    v4 = str(ipaddress.IPv4Address(value))
+    mapped = f"::ffff:{v4}"
+    refused = classify(v4) != "global"
+    assert squid_refuses(v4) == refused
+    assert squid_refuses(mapped) == refused == (classify(mapped) != "global")
+
+
+def test_squid_entries_are_networks_as_written() -> None:
+    for entry in squid_private_dst():
+        assert str(ipaddress.ip_network(entry)) == entry  # host bits clear, the short form

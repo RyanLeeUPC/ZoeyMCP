@@ -14,6 +14,8 @@ import pytest
 import yaml
 
 from zoeymcp.cli.main import EXIT_FINDINGS, EXIT_OK, main
+from zoeymcp.common import egresslist
+from zoeymcp.common.netguard import entry_key
 from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.selftest import runner
 from zoeymcp.selftest.cases import CaseFile, UpstreamExpectation, parse_cases
@@ -114,6 +116,43 @@ def test_credential_false_catches_a_leak(tmp_path: Path) -> None:
     )
     [result] = asyncio.run(Rig(policy, tmp_path).run(policy, cases))
     assert result.problems == ["a secret reached the upstream"]
+
+
+BROKER_POST = "the gateway may post to the broker's MCP endpoint with an access token"
+
+
+@pytest.mark.parametrize(
+    ("dropped", "reaching"),
+    [
+        # a route upstream
+        ("api.stats.example:443", {"stats read gets the forced user and the injected key"}),
+        ("mcp.broker.example:443", {BROKER_POST}),  # a route upstream, over OAuth
+        ("auth.broker.example:443", {BROKER_POST}),  # a token endpoint
+        ("smtp.mail.example:465", {"the gateway may send, with an idempotency key"}),  # a connector
+    ],
+)
+def test_every_destination_reached_is_in_the_derived_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dropped: str, reaching: set[str]
+) -> None:
+    # fold-in C32: the example's cases pass while derive names every destination they reach
+    # (test_example_cases_pass), and a destination derive left out fails exactly the cases whose
+    # request reaches it (the refused ones reach nothing), each with that one problem.
+    derive = egresslist.derive
+
+    def short(policy: Policy) -> egresslist.Lists:
+        vault = derive(policy)[egresslist.VAULT]
+        return {egresslist.VAULT: tuple(d for d in vault if entry_key(d.host, d.port) != dropped)}
+
+    monkeypatch.setattr(egresslist, "derive", short)
+    policy = example_policy()
+    results = asyncio.run(Rig(policy, tmp_path).run(policy, example_cases()))
+    problem = (
+        f"the vault connected to {dropped}, which the egress allowlist derived from the policy "
+        "doesn't name"
+    )
+    failed = [r for r in results if not r.ok]
+    assert {r.name for r in failed} == reaching
+    assert all(r.problems == [problem] for r in failed)
 
 
 def test_case_file_validation() -> None:
