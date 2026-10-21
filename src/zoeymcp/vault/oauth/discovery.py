@@ -83,7 +83,8 @@ Reason = Literal[
 QueryFor = Literal["authorize", "token"]
 PrmSource = Literal["challenge", "path", "root"]
 IssuerSource = Literal["only", "chosen", "given", "origin", "heuristic"]
-ScopeSource = Literal["challenge", "prm", "as", "as_too_many", "none"]
+# "given": the operator's own scopes (--scope), which replace the ones discovery chose (D.10).
+ScopeSource = Literal["challenge", "prm", "as", "as_too_many", "none", "given"]
 ProbeStep = Literal["challenge", "legacy", "well_known"]
 
 _RESERVED: Final[Mapping[QueryFor, frozenset[str]]] = {
@@ -824,6 +825,7 @@ SCOPE_SOURCES: Final[Mapping[str, str]] = {
     "as_too_many": "the authorization server lists more than a credential holds (64 scopes, "
     "2,048 characters), so none of its list is requested: name the ones you need",
     "none": "none named",
+    "given": "the scopes you gave",
 }
 
 

@@ -11,12 +11,14 @@ from zoeymcp.vault.secretplan import (
     NOT_WRITTEN,
     NOT_WRITTEN_REFUSAL,
     DeletePlan,
+    OnboardPutPlan,
     PutPlan,
     Reason,
     SecretRefusal,
     binding_refusal,
     check_name,
     plan_delete,
+    plan_onboard_secret,
     plan_put,
 )
 
@@ -305,3 +307,90 @@ def test_the_refusals_after_a_plan() -> None:
     assert NOT_WRITTEN == "kept in memory, not written to disk; check the state volume"
     assert refusal(500, "not_written", NOT_WRITTEN) == NOT_WRITTEN_REFUSAL
     assert refusal(404, "not_found", "no such secret") == NOT_FOUND
+
+
+# --- an onboarding's client secret (M7 design D.7) ----------------------------------------------
+
+NOTES = {
+    "oauth": {
+        "token": "https://auth.notes.example:443",
+        "resources": ["https://mcp.notes.example:443"],
+    }
+}
+META = {
+    "onboarded": "auth.notes.example",
+    "resource": "https://mcp.notes.example/mcp",
+    "client_id": "notes-client",
+    "client_secret_expires_at": None,
+}
+
+
+def onboard(name: str = "notes-client-secret", value: object = "notes-secret-1", **kw: Any) -> Any:
+    return plan_onboard_secret(name, value, NOTES, META, store_names=kw.get("store", ()))
+
+
+def test_an_onboarding_secret_plan_carries_its_meta() -> None:
+    binding, meta = dict(NOTES), dict(META)
+    plan = plan_onboard_secret(
+        "notes-client-secret", "notes-secret-1", binding, meta, store_names=["other"]
+    )
+    assert plan == OnboardPutPlan("notes-client-secret", "notes-secret-1", NOTES, META)
+    assert isinstance(plan, OnboardPutPlan)
+    # No running credential uses the name yet, so the store writes it, never the manager.
+    assert plan.oauth is False
+    # Copies: a caller's later change reaches no plan.
+    binding["oauth"] = {}
+    meta["client_id"] = "changed"
+    assert (plan.binding, plan.meta) == (NOTES, META)
+    assert "notes-secret-1" not in repr(plan)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Notes-Secret", refusal(400, "invalid_name", "invalid secret name")),
+        (
+            "oauth.notes.live",
+            refusal(409, "vault_managed", "managed by the vault; use zoeymcp login"),
+        ),
+    ],
+)
+def test_an_onboarding_secrets_name_is_checked(name: str, expected: SecretRefusal) -> None:
+    assert onboard(name) == expected
+
+
+def test_an_onboarding_secret_never_replaces_an_entry() -> None:
+    """D.7 step 1: a name the store has is name_taken, whatever the value."""
+    taken = refusal(409, "name_taken", "the store already has notes-client-secret")
+    assert onboard(store=["notes-client-secret"]) == taken
+    assert onboard(value="", store=["notes-client-secret"]) == taken
+    assert isinstance(onboard(store=["notes-client-secret-2"]), OnboardPutPlan)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", refusal(400, "empty_value", "value must be a non-empty string")),
+        (None, refusal(400, "empty_value", "value must be a non-empty string")),
+        (
+            f"abc{ZWSP}",
+            refusal(400, "bad_value", "value has line breaks, control or invisible characters"),
+        ),
+        (
+            "abc\rdef",
+            refusal(400, "bad_value", "value has line breaks, control or invisible characters"),
+        ),
+        (
+            E_ACUTE + "a" * 65535,
+            refusal(409, "value_too_large", "a secret can't be larger than 65536 bytes"),
+        ),
+    ],
+    ids=["empty", "none", "zwsp", "return", "too-large"],
+)
+def test_an_onboarding_secrets_value_is_checked(value: object, expected: SecretRefusal) -> None:
+    assert onboard(value=value) == expected
+
+
+def test_an_onboarding_secret_up_to_the_store_limit() -> None:
+    value = E_ACUTE + "a" * 65534
+    assert onboard(value=value) == OnboardPutPlan("notes-client-secret", value, NOTES, META)

@@ -27,6 +27,12 @@ errors are ``{"error", "reason"}`` with a stable reason. No answer holds a token
 or secret; the authorization URL holds ``state`` and the PKCE challenge, which are useless
 without the verifier the vault keeps.
 
+``POST /onboard/discover``, ``POST /onboard/{onboarding}/register``, ``POST
+/onboard/{onboarding}/fragment`` and ``DELETE /onboard/{onboarding}`` are onboarding by URL's
+phase 1 (M7 design M.1), owned by the CLI: :class:`.onboard.OnboardService`, which the portal
+shares, answers them, and a refusal is the catalogue's ``{"error", "reason"}`` with its own
+status (M.2). A given client secret comes in the register body, and no answer carries it.
+
 ``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
 design I), gathered by :class:`HealthReader`, which the portal's ``GET /api/health`` shares.
 
@@ -75,6 +81,13 @@ from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import KeySet, PortalKey
 from .oauth.login import LoginError, LoginService
 from .oauth.tokens import TokenManager
+from .onboard import (
+    DISCOVER_BODY_MAX,
+    FRAGMENT_BODY_MAX,
+    REGISTER_BODY_MAX,
+    OnboardError,
+    OnboardService,
+)
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
 from .secretplan import SecretRefusal
@@ -83,6 +96,7 @@ from .store import SecretStore
 MAX_BODY = 128 * 1024
 MAX_COMPLETE_BODY = 8 * 1024
 NO_TOKENS = "OAuth needs the vault's token manager"
+NO_ONBOARDING: Final = "this vault runs no onboarding service"
 NO_GATEWAY_KEYS = "the vault keeps no gateway key state"
 # POST /setup-code takes {reset?}.
 MAX_SETUP_BODY: Final = 4 * 1024
@@ -111,6 +125,7 @@ _LOGIN_STATUS = {
     "binding_changed": 409,
     "client_id_unavailable": 409,
     "client_secret_unavailable": 409,
+    "client_secret_binding_changed": 409,
     "too_many_flows": 429,
 }
 
@@ -431,6 +446,7 @@ class AdminApp:
         reports: ReportStore | None = None,
         passkeys: Passkeys | None = None,
         portal: PortalSessions | None = None,
+        onboard: OnboardService | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -445,8 +461,12 @@ class AdminApp:
         ``/passkeys`` answers 503 and health has no ``passkeys``.
 
         ``portal`` holds the portal's sessions: ``/sessions`` lists and ends them, and removing
-        a passkey ends the sessions it made. Without a portal there are none."""
+        a passkey ends the sessions it made. Without a portal there are none.
+
+        ``onboard`` is onboarding by URL's service, shared with the portal. Without it, the
+        ``/onboard`` routes answer 503."""
         self._store = store
+        self._onboard = onboard
         self._portal = portal
         self._passkeys = passkeys
         self._reports = reports
@@ -486,6 +506,10 @@ class AdminApp:
                 Route("/oauth/{credential}/login", self._oauth_login, methods=["POST"]),
                 Route("/oauth/{credential}/complete", self._oauth_complete, methods=["POST"]),
                 Route("/oauth/{credential}/reset", self._oauth_reset, methods=["POST"]),
+                Route("/onboard/discover", self._onboard_discover, methods=["POST"]),
+                Route("/onboard/{onboarding}/register", self._onboard_register, methods=["POST"]),
+                Route("/onboard/{onboarding}/fragment", self._onboard_fragment, methods=["POST"]),
+                Route("/onboard/{onboarding}", self._onboard_cancel, methods=["DELETE"]),
                 Route("/health", self._health, methods=["GET"]),
                 Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
                 Route("/ledger/reported/restart", self._ledger_restart, methods=["POST"]),
@@ -707,6 +731,56 @@ class AdminApp:
             return _login_error(LoginError("not_oauth", f"no oauth2 credential named {name!r}"))
         return JSONResponse({"credential": name, "reset": True})
 
+    # --- onboarding by URL (M7 design M.1) -----------------------------------------------------
+
+    async def _onboard_discover(self, request: Request) -> Response:
+        """The plan, or the onboarding of the same URL and names carried on (D.8, D.11)."""
+        if self._onboard is None:
+            return _reason(503, NO_ONBOARDING, "unavailable")
+        data = await _json_object(request, DISCOVER_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        try:
+            answer = await self._onboard.discover(data)
+        except OnboardError as exc:
+            return _onboard_refused(exc)
+        return JSONResponse(answer)
+
+    async def _onboard_register(self, request: Request) -> Response:
+        """``{client_secret?}``: the secret stored and fragment 1 (D.7). Never echoed."""
+        if self._onboard is None:
+            return _reason(503, NO_ONBOARDING, "unavailable")
+        data = await _json_object(request, REGISTER_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        try:
+            answer = await self._onboard.register(request.path_params["onboarding"], data)
+        except OnboardError as exc:
+            return _onboard_refused(exc)
+        return JSONResponse(answer)
+
+    async def _onboard_fragment(self, request: Request) -> Response:
+        """``{indent?}``: fragment 1, made or again (OPS-2)."""
+        if self._onboard is None:
+            return _reason(503, NO_ONBOARDING, "unavailable")
+        data = await _json_object(request, FRAGMENT_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        try:
+            answer = await self._onboard.fragment(request.path_params["onboarding"], data)
+        except OnboardError as exc:
+            return _onboard_refused(exc)
+        return JSONResponse(answer)
+
+    async def _onboard_cancel(self, request: Request) -> Response:
+        if self._onboard is None:
+            return _reason(503, NO_ONBOARDING, "unavailable")
+        try:
+            await self._onboard.cancel(request.path_params["onboarding"])
+        except OnboardError as exc:
+            return _onboard_refused(exc)
+        return Response(status_code=204)
+
     # --- health (M5 design I) ------------------------------------------------------------------
 
     async def _health(self, request: Request) -> Response:
@@ -800,6 +874,10 @@ class AdminApp:
             except OSError:
                 return _reason(500, NOT_WRITTEN, "not_written")
         return JSONResponse({"restarted": done.to_json(), "head": copy.head().to_json()})
+
+
+def _onboard_refused(exc: OnboardError) -> JSONResponse:
+    return JSONResponse(exc.answer.body(), status_code=exc.answer.status)
 
 
 def _reason(status: int, message: str, reason: str) -> JSONResponse:

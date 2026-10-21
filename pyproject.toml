@@ -203,3 +203,4 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.common.policy.change" = 95
 "zoeymcp.common.policy.emit" = 95
 "zoeymcp.common.policy.merge" = 95
+"zoeymcp.vault.onboarding" = 95

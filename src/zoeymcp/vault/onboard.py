@@ -1,0 +1,1160 @@
+"""Onboarding by URL, phase 1 (M7 design D.1-D.4, D.7, D.11, E.1-E.3, M.1, M.7). I/O, not mutated.
+
+:class:`OnboardService` is the one set of onboardings the admin socket (and, later, the portal)
+reaches, built once before them, like ``LoginService``. Its decisions are elsewhere and pure:
+what an answer means in ``oauth/discovery.py``, the table, names, ``next`` lists and the second
+run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the requests go through
+``oauth/fetch.py`` on the guarded onboarding client. Here they are put in order:
+
+- **Discover**: the probe (and one legacy probe after a 400), the protected-resource metadata,
+  or D.2a's legacy issuers when there is none, the authorization server's metadata, a
+  resolution check of every endpoint host the vault will connect to, and the plan with its draft
+  check (OPS-5). A given confidential client's issuer must be the one the operator named
+  (TI-15). Without a given client ID the answer is ``registration_unavailable``: the vault
+  registers no client itself yet (DCR comes later in M7).
+- **An operator's own proxy** refusing a host blocks the onboarding (D.11): ``proxy_refused``
+  with the hosts it needs and their Squid lines; the same discovery resumes it.
+- **Register** (a given confidential client) stores the secret under the binding fragment 1 will
+  derive, through ``secretops`` (D.7), after the draft check passes again, and deletes it again
+  if anything fails after the write (OPS-5); **fragment** makes a given public client's
+  fragment 1, sending and storing nothing, or renders a registered onboarding's again at any
+  indent (OPS-2).
+- **After a restart** (D.7 step 6) the same discovery finds the client secret an earlier run
+  stored for this server by its entry's meta, and takes it on, registered at once, only if its
+  authenticated binding is the one the fresh discovery predicts: fragment 1 again, with no
+  second registration or write.
+
+Every refusal is the catalogue's (``portal/refusals.py``): one status and one text on every
+surface. Nothing here logs an onboarding's ID, a secret, a URL path or query, or a body (X19);
+M.4's events are ``onboard_started``, ``discovery_fetch``, ``onboard_planned``,
+``onboard_refused``, ``onboard_registered``, ``onboard_blocked``, ``onboard_ended`` and
+``address_refused``.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+import secrets
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Final, cast
+from urllib.parse import urlsplit
+
+import anyio
+import httpx
+from pydantic import ValidationError
+
+from ..common import egresslist, netguard
+from ..common.policy.change import (
+    AddCredential,
+    AddEgressPrivate,
+    AddRoute,
+    AddServer,
+    ChangeRefused,
+    PolicyChange,
+    validate,
+)
+from ..common.policy.emit import COMPOSE_INDENT, INDENT_MAX, EmitRefused, Target, emit
+from ..common.policy.findings import Finding
+from ..common.policy.schema import (
+    _SCOPE_TOKEN,
+    MAX_SCOPES,
+    NAME_PATTERN,
+    OAuth2Credential,
+    Policy,
+    RemoteServer,
+    Route,
+    _check_redirect_uri,
+)
+from ..portal.refusals import Refusal as Answer
+from ..portal.refusals import refusal
+from ..portal.refusals import secret as secret_refusal
+from . import logs, netclient, secretops, secretplan
+from .bindings import oauth_binding
+from .oauth.discovery import (
+    LEGACY_PROBE,
+    MODERN_PROBE,
+    PKCE_METHOD,
+    SCOPE_TEXT_MAX,
+    AsMetadata,
+    Challenge,
+    IssuerSource,
+    Plan,
+    Prm,
+    PrmSource,
+    Refusal,
+    Scopes,
+    as_candidates,
+    as_exhausted,
+    build_plan,
+    check_as_metadata,
+    check_prm,
+    choose_issuer,
+    legacy_candidates,
+    origin_of,
+    parse_challenge,
+    prm_candidates,
+    prm_exhausted,
+    probe_next,
+    typed_url,
+)
+from .oauth.fetch import Fetcher, FetchError, FetchRecord, ProxyRefused
+from .oauth.pkce import CLI_OWNER
+from .oauth.tokens import TokenManager
+from .onboarding import (
+    INLINE_SOURCE,
+    NAME_SOURCES,
+    STDIN_SOURCE,
+    Names,
+    OnboardingRecord,
+    OnboardingRefused,
+    OnboardingTable,
+    Options,
+    choose_names,
+    in_use,
+    name_taken,
+    next_for,
+    secret_names,
+    server_host_port,
+    server_path,
+    surface,
+)
+from .secretplan import SecretRefusal
+from .store import SecretStore, SecretUnavailable
+
+# The body caps (K.2's discover; a secret; an indent).
+DISCOVER_BODY_MAX: Final = 4 * 1024
+REGISTER_BODY_MAX: Final = 8 * 1024
+FRAGMENT_BODY_MAX: Final = 1024
+# What a discovery may name: K.2's keys, the CLI's --name, the private tick (host access), and
+# whether a confidential client's secret follows at register (D.7).
+DISCOVER_KEYS: Final = frozenset(
+    {
+        "url",
+        "name",
+        "credential",
+        "route",
+        "server",
+        "issuer",
+        "scope",
+        "client_id",
+        "client_auth",
+        "redirect_uri",
+        "client_name",
+        "allow_private",
+        "secret_given",
+    }
+)
+# The address an operator-registered client uses unless told otherwise (D.4, D-15).
+SHARED_REDIRECT: Final = str(OAuth2Credential.model_fields["redirect_uri"].default)
+# A given client ID as fragment 1 can hold it: printable ASCII without a space, a quote, a
+# backslash or a $ (TI-1), at most the schema's 512.
+_CLIENT_ID = re.compile(r"[\x21\x23\x25-\x5b\x5d-\x7e]{1,512}")
+_CLIENT_NAME = re.compile(r"[\x20-\x7e]{1,64}")
+_NAME = re.compile(NAME_PATTERN)
+# The route's rules: the server's path, with what an MCP client sends (E.2).
+MCP_METHODS: Final = ("POST", "GET", "DELETE")
+BACKSTOP_OFF: Final = (
+    "The redirect address isn't this credential's own, so an answer meant for another "
+    "credential's sign-in isn't refused by its address (D.6's backstop is off for it)."
+)
+
+# The store name of a credential's client secret ends so (D.7 step 1).
+_SECRET_SUFFIX: Final = "-client-secret"  # noqa: S105 - a store name, not a secret
+
+Resolver = netclient.Resolver
+
+
+class OnboardError(Exception):
+    """A refused step: the catalogue's answer, as every surface sends it."""
+
+    def __init__(self, answer: Answer) -> None:
+        self.answer = answer
+        super().__init__(answer.reason)
+
+
+@dataclass(frozen=True)
+class _Kept:
+    """A client secret an earlier run stored for this server and kept across a restart (D.7
+    step 6), and the options a run that takes it on has: a confidential client's, with the
+    client ID from the entry's meta unless the run gives it (``from_meta``)."""
+
+    name: str
+    options: Options
+    from_meta: bool
+
+
+def _bad_body(detail: str) -> OnboardError:
+    return OnboardError(replace(refusal("bad_body"), more=(("detail", detail),)))
+
+
+def application_type(redirect_uri: str) -> str:
+    """Where the client runs, by the redirect's host whatever the scheme (D.4): ``native`` for a
+    loopback address or ``localhost``, else ``web``."""
+    host = urlsplit(redirect_uri).hostname or ""
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    return "native" if loopback else "web"
+
+
+def policy_source(config: str | None) -> str:
+    """The running policy's source as ``zoeymcp check`` names it (``load.read_source``)."""
+    if config is None:
+        return INLINE_SOURCE
+    return STDIN_SOURCE if config == "-" else config
+
+
+def _default_resolver() -> Resolver:
+    hooks = netclient.HOOKS
+    if hooks is not None and hooks.resolver is not None:
+        return hooks.resolver
+    return netclient.resolve
+
+
+def _host_port(url: str) -> tuple[str, int]:
+    parts = urlsplit(url)
+    return str(parts.hostname).lower(), parts.port or 443
+
+
+def _issuer_host(plan: Plan) -> str:
+    return _host_port(plan.issuer)[0]
+
+
+class OnboardService:
+    """Onboardings in progress and their steps, shared by every surface. ``client`` is the
+    onboarding client (``netclient.onboarding_client``); ``egress_proxy`` the startup one;
+    ``source`` the running policy's source label, for the ``next`` lists; ``resolver`` answers
+    names for the endpoint check (tests only)."""
+
+    def __init__(
+        self,
+        store: SecretStore,
+        tokens: TokenManager | None,
+        policy: Callable[[], Policy],
+        client: httpx.AsyncClient,
+        *,
+        egress_proxy: str | None = None,
+        source: str = INLINE_SOURCE,
+        clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
+        token: Callable[[int], str] = secrets.token_urlsafe,
+        resolver: Resolver | None = None,
+    ) -> None:
+        self._store = store
+        self._tokens = tokens
+        self._policy = policy
+        self._client = client
+        self._egress_proxy = egress_proxy
+        self._source = source
+        self._clock = clock
+        self._wall = wall
+        self._resolver = resolver
+        self._table = OnboardingTable(clock, token=token)
+
+    # --- discover ------------------------------------------------------------------------------
+
+    async def discover(self, body: Mapping[str, Any], *, owner: str = CLI_OWNER) -> dict[str, Any]:
+        """Phase 1's discovery (D.1-D.3), or the owner's onboarding of the same URL and names
+        carried on: a blocked one from the start, a discovered or registered one as it is."""
+        self._sweep()
+        policy = self._policy()
+        url, given, options = _request(body)
+        own = self._table.owned(owner)
+        kept: _Kept | None = None
+        if (
+            own is not None
+            and (own.server_url, own.options) == (url, options)
+            and _names_match(url, given, own.names)
+        ):
+            # The same run again (--plan-only, a retry): its names, though it may have stored
+            # an entry under them since.
+            names = own.names
+        else:
+            names, kept = self._names(url, given, owner, policy, options)
+            if kept is not None:
+                options = kept.options
+        try:
+            started = self._table.start(owner, url, names, options)
+        except OnboardingRefused as exc:
+            raise OnboardError(_table_refusal(exc)) from None
+        record = started.record
+        if started.resumed and record.stage in ("discovered", "registered"):
+            return self._plan_answer(record, policy, kept)
+        host = server_host_port(url)[0]
+        logs.event(
+            "onboard_started", owner=surface(owner), host=host, allow_private=options.allow_private
+        )
+        try:
+            plan = await self._discover(record, policy, kept=kept is not None)
+            if kept is not None:
+                self._check_kept(record, plan, kept)
+            policy = self._policy()
+            draft = self._draft_check(record, plan, policy)
+            record = self._table.discovered(record.id, owner, plan, draft)
+            if kept is not None:
+                record = self._registered_again(record, owner)
+        except ProxyRefused as exc:
+            raise OnboardError(self._blocked(record, exc, policy)) from None
+        except OnboardError as exc:
+            self._table.cancel(record.id, owner)
+            logs.event("onboard_refused", reason=exc.answer.reason, host=host)
+            raise
+        except (OnboardingRefused, ValueError):
+            # Cancelled or replaced while it ran.
+            raise OnboardError(refusal("onboarding_unknown")) from None
+        meta = plan.metadata
+        logs.event(
+            "onboard_planned",
+            host=host,
+            issuer=_issuer_host(plan),
+            require_iss=meta.require_iss,
+            registration="given",
+            auth=_client_auth(options),
+            scopes=len(plan.scopes.scopes),
+        )
+        if kept is not None:
+            logs.event(
+                "onboard_registered",
+                credential=record.names.credential,
+                issuer=_issuer_host(plan),
+                auth=_client_auth(options),
+                secret_stored=False,
+            )
+        return self._plan_answer(record, policy, kept)
+
+    def _names(
+        self,
+        url: str,
+        given: Mapping[str, str],
+        owner: str,
+        policy: Policy,
+        options: Options,
+    ) -> tuple[Names, _Kept | None]:
+        """The names given, each refused ``name_taken`` if the policy or the store has it, or
+        the defaults, which are free (OPS-15). A client secret an earlier run stored for this
+        server doesn't take the names it was stored under (D.7 step 6): they are this run's,
+        and the secret comes back with them, for the discovery to check."""
+        store_names = self._store.names()
+        others = self._table.names_in_use(owner)
+        for kept in self._kept(url, options):
+            rest = [name for name in store_names if name != kept.name]
+            names = choose_names(url, in_use(policy, rest, others), **given)
+            if (
+                secret_names(names.credential)[0] == kept.name
+                and name_taken(names, policy, rest) is None
+            ):
+                return names, kept
+        names = choose_names(url, in_use(policy, store_names, others), **given)
+        if given:  # _request checked each name given
+            found = name_taken(names, policy, store_names)
+            if found is not None:
+                raise OnboardError(refusal("name_taken", name=found))
+        return names, None
+
+    def _kept(self, url: str, options: Options) -> list[_Kept]:
+        """The client secrets an earlier run stored for this server, found by their entries'
+        meta (D.7 step 4: it finds an entry and decides nothing; the binding is checked after
+        discovery). A run that gives another client ID takes none on."""
+        origin = origin_of(url)
+        resources = (url, origin, f"{origin}/")
+        found = []
+        for entry in self._store.metadata():
+            meta = entry.meta or {}
+            client_id = meta.get("client_id")
+            if (
+                not entry.name.endswith(_SECRET_SUFFIX)
+                or meta.get("resource") not in resources
+                or not isinstance(client_id, str)
+                or not _CLIENT_ID.fullmatch(client_id)
+                or options.client_id not in (None, client_id)
+            ):
+                continue
+            try:
+                taken_on = replace(options, client_id=client_id, secret_given=True)
+            except ValueError:  # a run naming client authentication none
+                continue
+            found.append(_Kept(entry.name, taken_on, from_meta=options.client_id is None))
+        return found
+
+    def _check_kept(self, record: OnboardingRecord, plan: Plan, kept: _Kept) -> None:
+        """D.7 step 6 (MISS-14): the kept secret's entry names the resource this discovery
+        found, and its authenticated binding is the one this discovery predicts, else its names
+        stay taken. The clear meta only found it; the binding decides."""
+        entry = self._store.entry(kept.name)
+        same = entry is not None and (entry.meta or {}).get("resource") == plan.resource
+        if same:
+            try:
+                self._store.get_for_binding(kept.name, _binding(record, plan))
+            except SecretUnavailable:
+                same = False
+        if not same:
+            raise OnboardError(refusal("name_taken", name=record.names.credential))
+
+    def _registered_again(self, record: OnboardingRecord, owner: str) -> OnboardingRecord:
+        """A kept secret's onboarding, registered at once: fragment 1 as the earlier run made
+        it, checked with the policy now, with nothing registered or written (GR-21)."""
+        change = self._change(record)
+        _passes(self._findings(self._policy(), change))
+        return self._table.registered(record.id, owner, change)
+
+    async def _discover(self, record: OnboardingRecord, policy: Policy, *, kept: bool) -> Plan:
+        """D.2, D.2a and D.3 in order, each answer judged by ``discovery``. A kept secret
+        (``kept``, D.7 step 6) is sent nowhere and bound to nothing new, so it needs no named
+        issuer: its binding decides."""
+        fetcher = Fetcher(
+            self._client,
+            proxied=self._egress_proxy is not None,
+            onboarding=record.id,
+            private_target=record.private_target,
+            clock=self._clock,
+            report=_report,
+        )
+        url, options = record.server_url, record.options
+        answer = await _fetched(fetcher.probe(url, MODERN_PROBE))
+        step = probe_next(answer.status, legacy_sent=False)
+        if step == "legacy":
+            answer = await _fetched(fetcher.probe(url, LEGACY_PROBE))
+            step = probe_next(answer.status, legacy_sent=True)
+        challenge: Challenge | None = None
+        if step == "challenge":
+            challenge = _checked(parse_challenge(answer.challenges))
+        tried: list[str] = []
+        prm: Prm | None = None
+        prm_url: str | None = None
+        for candidate in prm_candidates(url, challenge):
+            self._widen(record, candidate.url)
+            tried.append(candidate.url)
+            well_known = candidate.source != "challenge"
+            fetched = await _fetched(fetcher.metadata(candidate.url, "prm", well_known=well_known))
+            if fetched.document is not None:
+                source = cast(PrmSource, candidate.source)  # prm_candidates' sources
+                prm = _checked(check_prm(fetched.document, source, url))
+                prm_url = candidate.url
+                break
+        issuer_source: IssuerSource
+        if prm is not None:
+            issuer = _checked(choose_issuer(prm.authorization_servers, options.issuer))
+            if options.secret_given and options.issuer is None and not kept:
+                # TI-15: a given secret goes only to the issuer the operator named.
+                raise OnboardError(_discovery_refusal(Refusal("as_unknown", values=(issuer,))))
+            issuer_source = "only" if options.issuer is None else "chosen"
+            metadata_url, metadata = await self._as_metadata(record, fetcher, issuer)
+        else:
+            found = None
+            for candidate in legacy_candidates(url, options.issuer):
+                self._widen(record, candidate.url)
+                tried.append(candidate.url)
+                fetched = await _fetched(fetcher.metadata(candidate.url, "as", well_known=True))
+                if fetched.document is not None:
+                    assert candidate.issuer is not None  # noqa: S101 - legacy candidates name one
+                    checked = _checked(check_as_metadata(fetched.document, candidate.issuer))
+                    found = (candidate.url, checked, candidate.source)
+                    break
+            if found is None:
+                raise OnboardError(
+                    _discovery_refusal(prm_exhausted(tried, probe_status=answer.status))
+                )
+            metadata_url, metadata, legacy = found
+            if options.secret_given and options.issuer is None and not kept:
+                raise OnboardError(
+                    _discovery_refusal(Refusal("as_unknown", values=(metadata.issuer,)))
+                )
+            issuer_source = cast(IssuerSource, legacy)  # legacy_candidates' sources
+        await self._check_endpoints(record, metadata, policy)
+        plan = _checked(
+            build_plan(
+                url,
+                challenge=challenge,
+                prm=prm,
+                resource_metadata=prm_url,
+                issuer_source=issuer_source,
+                metadata_url=metadata_url,
+                metadata=metadata,
+            )
+        )
+        if options.scope is not None:
+            plan = replace(plan, scopes=Scopes(tuple(options.scope.split(" ")), "given", False))
+        if options.client_id is None:
+            # D.4's order, until this vault registers clients: a given client ID, or none.
+            raise OnboardError(refusal("registration_unavailable", host=_issuer_host(plan)))
+        return plan
+
+    async def _as_metadata(
+        self, record: OnboardingRecord, fetcher: Fetcher, issuer: str
+    ) -> tuple[str, AsMetadata]:
+        """The issuer's metadata from the first candidate that has it (D.3)."""
+        tried = []
+        for candidate in as_candidates(issuer):
+            self._widen(record, candidate)
+            tried.append(candidate)
+            fetched = await _fetched(fetcher.metadata(candidate, "as", well_known=True))
+            if fetched.document is not None:
+                return candidate, _checked(check_as_metadata(fetched.document, issuer))
+        raise OnboardError(_discovery_refusal(as_exhausted(tried)))
+
+    async def _check_endpoints(
+        self, record: OnboardingRecord, metadata: AsMetadata, policy: Policy
+    ) -> None:
+        """D.3's resolution check of each endpoint the vault will connect to, without
+        ``egress_proxy`` (which checks for itself): a hostile token endpoint on a private
+        address fails before the operator commits it. Private is allowed for a ``host:port`` the
+        policy lists in ``egress_private``, or the typed server's own with ``allow_private``,
+        which fragment 1 lists."""
+        if self._egress_proxy is not None:
+            return
+        resolver = self._resolver or _default_resolver()
+        for url in (
+            metadata.token_endpoint,
+            metadata.registration_endpoint,
+            metadata.revocation_endpoint,
+        ):
+            if url is None:
+                continue
+            host, port = _host_port(url)
+            try:
+                with anyio.fail_after(netclient.RESOLVE_TIMEOUT):
+                    addresses = await resolver(host, port)
+            except (OSError, TimeoutError, UnicodeError):
+                raise OnboardError(refusal("resolve_failed", host=host)) from None
+            key = netguard.entry_key(host, port)
+            private_ok = key in policy.egress_private or key == record.private_target
+            verdict = netguard.addresses_allowed(addresses, private_ok=private_ok)
+            if not verdict.allowed:
+                logs.event(
+                    "address_refused",
+                    purpose="discovery",
+                    host=host,
+                    port=port,
+                    verdict=verdict.reason,
+                )
+                raise OnboardError(refusal("address_refused", host=host))
+
+    def _widen(self, record: OnboardingRecord, url: str) -> None:
+        """The allowance with the host the next request goes to (I.3)."""
+        self._table.widen(record.id, record.owner, [_host_port(url)])
+
+    def _blocked(self, record: OnboardingRecord, exc: ProxyRefused, policy: Policy) -> Answer:
+        """D.11: the onboarding blocks, keeping its allowance, and the answer names what the
+        operator's proxy must allow."""
+        try:
+            record = self._table.block(record.id, record.owner, (exc.host, exc.port), policy)
+        except (OnboardingRefused, ValueError):
+            return refusal("onboarding_unknown")
+        logs.event("onboard_blocked", host=exc.host, port=exc.port, needed=len(record.needed_hosts))
+        return self._blocked_answer(record, policy, exc.status)
+
+    def _blocked_answer(
+        self, record: OnboardingRecord, policy: Policy, status: int | None
+    ) -> Answer:
+        assert record.blocked_on is not None  # noqa: S101 - a blocked record names its host
+        host, port = record.blocked_on
+        more = (
+            ("host", host),
+            ("port", port),
+            ("status", status),
+            ("next", self._next(record, policy)),
+        )
+        return replace(refusal("proxy_refused", host=host), more=more)
+
+    # --- the change and its checks (E.2, OPS-5) -----------------------------------------------
+
+    def _change(self, record: OnboardingRecord) -> PolicyChange:
+        """Fragment 1 (E.2): the credential, its route to the server's origin, and the server
+        with no tools; with ``allow_private``, the server's ``host:port`` in ``egress_private``.
+        Every value is a validated URL, a scope token, or what the operator typed."""
+        plan, names, options = record.plan, record.names, record.options
+        assert plan is not None  # noqa: S101 - a discovered record holds its plan
+        meta = plan.metadata
+        client_secret, _, refresh = secret_names(names.credential)
+        auth = _client_auth(options)
+        fields: dict[str, Any] = {
+            "kind": "oauth2",
+            "token_url": meta.token_endpoint,
+            "authorize_url": meta.authorization_endpoint,
+            "issuer": plan.issuer,
+            "require_iss": meta.require_iss,
+            "client_id": options.client_id,
+            "client_auth": auth,
+            "refresh_token": f"store:{refresh}",
+            # A public client's refresh tokens rotate (RFC 9700 2.2.2), as check expects.
+            "rotates": auth == "none",
+            "redirect_uri": _redirect(options),
+            "extra_params": {"resource": plan.resource},
+            "authorize_params": {"resource": plan.resource},
+        }
+        if meta.revocation_endpoint is not None:
+            fields["revocation_url"] = meta.revocation_endpoint
+        if plan.resource_metadata is not None:
+            fields["resource_metadata"] = plan.resource_metadata
+        if options.secret_given:
+            fields["client_secret"] = f"store:{client_secret}"
+        if plan.scopes.scopes:
+            fields["scope"] = " ".join(plan.scopes.scopes)
+        url = record.server_url
+        path = server_path(url)
+        try:
+            credential = OAuth2Credential.model_validate(fields)
+            route = Route.model_validate(
+                {
+                    "name": names.route,
+                    "prefix": f"/{names.route}",
+                    "upstream": origin_of(url),
+                    "credential": names.credential,
+                    "callers": ["gateway"],
+                    "stream": True,
+                    "rules": [{"methods": list(MCP_METHODS), "paths": [path]}],
+                }
+            )
+            server = RemoteServer.model_validate(
+                {"kind": "remote", "route": names.route, "path": path, "tools": {"include": []}}
+            )
+        except ValidationError as exc:
+            detail = "; ".join(error["msg"] for error in exc.errors(include_url=False))
+            raise OnboardError(refusal("diff_invalid", detail=detail)) from None
+        ops: list[Any] = [
+            AddCredential(names.credential, credential),
+            AddRoute(route),
+            AddServer(names.server, server),
+        ]
+        if options.allow_private:
+            ops.append(AddEgressPrivate(netguard.entry_key(*server_host_port(url))))
+        title = (
+            f"onboarding {names.server} (1 of 2). Merge into your policy; nothing here replaces "
+            "a key you have."
+        )
+        return PolicyChange(title, tuple(ops))
+
+    def _findings(self, policy: Policy, change: PolicyChange) -> list[Finding]:
+        """``check`` on the running policy with ``change`` merged; a merge the schema refuses
+        is its errors (E.2)."""
+        try:
+            return validate(policy, change)
+        except ChangeRefused as exc:
+            if exc.reason == "name_taken":
+                raise OnboardError(refusal("name_taken", name=exc.path)) from None
+            messages = exc.messages or ("the merged policy doesn't load",)
+            return [Finding(exc.path, "error", message) for message in messages]
+
+    def _draft_check(self, record: OnboardingRecord, plan: Plan, policy: Policy) -> list[Finding]:
+        """D.8's draft check: fragment 1 as it will be, merged into the running policy, so an
+        error shows in the plan before anything is stored (OPS-5)."""
+        return self._findings(policy, self._change(replace(record, plan=plan)))
+
+    # --- register and fragment (D.7, E.2, OPS-2) -----------------------------------------------
+
+    async def register(
+        self, onboarding: str, body: Mapping[str, Any], *, owner: str = CLI_OWNER
+    ) -> dict[str, Any]:
+        """Store a given confidential client's secret and make fragment 1 (D.7); for a public
+        client, fragment 1 alone. A registered onboarding answers its fragment 1 again."""
+        if not set(body) <= {"client_secret"}:
+            raise _bad_body("expected {client_secret?}")
+        secret = body.get("client_secret")
+        if secret is not None and not isinstance(secret, str):
+            raise _bad_body("client_secret is a string")
+        record = self._ready(onboarding, owner)
+        if record.stage == "registered":
+            if secret is not None:
+                raise _bad_body("this onboarding is registered; its secret is stored")
+            return self._fragment_answer(record, 0, "plain")
+        if record.options.secret_given != (secret is not None):
+            raise _bad_body(
+                "a client secret comes here exactly when the onboarding was started with one"
+            )
+        return await self._finish(record, owner, secret)
+
+    async def fragment(
+        self, onboarding: str, body: Mapping[str, Any], *, owner: str = CLI_OWNER
+    ) -> dict[str, Any]:
+        """Fragment 1 for a given public client (nothing sent, nothing stored, PC-13), or a
+        registered onboarding's again, at ``indent`` (0-16, or ``compose``; OPS-2)."""
+        if not set(body) <= {"indent"}:
+            raise _bad_body("expected {indent?}")
+        indent, target = _indent(body.get("indent", 0))
+        record = self._ready(onboarding, owner)
+        if record.stage == "registered":
+            return self._fragment_answer(record, indent, target)
+        if record.options.secret_given:
+            raise _bad_body("this client's secret comes with register, which makes its fragment")
+        return await self._finish(record, owner, None, indent, target)
+
+    async def cancel(self, onboarding: str, *, owner: str = CLI_OWNER) -> None:
+        """Drop the owner's onboarding; another owner's answers as an unknown one (X24)."""
+        self._sweep()
+        ended = self._table.cancel(onboarding, owner)
+        if ended is None:
+            raise OnboardError(refusal("onboarding_unknown"))
+        logs.event("onboard_ended", why=ended.why)
+
+    def cancel_owner(self, owner: str) -> None:
+        """A portal session ended: its onboarding goes with it (D.8)."""
+        for ended in self._table.cancel_owner(owner):
+            logs.event("onboard_ended", why=ended.why)
+
+    def _ready(self, onboarding: str, owner: str) -> OnboardingRecord:
+        """The owner's onboarding, discovered or registered; a blocked one answers its
+        refusal again, with the hosts its proxy needs."""
+        self._sweep()
+        try:
+            record = self._table.get(onboarding, owner)
+        except OnboardingRefused as exc:
+            raise OnboardError(_table_refusal(exc)) from None
+        if record.stage == "blocked":
+            raise OnboardError(self._blocked_answer(record, self._policy(), None))
+        if record.stage == "discovering":
+            raise OnboardError(refusal("onboarding_unknown"))
+        return record
+
+    async def _finish(
+        self,
+        record: OnboardingRecord,
+        owner: str,
+        secret: str | None,
+        indent: int = 0,
+        target: Target = "plain",
+    ) -> dict[str, Any]:
+        """D.7's write path: the draft check again, the secret under the predicted binding, the
+        final check, then fragment 1. Whatever fails after the write deletes the secret again
+        in the same run, and the answer says so, so a run again never meets ``name_taken`` on
+        this run's own leftover (OPS-5)."""
+        plan = _plan(record)
+        change = self._change(record)
+        _passes(self._findings(self._policy(), change))
+        text = _emitted(change, indent, target)
+        if secret is None:
+            return self._register(record, owner, change, text, stored=False)
+        via: secretops.Via = "socket" if owner == CLI_OWNER else "portal"
+        name = secret_names(record.names.credential)[0]
+        planned = self._secret_plan(record, plan, name, secret)
+        # Still this owner's and still discovered, so a run that has expired never writes.
+        self._discovered(record, owner)
+        written = await secretops.put(self._store, self._tokens, planned, via=via)
+        try:
+            if isinstance(written, SecretRefusal):
+                # The store's only refusal of a plan without oauth: kept in memory alone, and
+                # deleted below, so nothing changed.
+                raise OnboardError(refusal("not_written"))
+            return self._register(record, owner, change, text, stored=True)
+        except OnboardError as exc:
+            deleting = secretplan.plan_delete(name, self._policy())
+            await secretops.delete(self._store, self._tokens, deleting, via=via)
+            raise OnboardError(_deleted(exc.answer)) from None
+
+    def _discovered(self, record: OnboardingRecord, owner: str) -> None:
+        """The onboarding as ``_ready`` found it, still: not expired, cancelled or replaced
+        since."""
+        try:
+            current = self._table.get(record.id, owner)
+        except OnboardingRefused as exc:
+            raise OnboardError(_table_refusal(exc)) from None
+        if current.stage != "discovered":
+            raise OnboardError(refusal("onboarding_unknown"))
+
+    def _register(
+        self,
+        record: OnboardingRecord,
+        owner: str,
+        change: PolicyChange,
+        text: str,
+        *,
+        stored: bool,
+    ) -> dict[str, Any]:
+        """The final check, then the onboarding registered with fragment 1 (E.2)."""
+        plan = _plan(record)
+        policy = self._policy()
+        findings = self._findings(policy, change)
+        if any(finding.level == "error" for finding in findings):
+            raise OnboardError(_diff_invalid(findings, deleted=stored))
+        try:
+            record = self._table.registered(record.id, owner, change)
+        except (OnboardingRefused, ValueError):
+            # Expired, cancelled or replaced while the secret was written.
+            raise OnboardError(refusal("onboarding_unknown")) from None
+        logs.event(
+            "onboard_registered",
+            credential=record.names.credential,
+            issuer=_issuer_host(plan),
+            auth=_client_auth(record.options),
+            secret_stored=stored,
+        )
+        return self._registered(record, text, findings, policy)
+
+    def _secret_plan(
+        self, record: OnboardingRecord, plan: Plan, name: str, secret: str
+    ) -> secretplan.OnboardPutPlan:
+        """The given secret's write, in the store under the binding fragment 1 will derive for
+        it: the token endpoint, and the server's origin as its route's upstream (D.7 steps
+        1-4)."""
+        binding = _binding(record, plan)
+        meta = {
+            "onboarded": _issuer_host(plan),
+            "resource": plan.resource,
+            "client_id": record.options.client_id,
+            "client_secret_expires_at": None,
+        }
+        planned = secretplan.plan_onboard_secret(
+            name, secret, binding, meta, store_names=self._store.names()
+        )
+        if isinstance(planned, SecretRefusal):
+            raise OnboardError(secret_refusal(planned, name=name))
+        return planned
+
+    # --- answers -------------------------------------------------------------------------------
+
+    def _next(self, record: OnboardingRecord, policy: Policy) -> list[dict[str, Any]]:
+        # The ports the policy's emitted Squid file has an ACL for (I.6), so the blocked
+        # answer defines only the others (D.11).
+        emitted = {d.port for d in egresslist.derive(policy)[egresslist.VAULT]}
+        steps = next_for(
+            record,
+            self._source,
+            own_proxy=self._egress_proxy is not None,
+            acl_names=policy.egress_proxy_acls,
+            emitted_ports=emitted,
+        )
+        return [step.answer() for step in steps]
+
+    def _expires(self, record: OnboardingRecord) -> int:
+        return int(self._wall() + record.expires_at - self._clock())
+
+    def _plan_answer(
+        self, record: OnboardingRecord, policy: Policy, kept: _Kept | None = None
+    ) -> dict[str, Any]:
+        """The plan (D.8, M.1): every host, endpoint and choice, the names, the draft check and
+        what to do next; for a kept secret (D.7 step 6), where its client ID came from."""
+        plan, names, options = _plan(record), record.names, record.options
+        meta = plan.metadata
+        redirect = _redirect(options)
+        kind = application_type(redirect)
+        notes = list(plan.notes)
+        if not _own_redirect(redirect, names.credential):
+            notes.append("backstop_off")
+        rows = [list(row) for row in plan.rows()]
+        rows += [
+            [
+                "Names",
+                f"{names.credential}, {names.route}, {names.server} ({NAME_SOURCES[names.source]})",
+            ],
+            ["Client", f"{options.client_id} ({_client_source(kept)})"],
+            ["Client authentication", _client_auth(options)],
+            ["Redirect", f"{redirect} ({kind})"],
+        ]
+        if kept is not None:
+            rows.append(
+                [
+                    "Client secret",
+                    f"{kept.name}, stored by an earlier run; nothing is registered or stored again",
+                ]
+            )
+        if "backstop_off" in notes:
+            rows.append(["Note", BACKSTOP_OFF])
+        return {
+            "onboarding": record.id,
+            "stage": record.stage,
+            "expires": self._expires(record),
+            "names": {
+                "credential": names.credential,
+                "route": names.route,
+                "server": names.server,
+                "source": names.source,
+            },
+            "plan": {
+                "server_url": plan.server_url,
+                "resource": plan.resource,
+                "resource_metadata": plan.resource_metadata,
+                "resource_name": plan.resource_name,
+                "issuer": plan.issuer,
+                "issuer_source": plan.issuer_source,
+                "metadata_url": plan.metadata_url,
+                "authorization_endpoint": meta.authorization_endpoint,
+                "token_endpoint": meta.token_endpoint,
+                "registration_endpoint": meta.registration_endpoint,
+                "revocation_endpoint": meta.revocation_endpoint,
+                "require_iss": meta.require_iss,
+                "pkce": PKCE_METHOD,
+                "registration": "given",
+                "client_id": options.client_id,
+                "client_auth": _client_auth(options),
+                "secret_given": options.secret_given,
+                "redirect_uri": redirect,
+                "application_type": kind,
+                "scopes": list(plan.scopes.scopes),
+                "scope_source": plan.scopes.source,
+                "offline_access_added": plan.scopes.offline_access_added,
+                "hosts": list(plan.hosts),
+                "notes": notes,
+            },
+            "rows": rows,
+            "allowance": sorted(netguard.entry_key(h, p) for h, p in record.allowance),
+            "draft_check": [finding.as_dict() for finding in record.draft_check],
+            "next": self._next(record, policy),
+        }
+
+    def _registered(
+        self, record: OnboardingRecord, text: str, findings: list[Finding], policy: Policy
+    ) -> dict[str, Any]:
+        """M.1's register answer: what was stored (never the value) and fragment 1."""
+        options = record.options
+        return {
+            "onboarding": record.id,
+            "stage": record.stage,
+            "credential": record.names.credential,
+            "client_auth": _client_auth(options),
+            "secret_stored": options.secret_given,
+            "secret_name": secret_names(record.names.credential)[0]
+            if options.secret_given
+            else None,
+            "client_secret_expires_at": None,
+            "diff": {"yaml": text, "check": [finding.as_dict() for finding in findings]},
+            "next": self._next(record, policy),
+        }
+
+    def _fragment_answer(
+        self, record: OnboardingRecord, indent: int, target: Target
+    ) -> dict[str, Any]:
+        """A registered onboarding's fragment 1 again (OPS-2), checked against the policy now."""
+        change = record.change
+        assert change is not None  # noqa: S101 - a registered record holds its change
+        policy = self._policy()
+        return self._registered(
+            record, _emitted(change, indent, target), self._findings(policy, change), policy
+        )
+
+    def _sweep(self) -> None:
+        """Log every onboarding that ended since the last call: replaced, expired, or registered
+        with its credential now in the running policy."""
+        for ended in self._table.sweep(self._policy().credentials):
+            logs.event("onboard_ended", why=ended.why)
+
+
+# --- the request ---------------------------------------------------------------------------------
+
+
+def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:
+    """A discovery's body: the server URL (B.4's rule for a typed URL), the names given, and
+    the options, each checked so fragment 1 can hold it."""
+    unknown = set(body) - DISCOVER_KEYS
+    if unknown:
+        raise _bad_body(f"unknown keys: {', '.join(sorted(unknown))}")
+    strings: dict[str, str] = {}
+    for key, value in body.items():
+        if key in ("allow_private", "secret_given"):
+            if not isinstance(value, bool):
+                raise _bad_body(f"{key} is true or false")
+        elif not isinstance(value, str):
+            raise _bad_body(f"{key} is a string")
+        else:
+            strings[key] = value
+    allow_private = bool(body.get("allow_private", False))
+    if "url" not in strings:
+        raise _bad_body("url is required")
+    url = typed_url(strings["url"], purpose="url", allow_private=allow_private)
+    if isinstance(url, Refusal):
+        raise OnboardError(_discovery_refusal(url))
+    issuer = strings.get("issuer")
+    if issuer is not None:
+        checked = typed_url(issuer, purpose="issuer")
+        if isinstance(checked, Refusal):
+            raise OnboardError(_discovery_refusal(checked))
+    given: dict[str, str] = {
+        key: strings[key] for key in ("name", "credential", "route", "server") if key in strings
+    }
+    for key, value in given.items():
+        if not _NAME.fullmatch(value):
+            raise _bad_body(f"{key} isn't a policy name")
+    scope = strings.get("scope")
+    if scope is not None:
+        tokens = scope.split(" ")
+        if (
+            len(tokens) > MAX_SCOPES
+            or len(scope) > SCOPE_TEXT_MAX
+            or not all(_SCOPE_TOKEN.fullmatch(t) and "$" not in t for t in tokens)
+        ):
+            raise _bad_body("scope is up to 64 scope tokens, one space apart, with no $")
+    client_id = strings.get("client_id")
+    if client_id is not None and not _CLIENT_ID.fullmatch(client_id):
+        raise _bad_body("client_id is printable ASCII without a space, a quote, \\ or $")
+    client_auth = strings.get("client_auth")
+    if client_auth is not None and client_auth not in ("none", "basic", "post"):
+        raise _bad_body("client_auth is none, basic or post")
+    redirect = strings.get("redirect_uri")
+    if redirect is not None:
+        try:
+            _check_redirect_uri(redirect)
+        except ValueError as exc:
+            raise _bad_body(f"redirect_uri: {exc}") from None
+        if "$" in redirect:
+            raise _bad_body("redirect_uri holds a $")
+    client_name = strings.get("client_name")
+    if client_name is not None and not _CLIENT_NAME.fullmatch(client_name):
+        raise _bad_body("client_name is 1 to 64 printable ASCII characters")
+    try:
+        options = Options(
+            client_id=client_id,
+            client_auth=client_auth,  # type: ignore[arg-type]
+            redirect_uri=redirect,
+            issuer=issuer,
+            scope=scope,
+            client_name=client_name,
+            allow_private=allow_private,
+            secret_given=bool(body.get("secret_given", False)),
+        )
+    except ValueError as exc:
+        raise _bad_body(str(exc)) from None
+    return url, given, options
+
+
+def _names_match(url: str, given: Mapping[str, str], names: Names) -> bool:
+    """Whether the names a run gives (none, or the same) are an onboarding's."""
+    return not given or choose_names(url, lambda name: False, **given).same(names)
+
+
+def _indent(value: object) -> tuple[int, Target]:
+    """A fragment's indent: 0 to 16 spaces, or ``compose`` (H.2)."""
+    if value == "compose":
+        return COMPOSE_INDENT, "compose"
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= INDENT_MAX:
+        raise _bad_body(f"indent is 0 to {INDENT_MAX}, or compose")
+    return value, "plain"
+
+
+# --- helpers -------------------------------------------------------------------------------------
+
+
+async def _fetched[T](call: Awaitable[T]) -> T:
+    """A fetch's answer, or its refusal as the catalogue words it. A proxy's refusal passes
+    through for D.11."""
+    try:
+        result = await call
+    except FetchError as exc:
+        if exc.reason == "address_refused":
+            logs.event(
+                "address_refused",
+                purpose="discovery",
+                host=exc.host,
+                port=exc.port,
+                verdict=exc.why,
+            )
+        raise OnboardError(_fetch_refusal(exc)) from None
+    return result
+
+
+def _checked[T](value: T | Refusal) -> T:
+    if isinstance(value, Refusal):
+        raise OnboardError(_discovery_refusal(value))
+    return value
+
+
+def _report(record: FetchRecord) -> None:
+    logs.event(
+        "discovery_fetch",
+        fetch_kind=record.kind,  # "kind" is the logger's own argument
+        host=record.host,
+        port=record.port,
+        status=record.status,
+        bytes=record.bytes,
+        ms=record.ms,
+        via=record.via,
+    )
+
+
+def _fetch_refusal(exc: FetchError) -> Answer:
+    if exc.reason == "fetch_failed":
+        detail = exc.why if exc.status is None else f"{exc.why}, HTTP {exc.status}"
+        return refusal("fetch_failed", host=exc.host, detail=detail)
+    return refusal(exc.reason, host=exc.host)
+
+
+def _discovery_refusal(found: Refusal) -> Answer:
+    """A discovery refusal with the fields its text names. Only values the vault built or
+    validated go beside it: the URLs tried, the issuers, the two resources."""
+    reason, values = found.reason, found.values
+    detail = " ".join(part for part in (found.field, found.why) if part) or "invalid"
+    fields: dict[str, str] = {}
+    more: tuple[tuple[str, Any], ...] = ()
+    if reason in ("url_invalid", "prm_invalid", "as_metadata_invalid"):
+        fields = {"detail": detail}
+    elif reason == "endpoint_invalid":
+        fields = {"field": found.field, "detail": found.why}
+    elif reason == "url_dollar":
+        fields = {"field": found.field}
+    elif reason == "prm_resource_mismatch":
+        fields = {"resource": values[0], "expected": values[1]}
+    elif reason in ("as_choice_needed", "as_unknown"):
+        fields = {"issuers": ", ".join(values)}
+        more = (("issuers", list(values)),)
+    elif reason in ("prm_not_found", "as_metadata_not_found"):
+        more = (("tried", list(values)),)
+    answer = refusal(reason, **fields)
+    return replace(answer, more=more) if more else answer
+
+
+def _table_refusal(exc: OnboardingRefused) -> Answer:
+    if exc.reason == "name_taken":
+        return refusal("name_taken", name=exc.values[0])
+    return refusal(exc.reason)
+
+
+def _deleted(answer: Answer) -> Answer:
+    """A refusal after the client secret was written, which this run then deleted (OPS-5)."""
+    return replace(answer, more=(*answer.more, ("secret_deleted", True)))
+
+
+def _diff_invalid(findings: list[Finding], *, deleted: bool) -> Answer:
+    errors = [f"{f.path}: {f.message}" for f in findings if f.level == "error"]
+    detail = "; ".join(errors[:5])
+    if deleted:
+        detail += "; the client secret this run stored was deleted"
+    answer = refusal("diff_invalid", detail=detail)
+    return replace(answer, more=(("check", [f.as_dict() for f in findings]),))
+
+
+def _passes(findings: list[Finding]) -> None:
+    if any(finding.level == "error" for finding in findings):
+        raise OnboardError(_diff_invalid(findings, deleted=False))
+
+
+def _emitted(change: PolicyChange, indent: int, target: Target) -> str:
+    try:
+        return emit(change, indent=indent, target=target)
+    except EmitRefused as exc:
+        raise OnboardError(refusal("diff_invalid", detail=f"{exc.path}: {exc.reason}")) from None
+
+
+def _binding(record: OnboardingRecord, plan: Plan) -> dict[str, Any]:
+    """The binding fragment 1 derives for the client secret (D.7 step 2): the token endpoint,
+    and the server's origin as its route's upstream."""
+    return oauth_binding(plan.metadata.token_endpoint, [origin_of(record.server_url)])
+
+
+def _client_source(kept: _Kept | None) -> str:
+    if kept is not None and kept.from_meta:
+        return "from the stored client secret's entry"
+    return "given"
+
+
+def _plan(record: OnboardingRecord) -> Plan:
+    assert record.plan is not None  # noqa: S101 - discovered and registered records hold one
+    return record.plan
+
+
+def _client_auth(options: Options) -> str:
+    return options.client_auth or "none"
+
+
+def _redirect(options: Options) -> str:
+    return options.redirect_uri or SHARED_REDIRECT
+
+
+def _own_redirect(redirect: str, credential: str) -> bool:
+    """Whether the redirect address is the credential's own (D.4, D.6's backstop): its path
+    ends in a segment that is the credential's name, as login's per-credential addresses do
+    (``/callback/<credential>``, ``/oauth/callback/<credential>``). The shared default never
+    is, whatever the credential is called."""
+    if redirect == SHARED_REDIRECT:
+        return False
+    return urlsplit(redirect).path.rsplit("/", 1)[-1] == credential

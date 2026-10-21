@@ -1053,6 +1053,25 @@ def test_the_portal_shares_the_sockets_setup_codes_passkeys_and_logins(
     assert portal.app.origins == ("http://localhost:8081", "https://zoeymcp.tailnet.example")
 
 
+def test_one_onboarding_service_on_the_onboarding_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7 design D.8, B.2: one set of onboardings, built before the socket, on the guarded
+    onboarding client and the startup egress_proxy, naming the policy's source in ``next``."""
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    vault = server.build(
+        str(EXAMPLE_POLICY), ["127.0.0.1:8080"], tmp_path, env(), tmp_path / "admin.sock"
+    )
+    try:
+        assert vault.admin is not None
+        assert vault.admin._onboard is vault.onboard
+        assert vault.onboard._client is vault.app.onboarding_client
+        assert (vault.onboard._egress_proxy, vault.onboard._source) == (None, str(EXAMPLE_POLICY))
+    finally:
+        asyncio.run(vault.app.aclose())
+
+
 def test_the_portal_is_built_without_the_socket_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

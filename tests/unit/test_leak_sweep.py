@@ -25,6 +25,9 @@ the one answer that mints it.
 
 The gateway's view of the policy gets its own sweep: built from a policy with every vault-side
 value filled in, it may hold none of them (M3 design D.1, invariant G1).
+
+A given confidential client's secret (M7 design D.7, X8, X19) is swept on its own: onboarded over
+the admin socket, it reaches the store and nothing else, its fragment holding only the ref.
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ from tests.fakes.oauth_server import (
     google_style,
     spotify_style,
 )
+from tests.unit import onboard_model
 from tests.unit.report_model import DIGEST, PIN, asked_line
 from zoeymcp.cli.main import main
 from zoeymcp.common import ledgerreport
@@ -70,6 +74,7 @@ from zoeymcp.vault.request import oauth_client_variants
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
+from .test_admin import AdminRig
 from .test_no_secret_answers import Recording, step_up
 from .test_oauth_tokens import KEYS, FakeClock
 from .test_portal_wire import ORIGIN
@@ -1125,3 +1130,55 @@ async def test_the_callback_shows_no_query_and_its_binder_only_in_its_cookie(
 
 def _flow(begun: dict[str, Any]) -> dict[str, Any]:
     return {"flow": begun["flow"], "returned": True}
+
+
+async def test_a_given_client_secret_reaches_the_store_and_nothing_else(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """Every onboarding answer and log line, through a refused register, a draft run whose
+    final check fails (the secret stored and deleted again, OPS-5), fragment 1 again at each
+    indent and a resumed discovery."""
+    rig = AdminRig(tmp_path, onboard=True)
+    secret = {"client_secret": onboard_model.GIVEN_SECRET}
+    texts: list[str] = []
+
+    async def call(method: str, path: str, body: Any = None) -> httpx.Response:
+        response = await rig.call(method, path, body)
+        texts.append(response.text + repr(response.headers.multi_items()))
+        return response
+
+    plan = (await call("POST", "/onboard/discover", onboard_model.confidential())).json()
+    onboarding = plan["onboarding"]
+    refused = await call("POST", f"/onboard/{onboarding}/fragment", secret)
+    assert refused.status_code == 400
+    made = await call("POST", f"/onboard/{onboarding}/register", secret)
+    assert made.status_code == 200
+    for indent in (0, 4, "compose"):
+        await call("POST", f"/onboard/{onboarding}/fragment", {"indent": indent})
+    again = await call("POST", f"/onboard/{onboarding}/register", secret)
+    assert again.status_code == 400
+    await call("POST", "/onboard/discover", onboard_model.confidential())
+    assert (await call("DELETE", f"/onboard/{onboarding}")).status_code == 204
+    # A second client under other names, whose final check fails after its secret is written.
+    second = {**onboard_model.confidential(), "name": "notes-b"}
+    plan = (await call("POST", "/onboard/discover", second)).json()
+    store_put = rig.store.put
+
+    def put_then_clash(*args: Any, **kwargs: Any) -> None:
+        store_put(*args, **kwargs)
+        raw = rig.policy.model_dump(by_alias=True)
+        clash = {**raw["routes"][0], "name": "clash", "prefix": "/notes-b"}
+        rig.policy = Policy.model_validate({**raw, "routes": [*raw["routes"], clash]})
+
+    rig.store.put = put_then_clash  # type: ignore[method-assign]
+    failed = await call("POST", f"/onboard/{plan['onboarding']}/register", secret)
+    assert failed.status_code == 422
+    assert rig.store.entry("notes-b-client-secret") is None
+    stored, _ = rig.store.get_for_oauth(
+        onboard_model.SECRET_NAME, token_url=f"{onboard_model.ISSUER}/token"
+    )
+    assert stored.reveal() == onboard_model.GIVEN_SECRET
+    assert '"store:notes-client-secret"' in made.json()["diff"]["yaml"]
+    swept = "".join([*texts, log_lines.getvalue()])
+    assert onboard_model.GIVEN_SECRET not in swept
+    await rig.token_client.aclose()

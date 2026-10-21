@@ -448,9 +448,9 @@ async def test_start_needs_a_usable_client_secret(tmp_path: Path, clock: FakeClo
         "the client secret isn't set or isn't bound to the token endpoint; "
         "enter the client secret with zoeymcp secret set google-secret"
     )
-    # Bound to another token endpoint: the same refusal.
+    # Bound to another token endpoint: since M7 (X8), the binding check's refusal.
     rig.store.put("google-secret", GOOGLE_SECRET, oauth_binding("https://elsewhere.example", [API]))
-    assert (await rig.refused(rig.start())).reason == "client_secret_unavailable"
+    assert (await rig.refused(rig.start())).reason == "client_secret_binding_changed"
     rig.put_client_secret()
     assert (await rig.start())["flow"]
 
@@ -468,6 +468,53 @@ async def test_an_unset_env_client_secret_is_refused(tmp_path: Path, clock: Fake
         "the client secret isn't set or isn't bound to the token endpoint; "
         "set the client secret in env GOOGLE_SECRET and restart the vault"
     )
+
+
+async def test_a_client_secret_bound_otherwise_is_refused(tmp_path: Path, clock: FakeClock) -> None:
+    """M7 D.7 step 5: a client secret in the store is bound to the token endpoint and the
+    resource origins the policy derived when it was stored (an onboarded client's, the ones
+    fragment 1 named). A committed policy that derives others refuses, and --rebind doesn't
+    apply: the secret is entered again."""
+    policy = make_policy({"music": google()}, routes={"music": (API, OTHER)})
+    rig = Rig(tmp_path, clock, policy, google_style(clock.time))
+    rig.put_client_secret()
+    refused = await rig.refused(rig.start())
+    assert refused.reason == "client_secret_binding_changed"
+    assert str(refused) == (
+        "the committed token endpoint or server origin differs from the ones this client was "
+        "registered with; onboard again, or set the secret with zoeymcp secret set google-secret"
+    )
+    both = oauth_binding(TOKEN_URL, [API, OTHER])
+    assert refused.details == {"old": BINDING, "new": both}
+    assert (await rig.refused(rig.start(rebind=True))).reason == "client_secret_binding_changed"
+    rig.store.put("google-secret", GOOGLE_SECRET, both)
+    assert (await rig.start())["flow"]
+
+
+async def test_a_committed_token_url_edited_after_onboarding(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """X8: diff 1 committed with an edited token_url. The secret was stored under the
+    binding the fragment derived, so the start refuses before any client is built."""
+    edited = "https://elsewhere.example/token"
+    policy = make_policy({"music": google(token_url=edited)})
+    rig = Rig(tmp_path, clock, policy, google_style(clock.time))
+    rig.put_client_secret()
+    refused = await rig.refused(rig.start())
+    assert refused.reason == "client_secret_binding_changed"
+    assert refused.details == {"old": BINDING, "new": oauth_binding(edited, [API])}
+    assert (await rig.refused(rig.start(rebind=True))).reason == "client_secret_binding_changed"
+
+
+async def test_a_client_secret_the_policy_cant_bind(tmp_path: Path, clock: FakeClock) -> None:
+    """Two credentials sending one stored client secret to two token endpoints."""
+    other = google(token_url="https://elsewhere.example/token", refresh_token="store:other-rt")
+    policy = make_policy({"music": google(), "other": other})
+    rig = Rig(tmp_path, clock, policy, google_style(clock.time))
+    rig.put_client_secret()
+    refused = await rig.refused(rig.start())
+    assert refused.reason == "no_route"
+    assert str(refused).startswith("'google-secret' would be sent to the token endpoints ")
 
 
 async def test_a_changed_binding_needs_rebind(tmp_path: Path, clock: FakeClock) -> None:

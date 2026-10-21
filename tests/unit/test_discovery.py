@@ -1454,6 +1454,8 @@ def test_the_notes_and_scope_sources_are_pinned() -> None:
         "as_too_many": "the authorization server lists more than a credential holds (64 "
         "scopes, 2,048 characters), so none of its list is requested: name the ones you need",
         "none": "none named",
+        # The operator's own (--scope), which replace what discovery chose (step 8a2).
+        "given": "the scopes you gave",
     }
 
 

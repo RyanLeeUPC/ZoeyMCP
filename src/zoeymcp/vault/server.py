@@ -66,6 +66,7 @@ from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
 from .oauth.login import LoginService
+from .onboard import OnboardService, policy_source
 from .peer import link_supported, peer_checked
 from .reportstore import ReportStore
 from .store import SecretStore, StoreError
@@ -656,6 +657,7 @@ class Vault:
     app: VaultApp
     gateway_keys: GatewayKeys
     login: LoginService
+    onboard: OnboardService
     setup: SetupCodes
     passkeys: Passkeys
     admin: AdminApp | None
@@ -736,6 +738,16 @@ def build(
         raise StartupError(f"can't recover the SMTP connectors' send journals: {exc}") from exc
     # One set of pending logins for every surface, so the flow limit is shared (M5 design H.2).
     login = LoginService(app.tokens)
+    # Likewise one set of onboardings, so their limits and owners hold across surfaces (M7
+    # design D.8): on the onboarding client, with the startup egress_proxy (B.2, D-61).
+    onboard = OnboardService(
+        runtime.store,
+        app.tokens,
+        lambda: app.policy,
+        app.onboarding_client,
+        egress_proxy=app.egress_proxy,
+        source=policy_source(config),
+    )
     # The portal's state files, one holder each for the socket and the portal. Built on every
     # platform: on Windows, or with --admin-socket none, the portal still redeems a code issued
     # offline with zoeymcp setup-code --state (M5 design E.2, verifier V12).
@@ -794,5 +806,8 @@ def build(
             reports=reports,
             passkeys=passkeys,
             portal=None if portal is None else portal.app,
+            onboard=onboard,
         )
-    return Vault(app, runtime.gateway_keys, login, setup, passkeys, admin, admin_socket, portal)
+    return Vault(
+        app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal
+    )

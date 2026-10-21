@@ -3,7 +3,8 @@
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
 ``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
 literal discovery ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused`` and fetch error
-reason), so a reason added there without a sentence here fails.
+reason, and every refusal the onboarding service words itself), so a reason added there without
+a sentence here fails.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from zoeymcp.portal.refusals import (
     wrong_host_literal,
 )
 from zoeymcp.portal.refusals import login as login_refusal
-from zoeymcp.vault import admin, onboarding, secretplan, store
+from zoeymcp.vault import admin, onboard, onboarding, secretplan, store
 from zoeymcp.vault.oauth import discovery, fetch, login, pkce
 from zoeymcp.vault.secretplan import SecretRefusal
 
@@ -131,6 +132,10 @@ ONBOARDING = {
     "onboarding_busy": 429,
     "onboarding_options_changed": 409,
 }
+# M7's M.2: the onboarding service's own (M7 step 8a2), and login's check of an onboarded
+# client's secret (D.7).
+SERVICE = {"registration_unavailable": 409, "proxy_refused": 502}
+LOGIN7 = {"client_secret_binding_changed": 409}
 FETCH = {
     "address_refused": 502,
     "resolve_failed": 502,
@@ -205,6 +210,8 @@ FIELDS = {
     "fetch_redirect": {"host"},
     "fetch_too_large": {"host"},
     "fetch_not_json": {"host"},
+    "registration_unavailable": {"host"},
+    "proxy_refused": {"host"},
 }
 
 
@@ -251,7 +258,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
-    expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH
+    expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -336,6 +343,7 @@ def test_every_redirect_reason_is_catalogued() -> None:
 
 def test_every_login_reason_is_catalogued() -> None:
     found = literal_reasons(login, "LoginError")
+    assert set(LOGIN7) <= found
     # The failure reasons of a client ref, and the token manager's own (tokens.client_for).
     found |= set(login._CLIENT_REFS) | {"not_configured"}
     assert "exchange_failed:" in found
@@ -373,6 +381,23 @@ def test_every_fetch_reason_is_catalogued() -> None:
     found = literal_reasons(fetch, "_error")
     assert found == set(get_args(fetch.Reason))
     assert found == set(FETCH)
+    assert found <= set(CATALOGUE)
+
+
+def test_every_onboarding_service_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to vault/onboard.py. Its own refusals are literal; the rest it
+    passes on from discovery, the table and the fetch layer, whose types are scanned above."""
+    found = literal_reasons(onboard, "refusal")
+    assert found == set(SERVICE) | {
+        "bad_body",
+        "name_taken",
+        "onboarding_unknown",
+        "diff_invalid",
+        "not_written",
+        "address_refused",
+        "resolve_failed",
+        "fetch_failed",
+    }
     assert found <= set(CATALOGUE)
 
 

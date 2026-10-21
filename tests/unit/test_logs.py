@@ -12,6 +12,7 @@ from zoeymcp.portal.actions import Action, Actions, HeldData
 from zoeymcp.portal.sessions import Ceremonies, Ceremony, SessionToken
 from zoeymcp.portal.setupcode import SetupCode
 from zoeymcp.vault import logs
+from zoeymcp.vault.onboarding import Names, OnboardingRecord, Options
 from zoeymcp.vault.store import Secret
 
 
@@ -151,6 +152,24 @@ def test_the_portals_secret_types_are_refused_nested(value: Any, lines: io.Strin
             logs.event("oops", f=wrapped)
     refused = {SessionToken, Ceremony, HeldData, Action, SetupCode}
     assert refused <= set(common_logs.refused_types())
+    assert lines.getvalue() == ""
+
+
+def test_an_onboarding_record_is_refused_nested(lines: io.StringIO) -> None:
+    """M7 M.5: it holds the onboarding's ID, which is never logged (M.4)."""
+    record = OnboardingRecord(
+        id="fake-onboarding-id-0001",
+        owner="cli",
+        server_url="https://mcp.notes.example/mcp",
+        names=Names("notes", "notes", "notes"),
+        options=Options(),
+        expires_at=0.0,
+    )
+    message = r"^refusing to log a secret \(OnboardingRecord\) in field 'f'$"
+    for wrapped in (record, [record], {"outer": [{"inner": (record,)}]}, {record: 1}):
+        with pytest.raises(TypeError, match=message):
+            logs.event("oops", f=wrapped)
+    assert OnboardingRecord in common_logs.refused_types()
     assert lines.getvalue() == ""
 
 

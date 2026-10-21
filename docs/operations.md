@@ -226,9 +226,10 @@ these `reason` codes, and the portal answers with the same reason and status, in
 | `no_authorize_url` | the credential has no `authorize_url` | add one, or give the refresh token another way (the message says how) |
 | `no_route` | no route uses the credential, so there is nothing to bind its tokens to | add a route |
 | `authorize_misconfigured` | the authorization URL can't be built: a `client_id` ref, or an `authorize_params` name the vault sets (`check` reports both) | fix the policy and run `check` |
-| `client_id_unavailable`, `client_secret_unavailable` | the client ID ref or client secret isn't set, or isn't bound to the token endpoint | `zoeymcp secret set <name>`, or set the env var and restart (the message says which) |
+| `client_id_unavailable`, `client_secret_unavailable` | the client ID ref or client secret isn't set, or the client ID isn't bound to the token endpoint (a stored client secret bound otherwise is `client_secret_binding_changed`) | `zoeymcp secret set <name>`, or set the env var and restart (the message says which) |
 | `not_configured` | the token manager doesn't know the credential; it shouldn't happen | reload the policy (§7) or restart the vault |
 | `binding_changed` | the stored grant is bound differently from what the policy now derives | `--rebind` |
+| `client_secret_binding_changed` | the client secret in the store is bound to another token endpoint origin or other server origins than the policy now derives. An onboarded client's secret is stored for the endpoints its fragment named; one you set yourself, for the token endpoint and the routes its credential had then, so adding or removing a route of a credential with a stored client secret, or naming the secret from a second credential, also needs it entered again (`zoeymcp health` doesn't report this yet) | revert the edit, onboard again, or enter the secret again with `zoeymcp secret set <name>`; `--rebind` doesn't apply |
 | `too_many_flows` | 8 logins are pending | finish one, or wait 10 minutes |
 | `flow_unknown` | the flow expired, was used, or belongs to another credential | run `login` again |
 | `redirect_mismatch` | the pasted address isn't under `redirect_uri`, can't be read, or has the answer in the fragment | paste the full address from the address bar |
@@ -655,6 +656,34 @@ every turn. Include only the tools each agent needs, and assign each agent only 
 uses. Where a client can load tools lazily (a tool search that fetches a definition only when the
 model asks for it), turn that on: the gateway serves the same pinned definitions either way, and
 tells clients when a list changes, so a lazy client fetches the new one.
+
+**Onboarding by URL** (M7, as it lands; `zoeymcp login --mcp` arrives with it). The vault's
+admin socket takes phase 1 now: `POST /onboard/discover` finds the server's authorization server
+and answers the plan, `POST /onboard/<onboarding>/register` stores a given client's secret and
+answers fragment 1, `POST /onboard/<onboarding>/fragment` answers fragment 1 for a client with no
+secret (or again, at another indent), and `DELETE /onboard/<onboarding>` cancels. Until the vault
+registers clients itself, a server whose authorization server you have no client at answers
+`registration_unavailable`. A vault restart ends every onboarding, but a client secret it
+stored stays (health reports it `unreferenced` until fragment 1 is committed); the same
+discovery again finds it, checks its binding against a fresh discovery, and answers the
+onboarding registered, so `/fragment` shows fragment 1 again without storing anything. If the
+binding differs, its names stay taken: delete the entry or choose other names. If anything fails
+after register stored the secret, the vault deletes it again and the answer says
+`secret_deleted`. Its log lines:
+
+| Event | Fields |
+| --- | --- |
+| `onboard_started` | `owner` (`cli` or `portal`), `host` (the server's), `allow_private` |
+| `discovery_fetch` | `fetch_kind` (`probe`, `prm`, `as`, `register`), `host`, `port`, `status`, `bytes`, `ms`, `via` (`direct` or `proxy`) |
+| `onboard_planned` | `host`, `issuer` (its host), `require_iss`, `registration`, `auth`, `scopes` (how many) |
+| `onboard_refused` | `reason`, `host` (the server's) |
+| `onboard_registered` | `credential`, `issuer` (its host), `auth`, `secret_stored` |
+| `onboard_blocked` | `host` and `port` your proxy refused, `needed` (how many hosts it must allow) |
+| `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired` or `owner_gone` |
+| `address_refused` | `purpose` (`discovery`), `host`, `port`, `verdict` |
+
+None holds an onboarding's ID, a secret, a URL's path or query, or a body; a stored client
+secret logs `secret_set` with `via` and its binding, as any secret does.
 
 ## 12. Drift
 
@@ -1407,6 +1436,7 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 409 | `binding_changed` | The policy now binds this grant differently (shown below). Connect again and accept the new binding. |
 | 409 | `client_id_unavailable` | The client ID isn't set, or isn't bound to the token endpoint. Set it on the Secrets page. |
 | 409 | `client_secret_unavailable` | The client secret isn't set, or isn't bound to the token endpoint. Set it on the Secrets page. |
+| 409 | `client_secret_binding_changed` | The committed token endpoint or server origin differs from the ones this client was registered with. Onboard again, or set the secret with zoeymcp secret set. |
 | 400 | `not_configured` | The vault has no token settings for this credential. |
 | 429 | `too_many_flows` | Too many sign-ins are pending. Finish or cancel one, or wait 10 minutes. |
 | 400 | `redirect_mismatch` | That isn't the address the provider sent you to; it starts with `<redirect_uri>`. |
@@ -1446,6 +1476,8 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 404 | `onboarding_unknown` | That onboarding isn't in progress: it finished, expired or was started elsewhere. Start it again. |
 | 429 | `onboarding_busy` | At most 4 onboardings can be in progress. Finish or cancel one, or wait for one to expire (30 minutes). |
 | 409 | `onboarding_options_changed` | The onboarding in progress for this URL and these names stopped at your proxy and was started with other options. Run it with the same options to carry on, or start again once it expires (30 minutes). |
+| 409 | `registration_unavailable` | Register a client at `<host>` and run again with its client ID. |
+| 502 | `proxy_refused` | Your egress proxy refused the vault's connection to `<host>`. Allow the hosts listed here in it for the vault, then run the same command again. |
 | 502 | `address_refused` | The vault doesn't connect to `<host>`: its name resolves to a private, loopback or reserved address. Nothing was sent to it. |
 | 502 | `resolve_failed` | The name `<host>` didn't resolve, so nothing was sent to it. |
 | 502 | `fetch_failed` | The host `<host>` didn't answer as needed (`<detail>`). |
@@ -1658,11 +1690,13 @@ of public and private, and an address whose PTR name is listed, and lets a liste
 through.
 
 **Onboarding through it.** With onboarding by URL (`zoeymcp login --mcp`, as M7 lands), the
-proxy refuses the hosts the policy doesn't name yet. The vault then stops, keeps what it has
-fetched, and answers `proxy_refused` with every host it has learned so far and the Squid lines
-that allow them, in the snippet's shape, reusing its `zoeymcp_port_<n>` and
-`zoeymcp_private_dst`; run the same command again after adding them and it resumes where it
-stopped. Usually two rounds suffice: the server's host, then its authorization server's. Keep
+proxy refuses the hosts the policy doesn't name yet. The vault then stops and answers
+`proxy_refused` with every host it has learned so far and the Squid lines that allow them, in
+the snippet's shape, reusing its `zoeymcp_private_dst` and its `zoeymcp_port_<n>` ACLs (a port
+the emitted file has no ACL for, such as an authorization server on 8443, gets its `acl` line
+among them); run the same command again after adding them and the vault runs discovery again
+under the same onboarding, with its names and its 30 minutes. Usually two rounds suffice: the
+server's host, then its authorization server's. Keep
 those lines in their own included file (`zoeymcp-onboarding.conf` above), so `--check` on the
 emitted file stays clean meanwhile. Once the policy names the credential and the route, the
 emitted list covers the hosts the vault needs from then on: regenerate it, reload the proxy, and

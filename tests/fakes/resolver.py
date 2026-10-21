@@ -9,7 +9,9 @@ dial to an address no fake was given is refused, so no test reaches the real net
 
 :meth:`FakeResolver.hooks` is what :data:`zoeymcp.vault.netclient.HOOKS` takes in process;
 :meth:`FakeResolver.save` and :func:`install` carry a fixed name map to an out-of-process vault
-(tests/acceptance/procs.py's launcher).
+(tests/acceptance/procs.py's launcher). A saved map may also name a ``pause_after_put`` marker
+file: that vault then holds every secret write once it returns, for a crash test to kill it
+there (M7 design N).
 
 :func:`serve_https` is the smallest fake a dial can reach: one TLS listener on loopback that
 answers every request ``200 ok`` and closes the connection, recording the SNI name and the request
@@ -27,6 +29,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from zoeymcp.vault import netclient
 
@@ -110,8 +113,28 @@ class FakeResolver:
 
 
 def install(path: str) -> None:
-    """In a vault's own process, before it builds a client: answer names from ``path``."""
+    """In a vault's own process, before it builds a client: answer names from ``path``, and
+    hold secret writes if it names a ``pause_after_put`` marker."""
     netclient.HOOKS = FakeResolver.load(Path(path)).hooks()
+    marker = json.loads(Path(path).read_bytes()).get("pause_after_put")
+    if marker is not None:
+        _pause_after_put(Path(marker))
+
+
+def _pause_after_put(marker: Path) -> None:
+    """Once a secret write returns, say so in ``marker`` and wait to be killed: the kill falls
+    after the write and before the answer."""
+    from zoeymcp.vault import secretops
+
+    real = secretops.put
+
+    async def put(*args: Any, **kwargs: Any) -> Any:
+        written = await real(*args, **kwargs)
+        marker.write_bytes(b"written\n")
+        await asyncio.sleep(3600)
+        return written
+
+    secretops.put = put
 
 
 @dataclass

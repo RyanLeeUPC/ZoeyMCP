@@ -236,6 +236,20 @@ def test_an_expiry_counted_by_len_is_still_reported() -> None:
     assert onboardings.sweep() == (Ended(record, "expired"),)
 
 
+def test_the_owners_own_onboarding() -> None:
+    """A run that names nothing resumes the owner's onboarding under its names (D.10)."""
+    onboardings, clock, _ = table()
+    assert onboardings.owned("cli") is None
+    record = onboardings.start("cli", SERVER, NOTES, Options()).record
+    other = onboardings.start(SESSION, SERVER, Names("b", "b", "b"), Options()).record
+    assert onboardings.owned("cli") is record
+    assert onboardings.owned(SESSION) is other
+    assert onboardings.owned(OTHER_SESSION) is None
+    clock.now = record.expires_at
+    assert onboardings.owned("cli") is None
+    assert onboardings.sweep() == (Ended(record, "expired"), Ended(other, "expired"))
+
+
 def test_one_onboarding_per_owner() -> None:
     onboardings, _, _ = table()
     first = onboardings.start("cli", SERVER, NOTES, Options()).record
@@ -928,7 +942,12 @@ def test_nothing_is_next_while_discovering() -> None:
 
 
 def test_a_blocked_onboarding_names_the_hosts_and_squid_lines() -> None:
-    (step,) = next_for(staged("blocked"), INLINE_SOURCE, acl_names={"vault": "stack_vault_net"})
+    (step,) = next_for(
+        staged("blocked"),
+        INLINE_SOURCE,
+        acl_names={"vault": "stack_vault_net"},
+        emitted_ports={443},
+    )
     assert step.answer() == {
         "do": "allow_hosts",
         "label": "Allow these hosts in your proxy for the vault",
@@ -944,10 +963,24 @@ def test_a_blocked_onboarding_names_the_hosts_and_squid_lines() -> None:
     }
 
 
+def test_a_blocked_onboarding_defines_the_ports_the_emitted_file_lacks() -> None:
+    """D.11 with 8a1's note: the lines reuse the emitted file's port ACLs, so a port it has no
+    ACL for gets its line, before the rules that name it."""
+    (step,) = next_for(staged("blocked"), INLINE_SOURCE)
+    assert step.squid[0] == "acl zoeymcp_port_443 port 443"
+    assert len(step.squid) == 5
+    (step,) = next_for(staged("blocked"), INLINE_SOURCE, emitted_ports={443, 8443})
+    assert len(step.squid) == 4
+    assert not [line for line in step.squid if line.startswith("acl zoeymcp_port_")]
+
+
 def test_allow_hosts_defaults_the_source_acl_and_writes_literals_as_dst() -> None:
-    step = allow_hosts([("10.0.0.5", 8443), ("10.0.0.5", 8443), ("fd00::1", 443)], {})
+    step = allow_hosts(
+        [("10.0.0.5", 8443), ("10.0.0.5", 8443), ("fd00::1", 443)], {}, emitted_ports=[443]
+    )
     assert step.hosts == ("10.0.0.5:8443", "[fd00::1]:443")
     assert step.squid == (
+        "acl zoeymcp_port_8443 port 8443",
         "acl zoeymcp_onboard_1 dst -n 10.0.0.5",
         "http_access allow zoeymcp_src_vault CONNECT zoeymcp_onboard_1 zoeymcp_port_8443 "
         "!zoeymcp_private_dst",
@@ -958,7 +991,9 @@ def test_allow_hosts_defaults_the_source_acl_and_writes_literals_as_dst() -> Non
 
 
 def test_allow_hosts_writes_hosts_in_lower_case() -> None:
-    step = allow_hosts([("Auth.Notes.EXAMPLE", 443), ("auth.notes.example", 443)], {})
+    step = allow_hosts(
+        [("Auth.Notes.EXAMPLE", 443), ("auth.notes.example", 443)], {}, emitted_ports=(443,)
+    )
     assert step.hosts == ("auth.notes.example:443",)
     assert step.squid[0] == "acl zoeymcp_onboard_1 dstdomain -n auth.notes.example"
     assert len(step.squid) == 2

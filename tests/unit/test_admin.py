@@ -21,6 +21,7 @@ import pytest
 import uvicorn
 
 from tests.fakes.oauth_server import FakeAuthServer
+from tests.unit import onboard_model
 from tests.unit.report_model import T0, asked_line
 from zoeymcp.cli.main import main
 from zoeymcp.common import canonical, ledgerreport
@@ -32,12 +33,14 @@ from zoeymcp.portal import passkeys as passkey_module
 from zoeymcp.portal import setupcode
 from zoeymcp.portal.app import PortalApp, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
+from zoeymcp.portal.refusals import CATALOGUE
 from zoeymcp.portal.setupcode import Redeemed, Refused
 from zoeymcp.portal.webauthn import Asserted
 from zoeymcp.vault import admin as admin_module
 from zoeymcp.vault import gatewaykeys, logs
 from zoeymcp.vault.admin import (
     NO_GATEWAY_KEYS,
+    NO_ONBOARDING,
     NO_TOKENS,
     NOT_WRITTEN,
     AdminApp,
@@ -108,6 +111,7 @@ class AdminRig:
         tokens: bool = True,
         passkeys: Passkeys | None = None,
         portal: PortalApp | None = None,
+        onboard: bool = False,
     ) -> None:
         self.policy = example_policy()
         self.store = SecretStore(tmp_path, KEYS)
@@ -126,6 +130,9 @@ class AdminRig:
             self.tokens if tokens else None,
             passkeys=passkeys,
             portal=portal,
+            onboard=onboard_model.onboard_service(self.store, self.tokens, lambda: self.policy)
+            if onboard
+            else None,
         )
 
     def set_policy(self, policy: Policy) -> None:
@@ -1952,4 +1959,95 @@ async def test_health_shows_the_reported_copy(tmp_path: Path) -> None:
     # Without a gateway in the policy, nothing reports: no section.
     rig.set_policy(rig.policy.model_copy(update={"gateway": None}))
     assert "ledger_copy" not in (await rig.call("GET", "/health")).json()
+    await rig.token_client.aclose()
+
+
+# --- onboarding by URL (M7 design M.1) ------------------------------------------------------------
+
+ONBOARD_ROUTES = [
+    ("POST", "/onboard/discover"),
+    ("POST", "/onboard/x/register"),
+    ("POST", "/onboard/x/fragment"),
+    ("DELETE", "/onboard/x"),
+]
+
+
+@pytest.mark.anyio
+async def test_without_an_onboarding_service_the_routes_are_503(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    for method, path in ONBOARD_ROUTES:
+        response = await rig.call(method, path, {})
+        assert response.status_code == 503
+        assert response.json() == {"error": NO_ONBOARDING, "reason": "unavailable"}
+
+
+@pytest.mark.anyio
+async def test_onboarding_over_the_socket(tmp_path: Path, log_buffer: io.StringIO) -> None:
+    """The CLI's phase 1 (M.1): the plan, the secret stored and fragment 1, fragment 1 again,
+    and the cancel; the secret in no answer and no line."""
+    rig = AdminRig(tmp_path, onboard=True)
+    discovered = await rig.call("POST", "/onboard/discover", onboard_model.confidential())
+    assert discovered.status_code == 200, discovered.text
+    plan = discovered.json()
+    assert (plan["stage"], plan["plan"]["issuer"]) == ("discovered", onboard_model.ISSUER)
+    onboarding = plan["onboarding"]
+    registered = await rig.call(
+        "POST",
+        f"/onboard/{onboarding}/register",
+        {"client_secret": onboard_model.GIVEN_SECRET},
+    )
+    assert registered.status_code == 200, registered.text
+    made = registered.json()
+    assert (made["secret_stored"], made["secret_name"]) == (True, onboard_model.SECRET_NAME)
+    fragment = load_mapping(made["diff"]["yaml"])
+    assert fragment["credentials"]["notes"]["client_secret"] == "store:notes-client-secret"
+    again = await rig.call("POST", f"/onboard/{onboarding}/fragment", {"indent": "compose"})
+    assert again.status_code == 200
+    assert again.json()["diff"]["yaml"].startswith(" " * 8 + "# zoeymcp: onboarding notes")
+    assert (await rig.call("DELETE", f"/onboard/{onboarding}")).status_code == 204
+    gone = await rig.call("DELETE", f"/onboard/{onboarding}")
+    assert gone.status_code == 404
+    assert gone.json()["reason"] == "onboarding_unknown"
+    entry = rig.store.entry(onboard_model.SECRET_NAME)
+    assert entry is not None
+    assert entry.meta is not None
+    assert entry.meta["client_id"] == onboard_model.CLIENT_ID
+    seen = discovered.text + registered.text + again.text + gone.text + log_buffer.getvalue()
+    assert onboard_model.GIVEN_SECRET not in seen
+    assert onboarding not in log_buffer.getvalue()
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("body", "status", "reason"),
+    [
+        ({"url": onboard_model.SERVER_URL}, 409, "registration_unavailable"),
+        ({"url": "http://mcp.notes.example/mcp"}, 400, "url_invalid"),
+        ({"url": onboard_model.SERVER_URL, "name": "broker-mcp"}, 409, "name_taken"),
+        ({"other": 1}, 400, "bad_body"),
+    ],
+)
+async def test_a_refused_discovery_is_the_catalogues(
+    tmp_path: Path, body: dict[str, Any], status: int, reason: str
+) -> None:
+    rig = AdminRig(tmp_path, onboard=True)
+    response = await rig.call("POST", "/onboard/discover", body)
+    assert response.status_code == status
+    answer = response.json()
+    assert answer["reason"] == reason
+    assert CATALOGUE[reason].status == status
+    assert answer["error"].endswith(".")
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_the_onboarding_bodies_are_capped(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path, onboard=True)
+    transport = httpx.ASGITransport(app=rig.admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
+        large = await client.post("/onboard/discover", content=b"{" + b" " * 5000 + b"}")
+        broken = await client.post("/onboard/discover", content=b"{")
+        listed = await client.post("/onboard/x/fragment", content=b"[]")
+    assert (large.status_code, broken.status_code, listed.status_code) == (413, 400, 400)
     await rig.token_client.aclose()

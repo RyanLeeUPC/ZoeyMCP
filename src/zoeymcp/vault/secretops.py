@@ -3,7 +3,9 @@
 The I/O half of :mod:`.secretplan`, apart so mutation testing covers only the decisions. A
 secret an oauth2 credential uses is written and deleted through the token manager, which first
 waits for any refresh of that slot (design D.12). If the store can't write its file, the change
-is kept in memory and the answer is ``not_written`` (B.4).
+is kept in memory and the answer is ``not_written`` (B.4). An onboarding's client secret (an
+:class:`~.secretplan.OnboardPutPlan`, M7 design D.7) is written by the store with its plan's
+``meta``; nothing reads that ``meta`` to refuse or inject.
 
 ``secret_set`` and ``secret_deleted`` say which interface asked, in ``via``.
 """
@@ -19,17 +21,18 @@ from .secretplan import (
     NOT_FOUND,
     NOT_WRITTEN_REFUSAL,
     DeletePlan,
+    OnboardPutPlan,
     PutPlan,
     SecretRefusal,
     binding_refusal,
 )
-from .store import SecretStore, StoreWriteError
+from .store import KEEP, SecretStore, StoreWriteError
 
 Via = Literal["socket", "portal"]
 
 
 async def put(
-    store: SecretStore, tokens: TokenManager | None, plan: PutPlan, *, via: Via
+    store: SecretStore, tokens: TokenManager | None, plan: PutPlan | OnboardPutPlan, *, via: Via
 ) -> dict[str, Any] | SecretRefusal:
     """Write a planned secret. Returns the binding it was stored with, or the refusal."""
     try:
@@ -38,7 +41,8 @@ async def put(
             binding = await tokens.replace_secret(plan.name, plan.value)
         else:
             binding = plan.binding
-            store.put(plan.name, plan.value, binding)
+            meta = plan.meta if isinstance(plan, OnboardPutPlan) else KEEP
+            store.put(plan.name, plan.value, binding, meta=meta)
     except StoreWriteError as exc:
         logs.event(
             "secret_set", name=plan.name, persisted=False, error_type=type(exc).__name__, via=via

@@ -171,6 +171,12 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "The client secret isn't set, or isn't bound to the token endpoint. Set it on the "
             "Secrets page.",
         ),
+        # An onboarded client's secret, bound before the commit (M7 D.7).
+        "client_secret_binding_changed": Entry(
+            409,
+            "The committed token endpoint or server origin differs from the ones this client was "
+            "registered with. Onboard again, or set the secret with zoeymcp secret set.",
+        ),
         "not_configured": Entry(400, "The vault has no token settings for this credential."),
         "too_many_flows": Entry(
             429, "Too many sign-ins are pending. Finish or cancel one, or wait 10 minutes."
@@ -317,6 +323,15 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "The onboarding in progress for this URL and these names stopped at your proxy and "
             "was started with other options. Run it with the same options to carry on, or start "
             "again once it expires (30 minutes).",
+        ),
+        # The onboarding service (M7 D.4, D.11; vault/onboard.py).
+        "registration_unavailable": Entry(
+            409, "Register a client at {host} and run again with its client ID."
+        ),
+        "proxy_refused": Entry(
+            502,
+            "Your egress proxy refused the vault's connection to {host}. Allow the hosts listed "
+            "here in it for the vault, then run the same command again.",
         ),
         # Phase 1's requests (M7 B.2, B.5; vault/oauth/fetch.py).
         "address_refused": Entry(

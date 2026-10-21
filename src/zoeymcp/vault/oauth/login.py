@@ -87,6 +87,11 @@ NO_REFRESH_HINT: Final = (
 # A paste's refusals after its state matched: an answer for the flow, so for a flow holding a
 # returned code, a different answer (H.6's conflict rule). The others aren't answers for it.
 _ANSWERS: Final = frozenset({"provider_error", "iss_mismatch", "no_code"})
+# A client secret stored under another binding than the policy now derives (M7 design D.7).
+REGISTERED_ELSEWHERE: Final = (
+    "the committed token endpoint or server origin differs from the ones this client was "
+    "registered with; onboard again, or set the secret with zoeymcp secret set "
+)
 # The failure reasons of a client ref, and what the ref holds.
 _CLIENT_REFS: Final = {
     "client_id_unavailable": "client ID",
@@ -177,6 +182,9 @@ class LoginService:
                 f"{credential!r} has no authorize_url; {refresh_token_hint(credential, cred)}",
             )
         binding = self._binding(credential, cred)
+        # Before the client is resolved, which would refuse a secret bound to another token
+        # endpoint as unavailable (M7 design X8).
+        self._client_secret_bound(cred)
         self._client(credential, cred)
         change = None
         existing = self._tokens.store.entry(slot_key(credential, cred))
@@ -639,6 +647,28 @@ class LoginService:
             return derive_binding(policy, slot_key(credential, cred))
         except BindingError as exc:
             raise LoginError("no_route", str(exc)) from None
+
+    def _client_secret_bound(self, cred: OAuth2Credential) -> None:
+        """A client secret from the store must still be bound as the policy now derives its
+        binding (M7 design D.7 step 5): an onboarding stored it under the binding fragment 1
+        would derive, so a committed token endpoint or server origin that differs refuses. It is
+        entered again, never re-bound (R16), so ``--rebind`` doesn't apply. A missing entry is
+        left to the client's own check (``client_secret_unavailable``)."""
+        ref = cred.client_secret or ""
+        if not ref.startswith("store:"):
+            return
+        name = ref.removeprefix("store:")
+        try:
+            expected = derive_binding(self._tokens.policy, name)
+        except BindingError as exc:
+            raise LoginError("no_route", str(exc)) from None
+        entry = self._tokens.store.entry(name)
+        if entry is not None and entry.binding != expected:
+            raise LoginError(
+                "client_secret_binding_changed",
+                f"{REGISTERED_ELSEWHERE}{name}",
+                details={"old": entry.binding, "new": expected},
+            )
 
     def _client(self, credential: str, cred: OAuth2Credential) -> Client:
         client = self._tokens.client_for(credential)

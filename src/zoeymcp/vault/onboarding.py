@@ -42,6 +42,7 @@ from urllib.parse import urlsplit
 
 from ..common import egresslist, netguard
 from ..common.egresslist import Allowance, Destination
+from ..common.logs import refuse_type
 from ..common.policy.change import PolicyChange
 from ..common.policy.findings import Finding
 from ..common.policy.schema import (
@@ -205,6 +206,10 @@ class OnboardingRecord:
         return f"OnboardingRecord(server={self.names.server!r}, stage={self.stage!r})"
 
 
+# It holds its ID, which is never logged (M.4, M.5).
+refuse_type(OnboardingRecord)
+
+
 @dataclass(frozen=True)
 class Started:
     """A start's onboarding, and whether it carries on with one the owner already had."""
@@ -265,8 +270,7 @@ class OnboardingTable:
         onboarding uses are ``name_taken``."""
         if owner != CLI_OWNER and not _SESSION_OWNER.fullmatch(owner):
             raise ValueError("an onboarding's owner is cli or session:<hex id>")
-        self._expire()
-        own = next((r for r in self._records.values() if r.owner == owner), None)
+        own = self.owned(owner)
         if own is not None and own.server_url == server_url and own.names.same(names):
             if own.stage == "blocked":
                 if own.options != options:
@@ -308,6 +312,12 @@ class OnboardingTable:
         )
         self._records[record.id] = record
         return Started(record, resumed=False)
+
+    def owned(self, owner: str) -> OnboardingRecord | None:
+        """The owner's onboarding in progress, if it has one: a run that names none resumes
+        it under its names (D.10)."""
+        self._expire()
+        return next((r for r in self._records.values() if r.owner == owner), None)
 
     def get(self, onboarding: str, owner: str) -> OnboardingRecord:
         """The owner's onboarding, unless it is unknown, expired or another owner's: all three
@@ -673,11 +683,17 @@ def _check(source: str, *more: str) -> tuple[tuple[str, ...], Via | None]:
     return ("zoeymcp", "check", "--config", "-" if source == STDIN_SOURCE else source, *more), None
 
 
-def allow_hosts(hosts: Iterable[tuple[str, int]], acl_names: Mapping[str, str]) -> NextStep:
+def allow_hosts(
+    hosts: Iterable[tuple[str, int]],
+    acl_names: Mapping[str, str],
+    emitted_ports: Collection[int] = (),
+) -> NextStep:
     """D.11's entry: the hosts an operator's proxy must allow for the vault, and the Squid
     lines for them, from ``egresslist.render`` with the vault's source ACL (``acl_names``, the
-    policy's ``egress_proxy_acls`` or ``--squid-src``). The lines reuse the emitted file's port
-    and private-destination ACLs, so only the destination ACLs and their rules are kept."""
+    policy's ``egress_proxy_acls`` or ``--squid-src``). The lines reuse the emitted file's
+    private-destination ACL and its ``zoeymcp_port_<n>`` ACLs, one per port in
+    ``emitted_ports``: a port the emitted file lacks gets its ACL line here, or Squid would
+    refuse a rule naming it."""
     pairs = tuple(dict.fromkeys((host.lower(), port) for host, port in hosts))
     lists = {
         ONBOARD_SOURCE: tuple(
@@ -686,10 +702,12 @@ def allow_hosts(hosts: Iterable[tuple[str, int]], acl_names: Mapping[str, str]) 
     }
     src = acl_names.get(egresslist.VAULT, f"zoeymcp_src_{egresslist.VAULT}")
     text = egresslist.render(lists, "squid", acl_names={ONBOARD_SOURCE: src})
+    emitted = {f"acl zoeymcp_port_{port} port {port}" for port in emitted_ports}
     squid = tuple(
         line
         for line in text.splitlines()
         if line.startswith((f"acl zoeymcp_{ONBOARD_SOURCE}_", "http_access "))
+        or (line.startswith("acl zoeymcp_port_") and line not in emitted)
     )
     return NextStep(
         "allow_hosts",
@@ -806,14 +824,16 @@ def next_for(
     *,
     own_proxy: bool = False,
     acl_names: Mapping[str, str] | None = None,
+    emitted_ports: Collection[int] = (),
 ) -> tuple[NextStep, ...]:
     """What the operator does next for ``record`` (M.7), the same words on every surface.
     ``source`` is the running policy's (``load.read_source``'s label: a file path,
     ``<stdin>`` or ``$ZOEYMCP_CONFIG``); ``own_proxy`` is an ``egress_proxy`` that isn't the
-    built-in role; ``acl_names`` its Squid source ACLs. A blocked onboarding's ``retry`` is the
-    CLI's own, from its argv (D.11)."""
+    built-in role; ``acl_names`` its Squid source ACLs; ``emitted_ports`` the ports whose ACLs
+    the policy's emitted Squid file defines. A blocked onboarding's ``retry`` is the CLI's own,
+    from its argv (D.11)."""
     if record.stage == "blocked":
-        return (allow_hosts(record.needed_hosts, acl_names or {}),)
+        return (allow_hosts(record.needed_hosts, acl_names or {}, emitted_ports),)
     if record.stage == "discovered":
         return _make(record)
     if record.stage == "registered":

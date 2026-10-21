@@ -3,8 +3,9 @@
 Each walk takes its routes from the route table, so a route added later is walked too:
 
 - **The admin socket**: every route of ``AdminApp``'s table, with secrets stored and a setup code
-  live. Only ``POST /setup-code`` (a new setup code) and ``GET /gateway-key`` (the gateway key)
-  may carry a credential, each only its own: the two exceptions R61 records (Q23).
+  live, and an onboarding whose given client secret was stored through the socket (M7 D.7).
+  Only ``POST /setup-code`` (a new setup code) and ``GET /gateway-key`` (the gateway key) may
+  carry a credential, each only its own: the two exceptions R61 records (Q23).
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
   a live slot, and a value held by a pending ``secret.put``. Its health, OAuth list, connect and
@@ -33,6 +34,7 @@ from starlette.routing import Route as StarletteRoute
 
 import zoeymcp.portal
 from tests.fakes.authenticator import SoftAuthenticator
+from tests.unit import onboard_model
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES, STATIC, Route
@@ -92,6 +94,9 @@ SOCKET_BODIES: dict[tuple[str, str], Any] = {
         "redirect_url": "http://127.0.0.1/callback?code=c&state=s",
     },
     ("POST", "/ledger/reported/restart"): {"dry_run": True},
+    ("POST", "/onboard/discover"): onboard_model.confidential(),
+    ("POST", "/onboard/{onboarding}/register"): {},
+    ("POST", "/onboard/{onboarding}/fragment"): {"indent": 2},
 }
 
 
@@ -107,21 +112,29 @@ def socket_routes(rig: AdminRig) -> list[tuple[str, str]]:
 async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     tmp_path: Path,
 ) -> None:
-    rig = AdminRig(tmp_path)
+    rig = AdminRig(tmp_path, onboard=True)
     store_values(rig)
     code, _ = rig.setup.issue()
-    credentials = dict.fromkeys(VALUES, "secret value")
+    discovered = await rig.call("POST", "/onboard/discover", onboard_model.confidential())
+    onboarding = discovered.json()["onboarding"]
+    secret = {"client_secret": onboard_model.GIVEN_SECRET}
+    stored = await rig.call("POST", f"/onboard/{onboarding}/register", secret)
+    assert stored.status_code == 200, stored.text
+    params = {**SOCKET_PARAMS, "onboarding": onboarding}
+    credentials = dict.fromkeys((*VALUES, onboard_model.GIVEN_SECRET), "secret value")
     credentials[code.reveal()] = "setup code"
     credentials[KEYS.gateway_key(1)] = "gateway key"
     answers: list[tuple[tuple[str, str], str]] = []
     walked = socket_routes(rig)
-    assert len(walked) == len(set(walked)) >= 19
+    assert len(walked) == len(set(walked)) >= 23
+    assert ("DELETE", "/onboard/{onboarding}") in walked
     for method, template in walked:
-        path = template.format(**SOCKET_PARAMS)
+        path = template.format(**params)
         response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
         answers.append(((method, template), response.text + repr(dict(response.headers))))
         if (method, template) == ("POST", "/setup-code"):
             credentials[response.json()["code"]] = "setup code"
+    answers.append((("POST", "/onboard/discover"), discovered.text + stored.text))
     found = {route: carried(text, credentials) for route, text in answers}
     # The exceptions carry their own credential and nothing else; every other answer none.
     assert {route: kinds for route, kinds in found.items() if kinds} == {
