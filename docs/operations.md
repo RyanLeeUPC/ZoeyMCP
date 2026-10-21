@@ -1424,6 +1424,23 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 400 | `bad_query` | The portal didn't take this sign-in. Copy this tab's address and paste it into the portal's Connect dialog, or into zoeymcp login if you started it there. |
 | 409 | `not_restartable` | The reported ledger isn't stuck, so there's nothing to restart. |
 | 503 | `copy_unavailable` | The vault's copy of the gateway's ledger can't be read: check the state volume. The proxy runs as before. |
+| 400 | `url_invalid` | That address can't be onboarded (`<detail>`). Use an https URL without a query; a private host needs allow private. |
+| 502 | `endpoint_invalid` | The server's `<field>` can't be used (`<detail>`), so nothing was sent to it. |
+| 502 | `url_dollar` | The server's `<field>` holds a $, which compose would read as a variable in the policy, so it isn't used. |
+| 502 | `challenge_ambiguous` | The server's sign-in challenges name two different metadata addresses, so neither is used. |
+| 502 | `scope_invalid` | The server names a scope a policy can't hold (a $, a quote, a backslash or a space in it, or too many), so nothing was registered. |
+| 409 | `not_protected` | The server answered without asking for a sign-in and publishes no OAuth metadata. Add it to the policy by hand. |
+| 502 | `prm_not_found` | The server publishes no protected-resource metadata, and no authorization server was found without it. Give its issuer, or add the server by hand. |
+| 502 | `prm_invalid` | The server's protected-resource metadata can't be used (`<detail>`). |
+| 502 | `prm_resource_mismatch` | The server's metadata is for `<resource>`, not `<expected>`, so it isn't used (RFC 9728). |
+| 502 | `dpop_required` | The server requires DPoP-bound tokens: the provider's tokens aren't Bearer tokens the vault can use. |
+| 409 | `as_choice_needed` | The server names more than one authorization server. Choose one of `<issuers>`. |
+| 400 | `as_unknown` | That issuer isn't one the server names. Choose one of `<issuers>`. |
+| 502 | `as_metadata_not_found` | No metadata was found for the authorization server at the addresses tried. |
+| 502 | `as_metadata_invalid` | The authorization server's metadata can't be used (`<detail>`). |
+| 502 | `as_issuer_mismatch` | The authorization server's metadata names another issuer than the one it was fetched for, so it isn't used (RFC 8414). |
+| 502 | `pkce_unsupported` | The authorization server doesn't advertise PKCE with S256, which MCP requires. |
+| 502 | `code_flow_unsupported` | The authorization server doesn't advertise the authorization code flow. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

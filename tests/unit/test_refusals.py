@@ -1,8 +1,8 @@
 """The refusal catalogue (M5 design M.2, O.2 ``refusals``): every reason has a status and a text.
 
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
-``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason), so a reason added
-there without a sentence here fails.
+``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
+literal discovery ``Refusal`` reason), so a reason added there without a sentence here fails.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from zoeymcp.portal.refusals import (
 )
 from zoeymcp.portal.refusals import login as login_refusal
 from zoeymcp.vault import admin, secretplan, store
-from zoeymcp.vault.oauth import login, pkce
+from zoeymcp.vault.oauth import discovery, login, pkce
 from zoeymcp.vault.secretplan import SecretRefusal
 
 ZWSP = chr(0x200B)
@@ -101,6 +101,26 @@ EXTRA = {
     "ambiguous_fingerprint": 409,
     "copy_unavailable": 503,
 }
+# M7's M.2: onboarding's discovery refusals (M7 step 6), with M7's statuses.
+DISCOVERY = {
+    "url_invalid": 400,
+    "endpoint_invalid": 502,
+    "url_dollar": 502,
+    "challenge_ambiguous": 502,
+    "scope_invalid": 502,
+    "not_protected": 409,
+    "prm_not_found": 502,
+    "prm_invalid": 502,
+    "prm_resource_mismatch": 502,
+    "dpop_required": 502,
+    "as_choice_needed": 409,
+    "as_unknown": 400,
+    "as_metadata_not_found": 502,
+    "as_metadata_invalid": 502,
+    "as_issuer_mismatch": 502,
+    "pkce_unsupported": 502,
+    "code_flow_unsupported": 502,
+}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -151,6 +171,14 @@ FIELDS = {
     "redirect_mismatch": {"redirect_uri"},
     "provider_error": {"error"},
     "exchange_failed": {"code"},
+    "url_invalid": {"detail"},
+    "endpoint_invalid": {"field", "detail"},
+    "url_dollar": {"field"},
+    "prm_invalid": {"detail"},
+    "prm_resource_mismatch": {"resource", "expected"},
+    "as_choice_needed": {"issuers"},
+    "as_unknown": {"issuers"},
+    "as_metadata_invalid": {"detail"},
 }
 
 
@@ -197,7 +225,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
-    expected |= EXTRA
+    expected |= EXTRA | DISCOVERY
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -286,6 +314,14 @@ def test_every_login_reason_is_catalogued() -> None:
     found |= set(login._CLIENT_REFS) | {"not_configured"}
     assert "exchange_failed:" in found
     found = {reason.removesuffix(":") for reason in found}
+    assert found <= set(CATALOGUE)
+
+
+def test_every_discovery_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to discovery's refusals; each is a literal of its Reason type."""
+    found = literal_reasons(discovery, "Refusal")
+    assert found == set(get_args(discovery.Reason))
+    assert found == set(DISCOVERY)
     assert found <= set(CATALOGUE)
 
 

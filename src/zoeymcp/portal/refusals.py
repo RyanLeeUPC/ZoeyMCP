@@ -219,6 +219,76 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "The vault's copy of the gateway's ledger can't be read: check the state volume. "
             "The proxy runs as before.",
         ),
+        # Onboarding by URL: discovery (M7 B.4, D.2-D.5; vault/oauth/discovery.py).
+        "url_invalid": Entry(
+            400,
+            "That address can't be onboarded ({detail}). Use an https URL without a query; a "
+            "private host needs allow private.",
+        ),
+        "endpoint_invalid": Entry(
+            502, "The server's {field} can't be used ({detail}), so nothing was sent to it."
+        ),
+        "url_dollar": Entry(
+            502,
+            "The server's {field} holds a $, which compose would read as a variable in the "
+            "policy, so it isn't used.",
+        ),
+        "challenge_ambiguous": Entry(
+            502,
+            "The server's sign-in challenges name two different metadata addresses, so neither "
+            "is used.",
+        ),
+        "scope_invalid": Entry(
+            502,
+            "The server names a scope a policy can't hold (a $, a quote, a backslash or a space "
+            "in it, or too many), so nothing was registered.",
+        ),
+        "not_protected": Entry(
+            409,
+            "The server answered without asking for a sign-in and publishes no OAuth metadata. "
+            "Add it to the policy by hand.",
+        ),
+        "prm_not_found": Entry(
+            502,
+            "The server publishes no protected-resource metadata, and no authorization server "
+            "was found without it. Give its issuer, or add the server by hand.",
+        ),
+        "prm_invalid": Entry(
+            502, "The server's protected-resource metadata can't be used ({detail})."
+        ),
+        "prm_resource_mismatch": Entry(
+            502,
+            "The server's metadata is for {resource}, not {expected}, so it isn't used (RFC 9728).",
+        ),
+        "dpop_required": Entry(
+            502,
+            "The server requires DPoP-bound tokens: the provider's tokens aren't Bearer tokens "
+            "the vault can use.",
+        ),
+        "as_choice_needed": Entry(
+            409, "The server names more than one authorization server. Choose one of {issuers}."
+        ),
+        "as_unknown": Entry(
+            400, "That issuer isn't one the server names. Choose one of {issuers}."
+        ),
+        "as_metadata_not_found": Entry(
+            502, "No metadata was found for the authorization server at the addresses tried."
+        ),
+        "as_metadata_invalid": Entry(
+            502, "The authorization server's metadata can't be used ({detail})."
+        ),
+        "as_issuer_mismatch": Entry(
+            502,
+            "The authorization server's metadata names another issuer than the one it was "
+            "fetched for, so it isn't used (RFC 8414).",
+        ),
+        "pkce_unsupported": Entry(
+            502,
+            "The authorization server doesn't advertise PKCE with S256, which MCP requires.",
+        ),
+        "code_flow_unsupported": Entry(
+            502, "The authorization server doesn't advertise the authorization code flow."
+        ),
     }
 )
 
