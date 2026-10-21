@@ -18,6 +18,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -28,6 +29,7 @@ from pydantic import (
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError, ValidationError
 
+from . import fields
 from .callback import CALLBACK_PREFIX, callback_address
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
@@ -89,8 +91,14 @@ def _no_line_breaks(value: str) -> str:
     return value
 
 
-def _check_url(value: str, *, schemes: tuple[str, ...], allow_path: bool) -> str:
+def _check_url(
+    value: str, *, schemes: tuple[str, ...], allow_path: bool, allow_query: bool = False
+) -> str:
+    """A URL field. Only ``allow_query`` (``token_url`` and ``authorize_url``, RFC 6749 3.1-3.2)
+    takes a query, by :func:`.fields.endpoint_query`, and caps the URL at ``URL_MAX``."""
     _no_line_breaks(value)
+    if allow_query and len(value) > fields.URL_MAX:
+        raise ValueError(f"at most {fields.URL_MAX} characters")
     parts = urlsplit(value)
     if parts.scheme not in schemes:
         raise ValueError(f"scheme must be one of: {', '.join(schemes)}")
@@ -98,8 +106,17 @@ def _check_url(value: str, *, schemes: tuple[str, ...], allow_path: bool) -> str
         raise ValueError("missing host")
     if parts.username is not None or parts.password is not None:
         raise ValueError("credentials in URLs are not allowed; use a credential reference")
-    if parts.query or parts.fragment:
+    if not allow_query and (parts.query or parts.fragment):
         raise ValueError("query strings and fragments are not allowed")
+    # urlsplit reports a trailing "#" as no fragment and a trailing "?" as no query.
+    if "#" in value:
+        raise ValueError("fragments are not allowed")
+    if "?" in value and not parts.query:
+        raise ValueError("an empty query is not allowed")
+    if "?" in value:
+        # Only a query field gets here. The query as written: urlsplit drops tabs, and the vault
+        # keeps and sends the text itself.
+        fields.endpoint_query(value.partition("?")[2])
     if not allow_path and parts.path not in ("", "/"):
         raise ValueError("a path is not allowed here")
     try:
@@ -244,7 +261,20 @@ def _check_mailbox(value: str, *, allow_display_name: bool) -> str:
 
 
 HostPort = Annotated[str, Field(min_length=3, max_length=300)]
+
+
+def _check_private_host_port(value: str) -> str:
+    return fields.host_port_lower(_check_host_port(value))
+
+
+# A destination allowed to resolve to a non-global address. Checked per entry, so an error names
+# its index.
+PrivateHostPort = Annotated[HostPort, AfterValidator(_check_private_host_port)]
 Network = Annotated[str, Field(min_length=1, max_length=64)]
+# An egress source, by name: the vault's is "vault". check refuses a name that isn't a source.
+SourceName = Annotated[str, StringConstraints(pattern=NAME_PATTERN)]
+# A Squid ACL name: check refuses one that isn't 1 to 64 of [A-Za-z0-9_].
+SquidAclName = Annotated[str, Field(max_length=300)]
 
 
 class _Model(BaseModel):
@@ -338,18 +368,40 @@ class OAuth2Credential(_Model):
     authorize_params: dict[QueryParam, ParamValue] = {}
     redirect_uri: str = "http://127.0.0.1/callback"
     issuer: str | None = None
+    # Refuse an authorization answer without iss (RFC 9207). Onboarding sets it from the AS
+    # metadata's authorization_response_iss_parameter_supported; off unless set.
+    require_iss: bool = False
+    # RFC 7009 revocation, best effort when the credential is deleted. https only.
+    revocation_url: str | None = None
+    # The protected-resource metadata URL onboarding used; health compares a runtime challenge's
+    # resource_metadata with it. No decision reads it.
+    resource_metadata: str | None = None
 
+    # The two endpoints may carry a query, which RFC 6749 3.1-3.2 say MUST be kept; the issuer
+    # never does (RFC 8414 section 2).
     @field_validator("token_url")
     @classmethod
     def _valid_token_url(cls, value: str) -> str:
-        return _check_url(value, schemes=("https", "http"), allow_path=True)
+        return _check_url(value, schemes=("https", "http"), allow_path=True, allow_query=True)
 
-    @field_validator("authorize_url", "issuer")
+    @field_validator("authorize_url")
     @classmethod
-    def _valid_optional_url(cls, value: str | None) -> str | None:
+    def _valid_authorize_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _check_url(value, schemes=("https", "http"), allow_path=True, allow_query=True)
+
+    @field_validator("issuer")
+    @classmethod
+    def _valid_issuer(cls, value: str | None) -> str | None:
         if value is None:
             return None
         return _check_url(value, schemes=("https", "http"), allow_path=True)
+
+    @field_validator("revocation_url", "resource_metadata")
+    @classmethod
+    def _valid_https(cls, value: str | None) -> str | None:
+        return None if value is None else _check_url(value, schemes=("https",), allow_path=True)
 
     @field_validator("redirect_uri")
     @classmethod
@@ -396,6 +448,30 @@ class OAuth2Credential(_Model):
             raise ValueError(f"client_auth {self.client_auth} needs a client_secret")
         if self.client_auth == "none" and self.client_secret is not None:
             raise ValueError("client_auth none takes no client_secret")
+        return self
+
+    @model_validator(mode="after")
+    def _endpoint_queries(self) -> OAuth2Credential:
+        """No name the vault sets on that request, nor one the credential's own params set.
+        Reported at the endpoint's own field."""
+        endpoints = [("token_url", self.token_url, fields.TOKEN_PARAMS | set(self.extra_params))]
+        if self.authorize_url is not None:
+            reserved = fields.AUTHORIZE_PARAMS | set(self.authorize_params)
+            endpoints.append(("authorize_url", self.authorize_url, reserved))
+        problems = []
+        for field, url, names in endpoints:
+            try:
+                fields.check_endpoint_query(url, names)
+            except ValueError as exc:
+                # A value_error, worded like the field validator's own refusals of that field.
+                problems.append(
+                    InitErrorDetails(
+                        type="value_error", loc=(field,), input=url, ctx={"error": exc}
+                    )
+                )
+        if problems:
+            # A ValidationError raised here keeps each error's own path, under the credential's.
+            raise ValidationError.from_exception_data("OAuth2Credential", problems)
         return self
 
     @property
@@ -777,6 +853,13 @@ class Policy(_Model):
     version: Literal[1]
     mode: Literal["managed", "declarative"]
     egress_proxy: str | None = None
+    # Vault destinations (host:port) allowed to resolve to non-global addresses.
+    egress_private: list[PrivateHostPort] = []
+    # The egress role's read-only key generation.
+    egress_key_generation: Annotated[int, Field(ge=1)] = 1
+    # The Squid source ACL name per egress source, for an operator's own proxy:
+    # {"vault": "stack_vault_net"}.
+    egress_proxy_acls: dict[SourceName, SquidAclName] = {}
     gateway_key_generation: Annotated[int, Field(ge=1)] = 1
     admin: Admin | None = None  # no block: no portal
     credentials: dict[Name, Credential] = {}

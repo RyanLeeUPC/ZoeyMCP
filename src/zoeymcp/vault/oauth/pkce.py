@@ -32,9 +32,8 @@ from urllib.parse import parse_qsl, urlsplit
 from ...common.logs import refuse_type
 from ...common.policy.schema import OAuth2Credential, is_secret_ref, param_values
 from ...common.textrules import find_violations
-from ..request import encode_query
 from ..store import Secret, canonical_origin
-from .protocol import safe_error_code
+from .protocol import safe_error_code, with_query
 
 FLOW_TTL: Final = 600.0
 MAX_FLOWS: Final = 8
@@ -99,7 +98,7 @@ def authorize_url(cred: OAuth2Credential, *, state: Secret, challenge: str) -> s
         if name in names:
             raise ValueError(f"authorize_params can't set {name!r}; the vault sets it")
         params.extend((name, one) for one in param_values(value))
-    return f"{cred.authorize_url}?{encode_query(params)}"
+    return with_query(cred.authorize_url, params)
 
 
 # --- the redirect ------------------------------------------------------------------------------

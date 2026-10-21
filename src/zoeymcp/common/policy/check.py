@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 from .. import canonical
+from . import fields
 from .callback import callback_address, callback_origin
 from .findings import Finding
 from .match import NormalizedPath, path_matches
@@ -129,6 +130,7 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
     _check_routes(policy, report)
     _check_tokens(policy, report)
     _check_gateway(policy, report)
+    _check_egress(policy, report)
     if policy.admin is not None:
         _check_admin(policy.admin, report)
     return sorted(set(report.findings))
@@ -289,6 +291,7 @@ def _check_oauth_refs(policy: Policy, report: _Report) -> None:
 def _check_credentials(policy: Policy, report: _Report) -> None:
     used = {r.credential for r in policy.routes if r.credential is not None}
     used_connectors = {r.connector for r in policy.routes if r.connector is not None}
+    mcp_routes = _remote_routes(policy)
     for name, cred in policy.credentials.items():
         path = f"credentials.{name}"
         is_oauth = isinstance(cred, OAuth2Credential)
@@ -303,7 +306,8 @@ def _check_credentials(policy: Policy, report: _Report) -> None:
         if isinstance(cred, OAuth2Credential):
             upstreams = [r.upstream for r in policy.routes if r.credential == name and r.upstream]
             origins = {o for o in map(_origin, upstreams) if o is not None}
-            _check_oauth(path, cred, origins, report)
+            mcp = any(r.credential == name and r.name in mcp_routes for r in policy.routes)
+            _check_oauth(path, cred, origins, mcp, report)
             if policy.admin is not None:
                 _check_callback(path, name, cred, policy.admin, report)
     for name, conn in policy.connectors.items():
@@ -385,13 +389,21 @@ def _origin(url: str) -> str | None:
     return f"{parts.scheme}://{parts.hostname}:{port}"
 
 
-def _check_oauth(path: str, cred: OAuth2Credential, origins: set[str], report: _Report) -> None:
+def _check_oauth(
+    path: str, cred: OAuth2Credential, origins: set[str], mcp: bool, report: _Report
+) -> None:
+    """``origins`` are the upstream origins of the routes using ``cred``; ``mcp`` says one of
+    those routes is a gateway server's."""
     if urlsplit(cred.token_url).scheme != "https":
         report.error(f"{path}.token_url", "the token endpoint must use https")
     if cred.authorize_url is not None and urlsplit(cred.authorize_url).scheme != "https":
         report.error(f"{path}.authorize_url", "the authorization endpoint must use https")
     if cred.issuer is not None and urlsplit(cred.issuer).scheme != "https":
         report.error(f"{path}.issuer", "the issuer must use https")
+    if cred.require_iss and cred.issuer is None:
+        report.error(f"{path}.require_iss", "require_iss needs issuer, the value iss must equal")
+    if cred.revocation_url is not None:
+        _check_revocation(path, cred, cred.revocation_url, report)
     if is_secret_ref(cred.client_id) and cred.authorize_url is not None:
         report.error(
             f"{path}.client_id",
@@ -406,6 +418,20 @@ def _check_oauth(path: str, cred: OAuth2Credential, origins: set[str], report: _
     _check_oauth_params(path, cred, report)
     _check_oauth_scopes(path, cred, report)
     _check_resources(path, cred, origins, report)
+    if mcp:
+        _check_mcp_resource(path, cred, report)
+
+
+def _check_revocation(path: str, cred: OAuth2Credential, url: str, report: _Report) -> None:
+    r_path = f"{path}.revocation_url"
+    if cred.grant == "client_credentials":
+        report.error(r_path, "not used by the client_credentials grant: it has no refresh token")
+    if _origin(url) != _origin(cred.token_url):
+        report.error(
+            r_path,
+            "revocation sends the refresh token and the client authentication, which may go "
+            "only to the token endpoint's origin",
+        )
 
 
 def _check_callback(
@@ -554,6 +580,29 @@ def _check_resources(path: str, cred: OAuth2Credential, origins: set[str], repor
         report.warning(r_path, "RFC 8707: send it on the authorization request too")
 
 
+def _check_mcp_resource(path: str, cred: OAuth2Credential, report: _Report) -> None:
+    """A credential behind a gateway server's route: MCP clients send ``resource`` (RFC 8707).
+    One without an ``authorize_url`` is never compared with ``authorize_params``; an absent
+    ``authorize_params.resource`` is ``_check_resources``' own warning."""
+    r_path = f"{path}.extra_params.resource"
+    if "resource" not in cred.extra_params:
+        report.warning(
+            r_path,
+            "a gateway server's tokens are for its URL: MCP clients send resource (RFC 8707), "
+            "so set it to the server's URL",
+        )
+        return
+    if cred.authorize_url is None or "resource" not in cred.authorize_params:
+        return
+    token = set(param_values(cred.extra_params["resource"]))
+    if token != set(param_values(cred.authorize_params["resource"])):
+        report.warning(
+            r_path,
+            "differs from authorize_params.resource: the tokens would be for a resource the "
+            "consent didn't name",
+        )
+
+
 # --- routes ------------------------------------------------------------------------------------
 
 
@@ -595,6 +644,13 @@ def _check_route_target(policy: Policy, path: str, route: Route, report: _Report
         report.error(f"{path}.connector", f"unknown connector {route.connector!r}")
     if route.upstream is not None:
         scheme = urlsplit(route.upstream).scheme
+        plain = scheme == "http" and route.allow_insecure_upstream and route.credential is None
+        if plain and policy.egress_proxy is not None:
+            report.warning(
+                path,
+                "CONNECT-only proxies refuse plain http (405); this route can't work through "
+                "the egress role",
+            )
         if scheme == "http" and not route.allow_insecure_upstream:
             report.error(
                 f"{path}.upstream",
@@ -726,6 +782,54 @@ def _check_tokens(policy: Policy, report: _Report) -> None:
         if len(paths) > 1:
             for p in paths:
                 report.error(p, "two clients share a token")
+
+
+# --- egress ------------------------------------------------------------------------------------
+
+
+def _check_egress(policy: Policy, report: _Report) -> None:
+    """``egress_private`` lists vault destinations, each once (the schema has their form and
+    case); ``egress_proxy_acls`` maps egress sources to Squid ACL names."""
+    destinations = _vault_destinations(policy)
+    first: dict[str, int] = {}
+    for index, entry in enumerate(policy.egress_private):
+        path = f"egress_private[{index}]"
+        if entry in first:
+            report.error(path, f"duplicate entry (also egress_private[{first[entry]}])")
+        first.setdefault(entry, index)
+        if entry not in destinations:
+            report.warning(path, "unused: the vault never connects here")
+    for source, acl in policy.egress_proxy_acls.items():
+        path = f"egress_proxy_acls.{source}"
+        if source != "vault":
+            report.error(path, f"{source!r} isn't an egress source; the vault's is vault")
+        if not fields.is_squid_acl_name(acl):
+            report.error(path, "a Squid ACL name is 1 to 64 letters, digits or underscores")
+
+
+def _vault_destinations(policy: Policy) -> set[str]:
+    """Every ``host:port`` the vault connects to, as ``egress_private`` writes it: the route
+    upstreams, the token and revocation endpoints, and the connectors."""
+    urls = [r.upstream for r in policy.routes if r.upstream is not None]
+    for cred in policy.credentials.values():
+        if isinstance(cred, OAuth2Credential):
+            urls.append(cred.token_url)
+            if cred.revocation_url is not None:
+                urls.append(cred.revocation_url)
+    found = {_host_port(url) for url in urls}
+    for conn in policy.connectors.values():
+        found.add(_join_host_port(conn.host.lower(), conn.port))
+    return found
+
+
+def _host_port(url: str) -> str:
+    """``host:port`` for an http(s) URL whose host and port the schema has checked."""
+    parts = urlsplit(url)  # lowercases the host
+    return _join_host_port(str(parts.hostname), parts.port or _DEFAULT_PORTS[parts.scheme])
+
+
+def _join_host_port(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 # --- the portal --------------------------------------------------------------------------------
@@ -1043,8 +1147,8 @@ def _check_upstream_server(path: str, server: RemoteServer | BridgeServer, repor
     if server.enable:
         report.error(
             f"{path}.enable",
-            "resources, prompts, completions, sampling, elicitation and roots can't be enabled "
-            "yet; M3 serves tools only",
+            "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
+            "the gateway serves tools only",
         )
     if server.shared_session:
         report.warning(

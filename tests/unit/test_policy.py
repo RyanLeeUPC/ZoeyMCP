@@ -563,7 +563,13 @@ def test_scope_and_param_helpers() -> None:
         ({"token_headers": {"X-A": "x" * 257}}, ".token_headers.X-A: String should have at most"),
         ({"token_headers": {"X A": "x"}}, ".token_headers.X A.[key]: String should match"),
         ({"authorize_url": "ftp://auth.example/a"}, ".authorize_url: Value error, scheme must"),
-        ({"authorize_url": AUTHORIZE + "?a=b"}, ".authorize_url: Value error, query strings"),
+        # A query is kept now (Q41); a reserved name, a "$" and a fragment are still refused.
+        (
+            {"authorize_url": AUTHORIZE + "?state=b"},
+            ".authorize_url: Value error, the endpoint's query sets",
+        ),
+        ({"authorize_url": AUTHORIZE + "?a=$b"}, ".authorize_url: Value error, a query may hold"),
+        ({"authorize_url": AUTHORIZE + "?a=b#f"}, ".authorize_url: Value error, fragments are"),
         ({"issuer": "https://u:p@auth.example"}, ".issuer: Value error, credentials in URLs"),
         ({"issuer": "https://auth.example/#f"}, ".issuer: Value error, query strings"),
     ],
@@ -1244,6 +1250,468 @@ def test_resource_origins_on_plain_http() -> None:
     ]
 
 
+# --- OAuth: M7's fields and endpoint queries (M7 design A.1, A.2 rows 1b, 3-5) ---------------
+
+# Every punctuation character an endpoint's query may hold (Q41).
+PUNCTUATION_QUERY = "?a=-._~!()*+,:@/?&b=%2F"
+# A.4's discovered credential, as diff 1 writes it.
+DISCOVERED: Raw = {
+    "kind": "oauth2",
+    "token_url": "https://auth.notes.example/oauth/token",
+    "authorize_url": "https://auth.notes.example/oauth/authorize",
+    "issuer": "https://auth.notes.example",
+    "require_iss": True,
+    "revocation_url": "https://auth.notes.example/oauth/revoke",
+    "resource_metadata": "https://mcp.notes.example/.well-known/oauth-protected-resource/mcp",
+    "client_id": "zc_4f1c9a",
+    "client_auth": "none",
+    "refresh_token": "store:notes-refresh",
+    "rotates": True,
+    "redirect_uri": "http://127.0.0.1/callback/notes",
+    "scope": "notes.read notes.write offline_access",
+    "extra_params": {"resource": "https://mcp.notes.example/mcp"},
+    "authorize_params": {"resource": "https://mcp.notes.example/mcp"},
+}
+
+
+def test_the_new_credential_fields_default_off() -> None:
+    cred = parsed(oauth())
+    assert (cred.require_iss, cred.revocation_url, cred.resource_metadata) == (False, None, None)
+
+
+def test_the_discovered_credential_example_checks_clean() -> None:
+    raw = oauth_policy({"notes": DISCOVERED}, upstream="https://mcp.notes.example")
+    assert found(raw) == []
+    cred = parse_policy(yaml.safe_dump(raw), "test").credentials["notes"]
+    assert isinstance(cred, OAuth2Credential)
+    assert cred.require_iss is True
+    assert cred.revocation_url == "https://auth.notes.example/oauth/revoke"
+
+
+def test_require_iss_needs_issuer() -> None:
+    login = {"authorize_url": AUTHORIZE, "scope": "read"}
+    assert found_for(oauth(require_iss=True, **login)) == [
+        "error credentials.o.require_iss: require_iss needs issuer, the value iss must equal"
+    ]
+    assert found_for(oauth(require_iss=True, issuer="https://auth.example", **login)) == []
+    assert found_for(oauth(require_iss=False, **login)) == []
+
+
+def test_revocation_is_for_a_refresh_grant_on_the_token_origin() -> None:
+    same = oauth(revocation_url="https://auth.example/oauth/revoke")
+    assert found_for(same) == found_for(oauth())
+    # Compared as origins: a default port written out is the same origin.
+    assert found_for(oauth(revocation_url="https://auth.example:443/r")) == found_for(oauth())
+    assert found_for(client_credentials(revocation_url="https://auth.example/revoke")) == [
+        "error credentials.o.revocation_url: not used by the client_credentials grant: it has "
+        "no refresh token"
+    ]
+    cross = (
+        "error credentials.o.revocation_url: revocation sends the refresh token and the client "
+        "authentication, which may go only to the token endpoint's origin"
+    )
+    for url in (
+        "https://revoke.example/revoke",
+        "https://auth.example:8443/revoke",
+        "https://other.auth.example/revoke",
+    ):
+        assert cross in found_for(oauth(revocation_url=url)), url
+    assert cross not in found_for(oauth(revocation_url="https://AUTH.example/revoke"))
+
+
+@pytest.mark.parametrize("field", ["revocation_url", "resource_metadata"])
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://auth.example/revoke", "scheme must be one of: https"),
+        ("https://auth.example/revoke?a=b", "query strings and fragments are not allowed"),
+        ("https://auth.example/revoke#f", "query strings and fragments are not allowed"),
+        ("https://auth.example/revoke#", "fragments are not allowed"),
+        ("https://auth.example/revoke?", "an empty query is not allowed"),
+        ("https://u@auth.example/revoke", "credentials in URLs are not allowed"),
+    ],
+)
+def test_the_two_https_fields(field: str, url: str, expected: str) -> None:
+    found_errors = schema_error_for(oauth(**{field: url}))
+    assert any(e.startswith(f".{field}: Value error, {expected}") for e in found_errors), (
+        found_errors
+    )
+
+
+def test_the_two_https_fields_accept_a_path() -> None:
+    url = "https://mcp.notes.example/.well-known/oauth-protected-resource/mcp"
+    assert parsed(oauth(resource_metadata=url)).resource_metadata == url
+    assert parsed(oauth(revocation_url=url)).revocation_url == url
+
+
+@pytest.mark.parametrize("field", ["token_url", "authorize_url"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "?tenant=a%2Fb&p=B2C_1_signin",
+        PUNCTUATION_QUERY,
+        "?a=",
+        "?" + "&".join(f"p{i}=v" for i in range(16)),
+    ],
+)
+def test_an_endpoint_query_is_kept_byte_for_byte(field: str, query: str) -> None:
+    url = f"https://auth.example/{field}{query}"
+    cred = parsed(oauth(**{field: url, "scope": "a"}))
+    assert getattr(cred, field) == url
+
+
+def test_each_request_reserves_its_own_names() -> None:
+    # state is the authorization request's, grant_type the token request's.
+    assert parsed(oauth(token_url="https://auth.example/token?state=x")).token_url.endswith("x")
+    with_grant = parsed(oauth(authorize_url=AUTHORIZE + "?grant_type=x"))
+    assert with_grant.authorize_url == AUTHORIZE + "?grant_type=x"
+
+
+QUERY_REFUSALS = [
+    ("?a=$b", "a query may hold letters, digits, %HH escapes"),
+    ("?a=b;redirect_uri=x", "a query may hold letters"),
+    ("?a='b'", "a query may hold letters"),
+    ('?a="b"', "a query may hold letters"),
+    ("?a=<b", "a query may hold letters"),
+    ("?a=b|c", "a query may hold letters"),
+    ("?a=b\\c", "a query may hold letters"),
+    ("?a=b c", "a query may hold letters"),
+    # urlsplit drops a tab; the query is checked as written.
+    ("?a=b	", "a query may hold letters"),
+    ("?a=é", "a query may hold letters"),
+    ("?a=%zz", "a query may hold letters"),
+    ("?a=%", "a query may hold letters"),
+    ("?a", "a query is name=value pairs joined by &"),
+    ("?a=1&&b=2", "a query is name=value pairs joined by &"),
+    ("?client%5Fid=x", "query parameter 'client%5Fid': a name is 1 to 128"),
+    ("?a=1&a=2", "the query sets a twice"),
+    ("?" + "&".join(f"p{i}=v" for i in range(17)), "a query has at most 16 parameters"),
+    ("?", "an empty query is not allowed"),
+    ("#", "fragments are not allowed"),
+    ("?a=b#", "fragments are not allowed"),
+    ("#f", "fragments are not allowed"),
+]
+
+
+@pytest.mark.parametrize("field", ["token_url", "authorize_url"])
+@pytest.mark.parametrize(("query", "expected"), QUERY_REFUSALS)
+def test_an_endpoint_query_is_refused(field: str, query: str, expected: str) -> None:
+    found_errors = schema_error_for(oauth(**{field: f"https://auth.example/{field}{query}"}))
+    assert any(e.startswith(f".{field}: Value error, {expected}") for e in found_errors), (
+        found_errors
+    )
+
+
+RESERVED_MESSAGE = (
+    ".{}: Value error, the endpoint's query sets {}, which the vault sets on this request or which "
+    "changes how the server reads the vault's parameters"
+)
+
+
+@pytest.mark.parametrize(
+    ("field", "name"),
+    [
+        ("token_url", "client_id"),
+        ("token_url", "resource"),
+        ("token_url", "client_assertion"),
+        ("token_url", "grant_type"),
+        ("authorize_url", "client_id"),
+        ("authorize_url", "state"),
+        ("authorize_url", "resource"),
+        ("authorize_url", "request_uri"),
+        ("authorize_url", "response_mode"),
+    ],
+)
+def test_a_reserved_name_in_an_endpoint_query_is_refused(field: str, name: str) -> None:
+    url = f"https://auth.example/{field}?tenant=t&{name}=x"
+    assert RESERVED_MESSAGE.format(field, name) in schema_error_for(oauth(**{field: url}))
+
+
+def test_a_name_the_credentials_own_params_set_is_refused() -> None:
+    token = oauth(token_url="https://auth.example/token?audience=a", extra_params={"audience": "b"})
+    assert RESERVED_MESSAGE.format("token_url", "audience") in schema_error_for(token)
+    authorize = oauth(authorize_url=AUTHORIZE + "?prompt=login", authorize_params={"prompt": "x"})
+    assert RESERVED_MESSAGE.format("authorize_url", "prompt") in schema_error_for(authorize)
+    # Each request's own params: extra_params says nothing about the authorization URL.
+    crossed = oauth(authorize_url=AUTHORIZE + "?audience=a", extra_params={"audience": "b"})
+    assert parsed(crossed).authorize_url == AUTHORIZE + "?audience=a"
+
+
+def test_each_endpoint_query_is_reported_at_its_own_field() -> None:
+    both = oauth(
+        token_url="https://auth.example/token?scope=a", authorize_url=AUTHORIZE + "?state=b"
+    )
+    found_errors = schema_error_for(both)
+    assert RESERVED_MESSAGE.format("token_url", "scope") in found_errors
+    assert RESERVED_MESSAGE.format("authorize_url", "state") in found_errors
+
+
+@pytest.mark.parametrize("field", ["token_url", "authorize_url"])
+@pytest.mark.parametrize("query", [False, True])
+def test_the_two_endpoints_are_capped_at_2048_characters(field: str, query: bool) -> None:
+    head = f"https://auth.example/{field}"
+    tail = "?q=" if query else "/"
+    fits = head + tail + "x" * (2048 - len(head) - len(tail))
+    assert len(fits) == 2048
+    assert getattr(parsed(oauth(**{field: fits})), field) == fits
+    found_errors = schema_error_for(oauth(**{field: fits + "x"}))
+    expected = f".{field}: Value error, at most 2048 characters"
+    assert any(e.startswith(expected) for e in found_errors), found_errors
+
+
+@pytest.mark.parametrize("field", ["issuer", "revocation_url", "resource_metadata"])
+def test_every_other_oauth_url_still_refuses_a_query(field: str) -> None:
+    found_errors = schema_error_for(oauth(**{field: "https://auth.example/x?tenant=a"}))
+    expected = f".{field}: Value error, query strings and fragments are not allowed"
+    assert any(e.startswith(expected) for e in found_errors), found_errors
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://auth.example/?", "an empty query is not allowed"),
+        ("https://auth.example/#", "fragments are not allowed"),
+    ],
+)
+def test_a_bare_query_or_fragment_on_the_issuer_and_the_redirect_uri(
+    url: str, expected: str
+) -> None:
+    assert any(
+        e.startswith(f".issuer: Value error, {expected}")
+        for e in schema_error_for(oauth(issuer=url))
+    )
+    redirect = url.replace("https://auth.example", "http://127.0.0.1")
+    assert any(
+        e.startswith(f".redirect_uri: Value error, {expected}")
+        for e in schema_error_for(oauth(redirect_uri=redirect))
+    )
+
+
+@pytest.mark.parametrize(
+    ("upstream", "expected"),
+    [
+        ("https://api.stats.example/?", "an empty query is not allowed"),
+        ("https://api.stats.example/#", "fragments are not allowed"),
+        ("https://api.stats.example?", "an empty query is not allowed"),
+    ],
+)
+def test_a_bare_query_or_fragment_on_a_route_upstream(
+    example_raw: Raw, upstream: str, expected: str
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "stats")["upstream"] = upstream
+    expected = f"routes[0].upstream: Value error, {expected}"
+    assert any(e.startswith(expected) for e in schema_errors(raw))
+
+
+def mcp_credential(raw: Raw, **fields: Any) -> list[str]:
+    """The findings at the example's MCP credential once ``fields`` change it."""
+    raw = copy.deepcopy(raw)
+    cred = raw["credentials"]["broker-mcp"]
+    cred.update(fields)
+    for name in [k for k, v in cred.items() if v is None]:
+        del cred[name]
+    return [
+        f"{f.level} {f.path}: {f.message}"
+        for f in run(raw)
+        if f.path.startswith("credentials.broker-mcp.")
+    ]
+
+
+RESOURCE_MISSING = (
+    "warning credentials.broker-mcp.extra_params.resource: a gateway server's tokens are for its "
+    "URL: MCP clients send resource (RFC 8707), so set it to the server's URL"
+)
+RESOURCE_DIFFERS = (
+    "warning credentials.broker-mcp.extra_params.resource: differs from "
+    "authorize_params.resource: the tokens would be for a resource the consent didn't name"
+)
+LOGIN_HINT = (
+    "warning credentials.broker-mcp.authorize_url: zoeymcp login can't run; enter the refresh "
+    "token with secret set or seed it from env:"
+)
+BOTH_REQUESTS = (
+    "warning credentials.broker-mcp.extra_params.resource: RFC 8707: send it on the "
+    "authorization request too"
+)
+
+
+def test_an_mcp_credential_sends_resource(example_raw: Raw) -> None:
+    # The example's refresh-only credential has a resource and no authorize_url: no warning.
+    assert mcp_credential(example_raw) == [LOGIN_HINT]
+    assert mcp_credential(example_raw, extra_params=None) == [LOGIN_HINT, RESOURCE_MISSING]
+    other = {"extra_params": {"audience": "x"}}
+    assert mcp_credential(example_raw, **other) == [LOGIN_HINT, RESOURCE_MISSING]
+
+
+def test_an_mcp_credential_with_an_authorize_url_sends_the_same_resource(
+    example_raw: Raw,
+) -> None:
+    login = {"client_id": "broker-client", "authorize_url": AUTHORIZE, "scope": "read trade"}
+    resource = "https://mcp.broker.example/"
+    same = mcp_credential(example_raw, **login, authorize_params={"resource": resource})
+    assert same == []
+    other = {"resource": "https://other.broker.example/"}
+    assert mcp_credential(example_raw, **login, authorize_params=other) == [RESOURCE_DIFFERS]
+    several = {"resource": [resource, "https://other.broker.example/"]}
+    assert mcp_credential(example_raw, **login, authorize_params=several) == [RESOURCE_DIFFERS]
+    # An absent one is the authorization request's own warning, given once.
+    assert mcp_credential(example_raw, **login) == [BOTH_REQUESTS]
+
+
+def test_a_credential_behind_no_mcp_route_needs_no_resource() -> None:
+    assert found_for(oauth()) == found_for(oauth(extra_params={"audience": "x"}))
+    assert not any("RFC 8707), so set it" in f for f in found_for(oauth()))
+
+
+# --- egress (M7 design A.1, A.2 rows 1, 2, 5b, 14) ---------------------------------------------
+
+
+def test_the_egress_fields_default_empty(example_text: str) -> None:
+    policy = parse_policy(example_text, "example")
+    assert (policy.egress_private, policy.egress_key_generation) == ([], 1)
+    assert policy.egress_proxy_acls == {}
+
+
+def test_egress_key_generation_counts_from_one(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["egress_key_generation"] = 2
+    assert parse_policy(yaml.safe_dump(raw), "test").egress_key_generation == 2
+    raw["egress_key_generation"] = 0
+    assert any(
+        e.startswith("egress_key_generation: Input should be greater than or equal to 1")
+        for e in schema_errors(raw)
+    )
+
+
+def egress_findings(raw: Raw) -> list[str]:
+    return [f"{f.level} {f.path}: {f.message}" for f in run(raw) if f.path.startswith("egress_")]
+
+
+def test_egress_private_names_vault_destinations(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["broker-mcp"]["revocation_url"] = "https://auth.broker.example:8443/r"
+    raw["credentials"]["broker-mcp"]["token_url"] = "https://auth.broker.example:8443/token"
+    route(raw, "stats")["upstream"] = "https://[fd00::5]:8443"
+    raw["egress_private"] = [
+        "mcp.broker.example:443",  # a route upstream, by its default port
+        "[fd00::5]:8443",  # a route upstream by IP literal
+        "auth.broker.example:8443",  # the token and revocation endpoints
+        "smtp.mail.example:465",  # a connector
+    ]
+    assert egress_findings(raw) == []
+    raw["egress_private"] = ["mcp.broker.example:80", "lan.example:443", "smtp.mail.example:587"]
+    unused = "unused: the vault never connects here"
+    assert egress_findings(raw) == [f"warning egress_private[{i}]: {unused}" for i in range(3)]
+
+
+def test_a_revocation_endpoint_is_a_vault_destination(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["broker-mcp"]["revocation_url"] = "https://auth.broker.example/revoke"
+    raw["egress_private"] = ["auth.broker.example:443"]
+    assert egress_findings(raw) == []
+    raw["credentials"]["broker-mcp"]["token_url"] = "https://auth.broker.example:8443/token"
+    raw["credentials"]["broker-mcp"]["revocation_url"] = "https://auth.broker.example/revoke"
+    assert egress_findings(raw) == []
+
+
+def test_a_connector_host_is_compared_in_lower_case(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["connectors"]["mail-out"]["host"] = "SMTP.Mail.example"
+    raw["egress_private"] = ["smtp.mail.example:465"]
+    assert egress_findings(raw) == []
+
+
+def test_a_duplicate_egress_private_entry(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["egress_private"] = ["mcp.broker.example:443", "smtp.mail.example:465"] * 2
+    assert egress_findings(raw) == [
+        "error egress_private[2]: duplicate entry (also egress_private[0])",
+        "error egress_private[3]: duplicate entry (also egress_private[1])",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("MCP.broker.example:443", "write host:port in lower case: the egress role compares"),
+        ("[FD00::1]:443", "write host:port in lower case"),
+        ("mcp.broker.example", "expected host:port"),
+        ("mcp.broker.example:99999", "invalid port"),
+        ("mcp.broker.example:0", "invalid port"),
+        ("[zz]:443", "invalid IPv6 address"),
+        ("bad_host!:443", "invalid host"),
+        ("mcp.broker.example:443\n", "invalid port"),
+    ],
+)
+def test_an_invalid_egress_private_entry(example_raw: Raw, entry: str, expected: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["egress_private"] = ["smtp.mail.example:465", entry]
+    found_errors = schema_errors(raw)
+    assert any(e.startswith(f"egress_private[1]: Value error, {expected}") for e in found_errors), (
+        found_errors
+    )
+
+
+def test_egress_proxy_acls(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["egress_proxy_acls"] = {"vault": "stack_vault_net"}
+    assert egress_findings(raw) == []
+    assert parse_policy(yaml.safe_dump(raw), "test").egress_proxy_acls == {
+        "vault": "stack_vault_net"
+    }
+    raw["egress_proxy_acls"] = {"gateway": "gw", "vault": "stack-vault", "stats": "a" * 65}
+    acl = "a Squid ACL name is 1 to 64 letters, digits or underscores"
+    assert egress_findings(raw) == [
+        "error egress_proxy_acls.gateway: 'gateway' isn't an egress source; the vault's is vault",
+        "error egress_proxy_acls.stats: 'stats' isn't an egress source; the vault's is vault",
+        f"error egress_proxy_acls.stats: {acl}",
+        f"error egress_proxy_acls.vault: {acl}",
+    ]
+    raw["egress_proxy_acls"] = {"vault": ""}
+    assert egress_findings(raw) == [f"error egress_proxy_acls.vault: {acl}"]
+    raw["egress_proxy_acls"] = {"Vault": "v"}
+    assert any(
+        e.startswith("egress_proxy_acls.Vault.[key]: String should match")
+        for e in schema_errors(raw)
+    )
+
+
+CONNECT_ONLY = (
+    "warning routes[0]: CONNECT-only proxies refuse plain http (405); this route can't work "
+    "through the egress role"
+)
+
+
+def test_a_plain_http_route_through_a_connect_proxy_warns(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    stats = route(raw, "stats")
+    stats.update(upstream="http://api.stats.example", allow_insecure_upstream=True)
+    del stats["credential"]
+    raw["credentials"].pop("music-stats")
+    assert CONNECT_ONLY not in listed(raw)
+    raw["egress_proxy"] = "http://proxy.example:3128"
+    assert CONNECT_ONLY in listed(raw)
+    stats["upstream"] = "https://api.stats.example"
+    assert CONNECT_ONLY not in listed(raw)
+    # Without the opt-in, plain http is its own error.
+    stats.update(upstream="http://api.stats.example", allow_insecure_upstream=False)
+    found = listed(raw)
+    assert CONNECT_ONLY not in found
+    assert any(f.startswith("error routes[0].upstream: plain http would send") for f in found)
+
+
+def test_a_plain_http_route_with_a_credential_has_its_own_error(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["egress_proxy"] = "http://proxy.example:3128"
+    route(raw, "stats").update(upstream="http://api.stats.example", allow_insecure_upstream=True)
+    found = listed(raw)
+    assert CONNECT_ONLY not in found
+    assert "error routes[0].upstream: a credential can't be sent over plain http" in found
+    route(raw, "stats")["allow_insecure_upstream"] = False
+    assert CONNECT_ONLY not in listed(raw)
+
+
 # --- gateway: clients and tokens --------------------------------------------------------------
 
 
@@ -1626,14 +2094,14 @@ def bridge(**fields: Any) -> Raw:
 
 
 @pytest.mark.parametrize("capability", ["resources", "completions", "roots"])
-def test_enable_is_an_error_for_now(example_raw: Raw, capability: str) -> None:
+def test_enable_is_an_error(example_raw: Raw, capability: str) -> None:
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
     raw["gateway"]["servers"]["bridge1"] = bridge(enable=[capability])
     raw["gateway"]["clients"]["agent1"]["servers"].append("bridge1")
     message = (
-        "resources, prompts, completions, sampling, elicitation and roots can't be enabled "
-        "yet; M3 serves tools only"
+        "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
+        "the gateway serves tools only"
     )
     found = errors(run(raw))
     assert found == [

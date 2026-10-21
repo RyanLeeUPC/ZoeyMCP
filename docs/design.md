@@ -1029,10 +1029,11 @@ name is ignored), and gives `review` and `tool_drift` the changed members and a 
 decision reads it.**
 
 **What else is off.** `resources`, `prompts`, `completions`, `sampling`, `elicitation` and
-`roots` stay off: `enable` must be empty in M3 (`check` refuses anything else). Upstreams are
-offered no capability at all. A legacy upstream's server → client request gets an error answer
-from the SDK; a modern `input_required` result ends the call with `isError` "refused: the server
-asked for input this gateway doesn't relay"; nothing of either reaches the agent.
+`roots` stay off: `enable` must be empty, since the gateway serves tools only (`check` refuses
+anything else). Upstreams are offered no capability at all. A legacy upstream's server → client
+request gets an error answer from the SDK; a modern `input_required` result ends the call with
+`isError` "refused: the server asked for input this gateway doesn't relay"; nothing of either
+reaches the agent.
 `notifications/message` and progress text are dropped.
 
 ### 5.2 Approvals

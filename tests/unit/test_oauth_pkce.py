@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from zoeymcp.common import logs as common_logs
 from zoeymcp.common.policy.schema import OAuth2Credential
@@ -149,6 +150,52 @@ def test_authorize_url_without_scope() -> None:
 def test_authorize_url_refuses(credential: OAuth2Credential, message: str) -> None:
     with pytest.raises(ValueError, match=f"^{message}$"):
         authorize_url(credential, state=Secret(STATE), challenge="ch-1")
+
+
+def test_an_authorization_endpoints_query_comes_first() -> None:
+    endpoint = "https://accounts.example/authorize?tenant=a%2Fb&p=B2C_1_signin"
+    url = authorize_url(cred(authorize_url=endpoint), state=Secret(STATE), challenge="ch-1")
+    assert url == (
+        endpoint + "&response_type=code&client_id=app-1"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&state=" + STATE + "&code_challenge=ch-1"
+        "&code_challenge_method=S256"
+    )
+    # Without a query the URL is byte for byte what it always was.
+    plain = authorize_url(cred(), state=Secret(STATE), challenge="ch-1")
+    assert plain.startswith("https://accounts.example/authorize?response_type=code&")
+
+
+def built_past_the_schema(endpoint: str) -> OAuth2Credential:
+    return OAuth2Credential.model_construct(
+        kind="oauth2",
+        token_url="https://accounts.example/oauth/token",
+        authorize_url=endpoint,
+        client_id="app-1",
+    )
+
+
+def test_redirect_uri_in_the_endpoints_query_is_refused() -> None:
+    endpoint = "https://accounts.example/authorize?redirect_uri=https://evil.example/cb"
+    with pytest.raises(ValidationError, match="the endpoint's query sets redirect_uri"):
+        cred(authorize_url=endpoint)
+    with pytest.raises(ValueError, match=r"^the endpoint's query already sets 'redirect_uri'$"):
+        authorize_url(built_past_the_schema(endpoint), state=Secret(STATE), challenge="ch-1")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "message"),
+    [
+        ("https://as/authorize?", r"^an endpoint ending in a bare '\?' can't take parameters$"),
+        ("https://as/authorize#", r"^an endpoint with a fragment can't take parameters$"),
+        ("https://as/authorize?a=b#", r"^an endpoint with a fragment can't take parameters$"),
+    ],
+)
+def test_a_bare_query_or_a_fragment_never_reaches_the_url(endpoint: str, message: str) -> None:
+    """Never sent as ``??`` or after a ``#``: the schema refuses each, and so does with_query."""
+    with pytest.raises(ValidationError):
+        cred(authorize_url=endpoint)
+    with pytest.raises(ValueError, match=message):
+        authorize_url(built_past_the_schema(endpoint), state=Secret(STATE), challenge="ch-1")
 
 
 # --- the redirect ------------------------------------------------------------------------------

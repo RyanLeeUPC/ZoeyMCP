@@ -26,8 +26,9 @@ from ... import __version__
 from ...common.adminsocket import EXCHANGE_DEADLINE as EXCHANGE_DEADLINE
 from ...common.adminsocket import REFRESH_BUDGET as REFRESH_BUDGET
 from ...common.canonical import JSONRejected, dumps_canonical, loads_strict
+from ...common.policy.fields import endpoint_query
 from ...common.policy.schema import OAuth2Credential, param_values
-from ..request import oauth_basic_credentials
+from ..request import encode_query, oauth_basic_credentials
 from ..store import Secret
 
 # --- limits and timings ------------------------------------------------------------------------
@@ -102,6 +103,37 @@ def valid_refresh_token(value: object) -> bool:
     if not isinstance(value, str) or _REFRESH_TOKEN.fullmatch(value) is None:
         return False
     return value == value.strip(" ")
+
+
+# --- endpoint queries --------------------------------------------------------------------------
+
+
+def with_query(endpoint: str, params: Sequence[tuple[str, str]]) -> str:
+    """``endpoint`` with ``params`` after its own query, which RFC 6749 3.1 says MUST be kept.
+
+    The endpoint is used as written, never decoded or re-encoded: then ``&`` when it holds a
+    ``?`` (the schema makes sure a query follows one) or ``?`` when it doesn't, then ``params``.
+    A name the endpoint's query already holds is refused, and so are a ``#`` and a bare ``?``,
+    which the schema refuses first.
+    """
+    if "#" in endpoint:
+        raise ValueError("an endpoint with a fragment can't take parameters")
+    if endpoint.endswith("?"):
+        raise ValueError("an endpoint ending in a bare '?' can't take parameters")
+    if "?" not in endpoint:
+        return f"{endpoint}?{encode_query(params)}"
+    held = _query_names(endpoint)
+    for name, _ in params:
+        if name in held:
+            raise ValueError(f"the endpoint's query already sets {name!r}")
+    return f"{endpoint}&{encode_query(params)}"
+
+
+def _query_names(endpoint: str) -> set[str]:
+    """The parameter names in an endpoint's query; none without a ``?``."""
+    if "?" not in endpoint:
+        return set()
+    return {name for name, _ in endpoint_query(endpoint.partition("?")[2])}
 
 
 # --- token requests ----------------------------------------------------------------------------
@@ -182,6 +214,11 @@ def _build(
         if name in names:
             raise ValueError(f"extra_params can't set {name!r}; the vault sets it")
         items.append((name, value))
+    # The request goes to token_url as written, query and all; no body field may repeat it.
+    held = _query_names(cred.token_url)
+    for name, _ in items:
+        if name in held:
+            raise ValueError(f"the token_url's query sets {name!r}, which the body sends")
 
     set_by_vault = {name for name, _ in headers}
     user_agent = ("user-agent", USER_AGENT)

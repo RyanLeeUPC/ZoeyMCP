@@ -63,6 +63,9 @@ def document() -> dict[str, Any]:
         "version": 1,
         "mode": "declarative",
         "egress_proxy": "http://proxy.example:3128",
+        "egress_private": ["api.example:443"],
+        "egress_key_generation": 2,
+        "egress_proxy_acls": {"vault": "stack_vault_net"},
         "admin": {"listen": "127.0.0.1:8081", "origins": ["http://localhost:8081"]},
         "credentials": {
             "header-cred": {
@@ -83,6 +86,10 @@ def document() -> dict[str, Any]:
                 "extra_params": {"resource": "https://api.example/"},
                 "token_headers": {"X-Extra": TOKEN_HEADER},
                 "scope": "read write",
+                "issuer": "https://auth.example",
+                "require_iss": True,
+                "revocation_url": "https://auth.example/revoke",
+                "resource_metadata": "https://api.example/.well-known/oauth-protected-resource",
             },
         },
         "connectors": {
@@ -392,6 +399,13 @@ def test_everything_else_is_shown_as_written_in_the_schemas_order() -> None:
     assert policy["gateway"]["clients"]["hashed"]["approvals"]["attended"] is True
     assert policy["gateway"]["limits"]["call_timeout"] == 300
     assert policy["egress_proxy"] == "http://proxy.example:3128"
+    # M7's fields show as written (M7 design A.1): none holds a secret.
+    assert (oauth["issuer"], oauth["require_iss"]) == ("https://auth.example", True)
+    assert oauth["revocation_url"] == "https://auth.example/revoke"
+    assert oauth["resource_metadata"] == "https://api.example/.well-known/oauth-protected-resource"
+    assert policy["egress_private"] == ["api.example:443"]
+    assert policy["egress_key_generation"] == 2
+    assert policy["egress_proxy_acls"] == {"vault": "stack_vault_net"}
 
 
 def test_every_string_is_shown() -> None:

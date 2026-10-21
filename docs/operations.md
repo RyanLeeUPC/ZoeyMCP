@@ -466,7 +466,25 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
   restart. An inline policy in `ZOEYMCP_CONFIG` is part of the environment too, so changing it
   means recreating the container.
 
+**Upgrading to M7.** A URL field that ends in a bare `?` or a bare `#`
+(`https://auth.example/token?`, `http://127.0.0.1/callback#`) loaded before and is now refused, at
+start and on reload. Delete the character: the address is the same without it. A `token_url` or
+`authorize_url` longer than 2,048 characters is now refused too. `check` gives two new warnings
+on a policy that loaded before: an oauth2 credential behind a gateway server's route that sends no
+`resource` in `extra_params` (set it to the server's URL), and, with `egress_proxy` set, a
+credential-less `allow_insecure_upstream` route over plain http, which a CONNECT-only proxy
+refuses.
+
 ## 8. Provider notes
+
+**Any provider.** A `token_url` or `authorize_url` may carry a query, such as a tenant or a
+policy name (`https://login.example/oauth2/token?p=B2C_1_signin`). RFC 6749 says it must be kept,
+so the vault sends it exactly as written and puts its own parameters after it. The query holds
+letters, digits, `%HH` escapes and `-._~!()*+,=&:@/?` only: at most 16 `name=value` pairs, each
+name written without escapes and given once, and none that the vault sets on that request
+(`client_id`, `redirect_uri`, `state`, `scope`, `resource` and the rest) or that the credential's
+`extra_params` or `authorize_params` sets. Either URL is at most 2,048 characters. Every other URL
+in a policy still takes no query.
 
 **Google** (`profiles/google-oauth.yaml`):
 

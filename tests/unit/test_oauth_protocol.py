@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
 
+import httpx
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -56,6 +57,7 @@ from zoeymcp.vault.oauth.protocol import (
     transport_failure,
     valid_access_token,
     valid_refresh_token,
+    with_query,
 )
 from zoeymcp.vault.store import Secret
 
@@ -333,6 +335,97 @@ def test_a_token_request_never_shows_its_body() -> None:
     )
     assert "rt-value-9" not in text
     assert "Basic" not in text
+
+
+# --- endpoint queries (M7 design B.4, Q41) ------------------------------------------------------
+
+# Every punctuation character an endpoint's query may hold, and an escape in each case.
+PUNCTUATION_QUERY = "?a=-._~!()*+,:@/?&b=%2F&c=%2f"
+VAULT_PARAMS = [("response_type", "code"), ("redirect_uri", "http://127.0.0.1/callback")]
+ENCODED = "response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("https://as.example/authorize", "https://as.example/authorize?" + ENCODED),
+        (
+            "https://as.example/authorize?tenant=t",
+            "https://as.example/authorize?tenant=t&" + ENCODED,
+        ),
+        ("https://as.example/a?x=1&y=", "https://as.example/a?x=1&y=&" + ENCODED),
+        ("https://as.example/a?tenant=a%2Fb", "https://as.example/a?tenant=a%2Fb&" + ENCODED),
+        (
+            "https://as.example/a" + PUNCTUATION_QUERY,
+            "https://as.example/a" + PUNCTUATION_QUERY + "&" + ENCODED,
+        ),
+    ],
+)
+def test_with_query_keeps_the_endpoints_query_first(endpoint: str, expected: str) -> None:
+    assert with_query(endpoint, VAULT_PARAMS) == expected
+
+
+def test_with_query_refuses_a_name_the_endpoint_holds() -> None:
+    with pytest.raises(ValueError, match=r"^the endpoint's query already sets 'redirect_uri'$"):
+        with_query("https://as.example/a?redirect_uri=https://evil.example/", VAULT_PARAMS)
+    with pytest.raises(ValueError, match=r"^the endpoint's query already sets 'response_type'$"):
+        with_query("https://as.example/a?x=1&response_type=token", VAULT_PARAMS)
+    # Names are compared as written.
+    assert with_query("https://as.example/a?Response_Type=x", VAULT_PARAMS).endswith(ENCODED)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "message"),
+    [
+        ("https://as.example/a?", r"^an endpoint ending in a bare '\?' can't take parameters$"),
+        ("https://as.example/a#", r"^an endpoint with a fragment can't take parameters$"),
+        ("https://as.example/a?a=b#", r"^an endpoint with a fragment can't take parameters$"),
+        ("https://as.example/a#?", r"^an endpoint with a fragment can't take parameters$"),
+        ("https://as.example/a?x=1&x=2", r"^the query sets x twice$"),
+        ("https://as.example/a?x=$", r"^a query may hold letters"),
+    ],
+)
+def test_with_query_refuses_what_the_schema_refuses(endpoint: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        with_query(endpoint, VAULT_PARAMS)
+
+
+def test_a_token_url_with_a_query_is_used_as_written() -> None:
+    url = TOKEN_URL + PUNCTUATION_QUERY
+    plain = build_refresh(cred(), PUBLIC_CLIENT, Secret("rt-1"))
+    request = build_refresh(cred(token_url=url), PUBLIC_CLIENT, Secret("rt-1"))
+    assert request.url == url
+    assert (request.headers, request.body) == (plain.headers, plain.body)
+    seen: list[tuple[bytes, bytes]] = []
+
+    def handle(sent: httpx.Request) -> httpx.Response:
+        seen.append((sent.url.raw_path, sent.content))
+        return httpx.Response(200)
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        client.post(request.url, headers=list(request.headers), content=request.body)
+    assert seen == [
+        (b"/oauth/token" + PUNCTUATION_QUERY.encode("ascii"), plain.body),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("fields", "name"),
+    [
+        ({"token_url": TOKEN_URL + "?grant_type=password"}, "grant_type"),
+        ({"token_url": TOKEN_URL + "?a=1&client_id=x"}, "client_id"),
+        ({"token_url": TOKEN_URL + "?audience=x", "extra_params": {"audience": "y"}}, "audience"),
+    ],
+)
+def test_a_body_field_the_token_urls_query_holds_is_refused(
+    fields: dict[str, Any], name: str
+) -> None:
+    # Built past the schema, which refuses each of these first.
+    raw: dict[str, Any] = {"kind": "oauth2", "token_url": TOKEN_URL, "client_id": "app-1"}
+    credential = OAuth2Credential.model_construct(**{**raw, **fields})
+    message = f"^the token_url's query sets '{name}', which the body sends$"
+    with pytest.raises(ValueError, match=message):
+        build_refresh(credential, PUBLIC_CLIENT, Secret("rt-1"))
 
 
 # --- response parsing --------------------------------------------------------------------------
