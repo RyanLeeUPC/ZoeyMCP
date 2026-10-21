@@ -46,6 +46,8 @@ from zoeymcp.common.policy.emit import (
     STRING_MAP,
     STRINGS,
     EmitRefused,
+    _field_names,
+    _table,
     document,
     emit,
 )
@@ -201,6 +203,13 @@ def test_the_table_holds_no_secret_value_client_limit_or_connector() -> None:
     assert "Client" not in FIELDS
     assert "PlaceholderCaller" not in FIELDS
     assert set(CREDENTIALS) == {"oauth2", "header"}
+
+
+def test_a_table_is_read_only() -> None:
+    table = _table(kind=STRING, rotates=BOOLEAN)
+    assert list(table.items()) == [("kind", STRING), ("rotates", BOOLEAN)]
+    with pytest.raises(TypeError):
+        table["kind"] = BOOLEAN  # type: ignore[index]
 
 
 def test_every_comment_kind_has_its_words() -> None:
@@ -422,7 +431,11 @@ def test_a_field_outside_the_table_is_refused() -> None:
         {**NOTES_CREDENTIAL, "token_headers": {"X-Key": "literal-secret"}}
     )
     error = refused(PolicyChange("t", (AddCredential("notes", credential),)))
-    assert (error.path, error.reason) == ("credentials.notes.token_headers", "field")
+    assert (error.path, error.reason, error.value) == (
+        "credentials.notes.token_headers",
+        "field",
+        "",
+    )
     route = Route.model_validate({**NOTES_ROUTE, "query": {"force": {"user": "alice"}}})
     error = refused(PolicyChange("t", (AddRoute(route),)))
     assert (error.path, error.reason) == ("routes[0].query", "field")
@@ -542,6 +555,10 @@ def test_a_name_outside_the_rule_is_refused() -> None:
         "credentials.c\u00e9",
         "characters",
     )
+    assert stub_refused({"gateway": {"servers": {"x": {"review": {"\u00e9": PIN_A}}}}}) == (
+        "gateway.servers.x.review.\u00e9",
+        "characters",
+    )
     assert stub_refused({"x": 1}) == ("x", "field")
 
 
@@ -578,7 +595,7 @@ def test_the_compose_form_is_indented_8_with_every_dollar_doubled() -> None:
 
 
 def test_the_compose_form_takes_no_other_indent() -> None:
-    with pytest.raises(ValueError, match="the compose form is indented 8"):
+    with pytest.raises(ValueError, match=r"^the compose form is indented 8; give no other indent$"):
         emit(notes_change(), target="compose", indent=4)
 
 
@@ -600,7 +617,8 @@ query_values = st.from_regex(r"[A-Za-z0-9._~!()*+,=:@/?-]{0,8}|%2[0-9A-F]", full
 queries = st.dictionaries(
     st.from_regex(r"q[a-z]{0,6}", fullmatch=True), query_values, min_size=1, max_size=3
 ).map(lambda pairs: "&".join(f"{name}={value}" for name, value in pairs.items()))
-scope_tokens = st.from_regex(r"[\x21\x23-\x5b\x5d-\x7e]{1,12}", fullmatch=True)
+# A.1's scope tokens without ",", so no token holds either separator.
+scope_tokens = st.from_regex(r"[\x21\x23-\x2b\x2d-\x5b\x5d-\x7e]{1,12}", fullmatch=True)
 
 
 @st.composite
@@ -857,6 +875,7 @@ def test_document_escapes_what_emit_refuses() -> None:
         ],
         "gateway": {"limits": {"call_timeout": 30}, "hosts": []},
         "yes": True,
+        "no": False,
         "admin": None,
         "numbers": {3: 1.5, "n": -2},
         "nested": [[{"a": 1}], [[1, 2]]],
@@ -865,7 +884,7 @@ def test_document_escapes_what_emit_refuses() -> None:
     assert '"a\\x0ab\\xe9\\U0001f600\\x01\\"\\\\\\u200b"' in text
     assert all(re.fullmatch(r"[\x20-\x7e]*", line) for line in text.splitlines())
     assert load_mapping(text) == data
-    assert '\n"yes": true\n' in text
+    assert '\n"yes": true\n"no": false\nadmin: null\n' in text
     assert '\n  3: 1.5\n  "n": -2\n' in text
 
 
@@ -894,6 +913,8 @@ def test_document_refuses_a_value_with_no_yaml_form() -> None:
 
 
 def test_field_names_are_the_documents() -> None:
-    assert {"from", "token_url", "servers", "include", "placeholder"} <= FIELD_NAMES
-    assert "from_" not in FIELD_NAMES
-    assert all(re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in FIELD_NAMES)
+    names = _field_names(Policy)
+    assert names == FIELD_NAMES
+    assert {"from", "token_url", "servers", "include", "placeholder"} <= names
+    assert "from_" not in names
+    assert all(re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in names)

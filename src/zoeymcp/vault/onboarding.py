@@ -1,0 +1,821 @@
+"""Onboardings in progress (M7 design D.8, D.11, D.12, I.3, M.7). Pure and mutation-tested.
+
+An onboarding is phase 1 of onboarding by URL, from the first probe to fragment 1: what the
+vault learned, what it may contact, and what the operator chose. :class:`OnboardingTable` holds
+them in the vault's memory, like ``pkce.FlowTable``: each has an owner, the CLI or one portal
+session, and another owner's answers as an unknown one; at most :data:`ONBOARDINGS_MAX` in all
+and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a monotonic clock.
+
+- **Stages**: ``discovering``, ``blocked`` (an operator's own proxy refused a host, D.11),
+  ``discovered`` (the plan, immutable, and the draft change's ``check`` result) and
+  ``registered`` (fragment 1's validated change, never a secret, so it can be rendered again at
+  any indent, OPS-2). A registered onboarding ends when the running policy names its credential.
+- **Resuming**: a start by the same owner for the same URL and names carries on with a blocked
+  one (D.11), unless its options differ (``onboarding_options_changed``, OPS-8), and with a
+  discovered (``--plan-only``, D.10) or registered one started with the same options; any other
+  start replaces the owner's own.
+- **Names** (OPS-15): :func:`default_name` from the server's host, never one the policy, the
+  store or another onboarding has; :func:`name_taken` for the names given.
+- **Allowances** (I.3): the ``host:port`` pairs an onboarding contacts, for the egress role's
+  list until it registers. Never private: ``private_target`` is the one typed server's
+  exception, carried per request (B.2, TI-10).
+- :func:`mismatches` (D.12, GR-26): where the committed credential, route and server differ
+  from a fresh discovery, by field name only.
+- :func:`next_for` (M.7): what the operator does next, each command an argument list shown
+  shell-quoted and without a container prefix, which the CLI adds.
+
+Nothing here does I/O; the clock and the ID source are injected. An onboarding's ID is never
+logged and is compared in constant time.
+"""
+
+from __future__ import annotations
+
+import hmac
+import ipaddress
+import re
+import secrets
+import shlex
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any, Final, Literal
+from urllib.parse import urlsplit
+
+from ..common import egresslist, netguard
+from ..common.egresslist import Allowance, Destination
+from ..common.policy.change import PolicyChange
+from ..common.policy.findings import Finding
+from ..common.policy.schema import (
+    NAME_PATTERN,
+    ClientAuth,
+    OAuth2Credential,
+    Policy,
+    RemoteServer,
+    Route,
+)
+from .oauth.discovery import Plan, origin_of
+from .oauth.pkce import CLI_OWNER
+
+ONBOARDING_TTL: Final = 1800.0
+ONBOARDINGS_MAX: Final = 4
+# 256 bits: token_urlsafe(32) gives 43 characters.
+ID_BYTES: Final = 32
+# Host labels that say nothing about the server, so never its default name (OPS-15).
+GENERIC_LABELS: Final = frozenset({"mcp", "api", "www", "app", "server"})
+# The default for a server named by an address, whose labels are numbers.
+ADDRESS_NAME: Final = "server"
+# The Squid source an onboarding's lines are written for, so their ACLs read zoeymcp_onboard_<n>.
+ONBOARD_SOURCE: Final = "onboard"
+
+Stage = Literal["discovering", "blocked", "discovered", "registered"]
+Ending = Literal["registered", "cancelled", "expired", "owner_gone"]
+Reason = Literal[
+    "onboarding_unknown", "onboarding_busy", "onboarding_options_changed", "name_taken"
+]
+NameSource = Literal["given", "label", "second_label", "address"]
+Do = Literal[
+    "register",
+    "make_fragment",
+    "check_fragment",
+    "check_policy",
+    "commit_fragment",
+    "reload",
+    "sign_in",
+    "connect",
+    "review",
+    "choose",
+    "assign_clients",
+    "allow_hosts",
+    "update_proxy_allowlist",
+    "retry",
+    "fix_policy",
+    "widen_scope",
+    "check_egress_role",
+    "onboard_again",
+]
+# Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
+# container that reads the inline policy from the service's environment; ``run_mount``, the same
+# with the working directory mounted at /w, for a fragment file; ``up``, the service recreated.
+# None: as written, where the policy file is.
+Via = Literal["exec", "run", "run_mount", "up"]
+
+NAME_SOURCES: Final[Mapping[NameSource, str]] = {
+    "given": "the name you gave",
+    "label": "from the server's host name",
+    "second_label": "from the server's host name, whose other labels say nothing about it",
+    "address": "a default: the server is named by its address",
+}
+# The policy sources ``zoeymcp check`` reads (load.read_source's labels), as E.5 names them.
+STDIN_SOURCE: Final = "<stdin>"
+INLINE_SOURCE: Final = "$ZOEYMCP_CONFIG"
+
+_NAME = re.compile(NAME_PATTERN)
+_SESSION_OWNER = re.compile(r"session:[0-9a-f]+")
+
+
+class OnboardingRefused(Exception):
+    """A start or a step the table refuses. ``reason`` is M.2's; ``values`` are what the
+    refusal names (the taken name and where the other onboarding was started)."""
+
+    def __init__(self, reason: Reason, message: str, values: tuple[str, ...] = ()) -> None:
+        self.reason: Reason = reason
+        self.values = values
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class Options:
+    """What an onboarding was started with (D.8), never a secret: resuming a blocked one with
+    other options refuses (OPS-8). ``secret_given`` says only that a given client came with a
+    secret, which ``client_auth`` then defaults to ``basic`` for (D.10); without one, a client
+    authenticates with nothing."""
+
+    client_id: str | None = None
+    client_auth: ClientAuth | None = None
+    redirect_uri: str | None = None
+    issuer: str | None = None
+    scope: str | None = None
+    client_name: str | None = None
+    allow_private: bool = False
+    secret_given: bool = False
+
+    def __post_init__(self) -> None:
+        if self.secret_given:
+            if self.client_id is None:
+                raise ValueError("a client secret needs its client ID")
+            if self.client_auth == "none":
+                raise ValueError("a client with a secret authenticates with basic or post")
+            if self.client_auth is None:
+                object.__setattr__(self, "client_auth", "basic")
+        elif self.client_auth in ("basic", "post"):
+            raise ValueError(f"client authentication {self.client_auth} needs a client secret")
+
+
+@dataclass(frozen=True)
+class Names:
+    """The credential, route and server an onboarding adds, and where they came from."""
+
+    credential: str
+    route: str
+    server: str
+    source: NameSource = "given"
+
+    def __post_init__(self) -> None:
+        for value in (self.credential, self.route, self.server):
+            if not _NAME.fullmatch(value):
+                raise ValueError(f"{value!r} isn't a policy name")
+
+    def same(self, other: Names) -> bool:
+        """The same three names, wherever they came from."""
+        return (self.credential, self.route, self.server) == (
+            other.credential,
+            other.route,
+            other.server,
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class OnboardingRecord:
+    """One onboarding. ``needed_hosts`` are the ``(host, port)`` pairs a blocked one's proxy must
+    allow (D.11); ``allowance`` the pairs it contacts (I.3). ``plan`` is set once, at
+    ``discovered``; ``change`` at ``registered``."""
+
+    id: str
+    owner: str
+    server_url: str
+    names: Names
+    options: Options
+    expires_at: float
+    stage: Stage = "discovering"
+    blocked_on: tuple[str, int] | None = None
+    needed_hosts: tuple[tuple[str, int], ...] = ()
+    plan: Plan | None = None
+    draft_check: tuple[Finding, ...] = ()
+    change: PolicyChange | None = None
+    allowance: frozenset[tuple[str, int]] = field(default_factory=frozenset)
+
+    @property
+    def private_target(self) -> str | None:
+        """The typed server's ``host:port`` when the operator ticked ``allow_private``: the one
+        destination its probe and metadata fetches may find private (B.2)."""
+        if not self.options.allow_private:
+            return None
+        return netguard.entry_key(*server_host_port(self.server_url))
+
+    def __repr__(self) -> str:
+        return f"OnboardingRecord(server={self.names.server!r}, stage={self.stage!r})"
+
+
+@dataclass(frozen=True)
+class Started:
+    """A start's onboarding, and whether it carries on with one the owner already had."""
+
+    record: OnboardingRecord
+    resumed: bool
+
+
+@dataclass(frozen=True)
+class Ended:
+    """An onboarding gone from the table, and why (M.4's ``onboard_ended``)."""
+
+    record: OnboardingRecord
+    why: Ending
+
+
+TokenFunction = Callable[[int], str]
+
+
+def server_host_port(server_url: str) -> tuple[str, int]:
+    """The ``(host, port)`` of an https URL discovery accepted, the host in lower case."""
+    parts = urlsplit(server_url)
+    return str(parts.hostname), parts.port or 443
+
+
+def server_path(server_url: str) -> str:
+    """The server's ``path`` in the policy: the URL's path, or ``/`` when it has none (B.4)."""
+    return urlsplit(server_url).path or "/"
+
+
+def surface(owner: str) -> str:
+    """Where an onboarding's owner works: ``cli`` or ``portal``."""
+    return "cli" if owner == CLI_OWNER else "portal"
+
+
+class OnboardingTable:
+    """Onboardings in progress: ``ONBOARDINGS_MAX`` in all, one per owner, each for
+    ``ONBOARDING_TTL`` seconds. What ends is kept for :meth:`sweep`, so each end is logged."""
+
+    def __init__(
+        self, clock: Callable[[], float], *, token: TokenFunction = secrets.token_urlsafe
+    ) -> None:
+        self._clock = clock
+        self._token = token
+        self._records: dict[str, OnboardingRecord] = {}
+        self._ended: list[Ended] = []
+
+    def __len__(self) -> int:
+        self._expire()
+        return len(self._records)
+
+    def start(self, owner: str, server_url: str, names: Names, options: Options) -> Started:
+        """The owner's onboarding of ``server_url`` under ``names``. A blocked one the owner
+        already has for the same URL and names carries on from the blocked fetch, back to
+        ``discovering`` and with its expiry, unless its options differ (OPS-8); a discovered or
+        registered one carries on as it is when its options are the same, and is replaced when
+        they aren't; one still discovering is replaced like any other. Names another owner's
+        onboarding uses are ``name_taken``."""
+        if owner != CLI_OWNER and not _SESSION_OWNER.fullmatch(owner):
+            raise ValueError("an onboarding's owner is cli or session:<hex id>")
+        self._expire()
+        own = next((r for r in self._records.values() if r.owner == owner), None)
+        if own is not None and own.server_url == server_url and own.names.same(names):
+            if own.stage == "blocked":
+                if own.options != options:
+                    raise OnboardingRefused(
+                        "onboarding_options_changed",
+                        "the onboarding in progress for this URL was started with other options",
+                    )
+                own = replace(own, stage="discovering", blocked_on=None, needed_hosts=())
+                self._records[own.id] = own
+                return Started(own, resumed=True)
+            if own.stage != "discovering" and own.options == options:
+                return Started(own, resumed=True)
+        for other in self._records.values():
+            if other.owner == owner:
+                continue
+            taken = _shared_name(names, other.names)
+            if taken is not None:
+                where = surface(other.owner)
+                raise OnboardingRefused(
+                    "name_taken",
+                    f"{taken} is taken by another onboarding, started from the {where}",
+                    (taken, where),
+                )
+        if own is not None:
+            del self._records[own.id]
+            self._ended.append(Ended(own, "cancelled"))
+        if len(self._records) >= ONBOARDINGS_MAX:
+            raise OnboardingRefused(
+                "onboarding_busy", f"at most {ONBOARDINGS_MAX} onboardings can be in progress"
+            )
+        record = OnboardingRecord(
+            id=self._token(ID_BYTES),
+            owner=owner,
+            server_url=server_url,
+            names=names,
+            options=options,
+            expires_at=self._clock() + ONBOARDING_TTL,
+            allowance=frozenset({server_host_port(server_url)}),
+        )
+        self._records[record.id] = record
+        return Started(record, resumed=False)
+
+    def get(self, onboarding: str, owner: str) -> OnboardingRecord:
+        """The owner's onboarding, unless it is unknown, expired or another owner's: all three
+        answer ``onboarding_unknown``."""
+        record = self._find(onboarding)
+        if record is None or record.owner != owner or self._clock() >= record.expires_at:
+            raise OnboardingRefused("onboarding_unknown", "no such onboarding is in progress")
+        return record
+
+    def widen(
+        self, onboarding: str, owner: str, hosts: Iterable[tuple[str, int]]
+    ) -> OnboardingRecord:
+        """The allowance with ``hosts`` added, as discovery learns them (I.3)."""
+        record = self.get(onboarding, owner)
+        if record.stage == "registered":
+            raise ValueError("a registered onboarding contacts nothing more")
+        added = frozenset((host.lower(), port) for host, port in hosts)
+        return self._put(replace(record, allowance=record.allowance | added))
+
+    def block(
+        self, onboarding: str, owner: str, target: tuple[str, int], policy: Policy
+    ) -> OnboardingRecord:
+        """A discovering onboarding stopped by a proxy refusing ``target`` (D.11). Its needed
+        hosts are the target and every host in its allowance that the running policy's own
+        destinations don't already cover, sorted."""
+        record = self._in_stage(onboarding, owner, "discovering")
+        host, port = target[0].lower(), target[1]
+        known = {(d.host, d.port) for d in egresslist.derive(policy)[egresslist.VAULT]}
+        # The refused target stays needed even when the policy names it: the proxy's list is
+        # behind the policy.
+        needed = sorted((record.allowance - known) | {(host, port)})
+        return self._put(
+            replace(
+                record,
+                stage="blocked",
+                blocked_on=(host, port),
+                needed_hosts=tuple(needed),
+                allowance=record.allowance | {(host, port)},
+            )
+        )
+
+    def discovered(
+        self, onboarding: str, owner: str, plan: Plan, draft_check: Iterable[Finding]
+    ) -> OnboardingRecord:
+        """A discovering onboarding's plan, and its draft change's ``check`` findings (OPS-5)."""
+        record = self._in_stage(onboarding, owner, "discovering")
+        return self._put(
+            replace(record, stage="discovered", plan=plan, draft_check=tuple(draft_check))
+        )
+
+    def registered(self, onboarding: str, owner: str, change: PolicyChange) -> OnboardingRecord:
+        """A discovered onboarding's fragment 1. It contacts nothing more, so its allowance
+        goes (I.3)."""
+        record = self._in_stage(onboarding, owner, "discovered")
+        return self._put(replace(record, stage="registered", change=change, allowance=frozenset()))
+
+    def cancel(self, onboarding: str, owner: str) -> Ended | None:
+        """Drop the onboarding. Another owner's stays, and answers as an unknown one; an expired
+        one is :meth:`sweep`'s to report."""
+        self._expire()
+        record = self._find(onboarding)
+        if record is None or record.owner != owner:
+            return None
+        del self._records[record.id]
+        return Ended(record, "cancelled")
+
+    def cancel_owner(self, owner: str) -> tuple[Ended, ...]:
+        """Drop the owner's onboarding: its portal session ended."""
+        self._expire()
+        gone = [r for r in self._records.values() if r.owner == owner]
+        for record in gone:
+            del self._records[record.id]
+        return tuple(Ended(record, "owner_gone") for record in gone)
+
+    def sweep(self, committed: Collection[str] = ()) -> tuple[Ended, ...]:
+        """Every onboarding that ended since the last sweep: replaced by its owner's next start,
+        expired, or registered with its credential now in the running policy (``committed``,
+        the policy's credential names)."""
+        self._expire()
+        for record in list(self._records.values()):
+            if record.stage == "registered" and record.names.credential in committed:
+                del self._records[record.id]
+                self._ended.append(Ended(record, "registered"))
+        ended, self._ended = tuple(self._ended), []
+        return ended
+
+    def allowances(self) -> tuple[Allowance, ...]:
+        """The live onboardings' allowances, for the vault's egress list (I.2, I.3)."""
+        now = self._clock()
+        return tuple(
+            Allowance(record.allowance)
+            for record in self._records.values()
+            if now < record.expires_at and record.allowance
+        )
+
+    def names_in_use(self, owner: str) -> frozenset[str]:
+        """Every name another owner's live onboarding uses, for :func:`default_name`."""
+        now = self._clock()
+        return frozenset(
+            name
+            for record in self._records.values()
+            if record.owner != owner and now < record.expires_at
+            for name in (record.names.credential, record.names.route, record.names.server)
+        )
+
+    def _find(self, onboarding: str) -> OnboardingRecord | None:
+        """The onboarding with this ID, every ID compared in constant time, with no early
+        exit."""
+        wanted = onboarding.encode("utf-8", "surrogatepass")
+        found = None
+        for record in self._records.values():
+            if hmac.compare_digest(record.id.encode("ascii"), wanted):
+                found = record
+        return found
+
+    def _in_stage(self, onboarding: str, owner: str, stage: Stage) -> OnboardingRecord:
+        record = self.get(onboarding, owner)
+        if record.stage != stage:
+            raise ValueError(f"the onboarding is {record.stage}, not {stage}")
+        return record
+
+    def _put(self, record: OnboardingRecord) -> OnboardingRecord:
+        self._records[record.id] = record
+        return record
+
+    def _expire(self) -> None:
+        now = self._clock()
+        for record in list(self._records.values()):
+            if now >= record.expires_at:
+                del self._records[record.id]
+                self._ended.append(Ended(record, "expired"))
+
+
+def _shared_name(mine: Names, theirs: Names) -> str | None:
+    """A name both onboardings would add as the same kind of thing, or None."""
+    for own, other in (
+        (mine.credential, theirs.credential),
+        (mine.route, theirs.route),
+        (mine.server, theirs.server),
+    ):
+        if own == other:
+            return own
+    return None
+
+
+# --- names (D.8, OPS-15) -----------------------------------------------------------------------
+
+
+def secret_names(credential: str) -> tuple[str, ...]:
+    """The store entries an onboarding of ``credential`` writes or names: its client secret
+    (D.7), a public client's ID (D.8) and the refresh-token slot login fills (E.2)."""
+    return (f"{credential}-client-secret", f"{credential}-client-id", f"{credential}-refresh")
+
+
+def _servers(policy: Policy) -> Mapping[str, object]:
+    return {} if policy.gateway is None else policy.gateway.servers
+
+
+def name_taken(names: Names, policy: Policy, store_names: Collection[str]) -> str | None:
+    """The first of ``names`` the running policy or the store already has, or None: a
+    credential (or an entry it would write), a route (or its prefix, ``/<route>``), a server."""
+    if names.credential in policy.credentials or any(
+        entry in store_names for entry in secret_names(names.credential)
+    ):
+        return names.credential
+    routes = {route.name for route in policy.routes} | {
+        route.prefix.removeprefix("/") for route in policy.routes
+    }
+    if names.route in routes:
+        return names.route
+    if names.server in _servers(policy):
+        return names.server
+    return None
+
+
+def in_use(
+    policy: Policy, store_names: Collection[str], others: Collection[str] = ()
+) -> Callable[[str], bool]:
+    """Whether a default name is taken: as any credential, route, route prefix or server of the
+    running policy, by an entry an onboarding under it would write, or by another onboarding."""
+    taken = set(policy.credentials) | set(_servers(policy)) | set(others)
+    for route in policy.routes:
+        taken |= {route.name, route.prefix.removeprefix("/")}
+
+    def check(name: str) -> bool:
+        return name in taken or any(entry in store_names for entry in secret_names(name))
+
+    return check
+
+
+def _base_name(host: str) -> tuple[str, NameSource]:
+    """A name from the host's labels: the first one before the last that isn't generic, else
+    the second-to-last; a single label is its own. An address has none worth using."""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return ADDRESS_NAME, "address"
+    labels = [label for label in host.lower().split(".") if _NAME.fullmatch(label)]
+    if not labels:
+        return ADDRESS_NAME, "address"
+    if len(labels) == 1:
+        return labels[0], "label"
+    for label in labels[:-1]:
+        if label not in GENERIC_LABELS:
+            return label, "label"
+    return labels[-2], "second_label"
+
+
+def default_name(server_url: str, taken: Callable[[str], bool]) -> tuple[str, NameSource]:
+    """The default name for the server at ``server_url`` (OPS-15), with ``-2``, ``-3`` and on
+    added until ``taken`` says it is free, the base shortened so the name still fits."""
+    base, source = _base_name(server_host_port(server_url)[0])
+    name, number = base, 1
+    while taken(name):
+        number += 1
+        suffix = f"-{number}"
+        name = base[: 63 - len(suffix)] + suffix
+    return name, source
+
+
+def choose_names(
+    server_url: str,
+    taken: Callable[[str], bool],
+    *,
+    name: str | None = None,
+    credential: str | None = None,
+    route: str | None = None,
+    server: str | None = None,
+) -> Names:
+    """The names an onboarding adds: each one given, else ``name``, else the default."""
+    source: NameSource = "given"
+    if name is None:
+        if credential is not None and route is not None and server is not None:
+            return Names(credential, route, server)
+        name, source = default_name(server_url, taken)
+    return Names(credential or name, route or name, server or name, source)
+
+
+# --- the second run's comparison (D.12, GR-26) -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Committed:
+    """The running policy's credential, route and remote server for an onboarded URL."""
+
+    credential: str
+    route: str
+    server: str
+
+
+def committed_for(policy: Policy, server_url: str) -> Committed | None:
+    """The remote server whose route's oauth2 credential names ``server_url`` as its resource,
+    or whose route's upstream origin and own ``path`` are the URL's: a credential written by
+    hand may have no resource, and a root-published one is the origin (D.3). The first by
+    server name; None when no running credential names it."""
+    routes = {route.name: route for route in policy.routes}
+    for name, server in sorted(_servers(policy).items()):
+        if not isinstance(server, RemoteServer) or server.route not in routes:
+            continue
+        route = routes[server.route]
+        cred = None if route.credential is None else policy.credentials.get(route.credential)
+        if not isinstance(cred, OAuth2Credential) or route.upstream is None:
+            continue
+        if cred.extra_params.get("resource") == server_url or (
+            origin_of(route.upstream) == origin_of(server_url)
+            and server.path == server_path(server_url)
+        ):
+            return Committed(str(route.credential), route.name, name)
+    return None
+
+
+def _auth_method(cred: OAuth2Credential) -> str:
+    """The RFC 8414 name of how the credential authenticates at the token endpoint."""
+    if cred.client_auth == "post":
+        return "client_secret_post"
+    if cred.client_auth == "none" or (cred.client_auth is None and cred.client_secret is None):
+        return "none"
+    return "client_secret_basic"
+
+
+def mismatches(policy: Policy, plan: Plan) -> list[str]:
+    """Every field of the committed credential, route and server that differs from what a fresh
+    discovery found (D.12), by name, never by value: the endpoints as written (a query
+    included, Q41), the issuer, the client authentication against the authorization server's
+    methods, both ``resource`` values, the route's upstream origin and the server's path, and
+    ``require_iss``, which may be stricter than the server's, never looser."""
+    found = committed_for(policy, plan.server_url)
+    if found is None:
+        raise ValueError("no running credential names this URL")
+    cred = policy.credentials[found.credential]
+    assert isinstance(cred, OAuth2Credential)  # noqa: S101 - committed_for found an oauth2 one
+    route: Route = next(r for r in policy.routes if r.name == found.route)
+    server = _servers(policy)[found.server]
+    assert isinstance(server, RemoteServer)  # noqa: S101 - committed_for found a remote one
+    meta = plan.metadata
+    at = f"credentials.{found.credential}"
+    checks = [
+        (f"{at}.token_url", cred.token_url == meta.token_endpoint),
+        (f"{at}.authorize_url", cred.authorize_url == meta.authorization_endpoint),
+        (f"{at}.issuer", cred.issuer == plan.issuer),
+        (f"{at}.revocation_url", cred.revocation_url == meta.revocation_endpoint),
+        (f"{at}.client_auth", _auth_method(cred) in meta.token_auth_methods),
+        (f"{at}.extra_params.resource", cred.extra_params.get("resource") == plan.resource),
+        (
+            f"{at}.authorize_params.resource",
+            cred.authorize_params.get("resource") == plan.resource,
+        ),
+        (f"{at}.require_iss", cred.require_iss or not meta.require_iss),
+        (f"routes.{found.route}.upstream", route.upstream == origin_of(plan.server_url)),
+        (
+            f"gateway.servers.{found.server}.path",
+            server.path == server_path(plan.server_url),
+        ),
+    ]
+    return [path for path, same in checks if not same]
+
+
+# --- next (M.7) --------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NextStep:
+    """One thing for the operator to do next. ``command`` is an argument list, shown
+    shell-quoted, every argument (TI-14); ``via`` says where the CLI runs it, and it adds the
+    prefix. ``hosts`` and ``squid`` are an ``allow_hosts`` entry's (D.11)."""
+
+    do: Do
+    label: str
+    command: tuple[str, ...] = ()
+    via: Via | None = None
+    hosts: tuple[str, ...] = ()
+    squid: tuple[str, ...] = ()
+
+    def shell(self) -> str:
+        return " ".join(shlex.quote(argument) for argument in self.command)
+
+    def answer(self) -> dict[str, Any]:
+        """The entry as the socket and the portal answer it: ``command`` already quoted."""
+        out: dict[str, Any] = {"do": self.do, "label": self.label}
+        if self.command:
+            out["command"] = self.shell()
+        if self.via is not None:
+            out["via"] = self.via
+        if self.hosts:
+            out["hosts"] = list(self.hosts)
+        if self.squid:
+            out["squid"] = list(self.squid)
+        return out
+
+
+def fragment_file(server: str, number: int) -> str:
+    """The file a fragment is written to in the documented commands (J1)."""
+    return f"onboard-{server}-{number}.yaml"
+
+
+def _check(source: str, *more: str) -> tuple[tuple[str, ...], Via | None]:
+    """``zoeymcp check`` against the policy's source (E.5): a one-off container for the inline
+    ``ZOEYMCP_CONFIG``, else ``--config`` with the file, or ``-`` for stdin, where it is."""
+    if source == INLINE_SOURCE:
+        return ("check", *more), "run"
+    return ("zoeymcp", "check", "--config", "-" if source == STDIN_SOURCE else source, *more), None
+
+
+def allow_hosts(hosts: Iterable[tuple[str, int]], acl_names: Mapping[str, str]) -> NextStep:
+    """D.11's entry: the hosts an operator's proxy must allow for the vault, and the Squid
+    lines for them, from ``egresslist.render`` with the vault's source ACL (``acl_names``, the
+    policy's ``egress_proxy_acls`` or ``--squid-src``). The lines reuse the emitted file's port
+    and private-destination ACLs, so only the destination ACLs and their rules are kept."""
+    pairs = tuple(dict.fromkeys((host.lower(), port) for host, port in hosts))
+    lists = {
+        ONBOARD_SOURCE: tuple(
+            Destination(host, port, False, frozenset({"onboarding"})) for host, port in pairs
+        )
+    }
+    src = acl_names.get(egresslist.VAULT, f"zoeymcp_src_{egresslist.VAULT}")
+    text = egresslist.render(lists, "squid", acl_names={ONBOARD_SOURCE: src})
+    squid = tuple(
+        line
+        for line in text.splitlines()
+        if line.startswith((f"acl zoeymcp_{ONBOARD_SOURCE}_", "http_access "))
+    )
+    return NextStep(
+        "allow_hosts",
+        "Allow these hosts in your proxy for the vault",
+        hosts=tuple(netguard.entry_key(host, port) for host, port in pairs),
+        squid=squid,
+    )
+
+
+def onboard_again(server_url: str) -> NextStep:
+    """Every ``onboard_again`` entry: register a new client under the same names (OPS-3)."""
+    return NextStep(
+        "onboard_again",
+        "Register a new client",
+        ("zoeymcp", "login", "--mcp", server_url, "--reregister"),
+        "exec",
+    )
+
+
+def _login_again(record: OnboardingRecord) -> tuple[str, ...]:
+    """The second ``login --mcp``, with the names and the discovery options of the first."""
+    names = record.names
+    command = ["zoeymcp", "login", "--mcp", record.server_url]
+    if names.credential == names.route == names.server:
+        command += ["--name", names.credential]
+    else:
+        command += [
+            "--credential",
+            names.credential,
+            "--route",
+            names.route,
+            "--server",
+            names.server,
+        ]
+    if record.options.issuer is not None:
+        command += ["--issuer", record.options.issuer]
+    if record.options.allow_private:
+        command.append("--allow-private")
+    return tuple(command)
+
+
+def _make(record: OnboardingRecord) -> tuple[NextStep, ...]:
+    errors = sum(1 for finding in record.draft_check if finding.level == "error")
+    if errors:
+        return (
+            NextStep(
+                "fix_policy",
+                f"Fix the policy first: check finds {errors} error(s) with this server merged",
+            ),
+        )
+    options = record.options
+    if options.client_id is None:
+        return (NextStep("register", "Register and make the YAML"),)
+    if options.secret_given:
+        return (NextStep("register", "Store the secret and make the YAML"),)
+    return (NextStep("make_fragment", "Make the YAML"),)
+
+
+def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[NextStep, ...]:
+    fragment = fragment_file(record.names.server, 1)
+    inline = source == INLINE_SOURCE
+    if inline:
+        check_fragment = NextStep(
+            "check_fragment",
+            "Check fragment 1 with the running policy",
+            ("check", "--with", f"/w/{fragment}"),
+            "run_mount",
+        )
+        merge = (
+            "Merge it into the policy under ZOEYMCP_CONFIG in the compose form (--for compose), "
+            "or print the whole merged block with --print-merged --for compose and replace it"
+        )
+        reload = NextStep("reload", "Commit, then recreate the vault", via="up")
+    else:
+        command, via = _check(source, "--with", fragment)
+        check_fragment = NextStep(
+            "check_fragment", "Check fragment 1 with the policy", command, via
+        )
+        merge = (
+            "Merge it into the policy, or print the whole merged policy with --print-merged and "
+            "replace it"
+        )
+        restart = (
+            "send the vault SIGHUP (docker kill -s HUP)"
+            if source != STDIN_SOURCE
+            else "restart the vault with the new policy"
+        )
+        reload = NextStep("reload", f"Commit, then {restart}")
+    command, via = _check(source)
+    steps = [
+        check_fragment,
+        NextStep("commit_fragment", merge),
+        NextStep("check_policy", "Then check the edited policy", command, via),
+        reload,
+    ]
+    if own_proxy:
+        command, via = _check(source, "--emit-egress-allowlist", "--allowlist-format", "squid")
+        steps.append(
+            NextStep(
+                "update_proxy_allowlist",
+                "Update your proxy's allowlist from the committed policy, reload your proxy, "
+                "then remove the onboarding lines",
+                command,
+                via,
+            )
+        )
+    steps.append(NextStep("connect", "Then sign in and review", _login_again(record), "exec"))
+    return tuple(steps)
+
+
+def next_for(
+    record: OnboardingRecord,
+    source: str,
+    *,
+    own_proxy: bool = False,
+    acl_names: Mapping[str, str] | None = None,
+) -> tuple[NextStep, ...]:
+    """What the operator does next for ``record`` (M.7), the same words on every surface.
+    ``source`` is the running policy's (``load.read_source``'s label: a file path,
+    ``<stdin>`` or ``$ZOEYMCP_CONFIG``); ``own_proxy`` is an ``egress_proxy`` that isn't the
+    built-in role; ``acl_names`` its Squid source ACLs. A blocked onboarding's ``retry`` is the
+    CLI's own, from its argv (D.11)."""
+    if record.stage == "blocked":
+        return (allow_hosts(record.needed_hosts, acl_names or {}),)
+    if record.stage == "discovered":
+        return _make(record)
+    if record.stage == "registered":
+        return _commit(record, source, own_proxy)
+    return ()

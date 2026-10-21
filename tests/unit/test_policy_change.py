@@ -8,6 +8,7 @@ change the merged policy can't take (``diff_invalid``).
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -191,6 +192,15 @@ def test_replace_names_the_review_blocks_and_a_set_credential() -> None:
         ("credentials", "notes"),
     )
     assert notes_change().replace() == ()
+    # Each op's paths add to those before it, whatever its place.
+    later = PolicyChange(
+        "t", (SetCredential("notes", oauth), SetServerReview("notes", Tools(), {}))
+    )
+    assert later.replace() == (
+        ("credentials", "notes"),
+        ("gateway", "servers", "notes", "tools"),
+        ("gateway", "servers", "notes", "review"),
+    )
 
 
 def test_comments_are_kept_in_order_and_hold_no_data() -> None:
@@ -206,16 +216,16 @@ def test_comments_are_kept_in_order_and_hold_no_data() -> None:
 
 
 @pytest.mark.parametrize(
-    "ops",
+    ("ops", "named"),
     [
-        ("cred", "cred"),
-        ("cred", "set"),
-        ("server", "review"),
-        ("route", "route"),
-        ("private", "private"),
+        (("cred", "cred"), "credentials.notes"),
+        (("cred", "set"), "credentials.notes"),
+        (("server", "review"), "gateway.servers.notes"),
+        (("route", "route"), "routes notes"),
+        (("private", "private"), "egress_private a.lan.example:443"),
     ],
 )
-def test_a_change_names_each_thing_once(ops: tuple[str, str]) -> None:
+def test_a_change_names_each_thing_once(ops: tuple[str, str], named: str) -> None:
     oauth = OAuth2Credential.model_validate(NOTES_CREDENTIAL)
     made: dict[str, Op] = {
         "cred": AddCredential("notes", oauth),
@@ -225,7 +235,7 @@ def test_a_change_names_each_thing_once(ops: tuple[str, str]) -> None:
         "route": AddRoute(Route.model_validate(NOTES_ROUTE)),
         "private": AddEgressPrivate("a.lan.example:443"),
     }
-    with pytest.raises(ValueError, match="twice"):
+    with pytest.raises(ValueError, match=rf"^the change names {re.escape(named)} twice$"):
         PolicyChange("t", (made[ops[0]], made[ops[1]]))
 
 
@@ -360,6 +370,8 @@ def test_apply_into_a_policy_without_those_blocks() -> None:
     assert list(merged.credentials) == ["notes"]
     assert merged.gateway is not None
     assert list(merged.gateway.servers) == ["notes"]
+    # A default the policy leaves out stays unset, as check --with loads the merge.
+    assert merged.model_fields_set == {"version", "mode", "credentials", "routes", "gateway"}
 
 
 @pytest.mark.parametrize(
@@ -433,6 +445,8 @@ def test_a_change_the_schema_refuses_is_diff_invalid() -> None:
     assert caught.value.messages == (
         "gateway.servers.mail.toolkit.era: Extra inputs are not permitted",
     )
+    two = ChangeRefused("diff_invalid", "(document)", ("a: one", "b: two"))
+    assert str(two) == "diff_invalid: (document); a: one; b: two"
 
 
 def test_a_portal_callback_for_an_unlisted_origin_is_diff_invalid() -> None:

@@ -1441,8 +1441,17 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 502 | `as_issuer_mismatch` | The authorization server's metadata names another issuer than the one it was fetched for, so it isn't used (RFC 8414). |
 | 502 | `pkce_unsupported` | The authorization server doesn't advertise PKCE with S256, which MCP requires. |
 | 502 | `code_flow_unsupported` | The authorization server doesn't advertise the authorization code flow. |
-| 409 | `name_taken` | The policy or the vault's store already has `<name>`. Choose another name. |
+| 409 | `name_taken` | The policy, the vault's store or another onboarding already has `<name>`. Choose another name. |
 | 422 | `diff_invalid` | The running policy with this change merged fails check (`<detail>`), so no fragment is shown. |
+| 404 | `onboarding_unknown` | That onboarding isn't in progress: it finished, expired or was started elsewhere. Start it again. |
+| 429 | `onboarding_busy` | At most 4 onboardings can be in progress. Finish or cancel one, or wait for one to expire (30 minutes). |
+| 409 | `onboarding_options_changed` | The onboarding in progress for this URL and these names stopped at your proxy and was started with other options. Run it with the same options to carry on, or start again once it expires (30 minutes). |
+| 502 | `address_refused` | The vault doesn't connect to `<host>`: its name resolves to a private, loopback or reserved address. Nothing was sent to it. |
+| 502 | `resolve_failed` | The name `<host>` didn't resolve, so nothing was sent to it. |
+| 502 | `fetch_failed` | The host `<host>` didn't answer as needed (`<detail>`). |
+| 502 | `fetch_redirect` | The host `<host>` answered with a redirect, which the vault doesn't follow. |
+| 502 | `fetch_too_large` | The answer from `<host>` is larger than the vault reads, so it isn't used. |
+| 502 | `fetch_not_json` | The answer from `<host>` isn't one JSON object, so it isn't used. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

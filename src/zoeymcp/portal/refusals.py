@@ -289,14 +289,51 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "code_flow_unsupported": Entry(
             502, "The authorization server doesn't advertise the authorization code flow."
         ),
-        # A change to the policy (M7 H.1; common/policy/change.py).
+        # A change to the policy (M7 H.1; common/policy/change.py), and an onboarding's names
+        # (D.8; vault/onboarding.py).
         "name_taken": Entry(
-            409, "The policy or the vault's store already has {name}. Choose another name."
+            409,
+            "The policy, the vault's store or another onboarding already has {name}. Choose "
+            "another name.",
         ),
         "diff_invalid": Entry(
             422,
             "The running policy with this change merged fails check ({detail}), so no fragment "
             "is shown.",
+        ),
+        # Onboardings in progress (M7 D.8; vault/onboarding.py).
+        "onboarding_unknown": Entry(
+            404,
+            "That onboarding isn't in progress: it finished, expired or was started elsewhere. "
+            "Start it again.",
+        ),
+        "onboarding_busy": Entry(
+            429,
+            "At most 4 onboardings can be in progress. Finish or cancel one, or wait for one to "
+            "expire (30 minutes).",
+        ),
+        "onboarding_options_changed": Entry(
+            409,
+            "The onboarding in progress for this URL and these names stopped at your proxy and "
+            "was started with other options. Run it with the same options to carry on, or start "
+            "again once it expires (30 minutes).",
+        ),
+        # Phase 1's requests (M7 B.2, B.5; vault/oauth/fetch.py).
+        "address_refused": Entry(
+            502,
+            "The vault doesn't connect to {host}: its name resolves to a private, loopback or "
+            "reserved address. Nothing was sent to it.",
+        ),
+        "resolve_failed": Entry(502, "The name {host} didn't resolve, so nothing was sent to it."),
+        "fetch_failed": Entry(502, "The host {host} didn't answer as needed ({detail})."),
+        "fetch_redirect": Entry(
+            502, "The host {host} answered with a redirect, which the vault doesn't follow."
+        ),
+        "fetch_too_large": Entry(
+            502, "The answer from {host} is larger than the vault reads, so it isn't used."
+        ),
+        "fetch_not_json": Entry(
+            502, "The answer from {host} isn't one JSON object, so it isn't used."
         ),
     }
 )

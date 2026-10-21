@@ -2,8 +2,8 @@
 
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
 ``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
-literal discovery ``Refusal`` and policy ``ChangeRefused`` reason), so a reason added there without
-a sentence here fails.
+literal discovery ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused`` and fetch error
+reason), so a reason added there without a sentence here fails.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ from zoeymcp.portal.refusals import (
     wrong_host_literal,
 )
 from zoeymcp.portal.refusals import login as login_refusal
-from zoeymcp.vault import admin, secretplan, store
-from zoeymcp.vault.oauth import discovery, login, pkce
+from zoeymcp.vault import admin, onboarding, secretplan, store
+from zoeymcp.vault.oauth import discovery, fetch, login, pkce
 from zoeymcp.vault.secretplan import SecretRefusal
 
 ZWSP = chr(0x200B)
@@ -125,6 +125,20 @@ DISCOVERY = {
 }
 # M7's M.2: a policy change's refusals (M7 step 7).
 CHANGE = {"name_taken": 409, "diff_invalid": 422}
+# M7's M.2: an onboarding's own refusals and phase 1's requests' (M7 step 8a1).
+ONBOARDING = {
+    "onboarding_unknown": 404,
+    "onboarding_busy": 429,
+    "onboarding_options_changed": 409,
+}
+FETCH = {
+    "address_refused": 502,
+    "resolve_failed": 502,
+    "fetch_failed": 502,
+    "fetch_redirect": 502,
+    "fetch_too_large": 502,
+    "fetch_not_json": 502,
+}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -185,6 +199,12 @@ FIELDS = {
     "as_metadata_invalid": {"detail"},
     "name_taken": {"name"},
     "diff_invalid": {"detail"},
+    "address_refused": {"host"},
+    "resolve_failed": {"host"},
+    "fetch_failed": {"host", "detail"},
+    "fetch_redirect": {"host"},
+    "fetch_too_large": {"host"},
+    "fetch_not_json": {"host"},
 }
 
 
@@ -231,7 +251,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
-    expected |= EXTRA | DISCOVERY | CHANGE
+    expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -337,6 +357,37 @@ def test_every_change_reason_is_catalogued() -> None:
     assert found == set(get_args(change.Reason))
     assert found == set(CHANGE)
     assert found <= set(CATALOGUE)
+
+
+def test_every_onboarding_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to the onboarding table's refusals (D.8), name_taken among them
+    (FM-10), each a literal of its Reason type."""
+    found = literal_reasons(onboarding, "OnboardingRefused")
+    assert found == set(get_args(onboarding.Reason))
+    assert found == set(ONBOARDING) | {"name_taken"}
+    assert found <= set(CATALOGUE)
+
+
+def test_every_fetch_reason_is_catalogued() -> None:
+    """M7 M.2: phase 1's request refusals (B.2, B.5), each a literal of its Reason type."""
+    found = literal_reasons(fetch, "_error")
+    assert found == set(get_args(fetch.Reason))
+    assert found == set(FETCH)
+    assert found <= set(CATALOGUE)
+
+
+def test_the_busy_text_names_the_tables_limits() -> None:
+    text = CATALOGUE["onboarding_busy"].text
+    assert f"At most {onboarding.ONBOARDINGS_MAX} onboardings" in text
+    assert f"({onboarding.ONBOARDING_TTL / 60:.0f} minutes)" in text
+
+
+def test_the_options_changed_text_names_the_tables_ttl() -> None:
+    """Only a blocked onboarding refuses other options (D.11), and the CLI has no cancel: the
+    text says when it ends."""
+    text = CATALOGUE["onboarding_options_changed"].text
+    assert "stopped at your proxy" in text
+    assert f"once it expires ({onboarding.ONBOARDING_TTL / 60:.0f} minutes)" in text
 
 
 def test_login_reasons_have_the_sockets_statuses() -> None:
