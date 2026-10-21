@@ -363,9 +363,10 @@ authenticated by the old key would hand the new key to whoever stole the old one
   reach it. `egress` must therefore stay the vault's only non-internal network and hold no other
   container, since whatever joins it reaches the portal: an egress proxy gets a network of its
   own. `tests/unit/test_deploy.py` pins both. If `egress` is replaced by an internal network to
-  the operator's own proxy, nothing can be published: give the vault a separate non-internal
-  network with its own alias, or run without a portal. A port published on `127.0.0.1` stays off
-  the LAN on Docker Engine 28.0 or later only.
+  the operator's own proxy, nothing can be published through it: publish the portal through a
+  relay on networks of its own (`examples/existing-stack/`, operations.md §29), or run without a
+  portal. A separate non-internal network would give the vault a direct route out beside the
+  proxy. A port published on `127.0.0.1` stays off the LAN on Docker Engine 28.0 or later only.
 - **Subnets are left to Docker** unless the operator pins addresses for defense in depth;
   identity doesn't depend on them (§3.2).
 - **Bridges** reach the outside through vault routes where the server takes a base-URL override.

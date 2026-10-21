@@ -1314,4 +1314,137 @@ hardened_tier exec -T gateway python -I -c "$old_key_view" "$first_key" \
     || fail "the retired key wasn't refused"
 hardened_tier down -v >/dev/null 2>&1
 
+# --- contract 54: the existing-stack example ----------------------------------------------------
+# examples/existing-stack/compose.yaml as shipped, with two internal networks standing in for the
+# stack's own: its agent network and its proxy's (no proxy runs: nothing here goes out). The
+# relay must pass Host, Origin and Sec-Fetch-* unchanged, so the vault's portal answers every
+# probe through it exactly as it answers a container on the portal network; and neither the vault
+# nor the gateway is on a network with a route out. This block removes all it starts, whatever
+# happens, with its own trap.
+step "existing stack: up, from examples/existing-stack/compose.yaml (contract 54)"
+existing_project="zoeymcp-smoke-existing-$$"
+stack_agents="zoeymcp-smoke-stack-agents-$$"
+stack_proxy="zoeymcp-smoke-stack-proxy-$$"
+existing_stack() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${existing_master:-unset}" \
+        ZOEYMCP_GATEWAY_KEY="${existing_gateway_key:-unset}" \
+        ZOEYMCP_STACK_AGENTS="$stack_agents" ZOEYMCP_STACK_PROXY="$stack_proxy" \
+        docker compose -p "$existing_project" -f "$examples/existing-stack/compose.yaml" "$@"
+}
+existing_cleanup() {
+    existing_stack down -v >/dev/null 2>&1 || true
+    docker network rm "$stack_agents" "$stack_proxy" >/dev/null 2>&1 || true
+}
+trap 'existing_cleanup; cleanup' EXIT
+existing_fail() {
+    existing_stack logs >&2 2>/dev/null || true
+    fail "existing stack: $*"
+}
+docker network create --internal "$stack_agents" >/dev/null
+docker network create --internal "$stack_proxy" >/dev/null
+existing_keys="$(docker run --rm "$image" keygen)"
+existing_master="$(echo "$existing_keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+existing_gateway_key="$(echo "$existing_keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+existing_stack up -d
+i=0
+until [ "$(portal localhost:8081 /)" = "200" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || existing_fail "the portal's shell never came through the relay"
+    sleep 0.3
+done
+
+step "existing stack: the portal answers through the relay as it does direct (contract 54)"
+# One line per probe: its name, the status and the refusal's reason ("-" for none). The probes
+# are the portal's posture checks (operations.md §26) and one for each header the relay must
+# pass: Host (the shell, and a name the policy doesn't list), Sec-Fetch-Site and Origin (a
+# cross-site request, a wrong Origin, and a setup code refused only after both passed), and
+# Sec-Fetch-Mode and Sec-Fetch-Dest (a callback taken as a navigation, and one refused as not).
+existing_probes='
+import http.client, json, sys
+host, port = sys.argv[1], int(sys.argv[2])
+own = {"Host": "localhost:8081"}
+page = {**own, "Sec-Fetch-Site": "same-origin", "Origin": "http://localhost:8081"}
+code = {"code": "AAAAAA-AAAAAA-AAAAAA-AAAAAA"}
+navigate = {**own, "Sec-Fetch-Site": "none", "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document"}
+probes = [
+    ("shell", "GET", "/", own, None),
+    ("wrong-host", "GET", "/", {"Host": "wrong.example"}, None),
+    ("cross-site", "POST", "/api/logout",
+     {**own, "Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"}, {}),
+    ("wrong-origin", "POST", "/api/setup/redeem", {**page, "Origin": "http://evil.example"}, code),
+    ("setup-code", "POST", "/api/setup/redeem", page, code),
+    ("navigation", "GET", "/oauth/callback/smoke?state=x", navigate, None),
+    ("not-navigation", "GET", "/oauth/callback/smoke?state=x",
+     {**navigate, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}, None),
+]
+for name, method, path, headers, body in probes:
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers = {**headers, "Content-Type": "application/json"}
+    connection = http.client.HTTPConnection(host, port, timeout=10)
+    connection.request(method, path, body=data, headers=headers)
+    answer = connection.getresponse()
+    text = answer.read()
+    connection.close()
+    try:
+        reason = json.loads(text).get("reason") or "-"
+    except (ValueError, AttributeError):
+        reason = "-"
+    print(name, answer.status, reason)
+'
+probe "${existing_project}_portal" -c "$existing_probes" vault-portal 8081 >"$work/direct" \
+    || existing_fail "the probes failed from the portal network"
+# shellcheck disable=SC2086
+docker run --rm $hardened --network host --entrypoint /opt/zoeymcp/bin/python "$image" \
+    -I -c "$existing_probes" 127.0.0.1 8081 >"$work/relayed" \
+    || existing_fail "the probes failed through the relay"
+cat "$work/relayed"
+diff "$work/direct" "$work/relayed" || existing_fail "the portal answered differently through the relay"
+for expected in "shell 200 -" "wrong-host 421 wrong_host" "cross-site 403 cross_site" \
+    "wrong-origin 403 bad_origin" "setup-code 401 setup_code_refused" "not-navigation 403 -"; do
+    grep -qx "$expected" "$work/relayed" || existing_fail "through the relay, not: $expected"
+done
+if grep -q '^navigation 403 ' "$work/relayed"; then
+    existing_fail "a navigation to the callback was refused as not one: Sec-Fetch-* didn't pass"
+fi
+# No access log: nothing the relay wrote names a path it passed on.
+if existing_stack logs portal-relay 2>&1 | grep -e '/api/' -e '/oauth/callback'; then
+    existing_fail "the relay logged a request"
+fi
+
+step "existing stack: neither the vault nor the gateway has a network with a route out (contract 54)"
+for existing_service in vault gateway; do
+    existing_id="$(existing_stack ps -q "$existing_service")"
+    [ -n "$existing_id" ] || existing_fail "no $existing_service container"
+    existing_nets="$(docker inspect \
+        -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' "$existing_id")"
+    echo "$existing_service: $existing_nets"
+    [ -n "$existing_nets" ] || existing_fail "$existing_service is on no network"
+    for existing_net in $existing_nets; do
+        [ "$(docker network inspect -f '{{.Internal}}' "$existing_net")" = true ] \
+            || existing_fail "$existing_service is on $existing_net, which isn't internal"
+    done
+done
+
+step "existing stack: the relay's 502 while the vault is down logs no URI or header (contract 54)"
+# Caddy's error log records the request, URI and headers, for every 5xx it makes; the example's
+# Caddyfile turns it off. Last, since a stopped vault leaves `ps -q` above without it; plain
+# docker stop, since Compose's would stop the relay too, as a service depending on the vault.
+existing_id="$(existing_stack ps -q vault)"
+docker stop -t 5 "$existing_id" >/dev/null 2>&1 || existing_fail "the vault wouldn't stop"
+existing_callback="/oauth/callback/smoke?code=zoeymcp-smoke-code&state=zoeymcp-smoke-state"
+existing_status="$(portal localhost:8081 "$existing_callback" \
+    -H "X-ZoeyMCP-Session: zoeymcp-smoke-session")"
+[ "$existing_status" = "502" ] \
+    || existing_fail "with the vault down, the relay answered $existing_status, not 502"
+if existing_stack logs portal-relay 2>&1 | grep -e zoeymcp-smoke-code -e zoeymcp-smoke-state \
+    -e zoeymcp-smoke-session -e /oauth/callback; then
+    existing_fail "the relay logged the request it couldn't pass on"
+fi
+existing_cleanup
+trap cleanup EXIT
+# --- end of contract 54 -------------------------------------------------------------------------
+
 echo "SMOKE OK"

@@ -1,0 +1,183 @@
+# ZoeyMCP in an existing stack (docs/operations.md, "Fitting ZoeyMCP into an existing stack").
+#
+# The hardened tier for a stack that already runs agents, an egress proxy and networks of its
+# own. The gateway is one more sidecar on the stack's agent network; the vault reaches the outside
+# only through the stack's proxy; and the portal is published on the host's loopback by a small
+# relay on two networks of its own, so the vault has no non-internal network at all.
+#
+#   ZOEYMCP_MASTER_KEY=... ZOEYMCP_GATEWAY_KEY=... \
+#     docker compose -f examples/existing-stack/compose.yaml up -d
+#
+# Both of the stack's networks must exist first, and both must be internal (`internal: true`, or
+# `docker network create --internal`): an agent network with a route out gives the gateway and
+# its toolkits egress beside the proxy, and a proxy network with one gives the vault a direct
+# route out. Name them with ZOEYMCP_STACK_AGENTS and ZOEYMCP_STACK_PROXY. The README has the
+# probes that check both, and the proxy's side.
+#
+# `zoeymcp keygen` prints both keys. Agents use http://zoeymcp-gateway:8090/s/<server>/mcp with
+# "Authorization: Bearer <client token>". Admin commands are those of compose.hardened.yaml with
+# this file's -f.
+#
+# The gateway and the agents reach ZoeyMCP by aliases only it uses, zoeymcp-vault and
+# zoeymcp-gateway, never by the bare service names: those are resolved on the stack's networks
+# too, where another `vault` or `gateway` may answer and be sent the gateway key or a client token.
+
+name: zoeymcp
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+# The relay's Caddy, the image deploy/compose.hardened.yaml pins (a test keeps them equal).
+x-caddy: &caddy-image caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+
+networks:
+  # The gateway's link to the vault. Internal: no route out.
+  internal:
+    internal: true
+  # The stack's agent network, where the gateway joins the agents. It must be internal.
+  stack-agents:
+    external: true
+    name: ${ZOEYMCP_STACK_AGENTS:-stack-agents}
+  # The network the stack's proxy listens on: the vault's only way out. It must be internal, and
+  # the proxy reaches the internet on a network of its own.
+  stack-proxy:
+    external: true
+    name: ${ZOEYMCP_STACK_PROXY:-stack-proxy}
+  # The vault's portal listener and the relay, and nothing else: whatever joins it reaches the
+  # portal. Internal, so the vault gains no route out here.
+  portal:
+    internal: true
+  # The relay's published port. Docker publishes only through a non-internal network, so this
+  # one is, and it holds the relay alone.
+  portal-pub: {}
+
+services:
+  vault:
+    <<: *hardened
+    # For a real deployment, pin by digest: ghcr.io/ryanleeupc/zoeymcp@sha256:...
+    image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
+    command: [vault, --listen, "0.0.0.0:8080"]
+    user: "10001:10001"
+    stop_grace_period: 75s
+    environment:
+      ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+        gateway_key_generation: ${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
+        # Every vault connection goes to the stack's proxy, as CONNECT host:port. Emit its
+        # allowlist with check --emit-egress-allowlist (zoeymcp-squid.conf beside this file).
+        egress_proxy: http://stack-proxy:3128
+        # The src ACL the proxy's squid.conf defines for the vault's address on stack-proxy.
+        egress_proxy_acls: {vault: stack_vault_net}
+        # The portal, through portal-relay. Leave this block out for no portal.
+        admin:
+          # The vault's alias on the portal network (below), resolved at start to exactly one
+          # address, so the portal listens there alone.
+          listen: vault-portal:8081
+          # The relay passes Host and Origin unchanged: list the browser's address.
+          origins: ["http://localhost:${ZOEYMCP_ADMIN_PORT:-8081}"]
+        credentials:
+          notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
+        routes:
+          - name: notes-mcp
+            prefix: /notes
+            upstream: https://mcp.notes.example
+            credential: notes-key
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+        gateway:
+          # The gateway's alias on the stack's agent network (below), which agents use.
+          hosts: [zoeymcp-gateway]
+          clients:
+            agent1:
+              # From `zoeymcp client-token`. This one matches no token anyone has.
+              token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              servers: [notes]
+          servers:
+            notes:
+              kind: remote
+              route: notes-mcp
+              path: /mcp
+              tools: {include: [], allow: [], approve: []}
+              review: {}
+    tmpfs:
+      - /tmp:size=16m
+      - /run/zoeymcp:size=1m,mode=0700,uid=10001,gid=10001
+    networks:
+      # zoeymcp-vault is the name the gateway uses: never the bare `vault` (above).
+      internal: {aliases: [zoeymcp-vault]}
+      stack-proxy: {}
+      # vault-portal names the vault's portal address alone: admin.listen above binds it.
+      portal: {aliases: [vault-portal]}
+    volumes:
+      - vault-state:/state
+
+  gateway:
+    <<: *hardened
+    image: ${ZOEYMCP_GATEWAY_IMAGE:-${ZOEYMCP_IMAGE:-zoeymcp:local}}
+    command: [gateway, --vault, "http://zoeymcp-vault:8080", --listen, "0.0.0.0:8090"]
+    user: "10002:10002"
+    stop_grace_period: 330s
+    depends_on:
+      vault: {condition: service_started}
+    environment:
+      ZOEYMCP_GATEWAY_KEY: ${ZOEYMCP_GATEWAY_KEY:?print it with `zoeymcp keygen` or `zoeymcp gateway-key`}
+    tmpfs:
+      - /tmp:size=16m
+      - /run/zoeymcp-gateway:size=1m,mode=0700,uid=10002,gid=10002
+    networks:
+      # zoeymcp-gateway is the name agents use: never the bare `gateway` (above).
+      stack-agents: {aliases: [zoeymcp-gateway]}
+      internal: {}
+    volumes:
+      - gateway-state:/state-gateway
+
+  # The portal on the host's loopback: http://localhost:8081 (ZOEYMCP_ADMIN_PORT moves it, and
+  # the origin above follows). Caddy passes Host, Origin and the Sec-Fetch-* headers unchanged,
+  # so the vault's own checks decide; it holds no secret and, with no log directive, writes no
+  # access log. Its error log and the proxy handler's log are off too: a 502 while the vault is
+  # down would log the request's URI and headers, the OAuth callback's query and the session
+  # header among them (operations.md §26). It sees what a browser sends the portal, as any proxy
+  # in front of it does.
+  portal-relay:
+    <<: *hardened
+    image: *caddy-image
+    user: "10007:10007"
+    # The image's caddy binary carries the file capability cap_net_bind_service, and won't
+    # start unless the bounding set holds it. It listens on 8081 and never uses it.
+    cap_add: [NET_BIND_SERVICE]
+    # Compose can't place a config file in a read-only container, so the Caddyfile comes in the
+    # environment and is written to tmpfs first.
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        printf '%s' "$$ZOEYMCP_CADDYFILE" >/config/Caddyfile
+        && exec caddy run --config /config/Caddyfile --adapter caddyfile
+    environment:
+      ZOEYMCP_CADDYFILE: |
+        {
+          admin off
+          auto_https off
+          log default {
+            exclude http.log.error http.handlers.reverse_proxy
+          }
+        }
+        :8081 {
+          reverse_proxy vault-portal:8081
+        }
+    depends_on:
+      vault: {condition: service_started}
+    ports: ["127.0.0.1:${ZOEYMCP_ADMIN_PORT:-8081}:8081"]
+    tmpfs:
+      - /config:size=1m,mode=0700,uid=10007,gid=10007
+      - /data:size=1m,mode=0700,uid=10007,gid=10007
+    networks: [portal, portal-pub]
+
+volumes:
+  vault-state: {}
+  gateway-state: {}

@@ -1094,8 +1094,11 @@ compose file's origin follows. Remove the `admin` block for no portal.
   the host's loopback reaches it: not the gateway, nor anything on `internal`, `direct` or
   `agents`. Keep `egress` to the vault alone, since whatever joins it reaches the portal (an
   egress proxy gets a network of its own). If `egress` must become an internal network to your
-  own proxy, nothing can be published: give the vault a separate non-internal network with its
-  own alias for the portal, or run without one.
+  own proxy, nothing can be published through it. A separate non-internal network with its own
+  alias for the portal would publish it, but **it gives the vault a direct route out beside your
+  proxy**, which only a host firewall rule outside Docker's view could then stop. Publish it
+  through a relay on networks of its own instead, as `examples/existing-stack/` does (§29), or
+  run without a portal.
 
 A port published on `127.0.0.1` stays off the LAN only on Docker Engine 28.0 or later; older
 engines let hosts on the same network segment reach it (§27).
@@ -1590,11 +1593,16 @@ at an ACL that isn't defined, so a missing one shows on `squid -k parse`:
 ```text
 http_port 3128
 acl CONNECT method CONNECT
-acl stack_vault_net src 172.30.5.0/24              # the network the vault reaches the proxy on
-include /etc/squid/zoeymcp.conf                    # emitted; never edited by hand
-include /etc/squid/zoeymcp-onboarding.conf         # onboarding lines only; empty otherwise
+# The network the vault reaches the proxy on.
+acl stack_vault_net src 172.30.5.0/24
+# Emitted; never edited by hand.
+include /etc/squid/zoeymcp.conf
+# Onboarding lines only; empty otherwise.
+include /etc/squid/zoeymcp-onboarding.conf
 http_access deny all
 ```
+
+Squid takes `#` as a comment only at the start of a line, so each comment has a line of its own.
 
 The `src` ACL's name comes from the policy's `egress_proxy_acls` (`{vault: stack_vault_net}`), so
 every command and the portal print the same lines; `--squid-src vault=NAME` overrides it for one
@@ -1644,22 +1652,30 @@ empty the onboarding file.
 
 A stack that already runs agents, an egress proxy and its own networks takes ZoeyMCP's hardened
 tier as two more services: the gateway beside the agents, the vault behind the stack's proxy,
-and no new route out for either. `examples/existing-stack/` (next in M7) holds a compose file that
-is tested end to end; this is the shape.
+and no new route out for either. `examples/existing-stack/` is this shape as a compose file of its
+own, with the portal relay below, the policy inline and the emitted Squid snippet; its README has
+the steps, a unit test pins the file's networks, and the image's smoke test runs it. This is the
+shape.
 
 - **The gateway** joins the stack's agent network in place of `agents`, plus `internal` to the
   vault, and nothing else; no `lan` profile. **The agent network must be `internal: true`**: if it
   isn't, the gateway, and the toolkits that run inside it, have a route out beside the proxy.
-- **The vault** is on `internal` and on one network it shares with the stack's proxy, and no other.
+- **Aliases only ZoeyMCP uses:** the gateway reaches the vault as `zoeymcp-vault` (an alias on
+  `internal`), and agents reach the gateway as `zoeymcp-gateway` (an alias on the agent network),
+  never by the bare service names. A name is resolved on every network the caller is on, and the
+  stack's networks may hold a `vault` or `gateway` of their own that would be sent the gateway
+  key or a client token.
+- **The vault** is on `internal` and on one network it shares with the stack's proxy, and, with
+  the portal, the relay's internal `portal` network (below), and no other.
   **That network must be `internal: true`** too, so the proxy is the vault's only way out (the
   proxy reaches the internet on a network of its own): if it isn't, the vault has a direct route
   out beside the proxy, and the allowlist confines nothing. `egress_proxy` names the proxy's
   address on that network, and the emitted snippet (§28) goes into the proxy's configuration,
   with the vault's address on that network as its `src` ACL.
 - **The agents** get one entry per server in the runtime's configuration: the URL
-  `http://gateway:8090/s/<server>/mcp`, the header `Authorization: Bearer <client token>` (§10),
-  and the runtime's own approval setting for that server at its least-prompting level, so the
-  gateway's approval (§19) is the one prompt.
+  `http://zoeymcp-gateway:8090/s/<server>/mcp`, the header
+  `Authorization: Bearer <client token>` (§10), and the runtime's own approval setting for that
+  server at its least-prompting level, so the gateway's approval (§19) is the one prompt.
 - **Your own compose files.** As M7's onboarding by URL lands, the commands ZoeyMCP prints for you
   are prefixed with `ZOEYMCP_COMPOSE_CMD`. Set it in `.env` to your stack's command (its `-f`
   files, `--project-directory` or `-p`), or they name `deploy/compose.hardened.yaml` alone.
@@ -1683,7 +1699,7 @@ routes:
     stream: true
     rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
 gateway:
-  hosts: [gateway]
+  hosts: [zoeymcp-gateway]
   clients:
     agent1:
       token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -1697,9 +1713,10 @@ gateway:
       review: {}
 ```
 
-An override beside the stack's own compose files moves both services onto those networks
-(`!override` replaces a list instead of adding to it, and `!reset` empties one; Compose 2.24.4 or
-later), and sets the vault's `ZOEYMCP_CONFIG` to the policy above:
+An override beside the stack's own compose files moves both services onto those networks with
+their aliases (`!override` replaces a list instead of adding to it, and `!reset` empties one;
+Compose 2.24.4 or later), points the gateway at `zoeymcp-vault`, and sets the vault's
+`ZOEYMCP_CONFIG` to the policy above:
 
 ```yaml
 # compose.zoeymcp.yaml
@@ -1709,14 +1726,17 @@ networks:
 services:
   vault:
     networks: !override
-      internal: {}
+      internal: {aliases: [zoeymcp-vault]}
       stack-proxy: {}
     ports: !reset []                  # nothing to publish through: see "The portal" below
     environment:
       ZOEYMCP_CONFIG: |
         # the policy above
   gateway:
-    networks: !override [internal, stack-agents]
+    command: [gateway, --vault, "http://zoeymcp-vault:8080", --listen, "0.0.0.0:8090"]
+    networks: !override
+      internal: {}
+      stack-agents: {aliases: [zoeymcp-gateway]}
 ```
 
 **The portal.** Docker publishes a port only through a non-internal network, so a vault with
@@ -1726,7 +1746,10 @@ gives it a direct route out beside the proxy. The answers, best first:
 - **A relay on networks of its own:** a small reverse proxy on an internal network shared with
   the vault alone (the vault's `vault-portal` alias is there) and on a second network that
   publishes `127.0.0.1:8081`. The vault keeps no non-internal network; the relay holds no secret
-  and keeps no access log. `examples/existing-stack/` ships this.
+  and keeps no access log, nor an error log that would record a request's URI and headers.
+  `examples/existing-stack/` ships this as its `portal-relay` service:
+  Caddy, passing `Host`, `Origin` and `Sec-Fetch-*` unchanged, so the vault's own checks answer
+  through it as they do without it.
 - **The stack's own reverse proxy** joins that internal network instead, and follows §26's rules
   for a proxy in front of the portal.
 - **A separate non-internal network** for the vault's portal, with a host firewall rule that drops
