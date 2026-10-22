@@ -1033,7 +1033,7 @@ step "standard tier: a container on the compose network gets only the shell and 
 # 429 from every route that holds anything, with the Host, Origin and Sec-Fetch-Site a browser
 # on the operator's origin would send.
 sibling='
-import http.client, json, sys
+import collections, http.client, json, sys
 from zoeymcp.portal.routes import ROUTES, STATIC
 def ask(method, path, body=None):
     headers = {"Host": "localhost:8081", "Origin": "http://localhost:8081",
@@ -1066,7 +1066,7 @@ elif status != 429:
 for route in ROUTES:
     if route.path == "/api/login/begin":
         continue
-    path = route.path.format(credential="x", flow="x", action="x")
+    path = route.path.format_map(collections.defaultdict(lambda: "x"))
     body = None
     if route.method == "POST":
         body = bodies.get(route.path, {key: "x" for key in route.body})
