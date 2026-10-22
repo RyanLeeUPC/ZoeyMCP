@@ -22,6 +22,7 @@ fail. Record no account names, addresses or other personal details.
 | 12 | no step waits on it (the portal tests cover it); run it with 1-7 |
 | 15 | step 13 (secrets) |
 | 16-18 | M7 step 14b (the MCP servers page) |
+| Live S9 | M7 step 15: onboarding by URL against a real server (its own section below) |
 
 ## The setup for every item
 
@@ -284,6 +285,42 @@ keep no token: everything below runs in a temporary directory.
 If the provider refuses the portless redirect, record what it showed and stop: a profile override
 with a fixed `redirect_uri` is the fallback, decided then.
 
+## Live S9: onboarding a real server by its URL
+
+Run by hand against one public remote MCP server that protects itself with OAuth, publishes its
+protected-resource metadata and offers dynamic client registration; CI never runs it, and
+`tests/acceptance/test_onboard_shape.py` walks the same steps against the fakes. Record it in the
+results table as item `Live S9`: the commit, the date, the kind of server (for example "a public
+notes server with DCR", never its name or address), the browser, and pass or fail per part. Record
+no account name, client ID, token or secret, and keep none: everything runs in a temporary state
+directory, and the registered client is removed in the provider's own console afterwards. If no
+such server is available, record it as not run.
+
+1. **Discovery and registration from the CLI.** A vault with an admin socket and a policy with
+   an `admin` block (the setup above, without `--admin-socket none`, on Linux or in the hardened
+   compose file), and its gateway:
+   `zoeymcp login --mcp <the server's URL> --name live > onboard-live-1.yaml`. Pass: the plan
+   shows the resource from the protected-resource metadata, the issuer and its metadata URL,
+   PKCE S256, the scopes and where they came from, a `Registration endpoint` row with the
+   server's endpoint and a `Client` row reading `registered at <host> once you confirm (dynamic
+   client registration)`; after the question, one registration, and fragment 1 on stdout whose
+   `check --with` against the policy has no error. The vault's log has `onboard_started`,
+   `discovery_fetch` lines for the probe, the protected-resource metadata and the authorization
+   server's metadata, `onboard_planned` and `onboard_registered`, and no client ID, secret or
+   registration access token.
+2. **Connect, `tools/list` and the review from the CLI.** Commit fragment 1, reload, run the same
+   command again. Pass: the comparison finds nothing changed, the sign-in link opens the
+   provider's consent page, the pasted address completes the sign-in, and the review's counts are
+   printed; `review live --via vault --choose --suggest` writes a choices file whose names are the
+   server's tools.
+3. **The same in the portal.** On a fresh state directory and the policy as it was before item 1
+   (without fragment 1, or the URL is compared, not onboarded): **MCP servers**, **Add a server
+   by URL**, the plan, **Register and make the YAML** with the passkey, **Copy**, the commit and
+   reload, **Connect** (through the portal's callback, the passkey at completion), the review the
+   page queues, **Generate** with one tool included, the commit and reload. Pass: each step as
+   §26 of operations.md describes it, and the row ends `reviewed`. Then an agent lists the
+   included tool through the gateway and calls it.
+
 ## Results
 
 | Item | Commit | Date | Browser and version | Origin | Pass or fail | Notes |
@@ -305,3 +342,4 @@ with a fixed `redirect_uri` is the fallback, decided then.
 | 13 | 5d45d02 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass, with findings | Against `tests.fakes.run_oauth_server`. A clicked link arrives `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`; the provider's link pasted into the address bar arrives `none` (accepted by C.7). The request carries `zoeymcp-8081-cb` (HttpOnly, `SameSite=Lax`), which isn't listed under Application after the confirm because the confirm expires it. It also carries `zoeymcp-8081-session`: the fake answers `/authorize` with an immediate redirect, so the navigation starts and ends on the portal and Chrome treats it as same-site for `SameSite`, with the fake at `https://localhost:9443` and again at `https://127.0.0.1:9443`. The callback reads only the binding cookie; the no-session-cookie line needs a provider with a consent page (D-183). The tab ends on `/callback/received`, the history list has no entry for the address that held the code, and Back doesn't return to it. The passkey summary showed where and when the sign-in came back and the "Confirm only if" line; `notes` then showed `ok`. The callback address opened in a Guest window: the refused page, the address intact, the first browser's dialog still waiting (`callback_not_taken`) |
 | 13 (https) | 5d45d02 | 2026-10-20 | - | - | Not run | Needs a Web-application client registered with an `https` callback address |
 | 14 | 5d45d02 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | Item 13's Guest-window address after its login was cancelled: typed into the address bar, `Sec-Fetch-Site: none` and the refused page; pasted into a new Connect, "That address belongs to another login" (`state_mismatch`, refused before any passkey prompt) |
+| Live S9 | cfdeb04 | 2026-10-22 | - | - | Not run | No public server with dynamic registration was used yet (D-154); the fakes' run is S9 (`tests/acceptance/test_onboard_shape.py`) |

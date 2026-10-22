@@ -4,8 +4,9 @@ How to run what is built so far: the vault (M1), OAuth in the vault (M2), the ga
 remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
 and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
 supported. M7's so far: onboarding a remote MCP server by URL (§11), your own egress proxy
-(§28), and fitting ZoeyMCP into a stack that already has one (§29). The design and the reasons
-behind it are in [design.md](design.md); this page is the how-to.
+(§28), fitting ZoeyMCP into a stack that already has one (§29), and a first hardened deployment
+end to end (§30). The design and the reasons behind it are in [design.md](design.md); this page
+is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -2343,3 +2344,96 @@ done
 
 Add the portal's probes from §26 ("Checks for a verify script") against the address you publish
 it on, if you do.
+
+## 30. A first hardened deployment, end to end
+
+The steps above in the order a first deployment takes them, in the hardened tier: the keys, a
+client token, the policy, a secret, the reload, a remote MCP server onboarded by its URL, its
+review, and an agent's container attached. Every command runs on the host, from the repository's
+root; `c` is the compose command, which the commands ZoeyMCP prints start with too (§11):
+
+```sh
+c="docker compose -f deploy/compose.hardened.yaml"
+docker build -t zoeymcp:local .
+```
+
+1. **The keys.** `docker run --rm zoeymcp:local keygen` prints `ZOEYMCP_MASTER_KEY` and
+   `ZOEYMCP_GATEWAY_KEY`. Keep both as deployment secrets (an `.env` file only you can read, say):
+   the master key opens the store, and a lost one means setting every secret and signing in
+   again (§6).
+2. **A client token** for each agent: `docker run --rm zoeymcp:local client-token` (§10). The
+   agent gets `client_token`; the policy gets `token_sha256`.
+3. **The policy.** The compose file's `ZOEYMCP_CONFIG` is the policy (or put it in a file, §7).
+   Put the agent's `token_sha256` under `gateway.clients.agent1`, and give it no servers yet
+   (`servers: []`). Remove the example `notes` server, its route `notes-mcp` and its credential
+   `notes-key` before you onboard a server at that URL: `login --mcp` refuses a URL a server
+   already reaches with another kind of credential (`already_configured`). Keep or remove the
+   `stats` route; if you keep it, replace its placeholder with a long random value. Then prove the
+   file: `$c run --rm --no-deps vault check`.
+4. **Start**: `$c up -d`. `$c exec vault zoeymcp health` lists what still needs you, and
+   `$c exec gateway zoeymcp gateway-status` shows the gateway's view, `fresh` once it has one.
+5. **A secret** for a route that holds one, piped in, never typed on the command line:
+   `printf '%s' "$KEY" | $c exec -T vault zoeymcp secret set music-stats`. No reload: the policy
+   names the secret, never its value.
+6. **The reload.** An inline policy is part of the vault's environment, so a changed one is
+   applied by recreating the vault: `$c up -d vault`. The gateway carries on, and sees the new
+   view once the vault is back (§9). Nothing the next step needs lives only in the vault's memory,
+   so a recreate costs at most a portal sign-in. For a policy file, `$c kill -s HUP vault` (§7).
+7. **A remote MCP server, by its URL** (§11, "Onboarding by URL"):
+
+   ```sh
+   $c exec vault zoeymcp login --mcp https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
+   $c run --rm --no-deps -v "$PWD:/w:ro" vault check --with /w/onboard-notes-1.yaml
+   ```
+
+   The plan and the `Next:` list go to the terminal, fragment 1 to the file. Merge fragment 1
+   into `ZOEYMCP_CONFIG` (`check --with /w/onboard-notes-1.yaml --print-merged --for compose`
+   prints the whole block to paste over it), prove the edited file with `$c run --rm --no-deps
+   vault check`, and recreate the vault (step 6). Then run the same `login --mcp` command again,
+   without the redirect: it compares the server with fragment 1, prints the sign-in link (open
+   it, approve, paste back the address you land on), and queues the server's review, which the
+   gateway runs. A server that offers neither a client you registered (`--client-id`) nor
+   dynamic registration stops at `registration_unavailable`: register a client there first.
+8. **The review.** The second run ends with the counts and two commands:
+
+   ```sh
+   $c exec vault zoeymcp review notes --via vault --choose --suggest > notes.choices
+   # edit notes.choices: skip, allow or approve on each line
+   $c exec -T vault zoeymcp review notes --via vault --choices - < notes.choices > onboard-notes-2.yaml
+   ```
+
+   Read the definitions you include (`$c exec vault zoeymcp review notes --via vault --show
+   TOOL`). Commit fragment 2 as fragment 1 (`check --with`, the merge, `check`, the recreate),
+   then add `notes` to `gateway.clients.agent1.servers` and recreate once more: fragment 2 never
+   assigns a server to a client. `$c exec gateway zoeymcp review notes` then exits 0.
+9. **The agent's container** joins the `agents` network, `zoeymcp_agents` to Docker (the compose
+   project is `zoeymcp`), and nothing else of ZoeyMCP's. In the agent's own compose file:
+
+   ```yaml
+   services:
+     agent:
+       networks: [zoeymcp]
+   networks:
+     zoeymcp:
+       external: true
+       name: zoeymcp_agents
+   ```
+
+   or `docker network connect zoeymcp_agents <container>` for one already running. Its MCP
+   client takes `http://gateway:8090/s/notes/mcp` with the header `Authorization: Bearer
+   <client_token>` (§10). The `agents` network has no route out, so an agent that needs the
+   internet keeps a network of its own for that; it still reaches the server only through the
+   gateway, and never holds the server's token.
+
+**The same in the portal.** Steps 7 and 8 can run in the portal instead (§26): issue a code with
+`$c exec vault zoeymcp setup-code`, open `http://localhost:8081`, and enrol a passkey. On **MCP
+servers**, **Add a server by URL** discovers the server and shows the plan; **Register and make
+the YAML** registers a client after your passkey (a client you registered yourself goes under
+**More options**), and fragment 1 shows with **Copy** and its steps. After the commit and the
+recreate, sign in again: the server's row says `needs_connect`, and **Connect** signs in with
+your passkey at the end, then queues the review by itself. **Review tools** shows the tools with
+the server's suggestions, **Generate** makes fragment 2, and the row says `reviewed` once it is
+committed. Assigning the server to the agent is still yours (step 8).
+
+Through your own egress proxy (§28), step 7 may stop at `proxy_refused`, naming the hosts to
+allow and the same command to run again, which carries on where it stopped once they are allowed.

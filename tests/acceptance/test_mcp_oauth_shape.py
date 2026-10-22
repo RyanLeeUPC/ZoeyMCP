@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
-import anyio
 import httpx
 import pytest
 
@@ -42,7 +41,8 @@ from zoeymcp.vault.oauth.protocol import MIN_401_AGE
 from zoeymcp.vault.store import STORE_FILE
 
 from .conftest import BASE, PROFILES, Clock, serve_tls
-from .gateway import GatewayDeployment, Seen
+from .gateway import GatewayDeployment
+from .helpers import Seen, listening
 from .test_mcp_shapes import LINKS, own_uid, text
 from .test_oauth_shapes import PRINTED_URL, REDIRECT, Browser, browse
 from .tls import ProviderCA
@@ -301,29 +301,6 @@ async def test_a_portal_connect_by_paste_then_the_same_calls(
     assert [line["action"] for line in confirmed] == ["oauth.complete"]
 
 
-async def listening(gateway: GatewayDeployment, fake: McpFake) -> None:
-    """Wait until the server has answered every upstream connection's ``subscriptions/listen``.
-
-    A connection opens that stream in the background once it has listed, while the agent's
-    first calls go on. Until the server has answered it, its POST carries the access token the
-    vault picked for it: a token the test may expire (moving the clock) or drop meanwhile. The
-    server then answers 401, the vault drops the token or sees a newer one, and the gateway
-    takes the stream as lost and lists again, COALESCE (5 s) after its last listing, its calls
-    waiting for that. Once the streams are open, no request is on its way when the test moves
-    the clock or drops the tokens.
-    """
-    deadline = anyio.current_time() + 10
-    while True:
-        connected = len(gateway.seen.events("upstream_connected"))
-        answered = [item.status for item in fake.requests("subscriptions/listen") if item.status]
-        if connected and answered.count(200) >= connected:
-            break
-        if anyio.current_time() > deadline:
-            raise AssertionError(json.dumps({"connected": connected, "listens": answered}))
-        await anyio.sleep(0.01)
-    assert answered == [200] * len(answered), answered
-
-
 async def the_calls(
     gateway: GatewayDeployment,
     running: Running,
@@ -339,7 +316,7 @@ async def the_calls(
         assert sorted(tool.name for tool in listed.tools) == sorted(TOOLS.values())
         assert text(await client.call_tool("echo", {"text": "before"})) == "before"
         assert len(auth.calls) == 1  # the login's access token is used
-        await listening(gateway, fake)
+        await listening(gateway.seen, fake)
 
         # The access token expires between calls, twice: each refresh rotates, and the
         # next one presents the new refresh token.

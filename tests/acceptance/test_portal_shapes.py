@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,7 @@ from zoeymcp.vault.keys import generate_master_key
 
 from .conftest import serve_tls
 from .gateway import GatewayDeployment
+from .helpers import wait_for, wait_until
 from .procs import PASSED, Process, free_port, start, wait_port
 from .test_mcp_shapes import LINKS, own_uid, text
 from .test_oauth_shapes import browse
@@ -147,10 +148,7 @@ def test_the_first_visit_and_a_restart(tmp_path: Path) -> None:
         sign_in(page, authenticator)
         assert page.fetch("GET", "/api/session").json()["credential"] == fingerprint
         assert [s["this"] for s in page.fetch("GET", "/api/sessions").json()["sessions"]] == [True]
-        deadline = time.monotonic() + 10
-        while not log_events(vault, "passkey_enrolled"):
-            assert time.monotonic() < deadline
-            time.sleep(0.05)
+        wait_until(lambda: bool(log_events(vault, "passkey_enrolled")), "passkey_enrolled")
         assert code not in vault.output()
         old_token = page.storage[SESSION_KEY]
     # A restart ends every session; the passkey file keeps the passkey.
@@ -355,16 +353,6 @@ def both_closed(page: dict[str, Any]) -> bool:
     return len(rows) == 2 and all(row["outcome"] is not None for row in rows)
 
 
-def wait_for(read: Callable[[], Any], until: Callable[[Any], bool], timeout: float = 30) -> Any:
-    deadline = time.monotonic() + timeout
-    while True:
-        value = read()
-        if until(value):
-            return value
-        assert time.monotonic() < deadline, value
-        time.sleep(0.1)
-
-
 @pytest.mark.anyio
 @pytest.mark.parametrize("link", LINKS)
 async def test_the_operators_journey(tmp_path: Path, ca: ProviderCA, link: str) -> None:
@@ -448,7 +436,7 @@ async def test_the_operators_journey(tmp_path: Path, ca: ProviderCA, link: str) 
             ) as client:
                 declined = await client.call_tool("send_note", {"subject": SUBJECT, "body": "No."})
             assert text(declined).startswith("declined by operator")
-            shown = wait_for(lambda: portal.get("/api/ledger"), both_closed)
+            shown = wait_for(lambda: portal.get("/api/ledger"), both_closed, timeout=30)
             policy = portal.get("/api/policy")
             sessions = portal.get("/api/sessions")["sessions"]
             out = portal.fetch("POST", "/api/logout", {})

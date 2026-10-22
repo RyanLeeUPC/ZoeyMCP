@@ -72,7 +72,10 @@ class Page:
         if self.cookie is not None:
             headers["Cookie"] = self.cookie
         response = await self.client.request(method, path, json=body, headers=headers)
-        if "token" in (response.json() if response.content else {}):
+        # An answer that mints a session sets its cookie; a second run's comparison has a
+        # ``token`` member too, its credential's token state (M7 design D.12).
+        minted = response.json() if response.content and "set-cookie" in response.headers else {}
+        if "token" in minted:
             self.token = response.json()["token"]
             self.cookie = response.headers["set-cookie"].split(";")[0]
         return response

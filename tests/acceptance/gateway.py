@@ -15,10 +15,8 @@ from __future__ import annotations
 
 import io
 import json
-import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,6 +39,7 @@ from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import KeySource, parse_link, report_client, view_client
 
 from .conftest import Clock, Deployment, _HTTPTransport
+from .helpers import Seen, wait_until
 from .tls import ProviderCA
 
 PROFILE = "remote-mcp-static-key.yaml"
@@ -91,21 +90,6 @@ class GatewayAdminTransport(httpx.BaseTransport):
             response = transport.handle_request(request)
             response.read()
         return response
-
-
-@dataclass
-class Seen:
-    """Everything a test showed an agent or an operator, for the sweeps."""
-
-    log: io.StringIO = field(default_factory=io.StringIO)
-    outputs: list[str] = field(default_factory=list)
-
-    def everything(self) -> str:
-        return self.log.getvalue() + "\n".join(self.outputs)
-
-    def events(self, kind: str | None = None) -> list[dict[str, Any]]:
-        parsed = [json.loads(line) for line in self.log.getvalue().splitlines() if line]
-        return [line for line in parsed if kind is None or line["event"] == kind]
 
 
 class GatewayDeployment:
@@ -230,8 +214,8 @@ class GatewayDeployment:
 
 
 def wait_healthy(running: Running, timeout: float = 15.0) -> None:
-    deadline = time.monotonic() + timeout
-    while httpx.get(f"{running.url}/healthz", timeout=5).status_code != 200:
-        if time.monotonic() > deadline:
-            raise RuntimeError("the gateway didn't become ready")
-        time.sleep(0.05)
+    wait_until(
+        lambda: httpx.get(f"{running.url}/healthz", timeout=5).status_code == 200,
+        "the gateway didn't become ready",
+        timeout,
+    )

@@ -65,11 +65,12 @@ from tests.fakes.oauth_server import (
 )
 from tests.unit import onboard_model
 from tests.unit.report_model import DIGEST, PIN, asked_line
+from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import main
 from zoeymcp.common import ledgerreport, pinhash
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.merge import Merged, merge
+from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.common.yamlload import load_mapping
@@ -88,7 +89,8 @@ from zoeymcp.vault.secretops import Revoker
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
-from .test_admin import AdminRig
+from .test_admin import AdminRig, example_policy
+from .test_cli import Reviews as CliReviews
 from .test_no_secret_answers import Recording, signed_in, step_up
 from .test_no_secret_answers import Reviews as NoSecretReviews
 from .test_oauth_tokens import KEYS, FakeClock
@@ -1479,3 +1481,205 @@ async def test_the_portals_onboarding_and_review_leak_nothing(
     assert sum(job in answer for answer in answers) >= 1
     await client.aclose()
     await rig.token_client.aclose()
+
+
+# --- one onboarding through the socket and the portal (M7 design O.5, step 15) ----------------
+
+
+class Onboarding:
+    """The vault's admin socket and portal over one store, token manager, logins, onboardings and
+    review jobs, as ``zoeymcp vault`` shares them. The onboarding service's server registers a
+    confidential client whose answer carries a secret, a registration access token and its URI
+    (onboard_model's ``planted``, each request kept); the fake authorization server signs that
+    client in. The gateway's side of a review is played at once (test_cli's ``Reviews``)."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.auth = FakeAuthServer(
+            client_id=onboard_model.DCR_CLIENT_ID,
+            client_secret=onboard_model.DCR_SECRET,
+            auth="basic",
+            issuer=onboard_model.ISSUER,
+            iss_supported=True,
+            scopes=("notes.read", "offline_access"),
+            registration="none",
+            registered_redirect="http://127.0.0.1/callback/notes",
+            prefix="fake-notes",
+        )
+        self.auth_app = self.auth.app()
+        self.store = SecretStore(tmp_path, KEYS)
+        self.store.load()
+        self.policy = example_policy()
+        self.token_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.auth_app))
+        self.tokens = TokenManager(self.store, self.token_client)
+        self.tokens.configure(self.policy, {})
+        # The registration requests the onboarding sent (X1).
+        self.registrations: list[httpx.Request] = []
+        onboard = onboard_model.onboard_service(
+            self.store, self.tokens, lambda: self.policy, register=self.register
+        )
+        self.reviews = CliReviews(lambda: self.policy)
+        login = LoginService(self.tokens)
+        setup = SetupCodes(tmp_path, KEYS.portal_key)
+        self.admin_app = AdminApp(
+            self.store,
+            KEYS,
+            lambda: self.policy,
+            setup,
+            self.tokens,
+            login,
+            onboard=onboard,
+            reviews=self.reviews,
+        )
+        (tmp_path / "portal").mkdir(mode=0o700)
+        self.portal_app = PortalApp(
+            [ORIGIN],
+            static=load_static(),
+            setup=setup,
+            passkeys=Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json"),
+            login=login,
+            secrets=Secrets(self.store, self.tokens, lambda: self.policy),
+            onboard=onboard,
+            reviews=self.reviews,
+        )
+        # Everything that left the vault, and every authorization URL it showed.
+        self.texts: list[str] = []
+        self.authorize_urls: list[str] = []
+
+    async def register(self, request: httpx.Request) -> httpx.Response:
+        """onboard_model's ``planted``, the request kept."""
+        self.registrations.append(request)
+        return await onboard_model.planted(request)
+
+    def commit(self, fragment: str) -> None:
+        """A fragment merged as ``check --with`` merges it, committed and reloaded."""
+        base = self.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+        merged = merge(base, load_mapping(fragment), replace=replace_paths(fragment))
+        assert isinstance(merged, Merged)
+        self.policy = Policy.model_validate(merged.data)
+        self.tokens.configure(self.policy, {})
+
+    async def admin(self, request: httpx.Request) -> httpx.Response:
+        transport = httpx.ASGITransport(app=self.admin_app.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
+            answer = await client.request(
+                request.method,
+                request.url.raw_path.decode(),
+                content=request.content,
+                headers={"content-type": "application/json"} if request.content else {},
+            )
+        self.texts.append(answer.text + repr(answer.headers.multi_items()))
+        return answer
+
+    async def browse(self, url: str) -> str:
+        """The operator's browser: approve, and return where the provider sent it."""
+        self.authorize_urls.append(url)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.auth_app)) as browser:
+            answer = await browser.get(url)
+        assert answer.status_code == 302, answer.text
+        location: str = answer.headers["location"]
+        return location
+
+    async def cli(
+        self, monkeypatch: pytest.MonkeyPatch, argv: list[str], stdin: str | None = None
+    ) -> tuple[int, str, str]:
+        """The CLI in a thread, on the socket; without ``stdin``, reading the paste opens the
+        URL it printed."""
+        loop = asyncio.get_running_loop()
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            answer = asyncio.run_coroutine_threadsafe(self.admin(request), loop).result(60)
+            return httpx.Response(answer.status_code, content=answer.content)
+
+        monkeypatch.setattr(httpx, "HTTPTransport", lambda **_: httpx.MockTransport(handle))
+        out, err = io.StringIO(), io.StringIO()
+        world = self
+
+        class Paste(io.StringIO):
+            def readline(self, size: int = -1, /) -> str:  # type: ignore[override]
+                [url] = PRINTED_URL.findall(out.getvalue())
+                pasted = asyncio.run_coroutine_threadsafe(world.browse(url), loop)
+                return pasted.result(60) + "\n"
+
+        source = Paste() if stdin is None else io.StringIO(stdin)
+        code = await asyncio.to_thread(main, argv, stdin=source, out=out, err=err)
+        self.texts += [out.getvalue(), err.getvalue()]
+        return code, out.getvalue(), err.getvalue()
+
+
+async def test_an_onboarding_through_the_socket_and_the_portal_leaks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_lines: io.StringIO
+) -> None:
+    """R24's onboarding scenario: J1 with a client the vault registers, through the CLI on the
+    socket (fragment 1, the commit, the second run's sign-in, the choices file), then in the
+    portal (the server's row, the URL again, a Connect by paste, the review and fragment 2). The
+    registered client's secret reaches the store alone; its registration access token and URI,
+    every code and verifier exchanged and every token reach nothing at all; a login's ``state``
+    shows only in its authorization URL."""
+    for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    world = Onboarding(tmp_path)
+    with anyio.fail_after(120):
+        j1 = ["login", "--mcp", onboard_model.SERVER_URL, "--name", "notes", "--socket", "x"]
+        code, fragment, err = await world.cli(monkeypatch, [*j1, "--yes"], "")
+        assert code == 0, err
+        assert '"store:notes-client-secret"' in fragment
+        # X1: before the commit nothing reached the authorization server, and the registration
+        # carried no credentials and asked for nothing secret.
+        assert world.auth.seen == []
+        [registration] = world.registrations
+        assert "authorization" not in registration.headers
+        secret_fields = {"client_secret", "code", "code_verifier", "access_token", "refresh_token"}
+        assert not secret_fields & set(json.loads(registration.content))
+        world.commit(fragment)
+        code, out, err = await world.cli(monkeypatch, j1)
+        assert code == 0, err
+        assert "Stored the refresh token for notes as notes-refresh.\n" in out
+        review = ["review", "notes", "--via", "vault", "--socket", "x"]
+        code, choices, err = await world.cli(monkeypatch, [*review, "--choose", "--suggest"], "")
+        assert code == 0, err
+        code, _, err = await world.cli(monkeypatch, [*review, "--choices", "-"], choices)
+        assert code == 0, err
+        # The portal: the row, the committed URL again, a Connect by paste and the review.
+        answers: list[str] = []
+        transport = httpx.ASGITransport(app=world.portal_app)
+        client = httpx.AsyncClient(transport=transport, base_url=ORIGIN)
+        page = Recording(client, answers)
+        authenticator = SoftAuthenticator()
+        await signed_in(page, world.portal_app, authenticator)
+        await page.call("GET", "/api/servers")
+        compared = await page.call(
+            "POST", "/api/onboard/discover", {"url": onboard_model.SERVER_URL}
+        )
+        assert compared.json()["stage"] == "committed"
+        started = (await page.call("POST", "/api/oauth/notes/start", {})).json()
+        pasted = await world.browse(started["authorize_url"])
+        data = {"credential": "notes", "flow": started["flow"], "redirect_url": pasted}
+        connected = await step_up(page, authenticator, "oauth.complete", data)
+        assert connected.status_code == 200, connected.text
+        job = (await page.call("POST", "/api/review/notes", {})).json()["job"]
+        await page.call("GET", f"/api/review/jobs/{job}")
+        chosen = {"include": ["list_notes"], "allow": ["list_notes"], "approve": []}
+        made = await page.call("POST", f"/api/review/jobs/{job}/diff", chosen)
+        assert made.status_code == 200, made.text
+        # The sweep.
+        exchanges = [call for call in world.auth.calls if call.grant_type == "authorization_code"]
+        assert len(exchanges) == 2  # the socket's sign-in and the portal's
+        verifiers = [call.params["code_verifier"] for call in exchanges]
+        states = [dict(parse_qsl(urlsplit(url).query))["state"] for url in world.authorize_urls]
+        swept = [*world.texts, *answers, log_lines.getvalue()]
+        held = world.store.path.read_bytes().decode("utf-8")
+        for text in swept:
+            for url in world.authorize_urls:
+                text = text.replace(url, "<authorize-url>")
+            found = ISSUED.search(text)
+            assert found is None, found and found.group()
+            for secret in (onboard_model.DCR_SECRET, *verifiers, *states):
+                assert secret not in text, secret
+        for planted in (onboard_model.REGISTRATION_TOKEN, onboard_model.REGISTRATION_URI):
+            assert planted not in "".join(swept) + held
+        stored, _ = world.store.get_for_oauth(
+            onboard_model.SECRET_NAME, token_url=f"{onboard_model.ISSUER}/token"
+        )
+        assert stored.reveal() == onboard_model.DCR_SECRET
+        await client.aclose()
+        await world.token_client.aclose()

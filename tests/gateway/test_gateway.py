@@ -208,8 +208,18 @@ async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
     """P20 (D-34): agents get no OAuth from ZoeyMCP. Neither the gateway nor the vault's proxy
     answers metadata, a client registration, a token or an authorization endpoint, with or
     without a client token, and the gateway's 401 names no resource metadata. The portal's half
-    is ``tests/portal/test_shell.py``."""
-    fake = McpFake()
+    is ``tests/portal/test_shell.py``.
+
+    The agent's side (M7 design step 15): the upstream here offers OAuth itself, publishing its
+    protected-resource metadata, and once it stops taking the vault's credential its 401 names
+    that metadata. No answer an agent gets carries any challenge but ``Bearer
+    realm="zoeymcp"``, nor the upstream's metadata."""
+    fake = McpFake(
+        key="fake-key-p20-0001",
+        prm="path",
+        authorization_servers=["https://auth.notes.example"],
+        scopes=("notes.read",),
+    )
     with (
         deployment(tmp_path, fake, include=TOOLS, review=review(fake)) as deployed,
         gateway(deployed) as running,
@@ -225,11 +235,28 @@ async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
             for headers in ({}, bearer)
         }
         unauthenticated = post(running, client=None)
+        wrong = post(running, client=None, headers={"authorization": "Bearer zgc1-wrong"})
+        untouched = list(fake.received)
+        # The upstream stops taking the vault's key: its 401 names its own metadata.
+        fake.key = "fake-key-p20-refused"
+        opened = post(running)
+        session = {"mcp-session-id": opened.headers["mcp-session-id"]}
+        session["mcp-protocol-version"] = "2025-11-25"
+        listing = post(
+            running, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers=session
+        )
     assert {key: a.status_code for key, a in answers.items() if a.status_code != 404} == {}
     for answer in answers.values():
         assert "www-authenticate" not in answer.headers
     assert unauthenticated.headers["www-authenticate"] == 'Bearer realm="zoeymcp"'
-    assert fake.received == []
+    assert untouched == []
+    assert 401 in [item.status for item in fake.received if item.method == "POST"]
+    agent_side = [*answers.values(), unauthenticated, wrong, opened, listing]
+    challenges = {value for a in agent_side for value in a.headers.get_list("www-authenticate")}
+    assert challenges == {'Bearer realm="zoeymcp"'}
+    for answer in agent_side:
+        assert "resource_metadata" not in answer.text + repr(answer.headers.multi_items())
+        assert "auth.notes.example" not in answer.text + repr(answer.headers.multi_items())
 
 
 # --- G5: servers and sessions -------------------------------------------------------------------

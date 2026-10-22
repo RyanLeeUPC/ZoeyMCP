@@ -1,0 +1,57 @@
+# S9: a remote MCP server with OAuth, onboarded by its URL (design §8.1, M7).
+#
+# This is fragment 1 as `zoeymcp login --mcp https://mcp.notes.example/mcp --name notes` writes
+# it for a server that publishes its protected-resource metadata (RFC 9728) and whose
+# authorization server registers clients (RFC 7591): the endpoints, the issuer and the scopes
+# come from the server, and the vault registered a public client, whose ID the provider chose.
+# Don't copy it by hand: run that command for your server (docs/operations.md §11, "Onboarding
+# by URL"), or add the server by URL on the portal's MCP servers page. It shows what you will
+# commit.
+#
+#   1. Commit fragment 1 and reload (check --with proves the merge first).
+#   2. Run the same login --mcp again: it compares the server with this, signs in (PKCE, the
+#      resource parameter, rotating refresh tokens) and queues the server's review.
+#   3. Choose the tools with the choices file it names, commit fragment 2 and reload; then add
+#      notes to the servers list of each client that should have it.
+#
+# The gateway is the route's only caller. The vault holds the grant and adds the access token
+# on the way out; neither token ever reaches an agent.
+
+# zoeymcp: onboarding notes (1 of 2). Merge into your policy; nothing here replaces a key you have.
+credentials:
+  "notes":
+    kind: "oauth2"
+    token_url: "https://auth.notes.example/token"
+    authorize_url: "https://auth.notes.example/authorize"
+    issuer: "https://auth.notes.example"
+    require_iss: true
+    revocation_url: "https://auth.notes.example/revoke"
+    resource_metadata: "https://mcp.notes.example/.well-known/oauth-protected-resource/mcp"
+    client_id: "example-registered-client" # the ID the provider gave the vault's registration
+    client_auth: "none"
+    refresh_token: "store:notes-refresh"
+    rotates: true
+    redirect_uri: "http://127.0.0.1/callback/notes"
+    scope: "notes.read notes.write offline_access"
+    extra_params:
+      "resource": "https://mcp.notes.example/mcp"
+    authorize_params:
+      "resource": "https://mcp.notes.example/mcp"
+routes:
+  - name: "notes"
+    prefix: "/notes"
+    upstream: "https://mcp.notes.example"
+    credential: "notes"
+    callers: ["gateway"]
+    stream: true
+    rules:
+      - methods: ["POST", "GET", "DELETE"]
+        paths: ["/mcp"]
+gateway:
+  servers:
+    "notes":
+      kind: "remote"
+      route: "notes"
+      path: "/mcp"
+      tools:
+        include: []

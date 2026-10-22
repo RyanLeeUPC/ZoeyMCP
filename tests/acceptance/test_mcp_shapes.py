@@ -42,7 +42,8 @@ from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import upstream as upstream_module
 
 from .conftest import serve_tls
-from .gateway import CLIENTS, SERVER, GatewayDeployment, Seen
+from .gateway import CLIENTS, SERVER, GatewayDeployment
+from .helpers import Seen
 from .tls import ProviderCA
 
 pytestmark = pytest.mark.anyio

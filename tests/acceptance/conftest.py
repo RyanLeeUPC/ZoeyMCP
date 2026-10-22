@@ -394,12 +394,3 @@ class Deployment:
             self.admin_url = None
             if not thread.is_alive():
                 loop.close()
-
-
-def wait_until(condition: Callable[[], bool], timeout: float = 10.0) -> None:
-    """Poll ``condition`` from the test thread until it holds."""
-    deadline = time.monotonic() + timeout
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError("condition not met in time")
-        time.sleep(0.01)

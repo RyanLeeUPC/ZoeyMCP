@@ -34,6 +34,9 @@ jobs:
   test:
     name: tests (Python ${{ matrix.python }})
     runs-on: ubuntu-24.04
+    # The acceptance tests run here too, S9's walks among them; a hung one ends the job (register
+    # D-170).
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

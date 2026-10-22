@@ -47,7 +47,8 @@ from zoeymcp.vault.oauth.protocol import MIN_401_AGE, Envelope, parse_envelope
 from zoeymcp.vault.server import reload_policy
 from zoeymcp.vault.store import STORE_FILE, Secret, SecretStore
 
-from .conftest import BASE, PROFILES, Clock, Deployment, serve_tls, wait_until
+from .conftest import BASE, PROFILES, Clock, Deployment, serve_tls
+from .helpers import wait_until
 from .tls import ProviderCA
 
 GOOGLE = "google-oauth.yaml"

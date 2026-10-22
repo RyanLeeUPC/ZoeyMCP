@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -34,18 +33,12 @@ from zoeymcp.gateway.ledger import LEDGER_DIR, ROTATE_BYTES, Ledger
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.reportstore import REPORTED_DIR
 
+from .helpers import wait_until
 from .procs import Process, free_port, start, wait_port
 from .test_portal_shapes import log_events, portal, setup_code, sign_in
 
 RECORDS = 10_002  # 3,334 calls, each asked, decided and closed
 WAIT = 90.0
-
-
-def wait_until(condition: Callable[[], bool], what: str, timeout: float = WAIT) -> None:
-    deadline = time.monotonic() + timeout
-    while not condition():
-        assert time.monotonic() < deadline, what
-        time.sleep(0.05)
 
 
 def first_visit(page: Page, passkey: SoftAuthenticator, state: Path, env: dict[str, str]) -> str:
@@ -263,7 +256,7 @@ def test_a_kill_mid_report_is_repaired_and_the_copy_completes(tmp_path: Path) ->
         ]  # fmt: skip
         gateway_env = {"ZOEYMCP_GATEWAY_KEY": keys.gateway_key(1)}
         gateway = start(gateway_argv, env=gateway_env, log=tmp_path / "gateway.log")
-        wait_until(lambda: bool(copied(vault_state)), "the first report")
+        wait_until(lambda: bool(copied(vault_state)), "the first report", WAIT)
         vault.kill()
         held = copied(vault_state)
         assert len(held) < RECORDS, "the stream finished before the kill"
@@ -272,7 +265,9 @@ def test_a_kill_mid_report_is_repaired_and_the_copy_completes(tmp_path: Path) ->
         newest.write_bytes(newest.read_bytes() + torn)
         vault = start(argv, env=env, log=log)
         wait_port(port, vault)
-        wait_until(lambda: copy_head(port, keys) == RECORDS - 1, "the copy's head at the gateway's")
+        wait_until(
+            lambda: copy_head(port, keys) == RECORDS - 1, "the copy's head at the gateway's", WAIT
+        )
     finally:
         if gateway is not None:
             gateway.stop()

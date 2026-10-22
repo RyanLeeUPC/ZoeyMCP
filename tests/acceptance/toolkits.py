@@ -50,7 +50,8 @@ from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import BASE, PROFILES, _Server, _wait_started, serve_tls, tls_client
-from .gateway import GatewayAdminTransport, Seen, wait_healthy
+from .gateway import GatewayAdminTransport, wait_healthy
+from .helpers import Seen
 from .tls import ProviderCA
 
 AGENT = "agent1"
