@@ -39,6 +39,7 @@ label {
 }
 
 input,
+select,
 textarea {
   width: 100%;
   max-width: 24rem;
@@ -83,7 +84,8 @@ code {
 #session-list li,
 #passkey-list li,
 #secret-list li,
-#ledger li {
+#ledger li,
+#servers li {
   margin-bottom: 0.5rem;
   overflow-wrap: anywhere;
 }
@@ -114,4 +116,57 @@ dt {
 dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+/* The MCP servers section (M7 K.1). A box and its words on one line; a step's hosts and Squid
+   lines, and the server's instructions, on lines of their own. */
+label.check,
+label.include {
+  display: inline-block;
+  margin: 0.5rem 1rem 0.5rem 0;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  margin: 0 0.25rem 0 0;
+}
+
+.steps li,
+#refusal-next li,
+.said,
+.description {
+  white-space: pre-line;
+}
+
+/* The authorization server's host, in large type (RFC 9728 7.8). */
+.issuer {
+  font-size: 1.5rem;
+  font-weight: bold;
+}
+
+.badge {
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+  padding: 0 0.25rem;
+  margin-left: 0.5rem;
+}
+
+#review-tools {
+  list-style: none;
+  padding: 0;
+}
+
+#review-tools > li {
+  border-top: 1px solid GrayText;
+  padding-top: 0.5rem;
+}
+
+/* A definition line's continuation chunks under it, marked; the text is the vault's, uncut. */
+.definition span {
+  display: block;
+}
+
+.definition span.more {
+  padding-left: 1ch;
+  border-left: 0.25rem solid GrayText;
 }

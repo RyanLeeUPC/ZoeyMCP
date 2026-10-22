@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/app.css">
 <script src="/webauthn.js" defer></script>
 <script src="/app.js" defer></script>
+<script src="/review.js" defer></script>
 </head>
 <body>
 <header id="bar" hidden>
@@ -17,6 +18,7 @@
 <nav id="nav">
 <button type="button" id="nav-home">Home</button>
 <button type="button" id="nav-credentials">Credentials</button>
+<button type="button" id="nav-servers">MCP servers</button>
 <button type="button" id="nav-sessions">Sessions</button>
 <button type="button" id="nav-passkeys">Passkeys</button>
 <button type="button" id="nav-secrets">Secrets</button>
@@ -84,6 +86,105 @@ itself); the vault stores the grant after you confirm with your passkey. Nothing
 secret or a token.</p>
 <ul id="credential-list"></ul>
 <p>This deployment's policy is declarative: the portal can't change it.</p>
+</section>
+
+<section id="servers" hidden>
+<h2>MCP servers</h2>
+<p>Every remote and toolkit server in the policy, and the one you are adding, each with its state
+and what to do next. The vault discovers a server by its URL, registers its client after you
+confirm with your passkey, and makes the YAML; review then shows the server's tools for you to
+choose. Nothing here changes the policy: you commit each fragment and reload.</p>
+<ul id="server-list"></ul>
+<ul id="refusal-next"></ul>
+<ul id="refusal-check"></ul>
+<h3>Add a server by URL</h3>
+<label for="add-url">The server's MCP URL</label>
+<input id="add-url" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+<details id="add-more">
+<summary>More options</summary>
+<label for="add-credential">Credential name (empty: from the server's host name)</label>
+<input id="add-credential" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+<label for="add-route">Route name</label>
+<input id="add-route" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+<label for="add-server">Server name</label>
+<input id="add-server" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+<label for="add-client-id">Client ID, for a client registered at the provider already</label>
+<input id="add-client-id" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="512">
+<label for="add-client-auth">Its client authentication (basic or post takes the secret below)</label>
+<select id="add-client-auth">
+<option value="">not given</option>
+<option value="none">none (a public client)</option>
+<option value="basic">basic</option>
+<option value="post">post</option>
+</select>
+<label for="add-client-secret">Its client secret (cleared from this page once sent, whatever the answer)</label>
+<textarea id="add-client-secret" class="masked" rows="2" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="512" data-1p-ignore data-lpignore="true" data-bwignore></textarea>
+<label for="add-redirect">Its redirect address</label>
+<input id="add-redirect" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+<label for="add-client-name">Client name for the provider's list of apps</label>
+<input id="add-client-name" type="text" autocomplete="off" maxlength="64">
+<label for="add-issuer">Issuer (required with a client secret)</label>
+<input id="add-issuer" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+<label for="add-scope">Scopes, separated by spaces (empty: what the server asks for)</label>
+<input id="add-scope" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+</details>
+<label class="check"><input id="add-private" type="checkbox"> This server is on my network
+(the discovery then asks for your passkey: it lets the vault reach that address)</label>
+<button type="button" id="add-discover">Discover</button>
+
+<div id="plan" hidden>
+<h3 id="plan-title"></h3>
+<p id="plan-issuer" class="issuer"></p>
+<p id="plan-blocked"></p>
+<dl id="plan-rows"></dl>
+<p id="plan-allowance"></p>
+<ul id="plan-check"></ul>
+<ul id="plan-next" class="steps"></ul>
+<button type="button" id="plan-cancel">Cancel this onboarding</button>
+</div>
+
+<div id="review" hidden>
+<h3 id="review-title"></h3>
+<p id="review-state" role="status"></p>
+<div id="review-body" hidden>
+<p id="review-info"></p>
+<p id="review-instructions" class="said"></p>
+<p id="review-notes"></p>
+<p id="review-counts"></p>
+<p>Nothing is included until you include it. A suggestion is the server's own annotation, not a
+judgement by ZoeyMCP: allow lets agents call the tool with no prompt, approve asks you first.</p>
+<div id="review-filters">
+<label class="check"><input id="review-chip-read-only" type="checkbox"> Suggested read-only</label>
+<label class="check"><input id="review-chip-unannotated" type="checkbox"> Not annotated</label>
+<label class="check"><input id="review-chip-findings" type="checkbox"> With findings</label>
+<label for="review-filter">Filter by name or title</label>
+<input id="review-filter" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+</div>
+<button type="button" id="review-suggested">Select suggested</button>
+<button type="button" id="review-clear">Clear</button>
+<ul id="review-tools"></ul>
+<button type="button" id="review-generate">Generate</button>
+</div>
+</div>
+
+<div id="fragment" hidden>
+<h3 id="fragment-title"></h3>
+<dl id="fragment-summary"></dl>
+<label for="fragment-indent">Indent</label>
+<select id="fragment-indent">
+<option value="0">plain, for a policy file</option>
+<option value="2">indented 2 spaces</option>
+<option value="4">indented 4 spaces</option>
+<option value="8">indented 8 spaces</option>
+<option value="compose">the compose form, under ZOEYMCP_CONFIG</option>
+</select>
+<button type="button" id="fragment-copy">Copy</button>
+<pre id="fragment-text"></pre>
+<ul id="fragment-check"></ul>
+<p>Then, in order.</p>
+<p id="fragment-carries">After fragment 1's commit and reload, this section carries on by itself.</p>
+<ul id="fragment-next" class="steps"></ul>
+</div>
 </section>
 
 <section id="sessions" hidden>

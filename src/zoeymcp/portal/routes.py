@@ -48,6 +48,8 @@ STATIC: Final[Mapping[str, StaticFile]] = MappingProxyType(
         "/": StaticFile("index.html", HTML),
         "/app.js": StaticFile("app.js", JAVASCRIPT),
         "/webauthn.js": StaticFile("webauthn.js", JAVASCRIPT),
+        # M7 step 14b: the MCP servers section's script (M7 K.4), with a line cap of its own.
+        "/review.js": StaticFile("review.js", JAVASCRIPT),
         "/app.css": StaticFile("app.css", CSS),
         # Step 14b: where the callback sends the tab (C.7). No script, no text from the query.
         "/callback/received": StaticFile("callback-received.html", HTML),

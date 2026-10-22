@@ -38,6 +38,7 @@ from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import Browser, Page, asgi_client, loopback
 from tests.fakes.oauth_server import FakeAuthServer
 from tests.unit import onboard_model
+from tests.unit.test_portal_static import reads
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault import app as vault_app
@@ -275,6 +276,39 @@ def test_j2_a_client_the_vault_registers_to_connect(world: World) -> None:
     assert connected.status_code == 200, connected.text
     [row] = world.servers()
     assert (row["state"], row["next"][0]["do"], row["tools"]) == ("needs_review", "review", 0)
+
+
+def test_the_page_reads_what_the_vault_sends(world: World) -> None:
+    """K.4's drift check of review.js against J2's answers: every field it reads of a row, a
+    plan, its names, fragment 1 and a check finding is one the portal sends. A blocked
+    onboarding's answer (D.11, vault/onboard.py's ``_stood``) adds ``blocked_on`` and
+    ``server_url`` beside its names."""
+    plan = discovered(world, url=SERVER_URL)
+    onboarding = plan["onboarding"]
+    [discovered_row] = world.servers()
+    made = step_up(world.page, world.passkey, "onboard.register", {"onboarding": onboarding})
+    assert made.status_code == 200, made.text
+    registered = made.json()
+    again = world.page.fetch("POST", f"/api/onboard/{onboarding}/fragment", json={})
+    assert again.status_code == 200, again.text
+    [registered_row] = world.servers()
+    world.commit(registered["diff"]["yaml"])
+    [server_row] = world.servers()
+    rows = {*discovered_row, *registered_row, *server_row}
+    assert reads("rowText", "row") | reads("listServers", "row") <= rows
+    assert reads("showOnboarding", "answer") <= {*plan, "blocked_on", "server_url"}
+    assert reads("showOnboarding", "plan") <= set(plan["plan"])
+    assert reads("fillNames", "names") <= set(plan["names"])
+    assert reads("showFragment", "answer") <= set(registered)
+    assert {"diff", "next"} <= set(again.json())
+    shown = {"level", "path", "message_shown"}
+    assert reads("renderChecks", "finding") <= shown
+    for found in [
+        *plan["draft_check"],
+        *registered["diff"]["check"],
+        *again.json()["diff"]["check"],
+    ]:
+        assert set(found) == shown
 
 
 def test_the_register_plan_refuses_before_the_passkey(world: World) -> None:

@@ -13,24 +13,33 @@ check that silently matched nothing would fail here.
 from __future__ import annotations
 
 import re
+import typing
 from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
 
-from zoeymcp.portal import routes as api
+from tests.unit.test_review_choices import large
+from tests.unit.test_reviewview import held
+from zoeymcp.common.policy.emit import INDENT_MAX
+from zoeymcp.portal import app as portal_app
+from zoeymcp.portal import reviewview
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
-from zoeymcp.portal.routes import ROUTES, STATIC
+from zoeymcp.portal.routes import JAVASCRIPT, ROUTES, STATIC
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
+from zoeymcp.vault import onboarding
+from zoeymcp.vault.oauth import dcr
 
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
-SCRIPTS = ("app.js", "webauthn.js")
-MAX_ASSETS = 96 * 1024
-# K.2 set 1,000 lines for app.js and webauthn.js together. Step 15's Ledger and Policy pages took
-# them past it (998 before, 1,041 after) although every line they show is made by the server and
-# the existing pages were folded onto one helper, so the cap moved by 50 lines rather than squeeze
-# the script further.
-MAX_SCRIPT_LINES = 1050
+# Every script the map serves (M7 K.4), so a new one can't escape a check below.
+SCRIPTS = tuple(file.name for file in STATIC.values() if file.content_type == JAVASCRIPT)
+MAX_ASSETS = 128 * 1024
+# Line caps, per file (M7 K.4); a script with no cap fails. K.2 set 1,000 lines for app.js and
+# webauthn.js together. Step 15's Ledger and Policy pages took them past it (998 before, 1,041
+# after) although every line they show is made by the server and the existing pages were folded
+# onto one helper, so the cap moved by 50 lines rather than squeeze the script further. M7 keeps
+# it, and gives review.js, the MCP servers section, its own.
+LINE_CAPS = {("app.js", "webauthn.js"): 1050, ("review.js",): 700}
 
 LT, GT, QUOTE = chr(0x3C), chr(0x3E), chr(0x22)
 FORBIDDEN_TAGS = frozenset({"style", "form", "iframe", "base", "object", "embed", "frame"})
@@ -73,6 +82,23 @@ def code_of(script: str) -> str:
     The page's scripts put no // or /* inside a string."""
     without_blocks = re.sub(r"/\*.*?\*/", "", script, flags=re.DOTALL)
     return re.sub(r"(?m)^\s*//.*$|\s//\s.*$", "", without_blocks)
+
+
+def keys(constant: str) -> set[str]:
+    """The keys of review.js's object ``constant``, one per line."""
+    code = code_of(read("review.js"))
+    block = code[code.index(f"const {constant} = {{") :]
+    return set(re.findall(r"^\s+([a-z_]+):", block[: block.index("};")], flags=re.M))
+
+
+def reads(function: str, name: str) -> set[str]:
+    """The fields review.js's ``function`` reads of ``name`` (``name.field``): the drift checks
+    against what the vault sends, here and in tests/portal (M7 K.4)."""
+    code = code_of(read("review.js"))
+    start = code.index(f"function {function}(")
+    found = set(re.findall(rf"\b{name}\.([a-z_]+)", code[start : code.index("\n  }\n", start)]))
+    assert found, (function, name)
+    return found
 
 
 # --- index.html ---------------------------------------------------------------------------------
@@ -146,8 +172,8 @@ def test_the_html_checker_catches_what_it_is_for() -> None:
 def test_index_html() -> None:
     page = parsed(read("index.html"))
     assert page.problems == []
-    # Every asset it loads is in the static map, and it loads both scripts and the stylesheet.
-    assert sorted(page.assets) == ["/app.css", "/app.js", "/webauthn.js"]
+    # Every asset it loads is in the static map, and it loads every script and the stylesheet.
+    assert sorted(page.assets) == ["/app.css", "/app.js", "/review.js", "/webauthn.js"]
     assert set(page.assets) <= set(STATIC)
 
 
@@ -174,12 +200,14 @@ def test_the_refused_page_says_what_the_catalogue_says() -> None:
     assert text not in read("callback-received.html")
 
 
-def test_every_element_the_script_names_exists() -> None:
+@pytest.mark.parametrize("name", ["app.js", "review.js"])
+def test_every_element_the_script_names_exists(name: str) -> None:
     ids = parsed(read("index.html")).ids
-    named = set(re.findall(r"\$\(\"([a-z-]+)\"\)", read("app.js")))
-    named |= set(re.findall(r"renderSummary\(\"([a-z-]+)\"", read("app.js")))
-    named |= set(re.findall(r"on\(\"([a-z-]+)\"", read("app.js")))
-    for listed in re.findall(r"PAGES = \[([^\]]*)\]|SETUP_STEPS = \[([^\]]*)\]", read("app.js")):
+    script = read(name)
+    named = set(re.findall(r"\$\(\"([a-z-]+)\"\)", script))
+    named |= set(re.findall(r"renderSummary\(\"([a-z-]+)\"", script))
+    named |= set(re.findall(r"on\(\"([a-z-]+)\"", script))
+    for listed in re.findall(r"PAGES = \[([^\]]*)\]|SETUP_STEPS = \[([^\]]*)\]", script):
         named |= set(re.findall(r"\"([a-z-]+)\"", "".join(listed)))
     assert named
     assert named <= ids, sorted(named - ids)
@@ -233,13 +261,24 @@ def test_no_sink_and_no_absolute_url(name: str) -> None:
 
 
 def test_the_scripts_are_small_strict_and_hand_written() -> None:
-    lines = sum(len(read(name).splitlines()) for name in SCRIPTS)
-    assert lines < MAX_SCRIPT_LINES
+    capped = [name for group in LINE_CAPS for name in group]
+    assert sorted(capped) == sorted(SCRIPTS)  # every script has one cap, and only scripts do
+    for group, cap in LINE_CAPS.items():
+        lines = sum(len(read(name).splitlines()) for name in group)
+        assert lines < cap, group
     total = sum((STATIC_DIR / file.name).stat().st_size for file in STATIC.values())
     assert total <= MAX_ASSETS
     for name in SCRIPTS:
         assert '"use strict";' in read(name)
         assert "import " not in code_of(read(name))  # no module, no dependency
+
+
+def test_the_scripts_are_derived_from_the_static_map() -> None:
+    """M7 K.4: SCRIPTS is every text/javascript file the map serves, and index.html loads each
+    of them, review.js after the app.js whose helpers it uses."""
+    assert SCRIPTS == ("app.js", "webauthn.js", "review.js")
+    order = re.findall(r'<script src="/([a-z]+\.js)" defer></script>', read("index.html"))
+    assert order == ["webauthn.js", "app.js", "review.js"]
 
 
 def test_every_button_runs_its_handler_once_at_a_time() -> None:
@@ -370,18 +409,21 @@ def test_session_storage_holds_one_key() -> None:
         if method != "clear":
             assert argument.split(",")[0].strip() == "TOKEN"
     assert 'const TOKEN = "session";' in read("app.js")
-    assert "sessionStorage" not in read("webauthn.js")
+    for name in SCRIPTS:
+        assert name == "app.js" or "sessionStorage" not in read(name), name
 
 
 def test_every_fetch_is_same_origin_with_no_redirect_and_no_cache() -> None:
-    """C.4: one fetch() in the page, with these options, and the session's header half."""
+    """C.4: one fetch() in the page, with these options, and the session's header half; the
+    other scripts call the API through it (review.js through window.zoeyPortal, M7 K.4)."""
     code = code_of(read("app.js"))
     assert code.count("fetch(") == 1
     for option in ('credentials: "same-origin"', 'redirect: "error"', 'cache: "no-store"'):
         assert option in code
     assert 'const HEADER = "X-ZoeyMCP-Session";' in code
     assert "headers[HEADER] = saved" in code
-    assert "fetch(" not in code_of(read("webauthn.js"))
+    for name in SCRIPTS:
+        assert name == "app.js" or "fetch(" not in code_of(read(name)), name
 
 
 def test_the_prompts_and_the_load_checks() -> None:
@@ -389,6 +431,7 @@ def test_the_prompts_and_the_load_checks() -> None:
     app = code_of(read("app.js"))
     webauthn = code_of(read("webauthn.js"))
     assert "navigator.credentials" not in app
+    assert "navigator.credentials" not in code_of(read("review.js"))
     assert webauthn.count("navigator.credentials.create(") == 1
     assert webauthn.count("navigator.credentials.get(") == 1
     order = [
@@ -405,33 +448,19 @@ def test_the_prompts_and_the_load_checks() -> None:
 # --- drift against the server (K.4) -------------------------------------------------------------
 
 
-# M7 K.2's routes, built in step 14a: the page's review.js names them from step 14b (K.4).
-REVIEW_SCRIPT = {
-    (route.method, route.path)
-    for route in (
-        api.SERVERS,
-        api.ONBOARD_DISCOVER,
-        api.ONBOARD,
-        api.ONBOARD_FRAGMENT,
-        api.ONBOARD_CANCEL,
-        api.REVIEW,
-        api.REVIEW_JOB,
-        api.REVIEW_DIFF,
-    )
-}
-
-
 def test_every_api_path_the_script_names_is_a_route_and_every_route_is_named() -> None:
-    code = code_of(read("app.js"))
-    named = set(API_CALL.findall(code))
-    # Every /api/ string is in a call this pattern sees, so none hides from the check.
-    assert len(API_PATH.findall(code)) == len(API_CALL.findall(code))
-    assert named == {(route.method, route.path) for route in ROUTES} - REVIEW_SCRIPT
-    assert {(route.method, route.path) for route in ROUTES} >= REVIEW_SCRIPT
+    """Across the scripts, M7 K.2's routes included (review.js names them)."""
+    named: set[tuple[str, str]] = set()
+    for name in SCRIPTS:
+        code = code_of(read(name))
+        named |= set(API_CALL.findall(code))
+        # Every /api/ string is in a call this pattern sees, so none hides from the check.
+        assert len(API_PATH.findall(code)) == len(API_CALL.findall(code)), name
+    assert named == {(route.method, route.path) for route in ROUTES}
 
 
 def test_every_reason_the_script_handles_is_catalogued() -> None:
-    handled = set(HANDLED.findall(code_of(read("app.js"))))
+    handled = {reason for name in SCRIPTS for reason in HANDLED.findall(code_of(read(name)))}
     assert handled
     assert handled <= reasons()
     for entry in CATALOGUE.values():
@@ -466,3 +495,134 @@ def test_the_browsers_own_refusals_are_worded_in_the_page() -> None:
     assert {"no_webauthn", "no_get_public_key"} <= set(
         re.findall(r"\"(no_[a-z_]+)\"", read("webauthn.js"))
     )
+
+
+# --- the MCP servers section (M7 K.1, K.4, K.5, M.7) ---------------------------------------------
+
+
+def test_review_js_clicks_go_through_app_js_guard() -> None:
+    """Every click in review.js goes through app.js's guard(): its buttons are button() and on(),
+    shared through window.zoeyPortal, and its own listeners are for changes and typing only."""
+    code = code_of(read("review.js"))
+    assert 'addEventListener("click"' not in code
+    assert set(re.findall(r"addEventListener\(\"(\w+)\"", code)) == {"change", "input"}
+    assert "function button(" not in code
+    assert "function guard(" not in code
+    app = code_of(read("app.js"))
+    shared = re.search(r"window\.zoeyPortal = Object\.freeze\(\{([^}]*)\}\);", app)
+    assert shared
+    exported = {word.strip() for word in shared.group(1).split(",")}
+    taken = re.search(r"const \{([^}]*)\} = window\.zoeyPortal;", code)
+    assert taken
+    assert {word.strip() for word in taken.group(1).split(",")} == exported
+    for helper in exported:
+        assert re.search(rf"function {helper}\(|const {helper} = \(", app), helper
+    # The one call app.js makes into review.js: a server row's Connect, once it completes.
+    assert re.findall(r"window\.zoeyReview\.(\w+)\(", app) == ["connected"]
+    assert "window.zoeyReview = Object.freeze({ connected: connected });" in code
+
+
+def test_a_client_secret_is_write_only_in_the_page() -> None:
+    """K.1, G: the client secret of Add by URL is the Secrets page's kind of field, a masked text
+    area no password manager keys on. It is read once, into onboard.register's prepare, and
+    emptied as soon as that request is made; leaving the section empties it too."""
+    parser = Inputs()
+    parser.feed(read("index.html"))
+    secret = parser.inputs["add-client-secret"]
+    assert (secret["tag"], secret["autocomplete"]) == ("textarea", "off")
+    assert "type" not in secret
+    assert "name" not in secret
+    for hint in ("data-1p-ignore", "data-lpignore", "data-bwignore"):
+        assert hint in secret, hint
+    assert "masked" in str(secret["class"]).split()
+    field = '$("add-client-secret").value'
+    code = code_of(read("review.js"))
+    assert code.count(field) == 2
+    start = code.index("async function prepareRegister(boarding) {")
+    body = code[start : code.index("\n  }\n", start)]
+    sent = body.index('prepare(\n      "onboard.register",')
+    assert sent < body.index(f"client_secret: {field}") < body.index(f'{field} = "";')
+    assert body.index(f'{field} = "";') < body.index("await sent;")
+    app = code_of(read("app.js"))
+    assert re.search(r'if \(page !== "servers"\) \{\s*\$\("add-client-secret"\)\.value = "";', app)
+    assert app.count(field) == 1
+
+
+def test_copy_puts_on_the_clipboard_the_text_shown() -> None:
+    """K.4, 14b's acceptance: a fragment's shown text and the copied string are one value, the
+    vault's YAML as it came, so a 2,048-character URL shows and copies the same."""
+    code = code_of(read("review.js"))
+    assert code.count("fragment = { yaml: answer.diff.yaml, again: again };") == 1
+    assert re.findall(r'\$\("fragment-text"\)\.textContent = (.*);', code) == ["fragment.yaml"]
+    assert re.findall(r"navigator\.clipboard\.writeText\((.*)\)", code) == ["fragment.yaml"]
+    assert "yaml =" not in code
+
+
+def test_the_page_words_every_row_state_and_where_every_command_runs() -> None:
+    """K.1's row states are the vault's (vault/onboarding.py's and the portal's own onboarding
+    rows'); M.7's next steps show every via, and the piped and redirect keys of J1's commands."""
+    code = code_of(read("review.js"))
+    # A server's states, and an onboarding's: each stage as the portal's row names it.
+    stages = typing.get_args(onboarding.Stage)
+    states = {portal_app.ROW_STATES.get(stage, stage) for stage in stages}
+    assert keys("STATES") == set(typing.get_args(onboarding.RowState)) | states
+    assert keys("VIA") == set(typing.get_args(onboarding.Via))
+    assert "step.piped" in code
+    assert '(step.redirect || "")' in code
+    # The steps the page has a button for: M.7's, and the portal's own show_fragment.
+    taken = keys("runs")
+    assert taken <= set(typing.get_args(onboarding.Do)) | {portal_app.SHOW_FRAGMENT["do"]}
+    assert portal_app.SHOW_FRAGMENT["do"] in taken
+    assert {"register", "make_fragment", "connect", "review", "allow_hosts"} <= taken
+
+
+def test_the_not_annotated_chip_is_the_vaults_reason() -> None:
+    """K.1's "not annotated" chip keeps the tools whose suggestion the vault gave as unannotated
+    (F.6): the page compares the reason, so its text is reviewview's."""
+    code = code_of(read("review.js"))
+    assert f'const UNANNOTATED = "{reviewview.WHY_UNANNOTATED}";' in code
+
+
+def test_a_registrations_notes_are_worded() -> None:
+    """Step 11's notes on a registration's answer (``grant_types_absent``): one wording each."""
+    assert keys("CLIENT_NOTES") == set(dcr.NOTES)
+    assert "CLIENT_NOTES[note] || note" in code_of(read("review.js"))
+
+
+def test_a_fragment_at_any_indent_the_routes_take() -> None:
+    """K.1, OPS-2: a fragment again at an indent the fragment and diff routes take (0 to 16, or
+    the compose form); fragment 1's last line shows under fragment 1 only."""
+    page = read("index.html")
+    select = page[page.index('<select id="fragment-indent">') :]
+    values = re.findall(r'<option value="([a-z0-9]+)">', select[: select.index("</select>")])
+    assert (values[0], values[-1]) == ("0", "compose")
+    assert len(values) > 2
+    assert {int(value) for value in values[:-1]} <= set(range(INDENT_MAX + 1))
+    code = code_of(read("review.js"))
+    assert 'value === "compose" ? "compose" : Number(value)' in code
+    assert '$("fragment-carries").hidden = title !== FIRST;' in code
+
+
+def test_the_review_screen_reads_what_the_vault_sends() -> None:
+    """J4 against F.6's rows for the large fake's 96 tools: every field review.js reads of the
+    answer, its counts and a tool row is one the vault sends, and the chips keep the tools the
+    counts count (64 suggested read-only, 32 not annotated, 4 with a warning; the one with an
+    error finding is counted apart)."""
+    view = reviewview.rows(held(large()))
+    code = code_of(read("review.js"))
+    assert set(re.findall(r"\btool\.([a-z_]+)", code)) <= {*view["tools"][0], "consequential"}
+    assert set(re.findall(r"\bcounts\.([a-z_]+)", code)) == set(view["counts"])
+    assert reads("renderReview", "answer") <= set(view)
+    tools = view["tools"]
+    found = {key for tool in tools for finding in tool["findings"] for key in finding}
+    assert reads("toolEntry", "finding") <= found == {"level", "message_shown"}
+    assert '(tool) => tool.suggested === "allow"]' in code
+    assert sum(tool["suggested"] == "allow" for tool in tools) == view["counts"]["read_only"]
+    assert "(tool) => tool.suggested_why === UNANNOTATED]" in code
+    unannotated = [tool for tool in tools if tool["suggested_why"] == reviewview.WHY_UNANNOTATED]
+    assert len(unannotated) == view["counts"]["not_annotated"]
+    assert '(tool) => tool.findings.some((found) => found.level === "warning")]' in code
+    warned = [tool for tool in tools if any(f["level"] == "warning" for f in tool["findings"])]
+    assert len(warned) == view["counts"]["with_findings"]
+    errors = [tool for tool in tools if any(f["level"] == "error" for f in tool["findings"])]
+    assert len(errors) == view["counts"]["with_errors"] == 1

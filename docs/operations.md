@@ -1706,6 +1706,81 @@ the verifier the vault keeps. Logs: `oauth_login_started`, `oauth_login_complete
 `oauth.complete` or `oauth.reset`, and `oauth_cache_reset`; never a pasted address, a flow ID or
 a provider's description.
 
+**MCP servers.** The MCP servers page is §11's onboarding by URL and review, in the browser (M7).
+It lists every remote and toolkit server in the policy (a toolkit says so; a bridge is a remote
+server), and the server you are adding, each with its state and one button for what comes next;
+the steps after it are written out, each command as you run it in the vault's container (put your
+compose command in front, `docker compose -f deploy/compose.hardened.yaml exec vault` or
+`docker compose -f deploy/compose.yaml exec zoeymcp`). The states:
+
+- `needs_register`: discovered, nothing sent or stored yet. **Register and make the YAML** (the
+  vault registers a client), **Store the secret and make the YAML** (a client you registered,
+  with its secret) or **Make the YAML** (a public client you registered).
+- `needs_commit`: fragment 1 is made but the running policy doesn't name its credential yet.
+  **Show fragment 1** makes it again, at any indent, until the commit or for 30 minutes.
+- `needs_connect`: in the policy, with no refresh token yet. **Connect** opens the Credentials
+  page's dialog (§2); once it completes, the page queues the server's review by itself.
+- `needs_review`: connected, and the policy includes none of its tools. **Review tools**.
+- `reviewed`: **Review again**; the tools it serves and the clients it is assigned to; for a
+  server whose credential names its resource, as onboarding by URL writes it, **Register a new
+  client** is `zoeymcp login --mcp URL --reregister` (§11), which the portal doesn't run.
+- `blocked`: your own egress proxy refused the vault (§28). **Show the hosts to allow** lists
+  them with the Squid lines; allow them, then **Try again**: it puts the onboarding's own URL and
+  names back in the form and discovers again (with the form's other options), so the onboarding
+  carries on where it stopped.
+
+**Add a server by URL** takes the URL; **More options** holds the names (empty, the vault picks
+free ones from the server's host name and fills them in; typing another URL empties them), a
+client ID you registered with its
+client authentication, secret and redirect address, a client name, an issuer (required with a
+secret) and scopes. The secret field is write-only, as on the Secrets page: it is sent once, when
+you prepare the registration, and the page empties it then and when you leave the page. **This
+server is on my network** lets the vault reach a private address for this server alone, so the
+discovery itself asks for your passkey first. **Discover** shows what the vault found: every row
+of the plan, the authorization server's host in large type (compare it with the provider you
+expect), the hosts the built-in egress role allows for it, `check`'s findings with the server
+merged, and the button worded for the case. Registering a client or storing a secret asks for
+your passkey, showing first the issuer's host, where the client is registered, the redirect
+address and the name and binding a secret is stored under; a public client you registered needs
+no passkey, since nothing is sent or stored. Fragment 1 then shows with what was stored (for a
+client the vault registered, when its secret expires and any note on its answer), **Copy**
+(the exact text shown), the indent (plain, indented 2, 4 or 8 spaces, or the compose form for
+`ZOEYMCP_CONFIG`) and the steps that apply it:
+`check --with` for your policy's source, the merge, `check` of the edited policy, the commit and
+the reload. The page reads the rows again while a server waits on its commit, so it moves on by
+itself once the vault sees the commit; after a recreate, sign in and it is there. A server that
+names several authorization servers asks you to choose one (a button for each). **Cancel** drops
+an onboarding in progress; signing out drops it too.
+
+**The review screen.** **Review tools** (or **Review again**) queues a review for the gateway's
+poll (§11, "The review job path") and shows it once the gateway reports: the server's own name
+and instructions, the counts ("96 tools: 64 the server marks read-only, 32 not annotated, ..."),
+three chips (suggested read-only, not annotated, with findings: a tool shows when it matches any
+chip ticked) and a filter on the name and title. "With findings" is a warning, as in the counts (a
+tool with an error finding is counted apart); a toolkit's consequential tool is suggested approve,
+so the first two chips leave it out. Each tool has its state, the server's suggestion
+and why, its description, its findings and **Show definition**, the pinned definition as JSON
+with every character outside ASCII escaped and nothing cut (a long line wraps onto marked lines
+under it). Nothing is included by default: tick **Include** on a tool, and its allow or approve
+choice starts at the server's suggestion, labelled as the server's (allow: agents call it with no
+prompt; approve: every call asks you first). A tool that can't be pinned has no box, and says
+why. **Select suggested** includes every pinnable tool the server marks read-only and not
+destructive, as allow; it is the only bulk allow. **Clear** takes every tool out. Tools the policy
+includes already start included, at their classification, so generating unchanged keeps them;
+taking one out drops it. **Generate (n tools: a allow, b approve)** makes fragment 2, with
+**Copy**, the indent and its steps, ending with the `gateway.clients.<client>.servers` line to
+add yourself: fragment 2 assigns no client. Nothing is saved.
+
+When a review doesn't come back: `review_unavailable` means the gateway isn't polling the vault
+(check that it runs and reaches it, then review again); `review_stale` means the policy was
+reloaded since (the gateway didn't take the job within 60 s, or the server's tools changed since
+its report): review again once the gateway has the new policy; `job_unknown` means the report
+expired (30 minutes), the vault restarted or it was already used: review again. Logs:
+`onboard_started` (`owner: portal`), `onboard_planned`, `onboard_refused`, `onboard_registered`,
+`onboard_blocked` and `onboard_ended` (§11), `step_up_confirmed` with the action
+`onboard.register` or `onboard.discover_private`, and `review_requested` with `owner: portal`;
+never a client secret, a fragment or a tool's definition.
+
 **Ledger.** The Ledger page is the vault's copy of the gateway's approval ledger (§21), newest
 first, 200 rows a page (**Older rows** for more). Each call shows when it was asked, its client,
 server and tool, the decision, the outcome and how many writes it asked for and sent, and under

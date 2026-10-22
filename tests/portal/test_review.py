@@ -22,11 +22,14 @@ import pytest
 
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import Page
+from tests.unit.test_portal_static import reads
 from tests.unit.test_review_choices import large
 from tests.unit.test_reviewview import held
 from zoeymcp.common import pinhash
+from zoeymcp.common.policy.findings import Finding
 from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.portal import reviewview
 from zoeymcp.portal.reviewview import rows
 from zoeymcp.vault.onboarding import reviewed_next
 from zoeymcp.vault.reviewjobs import read_result
@@ -217,6 +220,27 @@ def test_what_a_diff_refuses(world: World) -> None:
     rig.reload(rig_policy(rig.portal_port, **notes_entries(on_drift="fail")))
     stale = page.fetch("POST", path, json=body)
     assert status_reason(stale) == (409, "review_stale")
+
+
+def test_a_merged_policy_that_fails_check_answers_its_findings_shown(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K.5: a ``diff_invalid`` carries ``check``'s findings, each message shown as a success's
+    are (review.js renders them alike), never the raw message."""
+    found = [Finding("gateway.clients", "error", f"unknown server 'gh{RLO}ost'")]
+    monkeypatch.setattr(reviewview, "validate", lambda policy, change: found)
+    job, _ = done(world)
+    body = {"include": ["echo"], "allow": ["echo"], "approve": []}
+    refused = world.page.fetch("POST", f"/api/review/jobs/{job}/diff", json=body)
+    assert status_reason(refused) == (422, "diff_invalid")
+    assert refused.json()["check"] == [
+        {
+            "level": "error",
+            "path": "gateway.clients",
+            "message_shown": "unknown server 'gh[U+202E]ost'",
+        }
+    ]
+    assert reads("renderChecks", "finding") == set(refused.json()["check"][0])
 
 
 def test_a_job_of_another_surface_or_none(world: World) -> None:

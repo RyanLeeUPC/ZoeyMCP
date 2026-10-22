@@ -100,6 +100,7 @@ def test_the_portal_says_where_it_listens_and_that_setup_is_pending(rig: PortalR
         ("/", "index.html", "text/html; charset=utf-8"),
         ("/app.js", "app.js", "text/javascript; charset=utf-8"),
         ("/webauthn.js", "webauthn.js", "text/javascript; charset=utf-8"),
+        ("/review.js", "review.js", "text/javascript; charset=utf-8"),
         ("/app.css", "app.css", "text/css; charset=utf-8"),
         ("/callback/received", "callback-received.html", "text/html; charset=utf-8"),
         ("/callback/refused", "callback-refused.html", "text/html; charset=utf-8"),

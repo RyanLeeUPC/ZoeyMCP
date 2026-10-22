@@ -122,6 +122,7 @@ def test_the_static_map_is_fixed() -> None:
         "/": StaticFile("index.html", "text/html; charset=utf-8"),
         "/app.js": StaticFile("app.js", "text/javascript; charset=utf-8"),
         "/webauthn.js": StaticFile("webauthn.js", "text/javascript; charset=utf-8"),
+        "/review.js": StaticFile("review.js", "text/javascript; charset=utf-8"),
         "/app.css": StaticFile("app.css", "text/css; charset=utf-8"),
         "/callback/received": StaticFile("callback-received.html", "text/html; charset=utf-8"),
         "/callback/refused": StaticFile("callback-refused.html", "text/html; charset=utf-8"),

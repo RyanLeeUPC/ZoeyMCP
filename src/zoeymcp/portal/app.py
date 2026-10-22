@@ -740,6 +740,7 @@ class PortalApp:
         answer = await handler(call)
         reason: str | None
         if isinstance(answer, Refusal):
+            answer = _refusal_shown(answer)
             status, reason = answer.status, answer.reason
             await self._send_json(exchange, status, answer.body(), _refusal_headers(answer))
         else:
@@ -2697,6 +2698,16 @@ def _findings_shown(findings: Iterable[Mapping[str, str]]) -> list[dict[str, str
         }
         for finding in findings
     ]
+
+
+def _refusal_shown(refused: Refusal) -> Refusal:
+    """A refusal as the page shows it (M7 K.5): the ``check`` findings a ``diff_invalid`` carries
+    (fragment 2's, or an onboarding's), each message shown, as a success's are."""
+    more = dict(refused.more)
+    if "check" not in more:
+        return refused
+    more["check"] = _findings_shown(more["check"])
+    return replace(refused, more=tuple(more.items()))
 
 
 def _onboarding_row(answer: Mapping[str, Any]) -> dict[str, Any]:

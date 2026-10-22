@@ -12,7 +12,7 @@
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
   const PAGES = ["blocked", "login", "setup", "home", "credentials", "sessions", "passkeys",
-    "secrets", "ledger", "policy"];
+    "secrets", "ledger", "policy", "servers"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
@@ -126,6 +126,9 @@
     }
     if (page !== "secrets") {
       $("secret-value").value = ""; // a value typed but not sent doesn't stay in the page
+    }
+    if (page !== "servers") {
+      $("add-client-secret").value = ""; // nor does a client secret for an onboarding (M7 K.1)
     }
     $("status").textContent = "";
   }
@@ -417,6 +420,7 @@
     closeConfirm();
     await showCredentials();
     $("status").textContent = "Connected " + result.name_shown + ": " + result.text_shown;
+    await window.zoeyReview.connected(result.credential); // a server row's Connect reviews it
   }
 
   async function afterReset() {
@@ -955,5 +959,8 @@
     enter();
   }
 
+  // What review.js shares (M7 K.4): the fetch wrapper, the step-up, Connect and the builders.
+  window.zoeyPortal = Object.freeze({ api, fill, visit, fail, textOf, afterFailure, button, on,
+    prepare, closeConfirm, renderSummary, connect, when });
   start();
 })();

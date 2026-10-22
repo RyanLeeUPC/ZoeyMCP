@@ -1,9 +1,10 @@
-"""What the page posts is what the API takes (M5 design K.4, D.1, M.1).
+"""What the page posts is what the API takes (M5 design K.4, D.1, M.1; M7 K.2, K.3).
 
 The page parses nothing: it posts the raw WebAuthn fields, base64url-encoded, and fixed bodies.
 These tests drive the portal's API in process with ``tests/fakes/authenticator.py``, whose
-answers have exactly the fields ``webauthn.js`` posts, and read the bodies ``app.js`` sends from
-the script itself, so a field renamed on either side fails here before any browser is involved.
+answers have exactly the fields ``webauthn.js`` posts, and read the bodies ``app.js`` and
+``review.js`` send from the scripts themselves, so a field renamed on either side fails here
+before any browser is involved.
 """
 
 from __future__ import annotations
@@ -20,24 +21,24 @@ from tests.fakes.authenticator import Assertion, Attestation, SoftAuthenticator
 from zoeymcp.portal.actions import KINDS
 from zoeymcp.portal.app import PortalApp, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
-from zoeymcp.portal.routes import ROUTES
+from zoeymcp.portal.routes import ONBOARD_DISCOVER, ROUTES
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
 from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.keys import KeySet
 
-from .test_portal_static import REVIEW_SCRIPT
+from .test_portal_static import SCRIPTS
 
 ORIGIN = "http://localhost:8081"
 KEYS = KeySet.from_master(bytes(range(32)))
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
-# api("POST", "/api/...", { key: value, ... }) in app.js, the path a literal or a template
+# api("POST", "/api/...", { key: value, ... }) in a script, the path a literal or a template
 # filled in by fill("/api/...", { ... }).
 POSTED = re.compile(
     r"api\(\s*\"POST\",\s*(?:fill\()?\"(/api/[^\"]+)\"(?:,\s*\{[^}]*\}\))?,\s*\{([^}]*)\}",
     re.DOTALL,
 )
-# prepare("kind", { key: value, ... }, ...) in app.js: an action's data.
-PREPARED = re.compile(r"prepare\(\s*\"([a-z.]+)\",\s*\{([^}]*)\}", re.DOTALL)
+# prepare("kind", { key: value, ... }, ...) in a script: an action's data.
+PREPARED = re.compile(r"prepare\(\s*\"([a-z._]+)\",\s*\{([^}]*)\}", re.DOTALL)
 # The connect dialog's data, a paste (H.1) or a code the callback returned (H.6), handed to
 # prepareConnect(), which posts it as one kind's.
 CONNECTED = re.compile(r"prepareConnect\(\{([^}]*)\}\)")
@@ -88,23 +89,25 @@ async def page(tmp_path: Path) -> AsyncIterator[tuple[Page, PortalApp]]:
         yield Page(client), app
 
 
+def scripts() -> str:
+    return "".join((STATIC_DIR / name).read_bytes().decode("utf-8") for name in SCRIPTS)
+
+
 def test_the_page_posts_exactly_each_routes_body() -> None:
-    """Every POST app.js makes sends the keys its route takes, no more and no fewer."""
-    script = (STATIC_DIR / "app.js").read_bytes().decode("utf-8")
-    posted = {path: set(re.findall(r"(\w+):", keys)) for path, keys in POSTED.findall(script)}
-    routes = {
-        r.path: r for r in ROUTES if r.method == "POST" and (r.method, r.path) not in REVIEW_SCRIPT
-    }
-    assert set(posted) == set(routes)
-    for path, keys in posted.items():
+    """Every POST the page makes sends the keys its route takes, no more and no fewer; M7 K.2's
+    routes are review.js's."""
+    posted = [(path, set(re.findall(r"(\w+):", keys))) for path, keys in POSTED.findall(scripts())]
+    routes = {r.path: r for r in ROUTES if r.method == "POST"}
+    assert {path for path, _ in posted} == set(routes)
+    for path, keys in posted:
         route = routes[path]
         assert route.body <= keys <= route.body | route.optional, path
 
 
 def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
-    """Every action app.js prepares is a kind the portal runs, with the data keys the registry
-    takes; and the page prepares every kind the portal runs."""
-    script = (STATIC_DIR / "app.js").read_bytes().decode("utf-8")
+    """Every action the page prepares is a kind the portal runs, with the data keys the registry
+    takes; and the page prepares every kind the portal runs, M7 K.3's in review.js."""
+    script = scripts()
     prepared = PREPARED.findall(script)
     assert prepared
     assert CONNECT_KIND.findall(script) == ["oauth.complete"]
@@ -119,10 +122,12 @@ def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
         data = set(re.findall(r"(\w+):", keys))
         assert KINDS[kind].required <= data <= KINDS[kind].required | KINDS[kind].optional, kind
     app = PortalApp([ORIGIN], static=load_static())
-    # M7 K.3's kinds, built in step 14a, are prepared by review.js from step 14b (K.4).
-    review_kinds = {"onboard.discover_private", "onboard.register"}
-    assert {kind for kind, _ in prepared} == app.action_kinds - review_kinds
-    assert review_kinds <= app.action_kinds <= set(KINDS)
+    assert {kind for kind, _ in prepared} == app.action_kinds
+    assert app.action_kinds <= set(KINDS)
+    # A private server's discovery sends what the plain one may, and the tick (TI-3).
+    private = [keys for kind, keys in prepared if kind == "onboard.discover_private"]
+    discover = ONBOARD_DISCOVER.body | ONBOARD_DISCOVER.optional
+    assert [set(re.findall(r"(\w+):", keys)) for keys in private] == [discover | {"allow_private"}]
 
 
 def test_the_fake_answers_with_the_fields_the_page_posts() -> None:

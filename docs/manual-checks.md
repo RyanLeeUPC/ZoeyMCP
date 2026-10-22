@@ -21,6 +21,7 @@ fail. Record no account names, addresses or other personal details.
 | 13, 14 | step 14b (the OAuth callback) |
 | 12 | no step waits on it (the portal tests cover it); run it with 1-7 |
 | 15 | step 13 (secrets) |
+| 16-18 | M7 step 14b (the MCP servers page) |
 
 ## The setup for every item
 
@@ -204,6 +205,39 @@ view.
     typed (in Chrome, Edge and Safari; other browsers may show it as typed); the browser doesn't
     offer to save it as a password (and no password manager fills or stores it); after the confirm
     the value field is empty; the page's elements (developer tools, Elements) hold no copy of it.
+16. **The review screen with hostile text, under Trusted Types** (M7 step 14b). A vault with its
+    portal and a gateway that polls it (either tier's compose file with an `admin` block, say),
+    whose policy serves the fake MCP server as a remote server, connected. Start the fake from
+    the repository root with a certificate the route trusts, once as
+    `python -m tests.fakes.run_mcp_server CERT KEY --switch large` (J4's 96 tools) and once with
+    `--switch inject_definitions --switch inject_server_info --switch invalid_name`, reloading
+    the gateway between. In Chrome or Edge with the Console open, open **MCP servers** and choose
+    **Review tools** (or **Review again**). Pass, for each:
+    - no Trusted Types or Content Security Policy violation in the console;
+    - every string from the server (names, titles, descriptions, the server's name and
+      instructions, findings, definitions) shows as text, exactly as the vault sent it: markup
+      shows as its characters, nothing is bold, linked or laid out that the page didn't make, and
+      a hidden or right-to-left character shows as the visible mark the vault gives it;
+    - with `large`, the counts read 96 tools, 64 the server marks read-only and 32 not
+      annotated; the chips each keep those tools, the filter keeps the names holding its text,
+      **Select suggested** includes the 64 as allow and no unannotated tool, **Clear** empties
+      the selection, and **Generate** counts what is included;
+    - **Show definition** shows the whole definition, a long line continuing on marked lines
+      under it with nothing cut, and every character outside ASCII as an escape.
+17. **Copy is the exact fragment** (M7 step 14b). Onboard by URL from the portal against the fake
+    provider (`python -m tests.fakes.run_oauth_server --dir ./onboard-check --metadata`, with
+    `--issuer-path` given a path long enough that its token endpoint's URL is 2,048 characters,
+    the longest a policy takes) through a fake MCP server whose protected-resource metadata
+    names it. Make fragment 1, then choose **Copy** and paste into a text editor. Pass: the pasted
+    text is the shown text, line for line and character for character, the 2,048-character URL
+    whole on its line; the same after choosing the compose indent, and for fragment 2.
+18. **The callback of a client the vault registered** (M7 step 14b; item 13 against a DCR
+    client). With the fake provider of item 17 offering registration (`--registration open`),
+    add the server by URL in the portal with no client ID: the plan's redirect address is this
+    origin's `/oauth/callback/<credential>`. Register (a passkey), commit fragment 1 and reload,
+    then choose **Connect** on its row. Pass: as item 13's first part (the provider sends the
+    tab back to the portal, which asks for the passkey), and once connected the page queues the
+    server's review by itself.
 
 ## D-66: the live OAuth test against a real provider
 
