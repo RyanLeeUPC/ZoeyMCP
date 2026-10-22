@@ -1671,6 +1671,37 @@ async def test_an_upstream_scope_complaint_shows_until_a_login(
     assert rig.status()["upstream"] is None
 
 
+async def test_the_scopes_an_upstream_asked_for_and_other_resource_metadata(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """M7 design J and D.5: kept in memory for health, never a decision. A login clears what
+    an upstream said of the token, not the resource metadata a 401 named."""
+    rig = spotify_rig(tmp_path, clock)
+    assert rig.status()["resource_metadata"] is None
+    rig.manager.note_upstream("music", UPSTREAM_INSUFFICIENT_SCOPE, scopes=("a", "b"))
+    rig.manager.note_resource_metadata("music", "https://auth.example/prm")
+    assert rig.status()["upstream"] == {
+        "code": "upstream_insufficient_scope",
+        "at": "2026-10-17T09:00:00Z",
+        "scopes": ["a", "b"],
+    }
+    clock.advance(60)
+    rig.manager.note_resource_metadata("music", "https://auth.example/prm2")
+    assert rig.status()["resource_metadata"] == {
+        "url": "https://auth.example/prm2",
+        "at": "2026-10-17T09:01:00Z",
+    }
+    await rig.manager.commit_login(
+        "music",
+        refresh_token=Secret("fake-rt-login"),
+        minted=minted(),
+        sent_at=clock.mono,
+        rebind=False,
+    )
+    assert rig.status()["upstream"] is None
+    assert rig.status()["resource_metadata"]["url"] == "https://auth.example/prm2"
+
+
 async def test_commit_login_refuses_a_changed_binding_without_rebind(
     tmp_path: Path, clock: FakeClock
 ) -> None:

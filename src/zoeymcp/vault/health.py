@@ -14,15 +14,22 @@ command. The kinds are :func:`~.oauth.login.hint_action`'s (``connect``, ``reset
 ``set_secret`` and ``restart`` with the ``ref``, ``fix_policy``, ``wait``), plus
 ``delete_secret``, ``check_volume`` and ``check_mailbox``, and for the passkeys ``add_passkey``,
 ``review_passkeys`` and ``reset_passkeys``, and for the reported ledger ``check_gateway`` and
-``read_ledger``.
+``read_ledger``; from M7, ``onboard_again`` with the ``command`` (``login --mcp URL
+--reregister``, OPS-3) and ``widen_scope`` with the union ``scope`` and the ``fragment`` that
+sets it (D.5's step-up, SPEC-11), which ``connect`` follows.
 
 Stored bindings are judged by effect, not by equality (verifier V9), because the socket may store
 an explicit ``origins`` binding for any name: ``binding_changed`` means a use the policy makes now
 would be refused, ``binding_wider`` that every use is covered, and more.
 
-``insufficient_scope`` is the token manager's memory of an upstream's answer, so it covers the
-time since the vault started (D-16). :func:`last_failure` (D-23) and :func:`idle` (D-20) read
-``meta``; ``oauth status`` shows them too.
+``insufficient_scope`` and ``resource_metadata_changed`` are the token manager's memory of an
+upstream's answers, so they cover the time since the vault started (D-16, M7 design J).
+:func:`last_failure` (D-23) and :func:`idle` (D-20) read ``meta``; ``oauth status`` shows them
+too.
+
+A ``store:`` client secret of a credential that logs in is held to M7 design D.7 step 5 as
+login holds it, by :func:`~.bindings.client_secret_rebound`: bound exactly as the policy derives
+its binding now, or ``client_secret_binding_changed`` (D-185).
 """
 
 from __future__ import annotations
@@ -35,9 +42,17 @@ from typing import Any, Final, Literal
 
 from ..common.policy.check import secret_references
 from ..common.policy.schema import Credential, OAuth2Credential, Policy, SMTPConnector
-from .bindings import VAULT_PREFIX, BindingError, derive_binding, live_slot
+from .bindings import (
+    VAULT_PREFIX,
+    BindingError,
+    client_secret_rebound,
+    derive_binding,
+    live_slot,
+    oauth_binding,
+)
 from .connectors.sendjournal import DAY_MS, Journal
 from .oauth.protocol import GRANT_WARN_DAYS
+from .onboarding import onboard_again, widen_scope
 from .secretplan import binding_refusal
 from .store import EntryMeta, canonical_origin
 
@@ -56,6 +71,9 @@ DISPLAY_ONLY: Final = ("source", "consented_at", "rotations", "last_ok_ago")
 REGRESSION_DAYS: Final = 30
 # The gateway asks for the copy's head at least every 60 s while it takes reports (J.3).
 STALE_SECONDS: Final = 300
+# The entries an onboarding stores before its fragment is committed: a confidential client's
+# secret (M7 design D.7) and a public client's ID (D.8), each named after the credential.
+ONBOARDING_SUFFIXES: Final = ("-client-secret", "-client-id")
 
 Action = dict[str, str]
 Finding = dict[str, Any]
@@ -197,13 +215,15 @@ def _credential(
             bounds = oauth.grant == "client_credentials" and field_name == "client_secret"
             needs = origins if bounds else None
         row, found = _ref(inputs, stored, _Use("credential", name, ref, needs, fix))
+        if oauth is not None and field_name == "client_secret" and _logs_in(oauth):
+            row, found = _client_secret(policy, stored, name, oauth, (row, found), fix)
         rows.append(row)
         findings += found
     extra: dict[str, Any] = {}
     current = status.get(name)
     if oauth is not None and current is not None:
         extra["oauth"] = _oauth(current)
-        findings += _oauth_findings(name, oauth, current)
+        findings += _oauth_findings(policy, name, oauth, current)
     return {
         "name": name,
         "kind": cred.kind,
@@ -213,6 +233,37 @@ def _credential(
         **extra,
         "findings": findings,
     }
+
+
+def _client_secret(
+    policy: Policy,
+    stored: Mapping[str, EntryMeta],
+    name: str,
+    cred: OAuth2Credential,
+    judged: tuple[dict[str, Any], list[Finding]],
+    fix: Action,
+) -> tuple[dict[str, Any], list[Finding]]:
+    """A ``store:`` client secret held to D.7 step 5 as login holds it (D-185): bound otherwise
+    than the policy now derives, login refuses it ``client_secret_binding_changed``, whatever
+    :func:`judge` says of its token endpoint alone. ``judged`` is :func:`_ref`'s row and
+    findings, kept when the secret passes or the policy can't bind it (which they report)."""
+    try:
+        rebound = client_secret_rebound(policy, cred, stored.get)
+    except BindingError:
+        return judged
+    if rebound is None:
+        return judged
+    row, _ = judged
+    text = (
+        f"store:{rebound.name} was stored for another token endpoint or other server origins "
+        "than the policy has now; login refuses it"
+    )
+    # Onboarding again only when its store would clear this; ``secret set`` stores the binding
+    # the policy derives, whatever the cause.
+    action = _again(name, cred, fix) if _reregistered(cred) == rebound.new else fix
+    return {**row, "binding": "changed"}, [
+        _finding("client_secret_binding_changed", "error", text, action)
+    ]
 
 
 def _seed(
@@ -255,8 +306,10 @@ def _oauth(status: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _oauth_findings(name: str, cred: OAuth2Credential, status: Mapping[str, Any]) -> list[Finding]:
-    """The token manager's states, as ``oauth status`` shows them."""
+def _oauth_findings(
+    policy: Policy, name: str, cred: OAuth2Credential, status: Mapping[str, Any]
+) -> list[Finding]:
+    """The token manager's states, as ``oauth status`` shows them, and what upstreams said."""
     renew = _renew(name, cred)
     found: list[Finding] = []
     code = status["code"]
@@ -282,7 +335,27 @@ def _oauth_findings(name: str, cred: OAuth2Credential, status: Mapping[str, Any]
             f"an upstream said the token lacks a scope at {upstream['at']} "
             "(since the vault started)"
         )
-        found.append(_finding("insufficient_scope", "warning", text, renew))
+        action = renew
+        asked = upstream.get("scopes") or []
+        if asked:
+            text += f"; it asked for {' '.join(asked)}"
+            widened = widen_scope(policy, name, asked)
+            if widened is not None:
+                action = {
+                    **_act("widen_scope", "credential", name),
+                    "scope": widened.scope,
+                    "fragment": widened.fragment,
+                }
+        found.append(_finding("insufficient_scope", "warning", text, action))
+    moved = status["resource_metadata"]
+    if moved and cred.resource_metadata is not None and moved["url"] != cred.resource_metadata:
+        text = (
+            "a 401 on its route named other protected-resource metadata than its "
+            f"resource_metadata at {moved['at']} (since the vault started): the server may have "
+            "moved its authorization; the vault never registers again by itself"
+        )
+        action = _again(name, cred, _act("fix_policy", "credential", name))
+        found.append(_finding("resource_metadata_changed", "warning", text, action))
     failure = status["last_failure"]
     if failure:
         reset = {"kind": "reset", "credential": name}
@@ -348,9 +421,16 @@ def _store(inputs: Inputs) -> dict[str, Any]:
         if entry.name in used:
             continue
         action = {"kind": "delete_secret", "secret": entry.name}
+        waiting = _onboarded(entry)
         if entry.name.startswith(VAULT_PREFIX):
             text = f"{entry.name}: no credential keeps its live refresh token here"
             findings.append(_finding("orphan_slot", "info", text, action))
+        elif waiting is not None:
+            text = (
+                f"store:{entry.name} is waiting for its credential: commit onboarding fragment 1 "
+                f"for {waiting}, or delete it"
+            )
+            findings.append(_finding("unreferenced", "info", text, action, advisory=True))
         else:
             text = f"nothing in the policy uses store:{entry.name}"
             findings.append(_finding("unreferenced", "info", text, action))
@@ -528,6 +608,25 @@ def _route_origins(policy: Policy, credential: str) -> frozenset[str]:
     )
 
 
+def _onboarded(entry: EntryMeta) -> str | None:
+    """The credential an onboarding stored ``entry`` for, before its fragment 1 was committed
+    (M7 design D.7 step 6): a name :data:`ONBOARDING_SUFFIXES` ends, and the ``onboarded`` meta
+    the register run writes. Meta is clear text, so this only words the finding."""
+    meta = entry.meta or {}
+    if not isinstance(meta.get("onboarded"), str):
+        return None
+    for suffix in ONBOARDING_SUFFIXES:
+        credential = entry.name.removesuffix(suffix)
+        if credential and credential != entry.name:
+            return credential
+    return None
+
+
+def _logs_in(cred: OAuth2Credential) -> bool:
+    """Whether ``zoeymcp login`` runs for the credential, and so D.7 step 5's check."""
+    return cred.grant != "client_credentials" and cred.authorize_url is not None
+
+
 def _seeded(cred: Credential) -> bool:
     return isinstance(cred, OAuth2Credential) and (cred.refresh_token or "").startswith("env:")
 
@@ -560,6 +659,29 @@ def _act(kind: str, owner: str, name: str) -> Action:
 def _set(owner: str, name: str, ref: str) -> Action:
     """A reference given a value: an env var by a restart, a store entry by setting it."""
     return {**_act("restart" if ref.startswith("env:") else "set_secret", owner, name), "ref": ref}
+
+
+def _again(name: str, cred: OAuth2Credential, fallback: Action) -> Action:
+    """Onboarding again (D.12, OPS-3), for a credential that names its server's URL as its
+    ``resource``, as onboarding writes it; ``fallback`` for one written without."""
+    resource = cred.extra_params.get("resource")
+    if not isinstance(resource, str):
+        return fallback
+    return {**_act("onboard_again", "credential", name), "command": onboard_again(resource).shell()}
+
+
+def _reregistered(cred: OAuth2Credential) -> dict[str, Any] | None:
+    """The binding a re-registration stores the client secret under (D.7 step 2, as
+    ``onboard._binding`` makes it): the token endpoint, and the origin of the server the
+    credential names as its ``resource``. A route added, or a second credential naming the
+    secret, derives another. None without a resource."""
+    resource = cred.extra_params.get("resource")
+    if not isinstance(resource, str):
+        return None
+    try:
+        return oauth_binding(cred.token_url, [resource])
+    except ValueError:
+        return None
 
 
 def _renew(name: str, cred: OAuth2Credential) -> Action:

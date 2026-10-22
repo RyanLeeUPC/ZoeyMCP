@@ -1607,6 +1607,24 @@ def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
             "run: zoeymcp passkeys, and remove any you don't recognize",
         ),
         ({"kind": "reset_passkeys"}, "run: zoeymcp setup-code --reset"),
+        (
+            {
+                "kind": "onboard_again",
+                "credential": "notes",
+                "command": "zoeymcp login --mcp https://mcp.notes.example/mcp --reregister",
+            },
+            "run: zoeymcp login --mcp https://mcp.notes.example/mcp --reregister",
+        ),
+        (
+            {
+                "kind": "widen_scope",
+                "credential": "notes",
+                "scope": "notes.read notes.write",
+                "fragment": "# zoeymcp: widen the scope of notes\n",
+            },
+            'merge credentials.notes.scope: "notes.read notes.write" (the fragment is in health '
+            "--json), check and reload the policy, then run: zoeymcp login notes",
+        ),
         # A newer vault's action: its kind.
         ({"kind": "enrol_elsewhere"}, "enrol_elsewhere"),
     ],

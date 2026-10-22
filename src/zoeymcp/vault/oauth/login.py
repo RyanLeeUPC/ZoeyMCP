@@ -36,7 +36,13 @@ import httpx
 from ...common.policy.callback import callback_address, callback_origin
 from ...common.policy.schema import OAuth2Credential, split_scope
 from .. import logs
-from ..bindings import BindingError, derive_binding, derive_oauth_binding, live_slot
+from ..bindings import (
+    BindingError,
+    client_secret_rebound,
+    derive_binding,
+    derive_oauth_binding,
+    live_slot,
+)
 from ..health import idle, last_failure, parse_time
 from ..store import Secret
 from . import pkce
@@ -675,20 +681,15 @@ class LoginService:
         would derive, so a committed token endpoint or server origin that differs refuses. It is
         entered again, never re-bound (R16), so ``--rebind`` doesn't apply. A missing entry is
         left to the client's own check (``client_secret_unavailable``)."""
-        ref = cred.client_secret or ""
-        if not ref.startswith("store:"):
-            return
-        name = ref.removeprefix("store:")
         try:
-            expected = derive_binding(self._tokens.policy, name)
+            rebound = client_secret_rebound(self._tokens.policy, cred, self._tokens.store.entry)
         except BindingError as exc:
             raise LoginError("no_route", str(exc)) from None
-        entry = self._tokens.store.entry(name)
-        if entry is not None and entry.binding != expected:
+        if rebound is not None:
             raise LoginError(
                 "client_secret_binding_changed",
-                f"{REGISTERED_ELSEWHERE}{name}",
-                details={"old": entry.binding, "new": expected},
+                f"{REGISTERED_ELSEWHERE}{rebound.name}",
+                details={"old": rebound.old, "new": rebound.new},
             )
 
     def _client(self, credential: str, cred: OAuth2Credential) -> Client:

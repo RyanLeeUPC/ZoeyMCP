@@ -86,7 +86,7 @@ from ..portal.refusals import Refusal as Answer
 from ..portal.refusals import refusal
 from ..portal.refusals import secret as secret_refusal
 from . import logs, netclient, secretops, secretplan
-from .bindings import BindingError, derive_binding, oauth_binding
+from .bindings import BindingError, client_secret_rebound, oauth_binding
 from .oauth.discovery import (
     LEGACY_PROBE,
     MODERN_PROBE,
@@ -478,16 +478,11 @@ class OnboardService:
     ) -> None:
         """D.7 step 5 for the second run (D.12): a ``store:`` client secret's authenticated
         binding is still the one the committed policy derives, as login checks it."""
-        ref = cred.client_secret or ""
-        if not ref.startswith("store:"):
-            return
-        name = ref.removeprefix("store:")
         try:
-            expected = derive_binding(policy, name)
+            rebound = client_secret_rebound(policy, cred, self._store.entry)
         except BindingError as exc:
             raise OnboardError(refusal("no_route", detail=str(exc))) from None
-        entry = self._store.entry(name)
-        if entry is not None and entry.binding != expected:
+        if rebound is not None:
             answer = refusal("client_secret_binding_changed")
             raise OnboardError(replace(answer, more=(("next", again),)))
 

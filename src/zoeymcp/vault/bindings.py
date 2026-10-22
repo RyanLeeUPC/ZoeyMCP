@@ -16,7 +16,8 @@ tokens minted with it may go to.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from ..common.policy.schema import (
@@ -27,7 +28,7 @@ from ..common.policy.schema import (
     Policy,
     QueryCredential,
 )
-from .store import canonical_origin, origin_binding, smtp_binding
+from .store import EntryMeta, canonical_origin, origin_binding, smtp_binding
 
 # Store entries whose names start with this are managed by the vault, never set by hand.
 VAULT_PREFIX: Final = "oauth."
@@ -144,6 +145,37 @@ def derive_binding(policy: Policy, name: str) -> dict[str, Any]:
         "pass --origin to bind it explicitly",
         "unbound",
     )
+
+
+@dataclass(frozen=True)
+class Rebound:
+    """A ``store:`` client secret held under another binding than the policy now derives."""
+
+    name: str
+    old: Mapping[str, Any]
+    new: dict[str, Any]
+
+
+def client_secret_rebound(
+    policy: Policy, cred: OAuth2Credential, entry: Callable[[str], EntryMeta | None]
+) -> Rebound | None:
+    """M7 design D.7 step 5: a credential's ``store:`` client secret must still be bound exactly
+    as :func:`derive_binding` binds its name for ``policy``. An onboarding stored it under the
+    binding fragment 1 would derive, and a secret set by hand got the one its uses had then, so a
+    committed token endpoint or server origin that differs, a route added or removed, or a second
+    credential naming it gives a :class:`Rebound`. Login and the second ``login --mcp`` refuse
+    it as ``client_secret_binding_changed``, and health reports it by that code. None for a
+    secret from ``env:`` or none at all, and for a name with no entry (the client's own check
+    refuses that). Raises :class:`BindingError` when the policy can't bind the name."""
+    ref = cred.client_secret or ""
+    if not ref.startswith("store:"):
+        return None
+    name = ref.removeprefix("store:")
+    expected = derive_binding(policy, name)
+    held = entry(name)
+    if held is None or held.binding == expected:
+        return None
+    return Rebound(name, held.binding, expected)
 
 
 def _shared_oauth_binding(

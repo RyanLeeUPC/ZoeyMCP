@@ -72,6 +72,7 @@ from . import logs, netclient, secretops
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
+from .oauth.discovery import Challenge, parse_challenge
 from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
 from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
 from .oauth.tokens import UPSTREAM_INSUFFICIENT_SCOPE, Grant, OAuthUnavailable, TokenManager
@@ -631,13 +632,10 @@ class VaultApp:
             )
             if grant is not None:
                 assert route.credential is not None  # noqa: S101 - set for every OAuth route
+                assert isinstance(cred, OAuth2Credential)  # noqa: S101 - grant implies it
                 status = upstream_response.status_code
-                if status in (401, 403) and "insufficient_scope" in _challenge_errors(
-                    upstream_response
-                ):
-                    # A new token won't fix that; the operator may need to log in with more
-                    # scopes.
-                    self._tokens.note_upstream(route.credential, UPSTREAM_INSUFFICIENT_SCOPE)
+                if status in (401, 403):
+                    self._note_challenge(route.credential, cred, upstream_response)
                 if status == 401:
                     upstream_response, variants = await self._after_401(
                         upstream_response,
@@ -927,6 +925,32 @@ class VaultApp:
             if exc.code == OAUTH_UNAVAILABLE:
                 retry_after = max(1, math.ceil(exc.retry_after or 0))
             raise Refused(502, str(exc), code=exc.code, retry_after=retry_after) from exc
+
+    def _note_challenge(
+        self, credential: str, cred: OAuth2Credential, response: httpx.Response
+    ) -> None:
+        """What an upstream's 401 or 403 says about the token, kept for health (M7 design J,
+        D.5). An ``insufficient_scope`` (a new token won't fix it: the operator may need to log
+        in with more scopes), with the scope tokens its challenge asked for; and a 401 naming
+        other ``resource_metadata`` than the credential's. Both parts are read with discovery's
+        parser, bounded and cleaned, from the challenge whose ``error`` is read: one that doesn't
+        parse gives neither, never half of one."""
+        values = response.headers.get_list("www-authenticate")
+        parsed = parse_challenge(values)
+        challenge = parsed if isinstance(parsed, Challenge) else None
+        if "insufficient_scope" in _challenge_errors(response):
+            scopes: tuple[str, ...] = ()
+            if challenge is not None and challenge.error == "insufficient_scope":
+                scopes = challenge.scopes
+            self._tokens.note_upstream(credential, UPSTREAM_INSUFFICIENT_SCOPE, scopes=scopes)
+        if (
+            response.status_code == 401
+            and challenge is not None
+            and challenge.resource_metadata is not None
+            and cred.resource_metadata is not None
+            and challenge.resource_metadata != cred.resource_metadata
+        ):
+            self._tokens.note_resource_metadata(credential, challenge.resource_metadata)
 
     async def _after_401(
         self,

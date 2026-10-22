@@ -28,6 +28,8 @@ from .check import check_policy
 from .findings import Finding, format_location
 from .merge import REVIEW_BLOCKS, Merged, Path, describe, merge
 from .schema import (
+    _SCOPE_TOKEN,
+    MAX_SCOPES,
     NAME_PATTERN,
     HeaderCredential,
     OAuth2Credential,
@@ -45,12 +47,14 @@ CommentKind = Literal[
     "added", "changed_was", "not_included", "error_finding", "suggested", "merge_hint"
 ]
 Era = Literal["auto", "modern", "legacy"]
+ScopeSeparator = Literal[" ", ","]
 
 _NAME = re.compile(NAME_PATTERN)
 _REVIEW: Final = TypeAdapter(dict[ToolName, Pin])
 _TOOL_NAME: Final = TypeAdapter(ToolName)
 _ENTRY: Final = TypeAdapter(PrivateHostPort)
 _ERA: Final[TypeAdapter[Era]] = TypeAdapter(Era)
+_SEPARATOR: Final[TypeAdapter[ScopeSeparator]] = TypeAdapter(ScopeSeparator)
 
 
 class ChangeRefused(ValueError):
@@ -133,6 +137,31 @@ class SetCredential:
 
 
 @dataclass(frozen=True)
+class SetScope:
+    """A step-up (D.5, SPEC-11): an oauth2 credential's ``scope`` set to ``scopes`` joined by
+    its ``separator``, the rest of the credential kept, so the fragment merges into one written
+    by hand too. Each token is the schema's, and none holds the separator, so the scope splits
+    back into exactly these tokens; the merged policy checks its length."""
+
+    name: str
+    scopes: tuple[str, ...]
+    separator: ScopeSeparator = " "
+
+    def __post_init__(self) -> None:
+        _name(self.name)
+        _SEPARATOR.validate_python(self.separator)
+        if not 0 < len(self.scopes) <= MAX_SCOPES:
+            raise ValueError(f"1 to {MAX_SCOPES} scopes")
+        for scope in self.scopes:
+            if not _SCOPE_TOKEN.fullmatch(scope) or self.separator in scope:
+                raise ValueError(f"{scope!r} isn't a scope token")
+
+    @property
+    def scope(self) -> str:
+        return self.separator.join(self.scopes)
+
+
+@dataclass(frozen=True)
 class Comment:
     """A comment line of a fixed kind about a tool or a policy name; the emitter words it."""
 
@@ -151,6 +180,7 @@ Op = (
     | AddEgressPrivate
     | SetServerReview
     | SetCredential
+    | SetScope
     | Comment
 )
 
@@ -173,6 +203,9 @@ class PolicyChange:
         for op in self.ops:
             if isinstance(op, AddCredential | SetCredential):
                 out.setdefault("credentials", {})[op.name] = _plain(op.credential)
+            elif isinstance(op, SetScope):
+                # The kind the emitter needs to know the model; the merge keeps every other field.
+                out.setdefault("credentials", {})[op.name] = {"kind": "oauth2", "scope": op.scope}
             elif isinstance(op, AddRoute):
                 out.setdefault("routes", []).append(_plain(op.route))
             elif isinstance(op, AddServer):
@@ -202,7 +235,7 @@ class PolicyChange:
 
 def _target(op: Op) -> Path:
     """What an op adds or changes, so a change can't name it twice."""
-    if isinstance(op, AddCredential | SetCredential):
+    if isinstance(op, AddCredential | SetCredential | SetScope):
         return ("credentials", op.name)
     if isinstance(op, AddRoute):
         return ("routes", op.route.name)
@@ -263,4 +296,12 @@ def _check_names(policy: Policy, change: PolicyChange) -> None:
         if isinstance(op, SetCredential) and op.name not in policy.credentials:
             raise ChangeRefused(
                 "diff_invalid", f"credentials.{op.name}", ("the policy has no such credential",)
+            )
+        if isinstance(op, SetScope) and not isinstance(
+            policy.credentials.get(op.name), OAuth2Credential
+        ):
+            raise ChangeRefused(
+                "diff_invalid",
+                f"credentials.{op.name}",
+                ("the policy has no such oauth2 credential",),
             )

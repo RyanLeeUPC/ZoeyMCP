@@ -29,6 +29,8 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
   sets, not merely one by that name.
 - :func:`next_for` (M.7): what the operator does next, each command an argument list shown
   shell-quoted and without a container prefix, which the CLI adds.
+- :func:`widen_scope` (D.5's step-up, SPEC-11): health's fragment for a scope an upstream asked
+  for, the union of the committed scope and the challenged one.
 
 Nothing here does I/O; the clock and the ID source are injected. An onboarding's ID is never
 logged and is compared in constant time.
@@ -49,7 +51,8 @@ from urllib.parse import urlsplit
 from ..common import egresslist, netguard
 from ..common.egresslist import Allowance, Destination
 from ..common.logs import refuse_type
-from ..common.policy.change import PolicyChange, SetCredential
+from ..common.policy.change import PolicyChange, SetCredential, SetScope, apply
+from ..common.policy.emit import emit
 from ..common.policy.findings import Finding
 from ..common.policy.schema import (
     NAME_PATTERN,
@@ -58,6 +61,7 @@ from ..common.policy.schema import (
     Policy,
     RemoteServer,
     Route,
+    split_scope,
 )
 from .bindings import live_slot
 from .oauth.discovery import Plan, origin_of
@@ -829,6 +833,39 @@ def onboard_again(server_url: str) -> NextStep:
         ("zoeymcp", "login", "--mcp", server_url, "--reregister"),
         "exec",
     )
+
+
+@dataclass(frozen=True)
+class Widened:
+    """A credential's scope widened: the union as the fragment writes it, and the fragment."""
+
+    scope: str
+    fragment: str
+
+
+def widen_scope(policy: Policy, credential: str, challenged: Collection[str]) -> Widened | None:
+    """An ``upstream_insufficient_scope`` finding's fix (D.5's step-up, SPEC-11): a fragment
+    setting the running credential's ``scope`` to the union of its own and the scope an
+    upstream's challenge asked for, its own tokens first, merged into the credential (the rest of
+    it kept). None when the challenge adds no token, or when the union is no scope the credential
+    can hold (a token holding its separator, too many, too long): the finding then says to sign
+    in again, as before. The vault never widens a scope itself: the operator commits and
+    connects."""
+    cred = policy.credentials.get(credential)
+    if not isinstance(cred, OAuth2Credential):
+        return None
+    held = split_scope(cred.scope, cred.scope_separator)
+    # The schema lets a scope repeat a token, so new ones are looked for, not counted.
+    if set(challenged) <= set(held):
+        return None
+    union = tuple(dict.fromkeys([*held, *challenged]))
+    try:
+        op = SetScope(credential, union, cred.scope_separator)
+        change = PolicyChange(f"widen the scope of {credential}", (op,))
+        apply(policy, change)
+        return Widened(op.scope, emit(change))
+    except ValueError:  # ChangeRefused and EmitRefused are ones
+        return None
 
 
 def _login_again(record: OnboardingRecord) -> tuple[str, ...]:

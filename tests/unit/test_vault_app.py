@@ -632,6 +632,8 @@ class ApiServer:
         self.reject: set[str] = set()
         self.reject_all = False
         self.challenges: list[str] = [INVALID_TOKEN]
+        # The challenge of a 403 to a path ending /forbidden.
+        self.forbidden = 'Bearer error="insufficient_scope"'
         self.echo: list[str] = []
         # Answer as server-sent events, refusals included.
         self.sse = False
@@ -674,7 +676,7 @@ class ApiServer:
             return JSONResponse(
                 {"error": "insufficient_scope"},
                 status_code=403,
-                headers={"www-authenticate": 'Bearer error="insufficient_scope"'},
+                headers={"www-authenticate": self.forbidden},
             )
         return JSONResponse(
             {"ok": True, "token": token, "echo": self.echo}, headers={"x-echo": token}
@@ -1184,6 +1186,85 @@ async def test_an_insufficient_scope_is_recorded_for_status(
     assert (found["code"] if found else None) == (
         "upstream_insufficient_scope" if recorded else None
     )
+
+
+@pytest.mark.parametrize(
+    ("challenges", "scopes"),
+    [
+        (
+            ['Bearer error="insufficient_scope", scope="playlist-read user-top-read"'],
+            ["playlist-read", "user-top-read"],
+        ),
+        (['Bearer realm="api", error="insufficient_scope"'], None),
+        # One that doesn't parse, or a token D.2's parser refuses: the finding without a scope.
+        (['Bearer error="insufficient_scope", scope="playlist-read'], None),
+        (['Bearer error="insufficient_scope", scope="pay$day"'], None),
+        # The scope is read from the challenge whose error is read (the first Bearer one).
+        ([INVALID_TOKEN, 'Bearer error="insufficient_scope", scope="extra"'], None),
+    ],
+)
+async def test_an_insufficient_scope_keeps_the_scope_it_asked_for(
+    oauth: OAuthRig, challenges: list[str], scopes: list[str] | None
+) -> None:
+    """M7 design D.5's step-up (SPEC-11): the challenge's cleaned scope tokens, for health's
+    widen_scope fragment. The vault never asks for them itself."""
+    oauth.seed()
+    oauth.api.reject = {await first_token(oauth)}
+    oauth.api.challenges = challenges
+    await oauth.call("GET")
+    found = upstream_said(oauth)
+    assert found["code"] == "upstream_insufficient_scope"
+    assert found.get("scopes") == scopes
+    assert oauth.refreshes == 1
+
+
+PRM = "https://api.example/.well-known/oauth-protected-resource"
+OTHER_PRM = "https://auth.other.example/.well-known/oauth-protected-resource"
+
+
+@pytest.mark.parametrize(
+    ("pinned", "challenge", "noted"),
+    [
+        (PRM, f'Bearer resource_metadata="{OTHER_PRM}"', OTHER_PRM),
+        (PRM, f'Bearer error="invalid_token", resource_metadata="{OTHER_PRM}"', OTHER_PRM),
+        (PRM, f'Bearer resource_metadata="{PRM}"', None),
+        (PRM, INVALID_TOKEN, None),
+        # Not pinned (D.2a), or a URL D.2's parser refuses: nothing kept.
+        (None, f'Bearer resource_metadata="{OTHER_PRM}"', None),
+        (PRM, f'Bearer resource_metadata="{OTHER_PRM}?x=1"', None),
+        (PRM, f'Bearer resource_metadata="{OTHER_PRM}", Bearer resource_metadata="{PRM}"', None),
+    ],
+)
+async def test_a_401_naming_other_resource_metadata_is_kept_for_health(
+    tmp_path: Path, pinned: str | None, challenge: str, noted: str | None
+) -> None:
+    cred = SPOTIFY_CRED if pinned is None else {**SPOTIFY_CRED, "resource_metadata": pinned}
+    r = OAuthRig(tmp_path, cred=cred)
+    try:
+        r.seed()
+        r.api.reject = {await first_token(r)}
+        r.api.challenges = [challenge]
+        await r.call("GET")
+        found = r.tokens.status()[0]["resource_metadata"]
+        assert (found["url"] if found else None) == noted
+    finally:
+        await r.aclose()
+
+
+async def test_a_403_keeps_its_scope_but_not_its_resource_metadata(tmp_path: Path) -> None:
+    """J: resource_metadata_changed is a 401's; a 403 is the step-up's (D.5)."""
+    r = OAuthRig(tmp_path, cred={**SPOTIFY_CRED, "resource_metadata": PRM})
+    try:
+        r.seed()
+        await first_token(r)
+        r.api.forbidden = (
+            f'Bearer error="insufficient_scope", scope="extra", resource_metadata="{OTHER_PRM}"'
+        )
+        assert (await r.call("GET", "/api/v1/forbidden")).status_code == 403
+        assert r.tokens.status()[0]["resource_metadata"] is None
+        assert upstream_said(r)["scopes"] == ["extra"]
+    finally:
+        await r.aclose()
 
 
 async def test_a_failed_refresh_after_a_401_is_a_502_with_its_code(

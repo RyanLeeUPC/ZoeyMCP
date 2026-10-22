@@ -64,6 +64,7 @@ from zoeymcp.vault.onboarding import (
     server_host_port,
     server_path,
     token_state,
+    widen_scope,
 )
 
 from .test_policy_change import (
@@ -1217,6 +1218,35 @@ def test_onboard_again() -> None:
         "command": "zoeymcp login --mcp https://mcp.notes.example/mcp --reregister",
         "via": "exec",
     }
+
+
+def test_widen_scope_takes_the_union_in_the_credentials_order() -> None:
+    """D.5's step-up (SPEC-11): health's fragment; its cases in words are test_health.py's."""
+    policy = apply(example(), notes_change())
+    widened = widen_scope(policy, "notes", ["notes.admin", "notes.read"])
+    assert widened is not None
+    assert widened.scope == "notes.read notes.write offline_access notes.admin"
+    assert widened.fragment == (
+        "# zoeymcp: widen the scope of notes\n"
+        "credentials:\n"
+        '  "notes":\n'
+        '    kind: "oauth2"\n'
+        '    scope: "notes.read notes.write offline_access notes.admin"\n'
+    )
+    assert widen_scope(policy, "notes", ["notes.read"]) is None
+    assert widen_scope(policy, "notes", []) is None
+    # A scope may repeat a token: what is new is looked for, not counted.
+    notes = policy.credentials["notes"]
+    assert isinstance(notes, OAuth2Credential)
+    twice = notes.model_copy(update={"scope": "notes.read notes.read"})
+    repeated = apply(policy, PolicyChange("t", (SetCredential("notes", twice),)))
+    again = widen_scope(repeated, "notes", ["notes.write"])
+    assert again is not None
+    assert again.scope == "notes.read notes.write"
+    assert widen_scope(repeated, "notes", ["notes.read"]) is None
+    # Only an oauth2 credential of the running policy has a scope to widen.
+    assert widen_scope(policy, "music-stats", ["x"]) is None
+    assert widen_scope(policy, "absent", ["x"]) is None
 
 
 def test_a_step_without_a_command() -> None:

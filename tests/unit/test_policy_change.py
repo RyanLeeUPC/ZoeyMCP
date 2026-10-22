@@ -25,6 +25,7 @@ from zoeymcp.common.policy.change import (
     Op,
     PolicyChange,
     SetCredential,
+    SetScope,
     SetServerReview,
     apply,
     validate,
@@ -491,6 +492,63 @@ def test_a_set_credential_replaces_the_credential_whole() -> None:
         "credentials.absent",
         ("the policy has no such credential",),
     )
+
+
+def test_a_set_scope_merges_into_the_credential() -> None:
+    """Health's step-up fragment (D.5, SPEC-11): only the scope changes, nothing is replaced,
+    so a credential written by hand keeps every other field."""
+    op = SetScope("broker-mcp", ("tools.read", "tools.call"))
+    change = PolicyChange("t", (op,))
+    assert op.scope == "tools.read tools.call"
+    assert change.data() == {
+        "credentials": {"broker-mcp": {"kind": "oauth2", "scope": "tools.read tools.call"}}
+    }
+    assert change.replace() == ()
+    before = example().credentials["broker-mcp"]
+    after = apply(example(), change).credentials["broker-mcp"]
+    assert isinstance(after, OAuth2Credential)
+    assert after.scope == "tools.read tools.call"
+    assert after.model_dump(exclude={"scope"}) == before.model_dump(exclude={"scope"})
+    assert SetScope("broker-mcp", ("a", "b"), ",").scope == "a,b"
+    # Longer than the schema's scope: the merged policy refuses it.
+    long = tuple(chr(97 + n) * 250 for n in range(9))
+    with pytest.raises(ChangeRefused, match=r"^diff_invalid: \(document\); credentials"):
+        apply(example(), PolicyChange("t", (SetScope("broker-mcp", long),)))
+    for name in ("music-stats", "absent"):
+        with pytest.raises(ChangeRefused) as caught:
+            apply(example(), PolicyChange("t", (SetScope(name, ("a",)),)))
+        assert (caught.value.reason, caught.value.path, caught.value.messages) == (
+            "diff_invalid",
+            f"credentials.{name}",
+            ("the policy has no such oauth2 credential",),
+        )
+    assert isinstance(before, OAuth2Credential)
+    with pytest.raises(ValueError, match=r"names credentials\.broker-mcp twice"):
+        PolicyChange("t", (op, SetCredential("broker-mcp", before)))
+
+
+@pytest.mark.parametrize(
+    ("name", "scopes", "separator", "message"),
+    [
+        ("Notes", ("a",), " ", "isn't a policy name"),
+        ("notes", (), " ", "^1 to 64 scopes$"),
+        ("notes", tuple(f"s{n}" for n in range(65)), " ", "^1 to 64 scopes$"),
+        ("notes", ("a b",), " ", "isn't a scope token"),
+        ("notes", ("a,b",), ",", "isn't a scope token"),
+        ("notes", ('a"b',), " ", "isn't a scope token"),
+        ("notes", ("",), " ", "isn't a scope token"),
+        ("notes", ("a" * 257,), " ", "isn't a scope token"),
+        ("notes", ("a",), ";", "literal_error"),
+    ],
+)
+def test_a_set_scope_holds_schema_scope_tokens(
+    name: str, scopes: tuple[str, ...], separator: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        SetScope(name, scopes, separator)  # type: ignore[arg-type]
+    assert SetScope("notes", ("a,b",)).scope == "a,b"
+    assert SetScope("notes", tuple(f"s{n}" for n in range(64)), " ").scopes[-1] == "s63"
+    assert SetScope("notes", ("a" * 256,)).scope == "a" * 256
 
 
 def test_an_egress_private_entry_the_policy_has_is_kept_once() -> None:

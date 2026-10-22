@@ -1,5 +1,8 @@
 """Credential health (M5 design I): every finding both ways, bindings judged by effect, the
 connector journal summed up, and the meta-derived ``last_failure`` and ``idle`` (D-23, D-20).
+M7 (design J, step 10b): a stored client secret held to D.7 step 5 as login holds it (D-185),
+``resource_metadata_changed``, the challenged scope and its ``widen_scope`` fragment, and an
+onboarding's secret waiting for its credential.
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -13,11 +16,14 @@ from typing import Any
 import pytest
 
 from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import OAuth2Credential
-from zoeymcp.vault.bindings import BindingError, oauth_binding
+from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.vault.bindings import BindingError, client_secret_rebound, oauth_binding
 from zoeymcp.vault.connectors.sendjournal import DAY_MS, Journal
 from zoeymcp.vault.health import (
     DISPLAY_ONLY,
+    ONBOARDING_SUFFIXES,
     REGRESSION_DAYS,
     STALE_SECONDS,
     Inputs,
@@ -146,6 +152,7 @@ def status(credential: str = "music", **fields: Any) -> dict[str, Any]:
         "reconsent_due": None,
         "scopes": None,
         "upstream": None,
+        "resource_metadata": None,
         "last_failure": None,
         "idle": None,
     }
@@ -485,10 +492,11 @@ def test_a_connector_reference_with_no_entry() -> None:
         ("music-refresh", origin_binding([API, OTHER]), "changed"),
         ("music-refresh", {"oauth": "x"}, "changed"),
         ("music-refresh", {"oauth": {"token": "https://accounts.example:443"}}, "changed"),
-        # A client ID or secret of a refresh grant: only its token endpoint is checked.
+        # A client ID of a refresh grant: only its token endpoint is checked. Its client
+        # secret is held to D.7 step 5 instead (test_a_client_secret_is_held_as_login_holds_it).
         ("music-id", oauth_binding(TOKEN_URL, [API]), "ok"),
-        ("music-secret", oauth_binding(TOKEN_URL, [EXTRA_ORIGIN]), "ok"),
-        ("music-secret", oauth_binding(OTHER_TOKEN_URL, [API, OTHER]), "changed"),
+        ("music-id", oauth_binding(TOKEN_URL, [EXTRA_ORIGIN]), "ok"),
+        ("music-id", oauth_binding(OTHER_TOKEN_URL, [API, OTHER]), "changed"),
     ],
 )
 def test_an_oauth_binding(name: str, binding: dict[str, Any], verdict: str) -> None:
@@ -565,6 +573,153 @@ def test_a_client_credentials_binding(name: str, binding: dict[str, Any], verdic
             "credential": "machine",
             "ref": f"store:{name}",
         }
+
+
+# --- a stored client secret (M7 design D.7 step 5; D-185) ---------------------------------------
+
+RESOURCE = "https://mcp.music.example/mcp"
+REGISTER_AGAIN = {
+    "kind": "onboard_again",
+    "credential": "music",
+    "command": f"zoeymcp login --mcp {RESOURCE} --reregister",
+}
+SET_SECRET = {"kind": "set_secret", "credential": "music", "ref": "store:music-secret"}
+REFUSED_TEXT = (
+    "store:music-secret was stored for another token endpoint or other server origins than the "
+    "policy has now; login refuses it"
+)
+
+
+@pytest.mark.parametrize(
+    ("binding", "refused"),
+    [
+        (oauth_binding(TOKEN_URL, [API, OTHER]), False),
+        # Token endpoint right, but the routes differ: judge alone said ok.
+        (oauth_binding(TOKEN_URL, [EXTRA_ORIGIN]), True),
+        # A route added since it was stored.
+        (oauth_binding(TOKEN_URL, [API]), True),
+        # A route removed since: wider covers every use, but login wants it exact.
+        (oauth_binding(TOKEN_URL, [API, OTHER, EXTRA_ORIGIN]), True),
+        # Another token endpoint: one finding, the one login refuses with, not binding_changed.
+        (oauth_binding(OTHER_TOKEN_URL, [API, OTHER]), True),
+        (origin_binding([API, OTHER]), True),
+    ],
+)
+def test_a_client_secret_is_held_as_login_holds_it(binding: dict[str, Any], refused: bool) -> None:
+    """Health reports what login refuses as client_secret_binding_changed, from the same
+    function (bindings.client_secret_rebound)."""
+    policy = make_policy({"music": spotify()}, {"music": (API, OTHER)})
+    exact = oauth_binding(TOKEN_URL, [API, OTHER])
+    entries = [
+        entry("music-id", exact),
+        entry("music-secret", binding),
+        entry("music-refresh", exact),
+    ]
+    found = one(report(policy, entries))
+    rows = {row["ref"]: row["binding"] for row in found["refs"]}
+    assert rows["store:music-secret"] == ("changed" if refused else "ok")
+    expected = [finding("client_secret_binding_changed", "error", REFUSED_TEXT, SET_SECRET)]
+    assert found["findings"] == (expected if refused else [])
+    held = {e.name: e for e in entries}
+    cred = policy.credentials["music"]
+    assert isinstance(cred, OAuth2Credential)
+    rebound = client_secret_rebound(policy, cred, held.get)
+    if refused:
+        assert rebound is not None
+        assert (rebound.name, rebound.old, rebound.new) == ("music-secret", binding, exact)
+    else:
+        assert rebound is None
+
+
+@pytest.mark.parametrize(
+    ("upstreams", "stored", "action"),
+    [
+        # Another token endpoint: a re-registration stores the binding the policy derives.
+        ((RESOURCE,), oauth_binding(OTHER_TOKEN_URL, [RESOURCE]), REGISTER_AGAIN),
+        # A route added: a re-registration would store the server's origin alone again.
+        ((RESOURCE, API), oauth_binding(TOKEN_URL, [RESOURCE]), SET_SECRET),
+        # Routed elsewhere than the resource it names.
+        ((API,), oauth_binding(OTHER_TOKEN_URL, [API]), SET_SECRET),
+    ],
+)
+def test_an_onboarded_client_secret_is_registered_again_when_that_clears_it(
+    upstreams: tuple[str, ...], stored: dict[str, Any], action: dict[str, Any]
+) -> None:
+    """--reregister stores the secret under fragment 1's binding (onboard._binding): the token
+    endpoint and the server's origin. It is offered only when that is what the policy derives."""
+    cred = spotify(extra_params={"resource": RESOURCE}, authorize_params={"resource": RESOURCE})
+    policy = make_policy({"music": cred}, {"music": upstreams})
+    exact = oauth_binding(TOKEN_URL, upstreams)
+    entries = [
+        entry("music-id", exact),
+        entry("music-secret", stored),
+        entry("music-refresh", exact),
+    ]
+    found = one(report(policy, entries))
+    assert found["findings"] == [
+        finding("client_secret_binding_changed", "error", REFUSED_TEXT, action)
+    ]
+
+
+def test_a_second_credential_naming_the_secret_changes_its_binding() -> None:
+    policy = make_policy(
+        {"music": spotify(), "radio": spotify(refresh_token="store:radio-refresh")},
+        {"music": (API,), "radio": (OTHER,)},
+    )
+    entries = [
+        entry("music-id", oauth_binding(TOKEN_URL, [API, OTHER])),
+        entry("music-secret", oauth_binding(TOKEN_URL, [API])),
+        entry("music-refresh", oauth_binding(TOKEN_URL, [API])),
+        entry("radio-refresh", oauth_binding(TOKEN_URL, [OTHER])),
+    ]
+    found = report(policy, entries)
+    assert [codes(item) for item in found["credentials"]] == [
+        ["client_secret_binding_changed"],
+        ["client_secret_binding_changed"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "cred",
+    [
+        # No login: a refresh token given by other means, or the client_credentials grant, whose
+        # secret also bounds the access tokens (test_a_client_credentials_binding).
+        spotify(authorize_url=None),
+        machine(client_secret="store:music-secret"),
+        # The grant alone: login fetches a client_credentials token, whatever authorize_url says.
+        machine(client_secret="store:music-secret", authorize_url=AUTHORIZE_URL),
+        # Not from the store.
+        spotify(client_secret="env:MUSIC_SECRET"),
+    ],
+)
+def test_only_a_stored_client_secret_that_logs_in_is_held_to_it(cred: dict[str, Any]) -> None:
+    policy = make_policy({"music": cred})
+    stale = entry("music-secret", oauth_binding(TOKEN_URL, [EXTRA_ORIGIN]))
+    entries = [*SPOTIFY_ENTRIES[::2], entry("machine-id", oauth_binding(TOKEN_URL, [API])), stale]
+    found = one(report(policy, entries, env=["MUSIC_SECRET"]))
+    assert "client_secret_binding_changed" not in codes(found)
+
+
+def test_a_client_secret_the_policy_cant_bind_or_that_is_missing() -> None:
+    no_route = make_policy({"music": spotify()}, {"music": ()})
+    found = one(report(no_route, SPOTIFY_ENTRIES))
+    assert codes(found) == ["no_route"] * 3
+    missing = one(report(make_policy({"music": spotify()}), SPOTIFY_ENTRIES[::2]))
+    assert codes(missing) == ["missing"]
+    none: dict[str, EntryMeta] = {}
+    unset = OAuth2Credential.model_validate(spotify())
+    assert client_secret_rebound(make_policy({"music": spotify()}), unset, none.get) is None
+    # A secret from env: is never looked up, whatever the store holds.
+    from_env = spotify(client_secret="env:MUSIC_SECRET")
+    stale = entry("music-secret", oauth_binding(TOKEN_URL, [EXTRA_ORIGIN]))
+    assert (
+        client_secret_rebound(
+            make_policy({"music": from_env}),
+            OAuth2Credential.model_validate(from_env),
+            lambda name: stale,
+        )
+        is None
+    )
 
 
 def test_a_policy_that_cant_bind_a_name() -> None:
@@ -666,7 +821,8 @@ def test_a_live_slot_is_judged_like_the_grant() -> None:
     policy = make_policy({"music": spotify(**SEEDED)}, {"music": (API, OTHER)})
     entries = [
         entry("music-id", oauth_binding(TOKEN_URL, [API])),
-        entry("music-secret", oauth_binding(TOKEN_URL, [API])),
+        # Exact, or login would refuse it too (D.7 step 5).
+        entry("music-secret", oauth_binding(TOKEN_URL, [API, OTHER])),
         entry(LIVE, oauth_binding(TOKEN_URL, [API])),
     ]
     found = one(report(policy, entries))
@@ -714,6 +870,71 @@ def test_entries_nothing_uses() -> None:
     # A live slot is used only while its credential is seeded.
     unseeded = make_policy({"music": spotify()})
     assert codes(report(unseeded, [entry(LIVE, {"oauth": {}})])["store"]) == ["orphan_slot"]
+
+
+ONBOARDED = {
+    "onboarded": "auth.notes.example",
+    "resource": "https://mcp.notes.example/mcp",
+    "client_id": "client-1",
+    "client_secret_expires_at": None,
+}
+
+
+def test_an_onboardings_secret_waits_for_its_credential() -> None:
+    """D.7 step 6: a secret (or a public client's ID) stored before fragment 1 was committed.
+    The wording comes from clear meta, so it is advisory; the code, level and action stay."""
+    entries = [
+        entry("notes-client-secret", oauth_binding(TOKEN_URL, [API]), ONBOARDED),
+        entry("files-client-id", oauth_binding(TOKEN_URL, [API]), ONBOARDED),
+        # Another name, no onboarded meta, or meta of the wrong type: the usual words.
+        entry("notes-key", origin_binding([API]), ONBOARDED),
+        entry("mail-client-secret", oauth_binding(TOKEN_URL, [API]), {"resource": "x"}),
+        entry("old-client-secret", oauth_binding(TOKEN_URL, [API]), {"onboarded": 1}),
+        entry("-client-id", oauth_binding(TOKEN_URL, [API]), ONBOARDED),
+    ]
+    store = report(make_policy({}), entries)["store"]
+    waiting = "is waiting for its credential: commit onboarding fragment 1 for"
+    assert store["findings"][:2] == [
+        finding(
+            "unreferenced",
+            "info",
+            f"store:notes-client-secret {waiting} notes, or delete it",
+            {"kind": "delete_secret", "secret": "notes-client-secret"},
+            advisory=True,
+        ),
+        finding(
+            "unreferenced",
+            "info",
+            f"store:files-client-id {waiting} files, or delete it",
+            {"kind": "delete_secret", "secret": "files-client-id"},
+            advisory=True,
+        ),
+    ]
+    assert [(f["text"], f["advisory"]) for f in store["findings"][2:]] == [
+        (f"nothing in the policy uses store:{e.name}", False) for e in entries[2:]
+    ]
+    assert ONBOARDING_SUFFIXES == ("-client-secret", "-client-id")
+    # Once the policy names it, nothing.
+    named = make_policy({"notes": header("store:notes-client-secret")})
+    assert report(named, entries[:1])["store"]["findings"] == []
+
+
+def test_health_reads_no_clock_for_an_onboarding() -> None:
+    """FM-28's monotonic half: onboardings expire on the table's monotonic clock
+    (test_onboarding.py), and health judges nothing of one by the wall clock. A secret's
+    client_secret_expires_at (step 11's expiry codes) and its times change nothing yet."""
+    long_ago = {**ONBOARDED, "client_secret_expires_at": 1}
+    old = EntryMeta(
+        "notes-client-secret",
+        oauth_binding(TOKEN_URL, [API]),
+        "kid",
+        "1971-01-01T00:00:00Z",
+        "1971-01-01T00:00:00Z",
+        long_ago,
+    )
+    new = entry("notes-client-secret", oauth_binding(TOKEN_URL, [API]), ONBOARDED)
+    assert report(make_policy({}), [old]) == report(make_policy({}), [new])
+    assert codes(report(make_policy({}), [old])["store"]) == ["unreferenced"]
 
 
 def test_a_store_that_cant_be_written() -> None:
@@ -816,6 +1037,127 @@ def test_an_upstreams_insufficient_scope_is_since_the_vault_started() -> None:
             "an upstream said the token lacks a scope at 2026-09-21T10:00:00Z "
             "(since the vault started)",
             CONNECT,
+        )
+    ]
+
+
+def scope_findings(
+    asked: Sequence[str] | None, cred: Mapping[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    upstream: dict[str, Any] = {"code": "upstream_insufficient_scope", "at": "2026-09-21T10:00:00Z"}
+    if asked is not None:
+        upstream["scopes"] = list(asked)
+    return oauth_findings({"upstream": upstream}, cred or spotify(scope="read"))
+
+
+SAID = "an upstream said the token lacks a scope at 2026-09-21T10:00:00Z (since the vault started)"
+WIDENED = (
+    "# zoeymcp: widen the scope of music\n"
+    "credentials:\n"
+    '  "music":\n'
+    '    kind: "oauth2"\n'
+    '    scope: "read write admin"\n'
+)
+
+
+def test_a_challenged_scope_is_widened_by_a_fragment() -> None:
+    """SPEC-11: the union of the committed scope and the challenged one, committed tokens
+    first, as a fragment that merges into the credential and keeps the rest of it; then
+    connect (the CLI's words)."""
+    [found] = scope_findings(["write", "read", "admin"])
+    assert found == finding(
+        "insufficient_scope",
+        "warning",
+        f"{SAID}; it asked for write read admin",
+        {
+            "kind": "widen_scope",
+            "credential": "music",
+            "scope": "read write admin",
+            "fragment": WIDENED,
+        },
+    )
+    policy = make_policy({"music": spotify(scope="read", expected_scopes=["read"])})
+    fragment = load_mapping(WIDENED)
+    assert replace_paths(WIDENED) == ()
+    base = policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    merged = merge(base, fragment)
+    assert isinstance(merged, Merged)
+    widened = Policy.model_validate(merged.data).credentials["music"]
+    assert isinstance(widened, OAuth2Credential)
+    original = policy.credentials["music"]
+    assert widened.scope == "read write admin"
+    assert widened.model_dump(exclude={"scope"}) == original.model_dump(exclude={"scope"})
+
+
+@pytest.mark.parametrize(
+    ("asked", "cred", "widened_to"),
+    [
+        # Nothing new asked for: sign in again, as before.
+        (["read"], spotify(scope="read"), None),
+        # The credential's own separator.
+        (["write"], spotify(scope="read,list", scope_separator=","), "read,list,write"),
+        # A token holding that separator would split into two: no fragment.
+        (["a,b"], spotify(scope="read", scope_separator=","), None),
+        # No scope yet: the challenged one.
+        (["read", "read"], spotify(), "read"),
+        # More than the schema's 64 scopes, or longer than its 2048 characters.
+        ([f"s{n}" for n in range(64)], spotify(scope="read"), None),
+        ([chr(97 + n) * 250 for n in range(9)], spotify(scope="read"), None),
+    ],
+)
+def test_a_challenged_scope_the_credential_cant_take_is_signed_in_for(
+    asked: list[str], cred: dict[str, Any], widened_to: str | None
+) -> None:
+    [found] = scope_findings(asked, cred)
+    assert found["text"] == f"{SAID}; it asked for {' '.join(asked)}"
+    if widened_to is None:
+        assert found["action"] == CONNECT
+    else:
+        assert (found["action"]["kind"], found["action"]["scope"]) == ("widen_scope", widened_to)
+
+
+def test_a_challenge_without_a_scope_says_what_it_did() -> None:
+    expected = [finding("insufficient_scope", "warning", SAID, CONNECT)]
+    assert scope_findings(None) == expected
+    assert scope_findings([]) == expected
+
+
+PRM = "https://mcp.music.example/.well-known/oauth-protected-resource/mcp"
+MOVED = "https://auth.music.example/.well-known/oauth-protected-resource"
+
+
+@pytest.mark.parametrize(
+    ("cred", "named", "action"),
+    [
+        (
+            spotify(resource_metadata=PRM, extra_params={"resource": RESOURCE}),
+            MOVED,
+            REGISTER_AGAIN,
+        ),
+        # A credential written by hand, with no resource to onboard again by.
+        (spotify(resource_metadata=PRM), MOVED, {"kind": "fix_policy", "credential": "music"}),
+        # The same URL (a reload took the new one), or nothing pinned (D.2a): nothing.
+        (spotify(resource_metadata=PRM), PRM, None),
+        (spotify(), MOVED, None),
+        (spotify(resource_metadata=PRM), None, None),
+    ],
+)
+def test_a_resource_metadata_other_than_the_credentials(
+    cred: dict[str, Any], named: str | None, action: dict[str, str] | None
+) -> None:
+    moved = None if named is None else {"url": named, "at": "2026-09-21T10:00:00Z"}
+    found = oauth_findings({"resource_metadata": moved}, cred)
+    if action is None:
+        assert found == []
+        return
+    assert found == [
+        finding(
+            "resource_metadata_changed",
+            "warning",
+            "a 401 on its route named other protected-resource metadata than its "
+            "resource_metadata at 2026-09-21T10:00:00Z (since the vault started): the server "
+            "may have moved its authorization; the vault never registers again by itself",
+            action,
         )
     ]
 

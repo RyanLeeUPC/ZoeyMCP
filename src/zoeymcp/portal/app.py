@@ -238,6 +238,10 @@ ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
         "reset_passkeys": "Run zoeymcp setup-code --reset with host access.",
         "check_gateway": "Check that the gateway is running and reporting.",
         "read_ledger": "Read it on the Ledger page, or with zoeymcp ledger --vault.",
+        "onboard_again": "Register a new client: run zoeymcp health with host access for "
+        "the command.",
+        "widen_scope": "Merge the scope fragment from zoeymcp health --json, check and reload "
+        "the policy, then connect.",
     }
 )
 # The banner while the reported copy refuses reports (K.3), by its state (J.2 rows 8-10).

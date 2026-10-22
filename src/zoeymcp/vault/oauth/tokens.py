@@ -21,7 +21,7 @@ import hashlib
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
@@ -285,7 +285,9 @@ class TokenManager:
         self._previous: dict[str, Secret] = {}
         self._granted: dict[str, tuple[str, ...]] = {}
         # The last thing an upstream said about a credential's token, for status.
-        self._upstream: dict[str, dict[str, str]] = {}
+        self._upstream: dict[str, dict[str, Any]] = {}
+        # The last resource_metadata a 401 named other than the credential's (M7 design J).
+        self._resource_metadata: dict[str, dict[str, str]] = {}
         self._serial = 0
         self._closing = False
 
@@ -396,12 +398,27 @@ class TokenManager:
         self._slots[self._configs[credential].slot].trigger = "upstream_401"
         return "invalidated"
 
-    def note_upstream(self, credential: str, code: str) -> None:
-        """Record what an upstream said about the credential's token, for :meth:`status`.
+    def note_upstream(self, credential: str, code: str, *, scopes: Sequence[str] = ()) -> None:
+        """Record what an upstream said about the credential's token, for :meth:`status`, with
+        the scope tokens its challenge asked for, already cleaned and bounded (M7 design D.5).
 
         Memory only: a caller can make the upstream say it on every request. A login clears it.
         """
-        self._upstream[credential] = {"code": code, "at": _iso(self._wall())}
+        said: dict[str, Any] = {"code": code, "at": _iso(self._wall())}
+        if scopes:
+            said["scopes"] = list(scopes)
+        self._upstream[credential] = said
+
+    def note_resource_metadata(self, credential: str, url: str) -> None:
+        """Record that a 401 on the credential's route named ``url`` as its protected-resource
+        metadata, for :meth:`status` and health's ``resource_metadata_changed`` (M7 design J).
+
+        Memory only, like :meth:`note_upstream`; a login doesn't clear it, since only onboarding
+        again changes what the credential was registered for. Health compares it with the
+        credential's ``resource_metadata`` of the running policy, so a reload that takes the new
+        URL ends the finding.
+        """
+        self._resource_metadata[credential] = {"url": url, "at": _iso(self._wall())}
 
     # --- writers -------------------------------------------------------------------------------
 
@@ -592,6 +609,7 @@ class TokenManager:
                     "persisted": not self._store.dirty,
                     "meta": meta if isinstance(meta, dict) else None,
                     "upstream": self._upstream.get(name),
+                    "resource_metadata": self._resource_metadata.get(name),
                 }
             )
         return result

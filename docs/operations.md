@@ -250,7 +250,7 @@ these `reason` codes, and the portal answers with the same reason and status, in
 | `client_id_unavailable`, `client_secret_unavailable` | the client ID ref or client secret isn't set, or the client ID isn't bound to the token endpoint (a stored client secret bound otherwise is `client_secret_binding_changed`) | `zoeymcp secret set <name>`, or set the env var and restart (the message says which) |
 | `not_configured` | the token manager doesn't know the credential; it shouldn't happen | reload the policy (§7) or restart the vault |
 | `binding_changed` | the stored grant is bound differently from what the policy now derives; or, for a pasted answer or a code the portal's callback holds, a reload since the login started changed the credential's `issuer` or turned `require_iss` off (`old` and `new` show both) | `--rebind`; for the issuer, run `login` again |
-| `client_secret_binding_changed` | the client secret in the store is bound to another token endpoint origin or other server origins than the policy now derives. An onboarded client's secret is stored for the endpoints its fragment named; one you set yourself, for the token endpoint and the routes its credential had then, so adding or removing a route of a credential with a stored client secret, or naming the secret from a second credential, also needs it entered again (`zoeymcp health` doesn't report this yet) | revert the edit, onboard again, or enter the secret again with `zoeymcp secret set <name>`; `--rebind` doesn't apply |
+| `client_secret_binding_changed` | the client secret in the store is bound to another token endpoint origin or other server origins than the policy now derives. An onboarded client's secret is stored for the endpoints its fragment named; one you set yourself, for the token endpoint and the routes its credential had then, so adding or removing a route of a credential with a stored client secret, or naming the secret from a second credential, also needs it entered again (`zoeymcp health` reports it by this code, §3) | revert the edit, onboard again, or enter the secret again with `zoeymcp secret set <name>`; `--rebind` doesn't apply |
 | `too_many_flows` | 8 logins are pending | finish one, or wait 10 minutes |
 | `flow_unknown` | the flow expired, was used, or belongs to another credential | run `login` again |
 | `redirect_mismatch` | the pasted address isn't under `redirect_uri`, can't be read, or has the answer in the fragment | paste the full address from the address bar |
@@ -288,9 +288,10 @@ It exits 0 with no error (with `--strict`, no warning either), 1 otherwise, and 
 can't be asked. `--json` prints the whole report, with a `summary` of counts per level and each
 finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
 `set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
-`check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys` or
-`reset_passkeys`, and the name it applies to). For a
-deployment's verify script:
+`check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys`,
+`reset_passkeys`, `onboard_again` (with the `command`, `login --mcp URL --reregister`) or
+`widen_scope` (with the `scope` and the `fragment` that sets it), and the name it applies to). For
+a deployment's verify script:
 
 ```sh
 docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp health --json --strict > /dev/null
@@ -304,13 +305,15 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `env_unset` | error | an `env:` reference's variable wasn't set when the vault loaded the policy (an env seed only while there is no live token) |
 | `binding_changed` | error | the entry's binding doesn't cover a use the policy makes now (a route added, another connector constraint or token endpoint): the vault refuses that use until you enter it again |
 | `binding_wider` | info | the binding covers every use and more (an explicit `--origin`, or a route removed since): it works |
+| `client_secret_binding_changed` | error | a `store:` client secret of a credential you log in to isn't bound exactly as the policy now derives (§2's login refusal of that name): the token endpoint, or the routes of every credential naming it, differ from when it was stored. Onboard again (the action's command, for a credential onboarding wrote, when every route using the secret still goes to that server's origin) or enter it again with `secret set` |
 | `no_route`, `binding_conflict` | error | the policy can't bind the name, as `secret set` would refuse it: fix the policy |
 | `seed_ignored` | info | an env seed is set while the live token is used (§5) |
-| `unreferenced`, `orphan_slot` | info | an entry nothing in the policy uses; a live slot no credential keeps its token in |
+| `unreferenced`, `orphan_slot` | info | an entry nothing in the policy uses; a live slot no credential keeps its token in. An onboarding's client secret or client ID stored before its fragment 1 was committed says it is waiting for its credential (from stored metadata, §11) |
 | `degraded` | error | the store can't be written (§1) |
 | `terminal`, `backoff` | error, warning | as `oauth status` shows them, with the hint's action |
 | `reconsent_due`, `unexpected_scopes`, `missing_scopes` | warning | as `oauth status` shows them |
-| `insufficient_scope` | warning | an upstream said the token lacks a scope, **since the vault started**: a restart forgets it |
+| `insufficient_scope` | warning | an upstream said the token lacks a scope, **since the vault started**: a restart forgets it. When its challenge named a `scope`, the text lists it, and if that adds to the credential's own the action is `widen_scope`: merge the fragment (`--json` holds it; it sets `credentials.<c>.scope` to the union and keeps the rest), check and reload, then `zoeymcp login <c>`. The vault never widens a scope itself |
+| `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`login --mcp URL --reregister`); the vault never registers again by itself |
 | `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
 | `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
 | `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |

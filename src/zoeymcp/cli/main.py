@@ -65,6 +65,11 @@ HEALTH_ACTIONS = {
     "add_passkey": "run: zoeymcp setup-code, and enrol a second passkey with it",
     "review_passkeys": "run: zoeymcp passkeys, and remove any you don't recognize",
     "reset_passkeys": "run: zoeymcp setup-code --reset",
+    "onboard_again": "run: {command}",
+    "widen_scope": (
+        'merge credentials.{credential}.scope: "{scope}" (the fragment is in health --json), '
+        "check and reload the policy, then run: zoeymcp login {credential}"
+    ),
 }
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
