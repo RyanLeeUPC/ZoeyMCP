@@ -1517,13 +1517,12 @@ with urllib.request.urlopen(request, timeout=60) as answer:
 found="$(probe "${egress_project}_internal" -c "$send_mail" "$egress_gateway_key")" \
     || egress_fail "the send through the role failed"
 [ "$found" = 200 ] || egress_fail "the send through the role answered $found"
-i=0
-until egress_tier logs egress-proxy 2>&1 | grep '"event":"egress_tunnel"' | grep '"host":"fake-smtp"' \
-    | grep -q '"port":4650'; do
-    i=$((i + 1))
-    [ "$i" -lt 50 ] || egress_fail "the role logged no tunnel to fake-smtp:4650"
-    sleep 0.2
-done
+# A tunnel's egress_tunnel line comes when it ends. After QUIT the fake's TLS close can wait out
+# asyncio's 30 s shutdown timeout for a close_notify the vault never sends, so stop the role:
+# it ends every open tunnel ("stopped") and logs each, closed or not.
+egress_tier stop -t 15 egress-proxy >/dev/null 2>&1 || egress_fail "the role didn't stop"
+egress_tier logs egress-proxy 2>&1 | grep '"event":"egress_tunnel"' | grep '"host":"fake-smtp"' \
+    | grep -q '"port":4650' || egress_fail "the role logged no tunnel to fake-smtp:4650"
 egress_tier logs fake-smtp 2>&1 | grep '"event":"smtp_session"' \
     | grep -F '"rcpt_to":["partner@mail.example"]' | grep -F '"tls_at_auth":[true]' \
     | grep -q '"data":true' || egress_fail "the fake mail server got no message over TLS"
