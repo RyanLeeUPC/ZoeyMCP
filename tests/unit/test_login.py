@@ -23,7 +23,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
-from tests.fakes.oauth_server import FakeAuthServer, google_style, spotify_style
+from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer, google_style, spotify_style
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.vault import logs
@@ -2479,6 +2479,238 @@ async def test_a_cli_flow_never_takes_a_callback(tmp_path: Path, clock: FakeCloc
     assert not_taken(rig, url, planted).reason == "callback_not_taken"
     assert the_flow(rig, started["flow"]).stage == "pending"
     assert (await rig.login.complete("music", started["flow"], url))["persisted"] is True
+
+
+# --- mix-up (M7 design D.6) ----------------------------------------------------------------------
+
+STRICT = {"issuer": ISSUER, "require_iss": True}
+LOOSE = {"issuer": ISSUER, "require_iss": False}
+CHANGED_ISSUER = (
+    "the policy changed this credential's issuer or require_iss since the login started; "
+    "run login again"
+)
+MISSING = ("iss_missing", "the answer has no iss, which this server always sends")
+
+
+def issuer_rig(tmp_path: Path, clock: FakeClock, **fields: Any) -> Rig:
+    """A credential naming its issuer, and a fake that puts that iss on its code answers."""
+    server = spotify_style(clock.time, issuer=ISSUER)
+    return Rig(tmp_path, clock, make_policy({"music": spotify(issuer=ISSUER, **fields)}), server)
+
+
+async def test_a_flow_records_the_credentials_issuer_terms(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = issuer_rig(tmp_path, clock, require_iss=True)
+    started = await rig.start()
+    flow = the_flow(rig, started["flow"])
+    assert (flow.issuer, flow.require_iss) == (ISSUER, True)
+    pasted = await rig.browse(started["authorize_url"])
+    assert (await rig.login.complete("music", started["flow"], pasted))["persisted"] is True
+    (tmp_path / "plain").mkdir(mode=0o700)
+    plain = spotify_rig(tmp_path / "plain", clock)
+    flow = the_flow(plain, (await plain.start())["flow"])
+    assert (flow.issuer, flow.require_iss) == (None, False)
+
+
+async def test_a_required_iss_that_is_missing_is_refused(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    rig = issuer_rig(tmp_path, clock, require_iss=True)
+    rig.server.switches.add(AuthSwitch.ISS_MISSING)
+    flow, pasted = await rig.approved(owner=SESSION)
+    refused = checked(rig, "music", flow, pasted, SESSION)
+    assert (refused.reason, str(refused), refused.details) == (*MISSING, {})
+    refused = await rig.refused(rig.login.complete("music", flow, pasted, SESSION))
+    assert (refused.reason, str(refused), refused.details) == (*MISSING, {})
+    assert rig.server.calls == []
+    assert [e["reason"] for e in captured.events("oauth_login_failed")] == ["iss_missing"]
+
+
+async def test_an_answer_without_iss_is_taken_when_iss_isnt_required(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = issuer_rig(tmp_path, clock)
+    rig.server.switches.add(AuthSwitch.ISS_MISSING)
+    assert (await rig.login_once())["persisted"] is True
+
+
+async def test_a_wrong_iss_on_an_error_shows_no_provider_text(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    """The answer's error and description are never read: the CLI and the portal get only
+    iss_mismatch, with no details, and the paste check leaves the flow."""
+    rig = issuer_rig(tmp_path, clock, require_iss=True)
+    rig.server.switches.add(AuthSwitch.ISS_WRONG_ON_ERROR)
+    rig.server.answer = "error"
+    flow, pasted = await rig.approved()
+    assert "error_description=" in pasted
+    for refused in (
+        checked(rig, "music", flow, pasted),
+        await rig.refused(rig.login.complete("music", flow, pasted)),
+    ):
+        assert (refused.reason, str(refused), refused.details) == (
+            "iss_mismatch",
+            "the response came from a different issuer",
+            {},
+        )
+    assert rig.server.error_description not in captured.text
+    assert "access_denied" not in captured.text
+
+
+@pytest.mark.parametrize(
+    ("change", "new"),
+    [
+        # check refuses require_iss without issuer, so a reload removes both.
+        ({"issuer": None, "require_iss": False}, {"issuer": None, "require_iss": False}),
+        (
+            {"issuer": "https://other-issuer.example"},
+            {"issuer": "https://other-issuer.example", "require_iss": True},
+        ),
+        ({"require_iss": False}, LOOSE),
+    ],
+    ids=["issuer-removed", "issuer-changed", "require-iss-loosened"],
+)
+async def test_a_reload_between_start_and_answer_ends_the_paste(
+    tmp_path: Path, clock: FakeClock, change: dict[str, Any], new: dict[str, Any]
+) -> None:
+    """SPEC-2: a flow started, the policy reloaded, then an answer pasted: refused before it is
+    read, whatever iss it carries, and nothing is exchanged."""
+    rig = issuer_rig(tmp_path, clock, require_iss=True)
+    started = await rig.start()
+    flow = started["flow"]
+    good = await rig.browse(started["authorize_url"])
+    rig.server.answer = "wrong_iss"
+    wrong = await rig.browse(started["authorize_url"])
+    rig.reconfigure(make_policy({"music": spotify(**{**STRICT, **change})}))
+    refused = checked(rig, "music", flow, wrong)
+    assert (refused.reason, str(refused)) == ("binding_changed", CHANGED_ISSUER)
+    assert refused.details == {"old": STRICT, "new": new}
+    refused = await rig.refused(rig.login.complete("music", flow, good))
+    assert (refused.reason, refused.details) == ("binding_changed", {"old": STRICT, "new": new})
+    again = await rig.refused(rig.login.complete("music", flow, good))
+    assert again.reason == "flow_unknown"
+    assert rig.server.calls == []
+
+
+async def test_a_stricter_reload_keeps_the_flows_own_terms(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """The answer is checked against what the flow recorded, never the live credential: a
+    reload that only adds require_iss neither refuses the flow nor requires iss of its answer."""
+    rig = issuer_rig(tmp_path, clock)
+    rig.server.switches.add(AuthSwitch.ISS_MISSING)
+    flow, pasted = await rig.approved()
+    rig.reconfigure(make_policy({"music": spotify(**STRICT)}))
+    assert (await rig.login.complete("music", flow, pasted))["persisted"] is True
+
+
+async def test_a_reload_that_names_an_issuer_ends_a_flow_without_one(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = spotify_rig(tmp_path, clock)
+    rig.server.issuer = ISSUER
+    flow, pasted = await rig.approved()
+    rig.reconfigure(make_policy({"music": spotify(issuer=ISSUER)}))
+    refused = await rig.refused(rig.login.complete("music", flow, pasted))
+    assert (refused.reason, refused.details) == (
+        "binding_changed",
+        {"old": {"issuer": None, "require_iss": False}, "new": LOOSE},
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"issuer": None, "require_iss": False},
+        {"issuer": "https://other-issuer.example"},
+        {"require_iss": False},
+    ],
+    ids=["issuer-removed", "issuer-changed", "require-iss-loosened"],
+)
+async def test_a_reload_between_start_and_answer_ends_the_callback(
+    tmp_path: Path, clock: FakeClock, change: dict[str, Any]
+) -> None:
+    rig = callback_rig(tmp_path, clock, **STRICT)
+    rig.server.issuer = ISSUER
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    rig.reconfigure(callback_policy(**{**STRICT, **change}))
+    assert not_taken(rig, url, started["binder"]).reason == "callback_not_taken"
+    assert the_flow(rig, started["flow"]).stage == "pending"
+    # Back as it was, the callback is taken.
+    rig.reconfigure(callback_policy(**STRICT))
+    assert received(rig, url, started["binder"]) == "returned"
+
+
+async def test_a_reload_between_the_callback_and_the_confirm_ends_the_flow(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """SPEC-2 for a code the callback holds: the confirm's check and the paste refuse it and
+    leave it, the confirm ends it, and the held code is never sent."""
+    rig = callback_rig(tmp_path, clock, **STRICT)
+    rig.server.issuer = ISSUER
+    started = await portal_start(rig)
+    flow = started["flow"]
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "returned"
+    other = {"issuer": "https://other-issuer.example", "require_iss": True}
+    rig.reconfigure(callback_policy(**other))
+    details = {"old": STRICT, "new": other}
+    with pytest.raises(LoginError) as caught:
+        rig.login.check_returned("music", flow, SESSION)
+    assert (caught.value.reason, str(caught.value)) == ("binding_changed", CHANGED_ISSUER)
+    assert caught.value.details == details
+    refused = checked(rig, "music", flow, url, SESSION)
+    assert (refused.reason, refused.details) == ("binding_changed", details)
+    assert the_flow(rig, flow).stage == "returned"
+    refused = await rig.refused(rig.login.complete_returned("music", flow, SESSION))
+    assert (refused.reason, refused.details) == ("binding_changed", details)
+    assert len(rig.login._flows) == 0
+    assert rig.server.calls == []
+
+
+async def test_a_callback_checks_the_flows_own_terms(tmp_path: Path, clock: FakeClock) -> None:
+    rig = callback_rig(tmp_path, clock, **LOOSE)
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])  # no iss: this fake has no issuer
+    rig.reconfigure(callback_policy(**STRICT))
+    assert received(rig, url, started["binder"]) == "returned"
+
+
+@pytest.mark.parametrize(
+    ("switch", "reason"),
+    [(AuthSwitch.ISS_MISSING, "iss_missing"), (AuthSwitch.ISS_WRONG_ON_ERROR, "iss_mismatch")],
+)
+async def test_a_mismatched_error_fails_the_callback_flow_with_no_provider_text(
+    tmp_path: Path, clock: FakeClock, captured: Captured, switch: AuthSwitch, reason: str
+) -> None:
+    rig = callback_rig(tmp_path, clock, **STRICT)
+    rig.server.issuer = ISSUER
+    rig.server.switches.add(switch)
+    rig.server.answer = "error"
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "failed"
+    assert the_flow(rig, started["flow"]).failure == Failure(reason)
+    status = rig.login.flow_status(started["flow"], SESSION)
+    assert status["failure"] == {"reason": reason, "error": None, "description": None}
+    [line] = captured.events("oauth_callback_failed")
+    assert (line["reason"], line["error"]) == (reason, None)
+    assert rig.server.error_description not in captured.text
+
+
+async def test_a_paste_missing_a_required_iss_for_a_returned_flow_is_a_conflict(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = callback_rig(tmp_path, clock, **STRICT)
+    rig.server.issuer = ISSUER
+    started = await portal_start(rig)
+    url = await rig.browse(started["authorize_url"])
+    assert received(rig, url, started["binder"]) == "returned"
+    refused = checked(rig, "music", started["flow"], with_query(url, iss=None), SESSION)
+    assert refused.reason == "flow_conflict"
+    assert the_flow(rig, started["flow"]).failure == Failure("conflict")
 
 
 # --- the stateful machine (O.2) -------------------------------------------------------------

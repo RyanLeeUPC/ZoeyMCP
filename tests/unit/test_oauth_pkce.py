@@ -201,14 +201,18 @@ def test_a_bare_query_or_a_fragment_never_reaches_the_url(endpoint: str, message
 # --- the redirect ------------------------------------------------------------------------------
 
 
-def parse(pasted: str, *, issuer: str | None = None, state: str = STATE) -> tuple[str, str | None]:
-    result = parse_redirect(pasted, redirect_uri=REDIRECT, state=Secret(state), issuer=issuer)
+def parse(
+    pasted: str, *, issuer: str | None = None, require_iss: bool = False, state: str = STATE
+) -> tuple[str, str | None]:
+    result = parse_redirect(
+        pasted, redirect_uri=REDIRECT, state=Secret(state), issuer=issuer, require_iss=require_iss
+    )
     return result.code.reveal(), result.iss
 
 
-def refused(pasted: str, *, issuer: str | None = None) -> RedirectError:
+def refused(pasted: str, *, issuer: str | None = None, require_iss: bool = False) -> RedirectError:
     with pytest.raises(RedirectError) as caught:
-        parse(pasted, issuer=issuer)
+        parse(pasted, issuer=issuer, require_iss=require_iss)
     return caught.value
 
 
@@ -249,11 +253,15 @@ def test_the_redirect_must_match(pasted: str) -> None:
 @pytest.mark.parametrize("path", ["", "/"])
 def test_an_empty_path_is_the_root(redirect_uri: str, path: str) -> None:
     pasted = f"http://127.0.0.1:8976{path}?code={CODE}&state={STATE}"
-    result = parse_redirect(pasted, redirect_uri=redirect_uri, state=Secret(STATE), issuer=None)
+    result = parse_redirect(
+        pasted, redirect_uri=redirect_uri, state=Secret(STATE), issuer=None, require_iss=False
+    )
     assert result.code.reveal() == CODE
     other = f"http://127.0.0.1:8976/callback?code={CODE}&state={STATE}"
     with pytest.raises(RedirectError) as caught:
-        parse_redirect(other, redirect_uri=redirect_uri, state=Secret(STATE), issuer=None)
+        parse_redirect(
+            other, redirect_uri=redirect_uri, state=Secret(STATE), issuer=None, require_iss=False
+        )
     assert caught.value.reason == "redirect_mismatch"
 
 
@@ -360,14 +368,82 @@ def test_provider_error_text_is_filtered() -> None:
     assert tail.description == "d" * 200
 
 
-def test_the_issuer_must_match_when_both_are_known() -> None:
-    issuer = "https://accounts.example"
-    assert parse(ok_url("&iss=https%3A%2F%2Faccounts.example"), issuer=issuer) == (CODE, issuer)
-    assert parse(ok_url(), issuer=issuer) == (CODE, None)
-    error = refused(ok_url("&iss=https%3A%2F%2Fevil.example"), issuer=issuer)
-    assert (error.reason, str(error)) == (
-        "iss_mismatch",
-        "the response came from a different issuer",
+ISSUER = "https://accounts.example"
+RIGHT_ISS = "&iss=https%3A%2F%2Faccounts.example"
+WRONG_ISS = "&iss=https%3A%2F%2Fevil.example"
+MISMATCH = ("iss_mismatch", "the response came from a different issuer")
+MISSING = ("iss_missing", "the answer has no iss, which this server always sends")
+
+
+def test_iss_advertised_and_present_is_compared() -> None:
+    """RFC 9207 2.4, row 1: the server sends iss, and it must be the issuer."""
+    assert parse(ok_url(RIGHT_ISS), issuer=ISSUER, require_iss=True) == (CODE, ISSUER)
+    error = refused(ok_url(WRONG_ISS), issuer=ISSUER, require_iss=True)
+    assert (error.reason, str(error)) == MISMATCH
+    # An empty iss is present, and isn't the issuer.
+    assert refused(ok_url("&iss="), issuer=ISSUER, require_iss=True).reason == "iss_mismatch"
+
+
+def test_iss_advertised_and_absent_is_refused() -> None:
+    """Row 2: a server that always sends iss sent none."""
+    error = refused(ok_url(), issuer=ISSUER, require_iss=True)
+    assert (error.reason, str(error)) == MISSING
+    assert (error.error, error.description) == (None, None)
+
+
+def test_iss_not_advertised_and_present_is_compared_when_the_issuer_is_known() -> None:
+    """Row 3: compared against issuer when there is one; any iss passes without it."""
+    assert parse(ok_url(RIGHT_ISS), issuer=ISSUER) == (CODE, ISSUER)
+    error = refused(ok_url(WRONG_ISS), issuer=ISSUER)
+    assert (error.reason, str(error)) == MISMATCH
+    assert parse(ok_url(WRONG_ISS)) == (CODE, "https://evil.example")
+
+
+def test_iss_not_advertised_and_absent_proceeds() -> None:
+    """Row 4."""
+    assert parse(ok_url(), issuer=ISSUER) == (CODE, None)
+    assert parse(ok_url()) == (CODE, None)
+
+
+def test_iss_is_checked_after_state() -> None:
+    error = refused(f"{REDIRECT}?code={CODE}&state=other{WRONG_ISS}", issuer=ISSUER)
+    assert error.reason == "state_mismatch"
+    missing = refused(f"{REDIRECT}?code={CODE}&state=other", issuer=ISSUER, require_iss=True)
+    assert missing.reason == "state_mismatch"
+
+
+def test_iss_is_checked_before_the_code() -> None:
+    assert refused(f"{REDIRECT}?state={STATE}{WRONG_ISS}", issuer=ISSUER).reason == "iss_mismatch"
+    missing = refused(f"{REDIRECT}?state={STATE}", issuer=ISSUER, require_iss=True)
+    assert missing.reason == "iss_missing"
+
+
+@pytest.mark.parametrize("require_iss", [False, True])
+def test_an_error_with_a_wrong_iss_shows_no_provider_text(require_iss: bool) -> None:
+    """MCP 2026-07-28: a mismatched answer's error, description and URI are never read."""
+    pasted = (
+        f"{REDIRECT}?state={STATE}&error=access_denied&error_description=Sign+in+at+evil"
+        f"&error_uri=https%3A%2F%2Fevil.example{WRONG_ISS}"
+    )
+    error = refused(pasted, issuer=ISSUER, require_iss=require_iss)
+    assert (error.reason, str(error)) == MISMATCH
+    assert (error.error, error.description) == (None, None)
+
+
+def test_an_error_without_a_required_iss_shows_no_provider_text() -> None:
+    pasted = f"{REDIRECT}?state={STATE}&error=access_denied&error_description=Sign+in+at+evil"
+    error = refused(pasted, issuer=ISSUER, require_iss=True)
+    assert (error.reason, str(error)) == MISSING
+    assert (error.error, error.description) == (None, None)
+
+
+def test_an_error_with_the_right_iss_is_the_providers() -> None:
+    pasted = f"{REDIRECT}?state={STATE}&error=access_denied&error_description=No{RIGHT_ISS}"
+    error = refused(pasted, issuer=ISSUER, require_iss=True)
+    assert (error.reason, error.error, error.description) == (
+        "provider_error",
+        "access_denied",
+        "No",
     )
 
 
@@ -423,6 +499,7 @@ def test_a_flow() -> None:
     assert flow.redirect_uri == REDIRECT
     assert flow.expires_at == 1600.0
     assert flow.rebind is True
+    assert (flow.issuer, flow.require_iss) == (None, False)
     assert flow.state.reveal() != flow.verifier.reveal()
     assert flow.challenge == code_challenge(flow.verifier.reveal())
     assert flows.start("other", REDIRECT).rebind is False
@@ -508,6 +585,17 @@ def test_cancel() -> None:
 def test_flow_defaults() -> None:
     flow = Flow("id", "music", Secret("s"), Secret("v" * 43), REDIRECT, 1.0)
     assert flow.rebind is False
+    assert (flow.issuer, flow.require_iss) == (None, False)
+
+
+def test_a_flow_records_what_its_answer_is_checked_against() -> None:
+    """M7 design D.6 (SPEC-2): the issuer and require_iss when the flow starts."""
+    flows, _, _ = table()
+    flow = flows.start("music", REDIRECT, issuer=ISSUER, require_iss=True)
+    assert (flow.issuer, flow.require_iss) == (ISSUER, True)
+    assert flows.take(flow.id, "music") is flow
+    loose = flows.start("music", REDIRECT, issuer=ISSUER)
+    assert (loose.issuer, loose.require_iss) == (ISSUER, False)
 
 
 def test_redirects_and_flows_are_frozen() -> None:

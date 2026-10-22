@@ -146,7 +146,7 @@ from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
 from .policyview import Source
 from .policyview import view as policy_view
-from .refusals import Refusal, enrolment, refusal, secret
+from .refusals import Refusal, enrolment, issuer_changed, refusal, secret
 from .refusals import login as login_refusal
 from .routes import (
     CALLBACK,
@@ -1675,7 +1675,9 @@ class PortalApp:
     def _login_refused(self, exc: LoginError, credential: str) -> Refusal:
         """A refused start, paste or exchange in the portal's words (H.3), with the status and
         reason the socket answers. A provider's description (cleaned and capped by the vault,
-        then shown) and a ``binding_changed``'s two bindings go beside the text."""
+        then shown) and a ``binding_changed``'s two bindings go beside the text. A
+        ``binding_changed`` that compares a sign-in's issuer terms (M7 D.6) only ever answers a
+        paste or a confirm, whose dialog shows the text alone, so its text names both terms."""
         cred = self._policy().credentials.get(credential)
         redirect_uri = cred.redirect_uri if isinstance(cred, OAuth2Credential) else ""
         details = exc.details
@@ -1690,10 +1692,10 @@ class PortalApp:
             description = details.get("description")
             more = (("description_shown", None if description is None else shown(description)),)
         elif exc.reason == "binding_changed":
-            more = (
-                ("old_shown", _binding_words(details.get("old"))),
-                ("new_shown", _binding_words(details.get("new"))),
-            )
+            old, new = _binding_words(details.get("old")), _binding_words(details.get("new"))
+            if isinstance(details.get("old"), dict) and "require_iss" in details["old"]:
+                made = issuer_changed(old=old, new=new)
+            more = (("old_shown", old), ("new_shown", new))
         return replace(made, more=more)
 
     def _login_service(self) -> LoginService:
@@ -1974,10 +1976,12 @@ def _binding_words(binding: object) -> str:
     """What a binding lets the vault do with the secret, in words, every origin and host shown
     as text (K.1): "sent to https://api.example:443"; "token endpoint https://auth.example:443,
     its access tokens used at https://api.example:443"; "SMTP mail.example:465 from a@x to
-    b@y"."""
+    b@y". A paste's ``binding_changed`` for a reload between a login's start and its answer
+    (M7 D.6) compares the issuer terms instead: "issuer https://auth.example, iss required"."""
     words = "a binding the vault doesn't recognize"
     if isinstance(binding, dict):
         origins, oauth, smtp = binding.get("origins"), binding.get("oauth"), binding.get("smtp")
+        issuer, require_iss = binding.get("issuer"), binding.get("require_iss")
         if _strings(origins):
             words = f"sent to {', '.join(origins)}"
         elif isinstance(oauth, dict) and isinstance(oauth.get("token"), str):
@@ -1989,6 +1993,9 @@ def _binding_words(binding: object) -> str:
         elif isinstance(smtp, dict) and _strings(smtp.get("to")):
             words = f"SMTP {smtp.get('host')}:{smtp.get('port')} from {smtp.get('from')} to "
             words += ", ".join(smtp["to"])
+        elif isinstance(require_iss, bool) and (issuer is None or isinstance(issuer, str)):
+            named = "no issuer" if issuer is None else f"issuer {issuer}"
+            words = f"{named}, iss {'required' if require_iss else 'not required'}"
     return shown(words, SUMMARY_LIMIT)
 
 

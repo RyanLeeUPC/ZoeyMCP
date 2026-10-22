@@ -86,7 +86,7 @@ NO_REFRESH_HINT: Final = (
 )
 # A paste's refusals after its state matched: an answer for the flow, so for a flow holding a
 # returned code, a different answer (H.6's conflict rule). The others aren't answers for it.
-_ANSWERS: Final = frozenset({"provider_error", "iss_mismatch", "no_code"})
+_ANSWERS: Final = frozenset({"provider_error", "iss_missing", "iss_mismatch", "no_code"})
 # A client secret stored under another binding than the policy now derives (M7 design D.7).
 REGISTERED_ELSEWHERE: Final = (
     "the committed token endpoint or server origin differs from the ones this client was "
@@ -209,6 +209,8 @@ class LoginService:
                 owner=owner,
                 callback=None if binder is None else origin,
                 binder_hash=None if binder is None else binder.sha256(),
+                issuer=cred.issuer,
+                require_iss=cred.require_iss,
             )
         except TooManyFlows as exc:
             raise LoginError("too_many_flows", str(exc)) from None
@@ -367,11 +369,14 @@ class LoginService:
     def check_returned(self, credential: str, flow_id: str, owner: str) -> dict[str, Any]:
         """What completing a flow whose callback returned a code would store, as
         :meth:`check_paste` answers it, with where and when the code came back (F.4). Any other
-        flow, a pending one included, is ``flow_unknown``."""
+        flow, a pending one included, is ``flow_unknown``; one whose ``issuer`` or ``require_iss``
+        a reload changed is ``binding_changed`` and stays (M7 design D.6, SPEC-2)."""
         flow = self._flows.peek(flow_id, credential, owner)
         if flow is None or flow.returned is None:
             raise _flow_unknown()
         cred = self._refresh_credential(credential)
+        if not _issuer_kept(cred, flow):
+            raise _issuer_changed(cred, flow)
         return {
             **self._plan(credential, cred, flow),
             "origin": flow.callback,
@@ -413,12 +418,15 @@ class LoginService:
     async def complete_returned(self, credential: str, flow_id: str, owner: str) -> dict[str, Any]:
         """Exchange the code a callback returned and store the grant, as :meth:`complete` does
         after its parse (H.6). The flow is taken first, in stage ``returned`` only; any other is
-        ``flow_unknown``."""
+        ``flow_unknown``. A reload that changed its ``issuer`` or ``require_iss`` since the code
+        came back ends it, ``binding_changed``, before the code is sent (M7 design D.6, SPEC-2)."""
         try:
             flow = self._flows.take(flow_id, credential, owner, stage="returned")
             if flow is None or flow.returned is None:
                 raise _flow_unknown()
             cred = self._refresh_credential(credential)
+            if not _issuer_kept(cred, flow):
+                raise _issuer_changed(cred, flow)
             return await self._redeem(credential, cred, flow, flow.returned.code)
         except LoginError as exc:
             self._failed(credential, exc)
@@ -436,8 +444,8 @@ class LoginService:
 
         Raises :class:`LoginError` ``duplicate_param``, or ``callback_not_taken`` for every
         other cause (no such flow, expired, failed, the CLI's, no or a wrong binding cookie,
-        the address no longer this credential's callback, the same answer again), with no flow
-        touched."""
+        the address no longer this credential's callback, an ``issuer`` or ``require_iss`` other
+        than the flow recorded, the same answer again), with no flow touched."""
         try:
             state = pkce.callback_state(raw_query)
         except RedirectError as exc:
@@ -453,6 +461,9 @@ class LoginService:
             # on this origin (A.5): a reload that moves either ends the callback, not the paste.
             or cred.redirect_uri != flow.redirect_uri
             or callback_origin(cred.redirect_uri, credential, self._origins()) != origin
+            # Nor may it expect another issuer, or iss less strictly, than the flow recorded
+            # (M7 design D.6, SPEC-2).
+            or not _issuer_kept(cred, flow)
         ):
             raise _not_taken()
         try:
@@ -460,7 +471,8 @@ class LoginService:
                 flow.redirect_uri + "?" + raw_query,
                 redirect_uri=flow.redirect_uri,
                 state=flow.state,
-                issuer=cred.issuer,
+                issuer=flow.issuer,
+                require_iss=flow.require_iss,
             )
             refused = None
         except RedirectError as exc:
@@ -526,11 +538,20 @@ class LoginService:
     def _parse(
         self, credential: str, flow: Flow, redirect_url: str
     ) -> tuple[OAuth2Credential, Redirect]:
-        """The credential, and the code the pasted address carries for the flow."""
+        """The credential, and the code the pasted address carries for the flow, checked against
+        the ``issuer`` and ``require_iss`` the flow recorded. The policy now in force must expect
+        that issuer, and ``iss`` at least as strictly (M7 design D.6, SPEC-2), or the paste is
+        ``binding_changed``, before the address is read."""
         cred = self._refresh_credential(credential)
+        if not _issuer_kept(cred, flow):
+            raise _issuer_changed(cred, flow)
         try:
             redirect = pkce.parse_redirect(
-                redirect_url, redirect_uri=flow.redirect_uri, state=flow.state, issuer=cred.issuer
+                redirect_url,
+                redirect_uri=flow.redirect_uri,
+                state=flow.state,
+                issuer=flow.issuer,
+                require_iss=flow.require_iss,
             )
         except RedirectError as exc:
             details = {}
@@ -774,6 +795,28 @@ def _flow_unknown() -> LoginError:
 
 def _not_taken() -> LoginError:
     return LoginError("callback_not_taken", "no pending login takes this callback")
+
+
+def _issuer_kept(cred: OAuth2Credential, flow: Flow) -> bool:
+    """The credential still names the issuer the flow recorded, and requires ``iss`` if the
+    flow did: a stricter ``require_iss`` is kept, a looser one isn't (M7 design D.6)."""
+    return cred.issuer == flow.issuer and (cred.require_iss or not flow.require_iss)
+
+
+def _issuer_changed(cred: OAuth2Credential, flow: Flow) -> LoginError:
+    """The refusal of an answer, pasted or returned, whose flow's issuer terms the policy now in
+    force no longer keeps: ``binding_changed``, with the flow's terms and the policy's."""
+    return LoginError(
+        "binding_changed",
+        "the policy changed this credential's issuer or require_iss since the login started; "
+        "run login again",
+        details={"old": _issuer_terms(flow), "new": _issuer_terms(cred)},
+    )
+
+
+def _issuer_terms(source: OAuth2Credential | Flow) -> dict[str, Any]:
+    """What an answer is checked against, as a ``binding_changed`` compares it."""
+    return {"issuer": source.issuer, "require_iss": source.require_iss}
 
 
 def _same_code(one: Secret, other: Secret) -> bool:

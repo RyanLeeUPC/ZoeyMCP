@@ -195,6 +195,12 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "iss_mismatch": Entry(
             400, "The answer came from a different issuer; nothing was stored. Connect again."
         ),
+        # RFC 9207's iss, required by the credential (M7 D.6).
+        "iss_missing": Entry(
+            400,
+            "The answer didn't name its issuer, which this provider always does; nothing was "
+            "stored. Connect again.",
+        ),
         "no_code": Entry(400, "The provider's answer had no usable code. Connect again."),
         "exchange_failed": Entry(
             400, "The provider's token endpoint didn't take the sign-in ({code}). Connect again."
@@ -420,6 +426,14 @@ _WEBAUTHN_CONFLICTS: Final = frozenset({"duplicate_credential", "too_many_passke
 
 # A secret write that failed on disk is still in effect (G); a portal state write isn't.
 KEPT_IN_MEMORY: Final = "Kept in memory, not written to disk; check the state volume."
+# A paste, or the confirm of a code the callback returned, refused ``binding_changed`` because a
+# reload changed the issuer terms its sign-in recorded (M7 D.6). Only a refused start's dialog
+# shows two bindings below its text, and there is no new binding to accept, so this text names
+# the two terms itself.
+ISSUER_CHANGED: Final = (
+    "The policy changed this credential's issuer since the sign-in started: it was {old}, it is "
+    "now {new}. Nothing was stored. Connect again."
+)
 
 
 def refusal(reason: str, **fields: str) -> Refusal:
@@ -459,6 +473,14 @@ def login(reason: str, *, detail: str, error: str | None = None, redirect_uri: s
     offered = {"detail": detail, "error": error or "no error code", "redirect_uri": redirect_uri}
     wanted = _names(CATALOGUE[reason.partition(":")[0]].text) - {"code"}
     return refusal(reason, **{k: v for k, v in offered.items() if k in wanted})
+
+
+def issuer_changed(*, old: str, new: str) -> Refusal:
+    """The portal's ``binding_changed`` for a sign-in whose issuer terms a reload changed (M7
+    D.6): the catalogue's status, and :data:`ISSUER_CHANGED` with ``old`` and ``new``, each
+    already fit to show."""
+    status = CATALOGUE["binding_changed"].status
+    return Refusal(status, "binding_changed", ISSUER_CHANGED.format(old=old, new=new))
 
 
 def wrong_host_literal(authority: str) -> Refusal:

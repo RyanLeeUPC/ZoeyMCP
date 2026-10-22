@@ -27,6 +27,7 @@ from zoeymcp.portal.refusals import (
     WEBAUTHN,
     Refusal,
     enrolment,
+    issuer_changed,
     reasons,
     refusal,
     secret,
@@ -138,6 +139,8 @@ SERVICE = {"registration_unavailable": 409, "proxy_refused": 502}
 # M7's M.2: the second run's and a re-registration's (M7 step 8b; D.12, D-184).
 SECOND_RUN = {"already_configured": 409, "onboarding_mismatch": 409, "reregister_by_hand": 409}
 LOGIN7 = {"client_secret_binding_changed": 409}
+# M7's M.2: a required iss missing from the answer (M7 step 9; D.6).
+MIXUP = {"iss_missing": 400}
 FETCH = {
     "address_refused": 502,
     "resolve_failed": 502,
@@ -178,6 +181,8 @@ TEXTS = {
     "flow_conflict": "Two different answers came back for this sign-in. Nothing was stored. "
     "Connect again.",
     "iss_mismatch": "The answer came from a different issuer; nothing was stored. Connect again.",
+    "iss_missing": "The answer didn't name its issuer, which this provider always does; nothing "
+    "was stored. Connect again.",
     "no_code": "The provider's answer had no usable code. Connect again.",
     "callback_not_taken": "The portal didn't take this sign-in. Copy this tab's address and "
     "paste it into the portal's Connect dialog, or into zoeymcp login if you started it there.",
@@ -264,6 +269,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
+    expected |= MIXUP
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -296,6 +302,20 @@ def test_the_secret_texts_name_the_stores_limits() -> None:
     assert f"There are {webauthn.MAX_PASSKEYS} passkeys" in WEBAUTHN["too_many_passkeys"]
     assert KEPT_IN_MEMORY == "Kept in memory, not written to disk; check the state volume."
     assert KEPT_IN_MEMORY.lower().rstrip(".") == secretplan.NOT_WRITTEN
+
+
+def test_a_changed_issuer_names_both_terms() -> None:
+    """A paste's or a confirm's binding_changed for the issuer terms (M7 D.6): shown with the
+    text alone, so the text names them, and asks for no rebind."""
+    made = issuer_changed(old="issuer https://a.example, iss required", new="no issuer, iss x")
+    assert made == Refusal(
+        409,
+        "binding_changed",
+        "The policy changed this credential's issuer since the sign-in started: it was issuer "
+        "https://a.example, iss required, it is now no issuer, iss x. Nothing was stored. "
+        "Connect again.",
+    )
+    assert not find_violations(made.error, max_chars=300, single_line=True, allow_tabs=False)
 
 
 def test_the_callback_reasons_share_the_page_text() -> None:
@@ -339,6 +359,7 @@ def test_every_redirect_reason_is_catalogued() -> None:
         "duplicate_param",
         "state_mismatch",
         "provider_error",
+        "iss_missing",  # M7 D.6
         "iss_mismatch",
         "no_code",
         "callback_not_taken",  # callback_state's (H.6)

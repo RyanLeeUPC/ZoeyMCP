@@ -793,9 +793,15 @@ def test_new_client_tokens_are_random(monkeypatch: pytest.MonkeyPatch) -> None:
             },
             "SMTP smtp.mail.example:465 from a@mail.example to b@mail.example, c@mail.example",
         ),
+        # A login's issuer terms, changed by a reload before its answer (M7 D.6).
+        (
+            {"issuer": "https://accounts.example", "require_iss": True},
+            "issuer https://accounts.example, iss required",
+        ),
+        ({"issuer": None, "require_iss": False}, "no issuer, iss not required"),
         ({"other": 1}, '{"other": 1}'),
     ],
-    ids=["origins", "oauth", "smtp", "unknown"],
+    ids=["origins", "oauth", "smtp", "issuer", "no-issuer", "unknown"],
 )
 def test_describe_binding(binding: dict[str, Any], text: str) -> None:
     assert admin_client.describe_binding(binding) == text
@@ -1161,6 +1167,32 @@ def test_login_errors(admin: FakeAdmin) -> None:
     admin.answers[("POST", "/oauth/music/complete")] = (404, plain)
     _, _, err = cli(["login", "music", "--flow", "f", "--socket", "x"], io.StringIO(PASTED))
     assert err == "zoeymcp login: no such login is pending\n"
+
+
+def test_a_mixed_up_answer_shows_no_provider_text(admin: FakeAdmin) -> None:
+    """M7 D.6: a mismatched or missing iss carries nothing from the answer's error, and a reload
+    between start and paste names the issuer terms the flow and the policy hold."""
+    for reason, text in (
+        ("iss_mismatch", "the response came from a different issuer"),
+        ("iss_missing", "the answer has no iss, which this server always sends"),
+    ):
+        admin.answers[("POST", "/oauth/music/complete")] = (400, {"error": text, "reason": reason})
+        _, _, err = cli(["login", "music", "--flow", "f", "--socket", "x"], io.StringIO(PASTED))
+        assert err == f"zoeymcp login: {text}\n"
+    moved = {
+        "error": "the policy changed this credential's issuer or require_iss since the login "
+        "started; run login again",
+        "reason": "binding_changed",
+        "old": {"issuer": "https://accounts.example", "require_iss": True},
+        "new": {"issuer": None, "require_iss": True},
+    }
+    admin.answers[("POST", "/oauth/music/complete")] = (409, moved)
+    _, _, err = cli(["login", "music", "--flow", "f", "--socket", "x"], io.StringIO(PASTED))
+    assert err == (
+        f"zoeymcp login: {moved['error']}\n"
+        "  old: issuer https://accounts.example, iss required\n"
+        "  new: no issuer, iss required\n"
+    )
 
 
 def test_admin_errors_keep_their_answer(admin: FakeAdmin) -> None:

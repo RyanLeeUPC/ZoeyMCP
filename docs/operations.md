@@ -228,14 +228,15 @@ these `reason` codes, and the portal answers with the same reason and status, in
 | `authorize_misconfigured` | the authorization URL can't be built: a `client_id` ref, or an `authorize_params` name the vault sets (`check` reports both) | fix the policy and run `check` |
 | `client_id_unavailable`, `client_secret_unavailable` | the client ID ref or client secret isn't set, or the client ID isn't bound to the token endpoint (a stored client secret bound otherwise is `client_secret_binding_changed`) | `zoeymcp secret set <name>`, or set the env var and restart (the message says which) |
 | `not_configured` | the token manager doesn't know the credential; it shouldn't happen | reload the policy (§7) or restart the vault |
-| `binding_changed` | the stored grant is bound differently from what the policy now derives | `--rebind` |
+| `binding_changed` | the stored grant is bound differently from what the policy now derives; or, for a pasted answer or a code the portal's callback holds, a reload since the login started changed the credential's `issuer` or turned `require_iss` off (`old` and `new` show both) | `--rebind`; for the issuer, run `login` again |
 | `client_secret_binding_changed` | the client secret in the store is bound to another token endpoint origin or other server origins than the policy now derives. An onboarded client's secret is stored for the endpoints its fragment named; one you set yourself, for the token endpoint and the routes its credential had then, so adding or removing a route of a credential with a stored client secret, or naming the secret from a second credential, also needs it entered again (`zoeymcp health` doesn't report this yet) | revert the edit, onboard again, or enter the secret again with `zoeymcp secret set <name>`; `--rebind` doesn't apply |
 | `too_many_flows` | 8 logins are pending | finish one, or wait 10 minutes |
 | `flow_unknown` | the flow expired, was used, or belongs to another credential | run `login` again |
 | `redirect_mismatch` | the pasted address isn't under `redirect_uri`, can't be read, or has the answer in the fragment | paste the full address from the address bar |
 | `state_mismatch` | the address is from a different login | use the URL of the latest login |
 | `duplicate_param`, `no_code` | the address has a parameter twice, or no usable code | run `login` again |
-| `iss_mismatch` | the answer names a different issuer than `issuer` | check `issuer` against the provider's metadata |
+| `iss_mismatch` | the answer names a different issuer than the `issuer` the login started with; nothing else in it is read, so a provider's error isn't shown | check `issuer` against the provider's metadata |
+| `iss_missing` | the credential has `require_iss: true` and the answer has no `iss`; nothing else in it is read | check that the provider sends `iss` (its `authorization_response_iss_parameter_supported`) |
 | `provider_error` | the provider refused (for example, consent was denied); its description is shown, never logged | act on the description |
 | `exchange_failed:<code>` | the token endpoint refused the code; `<code>` is one of §4's codes | for `invalid_grant`, the code expired or was used: run `login` again |
 | `no_refresh_token` | the provider issued no refresh token | Google: keep `access_type: offline` and `prompt: consent`; other providers may need an `offline_access` scope |
@@ -1543,6 +1544,10 @@ is refused before any session is looked at.
 reason is in the vault's log line `portal_request` (or `portal_refused`, at most once per 10
 seconds per reason). What the browser itself refuses (an IP address, a page that isn't a secure
 context, no passkey support, a cancelled prompt) is worded by the page.
+A `binding_changed` for a pasted answer or a returned sign-in, when a reload changed the
+credential's `issuer` or turned `require_iss` off since the sign-in started, says instead: "The
+policy changed this credential's issuer since the sign-in started: it was `<old>`, it is now
+`<new>`. Nothing was stored. Connect again."
 
 <!-- refusals: generated from portal/refusals.py; tests/unit/test_refusal_doc.py -->
 | Status | Reason | What the portal says |
@@ -1601,6 +1606,7 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 400 | `duplicate_param` | That address has a parameter twice. Copy it again from the address bar. |
 | 400 | `provider_error` | The answer said the provider refused: `<error>` |
 | 400 | `iss_mismatch` | The answer came from a different issuer; nothing was stored. Connect again. |
+| 400 | `iss_missing` | The answer didn't name its issuer, which this provider always does; nothing was stored. Connect again. |
 | 400 | `no_code` | The provider's answer had no usable code. Connect again. |
 | 400 | `exchange_failed` | The provider's token endpoint didn't take the sign-in (`<code>`). Connect again. |
 | 400 | `no_refresh_token` | The provider issued no refresh token. For Google keep access_type: offline and prompt: consent; some providers need an offline_access scope. |

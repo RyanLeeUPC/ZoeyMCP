@@ -133,9 +133,14 @@ class Redirect:
 
 
 def parse_redirect(
-    pasted: str, *, redirect_uri: str, state: Secret, issuer: str | None
+    pasted: str, *, redirect_uri: str, state: Secret, issuer: str | None, require_iss: bool
 ) -> Redirect:
-    """Check the address the browser was sent to and take the code from it."""
+    """Check the address the browser was sent to and take the code from it.
+
+    After ``state``, the answer's ``iss`` (RFC 9207 2.4, M7 design D.6): absent, it is refused
+    when ``require_iss``; present, it must equal ``issuer`` when that is known. Both come before
+    ``error`` and ``code`` are read, so nothing a mismatched answer carries is shown or logged.
+    """
     text = pasted.strip()
     try:
         # A lone surrogate (from JSON, or undecodable stdin) can't be compared or answered.
@@ -175,6 +180,14 @@ def parse_redirect(
         got_state.encode("utf-8"), state.reveal().encode("utf-8")
     ):
         raise RedirectError("state_mismatch", "the address is for a different login")
+    iss = values.get("iss")
+    if iss is None:
+        if require_iss:
+            raise RedirectError(
+                "iss_missing", "the answer has no iss, which this server always sends"
+            )
+    elif issuer is not None and iss != issuer:
+        raise RedirectError("iss_mismatch", "the response came from a different issuer")
     if "error" in values:
         error = safe_error_code(values["error"])
         raise RedirectError(
@@ -183,9 +196,6 @@ def parse_redirect(
             error=error,
             description=_description(values.get("error_description")),
         )
-    iss = values.get("iss")
-    if issuer is not None and iss is not None and iss != issuer:
-        raise RedirectError("iss_mismatch", "the response came from a different issuer")
     code = values.get("code")
     if code is None or not _CODE.fullmatch(code):
         raise RedirectError("no_code", "the address has no usable authorization code")
@@ -283,7 +293,9 @@ def _not_taken() -> RedirectError:
 @dataclass(frozen=True, repr=False)
 class Flow:
     """A login. The flow ID, ``state``, verifier, binder hash and any returned code are never
-    logged. ``callback`` is the portal origin whose callback this flow can take, or None."""
+    logged. ``callback`` is the portal origin whose callback this flow can take, or None.
+    ``issuer`` and ``require_iss`` are the credential's when the flow started, which its answer
+    is checked against (M7 design D.6, SPEC-2)."""
 
     id: str
     credential: str
@@ -291,6 +303,8 @@ class Flow:
     verifier: Secret
     redirect_uri: str
     expires_at: float
+    issuer: str | None = None
+    require_iss: bool = False
     rebind: bool = False
     owner: str = CLI_OWNER
     callback: str | None = None
@@ -339,10 +353,13 @@ class FlowTable:
         owner: str = CLI_OWNER,
         callback: str | None = None,
         binder_hash: bytes | None = None,
+        issuer: str | None = None,
+        require_iss: bool = False,
     ) -> Flow:
         """A new flow. It replaces the credential's flow, in whatever stage and whoever owns it.
         A flow that can take the callback has both ``callback`` and ``binder_hash``, and a
-        portal session for its owner."""
+        portal session for its owner. ``issuer`` and ``require_iss`` are recorded for its
+        answer."""
         if owner != CLI_OWNER and not _SESSION_OWNER.fullmatch(owner):
             raise ValueError("a flow's owner is cli or session:<hex id>")
         if (callback is None) != (binder_hash is None) or (
@@ -363,6 +380,8 @@ class FlowTable:
             verifier=new_verifier(self._token),
             redirect_uri=redirect_uri,
             expires_at=now + FLOW_TTL,
+            issuer=issuer,
+            require_iss=require_iss,
             rebind=rebind,
             owner=owner,
             callback=callback,

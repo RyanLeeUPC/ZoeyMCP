@@ -374,4 +374,9 @@ def describe_binding(binding: dict[str, Any]) -> str:
     if "smtp" in binding:
         smtp = binding["smtp"]
         return f"SMTP {smtp['host']}:{smtp['port']} from {smtp['from']} to {', '.join(smtp['to'])}"
+    if "require_iss" in binding:
+        # A login's issuer terms, changed by a reload before its answer (M7 design D.6).
+        issuer = binding.get("issuer")
+        named = "no issuer" if issuer is None else f"issuer {issuer}"
+        return f"{named}, iss {'required' if binding['require_iss'] else 'not required'}"
     return json.dumps(binding)
