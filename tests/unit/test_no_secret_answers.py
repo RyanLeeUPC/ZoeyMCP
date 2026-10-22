@@ -11,8 +11,10 @@ Each walk takes its routes from the route table, so a route added later is walke
   carry a credential, each only its own: the two exceptions R61 records (Q23).
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
-  a live slot, and a value held by a pending ``secret.put``. Its health, OAuth list, connect and
-  policy routes read the same store, token manager, logins and policy, and its ledger a copy.
+  a live slot, a value held by a pending ``secret.put``, a given client secret stored through
+  ``onboard.register`` (M7 K.3) and a done review job of the portal's (F.6). Its health,
+  OAuth list, connect and policy routes read the same store, token manager, logins and policy,
+  and its ledger a copy.
   No answer carries a value, a setup code, the gateway key, or a session half beyond the one
   answer that mints it.
 - **The portal's code**: an AST check finds no reference to ``SetupCodes.issue``, the gateway key
@@ -105,12 +107,13 @@ SOCKET_BODIES: dict[tuple[str, str], Any] = {
     ("POST", "/onboard/discover"): onboard_model.confidential(),
     ("POST", "/onboard/{onboarding}/register"): {},
     ("POST", "/onboard/{onboarding}/fragment"): {"indent": 2},
+    ("POST", "/review/jobs/{job}/diff"): {"include": [], "allow": [], "approve": []},
 }
 
 
 class Reviews:
-    """Review jobs with one done for the CLI, as the vault's own queue answers them: the
-    socket's review routes answer its report (M7 design F.2)."""
+    """Review jobs with one done for the CLI and one for the portal, as the vault's own queue
+    answers them: the review routes answer its report (M7 design F.2)."""
 
     DIGEST = "sha256:" + "d" * 64
     SERVERS: Final[Mapping[str, ServerKind]] = MappingProxyType({"notes": "remote"})
@@ -118,11 +121,15 @@ class Reviews:
     def __init__(self) -> None:
         self.table = JobTable(lambda: 1000.0, started=0.0)
         self.table.poll_began()
-        queued = self.table.queue("notes", "cli", self.DIGEST, self.SERVERS)
+        self.done = self.finished("cli")
+        self.portal_done = self.finished("portal")
+
+    def finished(self, owner: Owner) -> Job:
+        queued = self.table.queue("notes", owner, self.DIGEST, self.SERVERS)
         assert isinstance(queued, Job)
         self.table.claim(self.DIGEST)
         body = {"v": 1, "job": queued.id, "server": "notes", "report": unclassified("list_notes")}
-        self.done = self.table.post(read_result(body, GatewayLimits())).job
+        return self.table.post(read_result(body, GatewayLimits())).job
 
     async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job:
         queued = self.table.queue(server, owner, self.DIGEST, self.SERVERS, fresh=fresh)
@@ -163,13 +170,14 @@ async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     assert len(walked) == len(set(walked)) >= 23
     assert ("DELETE", "/onboard/{onboarding}") in walked
     assert ("GET", "/review/jobs/{job}") in walked
+    assert ("POST", "/review/jobs/{job}/diff") in walked
     for method, template in walked:
         path = template.format(**params)
         response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
         answers.append(((method, template), response.text + repr(dict(response.headers))))
         if (method, template) == ("POST", "/setup-code"):
             credentials[response.json()["code"]] = "setup code"
-        if template.startswith("/review"):
+        if template.startswith("/review") and not template.endswith("/diff"):
             # The done job's report, answered whole (and handed back again on a queue call).
             assert response.json()["report"]["server"] == "notes", response.text
     answers.append((("POST", "/onboard/discover"), discovered.text + stored.text))
@@ -250,8 +258,18 @@ async def step_up(
     return await page.call("POST", path, {"credential": assertion})
 
 
-PORTAL_PARAMS = {"credential": "broker-mcp", "flow": "0123456789abcdef", "action": "0" * 16}
+PORTAL_PARAMS = {
+    "credential": "broker-mcp",
+    "flow": "0123456789abcdef",
+    "action": "0" * 16,
+    "onboarding": "0" * 16,
+    "job": "0" * 16,
+    "server": "notes",
+}
 PORTAL_BODIES: dict[str, Any] = {
+    "/api/onboard/discover": {"url": onboard_model.SERVER_URL},
+    "/api/onboard/{onboarding}/fragment": {"indent": 2},
+    "/api/review/jobs/{job}/diff": {"include": [], "allow": [], "approve": []},
     "/api/login/finish": {"ceremony": "0" * 16, "credential": {}},
     "/api/setup/redeem": {"code": "AAAA-BBBB-CCCC-DDDD"},
     "/api/passkeys/enrol/begin": {"name": "tablet"},
@@ -263,9 +281,11 @@ PORTAL_BODIES: dict[str, Any] = {
 ENDINGS = ("/api/sessions/end-others", "/api/logout")
 
 
-async def walk(pages: Iterable[Page], routes: Iterable[Route]) -> None:
+async def walk(
+    pages: Iterable[Page], routes: Iterable[Route], params: Mapping[str, str] = PORTAL_PARAMS
+) -> None:
     for route in routes:
-        path = route.path.format(**PORTAL_PARAMS)
+        path = route.path.format(**params)
         body = PORTAL_BODIES.get(route.path, {}) if route.method == "POST" else None
         for page in pages:
             await page.call(route.method, path, body)
@@ -277,6 +297,7 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
     rig = AdminRig(tmp_path)
     (tmp_path / "portal").mkdir(mode=0o700)
     passkeys = Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json")
+    reviews = Reviews()
     app = PortalApp(
         [ORIGIN],
         static=load_static(),
@@ -286,6 +307,8 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
         secrets=Secrets(rig.store, rig.tokens, lambda: rig.policy),
         health=HealthReader(rig.store, lambda: rig.policy, passkeys=passkeys).report,
         ledger=Ledger(ReportStore.open(tmp_path)),
+        onboard=onboard_model.onboard_service(rig.store, rig.tokens, lambda: rig.policy),
+        reviews=reviews,
     )
     answers: list[str] = []
     transport = httpx.ASGITransport(app=app)
@@ -307,6 +330,19 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
     assert (
         await full.call("POST", "/api/actions", {"kind": "secret.put", "data": data})
     ).is_success
+    # A given confidential client's secret, stored through the portal's register action.
+    given = {
+        "url": onboard_model.SERVER_URL,
+        "client_id": onboard_model.CLIENT_ID,
+        "issuer": onboard_model.ISSUER,
+        "client_auth": "basic",
+    }
+    plan = await full.call("POST", "/api/onboard/discover", given)
+    assert plan.is_success, plan.text
+    onboarding = plan.json()["onboarding"]
+    secret = {"onboarding": onboarding, "client_secret": onboard_model.GIVEN_SECRET}
+    stored = await step_up(full, authenticator, "onboard.register", secret)
+    assert stored.is_success, stored.text
     code, _ = rig.setup.issue()
     assert (await setup.call("POST", "/api/setup/redeem", {"code": code.reveal()})).is_success
     halves = {
@@ -315,13 +351,14 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
     }
     # Every route, from every page; the static files; then the routes that end sessions.
     pages = (full, setup, anonymous)
-    await walk(pages, [r for r in ROUTES if r.path not in ENDINGS])
+    params = {**PORTAL_PARAMS, "onboarding": onboarding, "job": reviews.portal_done.id}
+    await walk(pages, [r for r in ROUTES if r.path not in ENDINGS], params)
     for path in STATIC:
         response = await full.client.get(path, headers={"Host": "localhost:8081"})
         answers.append(response.text + repr(response.headers.multi_items()))
     await walk(pages, [r for path in ENDINGS for r in ROUTES if r.path == path])
     assert len(answers) > 3 * len(ROUTES)
-    credentials = dict.fromkeys(VALUES, "secret value")
+    credentials = dict.fromkeys((*VALUES, onboard_model.GIVEN_SECRET), "secret value")
     credentials[code.reveal()] = "setup code"
     credentials[KEYS.gateway_key(1)] = "gateway key"
     for text in answers:

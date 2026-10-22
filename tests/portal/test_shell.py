@@ -261,11 +261,15 @@ def test_each_listener_answers_as_itself(rig: PortalRig) -> None:
     refused(page.fetch("GET", "/_zoeymcp/gateway/v1/view"), 404, "not_found")
 
 
-# Where an agent would look for OAuth (the same list as tests/gateway/test_gateway.py's).
+# Where an agent would look for OAuth: the same list as tests/gateway/test_gateway.py's, its
+# path-suffixed metadata variants included (M7 GR-28), and the portal's own API prefix.
 OAUTH_PATHS = (
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-authorization-server/s/notes/mcp",
+    "/.well-known/oauth-protected-resource/s/notes/mcp",
+    "/s/notes/.well-known/openid-configuration",
     "/register",
     "/token",
     "/authorize",

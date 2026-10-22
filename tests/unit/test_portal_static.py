@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from zoeymcp.portal import routes as api
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
 from zoeymcp.portal.routes import ROUTES, STATIC
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
@@ -404,12 +405,29 @@ def test_the_prompts_and_the_load_checks() -> None:
 # --- drift against the server (K.4) -------------------------------------------------------------
 
 
+# M7 K.2's routes, built in step 14a: the page's review.js names them from step 14b (K.4).
+REVIEW_SCRIPT = {
+    (route.method, route.path)
+    for route in (
+        api.SERVERS,
+        api.ONBOARD_DISCOVER,
+        api.ONBOARD,
+        api.ONBOARD_FRAGMENT,
+        api.ONBOARD_CANCEL,
+        api.REVIEW,
+        api.REVIEW_JOB,
+        api.REVIEW_DIFF,
+    )
+}
+
+
 def test_every_api_path_the_script_names_is_a_route_and_every_route_is_named() -> None:
     code = code_of(read("app.js"))
     named = set(API_CALL.findall(code))
     # Every /api/ string is in a call this pattern sees, so none hides from the check.
     assert len(API_PATH.findall(code)) == len(API_CALL.findall(code))
-    assert named == {(route.method, route.path) for route in ROUTES}
+    assert named == {(route.method, route.path) for route in ROUTES} - REVIEW_SCRIPT
+    assert {(route.method, route.path) for route in ROUTES} >= REVIEW_SCRIPT
 
 
 def test_every_reason_the_script_handles_is_catalogued() -> None:

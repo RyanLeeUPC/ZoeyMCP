@@ -39,7 +39,17 @@ from zoeymcp.portal.admission import (
     values,
 )
 from zoeymcp.portal.refusals import Refusal, refusal, wrong_host_literal
-from zoeymcp.portal.routes import LEDGER, ROUTES, STATIC, Route, Scope
+from zoeymcp.portal.routes import (
+    LEDGER,
+    ONBOARD_DISCOVER,
+    ONBOARD_FRAGMENT,
+    REVIEW,
+    REVIEW_DIFF,
+    ROUTES,
+    STATIC,
+    Route,
+    Scope,
+)
 
 LOCAL = "http://localhost:8081"
 TAILNET = "https://zoeymcp.tailnet.example"
@@ -425,6 +435,57 @@ def test_the_default_table_is_the_built_routes() -> None:
     ledger = admit(request("GET", "/api/ledger"), ENTRIES)
     assert isinstance(ledger, Admitted)
     assert ledger.route == LEDGER
+
+
+@pytest.mark.parametrize(
+    ("route", "path", "length", "ok"),
+    [
+        (REVIEW_DIFF, "/api/review/jobs/j1/diff", "524288", True),
+        (REVIEW_DIFF, "/api/review/jobs/j1/diff", "524289", False),
+        (ONBOARD_DISCOVER, "/api/onboard/discover", "4096", True),
+        (ONBOARD_DISCOVER, "/api/onboard/discover", "4097", False),
+        (ONBOARD_FRAGMENT, "/api/onboard/o1/fragment", "64", True),
+        (ONBOARD_FRAGMENT, "/api/onboard/o1/fragment", "65", False),
+        (REVIEW, "/api/review/notes", "64", True),
+        (REVIEW, "/api/review/notes", "65", False),
+    ],
+)
+def test_the_k2_caps_on_the_default_table(route: Route, path: str, length: str, ok: bool) -> None:
+    """M7 K.2: a review's choices up to 512 KiB, its own cap; the others at the M.1 caps they
+    share."""
+    decision = admit(request(path=path, length=length), ENTRIES)
+    if ok:
+        assert isinstance(decision, Admitted)
+        assert decision.route == route
+    else:
+        assert decision == refusal("too_large")
+
+
+@pytest.mark.parametrize(
+    ("route", "raw", "ok"),
+    [
+        (ONBOARD_DISCOVER, b'{"url":"https://mcp.notes.example/mcp"}', True),
+        (ONBOARD_DISCOVER, b'{"url":"u","client_id":"c","client_auth":"basic"}', True),
+        # TI-3: a private discovery is the onboard.discover_private action, never this route.
+        (ONBOARD_DISCOVER, b'{"url":"u","allow_private":true}', False),
+        (ONBOARD_DISCOVER, b'{"url":"u","secret_given":true}', False),
+        (ONBOARD_DISCOVER, b'{"client_id":"c"}', False),
+        (ONBOARD_FRAGMENT, b"{}", True),
+        (ONBOARD_FRAGMENT, b'{"indent":"compose"}', True),
+        (ONBOARD_FRAGMENT, b'{"client_secret":"s"}', False),
+        (REVIEW, b"{}", True),
+        (REVIEW, b'{"fresh":true}', False),
+        (REVIEW_DIFF, b'{"include":[],"allow":[],"approve":[]}', True),
+        (REVIEW_DIFF, b'{"include":[],"allow":[],"approve":[],"indent":4}', True),
+        (REVIEW_DIFF, b'{"include":[],"allow":[]}', False),
+    ],
+)
+def test_the_k2_bodies(route: Route, raw: bytes, ok: bool) -> None:
+    parsed = parse_body(route, raw)
+    if ok:
+        assert isinstance(parsed, dict)
+    else:
+        assert parsed == refusal("bad_body")
 
 
 # --- row 7: body headers ------------------------------------------------------------------------

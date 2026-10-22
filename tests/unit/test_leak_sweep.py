@@ -34,7 +34,10 @@ secret go to the revocation endpoint and nowhere else.
 
 The review job path (M7 design F.2, M.4) is swept too: a job's ID reaches only the poll that
 claims it and the queue and read answers, the log naming it by hash8 alone, and nothing from a
-report (a tool's name or text, a pin) or a gateway's error message reaches the log.
+report (a tool's name or text, a pin) or a gateway's error message reaches the log. So is the
+portal's MCP servers section (M7 design K, step 14a): a given client secret held by its
+register action and one a registration issued reach the store alone, and a portal review job's
+ID no log line.
 """
 
 from __future__ import annotations
@@ -86,7 +89,8 @@ from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
 from .test_admin import AdminRig
-from .test_no_secret_answers import Recording, step_up
+from .test_no_secret_answers import Recording, signed_in, step_up
+from .test_no_secret_answers import Reviews as NoSecretReviews
 from .test_oauth_tokens import KEYS, FakeClock
 from .test_portal_wire import ORIGIN
 from .test_reviewjobs import Rig as ReviewRig
@@ -1395,3 +1399,83 @@ async def test_a_revoked_grant_reaches_its_revocation_endpoint_and_nothing_else(
     await revoker.aclose()
     await world.vault.aclose()
     await world.token_client.aclose()
+
+
+# --- the portal's MCP servers section (M7 design K, step 14a) -----------------------------------
+
+
+async def test_the_portals_onboarding_and_review_leak_nothing(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """K.3, D.7, X19: a given client secret held by ``onboard.register`` and stored, a refused
+    register, fragment 1 again at each indent, a resumed discovery, a cancel, then a registration
+    whose answer brings a client secret, a registration access token and a URI; and the review's
+    rows and fragment 2. Every portal answer and log line: the secrets reach the store alone, the
+    token and the URI nothing at all, and a review job's ID no log line."""
+    rig = AdminRig(tmp_path)
+    (tmp_path / "portal").mkdir(mode=0o700)
+    passkeys = Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json")
+    reviews = NoSecretReviews()
+    app = PortalApp(
+        [ORIGIN],
+        static=load_static(),
+        setup=rig.setup,
+        passkeys=passkeys,
+        login=LoginService(rig.tokens),
+        secrets=Secrets(rig.store, rig.tokens, lambda: rig.policy),
+        onboard=onboard_model.onboard_service(
+            rig.store, rig.tokens, lambda: rig.policy, register=onboard_model.planted
+        ),
+        reviews=reviews,
+    )
+    answers: list[str] = []
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
+    page = Recording(client, answers)
+    authenticator = SoftAuthenticator()
+    await signed_in(page, app, authenticator)
+    given = {
+        "url": onboard_model.SERVER_URL,
+        "client_id": onboard_model.CLIENT_ID,
+        "issuer": onboard_model.ISSUER,
+        "client_auth": "basic",
+    }
+    onboarding = (await page.call("POST", "/api/onboard/discover", given)).json()["onboarding"]
+    wrong = {"onboarding": onboarding, "client_secret": 7}
+    refused = await page.call("POST", "/api/actions", {"kind": "onboard.register", "data": wrong})
+    assert refused.status_code == 400
+    data = {"onboarding": onboarding, "client_secret": onboard_model.GIVEN_SECRET}
+    stored = await step_up(page, authenticator, "onboard.register", data)
+    assert stored.status_code == 200, stored.text
+    for indent in (0, 4, "compose"):
+        await page.call("POST", f"/api/onboard/{onboarding}/fragment", {"indent": indent})
+    await page.call("GET", f"/api/onboard/{onboarding}")
+    await page.call("GET", "/api/servers")
+    await page.call("POST", "/api/onboard/discover", given)
+    assert (await page.call("DELETE", f"/api/onboard/{onboarding}")).status_code == 200
+    # The registration then stores its own client's secret under the same name.
+    assert rig.store.delete(onboard_model.SECRET_NAME)
+    plan = await page.call("POST", "/api/onboard/discover", {"url": onboard_model.SERVER_URL})
+    assert plan.json()["plan"]["registration"] == "dcr"
+    registered = await step_up(
+        page, authenticator, "onboard.register", {"onboarding": plan.json()["onboarding"]}
+    )
+    assert registered.status_code == 200, registered.text
+    await page.call("POST", f"/api/onboard/{plan.json()['onboarding']}/fragment", {"indent": 2})
+    job = reviews.portal_done.id
+    await page.call("GET", f"/api/review/jobs/{job}")
+    choices = {"include": ["list_notes"], "allow": ["list_notes"], "approve": []}
+    await page.call("POST", f"/api/review/jobs/{job}/diff", choices)
+    stored_secret, _ = rig.store.get_for_oauth(
+        onboard_model.SECRET_NAME, token_url=f"{onboard_model.ISSUER}/token"
+    )
+    assert stored_secret.reveal() == onboard_model.DCR_SECRET
+    swept = "".join([*answers, log_lines.getvalue()])
+    for secret in (onboard_model.GIVEN_SECRET, onboard_model.DCR_SECRET):
+        assert secret not in swept
+    held = rig.store.path.read_bytes().decode("utf-8")
+    for planted in (onboard_model.REGISTRATION_TOKEN, onboard_model.REGISTRATION_URI):
+        assert planted not in swept + held
+    assert job not in log_lines.getvalue()
+    assert sum(job in answer for answer in answers) >= 1
+    await client.aclose()
+    await rig.token_client.aclose()

@@ -7,7 +7,8 @@ script names. Every other path outside ``/api/`` is 404 (C.2 row 3).
 
 The API table grew with the build: each of steps 11 to 15 added the rows it built, so a walk of
 the table or a drift check against the page never met a route that wasn't built (verifier V40);
-from step 15 it is M.1's whole table, and a test checks that it equals M.1. A path parameter is
+from step 15 it is M.1's whole table, and a test checks that it equals M.1. M7 publishes its
+own rows, the MCP servers section's (M7 design K.2), which the same test pins. A path parameter is
 checked against its pattern before a route matches, so a handler never sees a name the policy
 couldn't hold. A query string isn't part of a route: the one route that reads one, the ledger,
 checks it itself.
@@ -93,23 +94,28 @@ class Route:
         return not self.scopes
 
 
-# What a path parameter may be: a credential is a policy name; a flow or an action is the ID the
-# vault gave it (base64url or hex).
+# What a path parameter may be: a credential or a server is a policy name; a flow, an action, an
+# onboarding or a review job is the ID the vault gave it (base64url or hex).
 PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
     {
         "credential": re.compile(NAME_PATTERN),
         "flow": re.compile(r"[A-Za-z0-9_-]{1,64}"),
         "action": re.compile(r"[A-Za-z0-9_-]{1,64}"),
+        "onboarding": re.compile(r"[A-Za-z0-9_-]{1,64}"),
+        "job": re.compile(r"[A-Za-z0-9_-]{1,64}"),
+        "server": re.compile(NAME_PATTERN),
     }
 )
 
 # Body caps in bytes (F.1, M.1): an empty object, the default, a passkey's answer, a secret
-# (M1's MAX_BODY, and what POST /api/actions reads before it knows the kind) and a paste.
+# (M1's MAX_BODY, and what POST /api/actions reads before it knows the kind), a paste, and a
+# review's choices (M7 K.2: three lists of tool names).
 BODY_EMPTY: Final = 64
 BODY_DEFAULT: Final = 4 * 1024
 BODY_WEBAUTHN: Final = 16 * 1024
 BODY_SECRET: Final = 128 * 1024
 BODY_PASTE: Final = 8 * 1024
+BODY_CHOICES: Final = 512 * 1024
 
 NONE: Final[frozenset[Scope]] = frozenset()
 SETUP: Final[frozenset[Scope]] = frozenset({"setup"})
@@ -156,6 +162,44 @@ FLOW_STATUS: Final = Route("GET", "/api/oauth/flows/{flow}", FULL)
 # with the send journals (J.5), paged by its query. Restarting the copy's chain is an action.
 POLICY: Final = Route("GET", "/api/policy", FULL)
 LEDGER: Final = Route("GET", "/api/ledger", FULL)
+# M7 step 14a: the MCP servers section (M7 K.2). A discovery and a review only read and hold in
+# memory; registering a client, and a discovery that lifts the address guard, are actions
+# (onboard.register, onboard.discover_private). Fragment 1 and fragment 2 are rendered, never
+# saved.
+SERVERS: Final = Route("GET", "/api/servers", FULL)
+# A discovery's optional keys: an allow_private key is refused here, since only the action may
+# lift the address guard (TI-3).
+DISCOVER_KEYS: Final = frozenset(
+    {
+        "credential",
+        "route",
+        "server",
+        "issuer",
+        "scope",
+        "client_id",
+        "client_auth",
+        "redirect_uri",
+        "client_name",
+    }
+)
+ONBOARD_DISCOVER: Final = Route(
+    "POST", "/api/onboard/discover", FULL, BODY_DEFAULT, frozenset({"url"}), DISCOVER_KEYS
+)
+ONBOARD: Final = Route("GET", "/api/onboard/{onboarding}", FULL)
+ONBOARD_FRAGMENT: Final = Route(
+    "POST", "/api/onboard/{onboarding}/fragment", FULL, BODY_EMPTY, optional=frozenset({"indent"})
+)
+ONBOARD_CANCEL: Final = Route("DELETE", "/api/onboard/{onboarding}", FULL)
+REVIEW: Final = Route("POST", "/api/review/{server}", FULL, BODY_EMPTY)
+REVIEW_JOB: Final = Route("GET", "/api/review/jobs/{job}", FULL)
+REVIEW_DIFF: Final = Route(
+    "POST",
+    "/api/review/jobs/{job}/diff",
+    FULL,
+    BODY_CHOICES,
+    frozenset({"include", "allow", "approve"}),
+    frozenset({"indent"}),
+)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -176,6 +220,14 @@ ROUTES: Final[tuple[Route, ...]] = (
     FLOW_STATUS,
     FLOW_CANCEL,
     LEDGER,
+    SERVERS,
+    ONBOARD_DISCOVER,
+    ONBOARD,
+    ONBOARD_FRAGMENT,
+    ONBOARD_CANCEL,
+    REVIEW,
+    REVIEW_JOB,
+    REVIEW_DIFF,
     ACTIONS,
     CONFIRM,
     CANCEL,

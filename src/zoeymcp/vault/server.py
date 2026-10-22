@@ -57,6 +57,7 @@ from .admin import (
     AdminApp,
     AdminSocketError,
     HealthReader,
+    ReviewQueue,
     SetupCodes,
     check_socket_dir,
     socket_supported,
@@ -394,6 +395,8 @@ def build_portal(
     health: HealthReader | None = None,
     ledger: Ledger | None = None,
     source: Source = "file",
+    onboard: OnboardService | None = None,
+    reviews: ReviewQueue | None = None,
     lookup: Lookup = lookup_addresses,
 ) -> Portal | None:
     """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
@@ -402,8 +405,9 @@ def build_portal(
     any ``--listen`` is warned about (``admin_listener_shared``). ``secrets`` is what its Secrets
     area writes through, the admin socket's store, token manager and policy; ``health`` what
     its health checklist reads, as the socket's ``GET /health`` does; ``ledger`` the reported
-    copy and the send journals its Ledger page reads, as ``zoeymcp ledger --vault`` does; and
-    ``source`` where the policy came from, for its policy view."""
+    copy and the send journals its Ledger page reads, as ``zoeymcp ledger --vault`` does;
+    ``source`` where the policy came from, for its policy view; and ``onboard`` and ``reviews``
+    the onboardings and review jobs its MCP servers section shares with the socket (M7 K)."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -428,6 +432,8 @@ def build_portal(
         health=None if health is None else health.report,
         ledger=ledger,
         source=source,
+        onboard=onboard,
+        reviews=reviews,
     )
     return Portal(app, address)
 
@@ -790,6 +796,9 @@ def build(
         health=health,
         ledger=Ledger(reports, app.connectors),
         source=source,
+        # The same onboardings and review jobs as the socket's (M7 design D.8, F.2).
+        onboard=onboard,
+        reviews=app,
     )
     admin = None
     if admin_socket is not None:

@@ -7,6 +7,12 @@ and data, plans again and runs exactly what was held. So an assertion for anothe
 or origin, a stale or replayed one, or one from another RP ID's passkey changes nothing, and a
 plan that moved in between is ``409 changed``. The portal never removes the last passkey (the
 socket may: host access is the recovery path).
+
+M7's MCP servers section (K.3, GR-13): registering a client and a private discovery are
+actions; a discovery and a review are flow starts that hold only memory, fragment 1 and fragment 2
+are renders that write nothing, and an onboarding's cancel is a cancel. A discovery with
+``allow_private`` and no step-up reaches nothing, and every flow start and render leaves the
+store, the passkeys and the policy as they were.
 """
 
 from __future__ import annotations
@@ -22,10 +28,13 @@ import pytest
 
 from tests.fakes.authenticator import InvalidStateError, SoftAuthenticator, Switch
 from tests.fakes.browser import Page
+from tests.unit import onboard_model
 from zoeymcp.portal import passkeys as passkey_file
 from zoeymcp.portal.actions import ACTION_TTL, KINDS
 from zoeymcp.portal.routes import ROUTES, STATIC
 from zoeymcp.portal.webauthn import b64url
+from zoeymcp.vault import server
+from zoeymcp.vault.onboard import OnboardService
 
 from .flows import (
     ENROL_BEGIN,
@@ -40,6 +49,7 @@ from .flows import (
     status_reason,
 )
 from .rig import Clock, PortalRig, running
+from .test_review import gateway_answers, notes_entries, poller
 
 ACTIONS = "/api/actions"
 OTHER = "http://localhost:9000"
@@ -376,8 +386,9 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("passkey.enrol", ["x"]) == (400, "bad_body")
     assert refused("passkey.enrol", {"name": "x", "extra": 1}) == (400, "bad_body")
     assert refused("passkey.rename", {"name": "x"}) == (400, "bad_body")
-    # Every registered kind is built from step 15 (ledger.restart was the last), so none
-    # answers bad_body for being a later step's.
+    # Every registered kind is built (ledger.restart was M5's last; M7's step 14a built
+    # onboard.register and onboard.discover_private), so none answers bad_body for being a later
+    # step's.
     assert rig.app.action_kinds == set(KINDS)
     assert refused("ledger.restart", {"x": 1}) == (400, "bad_body")
     # Each kind's cap: 4 KiB for a passkey's (M.1), within the route's 128 KiB.
@@ -575,9 +586,21 @@ AUTHORIZED_ENROLMENT = {("POST", ENROL_BEGIN), ("POST", ENROL_FINISH)}
 # The action's own routes: prepare (holds, changes nothing) and confirm (the step-up).
 ACTION_ROUTES = {("POST", ACTIONS), ("POST", "/api/actions/{action}/confirm")}
 # A flow start writes no grant. The client_credentials start, a test fetch, is the one such
-# route that can clear a failure state, and only after a fetch that worked (F.4, H.1).
-FLOW_STARTS = {("POST", "/api/oauth/{credential}/start")}
-CANCELS = {("DELETE", "/api/actions/{action}"), ("DELETE", "/api/oauth/flows/{flow}")}
+# route that can clear a failure state, and only after a fetch that worked (F.4, H.1). A
+# discovery and a review hold what they learn in memory only (M7 K.3).
+FLOW_STARTS = {
+    ("POST", "/api/oauth/{credential}/start"),
+    ("POST", "/api/onboard/discover"),
+    ("POST", "/api/review/{server}"),
+}
+CANCELS = {
+    ("DELETE", "/api/actions/{action}"),
+    ("DELETE", "/api/oauth/flows/{flow}"),
+    ("DELETE", "/api/onboard/{onboarding}"),
+}
+# M7 K.3: fragment 1 (a given public client's, or a registered onboarding's again) and fragment
+# 2, each rendered from what the vault holds, writing nothing.
+RENDERS = {("POST", "/api/onboard/{onboarding}/fragment"), ("POST", "/api/review/jobs/{job}/diff")}
 # An OAuth credential whose sign-in a session can start (no token call until a confirm).
 OAUTH_POLICY: dict[str, Any] = {
     "credentials": {
@@ -601,21 +624,49 @@ OAUTH_POLICY: dict[str, Any] = {
         }
     ],
 }
+# The same, with a notes server as onboarding by URL leaves one: its own route for the gateway
+# alone and a server including nothing, which a review can be queued for (M7 E.2, F.2). It is
+# another host's, so discovering onboard_model's URL onboards it anew.
+_NOTES = notes_entries()
+SERVERS_POLICY: dict[str, Any] = {
+    "credentials": OAUTH_POLICY["credentials"],
+    "routes": [
+        *OAUTH_POLICY["routes"],
+        {
+            **_NOTES["routes"][0],
+            "name": "notes-mcp",
+            "prefix": "/notes-mcp",
+            "upstream": "https://mcp.tasks.example",
+        },
+    ],
+    "gateway": {
+        "servers": {"notes": {**_NOTES["gateway"]["servers"]["notes"], "route": "notes-mcp"}}
+    },
+}
+
+
+def model_onboarding(vault: server.Vault) -> OnboardService:
+    """The vault's onboarding service on tests/unit/onboard_model.py's in-process world."""
+    assert vault.portal is not None
+    secrets = vault.portal.app.secrets
+    assert secrets is not None
+    return onboard_model.onboard_service(secrets.store, secrets.tokens, lambda: vault.app.policy)
 
 
 def test_every_change_is_an_action(tmp_path: Path) -> None:
     allowed = SESSION_LIFECYCLE | AUTHORIZED_ENROLMENT | ACTION_ROUTES | FLOW_STARTS | CANCELS
+    allowed |= RENDERS
     unsafe = {(r.method, r.path) for r in ROUTES if r.method != "GET"}
     assert unsafe <= allowed, sorted(unsafe - allowed)
     assert allowed <= unsafe, sorted(allowed - unsafe)  # the lists name only built routes
-    with running(tmp_path, policy=OAUTH_POLICY) as rig:
+    with running(tmp_path, policy=SERVERS_POLICY, onboard=model_onboarding) as rig:
         every_get_leaves_the_tables(rig)
 
 
 def every_get_leaves_the_tables(rig: PortalRig) -> None:
     """Every GET, with a session of each scope it takes, leaves every table as it was (a
-    session's idle clock aside): with an action pending, an enrolment, a login and an OAuth
-    sign-in under way."""
+    session's idle clock aside): with an action pending, an enrolment, a login, an OAuth
+    sign-in, an onboarding and a review job under way."""
     world = two(rig)
     setup = rig.browser().page(rig.origin)
     assert redeem(setup, issue(rig)).status_code == 200
@@ -624,6 +675,15 @@ def every_get_leaves_the_tables(rig: PortalRig) -> None:
     prepared(world.first, "passkey.rename", {"credential": world.b, "name": "desk"})
     started = world.second.fetch("POST", "/api/oauth/notes/start", json={})
     assert started.status_code == 200, started.text
+    discover = {"url": onboard_model.SERVER_URL, "client_id": onboard_model.CLIENT_ID}
+    plan = world.first.fetch("POST", "/api/onboard/discover", json=discover)
+    assert plan.status_code == 200, plan.text
+    poller(rig)
+    queued = world.first.fetch("POST", "/api/review/notes", json={})
+    assert queued.status_code == 200, queued.text
+    review = queued.json()["job"]
+    gateway_answers(rig)
+    owned = [f"/api/onboard/{plan.json()['onboarding']}", f"/api/review/jobs/{review}"]
 
     def tables() -> object:
         app = rig.app
@@ -634,7 +694,13 @@ def every_get_leaves_the_tables(rig: PortalRig) -> None:
         counts = (len(app.sessions), len(app.ceremonies), len(app.actions))
         flows = rig.vault.login._flows._flows
         signing_in = sorted((f.id, f.credential, f.owner, f.expires_at) for f in flows.values())
-        return sessions, pending, counts, signing_in, rig.vault.passkeys.document
+        assert app.onboard is not None
+        records = app.onboard._table._records.values()
+        onboarding = sorted((r.id, r.owner, r.stage, r.expires_at) for r in records)
+        jobs = rig.vault.app._reviews._jobs.values()
+        reviews = sorted((j.id, j.owner, j.state, j.digest) for j in jobs)
+        held = (signing_in, onboarding, reviews)
+        return sessions, pending, counts, held, rig.vault.passkeys.document
 
     before = tables()
     gets = [r for r in ROUTES if r.method == "GET"]
@@ -642,6 +708,87 @@ def every_get_leaves_the_tables(rig: PortalRig) -> None:
     for route in gets:
         for page in (world.first, setup):
             page.fetch("GET", filled(route))
+    for path in owned:
+        assert world.first.fetch("GET", path).status_code == 200
     for path in STATIC:
         world.first.fetch("GET", path)
     assert tables() == before
+
+
+# --- M7 K.3: a private discovery, and what the flow starts and renders leave ---------------------
+
+
+def test_a_discovery_with_allow_private_and_no_step_up_reaches_nothing(tmp_path: Path) -> None:
+    """TI-3: the route refuses the key, and the action's plan sends nothing and holds no
+    onboarding; without its confirm nothing ever does."""
+    sent: list[str] = []
+
+    def recorded(vault: server.Vault) -> OnboardService:
+        service = model_onboarding(vault)
+        transport = service._client._transport
+        assert isinstance(transport, httpx.MockTransport)
+        handler = transport.handler
+
+        def note(request: httpx.Request) -> Any:
+            sent.append(str(request.url))
+            return handler(request)
+
+        service._client._transport = httpx.MockTransport(note)
+        return service
+
+    with running(tmp_path, onboard=recorded) as rig:
+        page = rig.browser().page(rig.origin)
+        passkey = SoftAuthenticator()
+        set_up(rig, page, passkey)
+        body = {
+            "url": onboard_model.SERVER_URL,
+            "allow_private": True,
+            "client_id": onboard_model.CLIENT_ID,
+        }
+        refused = page.fetch("POST", "/api/onboard/discover", json=body)
+        assert status_reason(refused) == (400, "bad_body")
+        held = prepared(page, "onboard.discover_private", body)
+        assert held["kind"] == "onboard.discover_private"
+        assert page.fetch("DELETE", f"{ACTIONS}/{held['action']}").json() == {"cancelled": True}
+        held = prepared(page, "onboard.discover_private", body)
+        # A confirm without the passkey's assertion is refused, and spends the action.
+        assert status_reason(confirm(page, held["action"], {})) == (401, "step_up_refused")
+        assert rig.app.onboard is not None
+        assert (sent, len(rig.app.onboard._table)) == ([], 0)
+        assert rig.lines("onboard_started") == []
+        # With the passkey it runs, and only then reaches the server.
+        done = step_up(page, passkey, "onboard.discover_private", body)
+        assert done.status_code == 200, done.text
+        assert sent
+        assert [line["allow_private"] for line in rig.lines("onboard_started")] == [True]
+
+
+def test_every_flow_start_and_render_leaves_the_store_the_passkeys_and_the_policy(
+    tmp_path: Path,
+) -> None:
+    """K.3's snapshot: a discovery, fragment 1 of a given public client and again, a review
+    queued and fragment 2 made: none writes the store, the passkey file or the policy."""
+    with running(tmp_path, policy=SERVERS_POLICY, onboard=model_onboarding) as rig:
+        page = rig.browser().page(rig.origin)
+        set_up(rig, page, SoftAuthenticator())
+        poller(rig)
+
+        def files() -> object:
+            state = sorted((p.name, p.read_bytes()) for p in rig.state.rglob("*") if p.is_file())
+            return state, rig.policy_file.read_bytes(), rig.vault.app.policy
+
+        before = files()
+        discover = {"url": onboard_model.SERVER_URL, "client_id": onboard_model.CLIENT_ID}
+        plan = page.fetch("POST", "/api/onboard/discover", json=discover)
+        assert plan.status_code == 200, plan.text
+        fragment = f"/api/onboard/{plan.json()['onboarding']}/fragment"
+        for indent in (0, "compose"):
+            made = page.fetch("POST", fragment, json={"indent": indent})
+            assert made.status_code == 200, made.text
+        queued = page.fetch("POST", "/api/review/notes", json={})
+        assert queued.status_code == 200, queued.text
+        gateway_answers(rig)
+        choices = {"include": ["echo"], "allow": ["echo"], "approve": []}
+        diff = page.fetch("POST", f"/api/review/jobs/{queued.json()['job']}/diff", json=choices)
+        assert diff.status_code == 200, diff.text
+        assert files() == before

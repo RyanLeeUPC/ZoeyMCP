@@ -21,7 +21,7 @@ from typing import Any, Final, Literal
 
 from ..common.canonical import digest
 from ..common.logs import refuse_type
-from .routes import BODY_DEFAULT, BODY_PASTE, BODY_SECRET
+from .routes import BODY_DEFAULT, BODY_PASTE, BODY_SECRET, DISCOVER_KEYS
 from .sessions import NONCE_BYTES, RandomBytes, challenge, new_id
 
 ACTION_TTL: Final = 300.0
@@ -36,7 +36,8 @@ STEP_UP_TAG: Final = b"zoeymcp/webauthn/step-up/v1\n"
 @dataclass(frozen=True)
 class Kind:
     """One kind of action: its body cap (M.1) and the keys of its ``data`` (F.4). The kind's
-    plan and run are the caller's; M6 and M8 add kinds here without changing the mechanism."""
+    plan and run are the caller's; later milestones add kinds here without changing the
+    mechanism."""
 
     name: str
     cap: int
@@ -62,6 +63,18 @@ KINDS: Final[dict[str, Kind]] = {
         Kind("passkey.rename", _DEFAULT_CAP, frozenset({"credential", "name"})),
         Kind("passkey.remove", _DEFAULT_CAP, frozenset({"credential"})),
         Kind("ledger.restart", _DEFAULT_CAP, frozenset()),
+        # M7 K.3: a discovery that lifts the address guard for the typed host:port (TI-3), whose
+        # run is the discovery itself; and registering a client, or storing a given one's secret,
+        # whose run sends the registration or writes the secret, then makes fragment 1.
+        Kind(
+            "onboard.discover_private",
+            _DEFAULT_CAP,
+            frozenset({"url", "allow_private"}),
+            DISCOVER_KEYS,
+        ),
+        Kind(
+            "onboard.register", BODY_SECRET, frozenset({"onboarding"}), frozenset({"client_secret"})
+        ),
     )
 }
 

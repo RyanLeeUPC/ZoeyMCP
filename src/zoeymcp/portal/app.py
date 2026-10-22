@@ -63,6 +63,20 @@ connectors' journals and the sends no call explains; no keyed digest or pin is i
 copy refuses every report, each page has its banner, and ``ledger.restart``, planned with every
 epoch it deletes, restarts the chain once the operator has decided why.
 
+MCP servers (M7 design K): ``GET /api/servers`` lists this session's onboarding and every server a
+review can be queued for, each with its state and what to do next. Onboarding by URL shares the
+admin socket's ``OnboardService``, its onboardings owned by the session and cancelled when it
+ends: ``POST /api/onboard/discover`` answers the plan, nothing sent but discovery's GETs and the
+probe, and a client the vault registers gets this origin's callback address; ``POST
+/api/onboard/{onboarding}/fragment`` makes a given public client's fragment 1, or a registered
+one's again at any indent (OPS-2); ``GET`` reads one and ``DELETE`` cancels it. Registering a
+client, or storing a given client's secret, is the ``onboard.register`` action, whose plan checks
+everything register will (``register_facts``); a private server's discovery, which lifts the
+address guard for the typed ``host:port``, is the ``onboard.discover_private`` action (TI-3).
+The review queues a job of the portal's surface for the gateway's poll (``POST
+/api/review/{server}``), answers a done job's rows (``portal/reviewview.py``), and makes
+fragment 2 from the operator's choices (``POST /api/review/jobs/{job}/diff``), saving nothing.
+
 The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
 a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
 origin. A start for one sets the flow's binding cookie (``SameSite=Lax``, its ``Path`` the
@@ -108,12 +122,23 @@ from urllib.parse import parse_qsl
 
 from starlette.types import Receive, Scope, Send
 
+from ..common import netguard
 from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
+from ..common.policy.fields import URL_MAX
 from ..common.policy.schema import OAuth2Credential, split_scope
 from ..vault import ledgerview, logs, secretops, secretplan
 from ..vault.bindings import VAULT_PREFIX
 from ..vault.oauth.login import LoginError
 from ..vault.oauth.pkce import FLOW_TTL, CallbackBinder
+from ..vault.onboard import OnboardError, check_request
+from ..vault.onboarding import (
+    Listed,
+    listed_next,
+    listed_server,
+    listed_servers,
+    server_host_port,
+    tools_max,
+)
 from ..vault.reportstore import (
     CopyUnavailable,
     NotRestartable,
@@ -121,8 +146,10 @@ from ..vault.reportstore import (
     RestartPlan,
     epoch_json,
 )
+from ..vault.reviewjobs import Job, Owner, ReviewRefused
 from ..vault.secretplan import PutPlan, SecretRefusal
 from . import passkeys as passkey_file
+from . import reviewview
 from . import routes as api
 from .actions import Action, ActionRefusal, Actions, changed, parse_request
 from .admission import (
@@ -182,10 +209,11 @@ from .webauthn import (
 
 if TYPE_CHECKING:
     from ..common.policy.schema import Policy
-    from ..vault.admin import SetupCodes
+    from ..vault.admin import ReviewQueue, SetupCodes
     from ..vault.connectors.smtp import SmtpConnectors
     from ..vault.oauth.login import LoginService
     from ..vault.oauth.tokens import TokenManager
+    from ..vault.onboard import OnboardService
     from ..vault.reportstore import ReportStore
     from ..vault.store import EntryMeta, SecretStore
     from .passkeys import Passkeys
@@ -275,6 +303,25 @@ ORPHAN_FLAGS: Final[Mapping[str, str]] = MappingProxyType(
 )
 # The ledger page's query (J.5): each at most once, all optional.
 LEDGER_QUERY: Final = frozenset({"archive", "before", "limit"})
+# The MCP servers section (M7 K). The portal's review jobs are its own surface's (F.2).
+REVIEW_OWNER: Final[Owner] = "portal"
+# A plan row's value is a validated URL at most (URL_MAX) with its label's words; a client ID is
+# at most the schema's 512 characters.
+ROW_LIMIT: Final = 2 * URL_MAX
+CLIENT_LIMIT: Final = 512
+# The client authentications whose secret comes with register (D.7), and the names a discovery
+# may give.
+SECRET_AUTHS: Final = frozenset({"basic", "post"})
+NAME_KEYS: Final = ("credential", "route", "server")
+# An onboarding's row state by its stage (K.1); a server's comes from onboarding.Listed.
+ROW_STATES: Final[Mapping[str, str]] = MappingProxyType(
+    {"discovered": "needs_register", "registered": "needs_commit"}
+)
+# A ``needs_commit`` row's primary step (K.1): fragment 1 again, at any indent (OPS-2), ahead of
+# the steps that apply it.
+SHOW_FRAGMENT: Final[Mapping[str, str]] = MappingProxyType(
+    {"do": "show_fragment", "label": "Show fragment 1"}
+)
 
 CSP: Final = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
@@ -448,7 +495,9 @@ class PortalApp:
     ``GET /api/health`` is a 500 and the session answer has no counts. ``ledger`` is what the
     Ledger page reads and ``ledger.restart`` restarts (J); without it, those are a 500 and no
     page shows the copy's banner. ``source`` is where the running policy came from, for the
-    policy view (L), which reads the policy through ``secrets``.
+    policy view (L), which reads the policy through ``secrets``. ``onboard`` is onboarding by
+    URL's service and ``reviews`` the review jobs, both shared with the admin socket (M7 design
+    K); without them, the MCP servers routes and actions are a 500.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
     class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
     limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
@@ -470,6 +519,8 @@ class PortalApp:
         health: Callable[[], dict[str, Any]] | None = None,
         ledger: Ledger | None = None,
         source: Source = "file",
+        onboard: OnboardService | None = None,
+        reviews: ReviewQueue | None = None,
         routes: Sequence[Route] = ROUTES,
         handlers: Mapping[Route, Handler] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -485,6 +536,8 @@ class PortalApp:
         self.health = health
         self.ledger = ledger
         self.source: Source = source
+        self.onboard = onboard
+        self.reviews = reviews
         self._routes = tuple(routes)
         self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
@@ -753,15 +806,18 @@ class PortalApp:
 
     def _finish(self, ended: Iterable[Ended]) -> None:
         """What every ending of a session needs: its enrolment ceremony and pending action go,
-        its OAuth flows are cancelled (H.2), and the end is logged (M.4). ``ended`` is only what
-        the table removed (``Sessions.end`` answers None for a session already gone), so each
-        session's end is finished and logged once, by the request that ended it."""
+        its OAuth flows and its onboarding are cancelled (H.2, M7 D.8), and the end is logged
+        (M.4). ``ended`` is only what the table removed (``Sessions.end`` answers None for a
+        session already gone), so each session's end is finished and logged once, by the
+        request that ended it."""
         for item in ended:
             session = item.session
             self.ceremonies.drop_session(session.id)
             self.actions.drop_session(session.id)
             if self.login is not None:
                 self.login.cancel_owner(session.owner)
+            if self.onboard is not None:
+                self.onboard.cancel_owner(session.owner)  # M7 D.8
             kind = "portal_logout" if item.why == "logout" else "portal_session_ended"
             logs.event(kind, session=session.fingerprint, why=item.why)
 
@@ -787,6 +843,14 @@ class PortalApp:
             api.FLOW_STATUS: self._flow_status,
             api.FLOW_CANCEL: self._flow_cancel,
             api.LEDGER: self._ledger_page,
+            api.SERVERS: self._servers,
+            api.ONBOARD_DISCOVER: self._onboard_discover,
+            api.ONBOARD: self._onboard_read,
+            api.ONBOARD_FRAGMENT: self._onboard_fragment,
+            api.ONBOARD_CANCEL: self._onboard_cancel,
+            api.REVIEW: self._review_queue,
+            api.REVIEW_JOB: self._review_read,
+            api.REVIEW_DIFF: self._review_diff,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -1154,7 +1218,8 @@ class PortalApp:
         return Reply({"cancelled": cancelled})
 
     def _own_kinds(self) -> dict[str, ActionKind]:
-        """The kinds this portal runs, each in ``actions.KINDS``; M6 and M8 add theirs here."""
+        """The kinds this portal runs, each in ``actions.KINDS``; later milestones add kinds
+        here without changing the mechanism."""
         return {
             "passkey.enrol": ActionKind(self._plan_enrol, self._run_enrol),
             "passkey.rename": ActionKind(self._plan_rename, self._run_rename),
@@ -1164,6 +1229,10 @@ class PortalApp:
             "oauth.complete": ActionKind(self._plan_complete, self._run_complete),
             "oauth.reset": ActionKind(self._plan_reset, self._run_reset),
             "ledger.restart": ActionKind(self._plan_restart, self._run_restart),
+            "onboard.discover_private": ActionKind(
+                self._plan_discover_private, self._run_discover_private
+            ),
+            "onboard.register": ActionKind(self._plan_register, self._run_register),
         }
 
     def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1675,6 +1744,192 @@ class PortalApp:
         except OSError:
             return refusal("not_written")
         return Reply({"restarted": done.to_json(), "head": copy.head().to_json()})
+
+    # --- MCP servers: the rows, onboarding by URL, the review (M7 design K) --------------------
+
+    async def _servers(self, call: Call) -> Reply | Refusal:
+        """K.1's rows: this session's onboarding first, while it lasts, then every server a
+        review can be queued for, each with its state and what to do next (M.7), the first of
+        which is the row's button."""
+        policy = self._policy()
+        own = self._onboard_service().owned(_session(call).owner)
+        found = [] if own is None else [_onboarding_row(own)]
+        names = self._secret_store().store.names()
+        found += [_server_row(listed) for listed in listed_servers(policy, names)]
+        return Reply({"servers": found})
+
+    async def _onboard_discover(self, call: Call) -> Reply | Refusal:
+        """Add by URL (K.1 item 2): discovery's plan, nothing sent but its GETs and the probe,
+        held in memory for this session (D.8); the same URL and names again carries on with the
+        onboarding as it is (D.11). A private server's discovery is the action (TI-3)."""
+        owner = _session(call).owner
+        try:
+            answer = await self._onboard_service().discover(
+                _discovery(_body(call), call.entry), owner=owner
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Reply(_onboard_view(answer))
+
+    async def _onboard_read(self, call: Call) -> Reply | Refusal:
+        """This session's onboarding as it stands: its plan, or its stage and what to do next.
+        Another session's answers as an unknown one (X24)."""
+        try:
+            answer = self._onboard_service().read(
+                call.params["onboarding"], owner=_session(call).owner
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Reply(_onboard_view(answer))
+
+    async def _onboard_fragment(self, call: Call) -> Reply | Refusal:
+        """Fragment 1 for a given public client, with nothing sent or stored, or a registered
+        onboarding's again at any indent (OPS-2): the ``needs_commit`` row's "Show fragment 1".
+        It writes nothing, so it needs no step-up."""
+        try:
+            answer = await self._onboard_service().fragment(
+                call.params["onboarding"], dict(_body(call)), owner=_session(call).owner
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Reply(_onboard_view(answer))
+
+    async def _onboard_cancel(self, call: Call) -> Reply | Refusal:
+        """Drop this session's onboarding: it only removes what discovery held (no step-up)."""
+        try:
+            await self._onboard_service().cancel(
+                call.params["onboarding"], owner=_session(call).owner
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Reply({"cancelled": True})
+
+    def _plan_discover_private(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``onboard.discover_private`` (TI-3): the discovery's body checked as discovery checks
+        it, with nothing sent, so a stolen session without the passkey can't make the vault
+        probe a private ``host:port``. The summary names what the guard is lifted for."""
+        if data["allow_private"] is not True:
+            return refusal("bad_body")
+        try:
+            url, options = check_request(_discovery(data, step.entry))
+        except OnboardError as exc:
+            return exc.answer
+        named = [shown(str(data[key]), NAME_LIMIT) for key in NAME_KEYS if key in data]
+        summary = (
+            ("Discover", url),
+            ("The address guard is lifted for", _host_port(url)),
+            ("Names", ", ".join(named) or "from the server's host name"),
+        )
+        return Plan(summary, (url, options, tuple(named)))
+
+    async def _run_discover_private(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """The discovery itself, with the guard lifted for the typed server alone (B.2)."""
+        try:
+            answer = await self._onboard_service().discover(
+                _discovery(data, step.entry), owner=step.session.owner
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Reply(_onboard_view(answer))
+
+    def _plan_register(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``onboard.register`` (K.3): ``register_facts`` reads the onboarding again (this
+        session's, its stage, not expired) and checks what register will check, a given secret
+        against the store, so a mistake shows before the passkey prompt. The summary repeats
+        the issuer's host, the registration endpoint's host (DCR), the redirect address and the
+        secret's name and binding when one will be stored. The facts leave out when the
+        onboarding expires, so an unchanged one plans the same at confirm."""
+        onboarding, secret = data["onboarding"], data.get("client_secret")
+        if not isinstance(onboarding, str) or (secret is not None and not isinstance(secret, str)):
+            return refusal("bad_body")
+        try:
+            facts = self._onboard_service().register_facts(
+                onboarding, owner=step.session.owner, secret=secret
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Plan(_register_summary(facts), (facts,))
+
+    async def _run_register(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """D.4's registration or D.7's write, then fragment 1 (E.2). The secret, from the held
+        data, goes to the store and nowhere else; a registered client's comes from its
+        authorization server."""
+        body = {} if data.get("client_secret") is None else {"client_secret": data["client_secret"]}
+        try:
+            answer = await self._onboard_service().register(
+                data["onboarding"], body, owner=step.session.owner
+            )
+        except OnboardError as exc:
+            return exc.answer
+        return Reply(_onboard_view(answer))
+
+    async def _review_queue(self, call: Call) -> Reply | Refusal:
+        """K.1 item 4: queue a review of a served server for the gateway's poll (F.2), or hand
+        back the portal's done one at the current view digest (OPS-11). It holds a job in memory
+        and changes nothing."""
+        server = call.params["server"]
+        try:
+            job = await self._review_jobs().queue_review(server, REVIEW_OWNER)
+        except ReviewRefused as exc:
+            return refusal(exc.reason, **exc.fields)
+        return Reply({**_job_view(job), "reused": job.state == "done"})
+
+    async def _review_read(self, call: Call) -> Reply | Refusal:
+        """The portal's job, as the page polls it: its state, and once done F.6's rows; a
+        failed job answers its refusal. The CLI's jobs answer as unknown ones."""
+        job = await self._review_job(call)
+        if isinstance(job, Refusal):
+            return job
+        if job.report is not None:
+            report = job.report.model_dump(mode="json", exclude_unset=True)
+            return Reply({**_job_view(job), **reviewview.rows(report)})
+        return Reply(_job_view(job))
+
+    async def _review_diff(self, call: Call) -> Reply | Refusal:
+        """Fragment 2 from the operator's choices (F.6, E.4), against the running policy; or
+        ``review_stale`` after a reload that changed the server's tools (GR-11). It writes
+        nothing, so it needs no step-up."""
+        job = await self._review_job(call)
+        if isinstance(job, Refusal):
+            return job
+        if job.report is None:
+            return replace(refusal("bad_body"), more=(("detail", "the review isn't done yet"),))
+        report = job.report.model_dump(mode="json", exclude_unset=True)
+        policy = self._policy()
+        answer = reviewview.diff(
+            report,
+            listed_server(policy, job.server),
+            _body(call),
+            policy=policy,
+            most=tools_max(policy),
+            source=self._onboard_service().source,
+        )
+        if isinstance(answer, Refusal):
+            return answer
+        diff = answer["diff"]
+        shown_diff = {"yaml": diff["yaml"], "check": _findings_shown(diff["check"])}
+        return Reply({**answer, "diff": shown_diff})
+
+    async def _review_job(self, call: Call) -> Job | Refusal:
+        """The portal's job the path names, as it is now; a failed one is its refusal."""
+        try:
+            job = await self._review_jobs().review_job(call.params["job"], REVIEW_OWNER)
+        except ReviewRefused as exc:
+            return refusal(exc.reason, **exc.fields)
+        if job.failure is not None:
+            refused = refusal(job.failure, **dict(job.fields))
+            return replace(refused, more=tuple(_job_view(job).items()))
+        return job
+
+    def _onboard_service(self) -> OnboardService:
+        if self.onboard is None:
+            raise RuntimeError("this portal has no onboarding service")
+        return self.onboard
+
+    def _review_jobs(self) -> ReviewQueue:
+        if self.reviews is None:
+            raise RuntimeError("this portal has no review jobs")
+        return self.reviews
 
     def _ledger(self) -> Ledger:
         if self.ledger is None:
@@ -2352,6 +2607,137 @@ def _restart_summary(plan: RestartPlan) -> tuple[tuple[str, str], ...]:
         summary.append(("Delete", words))
     summary.append(("Then", "the next report from the gateway starts a new chain, on trust"))
     return tuple(summary)
+
+
+def _discovery(body: Mapping[str, Any], entry: Origin) -> dict[str, Any]:
+    """A discovery's body as the onboarding service takes it from this origin: a client the
+    vault registers gets this origin's callback address as its redirect (M7 D.4, Q35), and a
+    client authentication that needs a secret says the secret follows with register (D.7)."""
+    request = dict(body)
+    if "client_id" not in request and "redirect_uri" not in request:
+        request["callback_origin"] = entry.origin
+    if request.get("client_auth") in SECRET_AUTHS:
+        request["secret_given"] = True
+    return request
+
+
+def _host_port(url: str) -> str:
+    """The ``host:port`` of a URL discovery accepted."""
+    return netguard.entry_key(*server_host_port(url))
+
+
+def _host(url: str) -> str:
+    """The host of a URL discovery accepted."""
+    return server_host_port(url)[0]
+
+
+def _register_summary(facts: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """What ``onboard.register`` will do (K.1 item 2): the issuer's host, the registration
+    endpoint's host for a client the vault registers, the redirect address, and what is
+    stored, a client secret's name and binding."""
+    names = ", ".join(facts["names"])
+    if facts["stage"] == "registered":
+        return (("Show fragment 1 again for", names), ("Sent or stored", "nothing"))
+    summary = [
+        ("Onboard", shown(facts["server_url"], ROW_LIMIT)),
+        ("As", names),
+        ("Issuer", _host(facts["issuer"])),
+    ]
+    if facts["registration"] == "dcr":
+        summary.append(("Register a client at", _host(facts["registration_endpoint"])))
+    else:
+        summary.append(("Client", f"{shown(facts['client_id'], CLIENT_LIMIT)} (given)"))
+    summary.append(("Redirect address", shown(facts["redirect_uri"], ROW_LIMIT)))
+    entry = facts["entry"]
+    if facts["secret_stored"]:
+        bound = f"{_host(facts['token_endpoint'])} and {facts['server_origin']}"
+        summary.append(("Stored", f"a client secret, as {entry}, bound to {bound}"))
+    elif entry is not None:
+        summary.append(("Stored", f"its client ID, as {entry}, until the policy names it"))
+    else:
+        summary.append(("Stored", "nothing"))
+    return tuple(summary)
+
+
+def _onboard_view(answer: Mapping[str, Any]) -> dict[str, Any]:
+    """An onboarding answer as the page shows it (M7 K.5): each row's value, the resource's
+    name from its metadata and a client ID shown, and every check finding's message. The
+    endpoints, hosts and scopes are the ones discovery validated (X2), and fragment 1 is the
+    emitter's text, for Copy as it is."""
+    view = dict(answer)
+    if "rows" in view:
+        view["rows_shown"] = [[label, shown(value, ROW_LIMIT)] for label, value in view.pop("rows")]
+    if "plan" in view:
+        plan = dict(view["plan"])
+        if "resource_name" in plan:
+            name = plan.pop("resource_name")
+            plan["resource_name_shown"] = None if name is None else shown(name)
+        if "client_id" in plan:
+            client = plan.pop("client_id")
+            plan["client_id_shown"] = None if client is None else shown(client, CLIENT_LIMIT)
+        view["plan"] = plan
+    if "client_id" in view:
+        client = view.pop("client_id")
+        view["client_id_shown"] = None if client is None else shown(client, CLIENT_LIMIT)
+    if "draft_check" in view:
+        view["draft_check"] = _findings_shown(view["draft_check"])
+    if "diff" in view:
+        diff = view["diff"]
+        view["diff"] = {"yaml": diff["yaml"], "check": _findings_shown(diff["check"])}
+    return view
+
+
+def _findings_shown(findings: Iterable[Mapping[str, str]]) -> list[dict[str, str]]:
+    """``check``'s findings with each message shown."""
+    return [
+        {
+            "level": finding["level"],
+            "path": finding["path"],
+            "message_shown": shown(finding["message"], SUMMARY_LIMIT),
+        }
+        for finding in findings
+    ]
+
+
+def _onboarding_row(answer: Mapping[str, Any]) -> dict[str, Any]:
+    """This session's onboarding as a row (K.1): ``needs_register`` with its plan,
+    ``needs_commit`` once fragment 1 is issued, or ``blocked`` (D.11), with what to do next:
+    for ``needs_commit``, "Show fragment 1" first, then how to apply it."""
+    stage = answer["stage"]
+    url = answer["plan"]["server_url"] if "plan" in answer else answer["server_url"]
+    names = answer["names"]
+    steps = answer["next"]
+    if stage == "registered":
+        steps = [dict(SHOW_FRAGMENT), *steps]
+    return {
+        "onboarding": answer["onboarding"],
+        "name_shown": shown(names["server"], NAME_LIMIT),
+        "kind": "remote",
+        "state": ROW_STATES.get(stage, stage),
+        "server_url": url,
+        "expires": answer["expires"],
+        "next": steps,
+    }
+
+
+def _server_row(listed: Listed) -> dict[str, Any]:
+    """A server of the running policy as a row (K.1): its state, the tools it serves and to
+    which clients, and what to do next."""
+    return {
+        "server": listed.name,
+        "name_shown": shown(listed.name, NAME_LIMIT),
+        "kind": listed.kind,
+        "state": listed.state,
+        "credential": listed.credential,
+        "tools": len(listed.tools.include),
+        "clients_shown": [shown(client, NAME_LIMIT) for client in listed.clients],
+        "next": [step.answer() for step in listed_next(listed)],
+    }
+
+
+def _job_view(job: Job) -> dict[str, Any]:
+    """A review job as the page polls it: never its digest or times."""
+    return {"job": job.id, "server_shown": shown(job.server, NAME_LIMIT), "state": job.state}
 
 
 def _session(call: Call) -> Session:

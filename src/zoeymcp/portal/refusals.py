@@ -459,10 +459,13 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "That review isn't known to the vault: it finished more than 30 minutes ago, the "
             "vault restarted, or its result came already. Review again.",
         ),
+        # A job no poll at its view claimed (F.2), or a report whose server the running policy
+        # no longer has as the review found it (F.6, GR-11): a reload since, either way.
         "review_stale": Entry(
             409,
-            "The gateway didn't take the review within 60 seconds: it holds another version of "
-            "the policy (a reload since). Review again once it has caught up.",
+            "The policy changed since this review (a reload): the gateway didn't take it within "
+            "60 seconds, holding another version, or the server's tools changed since its "
+            "report. Review again once the gateway has caught up.",
         ),
         "review_timeout": Entry(
             504,

@@ -569,3 +569,112 @@ def test_the_policys_digest_is_of_its_tools_alone() -> None:
         "allow": ["read_01"],
         "approve": ["echo"],
     }
+
+
+def head_of(answer: dict[str, Any]) -> str:
+    """The four header lines ``--choose`` writes for ``answer``, so the next line is line 5."""
+    return "\n".join(file_of(answer).splitlines()[:4]) + "\n"
+
+
+def test_a_line_read_keeps_its_number_past_a_blank_line_and_a_hash_in_its_comment() -> None:
+    """A blank line is skipped, not the end of the file; a comment is everything after the first
+    #, whatever it holds."""
+    answer = large()
+    pin = by_name(answer)["read_01"]["pin"]
+    text = head_of(answer) + f"\nallow read_01 {pin}   # see #2, and #3\n\n"
+    parsed = choices.parse(text)
+    assert parsed.lines == (choices.Line(6, "allow", "read_01", pin),)
+    added = choices.decide(answer, JOB, parsed).added
+    assert added == {"read_01": view.Added("allow", "allow, from the choices file")}
+    # A whole file's lines keep theirs: the comment line in between counts too.
+    text = file_of(answer)
+    numbers = {line.tool: line.number for line in choices.parse(text).lines}
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.startswith("#"):
+            assert numbers[line.split()[1]] == number
+
+
+def test_a_refusal_in_parsing_says_its_line_and_cuts_what_it_quotes() -> None:
+    """A word is cut to 20 characters and a tool name to 128, as a comment's upstream text is."""
+    answer = large()
+    text = file_of(answer)
+    end = len(text.splitlines()) + 1
+    [first] = [n for n, line in enumerate(text.splitlines(), start=1) if " read_01 " in line]
+
+    def message(line: str) -> str:
+        with pytest.raises(choices.ChoicesRefused) as caught:
+            choices.parse(text + line + "\n")
+        assert caught.value.reason == "choices_invalid"
+        return str(caught.value)
+
+    word, cut_word = "w" * 21, "w" * 20 + "..."
+    assert message(f"{word} read_01 {OTHER_PIN}") == (
+        f'line {end}: "{cut_word}" isn\'t skip, allow or approve'
+    )
+    tool, cut_tool = "t" * 129, "t" * 128 + "..."
+    assert message(f"allow {tool} {OTHER_PIN}") == f"line {end}: {cut_tool} isn't a tool name"
+    assert message(f"skip read_01 {OTHER_PIN}") == f"line {end}: read_01 is on line {first} too"
+    assert message("allow read_99 sha256:abc") == (
+        f"line {end}: read_99's pin isn't sha256: and 64 hex digits"
+    )
+    assert message(f"# report {JOB} {DIGESTS}") == f"line {end}: a second report line"
+
+
+def test_a_refusal_in_deciding_says_its_line() -> None:
+    answer = large()
+    head = head_of(answer)
+    caught = refused(answer, head + f"allow read_01 {OTHER_PIN}\n")
+    assert str(caught) == "line 5: read_01's pin isn't the one the server lists"
+    bad = by_name(answer)[LARGE_INVALID]["pin"]
+    caught = refused(answer, head + f"allow {LARGE_INVALID} {bad}\n")
+    assert str(caught) == f"line 5: {LARGE_INVALID} has an error finding, so it can't be pinned"
+    included = large(["bad_tool"], approve=["bad_tool"])
+    pin = by_name(included)["bad_tool"]["pin"]
+    caught = refused(included, head_of(included) + f"approve bad_tool {pin}\n")
+    assert str(caught) == (
+        "line 5: bad_tool stays as the policy has it (invalid); review notes shows why; it can't "
+        "be pinned"
+    )
+    for entry in answer["tools"]:
+        if entry["name"] == "read_01":
+            entry["consequential"] = True
+    pin = by_name(answer)["read_01"]["pin"]
+    caught = refused(answer, head_of(answer) + f"allow read_01 {pin}\n")
+    assert str(caught) == (
+        "line 5: the toolkit declares read_01 consequential, so it can't be in allow"
+    )
+
+
+def test_the_whole_file_refusals_are_choices_invalid() -> None:
+    answer = large()
+    text = file_of(answer).replace("# zoeymcp review notes:", "# zoeymcp review mail:")
+    assert refused(answer, text).reason == "choices_invalid"
+    with pytest.raises(choices.ChoicesRefused) as caught:
+        choices.parse("#" * (choices.FILE_MAX + 1))
+    assert caught.value.reason == "choices_invalid"
+    with pytest.raises(choices.ChoicesRefused) as caught:
+        choices.parse("")
+    assert (caught.value.reason, str(caught.value)) == (
+        "choices_invalid",
+        "the file has no zoeymcp review header and report line; write it with review <server> "
+        "--choose",
+    )
+
+
+def test_a_long_name_is_cut_in_a_comment_line() -> None:
+    """A name the policy can't hold, included or not, is shown cut to 128 characters, and an
+    error finding to 100; an included one that can't be pinned isn't told to repin, drifted or
+    not."""
+    answer = reviewed([LARGE[0], LARGE[1]], served())
+    kept, unpinned = answer["tools"]
+    kept.update(name="a" * 129, included=True, state="drift", classification="approve")
+    unpinned["name"] = "b" * 129
+    unpinned["findings"] = [{"level": "error", "pointer": "/description", "message": "m" * 150}]
+    lines = choices.render(answer, JOB, suggest=False)
+    kept_name, unpinned_name = "a" * 128 + "...", "b" * 128 + "..."
+    assert lines[4:] == [
+        f"# {kept_name} stays as the policy has it (drift); review notes shows why; it can't be "
+        "pinned",
+        f"# {unpinned_name} can't be included: error finding ({'m' * 100}...); review notes "
+        f"--show {unpinned_name}",
+    ]

@@ -6,8 +6,8 @@ The table's owners, TTL (on the injected monotonic clock, FM-28) and caps; resum
 the client a registration made, and its endpoint's host in the allowance (D.4); the name
 defaults (OPS-15); the second run's comparison by field name (D.12, GR-26), what it
 finds of a server reaching the URL otherwise (OPS-14) and of a refresh token already held
-(OPS-13); a re-registration's end (OPS-3); and the ``next`` lists with every command
-shell-quoted (M.7, TI-14).
+(OPS-13); a re-registration's end (OPS-3); the ``next`` lists with every command
+shell-quoted (M.7, TI-14); and the portal's server rows and the steps after fragment 2 (K.1, E.4).
 """
 
 from __future__ import annotations
@@ -27,7 +27,14 @@ from zoeymcp.common.policy.change import (
     apply,
 )
 from zoeymcp.common.policy.findings import Finding
-from zoeymcp.common.policy.schema import HeaderCredential, OAuth2Credential, RemoteServer, Route
+from zoeymcp.common.policy.schema import (
+    BridgeServer,
+    HeaderCredential,
+    OAuth2Credential,
+    RemoteServer,
+    Route,
+    Tools,
+)
 from zoeymcp.vault import onboarding
 from zoeymcp.vault.oauth.discovery import AsMetadata, Plan, Prm, build_plan
 from zoeymcp.vault.onboarding import (
@@ -57,16 +64,21 @@ from zoeymcp.vault.onboarding import (
     default_name,
     fragment_file,
     in_use,
+    listed_next,
+    listed_server,
+    listed_servers,
     mismatches,
     name_taken,
     next_for,
     onboard_again,
     remove_first,
+    reviewed_next,
     secret_names,
     served_at,
     server_host_port,
     server_path,
     token_state,
+    tools_max,
     widen_scope,
 )
 
@@ -1478,3 +1490,203 @@ def test_a_reregistration_signs_in_with_the_new_client() -> None:
     steps = next_for(staged("registered", Options(client_id="zc_new", reregister=True)), "p.yaml")
     login = ("zoeymcp", "login", "notes", "--rebind")
     assert steps[-1] == NextStep("connect", "Then sign in with the new client", login, "exec")
+
+
+# --- the portal's server rows (K.1, GR-21) ------------------------------------------------------
+
+
+def with_servers(policy: Policy, **servers: object) -> Policy:
+    """``policy`` with ``servers`` added to (or, as None, taken from) its gateway's."""
+    assert policy.gateway is not None
+    found = {**policy.gateway.servers, **servers}
+    kept = {name: server for name, server in found.items() if server is not None}
+    gateway = policy.gateway.model_copy(update={"servers": kept})
+    return policy.model_copy(update={"gateway": gateway})
+
+
+def test_the_servers_a_review_can_be_queued_for() -> None:
+    """Remote and toolkit servers, by name; a remote server's oauth2 credential, its resource
+    and whether it holds a refresh token; the clients assigned to each."""
+    found = listed_servers(committed(), {"broker-refresh"})
+    assert [(s.name, s.kind, s.credential, s.resource, s.held, s.clients) for s in found] == [
+        (
+            "broker-read",
+            "remote",
+            "broker-mcp",
+            "https://mcp.broker.example/",
+            "stored",
+            ("agent1",),
+        ),
+        (
+            "broker-trade",
+            "remote",
+            "broker-mcp",
+            "https://mcp.broker.example/",
+            "stored",
+            ("agent1",),
+        ),
+        ("mail", "toolkit", None, None, None, ("agent1",)),
+        ("notes", "remote", "notes", SERVER, "none", ()),
+    ]
+    trade = found[1]
+    assert (trade.tools.include, trade.tools.approve, trade.on_drift) == (
+        ["place_order", "cancel_order"],
+        ["place_order", "cancel_order"],
+        "fail",
+    )
+    assert [s.state for s in found] == ["reviewed", "reviewed", "reviewed", "needs_connect"]
+
+
+def test_a_rows_state() -> None:
+    """``needs_connect`` until the credential holds a refresh token (a seed waiting counts),
+    then ``needs_review`` until a tool is included, then ``reviewed``."""
+    tools = Tools(include=["list_notes"], allow=["list_notes"])
+    bare = onboarding.Listed("notes", "remote", Tools(), "hide")
+    assert bare.state == "needs_review"
+    assert replace(bare, tools=tools).state == "reviewed"
+    assert replace(bare, held="none").state == "needs_connect"
+    assert replace(bare, held="none", tools=tools).state == "needs_connect"
+    assert replace(bare, held="seeded").state == "needs_review"
+    assert replace(bare, held="stored", tools=tools).state == "reviewed"
+    assert (bare.clients, bare.credential, bare.resource, bare.held) == ((), None, None, None)
+
+
+def test_rows_without_an_oauth2_credential_or_a_bridge() -> None:
+    """A remote server on a route with another kind of credential, or none, has no credential
+    to connect; a ``kind: bridge`` server has no row until 18a; a server whose route is gone
+    is still listed."""
+    stats = RemoteServer.model_validate({**NOTES_SERVER, "route": "stats"})
+    unrouted = RemoteServer.model_validate({**NOTES_SERVER, "route": "gone"})
+    bridge = BridgeServer.model_validate({"kind": "bridge", "url": "http://bridge.example/mcp"})
+    policy = with_servers(committed(), a=stats, b=bridge, c=unrouted)
+    found = {s.name: s for s in listed_servers(policy, set())}
+    assert "b" not in found
+    assert (found["a"].credential, found["a"].held, found["a"].state) == (
+        None,
+        None,
+        "needs_review",
+    )
+    assert (found["c"].credential, found["c"].held) == (None, None)
+    assert listed_server(policy, "a") == found["a"]
+    assert listed_server(policy, "b") is None
+    assert listed_server(policy, "absent") is None
+
+
+def test_a_resource_that_isnt_one_url_isnt_listed() -> None:
+    policy = committed()
+    notes = policy.credentials["notes"]
+    assert isinstance(notes, OAuth2Credential)
+    listy = notes.model_copy(update={"extra_params": {"resource": ["a", "b"]}})
+    policy = policy.model_copy(update={"credentials": {**policy.credentials, "notes": listy}})
+    found = listed_server(policy, "notes", {"notes-refresh"})
+    assert found is not None
+    assert (found.credential, found.resource, found.held) == ("notes", None, "stored")
+
+
+def test_a_client_credentials_row_needs_no_sign_in() -> None:
+    """A ``client_credentials`` grant never holds a refresh token, so its row skips
+    ``needs_connect``: it reviews first."""
+    policy = committed()
+    notes = policy.credentials["notes"]
+    assert isinstance(notes, OAuth2Credential)
+    machine = notes.model_copy(update={"grant": "client_credentials", "refresh_token": None})
+    policy = policy.model_copy(update={"credentials": {**policy.credentials, "notes": machine}})
+    found = listed_server(policy, "notes", set())
+    assert found is not None
+    assert (found.credential, found.held, found.state) == ("notes", None, "needs_review")
+    assert listed_next(found)[0].do == "review"
+
+
+def test_a_policy_without_a_gateway_lists_no_server() -> None:
+    policy = Policy.model_validate({"version": 1, "mode": "declarative"})
+    assert listed_servers(policy, set()) == ()
+    assert tools_max(policy) == 512
+
+
+def test_the_most_tools_a_list_may_name() -> None:
+    policy = committed()
+    assert tools_max(policy) == 512
+    assert policy.gateway is not None
+    limits = policy.gateway.limits.model_copy(update={"max_tools_per_server": 96})
+    gateway = policy.gateway.model_copy(update={"limits": limits})
+    assert tools_max(policy.model_copy(update={"gateway": gateway})) == 96
+
+
+def test_each_rows_next_steps() -> None:
+    bare = onboarding.Listed("notes", "remote", Tools(), "hide")
+    connect = replace(bare, credential="notes", held="none", resource=SERVER)
+    assert [step.answer() for step in listed_next(connect)] == [
+        {"do": "connect", "label": "Connect", "command": "zoeymcp login notes", "via": "exec"}
+    ]
+    review = {
+        "do": "review",
+        "label": "Review tools",
+        "command": "zoeymcp review notes --via vault",
+        "via": "exec",
+    }
+    assert [step.answer() for step in listed_next(bare)] == [review]
+    held = replace(connect, held="stored")
+    assert [step.answer() for step in listed_next(held)] == [review]
+    reviewed = replace(held, tools=Tools(include=["list_notes"], allow=["list_notes"]))
+    assert listed_next(reviewed) == (
+        NextStep(
+            "review", "Review again", ("zoeymcp", "review", "notes", "--via", "vault"), "exec"
+        ),
+        onboard_again(SERVER),
+    )
+    # A toolkit, or a credential that names no resource, has no client to register again.
+    assert [step.do for step in listed_next(replace(reviewed, resource=None))] == ["review"]
+    # needs_connect without a credential can't happen; a row without one reviews.
+    assert listed_next(replace(bare, held="none"))[0].do == "review"
+
+
+def test_the_steps_after_fragment_2_for_an_inline_policy() -> None:
+    steps = reviewed_next("notes", INLINE_SOURCE)
+    assert [step.answer() for step in steps] == [
+        {
+            "do": "check_fragment",
+            "label": "Check fragment 2 with the running policy",
+            "command": "check --with /w/onboard-notes-2.yaml",
+            "via": "run_mount",
+        },
+        {
+            "do": "commit_fragment",
+            "label": "Replace the tools: and review: blocks of gateway.servers.notes under "
+            "ZOEYMCP_CONFIG with it, in the compose form (--for compose)",
+        },
+        {
+            "do": "check_policy",
+            "label": "Then check the edited policy",
+            "command": "check",
+            "via": "run",
+        },
+        {"do": "reload", "label": "Commit, then recreate the vault", "via": "up"},
+        {
+            "do": "assign_clients",
+            "label": "Then add notes to gateway.clients.<client>.servers for each client that "
+            "should reach it",
+        },
+    ]
+
+
+def test_the_steps_after_fragment_2_for_a_policy_file_or_stdin() -> None:
+    steps = reviewed_next("notes", "/config/my policy.yaml")
+    assert [(step.do, step.shell(), step.via) for step in steps] == [
+        (
+            "check_fragment",
+            "zoeymcp check --config '/config/my policy.yaml' --with onboard-notes-2.yaml",
+            None,
+        ),
+        ("commit_fragment", "", None),
+        ("check_policy", "zoeymcp check --config '/config/my policy.yaml'", None),
+        ("reload", "", None),
+        ("assign_clients", "", None),
+    ]
+    assert steps[0].label == "Check fragment 2 with the policy"
+    assert (
+        steps[1].label == "Replace the tools: and review: blocks of gateway.servers.notes with it"
+    )
+    assert steps[3].label == "Commit, then send the vault SIGHUP (docker kill -s HUP)"
+    piped = reviewed_next("notes", STDIN_SOURCE)
+    assert piped[0].command[:4] == ("zoeymcp", "check", "--config", "-")
+    assert piped[3].label == "Commit, then restart the vault with the new policy"

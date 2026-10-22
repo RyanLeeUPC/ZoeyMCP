@@ -132,6 +132,7 @@ only_mutate = [
     "*zoeymcp/portal/setupcode.py",
     "*zoeymcp/portal/listen.py",
     "*zoeymcp/portal/policyview.py",
+    "*zoeymcp/portal/reviewview.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/approvaltext.py",
@@ -219,3 +220,4 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.common.suggest" = 95
 "zoeymcp.vault.internal" = 95
 "zoeymcp.vault.reviewjobs" = 95
+"zoeymcp.cli.choices" = 95

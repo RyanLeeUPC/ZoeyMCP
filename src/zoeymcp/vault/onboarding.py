@@ -33,6 +33,9 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
   shell-quoted and without a container prefix, which the CLI adds.
 - :func:`widen_scope` (D.5's step-up, SPEC-11): health's fragment for a scope an upstream asked
   for, the union of the committed scope and the challenged one.
+- :func:`listed_servers` (K.1, GR-21): the running policy's servers as the portal's rows list
+  them, each with its state and, from :func:`listed_next`, what to do next; and
+  :func:`reviewed_next`, the steps after fragment 2 (E.4), on every surface.
 
 Nothing here does I/O; the clock and the ID source are injected. An onboarding's ID is never
 logged and is compared in constant time.
@@ -59,10 +62,13 @@ from ..common.policy.findings import Finding
 from ..common.policy.schema import (
     NAME_PATTERN,
     ClientAuth,
+    GatewayLimits,
     OAuth2Credential,
     Policy,
     RemoteServer,
     Route,
+    ToolkitServer,
+    Tools,
     split_scope,
 )
 from .bindings import live_slot
@@ -908,6 +914,93 @@ def onboard_again(server_url: str) -> NextStep:
     )
 
 
+# --- the portal's server rows (K.1, GR-21) ------------------------------------------------------
+
+ServerKind = Literal["remote", "toolkit"]
+RowState = Literal["needs_connect", "needs_review", "reviewed"]
+
+
+@dataclass(frozen=True)
+class Listed:
+    """A server of the running policy as the portal lists it (K.1): its kind, its tools and
+    ``on_drift`` as the policy has them, the clients it is assigned to, and for a remote server
+    whose route has an oauth2 credential, that credential, the resource it names (D.12) and,
+    for a ``refresh_token`` grant, whether it holds a refresh token (OPS-13): a
+    ``client_credentials`` grant never holds one, and needs no sign-in."""
+
+    name: str
+    kind: ServerKind
+    tools: Tools
+    on_drift: str
+    clients: tuple[str, ...] = ()
+    credential: str | None = None
+    resource: str | None = None
+    held: TokenState | None = None
+
+    @property
+    def state(self) -> RowState:
+        """``needs_connect`` until its credential holds a refresh token, then ``needs_review``
+        while it includes no tool, then ``reviewed``."""
+        if self.held == "none":
+            return "needs_connect"
+        return "reviewed" if self.tools.include else "needs_review"
+
+
+def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed, ...]:
+    """Every server a review job can be queued for (F.2), remote or toolkit, by name; a ``kind:
+    bridge`` server has no row until a bridge is a remote server (18a)."""
+    routes = {route.name: route for route in policy.routes}
+    clients = {} if policy.gateway is None else policy.gateway.clients
+    found = []
+    for name, server in sorted(_servers(policy).items()):
+        assigned = tuple(sorted(c for c, client in clients.items() if name in client.servers))
+        if isinstance(server, ToolkitServer):
+            found.append(Listed(name, "toolkit", server.tools, server.on_drift, assigned))
+            continue
+        if not isinstance(server, RemoteServer):
+            continue
+        route = routes.get(server.route)
+        credential = None if route is None else route.credential
+        cred = None if credential is None else policy.credentials.get(credential)
+        listed = Listed(name, "remote", server.tools, server.on_drift, assigned)
+        if credential is not None and isinstance(cred, OAuth2Credential):
+            held = None
+            if cred.grant == "refresh_token":
+                held = token_state(credential, cred, store_names)
+            found_resource = cred.extra_params.get("resource")
+            resource = found_resource if isinstance(found_resource, str) else None
+            listed = replace(listed, credential=credential, resource=resource, held=held)
+        found.append(listed)
+    return tuple(found)
+
+
+def listed_server(policy: Policy, name: str, store_names: Collection[str] = ()) -> Listed | None:
+    """The server ``name`` as :func:`listed_servers` lists it, or None."""
+    return next((s for s in listed_servers(policy, store_names) if s.name == name), None)
+
+
+def tools_max(policy: Policy) -> int:
+    """``gateway.limits.max_tools_per_server``: the most tools a list of a server's may name."""
+    limits = GatewayLimits() if policy.gateway is None else policy.gateway.limits
+    return limits.max_tools_per_server
+
+
+def listed_next(listed: Listed) -> tuple[NextStep, ...]:
+    """A row's steps (K.1): connect, else review its tools, else review them again, and for an
+    onboarded credential register a new client (OPS-3). The page's button does the first; each
+    command is the CLI's way to the same."""
+    review = ("zoeymcp", "review", listed.name, "--via", "vault")
+    if listed.state == "needs_connect" and listed.credential is not None:
+        login = ("zoeymcp", "login", listed.credential)
+        return (NextStep("connect", "Connect", login, "exec"),)
+    if listed.state == "needs_review":
+        return (NextStep("review", "Review tools", review, "exec"),)
+    steps = [NextStep("review", "Review again", review, "exec")]
+    if listed.resource is not None:
+        steps.append(onboard_again(listed.resource))
+    return tuple(steps)
+
+
 @dataclass(frozen=True)
 class Widened:
     """A credential's scope widened: the union as the fragment writes it, and the fragment."""
@@ -980,29 +1073,23 @@ def _make(record: OnboardingRecord) -> tuple[NextStep, ...]:
     return (NextStep("make_fragment", "Make the YAML"),)
 
 
-def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[NextStep, ...]:
-    fragment = fragment_file(record.names.server, 1)
-    inline = source == INLINE_SOURCE
-    if inline:
+def _applied(server: str, number: int, source: str, merge: str) -> list[NextStep]:
+    """How fragment ``number`` of ``server`` is applied for the policy's source (E.5): checked
+    with the policy, merged as ``merge`` says, the edited policy checked, then the vault
+    reloaded, or recreated for an inline policy."""
+    fragment = fragment_file(server, number)
+    if source == INLINE_SOURCE:
         check_fragment = NextStep(
             "check_fragment",
-            "Check fragment 1 with the running policy",
+            f"Check fragment {number} with the running policy",
             ("check", "--with", f"/w/{fragment}"),
             "run_mount",
-        )
-        merge = (
-            "Merge it into the policy under ZOEYMCP_CONFIG in the compose form (--for compose), "
-            "or print the whole merged block with --print-merged --for compose and replace it"
         )
         reload = NextStep("reload", "Commit, then recreate the vault", via="up")
     else:
         command, via = _check(source, "--with", fragment)
         check_fragment = NextStep(
-            "check_fragment", "Check fragment 1 with the policy", command, via
-        )
-        merge = (
-            "Merge it into the policy, or print the whole merged policy with --print-merged and "
-            "replace it"
+            "check_fragment", f"Check fragment {number} with the policy", command, via
         )
         restart = (
             "send the vault SIGHUP (docker kill -s HUP)"
@@ -1011,12 +1098,26 @@ def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[Nex
         )
         reload = NextStep("reload", f"Commit, then {restart}")
     command, via = _check(source)
-    steps = [
+    return [
         check_fragment,
         NextStep("commit_fragment", merge),
         NextStep("check_policy", "Then check the edited policy", command, via),
         reload,
     ]
+
+
+def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[NextStep, ...]:
+    if source == INLINE_SOURCE:
+        merge = (
+            "Merge it into the policy under ZOEYMCP_CONFIG in the compose form (--for compose), "
+            "or print the whole merged block with --print-merged --for compose and replace it"
+        )
+    else:
+        merge = (
+            "Merge it into the policy, or print the whole merged policy with --print-merged and "
+            "replace it"
+        )
+    steps = _applied(record.names.server, 1, source, merge)
     if own_proxy:
         command, via = _check(source, "--emit-egress-allowlist", "--allowlist-format", "squid")
         steps.append(
@@ -1037,6 +1138,25 @@ def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[Nex
     else:
         steps.append(NextStep("connect", "Then sign in and review", _login_again(record), "exec"))
     return tuple(steps)
+
+
+def reviewed_next(server: str, source: str) -> tuple[NextStep, ...]:
+    """What the operator does after fragment 2 of ``server`` (E.4, M.7), the same words on every
+    surface: apply it as fragment 1 was, its two blocks replacing the server's, then assign the
+    server to its clients, which fragment 2 never does (GR-D2, Q33)."""
+    blocks = f"the tools: and review: blocks of gateway.servers.{server}"
+    if source == INLINE_SOURCE:
+        merge = (
+            f"Replace {blocks} under ZOEYMCP_CONFIG with it, in the compose form (--for compose)"
+        )
+    else:
+        merge = f"Replace {blocks} with it"
+    assign = NextStep(
+        "assign_clients",
+        f"Then add {server} to gateway.clients.<client>.servers for each client that should "
+        "reach it",
+    )
+    return (*_applied(server, 2, source, merge), assign)
 
 
 def next_for(

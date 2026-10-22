@@ -1,7 +1,7 @@
 """Onboarding by URL, phase 1 (M7 design D.1-D.4, D.7, D.11, E.1-E.3, M.1, M.7). I/O, not mutated.
 
-:class:`OnboardService` is the one set of onboardings the admin socket (and, later, the portal)
-reaches, built once before them, like ``LoginService``. Its decisions are elsewhere and pure:
+:class:`OnboardService` is the one set of onboardings the admin socket and the portal reach,
+built once before them, like ``LoginService``. Its decisions are elsewhere and pure:
 what an answer means in ``oauth/discovery.py``, the table, names, ``next`` lists and the second
 run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the requests go through
 ``oauth/fetch.py`` on the guarded onboarding client. Here they are put in order:
@@ -44,6 +44,9 @@ run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the re
   write puts the committed secret back rather than deleting it. A credential setting what a
   fragment can't carry (``token_headers``, a list in ``extra_params`` or ``authorize_params``) is
   refused ``reregister_by_hand`` at discovery, before anything is confirmed or stored (D-184).
+- **The portal** (K.1-K.3) reads an onboarding as it stands, and plans its ``onboard.register``
+  action with :meth:`OnboardService.register_facts`, which checks what register will check
+  with nothing sent or stored, so a mistake shows before the passkey prompt.
 
 Every refusal is the catalogue's (``portal/refusals.py``): one status and one text on every
 surface. Nothing here logs an onboarding's ID, a secret, a URL path or query, or a body (X19);
@@ -445,11 +448,13 @@ class OnboardService:
         except OnboardError as exc:
             logs.event("onboard_refused", reason=exc.answer.reason, host=host)
             raise
-        await self._client_id_entry_gone(names.credential, owner)
+        if owner == CLI_OWNER:
+            # Only the CLI's run deletes (D.8): the portal's discover stays memory only (K.2).
+            await self._client_id_entry_gone(names.credential)
         logs.event("onboard_ended", why="compared")
         return answer
 
-    async def _client_id_entry_gone(self, credential: str, owner: str) -> None:
+    async def _client_id_entry_gone(self, credential: str) -> None:
         """D.8 (OPS-2): a registered public client's ``<credential>-client-id`` entry served
         only to show fragment 1 again before the commit. The policy names the credential now,
         so it goes, through ``secretops``, unless the policy itself uses the entry."""
@@ -463,9 +468,8 @@ class OnboardService:
             or not isinstance((entry.meta or {}).get("onboarded"), str)
         ):
             return
-        via: secretops.Via = "socket" if owner == CLI_OWNER else "portal"
         await secretops.delete(
-            self._store, self._tokens, secretplan.plan_delete(name, policy), via=via
+            self._store, self._tokens, secretplan.plan_delete(name, policy), via="socket"
         )
 
     def _compared(self, url: str, plan: Plan) -> dict[str, Any]:
@@ -991,6 +995,108 @@ class OnboardService:
         for ended in self._table.cancel_owner(owner):
             logs.event("onboard_ended", why=ended.why)
 
+    # --- reading an onboarding, and register's plan (K.1-K.3) ----------------------------------
+
+    @property
+    def source(self) -> str:
+        """The running policy's source label, which every ``next`` list names (E.5)."""
+        return self._source
+
+    def read(self, onboarding: str, *, owner: str = CLI_OWNER) -> dict[str, Any]:
+        """The owner's onboarding as it stands (the portal's ``GET``, K.2): the plan of one
+        discovered or registered, as discovery answered it, else its stage, its names and what
+        to do next (D.11). Another owner's answers as an unknown one (X24)."""
+        self._sweep()
+        try:
+            record = self._table.get(onboarding, owner)
+        except OnboardingRefused as exc:
+            raise OnboardError(_table_refusal(exc)) from None
+        return self._stood(record, self._policy())
+
+    def owned(self, owner: str) -> dict[str, Any] | None:
+        """The owner's one onboarding as :meth:`read` answers it, or None (K.1's row)."""
+        self._sweep()
+        record = self._table.owned(owner)
+        return None if record is None else self._stood(record, self._policy())
+
+    def register_facts(
+        self, onboarding: str, *, owner: str = CLI_OWNER, secret: str | None = None
+    ) -> dict[str, Any]:
+        """What :meth:`register` will do, checked as far as it can be with nothing sent or
+        stored (K.3's plan): the onboarding is the owner's, discovered or registered; a secret
+        comes exactly when the onboarding was started with one, and the store would take it;
+        and fragment 1 as it will be still passes ``check``. The facts hold nothing that moves
+        without mattering, such as when it expires, so a confirm can compare them; never the
+        secret."""
+        record = self._ready(onboarding, owner)
+        names = record.names
+        facts: dict[str, Any] = {
+            "onboarding": record.id,
+            "stage": record.stage,
+            "server_url": record.server_url,
+            "names": [names.credential, names.route, names.server],
+        }
+        if record.stage == "registered":
+            if secret is not None:
+                raise _bad_body("this onboarding is registered; its secret is stored")
+            return facts
+        plan = _plan(record)
+        meta = plan.metadata
+        method = _registration_method(record.options)
+        if method == "dcr":
+            if secret is not None:
+                raise _bad_body("a registered client's secret comes from its authorization server")
+            _checked_dcr(dcr.request_auth(meta.token_auth_methods))
+            drafted = replace(record, client=_predicted(record))
+            stored = client_options(drafted).secret_given
+        else:
+            if record.options.secret_given != (secret is not None):
+                raise _bad_body(
+                    "a client secret comes here exactly when the onboarding was started with one"
+                )
+            drafted, stored = record, record.options.secret_given
+        _passes(self._findings(self._policy(), self._change(drafted)))
+        entry = _entry_name(names.credential, secret=stored)
+        if secret is not None:
+            self._secret_plan(record, plan, entry, secret)
+        return {
+            **facts,
+            "registration": method,
+            "issuer": plan.issuer,
+            "registration_endpoint": meta.registration_endpoint if method == "dcr" else None,
+            "redirect_uri": _redirect(record),
+            "client_id": record.options.client_id,
+            "client_auth": _client_auth(client_options(drafted)),
+            "secret_stored": stored,
+            "entry": entry if stored or method == "dcr" else None,
+            "token_endpoint": meta.token_endpoint,
+            "server_origin": origin_of(record.server_url),
+        }
+
+    def _stood(self, record: OnboardingRecord, policy: Policy) -> dict[str, Any]:
+        """An onboarding as it stands: its plan, or for one discovering or blocked, its stage,
+        names, the hosts a blocked one's proxy must allow, and what to do next."""
+        if record.stage in ("discovered", "registered"):
+            return self._plan_answer(record, policy)
+        names = record.names
+        answer: dict[str, Any] = {
+            "onboarding": record.id,
+            "stage": record.stage,
+            "expires": self._expires(record),
+            "server_url": record.server_url,
+            "names": {
+                "credential": names.credential,
+                "route": names.route,
+                "server": names.server,
+                "source": names.source,
+            },
+            "next": self._next(record, policy),
+        }
+        if record.blocked_on is not None:
+            answer["blocked_on"] = netguard.entry_key(*record.blocked_on)
+            answer["needed_hosts"] = [netguard.entry_key(h, p) for h, p in record.needed_hosts]
+        return answer
+
     def _ready(self, onboarding: str, owner: str) -> OnboardingRecord:
         """The owner's onboarding, discovered or registered; a blocked one answers its
         refusal again, with the hosts its proxy needs."""
@@ -1348,6 +1454,14 @@ class OnboardService:
 
 
 # --- the request ---------------------------------------------------------------------------------
+
+
+def check_request(body: Mapping[str, Any]) -> tuple[str, Options]:
+    """A discovery's body checked as :meth:`OnboardService.discover` checks it, with nothing
+    sent: the server URL and the options, or :class:`OnboardError` (the portal's private
+    discovery plans with it, K.3)."""
+    url, _, options = _request(body)
+    return url, options
 
 
 def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:

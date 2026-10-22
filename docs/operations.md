@@ -1039,7 +1039,10 @@ no server) are only that. One review runs at a time in the gateway, a job's or t
 Behind it are the admin socket's routes: `POST /review/<server>` queues a review of a remote or toolkit server in the running policy, or
 answers the CLI's finished review of it at the current policy view again (send `{"fresh": true}` for
 a new one); `GET /review/jobs/<job>?wait=N` (at most 30 s) answers the job's state, and its report
-once it is done. At most two reviews are under way at once, one per server. A queue call is refused
+once it is done; `POST /review/jobs/<job>/diff` makes fragment 2 from `{"include": [...], "allow":
+[...], "approve": [...]}` (and `"indent"`, 0 to 16 or `"compose"`), as the portal's review screen
+does, saving nothing, or refuses `review_stale` when the server's tools in the running policy
+changed since the review. At most two reviews are under way at once, one per server. A queue call is refused
 `review_unavailable` while the gateway isn't polling (no poll waiting, no review it took still
 running, and no poll or result in the last 15 s); in the first 45 s after the vault starts it waits
 for the gateway's first poll instead. A job the gateway doesn't take within 60 s, because it holds
@@ -1901,7 +1904,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 429 | `review_jobs_full` | At most 2 reviews can be under way at once. Wait for one, then review again. |
 | 503 | `review_unavailable` | The gateway isn't asking the vault for review jobs (`<detail>`), so nothing was queued. Check that the gateway is running and reaches the vault. |
 | 409 | `job_unknown` | That review isn't known to the vault: it finished more than 30 minutes ago, the vault restarted, or its result came already. Review again. |
-| 409 | `review_stale` | The gateway didn't take the review within 60 seconds: it holds another version of the policy (a reload since). Review again once it has caught up. |
+| 409 | `review_stale` | The policy changed since this review (a reload): the gateway didn't take it within 60 seconds, holding another version, or the server's tools changed since its report. Review again once the gateway has caught up. |
 | 504 | `review_timeout` | The gateway took the review but sent no result within 2 minutes. Check the gateway's log, then review again. |
 | 502 | `review_failed` | The gateway couldn't review the server (`<code>`). Its log says why; review again once that is fixed. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |

@@ -8,8 +8,9 @@ raced for and the policy names the portal's real port. The fake browser connects
 literal and sends ``Host: localhost:<port>`` itself (verifier V49).
 
 A test may give the portal routes and handlers of its own, shorter head and body deadlines, so
-the slowloris cases take a second, not ten, and a :class:`Clock` it can move forward, so the
-idle limit or the rate bucket's refill takes no waiting.
+the slowloris cases take a second, not ten, a :class:`Clock` it can move forward, so the
+idle limit or the rate bucket's refill takes no waiting, and an onboarding service of its own
+over the vault's store and policy, whose client reaches its fakes in process (M7 design K).
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from zoeymcp.portal.routes import ROUTES, Route
 from zoeymcp.portal.server import HEADER_DEADLINE
 from zoeymcp.vault import server
 from zoeymcp.vault.keys import generate_master_key
+from zoeymcp.vault.onboard import OnboardService
 
 STARTUP_TIMEOUT = 10.0
 
@@ -160,11 +162,12 @@ def running(
     body_deadline: float = BODY_DEADLINE,
     before_start: Callable[[Path], None] | None = None,
     clock: Clock | None = None,
+    onboard: Callable[[server.Vault], OnboardService] | None = None,
 ) -> Iterator[PortalRig]:
     """The vault serving its proxy and portal until the block ends. ``policy`` adds to the rig's
     policy (routes, say), or makes what it adds from the portal's origin (a credential whose
     ``redirect_uri`` is a callback address there); ``before_start`` may change the state
-    directory first."""
+    directory first; ``onboard`` makes the onboarding service the portal shares."""
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     portal_sock, proxy_sock = _bound(), _bound()
@@ -186,7 +189,7 @@ def running(
         assert vault.portal is not None
         app = vault.portal.app
         rebuilt = routes is not ROUTES or handlers is not None or body_deadline != BODY_DEADLINE
-        if rebuilt or clock is not None:
+        if rebuilt or clock is not None or onboard is not None:
             clocks: dict[str, Callable[[], float]] = (
                 {} if clock is None else {"clock": clock.monotonic, "wall": clock.wall}
             )
@@ -200,6 +203,8 @@ def running(
                 health=app.health,
                 ledger=app.ledger,
                 source=app.source,
+                onboard=app.onboard if onboard is None else onboard(vault),
+                reviews=app.reviews,
                 routes=routes,
                 handlers=handlers,
                 body_deadline=body_deadline,

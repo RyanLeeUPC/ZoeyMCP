@@ -27,6 +27,7 @@ from zoeymcp.portal.actions import (
     changed,
     parse_request,
 )
+from zoeymcp.portal.routes import DISCOVER_KEYS
 from zoeymcp.vault.secretplan import PutPlan
 
 ORIGIN = "http://localhost:8081"
@@ -81,8 +82,27 @@ def test_the_registry_holds_f4s_kinds() -> None:
         "passkey.rename": (4096, ["credential", "name"], []),
         "passkey.remove": (4096, ["credential"], []),
         "ledger.restart": (4096, [], []),
+        # M7 K.3: a private discovery takes the discover route's keys, and a registration a
+        # secret at most as large as secret.put's.
+        "onboard.discover_private": (
+            4096,
+            ["allow_private", "url"],
+            [
+                "client_auth",
+                "client_id",
+                "client_name",
+                "credential",
+                "issuer",
+                "redirect_uri",
+                "route",
+                "scope",
+                "server",
+            ],
+        ),
+        "onboard.register": (131072, ["onboarding"], ["client_secret"]),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
+    assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS
 
 
 def test_a_kinds_optional_keys_default_to_empty() -> None:

@@ -20,7 +20,14 @@ from zoeymcp.portal.routes import Route
 from .rig import PortalRig
 
 # A value for each path parameter, so a walk of the route table can send every route.
-SAMPLE_PARAMS = {"credential": "github", "flow": "0123456789abcdef", "action": "0123456789abcdef"}
+SAMPLE_PARAMS = {
+    "credential": "github",
+    "flow": "0123456789abcdef",
+    "action": "0123456789abcdef",
+    "onboarding": "0123456789abcdef",
+    "job": "0123456789abcdef",
+    "server": "notes",
+}
 LOGIN_BEGIN = "/api/login/begin"
 LOGIN_FINISH = "/api/login/finish"
 REDEEM = "/api/setup/redeem"

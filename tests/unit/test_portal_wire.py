@@ -25,6 +25,8 @@ from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
 from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.keys import KeySet
 
+from .test_portal_static import REVIEW_SCRIPT
+
 ORIGIN = "http://localhost:8081"
 KEYS = KeySet.from_master(bytes(range(32)))
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
@@ -90,7 +92,9 @@ def test_the_page_posts_exactly_each_routes_body() -> None:
     """Every POST app.js makes sends the keys its route takes, no more and no fewer."""
     script = (STATIC_DIR / "app.js").read_bytes().decode("utf-8")
     posted = {path: set(re.findall(r"(\w+):", keys)) for path, keys in POSTED.findall(script)}
-    routes = {r.path: r for r in ROUTES if r.method == "POST"}
+    routes = {
+        r.path: r for r in ROUTES if r.method == "POST" and (r.method, r.path) not in REVIEW_SCRIPT
+    }
     assert set(posted) == set(routes)
     for path, keys in posted.items():
         route = routes[path]
@@ -115,8 +119,10 @@ def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
         data = set(re.findall(r"(\w+):", keys))
         assert KINDS[kind].required <= data <= KINDS[kind].required | KINDS[kind].optional, kind
     app = PortalApp([ORIGIN], static=load_static())
-    assert {kind for kind, _ in prepared} == app.action_kinds
-    assert app.action_kinds <= set(KINDS)
+    # M7 K.3's kinds, built in step 14a, are prepared by review.js from step 14b (K.4).
+    review_kinds = {"onboard.discover_private", "onboard.register"}
+    assert {kind for kind, _ in prepared} == app.action_kinds - review_kinds
+    assert review_kinds <= app.action_kinds <= set(KINDS)
 
 
 def test_the_fake_answers_with_the_fields_the_page_posts() -> None:

@@ -28,8 +28,9 @@ from tests.unit.test_vault_view import KEYS, key, raw_policy
 from zoeymcp.common import logs as common_logs
 from zoeymcp.common import reviewreport
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.common.policy.schema import GatewayLimits, Tools
 from zoeymcp.common.reviewreport import REPORT_BYTES_MIN, ReportRefused
+from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault import logs, reviewjobs
 from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.app import (
@@ -1310,9 +1311,106 @@ async def test_without_reviews_the_routes_answer_503(tmp_path: Path) -> None:
     admin = AdminApp(store, KEYS, review_policy, setup)
     transport = httpx.ASGITransport(app=admin.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://admin") as client:
-        for method, path in (("POST", "/review/notes"), ("GET", "/review/jobs/x")):
+        for method, path in (
+            ("POST", "/review/notes"),
+            ("GET", "/review/jobs/x"),
+            ("POST", "/review/jobs/x/diff"),
+        ):
             response = await client.request(method, path)
             assert (response.status_code, response.json()["reason"]) == (503, "unavailable")
+
+
+# --- fragment 2 over the socket (M7 design F.6, M.1; step 14a) ---------------------------------
+
+
+def unreviewed_policy() -> Policy:
+    """The review policy, its notes server including no tool yet (the report's policy block)
+    and its route the gateway's alone, so the policy passes check."""
+    policy = review_policy()
+    assert policy.gateway is not None
+    server = policy.gateway.servers["notes"].model_copy(update={"tools": Tools(), "review": {}})
+    servers = {**policy.gateway.servers, "notes": server}
+    gateway = policy.gateway.model_copy(update={"servers": servers})
+    route = policy.routes[0].model_copy(update={"callers": ["gateway"]})
+    return policy.model_copy(update={"gateway": gateway, "routes": [route, *policy.routes[1:]]})
+
+
+async def done_job(rig: Rig, owner: reviewjobs.Owner = "cli") -> Job:
+    job = await rig.app.queue_review("notes", owner)
+    await rig.poll()
+    assert (await rig.post(posted(rig.jobs.get(job.id, owner)))).status_code == 200
+    return rig.jobs.get(job.id, owner)
+
+
+CHOSEN = {"include": ["list_notes"], "allow": ["list_notes"], "approve": []}
+
+
+async def test_the_socket_makes_fragment_2(tmp_path: Path) -> None:
+    """J1's choices, as the portal posts them: fragment 2 for the CLI's done job, checked
+    against the running policy, and the steps after it; nothing is saved."""
+    rig = Rig(tmp_path, policy=unreviewed_policy())
+    rig.seen()
+    job = await done_job(rig)
+    made = await rig.socket("POST", f"/review/jobs/{job.id}/diff", CHOSEN)
+    assert made.status_code == 200, made.text
+    answer = made.json()
+    assert set(answer) == {"diff", "next"}
+    entry = load_mapping(answer["diff"]["yaml"])["gateway"]["servers"]["notes"]
+    assert entry["tools"] == {"include": ["list_notes"], "allow": ["list_notes"], "approve": []}
+    [listed] = [e for e in report()["tools"] if e["name"] == "list_notes"]
+    assert entry["review"] == {"list_notes": listed["pin"]}
+    # Without an onboarding service the socket names the inline policy's commands.
+    assert answer["next"][0] == {
+        "do": "check_fragment",
+        "label": "Check fragment 2 with the running policy",
+        "command": "check --with /w/onboard-notes-2.yaml",
+        "via": "run_mount",
+    }
+    compose = await rig.socket(
+        "POST", f"/review/jobs/{job.id}/diff", {**CHOSEN, "indent": "compose"}
+    )
+    assert compose.json()["diff"]["yaml"].startswith("        # zoeymcp: review of notes")
+    assert rig.app.policy == unreviewed_policy()
+    await rig.app.aclose()
+
+
+async def test_the_socket_refuses_fragment_2(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, policy=unreviewed_policy())
+    rig.seen()
+    queued = await rig.app.queue_review("notes", "cli")
+    path = f"/review/jobs/{queued.id}/diff"
+    waiting = await rig.socket("POST", path, CHOSEN)
+    assert (waiting.status_code, waiting.json()["reason"]) == (400, "bad_body")
+    await rig.poll()
+    await rig.post(posted(rig.jobs.get(queued.id, "cli")))
+    bodies: list[dict[str, Any]] = [{"include": [], "allow": []}, {**CHOSEN, "extra": 1}]
+    for body in bodies:
+        refused = await rig.socket("POST", path, body)
+        assert (refused.status_code, refused.json()["reason"]) == (400, "bad_body")
+    shaped = await rig.socket("POST", path, {**CHOSEN, "indent": 99})
+    assert (shaped.status_code, shaped.json()["detail"]) == (400, "indent is 0 to 16, or compose")
+    unknown = await rig.socket("POST", path, {**CHOSEN, "include": ["nope"], "allow": ["nope"]})
+    assert (unknown.status_code, unknown.json()["reason"]) == (422, "diff_invalid")
+    gone = await rig.socket("POST", "/review/jobs/nope/diff", CHOSEN)
+    assert (gone.status_code, gone.json()["reason"]) == (409, "job_unknown")
+    portal = await done_job(rig, "portal")
+    theirs = await rig.socket("POST", f"/review/jobs/{portal.id}/diff", CHOSEN)
+    assert theirs.json()["reason"] == "job_unknown"
+    # GR-11: a reload that changes the server's tools since the review.
+    rig.app.reload(review_policy())
+    stale = await rig.socket("POST", path, CHOSEN)
+    assert (stale.status_code, stale.json()["reason"]) == (409, "review_stale")
+    await rig.app.aclose()
+
+
+async def test_a_failed_job_has_no_fragment_2(rig: Rig) -> None:
+    job = await rig.app.queue_review("notes", "cli")
+    await rig.poll()
+    error = {"status": 502, "code": "upstream", "message": "m"}
+    await rig.post({"v": 1, "job": job.id, "error": error})
+    refused = await rig.socket("POST", f"/review/jobs/{job.id}/diff", CHOSEN)
+    assert (refused.status_code, refused.json()["reason"]) == (502, "review_failed")
+    assert refused.json()["state"] == "failed"
 
 
 def test_the_listener_scope_key_is_the_apps() -> None:

@@ -33,11 +33,13 @@ phase 1 (M7 design M.1), owned by the CLI: :class:`.onboard.OnboardService`, whi
 shares, answers them, and a refusal is the catalogue's ``{"error", "reason"}`` with its own
 status (M.2). A given client secret comes in the register body, and no answer carries it.
 
-``POST /review/{server}`` and ``GET /review/jobs/{job}?wait=N`` are the review job path's
-(M7 design F.2, M.1), owned by the CLI: the first queues a review of a server in the running view
-for the gateway's poll, or answers the CLI's ``done`` job at the current view digest unless the
-body says ``{"fresh": true}`` (OPS-11); the second answers the job's state, and its report once
-it is done, or a failed job's refusal. A refusal is the catalogue's ``{"error", "reason"}``
+``POST /review/{server}``, ``GET /review/jobs/{job}?wait=N`` and ``POST
+/review/jobs/{job}/diff`` are the review job path's (M7 design F.2, F.6, M.1), owned by the CLI:
+the first queues a review of a server in the running view for the gateway's poll, or answers the
+CLI's ``done`` job at the current view digest unless the body says ``{"fresh": true}`` (OPS-11);
+the second answers the job's state, and its report once it is done, or a failed job's refusal;
+the third makes fragment 2 from ``{include, allow, approve, indent?}`` as the portal does
+(``portal/reviewview.py``), saving nothing. A refusal is the catalogue's ``{"error", "reason"}``
 (M.2).
 
 ``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
@@ -78,9 +80,10 @@ from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy.schema import Policy
 from ..portal import passkeys as passkey_file
-from ..portal import setupcode
+from ..portal import reviewview, setupcode
 from ..portal.passkeys import PasskeyError, Passkeys
-from ..portal.refusals import refusal
+from ..portal.refusals import Refusal, refusal
+from ..portal.routes import BODY_CHOICES
 from ..portal.sessions import SETUP_SESSION_MAX
 from ..portal.setupcode import Record, Redeemed, Refused, SetupCode
 from . import health, ledgerview, logs, secretops, secretplan
@@ -96,6 +99,7 @@ from .onboard import (
     OnboardError,
     OnboardService,
 )
+from .onboarding import INLINE_SOURCE, listed_server, tools_max
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
 from .reviewjobs import Job, Owner, ReviewRefused
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
@@ -108,9 +112,12 @@ NO_TOKENS = "OAuth needs the vault's token manager"
 NO_ONBOARDING: Final = "this vault runs no onboarding service"
 NO_GATEWAY_KEYS = "the vault keeps no gateway key state"
 NO_REVIEWS: Final = "this vault queues no review jobs"
-# POST /review/{server} takes {fresh?}; GET /review/jobs/{job}?wait=N waits at most this long.
+# POST /review/{server} takes {fresh?}; GET /review/jobs/{job}?wait=N waits at most this long;
+# POST /review/jobs/{job}/diff takes the portal's choices, under the portal's cap (M7 K.2).
 REVIEW_BODY_MAX: Final = 1024
 REVIEW_WAIT_MAX: Final = 30
+REVIEW_DIFF_BODY_MAX: Final = BODY_CHOICES
+REVIEW_DIFF_KEYS: Final = frozenset({"include", "allow", "approve"})
 # The socket's review jobs are the CLI's (M.1).
 _REVIEW_OWNER: Final[Owner] = "cli"
 # POST /setup-code takes {reset?}.
@@ -548,6 +555,7 @@ class AdminApp:
                 Route("/onboard/{onboarding}/fragment", self._onboard_fragment, methods=["POST"]),
                 Route("/onboard/{onboarding}", self._onboard_cancel, methods=["DELETE"]),
                 Route("/review/jobs/{job}", self._review_read, methods=["GET"]),
+                Route("/review/jobs/{job}/diff", self._review_diff, methods=["POST"]),
                 Route("/review/{server}", self._review_queue, methods=["POST"]),
                 Route("/health", self._health, methods=["GET"]),
                 Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
@@ -868,6 +876,39 @@ class AdminApp:
             assert job.failure is not None  # noqa: S101 - every failed job has one
             return _review_refused(job.failure, dict(job.fields), _job_answer(job))
         return JSONResponse(_job_answer(job))
+
+    async def _review_diff(self, request: Request) -> Response:
+        """``{include, allow, approve, indent?}``: fragment 2 for the CLI's done job, against
+        the running policy (F.6, E.4), as the portal's ``POST /api/review/jobs/{job}/diff``
+        makes it; ``review_stale`` after a reload that changed the server's tools (GR-11)."""
+        if self._reviews is None:
+            return _reason(503, NO_REVIEWS, "unavailable")
+        data = await _json_object(request, REVIEW_DIFF_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        if not REVIEW_DIFF_KEYS <= set(data) <= REVIEW_DIFF_KEYS | {"indent"}:
+            return _review_refused("bad_body", {})
+        try:
+            job = await self._reviews.review_job(request.path_params["job"], _REVIEW_OWNER)
+        except ReviewRefused as exc:
+            return _review_refused(exc.reason, exc.fields)
+        if job.state == "failed":
+            assert job.failure is not None  # noqa: S101 - every failed job has one
+            return _review_refused(job.failure, dict(job.fields), _job_answer(job))
+        if job.report is None:
+            return _reason(400, "the review isn't done yet", "bad_body")
+        policy = self._policy()
+        answer = reviewview.diff(
+            job.report.model_dump(mode="json", exclude_unset=True),
+            listed_server(policy, job.server),
+            data,
+            policy=policy,
+            most=tools_max(policy),
+            source=INLINE_SOURCE if self._onboard is None else self._onboard.source,
+        )
+        if isinstance(answer, Refusal):
+            return JSONResponse(answer.body(), status_code=answer.status)
+        return JSONResponse(answer)
 
     # --- health (M5 design I) ------------------------------------------------------------------
 

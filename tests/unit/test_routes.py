@@ -1,8 +1,9 @@
-"""The portal's route table and static map (M5 design M.1, O.2 ``routes``).
+"""The portal's route table and static map (M5 design M.1, O.2 ``routes``; M7 design K.2).
 
 Step 6a built the static map and the route shape, and each of steps 11 to 15 added the rows it
-built. From step 15 the table is M.1's, written here in the shape: the table equals it, and
-matching finds each row.
+built. From step 15 the table is M.1's, written here in the shape, and from M7 step 14a M.1's
+with K.2's, the route table M7 publishes (fold-in R27), before the step-up rows: the table equals
+them, and matching finds each row.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import get_args
 import pytest
 
 from zoeymcp.portal.routes import (
+    BODY_CHOICES,
     BODY_DEFAULT,
     BODY_EMPTY,
     BODY_PASTE,
@@ -66,11 +68,53 @@ M1 = (
     Route("GET", "/api/oauth/flows/{flow}", FULL),
     Route("DELETE", "/api/oauth/flows/{flow}", FULL),
     Route("GET", "/api/ledger", FULL),
+)
+# M.1's step-up routes, the table's last rows.
+ACTION_ROWS = (
     Route("POST", "/api/actions", FULL, 128 * KIB, frozenset({"kind", "data"})),
     Route("POST", "/api/actions/{action}/confirm", FULL, 16 * KIB, frozenset({"credential"})),
     Route("DELETE", "/api/actions/{action}", FULL),
 )
-SAMPLE = {"credential": "github", "flow": "Zm9vYmFyLWZsb3ctaWQx", "action": "0123456789abcdef"}
+# M7 K.2's table: the MCP servers section.
+DISCOVER_KEYS = frozenset(
+    {
+        "credential",
+        "route",
+        "server",
+        "issuer",
+        "scope",
+        "client_id",
+        "client_auth",
+        "redirect_uri",
+        "client_name",
+    }
+)
+K2 = (
+    Route("GET", "/api/servers", FULL),
+    Route("POST", "/api/onboard/discover", FULL, 4 * KIB, frozenset({"url"}), DISCOVER_KEYS),
+    Route("GET", "/api/onboard/{onboarding}", FULL),
+    Route("POST", "/api/onboard/{onboarding}/fragment", FULL, 64, optional=frozenset({"indent"})),
+    Route("DELETE", "/api/onboard/{onboarding}", FULL),
+    Route("POST", "/api/review/{server}", FULL, 64),
+    Route("GET", "/api/review/jobs/{job}", FULL),
+    Route(
+        "POST",
+        "/api/review/jobs/{job}/diff",
+        FULL,
+        512 * KIB,
+        frozenset({"include", "allow", "approve"}),
+        frozenset({"indent"}),
+    ),
+)
+TABLE = (*M1, *K2, *ACTION_ROWS)
+SAMPLE = {
+    "credential": "github",
+    "flow": "Zm9vYmFyLWZsb3ctaWQx",
+    "action": "0123456789abcdef",
+    "onboarding": "o32x0000000000000000000000000000000000000001",
+    "job": "jQx_-000000000000000000000000000000000000001",
+    "server": "notes",
+}
 
 
 def test_the_static_map_is_fixed() -> None:
@@ -92,18 +136,29 @@ def test_the_static_map_is_fixed() -> None:
         STATIC["/x"] = StaticFile("x", HTML)  # type: ignore[index]
 
 
-def test_the_table_is_m1s() -> None:
+def test_the_table_is_m1s_with_k2s() -> None:
     # Steps 11 to 15 each added the rows they built (verifier V40); step 15's were the policy
-    # view and the ledger, the last of M.1's.
-    assert ROUTES == M1
+    # view and the ledger, the last of M.1's. M7's step 14a added K.2's, before the actions.
+    assert ROUTES == TABLE
     assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
         "/api/login/begin",
         "/api/logout",
         "/api/sessions/end-others",
         "/api/oauth/{credential}/start",
+        "/api/onboard/{onboarding}/fragment",
+        "/api/review/{server}",
     ]
     assert (BODY_EMPTY, BODY_DEFAULT, BODY_WEBAUTHN) == (64, 4 * KIB, 16 * KIB)
-    assert (BODY_SECRET, BODY_PASTE) == (128 * KIB, 8 * KIB)
+    assert (BODY_SECRET, BODY_PASTE, BODY_CHOICES) == (128 * KIB, 8 * KIB, 512 * KIB)
+
+
+def test_k2_takes_no_private_discovery() -> None:
+    """TI-3: a discovery with allow_private goes through the action, so the route's body has
+    no such key; and K.2's rows all need a full session."""
+    discover = next(r for r in ROUTES if r.path == "/api/onboard/discover")
+    assert "allow_private" not in discover.body | discover.optional
+    assert all(route.scopes == FULL for route in K2)
+    assert [r for r in ROUTES if r.cap == BODY_CHOICES] == [K2[-1]]
 
 
 def test_the_methods_and_scopes() -> None:
@@ -119,19 +174,19 @@ def test_the_shapes_are_frozen() -> None:
         M1[0].cap = 1  # type: ignore[misc]
 
 
-@pytest.mark.parametrize("route", M1, ids=lambda r: f"{r.method} {r.path}")
-def test_every_m1_route_fits_the_shape_and_matches(route: Route) -> None:
+@pytest.mark.parametrize("route", TABLE, ids=lambda r: f"{r.method} {r.path}")
+def test_every_route_fits_the_shape_and_matches(route: Route) -> None:
     names = re.findall(r"\{(\w+)\}", route.path)
     assert set(names) <= set(PARAMS)
     assert route.method in METHODS
     assert route.path.startswith("/api/")
     assert (route.cap == 0) == (route.method != "POST")
     path = route.path.format(**SAMPLE)
-    assert match(M1, route.method, path) == (route, {name: SAMPLE[name] for name in names})
+    assert match(TABLE, route.method, path) == (route, {name: SAMPLE[name] for name in names})
 
 
-def test_m1_has_one_route_per_method_and_path() -> None:
-    keys = [(route.method, route.path) for route in M1]
+def test_the_table_has_one_route_per_method_and_path() -> None:
+    keys = [(route.method, route.path) for route in TABLE]
     assert len(keys) == len(set(keys))
 
 
@@ -156,6 +211,7 @@ def test_nothing_matches_an_empty_table() -> None:
     assert match(ROUTES, "GET", "/api/health") == (ROUTES[11], {})
     assert match(ROUTES, "GET", "/api/policy") == (ROUTES[12], {})
     assert match(ROUTES, "GET", "/api/ledger") == (ROUTES[17], {})
+    assert match(ROUTES, "GET", "/api/servers") == (ROUTES[18], {})
 
 
 @pytest.mark.parametrize(
@@ -202,6 +258,41 @@ def test_a_credential_is_a_policy_name(value: str, ok: bool) -> None:
 
 
 @pytest.mark.parametrize(
+    ("method", "path", "route", "params"),
+    [
+        # A literal segment where a parameter could be: each method finds its own route.
+        ("POST", "/api/onboard/discover", K2[1], {}),
+        ("GET", "/api/onboard/discover", K2[2], {"onboarding": "discover"}),
+        ("DELETE", "/api/onboard/discover", K2[4], {"onboarding": "discover"}),
+        ("POST", "/api/review/jobs", K2[5], {"server": "jobs"}),
+        ("GET", "/api/review/jobs/j1", K2[6], {"job": "j1"}),
+        ("POST", "/api/review/jobs/j1/diff", K2[7], {"job": "j1"}),
+    ],
+)
+def test_the_k2_routes_match_by_method_and_length(
+    method: str, path: str, route: Route, params: dict[str, str]
+) -> None:
+    assert match(ROUTES, method, path) == (route, params)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/review/Notes",  # a server is a policy name
+        "/api/review/-notes",
+        "/api/review/" + "a" * 64,
+        "/api/review/jobs/j.1/diff",  # a job is the vault's ID
+        "/api/review/jobs/" + "j" * 65 + "/diff",
+        "/api/onboard/a%2Fb/fragment",
+        "/api/onboard/" + "o" * 65 + "/fragment",
+        "/api/review/jobs/j1/diff/",
+    ],
+)
+def test_a_k2_parameter_outside_its_pattern_matches_nothing(path: str) -> None:
+    assert match(ROUTES, "POST", path) is None
+
+
+@pytest.mark.parametrize(
     ("value", "ok"),
     [
         ("Zm9v_bar-1", True),
@@ -216,9 +307,17 @@ def test_a_credential_is_a_policy_name(value: str, ok: bool) -> None:
         ("ab\n", False),
     ],
 )
-def test_a_flow_or_action_is_an_id(value: str, ok: bool) -> None:
-    assert (match(M1, "DELETE", f"/api/oauth/flows/{value}") is not None) == ok
-    assert (match(M1, "POST", f"/api/actions/{value}/confirm") is not None) == ok
+def test_a_flow_action_onboarding_or_job_is_an_id(value: str, ok: bool) -> None:
+    assert (match(TABLE, "DELETE", f"/api/oauth/flows/{value}") is not None) == ok
+    assert (match(TABLE, "POST", f"/api/actions/{value}/confirm") is not None) == ok
+    assert (match(TABLE, "DELETE", f"/api/onboard/{value}") is not None) == ok
+    assert (match(TABLE, "GET", f"/api/review/jobs/{value}") is not None) == ok
+
+
+def test_the_parameters() -> None:
+    assert set(PARAMS) == {"credential", "flow", "action", "onboarding", "job", "server"}
+    assert PARAMS["server"].pattern == PARAMS["credential"].pattern
+    assert PARAMS["onboarding"].pattern == PARAMS["job"].pattern == PARAMS["flow"].pattern
 
 
 def test_the_first_route_that_matches_wins() -> None:

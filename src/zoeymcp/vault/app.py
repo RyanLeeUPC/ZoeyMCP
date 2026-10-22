@@ -18,7 +18,7 @@ view, a long poll that a reload wakes (M3 design D.1, D.2); the report path, whe
 ledger to the vault's copy (M5 design J.2); and the review job path (M7 design F.2), a long poll
 of the review jobs queued at the view it holds and the path it posts each job's result to. The
 rest are 404. :meth:`VaultApp.queue_review` and :meth:`VaultApp.review_job` queue and read the
-jobs for the admin socket (and later the portal), on :mod:`.reviewjobs`' table.
+jobs for the admin socket and the portal, on :mod:`.reviewjobs`' table.
 
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
