@@ -1719,6 +1719,9 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `fetch_redirect` | The host `<host>` answered with a redirect, which the vault doesn't follow. |
 | 502 | `fetch_too_large` | The answer from `<host>` is larger than the vault reads, so it isn't used. |
 | 502 | `fetch_not_json` | The answer from `<host>` isn't one JSON object, so it isn't used. |
+| 502 | `review_invalid` | The gateway's review report isn't in the form the vault reads (`<detail>`), so nothing from it is shown. Review again. |
+| 502 | `pin_mismatch` | The gateway's review report gives a pin that isn't its definition's, for `<tools>`, so nothing from it is shown. The gateway's own review never reports that: check the gateway. |
+| 413 | `review_too_large` | The gateway's review report is too large (`<detail>`), so it isn't read. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

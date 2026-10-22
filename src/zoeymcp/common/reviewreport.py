@@ -1,0 +1,368 @@
+"""A review report, as the vault accepts it from the gateway (M7 design F.4; D-29, COV-1). Pure.
+
+A review job's result is the gateway's own review answer: ``review.report()``'s for a remote
+server (a bridge reports as the remote server it is) or ``toolkit_report()``'s for a toolkit,
+told apart by ``kind``. :data:`ReviewReport` is a strict model of both, keyed by definition kind
+on each entry (``"kind": "tool"``, the only kind in M7; ``review.report()`` doesn't write it, so
+an entry without one is a tool), so M6's drift review of any server kind reads the same shape.
+
+:func:`read` takes one report under the running limits: the model, the caps that follow
+``gateway.limits`` (GR-30), then the integrity check (fold-in C25, X11), which recomputes every
+reported pin from the definition beside it and refuses the whole report if any differs. A refusal
+is :class:`ReportRefused`, whose ``reason`` is M.2's. Nothing in a report is trusted further than
+that: its findings and states are shown labelled as the gateway's.
+
+A genuine review can exceed those caps for one odd tool (a definition far over the schema limit, a
+pattern on each of hundreds of properties, a name that isn't a tool name), and one tool mustn't
+make a whole server unreviewable through the vault. So the gateway passes its answer through
+:func:`fit` before posting it: what is over a cap is cut, or dropped and replaced by a finding
+that says so, and ``read(fit(answer), limits)`` takes any answer the review code writes.
+
+This module is pure: the vault reads reports with it, and the gateway's side is the review code
+the model describes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from collections.abc import Mapping, Sequence
+from typing import Annotated, Any, Final, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+
+from . import canonical
+from .pinhash import ProjectionError, pin_of
+from .policy.findings import format_location
+from .policy.schema import GatewayLimits, ModulePath, Name, Pin, SlotName, ToolName
+from .policy.view import VaultPath
+
+Reason = Literal["review_invalid", "pin_mismatch", "review_too_large"]
+
+# The body cap (M.6's REVIEW_REPORT_MAX): max_tools_per_server x 16 KiB, within 8 and 64 MiB.
+REPORT_BYTES_PER_TOOL: Final = 16 * 1024
+REPORT_BYTES_MIN: Final = 8 * 2**20
+REPORT_BYTES_MAX: Final = 64 * 2**20
+# max_tools_per_server's own ceiling (schema.py), which bounds every list of names a report holds.
+NAMES_MAX: Final = 10_000
+FINDINGS_MAX: Final = 64
+POINTER_MAX: Final = 256
+MESSAGE_MAX: Final = 1000
+CHANGED_MAX: Final = 16
+MEMBER_MAX: Final = 128
+TEXT_MAX: Final = 16_384  # each of server_info's strings, and instructions
+# review.report() cuts longer instructions to TEXT_MAX and marks the cut with "...".
+INSTRUCTIONS_MAX: Final = TEXT_MAX + len("...")
+DISTRIBUTION_MAX: Final = 256
+# A listed tool's name, which is a ToolName unless the tool is reported invalid or duplicate.
+LISTED_NAME_MAX: Final = 4096
+CUT: Final = "..."
+# A definition is at most max_schema_bytes x 4 in canonical form, with room in any case for the
+# text a valid one may hold beside its two schemas: a 16,384-character description, a name and
+# two titles (pins.py's limits), at 4 UTF-8 bytes a character.
+DEFINITION_SCALE: Final = 4
+DEFINITION_TEXT_BYTES: Final = 4 * (16_384 + 128 + 2 * 256) + 1024
+# A drift diff holds both definitions, indented: its lines are bounded by this many times the
+# definition cap, in characters.
+DIFF_SCALE: Final = 16
+# The protocol versions the gateway speaks (gateway/access.py, which common can't import).
+PROTOCOL_VERSIONS: Final = ("2026-07-28", "2025-11-25", "2025-06-18")
+# A tool name (schema.py's ToolName), and the only location key a refusal shows as it is.
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_UNPINNABLE: Final = ("invalid", "duplicate")
+_LEVELS: Final = ("error", "warning", "note")
+_LOCATIONS_SHOWN = 5
+
+State = Literal["ok", "marked", "blocked", "drift", "unreviewed", "invalid", "duplicate", "missing"]
+ProtocolVersion = Literal["2026-07-28", "2025-11-25", "2025-06-18"]
+Names = Annotated[list[ToolName], Field(max_length=NAMES_MAX)]
+Text = Annotated[str, Field(max_length=TEXT_MAX)]
+# A drift entry's changed top-level members (defstore.changed_members).
+Members = Annotated[
+    list[Annotated[str, Field(max_length=MEMBER_MAX)]], Field(max_length=CHANGED_MAX)
+]
+
+
+class ReportRefused(ValueError):
+    """A report the vault doesn't take: ``review_too_large`` (over the body cap),
+    ``review_invalid`` (not the gateway's review shape, or over a cap) or ``pin_mismatch`` (a
+    reported pin that isn't its definition's; ``tools`` names each). ``detail`` names locations
+    and limits, never a value from the report."""
+
+    def __init__(self, reason: Reason, detail: str, tools: tuple[str, ...] = ()) -> None:
+        self.reason: Reason = reason
+        self.detail = detail
+        self.tools = tools
+        super().__init__(f"{reason}: {detail}")
+
+
+class _Model(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class Finding(_Model):
+    level: Literal["error", "warning", "note"]
+    pointer: Annotated[str, Field(max_length=POINTER_MAX)]
+    message: Annotated[str, Field(max_length=MESSAGE_MAX)]
+
+
+class ToolEntry(_Model):
+    """One listed or included tool, as review.py's ``_tool_entry`` writes it."""
+
+    kind: Literal["tool"] = "tool"
+    name: Annotated[str, Field(max_length=LISTED_NAME_MAX)]
+    state: State
+    included: bool
+    classification: Literal["allow", "approve"] | None  # null: not classified (F-56, CR-9)
+    pin: Pin | None
+    pinned: Pin | None
+    definition: dict[str, Any] | None
+    findings: Annotated[list[Finding], Field(max_length=FINDINGS_MAX)]
+    changed: Members | None
+    diff: list[str] | None
+
+    @model_validator(mode="after")
+    def _pinned_definition(self) -> ToolEntry:
+        # A pin is only ever reported beside the definition it is checked against.
+        if (self.pin is None) != (self.definition is None):
+            raise ValueError("a pin and its definition come together")
+        if self.definition is not None and self.definition.get("name") != self.name:
+            raise ValueError("the definition is another tool's")
+        # review.py writes an entry under every name the server lists: one that isn't a tool
+        # name can only be the invalid or duplicate tool it reports, with no definition.
+        unpinnable = self.definition is None and self.state in _UNPINNABLE
+        if not unpinnable and _PLAIN_NAME.fullmatch(self.name) is None:
+            raise ValueError("not a tool name")
+        return self
+
+
+class ToolkitEntry(ToolEntry):
+    consequential: bool
+
+
+class ReviewedPolicy(_Model):
+    """The server's entry the review ran under (review.py's ``policy`` block)."""
+
+    include: Names
+    allow: Names
+    approve: Names
+    on_drift: Literal["hide", "fail"]
+
+
+class ServerInfo(_Model):
+    name: Text
+    version: Text
+    title: Text | None = None
+
+
+class RemoteReport(_Model):
+    """``review.report()``'s answer: a remote server's, a bridge's included."""
+
+    server: Name
+    kind: Literal["remote"]
+    vault_path: VaultPath
+    era: Literal["modern", "legacy"] | None
+    asserted_era: Literal["auto", "modern", "legacy"]
+    policy: ReviewedPolicy
+    protocol_version: ProtocolVersion | None
+    server_info: ServerInfo | None
+    instructions: Annotated[str, Field(max_length=INSTRUCTIONS_MAX)] | None
+    blocked: bool
+    marked: Names
+    tools: Annotated[list[ToolEntry], Field(max_length=2 * NAMES_MAX)]
+    clean: bool
+
+
+class ToolkitReport(_Model):
+    """``toolkit_report()``'s answer."""
+
+    server: Name
+    kind: Literal["toolkit"]
+    module: ModulePath
+    distribution: Annotated[str, Field(max_length=DISTRIBUTION_MAX)] | None
+    version: Annotated[str, Field(max_length=DISTRIBUTION_MAX)] | None
+    pinning: Literal["required", "off"]
+    slots: Annotated[list[SlotName], Field(max_length=NAMES_MAX)]
+    policy: ReviewedPolicy
+    blocked: bool
+    marked: Names
+    tools: Annotated[list[ToolkitEntry], Field(max_length=2 * NAMES_MAX)]
+    clean: bool
+
+
+ReviewReport = Annotated[RemoteReport | ToolkitReport, Field(discriminator="kind")]
+_REPORT: Final[TypeAdapter[RemoteReport | ToolkitReport]] = TypeAdapter(ReviewReport)
+
+
+def report_max(limits: GatewayLimits) -> int:
+    """The most bytes a report's body may have under ``limits`` (GR-30, F-47)."""
+    wanted = limits.max_tools_per_server * REPORT_BYTES_PER_TOOL
+    return min(max(wanted, REPORT_BYTES_MIN), REPORT_BYTES_MAX)
+
+
+def definition_max(limits: GatewayLimits) -> int:
+    """The most bytes one entry's definition may have in canonical form under ``limits``."""
+    schema_bytes = limits.max_schema_bytes
+    return max(DEFINITION_SCALE * schema_bytes, 2 * schema_bytes + DEFINITION_TEXT_BYTES)
+
+
+def check_length(length: int, limits: GatewayLimits) -> None:
+    """Refuse a body of ``length`` bytes over :func:`report_max`, before any of it is read."""
+    most = report_max(limits)
+    if length > most:
+        raise ReportRefused(
+            "review_too_large", f"a report is at most {most} bytes (gateway.limits)"
+        )
+
+
+def _location(location: Sequence[int | str]) -> str:
+    """A pydantic location, with any key that isn't a short plain name replaced by "?"."""
+    return format_location(
+        [part if isinstance(part, int) or _PLAIN_NAME.fullmatch(part) else "?" for part in location]
+    )
+
+
+def _invalid(locations: Sequence[str]) -> ReportRefused:
+    unique = sorted(set(locations))
+    shown = ", ".join(unique[:_LOCATIONS_SHOWN])
+    more = len(unique) - _LOCATIONS_SHOWN
+    return ReportRefused(
+        "review_invalid", f"at {shown}" + (f" and {more} more" if more > 0 else "")
+    )
+
+
+def _within(report: RemoteReport | ToolkitReport, limits: GatewayLimits) -> list[str]:
+    """Where ``report`` exceeds what ``limits`` allow, or repeats a tool."""
+    over: list[str] = []
+    missing = sum(entry.state == "missing" for entry in report.tools)
+    if len(report.tools) - missing > limits.max_tools_per_server:
+        over.append("tools (more than gateway.limits.max_tools_per_server listed)")
+    if missing > len(report.policy.include):
+        over.append("tools (more missing than the policy includes)")
+    if len({entry.name for entry in report.tools}) != len(report.tools):
+        over.append("tools (a tool twice)")
+    most = definition_max(limits)
+    for index, entry in enumerate(report.tools):
+        if entry.definition is not None:
+            try:
+                size = len(canonical.dumps_canonical(entry.definition))
+            except canonical.JSONRejected:
+                over.append(f"tools[{index}].definition (no canonical form)")
+                continue
+            if size > most:
+                over.append(f"tools[{index}].definition (over {most} bytes)")
+        if entry.diff is not None and sum(map(len, entry.diff)) > DIFF_SCALE * most:
+            over.append(f"tools[{index}].diff (over {DIFF_SCALE * most} characters)")
+    return over
+
+
+def _mismatched(report: RemoteReport | ToolkitReport) -> tuple[str, ...]:
+    """Every tool whose reported pin isn't its definition's (X11)."""
+    found = []
+    for entry in report.tools:
+        if entry.definition is None:
+            continue
+        try:
+            pin = pin_of(entry.definition)
+        except ProjectionError:  # one the gateway couldn't have pinned either
+            found.append(entry.name)
+            continue
+        if pin != entry.pin:
+            found.append(entry.name)
+    return tuple(found)
+
+
+def read(data: object, limits: GatewayLimits) -> RemoteReport | ToolkitReport:
+    """One report, from its parsed JSON, under the running ``limits``. Raises
+    :class:`ReportRefused`: ``review_invalid`` for one that fails the model or a cap, then
+    ``pin_mismatch`` if any reported pin isn't its definition's, which refuses all of it."""
+    try:
+        report = _REPORT.validate_python(data)
+    except ValidationError as exc:
+        raise _invalid([_location(error["loc"]) for error in exc.errors()]) from exc
+    over = _within(report, limits)
+    if over:
+        raise _invalid(over)
+    mismatched = _mismatched(report)
+    if mismatched:
+        raise ReportRefused(
+            "pin_mismatch", "a reported pin isn't the pin of its definition", mismatched
+        )
+    return report
+
+
+# --- the gateway's side: fitting an answer to the caps ------------------------------------------
+
+
+def _cut(text: str, most: int) -> str:
+    """``text`` within ``most`` characters, a cut marked with "..."."""
+    return text if len(text) <= most else text[: most - len(CUT)] + CUT
+
+
+def _name(name: str) -> str:
+    """A listed name within :data:`LISTED_NAME_MAX`: a cut one keeps the digest of the whole, so
+    two names cut alike stay two tools."""
+    if len(name) <= LISTED_NAME_MAX:
+        return name
+    digest = "sha256:" + hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()
+    return name[: LISTED_NAME_MAX - len(CUT) - len(digest)] + CUT + digest
+
+
+def _finding(level: str, message: str) -> dict[str, str]:
+    return {"level": level, "pointer": "", "message": message}
+
+
+def _fit_entry(entry: Mapping[str, Any], most: int) -> dict[str, Any]:
+    fitted = {**entry, "name": _name(entry["name"])}
+    findings = [
+        {
+            "level": finding["level"],
+            "pointer": _cut(finding["pointer"], POINTER_MAX),
+            "message": _cut(finding["message"], MESSAGE_MAX),
+        }
+        for finding in entry["findings"]
+    ]
+    definition = entry["definition"]
+    if definition is not None and len(canonical.dumps_canonical(definition)) > most:
+        fitted.update(definition=None, pin=None, diff=None)
+        message = f"the definition is over {most} bytes, more than a review report carries"
+        findings.insert(0, _finding("error", message))
+    diff = fitted["diff"]
+    if diff is not None and sum(map(len, diff)) > DIFF_SCALE * most:
+        fitted["diff"] = None
+        findings.append(
+            _finding("note", f"the diff is over {DIFF_SCALE * most} characters, so not shown")
+        )
+    if len(findings) > FINDINGS_MAX:
+        rest = findings[FINDINGS_MAX - 1 :]
+        level = min((finding["level"] for finding in rest), key=_LEVELS.index)
+        findings = findings[: FINDINGS_MAX - 1]
+        findings.append(_finding(level, f"and {len(rest)} more findings, not shown"))
+    fitted["findings"] = findings
+    return fitted
+
+
+def fit(answer: Mapping[str, Any], limits: GatewayLimits) -> dict[str, Any]:
+    """The gateway's review ``answer`` (``review.report()``'s or ``toolkit_report()``'s) within
+    the caps :func:`read` applies under ``limits``. Pure; ``answer`` itself isn't changed.
+
+    Each finding's pointer and message are cut; a definition over :func:`definition_max` goes,
+    with its pin and diff, for an error finding that says so (such a tool has an error finding
+    already, so it could never be included); a diff over its cap goes, for a note; findings past
+    the 63rd become one, at the most severe level among them; ``server_info``'s strings,
+    ``instructions``, a toolkit's distribution and version, and a name that isn't a tool name are
+    cut. Everything else is the gateway's as it is."""
+    most = definition_max(limits)
+    fitted = {**answer, "tools": [_fit_entry(entry, most) for entry in answer["tools"]]}
+    info = answer.get("server_info")
+    if info is not None:
+        fitted["server_info"] = {
+            member: value if value is None else _cut(value, TEXT_MAX)
+            for member, value in info.items()
+        }
+    if answer.get("instructions") is not None:
+        fitted["instructions"] = _cut(answer["instructions"], INSTRUCTIONS_MAX)
+    for member in ("distribution", "version"):
+        if answer.get(member) is not None:
+            fitted[member] = _cut(answer[member], DISTRIBUTION_MAX)
+    return fitted

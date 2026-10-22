@@ -6,8 +6,10 @@ later can't slip through: ``icons``, ``_meta``, ``execution`` and every unknown 
 stripped. Every member that is served is pinned, and every member that isn't pinned is stripped.
 
 The pin is the canonical digest of the projection under a domain tag, so a later projection can
-never produce a v1 pin. What is served is the projection itself: it hashed to the pin, so it is
-the reviewed definition.
+never produce a v1 pin; :func:`pin_of`, ``PIN_TAG`` and :class:`ProjectionError` live in
+:mod:`zoeymcp.common.pinhash`, since the vault recomputes reported pins too, and are re-exported
+here. What is served is the projection itself: it hashed to the pin, so it is the reviewed
+definition.
 
 :func:`evaluate` decides from one connection's listing which tools are exposed. It is pure: drift
 marks come in and go out as values, and the reports are returned for the caller to log.
@@ -24,11 +26,13 @@ from typing import Any, Literal, Protocol
 
 from mcp.types import Tool
 
-from ..common import canonical, textrules
+from ..common import textrules
+from ..common.pinhash import PIN_TAG as PIN_TAG
+from ..common.pinhash import ProjectionError as ProjectionError
+from ..common.pinhash import pin_of as pin_of
 from ..common.policy.schema import GatewayLimits, Tools
 from . import schemas
 
-PIN_TAG = "tool-pin/1"
 TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 # The annotation hints that are pinned and served: wire name, SDK attribute.
 HINTS = (
@@ -44,10 +48,6 @@ MAX_DESCRIPTION_CHARS = 16_384
 MAX_SCHEMA_TEXT_CHARS = 4096
 
 Path = tuple[str | int, ...]
-
-
-class ProjectionError(ValueError):
-    """A tool the gateway can't project or pin. The message names the member, never its value."""
 
 
 @dataclass(frozen=True)
@@ -105,16 +105,6 @@ def project(tool: Tool) -> dict[str, Any]:
     if annotations:
         projection["annotations"] = annotations
     return projection
-
-
-def pin_of(projection: Mapping[str, Any]) -> str:
-    """The pin of a projection: ``sha256:`` and the hex digest of it under the domain tag."""
-    try:
-        return canonical.digest({"zoeymcp": PIN_TAG, "tool": projection})
-    except canonical.JSONRejected as exc:
-        raise ProjectionError(
-            "the definition has no canonical form (an unsafe integer, a lone surrogate or too deep)"
-        ) from exc
 
 
 def project_and_pin(tool: Tool) -> Projected:

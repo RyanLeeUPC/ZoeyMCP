@@ -17,11 +17,12 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from mcp.types import Tool
 
 from tests.unit.report_model import asked_line
-from zoeymcp.common import ledgerreport
+from zoeymcp.common import ledgerreport, pinhash
 from zoeymcp.common.canonical import dumps_canonical, loads_strict
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
+from zoeymcp.gateway import pins
 from zoeymcp.gateway.pins import PIN_TAG, project, project_and_pin
 from zoeymcp.portal.passkeys import Passkey, PasskeyFile, fingerprint, seal, unseal
 from zoeymcp.vault.keys import KeySet
@@ -294,6 +295,19 @@ def test_the_tagged_pin_encoding_is_pinned() -> None:
         b'{"tool":{"inputSchema":{"type":"object"},"name":"ping"},"zoeymcp":"tool-pin/1"}'
     )
     assert "sha256:" + hashlib.sha256(encoded).hexdigest() == pin
+
+
+def test_the_shared_pin_function_gives_the_same_pins() -> None:
+    """M7 F.4: the pin moved to common.pinhash, which the vault uses to check reported pins; the
+    gateway's names are the same objects, so no pin anywhere changes."""
+    assert (pins.pin_of, pins.PIN_TAG, pins.ProjectionError) == (
+        pinhash.pin_of,
+        pinhash.PIN_TAG,
+        pinhash.ProjectionError,
+    )
+    assert pinhash.PIN_TAG == "tool-pin/1"
+    for name, (wire, pin) in TOOL_PIN_VECTORS.items():
+        assert pinhash.pin_of(project(Tool.model_validate_json(wire))) == pin, name
 
 
 # --- the passkey file (M5 design D.4) ------------------------------------------------------------

@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from ..common import textrules
+from ..common import suggest, textrules
 from ..common.policy.schema import GatewayLimits
 from . import pins, schemas
 
@@ -99,12 +99,11 @@ def has_nested_quantifier(pattern: str) -> bool:
 
 
 def _suggested(annotations: Mapping[str, Any]) -> str | None:
-    hints = [member for member, _ in pins.HINTS if member in annotations]
-    if not hints:
+    """The note for the server's hints: the shared rule's suggestion (CR-3), and the hints."""
+    classification = suggest.suggestion(annotations)
+    if classification is None:
         return None
-    read_only = annotations.get("readOnlyHint") is True
-    destructive = annotations.get("destructiveHint") is True
-    classification = "allow" if read_only and not destructive else "approve"
+    hints = [member for member, _ in pins.HINTS if member in annotations]
     shown = ", ".join(f"{member}={str(annotations[member]).lower()}" for member in hints)
     return f"suggested by the server: {classification} ({shown})"
 

@@ -420,6 +420,21 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "fetch_not_json": Entry(
             502, "The answer from {host} isn't one JSON object, so it isn't used."
         ),
+        # A review report from the gateway (M7 F.4; common/reviewreport.py).
+        "review_invalid": Entry(
+            502,
+            "The gateway's review report isn't in the form the vault reads ({detail}), so "
+            "nothing from it is shown. Review again.",
+        ),
+        "pin_mismatch": Entry(
+            502,
+            "The gateway's review report gives a pin that isn't its definition's, for {tools}, "
+            "so nothing from it is shown. The gateway's own review never reports that: check "
+            "the gateway.",
+        ),
+        "review_too_large": Entry(
+            413, "The gateway's review report is too large ({detail}), so it isn't read."
+        ),
     }
 )
 

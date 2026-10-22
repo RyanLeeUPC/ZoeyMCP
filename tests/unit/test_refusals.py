@@ -2,9 +2,9 @@
 
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
 ``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
-literal discovery and registration ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused``
-and fetch error reason, and every refusal the onboarding service words itself), so a reason
-added there without a sentence here fails.
+literal discovery and registration ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused``,
+fetch error and review report ``ReportRefused`` reason, and every refusal the onboarding service
+words itself), so a reason added there without a sentence here fails.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import get_args
 
 import pytest
 
+from zoeymcp.common import reviewreport
 from zoeymcp.common.policy import change
 from zoeymcp.common.textrules import find_violations
 from zoeymcp.portal import passkeys, webauthn
@@ -162,6 +163,8 @@ FETCH = {
     "fetch_too_large": 502,
     "fetch_not_json": 502,
 }
+# M7's M.2: a review report the vault refuses (M7 step 12a; F.4).
+REPORT = {"review_invalid": 502, "pin_mismatch": 502, "review_too_large": 413}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -239,6 +242,9 @@ FIELDS = {
     "already_configured": {"server", "kind"},
     "onboarding_mismatch": {"fields"},
     "reregister_by_hand": {"credential", "field", "why"},
+    "review_invalid": {"detail"},
+    "pin_mismatch": {"tools"},
+    "review_too_large": {"detail"},
 }
 
 
@@ -286,7 +292,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR
+    expected |= MIXUP | DCR | REPORT
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -457,6 +463,15 @@ def test_every_registration_reason_is_catalogued() -> None:
     found = literal_reasons(dcr, "Refusal")
     assert found == set(get_args(dcr.Reason))
     assert found == set(DCR) - {"cimd_only"}
+    assert found <= set(CATALOGUE)
+
+
+def test_every_review_report_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to the review report's refusals (F.4), each a literal of its
+    Reason type."""
+    found = literal_reasons(reviewreport, "ReportRefused")
+    assert found == set(get_args(reviewreport.Reason))
+    assert found == set(REPORT)
     assert found <= set(CATALOGUE)
 
 
