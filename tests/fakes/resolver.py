@@ -9,7 +9,8 @@ dial to an address no fake was given is refused, so no test reaches the real net
 
 :meth:`FakeResolver.hooks` is what :data:`zoeymcp.vault.netclient.HOOKS` takes in process;
 :meth:`FakeResolver.save` and :func:`install` carry a fixed name map to an out-of-process vault
-(tests/acceptance/procs.py's launcher). A saved map may also name a ``pause_after_put`` marker
+(tests/acceptance/procs.py's launcher), whose token client it also puts on the guarded transport
+until step 16 builds it there. A saved map may also name a ``pause_after_put`` marker
 file: that vault then holds every secret write once it returns, for a crash test to kill it
 there (M7 design N).
 
@@ -30,6 +31,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from zoeymcp.vault import netclient
 
@@ -113,12 +116,33 @@ class FakeResolver:
 
 
 def install(path: str) -> None:
-    """In a vault's own process, before it builds a client: answer names from ``path``, and
-    hold secret writes if it names a ``pause_after_put`` marker."""
+    """In a vault's own process, before it builds a client: answer names from ``path``, the
+    token client's included, and hold secret writes if it names a ``pause_after_put`` marker."""
     netclient.HOOKS = FakeResolver.load(Path(path)).hooks()
+    _guard_token_client()
     marker = json.loads(Path(path).read_bytes()).get("pause_after_put")
     if marker is not None:
         _pause_after_put(Path(marker))
+
+
+def _guard_token_client() -> None:
+    """The vault's token client on the guarded transport, so a login reaches a fake's token
+    endpoint by name. Until M7 step 16 moves that client onto ``netclient``'s builder, it
+    resolves through the system, which knows no fake's name. Its other settings are the
+    vault's own (``vault/app.py``'s ``_token_client``)."""
+    from zoeymcp.common.policy import Policy
+    from zoeymcp.vault import app
+    from zoeymcp.vault.oauth.protocol import ATTEMPT_DEADLINE, CONNECT_TIMEOUT
+
+    def token_client(policy: Policy) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=netclient.guarded_transport(policy.egress_proxy),
+            trust_env=False,
+            follow_redirects=False,
+            timeout=httpx.Timeout(ATTEMPT_DEADLINE, connect=CONNECT_TIMEOUT),
+        )
+
+    app._token_client = token_client
 
 
 def _pause_after_put(marker: Path) -> None:

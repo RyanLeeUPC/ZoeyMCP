@@ -8,12 +8,15 @@ from pathlib import Path
 
 import anyio
 import anyio.abc
+import certifi
 import pytest
 
 from tests.acceptance import procs
 from tests.acceptance.tls import ProviderCA, issue_cert, make_ca
 from tests.fakes.resolver import TIMEOUT, FakeResolver, install, serve_https
 from zoeymcp.common import netguard
+from zoeymcp.common.policy import Policy
+from zoeymcp.vault import app as vault_app
 from zoeymcp.vault import netclient
 
 
@@ -108,10 +111,34 @@ async def test_a_saved_map_installs_in_the_vaults_process(
     assert await loaded.resolve("rebind.example.com", 443) == ["11.9.9.9"]
     assert loaded.dial(address, 443) == ("127.0.0.1", 4431)
     monkeypatch.setattr(netclient, "HOOKS", None)
+    monkeypatch.setattr(vault_app, "_token_client", vault_app._token_client)  # put back after
     install(str(path))
     assert netclient.HOOKS is not None
     assert netclient.HOOKS.resolver is not None
     assert await netclient.HOOKS.resolver("mcp.example.com", 443) == [address]
+
+
+async def test_the_installed_map_reaches_the_vaults_token_client(
+    ca: ProviderCA, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The token client isn't on the guarded transport until step 16, so the install puts it
+    there: a token call names the fake's host and reaches it, its certificate checked."""
+    cert, key = issue_cert(ca, "auth.example.com", tmp_path)
+    monkeypatch.setattr(certifi, "where", lambda: str(ca.ca_file))
+    monkeypatch.setattr(netclient, "HOOKS", None)
+    monkeypatch.setattr(vault_app, "_token_client", vault_app._token_client)  # put back after
+    policy = Policy.model_validate({"version": 1, "mode": "declarative", "gateway": {}})
+    with anyio.fail_after(10):
+        async with serve_https(cert, key) as (port, seen):
+            fake = FakeResolver()
+            fake.serve("auth.example.com", port)
+            saved = tmp_path / "hooks.json"
+            fake.save(saved)
+            install(str(saved))
+            async with vault_app._token_client(policy) as client:
+                answer = await client.post("https://auth.example.com/token")
+    assert (answer.status_code, answer.text) == (200, "ok")
+    assert seen.names == ["auth.example.com"]
 
 
 def _launched(tmp_path: Path, hooks: Path) -> tuple[int, str]:
