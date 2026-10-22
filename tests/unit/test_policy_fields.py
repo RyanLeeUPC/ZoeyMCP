@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 
 from zoeymcp.common.policy import fields
@@ -20,6 +21,7 @@ from zoeymcp.common.policy.fields import (
     TOKEN_PARAMS,
     URL_MAX,
     check_endpoint_query,
+    client_host,
     endpoint_query,
     host_port_lower,
     is_mail_address,
@@ -275,3 +277,33 @@ def test_the_module_uses_fullmatch_only() -> None:
     text = Path(fields.__file__ or "").read_text(encoding="utf-8")
     assert ".match(" not in text
     assert ".search(" not in text
+
+
+# --- the client's host (D-190) ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("api.example", "api.example"),
+        ("lan.example.", "lan.example."),
+        ("2001:db8::5", "2001:db8::5"),
+        ("10.0.0.9", "10.0.0.9"),
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("bücher.example.", "xn--bcher-kva.example."),
+        # IDNA 2008, as httpx encodes it: not IDNA 2003's "ss.example".
+        ("ß.example", "xn--zca.example"),
+        ("пример.рф", "xn--e1afmkfd.xn--p1ai"),
+    ],
+)
+def test_the_clients_host_is_httpxs_raw_host(host: str, expected: str) -> None:
+    assert client_host(host) == expected
+    netloc = f"[{host}]" if ":" in host else host
+    assert httpx.URL(f"https://{netloc}/").raw_host.decode("ascii") == expected
+
+
+def test_a_name_idna_refuses_keeps_its_form() -> None:
+    """The client can't connect to it at all, so its key only has to be stable."""
+    assert client_host("☃.example") == "☃.example"
+    with pytest.raises(httpx.InvalidURL):
+        _ = httpx.URL("https://☃.example/").raw_host

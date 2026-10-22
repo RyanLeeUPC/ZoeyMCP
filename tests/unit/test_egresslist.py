@@ -29,6 +29,7 @@ from zoeymcp.common.egresslist import (
     render,
 )
 from zoeymcp.common.policy import Policy, parse_policy
+from zoeymcp.egress.allowlist import parse_document
 
 Raw = dict[str, Any]
 RULES = [{"methods": ["GET"], "paths": ["/**"]}]
@@ -149,6 +150,48 @@ def test_an_ipv6_entry_in_egress_private_marks_its_destination() -> None:
     raw["egress_private"] = ["[2001:db8::5]:443"]
     lists = derive(parse(raw))
     assert [d.host for d in lists["vault"] if d.private] == ["2001:db8::5"]
+
+
+def test_an_internationalized_host_is_keyed_as_the_client_sends_it() -> None:
+    """D-190: the vault's client sends an internationalized name in its xn-- form, so the role's
+    list holds that form, and an egress_private entry in it marks the destination."""
+    raw = policy_raw()
+    raw["egress_private"] = ["xn--bcher-kva.example:443"]
+    raw["routes"] = [
+        route("books", "https://Bücher.example/api"),
+        route("street", "https://straße.example"),
+        route("snow", "https://☃.example"),
+    ]
+    raw["credentials"] = {"o1": oauth("https://auth.bücher.example/token")}
+    raw["connectors"] = {}
+    assert derive(parse(raw)) == {
+        "vault": (
+            dest("auth.xn--bcher-kva.example", 443, "token"),
+            dest("xn--bcher-kva.example", 443, "route", private=True),
+            dest("xn--strae-oqa.example", 443, "route"),  # IDNA 2008, as httpx: not "ss"
+            dest("☃.example", 443, "route"),  # IDNA refuses it: the client never connects
+        )
+    }
+    # The role skips the one host no CONNECT could name and keeps the rest of the document.
+    _, lists, skipped = parse_document(json.dumps(document(derive(parse(raw)))).encode())
+    assert (len(lists["vault"]), skipped) == (3, 1)
+    raw["egress_private"] = ["bucher.example:443"]
+    assert not any(d.private for d in derive(parse(raw))["vault"])
+
+
+def test_a_trailing_dot_is_private_by_its_entry_without_it() -> None:
+    """As the address guard matches it (netclient.guard_key): the list keeps the name the
+    client sends in its CONNECT, the dot included."""
+    raw = policy_raw()
+    raw["egress_private"] = ["files.lan.example:443"]
+    raw["routes"] = [route("files", "https://Files.LAN.example./v1")]
+    raw["credentials"] = {}
+    raw["connectors"] = {}
+    assert derive(parse(raw)) == {
+        "vault": (dest("files.lan.example.", 443, "route", private=True),)
+    }
+    raw["egress_private"] = ["other.lan.example:443"]
+    assert derive(parse(raw))["vault"] == (dest("files.lan.example.", 443, "route"),)
 
 
 # --- onboarding allowances ---------------------------------------------------------------------

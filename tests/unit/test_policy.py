@@ -1659,6 +1659,19 @@ def test_egress_private_names_vault_destinations(example_raw: Raw) -> None:
     assert egress_findings(raw) == [f"warning egress_private[{i}]: {unused}" for i in range(3)]
 
 
+def test_egress_private_keys_a_destination_as_the_guard_does(example_raw: Raw) -> None:
+    """D-190: the guard keys an internationalized name in its xn-- form and a trailing-dot name
+    by its entry without the dot, so such entries are used, and the decoded form isn't."""
+    raw = copy.deepcopy(example_raw)
+    route(raw, "stats")["upstream"] = "https://Stats.Bücher.example./v1"
+    raw["credentials"]["broker-mcp"]["token_url"] = "https://auth.straße.example/token"
+    raw["egress_private"] = ["stats.xn--bcher-kva.example:443", "auth.xn--strae-oqa.example:443"]
+    assert egress_findings(raw) == []
+    raw["egress_private"] = ["auth.ss.example:443", "stats.bucher.example:443"]
+    unused = "unused: the vault never connects here"
+    assert egress_findings(raw) == [f"warning egress_private[{i}]: {unused}" for i in range(2)]
+
+
 def test_a_revocation_endpoint_is_a_vault_destination(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     raw["credentials"]["broker-mcp"]["revocation_url"] = "https://auth.broker.example/revoke"

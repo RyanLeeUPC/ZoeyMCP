@@ -18,6 +18,8 @@ dependencies = [
     "certifi>=2026.10.19",
     "cryptography>=43",
     "httpx>=0.27",
+    # common.policy.fields encodes hosts with it, as httpx does; declared, not only httpx's.
+    "idna>=3.7",
     "pydantic>=2.9",
     "pyyaml>=6.0.2",
     "starlette>=0.38",
@@ -170,6 +172,7 @@ only_mutate = [
     "*zoeymcp/toolkit/rules.py",
     "*zoeymcp/entrypoint/env.py",
     "*zoeymcp/cli/choices.py",
+    "*zoeymcp/egress/connect.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene, import-guard and mutation-script tests check the repository itself (the lock, the

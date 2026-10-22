@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from zoeymcp.common import logs as common_logs
+from zoeymcp.egress.allowlist import EgressKey
 from zoeymcp.portal.actions import Action, Actions, HeldData
 from zoeymcp.portal.sessions import Ceremonies, Ceremony, SessionToken
 from zoeymcp.portal.setupcode import SetupCode
@@ -204,11 +205,22 @@ def test_a_registration_is_refused_nested(lines: io.StringIO) -> None:
     assert lines.getvalue() == ""
 
 
+def test_the_egress_key_is_refused_nested(lines: io.StringIO) -> None:
+    """M7 M.5: the egress role's key wrapper, in whichever role's line it would land."""
+    key = EgressKey("zeg1-" + "k" * 43)
+    message = r"^refusing to log a secret \(EgressKey\) in field 'f'$"
+    for wrapped in (key, [key], {"outer": [{"inner": (key,)}]}):
+        with pytest.raises(TypeError, match=message):
+            common_logs.Log("egress").event("oops", f=wrapped)
+    assert EgressKey in common_logs.refused_types()
+    assert lines.getvalue() == ""
+
+
 def test_a_registered_type_is_refused_in_every_role(
     refused_stand_in: None, lines: io.StringIO
 ) -> None:
     message = r"^refusing to log a secret \(ClientTokenLike\) in field 'token'$"
-    for role in ("vault", "gateway", "launcher"):
+    for role in ("vault", "gateway", "launcher", "egress"):
         log = common_logs.Log(role)
         with pytest.raises(TypeError, match=message):
             log.event("oops", token=ClientTokenLike())

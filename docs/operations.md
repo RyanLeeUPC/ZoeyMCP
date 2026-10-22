@@ -4,9 +4,9 @@ How to run what is built so far: the vault (M1), OAuth in the vault (M2), the ga
 remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
 and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
 supported. M7's so far: onboarding a remote MCP server by URL (§11), your own egress proxy
-(§28), fitting ZoeyMCP into a stack that already has one (§29), and a first hardened deployment
-end to end (§30). The design and the reasons behind it are in [design.md](design.md); this page
-is the how-to.
+(§28), fitting ZoeyMCP into a stack that already has one (§29), a first hardened deployment
+end to end (§30), and the egress role (§31). The design and the reasons behind it are in
+[design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -1276,8 +1276,9 @@ session idle timeout takes a gateway restart (`limits_change_needs_restart`).
 | `isError` with `(ref ...)` | an upstream error, a timeout, a lost connection, a result refused | grep the ref |
 | `arguments refused: at ...` | the arguments don't match the pinned schema | the tool's definition (`review --show`) |
 
-Every log line is JSON with `role` (`vault`, `gateway` or `launcher`). No client token or hash,
-gateway key, session id, argument value, result content or upstream error text is ever logged.
+Every log line is JSON with `role` (`vault`, `gateway`, `launcher` or `egress`). No client
+token or hash, gateway key, session id, argument value, result content or upstream error text is
+ever logged.
 
 ## 19. Approvals
 
@@ -2466,3 +2467,66 @@ committed. Assigning the server to the agent is still yours (step 8).
 
 Through your own egress proxy (§28), step 7 may stop at `proxy_refused`, naming the hosts to
 allow and the same command to run again, which carries on where it stopped once they are allowed.
+
+## 31. The egress role
+
+`zoeymcp egress` is ZoeyMCP's own egress proxy for the hardened tier: CONNECT only, with one
+listener per egress source, each allowing only that source's `host:port` list. The vault's
+source is `vault`; a route's program is the source named by the route. It holds no policy and no
+secret but its key, inspects no TLS and caches nothing.
+
+```sh
+zoeymcp egress --vault http://vault:8080 --listen vault=egress-vault:3128
+```
+
+- `--listen SOURCE=NAME:PORT` (repeatable) binds the role's address on that source's network.
+  `NAME` is a host name or an IP address; it must resolve to exactly one address, and never to
+  `0.0.0.0` or `::`, so a container on another source's network can't reach the listener. A name
+  that resolves to no address or to several, or doesn't resolve within 5 s, leaves that listener
+  unbound, which refuses its source's tunnels; the role logs it and tries again at each contact
+  with the vault. A source the vault's lists don't name refuses every tunnel on its listener.
+- The lists come from the vault: the role long-polls `GET /_zoeymcp/egress/v1/allowlists` with
+  the egress key in `x-zoeymcp-egress`, from `ZOEYMCP_EGRESS_KEY` or the file
+  `ZOEYMCP_EGRESS_KEY_FILE` names (re-read on `SIGHUP` and after a 403, at most once per 10 s).
+  Without a key it refuses to start, naming `zoeymcp egress-key`. It opens no tunnel before its
+  first list, and none once 300 s pass without an answer from the vault (fail closed); a list
+  that doesn't parse is refused and the last good one kept, still going stale on time. A
+  destination whose host no CONNECT could name (a route's name IDNA refuses) is skipped, and the
+  rest of the list kept. After a failure it retries within 30 s; the held request sends TCP
+  keepalives, so a vault that vanishes without closing it is noticed within 15 s.
+- Per connection: one `CONNECT host:port` head (8 KiB, 10 s), the `host:port` exactly as listed
+  (lower case; a non-ASCII name is never listed), one lookup (5 s) whose every address is global
+  unless the entry is marked private, and a connect (10 s) to the address it checked, never a
+  second lookup. Tunnels close after `--idle-timeout` (900 s) idle or `--max-tunnel-seconds`
+  (86400) open, and at most `--max-tunnels` (256) run per listener, 1,024 in all. When the lists
+  change, a tunnel whose destination left its source's list is closed.
+- Every answer the role makes itself is empty, with `Content-Length: 0` and no
+  `WWW-Authenticate` or `Proxy-Authenticate`. Any method but CONNECT is 405 with `Allow:
+  CONNECT`, so plain http can't go through it.
+
+| Reason | Status | Why |
+| --- | --- | --- |
+| `head_too_large`, `head_timeout`, `bad_request` | 431, 408, 400 | the head is over 8 KiB, took over 10 s, or isn't `CONNECT host:port HTTP/1.1` with at most 64 header lines |
+| `not_connect` | 405 | another method |
+| `list_stale` | 503 | no list yet, or none fetched in the last 300 s |
+| `no_list`, `not_allowed` | 403 | the vault's lists don't name this listener's source, or don't list this `host:port` for it |
+| `resolve_failed`, `address_refused` | 502, 403 | the name didn't resolve in 5 s, or resolved to a private, loopback or otherwise non-global address the entry isn't marked private for (`verdict` names its class) |
+| `connect_failed` | 502 | no connection in 10 s |
+| `busy` | 503 | the listener's, or the role's, tunnel cap |
+
+Its log lines (`role: egress`):
+
+| Event | Fields |
+| --- | --- |
+| `egress_started` | `vault` (its `host:port`), `listeners` (each source's bound address, or `null` when unbound), `max_tunnels` |
+| `egress_listen_failed` | `source`, `listen`, `reason`: a listener left unbound, once per reason |
+| `egress_listen_bound` | `source`, `address`: a listener bound at a later try |
+| `egress_allowlist_applied` | `digest`, `sources` (how many destinations each source has), `skipped` (destinations no CONNECT could name): new lists |
+| `egress_allowlist_failed` | `error_type`, or `status` and, for a document it refused, `reason`: a fetch that wasn't contact |
+| `egress_allowlist_ended` | `error_type`: the long poll ended, which can't happen in a working role; the role stops |
+| `egress_allowlist_stale` | `age_s`, `digest`: 300 s without contact, once until contact resumes |
+| `egress_key_reloaded`, `egress_key_unreadable` | a changed key file read after `SIGHUP`; a key file that can't be read (`reason`), the old key kept |
+| `egress_tunnel` | `source`, `host`, `port`, `address`, `result` (`closed`, `idle`, `timeout`, `removed` or `stopped`), `bytes_up`, `bytes_down`, `ms` |
+| `egress_refused` | `source`, `reason` (the table above), and `host`, `port`, `verdict` and `address` where known |
+
+None holds the key, a request's headers or anything a tunnel carries.

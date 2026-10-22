@@ -255,6 +255,51 @@ def _build_parser() -> argparse.ArgumentParser:
         help="read HUP and TERM lines from this pipe; its end stops the gateway (the launcher's)",
     )
 
+    egress = commands.add_parser(
+        "egress",
+        help="run the egress role: a CONNECT proxy held to the vault's allowlists (hardened tier)",
+        description=(
+            "Run the egress role: a CONNECT-only proxy with one listener per egress source, each "
+            "allowing only that source's host:port list, which it long-polls from the vault "
+            "with the egress key (ZOEYMCP_EGRESS_KEY or ZOEYMCP_EGRESS_KEY_FILE). It refuses "
+            "every tunnel until it has a list, and again once its list is 300 s old."
+        ),
+    )
+    egress.add_argument(
+        "--vault", required=True, metavar="URL", help="the vault's listener, http://host:port"
+    )
+    egress.add_argument(
+        "--listen",
+        action="append",
+        required=True,
+        metavar="SOURCE=NAME:PORT",
+        help=(
+            "a source's listener (repeatable): vault, or a route's name, and the role's address "
+            "on that source's network, as a name that resolves to exactly one address"
+        ),
+    )
+    egress.add_argument(
+        "--max-tunnels",
+        type=int,
+        default=256,
+        metavar="N",
+        help="open tunnels per listener (default 256; 1,024 in all)",
+    )
+    egress.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=900.0,
+        metavar="SECONDS",
+        help="close a tunnel that carried nothing for this long (default 900)",
+    )
+    egress.add_argument(
+        "--max-tunnel-seconds",
+        type=float,
+        default=86400.0,
+        metavar="SECONDS",
+        help="close a tunnel open for this long (default 86400)",
+    )
+
     standard = commands.add_parser(
         "standard",
         help="run the standard tier: the vault and the gateway in one container, as two uids",
@@ -719,6 +764,24 @@ def _cmd_gateway(args: argparse.Namespace, out: TextIO) -> int:
         run(options, os.environ)
     except StartupError as exc:
         out.write(f"zoeymcp gateway: {exc}\n")
+        return EXIT_UNREADABLE
+    return EXIT_OK
+
+
+def _cmd_egress(args: argparse.Namespace, err: TextIO) -> int:
+    from ..egress.main import Options, StartupError, run
+
+    options = Options(
+        vault=args.vault,
+        listens=tuple(args.listen),
+        max_tunnels=args.max_tunnels,
+        idle_timeout=args.idle_timeout,
+        max_tunnel_seconds=args.max_tunnel_seconds,
+    )
+    try:
+        run(options, os.environ)
+    except StartupError as exc:
+        err.write(f"zoeymcp egress: {exc}\n")
         return EXIT_UNREADABLE
     return EXIT_OK
 
@@ -1993,6 +2056,8 @@ def main(
         return _cmd_vault(args, err)
     if args.command == "gateway":
         return _cmd_gateway(args, err)
+    if args.command == "egress":
+        return _cmd_egress(args, err)
     if args.command == "standard":
         return _cmd_standard(args, err)
     if args.command == "selftest":

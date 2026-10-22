@@ -7,6 +7,8 @@ decisions M7 adds to the schema are tested without putting all of ``schema.py`` 
 - :func:`is_numeric_label` and :func:`is_mail_address`: the portal origin's last-label rule and a
   connector's mail address, moved here so they are mutation-tested (COV-2) and whole-value
   (D-138: ``$`` also matches before a final line break, so ``.match`` let one through).
+- :func:`client_host`: a URL's host as the vault's HTTP client sends it (httpx's ``raw_host``),
+  so the egress lists and ``check`` key a destination as the address guard does (D-190).
 - :func:`endpoint_query` and :func:`check_endpoint_query`: the query a ``token_url`` or an
   ``authorize_url`` may carry (Q41). RFC 6749 3.1-3.2 say such a query MUST be kept when the
   client adds its parameters, so the vault keeps it byte for byte and puts its own after it; the
@@ -22,6 +24,8 @@ import re
 from collections.abc import Set
 from typing import Final
 from urllib.parse import parse_qsl
+
+import idna
 
 # The longest token_url or authorize_url, query or not. Here because common can't import vault
 # code; discovery (M7 design B.4) uses the same cap for every URL it learns.
@@ -83,6 +87,19 @@ def host_port_lower(value: str) -> str:
     if value != value.lower():
         raise ValueError("write host:port in lower case: the egress role compares it as written")
     return value
+
+
+def client_host(host: str) -> str:
+    """A URL's host (``urlsplit().hostname``: in lower case, without brackets) as the vault's
+    HTTP client connects to it and names it in a ``CONNECT``: httpx's ``raw_host``, which writes
+    an internationalized name in its IDNA 2008 ``xn--`` form, encoded as httpx encodes it. A
+    name IDNA refuses stays as it is: the client can't connect to it at all."""
+    if host.isascii():
+        return host
+    try:
+        return idna.encode(host).decode("ascii")
+    except idna.IDNAError:
+        return host
 
 
 def is_squid_acl_name(value: str) -> bool:

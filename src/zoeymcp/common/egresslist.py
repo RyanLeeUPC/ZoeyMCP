@@ -13,8 +13,11 @@ from it, so they can't disagree. Each source is a place connections start from; 
   An allowance is never private: the role can't tell which vault request a tunnel carries, so it
   would give every vault connection to that ``host:port`` the exception (TI-10).
 
-A destination is private when the policy lists it in ``egress_private`` (:func:`private_exceptions`,
-the set the vault's guarded transport reads too). Lists are sorted by source, then host, then
+A URL's host is keyed as the vault's client sends it, an internationalized name in its ``xn--``
+form (``fields.client_host``, D-190). A destination is private when the policy lists it in
+``egress_private`` (:func:`private_exceptions`, the set the vault's guarded transport reads
+too), compared as the guard compares it: a trailing dot (``lan.example.``) names the entry
+without it. Lists are sorted by source, then host, then
 port, with a destination's reasons merged. The digest covers the lists alone (host, port and
 private), so an edit the lists don't see changes no output (GR-20).
 """
@@ -30,6 +33,7 @@ from typing import Any, Final, Literal
 from urllib.parse import urlsplit
 
 from . import canonical, netguard
+from .policy import fields
 from .policy.schema import OAuth2Credential, Policy
 
 SourceName = str  # "vault", or (from M7 step 18b) the name of a route with a program
@@ -66,10 +70,11 @@ def private_exceptions(policy: Policy) -> frozenset[str]:
 
 
 def _url_destination(url: str) -> tuple[str, int, bool]:
-    """``(host, port, plain_http)`` for an http(s) URL the schema has checked."""
+    """``(host, port, plain_http)`` for an http(s) URL the schema has checked, the host as the
+    vault's client sends it (an ``xn--`` name for an internationalized one)."""
     parts = urlsplit(url)  # lowercases the scheme and the host
     port = parts.port or _DEFAULT_PORTS[parts.scheme]
-    return str(parts.hostname), port, parts.scheme == "http"
+    return fields.client_host(str(parts.hostname)), port, parts.scheme == "http"
 
 
 def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
@@ -95,7 +100,11 @@ def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
         add(conn.host, conn.port, False, "connector")
     # Only the policy's own destinations can be private; an allowance never is (TI-10).
     exceptions = private_exceptions(policy)
-    private = {key for key in reasons if netguard.entry_key(*key) in exceptions}
+    private = {
+        (host, port)
+        for host, port in reasons
+        if netguard.entry_key(host.removesuffix("."), port) in exceptions
+    }
     for allowance in allowances:
         for host, port in allowance.destinations:
             add(host, port, False, "onboarding")

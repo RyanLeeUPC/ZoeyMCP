@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from pathlib import Path
@@ -13,6 +14,8 @@ import pytest
 from mcp.shared.exceptions import MCPError
 from mcp.types import TextContent, Tool
 
+from tests.fakes.allowlist import KEY as EGRESS_KEY
+from tests.fakes.allowlist import AllowlistFake, serve_allowlist
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import ZERO_WIDTH, Drift, McpFake, Switch, encoded_form
 from tests.gateway.rig import (
@@ -28,6 +31,8 @@ from tests.gateway.rig import (
     until,
 )
 from zoeymcp.common.canonical import dumps_canonical
+from zoeymcp.egress import allowlist as egress_allowlist
+from zoeymcp.egress import main as egress_main
 from zoeymcp.gateway import pipeline, upstream
 from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
@@ -208,7 +213,8 @@ async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
     """P20 (D-34): agents get no OAuth from ZoeyMCP. Neither the gateway nor the vault's proxy
     answers metadata, a client registration, a token or an authorization endpoint, with or
     without a client token, and the gateway's 401 names no resource metadata. The portal's half
-    is ``tests/portal/test_shell.py``.
+    is ``tests/portal/test_shell.py``. The egress role answers every one of those paths 405,
+    empty and with no challenge, before and after it holds a list (M7 design X17, COV-12).
 
     The agent's side (M7 design step 15): the upstream here offers OAuth itself, publishing its
     protected-resource metadata, and once it stops taking the vault's credential its 401 names
@@ -257,6 +263,47 @@ async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
     for answer in agent_side:
         assert "resource_metadata" not in answer.text + repr(answer.headers.multi_items())
         assert "auth.notes.example" not in answer.text + repr(answer.headers.multi_items())
+    role_answers = await egress_role_answers(bearer)
+    assert len(role_answers) == 2 * len(OAUTH_PATHS) * 2 * 2
+    for answer in role_answers:
+        assert (answer.status_code, answer.content) == (405, b"")
+        assert answer.headers["allow"] == "CONNECT"
+        assert "www-authenticate" not in answer.headers
+        assert "proxy-authenticate" not in answer.headers
+
+
+async def egress_role_answers(bearer: dict[str, str]) -> list[httpx.Response]:
+    """Every OAuth path asked of an egress role in process, by GET and POST, with and without
+    a client token, before its first list and after it."""
+    fake = AllowlistFake()
+    answers: list[httpx.Response] = []
+    async with serve_allowlist(fake) as url:
+        role = egress_main.Role(
+            egress_main.Options(url, ("vault=127.0.0.1:0",)),
+            egress_allowlist.KeySource(EGRESS_KEY),
+            jitter=lambda: 0.01,
+        )
+        task = asyncio.create_task(role.serve())
+        try:
+            with anyio.fail_after(30):
+                await until(lambda: role.started)
+                base = f"http://127.0.0.1:{role.bound['vault'][1]}"
+                async with httpx.AsyncClient(base_url=base, trust_env=False) as client:
+                    asks = [
+                        (method, path, headers)
+                        for path in OAUTH_PATHS
+                        for method in ("GET", "POST")
+                        for headers in ({}, bearer)
+                    ]
+                    answers += [await client.request(m, p, headers=h) for m, p, h in asks]
+                    digest = fake.publish({"vault": [("auth.notes.example", 443)]})
+                    await until(lambda: role.allowlist.digest == digest)
+                    answers += [await client.request(m, p, headers=h) for m, p, h in asks]
+        finally:
+            role.stop()
+            with anyio.fail_after(10):
+                await task
+    return answers
 
 
 # --- G5: servers and sessions -------------------------------------------------------------------

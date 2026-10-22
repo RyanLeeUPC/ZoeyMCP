@@ -823,9 +823,12 @@ def _vault_destinations(policy: Policy) -> set[str]:
 
 
 def _host_port(url: str) -> str:
-    """``host:port`` for an http(s) URL whose host and port the schema has checked."""
+    """``host:port`` for an http(s) URL whose host and port the schema has checked, as the
+    address guard keys it: the client's host (an ``xn--`` name for an internationalized one,
+    D-190), without a trailing dot."""
     parts = urlsplit(url)  # lowercases the host
-    return _join_host_port(str(parts.hostname), parts.port or _DEFAULT_PORTS[parts.scheme])
+    host = fields.client_host(str(parts.hostname)).removesuffix(".")
+    return _join_host_port(host, parts.port or _DEFAULT_PORTS[parts.scheme])
 
 
 def _join_host_port(host: str, port: int) -> str:
