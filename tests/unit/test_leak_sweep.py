@@ -27,7 +27,9 @@ The gateway's view of the policy gets its own sweep: built from a policy with ev
 value filled in, it may hold none of them (M3 design D.1, invariant G1).
 
 A given confidential client's secret (M7 design D.7, X8, X19) is swept on its own: onboarded over
-the admin socket, it reaches the store and nothing else, its fragment holding only the ref.
+the admin socket, it reaches the store and nothing else, its fragment holding only the ref. So
+is a deleted grant's revocation (D.9): the refresh token and the client secret go to the
+revocation endpoint and nowhere else.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
+import anyio
 import httpx
 import pytest
 
@@ -73,6 +76,7 @@ from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.request import oauth_client_variants
+from zoeymcp.vault.secretops import Revoker
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
@@ -1225,3 +1229,73 @@ async def test_a_reregistered_client_secret_reaches_the_store_and_nothing_else(
     assert onboard_model.GIVEN_SECRET not in swept
     assert replaced not in swept
     await rig.token_client.aclose()
+
+
+async def test_a_revoked_grant_reaches_its_revocation_endpoint_and_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_lines: io.StringIO
+) -> None:
+    """M7 design D.9, X18, X19: a refresh token deleted through the portal and a live slot
+    deleted over the socket are each revoked at their own token endpoint's origin, the
+    confidential client's secret with it; neither token, nor the secret, shows in any answer,
+    CLI output or log line."""
+    world = World(tmp_path, monkeypatch)
+    raw = world.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    raw["credentials"]["music"]["revocation_url"] = "https://accounts.spotify.example/revoke"
+    raw["credentials"]["calendar"]["revocation_url"] = "https://accounts.google.example/revoke"
+    world.policy = Policy.model_validate(raw)
+    world.vault.reload(world.policy)
+    # The socket and the portal share one revoker, on a client that reaches each fake by host.
+    revoker = Revoker(world.token_client)
+    world.admin_app = AdminApp(
+        world.store,
+        KEYS,
+        lambda: world.policy,
+        SetupCodes(tmp_path, KEYS.portal_key),
+        world.tokens,
+        revoker=revoker,
+    )
+    world.portal_app.secrets = Secrets(world.store, world.tokens, lambda: world.policy, revoker)
+    put = await world.admin("PUT", "/secrets/google-secret", {"value": GOOGLE_SECRET})
+    assert put.status_code == 200
+    code, _, err = await world.cli(["login", "music"], browse=True)
+    assert code == 0, err
+    assert (await world.proxy("calendar")).status_code == 200  # the seed, promoted
+    music = world.store.get_for_oauth(
+        "music-refresh", token_url="https://accounts.spotify.example/token"
+    )[0].reveal()
+    deleted = await world.portal("secret.delete", {"name": "music-refresh"})
+    assert deleted.json() == {"name": "music-refresh", "deleted": True, "revocation": "requested"}
+    deleted = await world.admin("DELETE", "/secrets/oauth.calendar.live")
+    assert deleted.json()["revocation"] == "requested"
+    assert (await world.cli(["secret", "list"]))[0] == 0
+    with anyio.fail_after(10):
+        await revoker.wait()
+    assert world.spotify.revocations == [music]
+    [calendar] = world.google.revocations
+    assert ISSUED.fullmatch(calendar)
+    [sent] = [s for s in world.google.seen if s.path == "/revoke"]
+    assert dict(parse_qsl(sent.body.decode()))["client_secret"] == GOOGLE_SECRET
+    outcomes = [json.loads(line) for line in log_lines.getvalue().splitlines()]
+    revoked = [(e["credential"], e["outcome"]) for e in outcomes if e["event"] == "oauth_revoked"]
+    assert sorted(revoked) == [("calendar", "ok"), ("music", "ok")]
+    # --- the sweep -----------------------------------------------------------------------------
+    texts = [
+        *world.admin_answers,
+        *world.portal_answers,
+        *world.cli_outputs,
+        *world.proxied,
+        log_lines.getvalue(),
+    ]
+    for text in texts:
+        shown = text
+        for url in world.authorize_urls:
+            shown = shown.replace(url, "<authorize-url>")
+        found = ISSUED.search(shown)
+        assert found is None, found and found.group()
+        for secret in [*world.secrets(), music, calendar]:
+            assert secret not in shown, secret
+    assert world.page is not None
+    await world.page.client.aclose()
+    await revoker.aclose()
+    await world.vault.aclose()
+    await world.token_client.aclose()

@@ -1162,7 +1162,8 @@ async def test_oauth_secret_delete_goes_through_the_manager(tmp_path: Path) -> N
     await rig.tokens.grant_for("broker-mcp", BROKER_UPSTREAM)
     response = await rig.call("DELETE", "/secrets/broker-refresh")
     assert response.status_code == 200
-    assert response.json() == {"name": "broker-refresh", "deleted": True}
+    # The broker names no revocation_url: nothing to revoke (M7 design D.9).
+    assert response.json() == {"name": "broker-refresh", "deleted": True, "revocation": "none"}
     assert rig.store.names() == ["broker-client-id"]
     # The cache went with it: nothing is left to present.
     with pytest.raises(OAuthUnavailable) as caught:

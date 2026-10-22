@@ -266,7 +266,7 @@ def test_set_replace_and_delete_each_after_a_step_up(
     assert held["summary"][1] == ["Bound to", "sent to https://api.stats.example:443"]
     body = authenticator.get(held["options"], page.origin).body()
     answer = confirm(page, held["action"], body)
-    assert answer.json() == {"name": "music-stats", "deleted": True}
+    assert answer.json() == {"name": "music-stats", "deleted": True, "revocation": "none"}
     assert store(rig).names() == []
     assert events(rig, "secret_set", "secret_deleted") == [
         {"event": "secret_set", "name": "music-stats", "binding": STATS_BINDING, "via": "portal"},
@@ -567,7 +567,7 @@ def test_an_oauth_secret_is_deleted_through_the_token_manager(
     page, authenticator = signed_in
     assert put(page, authenticator, name="broker-refresh", value=VALUE).status_code == 200
     answer = delete(page, authenticator, "broker-refresh")
-    assert answer.json() == {"name": "broker-refresh", "deleted": True}
+    assert answer.json() == {"name": "broker-refresh", "deleted": True, "revocation": "none"}
     assert store(rig).names() == []
     resets = [line for line in rig.lines("oauth_cache_reset") if line["reason"] == "secret_delete"]
     assert resets

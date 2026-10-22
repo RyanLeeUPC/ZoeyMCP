@@ -12,6 +12,7 @@ from zoeymcp.portal.actions import Action, Actions, HeldData
 from zoeymcp.portal.sessions import Ceremonies, Ceremony, SessionToken
 from zoeymcp.portal.setupcode import SetupCode
 from zoeymcp.vault import logs
+from zoeymcp.vault.oauth.protocol import Client, RevocationMaterial
 from zoeymcp.vault.onboarding import Names, OnboardingRecord, Options
 from zoeymcp.vault.store import Secret
 
@@ -170,6 +171,24 @@ def test_an_onboarding_record_is_refused_nested(lines: io.StringIO) -> None:
         with pytest.raises(TypeError, match=message):
             logs.event("oops", f=wrapped)
     assert OnboardingRecord in common_logs.refused_types()
+    assert lines.getvalue() == ""
+
+
+def test_revocation_material_is_refused_nested(lines: io.StringIO) -> None:
+    """M7 M.5: it holds a refresh token and the client's secret (D.9)."""
+    material = RevocationMaterial(
+        credential="notes",
+        url="https://auth.notes.example/revoke",
+        token_origin="https://auth.notes.example:443",
+        auth="post",
+        client=Client("notes-client", Secret("fake-client-secret")),
+        refresh_token=Secret("fake-refresh-token"),
+    )
+    message = r"^refusing to log a secret \(RevocationMaterial\) in field 'f'$"
+    for wrapped in (material, [material], {"outer": [{"inner": (material,)}]}):
+        with pytest.raises(TypeError, match=message):
+            logs.event("oops", f=wrapped)
+    assert RevocationMaterial in common_logs.refused_types()
     assert lines.getvalue() == ""
 
 

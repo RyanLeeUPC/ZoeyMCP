@@ -764,8 +764,9 @@ def build(
         logs.event("admin_socket_disabled", reason="Unix sockets aren't supported on this platform")
         admin_socket = None
     # The same SetupCodes, passkeys and logins as the socket's (verifier V12, M5 design H.2), and
-    # the same store, token manager and running policy for secrets (M5 design G, P10).
-    secrets = Secrets(runtime.store, app.tokens, lambda: app.policy)
+    # the same store, token manager, running policy and revocations for secrets (M5 design G,
+    # P10; M7 design D.9).
+    secrets = Secrets(runtime.store, app.tokens, lambda: app.policy, app.revoker)
     # Health from the same sources as the socket's GET /health (M5 design I.2).
     health = HealthReader(
         runtime.store,
@@ -807,6 +808,7 @@ def build(
             passkeys=passkeys,
             portal=None if portal is None else portal.app,
             onboard=onboard,
+            revoker=app.revoker,
         )
     return Vault(
         app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal

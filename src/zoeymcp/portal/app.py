@@ -82,10 +82,11 @@ handlers log ``portal_login``, ``portal_login_failed``, ``setup_code_redeemed``,
 a setup code enrolled it, E.4), ``passkeys_reset``, ``portal_logout``, ``portal_session_ended``,
 ``step_up_confirmed``, ``step_up_refused``, ``action_changed``, ``passkey_renamed`` and
 ``passkey_removed``; ``secretops`` logs ``secret_set`` and ``secret_deleted`` with
-``via: "portal"``; the logins log ``oauth_login_started``, ``oauth_login_completed``,
-``oauth_login_failed`` and ``oauth_flow_replaced``, a reset ``oauth_cache_reset``, and the
-copy ``ledger_reported_restarted``. The callback logs ``portal_request`` for its 303 with the
-route's template only, never its query; ``oauth_callback_returned`` or ``oauth_callback_failed``
+``via: "portal"``, and a delete's revocation ``oauth_revoked``; the logins log
+``oauth_login_started``, ``oauth_login_completed``, ``oauth_login_failed`` and
+``oauth_flow_replaced``, a reset ``oauth_cache_reset``, and the copy
+``ledger_reported_restarted``. The callback logs ``portal_request`` for its 303 with the route's
+template only, never its query; ``oauth_callback_returned`` or ``oauth_callback_failed``
 (the logins'); and for a refusal ``oauth_callback_refused`` (``callback_not_taken``,
 ``not_navigation``, ``bad_query``, ``duplicate_param``), at most once per 10 s per reason with a
 count, or ``portal_refused`` for ``busy`` and ``rate_limited``.
@@ -367,15 +368,17 @@ class Step:
 
 @dataclass(frozen=True)
 class Secrets:
-    """What the Secrets area works on (G), the same three the admin socket's ``/secrets`` does:
-    the vault's store; its token manager, which writes and deletes a name an oauth2 credential
-    uses once any refresh of it is done (None writes the store directly, as the socket without
-    one); and the running policy, read at every plan, so a reload between prepare and confirm
-    that moves a binding is ``409 changed``."""
+    """What the Secrets area works on (G), the same as the admin socket's ``/secrets``: the
+    vault's store; its token manager, which writes and deletes a name an oauth2 credential uses
+    once any refresh of it is done (None writes the store directly, as the socket without one);
+    the running policy, read at every plan, so a reload between prepare and confirm that moves
+    a binding is ``409 changed``; and the revocations a deleted refresh token starts (M7 design
+    D.9; None revokes nothing)."""
 
     store: SecretStore
     tokens: TokenManager | None
     policy: Callable[[], Policy]
+    revoker: secretops.Revoker | None = None
 
 
 @dataclass(frozen=True)
@@ -1346,10 +1349,12 @@ class PortalApp:
         place = self._secret_store()
         name = data["name"]
         plan = secretplan.plan_delete(name, place.policy())
-        refused = await secretops.delete(place.store, place.tokens, plan, via="portal")
-        if refused is not None:
-            return secret(refused, name=name)
-        return Reply({"name": name, "deleted": True})
+        done = await secretops.delete(
+            place.store, place.tokens, plan, via="portal", revoker=place.revoker
+        )
+        if isinstance(done, SecretRefusal):
+            return secret(done, name=name)
+        return Reply({"name": name, "deleted": True, "revocation": done})
 
     # --- health (I) and OAuth connect by paste (H) -----------------------------------------------
 

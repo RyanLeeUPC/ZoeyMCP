@@ -23,7 +23,8 @@ other request, another onboarding's included, ever reuses a connection the excep
 Every client verifies against certifi's roots, through one ``ssl_context`` per client built from
 ``certifi.where()`` (B.6, X23), as the SMTP connector's ``default_tls`` does. Each is built once,
 at start, from the startup policy, so a reload that changes ``egress_proxy`` changes no client
-(D-61). This step builds the onboarding client; the route and token clients move here in step 16.
+(D-61). Here are the onboarding client and the revocation client (M7 design D.9); the route and
+token clients move here in step 16.
 
 Tests answer names through :data:`HOOKS` (BP-1): a resolver that maps names to addresses reserved
 for the run, and a ``dial`` that sends a checked address to the loopback port of the right fake,
@@ -51,6 +52,8 @@ RESOLVE_TIMEOUT: Final = 5.0
 # The onboarding client's defaults, B.5's per-fetch numbers; vault/oauth/fetch.py bounds each
 # whole fetch, and a discovery, on top of them.
 ONBOARDING_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
+# The revocation client's: the whole of one revocation is REVOKE_TIMEOUT (vault/secretops.py).
+REVOCATION_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
 # The per-request exception (TI-10): (onboarding id, purpose, host:port).
 ONBOARDING_EXTENSION: Final = "zoeymcp.onboarding"
 # The fetches an onboarding's exception may cover: the probe of the server URL and its PRM. Never
@@ -273,4 +276,19 @@ def onboarding_client(egress_proxy: str | None) -> httpx.AsyncClient:
         trust_env=False,
         follow_redirects=False,
         timeout=ONBOARDING_TIMEOUT,
+    )
+
+
+def revocation_client(
+    egress_proxy: str | None, exceptions: Callable[[], Collection[str]]
+) -> httpx.AsyncClient:
+    """The client a deleted refresh token's revocation is posted on (M7 design D.9). Its
+    exception set is the running policy's ``egress_private``, read at each connection, as the
+    token client's will be from step 16, so a token origin listed there revokes as it refreshes
+    (TI-11). No redirects, no proxy variables; the vault gives it a jar that keeps no cookies."""
+    return httpx.AsyncClient(
+        transport=guarded_transport(egress_proxy, exceptions),
+        trust_env=False,
+        follow_redirects=False,
+        timeout=REVOCATION_TIMEOUT,
     )

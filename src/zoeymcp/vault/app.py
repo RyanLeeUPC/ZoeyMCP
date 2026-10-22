@@ -53,7 +53,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
-from ..common import canonical, ledgerreport
+from ..common import canonical, egresslist, ledgerreport
 from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
     BasicCredential,
@@ -68,7 +68,7 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from ..common.policy.view import build_view, dump_view
-from . import logs, netclient
+from . import logs, netclient, secretops
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
@@ -333,6 +333,7 @@ class VaultApp:
         client: httpx.AsyncClient | None = None,
         token_client: httpx.AsyncClient | None = None,
         onboarding_client: httpx.AsyncClient | None = None,
+        revocation_client: httpx.AsyncClient | None = None,
         tokens: TokenManager | None = None,
         environ: Mapping[str, str] | None = None,
         gateway_keys: GatewayKeys | None = None,
@@ -345,7 +346,9 @@ class VaultApp:
         so ``token_client`` is then not used.
 
         ``onboarding_client`` reaches hosts learned from the network (discovery, registration;
-        M7 design B.2), guarded by :mod:`.netclient`. When ``client`` is given and it isn't,
+        M7 design B.2), and ``revocation_client`` the revocation endpoint of a deleted refresh
+        token (D.9), both guarded by :mod:`.netclient`, the second with the running policy's
+        ``egress_private`` as its exceptions (TI-11). When ``client`` is given and either isn't,
         ``client`` serves that role too, so an injected client never falls back to a networked
         one. Every client, and the SMTP connectors' proxy, stays on the ``egress_proxy`` of
         ``policy``, the startup one: a reload never changes them (D-61).
@@ -373,6 +376,14 @@ class VaultApp:
         if onboarding_client is None and client is None:
             onboarding_client = netclient.onboarding_client(policy.egress_proxy)
         self._onboarding_client = without_cookies(onboarding_client or self._client)
+        if revocation_client is None and client is None:
+            revocation_client = netclient.revocation_client(
+                policy.egress_proxy, lambda: egresslist.private_exceptions(self._policy)
+            )
+        self._revocation_client = without_cookies(revocation_client or self._client)
+        self._revoker = secretops.Revoker(
+            self._revocation_client, proxied=policy.egress_proxy is not None
+        )
         self._token_client: httpx.AsyncClient | None = None
         if tokens is None:
             self._token_client = without_cookies(token_client or _token_client(policy))
@@ -435,6 +446,12 @@ class VaultApp:
         return self._onboarding_client
 
     @property
+    def revoker(self) -> secretops.Revoker:
+        """The revocations after a committed delete, on the revocation client (M7 design D.9).
+        The socket and the portal share it."""
+        return self._revoker
+
+    @property
     def env_names(self) -> frozenset[str]:
         """The ``env:`` variables found set when the policy was loaded: names only."""
         return frozenset(self._env_secrets)
@@ -468,15 +485,20 @@ class VaultApp:
         return self._install(policy)
 
     async def aclose(self) -> None:
-        """Wait for refreshes in flight, then close the clients (N5)."""
+        """Wait for refreshes and revocations in flight, then close the clients (N5)."""
         try:
-            await self._tokens.aclose()
+            try:
+                await self._tokens.aclose()
+            finally:
+                await self._revoker.aclose()
         finally:
             await self._client.aclose()
             if self._token_client is not None and self._token_client is not self._client:
                 await self._token_client.aclose()
             if self._onboarding_client is not self._client:
                 await self._onboarding_client.aclose()
+            if self._revocation_client is not self._client:
+                await self._revocation_client.aclose()
 
     # --- ASGI ----------------------------------------------------------------------------------
 

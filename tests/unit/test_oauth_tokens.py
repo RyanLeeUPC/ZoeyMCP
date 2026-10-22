@@ -40,6 +40,7 @@ from zoeymcp.vault.oauth.protocol import (
     Client,
     Failure,
     Minted,
+    RevocationMaterial,
     TokenRequest,
     encode_envelope,
     parse_envelope,
@@ -841,7 +842,7 @@ async def test_terminal_states_make_no_calls_and_each_clearing_action_reenables(
     rig.manager._cache.clear()
     await rig.refused()
     calls = rig.calls
-    assert await rig.manager.forget("music-refresh") is True
+    assert await rig.manager.forget("music-refresh") == (True, None)
     assert (await rig.refused()).reason == "no_token"
     assert rig.calls == calls
     # A reload with changed settings and a restart are covered below.
@@ -1148,7 +1149,7 @@ async def test_deleting_the_live_slot_reseeds(tmp_path: Path, clock: FakeClock) 
     rig, seed = seeded_rig(tmp_path, clock, "issue", rotates=False)
     rig.server.rotate = False
     await rig.grant()
-    assert await rig.manager.forget(live_slot("music")) is True
+    assert await rig.manager.forget(live_slot("music")) == (True, None)
     assert rig.manager._cache == {}
     await rig.grant()
     assert [c.refresh_token for c in rig.server.refresh_calls] == [seed, seed]
@@ -1469,13 +1470,114 @@ async def test_forget_waits_for_the_refresh_in_flight(
     assert not writer.done()
     gate.set()
     await waiter
-    assert await writer is True
+    assert await writer == (True, None)
     assert rig.store.entry("music-refresh") is None
     assert rig.manager._cache == {}
     assert [without_ts(e) for e in captured.events("oauth_cache_reset")] == [
         {"event": "oauth_cache_reset", "credential": "music", "reason": "secret_delete"}
     ]
-    assert await rig.manager.forget("music-refresh") is False
+    assert await rig.manager.forget("music-refresh") == (False, None)
+
+
+# --- the revocation material (M7 design D.9, CR-5) ---------------------------------------------
+
+REVOKE = "https://accounts.example/revoke"
+
+
+def state(tmp_path: Path, name: str) -> Path:
+    directory = tmp_path / name
+    directory.mkdir(mode=0o700)
+    return directory
+
+
+async def test_forget_takes_the_revocation_material(tmp_path: Path, clock: FakeClock) -> None:
+    rig = spotify_rig(tmp_path, clock, revocation_url=REVOKE)
+    token = rig.seed()
+    existed, material = await rig.manager.forget("music-refresh")
+    assert existed is True
+    assert isinstance(material, RevocationMaterial)
+    assert (material.credential, material.url, material.token_origin) == (
+        "music",
+        REVOKE,
+        "https://accounts.example:443",
+    )
+    assert (material.auth, material.client) == ("none", Client(SPOTIFY_ID))
+    assert material.refresh_token.reveal() == token
+    assert rig.store.entry("music-refresh") is None
+
+
+async def test_the_material_is_the_token_a_rotation_during_the_wait_saved(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """CR-5: read after the refresh in flight, so the successor it saved is the one revoked."""
+    rig = spotify_rig(tmp_path, clock, revocation_url=REVOKE)
+    first = rig.seed()
+    gate = rig.server.hold()
+    waiter = asyncio.create_task(rig.grant())
+    await rig.server.arrived()
+    writer = asyncio.create_task(rig.manager.forget("music-refresh"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not writer.done()
+    gate.set()
+    await waiter
+    existed, material = await writer
+    successor = rig.server.active_refresh_token()
+    assert successor is not None
+    assert successor != first
+    assert existed is True
+    assert material is not None
+    assert material.refresh_token.reveal() == successor
+
+
+async def test_a_confidential_clients_material_carries_its_secret(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig = google_rig(tmp_path, clock, revocation_url=REVOKE)
+    token = rig.seed()
+    _, material = await rig.manager.forget("music-refresh")
+    assert material is not None
+    assert (material.auth, material.client.client_id) == ("post", GOOGLE_ID)
+    assert material.client.secret is not None
+    assert material.client.secret.reveal() == GOOGLE_SECRET
+    assert material.refresh_token.reveal() == token
+
+
+async def test_a_live_slots_material_is_the_token_in_its_envelope(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    rig, _ = seeded_rig(tmp_path, clock, None, revocation_url=REVOKE)
+    live = rig.server.issue_grant()
+    value = encode_envelope(Secret(live), None)
+    rig.store.put(live_slot("music"), value.reveal(), oauth_binding(TOKEN_URL, [API]))
+    _, material = await rig.manager.forget(live_slot("music"))
+    assert material is not None
+    assert material.refresh_token.reveal() == live
+
+
+async def test_no_material_without_something_to_revoke(tmp_path: Path, clock: FakeClock) -> None:
+    """No revocation_url, not asked for, a client secret, an absent or unusable slot, or a
+    client the manager can't authenticate: nothing to send."""
+    plain = spotify_rig(state(tmp_path, "plain"), clock)
+    plain.seed()
+    assert await plain.manager.forget("music-refresh") == (True, None)
+    unasked = spotify_rig(state(tmp_path, "unasked"), clock, revocation_url=REVOKE)
+    unasked.seed()
+    assert await unasked.manager.forget("music-refresh", take_revocation=False) == (True, None)
+    assert await unasked.manager.forget("music-refresh") == (False, None)
+    secret = google_rig(state(tmp_path, "secret"), clock, revocation_url=REVOKE)
+    secret.seed()
+    assert await secret.manager.forget("google-secret") == (True, None)
+    # With its client secret gone, the grant can't be revoked either.
+    assert await secret.manager.forget("music-refresh") == (True, None)
+    tampered = spotify_rig(state(tmp_path, "tampered"), clock, revocation_url=REVOKE)
+    tampered.seed("music-refresh", resources=(API,))
+    elsewhere = oauth_binding("https://evil.example/token", [API])
+    tampered.store.put("music-refresh", "fake-rt-elsewhere", elsewhere)
+    assert await tampered.manager.forget("music-refresh") == (True, None)
+    seeded, _ = seeded_rig(state(tmp_path, "seeded"), clock, None, revocation_url=REVOKE)
+    seeded.store.put(live_slot("music"), "not-an-envelope", oauth_binding(TOKEN_URL, [API]))
+    assert await seeded.manager.forget(live_slot("music")) == (True, None)
 
 
 async def test_replace_secret_of_a_client_secret_clears_its_users(

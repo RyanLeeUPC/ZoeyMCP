@@ -362,6 +362,11 @@ class FakeAuthServer:
         self.latch: threading.Event | None = None
         self.calls: list[TokenCall] = []
         self.revocations: list[str] = []
+        # /revoke (M7 design D.9): a status other than 200 revokes nothing (with
+        # ``revoke_location`` as its Location), and with the gate set the answer waits for it.
+        self.revoke_status = 200
+        self.revoke_location: str | None = None
+        self.revoke_gate: asyncio.Event | None = None
         self._failures: list[_Failure] = []
         self._force_rotation = 0
         self._rotations = 0
@@ -796,6 +801,11 @@ class FakeAuthServer:
         params = await self._params(request)
         token = params.get("token", "")
         self.revocations.append(token)
+        if self.revoke_gate is not None:
+            await self.revoke_gate.wait()
+        if self.revoke_status != 200:
+            moved = {} if self.revoke_location is None else {"location": self.revoke_location}
+            return Response(status_code=self.revoke_status, headers=moved)
         for family in self._families:
             if token == family.refresh_token or token in family.retired:
                 family.revoked = True

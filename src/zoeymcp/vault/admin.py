@@ -447,6 +447,7 @@ class AdminApp:
         passkeys: Passkeys | None = None,
         portal: PortalSessions | None = None,
         onboard: OnboardService | None = None,
+        revoker: secretops.Revoker | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -464,8 +465,12 @@ class AdminApp:
         a passkey ends the sessions it made. Without a portal there are none.
 
         ``onboard`` is onboarding by URL's service, shared with the portal. Without it, the
-        ``/onboard`` routes answer 503."""
+        ``/onboard`` routes answer 503.
+
+        ``revoker`` revokes a deleted refresh token whose credential names a ``revocation_url``
+        (M7 design D.9), shared with the portal. Without it, nothing is revoked."""
         self._store = store
+        self._revoker = revoker
         self._onboard = onboard
         self._portal = portal
         self._passkeys = passkeys
@@ -542,10 +547,13 @@ class AdminApp:
 
     async def _delete(self, request: Request) -> Response:
         plan = secretplan.plan_delete(request.path_params["name"], self._policy())
-        refusal = await secretops.delete(self._store, self._tokens, plan, via="socket")
-        if refusal is not None:
-            return _refused(refusal)
-        return JSONResponse({"name": plan.name, "deleted": True})
+        done = await secretops.delete(
+            self._store, self._tokens, plan, via="socket", revoker=self._revoker
+        )
+        if isinstance(done, SecretRefusal):
+            return _refused(done)
+        # The revocation, if any, runs on: the answer never waits for it (D.9).
+        return JSONResponse({"name": plan.name, "deleted": True, "revocation": done})
 
     # --- setup codes, passkeys and sessions (M5 design E, D.5, F.2) ----------------------------
 

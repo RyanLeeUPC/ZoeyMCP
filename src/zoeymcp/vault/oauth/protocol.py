@@ -1,8 +1,9 @@
 """The OAuth 2.0 protocol as pure functions (design §4.3).
 
 Token request builders and client authentication, token response parsing and classification,
-lifetimes and skew, scopes, the seed-vs-live decision, the live-slot envelope, backoff, and the
-filter for provider error codes.
+lifetimes and skew, scopes, the seed-vs-live decision, the live-slot envelope, backoff, the
+filter for provider error codes, and the revocation request of a deleted refresh token (M7
+design D.9).
 
 Nothing here does I/O or reads a clock: the caller passes the times in. Every token is held as a
 :class:`Secret` from parse to use, so it can't be logged by accident.
@@ -26,10 +27,11 @@ from ... import __version__
 from ...common.adminsocket import EXCHANGE_DEADLINE as EXCHANGE_DEADLINE
 from ...common.adminsocket import REFRESH_BUDGET as REFRESH_BUDGET
 from ...common.canonical import JSONRejected, dumps_canonical, loads_strict
+from ...common.logs import refuse_type
 from ...common.policy.fields import endpoint_query
-from ...common.policy.schema import OAuth2Credential, param_values
+from ...common.policy.schema import ClientAuth, OAuth2Credential, param_values
 from ..request import encode_query, oauth_basic_credentials
-from ..store import Secret
+from ..store import Secret, canonical_origin
 
 # --- limits and timings ------------------------------------------------------------------------
 
@@ -198,16 +200,9 @@ def _build(
     items = list(fields)
     content_type = "application/json" if cred.token_body == "json" else FORM  # noqa: S105
     headers = [("accept", "application/json"), ("content-type", content_type)]
-    auth = cred.effective_client_auth
-    if auth == "basic":
-        secret = _client_secret(client)
-        credentials = oauth_basic_credentials(client.client_id, secret.reveal())
-        headers.append(("authorization", "Basic " + credentials))
-    elif auth == "post":
-        secret = _client_secret(client)
-        items += [("client_id", client.client_id), ("client_secret", secret.reveal())]
-    else:
-        items.append(("client_id", client.client_id))
+    auth_headers, auth_items = _client_auth(cred.effective_client_auth, client)
+    headers += auth_headers
+    items += auth_items
 
     names = {name for name, _ in items}
     for name, value in cred.extra_params.items():
@@ -243,10 +238,66 @@ def _build(
     return TokenRequest(cred.token_url, tuple(headers), body)
 
 
+def _client_auth(
+    auth: ClientAuth, client: Client
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The client's authentication (RFC 6749 2.3), as headers and body fields: a Basic header,
+    the ID and secret in the body, or the ID alone for a public client."""
+    if auth == "basic":
+        credentials = oauth_basic_credentials(client.client_id, _client_secret(client).reveal())
+        return [("authorization", "Basic " + credentials)], []
+    if auth == "post":
+        secret = _client_secret(client)
+        return [], [("client_id", client.client_id), ("client_secret", secret.reveal())]
+    return [], [("client_id", client.client_id)]
+
+
 def _client_secret(client: Client) -> Secret:
     if client.secret is None:
         raise ValueError("this client authentication needs the client secret")
     return client.secret
+
+
+# --- revocation (M7 design D.9) ----------------------------------------------------------------
+
+
+@dataclass(frozen=True, repr=False)
+class RevocationMaterial:
+    """What revoking a deleted refresh token needs, read by the token manager after the
+    refreshes in flight and before the delete (CR-5): the credential, its ``revocation_url``,
+    the token origin the token was bound to, the client authentication its token requests
+    use, and the token. Never logged; ``repr`` names the credential and the URL only."""
+
+    credential: str
+    url: str
+    token_origin: str
+    auth: ClientAuth
+    client: Client
+    refresh_token: Secret
+
+    def __repr__(self) -> str:
+        return f"RevocationMaterial(credential={self.credential!r}, url={self.url!r})"
+
+
+refuse_type(RevocationMaterial)
+
+
+def build_revocation(material: RevocationMaterial) -> TokenRequest:
+    """An RFC 7009 revocation of the refresh token: ``token`` and ``token_type_hint``, with the
+    client authentication the token endpoint gets (2.1), always as a form.
+
+    Raises ``ValueError``, and nothing may be sent, unless the URL's canonical origin is the
+    token origin the token was bound to: the token and the client's secret go nowhere else
+    (TI-2; ``check`` refuses such a ``revocation_url`` first, A.2 row 4b).
+    """
+    if canonical_origin(material.url) != material.token_origin:
+        raise ValueError("the revocation endpoint isn't on the token endpoint's origin")
+    items = [("token", material.refresh_token.reveal()), ("token_type_hint", "refresh_token")]
+    headers = [("accept", "application/json"), ("content-type", FORM)]
+    auth_headers, auth_items = _client_auth(material.auth, material.client)
+    headers += [*auth_headers, ("user-agent", USER_AGENT)]
+    body = urlencode([*items, *auth_items]).encode("ascii")
+    return TokenRequest(material.url, tuple(headers), body)
 
 
 # --- token responses ---------------------------------------------------------------------------

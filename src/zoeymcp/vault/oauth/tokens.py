@@ -49,6 +49,7 @@ from .protocol import (
     Failure,
     Minted,
     Outcome,
+    RevocationMaterial,
     ScopeCheck,
     SlotState,
     TokenRequest,
@@ -425,11 +426,21 @@ class TokenManager:
             self._reset(users, "secret_set")
         return binding
 
-    async def forget(self, name: str) -> bool:
-        """``secret delete`` of an OAuth secret or a live slot. Returns whether it existed."""
+    async def forget(
+        self, name: str, *, take_revocation: bool = True
+    ) -> tuple[bool, RevocationMaterial | None]:
+        """``secret delete`` of an OAuth secret or a live slot. Returns whether it existed and,
+        with ``take_revocation``, what revoking the refresh token it held needs (M7 design D.9).
+
+        The material is read after the refreshes in flight and before the delete, with no await
+        in between, so a rotation that completed meanwhile is the token revoked, not the one it
+        superseded (CR-5). There is none for a client ID or secret, a credential without
+        ``revocation_url``, or a slot the token endpoint's binding doesn't vouch for.
+        """
         users = await self._quiesce(lambda: self._users(name))
+        material = self._revocation(name, users) if take_revocation else None
         try:
-            return self._store.delete(name)
+            return self._store.delete(name), material
         finally:
             self._reset(users, "secret_delete")
 
@@ -1042,6 +1053,37 @@ class TokenManager:
                 return users
             # This never cancels them. Another refresh may start meanwhile, so look again.
             await asyncio.wait(tasks)
+
+    def _revocation(self, name: str, users: list[_Config]) -> RevocationMaterial | None:
+        """The material to revoke the refresh token in slot ``name``: the first credential that
+        keeps its grant there and names a ``revocation_url``."""
+        for cfg in users:
+            url = cfg.cred.revocation_url
+            # A client_credentials slot is cc:<name>, which no secret's name can be.
+            if cfg.slot != name or url is None:
+                continue
+            state, value, binding = self._read_slot(cfg)
+            if state != "usable":
+                return None
+            assert value is not None  # noqa: S101 - a usable slot has a value and a binding
+            assert binding is not None  # noqa: S101
+            if self._seeded(cfg):
+                try:
+                    value = parse_envelope(value).rt
+                except EnvelopeError:
+                    return None
+            client = self._client_for(cfg)
+            if isinstance(client, Failure):
+                return None
+            return RevocationMaterial(
+                credential=cfg.name,
+                url=url,
+                token_origin=binding["oauth"]["token"],
+                auth=cfg.cred.effective_client_auth,
+                client=client,
+                refresh_token=value,
+            )
+        return None
 
     def _users(self, name: str) -> list[_Config]:
         """The credentials whose slot is ``name`` or that reference ``store:<name>``."""

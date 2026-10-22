@@ -13,6 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from zoeymcp import __version__
+from zoeymcp.common import logs as common_logs
 from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.vault.oauth import protocol
 from zoeymcp.vault.oauth.protocol import (
@@ -32,6 +33,7 @@ from zoeymcp.vault.oauth.protocol import (
     GrantKind,
     Minted,
     Outcome,
+    RevocationMaterial,
     ScopeCheck,
     SlotState,
     SourceDecision,
@@ -40,6 +42,7 @@ from zoeymcp.vault.oauth.protocol import (
     build_client_credentials,
     build_exchange,
     build_refresh,
+    build_revocation,
     check_login_scopes,
     check_refresh_scopes,
     clamp_lifetime,
@@ -335,6 +338,86 @@ def test_a_token_request_never_shows_its_body() -> None:
     )
     assert "rt-value-9" not in text
     assert "Basic" not in text
+
+
+# --- revocation (M7 design D.9, TI-2) ----------------------------------------------------------
+
+REVOCATION_URL = "https://accounts.example/oauth/revoke"
+TOKEN_ORIGIN = "https://accounts.example:443"
+
+
+def material(
+    auth: Any = "none", client: Client = PUBLIC_CLIENT, url: str = REVOCATION_URL
+) -> RevocationMaterial:
+    return RevocationMaterial(
+        credential="music",
+        url=url,
+        token_origin=TOKEN_ORIGIN,
+        auth=auth,
+        client=client,
+        refresh_token=Secret("rt 1"),
+    )
+
+
+def test_a_public_clients_revocation() -> None:
+    """RFC 7009 2.1: the token and its hint, and the client ID a public client sends."""
+    request = build_revocation(material())
+    assert request.url == REVOCATION_URL
+    assert request.headers == (ACCEPT, FORM_TYPE, UA)
+    assert request.body == b"token=rt+1&token_type_hint=refresh_token&client_id=app-1"
+
+
+def test_a_confidential_clients_revocation_authenticates_as_at_the_token_endpoint() -> None:
+    basic = build_revocation(material("basic", SECRET_CLIENT))
+    encoded = base64.b64encode(b"app-1:cs-value-1").decode()
+    assert basic.headers == (ACCEPT, FORM_TYPE, ("authorization", "Basic " + encoded), UA)
+    assert basic.body == b"token=rt+1&token_type_hint=refresh_token"
+    post = build_revocation(material("post", SECRET_CLIENT))
+    assert post.headers == (ACCEPT, FORM_TYPE, UA)
+    assert post.body == (
+        b"token=rt+1&token_type_hint=refresh_token&client_id=app-1&client_secret=cs-value-1"
+    )
+
+
+@pytest.mark.parametrize("auth", ["basic", "post"])
+def test_a_revocation_without_the_client_secret_is_refused(auth: str) -> None:
+    with pytest.raises(ValueError, match=r"^this client authentication needs the client secret$"):
+        build_revocation(material(auth))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://other.example/oauth/revoke",
+        "https://accounts.example:8443/oauth/revoke",
+        "http://accounts.example/oauth/revoke",
+        "https://accounts.example.evil/oauth/revoke",
+        "/oauth/revoke",
+    ],
+)
+def test_a_revocation_off_the_token_origin_is_refused(url: str) -> None:
+    """TI-2: the token and the client's secret go to the token endpoint's origin alone."""
+    with pytest.raises(ValueError, match=r"isn't on the token endpoint's origin|not an absolute"):
+        build_revocation(material("post", SECRET_CLIENT, url))
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://ACCOUNTS.example/r", "https://accounts.example:443/r", "https://accounts.example"],
+)
+def test_the_token_origin_is_compared_canonically(url: str) -> None:
+    assert build_revocation(material(url=url)).url == url
+
+
+def test_revocation_material_never_shows_and_is_never_logged() -> None:
+    held = material("post", SECRET_CLIENT)
+    text = repr(held)
+    assert text == f"RevocationMaterial(credential='music', url={REVOCATION_URL!r})"
+    assert "rt 1" not in text
+    assert "cs-value-1" not in text
+    assert RevocationMaterial in common_logs.refused_types()
+    with pytest.raises(FrozenInstanceError):
+        held.url = "https://other.example/"  # type: ignore[misc]
 
 
 # --- endpoint queries (M7 design B.4, Q41) ------------------------------------------------------

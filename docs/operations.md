@@ -90,8 +90,9 @@ degraded:** a crash or restart before a successful write loses the change, and f
 refresh token that means a new `zoeymcp login`.
 
 **Stopping.** The vault waits up to 45 s for refreshes in flight, so a new refresh token is saved
-before it exits. The hardened compose sets `stop_grace_period: 50s` for this. Docker's default
-is 10 s, so when running the image some other way, give it the same time (`docker stop -t 50`).
+before it exits, and for the revocations of deleted grants (§2). The hardened compose sets
+`stop_grace_period: 50s` for this. Docker's default is 10 s, so when running the image some
+other way, give it the same time (`docker stop -t 50`).
 
 ## 2. Logging in
 
@@ -215,6 +216,26 @@ a refresh of the same slot that is already running, and 15 s to spare), up to 56
 `secret set` and `secret delete` (a secret an OAuth credential uses waits for a refresh in
 flight), and 10 s for everything else. After a timeout, check `oauth status` before
 trying again: the vault may have finished.
+
+**Deleting a grant revokes it.** `zoeymcp secret delete` (or the portal's **Delete**) of a
+credential's refresh token, the entry its `refresh_token` names or its live slot
+`oauth.<credential>.live`, also revokes that token (RFC 7009) when the credential has a
+`revocation_url`: onboarding writes it from the provider's `revocation_endpoint`, or you set it
+by hand, on the token endpoint's origin (`check` refuses another, and the vault sends nothing
+there). The token revoked is the one deleted: a refresh running at the time finishes first, and
+if it rotated the token, the new one is revoked. The request carries the client authentication
+the token endpoint gets; it is sent once, after the delete is saved, waits at most 10 s and
+follows no redirect. The delete's answer never waits for it, and says `revocation: "requested"`,
+or `"none"` when nothing is sent. A failure changes nothing: the entry is gone either way, and the
+provider may keep the grant until it expires (end it in the provider's settings if it must end
+now); a stop or restart waits for it (within those 10 s), but a crash or a kill within those
+10 s skips it. Nothing is revoked when you replace a secret, log in again or reset a credential,
+nor for a client ID or client secret. Deleting a live slot to reseed (§5) revokes the token it
+held, so an env seed of that same grant (a provider that doesn't rotate) is revoked with it. The
+revocation endpoint is a vault destination like the token endpoint: it goes through
+`egress_proxy` when that is set, and otherwise a host whose name resolves to a private address
+needs its `host:port` in `egress_private`. Logs: `oauth_revoked` (the table at the end of §11),
+and `discovery_fetch` with `fetch_kind: revoke` for the request.
 
 **Why a login is refused.** The CLI prints a message; the admin answer also carries one of
 these `reason` codes, and the portal answers with the same reason and status, in its own words
@@ -832,13 +853,14 @@ If anything fails after register stored the secret, the vault deletes it again a
 | Event | Fields |
 | --- | --- |
 | `onboard_started` | `owner` (`cli` or `portal`), `host` (the server's), `allow_private` |
-| `discovery_fetch` | `fetch_kind` (`probe`, `prm`, `as`, `register`), `host`, `port`, `status`, `bytes`, `ms`, `via` (`direct` or `proxy`) |
+| `discovery_fetch` | `fetch_kind` (`probe`, `prm`, `as`, `register`, or `revoke` for a deleted grant's revocation, §2), `host`, `port`, `status`, `bytes`, `ms`, `via` (`direct` or `proxy`) |
 | `onboard_planned` | `host`, `issuer` (its host), `require_iss`, `registration`, `auth`, `scopes` (how many) |
 | `onboard_refused` | `reason`, `host` (the server's) |
 | `onboard_registered` | `credential`, `issuer` (its host), `auth`, `secret_stored` |
 | `onboard_blocked` | `host` and `port` your proxy refused, `needed` (how many hosts it must allow) |
 | `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired`, `owner_gone`, or `compared` (a second run's comparison found nothing changed) |
-| `address_refused` | `purpose` (`discovery`), `host`, `port`, `verdict` |
+| `address_refused` | `purpose` (`discovery`, or `revocation`), `host`, `port`, `verdict` |
+| `oauth_revoked` | `credential`, `outcome` (`ok`; `refused`: nothing was sent, because the endpoint isn't on the token endpoint's origin, its address was refused, or the client can't be authenticated; `failed`, with the `status` when there was an answer; `timeout`), `status`: a deleted grant's revocation (§2) |
 
 None holds an onboarding's ID, a secret, a URL's path or query, or a body; a stored client
 secret logs `secret_set` with `via` and its binding, as any secret does.
@@ -1436,12 +1458,13 @@ now, when that changes); the checks and bindings are exactly `zoeymcp secret set
 route or connector uses needs **Origins** (the https addresses it may be sent to); an OAuth
 secret (a client ID, client secret or refresh token in the policy) always takes the policy's
 binding and refuses origins. **Replace** fills in the name for a new value; **Delete** removes
-one. Names starting `oauth.` are the vault's own (a credential's live tokens): the portal
-neither writes nor deletes them (Connect does, on the Credentials page; `zoeymcp secret delete`
-can from the host). If the policy is reloaded between the summary and the passkey prompt and
-the binding moves, the vault refuses with what it finds now. A write the state volume refuses is
-kept in memory and said so, as with the CLI. Logs: `secret_set` and `secret_deleted` with `via:
-"portal"` (or `"socket"`), never the value.
+one, and revokes a refresh token as `zoeymcp secret delete` does (§2). Names starting `oauth.`
+are the vault's own (a credential's live tokens): the portal neither writes nor deletes them
+(Connect does, on the Credentials page; `zoeymcp secret delete` can from the host). If the
+policy is reloaded between the summary and the passkey prompt and the binding moves, the vault
+refuses with what it finds now. A write the state volume refuses is kept in memory and said so,
+as with the CLI. Logs: `secret_set` and `secret_deleted` with `via: "portal"` (or `"socket"`),
+never the value.
 
 **Home and health.** Home is the checklist of what needs you: every finding `zoeymcp health`
 reports (§3), errors first, then warnings, then information, each with what to do: a button
