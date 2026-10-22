@@ -217,10 +217,6 @@ def _policy(app: Any, server: str) -> tuple[ViewRemoteServer | ViewToolkitServer
     policy = gateway.servers.get(server)
     if policy is None:
         raise ReviewError(404, "unknown_server", f"no gateway server named {server!r}")
-    if not isinstance(policy, ViewRemoteServer | ViewToolkitServer):
-        raise ReviewError(
-            409, "unsupported", f"{server!r} is a {policy.kind} server; this version can't serve it"
-        )
     return policy, gateway.limits
 
 

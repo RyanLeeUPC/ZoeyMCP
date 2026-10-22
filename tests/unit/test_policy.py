@@ -1962,17 +1962,6 @@ def test_clients_without_servers_warn(example_raw: Raw) -> None:
     assert not any("reaches nothing" in f for f in listed(example_raw))
 
 
-def test_servers_this_version_does_not_serve(example_raw: Raw) -> None:
-    raw = copy.deepcopy(example_raw)
-    raw["gateway"]["servers"]["bridge1"] = {"kind": "bridge", "url": "https://bridge.example"}
-    raw["gateway"]["clients"]["agent1"]["servers"] = ["broker-read", "mail", "bridge1"]
-    found = [f for f in listed(raw) if f.startswith("warning gateway.clients.agent1")]
-    assert found == [
-        "warning gateway.clients.agent1.servers: 'bridge1' is a bridge server: "
-        "not served by this version",
-    ]
-
-
 def test_unassigned_servers_warn(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["clients"]["agent1"]["servers"] = ["broker-read", "mail"]
@@ -2194,30 +2183,70 @@ def test_a_connector_route_gets_one_error(example_raw: Raw) -> None:
 # --- gateway: servers ---------------------------------------------------------------------------
 
 
-def bridge(**fields: Any) -> Raw:
+# A.1's message (M7 design, CR-B2): the upstream is the old url's origin alone, since the vault
+# appends the server's path to it.
+NO_BRIDGE_KIND = (
+    "kind: bridge is gone: a bridge is an upstream. Write kind: remote with route: <r> and "
+    "path: <the old url's path>; route <r> has upstream: <the old url's scheme://host:port>, "
+    "callers: [gateway], stream: true, rules allowing POST, GET and DELETE on that path, and a "
+    "header credential holding the bridge's token. For plain http add allow_insecure_upstream: "
+    "true; that works only to a loopback or private address or a single-label name, otherwise "
+    "use https; a bridge under the standard launcher is upstream: "
+    "unix:/run/zoeymcp-bridge-<name>/mcp.sock instead. Move egress to <r>'s program.egress "
+    "(operations.md, 'A stdio server behind a bridge')"
+)
+
+
+def old_bridge(**fields: Any) -> Raw:
+    """A ``kind: bridge`` server as M6 wrote it."""
     return {
         "kind": "bridge",
-        "url": "https://bridge.example/mcp",
+        "url": "http://bridge.example:9000/mcp",
+        "egress": ["api.bridge.example:443"],
         "tools": {"include": ["t"], "allow": ["t"]},
         "review": {"t": "sha256:" + "1" * 64},
         **fields,
     }
 
 
+def test_kind_bridge_is_refused_with_what_to_write(example_raw: Raw) -> None:
+    """At the server's kind, with the route and the remote server to write instead (A.1)."""
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["fetch"] = old_bridge()
+    raw["gateway"]["clients"]["agent1"]["servers"].append("fetch")
+    assert schema_errors(raw) == [f"gateway.servers.fetch.kind: {NO_BRIDGE_KIND}"]
+
+
+def test_kind_bridge_without_its_url_is_refused_alike(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["fetch"] = {"kind": "bridge"}
+    assert schema_errors(raw) == [f"gateway.servers.fetch.kind: {NO_BRIDGE_KIND}"]
+
+
+def test_each_bridge_server_is_named(example_raw: Raw) -> None:
+    """One error per bridge, at each one's own path; the other servers aren't reported."""
+    raw = copy.deepcopy(example_raw)
+    servers = raw["gateway"]["servers"]
+    raw["gateway"]["servers"] = {"fetch": old_bridge(), **servers, "files": {"kind": "bridge"}}
+    assert schema_errors(raw) == [
+        f"gateway.servers.fetch.kind: {NO_BRIDGE_KIND}",
+        f"gateway.servers.files.kind: {NO_BRIDGE_KIND}",
+    ]
+
+
 @pytest.mark.parametrize("capability", ["resources", "completions", "roots"])
 def test_enable_is_an_error(example_raw: Raw, capability: str) -> None:
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
-    raw["gateway"]["servers"]["bridge1"] = bridge(enable=[capability])
-    raw["gateway"]["clients"]["agent1"]["servers"].append("bridge1")
+    raw["gateway"]["servers"]["broker-trade"]["enable"] = [capability]
     message = (
         "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
         "the gateway serves tools only"
     )
     found = errors(run(raw))
     assert found == [
-        f"gateway.servers.bridge1.enable: {message}",
         f"gateway.servers.broker-read.enable: {message}",
+        f"gateway.servers.broker-trade.enable: {message}",
     ]
 
 

@@ -58,7 +58,7 @@ def _fields(*shown_names: str, **special: Treatment) -> Mapping[str, Treatment]:
     return MappingProxyType({**found, **special})
 
 
-# The fields a remote and a bridge server share (the schema's _UpstreamServer).
+# The fields of the schema's _UpstreamServer, a remote server's base.
 _UPSTREAM: Final = (
     "tools",
     "review",
@@ -150,7 +150,6 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
         "Tools": _fields("include", "allow", "approve"),
         "_UpstreamServer": _fields(*_UPSTREAM),
         "RemoteServer": _fields(*_UPSTREAM, "kind", "route", "path"),
-        "BridgeServer": _fields(*_UPSTREAM, "kind", "url", "egress"),
         "ToolkitRule": _fields("methods", "paths", "approved"),
         "ToolkitSlot": _fields("route", "rules"),
         "ToolkitServer": _fields(

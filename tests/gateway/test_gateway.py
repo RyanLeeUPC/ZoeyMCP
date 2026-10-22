@@ -309,24 +309,21 @@ async def egress_role_answers(bearer: dict[str, str]) -> list[httpx.Response]:
 # --- G5: servers and sessions -------------------------------------------------------------------
 
 TOOLKIT = {"mail": {"kind": "toolkit", "module": "example_toolkits.mail"}}
-BRIDGE = {"bridged": {"kind": "bridge", "url": "https://bridge.example/mcp"}}
 
 
-async def test_unknown_unassigned_and_bridge_servers_are_one_404(tmp_path: Path) -> None:
+async def test_unknown_and_unassigned_servers_are_one_404(tmp_path: Path) -> None:
     fake = McpFake()
     options = {
         "include": TOOLS,
         "review": review(fake),
         "clients": ("agent1", "agent2"),
-        "servers": BRIDGE,
-        "assigned": {"agent1": [SERVER, "bridged"], "agent2": []},
+        "assigned": {"agent1": [SERVER], "agent2": []},
     }
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         unknown = post(running, server="nowhere")
         unassigned = post(running, client="agent2")
-        bridged = post(running, server="bridged")
-    assert {unknown.status_code, unassigned.status_code, bridged.status_code} == {404}
-    assert len({unknown.content, unassigned.content, bridged.content}) == 1
+    assert {unknown.status_code, unassigned.status_code} == {404}
+    assert unknown.content == unassigned.content
     assert fake.received == []
 
 

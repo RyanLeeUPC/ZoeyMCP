@@ -6,7 +6,6 @@ upstream URLs or admin settings. Client tokens appear only as their ``token_sha2
 remote server carries ``vault_path``, the vault path that reaches it (its route's prefix plus its
 path). A toolkit server carries its module, which the gateway imports, and its slots: each slot's
 route prefix, the connector's kind (never its name) and the toolkit's rules as full vault paths.
-Bridge servers carry only their kind: this version doesn't serve them.
 
 ``digest`` is the canonical digest of everything else, so it changes exactly when the view does.
 The module is pure and needs only pydantic, so the vault builds the view without the gateway's
@@ -35,7 +34,6 @@ from .schema import (
     Origin,
     Pin,
     Policy,
-    RemoteServer,
     Server,
     SlotName,
     TokenHash,
@@ -116,15 +114,7 @@ class ViewToolkitServer(_Model):
     call_timeout: Annotated[int, Field(ge=1, le=3600)] | None
 
 
-class ViewOtherServer(_Model):
-    """A server of a kind this version doesn't serve."""
-
-    kind: Literal["bridge"]
-
-
-ViewServer = Annotated[
-    ViewRemoteServer | ViewToolkitServer | ViewOtherServer, Field(discriminator="kind")
-]
+ViewServer = Annotated[ViewRemoteServer | ViewToolkitServer, Field(discriminator="kind")]
 
 
 class ViewGateway(_Model):
@@ -197,8 +187,6 @@ def _toolkit(name: str, server: ToolkitServer, policy: Policy) -> ViewToolkitSer
 def _server(name: str, server: Server, policy: Policy, prefixes: dict[str, str]) -> ViewServer:
     if isinstance(server, ToolkitServer):
         return _toolkit(name, server, policy)
-    if not isinstance(server, RemoteServer):
-        return ViewOtherServer(kind=server.kind)
     prefix = prefixes.get(server.route)
     if prefix is None:
         raise ValueError(f"gateway server {name!r} names an unknown route")

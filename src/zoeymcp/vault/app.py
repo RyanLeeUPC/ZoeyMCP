@@ -84,10 +84,8 @@ from ..common.policy.schema import (
     PlaceholderCaller,
     Policy,
     QueryCredential,
-    RemoteServer,
     Route,
     SMTPConnector,
-    ToolkitServer,
     is_secret_ref,
 )
 from ..common.policy.view import build_view, dump_view
@@ -1173,14 +1171,11 @@ class VaultApp:
         return GatewayLimits() if gateway is None else gateway.limits
 
     def _reviewable(self) -> dict[str, ServerKind]:
-        """The running view's servers a review job may be for: remote (a bridge is one once it
-        is an upstream, 18a) and toolkit (COV-1)."""
+        """The running view's servers a review job may be for: every one, remote (a bridge is
+        one) or toolkit (COV-1)."""
         gateway = self._policy.gateway
-        servers: dict[str, ServerKind] = {}
-        for name, server in ({} if gateway is None else gateway.servers).items():
-            if isinstance(server, RemoteServer | ToolkitServer):
-                servers[name] = server.kind
-        return servers
+        servers = {} if gateway is None else gateway.servers
+        return {name: server.kind for name, server in servers.items()}
 
     def _log_review_ends(self) -> None:
         """Log every job the clock ended since the last look (M.4)."""

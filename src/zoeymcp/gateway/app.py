@@ -52,7 +52,7 @@ from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewGateway, ViewRemoteServer, ViewToolkitServer
+from ..common.policy.view import ViewGateway, ViewToolkitServer
 from . import access, logs, pipeline
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
@@ -380,12 +380,7 @@ class GatewayApp:
             if withdrawn:
                 logs.event("approvals_withdrawn", count=withdrawn)
         if previous is None:
-            keep = {
-                pin
-                for server in gateway.servers.values()
-                if isinstance(server, ViewRemoteServer | ViewToolkitServer)
-                for pin in server.review.values()
-            }
+            keep = {pin for server in gateway.servers.values() for pin in server.review.values()}
             for server_name in self.pool.marks.servers():
                 keep |= {pin for _, pin in self.pool.marks.for_server(server_name)}
             self.pool.defs.prune(keep)

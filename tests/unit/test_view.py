@@ -59,7 +59,7 @@ def raw_policy() -> Raw:
                 "agent1": {"token": TOKEN_1, "servers": ["notes-read"]},
                 "agent2": {
                     "token_sha256": HASH_2,
-                    "servers": ["notes-read", "notes-write", "mail", "bridged"],
+                    "servers": ["notes-read", "notes-write", "mail"],
                     "sources": ["10.0.0.0/8", "::1"],
                 },
             },
@@ -86,11 +86,6 @@ def raw_policy() -> Raw:
                     "call_timeout": 3600,
                 },
                 "mail": {"kind": "toolkit", "module": "zoeymcp.toolkits.mail"},
-                "bridged": {
-                    "kind": "bridge",
-                    "url": "http://bridge.example:9000/mcp",
-                    "egress": ["api.bridge.example:443"],
-                },
             },
         },
     }
@@ -153,7 +148,7 @@ EXPECTED_GATEWAY: Raw = {
         },
         "agent2": {
             "token_sha256": HASH_2,
-            "servers": ["notes-read", "notes-write", "mail", "bridged"],
+            "servers": ["notes-read", "notes-write", "mail"],
             "sources": ["10.0.0.0/8", "::1"],
             "approvals": None,
         },
@@ -196,7 +191,6 @@ EXPECTED_GATEWAY: Raw = {
             "wrap_results": False,
             "call_timeout": None,
         },
-        "bridged": {"kind": "bridge"},
     },
 }
 

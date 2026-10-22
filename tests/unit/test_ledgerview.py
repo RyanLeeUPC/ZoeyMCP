@@ -220,7 +220,7 @@ def test_the_names_a_policy_knows() -> None:
             "agent1": {"token_sha256": "sha256:" + "3" * 64, "servers": ["mail"]},
             "agent3": {"token_sha256": "sha256:" + "4" * 64},
         },
-        "servers": {"mail": {"kind": "bridge", "url": "http://bridge.example:9000/mcp"}},
+        "servers": {"mail": {"kind": "remote", "route": "x"}},
     }
     found = known(Policy.model_validate({**base, "gateway": gateway}))
     assert found == {"client": frozenset({"agent1", "agent3"}), "server": frozenset({"mail"})}

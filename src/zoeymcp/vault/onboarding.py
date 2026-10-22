@@ -570,7 +570,7 @@ def secret_names(credential: str) -> tuple[str, ...]:
     return (f"{credential}-client-secret", f"{credential}-client-id", f"{credential}-refresh")
 
 
-def _servers(policy: Policy) -> Mapping[str, object]:
+def _servers(policy: Policy) -> Mapping[str, RemoteServer | ToolkitServer]:
     return {} if policy.gateway is None else policy.gateway.servers
 
 
@@ -958,8 +958,7 @@ class Listed:
 
 
 def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed, ...]:
-    """Every server a review job can be queued for (F.2), remote or toolkit, by name; a ``kind:
-    bridge`` server has no row until a bridge is a remote server (18a)."""
+    """Every server a review job can be queued for (F.2), remote or toolkit, by name."""
     routes = {route.name: route for route in policy.routes}
     clients = {} if policy.gateway is None else policy.gateway.clients
     found = []
@@ -967,8 +966,6 @@ def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed
         assigned = tuple(sorted(c for c, client in clients.items() if name in client.servers))
         if isinstance(server, ToolkitServer):
             found.append(Listed(name, "toolkit", server.tools, server.on_drift, assigned))
-            continue
-        if not isinstance(server, RemoteServer):
             continue
         route = routes.get(server.route)
         credential = None if route is None else route.credential

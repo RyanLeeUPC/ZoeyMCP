@@ -510,9 +510,6 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
             if needs_operator:
                 code = EXIT_NEEDS_OPERATOR
             continue
-        if server["kind"] != "remote":
-            lines.append(f"{name}  {server['kind']}: not served by this version")
-            continue
         reports = server.get("reports", {})
         counts = {kind: len(reports.get(kind, [])) for kind in ("drift", "missing", "invalid")}
         counts["unreviewed"] = len(reports.get("unreviewed", []))
@@ -551,7 +548,7 @@ def _toolkit_summary(name: str, server: dict[str, Any]) -> tuple[str, bool]:
 
 
 def _status_head(name: str, entry: dict[str, Any]) -> str | None:
-    """A server's first ``gateway-status`` line; ``None`` if nothing more follows it."""
+    """A server's first ``gateway-status`` line; ``None`` for a toolkit that didn't load."""
     if entry["kind"] == "toolkit":
         if entry["state"] != "loaded":
             return None
@@ -560,8 +557,6 @@ def _status_head(name: str, entry: dict[str, Any]) -> str | None:
             f"{name}  toolkit  {entry['module']}{version}  pinning {entry['pinning']}  "
             f"exposed {entry['exposed']}/{entry['included']}"
         )
-    if entry["kind"] != "remote":
-        return None
     return (
         f"{name}  remote  {','.join(entry['state'])}  era {entry['era'] or 'unknown'}  "
         f"connections {entry['connections']}  exposed {entry['exposed']}/{entry['included']}"
@@ -577,10 +572,7 @@ def status_lines(status: dict[str, Any], server: str | None) -> list[str]:
             continue
         head = _status_head(name, entry)
         if head is None:
-            if entry["kind"] == "toolkit":
-                lines.append(f"{name}  toolkit  unavailable ({entry.get('reason', 'unknown')})")
-            else:
-                lines.append(f"{name}  {entry['kind']}  unsupported")
+            lines.append(f"{name}  toolkit  unavailable ({entry.get('reason', 'unknown')})")
             continue
         lines.append(head)
         if entry["marked"]:

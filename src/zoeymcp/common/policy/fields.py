@@ -14,6 +14,8 @@ decisions M7 adds to the schema are tested without putting all of ``schema.py`` 
   client adds its parameters, so the vault keeps it byte for byte and puts its own after it; the
   endpoint may set none of the parameters the vault sets on that request (:data:`TOKEN_PARAMS`,
   :data:`AUTHORIZE_PARAMS`), nor one the credential's own params set.
+- :func:`no_bridge_kind` and :data:`NO_BRIDGE_KIND`: a server written ``kind: bridge``, refused
+  with what to write instead, since a bridge is an upstream: a remote server behind a route.
 
 Every pattern here is used with ``fullmatch``.
 """
@@ -21,7 +23,7 @@ Every pattern here is used with ``fullmatch``.
 from __future__ import annotations
 
 import re
-from collections.abc import Set
+from collections.abc import Mapping, Set
 from typing import Final
 from urllib.parse import parse_qsl
 
@@ -79,6 +81,20 @@ AUTHORIZE_PARAMS: Final = frozenset(
         "request_uri",
         "response_mode",
     }
+)
+
+# The refusal of a kind: bridge server, at its kind. The route's upstream is the old url's origin
+# alone: the vault appends the server's path to the upstream's, so an upstream carrying the old
+# /mcp would send /mcp/mcp.
+NO_BRIDGE_KIND: Final = (
+    "kind: bridge is gone: a bridge is an upstream. Write kind: remote with route: <r> and "
+    "path: <the old url's path>; route <r> has upstream: <the old url's scheme://host:port>, "
+    "callers: [gateway], stream: true, rules allowing POST, GET and DELETE on that path, and a "
+    "header credential holding the bridge's token. For plain http add allow_insecure_upstream: "
+    "true; that works only to a loopback or private address or a single-label name, otherwise "
+    "use https; a bridge under the standard launcher is upstream: "
+    "unix:/run/zoeymcp-bridge-<name>/mcp.sock instead. Move egress to <r>'s program.egress "
+    "(operations.md, 'A stdio server behind a bridge')"
 )
 
 
@@ -139,6 +155,18 @@ def endpoint_query(query: str) -> tuple[tuple[str, str], ...]:
             raise ValueError(f"the query sets {name} twice")
         seen.add(name)
     return tuple(pairs)
+
+
+def no_bridge_kind(servers: object) -> list[str]:
+    """The names of the servers written ``kind: bridge``, in the order written. Anything that
+    isn't a mapping of mappings is left to the schema's own refusals."""
+    if not isinstance(servers, Mapping):
+        return []
+    return [
+        name
+        for name, server in servers.items()
+        if isinstance(server, Mapping) and server.get("kind") == "bridge"
+    ]
 
 
 def check_endpoint_query(url: str, reserved: Set[str]) -> None:

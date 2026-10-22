@@ -21,7 +21,6 @@ from .paths import PathPatternError, parse_path_pattern
 from .schema import (
     Admin,
     BasicCredential,
-    BridgeServer,
     Gateway,
     HeaderCredential,
     OAuth2Credential,
@@ -918,7 +917,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
             else:
                 _check_mcp_route(path, server, route, server_paths[route.name], report)
         _check_stop_window(path, server, gateway.limits.call_timeout, report)
-        if isinstance(server, RemoteServer | BridgeServer):
+        if isinstance(server, RemoteServer):
             _check_upstream_server(path, server, report)
             _check_tools(
                 path, server.tools.include, server.tools.allow, server.tools.approve, report
@@ -989,7 +988,7 @@ def _check_toolkit_rule(path: str, rule: ToolkitRule, route: Route, report: _Rep
 
 
 def _check_stop_window(
-    path: str, server: RemoteServer | BridgeServer | ToolkitServer, default: int, report: _Report
+    path: str, server: RemoteServer | ToolkitServer, default: int, report: _Report
 ) -> None:
     timeout = server.call_timeout or default
     if server.tools.approve and timeout > STOP_WINDOW_CALL_TIMEOUT:
@@ -1007,13 +1006,8 @@ def _check_clients(gateway: Gateway, report: _Report) -> None:
         if not client.servers:
             report.warning(path, "no servers: this client reaches nothing")
         for server_name in client.servers:
-            server = gateway.servers.get(server_name)
-            if server is None:
+            if server_name not in gateway.servers:
                 report.error(path, f"unknown server {server_name!r}")
-            elif isinstance(server, BridgeServer):
-                report.warning(
-                    path, f"{server_name!r} is a {server.kind} server: not served by this version"
-                )
 
 
 def _check_approvals(gateway: Gateway, report: _Report) -> None:
@@ -1152,7 +1146,7 @@ def _check_mcp_route(
         )
 
 
-def _check_upstream_server(path: str, server: RemoteServer | BridgeServer, report: _Report) -> None:
+def _check_upstream_server(path: str, server: RemoteServer, report: _Report) -> None:
     if server.enable:
         report.error(
             f"{path}.enable",

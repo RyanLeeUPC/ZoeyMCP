@@ -702,24 +702,6 @@ class RemoteServer(_UpstreamServer):
     path: Annotated[str, Field(min_length=1, max_length=1024)] = "/mcp"
 
 
-class BridgeServer(_UpstreamServer):
-    kind: Literal["bridge"]
-    url: str
-    egress: list[HostPort] = []
-
-    @field_validator("url")
-    @classmethod
-    def _valid_url(cls, value: str) -> str:
-        return _check_url(value, schemes=("http", "https"), allow_path=True)
-
-    @field_validator("egress")
-    @classmethod
-    def _valid_egress(cls, value: list[str]) -> list[str]:
-        for entry in value:
-            _check_host_port(entry)
-        return value
-
-
 ToolkitMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
@@ -752,7 +734,7 @@ class ToolkitServer(_Model):
     call_timeout: Annotated[int, Field(ge=1, le=3600)] | None = None  # overrides limits
 
 
-Server = Annotated[RemoteServer | BridgeServer | ToolkitServer, Field(discriminator="kind")]
+Server = Annotated[RemoteServer | ToolkitServer, Field(discriminator="kind")]
 
 
 class GatewayLimits(_Model):
@@ -792,6 +774,25 @@ class Gateway(_Model):
     # A request without Origin is fine; one with an Origin must name one of these.
     origins: list[Origin] = []
     limits: GatewayLimits = GatewayLimits()
+
+    @field_validator("servers", mode="before")
+    @classmethod
+    def _no_bridge_kind(cls, value: object) -> object:
+        """A server written ``kind: bridge`` is refused with what to write instead: a bridge is
+        an upstream, a remote server behind a route (M7 design A.1). Reported at each one's
+        ``kind``, so every bridge entry is named."""
+        problems = [
+            InitErrorDetails(
+                type=PydanticCustomError("bridge_kind", fields.NO_BRIDGE_KIND),
+                loc=(name, "kind"),
+                input="bridge",
+            )
+            for name in fields.no_bridge_kind(value)
+        ]
+        if problems:
+            # A ValidationError raised here keeps each error's own path, under gateway.servers.
+            raise ValidationError.from_exception_data("Gateway", problems)
+        return value
 
     @field_validator("hosts")
     @classmethod

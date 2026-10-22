@@ -1724,7 +1724,7 @@ portal's session halves, the callback's query and binding cookie, and the policy
   | G2 | **One path out:** every upstream MCP byte goes through a vault route that accepts only the gateway; the hardened gateway has no other network peer |
   | G3 | **Gateway identity:** the link socket (directory, then peer uid) in the standard tier, where TCP listeners refuse gateway keys; a key of an accepted generation, under the persisted ratchet, in the hardened tier |
   | G4 | **Client identity on every request:** Host, then Origin, then the bearer token (never the query), compared by hash against every client; source pins on the direct peer only; one 401 for every reason; nothing read before it |
-  | G5 | **Scoping:** unknown, unassigned and unsupported servers are one 404; a session id is bound to (client, server) and never authenticates by itself |
+  | G5 | **Scoping:** unknown and unassigned servers are one 404; a session id is bound to (client, server) and never authenticates by itself |
   | G6 | **Exposure:** a tool is listed or called only if included, pinned, valid, matching on the connection that carries the call, and unmarked; everything else is one `-32602` |
   | G7 | **Served as pinned:** agents get exactly the projection; `icons`, `_meta`, `execution`, unknown members, `instructions` and `serverInfo` text are never forwarded |
   | G8 | **Re-check before use:** after a change signal, nothing is admitted until the listing is compared again; marks are sticky |
@@ -2204,7 +2204,6 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | M7 |
 | D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML diffs | M7 |
 | D-33 | Provider profiles for S9 and S11 | M7 |
-| D-49 | Designed log events that are never emitted (`server_unsupported`, `vault_link_refused`, `approval_unavailable`) | M7 |
 | D-122 | No how-to for configuring the operator's own egress proxy (R5) | M7, with D-31 |
 | D-136 | No mix-up defence for pasted OAuth answers | M7, with onboarding by URL |
 
@@ -2316,6 +2315,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records are M8 (D-35) |
 | D-28 | The gateway's entry path still loads vault code | Done in M5 |
 | D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | Done in M5: stated, with a test that no listener offers them; the constraint stands through M7 and M8 |
+| D-49 | Designed log events that are never emitted (`server_unsupported`, `vault_link_refused`, `approval_unavailable`) | Done in M7: `server_unsupported` struck as obsolete, since no server kind is left unserved once `kind: bridge` is gone; `vault_link_refused` struck, covered by `policy_fetch_failed` with `status: 403` and `vault_refused`; `approval_unavailable` superseded by `approval_refused` |
 | D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | Done in M5 (the docs); detection is D-130 |
 | D-63 | Network filesystems are unsupported for state | Done |
 | D-66 | The live OAuth smoke test has never been run against a real provider: run it once and record the result | Done in M5: the portless redirect works with a real provider, recorded in [manual-checks.md](manual-checks.md) |

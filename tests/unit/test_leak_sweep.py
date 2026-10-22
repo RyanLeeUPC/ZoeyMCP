@@ -832,8 +832,6 @@ VAULT_SIDE = {
     "forced query": "leak-force-value",
     "rule path": "/leak-rule-path",
     "rule param": "leak-rule-value",
-    "bridge url": "leak-bridge.example",
-    "bridge egress": "leak-egress.example",
 }
 # What the gateway does need, though it sits beside vault-side values, and why.
 GATEWAY_NEEDS = {
@@ -933,16 +931,11 @@ def secret_heavy_policy() -> Policy:
             "literal": {"token": LITERAL_TOKEN, "servers": ["srv-remote"]},
             "hashed": {
                 "token_sha256": "sha256:" + "3" * 64,
-                "servers": ["srv-remote", "srv-bridge", "srv-toolkit"],
+                "servers": ["srv-remote", "srv-toolkit"],
             },
         },
         "servers": {
             "srv-remote": {"kind": "remote", "route": "leak-route-mcp", "path": "/mcp"},
-            "srv-bridge": {
-                "kind": "bridge",
-                "url": "http://leak-bridge.example:9000/mcp",
-                "egress": ["leak-egress.example:443"],
-            },
             "srv-toolkit": {
                 "kind": "toolkit",
                 "module": "zoeymcp.toolkits.leakmodule",

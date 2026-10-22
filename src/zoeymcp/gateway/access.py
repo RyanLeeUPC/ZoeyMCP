@@ -91,9 +91,6 @@ def refusal_headers(refusal: Refusal) -> list[tuple[str, str]]:
     return headers
 
 
-# The server kinds this version serves.
-SERVED = (ViewRemoteServer, ViewToolkitServer)
-
 # --- steps 1-5: path, freshness, Host, Origin, method -----------------------------------------
 
 
@@ -239,8 +236,8 @@ def revoked(old: ViewGateway, new: ViewGateway) -> frozenset[tuple[str, str]]:
     """The (client, server) pairs a new view takes away (M3 design D.3).
 
     A pair is revoked when the client is gone, its token or source networks changed, it is no
-    longer assigned the server, or the server is no longer one this version serves. Requests in
-    flight for a revoked pair are stopped: the next request would be refused anyway.
+    longer assigned the server, or the server is gone. Requests in flight for a revoked pair are
+    stopped: the next request would be refused anyway.
     """
     gone: set[tuple[str, str]] = set()
     for name, client in old.clients.items():
@@ -251,14 +248,9 @@ def revoked(old: ViewGateway, new: ViewGateway) -> frozenset[tuple[str, str]]:
             and now.sources == client.sources
         )
         for server in client.servers:
-            if not isinstance(old.servers.get(server), SERVED):
+            if server not in old.servers:
                 continue  # never served, so nothing can be in flight
-            kept = (
-                same
-                and now is not None
-                and server in now.servers
-                and isinstance(new.servers.get(server), SERVED)
-            )
+            kept = same and now is not None and server in now.servers and server in new.servers
             if not kept:
                 gone.add((name, server))
     return frozenset(gone)
@@ -270,17 +262,15 @@ def revoked(old: ViewGateway, new: ViewGateway) -> frozenset[tuple[str, str]]:
 def server_for(
     gateway: ViewGateway, client: str, name: str
 ) -> ViewRemoteServer | ViewToolkitServer | Refusal:
-    """Step 7: the server, if it exists, is of a kind served (remote or toolkit), and is assigned
-    to the client. A toolkit server is admitted whether or not its toolkit loaded: a failed load
-    answers in the protocol, so clients retry instead of caching nothing (M4 design H.2).
+    """Step 7: the server, remote or toolkit, exists and is assigned to the client. A toolkit
+    server is admitted whether or not its toolkit loaded: a failed load answers in the protocol,
+    so clients retry instead of caching nothing (M4 design H.2).
 
-    The same 404 for all three, so a client learns nothing about servers it isn't given.
+    The same 404 for both, so a client learns nothing about servers it isn't given.
     """
     server = gateway.servers.get(name)
     if server is None or name not in gateway.clients[client].servers:
         return Refusal(404, "server not assigned")
-    if not isinstance(server, SERVED):
-        return Refusal(404, "server kind not served")
     return server
 
 

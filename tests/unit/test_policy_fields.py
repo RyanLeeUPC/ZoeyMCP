@@ -4,6 +4,9 @@ An endpoint's query: RFC 3986 query characters without ``$``, ``;`` or ``'``, a 
 1 to 16 parameters, each name as written, none twice, and no name the vault reserves on that
 request. The schema-level rows (both URL fields, the length cap, the other URL fields) are in
 ``test_policy.py``.
+
+A server written ``kind: bridge``: listed by name, so the schema refuses each at its ``kind``
+(M7 design A.1). The message itself is asserted whole in ``test_policy.py``.
 """
 
 from __future__ import annotations
@@ -27,7 +30,9 @@ from zoeymcp.common.policy.fields import (
     is_mail_address,
     is_numeric_label,
     is_squid_acl_name,
+    no_bridge_kind,
 )
+from zoeymcp.common.policy.schema import RemoteServer
 
 # Every punctuation character a query may hold, once.
 PUNCTUATION = "a=-._~!()*+,:@/?&b=%2F"
@@ -307,3 +312,42 @@ def test_a_name_idna_refuses_keeps_its_form() -> None:
     assert client_host("☃.example") == "☃.example"
     with pytest.raises(httpx.InvalidURL):
         _ = httpx.URL("https://☃.example/").raw_host
+
+
+# --- no bridge kind (M7 design A.1) --------------------------------------------------------------
+
+
+def test_every_bridge_server_is_listed_in_the_order_written() -> None:
+    servers = {
+        "fetch": {"kind": "bridge", "url": "http://bridge.example:9000/mcp"},
+        "notes": {"kind": "remote", "route": "notes"},
+        "kit": {"kind": "toolkit", "module": "zoeymcp.toolkits.mail"},
+        "a-bridge": {"kind": "bridge"},
+    }
+    assert no_bridge_kind(servers) == ["fetch", "a-bridge"]
+
+
+def test_servers_without_a_bridge_list_nothing() -> None:
+    assert no_bridge_kind({}) == []
+    assert no_bridge_kind({"notes": {"kind": "remote", "route": "notes"}, "x": {}}) == []
+
+
+@pytest.mark.parametrize("kind", ["Bridge", "bridges", " bridge", "remote", None, ["bridge"]])
+def test_only_the_kind_bridge_is_listed(kind: object) -> None:
+    assert no_bridge_kind({"s": {"kind": kind}}) == []
+
+
+@pytest.mark.parametrize(
+    "servers",
+    [
+        None,
+        "bridge",
+        [{"kind": "bridge"}],
+        {"s": "bridge"},
+        {"s": None},
+        {"s": [("kind", "bridge")]},
+        {"s": RemoteServer(kind="remote", route="notes")},
+    ],
+)
+def test_what_isnt_a_mapping_of_mappings_is_left_to_the_schema(servers: object) -> None:
+    assert no_bridge_kind(servers) == []

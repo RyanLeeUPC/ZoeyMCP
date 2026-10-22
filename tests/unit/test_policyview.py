@@ -140,11 +140,7 @@ def document() -> dict[str, Any]:
             },
             "servers": {
                 "remote": {"kind": "remote", "route": "api", "review": {"t": "sha256:" + "5" * 64}},
-                "bridge": {
-                    "kind": "bridge",
-                    "url": "http://bridge.example:9000/mcp",
-                    "egress": ["api.example:443"],
-                },
+                "bridge": {"kind": "remote", "route": "api", "path": "/bridge/mcp"},
                 "kit": {
                     "kind": "toolkit",
                     "module": "zoeymcp.toolkits.example",
@@ -393,7 +389,7 @@ def test_everything_else_is_shown_as_written_in_the_schemas_order() -> None:
     ]
     servers = policy["gateway"]["servers"]
     assert servers["remote"]["review"] == {"t": "sha256:" + "5" * 64}
-    assert servers["bridge"]["egress"] == ["api.example:443"]
+    assert servers["bridge"]["path"] == "/bridge/mcp"
     assert servers["kit"]["slots"]["mail"]["rules"] == [
         {"methods": ["POST"], "paths": ["/send"], "approved": False}
     ]

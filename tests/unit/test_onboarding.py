@@ -28,7 +28,6 @@ from zoeymcp.common.policy.change import (
 )
 from zoeymcp.common.policy.findings import Finding
 from zoeymcp.common.policy.schema import (
-    BridgeServer,
     HeaderCredential,
     OAuth2Credential,
     RemoteServer,
@@ -1551,16 +1550,13 @@ def test_a_rows_state() -> None:
     assert (bare.clients, bare.credential, bare.resource, bare.held) == ((), None, None, None)
 
 
-def test_rows_without_an_oauth2_credential_or_a_bridge() -> None:
+def test_rows_without_an_oauth2_credential() -> None:
     """A remote server on a route with another kind of credential, or none, has no credential
-    to connect; a ``kind: bridge`` server has no row until 18a; a server whose route is gone
-    is still listed."""
+    to connect; a server whose route is gone is still listed."""
     stats = RemoteServer.model_validate({**NOTES_SERVER, "route": "stats"})
     unrouted = RemoteServer.model_validate({**NOTES_SERVER, "route": "gone"})
-    bridge = BridgeServer.model_validate({"kind": "bridge", "url": "http://bridge.example/mcp"})
-    policy = with_servers(committed(), a=stats, b=bridge, c=unrouted)
+    policy = with_servers(committed(), a=stats, c=unrouted)
     found = {s.name: s for s in listed_servers(policy, set())}
-    assert "b" not in found
     assert (found["a"].credential, found["a"].held, found["a"].state) == (
         None,
         None,
@@ -1568,7 +1564,6 @@ def test_rows_without_an_oauth2_credential_or_a_bridge() -> None:
     )
     assert (found["c"].credential, found["c"].held) == (None, None)
     assert listed_server(policy, "a") == found["a"]
-    assert listed_server(policy, "b") is None
     assert listed_server(policy, "absent") is None
 
 

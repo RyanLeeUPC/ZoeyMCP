@@ -34,7 +34,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..common import canonical, control
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
+from ..common.policy.view import ViewToolkitServer
 from . import logs, review
 from .app import GatewayApp
 from .defstore import DefinitionStore
@@ -163,9 +163,6 @@ def status(app: GatewayApp) -> dict[str, Any]:
         for name, server in snapshot.view.gateway.servers.items():
             if isinstance(server, ViewToolkitServer):
                 servers[name] = _toolkit_status(app, name, server)
-                continue
-            if not isinstance(server, ViewRemoteServer):
-                servers[name] = {"kind": server.kind, "state": "unsupported"}
                 continue
             connections = [c for c in app.pool.connections() if c.server == name]
             phases = sorted({c.state.phase.value for c in connections})

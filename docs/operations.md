@@ -547,6 +547,16 @@ internationalized name in its `xn--` form, as the hint writes it), and the port 
 80 for http when the URL has none). With `egress_proxy` set nothing changes: the proxy resolves the
 names and its allowlist judges the address (§28).
 
+**Upgrading to M7: no bridge kind.** A gateway server written `kind: bridge` never ran (no version
+served one; `check` warned "not served by this version" on a client assigned one); it now stops the
+policy loading, at start and on reload, with an error at `gateway.servers.<name>.kind` that says
+what to write instead. A bridge is an upstream: a `kind: remote` server behind a vault route, the
+same as any other. The old `url` splits in two: its scheme, host and port become the route's
+`upstream` and its path the server's `path` (the vault joins the two, so an upstream that kept
+`/mcp` would send `/mcp/mcp`). The route has `callers: [gateway]`, `stream: true`, rules allowing
+`POST`, `GET` and `DELETE` on that path, and a `header` credential holding the bridge's token; the
+old `egress` list moves to the route's `program.egress`.
+
 ## 8. Provider notes
 
 **Any provider.** A `token_url` or `authorize_url` may carry a query, such as a tenant or a
@@ -736,8 +746,8 @@ agent that reads a JSON MCP config, typically:
 7. **Reload** again. Agents see the tools at once (their clients are told the list changed).
 
 `review` exits 0 when every included tool matches its pin and nothing is marked, 1 when
-something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown or
-not a remote one, the vault refused, the upstream failed or a listing limit was hit) or an option
+something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown, the
+vault refused, the upstream failed or a listing limit was hit) or an option
 doesn't fit what it found. The message says which. `--format json` prints the same, with the
 snippet as a list of lines.
 
@@ -1190,7 +1200,8 @@ shows definitions or token hashes. `--format json` for both.
 
 For a suspected leak, run `zoeymcp gateway-key --retire-previous` right after step 1. The gateway
 is then down until step 3. If step 3 misses the 5 minutes, the gateway logs
-`policy_fetch_failed` with `status: 403`, and answers 503 until it has the new key.
+`policy_fetch_failed` with `status: 403` (and `vault_refused` with `status: 403` for a call in
+flight; there is no other event for a refused key), and answers 503 until it has the new key.
 
 A bump is written to `/state/gateway-key.json` before the new policy is used, and a vault restart
 doesn't revive a retired key. A generation lower than the current one is refused. The standard
@@ -1292,10 +1303,10 @@ session idle timeout takes a gateway restart (`limits_change_needs_restart`).
 | An agent sees | Likely cause | Look at |
 | --- | --- | --- |
 | 401 | a wrong or missing token, a source pin | `auth_refused` with `reason` `no_token`, `bad_token` or `source` |
-| 404 | the server isn't assigned to the client, doesn't exist, or isn't remote; another client's session | the policy; `auth_refused` with `reason` `unassigned` or `session` |
+| 404 | the server isn't assigned to the client or doesn't exist; another client's session | the policy; `auth_refused` with `reason` `unassigned` or `session` |
 | 421 / 403 | `Host` not in `gateway.hosts` / `Origin` not in `gateway.origins` | `auth_refused` with `reason` `host` or `origin` |
 | 429 | too many requests, streams or sessions for the client | `auth_refused` with `reason` `limit`; `gateway.limits` |
-| 503 | no view yet, or a stale one | `policy_stale`; `policy_fetch_failed` (`status: 403` is a refused gateway key) |
+| 503 | no view yet, or a stale one | `policy_stale`; `policy_fetch_failed` (`status: 403` is a refused gateway key, the one sign of it besides `vault_refused`) |
 | `-32602 Unknown tool` | not included, unpinned, drifted, marked or invalid | `zoeymcp review <server>` |
 | `-32603 upstream unavailable (ref ...)` | the listing failed, the vault refused (its `code` says why, e.g. `credential_unavailable`), or the upstream is down | grep the ref; `server_list_failed`, `vault_refused` |
 | `isError` with `(ref ...)` | an upstream error, a timeout, a lost connection, a result refused | grep the ref |

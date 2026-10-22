@@ -432,10 +432,9 @@ REMOTE = {
 
 
 def test_the_summary() -> None:
-    lines, code = view.summary(status(notes=REMOTE, bridged={"kind": "bridge"}))
+    lines, code = view.summary(status(notes=REMOTE))
     assert code == 0
     assert lines == [
-        "bridged  bridge: not served by this version",
         "notes  modern  exposed 2/2  drift 0  marked 0  missing 0  unreviewed 1  invalid 0  "
         "listed 12 s ago",
     ]
@@ -455,10 +454,9 @@ def test_the_summary() -> None:
 
 def test_status_lines() -> None:
     marked = {**REMOTE, "marked": ["a"], "reports": {"drift": ["a"], "missing": []}}
-    lines = view.status_lines(status(notes=marked, bridged={"kind": "bridge"}), None)
+    lines = view.status_lines(status(notes=marked), None)
     assert lines == [
         f"view sha256:{'0' * 64}  fresh",
-        "bridged  bridge  unsupported",
         "notes  remote  ready  era modern  connections 1  exposed 2/2",
         "  marked: a",
         "  drift: a",

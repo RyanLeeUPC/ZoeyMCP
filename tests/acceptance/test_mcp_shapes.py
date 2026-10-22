@@ -240,7 +240,7 @@ async def test_s10_onboarding_with_review(tmp_path: Path, ca: ProviderCA) -> Non
         assert sorted(added) == ["add", "echo"]
         gateway.reload({"echo": "allow", "add": "allow"}, added)
         await until(lambda: running.app.policy.snapshot is not None and "echo" in (
-            running.app.policy.snapshot.view.gateway.servers[SERVER].tools.include  # type: ignore[union-attr]
+            running.app.policy.snapshot.view.gateway.servers[SERVER].tools.include
         ))  # fmt: skip
         async with agent(running) as client:
             listed = sorted(tool.name for tool in (await client.list_tools()).tools)
