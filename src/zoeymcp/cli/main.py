@@ -216,6 +216,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="FD",
         help="read HUP and TERM lines from this pipe; its end stops the vault (the launcher's)",
     )
+    vault.add_argument(
+        "--bridge",
+        action="append",
+        default=[],
+        metavar="NAME=UID",
+        help=(
+            "a bridge the launcher started (repeatable; Linux): a unix: route to it is reached "
+            "on its socket, only when that uid listens there"
+        ),
+    )
 
     gateway = commands.add_parser(
         "gateway",
@@ -761,6 +771,7 @@ def _cmd_vault(args: argparse.Namespace, out: TextIO) -> int:
             gateway_socket=Path(args.gateway_socket) if args.gateway_socket else None,
             gateway_uid=args.gateway_uid,
             control_fd=args.control_fd,
+            bridges=args.bridge,
         )
     except StartupError as exc:
         out.write(f"zoeymcp vault: {exc}\n")

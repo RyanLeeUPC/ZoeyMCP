@@ -136,6 +136,28 @@ def test_static_secrets_bind_to_every_upstream_that_uses_them(cred: Raw) -> None
     }
 
 
+def test_a_header_secret_on_a_unix_route_binds_to_its_socket(tmp_path: Path) -> None:
+    """M7 design A.2's unix: origin: a bridge's token binds to the socket as written, so it is
+    injected on a route to that socket and refused on another bridge's; a secret used on both
+    binds to both, as for any two upstreams."""
+    fetch = "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+    files = "unix:/run/zoeymcp-bridge-files/mcp.sock"
+    p = policy(
+        {"fetch": header("store:fetch-token"), "files": header("store:files-token")},
+        [("fetch", fetch), ("files", files)],
+    )
+    binding = derive_binding(p, "fetch-token")
+    assert binding == {"origins": [fetch]}
+    store = SecretStore(tmp_path, KeySet.from_master(bytes(range(32))))
+    store.load()
+    store.put("fetch-token", "t-fetch", binding)
+    assert store.get_for_origin("fetch-token", fetch).reveal() == "t-fetch"
+    with pytest.raises(SecretUnavailable):
+        store.get_for_origin("fetch-token", files)
+    shared = policy({"a": header("store:t"), "b": header("store:t")}, [("a", fetch), ("b", files)])
+    assert derive_binding(shared, "t") == {"origins": [fetch, files]}
+
+
 def test_smtp_password_binds_to_the_connector() -> None:
     assert derive_binding(example_policy(), "mail-pass") == {
         "smtp": {

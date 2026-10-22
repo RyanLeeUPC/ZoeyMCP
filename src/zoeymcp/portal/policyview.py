@@ -134,7 +134,11 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
             "rules",
             "stream",
             "allow_insecure_upstream",
+            "program",
         ),
+        # A route's program (M7 design A.1): configuration, no secret. A unix: upstream shows as
+        # written above, as any upstream does.
+        "RouteProgram": _fields("egress", "egress_private", "holds_secret"),
         "ClientApprovals": _fields(
             "attended", "timeout", "budget_chars", "confirm_code", "renders"
         ),

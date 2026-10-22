@@ -4,7 +4,10 @@ Every row of both tables, both sides of each boundary, every mapped, compatible,
 NAT64 form of three private addresses, the host-name rules, the egress-list key, the Squid
 entries (against a model of how Squid holds addresses: IPv4 as IPv4-mapped), and two properties:
 no address the standard library calls non-global is ever allowed, and the Squid rule refuses an
-IPv4 address, or its mapped form, exactly when the guard does.
+IPv4 address, or its mapped form, exactly when the guard does. From step 18b, a local MCP
+route's rules (``local_target``, ``local_only``) on both sides of each ``LOCAL_*`` boundary, with
+a property that ``local_only`` never allows a global address, and a bridge socket's peer rule
+(``unix_peer``).
 """
 
 from __future__ import annotations
@@ -20,13 +23,18 @@ from zoeymcp.common.netguard import (
     DENIED_V4,
     DENIED_V6,
     INTERNAL_SUFFIXES,
+    LOCAL_V4,
+    LOCAL_V6,
     AddressVerdict,
     HostVerdict,
     addresses_allowed,
     classify,
     entry_key,
     listed,
+    local_only,
+    local_target,
     squid_private_dst,
+    unix_peer,
     untrusted_host,
 )
 from zoeymcp.common.policy import fields, schema
@@ -524,3 +532,161 @@ def test_squid_and_the_guard_agree_on_every_ipv4_address(value: int) -> None:
 def test_squid_entries_are_networks_as_written() -> None:
     for entry in squid_private_dst():
         assert str(ipaddress.ip_network(entry)) == entry  # host bits clear, the short form
+
+
+# --- local MCP routes: local_target and local_only (M7 design B.1, step 18b) ---------------------
+
+
+def test_the_local_tables_are_pinned() -> None:
+    assert LOCAL_V4 == ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    assert LOCAL_V6 == ("::1/128", "fc00::/7")
+    # Each is a row of the denied tables: a local address is never a global one.
+    assert set(LOCAL_V4) <= set(DENIED_V4)
+    assert set(LOCAL_V6) <= set(DENIED_V6)
+
+
+# Both sides of each LOCAL_* boundary, and the denied addresses next to them.
+LOCAL = [
+    "127.0.0.0",
+    "127.0.0.1",
+    "127.255.255.255",
+    "10.0.0.0",
+    "10.255.255.255",
+    "172.16.0.0",
+    "172.31.255.255",
+    "192.168.0.0",
+    "192.168.255.255",
+    "::1",
+    "fc00::",
+    "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    "::ffff:10.0.0.1",  # mapped: by its IPv4 address
+    "::ffff:127.0.0.1",
+]
+# The reason is the address's class (None: whatever classify says, which for these rows leans on
+# the standard library's is_global), or not_local for a loopback or private one.
+NOT_LOCAL: list[tuple[str, str | None]] = [
+    ("126.255.255.255", "global"),
+    ("128.0.0.0", "global"),
+    ("9.255.255.255", "global"),
+    ("11.0.0.0", "global"),
+    ("172.15.255.255", "global"),
+    ("172.32.0.0", "global"),
+    ("192.167.255.255", "global"),
+    ("192.169.0.0", "global"),
+    ("8.8.8.8", "global"),
+    ("169.254.169.254", "link_local"),  # cloud metadata
+    ("100.64.0.1", "cgnat"),
+    ("0.0.0.1", "unspecified"),
+    ("224.0.0.1", "multicast"),
+    ("192.0.2.1", "documentation"),
+    ("::ffff:8.8.8.8", None),
+    ("::ffff:169.254.169.254", "link_local"),
+    ("fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", None),
+    ("fe00::", None),
+    ("::", "unspecified"),
+    ("::2", None),
+    ("fe80::1", "link_local"),
+    ("fec0::1", "not_local"),  # private to the denied table, never a local route's
+    ("::10.0.0.1", "not_local"),  # IPv4-compatible: only the mapped form counts
+    ("::127.0.0.1", "not_local"),  # likewise, for loopback
+    ("64:ff9b::a00:1", "not_local"),  # NAT64 of 10.0.0.1
+    ("2002:a00:1::", "embedded"),  # 6to4 of 10.0.0.1
+    ("2001::1", "embedded"),  # Teredo
+    ("2001:4860:4860::8888", None),
+]
+
+
+@pytest.mark.parametrize("address", LOCAL)
+def test_a_local_address(address: str) -> None:
+    assert local_only([address]) == AddressVerdict(allowed=True, reason="local", address=address)
+    assert local_target(address)
+    host = f"[{address}]" if ":" in address else address
+    assert local_target(host)
+
+
+@pytest.mark.parametrize(("address", "reason"), NOT_LOCAL)
+def test_an_address_outside_the_local_tables(address: str, reason: str | None) -> None:
+    expected = reason or classify(address)
+    assert expected not in ("loopback", "private")
+    assert local_only([address]) == AddressVerdict(allowed=False, reason=expected, address=address)
+    assert not local_target(address)
+
+
+def test_local_only_refuses_the_whole_name() -> None:
+    """Every address must be local: one global, link-local or CGNAT answer refuses them all,
+    wherever it comes, and the verdict names it; the first address is the one to dial."""
+    assert local_only(["10.0.0.1", "8.8.8.8"]) == AddressVerdict(False, "global", "8.8.8.8")
+    assert local_only(["169.254.169.254", "10.0.0.1"]) == AddressVerdict(
+        False, "link_local", "169.254.169.254"
+    )
+    assert local_only(["10.0.0.1", "127.0.0.1", "::1"]) == AddressVerdict(True, "local", "10.0.0.1")
+    assert local_only([]) == AddressVerdict(False, "no_address", None)
+    for bad in ("not-an-address", "fe80::1%eth0", "::1%lo", "10.0.0.1/8", ""):
+        assert local_only(["10.0.0.1", bad]) == AddressVerdict(False, "unparsable", bad)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["localhost", "LOCALHOST", "bridge", "bridge-fetch-mcp", "fetch", "b2", "a" * 63],
+)
+def test_a_single_label_name_is_a_local_target(host: str) -> None:
+    assert local_target(host)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "bridge.fetch.example",  # two labels, whatever they resolve to
+        "x.localhost",
+        "localhost.",  # a trailing dot is a name of its own
+        "bridge.",
+        "a" * 64,  # longer than a label
+        "-bridge",
+        "bridge-",
+        "bri_dge",
+        "",
+        "2130706433",  # 127.0.0.1, spelled as a number
+        "0x7f000001",
+        "0177",
+        "0x",
+        "[localhost]",
+        "fe80::1%eth0",
+        "::1%lo",
+        "bücher",
+    ],
+)
+def test_anything_else_is_not_a_local_target(host: str) -> None:
+    assert not local_target(host)
+
+
+@settings(max_examples=50, deadline=None)
+@given(st.lists(ADDRESSES, min_size=1, max_size=4))
+def test_local_only_is_false_whenever_any_address_is_global(answers: list[str]) -> None:
+    verdict = local_only(answers)
+    if any(ipaddress.ip_address(a).is_global for a in answers):
+        assert not verdict.allowed
+    if verdict.allowed:
+        assert all(classify(a) in ("loopback", "private") for a in answers)
+        assert verdict.address == answers[0]
+
+
+# --- a bridge's socket: unix_peer (M7 design B.1, Q46) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("peer", "expected", "verdict"),
+    [
+        (10100, 10100, AddressVerdict(True, "bridge_uid", None)),
+        (10107, 10107, AddressVerdict(True, "bridge_uid", None)),
+        (1, 1, AddressVerdict(True, "bridge_uid", None)),
+        (10101, 10100, AddressVerdict(False, "peer_uid", None)),  # another bridge's uid
+        (10001, 10100, AddressVerdict(False, "peer_uid", None)),  # the vault's own
+        (0, 10100, AddressVerdict(False, "peer_uid", None)),
+        (0, 0, AddressVerdict(False, "peer_uid", None)),  # root never, even if named
+        (None, 10100, AddressVerdict(False, "peer_uid", None)),  # the kernel didn't say
+        (10100, None, AddressVerdict(False, "unknown_socket", None)),  # a name not started
+        (None, None, AddressVerdict(False, "unknown_socket", None)),
+    ],
+)
+def test_unix_peer(peer: int | None, expected: int | None, verdict: AddressVerdict) -> None:
+    assert unix_peer(peer, expected) == verdict

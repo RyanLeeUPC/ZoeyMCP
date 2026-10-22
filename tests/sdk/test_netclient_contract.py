@@ -7,13 +7,23 @@ for the certificate check, so the guard may connect to an address; the pool's ``
 the one used, and httpx's transport sends through the pool it holds as ``_pool``. 46: with
 ``proxy=`` httpx sends ``CONNECT host:port`` by name and resolves nothing itself;
 ``trust_env=False`` ignores the proxy variables; a CONNECT the proxy refuses is an
-``httpx.ProxyError`` carrying the status only in its text.
+``httpx.ProxyError`` carrying the status only in its text. 45's socket half (step 18b, Q46, Linux
+only): a pool built with ``uds=`` calls the backend's ``connect_unix_socket`` with that path, and
+the stream it returns gives the connected socket, from which ``SO_PEERCRED`` reads the listener's
+uid; uvicorn's ``uds=`` leaves the socket ``0666``, so the directory is the gate.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
+import shutil
 import socket
 import ssl
+import stat
+import struct
+import sys
+import tempfile
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -23,6 +33,7 @@ import certifi
 import httpcore
 import httpx
 import pytest
+import uvicorn
 
 from tests.acceptance.tls import ProviderCA, issue_cert, make_ca
 from tests.fakes.connect_proxy import ConnectProxy, ProxySwitch, serve_proxy
@@ -236,3 +247,104 @@ async def test_trust_env_false_ignores_the_proxy_variables(
     assert len(seen.heads) == 1
     # The control: with trust_env the same variables send it through the proxy.
     assert proxy.targets == ([f"localhost:{port}"] if trust_env else [])
+
+
+# --- 45, the socket half (step 18b, Q46; Linux): uds= reaches the backend; the peer's uid ---------
+
+LINUX = pytest.mark.skipif(
+    not hasattr(socket, "SO_PEERCRED"), reason="a socket's peer uid needs Linux (SO_PEERCRED)"
+)
+
+
+class RecordingUnixBackend(httpcore.AsyncNetworkBackend):
+    """Records what ``connect_unix_socket`` is asked for, and what the stream it returned gives:
+    the connected socket, and the peer's uid read from it while it is open, as
+    ``GuardedBackend`` reads it (the pool closes the stream once the response is read)."""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+        self.sockets: list[object] = []
+        self.uids: list[int] = []
+        self._backend = httpcore.AnyIOBackend()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        self.paths.append(path)
+        stream = await self._backend.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options
+        )
+        sock = stream.get_extra_info("socket")
+        self.sockets.append(sock)
+        if sys.platform != "win32" and isinstance(sock, socket.socket):
+            raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("=iII"))
+            self.uids.append(struct.unpack("=iII", raw)[1])
+        return stream
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+@pytest.fixture
+def short_dir() -> Iterator[Path]:
+    """A directory with a short path: a Unix socket's path holds at most 107 bytes."""
+    directory = Path(tempfile.mkdtemp(prefix="zc-"))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+async def _ok(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    await reader.readuntil(b"\r\n\r\n")
+    writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+    await writer.drain()
+    writer.close()
+
+
+@LINUX
+async def test_a_uds_pool_connects_through_the_backend_and_the_stream_holds_the_socket(
+    short_dir: Path,
+) -> None:
+    """vault/netclient.py's socket client: the pool calls the backend's connect_unix_socket
+    with its path, and the stream it returns gives the connected socket, from which
+    SO_PEERCRED reads the listener's uid (here the test's own)."""
+    if sys.platform == "win32":
+        raise RuntimeError("a Unix socket listener needs Linux here")
+    path = str(short_dir / "mcp.sock")
+    backend = RecordingUnixBackend()
+    with anyio.fail_after(10):
+        async with (
+            await asyncio.start_unix_server(_ok, path=path),
+            httpcore.AsyncConnectionPool(uds=path, network_backend=backend) as pool,
+        ):
+            response = await pool.request("GET", "http://bridge.invalid/mcp")
+    assert response.status == 200
+    assert backend.paths == [path]
+    [sock] = backend.sockets
+    assert isinstance(sock, socket.socket)
+    assert backend.uids == [os.getuid()]
+
+
+@LINUX
+async def test_uvicorns_uds_leaves_the_socket_0666(short_dir: Path) -> None:
+    """The directory is the gate, not the socket's mode (C.10's 0750 directory, Q46)."""
+    path = short_dir / "mcp.sock"
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        raise AssertionError("never called")
+
+    config = uvicorn.Config(app, uds=str(path), lifespan="off", log_config=None)
+    config.load()
+    server = uvicorn.Server(config)
+    server.lifespan = config.lifespan_class(config)
+    with anyio.fail_after(10):
+        await server.startup()
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        finally:
+            await server.shutdown()
+    assert mode == 0o666

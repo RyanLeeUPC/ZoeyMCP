@@ -45,6 +45,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..common.canonical import dumps_canonical
+from ..common.policy import fields
 from .keys import KeySet
 
 STORE_FORMAT = 1
@@ -97,7 +98,12 @@ class Secret:
 
 
 def canonical_origin(url: str) -> str:
-    """``scheme://host:port`` with a lowercase host and an explicit port."""
+    """``scheme://host:port`` with a lowercase host and an explicit port. A ``unix:`` upstream
+    (a standard-tier bridge's socket, M7 design A.2) is its own origin, compared as written: the
+    schema takes it in one fixed form only, so a header secret bound to it is injected only on a
+    route to that socket."""
+    if url.startswith(fields.UNIX_PREFIX):
+        return fields.unix_upstream(url)
     parts = urlsplit(url)
     if not parts.scheme or not parts.hostname:
         raise ValueError(f"not an absolute URL: {url!r}")

@@ -27,13 +27,15 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import ValidationError
 from starlette.types import Receive, Scope, Send
 
 from ..common import egresslist, netguard
-from ..common.policy.check import secret_references
+from ..common.policy.check import local_mcp_routes, secret_references
+from ..common.policy.fields import UNIX_PREFIX
 from ..common.policy.schema import (
     BasicCredential,
     HeaderCredential,
@@ -51,6 +53,7 @@ from ..vault.app import GATEWAY_HEADER, REPLAYED_HEADER, VaultApp
 from ..vault.bindings import BindingError, derive_binding
 from ..vault.connectors.smtp import SendResult, SmtpConnectors
 from ..vault.keys import KeySet, generate_master_key
+from ..vault.netclient import BRIDGE_BASE
 from ..vault.store import SecretStore
 from .cases import Case, CaseFile, PlaceholderPresent
 from .echo import EchoUpstream, Received, TokenClient, TokenEcho
@@ -140,6 +143,8 @@ class Rig:
         allowed = {
             netguard.entry_key(d.host, d.port) for d in egresslist.derive(policy)[egresslist.VAULT]
         }
+        # A local MCP route goes direct, never through a proxy, so the list rightly leaves it out.
+        allowed |= _local_destinations(policy)
         reached: list[str] = []
 
         async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
@@ -157,12 +162,17 @@ class Rig:
         connectors = SmtpConnectors(
             Path(journals.name), self.keys, transport=recorder, message_id=recorder.message_id
         )
+        # The echo client for every role, a local MCP route's and a bridge's socket included, so
+        # a case on one reaches the echo server like any other: no --bridge, no socket, no TCP
+        # connection, and a dummy token never leaves the process (M7 design B.2).
         app = VaultApp(
             policy,
             self.store,
             self.keys,
             client=client,
             token_client=client,
+            local_client=client,
+            socket_clients=lambda _name: client,
             environ=self.environ,
             connectors=connectors,
         )
@@ -311,6 +321,20 @@ class Rig:
     def _any_secret_in(self, got: Received, tokens: TokenEcho) -> bool:
         haystack = got.path + repr(got.query) + repr(got.headers) + got.body.decode("latin-1")
         return any(value in haystack for value in [*self.values.values(), *tokens.issued])
+
+
+def _local_destinations(policy: Policy) -> set[str]:
+    """Where a case on a local MCP route connects (M7 design B.2): its plain-http upstream, or
+    the request base every bridge's socket shares."""
+    local = local_mcp_routes(policy)
+    found: set[str] = set()
+    for route in policy.routes:
+        if route.name not in local or route.upstream is None:
+            continue
+        url = BRIDGE_BASE if route.upstream.startswith(UNIX_PREFIX) else route.upstream
+        parts = urlsplit(url)
+        found.add(netguard.entry_key(parts.hostname or "", parts.port or _DEFAULT_PORTS["http"]))
+    return found
 
 
 def _destination(scope: Scope) -> str:

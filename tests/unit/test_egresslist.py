@@ -441,3 +441,153 @@ def test_compare_uses_the_acl_names() -> None:
     differences = compare(lists, text, "squid", acl_names={"vault": "net_v"})
     assert differences
     assert all("zoeymcp_src_vault" in d or "net_v" in d for d in differences)
+
+
+# --- route programs and local MCP routes (M7 design I.2, step 18b) -------------------------------
+
+
+def bridged_raw() -> Raw:
+    """policy_raw with three bridges a gateway server names: a hardened one (a container alias
+    over plain http, with a program), a standard one (a socket, with a program the role can't
+    confine) and a remote one (https, with a program); and a program on a route no server
+    names, whose own upstream stays the vault's."""
+    raw = policy_raw()
+    raw["credentials"].update(
+        {name: {"kind": "header", "secret": f"store:{name}"} for name in ("t1", "t2", "t3")}
+    )
+    mcp = [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}]
+
+    def bridge(name: str, upstream: str, credential: str, program: Raw, **fields: Any) -> Raw:
+        return {
+            **route(name, upstream, credential=credential, program=program, **fields),
+            "callers": ["gateway"],
+            "stream": True,
+            "rules": copy.deepcopy(mcp),
+        }
+
+    raw["routes"] += [
+        bridge(
+            "bridge-fetch",
+            "http://bridge-fetch-mcp:9000",
+            "t1",
+            {
+                # Listed twice: one destination. The private entries are the program's own.
+                "egress": ["files.lan:8443", "docs.example.org:443", "[fd00::7]:443"] * 2,
+                "egress_private": ["files.lan:8443", "[fd00::7]:443"],
+            },
+            allow_insecure_upstream=True,
+        ),
+        bridge(
+            "files", "unix:/run/zoeymcp-bridge-files/mcp.sock", "t2", {"egress": ["a.example:443"]}
+        ),
+        bridge("remote", "https://fetch.bridges.example", "t3", {"egress": ["b.example:443"]}),
+        route("scraper", "https://scraper.example", program={"egress": ["c.example:80"]}),
+    ]
+    raw["gateway"] = {
+        "servers": {
+            name: {"kind": "remote", "route": name} for name in ("bridge-fetch", "files", "remote")
+        }
+    }
+    return raw
+
+
+BRIDGED: Lists = {
+    "bridge-fetch": (
+        dest("docs.example.org", 443, "program"),
+        dest("fd00::7", 443, "program", private=True),
+        dest("files.lan", 8443, "program", private=True),
+    ),
+    "files": (dest("a.example", 443, "program"),),
+    "remote": (dest("b.example", 443, "program"),),
+    "scraper": (dest("c.example", 80, "program"),),
+}
+
+
+def test_each_route_program_is_a_source_of_its_own() -> None:
+    """Named by its route: each entry once, private when the program's own egress_private
+    lists it; in whatever placement, since the role confines only the hardened one (check
+    warns about the others). Sorted by source, the vault's among them."""
+    lists = derive(parse(bridged_raw()))
+    assert {source: found for source, found in lists.items() if source != "vault"} == BRIDGED
+    assert list(lists) == ["bridge-fetch", "files", "remote", "scraper", "vault"]
+
+
+def test_a_local_mcp_route_is_left_out_of_the_vaults_list() -> None:
+    """B.2: the vault reaches a bridge on its local or socket client, never through a proxy,
+    and a socket has no host:port. A remote bridge's https route and a route no server names
+    are the vault's as before."""
+    raw = bridged_raw()
+    vault = derive(parse(raw))["vault"]
+    added = (dest("fetch.bridges.example", 443, "route"), dest("scraper.example", 443, "route"))
+    assert vault == tuple(sorted((*EXPECTED, *added), key=lambda d: (d.host, d.port)))
+    # The same plain-http route that no gateway server names is no local MCP route.
+    del raw["gateway"]
+    vault = derive(parse(raw))["vault"]
+    assert dest("bridge-fetch-mcp", 9000, "route", http=True) in vault
+
+
+def test_a_route_without_program_egress_is_no_source() -> None:
+    raw = bridged_raw()
+    for bridge in raw["routes"][-4:]:
+        bridge["program"] = {"holds_secret": True}
+    assert list(derive(parse(raw))) == ["vault"]
+
+
+def test_a_route_named_vault_never_takes_the_vaults_list() -> None:
+    """check refuses its program (A.2 row 6); the derivation keeps the vault's own list."""
+    raw = policy_raw()
+    raw["routes"].append(route("vault", "https://v.example", program={"egress": ["x.example:443"]}))
+    assert derive(parse(raw))["vault"] == tuple(
+        sorted((*EXPECTED, dest("v.example", 443, "route")), key=lambda d: (d.host, d.port))
+    )
+
+
+def test_a_program_entry_changes_the_digest() -> None:
+    raw = bridged_raw()
+    before = digest(derive(parse(raw)))
+    raw["routes"][-4]["program"]["egress_private"] = ["files.lan:8443"]
+    assert digest(derive(parse(raw))) != before
+
+
+def test_the_role_reads_every_route_programs_list() -> None:
+    """The egress role's parser takes the program sources as the vault writes them, private
+    marks and IPv6 brackets included (egress/allowlist.py, X16)."""
+    document_text = json.dumps(document(derive(parse(bridged_raw())))).encode()
+    _, lists, skipped = parse_document(document_text)
+    assert skipped == 0
+    assert lists["bridge-fetch"] == {
+        "docs.example.org:443": False,
+        "[fd00::7]:443": True,
+        "files.lan:8443": True,
+    }
+    assert lists["files"] == {"a.example:443": False}
+    assert set(lists) == {"bridge-fetch", "files", "remote", "scraper", "vault"}
+
+
+def test_the_text_and_squid_forms_name_each_route_source() -> None:
+    """The source ACLs default to zoeymcp_src_<route> and each destination ACL to
+    zoeymcp_<route>_<n>, the route's name as written (its hyphen kept); the operator's own
+    names come from egress_proxy_acls."""
+    lists: Lists = {"bridge-fetch": BRIDGED["bridge-fetch"], "vault": ()}
+    assert render(lists, "text").splitlines()[1:] == [
+        "bridge-fetch docs.example.org:443",
+        "bridge-fetch [fd00::7]:443",
+        "bridge-fetch files.lan:8443",
+    ]
+    lines = render(lists, "squid", acl_names={"bridge-fetch": "fetch_net"}).splitlines()
+    assert lines[:3] == squid_head(
+        lists,
+        "acl fetch_net src <the bridge-fetch's network>, and "
+        "acl zoeymcp_src_vault src <the vault's network>",
+    )
+    assert lines[3:] == [
+        "acl zoeymcp_port_443 port 443",
+        "acl zoeymcp_port_8443 port 8443",
+        "acl zoeymcp_bridge-fetch_1 dstdomain -n docs.example.org",
+        "http_access allow fetch_net CONNECT zoeymcp_bridge-fetch_1 zoeymcp_port_443 "
+        "!zoeymcp_private_dst",
+        "acl zoeymcp_bridge-fetch_2 dst -n fd00::7",
+        "http_access allow fetch_net CONNECT zoeymcp_bridge-fetch_2 zoeymcp_port_443",
+        "acl zoeymcp_bridge-fetch_3 dstdomain -n files.lan",
+        "http_access allow fetch_net CONNECT zoeymcp_bridge-fetch_3 zoeymcp_port_8443",
+    ]

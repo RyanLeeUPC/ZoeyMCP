@@ -128,6 +128,20 @@ def document() -> dict[str, Any]:
                 "callers": ["gateway"],
                 "rules": [{"methods": ["POST"], "paths": ["/send"]}],
             },
+            {
+                "name": "bridge",
+                "prefix": "/bridge",
+                "upstream": "unix:/run/zoeymcp-bridge-fetch/mcp.sock",
+                "credential": "header-cred",
+                "callers": ["gateway"],
+                "stream": True,
+                "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+                "program": {
+                    "egress": ["api.example:443", "files.lan:443"],
+                    "egress_private": ["files.lan:443"],
+                    "holds_secret": True,
+                },
+            },
         ],
         "gateway": {
             "clients": {
@@ -390,6 +404,15 @@ def test_everything_else_is_shown_as_written_in_the_schemas_order() -> None:
     servers = policy["gateway"]["servers"]
     assert servers["remote"]["review"] == {"t": "sha256:" + "5" * 64}
     assert servers["bridge"]["path"] == "/bridge/mcp"
+    # A route's program and a unix: upstream are configuration, shown as written (M7 design A.1).
+    bridge = policy["routes"][2]
+    assert bridge["upstream"] == "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+    assert bridge["program"] == {
+        "egress": ["api.example:443", "files.lan:443"],
+        "egress_private": ["files.lan:443"],
+        "holds_secret": True,
+    }
+    assert policy["routes"][0]["program"] is None
     assert servers["kit"]["slots"]["mail"]["rules"] == [
         {"methods": ["POST"], "paths": ["/send"], "approved": False}
     ]

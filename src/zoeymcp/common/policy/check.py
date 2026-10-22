@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from urllib.parse import urlsplit
 
-from .. import canonical
+from .. import canonical, netguard
 from . import fields
 from .callback import callback_address, callback_origin
 from .findings import Finding
@@ -30,6 +30,7 @@ from .schema import (
     QueryCredential,
     RemoteServer,
     Route,
+    RouteProgram,
     Rule,
     ToolkitRule,
     ToolkitServer,
@@ -379,7 +380,10 @@ def _check_connector_use(policy: Policy, report: _Report) -> None:
 
 
 def _origin(url: str) -> str | None:
-    """``scheme://host:port`` for an http(s) URL, or None when its port is invalid."""
+    """``scheme://host:port`` for an http(s) URL, or None when its port is invalid. A ``unix:``
+    upstream is its own origin, as written: the schema takes it in one fixed form only."""
+    if url.startswith(fields.UNIX_PREFIX):
+        return url
     parts = urlsplit(url)  # lowercases the scheme and the host
     try:
         port = parts.port or _DEFAULT_PORTS[parts.scheme]
@@ -608,6 +612,7 @@ def _check_mcp_resource(path: str, cred: OAuth2Credential, report: _Report) -> N
 def _check_routes(policy: Policy, report: _Report) -> None:
     names: dict[str, int] = {}
     prefixes: dict[str, int] = {}
+    sockets: dict[str, int] = {}
     mcp_routes = _remote_routes(policy)
     for index, route in enumerate(policy.routes):
         path = f"routes[{index}]"
@@ -619,12 +624,22 @@ def _check_routes(policy: Policy, report: _Report) -> None:
                 f"{path}.prefix", f"duplicate prefix (also routes[{prefixes[route.prefix]}])"
             )
         prefixes.setdefault(route.prefix, index)
-        _check_route_target(policy, path, route, report)
+        if route.upstream is not None and _is_unix(route.upstream):
+            if route.upstream in sockets:
+                report.error(
+                    f"{path}.upstream",
+                    f"duplicate socket (also routes[{sockets[route.upstream]}]): a bridge serves "
+                    "one route",
+                )
+            sockets.setdefault(route.upstream, index)
+        _check_route_target(policy, path, route, route.name in mcp_routes, report)
         _check_route_callers(path, route, route.name in mcp_routes, report)
         _check_route_rules(path, route, report)
         if route.connector is not None:
             _check_connector_rules(path, route, report)
         _check_route_query(policy, path, route, report)
+        if route.program is not None:
+            _check_program(f"{path}.program", route, route.program, report)
 
 
 def _remote_routes(policy: Policy) -> set[str]:
@@ -636,15 +651,97 @@ def _remote_routes(policy: Policy) -> set[str]:
     }
 
 
-def _check_route_target(policy: Policy, path: str, route: Route, report: _Report) -> None:
+def _is_unix(upstream: str) -> bool:
+    return upstream.startswith(fields.UNIX_PREFIX)
+
+
+def local_mcp_routes(policy: Policy) -> frozenset[str]:
+    """The names of the local MCP routes (M7 design A.2 rows 9 and 9b): a gateway server's route
+    whose upstream is a bridge's ``unix:`` socket, or plain http with
+    ``allow_insecure_upstream`` to a local target (``netguard.local_target``). The vault sends
+    them on its local and socket clients, never through ``egress_proxy``, and the egress lists
+    leave them out (B.2, I.2). ``check`` refuses one without the rest of row 9 (its token)."""
+    mcp = _remote_routes(policy)
+    return frozenset(
+        r.name
+        for r in policy.routes
+        if r.name in mcp and r.upstream is not None and _local_upstream(r.upstream, r)
+    )
+
+
+def _local_upstream(upstream: str, route: Route) -> bool:
+    if _is_unix(upstream):
+        return True
+    parts = urlsplit(upstream)
+    return (
+        parts.scheme == "http"
+        and route.allow_insecure_upstream
+        and netguard.local_target(parts.hostname or "")
+    )
+
+
+# Row 9's reason, after the part that fails, and row 9b's refusal of every other route.
+_LOCAL_ONLY = (
+    "plain http only to a loopback or private address, with the adapter's token; anything "
+    "further uses https"
+)
+_UNIX_MCP_ONLY = (
+    "a unix: upstream is a standard-tier bridge's socket and serves only an MCP route that "
+    "accepts only the gateway"
+)
+
+
+def _token_problems(policy: Policy, route: Route) -> list[str]:
+    """Why ``route`` doesn't carry an adapter's token: a ``header`` credential no other route
+    names, whose ``store:`` secret no other credential or connector uses, so it reaches nothing
+    but this adapter."""
+    cred = policy.credentials.get(route.credential or "")
+    if not isinstance(cred, HeaderCredential):
+        return ["the route has no header credential for the adapter's token"]
+    problems = []
+    others = [r.name for r in policy.routes if r.credential == route.credential and r is not route]
+    if others:
+        problems.append(f"{route.credential} is also route {', '.join(others)}'s credential")
+    uses = sum(1 for _, ref, _ in secret_references(policy) if ref == cred.secret)
+    if not cred.secret.startswith("store:") or uses > 1:
+        problems.append(f"{cred.secret} isn't a store: secret this credential alone uses")
+    return problems
+
+
+def _local_mcp_problems(policy: Policy, route: Route) -> list[str]:
+    """Why an MCP route over plain http isn't a local MCP route (A.2 row 9); none when it is."""
+    assert route.upstream is not None  # noqa: S101 - only routes with an upstream get here
+    problems = []
+    if not route.allow_insecure_upstream:
+        problems.append("allow_insecure_upstream isn't set")
+    host = urlsplit(route.upstream).hostname or ""
+    if not netguard.local_target(host):
+        problems.append(f"{host} isn't a loopback or private address or a single-label name")
+    return problems + _token_problems(policy, route)
+
+
+def _local_message(problems: list[str]) -> str:
+    return f"{'; '.join(problems)}: {_LOCAL_ONLY}"
+
+
+def _check_route_target(
+    policy: Policy, path: str, route: Route, is_mcp: bool, report: _Report
+) -> None:
     if route.credential is not None and route.credential not in policy.credentials:
         report.error(f"{path}.credential", f"unknown credential {route.credential!r}")
     if route.connector is not None and route.connector not in policy.connectors:
         report.error(f"{path}.connector", f"unknown connector {route.connector!r}")
-    if route.upstream is not None:
+    if route.upstream is not None and _is_unix(route.upstream):
+        _check_unix_upstream(policy, path, route, is_mcp, report)
+    elif route.upstream is not None:
         scheme = urlsplit(route.upstream).scheme
+        problems = _local_mcp_problems(policy, route) if is_mcp and scheme == "http" else []
+        if is_mcp and scheme == "http" and not problems:
+            return  # a local MCP route: plain http with the adapter's token (A.2 row 9)
         plain = scheme == "http" and route.allow_insecure_upstream and route.credential is None
-        if plain and policy.egress_proxy is not None:
+        # Row 14: a local MCP route bypasses the proxy (B.2), even one row 9 refuses.
+        local = is_mcp and _local_upstream(route.upstream, route)
+        if plain and not local and policy.egress_proxy is not None:
             report.warning(
                 path,
                 "CONNECT-only proxies refuse plain http (405); this route can't work through "
@@ -661,6 +758,83 @@ def _check_route_target(policy: Policy, path: str, route: Route, report: _Report
                 report.error(f"{path}.upstream", "a credential can't be sent over plain http")
             else:
                 report.warning(f"{path}.upstream", "plain http upstream")
+        if problems:
+            report.error(f"{path}.upstream", _local_message(problems))
+
+
+def _check_unix_upstream(
+    policy: Policy, path: str, route: Route, is_mcp: bool, report: _Report
+) -> None:
+    """A.2 row 9b: a bridge's socket is the other local MCP route, for the gateway alone, with
+    the bridge's token. Nothing crosses a network, so plain http needs no opt-in."""
+    if not is_mcp or any(c != "gateway" for c in route.callers):
+        report.error(f"{path}.upstream", _UNIX_MCP_ONLY)
+    for problem in _token_problems(policy, route):
+        report.error(f"{path}.upstream", f"{problem}: a bridge's socket takes the bridge's token")
+    if route.allow_insecure_upstream:
+        report.warning(
+            f"{path}.upstream",
+            "allow_insecure_upstream has no effect on a unix: upstream; remove it",
+        )
+
+
+def _check_program(path: str, route: Route, program: RouteProgram, report: _Report) -> None:
+    """A.2 rows 6-8, 7b and 11: the program behind a route, and what the egress role lets it
+    reach."""
+    if route.connector is not None:
+        report.error(path, "a connector has no program behind it")
+        return
+    if route.name == "vault":
+        report.error(path, "vault is the egress role's own source name")
+    egress, private = set(program.egress), set(program.egress_private)
+    for index, entry in enumerate(program.egress):
+        host = entry.rpartition(":")[0].removeprefix("[").removesuffix("]")
+        if entry not in private and not netguard.untrusted_host(host).allowed:
+            report.error(
+                f"{path}.egress[{index}]",
+                "this would let the program reach a private address; list it in egress_private "
+                "if that is the point",
+            )
+    for index, entry in enumerate(program.egress_private):
+        if entry not in egress:
+            report.error(f"{path}.egress_private[{index}]", "not in egress: list it there too")
+    if program.egress and route.upstream is not None and not _confined(route.upstream):
+        where = route.upstream if _is_unix(route.upstream) else urlsplit(route.upstream).hostname
+        report.warning(
+            f"{path}.egress",
+            "only the egress role confines a program, and only one in its own container on your "
+            f"ZoeyMCP networks (the hardened tier); for a program at {where} nothing enforces "
+            "this list",
+        )
+    if program.holds_secret:
+        report.warning(
+            f"{path}.holds_secret",
+            "the program behind this route holds a real secret (R35); through the egress role it "
+            f"can send it to: {', '.join(program.egress) or 'nowhere'}; in the standard tier or "
+            "on another host nothing confines where it sends it",
+        )
+        shared = [entry for entry in program.egress if entry in private]
+        if shared:
+            report.error(
+                f"{path}.holds_secret",
+                f"a program holding a real secret may reach no private address: "
+                f"{', '.join(shared)} is in egress_private",
+            )
+
+
+def _confined(upstream: str) -> bool:
+    """Whether the program at ``upstream`` can be one the egress role confines (A.2 row 7b): a
+    container alias, a single-label name on a ZoeyMCP network. A socket is always a
+    standard-tier bridge; ``localhost``, a name under it and an IP literal are the container's
+    own or another host, where nothing enforces the list (CR-B8)."""
+    if _is_unix(upstream):
+        return False
+    host = urlsplit(upstream).hostname or ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host != "localhost" and netguard.local_target(host)
+    return False
 
 
 def _check_route_callers(path: str, route: Route, is_mcp: bool, report: _Report) -> None:
@@ -789,8 +963,10 @@ def _check_tokens(policy: Policy, report: _Report) -> None:
 def _check_egress(policy: Policy, report: _Report) -> None:
     """``egress_private`` lists vault destinations, each once (the schema has their form and
     case); ``egress_proxy_acls`` maps egress sources to Squid ACL names, which only an
-    operator's own proxy uses."""
+    operator's own proxy uses. The sources are ``vault`` and each route whose program has
+    egress (M7 design I.2)."""
     destinations = _vault_destinations(policy)
+    sources = {"vault"} | {r.name for r in policy.routes if r.program and r.program.egress}
     first: dict[str, int] = {}
     for index, entry in enumerate(policy.egress_private):
         path = f"egress_private[{index}]"
@@ -801,8 +977,12 @@ def _check_egress(policy: Policy, report: _Report) -> None:
             report.warning(path, "unused: the vault never connects here")
     for source, acl in policy.egress_proxy_acls.items():
         path = f"egress_proxy_acls.{source}"
-        if source != "vault":
-            report.error(path, f"{source!r} isn't an egress source; the vault's is vault")
+        if source not in sources:
+            report.error(
+                path,
+                f"{source!r} isn't an egress source: the vault's is vault, and a route's is its "
+                "name once its program lists egress",
+            )
         if not fields.is_squid_acl_name(acl):
             report.error(path, "a Squid ACL name is 1 to 64 letters, digits or underscores")
     if policy.egress_proxy_acls and policy.egress_proxy_kind == "role":
@@ -810,12 +990,66 @@ def _check_egress(policy: Policy, report: _Report) -> None:
             "egress_proxy_acls",
             "unused: these name your own Squid's ACLs, and egress_proxy_kind is role",
         )
+    if policy.egress_proxy_kind != "role":
+        _check_squid_names(policy, report)
+
+
+def _program_destinations(program: RouteProgram) -> int:
+    """How many destinations egresslist lists for ``program``: its entries as the vault's client
+    keys them, each with its private mark."""
+    private = set(program.egress_private)
+    found = set()
+    for entry in program.egress:
+        host, _, port = entry.rpartition(":")
+        name = fields.client_host(host.removeprefix("[").removesuffix("]"))
+        found.add((name, int(port), entry in private))
+    return len(found)
+
+
+# Squid refuses an ACL name of 64 characters or more (ACL_NAME_SZ).
+_SQUID_NAME_MAX = 63
+
+
+def _check_squid_names(policy: Policy, report: _Report) -> None:
+    """The Squid names egresslist.render makes for a route program's source (I.6): its default
+    ``zoeymcp_src_<route>`` and ``zoeymcp_<route>_<n>`` per destination must fit Squid, and a
+    route named ``src``, ``src_...`` or ``port`` would make a destination ACL that another
+    source's ``src`` ACL or a ``zoeymcp_port_<port>`` ACL also names. The vault's are fixed."""
+    for index, route in enumerate(policy.routes):
+        if route.program is None or not route.program.egress or route.name == "vault":
+            continue
+        path = f"routes[{index}].name"
+        if route.name in ("src", "port") or route.name.startswith("src_"):
+            report.error(
+                path,
+                f"a route whose program lists egress can't be named {route.name}: its Squid "
+                "ACLs would share names with others in the snippet",
+            )
+        count = _program_destinations(route.program)
+        if len(f"zoeymcp_{route.name}_{count}") > _SQUID_NAME_MAX:
+            report.error(
+                path,
+                f"too long for its Squid ACLs (zoeymcp_{route.name}_{count} is over "
+                f"{_SQUID_NAME_MAX} characters); use a shorter name",
+            )
+        default = f"zoeymcp_src_{route.name}"
+        if route.name not in policy.egress_proxy_acls and len(default) > _SQUID_NAME_MAX:
+            report.error(
+                path,
+                f"its Squid source ACL {default} is over {_SQUID_NAME_MAX} characters; name a "
+                f"shorter one in egress_proxy_acls.{route.name}",
+            )
 
 
 def _vault_destinations(policy: Policy) -> set[str]:
     """Every ``host:port`` the vault connects to, as ``egress_private`` writes it: the route
-    upstreams, the token and revocation endpoints, and the connectors."""
-    urls = [r.upstream for r in policy.routes if r.upstream is not None]
+    upstreams, the token and revocation endpoints, and the connectors. A ``unix:`` upstream is a
+    socket, with no ``host:port``."""
+    urls = [
+        r.upstream
+        for r in policy.routes
+        if r.upstream is not None and not r.upstream.startswith(fields.UNIX_PREFIX)
+    ]
     for cred in policy.credentials.values():
         if isinstance(cred, OAuth2Credential):
             urls.append(cred.token_url)
@@ -915,7 +1149,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
             if route is None:
                 report.error(f"{path}.route", f"unknown route {server.route!r}")
             else:
-                _check_mcp_route(path, server, route, server_paths[route.name], report)
+                _check_mcp_route(policy, path, server, route, server_paths[route.name], report)
         _check_stop_window(path, server, gateway.limits.call_timeout, report)
         if isinstance(server, RemoteServer):
             _check_upstream_server(path, server, report)
@@ -1079,6 +1313,7 @@ def _reaches(rule: Rule, source: str, path: NormalizedPath) -> bool:
 
 
 def _check_mcp_route(
+    policy: Policy,
     path: str,
     server: RemoteServer,
     route: Route,
@@ -1093,9 +1328,13 @@ def _check_mcp_route(
         report.error(f"{path}.route", "points at a connector route, not an upstream")
         return
     if route.upstream is not None and urlsplit(route.upstream).scheme == "http":
-        report.error(
-            f"{path}.route", f"route {route.name!r} uses plain http: MCP over cleartext is refused"
-        )
+        # MCP over cleartext only on a local MCP route (A.2 rows 9 and 10).
+        problems = _local_mcp_problems(policy, route)
+        if problems:
+            report.error(
+                f"{path}.route",
+                f"route {route.name!r} uses plain http: {_local_message(problems)}",
+            )
     if not route.stream:
         report.error(f"{path}.route", f"route {route.name!r} must set stream: true for MCP")
     if request_path is None:

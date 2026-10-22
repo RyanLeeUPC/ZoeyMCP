@@ -408,7 +408,7 @@ different action:
 | `oauth_misconfigured` | the provider refused the request (`invalid_scope`, `invalid_request`, ...) | fix the policy (scope, `extra_params`, `client_auth`), reload, or `oauth reset` |
 | `oauth_unsupported` | the provider's tokens can't be used (DPoP or another non-Bearer type), or it sent a malformed refresh token | not usable with this vault yet |
 | `oauth_unavailable` | the token endpoint is down, rate limiting, or answered with nothing usable | none: the vault backs off and the next request after `Retry-After` tries again |
-| `address_refused` | the route's upstream name resolves to a private, loopback or otherwise non-global address that `egress_private` doesn't list; nothing was sent | list its `host:port` in `egress_private` if it is meant to be private, and reload (§7) |
+| `address_refused` | the route's upstream name resolves to a private, loopback or otherwise non-global address that `egress_private` doesn't list; nothing was sent. On a local MCP route (a bridge's plain-http route) its name resolved beyond a loopback or private address, which `egress_private` can't change; on a `unix:` route no bridge of that name was started, or another uid listens on its socket (the log's `verdict` says which) | list its `host:port` in `egress_private` if it is meant to be private, and reload (§7); for a bridge, check its name, its address or that it runs |
 
 A 502 for an upstream that failed by itself carries no code. Identity failures stay a bare 403.
 An upstream's `WWW-Authenticate` is never passed to the gateway (the vault reads it first, for
@@ -1083,7 +1083,7 @@ If anything fails after register stored the secret, the vault deletes it again a
 | `onboard_registered` | `credential`, `issuer` (its host), `auth`, `secret_stored` |
 | `onboard_blocked` | `host` and `port` your proxy refused, `needed` (how many hosts it must allow) |
 | `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired`, `owner_gone`, or `compared` (a second run's comparison found nothing changed) |
-| `address_refused` | `purpose` (`discovery`, `registration`, `revocation`, `route` or `token`), `host`, `port`, `verdict` |
+| `address_refused` | `purpose` (`discovery`, `registration`, `revocation`, `route` or `token`), `host`, `port`, `verdict`; for a `unix:` route, `bridge` (its name) instead of `host` and `port`, and `verdict` `unknown_socket` (no bridge of that name was started) or `peer_uid` with the `uid` that listens there |
 | `oauth_revoked` | `credential`, `outcome` (`ok`; `refused`: nothing was sent, because the endpoint isn't on the token endpoint's origin, its address was refused, or the client can't be authenticated; `failed`, with the `status` when there was an answer; `timeout`), `status`: a deleted grant's revocation (§2) |
 
 None holds an onboarding's ID, a secret, a registration access token or URI, a URL's path or
@@ -2206,7 +2206,9 @@ no output, and `--check` stays clean.
   ```
 
   The vault's source is `vault`; a plain-http destination's line ends with
-  `# plain http: refused by a CONNECT-only proxy`.
+  `# plain http: refused by a CONNECT-only proxy`. A route whose `program.egress` lists something
+  (a bridge's) is a source of its own, named by the route, and a local MCP route's own upstream
+  is never in the vault's list: the vault reaches a bridge directly, never through a proxy.
 - `json`: `{"v": 1, "digest": ..., "sources": {"vault": [{"host", "port", "private"}, ...]}}`.
 - `squid`: a snippet to `include` from your `squid.conf`:
 
@@ -2243,7 +2245,11 @@ Squid takes `#` as a comment only at the start of a line, so each comment has a 
 The `src` ACL's name comes from the policy's `egress_proxy_acls` (`{vault: stack_vault_net}`), so
 every command and the portal print the same lines; `--squid-src vault=NAME` overrides it for one
 run, and with neither the snippet uses `zoeymcp_src_vault`. A name is 1 to 64 letters, digits or
-underscores.
+underscores. A route program's source takes its own key, the route's name
+(`{bridge-fetch: fetch_net}`), and defaults to `zoeymcp_src_<route>`. Unless `egress_proxy_kind`
+is `role`, `check` refuses such a route named `src`, `src_...` or `port`, whose destination ACLs
+(`zoeymcp_<route>_<n>`) would share a name with another ACL in the snippet, and a name that makes
+an ACL name longer than Squid's 63 characters.
 
 **How the snippet's rules work.** Each destination gets its own rule, so a host and its port
 stay paired. The rule tests the source, `CONNECT`, the exact name (`dstdomain -n`, so a subdomain

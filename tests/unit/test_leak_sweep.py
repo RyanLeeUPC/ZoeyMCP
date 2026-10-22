@@ -832,6 +832,11 @@ VAULT_SIDE = {
     "forced query": "leak-force-value",
     "rule path": "/leak-rule-path",
     "rule param": "leak-rule-value",
+    # A route's program (M7 design A.3): routes never reach the view, so neither does it.
+    "program egress": "leak-egress.example",
+    "program private egress": "leak-egress-private.example",
+    "local upstream": "leak-bridge-alias",
+    "unix upstream": "zoeymcp-bridge-leaksock",
 }
 # What the gateway does need, though it sits beside vault-side values, and why.
 GATEWAY_NEEDS = {
@@ -925,17 +930,42 @@ def secret_heavy_policy() -> Policy:
             "callers": ["gateway"],
             "rules": [{"methods": ["POST"], "paths": ["/send"]}],
         },
+        # Two local MCP routes (M7 design A.2 rows 9 and 9b), each with a program holding all
+        # three of its settings.
+        *(
+            {
+                "name": f"leak-route-{kind}",
+                "prefix": f"/{kind}",
+                "upstream": upstream,
+                "allow_insecure_upstream": kind == "bridge",
+                "credential": "leak-cred-header",
+                "callers": ["gateway"],
+                "stream": True,
+                "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+                "program": {
+                    "egress": ["leak-egress.example:443", "leak-egress-private.example:443"],
+                    "egress_private": ["leak-egress-private.example:443"],
+                    "holds_secret": True,
+                },
+            }
+            for kind, upstream in (
+                ("bridge", "http://leak-bridge-alias:9000"),
+                ("socket", "unix:/run/zoeymcp-bridge-leaksock/mcp.sock"),
+            )
+        ),
     ]
     gateway = {
         "clients": {
             "literal": {"token": LITERAL_TOKEN, "servers": ["srv-remote"]},
             "hashed": {
                 "token_sha256": "sha256:" + "3" * 64,
-                "servers": ["srv-remote", "srv-toolkit"],
+                "servers": ["srv-remote", "srv-toolkit", "srv-bridge", "srv-socket"],
             },
         },
         "servers": {
             "srv-remote": {"kind": "remote", "route": "leak-route-mcp", "path": "/mcp"},
+            "srv-bridge": {"kind": "remote", "route": "leak-route-bridge"},
+            "srv-socket": {"kind": "remote", "route": "leak-route-socket"},
             "srv-toolkit": {
                 "kind": "toolkit",
                 "module": "zoeymcp.toolkits.leakmodule",
@@ -997,7 +1027,17 @@ def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:
     served = dump_view(view).decode()
     for where, value in VAULT_SIDE.items():
         assert value not in served, where
-    for marker in ("store:", "env:", "https://", "http://", "placeholder", "secret"):
+    for marker in (
+        "store:",
+        "env:",
+        "https://",
+        "http://",
+        "unix:",
+        "placeholder",
+        "secret",
+        "egress",
+        "program",
+    ):
         assert marker not in served, marker
     for where, (value, _why) in GATEWAY_NEEDS.items():
         assert value in served, where
@@ -1007,6 +1047,9 @@ def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:
     # What the gateway does get: the token's hash and the vault path.
     assert hash_token(LITERAL_TOKEN) in served
     assert view.gateway.servers["srv-remote"].model_dump()["vault_path"] == "/mcp-a/mcp"
+    # A bridge is a remote server like any other: its route's prefix and the server's path.
+    assert view.gateway.servers["srv-bridge"].model_dump()["vault_path"] == "/bridge/mcp"
+    assert view.gateway.servers["srv-socket"].model_dump()["vault_path"] == "/socket/mcp"
     assert parse_view(served.encode()) == view
 
 

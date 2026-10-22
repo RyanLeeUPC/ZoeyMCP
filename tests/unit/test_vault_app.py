@@ -1470,3 +1470,158 @@ async def test_a_401_is_never_relayed_as_a_stream(tmp_path: Path, captured: io.S
     assert refused.text == "data: [REDACTED]\n\n"
     streamed = [line.get("streamed") for line in events(captured, "request")]
     assert streamed == [True, None]
+
+
+# --- local MCP routes and unix: upstreams: which client, and which URL (M7 design B.2) -----------
+
+BRIDGE_SOCKET = "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+BRIDGE_TOKEN = "token-for-the-fetch-bridge"
+
+
+def bridge_policy(upstream: str, *, served: bool = True) -> Policy:
+    """A bridge's route as A.4 writes it, with the remote server that makes it an MCP route
+    (``served``) or without one."""
+    return Policy.model_validate(
+        {
+            **BASE,
+            "credentials": {"fetch": {"kind": "header", "secret": "store:fetch-token"}},
+            "routes": [
+                {
+                    "name": "fetch",
+                    "prefix": "/fetch",
+                    "upstream": upstream,
+                    "allow_insecure_upstream": upstream.startswith("http:"),
+                    "credential": "fetch",
+                    "callers": ["gateway"],
+                    "stream": True,
+                    "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+                }
+            ],
+            "gateway": {
+                "servers": {"fetch": {"kind": "remote", "route": "fetch"}} if served else {}
+            },
+        }
+    )
+
+
+class Recorder:
+    """A client that records each request it is given and answers 200 ok."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.client = httpx.AsyncClient(transport=httpx.MockTransport(self._answer))
+
+    def _answer(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(200, text="ok")
+
+
+def bridge_vault(tmp_path: Path, pol: Policy, **clients: Any) -> VaultApp:
+    store = SecretStore(tmp_path, KEYS)
+    store.load()
+    upstream = pol.routes[0].upstream
+    assert upstream is not None
+    store.put("fetch-token", BRIDGE_TOKEN, origin_binding([upstream]))
+    return VaultApp(pol, store, KEYS, environ={}, **clients)
+
+
+async def from_the_gateway(app: VaultApp) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 40000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
+        headers = {GATEWAY_HEADER: KEYS.gateway_key(1)}
+        return await client.post("/fetch/mcp", headers=headers, content=b"{}")
+
+
+async def test_a_unix_route_goes_to_its_bridges_client_on_the_shared_base(tmp_path: Path) -> None:
+    """The socket is the whole upstream: the server's path is the HTTP path, on
+    http://bridge.invalid, whatever the bridge; the client is picked by the bridge's name."""
+    route, local, fetch, files = Recorder(), Recorder(), Recorder(), Recorder()
+    bridges = {"fetch": fetch.client, "files": files.client}
+    app = bridge_vault(
+        tmp_path,
+        bridge_policy(BRIDGE_SOCKET),
+        client=route.client,
+        local_client=local.client,
+        socket_clients=bridges.get,
+    )
+    try:
+        answer = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert (answer.status_code, answer.text) == (200, "ok")
+    [sent] = fetch.requests
+    assert str(sent.url) == "http://bridge.invalid/mcp"
+    assert sent.headers["host"] == "bridge.invalid"
+    assert sent.headers["authorization"] == f"Bearer {BRIDGE_TOKEN}"
+    assert (route.requests, local.requests, files.requests) == ([], [], [])
+
+
+async def test_a_bridge_with_no_client_answers_unknown_socket(
+    tmp_path: Path, captured: io.StringIO
+) -> None:
+    """A bridge the launcher didn't start: 502 address_refused, nothing sent anywhere, logged
+    with the bridge's name. Another bridge's client is never used for it. (A vault with no
+    --bridge at all is test_netclient.py's.)"""
+    route, other = Recorder(), Recorder()
+    app = bridge_vault(
+        tmp_path,
+        bridge_policy(BRIDGE_SOCKET),
+        client=route.client,
+        local_client=route.client,
+        socket_clients={"other": other.client}.get,
+    )
+    try:
+        answer = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert answer.status_code == 502
+    assert answer.json() == {"error": "upstream unavailable", "code": "address_refused"}
+    assert (route.requests, other.requests) == ([], [])
+    [refused] = events(captured, "address_refused")
+    assert {k: v for k, v in refused.items() if k != "ts"} == {
+        "role": "vault",
+        "event": "address_refused",
+        "purpose": "route",
+        "bridge": "fetch",
+        "verdict": "unknown_socket",
+    }
+    request = events(captured, "request")[-1]
+    assert request["reason"] == "address refused (unknown_socket): no bridge fetch was started"
+
+
+async def test_a_local_route_goes_on_the_local_client_of_the_running_policy(
+    tmp_path: Path,
+) -> None:
+    """A local MCP route of the running policy goes on the local client, at the upstream's
+    origin and the server's path once (CR-B2); a reload that makes it no MCP route sends it on
+    the ordinary client again, with no restart."""
+    route, local = Recorder(), Recorder()
+    app = bridge_vault(
+        tmp_path,
+        bridge_policy("http://bridge:9000"),
+        client=route.client,
+        local_client=local.client,
+    )
+    try:
+        assert (await from_the_gateway(app)).status_code == 200
+        app.reload(bridge_policy("http://bridge:9000", served=False))
+        assert (await from_the_gateway(app)).status_code == 200
+    finally:
+        await app.aclose()
+    assert [str(r.url) for r in local.requests] == ["http://bridge:9000/mcp"]
+    assert [str(r.url) for r in route.requests] == ["http://bridge:9000/mcp"]
+    assert local.requests[0].headers["authorization"] == f"Bearer {BRIDGE_TOKEN}"
+
+
+async def test_an_injected_client_alone_serves_local_and_unix_routes(tmp_path: Path) -> None:
+    """A test or the self-test that injects a client never falls back to a networked one."""
+    for upstream in ("http://bridge:9000", BRIDGE_SOCKET):
+        injected = Recorder()
+        app = bridge_vault(tmp_path / upstream[:4], bridge_policy(upstream), client=injected.client)
+        assert app._local_client is app._client
+        try:
+            assert (await from_the_gateway(app)).status_code == 200
+        finally:
+            await app.aclose()
+        assert len(injected.requests) == 1
+        assert injected.client.is_closed

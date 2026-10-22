@@ -16,6 +16,9 @@ decisions M7 adds to the schema are tested without putting all of ``schema.py`` 
   :data:`AUTHORIZE_PARAMS`), nor one the credential's own params set.
 - :func:`no_bridge_kind` and :data:`NO_BRIDGE_KIND`: a server written ``kind: bridge``, refused
   with what to write instead, since a bridge is an upstream: a remote server behind a route.
+- :func:`unix_upstream`, :func:`bridge_name` and :func:`bridge_socket`: a route's ``unix:``
+  upstream, a standard-tier bridge's socket (Q46). Only the one fixed form is taken, so a route
+  can't name any other socket in the container (the vault's admin socket, the link socket).
 
 Every pattern here is used with ``fullmatch``.
 """
@@ -45,6 +48,12 @@ _SQUID_ACL_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
 # since the egress role may import only the standard library; test_netguard.py pins them equal.
 _NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 _ADDRESS = re.compile(r"[^@\s<>\"]{1,64}@[A-Za-z0-9.-]{1,253}")
+# A standard-tier bridge's socket: its name is the launcher's bridge name pattern (C.10).
+UNIX_PREFIX: Final = "unix:"
+_UNIX_UPSTREAM = re.compile(r"unix:/run/zoeymcp-bridge-([a-z0-9]{1,16})/mcp\.sock")
+UNIX_UPSTREAM_FORM: Final = (
+    "a unix: upstream is a standard-tier bridge's socket, unix:/run/zoeymcp-bridge-<name>/mcp.sock"
+)
 
 # The names the vault sets on a token request (protocol._build), resource (which onboarding sets),
 # and those that compete with the client authentication the vault sends (RFC 7521, RFC 7523).
@@ -167,6 +176,28 @@ def no_bridge_kind(servers: object) -> list[str]:
         for name, server in servers.items()
         if isinstance(server, Mapping) and server.get("kind") == "bridge"
     ]
+
+
+def unix_upstream(value: str) -> str:
+    """A route's ``unix:`` upstream: exactly ``unix:/run/zoeymcp-bridge-<name>/mcp.sock``. The
+    socket is the whole upstream, with no HTTP path, query or authority: the server's ``path`` is
+    the HTTP path, as for any upstream written as an origin alone."""
+    if not _UNIX_UPSTREAM.fullmatch(value):
+        raise ValueError(UNIX_UPSTREAM_FORM)
+    return value
+
+
+def bridge_name(upstream: str) -> str:
+    """The bridge a ``unix:`` upstream names; a ``ValueError`` for any other upstream."""
+    found = _UNIX_UPSTREAM.fullmatch(upstream)
+    if found is None:
+        raise ValueError(UNIX_UPSTREAM_FORM)
+    return found.group(1)
+
+
+def bridge_socket(name: str) -> str:
+    """The socket path a bridge listens on, which the ``unix:`` upstream naming it names."""
+    return f"/run/zoeymcp-bridge-{name}/mcp.sock"
 
 
 def check_endpoint_query(url: str, reserved: Set[str]) -> None:

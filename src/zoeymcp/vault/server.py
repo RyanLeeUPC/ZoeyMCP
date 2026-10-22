@@ -9,7 +9,9 @@ the running one stays.
 In the standard tier (M3 design B.2, C.1) the vault also listens on the link socket, where only
 the gateway's uid may connect, and may have no TCP listener at all (``--listen none``). The
 launcher can't signal the vault's uid, so it writes ``HUP`` and ``TERM`` to a control pipe
-instead; the end of that pipe stops the vault too.
+instead; the end of that pipe stops the vault too. The launcher also names each bridge it starts
+(``--bridge NAME=UID``, M7 design C.10): the vault reaches a ``unix:`` route's bridge only on that
+bridge's socket, and only when its listener is that uid (B.2, Q46).
 
 Every TCP listener's sockets are bound before any server starts (M5 design B.3, D17), so an
 address in use is a ``StartupError`` that names it; uvicorn would otherwise call ``sys.exit``
@@ -28,6 +30,7 @@ import asyncio
 import contextlib
 import errno
 import os
+import re
 import signal
 import socket
 import stat
@@ -37,6 +40,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import uvicorn
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -62,10 +66,11 @@ from .admin import (
     check_socket_dir,
     socket_supported,
 )
-from .app import LISTENER_SCOPE_KEY, Listener, VaultApp
+from .app import CONNECT_TIMEOUT, LISTENER_SCOPE_KEY, READ_TIMEOUT, Listener, VaultApp
 from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
+from .netclient import SocketClients
 from .oauth.login import LoginService
 from .onboard import OnboardService, policy_source
 from .peer import link_supported, peer_checked
@@ -83,6 +88,8 @@ Lookup = Callable[[str], Sequence[str]]
 # How often the timer retires an expired previous gateway key, in seconds.
 GATEWAY_KEY_TICK = 5.0
 # The launcher's control pipe: one command per line.
+# --bridge NAME=UID: the launcher's bridge name (C.10) and the uid it runs that bridge as.
+_BRIDGE = re.compile(r"([a-z0-9]{1,16})=([0-9]{1,10})")
 
 
 class StartupError(Exception):
@@ -166,6 +173,28 @@ def check_link_options(
         raise StartupError("--gateway-socket needs Linux (SO_PEERCRED)")
     if not listens and gateway_socket is None:
         raise StartupError("--listen none leaves nothing to serve; it needs --gateway-socket")
+
+
+def parse_bridges(values: Sequence[str]) -> dict[str, int]:
+    """``--bridge NAME=UID``, repeatable: each bridge the launcher started, and its uid (M7
+    design B.2, C.10). Linux only, like the link socket: the peer check needs ``SO_PEERCRED``.
+    A name given twice and root are refused; so is any other form."""
+    bridges: dict[str, int] = {}
+    for value in values:
+        found = _BRIDGE.fullmatch(value)
+        if found is None:
+            raise StartupError(
+                f"--bridge {value}: write NAME=UID, NAME 1 to 16 lower-case letters or digits"
+            )
+        name, uid = found.group(1), int(found.group(2))
+        if name in bridges:
+            raise StartupError(f"--bridge {name} is given twice")
+        if uid == 0:
+            raise StartupError(f"--bridge {name}: a bridge never runs as root")
+        bridges[name] = uid
+    if bridges and not link_supported():
+        raise StartupError("--bridge needs Linux (SO_PEERCRED)")
+    return bridges
 
 
 def check_control_fd(fd: int) -> None:
@@ -686,16 +715,27 @@ def run(
     gateway_socket: Path | None = None,
     gateway_uid: int | None = None,
     control_fd: int | None = None,
+    bridges: Sequence[str] = (),
 ) -> None:
     """Start the vault. ``listens`` may be empty (``--listen none``) when ``gateway_socket`` is
-    set; ``gateway_socket`` and ``gateway_uid`` go together."""
+    set; ``gateway_socket`` and ``gateway_uid`` go together. ``bridges`` are the
+    ``--bridge NAME=UID`` values."""
     check_link_options(listens, gateway_socket, gateway_uid)
+    named = parse_bridges(bridges)
     if control_fd is not None:
         check_control_fd(control_fd)
     # Before loading the store, which may rewrite it (key rotation). Not in load_runtime: tests
     # call that twice on one directory in one process.
     acquire_state_lock(state_dir)
-    vault = build(config, listens, state_dir, environ, admin_socket, gateway_socket=gateway_socket)
+    vault = build(
+        config,
+        listens,
+        state_dir,
+        environ,
+        admin_socket,
+        gateway_socket=gateway_socket,
+        bridges=named,
+    )
     asyncio.run(
         serve(
             vault.app,
@@ -721,10 +761,11 @@ def build(
     admin_socket: Path | None,
     *,
     gateway_socket: Path | None = None,
+    bridges: Mapping[str, int] | None = None,
 ) -> Vault:
     """With the state lock held: keys, policy, store, gateway keys, the link directory, the
     journals and the copy, the portal's state files, then the portal (M5 design B.4). Nothing
-    listens yet."""
+    listens yet. ``bridges`` are the bridges the launcher started, by name, with their uids."""
     runtime = load_runtime(config, state_dir, environ)
     if gateway_socket is not None:
         check_link_dir(gateway_socket)
@@ -733,11 +774,14 @@ def build(
     reports = ReportStore.open(state_dir)
     # Its HTTP clients, every one guarded (routes, tokens, revocation, onboarding), are built here
     # from the startup policy and kept until the process ends; a reload changes none, though each
-    # reads the running policy's egress_private at every connection (M7 design B.2, D-61).
+    # reads the running policy's egress_private at every connection (M7 design B.2, D-61). The
+    # bridges' socket clients too: one per --bridge, none in the hardened tier (Q46).
+    timeout = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT)
     app = VaultApp(
         runtime.policy,
         runtime.store,
         runtime.keys,
+        socket_clients=SocketClients(bridges or {}, timeout=timeout),
         environ=environ,
         gateway_keys=runtime.gateway_keys,
         gateway_link=gateway_socket is not None,

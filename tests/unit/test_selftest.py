@@ -720,3 +720,88 @@ def test_endpoint_key() -> None:
         "/oauth/token",
     )
     assert endpoint_key("http://[::1]:8080/t") == ("http://[::1]:8080", "/t")
+
+
+# --- local MCP routes and bridges' sockets (M7 design B.2, step 18b) ----------------------------
+
+
+def bridged_policy() -> Policy:
+    """The example policy with A.4's two bridges: a hardened one over plain http to a container
+    alias, and a standard one on its socket, each a remote server behind a local MCP route."""
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    for name, upstream in (
+        ("fetch", "http://bridge-fetch-mcp:9000"),
+        ("files", "unix:/run/zoeymcp-bridge-files/mcp.sock"),
+    ):
+        raw["credentials"][name] = {"kind": "header", "secret": f"store:bridge-{name}-token"}
+        raw["routes"].append(
+            {
+                "name": f"bridge-{name}",
+                "prefix": f"/bridge-{name}",
+                "upstream": upstream,
+                "allow_insecure_upstream": upstream.startswith("http:"),
+                "credential": name,
+                "callers": ["gateway"],
+                "stream": True,
+                "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+            }
+        )
+        raw["gateway"]["servers"][name] = {"kind": "remote", "route": f"bridge-{name}"}
+    return parse_policy(yaml.safe_dump(raw, sort_keys=False), "bridged")
+
+
+def bridge_cases() -> CaseFile:
+    return parse_cases(
+        yaml.safe_dump(
+            {
+                "cases": [
+                    {
+                        "name": f"the gateway reaches the {name} bridge with its token",
+                        "request": {
+                            "method": "POST",
+                            "path": f"/bridge-{name}/mcp",
+                            "caller": "gateway",
+                        },
+                        "expect": {
+                            "status": 200,
+                            "upstream": {"method": "POST", "path": "/mcp", "credential": True},
+                        },
+                    }
+                    for name in ("fetch", "files")
+                ]
+            }
+        )
+    )
+
+
+def test_a_case_on_a_local_route_or_a_socket_reaches_the_echo_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The self-test's echo client serves every role, a local MCP route's and each bridge's
+    socket included: no --bridge, no socket, no network transport, and a dummy token never
+    leaves the process. The egress lists rightly leave both routes out, so reaching them isn't
+    a destination the allowlist misses."""
+
+    def no_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a self-test built a network transport")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "__init__", no_network)
+    policy = bridged_policy()
+    assert {"bridge-fetch-mcp"}.isdisjoint(d.host for d in egresslist.derive(policy)["vault"])
+    results = asyncio.run(Rig(policy, tmp_path).run(policy, bridge_cases()))
+    assert [(r.name, r.problems) for r in results] == [
+        ("the gateway reaches the fetch bridge with its token", []),
+        ("the gateway reaches the files bridge with its token", []),
+    ]
+
+
+def test_a_local_route_is_exempt_from_the_allowlist_check_only_as_a_local_route(
+    tmp_path: Path,
+) -> None:
+    """The exemption is the running policy's local MCP routes: the same plain-http route that
+    no server names is the vault's destination, in the derived list as before."""
+    assert runner._local_destinations(bridged_policy()) == {
+        "bridge-fetch-mcp:9000",
+        "bridge.invalid:80",
+    }
+    assert runner._local_destinations(example_policy()) == set()

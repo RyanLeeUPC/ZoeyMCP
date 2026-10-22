@@ -6,12 +6,18 @@ from it, so they can't disagree. Each source is a place connections start from; 
 ``vault``:
 
 - ``route``: every route upstream's ``host:port`` (an ``http`` upstream on port 80 unless it
-  names one, and marked in the text form: a CONNECT-only proxy refuses plain http);
+  names one, and marked in the text form: a CONNECT-only proxy refuses plain http), except a
+  local MCP route's (``check.local_mcp_routes``): the vault reaches a bridge directly, never
+  through a proxy, and a ``unix:`` upstream has no ``host:port`` at all (B.2);
 - ``token`` and ``revocation``: every oauth2 ``token_url`` and ``revocation_url``;
 - ``connector``: every connector's ``host:port``;
 - ``onboarding``: each live onboarding's allowance (I.3), which only the vault's memory holds.
   An allowance is never private: the role can't tell which vault request a tunnel carries, so it
   would give every vault connection to that ``host:port`` the exception (TI-10).
+
+Each route whose ``program.egress`` lists something is a source of its own, named by the route
+(the bridge's identity in the policy): each entry, ``program``, private when the program's own
+``egress_private`` lists it too.
 
 A URL's host is keyed as the vault's client sends it, an internationalized name in its ``xn--``
 form (``fields.client_host``, D-190). A destination is private when the policy lists it in
@@ -34,9 +40,10 @@ from urllib.parse import urlsplit
 
 from . import canonical, netguard
 from .policy import fields
-from .policy.schema import OAuth2Credential, Policy
+from .policy.check import local_mcp_routes
+from .policy.schema import OAuth2Credential, Policy, RouteProgram
 
-SourceName = str  # "vault", or (from M7 step 18b) the name of a route with a program
+SourceName = str  # "vault", or the name of a route whose program lists egress
 Reason = Literal["route", "token", "revocation", "connector", "program", "onboarding"]
 Format = Literal["text", "json", "squid"]
 VAULT: Final = "vault"
@@ -48,7 +55,7 @@ PLAIN_HTTP_NOTE: Final = "plain http: refused by a CONNECT-only proxy"
 class Destination:
     host: str  # lower case, as netguard.entry_key writes it (an IPv6 address without brackets)
     port: int
-    private: bool  # in egress_private
+    private: bool  # in egress_private (vault) or the route program's egress_private
     reasons: frozenset[Reason]
     plain_http: bool = False  # reached over http: only the text form says so
 
@@ -77,8 +84,24 @@ def _url_destination(url: str) -> tuple[str, int, bool]:
     return fields.client_host(str(parts.hostname)), port, parts.scheme == "http"
 
 
+def _program(program: RouteProgram) -> tuple[Destination, ...]:
+    """A route program's list: each ``egress`` entry, private when its ``egress_private`` lists
+    it. The schema keeps each entry a lower-case ``host:port`` (``[ipv6]:port``)."""
+    private = set(program.egress_private)
+    found: set[tuple[str, int, bool]] = set()
+    for entry in program.egress:
+        host, _, port = entry.rpartition(":")
+        name = fields.client_host(host.removeprefix("[").removesuffix("]"))
+        found.add((name, int(port), entry in private))
+    return tuple(
+        Destination(host=host, port=port, private=mark, reasons=frozenset({"program"}))
+        for host, port, mark in sorted(found)
+    )
+
+
 def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
-    """Every source's destinations. The vault's list is always present, even empty."""
+    """Every source's destinations. The vault's list is always present, even empty; a route
+    whose program lists egress has its own."""
     reasons: dict[tuple[str, int], set[Reason]] = {}
     plain_http: set[tuple[str, int]] = set()
 
@@ -88,9 +111,13 @@ def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
         if http:
             plain_http.add(key)
 
+    local = local_mcp_routes(policy)
     for route in policy.routes:
-        if route.upstream is not None:
-            add(*_url_destination(route.upstream), "route")
+        upstream = route.upstream
+        # A socket has no host:port, on whatever route check found it (A.2 row 9b).
+        if upstream is None or route.name in local or upstream.startswith(fields.UNIX_PREFIX):
+            continue
+        add(*_url_destination(upstream), "route")
     for cred in policy.credentials.values():
         if isinstance(cred, OAuth2Credential):
             add(*_url_destination(cred.token_url), "token")
@@ -118,7 +145,12 @@ def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
         )
         for (host, port), found in sorted(reasons.items())
     )
-    return {VAULT: vault}
+    lists: dict[SourceName, tuple[Destination, ...]] = {VAULT: vault}
+    for route in policy.routes:
+        # A route named vault can't take the vault's list (check refuses its program).
+        if route.program is not None and route.program.egress and route.name != VAULT:
+            lists[route.name] = _program(route.program)
+    return dict(sorted(lists.items()))
 
 
 def _sources(lists: Lists) -> dict[str, list[dict[str, Any]]]:

@@ -28,16 +28,36 @@ at start, from the startup policy, so a reload that changes ``egress_proxy`` cha
 running policy's ``egress_private`` at each connection, so a reload that lists a destination
 lets the next connection through without a restart.
 
+A local MCP route (M7 design A.2 row 9) goes through :func:`local_client`, direct and never
+proxied, whose backend allows a connection only when every address the name resolves to is
+loopback or private (``netguard.local_only``), and reads no exception set: the egress lists never
+name a local route, so a bridge is reached neither through the role nor through an operator's
+proxy, and its name can't be steered to a global address. A ``unix:`` route (Q46) goes through
+:class:`SocketClients`: one client per bridge the launcher named (``--bridge NAME=UID``), over a
+pool on that bridge's socket, whose backend reads the listener's uid from the connected socket
+(``SO_PEERCRED``) and closes the connection unless it is the uid the launcher gave that bridge
+(``netguard.unix_peer``), so nothing is written to a socket another uid planted. Every bridge's
+request base is :data:`BRIDGE_BASE`: the client is chosen by the bridge's name, never by host.
+
 Tests answer names through :data:`HOOKS` (BP-1): a resolver that maps names to addresses reserved
 for the run, and a ``dial`` that sends a checked address to the loopback port of the right fake,
-so the guard runs unchanged on every test connection. Production never sets it.
+so the guard runs unchanged on every test connection; ``socket_path`` puts a bridge's socket in a
+test directory while the policy keeps the fixed form. Production never sets it.
 """
 
 from __future__ import annotations
 
 import socket
 import ssl
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from typing import Final
 
@@ -48,8 +68,10 @@ import httpx
 
 from ..common import netguard
 from ..common.netguard import AddressVerdict
+from ..common.policy import fields
 from .oauth.protocol import ATTEMPT_DEADLINE
 from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
+from .peer import peer_uid
 
 # One lookup's limit, in seconds (M.6).
 RESOLVE_TIMEOUT: Final = 5.0
@@ -67,20 +89,26 @@ ONBOARDING_EXTENSION: Final = "zoeymcp.onboarding"
 # The fetches an onboarding's exception may cover: the probe of the server URL and its PRM. Never
 # the AS metadata, registration or an endpoint.
 PRIVATE_PURPOSES: Final = frozenset({"probe", "prm"})
+# A unix: route's request base, the same for every bridge (M.6): its client is chosen by the
+# bridge's name, so Host is never what picks a socket. The bridge ignores Host.
+BRIDGE_BASE: Final = "http://bridge.invalid"
 _DEFAULT_PORTS: Final = {"http": 80, "https": 443}
 
 # A name and port to its addresses; raises OSError (or TimeoutError) when it doesn't resolve.
 Resolver = Callable[[str, int], Awaitable[Sequence[str]]]
 # A checked address and port to the address and port actually connected to.
 Dial = Callable[[str, int], tuple[str, int]]
+# A bridge's name to the path of its socket.
+SocketPath = Callable[[str], str]
 
 
 @dataclass(frozen=True)
 class Hooks:
-    """Test-only stand-ins for the resolver and the connect target (BP-1)."""
+    """Test-only stand-ins for the resolver, the connect target and a bridge's socket (BP-1)."""
 
     resolver: Resolver | None = None
     dial: Dial | None = None
+    socket_path: SocketPath | None = None
 
 
 # Set only by tests: tests/acceptance/procs.py's launcher in an out-of-process vault, as it
@@ -94,6 +122,15 @@ class AddressRefused(httpx.ConnectError):
     def __init__(self, host: str, port: int, verdict: AddressVerdict) -> None:
         self.host, self.port, self.verdict = host, port, verdict
         super().__init__(f"{netguard.entry_key(host, port)}: address refused ({verdict.reason})")
+
+
+class SocketRefused(httpx.ConnectError):
+    """A bridge's socket was refused: its listener isn't the uid the launcher gave that bridge,
+    or the kernel didn't say. The connection was closed with nothing written."""
+
+    def __init__(self, bridge: str, verdict: AddressVerdict, uid: int | None) -> None:
+        self.bridge, self.verdict, self.uid = bridge, verdict, uid
+        super().__init__(f"bridge {bridge}: socket refused ({verdict.reason})")
 
 
 class ResolveFailed(httpx.ConnectError):
@@ -140,7 +177,10 @@ def _no_exceptions() -> Collection[str]:
 class GuardedBackend(httpcore.AsyncNetworkBackend):
     """httpcore's network backend with X3's rule on every TCP connection. ``exceptions`` is
     read at each connection: the ``host:port`` entries allowed to resolve to non-global
-    addresses. ``resolver`` and ``dial`` are for tests only (BP-1)."""
+    addresses. With ``local_only`` (a local MCP route's client) every address must be loopback
+    or private instead, and no exception is read. With ``bridge`` and ``expected_uid`` (a
+    bridge's socket client) a Unix socket connection is kept only when its peer is that uid.
+    ``resolver`` and ``dial`` are for tests only (BP-1)."""
 
     def __init__(
         self,
@@ -148,10 +188,15 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
         *,
         resolver: Resolver | None = None,
         dial: Dial | None = None,
+        local_only: bool = False,
+        bridge: str = "",
+        expected_uid: int | None = None,
     ) -> None:
         self._exceptions = exceptions
         self._resolver = resolver or resolve
         self._dial = dial
+        self._local_only = local_only
+        self._bridge, self._expected_uid = bridge, expected_uid
         self._backend = httpcore.AnyIOBackend()
 
     async def connect_tcp(
@@ -166,10 +211,13 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
             addresses = await self._resolver(host, port)
         except (OSError, TimeoutError, UnicodeError) as exc:
             raise ResolveFailed(host, port) from exc
-        exceptions = self._exceptions()
-        # The name exactly (an onboarding's exception), or as an entry writes it (guard_key).
-        private_ok = netguard.listed(exceptions, host, port) or guard_key(host, port) in exceptions
-        verdict = netguard.addresses_allowed(addresses, private_ok=private_ok)
+        if self._local_only:
+            verdict = netguard.local_only(addresses)
+        else:
+            exceptions = self._exceptions()
+            # The name exactly (an onboarding's exception), or as an entry writes it (guard_key).
+            listed = netguard.listed(exceptions, host, port) or guard_key(host, port) in exceptions
+            verdict = netguard.addresses_allowed(addresses, private_ok=listed)
         if not verdict.allowed or verdict.address is None:
             raise AddressRefused(host, port, verdict)
         # The checked address, never the name again: a second lookup could answer otherwise.
@@ -184,14 +232,38 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
             socket_options=socket_options,
         )
 
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if self._expected_uid is None:  # no bridge of this name: never connect at all
+            raise SocketRefused(self._bridge, netguard.unix_peer(None, None), None)
+        stream = await self._backend.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options
+        )
+        # The listener's uid, from the connected socket, before a byte is written to it.
+        uid = peer_uid(stream.get_extra_info("socket"))
+        verdict = netguard.unix_peer(uid, self._expected_uid)
+        if not verdict.allowed:
+            await stream.aclose()
+            raise SocketRefused(self._bridge, verdict, uid)
+        return stream
+
     async def sleep(self, seconds: float) -> None:
         await self._backend.sleep(seconds)
 
 
 def _pooled(
-    context: ssl.SSLContext, backend: GuardedBackend, *, keepalive: bool
+    context: ssl.SSLContext,
+    backend: GuardedBackend,
+    *,
+    keepalive: bool,
+    uds: str | None = None,
 ) -> httpx.AsyncHTTPTransport:
-    """httpx's transport, for its request and error mapping, over a pool with ``backend``."""
+    """httpx's transport, for its request and error mapping, over a pool with ``backend``, on
+    the Unix socket ``uds`` when given."""
     transport = httpx.AsyncHTTPTransport(verify=context, trust_env=False)
     limits = httpx.Limits() if keepalive else httpx.Limits(max_keepalive_connections=0)
     transport._pool = httpcore.AsyncConnectionPool(
@@ -199,6 +271,7 @@ def _pooled(
         max_connections=limits.max_connections,
         max_keepalive_connections=limits.max_keepalive_connections,
         keepalive_expiry=limits.keepalive_expiry,
+        uds=uds,
         network_backend=backend,
     )
     return transport
@@ -355,3 +428,48 @@ def token_client(
         follow_redirects=False,
         timeout=TOKEN_TIMEOUT,
     )
+
+
+def local_client(*, timeout: httpx.Timeout) -> httpx.AsyncClient:
+    """The client a local MCP route's upstream is reached on (M7 design B.2): direct, never
+    proxied, whatever ``egress_proxy`` says, and only to loopback or private addresses
+    (``netguard.local_only``), with no exception set. The vault picks it for a route that is a
+    local MCP route in the running policy, so a reload that adds one needs no restart. No
+    redirects, no proxy variables; the vault gives it a jar that keeps no cookies."""
+    hooks = HOOKS or Hooks()
+    backend = GuardedBackend(local_only=True, resolver=hooks.resolver, dial=hooks.dial)
+    return httpx.AsyncClient(
+        transport=_pooled(ssl_context(), backend, keepalive=True),
+        trust_env=False,
+        follow_redirects=False,
+        timeout=timeout,
+    )
+
+
+class SocketClients:
+    """The clients ``unix:`` routes are reached on (M7 design B.2, Q46): one per bridge the
+    launcher named on the vault's command line (``--bridge NAME=UID``), built at start, each
+    over a pool on that bridge's socket whose backend keeps a connection only when its listener
+    is that uid. Called with a bridge's name, it gives that bridge's client, or None for a name
+    the launcher didn't start (``unknown_socket``). Direct, never proxied, no redirects, no proxy
+    variables; the vault gives each a jar that keeps no cookies."""
+
+    def __init__(self, bridges: Mapping[str, int], *, timeout: httpx.Timeout) -> None:
+        hooks = HOOKS or Hooks()
+        where = hooks.socket_path or fields.bridge_socket
+        self._clients: dict[str, httpx.AsyncClient] = {}
+        for name, uid in bridges.items():
+            backend = GuardedBackend(bridge=name, expected_uid=uid)
+            self._clients[name] = httpx.AsyncClient(
+                transport=_pooled(ssl_context(), backend, keepalive=True, uds=where(name)),
+                trust_env=False,
+                follow_redirects=False,
+                timeout=timeout,
+            )
+
+    def __call__(self, name: str) -> httpx.AsyncClient | None:
+        return self._clients.get(name)
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            await client.aclose()

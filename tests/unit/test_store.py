@@ -54,6 +54,40 @@ def test_canonical_origin(url: str, origin: str) -> None:
     assert canonical_origin(url) == origin
 
 
+BRIDGE = "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+
+
+def test_a_bridges_socket_is_its_own_origin() -> None:
+    """M7 design A.2: a unix: upstream is its own origin, as written; any other unix: form, or
+    one no route could hold, isn't an origin at all."""
+    assert canonical_origin(BRIDGE) == BRIDGE
+    assert origin_binding([BRIDGE, "https://api.example"]) == {
+        "origins": ["https://api.example:443", BRIDGE]
+    }
+    for url in (
+        "unix:/run/zoeymcp-bridge-Fetch/mcp.sock",
+        "unix:/run/zoeymcp-link/vault.sock",
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock/mcp",
+    ):
+        with pytest.raises(ValueError, match="a unix: upstream is a standard-tier bridge's socket"):
+            canonical_origin(url)
+
+
+def test_a_secret_bound_to_a_socket_goes_only_to_that_socket(tmp_path: Path) -> None:
+    """A bridge's token, stored by secret set --generate under its route's binding, is injected
+    only on a route to that socket: not another bridge's, nor any URL."""
+    store = new_store(tmp_path)
+    store.put("bridge-fetch-token", "token-value", origin_binding([BRIDGE]))
+    assert store.get_for_origin("bridge-fetch-token", BRIDGE).reveal() == "token-value"
+    for other in (
+        "unix:/run/zoeymcp-bridge-files/mcp.sock",
+        "http://bridge-fetch-mcp:9000",
+        "http://localhost",
+    ):
+        with pytest.raises(SecretUnavailable):
+            store.get_for_origin("bridge-fetch-token", other)
+
+
 def test_round_trip_and_persistence(tmp_path: Path) -> None:
     store = new_store(tmp_path)
     store.put("stats", "s3cret-value", API)

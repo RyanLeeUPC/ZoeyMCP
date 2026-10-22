@@ -12,6 +12,7 @@ dial to an address no fake was given is refused, so no test reaches the real net
 (tests/acceptance/procs.py's launcher), whose clients are all guarded and so all answer names from
 it. A saved map may also name a ``pause_after_put`` marker file: that vault then holds every
 secret write once it returns, for a crash test to kill it there (M7 design N).
+:func:`install_sockets` puts each bridge's socket in a test directory (:func:`sockets_in`).
 
 :func:`serve_https` is the smallest fake a dial can reach: one TLS listener on loopback that
 answers every request ``200 ok`` and closes the connection, recording the SNI name and the request
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import ipaddress
 import json
 import ssl
@@ -119,6 +121,20 @@ def install(path: str) -> None:
     marker = json.loads(Path(path).read_bytes()).get("pause_after_put")
     if marker is not None:
         _pause_after_put(Path(marker))
+
+
+def sockets_in(directory: Path) -> netclient.SocketPath:
+    """A ``socket_path`` hook (M7 design B.2): bridge ``<name>``'s socket is
+    ``<directory>/zoeymcp-bridge-<name>/mcp.sock``, a test's stand-in for the fixed
+    ``/run/zoeymcp-bridge-<name>/mcp.sock`` its route's ``unix:`` upstream still names."""
+    return lambda name: str(directory / f"zoeymcp-bridge-{name}" / "mcp.sock")
+
+
+def install_sockets(directory: str) -> None:
+    """In a vault's own process, before it builds a client: find each bridge's socket under
+    ``directory`` (:func:`sockets_in`), keeping any resolver hooks already installed."""
+    hooks = netclient.HOOKS or netclient.Hooks()
+    netclient.HOOKS = dataclasses.replace(hooks, socket_path=sockets_in(Path(directory)))
 
 
 def _pause_after_put(marker: Path) -> None:

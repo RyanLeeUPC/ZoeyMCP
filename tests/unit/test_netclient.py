@@ -1,7 +1,9 @@
 """Effect tests for the vault's guarded clients (M7 design B.2, B.3, B.6; X3, X23, FM-8, TI-10),
 through the real ``VaultApp`` constructor (F-2): the onboarding client (step 4), and the route and
 token clients (step 16), whose refusals answer 502 ``address_refused``, fail a token call with the
-reason ``address_refused``, and are logged and kept for health.
+reason ``address_refused``, and are logged and kept for health; and (step 18b) the local client a
+local MCP route goes on, and the socket clients ``unix:`` routes go on, the latter on Linux with a
+listener in a test directory that ``socket_path`` maps each bridge's fixed path to.
 
 Names resolve through the fake resolver (tests/fakes/resolver.py): each answers an address
 reserved for the run, and the dial map sends the address the guard checked to a TLS fake on
@@ -12,10 +14,16 @@ does, except in X23's row, which keeps the real bundle.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import io
 import json
+import os
+import shutil
 import socket
 import ssl
+import sys
+import tempfile
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,11 +36,12 @@ import pytest
 
 from tests.acceptance.tls import ProviderCA, issue_cert, make_ca
 from tests.fakes.connect_proxy import ConnectProxy, ProxySwitch, serve_proxy
-from tests.fakes.resolver import TIMEOUT, FakeResolver, serve_https
+from tests.fakes.resolver import TIMEOUT, FakeResolver, serve_https, sockets_in
 from zoeymcp.common.netguard import AddressVerdict
 from zoeymcp.common.policy import Policy
 from zoeymcp.vault import logs, netclient
-from zoeymcp.vault.app import VaultApp
+from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
+from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.netclient import ONBOARDING_EXTENSION, AddressRefused, ResolveFailed
 from zoeymcp.vault.oauth.protocol import TokenRequest, TokenResponse
@@ -701,3 +710,402 @@ async def test_a_trailing_dot_name_is_listed_by_its_entry_without_the_dot() -> N
         with pytest.raises(AddressRefused) as caught:
             await backend.connect_tcp(f"{LAN}.", 443)
     assert caught.value.verdict.reason == "private"
+
+
+# --- step 18b: local MCP routes and bridges' sockets (X3, FM-29, Q46) ----------------------------
+
+MCP_RULES = [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}]
+LOCAL_ONLY = "a local MCP route reaches only loopback or private addresses"
+# The peer check reads SO_PEERCRED (Linux); a test run as root can't show a uid refused.
+UID = getattr(os, "getuid", lambda: -1)()
+SOCKETS = pytest.mark.skipif(
+    not hasattr(socket, "SO_PEERCRED") or UID <= 0,
+    reason="a bridge's socket needs Linux (SO_PEERCRED) and a uid other than root",
+)
+
+
+@asynccontextmanager
+async def serve_http(unix: Path | None = None) -> AsyncIterator[tuple[int, list[bytes]]]:
+    """A plain-http upstream, on loopback or on the Unix socket ``unix``: each connection's
+    request head, as far as it came, is recorded and a whole one answered ``200 ok``."""
+    heads: list[bytes] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+        except asyncio.IncompleteReadError as exc:
+            head = exc.partial
+        heads.append(head)
+        if head:
+            writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            with contextlib.suppress(ConnectionError):
+                await writer.drain()
+        writer.close()
+
+    if unix is None:
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = int(server.sockets[0].getsockname()[1])
+    else:
+        if sys.platform == "win32":
+            raise RuntimeError("a Unix socket listener needs Linux here")
+        server = await asyncio.start_unix_server(handle, path=str(unix))
+        port = 0
+    async with server:
+        yield port, heads
+
+
+def bridges_policy(
+    upstreams: dict[str, str], *, served: bool = True, proxy: str | None = None
+) -> Policy:
+    """One bridge route per name, as A.4 writes it, each with its own token and, when
+    ``served``, the remote server that makes it a local MCP route."""
+    document: dict[str, Any] = {
+        "version": 1,
+        "mode": "declarative",
+        "credentials": {
+            name: {"kind": "header", "secret": f"store:{name}-token"} for name in upstreams
+        },
+        "routes": [
+            {
+                "name": name,
+                "prefix": f"/{name}",
+                "upstream": upstream,
+                "allow_insecure_upstream": upstream.startswith("http:"),
+                "credential": name,
+                "callers": ["gateway"],
+                "stream": True,
+                "rules": MCP_RULES,
+            }
+            for name, upstream in upstreams.items()
+        ],
+        "gateway": {
+            "servers": {name: {"kind": "remote", "route": name} for name in upstreams}
+            if served
+            else {}
+        },
+    }
+    if proxy is not None:
+        document["egress_proxy"] = proxy
+    return Policy.model_validate(document)
+
+
+def bridges_vault(
+    tmp_path: Path, policy: Policy, bridges: dict[str, int] | None = None
+) -> VaultApp:
+    """The real VaultApp with no client injected, each bridge's token stored under the binding
+    its route gives it, and, with ``bridges``, the socket clients ``--bridge`` would build."""
+    keys = KeySet.from_text(KEY)
+    store = SecretStore(tmp_path / "state", keys)
+    store.load()
+    for name in policy.credentials:
+        store.put(f"{name}-token", f"token-{name}", derive_binding(policy, f"{name}-token"))
+    if bridges is None:
+        return VaultApp(policy, store, keys, environ={})
+    timeout = httpx.Timeout(60.0, connect=10.0)
+    sockets = netclient.SocketClients(bridges, timeout=timeout)
+    return VaultApp(policy, store, keys, environ={}, socket_clients=sockets)
+
+
+async def from_the_gateway(app: VaultApp, name: str = "fetch") -> httpx.Response:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 40000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://vault") as caller:
+        key = KeySet.from_text(KEY).gateway_key(1)
+        return await caller.post(f"/{name}/mcp", headers={GATEWAY_HEADER: key}, content=b"{}")
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.5", "172.16.0.9", "fd00::5"])
+async def test_a_local_route_reaches_a_loopback_or_private_address(
+    tmp_path: Path, fake: FakeResolver, address: str
+) -> None:
+    """X3 for a local MCP route: its own client, with no egress_private entry needed."""
+    app = bridges_vault(tmp_path, bridges_policy({"fetch": "http://bridge-fetch-mcp:9000"}))
+    try:
+        async with serve_http() as (port, heads):
+            fake.serve("bridge-fetch-mcp", port, address=address)
+            with anyio.fail_after(10):
+                answer = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert (answer.status_code, answer.text) == (200, "ok")
+    assert fake.dialled == [(address, 9000)]
+    [head] = heads
+    assert head.startswith(b"POST /mcp HTTP/1.1\r\n")
+    assert b"\r\nauthorization: bearer token-fetch\r\n" in head.lower()
+
+
+@pytest.mark.parametrize(
+    ("answer", "verdict"),
+    [
+        (["8.8.8.8"], "global"),
+        (["169.254.169.254"], "link_local"),
+        (["100.64.0.1"], "cgnat"),
+        (["10.0.0.5", "8.8.8.8"], "global"),  # one global answer refuses the name
+    ],
+)
+async def test_a_local_routes_name_steered_beyond_a_local_address_is_refused(
+    tmp_path: Path, fake: FakeResolver, events: io.StringIO, answer: list[str], verdict: str
+) -> None:
+    """Nothing dialled, 502 address_refused, logged; egress_private can't help a local route,
+    so the reason says what can, and health isn't asked to list it."""
+    app = bridges_vault(tmp_path, bridges_policy({"fetch": "http://bridge-fetch-mcp:9000"}))
+    try:
+        fake.answer("bridge-fetch-mcp", answer)
+        with anyio.fail_after(10):
+            refused = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert refused.status_code == 502
+    assert refused.json() == {"error": "upstream unavailable", "code": "address_refused"}
+    assert fake.dialled == []
+    [line] = lines(events, "address_refused")
+    assert fields(line) == {
+        "purpose": "route",
+        "host": "bridge-fetch-mcp",
+        "port": 9000,
+        "verdict": verdict,
+    }
+    assert lines(events, "request")[-1]["reason"] == f"address refused ({verdict}): {LOCAL_ONLY}"
+    assert kept(app) == []
+
+
+async def test_a_reload_that_adds_a_local_route_serves_it_without_a_restart(
+    tmp_path: Path, fake: FakeResolver
+) -> None:
+    """The local client is picked by the running policy: the same route that no server names
+    goes on the route client, which refuses a private address egress_private doesn't list;
+    once a reload makes it a local MCP route, the next request goes through."""
+    upstreams = {"fetch": "http://bridge-fetch-mcp:9000"}
+    app = bridges_vault(tmp_path, bridges_policy(upstreams, served=False))
+    try:
+        async with serve_http() as (port, heads):
+            fake.serve("bridge-fetch-mcp", port, address="10.0.0.5")
+            with anyio.fail_after(10):
+                refused = await from_the_gateway(app)
+                app.reload(bridges_policy(upstreams))
+                served = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert (refused.status_code, refused.json()["code"]) == (502, "address_refused")
+    assert (served.status_code, served.text) == (200, "ok")
+    assert len(heads) == 1
+
+
+async def test_a_local_route_never_goes_through_egress_proxy(
+    tmp_path: Path, fake: FakeResolver
+) -> None:
+    """B.2: the egress lists never name a local route, so the vault reaches a bridge directly,
+    whatever egress_proxy says, while an ordinary route still goes through the proxy."""
+    proxy = ConnectProxy({ProxySwitch.REFUSE_403})
+    with serve_proxy(proxy) as url:
+        policy = bridges_policy({"fetch": "http://bridge-fetch-mcp:9000"}, proxy=url)
+        app = bridges_vault(tmp_path, policy)
+        try:
+            async with serve_http() as (port, heads):
+                fake.serve("bridge-fetch-mcp", port, address="127.0.0.1")
+                with anyio.fail_after(10):
+                    answer = await from_the_gateway(app)
+        finally:
+            await app.aclose()
+    assert (answer.status_code, answer.text) == (200, "ok")
+    assert len(heads) == 1
+    assert proxy.targets == []
+    # The route client is the proxied one; the local client is never built with the proxy.
+    assert not isinstance(app._client._transport, netclient.GuardedTransport)
+    pool = app._local_client._transport._pool  # type: ignore[attr-defined]
+    assert isinstance(pool._network_backend, netclient.GuardedBackend)
+
+
+async def test_the_local_client_is_direct_and_guarded(tmp_path: Path) -> None:
+    app = bridges_vault(tmp_path, bridges_policy({"fetch": "http://bridge:9000"}))
+    client = app._local_client
+    try:
+        assert client is not app._client
+        assert client.follow_redirects is False
+        assert client.trust_env is False
+        assert type(client.cookies.jar).__name__ == "_DiscardingJar"
+        pool = client._transport._pool  # type: ignore[attr-defined]
+        assert isinstance(pool._network_backend, netclient.GuardedBackend)
+        assert pool._network_backend._local_only is True
+    finally:
+        await app.aclose()
+    assert client.is_closed
+
+
+# --- the socket rows (Linux): a listener in a test directory, through socket_path -----------------
+
+
+@pytest.fixture
+def sockets(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A short directory (a socket's path has at most 107 bytes) holding each bridge's
+    ``zoeymcp-bridge-<name>/mcp.sock``, which the socket clients find through ``socket_path``."""
+    directory = Path(tempfile.mkdtemp(prefix="zb-"))
+    for name in ("fetch", "files"):
+        (directory / f"zoeymcp-bridge-{name}").mkdir(mode=0o700)
+    monkeypatch.setattr(netclient, "HOOKS", netclient.Hooks(socket_path=sockets_in(directory)))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def socket_of(directory: Path, name: str) -> Path:
+    return directory / f"zoeymcp-bridge-{name}" / "mcp.sock"
+
+
+FETCH = "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+FILES = "unix:/run/zoeymcp-bridge-files/mcp.sock"
+
+
+@SOCKETS
+async def test_a_unix_route_is_served_by_the_uid_bridge_named(
+    tmp_path: Path, sockets: Path
+) -> None:
+    app = bridges_vault(tmp_path, bridges_policy({"fetch": FETCH}), {"fetch": UID})
+    try:
+        async with serve_http(socket_of(sockets, "fetch")) as (_, heads):
+            with anyio.fail_after(10):
+                answer = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert (answer.status_code, answer.text) == (200, "ok")
+    [head] = heads
+    assert head.startswith(b"POST /mcp HTTP/1.1\r\n")
+    assert b"\r\nhost: bridge.invalid\r\n" in head.lower()
+    assert b"\r\nauthorization: bearer token-fetch\r\n" in head.lower()
+
+
+@SOCKETS
+async def test_a_socket_another_uid_listens_on_is_refused_before_a_byte_is_written(
+    tmp_path: Path, sockets: Path, events: io.StringIO
+) -> None:
+    """The peer check (Q46): the listener runs as the test's uid, --bridge named another."""
+    app = bridges_vault(tmp_path, bridges_policy({"fetch": FETCH}), {"fetch": UID + 1})
+    try:
+        async with serve_http(socket_of(sockets, "fetch")) as (_, heads):
+            with anyio.fail_after(10):
+                refused = await from_the_gateway(app)
+            await anyio.sleep(0)  # let the listener see the closed connection, if it hasn't
+    finally:
+        await app.aclose()
+    assert refused.status_code == 502
+    assert refused.json() == {"error": "upstream unavailable", "code": "address_refused"}
+    assert not any(heads)
+    [line] = lines(events, "address_refused")
+    assert {k: line[k] for k in ("purpose", "bridge", "verdict", "uid")} == {
+        "purpose": "route",
+        "bridge": "fetch",
+        "verdict": "peer_uid",
+        "uid": UID,
+    }
+
+
+@SOCKETS
+@pytest.mark.parametrize("bridges", [{"other": UID}, None], ids=["unknown name", "no --bridge"])
+async def test_a_bridge_the_launcher_didnt_start_answers_unknown_socket(
+    tmp_path: Path, sockets: Path, events: io.StringIO, bridges: dict[str, int] | None
+) -> None:
+    app = bridges_vault(tmp_path, bridges_policy({"fetch": FETCH}), bridges)
+    try:
+        async with serve_http(socket_of(sockets, "fetch")) as (_, heads):
+            with anyio.fail_after(10):
+                refused = await from_the_gateway(app)
+    finally:
+        await app.aclose()
+    assert (refused.status_code, refused.json()["code"]) == (502, "address_refused")
+    assert heads == []
+    [line] = lines(events, "address_refused")
+    assert (line["bridge"], line["verdict"]) == ("fetch", "unknown_socket")
+
+
+@SOCKETS
+async def test_a_dead_bridge_fails_fast(tmp_path: Path, sockets: Path) -> None:
+    """FM-29: a refused bridge's socket is absent, an exited one's has no listener; either
+    route answers 502 at once, with nothing sent."""
+    app = bridges_vault(
+        tmp_path, bridges_policy({"fetch": FETCH, "files": FILES}), {"fetch": UID, "files": UID}
+    )
+    if sys.platform == "win32":
+        raise RuntimeError("a Unix socket needs Linux here")
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(socket_of(sockets, "files")))
+    stale.close()  # the file stays; nothing listens on it
+    try:
+        with anyio.fail_after(2):
+            absent = await from_the_gateway(app, "fetch")
+            no_listener = await from_the_gateway(app, "files")
+    finally:
+        await app.aclose()
+    for answer in (absent, no_listener):
+        assert answer.status_code == 502
+        assert "code" not in answer.json()
+
+
+@SOCKETS
+async def test_two_bridges_each_reach_their_own_socket(
+    tmp_path: Path, sockets: Path, events: io.StringIO
+) -> None:
+    """Each route its own socket, picked by the bridge's name; a --bridge mapping that swaps
+    their uids (here one uid is not the listener's) is refused by the peer check, nothing
+    written."""
+    policy = bridges_policy({"fetch": FETCH, "files": FILES})
+    app = bridges_vault(tmp_path, policy, {"fetch": UID, "files": UID})
+    swapped = bridges_vault(tmp_path / "swapped", policy, {"fetch": UID, "files": UID + 1})
+    try:
+        async with (
+            serve_http(socket_of(sockets, "fetch")) as (_, fetch),
+            serve_http(socket_of(sockets, "files")) as (_, files),
+        ):
+            with anyio.fail_after(10):
+                answers = [await from_the_gateway(app, name) for name in ("fetch", "files")]
+                refused = await from_the_gateway(swapped, "files")
+                await anyio.sleep(0)
+    finally:
+        await app.aclose()
+        await swapped.aclose()
+    assert [a.status_code for a in answers] == [200, 200]
+    assert [h for h in fetch if h] == fetch[:1]
+    assert b"authorization: bearer token-fetch" in fetch[0].lower()
+    [served] = [h for h in files if h]
+    assert b"authorization: bearer token-files" in served.lower()
+    assert refused.status_code == 502
+    [line] = lines(events, "address_refused")
+    assert (line["bridge"], line["verdict"]) == ("files", "peer_uid")
+
+
+async def test_the_socket_clients_are_one_per_bridge_and_closed_with_the_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Built at start from --bridge, each over its bridge's socket; none for another name."""
+    monkeypatch.setattr(netclient, "HOOKS", None)
+    clients = netclient.SocketClients({"fetch": 10100, "files": 10101}, timeout=httpx.Timeout(5))
+    fetch, files = clients("fetch"), clients("files")
+    assert fetch is not None
+    assert files is not None
+    assert fetch is not files
+    assert clients("other") is None
+    pool = fetch._transport._pool  # type: ignore[attr-defined]
+    assert pool._uds == "/run/zoeymcp-bridge-fetch/mcp.sock"
+    backend = pool._network_backend
+    assert (backend._bridge, backend._expected_uid) == ("fetch", 10100)
+    assert (fetch.follow_redirects, fetch.trust_env) == (False, False)
+    keys = KeySet.from_text(KEY)
+    store = SecretStore(tmp_path / "state", keys)
+    store.load()
+    app = VaultApp(
+        bridges_policy({"fetch": FETCH}), store, keys, environ={}, socket_clients=clients
+    )
+    await app.aclose()
+    assert fetch.is_closed
+    assert files.is_closed
+
+
+async def test_a_backend_without_a_bridge_never_connects(tmp_path: Path) -> None:
+    """unknown_socket before any connect: no uid was named for this socket."""
+    backend = netclient.GuardedBackend(bridge="fetch")
+    with pytest.raises(netclient.SocketRefused) as caught:
+        await backend.connect_unix_socket(str(tmp_path / "nothing-here.sock"))
+    assert (caught.value.bridge, caught.value.verdict.reason, caught.value.uid) == (
+        "fetch",
+        "unknown_socket",
+        None,
+    )

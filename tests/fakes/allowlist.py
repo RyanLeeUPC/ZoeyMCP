@@ -26,7 +26,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from zoeymcp.common import egresslist
-from zoeymcp.common.egresslist import Destination
+from zoeymcp.common.egresslist import Destination, Reason
 
 PATH = "/_zoeymcp/egress/v1/allowlists"
 HEADER = "x-zoeymcp-egress"
@@ -60,15 +60,21 @@ class Seen:
 
 
 def document(sources: Mapping[str, Iterable[Entry]]) -> dict[str, Any]:
-    """The vault's answer for these lists (G.2), through ``egresslist.document``."""
+    """The vault's answer for these lists (G.2), through ``egresslist.document``: any source
+    other than ``vault`` is a route program's (I.2), named by its route."""
     lists = {
         source: tuple(
-            Destination(e[0], e[1], bool(e[2]) if len(e) == 3 else False, frozenset({"route"}))
+            Destination(e[0], e[1], bool(e[2]) if len(e) == 3 else False, _reasons(source))
             for e in sorted(entries)
         )
         for source, entries in sources.items()
     }
     return egresslist.document(lists)
+
+
+def _reasons(source: str) -> frozenset[Reason]:
+    # Never in the document: only egresslist's text and the self-test read reasons.
+    return frozenset({"route" if source == egresslist.VAULT else "program"})
 
 
 @dataclass

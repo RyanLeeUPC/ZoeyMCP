@@ -15,7 +15,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from zoeymcp.common.policy import Finding, PolicyError, check_policy, parse_policy
+from zoeymcp.common.policy import Finding, PolicyError, check, check_policy, parse_policy
 from zoeymcp.common.policy.schema import (
     Client,
     Gateway,
@@ -27,6 +27,7 @@ from zoeymcp.common.policy.schema import (
     param_values,
     split_scope,
 )
+from zoeymcp.common.policy.view import build_view
 
 Raw = dict[str, Any]
 # agent1's token_sha256 in the example policy.
@@ -1748,6 +1749,12 @@ def test_an_invalid_egress_private_entry(example_raw: Raw, entry: str, expected:
     )
 
 
+NOT_A_SOURCE = (
+    "isn't an egress source: the vault's is vault, and a route's is its name once its program "
+    "lists egress"
+)
+
+
 def test_egress_proxy_acls(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     raw["egress_proxy_acls"] = {"vault": "stack_vault_net"}
@@ -1758,8 +1765,8 @@ def test_egress_proxy_acls(example_raw: Raw) -> None:
     raw["egress_proxy_acls"] = {"gateway": "gw", "vault": "stack-vault", "stats": "a" * 65}
     acl = "a Squid ACL name is 1 to 64 letters, digits or underscores"
     assert egress_findings(raw) == [
-        "error egress_proxy_acls.gateway: 'gateway' isn't an egress source; the vault's is vault",
-        "error egress_proxy_acls.stats: 'stats' isn't an egress source; the vault's is vault",
+        f"error egress_proxy_acls.gateway: 'gateway' {NOT_A_SOURCE}",
+        f"error egress_proxy_acls.stats: 'stats' {NOT_A_SOURCE}",
         f"error egress_proxy_acls.stats: {acl}",
         f"error egress_proxy_acls.vault: {acl}",
     ]
@@ -2046,10 +2053,15 @@ def test_mcp_over_plain_http_is_refused(example_raw: Raw) -> None:
     mcp.pop("credential")
     raw["credentials"].pop("broker-mcp")
     found = listed(raw)
+    # Only a local MCP route may be plain http (A.2 rows 9 and 10): the parts that fail, named.
+    parts = (
+        "mcp.broker.example isn't a loopback or private address or a single-label name; the "
+        f"route has no header credential for the adapter's token: {LOCAL_ONLY}"
+    )
     assert (
-        "error gateway.servers.broker-read.route: route 'broker-mcp' uses plain http: "
-        "MCP over cleartext is refused"
+        f"error gateway.servers.broker-read.route: route 'broker-mcp' uses plain http: {parts}"
     ) in found
+    assert f"error routes[1].upstream: {parts}" in found
     # The route alone would only be a warning.
     assert "warning routes[1].upstream: plain http upstream" in found
 
@@ -2232,6 +2244,677 @@ def test_each_bridge_server_is_named(example_raw: Raw) -> None:
         f"gateway.servers.fetch.kind: {NO_BRIDGE_KIND}",
         f"gateway.servers.files.kind: {NO_BRIDGE_KIND}",
     ]
+
+
+# --- local MCP routes, unix: upstreams and route programs (M7 design A.2 rows 5b, 6-11, 9b, 14) --
+
+BRIDGE_TOKEN = "store:bridge-fetch-token"
+SOCKET = "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+# Row 9's tail, after the parts that fail (A.2 rows 9 and 10).
+LOCAL_ONLY = (
+    "plain http only to a loopback or private address, with the adapter's token; anything "
+    "further uses https"
+)
+UNIX_MCP_ONLY = (
+    "a unix: upstream is a standard-tier bridge's socket and serves only an MCP route that "
+    "accepts only the gateway"
+)
+TAKES_THE_TOKEN = "a bridge's socket takes the bridge's token"
+NO_HEADER = "the route has no header credential for the adapter's token"
+SHARED = f"{BRIDGE_TOKEN} isn't a store: secret this credential alone uses"
+SHARED_ROUTE = "bridge-fetch is also route stats's credential"
+NOT_LOCAL = "isn't a loopback or private address or a single-label name"
+UNCONFINED = (
+    "only the egress role confines a program, and only one in its own container on your ZoeyMCP "
+    "networks (the hardened tier); for a program at {} nothing enforces this list"
+)
+REACHES_PRIVATE = (
+    "this would let the program reach a private address; list it in egress_private if that is "
+    "the point"
+)
+
+
+def bridged(example_raw: Raw, upstream: str = "http://bridge-fetch-mcp:9000", **fields: Any) -> Raw:
+    """A.4's hardened bridge added to the example policy as routes[3]: a local MCP route with a
+    program, its token credential and a remote server assigned to agent1."""
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["bridge-fetch"] = {"kind": "header", "secret": BRIDGE_TOKEN}
+    bridge: Raw = {
+        "name": "bridge-fetch",
+        "prefix": "/bridge-fetch",
+        "upstream": upstream,
+        "allow_insecure_upstream": True,
+        "credential": "bridge-fetch",
+        "callers": ["gateway"],
+        "stream": True,
+        "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+        "program": {"egress": ["docs.example.org:443"]},
+    }
+    bridge.update(fields)
+    raw["routes"].append(bridge)
+    raw["gateway"]["servers"]["fetch"] = {
+        "kind": "remote",
+        "route": "bridge-fetch",
+        "era": "legacy",
+    }
+    raw["gateway"]["clients"]["agent1"]["servers"].append("fetch")
+    return raw
+
+
+def standard(example_raw: Raw, **fields: Any) -> Raw:
+    """A.4's same bridge in the standard tier: its socket, no plain-http opt-in, no egress, and
+    the program flagged as holding a real secret."""
+    raw = bridged(example_raw, SOCKET, program={"holds_secret": True})
+    bridge = route(raw, "bridge-fetch")
+    del bridge["allow_insecure_upstream"]
+    bridge.update(fields)
+    return raw
+
+
+def bridge_findings(raw: Raw) -> list[str]:
+    """The findings about the bridge: its route, its server, its credential."""
+    paths = ("routes[3]", "gateway.servers.fetch", "credentials.bridge-fetch")
+    return [f for f in listed(raw) if f.split(" ", 1)[1].startswith(paths)]
+
+
+HOLDS_A_SECRET = (
+    "warning routes[3].program.holds_secret: the program behind this route holds a real secret "
+    "(R35); through the egress role it can send it to: {}; in the standard tier or on another "
+    "host nothing confines where it sends it"
+)
+
+
+def test_the_hardened_bridge_checks_clean(example_raw: Raw) -> None:
+    """A.4's example: a container alias over plain http with the bridge's token, and the
+    program's egress, which the role confines there. Nothing is said about it."""
+    raw = bridged(example_raw)
+    assert bridge_findings(raw) == []
+    assert errors(run(raw)) == []
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    assert check.local_mcp_routes(policy) == frozenset({"bridge-fetch"})
+
+
+def test_the_standard_bridge_checks_clean_but_for_its_secret(example_raw: Raw) -> None:
+    """A.4's standard example: a socket needs no plain-http opt-in, and a program holding a
+    real secret is always a warning (row 11)."""
+    raw = standard(example_raw)
+    assert bridge_findings(raw) == [HOLDS_A_SECRET.format("nowhere")]
+    assert errors(run(raw)) == []
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    assert policy.routes[3].upstream == SOCKET
+    assert check.local_mcp_routes(policy) == frozenset({"bridge-fetch"})
+
+
+def test_a_remote_bridge_is_an_ordinary_route(example_raw: Raw) -> None:
+    """A.4's remote bridge: https, no opt-in; its egress is a list nothing enforces (row 7b)."""
+    raw = bridged(example_raw, "https://fetch.bridges.example")
+    del route(raw, "bridge-fetch")["allow_insecure_upstream"]
+    assert bridge_findings(raw) == [
+        f"warning routes[3].program.egress: {UNCONFINED.format('fetch.bridges.example')}"
+    ]
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    assert check.local_mcp_routes(policy) == frozenset()
+
+
+def test_the_route_the_kind_bridge_message_describes_passes_check(example_raw: Raw) -> None:
+    """CR-B2: old_bridge's url, http://bridge.example:9000/mcp, written as the message says,
+    with a single-label host: the origin is the upstream, the old path the server's, and the
+    server's vault path is the route's prefix and /mcp once, which the vault joins to the
+    upstream's empty path."""
+    raw = copy.deepcopy(example_raw)
+    raw["credentials"]["fetch-token"] = {"kind": "header", "secret": "store:fetch-token"}
+    raw["routes"].append(
+        {
+            "name": "fetch",
+            "prefix": "/fetch",
+            "upstream": "http://bridge:9000",
+            "allow_insecure_upstream": True,
+            "credential": "fetch-token",
+            "callers": ["gateway"],
+            "stream": True,
+            "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+            "program": {"egress": ["api.bridge.example:443"]},
+        }
+    )
+    server = old_bridge()
+    del server["url"], server["egress"]
+    raw["gateway"]["servers"]["fetch"] = {
+        **server,
+        "kind": "remote",
+        "route": "fetch",
+        "path": "/mcp",
+    }
+    raw["gateway"]["clients"]["agent1"]["servers"].append("fetch")
+    assert errors(run(raw)) == []
+    assert [f for f in warnings(run(raw)) if "fetch" in f or f.startswith("routes[3]")] == []
+    view = build_view(parse_policy(yaml.safe_dump(raw, sort_keys=False), "test"))
+    assert view.gateway.servers["fetch"].model_dump()["vault_path"] == "/fetch/mcp"
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        "http://127.0.0.1:9000",
+        "http://127.255.255.254",
+        "http://10.1.2.3:9000",
+        "http://172.16.0.5:9000",
+        "http://172.31.255.255:9000",
+        "http://192.168.1.1:9000",
+        "http://[::1]:9000",
+        "http://[fd00::5]:9000",
+        "http://localhost:9000",
+        "http://bridge:9000",
+    ],
+)
+def test_a_local_target_over_plain_http(example_raw: Raw, upstream: str) -> None:
+    """Row 9's host half: a loopback or private literal, or a single-label name."""
+    raw = bridged(example_raw, upstream)
+    del route(raw, "bridge-fetch")["program"]
+    assert bridge_findings(raw) == []
+
+
+@pytest.mark.parametrize(
+    ("upstream", "host"),
+    [
+        ("http://bridge.fetch.example:9000", "bridge.fetch.example"),  # two labels
+        ("http://8.8.8.8:9000", "8.8.8.8"),  # global
+        ("http://169.254.169.254", "169.254.169.254"),  # link-local: cloud metadata
+        ("http://100.64.0.1:9000", "100.64.0.1"),  # CGNAT
+        ("http://172.32.0.1:9000", "172.32.0.1"),  # just past 172.16.0.0/12
+        ("http://[fe80::1]:9000", "fe80::1"),
+        ("http://x.localhost:9000", "x.localhost"),
+        ("http://2130706433:9000", "2130706433"),  # 127.0.0.1, spelled as a number
+    ],
+)
+def test_plain_http_beyond_a_local_target_is_refused(
+    example_raw: Raw, upstream: str, host: str
+) -> None:
+    """Row 9 at the route, row 10 at the server, both naming the host; and row 9 doesn't lift
+    the route's own refusal of a credential over plain http."""
+    raw = bridged(example_raw, upstream)
+    del route(raw, "bridge-fetch")["program"]
+    parts = f"{host} {NOT_LOCAL}: {LOCAL_ONLY}"
+    assert sorted(bridge_findings(raw)) == [
+        f"error gateway.servers.fetch.route: route 'bridge-fetch' uses plain http: {parts}",
+        *sorted(
+            [
+                "error routes[3].upstream: a credential can't be sent over plain http",
+                f"error routes[3].upstream: {parts}",
+            ]
+        ),
+    ]
+
+
+def test_without_the_opt_in_plain_http_is_refused(example_raw: Raw) -> None:
+    raw = bridged(example_raw, allow_insecure_upstream=False)
+    parts = f"allow_insecure_upstream isn't set: {LOCAL_ONLY}"
+    assert bridge_findings(raw) == [
+        f"error gateway.servers.fetch.route: route 'bridge-fetch' uses plain http: {parts}",
+        f"error routes[3].upstream: {parts}",
+        "error routes[3].upstream: plain http would send the credential in cleartext; use https "
+        "(or allow_insecure_upstream for a route without one)",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("credential", "problem"),
+    [
+        ({"kind": "query", "param": "key", "secret": BRIDGE_TOKEN}, NO_HEADER),
+        ({"kind": "basic", "username": "u", "secret": BRIDGE_TOKEN}, NO_HEADER),
+        ({"kind": "path", "template": "/t/{secret}", "secret": BRIDGE_TOKEN}, NO_HEADER),
+        (
+            {"kind": "header", "secret": "env:BRIDGE_TOKEN"},
+            "env:BRIDGE_TOKEN isn't a store: secret this credential alone uses",
+        ),
+    ],
+)
+def test_a_local_route_carries_the_adapters_token_in_a_header(
+    example_raw: Raw, credential: Raw, problem: str
+) -> None:
+    raw = bridged(example_raw)
+    raw["credentials"]["bridge-fetch"] = credential
+    parts = f"{problem}: {LOCAL_ONLY}"
+    found = bridge_findings(raw)
+    assert f"error routes[3].upstream: {parts}" in found
+    assert f"error gateway.servers.fetch.route: route 'bridge-fetch' uses plain http: {parts}" in (
+        found
+    )
+    assert "error routes[3].upstream: a credential can't be sent over plain http" in found
+
+
+def test_a_local_route_without_a_credential_is_refused(example_raw: Raw) -> None:
+    raw = bridged(example_raw)
+    del route(raw, "bridge-fetch")["credential"]
+    del raw["credentials"]["bridge-fetch"]
+    parts = f"{NO_HEADER}: {LOCAL_ONLY}"
+    assert bridge_findings(raw) == [
+        f"error gateway.servers.fetch.route: route 'bridge-fetch' uses plain http: {parts}",
+        f"error routes[3].upstream: {parts}",
+        "warning routes[3].upstream: plain http upstream",
+    ]
+
+
+def test_a_local_routes_token_is_no_other_credentials(example_raw: Raw) -> None:
+    """A secret another credential also uses could be sent anywhere that one goes."""
+    raw = bridged(example_raw)
+    raw["credentials"]["other"] = {"kind": "header", "secret": BRIDGE_TOKEN}
+    route(raw, "stats")["credential"] = "other"
+    parts = f"{SHARED}: {LOCAL_ONLY}"
+    found = bridge_findings(raw)
+    assert f"error routes[3].upstream: {parts}" in found
+    assert f"error gateway.servers.fetch.route: route 'bridge-fetch' uses plain http: {parts}" in (
+        found
+    )
+
+
+def test_a_local_routes_credential_is_no_other_routes(example_raw: Raw) -> None:
+    """TI-B6: a credential another route names sends its secret there too, so a real secret
+    could be the token and reach the program in cleartext."""
+    raw = bridged(example_raw)
+    route(raw, "stats")["credential"] = "bridge-fetch"
+    parts = f"{SHARED_ROUTE}: {LOCAL_ONLY}"
+    found = bridge_findings(raw)
+    assert f"error routes[3].upstream: {parts}" in found
+    assert f"error gateway.servers.fetch.route: route 'bridge-fetch' uses plain http: {parts}" in (
+        found
+    )
+
+
+def test_every_failing_part_is_named(example_raw: Raw) -> None:
+    raw = bridged(example_raw, "http://bridge.fetch.example", allow_insecure_upstream=False)
+    raw["credentials"]["bridge-fetch"] = {"kind": "query", "param": "k", "secret": BRIDGE_TOKEN}
+    del route(raw, "bridge-fetch")["program"]
+    parts = (
+        f"allow_insecure_upstream isn't set; bridge.fetch.example {NOT_LOCAL}; {NO_HEADER}: "
+        f"{LOCAL_ONLY}"
+    )
+    assert f"error routes[3].upstream: {parts}" in bridge_findings(raw)
+
+
+def test_a_route_of_the_same_shape_that_isnt_mcp_is_still_refused(example_raw: Raw) -> None:
+    """Rows 9 and 9b are for MCP routes: any other route keeps every plain-http refusal."""
+    raw = bridged(example_raw)
+    del raw["gateway"]["servers"]["fetch"]
+    raw["gateway"]["clients"]["agent1"]["servers"].remove("fetch")
+    found = bridge_findings(raw)
+    assert "error routes[3].upstream: a credential can't be sent over plain http" in found
+    assert not any(LOCAL_ONLY in f for f in found)
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    assert check.local_mcp_routes(policy) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("upstream", "insecure", "served", "local"),
+    [
+        ("http://bridge-fetch-mcp:9000", True, True, True),
+        ("http://10.0.0.7:9000", True, True, True),
+        (SOCKET, False, True, True),
+        (SOCKET, True, True, True),
+        ("http://bridge-fetch-mcp:9000", False, True, False),  # no plain-http opt-in
+        ("https://bridge-fetch-mcp:9000", True, True, False),  # not plain http
+        ("http://bridge.fetch.example:9000", True, True, False),  # no local target
+        ("http://8.8.8.8:9000", True, True, False),
+        ("http://bridge-fetch-mcp:9000", True, False, False),  # no server names it
+        (SOCKET, False, False, False),
+    ],
+)
+def test_which_routes_are_local_mcp_routes(
+    example_raw: Raw, upstream: str, insecure: bool, served: bool, local: bool
+) -> None:
+    """The vault's choice of client and the egress lists read this set (B.2, I.2); check
+    refuses a member without the rest of row 9 or 9b."""
+    raw = bridged(example_raw, upstream, allow_insecure_upstream=insecure)
+    if not served:
+        del raw["gateway"]["servers"]["fetch"]
+        raw["gateway"]["clients"]["agent1"]["servers"].remove("fetch")
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    assert check.local_mcp_routes(policy) == (frozenset({"bridge-fetch"}) if local else frozenset())
+
+
+@pytest.mark.parametrize("upstream", ["http://bridge-fetch-mcp:9000", SOCKET])
+def test_a_local_route_gets_no_connect_only_warning(example_raw: Raw, upstream: str) -> None:
+    """Row 14: a local MCP route, a socket included, bypasses the proxy (B.2), even one row 9
+    or 9b refuses for its missing token; a credential-less plain-http route that isn't one
+    still gets the warning."""
+    raw = bridged(example_raw, upstream)
+    raw["egress_proxy"] = "http://proxy.example:3128"
+    del route(raw, "bridge-fetch")["credential"]
+    del raw["credentials"]["bridge-fetch"]
+    found = bridge_findings(raw)
+    assert any(NO_HEADER in f for f in found)
+    assert not any("CONNECT-only" in f for f in found)
+    route(raw, "bridge-fetch")["upstream"] = "http://bridge.fetch.example:9000"
+    assert any("CONNECT-only" in f for f in bridge_findings(raw))
+
+
+# --- row 9b: a unix: upstream
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        "unix:/run/zoeymcp-link/vault.sock",  # another socket in the container
+        "unix:/run/zoeymcp-bridge-fetch/other.sock",
+        "unix:/tmp/zoeymcp-bridge-fetch/mcp.sock",
+        "unix:run/zoeymcp-bridge-fetch/mcp.sock",  # relative
+        "unix:/run/zoeymcp-bridge-fetch/../zoeymcp-link/mcp.sock",
+        "unix:/run/zoeymcp-bridge-../mcp.sock",
+        "unix:/run/zoeymcp-bridge-abcdefghijklmnopq/mcp.sock",  # 17 characters
+        "unix:/run/zoeymcp-bridge-Fetch/mcp.sock",
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock/",  # a trailing slash
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock/mcp",  # an HTTP path after the socket
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock?a=b",
+        "unix://run/zoeymcp-bridge-fetch/mcp.sock",
+    ],
+)
+def test_a_unix_upstream_takes_one_form(example_raw: Raw, upstream: str) -> None:
+    raw = standard(example_raw)
+    route(raw, "bridge-fetch")["upstream"] = upstream
+    assert schema_errors(raw) == [
+        "routes[3].upstream: Value error, a unix: upstream is a standard-tier bridge's socket, "
+        "unix:/run/zoeymcp-bridge-<name>/mcp.sock"
+    ]
+
+
+def test_a_sixteen_character_bridge_name(example_raw: Raw) -> None:
+    raw = standard(example_raw, upstream="unix:/run/zoeymcp-bridge-abcdefghijklmnop/mcp.sock")
+    assert errors(run(raw)) == []
+
+
+def test_a_unix_upstream_serves_only_an_mcp_route(example_raw: Raw) -> None:
+    raw = standard(example_raw)
+    del raw["gateway"]["servers"]["fetch"]
+    raw["gateway"]["clients"]["agent1"]["servers"].remove("fetch")
+    assert f"error routes[3].upstream: {UNIX_MCP_ONLY}" in bridge_findings(raw)
+
+
+def test_a_unix_upstream_accepts_only_the_gateway(example_raw: Raw) -> None:
+    raw = standard(example_raw)
+    route(raw, "bridge-fetch")["callers"] = ["gateway", {"placeholder": "ph-fetch-0123456789ab"}]
+    found = bridge_findings(raw)
+    assert f"error routes[3].upstream: {UNIX_MCP_ONLY}" in found
+    assert any(f.startswith("error routes[3].callers: a route used by a gateway") for f in found)
+
+
+@pytest.mark.parametrize(
+    ("credential", "problem"),
+    [
+        ({"kind": "query", "param": "key", "secret": BRIDGE_TOKEN}, NO_HEADER),
+        (
+            {
+                "kind": "oauth2",
+                "token_url": "https://auth.example/token",
+                "client_id": "c",
+                "refresh_token": BRIDGE_TOKEN,
+            },
+            NO_HEADER,
+        ),
+        (None, NO_HEADER),
+    ],
+)
+def test_a_unix_upstream_carries_the_bridges_token(
+    example_raw: Raw, credential: Raw | None, problem: str
+) -> None:
+    raw = standard(example_raw)
+    if credential is None:
+        del route(raw, "bridge-fetch")["credential"]
+        del raw["credentials"]["bridge-fetch"]
+    else:
+        raw["credentials"]["bridge-fetch"] = credential
+    assert f"error routes[3].upstream: {problem}: {TAKES_THE_TOKEN}" in bridge_findings(raw)
+
+
+def test_a_unix_upstreams_token_is_no_other_credentials(example_raw: Raw) -> None:
+    raw = standard(example_raw)
+    raw["credentials"]["other"] = {"kind": "header", "secret": BRIDGE_TOKEN}
+    route(raw, "stats")["credential"] = "other"
+    assert f"error routes[3].upstream: {SHARED}: {TAKES_THE_TOKEN}" in bridge_findings(raw)
+
+
+def test_a_unix_upstreams_credential_is_no_other_routes(example_raw: Raw) -> None:
+    raw = standard(example_raw)
+    route(raw, "stats")["credential"] = "bridge-fetch"
+    assert f"error routes[3].upstream: {SHARED_ROUTE}: {TAKES_THE_TOKEN}" in bridge_findings(raw)
+
+
+def test_a_unix_upstream_needs_no_plain_http_opt_in(example_raw: Raw) -> None:
+    raw = standard(example_raw, allow_insecure_upstream=True)
+    assert bridge_findings(raw) == [
+        HOLDS_A_SECRET.format("nowhere"),
+        "warning routes[3].upstream: allow_insecure_upstream has no effect on a unix: upstream; "
+        "remove it",
+    ]
+
+
+def test_a_unix_upstream_must_stream(example_raw: Raw) -> None:
+    raw = standard(example_raw, stream=False)
+    assert (
+        "error gateway.servers.fetch.route: route 'bridge-fetch' must set stream: true for MCP"
+    ) in bridge_findings(raw)
+
+
+def test_two_routes_naming_one_socket(example_raw: Raw) -> None:
+    raw = standard(example_raw)
+    twin = {**copy.deepcopy(route(raw, "bridge-fetch")), "name": "twin", "prefix": "/twin"}
+    raw["routes"].append(twin)
+    raw["gateway"]["servers"]["twin"] = {"kind": "remote", "route": "twin"}
+    raw["gateway"]["clients"]["agent1"]["servers"].append("twin")
+    found = errors(run(raw))
+    assert (
+        "routes[4].upstream: duplicate socket (also routes[3]): a bridge serves one route" in found
+    )
+    assert not any(f.startswith("routes[3].upstream: duplicate") for f in found)
+
+
+def test_a_unix_upstream_is_its_own_origin(example_raw: Raw) -> None:
+    """The origin a header secret binds to (A.2's unix: origin): the socket, as written; an
+    oauth2 credential's resource never matches one."""
+    assert check._origin(SOCKET) == SOCKET
+    assert check._origin("https://API.example") == "https://api.example:443"
+
+
+# --- route programs (rows 6, 7, 7b, 8, 11, 5b)
+
+
+def program_findings(raw: Raw) -> list[str]:
+    return [f for f in listed(raw) if ".program" in f.split(":")[0] or "egress_proxy_acls" in f]
+
+
+def test_a_connector_has_no_program(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    route(raw, "mail-send")["program"] = {"egress": ["docs.example.org:443"]}
+    assert program_findings(raw) == [
+        "error routes[2].program: a connector has no program behind it"
+    ]
+
+
+def test_vault_is_the_roles_own_source_name(example_raw: Raw) -> None:
+    raw = bridged(example_raw)
+    route(raw, "bridge-fetch")["name"] = "vault"
+    raw["gateway"]["servers"]["fetch"]["route"] = "vault"
+    assert program_findings(raw) == [
+        "error routes[3].program: vault is the egress role's own source name"
+    ]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "10.0.0.5:443",  # an IP literal
+        "8.8.8.8:443",  # any IP literal, global or not
+        "[fd00::1]:443",
+        "intranet:443",  # a single label
+        "files.lan:443",  # an internal suffix
+        "files.internal:8443",
+        "printer.local:631",
+        "localhost:443",
+        "x.localhost:443",
+        "a.123:443",  # a numeric last label
+    ],
+)
+def test_a_private_looking_egress_entry_needs_egress_private(example_raw: Raw, entry: str) -> None:
+    """Row 7: netguard's host rules (untrusted_host and INTERNAL_SUFFIXES, the one list)."""
+    raw = bridged(example_raw, program={"egress": ["docs.example.org:443", entry]})
+    assert program_findings(raw) == [f"error routes[3].program.egress[1]: {REACHES_PRIVATE}"]
+    route(raw, "bridge-fetch")["program"]["egress_private"] = [entry]
+    assert program_findings(raw) == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("Docs.example.org:443", "write host:port in lower case"),
+        ("docs.example.org", "expected host:port"),
+        ("docs.example.org:0", "invalid port"),
+    ],
+)
+def test_an_invalid_program_entry(example_raw: Raw, entry: str, expected: str) -> None:
+    for field in ("egress", "egress_private"):
+        raw = bridged(example_raw, program={field: ["docs.example.org:443", entry]})
+        found = schema_errors(raw)
+        assert any(
+            e.startswith(f"routes[3].program.{field}[1]: Value error, {expected}") for e in found
+        ), found
+
+
+def test_egress_private_names_entries_of_egress(example_raw: Raw) -> None:
+    """Row 8."""
+    raw = bridged(
+        example_raw,
+        program={"egress": ["docs.example.org:443"], "egress_private": ["files.lan:443"]},
+    )
+    assert program_findings(raw) == [
+        "error routes[3].program.egress_private[0]: not in egress: list it there too"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("upstream", "where"),
+    [
+        (SOCKET, SOCKET),  # always a standard-tier bridge
+        ("http://localhost:9000", "localhost"),
+        ("http://127.0.0.1:9000", "127.0.0.1"),
+        ("http://[::1]:9000", "::1"),
+        ("http://10.0.0.7:9000", "10.0.0.7"),
+        ("https://fetch.localhost", "fetch.localhost"),
+        ("https://fetch.bridges.example", "fetch.bridges.example"),
+    ],
+)
+def test_egress_nothing_can_enforce_is_a_warning(
+    example_raw: Raw, upstream: str, where: str
+) -> None:
+    """Row 7b (CR-B8): only a program behind a container alias can be one the role confines;
+    localhost and names under it count with the loopback literals."""
+    raw = bridged(example_raw, upstream)
+    if upstream.startswith(("unix:", "https:")):
+        del route(raw, "bridge-fetch")["allow_insecure_upstream"]
+    assert f"warning routes[3].program.egress: {UNCONFINED.format(where)}" in program_findings(raw)
+
+
+def test_a_container_alias_is_confined(example_raw: Raw) -> None:
+    for alias in ("http://bridge-fetch-mcp:9000", "http://fetch"):
+        assert program_findings(bridged(example_raw, alias)) == []
+    # No egress, nothing to warn about.
+    raw = bridged(example_raw, SOCKET, program={"egress": []})
+    del route(raw, "bridge-fetch")["allow_insecure_upstream"]
+    assert program_findings(raw) == []
+
+
+def test_a_program_holding_a_secret_is_always_a_warning(example_raw: Raw) -> None:
+    """Row 11: the warning names where the role lets it send the secret; a private entry is an
+    error."""
+    egress = ["docs.example.org:443", "api.example.org:443"]
+    raw = bridged(example_raw, program={"egress": egress, "holds_secret": True})
+    assert program_findings(raw) == [
+        HOLDS_A_SECRET.format("docs.example.org:443, api.example.org:443")
+    ]
+    route(raw, "bridge-fetch")["program"]["egress"].append("files.lan:443")
+    route(raw, "bridge-fetch")["program"]["egress_private"] = ["files.lan:443"]
+    assert program_findings(raw) == [
+        "error routes[3].program.holds_secret: a program holding a real secret may reach no "
+        "private address: files.lan:443 is in egress_private",
+        HOLDS_A_SECRET.format("docs.example.org:443, api.example.org:443, files.lan:443"),
+    ]
+
+
+def test_a_route_program_is_an_egress_source(example_raw: Raw) -> None:
+    """Row 5b: an egress_proxy_acls key may name a route whose program lists egress."""
+    raw = bridged(example_raw)
+    raw["egress_proxy_acls"] = {"vault": "stack_vault_net", "bridge-fetch": "fetch_net"}
+    assert program_findings(raw) == []
+    route(raw, "bridge-fetch")["program"] = {"holds_secret": False}
+    assert program_findings(raw) == [
+        f"error egress_proxy_acls.bridge-fetch: 'bridge-fetch' {NOT_A_SOURCE}"
+    ]
+    del route(raw, "bridge-fetch")["program"]
+    assert program_findings(raw) == [
+        f"error egress_proxy_acls.bridge-fetch: 'bridge-fetch' {NOT_A_SOURCE}"
+    ]
+
+
+def renamed(raw: Raw, name: str) -> Raw:
+    route(raw, "bridge-fetch")["name"] = name
+    raw["gateway"]["servers"]["fetch"]["route"] = name
+    return raw
+
+
+def name_findings(raw: Raw) -> list[str]:
+    return [f for f in listed(raw) if f.split(" ", 1)[1].startswith("routes[3].name")]
+
+
+@pytest.mark.parametrize("name", ["src", "src_x", "port"])
+def test_a_program_source_name_that_would_clash_in_squid(example_raw: Raw, name: str) -> None:
+    """Route src_x's first destination ACL would be zoeymcp_src_x_1, route x_1's default source
+    ACL; route port's nth, zoeymcp_port_<n>, a port ACL. Nothing reads them with the role."""
+    raw = renamed(bridged(example_raw), name)
+    assert name_findings(raw) == [
+        f"error routes[3].name: a route whose program lists egress can't be named {name}: its "
+        "Squid ACLs would share names with others in the snippet"
+    ]
+    raw["egress_proxy"] = "http://egress-vault:3128"
+    raw["egress_proxy_kind"] = "role"
+    assert name_findings(raw) == []
+    del raw["egress_proxy_kind"]
+    raw["routes"][3]["program"] = {"holds_secret": False}
+    assert name_findings(raw) == []
+
+
+def test_a_program_source_name_too_long_for_squid(example_raw: Raw) -> None:
+    """Squid refuses an ACL name over 63 characters: zoeymcp_src_<route> past 51 (unless
+    egress_proxy_acls names a shorter one), zoeymcp_<route>_<n> past 53 for one destination."""
+    raw = renamed(bridged(example_raw), "b" * 51)
+    assert name_findings(raw) == []
+    raw = renamed(bridged(example_raw), "b" * 52)
+    source = f"its Squid source ACL zoeymcp_src_{'b' * 52} is over 63 characters"
+    assert name_findings(raw) == [
+        f"error routes[3].name: {source}; name a shorter one in egress_proxy_acls.{'b' * 52}"
+    ]
+    raw["egress_proxy_acls"] = {"b" * 52: "fetch_net"}
+    assert name_findings(raw) == []
+    raw = renamed(bridged(example_raw), "b" * 54)
+    raw["egress_proxy_acls"] = {"b" * 54: "fetch_net"}
+    assert name_findings(raw) == [
+        f"error routes[3].name: too long for its Squid ACLs (zoeymcp_{'b' * 54}_1 is over 63 "
+        "characters); use a shorter name"
+    ]
+    raw = renamed(bridged(example_raw), "b" * 53)
+    raw["egress_proxy_acls"] = {"b" * 53: "fetch_net"}
+    assert name_findings(raw) == []
+    entries = [f"h{i}.example.org:443" for i in range(10)]
+    raw["routes"][3]["program"] = {"egress": entries + entries[:1]}
+    assert name_findings(raw) == [
+        f"error routes[3].name: too long for its Squid ACLs (zoeymcp_{'b' * 53}_10 is over 63 "
+        "characters); use a shorter name"
+    ]
+
+
+def test_a_program_needs_no_egress(example_raw: Raw) -> None:
+    raw = bridged(example_raw, program={})
+    assert program_findings(raw) == []
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    program = policy.routes[3].program
+    assert program is not None
+    assert (program.egress, program.egress_private, program.holds_secret) == ([], [], False)
 
 
 @pytest.mark.parametrize("capability", ["resources", "completions", "roots"])

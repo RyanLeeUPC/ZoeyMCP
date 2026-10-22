@@ -7,6 +7,9 @@ request. The schema-level rows (both URL fields, the length cap, the other URL f
 
 A server written ``kind: bridge``: listed by name, so the schema refuses each at its ``kind``
 (M7 design A.1). The message itself is asserted whole in ``test_policy.py``.
+
+A route's ``unix:`` upstream (Q46): ``unix:/run/zoeymcp-bridge-<name>/mcp.sock`` exactly, by
+``fullmatch``, and the bridge's name read back from it.
 """
 
 from __future__ import annotations
@@ -22,7 +25,10 @@ from zoeymcp.common.policy.fields import (
     AUTHORIZE_PARAMS,
     MAX_QUERY_PARAMS,
     TOKEN_PARAMS,
+    UNIX_UPSTREAM_FORM,
     URL_MAX,
+    bridge_name,
+    bridge_socket,
     check_endpoint_query,
     client_host,
     endpoint_query,
@@ -31,6 +37,7 @@ from zoeymcp.common.policy.fields import (
     is_numeric_label,
     is_squid_acl_name,
     no_bridge_kind,
+    unix_upstream,
 )
 from zoeymcp.common.policy.schema import RemoteServer
 
@@ -351,3 +358,58 @@ def test_only_the_kind_bridge_is_listed(kind: object) -> None:
 )
 def test_what_isnt_a_mapping_of_mappings_is_left_to_the_schema(servers: object) -> None:
     assert no_bridge_kind(servers) == []
+
+
+# --- a unix: upstream (M7 design A.1, Q46) -------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["fetch", "a", "0", "abcdefghijklmnop", "b2b"])
+def test_a_bridges_socket_is_a_unix_upstream(name: str) -> None:
+    upstream = f"unix:{bridge_socket(name)}"
+    assert upstream == f"unix:/run/zoeymcp-bridge-{name}/mcp.sock"
+    assert unix_upstream(upstream) == upstream
+    assert bridge_name(upstream) == name
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        "unix:/run/zoeymcp-link/vault.sock",  # every other directory
+        "unix:/run/zoeymcp-admin/admin.sock",
+        "unix:/tmp/zoeymcp-bridge-fetch/mcp.sock",
+        "unix:/run/zoeymcp-bridge-fetch/vault.sock",
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sockx",
+        "unix:/run/zoeymcp-bridge-fetch/mcpXsock",  # the dot is a dot
+        "unix:/run/zoeymcp-bridge-/mcp.sock",
+        "unix:/run/zoeymcp-bridge-abcdefghijklmnopq/mcp.sock",  # 17 characters
+        "unix:/run/zoeymcp-bridge-Fetch/mcp.sock",
+        "unix:/run/zoeymcp-bridge-fe_ch/mcp.sock",
+        "unix:/run/zoeymcp-bridge-fe-ch/mcp.sock",
+        "unix:/run/zoeymcp-bridge-../mcp.sock",
+        "unix:/run/zoeymcp-bridge-fetch/../zoeymcp-link/mcp.sock",
+        "unix:run/zoeymcp-bridge-fetch/mcp.sock",
+        "unix://run/zoeymcp-bridge-fetch/mcp.sock",
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock/",  # a trailing slash
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock/mcp",  # an HTTP path
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock?a=b",  # a query
+        "unix:/run/zoeymcp-bridge-fetch/mcp.sock\n",
+        "xunix:/run/zoeymcp-bridge-fetch/mcp.sock",
+        "UNIX:/run/zoeymcp-bridge-fetch/mcp.sock",
+        "/run/zoeymcp-bridge-fetch/mcp.sock",
+        "http://bridge.invalid/mcp",
+        "",
+    ],
+)
+def test_every_other_upstream_is_refused(upstream: str) -> None:
+    with pytest.raises(ValueError, match=f"^{re.escape(UNIX_UPSTREAM_FORM)}$"):
+        unix_upstream(upstream)
+    with pytest.raises(ValueError, match=f"^{re.escape(UNIX_UPSTREAM_FORM)}$"):
+        bridge_name(upstream)
+
+
+def test_the_form_is_named_in_the_refusal() -> None:
+    assert UNIX_UPSTREAM_FORM == (
+        "a unix: upstream is a standard-tier bridge's socket, "
+        "unix:/run/zoeymcp-bridge-<name>/mcp.sock"
+    )
+    assert fields.UNIX_PREFIX == "unix:"

@@ -34,7 +34,11 @@ another caller (N2).
 Every HTTP client is :mod:`.netclient`'s, guarded (M7 design B.2): an upstream or token endpoint
 whose name resolves to a non-global address is refused before anything is sent, unless the
 running policy lists its ``host:port`` in ``egress_private``. A route then answers 502
-``address_refused``, and the token manager keeps the refusal for health (J). An upstream's
+``address_refused``, and the token manager keeps the refusal for health (J). A local MCP route
+(a bridge's, A.2 row 9) goes on the local client instead, direct and only to loopback or private
+addresses, and a ``unix:`` route on its bridge's socket client, picked by the bridge's name and
+refused unless the launcher started that bridge and its socket's listener is the uid it was
+given (Q46); neither ever goes through ``egress_proxy``. An upstream's
 ``WWW-Authenticate`` never reaches the gateway: the vault reads it for health, and a
 ``resource_metadata`` must reach nothing that could start OAuth discovery (DD-12, X17).
 
@@ -73,6 +77,8 @@ from starlette.types import Receive, Scope, Send
 
 from ..common import canonical, egresslist, ledgerreport, reviewreport
 from ..common.egresslist import Allowance
+from ..common.policy import fields
+from ..common.policy.check import local_mcp_routes
 from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
     BasicCredential,
@@ -261,6 +267,11 @@ class _DiscardingJar(http.cookiejar.CookieJar):
         pass
 
 
+def _no_socket_client(_bridge: str) -> httpx.AsyncClient | None:
+    """No bridge was started: every ``unix:`` route answers ``unknown_socket``."""
+    return None
+
+
 def without_cookies(client: httpx.AsyncClient) -> httpx.AsyncClient:
     """Give ``client`` a cookie jar that discards everything, and return it.
 
@@ -376,6 +387,8 @@ class VaultApp:
         token_client: httpx.AsyncClient | None = None,
         onboarding_client: httpx.AsyncClient | None = None,
         revocation_client: httpx.AsyncClient | None = None,
+        local_client: httpx.AsyncClient | None = None,
+        socket_clients: Callable[[str], httpx.AsyncClient | None] | None = None,
         tokens: TokenManager | None = None,
         environ: Mapping[str, str] | None = None,
         gateway_keys: GatewayKeys | None = None,
@@ -398,6 +411,14 @@ class VaultApp:
         one. Every client, and the SMTP connectors' proxy, stays on the ``egress_proxy`` of
         ``policy``, the startup one: a reload never changes them (D-61). Its
         ``egress_proxy_kind`` is kept likewise.
+
+        ``local_client`` reaches a local MCP route's upstream (M7 design A.2 row 9, B.2): by
+        default :mod:`.netclient`'s, direct and only to loopback or private addresses.
+        ``socket_clients`` gives a ``unix:`` route's client by the bridge's name, or None for a
+        bridge the launcher didn't start (Q46); by default there is none, as in the hardened
+        tier, and the server passes :class:`.netclient.SocketClients` for its ``--bridge`` list.
+        When ``client`` is given and either isn't, ``client`` serves that role too, so a test or
+        a self-test that injects a client never falls back to a networked one.
 
         ``gateway_keys`` is the persisted ratchet the vault loaded at startup. Without one, the
         gateway keys are tracked in memory only (self-tests and unit tests).
@@ -433,6 +454,14 @@ class VaultApp:
         if revocation_client is None and not injected:
             revocation_client = netclient.revocation_client(proxy, self._private)
         self._revocation_client = without_cookies(revocation_client or self._client)
+        if local_client is None and not injected:
+            timeout = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT)
+            local_client = netclient.local_client(timeout=timeout)
+        self._local_client = without_cookies(local_client or self._client)
+        if socket_clients is None:
+            injected_client = self._client
+            socket_clients = (lambda _name: injected_client) if injected else _no_socket_client
+        self._socket_clients = socket_clients
         self._token_client: httpx.AsyncClient | None = None
         if tokens is None:
             token_client = token_client or netclient.token_client(proxy, self._private)
@@ -485,6 +514,9 @@ class VaultApp:
         self._gateway_keys.advance(policy.gateway_key_generation)
         self._policy = policy
         self._routes = _compile(policy)
+        # The routes the local and socket clients serve, from the running policy, so a reload
+        # that adds a bridge's route needs no restart (M7 design B.2).
+        self._local_routes = local_mcp_routes(policy)
         self._env_secrets = snapshot_env_secrets(policy, self._environ)
         self._view = _ServedView(view.digest, dump_view(view))
         # A new generation retires the old egress key at once: there is no ratchet (G.3).
@@ -673,6 +705,10 @@ class VaultApp:
                 await self._onboarding_client.aclose()
             if self._revocation_client is not self._client:
                 await self._revocation_client.aclose()
+            if self._local_client is not self._client:
+                await self._local_client.aclose()
+            if isinstance(self._socket_clients, netclient.SocketClients):
+                await self._socket_clients.aclose()
 
     # --- ASGI ----------------------------------------------------------------------------------
 
@@ -744,9 +780,14 @@ class VaultApp:
         assert route.upstream is not None  # noqa: S101 - guaranteed by the schema
 
         body = await self._read_body(request)
-        upstream = urlsplit(route.upstream)
-        base_path = upstream.path.rstrip("/")
-        upstream_origin = f"{upstream.scheme}://{upstream.netloc}"
+        if route.upstream.startswith(fields.UNIX_PREFIX):
+            # A bridge's socket is the whole upstream: the server's path is the HTTP path, on
+            # the request base every bridge shares (its client is picked by name, in _send).
+            base_path, upstream_origin = "", netclient.BRIDGE_BASE
+        else:
+            upstream = urlsplit(route.upstream)
+            base_path = upstream.path.rstrip("/")
+            upstream_origin = f"{upstream.scheme}://{upstream.netloc}"
         headers = filter_request_headers(
             request.headers.items(), drop=[used_header] if used_header else ()
         )
@@ -1480,19 +1521,57 @@ class VaultApp:
         departure: Departure,
     ) -> httpx.Response:
         """Send the request upstream. Returns once the status line and headers arrived, or
-        raises :class:`CallerGone` (and closes the request) if the caller leaves first."""
+        raises :class:`CallerGone` (and closes the request) if the caller leaves first.
+
+        A local MCP route of the running policy goes on the local client, a ``unix:`` one on its
+        bridge's socket client, chosen by the bridge's name, and every other route on the
+        ordinary client (M7 design B.2)."""
         timeout = httpx.Timeout(None if route.stream else READ_TIMEOUT, connect=CONNECT_TIMEOUT)
-        outgoing = self._client.build_request(
-            method, url, headers=headers, content=body, timeout=timeout
-        )
+        local = route.name in self._local_routes
+        client = self._local_client if local else self._client
+        if route.upstream is not None and route.upstream.startswith(fields.UNIX_PREFIX):
+            # A bridge's socket goes on its socket client only, never on a networked one.
+            bridge = fields.bridge_name(route.upstream)
+            found = self._socket_clients(bridge)
+            if found is None:
+                # No bridge of that name was started (or none at all: the hardened tier).
+                verdict = "unknown_socket"
+                logs.event("address_refused", purpose="route", bridge=bridge, verdict=verdict)
+                raise Refused(
+                    502,
+                    f"address refused ({verdict}): no bridge {bridge} was started",
+                    code=netclient.ADDRESS_REFUSED,
+                )
+            client = without_cookies(found)
+        outgoing = client.build_request(method, url, headers=headers, content=body, timeout=timeout)
         try:
-            return await departure.race(self._client.send(outgoing, stream=True), phase="headers")
+            return await departure.race(client.send(outgoing, stream=True), phase="headers")
+        except netclient.SocketRefused as exc:
+            # Nothing was written: the socket's listener isn't the uid the launcher gave it.
+            reason = exc.verdict.reason
+            logs.event(
+                "address_refused", purpose="route", bridge=exc.bridge, verdict=reason, uid=exc.uid
+            )
+            raise Refused(
+                502,
+                f"address refused ({reason}): bridge {exc.bridge}'s socket isn't its own",
+                code=netclient.ADDRESS_REFUSED,
+            ) from exc
         except netclient.AddressRefused as exc:
             # Nothing was sent: the upstream's name resolves where the policy doesn't allow.
             reason = exc.verdict.reason
             logs.event(
                 "address_refused", purpose="route", host=exc.host, port=exc.port, verdict=reason
             )
+            if local:
+                # egress_private can't help a local route: its client takes loopback and
+                # private addresses only, whatever the policy lists.
+                raise Refused(
+                    502,
+                    f"address refused ({reason}): a local MCP route reaches only loopback or "
+                    "private addresses",
+                    code=netclient.ADDRESS_REFUSED,
+                ) from exc
             self._tokens.note_refused("route", exc.host, exc.port, reason)
             hint = netclient.private_hint(netclient.guard_key(exc.host, exc.port))
             raise Refused(

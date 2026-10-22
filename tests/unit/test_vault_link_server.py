@@ -30,6 +30,7 @@ from zoeymcp.cli.main import EXIT_OK, EXIT_UNREADABLE, main
 from zoeymcp.vault import logs, server
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.keys import generate_master_key
+from zoeymcp.vault.netclient import SocketClients
 from zoeymcp.vault.peer import UCRED
 from zoeymcp.vault.server import (
     CONTROL_LINE_LIMIT,
@@ -843,6 +844,64 @@ def test_run_checks_the_options_before_the_lock(
     assert captured_run["order"] == []
 
 
+def test_run_with_bridges(tmp_path: Path, captured_run: dict[str, Any]) -> None:
+    """The launcher's --bridge NAME=UID: one socket client per bridge, picked by name (M7 design
+    B.2, C.10); none for another name, and none at all without --bridge."""
+    server.run(
+        str(EXAMPLE_POLICY),
+        ["127.0.0.1:0"],
+        tmp_path,
+        env(),
+        None,
+        bridges=["fetch=10100", "files=10101"],
+    )
+    clients = captured_run["app"]._socket_clients
+    assert isinstance(clients, SocketClients)
+    fetch = clients("fetch")
+    assert fetch is not None
+    assert clients("files") is not None
+    assert clients("other") is None
+    assert fetch.is_closed  # closed with the vault
+    (tmp_path / "plain").mkdir(mode=0o700)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:0"], tmp_path / "plain", env(), None)
+    assert captured_run["app"]._socket_clients("fetch") is None
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (["fetch"], "--bridge fetch: write NAME=UID, NAME 1 to 16 lower-case letters or digits"),
+        (["Fetch=10100"], "--bridge Fetch=10100: write NAME=UID"),
+        (["fetch=-1"], "--bridge fetch=-1: write NAME=UID"),
+        (["fetch=10100x"], "--bridge fetch=10100x: write NAME=UID"),
+        (["abcdefghijklmnopq=10100"], "--bridge abcdefghijklmnopq=10100: write NAME=UID"),
+        (["fe-ch=10100"], "--bridge fe-ch=10100: write NAME=UID"),
+        (["fetch=10100", "fetch=10101"], "--bridge fetch is given twice"),
+        (["fetch=0"], "--bridge fetch: a bridge never runs as root"),
+    ],
+)
+def test_bridges_refused(linux: None, values: list[str], message: str) -> None:
+    with pytest.raises(StartupError) as caught:
+        server.parse_bridges(values)
+    assert str(caught.value).startswith(message)
+
+
+def test_bridges_taken(linux: None) -> None:
+    assert server.parse_bridges([]) == {}
+    assert server.parse_bridges(["fetch=10100", "abcdefghijklmnop=10107", "b2=1"]) == {
+        "fetch": 10100,
+        "abcdefghijklmnop": 10107,
+        "b2": 1,
+    }
+
+
+def test_bridges_need_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "link_supported", lambda: False)
+    with pytest.raises(StartupError, match=r"^--bridge needs Linux \(SO_PEERCRED\)$"):
+        server.parse_bridges(["fetch=10100"])
+    assert server.parse_bridges([]) == {}
+
+
 def test_run_checks_the_link_dir_after_the_policy(
     tmp_path: Path, captured_run: dict[str, Any]
 ) -> None:
@@ -878,6 +937,10 @@ def test_cli_passes_the_link_options(cli_run: list[tuple[Any, ...]]) -> None:
         "5",
         "--admin-socket",
         "none",
+        "--bridge",
+        "fetch=10100",
+        "--bridge",
+        "files=10101",
     ]
     assert main(argv, err=io.StringIO()) == EXIT_OK
     [(config, listens, state, _environ, admin, kwargs)] = cli_run
@@ -886,6 +949,7 @@ def test_cli_passes_the_link_options(cli_run: list[tuple[Any, ...]]) -> None:
         "gateway_socket": Path("/run/zoeymcp-link/vault.sock"),
         "gateway_uid": 10002,
         "control_fd": 5,
+        "bridges": ["fetch=10100", "files=10101"],
     }
 
 
@@ -893,7 +957,12 @@ def test_cli_defaults(cli_run: list[tuple[Any, ...]]) -> None:
     assert main(["vault", "--admin-socket", "none"], err=io.StringIO()) == EXIT_OK
     [(_, listens, _, _, _, kwargs)] = cli_run
     assert listens == ["0.0.0.0:8080"]
-    assert kwargs == {"gateway_socket": None, "gateway_uid": None, "control_fd": None}
+    assert kwargs == {
+        "gateway_socket": None,
+        "gateway_uid": None,
+        "control_fd": None,
+        "bridges": [],
+    }
 
 
 def test_cli_refuses_none_with_addresses(cli_run: list[tuple[Any, ...]]) -> None:

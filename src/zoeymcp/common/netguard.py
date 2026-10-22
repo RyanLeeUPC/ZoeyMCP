@@ -13,6 +13,12 @@ transport and the allowlist emitter all ask this one module, so their answers ca
   The function is ``listed``, not ``match``, so the source test that bans a call of that name
   (test_source_hygiene.py) never meets it.
 - :func:`squid_private_dst`: the emitted ``zoeymcp_private_dst`` ACL, from the same tables.
+- :func:`local_target` and :func:`local_only`: a local MCP route's plain http (M7 design A.2 row
+  9, B.2). ``check`` takes plain http on an MCP route only to a loopback or private literal or a
+  single-label name; the vault then connects only when every address the name resolves to is
+  loopback or private (:data:`LOCAL_V4`, :data:`LOCAL_V6`), never link-local or CGNAT.
+- :func:`unix_peer`: a ``unix:`` route's socket (Q46). The vault writes nothing to a socket whose
+  listener isn't the uid the launcher gave that bridge.
 
 The tables are explicit, so the decision doesn't move with the standard library's own; a global
 address must also be ``is_global`` to it, a second, independent opinion. This module imports the
@@ -113,13 +119,22 @@ _HOSTNAME = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 _NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+# Where a local MCP route may connect over plain http: loopback and the private ranges, and
+# nothing else the tables deny (link-local holds cloud metadata, CGNAT a provider's network).
+LOCAL_V4: Final = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+LOCAL_V6: Final = ("::1/128", "fc00::/7")
+_LOCAL_V4_NETS: Final = tuple(ipaddress.IPv4Network(net) for net in LOCAL_V4)
+_LOCAL_V6_NETS: Final = tuple(ipaddress.IPv6Network(net) for net in LOCAL_V6)
 
 
 @dataclass(frozen=True)
 class AddressVerdict:
-    """``allowed``, and why: ``global`` or ``private_ok`` when allowed; ``no_address``,
-    ``unparsable`` or the refused address's class when not. ``address`` is the first address when
-    allowed (the one to connect to) and the one that refused otherwise."""
+    """``allowed``, and why: ``global`` or ``private_ok`` when allowed (``local`` by
+    :func:`local_only`); ``no_address``, ``unparsable`` or the refused address's class when not
+    (``not_local`` by :func:`local_only` for a loopback or private address outside its tables).
+    ``address`` is the first address when allowed (the one to connect to) and the one that
+    refused otherwise. :func:`unix_peer` judges a socket's peer, not an address: ``bridge_uid``,
+    or ``unknown_socket`` or ``peer_uid``, with no address."""
 
     allowed: bool
     reason: str
@@ -217,6 +232,58 @@ def untrusted_host(host: str) -> HostVerdict:
     if any(name == suffix or name.endswith("." + suffix) for suffix in INTERNAL_SUFFIXES):
         return HostVerdict(allowed=False, reason="internal_suffix", host=name)
     return HostVerdict(allowed=True, reason="allowed", host=name)
+
+
+def _local_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Inside :data:`LOCAL_V4` or :data:`LOCAL_V6`; an IPv4-mapped address by its IPv4 one."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv4Address):
+        return any(ip in net for net in _LOCAL_V4_NETS)
+    return ip.scope_id is None and any(ip in net for net in _LOCAL_V6_NETS)
+
+
+def local_target(host: str) -> bool:
+    """A.2 row 9's host rule for a local MCP route, before any DNS: an IP literal inside
+    :data:`LOCAL_V4` or :data:`LOCAL_V6`, or a single-label name (``localhost``, a container
+    alias). Never a name of two labels or more, whatever it resolves to, nor a label that reads
+    as a number (an address spelled otherwise, like ``2130706433``)."""
+    name = host.lower()
+    try:
+        ip = ipaddress.ip_address(name.removeprefix("[").removesuffix("]"))
+    except ValueError:
+        single = "." not in name and _HOSTNAME.fullmatch(name) is not None
+        return single and _NUMERIC_LABEL.fullmatch(name) is None
+    return _local_address(ip)
+
+
+def local_only(addresses: Sequence[str]) -> AddressVerdict:
+    """B.2's plain-http rule for a local MCP route: every address a name resolves to is inside
+    :data:`LOCAL_V4` or :data:`LOCAL_V6`. An empty answer, an unparsable one, or any global,
+    link-local (cloud metadata), CGNAT or other address refuses the whole name."""
+    if not addresses:
+        return AddressVerdict(allowed=False, reason="no_address", address=None)
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+            kind = classify(address)
+        except ValueError:
+            return AddressVerdict(allowed=False, reason="unparsable", address=address)
+        if not _local_address(ip):
+            reason = "not_local" if kind in ("loopback", "private") else kind
+            return AddressVerdict(allowed=False, reason=reason, address=address)
+    return AddressVerdict(allowed=True, reason="local", address=addresses[0])
+
+
+def unix_peer(peer_uid: int | None, expected_uid: int | None) -> AddressVerdict:
+    """B.2's socket rule (Q46): a ``unix:`` route's socket is used only when the launcher named
+    its bridge (``expected_uid`` known) and the connected peer's uid, as ``SO_PEERCRED`` gives
+    it, is that uid. An unknown name, an unreadable uid, root or any other uid refuses."""
+    if expected_uid is None:
+        return AddressVerdict(allowed=False, reason="unknown_socket", address=None)
+    if peer_uid is None or peer_uid == 0 or peer_uid != expected_uid:
+        return AddressVerdict(allowed=False, reason="peer_uid", address=None)
+    return AddressVerdict(allowed=True, reason="bridge_uid", address=None)
 
 
 def entry_key(host: str, port: int) -> str:

@@ -13,7 +13,14 @@ import pytest
 
 from tests.acceptance import procs
 from tests.acceptance.tls import ProviderCA, issue_cert, make_ca
-from tests.fakes.resolver import TIMEOUT, FakeResolver, install, serve_https
+from tests.fakes.resolver import (
+    TIMEOUT,
+    FakeResolver,
+    install,
+    install_sockets,
+    serve_https,
+    sockets_in,
+)
 from zoeymcp.common import netguard
 from zoeymcp.vault import netclient
 
@@ -166,6 +173,40 @@ def test_the_launcher_installs_the_hooks_before_zoeymcp_runs(
     assert "FileNotFoundError" in output
     assert str(Path("tests", "fakes", "resolver.py")) in output
     assert not output.startswith("zoeymcp ")
+
+
+def test_install_sockets_keeps_the_resolver_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7 design B.2's socket_path hook: each bridge's socket in a test directory, beside the
+    resolver and dial hooks a saved map installed, or alone."""
+    fake = FakeResolver()
+    monkeypatch.setattr(netclient, "HOOKS", fake.hooks())
+    install_sockets(str(tmp_path))
+    hooks = netclient.HOOKS
+    assert hooks is not None
+    assert (hooks.resolver, hooks.dial) == (fake.resolve, fake.dial)
+    assert hooks.socket_path is not None
+    assert hooks.socket_path("fetch") == str(tmp_path / "zoeymcp-bridge-fetch" / "mcp.sock")
+    monkeypatch.setattr(netclient, "HOOKS", None)
+    install_sockets(str(tmp_path))
+    alone = netclient.HOOKS
+    assert alone is not None
+    assert (alone.resolver, alone.dial) == (None, None)
+    assert alone.socket_path is not None
+    assert sockets_in(tmp_path)("files") == str(tmp_path / "zoeymcp-bridge-files" / "mcp.sock")
+
+
+def test_the_launcher_takes_a_sockets_directory(tmp_path: Path) -> None:
+    """With a sockets directory the launcher installs the hook and still runs zoeymcp with its
+    own arguments, after the three of its own."""
+    log = tmp_path / "sockets.log"
+    process = procs.start(["--version"], env={}, log=log, sockets=tmp_path)
+    try:
+        status = process.popen.wait(60)
+    finally:
+        process.stop()
+    assert (status, process.output().split()[0]) == (0, "zoeymcp")
 
 
 async def test_serve_https_records_the_name_and_the_head(ca: ProviderCA, tmp_path: Path) -> None:

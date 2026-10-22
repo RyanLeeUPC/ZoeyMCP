@@ -592,9 +592,23 @@ class QueryPolicy(_Model):
     allow: list[QueryParam] | None = None
 
 
+class RouteProgram(_Model):
+    """The program behind a route that ZoeyMCP runs or confines: a bridge, or a wrapper of the
+    operator's (M7 design A.1). Only the egress role (the hardened tier) enforces its egress;
+    check says so."""
+
+    # What the egress role lets the program reach, each host:port in lower case.
+    egress: list[PrivateHostPort] = []
+    # The entries of egress allowed to resolve to non-global addresses.
+    egress_private: list[PrivateHostPort] = []
+    # The program holds a real secret (R35's flagged exception): check always warns.
+    holds_secret: bool = False
+
+
 class Route(_Model):
     name: Name
     prefix: Annotated[str, StringConstraints(pattern=r"^/[a-z0-9][a-z0-9_-]{0,62}$")]
+    # http(s), or a standard-tier bridge's socket: unix:/run/zoeymcp-bridge-<name>/mcp.sock.
     upstream: str | None = None
     credential: Name | None = None
     connector: Name | None = None
@@ -602,13 +616,17 @@ class Route(_Model):
     query: QueryPolicy = QueryPolicy()
     rules: Annotated[list[Rule], Field(min_length=1)]
     stream: bool = False
+    # Plain http; with a credential, only on a local MCP route (check).
     allow_insecure_upstream: bool = False
+    program: RouteProgram | None = None
 
     @field_validator("upstream")
     @classmethod
     def _valid_upstream(cls, value: str | None) -> str | None:
         if value is None:
             return None
+        if value.startswith(fields.UNIX_PREFIX):
+            return fields.unix_upstream(value)
         return _check_url(value, schemes=("https", "http"), allow_path=True)
 
     @model_validator(mode="after")

@@ -2,10 +2,12 @@
 
 A process runs ``zoeymcp.cli.main`` in a fresh interpreter, so a kill is a real kill: nothing in
 the test's process can finish the work. The changes from production: certifi's bundle is the
-test CA, so the vault's TLS clients (the SMTP connector included) trust the fakes, and with a
+test CA, so the vault's TLS clients (the SMTP connector included) trust the fakes; with a
 hooks file the guarded clients answer names from the fake resolver's map (M7 design B.2, BP-1),
-so a name reaches a loopback fake through the address guard. Both happen in the launcher below,
-never in ZoeyMCP's code.
+so a name reaches a loopback fake through the address guard; and with a sockets directory a
+bridge's socket client finds its socket there, while the policy keeps the fixed
+``unix:/run/zoeymcp-bridge-<name>/mcp.sock`` (B.2's ``socket_path`` hook). All happen in the
+launcher below, never in ZoeyMCP's code.
 """
 
 from __future__ import annotations
@@ -21,18 +23,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 # argv: the CA file or "", the hooks file (tests/fakes/resolver.py's FakeResolver.save) or "",
-# then zoeymcp's own arguments.
+# the bridges' sockets directory (tests/fakes/resolver.py's install_sockets) or "", then
+# zoeymcp's own arguments.
 LAUNCHER = f"""
 import sys
 import certifi
 if sys.argv[1]:
     certifi.where = lambda: sys.argv[1]
-if sys.argv[2]:
+if sys.argv[2] or sys.argv[3]:
     sys.path.insert(0, {str(ROOT)!r})
+if sys.argv[2]:
     from tests.fakes.resolver import install
     install(sys.argv[2])
+if sys.argv[3]:
+    from tests.fakes.resolver import install_sockets
+    install_sockets(sys.argv[3])
 from zoeymcp.cli.main import main
-sys.exit(main(sys.argv[3:]))
+sys.exit(main(sys.argv[4:]))
 """
 # What a child needs from the test's environment to start at all, and nothing secret.
 PASSED = ("PATH", "SYSTEMROOT", "PYTHONPATH", "TEMP", "TMP", "HOME", "USERPROFILE")
@@ -74,14 +81,24 @@ def start(
     log: Path,
     ca: Path | None = None,
     hooks: Path | None = None,
+    sockets: Path | None = None,
 ) -> Process:
     """``zoeymcp <argv>`` in its own process, with only ``env`` and the basics. ``hooks`` is a
-    fake resolver's saved map, for the guarded clients."""
+    fake resolver's saved map, for the guarded clients; ``sockets`` the directory that holds
+    each bridge's socket, as ``zoeymcp-bridge-<name>/mcp.sock``."""
     environment = {name: os.environ[name] for name in PASSED if name in os.environ}
     environment.update(env)
     handle = log.open("ab")
     popen = subprocess.Popen(  # noqa: S603 - our own interpreter and arguments
-        [sys.executable, "-c", LAUNCHER, str(ca or ""), str(hooks or ""), *argv],
+        [
+            sys.executable,
+            "-c",
+            LAUNCHER,
+            str(ca or ""),
+            str(hooks or ""),
+            str(sockets or ""),
+            *argv,
+        ],
         env=environment,
         stdout=handle,
         stderr=subprocess.STDOUT,
