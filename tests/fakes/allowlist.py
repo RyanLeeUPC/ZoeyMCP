@@ -36,10 +36,12 @@ Entry = tuple[str, int] | tuple[str, int, bool]
 
 
 class Clock:
-    """A clock the test moves. Starts at the real monotonic time."""
+    """A clock the test moves. Starts at the real monotonic time in whole seconds, so that
+    advancing it by whole or half seconds is exact: from a fractional start, 300 s on can read
+    as 300.00000000001 s and a list due to serve at exactly 300 s goes stale."""
 
     def __init__(self) -> None:
-        self.now = time.monotonic()
+        self.now = float(int(time.monotonic()))
 
     def __call__(self) -> float:
         return self.now
