@@ -328,11 +328,13 @@ def test_reload_refuses_a_bad_policy(
     asyncio.run(app.aclose())
 
 
-def _with_proxy(example_text: str, proxy: str | None) -> str:
+def _with_proxy(example_text: str, proxy: str | None, kind: str | None = None) -> str:
     if proxy is None:
         return example_text
+    kind_line = "" if kind is None else f"\negress_proxy_kind: {kind}"
     return example_text.replace(
-        "gateway_key_generation: 1", f"gateway_key_generation: 1\negress_proxy: {proxy}"
+        "gateway_key_generation: 1",
+        f"gateway_key_generation: 1\negress_proxy: {proxy}{kind_line}",
     )
 
 
@@ -404,6 +406,45 @@ def test_reload_says_an_egress_proxy_change_needs_a_restart(
 
     assert asyncio.run(send()).status_code == 200
     assert connectors.proxies == [before]
+    asyncio.run(app.aclose())
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "restart"),
+    [
+        (None, "role", True),
+        ("role", "own", True),
+        ("role", None, True),
+        ("role", "role", False),
+        # "own" is the default: writing it changes nothing.
+        (None, "own", False),
+    ],
+)
+def test_reload_says_an_egress_proxy_kind_change_needs_a_restart(
+    tmp_path: Path,
+    example_text: str,
+    log_buffer: io.StringIO,
+    before: str | None,
+    after: str | None,
+    restart: bool,
+) -> None:
+    """Whether egress_proxy is the egress role is a startup setting too (D-61): onboarding keeps
+    the startup kind, so a reload that changes it alone logs the same restart note."""
+    proxy = "http://egress-vault:3128"
+    first = tmp_path / "first.yaml"
+    first.write_bytes(_with_proxy(example_text, proxy, before).encode())
+    runtime = load_runtime(str(first), tmp_path / "state", env())
+    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+    started = app.egress_proxy_kind
+    assert started == (before or "own")
+    second = tmp_path / "second.yaml"
+    second.write_bytes(_with_proxy(example_text, proxy, after).encode())
+    server.reload_policy(app, str(second), env())
+    events = [line["event"] for line in _log_lines(log_buffer)]
+    assert events[-1] == "reload_ok"
+    assert ("egress_proxy_change_needs_restart" in events) is restart
+    assert app.policy.egress_proxy_kind == (after or "own")
+    assert (app.egress_proxy, app.egress_proxy_kind) == (proxy, started)
     asyncio.run(app.aclose())
 
 
@@ -1054,20 +1095,27 @@ def test_the_portal_shares_the_sockets_setup_codes_passkeys_and_logins(
 
 
 def test_one_onboarding_service_on_the_onboarding_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """M7 design D.8, B.2: one set of onboardings, built before the socket, on the guarded
-    onboarding client and the startup egress_proxy, naming the policy's source in ``next``."""
+    onboarding client and the startup egress_proxy and its kind, naming the policy's source in
+    ``next``."""
     monkeypatch.setattr(server, "socket_supported", lambda: True)
     monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    config = tmp_path / "policy.yaml"
+    config.write_bytes(_with_proxy(example_text, "http://egress-vault:3128", "role").encode())
     vault = server.build(
-        str(EXAMPLE_POLICY), ["127.0.0.1:8080"], tmp_path, env(), tmp_path / "admin.sock"
+        str(config), ["127.0.0.1:8080"], tmp_path / "state", env(), tmp_path / "admin.sock"
     )
     try:
         assert vault.admin is not None
         assert vault.admin._onboard is vault.onboard
         assert vault.onboard._client is vault.app.onboarding_client
-        assert (vault.onboard._egress_proxy, vault.onboard._source) == (None, str(EXAMPLE_POLICY))
+        assert (vault.onboard._egress_proxy, vault.onboard._egress_proxy_kind) == (
+            "http://egress-vault:3128",
+            "role",
+        )
+        assert vault.onboard._source == str(config)
     finally:
         asyncio.run(vault.app.aclose())
 

@@ -635,8 +635,12 @@ def reload_policy(
     except StartupError as exc:
         logs.event("reload_refused", reason=str(exc))
         return
-    # Against the startup value, which every client and connector keeps (M7 design B.2, D-61).
-    egress_changed = policy.egress_proxy != app.egress_proxy
+    # Against the startup values, which every client, connector and onboarding keeps (M7 design
+    # B.2, D-61): the proxy, and whether it is the egress role.
+    egress_changed = (policy.egress_proxy, policy.egress_proxy_kind) != (
+        app.egress_proxy,
+        app.egress_proxy_kind,
+    )
     # Where the portal listens: its listener's address, else the running policy's (none).
     before = app.policy.admin
     listening = portal.address.listen if portal is not None else before and before.listen
@@ -647,7 +651,8 @@ def reload_policy(
         logs.event("reload_refused", reason=str(exc))
         return
     if egress_changed:
-        # The HTTP clients were built with the startup proxy, and SMTP sends keep it too.
+        # The HTTP clients were built with the startup proxy, and SMTP sends keep it too;
+        # onboarding keeps the startup kind.
         logs.event("egress_proxy_change_needs_restart")
     if listening != (policy.admin and policy.admin.listen):
         logs.event("admin_listen_change_needs_restart")
@@ -746,15 +751,19 @@ def build(
     # One set of pending logins for every surface, so the flow limit is shared (M5 design H.2).
     login = LoginService(app.tokens)
     # Likewise one set of onboardings, so their limits and owners hold across surfaces (M7
-    # design D.8): on the onboarding client, with the startup egress_proxy (B.2, D-61).
+    # design D.8): on the onboarding client, with the startup egress_proxy and its kind (B.2,
+    # D-61). Their allowances are the egress role's, through the proxy listener's allowlists (I.3).
     onboard = OnboardService(
         runtime.store,
         app.tokens,
         lambda: app.policy,
         app.onboarding_client,
         egress_proxy=app.egress_proxy,
+        egress_proxy_kind=app.egress_proxy_kind,
+        egress=app,
         source=policy_source(config),
     )
+    app.use_allowances(onboard.allowances, onboard.allowances_expire_in)
     # The portal's state files, one holder each for the socket and the portal. Built on every
     # platform: on Windows, or with --admin-socket none, the portal still redeems a code issued
     # offline with zoeymcp setup-code --state (M5 design E.2, verifier V12).
@@ -783,6 +792,7 @@ def build(
         env_names=lambda: app.env_names,
         reports=reports,
         passkeys=passkeys,
+        egress_fetched_ago=app.allowlist_fetched_ago,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
     # (M5 design J.5); the policy view says where the policy came from (L).
@@ -821,6 +831,7 @@ def build(
             revoker=app.revoker,
             # The review jobs the gateway polls the proxy listener for (M7 design F.2).
             reviews=app,
+            egress_fetched_ago=app.allowlist_fetched_ago,
         )
     return Vault(
         app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal

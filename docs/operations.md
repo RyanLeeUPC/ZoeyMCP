@@ -291,9 +291,9 @@ can't be asked. `--json` prints the whole report, with a `summary` of counts per
 finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
 `set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
 `check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys`,
-`reset_passkeys`, `onboard_again` (with the `command`, `login --mcp URL --reregister`) or
-`widen_scope` (with the `scope` and the `fragment` that sets it), and the name it applies to). For
-a deployment's verify script:
+`reset_passkeys`, `onboard_again` (with the `command`, `login --mcp URL --reregister`),
+`widen_scope` (with the `scope` and the `fragment` that sets it) or `check_egress_role`, and the
+name it applies to). For a deployment's verify script:
 
 ```sh
 docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp health --json --strict > /dev/null
@@ -318,6 +318,7 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `client_secret_expiring`, `client_secret_expired` | warning, error | a client the vault registered has a `client_secret_expires_at` (from stored metadata) within 14 days, or past: register a new client with `login --mcp URL --reregister` (the action's command), or for a credential without the server's URL as its `resource`, enter the new secret with `secret set`. The wall clock judges it |
 | `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`login --mcp URL --reregister`); the vault never registers again by itself |
 | `address_refused` | error | the vault refused to connect to the credential's token endpoint, its revocation endpoint or a route's upstream **since the vault started**, because the name resolved to a private, loopback or otherwise non-global address (§7's upgrade note): list its `host:port` in `egress_private` if it is meant to be private, and reload. A reload that lists it, or moves the endpoint, ends the finding. A route with no credential has no credential section: its refusal is the `egress` section's, with the route's name (`fix_policy`). The log has each refusal too (`address_refused`, §11) |
+| `egress_allowlist_stale` | warning | the egress role (§31) hasn't fetched its allowlists for more than 300 s: its lists are stale, so it refuses every new tunnel. A role whose key the vault refuses (a wrong key, or the old one after a generation bump) counts from its first request. With `egress_proxy_kind: role` the role is expected, so one that hasn't asked since the vault started counts from the vault's start. Check that it runs, reaches the vault, and has the key `zoeymcp egress-key` prints (`check_egress_role`). In the `egress` section; with your own proxy or none, a vault no role has asked since it started has no such finding |
 | `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
 | `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
 | `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |
@@ -500,9 +501,11 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
 - On success the log has `reload_ok`, with `oauth_reset` listing the OAuth credentials whose
   settings or route origins changed. Their cached access tokens are dropped and their failure
   states cleared. A refresh in flight still saves its new refresh token.
-- A changed `egress_proxy` needs a restart: every HTTP client and the SMTP connectors keep the
-  proxy the vault started with until then. A reload whose `egress_proxy` differs from the one the
-  vault started with logs `egress_proxy_change_needs_restart`, on every reload until the restart.
+- A changed `egress_proxy` or `egress_proxy_kind` needs a restart: every HTTP client and the SMTP
+  connectors keep the proxy the vault started with until then, and onboarding keeps whether it
+  is the egress role. A reload whose `egress_proxy` or `egress_proxy_kind` differs from the one
+  the vault started with logs `egress_proxy_change_needs_restart`, on every reload until the
+  restart.
 - A changed `egress_private` takes effect at once: the vault reads it at each new connection, so
   the next request to a destination a reload lists goes through, and a connection already open to
   one it removes isn't cut.
@@ -1006,6 +1009,22 @@ binding when the token endpoint moved.
 carries on where it stopped. Keep the onboarding lines in a separate included file, so `--check`
 on the emitted file stays clean. After the commit, the `Next:` list says to emit the allowlist
 again, reload the proxy and remove the onboarding lines.
+
+**Through the egress role** (§31): nothing to edit. With `egress_proxy_kind: role` the vault
+takes `egress_proxy` to be the role (it never guesses: without that setting the proxy is your
+own, even while a role fetches the vault's lists): each host joins the onboarding's allowance in
+the vault's list before the vault connects to it, the role's long poll is answered at once, and
+the vault waits up to 5 s for the role to fetch the widened list. An allowance is gone once the
+onboarding has its fragment 1, is cancelled or expires (30 minutes). A CONNECT the role refuses
+all the same (a role that isn't running or stopped polling, one with an old key, or a host whose
+address it refuses or can't reach) is `egress_refused`, naming the host and the role's status:
+during discovery it ends the onboarding; at registration the onboarding is kept. The role's
+`egress_refused` log line names the reason; for a role that hadn't fetched, run the same command
+again.
+"This server is on my network" (`--allow-private`) is refused `private_needs_direct` through the
+role, which can't tell one vault request from another and would give every vault connection to
+that host the exception: onboard such a server with `egress_proxy` unset, or write its fragment
+by hand.
 
 **Your own compose command.** The printed commands start with `ZOEYMCP_COMPOSE_CMD` and name the
 service in `ZOEYMCP_EXEC_SERVICE`, which the shipped compose files set. They also set
@@ -1993,6 +2012,8 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `dcr_grant_missing` | The authorization server registered the client without the authorization_code and refresh_token grants, so it isn't used. |
 | 502 | `dcr_answer_invalid` | The authorization server's registration answer can't be used (`<detail>`). |
 | 502 | `proxy_refused` | Your egress proxy refused the vault's connection to `<host>`. Allow the hosts listed here in it for the vault, then run the same command again. |
+| 502 | `egress_refused` | The egress role refused the vault's connection to `<host>`: it hadn't fetched the onboarding's hosts yet, its key is out of date, or it refused or couldn't reach the host's address. Its egress_refused log line names which; if it hadn't fetched yet, run the same command again. |
+| 409 | `private_needs_direct` | A server on your network can't be onboarded through the egress role, which can't keep its private exception to this onboarding. Onboard it with egress_proxy unset, or add it to the policy by hand. |
 | 409 | `already_configured` | The server `<server>` already reaches this URL, with a credential of kind `<kind>`, not oauth2. Remove it, its route and that credential from the policy and reload first. |
 | 409 | `onboarding_mismatch` | The committed policy differs from what the server publishes now, at `<fields>`. Revert the edit, or register a new client with zoeymcp login --mcp URL --reregister. |
 | 409 | `reregister_by_hand` | The credential `<credential>` sets `<field>`, which a re-registration's fragment can't carry (`<why>`). Re-register by hand: edit the credential in the policy. |
@@ -2117,11 +2138,17 @@ routes:
   one goes to the proxy as a forwarded request, which a CONNECT-only proxy (the snippet below
   allows nothing else) refuses. The text form marks such a destination, and `check` warns about a
   credential-less `allow_insecure_upstream` route over plain http when `egress_proxy` is set.
-- **Changing it needs a restart.** `egress_proxy` is read when the vault starts, and every vault
-  connection (routes, token requests, onboarding and SMTP sends) keeps that proxy. A reload whose
-  `egress_proxy` differs from the one the vault started with logs
-  `egress_proxy_change_needs_restart`, again on every reload until the restart: recreate the vault
-  right after changing it (§7).
+- **Your own proxy or the egress role.** `egress_proxy_kind` says which `egress_proxy` is: `own`
+  (the default) for your own proxy, as this section describes, where onboarding stops at
+  `proxy_refused` with the Squid lines to add (§11); `role` for ZoeyMCP's egress role (§31),
+  which takes its lists from the vault, so nothing is edited. `role` without `egress_proxy` is
+  refused, and `check` warns about `egress_proxy_acls` with `role`: those names serve your own
+  Squid only.
+- **Changing it needs a restart.** `egress_proxy` and `egress_proxy_kind` are read when the vault
+  starts, and every vault connection (routes, token requests, onboarding and SMTP sends) keeps
+  that proxy. A reload whose `egress_proxy` or `egress_proxy_kind` differs from the one the vault
+  started with logs `egress_proxy_change_needs_restart`, again on every reload until the restart:
+  recreate the vault right after changing it (§7).
 
 **Emitting the allowlist.** Run the image, which reads the service's own inline policy (add
 `--config FILE` for a policy file). The policy is checked first: its findings go to stderr, the
@@ -2530,3 +2557,23 @@ Its log lines (`role: egress`):
 | `egress_refused` | `source`, `reason` (the table above), and `host`, `port`, `verdict` and `address` where known |
 
 None holds the key, a request's headers or anything a tunnel carries.
+
+**The vault's side.** Name the role in the policy: `egress_proxy` is its `vault` listener
+(`http://egress-vault:3128` for the command above) and `egress_proxy_kind: role` says it is the
+role, which onboarding needs (§11, "Through the egress role"); both take a restart to change
+(§7). `zoeymcp egress-key` (inside the vault's container) prints
+`ZOEYMCP_EGRESS_KEY=...` for the policy's `egress_key_generation` (1 by default), and the
+generation on stderr. The key reads the allowlists and nothing else: the vault refuses it on
+every other path, and on the gateway's link socket, and the gateway's key on the allowlists.
+To change it, raise `egress_key_generation` and reload: the old key is refused at once (there is
+no rotation window), so the role refuses new tunnels within 300 s unless it is given the new key
+(update the file and send it `SIGHUP`, or set the variable and recreate it). The vault's list
+is the policy's destinations (`check --emit-egress-allowlist` shows the same), plus each
+onboarding's allowance while it runs (§11, "Through the egress role"). `health` reports
+`egress_allowlist_stale` (§3) when a role stops fetching, when its key is refused, or, with
+`egress_proxy_kind: role`, when no role has asked within 300 s of the vault's start.
+The vault's log line (`role: vault`):
+
+| Event | Fields |
+| --- | --- |
+| `egress_allowlist_served` | `digest`, `waited_ms`: new lists answered to the role (a 304 isn't logged; each request is a `request` line with `endpoint: egress_allowlists`) |

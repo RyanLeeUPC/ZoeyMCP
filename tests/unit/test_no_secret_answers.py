@@ -1,4 +1,4 @@
-"""No endpoint returns a secret (invariant P1; R61 and its two scoped exceptions, D-115).
+"""No endpoint returns a secret (invariant P1; R61 and its three scoped exceptions, D-115, DD-14).
 
 Each walk takes its routes from the route table, so a route added later is walked too:
 
@@ -7,19 +7,20 @@ Each walk takes its routes from the route table, so a route added later is walke
   through the socket (M7 D.7);
   and again once a registration's answer brought a secret, a registration access token and a
   URI (D.4), which no answer carries.
-  Only ``POST /setup-code`` (a new setup code) and ``GET /gateway-key`` (the gateway key) may
-  carry a credential, each only its own: the two exceptions R61 records (Q23).
+  Only ``POST /setup-code`` (a new setup code), ``GET /gateway-key`` (the gateway key) and
+  ``GET /egress-key`` (the egress role's key, M7 G.3) may carry a credential, each only its own:
+  the exceptions R61 records (Q23, DD-14).
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
   a live slot, a value held by a pending ``secret.put``, a given client secret stored through
   ``onboard.register`` (M7 K.3) and a done review job of the portal's (F.6). Its health,
   OAuth list, connect and policy routes read the same store, token manager, logins and policy,
   and its ledger a copy.
-  No answer carries a value, a setup code, the gateway key, or a session half beyond the one
-  answer that mints it.
-- **The portal's code**: an AST check finds no reference to ``SetupCodes.issue``, the gateway key
-  or a store read of a value anywhere in ``portal/``, so no portal route can reach either
-  exception. Under mutmut the source also holds every function's mutants, named with
+  No answer carries a value, a setup code, the gateway key, the egress key, or a session half
+  beyond the one answer that mints it.
+- **The portal's code**: an AST check finds no reference to ``SetupCodes.issue``, the gateway key,
+  the egress key or a store read of a value anywhere in ``portal/``, so no portal route can reach
+  an exception. Under mutmut the source also holds every function's mutants, named with
   ``__mutmut_``; they are left out, as in ``test_refusals.py``.
 """
 
@@ -63,8 +64,12 @@ MAIL_VALUE = "p1-mail-pass-value-0001"
 LIVE_VALUE = "p1-live-slot-value-0001"
 HELD_VALUE = "p1-held-value-0001"
 VALUES = (STATIC_VALUE, REFRESH_VALUE, CLIENT_ID_VALUE, MAIL_VALUE, LIVE_VALUE, HELD_VALUE)
-# The two answers that carry a credential, and only over the socket (R61, D-115).
-EXCEPTIONS = {("POST", "/setup-code"): "setup code", ("GET", "/gateway-key"): "gateway key"}
+# The answers that carry a credential, and only over the socket (R61, D-115, DD-14).
+EXCEPTIONS = {
+    ("POST", "/setup-code"): "setup code",
+    ("GET", "/gateway-key"): "gateway key",
+    ("GET", "/egress-key"): "egress key",
+}
 
 
 @pytest.fixture
@@ -149,7 +154,7 @@ def socket_routes(rig: AdminRig) -> list[tuple[str, str]]:
     return walked
 
 
-async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
+async def test_no_socket_answer_carries_a_credential_but_the_exceptions(
     tmp_path: Path,
 ) -> None:
     reviews = Reviews()
@@ -165,9 +170,11 @@ async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     credentials = dict.fromkeys((*VALUES, onboard_model.GIVEN_SECRET), "secret value")
     credentials[code.reveal()] = "setup code"
     credentials[KEYS.gateway_key(1)] = "gateway key"
+    credentials[KEYS.egress_key(1)] = "egress key"
     answers: list[tuple[tuple[str, str], str]] = []
     walked = socket_routes(rig)
-    assert len(walked) == len(set(walked)) >= 23
+    assert len(walked) == len(set(walked)) >= 24
+    assert ("GET", "/egress-key") in walked
     assert ("DELETE", "/onboard/{onboarding}") in walked
     assert ("GET", "/review/jobs/{job}") in walked
     assert ("POST", "/review/jobs/{job}/diff") in walked
@@ -210,6 +217,20 @@ async def test_no_socket_answer_carries_what_a_registration_issued(tmp_path: Pat
         response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
         answers.append(response.text + repr(dict(response.headers)))
     assert [text for text in answers if carried(text, credentials)] == []
+    await rig.token_client.aclose()
+
+
+async def test_the_egress_key_answers_its_running_generation_alone(tmp_path: Path) -> None:
+    """R61's third exception (DD-14) carries the egress key of the running generation and no
+    other: no previous key, since a bump retires it at once (G.3)."""
+    rig = AdminRig(tmp_path)
+    answer = await rig.call("GET", "/egress-key")
+    assert answer.json() == {"key": KEYS.egress_key(1), "generation": 1}
+    rig.set_policy(rig.policy.model_copy(update={"egress_key_generation": 3}))
+    answer = await rig.call("GET", "/egress-key")
+    assert answer.json() == {"key": KEYS.egress_key(3), "generation": 3}
+    assert KEYS.egress_key(1) not in answer.text
+    assert KEYS.gateway_key(1) not in answer.text
     await rig.token_client.aclose()
 
 
@@ -361,6 +382,7 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
     credentials = dict.fromkeys((*VALUES, onboard_model.GIVEN_SECRET), "secret value")
     credentials[code.reveal()] = "setup code"
     credentials[KEYS.gateway_key(1)] = "gateway key"
+    credentials[KEYS.egress_key(1)] = "egress key"
     for text in answers:
         assert carried(text, credentials) == set()
     # Each session half is in the one answer that minted it, and in no other.
@@ -377,12 +399,20 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
 
 # --- the portal's code (D-115) ------------------------------------------------------------------
 
-# What would reach a credential: a setup code's issue, the gateway key or its ratchet, and a
-# store or token manager read of a value.
+# What would reach a credential: a setup code's issue, the gateway key or its ratchet, the
+# egress key, and a store or token manager read of a value.
 FORBIDDEN_ATTRIBUTES = frozenset(
-    {"issue", "gateway_key", "gateway_keys", "get_for_origin", "get_for_oauth", "grant_for"}
+    {
+        "issue",
+        "gateway_key",
+        "gateway_keys",
+        "egress_key",
+        "get_for_origin",
+        "get_for_oauth",
+        "grant_for",
+    }
 )
-FORBIDDEN_PATHS = ("/setup-code", "/gateway-key")
+FORBIDDEN_PATHS = ("/setup-code", "/gateway-key", "/egress-key")
 
 
 def without_mutants(tree: ast.Module) -> ast.Module:
@@ -403,7 +433,7 @@ def without_mutants(tree: ast.Module) -> ast.Module:
 
 def references(tree: ast.Module) -> list[str]:
     """Every reference in ``tree`` to a forbidden attribute, a name with ``gateway`` in it, or
-    a string that is one of the two socket paths (a docstring may name them)."""
+    a string that is one of the socket paths (a docstring may name them)."""
     found = []
     for node in ast.walk(tree):
         names: list[str] = []
@@ -438,6 +468,8 @@ def test_the_reference_checker_catches_what_it_is_for() -> None:
         "from ..vault import gatewaykeys",
         "path = '/setup-code'",
         "url = f'/gateway-key?x={y}'",
+        "key = keys.egress_key(1)",
+        "path = '/egress-key'",
         "secret = store.get_for_origin(name, url)",
         "secret, _ = store.get_for_oauth(name, token_url=url)",
         "grant = await tokens.grant_for(name, upstream)",
@@ -449,7 +481,7 @@ def test_the_reference_checker_catches_what_it_is_for() -> None:
     assert references(without_mutants(ast.parse(mutated))) == []
 
 
-def test_no_portal_code_reaches_a_setup_code_issue_or_the_gateway_key() -> None:
+def test_no_portal_code_reaches_a_setup_code_issue_or_a_key() -> None:
     modules = portal_modules()
     assert {"zoeymcp.portal.app", "zoeymcp.portal.routes", "zoeymcp.portal.setupcode"} <= set(
         modules
@@ -460,3 +492,4 @@ def test_no_portal_code_reaches_a_setup_code_issue_or_the_gateway_key() -> None:
     for route in ROUTES:
         assert "setup-code" not in route.path
         assert "gateway" not in route.path
+        assert "egress-key" not in route.path

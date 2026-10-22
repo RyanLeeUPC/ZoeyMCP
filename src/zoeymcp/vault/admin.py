@@ -5,9 +5,9 @@ socket's directory must be owned by the vault's uid and closed to everyone else,
 uid (or root, which already has the host) can connect. The CLI reaches it with
 ``docker exec <vault> zoeymcp secret ...``.
 
-There is deliberately no endpoint that returns a secret value. Two answers carry a credential, as
-recorded exceptions to R61 (M5 design D16): ``POST /setup-code`` the new setup code, and
-``GET /gateway-key`` the gateway key.
+There is deliberately no endpoint that returns a secret value. Three answers carry a credential,
+as recorded exceptions to R61 (M5 design D16, M7 design DD-14): ``POST /setup-code`` the new
+setup code, ``GET /gateway-key`` the gateway key, and ``GET /egress-key`` the egress role's key.
 
 ``zoeymcp setup-code [--reset] [--wait]`` uses ``POST /setup-code`` and ``GET /setup-code/status``;
 ``zoeymcp passkeys`` and ``sessions`` list and remove the portal's passkeys and sessions, with no
@@ -20,7 +20,9 @@ store can't write its file, the change is kept in memory and the answer is a 500
 (B.4).
 
 ``zoeymcp gateway-key`` prints the gateway key and any rotation pending; ``--retire-previous``
-retires the previous key at once (M3 design C.2).
+retires the previous key at once (M3 design C.2). ``zoeymcp egress-key`` prints the egress role's
+key for the running ``egress_key_generation`` (M7 design G.3): it reads the allowlists alone,
+and a new generation retires it at once.
 
 ``zoeymcp login`` and ``oauth status|reset`` use the ``/oauth`` endpoints (design E.1). Their
 errors are ``{"error", "reason"}`` with a stable reason. No answer holds a token, code, verifier
@@ -395,7 +397,9 @@ class HealthReader:
     no sends; without ``env_names`` every ``env:`` reference is unset; without ``reports`` or
     ``passkeys`` the report has no ``ledger_copy`` or ``passkeys`` section. ``wall`` is the
     wall clock a registered client's secret expiry is judged on (M7 design J, FM-28). The
-    address guard's refusals come from the logins' token manager (J)."""
+    address guard's refusals come from the logins' token manager (J), and the egress role's last
+    fetch from ``egress_fetched_ago`` (``VaultApp``'s; without it, no
+    ``egress_allowlist_stale``)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -405,6 +409,7 @@ class HealthReader:
     reports: ReportStore | None = None
     passkeys: Passkeys | None = None
     wall: Callable[[], float] = time.time
+    egress_fetched_ago: Callable[[], float | None] | None = None
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -420,6 +425,9 @@ class HealthReader:
             ledger_copy=self._ledger_copy(policy),
             wall=self.wall(),
             refused=() if self.login is None else self.login.refused(),
+            egress_fetched_ago=None
+            if self.egress_fetched_ago is None
+            else self.egress_fetched_ago(),
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report
@@ -485,6 +493,7 @@ class AdminApp:
         onboard: OnboardService | None = None,
         revoker: secretops.Revoker | None = None,
         reviews: ReviewQueue | None = None,
+        egress_fetched_ago: Callable[[], float | None] | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -508,7 +517,10 @@ class AdminApp:
         (M7 design D.9), shared with the portal. Without it, nothing is revoked.
 
         ``reviews`` holds the review jobs the gateway polls for (M7 design F.2). Without it,
-        the ``/review`` routes answer 503."""
+        the ``/review`` routes answer 503.
+
+        ``egress_fetched_ago`` says how long ago the egress role last fetched its lists, for
+        health (M7 design J). Without it, health has no ``egress_allowlist_stale``."""
         self._store = store
         self._reviews = reviews
         self._revoker = revoker
@@ -533,6 +545,7 @@ class AdminApp:
             env_names=env_names,
             reports=reports,
             passkeys=passkeys,
+            egress_fetched_ago=egress_fetched_ago,
         )
         self.app = Starlette(
             routes=[
@@ -547,6 +560,7 @@ class AdminApp:
                 Route("/sessions", self._session_end_all, methods=["DELETE"]),
                 Route("/gateway-key", self._gateway_key, methods=["GET"]),
                 Route("/gateway-key/retire-previous", self._retire_previous, methods=["POST"]),
+                Route("/egress-key", self._egress_key, methods=["GET"]),
                 Route("/oauth", self._oauth_status, methods=["GET"]),
                 Route("/oauth/flows/{flow}", self._oauth_cancel, methods=["DELETE"]),
                 Route("/oauth/{credential}/login", self._oauth_login, methods=["POST"]),
@@ -717,6 +731,12 @@ class AdminApp:
             key = self._keys.gateway_key(generation)
             return JSONResponse({"generation": generation, "key": key, "previous": None})
         return JSONResponse(self._gateway_keys.info())
+
+    async def _egress_key(self, request: Request) -> Response:
+        """The egress role's key for the running ``egress_key_generation``: R61's third scoped
+        exception (M7 design G.3, DD-14). No previous key is accepted, so none is shown."""
+        generation = self._policy().egress_key_generation
+        return JSONResponse({"key": self._keys.egress_key(generation), "generation": generation})
 
     async def _retire_previous(self, request: Request) -> Response:
         if self._gateway_keys is None:

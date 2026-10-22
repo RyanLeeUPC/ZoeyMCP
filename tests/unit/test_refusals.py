@@ -136,8 +136,13 @@ ONBOARDING = {
     "onboarding_options_changed": 409,
 }
 # M7's M.2: the onboarding service's own (M7 step 8a2), and login's check of an onboarded
-# client's secret (D.7).
-SERVICE = {"registration_unavailable": 409, "proxy_refused": 502}
+# client's secret (D.7); through the built-in egress role (M7 step 17b; I.3, TI-10).
+SERVICE = {
+    "registration_unavailable": 409,
+    "proxy_refused": 502,
+    "egress_refused": 502,
+    "private_needs_direct": 409,
+}
 # M7's M.2: a registration the vault makes (M7 step 11; D.4, X7), and a server that registers
 # clients by metadata document alone.
 DCR = {
@@ -251,6 +256,7 @@ FIELDS = {
     "dcr_failed": {"detail"},
     "dcr_answer_invalid": {"detail"},
     "proxy_refused": {"host"},
+    "egress_refused": {"host"},
     "already_configured": {"server", "kind"},
     "onboarding_mismatch": {"fields"},
     "reregister_by_hand": {"credential", "field", "why"},

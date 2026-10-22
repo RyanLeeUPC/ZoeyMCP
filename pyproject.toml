@@ -226,3 +226,4 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.cli.choices" = 95
 "zoeymcp.portal.reviewview" = 95
 "zoeymcp.vault.oauth.dcr" = 95
+"zoeymcp.egress.connect" = 95

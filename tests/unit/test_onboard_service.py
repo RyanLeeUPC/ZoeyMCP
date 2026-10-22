@@ -9,7 +9,11 @@ client checks every address unchanged. The MCP fake serves ``mcp.notes.example``
 private host, ``mcp.lan.example``), the OAuth fake ``auth.notes.example``, and a third host
 answers every request with a redirect. Step 5's hostile switches each get a row here, the
 registration answers and a stalled registration (FM-9) among them, except RFC 9207's ``iss``
-(login's).
+(login's). Through the built-in egress role (I.3, step 17b), which the policy names with
+``egress_proxy_kind: role``, an onboarding's hosts reach the role's list through the vault's real
+allowlist endpoint, and no proxy is edited (J5's built-in variant); a refusal all the same is
+``egress_refused``, and ``allow_private`` is refused. An ``egress_proxy`` of kind ``own`` is the
+operator's proxy even while a role fetches the vault's lists.
 
 FM-5 and FM-6 shorten the fetch limits for the test (``test_fetch.py`` pins their values), so
 no test waits for long and none sleeps.
@@ -17,6 +21,8 @@ no test waits for long and none sleeps.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import io
 import json
 import time
@@ -29,6 +35,7 @@ from urllib.parse import urlsplit
 
 import anyio
 import certifi
+import httpx
 import pytest
 from starlette.types import Receive, Scope, Send
 
@@ -45,12 +52,15 @@ from tests.fakes.oauth_server import (
     FakeAuthServer,
 )
 from tests.fakes.resolver import TIMEOUT, FakeResolver
+from zoeymcp.common import egresslist
 from zoeymcp.common.policy import Policy, check_policy, parse_policy
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
-from zoeymcp.common.policy.schema import OAuth2Credential
+from zoeymcp.common.policy.schema import EgressProxyKind, OAuth2Credential
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.egress.allowlist import parse_document
 from zoeymcp.portal.refusals import CATALOGUE
-from zoeymcp.vault import logs, netclient, secretops
+from zoeymcp.vault import logs, netclient, onboard, secretops
+from zoeymcp.vault.app import ALLOWLIST_PATH, EGRESS_HEADER, VaultApp
 from zoeymcp.vault.bindings import derive_binding, oauth_binding
 from zoeymcp.vault.oauth import fetch
 from zoeymcp.vault.oauth.pkce import CLI_OWNER
@@ -211,6 +221,8 @@ class Rig:
         tmp_path: Path,
         proxy: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        egress: VaultApp | None = None,
+        kind: EgressProxyKind = "own",
     ) -> None:
         state = tmp_path / "state"
         state.mkdir(mode=0o700)
@@ -220,6 +232,8 @@ class Rig:
         self.client = netclient.onboarding_client(proxy)
         self.proxy = proxy
         self.clock = clock
+        self.egress = egress
+        self.kind: EgressProxyKind = kind
         self.restart()
 
     def restart(self) -> None:
@@ -230,9 +244,13 @@ class Rig:
             lambda: self.policy,
             self.client,
             egress_proxy=self.proxy,
+            egress_proxy_kind=self.kind,
+            egress=self.egress,
             source="policy.yaml",
             clock=self.clock,
         )
+        if self.egress is not None:
+            self.egress.use_allowances(self.service.allowances, self.service.allowances_expire_in)
 
     async def discover(self, owner: str = CLI_OWNER, **body: Any) -> dict[str, Any]:
         with anyio.fail_after(20):
@@ -255,9 +273,13 @@ class Rig:
 
 @asynccontextmanager
 async def running(
-    tmp_path: Path, proxy: str | None = None, clock: Callable[[], float] = time.monotonic
+    tmp_path: Path,
+    proxy: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    egress: VaultApp | None = None,
+    kind: EgressProxyKind = "own",
 ) -> AsyncIterator[Rig]:
-    rig = Rig(tmp_path, proxy, clock)
+    rig = Rig(tmp_path, proxy, clock, egress, kind)
     try:
         yield rig
     finally:
@@ -1288,6 +1310,210 @@ async def test_an_own_proxy_refusal_and_its_resume(
     assert blocked == {**blocked, "host": AUTH, "port": 443, "needed": 2}
     fetched = [r for r in records(lines) if r["event"] == "discovery_fetch"]
     assert {r["via"] for r in fetched} == {"proxy"}
+
+
+# --- the built-in egress role (I.3, TI-10; J5's built-in variant) --------------------------------
+
+
+def unreachable(request: httpx.Request) -> httpx.Response:
+    raise AssertionError("the vault's own clients aren't used here")
+
+
+def role_vault(tmp_path: Path) -> VaultApp:
+    """The vault whose allowlist endpoint the role polls, on the example policy."""
+    state = tmp_path / "vault"
+    state.mkdir(mode=0o700)
+    store = SecretStore(state, KEYS)
+    store.load()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(unreachable))
+    return VaultApp(example_policy(), store, KEYS, client=client, environ={})
+
+
+@asynccontextmanager
+async def egress_role(
+    vault: VaultApp, proxy: ConnectProxy, *, polls: bool = True, applying: float = 0.0
+) -> AsyncIterator[list[str]]:
+    """The role as the vault meets it: it long-polls the allowlists with its key and, on each
+    200, lets through what the new list holds (the proxy's ``allow``, the role's own parser
+    reading the vault's answer), then polls again naming the digest it holds (I.4). Applying a
+    list takes ``applying`` seconds, so a vault that didn't wait for the role's next poll would
+    CONNECT before the list changed. Without ``polls`` it fetches once and stops. Yields each
+    digest it applied."""
+    applied: list[str] = []
+    transport = httpx.ASGITransport(app=vault, client=("172.30.9.2", 40000))
+
+    async def poll(client: httpx.AsyncClient) -> None:
+        held: str | None = None
+        while True:
+            headers = {EGRESS_HEADER: KEYS.egress_key(1)}
+            path = ALLOWLIST_PATH.text
+            if held is not None:
+                headers["If-None-Match"] = f'"{held}"'
+                path += "?wait=25"
+            answer = await client.get(path, headers=headers)
+            if answer.status_code == 200:
+                held, lists, _ = parse_document(answer.content)
+                await asyncio.sleep(applying)
+                proxy.allow = set(lists[egresslist.VAULT])
+                applied.append(held)
+            if not polls:
+                return
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
+        task = asyncio.create_task(poll(client))
+        with anyio.fail_after(10):
+            while not applied:
+                await asyncio.sleep(0.01)
+        try:
+            yield applied
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    await vault.aclose()
+
+
+def proxy_through(world: World, **kwargs: Any) -> ConnectProxy:
+    beyond = FakeResolver()
+    for name, port in world.ports.items():
+        beyond.serve(name, port)
+    return ConnectProxy(names=beyond, **kwargs)
+
+
+@pytest.mark.usefixtures("mcp", "auth")
+async def test_through_the_role_an_onboarding_needs_no_proxy_edit(
+    tmp_path: Path, world: World, names: FakeResolver, lines: io.StringIO
+) -> None:
+    """J5's built-in variant (I.3): each host joins the allowance before the vault connects to
+    it, the role fetches the widened list, and the CONNECT passes. The role takes its time to
+    apply each list, so the CONNECT passes only because the vault waits for the role's next
+    poll to name the widened digest. Once the onboarding has its fragment, its hosts leave the
+    list."""
+    proxy = proxy_through(world, allow=set())
+    vault = role_vault(tmp_path)
+    with serve_proxy(proxy) as proxy_url:
+        async with (
+            egress_role(vault, proxy, applying=0.3) as applied,
+            running(tmp_path, proxy_url, egress=vault, kind="role") as rig,
+        ):
+            started = len(applied)
+            plan = await rig.discover(**PUBLIC)
+            assert plan["stage"] == "discovered"
+            widened = list(applied)
+            made = await rig.service.fragment(plan["onboarding"], {})
+            policy_only = egresslist.digest(egresslist.derive(rig.policy))
+            with anyio.fail_after(5):
+                while applied[-1] != policy_only:
+                    await asyncio.sleep(0.01)
+    # The server's host, then the authorization server's, each fetched before its CONNECT.
+    assert len(widened) >= started + 2
+    assert proxy.targets[0] == f"{MCP}:443"
+    assert f"{AUTH}:443" in proxy.targets
+    assert plan["allowance"] == [f"{AUTH}:443", f"{MCP}:443"]
+    assert proxy.allow is not None
+    assert f"{AUTH}:443" not in proxy.allow
+    assert f"{MCP}:443" not in proxy.allow
+    # No proxy round, and no proxy file to update after the commit.
+    assert "onboard_blocked" not in events(lines)
+    assert "update_proxy_allowlist" not in [step["do"] for step in made["next"]]
+    # Through a proxy nothing resolves here: the role judges every address (B.3).
+    assert names.lookups == []
+
+
+@pytest.mark.usefixtures("mcp", "auth")
+async def test_a_connect_the_role_refuses_is_egress_refused(
+    tmp_path: Path,
+    world: World,
+    names: FakeResolver,
+    lines: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A role that stopped polling never fetches the widened list: after ALLOWANCE_WAIT the
+    vault connects anyway, the role refuses, and the onboarding ends ``egress_refused``,
+    naming the host, with no proxy lines to add (I.3)."""
+    monkeypatch.setattr(onboard, "ALLOWANCE_WAIT", 0.2)
+    proxy = proxy_through(world, allow=set())
+    vault = role_vault(tmp_path)
+    with serve_proxy(proxy) as proxy_url:
+        async with (
+            egress_role(vault, proxy, polls=False),
+            running(tmp_path, proxy_url, egress=vault, kind="role") as rig,
+        ):
+            status, body = await rig.refused(**PUBLIC)
+            assert rig.service.owned(CLI_OWNER) is None
+    assert (status, body["reason"]) == (502, "egress_refused")
+    # The role's own status: 403, a host its lists don't hold (I.4).
+    assert (body["host"], body["port"], body["status"]) == (MCP, 443, 403)
+    assert "next" not in body
+    assert body["error"] == CATALOGUE["egress_refused"].text.format(host=MCP)
+    assert proxy.targets == [f"{MCP}:443"]
+    refused = [r for r in records(lines) if r["event"] == "onboard_refused"]
+    assert [(r["reason"], r["host"]) for r in refused] == [("egress_refused", MCP)]
+    assert "onboard_blocked" not in events(lines)
+
+
+@pytest.mark.usefixtures("mcp", "auth")
+async def test_allow_private_through_the_role_is_refused(
+    tmp_path: Path, world: World, names: FakeResolver, lines: io.StringIO
+) -> None:
+    """TI-10: the role can't scope a private exception to one onboarding's requests, so the
+    tick is refused before anything is sent; without the role it is the vault's own (B.2)."""
+    proxy = proxy_through(world, allow=set())
+    vault = role_vault(tmp_path)
+    with serve_proxy(proxy) as proxy_url:
+        async with (
+            egress_role(vault, proxy),
+            running(tmp_path, proxy_url, egress=vault, kind="role") as rig,
+        ):
+            status, body = await rig.refused(url=LAN_URL, client_id=CLIENT_ID, allow_private=True)
+    assert (status, body["reason"]) == (409, "private_needs_direct")
+    assert proxy.targets == []
+    assert "onboard_started" not in events(lines)
+
+
+@pytest.mark.usefixtures("mcp", "auth")
+async def test_a_role_that_never_polled_is_egress_refused(
+    tmp_path: Path, world: World, names: FakeResolver, lines: io.StringIO
+) -> None:
+    """With egress_proxy_kind role the vault doesn't wait to see the role: a role that never
+    fetched its lists holds none, refuses the CONNECT, and the onboarding ends
+    ``egress_refused``, with no Squid lines to add and nothing blocked (I.3)."""
+    proxy = proxy_through(world, allow=set())
+    vault = role_vault(tmp_path)
+    with serve_proxy(proxy) as proxy_url:
+        async with running(tmp_path, proxy_url, egress=vault, kind="role") as rig:
+            status, body = await rig.refused(**PUBLIC)
+            assert rig.service.owned(CLI_OWNER) is None
+    await vault.aclose()
+    assert (status, body["reason"]) == (502, "egress_refused")
+    assert (body["host"], body["port"], body["status"]) == (MCP, 443, 403)
+    assert "next" not in body
+    assert proxy.targets == [f"{MCP}:443"]
+    assert "onboard_blocked" not in events(lines)
+
+
+@pytest.mark.usefixtures("mcp", "auth")
+async def test_an_own_proxy_stays_the_operators_while_a_role_polls(
+    tmp_path: Path, world: World, names: FakeResolver, lines: io.StringIO
+) -> None:
+    """egress_proxy_kind own (the default) is the operator's proxy whatever fetches the vault's
+    lists: with a role polling them (as one serving bridges would), the own proxy's refusal
+    still blocks the onboarding with the Squid lines to add (D.11), and the vault never waits
+    for the role."""
+    own = proxy_through(world, refuse={AUTH})
+    vault = role_vault(tmp_path)
+    with serve_proxy(own) as proxy_url:
+        async with (
+            egress_role(vault, ConnectProxy()) as applied,
+            running(tmp_path, proxy_url, egress=vault) as rig,
+        ):
+            status, body = await rig.refused(**PUBLIC)
+            assert applied
+    assert (status, body["reason"]) == (502, "proxy_refused")
+    assert body["host"] == AUTH
+    assert body["next"][0]["do"] == "allow_hosts"
+    assert f"{AUTH}:443" in own.targets
+    assert "onboard_blocked" in events(lines)
 
 
 @pytest.mark.usefixtures("names")

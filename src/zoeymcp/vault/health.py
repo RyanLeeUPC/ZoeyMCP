@@ -15,8 +15,8 @@ command. The kinds are :func:`~.oauth.login.hint_action`'s (``connect``, ``reset
 ``delete_secret``, ``check_volume`` and ``check_mailbox``, and for the passkeys ``add_passkey``,
 ``review_passkeys`` and ``reset_passkeys``, and for the reported ledger ``check_gateway`` and
 ``read_ledger``; from M7, ``onboard_again`` with the ``command`` (``login --mcp URL
---reregister``, OPS-3) and ``widen_scope`` with the union ``scope`` and the ``fragment`` that
-sets it (D.5's step-up, SPEC-11), which ``connect`` follows.
+--reregister``, OPS-3), ``widen_scope`` with the union ``scope`` and the ``fragment`` that
+sets it (D.5's step-up, SPEC-11), which ``connect`` follows, and ``check_egress_role``.
 
 Stored bindings are judged by effect, not by equality (verifier V9), because the socket may store
 an explicit ``origins`` binding for any name: ``binding_changed`` means a use the policy makes now
@@ -42,6 +42,13 @@ resolved where the running policy doesn't allow. A route with no credential has 
 section, so its refusals are the ``egress`` section's, one finding per route. Each is judged
 against the running policy, keyed as the guard sees the destination (:func:`.netclient.guard_key`),
 so a reload that lists it in ``egress_private``, or moves the endpoint, ends it.
+
+``egress_allowlist_stale`` (M7 design J, COV-7) is the ``egress`` section's too: the egress role
+hasn't fetched its lists for more than :data:`.internal.ALLOWLIST_MAX_STALE` seconds, so it
+refuses every new tunnel (I.4). A role that has asked since the vault started but was never
+admitted (a wrong or old key) counts from its first request. A vault no role has asked since it
+started counts from its start when its startup policy's ``egress_proxy`` is the role
+(``egress_proxy_kind: role``), which is expected then, and has no such finding otherwise.
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ from .bindings import (
     oauth_binding,
 )
 from .connectors.sendjournal import DAY_MS, Journal
+from .internal import ALLOWLIST_MAX_STALE
 from .netclient import destination_key, guard_key, private_hint
 from .oauth.protocol import GRANT_WARN_DAYS
 from .onboarding import onboard_again, widen_scope
@@ -134,6 +142,10 @@ class Inputs:
     wall: float | None = None
     # The address guard's refusals since start: LoginService.refused().
     refused: Sequence[Mapping[str, Any]] = ()
+    # Seconds since the egress role last fetched its lists, or since its first refused request,
+    # or since the vault started when egress_proxy is the role and none has asked; None if no
+    # role has asked and none is expected (VaultApp.allowlist_fetched_ago).
+    egress_fetched_ago: float | None = None
 
 
 @dataclass(frozen=True)
@@ -167,7 +179,7 @@ class _Use:
 
 def assess(inputs: Inputs) -> dict[str, Any]:
     """The health of every credential, connector and store entry, and of the routes with no
-    credential the guard refused (``egress``), and a count per level."""
+    credential the guard refused and the egress role (``egress``), and a count per level."""
     policy = inputs.policy
     stored = {entry.name: entry for entry in inputs.entries}
     status = {item["credential"]: item for item in inputs.oauth or ()}
@@ -184,7 +196,7 @@ def assess(inputs: Inputs) -> dict[str, Any]:
         for name, connector in policy.connectors.items()
     ]
     store = _store(inputs)
-    egress = _egress(policy, inputs.refused)
+    egress = _egress(policy, inputs.refused, inputs.egress_fetched_ago)
     sections = [*credentials, *connectors, store, egress]
     report: dict[str, Any] = {
         "credentials": credentials,
@@ -456,10 +468,13 @@ def _address_refused(
     return found
 
 
-def _egress(policy: Policy, refused: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _egress(
+    policy: Policy, refused: Sequence[Mapping[str, Any]], fetched_ago: float | None
+) -> dict[str, Any]:
     """The guard's refusals of a route with no credential, which no credential's section holds
     (M7 design J): one finding per such route whose upstream, as the running policy has it now,
-    was refused and isn't listed in its ``egress_private``."""
+    was refused and isn't listed in its ``egress_private``; then an egress role whose last fetch
+    of its lists is older than they stay fresh (COV-7)."""
     listed = egresslist.private_exceptions(policy)
     seen = {guard_key(i["host"], i["port"]): i for i in refused if i["purpose"] == "route"}
     findings: list[Finding] = []
@@ -472,6 +487,14 @@ def _egress(policy: Policy, refused: Sequence[Mapping[str, Any]]) -> dict[str, A
         text = _refused_text(f"route {route.name}'s upstream", key, seen[key])
         action = _act("fix_policy", "route", route.name)
         findings.append(_finding("address_refused", "error", text, action))
+    if fetched_ago is not None and fetched_ago > ALLOWLIST_MAX_STALE:
+        text = (
+            f"the egress role hasn't fetched its allowlists for {int(fetched_ago) // 60} min: "
+            f"its lists go stale after {ALLOWLIST_MAX_STALE} s, and then it refuses every new "
+            "tunnel"
+        )
+        action = {"kind": "check_egress_role"}
+        findings.append(_finding("egress_allowlist_stale", "warning", text, action))
     return {"level": _level(findings), "findings": findings}
 
 

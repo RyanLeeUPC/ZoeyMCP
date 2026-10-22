@@ -63,6 +63,7 @@ def document() -> dict[str, Any]:
         "version": 1,
         "mode": "declarative",
         "egress_proxy": "http://proxy.example:3128",
+        "egress_proxy_kind": "role",
         "egress_private": ["api.example:443"],
         "egress_key_generation": 2,
         "egress_proxy_acls": {"vault": "stack_vault_net"},
@@ -406,6 +407,7 @@ def test_everything_else_is_shown_as_written_in_the_schemas_order() -> None:
     assert policy["egress_private"] == ["api.example:443"]
     assert policy["egress_key_generation"] == 2
     assert policy["egress_proxy_acls"] == {"vault": "stack_vault_net"}
+    assert policy["egress_proxy_kind"] == "role"
 
 
 def test_every_string_is_shown() -> None:

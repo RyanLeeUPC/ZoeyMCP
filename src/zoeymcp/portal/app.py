@@ -270,6 +270,8 @@ ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
         "the command.",
         "widen_scope": "Merge the scope fragment from zoeymcp health --json, check and reload "
         "the policy, then connect.",
+        "check_egress_role": "Check that the egress role is running, reaches the vault and has "
+        "the key zoeymcp egress-key prints.",
     }
 )
 # The banner while the reported copy refuses reports (K.3), by its state (J.2 rows 8-10).

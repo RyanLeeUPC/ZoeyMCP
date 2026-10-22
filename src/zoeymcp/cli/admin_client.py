@@ -215,6 +215,11 @@ def gateway_key(socket: str, transport: httpx.BaseTransport | None = None) -> di
     return _request(socket, "GET", "/gateway-key", transport=transport)
 
 
+def egress_key(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    """The egress role's key for the running generation (M7 design G.3): ``{key, generation}``."""
+    return _request(socket, "GET", "/egress-key", transport=transport)
+
+
 def gateway_key_retire_previous(
     socket: str, transport: httpx.BaseTransport | None = None
 ) -> dict[str, Any]:

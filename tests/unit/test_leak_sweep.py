@@ -38,6 +38,11 @@ report (a tool's name or text, a pin) or a gateway's error message reaches the l
 portal's MCP servers section (M7 design K, step 14a): a given client secret held by its
 register action and one a registration issued reach the store alone, and a portal review job's
 ID no log line.
+
+The egress role's key (M7 design G.3, O.5, step 17b) reaches the socket's ``GET /egress-key``
+answer, the key file and the role's own requests, and nothing else: no log line of the vault or
+the role, no answer of the allowlist path or of a path it is refused on, and no health report;
+neither does a retired generation's key, or a key file the role can't use.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ import httpx
 import pytest
 
 from tests.fakes.authenticator import Assertion, Attestation, SoftAuthenticator, b64url_decode
+from tests.fakes.harness import serve
 from tests.fakes.oauth_server import (
     FakeAuthServer,
     FakeResourceServer,
@@ -74,13 +80,14 @@ from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.egress.allowlist import Allowlist, KeySource
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
 from zoeymcp.vault import logs, reviewjobs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
-from zoeymcp.vault.app import VaultApp
+from zoeymcp.vault.app import EGRESS_HEADER, VaultApp
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.reportstore import ReportStore
@@ -1683,3 +1690,70 @@ async def test_an_onboarding_through_the_socket_and_the_portal_leaks_nothing(
         assert stored.reveal() == onboard_model.DCR_SECRET
         await client.aclose()
         await world.token_client.aclose()
+
+
+def test_the_egress_key_reaches_the_role_and_nothing_else(tmp_path: Path) -> None:
+    """The role fetches with the key the socket printed, polls again, then meets a vault whose
+    generation moved on (403) and a key file it can't use; the vault answers its lists, its
+    refusals and health. Only the socket's answer holds a key."""
+    old, new = KEYS.egress_key(1), KEYS.egress_key(2)
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    answers: list[str] = []
+    try:
+        (tmp_path / "admin").mkdir(mode=0o700)
+        (tmp_path / "vault").mkdir(mode=0o700)
+        rig = AdminRig(tmp_path / "admin")
+        store = SecretStore(tmp_path / "vault", KEYS)
+        store.load()
+        first = VaultApp(rig.policy, store, KEYS, environ={})
+        bumped = VaultApp(
+            rig.policy.model_copy(update={"egress_key_generation": 2}), store, KEYS, environ={}
+        )
+        key_file = tmp_path / "egress.key"
+
+        async def run(base: str, moved_on: str) -> str:
+            shown = await rig.call("GET", "/egress-key")
+            key_file.write_bytes(shown.json()["key"].encode() + b"\n")
+            role = Allowlist(
+                base, KeySource.from_environ({"ZOEYMCP_EGRESS_KEY_FILE": str(key_file)})
+            )
+            assert await role.fetch_once()
+            # The bumped vault refuses it; the file read again holds the same key.
+            source = KeySource(file=key_file)
+            later = Allowlist(moved_on, source, wait=0)
+            assert not await later.fetch_once()
+            key_file.write_bytes(old.encode() + b"!\n")
+            assert source.reload() is False
+            for app, value in ((first, old), (bumped, old), (first, new), (bumped, new)):
+                transport = httpx.ASGITransport(app=app, client=(AGENT, 40000))
+                async with httpx.AsyncClient(transport=transport, base_url="http://vault") as c:
+                    for path in (
+                        "/_zoeymcp/egress/v1/allowlists",
+                        "/_zoeymcp/egress/v1/allowlists?wait=x",
+                        "/_zoeymcp/gateway/v1/view",
+                        "/music/v1/me",
+                    ):
+                        got = await c.get(path, headers={EGRESS_HEADER: value})
+                        answers.append(got.text + repr(got.headers.multi_items()))
+            health = await rig.call("GET", "/health")
+            answers.append(health.text)
+            return shown.text
+
+        with serve(first) as base, serve(bumped) as moved_on:
+            shown = asyncio.run(run(base, moved_on))
+        asyncio.run(first.aclose())
+        asyncio.run(bumped.aclose())
+        asyncio.run(rig.token_client.aclose())
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    for event in ("egress_allowlist_served", "egress_allowlist_applied", "egress_allowlist_failed"):
+        assert f'"event":"{event}"' in text, event
+    assert '"event":"egress_key_unreadable"' in text
+    assert '"reason":"egress key refused"' in text
+    # The exception carries the running generation's key, and nothing else carries either.
+    assert old in shown
+    for key in (old, new, old[5:], new[5:]):
+        assert key not in text, key
+        assert [answer for answer in answers if key in answer] == []

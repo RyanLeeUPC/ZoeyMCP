@@ -1,5 +1,6 @@
 """The vault's own endpoints (M7 design G.1; O.2 ``test_internal.py``): one table, decided before
-any body byte is read, and the review jobs poll's query (F.2, CR-8)."""
+any body byte is read, the review jobs poll's query (F.2, CR-8), and (step 17b) the egress
+role's allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21)."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from zoeymcp.common import ledgerreport
 from zoeymcp.common.policy.match import NormalizedPath, RequestRejected
 from zoeymcp.vault import app, internal
 from zoeymcp.vault.internal import (
+    ALLOWLISTS,
     ENDPOINTS,
     LEDGER,
     REVIEW_JOBS,
@@ -18,7 +20,9 @@ from zoeymcp.vault.internal import (
     VIEW,
     Endpoint,
     Refusal,
+    _egress_path,
     _path,
+    allowlist_wait,
     decide,
     find,
     jobs_query,
@@ -26,6 +30,7 @@ from zoeymcp.vault.internal import (
 )
 
 DIGEST = "sha256:" + "ab" * 32
+GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT)
 
 
 def path(text: str) -> NormalizedPath:
@@ -36,8 +41,8 @@ def path(text: str) -> NormalizedPath:
 
 
 def test_the_table_is_g1s() -> None:
-    """Path, methods, identity, body cap and waiters, as G.1 lists them, without the egress row
-    (step 17)."""
+    """Path, methods, identity, body cap and waiters, as G.1 lists them, the egress row last
+    (step 17b)."""
     rows = [
         (e.path.text, e.methods, e.identity, e.body_cap, e.waiters, e.name, e.label)
         for e in ENDPOINTS
@@ -71,9 +76,20 @@ def test_the_table_is_g1s() -> None:
             "review_report",
             "the review report path",
         ),
+        (
+            "/_zoeymcp/egress/v1/allowlists",
+            ("GET",),
+            "egress",
+            0,
+            2,
+            "egress_allowlists",
+            "the allowlist path",
+        ),
     ]
     assert LEDGER.body_cap == ledgerreport.MAX_BODY_BYTES
     assert REVIEW_JOBS.waiters == internal.REVIEW_WAITERS
+    assert ALLOWLISTS.waiters == internal.ALLOWLIST_WAITERS
+    assert (*GATEWAY_ENDPOINTS, ALLOWLISTS) == ENDPOINTS
 
 
 def test_path_is_under_the_gateways_version() -> None:
@@ -82,6 +98,8 @@ def test_path_is_under_the_gateways_version() -> None:
         ("_zoeymcp", "gateway", "v1", "review", "jobs")
     )
     assert _path() == NormalizedPath(("_zoeymcp", "gateway", "v1"))
+    assert _egress_path("allowlists") == NormalizedPath(("_zoeymcp", "egress", "v1", "allowlists"))
+    assert _egress_path() == NormalizedPath(("_zoeymcp", "egress", "v1"))
 
 
 def test_the_constants() -> None:
@@ -89,6 +107,10 @@ def test_the_constants() -> None:
     assert (internal.REVIEW_WAIT, internal.REVIEW_WAITERS) == (25, 1)
     assert internal.REVIEW_READ_DEADLINE == 30.0
     assert (internal.VIEW_MAX_WAIT, internal.VIEW_MAX_WAITERS) == (25, 4)
+    assert (internal.ALLOWLIST_WAIT, internal.ALLOWLIST_WAITERS) == (25, 2)
+    assert internal.ALLOWLIST_MAX_STALE == 300
+    assert app.ALLOWLIST_PATH is ALLOWLISTS.path
+    assert app.ALLOWLIST_PATH.text == "/_zoeymcp/egress/v1/allowlists"
     assert (app.VIEW_MAX_WAIT, app.VIEW_MAX_WAITERS) == (25, 4)
     assert app.VIEW_PATH is VIEW.path
     assert app.REPORT_PATH is LEDGER.path
@@ -118,12 +140,18 @@ def test_each_path_finds_its_row(endpoint: Endpoint) -> None:
         "/_zoeymcp/gateway/v1/report",
         "/_zoeymcp/gateway/v1/report/Review",
         "/_zoeymcp/gateway/v2/review/jobs",
-        "/_zoeymcp/egress/v1/allowlists",
+        "/_zoeymcp/egress/v1",
+        "/_zoeymcp/egress/v1/allowlist",
+        "/_zoeymcp/egress/v2/allowlists",
+        "/_zoeymcp/egress/v1/allowlists/vault",
+        "/_zoeymcp/gateway/v1/allowlists",
+        "/_zoeymcp/egress/v1/view",
     ],
 )
 def test_anything_else_is_404(text: str) -> None:
     assert find(path(text)) is None
     assert decide(path(text), "GET", "gateway", "gateway") == Refusal(404, "no such vault endpoint")
+    assert decide(path(text), "GET", "tcp", "egress") == Refusal(404, "no such vault endpoint")
 
 
 def test_a_trailing_slash_is_another_path() -> None:
@@ -134,7 +162,7 @@ def test_a_trailing_slash_is_another_path() -> None:
 # --- deciding -------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("endpoint", ENDPOINTS, ids=lambda e: e.name)
+@pytest.mark.parametrize("endpoint", GATEWAY_ENDPOINTS, ids=lambda e: e.name)
 @pytest.mark.parametrize("listener", ["gateway", "tcp"])
 def test_the_gateway_reaches_each_method(endpoint: Endpoint, listener: internal.Listener) -> None:
     for method in endpoint.methods:
@@ -177,6 +205,83 @@ def test_another_method_is_405_with_allow(
 
 def test_a_refusal_has_no_allow_by_default() -> None:
     assert Refusal(403, "x").allow is None
+
+
+# --- the egress role (G.2, G.3, X21) --------------------------------------------------------------
+
+
+def test_the_egress_role_reaches_the_allowlists_over_tcp() -> None:
+    assert decide(ALLOWLISTS.path, "GET", "tcp", "egress") is ALLOWLISTS
+    assert decide(path("/_zoeymcp/egress/v1/allowlists"), "GET", "tcp", "egress") is ALLOWLISTS
+
+
+@pytest.mark.parametrize("identity", ["egress", "gateway", None])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_the_allowlists_are_never_served_on_the_link(
+    identity: internal.Identity | None, method: str
+) -> None:
+    """X21: before the identity and the method, whoever the link's caller says it is."""
+    refused = Refusal(403, "the allowlist path isn't served on the gateway's link")
+    assert decide(ALLOWLISTS.path, method, "gateway", identity) == refused
+
+
+@pytest.mark.parametrize("identity", ["gateway", None])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_only_the_egress_key_reaches_the_allowlists(
+    identity: internal.Identity | None, method: str
+) -> None:
+    refused = Refusal(403, "the allowlist path is for the egress role only")
+    assert decide(ALLOWLISTS.path, method, "tcp", identity) == refused
+
+
+@pytest.mark.parametrize("endpoint", GATEWAY_ENDPOINTS, ids=lambda e: e.name)
+@pytest.mark.parametrize("listener", ["gateway", "tcp"])
+def test_the_egress_key_reaches_no_gateway_path(
+    endpoint: Endpoint, listener: internal.Listener
+) -> None:
+    for method in endpoint.methods:
+        refused = decide(endpoint.path, method, listener, "egress")
+        assert refused == Refusal(403, f"{endpoint.label} is for the gateway only")
+
+
+@pytest.mark.parametrize("method", ["POST", "HEAD", "get", "DELETE"])
+def test_the_allowlists_take_get_only(method: str) -> None:
+    refused = Refusal(405, "the allowlist path takes GET only", "GET")
+    assert decide(ALLOWLISTS.path, method, "tcp", "egress") == refused
+
+
+@pytest.mark.parametrize(
+    ("params", "seconds"),
+    [
+        ([], 0),
+        ([("wait", "0")], 0),
+        ([("wait", "25")], 25),
+        ([("wait", "24")], 24),
+        ([("wait", "26")], 25),
+        ([("wait", "9" * 400)], 25),
+        ([("wait", "007")], 7),
+    ],
+)
+def test_the_allowlist_wait(params: list[tuple[str, str]], seconds: int) -> None:
+    assert allowlist_wait(params) == seconds
+
+
+@pytest.mark.parametrize(
+    ("params", "reason"),
+    [
+        ([("other", "1")], "the allowlist path takes one parameter, wait"),
+        ([("wait", "1"), ("wait", "1")], "the allowlist path takes one parameter, wait"),
+        ([("wait", "1"), ("view", DIGEST)], "the allowlist path takes one parameter, wait"),
+        ([("Wait", "1")], "the allowlist path takes one parameter, wait"),
+        ([("wait", "x")], "wait must be a number of seconds"),
+        ([("wait", "")], "wait must be a number of seconds"),
+        ([("wait", "-1")], "wait must be a number of seconds"),
+    ],
+)
+def test_a_bad_allowlist_query_is_refused(params: list[tuple[str, str]], reason: str) -> None:
+    with pytest.raises(RequestRejected) as caught:
+        allowlist_wait(params)
+    assert caught.value.reason == reason
 
 
 # --- the review jobs poll's query ---------------------------------------------------------------

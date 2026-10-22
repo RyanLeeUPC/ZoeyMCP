@@ -71,6 +71,10 @@ HEALTH_ACTIONS = {
         'merge credentials.{credential}.scope: "{scope}" (the fragment is in health --json), '
         "check and reload the policy, then run: zoeymcp login {credential}"
     ),
+    "check_egress_role": (
+        "check that the egress role runs, reaches the vault, and has the key zoeymcp egress-key "
+        "prints"
+    ),
 }
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
@@ -419,6 +423,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stop accepting the previous key now, for a suspected leak",
     )
+    commands.add_parser(
+        "egress-key",
+        help="print the egress role's key for the current generation (inside the vault)",
+        description=(
+            "Print the egress role's key for the current egress_key_generation, as "
+            "ZOEYMCP_EGRESS_KEY. It reads the vault's allowlists and nothing else. After a bump "
+            "the old key is refused at once, and the role refuses new tunnels within 300 s "
+            "until it has the new one."
+        ),
+    )
 
     review = commands.add_parser(
         "review",
@@ -712,7 +726,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")
-    for name in ("setup-code", "passkeys", "sessions", "gateway-key", "login", "health"):
+    for name in (
+        "setup-code",
+        "passkeys",
+        "sessions",
+        "gateway-key",
+        "egress-key",
+        "login",
+        "health",
+    ):
         commands.choices[name].add_argument("--socket", metavar="PATH", help="admin socket path")
     return parser
 
@@ -837,6 +859,10 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     try:
         if args.command == "gateway-key":
             _gateway_key(socket, args.retire_previous, out, err)
+        elif args.command == "egress-key":
+            result = admin_client.egress_key(socket)
+            out.write(f"ZOEYMCP_EGRESS_KEY={result['key']}\n")
+            err.write(f"Generation {result['generation']}.\n")
         elif args.action == "set":
             value = admin_client.read_secret_value(stdin)
             result = admin_client.secret_set(socket, args.name, value, args.origin)
@@ -2062,7 +2088,7 @@ def main(
         return _cmd_standard(args, err)
     if args.command == "selftest":
         return _cmd_selftest(args, stdin, out)
-    if args.command in ("secret", "gateway-key"):
+    if args.command in ("secret", "gateway-key", "egress-key"):
         return _cmd_admin(args, stdin, out, err)
     if args.command == "setup-code":
         return _cmd_setup_code(args, out, err)

@@ -385,6 +385,20 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "Your egress proxy refused the vault's connection to {host}. Allow the hosts listed "
             "here in it for the vault, then run the same command again.",
         ),
+        # Onboarding through the built-in egress role (M7 I.3, TI-10; vault/onboard.py).
+        "egress_refused": Entry(
+            502,
+            "The egress role refused the vault's connection to {host}: it hadn't fetched the "
+            "onboarding's hosts yet, its key is out of date, or it refused or couldn't reach "
+            "the host's address. Its egress_refused log line names which; if it hadn't fetched "
+            "yet, run the same command again.",
+        ),
+        "private_needs_direct": Entry(
+            409,
+            "A server on your network can't be onboarded through the egress role, which can't "
+            "keep its private exception to this onboarding. Onboard it with egress_proxy unset, "
+            "or add it to the policy by hand.",
+        ),
         # The second run and a re-registration (M7 D.12, D-184; vault/onboard.py).
         "already_configured": Entry(
             409,

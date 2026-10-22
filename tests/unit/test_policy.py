@@ -143,6 +143,19 @@ def test_example_policy_is_clean(example_text: str) -> None:
             lambda r: r.update(egress_proxy="https://proxy.example:3128"),
             "egress_proxy: Value error, scheme must be one of: http",
         ),
+        (
+            lambda r: r.update(egress_proxy_kind="role"),
+            "egress_proxy_kind: Value error, role needs egress_proxy: set it to the egress "
+            "role's vault listener, like http://egress-vault:3128",
+        ),
+        (
+            lambda r: r.update(egress_proxy="http://proxy.example:3128", egress_proxy_kind="squid"),
+            "egress_proxy_kind: Input should be 'own' or 'role'",
+        ),
+        (
+            lambda r: r.update(egress_proxy="http://proxy.example:3128", egress_proxy_kind="Role"),
+            "egress_proxy_kind: Input should be 'own' or 'role'",
+        ),
     ],
 )
 def test_schema_rejects(example_raw: Raw, mutate: Callable[[Raw], object], expected: str) -> None:
@@ -1625,6 +1638,21 @@ def test_the_egress_fields_default_empty(example_text: str) -> None:
     policy = parse_policy(example_text, "example")
     assert (policy.egress_private, policy.egress_key_generation) == ([], 1)
     assert policy.egress_proxy_acls == {}
+    # An egress_proxy is the operator's own unless the policy says it is the egress role.
+    assert policy.egress_proxy_kind == "own"
+
+
+def test_egress_proxy_kind_role_names_the_role(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["egress_proxy"] = "http://egress-vault:3128"
+    raw["egress_proxy_kind"] = "role"
+    assert parse_policy(yaml.safe_dump(raw), "test").egress_proxy_kind == "role"
+    assert egress_findings(raw) == []
+    # Without egress_proxy it names nothing: refused at the kind (test_schema_rejects). With an
+    # egress_proxy that fails its own check, that error alone is reported.
+    raw["egress_proxy"] = "https://egress-vault:3128"
+    found_errors = schema_errors(raw)
+    assert [e.split(":")[0] for e in found_errors] == ["egress_proxy"], found_errors
 
 
 def test_egress_key_generation_counts_from_one(example_raw: Raw) -> None:
@@ -1742,6 +1770,22 @@ def test_egress_proxy_acls(example_raw: Raw) -> None:
         e.startswith("egress_proxy_acls.Vault.[key]: String should match")
         for e in schema_errors(raw)
     )
+
+
+def test_egress_proxy_acls_with_the_role_are_unused(example_raw: Raw) -> None:
+    """The ACL names serve an operator's own Squid: the egress role takes its lists from the
+    vault, so with kind role they are a warning, and nothing else changes."""
+    raw = copy.deepcopy(example_raw)
+    raw["egress_proxy"] = "http://egress-vault:3128"
+    raw["egress_proxy_acls"] = {"vault": "stack_vault_net"}
+    assert egress_findings(raw) == []
+    raw["egress_proxy_kind"] = "role"
+    assert egress_findings(raw) == [
+        "warning egress_proxy_acls: unused: these name your own Squid's ACLs, and "
+        "egress_proxy_kind is role"
+    ]
+    raw["egress_proxy_acls"] = {}
+    assert egress_findings(raw) == []
 
 
 CONNECT_ONLY = (

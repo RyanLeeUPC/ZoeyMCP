@@ -3,7 +3,8 @@ connector journal summed up, and the meta-derived ``last_failure`` and ``idle`` 
 M7 (design J, step 10b): a stored client secret held to D.7 step 5 as login holds it (D-185),
 ``resource_metadata_changed``, the challenged scope and its ``widen_scope`` fragment, and an
 onboarding's secret waiting for its credential; (step 11) a registered client's secret near or
-past its expiry, on the wall clock; (step 16) the address guard's refusals, ``address_refused``.
+past its expiry, on the wall clock; (step 16) the address guard's refusals, ``address_refused``;
+(step 17b) an egress role that stopped fetching its lists, ``egress_allowlist_stale`` (COV-7).
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -40,6 +41,7 @@ from zoeymcp.vault.health import (
     parse_time,
     sends,
 )
+from zoeymcp.vault.internal import ALLOWLIST_MAX_STALE
 from zoeymcp.vault.store import EntryMeta, origin_binding, smtp_binding
 
 TOKEN_URL = "https://accounts.example/token"
@@ -1483,6 +1485,53 @@ def test_an_egress_route_is_matched_as_the_guard_sees_it() -> None:
     found = report(literal, refused=[refusal("route", "fd00::7", 8443)])
     [item] = found["egress"]["findings"]
     assert item["text"] == refused_text("route files's upstream", "[fd00::7]:8443")
+
+
+# --- the egress role's fetches (M7 design J, COV-7) ---------------------------------------------
+
+CHECK_ROLE = {"kind": "check_egress_role"}
+
+
+def stale_text(minutes: int) -> str:
+    return (
+        f"the egress role hasn't fetched its allowlists for {minutes} min: its lists go stale "
+        "after 300 s, and then it refuses every new tunnel"
+    )
+
+
+@pytest.mark.parametrize(
+    ("ago", "findings"),
+    [
+        # No role has asked since the vault started and none is expected (egress_proxy_kind
+        # own, or no egress_proxy): nothing to judge. A role never admitted (its key refused) is
+        # measured from its first request, and with kind role one that never asked from the
+        # vault's start (test_egress_endpoint.py).
+        (None, []),
+        (0.0, []),
+        (299.9, []),
+        (300.0, []),
+        (300.5, [finding("egress_allowlist_stale", "warning", stale_text(5), CHECK_ROLE)]),
+        (359.0, [finding("egress_allowlist_stale", "warning", stale_text(5), CHECK_ROLE)]),
+        (3600.0, [finding("egress_allowlist_stale", "warning", stale_text(60), CHECK_ROLE)]),
+    ],
+)
+def test_an_egress_role_that_stopped_fetching(
+    ago: float | None, findings: list[dict[str, Any]]
+) -> None:
+    found = report(make_policy({}), egress_fetched_ago=ago)
+    assert found["egress"] == {"level": "warning" if findings else "ok", "findings": findings}
+    assert found["summary"]["warning"] == len(findings)
+    assert ALLOWLIST_MAX_STALE == 300
+
+
+def test_a_stale_role_follows_the_refused_routes() -> None:
+    """One section: the guard's refusals first, then the role, the worst level winning."""
+    found = report(
+        egress_policy(), refused=[refusal("route", "files.lan.example")], egress_fetched_ago=301
+    )
+    assert codes(found["egress"]) == ["address_refused", "egress_allowlist_stale"]
+    assert found["egress"]["level"] == "error"
+    assert found["summary"]["warning"] == report(egress_policy())["summary"]["warning"] + 1
 
 
 # --- connectors --------------------------------------------------------------------------------

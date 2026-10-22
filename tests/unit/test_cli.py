@@ -1330,6 +1330,33 @@ def test_gateway_key_prints_the_key(admin: FakeAdmin) -> None:
     assert admin.timeouts == [10.0]
 
 
+def test_egress_key_prints_the_key(admin: FakeAdmin) -> None:
+    """M7 design G.3 (step 17b): the role's key as the compose file reads it, the generation on
+    stderr; there is no previous key to show."""
+    key = "zeg1-" + "k" * 43
+    admin.answers[("GET", "/egress-key")] = (200, {"key": key, "generation": 3})
+    code, out, err = cli(["egress-key", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out == f"ZOEYMCP_EGRESS_KEY={key}\n"
+    assert err == "Generation 3.\n"
+    assert admin.requests == [("GET", "/egress-key", None)]
+
+
+def test_egress_key_without_the_vault(admin: FakeAdmin) -> None:
+    admin.answers[("GET", "/egress-key")] = (503, {"error": "unavailable"})
+    code, out, err = cli(["egress-key", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert out == ""
+    assert err.startswith("zoeymcp egress-key: ")
+
+
+def test_a_stale_egress_role_is_worded() -> None:
+    assert main_module.health_action({"kind": "check_egress_role"}) == (
+        "check that the egress role runs, reaches the vault, and has the key zoeymcp egress-key "
+        "prints"
+    )
+
+
 @pytest.mark.parametrize(
     ("generation", "master_key", "line"),
     [

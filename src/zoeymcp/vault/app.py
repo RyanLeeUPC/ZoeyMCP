@@ -13,12 +13,18 @@ gateway, proved by the kernel; on TCP it is whoever presents a placeholder or a 
 when the link socket is configured TCP refuses gateway keys altogether (M3 design C.1).
 
 Paths under ``/_zoeymcp/`` are the vault's own and never reach a route (no route prefix can start
-with ``_``). :mod:`.internal`'s table decides them, all four for the gateway only: its policy
+with ``_``). :mod:`.internal`'s table decides them. Four are for the gateway only: its policy
 view, a long poll that a reload wakes (M3 design D.1, D.2); the report path, where it pushes its
 ledger to the vault's copy (M5 design J.2); and the review job path (M7 design F.2), a long poll
 of the review jobs queued at the view it holds and the path it posts each job's result to. The
-rest are 404. :meth:`VaultApp.queue_review` and :meth:`VaultApp.review_job` queue and read the
-jobs for the admin socket and the portal, on :mod:`.reviewjobs`' table.
+fifth is the egress role's allowlists (M7 design G.2), for its key alone and never on the link
+socket: a long poll that a reload or an onboarding's allowance change wakes (I.3). The vault
+keeps when the role last fetched and the digest it holds, for health's
+``egress_allowlist_stale`` (J) and for an onboarding through the role, which waits for it to
+fetch a widened list (:meth:`VaultApp.role_fetched`). Whether ``egress_proxy`` is the role is
+the startup policy's ``egress_proxy_kind``, never guessed from the fetches. The rest are 404.
+:meth:`VaultApp.queue_review` and :meth:`VaultApp.review_job` queue and read the jobs for the
+admin socket and the portal, on :mod:`.reviewjobs`' table.
 
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
@@ -49,12 +55,13 @@ import contextlib
 import hmac
 import http.cookiejar
 import ipaddress
+import json
 import math
 import os
 import re
 import time
 import urllib.request
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 from urllib.parse import quote, urlsplit
@@ -65,9 +72,11 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
 from ..common import canonical, egresslist, ledgerreport, reviewreport
+from ..common.egresslist import Allowance
 from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
     BasicCredential,
+    EgressProxyKind,
     GatewayLimits,
     HeaderCredential,
     OAuth2Credential,
@@ -120,6 +129,8 @@ from .reviewjobs import (
 from .store import Secret, SecretStore, SecretUnavailable, smtp_binding
 
 GATEWAY_HEADER = "x-zoeymcp-gateway"
+# The egress role's key, for the allowlists alone (M7 design G.3).
+EGRESS_HEADER = "x-zoeymcp-egress"
 # Marks a connector's replayed answer: the key was seen, nothing was sent again (M4 design J.2).
 REPLAYED_HEADER = "x-zoeymcp-replayed"
 # Marks an answer the vault made itself, so the gateway can tell it from an upstream's (C.4).
@@ -135,11 +146,14 @@ VIEW_PATH = internal.VIEW.path
 REPORT_PATH = internal.LEDGER.path
 REVIEW_JOBS_PATH = internal.REVIEW_JOBS.path
 REVIEW_REPORT_PATH = internal.REVIEW_REPORT.path
+ALLOWLIST_PATH = internal.ALLOWLISTS.path
 # A report's body is read within this many seconds (M5 design J.2).
 REPORT_DEADLINE = 10.0
 # The longest ``?wait=`` in seconds, and how many may wait at once (M3 design D.2).
 VIEW_MAX_WAIT = internal.VIEW_MAX_WAIT
 VIEW_MAX_WAITERS = internal.VIEW_MAX_WAITERS
+# A waiting allowlist poll looks again when an allowance expires, at most this often (seconds).
+RECHECK_MIN = 0.05
 # A review report nests a tool's definition four levels down (the result, the report, its tools,
 # an entry), and a definition's pin is only computed within canonical's default depth.
 REVIEW_MAX_DEPTH = canonical.DEFAULT_MAX_DEPTH + 4
@@ -384,7 +398,8 @@ class VaultApp:
         ``egress_private`` as its exceptions (TI-11). When ``client`` is given and either isn't,
         ``client`` serves that role too, so an injected client never falls back to a networked
         one. Every client, and the SMTP connectors' proxy, stays on the ``egress_proxy`` of
-        ``policy``, the startup one: a reload never changes them (D-61).
+        ``policy``, the startup one: a reload never changes them (D-61). Its
+        ``egress_proxy_kind`` is kept likewise.
 
         ``gateway_keys`` is the persisted ratchet the vault loaded at startup. Without one, the
         gateway keys are tracked in memory only (self-tests and unit tests).
@@ -408,6 +423,7 @@ class VaultApp:
             keys, policy.gateway_key_generation
         )
         proxy = self._egress_proxy = policy.egress_proxy
+        self._egress_proxy_kind: EgressProxyKind = policy.egress_proxy_kind
         injected = client is not None
         if client is None:
             timeout = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT)
@@ -443,6 +459,23 @@ class VaultApp:
         self._reviews = JobTable(time.monotonic) if review_jobs is None else review_jobs
         self._reviews_changed = asyncio.Event()
         self._review_lock = asyncio.Lock()
+        # The egress role's allowlists (M7 design G.2, I.3): their polls wait on this event,
+        # which an install or an allowance change sets and replaces. The onboardings'
+        # allowances come from use_allowances, with the seconds until the next of them expires.
+        # The role's last fetch (monotonic) is for health, and so is its first request with an
+        # egress key, admitted or not, so a role whose key is refused from the start is stale
+        # too, and the vault's start, for a role the policy names that never asks; the digest it
+        # holds, which it names in If-None-Match once it has applied the
+        # lists, is for an onboarding through the role, which waits on _role_poll.
+        self._allowances: Callable[[], Iterable[Allowance]] = lambda: ()
+        self._allowances_expire: Callable[[], float | None] = lambda: None
+        self._allowlist_changed = asyncio.Event()
+        self._allowlist_waiters = 0
+        self._role_fetched_at: float | None = None
+        self._role_asked_at: float | None = None
+        self._role_digest: str | None = None
+        self._role_poll = asyncio.Event()
+        self._started = time.monotonic()
         self._install(policy)
 
     def _install(self, policy: Policy) -> list[str]:
@@ -456,7 +489,10 @@ class VaultApp:
         self._routes = _compile(policy)
         self._env_secrets = snapshot_env_secrets(policy, self._environ)
         self._view = _ServedView(view.digest, dump_view(view))
+        # A new generation retires the old egress key at once: there is no ratchet (G.3).
+        self._egress_key = self._keys.egress_key(policy.egress_key_generation).encode()
         self._wake_view_waiters()
+        self._wake_allowlist()
         return self._tokens.configure(policy, self._env_secrets)
 
     def _private(self) -> frozenset[str]:
@@ -470,6 +506,10 @@ class VaultApp:
 
     def _wake_reviews(self) -> None:
         woken, self._reviews_changed = self._reviews_changed, asyncio.Event()
+        woken.set()
+
+    def _wake_allowlist(self) -> None:
+        woken, self._allowlist_changed = self._allowlist_changed, asyncio.Event()
         woken.set()
 
     @property
@@ -492,6 +532,12 @@ class VaultApp:
     def egress_proxy(self) -> str | None:
         """The startup policy's ``egress_proxy``, which every client and connector uses."""
         return self._egress_proxy
+
+    @property
+    def egress_proxy_kind(self) -> EgressProxyKind:
+        """The startup policy's ``egress_proxy_kind``: whether that proxy is the operator's own
+        or the built-in egress role (I.3)."""
+        return self._egress_proxy_kind
 
     @property
     def onboarding_client(self) -> httpx.AsyncClient:
@@ -523,13 +569,88 @@ class VaultApp:
         """How many long polls of the view are waiting."""
         return self._view_waiters
 
+    @property
+    def allowlist_waiters(self) -> int:
+        """How many long polls of the allowlists are waiting."""
+        return self._allowlist_waiters
+
     def stop_view_waits(self) -> None:
-        """Answer every long poll of the view and of the review jobs now, and the socket's
-        review waits, and wait no more. For shutdown: the servers wait for requests in flight,
-        and a long poll would hold them for up to 25 s."""
+        """Answer every long poll of the view, of the review jobs and of the allowlists now, and
+        the socket's review waits and an onboarding's wait for the egress role, and wait no
+        more. For shutdown: the servers wait for requests in flight, and a long poll would hold
+        them for up to 25 s."""
         self._view_stopping = True
         self._wake_view_waiters()
         self._wake_reviews()
+        self._wake_allowlist()
+        self._wake_role_poll()
+
+    # --- the egress role's allowlists (M7 design G.2, I.3) --------------------------------------
+
+    def use_allowances(
+        self,
+        allowances: Callable[[], Iterable[Allowance]],
+        expire_in: Callable[[], float | None] = lambda: None,
+    ) -> None:
+        """Take the live onboardings' allowances from ``allowances`` (the onboarding service's)
+        for the vault's list (I.3). ``expire_in`` is the seconds until the next of them expires
+        (None: none will), when a waiting poll looks at the lists again, since an expiry sets
+        no event."""
+        self._allowances = allowances
+        self._allowances_expire = expire_in
+        self._wake_allowlist()
+
+    def allowlist_document(self) -> dict[str, Any]:
+        """The allowlist endpoint's answer now (G.2): the running policy's lists with the live
+        allowances, as ``egresslist.document`` writes them."""
+        return egresslist.document(egresslist.derive(self._policy, self._allowances()))
+
+    def lists_changed(self) -> None:
+        """An onboarding's allowance changed: every waiting allowlist poll looks again."""
+        self._wake_allowlist()
+
+    def allowlist_fetched_ago(self) -> float | None:
+        """Seconds since the egress role last fetched its lists (health's
+        ``egress_allowlist_stale``, J). A role that has asked since the vault started but was
+        never admitted (a wrong or old key) is measured from its first request. When no request
+        with an egress key has come since the vault started: from the start when the startup
+        policy's ``egress_proxy`` is the role, which is expected then, else None."""
+        since = self._role_fetched_at if self._role_fetched_at is not None else self._role_asked_at
+        if since is None and self._egress_proxy is not None and self._egress_proxy_kind == "role":
+            since = self._started
+        if since is None:
+            return None
+        return max(0.0, time.monotonic() - since)
+
+    async def role_fetched(self, wait: float) -> bool:
+        """Wake every allowlist poll, then wait up to ``wait`` seconds for the egress role to
+        hold the lists as they are now (I.3). The role names the digest it holds in
+        ``If-None-Match``, and it polls again as soon as it has applied a 200, so a poll naming
+        the current digest means the role allows what the lists do. False when it doesn't by
+        then, at shutdown, or when no role has fetched since the vault started."""
+        self._wake_allowlist()
+        if self._role_fetched_at is None:
+            return False
+        deadline = time.monotonic() + wait
+        while True:
+            polled = self._role_poll
+            if self._role_digest == self.allowlist_document()["digest"]:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self._view_stopping:
+                return False
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(polled.wait(), remaining)
+
+    def _role_holds(self, tags: frozenset[str]) -> None:
+        """A poll of the role's named ``tags`` in ``If-None-Match``: the one digest it holds,
+        or none known (its first poll names none)."""
+        self._role_digest = next(iter(tags)) if len(tags) == 1 else None
+        self._wake_role_poll()
+
+    def _wake_role_poll(self) -> None:
+        woken, self._role_poll = self._role_poll, asyncio.Event()
+        woken.set()
 
     def reload(self, policy: Policy) -> list[str]:
         """Swap the policy. Returns the OAuth credentials whose cached tokens were reset.
@@ -808,12 +929,26 @@ class VaultApp:
             raise Refused(404, "no such vault endpoint")
         log["endpoint"] = endpoint.name
         gateway = listener == "gateway" or self._gateway_key(request, accepted=True)
-        identity: internal.Identity | None = "gateway" if gateway else None
+        if (
+            listener == "tcp"
+            and endpoint is internal.ALLOWLISTS
+            and EGRESS_HEADER in request.headers
+            and self._role_asked_at is None
+        ):
+            # A role asks, admitted or not: health measures a role never admitted from here.
+            self._role_asked_at = time.monotonic()
+        # The link socket's caller is the gateway: no egress key is read there (X21).
+        egress = listener == "tcp" and self._egress_key_presented(request)
+        if gateway and egress:
+            raise Refused(403, "two identities presented")
+        identity: internal.Identity | None = "gateway" if gateway else "egress" if egress else None
         if identity is not None:
             log["caller"] = identity
         decided = internal.decide(path, request.method, listener, identity)
         if isinstance(decided, internal.Refusal):
             raise Refused(decided.status, decided.reason, allow=decided.allow)
+        if decided is internal.ALLOWLISTS:
+            return await self._allowlists(request, log)
         if decided is internal.LEDGER:
             return await self._report(request, log)
         if decided is internal.REVIEW_JOBS:
@@ -821,6 +956,44 @@ class VaultApp:
         if decided is internal.REVIEW_REPORT:
             return await self._review_report(request, log)
         return await self._view_answer(request, log)
+
+    def _egress_key_presented(self, request: Request) -> bool:
+        """Whether a TCP request presents the egress key of the running generation (G.3);
+        False when it presents none. Any other key, or two, is refused."""
+        presented = request.headers.getlist(EGRESS_HEADER)
+        if not presented:
+            return False
+        if len(presented) == 1 and hmac.compare_digest(presented[0].encode(), self._egress_key):
+            return True
+        raise Refused(403, "egress key refused")
+
+    async def _allowlists(self, request: Request, log: dict[str, Any]) -> Response:
+        """``GET /_zoeymcp/egress/v1/allowlists``: the egress role's lists (G.2), with their
+        digest as the ``ETag``, or 304 while the digest is one the role named in
+        ``If-None-Match``. With ``?wait=N`` a 304 waits up to N seconds (at most 25; two
+        waiters) for a reload or an allowance change that changes the lists. The tag it names
+        is the digest it holds (I.3), and each answer is a fetch, for health (J)."""
+        try:
+            wait = internal.allowlist_wait(parse_query(request.scope.get("query_string", b"")))
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason) from exc
+        tags = entity_tags(request.headers.getlist("if-none-match"))
+        self._role_holds(tags)
+        started = time.monotonic()
+        document = self.allowlist_document()
+        if wait and document["digest"] in tags and not self._view_stopping:
+            await self._wait_for_allowlist(tags, started + wait, request.receive, log)
+            document = self.allowlist_document()
+        digest = document["digest"]
+        if not log.get("disconnected"):
+            self._role_fetched_at = time.monotonic()
+        headers = {"etag": f'"{digest}"', "cache-control": "no-store"}
+        if digest in tags:
+            return Response(status_code=304, headers=headers)
+        waited_ms = round((time.monotonic() - started) * 1000)
+        logs.event("egress_allowlist_served", digest=digest, waited_ms=waited_ms)
+        body = json.dumps(document).encode()
+        return Response(body, media_type="application/json", headers=headers)
 
     async def _view_answer(self, request: Request, log: dict[str, Any]) -> Response:
         """``GET /_zoeymcp/gateway/v1/view``: the view with its digest as the ``ETag``, or 304
@@ -1074,24 +1247,68 @@ class VaultApp:
         if self._view_waiters >= VIEW_MAX_WAITERS:
             raise Refused(429, "too many view waiters", retry_after=1)
         self._view_waiters += 1
+        try:
+            await self._until_changed(
+                lambda: self._view.digest, lambda: self._view_changed, tags, deadline, receive, log
+            )
+        finally:
+            self._view_waiters -= 1
+
+    async def _wait_for_allowlist(
+        self, tags: frozenset[str], deadline: float, receive: Receive, log: dict[str, Any]
+    ) -> None:
+        """As :meth:`_wait_for_view`, for the allowlists' digest: at most
+        :data:`.internal.ALLOWLIST_WAITERS` wait; one more is refused with 429."""
+        if self._allowlist_waiters >= internal.ALLOWLIST_WAITERS:
+            raise Refused(429, "too many allowlist waiters", retry_after=1)
+        self._allowlist_waiters += 1
+        try:
+            await self._until_changed(
+                lambda: str(self.allowlist_document()["digest"]),
+                lambda: self._allowlist_changed,
+                tags,
+                deadline,
+                receive,
+                log,
+                recheck=self._allowances_expire,
+            )
+        finally:
+            self._allowlist_waiters -= 1
+
+    async def _until_changed(
+        self,
+        digest: Callable[[], str],
+        changed: Callable[[], asyncio.Event],
+        tags: frozenset[str],
+        deadline: float,
+        receive: Receive,
+        log: dict[str, Any],
+        *,
+        recheck: Callable[[], float | None] = lambda: None,
+    ) -> None:
+        """Wait until ``digest()`` isn't in ``tags``, the deadline, shutdown, or the caller
+        leaves, waking each time ``changed()``'s event is set, and after ``recheck()`` seconds
+        when it names some (a change no event marks; at least :data:`RECHECK_MIN` apart)."""
         gone = asyncio.ensure_future(_disconnected(receive))
         try:
-            while self._view.digest in tags and not self._view_stopping:
+            while digest() in tags and not self._view_stopping:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return
-                changed = asyncio.ensure_future(self._view_changed.wait())
+                due = recheck()
+                if due is not None:
+                    remaining = min(remaining, max(due, RECHECK_MIN))
+                woken = asyncio.ensure_future(changed().wait())
                 try:
                     await asyncio.wait(
-                        (changed, gone), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                        (woken, gone), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
                     )
                 finally:
-                    changed.cancel()
+                    woken.cancel()
                 if gone.done():
                     log["disconnected"] = True
                     return
         finally:
-            self._view_waiters -= 1
             # On a task that has already failed, cancel() also marks its error as retrieved, so
             # asyncio doesn't report it as never retrieved.
             gone.cancel()

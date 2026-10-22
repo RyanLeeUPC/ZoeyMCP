@@ -789,7 +789,8 @@ def _check_tokens(policy: Policy, report: _Report) -> None:
 
 def _check_egress(policy: Policy, report: _Report) -> None:
     """``egress_private`` lists vault destinations, each once (the schema has their form and
-    case); ``egress_proxy_acls`` maps egress sources to Squid ACL names."""
+    case); ``egress_proxy_acls`` maps egress sources to Squid ACL names, which only an
+    operator's own proxy uses."""
     destinations = _vault_destinations(policy)
     first: dict[str, int] = {}
     for index, entry in enumerate(policy.egress_private):
@@ -805,6 +806,11 @@ def _check_egress(policy: Policy, report: _Report) -> None:
             report.error(path, f"{source!r} isn't an egress source; the vault's is vault")
         if not fields.is_squid_acl_name(acl):
             report.error(path, "a Squid ACL name is 1 to 64 letters, digits or underscores")
+    if policy.egress_proxy_acls and policy.egress_proxy_kind == "role":
+        report.warning(
+            "egress_proxy_acls",
+            "unused: these name your own Squid's ACLs, and egress_proxy_kind is role",
+        )
 
 
 def _vault_destinations(policy: Policy) -> set[str]:

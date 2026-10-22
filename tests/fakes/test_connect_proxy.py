@@ -109,3 +109,25 @@ async def test_chosen_hosts_are_refused_until_the_operator_allows_them() -> None
     assert resumed.startswith(b"HTTP/1.1 200")
     assert echoed == b"ping"
     assert proxy.targets == ["as.example:443", "mcp.example:443", "as.example:443"]
+
+
+async def test_with_an_allow_list_only_its_targets_pass() -> None:
+    """The egress role's list, as the onboarding rows through the role use it (M7 I.3)."""
+    names = FakeResolver()
+    proxy = ConnectProxy(allow={"mcp.example:443"}, names=names)
+    with anyio.fail_after(10):
+        async with echo_server() as port:
+            names.serve("as.example", port)
+            names.serve("mcp.example", port)
+            with serve_proxy(proxy) as url:
+                refused, _ = await tunnel(url, "as.example:443")
+                port_refused, _ = await tunnel(url, "mcp.example:8443")
+                allowed, _ = await tunnel(url, "mcp.example:443")
+                lookups = list(names.lookups)
+                proxy.allow = {"mcp.example:443", "as.example:443"}  # a new list
+                widened, echoed = await tunnel(url, "as.example:443")
+    assert refused == port_refused == b"HTTP/1.1 403 Forbidden\r\n\r\n"
+    assert allowed.startswith(b"HTTP/1.1 200")
+    assert lookups == [("mcp.example", 443)]
+    assert widened.startswith(b"HTTP/1.1 200")
+    assert echoed == b"ping"

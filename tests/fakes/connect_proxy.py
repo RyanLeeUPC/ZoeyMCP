@@ -9,6 +9,9 @@ For onboarding through the operator's own proxy (M7 design D.11, O.1), ``refuse`
 answers 403, as a proxy whose allowlist lacks them does, and ``names`` takes the fake resolver's
 name map (BP-1), so a CONNECT by name reaches the loopback fake that name stands for; a name the
 map doesn't know gets 502, so nothing reaches the real network.
+
+For onboarding through the built-in egress role (M7 design I.3), ``allow`` stands in for the
+role's list: once set, only those ``host:port`` targets pass, and any other is answered 403.
 """
 
 from __future__ import annotations
@@ -42,6 +45,8 @@ class ConnectProxy:
     targets: list[str] = field(default_factory=list)
     # Hosts answered 403, compared without case.
     refuse: set[str] = field(default_factory=set)
+    # host:port targets let through, the rest answered 403; None lets every target through.
+    allow: set[str] | None = None
     names: FakeResolver | None = None
     _loop: asyncio.AbstractEventLoop | None = None
 
@@ -72,7 +77,9 @@ class ConnectProxy:
                 writer.close()
                 return
         host, _, port = target.rpartition(":")
-        if host.lower() in {name.lower() for name in self.refuse}:
+        allow = self.allow
+        refused = allow is not None and target.lower() not in allow
+        if refused or host.lower() in {name.lower() for name in self.refuse}:
             writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             await writer.drain()
             writer.close()

@@ -23,12 +23,15 @@ MASTER_KEY_ENV = "ZOEYMCP_MASTER_KEY"
 PREVIOUS_MASTER_KEY_ENV = "ZOEYMCP_MASTER_KEY_PREVIOUS"
 MASTER_KEY_BYTES = 32
 GATEWAY_KEY_PREFIX = "zgw1-"
+# The egress role's read-only key (M7 design G.3): the allowlists, nothing else.
+EGRESS_KEY_PREFIX = "zeg1-"
 
 _SALT = b"zoeymcp/v1"
 CONTEXT_STORE = "zoeymcp/store/v1"
 CONTEXT_CONFIG = "zoeymcp/config/v1"
 CONTEXT_KEY_ID = "zoeymcp/key-id/v1"
 CONTEXT_GATEWAY = "zoeymcp/gateway/v1/gen-{generation}"
+CONTEXT_EGRESS = "zoeymcp/egress/v1/gen-{generation}"
 # The SMTP connector's send journal keys its request digests with this (M4 design J.3).
 CONTEXT_AUDIT = "zoeymcp/audit/v1"
 # The portal's state files are MAC'd with this, and passkey fingerprints keyed (M5 design D.4, E.2).
@@ -152,3 +155,11 @@ class KeySet:
             raise ValueError("generations start at 1")
         context = CONTEXT_GATEWAY.format(generation=generation)
         return GATEWAY_KEY_PREFIX + _b64url(derive(self._master, context))
+
+    def egress_key(self, generation: int) -> str:
+        """The egress role's key for one key generation (M7 design G.3). It grants the
+        allowlists alone; a new generation retires the old key at once."""
+        if generation < 1:
+            raise ValueError("generations start at 1")
+        context = CONTEXT_EGRESS.format(generation=generation)
+        return EGRESS_KEY_PREFIX + _b64url(derive(self._master, context))

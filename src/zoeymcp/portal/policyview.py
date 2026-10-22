@@ -192,6 +192,7 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
             "version",
             "mode",
             "egress_proxy",
+            "egress_proxy_kind",
             "egress_private",
             "egress_key_generation",
             "egress_proxy_acls",

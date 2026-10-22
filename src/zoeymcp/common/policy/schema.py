@@ -272,6 +272,8 @@ Network = Annotated[str, Field(min_length=1, max_length=64)]
 SourceName = Annotated[str, StringConstraints(pattern=NAME_PATTERN)]
 # A Squid ACL name: check refuses one that isn't 1 to 64 of [A-Za-z0-9_].
 SquidAclName = Annotated[str, Field(max_length=300)]
+# What egress_proxy is: the operator's own proxy, or the built-in egress role (zoeymcp egress).
+EgressProxyKind = Literal["own", "role"]
 
 
 class _Model(BaseModel):
@@ -850,6 +852,9 @@ class Policy(_Model):
     version: Literal[1]
     mode: Literal["managed", "declarative"]
     egress_proxy: str | None = None
+    # What egress_proxy is: "own" (the operator's proxy, which onboarding asks to edit) or
+    # "role" (the built-in egress role, which fetches the vault's lists). "role" needs egress_proxy.
+    egress_proxy_kind: EgressProxyKind = "own"
     # Vault destinations (host:port) allowed to resolve to non-global addresses.
     egress_private: list[PrivateHostPort] = []
     # The egress role's read-only key generation.
@@ -903,3 +908,14 @@ class Policy(_Model):
         if value is None:
             return None
         return _check_url(value, schemes=("http",), allow_path=False)
+
+    @field_validator("egress_proxy_kind")
+    @classmethod
+    def _kind_needs_a_proxy(cls, value: str, info: ValidationInfo) -> str:
+        # An egress_proxy that failed its own check isn't in info.data: that error is enough.
+        if value == "role" and "egress_proxy" in info.data and info.data["egress_proxy"] is None:
+            raise ValueError(
+                "role needs egress_proxy: set it to the egress role's vault listener, like "
+                "http://egress-vault:3128"
+            )
+        return value

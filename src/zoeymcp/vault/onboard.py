@@ -16,6 +16,13 @@ run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the re
   metadata document only.
 - **An operator's own proxy** refusing a host blocks the onboarding (D.11): ``proxy_refused``
   with the hosts it needs and their Squid lines; the same discovery resumes it.
+- **The built-in egress role** (I.3): an ``egress_proxy`` is the role when the startup policy
+  says so (``egress_proxy_kind: role``), never by guessing. Each host joins the onboarding's
+  allowance before the vault connects to it, and the vault waits up to :data:`ALLOWANCE_WAIT`
+  for the role to fetch the widened list, so no proxy is edited; a CONNECT the role refuses all
+  the same (a role that isn't polling among them) is ``egress_refused``, naming the host. The
+  role can't tell which vault request a tunnel carries, so ``allow_private`` through it is
+  refused ``private_needs_direct`` (TI-10).
 - **Register** (a given confidential client) stores the secret under the binding fragment 1 will
   derive, through ``secretops`` (D.7), after the draft check passes again, and deletes it again
   if anything fails after the write (OPS-5); **fragment** makes a given public client's
@@ -62,7 +69,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Final, cast
+from typing import Any, Final, Protocol, cast
 from urllib.parse import urlsplit
 
 import anyio
@@ -70,6 +77,7 @@ import httpx
 from pydantic import ValidationError
 
 from ..common import egresslist, netguard
+from ..common.egresslist import Allowance
 from ..common.policy.change import (
     AddCredential,
     AddEgressPrivate,
@@ -88,6 +96,7 @@ from ..common.policy.schema import (
     _SCOPE_TOKEN,
     MAX_SCOPES,
     NAME_PATTERN,
+    EgressProxyKind,
     OAuth2Credential,
     Policy,
     RemoteServer,
@@ -165,6 +174,9 @@ from .onboarding import (
 from .secretplan import SecretRefusal
 from .store import EntryMeta, Secret, SecretStore, SecretUnavailable
 
+# How long an onboarding through the egress role waits for the role to fetch its widened list,
+# before it connects anyway (M.6, I.3).
+ALLOWANCE_WAIT: Final = 5.0
 # The body caps (K.2's discover; a secret; an indent).
 DISCOVER_BODY_MAX: Final = 4 * 1024
 REGISTER_BODY_MAX: Final = 8 * 1024
@@ -238,6 +250,18 @@ _UNWRITABLE: Final = {
 Resolver = netclient.Resolver
 
 
+class EgressLists(Protocol):
+    """The vault's allowlist endpoint as onboarding reaches it (I.3): ``VaultApp``'s."""
+
+    def lists_changed(self) -> None:
+        """An allowance changed: the role's waiting poll looks at the lists again."""
+        ...
+
+    async def role_fetched(self, wait: float) -> bool:
+        """Wait up to ``wait`` seconds for the role to hold the lists as they are now."""
+        ...
+
+
 class OnboardError(Exception):
     """A refused step: the catalogue's answer, as every surface sends it."""
 
@@ -266,6 +290,14 @@ def _bad_body(detail: str) -> OnboardError:
     return OnboardError(replace(refusal("bad_body"), more=(("detail", detail),)))
 
 
+def _egress_refused(exc: ProxyRefused) -> Answer:
+    """The built-in egress role refused the vault's CONNECT (I.3): its host and port, and the
+    role's status (403 for a host it doesn't list or an address it refuses, 502 for one it
+    couldn't resolve or reach, 503 for stale lists or too many tunnels; I.4)."""
+    more = (("host", exc.host), ("port", exc.port), ("status", exc.status))
+    return replace(refusal("egress_refused", host=exc.host), more=more)
+
+
 def policy_source(config: str | None) -> str:
     """The running policy's source as ``zoeymcp check`` names it (``load.read_source``)."""
     if config is None:
@@ -291,9 +323,11 @@ def _issuer_host(plan: Plan) -> str:
 
 class OnboardService:
     """Onboardings in progress and their steps, shared by every surface. ``client`` is the
-    onboarding client (``netclient.onboarding_client``); ``egress_proxy`` the startup one;
-    ``source`` the running policy's source label, for the ``next`` lists; ``resolver`` answers
-    names for the endpoint check (tests only)."""
+    onboarding client (``netclient.onboarding_client``); ``egress_proxy`` the startup one, and
+    ``egress_proxy_kind`` whether it is the operator's own or the built-in egress role (I.3);
+    ``egress`` the vault's allowlist endpoint, which serves the allowances and says when the
+    role holds them; ``source`` the running policy's source label, for the ``next``
+    lists; ``resolver`` answers names for the endpoint check (tests only)."""
 
     def __init__(
         self,
@@ -303,6 +337,8 @@ class OnboardService:
         client: httpx.AsyncClient,
         *,
         egress_proxy: str | None = None,
+        egress_proxy_kind: EgressProxyKind = "own",
+        egress: EgressLists | None = None,
         source: str = INLINE_SOURCE,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
@@ -314,11 +350,42 @@ class OnboardService:
         self._policy = policy
         self._client = client
         self._egress_proxy = egress_proxy
+        self._egress_proxy_kind = egress_proxy_kind
+        self._egress = egress
         self._source = source
         self._clock = clock
         self._wall = wall
         self._resolver = resolver
         self._table = OnboardingTable(clock, token=token)
+
+    # --- the egress role (I.3) ------------------------------------------------------------------
+
+    def allowances(self) -> tuple[Allowance, ...]:
+        """The live onboardings' allowances, for the vault's egress list (I.2, I.3)."""
+        return self._table.allowances()
+
+    def allowances_expire_in(self) -> float | None:
+        """Seconds until the next live allowance expires, or None (I.3): the vault's allowlist
+        polls look again then."""
+        return self._table.allowances_expire_in()
+
+    @property
+    def _through_role(self) -> bool:
+        """Whether the vault's connections go through the built-in egress role: an
+        ``egress_proxy`` set, with ``egress_proxy_kind: role`` (the startup values, D-61)."""
+        return self._egress_proxy is not None and self._egress_proxy_kind == "role"
+
+    def _lists_changed(self) -> None:
+        if self._egress is not None:
+            self._egress.lists_changed()
+
+    async def _allowed(self) -> None:
+        """An allowance grew: through the role, wait up to :data:`ALLOWANCE_WAIT` for it to
+        fetch the widened list, then go on either way (a refusal is ``egress_refused``)."""
+        if self._egress is not None and self._through_role:
+            await self._egress.role_fetched(ALLOWANCE_WAIT)
+        else:
+            self._lists_changed()
 
     # --- discover ------------------------------------------------------------------------------
 
@@ -331,6 +398,9 @@ class OnboardService:
         origins = [] if policy.admin is None else policy.admin.origins
         if options.callback_origin is not None and options.callback_origin not in origins:
             raise _bad_body("callback_origin isn't one of the policy's admin.origins")
+        if options.allow_private and self._through_role:
+            # The role can't scope a private exception to this onboarding's requests (TI-10).
+            raise OnboardError(refusal("private_needs_direct"))
         found = committed_for(policy, url)
         if not options.reregister:
             if found is not None:
@@ -375,9 +445,10 @@ class OnboardService:
             if kept is not None:
                 record = self._registered_again(record, owner)
         except ProxyRefused as exc:
-            raise OnboardError(self._blocked(record, exc, policy)) from None
+            raise self._proxy_refused(record, exc, policy) from None
         except OnboardError as exc:
             self._table.cancel(record.id, owner)
+            self._lists_changed()
             logs.event("onboard_refused", reason=exc.answer.reason, host=host)
             raise
         except (OnboardingRefused, ValueError):
@@ -435,14 +506,16 @@ class OnboardService:
         try:
             plan = await self._discover(record, policy, kept=False, committed=True)
         except ProxyRefused as exc:
-            raise OnboardError(self._blocked(record, exc, policy)) from None
+            raise self._proxy_refused(record, exc, policy) from None
         except OnboardError as exc:
             self._table.cancel(record.id, owner)
+            self._lists_changed()
             logs.event("onboard_refused", reason=exc.answer.reason, host=host)
             raise
         except (OnboardingRefused, ValueError):
             raise OnboardError(refusal("onboarding_unknown")) from None
         self._table.cancel(record.id, owner)
+        self._lists_changed()
         try:
             answer = self._compared(url, plan)
         except OnboardError as exc:
@@ -620,7 +693,9 @@ class OnboardService:
         it, checked with the policy now, with nothing registered or written (GR-21)."""
         change = self._change(record)
         _passes(self._findings(self._policy(), change))
-        return self._table.registered(record.id, owner, change)
+        registered = self._table.registered(record.id, owner, change)
+        self._lists_changed()
+        return registered
 
     async def _discover(
         self, record: OnboardingRecord, policy: Policy, *, kept: bool, committed: bool = False
@@ -638,6 +713,7 @@ class OnboardService:
             report=_report,
         )
         url, options = record.server_url, record.options
+        await self._widen(record, url)
         answer = await _fetched(fetcher.probe(url, MODERN_PROBE))
         step = probe_next(answer.status, legacy_sent=False)
         if step == "legacy":
@@ -650,7 +726,7 @@ class OnboardService:
         prm: Prm | None = None
         prm_url: str | None = None
         for candidate in prm_candidates(url, challenge):
-            self._widen(record, candidate.url)
+            await self._widen(record, candidate.url)
             tried.append(candidate.url)
             well_known = candidate.source != "challenge"
             fetched = await _fetched(fetcher.metadata(candidate.url, "prm", well_known=well_known))
@@ -670,7 +746,7 @@ class OnboardService:
         else:
             found = None
             for candidate in legacy_candidates(url, options.issuer):
-                self._widen(record, candidate.url)
+                await self._widen(record, candidate.url)
                 tried.append(candidate.url)
                 fetched = await _fetched(fetcher.metadata(candidate.url, "as", well_known=True))
                 if fetched.document is not None:
@@ -718,7 +794,7 @@ class OnboardService:
         """The issuer's metadata from the first candidate that has it (D.3)."""
         tried = []
         for candidate in as_candidates(issuer):
-            self._widen(record, candidate)
+            await self._widen(record, candidate)
             tried.append(candidate)
             fetched = await _fetched(fetcher.metadata(candidate, "as", well_known=True))
             if fetched.document is not None:
@@ -762,9 +838,27 @@ class OnboardService:
                 )
                 raise OnboardError(refusal("address_refused", host=host))
 
-    def _widen(self, record: OnboardingRecord, url: str) -> None:
-        """The allowance with the host the next request goes to (I.3)."""
+    async def _widen(self, record: OnboardingRecord, url: str) -> None:
+        """The allowance with the host the next request goes to (I.3), which the egress role
+        then fetches."""
         self._table.widen(record.id, record.owner, [_host_port(url)])
+        await self._allowed()
+
+    def _proxy_refused(
+        self, record: OnboardingRecord, exc: ProxyRefused, policy: Policy
+    ) -> OnboardError:
+        """A discovery's CONNECT refused: an operator's own proxy blocks the onboarding (D.11);
+        the built-in role ends it, ``egress_refused`` naming the host (I.3), since there is no
+        proxy for the operator to edit."""
+        if not self._through_role:
+            return OnboardError(self._blocked(record, exc, policy))
+        self._table.cancel(record.id, record.owner)
+        self._lists_changed()
+        answer = _egress_refused(exc)
+        logs.event(
+            "onboard_refused", reason=answer.reason, host=server_host_port(record.server_url)[0]
+        )
+        return OnboardError(answer)
 
     def _blocked(self, record: OnboardingRecord, exc: ProxyRefused, policy: Policy) -> Answer:
         """D.11: the onboarding blocks, keeping its allowance, and the answer names what the
@@ -988,12 +1082,16 @@ class OnboardService:
         ended = self._table.cancel(onboarding, owner)
         if ended is None:
             raise OnboardError(refusal("onboarding_unknown"))
+        self._lists_changed()
         logs.event("onboard_ended", why=ended.why)
 
     def cancel_owner(self, owner: str) -> None:
         """A portal session ended: its onboarding goes with it (D.8)."""
-        for ended in self._table.cancel_owner(owner):
-            logs.event("onboard_ended", why=ended.why)
+        ended = self._table.cancel_owner(owner)
+        if ended:
+            self._lists_changed()
+        for each in ended:
+            logs.event("onboard_ended", why=each.why)
 
     # --- reading an onboarding, and register's plan (K.1-K.3) ----------------------------------
 
@@ -1131,6 +1229,8 @@ class OnboardService:
         request = dcr.registration_request(plan, choices)
         # Still this owner's and still discovered, so a run that has expired never registers.
         self._discovered(record, owner)
+        # The registration endpoint joined the allowance at discovered (I.3).
+        await self._widen(record, endpoint)
         fetcher = Fetcher(
             self._client,
             proxied=self._egress_proxy is not None,
@@ -1155,7 +1255,10 @@ class OnboardService:
 
     def _registration_blocked(self, exc: ProxyRefused) -> Answer:
         """An operator's own proxy refusing the registration endpoint (D.11): its host and the
-        lines to allow it, the onboarding kept as it was."""
+        lines to allow it, the onboarding kept as it was. The built-in role's refusal is
+        ``egress_refused``, the onboarding kept as well (I.3)."""
+        if self._through_role:
+            return _egress_refused(exc)
         policy = self._policy()
         emitted = {d.port for d in egresslist.derive(policy)[egresslist.VAULT]}
         step = allow_hosts([(exc.host, exc.port)], policy.egress_proxy_acls, emitted)
@@ -1258,6 +1361,8 @@ class OnboardService:
         except (OnboardingRefused, ValueError):
             # Expired, cancelled or replaced while the secret was written.
             raise OnboardError(refusal("onboarding_unknown")) from None
+        # It contacts nothing more, so its allowance left the egress list (I.3).
+        self._lists_changed()
         options = client_options(record)
         logs.event(
             "onboard_registered",
@@ -1305,7 +1410,7 @@ class OnboardService:
         steps = next_for(
             record,
             self._source,
-            own_proxy=self._egress_proxy is not None,
+            own_proxy=self._egress_proxy is not None and not self._through_role,
             acl_names=policy.egress_proxy_acls,
             emitted_ports=emitted,
         )
@@ -1448,9 +1553,12 @@ class OnboardService:
 
     def _sweep(self) -> None:
         """Log every onboarding that ended since the last call: replaced, expired, or registered
-        with its credential now in the running policy."""
-        for ended in self._table.sweep(self._policy().credentials):
-            logs.event("onboard_ended", why=ended.why)
+        with its credential now in the running policy. Its allowance left the egress list."""
+        ended = self._table.sweep(self._policy().credentials)
+        if ended:
+            self._lists_changed()
+        for each in ended:
+            logs.event("onboard_ended", why=each.why)
 
 
 # --- the request ---------------------------------------------------------------------------------

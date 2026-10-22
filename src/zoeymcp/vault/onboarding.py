@@ -486,6 +486,17 @@ class OnboardingTable:
             if now < record.expires_at and record.allowance
         )
 
+    def allowances_expire_in(self) -> float | None:
+        """Seconds until the next live allowance expires, or None when none is live: an expiry
+        changes the egress list with no event (I.3)."""
+        now = self._clock()
+        live = [
+            record.expires_at - now
+            for record in self._records.values()
+            if now < record.expires_at and record.allowance
+        ]
+        return min(live, default=None)
+
     def names_in_use(self, owner: str) -> frozenset[str]:
         """Every name another owner's live onboarding uses, for :func:`default_name`."""
         now = self._clock()

@@ -8,9 +8,12 @@ import io
 import pytest
 
 from zoeymcp.common import logs
+from zoeymcp.egress.allowlist import KEY_PATTERN, EgressKey
 from zoeymcp.vault.keys import (
     CONTEXT_AUDIT,
     CONTEXT_CONFIG,
+    CONTEXT_EGRESS,
+    CONTEXT_GATEWAY,
     CONTEXT_KEY_ID,
     CONTEXT_PORTAL,
     CONTEXT_STORE,
@@ -61,8 +64,10 @@ def test_contexts_give_independent_keys() -> None:
         keys.gateway_key(2).encode(),
         derive(MASTER, CONTEXT_AUDIT),
         derive(MASTER, CONTEXT_PORTAL),
+        keys.egress_key(1).encode(),
+        keys.egress_key(2).encode(),
     }
-    assert len(derived) == 7
+    assert len(derived) == 9
     assert MASTER not in derived
     assert keys.store_key == derive(MASTER, CONTEXT_STORE)
     assert keys.config_key == derive(MASTER, CONTEXT_CONFIG)
@@ -122,3 +127,33 @@ def test_the_portal_key_never_shows() -> None:
         logs.set_stream(None)
     assert buffer.getvalue() == ""
     assert PortalKey in logs.refused_types()
+
+
+# --- the egress key (M7 design G.3) -------------------------------------------------------------
+
+
+def test_the_egress_context_is_its_own_and_pinned() -> None:
+    """A context of its own, beside the gateway's: neither key can be turned into the other."""
+    assert CONTEXT_EGRESS == "zoeymcp/egress/v1/gen-{generation}"
+    assert CONTEXT_GATEWAY == "zoeymcp/gateway/v1/gen-{generation}"
+    assert derive(MASTER, "zoeymcp/egress/v1/gen-1").hex() == (
+        "19140e620432121bc680b380358854275866101c093d1638b28f718af7f8f3c3"
+    )
+    keys = KeySet.from_master(MASTER)
+    assert keys.egress_key(1) == "zeg1-GRQOYgQyEhvGgLOANYhUJ1hmEBwJPRY4so9xivf488M"
+    assert keys.egress_key(1)[5:] != keys.gateway_key(1)[5:]
+    assert len({keys.egress_key(n) for n in range(1, 6)}) == 5
+
+
+def test_the_egress_key_is_what_the_role_takes() -> None:
+    """``zeg1-`` and 43 base64url characters: the role's own pattern accepts it (G.3)."""
+    keys = KeySet.from_master(MASTER)
+    for generation in (1, 2, 1000):
+        key = keys.egress_key(generation)
+        assert key.startswith("zeg1-")
+        assert len(base64.urlsafe_b64decode(key[5:] + "=")) == 32
+        assert KEY_PATTERN.fullmatch(key)
+        assert EgressKey(key).reveal() == key
+    assert KeySet.from_master(bytes(32)).egress_key(1) != keys.egress_key(1)
+    with pytest.raises(ValueError, match="start at 1"):
+        keys.egress_key(0)
