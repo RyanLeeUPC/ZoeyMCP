@@ -3,7 +3,8 @@
 Each walk takes its routes from the route table, so a route added later is walked too:
 
 - **The admin socket**: every route of ``AdminApp``'s table, with secrets stored and a setup code
-  live, and an onboarding whose given client secret was stored through the socket (M7 D.7);
+  live, a done review job (M7 F.2), and an onboarding whose given client secret was stored
+  through the socket (M7 D.7);
   and again once a registration's answer brought a secret, a registration access token and a
   URI (D.4), which no answer carries.
   Only ``POST /setup-code`` (a new setup code) and ``GET /gateway-key`` (the gateway key) may
@@ -26,9 +27,10 @@ import ast
 import importlib
 import inspect
 import pkgutil
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Final
 
 import httpx
 import pytest
@@ -37,15 +39,18 @@ from starlette.routing import Route as StarletteRoute
 import zoeymcp.portal
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.unit import onboard_model
+from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES, STATIC, Route
 from zoeymcp.vault.admin import HealthReader
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.reportstore import ReportStore
+from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
 
 from .test_admin import BROKER_BINDING, KEYS, AdminRig
 from .test_portal_wire import ORIGIN, Page
+from .test_reviewreport import unclassified
 
 pytestmark = pytest.mark.anyio
 
@@ -82,6 +87,7 @@ def carried(text: str, credentials: dict[str, str]) -> set[str]:
 # --- the admin socket ---------------------------------------------------------------------------
 
 SOCKET_PARAMS = {
+    "server": "notes",
     "name": "music-stats",
     "fingerprint": "0" * 16,
     "flow": "0123456789abcdef",
@@ -102,6 +108,31 @@ SOCKET_BODIES: dict[tuple[str, str], Any] = {
 }
 
 
+class Reviews:
+    """Review jobs with one done for the CLI, as the vault's own queue answers them: the
+    socket's review routes answer its report (M7 design F.2)."""
+
+    DIGEST = "sha256:" + "d" * 64
+    SERVERS: Final[Mapping[str, ServerKind]] = MappingProxyType({"notes": "remote"})
+
+    def __init__(self) -> None:
+        self.table = JobTable(lambda: 1000.0, started=0.0)
+        self.table.poll_began()
+        queued = self.table.queue("notes", "cli", self.DIGEST, self.SERVERS)
+        assert isinstance(queued, Job)
+        self.table.claim(self.DIGEST)
+        body = {"v": 1, "job": queued.id, "server": "notes", "report": unclassified("list_notes")}
+        self.done = self.table.post(read_result(body, GatewayLimits())).job
+
+    async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job:
+        queued = self.table.queue(server, owner, self.DIGEST, self.SERVERS, fresh=fresh)
+        assert isinstance(queued, Job)
+        return queued
+
+    async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
+        return self.table.get(job_id, owner)
+
+
 def socket_routes(rig: AdminRig) -> list[tuple[str, str]]:
     """Every method and path template of the socket's table, in its order."""
     walked = []
@@ -114,7 +145,8 @@ def socket_routes(rig: AdminRig) -> list[tuple[str, str]]:
 async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     tmp_path: Path,
 ) -> None:
-    rig = AdminRig(tmp_path, onboard=True)
+    reviews = Reviews()
+    rig = AdminRig(tmp_path, onboard=True, reviews=reviews)
     store_values(rig)
     code, _ = rig.setup.issue()
     discovered = await rig.call("POST", "/onboard/discover", onboard_model.confidential())
@@ -122,7 +154,7 @@ async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     secret = {"client_secret": onboard_model.GIVEN_SECRET}
     stored = await rig.call("POST", f"/onboard/{onboarding}/register", secret)
     assert stored.status_code == 200, stored.text
-    params = {**SOCKET_PARAMS, "onboarding": onboarding}
+    params = {**SOCKET_PARAMS, "onboarding": onboarding, "job": reviews.done.id}
     credentials = dict.fromkeys((*VALUES, onboard_model.GIVEN_SECRET), "secret value")
     credentials[code.reveal()] = "setup code"
     credentials[KEYS.gateway_key(1)] = "gateway key"
@@ -130,12 +162,16 @@ async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     walked = socket_routes(rig)
     assert len(walked) == len(set(walked)) >= 23
     assert ("DELETE", "/onboard/{onboarding}") in walked
+    assert ("GET", "/review/jobs/{job}") in walked
     for method, template in walked:
         path = template.format(**params)
         response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
         answers.append(((method, template), response.text + repr(dict(response.headers))))
         if (method, template) == ("POST", "/setup-code"):
             credentials[response.json()["code"]] = "setup code"
+        if template.startswith("/review"):
+            # The done job's report, answered whole (and handed back again on a queue call).
+            assert response.json()["report"]["server"] == "notes", response.text
     answers.append((("POST", "/onboard/discover"), discovered.text + stored.text))
     found = {route: carried(text, credentials) for route, text in answers}
     # The exceptions carry their own credential and nothing else; every other answer none.
@@ -160,7 +196,7 @@ async def test_no_socket_answer_carries_what_a_registration_issued(tmp_path: Pat
     )
     credentials = dict.fromkeys(planted, "registration")
     answers = [discovered.text + registered.text]
-    params = {**SOCKET_PARAMS, "onboarding": onboarding}
+    params = {**SOCKET_PARAMS, "onboarding": onboarding, "job": "unknown-job"}
     for method, template in socket_routes(rig):
         path = template.format(**params)
         response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))

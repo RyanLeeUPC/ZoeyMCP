@@ -31,6 +31,10 @@ the admin socket, it reaches the store and nothing else, its fragment holding on
 is one a registration issued (D.4), whose answer's registration access token and URI reach
 nothing at all. So is a deleted grant's revocation (D.9): the refresh token and the client
 secret go to the revocation endpoint and nowhere else.
+
+The review job path (M7 design F.2, M.4) is swept too: a job's ID reaches only the poll that
+claims it and the queue and read answers, the log naming it by hash8 alone, and nothing from a
+report (a tool's name or text, a pin) or a gateway's error message reaches the log.
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ from tests.fakes.oauth_server import (
 from tests.unit import onboard_model
 from tests.unit.report_model import DIGEST, PIN, asked_line
 from zoeymcp.cli.main import main
-from zoeymcp.common import ledgerreport
+from zoeymcp.common import ledgerreport, pinhash
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.merge import Merged, merge
@@ -70,7 +74,7 @@ from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
-from zoeymcp.vault import logs
+from zoeymcp.vault import logs, reviewjobs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.oauth.login import LoginService
@@ -85,6 +89,8 @@ from .test_admin import AdminRig
 from .test_no_secret_answers import Recording, step_up
 from .test_oauth_tokens import KEYS, FakeClock
 from .test_portal_wire import ORIGIN
+from .test_reviewjobs import Rig as ReviewRig
+from .test_reviewreport import unclassified
 
 pytestmark = pytest.mark.anyio
 
@@ -999,6 +1005,53 @@ def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:
 
 
 # --- the report path (M5 design J.2, J.4, M.4) ---------------------------------------------------
+
+
+async def test_no_review_job_id_or_report_reaches_the_vault_logs(tmp_path: Path) -> None:
+    """Jobs queued over the socket, claimed by a poll, and ended by a report, a lying report, a
+    gateway's error and the clock: the log holds servers, hash8s, counts and reasons only."""
+    sentinel = "review-description-sentinel"
+    message = "gateway-message-sentinel"
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        rig = ReviewRig(tmp_path)
+        rig.seen()
+        texts: list[str] = []
+        ids: list[str] = []
+        for outcome in ("done", "pin_mismatch", "error", "stale"):
+            queued = await rig.socket("POST", "/review/notes", {"fresh": True})
+            texts.append(queued.text)
+            job = queued.json()["job"]
+            ids.append(job)
+            if outcome == "stale":
+                rig.clock.now += reviewjobs.QUEUE_TTL
+                rig.seen()
+            else:
+                texts.append((await rig.poll()).text)
+            data = unclassified("secret_tool")
+            data["tools"][0]["definition"]["description"] = sentinel
+            data["tools"][0]["pin"] = pinhash.pin_of(data["tools"][0]["definition"])
+            if outcome == "pin_mismatch":
+                data["tools"][0]["pin"] = PIN
+            body: dict[str, Any] = {"v": 1, "job": job, "server": "notes", "report": data}
+            if outcome == "error":
+                error = {"status": 502, "code": "x", "message": message}
+                body = {"v": 1, "job": job, "error": error}
+            if outcome != "stale":
+                texts.append((await rig.post(body)).text)
+            texts.append((await rig.socket("GET", f"/review/jobs/{job}")).text)
+        await rig.app.aclose()
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    for event in ("review_requested", "review_reported", "review_refused", "review_stale"):
+        assert f'"event":"{event}"' in text
+    for secret in (*ids, sentinel, message, "secret_tool", PIN):
+        assert secret not in text, secret
+    # The report's text reaches the operator's read of the done job, and nothing else.
+    assert sum(sentinel in answer for answer in texts) == 1
+    assert all(message not in answer for answer in texts)
 
 
 async def test_no_ledger_line_reaches_the_vault_logs(tmp_path: Path) -> None:

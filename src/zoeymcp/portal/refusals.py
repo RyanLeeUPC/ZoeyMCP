@@ -435,6 +435,45 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "review_too_large": Entry(
             413, "The gateway's review report is too large ({detail}), so it isn't read."
         ),
+        # Review jobs (M7 F.2; vault/reviewjobs.py).
+        "review_unknown_server": Entry(
+            404,
+            "The running policy has no remote or toolkit server named {server}. Check the name, "
+            "or reload the policy that adds it.",
+        ),
+        "review_busy": Entry(
+            409,
+            "A review of {server} is already under way. Wait for it (at most 3 minutes), then "
+            "review again.",
+        ),
+        "review_jobs_full": Entry(
+            429, "At most 2 reviews can be under way at once. Wait for one, then review again."
+        ),
+        "review_unavailable": Entry(
+            503,
+            "The gateway isn't asking the vault for review jobs ({detail}), so nothing was "
+            "queued. Check that the gateway is running and reaches the vault.",
+        ),
+        "job_unknown": Entry(
+            409,
+            "That review isn't known to the vault: it finished more than 30 minutes ago, the "
+            "vault restarted, or its result came already. Review again.",
+        ),
+        "review_stale": Entry(
+            409,
+            "The gateway didn't take the review within 60 seconds: it holds another version of "
+            "the policy (a reload since). Review again once it has caught up.",
+        ),
+        "review_timeout": Entry(
+            504,
+            "The gateway took the review but sent no result within 2 minutes. Check the "
+            "gateway's log, then review again.",
+        ),
+        "review_failed": Entry(
+            502,
+            "The gateway couldn't review the server ({code}). Its log says why; review again "
+            "once that is fixed.",
+        ),
     }
 )
 

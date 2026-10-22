@@ -809,6 +809,8 @@ def build(
             portal=None if portal is None else portal.app,
             onboard=onboard,
             revoker=app.revoker,
+            # The review jobs the gateway polls the proxy listener for (M7 design F.2).
+            reviews=app,
         )
     return Vault(
         app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal

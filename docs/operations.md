@@ -902,6 +902,38 @@ None holds an onboarding's ID, a secret, a registration access token or URI, a U
 query, or a body; a stored client secret (or a registered public client's ID) logs `secret_set`
 with `via` and its binding, as any secret does.
 
+### The review job path
+
+A review can also run through the vault (M7 design F.2): the vault queues a job, and the gateway,
+which asks the vault for work and never takes a connection from it, runs the same review as
+`zoeymcp review` and posts its result back. The CLI's side of this (`review --via vault`, and the second
+`login --mcp` queueing the review) comes with a later M7 step; the admin socket's routes are there
+now. `POST /review/<server>` queues a review of a remote or toolkit server in the running policy, or
+answers the CLI's finished review of it at the current policy view again (send `{"fresh": true}` for
+a new one); `GET /review/jobs/<job>?wait=N` (at most 30 s) answers the job's state, and its report
+once it is done. At most two reviews are under way at once, one per server. A queue call is refused
+`review_unavailable` while the gateway isn't polling (no poll waiting, no review it took still
+running, and no poll or result in the last 15 s); in the first 45 s after the vault starts it waits
+for the gateway's first poll instead. A job the gateway doesn't take within 60 s, because it holds
+another version of the policy, fails `review_stale`; one it took and didn't answer within 2 minutes
+fails `review_timeout`. A finished review is kept for 30 minutes, in memory only: a vault restart
+forgets every job. The vault reads a report under the gateway's limits and recomputes every pin from
+the definition beside it: one pin that isn't its definition's refuses the whole report
+(`pin_mismatch`, logged at `critical`: the gateway's own review never reports that). A report larger
+than the cap the gateway's limits give (`max_tools_per_server` x 16 KiB, within 8 and 64 MiB) isn't
+read at all, and the review fails `review_too_large`, naming the cap. Its log lines:
+
+| Event | Fields |
+| --- | --- |
+| `review_requested` | `server`, `job` (the first 8 hex digits of the job ID's SHA-256), `owner` (`cli` or `portal`), `reused` (a finished review handed back) |
+| `review_reported` | `server`, `job`, `tools` (how many the report lists); or, when the gateway couldn't review it, `reason` (`review_failed`, or `review_too_large` when the vault refused its report as too large) and the gateway's `code` |
+| `review_refused` | `reason` (`job_unknown`, `review_invalid` or `pin_mismatch`), with `server` and `job` for a known job, and `tools` (how many pins differ) for `pin_mismatch` |
+| `review_unavailable` | `server`: a queue call refused because the gateway isn't polling, or the vault is stopping |
+| `review_stale` | `server`, `job`: the gateway didn't take it within 60 s |
+| `review_timeout` | `server`, `job`: the gateway took it and sent no result within 2 minutes |
+
+None holds a job's ID, a tool's name or definition, or anything else from a report.
+
 ## 12. Drift
 
 When an included tool's definition changes, the gateway hides it from every client of the
@@ -1722,6 +1754,14 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `review_invalid` | The gateway's review report isn't in the form the vault reads (`<detail>`), so nothing from it is shown. Review again. |
 | 502 | `pin_mismatch` | The gateway's review report gives a pin that isn't its definition's, for `<tools>`, so nothing from it is shown. The gateway's own review never reports that: check the gateway. |
 | 413 | `review_too_large` | The gateway's review report is too large (`<detail>`), so it isn't read. |
+| 404 | `review_unknown_server` | The running policy has no remote or toolkit server named `<server>`. Check the name, or reload the policy that adds it. |
+| 409 | `review_busy` | A review of `<server>` is already under way. Wait for it (at most 3 minutes), then review again. |
+| 429 | `review_jobs_full` | At most 2 reviews can be under way at once. Wait for one, then review again. |
+| 503 | `review_unavailable` | The gateway isn't asking the vault for review jobs (`<detail>`), so nothing was queued. Check that the gateway is running and reaches the vault. |
+| 409 | `job_unknown` | That review isn't known to the vault: it finished more than 30 minutes ago, the vault restarted, or its result came already. Review again. |
+| 409 | `review_stale` | The gateway didn't take the review within 60 seconds: it holds another version of the policy (a reload since). Review again once it has caught up. |
+| 504 | `review_timeout` | The gateway took the review but sent no result within 2 minutes. Check the gateway's log, then review again. |
+| 502 | `review_failed` | The gateway couldn't review the server (`<code>`). Its log says why; review again once that is fixed. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

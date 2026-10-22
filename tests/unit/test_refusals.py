@@ -3,8 +3,9 @@
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
 ``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
 literal discovery and registration ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused``,
-fetch error and review report ``ReportRefused`` reason, and every refusal the onboarding service
-words itself), so a reason added there without a sentence here fails.
+fetch error, review report ``ReportRefused`` and review job ``ReviewRefused`` reason, every way a
+review job fails, and every refusal the onboarding service words itself), so a reason added there
+without a sentence here fails.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from zoeymcp.portal.refusals import (
     wrong_host_literal,
 )
 from zoeymcp.portal.refusals import login as login_refusal
-from zoeymcp.vault import admin, onboard, onboarding, secretplan, store
+from zoeymcp.vault import admin, onboard, onboarding, reviewjobs, secretplan, store
 from zoeymcp.vault.oauth import dcr, discovery, fetch, login, pkce
 from zoeymcp.vault.secretplan import SecretRefusal
 
@@ -165,6 +166,17 @@ FETCH = {
 }
 # M7's M.2: a review report the vault refuses (M7 step 12a; F.4).
 REPORT = {"review_invalid": 502, "pin_mismatch": 502, "review_too_large": 413}
+# M7's M.2: review jobs (M7 step 12b1; F.2), job_unknown 409 (PC-6), and a job's failures.
+REVIEW = {
+    "review_busy": 409,
+    "review_unknown_server": 404,
+    "job_unknown": 409,
+    "review_failed": 502,
+    "review_timeout": 504,
+    "review_jobs_full": 429,
+    "review_unavailable": 503,
+    "review_stale": 409,
+}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -245,6 +257,10 @@ FIELDS = {
     "review_invalid": {"detail"},
     "pin_mismatch": {"tools"},
     "review_too_large": {"detail"},
+    "review_unknown_server": {"server"},
+    "review_busy": {"server"},
+    "review_unavailable": {"detail"},
+    "review_failed": {"code"},
 }
 
 
@@ -292,7 +308,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR | REPORT
+    expected |= MIXUP | DCR | REPORT | REVIEW
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -473,6 +489,30 @@ def test_every_review_report_reason_is_catalogued() -> None:
     assert found == set(get_args(reviewreport.Reason))
     assert found == set(REPORT)
     assert found <= set(CATALOGUE)
+
+
+def test_every_review_job_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to vault/reviewjobs.py, each refusal a literal of its Reason type;
+    a job's failures are the clock's, the gateway's and the review report's refusals."""
+    found = literal_reasons(reviewjobs, "ReviewRefused")
+    assert found == set(get_args(reviewjobs.Reason))
+    failures = {reason for part in get_args(reviewjobs.Failure) for reason in get_args(part)}
+    own = {"review_stale", "review_timeout", "review_failed"}
+    assert failures == own | set(REPORT)
+    assert found | own == set(REVIEW)
+    assert found | failures <= set(CATALOGUE)
+
+
+def test_the_review_texts_name_the_tables_limits() -> None:
+    """Each wait a review text names is the job table's (M.6)."""
+    busy = (reviewjobs.QUEUE_TTL + reviewjobs.CLAIM_DEADLINE) / 60
+    assert f"(at most {busy:.0f} minutes)" in CATALOGUE["review_busy"].text
+    assert f"At most {reviewjobs.REVIEW_JOBS_MAX} reviews" in CATALOGUE["review_jobs_full"].text
+    assert f"within {reviewjobs.QUEUE_TTL:.0f} seconds" in CATALOGUE["review_stale"].text
+    timeout = reviewjobs.CLAIM_DEADLINE / 60
+    assert f"within {timeout:.0f} minutes" in CATALOGUE["review_timeout"].text
+    kept = reviewjobs.RESULT_TTL / 60
+    assert f"more than {kept:.0f} minutes ago" in CATALOGUE["job_unknown"].text
 
 
 def test_the_busy_text_names_the_tables_limits() -> None:

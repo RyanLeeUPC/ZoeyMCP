@@ -45,6 +45,7 @@ from zoeymcp.vault.admin import (
     NOT_WRITTEN,
     AdminApp,
     AdminSocketError,
+    ReviewQueue,
     SetupCodes,
     check_socket_dir,
     json_safe,
@@ -102,7 +103,8 @@ def broker_server() -> tuple[FakeAuthServer, Any]:
 
 class AdminRig:
     """The admin app with the example policy and, as in the vault, a token manager; with
-    ``onboard``, onboard_model's service, whose server registers clients by ``register``."""
+    ``onboard``, onboard_model's service, whose server registers clients by ``register``; with
+    ``reviews``, those review jobs."""
 
     def __init__(
         self,
@@ -114,6 +116,7 @@ class AdminRig:
         portal: PortalApp | None = None,
         onboard: bool = False,
         register: onboard_model.Register | None = None,
+        reviews: ReviewQueue | None = None,
     ) -> None:
         self.policy = example_policy()
         self.store = SecretStore(tmp_path, KEYS)
@@ -137,6 +140,7 @@ class AdminRig:
             )
             if onboard
             else None,
+            reviews=reviews,
         )
 
     def set_policy(self, policy: Policy) -> None:

@@ -116,6 +116,8 @@ only_mutate = [
     "*zoeymcp/vault/oauth/discovery.py",
     "*zoeymcp/vault/oauth/dcr.py",
     "*zoeymcp/vault/onboarding.py",
+    "*zoeymcp/vault/internal.py",
+    "*zoeymcp/vault/reviewjobs.py",
     "*zoeymcp/vault/gatewaykeys.py",
     "*zoeymcp/vault/peer.py",
     "*zoeymcp/portal/webauthn.py",
@@ -211,3 +213,6 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.vault.onboarding" = 95
 "zoeymcp.gateway.pins" = 95
 "zoeymcp.gateway.findings" = 95
+"zoeymcp.common.pinhash" = 95
+"zoeymcp.common.reviewreport" = 95
+"zoeymcp.common.suggest" = 95

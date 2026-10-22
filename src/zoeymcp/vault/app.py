@@ -13,9 +13,12 @@ gateway, proved by the kernel; on TCP it is whoever presents a placeholder or a 
 when the link socket is configured TCP refuses gateway keys altogether (M3 design C.1).
 
 Paths under ``/_zoeymcp/`` are the vault's own and never reach a route (no route prefix can start
-with ``_``). There are two, both for the gateway only: its policy view, a long poll that a reload
-wakes (M3 design D.1, D.2), and the report path, where it pushes its ledger to the vault's copy
-(M5 design J.2); the rest are 404.
+with ``_``). :mod:`.internal`'s table decides them, all four for the gateway only: its policy
+view, a long poll that a reload wakes (M3 design D.1, D.2); the report path, where it pushes its
+ledger to the vault's copy (M5 design J.2); and the review job path (M7 design F.2), a long poll
+of the review jobs queued at the view it holds and the path it posts each job's result to. The
+rest are 404. :meth:`VaultApp.queue_review` and :meth:`VaultApp.review_job` queue and read the
+jobs for the admin socket (and later the portal), on :mod:`.reviewjobs`' table.
 
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hmac
 import http.cookiejar
 import ipaddress
@@ -53,22 +57,25 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
-from ..common import canonical, egresslist, ledgerreport
+from ..common import canonical, egresslist, ledgerreport, reviewreport
 from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
     BasicCredential,
+    GatewayLimits,
     HeaderCredential,
     OAuth2Credential,
     PathCredential,
     PlaceholderCaller,
     Policy,
     QueryCredential,
+    RemoteServer,
     Route,
     SMTPConnector,
+    ToolkitServer,
     is_secret_ref,
 )
 from ..common.policy.view import build_view, dump_view
-from . import logs, netclient, secretops
+from . import internal, logs, netclient, secretops
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
@@ -94,6 +101,16 @@ from .request import (
     scrub_headers,
     secret_variants,
 )
+from .reviewjobs import (
+    Job,
+    JobTable,
+    Owner,
+    Result,
+    ReviewRefused,
+    ServerKind,
+    named_job,
+    read_result,
+)
 from .store import Secret, SecretStore, SecretUnavailable, smtp_binding
 
 GATEWAY_HEADER = "x-zoeymcp-gateway"
@@ -105,15 +122,21 @@ REFUSAL_MARKER = "refused"
 # The scope key the listener wrapper sets: "gateway" on the link socket, "tcp" elsewhere.
 LISTENER_SCOPE_KEY = "zoeymcp.listener"
 Listener = Literal["gateway", "tcp"]
-# The vault's own endpoints: the gateway's view (M3 design D.1) and its report path (M5 J.2).
-INTERNAL_SEGMENT = "_zoeymcp"
-VIEW_PATH = NormalizedPath((INTERNAL_SEGMENT, "gateway", "v1", "view"))
-REPORT_PATH = NormalizedPath((INTERNAL_SEGMENT, "gateway", "v1", "report", "ledger"))
+# The vault's own endpoints (M7 design G.1): the gateway's view (M3 design D.1), its report path
+# (M5 J.2) and the review job path (M7 F.2).
+INTERNAL_SEGMENT = internal.SEGMENT
+VIEW_PATH = internal.VIEW.path
+REPORT_PATH = internal.LEDGER.path
+REVIEW_JOBS_PATH = internal.REVIEW_JOBS.path
+REVIEW_REPORT_PATH = internal.REVIEW_REPORT.path
 # A report's body is read within this many seconds (M5 design J.2).
 REPORT_DEADLINE = 10.0
 # The longest ``?wait=`` in seconds, and how many may wait at once (M3 design D.2).
-VIEW_MAX_WAIT = 25
-VIEW_MAX_WAITERS = 4
+VIEW_MAX_WAIT = internal.VIEW_MAX_WAIT
+VIEW_MAX_WAITERS = internal.VIEW_MAX_WAITERS
+# A review report nests a tool's definition four levels down (the result, the report, its tools,
+# an entry), and a definition's pin is only computed within canonical's default depth.
+REVIEW_MAX_DEPTH = canonical.DEFAULT_MAX_DEPTH + 4
 # One entity tag of If-None-Match, weak or strong; the tag itself is the group.
 _ENTITY_TAG = re.compile(r'\s*(?:W/)?"([\x21\x23-\x7e]*)"\s*')
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
@@ -341,6 +364,7 @@ class VaultApp:
         gateway_link: bool = False,
         connectors: SmtpConnectors | None = None,
         reports: ReportStore | None = None,
+        review_jobs: JobTable | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
@@ -365,6 +389,9 @@ class VaultApp:
 
         ``reports`` is the copy of the gateway's ledger, recovered before the listeners open.
         Without one, the report path answers 503.
+
+        ``review_jobs`` replaces the review job table (tests inject a clock). By default it is
+        on the monotonic clock, started now.
         """
         self._gateway_link = gateway_link
         self._store = store
@@ -400,6 +427,11 @@ class VaultApp:
         self._view_changed = asyncio.Event()
         self._view_waiters = 0
         self._view_stopping = False
+        # Review jobs (M7 design F.2): every change sets this event and puts a new one in its
+        # place, waking the gateway's poll and the socket's waits. One report is read at a time.
+        self._reviews = JobTable(time.monotonic) if review_jobs is None else review_jobs
+        self._reviews_changed = asyncio.Event()
+        self._review_lock = asyncio.Lock()
         self._install(policy)
 
     def _install(self, policy: Policy) -> list[str]:
@@ -418,6 +450,10 @@ class VaultApp:
 
     def _wake_view_waiters(self) -> None:
         woken, self._view_changed = self._view_changed, asyncio.Event()
+        woken.set()
+
+    def _wake_reviews(self) -> None:
+        woken, self._reviews_changed = self._reviews_changed, asyncio.Event()
         woken.set()
 
     @property
@@ -472,10 +508,12 @@ class VaultApp:
         return self._view_waiters
 
     def stop_view_waits(self) -> None:
-        """Answer every long poll of the view now, and wait no more. For shutdown: the servers
-        wait for requests in flight, and a long poll would hold them for up to 25 s."""
+        """Answer every long poll of the view and of the review jobs now, and the socket's
+        review waits, and wait no more. For shutdown: the servers wait for requests in flight,
+        and a long poll would hold them for up to 25 s."""
         self._view_stopping = True
         self._wake_view_waiters()
+        self._wake_reviews()
 
     def reload(self, policy: Policy) -> list[str]:
         """Swap the policy. Returns the OAuth credentials whose cached tokens were reset.
@@ -746,23 +784,32 @@ class VaultApp:
     async def _internal(
         self, request: Request, path: NormalizedPath, listener: Listener, log: dict[str, Any]
     ) -> Response:
-        """``GET /_zoeymcp/gateway/v1/view`` and the report path (:meth:`_report`), for the
-        gateway only; every other path here is 404.
-
-        The answer is the view with its digest as the ``ETag``, or 304 while the digest is one
-        the caller named in ``If-None-Match``. With ``?wait=N`` a 304 waits up to N seconds for
-        a reload that changes the view (M3 design D.2).
-        """
-        if path == REPORT_PATH:
-            return await self._report(request, listener, log)
-        if path != VIEW_PATH:
+        """The vault's own endpoints, as :func:`.internal.decide` admits them: the path (404),
+        the gateway's identity (403; a gateway key is read only for a path in the table), then
+        the method (405). Each handler checks the rest before any body byte is read."""
+        endpoint = internal.find(path)
+        if endpoint is None:
             raise Refused(404, "no such vault endpoint")
-        log["endpoint"] = "gateway_view"
-        if listener != "gateway" and not self._gateway_key(request, accepted=True):
-            raise Refused(403, "the view is for the gateway only")
-        log["caller"] = "gateway"
-        if request.method != "GET":
-            raise Refused(405, "the view takes GET only", allow="GET")
+        log["endpoint"] = endpoint.name
+        gateway = listener == "gateway" or self._gateway_key(request, accepted=True)
+        identity: internal.Identity | None = "gateway" if gateway else None
+        if identity is not None:
+            log["caller"] = identity
+        decided = internal.decide(path, request.method, listener, identity)
+        if isinstance(decided, internal.Refusal):
+            raise Refused(decided.status, decided.reason, allow=decided.allow)
+        if decided is internal.LEDGER:
+            return await self._report(request, log)
+        if decided is internal.REVIEW_JOBS:
+            return await self._review_jobs(request, log)
+        if decided is internal.REVIEW_REPORT:
+            return await self._review_report(request, log)
+        return await self._view_answer(request, log)
+
+    async def _view_answer(self, request: Request, log: dict[str, Any]) -> Response:
+        """``GET /_zoeymcp/gateway/v1/view``: the view with its digest as the ``ETag``, or 304
+        while the digest is one the caller named in ``If-None-Match``. With ``?wait=N`` a 304
+        waits up to N seconds for a reload that changes the view (M3 design D.2)."""
         try:
             wait = view_wait(parse_query(request.scope.get("query_string", b"")))
         except RequestRejected as exc:
@@ -779,7 +826,7 @@ class VaultApp:
         logs.event("gateway_view_served", digest=view.digest, waited_ms=waited_ms)
         return Response(view.body, media_type="application/json", headers=headers)
 
-    async def _report(self, request: Request, listener: Listener, log: dict[str, Any]) -> Response:
+    async def _report(self, request: Request, log: dict[str, Any]) -> Response:
         """``GET`` and ``POST`` of the report path (M5 design J.2), for the gateway only.
 
         Before any body byte is read: the gateway's identity (403), the method (405), no query
@@ -790,12 +837,6 @@ class VaultApp:
         copy. ``GET`` answers the head; an accepted ``POST`` answers the same, a refused one its
         ``code`` with the head.
         """
-        log["endpoint"] = "gateway_report"
-        if listener != "gateway" and not self._gateway_key(request, accepted=True):
-            raise Refused(403, "the report path is for the gateway only")
-        log["caller"] = "gateway"
-        if request.method not in ("GET", "POST"):
-            raise Refused(405, "the report path takes GET or POST", allow="GET, POST")
         if request.scope.get("query_string"):
             raise Refused(400, "the report path takes no query")
         copy = self._reports
@@ -826,6 +867,188 @@ class VaultApp:
             headers = {REFUSAL_HEADER: REFUSAL_MARKER, "cache-control": "no-store"}
             return JSONResponse(refusal, status_code=result.status, headers=headers)
         return _head(copy)
+
+    # --- review jobs (M7 design F.2) -----------------------------------------------------------
+
+    async def _review_jobs(self, request: Request, log: dict[str, Any]) -> Response:
+        """``GET /_zoeymcp/gateway/v1/review/jobs?wait=N&view=<digest>``: the jobs queued at the
+        view digest the gateway's policy client holds, now ``sent``, once there are any, or
+        none after N seconds (at most 25), at shutdown, or when the caller leaves. One poll
+        waits at a time (429); while it waits the poller counts as seen (CR-15)."""
+        try:
+            wait, digest = internal.jobs_query(parse_query(request.scope.get("query_string", b"")))
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason) from exc
+        table = self._reviews
+        if table.waiting >= internal.REVIEW_WAITERS:
+            raise Refused(429, "a review poll is already waiting", retry_after=1)
+        table.poll_began()
+        # A queue call waiting for the first poll after the vault started goes on (OPS-20).
+        self._wake_reviews()
+        gone = asyncio.ensure_future(_disconnected(request.receive))
+        left = False
+        try:
+            deadline = table.now() + wait
+            while not table.offered(digest) and not self._view_stopping:
+                remaining = deadline - table.now()
+                if remaining <= 0:
+                    break
+                changed = asyncio.ensure_future(self._reviews_changed.wait())
+                try:
+                    await asyncio.wait(
+                        (changed, gone), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    changed.cancel()
+                if gone.done():
+                    left = log["disconnected"] = True
+                    break
+        finally:
+            table.poll_ended()
+            # On a task that has already failed, cancel() also marks its error as retrieved.
+            gone.cancel()
+            self._log_review_ends()
+        # A job is sent only to a poll that is still there to take it.
+        claimed = () if left else table.claim(digest)
+        if claimed:
+            self._wake_reviews()
+        log["jobs"] = len(claimed)
+        jobs = [{"id": job.id, "server": job.server} for job in claimed]
+        return JSONResponse({"v": 1, "jobs": jobs}, headers={"cache-control": "no-store"})
+
+    async def _review_report(self, request: Request, log: dict[str, Any]) -> Response:
+        """``POST /_zoeymcp/gateway/v1/report/review``: one job's result (F.2, F.4).
+
+        Before any body byte is read: no query (400), exactly one ``Content-Type:
+        application/json`` (415) and one ``Content-Length`` (411) of at most the report cap the
+        limits give (413 ``review_too_large``). Then, one at a time (429 ``busy``), the body is
+        read within the cap and 30 s (408) and parsed strictly (400 ``bad_body``). A result for
+        no ``sent`` job is 409 ``job_unknown``; a report the vault refuses fails its job and is
+        answered with its reason (``pin_mismatch`` logged at critical). An accepted result is
+        answered with the job's state. A 413 names no job, so the gateway posts it back as its
+        error ``review_too_large``, which fails the job with the cap (F.4)."""
+        if request.scope.get("query_string"):
+            raise Refused(400, "the review report path takes no query")
+        limits = self._limits()
+        most = reviewreport.report_max(limits)
+        length = _json_length(request, kind="a review report")
+        try:
+            reviewreport.check_length(length, limits)
+        except reviewreport.ReportRefused as exc:
+            raise Refused(413, exc.detail, code=exc.reason) from exc
+        if self._review_lock.locked():
+            raise Refused(429, "a review report is being read", code="busy", retry_after=1)
+        async with self._review_lock:
+            too_large = (f"a review report is at most {most} bytes", "review_too_large")
+            body = await _read_json_body(
+                request, most, internal.REVIEW_READ_DEADLINE, too_large, kind="the review report"
+            )
+            try:
+                data = await asyncio.to_thread(
+                    canonical.loads_strict, body, max_bytes=most, max_depth=REVIEW_MAX_DEPTH
+                )
+            except ValueError as exc:
+                raise Refused(400, "the review report isn't strict JSON", code="bad_body") from exc
+            try:
+                self._reviews.sent(named_job(data))
+                # A large report is read off the event loop; its job is ended back on it, and a
+                # job that timed out meanwhile is job_unknown then.
+                result: Result = await asyncio.to_thread(read_result, data, limits)
+                posted = self._reviews.post(result)
+            except ReviewRefused as exc:
+                logs.event("review_refused", reason=exc.reason)
+                raise Refused(409, "no such review job was sent", code=exc.reason) from exc
+            finally:
+                self._log_review_ends()
+        self._wake_reviews()
+        job = posted.job
+        event: dict[str, Any] = {"server": job.server, "job": job.hash8}
+        log["server"] = job.server
+        refused = posted.refused
+        if refused is not None:
+            event["reason"] = refused.reason
+            if refused.reason == "pin_mismatch":
+                event.update(tools=len(refused.tools), level="critical")
+            logs.event("review_refused", **event)
+            raise Refused(502, refused.detail, code=refused.reason)
+        if job.report is not None:
+            event["tools"] = len(job.report.tools)
+        else:
+            event.update(reason=job.failure, code=result.code)
+        logs.event("review_reported", **event)
+        answer = {"v": 1, "job": job.id, "state": job.state}
+        return JSONResponse(answer, headers={"cache-control": "no-store"})
+
+    def _limits(self) -> GatewayLimits:
+        gateway = self._policy.gateway
+        return GatewayLimits() if gateway is None else gateway.limits
+
+    def _reviewable(self) -> dict[str, ServerKind]:
+        """The running view's servers a review job may be for: remote (a bridge is one once it
+        is an upstream, 18a) and toolkit (COV-1)."""
+        gateway = self._policy.gateway
+        servers: dict[str, ServerKind] = {}
+        for name, server in ({} if gateway is None else gateway.servers).items():
+            if isinstance(server, RemoteServer | ToolkitServer):
+                servers[name] = server.kind
+        return servers
+
+    def _log_review_ends(self) -> None:
+        """Log every job the clock ended since the last look (M.4)."""
+        for ended in self._reviews.sweep():
+            logs.event(ended.why, server=ended.job.server, job=ended.job.hash8)
+
+    async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job:
+        """Queue a review of ``server`` for the ``owner``'s surface at the running view's
+        digest, or hand back that surface's ``done`` job at it unless ``fresh`` (OPS-11).
+        Raises :class:`.reviewjobs.ReviewRefused`. In the first 45 s after the vault started,
+        with no poll seen yet, it waits for the first one before it answers (OPS-20), unless
+        the vault is stopping: no poll comes then, and it is ``review_unavailable`` at once."""
+        table = self._reviews
+        while True:
+            changed = self._reviews_changed
+            try:
+                queued = table.queue(
+                    server, owner, self._view.digest, self._reviewable(), fresh=fresh
+                )
+            except ReviewRefused as exc:
+                if exc.reason == "review_unavailable":
+                    logs.event("review_unavailable", server=server)
+                raise
+            finally:
+                self._log_review_ends()
+            if isinstance(queued, Job):
+                break
+            if self._view_stopping:
+                logs.event("review_unavailable", server=server)
+                raise ReviewRefused(
+                    "review_unavailable", "the vault is stopping", detail="the vault is stopping"
+                )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(changed.wait(), max(0.0, queued.until - table.now()))
+        reused = queued.state == "done"
+        if not reused:
+            self._wake_reviews()
+        logs.event("review_requested", server=server, job=queued.hash8, owner=owner, reused=reused)
+        return queued
+
+    async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
+        """The ``owner``'s surface's job, once it is ``done`` or ``failed``, after ``wait``
+        seconds, or at shutdown. Raises :class:`.reviewjobs.ReviewRefused` (``job_unknown``)."""
+        table = self._reviews
+        deadline = table.now() + wait
+        while True:
+            changed = self._reviews_changed
+            try:
+                job = table.get(job_id, owner)
+            finally:
+                self._log_review_ends()
+            ends = table.deadline(job)
+            remaining = deadline - table.now()
+            if ends is None or remaining <= 0 or self._view_stopping:
+                return job
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(changed.wait(), min(remaining, ends - table.now()))
 
     async def _wait_for_view(
         self, tags: frozenset[str], deadline: float, receive: Receive, log: dict[str, Any]
@@ -1110,9 +1333,17 @@ def _head(copy: ReportStore) -> Response:
 
 def _report_headers(request: Request) -> None:
     """A report's ``Content-Type`` and ``Content-Length``, checked before its body is read."""
+    if _json_length(request) > ledgerreport.MAX_BODY_BYTES:
+        raise Refused(413, "a report is at most 1 MiB", code="too_large")
+
+
+def _json_length(request: Request, *, kind: str = "a report") -> int:
+    """The ``Content-Length`` of a body that must be one ``Content-Type: application/json``
+    (415), with one plain ``Content-Length`` and no ``Transfer-Encoding`` (411), checked before
+    the body is read. The caller compares it with its cap."""
     types = request.headers.getlist("content-type")
     if len(types) != 1 or _media_type(types[0]) != "application/json":
-        raise Refused(415, "a report is application/json", code="content_type")
+        raise Refused(415, f"{kind} is application/json", code="content_type")
     lengths = request.headers.getlist("content-length")
     if (
         request.headers.getlist("transfer-encoding")
@@ -1120,26 +1351,39 @@ def _report_headers(request: Request) -> None:
         or not (lengths[0].isascii() and lengths[0].isdigit())
         or len(lengths[0]) > 12
     ):
-        raise Refused(411, "a report needs one Content-Length", code="length_required")
-    if int(lengths[0]) > ledgerreport.MAX_BODY_BYTES:
-        raise Refused(413, "a report is at most 1 MiB", code="too_large")
+        raise Refused(411, f"{kind} needs one Content-Length", code="length_required")
+    return int(lengths[0])
 
 
 async def _read_report(request: Request) -> bytes:
     """The body, within the cap and :data:`REPORT_DEADLINE`, and as long as it said."""
+    too_large = ("a report is at most 1 MiB", "too_large")
+    return await _read_json_body(request, ledgerreport.MAX_BODY_BYTES, REPORT_DEADLINE, too_large)
+
+
+async def _read_json_body(
+    request: Request,
+    most: int,
+    deadline: float,
+    too_large: tuple[str, str],
+    *,
+    kind: str = "the report",
+) -> bytes:
+    """The body, within ``most`` bytes (413, with ``too_large``'s reason and code) and
+    ``deadline`` seconds (408), and as long as its ``Content-Length`` said (400)."""
     chunks: list[bytes] = []
     size = 0
     try:
-        async with asyncio.timeout(REPORT_DEADLINE):
+        async with asyncio.timeout(deadline):
             async for chunk in request.stream():
                 size += len(chunk)
-                if size > ledgerreport.MAX_BODY_BYTES:
-                    raise Refused(413, "a report is at most 1 MiB", code="too_large")
+                if size > most:
+                    raise Refused(413, too_large[0], code=too_large[1])
                 chunks.append(chunk)
     except TimeoutError as exc:
-        raise Refused(408, "the report came too slowly", code="too_slow") from exc
+        raise Refused(408, f"{kind} came too slowly", code="too_slow") from exc
     if size != int(request.headers["content-length"]):
-        raise Refused(400, "the report isn't as long as it said", code="bad_body")
+        raise Refused(400, f"{kind} isn't as long as it said", code="bad_body")
     return b"".join(chunks)
 
 
@@ -1152,14 +1396,7 @@ def view_wait(params: list[tuple[str, str]]) -> int:
         return 0
     if len(params) > 1 or params[0][0] != "wait":
         raise RequestRejected("the view takes one parameter, wait")
-    value = params[0][1]
-    if not (value.isascii() and value.isdigit()):
-        raise RequestRejected("wait must be a number of seconds")
-    # Capped before int(), which refuses a string of thousands of digits.
-    seconds = value.lstrip("0")
-    if len(seconds) > len(str(VIEW_MAX_WAIT)):
-        return VIEW_MAX_WAIT
-    return min(int(seconds or "0"), VIEW_MAX_WAIT)
+    return internal.wait_seconds(params[0][1], VIEW_MAX_WAIT)
 
 
 def entity_tags(values: list[str]) -> frozenset[str]:

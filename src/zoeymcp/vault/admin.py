@@ -33,6 +33,13 @@ phase 1 (M7 design M.1), owned by the CLI: :class:`.onboard.OnboardService`, whi
 shares, answers them, and a refusal is the catalogue's ``{"error", "reason"}`` with its own
 status (M.2). A given client secret comes in the register body, and no answer carries it.
 
+``POST /review/{server}`` and ``GET /review/jobs/{job}?wait=N`` are the review job path's
+(M7 design F.2, M.1), owned by the CLI: the first queues a review of a server in the running view
+for the gateway's poll, or answers the CLI's ``done`` job at the current view digest unless the
+body says ``{"fresh": true}`` (OPS-11); the second answers the job's state, and its report once
+it is done, or a failed job's refusal. A refusal is the catalogue's ``{"error", "reason"}``
+(M.2).
+
 ``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
 design I), gathered by :class:`HealthReader`, which the portal's ``GET /api/health`` shares.
 
@@ -54,7 +61,7 @@ import secrets
 import stat
 import sys
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol
@@ -73,6 +80,7 @@ from ..common.policy.schema import Policy
 from ..portal import passkeys as passkey_file
 from ..portal import setupcode
 from ..portal.passkeys import PasskeyError, Passkeys
+from ..portal.refusals import refusal
 from ..portal.sessions import SETUP_SESSION_MAX
 from ..portal.setupcode import Record, Redeemed, Refused, SetupCode
 from . import health, ledgerview, logs, secretops, secretplan
@@ -89,6 +97,7 @@ from .onboard import (
     OnboardService,
 )
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
+from .reviewjobs import Job, Owner, ReviewRefused
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
 from .secretplan import SecretRefusal
 from .store import SecretStore
@@ -98,6 +107,12 @@ MAX_COMPLETE_BODY = 8 * 1024
 NO_TOKENS = "OAuth needs the vault's token manager"
 NO_ONBOARDING: Final = "this vault runs no onboarding service"
 NO_GATEWAY_KEYS = "the vault keeps no gateway key state"
+NO_REVIEWS: Final = "this vault queues no review jobs"
+# POST /review/{server} takes {fresh?}; GET /review/jobs/{job}?wait=N waits at most this long.
+REVIEW_BODY_MAX: Final = 1024
+REVIEW_WAIT_MAX: Final = 30
+# The socket's review jobs are the CLI's (M.1).
+_REVIEW_OWNER: Final[Owner] = "cli"
 # POST /setup-code takes {reset?}.
 MAX_SETUP_BODY: Final = 4 * 1024
 # The longest GET /setup-code/status?wait=N waits, in seconds.
@@ -139,6 +154,15 @@ class PortalSessions(Protocol):
     def end_all(self) -> int: ...
 
     def end_credential(self, fingerprint: str) -> int: ...
+
+
+class ReviewQueue(Protocol):
+    """The review jobs as the socket reaches them (``app.VaultApp``), on the loop both serve
+    from (M7 design F.2)."""
+
+    async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job: ...
+
+    async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job: ...
 
 
 class AdminSocketError(Exception):
@@ -451,6 +475,7 @@ class AdminApp:
         portal: PortalSessions | None = None,
         onboard: OnboardService | None = None,
         revoker: secretops.Revoker | None = None,
+        reviews: ReviewQueue | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -471,8 +496,12 @@ class AdminApp:
         ``/onboard`` routes answer 503.
 
         ``revoker`` revokes a deleted refresh token whose credential names a ``revocation_url``
-        (M7 design D.9), shared with the portal. Without it, nothing is revoked."""
+        (M7 design D.9), shared with the portal. Without it, nothing is revoked.
+
+        ``reviews`` holds the review jobs the gateway polls for (M7 design F.2). Without it,
+        the ``/review`` routes answer 503."""
         self._store = store
+        self._reviews = reviews
         self._revoker = revoker
         self._onboard = onboard
         self._portal = portal
@@ -518,6 +547,8 @@ class AdminApp:
                 Route("/onboard/{onboarding}/register", self._onboard_register, methods=["POST"]),
                 Route("/onboard/{onboarding}/fragment", self._onboard_fragment, methods=["POST"]),
                 Route("/onboard/{onboarding}", self._onboard_cancel, methods=["DELETE"]),
+                Route("/review/jobs/{job}", self._review_read, methods=["GET"]),
+                Route("/review/{server}", self._review_queue, methods=["POST"]),
                 Route("/health", self._health, methods=["GET"]),
                 Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
                 Route("/ledger/reported/restart", self._ledger_restart, methods=["POST"]),
@@ -792,6 +823,52 @@ class AdminApp:
             return _onboard_refused(exc)
         return Response(status_code=204)
 
+    # --- review jobs (M7 design F.2, M.1) ------------------------------------------------------
+
+    async def _review_queue(self, request: Request) -> Response:
+        """``{fresh?}``: ``{job, server, state, reused}``, the job queued for the gateway's
+        poll or the CLI's ``done`` one at the current view digest (OPS-11)."""
+        if self._reviews is None:
+            return _reason(503, NO_REVIEWS, "unavailable")
+        data = await _json_object(request, REVIEW_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        fresh = data.get("fresh", False)
+        if not set(data) <= {"fresh"} or not isinstance(fresh, bool):
+            return _review_refused("bad_body", {})
+        try:
+            job = await self._reviews.queue_review(
+                request.path_params["server"], _REVIEW_OWNER, fresh=fresh
+            )
+        except ReviewRefused as exc:
+            return _review_refused(exc.reason, exc.fields)
+        answer = _job_answer(job)
+        answer["reused"] = job.state == "done"
+        return JSONResponse(answer)
+
+    async def _review_read(self, request: Request) -> Response:
+        """``?wait=N``: the CLI's job once it is done or failed, or after N seconds (at most
+        30): its state, and its report once done; a failed job answers its refusal."""
+        if self._reviews is None:
+            return _reason(503, NO_REVIEWS, "unavailable")
+        query = dict(request.query_params)
+        if set(query) - {"wait"} or len(request.query_params.multi_items()) != len(query):
+            return _reason(400, "expected ?wait=N", "bad_query")
+        try:
+            wait = _number(query.get("wait"))
+        except _BadNumber:
+            return _reason(400, "wait is a number of seconds", "bad_query")
+        try:
+            job = await self._reviews.review_job(
+                request.path_params["job"], _REVIEW_OWNER, wait=min(wait or 0, REVIEW_WAIT_MAX)
+            )
+        except ReviewRefused as exc:
+            return _review_refused(exc.reason, exc.fields)
+        if job.state == "failed":
+            assert job.failure is not None  # noqa: S101 - every failed job has one
+            return _review_refused(job.failure, dict(job.fields), _job_answer(job))
+        return JSONResponse(_job_answer(job))
+
     # --- health (M5 design I) ------------------------------------------------------------------
 
     async def _health(self, request: Request) -> Response:
@@ -889,6 +966,23 @@ class AdminApp:
 
 def _onboard_refused(exc: OnboardError) -> JSONResponse:
     return JSONResponse(exc.answer.body(), status_code=exc.answer.status)
+
+
+def _job_answer(job: Job) -> dict[str, Any]:
+    """A job as the socket answers it: never its digest or times; its report once ``done``, as
+    the gateway posted it."""
+    answer: dict[str, Any] = {"job": job.id, "server": job.server, "state": job.state}
+    if job.report is not None:
+        answer["report"] = job.report.model_dump(mode="json", exclude_unset=True)
+    return answer
+
+
+def _review_refused(
+    reason: str, fields: Mapping[str, str], more: Mapping[str, Any] | None = None
+) -> JSONResponse:
+    """The catalogue's refusal (M.2), its text filled with ``fields``, beside ``more``."""
+    answer = refusal(reason, **fields)
+    return JSONResponse({**(more or {}), **answer.body()}, status_code=answer.status)
 
 
 def _reason(status: int, message: str, reason: str) -> JSONResponse:
