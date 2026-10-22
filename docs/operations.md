@@ -1014,7 +1014,8 @@ again, reload the proxy and remove the onboarding lines.
 takes `egress_proxy` to be the role (it never guesses: without that setting the proxy is your
 own, even while a role fetches the vault's lists): each host joins the onboarding's allowance in
 the vault's list before the vault connects to it, the role's long poll is answered at once, and
-the vault waits up to 5 s for the role to fetch the widened list. An allowance is gone once the
+the vault waits up to 5 s for the role to fetch the widened list (a role still starting up, or
+back after a vault restart, is waited for the same way). An allowance is gone once the
 onboarding has its fragment 1, is cancelled or expires (30 minutes). A CONNECT the role refuses
 all the same (a role that isn't running or stopped polling, one with an old key, or a host whose
 address it refuses or can't reach) is `egress_refused`, naming the host and the role's status:

@@ -289,10 +289,8 @@ async def test_a_bad_query_is_400(rig: Rig, captured: io.StringIO, query: str, r
     assert response.headers[REFUSAL_HEADER] == REFUSAL_MARKER
     [line] = lines(captured, "request")
     assert line["reason"] == reason
-    # Not a fetch: an onboarding through the role doesn't wait for it.
-    started = time.monotonic()
-    assert await rig.app.role_fetched(5) is False
-    assert time.monotonic() - started < 1
+    # Not a fetch: the role isn't known to hold anything.
+    assert await rig.app.role_fetched(0.2) is False
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
@@ -364,13 +362,11 @@ async def test_a_role_whose_key_is_refused_from_the_start_goes_stale(
 ) -> None:
     """A role given a wrong key, or kept on the old one across a restart after a bump, is
     never admitted: health measures it from its first request, so after 300 s it warns
-    (COV-7). An onboarding through it doesn't wait for a role never admitted (I.3)."""
+    (COV-7). An onboarding through it waits out its wait and gets nothing (I.3)."""
     first = time.monotonic()
     assert (await rig.call(headers=key(2))).status_code == 403
     assert (await rig.call(headers=key(2))).status_code == 403
-    started = time.monotonic()
-    assert await rig.app.role_fetched(5) is False
-    assert time.monotonic() - started < 1
+    assert await rig.app.role_fetched(0.2) is False
     later = SimpleNamespace(monotonic=lambda: first + 301)
     monkeypatch.setattr(vault_app, "time", later)
     ago = rig.app.allowlist_fetched_ago()
@@ -645,10 +641,23 @@ async def test_an_expiry_answers_a_waiting_poll(tmp_path: Path) -> None:
 # --- the role holding the lists (I.3) -------------------------------------------------------------
 
 
-async def test_without_a_role_nothing_waits(rig: Rig) -> None:
+async def test_a_role_not_yet_seen_is_waited_for(rig: Rig) -> None:
+    """No role has fetched since the vault started: the wait runs its course, then gives up."""
     started = time.monotonic()
-    assert await rig.app.role_fetched(5) is False
-    assert time.monotonic() - started < 1
+    assert await rig.app.role_fetched(0.3) is False
+    assert 0.25 <= time.monotonic() - started < 2
+
+
+async def test_a_role_that_starts_during_the_wait_ends_it(rig: Rig) -> None:
+    """A role still starting up (or back after a vault restart) fetches during the wait: its
+    first poll names nothing, its next names the digest it applied, and the wait ends there."""
+    waiting = asyncio.create_task(rig.app.role_fetched(5))
+    await asyncio.sleep(0.05)
+    assert not waiting.done()
+    held = (await rig.fetch()).headers["etag"].strip('"')
+    assert not waiting.done()
+    assert (await rig.fetch(tag=held)).status_code == 304
+    assert await asyncio.wait_for(waiting, 2) is True
 
 
 async def test_the_role_holds_the_lists_once_it_names_their_digest(rig: Rig) -> None:

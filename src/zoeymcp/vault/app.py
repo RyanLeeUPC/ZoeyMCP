@@ -626,11 +626,11 @@ class VaultApp:
         """Wake every allowlist poll, then wait up to ``wait`` seconds for the egress role to
         hold the lists as they are now (I.3). The role names the digest it holds in
         ``If-None-Match``, and it polls again as soon as it has applied a 200, so a poll naming
-        the current digest means the role allows what the lists do. False when it doesn't by
-        then, at shutdown, or when no role has fetched since the vault started."""
+        the current digest means the role allows what the lists do. A role not seen since the
+        vault started is waited for the same way, so one still starting up (or back after a
+        vault restart) is given its chance. False when it doesn't hold them by then, or at
+        shutdown."""
         self._wake_allowlist()
-        if self._role_fetched_at is None:
-            return False
         deadline = time.monotonic() + wait
         while True:
             polled = self._role_poll

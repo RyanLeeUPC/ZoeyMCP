@@ -1473,11 +1473,17 @@ async def test_allow_private_through_the_role_is_refused(
 
 @pytest.mark.usefixtures("mcp", "auth")
 async def test_a_role_that_never_polled_is_egress_refused(
-    tmp_path: Path, world: World, names: FakeResolver, lines: io.StringIO
+    tmp_path: Path,
+    world: World,
+    names: FakeResolver,
+    lines: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With egress_proxy_kind role the vault doesn't wait to see the role: a role that never
-    fetched its lists holds none, refuses the CONNECT, and the onboarding ends
-    ``egress_refused``, with no Squid lines to add and nothing blocked (I.3)."""
+    """With egress_proxy_kind role the vault waits ALLOWANCE_WAIT for a role it hasn't seen
+    (one still starting up), then connects: a role that never fetched its lists holds none,
+    refuses the CONNECT, and the onboarding ends ``egress_refused``, with no Squid lines to add
+    and nothing blocked (I.3)."""
+    monkeypatch.setattr(onboard, "ALLOWANCE_WAIT", 0.2)
     proxy = proxy_through(world, allow=set())
     vault = role_vault(tmp_path)
     with serve_proxy(proxy) as proxy_url:
