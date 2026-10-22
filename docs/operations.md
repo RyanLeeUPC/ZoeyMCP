@@ -696,8 +696,8 @@ tells clients when a list changes, so a lazy client fetches the new one.
 
 `zoeymcp login --mcp URL` (M7) adds an OAuth-protected MCP server from its URL, beside the manual
 path above. It takes two commits: fragment 1 adds the credential, its route and the server with
-no tools; once it is committed, the same command again signs in, and the review (steps 5 to 7
-above) gives the tools to commit. Without `--client-id`, the vault registers a client itself
+no tools; once it is committed, the same command again signs in and queues the review (steps 5
+to 7 above), which gives the tools to commit. Without `--client-id`, the vault registers a client itself
 (dynamic client registration, RFC 7591) when the authorization server offers it; with one, it
 uses the client the provider registered for you. A server that offers neither stops the plan at
 `registration_unavailable` (or `cimd_only`, for one that registers clients by metadata document
@@ -824,9 +824,23 @@ what it finds with the committed credential, route and server, and signs in with
 login`'s paste flow (§2; `--rebind` passes through). A difference is refused
 `onboarding_mismatch`, naming each field that differs, never its value: revert the edit, or
 register a new client with `--reregister`. A stored client secret's binding is checked too
-(`client_secret_binding_changed`). Then the `Next:` list says to review the server in the
-gateway's container (`zoeymcp review <server>`, steps 5 to 7 above); later in M7 the vault queues
-the review itself.
+(`client_secret_binding_changed`). Then it queues the server's review through the vault (the
+review job path, below), waits up to 2 minutes for the gateway's report, and prints its counts:
+
+```text
+Reviewing through the gateway: 96 tools (64 the server marks read-only, 32 not annotated, 1 with an error finding).
+Next:
+  Review its tools:
+    docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review notes --via vault
+```
+
+The counts are the server's own annotations, not a judgement by ZoeyMCP. `zoeymcp review notes
+--via vault`, in the vault's container, prints that same review (steps 5 to 7 above: the tools,
+their findings and the YAML snippet, with `--add`, `--show` and the rest) without listing the
+server again; within 30 minutes and at the same policy, every run reads the one report, and
+`--fresh` reviews again. A review that fails or isn't done in time says so, and the run exits 1;
+the same `review` command then tells you more. With `--no-connect` and no token yet there is
+nothing to review with, so no review is queued.
 
 **Adopting a grant another tool holds.** Onboard with that tool's client
 (`login --mcp URL --client-id ID ...`) and commit fragment 1; stop the old holder's refreshes;
@@ -856,8 +870,9 @@ on the emitted file stays clean. After the commit, the `Next:` list says to emit
 again, reload the proxy and remove the onboarding lines.
 
 **Your own compose command.** The printed commands start with `ZOEYMCP_COMPOSE_CMD` and name the
-services in `ZOEYMCP_EXEC_SERVICE` and `ZOEYMCP_REVIEW_SERVICE`, which the shipped compose files
-set. If you run compose with override files, a project directory or a project name, set
+service in `ZOEYMCP_EXEC_SERVICE`, which the shipped compose files set. They also set
+`ZOEYMCP_REVIEW_SERVICE`, which is kept for compatibility: no printed command uses it now that the
+review runs through the vault. If you run compose with override files, a project directory or a project name, set
 `ZOEYMCP_COMPOSE_CMD` in `.env` to the command you type (`docker compose -f
 deploy/compose.hardened.yaml -f my-override.yaml`), or every printed command names the shipped
 file alone.
@@ -906,9 +921,14 @@ with `via` and its binding, as any secret does.
 
 A review can also run through the vault (M7 design F.2): the vault queues a job, and the gateway,
 which asks the vault for work and never takes a connection from it, runs the same review as
-`zoeymcp review` and posts its result back. The CLI's side of this (`review --via vault`, and the second
-`login --mcp` queueing the review) comes with a later M7 step; the admin socket's routes are there
-now. `POST /review/<server>` queues a review of a remote or toolkit server in the running policy, or
+`zoeymcp review` and posts its result back: `zoeymcp review <server> --via vault` in the vault's
+container (both tiers: `docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review
+notes --via vault`, or `docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes
+--via vault`), and the second `login --mcp`. `--via auto`, the default, takes the gateway's admin
+socket when the container has it, as the standard tier's does, else the vault's; `--via gateway`
+is the review over the gateway's socket as before, and `--clear` and the summary (`review` with
+no server) are only that. One review runs at a time in the gateway, a job's or the socket's.
+Behind it are the admin socket's routes: `POST /review/<server>` queues a review of a remote or toolkit server in the running policy, or
 answers the CLI's finished review of it at the current policy view again (send `{"fresh": true}` for
 a new one); `GET /review/jobs/<job>?wait=N` (at most 30 s) answers the job's state, and its report
 once it is done. At most two reviews are under way at once, one per server. A queue call is refused
@@ -931,6 +951,20 @@ read at all, and the review fails `review_too_large`, naming the cap. Its log li
 | `review_unavailable` | `server`: a queue call refused because the gateway isn't polling, or the vault is stopping |
 | `review_stale` | `server`, `job`: the gateway didn't take it within 60 s |
 | `review_timeout` | `server`, `job`: the gateway took it and sent no result within 2 minutes |
+
+The gateway's side: it polls with the digest of the policy view it holds, so a job queued at
+another view waits for it to catch up (or fails `review_stale`), and posts the report fitted to
+the vault's caps (an odd tool's long text or oversized definition is cut and marked, never a
+reason to refuse the server's report). A report over the vault's cap isn't sent: the job fails
+`review_too_large`. A post that fails is tried twice more within the 2 minutes, then dropped; a
+poll that fails backs off from 1 s up to 30 s. Its log lines:
+
+| Event | Fields |
+| --- | --- |
+| `review_job_started` | `server`, `job` |
+| `review_job_done` | `server`, `job`, `outcome`: `done`, or `failed` (the gateway's review couldn't run, and its error was posted), or `review_invalid` or `pin_mismatch` (the vault refused the report, logged at `error`) |
+| `review_job_post_failed` | `server`, `job`, `outcome`: `job_unknown` (the vault restarted, or the job ended), or why the last try failed |
+| `review_poll_failed` | `reason`: why a poll failed, at most once a minute |
 
 None holds a job's ID, a tool's name or definition, or anything else from a report.
 

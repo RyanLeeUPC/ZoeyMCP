@@ -18,17 +18,29 @@ For a toolkit server (M4 design H.6), ``--add TOOL`` puts a tool its code declar
 into ``approve`` ("declared by the toolkit") and leaves a routine one to the operator, as for a
 remote tool. With ``pinning: off`` the snippet has no pins, and every definition is printed, so an
 image change can be read before or after it is deployed.
+
+``--via`` says where the review runs (M7 design F.5): ``gateway`` over the gateway's admin socket,
+or ``vault`` over the vault's, which queues a review job that the gateway's poller runs and
+reports (F.2), so the vault's container reviews too; ``auto`` (the default) takes the gateway's
+socket when the container has it. Through the vault the CLI's finished review of the server at
+the current policy view is read again, so one report serves several runs, unless ``--fresh``
+(OPS-11). Either way the answer is the gateway's review, printed alike.
 """
 
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, TextIO
+from typing import Any, Final, Literal, TextIO
 
+from ..common.suggest import suggestion
 from ..common.textrules import reveal_hidden
+from . import admin_client
 
 EXIT_CLEAN = 0
 EXIT_NEEDS_OPERATOR = 1
@@ -280,6 +292,94 @@ def write_lines(lines: Sequence[str], out: TextIO) -> None:
 def write_json(data: Any, out: TextIO) -> None:
     json.dump(data, out, indent=2, sort_keys=True, ensure_ascii=True)
     out.write("\n")
+
+
+# --- where the review runs (M7 design F.5) -----------------------------------------------------
+
+Via = Literal["auto", "gateway", "vault"]
+# Each read of a queued job waits at most this long (the vault's socket waits up to 30 s).
+JOB_READ_WAIT: Final = 30
+# A job the vault queued has ended by then: 60 s for the gateway to take it, 120 s to answer.
+JOB_WAIT_MAX: Final = 60 + 120
+
+
+class StillRunning(Exception):
+    """The review job hadn't ended when the wait did. ``job`` is the vault's last answer."""
+
+    def __init__(self, job: Mapping[str, Any]) -> None:
+        self.job = dict(job)
+        super().__init__("the review is still running")
+
+
+def pick_via(
+    via: Via, socket: str | None, exists: Callable[[str], bool] = os.path.exists
+) -> Literal["gateway", "vault"]:
+    """Where ``review`` runs. ``auto``: the gateway's admin socket when this container has it
+    (today's path, and in the standard tier, where both run in one container), else the vault's
+    when it has that one, else the gateway's, whose absence the error then names. A ``--socket``
+    is the gateway's unless ``--via vault`` says otherwise."""
+    if via != "auto":
+        return via
+    if socket is not None or exists(admin_client.gateway_socket_path(None)):
+        return "gateway"
+    return "vault" if exists(admin_client.socket_path(None)) else "gateway"
+
+
+def vault_review(
+    socket: str,
+    server: str,
+    *,
+    fresh: bool,
+    wait: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """A review of ``server`` through the vault's job path: queued, or the CLI's finished one
+    handed back unless ``fresh``, then read until it is done or ``wait`` seconds pass (by
+    default :data:`JOB_WAIT_MAX`). The job's answer, with its ``report``. Raises
+    :class:`.admin_client.AdminUnavailable` for a refusal or a failed job, and
+    :class:`StillRunning`."""
+    job = admin_client.review_queue(socket, server, fresh=fresh)
+    deadline = clock() + (JOB_WAIT_MAX if wait is None else wait)
+    while job.get("state") != "done":
+        left = deadline - clock()
+        if left <= 0:
+            raise StillRunning(job)
+        seconds = min(JOB_READ_WAIT, math.ceil(left))
+        job = admin_client.review_job(socket, job["job"], wait=seconds)
+    return job
+
+
+def report_counts(review: Mapping[str, Any]) -> dict[str, int]:
+    """What a review found, by the tools the server lists: how many, how many the shared rule
+    suggests ``allow`` for (marked read-only), ``approve`` for (marked otherwise) or nothing
+    for (not annotated), and how many have an error finding."""
+    counts = {"tools": 0, "read_only": 0, "marked_otherwise": 0, "not_annotated": 0, "errors": 0}
+    for entry in review["tools"]:
+        if entry["state"] == "missing":
+            continue
+        counts["tools"] += 1
+        definition = entry.get("definition")
+        found = suggestion(definition.get("annotations") if isinstance(definition, dict) else None)
+        key = {"allow": "read_only", "approve": "marked_otherwise"}.get(
+            found or "", "not_annotated"
+        )
+        counts[key] += 1
+        if any(finding["level"] == "error" for finding in entry["findings"]):
+            counts["errors"] += 1
+    return counts
+
+
+def counts_line(counts: Mapping[str, int]) -> str:
+    """``96 tools (64 the server marks read-only, 32 not annotated, 1 with an error finding)``:
+    the annotations are the server's claims, so the line says whose."""
+    parts = [f"{counts['read_only']} the server marks read-only"]
+    if counts["marked_otherwise"]:
+        parts.append(f"{counts['marked_otherwise']} it marks otherwise")
+    parts.append(f"{counts['not_annotated']} not annotated")
+    if counts["errors"]:
+        parts.append(f"{counts['errors']} with an error finding")
+    tools = counts["tools"]
+    return f"{tools} tool{'' if tools == 1 else 's'} ({', '.join(parts)})"
 
 
 # --- the summary and gateway-status --------------------------------------------------------------

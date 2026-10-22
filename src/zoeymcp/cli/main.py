@@ -376,13 +376,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     review = commands.add_parser(
         "review",
-        help="review a gateway server's tools and print pins to commit (inside the gateway)",
+        help="review a gateway server's tools and print pins to commit (in either container)",
         description=(
             "Ask the running gateway to list a server's tools on a fresh connection and show, per "
             "tool, its state, pin and findings, a diff for drifted tools, and a YAML snippet for "
-            "the policy. With no server, one line per server and no upstream call. Exit 0 when "
-            "every included tool matches and nothing is marked, 1 when something needs you, 2 "
-            "when the review couldn't run."
+            "the policy. With no server, one line per server and no upstream call. Inside the "
+            "vault, --via vault asks the gateway through the vault's review jobs, and reads the "
+            "last finished review again unless --fresh. Exit 0 when every included tool matches "
+            "and nothing is marked, 1 when something needs you, 2 when the review couldn't run."
         ),
     )
     review.add_argument("server", nargs="?")
@@ -415,6 +416,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--clear",
         action="store_true",
         help="clear the server's drift marks, if every included tool matches its pin again",
+    )
+    review.add_argument(
+        "--via",
+        choices=("auto", "gateway", "vault"),
+        default="auto",
+        help=(
+            "where the review runs: the gateway's admin socket, or the vault's and its review "
+            "jobs (default: the gateway's socket when this container has it)"
+        ),
+    )
+    review.add_argument(
+        "--fresh",
+        action="store_true",
+        help="with --via vault: review again, not the last finished review at this policy",
     )
     review.add_argument("--format", choices=("text", "json"), default="text")
     gateway_status = commands.add_parser(
@@ -469,7 +484,8 @@ def _build_parser() -> argparse.ArgumentParser:
             metavar="PATH",
             help=(
                 f"the gateway's admin socket (default ${admin_client.GATEWAY_SOCKET_ENV} or "
-                f"{admin_client.GATEWAY_SOCKET}); with ledger --vault, the vault's"
+                f"{admin_client.GATEWAY_SOCKET}); with ledger --vault or review --via vault, "
+                "the vault's"
             ),
         )
 
@@ -1001,6 +1017,14 @@ def _cmd_sessions(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 
 
 def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    if review_view.pick_via(args.via, args.socket) == "vault":
+        return _review_through_vault(args, out, err)
+    if args.fresh:  # --via gateway, or auto on the gateway's socket
+        err.write(
+            "zoeymcp review: --fresh goes with --via vault; this review runs over the gateway's "
+            "socket, which always lists anew\n"
+        )
+        return review_view.EXIT_COULD_NOT_RUN
     socket = admin_client.gateway_socket_path(args.socket)
     if args.server is None:
         if args.tool or args.show or args.all or args.add or args.repin or args.clear:
@@ -1017,13 +1041,7 @@ def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         else:
             review_view.write_lines(lines, out)
         return code
-    choices = review_view.Choices(
-        tools=frozenset(args.tool),
-        show=frozenset(args.show),
-        show_all=args.all,
-        add=tuple(dict.fromkeys(args.add)),
-        repin=frozenset(args.repin),
-    )
+    choices = _review_choices(args)
     try:
         result = admin_client.gateway_review(socket, args.server, clear=args.clear)
     except admin_client.AdminUnavailable as exc:
@@ -1041,6 +1059,50 @@ def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         return review_view.EXIT_COULD_NOT_RUN
     _print_review(result, choices, args.format, out)
     return review_view.exit_code(result)
+
+
+def _review_through_vault(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    """``review <server> --via vault`` (M7 design F.5): the gateway's review, as a job the vault
+    queued and the gateway ran, printed as the gateway's own answer is."""
+    if args.server is None:
+        # The summary is the gateway's status, which only its own socket answers.
+        err.write("zoeymcp review: through the vault, name the server to review\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    if args.clear:
+        err.write("zoeymcp review: --clear runs in the gateway's container, with --via gateway\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    choices = _review_choices(args)
+    try:
+        job = review_view.vault_review(
+            admin_client.socket_path(args.socket), args.server, fresh=args.fresh
+        )
+    except admin_client.AdminUnavailable as exc:
+        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    except review_view.StillRunning:
+        err.write(
+            "zoeymcp review: the review is still running in the gateway; run this again in a "
+            "minute to read it\n"
+        )
+        return review_view.EXIT_COULD_NOT_RUN
+    result = job["report"]
+    try:
+        review_view.check_choices(result, choices)
+    except review_view.UsageError as exc:
+        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    _print_review(result, choices, args.format, out)
+    return review_view.exit_code(result)
+
+
+def _review_choices(args: argparse.Namespace) -> review_view.Choices:
+    return review_view.Choices(
+        tools=frozenset(args.tool),
+        show=frozenset(args.show),
+        show_all=args.all,
+        add=tuple(dict.fromkeys(args.add)),
+        repin=frozenset(args.repin),
+    )
 
 
 def _print_review(

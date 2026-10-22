@@ -18,6 +18,7 @@ from zoeymcp.vault.internal import (
     VIEW,
     Endpoint,
     Refusal,
+    _path,
     decide,
     find,
     jobs_query,
@@ -73,6 +74,14 @@ def test_the_table_is_g1s() -> None:
     ]
     assert LEDGER.body_cap == ledgerreport.MAX_BODY_BYTES
     assert REVIEW_JOBS.waiters == internal.REVIEW_WAITERS
+
+
+def test_path_is_under_the_gateways_version() -> None:
+    """Called directly, since the table is built at import, before a mutant is switched on."""
+    assert _path("review", "jobs") == NormalizedPath(
+        ("_zoeymcp", "gateway", "v1", "review", "jobs")
+    )
+    assert _path() == NormalizedPath(("_zoeymcp", "gateway", "v1"))
 
 
 def test_the_constants() -> None:

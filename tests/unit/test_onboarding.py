@@ -1400,9 +1400,9 @@ def test_the_second_runs_steps() -> None:
     found = Committed("c", "r", "s")
     review = {
         "do": "review",
-        "label": "Review its tools in the gateway's container",
-        "command": "zoeymcp review s",
-        "via": "exec_gateway",
+        "label": "Review its tools",
+        "command": "zoeymcp review s --via vault",
+        "via": "exec",
     }
     assert [step.answer() for step in committed_next(found, "none")] == [
         {"do": "connect", "label": "Sign in", "command": "zoeymcp login c", "via": "exec"},

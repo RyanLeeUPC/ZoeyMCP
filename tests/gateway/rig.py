@@ -37,7 +37,15 @@ from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import project_and_pin
 from zoeymcp.gateway.server import AdminApp
 from zoeymcp.gateway.upstream import UpstreamPool
-from zoeymcp.gateway.vaultlink import KeySource, parse_link, report_client, view_client
+from zoeymcp.gateway.vaultlink import (
+    KeySource,
+    parse_link,
+    report_client,
+    review_client,
+    view_client,
+)
+from zoeymcp.vault.admin import AdminApp as VaultAdmin
+from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet
@@ -163,6 +171,11 @@ class Deployed:
         raw = raw_policy(self.fake_url, **{**self.options, **options})
         return build_view(Policy.model_validate(raw))
 
+    @property
+    def vault_admin_url(self) -> str:
+        """The vault's admin socket app, served beside it (:class:`Reloadable`)."""
+        return self.vault_url + VAULT_ADMIN_PREFIX
+
     def reload(self, **options: Any) -> None:
         """Reload the running vault with ``raw_policy`` options changed, as SIGHUP would."""
         self.options = {**self.options, **options}
@@ -174,15 +187,28 @@ class Deployed:
 
 
 RELOAD_PATH = "/_test_reload"
+VAULT_ADMIN_PREFIX = "/_test_vault_admin"
 
 
 class Reloadable:
-    """The vault, plus a test-only path that swaps its policy on the vault's own loop."""
+    """The vault, plus a test-only path that swaps its policy on the vault's own loop and, with
+    ``admin``, the vault's admin socket app under :data:`VAULT_ADMIN_PREFIX`, on that loop too,
+    as the vault serves its socket."""
 
-    def __init__(self, app: VaultApp) -> None:
+    def __init__(self, app: VaultApp, admin: ASGIApp | None = None) -> None:
         self.app = app
+        self.admin = admin
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        if (
+            scope["type"] == "http"
+            and self.admin is not None
+            and path.startswith(VAULT_ADMIN_PREFIX)
+        ):
+            inner = {**scope, "path": path[len(VAULT_ADMIN_PREFIX) :], "root_path": ""}
+            await self.admin(inner, receive, send)
+            return
         if scope["type"] == "http" and scope["path"] == RELOAD_PATH:
             chunks = []
             while True:
@@ -227,7 +253,9 @@ def deployment_with(
             app = VaultApp(
                 policy, store, KEYS, client=httpx.AsyncClient(), environ={}, reports=reports
             )
-            served: ASGIApp = Reloadable(app)
+            setup = SetupCodes(tmp_path / "vault", KEYS.portal_key)
+            admin = VaultAdmin(store, KEYS, lambda: app.policy, setup, reviews=app)
+            served: ASGIApp = Reloadable(app, admin.app)
             with serve(wrap(served) if wrap is not None else served) as vault_url:
                 yield Deployed(
                     fake,
@@ -329,9 +357,12 @@ class Running:
 
 
 @contextmanager
-def gateway(deployed: Deployed, *, policy_wait: int = 1, report: bool = False) -> Iterator[Running]:
+def gateway(
+    deployed: Deployed, *, policy_wait: int = 1, report: bool = False, review: bool = False
+) -> Iterator[Running]:
     """The gateway app on a uvicorn thread, on the deployment's vault, once it is ready.
-    With ``report``, it reports its ledger to the vault, as ``zoeymcp gateway`` does."""
+    With ``report``, it reports its ledger to the vault, and with ``review`` it polls for the
+    vault's review jobs, as ``zoeymcp gateway`` does."""
     pool = UpstreamPool(
         parse_link(deployed.vault_url),
         KeySource(KEYS.gateway_key(1)),
@@ -341,7 +372,14 @@ def gateway(deployed: Deployed, *, policy_wait: int = 1, report: bool = False) -
     )
     link, keys = parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1))
     reporting = report_client(link, keys) if report else None
-    app = GatewayApp(pool, view_client(link, keys), policy_wait=policy_wait, report_http=reporting)
+    reviewing = review_client(link, keys) if review else None
+    app = GatewayApp(
+        pool,
+        view_client(link, keys),
+        policy_wait=policy_wait,
+        report_http=reporting,
+        review_http=reviewing,
+    )
     app.ledger, _ = Ledger.open_at(
         deployed.state, max_bytes=deployed.view.gateway.limits.ledger_max_bytes
     )

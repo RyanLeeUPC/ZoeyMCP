@@ -216,3 +216,5 @@ also_copy = ["deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.common.pinhash" = 95
 "zoeymcp.common.reviewreport" = 95
 "zoeymcp.common.suggest" = 95
+"zoeymcp.vault.internal" = 95
+"zoeymcp.vault.reviewjobs" = 95

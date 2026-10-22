@@ -9,7 +9,8 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -17,12 +18,14 @@ from typing import Any
 import httpx
 import pytest
 from anyio.from_thread import BlockingPortal, start_blocking_portal
+from mcp.types import Tool
 
 from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer
 from tests.unit import onboard_model
 from zoeymcp.cli import admin_client
 from zoeymcp.cli import main as main_module
 from zoeymcp.cli import onboard as onboard_cli
+from zoeymcp.cli import review as review_view
 from zoeymcp.cli.main import (
     EXIT_FINDINGS,
     EXIT_OK,
@@ -42,17 +45,24 @@ from zoeymcp.cli.main import (
     new_client_token,
 )
 from zoeymcp.common import egresslist, netguard
+from zoeymcp.common.adminsocket import SOCKET_ENV
 from zoeymcp.common.policy import Finding, Policy, parse_policy
 from zoeymcp.common.policy import change as policy_change
 from zoeymcp.common.policy import emit as policy_emit
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
+from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.common.policy.view import ViewRemoteServer, ViewToolkitServer, build_view
+from zoeymcp.common.reviewreport import fit
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.gateway import pins as gateway_pins
+from zoeymcp.gateway import review as gateway_review
 from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.netclient import RESOLVE_TIMEOUT
 from zoeymcp.vault.oauth import fetch
 from zoeymcp.vault.oauth.dcr import NOTES
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.onboarding import INLINE_SOURCE, allow_hosts, next_for, onboard_again
+from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
@@ -60,6 +70,7 @@ from .test_deploy import compose, inline_policy
 from .test_oauth_tokens import KEYS
 from .test_onboarding import staged as onboarding_staged
 from .test_policy_change import notes_change, review_change
+from .test_review import policy as review_server
 
 
 def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
@@ -3062,11 +3073,95 @@ def test_an_expiry_past_what_a_date_holds(onboard_admin: FakeAdmin) -> None:
 # --- the second run, through the real admin app (D.12, J1, J3) -----------------------------------
 
 
+def notes_tools() -> list[Tool]:
+    """What the notes server lists in these tests: one tool it marks read-only, one it marks
+    destructive, one it doesn't annotate, and one whose description fails the text rules."""
+
+    def tool(name: str, description: str = "Does a thing.", **annotations: bool) -> Tool:
+        wire: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "inputSchema": {"type": "object"},
+        }
+        if annotations:
+            wire["annotations"] = annotations
+        return Tool.model_validate(wire)
+
+    return [
+        tool("list_notes", readOnlyHint=True),
+        tool("delete_note", destructiveHint=True),
+        tool("export_all"),
+        tool("bad_tool", "Clears \x1b[2J the screen."),
+    ]
+
+
+def notes_report(served: ViewRemoteServer, limits: GatewayLimits) -> dict[str, Any]:
+    """The gateway's review of :func:`notes_tools` under ``served``, fitted and through JSON, as
+    the review poller posts it."""
+    tools = notes_tools()
+    evaluation = gateway_pins.evaluate(tools, served, frozenset(), limits)
+    answer = gateway_review.report(
+        "notes",
+        served,
+        tools,
+        evaluation,
+        marks=frozenset(),
+        defs=lambda pin: None,
+        limits=limits,
+        era="modern",
+        protocol_version="2026-07-28",
+        server_info=None,
+        instructions=None,
+    )
+    fitted: dict[str, Any] = json.loads(json.dumps(fit(answer, limits)))
+    return fitted
+
+
+class Reviews:
+    """The vault's review jobs as the admin socket reaches them, on a real job table, with the
+    gateway's side done at once: a job queued is claimed at the policy's view and answered with
+    the gateway's review of :func:`notes_tools`, read as the vault reads a report, or with
+    ``error``, the gateway's error. ``queued`` lists each server a new job was queued for."""
+
+    def __init__(self, policy: Callable[[], Policy]) -> None:
+        self.policy = policy
+        self.jobs = JobTable(time.monotonic)
+        self.jobs.poll_began()
+        self.jobs.poll_ended()
+        self.queued: list[str] = []
+        self.error: dict[str, Any] | None = None
+
+    async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job:
+        view = build_view(self.policy())
+        servers: dict[str, ServerKind] = {
+            name: entry.kind
+            for name, entry in view.gateway.servers.items()
+            if isinstance(entry, ViewRemoteServer | ViewToolkitServer)
+        }
+        job = self.jobs.queue(server, owner, view.digest, servers, fresh=fresh)
+        assert isinstance(job, Job)
+        if job.state == "queued":
+            self.queued.append(server)
+            [claimed] = self.jobs.claim(view.digest)
+            body: dict[str, Any] = {"v": 1, "job": claimed.id}
+            if self.error is not None:
+                body["error"] = self.error
+            else:
+                served = view.gateway.servers[server]
+                assert isinstance(served, ViewRemoteServer)
+                body |= {"server": server, "report": notes_report(served, view.gateway.limits)}
+            self.jobs.post(read_result(body, view.gateway.limits))
+        return job
+
+    async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
+        return self.jobs.get(job_id, owner)
+
+
 class Vault(httpx.BaseTransport):
     """The vault's admin app, reached as the CLI reaches its socket: the onboarding service on
-    onboard_model's in-process server and its authorization server's metadata, and a token
-    manager and login whose token endpoint is the fake authorization server, all on the
-    portal's one event loop."""
+    onboard_model's in-process server and its authorization server's metadata, a token manager
+    and login whose token endpoint is the fake authorization server, and review jobs a gateway
+    answers at once (:class:`Reviews`), all on the portal's one event loop."""
 
     def __init__(self, tmp_path: Path, portal: BlockingPortal) -> None:
         self.portal = portal
@@ -3087,8 +3182,15 @@ class Vault(httpx.BaseTransport):
         self.tokens.configure(self.policy, {})
         onboard = onboard_model.onboard_service(self.store, self.tokens, lambda: self.policy)
         self.setup = SetupCodes(tmp_path, KEYS.portal_key)
+        self.reviews = Reviews(lambda: self.policy)
         self.admin = AdminApp(
-            self.store, KEYS, lambda: self.policy, self.setup, self.tokens, onboard=onboard
+            self.store,
+            KEYS,
+            lambda: self.policy,
+            self.setup,
+            self.tokens,
+            onboard=onboard,
+            reviews=self.reviews,
         )
 
     def set_policy(self, policy: Policy) -> None:
@@ -3104,7 +3206,13 @@ class Vault(httpx.BaseTransport):
             self.store, self.tokens, lambda: self.policy, register=self.register
         )
         self.admin = AdminApp(
-            self.store, KEYS, lambda: self.policy, self.setup, self.tokens, onboard=onboard
+            self.store,
+            KEYS,
+            lambda: self.policy,
+            self.setup,
+            self.tokens,
+            onboard=onboard,
+            reviews=self.reviews,
         )
 
     async def register(self, request: httpx.Request) -> httpx.Response:
@@ -3224,10 +3332,12 @@ def test_j1_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
         f"({onboard_model.SERVER_URL}).\nConnecting:\n"
     )
     assert err.endswith(
-        f"Next:\n  Review its tools in the gateway's container:\n"
-        f"    {HARDENED} exec gateway zoeymcp review notes\n"
+        "Reviewing through the gateway: 4 tools (1 the server marks read-only, 1 it marks "
+        "otherwise, 2 not annotated, 1 with an error finding).\n"
+        f"Next:\n  Review its tools:\n    {HARDENED} exec vault zoeymcp review notes --via vault\n"
     )
     assert vault.store.names() == ["notes-refresh"]
+    assert vault.reviews.queued == ["notes"]
     # Signed in, the run again compares and doesn't sign in over the token it holds (OPS-13).
     code, out, err, browser = onboarded(vault, J1)
     assert (code, out, browser.visits) == (EXIT_OK, "", 0)
@@ -3380,3 +3490,191 @@ def test_adopting_a_grant_with_no_connect(vault: Vault) -> None:
     assert (code, out, browser.visits) == (EXIT_OK, "", 0)
     assert "notes already holds a refresh token (stored)" in err
     assert vault.auth.seen == []
+
+
+# --- the second run's review, and review --via vault (D.12 step 4, F.5; step 12b2) ---------------
+
+
+def test_login_then_two_reviews_read_one_report(vault: Vault) -> None:
+    """OPS-11: the second run queues the review and prints its counts; review --via vault then
+    reads that same report, twice, as --choose and --choices will, until --fresh asks again."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    code, _, err, _ = onboarded(vault, J1)
+    assert code == EXIT_OK, err
+    assert "Reviewing through the gateway: 4 tools (" in err
+    assert vault.reviews.queued == ["notes"]
+    shown = []
+    for _ in range(2):
+        code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+        assert (code, err) == (EXIT_OK, "")
+        shown.append(out)
+    assert shown[0] == shown[1]
+    assert vault.reviews.queued == ["notes"]
+    lines = shown[0].splitlines()
+    assert lines[0].startswith("server notes  (remote, vault path ")
+    assert any(
+        line.startswith("  bad_tool: error /description: control character") for line in lines
+    )
+    assert "# YAML to commit (declarative mode). Review the changes above first." in lines
+    code, _, _ = cli(["review", "notes", "--via", "vault", "--fresh", "--socket", "x"])
+    assert code == EXIT_OK
+    assert vault.reviews.queued == ["notes", "notes"]
+
+
+def test_the_second_run_as_json_carries_the_counts(vault: Vault) -> None:
+    """Run again once signed in, the second run hands back the review the first one queued."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    assert onboarded(vault, J1)[0] == EXIT_OK
+    code, out, err, _ = onboarded(vault, [*J1, "--format", "json"])
+    assert code == EXIT_OK, err
+    review = json.loads(out)["review"]
+    assert (review["state"], review["reused"]) == ("done", True)
+    assert vault.reviews.queued == ["notes"]
+    assert review["counts"] == {
+        "tools": 4,
+        "read_only": 1,
+        "marked_otherwise": 1,
+        "not_annotated": 2,
+        "errors": 1,
+    }
+
+
+def test_a_review_that_fails_says_so_after_the_sign_in(vault: Vault) -> None:
+    """The gateway's error ends the job failed: the run signed in, says the review didn't run,
+    still prints what is next, and exits 1. The gateway's message stays in its own log."""
+    vault.reviews.error = {"status": 502, "code": "upstream", "message": "the listing failed"}
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    code, out, err, browser = onboarded(vault, J1)
+    assert (code, browser.visits) == (EXIT_FINDINGS, 1), err
+    assert "Stored the refresh token for notes as notes-refresh.\n" in out
+    assert "The review didn't run: The gateway couldn't review the server (upstream)." in err
+    assert err.endswith(f"    {HARDENED} exec vault zoeymcp review notes --via vault\n")
+    assert "the listing failed" not in err
+
+
+def test_no_connect_before_a_token_queues_no_review(vault: Vault) -> None:
+    """Nothing could be reviewed without a token: the run names the sign-in and the review."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    code, _, err, _ = onboarded(vault, [*J1, "--no-connect"])
+    assert code == EXIT_OK, err
+    assert vault.reviews.queued == []
+    assert "Reviewing" not in err
+    assert err.endswith(f"    {HARDENED} exec vault zoeymcp review notes --via vault\n")
+
+
+def job_answer(state: str, **more: Any) -> dict[str, Any]:
+    return {"job": "job-0001", "server": "notes", "state": state, **more}
+
+
+def vault_report() -> dict[str, Any]:
+    """A report as the socket answers it, for a server that includes nothing yet."""
+    return notes_report(review_server([], {}), GatewayLimits())
+
+
+def test_review_via_vault_queues_then_reads_the_job(admin: FakeAdmin) -> None:
+    report = vault_report()
+    admin.answers[("POST", "/review/notes")] = (200, job_answer("queued", reused=False))
+    admin.answers[("GET", "/review/jobs/job-0001?wait=30")] = (
+        200,
+        job_answer("done", report=report),
+    )
+    code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert admin.requests == [
+        ("POST", "/review/notes", {"fresh": False}),
+        ("GET", "/review/jobs/job-0001?wait=30", None),
+    ]
+    # Queueing may wait out the vault's start grace; a read waits up to 30 s.
+    assert admin.timeouts == [60.0, 40.0]
+    assert out == "".join(
+        f"{review_view.untrusted(line, 1_000_000)}\n"
+        for line in review_view.render(report, review_view.Choices())
+    )
+    cli(["review", "notes", "--via", "vault", "--fresh", "--socket", "x"])
+    assert admin.requests[-2] == ("POST", "/review/notes", {"fresh": True})
+    code, out, _ = cli(["review", "notes", "--via", "vault", "--format", "json", "--socket", "x"])
+    assert json.loads(out)["tools"] == report["tools"]
+
+
+def test_a_reused_review_is_read_from_the_queue_answer(admin: FakeAdmin) -> None:
+    admin.answers[("POST", "/review/notes")] = (
+        200,
+        job_answer("done", reused=True, report=vault_report()),
+    )
+    code, _, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert [path for _, path, _ in admin.requests] == ["/review/notes"]
+
+
+def test_a_failed_review_job_couldnt_run(admin: FakeAdmin) -> None:
+    admin.answers[("POST", "/review/notes")] = (200, job_answer("queued", reused=False))
+    refused = job_answer(
+        "failed",
+        error="The gateway couldn't review the server (upstream\x1b[2J).",
+        reason="review_failed",
+    )
+    admin.answers[("GET", "/review/jobs/job-0001?wait=30")] = (502, refused)
+    code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+    assert (code, out) == (2, "")
+    assert err == "zoeymcp review: The gateway couldn't review the server (upstream[U+001B][2J).\n"
+
+
+def test_a_review_job_still_running_when_the_wait_ends(
+    admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(review_view, "JOB_WAIT_MAX", 0)
+    admin.answers[("POST", "/review/notes")] = (200, job_answer("queued", reused=False))
+    code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+    assert (code, out) == (2, "")
+    assert "the review is still running in the gateway" in err
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["review", "--via", "vault"], "through the vault, name the server to review"),
+        (["review", "notes", "--via", "vault", "--clear"], "--clear runs in the gateway's"),
+        (["review", "notes", "--via", "gateway", "--fresh"], "--fresh goes with --via vault"),
+        (["review", "notes", "--fresh"], "--fresh goes with --via vault"),  # auto, on the gateway's
+    ],
+)
+def test_review_via_usage_errors(admin: FakeAdmin, argv: list[str], message: str) -> None:
+    code, out, err = cli([*argv, "--socket", "x"])
+    assert (code, out) == (2, "")
+    assert message in err
+    assert admin.requests == []
+
+
+def test_auto_takes_the_gateways_socket_when_the_container_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(admin_client.GATEWAY_SOCKET_ENV, raising=False)
+    monkeypatch.delenv(SOCKET_ENV, raising=False)
+    gateway, vault = admin_client.GATEWAY_SOCKET, admin_client.socket_path(None)
+    for present, socket, picked in (
+        ({gateway, vault}, None, "gateway"),  # the standard tier's one container
+        ({gateway}, None, "gateway"),
+        ({vault}, None, "vault"),
+        (set(), None, "gateway"),  # whose missing socket the error then names
+        ({vault}, "/run/elsewhere.sock", "gateway"),  # a --socket is the gateway's
+    ):
+        assert review_view.pick_via("auto", socket, present.__contains__) == picked
+    assert review_view.pick_via("vault", None, lambda path: False) == "vault"
+    assert review_view.pick_via("gateway", None, lambda path: True) == "gateway"
+
+
+def test_the_counts_line() -> None:
+    counts = {"tools": 96, "read_only": 64, "marked_otherwise": 0, "not_annotated": 32}
+    assert review_view.counts_line({**counts, "errors": 1}) == (
+        "96 tools (64 the server marks read-only, 32 not annotated, 1 with an error finding)"
+    )
+    one = {"tools": 1, "read_only": 0, "marked_otherwise": 1, "not_annotated": 0, "errors": 0}
+    assert review_view.counts_line(one) == (
+        "1 tool (0 the server marks read-only, 1 it marks otherwise, 0 not annotated)"
+    )
+    missing: dict[str, Any] = {"name": "x", "state": "missing", "definition": None, "findings": []}
+    assert review_view.report_counts({"tools": [missing]})["tools"] == 0

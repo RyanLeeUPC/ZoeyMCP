@@ -11,8 +11,10 @@ M.7). The vault does the work over its admin socket; this module asks, prompts a
   ``--plan-only`` stops after the plan, which the next run with the same URL and names resumes.
 - **The second run** (D.12): for a URL the running policy has onboarded, the vault compares what
   it finds with what is committed, and the CLI signs in with ``login``'s own paste flow, unless
-  ``--no-connect`` or the credential already holds a refresh token (OPS-13), then prints what is
-  next: until the vault queues reviews, ``review`` in the gateway's container.
+  ``--no-connect`` or the credential already holds a refresh token (OPS-13). Then, with a token
+  to review with, it queues the server's review through the vault's job path (F.2), waits up to
+  :data:`REPORT_WAIT` for the gateway's report, prints its counts, and prints what is next:
+  ``review <server> --via vault``, which reads that same report (OPS-11).
 - **Commands** in a ``next`` list are the vault's argument lists, shell-quoted (TI-14), printed
   after the prefix ``ZOEYMCP_COMPOSE_CMD`` names and the service ``ZOEYMCP_EXEC_SERVICE`` (or,
   for ``review``, ``ZOEYMCP_REVIEW_SERVICE``) names, as the entry's ``via`` says (OPS-17). A
@@ -39,7 +41,7 @@ from ..common.policy.emit import INDENT_MAX
 from ..vault.oauth import dcr
 from ..vault.onboarding import ONBOARDING_TTL, fragment_file
 from . import admin_client
-from .review import untrusted, write_json
+from .review import StillRunning, counts_line, report_counts, untrusted, vault_review, write_json
 
 EXIT_OK = 0
 EXIT_FINDINGS = 1
@@ -52,6 +54,8 @@ REVIEW_SERVICE_ENV: Final = "ZOEYMCP_REVIEW_SERVICE"
 DEFAULT_COMPOSE_CMD: Final = "docker compose -f deploy/compose.hardened.yaml"
 DEFAULT_EXEC_SERVICE: Final = "vault"
 DEFAULT_REVIEW_SERVICE: Final = "gateway"
+# How long the second run waits for the review it queued (M.6).
+REPORT_WAIT: Final = 120
 # The onboarding's flags, which a login of a named credential doesn't take: (dest, flag).
 ONBOARD_FLAGS: Final = (
     ("name", "--name"),
@@ -429,7 +433,9 @@ class _Run:
                 f"doesn't sign in again; zoeymcp login {untrusted(credential)} does."
             )
         elif self.args.no_connect:
-            self.say("Not signing in (--no-connect).")
+            # Nothing to review with until a sign-in or a seed: the review would only fail.
+            self.say("Not signing in (--no-connect).", *next_lines(steps, self.prefix))
+            return self.finish(EXIT_OK)
         else:
             self.say("Connecting:")
             code = self.connect(credential, self.err if self.json else self.out)
@@ -437,8 +443,35 @@ class _Run:
             if code != EXIT_OK:
                 return self.finish(code)
             steps = [step for step in steps if step not in signing_in]
+        code = self.review(server)
         self.say(*next_lines(steps, self.prefix))
-        return self.finish(EXIT_OK)
+        return self.finish(code)
+
+    def review(self, server: str) -> int:
+        """D.12 step 4: queue the server's review through the vault, wait up to
+        :data:`REPORT_WAIT` for the gateway's report, and say what it found."""
+        try:
+            job = vault_review(self.socket, server, fresh=False, wait=REPORT_WAIT)
+        except admin_client.AdminUnavailable as exc:
+            self.answers["review"] = dict(exc.data) or {"error": str(exc)}
+            self.say(f"The review didn't run: {untrusted(exc)}")
+            return EXIT_FINDINGS
+        except StillRunning as running:
+            self.answers["review"] = running.job
+            self.say(
+                f"The review is still running in the gateway after {REPORT_WAIT} s; the review "
+                "command below reads it once it is done."
+            )
+            return EXIT_FINDINGS
+        counts = report_counts(job["report"])
+        self.answers["review"] = {
+            "job": job["job"],
+            "state": job["state"],
+            "reused": job.get("reused", False),
+            "counts": counts,
+        }
+        self.say(f"Reviewing through the gateway: {counts_line(counts)}.")
+        return EXIT_OK
 
     # --- refusals ------------------------------------------------------------------------------
 

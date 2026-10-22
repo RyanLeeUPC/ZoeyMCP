@@ -5,7 +5,8 @@ It refuses to start with a master key or ``ZOEYMCP_CONFIG`` in its environment (
 ``unix:`` a key is ignored. ``SIGHUP`` (or ``HUP`` on the control pipe) fetches the view now
 and re-reads the key file; ``SIGTERM`` (or ``TERM``, or the pipe's end) stops, giving calls in
 flight 10 seconds. The admin socket answers ``GET /status``, ``POST /review/<server>`` and
-``POST /review/<server>/clear`` (:mod:`.review`).
+``POST /review/<server>/clear`` (:mod:`.review`); the same reviews run for the vault's review
+jobs, one at a time with the socket's (:mod:`.reviewpoll`, M7 design F.3).
 
 The SDK's own loggers are silenced: they log session ids and request headers (G20).
 """
@@ -48,6 +49,7 @@ from .vaultlink import (
     environ_has_no_secrets,
     parse_link,
     report_client,
+    review_client,
     running_as_root,
     view_client,
 )
@@ -139,7 +141,11 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
     pool = UpstreamPool(link, keys, marks, DefinitionStore(options.state))
     toolkits = Toolkits(link, keys, marks, allow_writable=options.allow_writable_toolkits)
     app = GatewayApp(
-        pool, view_client(link, keys), toolkits=toolkits, report_http=report_client(link, keys)
+        pool,
+        view_client(link, keys),
+        toolkits=toolkits,
+        report_http=report_client(link, keys),
+        review_http=review_client(link, keys),
     )
     try:
         # The view's limit applies once the first view arrives.
@@ -217,12 +223,12 @@ def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> di
 
 
 class AdminApp:
-    """The gateway's admin socket: ``GET /status``, ``review`` (one at a time), and the
-    ledger: ``GET /ledger``, ``POST /ledger/verify`` and ``POST /ledger/check``."""
+    """The gateway's admin socket: ``GET /status``, ``review`` (one at a time, on the gateway's
+    ``reviewing`` lock, which the review poller shares), and the ledger: ``GET /ledger``,
+    ``POST /ledger/verify`` and ``POST /ledger/check``."""
 
     def __init__(self, app: GatewayApp) -> None:
         self.app = app
-        self.reviewing = anyio.Lock()
 
     async def answer(
         self, method: str, path: str, query: str = "", body: bytes = b""
@@ -236,7 +242,7 @@ class AdminApp:
             return 404, {"error": "not found"}
         if method != "POST":
             return 405, {"error": "use POST"}
-        async with self.reviewing:
+        async with self.app.reviewing:
             try:
                 return 200, await review.review(
                     self.app, found.group(1), clear=found.group(2) is not None

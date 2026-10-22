@@ -375,7 +375,8 @@ J1 = ["login", "--mcp", SERVER_URL, "--name", "notes"]
 def test_commit_recreates_the_vault(tmp_path: Path, ca: ProviderCA) -> None:
     """FM-3, J1 through the CLI: fragment 1 from a given public client, the commit recreating
     the vault, and the second run, which finds the credential committed, signs in with nothing
-    lost (F-13) and names the review next."""
+    lost (F-13), queues the review, which has no gateway to run it here (so it is refused once
+    the vault's start grace ends, and the run exits 1), and names ``review --via vault`` next."""
     with deployed(tmp_path, ca, auth="none") as vault:
         vault.start()
         code, fragment, err = vault.cli([*J1, "--client-id", CLIENT_ID, "--yes"])
@@ -384,17 +385,18 @@ def test_commit_recreates_the_vault(tmp_path: Path, ca: ProviderCA) -> None:
         vault.commit(fragment)
         code, out, err = vault.cli(J1, Browser(vault))
         vault.stop()
-    assert code == 0, err
+    assert code == 1, err
     assert "Stored the refresh token for notes as notes-refresh.\n" in out
     assert "notes is in the policy and matches what the server publishes" in err
-    assert err.endswith("exec gateway zoeymcp review notes\n")
+    assert "The review didn't run:" in err
+    assert err.endswith("exec vault zoeymcp review notes --via vault\n")
     assert vault.store().names() == ["notes-refresh"]
 
 
 def test_restart_during_login(tmp_path: Path, ca: ProviderCA) -> None:
     """FM-4, J3 through the CLI: the vault killed while the operator is at the provider loses
     the sign-in (M2), and the client secret stored at register stays; the same command then
-    signs in with it."""
+    signs in with it, and queues the review, which has no gateway to run it here."""
     with deployed(tmp_path, ca, client_secret=SECRET) as vault:
         vault.start()
         argv = [*J1, "--issuer", ISSUER, "--client-id", CLIENT_ID, "--client-secret", "--yes"]
@@ -411,7 +413,8 @@ def test_restart_during_login(tmp_path: Path, ca: ProviderCA) -> None:
         assert vault.store().names() == [SECRET_NAME]
         again, out, err = vault.cli(J1, Browser(vault))
         vault.stop()
-    assert again == 0, err
+    assert again == 1, err
+    assert "The review didn't run:" in err
     assert "Stored the refresh token for notes as notes-refresh.\n" in out
     held = vault.store()
     assert held.names() == ["notes-client-secret", "notes-refresh"]

@@ -27,6 +27,9 @@ DEFAULT_TIMEOUT: Final = 10.0
 # A review lists the server on a fresh connection: up to the largest list_timeout (300 s), the
 # gateway's own wait beyond it, and closing the connection.
 REVIEW_TIMEOUT: Final = 300 + 15 + 15
+# Queueing a review through the vault may wait out its start grace (REVIEW_START_GRACE, 45 s)
+# for the gateway's first poll.
+REVIEW_QUEUE_TIMEOUT: Final = 45 + 15
 # A login may wait for the code exchange, then for a refresh of the slot already in flight
 # (commit waits for it before storing), plus time to answer.
 LOGIN_TIMEOUT: Final = EXCHANGE_DEADLINE + REFRESH_BUDGET + 15
@@ -325,6 +328,25 @@ def gateway_review(
     return _request(
         socket, "POST", path, transport=transport, timeout=REVIEW_TIMEOUT, role="gateway"
     )
+
+
+def review_queue(
+    socket: str, server: str, *, fresh: bool, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Queue a review of ``server`` for the gateway's poll (M7 design M.1): ``{job, server,
+    state, reused}``, the CLI's finished one at the current view handed back unless ``fresh``. A
+    queue call may wait for the gateway's first poll after the vault started."""
+    path = f"/review/{quote(server, safe='')}"
+    return _request(socket, "POST", path, {"fresh": fresh}, transport, REVIEW_QUEUE_TIMEOUT)
+
+
+def review_job(
+    socket: str, job: str, *, wait: int, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """The job once it is done or failed, or after ``wait`` seconds (at most 30): its state, and
+    its report once done. A failed job is :class:`AdminUnavailable` with its refusal."""
+    path = f"/review/jobs/{quote(job, safe='')}?wait={wait}"
+    return _request(socket, "GET", path, transport=transport, timeout=wait + DEFAULT_TIMEOUT)
 
 
 LEDGER_PAGE: Final = 10_000

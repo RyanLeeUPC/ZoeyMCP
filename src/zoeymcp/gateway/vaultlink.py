@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx2
 
@@ -469,6 +469,85 @@ def report_client(
         max_redirects=0,
         trust_env=False,
         timeout=REPORT_TIMEOUT,
+        event_hooks=_hooks(link, keys),
+    )
+
+
+REVIEW_JOBS_PATH = "/_zoeymcp/gateway/v1/review/jobs"
+REVIEW_REPORT_PATH = "/_zoeymcp/gateway/v1/report/review"
+REVIEW_QUERY_KEYS = frozenset({"wait", "view"})
+REVIEW_MAX_ANSWER_BYTES = 4096  # a list of jobs, a job's state, or a refusal (M7 design F.3)
+
+
+def _jobs_query(query: bytes) -> bool:
+    """A jobs poll's query: ``wait`` and ``view``, each at most once, and nothing else."""
+    try:
+        params = parse_qsl(query.decode("ascii"), keep_blank_values=True, strict_parsing=True)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    names = [name for name, _ in params]
+    return len(set(names)) == len(names) and set(names) <= REVIEW_QUERY_KEYS
+
+
+class _ReviewOnly(httpx2.AsyncBaseTransport):
+    """The review poller's transport (M7 design F.3): a GET of exactly the jobs path, with only
+    the ``wait`` and ``view`` query keys, or a POST of exactly the review report path, on the
+    link's scheme, host and port, and nothing else. An answer is cut off past
+    :data:`REVIEW_MAX_ANSWER_BYTES`."""
+
+    def __init__(self, inner: httpx2.AsyncBaseTransport, link: Link) -> None:
+        self._inner = inner
+        self._link = link
+
+    def _allowed(self, request: httpx2.Request) -> bool:
+        url = request.url
+        if (url.scheme, url.host, url.port) != (
+            self._link.scheme,
+            self._link.host,
+            self._link.port,
+        ):
+            return False
+        raw_path, question, query = url.raw_path.partition(b"?")
+        if request.method == "GET" and raw_path == REVIEW_JOBS_PATH.encode():
+            return not question or (bool(query) and _jobs_query(query))
+        return request.method == "POST" and url.raw_path == REVIEW_REPORT_PATH.encode()
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        if not self._allowed(request):
+            raise UpstreamBlocked("the review poller only reaches the review job path")
+        response = await self._inner.handle_async_request(request)
+        if is_redirect(response.status_code):
+            await response.aclose()
+            raise UpstreamRedirect(str(response.status_code))
+        return httpx2.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=_Capped(response.stream, REVIEW_MAX_ANSWER_BYTES),  # type: ignore[arg-type]
+            extensions=response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+# A poll waits up to 25 s for a job; the vault reads a report within 30 s, then checks every pin
+# in it before it answers, which for a large report takes a while.
+REVIEW_TIMEOUT = httpx2.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+
+
+def review_client(
+    link: Link, keys: KeySource | None, inner: httpx2.AsyncBaseTransport | None = None
+) -> httpx2.AsyncClient:
+    """The HTTP client that asks the vault for review jobs and posts their results (M7 design
+    F.3), built like :func:`report_client`."""
+    return httpx2.AsyncClient(
+        transport=_ReviewOnly(inner if inner is not None else _inner_transport(link), link),
+        base_url=link.base_url,
+        follow_redirects=False,
+        max_redirects=0,
+        trust_env=False,
+        timeout=REVIEW_TIMEOUT,
         event_hooks=_hooks(link, keys),
     )
 

@@ -62,6 +62,7 @@ from .ledger import Ledger
 from .notify import Notifier
 from .policyclient import PolicyClient, Snapshot
 from .reporter import Reporter
+from .reviewpoll import ReviewPoller
 from .toolkits import Toolkits
 from .toolkitsource import ToolkitSource, ToolkitUnavailable
 from .toolsource import RemoteSource, ServedServer, ToolSource
@@ -248,8 +249,9 @@ MAX_ANSWER_BYTES = 64 * 1024  # an agent's answer to a prompt (M4 design D.3)
 
 class GatewayApp:
     """The gateway as one ASGI app. Its lifespan runs the pool, the notifier, the policy client,
-    the ledger's reporter (with ``report_http``) and, once the first view has arrived, the SDK's
-    session manager."""
+    the ledger's reporter (with ``report_http``), the review poller (with ``review_http``, M7
+    design F.3) and, once the first view has arrived, the SDK's session manager. At shutdown it
+    closes every client it holds on the vault link (D-166)."""
 
     def __init__(
         self,
@@ -261,11 +263,18 @@ class GatewayApp:
         policy_wait: int | None = None,
         toolkits: Toolkits | None = None,
         report_http: httpx2.AsyncClient | None = None,
+        review_http: httpx2.AsyncClient | None = None,
     ) -> None:
         self.pool = pool
+        self.policy_http = policy_http
         # The ledger's reporter, made in the lifespan once the ledger is open (M5 design J.3).
         self.report_http = report_http
         self.reporter: Reporter | None = None
+        # The review jobs the vault queues (M7 design F.3), polled for in the lifespan.
+        self.review_http = review_http
+        self.review_poller: ReviewPoller | None = None
+        # One review at a time, the admin socket's or a review job's (GR-12).
+        self.reviewing = anyio.Lock()
         self.toolkits = toolkits or Toolkits(pool.link, pool.keys, pool.marks)
         self.notifier = notifier if notifier is not None else Notifier()
         self.clock = clock
@@ -458,6 +467,9 @@ class GatewayApp:
                         # Apart from approvals: nothing they do waits for it (M5 design J.3).
                         self.reporter = Reporter(self.report_http, self.ledger)
                         group.start_soon(self.reporter.run)
+                if self.review_http is not None:
+                    self.review_poller = ReviewPoller(self, self.review_http)
+                    group.start_soon(self._run_reviews, first_view, self.review_poller)
                 # Committed calls run in this group, out of reach of uvicorn's request cancels.
                 self.committed.attach(group)
                 group.start_soon(self.approvals.sweep_forever)
@@ -479,7 +491,21 @@ class GatewayApp:
         finally:
             self.committed.attach(None)
             self.manager = None
+            with anyio.CancelScope(shield=True):
+                await self._close_vault_clients()
         await send({"type": "lifespan.shutdown.complete"})
+
+    async def _run_reviews(self, first_view: anyio.Event, poller: ReviewPoller) -> None:
+        # A poll names the digest of the view the policy client holds: there is none before.
+        await first_view.wait()
+        await poller.run()
+
+    async def _close_vault_clients(self) -> None:
+        """The view's, the reporter's and the review poller's clients (D-166); the pool and
+        the toolkits close their own."""
+        for http in (self.policy_http, self.report_http, self.review_http):
+            if http is not None:
+                await http.aclose()
 
     # --- ASGI ----------------------------------------------------------------------------------
 

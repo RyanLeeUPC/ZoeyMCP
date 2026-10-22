@@ -1734,9 +1734,9 @@ async def test_the_second_run_compares_and_stores_nothing(
     assert ["Token endpoint", f"{ISSUER}/token"] in again["rows"]
     review = {
         "do": "review",
-        "label": "Review its tools in the gateway's container",
-        "command": "zoeymcp review notes",
-        "via": "exec_gateway",
+        "label": "Review its tools",
+        "command": "zoeymcp review notes --via vault",
+        "via": "exec",
     }
     assert again["next"] == [
         {"do": "connect", "label": "Sign in", "command": "zoeymcp login notes", "via": "exec"},

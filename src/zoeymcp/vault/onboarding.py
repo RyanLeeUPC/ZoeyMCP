@@ -107,7 +107,7 @@ Do = Literal[
     "onboard_again",
 ]
 # Where the CLI runs a command (M.7): ``exec`` in the running service; ``exec_gateway`` in the
-# gateway's (``review``, until the vault queues reviews itself); ``run``, a one-off container that
+# gateway's (a review over its admin socket); ``run``, a one-off container that
 # reads the inline policy from the service's environment; ``run_mount``, the same with the working
 # directory mounted at /w, for a fragment file; ``up``, the service recreated. None: as written,
 # where the policy file is.
@@ -857,17 +857,17 @@ def remove_first(served: Served) -> NextStep:
 
 def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
     """The second run's steps after its comparison (D.12 steps 3 and 4): sign in, unless the
-    credential holds a refresh token, then review the server's tools in the gateway's container
-    (the vault queues the review itself later in M7)."""
+    credential holds a refresh token, then review the server's tools through the vault's job
+    path, which reads the review the second run queued once it is done (OPS-11)."""
     steps = []
     if held == "none":
         steps.append(NextStep("connect", "Sign in", ("zoeymcp", "login", found.credential), "exec"))
     steps.append(
         NextStep(
             "review",
-            "Review its tools in the gateway's container",
-            ("zoeymcp", "review", found.server),
-            "exec_gateway",
+            "Review its tools",
+            ("zoeymcp", "review", found.server, "--via", "vault"),
+            "exec",
         )
     )
     return tuple(steps)
