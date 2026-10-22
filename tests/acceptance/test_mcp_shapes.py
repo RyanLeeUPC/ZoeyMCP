@@ -341,7 +341,7 @@ async def test_s12_hostile_definitions_and_results_arrive_visible(
     assert ZERO_WIDTH not in dumped(result)
     assert "[U+200B]" in dumped(result)
     assert code == 0  # the included tools match; the hostile ones stay unincluded
-    assert "(error findings: not pinnable)" in out
+    assert "# can't be included, error finding: " in out
 
 
 @pytest.mark.parametrize(
