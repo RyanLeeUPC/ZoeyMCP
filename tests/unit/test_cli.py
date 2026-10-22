@@ -3311,6 +3311,11 @@ def onboarded(vault: Vault, argv: list[str], text: str = "") -> tuple[int, str, 
 
 
 J1 = ["login", "--mcp", onboard_model.SERVER_URL, "--name", "notes", "--socket", "x"]
+# The second run's last step (J1): fragment 2 from the edited choices file.
+SECOND_CHOICES = (
+    f"{HARDENED} exec -T vault zoeymcp review notes --via vault --choices - < notes.choices > "
+    "onboard-notes-2.yaml"
+)
 
 
 def test_j1_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
@@ -3334,7 +3339,10 @@ def test_j1_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
     assert err.endswith(
         "Reviewing through the gateway: 4 tools (1 the server marks read-only, 1 it marks "
         "otherwise, 2 not annotated, 1 with an error finding).\n"
-        f"Next:\n  Review its tools:\n    {HARDENED} exec vault zoeymcp review notes --via vault\n"
+        f"Next:\n  Choose its tools:\n    {HARDENED} exec vault zoeymcp review notes --via vault "
+        "--choose --suggest > notes.choices\n"
+        "  Edit notes.choices (skip, allow or approve on each line), then make fragment 2:\n"
+        f"    {SECOND_CHOICES}\n"
     )
     assert vault.store.names() == ["notes-refresh"]
     assert vault.reviews.queued == ["notes"]
@@ -3522,6 +3530,56 @@ def test_login_then_two_reviews_read_one_report(vault: Vault) -> None:
     assert vault.reviews.queued == ["notes", "notes"]
 
 
+def test_j1_choose_then_choices_makes_a_fragment_check_with_accepts(
+    vault: Vault, tmp_path: Path
+) -> None:
+    """J1's choices-file commands (F.5): after the second run, --choose --suggest writes the file
+    from the report it queued, the operator edits it, and --choices - reads it back into
+    fragment 2, which check --with merges into the committed policy with no error."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    assert onboarded(vault, J1)[0] == EXIT_OK
+    review = ["review", "notes", "--via", "vault", "--socket", "x"]
+    code, written, err = cli([*review, "--choose", "--suggest"])
+    assert (code, err) == (EXIT_OK, "")
+    rows = {line.split()[1]: line.split()[0] for line in written.splitlines() if line[0] != "#"}
+    # Only the tool the server marks read-only is allowed; the error finding has no line.
+    assert rows == {"delete_note": "skip", "export_all": "skip", "list_notes": "allow"}
+    assert "# bad_tool can't be included: error finding (" in written
+    choices = written.replace("skip     export_all", "approve  export_all")
+    code, fragment_2, err = cli([*review, "--choices", "-"], io.StringIO(choices))
+    assert code == EXIT_OK, err
+    assert vault.reviews.queued == ["notes"]  # one report for the second run and both
+    assert err == (
+        "zoeymcp review: the file includes 2 tools (1 allow, 1 approve). Prove it with check "
+        "--with, commit it and reload, then assign the server to its clients.\n"
+    )
+    assert fragment_2.startswith(
+        "# zoeymcp: review of notes (2 of 2). Replace the tools: and review: blocks of "
+        "gateway.servers.notes, then assign notes to its clients.\n"
+        "# zoeymcp replace: gateway.servers.notes.tools gateway.servers.notes.review\n"
+    )
+    entry = load_mapping(fragment_2)["gateway"]["servers"]["notes"]
+    assert entry["tools"] == {
+        "include": ["export_all", "list_notes"],
+        "allow": ["list_notes"],
+        "approve": ["export_all"],
+    }
+    policy_file, fragment_file = tmp_path / "policy.yaml", tmp_path / "onboard-notes-2.yaml"
+    base = vault.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    policy_file.write_bytes(policy_emit.document(base).encode())
+    fragment_file.write_bytes(fragment_2.encode())
+    code, out, err = cli(["check", "--config", str(policy_file), "--with", str(fragment_file)])
+    assert code == EXIT_OK, out + err
+    assert "with onboard-notes-2.yaml merged: 0 errors, " in out + err
+    assert "and replaces gateway.servers.notes.tools and gateway.servers.notes.review" in out + err
+    # A file whose pin no longer matches is refused before anything is printed.
+    stale = choices.replace(entry["review"]["list_notes"], "sha256:" + "0" * 64)
+    code, out, err = cli([*review, "--choices", "-"], io.StringIO(stale))
+    assert (code, out) == (2, "")
+    assert err.startswith("zoeymcp review: choices_invalid: line ")
+
+
 def test_the_second_run_as_json_carries_the_counts(vault: Vault) -> None:
     """Run again once signed in, the second run hands back the review the first one queued."""
     code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
@@ -3551,7 +3609,7 @@ def test_a_review_that_fails_says_so_after_the_sign_in(vault: Vault) -> None:
     assert (code, browser.visits) == (EXIT_FINDINGS, 1), err
     assert "Stored the refresh token for notes as notes-refresh.\n" in out
     assert "The review didn't run: The gateway couldn't review the server (upstream)." in err
-    assert err.endswith(f"    {HARDENED} exec vault zoeymcp review notes --via vault\n")
+    assert err.endswith(f"    {SECOND_CHOICES}\n")
     assert "the listing failed" not in err
 
 
@@ -3563,7 +3621,7 @@ def test_no_connect_before_a_token_queues_no_review(vault: Vault) -> None:
     assert code == EXIT_OK, err
     assert vault.reviews.queued == []
     assert "Reviewing" not in err
-    assert err.endswith(f"    {HARDENED} exec vault zoeymcp review notes --via vault\n")
+    assert err.endswith(f"    {SECOND_CHOICES}\n")
 
 
 def job_answer(state: str, **more: Any) -> dict[str, Any]:

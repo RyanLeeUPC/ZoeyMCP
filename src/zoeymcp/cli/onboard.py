@@ -14,7 +14,8 @@ M.7). The vault does the work over its admin socket; this module asks, prompts a
   ``--no-connect`` or the credential already holds a refresh token (OPS-13). Then, with a token
   to review with, it queues the server's review through the vault's job path (F.2), waits up to
   :data:`REPORT_WAIT` for the gateway's report, prints its counts, and prints what is next:
-  ``review <server> --via vault``, which reads that same report (OPS-11).
+  ``review <server> --via vault --choose --suggest`` and ``--choices -``, the choices file and
+  fragment 2 (J1), which read that same report (OPS-11).
 - **Commands** in a ``next`` list are the vault's argument lists, shell-quoted (TI-14), printed
   after the prefix ``ZOEYMCP_COMPOSE_CMD`` names and the service ``ZOEYMCP_EXEC_SERVICE`` (or,
   for ``review``, ``ZOEYMCP_REVIEW_SERVICE``) names, as the entry's ``via`` says (OPS-17). A

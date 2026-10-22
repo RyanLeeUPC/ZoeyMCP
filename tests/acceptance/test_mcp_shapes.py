@@ -38,6 +38,7 @@ from tests.fakes.mcp_server import (
 )
 from tests.gateway.rig import agent, pin_of_fake, token_for, until
 from zoeymcp.common.policy.schema import hash_token
+from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import upstream as upstream_module
 
 from .conftest import serve_tls
@@ -233,12 +234,8 @@ async def test_s10_onboarding_with_review(tmp_path: Path, ca: ProviderCA) -> Non
         code, out, _ = gateway.cli(
             running, "review", SERVER, "--add", "echo", "--add", "add", "--format", "json"
         )
-        snippet = json.loads(out)["snippet"]
-        added = {
-            line.split(":")[0].strip(): line.split(":", 1)[1].split("#")[0].strip()
-            for line in snippet
-            if line.startswith("        ") and "sha256:" in line
-        }
+        snippet = load_mapping("\n".join(json.loads(out)["snippet"]))
+        added = snippet["gateway"]["servers"][SERVER]["review"]
         assert sorted(added) == ["add", "echo"]
         gateway.reload({"echo": "allow", "add": "allow"}, added)
         await until(lambda: running.app.policy.snapshot is not None and "echo" in (

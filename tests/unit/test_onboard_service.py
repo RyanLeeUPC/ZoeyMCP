@@ -1732,17 +1732,29 @@ async def test_the_second_run_compares_and_stores_nothing(
     assert again["plan"]["token_endpoint"] == f"{ISSUER}/token"
     assert again["plan"]["client_auth"] == "none"
     assert ["Token endpoint", f"{ISSUER}/token"] in again["rows"]
-    review = {
-        "do": "review",
-        "label": "Review its tools",
-        "command": "zoeymcp review notes --via vault",
-        "via": "exec",
-    }
+    review = [
+        {
+            "do": "choose",
+            "label": "Choose its tools",
+            "command": "zoeymcp review notes --via vault --choose --suggest",
+            "via": "exec",
+            "redirect": " > notes.choices",
+        },
+        {
+            "do": "make_fragment",
+            "label": "Edit notes.choices (skip, allow or approve on each line), then make "
+            "fragment 2",
+            "command": "zoeymcp review notes --via vault --choices -",
+            "via": "exec",
+            "piped": True,
+            "redirect": " < notes.choices > onboard-notes-2.yaml",
+        },
+    ]
     assert again["next"] == [
         {"do": "connect", "label": "Sign in", "command": "zoeymcp login notes", "via": "exec"},
-        review,
+        *review,
     ]
-    assert (held["token"], held["next"]) == ("stored", [review])
+    assert (held["token"], held["next"]) == ("stored", review)
     assert auth.registrations == []
     assert rig.store.names() == ["notes-refresh"]
     later = records(lines)[before:]

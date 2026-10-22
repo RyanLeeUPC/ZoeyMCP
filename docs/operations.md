@@ -649,7 +649,7 @@ agent that reads a JSON MCP config, typically:
    connection of its own; the server needn't be assigned to anyone yet:
 
    ```text
-   $ zoeymcp review notes --add get_note --add search_notes
+   $ zoeymcp review notes --allow search_notes --approve get_note
    server notes  (remote, vault path /notes/mcp, modern 2026-07-28)
      get_note      unreviewed  sha256:71d2a3b4c5d6...  not included
      search_notes  unreviewed  sha256:0c4e1f2a3b4c...  not included
@@ -657,40 +657,145 @@ agent that reads a JSON MCP config, typically:
      search_notes: note /annotations: suggested by the server: allow (readOnlyHint=true)
 
    # YAML to commit (declarative mode). Review the changes above first.
+   # zoeymcp: review of notes. Replace the tools: and review: blocks of gateway.servers.notes.
+   # zoeymcp replace: gateway.servers.notes.tools gateway.servers.notes.review
+   # added: search_notes (allow)
+   # added: get_note (approve)
    gateway:
      servers:
-       notes:
-         era: modern
+       "notes":
+         era: "modern"
          tools:
-           include: [get_note, search_notes]
-           allow: []
-           approve: []
-           # get_note: put it in allow or approve; nothing is implied
-           # search_notes: put it in allow or approve; nothing is implied
+           include: ["search_notes", "get_note"]
+           allow: ["search_notes"]
+           approve: ["get_note"]
          review:
-           get_note: sha256:71d2...  # ADDED
-           search_notes: sha256:0c4e...  # ADDED
+           "get_note": "sha256:71d2..."
+           "search_notes": "sha256:0c4e..."
    ```
 
-   Read each definition (`--show TOOL`, or `--all`) before you add it. Findings are heuristics:
-   instruction-like text, URLs, long base64 runs, nested-quantifier patterns, arguments that
-   travel in HTTP headers, and the server's suggested classification. Hidden characters are
-   shown as `[U+XXXX]`. A tool with an error finding (hidden characters, an unsafe schema) gets no
-   pin line at all.
-6. **Classify and commit:** put each added tool under `allow` or `approve`. `check` fails until
-   you do: there is no implicit default. An `approve` tool asks a human before each call (§19).
+   Read each definition (`--show TOOL`, or `--all`) before you include it. Findings are
+   heuristics: instruction-like text, URLs, long base64 runs, nested-quantifier patterns,
+   arguments that travel in HTTP headers, and the server's suggested classification. Hidden
+   characters are shown as `[U+XXXX]`. A tool with an error finding (hidden characters, an unsafe
+   schema) gets no pin line at all.
+
+   The snippet is a fragment, written as onboarding's are: its header says it replaces the
+   server's `tools:` and `review:` blocks whole, so a tool you leave out loses its pin too. Prove
+   it with `check --with` (below) and merge it, or paste those two blocks over the server's. Its
+   comments are of fixed kinds and carry no text from the server: `added` (and why), `changed` (a
+   re-pin, with the old pin), `kept` (a drifted, missing or unpinnable tool keeps its old pin and
+   stays hidden), `not included` (with its pin and the server's suggestion), `can't be included`
+   (an error finding), `suggested` (the server's suggestion for a tool `--add` leaves to you) and
+   `merge` (a toolkit with `pinning: off`, which keeps no pins).
+6. **Classify and commit:** `--allow TOOL` and `--approve TOOL` include a tool and classify it.
+   `--allow-read-only` includes as `allow` every tool the server marks read-only and not
+   destructive (`readOnlyHint: true` without `destructiveHint: true`); that is the server's own
+   claim, not a judgement by ZoeyMCP, and no option includes an unannotated tool in bulk. `--add
+   TOOL` includes a tool and leaves it to you: `check` fails until it is under `allow` or
+   `approve`, since there is no implicit default. An `approve` tool asks a human before each call
+   (§19). For many tools, use the choices file (below).
 7. **Reload** again. Agents see the tools at once (their clients are told the list changed).
 
 `review` exits 0 when every included tool matches its pin and nothing is marked, 1 when
 something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown or
-not a remote one, the vault refused, the upstream failed or a listing limit was hit). The
-message says which. `--format json` prints the same, with the snippet as a list of lines.
+not a remote one, the vault refused, the upstream failed or a listing limit was hit) or an option
+doesn't fit what it found. The message says which. `--format json` prints the same, with the
+snippet as a list of lines.
 
 **Keep the tool list small.** Every tool an agent is given takes room in the model's context, on
 every turn. Include only the tools each agent needs, and assign each agent only the servers it
 uses. Where a client can load tools lazily (a tool search that fetches a definition only when the
 model asks for it), turn that on: the gateway serves the same pinned definitions either way, and
 tells clients when a list changes, so a lazy client fetches the new one.
+
+**Reading pinned schemas.** A pin covers a tool's input schema, and the gateway checks every call's
+arguments against the pinned one. JSON Schema's `pattern` is written for ECMA-262 (JavaScript's
+regular expressions); the gateway runs it on Python's `regex` module, and the two differ in places,
+so read a pattern for what the gateway will enforce:
+
+- `\d` and `\w` match ASCII only, as in ECMA-262 (the `ASCII` flag), and so does `\s`, where
+  ECMA-262's also matches Unicode spaces and line separators.
+- `$` also matches before a final newline in Python, and not in ECMA-262. So that a value can't
+  slip a trailing `\n` past a pattern meant to end there, a pattern with an unescaped `$` refuses
+  every string that ends in `\n`.
+- `\A` and `\Z` are anchors here (the start and the very end of the string); in ECMA-262 they are
+  the letters `A` and `Z`, or an error with the `u` flag.
+- `\p{...}` (a Unicode property) matches ASCII characters only here, under the same flag: `\p{L}`
+  refuses `é`, and `\P{L}` accepts it. In ECMA-262 it needs the `u` flag and then covers all of
+  Unicode; without the flag, `\p{L}` is the text `p{L}`.
+- Possessive quantifiers (`a*+`) and atomic groups (`(?>...)`) work here and never backtrack;
+  ECMA-262 has neither, so a schema that uses them wasn't written for it.
+- Lookbehind (`(?<=...)`, `(?<!...)`) works here at any length, as in current ECMA-262.
+
+What a reviewer can hit: a pattern the `regex` module can't compile, an unsupported `$schema`, a
+`$ref` that isn't a local pointer, or `$id` and the dynamic keywords are error findings (the tool
+can't be pinned); a pattern with a nested quantifier is a warning (it can backtrack for a long
+time); and every pattern gets a note saying it is checked this way. At call time a match over
+50 ms, or a call over its time budget, refuses the call (`arguments refused`), never passes it.
+
+### Many tools: the choices file
+
+Per-tool options don't scale to a hundred tools. `review <server> --choose` prints a choices
+file, one line per tool the server lists, and `--choices FILE` (`-` for stdin) reads the edited
+file back and prints the fragment, the same one the options would make. Both run in either
+container; in the vault's they go through the review job path (below), so `--choose` and
+`--choices` read the one report within 30 minutes, at the same policy:
+
+```sh
+# hardened tier
+docker compose -f deploy/compose.hardened.yaml exec vault \
+  zoeymcp review notes --choose --suggest > notes.choices
+# edit notes.choices: skip, allow or approve on each line, then:
+docker compose -f deploy/compose.hardened.yaml exec -T vault \
+  zoeymcp review notes --choices - < notes.choices > onboard-notes-2.yaml
+# standard tier
+docker compose -f deploy/compose.yaml exec zoeymcp \
+  zoeymcp review notes --choose --suggest > notes.choices
+docker compose -f deploy/compose.yaml exec -T zoeymcp \
+  zoeymcp review notes --choices - < notes.choices > onboard-notes-2.yaml
+```
+
+```text
+# zoeymcp review notes: 96 tools. Keep "skip", or write "allow" or "approve", on each line.
+# report 3f9c... sha256:aa41... policy sha256:5e07...
+# allow: agents call it with no prompt. approve: every call asks you first.
+# The suggestions are the server's own annotations, not a judgement by ZoeyMCP.
+# bad_tool can't be included: error finding (...); review notes --show bad_tool
+skip     delete_note  sha256:0b7d...   # not annotated: approve suggested if you include it
+allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
+```
+
+- **Each line** is a word (`skip`, `allow` or `approve`), the tool's name and its full pin, then a
+  comment; `#` lines are comments, and a line you delete counts as no change. Write the word you
+  want; leave the rest alone.
+- **Without `--suggest`** every tool not yet included says `skip`. With it, a tool the server
+  marks read-only and not destructive says `allow`, and every other line stays `skip` with the
+  server's suggestion in its comment (`approve` for an unannotated or destructive tool), so an
+  unedited file never includes one. A tool the policy already includes says its classification,
+  so an unedited file changes nothing; `skip` on it takes it out.
+- **No line**: a tool with an error finding (it can't be pinned), and an included tool that has
+  drifted, is missing or no longer pins; it stays as the policy has it (`review <server> --repin
+  TOOL` takes a drifted tool's new pin).
+- **Comments** show the server's text cut to 100 characters, with every line break and hidden
+  character made visible, so a description can't start a line of its own. A file saved with
+  CRLF line endings or a byte order mark (as Windows editors and PowerShell 5.1 save it) reads the
+  same.
+- **The header** names the report: its job (`-` for a review over the gateway's socket), its
+  digest, and the digest of the server's `include`, `allow` and `approve` in the policy. If the
+  policy's tools for the server changed since `--choose` (you included, took out or reclassified
+  one), `--choices` refuses the file `choices_stale`: its `skip` lines would take out what you
+  included since. Write the file again. `--choices` checks every `allow` and `approve` line's pin against the report it reads
+  then, the same one or a newer listing, and emits exactly the pins in the file. A tool whose
+  definition changed since `--choose` refuses the whole file `choices_stale`, naming each such
+  tool: read it again (`--show`) and write the file again. Anything else wrong (an unknown word,
+  an unknown or repeated tool, a missing or edited pin, `allow` or `approve` for a tool that can't
+  be pinned, a tool a toolkit declares consequential in `allow`, a file for another server)
+  refuses it `choices_invalid`, naming the line. Both exit 2 with nothing on stdout.
+- **Fragment 2** goes to stdout and a line saying what it includes to stderr. Commit it as
+  fragment 1 is (**Committing fragment 1**, below: `check --with`, merge, `check`, reload). It
+  never assigns the server to clients: add `notes` by hand to the
+  `gateway.clients.<client>.servers` list of each client that should have it.
 
 ### Onboarding by URL
 
@@ -830,15 +935,18 @@ review job path, below), waits up to 2 minutes for the gateway's report, and pri
 ```text
 Reviewing through the gateway: 96 tools (64 the server marks read-only, 32 not annotated, 1 with an error finding).
 Next:
-  Review its tools:
-    docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review notes --via vault
+  Choose its tools:
+    docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review notes --via vault --choose --suggest > notes.choices
+  Edit notes.choices (skip, allow or approve on each line), then make fragment 2:
+    docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp review notes --via vault --choices - < notes.choices > onboard-notes-2.yaml
 ```
 
-The counts are the server's own annotations, not a judgement by ZoeyMCP. `zoeymcp review notes
---via vault`, in the vault's container, prints that same review (steps 5 to 7 above: the tools,
-their findings and the YAML snippet, with `--add`, `--show` and the rest) without listing the
-server again; within 30 minutes and at the same policy, every run reads the one report, and
-`--fresh` reviews again. A review that fails or isn't done in time says so, and the run exits 1;
+The counts are the server's own annotations, not a judgement by ZoeyMCP. The two commands are
+the choices file (above): both read that same review without listing the server again, since
+within 30 minutes and at the same policy every run reads the one report (`--fresh` reviews
+again). Commit fragment 2 as fragment 1 was. `zoeymcp review notes --via vault`, in the vault's
+container, prints the review itself (steps 5 to 7 above: the tools, their findings and the YAML
+snippet, with `--allow`, `--show` and the rest). A review that fails or isn't done in time says so, and the run exits 1;
 the same `review` command then tells you more. With `--no-connect` and no token yet there is
 nothing to review with, so no review is queued.
 

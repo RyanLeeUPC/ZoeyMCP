@@ -124,7 +124,7 @@ async def test_a_clean_server_exits_0_and_its_snippet_changes_nothing(
     assert server["review"] == options["review"]
     assert check_errors(merged(before, patch)) == check_errors(before)
     # Unincluded tools are comments, with their pins.
-    assert f"# not included: counter  {pin_of_fake(fake, 'counter')}" in out
+    assert f"# not included: counter ({pin_of_fake(fake, 'counter')}; " in out
 
 
 async def test_drift_is_shown_with_a_diff_and_marks_the_tool(
@@ -214,8 +214,8 @@ async def test_hostile_definitions_reach_the_terminal_visible_and_unpinned(
     assert hostile
     tail = out.split("# YAML to commit")[1]
     for entry in hostile:
-        assert entry["pin"] is None or entry["pin"] not in tail.replace("(error findings", "")
-    assert "(error findings: not pinnable)" in tail
+        assert entry["pin"] is None or entry["pin"] not in tail
+    assert "# can't be included, error finding: " in tail
 
 
 async def test_add_includes_a_tool_and_leaves_its_classification_to_the_operator(

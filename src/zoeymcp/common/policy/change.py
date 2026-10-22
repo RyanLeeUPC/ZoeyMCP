@@ -44,7 +44,7 @@ from .schema import (
 
 Reason = Literal["name_taken", "diff_invalid"]
 CommentKind = Literal[
-    "added", "changed_was", "not_included", "error_finding", "suggested", "merge_hint"
+    "added", "changed_was", "kept", "not_included", "error_finding", "suggested", "merge_hint"
 ]
 Era = Literal["auto", "modern", "legacy"]
 ScopeSeparator = Literal[" ", ","]

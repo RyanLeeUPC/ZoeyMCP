@@ -769,7 +769,9 @@ def mismatches(policy: Policy, plan: Plan) -> list[str]:
 class NextStep:
     """One thing for the operator to do next. ``command`` is an argument list, shown
     shell-quoted, every argument (TI-14); ``via`` says where the CLI runs it, and it adds the
-    prefix. ``hosts`` and ``squid`` are an ``allow_hosts`` entry's (D.11)."""
+    prefix. ``piped`` says stdin is redirected into it, and ``redirect`` is the fixed text after
+    it (J1's files), as the CLI's own ``retry`` carries them. ``hosts`` and ``squid`` are an
+    ``allow_hosts`` entry's (D.11)."""
 
     do: Do
     label: str
@@ -777,6 +779,8 @@ class NextStep:
     via: Via | None = None
     hosts: tuple[str, ...] = ()
     squid: tuple[str, ...] = ()
+    piped: bool = False
+    redirect: str = ""
 
     def shell(self) -> str:
         return " ".join(shlex.quote(argument) for argument in self.command)
@@ -792,12 +796,21 @@ class NextStep:
             out["hosts"] = list(self.hosts)
         if self.squid:
             out["squid"] = list(self.squid)
+        if self.piped:
+            out["piped"] = True
+        if self.redirect:
+            out["redirect"] = self.redirect
         return out
 
 
 def fragment_file(server: str, number: int) -> str:
     """The file a fragment is written to in the documented commands (J1)."""
     return f"onboard-{server}-{number}.yaml"
+
+
+def choices_file(server: str) -> str:
+    """The choices file of ``review --choose`` in the documented commands (J1)."""
+    return f"{server}.choices"
 
 
 def _check(source: str, *more: str) -> tuple[tuple[str, ...], Via | None]:
@@ -857,19 +870,31 @@ def remove_first(served: Served) -> NextStep:
 
 def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
     """The second run's steps after its comparison (D.12 steps 3 and 4): sign in, unless the
-    credential holds a refresh token, then review the server's tools through the vault's job
-    path, which reads the review the second run queued once it is done (OPS-11)."""
+    credential holds a refresh token, then choose the server's tools (J1, F.5): the choices file
+    and, once edited, fragment 2 from it, both through the vault's job path, which reads the
+    review the second run queued once it is done (OPS-11)."""
     steps = []
     if held == "none":
         steps.append(NextStep("connect", "Sign in", ("zoeymcp", "login", found.credential), "exec"))
-    steps.append(
+    review = ("zoeymcp", "review", found.server, "--via", "vault")
+    choices = choices_file(found.server)
+    steps += [
         NextStep(
-            "review",
-            "Review its tools",
-            ("zoeymcp", "review", found.server, "--via", "vault"),
+            "choose",
+            "Choose its tools",
+            (*review, "--choose", "--suggest"),
             "exec",
-        )
-    )
+            redirect=f" > {choices}",
+        ),
+        NextStep(
+            "make_fragment",
+            f"Edit {choices} (skip, allow or approve on each line), then make fragment 2",
+            (*review, "--choices", "-"),
+            "exec",
+            piped=True,
+            redirect=f" < {choices} > {fragment_file(found.server, 2)}",
+        ),
+    ]
     return tuple(steps)
 
 

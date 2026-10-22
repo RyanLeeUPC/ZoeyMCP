@@ -376,7 +376,8 @@ def test_commit_recreates_the_vault(tmp_path: Path, ca: ProviderCA) -> None:
     """FM-3, J1 through the CLI: fragment 1 from a given public client, the commit recreating
     the vault, and the second run, which finds the credential committed, signs in with nothing
     lost (F-13), queues the review, which has no gateway to run it here (so it is refused once
-    the vault's start grace ends, and the run exits 1), and names ``review --via vault`` next."""
+    the vault's start grace ends, and the run exits 1), and names the choices file's commands
+    next."""
     with deployed(tmp_path, ca, auth="none") as vault:
         vault.start()
         code, fragment, err = vault.cli([*J1, "--client-id", CLIENT_ID, "--yes"])
@@ -389,7 +390,10 @@ def test_commit_recreates_the_vault(tmp_path: Path, ca: ProviderCA) -> None:
     assert "Stored the refresh token for notes as notes-refresh.\n" in out
     assert "notes is in the policy and matches what the server publishes" in err
     assert "The review didn't run:" in err
-    assert err.endswith("exec vault zoeymcp review notes --via vault\n")
+    assert err.endswith(
+        "exec -T vault zoeymcp review notes --via vault --choices - < notes.choices > "
+        "onboard-notes-2.yaml\n"
+    )
     assert vault.store().names() == ["notes-refresh"]
 
 

@@ -185,21 +185,15 @@ def test_untrusted_text_is_one_visible_line() -> None:
     assert view.untrusted("x" * 10, limit=4) == "xxxx..."
 
 
-@pytest.mark.parametrize(
-    ("name", "key"),
-    [
-        ("echo", "echo"),
-        ("get_note", "get_note"),
-        ("true", '"true"'),
-        ("No", '"No"'),
-        ("-x", '"-x"'),
-        ("1abc", '"1abc"'),
-        ("a.b", '"a.b"'),
-    ],
-)
-def test_yaml_keys_are_quoted_when_needed(name: str, key: str) -> None:
-    assert view.yaml_key(name) == key
-    assert load_mapping(f"{key}: 1\n") == {name: 1}
+@pytest.mark.parametrize("name", ["echo", "true", "No", "-x", "1abc", "a.b", "1e3", "null"])
+def test_every_tool_name_is_a_quoted_key_that_stays_a_string(name: str) -> None:
+    """The emitter quotes every policy name (H.2), so YAML 1.1 words stay tool names."""
+    server = policy([name], {name: pin(name)})
+    lines = view.snippet(reviewed([tool(name)], server), view.Choices())
+    assert f'        "{name}": "{pin(name)}"' in lines
+    entry = load_mapping("\n".join(lines))["gateway"]["servers"]["notes"]
+    assert entry["tools"]["include"] == [name]
+    assert entry["review"] == {name: pin(name)}
 
 
 def hostile_review() -> dict[str, Any]:
@@ -232,8 +226,15 @@ def test_the_snippet_keeps_pins_and_never_pins_an_error() -> None:
     lines = view.snippet(hostile_review(), view.Choices())
     document = load_mapping("\n".join(lines))
     server = document["gateway"]["servers"]["notes"]
-    assert server == {"era": "modern", "review": {"fine": pin("fine")}}
-    assert "      # not included: evil  (error findings: not pinnable)" in lines
+    tools = {"include": ["fine"], "allow": ["fine"], "approve": []}
+    assert server == {"era": "modern", "tools": tools, "review": {"fine": pin("fine")}}
+    # The emitter's fixed comment kinds (H.2): no upstream text reaches the snippet.
+    assert "# can't be included, error finding: evil (review notes --show evil)" in lines
+    assert lines[:2] == [
+        "# zoeymcp: review of notes. Replace the tools: and review: blocks of "
+        "gateway.servers.notes.",
+        "# zoeymcp replace: gateway.servers.notes.tools gateway.servers.notes.review",
+    ]
 
 
 def drifted() -> dict[str, Any]:
@@ -246,10 +247,14 @@ def test_the_snippet_for_drift_missing_and_invalid_keeps_the_old_pins() -> None:
     review = load_mapping("\n".join(lines))["gateway"]["servers"]["notes"]["review"]
     assert review == {"a": pin("a"), "gone": pin("gone"), "bad": pin("bad")}
     text = "\n".join(lines)
-    assert f"# DRIFT: the server lists {pin('a', 'Changed.')}; --repin a takes it" in text
-    assert "# MISSING: the server doesn't list it" in text
-    assert "# INVALID: not pinnable, kept hidden" in text
-    assert f"# not included: new  {pin('new')}" in text
+    drift = f"# kept: a (drift: the server lists {pin('a', 'Changed.')}; review notes --repin a "
+    assert drift + "takes it)" in text
+    assert "# kept: gone (missing: the server doesn't list it)" in text
+    assert "# kept: bad (invalid: not pinnable, kept hidden)" in text
+    assert (
+        f"# not included: new ({pin('new')}; not annotated: approve suggested if you include it)"
+        in text
+    )
 
 
 def test_repin_and_add() -> None:
@@ -263,8 +268,10 @@ def test_repin_and_add() -> None:
         "allow": ["a", "gone", "bad"],
         "approve": [],
     }
-    assert "        # new: put it in allow or approve; nothing is implied" in lines
-    assert f"        a: {pin('a', 'Changed.')}  # CHANGED, was {pin('a')}" in lines
+    assert "# added: new (put it in allow or approve; nothing is implied)" in lines
+    assert "# suggested: new (not annotated: approve suggested if you include it)" in lines
+    assert f"# changed: a (was {pin('a')})" in lines
+    assert f'        "a": "{pin("a", "Changed.")}"' in lines
 
 
 @pytest.mark.parametrize(
@@ -291,6 +298,104 @@ def test_an_error_tool_cant_be_added_or_repinned() -> None:
     entry = {**answer["tools"][0], "state": "drift"}
     with pytest.raises(view.UsageError, match="error findings"):
         view.check_choices({**answer, "tools": [entry]}, view.Choices(repin=frozenset({"a"})))
+
+
+def hinted(name: str, **hints: bool) -> Tool:
+    return Tool.model_validate({**wire(name), "annotations": hints})
+
+
+def pins_of_hinted(name: str) -> str:
+    return pins.project_and_pin(hinted(name, readOnlyHint=True)).pin
+
+
+def classifying() -> dict[str, Any]:
+    """A server with nothing included yet: tools the server marks read-only, destructive, both
+    (a contradiction), not at all, and one with an error finding that claims read-only."""
+    return reviewed(
+        [
+            hinted("ro", readOnlyHint=True),
+            hinted("rw", readOnlyHint=False, destructiveHint=True),
+            hinted("both", readOnlyHint=True, destructiveHint=True),
+            tool("plain"),
+            Tool.model_validate({**wire("bad", f"x{BIDI}"), "annotations": {"readOnlyHint": True}}),
+        ],
+        policy([], {}),
+    )
+
+
+def listed_pins(answer: dict[str, Any]) -> dict[str, str]:
+    return {entry["name"]: entry["pin"] for entry in answer["tools"]}
+
+
+def snippet_entry(lines: list[str]) -> dict[str, Any]:
+    entry: dict[str, Any] = load_mapping("\n".join(lines))["gateway"]["servers"]["notes"]
+    return entry
+
+
+def test_allow_and_approve_include_and_classify() -> None:
+    answer = classifying()
+    choices = view.Choices(allow=("plain",), approve=("rw",), add=("both",))
+    view.check_choices(answer, choices)
+    lines = view.snippet(answer, choices)
+    entry = snippet_entry(lines)
+    assert entry["tools"] == {
+        "include": ["both", "plain", "rw"],
+        "allow": ["plain"],
+        "approve": ["rw"],
+    }
+    found = listed_pins(answer)
+    assert entry["review"] == {name: found[name] for name in ("both", "plain", "rw")}
+    assert "# added: plain (allow)" in lines
+    assert "# added: rw (approve)" in lines
+    # --add leaves the classification to the operator, with the server's suggestion beside it.
+    assert "# added: both (put it in allow or approve; nothing is implied)" in lines
+    assert (
+        "# suggested: both (not read-only (the server's hints): approve suggested if you "
+        "include it)"
+    ) in lines
+    assert f"# not included: ro ({found['ro']}; read-only (the server's suggestion))" in lines
+    assert "# can't be included, error finding: bad (review notes --show bad)" in lines
+
+
+def test_allow_read_only_allows_only_what_the_server_marks_read_only() -> None:
+    """Nothing bulk-allows a destructive tool, an unannotated one or one with an error finding
+    (PC-2, F-52): only ro, which says why it was allowed."""
+    answer = classifying()
+    assert view.read_only(answer) == ["ro"]
+    lines = view.snippet(answer, view.Choices(allow_read_only=True))
+    entry = snippet_entry(lines)
+    assert entry["tools"] == {"include": ["ro"], "allow": ["ro"], "approve": []}
+    assert entry["review"] == {"ro": listed_pins(answer)["ro"]}
+    assert "# added: ro (allowed because the server marks it read-only)" in lines
+    # An option naming the tool wins over the bulk one.
+    both = view.Choices(allow_read_only=True, approve=("ro",))
+    assert snippet_entry(view.snippet(answer, both))["tools"]["approve"] == ["ro"]
+
+
+def test_bulk_allow_leaves_included_tools_alone() -> None:
+    server = policy(["ro"], {"ro": pins_of_hinted("ro")})
+    answer = reviewed([hinted("ro", readOnlyHint=True), hinted("ro2", readOnlyHint=True)], server)
+    entry = snippet_entry(view.snippet(answer, view.Choices(allow_read_only=True)))
+    assert entry["tools"] == {"include": ["ro", "ro2"], "allow": ["ro", "ro2"], "approve": []}
+
+
+@pytest.mark.parametrize(
+    ("choices", "message"),
+    [
+        (view.Choices(allow=("nothing",)), "--allow nothing: the server doesn't list it"),
+        (view.Choices(approve=("bad",)), "--approve bad: it has error findings"),
+        (view.Choices(allow=("bad",)), "--allow bad: it has error findings"),
+        (view.Choices(add=("ro",), allow=("ro",)), "ro: name it in one of --add, --allow and"),
+        (view.Choices(allow=("ro",), approve=("ro",)), "ro: name it in one of"),
+    ],
+)
+def test_classifying_options_that_dont_fit(choices: view.Choices, message: str) -> None:
+    with pytest.raises(view.UsageError, match=message):
+        view.check_choices(classifying(), choices)
+    server = policy(["ro"], {"ro": pins_of_hinted("ro")})
+    included = reviewed([hinted("ro", readOnlyHint=True)], server)
+    with pytest.raises(view.UsageError, match="--approve ro: it is already included"):
+        view.check_choices(included, view.Choices(approve=("ro",)))
 
 
 def test_tool_lines() -> None:
@@ -441,6 +546,104 @@ def test_review_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert list(json.loads(out)["servers"]) == ["notes"]
     code, out, _ = run_cli(monkeypatch, fake, "review", "--format", "json")
     assert json.loads(out)["servers"]["notes"]["kind"] == "remote"
+
+
+def test_review_classifies_through_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeGateway({("POST", "/review/notes"): (200, classifying())})
+    code, out, err = run_cli(
+        monkeypatch, fake, "review", "notes", "--allow-read-only", "--approve", "plain"
+    )
+    assert (code, err) == (0, "")
+    snippet = out[out.index("# YAML to commit") :].splitlines()[1:]
+    assert snippet_entry(snippet)["tools"] == {
+        "include": ["plain", "ro"],
+        "allow": ["ro"],
+        "approve": ["plain"],
+    }
+    code, _, err = run_cli(monkeypatch, fake, "review", "notes", "--allow", "rw", "--add", "rw")
+    assert (code, err) == (
+        2,
+        "zoeymcp review: rw: name it in one of --add, --allow and --approve\n",
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--suggest"], "--suggest goes with --choose"),
+        (["--choose", "--choices", "-"], "--choose writes a choices file and --choices reads one"),
+        (["--choose", "--add", "x"], "--choose and --choices print text and take no other"),
+        (["--choices", "-", "--allow-read-only"], "take no other choices"),
+        (["--choose", "--format", "json"], "take no other choices"),
+        (["--choose", "--show", "x"], "take no other choices"),
+    ],
+)
+def test_choices_usage_errors(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], message: str
+) -> None:
+    fake = FakeGateway({})
+    code, out, err = run_cli(monkeypatch, fake, "review", "notes", *argv)
+    assert (code, out) == (2, "")
+    assert message in err
+    assert fake.paths == []
+    for option in (["--choose"], ["--allow-read-only"], ["--approve", "x"]):
+        assert run_cli(monkeypatch, fake, "review", *option)[2] == (
+            "zoeymcp review: these options need a server\n"
+        )
+
+
+def test_choose_and_choices_over_the_gateways_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The gateway's socket keeps no job, so the header names none; a file read by path comes
+    back as fragment 2, and a listing changed since refuses it, printing nothing."""
+    answer = classifying()
+    fake = FakeGateway({("POST", "/review/notes"): (200, answer)})
+    code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choose", "--suggest")
+    assert (code, err) == (0, "")
+    assert out.splitlines()[1].startswith("# report - sha256:")
+    lines = [
+        "approve" + line[4:] if line.split()[:2] == ["skip", "plain"] else line
+        for line in out.splitlines()
+    ]
+    path = tmp_path / "notes.choices"
+    path.write_bytes(("\n".join(lines) + "\n").encode())
+    code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choices", str(path))
+    assert code == 0
+    assert err.startswith("zoeymcp review: the file includes 2 tools (1 allow, 1 approve). ")
+    assert load_mapping(out)["gateway"]["servers"]["notes"]["tools"] == {
+        "include": ["plain", "ro"],
+        "allow": ["ro"],
+        "approve": ["plain"],
+    }
+    assert fake.paths == ["/review/notes", "/review/notes"]
+    changed = "sha256:" + "1" * 64
+    later = [{**e, "pin": changed} if e["name"] == "ro" else e for e in answer["tools"]]
+    fake.answers[("POST", "/review/notes")] = (200, {**answer, "tools": later})
+    code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choices", str(path))
+    assert (code, out) == (2, "")
+    assert err == (
+        "zoeymcp review: choices_stale: changed since review --choose wrote the file: ro; read "
+        "each again (review notes --show TOOL), then write the file again\n"
+    )
+
+
+def test_a_choices_file_is_read_before_the_review_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    fake = FakeGateway({})
+    bad = tmp_path / "bad.choices"
+    bad.write_bytes(b"# zoeymcp review notes: \xff\n")
+    headless = tmp_path / "headless.choices"
+    headless.write_bytes(f"allow ro {'sha256:' + '0' * 64}\n".encode())
+    for path in (tmp_path / "gone.choices", bad):
+        code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choices", str(path))
+        assert (code, out) == (2, "")
+        assert err.startswith(f"zoeymcp review: can't read {path}: ")
+    code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choices", str(headless))
+    assert (code, out) == (2, "")
+    assert err.startswith("zoeymcp review: choices_invalid: the file has no zoeymcp review header")
+    assert fake.paths == []
 
 
 def test_an_unreachable_gateway_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:

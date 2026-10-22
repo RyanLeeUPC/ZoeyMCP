@@ -1398,18 +1398,29 @@ def test_a_refresh_token_already_held() -> None:
 
 def test_the_second_runs_steps() -> None:
     found = Committed("c", "r", "s")
-    review = {
-        "do": "review",
-        "label": "Review its tools",
-        "command": "zoeymcp review s --via vault",
-        "via": "exec",
-    }
+    review = [
+        {
+            "do": "choose",
+            "label": "Choose its tools",
+            "command": "zoeymcp review s --via vault --choose --suggest",
+            "via": "exec",
+            "redirect": " > s.choices",
+        },
+        {
+            "do": "make_fragment",
+            "label": "Edit s.choices (skip, allow or approve on each line), then make fragment 2",
+            "command": "zoeymcp review s --via vault --choices -",
+            "via": "exec",
+            "piped": True,
+            "redirect": " < s.choices > onboard-s-2.yaml",
+        },
+    ]
     assert [step.answer() for step in committed_next(found, "none")] == [
         {"do": "connect", "label": "Sign in", "command": "zoeymcp login c", "via": "exec"},
-        review,
+        *review,
     ]
-    assert [step.answer() for step in committed_next(found, "stored")] == [review]
-    assert [step.answer() for step in committed_next(found, "seeded")] == [review]
+    assert [step.answer() for step in committed_next(found, "stored")] == review
+    assert [step.answer() for step in committed_next(found, "seeded")] == review
 
 
 def test_what_to_remove_before_onboarding_a_url_already_served() -> None:

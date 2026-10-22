@@ -85,13 +85,30 @@ def test_add_puts_a_consequential_tool_into_approve(
     choices = view.Choices(add=("send_note",))
     view.check_choices(answer, choices)
     lines = view.snippet(answer, choices)
-    assert "        approve: [send_note]" in lines
-    assert "        # send_note: approve, declared by the toolkit" in lines
+    assert '        approve: ["send_note"]' in lines
+    assert "# added: send_note (approve, declared by the toolkit)" in lines
     assert errors(pasted(raw, lines)) == []
     assert (
         pasted(raw, lines)["gateway"]["servers"]["mail"]["review"]
         == example_raw["gateway"]["servers"]["mail"]["review"]
     )
+
+
+def test_a_consequential_tool_is_never_allowed(tmp_path: Path, example_raw: dict[str, Any]) -> None:
+    """``--allow`` refuses a tool the toolkit's code declares consequential, and neither the bulk
+    option nor a suggestion allows it, whatever its annotations say."""
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["mail"]["tools"] = {}
+    raw["gateway"]["servers"]["mail"]["review"] = {}
+    answer = reviewed(tmp_path, raw)
+    with pytest.raises(view.UsageError, match="declares it consequential"):
+        view.check_choices(answer, view.Choices(allow=("send_note",)))
+    [entry] = answer["tools"]
+    hinted = {**entry, "definition": {**entry["definition"], "annotations": {"readOnlyHint": True}}}
+    assert view.read_only({**answer, "tools": [hinted]}) == []
+    assert view.suggested_words(hinted).startswith("declared consequential by the toolkit")
+    lines = view.snippet(answer, view.Choices(approve=("send_note",)))
+    assert errors(pasted(raw, lines)) == []
 
 
 def test_pinning_off_writes_no_pins_and_prints_definitions(
@@ -104,7 +121,9 @@ def test_pinning_off_writes_no_pins_and_prints_definitions(
     lines = view.render(answer, view.Choices())
     assert any(line.startswith("definition send_note (sha256:") for line in lines)
     snippet = view.snippet(answer, view.Choices())
-    assert not any(line.strip().startswith("send_note: sha256:") for line in snippet)
+    assert not any(line.strip().startswith('"send_note": "sha256:') for line in snippet)
+    assert "      review: {}" in snippet
+    assert "# merge: mail (pinning: off: definitions follow the image)" in snippet
     assert errors(pasted(raw, snippet)) == []
 
 

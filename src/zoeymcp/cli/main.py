@@ -35,6 +35,7 @@ from ..common.yamlload import load_mapping
 # The vault's code is imported in the handlers that use it: ``python -m zoeymcp gateway`` runs
 # this module in the gateway's process, which loads none of it.
 from . import admin_client
+from . import choices as review_choices
 from . import ledger as ledger_view
 from . import review as review_view
 
@@ -382,8 +383,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "tool, its state, pin and findings, a diff for drifted tools, and a YAML snippet for "
             "the policy. With no server, one line per server and no upstream call. Inside the "
             "vault, --via vault asks the gateway through the vault's review jobs, and reads the "
-            "last finished review again unless --fresh. Exit 0 when every included tool matches "
-            "and nothing is marked, 1 when something needs you, 2 when the review couldn't run."
+            "last finished review again unless --fresh. --choose prints a choices file, one line "
+            "per tool (skip, allow or approve), and --choices FILE reads the edited file back "
+            "into the snippet. Exit 0 when every included tool matches and nothing is marked, 1 "
+            "when something needs you, 2 when the review couldn't run."
         ),
     )
     review.add_argument("server", nargs="?")
@@ -404,6 +407,43 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="TOOL",
         help="include TOOL in the snippet; you still classify it as allow or approve",
+    )
+    review.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        metavar="TOOL",
+        help="include TOOL in the snippet as allow: agents call it with no prompt",
+    )
+    review.add_argument(
+        "--approve",
+        action="append",
+        default=[],
+        metavar="TOOL",
+        help="include TOOL in the snippet as approve: every call asks you first",
+    )
+    review.add_argument(
+        "--allow-read-only",
+        action="store_true",
+        help=(
+            "include as allow every tool the server marks read-only and not destructive (its "
+            "own annotations, not a judgement by ZoeyMCP); never an unannotated tool"
+        ),
+    )
+    review.add_argument(
+        "--choose",
+        action="store_true",
+        help="print a choices file: one line per tool, to edit and read back with --choices",
+    )
+    review.add_argument(
+        "--suggest",
+        action="store_true",
+        help="with --choose: write allow on each tool the server marks read-only, skip elsewhere",
+    )
+    review.add_argument(
+        "--choices",
+        metavar="FILE",
+        help="read an edited choices file (- for stdin) and print the snippet it makes",
     )
     review.add_argument(
         "--repin",
@@ -1016,9 +1056,25 @@ def _cmd_sessions(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 # --- review and gateway-status ----------------------------------------------------------------
 
 
-def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+def _cmd_review(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    usage = _review_usage(args)
+    if usage is not None:
+        err.write(f"zoeymcp review: {usage}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    parsed: review_choices.Parsed | None = None
+    if args.choices is not None:
+        # Read before the review runs, so a file that can't be read costs no listing.
+        try:
+            text = stdin.read() if args.choices == "-" else Path(args.choices).read_text("utf-8")
+            parsed = review_choices.parse(text)
+        except (OSError, UnicodeDecodeError) as exc:
+            err.write(f"zoeymcp review: can't read {args.choices}: {exc}\n")
+            return review_view.EXIT_COULD_NOT_RUN
+        except review_choices.ChoicesRefused as exc:
+            err.write(f"zoeymcp review: {exc.reason}: {review_view.untrusted(exc)}\n")
+            return review_view.EXIT_COULD_NOT_RUN
     if review_view.pick_via(args.via, args.socket) == "vault":
-        return _review_through_vault(args, out, err)
+        return _review_through_vault(args, parsed, out, err)
     if args.fresh:  # --via gateway, or auto on the gateway's socket
         err.write(
             "zoeymcp review: --fresh goes with --via vault; this review runs over the gateway's "
@@ -1027,9 +1083,6 @@ def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         return review_view.EXIT_COULD_NOT_RUN
     socket = admin_client.gateway_socket_path(args.socket)
     if args.server is None:
-        if args.tool or args.show or args.all or args.add or args.repin or args.clear:
-            err.write("zoeymcp review: these options need a server\n")
-            return review_view.EXIT_COULD_NOT_RUN
         try:
             status = admin_client.gateway_status(socket)
         except admin_client.AdminUnavailable as exc:
@@ -1048,20 +1101,40 @@ def _cmd_review(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         if exc.reason == "not_clean" and isinstance(exc.data.get("review"), dict):
             # --clear refused: show what doesn't match, and why.
             err.write(f"zoeymcp review: --clear refused: {review_view.untrusted(exc)}\n")
-            _print_review(exc.data["review"], choices, args.format, out)
-            return review_view.EXIT_NEEDS_OPERATOR
+            code = _review_output(exc.data["review"], choices, args, out, err)
+            return max(code, review_view.EXIT_NEEDS_OPERATOR)
         err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
         return review_view.EXIT_COULD_NOT_RUN
-    try:
-        review_view.check_choices(result, choices)
-    except review_view.UsageError as exc:
-        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
-        return review_view.EXIT_COULD_NOT_RUN
-    _print_review(result, choices, args.format, out)
-    return review_view.exit_code(result)
+    # The gateway's own socket keeps no job: the choices file names none.
+    return _review_output(result, choices, args, out, err, job=review_choices.NO_JOB, read=parsed)
 
 
-def _review_through_vault(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+def _review_usage(args: argparse.Namespace) -> str | None:
+    """What's wrong with ``review``'s options as given, before anything is asked."""
+    picked = args.add or args.allow or args.approve or args.allow_read_only or args.repin
+    shown = args.tool or args.show or args.all
+    if args.server is None and (picked or shown or args.clear or args.choose or args.choices):
+        return "these options need a server"
+    if args.suggest and not args.choose:
+        return "--suggest goes with --choose"
+    if args.choose and args.choices is not None:
+        return "--choose writes a choices file and --choices reads one: give one of them"
+    if (args.choose or args.choices is not None) and (
+        picked or shown or args.clear or args.format == "json"
+    ):
+        return (
+            "--choose and --choices print text and take no other choices: give them in the "
+            "file, or leave --choose out"
+        )
+    return None
+
+
+def _review_through_vault(
+    args: argparse.Namespace,
+    parsed: review_choices.Parsed | None,
+    out: TextIO,
+    err: TextIO,
+) -> int:
     """``review <server> --via vault`` (M7 design F.5): the gateway's review, as a job the vault
     queued and the gateway ran, printed as the gateway's own answer is."""
     if args.server is None:
@@ -1085,14 +1158,7 @@ def _review_through_vault(args: argparse.Namespace, out: TextIO, err: TextIO) ->
             "minute to read it\n"
         )
         return review_view.EXIT_COULD_NOT_RUN
-    result = job["report"]
-    try:
-        review_view.check_choices(result, choices)
-    except review_view.UsageError as exc:
-        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
-        return review_view.EXIT_COULD_NOT_RUN
-    _print_review(result, choices, args.format, out)
-    return review_view.exit_code(result)
+    return _review_output(job["report"], choices, args, out, err, job=job["job"], read=parsed)
 
 
 def _review_choices(args: argparse.Namespace) -> review_view.Choices:
@@ -1102,16 +1168,66 @@ def _review_choices(args: argparse.Namespace) -> review_view.Choices:
         show_all=args.all,
         add=tuple(dict.fromkeys(args.add)),
         repin=frozenset(args.repin),
+        allow=tuple(dict.fromkeys(args.allow)),
+        approve=tuple(dict.fromkeys(args.approve)),
+        allow_read_only=args.allow_read_only,
     )
 
 
-def _print_review(
-    result: dict[str, Any], choices: review_view.Choices, fmt: str, out: TextIO
-) -> None:
-    if fmt == "json":
-        review_view.write_json({**result, "snippet": review_view.snippet(result, choices)}, out)
-    else:
-        review_view.write_lines(review_view.render(result, choices), out)
+def _review_output(
+    result: dict[str, Any],
+    choices: review_view.Choices,
+    args: argparse.Namespace,
+    out: TextIO,
+    err: TextIO,
+    *,
+    job: str = review_choices.NO_JOB,
+    read: review_choices.Parsed | None = None,
+) -> int:
+    """Print the review as asked: the text and snippet (or JSON), the choices file
+    (``--choose``), or the snippet a choices file makes (``--choices``)."""
+    if args.choose:
+        lines = review_choices.render(result, job, suggest=args.suggest)
+        review_view.write_lines(lines, out)
+        return review_view.exit_code(result)
+    try:
+        if read is not None:
+            changes = review_choices.decide(result, job, read)
+            heading = review_view.second_title(result["server"])
+            out.write(policy_emit.emit(review_view.fragment(result, changes, heading=heading)))
+            err.write(
+                f"zoeymcp review: {_classified(changes)}. Prove it with check --with, commit it "
+                "and reload, then assign the server to its clients.\n"
+            )
+            return review_view.exit_code(result)
+        review_view.check_choices(result, choices)
+        if args.format == "json":
+            snippet = review_view.snippet(result, choices)
+            review_view.write_json({**result, "snippet": snippet}, out)
+        else:
+            review_view.write_lines(review_view.render(result, choices), out)
+    except review_choices.ChoicesRefused as exc:
+        err.write(f"zoeymcp review: {exc.reason}: {review_view.untrusted(exc)}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    except ValueError as exc:  # a UsageError, or a name the policy can't hold
+        err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+        return review_view.EXIT_COULD_NOT_RUN
+    return review_view.exit_code(result)
+
+
+def _classified(changes: review_view.Changes) -> str:
+    """``the file includes 3 tools (2 allow, 1 approve) and takes out 1``, for stderr."""
+    kinds = [added.classification for added in changes.added.values()]
+    count = len(kinds)
+    said = (
+        f"the file includes {count} tool{'' if count == 1 else 's'} ({kinds.count('allow')} "
+        f"allow, {kinds.count('approve')} approve)"
+    )
+    if changes.dropped:
+        said += f", takes out {len(changes.dropped)}"
+    if changes.moved:
+        said += f", classifies {len(changes.moved)} anew"
+    return said
 
 
 def _cmd_gateway_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
@@ -1885,7 +2001,7 @@ def main(
     if args.command == "sessions":
         return _cmd_sessions(args, out, err)
     if args.command == "review":
-        return _cmd_review(args, out, err)
+        return _cmd_review(args, stdin, out, err)
     if args.command == "gateway-status":
         return _cmd_gateway_status(args, out, err)
     if args.command == "ledger":

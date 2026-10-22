@@ -1016,7 +1016,8 @@ if [ -n "$official" ]; then
     step "derived: review of the mail toolkit, as root (D-74)"
     out="$(docker exec "$std" zoeymcp review mail)" || fail "review mail didn't reach the gateway"
     echo "$out"
-    echo "$out" | grep -qF "send_note: $mail_pin" || fail "review mail doesn't show the committed pin"
+    # The snippet's pin line, as the emitter writes it: key and value quoted.
+    echo "$out" | grep -qF "\"send_note\": \"$mail_pin\"" || fail "review mail doesn't show the committed pin"
 fi
 
 step "standard tier: the portal's shell from the host's loopback, with C.3's headers (contract 42)"

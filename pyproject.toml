@@ -168,6 +168,7 @@ only_mutate = [
     "*zoeymcp/toolkit/plan.py",
     "*zoeymcp/toolkit/rules.py",
     "*zoeymcp/entrypoint/env.py",
+    "*zoeymcp/cli/choices.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene, import-guard and mutation-script tests check the repository itself (the lock, the
