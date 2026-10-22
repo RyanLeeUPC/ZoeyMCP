@@ -1,6 +1,7 @@
 """The compose files: their inline policies pass ``check``, the standard tier's container is the
-box its launcher insists on (M3 design B.2, B.3), and the portal is published on the host's
-loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2)."""
+box its launcher insists on (M3 design B.2, B.3), the portal is published on the host's
+loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2), and the
+egress role is a profile of the hardened tier alone, on networks of its own (M7 design I.5, L)."""
 
 from __future__ import annotations
 
@@ -14,11 +15,18 @@ import yaml
 from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.common.policy import check_policy, parse_policy
 from zoeymcp.common.policy.schema import GatewayLimits, Policy
+from zoeymcp.egress import allowlist as egress_allowlist
+from zoeymcp.egress import listen as egress_listen
+from zoeymcp.egress.main import Options as EgressOptions
+from zoeymcp.egress.main import StartupError as EgressStartupError
+from zoeymcp.egress.main import build as build_egress
 from zoeymcp.entrypoint import env, launcher
 from zoeymcp.portal import listen
 
-DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
+ROOT = Path(__file__).resolve().parents[2]
+DEPLOY = ROOT / "deploy"
 COMPOSE_FILES = sorted(DEPLOY.glob("compose*.yaml"))
+EGRESS_UID = 10006
 
 
 # An innermost ${...}: its default holds no other variable.
@@ -182,7 +190,9 @@ def test_the_hardened_portal_listens_on_egress_alone() -> None:
     vault = services["vault"]["networks"]
     assert isinstance(vault, dict)
     aliases = {network: (vault[network] or {}).get("aliases", []) for network in vault}
-    assert aliases == {"internal": [], "direct": [], "egress": ["vault-portal"]}
+    # egress-ctl since M7 (design L): the egress role fetches its lists from the vault there.
+    assert aliases == {"internal": [], "direct": [], "egress": ["vault-portal"], "egress-ctl": []}
+    assert networks["egress-ctl"]["internal"] is True
     # Docker publishes a port only through a non-internal network: egress must be the vault's
     # only one, so the published port lands on the address the portal listens on.
     assert [n for n in vault if networks[n].get("internal") is not True] == ["egress"]
@@ -306,3 +316,118 @@ def test_the_printed_commands_name_the_tier_and_its_services(
     # The CLI's own default is the hardened file's, as M.7 says.
     if name == "compose.hardened.yaml":
         assert command == onboard_cli.DEFAULT_COMPOSE_CMD
+
+
+# --- the egress role (M7 design I.5, L) ---------------------------------------------------------
+
+# A policy line the hardened file and the SMTP profiles leave commented, for the egress role.
+_ROLE_LINE = re.compile(r"^ *# (egress_proxy(?:_kind)?: \S+)$", re.MULTILINE)
+
+
+def _on(services: dict[str, Any], network: str) -> set[str]:
+    """The services on ``network``."""
+    return {name for name, service in services.items() if network in service.get("networks", [])}
+
+
+def test_the_egress_role_is_a_profile_on_networks_of_its_own() -> None:
+    document = compose("compose.hardened.yaml")
+    networks, services = document["networks"], document["services"]
+    role = services["egress-proxy"]
+    assert role["profiles"] == ["egress-proxy"]
+    # It listens on 3128, so it needs no NET_BIND_SERVICE: no capability at all.
+    unprivileged(role)
+    assert role["user"] == f"{EGRESS_UID}:{EGRESS_UID}"
+    # The official image, as the vault's: never a derived gateway image.
+    assert role["image"] == services["vault"]["image"]
+    assert role["command"] == [
+        "egress", "--vault", "http://vault:8080", "--listen", "vault=egress-vault:3128",
+    ]  # fmt: skip
+    assert "ports" not in role
+    # The vault's side, internal, and its own way out; never egress, which reaches the portal.
+    assert role["networks"] == {"egress-ctl": {"aliases": ["egress-vault"]}, "egress-out": {}}
+    assert networks["egress-ctl"] == {"internal": True}
+    assert networks["egress-out"].get("internal") is not True
+    assert _on(services, "egress-ctl") == {"vault", "egress-proxy"}
+    assert _on(services, "egress-out") == {"egress-proxy"}
+    assert _on(services, "egress") == {"vault"}
+    # Its one listener is the alias egress-ctl gives it, and nothing else answers to that name.
+    [spec] = egress_listen.parse_all(role["command"][4:])
+    assert (spec.source, spec.host, spec.port) == ("vault", "egress-vault", 3128)
+    for name, service in services.items():
+        if name != "egress-proxy" and isinstance(service.get("networks"), dict):
+            for settings in service["networks"].values():
+                assert "egress-vault" not in (settings or {}).get("aliases", [])
+    # --vault is the vault's own listener, reached on egress-ctl.
+    vault = services["vault"]
+    assert vault["command"] == ["vault", "--listen", "0.0.0.0:8080"]
+    assert role["command"][2] == f"http://vault:{listen.split(vault['command'][2])[1]}"
+    # Its environment holds its key and nothing else: no master key, gateway key or policy.
+    assert list(role["environment"]) == [egress_allowlist.KEY_ENV]
+    assert _seconds(role["stop_grace_period"]) == 15
+    # With the profile off, nothing waits on it.
+    for service in services.values():
+        assert "egress-proxy" not in service.get("depends_on", {})
+
+
+def test_the_egress_roles_uid_is_the_images_egress_user() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert f" && groupadd --gid {EGRESS_UID} egress \\\n" in dockerfile
+    assert (
+        f" && useradd --uid {EGRESS_UID} --gid {EGRESS_UID} --no-create-home "
+        "--home-dir /nonexistent --shell /usr/sbin/nologin egress \\\n"
+    ) in dockerfile
+    # One uid per container, root aside (lan-init's one-shot chown).
+    services = compose("compose.hardened.yaml")["services"].values()
+    users = [s["user"] for s in services if not s["user"].startswith("0:")]
+    assert len(set(users)) == len(users)
+
+
+def test_the_egress_key_is_needed_only_when_the_role_runs() -> None:
+    """M7 design I.5 (GR-8): ``:-`` rather than ``:?``, so ``docker compose config`` passes with
+    the key unset and the profile off; with the profile on and no key, the role refuses to start
+    and names ``zoeymcp egress-key``."""
+    text = (DEPLOY / "compose.hardened.yaml").read_text(encoding="utf-8")
+    assert "ZOEYMCP_EGRESS_KEY: ${ZOEYMCP_EGRESS_KEY:-}\n" in text
+    assert "${ZOEYMCP_EGRESS_KEY:?" not in text
+    role = compose("compose.hardened.yaml")["services"]["egress-proxy"]
+    # Compose interpolates after parsing, so the role gets an empty string where this text-level
+    # interpolation leaves YAML's null.
+    environ = {name: value or "" for name, value in role["environment"].items()}
+    assert environ == {egress_allowlist.KEY_ENV: ""}
+    options = EgressOptions(vault=role["command"][2], listens=(role["command"][4],))
+    with pytest.raises(EgressStartupError, match="zoeymcp egress-key"):
+        build_egress(options, environ)
+    given = {egress_allowlist.KEY_ENV: "zeg1-" + "k" * 43}
+    role = compose("compose.hardened.yaml", given)["services"]["egress-proxy"]
+    assert role["environment"] == given
+
+
+def test_the_standard_tier_has_no_egress_role() -> None:
+    """X21: confinement is hardened-only. Nothing in the standard tier could make a program use
+    the role."""
+    services = compose("compose.yaml")["services"]
+    assert "egress-proxy" not in services
+    assert all(service.get("command", [""])[0] != "egress" for service in services.values())
+    assert "ZOEYMCP_EGRESS_KEY" not in (DEPLOY / "compose.yaml").read_text(encoding="utf-8")
+
+
+def test_the_vaults_policy_names_the_role_commented() -> None:
+    """The hardened file's inline policy and the SMTP profiles carry the same two commented
+    lines; uncommented, they name the role's vault listener as the role, and pass ``check``."""
+    document = compose("compose.hardened.yaml")
+    text = document["services"]["vault"]["environment"]["ZOEYMCP_CONFIG"]
+    lines = _ROLE_LINE.findall(text)
+    assert lines == ["egress_proxy: http://egress-vault:3128", "egress_proxy_kind: role"]
+    for profile in ("smtp-implicit-tls.yaml", "smtp-starttls.yaml"):
+        assert (
+            _ROLE_LINE.findall((ROOT / "profiles" / profile).read_text(encoding="utf-8")) == lines
+        )
+    policy = parse_policy(_ROLE_LINE.sub(r"\1", text), "compose.hardened.yaml")
+    assert (policy.egress_proxy, policy.egress_proxy_kind) == ("http://egress-vault:3128", "role")
+    assert [f for f in check_policy(policy) if f.level == "error"] == []
+    # The address is the role's vault listener, as its --listen names it.
+    [spec] = egress_listen.parse_all(document["services"]["egress-proxy"]["command"][4:])
+    assert policy.egress_proxy == f"http://{spec.host}:{spec.port}"
+    # As shipped the lines stay comments: no proxy, so nothing needs the profile.
+    shipped = inline_policy(document, "compose.hardened.yaml")
+    assert (shipped.egress_proxy, shipped.egress_proxy_kind) == (None, "own")

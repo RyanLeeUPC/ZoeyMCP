@@ -611,6 +611,11 @@ docker compose -f deploy/compose.hardened.yaml up -d
 Agents' containers join the `agents` network and use `http://gateway:8090/s/<server>/mcp`. For
 agents on other hosts, use the `lan` profile (§15).
 
+**The egress role** runs in its own container, in the hardened tier only: the `egress-proxy`
+profile (§31), ZoeyMCP's own CONNECT-only proxy, held to the allowlists the vault derives from
+the policy. The standard tier has no role: nothing in its one container could make a program
+use it.
+
 **What stops the gateway starting** (it prints one line and exits 2): the master key,
 `ZOEYMCP_MASTER_KEY_PREVIOUS` or `ZOEYMCP_CONFIG` in its environment; running as root; an
 `http://` link without `ZOEYMCP_GATEWAY_KEY` or `ZOEYMCP_GATEWAY_KEY_FILE`; a state directory
@@ -2264,7 +2269,7 @@ empty the onboarding file.
 - **A NAT64 answer slips through.** A Squid `dst` ACL can't see the IPv4 address inside a NAT64
   answer (`64:ff9b::/96`), so where your resolver synthesizes them, a listed name can steer the
   proxy to a private IPv4 address that way. Only a proxy that judges the address it connects to
-  catches it, as ZoeyMCP's own egress role (hardened tier, later in M7) does; Squid doesn't.
+  catches it, as ZoeyMCP's own egress role (hardened tier, §31) does; Squid doesn't.
 - **It doesn't confine the gateway or toolkits in the standard tier.** They share the vault's
   network namespace there and don't use `egress_proxy`: the standard tier shares egress (§24).
   Neither your proxy nor ZoeyMCP's own egress role changes that; the hardened tier, whose gateway
@@ -2578,3 +2583,78 @@ The vault's log line (`role: vault`):
 | Event | Fields |
 | --- | --- |
 | `egress_allowlist_served` | `digest`, `waited_ms`: new lists answered to the role (a 304 isn't logged; each request is a `request` line with `endpoint: egress_allowlists`) |
+
+**In the hardened tier: the `egress-proxy` profile.** `deploy/compose.hardened.yaml` runs the
+role as the `egress-proxy` service, and only with `--profile egress-proxy`. The standard tier has
+no role (§9). Start the vault, print the key it holds for the role, then start the role with it:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp egress-key
+export ZOEYMCP_EGRESS_KEY=zeg1-...   # the line it printed
+docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
+```
+
+- **Its container.** uid 10006 (the image's `egress` user, which owns no file), read-only, every
+  capability dropped (it listens on 3128, so it needs no `NET_BIND_SERVICE`),
+  `no-new-privileges`, no published port, and no ZoeyMCP setting but the key. Its command
+  is the one above, `egress --vault http://vault:8080 --listen vault=egress-vault:3128`. The
+  compose file reads `ZOEYMCP_EGRESS_KEY: ${ZOEYMCP_EGRESS_KEY:-}`, so compose commands with the
+  profile off don't need the key; with the profile on and no key the role exits 2 naming
+  `zoeymcp egress-key`, and compose keeps restarting it to no effect, since a restart keeps the
+  environment the container was made with: set `ZOEYMCP_EGRESS_KEY` and run the `up -d` above
+  again, which recreates it with the key. For a key in a file (a Docker
+  secret, say), set `ZOEYMCP_EGRESS_KEY_FILE` in an override instead, and
+  `docker compose kill -s HUP egress-proxy` after changing it.
+- **Its networks.** `egress-ctl` is internal and holds the vault and the role: the role fetches
+  the vault's lists there, and the vault reaches the role's one listener there, as
+  `egress-vault`. `egress-out` is the role's way out and holds the role alone. The role never
+  joins `egress`, the vault's own way out, since whatever joins it reaches the portal (§26); nor
+  `internal`, `direct` or `agents`, so nothing there can reach its listener.
+- **The vault through it.** The compose file's inline policy carries the two lines, commented;
+  uncomment them and recreate the vault (`egress_proxy` and `egress_proxy_kind` are read at
+  start, §7). `egress_proxy_kind: role` is what tells the vault the proxy is the role, so
+  onboarding needs no proxy edit (§11); without it the vault takes `egress_proxy` for a proxy of
+  your own. The SMTP profiles carry the same two lines, commented: with them the connector's
+  CONNECT goes through the role's vault listener, which allows the connector's `host:port` since
+  it is in the vault's list.
+
+  ```yaml policy
+  version: 1
+  mode: declarative
+  egress_proxy: http://egress-vault:3128
+  egress_proxy_kind: role
+  connectors:
+    mail-out:
+      kind: smtp
+      host: smtp.mail.example
+      port: 465
+      tls: implicit
+      username: agent@mail.example
+      password: store:mail-pass
+      from: "Agent <agent@mail.example>"
+      to: [partner@mail.example]
+  routes:
+    - name: mail-send
+      prefix: /mail
+      connector: mail-out
+      callers: [gateway]
+      rules: [{methods: [GET], paths: [/config]}, {methods: [POST], paths: [/send]}]
+  ```
+
+  A destination on your own network (a mail server at a private address, say) needs its
+  `egress_private` line, as without the role: the role reads the private mark from the vault's
+  list, and refuses an unmarked name that resolves to a private address (`address_refused`).
+- **What it protects, honestly.** The role is for programs that can't be trusted to keep their
+  own limits: a hardened bridge (later in M7), confined to its own `host:port` list. For the
+  vault it adds the allowlist and an address check at connect time behind a proxy, but the vault
+  already guards its own connections (§7's upgrade note) and keeps its direct route on `egress`
+  for the portal, so the role doesn't confine the vault: sending the vault through it stays
+  optional. It confines nothing in the standard tier, and the hardened gateway and its toolkits
+  need no role: they have no route out at all.
+- **A restart** (a new image, `docker compose restart egress-proxy`, a crash) cuts the role's
+  open tunnels: a vault request in flight fails 502, and a mail send cut after its final dot is
+  `smtp_outcome_unknown`, journaled and never sent again (§22). The new role opens no tunnel until
+  its first fetch from the vault: until then every CONNECT is 503 `list_stale`.
+- **A new key.** After `egress_key_generation` is raised and the policy reloaded, run
+  `zoeymcp egress-key` again, set the new `ZOEYMCP_EGRESS_KEY`, and run the `up -d` above again,
+  which recreates the role with it.

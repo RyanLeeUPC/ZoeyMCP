@@ -1,4 +1,4 @@
-# ZoeyMCP image: one image for every role (vault and gateway now; bridge and egress later).
+# ZoeyMCP image: one image for every role (vault, gateway and egress now; bridge later).
 #
 # Base images are pinned by digest. Dependencies are installed from uv.lock, whose hashes uv
 # verifies, and nothing is installed at runtime. Two virtual environments come from the one lock:
@@ -47,6 +47,7 @@ LABEL org.opencontainers.image.title="ZoeyMCP" \
       io.zoeymcp.source-tree="${SOURCE_TREE}"
 
 # One uid per role, and 10003 for the standard tier's PID 1 once it drops root: it owns no files.
+# 10006 is the egress role's (the hardened tier's egress-proxy profile); it owns no files either.
 # A named volume mounted at /state or /state-gateway inherits the ownership set here. The
 # directories under /run are tmpfs mounts in compose; they exist here with the same owners and
 # modes for runtimes that ignore tmpfs options. The link socket's directory is group gateway and
@@ -57,6 +58,8 @@ RUN groupadd --gid 10001 vault \
  && useradd --uid 10002 --gid 10002 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin gateway \
  && groupadd --gid 10003 init \
  && useradd --uid 10003 --gid 10003 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin init \
+ && groupadd --gid 10006 egress \
+ && useradd --uid 10006 --gid 10006 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin egress \
  && mkdir -p /state /state-gateway /run/zoeymcp /run/zoeymcp-link /run/zoeymcp-gateway \
  && chown 10001:10001 /state /run/zoeymcp \
  && chmod 0700 /state /run/zoeymcp \

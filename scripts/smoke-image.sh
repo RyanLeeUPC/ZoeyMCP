@@ -4,6 +4,8 @@
 # a fake upstream (tests/fakes/run_mcp_server.py) with one tools/list and one tools/call. Both
 # serve the portal on the host's loopback, and the probes show who else can reach it. A Squid
 # pinned by digest parses the emitted egress allowlist and is probed against it (contract 51).
+# The hardened tier's egress-proxy profile runs the egress role, which the vault's SMTP connector
+# sends through, and probes show who can reach it and what it refuses (contract 52).
 # With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
 # compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
 # Usage: scripts/smoke-image.sh [--derived OFFICIAL] IMAGE
@@ -334,9 +336,11 @@ found="$(docker run --rm --entrypoint stat "$image" -c '%n %u:%g %a' \
 [ "$found" = "$expected" ] || fail "directory owners or modes differ: $found"
 [ "$(docker run --rm --entrypoint id "$image" init)" = "uid=10003(init) gid=10003(init) groups=10003(init)" ] \
     || fail "no init user 10003"
+[ "$(docker run --rm --entrypoint id "$image" egress)" = "uid=10006(egress) gid=10006(egress) groups=10006(egress)" ] \
+    || fail "no egress user 10006"
 found="$(docker run --rm --network none -u 0 --entrypoint find "$image" / -xdev \
-    \( -user 10003 -o -group 10003 \) -print)"
-[ -z "$found" ] || fail "the init user owns files: $found"
+    \( -user 10003 -o -group 10003 -o -user 10006 -o -group 10006 \) -print)"
+[ -z "$found" ] || fail "the init or egress user owns files: $found"
 found="$(docker run --rm --network none -u 0 --entrypoint find "$image" / -xdev -perm /6000 -type f)"
 [ -z "$found" ] || fail "setuid or setgid files: $found"
 
@@ -659,6 +663,7 @@ from zoeymcp.gateway.pins import project_and_pin
 out = Path(sys.argv[1])
 ca = make_ca(out)
 issue_cert(ca, "fake-upstream", out)
+issue_cert(ca, "fake-smtp", out)  # the mail server of contract 52
 (out / "bundle.pem").write_text(Path(certifi.where()).read_text() + ca.ca_file.read_text())
 for tool in base_tools():
     if tool["name"] in ("echo", "slow"):
@@ -1178,10 +1183,15 @@ found="$(hardened_tier exec -T vault python -I -c "$resolve" vault-portal)" \
     || fail "the vault can't resolve vault-portal"
 [ -n "$egress" ] && [ "$found" = "$egress" ] \
     || fail "vault-portal resolves to $found in the vault, not its egress address $egress"
+# The address the portal bound, from its own log line, and the name it bound by (D-169): a
+# lookup of vault rather than vault-portal can give the egress address too, and pass above.
+hardened_tier logs vault >"$work/logs" 2>&1
+grep -qF "\"event\":\"portal_listening\",\"listen\":\"vault-portal:8081\",\"address\":\"$egress:8081\"" \
+    "$work/logs" || fail "the portal didn't listen by vault-portal on the egress address $egress"
 # shellcheck disable=SC2086
 hardened_tier exec -T gateway python -I -c "$unreachable" vault vault-portal $addresses \
     || fail "the gateway reached the portal"
-for network in internal direct agents; do
+for network in internal direct agents egress-ctl; do
     # shellcheck disable=SC2086
     probe "${hardened_project}_$network" -c "$unreachable" vault vault-portal $addresses \
         || fail "a container on $network reached the portal"
@@ -1317,6 +1327,209 @@ sys.exit("the old key was accepted")
 hardened_tier exec -T gateway python -I -c "$old_key_view" "$first_key" \
     || fail "the retired key wasn't refused"
 hardened_tier down -v >/dev/null 2>&1
+
+# --- contract 52: the egress role ---------------------------------------------------------------
+# deploy/compose.hardened.yaml with the egress-proxy profile, and an override whose policy sends
+# the vault through the role (egress_proxy_kind: role) to a fake mail server on egress-out, the
+# role's own way out, for this run only. The role's one listener is on egress-ctl alone; it
+# refuses a host the vault's list doesn't hold and a listed name that resolves to a private
+# address without the private mark; and the SMTP connector's CONNECT goes through it (fold-in
+# R6). This block removes all it starts, whatever happens, with its own trap.
+step "egress role: compose config passes with ZOEYMCP_EGRESS_KEY unset, profile off or on (contract 52)"
+unset ZOEYMCP_EGRESS_KEY
+for egress_profile in "" "--profile egress-proxy"; do
+    # shellcheck disable=SC2086
+    ZOEYMCP_MASTER_KEY=unset ZOEYMCP_GATEWAY_KEY=unset \
+        docker compose -f "$deploy/compose.hardened.yaml" $egress_profile config -q \
+        || fail "compose config failed with ZOEYMCP_EGRESS_KEY unset (${egress_profile:-no profile})"
+done
+egress_project="zoeymcp-smoke-egress-$$"
+egress_tier() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${egress_master:-unset}" \
+        ZOEYMCP_GATEWAY_KEY="${egress_gateway_key:-unset}" ZOEYMCP_EGRESS_KEY="${egress_key:-}" \
+        docker compose -p "$egress_project" -f "$deploy/compose.hardened.yaml" \
+        -f "$work/egress.yaml" --profile egress-proxy "$@"
+}
+egress_cleanup() {
+    egress_tier down -v >/dev/null 2>&1 || true
+}
+trap 'egress_cleanup; cleanup' EXIT
+egress_fail() {
+    egress_tier logs >&2 2>/dev/null || true
+    fail "egress role: $*"
+}
+# The fake mail server: tests/fakes/smtp_server.py with implicit TLS on fake-smtp:4650, from the
+# smoke's CA, printing one line per session.
+cat >"$work/tls/fake_smtp.py" <<'EOF'
+import asyncio, json, ssl
+from tests.fakes.smtp_server import SmtpFake
+class Fake(SmtpFake):
+    async def _handle(self, reader, writer):
+        index = len(self.sessions)
+        await super()._handle(reader, writer)
+        session = self.sessions[index]
+        print(json.dumps({"event": "smtp_session", "mail_from": session.mail_from,
+                          "rcpt_to": session.rcpt_to, "tls_at_auth": session.tls_at_auth,
+                          "data": session.data is not None}, separators=(",", ":")), flush=True)
+async def main():
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain("/tls/fake-smtp.pem", "/tls/fake-smtp.key")
+    fake = Fake(ca=None, name="fake-smtp")
+    fake._context = context
+    server = await asyncio.start_server(fake._handle, "0.0.0.0", 4650, ssl=context)
+    async with server:
+        await server.serve_forever()
+asyncio.run(main())
+EOF
+chmod 0644 "$work/tls/fake_smtp.py"
+# The vault through the role; fake-smtp:4650 is listed private, since it resolves to egress-out's
+# address, and fake-smtp:8443 isn't, so the role must refuse it at its address check.
+cat >"$work/egress.yaml" <<EOF
+services:
+  vault:
+$(vault_trust)
+    environment:
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+        egress_proxy: http://egress-vault:3128
+        egress_proxy_kind: role
+        egress_private: ["fake-smtp:4650"]
+        connectors:
+          mail-out:
+            {kind: smtp, host: fake-smtp, port: 4650, tls: implicit, from: agent@mail.example,
+             to: [partner@mail.example], username: agent@mail.example, password: store:mail-pass}
+        routes:
+          - name: mail-send
+            prefix: /mail
+            connector: mail-out
+            callers: [gateway]
+            rules: [{methods: [GET], paths: [/config]}, {methods: [POST], paths: [/send]}]
+          - name: private
+            prefix: /private
+            upstream: https://fake-smtp:8443
+            callers: [{placeholder: ph-egress-private-0123456789}]
+            rules: [{methods: [GET], paths: [/v1/**]}]
+  fake-smtp:
+    image: $fake_image
+    entrypoint: [/opt/zoeymcp-gateway/bin/python]
+    command: [/tls/fake_smtp.py]
+    environment:
+      PYTHONPATH: /opt/src
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp:size=16m]
+    volumes: ["$tests:/opt/src/tests:ro", "$work/tls:/tls:ro"]
+    networks: [egress-out]
+EOF
+egress_keys="$(docker run --rm "$image" keygen)"
+egress_master="$(echo "$egress_keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+egress_gateway_key="$(echo "$egress_keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+
+step "egress role: with the profile on and no key, it refuses to start, naming zoeymcp egress-key"
+status=0
+egress_tier run --rm --no-deps -T egress-proxy >"$work/no-key" 2>&1 || status=$?
+cat "$work/no-key"
+[ "$status" = 2 ] || egress_fail "the role without a key exited $status, not 2"
+grep -q 'zoeymcp egress-key' "$work/no-key" || egress_fail "the refusal doesn't name zoeymcp egress-key"
+
+step "egress role: up with the key the vault prints, as uid 10006 (contract 52)"
+egress_tier up -d vault fake-smtp
+i=0
+until egress_key="$(egress_tier exec -T vault zoeymcp egress-key 2>/dev/null \
+    | sed -n 's/^ZOEYMCP_EGRESS_KEY=//p')" && [ -n "$egress_key" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || egress_fail "zoeymcp egress-key printed no key"
+    sleep 0.3
+done
+out="$(printf 'app-password-0001' | egress_tier exec -T vault zoeymcp secret set mail-pass)"
+echo "$out"
+echo "$out" | grep -q "^stored mail-pass" || egress_fail "the mail password wasn't stored"
+egress_tier up -d egress-proxy
+i=0
+until egress_tier logs egress-proxy 2>&1 | grep -q '"event":"egress_allowlist_applied"'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || egress_fail "the role never applied the vault's lists"
+    sleep 0.3
+done
+role_id="$(egress_tier ps -q egress-proxy)"
+[ "$(egress_tier exec -T egress-proxy id -u)" = "10006" ] || egress_fail "the role doesn't run as 10006"
+if egress_tier logs egress-proxy 2>&1 | grep -qF "$egress_key"; then
+    egress_fail "the egress key is in the role's log"
+fi
+
+step "egress role: its one listener is on egress-ctl, out of reach from every other network (contract 52)"
+role_ctl="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${egress_project}_egress-ctl\").IPAddress}}" \
+    "$role_id")"
+role_addresses="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$role_id")"
+echo "the role's addresses: $role_addresses; egress-ctl: $role_ctl"
+[ -n "$role_ctl" ] || egress_fail "the role has no egress-ctl address"
+egress_tier logs egress-proxy 2>&1 | grep -qF "\"listeners\":{\"vault\":\"$role_ctl:3128\"}" \
+    || egress_fail "the role's vault listener isn't its egress-ctl address $role_ctl"
+# Exits non-zero naming each address that takes a connection on 3128 within 2 s.
+unreachable_role='
+import socket, sys
+reached = []
+for address in sys.argv[1:]:
+    try:
+        socket.create_connection((address, 3128), timeout=2).close()
+    except OSError:
+        continue
+    reached.append(address)
+if reached:
+    sys.exit("reached port 3128 at " + ", ".join(reached))
+print("3128 unreachable at", " ".join(sys.argv[1:]))
+'
+# The networks this run created; the gateway's agents network isn't among them.
+for network in internal direct egress egress-out; do
+    # shellcheck disable=SC2086
+    probe "${egress_project}_$network" -c "$unreachable_role" egress-vault $role_addresses \
+        || egress_fail "a container on $network reached the role's listener"
+done
+
+step "egress role: an unlisted host, and a listed name resolving to a private address, refused (contract 52)"
+for refused in unlisted.example:443 fake-smtp:8443; do
+    found="$(egress_tier exec -T vault python -I -c "$connect_through" egress-vault "$refused")" \
+        || egress_fail "no answer from the role for $refused"
+    echo "$refused: $found"
+    [ "$found" = "403 -" ] || egress_fail "the role didn't refuse $refused: $found"
+done
+egress_tier logs egress-proxy >"$work/logs" 2>&1
+grep '"event":"egress_refused"' "$work/logs" | grep '"reason":"not_allowed"' \
+    | grep -q '"host":"unlisted.example"' || egress_fail "no not_allowed line for unlisted.example"
+grep '"event":"egress_refused"' "$work/logs" | grep '"reason":"address_refused"' \
+    | grep -q '"host":"fake-smtp"' || egress_fail "no address_refused line for fake-smtp:8443"
+
+step "egress role: the SMTP connector sends through it (contract 52, fold-in R6)"
+send_mail='
+import json, sys, urllib.request
+body = {"expect_from": "agent@mail.example", "expect_to": ["partner@mail.example"],
+        "subject": "Smoke", "body": "Through the egress role."}
+request = urllib.request.Request(
+    "http://vault:8080/mail/send", data=json.dumps(body).encode(), method="POST",
+    headers={"x-zoeymcp-gateway": sys.argv[1], "idempotency-key": "smoke-egress-role-0001",
+             "content-type": "application/json"},
+)
+with urllib.request.urlopen(request, timeout=60) as answer:
+    print(answer.status)
+'
+found="$(probe "${egress_project}_internal" -c "$send_mail" "$egress_gateway_key")" \
+    || egress_fail "the send through the role failed"
+[ "$found" = 200 ] || egress_fail "the send through the role answered $found"
+i=0
+until egress_tier logs egress-proxy 2>&1 | grep '"event":"egress_tunnel"' | grep '"host":"fake-smtp"' \
+    | grep -q '"port":4650'; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || egress_fail "the role logged no tunnel to fake-smtp:4650"
+    sleep 0.2
+done
+egress_tier logs fake-smtp 2>&1 | grep '"event":"smtp_session"' \
+    | grep -F '"rcpt_to":["partner@mail.example"]' | grep -F '"tls_at_auth":[true]' \
+    | grep -q '"data":true' || egress_fail "the fake mail server got no message over TLS"
+egress_cleanup
+trap cleanup EXIT
+# --- end of contract 52 -------------------------------------------------------------------------
 
 # --- contract 54: the existing-stack example ----------------------------------------------------
 # examples/existing-stack/compose.yaml as shipped, with two internal networks standing in for the

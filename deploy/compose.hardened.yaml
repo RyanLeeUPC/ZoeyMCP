@@ -37,6 +37,17 @@
 #
 # The lan profile (`--profile lan`) adds a TLS reverse proxy for agents on other hosts; see
 # below.
+#
+# The egress-proxy profile (`--profile egress-proxy`) adds the egress role, ZoeyMCP's own
+# CONNECT-only proxy, held to the allowlists the vault derives from the policy
+# (docs/operations.md §31). Start the vault, print its key, then start the role with it:
+#
+#   docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp egress-key
+#   ZOEYMCP_EGRESS_KEY=... docker compose -f deploy/compose.hardened.yaml \
+#     --profile egress-proxy up -d
+#
+# To send the vault's own traffic through it, uncomment egress_proxy and egress_proxy_kind in
+# the policy below and recreate the vault.
 
 name: zoeymcp
 
@@ -64,6 +75,12 @@ networks:
   # no other container: whatever joins it reaches the portal. An egress proxy gets a network of
   # its own.
   egress: {}
+  # The vault and the egress role: the role's allowlist fetch, and the vault's CONNECTs to it.
+  # Internal: the role is the way out from here.
+  egress-ctl:
+    internal: true
+  # The egress role's own way out. It holds the role alone.
+  egress-out: {}
   # The lan profile's published port.
   lan: {}
 
@@ -91,6 +108,11 @@ services:
         version: 1
         mode: declarative
         gateway_key_generation: ${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
+        # Through the egress role (--profile egress-proxy): its vault listener, and that it is
+        # the role, not a proxy of your own, so onboarding needs no proxy edit. Both take a
+        # restart (recreate the vault) to change.
+        # egress_proxy: http://egress-vault:3128
+        # egress_proxy_kind: role
         # The portal. Leave this block out for no portal.
         admin:
           # The vault's alias on egress (below), resolved at start to exactly one address, so
@@ -148,6 +170,8 @@ services:
       direct: {}
       # vault-portal names the vault's egress address alone: admin.listen above binds it.
       egress: {aliases: [vault-portal]}
+      # To the egress role, which fetches its allowlists from the vault here.
+      egress-ctl: {}
     # The portal, on the host's loopback only. Docker forwards it to the vault's egress address,
     # the one its listener is on.
     ports: ["127.0.0.1:${ZOEYMCP_ADMIN_PORT:-8081}:8081"]
@@ -177,6 +201,28 @@ services:
     networks: [agents, internal]
     volumes:
       - gateway-state:/state-gateway
+
+  # --- the egress-proxy profile ----------------------------------------------------------------
+  #
+  # The egress role (docs/operations.md §31): a listener for the vault on egress-ctl, under the
+  # alias egress-vault, allowing only the vault's host:port list, fetched from the vault with the
+  # egress key. It never joins egress, which would reach the portal. Hardened tier only: in the
+  # standard tier nothing could make a program use it.
+  egress-proxy:
+    <<: *hardened
+    profiles: [egress-proxy]
+    image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
+    command: [egress, --vault, "http://vault:8080", --listen, "vault=egress-vault:3128"]
+    user: "10006:10006"
+    environment:
+      # :- rather than :?, so compose commands with the profile off don't need it; the role
+      # refuses to start without a key, naming `zoeymcp egress-key`.
+      ZOEYMCP_EGRESS_KEY: ${ZOEYMCP_EGRESS_KEY:-}
+    networks:
+      egress-ctl: {aliases: [egress-vault]}
+      egress-out: {}
+    # Open tunnels are cut on stop; nothing waits on them.
+    stop_grace_period: 15s
 
   # --- the lan profile -------------------------------------------------------------------------
   #

@@ -27,8 +27,11 @@ connectors:
     max_per_day: 20 # a rolling 24 hours; failed attempts count too
     paused: false
 
-# Optional: send through the egress proxy, which then sees only a CONNECT to host:port.
-# egress_proxy: http://egress-proxy:3128
+# Optional: send through the egress proxy, which then sees only a CONNECT to host:port. For
+# the hardened tier's egress role (--profile egress-proxy), its vault listener, and that it is
+# the role (docs/operations.md §31); for a proxy of your own, its address and no kind.
+# egress_proxy: http://egress-vault:3128
+# egress_proxy_kind: role
 
 routes:
   - name: mail-send
