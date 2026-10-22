@@ -3,9 +3,9 @@
 How to run what is built so far: the vault (M1), OAuth in the vault (M2), the gateway for
 remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
 and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
-supported. §28 and §29 are M7's so far: your own egress proxy, and fitting ZoeyMCP into a stack
-that already has one. The design and the reasons behind it are in [design.md](design.md); this
-page is the how-to.
+supported. M7's so far: onboarding a remote MCP server by URL (§11), your own egress proxy
+(§28), and fitting ZoeyMCP into a stack that already has one (§29). The design and the reasons
+behind it are in [design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -410,6 +410,15 @@ see it.
 A seed env var that is unset is only a warning in `check`: the vault uses the live token, so the
 seed may be removed once it has been promoted.
 
+**Adopting a grant another tool holds** (a refresh token issued to another client of yours):
+there must be one holder at a time, or a rotating token is used twice and the provider may revoke
+the whole grant. In order: commit the credential with that tool's client ID (onboarded with `login
+--mcp URL --client-id ID`, §11, or written by hand); stop the old holder's refreshes; seed the
+token, `printf '%s' "$RT" | zoeymcp secret set <credential>-refresh` (or an `env:` seed); and only
+then let the vault refresh it. `login --mcp URL --no-connect` then compares the committed
+credential with the server's metadata without signing in, and a second run never signs in over a
+token the credential already holds.
+
 ## 6. Recovery per kind
 
 Where the table says `secret set` or `zoeymcp login`, the portal's **Set the secret** (Secrets
@@ -657,19 +666,167 @@ uses. Where a client can load tools lazily (a tool search that fetches a definit
 model asks for it), turn that on: the gateway serves the same pinned definitions either way, and
 tells clients when a list changes, so a lazy client fetches the new one.
 
-**Onboarding by URL** (M7, as it lands; `zoeymcp login --mcp` arrives with it). The vault's
-admin socket takes phase 1 now: `POST /onboard/discover` finds the server's authorization server
-and answers the plan, `POST /onboard/<onboarding>/register` stores a given client's secret and
-answers fragment 1, `POST /onboard/<onboarding>/fragment` answers fragment 1 for a client with no
-secret (or again, at another indent), and `DELETE /onboard/<onboarding>` cancels. Until the vault
-registers clients itself, a server whose authorization server you have no client at answers
-`registration_unavailable`. A vault restart ends every onboarding, but a client secret it
-stored stays (health reports it `unreferenced` until fragment 1 is committed); the same
-discovery again finds it, checks its binding against a fresh discovery, and answers the
-onboarding registered, so `/fragment` shows fragment 1 again without storing anything. If the
-binding differs, its names stay taken: delete the entry or choose other names. If anything fails
-after register stored the secret, the vault deletes it again and the answer says
-`secret_deleted`. Its log lines:
+### Onboarding by URL
+
+`zoeymcp login --mcp URL` (M7) adds an OAuth-protected MCP server from its URL, beside the manual
+path above. It takes two commits: fragment 1 adds the credential, its route and the server with
+no tools; once it is committed, the same command again signs in, and the review (steps 5 to 7
+above) gives the tools to commit. Until the vault registers clients itself (later in M7), it
+needs a client the provider registered for you: its client ID, and its secret if it has one.
+Without one the plan stops at `registration_unavailable`.
+
+It runs in the vault's container, over the admin socket:
+
+```sh
+# hardened tier
+docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp login \
+  --mcp https://mcp.notes.example/mcp --name notes --client-id my-client > onboard-notes-1.yaml
+# standard tier
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp login \
+  --mcp https://mcp.notes.example/mcp --name notes --client-id my-client > onboard-notes-1.yaml
+```
+
+The vault probes the URL once, reads the server's protected-resource metadata and its
+authorization server's metadata through its guarded client, and the plan goes to stderr: every
+host it contacted or will contact, the endpoints, the issuer, whether `iss` is required, the
+scopes and where they came from, the names, the client and its redirect address, and `check`'s
+findings with the server merged (an error there stops it before anything is stored). Every string
+from the network is shown with hidden characters made visible. Confirm (`--yes` doesn't ask), and
+fragment 1 goes to stdout and a `Next:` list to stderr: each command to run, as you type it on the
+host.
+
+- **The shipped `notes` example.** The compose files carry a `notes` server with a static key
+  (credential `notes-key`, route `notes-mcp`) at `https://mcp.notes.example/mcp`. A URL a server
+  already reaches with a credential that isn't oauth2 is refused `already_configured`: remove that
+  server, its route and its credential first.
+- **Names.** `--name` names the credential, the route and the server; `--credential`, `--route`
+  and `--server` name each. Without them, the host's first label that says something (not `mcp`,
+  `api`, `www`, `app` or `server`), with `-2` and on when it is taken. A name you give that the
+  policy, the store or another onboarding has is refused `name_taken`.
+- **A public client** (`--client-id` alone): nothing is sent past discovery and nothing is stored;
+  the fragment holds only what you typed.
+- **A confidential client**: `--client-secret`, with `--issuer` (the authorization server that
+  issued the client: a discovered one that differs, byte for byte, is refused `as_unknown`) and
+  `--client-auth basic|post` (default `basic`). Show the plan first with `--plan-only`, then pipe
+  the secret in with `exec -T` and `--yes`: the question can't be read from the stdin the secret
+  comes on, and a secret typed into an `exec` whose stdout is redirected would be echoed. On a
+  terminal without `--yes`, it is read from a hidden prompt once you confirm. Never on the command
+  line.
+
+  ```sh
+  docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp login \
+    --mcp https://mcp.notes.example/mcp --name notes --issuer https://auth.notes.example \
+    --client-id existing-client --plan-only
+  printf '%s' "$CLIENT_SECRET" | docker compose -f deploy/compose.hardened.yaml exec -T vault \
+    zoeymcp login --mcp https://mcp.notes.example/mcp --name notes \
+    --issuer https://auth.notes.example --client-id existing-client --client-secret \
+    --client-auth basic --redirect-uri http://127.0.0.1:8765/callback --yes > onboard-notes-1.yaml
+  ```
+
+  The secret is stored at once as `<credential>-client-secret`, bound to the token endpoint and
+  the server's origin that fragment 1 names: it works once that fragment is committed, and only
+  while those stay (`client_secret_binding_changed` otherwise). The fragment holds `client_secret:
+  "store:<credential>-client-secret"`, never the value.
+- **The redirect address**: `--redirect-uri` is the one the provider has on record for the
+  client; without it, the shared `http://127.0.0.1/callback`. The plan says when the address isn't
+  the credential's own, which turns off a backstop against pasting an answer meant for another
+  sign-in.
+- **`--plan-only`** discovers and prints the plan, then stops. The same command (the same URL,
+  names and options) within 30 minutes carries on from that plan.
+- **A server that publishes no protected-resource metadata** (an older pattern): the plan says
+  so, and where the authorization server was found: the issuer you named (`--issuer`, MCP's
+  "pre-configured values"), the server's origin (MCP 2025-03-26's rule), or the server's own URL as
+  an issuer, which the plan marks as a ZoeyMCP heuristic and no MCP rule. Check that one before you
+  confirm.
+- **Several authorization servers**: the plan stops at `as_choice_needed`, listing them; name one
+  with `--issuer`.
+- **More options**: `--scope "a b"` requests your scopes instead of the server's; `--allow-private`
+  lets the typed server's own `host:port` resolve to a private address (fragment 1 then adds it to
+  `egress_private`); `--client-name` is the name a provider may show for the client; `--indent N`
+  or `--for compose` lays fragment 1 out for an inline policy; `--format json` prints the vault's
+  answers as one JSON document on stdout instead.
+
+**Committing fragment 1.** The `Next:` list gives the commands for the policy's source: `check
+--with` proves the fragment merges and says what it adds, then you merge it, prove the edited
+policy with `check`, and reload. For the inline `ZOEYMCP_CONFIG` of the compose files:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -v "$PWD:/w:ro" vault \
+  check --with /w/onboard-notes-1.yaml
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps vault check
+docker compose -f deploy/compose.hardened.yaml up -d vault
+```
+
+Merge it under `ZOEYMCP_CONFIG` in the compose form (`--for compose`: indented 8, every `$`
+written `$$`), or replace the whole block with `check --with FRAGMENT --print-merged --for
+compose`. Check the edited file before `up -d`: a bad merge stops the vault from starting, and
+the portal with it. For a policy file the commands are `zoeymcp check --config FILE --with
+FRAGMENT` and `zoeymcp check --config FILE`, then SIGHUP (§7); for a policy on stdin, `--config
+-`, then a restart.
+
+**The second run.** Once the policy names the credential, the same `login --mcp` command doesn't
+onboard again. It rediscovers (the probe and GETs; nothing is registered or stored), compares
+what it finds with the committed credential, route and server, and signs in with `zoeymcp
+login`'s paste flow (§2; `--rebind` passes through). A difference is refused
+`onboarding_mismatch`, naming each field that differs, never its value: revert the edit, or
+register a new client with `--reregister`. A stored client secret's binding is checked too
+(`client_secret_binding_changed`). Then the `Next:` list says to review the server in the
+gateway's container (`zoeymcp review <server>`, steps 5 to 7 above); later in M7 the vault queues
+the review itself.
+
+**Adopting a grant another tool holds.** Onboard with that tool's client
+(`login --mcp URL --client-id ID ...`) and commit fragment 1; stop the old holder's refreshes;
+seed its refresh token with `printf '%s' "$RT" | ... exec -T vault zoeymcp secret set
+<credential>-refresh`; then run `login --mcp URL --no-connect`, which compares and doesn't sign
+in. The second run skips signing in by itself whenever the credential already holds a refresh
+token, and says so. Keep that order for a rotating token (§5).
+
+**Re-registering** (`login --mcp URL --reregister`): a new client for the committed credential,
+under its own names. Discovery runs again, the new client's secret replaces the stored one, and
+fragment 1 replaces `credentials.<credential>` whole: its header line says so, and a comment names
+each field that changed. What you set beyond the client and the endpoints (the scopes unless you
+give `--scope`, lifetimes, the refresh token's ref) is kept; `rotates` follows the new client
+when it authenticates differently. A credential with `token_headers`, or with a list in
+`extra_params` or `authorize_params`, can't be written into a fragment, so it is refused
+`reregister_by_hand` before anything is asked or stored: edit that credential by hand. If
+anything fails after the new client's secret is stored, the vault puts the committed secret back
+and the answer says `secret_restored`. After the commit, sign in again with `zoeymcp login
+<credential> --rebind`: the old grant belongs to the old client, and `--rebind` accepts its new
+binding when the token endpoint moved.
+
+**Through your own proxy** (§28): a host the proxy refuses stops the onboarding at
+`proxy_refused`, naming every host it needs with the Squid lines to add for the vault
+(`--squid-src vault=ACL` names its source ACL there), and the same command to run again, which
+carries on where it stopped. Keep the onboarding lines in a separate included file, so `--check`
+on the emitted file stays clean. After the commit, the `Next:` list says to emit the allowlist
+again, reload the proxy and remove the onboarding lines.
+
+**Your own compose command.** The printed commands start with `ZOEYMCP_COMPOSE_CMD` and name the
+services in `ZOEYMCP_EXEC_SERVICE` and `ZOEYMCP_REVIEW_SERVICE`, which the shipped compose files
+set. If you run compose with override files, a project directory or a project name, set
+`ZOEYMCP_COMPOSE_CMD` in `.env` to the command you type (`docker compose -f
+deploy/compose.hardened.yaml -f my-override.yaml`), or every printed command names the shipped
+file alone.
+
+| When | What happens, and what to do |
+| --- | --- |
+| The vault restarts before you confirm | the onboarding is gone: run the same command again |
+| It restarts after a client secret was stored, before the commit | the secret stays (health reports it `unreferenced` until fragment 1 is committed): commit the fragment you were shown, or run the same command to see fragment 1 again, which stores nothing |
+| The commit recreates the vault (inline `ZOEYMCP_CONFIG`) | nothing is lost: run `login --mcp` again to sign in |
+| It restarts during the sign-in | the sign-in is lost (§2): run it again; a stored client secret stays |
+| The store is lost | the client secret with it: onboard again with a new client (`--reregister` once the policy names the credential); the old client stays registered at the provider |
+
+The admin socket's routes behind it (M7 design M.1): `POST /onboard/discover` answers the plan,
+or the second run's comparison (`stage: committed`); `POST /onboard/<onboarding>/register` stores
+a given client's secret and answers fragment 1; `POST /onboard/<onboarding>/fragment` answers
+fragment 1 for a client with no secret (or again, at another indent); `DELETE
+/onboard/<onboarding>` cancels. A vault restart ends every onboarding, but a client secret it
+stored stays; the same discovery again finds it, checks its binding against a fresh discovery,
+and answers the onboarding registered, so `/fragment` shows fragment 1 again without storing
+anything. If the binding differs, its names stay taken: delete the entry or choose other names.
+If anything fails after register stored the secret, the vault deletes it again and the answer says
+`secret_deleted`; a re-registration's puts back the secret it replaced, and says
+`secret_restored`. Its log lines:
 
 | Event | Fields |
 | --- | --- |
@@ -679,7 +836,7 @@ after register stored the secret, the vault deletes it again and the answer says
 | `onboard_refused` | `reason`, `host` (the server's) |
 | `onboard_registered` | `credential`, `issuer` (its host), `auth`, `secret_stored` |
 | `onboard_blocked` | `host` and `port` your proxy refused, `needed` (how many hosts it must allow) |
-| `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired` or `owner_gone` |
+| `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired`, `owner_gone`, or `compared` (a second run's comparison found nothing changed) |
 | `address_refused` | `purpose` (`discovery`), `host`, `port`, `verdict` |
 
 None holds an onboarding's ID, a secret, a URL's path or query, or a body; a stored client
@@ -1478,6 +1635,9 @@ context, no passkey support, a cancelled prompt) is worded by the page.
 | 409 | `onboarding_options_changed` | The onboarding in progress for this URL and these names stopped at your proxy and was started with other options. Run it with the same options to carry on, or start again once it expires (30 minutes). |
 | 409 | `registration_unavailable` | Register a client at `<host>` and run again with its client ID. |
 | 502 | `proxy_refused` | Your egress proxy refused the vault's connection to `<host>`. Allow the hosts listed here in it for the vault, then run the same command again. |
+| 409 | `already_configured` | The server `<server>` already reaches this URL, with a credential of kind `<kind>`, not oauth2. Remove it, its route and that credential from the policy and reload first. |
+| 409 | `onboarding_mismatch` | The committed policy differs from what the server publishes now, at `<fields>`. Revert the edit, or register a new client with zoeymcp login --mcp URL --reregister. |
+| 409 | `reregister_by_hand` | The credential `<credential>` sets `<field>`, which a re-registration's fragment can't carry (`<why>`). Re-register by hand: edit the credential in the policy. |
 | 502 | `address_refused` | The vault doesn't connect to `<host>`: its name resolves to a private, loopback or reserved address. Nothing was sent to it. |
 | 502 | `resolve_failed` | The name `<host>` didn't resolve, so nothing was sent to it. |
 | 502 | `fetch_failed` | The host `<host>` didn't answer as needed (`<detail>`). |
@@ -1741,9 +1901,10 @@ shape.
   `http://zoeymcp-gateway:8090/s/<server>/mcp`, the header
   `Authorization: Bearer <client token>` (§10), and the runtime's own approval setting for that
   server at its least-prompting level, so the gateway's approval (§19) is the one prompt.
-- **Your own compose files.** As M7's onboarding by URL lands, the commands ZoeyMCP prints for you
-  are prefixed with `ZOEYMCP_COMPOSE_CMD`. Set it in `.env` to your stack's command (its `-f`
-  files, `--project-directory` or `-p`), or they name `deploy/compose.hardened.yaml` alone.
+- **Your own compose files.** The commands onboarding by URL prints (§11) start with
+  `ZOEYMCP_COMPOSE_CMD`, which `examples/existing-stack/compose.yaml` sets to its own file. Set it
+  in `.env` to your stack's command (its `-f` files, `--project-directory` or `-p`), or they name
+  that file alone.
 
 The vault's policy, inline in its `ZOEYMCP_CONFIG` as in `deploy/compose.hardened.yaml`, here
 with no portal (no `admin` block: see "The portal" below for adding one):

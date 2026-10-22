@@ -32,6 +32,9 @@ REVIEW_TIMEOUT: Final = 300 + 15 + 15
 LOGIN_TIMEOUT: Final = EXCHANGE_DEADLINE + REFRESH_BUDGET + 15
 # Setting or deleting a secret an OAuth credential uses waits for its refresh in flight.
 SECRET_TIMEOUT: Final = REFRESH_BUDGET + 15
+# A discovery waits for its fetches (the vault's DISCOVERY_DEADLINE, 30 s) and for the endpoint
+# check's lookups (RESOLVE_TIMEOUT, 5 s for each of three endpoints), plus time to answer.
+ONBOARD_TIMEOUT: Final = 30 + 3 * 5 + 15
 
 
 class AdminUnavailable(Exception):
@@ -105,6 +108,8 @@ def _request(
     except (httpx.HTTPError, OSError, RuntimeError) as exc:
         # RuntimeError: httpx on Windows, where Unix sockets aren't supported.
         raise AdminUnavailable(f"can't reach the {role}'s admin socket at {socket}: {exc}") from exc
+    if response.status_code == 204:
+        return {}
     try:
         data: dict[str, Any] = response.json()
     except ValueError as exc:
@@ -249,6 +254,44 @@ def oauth_reset(
 ) -> dict[str, Any]:
     path = f"/oauth/{quote(credential, safe='')}/reset"
     return _request(socket, "POST", path, transport=transport)
+
+
+def onboard_discover(
+    socket: str, body: dict[str, Any], transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Discover the server at ``body["url"]`` (M7 design M.1): the plan, or a second run's
+    comparison. A refusal carries ``next`` (and a blocked one the hosts its proxy needs)."""
+    return _request(socket, "POST", "/onboard/discover", body, transport, ONBOARD_TIMEOUT)
+
+
+def onboard_register(
+    socket: str,
+    onboarding: str,
+    client_secret: str | None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """Store a given client's secret and make fragment 1; never echoed."""
+    path = f"/onboard/{quote(onboarding, safe='')}/register"
+    body = {} if client_secret is None else {"client_secret": client_secret}
+    return _request(socket, "POST", path, body, transport, ONBOARD_TIMEOUT)
+
+
+def onboard_fragment(
+    socket: str,
+    onboarding: str,
+    indent: int | str,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """Fragment 1 at ``indent`` (0 to 16, or ``compose``): made, or again."""
+    path = f"/onboard/{quote(onboarding, safe='')}/fragment"
+    return _request(socket, "POST", path, {"indent": indent}, transport, ONBOARD_TIMEOUT)
+
+
+def onboard_cancel(
+    socket: str, onboarding: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    path = f"/onboard/{quote(onboarding, safe='')}"
+    return _request(socket, "DELETE", path, transport=transport)
 
 
 def health(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:

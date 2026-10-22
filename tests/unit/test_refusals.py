@@ -135,6 +135,8 @@ ONBOARDING = {
 # M7's M.2: the onboarding service's own (M7 step 8a2), and login's check of an onboarded
 # client's secret (D.7).
 SERVICE = {"registration_unavailable": 409, "proxy_refused": 502}
+# M7's M.2: the second run's and a re-registration's (M7 step 8b; D.12, D-184).
+SECOND_RUN = {"already_configured": 409, "onboarding_mismatch": 409, "reregister_by_hand": 409}
 LOGIN7 = {"client_secret_binding_changed": 409}
 FETCH = {
     "address_refused": 502,
@@ -212,6 +214,9 @@ FIELDS = {
     "fetch_not_json": {"host"},
     "registration_unavailable": {"host"},
     "proxy_refused": {"host"},
+    "already_configured": {"server", "kind"},
+    "onboarding_mismatch": {"fields"},
+    "reregister_by_hand": {"credential", "field", "why"},
 }
 
 
@@ -258,7 +263,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
-    expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7
+    expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -388,7 +393,7 @@ def test_every_onboarding_service_reason_is_catalogued() -> None:
     """M7 M.2: the scan widens to vault/onboard.py. Its own refusals are literal; the rest it
     passes on from discovery, the table and the fetch layer, whose types are scanned above."""
     found = literal_reasons(onboard, "refusal")
-    assert found == set(SERVICE) | {
+    assert found == set(SERVICE) | set(SECOND_RUN) | {
         "bad_body",
         "name_taken",
         "onboarding_unknown",
@@ -397,6 +402,9 @@ def test_every_onboarding_service_reason_is_catalogued() -> None:
         "address_refused",
         "resolve_failed",
         "fetch_failed",
+        # The second run's checks of a stored client secret, as login words them (D.7 step 5).
+        "client_secret_binding_changed",
+        "no_route",
     }
     assert found <= set(CATALOGUE)
 

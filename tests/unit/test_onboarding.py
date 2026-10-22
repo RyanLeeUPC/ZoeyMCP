@@ -3,8 +3,10 @@
 The table's owners, TTL (on the injected monotonic clock, FM-28) and caps; resuming, and
 ``onboarding_options_changed`` when the options differ (OPS-8); two owners under the same names
 (FM-10); the stages, with ``registered`` holding fragment 1's change (OPS-2); allowances (I.3);
-the name defaults (OPS-15); the second run's comparison by field name (D.12, GR-26); and the
-``next`` lists with every command shell-quoted (M.7, TI-14).
+the name defaults (OPS-15); the second run's comparison by field name (D.12, GR-26), what it
+finds of a server reaching the URL otherwise (OPS-14) and of a refresh token already held
+(OPS-13); a re-registration's end (OPS-3); and the ``next`` lists with every command
+shell-quoted (M.7, TI-14).
 """
 
 from __future__ import annotations
@@ -15,9 +17,16 @@ import pytest
 
 from zoeymcp.common.egresslist import Allowance
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.change import apply
+from zoeymcp.common.policy.change import (
+    AddCredential,
+    AddRoute,
+    AddServer,
+    PolicyChange,
+    SetCredential,
+    apply,
+)
 from zoeymcp.common.policy.findings import Finding
-from zoeymcp.common.policy.schema import HeaderCredential
+from zoeymcp.common.policy.schema import HeaderCredential, OAuth2Credential, RemoteServer, Route
 from zoeymcp.vault import onboarding
 from zoeymcp.vault.oauth.discovery import AsMetadata, Plan, Prm, build_plan
 from zoeymcp.vault.onboarding import (
@@ -37,9 +46,11 @@ from zoeymcp.vault.onboarding import (
     OnboardingRefused,
     OnboardingTable,
     Options,
+    Served,
     allow_hosts,
     choose_names,
     committed_for,
+    committed_next,
     default_name,
     fragment_file,
     in_use,
@@ -47,12 +58,21 @@ from zoeymcp.vault.onboarding import (
     name_taken,
     next_for,
     onboard_again,
+    remove_first,
     secret_names,
+    served_at,
     server_host_port,
     server_path,
+    token_state,
 )
 
-from .test_policy_change import NOTES_CREDENTIAL, example, notes_change
+from .test_policy_change import (
+    NOTES_CREDENTIAL,
+    NOTES_ROUTE,
+    NOTES_SERVER,
+    example,
+    notes_change,
+)
 
 SERVER = "https://mcp.notes.example/mcp"
 ISSUER = "https://auth.notes.example"
@@ -1208,3 +1228,133 @@ def test_a_step_without_a_command() -> None:
 def test_fragment_files() -> None:
     assert fragment_file("notes", 1) == "onboard-notes-1.yaml"
     assert fragment_file("notes", 2) == "onboard-notes-2.yaml"
+
+
+# --- the second run's other findings (D.12, OPS-13, OPS-14) --------------------------------------
+
+
+def shipped(*, keyed: bool = True) -> Policy:
+    """J1's shipped example: a notes server reaching the URL with a static key, or with no
+    credential on its route."""
+    route = {**NOTES_ROUTE, "name": "notes-mcp", "credential": "notes-key"}
+    ops: list[AddCredential | AddRoute | AddServer] = []
+    if keyed:
+        key = HeaderCredential.model_validate({"kind": "header", "secret": "store:notes-key"})
+        ops.append(AddCredential("notes-key", key))
+    else:
+        del route["credential"]
+    ops += [
+        AddRoute(Route.model_validate(route)),
+        AddServer("notes", RemoteServer.model_validate({**NOTES_SERVER, "route": "notes-mcp"})),
+    ]
+    return apply(example(), PolicyChange("t", tuple(ops)))
+
+
+def test_a_static_key_on_the_route_to_the_url_is_served_at() -> None:
+    policy = shipped()
+    assert committed_for(policy, SERVER) is None
+    assert served_at(policy, SERVER) == Served("notes", "notes-mcp", "notes-key", "header")
+    assert served_at(policy, "https://mcp.notes.example/mcp2") is None
+    assert served_at(policy, "https://mcp2.notes.example/mcp") is None
+    assert served_at(example(), SERVER) is None
+
+
+def test_a_route_without_a_credential_is_served_at_too() -> None:
+    assert served_at(shipped(keyed=False), SERVER) == Served("notes", "notes-mcp", None, "none")
+
+
+def test_served_at_takes_the_first_server_by_name() -> None:
+    policy = shipped()
+    assert policy.gateway is not None
+    servers = {**policy.gateway.servers, "a-notes": policy.gateway.servers["notes"]}
+    gateway = policy.gateway.model_copy(update={"servers": servers})
+    policy = policy.model_copy(update={"gateway": gateway})
+    assert served_at(policy, SERVER) == Served("a-notes", "notes-mcp", "notes-key", "header")
+
+
+def test_a_refresh_token_already_held() -> None:
+    """OPS-13: a store: slot that holds one, or an env seed (promoted to its live slot, or
+    waiting for its first use), means the second run doesn't sign in again."""
+    stored = OAuth2Credential.model_validate(NOTES_CREDENTIAL)
+    seeded = stored.model_copy(update={"refresh_token": "env:NOTES_RT"})
+    none = stored.model_copy(update={"refresh_token": None})
+    assert token_state("notes", stored, set()) == "none"
+    assert token_state("notes", stored, {"notes-refresh"}) == "stored"
+    assert token_state("notes", stored, {"oauth.notes.live", "other-refresh"}) == "none"
+    assert token_state("notes", seeded, set()) == "seeded"
+    assert token_state("notes", seeded, {"oauth.notes.live"}) == "stored"
+    assert token_state("notes", seeded, {"oauth.other.live"}) == "seeded"
+    assert token_state("notes", none, {"notes-refresh"}) == "none"
+
+
+def test_the_second_runs_steps() -> None:
+    found = Committed("c", "r", "s")
+    review = {
+        "do": "review",
+        "label": "Review its tools in the gateway's container",
+        "command": "zoeymcp review s",
+        "via": "exec_gateway",
+    }
+    assert [step.answer() for step in committed_next(found, "none")] == [
+        {"do": "connect", "label": "Sign in", "command": "zoeymcp login c", "via": "exec"},
+        review,
+    ]
+    assert [step.answer() for step in committed_next(found, "stored")] == [review]
+    assert [step.answer() for step in committed_next(found, "seeded")] == [review]
+
+
+def test_what_to_remove_before_onboarding_a_url_already_served() -> None:
+    assert remove_first(Served("notes", "notes-mcp", "notes-key", "header")) == NextStep(
+        "fix_policy",
+        "Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key from the "
+        "policy, reload, then run this command again",
+    )
+    assert remove_first(Served("notes", "notes-mcp", None, "none")).label == (
+        "Remove gateway.servers.notes and routes notes-mcp from the policy, reload, then run "
+        "this command again"
+    )
+
+
+# --- a re-registration (D.12, OPS-3) -------------------------------------------------------------
+
+
+def reregistered(client_id: str = "zc_new") -> tuple[OnboardingTable, OnboardingRecord, Policy]:
+    """A registered re-registration of the committed notes, and the policy its fragment makes."""
+    onboardings, _, _ = table()
+    options = Options(client_id=client_id, reregister=True)
+    record = onboardings.start("cli", SERVER, NOTES, options).record
+    onboardings.discovered(record.id, "cli", plan(), ())
+    credential = OAuth2Credential.model_validate({**NOTES_CREDENTIAL, "client_id": client_id})
+    change = PolicyChange("t", (SetCredential("notes", credential),))
+    registered = onboardings.registered(record.id, "cli", change)
+    return onboardings, registered, apply(committed(), change)
+
+
+def test_a_reregistration_is_an_option_of_its_own() -> None:
+    assert Options().reregister is False
+    assert Options(reregister=True) != Options()
+
+
+def test_a_reregistration_ends_once_the_policy_holds_its_credential() -> None:
+    """The policy named the credential all along: only the one its fragment sets ends it."""
+    onboardings, registered, applied = reregistered()
+    assert onboardings.sweep(committed().credentials) == ()
+    assert onboardings.sweep(["notes"]) == ()
+    key = HeaderCredential.model_validate({"kind": "header", "secret": "store:notes-key"})
+    assert onboardings.sweep({"notes": key}) == ()
+    assert onboardings.get(registered.id, "cli") is registered
+    assert onboardings.sweep(applied.credentials) == (Ended(registered, "registered"),)
+
+
+def test_a_first_onboarding_ends_by_its_credentials_name() -> None:
+    onboardings, _, _ = table()
+    record = onboardings.start("cli", SERVER, NOTES, Options()).record
+    onboardings.discovered(record.id, "cli", plan(), ())
+    registered = onboardings.registered(record.id, "cli", notes_change())
+    assert onboardings.sweep(committed().credentials) == (Ended(registered, "registered"),)
+
+
+def test_a_reregistration_signs_in_with_the_new_client() -> None:
+    steps = next_for(staged("registered", Options(client_id="zc_new", reregister=True)), "p.yaml")
+    login = ("zoeymcp", "login", "notes", "--rebind")
+    assert steps[-1] == NextStep("connect", "Then sign in with the new client", login, "exec")

@@ -19,8 +19,14 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
 - **Allowances** (I.3): the ``host:port`` pairs an onboarding contacts, for the egress role's
   list until it registers. Never private: ``private_target`` is the one typed server's
   exception, carried per request (B.2, TI-10).
-- :func:`mismatches` (D.12, GR-26): where the committed credential, route and server differ
-  from a fresh discovery, by field name only.
+- **The second run** (D.12): :func:`committed_for` finds the running oauth2 credential an
+  onboarded URL has, :func:`mismatches` where it, its route and its server differ from a fresh
+  discovery, by field name only, and :func:`token_state` whether it already holds a refresh
+  token; :func:`served_at` finds a server reaching the URL with another kind of credential
+  (``already_configured``, OPS-14).
+- **A re-registration** (``--reregister``, OPS-3) keeps the committed names and replaces the
+  credential: its onboarding ends once the running policy holds the credential its fragment
+  sets, not merely one by that name.
 - :func:`next_for` (M.7): what the operator does next, each command an argument list shown
   shell-quoted and without a container prefix, which the CLI adds.
 
@@ -43,7 +49,7 @@ from urllib.parse import urlsplit
 from ..common import egresslist, netguard
 from ..common.egresslist import Allowance, Destination
 from ..common.logs import refuse_type
-from ..common.policy.change import PolicyChange
+from ..common.policy.change import PolicyChange, SetCredential
 from ..common.policy.findings import Finding
 from ..common.policy.schema import (
     NAME_PATTERN,
@@ -53,6 +59,7 @@ from ..common.policy.schema import (
     RemoteServer,
     Route,
 )
+from .bindings import live_slot
 from .oauth.discovery import Plan, origin_of
 from .oauth.pkce import CLI_OWNER
 
@@ -93,11 +100,16 @@ Do = Literal[
     "check_egress_role",
     "onboard_again",
 ]
-# Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
-# container that reads the inline policy from the service's environment; ``run_mount``, the same
-# with the working directory mounted at /w, for a fragment file; ``up``, the service recreated.
-# None: as written, where the policy file is.
-Via = Literal["exec", "run", "run_mount", "up"]
+# Where the CLI runs a command (M.7): ``exec`` in the running service; ``exec_gateway`` in the
+# gateway's (``review``, until the vault queues reviews itself); ``run``, a one-off container that
+# reads the inline policy from the service's environment; ``run_mount``, the same with the working
+# directory mounted at /w, for a fragment file; ``up``, the service recreated. None: as written,
+# where the policy file is.
+Via = Literal["exec", "exec_gateway", "run", "run_mount", "up"]
+# Whether a committed credential holds a refresh token (D.12, OPS-13): ``stored`` in its store
+# slot (by login, a seeding secret set, or an env seed promoted), ``seeded`` from an env: seed
+# not used yet, or ``none``.
+TokenState = Literal["stored", "seeded", "none"]
 
 NAME_SOURCES: Final[Mapping[NameSource, str]] = {
     "given": "the name you gave",
@@ -128,7 +140,8 @@ class Options:
     """What an onboarding was started with (D.8), never a secret: resuming a blocked one with
     other options refuses (OPS-8). ``secret_given`` says only that a given client came with a
     secret, which ``client_auth`` then defaults to ``basic`` for (D.10); without one, a client
-    authenticates with nothing."""
+    authenticates with nothing. ``reregister`` is a re-registration of a committed credential
+    under its own names (D.12, OPS-3)."""
 
     client_id: str | None = None
     client_auth: ClientAuth | None = None
@@ -138,6 +151,7 @@ class Options:
     client_name: str | None = None
     allow_private: bool = False
     secret_given: bool = False
+    reregister: bool = False
 
     def __post_init__(self) -> None:
         if self.secret_given:
@@ -392,13 +406,14 @@ class OnboardingTable:
             del self._records[record.id]
         return tuple(Ended(record, "owner_gone") for record in gone)
 
-    def sweep(self, committed: Collection[str] = ()) -> tuple[Ended, ...]:
+    def sweep(self, committed: Collection[str] | Mapping[str, object] = ()) -> tuple[Ended, ...]:
         """Every onboarding that ended since the last sweep: replaced by its owner's next start,
         expired, or registered with its credential now in the running policy (``committed``,
-        the policy's credential names)."""
+        the policy's credentials by name). A re-registration's credential was there all along,
+        so it ends once the policy's is the one its fragment sets."""
         self._expire()
         for record in list(self._records.values()):
-            if record.stage == "registered" and record.names.credential in committed:
+            if record.stage == "registered" and _in_force(record, committed):
                 del self._records[record.id]
                 self._ended.append(Ended(record, "registered"))
         ended, self._ended = tuple(self._ended), []
@@ -449,6 +464,20 @@ class OnboardingTable:
             if now >= record.expires_at:
                 del self._records[record.id]
                 self._ended.append(Ended(record, "expired"))
+
+
+def _in_force(record: OnboardingRecord, committed: Collection[str] | Mapping[str, object]) -> bool:
+    """Whether the running policy holds a registered onboarding's credential: by name, or for a
+    re-registration, the very credential its fragment sets."""
+    name = record.names.credential
+    if name not in committed:
+        return False
+    if not record.options.reregister:
+        return True
+    assert record.change is not None  # noqa: S101 - a registered record holds its change
+    wanted = [op.credential for op in record.change.ops if isinstance(op, SetCredential)]
+    found = committed.get(name) if isinstance(committed, Mapping) else None
+    return isinstance(found, OAuth2Credential) and [found] == wanted
 
 
 def _shared_name(mine: Names, theirs: Names) -> str | None:
@@ -591,6 +620,50 @@ def committed_for(policy: Policy, server_url: str) -> Committed | None:
     return None
 
 
+@dataclass(frozen=True)
+class Served:
+    """A remote server reaching an onboarded URL through a route whose credential isn't
+    oauth2: ``kind`` is that credential's kind, or ``none``."""
+
+    server: str
+    route: str
+    credential: str | None
+    kind: str
+
+
+def served_at(policy: Policy, server_url: str) -> Served | None:
+    """The first remote server by name whose route's upstream origin and own ``path`` are
+    ``server_url``'s, whatever its route's credential: after :func:`committed_for` finds none,
+    one with a static key (J1's shipped ``notes``) or no credential, which D.12 refuses
+    ``already_configured`` rather than onboarding the URL a second time (OPS-14)."""
+    routes = {route.name: route for route in policy.routes}
+    for name, server in sorted(_servers(policy).items()):
+        if not isinstance(server, RemoteServer) or server.route not in routes:
+            continue
+        route = routes[server.route]
+        if route.upstream is None or origin_of(route.upstream) != origin_of(server_url):
+            continue
+        if server.path != server_path(server_url):
+            continue
+        cred = None if route.credential is None else policy.credentials.get(route.credential)
+        return Served(name, route.name, route.credential, "none" if cred is None else cred.kind)
+    return None
+
+
+def token_state(
+    credential: str, cred: OAuth2Credential, store_names: Collection[str]
+) -> TokenState:
+    """Whether a committed credential already holds a refresh token, so the second run doesn't
+    sign in again (D.12 step 3, OPS-13): its ``store:`` slot, or an env seed's live slot, is in
+    the store (``stored``), or an env seed waits for its first use (``seeded``)."""
+    ref = cred.refresh_token or ""
+    if ref.startswith("store:"):
+        return "stored" if ref.removeprefix("store:") in store_names else "none"
+    if ref.startswith("env:"):
+        return "stored" if live_slot(credential) in store_names else "seeded"
+    return "none"
+
+
 def _auth_method(cred: OAuth2Credential) -> str:
     """The RFC 8414 name of how the credential authenticates at the token endpoint."""
     if cred.client_auth == "post":
@@ -717,6 +790,37 @@ def allow_hosts(
     )
 
 
+def remove_first(served: Served) -> NextStep:
+    """``already_configured``'s entry (OPS-14): what to take out of the policy before the URL
+    can be onboarded."""
+    parts = [f"gateway.servers.{served.server}", f"routes {served.route}"]
+    if served.credential is not None:
+        parts.append(f"credentials.{served.credential}")
+    return NextStep(
+        "fix_policy",
+        f"Remove {', '.join(parts[:-1])} and {parts[-1]} from the policy, reload, then run this "
+        "command again",
+    )
+
+
+def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
+    """The second run's steps after its comparison (D.12 steps 3 and 4): sign in, unless the
+    credential holds a refresh token, then review the server's tools in the gateway's container
+    (the vault queues the review itself later in M7)."""
+    steps = []
+    if held == "none":
+        steps.append(NextStep("connect", "Sign in", ("zoeymcp", "login", found.credential), "exec"))
+    steps.append(
+        NextStep(
+            "review",
+            "Review its tools in the gateway's container",
+            ("zoeymcp", "review", found.server),
+            "exec_gateway",
+        )
+    )
+    return tuple(steps)
+
+
 def onboard_again(server_url: str) -> NextStep:
     """Every ``onboard_again`` entry: register a new client under the same names (OPS-3)."""
     return NextStep(
@@ -814,7 +918,14 @@ def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[Nex
                 via,
             )
         )
-    steps.append(NextStep("connect", "Then sign in and review", _login_again(record), "exec"))
+    if record.options.reregister:
+        # The committed credential keeps its old grant until a sign-in with the new client,
+        # which discards it on purpose: --rebind, since a token endpoint that moved changes the
+        # old grant's binding.
+        login = ("zoeymcp", "login", record.names.credential, "--rebind")
+        steps.append(NextStep("connect", "Then sign in with the new client", login, "exec"))
+    else:
+        steps.append(NextStep("connect", "Then sign in and review", _login_again(record), "exec"))
     return tuple(steps)
 
 

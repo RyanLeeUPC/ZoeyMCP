@@ -79,6 +79,12 @@ services:
     stop_grace_period: 75s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
+      # The commands `zoeymcp login --mcp` prints start with this compose command and name these
+      # services (docs/operations.md §11). Run compose with override files, a project directory
+      # or a project name? Set ZOEYMCP_COMPOSE_CMD in .env to the command you type.
+      ZOEYMCP_COMPOSE_CMD: "${ZOEYMCP_COMPOSE_CMD:-docker compose -f deploy/compose.hardened.yaml}"
+      ZOEYMCP_EXEC_SERVICE: vault
+      ZOEYMCP_REVIEW_SERVICE: gateway
       # The policy, inline: no bind mounts needed. Reload it with `docker compose kill -s HUP vault`
       # after changing a file-based policy, or recreate the container for this inline one.
       ZOEYMCP_CONFIG: |
@@ -163,6 +169,8 @@ services:
     environment:
       # Or ZOEYMCP_GATEWAY_KEY_FILE, a file the gateway re-reads on HUP (a Docker secret, say).
       ZOEYMCP_GATEWAY_KEY: ${ZOEYMCP_GATEWAY_KEY:?print it with `zoeymcp keygen` or `zoeymcp gateway-key`}
+      # This service's name, in the commands ZoeyMCP prints.
+      ZOEYMCP_EXEC_SERVICE: gateway
     tmpfs:
       - /tmp:size=16m
       - /run/zoeymcp-gateway:size=1m,mode=0700,uid=10002,gid=10002

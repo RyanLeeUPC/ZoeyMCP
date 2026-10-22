@@ -23,12 +23,24 @@ run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the re
   stored for this server by its entry's meta, and takes it on, registered at once, only if its
   authenticated binding is the one the fresh discovery predicts: fragment 1 again, with no
   second registration or write.
+- **The second run** (D.12): a discovery of a URL a running oauth2 credential names starts no
+  onboarding. It rediscovers (the probe and GETs), compares the committed credential, route and
+  server with what it finds, by field name (``onboarding_mismatch``), checks a stored client
+  secret's binding (D.7 step 5), and answers ``committed`` with whether the credential holds a
+  refresh token and what to do next; the CLI signs in. A URL a server reaches with another kind
+  of credential is ``already_configured`` (OPS-14).
+- **A re-registration** (``reregister``, OPS-3) skips that: it keeps the committed names and runs
+  the first run again, its fragment 1 replacing the credential whole (``SetCredential``) and its
+  secret replacing the stored one under the binding that fragment derives; a failure after that
+  write puts the committed secret back rather than deleting it. A credential setting what a
+  fragment can't carry (``token_headers``, a list in ``extra_params`` or ``authorize_params``) is
+  refused ``reregister_by_hand`` at discovery, before anything is confirmed or stored (D-184).
 
 Every refusal is the catalogue's (``portal/refusals.py``): one status and one text on every
 surface. Nothing here logs an onboarding's ID, a secret, a URL path or query, or a body (X19);
 M.4's events are ``onboard_started``, ``discovery_fetch``, ``onboard_planned``,
-``onboard_refused``, ``onboard_registered``, ``onboard_blocked``, ``onboard_ended`` and
-``address_refused``.
+``onboard_refused``, ``onboard_registered``, ``onboard_blocked``, ``onboard_ended`` (``compared``
+after a second run) and ``address_refused``.
 """
 
 from __future__ import annotations
@@ -53,7 +65,9 @@ from ..common.policy.change import (
     AddRoute,
     AddServer,
     ChangeRefused,
+    Comment,
     PolicyChange,
+    SetCredential,
     validate,
 )
 from ..common.policy.emit import COMPOSE_INDENT, INDENT_MAX, EmitRefused, Target, emit
@@ -72,7 +86,7 @@ from ..portal.refusals import Refusal as Answer
 from ..portal.refusals import refusal
 from ..portal.refusals import secret as secret_refusal
 from . import logs, netclient, secretops, secretplan
-from .bindings import oauth_binding
+from .bindings import BindingError, derive_binding, oauth_binding
 from .oauth.discovery import (
     LEGACY_PROBE,
     MODERN_PROBE,
@@ -107,22 +121,31 @@ from .onboarding import (
     INLINE_SOURCE,
     NAME_SOURCES,
     STDIN_SOURCE,
+    Committed,
     Names,
     OnboardingRecord,
     OnboardingRefused,
     OnboardingTable,
     Options,
+    Served,
     choose_names,
+    committed_for,
+    committed_next,
     in_use,
+    mismatches,
     name_taken,
     next_for,
+    onboard_again,
+    remove_first,
     secret_names,
+    served_at,
     server_host_port,
     server_path,
     surface,
+    token_state,
 )
 from .secretplan import SecretRefusal
-from .store import SecretStore, SecretUnavailable
+from .store import EntryMeta, Secret, SecretStore, SecretUnavailable
 
 # The body caps (K.2's discover; a secret; an indent).
 DISCOVER_BODY_MAX: Final = 4 * 1024
@@ -145,8 +168,11 @@ DISCOVER_KEYS: Final = frozenset(
         "client_name",
         "allow_private",
         "secret_given",
+        "reregister",
     }
 )
+# The body keys that are true or false.
+FLAG_KEYS: Final = frozenset({"allow_private", "secret_given", "reregister"})
 # The address an operator-registered client uses unless told otherwise (D.4, D-15).
 SHARED_REDIRECT: Final = str(OAuth2Credential.model_fields["redirect_uri"].default)
 # A given client ID as fragment 1 can hold it: printable ASCII without a space, a quote, a
@@ -163,6 +189,28 @@ BACKSTOP_OFF: Final = (
 
 # The store name of a credential's client secret ends so (D.7 step 1).
 _SECRET_SUFFIX: Final = "-client-secret"  # noqa: S105 - a store name, not a secret
+# What a re-registration replaces in the committed credential (D.12, OPS-3): the client and the
+# endpoints a fresh discovery gives. Everything else the operator set stays.
+REREGISTERED: Final = (
+    "token_url",
+    "authorize_url",
+    "issuer",
+    "require_iss",
+    "revocation_url",
+    "resource_metadata",
+    "client_id",
+    "client_secret",
+    "client_auth",
+    "redirect_uri",
+)
+# What a failure after the client secret's write does with it, as diff_invalid's detail says it.
+_DELETED: Final = "the client secret this run stored was deleted"
+_RESTORED: Final = "the client secret it replaced was put back"
+# Why a fragment can't carry a field (emit's refusals), as reregister_by_hand says it (D-184).
+_UNWRITABLE: Final = {
+    "field": "a fragment never holds its values",
+    "type": "a fragment writes each parameter as one string, not a list",
+}
 
 Resolver = netclient.Resolver
 
@@ -263,6 +311,13 @@ class OnboardService:
         self._sweep()
         policy = self._policy()
         url, given, options = _request(body)
+        found = committed_for(policy, url)
+        if not options.reregister:
+            if found is not None:
+                return await self._second_run(url, given, options, found, owner)
+            served = served_at(policy, url)
+            if served is not None:
+                raise OnboardError(_already_configured(served))
         own = self._table.owned(owner)
         kept: _Kept | None = None
         if (
@@ -273,6 +328,8 @@ class OnboardService:
             # The same run again (--plan-only, a retry): its names, though it may have stored
             # an entry under them since.
             names = own.names
+        elif options.reregister:
+            names = _committed_names(url, given, found)
         else:
             names, kept = self._names(url, given, owner, policy, options)
             if kept is not None:
@@ -325,6 +382,114 @@ class OnboardService:
                 secret_stored=False,
             )
         return self._plan_answer(record, policy, kept)
+
+    async def _second_run(
+        self,
+        url: str,
+        given: Mapping[str, str],
+        options: Options,
+        found: Committed,
+        owner: str,
+    ) -> dict[str, Any]:
+        """D.12 steps 1 and 2: rediscover (the probe and GETs; nothing is registered or stored)
+        under the committed names, compare by field name, and check a stored client secret's
+        binding. The onboarding exists only while it runs, or while a proxy blocks it (D.11)."""
+        names = _committed_names(url, given, found)
+        own = self._table.owned(owner)
+        if own is not None and own.server_url == url and own.stage != "blocked":
+            # The owner's own earlier run of this URL (--plan-only, say, before the policy named
+            # it): its plan may be stale, and only a blocked fetch carries on (step 1).
+            ended = self._table.cancel(own.id, owner)
+            if ended is not None:
+                logs.event("onboard_ended", why=ended.why)
+        try:
+            started = self._table.start(owner, url, names, options)
+        except OnboardingRefused as exc:
+            raise OnboardError(_table_refusal(exc)) from None
+        record = started.record
+        host = server_host_port(url)[0]
+        policy = self._policy()
+        logs.event(
+            "onboard_started", owner=surface(owner), host=host, allow_private=options.allow_private
+        )
+        try:
+            plan = await self._discover(record, policy, kept=False, committed=True)
+        except ProxyRefused as exc:
+            raise OnboardError(self._blocked(record, exc, policy)) from None
+        except OnboardError as exc:
+            self._table.cancel(record.id, owner)
+            logs.event("onboard_refused", reason=exc.answer.reason, host=host)
+            raise
+        except (OnboardingRefused, ValueError):
+            raise OnboardError(refusal("onboarding_unknown")) from None
+        self._table.cancel(record.id, owner)
+        try:
+            answer = self._compared(url, plan)
+        except OnboardError as exc:
+            logs.event("onboard_refused", reason=exc.answer.reason, host=host)
+            raise
+        logs.event("onboard_ended", why="compared")
+        return answer
+
+    def _compared(self, url: str, plan: Plan) -> dict[str, Any]:
+        """The committed credential, route and server against a fresh discovery (D.12 step 2),
+        in the policy now: field names only, never values."""
+        policy = self._policy()
+        found = committed_for(policy, url)
+        if found is None:
+            # Reloaded while it ran: the policy names this URL no more.
+            raise OnboardError(refusal("onboarding_unknown"))
+        fields = mismatches(policy, plan)
+        again = [onboard_again(url).answer()]
+        if fields:
+            answer = refusal("onboarding_mismatch", fields=", ".join(fields))
+            raise OnboardError(replace(answer, more=(("fields", fields), ("next", again))))
+        cred = policy.credentials[found.credential]
+        assert isinstance(cred, OAuth2Credential)  # noqa: S101 - committed_for found an oauth2 one
+        self._secret_bound(policy, cred, again)
+        held = token_state(found.credential, cred, self._store.names())
+        meta = plan.metadata
+        return {
+            "stage": "committed",
+            "names": {
+                "credential": found.credential,
+                "route": found.route,
+                "server": found.server,
+                "source": "given",
+            },
+            "plan": {
+                "server_url": plan.server_url,
+                "resource": plan.resource,
+                "issuer": plan.issuer,
+                "authorization_endpoint": meta.authorization_endpoint,
+                "token_endpoint": meta.token_endpoint,
+                "revocation_endpoint": meta.revocation_endpoint,
+                "require_iss": meta.require_iss,
+                "client_auth": cred.effective_client_auth,
+                "hosts": list(plan.hosts),
+            },
+            "rows": [list(row) for row in plan.rows()],
+            "token": held,
+            "next": [step.answer() for step in committed_next(found, held)],
+        }
+
+    def _secret_bound(
+        self, policy: Policy, cred: OAuth2Credential, again: list[dict[str, Any]]
+    ) -> None:
+        """D.7 step 5 for the second run (D.12): a ``store:`` client secret's authenticated
+        binding is still the one the committed policy derives, as login checks it."""
+        ref = cred.client_secret or ""
+        if not ref.startswith("store:"):
+            return
+        name = ref.removeprefix("store:")
+        try:
+            expected = derive_binding(policy, name)
+        except BindingError as exc:
+            raise OnboardError(refusal("no_route", detail=str(exc))) from None
+        entry = self._store.entry(name)
+        if entry is not None and entry.binding != expected:
+            answer = refusal("client_secret_binding_changed")
+            raise OnboardError(replace(answer, more=(("next", again),)))
 
     def _names(
         self,
@@ -401,10 +566,13 @@ class OnboardService:
         _passes(self._findings(self._policy(), change))
         return self._table.registered(record.id, owner, change)
 
-    async def _discover(self, record: OnboardingRecord, policy: Policy, *, kept: bool) -> Plan:
+    async def _discover(
+        self, record: OnboardingRecord, policy: Policy, *, kept: bool, committed: bool = False
+    ) -> Plan:
         """D.2, D.2a and D.3 in order, each answer judged by ``discovery``. A kept secret
         (``kept``, D.7 step 6) is sent nowhere and bound to nothing new, so it needs no named
-        issuer: its binding decides."""
+        issuer: its binding decides. A second run (``committed``, D.12) registers nothing, so
+        it needs no client."""
         fetcher = Fetcher(
             self._client,
             proxied=self._egress_proxy is not None,
@@ -478,7 +646,7 @@ class OnboardService:
         )
         if options.scope is not None:
             plan = replace(plan, scopes=Scopes(tuple(options.scope.split(" ")), "given", False))
-        if options.client_id is None:
+        if options.client_id is None and not committed:
             # D.4's order, until this vault registers clients: a given client ID, or none.
             raise OnboardError(refusal("registration_unavailable", host=_issuer_host(plan)))
         return plan
@@ -594,6 +762,8 @@ class OnboardService:
             fields["client_secret"] = f"store:{client_secret}"
         if plan.scopes.scopes:
             fields["scope"] = " ".join(plan.scopes.scopes)
+        if options.reregister:
+            return self._reregistration(record, fields)
         url = record.server_url
         path = server_path(url)
         try:
@@ -627,6 +797,65 @@ class OnboardService:
             "a key you have."
         )
         return PolicyChange(title, tuple(ops))
+
+    def _reregistration(self, record: OnboardingRecord, fields: Mapping[str, Any]) -> PolicyChange:
+        """A re-registration's fragment 1 (D.12, OPS-3): the committed credential replaced whole
+        (H.4), with the client and endpoints a fresh discovery gives and everything else the
+        operator set kept, each changed field named in a comment, never its value."""
+        names, options = record.names, record.options
+        old = self._policy().credentials.get(names.credential)
+        if not isinstance(old, OAuth2Credential):
+            # Reloaded while it ran: the policy has no such credential to replace.
+            raise OnboardError(refusal("onboarding_unknown"))
+        kept = old.model_dump(mode="json", exclude_unset=True, exclude_none=True)
+        for params in ("extra_params", "authorize_params"):
+            for key, value in kept.get(params, {}).items():
+                if isinstance(value, list):
+                    # D-184: several values (resources, say) that no fragment writes, and that
+                    # the discovered resource would replace.
+                    raise _by_hand(names.credential, f"{params}.{key}", _UNWRITABLE["type"])
+        replaced = list(REREGISTERED)
+        if options.scope is not None:
+            # The operator's --scope replaces the committed scopes, as on a first run.
+            replaced.append("scope")
+        if old.effective_client_auth != fields["client_auth"]:
+            # A public client's refresh tokens rotate, a confidential one's needn't (_change).
+            replaced.append("rotates")
+        new = {key: value for key, value in kept.items() if key not in replaced}
+        new |= {key: fields[key] for key in replaced if key in fields}
+        for params in ("extra_params", "authorize_params"):
+            new[params] = {**kept.get(params, {}), **fields[params]}
+        try:
+            credential = OAuth2Credential.model_validate(new)
+        except ValidationError as exc:
+            detail = "; ".join(error["msg"] for error in exc.errors(include_url=False))
+            raise OnboardError(refusal("diff_invalid", detail=detail)) from None
+        # By effective value, defaults included: a default left unwritten that the fragment
+        # writes out hasn't changed.
+        before, after = old.model_dump(mode="json"), credential.model_dump(mode="json")
+        changed = [
+            key
+            for key in (*REREGISTERED, "scope", "rotates", "extra_params", "authorize_params")
+            if before.get(key) != after.get(key)
+        ]
+        ops: list[Any] = [Comment("changed_was", names.credential, key) for key in changed]
+        ops.append(SetCredential(names.credential, credential))
+        if options.allow_private:
+            ops.append(AddEgressPrivate(netguard.entry_key(*server_host_port(record.server_url))))
+        title = (
+            f"re-registration of {names.server} (1 of 2). Replace credentials."
+            f"{names.credential} with this one; nothing else changes."
+        )
+        change = PolicyChange(title, tuple(ops))
+        try:
+            emit(change)
+        except EmitRefused as exc:
+            # D-184: a field the fragment can't carry would be dropped, or the fragment never
+            # made: refused now, before the operator confirms anything.
+            field = exc.path.removeprefix(f"credentials.{names.credential}.")
+            why = _UNWRITABLE.get(exc.reason, "it can't be written into a fragment")
+            raise _by_hand(names.credential, field, why) from None
+        return change
 
     def _findings(self, policy: Policy, change: PolicyChange) -> list[Finding]:
         """``check`` on the running policy with ``change`` merged; a merge the schema refuses
@@ -720,29 +949,49 @@ class OnboardService:
         """D.7's write path: the draft check again, the secret under the predicted binding, the
         final check, then fragment 1. Whatever fails after the write deletes the secret again
         in the same run, and the answer says so, so a run again never meets ``name_taken`` on
-        this run's own leftover (OPS-5)."""
+        this run's own leftover (OPS-5). A re-registration's write replaced the committed
+        credential's secret, which the running policy still uses: that one is put back."""
         plan = _plan(record)
         change = self._change(record)
         _passes(self._findings(self._policy(), change))
         text = _emitted(change, indent, target)
         if secret is None:
-            return self._register(record, owner, change, text, stored=False)
+            return self._register(record, owner, change, text)
         via: secretops.Via = "socket" if owner == CLI_OWNER else "portal"
         name = secret_names(record.names.credential)[0]
         planned = self._secret_plan(record, plan, name, secret)
+        previous = self._previous(name) if record.options.reregister else None
         # Still this owner's and still discovered, so a run that has expired never writes.
         self._discovered(record, owner)
         written = await secretops.put(self._store, self._tokens, planned, via=via)
+        undone = _DELETED if previous is None else _RESTORED
         try:
             if isinstance(written, SecretRefusal):
                 # The store's only refusal of a plan without oauth: kept in memory alone, and
-                # deleted below, so nothing changed.
+                # deleted or put back below, so nothing changed.
                 raise OnboardError(refusal("not_written"))
-            return self._register(record, owner, change, text, stored=True)
+            return self._register(record, owner, change, text, undone=undone)
         except OnboardError as exc:
+            if previous is not None:
+                entry, value = previous
+                await secretops.restore(self._store, entry, value, via=via)
+                raise OnboardError(_undone(exc.answer, "secret_restored")) from None
             deleting = secretplan.plan_delete(name, self._policy())
             await secretops.delete(self._store, self._tokens, deleting, via=via)
-            raise OnboardError(_deleted(exc.answer)) from None
+            raise OnboardError(_undone(exc.answer, "secret_deleted")) from None
+
+    def _previous(self, name: str) -> tuple[EntryMeta, Secret] | None:
+        """The committed client secret a re-registration's write replaces, as it is stored, for
+        a failure after the write to put back. One the store can't read (or doesn't have) is
+        already of no use to the running credential, so the failure deletes as a first run's
+        does."""
+        entry = self._store.entry(name)
+        if entry is None:
+            return None
+        try:
+            return entry, self._store.get_for_binding(name, entry.binding)
+        except SecretUnavailable:
+            return None
 
     def _discovered(self, record: OnboardingRecord, owner: str) -> None:
         """The onboarding as ``_ready`` found it, still: not expired, cancelled or replaced
@@ -761,14 +1010,15 @@ class OnboardService:
         change: PolicyChange,
         text: str,
         *,
-        stored: bool,
+        undone: str | None = None,
     ) -> dict[str, Any]:
-        """The final check, then the onboarding registered with fragment 1 (E.2)."""
+        """The final check, then the onboarding registered with fragment 1 (E.2). ``undone``,
+        after a secret was written, says what a failure does with it."""
         plan = _plan(record)
         policy = self._policy()
         findings = self._findings(policy, change)
         if any(finding.level == "error" for finding in findings):
-            raise OnboardError(_diff_invalid(findings, deleted=stored))
+            raise OnboardError(_diff_invalid(findings, undone=undone))
         try:
             record = self._table.registered(record.id, owner, change)
         except (OnboardingRefused, ValueError):
@@ -779,7 +1029,7 @@ class OnboardService:
             credential=record.names.credential,
             issuer=_issuer_host(plan),
             auth=_client_auth(record.options),
-            secret_stored=stored,
+            secret_stored=undone is not None,
         )
         return self._registered(record, text, findings, policy)
 
@@ -796,8 +1046,12 @@ class OnboardService:
             "client_id": record.options.client_id,
             "client_secret_expires_at": None,
         }
+        store_names = self._store.names()
+        if record.options.reregister:
+            # A re-registration replaces the committed client's secret (D.7 step 1, OPS-3).
+            store_names = [entry for entry in store_names if entry != name]
         planned = secretplan.plan_onboard_secret(
-            name, secret, binding, meta, store_names=self._store.names()
+            name, secret, binding, meta, store_names=store_names
         )
         if isinstance(planned, SecretRefusal):
             raise OnboardError(secret_refusal(planned, name=name))
@@ -852,6 +1106,14 @@ class OnboardService:
             )
         if "backstop_off" in notes:
             rows.append(["Note", BACKSTOP_OFF])
+        if options.reregister:
+            rows.append(
+                [
+                    "Re-registration",
+                    f"replaces credentials.{names.credential} and its stored client secret; "
+                    "its route and server stay",
+                ]
+            )
         return {
             "onboarding": record.id,
             "stage": record.stage,
@@ -942,7 +1204,7 @@ def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:
         raise _bad_body(f"unknown keys: {', '.join(sorted(unknown))}")
     strings: dict[str, str] = {}
     for key, value in body.items():
-        if key in ("allow_private", "secret_given"):
+        if key in FLAG_KEYS:
             if not isinstance(value, bool):
                 raise _bad_body(f"{key} is true or false")
         elif not isinstance(value, str):
@@ -1002,6 +1264,7 @@ def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:
             client_name=client_name,
             allow_private=allow_private,
             secret_given=bool(body.get("secret_given", False)),
+            reregister=bool(body.get("reregister", False)),
         )
     except ValueError as exc:
         raise _bad_body(str(exc)) from None
@@ -1011,6 +1274,20 @@ def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:
 def _names_match(url: str, given: Mapping[str, str], names: Names) -> bool:
     """Whether the names a run gives (none, or the same) are an onboarding's."""
     return not given or choose_names(url, lambda name: False, **given).same(names)
+
+
+def _committed_names(url: str, given: Mapping[str, str], found: Committed | None) -> Names:
+    """The names a second run or a re-registration works under: the committed credential's,
+    route's and server's (D.12). Names given must be those."""
+    if found is None:
+        raise _bad_body("nothing in the running policy onboards this URL: run without --reregister")
+    names = Names(found.credential, found.route, found.server)
+    if not _names_match(url, given, names):
+        raise _bad_body(
+            f"this URL is onboarded as credential {found.credential}, route {found.route} and "
+            f"server {found.server}: give those names, or none"
+        )
+    return names
 
 
 def _indent(value: object) -> tuple[int, Target]:
@@ -1093,29 +1370,49 @@ def _discovery_refusal(found: Refusal) -> Answer:
     return replace(answer, more=more) if more else answer
 
 
+def _already_configured(served: Served) -> Answer:
+    """D.12 (OPS-14): a server reaches this URL with a credential that isn't oauth2."""
+    answer = refusal("already_configured", server=served.server, kind=served.kind)
+    more = (
+        ("server", served.server),
+        ("route", served.route),
+        ("credential", served.credential),
+        ("kind", served.kind),
+        ("next", [remove_first(served).answer()]),
+    )
+    return replace(answer, more=more)
+
+
+def _by_hand(credential: str, field: str, why: str) -> OnboardError:
+    """D-184: a re-registration whose fragment can't carry what the credential sets."""
+    return OnboardError(refusal("reregister_by_hand", credential=credential, field=field, why=why))
+
+
 def _table_refusal(exc: OnboardingRefused) -> Answer:
     if exc.reason == "name_taken":
         return refusal("name_taken", name=exc.values[0])
     return refusal(exc.reason)
 
 
-def _deleted(answer: Answer) -> Answer:
-    """A refusal after the client secret was written, which this run then deleted (OPS-5)."""
-    return replace(answer, more=(*answer.more, ("secret_deleted", True)))
+def _undone(answer: Answer, key: str) -> Answer:
+    """A refusal after the client secret was written, which this run then deleted
+    (``secret_deleted``, OPS-5) or, a re-registration's, replaced by the committed one again
+    (``secret_restored``)."""
+    return replace(answer, more=(*answer.more, (key, True)))
 
 
-def _diff_invalid(findings: list[Finding], *, deleted: bool) -> Answer:
+def _diff_invalid(findings: list[Finding], *, undone: str | None) -> Answer:
     errors = [f"{f.path}: {f.message}" for f in findings if f.level == "error"]
     detail = "; ".join(errors[:5])
-    if deleted:
-        detail += "; the client secret this run stored was deleted"
+    if undone is not None:
+        detail += f"; {undone}"
     answer = refusal("diff_invalid", detail=detail)
     return replace(answer, more=(("check", [f.as_dict() for f in findings]),))
 
 
 def _passes(findings: list[Finding]) -> None:
     if any(finding.level == "error" for finding in findings):
-        raise OnboardError(_diff_invalid(findings, deleted=False))
+        raise OnboardError(_diff_invalid(findings, undone=None))
 
 
 def _emitted(change: PolicyChange, indent: int, target: Target) -> str:

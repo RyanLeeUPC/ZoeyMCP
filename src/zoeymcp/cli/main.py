@@ -470,15 +470,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
     login = commands.add_parser(
         "login",
-        help="consent to an OAuth credential and store its refresh token (inside the vault)",
+        help="consent to an OAuth credential, or onboard an MCP server by URL (inside the vault)",
         description=(
             "Open the printed URL in a browser and approve. The browser is then sent to the "
             "credential's redirect_uri, which fails to load: paste that address back. It is read "
             "from a hidden prompt, or one line of stdin, never from the command line. For the "
-            "client_credentials grant, login is a test fetch."
+            "client_credentials grant, login is a test fetch. With --mcp URL instead of a "
+            "credential, onboard the MCP server at URL: the vault discovers its authorization "
+            "server and shows the plan (stderr); confirmed, fragment 1 for the policy goes to "
+            "stdout. Run it again once the fragment is committed to compare and sign in."
         ),
     )
-    login.add_argument("credential")
+    target = login.add_mutually_exclusive_group(required=True)
+    target.add_argument("credential", nargs="?")
+    target.add_argument("--mcp", metavar="URL", help="onboard the MCP server at URL")
     login.add_argument(
         "--rebind", action="store_true", help="accept a binding the policy has changed"
     )
@@ -489,6 +494,86 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--flow", metavar="ID", help="complete a flow from --start; reads the address from stdin"
     )
+    onboard = login.add_argument_group("onboarding by URL (with --mcp)")
+    onboard.add_argument(
+        "--name", metavar="NAME", help="the credential, route and server name (default: the host's)"
+    )
+    onboard.add_argument("--credential", dest="credential_name", metavar="C")
+    onboard.add_argument("--route", metavar="R")
+    onboard.add_argument("--server", metavar="S")
+    onboard.add_argument(
+        "--issuer",
+        metavar="ISSUER",
+        help="the authorization server to use; needed with --client-secret",
+    )
+    onboard.add_argument(
+        "--scope", metavar='"TOKEN ..."', help="the scopes to request, instead of the server's"
+    )
+    onboard.add_argument("--client-name", metavar="TEXT", help="the client's name at the provider")
+    onboard.add_argument(
+        "--client-id", metavar="ID", help="a client registered at the provider already"
+    )
+    # It takes no value, but parses one (--client-secret=VALUE included) so that login --mcp
+    # refuses it without echoing it, as argparse's own error would (D.10, OPS-4).
+    onboard.add_argument(
+        "--client-secret",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="",
+        help="the client has a secret: read from a hidden prompt, or with --yes from stdin, "
+        "never from the command line",
+    )
+    onboard.add_argument(
+        "--client-auth",
+        choices=("basic", "post"),
+        help="how the client sends its secret (default basic)",
+    )
+    onboard.add_argument(
+        "--redirect-uri", metavar="URL", help="the redirect address the provider has on record"
+    )
+    onboard.add_argument(
+        "--allow-private",
+        action="store_true",
+        help="the server is on your network: its own host:port may resolve privately",
+    )
+    onboard.add_argument(
+        "--plan-only", action="store_true", help="show the plan, then stop; nothing is stored"
+    )
+    onboard.add_argument(
+        "--yes", action="store_true", help="don't ask; needed when a client secret is piped in"
+    )
+    onboard.add_argument(
+        "--reregister",
+        action="store_true",
+        help="register a new client for the committed credential, under its names",
+    )
+    onboard.add_argument(
+        "--no-connect",
+        action="store_true",
+        help="after the commit: compare only, don't sign in (an adopted grant)",
+    )
+    onboard.add_argument(
+        "--squid-src",
+        action="append",
+        default=[],
+        metavar="vault=ACL",
+        help="the Squid src ACL for the vault in the lines a proxy refusal prints",
+    )
+    layout = onboard.add_mutually_exclusive_group()
+    layout.add_argument(
+        "--indent",
+        type=int,
+        metavar="N",
+        help=f"indent fragment 1's lines N spaces (0 to {policy_emit.INDENT_MAX})",
+    )
+    layout.add_argument(
+        "--for",
+        dest="target",
+        choices=("compose",),
+        help="fragment 1 in the compose form, indented 8 with every $ written $$",
+    )
+    onboard.add_argument("--format", choices=("text", "json"))
 
     oauth = commands.add_parser("oauth", help="OAuth health: status and reset (inside the vault)")
     oauth_commands = oauth.add_subparsers(dest="action", required=True, metavar="action")
@@ -1073,25 +1158,55 @@ def _restart_chain(socket: str, stdin: TextIO, out: TextIO, err: TextIO) -> int:
 # --- login and oauth ---------------------------------------------------------------------------
 
 
-def _cmd_login(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
-    from ..vault.oauth.pkce import FLOW_TTL
+def _cmd_login(
+    args: argparse.Namespace, argv: Sequence[str], stdin: TextIO, out: TextIO, err: TextIO
+) -> int:
+    from . import onboard as onboard_cli
 
     socket = admin_client.socket_path(args.socket)
+    if args.mcp is not None:
+
+        def connect(credential: str, shown: TextIO) -> int:
+            # D.12 step 3: the login a named credential gets, with --rebind passed through.
+            return _login(socket, credential, args.rebind, None, False, stdin, shown, err)
+
+        return onboard_cli.login_mcp(
+            args, argv, stdin, out, err, connect=connect, environ=os.environ
+        )
+    problem = onboard_cli.without_mcp(args)
+    if problem is not None:
+        err.write(f"zoeymcp login: {problem}\n")
+        return EXIT_UNREADABLE
+    return _login(socket, args.credential, args.rebind, args.flow, args.start, stdin, out, err)
+
+
+def _login(
+    socket: str,
+    credential: str,
+    rebind: bool,
+    flow: str | None,
+    start: bool,
+    stdin: TextIO,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    from ..vault.oauth.pkce import FLOW_TTL
+
     try:
-        if args.flow is not None:
-            url = _read_paste(socket, args.flow, stdin, err)
+        if flow is not None:
+            url = _read_paste(socket, flow, stdin, err)
             if url is None:
                 return EXIT_FINDINGS
-            result = admin_client.oauth_complete(socket, args.credential, args.flow, url)
-            return _report_login(args.credential, result, out, err)
-        started = admin_client.oauth_login(socket, args.credential, rebind=args.rebind)
+            result = admin_client.oauth_complete(socket, credential, flow, url)
+            return _report_login(credential, result, out, err)
+        started = admin_client.oauth_login(socket, credential, rebind=rebind)
         if "flow" not in started:
-            return _report_test_fetch(args.credential, started, out, err)
-        _describe_login(args.credential, started, out)
+            return _report_test_fetch(credential, started, out, err)
+        _describe_login(credential, started, out)
         minutes = round(FLOW_TTL / 60)
-        if args.start:
+        if start:
             out.write(
-                f"\nThen, within {minutes} minutes, run: zoeymcp login {args.credential} "
+                f"\nThen, within {minutes} minutes, run: zoeymcp login {credential} "
                 f"--flow={started['flow']}\nand give it the address your browser was sent to.\n"
             )
             return EXIT_OK
@@ -1114,8 +1229,8 @@ def _cmd_login(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
         url = _read_paste(socket, started["flow"], stdin, err)
         if url is None:
             return EXIT_FINDINGS
-        result = admin_client.oauth_complete(socket, args.credential, started["flow"], url)
-        return _report_login(args.credential, result, out, err)
+        result = admin_client.oauth_complete(socket, credential, started["flow"], url)
+        return _report_login(credential, result, out, err)
     except admin_client.AdminUnavailable as exc:
         _report_login_error(exc, err)
         return EXIT_FINDINGS
@@ -1704,7 +1819,7 @@ def main(
     if args.command == "ledger":
         return _cmd_ledger(args, stdin, out, err)
     if args.command == "login":
-        return _cmd_login(args, stdin, out, err)
+        return _cmd_login(args, argv, stdin, out, err)
     if args.command == "oauth":
         return _cmd_oauth(args, out, err)
     if args.command == "health":

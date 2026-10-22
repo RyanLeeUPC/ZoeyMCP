@@ -1,5 +1,6 @@
 """Effect tests for onboarding by URL's phase 1 (M7 design D.1-D.4's given-client branch, D.7,
-D.11, E.1-E.3, M.1, M.7; X24; FM-5 to FM-7, FM-11; step 8a2).
+D.11, E.1-E.3, M.1, M.7; X24; FM-5 to FM-7, FM-11; step 8a2), and the second run and a
+re-registration (D.12, OPS-3, OPS-14, D-184; step 8b).
 
 The fakes run over TLS on loopback (tests/fakes/harness.py), and every name reaches them through
 the fake resolver's dial map (tests/fakes/resolver.py, BP-1), so the vault's guarded onboarding
@@ -37,7 +38,8 @@ from tests.fakes.mcp_server import OTHER_AS, McpFake, Switch
 from tests.fakes.oauth_server import METADATA_ELSEWHERE, AuthSwitch, FakeAuthServer
 from tests.fakes.resolver import TIMEOUT, FakeResolver
 from zoeymcp.common.policy import Policy, check_policy, parse_policy
-from zoeymcp.common.policy.merge import Merged, merge
+from zoeymcp.common.policy.merge import Merged, merge, replace_paths
+from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.portal.refusals import CATALOGUE
 from zoeymcp.vault import logs, netclient, secretops
@@ -56,6 +58,7 @@ from zoeymcp.vault.onboarding import allow_hosts
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
+from .test_deploy import compose, inline_policy
 from .test_oauth_tokens import KEYS, FailingWrites
 
 pytestmark = pytest.mark.anyio
@@ -237,7 +240,7 @@ class Rig:
     def merged(self, fragment: str) -> Policy:
         """The policy with fragment 1 merged, as ``check --with`` merges it (H.4)."""
         base = self.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
-        result = merge(base, load_mapping(fragment))
+        result = merge(base, load_mapping(fragment), replace=replace_paths(fragment))
         assert isinstance(result, Merged)
         return Policy.model_validate(result.data)
 
@@ -1255,3 +1258,379 @@ async def test_each_fetch_is_logged_without_a_path(tmp_path: Path, lines: io.Str
         "scopes": 2,
     }
     assert "/.well-known" not in lines.getvalue()
+
+
+# --- the second run (D.12, OPS-13, OPS-14) --------------------------------------------------------
+
+NEW_CLIENT = "notes-new-client"
+NEW_SECRET = "onboard-new-secret-0002"
+
+
+async def committed_public(rig: Rig) -> dict[str, Any]:
+    """J1 up to the commit: a given public client's fragment 1, merged into the policy."""
+    plan = await rig.discover(**PUBLIC)
+    made = await rig.service.fragment(plan["onboarding"], {})
+    rig.policy = rig.merged(made["diff"]["yaml"])
+    return made
+
+
+def changed_lines(text: str) -> list[str]:
+    """A re-registration fragment's comments naming each changed field."""
+    return [line for line in text.splitlines() if line.startswith("# changed:")]
+
+
+def with_credential(rig: Rig, **changes: Any) -> None:
+    """The committed notes credential edited by hand, as the operator's policy holds it."""
+    raw = rig.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    raw["credentials"]["notes"] = {**raw["credentials"]["notes"], **changes}
+    rig.policy = Policy.model_validate(raw)
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_the_second_run_compares_and_stores_nothing(
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+) -> None:
+    """D.12 steps 1 and 2: the URL a running oauth2 credential names starts no onboarding; it is
+    rediscovered with the probe and GETs alone, compared, and answered with what is next."""
+    async with running(tmp_path) as rig:
+        await committed_public(rig)
+        before = len(records(lines))
+        again = await rig.discover(**PUBLIC)
+        # A run naming nothing, or the same names, is the same second run.
+        assert (await rig.discover(url=SERVER_URL, name="notes"))["stage"] == "committed"
+        status, refused = await rig.refused(url=SERVER_URL, name="other")
+        assert (status, refused["reason"]) == (400, "bad_body")
+        assert "credential notes, route notes and server notes" in refused["detail"]
+        # A refresh token already held: the second run doesn't sign in (OPS-13).
+        slot = derive_binding(rig.policy, "notes-refresh")
+        rig.store.put("notes-refresh", "rt-notes-0001", slot)
+        held = await rig.discover(**PUBLIC)
+        assert len(rig.service._table) == 0
+    assert (again["stage"], again["names"]) == (
+        "committed",
+        {"credential": "notes", "route": "notes", "server": "notes", "source": "given"},
+    )
+    assert again["token"] == "none"
+    assert again["plan"]["token_endpoint"] == f"{ISSUER}/token"
+    assert again["plan"]["client_auth"] == "none"
+    assert ["Token endpoint", f"{ISSUER}/token"] in again["rows"]
+    review = {
+        "do": "review",
+        "label": "Review its tools in the gateway's container",
+        "command": "zoeymcp review notes",
+        "via": "exec_gateway",
+    }
+    assert again["next"] == [
+        {"do": "connect", "label": "Sign in", "command": "zoeymcp login notes", "via": "exec"},
+        review,
+    ]
+    assert (held["token"], held["next"]) == ("stored", [review])
+    assert auth.registrations == []
+    assert rig.store.names() == ["notes-refresh"]
+    later = records(lines)[before:]
+    fetched = [r["fetch_kind"] for r in later if r["event"] == "discovery_fetch"]
+    assert fetched[:3] == ["probe", "prm", "as"]
+    # The first onboarding ends as its credential is found committed (D.8).
+    ended = [r["why"] for r in later if r["event"] == "onboard_ended"]
+    assert ended == ["registered", "compared", "compared", "compared"]
+    assert "onboard_planned" not in [r["event"] for r in later]
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+async def test_the_second_run_rediscovers_over_an_earlier_plan(
+    tmp_path: Path, lines: io.StringIO
+) -> None:
+    """D.12 step 1: the owner's --plan-only run of the URL from before the commit is no plan to
+    compare against; it ends, and the second run discovers afresh."""
+    async with running(tmp_path) as rig:
+        await committed_public(rig)
+        committed = rig.policy
+        rig.restart()
+        rig.policy = example_policy()
+        planned = await rig.discover(**PUBLIC)
+        rig.policy = committed
+        before = len(records(lines))
+        again = await rig.discover(**PUBLIC)
+        assert len(rig.service._table) == 0
+    assert (planned["stage"], again["stage"]) == ("discovered", "committed")
+    later = records(lines)[before:]
+    assert [(r["event"], r.get("why")) for r in later[:2]] == [
+        ("onboard_ended", "cancelled"),
+        ("onboard_started", None),
+    ]
+    fetched = [r["fetch_kind"] for r in later if r["event"] == "discovery_fetch"]
+    assert fetched[:3] == ["probe", "prm", "as"]
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+async def test_a_committed_field_that_differs_is_named(tmp_path: Path, lines: io.StringIO) -> None:
+    """GR-26: a hand edit between the commits is named by its field, never its value, and the
+    answer says how to register again (OPS-3)."""
+    async with running(tmp_path) as rig:
+        await committed_public(rig)
+        with_credential(rig, token_url=f"{ISSUER}/edited-token", require_iss=False)
+        status, body = await rig.refused(**PUBLIC)
+        assert len(rig.service._table) == 0
+    assert (status, body["reason"]) == (409, "onboarding_mismatch")
+    assert body["fields"] == ["credentials.notes.token_url", "credentials.notes.require_iss"]
+    assert "credentials.notes.token_url, credentials.notes.require_iss" in body["error"]
+    assert "edited-token" not in json.dumps(body)
+    assert body["next"] == [
+        {
+            "do": "onboard_again",
+            "label": "Register a new client",
+            "command": f"zoeymcp login --mcp {SERVER_URL} --reregister",
+            "via": "exec",
+        }
+    ]
+    [refused] = [r for r in records(lines) if r["event"] == "onboard_refused"]
+    assert (refused["reason"], refused["host"]) == ("onboarding_mismatch", MCP)
+
+
+@pytest.mark.usefixtures("mcp", "auth")
+@pytest.mark.parametrize("name", ["compose.hardened.yaml", "compose.yaml"])
+async def test_the_shipped_static_key_notes_is_already_configured(
+    tmp_path: Path, names: FakeResolver, name: str
+) -> None:
+    """OPS-14: J1 walked verbatim meets the compose files' example notes server, whose route has a
+    static key; nothing is fetched."""
+    async with running(tmp_path) as rig:
+        rig.policy = inline_policy(compose(name), name)
+        status, body = await rig.refused(**PUBLIC)
+        assert len(rig.service._table) == 0
+    assert (status, body["reason"]) == (409, "already_configured")
+    assert (body["server"], body["route"], body["credential"], body["kind"]) == (
+        "notes",
+        "notes-mcp",
+        "notes-key",
+        "header",
+    )
+    assert "with a credential of kind header, not oauth2" in body["error"]
+    assert body["next"] == [
+        {
+            "do": "fix_policy",
+            "label": "Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key "
+            "from the policy, reload, then run this command again",
+        }
+    ]
+    assert names.lookups == []
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+async def test_the_second_run_checks_a_stored_secrets_binding(tmp_path: Path) -> None:
+    """D.12 step 2 runs D.7 step 5's check: a client secret stored under another binding than
+    the committed policy derives is refused, with the command to register again."""
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(**CONFIDENTIAL)
+        made = await rig.service.register(plan["onboarding"], {"client_secret": SECRET})
+        rig.policy = rig.merged(made["diff"]["yaml"])
+        fine = await rig.discover(**CONFIDENTIAL)
+        entry = rig.store.entry(SECRET_NAME)
+        assert entry is not None
+        elsewhere = oauth_binding("https://tokens.elsewhere.example/token", [f"https://{MCP}"])
+        rig.store.put(SECRET_NAME, SECRET, elsewhere, meta=entry.meta)
+        status, body = await rig.refused(**CONFIDENTIAL)
+    assert (fine["stage"], fine["plan"]["client_auth"]) == ("committed", "basic")
+    assert (status, body["reason"]) == (409, "client_secret_binding_changed")
+    assert body["next"][0]["command"] == f"zoeymcp login --mcp {SERVER_URL} --reregister"
+
+
+# --- a re-registration (D.12, OPS-3, D-184) -------------------------------------------------------
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_a_reregistration_replaces_the_credential_and_its_secret(
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+) -> None:
+    """OPS-3: the committed names kept, fragment 1 replacing credentials.notes whole with the
+    new client, each changed field named, what the operator set kept, and the stored secret
+    replaced under the binding that fragment derives."""
+    again = {**CONFIDENTIAL, "client_id": NEW_CLIENT, "reregister": True}
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(**CONFIDENTIAL)
+        made = await rig.service.register(plan["onboarding"], {"client_secret": SECRET})
+        rig.policy = rig.merged(made["diff"]["yaml"])
+        with_credential(rig, grant_lifetime_days=30)
+        planned = await rig.discover(**again)
+        redone = await rig.service.register(planned["onboarding"], {"client_secret": NEW_SECRET})
+        # Until the policy holds the new credential, fragment 1 is there to show again.
+        shown = await rig.service.fragment(planned["onboarding"], {})
+        rig.policy = rig.merged(redone["diff"]["yaml"])
+        status, gone = await refusal_of(rig.service.fragment(planned["onboarding"], {}))
+        # Committed, the second run compares it as any other.
+        compared = await rig.discover(**{**CONFIDENTIAL, "client_id": NEW_CLIENT})
+    assert (planned["stage"], planned["names"]["credential"]) == ("discovered", "notes")
+    assert [
+        "Re-registration",
+        "replaces credentials.notes and its stored client secret; its route and server stay",
+    ] in planned["rows"]
+    text = redone["diff"]["yaml"]
+    assert text.splitlines()[:2] == [
+        "# zoeymcp: re-registration of notes (1 of 2). Replace credentials.notes with this one; "
+        "nothing else changes.",
+        "# zoeymcp replace: credentials.notes",
+    ]
+    # Only the field that changed by value: the defaults the hand-kept policy leaves unwritten
+    # (redirect_uri, say) and the fragment writes out are the same.
+    assert changed_lines(text) == ["# changed: notes (client_id)"]
+    fragment = load_mapping(text)
+    assert list(fragment) == ["credentials"]
+    credential = fragment["credentials"]["notes"]
+    assert credential["client_id"] == NEW_CLIENT
+    assert credential["client_secret"] == f"store:{SECRET_NAME}"
+    assert credential["grant_lifetime_days"] == 30
+    assert shown["diff"]["yaml"] == text
+    assert (status, gone["reason"]) == (404, "onboarding_unknown")
+    assert compared["stage"] == "committed"
+    assert redone["next"][-1] == {
+        "do": "connect",
+        "label": "Then sign in with the new client",
+        "command": "zoeymcp login notes --rebind",
+        "via": "exec",
+    }
+    secret, _ = rig.store.get_for_oauth(SECRET_NAME, token_url=f"{ISSUER}/token")
+    assert secret.reveal() == NEW_SECRET
+    entry = rig.store.entry(SECRET_NAME)
+    assert entry is not None
+    assert entry.binding == derive_binding(rig.policy, SECRET_NAME)
+    assert entry.meta is not None
+    assert entry.meta["client_id"] == NEW_CLIENT
+    assert auth.registrations == []
+    assert NEW_SECRET not in json.dumps([planned, redone, shown]) + lines.getvalue()
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+async def test_a_reregistration_that_fails_after_its_write_puts_the_old_secret_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lines: io.StringIO
+) -> None:
+    """OPS-3, OPS-5: the write replaced the secret the running credential still uses, so a final
+    check that fails after it puts that secret back, with its binding and meta, rather than
+    deleting it."""
+    again = {**CONFIDENTIAL, "client_id": NEW_CLIENT, "reregister": True}
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(**CONFIDENTIAL)
+        made = await rig.service.register(plan["onboarding"], {"client_secret": SECRET})
+        rig.policy = rig.merged(made["diff"]["yaml"])
+        committed = rig.store.entry(SECRET_NAME)
+        planned = await rig.discover(**again)
+        raw = rig.policy.model_dump(by_alias=True)
+        clash = {**raw["routes"][0], "name": "clash", "prefix": "/notes"}
+        moved_on = Policy.model_validate({**raw, "routes": [*raw["routes"], clash]})
+        put = rig.store.put
+        reloads = [moved_on]
+
+        def put_then_reload(*args: Any, **kwargs: Any) -> None:
+            put(*args, **kwargs)
+            if reloads:
+                rig.policy = reloads.pop()
+
+        monkeypatch.setattr(rig.store, "put", put_then_reload)
+        before = len(records(lines))
+        status, body = await refusal_of(
+            rig.service.register(planned["onboarding"], {"client_secret": NEW_SECRET})
+        )
+    assert (status, body["reason"], body["secret_restored"]) == (422, "diff_invalid", True)
+    assert "secret_deleted" not in body
+    assert body["error"].endswith(
+        "the client secret it replaced was put back), so no fragment is shown."
+    )
+    entry = rig.store.entry(SECRET_NAME)
+    assert committed is not None
+    assert entry is not None
+    assert (entry.binding, entry.meta) == (committed.binding, committed.meta)
+    assert rig.store.get_for_binding(SECRET_NAME, entry.binding).reveal() == SECRET
+    later = [r["event"] for r in records(lines)[before:]]
+    assert [e for e in later if e.startswith("secret_")] == ["secret_set", "secret_set"]
+    assert NEW_SECRET not in json.dumps(body) + lines.getvalue()
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+async def test_a_reregistration_takes_a_scope_given_and_the_new_clients_rotation(
+    tmp_path: Path,
+) -> None:
+    """A re-registration keeps the committed scopes unless --scope gives others, and a client
+    that authenticates differently takes its own ``rotates``, as a first run's fragment does,
+    so check has nothing to warn about."""
+    async with running(tmp_path) as rig:
+        await committed_public(rig)
+        with_credential(rig, scope="notes.read kept.by.hand")
+        texts: list[str] = []
+        for body in (
+            {**PUBLIC, "reregister": True},
+            {**PUBLIC, "scope": "notes.read", "reregister": True},
+            {**CONFIDENTIAL, "client_id": NEW_CLIENT, "reregister": True},
+        ):
+            planned = await rig.discover(**body)
+            if body.get("secret_given"):
+                made = await rig.service.register(planned["onboarding"], {"client_secret": SECRET})
+            else:
+                made = await rig.service.fragment(planned["onboarding"], {})
+            texts.append(made["diff"]["yaml"])
+    merged: list[OAuth2Credential] = []
+    for text in texts:
+        cred = rig.merged(text).credentials["notes"]
+        assert isinstance(cred, OAuth2Credential)
+        merged.append(cred)
+    assert [changed_lines(text) for text in texts] == [
+        [],
+        ["# changed: notes (scope)"],
+        [
+            "# changed: notes (client_id)",
+            "# changed: notes (client_secret)",
+            "# changed: notes (client_auth)",
+            "# changed: notes (rotates)",
+        ],
+    ]
+    assert [cred.scope for cred in merged] == [
+        "notes.read kept.by.hand",
+        "notes.read",
+        "notes.read kept.by.hand",
+    ]
+    assert [cred.rotates for cred in merged] == [True, True, False]
+    assert [f for f in check_policy(rig.merged(texts[2])) if "rotates" in f.message] == []
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+@pytest.mark.parametrize(
+    ("changes", "field", "why"),
+    [
+        ({"token_headers": {"X-Tenant": "notes"}}, "token_headers", "never holds its values"),
+        (
+            {"extra_params": {"resource": SERVER_URL, "audience": ["a", "b"]}},
+            "extra_params.audience",
+            "not a list",
+        ),
+        (
+            {"authorize_params": {"resource": [SERVER_URL, f"{SERVER_URL}2"]}},
+            "authorize_params.resource",
+            "not a list",
+        ),
+    ],
+)
+async def test_what_a_fragment_cant_carry_is_refused_before_anything_is_stored(
+    tmp_path: Path, changes: dict[str, Any], field: str, why: str
+) -> None:
+    """D-184: a re-registration replaces the credential whole, so a field its fragment can't
+    write would be dropped: refused at discovery, before the operator confirms."""
+    async with running(tmp_path) as rig:
+        await committed_public(rig)
+        with_credential(rig, **changes)
+        status, body = await rig.refused(**PUBLIC, reregister=True)
+        assert len(rig.service._table) == 0
+    assert (status, body["reason"]) == (409, "reregister_by_hand")
+    assert f"The credential notes sets {field}, " in body["error"]
+    assert why in body["error"]
+    assert rig.store.names() == []
+
+
+@pytest.mark.usefixtures("names", "mcp", "auth")
+async def test_a_reregistration_needs_the_committed_credential(tmp_path: Path) -> None:
+    async with running(tmp_path) as rig:
+        status, body = await rig.refused(**PUBLIC, reregister=True)
+        assert (status, body["reason"]) == (400, "bad_body")
+        assert body["detail"].endswith("run without --reregister")
+        await committed_public(rig)
+        status, body = await rig.refused(**PUBLIC, name="other", reregister=True)
+        assert (status, body["reason"]) == (400, "bad_body")
+        status, body = await rig.refused(**PUBLIC, reregister="yes")
+        assert (status, body["reason"]) == (400, "bad_body")

@@ -5,7 +5,8 @@ secret an oauth2 credential uses is written and deleted through the token manage
 waits for any refresh of that slot (design D.12). If the store can't write its file, the change
 is kept in memory and the answer is ``not_written`` (B.4). An onboarding's client secret (an
 :class:`~.secretplan.OnboardPutPlan`, M7 design D.7) is written by the store with its plan's
-``meta``; nothing reads that ``meta`` to refuse or inject.
+``meta``; nothing reads that ``meta`` to refuse or inject. A re-registration that fails after
+its write puts the entry it replaced back as it was (:func:`restore`).
 
 ``secret_set`` and ``secret_deleted`` say which interface asked, in ``via``.
 """
@@ -26,7 +27,7 @@ from .secretplan import (
     SecretRefusal,
     binding_refusal,
 )
-from .store import KEEP, SecretStore, StoreWriteError
+from .store import KEEP, EntryMeta, Secret, SecretStore, StoreWriteError
 
 Via = Literal["socket", "portal"]
 
@@ -56,6 +57,22 @@ async def put(
         return SecretRefusal(409, "not_oauth", str(exc))
     logs.event("secret_set", name=plan.name, binding=binding, via=via)
     return binding
+
+
+async def restore(
+    store: SecretStore, entry: EntryMeta, value: Secret, *, via: Via
+) -> SecretRefusal | None:
+    """Put an entry back as it was before a write replaced it: its value, binding and ``meta``
+    (M7 design OPS-3, OPS-5). Returns the refusal, or ``None`` once it is back."""
+    try:
+        store.put(entry.name, value.reveal(), entry.binding, meta=entry.meta)
+    except StoreWriteError as exc:
+        logs.event(
+            "secret_set", name=entry.name, persisted=False, error_type=type(exc).__name__, via=via
+        )
+        return NOT_WRITTEN_REFUSAL
+    logs.event("secret_set", name=entry.name, binding=entry.binding, via=via)
+    return None
 
 
 async def delete(

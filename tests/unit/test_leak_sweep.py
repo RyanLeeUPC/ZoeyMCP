@@ -58,8 +58,10 @@ from zoeymcp.cli.main import main
 from zoeymcp.common import ledgerreport
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy.merge import Merged, merge
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
+from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
@@ -1181,4 +1183,45 @@ async def test_a_given_client_secret_reaches_the_store_and_nothing_else(
     assert '"store:notes-client-secret"' in made.json()["diff"]["yaml"]
     swept = "".join([*texts, log_lines.getvalue()])
     assert onboard_model.GIVEN_SECRET not in swept
+    await rig.token_client.aclose()
+
+
+async def test_a_reregistered_client_secret_reaches_the_store_and_nothing_else(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """D.12 (step 8b): after fragment 1 is committed, the second run's comparison, and a
+    re-registration whose new client secret replaces the stored one, fragment 1 again: neither
+    secret in any answer or log line."""
+    rig = AdminRig(tmp_path, onboard=True)
+    replaced = "onboard-reregistered-secret-0002"
+    texts: list[str] = []
+
+    async def call(method: str, path: str, body: Any = None) -> httpx.Response:
+        response = await rig.call(method, path, body)
+        texts.append(response.text + repr(response.headers.multi_items()))
+        return response
+
+    secret = {"client_secret": onboard_model.GIVEN_SECRET}
+    plan = (await call("POST", "/onboard/discover", onboard_model.confidential())).json()
+    made = (await call("POST", f"/onboard/{plan['onboarding']}/register", secret)).json()
+    raw = rig.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    merged = merge(raw, load_mapping(made["diff"]["yaml"]))
+    assert isinstance(merged, Merged)
+    rig.set_policy(Policy.model_validate(merged.data))
+    compared = await call("POST", "/onboard/discover", onboard_model.confidential())
+    assert compared.json()["stage"] == "committed"
+    again = {**onboard_model.confidential(), "client_id": "notes-new-client", "reregister": True}
+    plan = (await call("POST", "/onboard/discover", again)).json()
+    redone = await call(
+        "POST", f"/onboard/{plan['onboarding']}/register", {"client_secret": replaced}
+    )
+    assert redone.status_code == 200, redone.text
+    await call("POST", f"/onboard/{plan['onboarding']}/fragment", {"indent": "compose"})
+    stored, _ = rig.store.get_for_oauth(
+        onboard_model.SECRET_NAME, token_url=f"{onboard_model.ISSUER}/token"
+    )
+    assert stored.reveal() == replaced
+    swept = "".join([*texts, log_lines.getvalue()])
+    assert onboard_model.GIVEN_SECRET not in swept
+    assert replaced not in swept
     await rig.token_client.aclose()

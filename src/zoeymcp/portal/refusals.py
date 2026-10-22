@@ -333,6 +333,24 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "Your egress proxy refused the vault's connection to {host}. Allow the hosts listed "
             "here in it for the vault, then run the same command again.",
         ),
+        # The second run and a re-registration (M7 D.12, D-184; vault/onboard.py).
+        "already_configured": Entry(
+            409,
+            "The server {server} already reaches this URL, with a credential of kind {kind}, "
+            "not oauth2. Remove it, its route and that credential from the policy and reload "
+            "first.",
+        ),
+        "onboarding_mismatch": Entry(
+            409,
+            "The committed policy differs from what the server publishes now, at {fields}. "
+            "Revert the edit, or register a new client with zoeymcp login --mcp URL "
+            "--reregister.",
+        ),
+        "reregister_by_hand": Entry(
+            409,
+            "The credential {credential} sets {field}, which a re-registration's fragment can't "
+            "carry ({why}). Re-register by hand: edit the credential in the policy.",
+        ),
         # Phase 1's requests (M7 B.2, B.5; vault/oauth/fetch.py).
         "address_refused": Entry(
             502,

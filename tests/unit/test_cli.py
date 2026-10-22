@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import getpass
 import inspect
 import io
@@ -8,14 +9,20 @@ import os
 import re
 import shlex
 import sys
+from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from anyio.from_thread import BlockingPortal, start_blocking_portal
 
+from tests.fakes.oauth_server import FakeAuthServer
+from tests.unit import onboard_model
 from zoeymcp.cli import admin_client
 from zoeymcp.cli import main as main_module
+from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import (
     EXIT_FINDINGS,
     EXIT_OK,
@@ -35,12 +42,22 @@ from zoeymcp.cli.main import (
     new_client_token,
 )
 from zoeymcp.common import egresslist, netguard
-from zoeymcp.common.policy import Finding, parse_policy
+from zoeymcp.common.policy import Finding, Policy, parse_policy
 from zoeymcp.common.policy import change as policy_change
 from zoeymcp.common.policy import emit as policy_emit
+from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.vault.admin import AdminApp, SetupCodes
+from zoeymcp.vault.netclient import RESOLVE_TIMEOUT
+from zoeymcp.vault.oauth import fetch
+from zoeymcp.vault.oauth.tokens import TokenManager
+from zoeymcp.vault.onboarding import INLINE_SOURCE, allow_hosts, next_for, onboard_again
+from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
+from .test_deploy import compose, inline_policy
+from .test_oauth_tokens import KEYS
+from .test_onboarding import staged as onboarding_staged
 from .test_policy_change import notes_change, review_change
 
 
@@ -2426,3 +2443,740 @@ def test_sessions_are_listed_and_ended(admin: FakeAdmin) -> None:
         "",
         "zoeymcp sessions: stopping\n",
     )
+
+
+# --- login --mcp: onboarding by URL (M7 design D.10-D.12, M.7; step 8b) ---------------------------
+
+URL = "https://mcp.notes.example/mcp"
+HOSTILE_URL = "https://mcp.notes.example/a;id"
+ISSUER = "https://auth.notes.example"
+HARDENED = "docker compose -f deploy/compose.hardened.yaml"
+FRAGMENT = (
+    "# zoeymcp: onboarding notes (1 of 2). Merge into your policy; nothing here replaces a key "
+    'you have.\ncredentials:\n  "notes":\n    kind: "oauth2"\n'
+)
+PLAN_ROWS = [
+    ["Server", URL],
+    ["Resource name", "Notes\u202e\x1b[2J"],
+    ["Issuer", f"{ISSUER} (the only one the server names)"],
+    ["Client", "zc_given (given)"],
+]
+
+
+def discovered(**changes: Any) -> dict[str, Any]:
+    """A discover answer for a given public client (M.1)."""
+    plan = {"server_url": URL, "issuer": ISSUER, "client_id": "zc_given"}
+    answer = {
+        "onboarding": "ob-0001",
+        "stage": "discovered",
+        "expires": 1_800_000_000,
+        "names": {"credential": "notes", "route": "notes", "server": "notes", "source": "given"},
+        "plan": plan,
+        "rows": PLAN_ROWS,
+        "allowance": [],
+        "draft_check": [{"level": "warning", "path": "routes", "message": "a warning"}],
+        "next": [{"do": "make_fragment", "label": "Make the YAML"}],
+    }
+    return {**answer, **changes}
+
+
+def registered_next(server_url: str = HOSTILE_URL) -> list[dict[str, Any]]:
+    """The vault's own next list after fragment 1, for an inline policy (onboarding.next_for)."""
+    record = replace(onboarding_staged("registered"), server_url=server_url)
+    return [step.answer() for step in next_for(record, INLINE_SOURCE)]
+
+
+def made(**changes: Any) -> dict[str, Any]:
+    """A fragment answer (M.1's register answer)."""
+    answer = {
+        "onboarding": "ob-0001",
+        "stage": "registered",
+        "credential": "notes",
+        "client_auth": "none",
+        "secret_stored": False,
+        "secret_name": None,
+        "client_secret_expires_at": None,
+        "diff": {"yaml": FRAGMENT, "check": []},
+        "next": registered_next(),
+    }
+    return {**answer, **changes}
+
+
+@pytest.fixture
+def onboard_admin(admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch) -> FakeAdmin:
+    """The admin socket answering one public client's onboarding, with no compose variables."""
+    for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(onboard_cli.REVIEW_SERVICE_ENV, raising=False)
+    admin.answers[("POST", "/onboard/discover")] = (200, discovered())
+    admin.answers[("POST", "/onboard/ob-0001/fragment")] = (200, made())
+    admin.answers[("DELETE", "/onboard/ob-0001")] = (204, {})
+    return admin
+
+
+PUBLIC_ARGV = ["login", "--mcp", URL, "--name", "notes", "--client-id", "zc_given", "--socket", "x"]
+
+
+def test_login_mcp_writes_fragment_1_to_stdout_and_the_rest_to_stderr(
+    onboard_admin: FakeAdmin,
+) -> None:
+    """J1 for a given public client: the plan, fragment 1 and the next commands, each as typed on
+    the host: shell-quoted by the vault (a URL with ;id), prefixed here (M.7, TI-14)."""
+    code, out, err = cli([*PUBLIC_ARGV, "--yes"])
+    assert (code, out) == (EXIT_OK, FRAGMENT)
+    assert onboard_admin.requests == [
+        (
+            "POST",
+            "/onboard/discover",
+            {"url": URL, "name": "notes", "client_id": "zc_given"},
+        ),
+        ("POST", "/onboard/ob-0001/fragment", {"indent": 0}),
+    ]
+    # Discovery waits for its fetches and lookups (the vault's 30 s and 3 x 5 s).
+    assert onboard_admin.timeouts == [60.0, 60.0]
+    assert admin_client.ONBOARD_TIMEOUT == fetch.DISCOVERY_DEADLINE + 3 * RESOLVE_TIMEOUT + 15
+    assert err == (
+        f"Discovering {URL}\n"
+        f"  Server                  {URL}\n"
+        "  Resource name           Notes[U+202E][U+001B][2J\n"
+        f"  Issuer                  {ISSUER} (the only one the server names)\n"
+        "  Client                  zc_given (given)\n"
+        "check, with this server merged:\n"
+        "  warning routes: a warning\n"
+        "Wrote fragment 1 of 2 to stdout.\n"
+        "Next:\n"
+        "  Check fragment 1 with the running policy:\n"
+        f'    {HARDENED} run --rm --no-deps -v "$PWD:/w:ro" vault check --with '
+        "/w/onboard-notes-1.yaml\n"
+        "  Merge it into the policy under ZOEYMCP_CONFIG in the compose form (--for compose), or "
+        "print the whole merged block with --print-merged --for compose and replace it\n"
+        "  Then check the edited policy:\n"
+        f"    {HARDENED} run --rm --no-deps vault check\n"
+        "  Commit, then recreate the vault:\n"
+        f"    {HARDENED} up -d vault\n"
+        "  Then sign in and review:\n"
+        f"    {HARDENED} exec vault zoeymcp login --mcp 'https://mcp.notes.example/a;id' "
+        "--name notes\n"
+    )
+
+
+def test_the_prefix_comes_from_the_compose_variables(
+    onboard_admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OPS-17: an operator with override files sets ZOEYMCP_COMPOSE_CMD; the compose files set
+    the services."""
+    monkeypatch.setenv(onboard_cli.COMPOSE_CMD_ENV, "docker compose -f deploy/compose.yaml -p mine")
+    monkeypatch.setenv(onboard_cli.EXEC_SERVICE_ENV, "zoeymcp")
+    code, _, err = cli([*PUBLIC_ARGV, "--yes"])
+    assert code == EXIT_OK
+    assert "    docker compose -f deploy/compose.yaml -p mine up -d zoeymcp\n" in err
+    assert "docker compose -f deploy/compose.yaml -p mine exec zoeymcp zoeymcp login" in err
+
+
+def test_each_way_a_command_runs() -> None:
+    prefix = onboard_cli.Prefix("dc", "my vault", "gw")
+    assert prefix.line("zoeymcp x", "exec") == "dc exec 'my vault' zoeymcp x"
+    assert prefix.line("zoeymcp x", "exec", piped=True) == "dc exec -T 'my vault' zoeymcp x"
+    assert prefix.line("zoeymcp review s", "exec_gateway") == "dc exec gw zoeymcp review s"
+    assert prefix.line("check", "run") == "dc run --rm --no-deps 'my vault' check"
+    assert prefix.line("check", "run_mount") == (
+        "dc run --rm --no-deps -v \"$PWD:/w:ro\" 'my vault' check"
+    )
+    assert prefix.line("", "up") == "dc up -d 'my vault'"
+    assert prefix.line("zoeymcp check --config p.yaml", None) == "zoeymcp check --config p.yaml"
+    assert onboard_cli.Prefix.from_environ({}) == onboard_cli.Prefix(
+        "docker compose -f deploy/compose.hardened.yaml", "vault", "gateway"
+    )
+
+
+def test_login_mcp_as_json(onboard_admin: FakeAdmin) -> None:
+    """D-171: --format json; stdout holds one ASCII JSON document of the vault's answers."""
+    code, out, err = cli([*PUBLIC_ARGV, "--yes", "--format", "json"])
+    assert code == EXIT_OK
+    assert out.isascii()
+    assert json.loads(out) == {"discover": discovered(), "fragment": made()}
+    assert "Wrote fragment 1 of 2 to stdout." in err
+
+
+@pytest.mark.parametrize(("answer", "goes_on"), [("y\n", True), ("YES\n", True), ("n\n", False)])
+def test_the_operator_confirms_the_client(
+    onboard_admin: FakeAdmin, answer: str, goes_on: bool
+) -> None:
+    code, out, err = cli(PUBLIC_ARGV, io.StringIO(answer))
+    assert "\nUse client zc_given at auth.notes.example? [y/N] " in err
+    if goes_on:
+        assert (code, out) == (EXIT_OK, FRAGMENT)
+        return
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err.endswith("zoeymcp login: nothing was registered or stored\n")
+    assert onboard_admin.requests[-1] == ("DELETE", "/onboard/ob-0001", None)
+
+
+def test_a_registration_is_asked_for_by_its_host(onboard_admin: FakeAdmin) -> None:
+    plan = discovered(plan={"server_url": URL, "issuer": ISSUER, "client_id": None})
+    onboard_admin.answers[("POST", "/onboard/discover")] = (200, plan)
+    _, _, err = cli(["login", "--mcp", URL, "--socket", "x"])
+    assert "Register a client at auth.notes.example? [y/N] " in err
+
+
+SECRET_ARGV = [
+    "login",
+    "--mcp",
+    URL,
+    "--name",
+    "notes",
+    "--issuer",
+    ISSUER,
+    "--client-id",
+    "zc_given",
+    "--client-secret",
+    "--socket",
+    "x",
+]
+
+
+def test_a_piped_client_secret_needs_yes(onboard_admin: FakeAdmin) -> None:
+    """OPS-4: the confirmation can't come from the stdin the secret does; the refusal names the
+    piped exec -T form, and nothing is asked of the vault."""
+    code, out, err = cli(SECRET_ARGV, io.StringIO("onboard-cli-secret-0001\n"))
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err == (
+        "zoeymcp login: a client secret read from a pipe needs --yes, since the confirmation "
+        "can't come from the same stdin: printf '%s' \"$CLIENT_SECRET\" | "
+        f"{HARDENED} exec -T vault zoeymcp login --mcp {URL} --name notes --issuer {ISSUER} "
+        "--client-id zc_given --client-secret --socket x --yes\n"
+    )
+    assert onboard_admin.requests == []
+
+
+def test_a_piped_client_secret_with_yes_goes_only_to_register(onboard_admin: FakeAdmin) -> None:
+    secret = "onboard-cli-secret-0001"
+    plan = discovered(next=[{"do": "register", "label": "Store the secret and make the YAML"}])
+    onboard_admin.answers[("POST", "/onboard/discover")] = (200, plan)
+    stored = made(client_auth="basic", secret_stored=True, secret_name="notes-client-secret")
+    onboard_admin.answers[("POST", "/onboard/ob-0001/register")] = (200, stored)
+    composed = made(diff={"yaml": " " * 8 + FRAGMENT, "check": []})
+    onboard_admin.answers[("POST", "/onboard/ob-0001/fragment")] = (200, composed)
+    code, out, err = cli([*SECRET_ARGV, "--yes", "--for", "compose"], io.StringIO(secret + "\n"))
+    assert (code, out) == (EXIT_OK, " " * 8 + FRAGMENT)
+    assert onboard_admin.requests == [
+        (
+            "POST",
+            "/onboard/discover",
+            {
+                "url": URL,
+                "name": "notes",
+                "issuer": ISSUER,
+                "client_id": "zc_given",
+                "secret_given": True,
+            },
+        ),
+        ("POST", "/onboard/ob-0001/register", {"client_secret": secret}),
+        ("POST", "/onboard/ob-0001/fragment", {"indent": "compose"}),
+    ]
+    assert "Stored the client secret as notes-client-secret, bound to the token endpoint" in err
+    assert secret not in out + err
+
+
+def test_a_terminal_reads_the_secret_hidden(
+    onboard_admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts: list[str] = []
+
+    def hidden(prompt: str) -> str:
+        prompts.append(prompt)
+        return "onboard-cli-secret-0002"
+
+    monkeypatch.setattr(getpass, "getpass", hidden)
+    stored = made(secret_stored=True, secret_name="notes-client-secret")
+    onboard_admin.answers[("POST", "/onboard/ob-0001/register")] = (200, stored)
+    code, _, _ = cli([*SECRET_ARGV, "--yes"], TTY())
+    assert code == EXIT_OK
+    assert prompts == ["Secret value (input hidden): "]
+    assert onboard_admin.requests[-1] == (
+        "POST",
+        "/onboard/ob-0001/register",
+        {"client_secret": "onboard-cli-secret-0002"},
+    )
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        ["--client-secret", "s3cret-in-argv"],
+        ["--client-secret=s3cret-in-argv"],
+        ["--client-sec=s3cret-in-argv"],
+        ["--client-secret="],
+    ],
+)
+def test_a_client_secret_is_never_an_argument(admin: FakeAdmin, written: list[str]) -> None:
+    """--client-secret takes no value, however it is written, and the refusal doesn't echo it
+    (D.10, OPS-4)."""
+    argv = ["login", "--mcp", URL, "--client-id", "c", "--issuer", ISSUER, *written, "--yes"]
+    code, out, err = cli([*argv, "--socket", "x"])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err == (
+        "zoeymcp login: a client secret is never an argument: give --client-secret alone, and "
+        "pipe the secret in with --yes or type it at the hidden prompt\n"
+    )
+    assert admin.requests == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--mcp", URL, "--start"], "--start and --flow go with a credential, not --mcp"),
+        (
+            ["--mcp", URL, "--client-secret", "--issuer", ISSUER, "--yes"],
+            "--client-secret goes with --client-id",
+        ),
+        (
+            ["--mcp", URL, "--client-id", "c", "--client-secret", "--yes"],
+            "--client-secret needs --issuer, the authorization server that issued the client: a "
+            "discovered one that differs is refused",
+        ),
+        (
+            ["--mcp", URL, "--client-id", "c", "--client-auth", "post"],
+            "--client-auth goes with --client-secret",
+        ),
+        (
+            ["--mcp", URL, "--reregister", "--no-connect"],
+            "--no-connect goes with the run after the commit, not with --reregister",
+        ),
+        (["--mcp", URL, "--indent", "17"], "--indent is 0 to 16"),
+        (
+            ["--mcp", URL, "--squid-src", "gateway=acl"],
+            "--squid-src gateway=acl: write vault=ACL, ACL 1 to 64 letters, digits or underscores",
+        ),
+        (
+            ["--mcp", URL, "--squid-src", "vault=bad-acl"],
+            "--squid-src vault=bad-acl: write vault=ACL, ACL 1 to 64 letters, digits or "
+            "underscores",
+        ),
+        (["music", "--plan-only"], "--plan-only goes with --mcp"),
+        (["music", "--name", "n", "--yes"], "--name, --yes go with --mcp"),
+    ],
+)
+def test_login_mcp_usage_errors(admin: FakeAdmin, argv: list[str], message: str) -> None:
+    code, out, err = cli(["login", *argv, "--socket", "x"])
+    assert (code, out, err) == (EXIT_UNREADABLE, "", f"zoeymcp login: {message}\n")
+    assert admin.requests == []
+
+
+@pytest.mark.parametrize("argv", [["music", "--mcp", URL], []])
+def test_a_credential_and_mcp_exclude_each_other(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as info, contextlib.redirect_stderr(io.StringIO()):
+        main(["login", *argv], out=io.StringIO(), err=io.StringIO())
+    assert info.value.code == 2
+
+
+def test_a_draft_check_error_stops_before_anything_is_asked(onboard_admin: FakeAdmin) -> None:
+    error = {"level": "error", "path": "routes[3].prefix", "message": "/notes is taken\x07"}
+    fix = {
+        "do": "fix_policy",
+        "label": "Fix the policy first: check finds 1 error(s) with this server merged",
+    }
+    plan = discovered(draft_check=[error], next=[fix])
+    onboard_admin.answers[("POST", "/onboard/discover")] = (200, plan)
+    code, out, err = cli([*PUBLIC_ARGV, "--yes"])
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert "  error   routes[3].prefix: /notes is taken[U+0007]\n" in err
+    assert err.endswith(f"Next:\n  {fix['label']}\n")
+    assert [request[1] for request in onboard_admin.requests] == ["/onboard/discover"]
+
+
+def test_plan_only_stops_after_the_plan(onboard_admin: FakeAdmin) -> None:
+    code, out, err = cli([*PUBLIC_ARGV, "--plan-only"])
+    assert (code, out) == (EXIT_OK, "")
+    assert err.endswith(
+        "Plan only: nothing was registered or stored. The same command without --plan-only "
+        "carries on from this plan within 30 minutes.\n"
+    )
+    assert [request[1] for request in onboard_admin.requests] == ["/onboard/discover"]
+
+
+def proxy_refusal() -> dict[str, Any]:
+    """D.11's answer, as the vault words it (onboarding.allow_hosts)."""
+    hosts = allow_hosts([("auth.notes.example", 443), ("mcp.notes.example", 443)], {})
+    return {
+        "reason": "proxy_refused",
+        "error": "Your egress proxy refused the vault's connection to auth.notes.example. Allow "
+        "the hosts listed here in it for the vault, then run the same command again.",
+        "host": "auth.notes.example",
+        "port": 443,
+        "status": 403,
+        "next": [hosts.answer()],
+    }
+
+
+def test_a_proxy_refusal_names_the_hosts_and_the_command_again(onboard_admin: FakeAdmin) -> None:
+    """D.11: the hosts, their Squid lines with the vault's source ACL from --squid-src (OPS-7),
+    and this run's argv again, every argument shell-quoted, with -T for a piped stdin and the
+    fragment's redirect for a redirected stdout."""
+    onboard_admin.answers[("POST", "/onboard/discover")] = (502, proxy_refusal())
+    argv = ["login", "--mcp", HOSTILE_URL, "--name", "notes", "--client-id", "zc_given"]
+    argv += ["--squid-src", "vault=stack_vault_net", "--socket", "x"]
+    code, out, err = cli(argv)
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err == (
+        "zoeymcp login: Your egress proxy refused the vault's connection to auth.notes.example. "
+        "Allow the hosts listed here in it for the vault, then run the same command again.\n"
+        "Next:\n"
+        "  Allow these hosts in your proxy for the vault\n"
+        "    auth.notes.example:443\n"
+        "    mcp.notes.example:443\n"
+        "    acl zoeymcp_port_443 port 443\n"
+        "    acl zoeymcp_onboard_1 dstdomain -n auth.notes.example\n"
+        "    http_access allow stack_vault_net CONNECT zoeymcp_onboard_1 zoeymcp_port_443 "
+        "!zoeymcp_private_dst\n"
+        "    acl zoeymcp_onboard_2 dstdomain -n mcp.notes.example\n"
+        "    http_access allow stack_vault_net CONNECT zoeymcp_onboard_2 zoeymcp_port_443 "
+        "!zoeymcp_private_dst\n"
+        "  Then run the same command again:\n"
+        f"    {HARDENED} exec -T vault zoeymcp login --mcp 'https://mcp.notes.example/a;id' "
+        "--name notes --client-id zc_given --squid-src vault=stack_vault_net --socket x "
+        "> onboard-notes-1.yaml\n"
+    )
+
+
+def test_the_retry_on_a_terminal_has_no_redirect(
+    onboard_admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    onboard_admin.answers[("POST", "/onboard/discover")] = (502, proxy_refusal())
+    out, err = TTY(), io.StringIO()
+    code = main(["login", "--mcp", URL, "--socket", "x"], stdin=TTY(), out=out, err=err)
+    assert code == EXIT_FINDINGS
+    assert err.getvalue().endswith(
+        f"  Then run the same command again:\n    {HARDENED} exec vault zoeymcp login --mcp {URL} "
+        "--socket x\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "lines"),
+    [
+        (
+            {
+                "reason": "as_choice_needed",
+                "error": "The server names several authorization servers.",
+                "issuers": ["https://a.example", "https://b.example"],
+            },
+            ["  issuers: https://a.example, https://b.example", "  name one with --issuer"],
+        ),
+        (
+            {"reason": "prm_not_found", "error": "No metadata.", "tried": [f"{URL}/x"]},
+            [f"  tried: {URL}/x"],
+        ),
+        (
+            {"reason": "bad_body", "error": "The request didn't fit.", "detail": "scope is bad"},
+            ["  scope is bad"],
+        ),
+        (
+            {
+                "reason": "diff_invalid",
+                "error": "Fails check.",
+                "check": [{"level": "error", "path": "routes", "message": "taken"}],
+                "secret_deleted": True,
+            },
+            ["  error   routes: taken", "  The client secret this run stored was deleted again."],
+        ),
+        (
+            {"reason": "not_written", "error": "Not written.", "secret_restored": True},
+            ["  The client secret it replaced was put back; the policy still uses it."],
+        ),
+        (
+            {
+                "reason": "onboarding_mismatch",
+                "error": "Differs.",
+                "fields": ["credentials.notes.token_url"],
+                "next": [onboard_again(URL).answer()],
+            },
+            [
+                "  differs: credentials.notes.token_url",
+                "Next:",
+                "  Register a new client:",
+                f"    {HARDENED} exec vault zoeymcp login --mcp {URL} --reregister",
+            ],
+        ),
+    ],
+)
+def test_what_a_refusal_carries_is_shown(
+    onboard_admin: FakeAdmin, answer: dict[str, Any], lines: list[str]
+) -> None:
+    onboard_admin.answers[("POST", "/onboard/discover")] = (409, answer)
+    code, _, err = cli([*PUBLIC_ARGV, "--yes"])
+    assert code == EXIT_FINDINGS
+    assert err.splitlines() == [f"zoeymcp login: {answer['error']}", *lines]
+
+
+def test_a_refusal_as_json(onboard_admin: FakeAdmin) -> None:
+    onboard_admin.answers[("POST", "/onboard/discover")] = (502, proxy_refusal())
+    code, out, _ = cli([*PUBLIC_ARGV, "--format", "json"])
+    assert code == EXIT_FINDINGS
+    refused = json.loads(out)["refused"]
+    assert refused["reason"] == "proxy_refused"
+    assert [step["do"] for step in refused["next"]] == ["allow_hosts", "retry"]
+
+
+def test_a_cancelled_onboarding_answers_nothing(onboard_admin: FakeAdmin) -> None:
+    assert admin_client.onboard_cancel("x", "ob-0001") == {}
+
+
+# --- the second run, through the real admin app (D.12, J1, J3) -----------------------------------
+
+
+class Vault(httpx.BaseTransport):
+    """The vault's admin app, reached as the CLI reaches its socket: the onboarding service on
+    onboard_model's in-process server and its authorization server's metadata, and a token
+    manager and login whose token endpoint is the fake authorization server, all on the
+    portal's one event loop."""
+
+    def __init__(self, tmp_path: Path, portal: BlockingPortal) -> None:
+        self.portal = portal
+        self.policy = parse_policy(EXAMPLE_POLICY.read_text(encoding="utf-8"), "example")
+        self.store = SecretStore(tmp_path, KEYS)
+        self.store.load()
+        self.auth = FakeAuthServer(
+            client_id=onboard_model.CLIENT_ID,
+            auth="none",
+            issuer=onboard_model.ISSUER,
+            scopes=("notes.read", "offline_access"),
+            registration="none",
+            prefix="fake-notes",
+        )
+        self.auth_app = self.auth.app()
+        self.token_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.auth_app))
+        self.tokens = TokenManager(self.store, self.token_client)
+        self.tokens.configure(self.policy, {})
+        onboard = onboard_model.onboard_service(self.store, self.tokens, lambda: self.policy)
+        setup = SetupCodes(tmp_path, KEYS.portal_key)
+        self.admin = AdminApp(
+            self.store, KEYS, lambda: self.policy, setup, self.tokens, onboard=onboard
+        )
+
+    def set_policy(self, policy: Policy) -> None:
+        """As a reload does: the admin and the token manager see the same policy."""
+        self.policy = policy
+        self.tokens.configure(policy, {})
+
+    def commit(self, fragment: str) -> None:
+        """Fragment 1 merged as ``check --with`` merges it, committed and reloaded."""
+        base = self.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+        merged = merge(base, load_mapping(fragment), replace=replace_paths(fragment))
+        assert isinstance(merged, Merged)
+        self.set_policy(Policy.model_validate(merged.data))
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        content = request.read()
+        path = request.url.raw_path.decode()
+
+        async def call() -> tuple[int, bytes]:
+            transport = httpx.ASGITransport(app=self.admin.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://vault-admin") as c:
+                answer = await c.request(
+                    request.method,
+                    path,
+                    content=content,
+                    headers={"content-type": "application/json"} if content else {},
+                )
+            return answer.status_code, answer.content
+
+        status, body = self.portal.call(call)
+        return httpx.Response(status, content=body)
+
+    def browse(self, url: str) -> str:
+        """The operator's browser at the authorization URL: where it is sent back to."""
+
+        async def go() -> str:
+            transport = httpx.ASGITransport(app=self.auth_app)
+            async with httpx.AsyncClient(transport=transport) as client:
+                answer = await client.get(url)
+            assert answer.status_code == 302, answer.text
+            return answer.headers["location"]
+
+        return self.portal.call(go)
+
+
+class Browser(io.StringIO):
+    """The paste: reading it opens the authorization URL the CLI printed, in the fake's
+    browser, and answers the address the browser was sent to."""
+
+    def __init__(self, vault: Vault, shown: io.StringIO, text: str = "") -> None:
+        super().__init__(text)
+        self.vault = vault
+        self.shown = shown
+        self.visits = 0
+
+    def readline(self, size: int = -1, /) -> str:  # type: ignore[override]  # as typeshed
+        found = re.findall(
+            r"^  (https://auth\.notes\.example/authorize\?\S+)$", self.shown.getvalue(), re.M
+        )
+        if not found:
+            return super().readline()
+        self.visits += 1
+        return self.vault.browse(found[-1]) + "\n"
+
+
+@pytest.fixture
+def vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Vault]:
+    for name in (
+        onboard_cli.COMPOSE_CMD_ENV,
+        onboard_cli.EXEC_SERVICE_ENV,
+        onboard_cli.REVIEW_SERVICE_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with start_blocking_portal() as portal:
+        rig = Vault(tmp_path, portal)
+        monkeypatch.setattr(httpx, "HTTPTransport", lambda **_: rig)
+        try:
+            yield rig
+        finally:
+            portal.call(rig.token_client.aclose)
+
+
+def onboarded(vault: Vault, argv: list[str], text: str = "") -> tuple[int, str, str, Browser]:
+    out, err = io.StringIO(), io.StringIO()
+    stdin = Browser(vault, out, text)
+    code = main(argv, stdin=stdin, out=out, err=err)
+    return code, out.getvalue(), err.getvalue(), stdin
+
+
+J1 = ["login", "--mcp", onboard_model.SERVER_URL, "--name", "notes", "--socket", "x"]
+
+
+def test_j1_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
+    """J1 for a given public client against the fakes: fragment 1, the commit, and the second
+    run, which compares, signs in with login's paste flow and names the review next (D.12)."""
+    code, fragment, err, _ = onboarded(
+        vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"]
+    )
+    assert code == EXIT_OK, err
+    assert fragment.startswith("# zoeymcp: onboarding notes (1 of 2).")
+    assert vault.store.names() == []
+    vault.commit(fragment)
+    code, out, err, browser = onboarded(vault, J1)
+    assert code == EXIT_OK, err
+    assert browser.visits == 1
+    assert "Stored the refresh token for notes as notes-refresh.\n" in out
+    assert err.startswith(
+        "notes is in the policy and matches what the server publishes "
+        f"({onboard_model.SERVER_URL}).\nConnecting:\n"
+    )
+    assert err.endswith(
+        f"Next:\n  Review its tools in the gateway's container:\n"
+        f"    {HARDENED} exec gateway zoeymcp review notes\n"
+    )
+    assert vault.store.names() == ["notes-refresh"]
+    # Signed in, the run again compares and doesn't sign in over the token it holds (OPS-13).
+    code, out, err, browser = onboarded(vault, J1)
+    assert (code, out, browser.visits) == (EXIT_OK, "", 0)
+    assert "notes already holds a refresh token (stored), so this run doesn't sign in again" in err
+
+
+def test_j3_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
+    """J3: a given confidential client, its secret piped with --yes and stored under the
+    predicted binding, then the second run signs in with it."""
+    vault.auth.client_secret = onboard_model.GIVEN_SECRET
+    vault.auth.auth = "basic"
+    argv = [*J1, "--issuer", onboard_model.ISSUER, "--client-id", onboard_model.CLIENT_ID]
+    argv += ["--client-secret", "--yes"]
+    code, fragment, err, _ = onboarded(vault, argv, onboard_model.GIVEN_SECRET + "\n")
+    assert code == EXIT_OK, err
+    assert 'client_secret: "store:notes-client-secret"' in fragment
+    assert vault.store.names() == ["notes-client-secret"]
+    vault.commit(fragment)
+    code, out, err, browser = onboarded(vault, J1)
+    assert (code, browser.visits) == (EXIT_OK, 1), err
+    assert "(confidential client, PKCE S256" in out
+    assert "Stored the refresh token for notes as notes-refresh.\n" in out
+    assert onboard_model.GIVEN_SECRET not in out + err + fragment
+
+
+def test_a_reregistration_signs_in_over_a_moved_token_endpoint(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OPS-3, D-10: the old client's grant is bound to the old token endpoint's origin, so the
+    re-registration's sign-in command passes --rebind, and completes once the endpoint moved."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    code, _, err, _ = onboarded(vault, J1)
+    assert code == EXIT_OK, err
+    held = vault.store.entry("notes-refresh")
+    moved = {
+        **onboard_model.metadata(),
+        "token_endpoint": "https://tokens.notes.example/token",
+        "revocation_endpoint": "https://tokens.notes.example/revoke",
+    }
+    monkeypatch.setattr(onboard_model, "metadata", lambda: moved)
+    argv = [*J1, "--client-id", onboard_model.CLIENT_ID, "--reregister", "--yes"]
+    code, fragment, err, _ = onboarded(vault, argv)
+    assert code == EXIT_OK, err
+    assert "# changed: notes (token_url)" in fragment.splitlines()
+    assert err.endswith(
+        f"  Then sign in with the new client:\n    {HARDENED} exec vault zoeymcp login notes "
+        "--rebind\n"
+    )
+    vault.commit(fragment)
+    # Without it, login refuses the old grant's binding.
+    code, _, err, _ = onboarded(vault, ["login", "notes", "--socket", "x"])
+    assert code != EXIT_OK
+    assert "pass --rebind to accept" in err
+    code, out, err, browser = onboarded(vault, ["login", "notes", "--rebind", "--socket", "x"])
+    assert (code, browser.visits) == (EXIT_OK, 1), err
+    assert "Stored the refresh token for notes as notes-refresh.\n" in out
+    entry = vault.store.entry("notes-refresh")
+    assert held is not None
+    assert entry is not None
+    assert entry.binding != held.binding
+
+
+def test_the_second_run_names_each_field_that_differs(vault: Vault) -> None:
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    raw = vault.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    raw["credentials"]["notes"]["token_url"] = f"{onboard_model.ISSUER}/edited"
+    vault.set_policy(Policy.model_validate(raw))
+    code, out, err, browser = onboarded(vault, J1)
+    assert (code, out, browser.visits) == (EXIT_FINDINGS, "", 0)
+    assert err.splitlines() == [
+        "zoeymcp login: The committed policy differs from what the server publishes now, at "
+        "credentials.notes.token_url. Revert the edit, or register a new client with zoeymcp "
+        "login --mcp URL --reregister.",
+        "  differs: credentials.notes.token_url",
+        "Next:",
+        "  Register a new client:",
+        f"    {HARDENED} exec vault zoeymcp login --mcp {onboard_model.SERVER_URL} --reregister",
+    ]
+
+
+def test_the_shipped_static_key_notes_is_already_configured(vault: Vault) -> None:
+    """OPS-14: J1 walked verbatim against the shipped compose file's policy."""
+    vault.set_policy(inline_policy(compose("compose.hardened.yaml"), "compose.hardened.yaml"))
+    code, out, err, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err.splitlines() == [
+        "zoeymcp login: The server notes already reaches this URL, with a credential of kind "
+        "header, not oauth2. Remove it, its route and that credential from the policy and reload "
+        "first.",
+        "Next:",
+        "  Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key from the "
+        "policy, reload, then run this command again",
+    ]
+
+
+def test_adopting_a_grant_with_no_connect(vault: Vault) -> None:
+    """OPS-13 (D.10): fragment 1 for the other tool's client, committed; --no-connect before the
+    seed signs in nothing and says how; the refresh token seeded with secret set; the second run
+    then compares and leaves it alone."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    code, out, err, browser = onboarded(vault, [*J1, "--no-connect"])
+    assert (code, out, browser.visits) == (EXIT_OK, "", 0)
+    assert "Not signing in (--no-connect).\nNext:\n  Sign in:\n" in err
+    assert f"    {HARDENED} exec vault zoeymcp login notes\n" in err
+    seeded = cli(["secret", "set", "notes-refresh", "--socket", "x"], io.StringIO("rt-adopted-1"))
+    assert seeded[0] == EXIT_OK, seeded
+    code, out, err, browser = onboarded(vault, [*J1, "--no-connect"])
+    assert (code, out, browser.visits) == (EXIT_OK, "", 0)
+    assert "notes already holds a refresh token (stored)" in err
+    assert vault.auth.seen == []

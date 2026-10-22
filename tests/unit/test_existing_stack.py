@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 import yaml
 
+from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import EXIT_OK, main
 from zoeymcp.common.policy import check_policy
 from zoeymcp.portal import listen
@@ -237,3 +238,22 @@ def test_the_readme_probes_both_containers_networks() -> None:
     assert "must be `internal: true`" in readme
     assert "for service in vault gateway; do" in readme
     assert "docker network inspect -f '{{.Internal}}'" in readme
+
+
+def test_the_printed_commands_name_this_file() -> None:
+    """M7 design M.7 (OPS-17): the commands ``login --mcp`` prints start with this file's own
+    compose command unless .env sets another, and name its services."""
+    services = compose()["services"]
+    vault, gateway = services["vault"]["environment"], services["gateway"]["environment"]
+    assert vault[onboard_cli.COMPOSE_CMD_ENV] == (
+        "docker compose -f examples/existing-stack/compose.yaml"
+    )
+    assert (vault[onboard_cli.EXEC_SERVICE_ENV], vault[onboard_cli.REVIEW_SERVICE_ENV]) == (
+        "vault",
+        "gateway",
+    )
+    assert gateway[onboard_cli.EXEC_SERVICE_ENV] == "gateway"
+    given = compose({onboard_cli.COMPOSE_CMD_ENV: "docker compose -f stack.yaml"})
+    assert given["services"]["vault"]["environment"][onboard_cli.COMPOSE_CMD_ENV] == (
+        "docker compose -f stack.yaml"
+    )

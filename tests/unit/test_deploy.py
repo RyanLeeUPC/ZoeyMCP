@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import yaml
 
+from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.common.policy import check_policy, parse_policy
 from zoeymcp.common.policy.schema import GatewayLimits, Policy
 from zoeymcp.entrypoint import env, launcher
@@ -264,3 +265,44 @@ def test_interpolation_resolves_nested_defaults() -> None:
     assert interpolated("${A:-${B:-x}}", {"B": "b"}) == "b"
     assert interpolated("${A:-${B:-x}}", {"A": "a"}) == "a"
     assert interpolated("${A:?say so}") == "set-by-the-operator"
+
+
+@pytest.mark.parametrize(
+    ("name", "command", "services"),
+    [
+        (
+            "compose.hardened.yaml",
+            "docker compose -f deploy/compose.hardened.yaml",
+            {"vault": ("vault", "gateway"), "gateway": ("gateway", None)},
+        ),
+        (
+            "compose.yaml",
+            "docker compose -f deploy/compose.yaml",
+            {"zoeymcp": ("zoeymcp", "zoeymcp")},
+        ),
+    ],
+)
+def test_the_printed_commands_name_the_tier_and_its_services(
+    name: str, command: str, services: dict[str, tuple[str, str | None]]
+) -> None:
+    """M7 design M.7 (OPS-17): ``login --mcp`` prints its commands after ZOEYMCP_COMPOSE_CMD,
+    this file's own command unless .env sets another, and the services each service names."""
+    found = compose(name)["services"]
+    for service, (own, review) in services.items():
+        environment = found[service]["environment"]
+        assert environment[onboard_cli.EXEC_SERVICE_ENV] == own
+        assert environment.get(onboard_cli.REVIEW_SERVICE_ENV) == review
+        has_command = onboard_cli.COMPOSE_CMD_ENV in environment
+        assert has_command == (review is not None)
+        if has_command:
+            assert environment[onboard_cli.COMPOSE_CMD_ENV] == command
+    given = compose(name, {onboard_cli.COMPOSE_CMD_ENV: "docker compose -f a.yaml -p mine"})
+    commands = [
+        service["environment"][onboard_cli.COMPOSE_CMD_ENV]
+        for service in given["services"].values()
+        if onboard_cli.COMPOSE_CMD_ENV in service.get("environment", {})
+    ]
+    assert commands == ["docker compose -f a.yaml -p mine"]
+    # The CLI's own default is the hardened file's, as M.7 says.
+    if name == "compose.hardened.yaml":
+        assert command == onboard_cli.DEFAULT_COMPOSE_CMD
