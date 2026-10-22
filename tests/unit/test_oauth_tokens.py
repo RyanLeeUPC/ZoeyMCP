@@ -23,10 +23,12 @@ import pytest
 
 from tests.fakes.oauth_server import MISSING, FakeAuthServer, google_style, spotify_style
 from zoeymcp.common.canonical import dumps_canonical
+from zoeymcp.common.netguard import AddressVerdict
 from zoeymcp.common.policy import Policy
 from zoeymcp.vault import logs
 from zoeymcp.vault.bindings import live_slot, oauth_binding
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.netclient import AddressRefused
 from zoeymcp.vault.oauth import tokens
 from zoeymcp.vault.oauth.protocol import (
     CREDENTIAL_UNAVAILABLE,
@@ -652,6 +654,80 @@ async def test_a_pre_send_failure_on_the_replay_ends_the_refresh(
     refused = await rig.refused()
     assert len(calls) == 2
     assert refused.reason == "no_response"
+
+
+def refusing(
+    host: str = "accounts.example", port: int = 443
+) -> tuple[httpx.MockTransport, list[int]]:
+    """A transport whose every request the address guard refuses (M7 design B.2)."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise AddressRefused(host, port, AddressVerdict(False, "loopback", "127.0.0.1"))
+
+    return httpx.MockTransport(handler), calls
+
+
+async def test_an_address_refused_token_endpoint_is_one_attempt_logged_and_kept(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    """Nothing was sent, so no replay: the refresh fails oauth_unavailable with the reason
+    address_refused, and the refusal is logged and kept for health (M7 design J)."""
+    transport, calls = refusing()
+    rig = Rig(
+        tmp_path, clock, spotify_style(clock.time), make_policy(spotify_cred()), transport=transport
+    )
+    rig.seed()
+    refused = await rig.refused()
+    assert len(calls) == 1
+    assert clock.sleeps == []
+    assert (refused.code, refused.reason) == (OAUTH_UNAVAILABLE, "address_refused")
+    line = captured.events("oauth_refresh")[0]
+    assert (line["attempt"], line["replayed"], line["failure_reason"]) == (
+        1,
+        False,
+        "address_refused",
+    )
+    [event] = captured.events("address_refused")
+    assert {k: event[k] for k in ("purpose", "host", "port", "verdict")} == {
+        "purpose": "token",
+        "host": "accounts.example",
+        "port": 443,
+        "verdict": "loopback",
+    }
+    assert rig.manager.refused() == [
+        {
+            "purpose": "token",
+            "host": "accounts.example",
+            "port": 443,
+            "verdict": "loopback",
+            "at": "2026-10-17T09:00:00Z",
+        }
+    ]
+
+
+async def test_the_guards_refusals_are_kept_once_per_destination_in_order(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """One entry per purpose and host:port, the latest time and verdict kept, in order."""
+    rig = Rig(tmp_path, clock, spotify_style(clock.time), make_policy(spotify_cred()))
+    manager = rig.manager
+    assert manager.refused() == []
+    manager.note_refused("token", "b.example", 443, "private")
+    manager.note_refused("route", "b.example", 443, "private")
+    manager.note_refused("route", "a.example", 8443, "cgnat")
+    manager.note_refused("route", "a.example", 443, "private")
+    clock.wall += 60
+    manager.note_refused("token", "b.example", 443, "loopback")
+    assert [(r["purpose"], r["host"], r["port"], r["verdict"]) for r in manager.refused()] == [
+        ("route", "a.example", 443, "private"),
+        ("route", "a.example", 8443, "cgnat"),
+        ("route", "b.example", 443, "private"),
+        ("token", "b.example", 443, "loopback"),
+    ]
+    assert manager.refused()[-1]["at"] == "2026-10-17T09:01:00Z"
+    assert manager.refused()[0]["at"] == "2026-10-17T09:00:00Z"
 
 
 async def test_the_replay_can_succeed(tmp_path: Path, clock: FakeClock, captured: Captured) -> None:

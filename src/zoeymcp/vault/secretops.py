@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Any, Final, Literal
 
 import anyio
@@ -59,13 +60,21 @@ _ANSWER_MAX: Final = 64 * 1024
 class Revoker:
     """The revocations after committed deletes: one task each, on ``client``, a guarded client
     that follows no redirect (M7 design B.2). ``proxied`` says it goes through
-    ``egress_proxy``, for the ``discovery_fetch`` line's ``via``; ``timeout`` is for tests."""
+    ``egress_proxy``, for the ``discovery_fetch`` line's ``via``; ``refused`` keeps a refusal by
+    the address guard for health (the token manager's ``note_refused``, M7 design J);
+    ``timeout`` is for tests."""
 
     def __init__(
-        self, client: httpx.AsyncClient, *, proxied: bool = False, timeout: float = REVOKE_TIMEOUT
+        self,
+        client: httpx.AsyncClient,
+        *,
+        proxied: bool = False,
+        refused: Callable[[str, str, int, str], None] | None = None,
+        timeout: float = REVOKE_TIMEOUT,
     ) -> None:
         self._client = client
         self._via = "proxy" if proxied else "direct"
+        self._refused = refused
         self._timeout = timeout
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -131,6 +140,8 @@ class Revoker:
                 port=exc.port,
                 verdict=exc.verdict.reason,
             )
+            if self._refused is not None:
+                self._refused("revocation", exc.host, exc.port, exc.verdict.reason)
             return "refused", None
         except (TimeoutError, httpx.TimeoutException):
             return "timeout", None

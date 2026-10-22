@@ -685,7 +685,9 @@ def test_a_rejected_passkey_file_and_an_unreadable_copy_leave_both_listeners_ser
             "callers": [{"placeholder": PH}],
             "rules": [{"methods": ["GET"], "paths": ["/**"]}],
         }
-        with running(tmp_path, policy={"routes": [route]}, before_start=spoil) as rig:
+        # The vault's route client is guarded: the loopback fake is listed (M7 design B.2).
+        listed = {"routes": [route], "egress_private": [upstream.removeprefix("http://")]}
+        with running(tmp_path, policy=listed, before_start=spoil) as rig:
             browser = rig.browser()
             assert browser.navigate(rig.origin + "/").status_code == 200
             proxied = browser.forge(

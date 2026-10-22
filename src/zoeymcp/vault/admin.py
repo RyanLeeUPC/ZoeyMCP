@@ -394,7 +394,8 @@ class HealthReader:
     variables found set, the reported copy and the passkey file. Without ``connectors`` it shows
     no sends; without ``env_names`` every ``env:`` reference is unset; without ``reports`` or
     ``passkeys`` the report has no ``ledger_copy`` or ``passkeys`` section. ``wall`` is the
-    wall clock a registered client's secret expiry is judged on (M7 design J, FM-28)."""
+    wall clock a registered client's secret expiry is judged on (M7 design J, FM-28). The
+    address guard's refusals come from the logins' token manager (J)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -418,6 +419,7 @@ class HealthReader:
             passkeys=self._passkey_state(policy),
             ledger_copy=self._ledger_copy(policy),
             wall=self.wall(),
+            refused=() if self.login is None else self.login.refused(),
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report

@@ -30,7 +30,7 @@ import pytest
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import Browser, Page, asgi_client, loopback
 from zoeymcp.portal.routes import ROUTES, STATIC
-from zoeymcp.vault import app as vault_app
+from zoeymcp.vault import netclient
 from zoeymcp.vault.oauth.pkce import FLOW_TTL
 
 from .flows import filled, set_up, status_reason
@@ -123,9 +123,9 @@ class World:
 def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     fakes = providers()
     monkeypatch.setattr(
-        vault_app,
-        "_token_client",
-        lambda _: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
+        netclient,
+        "token_client",
+        lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
     )
     clock = Clock()
     with running(tmp_path, policy=callback_policy, clock=clock) as rig:
@@ -714,9 +714,9 @@ def test_an_https_origin_sets_a_secure_binding_cookie(
     tailnet = "https://zoeymcp.tailnet.example"
     fakes = providers()
     monkeypatch.setattr(
-        vault_app,
-        "_token_client",
-        lambda _: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
+        netclient,
+        "token_client",
+        lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
     )
     document = policy()
     document["credentials"]["notes"]["redirect_uri"] = f"{tailnet}/oauth/callback/notes"

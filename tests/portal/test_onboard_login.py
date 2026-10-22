@@ -25,7 +25,7 @@ import pytest
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import Page
 from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer
-from zoeymcp.vault import app as vault_app
+from zoeymcp.vault import netclient
 
 from .flows import set_up, status_reason
 from .rig import PortalRig, rig_policy, running
@@ -129,9 +129,9 @@ def serving(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **changes: Any) -> 
         await apps[host](scope, receive, send)
 
     monkeypatch.setattr(
-        vault_app,
-        "_token_client",
-        lambda _: httpx.AsyncClient(transport=httpx.ASGITransport(app=by_host)),
+        netclient,
+        "token_client",
+        lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=by_host)),
     )
     with running(tmp_path, policy=policy(**changes)) as rig:
         passkey = SoftAuthenticator()

@@ -190,6 +190,8 @@ def test_an_s5_connect_through_the_callback(tmp_path: Path, ca: ProviderCA) -> N
             "version": 1,
             "mode": "declarative",
             "admin": {"listen": f"127.0.0.1:{port}", "origins": [origin]},
+            # The vault's token client is guarded: the loopback fake is listed (M7 design B.2).
+            "egress_private": [auth_url.removeprefix("https://")],
             **fragment,
         }
         config = tmp_path / "policy.json"

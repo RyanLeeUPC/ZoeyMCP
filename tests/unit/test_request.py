@@ -278,6 +278,32 @@ def test_response_headers_drop_cookies() -> None:
     assert kept == [("Content-Type", "application/json"), ("X-Request-Id", "abc")]
 
 
+UPSTREAM_ANSWER = [
+    ("Content-Type", "application/json"),
+    ("WWW-Authenticate", 'Bearer resource_metadata="https://mcp.example/.well-known/x"'),
+    ("www-authenticate", 'Bearer error="insufficient_scope"'),
+    ("Set-Cookie", "session=upstream-credential"),
+    ("X-Request-Id", "abc"),
+]
+
+
+def test_the_gateway_never_gets_an_upstreams_challenge() -> None:
+    """M7 design DD-12, X17: dropped for the gateway caller, with the other drops kept."""
+    kept = filter_response_headers(UPSTREAM_ANSWER, gateway=True)
+    assert kept == [("Content-Type", "application/json"), ("X-Request-Id", "abc")]
+
+
+def test_a_placeholder_caller_still_gets_the_challenge() -> None:
+    expected = [
+        ("Content-Type", "application/json"),
+        ("WWW-Authenticate", 'Bearer resource_metadata="https://mcp.example/.well-known/x"'),
+        ("www-authenticate", 'Bearer error="insufficient_scope"'),
+        ("X-Request-Id", "abc"),
+    ]
+    assert filter_response_headers(UPSTREAM_ANSWER) == expected
+    assert filter_response_headers(UPSTREAM_ANSWER, gateway=False) == expected
+
+
 # --- scrubbing ---------------------------------------------------------------------------------
 
 SECRET = 'sk-live/Ab+Cd="q"'

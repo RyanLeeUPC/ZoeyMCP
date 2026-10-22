@@ -124,6 +124,10 @@ _DROP_RESPONSE = HOP_BY_HOP | {
     "strict-transport-security",
     "alt-svc",
 }
+# Dropped from answers to the gateway too (M7 design DD-12, X17): it has no use for a challenge,
+# and a resource_metadata must reach nothing that could start OAuth discovery. The vault reads it
+# first, for health; a placeholder caller still gets it.
+_DROP_FOR_GATEWAY = frozenset({"www-authenticate"})
 INTERNAL_HEADER_PREFIX = "x-zoeymcp-"
 
 Headers = list[tuple[str, str]]
@@ -153,11 +157,16 @@ def filter_request_headers(
     return kept
 
 
-def filter_response_headers(headers: Iterable[tuple[str, str]]) -> Headers:
+def filter_response_headers(
+    headers: Iterable[tuple[str, str]], *, gateway: bool = False
+) -> Headers:
     """Headers to return to the caller: no hop-by-hop, no cookies (an upstream session cookie is
-    a credential the caller must never hold), no encodings the vault already decoded."""
+    a credential the caller must never hold), no encodings the vault already decoded, and for the
+    ``gateway`` no ``WWW-Authenticate``."""
     headers = list(headers)
     dropped = _DROP_RESPONSE | _connection_tokens(headers)
+    if gateway:
+        dropped |= _DROP_FOR_GATEWAY
     return [
         (name, value)
         for name, value in headers

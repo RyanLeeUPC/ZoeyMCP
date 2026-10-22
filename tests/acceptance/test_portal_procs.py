@@ -48,6 +48,8 @@ def policy(auth_url: str, portal: int) -> dict[str, Any]:
         "version": 1,
         "mode": "declarative",
         "admin": {"listen": f"127.0.0.1:{portal}", "origins": [f"http://localhost:{portal}"]},
+        # The vault's token client is guarded: the loopback fake is listed (M7 design B.2).
+        "egress_private": [auth_url.removeprefix("https://")],
         "credentials": {
             "notes": {
                 "kind": "oauth2",

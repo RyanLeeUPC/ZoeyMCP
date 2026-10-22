@@ -12,6 +12,10 @@ keeps the new token in memory, so the next refresh presents it (I4).
 
 There is no copy of a refresh token outside the store, and no background refresh: a refresh
 happens when a request needs a token. Clocks, ``sleep`` and the jitter are injected.
+
+A token endpoint the address guard refuses (M7 design B.2) fails ``oauth_unavailable`` with the
+reason ``address_refused``: nothing was sent, so there is no replay. The manager keeps every
+guard refusal of the vault's route, token and revocation calls since start, for health (J).
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from ...common.canonical import dumps_canonical
 from ...common.policy.schema import OAuth2Credential, Policy, is_secret_ref, split_scope
 from .. import logs
 from ..bindings import VAULT_PREFIX, derive_binding, live_slot
+from ..netclient import ADDRESS_REFUSED, AddressRefused
 from ..request import oauth_client_variants, secret_variants
 from ..store import Secret, SecretStore, SecretUnavailable, StoreWriteError, canonical_origin
 from .protocol import (
@@ -288,6 +293,8 @@ class TokenManager:
         self._upstream: dict[str, dict[str, Any]] = {}
         # The last resource_metadata a 401 named other than the credential's (M7 design J).
         self._resource_metadata: dict[str, dict[str, str]] = {}
+        # The guard's refusals since start, by purpose and host:port (M7 design J).
+        self._refused: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._serial = 0
         self._closing = False
 
@@ -419,6 +426,24 @@ class TokenManager:
         URL ends the finding.
         """
         self._resource_metadata[credential] = {"url": url, "at": _iso(self._wall())}
+
+    def note_refused(self, purpose: str, host: str, port: int, verdict: str) -> None:
+        """Record that the address guard refused a ``purpose`` call (``route``, ``token`` or
+        ``revocation``) to ``host``:``port``, for :meth:`refused` and health's
+        ``address_refused`` (M7 design J). Memory only, the latest of each kept: health judges it
+        against the running policy, so a reload that lists the destination ends the finding."""
+        key = (purpose, host, port)
+        self._refused[key] = {
+            "purpose": purpose,
+            "host": host,
+            "port": port,
+            "verdict": verdict,
+            "at": _iso(self._wall()),
+        }
+
+    def refused(self) -> list[dict[str, Any]]:
+        """The guard's refusals since start, as :meth:`note_refused` kept them, in order."""
+        return [self._refused[key] for key in sorted(self._refused)]
 
     # --- writers -------------------------------------------------------------------------------
 
@@ -837,6 +862,8 @@ class TokenManager:
         sent_at = self._clock()
         try:
             response = await self.post(prep.request)
+        except AddressRefused:
+            return transport_failure(ADDRESS_REFUSED), 1, False, sent_at
         except PRE_SEND:
             return transport_failure("pre_send"), 1, False, sent_at
         except Exception:
@@ -855,7 +882,8 @@ class TokenManager:
         """One POST through the token client, within ``deadline`` seconds (login uses it too).
 
         The default is ``ATTEMPT_DEADLINE``, read at call time. Redirects are never followed;
-        the body is read until it passes the cap.
+        the body is read until it passes the cap. A refusal by the address guard is logged and
+        kept (:meth:`note_refused`), then raised: nothing was sent.
         """
         if deadline is None:
             deadline = ATTEMPT_DEADLINE
@@ -867,7 +895,19 @@ class TokenManager:
                 content=request.body,
                 timeout=httpx.Timeout(deadline, connect=CONNECT_TIMEOUT),
             )
-            response = await self._client.send(outgoing, stream=True, follow_redirects=False)
+            try:
+                response = await self._client.send(outgoing, stream=True, follow_redirects=False)
+            except AddressRefused as exc:
+                verdict = exc.verdict.reason
+                logs.event(
+                    "address_refused",
+                    purpose="token",
+                    host=exc.host,
+                    port=exc.port,
+                    verdict=verdict,
+                )
+                self.note_refused("token", exc.host, exc.port, verdict)
+                raise
             try:
                 body = await _read_capped(response, MAX_TOKEN_BODY)
             finally:

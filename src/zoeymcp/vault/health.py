@@ -35,6 +35,13 @@ A ``store:`` client secret whose entry's meta has a registration's ``client_secr
 (M7 design J, D.7 step 7) is ``client_secret_expiring`` within :data:`GRANT_WARN_DAYS` of it and
 ``client_secret_expired`` after it, judged on the wall clock (``Inputs.wall``; FM-28), each
 advisory: the one decision-free read of clear meta that D.7 step 4 allows.
+
+``address_refused`` is the token manager's memory of the address guard's refusals since start
+(M7 design B.2, J): a credential's token or revocation endpoint, or a route of its, whose name
+resolved where the running policy doesn't allow. A route with no credential has no credential
+section, so its refusals are the ``egress`` section's, one finding per route. Each is judged
+against the running policy, keyed as the guard sees the destination (:func:`.netclient.guard_key`),
+so a reload that lists it in ``egress_private``, or moves the endpoint, ends it.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
+from ..common import egresslist
 from ..common.policy.check import secret_references
 from ..common.policy.schema import Credential, OAuth2Credential, Policy, SMTPConnector
 from .bindings import (
@@ -56,6 +64,7 @@ from .bindings import (
     oauth_binding,
 )
 from .connectors.sendjournal import DAY_MS, Journal
+from .netclient import destination_key, guard_key, private_hint
 from .oauth.protocol import GRANT_WARN_DAYS
 from .onboarding import onboard_again, widen_scope
 from .secretplan import binding_refusal
@@ -123,6 +132,8 @@ class Inputs:
     ledger_copy: LedgerCopy | None = None
     # The wall clock now (seconds since the epoch), or None: no client secret's expiry is judged.
     wall: float | None = None
+    # The address guard's refusals since start: LoginService.refused().
+    refused: Sequence[Mapping[str, Any]] = ()
 
 
 @dataclass(frozen=True)
@@ -155,7 +166,8 @@ class _Use:
 
 
 def assess(inputs: Inputs) -> dict[str, Any]:
-    """The health of every credential, connector and store entry, and a count per level."""
+    """The health of every credential, connector and store entry, and of the routes with no
+    credential the guard refused (``egress``), and a count per level."""
     policy = inputs.policy
     stored = {entry.name: entry for entry in inputs.entries}
     status = {item["credential"]: item for item in inputs.oauth or ()}
@@ -172,11 +184,13 @@ def assess(inputs: Inputs) -> dict[str, Any]:
         for name, connector in policy.connectors.items()
     ]
     store = _store(inputs)
-    sections = [*credentials, *connectors, store]
+    egress = _egress(policy, inputs.refused)
+    sections = [*credentials, *connectors, store, egress]
     report: dict[str, Any] = {
         "credentials": credentials,
         "connectors": connectors,
         "store": store,
+        "egress": egress,
     }
     if inputs.passkeys is not None:
         report["passkeys"] = _passkeys(inputs.passkeys)
@@ -233,6 +247,7 @@ def _credential(
     if oauth is not None and current is not None:
         extra["oauth"] = _oauth(current)
         findings += _oauth_findings(policy, name, oauth, current)
+    findings += _address_refused(policy, name, cred, inputs.refused)
     return {
         "name": name,
         "kind": cred.kind,
@@ -399,6 +414,72 @@ def _oauth_findings(
     if unused:
         found.append(_finding("idle", "warning", idle_text(unused), renew, advisory=True))
     return found
+
+
+# What each purpose's refusals were calls to (M7 design J).
+_REFUSED_CALLS: Final = {
+    "route": "a route's upstream",
+    "token": "the token endpoint",
+    "revocation": "the revocation endpoint",
+}
+
+
+def _address_refused(
+    policy: Policy, name: str, cred: Credential, refused: Sequence[Mapping[str, Any]]
+) -> list[Finding]:
+    """The guard's refusals of the credential's destinations since start (M7 design B.2, J):
+    its token or revocation endpoint, or the upstream of a route that uses it, each as the
+    running policy has it now and not listed in its ``egress_private``."""
+    destinations = {
+        "route": {
+            destination_key(r.upstream)
+            for r in policy.routes
+            if r.credential == name and r.upstream is not None
+        },
+        "token": set(),
+        "revocation": set(),
+    }
+    if isinstance(cred, OAuth2Credential):
+        destinations["token"].add(destination_key(cred.token_url))
+        if cred.revocation_url is not None:
+            destinations["revocation"].add(destination_key(cred.revocation_url))
+    listed = egresslist.private_exceptions(policy)
+    found: list[Finding] = []
+    for item in refused:
+        purpose = item["purpose"]
+        key = guard_key(item["host"], item["port"])
+        if key not in destinations.get(purpose, ()) or key in listed:
+            continue
+        text = _refused_text(_REFUSED_CALLS[purpose], key, item)
+        action = _act("fix_policy", "credential", name)
+        found.append(_finding("address_refused", "error", text, action))
+    return found
+
+
+def _egress(policy: Policy, refused: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The guard's refusals of a route with no credential, which no credential's section holds
+    (M7 design J): one finding per such route whose upstream, as the running policy has it now,
+    was refused and isn't listed in its ``egress_private``."""
+    listed = egresslist.private_exceptions(policy)
+    seen = {guard_key(i["host"], i["port"]): i for i in refused if i["purpose"] == "route"}
+    findings: list[Finding] = []
+    for route in policy.routes:
+        if route.credential is not None or route.upstream is None:
+            continue
+        key = destination_key(route.upstream)
+        if key not in seen or key in listed:
+            continue
+        text = _refused_text(f"route {route.name}'s upstream", key, seen[key])
+        action = _act("fix_policy", "route", route.name)
+        findings.append(_finding("address_refused", "error", text, action))
+    return {"level": _level(findings), "findings": findings}
+
+
+def _refused_text(call: str, key: str, item: Mapping[str, Any]) -> str:
+    return (
+        f"{call} at {key} was refused at {item['at']} (since the vault started): its name "
+        f"resolved to an address the guard refuses ({item['verdict']}); {private_hint(key)}"
+    )
 
 
 # --- connectors and the store ------------------------------------------------------------------

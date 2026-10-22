@@ -23,8 +23,10 @@ other request, another onboarding's included, ever reuses a connection the excep
 Every client verifies against certifi's roots, through one ``ssl_context`` per client built from
 ``certifi.where()`` (B.6, X23), as the SMTP connector's ``default_tls`` does. Each is built once,
 at start, from the startup policy, so a reload that changes ``egress_proxy`` changes no client
-(D-61). Here are the onboarding client and the revocation client (M7 design D.9); the route and
-token clients move here in step 16.
+(D-61). Every client the vault uses is built here: the onboarding client, the revocation client
+(M7 design D.9), and the route and token clients (B.2's second stage). The last three read the
+running policy's ``egress_private`` at each connection, so a reload that lists a destination
+lets the next connection through without a restart.
 
 Tests answer names through :data:`HOOKS` (BP-1): a resolver that maps names to addresses reserved
 for the run, and a ``dial`` that sends a checked address to the loopback port of the right fake,
@@ -46,6 +48,8 @@ import httpx
 
 from ..common import netguard
 from ..common.netguard import AddressVerdict
+from .oauth.protocol import ATTEMPT_DEADLINE
+from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
 
 # One lookup's limit, in seconds (M.6).
 RESOLVE_TIMEOUT: Final = 5.0
@@ -54,6 +58,10 @@ RESOLVE_TIMEOUT: Final = 5.0
 ONBOARDING_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
 # The revocation client's: the whole of one revocation is REVOKE_TIMEOUT (vault/secretops.py).
 REVOCATION_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
+# The token client's (design D.14); each call sets its own deadline (TokenManager.post).
+TOKEN_TIMEOUT: Final = httpx.Timeout(ATTEMPT_DEADLINE, connect=TOKEN_CONNECT_TIMEOUT)
+# A route's 502 code, a token call's failure reason, and the onboarding refusal (M7 design B.2).
+ADDRESS_REFUSED: Final = "address_refused"
 # The per-request exception (TI-10): (onboarding id, purpose, host:port).
 ONBOARDING_EXTENSION: Final = "zoeymcp.onboarding"
 # The fetches an onboarding's exception may cover: the probe of the server URL and its PRM. Never
@@ -94,6 +102,27 @@ class ResolveFailed(httpx.ConnectError):
     def __init__(self, host: str, port: int) -> None:
         self.host, self.port = host, port
         super().__init__(f"{netguard.entry_key(host, port)}: the name didn't resolve")
+
+
+def guard_key(host: str, port: int) -> str:
+    """The ``egress_private`` entry that lists ``host``:``port`` as :class:`GuardedBackend` is
+    given it, the URL's ``raw_host``: in lower case, without a trailing dot (``lan.example.``
+    names ``lan.example``, and the schema takes no entry that ends in one)."""
+    return netguard.entry_key(host.removesuffix("."), port)
+
+
+def destination_key(url: str) -> str:
+    """An http(s) URL's ``host:port`` as the guard sees it, so as ``egress_private`` must list
+    it: the IDNA-encoded ``raw_host``, never httpx's decoded ``host`` (as for
+    :func:`onboarding_target`), and the default port written out."""
+    parsed = httpx.URL(url)
+    port = parsed.port or _DEFAULT_PORTS.get(parsed.scheme, 443)
+    return guard_key(parsed.raw_host.decode("ascii"), port)
+
+
+def private_hint(key: str) -> str:
+    """What an ``address_refused`` asks the operator to do about the ``host:port`` ``key``."""
+    return f"list {key} in egress_private if this destination is meant to be private"
 
 
 async def resolve(host: str, port: int) -> list[str]:
@@ -137,7 +166,9 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
             addresses = await self._resolver(host, port)
         except (OSError, TimeoutError, UnicodeError) as exc:
             raise ResolveFailed(host, port) from exc
-        private_ok = netguard.listed(self._exceptions(), host, port)
+        exceptions = self._exceptions()
+        # The name exactly (an onboarding's exception), or as an entry writes it (guard_key).
+        private_ok = netguard.listed(exceptions, host, port) or guard_key(host, port) in exceptions
         verdict = netguard.addresses_allowed(addresses, private_ok=private_ok)
         if not verdict.allowed or verdict.address is None:
             raise AddressRefused(host, port, verdict)
@@ -284,11 +315,43 @@ def revocation_client(
 ) -> httpx.AsyncClient:
     """The client a deleted refresh token's revocation is posted on (M7 design D.9). Its
     exception set is the running policy's ``egress_private``, read at each connection, as the
-    token client's will be from step 16, so a token origin listed there revokes as it refreshes
-    (TI-11). No redirects, no proxy variables; the vault gives it a jar that keeps no cookies."""
+    token client's is, so a token origin listed there revokes as it refreshes (TI-11). No
+    redirects, no proxy variables; the vault gives it a jar that keeps no cookies."""
     return httpx.AsyncClient(
         transport=guarded_transport(egress_proxy, exceptions),
         trust_env=False,
         follow_redirects=False,
         timeout=REVOCATION_TIMEOUT,
+    )
+
+
+def route_client(
+    egress_proxy: str | None, exceptions: Callable[[], Collection[str]], *, timeout: httpx.Timeout
+) -> httpx.AsyncClient:
+    """The client every route's upstream is reached on (B.2's second stage). Its exception set
+    is the running policy's ``egress_private``, read at each connection; each request sets its
+    own timeout, ``timeout`` is the default. No redirects (the vault relays a 3xx as it is, or
+    refuses it for the gateway), no proxy variables; the vault gives it a jar that keeps no
+    cookies."""
+    return httpx.AsyncClient(
+        transport=guarded_transport(egress_proxy, exceptions),
+        trust_env=False,
+        follow_redirects=False,
+        timeout=timeout,
+    )
+
+
+def token_client(
+    egress_proxy: str | None, exceptions: Callable[[], Collection[str]]
+) -> httpx.AsyncClient:
+    """The client login, refresh and the code exchange post to token endpoints on (B.2's
+    second stage, design D.14). Its exception set is the running policy's ``egress_private``,
+    read at each connection, as the revocation client's is (TI-11). A redirect would re-send
+    secrets, so none is followed; no proxy variables; the vault gives it a jar that keeps no
+    cookies."""
+    return httpx.AsyncClient(
+        transport=guarded_transport(egress_proxy, exceptions),
+        trust_env=False,
+        follow_redirects=False,
+        timeout=TOKEN_TIMEOUT,
     )

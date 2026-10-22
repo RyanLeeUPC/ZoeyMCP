@@ -1722,6 +1722,23 @@ async def test_health_sums_up_each_connector_and_knows_the_env(tmp_path: Path) -
 
 
 @pytest.mark.anyio
+async def test_health_shows_the_guards_refusals(tmp_path: Path) -> None:
+    """The reader takes the address guard's refusals from the logins' token manager (M7 design
+    J): a refused token endpoint is the credential's ``address_refused``."""
+    rig = AdminRig(tmp_path)
+    rig.tokens.note_refused("token", "auth.broker.example", 443, "private")
+    found = (await rig.call("GET", "/health")).json()
+    [broker] = [item for item in found["credentials"] if item["name"] == "broker-mcp"]
+    [refused] = [f for f in broker["findings"] if f["code"] == "address_refused"]
+    assert (refused["level"], refused["action"]) == (
+        "error",
+        {"kind": "fix_policy", "credential": "broker-mcp"},
+    )
+    assert "list auth.broker.example:443 in egress_private" in refused["text"]
+    await rig.token_client.aclose()
+
+
+@pytest.mark.anyio
 async def test_health_without_the_token_manager(tmp_path: Path) -> None:
     rig = AdminRig(tmp_path, tokens=False)
     response = await rig.call("GET", "/health")

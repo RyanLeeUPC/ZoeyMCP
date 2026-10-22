@@ -794,6 +794,8 @@ def test_a_closed_socket_closes_a_silent_upstream(tmp_path: Path, phase: str, ta
             allow_insecure_upstream=True,
             rules=[{"methods": ["GET"], "paths": ["/slow"]}],
         )
+        # The real route client is guarded: the loopback fake is listed (M7 design B.2).
+        pol = pol.model_copy(update={"egress_private": [upstream_base.removeprefix("http://")]})
         app = VaultApp(pol, store, KEYS, environ={})
         with serve(app) as vault_base:
             host, port = vault_base.removeprefix("http://").split(":")

@@ -45,7 +45,7 @@
     set_secret: "Set it on the Secrets page", delete_secret: "See the Secrets page",
     review_passkeys: "Review the passkeys" };
   const SECTION = { credential: "Credential", connector: "Connector", store: "The store",
-    passkeys: "Passkeys", ledger_copy: "The reported ledger" };
+    egress: "Egress", passkeys: "Passkeys", ledger_copy: "The reported ledger" };
 
   let pending = null; // the action being confirmed: its ID, step-up options and what follows
   let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created

@@ -3,9 +3,8 @@
 Agent (the SDK client, both eras) -> gateway -> vault -> the fake MCP server, which takes only the
 fake authorization server's live access tokens. Both fakes serve real TLS under their own names,
 ``mcp.notes.example`` and ``auth.notes.example``, and every vault connection reaches them by name
-through the fake resolver's dial map (tests/fakes/resolver.py, BP-1), the address guard unchanged;
-the vault's token and route clients are put on that guarded transport here, as the onboarding and
-revocation clients already are, until step 16 builds them there. The vault, the authorization
+through the fake resolver's dial map (tests/fakes/resolver.py, BP-1), the address guard unchanged
+on every one of the vault's own guarded clients (M7 design B.2). The vault, the authorization
 server and the MCP server read one clock, so a test can let an access token expire, and the
 gateway's review poll is shortened (``short_review_polls``) so no review waits out a poll.
 
@@ -91,11 +90,11 @@ from zoeymcp.portal.passkeys import Passkeys
 from zoeymcp.portal.server import HEAD_LIMIT, portal_protocol
 from zoeymcp.vault import netclient
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
-from zoeymcp.vault.app import CONNECT_TIMEOUT, READ_TIMEOUT, VaultApp, without_cookies
+from zoeymcp.vault.app import VaultApp, without_cookies
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.oauth.discovery import ISSUER_LABELS, NOTES
 from zoeymcp.vault.oauth.login import LoginService
-from zoeymcp.vault.oauth.protocol import ATTEMPT_DEADLINE, MIN_401_AGE
+from zoeymcp.vault.oauth.protocol import MIN_401_AGE
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.onboard import BACKSTOP_OFF, OnboardService
 from zoeymcp.vault.peer import peer_checked
@@ -312,19 +311,6 @@ def base_policy(*, portal_port: int | None = None, proxy: str | None = None) -> 
     return document
 
 
-def guarded(proxy: str | None, timeout: httpx.Timeout) -> httpx.AsyncClient:
-    """A vault client on the guarded transport (B.2), with the settings of the one it stands
-    for (``vault/app.py``'s ``_upstream_client`` and ``_token_client``)."""
-    return without_cookies(
-        httpx.AsyncClient(
-            transport=netclient.guarded_transport(proxy),
-            trust_env=False,
-            follow_redirects=False,
-            timeout=timeout,
-        )
-    )
-
-
 def checked(document: Mapping[str, Any]) -> Policy:
     policy = Policy.model_validate(document)
     errors = [f for f in check_policy(policy) if f.level == "error"]
@@ -368,7 +354,11 @@ class Vault:
         proxy = self.policy.egress_proxy
         self.store = SecretStore(self.state, self.keys)
         self.store.load()
-        self.token_client = guarded(proxy, httpx.Timeout(ATTEMPT_DEADLINE, connect=CONNECT_TIMEOUT))
+        # The token manager reads the world's clock, so it is made here, on the vault's own
+        # token client (B.2); VaultApp builds its other clients itself.
+        self.token_client = without_cookies(
+            netclient.token_client(proxy, lambda: egresslist.private_exceptions(app.policy))
+        )
         self.tokens = TokenManager(
             self.store, self.token_client, clock=clock.monotonic, wall=clock.wall
         )
@@ -376,11 +366,6 @@ class Vault:
             self.policy,
             self.store,
             self.keys,
-            client=guarded(proxy, httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT)),
-            onboarding_client=netclient.onboarding_client(proxy),
-            revocation_client=netclient.revocation_client(
-                proxy, lambda: egresslist.private_exceptions(app.policy)
-            ),
             tokens=self.tokens,
             environ={},
             gateway_link=self.link_socket is not None,

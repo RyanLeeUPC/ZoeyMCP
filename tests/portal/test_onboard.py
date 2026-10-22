@@ -41,8 +41,7 @@ from tests.unit import onboard_model
 from tests.unit.test_portal_static import reads
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.yamlload import load_mapping
-from zoeymcp.vault import app as vault_app
-from zoeymcp.vault import server
+from zoeymcp.vault import netclient, server
 from zoeymcp.vault.onboard import OnboardService
 from zoeymcp.vault.store import SecretStore
 
@@ -141,9 +140,9 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     )
     hosts = Hosts(auth)
     monkeypatch.setattr(
-        vault_app,
-        "_token_client",
-        lambda _: httpx.AsyncClient(transport=httpx.ASGITransport(app=auth.app())),
+        netclient,
+        "token_client",
+        lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=auth.app())),
     )
     with running(tmp_path, onboard=onboarding_service(hosts)) as rig:
         provider = asgi_client(auth.app(), ISSUER)

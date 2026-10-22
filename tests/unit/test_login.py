@@ -24,10 +24,12 @@ from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer, google_style, spotify_style
+from zoeymcp.common.netguard import AddressVerdict
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.vault import logs
 from zoeymcp.vault.bindings import live_slot, oauth_binding
+from zoeymcp.vault.netclient import AddressRefused
 from zoeymcp.vault.oauth import login as login_module
 from zoeymcp.vault.oauth.login import (
     CODE_HINT,
@@ -898,6 +900,35 @@ async def test_no_answer_is_not_replayed(
     assert clock.sleeps == []
 
 
+async def test_a_refused_token_endpoint_is_not_replayed_and_says_what_to_add(
+    tmp_path: Path, clock: FakeClock, captured: Captured
+) -> None:
+    """M7 design B.2: the address guard refused the token endpoint, so nothing was sent; the
+    message names the egress_private line, the call is logged with the reason address_refused,
+    and the refusal is kept for health, as the logins show it."""
+    calls: list[int] = []
+
+    def refused_address(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise AddressRefused("accounts.example", 443, AddressVerdict(False, "private", "10.0.0.9"))
+
+    transport = httpx.MockTransport(refused_address)
+    rig = Rig(tmp_path, clock, make_policy({"music": spotify()}), transport=transport)
+    flow, pasted = await rig.approved()
+    refused = await rig.refused(rig.login.complete("music", flow, pasted))
+    assert refused.reason == f"exchange_failed:{OAUTH_UNAVAILABLE}"
+    assert str(refused) == (
+        "the vault doesn't connect to the token endpoint: list accounts.example:443 in "
+        "egress_private if this destination is meant to be private; then run login again"
+    )
+    assert calls == [1]
+    assert clock.sleeps == []
+    [line] = captured.events("oauth_refresh")
+    assert (line["trigger"], line["failure_reason"]) == ("login", "address_refused")
+    assert [item["purpose"] for item in rig.login.refused()] == ["token"]
+    assert rig.login.refused() == rig.manager.refused()
+
+
 async def test_a_timeout_is_no_answer(tmp_path: Path, clock: FakeClock) -> None:
     rig = spotify_rig(tmp_path, clock)
     flow, pasted = await rig.approved()
@@ -1732,6 +1763,20 @@ def test_hints(code: str | None, fields: dict[str, Any], text: str | None) -> No
             "then run: zoeymcp oauth reset music",
         ),
         ({}, "no_route", "no route uses music; fix the policy"),
+        (
+            {},
+            "address_refused",
+            "the vault doesn't connect to the token endpoint: list accounts.example:443 in "
+            "egress_private if this destination is meant to be private; "
+            "then run: zoeymcp oauth reset music",
+        ),
+        (
+            {"token_url": "https://Auth.LAN.example:8443/token"},
+            "address_refused",
+            "the vault doesn't connect to the token endpoint: list auth.lan.example:8443 in "
+            "egress_private if this destination is meant to be private; "
+            "then run: zoeymcp oauth reset music",
+        ),
         ({}, "live_unusable", "run: zoeymcp login music"),
         ({}, None, "run: zoeymcp login music"),
     ],
@@ -1826,6 +1871,7 @@ def test_hint_actions(code: str | None, fields: dict[str, Any], action: Any) -> 
             {"kind": "restart", "credential": "music", "ref": "env:MUSIC_ID"},
         ),
         ({}, "no_route", FIX_POLICY),
+        ({}, "address_refused", FIX_POLICY),
         ({}, "live_unusable", CONNECT),
         ({}, None, CONNECT),
     ],

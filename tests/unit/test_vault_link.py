@@ -39,6 +39,7 @@ from zoeymcp.vault.store import SecretStore, origin_binding
 KEYS = KeySet.from_master(bytes(range(32)))
 PH = "ph-agent1-direct-0001"
 SECRET = "sk-live-8f3c2a91d7e4"
+CHALLENGE = 'Bearer resource_metadata="https://api.example/.well-known/oauth-protected-resource"'
 CRED = {"api-key": {"kind": "header", "secret": "store:api-key"}}
 
 pytestmark = pytest.mark.anyio
@@ -100,6 +101,7 @@ class Upstream:
             routes=[
                 Route("/base/v1/status/{code:int}", self._status, methods=["GET"]),
                 Route("/base/v1/sse", self._sse, methods=["GET"]),
+                Route("/base/v1/challenge", self._challenge, methods=["GET"]),
                 Route("/base/v1/{rest:path}", self._ok, methods=["GET", "POST"]),
             ]
         )
@@ -118,6 +120,12 @@ class Upstream:
             "data: one\n\n",
             media_type="text/event-stream",
             headers={REFUSAL_HEADER: REFUSAL_MARKER},
+        )
+
+    async def _challenge(self, request: Request) -> Response:
+        self._record(request)
+        return JSONResponse(
+            {"error": "invalid_token"}, 401, headers={"www-authenticate": CHALLENGE}
         )
 
     async def _ok(self, request: Request) -> Response:
@@ -198,6 +206,19 @@ async def test_the_marker_on_the_wire(rig: Rig) -> None:
     response = await rig.call("GET", "/nowhere/v1/x", headers=bearer())
     assert response.status_code == 404
     assert response.headers.get_list("x-zoeymcp-vault") == ["refused"]
+
+
+async def test_an_upstreams_challenge_never_reaches_the_gateway(rig: Rig) -> None:
+    """M7 design DD-12, X17: the vault reads an upstream's WWW-Authenticate for health; the
+    gateway never gets it, so a resource_metadata reaches nothing that could start OAuth
+    discovery. A placeholder caller still does."""
+    gateway = await rig.call("GET", "/gw/v1/challenge", listener="gateway")
+    assert gateway.status_code == 401
+    assert gateway.headers.get_list("www-authenticate") == []
+    direct = await rig.call("GET", "/api/v1/challenge", headers=bearer())
+    assert direct.status_code == 401
+    assert direct.headers.get_list("www-authenticate") == [CHALLENGE]
+    assert [path for path, _ in rig.upstream.received] == ["/base/v1/challenge"] * 2
 
 
 async def test_a_502_with_a_code_and_retry_after_is_marked(

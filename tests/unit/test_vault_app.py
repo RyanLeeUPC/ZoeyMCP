@@ -459,7 +459,11 @@ async def test_streaming_route_relays_sse(tmp_path: Path) -> None:
         )
         store = SecretStore(tmp_path, KEYS)
         store.load()
-        app = VaultApp(policy([route]), store, KEYS, environ={})
+        # The real route client is guarded: the loopback fake is listed (M7 design B.2).
+        listed = policy([route]).model_copy(
+            update={"egress_private": [upstream_base.removeprefix("http://")]}
+        )
+        app = VaultApp(listed, store, KEYS, environ={})
         with serve(app) as vault_base:
             async with (
                 httpx.AsyncClient() as client,

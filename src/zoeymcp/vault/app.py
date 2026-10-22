@@ -25,6 +25,13 @@ token is bad drops it, and a request that's safe to repeat is sent once more wit
 (design D.10). Neither HTTP client keeps cookies: an upstream's session cookie must never reach
 another caller (N2).
 
+Every HTTP client is :mod:`.netclient`'s, guarded (M7 design B.2): an upstream or token endpoint
+whose name resolves to a non-global address is refused before anything is sent, unless the
+running policy lists its ``host:port`` in ``egress_private``. A route then answers 502
+``address_refused``, and the token manager keeps the refusal for health (J). An upstream's
+``WWW-Authenticate`` never reaches the gateway: the vault reads it for health, and a
+``resource_metadata`` must reach nothing that could start OAuth discovery (DD-12, X17).
+
 Streams on stream routes are relayed as they arrive, scrubbed one SSE event or NDJSON line at a
 time. Answers to the gateway are scrubbed at any size, and an upstream redirect becomes a 502 for
 it. Once the body is read the vault watches the caller: if it leaves while the vault waits for
@@ -80,8 +87,7 @@ from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
 from .oauth.discovery import Challenge, parse_challenge
-from .oauth.protocol import ATTEMPT_DEADLINE, CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
-from .oauth.protocol import CONNECT_TIMEOUT as TOKEN_CONNECT_TIMEOUT
+from .oauth.protocol import CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
 from .oauth.tokens import UPSTREAM_INSUFFICIENT_SCOPE, Grant, OAuthUnavailable, TokenManager
 from .reports import Refused as ReportRefused
 from .reportstore import CopyUnavailable, ReportStore
@@ -367,8 +373,10 @@ class VaultApp:
         review_jobs: JobTable | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
-        keeps no cookies. ``tokens`` replaces the token manager (tests). It brings its own client,
-        so ``token_client`` is then not used.
+        keeps no cookies. By default both are :mod:`.netclient`'s guarded clients, with the
+        running policy's ``egress_private`` as their exceptions (M7 design B.2). ``tokens``
+        replaces the token manager (tests). It brings its own client, so ``token_client`` is then
+        not used.
 
         ``onboarding_client`` reaches hosts learned from the network (discovery, registration;
         M7 design B.2), and ``revocation_client`` the revocation endpoint of a deleted refresh
@@ -399,24 +407,27 @@ class VaultApp:
         self._gateway_keys = gateway_keys or GatewayKeys.in_memory(
             keys, policy.gateway_key_generation
         )
-        self._client = without_cookies(client or _upstream_client(policy))
-        self._egress_proxy = policy.egress_proxy
-        if onboarding_client is None and client is None:
-            onboarding_client = netclient.onboarding_client(policy.egress_proxy)
+        proxy = self._egress_proxy = policy.egress_proxy
+        injected = client is not None
+        if client is None:
+            timeout = httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT)
+            client = netclient.route_client(proxy, self._private, timeout=timeout)
+        self._client = without_cookies(client)
+        if onboarding_client is None and not injected:
+            onboarding_client = netclient.onboarding_client(proxy)
         self._onboarding_client = without_cookies(onboarding_client or self._client)
-        if revocation_client is None and client is None:
-            revocation_client = netclient.revocation_client(
-                policy.egress_proxy, lambda: egresslist.private_exceptions(self._policy)
-            )
+        if revocation_client is None and not injected:
+            revocation_client = netclient.revocation_client(proxy, self._private)
         self._revocation_client = without_cookies(revocation_client or self._client)
-        self._revoker = secretops.Revoker(
-            self._revocation_client, proxied=policy.egress_proxy is not None
-        )
         self._token_client: httpx.AsyncClient | None = None
         if tokens is None:
-            self._token_client = without_cookies(token_client or _token_client(policy))
+            token_client = token_client or netclient.token_client(proxy, self._private)
+            self._token_client = without_cookies(token_client)
             tokens = TokenManager(store, self._token_client)
         self._tokens = tokens
+        self._revoker = secretops.Revoker(
+            self._revocation_client, proxied=proxy is not None, refused=tokens.note_refused
+        )
         # The last access token serial seen per credential, for the request log.
         self._serials: dict[str, int] = {}
         self._environ = os.environ if environ is None else environ
@@ -447,6 +458,11 @@ class VaultApp:
         self._view = _ServedView(view.digest, dump_view(view))
         self._wake_view_waiters()
         return self._tokens.configure(policy, self._env_secrets)
+
+    def _private(self) -> frozenset[str]:
+        """The running policy's ``egress_private``: the guarded clients read it at each
+        connection (M7 design B.2)."""
+        return egresslist.private_exceptions(self._policy)
 
     def _wake_view_waiters(self) -> None:
         woken, self._view_changed = self._view_changed, asyncio.Event()
@@ -1259,6 +1275,17 @@ class VaultApp:
         )
         try:
             return await departure.race(self._client.send(outgoing, stream=True), phase="headers")
+        except netclient.AddressRefused as exc:
+            # Nothing was sent: the upstream's name resolves where the policy doesn't allow.
+            reason = exc.verdict.reason
+            logs.event(
+                "address_refused", purpose="route", host=exc.host, port=exc.port, verdict=reason
+            )
+            self._tokens.note_refused("route", exc.host, exc.port, reason)
+            hint = netclient.private_hint(netclient.guard_key(exc.host, exc.port))
+            raise Refused(
+                502, f"address refused ({reason}): {hint}", code=netclient.ADDRESS_REFUSED
+            ) from exc
         except httpx.HTTPError as exc:
             raise Refused(502, f"upstream request failed: {type(exc).__name__}") from exc
 
@@ -1279,7 +1306,7 @@ class VaultApp:
             await upstream.aclose()
             raise Refused(502, "redirect refused")
         response_headers, header_hits = scrub_headers(
-            filter_response_headers(upstream.headers.multi_items()), variants
+            filter_response_headers(upstream.headers.multi_items(), gateway=gateway), variants
         )
 
         # Only real streams are relayed as they arrive. Anything else on a stream route (JSON
@@ -1418,25 +1445,6 @@ async def _disconnected(receive: Receive) -> None:
     """Return once the caller has gone. A GET's body is empty, so nothing else is expected."""
     while (await receive())["type"] != "http.disconnect":
         pass
-
-
-def _upstream_client(policy: Policy) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        proxy=policy.egress_proxy,
-        trust_env=False,
-        follow_redirects=False,
-        timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT),
-    )
-
-
-def _token_client(policy: Policy) -> httpx.AsyncClient:
-    """The client for token endpoints (design D.14). A redirect would re-send secrets."""
-    return httpx.AsyncClient(
-        proxy=policy.egress_proxy,
-        trust_env=False,
-        follow_redirects=False,
-        timeout=httpx.Timeout(ATTEMPT_DEADLINE, connect=TOKEN_CONNECT_TIMEOUT),
-    )
 
 
 def _bearer(grant: Grant) -> tuple[str, str]:

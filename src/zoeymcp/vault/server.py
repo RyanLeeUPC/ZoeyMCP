@@ -726,8 +726,9 @@ def build(
     # Before any listener opens: a torn tail is cut and the head rebuilt from the lines (M5 J.4).
     # A copy that can't be read is unavailable, and the proxy runs anyway.
     reports = ReportStore.open(state_dir)
-    # Its HTTP clients, the guarded onboarding client among them, are built here from the startup
-    # policy and kept until the process ends; a reload changes none (M7 design B.2, D-61).
+    # Its HTTP clients, every one guarded (routes, tokens, revocation, onboarding), are built here
+    # from the startup policy and kept until the process ends; a reload changes none, though each
+    # reads the running policy's egress_private at every connection (M7 design B.2, D-61).
     app = VaultApp(
         runtime.policy,
         runtime.store,

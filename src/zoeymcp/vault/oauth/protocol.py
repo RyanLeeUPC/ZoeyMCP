@@ -353,8 +353,9 @@ class Outcome:
     new_refresh_token: Secret | None = None
 
 
-def transport_failure(reason: Literal["pre_send", "no_response"]) -> Outcome:
-    """No usable response: the request wasn't sent, or nothing came back."""
+def transport_failure(reason: Literal["pre_send", "no_response", "address_refused"]) -> Outcome:
+    """No usable response: the request wasn't sent, nothing came back, or the guard refused
+    the token endpoint's address (M7 design B.2), so nothing was sent."""
     return Outcome(None, failure=Failure("backoff", OAUTH_UNAVAILABLE, reason))
 
 

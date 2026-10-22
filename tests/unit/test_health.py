@@ -3,7 +3,7 @@ connector journal summed up, and the meta-derived ``last_failure`` and ``idle`` 
 M7 (design J, step 10b): a stored client secret held to D.7 step 5 as login holds it (D-185),
 ``resource_metadata_changed``, the challenged scope and its ``widen_scope`` fragment, and an
 onboarding's secret waiting for its credential; (step 11) a registered client's secret near or
-past its expiry, on the wall clock.
+past its expiry, on the wall clock; (step 16) the address guard's refusals, ``address_refused``.
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -300,6 +300,7 @@ def test_nothing_in_the_policy() -> None:
         "credentials": [],
         "connectors": [],
         "store": {"entries": 0, "level": "ok", "findings": []},
+        "egress": {"level": "ok", "findings": []},
     }
 
 
@@ -1280,6 +1281,210 @@ def test_the_oauth_block_shows_only_well_typed_meta() -> None:
     assert "oauth" not in one(report(static, oauth=[status("notes")]))
 
 
+# --- the address guard's refusals (M7 design B.2, J) ---------------------------------------------
+
+AT = "2026-09-21T10:00:00Z"
+HINT = "list {} in egress_private if this destination is meant to be private"
+FIX = {"kind": "fix_policy", "credential": "music"}
+
+
+def refusal(purpose: str, host: str, port: int = 443, verdict: str = "private") -> dict[str, Any]:
+    """An item of ``LoginService.refused()``."""
+    return {"purpose": purpose, "host": host, "port": port, "verdict": verdict, "at": AT}
+
+
+def refused_text(call: str, key: str, verdict: str = "private") -> str:
+    return (
+        f"{call} at {key} was refused at {AT} (since the vault started): its name resolved to "
+        f"an address the guard refuses ({verdict}); {HINT.format(key)}"
+    )
+
+
+def guard_policy(private: Sequence[str] = (), **music: Any) -> Policy:
+    """music (oauth2, a route to API) and notes (a header credential, a route to OTHER)."""
+    policy = make_policy({"music": spotify(**music), "notes": header()}, routes={"notes": (OTHER,)})
+    return policy.model_copy(update={"egress_private": list(private)})
+
+
+def refused_findings(policy: Policy, *refused: Mapping[str, Any]) -> dict[str, list[str]]:
+    found = report(policy, refused=refused)
+    return {
+        item["name"]: [f["text"] for f in item["findings"] if f["code"] == "address_refused"]
+        for item in found["credentials"]
+    }
+
+
+def test_a_refused_token_endpoint_is_an_error_with_the_line_to_add() -> None:
+    found = report(guard_policy(), refused=[refusal("token", "accounts.example")])
+    music = next(item for item in found["credentials"] if item["name"] == "music")
+    assert [f for f in music["findings"] if f["code"] == "address_refused"] == [
+        finding(
+            "address_refused",
+            "error",
+            refused_text("the token endpoint", "accounts.example:443"),
+            FIX,
+        )
+    ]
+    assert music["level"] == "error"
+    assert found["summary"]["error"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("refused", "music", "notes"),
+    [
+        # Each purpose against its own destination, and only the credential's own.
+        (
+            refusal("route", "api.example"),
+            [refused_text("a route's upstream", "api.example:443")],
+            [],
+        ),
+        (
+            refusal("route", "other.example", verdict="loopback"),
+            [],
+            [refused_text("a route's upstream", "other.example:443", "loopback")],
+        ),
+        (
+            refusal("revocation", "accounts.example", 8443),
+            [refused_text("the revocation endpoint", "accounts.example:8443")],
+            [],
+        ),
+        # Another purpose's destination, another port, or no longer the policy's: nothing.
+        (refusal("token", "api.example"), [], []),
+        (refusal("route", "accounts.example"), [], []),
+        (refusal("revocation", "accounts.example"), [], []),
+        (refusal("token", "accounts.example", 8443), [], []),
+        (refusal("token", "gone.example"), [], []),
+        (refusal("discovery", "accounts.example"), [], []),
+    ],
+)
+def test_each_refusal_belongs_to_the_credential_whose_destination_it_was(
+    refused: dict[str, Any], music: list[str], notes: list[str]
+) -> None:
+    policy = guard_policy(revocation_url="https://accounts.example:8443/revoke")
+    assert refused_findings(policy, refused) == {"music": music, "notes": notes}
+
+
+def test_a_revocation_refusal_needs_a_revocation_endpoint() -> None:
+    found = refused_findings(guard_policy(), refusal("revocation", "accounts.example"))
+    assert found == {"music": [], "notes": []}
+
+
+def test_a_reload_that_lists_the_destination_ends_the_finding() -> None:
+    refused = [refusal("token", "accounts.example"), refusal("route", "api.example")]
+    listed = guard_policy(private=["accounts.example:443"])
+    assert refused_findings(listed, *refused) == {
+        "music": [refused_text("a route's upstream", "api.example:443")],
+        "notes": [],
+    }
+    both = guard_policy(private=["accounts.example:443", "api.example:443"])
+    assert refused_findings(both, *refused) == {"music": [], "notes": []}
+
+
+def test_an_ipv6_destination_is_matched_as_egress_private_writes_it() -> None:
+    policy = guard_policy(token_url="https://[fd00::5]:8443/token")
+    found = refused_findings(policy, refusal("token", "fd00::5", 8443))
+    assert found["music"] == [refused_text("the token endpoint", "[fd00::5]:8443")]
+
+
+def test_no_refusals_no_findings() -> None:
+    assert refused_findings(guard_policy()) == {"music": [], "notes": []}
+
+
+def test_an_idn_destination_is_matched_as_the_guard_sees_it() -> None:
+    """The guard is given the URL's IDNA-encoded host, so the refusal names the ``xn--`` form,
+    the one egress_private can list; the decoded name would match nothing."""
+    policy = guard_policy(token_url="https://bücher.example/token")
+    found = refused_findings(policy, refusal("token", "xn--bcher-kva.example"))
+    assert found["music"] == [refused_text("the token endpoint", "xn--bcher-kva.example:443")]
+    listed = policy.model_copy(update={"egress_private": ["xn--bcher-kva.example:443"]})
+    assert refused_findings(listed, refusal("token", "xn--bcher-kva.example"))["music"] == []
+
+
+def test_a_trailing_dot_destination_is_matched_without_its_dot() -> None:
+    policy = guard_policy(token_url="https://accounts.example./token")
+    found = refused_findings(policy, refusal("token", "accounts.example."))
+    assert found["music"] == [refused_text("the token endpoint", "accounts.example:443")]
+    listed = policy.model_copy(update={"egress_private": ["accounts.example:443"]})
+    assert refused_findings(listed, refusal("token", "accounts.example."))["music"] == []
+
+
+FILES = "https://files.lan.example/v1"
+RULES = [{"methods": ["GET"], "paths": ["/**"]}]
+
+
+def egress_policy(private: Sequence[str] = (), files: str = FILES) -> Policy:
+    """music (oauth2, a route to API), and files, a route to ``files`` with no credential."""
+    routes: list[dict[str, Any]] = [
+        {"name": "r0", "prefix": "/r0", "upstream": API, "credential": "music"},
+        {"name": "files", "prefix": "/files", "upstream": files},
+    ]
+    for index, route in enumerate(routes):
+        route.update(callers=[{"placeholder": f"ph-agent{index}-direct-0001"}], rules=RULES)
+    return Policy.model_validate(
+        {
+            **BASE,
+            "egress_private": list(private),
+            "routes": routes,
+            "credentials": {"music": spotify()},
+        }
+    )
+
+
+def test_a_refused_route_with_no_credential_is_the_egress_sections() -> None:
+    """No credential's section can hold it, so the egress section does, naming the route."""
+    found = report(egress_policy(), refused=[refusal("route", "files.lan.example")])
+    text = refused_text("route files's upstream", "files.lan.example:443")
+    assert found["egress"] == {
+        "level": "error",
+        "findings": [
+            finding("address_refused", "error", text, {"kind": "fix_policy", "route": "files"})
+        ],
+    }
+    assert found["summary"]["error"] == report(egress_policy())["summary"]["error"] + 1
+    [music] = found["credentials"]
+    assert [f for f in music["findings"] if f["code"] == "address_refused"] == []
+
+
+@pytest.mark.parametrize(
+    "refused",
+    [
+        [],
+        # The credential's route, or a call that isn't a route's, at the same destination.
+        [refusal("route", "api.example")],
+        [refusal("token", "files.lan.example"), refusal("revocation", "files.lan.example")],
+        # Another port, or a destination no route has now.
+        [refusal("route", "files.lan.example", 8443)],
+        [refusal("route", "gone.lan.example")],
+    ],
+)
+def test_the_egress_section_holds_only_a_refused_route_with_no_credential(
+    refused: list[dict[str, Any]],
+) -> None:
+    found = report(egress_policy(), refused=refused)
+    assert found["egress"] == {"level": "ok", "findings": []}
+
+
+def test_a_reload_that_lists_or_moves_the_route_ends_its_egress_finding() -> None:
+    refused = [refusal("route", "files.lan.example")]
+    assert report(egress_policy(), refused=refused)["egress"]["level"] == "error"
+    listed = egress_policy(private=["files.lan.example:443"])
+    assert report(listed, refused=refused)["egress"]["findings"] == []
+    moved = egress_policy(files="https://files.example/v1")
+    assert report(moved, refused=refused)["egress"]["findings"] == []
+
+
+def test_an_egress_route_is_matched_as_the_guard_sees_it() -> None:
+    """IDN and IPv6 upstreams: the key is the IDNA-encoded host, and an IPv6 one in brackets."""
+    idn = egress_policy(files="https://bücher.lan.example/v1")
+    found = report(idn, refused=[refusal("route", "xn--bcher-kva.lan.example")])
+    [item] = found["egress"]["findings"]
+    assert item["text"] == refused_text("route files's upstream", "xn--bcher-kva.lan.example:443")
+    literal = egress_policy(files="https://[fd00::7]:8443/v1")
+    found = report(literal, refused=[refusal("route", "fd00::7", 8443)])
+    [item] = found["egress"]["findings"]
+    assert item["text"] == refused_text("route files's upstream", "[fd00::7]:8443")
+
+
 # --- connectors --------------------------------------------------------------------------------
 
 
@@ -1579,7 +1784,7 @@ def test_the_summary_counts_the_passkeys() -> None:
     state = PasskeyState(1, regressed_ago=0)
     found = report(make_policy({}), persisted=False, passkeys=state)
     assert found["summary"] == {"error": 1, "warning": 1, "info": 1}
-    assert list(found) == ["summary", "credentials", "connectors", "store", "passkeys"]
+    assert list(found) == ["summary", "credentials", "connectors", "store", "egress", "passkeys"]
 
 
 # --- the reported ledger's copy (M5 design J.4) --------------------------------------------------

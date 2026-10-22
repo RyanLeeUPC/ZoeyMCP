@@ -44,6 +44,7 @@ from ..bindings import (
     live_slot,
 )
 from ..health import idle, last_failure, parse_time
+from ..netclient import ADDRESS_REFUSED, AddressRefused, destination_key, private_hint
 from ..store import Secret
 from . import pkce
 from .pkce import (
@@ -646,6 +647,11 @@ class LoginService:
             )
         return result
 
+    def refused(self) -> list[dict[str, Any]]:
+        """The address guard's refusals since start, as the token manager keeps them, for
+        health's ``address_refused`` (M7 design J)."""
+        return self._tokens.refused()
+
     # --- helpers -------------------------------------------------------------------------------
 
     def _credential(self, name: str) -> OAuth2Credential:
@@ -713,6 +719,14 @@ class LoginService:
         started = self._clock()
         try:
             response = await self._tokens.post(request, deadline=EXCHANGE_DEADLINE)
+        except AddressRefused:
+            # Nothing was sent: the guard refused the endpoint's address (M7 design B.2).
+            self._log_call(credential, cred, grant, transport_failure(ADDRESS_REFUSED), started)
+            raise LoginError(
+                f"exchange_failed:{OAUTH_UNAVAILABLE}",
+                "the vault doesn't connect to the token endpoint: "
+                f"{private_hint(destination_key(cred.token_url))}; then run login again",
+            ) from None
         except (httpx.HTTPError, TimeoutError, OSError):
             self._log_call(credential, cred, grant, transport_failure("no_response"), started)
             raise LoginError(
@@ -887,6 +901,13 @@ def _advice(
         )
     if reason == "no_route":
         return f"no route uses {name}; fix the policy", _action("fix_policy", name)
+    if reason == ADDRESS_REFUSED:
+        key = destination_key(cred.token_url)
+        return (
+            f"the vault doesn't connect to the token endpoint: {private_hint(key)}; "
+            f"then run: zoeymcp oauth reset {name}",
+            _action("fix_policy", name),
+        )
     reset = f"check the client ID and secret, then run: zoeymcp oauth reset {name}"
     if code in (OAUTH_RECONSENT_NEEDED, OAUTH_ROTATION_LOST, CREDENTIAL_UNAVAILABLE):
         if cred.grant == "client_credentials":

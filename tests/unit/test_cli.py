@@ -2057,6 +2057,42 @@ def test_health_shows_the_ledger_copy(admin: FakeAdmin) -> None:
     )
 
 
+def test_health_shows_the_egress_section_only_with_findings(admin: FakeAdmin) -> None:
+    """A route with no credential that the guard refused (M7 design J); a quiet section is
+    not printed."""
+    finding = {
+        "code": "address_refused",
+        "level": "error",
+        "advisory": False,
+        "text": "route files's upstream at files.lan.example:443 was refused",
+        "action": {"kind": "fix_policy", "route": "files"},
+    }
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    report = {
+        "summary": {"error": 1, "warning": 0, "info": 0},
+        "credentials": [],
+        "connectors": [],
+        "store": empty,
+        "egress": {"level": "error", "findings": [finding]},
+    }
+    admin.answers[("GET", "/health")] = (200, report)
+    code, out, _ = cli(["health", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert out.splitlines()[1:-1] == [
+        "egress: error",
+        "  error   address_refused: route files's upstream at files.lan.example:443 was refused",
+        "          fix the policy",
+    ]
+    report.update(
+        summary={"error": 0, "warning": 0, "info": 0}, egress={"level": "ok", "findings": []}
+    )
+    _, out, _ = cli(["health", "--socket", "x"])
+    assert out.splitlines() == [
+        "store: ok (0 entries)",
+        "health: ok (0 error(s), 0 warning(s), 0 info)",
+    ]
+
+
 @pytest.mark.parametrize(
     ("state", "lines"),
     [

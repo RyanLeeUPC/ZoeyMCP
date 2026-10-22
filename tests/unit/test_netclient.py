@@ -1,5 +1,7 @@
-"""Effect tests for the vault's guarded onboarding client (M7 design B.2, B.3, B.6; X3's
-onboarding half, X23, FM-8, TI-10), through the real ``VaultApp`` constructor (F-2).
+"""Effect tests for the vault's guarded clients (M7 design B.2, B.3, B.6; X3, X23, FM-8, TI-10),
+through the real ``VaultApp`` constructor (F-2): the onboarding client (step 4), and the route and
+token clients (step 16), whose refusals answer 502 ``address_refused``, fail a token call with the
+reason ``address_refused``, and are logged and kept for health.
 
 Names resolve through the fake resolver (tests/fakes/resolver.py): each answers an address
 reserved for the run, and the dial map sends the address the guard checked to a TLS fake on
@@ -10,9 +12,11 @@ does, except in X23's row, which keeps the real bundle.
 
 from __future__ import annotations
 
+import io
+import json
 import socket
 import ssl
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -26,11 +30,14 @@ from tests.acceptance.tls import ProviderCA, issue_cert, make_ca
 from tests.fakes.connect_proxy import ConnectProxy, ProxySwitch, serve_proxy
 from tests.fakes.resolver import TIMEOUT, FakeResolver, serve_https
 from zoeymcp.common.netguard import AddressVerdict
-from zoeymcp.vault import netclient
+from zoeymcp.common.policy import Policy
+from zoeymcp.vault import logs, netclient
 from zoeymcp.vault.app import VaultApp
-from zoeymcp.vault.keys import generate_master_key
+from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.netclient import ONBOARDING_EXTENSION, AddressRefused, ResolveFailed
+from zoeymcp.vault.oauth.protocol import TokenRequest, TokenResponse
 from zoeymcp.vault.server import load_runtime
+from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
 
@@ -392,3 +399,305 @@ async def test_an_injected_client_serves_onboarding_too(tmp_path: Path) -> None:
     finally:
         await app.aclose()
     assert injected.is_closed
+
+
+# --- step 16: the route and token clients -------------------------------------------------------
+
+AGENT = "172.30.4.10"
+PH = "ph-agent1-direct-0001"
+HINT = "list {} in egress_private if this destination is meant to be private"
+
+
+@pytest.fixture
+def events() -> Iterator[io.StringIO]:
+    stream = io.StringIO()
+    logs.set_stream(stream)
+    try:
+        yield stream
+    finally:
+        logs.set_stream(None)
+
+
+def lines(stream: io.StringIO, kind: str) -> list[dict[str, Any]]:
+    found = [json.loads(line) for line in stream.getvalue().splitlines()]
+    return [line for line in found if line["event"] == kind]
+
+
+def guarded_policy(
+    upstream: str, *, private: Sequence[str] = (), proxy: str | None = None
+) -> Policy:
+    """One route to ``upstream`` for a placeholder caller, and ``egress_private``."""
+    document: dict[str, Any] = {
+        "version": 1,
+        "mode": "declarative",
+        "egress_private": list(private),
+        "routes": [
+            {
+                "name": "api",
+                "prefix": "/api",
+                "upstream": upstream,
+                "callers": [{"placeholder": PH}],
+                "rules": [{"methods": ["GET"], "paths": ["/**"]}],
+            }
+        ],
+    }
+    if proxy is not None:
+        document["egress_proxy"] = proxy
+    return Policy.model_validate(document)
+
+
+def guarded_vault(tmp_path: Path, policy: Policy) -> VaultApp:
+    """The real VaultApp with no client injected: every client is netclient's."""
+    keys = KeySet.from_text(KEY)
+    store = SecretStore(tmp_path / "state", keys)
+    store.load()
+    return VaultApp(policy, store, keys, environ={})
+
+
+async def through(app: VaultApp, path: str = "/api/x") -> httpx.Response:
+    """A placeholder caller's GET through the vault's route."""
+    transport = httpx.ASGITransport(app=app, client=(AGENT, 40000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://vault") as caller:
+        return await caller.get(path, headers={"authorization": f"Bearer {PH}"})
+
+
+async def token_call(app: VaultApp, url: str) -> TokenResponse:
+    """One POST through the vault's token client, as login and refresh make it."""
+    return await app.tokens.post(TokenRequest(url, (), b"grant_type=refresh_token"))
+
+
+def kept(app: VaultApp) -> list[dict[str, Any]]:
+    """The token manager's refusals, without the time each was seen."""
+    return [{k: v for k, v in item.items() if k != "at"} for item in app.tokens.refused()]
+
+
+def fields(line: dict[str, Any]) -> dict[str, Any]:
+    return {k: line[k] for k in ("purpose", "host", "port", "verdict")}
+
+
+@pytest.mark.usefixtures("trusted")
+async def test_a_route_rebinding_between_connections_answers_address_refused(
+    tmp_path: Path, fake: FakeResolver, certs: dict[str, tuple[Path, Path]], events: io.StringIO
+) -> None:
+    """FM-8 for routes: the first request reaches the upstream at the address checked; the
+    second connection's lookup answers private, so the route answers 502 ``address_refused``
+    with nothing sent, logged with the hint and kept for health."""
+    app = guarded_vault(tmp_path, guarded_policy(f"https://{NAME}"))
+    try:
+        async with serve_https(*certs[NAME]) as (port, seen):
+            public = fake.serve(NAME, port)
+            fake.rebind(NAME, public, "10.0.0.1")
+            with anyio.fail_after(10):
+                first = await through(app)
+                second = await through(app)
+    finally:
+        await app.aclose()
+    assert (first.status_code, first.text) == (200, "ok")
+    assert second.status_code == 502
+    assert second.json() == {"error": "upstream unavailable", "code": "address_refused"}
+    assert second.headers["x-zoeymcp-vault"] == "refused"
+    assert fake.lookups == [(NAME, 443), (NAME, 443)]
+    assert fake.dialled == [(public, 443)]
+    assert len(seen.heads) == 1
+    assert seen.heads[0].startswith(b"GET /x HTTP/1.1\r\n")
+    [refused] = lines(events, "address_refused")
+    assert fields(refused) == {"purpose": "route", "host": NAME, "port": 443, "verdict": "private"}
+    request = lines(events, "request")[-1]
+    assert (request["status"], request["code"]) == (502, "address_refused")
+    assert request["reason"] == f"address refused (private): {HINT.format(f'{NAME}:443')}"
+    assert kept(app) == [{"purpose": "route", "host": NAME, "port": 443, "verdict": "private"}]
+
+
+@pytest.mark.usefixtures("trusted")
+async def test_a_reload_that_lists_a_private_upstream_lets_the_next_request_through(
+    tmp_path: Path, fake: FakeResolver, certs: dict[str, tuple[Path, Path]]
+) -> None:
+    """An unlisted LAN upstream is refused; the route client reads the running policy's
+    egress_private at each connection, so a reload listing it needs no restart."""
+    app = guarded_vault(tmp_path, guarded_policy(f"https://{LAN}"))
+    try:
+        async with serve_https(*certs[LAN]) as (port, seen):
+            fake.serve(LAN, port, address="10.0.0.5")
+            with anyio.fail_after(10):
+                refused = await through(app)
+                app.reload(guarded_policy(f"https://{LAN}", private=[f"{LAN}:443"]))
+                listed = await through(app)
+    finally:
+        await app.aclose()
+    assert (refused.status_code, refused.json()["code"]) == (502, "address_refused")
+    assert (listed.status_code, listed.text) == (200, "ok")
+    assert fake.dialled == [("10.0.0.5", 443)]
+    assert len(seen.heads) == 1
+
+
+@pytest.mark.usefixtures("trusted")
+async def test_a_token_endpoint_rebinding_between_connections_is_refused_and_kept(
+    tmp_path: Path, fake: FakeResolver, certs: dict[str, tuple[Path, Path]], events: io.StringIO
+) -> None:
+    """FM-8 for tokens: login, refresh and the code exchange post on one guarded client, which
+    refuses the second connection once the name answers private, logs it and keeps it."""
+    app = guarded_vault(tmp_path, guarded_policy(f"https://{NAME}"))
+    try:
+        async with serve_https(*certs[NAME]) as (port, seen):
+            public = fake.serve(NAME, port)
+            fake.rebind(NAME, public, "10.0.0.1")
+            with anyio.fail_after(10):
+                first = await token_call(app, f"https://{NAME}/token")
+                with pytest.raises(AddressRefused) as caught:
+                    await token_call(app, f"https://{NAME}/token")
+    finally:
+        await app.aclose()
+    assert (first.status, first.body) == (200, b"ok")
+    verdict = AddressVerdict(allowed=False, reason="private", address="10.0.0.1")
+    assert caught.value.verdict == verdict
+    assert fake.dialled == [(public, 443)]
+    assert len(seen.heads) == 1
+    assert seen.heads[0].startswith(b"POST /token HTTP/1.1\r\n")
+    [refused] = lines(events, "address_refused")
+    assert fields(refused) == {"purpose": "token", "host": NAME, "port": 443, "verdict": "private"}
+    assert kept(app) == [{"purpose": "token", "host": NAME, "port": 443, "verdict": "private"}]
+
+
+@pytest.mark.usefixtures("trusted")
+async def test_a_listed_token_endpoint_is_reached_after_a_reload(
+    tmp_path: Path, fake: FakeResolver, certs: dict[str, tuple[Path, Path]]
+) -> None:
+    """The token client reads the running policy's egress_private, as the revocation client
+    does (TI-11): a LAN token endpoint is refused until a reload lists it."""
+    app = guarded_vault(tmp_path, guarded_policy(f"https://{NAME}"))
+    try:
+        async with serve_https(*certs[LAN]) as (port, seen):
+            fake.serve(LAN, port, address="10.0.0.5")
+            with anyio.fail_after(10):
+                with pytest.raises(AddressRefused):
+                    await token_call(app, f"https://{LAN}/token")
+                app.reload(guarded_policy(f"https://{NAME}", private=[f"{LAN}:443"]))
+                answer = await token_call(app, f"https://{LAN}/token")
+    finally:
+        await app.aclose()
+    assert (answer.status, answer.body) == (200, b"ok")
+    assert len(seen.heads) == 1
+
+
+async def test_route_and_token_clients_refuse_a_certificate_only_a_test_store_trusts(
+    tmp_path: Path, fake: FakeResolver, certs: dict[str, tuple[Path, Path]]
+) -> None:
+    """X23 for both: certifi's roots, and no others. The route answers 502 with no code."""
+    app = guarded_vault(tmp_path, guarded_policy(f"https://{NAME}"))
+    try:
+        async with serve_https(*certs[NAME]) as (port, seen):
+            fake.serve(NAME, port)
+            with anyio.fail_after(10):
+                routed = await through(app)
+                with pytest.raises(httpx.ConnectError) as caught:
+                    await token_call(app, f"https://{NAME}/token")
+    finally:
+        await app.aclose()
+    assert routed.status_code == 502
+    assert "code" not in routed.json()
+    assert any(isinstance(e, ssl.SSLCertVerificationError) for e in causes(caught.value))
+    assert seen.heads == []
+    assert app.tokens.refused() == []
+
+
+async def test_with_a_proxy_routes_and_tokens_resolve_nothing_locally(
+    tmp_path: Path, fake: FakeResolver, lookups: list[Any]
+) -> None:
+    """B.3: with egress_proxy set nothing changes for an existing stack: the proxy is asked
+    for the name, and the guard judges nothing, an unlisted LAN name included."""
+    proxy = ConnectProxy({ProxySwitch.REFUSE_403})
+    with serve_proxy(proxy) as url:
+        app = guarded_vault(tmp_path, guarded_policy(f"https://{LAN}", proxy=url))
+        try:
+            with anyio.fail_after(10):
+                routed = await through(app)
+                with pytest.raises(httpx.ProxyError):
+                    await token_call(app, f"https://{NAME}/token")
+        finally:
+            await app.aclose()
+    assert routed.status_code == 502
+    assert "code" not in routed.json()
+    assert proxy.targets == [f"{LAN}:443", f"{NAME}:443"]
+    assert fake.lookups == []
+    assert set(lookups) <= {"127.0.0.1"}
+    assert app.tokens.refused() == []
+
+
+async def test_the_route_and_token_clients_are_built_once_from_the_startup_policy(
+    tmp_path: Path,
+) -> None:
+    app = guarded_vault(tmp_path, guarded_policy(f"https://{NAME}"))
+    route, token = app._client, app._token_client
+    try:
+        assert token is not None
+        for client in (route, token):
+            assert isinstance(client._transport, netclient.GuardedTransport)
+            assert client.follow_redirects is False
+            assert client.trust_env is False
+            assert type(client.cookies.jar).__name__ == "_DiscardingJar"
+        assert route.timeout == httpx.Timeout(60.0, connect=10.0)
+        assert token.timeout == netclient.TOKEN_TIMEOUT
+        # A reload that sets egress_proxy changes neither client: that waits for a restart.
+        app.reload(guarded_policy(f"https://{NAME}", proxy="http://proxy.example:3128"))
+        assert app._client is route
+        assert app._token_client is token
+        assert isinstance(route._transport, netclient.GuardedTransport)
+        assert isinstance(token._transport, netclient.GuardedTransport)
+        assert app.egress_proxy is None
+    finally:
+        await app.aclose()
+    assert route.is_closed
+    assert token is not None
+    assert token.is_closed
+    (tmp_path / "proxied").mkdir(mode=0o700)
+    proxied = guarded_vault(
+        tmp_path / "proxied", guarded_policy(f"https://{NAME}", proxy="http://proxy.example:3128")
+    )
+    try:
+        assert isinstance(proxied._client._transport, httpx.AsyncHTTPTransport)
+        assert proxied._token_client is not None
+        assert isinstance(proxied._token_client._transport, httpx.AsyncHTTPTransport)
+    finally:
+        await proxied.aclose()
+
+
+def test_the_hint_and_the_destination_key() -> None:
+    """The key is the guard's: the IDNA-encoded host, without a trailing dot, the port written
+    out, an IPv6 address in brackets; each one an egress_private entry the schema takes."""
+    assert netclient.private_hint("files.lan.example:443") == HINT.format("files.lan.example:443")
+    assert netclient.destination_key("https://Files.LAN.example/x") == "files.lan.example:443"
+    assert netclient.destination_key("http://files.lan.example/x") == "files.lan.example:80"
+    assert netclient.destination_key("https://[fd00::5]:8443/token") == "[fd00::5]:8443"
+    assert netclient.destination_key("https://[FD00::5]/token") == "[fd00::5]:443"
+    assert netclient.destination_key(f"https://{UNICODE}/mcp") == f"{PUNY}:443"
+    assert netclient.destination_key("https://lan.example.:8443/x") == "lan.example:8443"
+    assert netclient.guard_key("Files.LAN.example.", 443) == "files.lan.example:443"
+    assert netclient.guard_key("fd00::5", 8443) == "[fd00::5]:8443"
+    keys = ["files.lan.example:8443", f"{PUNY}:443", "[fd00::5]:443"]
+    assert Policy.model_validate({"version": 1, "mode": "declarative", "egress_private": keys})
+
+
+async def test_a_trailing_dot_name_is_listed_by_its_entry_without_the_dot() -> None:
+    """httpcore gives the guard the URL's host with its trailing dot; ``lan.example.`` names
+    ``lan.example``, so the entry the schema takes lists it, as the exact name still does."""
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        port = listener.getsockname()[1]
+
+        async def lan(_host: str, _port: int) -> list[str]:
+            return ["10.0.0.5"]
+
+        def dial(_address: str, _port: int) -> tuple[str, int]:
+            return "127.0.0.1", port
+
+        for entry in (f"{LAN}:443", f"{LAN}.:443"):
+
+            def listed(entry: str = entry) -> set[str]:
+                return {entry}
+
+            backend = netclient.GuardedBackend(listed, resolver=lan, dial=dial)
+            stream = await backend.connect_tcp(f"{LAN}.", 443)
+            await stream.aclose()
+        backend = netclient.GuardedBackend(lambda: {f"{NAME}:443"}, resolver=lan, dial=dial)
+        with pytest.raises(AddressRefused) as caught:
+            await backend.connect_tcp(f"{LAN}.", 443)
+    assert caught.value.verdict.reason == "private"

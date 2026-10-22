@@ -571,7 +571,8 @@ async def test_the_vaults_revocation_client_reads_the_running_policy(
 ) -> None:
     """Through the real VaultApp constructor (F-2): its revocation client is built once, at
     start, and reads egress_private from the policy running at each connection, so a reload
-    that lists the token origin lets the next revocation through."""
+    that lists the token origin lets the next revocation through. The refusal is kept for
+    health with the route's and the token client's (M7 design J)."""
     held = Revocations(tmp_path, clock, policy=lan_policy(listed=False))
     app = VaultApp(held.rig.policy, held.store, KEYS, environ={}, tokens=held.rig.manager)
     async with serve_https(*lan_cert) as (port, seen):
@@ -589,4 +590,6 @@ async def test_the_vaults_revocation_client_reads_the_running_policy(
         await app.aclose()
     assert [line["outcome"] for line in captured.events("oauth_revoked")] == ["refused", "ok"]
     assert len(seen.heads) == 1
+    [kept] = app.tokens.refused()
+    assert kept == {**kept, "purpose": "revocation", "host": LAN, "port": 443, "verdict": "private"}
     await held.aclose()

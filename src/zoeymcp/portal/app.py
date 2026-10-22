@@ -2289,7 +2289,7 @@ def _health_view(report: Mapping[str, Any]) -> dict[str, Any]:
     view: dict[str, Any] = {"summary": report["summary"]}
     for key, kind in (("credentials", "credential"), ("connectors", "connector")):
         view[key] = [_health_section(kind, item, checklist) for item in report[key]]
-    for key in ("store", "passkeys", "ledger_copy"):
+    for key in ("store", "egress", "passkeys", "ledger_copy"):
         if key in report:
             view[key] = _health_section(key, report[key], checklist)
     rank = {"error": 0, "warning": 1, "info": 2}

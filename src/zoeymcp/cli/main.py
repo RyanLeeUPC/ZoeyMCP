@@ -1586,7 +1586,8 @@ def _cmd_health(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 
 def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
     """The lines ``health`` prints: per credential, connector and the store, its findings, each
-    with what to do, then the counts."""
+    with what to do, then the routes with no credential the guard refused (``egress``, only when
+    there are some), then the counts."""
     lines: list[str] = []
     for item in report["credentials"]:
         lines.append(f"{item['name']} ({item['kind']}): {item['level']}")
@@ -1600,6 +1601,10 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
     store = report["store"]
     lines.append(f"store: {store['level']} ({store['entries']} entries)")
     lines += _finding_lines(store["findings"])
+    egress = report.get("egress")
+    if egress is not None and egress["findings"]:
+        lines.append(f"egress: {egress['level']}")
+        lines += _finding_lines(egress["findings"])
     passkeys = report.get("passkeys")
     if passkeys is not None:
         count = (

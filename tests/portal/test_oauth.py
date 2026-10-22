@@ -31,7 +31,7 @@ import pytest
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import Page
 from tests.fakes.oauth_server import FakeAuthServer
-from zoeymcp.vault import app as vault_app
+from zoeymcp.vault import netclient
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.oauth.pkce import FLOW_TTL
 from zoeymcp.vault.store import SecretStore
@@ -178,9 +178,9 @@ class World:
 def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     fakes = providers()
     monkeypatch.setattr(
-        vault_app,
-        "_token_client",
-        lambda _: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
+        netclient,
+        "token_client",
+        lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
     )
     with running(tmp_path, policy=policy()) as rig:
         passkey = SoftAuthenticator()
@@ -310,6 +310,31 @@ def test_health_is_the_sockets_report_fit_to_show(world: World) -> None:
     assert "passkeys" in shown  # this vault has a portal
     assert [f["code"] for f in shown["passkeys"]["findings"]] == ["passkey_single"]
     assert shown["passkeys"]["findings"][0]["section"] == "passkeys"
+    assert shown["egress"] == {"level": "ok", "findings": []}
+
+
+def test_a_refused_route_with_no_credential_is_on_the_checklist() -> None:
+    """Health's egress section (M7 design J): its finding names the route in its text, and the
+    page words its action."""
+    from zoeymcp.portal.app import _health_view
+
+    text = "route files's upstream at files.lan.example:443 was refused"
+    action = {"kind": "fix_policy", "route": "files"}
+    finding = {"code": "address_refused", "level": "error", "advisory": False, "text": text}
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    view = _health_view(
+        {
+            "summary": {"error": 1, "warning": 0, "info": 0},
+            "credentials": [],
+            "connectors": [],
+            "store": empty,
+            "egress": {"level": "error", "findings": [{**finding, "action": action}]},
+        }
+    )
+    [shown] = view["checklist"]
+    assert view["egress"]["findings"] == [shown]
+    assert (shown["section"], shown["name_shown"], shown["text_shown"]) == ("egress", None, text)
+    assert (shown["action"], shown["todo"]) == (action, "Fix the policy.")
 
 
 def test_a_setup_session_reaches_neither_health_nor_the_oauth_routes(world: World) -> None:
@@ -740,9 +765,9 @@ def test_the_completion_data_is_checked_before_the_flow(world: World) -> None:
 def test_too_many_pending_logins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fakes = providers()
     monkeypatch.setattr(
-        vault_app,
-        "_token_client",
-        lambda _: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
+        netclient,
+        "token_client",
+        lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=fakes.app())),
     )
     spare = {f"spare{n}": notes(refresh_token=f"store:spare{n}-refresh") for n in range(8)}
     with running(tmp_path, policy=policy(**spare)) as rig:

@@ -712,8 +712,11 @@ mail_toolkit() {
 }
 # The smoke's policy after its first lines, indented for ZOEYMCP_CONFIG: the shipped notes
 # server, and a fake server routed to the fake upstream, with echo and slow pinned and allowed.
+# The fake upstream's name resolves to a compose network's private address, which the vault's
+# address guard refuses unless egress_private lists it (M7 design B.2).
 smoke_policy() {
     cat <<EOF
+        egress_private: ["fake-upstream:9000"]
         credentials:
           notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
 $(mail_toolkit connectors)

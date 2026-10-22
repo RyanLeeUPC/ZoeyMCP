@@ -270,7 +270,8 @@ came back for one sign-in and the login ended with nothing stored: connect again
 ## 3. Credential health: `health`, `oauth status` and `oauth reset`
 
 **`zoeymcp health`** lists what needs you, per credential, connector and store entry, with what
-to do about each. It reads metadata only: nothing is decrypted and no request is sent.
+to do about each, and under `egress` each route with no credential whose upstream the vault
+refused to connect to. It reads metadata only: nothing is decrypted and no request is sent.
 
 ```text
 $ zoeymcp health
@@ -316,6 +317,7 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `insufficient_scope` | warning | an upstream said the token lacks a scope, **since the vault started**: a restart forgets it. When its challenge named a `scope`, the text lists it, and if that adds to the credential's own the action is `widen_scope`: merge the fragment (`--json` holds it; it sets `credentials.<c>.scope` to the union and keeps the rest), check and reload, then `zoeymcp login <c>`. The vault never widens a scope itself |
 | `client_secret_expiring`, `client_secret_expired` | warning, error | a client the vault registered has a `client_secret_expires_at` (from stored metadata) within 14 days, or past: register a new client with `login --mcp URL --reregister` (the action's command), or for a credential without the server's URL as its `resource`, enter the new secret with `secret set`. The wall clock judges it |
 | `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`login --mcp URL --reregister`); the vault never registers again by itself |
+| `address_refused` | error | the vault refused to connect to the credential's token endpoint, its revocation endpoint or a route's upstream **since the vault started**, because the name resolved to a private, loopback or otherwise non-global address (§7's upgrade note): list its `host:port` in `egress_private` if it is meant to be private, and reload. A reload that lists it, or moves the endpoint, ends the finding. A route with no credential has no credential section: its refusal is the `egress` section's, with the route's name (`fix_policy`). The log has each refusal too (`address_refused`, §11) |
 | `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
 | `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
 | `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |
@@ -368,6 +370,7 @@ Each credential gets a line with its state, then details. Nothing in it is a sec
 | --- | --- |
 | reason `client_id_unavailable` / `client_secret_unavailable` | "enter the client ID (or secret) with zoeymcp secret set NAME" or "set the client ID (or secret) in env VAR and restart the vault", then "then run: zoeymcp oauth reset NAME" |
 | reason `no_route` | "no route uses NAME; fix the policy" |
+| reason `address_refused` | "the vault doesn't connect to the token endpoint: list HOST:PORT in egress_private if this destination is meant to be private; then run: zoeymcp oauth reset NAME" |
 | `oauth_reconsent_needed`, `oauth_rotation_lost`, `credential_unavailable` | with `authorize_url`: "run: zoeymcp login NAME". Without one, how to give a new refresh token: "enter the refresh token with zoeymcp secret set ENTRY", or for an env seed "put a new refresh token in env VAR and restart the vault (reseed: on-change)" or "put a new refresh token in env VAR, delete oauth.NAME.live with zoeymcp secret delete (reseed: never keeps it), and restart the vault". For `client_credentials`: "check the client ID and secret, then run: zoeymcp oauth reset NAME" |
 | `oauth_client_rejected` | "check the client ID and secret, then run: zoeymcp oauth reset NAME" |
 | `oauth_misconfigured` | "fix the policy, then run: zoeymcp oauth reset NAME" |
@@ -383,7 +386,8 @@ failure states live in memory.
 
 The `reason` behind a failure is in the admin answer's `reason` field and in the `oauth_refresh`
 log line's `failure_reason`: `provider_error` and `http_status` (the token endpoint refused),
-`no_response` and `pre_send` (no answer), `unparseable_body`, `not_ok`, `bad_access_token`,
+`no_response` and `pre_send` (no answer), `address_refused` (nothing was sent: the token
+endpoint's name resolves to a non-global address `egress_private` doesn't list), `unparseable_body`, `not_ok`, `bad_access_token`,
 `token_type` and `unusable_refresh_token` (an answer the vault can't use), `internal_error`, and,
 before any call, `no_token`, `live_unusable`, `seed_unusable`, `no_route`, `request` (the policy
 can't build the request), `client_id_unavailable` and `client_secret_unavailable`.
@@ -403,8 +407,11 @@ different action:
 | `oauth_misconfigured` | the provider refused the request (`invalid_scope`, `invalid_request`, ...) | fix the policy (scope, `extra_params`, `client_auth`), reload, or `oauth reset` |
 | `oauth_unsupported` | the provider's tokens can't be used (DPoP or another non-Bearer type), or it sent a malformed refresh token | not usable with this vault yet |
 | `oauth_unavailable` | the token endpoint is down, rate limiting, or answered with nothing usable | none: the vault backs off and the next request after `Retry-After` tries again |
+| `address_refused` | the route's upstream name resolves to a private, loopback or otherwise non-global address that `egress_private` doesn't list; nothing was sent | list its `host:port` in `egress_private` if it is meant to be private, and reload (§7) |
 
 A 502 for an upstream that failed by itself carries no code. Identity failures stay a bare 403.
+An upstream's `WWW-Authenticate` is never passed to the gateway (the vault reads it first, for
+health); a placeholder caller still gets it.
 
 ## 5. Seed vs live
 
@@ -496,6 +503,9 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
 - A changed `egress_proxy` needs a restart: every HTTP client and the SMTP connectors keep the
   proxy the vault started with until then. A reload whose `egress_proxy` differs from the one the
   vault started with logs `egress_proxy_change_needs_restart`, on every reload until the restart.
+- A changed `egress_private` takes effect at once: the vault reads it at each new connection, so
+  the next request to a destination a reload lists goes through, and a connection already open to
+  one it removes isn't cut.
 - A changed, added or removed `admin.listen` needs a restart (`admin_listen_change_needs_restart`):
   the portal stays where it listens. A changed `admin.origins` takes effect at once, and the
   sessions of a removed origin end. Removing the whole `admin` block keeps the portal on its old
@@ -514,6 +524,25 @@ on a policy that loaded before: an oauth2 credential behind a gateway server's r
 `resource` in `extra_params` (set it to the server's URL), and, with `egress_proxy` set, a
 credential-less `allow_insecure_upstream` route over plain http, which a CONNECT-only proxy
 refuses.
+
+**Upgrading to M7: the address guard.** Without `egress_proxy`, the vault now refuses to connect
+to any destination whose name resolves to a private, loopback, link-local or otherwise non-global
+address, for every route's upstream, every token endpoint and every revocation endpoint, as it
+already did for onboarding, unless `egress_private` lists its `host:port`. It resolves the name
+once per connection and connects to the address it checked, so a name can't be pointed at the
+vault's own networks after you added it. A route on your own network then answers 502
+`address_refused` (§4) and a login or refresh fails with the reason `address_refused` (§3), each
+logged as `address_refused` with the destination (§11), and `health` reports it. Add one line per
+such destination and reload; no restart is needed:
+
+```yaml
+egress_private: ["files.lan.example:443", "auth.lan.example:8443"]
+```
+
+The entry is the host as the URL writes it, in lower case and without a trailing dot (an
+internationalized name in its `xn--` form, as the hint writes it), and the port (443 for https and
+80 for http when the URL has none). With `egress_proxy` set nothing changes: the proxy resolves the
+names and its allowlist judges the address (§28).
 
 ## 8. Provider notes
 
@@ -1019,7 +1048,7 @@ If anything fails after register stored the secret, the vault deletes it again a
 | `onboard_registered` | `credential`, `issuer` (its host), `auth`, `secret_stored` |
 | `onboard_blocked` | `host` and `port` your proxy refused, `needed` (how many hosts it must allow) |
 | `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired`, `owner_gone`, or `compared` (a second run's comparison found nothing changed) |
-| `address_refused` | `purpose` (`discovery`, `registration`, or `revocation`), `host`, `port`, `verdict` |
+| `address_refused` | `purpose` (`discovery`, `registration`, `revocation`, `route` or `token`), `host`, `port`, `verdict` |
 | `oauth_revoked` | `credential`, `outcome` (`ok`; `refused`: nothing was sent, because the endpoint isn't on the token endpoint's origin, its address was refused, or the client can't be authenticated; `failed`, with the `status` when there was an answer; `timeout`), `status`: a deleted grant's revocation (§2) |
 
 None holds an onboarding's ID, a secret, a registration access token or URI, a URL's path or
