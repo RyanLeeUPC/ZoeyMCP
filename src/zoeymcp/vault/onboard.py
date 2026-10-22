@@ -10,8 +10,10 @@ run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the re
   or D.2a's legacy issuers when there is none, the authorization server's metadata, a
   resolution check of every endpoint host the vault will connect to, and the plan with its draft
   check (OPS-5). A given confidential client's issuer must be the one the operator named
-  (TI-15). Without a given client ID the answer is ``registration_unavailable``: the vault
-  registers no client itself yet (DCR comes later in M7).
+  (TI-15). Without a given client ID the vault registers one (D.4) when the authorization server
+  publishes a ``registration_endpoint`` with an authentication it speaks; else
+  ``registration_unavailable``, or ``cimd_only`` for a server that registers clients by
+  metadata document only.
 - **An operator's own proxy** refusing a host blocks the onboarding (D.11): ``proxy_refused``
   with the hosts it needs and their Squid lines; the same discovery resumes it.
 - **Register** (a given confidential client) stores the secret under the binding fragment 1 will
@@ -19,16 +21,23 @@ run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the re
   if anything fails after the write (OPS-5); **fragment** makes a given public client's
   fragment 1, sending and storing nothing, or renders a registered onboarding's again at any
   indent (OPS-2).
-- **After a restart** (D.7 step 6) the same discovery finds the client secret an earlier run
-  stored for this server by its entry's meta, and takes it on, registered at once, only if its
-  authenticated binding is the one the fresh discovery predicts: fragment 1 again, with no
-  second registration or write.
+- **A registration** (DCR, register with no client ID) runs the draft check again, sends D.4's
+  one request, checks the answer (``oauth/dcr.py``, X7), and writes what a run after a restart
+  needs as register does for a given client: a confidential client's secret, or a public
+  client's ID as ``<credential>-client-id`` (OPS-2), each with the registration's choices in
+  its meta. The answer's registration access token and URI are never read.
+- **After a restart** (D.7 step 6) the same discovery finds the client secret (or a registered
+  public client's ID) an earlier run stored for this server by its entry's meta, and takes it
+  on, registered at once, only if its authenticated binding is the one the fresh discovery
+  predicts: fragment 1 again, with no second registration or write.
 - **The second run** (D.12): a discovery of a URL a running oauth2 credential names starts no
   onboarding. It rediscovers (the probe and GETs), compares the committed credential, route and
   server with what it finds, by field name (``onboarding_mismatch``), checks a stored client
   secret's binding (D.7 step 5), and answers ``committed`` with whether the credential holds a
-  refresh token and what to do next; the CLI signs in. A URL a server reaches with another kind
-  of credential is ``already_configured`` (OPS-14).
+  refresh token and what to do next; the CLI signs in. A registered public client's
+  ``<credential>-client-id`` entry is deleted then: nothing needs it once the policy names the
+  credential (D.8). A URL a server reaches with another kind of credential is
+  ``already_configured`` (OPS-14).
 - **A re-registration** (``reregister``, OPS-3) skips that: it keeps the committed names and runs
   the first run again, its fragment 1 replacing the credential whole (``SetCredential``) and its
   secret replacing the stored one under the binding that fragment derives; a failure after that
@@ -45,7 +54,6 @@ after a second run) and ``address_refused``.
 
 from __future__ import annotations
 
-import ipaddress
 import re
 import secrets
 import time
@@ -70,6 +78,7 @@ from ..common.policy.change import (
     SetCredential,
     validate,
 )
+from ..common.policy.check import secret_references
 from ..common.policy.emit import COMPOSE_INDENT, INDENT_MAX, EmitRefused, Target, emit
 from ..common.policy.findings import Finding
 from ..common.policy.schema import (
@@ -87,6 +96,9 @@ from ..portal.refusals import refusal
 from ..portal.refusals import secret as secret_refusal
 from . import logs, netclient, secretops, secretplan
 from .bindings import BindingError, client_secret_rebound, oauth_binding
+from .oauth import dcr
+from .oauth.dcr import SHARED_REDIRECT as SHARED_REDIRECT
+from .oauth.dcr import application_type as application_type
 from .oauth.discovery import (
     LEGACY_PROBE,
     MODERN_PROBE,
@@ -121,6 +133,7 @@ from .onboarding import (
     INLINE_SOURCE,
     NAME_SOURCES,
     STDIN_SOURCE,
+    Client,
     Committed,
     Names,
     OnboardingRecord,
@@ -128,7 +141,9 @@ from .onboarding import (
     OnboardingTable,
     Options,
     Served,
+    allow_hosts,
     choose_names,
+    client_options,
     committed_for,
     committed_next,
     in_use,
@@ -169,16 +184,17 @@ DISCOVER_KEYS: Final = frozenset(
         "allow_private",
         "secret_given",
         "reregister",
+        "callback_origin",
     }
 )
 # The body keys that are true or false.
 FLAG_KEYS: Final = frozenset({"allow_private", "secret_given", "reregister"})
-# The address an operator-registered client uses unless told otherwise (D.4, D-15).
-SHARED_REDIRECT: Final = str(OAuth2Credential.model_fields["redirect_uri"].default)
+# The client ID a registration's draft check is made with before the server issues one (D.8).
+DRAFT_CLIENT_ID: Final = "zoeymcp-draft-client"
 # A given client ID as fragment 1 can hold it: printable ASCII without a space, a quote, a
 # backslash or a $ (TI-1), at most the schema's 512.
 _CLIENT_ID = re.compile(r"[\x21\x23\x25-\x5b\x5d-\x7e]{1,512}")
-_CLIENT_NAME = re.compile(r"[\x20-\x7e]{1,64}")
+_CLIENT_NAME = re.compile(rf"[\x20-\x7e]{{1,{dcr.CLIENT_NAME_MAX}}}")
 _NAME = re.compile(NAME_PATTERN)
 # The route's rules: the server's path, with what an MCP client sends (E.2).
 MCP_METHODS: Final = ("POST", "GET", "DELETE")
@@ -187,8 +203,12 @@ BACKSTOP_OFF: Final = (
     "credential's sign-in isn't refused by its address (D.6's backstop is off for it)."
 )
 
-# The store name of a credential's client secret ends so (D.7 step 1).
+# The store name of a credential's client secret ends so (D.7 step 1), and a registered public
+# client's ID so (D.8).
 _SECRET_SUFFIX: Final = "-client-secret"  # noqa: S105 - a store name, not a secret
+_CLIENT_ID_SUFFIX: Final = "-client-id"
+# How a client authenticates, as an entry's meta may name it.
+_AUTHS: Final = ("none", "basic", "post")
 # What a re-registration replaces in the committed credential (D.12, OPS-3): the client and the
 # endpoints a fresh discovery gives. Everything else the operator set stays.
 REREGISTERED: Final = (
@@ -226,27 +246,21 @@ class OnboardError(Exception):
 @dataclass(frozen=True)
 class _Kept:
     """A client secret an earlier run stored for this server and kept across a restart (D.7
-    step 6), and the options a run that takes it on has: a confidential client's, with the
-    client ID from the entry's meta unless the run gives it (``from_meta``)."""
+    step 6), or a registered public client's ID (D.8), and the options a run that takes it on
+    has: the client's, with the client ID from the entry's meta unless the run gives it
+    (``from_meta``), and a registration's authentication and redirect address from it too."""
 
     name: str
     options: Options
     from_meta: bool
 
+    @property
+    def secret(self) -> bool:
+        return self.name.endswith(_SECRET_SUFFIX)
+
 
 def _bad_body(detail: str) -> OnboardError:
     return OnboardError(replace(refusal("bad_body"), more=(("detail", detail),)))
-
-
-def application_type(redirect_uri: str) -> str:
-    """Where the client runs, by the redirect's host whatever the scheme (D.4): ``native`` for a
-    loopback address or ``localhost``, else ``web``."""
-    host = urlsplit(redirect_uri).hostname or ""
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = host == "localhost"
-    return "native" if loopback else "web"
 
 
 def policy_source(config: str | None) -> str:
@@ -311,6 +325,9 @@ class OnboardService:
         self._sweep()
         policy = self._policy()
         url, given, options = _request(body)
+        origins = [] if policy.admin is None else policy.admin.origins
+        if options.callback_origin is not None and options.callback_origin not in origins:
+            raise _bad_body("callback_origin isn't one of the policy's admin.origins")
         found = committed_for(policy, url)
         if not options.reregister:
             if found is not None:
@@ -369,8 +386,8 @@ class OnboardService:
             host=host,
             issuer=_issuer_host(plan),
             require_iss=meta.require_iss,
-            registration="given",
-            auth=_client_auth(options),
+            registration=_registration_method(options),
+            auth=_client_auth(_planned_options(record)),
             scopes=len(plan.scopes.scopes),
         )
         if kept is not None:
@@ -428,8 +445,28 @@ class OnboardService:
         except OnboardError as exc:
             logs.event("onboard_refused", reason=exc.answer.reason, host=host)
             raise
+        await self._client_id_entry_gone(names.credential, owner)
         logs.event("onboard_ended", why="compared")
         return answer
+
+    async def _client_id_entry_gone(self, credential: str, owner: str) -> None:
+        """D.8 (OPS-2): a registered public client's ``<credential>-client-id`` entry served
+        only to show fragment 1 again before the commit. The policy names the credential now,
+        so it goes, through ``secretops``, unless the policy itself uses the entry."""
+        name = _entry_name(credential, secret=False)
+        entry = self._store.entry(name)
+        policy = self._policy()
+        used = {ref.removeprefix("store:") for _, ref, _ in secret_references(policy)}
+        if (
+            entry is None
+            or name in used
+            or not isinstance((entry.meta or {}).get("onboarded"), str)
+        ):
+            return
+        via: secretops.Via = "socket" if owner == CLI_OWNER else "portal"
+        await secretops.delete(
+            self._store, self._tokens, secretplan.plan_delete(name, policy), via=via
+        )
 
     def _compared(self, url: str, plan: Plan) -> dict[str, Any]:
         """The committed credential, route and server against a fresh discovery (D.12 step 2),
@@ -504,7 +541,7 @@ class OnboardService:
             rest = [name for name in store_names if name != kept.name]
             names = choose_names(url, in_use(policy, rest, others), **given)
             if (
-                secret_names(names.credential)[0] == kept.name
+                _entry_name(names.credential, secret=kept.secret) == kept.name
                 and name_taken(names, policy, rest) is None
             ):
                 return names, kept
@@ -516,41 +553,61 @@ class OnboardService:
         return names, None
 
     def _kept(self, url: str, options: Options) -> list[_Kept]:
-        """The client secrets an earlier run stored for this server, found by their entries'
-        meta (D.7 step 4: it finds an entry and decides nothing; the binding is checked after
-        discovery). A run that gives another client ID takes none on."""
+        """The client secrets, and registered public clients' IDs, an earlier run stored for
+        this server, found by their entries' meta (D.7 step 4: it finds an entry and decides
+        nothing; the binding is checked after discovery). A run that gives another client ID
+        takes none on. One a registration wrote names its authentication and redirect address,
+        which a run naming no client and no other redirect address takes on, so its fragment 1 is
+        the one shown before."""
         origin = origin_of(url)
         resources = (url, origin, f"{origin}/")
         found = []
         for entry in self._store.metadata():
             meta = entry.meta or {}
             client_id = meta.get("client_id")
+            secret = entry.name.endswith(_SECRET_SUFFIX)
             if (
-                not entry.name.endswith(_SECRET_SUFFIX)
+                not (secret or entry.name.endswith(_CLIENT_ID_SUFFIX))
                 or meta.get("resource") not in resources
                 or not isinstance(client_id, str)
                 or not _CLIENT_ID.fullmatch(client_id)
+                # Clear meta: never a reference fragment 1 would read as a secret (X7).
+                or client_id.startswith(dcr.SECRET_PREFIXES)
                 or options.client_id not in (None, client_id)
             ):
                 continue
+            chosen: dict[str, Any] = {}
+            auth, redirect = meta.get("client_auth"), meta.get("redirect_uri")
+            if options.client_id is None and auth in _AUTHS and _usable_redirect(redirect):
+                if options.redirect_uri not in (None, redirect):
+                    # A registered client's redirect is fixed (X7's dcr_redirect_changed): with
+                    # another, it isn't the fragment 1 shown before, so its names stay taken.
+                    continue
+                chosen = {"client_auth": options.client_auth or auth, "redirect_uri": redirect}
+            elif not secret:
+                # A public client's ID is written by a registration alone, with its choices.
+                continue
             try:
-                taken_on = replace(options, client_id=client_id, secret_given=True)
-            except ValueError:  # a run naming client authentication none
+                taken_on = replace(options, client_id=client_id, secret_given=secret, **chosen)
+            except ValueError:  # the run's client authentication isn't the entry's kind
                 continue
             found.append(_Kept(entry.name, taken_on, from_meta=options.client_id is None))
         return found
 
     def _check_kept(self, record: OnboardingRecord, plan: Plan, kept: _Kept) -> None:
-        """D.7 step 6 (MISS-14): the kept secret's entry names the resource this discovery
-        found, and its authenticated binding is the one this discovery predicts, else its names
-        stay taken. The clear meta only found it; the binding decides."""
+        """D.7 step 6 (MISS-14): the kept entry names the resource this discovery found, and
+        its authenticated binding is the one this discovery predicts, else its names stay
+        taken; a public client's ID entry also holds the client ID its meta names. The clear
+        meta only found it; the binding decides."""
         entry = self._store.entry(kept.name)
         same = entry is not None and (entry.meta or {}).get("resource") == plan.resource
         if same:
             try:
-                self._store.get_for_binding(kept.name, _binding(record, plan))
+                value = self._store.get_for_binding(kept.name, _binding(record, plan))
             except SecretUnavailable:
                 same = False
+            else:
+                same = kept.secret or value.reveal() == kept.options.client_id
         if not same:
             raise OnboardError(refusal("name_taken", name=record.names.credential))
 
@@ -642,8 +699,13 @@ class OnboardService:
         if options.scope is not None:
             plan = replace(plan, scopes=Scopes(tuple(options.scope.split(" ")), "given", False))
         if options.client_id is None and not committed:
-            # D.4's order, until this vault registers clients: a given client ID, or none.
-            raise OnboardError(refusal("registration_unavailable", host=_issuer_host(plan)))
+            # D.4's order: a given client ID, else a registration, else a refusal, before the
+            # operator is asked anything.
+            if metadata.registration_endpoint is None and "cimd" in metadata.notes:
+                raise OnboardError(refusal("cimd_only", host=_issuer_host(plan)))
+            if metadata.registration_endpoint is None:
+                raise OnboardError(refusal("registration_unavailable", host=_issuer_host(plan)))
+            _checked_dcr(dcr.request_auth(metadata.token_auth_methods))
         return plan
 
     async def _as_metadata(
@@ -728,8 +790,9 @@ class OnboardService:
     def _change(self, record: OnboardingRecord) -> PolicyChange:
         """Fragment 1 (E.2): the credential, its route to the server's origin, and the server
         with no tools; with ``allow_private``, the server's ``host:port`` in ``egress_private``.
-        Every value is a validated URL, a scope token, or what the operator typed."""
-        plan, names, options = record.plan, record.names, record.options
+        Every value is a validated URL, a scope token, or what the operator typed; a client the
+        vault registered (or, for a draft, the one it predicts) stands in for a given one."""
+        plan, names, options = record.plan, record.names, client_options(record)
         assert plan is not None  # noqa: S101 - a discovered record holds its plan
         meta = plan.metadata
         client_secret, _, refresh = secret_names(names.credential)
@@ -745,7 +808,7 @@ class OnboardService:
             "refresh_token": f"store:{refresh}",
             # A public client's refresh tokens rotate (RFC 9700 2.2.2), as check expects.
             "rotates": auth == "none",
-            "redirect_uri": _redirect(options),
+            "redirect_uri": _redirect(record),
             "extra_params": {"resource": plan.resource},
             "authorize_params": {"resource": plan.resource},
         }
@@ -797,7 +860,7 @@ class OnboardService:
         """A re-registration's fragment 1 (D.12, OPS-3): the committed credential replaced whole
         (H.4), with the client and endpoints a fresh discovery gives and everything else the
         operator set kept, each changed field named in a comment, never its value."""
-        names, options = record.names, record.options
+        names, options = record.names, client_options(record)
         old = self._policy().credentials.get(names.credential)
         if not isinstance(old, OAuth2Credential):
             # Reloaded while it ran: the policy has no such credential to replace.
@@ -865,8 +928,10 @@ class OnboardService:
 
     def _draft_check(self, record: OnboardingRecord, plan: Plan, policy: Policy) -> list[Finding]:
         """D.8's draft check: fragment 1 as it will be, merged into the running policy, so an
-        error shows in the plan before anything is stored (OPS-5)."""
-        return self._findings(policy, self._change(replace(record, plan=plan)))
+        error shows in the plan before anything is stored or registered (OPS-5); for a client
+        the vault registers, with a placeholder client ID and the authentication it asks for."""
+        drafted = replace(record, plan=plan)
+        return self._findings(policy, self._change(replace(drafted, client=_predicted(drafted))))
 
     # --- register and fragment (D.7, E.2, OPS-2) -----------------------------------------------
 
@@ -874,7 +939,8 @@ class OnboardService:
         self, onboarding: str, body: Mapping[str, Any], *, owner: str = CLI_OWNER
     ) -> dict[str, Any]:
         """Store a given confidential client's secret and make fragment 1 (D.7); for a public
-        client, fragment 1 alone. A registered onboarding answers its fragment 1 again."""
+        client, fragment 1 alone; with no client ID, register one (D.4) and make its fragment 1.
+        A registered onboarding answers its fragment 1 again."""
         if not set(body) <= {"client_secret"}:
             raise _bad_body("expected {client_secret?}")
         secret = body.get("client_secret")
@@ -885,6 +951,10 @@ class OnboardService:
             if secret is not None:
                 raise _bad_body("this onboarding is registered; its secret is stored")
             return self._fragment_answer(record, 0, "plain")
+        if record.options.client_id is None:
+            if secret is not None:
+                raise _bad_body("a registered client's secret comes from its authorization server")
+            return await self._registration(record, owner)
         if record.options.secret_given != (secret is not None):
             raise _bad_body(
                 "a client secret comes here exactly when the onboarding was started with one"
@@ -902,6 +972,8 @@ class OnboardService:
         record = self._ready(onboarding, owner)
         if record.stage == "registered":
             return self._fragment_answer(record, indent, target)
+        if record.options.client_id is None:
+            raise _bad_body("this onboarding registers its client: register makes its fragment")
         if record.options.secret_given:
             raise _bad_body("this client's secret comes with register, which makes its fragment")
         return await self._finish(record, owner, None, indent, target)
@@ -933,6 +1005,62 @@ class OnboardService:
             raise OnboardError(refusal("onboarding_unknown"))
         return record
 
+    async def _registration(self, record: OnboardingRecord, owner: str) -> dict[str, Any]:
+        """D.4's registration: the draft check again with the client the request asks for
+        (OPS-5), the one POST of public metadata to the registration endpoint, its answer
+        checked (X7), then D.7's write path with the client it made: a confidential client's
+        secret, or a public client's ID as ``<credential>-client-id`` (OPS-2). A timeout is
+        ``dcr_failed``: the server may have registered a client all the same (D-155), and a run
+        again registers anew (FM-9)."""
+        plan = _plan(record)
+        meta = plan.metadata
+        endpoint = meta.registration_endpoint
+        assert endpoint is not None  # noqa: S101 - discovery refused a plan without one
+        method: dcr.AuthMethod = _checked_dcr(dcr.request_auth(meta.token_auth_methods))
+        drafted = replace(record, client=_predicted(record))
+        _passes(self._findings(self._policy(), self._change(drafted)))
+        choices = dcr.Choices(
+            record.names.server, _redirect(record), method, record.options.client_name
+        )
+        request = dcr.registration_request(plan, choices)
+        # Still this owner's and still discovered, so a run that has expired never registers.
+        self._discovered(record, owner)
+        fetcher = Fetcher(
+            self._client,
+            proxied=self._egress_proxy is not None,
+            onboarding=record.id,
+            clock=self._clock,
+            report=_report,
+        )
+        try:
+            fetched = await _fetched(
+                fetcher.register(endpoint, dcr.request_body(request)), purpose="registration"
+            )
+        except ProxyRefused as exc:
+            # The onboarding stays discovered: the same command again registers once the proxy
+            # allows the host (D.11).
+            raise OnboardError(self._registration_blocked(exc)) from None
+        made = _checked_dcr(dcr.check_registration(fetched.status, fetched.document, request))
+        client = Client(
+            made.client_id, made.auth, made.expires_at, dcr.notes(fetched.document or {})
+        )
+        value = made.client_id if made.client_secret is None else made.client_secret.reveal()
+        return await self._finish(record, owner, value, client=client)
+
+    def _registration_blocked(self, exc: ProxyRefused) -> Answer:
+        """An operator's own proxy refusing the registration endpoint (D.11): its host and the
+        lines to allow it, the onboarding kept as it was."""
+        policy = self._policy()
+        emitted = {d.port for d in egresslist.derive(policy)[egresslist.VAULT]}
+        step = allow_hosts([(exc.host, exc.port)], policy.egress_proxy_acls, emitted)
+        more = (
+            ("host", exc.host),
+            ("port", exc.port),
+            ("status", exc.status),
+            ("next", [step.answer()]),
+        )
+        return replace(refusal("proxy_refused", host=exc.host), more=more)
+
     async def _finish(
         self,
         record: OnboardingRecord,
@@ -940,20 +1068,25 @@ class OnboardService:
         secret: str | None,
         indent: int = 0,
         target: Target = "plain",
+        *,
+        client: Client | None = None,
     ) -> dict[str, Any]:
         """D.7's write path: the draft check again, the secret under the predicted binding, the
         final check, then fragment 1. Whatever fails after the write deletes the secret again
         in the same run, and the answer says so, so a run again never meets ``name_taken`` on
         this run's own leftover (OPS-5). A re-registration's write replaced the committed
-        credential's secret, which the running policy still uses: that one is put back."""
+        credential's secret, which the running policy still uses: that one is put back. With
+        the ``client`` a registration made, ``secret`` is its secret, or a public client's ID,
+        written as its ``-client-id`` entry (D.8)."""
         plan = _plan(record)
+        record = replace(record, client=client)
         change = self._change(record)
         _passes(self._findings(self._policy(), change))
         text = _emitted(change, indent, target)
         if secret is None:
             return self._register(record, owner, change, text)
         via: secretops.Via = "socket" if owner == CLI_OWNER else "portal"
-        name = secret_names(record.names.credential)[0]
+        name = _entry_name(record.names.credential, secret=client_options(record).secret_given)
         planned = self._secret_plan(record, plan, name, secret)
         previous = self._previous(name) if record.options.reregister else None
         # Still this owner's and still discovered, so a run that has expired never writes.
@@ -1015,16 +1148,17 @@ class OnboardService:
         if any(finding.level == "error" for finding in findings):
             raise OnboardError(_diff_invalid(findings, undone=undone))
         try:
-            record = self._table.registered(record.id, owner, change)
+            record = self._table.registered(record.id, owner, change, record.client)
         except (OnboardingRefused, ValueError):
             # Expired, cancelled or replaced while the secret was written.
             raise OnboardError(refusal("onboarding_unknown")) from None
+        options = client_options(record)
         logs.event(
             "onboard_registered",
             credential=record.names.credential,
             issuer=_issuer_host(plan),
-            auth=_client_auth(record.options),
-            secret_stored=undone is not None,
+            auth=_client_auth(options),
+            secret_stored=undone is not None and options.secret_given,
         )
         return self._registered(record, text, findings, policy)
 
@@ -1033,14 +1167,18 @@ class OnboardService:
     ) -> secretplan.OnboardPutPlan:
         """The given secret's write, in the store under the binding fragment 1 will derive for
         it: the token endpoint, and the server's origin as its route's upstream (D.7 steps
-        1-4)."""
+        1-4). A registration's entry also names the client's authentication and redirect
+        address, which a run after a restart takes on to show the same fragment 1 (step 6)."""
         binding = _binding(record, plan)
-        meta = {
+        client = record.client
+        meta: dict[str, Any] = {
             "onboarded": _issuer_host(plan),
             "resource": plan.resource,
-            "client_id": record.options.client_id,
-            "client_secret_expires_at": None,
+            "client_id": client_options(record).client_id,
+            "client_secret_expires_at": None if client is None else client.expires_at,
         }
+        if client is not None:
+            meta |= {"client_auth": client.client_auth, "redirect_uri": _redirect(record)}
         store_names = self._store.names()
         if record.options.reregister:
             # A re-registration replaces the committed client's secret (D.7 step 1, OPS-3).
@@ -1074,31 +1212,49 @@ class OnboardService:
         self, record: OnboardingRecord, policy: Policy, kept: _Kept | None = None
     ) -> dict[str, Any]:
         """The plan (D.8, M.1): every host, endpoint and choice, the names, the draft check and
-        what to do next; for a kept secret (D.7 step 6), where its client ID came from."""
-        plan, names, options = _plan(record), record.names, record.options
+        what to do next; for a kept secret (D.7 step 6), where its client ID came from; for a
+        client the vault registers, where and with what authentication and name."""
+        plan, names = _plan(record), record.names
+        options = _planned_options(record)
         meta = plan.metadata
-        redirect = _redirect(options)
+        redirect = _redirect(record)
         kind = application_type(redirect)
+        method = _registration_method(record.options)
         notes = list(plan.notes)
         if not _own_redirect(redirect, names.credential):
             notes.append("backstop_off")
+        if record.client is not None:
+            notes += record.client.notes
         rows = [list(row) for row in plan.rows()]
-        rows += [
+        rows.append(
             [
                 "Names",
                 f"{names.credential}, {names.route}, {names.server} ({NAME_SOURCES[names.source]})",
-            ],
-            ["Client", f"{options.client_id} ({_client_source(kept)})"],
+            ]
+        )
+        if record.client is not None:
+            rows.append(["Client", f"{record.client.client_id} (registered)"])
+        elif method == "dcr":
+            host = _host_port(str(meta.registration_endpoint))[0]
+            rows += [
+                ["Client", f"registered at {host} once you confirm (dynamic client registration)"],
+                ["Client name", dcr.client_name(names.server, record.options.client_name)],
+            ]
+        else:
+            rows.append(["Client", f"{options.client_id} ({_client_source(kept)})"])
+        rows += [
             ["Client authentication", _client_auth(options)],
             ["Redirect", f"{redirect} ({kind})"],
         ]
         if kept is not None:
+            label = "Client secret" if kept.secret else "Client ID entry"
             rows.append(
                 [
-                    "Client secret",
+                    label,
                     f"{kept.name}, stored by an earlier run; nothing is registered or stored again",
                 ]
             )
+        rows += [["Note", dcr.NOTES[note]] for note in notes if note in dcr.NOTES]
         if "backstop_off" in notes:
             rows.append(["Note", BACKSTOP_OFF])
         if options.reregister:
@@ -1133,8 +1289,8 @@ class OnboardService:
                 "revocation_endpoint": meta.revocation_endpoint,
                 "require_iss": meta.require_iss,
                 "pkce": PKCE_METHOD,
-                "registration": "given",
-                "client_id": options.client_id,
+                "registration": method,
+                "client_id": _shown_client_id(record, options),
                 "client_auth": _client_auth(options),
                 "secret_given": options.secret_given,
                 "redirect_uri": redirect,
@@ -1154,18 +1310,21 @@ class OnboardService:
     def _registered(
         self, record: OnboardingRecord, text: str, findings: list[Finding], policy: Policy
     ) -> dict[str, Any]:
-        """M.1's register answer: what was stored (never the value) and fragment 1."""
-        options = record.options
+        """M.1's register answer: what was stored (never the value) and fragment 1; for a
+        client the vault registered, its ID, when its secret expires, and the answer's notes."""
+        options, client = client_options(record), record.client
         return {
             "onboarding": record.id,
             "stage": record.stage,
             "credential": record.names.credential,
+            "client_id": options.client_id,
             "client_auth": _client_auth(options),
             "secret_stored": options.secret_given,
             "secret_name": secret_names(record.names.credential)[0]
             if options.secret_given
             else None,
-            "client_secret_expires_at": None,
+            "client_secret_expires_at": None if client is None else client.expires_at,
+            "notes": [] if client is None else list(client.notes),
             "diff": {"yaml": text, "check": [finding.as_dict() for finding in findings]},
             "next": self._next(record, policy),
         }
@@ -1249,6 +1408,12 @@ def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:
     client_name = strings.get("client_name")
     if client_name is not None and not _CLIENT_NAME.fullmatch(client_name):
         raise _bad_body("client_name is 1 to 64 printable ASCII characters")
+    callback_origin = strings.get("callback_origin")
+    if callback_origin is not None and (client_id is not None or redirect is not None):
+        # D.4: the portal's callback is for a client the vault registers, unless told otherwise.
+        raise _bad_body(
+            "callback_origin goes with a registration, without client_id or redirect_uri"
+        )
     try:
         options = Options(
             client_id=client_id,
@@ -1260,6 +1425,7 @@ def _request(body: Mapping[str, Any]) -> tuple[str, dict[str, str], Options]:
             allow_private=allow_private,
             secret_given=bool(body.get("secret_given", False)),
             reregister=bool(body.get("reregister", False)),
+            callback_origin=callback_origin,
         )
     except ValueError as exc:
         raise _bad_body(str(exc)) from None
@@ -1297,20 +1463,23 @@ def _indent(value: object) -> tuple[int, Target]:
 # --- helpers -------------------------------------------------------------------------------------
 
 
-async def _fetched[T](call: Awaitable[T]) -> T:
+async def _fetched[T](call: Awaitable[T], *, purpose: str = "discovery") -> T:
     """A fetch's answer, or its refusal as the catalogue words it. A proxy's refusal passes
-    through for D.11."""
+    through for D.11. A registration that gets no usable answer, a timeout among them, is
+    ``dcr_failed`` (FM-9)."""
     try:
         result = await call
     except FetchError as exc:
         if exc.reason == "address_refused":
             logs.event(
                 "address_refused",
-                purpose="discovery",
+                purpose=purpose,
                 host=exc.host,
                 port=exc.port,
                 verdict=exc.why,
             )
+        if purpose == "registration" and exc.reason == "fetch_failed":
+            raise OnboardError(refusal("dcr_failed", detail=_failure(exc))) from None
         raise OnboardError(_fetch_refusal(exc)) from None
     return result
 
@@ -1334,11 +1503,36 @@ def _report(record: FetchRecord) -> None:
     )
 
 
+def _failure(exc: FetchError) -> str:
+    return exc.why if exc.status is None else f"{exc.why}, HTTP {exc.status}"
+
+
 def _fetch_refusal(exc: FetchError) -> Answer:
     if exc.reason == "fetch_failed":
-        detail = exc.why if exc.status is None else f"{exc.why}, HTTP {exc.status}"
-        return refusal("fetch_failed", host=exc.host, detail=detail)
+        return refusal("fetch_failed", host=exc.host, detail=_failure(exc))
     return refusal(exc.reason, host=exc.host)
+
+
+def _checked_dcr[T](value: T | dcr.Refusal) -> T:
+    if isinstance(value, dcr.Refusal):
+        raise OnboardError(_dcr_refusal(value))
+    return value
+
+
+def _dcr_refusal(found: dcr.Refusal) -> Answer:
+    """A registration's refusal (D.4, X7) with what its text names: a ``dcr_refused``'s
+    filtered error code, its cleaned description beside it for the operator (never logged),
+    a ``dcr_failed``'s status, the member a ``dcr_answer_invalid`` is about. Nothing else of
+    the answer is shown."""
+    if found.reason == "dcr_refused":
+        answer = refusal("dcr_refused", error=found.values[0])
+        said = found.values[1:]
+        return replace(answer, more=(("description", said[0]),)) if said else answer
+    if found.reason == "dcr_failed":
+        return refusal("dcr_failed", detail=f"HTTP {found.values[0]}")
+    if found.reason == "dcr_answer_invalid":
+        return refusal("dcr_answer_invalid", detail=found.field)
+    return refusal(found.reason)
 
 
 def _discovery_refusal(found: Refusal) -> Answer:
@@ -1438,8 +1632,64 @@ def _client_auth(options: Options) -> str:
     return options.client_auth or "none"
 
 
-def _redirect(options: Options) -> str:
-    return options.redirect_uri or SHARED_REDIRECT
+def _redirect(record: OnboardingRecord) -> str:
+    """The onboarding's redirect address (D.4): the operator's, the shared one for a given
+    client, else the credential's own, paste or on the portal origin named."""
+    options = record.options
+    return dcr.redirect_for(
+        record.names.credential,
+        options.callback_origin,
+        options.redirect_uri,
+        given=options.client_id is not None,
+    )
+
+
+def _registration_method(options: Options) -> str:
+    """How the onboarding gets its client: ``given``, or ``dcr`` (D.4)."""
+    return "given" if options.client_id is not None else "dcr"
+
+
+def _predicted(record: OnboardingRecord) -> Client | None:
+    """The client a registration the vault is still to make is expected to give (D.8's
+    draft): a placeholder ID and the authentication the request asks for. None for a given
+    client, or one already registered."""
+    if record.client is not None or record.options.client_id is not None or record.plan is None:
+        return None
+    method = dcr.request_auth(record.plan.metadata.token_auth_methods)
+    if isinstance(method, dcr.Refusal):
+        return None
+    return Client(DRAFT_CLIENT_ID, dcr.METHODS[method])
+
+
+def _shown_client_id(record: OnboardingRecord, options: Options) -> str | None:
+    """The client ID the plan shows: none yet for a client the vault is still to register."""
+    if record.client is None and record.options.client_id is None:
+        return None
+    return options.client_id
+
+
+def _planned_options(record: OnboardingRecord) -> Options:
+    """The options the plan shows: a registered client's, or the one a registration predicts,
+    in a given client's place."""
+    return client_options(record, _predicted(record))
+
+
+def _entry_name(credential: str, *, secret: bool) -> str:
+    """The store entry an onboarding writes for its client: the secret (D.7 step 1), or a
+    registered public client's ID (D.8)."""
+    return secret_names(credential)[0 if secret else 1]
+
+
+def _usable_redirect(value: object) -> bool:
+    """Whether an entry's meta names a redirect address fragment 1 can hold, as discovery's
+    request checks one: the meta is clear text, so it is checked before it is shown again."""
+    if not isinstance(value, str) or "$" in value:
+        return False
+    try:
+        _check_redirect_uri(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _own_redirect(redirect: str, credential: str) -> bool:

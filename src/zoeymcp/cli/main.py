@@ -538,6 +538,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--redirect-uri", metavar="URL", help="the redirect address the provider has on record"
     )
     onboard.add_argument(
+        "--callback-origin",
+        metavar="ORIGIN",
+        help="register the client with this admin.origins portal's callback, not the paste one",
+    )
+    onboard.add_argument(
         "--allow-private",
         action="store_true",
         help="the server is on your network: its own host:port may resolve privately",

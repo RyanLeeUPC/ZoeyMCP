@@ -27,9 +27,10 @@ The gateway's view of the policy gets its own sweep: built from a policy with ev
 value filled in, it may hold none of them (M3 design D.1, invariant G1).
 
 A given confidential client's secret (M7 design D.7, X8, X19) is swept on its own: onboarded over
-the admin socket, it reaches the store and nothing else, its fragment holding only the ref. So
-is a deleted grant's revocation (D.9): the refresh token and the client secret go to the
-revocation endpoint and nowhere else.
+the admin socket, it reaches the store and nothing else, its fragment holding only the ref; so
+is one a registration issued (D.4), whose answer's registration access token and URI reach
+nothing at all. So is a deleted grant's revocation (D.9): the refresh token and the client
+secret go to the revocation endpoint and nowhere else.
 """
 
 from __future__ import annotations
@@ -1228,6 +1229,48 @@ async def test_a_reregistered_client_secret_reaches_the_store_and_nothing_else(
     swept = "".join([*texts, log_lines.getvalue()])
     assert onboard_model.GIVEN_SECRET not in swept
     assert replaced not in swept
+    await rig.token_client.aclose()
+
+
+async def test_a_registered_client_secret_reaches_the_store_and_nothing_else(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """D.4, D.7, X19 (step 11): a registration whose answer carries a client secret, a
+    registration access token and its URI. Through the plan, the register, fragment 1 at each
+    indent, a resumed discovery and the second run after the commit, the secret reaches the
+    store alone, and the token and the URI nowhere at all, the store's clear meta included."""
+    rig = AdminRig(tmp_path, onboard=True, register=onboard_model.planted)
+    texts: list[str] = []
+
+    async def call(method: str, path: str, body: Any = None) -> httpx.Response:
+        response = await rig.call(method, path, body)
+        texts.append(response.text + repr(response.headers.multi_items()))
+        return response
+
+    body = {"url": onboard_model.SERVER_URL}
+    plan = (await call("POST", "/onboard/discover", body)).json()
+    assert plan["plan"]["registration"] == "dcr"
+    made = await call("POST", f"/onboard/{plan['onboarding']}/register", {})
+    assert made.status_code == 200, made.text
+    for indent in (0, 4, "compose"):
+        await call("POST", f"/onboard/{plan['onboarding']}/fragment", {"indent": indent})
+    await call("POST", "/onboard/discover", body)
+    raw = rig.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    merged = merge(raw, load_mapping(made.json()["diff"]["yaml"]))
+    assert isinstance(merged, Merged)
+    rig.set_policy(Policy.model_validate(merged.data))
+    compared = await call("POST", "/onboard/discover", body)
+    assert compared.json()["stage"] == "committed"
+    stored, _ = rig.store.get_for_oauth(
+        onboard_model.SECRET_NAME, token_url=f"{onboard_model.ISSUER}/token"
+    )
+    assert stored.reveal() == onboard_model.DCR_SECRET
+    assert '"store:notes-client-secret"' in made.json()["diff"]["yaml"]
+    swept = "".join([*texts, log_lines.getvalue()])
+    assert onboard_model.DCR_SECRET not in swept
+    held = rig.store.path.read_bytes().decode("utf-8")
+    for planted in (onboard_model.REGISTRATION_TOKEN, onboard_model.REGISTRATION_URI):
+        assert planted not in swept + held
     await rig.token_client.aclose()
 
 

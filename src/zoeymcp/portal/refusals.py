@@ -334,6 +334,52 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "registration_unavailable": Entry(
             409, "Register a client at {host} and run again with its client ID."
         ),
+        "cimd_only": Entry(
+            409,
+            "This server registers clients by metadata document, which ZoeyMCP doesn't support "
+            "yet. Register a client at {host} and run again with its client ID.",
+        ),
+        # A registration the vault makes (M7 D.4, X7; vault/oauth/dcr.py).
+        "dcr_refused": Entry(
+            502,
+            "The authorization server refused the registration ({error}), so no client was "
+            "registered.",
+        ),
+        "dcr_failed": Entry(
+            502,
+            "The authorization server didn't answer the registration as needed ({detail}). It "
+            "may have registered a client anyway; the next run registers a new one.",
+        ),
+        "dcr_redirect_changed": Entry(
+            502,
+            "The authorization server registered another redirect address than the one asked "
+            "for, so its client isn't used.",
+        ),
+        "dcr_auth_unsupported": Entry(
+            502,
+            "The authorization server offers no client authentication the vault speaks (none, "
+            "client_secret_basic or client_secret_post), so no client is used.",
+        ),
+        "dcr_bad_client_id": Entry(
+            502,
+            "The client ID the authorization server issued can't be written into a policy (1 "
+            "to 255 printable characters, no space, quote, backslash or $, and no store: or env: "
+            "reference), so it isn't used.",
+        ),
+        "dcr_bad_secret": Entry(
+            502,
+            "The authorization server's client secret doesn't fit the client's authentication "
+            "(one missing, one too many, or one that can't be stored), so its client isn't "
+            "used.",
+        ),
+        "dcr_grant_missing": Entry(
+            502,
+            "The authorization server registered the client without the authorization_code and "
+            "refresh_token grants, so it isn't used.",
+        ),
+        "dcr_answer_invalid": Entry(
+            502, "The authorization server's registration answer can't be used ({detail})."
+        ),
         "proxy_refused": Entry(
             502,
             "Your egress proxy refused the vault's connection to {host}. Allow the hosts listed "

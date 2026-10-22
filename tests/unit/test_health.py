@@ -2,7 +2,8 @@
 connector journal summed up, and the meta-derived ``last_failure`` and ``idle`` (D-23, D-20).
 M7 (design J, step 10b): a stored client secret held to D.7 step 5 as login holds it (D-185),
 ``resource_metadata_changed``, the challenged scope and its ``widen_scope`` fragment, and an
-onboarding's secret waiting for its credential.
+onboarding's secret waiting for its credential; (step 11) a registered client's secret near or
+past its expiry, on the wall clock.
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -921,8 +922,9 @@ def test_an_onboardings_secret_waits_for_its_credential() -> None:
 
 def test_health_reads_no_clock_for_an_onboarding() -> None:
     """FM-28's monotonic half: onboardings expire on the table's monotonic clock
-    (test_onboarding.py), and health judges nothing of one by the wall clock. A secret's
-    client_secret_expires_at (step 11's expiry codes) and its times change nothing yet."""
+    (test_onboarding.py), and health judges nothing of one by the wall clock. An entry no
+    credential names yet isn't judged by its client_secret_expires_at: the expiry codes are a
+    committed credential's (test_a_registered_clients_secret_expiry)."""
     long_ago = {**ONBOARDED, "client_secret_expires_at": 1}
     old = EntryMeta(
         "notes-client-secret",
@@ -934,7 +936,80 @@ def test_health_reads_no_clock_for_an_onboarding() -> None:
     )
     new = entry("notes-client-secret", oauth_binding(TOKEN_URL, [API]), ONBOARDED)
     assert report(make_policy({}), [old]) == report(make_policy({}), [new])
+    assert report(make_policy({}), [old], wall=NOW) == report(make_policy({}), [new], wall=NOW)
     assert codes(report(make_policy({}), [old])["store"]) == ["unreferenced"]
+
+
+def registered_client(expires: object) -> tuple[Policy, list[EntryMeta]]:
+    """A committed credential whose client secret a registration stored (D.7 step 4's meta),
+    its server's URL as its resource, as onboarding writes it."""
+    cred = spotify(extra_params={"resource": RESOURCE}, authorize_params={"resource": RESOURCE})
+    policy = make_policy({"music": cred}, {"music": (RESOURCE,)})
+    exact = oauth_binding(TOKEN_URL, [RESOURCE])
+    meta = {**ONBOARDED, "client_secret_expires_at": expires}
+    return policy, [
+        entry("music-id", exact),
+        entry("music-secret", exact, meta),
+        entry("music-refresh", exact),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("expires", "expected"),
+    [
+        (int(NOW) + 14 * DAY + 1, []),
+        (int(NOW) + 14 * DAY, ["client_secret_expiring"]),
+        (int(NOW) + 1, ["client_secret_expiring"]),
+        (int(NOW), ["client_secret_expired"]),
+        (int(NOW) - DAY, ["client_secret_expired"]),
+        (1, ["client_secret_expired"]),
+        # 0 is never (RFC 7591 3.2.1); anything else that isn't a positive integer, nothing.
+        (0, []),
+        (None, []),
+        (-5, []),
+        (True, []),
+        (str(int(NOW)), []),
+        (NOW - DAY, []),
+        # Far off: no time is formatted for it.
+        (10**30, []),
+    ],
+)
+def test_a_registered_clients_secret_expiry(expires: object, expected: list[str]) -> None:
+    """M7 J, D.7 step 7, FM-28's wall-clock half: judged on ``wall``, from clear meta."""
+    policy, entries = registered_client(expires)
+    assert codes(one(report(policy, entries, wall=NOW))) == expected
+    # Without a wall clock, never.
+    assert codes(one(report(policy, entries))) == []
+
+
+def test_the_expiry_findings() -> None:
+    """Both advisory (clear meta), with onboarding again as the action, which names the
+    command; a credential without its server's URL as a resource gets secret set instead."""
+    policy, entries = registered_client(int(NOW) + 3 * DAY)
+    [expiring] = one(report(policy, entries, wall=NOW))["findings"]
+    assert expiring == finding(
+        "client_secret_expiring",
+        "warning",
+        "store:music-secret expires at 2026-09-24T14:13:20Z: register a new client before then",
+        REGISTER_AGAIN,
+        advisory=True,
+    )
+    [expired] = one(report(policy, entries, wall=NOW + 4 * DAY))["findings"]
+    assert expired == finding(
+        "client_secret_expired",
+        "error",
+        "store:music-secret expired at 2026-09-24T14:13:20Z: the provider refuses this client now",
+        REGISTER_AGAIN,
+        advisory=True,
+    )
+    unnamed = make_policy({"music": spotify()}, {"music": (RESOURCE,)})
+    [by_hand] = one(report(unnamed, entries, wall=NOW))["findings"]
+    assert (by_hand["code"], by_hand["action"]) == ("client_secret_expiring", SET_SECRET)
+    # A client secret from the environment has no entry to read an expiry from.
+    from_env = make_policy(
+        {"music": spotify(client_secret="env:MUSIC_SECRET")}, {"music": (RESOURCE,)}
+    )
+    assert codes(one(report(from_env, entries, ["MUSIC_SECRET"], wall=NOW))) == []
 
 
 def test_a_store_that_cant_be_written() -> None:

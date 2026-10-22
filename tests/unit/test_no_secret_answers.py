@@ -3,7 +3,9 @@
 Each walk takes its routes from the route table, so a route added later is walked too:
 
 - **The admin socket**: every route of ``AdminApp``'s table, with secrets stored and a setup code
-  live, and an onboarding whose given client secret was stored through the socket (M7 D.7).
+  live, and an onboarding whose given client secret was stored through the socket (M7 D.7);
+  and again once a registration's answer brought a secret, a registration access token and a
+  URI (D.4), which no answer carries.
   Only ``POST /setup-code`` (a new setup code) and ``GET /gateway-key`` (the gateway key) may
   carry a credential, each only its own: the two exceptions R61 records (Q23).
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
@@ -140,6 +142,30 @@ async def test_no_socket_answer_carries_a_credential_but_the_two_exceptions(
     assert {route: kinds for route, kinds in found.items() if kinds} == {
         route: {kind} for route, kind in EXCEPTIONS.items()
     }
+    await rig.token_client.aclose()
+
+
+async def test_no_socket_answer_carries_what_a_registration_issued(tmp_path: Path) -> None:
+    """D.4, X19 (step 11): every route walked once a registration's answer brought a client
+    secret, a registration access token and a URI: none carries any of them."""
+    rig = AdminRig(tmp_path, onboard=True, register=onboard_model.planted)
+    discovered = await rig.call("POST", "/onboard/discover", {"url": onboard_model.SERVER_URL})
+    onboarding = discovered.json()["onboarding"]
+    registered = await rig.call("POST", f"/onboard/{onboarding}/register", {})
+    assert registered.status_code == 200, registered.text
+    planted = (
+        onboard_model.DCR_SECRET,
+        onboard_model.REGISTRATION_TOKEN,
+        onboard_model.REGISTRATION_URI,
+    )
+    credentials = dict.fromkeys(planted, "registration")
+    answers = [discovered.text + registered.text]
+    params = {**SOCKET_PARAMS, "onboarding": onboarding}
+    for method, template in socket_routes(rig):
+        path = template.format(**params)
+        response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
+        answers.append(response.text + repr(dict(response.headers)))
+    assert [text for text in answers if carried(text, credentials)] == []
     await rig.token_client.aclose()
 
 

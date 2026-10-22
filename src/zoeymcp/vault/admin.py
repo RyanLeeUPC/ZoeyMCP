@@ -362,7 +362,8 @@ class HealthReader:
     entries, the running policy, the logins' status, the connectors' send journals, the ``env:``
     variables found set, the reported copy and the passkey file. Without ``connectors`` it shows
     no sends; without ``env_names`` every ``env:`` reference is unset; without ``reports`` or
-    ``passkeys`` the report has no ``ledger_copy`` or ``passkeys`` section."""
+    ``passkeys`` the report has no ``ledger_copy`` or ``passkeys`` section. ``wall`` is the
+    wall clock a registered client's secret expiry is judged on (M7 design J, FM-28)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -371,6 +372,7 @@ class HealthReader:
     env_names: Callable[[], Collection[str]] | None = None
     reports: ReportStore | None = None
     passkeys: Passkeys | None = None
+    wall: Callable[[], float] = time.time
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -384,6 +386,7 @@ class HealthReader:
             persisted=not self.store.dirty,
             passkeys=self._passkey_state(policy),
             ledger_copy=self._ledger_copy(policy),
+            wall=self.wall(),
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report

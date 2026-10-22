@@ -5,8 +5,9 @@ M.7). The vault does the work over its admin socket; this module asks, prompts a
   string from the network through :func:`.review.untrusted`; asks, unless ``--yes``, whether to
   use the client at that authorization server; reads a given client secret from a hidden prompt
   on a terminal, or with ``--yes`` from a piped stdin (never from argv, and never from the stdin
-  a confirmation is read from: OPS-4); then ``register`` (with a secret) or ``fragment`` (a
-  public client, PC-13) writes fragment 1 to stdout and the ``next`` list to stderr.
+  a confirmation is read from: OPS-4); then ``register`` (with a secret, or with no client ID,
+  when the vault registers one, D.4) or ``fragment`` (a given public client, PC-13) writes
+  fragment 1 to stdout and the ``next`` list to stderr.
   ``--plan-only`` stops after the plan, which the next run with the same URL and names resumes.
 - **The second run** (D.12): for a URL the running policy has onboarded, the vault compares what
   it finds with what is committed, and the CLI signs in with ``login``'s own paste flow, unless
@@ -29,11 +30,13 @@ import contextlib
 import shlex
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Final, TextIO
 from urllib.parse import urlsplit
 
 from ..common.policy import fields
 from ..common.policy.emit import INDENT_MAX
+from ..vault.oauth import dcr
 from ..vault.onboarding import ONBOARDING_TTL, fragment_file
 from . import admin_client
 from .review import untrusted, write_json
@@ -62,6 +65,7 @@ ONBOARD_FLAGS: Final = (
     ("client_secret", "--client-secret"),
     ("client_auth", "--client-auth"),
     ("redirect_uri", "--redirect-uri"),
+    ("callback_origin", "--callback-origin"),
     ("allow_private", "--allow-private"),
     ("plan_only", "--plan-only"),
     ("yes", "--yes"),
@@ -84,6 +88,7 @@ BODY_KEYS: Final = (
     ("client_auth", "client_auth"),
     ("redirect_uri", "redirect_uri"),
     ("client_name", "client_name"),
+    ("callback_origin", "callback_origin"),
 )
 # The Squid source an onboarding's lines are for: the vault's (D.11).
 SQUID_SOURCE: Final = "vault"
@@ -340,15 +345,16 @@ class _Run:
                     self.say(f"zoeymcp login: {exc}")
                     return self.finish(EXIT_FINDINGS)
         indent: int | str = "compose" if self.args.target == "compose" else self.args.indent or 0
+        registers = plan["stage"] != "registered" and plan["plan"].get("registration") == "dcr"
         stored_as = None
         try:
-            if secret is not None:
-                made = admin_client.onboard_register(self.socket, onboarding, secret)
+            if secret is not None or registers:
+                first = made = admin_client.onboard_register(self.socket, onboarding, secret)
                 stored_as = made["secret_name"] if made["secret_stored"] else None
                 if indent != 0:
                     made = admin_client.onboard_fragment(self.socket, onboarding, indent)
             else:
-                made = admin_client.onboard_fragment(self.socket, onboarding, indent)
+                first = made = admin_client.onboard_fragment(self.socket, onboarding, indent)
         except admin_client.AdminUnavailable as exc:
             return self.refused(exc)
         self.answers["fragment"] = made
@@ -356,10 +362,24 @@ class _Run:
             self.out.write(made["diff"]["yaml"])
             self.out.flush()
         lines = []
+        if registers:
+            host = urlsplit(plan["plan"]["registration_endpoint"]).hostname
+            client = untrusted(first["client_id"])
+            lines.append(f"Registered client {client} at {untrusted(host)}.")
+            lines += [f"  {untrusted(dcr.NOTES.get(note, note))}" for note in first["notes"]]
         if stored_as is not None:
             lines.append(
                 f"Stored the client secret as {untrusted(stored_as)}, bound to the token "
                 "endpoint and the server's origin fragment 1 names."
+            )
+        expires = first.get("client_secret_expires_at")
+        if isinstance(expires, int) and expires > 0:
+            try:
+                when = datetime.fromtimestamp(expires, UTC).strftime("%Y-%m-%d %H:%M UTC")
+            except (OverflowError, OSError, ValueError):  # past what a datetime holds
+                when = f"epoch second {expires}"
+            lines.append(
+                f"The provider expires that secret at {when}; zoeymcp health warns 14 days before."
             )
         lines.append("Wrote fragment 1 of 2 to stdout.")
         if made["diff"]["check"]:
@@ -438,6 +458,9 @@ class _Run:
         reason = data.get("reason")
         if reason == "bad_body" and data.get("detail"):
             lines.append(f"  {untrusted(data['detail'])}")
+        if reason == "dcr_refused" and data.get("description"):
+            # The provider's own words, for the operator alone (D.4): never logged.
+            lines.append(f"  the provider says: {untrusted(data['description'])}")
         if data.get("issuers"):
             lines.append(f"  issuers: {untrusted(', '.join(data['issuers']))}")
             if reason == "as_choice_needed":

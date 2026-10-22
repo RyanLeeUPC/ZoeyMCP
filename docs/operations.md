@@ -313,6 +313,7 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `terminal`, `backoff` | error, warning | as `oauth status` shows them, with the hint's action |
 | `reconsent_due`, `unexpected_scopes`, `missing_scopes` | warning | as `oauth status` shows them |
 | `insufficient_scope` | warning | an upstream said the token lacks a scope, **since the vault started**: a restart forgets it. When its challenge named a `scope`, the text lists it, and if that adds to the credential's own the action is `widen_scope`: merge the fragment (`--json` holds it; it sets `credentials.<c>.scope` to the union and keeps the rest), check and reload, then `zoeymcp login <c>`. The vault never widens a scope itself |
+| `client_secret_expiring`, `client_secret_expired` | warning, error | a client the vault registered has a `client_secret_expires_at` (from stored metadata) within 14 days, or past: register a new client with `login --mcp URL --reregister` (the action's command), or for a credential without the server's URL as its `resource`, enter the new secret with `secret set`. The wall clock judges it |
 | `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`login --mcp URL --reregister`); the vault never registers again by itself |
 | `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
 | `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
@@ -696,17 +697,19 @@ tells clients when a list changes, so a lazy client fetches the new one.
 `zoeymcp login --mcp URL` (M7) adds an OAuth-protected MCP server from its URL, beside the manual
 path above. It takes two commits: fragment 1 adds the credential, its route and the server with
 no tools; once it is committed, the same command again signs in, and the review (steps 5 to 7
-above) gives the tools to commit. Until the vault registers clients itself (later in M7), it
-needs a client the provider registered for you: its client ID, and its secret if it has one.
-Without one the plan stops at `registration_unavailable`.
+above) gives the tools to commit. Without `--client-id`, the vault registers a client itself
+(dynamic client registration, RFC 7591) when the authorization server offers it; with one, it
+uses the client the provider registered for you. A server that offers neither stops the plan at
+`registration_unavailable` (or `cimd_only`, for one that registers clients by metadata document
+alone, which ZoeyMCP doesn't support yet): register a client there and give its client ID.
 
 It runs in the vault's container, over the admin socket:
 
 ```sh
 # hardened tier
 docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp login \
-  --mcp https://mcp.notes.example/mcp --name notes --client-id my-client > onboard-notes-1.yaml
-# standard tier
+  --mcp https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
+# standard tier, with a client the provider registered for you
 docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp login \
   --mcp https://mcp.notes.example/mcp --name notes --client-id my-client > onboard-notes-1.yaml
 ```
@@ -728,6 +731,29 @@ host.
   and `--server` name each. Without them, the host's first label that says something (not `mcp`,
   `api`, `www`, `app` or `server`), with `-2` and on when it is taken. A name you give that the
   policy, the store or another onboarding has is refused `name_taken`.
+- **A client the vault registers** (no `--client-id`): once you confirm "Register a client at
+  <issuer host>?", the vault sends one request to the server's `registration_endpoint`, with
+  public metadata only: the client's name (`--client-name`, default `ZoeyMCP (<server>)`), its
+  redirect address, the authorization code and refresh token grants, and the scopes. It asks
+  for a public client (`token_endpoint_auth_method: none`) when the server allows one, else a
+  client secret (`client_secret_basic`, else `client_secret_post`); `dcr_auth_unsupported`
+  otherwise, before anything is sent. The answer is checked, not trusted: a client ID a policy
+  can't hold (`dcr_bad_client_id`), another redirect address than the one asked for
+  (`dcr_redirect_changed`), an authentication the vault doesn't speak, a secret where none
+  belongs or none where one does (`dcr_bad_secret`), grants without the authorization code and
+  the refresh token (`dcr_grant_missing`) or a malformed expiry (`dcr_answer_invalid`) are
+  refused, and so is a server's refusal (`dcr_refused`, with its error code and, for you alone,
+  its description) or any other answer (`dcr_failed`). A refused or timed-out registration may
+  have left a client at the provider (`dcr_failed` says so): the next run registers a new one.
+  The answer's registration access token and URI are never kept, so the vault never updates or
+  deletes the client at the provider: remove an unused one in the provider's own console.
+
+  A confidential client's secret is stored at once as `<credential>-client-secret`, as for a
+  secret you give (below); a public client's ID is stored as `<credential>-client-id`, only so
+  that a vault restart before the commit can show fragment 1 again, and the second run deletes
+  it. When the provider sets `client_secret_expires_at`, `zoeymcp health` warns 14 days before
+  it (`client_secret_expiring`) and errors after it (`client_secret_expired`): register a new
+  client with `--reregister`.
 - **A public client** (`--client-id` alone): nothing is sent past discovery and nothing is stored;
   the fragment holds only what you typed.
 - **A confidential client**: `--client-secret`, with `--issuer` (the authorization server that
@@ -753,9 +779,12 @@ host.
   while those stay (`client_secret_binding_changed` otherwise). The fragment holds `client_secret:
   "store:<credential>-client-secret"`, never the value.
 - **The redirect address**: `--redirect-uri` is the one the provider has on record for the
-  client; without it, the shared `http://127.0.0.1/callback`. The plan says when the address isn't
-  the credential's own, which turns off a backstop against pasting an answer meant for another
-  sign-in.
+  client; without it, a given client uses the shared `http://127.0.0.1/callback`, and a client
+  the vault registers gets the credential's own, `http://127.0.0.1/callback/<credential>`
+  (paste), or with `--callback-origin ORIGIN`, one of `admin.origins`, that portal's
+  `ORIGIN/oauth/callback/<credential>`. A loopback or `localhost` address registers the client
+  as `native`, any other as `web`. The plan says when the address isn't the credential's own,
+  which turns off a backstop against pasting an answer meant for another sign-in.
 - **`--plan-only`** discovers and prints the plan, then stops. The same command (the same URL,
   names and options) within 30 minutes carries on from that plan.
 - **A server that publishes no protected-resource metadata** (an older pattern): the plan says
@@ -837,18 +866,22 @@ file alone.
 | --- | --- |
 | The vault restarts before you confirm | the onboarding is gone: run the same command again |
 | It restarts after a client secret was stored, before the commit | the secret stays (health reports it `unreferenced` until fragment 1 is committed): commit the fragment you were shown, or run the same command to see fragment 1 again, which stores nothing |
+| It restarts after it registered a public client, before the commit | its `<credential>-client-id` entry stays, likewise: commit the fragment, or run the same command to see fragment 1 again, which registers nothing |
+| A registration times out | `dcr_failed`: the provider may hold a client nobody uses; the same command registers a new one |
 | The commit recreates the vault (inline `ZOEYMCP_CONFIG`) | nothing is lost: run `login --mcp` again to sign in |
 | It restarts during the sign-in | the sign-in is lost (§2): run it again; a stored client secret stays |
 | The store is lost | the client secret with it: onboard again with a new client (`--reregister` once the policy names the credential); the old client stays registered at the provider |
 
 The admin socket's routes behind it (M7 design M.1): `POST /onboard/discover` answers the plan,
 or the second run's comparison (`stage: committed`); `POST /onboard/<onboarding>/register` stores
-a given client's secret and answers fragment 1; `POST /onboard/<onboarding>/fragment` answers
-fragment 1 for a client with no secret (or again, at another indent); `DELETE
-/onboard/<onboarding>` cancels. A vault restart ends every onboarding, but a client secret it
-stored stays; the same discovery again finds it, checks its binding against a fresh discovery,
-and answers the onboarding registered, so `/fragment` shows fragment 1 again without storing
-anything. If the binding differs, its names stay taken: delete the entry or choose other names.
+a given client's secret, or registers a client for an onboarding with no client ID, and answers
+fragment 1 (with the registered `client_id` and its secret's `client_secret_expires_at`);
+`POST /onboard/<onboarding>/fragment` answers fragment 1 for a client with no secret (or again,
+at another indent); `DELETE /onboard/<onboarding>` cancels. A vault restart ends every
+onboarding, but a client secret it stored stays; the same discovery again finds it, checks its
+binding against a fresh discovery, and answers the onboarding registered, so `/fragment` shows
+fragment 1 again without storing anything. If the binding differs, its names stay taken: delete
+the entry or choose other names.
 If anything fails after register stored the secret, the vault deletes it again and the answer says
 `secret_deleted`; a re-registration's puts back the secret it replaced, and says
 `secret_restored`. Its log lines:
@@ -862,11 +895,12 @@ If anything fails after register stored the secret, the vault deletes it again a
 | `onboard_registered` | `credential`, `issuer` (its host), `auth`, `secret_stored` |
 | `onboard_blocked` | `host` and `port` your proxy refused, `needed` (how many hosts it must allow) |
 | `onboard_ended` | `why`: `registered` (the policy names its credential now), `cancelled`, `expired`, `owner_gone`, or `compared` (a second run's comparison found nothing changed) |
-| `address_refused` | `purpose` (`discovery`, or `revocation`), `host`, `port`, `verdict` |
+| `address_refused` | `purpose` (`discovery`, `registration`, or `revocation`), `host`, `port`, `verdict` |
 | `oauth_revoked` | `credential`, `outcome` (`ok`; `refused`: nothing was sent, because the endpoint isn't on the token endpoint's origin, its address was refused, or the client can't be authenticated; `failed`, with the `status` when there was an answer; `timeout`), `status`: a deleted grant's revocation (§2) |
 
-None holds an onboarding's ID, a secret, a URL's path or query, or a body; a stored client
-secret logs `secret_set` with `via` and its binding, as any secret does.
+None holds an onboarding's ID, a secret, a registration access token or URI, a URL's path or
+query, or a body; a stored client secret (or a registered public client's ID) logs `secret_set`
+with `via` and its binding, as any secret does.
 
 ## 12. Drift
 
@@ -1666,6 +1700,15 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 429 | `onboarding_busy` | At most 4 onboardings can be in progress. Finish or cancel one, or wait for one to expire (30 minutes). |
 | 409 | `onboarding_options_changed` | The onboarding in progress for this URL and these names stopped at your proxy and was started with other options. Run it with the same options to carry on, or start again once it expires (30 minutes). |
 | 409 | `registration_unavailable` | Register a client at `<host>` and run again with its client ID. |
+| 409 | `cimd_only` | This server registers clients by metadata document, which ZoeyMCP doesn't support yet. Register a client at `<host>` and run again with its client ID. |
+| 502 | `dcr_refused` | The authorization server refused the registration (`<error>`), so no client was registered. |
+| 502 | `dcr_failed` | The authorization server didn't answer the registration as needed (`<detail>`). It may have registered a client anyway; the next run registers a new one. |
+| 502 | `dcr_redirect_changed` | The authorization server registered another redirect address than the one asked for, so its client isn't used. |
+| 502 | `dcr_auth_unsupported` | The authorization server offers no client authentication the vault speaks (none, client_secret_basic or client_secret_post), so no client is used. |
+| 502 | `dcr_bad_client_id` | The client ID the authorization server issued can't be written into a policy (1 to 255 printable characters, no space, quote, backslash or $, and no store: or env: reference), so it isn't used. |
+| 502 | `dcr_bad_secret` | The authorization server's client secret doesn't fit the client's authentication (one missing, one too many, or one that can't be stored), so its client isn't used. |
+| 502 | `dcr_grant_missing` | The authorization server registered the client without the authorization_code and refresh_token grants, so it isn't used. |
+| 502 | `dcr_answer_invalid` | The authorization server's registration answer can't be used (`<detail>`). |
 | 502 | `proxy_refused` | Your egress proxy refused the vault's connection to `<host>`. Allow the hosts listed here in it for the vault, then run the same command again. |
 | 409 | `already_configured` | The server `<server>` already reaches this URL, with a credential of kind `<kind>`, not oauth2. Remove it, its route and that credential from the policy and reload first. |
 | 409 | `onboarding_mismatch` | The committed policy differs from what the server publishes now, at `<fields>`. Revert the edit, or register a new client with zoeymcp login --mcp URL --reregister. |

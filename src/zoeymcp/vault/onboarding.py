@@ -9,7 +9,8 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
 - **Stages**: ``discovering``, ``blocked`` (an operator's own proxy refused a host, D.11),
   ``discovered`` (the plan, immutable, and the draft change's ``check`` result) and
   ``registered`` (fragment 1's validated change, never a secret, so it can be rendered again at
-  any indent, OPS-2). A registered onboarding ends when the running policy names its credential.
+  any indent, OPS-2, and the :class:`Client` a registration made, D.4). A registered onboarding
+  ends when the running policy names its credential.
 - **Resuming**: a start by the same owner for the same URL and names carries on with a blocked
   one (D.11), unless its options differ (``onboarding_options_changed``, OPS-8), and with a
   discovered (``--plan-only``, D.10) or registered one started with the same options; any other
@@ -17,8 +18,9 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
 - **Names** (OPS-15): :func:`default_name` from the server's host, never one the policy, the
   store or another onboarding has; :func:`name_taken` for the names given.
 - **Allowances** (I.3): the ``host:port`` pairs an onboarding contacts, for the egress role's
-  list until it registers. Never private: ``private_target`` is the one typed server's
-  exception, carried per request (B.2, TI-10).
+  list until it registers: the hosts discovery fetched from, and the registration endpoint's
+  once the plan says the vault registers the client. Never private: ``private_target`` is the
+  one typed server's exception, carried per request (B.2, TI-10).
 - **The second run** (D.12): :func:`committed_for` finds the running oauth2 credential an
   onboarded URL has, :func:`mismatches` where it, its route and its server differ from a fresh
   discovery, by field name only, and :func:`token_state` whether it already holds a refresh
@@ -145,7 +147,8 @@ class Options:
     other options refuses (OPS-8). ``secret_given`` says only that a given client came with a
     secret, which ``client_auth`` then defaults to ``basic`` for (D.10); without one, a client
     authenticates with nothing. ``reregister`` is a re-registration of a committed credential
-    under its own names (D.12, OPS-3)."""
+    under its own names (D.12, OPS-3). Without a ``client_id`` the vault registers the client
+    (D.4), at the portal origin ``callback_origin``'s callback when one is named."""
 
     client_id: str | None = None
     client_auth: ClientAuth | None = None
@@ -156,6 +159,7 @@ class Options:
     allow_private: bool = False
     secret_given: bool = False
     reregister: bool = False
+    callback_origin: str | None = None
 
     def __post_init__(self) -> None:
         if self.secret_given:
@@ -192,11 +196,23 @@ class Names:
         )
 
 
+@dataclass(frozen=True)
+class Client:
+    """The client a registration made (D.4): its ID, how it authenticates at the token endpoint,
+    its secret's ``client_secret_expires_at`` (0 or None: never), and what its answer leaves to
+    note (``dcr.NOTES``). Never the secret."""
+
+    client_id: str
+    client_auth: ClientAuth
+    expires_at: int | None = None
+    notes: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True, repr=False)
 class OnboardingRecord:
     """One onboarding. ``needed_hosts`` are the ``(host, port)`` pairs a blocked one's proxy must
     allow (D.11); ``allowance`` the pairs it contacts (I.3). ``plan`` is set once, at
-    ``discovered``; ``change`` at ``registered``."""
+    ``discovered``; ``change`` at ``registered``, with ``client`` when the vault registered it."""
 
     id: str
     owner: str
@@ -210,6 +226,7 @@ class OnboardingRecord:
     plan: Plan | None = None
     draft_check: tuple[Finding, ...] = ()
     change: PolicyChange | None = None
+    client: Client | None = None
     allowance: frozenset[tuple[str, int]] = field(default_factory=frozenset)
 
     @property
@@ -251,6 +268,21 @@ def server_host_port(server_url: str) -> tuple[str, int]:
     """The ``(host, port)`` of an https URL discovery accepted, the host in lower case."""
     parts = urlsplit(server_url)
     return str(parts.hostname), parts.port or 443
+
+
+def client_options(record: OnboardingRecord, client: Client | None = None) -> Options:
+    """The options fragment 1 is made with: the onboarding's, with the client a registration
+    made (``client``, else the record's) in the given client's place (D.4): its ID, and its
+    authentication, a secret for any but ``none``."""
+    made = client or record.client
+    if made is None:
+        return record.options
+    return replace(
+        record.options,
+        client_id=made.client_id,
+        client_auth=made.client_auth,
+        secret_given=made.client_auth != "none",
+    )
 
 
 def server_path(server_url: str) -> str:
@@ -380,17 +412,33 @@ class OnboardingTable:
     def discovered(
         self, onboarding: str, owner: str, plan: Plan, draft_check: Iterable[Finding]
     ) -> OnboardingRecord:
-        """A discovering onboarding's plan, and its draft change's ``check`` findings (OPS-5)."""
+        """A discovering onboarding's plan, and its draft change's ``check`` findings (OPS-5).
+        One with no client ID registers its client next, so the registration endpoint's host
+        joins its allowance (D.8, I.3)."""
         record = self._in_stage(onboarding, owner, "discovering")
+        allowance = record.allowance
+        endpoint = plan.metadata.registration_endpoint
+        if record.options.client_id is None and endpoint is not None:
+            allowance |= {server_host_port(endpoint)}
         return self._put(
-            replace(record, stage="discovered", plan=plan, draft_check=tuple(draft_check))
+            replace(
+                record,
+                stage="discovered",
+                plan=plan,
+                draft_check=tuple(draft_check),
+                allowance=allowance,
+            )
         )
 
-    def registered(self, onboarding: str, owner: str, change: PolicyChange) -> OnboardingRecord:
-        """A discovered onboarding's fragment 1. It contacts nothing more, so its allowance
-        goes (I.3)."""
+    def registered(
+        self, onboarding: str, owner: str, change: PolicyChange, client: Client | None = None
+    ) -> OnboardingRecord:
+        """A discovered onboarding's fragment 1, and the ``client`` its registration made. It
+        contacts nothing more, so its allowance goes (I.3)."""
         record = self._in_stage(onboarding, owner, "discovered")
-        return self._put(replace(record, stage="registered", change=change, allowance=frozenset()))
+        return self._put(
+            replace(record, stage="registered", change=change, client=client, allowance=frozenset())
+        )
 
     def cancel(self, onboarding: str, owner: str) -> Ended | None:
         """Drop the onboarding. Another owner's stays, and answers as an unknown one; an expired

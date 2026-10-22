@@ -3,7 +3,8 @@
 The table's owners, TTL (on the injected monotonic clock, FM-28) and caps; resuming, and
 ``onboarding_options_changed`` when the options differ (OPS-8); two owners under the same names
 (FM-10); the stages, with ``registered`` holding fragment 1's change (OPS-2); allowances (I.3);
-the name defaults (OPS-15); the second run's comparison by field name (D.12, GR-26), what it
+the client a registration made, and its endpoint's host in the allowance (D.4); the name
+defaults (OPS-15); the second run's comparison by field name (D.12, GR-26), what it
 finds of a server reaching the URL otherwise (OPS-14) and of a refresh token already held
 (OPS-13); a re-registration's end (OPS-3); and the ``next`` lists with every command
 shell-quoted (M.7, TI-14).
@@ -38,6 +39,7 @@ from zoeymcp.vault.onboarding import (
     ONBOARDING_TTL,
     ONBOARDINGS_MAX,
     STDIN_SOURCE,
+    Client,
     Committed,
     Ended,
     Names,
@@ -49,6 +51,7 @@ from zoeymcp.vault.onboarding import (
     Served,
     allow_hosts,
     choose_names,
+    client_options,
     committed_for,
     committed_next,
     default_name,
@@ -594,6 +597,82 @@ def test_registered_holds_fragment_1_and_contacts_nothing_more() -> None:
     assert registered.allowance == frozenset()
     with pytest.raises(ValueError, match=r"^a registered onboarding contacts nothing more$"):
         onboardings.widen(record.id, "cli", [("x.example", 443)])
+    assert registered.client is None
+
+
+REGISTRATION = "https://Reg.Notes.example:8443/register"
+
+
+@pytest.mark.parametrize(
+    ("options", "added"),
+    [
+        # No client ID: the vault registers one, at the registration endpoint (D.4, I.3).
+        (Options(), {("reg.notes.example", 8443)}),
+        (Options(callback_origin="http://localhost:8081"), {("reg.notes.example", 8443)}),
+        # A given client: nothing is registered.
+        (Options(client_id="given"), set()),
+    ],
+)
+def test_a_registration_adds_its_endpoints_host_to_the_allowance(
+    options: Options, added: set[tuple[str, int]]
+) -> None:
+    onboardings, _, _ = table()
+    record = onboardings.start("cli", SERVER, NOTES, options).record
+    found = onboardings.discovered(record.id, "cli", plan(registration_endpoint=REGISTRATION), ())
+    assert found.allowance == record.allowance | added
+    assert onboardings.allowances() == (Allowance(found.allowance),)
+    # None published: nothing added, whatever the options.
+    onboardings.cancel(record.id, "cli")
+    record = onboardings.start("cli", SERVER, NOTES, options).record
+    found = onboardings.discovered(record.id, "cli", plan(registration_endpoint=None), ())
+    assert found.allowance == record.allowance
+
+
+def test_registered_holds_the_client_a_registration_made() -> None:
+    """D.4: the client's ID, authentication and expiry, never its secret; the allowance goes."""
+    onboardings, _, _ = table()
+    record = onboardings.start("cli", SERVER, NOTES, Options()).record
+    onboardings.discovered(record.id, "cli", plan(), ())
+    client = Client("issued-1", "basic", 1_790_000_000, ("grant_types_absent",))
+    registered = onboardings.registered(record.id, "cli", notes_change(), client)
+    assert registered.client is client
+    assert registered.allowance == frozenset()
+    assert onboardings.allowances() == ()
+    assert Client("issued-2", "none") == Client("issued-2", "none", None, ())
+
+
+@pytest.mark.parametrize(
+    ("client", "expected"),
+    [
+        (None, Options(scope="a b")),
+        (
+            Client("issued-1", "none"),
+            Options(client_id="issued-1", client_auth="none", scope="a b"),
+        ),
+        (
+            Client("issued-1", "basic"),
+            Options(client_id="issued-1", client_auth="basic", secret_given=True, scope="a b"),
+        ),
+        (
+            Client("issued-1", "post"),
+            Options(client_id="issued-1", client_auth="post", secret_given=True, scope="a b"),
+        ),
+    ],
+)
+def test_client_options_put_the_registered_client_in_a_given_ones_place(
+    client: Client | None, expected: Options
+) -> None:
+    record = OnboardingRecord("id", "cli", SERVER, NOTES, Options(scope="a b"), 0.0)
+    assert client_options(record, client) == expected
+    assert client_options(replace(record, client=client)) == expected
+    # The client passed in comes before the record's own.
+    if client is not None:
+        assert client_options(replace(record, client=Client("other", "none")), client) == expected
+
+
+def test_options_name_no_portal_origin_by_default() -> None:
+    assert Options().callback_origin is None
+    assert Options(callback_origin="http://localhost:8081") != Options()
 
 
 def test_each_step_needs_its_stage() -> None:

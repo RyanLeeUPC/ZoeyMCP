@@ -18,7 +18,7 @@ import httpx
 import pytest
 from anyio.from_thread import BlockingPortal, start_blocking_portal
 
-from tests.fakes.oauth_server import FakeAuthServer
+from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer
 from tests.unit import onboard_model
 from zoeymcp.cli import admin_client
 from zoeymcp.cli import main as main_module
@@ -50,6 +50,7 @@ from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.netclient import RESOLVE_TIMEOUT
 from zoeymcp.vault.oauth import fetch
+from zoeymcp.vault.oauth.dcr import NOTES
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.onboarding import INLINE_SOURCE, allow_hosts, next_for, onboard_again
 from zoeymcp.vault.store import SecretStore
@@ -2972,6 +2973,92 @@ def test_a_cancelled_onboarding_answers_nothing(onboard_admin: FakeAdmin) -> Non
     assert admin_client.onboard_cancel("x", "ob-0001") == {}
 
 
+def test_a_registration_from_the_cli(onboard_admin: FakeAdmin) -> None:
+    """D.4, D.10: no --client-id, so register (with no secret) makes the client and fragment 1,
+    at a portal origin's callback with --callback-origin; the client, its stored secret and the
+    secret's expiry are said on stderr, and a fragment at another indent is asked for again."""
+    plan = {
+        "server_url": URL,
+        "issuer": ISSUER,
+        "client_id": None,
+        "registration": "dcr",
+        "registration_endpoint": f"{ISSUER}/register",
+    }
+    onboard_admin.answers[("POST", "/onboard/discover")] = (200, discovered(plan=plan))
+    registered = made(
+        client_id="zc_issued",
+        client_auth="basic",
+        secret_stored=True,
+        secret_name="notes-client-secret",
+        client_secret_expires_at=1_900_000_000,
+        notes=["grant_types_absent"],
+    )
+    onboard_admin.answers[("POST", "/onboard/ob-0001/register")] = (200, registered)
+    origin = "https://zoeymcp.tailnet.example"
+    argv = ["login", "--mcp", URL, "--name", "notes", "--callback-origin", origin, "--socket", "x"]
+    code, out, err = cli([*argv, "--yes", "--indent", "4"])
+    assert (code, out) == (EXIT_OK, FRAGMENT)
+    assert onboard_admin.requests == [
+        ("POST", "/onboard/discover", {"url": URL, "name": "notes", "callback_origin": origin}),
+        ("POST", "/onboard/ob-0001/register", {}),
+        ("POST", "/onboard/ob-0001/fragment", {"indent": 4}),
+    ]
+    assert (
+        "Registered client zc_issued at auth.notes.example.\n"
+        f"  {NOTES['grant_types_absent']}\n"
+        "Stored the client secret as notes-client-secret, bound to the token endpoint and the "
+        "server's origin fragment 1 names.\n"
+        "The provider expires that secret at 2030-03-17 17:46 UTC; zoeymcp health warns 14 days "
+        "before.\n"
+        "Wrote fragment 1 of 2 to stdout.\n"
+    ) in err
+    # Without --yes, the question names the authorization server.
+    code, _, err = cli(argv, stdin=io.StringIO("n\n"))
+    assert code == EXIT_FINDINGS
+    assert "Register a client at auth.notes.example? [y/N] " in err
+    # An onboarding's flag, which a login of a named credential doesn't take.
+    code, _, err = cli(["login", "music", "--callback-origin", origin, "--socket", "x"])
+    assert (code, err) == (
+        onboard_cli.EXIT_USAGE,
+        "zoeymcp login: --callback-origin goes with --mcp\n",
+    )
+
+
+def test_an_expiry_past_what_a_date_holds(onboard_admin: FakeAdmin) -> None:
+    """X7 takes any non-negative integer as the secret's expiry; one past year 9999 is said as
+    its epoch second, and the run still finishes, as JSON too."""
+    plan = {
+        "server_url": URL,
+        "issuer": ISSUER,
+        "client_id": None,
+        "registration": "dcr",
+        "registration_endpoint": f"{ISSUER}/register",
+    }
+    registered = made(
+        client_id="zc_issued",
+        client_auth="basic",
+        secret_stored=True,
+        secret_name="notes-client-secret",
+        client_secret_expires_at=2**40,
+        notes=[],
+    )
+    argv = ["login", "--mcp", URL, "--name", "notes", "--socket", "x", "--yes"]
+    for extra in ([], ["--format", "json"]):
+        onboard_admin.answers[("POST", "/onboard/discover")] = (200, discovered(plan=plan))
+        onboard_admin.answers[("POST", "/onboard/ob-0001/register")] = (200, registered)
+        code, out, err = cli([*argv, *extra])
+        assert code == EXIT_OK
+        if extra:
+            assert json.loads(out)["fragment"]["client_secret_expires_at"] == 2**40
+        else:
+            assert out == FRAGMENT
+            assert (
+                f"The provider expires that secret at epoch second {2**40}; zoeymcp health warns "
+                "14 days before.\n"
+                "Wrote fragment 1 of 2 to stdout.\n"
+            ) in err
+
+
 # --- the second run, through the real admin app (D.12, J1, J3) -----------------------------------
 
 
@@ -2999,15 +3086,39 @@ class Vault(httpx.BaseTransport):
         self.tokens = TokenManager(self.store, self.token_client)
         self.tokens.configure(self.policy, {})
         onboard = onboard_model.onboard_service(self.store, self.tokens, lambda: self.policy)
-        setup = SetupCodes(tmp_path, KEYS.portal_key)
+        self.setup = SetupCodes(tmp_path, KEYS.portal_key)
         self.admin = AdminApp(
-            self.store, KEYS, lambda: self.policy, setup, self.tokens, onboard=onboard
+            self.store, KEYS, lambda: self.policy, self.setup, self.tokens, onboard=onboard
         )
 
     def set_policy(self, policy: Policy) -> None:
         """As a reload does: the admin and the token manager see the same policy."""
         self.policy = policy
         self.tokens.configure(policy, {})
+
+    def registering(self) -> None:
+        """The server's metadata names a registration endpoint, which the fake authorization
+        server answers (M7 D.4): the vault registers a client when none is given."""
+        self.auth.registration = "open"
+        onboard = onboard_model.onboard_service(
+            self.store, self.tokens, lambda: self.policy, register=self.register
+        )
+        self.admin = AdminApp(
+            self.store, KEYS, lambda: self.policy, self.setup, self.tokens, onboard=onboard
+        )
+
+    async def register(self, request: httpx.Request) -> httpx.Response:
+        transport = httpx.ASGITransport(app=self.auth_app)
+        async with httpx.AsyncClient(transport=transport) as client:
+            answer = await client.post(
+                str(request.url),
+                content=request.content,
+                headers={"content-type": "application/json"},
+            )
+        headers = {"content-type": answer.headers["content-type"]}
+        return httpx.Response(
+            answer.status_code, headers=headers, stream=onboard_model.Body(answer.content)
+        )
 
     def commit(self, fragment: str) -> None:
         """Fragment 1 merged as ``check --with`` merges it, committed and reloaded."""
@@ -3140,6 +3251,45 @@ def test_j3_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
     assert "(confidential client, PKCE S256" in out
     assert "Stored the refresh token for notes as notes-refresh.\n" in out
     assert onboard_model.GIVEN_SECRET not in out + err + fragment
+
+
+def test_j1_with_a_registered_client_up_to_a_completed_login(vault: Vault) -> None:
+    """J1 (DCR) against the fakes: no client ID, so the vault registers a public client at the
+    server's registration endpoint, keeps its ID for a restart, and fragment 1 holds it with the
+    credential's own redirect address; the second run signs in with it and deletes the kept ID
+    (D.4, D.8, OPS-2)."""
+    vault.registering()
+    code, fragment, err, _ = onboarded(vault, [*J1, "--yes"])
+    assert code == EXIT_OK, err
+    [client_id] = vault.auth.registered
+    assert f"Registered client {client_id} at auth.notes.example.\n" in err
+    credential = load_mapping(fragment)["credentials"]["notes"]
+    assert (credential["client_id"], credential["redirect_uri"]) == (
+        client_id,
+        "http://127.0.0.1/callback/notes",
+    )
+    assert vault.store.names() == ["notes-client-id"]
+    vault.commit(fragment)
+    code, out, err, browser = onboarded(vault, J1)
+    assert (code, browser.visits) == (EXIT_OK, 1), err
+    assert "Stored the refresh token for notes as notes-refresh.\n" in out
+    assert vault.store.names() == ["notes-refresh"]
+
+
+def test_a_refused_registration_shows_the_providers_words(vault: Vault) -> None:
+    """D.4: the code and the cleaned description, on stderr only; nothing stored."""
+    vault.registering()
+    vault.auth.switches = {AuthSwitch.DCR_ERROR_INJECTED}
+    code, out, err, _ = onboarded(vault, [*J1, "--yes"])
+    assert (code, out) == (EXIT_FINDINGS, "")
+    lines = err.splitlines()
+    assert (
+        "zoeymcp login: The authorization server refused the registration "
+        "(invalid_client_metadata), so no client was registered."
+    ) in lines
+    [said] = [line for line in lines if line.startswith("  the provider says: ")]
+    assert "[U+000D]" in said
+    assert vault.store.names() == []
 
 
 def test_a_reregistration_signs_in_over_a_moved_token_endpoint(

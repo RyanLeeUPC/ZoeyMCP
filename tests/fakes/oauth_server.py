@@ -349,6 +349,8 @@ class FakeAuthServer:
         self.switches: set[AuthSwitch] = set()
         self.trickle_interval = TRICKLE_INTERVAL
         self.registered: dict[str, _Client] = {}
+        # What a registered secret's client_secret_expires_at says (0: never).
+        self.secret_expires_at = 0
         self.seen: list[Seen] = []
         # Hostile and flaky behavior.
         self.drop_after_processing = 0
@@ -949,7 +951,7 @@ class FakeAuthServer:
             secret = self._new("secret")
         if secret is not None:
             answer["client_secret"] = secret
-            answer["client_secret_expires_at"] = 0
+            answer["client_secret_expires_at"] = self.secret_expires_at
         if AuthSwitch.DCR_REDIRECT_CHANGED in on:
             answer["redirect_uris"] = [CHANGED_REDIRECT]
         if AuthSwitch.DCR_PRIVATE_KEY_JWT in on:

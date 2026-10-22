@@ -101,7 +101,8 @@ def broker_server() -> tuple[FakeAuthServer, Any]:
 
 
 class AdminRig:
-    """The admin app with the example policy and, as in the vault, a token manager."""
+    """The admin app with the example policy and, as in the vault, a token manager; with
+    ``onboard``, onboard_model's service, whose server registers clients by ``register``."""
 
     def __init__(
         self,
@@ -112,6 +113,7 @@ class AdminRig:
         passkeys: Passkeys | None = None,
         portal: PortalApp | None = None,
         onboard: bool = False,
+        register: onboard_model.Register | None = None,
     ) -> None:
         self.policy = example_policy()
         self.store = SecretStore(tmp_path, KEYS)
@@ -130,7 +132,9 @@ class AdminRig:
             self.tokens if tokens else None,
             passkeys=passkeys,
             portal=portal,
-            onboard=onboard_model.onboard_service(self.store, self.tokens, lambda: self.policy)
+            onboard=onboard_model.onboard_service(
+                self.store, self.tokens, lambda: self.policy, register=register
+            )
             if onboard
             else None,
         )

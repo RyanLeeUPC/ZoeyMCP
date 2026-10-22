@@ -10,6 +10,9 @@ point and started again:
   gone, the secret stays in the store under the predicted binding, which the fragment, merged
   into the policy, derives (FM-2); health reports the entry unreferenced until then, and the
   same command shows fragment 1 again without storing anything (D.7 step 6);
+- after a client the vault registered (step 11) was given a secret and fragment 1 shown: the
+  secret stays under the predicted binding with the registration's meta, and the same command
+  shows that fragment 1 again, registering nothing more (FM-2 for DCR);
 - before the register request is sent, the store holds nothing; once the secret's write has
   returned and before the answer (held there by the hooks file's ``pause_after_put``), the
   store holds that secret under the predicted binding, and nothing else;
@@ -163,9 +166,8 @@ def deployed(tmp_path: Path, ca: ProviderCA, **auth_options: Any) -> Iterator[De
     """The fakes over TLS, their names in a hooks file, and a vault ready to start."""
     mcp = McpFake(key="fake-key-notes-0001", prm="path", authorization_servers=[ISSUER])
     mcp.scopes = ("notes.read",)
-    auth = FakeAuthServer(
-        client_id=CLIENT_ID, issuer=ISSUER, iss_supported=True, registration="none", **auth_options
-    )
+    options = {"registration": "none", **auth_options}
+    auth = FakeAuthServer(client_id=CLIENT_ID, issuer=ISSUER, iss_supported=True, **options)
     certs = tmp_path / "certs"
     certs.mkdir(mode=0o700)
     resolver = FakeResolver()
@@ -289,6 +291,47 @@ def test_restart_after_register(tmp_path: Path, ca: ProviderCA) -> None:
     )
     logged = vault.log.read_text(encoding="utf-8", errors="replace")
     assert SECRET not in json.dumps(health) + made.text + shown.text + logged
+
+
+def test_restart_after_a_registration(tmp_path: Path, ca: ProviderCA) -> None:
+    """FM-2 for a confidential client the vault registered (D.4, D.7 step 6)."""
+    with deployed(tmp_path, ca, registration="confidential_only") as vault:
+        vault.start()
+        body = {"url": SERVER_URL}
+        plan = vault.call("POST", "/onboard/discover", body).json()
+        assert plan["plan"]["registration"] == "dcr"
+        made = vault.call("POST", f"/onboard/{plan['onboarding']}/register", {})
+        assert made.status_code == 200, made.text
+        vault.kill()
+        vault.start()
+        again = vault.call("POST", "/onboard/discover", body)
+        assert again.status_code == 200, again.text
+        shown = vault.call("POST", f"/onboard/{again.json()['onboarding']}/fragment", {})
+        vault.stop()
+    assert again.json()["stage"] == "registered"
+    assert shown.status_code == 200, shown.text
+    # The same client: nothing was registered again.
+    assert shown.json()["client_id"] == made.json()["client_id"]
+    assert shown.json()["diff"]["yaml"] == made.json()["diff"]["yaml"]
+    held = vault.store()
+    assert held.names() == [SECRET_NAME]
+    entry = held.entry(SECRET_NAME)
+    assert entry is not None
+    assert entry.binding == predicted()
+    assert entry.meta == {
+        "onboarded": AUTH,
+        "resource": SERVER_URL,
+        "client_id": made.json()["client_id"],
+        "client_secret_expires_at": 0,
+        "client_auth": "basic",
+        "redirect_uri": "http://127.0.0.1/callback/notes",
+    }
+    policy = merged(made.json()["diff"]["yaml"])
+    assert not [f for f in check_policy(policy) if f.level == "error"]
+    assert derive_binding(policy, SECRET_NAME) == entry.binding
+    secret = held.get_for_oauth(SECRET_NAME, token_url=f"{ISSUER}/token")[0].reveal()
+    logged = vault.log.read_text(encoding="utf-8", errors="replace")
+    assert secret not in made.text + again.text + shown.text + logged
 
 
 def test_a_kill_during_register(tmp_path: Path, ca: ProviderCA) -> None:

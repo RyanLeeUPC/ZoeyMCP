@@ -2,9 +2,9 @@
 
 The reasons come from the deciding modules, read from their code here (the WebAuthn and secret
 ``Reason`` literals, every literal ``LoginError`` and ``RedirectError`` reason, and from M7 every
-literal discovery ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused`` and fetch error
-reason, and every refusal the onboarding service words itself), so a reason added there without
-a sentence here fails.
+literal discovery and registration ``Refusal``, policy ``ChangeRefused``, ``OnboardingRefused``
+and fetch error reason, and every refusal the onboarding service words itself), so a reason
+added there without a sentence here fails.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from zoeymcp.portal.refusals import (
 )
 from zoeymcp.portal.refusals import login as login_refusal
 from zoeymcp.vault import admin, onboard, onboarding, secretplan, store
-from zoeymcp.vault.oauth import discovery, fetch, login, pkce
+from zoeymcp.vault.oauth import dcr, discovery, fetch, login, pkce
 from zoeymcp.vault.secretplan import SecretRefusal
 
 ZWSP = chr(0x200B)
@@ -136,6 +136,19 @@ ONBOARDING = {
 # M7's M.2: the onboarding service's own (M7 step 8a2), and login's check of an onboarded
 # client's secret (D.7).
 SERVICE = {"registration_unavailable": 409, "proxy_refused": 502}
+# M7's M.2: a registration the vault makes (M7 step 11; D.4, X7), and a server that registers
+# clients by metadata document alone.
+DCR = {
+    "cimd_only": 409,
+    "dcr_refused": 502,
+    "dcr_failed": 502,
+    "dcr_redirect_changed": 502,
+    "dcr_auth_unsupported": 502,
+    "dcr_bad_client_id": 502,
+    "dcr_bad_secret": 502,
+    "dcr_grant_missing": 502,
+    "dcr_answer_invalid": 502,
+}
 # M7's M.2: the second run's and a re-registration's (M7 step 8b; D.12, D-184).
 SECOND_RUN = {"already_configured": 409, "onboarding_mismatch": 409, "reregister_by_hand": 409}
 LOGIN7 = {"client_secret_binding_changed": 409}
@@ -218,6 +231,10 @@ FIELDS = {
     "fetch_too_large": {"host"},
     "fetch_not_json": {"host"},
     "registration_unavailable": {"host"},
+    "cimd_only": {"host"},
+    "dcr_refused": {"error"},
+    "dcr_failed": {"detail"},
+    "dcr_answer_invalid": {"detail"},
     "proxy_refused": {"host"},
     "already_configured": {"server", "kind"},
     "onboarding_mismatch": {"fields"},
@@ -269,7 +286,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP
+    expected |= MIXUP | DCR
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -415,6 +432,11 @@ def test_every_onboarding_service_reason_is_catalogued() -> None:
     passes on from discovery, the table and the fetch layer, whose types are scanned above."""
     found = literal_reasons(onboard, "refusal")
     assert found == set(SERVICE) | set(SECOND_RUN) | {
+        # A registration's own (D.4; the rest pass on from dcr, scanned below).
+        "cimd_only",
+        "dcr_refused",
+        "dcr_failed",
+        "dcr_answer_invalid",
         "bad_body",
         "name_taken",
         "onboarding_unknown",
@@ -427,6 +449,14 @@ def test_every_onboarding_service_reason_is_catalogued() -> None:
         "client_secret_binding_changed",
         "no_route",
     }
+    assert found <= set(CATALOGUE)
+
+
+def test_every_registration_reason_is_catalogued() -> None:
+    """M7 M.2: the scan widens to dcr.py, each reason a literal of its Reason type."""
+    found = literal_reasons(dcr, "Refusal")
+    assert found == set(get_args(dcr.Reason))
+    assert found == set(DCR) - {"cimd_only"}
     assert found <= set(CATALOGUE)
 
 

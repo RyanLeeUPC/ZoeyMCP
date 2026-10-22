@@ -3,14 +3,17 @@ surfaces around the service: the admin socket, the no-secret walk and the leak s
 
 One ``httpx.MockTransport`` answers as an MCP server that asks for a token and publishes its
 protected-resource metadata, and as its authorization server's metadata; the endpoint check's
-names answer an address the guard calls global. No network, no sleep. The service's own effect
+names answer an address the guard calls global. Given a ``register`` answerer, the metadata
+publishes a registration endpoint that it answers (M7 D.4): :func:`planted` registers a
+confidential client whose answer carries a secret, a registration access token and a URI for the
+sweeps to look for. No network, no sleep. The service's own effect
 tests, through the real fakes over TLS and the guard, are ``test_onboard_service.py``'s.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from typing import Any
 
 import httpx
@@ -24,12 +27,20 @@ SERVER_URL = "https://mcp.notes.example/mcp"
 ISSUER = "https://auth.notes.example"
 PRM_URL = "https://mcp.notes.example/.well-known/oauth-protected-resource/mcp"
 AS_URL = "https://auth.notes.example/.well-known/oauth-authorization-server"
+REGISTER_URL = "https://auth.notes.example/register"
 CLIENT_ID = "notes-given-client"
 # A given client secret, planted for the sweeps to look for.
 GIVEN_SECRET = "onboard-given-secret-value-0001"
 SECRET_NAME = "notes-client-secret"
 # An address netguard calls global (tests/fakes/resolver.py's range).
 GLOBAL = "11.0.0.1"
+# A registered client's secret, and the RFC 7592 values of its answer, planted for the sweeps.
+DCR_CLIENT_ID = "notes-registered-client"
+DCR_SECRET = "onboard-dcr-secret-value-0001"
+REGISTRATION_TOKEN = "onboard-registration-token-0001"
+REGISTRATION_URI = "https://auth.notes.example/register/onboard-registration-uri-0001"
+
+Register = Callable[[httpx.Request], Awaitable[httpx.Response]]
 
 
 class Body(httpx.AsyncByteStream):
@@ -77,14 +88,60 @@ def handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404)
 
 
+def json_answer(status: int, document: dict[str, Any]) -> httpx.Response:
+    body = Body(json.dumps(document).encode())
+    return httpx.Response(status, headers={"content-type": "application/json"}, stream=body)
+
+
+def answers(register: Register) -> Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]:
+    """:func:`handler`, with a registration endpoint in the metadata that ``register`` answers."""
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if request.method == "POST" and url == REGISTER_URL:
+            return await register(request)
+        if request.method == "GET" and url == AS_URL:
+            return json_answer(200, {**metadata(), "registration_endpoint": REGISTER_URL})
+        return handler(request)
+
+    return answer
+
+
+async def planted(request: httpx.Request) -> httpx.Response:
+    """A confidential client registered, the answer carrying the planted secret, registration
+    access token and URI."""
+    asked = json.loads(request.content)
+    return json_answer(
+        201,
+        {
+            "client_id": DCR_CLIENT_ID,
+            "client_secret": DCR_SECRET,
+            "client_secret_expires_at": 0,
+            "redirect_uris": asked["redirect_uris"],
+            "token_endpoint_auth_method": "client_secret_basic",
+            "grant_types": asked["grant_types"],
+            "registration_access_token": REGISTRATION_TOKEN,
+            "registration_client_uri": REGISTRATION_URI,
+        },
+    )
+
+
 async def resolve(host: str, port: int) -> list[str]:
     return [GLOBAL]
 
 
 def onboard_service(
-    store: SecretStore, tokens: TokenManager | None, policy: Callable[[], Policy]
+    store: SecretStore,
+    tokens: TokenManager | None,
+    policy: Callable[[], Policy],
+    *,
+    register: Register | None = None,
 ) -> OnboardService:
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    """The service on this world; with ``register``, its server registers clients."""
+    transport = (
+        httpx.MockTransport(handler) if register is None else httpx.MockTransport(answers(register))
+    )
+    client = httpx.AsyncClient(transport=transport, trust_env=False)
     return OnboardService(
         store, tokens, policy, client, source="examples/policy.yaml", resolver=resolve
     )

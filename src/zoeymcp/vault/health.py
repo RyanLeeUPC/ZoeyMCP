@@ -30,6 +30,11 @@ too.
 A ``store:`` client secret of a credential that logs in is held to M7 design D.7 step 5 as
 login holds it, by :func:`~.bindings.client_secret_rebound`: bound exactly as the policy derives
 its binding now, or ``client_secret_binding_changed`` (D-185).
+
+A ``store:`` client secret whose entry's meta has a registration's ``client_secret_expires_at``
+(M7 design J, D.7 step 7) is ``client_secret_expiring`` within :data:`GRANT_WARN_DAYS` of it and
+``client_secret_expired`` after it, judged on the wall clock (``Inputs.wall``; FM-28), each
+advisory: the one decision-free read of clear meta that D.7 step 4 allows.
 """
 
 from __future__ import annotations
@@ -116,6 +121,8 @@ class Inputs:
     passkeys: PasskeyState | None = None
     # The reported copy, or None without a gateway: the report then has no ledger_copy section.
     ledger_copy: LedgerCopy | None = None
+    # The wall clock now (seconds since the epoch), or None: no client secret's expiry is judged.
+    wall: float | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +224,8 @@ def _credential(
         row, found = _ref(inputs, stored, _Use("credential", name, ref, needs, fix))
         if oauth is not None and field_name == "client_secret" and _logs_in(oauth):
             row, found = _client_secret(policy, stored, name, oauth, (row, found), fix)
+        if oauth is not None and field_name == "client_secret" and ref.startswith("store:"):
+            found += _expiry(inputs.wall, stored.get(ref.removeprefix("store:")), name, oauth)
         rows.append(row)
         findings += found
     extra: dict[str, Any] = {}
@@ -264,6 +273,30 @@ def _client_secret(
     return {**row, "binding": "changed"}, [
         _finding("client_secret_binding_changed", "error", text, action)
     ]
+
+
+def _expiry(
+    wall: float | None, entry: EntryMeta | None, name: str, cred: OAuth2Credential
+) -> list[Finding]:
+    """A registered client's secret near or past its ``client_secret_expires_at`` (M7 design
+    J, D.7 step 7): a warning within :data:`GRANT_WARN_DAYS` of it, an error once it is past;
+    nothing for 0 (never), for no such meta, or with no wall clock. Read from clear meta, so
+    advisory. Onboarding again registers a new client; without the server's URL as its
+    ``resource``, enter the new secret with ``secret set``."""
+    if wall is None or entry is None:
+        return []
+    expires = (entry.meta or {}).get("client_secret_expires_at")
+    if isinstance(expires, bool) or not isinstance(expires, int) or expires <= 0:
+        return []
+    if expires - wall > GRANT_WARN_DAYS * DAY:
+        return []
+    action = _again(name, cred, _set("credential", name, f"store:{entry.name}"))
+    when = _iso(float(expires))
+    if expires <= wall:
+        text = f"store:{entry.name} expired at {when}: the provider refuses this client now"
+        return [_finding("client_secret_expired", "error", text, action, advisory=True)]
+    text = f"store:{entry.name} expires at {when}: register a new client before then"
+    return [_finding("client_secret_expiring", "warning", text, action, advisory=True)]
 
 
 def _seed(

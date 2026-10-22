@@ -1,14 +1,15 @@
 """Effect tests for onboarding by URL's phase 1 (M7 design D.1-D.4's given-client branch, D.7,
-D.11, E.1-E.3, M.1, M.7; X24; FM-5 to FM-7, FM-11; step 8a2), and the second run and a
-re-registration (D.12, OPS-3, OPS-14, D-184; step 8b).
+D.11, E.1-E.3, M.1, M.7; X24; FM-5 to FM-7, FM-11; step 8a2), the second run and a
+re-registration (D.12, OPS-3, OPS-14, D-184; step 8b), and a client the vault registers (D.4's
+DCR branch, X7, OPS-2; FM-9; step 11).
 
 The fakes run over TLS on loopback (tests/fakes/harness.py), and every name reaches them through
 the fake resolver's dial map (tests/fakes/resolver.py, BP-1), so the vault's guarded onboarding
 client checks every address unchanged. The MCP fake serves ``mcp.notes.example`` (and, as a
 private host, ``mcp.lan.example``), the OAuth fake ``auth.notes.example``, and a third host
-answers every request with a redirect. Step 5's hostile switches each get a row here, except the
-registration answers (DCR, a later step), RFC 9207's ``iss`` (login, a later step) and a stalled
-registration (FM-9, with DCR).
+answers every request with a redirect. Step 5's hostile switches each get a row here, the
+registration answers and a stalled registration (FM-9) among them, except RFC 9207's ``iss``
+(login's).
 
 FM-5 and FM-6 shorten the fetch limits for the test (``test_fetch.py`` pins their values), so
 no test waits for long and none sleeps.
@@ -35,7 +36,14 @@ from tests.acceptance.tls import ProviderCA, issue_cert, make_ca
 from tests.fakes.connect_proxy import ConnectProxy, serve_proxy
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import OTHER_AS, McpFake, Switch
-from tests.fakes.oauth_server import METADATA_ELSEWHERE, AuthSwitch, FakeAuthServer
+from tests.fakes.oauth_server import (
+    BIDI_OVERRIDE,
+    METADATA_ELSEWHERE,
+    REGISTRATION_ACCESS_TOKEN,
+    REGISTRATION_CLIENT_PATH,
+    AuthSwitch,
+    FakeAuthServer,
+)
 from tests.fakes.resolver import TIMEOUT, FakeResolver
 from zoeymcp.common.policy import Policy, check_policy, parse_policy
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
@@ -572,19 +580,429 @@ async def test_the_operators_scopes_replace_the_ones_found(tmp_path: Path) -> No
 
 @pytest.mark.usefixtures("names", "mcp")
 async def test_without_a_client_id_registration_is_unavailable(
-    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Until the vault registers clients, whatever the metadata offers (D.4)."""
-    auth.registration = "open"
+    """D.4's order: no client ID, and no registration endpoint (or none with an authentication
+    the vault speaks), refuses before the operator is asked anything (step 11: with one, the
+    vault registers)."""
+    assert auth.registration == "none"
     async with running(tmp_path) as rig:
         status, body = await rig.refused(url=SERVER_URL)
         # The refused onboarding is gone: the same command starts afresh.
         assert len(rig.service._table) == 0
+        auth.registration = "cimd_only"
+        cimd = await rig.refused(url=SERVER_URL)
+        auth.registration = "open"
+        monkeypatch.setattr(auth, "_auth_methods", lambda: ["private_key_jwt"])
+        jwt = await rig.refused(url=SERVER_URL)
     assert (status, body["reason"]) == (409, "registration_unavailable")
     assert body["error"] == f"Register a client at {AUTH} and run again with its client ID."
+    assert cimd == (409, {**cimd[1], "reason": "cimd_only"})
+    assert cimd[1]["error"] == (
+        "This server registers clients by metadata document, which ZoeyMCP doesn't support "
+        f"yet. Register a client at {AUTH} and run again with its client ID."
+    )
+    assert (jwt[0], jwt[1]["reason"]) == (502, "dcr_auth_unsupported")
     assert auth.registrations == []
     refused = [r for r in records(lines) if r["event"] == "onboard_refused"]
-    assert refused == [{**refused[0], "reason": "registration_unavailable", "host": MCP}]
+    assert [r["reason"] for r in refused] == [
+        "registration_unavailable",
+        "cimd_only",
+        "dcr_auth_unsupported",
+    ]
+    assert refused[0] == {**refused[0], "reason": "registration_unavailable", "host": MCP}
+
+
+# --- a client the vault registers (D.4, D.7, D.8, X7; step 11) ------------------------------------
+
+DCR_REDIRECT = "http://127.0.0.1/callback/notes"
+CLIENT_ID_NAME = "notes-client-id"
+PORTAL_ORIGIN = "https://zoeymcp.tailnet.example"
+
+
+def predicted_binding() -> dict[str, Any]:
+    return oauth_binding(f"{ISSUER}/token", [f"https://{MCP}"])
+
+
+def dcr_meta(client_id: str, auth: str, expires: int | None = None) -> dict[str, Any]:
+    """D.7 step 4's meta, with what a run after a restart takes on (D.7 step 6)."""
+    return {
+        "onboarded": AUTH,
+        "resource": SERVER_URL,
+        "client_id": client_id,
+        "client_secret_expires_at": expires,
+        "client_auth": auth,
+        "redirect_uri": DCR_REDIRECT,
+    }
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_a_public_client_the_vault_registers(
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+) -> None:
+    """J1 (DCR) to the commit: no client ID and a registration endpoint allowing a public
+    client. One POST of public metadata after the confirmation, its answer checked, the
+    client's ID kept as notes-client-id under the predicted binding (OPS-2), and fragment 1
+    with the credential's own redirect address (D.6's backstop on); the second run deletes the
+    entry (D.8)."""
+    auth.registration = "open"
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        # Neither a fragment nor a secret before the registration: register makes them.
+        status, refused = await refusal_of(rig.service.fragment(plan["onboarding"], {}))
+        assert (status, refused["reason"]) == (400, "bad_body")
+        status, refused = await refusal_of(
+            rig.service.register(plan["onboarding"], {"client_secret": SECRET})
+        )
+        assert (status, refused["reason"]) == (400, "bad_body")
+        assert auth.registrations == []
+        made = await rig.service.register(plan["onboarding"], {})
+        again = await rig.service.register(plan["onboarding"], {})
+        indented = await rig.service.fragment(plan["onboarding"], {"indent": 4})
+        rig.policy = rig.merged(made["diff"]["yaml"])
+        names_before = rig.store.names()
+        compared = await rig.discover(url=SERVER_URL)
+    shown = plan["plan"]
+    assert (shown["registration"], shown["client_id"], shown["client_auth"]) == (
+        "dcr",
+        None,
+        "none",
+    )
+    assert (shown["redirect_uri"], shown["application_type"]) == (DCR_REDIRECT, "native")
+    assert shown["registration_endpoint"] == f"{ISSUER}/register"
+    assert "backstop_off" not in shown["notes"]
+    assert [
+        "Client",
+        f"registered at {AUTH} once you confirm (dynamic client registration)",
+    ] in plan["rows"]
+    assert ["Client name", "ZoeyMCP (notes)"] in plan["rows"]
+    assert plan["next"] == [{"do": "register", "label": "Register and make the YAML"}]
+    assert not [f for f in plan["draft_check"] if f["level"] == "error"]
+    [sent] = auth.registrations
+    assert json.loads(sent.body) == {
+        "client_name": "ZoeyMCP (notes)",
+        "redirect_uris": [DCR_REDIRECT],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "application_type": "native",
+        "scope": "notes.read offline_access",
+    }
+    assert "authorization" not in sent.headers
+    assert sent.headers["content-type"] == "application/json"
+    client_id = made["client_id"]
+    assert client_id in auth.registered
+    assert (made["client_auth"], made["secret_stored"], made["secret_name"]) == (
+        "none",
+        False,
+        None,
+    )
+    assert (made["client_secret_expires_at"], made["notes"]) == (None, [])
+    assert again == made
+    credential = load_mapping(made["diff"]["yaml"])["credentials"]["notes"]
+    assert credential == {
+        "kind": "oauth2",
+        "token_url": f"{ISSUER}/token",
+        "authorize_url": f"{ISSUER}/authorize",
+        "issuer": ISSUER,
+        "require_iss": True,
+        "revocation_url": f"{ISSUER}/revoke",
+        "resource_metadata": PRM_URL,
+        "client_id": client_id,
+        "client_auth": "none",
+        "refresh_token": "store:notes-refresh",
+        "rotates": True,
+        "redirect_uri": DCR_REDIRECT,
+        "scope": "notes.read offline_access",
+        "extra_params": {"resource": SERVER_URL},
+        "authorize_params": {"resource": SERVER_URL},
+    }
+    assert load_mapping(indented["diff"]["yaml"]) == load_mapping(made["diff"]["yaml"])
+    assert not [f for f in check_policy(rig.policy) if f.level == "error"]
+    # The ID is kept for a restart before the commit (OPS-2): not a secret, under the binding.
+    assert names_before == [CLIENT_ID_NAME]
+    # The second run, once the policy names the credential, deletes it.
+    assert compared["stage"] == "committed"
+    assert rig.store.names() == []
+    fetched = [r["fetch_kind"] for r in records(lines) if r["event"] == "discovery_fetch"]
+    assert fetched[:4] == ["probe", "prm", "as", "register"]
+    [planned, *_] = [r for r in records(lines) if r["event"] == "onboard_planned"]
+    assert (planned["registration"], planned["auth"]) == ("dcr", "none")
+    [registered] = [r for r in records(lines) if r["event"] == "onboard_registered"]
+    assert (registered["auth"], registered["secret_stored"]) == ("none", False)
+    assert [e for e in events(lines) if e.startswith("secret_")] == [
+        "secret_set",
+        "secret_deleted",
+    ]
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_a_public_clients_id_entry(tmp_path: Path, auth: FakeAuthServer) -> None:
+    auth.registration = "open"
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        made = await rig.service.register(plan["onboarding"], {})
+        entry = rig.store.entry(CLIENT_ID_NAME)
+        value = rig.store.get_for_binding(CLIENT_ID_NAME, predicted_binding())
+    assert entry is not None
+    assert entry.binding == predicted_binding()
+    assert entry.meta == dcr_meta(made["client_id"], "none")
+    assert value.reveal() == made["client_id"]
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_a_confidential_client_the_vault_registers_and_stores_its_secret(
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+) -> None:
+    """D.4, D.7: a server that takes no public client registers one with a secret, stored at
+    once under the predicted binding, its expiry in the meta (J's expiry codes read it)."""
+    auth.registration = "confidential_only"
+    auth.secret_expires_at = 1_900_000_000
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        made = await rig.service.register(plan["onboarding"], {})
+        texts = json.dumps(plan) + json.dumps(made)
+    assert (plan["plan"]["client_auth"], plan["plan"]["secret_given"]) == ("basic", True)
+    [sent] = auth.registrations
+    assert json.loads(sent.body)["token_endpoint_auth_method"] == "client_secret_basic"
+    client_id = made["client_id"]
+    secret = auth.registered[client_id].secret
+    assert secret is not None
+    assert (made["client_auth"], made["secret_stored"], made["secret_name"]) == (
+        "basic",
+        True,
+        SECRET_NAME,
+    )
+    assert made["client_secret_expires_at"] == 1_900_000_000
+    credential = load_mapping(made["diff"]["yaml"])["credentials"]["notes"]
+    assert (credential["client_id"], credential["client_secret"]) == (
+        client_id,
+        f"store:{SECRET_NAME}",
+    )
+    assert (credential["client_auth"], credential["rotates"]) == ("basic", False)
+    entry = rig.store.entry(SECRET_NAME)
+    assert entry is not None
+    assert entry.binding == predicted_binding()
+    assert entry.binding == derive_binding(rig.merged(made["diff"]["yaml"]), SECRET_NAME)
+    assert entry.meta == dcr_meta(client_id, "basic", 1_900_000_000)
+    stored, _ = rig.store.get_for_oauth(SECRET_NAME, token_url=f"{ISSUER}/token")
+    assert stored.reveal() == secret
+    assert rig.store.names() == [SECRET_NAME]
+    assert secret not in texts + lines.getvalue()
+    [registered] = [r for r in records(lines) if r["event"] == "onboard_registered"]
+    assert (registered["auth"], registered["secret_stored"]) == ("basic", True)
+
+
+@pytest.mark.usefixtures("names", "mcp")
+@pytest.mark.parametrize(
+    ("switch", "reason"),
+    [
+        (AuthSwitch.DCR_REDIRECT_CHANGED, "dcr_redirect_changed"),
+        (AuthSwitch.DCR_PRIVATE_KEY_JWT, "dcr_auth_unsupported"),
+        (AuthSwitch.DCR_SECRET_FOR_NONE, "dcr_bad_secret"),
+        (AuthSwitch.DCR_CLIENT_ID_SPACE, "dcr_bad_client_id"),
+        (AuthSwitch.DCR_CLIENT_ID_BIDI, "dcr_bad_client_id"),
+    ],
+)
+async def test_a_registration_answer_that_isnt_used(
+    tmp_path: Path, auth: FakeAuthServer, switch: AuthSwitch, reason: str, lines: io.StringIO
+) -> None:
+    """X7: each hostile answer refused by name, nothing stored; the onboarding stays, so a run
+    again registers anew."""
+    auth.registration = "open"
+    auth.switches = {switch}
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        status, body = await refusal_of(rig.service.register(plan["onboarding"], {}))
+        names = rig.store.names()
+        auth.switches = set()
+        made = await rig.service.register(plan["onboarding"], {})
+    assert (status, body["reason"]) == (502, reason)
+    assert body["error"] == CATALOGUE[reason].text
+    assert names == []
+    assert len(auth.registrations) == 2
+    assert made["stage"] == "registered"
+    assert events(lines).count("onboard_registered") == 1
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_the_servers_refusal_is_shown_to_the_operator_alone(
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+) -> None:
+    """D.4: a 400's error code filtered, its description cleaned, capped and revealed, in the
+    answer only; and a server that wants an initial access token is dcr_failed (D-179)."""
+    auth.registration = "open"
+    auth.switches = {AuthSwitch.DCR_ERROR_INJECTED}
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        status, body = await refusal_of(rig.service.register(plan["onboarding"], {}))
+        auth.switches = set()
+        auth.registration = "needs_initial_token"
+        failed = await refusal_of(rig.service.register(plan["onboarding"], {}))
+    assert (status, body["reason"]) == (502, "dcr_refused")
+    assert body["error"] == (
+        "The authorization server refused the registration (invalid_client_metadata), so no "
+        "client was registered."
+    )
+    said = body["description"]
+    assert said.startswith("Bad metadata[U+000D] X-Injected: 1 [U+202E]<b>Approve</b>")
+    assert BIDI_OVERRIDE not in said
+    assert "Bad metadata" not in lines.getvalue()
+    assert failed[0] == 502
+    assert failed[1]["reason"] == "dcr_failed"
+    assert "(HTTP 401)" in failed[1]["error"]
+    assert rig.store.names() == []
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_a_registration_access_token_and_uri_are_never_kept(
+    tmp_path: Path, auth: FakeAuthServer, lines: io.StringIO
+) -> None:
+    """D-148, X19: the answer's RFC 7592 token and URI are dropped unread: in no answer, line,
+    entry or fragment."""
+    auth.registration = "confidential_only"
+    auth.switches = {AuthSwitch.DCR_ACCESS_TOKEN}
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        made = await rig.service.register(plan["onboarding"], {})
+        again = await rig.service.fragment(plan["onboarding"], {"indent": "compose"})
+        entry = rig.store.entry(SECRET_NAME)
+    assert entry is not None
+    swept = json.dumps([plan, made, again, entry.meta]) + lines.getvalue()
+    assert REGISTRATION_ACCESS_TOKEN not in swept
+    assert REGISTRATION_CLIENT_PATH not in swept
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_registration_timeout(
+    tmp_path: Path, auth: FakeAuthServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-9: dcr_failed at the registration's own limit; the server may have registered a
+    client (D-155), and the run again registers anew."""
+    auth.registration = "open"
+    auth.switches = {AuthSwitch.STALL_REGISTER}
+    monkeypatch.setattr(fetch, "REGISTRATION_TIMEOUT", 0.5)
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        started = time.monotonic()
+        status, body = await refusal_of(rig.service.register(plan["onboarding"], {}))
+        took = time.monotonic() - started
+        held = rig.store.names()
+        auth.switches = set()
+        made = await rig.service.register(plan["onboarding"], {})
+    assert (status, body["reason"]) == (502, "dcr_failed")
+    assert body["error"] == (
+        "The authorization server didn't answer the registration as needed (timeout). It may "
+        "have registered a client anyway; the next run registers a new one."
+    )
+    assert took < 5
+    assert held == []
+    assert len(auth.registrations) == 2
+    assert made["stage"] == "registered"
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_the_redirect_a_registration_asks_for(tmp_path: Path, auth: FakeAuthServer) -> None:
+    """D.4: --redirect-uri with a loopback port is registered exactly as given; a portal origin
+    from admin.origins registers its callback, as a web client; an origin not listed, or one
+    beside a given client or address, is refused."""
+    auth.registration = "open"
+    loopback = "http://127.0.0.1:8765/callback/notes"
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL, redirect_uri=loopback)
+        made = await rig.service.register(plan["onboarding"], {})
+        await rig.service.cancel(plan["onboarding"])
+        portal = await rig.discover(url=SERVER_URL, callback_origin=PORTAL_ORIGIN, name="files")
+        portal_made = await rig.service.register(portal["onboarding"], {})
+        await rig.service.cancel(portal["onboarding"])
+        unlisted = await rig.refused(url=SERVER_URL, callback_origin="https://other.example")
+        given = await rig.refused(**PUBLIC, callback_origin=PORTAL_ORIGIN)
+        both = await rig.refused(
+            url=SERVER_URL, callback_origin=PORTAL_ORIGIN, redirect_uri=loopback
+        )
+    first, second = (json.loads(sent.body) for sent in auth.registrations)
+    assert (first["redirect_uris"], first["application_type"]) == ([loopback], "native")
+    assert (plan["plan"]["redirect_uri"], plan["plan"]["application_type"]) == (loopback, "native")
+    assert "backstop_off" not in plan["plan"]["notes"]
+    assert load_mapping(made["diff"]["yaml"])["credentials"]["notes"]["redirect_uri"] == loopback
+    callback = f"{PORTAL_ORIGIN}/oauth/callback/files"
+    assert (second["redirect_uris"], second["application_type"]) == ([callback], "web")
+    assert (second["client_name"], portal["plan"]["application_type"]) == ("ZoeyMCP (files)", "web")
+    fragment = load_mapping(portal_made["diff"]["yaml"])
+    assert fragment["credentials"]["files"]["redirect_uri"] == callback
+    assert not [
+        f for f in check_policy(rig.merged(portal_made["diff"]["yaml"])) if f.level == "error"
+    ]
+    for status, body in (unlisted, given, both):
+        assert (status, body["reason"]) == (400, "bad_body")
+    assert "admin.origins" in unlisted[1]["detail"]
+    assert len(auth.registrations) == 2
+
+
+@pytest.mark.usefixtures("names", "mcp")
+@pytest.mark.parametrize(
+    ("mode", "name"), [("open", CLIENT_ID_NAME), ("confidential_only", SECRET_NAME)]
+)
+async def test_after_a_restart_a_registered_client_shows_fragment_1_again(
+    tmp_path: Path, auth: FakeAuthServer, mode: str, name: str
+) -> None:
+    """D.7 step 6 for DCR (FM-2): the entry the registration wrote is found by its meta, its
+    binding (and a public client's ID, its value) checked against a fresh discovery, and
+    fragment 1 shown again with nothing registered or stored again."""
+    auth.registration = mode  # type: ignore[assignment]
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        made = await rig.service.register(plan["onboarding"], {})
+        rig.restart()
+        again = await rig.discover(url=SERVER_URL)
+        shown = await rig.service.fragment(again["onboarding"], {})
+        # Another redirect address isn't the registered client's: its names stay taken.
+        rig.restart()
+        moved = await rig.refused(
+            url=SERVER_URL, name="notes", redirect_uri="http://127.0.0.1:8765/callback/notes"
+        )
+        assert (moved[0], moved[1]["reason"]) == (409, "name_taken")
+        # A public client's ID entry whose value isn't the meta's: its names stay taken.
+        if name == CLIENT_ID_NAME:
+            entry = rig.store.entry(name)
+            assert entry is not None
+            rig.store.put(name, "another-client", entry.binding, meta=entry.meta)
+            rig.restart()
+            tampered = await rig.refused(url=SERVER_URL, name="notes")
+            assert (tampered[0], tampered[1]["reason"]) == (409, "name_taken")
+    assert again["stage"] == "registered"
+    assert again["names"] == plan["names"]
+    assert shown["diff"]["yaml"] == made["diff"]["yaml"]
+    assert len(auth.registrations) == 1
+    label = "Client secret" if name == SECRET_NAME else "Client ID entry"
+    assert [
+        label,
+        f"{name}, stored by an earlier run; nothing is registered or stored again",
+    ] in again["rows"]
+
+
+@pytest.mark.usefixtures("names", "mcp")
+async def test_a_reregistration_registers_a_new_client(
+    tmp_path: Path, auth: FakeAuthServer
+) -> None:
+    """OPS-3 for DCR: --reregister with no client ID registers again under the committed names,
+    replacing the credential's client and the stored client-ID entry."""
+    auth.registration = "open"
+    async with running(tmp_path) as rig:
+        plan = await rig.discover(url=SERVER_URL)
+        first = await rig.service.register(plan["onboarding"], {})
+        rig.policy = rig.merged(first["diff"]["yaml"])
+        plan = await rig.discover(url=SERVER_URL, reregister=True)
+        made = await rig.service.register(plan["onboarding"], {})
+        value = rig.store.get_for_binding(CLIENT_ID_NAME, predicted_binding())
+    assert plan["plan"]["registration"] == "dcr"
+    assert made["client_id"] != first["client_id"]
+    assert "# changed: notes (client_id)" in made["diff"]["yaml"].splitlines()
+    replaced = rig.merged(made["diff"]["yaml"]).credentials["notes"]
+    assert isinstance(replaced, OAuth2Credential)
+    assert (replaced.client_id, replaced.redirect_uri) == (made["client_id"], DCR_REDIRECT)
+    assert value.reveal() == made["client_id"]
+    assert len(auth.registrations) == 2
 
 
 # --- the legacy server with no protected-resource metadata (D.2a) --------------------------------

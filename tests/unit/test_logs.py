@@ -12,6 +12,7 @@ from zoeymcp.portal.actions import Action, Actions, HeldData
 from zoeymcp.portal.sessions import Ceremonies, Ceremony, SessionToken
 from zoeymcp.portal.setupcode import SetupCode
 from zoeymcp.vault import logs
+from zoeymcp.vault.oauth.dcr import Registration
 from zoeymcp.vault.oauth.protocol import Client, RevocationMaterial
 from zoeymcp.vault.onboarding import Names, OnboardingRecord, Options
 from zoeymcp.vault.store import Secret
@@ -189,6 +190,17 @@ def test_revocation_material_is_refused_nested(lines: io.StringIO) -> None:
         with pytest.raises(TypeError, match=message):
             logs.event("oops", f=wrapped)
     assert RevocationMaterial in common_logs.refused_types()
+    assert lines.getvalue() == ""
+
+
+def test_a_registration_is_refused_nested(lines: io.StringIO) -> None:
+    """M7 M.5: a checked registration holds the client secret its server issued (D.4)."""
+    made = Registration("issued-client-1", "basic", Secret("fake-dcr-secret"), None)
+    message = r"^refusing to log a secret \(Registration\) in field 'f'$"
+    for wrapped in (made, [made], {"outer": [{"inner": (made,)}]}):
+        with pytest.raises(TypeError, match=message):
+            logs.event("oops", f=wrapped)
+    assert Registration in common_logs.refused_types()
     assert lines.getvalue() == ""
 
 
