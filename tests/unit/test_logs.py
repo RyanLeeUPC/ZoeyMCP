@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from zoeymcp.bridge.admit import BridgeTokenHash
 from zoeymcp.common import logs as common_logs
 from zoeymcp.egress.allowlist import EgressKey
 from zoeymcp.portal.actions import Action, Actions, HeldData
@@ -213,6 +214,17 @@ def test_the_egress_key_is_refused_nested(lines: io.StringIO) -> None:
         with pytest.raises(TypeError, match=message):
             common_logs.Log("egress").event("oops", f=wrapped)
     assert EgressKey in common_logs.refused_types()
+    assert lines.getvalue() == ""
+
+
+def test_the_bridge_token_hash_is_refused_nested(lines: io.StringIO) -> None:
+    """M7 M.5: a bridge token's hash is never logged (M.4), in whichever line it would land."""
+    held = BridgeTokenHash("sha256:" + "ab" * 32)
+    message = r"^refusing to log a secret \(BridgeTokenHash\) in field 'f'$"
+    for wrapped in (held, [held], {"outer": [{"inner": (held,)}]}):
+        with pytest.raises(TypeError, match=message):
+            logs.event("oops", f=wrapped)
+    assert BridgeTokenHash in common_logs.refused_types()
     assert lines.getvalue() == ""
 
 

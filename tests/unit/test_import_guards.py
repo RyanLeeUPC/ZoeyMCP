@@ -36,6 +36,11 @@ GATEWAY_SIDE = ("gateway", "common", "toolkit")
 # The egress role (M7 design I.4, O.2): the standard library, netguard and the log writer only.
 EGRESS_SIDE = ("egress", "common")
 EGRESS_ALLOWED = ("zoeymcp.egress", "zoeymcp.common.netguard", "zoeymcp.common.logs")
+# The bridge (M7 design C.1, O.2): run from the vault's environment, it may import Starlette,
+# uvicorn, the standard library and common, and none of the MCP SDK, the gateway's or the
+# vault's code.
+BRIDGE_SIDE = ("bridge", "common")
+BRIDGE_PACKAGES = ("starlette", "uvicorn")
 # What the gateway's code and its entry path must never load: the vault side without common.
 VAULT_ONLY = ("zoeymcp.vault", "zoeymcp.portal", "zoeymcp.selftest", "zoeymcp.entrypoint")
 # The one toolkit module that may use the gateway's code: a test helper (M4 design G.1).
@@ -295,7 +300,7 @@ def test_gateway_code_never_imports_vault_code() -> None:
 
 def test_every_subpackage_has_a_side() -> None:
     """A new subpackage must be placed, so no guard misses it."""
-    placed = {*VAULT_SIDE, *GATEWAY_SIDE, *EGRESS_SIDE, CLI}
+    placed = {*VAULT_SIDE, *GATEWAY_SIDE, *EGRESS_SIDE, *BRIDGE_SIDE, CLI}
     found = {p.parent.name for p in PACKAGE.glob("*/__init__.py")}
     assert found - placed == set()
     assert placed - found == set()
@@ -375,6 +380,26 @@ def test_the_egress_role_uses_the_standard_library_netguard_and_logs_only() -> N
             elif top and top not in sys.stdlib_module_names and top != "__future__":
                 found.append(f"{path.name}: {name}")
     assert found == []
+
+
+def test_the_bridge_uses_the_standard_library_starlette_uvicorn_and_common_only() -> None:
+    """The bridge's code (``BRIDGE_SIDE``'s first entry) imports no MCP SDK and nothing of the
+    gateway's, the vault's or any other role's (M7 design C.1, DD-3)."""
+    allowed = ("zoeymcp.bridge", "zoeymcp.common")
+    found = []
+    paths = sorted((PACKAGE / BRIDGE_SIDE[0]).rglob("*.py"))
+    assert len(paths) >= 6
+    for path in paths:
+        for name in imported_modules(path, module_name(path, PACKAGE.parent)):
+            top = name.partition(".")[0]
+            if top == "zoeymcp":
+                if not any(name == a or name.startswith(a + ".") for a in allowed):
+                    found.append(f"{path.name}: {name}")
+            elif top not in (*BRIDGE_PACKAGES, "__future__", *sys.stdlib_module_names):
+                found.append(f"{path.name}: {name}")
+    assert found == []
+    forbidden = ["zoeymcp.gateway", *VAULT_ONLY, *sorted(gateway_only_modules())]
+    assert violations(PACKAGE.parent, BRIDGE_SIDE, forbidden) == []
 
 
 def test_netguard_uses_the_standard_library_only() -> None:
@@ -476,6 +501,15 @@ def test_loading_the_egress_role_loads_none_of_our_other_code() -> None:
         "zoeymcp.common.logs",
         "zoeymcp.common.netguard",
     }
+
+
+def test_loading_the_bridge_loads_no_gateway_vault_or_sdk_code() -> None:
+    blocked = gateway_only_modules()
+    loaded = loaded_modules([f"zoeymcp.{BRIDGE_SIDE[0]}"], sorted(blocked))
+    ours = {name for name in loaded if name.partition(".")[0] == "zoeymcp"}
+    assert {"zoeymcp.bridge.admit", "zoeymcp.bridge.relay", "zoeymcp.common.canonical"} <= ours
+    assert ours - _within(ours, "zoeymcp.bridge") - _within(ours, "zoeymcp.common") == {"zoeymcp"}
+    assert not {name.partition(".")[0] for name in loaded} & blocked
 
 
 def test_loading_gateway_code_loads_no_vault_code() -> None:

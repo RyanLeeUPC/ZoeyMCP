@@ -173,6 +173,11 @@ only_mutate = [
     "*zoeymcp/entrypoint/env.py",
     "*zoeymcp/cli/choices.py",
     "*zoeymcp/egress/connect.py",
+    "*zoeymcp/bridge/admit.py",
+    "*zoeymcp/bridge/framing.py",
+    "*zoeymcp/bridge/relay.py",
+    "*zoeymcp/bridge/sessions.py",
+    "*zoeymcp/bridge/childenv.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene, import-guard and mutation-script tests check the repository itself (the lock, the
