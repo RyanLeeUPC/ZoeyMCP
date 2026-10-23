@@ -4,7 +4,9 @@ M7 (design J, step 10b): a stored client secret held to D.7 step 5 as login hold
 ``resource_metadata_changed``, the challenged scope and its ``widen_scope`` fragment, and an
 onboarding's secret waiting for its credential; (step 11) a registered client's secret near or
 past its expiry, on the wall clock; (step 16) the address guard's refusals, ``address_refused``;
-(step 17b) an egress role that stopped fetching its lists, ``egress_allowlist_stale`` (COV-7).
+(step 17b) an egress role that stopped fetching its lists, ``egress_allowlist_stale`` (COV-7);
+(step 18d) the bridges' routes: ``program_unconfined``, ``loopback_bridge_route``,
+``bridge_socket_unknown`` and ``program_secret_unflagged`` (C.10, Q46).
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -21,6 +23,7 @@ from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.vault import health
 from zoeymcp.vault.bindings import BindingError, client_secret_rebound, oauth_binding
 from zoeymcp.vault.connectors.sendjournal import DAY_MS, Journal
 from zoeymcp.vault.health import (
@@ -28,6 +31,7 @@ from zoeymcp.vault.health import (
     ONBOARDING_SUFFIXES,
     REGRESSION_DAYS,
     STALE_SECONDS,
+    Bridges,
     Inputs,
     LedgerCopy,
     PasskeyState,
@@ -1532,6 +1536,264 @@ def test_a_stale_role_follows_the_refused_routes() -> None:
     assert codes(found["egress"]) == ["address_refused", "egress_allowlist_stale"]
     assert found["egress"]["level"] == "error"
     assert found["summary"]["warning"] == report(egress_policy())["summary"]["warning"] + 1
+
+
+# --- the bridges' routes (M7 design C.10, J, step 18d) ------------------------------------------
+
+MCP_RULES = [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}]
+STANDARD = Bridges(link=True)
+UNCONFINED = (
+    "nothing in the standard tier confines this program: it can reach every listener in the "
+    "container, the host's network and the internet"
+)
+
+
+def bridge_policy(
+    upstreams: Mapping[str, str],
+    programs: Mapping[str, dict[str, Any]] | None = None,
+    served: bool = True,
+) -> Policy:
+    """A route per name with its own token, plain http only where it is, each a gateway
+    server's (so a local MCP route) when ``served``, and with ``programs`` its program block."""
+    routes: list[dict[str, Any]] = []
+    for name, upstream in upstreams.items():
+        route: dict[str, Any] = {
+            "name": name,
+            "prefix": f"/{name}",
+            "upstream": upstream,
+            "allow_insecure_upstream": upstream.startswith("http:"),
+            "credential": name,
+            "callers": ["gateway"],
+            "stream": True,
+            "rules": MCP_RULES,
+        }
+        if name in (programs or {}):
+            route["program"] = (programs or {})[name]
+        routes.append(route)
+    return Policy.model_validate(
+        {
+            **BASE,
+            "credentials": {name: header(f"store:{name}-token") for name in upstreams},
+            "routes": routes,
+            "gateway": {
+                "servers": {name: {"kind": "remote", "route": name} for name in upstreams}
+                if served
+                else {}
+            },
+        }
+    )
+
+
+def egress_findings(policy: Policy, bridges: Bridges) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = report(policy, bridges=bridges)["egress"]["findings"]
+    return findings
+
+
+def fix(route: str) -> dict[str, str]:
+    return {"kind": "fix_policy", "route": route}
+
+
+def unconfined(route: str) -> dict[str, Any]:
+    return finding("program_unconfined", "info", f"route {route}: {UNCONFINED}", None)
+
+
+def loopback(route: str, key: str) -> dict[str, Any]:
+    text = (
+        f"route {route}: any process in this container can listen on {key} first and receive "
+        "this route's token; a bridge under the launcher listens on "
+        "unix:/run/zoeymcp-bridge-<name>/mcp.sock"
+    )
+    return finding("loopback_bridge_route", "error", text, fix(route))
+
+
+def unknown(route: str, bridge: str) -> dict[str, Any]:
+    text = f"route {route}: the route answers 502: no bridge {bridge} runs in this container"
+    return finding("bridge_socket_unknown", "error", text, fix(route))
+
+
+def unflagged(route: str) -> dict[str, Any]:
+    text = (
+        f"route {route}: this route's program holds a real secret, and check can't warn about it "
+        "until program.holds_secret is set"
+    )
+    return finding("program_secret_unflagged", "warning", text, fix(route))
+
+
+ROUTES = {
+    "sock": "unix:/run/zoeymcp-bridge-fetch/mcp.sock",
+    "lit": "http://127.0.0.1:9000",
+    "lh": "http://localhost:9000",
+    "prog": "https://api.example",
+    "lan": "http://10.0.0.5:9000",
+    "plain": "https://other.example",
+}
+
+
+def test_program_unconfined_with_the_link_socket_only() -> None:
+    """A program block, a unix: upstream, a local MCP route to loopback: each unconfined in the
+    standard tier; a private address or an ordinary route isn't."""
+    policy = bridge_policy(ROUTES, {"prog": {"holds_secret": False}})
+    named = Bridges(link=True, named=frozenset({"fetch"}))
+    assert egress_findings(policy, named) == [
+        unconfined("sock"),
+        unconfined("lit"),
+        loopback("lit", "127.0.0.1:9000"),
+        unconfined("lh"),
+        loopback("lh", "localhost:9000"),
+        unconfined("prog"),
+    ]
+    found = report(policy, bridges=named)
+    assert found["egress"]["level"] == "error"
+    assert found["summary"]["info"] == report(policy)["summary"]["info"] + 4
+    # The hardened tier: nothing here is unconfined, and no launcher named the socket's bridge.
+    assert egress_findings(policy, Bridges()) == [unknown("sock", "fetch")]
+    assert egress_findings(policy, Bridges(named=frozenset({"fetch"}))) == []
+
+
+@pytest.mark.parametrize(
+    ("upstream", "key"),
+    [
+        ("http://127.0.0.1:9000", "127.0.0.1:9000"),
+        ("http://127.8.0.1", "127.8.0.1:80"),
+        ("http://[::1]:9000", "[::1]:9000"),
+        ("http://LocalHost:9000", "localhost:9000"),
+    ],
+)
+def test_a_loopback_bridge_route(upstream: str, key: str) -> None:
+    policy = bridge_policy({"fetch": upstream})
+    assert egress_findings(policy, STANDARD) == [unconfined("fetch"), loopback("fetch", key)]
+    assert egress_findings(policy, Bridges()) == []
+
+
+@pytest.mark.parametrize(
+    ("upstream", "loopback"),
+    [
+        ("http://localhost:1", True),
+        ("http://a.localhost:1", True),
+        ("http://a.LOCALHOST:1", True),
+        ("http://127.0.0.1:1", True),
+        ("http://[::1]:1", True),
+        ("http://[::ffff:127.0.0.9]:1", True),
+        ("http://localhost.example:1", False),
+        ("http://notlocalhost:1", False),
+        ("http://10.0.0.1:1", False),
+        ("http://[::ffff:10.0.0.1]:1", False),
+        ("http://[fd00::1]:1", False),
+        ("http://bridge-fetch-mcp:1", False),
+    ],
+)
+def test_what_is_loopback(upstream: str, loopback: bool) -> None:
+    """CR-B8: localhost and every name under it, as row 7b reads them."""
+    assert health._loopback(upstream) is loopback
+
+
+def test_a_mapped_loopback_literal_is_loopback() -> None:
+    policy = bridge_policy({"fetch": "http://[::ffff:127.0.0.1]:9000"})
+    assert codes(report(policy, bridges=STANDARD)["egress"]) == [
+        "program_unconfined",
+        "loopback_bridge_route",
+    ]
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    ["http://10.0.0.5:9000", "http://[fd00::5]:9000", "http://bridge-fetch-mcp:9000"],
+)
+def test_a_local_route_off_loopback_isnt_squattable(upstream: str) -> None:
+    assert egress_findings(bridge_policy({"fetch": upstream}), STANDARD) == []
+
+
+def test_only_a_local_mcp_route_is_a_loopback_bridge_route() -> None:
+    """Not a gateway server's route, so not a local MCP route: the vault sends it as any route."""
+    policy = bridge_policy({"fetch": "http://127.0.0.1:9000"}, served=False)
+    assert egress_findings(policy, STANDARD) == []
+    # A program block on it is still unconfined.
+    policy = bridge_policy({"fetch": "http://127.0.0.1:9000"}, {"fetch": {}}, served=False)
+    assert egress_findings(policy, STANDARD) == [unconfined("fetch")]
+
+
+def test_bridge_socket_unknown() -> None:
+    policy = bridge_policy(
+        {
+            "fetch": "unix:/run/zoeymcp-bridge-fetch/mcp.sock",
+            "notes": "unix:/run/zoeymcp-bridge-notes/mcp.sock",
+        }
+    )
+    # Named: nothing but the unconfined program.
+    both = Bridges(link=True, named=frozenset({"fetch", "notes"}))
+    assert egress_findings(policy, both) == [unconfined("fetch"), unconfined("notes")]
+    # An unknown name.
+    one = Bridges(link=True, named=frozenset({"fetch", "other"}))
+    assert egress_findings(policy, one) == [
+        unconfined("fetch"),
+        unconfined("notes"),
+        unknown("notes", "notes"),
+    ]
+    # Any unix: upstream without --bridge, in either tier.
+    assert egress_findings(policy, STANDARD) == [
+        unconfined("fetch"),
+        unknown("fetch", "fetch"),
+        unconfined("notes"),
+        unknown("notes", "notes"),
+    ]
+    assert egress_findings(policy, Bridges()) == [
+        unknown("fetch", "fetch"),
+        unknown("notes", "notes"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("program", "bridges", "flagged"),
+    [
+        (None, Bridges(True, frozenset({"fetch"}), frozenset({"fetch"})), True),
+        ({}, Bridges(True, frozenset({"fetch"}), frozenset({"fetch"})), True),
+        ({"holds_secret": False}, Bridges(True, frozenset({"fetch"}), frozenset({"fetch"})), True),
+        ({"holds_secret": True}, Bridges(True, frozenset({"fetch"}), frozenset({"fetch"})), False),
+        # Its ARGS hold no --secret-env.
+        (None, Bridges(True, frozenset({"fetch"}), frozenset({"notes"})), False),
+        # The hardened tier has no such bridge.
+        (None, Bridges(False, frozenset({"fetch"}), frozenset({"fetch"})), False),
+    ],
+)
+def test_program_secret_unflagged(
+    program: dict[str, Any] | None, bridges: Bridges, flagged: bool
+) -> None:
+    programs = {} if program is None else {"fetch": program}
+    policy = bridge_policy({"fetch": "unix:/run/zoeymcp-bridge-fetch/mcp.sock"}, programs)
+    found = egress_findings(policy, bridges)
+    assert (unflagged("fetch") in found) is flagged
+    if flagged:
+        assert found == [unconfined("fetch"), unflagged("fetch")]
+        assert report(policy, bridges=bridges)["egress"]["level"] == "warning"
+
+
+def test_a_secret_bridge_flags_only_its_own_route() -> None:
+    policy = bridge_policy(
+        {
+            "fetch": "unix:/run/zoeymcp-bridge-fetch/mcp.sock",
+            "notes": "unix:/run/zoeymcp-bridge-notes/mcp.sock",
+            "lit": "http://127.0.0.1:9000",
+        }
+    )
+    bridges = Bridges(True, frozenset({"fetch", "notes"}), frozenset({"notes"}))
+    assert codes(report(policy, bridges=bridges)["egress"]) == [
+        "program_unconfined",
+        "program_unconfined",
+        "program_secret_unflagged",
+        "program_unconfined",
+        "loopback_bridge_route",
+    ]
+
+
+def test_the_routes_follow_the_refusals_and_precede_the_role() -> None:
+    policy = bridge_policy({"fetch": "unix:/run/zoeymcp-bridge-fetch/mcp.sock"})
+    found = report(policy, bridges=STANDARD, egress_fetched_ago=301)
+    assert codes(found["egress"]) == [
+        "program_unconfined",
+        "bridge_socket_unknown",
+        "egress_allowlist_stale",
+    ]
+    assert Inputs(policy, (), frozenset()).bridges == Bridges(False, frozenset(), frozenset())
 
 
 # --- connectors --------------------------------------------------------------------------------

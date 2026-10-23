@@ -48,6 +48,11 @@ A bridge's token (M7 design C.2, M.4, X14, step 18c2), made by ``secret set --ge
 the store and the requests the bridge checks, and no answer or log line; neither does its hash,
 which only the generating answer shows. A ``--secret-env`` or ``--env`` value a child prints to
 stderr reaches no log line in the default mode, which counts (TI-13).
+
+Under the standard launcher (M7 design C.10, TI-B7, step 18d), a bridge's ``ENV_*`` secret
+reaches that bridge's environment and the vault's, never the gateway's, another bridge's, a
+command line or a log line; and ``launcher_bridge_refused`` holds no value from ARGS, a token
+hash or an ``ENV_*`` variable, whatever shape refused it.
 """
 
 from __future__ import annotations
@@ -56,8 +61,10 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
-from collections.abc import Iterator
+import stat
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +99,7 @@ from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.egress.allowlist import Allowlist, KeySource
+from zoeymcp.entrypoint import launcher
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
@@ -1900,3 +1908,93 @@ async def test_a_childs_stderr_shows_no_env_value_by_default(log_lines: io.Strin
         assert value not in text
         assert value not in str(refused.value)
         assert value not in repr(child.spec)
+
+
+# --- a standard-tier bridge's configuration (M7 design C.10, TI-B7, step 18d) -------------------
+
+BRIDGE_ENV_SECRET = "leak-bridge-env-secret-sentinel-01"
+BRIDGE_ARGS_SENTINEL = "leak-bridge-args-sentinel-01"
+
+
+class Launched:
+    """The launcher's children as a fake ``spawn`` records them, and its directory checks
+    answered by a ``stat`` that gives each bridge's tmpfs the uid in ``uids``."""
+
+    def __init__(self, uids: dict[str, int]) -> None:
+        self.uids = uids
+        self.children: list[tuple[str, list[str], dict[str, str]]] = []
+
+    def spawn(
+        self, name: str, argv: Callable[[int], list[str]], uid: int, environ: Mapping[str, str]
+    ) -> launcher.Child:
+        fd = 4 + len(self.children)
+        self.children.append((name, argv(fd), dict(environ)))
+        return launcher.Child(name, 100 + fd, fd)
+
+    def stat(self, path: str) -> os.stat_result:
+        uid = self.uids[path.removeprefix("/run/zoeymcp-bridge-")]
+        return os.stat_result((stat.S_IFDIR | 0o750, 1, 1, 1, uid, 10001, 0, 0, 0, 0))
+
+
+def test_a_bridges_env_secret_reaches_its_bridge_alone(log_lines: io.StringIO) -> None:
+    """An ``ENV_*`` secret reaches its own bridge, under its plain name, and the vault, which gets
+    the whole environment as it always has; never the gateway, another bridge, a command line
+    (readable by every process in the container) or a log line."""
+    environ = {
+        "PATH": "/usr/bin",
+        "ZOEYMCP_MASTER_KEY": "leak-master-key",
+        "ZOEYMCP_BRIDGE_FETCH_ARGS": json.dumps(
+            ["--era", "legacy", "--secret-env", "API_KEY", "--", "fetch-server"]
+        ),
+        "ZOEYMCP_BRIDGE_FETCH_ENV_API_KEY": BRIDGE_ENV_SECRET,
+        "ZOEYMCP_BRIDGE_NOTES_ARGS": json.dumps(["--era", "modern", "--", "notes-server"]),
+    }
+    launched = Launched({"fetch": 10100, "notes": 10101})
+    options = launcher.Options(bridges=("fetch", "notes"))
+    launcher.start(options, environ, spawn=launched.spawn, stat_path=launched.stat)
+    holders = []
+    for name, argv, child_environ in launched.children:
+        assert BRIDGE_ENV_SECRET not in " ".join(argv)
+        if BRIDGE_ENV_SECRET in child_environ.values():
+            holders.append(name)
+    assert holders == ["vault", "bridge:fetch"]
+    assert launched.children[2][2]["API_KEY"] == BRIDGE_ENV_SECRET
+    assert "leak-master-key" not in launched.children[2][2].values()
+    assert BRIDGE_ENV_SECRET not in log_lines.getvalue()
+
+
+def test_no_args_value_reaches_a_refused_bridges_line(log_lines: io.StringIO) -> None:
+    """``launcher_bridge_refused`` names a variable, a position or the directory, never what
+    ARGS, the token hash or an ``ENV_*`` value hold (TI-B7): a sentinel in every refused shape."""
+    sentinel = BRIDGE_ARGS_SENTINEL
+    environ = {
+        # Not JSON, holding the sentinel.
+        "ZOEYMCP_BRIDGE_A_ARGS": f'["--era", "{sentinel}"',
+        # Each launcher option, alone and with its value, and --egress-proxy.
+        "ZOEYMCP_BRIDGE_B_ARGS": json.dumps(
+            [
+                f"--listen=unix:/{sentinel}",
+                "--peer-uid",
+                sentinel,
+                f"--work-dir={sentinel}",
+                "--control-fd",
+                sentinel,
+                f"--egress-proxy=http://{sentinel}:3128",
+                sentinel,
+            ]
+        ),
+        "ZOEYMCP_BRIDGE_B_TOKEN_SHA256": sentinel,
+        "ZOEYMCP_BRIDGE_B_ENV_ZOEYMCP_TOKEN": sentinel,
+        "ZOEYMCP_BRIDGE_B_ENV_": sentinel,
+        # Well-formed, refused for its directory alone.
+        "ZOEYMCP_BRIDGE_C_ARGS": json.dumps(["--era", sentinel, "--", sentinel, sentinel]),
+        "ZOEYMCP_BRIDGE_C_TOKEN_SHA256": sentinel,
+        "ZOEYMCP_BRIDGE_C_ENV_KEY": sentinel,
+    }
+    launched = Launched({"a": 10100, "b": 10101, "c": 0})
+    options = launcher.Options(bridges=("a", "b", "c", f"{sentinel}!"))
+    launcher.start(options, environ, spawn=launched.spawn, stat_path=launched.stat)
+    assert [name for name, _, _ in launched.children] == ["vault", "gateway"]
+    text = log_lines.getvalue()
+    assert text.count('"event":"launcher_bridge_refused"') == 4
+    assert sentinel not in text

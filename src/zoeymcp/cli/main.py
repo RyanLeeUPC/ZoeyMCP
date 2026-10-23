@@ -419,8 +419,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "The standard tier's entrypoint, PID 1 of a container started as root with "
             "cap_drop: [ALL], cap_add: [SETUID, SETGID] and no-new-privileges. It starts the "
-            "vault as uid 10001 and the gateway as uid 10002, linked by a Unix socket, then "
-            "drops to uid 10003 with an empty environment and supervises them."
+            "vault as uid 10001 and the gateway as uid 10002, linked by a Unix socket, and each "
+            "--bridge as uid 10100 and up, then drops to uid 10003 with an empty environment "
+            "and supervises them."
         ),
     )
     standard.add_argument(
@@ -440,6 +441,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--unsafe-skip-checks",
         action="store_true",
         help="skip the NoNewPrivs and capability checks (development only)",
+    )
+    standard.add_argument(
+        "--bridge",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "also run bridge NAME, unconfined, from ZOEYMCP_BRIDGE_<NAME>_ARGS, _TOKEN_SHA256 "
+            "and _ENV_*, on unix:/run/zoeymcp-bridge-NAME/mcp.sock (repeatable; at most 8)"
+        ),
     )
     standard.add_argument("--supervise", action="append", default=[], help=argparse.SUPPRESS)
 
@@ -972,6 +983,7 @@ def _cmd_standard(args: argparse.Namespace, err: TextIO) -> int:
                 gateway_listen=args.gateway_listen,
                 vault_listens=tuple(args.vault_listen),
                 unsafe_skip_checks=args.unsafe_skip_checks,
+                bridges=tuple(args.bridge),
             ),
             os.environ,
         )

@@ -250,6 +250,10 @@ def test_the_stop_windows_let_approved_calls_finish() -> None:
     # vault, so the gateway stops first and the windows cover the default call_timeout.
     standard = compose("compose.yaml")["services"]["zoeymcp"]
     assert _seconds(standard["stop_grace_period"]) > launcher.STOP_WAIT
+    # The standard tier's bridges get their 10 s after the vault's 75 s, still inside compose's
+    # 420 s (M7 design C.10, CR-B5).
+    assert launcher.BRIDGE_STOP_WAIT == 10
+    assert launcher.STOP_WAIT == 330 + 75 + 10 < _seconds(standard["stop_grace_period"]) == 420
     hardened = compose("compose.hardened.yaml")["services"]
     assert _seconds(hardened["gateway"]["stop_grace_period"]) >= launcher.GATEWAY_STOP_WAIT
     assert _seconds(hardened["vault"]["stop_grace_period"]) >= launcher.VAULT_STOP_WAIT

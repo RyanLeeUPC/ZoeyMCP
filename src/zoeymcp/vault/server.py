@@ -50,6 +50,7 @@ from ..common.control import CONTROL_RELOAD as CONTROL_RELOAD
 from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
+from ..entrypoint.env import holds_secret_env
 from ..portal import listen as portal_listen
 from ..portal.app import Ledger, PortalApp, Secrets, StaticMissing, load_static
 from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
@@ -69,6 +70,7 @@ from .admin import (
 from .app import CONNECT_TIMEOUT, LISTENER_SCOPE_KEY, READ_TIMEOUT, Listener, VaultApp
 from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
+from .health import Bridges
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
 from .netclient import SocketClients
 from .oauth.login import LoginService
@@ -827,7 +829,14 @@ def build(
     # the same store, token manager, running policy and revocations for secrets (M5 design G,
     # P10; M7 design D.9).
     secrets = Secrets(runtime.store, app.tokens, lambda: app.policy, app.revoker)
-    # Health from the same sources as the socket's GET /health (M5 design I.2).
+    # Health from the same sources as the socket's GET /health (M5 design I.2), with the tier
+    # and the bridges this vault was started with (M7 design C.10, J).
+    named = frozenset(bridges or ())
+    tier = Bridges(
+        link=gateway_socket is not None,
+        named=named,
+        secret_env=frozenset(name for name in named if holds_secret_env(environ, name)),
+    )
     health = HealthReader(
         runtime.store,
         lambda: app.policy,
@@ -837,6 +846,7 @@ def build(
         reports=reports,
         passkeys=passkeys,
         egress_fetched_ago=app.allowlist_fetched_ago,
+        bridges=tier,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
     # (M5 design J.5); the policy view says where the policy came from (L).
@@ -876,6 +886,7 @@ def build(
             # The review jobs the gateway polls the proxy listener for (M7 design F.2).
             reviews=app,
             egress_fetched_ago=app.allowlist_fetched_ago,
+            bridges=tier,
         )
     return Vault(
         app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal

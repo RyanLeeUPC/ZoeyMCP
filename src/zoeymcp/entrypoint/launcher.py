@@ -1,22 +1,33 @@
 """``zoeymcp standard``: the standard tier's launcher (M3 design B.2).
 
 1. **Check the box** (:mod:`.env`): PID 1, root, ``NoNewPrivs``, and no capability beyond
-   ``SETUID`` and ``SETGID``. Then the state and socket directories' owners and modes.
-2. **Split the environment**: the vault gets all of it, the gateway an allowlist.
-3. **Start the vault** as 10001 and **the gateway** as 10002, no supplementary groups, umask
-   077, each with the read end of its own control pipe. The vault listens on the link socket
-   only (or also on ``--vault-listen`` addresses, for direct routes). The gateway answers 503
-   until it has a view, so it isn't made to wait.
+   ``SETUID`` and ``SETGID``. Then the state and socket directories' owners and modes. Then each
+   bridge (``--bridge NAME``, M7 design C.10): its spec, from the environment, and its socket
+   directory, ``/run/zoeymcp-bridge-<name>``, before any child starts. A bridge refused here is
+   logged ``launcher_bridge_refused`` and not started; the vault and the gateway start anyway.
+2. **Split the environment**: the vault gets all of it, the gateway an allowlist, each bridge
+   an allowlist with its own token hash and ``ENV_*`` values.
+3. **Start the vault** as 10001 and **the gateway** as 10002, then **each bridge** as
+   10100 + its place in ``--bridge`` order, no supplementary groups, umask 077, each with the
+   read end of its own control pipe. The vault listens on the link socket only (or also on
+   ``--vault-listen`` addresses, for direct routes), and is told each bridge's name and uid
+   (``--bridge NAME=UID``, refused bridges included). The gateway answers 503 until it has a
+   view, so it isn't made to wait. A bridge creates its own socket in its own directory: the
+   launcher binds, holds and passes no listener.
 4. **Drop PID 1** to 10003, which owns no files, and re-exec as ``zoeymcp standard
    --supervise`` with an empty environment: the master key is then gone from PID 1's memory and
    from ``/proc/1/environ``, and PID 1 holds no capability.
 5. **Supervise**. PID 1 can't signal other uids, so ``SIGTERM`` and ``SIGINT`` become ``TERM``
-   on the control pipes and ``SIGHUP`` becomes ``HUP`` on both. The gateway is told to stop
-   first: an approved call it is still forwarding goes through the vault (M4 design B.6). The
-   vault is told once the gateway has exited, or after :data:`GATEWAY_STOP_WAIT` seconds. If
-   either child exits on its own, the other is told to stop. After at most :data:`STOP_WAIT`
-   seconds the launcher exits non-zero, so the container restarts. PID 1 reaps every process
-   that ends, orphans included.
+   on the control pipes and ``SIGHUP`` becomes ``HUP`` on the vault's and the gateway's (a bridge
+   has nothing to reload). The gateway is told to stop first: an approved call it is still
+   forwarding goes through the vault (M4 design B.6). The vault is told once the gateway has
+   exited, or after :data:`GATEWAY_STOP_WAIT` seconds, and the bridges once the vault has
+   exited, or :data:`VAULT_STOP_WAIT` seconds after it was told, so a call through a bridge
+   finishes inside the vault's window. If the vault or the gateway exits on its own, the others
+   are told to stop. A bridge that exits on its own is logged ``launcher_bridge_down`` and isn't
+   restarted (PID 1 can't start a process as another uid any more); the others keep running.
+   After at most :data:`STOP_WAIT` seconds the launcher exits non-zero, so the container
+   restarts. PID 1 reaps every process that ends, orphans included.
 
 The launcher uses the standard library only.
 """
@@ -30,8 +41,8 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import NoReturn
 
@@ -45,10 +56,14 @@ GATEWAY_PYTHON = "/opt/zoeymcp-gateway/bin/python"
 GATEWAY_STOP_WAIT = 330.0
 # Seconds the vault gets after that: more than an SMTP send's 60 s.
 VAULT_STOP_WAIT = 75.0
+# Seconds each bridge gets after that: its children's 4 s stop (M7 design C.3, C.10).
+BRIDGE_STOP_WAIT = 10.0
 # compose's stop_grace_period is 420 s.
-STOP_WAIT = GATEWAY_STOP_WAIT + VAULT_STOP_WAIT
+STOP_WAIT = GATEWAY_STOP_WAIT + VAULT_STOP_WAIT + BRIDGE_STOP_WAIT
 POLL = 0.2
 STATUS_FILE = "/proc/self/status"
+# A bridge child's name: bridge:<its --bridge name>.
+BRIDGE_CHILD = "bridge:"
 # POSIX constants, looked up so the module still imports (and type-checks) on Windows.
 SIGHUP: int = getattr(signal, "SIGHUP", 1)
 WNOHANG: int = getattr(os, "WNOHANG", 1)
@@ -65,6 +80,7 @@ class Options:
     gateway_listen: str = "0.0.0.0:8090"
     vault_listens: tuple[str, ...] = ()
     unsafe_skip_checks: bool = False
+    bridges: tuple[str, ...] = ()
 
 
 def python_command(module_argv: Sequence[str], python: str | None = None) -> list[str]:
@@ -75,6 +91,11 @@ def python_command(module_argv: Sequence[str], python: str | None = None) -> lis
 
 def vault_argv(options: Options, control_fd: int) -> list[str]:
     listens = [arg for address in options.vault_listens for arg in ("--listen", address)]
+    bridges = [
+        arg
+        for name, uid in env.bridge_uids(options.bridges).items()
+        for arg in ("--bridge", f"{name}={uid}")
+    ]
     return python_command(
         [
             "vault",
@@ -85,6 +106,7 @@ def vault_argv(options: Options, control_fd: int) -> list[str]:
             *(listens or ["--listen", "none"]),
             "--control-fd",
             str(control_fd),
+            *bridges,
         ]
     )
 
@@ -103,11 +125,33 @@ def gateway_argv(options: Options, control_fd: int, python: str = GATEWAY_PYTHON
     return python_command(argv, python if os.path.isfile(python) else None)
 
 
+def bridge_argv(bridge: env.Bridge, control_fd: int) -> list[str]:
+    """A bridge from this interpreter (no SDK), on its socket in its own directory, with only the
+    vault's uid let in; the launcher's options first, the operator's ARGS (the command last)
+    after, so none of them can be given again (C.8)."""
+    directory = bridge.directory.path
+    return python_command(
+        [
+            "bridge",
+            "--control-fd",
+            str(control_fd),
+            "--listen",
+            f"unix:{directory}/mcp.sock",
+            "--peer-uid",
+            str(env.VAULT_UID),
+            "--work-dir",
+            f"{directory}/work",
+            *bridge.args,
+        ]
+    )
+
+
 def found_directories(
     stat_path: Callable[[str], os.stat_result] = os.stat,
+    directories: Iterable[env.Directory] = env.DIRECTORIES,
 ) -> dict[str, env.Found | None]:
     found: dict[str, env.Found | None] = {}
-    for wanted in env.DIRECTORIES:
+    for wanted in directories:
         try:
             info = stat_path(wanted.path)
         except OSError:
@@ -120,7 +164,7 @@ def found_directories(
 
 
 def check(options: Options) -> None:
-    """Step 1, or :class:`LaunchError` with every reason."""
+    """Step 1's box and directories, or :class:`LaunchError` with every reason."""
     if sys.platform != "linux":
         raise LaunchError("the standard tier runs only in a Linux container")
     refusals: list[str] = []
@@ -136,12 +180,39 @@ def check(options: Options) -> None:
         raise LaunchError("; ".join(refusals))
 
 
+def check_bridges(
+    options: Options,
+    environ: Mapping[str, str],
+    stat_path: Callable[[str], os.stat_result] = os.stat,
+) -> list[env.Bridge]:
+    """Step 1's bridges: each spec, then each accepted one's directory, refusing that bridge
+    alone (FM-31). Each refused one is logged with its reasons, which hold no value."""
+    specs = env.bridge_specs(environ, options.bridges)
+    found = found_directories(stat_path, [s.directory for s in specs if not s.refusals])
+    checked = []
+    for spec in specs:
+        if not spec.refusals:
+            refusal = env.directory_refusal(spec.directory, found[spec.directory.path])
+            if refusal is not None:
+                spec = replace(spec, args=(), refusals=(refusal,))
+        if spec.refusals:
+            named = spec.name if env.BRIDGE_NAME.fullmatch(spec.name) else None
+            log("launcher_bridge_refused", name=named, reasons=list(spec.refusals))
+        checked.append(spec)
+    return checked
+
+
 @dataclass
 class Child:
     name: str
     pid: int
     control: int  # the write end of its control pipe
     status: int | None = None  # the exit code, once it has ended
+
+
+# What starts a child: its name, its command line from its control pipe's number, its uid and
+# its environment (:func:`spawn`; tests record instead).
+Spawn = Callable[[str, Callable[[int], list[str]], int, Mapping[str, str]], Child]
 
 
 def spawn(
@@ -183,6 +254,46 @@ def drop_and_supervise(children: Sequence[Child]) -> NoReturn:  # pragma: no cov
     os.execve(sys.executable, argv, {})  # noqa: S606 - this interpreter, no shell
 
 
+def start(
+    options: Options,
+    environ: Mapping[str, str],
+    *,
+    spawn: Spawn = spawn,
+    stat_path: Callable[[str], os.stat_result] = os.stat,
+) -> list[Child]:
+    """Steps 1 (the bridges) to 3: every bridge checked before any child starts, then the vault,
+    the gateway and each bridge that passed. A bridge that can't be spawned (a command line too
+    long for ``exec``, say) is refused as a checked one is, and the others start (C.10)."""
+    bridges = [
+        bridge for bridge in check_bridges(options, environ, stat_path) if not bridge.refusals
+    ]
+    vault_env, gateway_env, bridge_envs = env.split_environment(
+        environ, [bridge.name for bridge in bridges]
+    )
+    log("launcher_started", vault_uid=env.VAULT_UID, gateway_uid=env.GATEWAY_UID)
+    children = [
+        spawn("vault", partial(vault_argv, options), env.VAULT_UID, vault_env),
+        spawn("gateway", partial(gateway_argv, options), env.GATEWAY_UID, gateway_env),
+    ]
+    for bridge in bridges:
+        argv = partial(bridge_argv, bridge)
+        try:
+            children.append(
+                spawn(f"{BRIDGE_CHILD}{bridge.name}", argv, bridge.uid, bridge_envs[bridge.name])
+            )
+        except (OSError, ValueError) as exc:
+            log("launcher_bridge_refused", name=bridge.name, reasons=[spawn_refusal(exc)])
+    return children
+
+
+def spawn_refusal(exc: OSError | ValueError) -> str:
+    """Why a bridge couldn't be spawned, without a value: an error's message may quote its
+    command line (``UnicodeEncodeError`` does), so only ``strerror`` or the error's type."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return f"it couldn't be started: {exc.strerror}"
+    return f"it couldn't be started ({type(exc).__name__})"
+
+
 def launch(options: Options, environ: Mapping[str, str]) -> NoReturn:  # pragma: no cover
     """Steps 1 to 4. Raises :class:`LaunchError` before anything starts."""
     try:
@@ -190,28 +301,29 @@ def launch(options: Options, environ: Mapping[str, str]) -> NoReturn:  # pragma:
     except LaunchError as exc:
         log("launcher_refused", reason=str(exc))
         raise
-    vault_env, gateway_env = env.split_environment(environ)
-    log("launcher_started", vault_uid=env.VAULT_UID, gateway_uid=env.GATEWAY_UID)
-    children = [
-        spawn("vault", partial(vault_argv, options), env.VAULT_UID, vault_env),
-        spawn("gateway", partial(gateway_argv, options), env.GATEWAY_UID, gateway_env),
-    ]
-    drop_and_supervise(children)
+    drop_and_supervise(start(options, environ))
 
 
 # --- supervising ---------------------------------------------------------------------------------
 
 
 def parse_supervised(values: Sequence[str]) -> list[Child]:
-    """``--supervise NAME=PID:FD`` values, as the launcher wrote them."""
-    children = []
+    """``--supervise NAME=PID:FD`` values, as the launcher wrote them: the vault and the gateway
+    once each, and any ``bridge:<name>`` once (a refused bridge is simply absent)."""
+    children: list[Child] = []
     for value in values:
         name, _, rest = value.partition("=")
         pid, _, fd = rest.partition(":")
-        if name not in ("vault", "gateway") or not pid.isdigit() or not fd.isdigit():
+        bridge = name.removeprefix(BRIDGE_CHILD)
+        known = name in ("vault", "gateway") or (
+            name.startswith(BRIDGE_CHILD) and env.BRIDGE_NAME.fullmatch(bridge) is not None
+        )
+        if not known or not pid.isdigit() or not fd.isdigit():
             raise LaunchError(f"bad --supervise value {value!r}")
+        if name in (child.name for child in children):
+            raise LaunchError(f"--supervise names {name} twice")
         children.append(Child(name, int(pid), int(fd)))
-    if sorted(child.name for child in children) != ["gateway", "vault"]:
+    if not {"vault", "gateway"} <= {child.name for child in children}:
         raise LaunchError("--supervise needs the vault and the gateway")
     return children
 
@@ -228,19 +340,24 @@ class Supervisor:
     pending: list[str] = field(default_factory=list)  # commands from signal handlers
     stopping_since: float | None = None
     failed: bool = False
-    vault_told: bool = False
+    vault_told: float | None = None  # when the vault was told to stop
+    bridges_told: bool = False
 
     def on_signal(self, signum: int, _frame: object = None) -> None:
         self.pending.append("HUP" if signum == SIGHUP else "TERM")
 
-    def tell(self, command: str, names: tuple[str, ...] = ("vault", "gateway")) -> None:
+    def tell(self, command: str, names: Iterable[str] = ("vault", "gateway")) -> None:
+        wanted = set(names)
         for child in self.children:
-            if child.status is None and child.name in names:
+            if child.status is None and child.name in wanted:
                 with contextlib.suppress(OSError):  # a child that just ended
                     self.write(child.control, command.encode() + b"\n")
 
     def _child(self, name: str) -> Child:
         return next(child for child in self.children if child.name == name)
+
+    def _bridges(self) -> list[str]:
+        return [child.name for child in self.children if child.name.startswith(BRIDGE_CHILD)]
 
     def stop(self, reason: str) -> None:
         if self.stopping_since is None:
@@ -251,12 +368,21 @@ class Supervisor:
 
     def _stop_vault_when_due(self) -> None:
         """The vault outlives the gateway, up to :data:`GATEWAY_STOP_WAIT`."""
-        if self.stopping_since is None or self.vault_told:
+        if self.stopping_since is None or self.vault_told is not None:
             return
         waited = self.clock() - self.stopping_since
         if self._child("gateway").status is not None or waited > GATEWAY_STOP_WAIT:
-            self.vault_told = True
+            self.vault_told = self.clock()
             self.tell("TERM", ("vault",))
+
+    def _stop_bridges_when_due(self) -> None:
+        """The bridges outlive the vault, up to :data:`VAULT_STOP_WAIT` after it was told."""
+        if self.vault_told is None or self.bridges_told:
+            return
+        waited = self.clock() - self.vault_told
+        if self._child("vault").status is not None or waited > VAULT_STOP_WAIT:
+            self.bridges_told = True
+            self.tell("TERM", self._bridges())
 
     def reap(self) -> None:
         while True:
@@ -270,7 +396,13 @@ class Supervisor:
                 if child.pid == pid and child.status is None:
                     child.status = os.waitstatus_to_exitcode(status)
                     log("child_exited", child=child.name, status=child.status)
-                    if self.stopping_since is None:
+                    if self.stopping_since is not None:
+                        continue
+                    if child.name.startswith(BRIDGE_CHILD):
+                        # Not restarted, and nothing else is stopped (Q44).
+                        name = child.name.removeprefix(BRIDGE_CHILD)
+                        log("launcher_bridge_down", name=name, status=child.status)
+                    else:
                         self.failed = True
                         self.stop(f"{child.name} exited")
 
@@ -285,6 +417,7 @@ class Supervisor:
                 self.stop("signal")
         self.reap()
         self._stop_vault_when_due()
+        self._stop_bridges_when_due()
         if all(child.status is not None for child in self.children):
             return 1 if self.failed else 0
         if self.stopping_since is not None and self.clock() - self.stopping_since > STOP_WAIT:

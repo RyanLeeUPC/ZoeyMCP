@@ -319,6 +319,10 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`login --mcp URL --reregister`); the vault never registers again by itself |
 | `address_refused` | error | the vault refused to connect to the credential's token endpoint, its revocation endpoint or a route's upstream **since the vault started**, because the name resolved to a private, loopback or otherwise non-global address (§7's upgrade note): list its `host:port` in `egress_private` if it is meant to be private, and reload. A reload that lists it, or moves the endpoint, ends the finding. A route with no credential has no credential section: its refusal is the `egress` section's, with the route's name (`fix_policy`). The log has each refusal too (`address_refused`, §11) |
 | `egress_allowlist_stale` | warning | the egress role (§31) hasn't fetched its allowlists for more than 300 s: its lists are stale, so it refuses every new tunnel. A role whose key the vault refuses (a wrong key, or the old one after a generation bump) counts from its first request. With `egress_proxy_kind: role` the role is expected, so one that hasn't asked since the vault started counts from the vault's start. Check that it runs, reaches the vault, and has the key `zoeymcp egress-key` prints (`check_egress_role`). In the `egress` section; with your own proxy or none, a vault no role has asked since it started has no such finding |
+| `program_unconfined` | info | (standard tier) a route has a `program` block, a `unix:` upstream, or is a bridge's route to a loopback address (a literal, `localhost` or a name under it): nothing in the standard tier confines that program, which can reach every listener in the container, the host's network and the internet (§32). In the `egress` section, naming the route; nothing to do but know it, or move the program to the hardened tier |
+| `loopback_bridge_route` | error | (standard tier) a bridge's route (a gateway server's route over plain http with `allow_insecure_upstream`) goes to a loopback address over TCP: any process in the container can listen there first and receive the route's token. A bridge under the launcher listens on `unix:/run/zoeymcp-bridge-<name>/mcp.sock`; use that as the upstream (`fix_policy`) |
+| `bridge_socket_unknown` | error | a route's upstream is `unix:/run/zoeymcp-bridge-<name>/mcp.sock` and the launcher started no bridge `<name>` (`--bridge`; none in the hardened tier): the route answers 502. Fix the name, or start the bridge (`fix_policy`) |
+| `program_secret_unflagged` | warning | (standard tier) a bridge's `ZOEYMCP_BRIDGE_<NAME>_ARGS` hold `--secret-env`, and the route to its socket has no `program: {holds_secret: true}`, so `check` can't warn about the secret it holds (`fix_policy`) |
 | `last_failure` | warning | no failure in memory, but the last attempt failed after the last success: a restart forgets failures, the store's metadata doesn't |
 | `idle` | warning | `idle_expiry_days` is set, and the last success is older than it less 14 days. Refresh happens only on demand, so an unused grant can reach a provider's idle expiry |
 | `paused`, `near_limit`, `unknown_sends` | info, warning, warning | a paused connector; 80% of `max_per_day` used in the last 24 hours; a send in the last 24 hours with an unknown outcome |
@@ -2772,3 +2776,54 @@ Its log lines (`role: bridge`):
 
 None holds the token or its hash, a session id, a request's or the child's content, an
 environment value or the command's arguments.
+
+### Under the standard launcher
+
+In the standard tier, `zoeymcp standard --bridge NAME` (repeatable, at most 8; `NAME` is 1 to 16
+lower-case letters or digits) starts bridge `NAME` as one more child of the launcher, after the
+vault and the gateway. It is **unconfined**: it shares the container with the vault and the
+gateway, can reach every listener there, the host's network and the internet, can ignore proxy
+settings, and can use up the container's memory, processes and CPU. Health says so
+(`program_unconfined`, §3).
+
+- **Its uid** is 10100 plus its place in the `--bridge` list (10100 to 10107), group the same,
+  with no other group: it can't signal or read the vault, the gateway or another bridge.
+- **Its socket** is always `/run/zoeymcp-bridge-<name>/mcp.sock`, the route's
+  `upstream: unix:/run/zoeymcp-bridge-<name>/mcp.sock`. The directory is a tmpfs of its own,
+  owned by its uid, group 10001 (the vault's), mode 0750: only the vault can reach the socket,
+  and only the bridge can create one there, whether it runs or not. Its work directory is
+  `work/` beside the socket. Before starting any child the launcher checks each bridge's
+  directory and refuses that bridge alone if it is missing or isn't exactly
+  `<10100+i>:10001 0750` (a reordered `--bridge` list, a typo in the mount). The vault is told
+  each bridge's name and uid (`--bridge NAME=UID`) and refuses a socket another uid listens on.
+- **Its configuration** is the container's environment:
+  `ZOEYMCP_BRIDGE_<NAME>_ARGS`, a JSON array of its `zoeymcp bridge` arguments, which must hold
+  `--era` and `--` with a command, and may not hold `--listen`, `--peer-uid`, `--work-dir` or
+  `--control-fd` (the launcher's) or `--egress-proxy` (nothing in the standard tier enforces
+  egress), alone or as `--<option>=<value>`, before the `--`. Every process in the container can
+  read these arguments, so **no secret goes in ARGS**. `ZOEYMCP_BRIDGE_<NAME>_TOKEN_SHA256` is
+  handed to it as `ZOEYMCP_BRIDGE_TOKEN_SHA256`; and each `ZOEYMCP_BRIDGE_<NAME>_ENV_<VAR>` as
+  `<VAR>`, for its `--env` and `--secret-env`: a process's environment is readable only by its
+  own uid, so this is where a secret goes (with `program: {holds_secret: true}` on its route,
+  or health warns `program_secret_unflagged`). It gets nothing else: no master key, no
+  `ZOEYMCP_CONFIG`, no gateway key, no other bridge's variables.
+- **A refused bridge** (its ARGS, an `ENV_` name that isn't a variable name or is a `ZOEYMCP_`
+  one, its name, a ninth bridge, its directory) isn't started, and the vault and the gateway
+  start as usual; its route answers 502. A bridge without its token hash is started and refuses
+  to start itself (§32's token): on a cold start, run `secret set --generate`, set the hash and
+  recreate the container.
+- **A bridge that exits** isn't restarted, and the vault and the gateway keep serving: its route
+  answers 502 at once, and no other process can listen in its place. Restarting the container
+  brings it back. A bridge has nothing to reload, so `SIGHUP` reaches only the vault and the
+  gateway.
+- **Stopping**: the gateway first (up to 330 s), then the vault (up to 75 s), then each bridge
+  (10 s), so a call in flight through a bridge finishes inside the vault's window; the launcher
+  waits at most 415 s, inside compose's `stop_grace_period: 420s`.
+
+The launcher's log lines (`role: launcher`) about bridges:
+
+| Event | Fields |
+| --- | --- |
+| `child_started`, `child_exited` | `child` (`bridge:<name>`), `pid` and `uid`; `status` |
+| `launcher_bridge_refused` | `name` (none for a malformed one), `reasons`: each names a variable, the directory, or for ARGS a position (`ZOEYMCP_BRIDGE_FETCH_ARGS[3]: --listen is the launcher's`), or why it couldn't be spawned (`it couldn't be started: Argument list too long`), never a value |
+| `launcher_bridge_down` | `name`, `status`: after its `child_exited`, a bridge that exited on its own; it isn't restarted and the others keep running |

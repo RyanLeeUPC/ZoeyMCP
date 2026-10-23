@@ -25,6 +25,7 @@ from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
 from zoeymcp.vault.connectors import sendjournal
 from zoeymcp.vault.connectors.smtp import Answer, SmtpConnectors
 from zoeymcp.vault.gatewaykeys import BACKWARDS, STATE_FILE, TAMPERED, State
+from zoeymcp.vault.health import Bridges
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.server import (
@@ -1118,6 +1119,53 @@ def test_one_onboarding_service_on_the_onboarding_client(
         assert vault.onboard._source == str(config)
     finally:
         asyncio.run(vault.app.aclose())
+
+
+def test_health_is_told_the_tier_and_the_bridges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7 design C.10, J: the link socket makes it the standard tier, ``--bridge`` names the
+    bridges, and each one's ARGS in the vault's environment say which has a ``--secret-env``;
+    the socket's health and the portal's read the same."""
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "check_link_dir", lambda path: None)
+    environ = env(
+        ZOEYMCP_BRIDGE_FETCH_ARGS=json.dumps(["--era", "legacy", "--env", "BASE", "--", "x"]),
+        ZOEYMCP_BRIDGE_NOTES_ARGS=json.dumps(["--era", "legacy", "--secret-env", "KEY", "--", "x"]),
+        # Not a bridge this vault was told of.
+        ZOEYMCP_BRIDGE_OTHER_ARGS=json.dumps(["--secret-env", "KEY", "--", "x"]),
+    )
+
+    def built(state: str, **kwargs: Any) -> Bridges:
+        vault = server.build(
+            str(EXAMPLE_POLICY),
+            ["127.0.0.1:8080"],
+            tmp_path / state,
+            environ,
+            tmp_path / f"{state}.sock",
+            **kwargs,
+        )
+        try:
+            assert vault.admin is not None
+            assert vault.portal is not None
+            found: Bridges = vault.admin._health_reader.bridges
+            # The portal is handed the reader's bound report.
+            assert cast(Any, vault.portal.app.health).__self__.bridges == found
+            return found
+        finally:
+            asyncio.run(vault.app.aclose())
+
+    standard = built(
+        "standard",
+        gateway_socket=tmp_path / "link" / "vault.sock",
+        bridges={"fetch": 10100, "notes": 10101},
+    )
+    assert standard == Bridges(True, frozenset({"fetch", "notes"}), frozenset({"notes"}))
+    assert built("hardened") == Bridges(False, frozenset(), frozenset())
+    assert built("linked", gateway_socket=tmp_path / "link" / "vault.sock") == Bridges(
+        True, frozenset(), frozenset()
+    )
 
 
 def test_the_portal_is_built_without_the_socket_too(

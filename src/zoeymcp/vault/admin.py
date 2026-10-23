@@ -71,7 +71,7 @@ import stat
 import sys
 import time
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol
 
@@ -423,7 +423,8 @@ class HealthReader:
     wall clock a registered client's secret expiry is judged on (M7 design J, FM-28). The
     address guard's refusals come from the logins' token manager (J), and the egress role's last
     fetch from ``egress_fetched_ago`` (``VaultApp``'s; without it, no
-    ``egress_allowlist_stale``)."""
+    ``egress_allowlist_stale``). ``bridges`` is the tier and the bridges the vault was started
+    with (M7 design C.10, J; by default the hardened tier's: no link socket, no bridge)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -434,6 +435,7 @@ class HealthReader:
     passkeys: Passkeys | None = None
     wall: Callable[[], float] = time.time
     egress_fetched_ago: Callable[[], float | None] | None = None
+    bridges: health.Bridges = field(default_factory=health.Bridges)
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -452,6 +454,7 @@ class HealthReader:
             egress_fetched_ago=None
             if self.egress_fetched_ago is None
             else self.egress_fetched_ago(),
+            bridges=self.bridges,
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report
@@ -518,6 +521,7 @@ class AdminApp:
         revoker: secretops.Revoker | None = None,
         reviews: ReviewQueue | None = None,
         egress_fetched_ago: Callable[[], float | None] | None = None,
+        bridges: health.Bridges | None = None,
         random: Callable[[int], bytes] = secrets.token_bytes,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
@@ -547,6 +551,9 @@ class AdminApp:
         ``egress_fetched_ago`` says how long ago the egress role last fetched its lists, for
         health (M7 design J). Without it, health has no ``egress_allowlist_stale``.
 
+        ``bridges`` is the tier and the bridges the vault was started with, for health's route
+        findings (M7 design C.10, J). Without it, health judges routes as the hardened tier's.
+
         ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests)."""
         self._store = store
         self._random = random
@@ -574,6 +581,7 @@ class AdminApp:
             reports=reports,
             passkeys=passkeys,
             egress_fetched_ago=egress_fetched_ago,
+            bridges=bridges or health.Bridges(),
         )
         self.app = Starlette(
             routes=[

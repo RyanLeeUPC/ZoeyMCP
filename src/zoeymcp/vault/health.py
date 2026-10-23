@@ -49,19 +49,33 @@ refuses every new tunnel (I.4). A role that has asked since the vault started bu
 admitted (a wrong or old key) counts from its first request. A vault no role has asked since it
 started counts from its start when its startup policy's ``egress_proxy`` is the role
 (``egress_proxy_kind: role``), which is expected then, and has no such finding otherwise.
+
+The ``egress`` section also judges each route against the bridges the vault was started with
+(:class:`Bridges`; M7 design C.10, J, Q46). In the standard tier (the vault runs with the gateway
+link socket), a route with a ``program`` block, a ``unix:`` upstream, or a local MCP route to a
+loopback address (a literal, ``localhost`` or a name under it) is ``program_unconfined`` (info:
+nothing there confines the program); that local MCP route over TCP is also
+``loopback_bridge_route`` (error: any process in the container could listen there first and
+receive the route's token); and a route to the socket of a bridge whose ARGS hold
+``--secret-env`` without ``program.holds_secret`` is ``program_secret_unflagged`` (warning). In
+either tier, a ``unix:`` upstream naming a bridge the launcher didn't start is
+``bridge_socket_unknown`` (error: the route answers 502).
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
+from urllib.parse import urlsplit
 
 from ..common import egresslist
-from ..common.policy.check import secret_references
-from ..common.policy.schema import Credential, OAuth2Credential, Policy, SMTPConnector
+from ..common.policy import fields as policy_fields
+from ..common.policy.check import local_mcp_routes, secret_references
+from ..common.policy.schema import Credential, OAuth2Credential, Policy, Route, SMTPConnector
 from .bindings import (
     VAULT_PREFIX,
     BindingError,
@@ -123,6 +137,19 @@ class PasskeyState:
 
 
 @dataclass(frozen=True)
+class Bridges:
+    """What the vault was started with for the standard tier's bridges (M7 design C.10, J):
+    fixed at start, so a reload changes none of it."""
+
+    # The vault runs with the gateway link socket: the standard tier.
+    link: bool = False
+    # The bridges the launcher started (--bridge NAME=UID), by name.
+    named: frozenset[str] = frozenset()
+    # Those whose ZOEYMCP_BRIDGE_<NAME>_ARGS, in the vault's environment, hold --secret-env.
+    secret_env: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class Inputs:
     policy: Policy
     entries: Sequence[EntryMeta]
@@ -146,6 +173,8 @@ class Inputs:
     # or since the vault started when egress_proxy is the role and none has asked; None if no
     # role has asked and none is expected (VaultApp.allowlist_fetched_ago).
     egress_fetched_ago: float | None = None
+    # The tier and the bridges, for the routes' findings in the egress section.
+    bridges: Bridges = Bridges()
 
 
 @dataclass(frozen=True)
@@ -196,7 +225,7 @@ def assess(inputs: Inputs) -> dict[str, Any]:
         for name, connector in policy.connectors.items()
     ]
     store = _store(inputs)
-    egress = _egress(policy, inputs.refused, inputs.egress_fetched_ago)
+    egress = _egress(policy, inputs.refused, inputs.egress_fetched_ago, inputs.bridges)
     sections = [*credentials, *connectors, store, egress]
     report: dict[str, Any] = {
         "credentials": credentials,
@@ -469,12 +498,16 @@ def _address_refused(
 
 
 def _egress(
-    policy: Policy, refused: Sequence[Mapping[str, Any]], fetched_ago: float | None
+    policy: Policy,
+    refused: Sequence[Mapping[str, Any]],
+    fetched_ago: float | None,
+    bridges: Bridges,
 ) -> dict[str, Any]:
     """The guard's refusals of a route with no credential, which no credential's section holds
     (M7 design J): one finding per such route whose upstream, as the running policy has it now,
-    was refused and isn't listed in its ``egress_private``; then an egress role whose last fetch
-    of its lists is older than they stay fresh (COV-7)."""
+    was refused and isn't listed in its ``egress_private``; then each route's program and
+    bridge (:func:`_programs`); then an egress role whose last fetch of its lists is older than
+    they stay fresh (COV-7)."""
     listed = egresslist.private_exceptions(policy)
     seen = {guard_key(i["host"], i["port"]): i for i in refused if i["purpose"] == "route"}
     findings: list[Finding] = []
@@ -487,6 +520,7 @@ def _egress(
         text = _refused_text(f"route {route.name}'s upstream", key, seen[key])
         action = _act("fix_policy", "route", route.name)
         findings.append(_finding("address_refused", "error", text, action))
+    findings += _programs(policy, bridges)
     if fetched_ago is not None and fetched_ago > ALLOWLIST_MAX_STALE:
         text = (
             f"the egress role hasn't fetched its allowlists for {int(fetched_ago) // 60} min: "
@@ -496,6 +530,75 @@ def _egress(
         action = {"kind": "check_egress_role"}
         findings.append(_finding("egress_allowlist_stale", "warning", text, action))
     return {"level": _level(findings), "findings": findings}
+
+
+UNCONFINED: Final = (
+    "nothing in the standard tier confines this program: it can reach every listener in the "
+    "container, the host's network and the internet"
+)
+
+
+def _programs(policy: Policy, bridges: Bridges) -> list[Finding]:
+    """Each route's program and bridge against the tier and the bridges the launcher started
+    (M7 design C.10, J, Q46), in the policy's order."""
+    local = local_mcp_routes(policy)
+    findings: list[Finding] = []
+    for route in policy.routes:
+        if route.upstream is None:
+            continue
+        bridge = _bridge_of(route.upstream)
+        loopback = route.name in local and bridge is None and _loopback(route.upstream)
+        fix = _act("fix_policy", "route", route.name)
+        if bridges.link and (route.program is not None or bridge is not None or loopback):
+            text = f"route {route.name}: {UNCONFINED}"
+            findings.append(_finding("program_unconfined", "info", text, None))
+        if bridges.link and loopback:
+            text = (
+                f"route {route.name}: any process in this container can listen on "
+                f"{destination_key(route.upstream)} first and receive this route's token; a "
+                "bridge under the launcher listens on unix:/run/zoeymcp-bridge-<name>/mcp.sock"
+            )
+            findings.append(_finding("loopback_bridge_route", "error", text, fix))
+        if bridge is not None and bridge not in bridges.named:
+            text = (
+                f"route {route.name}: the route answers 502: no bridge {bridge} runs in this "
+                "container"
+            )
+            findings.append(_finding("bridge_socket_unknown", "error", text, fix))
+        secret = bridge is not None and bridge in bridges.secret_env
+        if bridges.link and secret and not _holds_secret(route):
+            text = (
+                f"route {route.name}: this route's program holds a real secret, and check "
+                "can't warn about it until program.holds_secret is set"
+            )
+            findings.append(_finding("program_secret_unflagged", "warning", text, fix))
+    return findings
+
+
+def _bridge_of(upstream: str) -> str | None:
+    """The bridge a ``unix:`` upstream names (the schema allows only its one form), else None."""
+    if not upstream.startswith(policy_fields.UNIX_PREFIX):
+        return None
+    return policy_fields.bridge_name(upstream)
+
+
+def _loopback(upstream: str) -> bool:
+    """A loopback host (CR-B8): a literal, an IPv4-mapped one included, ``localhost`` or a name
+    under it."""
+    host = (urlsplit(upstream).hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def _holds_secret(route: Route) -> bool:
+    return route.program is not None and route.program.holds_secret
 
 
 def _refused_text(call: str, key: str, item: Mapping[str, Any]) -> str:
