@@ -2598,8 +2598,6 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-30 | The bridge for stdio MCP servers (R35, S11) | M7 (open): built; each check of the bridge's image verifier and smoke rows is still to be shown failing under a deliberate break |
-| D-151 | How the gateway reaches a bridge: a gateway-only vault route with the bridge's own token, in three placements, with confinement in the hardened tier only | M7 (open): built; closes with D-30 |
 | D-154 | A recorded by-hand onboarding run against a real OAuth-protected MCP server | M7 (open): recorded "not run" in [manual-checks.md](manual-checks.md); waits on a suitable public server, else the backlog with D-69 |
 | D-183 | The fake OAuth provider had no consent page, so a by-hand check couldn't show the session cookie held back on the callback | M7 (open): the consent page is built; that line of the check is still to run by hand |
 
@@ -2712,6 +2710,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-187 | A cancelled Connect from a server row leaves that server's review hold set | The next change to the portal's Connect flow |
 | D-188 | The review screen's "not annotated" filter misses a toolkit's unannotated consequential tools | The next change to the review screen's data |
 | D-189 | A review asked for right after a reload can wait up to about 25 s | M6, or the next change to the review poll |
+| D-192 | A richer supervisor for standard-tier bridges: a restart with crash-loop backoff, instead of staying down until the container restarts | Backlog |
 
 **Closed.**
 
@@ -2740,6 +2739,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-25 | The vault's SMTP send journal shown next to the ledger | Done in M5: the ledger view joins the journal and flags sends with no ledger record |
 | D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records are M8 (D-35) |
 | D-28 | The gateway's entry path still loads vault code | Done in M5 |
+| D-30 | The bridge for stdio MCP servers (R35, S11) | Done in M7: `zoeymcp bridge`, local MCP routes and `unix:` upstreams, the standard launcher's bridges, the bridge image and its verifier, S11 in every placement; each verifier check and smoke row shown failing under a deliberate break |
 | D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | Done in M7 |
 | D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML fragments | Done in M7: `login --mcp` and the portal's MCP servers page, walked end to end by S9 |
 | D-33 | Provider profiles for S9 and S11 | Done in M7 |
@@ -2789,6 +2789,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-148 | Where a registered client's secret lives, how it is bound and how it expires | Done in M7: stored at once under the binding the plan predicts, with expiry findings in health |
 | D-149 | The vault's egress allowlist must cover onboarding and the endpoints it pins | Done in M7: one derivation with named sources, and onboarding allowances that expire with the onboarding |
 | D-150 | The onboarding YAML: its form, and one emitter for untrusted strings | Done in M7: one change object and one emitter for every fragment |
+| D-151 | How the gateway reaches a bridge: a gateway-only vault route with the bridge's own token, in three placements, with confinement in the hardened tier only | Done in M7, with D-30 |
 | D-152 | [threat-model.md](threat-model.md) had no actors or limits for M7's surfaces | Done in M7 |
 | D-164 | No end-to-end guide to a first hardened deployment, and no recipe for an existing stack with its own egress proxy | Done in M7: [operations.md](operations.md) §29 and §30, and `examples/existing-stack/` |
 | D-166 | The gateway's vault-link clients weren't closed at shutdown | Done in M7 |
