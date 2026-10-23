@@ -2224,6 +2224,15 @@ services:
               era: legacy
               tools: {include: [echo, wait], allow: [echo, wait]}
               review: {echo: "$pin_echo", wait: "$pin_wait"}
+            # spare's route needs a server: a unix: upstream serves only an MCP route. No client
+            # is given it, since spare is refused for its directory and never runs.
+            spare:
+              kind: remote
+              route: bridge-spare
+              path: /mcp
+              era: legacy
+              tools: {include: [echo], allow: [echo]}
+              review: {echo: "$pin_echo"}
       ZOEYMCP_BRIDGE_OTHER_ARGS: >-
         ["--era", "legacy", "--stderr", "text", "--", "$bridge_command"]
       ZOEYMCP_BRIDGE_OTHER_TOKEN_SHA256: \${ZOEYMCP_BRIDGE_OTHER_TOKEN_SHA256:-}
