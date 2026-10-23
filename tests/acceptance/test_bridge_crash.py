@@ -115,6 +115,7 @@ async def test_a_bridge_killed_mid_call(
                     # refused not_ready, which says nothing about the restart.
                     refused = second.events("bridge_refused")
                     started = second.events("bridge_session_started")
+                    became_ready = second.events("bridge_ready")[0]["ts"]
             failed = [
                 line
                 for line in gateway.seen.events("request")
@@ -134,7 +135,11 @@ async def test_a_bridge_killed_mid_call(
     assert after == "after"
     # A fresh session on the new bridge: the old session's id means nothing there (404, as for
     # any legacy restart), so the gateway initialized a new session after the kill.
-    assert {line["reason"] for line in refused} <= {"session_unknown"}, refused
+    # The new bridge listens before its probe passes, so the gateway's retries can reach it then
+    # (not_ready); once ready, the only refusal is the old session's id.
+    early = [line for line in refused if line["reason"] == "not_ready"]
+    assert all(line["ts"] <= became_ready for line in early), refused
+    assert {line["reason"] for line in refused} - {"not_ready"} <= {"session_unknown"}, refused
     assert reconnected, "the gateway didn't initialize a new session after the kill"
     assert started
     assert TOKEN not in everything
