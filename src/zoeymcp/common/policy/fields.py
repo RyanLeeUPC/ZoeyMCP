@@ -19,6 +19,10 @@ decisions M7 adds to the schema are tested without putting all of ``schema.py`` 
 - :func:`unix_upstream`, :func:`bridge_name` and :func:`bridge_socket`: a route's ``unix:``
   upstream, a standard-tier bridge's socket (Q46). Only the one fixed form is taken, so a route
   can't name any other socket in the container (the vault's admin socket, the link socket).
+- :func:`reserved_env` and :data:`VAULT_ONLY_ENV`: ZoeyMCP's own environment variables. No
+  ``env:`` reference may name one (``check``, by the prefix), and the gateway refuses to start
+  with the vault's three in its environment (its own ``ZOEYMCP_GATEWAY_KEY`` and the bridges'
+  variables pass that check, so it names the three, not the prefix).
 
 Every pattern here is used with ``fullmatch``.
 """
@@ -54,6 +58,12 @@ _UNIX_UPSTREAM = re.compile(r"unix:/run/zoeymcp-bridge-([a-z0-9]{1,16})/mcp\.soc
 UNIX_UPSTREAM_FORM: Final = (
     "a unix: upstream is a standard-tier bridge's socket, unix:/run/zoeymcp-bridge-<name>/mcp.sock"
 )
+
+# Every variable ZoeyMCP reads starts with this: the master keys, the policy, the gateway's key, the
+# bridges' variables, and any later one.
+RESERVED_ENV_PREFIX: Final = "ZOEYMCP_"
+# What the gateway's environment must never hold: the vault's master keys and its policy.
+VAULT_ONLY_ENV: Final = ("ZOEYMCP_MASTER_KEY", "ZOEYMCP_MASTER_KEY_PREVIOUS", "ZOEYMCP_CONFIG")
 
 # The names the vault sets on a token request (protocol._build), resource (which onboarding sets),
 # and those that compete with the client authentication the vault sends (RFC 7521, RFC 7523).
@@ -125,6 +135,13 @@ def client_host(host: str) -> str:
         return idna.encode(host).decode("ascii")
     except idna.IDNAError:
         return host
+
+
+def reserved_env(name: str) -> bool:
+    """Whether ``name`` is one of ZoeyMCP's own environment variables, which no secret may come
+    from. In any case: Windows reads its environment so, and ``env:zoeymcp_master_key`` there is
+    the master key."""
+    return name.upper().startswith(RESERVED_ENV_PREFIX)
 
 
 def is_squid_acl_name(value: str) -> bool:

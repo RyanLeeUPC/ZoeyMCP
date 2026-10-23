@@ -164,6 +164,20 @@ def test_a_re_review_dropping_a_tool_leaves_no_stale_pin() -> None:
     assert result.added == ()
 
 
+def test_a_fragment_that_names_declined_replaces_it_whole() -> None:
+    """M6 design A.4: the merge takes a replace path at ``declined``, like ``tools`` and
+    ``review``. No review op names it yet (``test_policy_change.py``); one that does leaves no
+    stale declined entry."""
+    policy = base()
+    policy["gateway"]["servers"]["notes"]["declined"] = {"read": PIN_A, "old": PIN_A}
+    replace = [("gateway", "servers", "notes", "declined")]
+    fragment = {"gateway": {"servers": {"notes": {"declined": {"new": PIN_B}}}}}
+    result = merged(merge(policy, fragment, replace=replace))
+    assert result.data["gateway"]["servers"]["notes"]["declined"] == {"new": PIN_B}
+    assert result.replaced == tuple(replace)
+    assert replace_paths(replace_line(replace)) == tuple(replace)
+
+
 def test_a_replace_path_is_recorded_even_when_equal() -> None:
     server = base()["gateway"]["servers"]["notes"]
     replace = [("gateway", "servers", "notes", "review")]
@@ -273,6 +287,7 @@ def test_egress_private_that_is_not_a_list_is_replaced() -> None:
         (("credentials", "notes"), True),
         (("gateway", "servers", "notes", "tools"), True),
         (("gateway", "servers", "notes", "review"), True),
+        (("gateway", "servers", "notes", "declined"), True),
         (("credentials",), False),
         (("credentials", "Notes"), False),
         (("connectors", "notes"), False),

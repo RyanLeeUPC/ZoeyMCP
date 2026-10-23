@@ -107,6 +107,19 @@ STOP_WINDOW_CALL_TIMEOUT = 300
 PROMPT_FRAME_CHARS = 200
 PROMPT_REPLY_LINE_CHARS = 264
 PROMPT_CODE_LINE_CHARS = 44
+# Why each capability can't be enabled. Prompts, resources and completions aren't served yet.
+_TOOLS_ONLY = (
+    "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
+    "the gateway serves tools only"
+)
+_ENABLE_REFUSED: Mapping[str, str] = {
+    "sampling": "sampling is deprecated in MCP 2026-07-28 and the gateway never relays it",
+    "roots": "roots is deprecated in MCP 2026-07-28 and the gateway never relays it",
+    "elicitation": (
+        "the gateway doesn't relay an upstream's elicitation; its own approval prompts are the "
+        "only questions agents see"
+    ),
+}
 
 
 class _Report:
@@ -124,6 +137,7 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
     """Return every finding for ``policy``. With ``environ``, ``env:`` references must resolve;
     an unset refresh-token seed is only a warning, since the live token is in the store."""
     report = _Report()
+    _check_mode(policy, report)
     _check_secret_refs(policy, report, environ)
     _check_oauth_refs(policy, report)
     _check_credentials(policy, report)
@@ -134,6 +148,25 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
     if policy.admin is not None:
         _check_admin(policy.admin, report)
     return sorted(set(report.findings))
+
+
+# --- the mode ----------------------------------------------------------------------------------
+
+
+def _check_mode(policy: Policy, report: _Report) -> None:
+    """The only rules that read ``mode``: every other rule is the same in both modes."""
+    if policy.mode != "managed":
+        return
+    if policy.admin is None:
+        report.error(
+            "mode",
+            "managed mode is edited in the portal: add an admin block, or use mode: declarative",
+        )
+    report.warning(
+        "mode",
+        "the vault seeds its first revision from this document and ignores it afterwards: "
+        "change policy in the portal, or with zoeymcp policy import (operations.md §34)",
+    )
 
 
 # --- secrets -----------------------------------------------------------------------------------
@@ -170,6 +203,13 @@ def _check_secret_refs(policy: Policy, report: _Report, environ: Mapping[str, st
         if not ref.startswith("env:"):
             continue
         var = ref.removeprefix("env:")
+        if fields.reserved_env(var):
+            # In every mode: the master keys, the policy and the gateway's key are never a secret
+            # to send upstream, and the vault can't tell one that is.
+            report.error(
+                path, f"{ref} names one of ZoeyMCP's own variables, which no secret may come from"
+            )
+            continue
         if path.startswith("connectors.") and path.endswith(".password"):
             report.error(
                 path,
@@ -1159,6 +1199,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
             _check_pins(path, server.tools.include, server.review, report)
         else:
             _check_toolkit(path, server, routes, remote_routes, report)
+        _check_declined(path, server, report)
     limits = gateway.limits
     if limits.max_result_bytes > limits.max_upstream_message_bytes:
         report.error(
@@ -1198,6 +1239,16 @@ def _check_toolkit(
             report.error(f"{s_path}.route", "a toolkit must not speak raw MCP to a reviewed server")
         for index, rule in enumerate(binding.rules):
             _check_toolkit_rule(f"{s_path}.rules[{index}]", rule, route, report)
+
+
+def _check_declined(path: str, server: RemoteServer | ToolkitServer, report: _Report) -> None:
+    for tool in sorted(set(server.declined) & set(server.tools.include)):
+        report.error(f"{path}.declined", f"{tool!r} is both included and declined")
+    if isinstance(server, ToolkitServer) and server.pinning == "off" and server.declined:
+        report.warning(
+            f"{path}.declined",
+            "with pinning off a declined tool can't be told apart when it changes",
+        )
 
 
 def _check_toolkit_rule(path: str, rule: ToolkitRule, route: Route, report: _Report) -> None:
@@ -1386,12 +1437,8 @@ def _check_mcp_route(
 
 
 def _check_upstream_server(path: str, server: RemoteServer, report: _Report) -> None:
-    if server.enable:
-        report.error(
-            f"{path}.enable",
-            "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
-            "the gateway serves tools only",
-        )
+    for capability in server.enable:
+        report.error(f"{path}.enable", _ENABLE_REFUSED.get(capability, _TOOLS_ONLY))
     if server.shared_session:
         report.warning(
             f"{path}.shared_session",

@@ -26,7 +26,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from .check import check_policy
 from .findings import Finding, format_location
-from .merge import REVIEW_BLOCKS, Merged, Path, describe, merge
+from .merge import Merged, Path, describe, merge
 from .schema import (
     _SCOPE_TOKEN,
     MAX_SCOPES,
@@ -55,6 +55,9 @@ _TOOL_NAME: Final = TypeAdapter(ToolName)
 _ENTRY: Final = TypeAdapter(PrivateHostPort)
 _ERA: Final[TypeAdapter[Era]] = TypeAdapter(Era)
 _SEPARATOR: Final[TypeAdapter[ScopeSeparator]] = TypeAdapter(ScopeSeparator)
+# The blocks a review's op writes, each replaced whole. A fragment may also replace a server's
+# declined block (merge.REVIEW_BLOCKS), which no op writes yet.
+_REVIEW_WRITES: Final = ("tools", "review")
 
 
 class ChangeRefused(ValueError):
@@ -224,7 +227,7 @@ class PolicyChange:
         paths: list[Path] = []
         for op in self.ops:
             if isinstance(op, SetServerReview):
-                paths += [("gateway", "servers", op.name, block) for block in REVIEW_BLOCKS]
+                paths += [("gateway", "servers", op.name, block) for block in _REVIEW_WRITES]
             elif isinstance(op, SetCredential):
                 paths.append(("credentials", op.name))
         return tuple(paths)

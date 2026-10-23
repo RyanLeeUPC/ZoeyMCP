@@ -112,6 +112,7 @@ FIELDS: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
             call_timeout=INTEGER,
             tools="Tools",
             review=STRING_MAP,
+            declined=STRING_MAP,
         ),
         "Tools": _table(include=STRINGS, allow=STRINGS, approve=STRINGS),
     }

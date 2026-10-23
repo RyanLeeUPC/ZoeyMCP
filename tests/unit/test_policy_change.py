@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from zoeymcp.common.policy import Policy, parse_policy
@@ -417,6 +418,24 @@ def test_a_review_replaces_tools_and_review_whole() -> None:
     assert server.review == {"get_quote": PIN_A}
     assert server.era == "modern"
     assert server.route == "broker-mcp"
+
+
+def test_a_review_keeps_the_servers_declined_block() -> None:
+    """No op writes ``declined`` yet (M6 design step 12a makes the review write it): a review
+    that includes a declined tool fails check (row 3) until the entry is deleted by hand."""
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    raw["gateway"]["servers"]["broker-read"]["declined"] = {"get_news": PIN_B}
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
+    tools = Tools(include=["get_quote", "get_news"], allow=["get_quote", "get_news"])
+    pins = {"get_quote": PIN_A, "get_news": PIN_A}
+    change = PolicyChange("t", (SetServerReview("broker-read", tools, pins, era="modern"),))
+    assert ("gateway", "servers", "broker-read", "declined") not in change.replace()
+    merged = apply(policy, change)
+    assert merged.gateway is not None
+    assert merged.gateway.servers["broker-read"].declined == {"get_news": PIN_B}
+    assert [(f.path, f.message) for f in validate(policy, change) if f.level == "error"] == [
+        ("gateway.servers.broker-read.declined", "'get_news' is both included and declined")
+    ]
 
 
 def test_a_review_without_an_era_keeps_the_servers() -> None:

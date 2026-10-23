@@ -519,6 +519,8 @@ within a second or two (it long-polls its view, §9). In the standard tier the l
 `HUP` on to both. The vault:
 
 - A policy that fails is refused (`reload_refused` in the log), and the running one stays.
+  So is a policy whose `egress_key_generation` is below the running policy's: the lower
+  generation's key was retired (§31).
 - A reload that fails in some other way logs `reload_failed` with the error's type, and the
   running policy stays. The launcher's `TERM` after it still stops the process.
 - On success the log has `reload_ok`, with `oauth_reset` listing the OAuth credentials whose
@@ -579,6 +581,15 @@ same as any other. The old `url` splits in two: its scheme, host and port become
 `/mcp` would send `/mcp/mcp`). The route has `callers: [gateway]`, `stream: true`, rules allowing
 `POST`, `GET` and `DELETE` on that path, and a `header` credential holding the bridge's token; the
 old `egress` list moves to the route's `program.egress`. See §33, A stdio server behind a bridge.
+
+**Upgrading to M6: check.** An `env:` reference that names one of ZoeyMCP's own variables
+(any name that starts with `ZOEYMCP_`, such as `ZOEYMCP_MASTER_KEY` or `ZOEYMCP_GATEWAY_KEY`) is
+now an error in every mode, at start and on reload: keep that secret in the store, or under a
+variable of its own name. No shipped policy has one. `check` now reads `mode` for two findings:
+`mode: managed` is a warning that the vault seeds its first revision from the document and
+ignores it afterwards, and without an `admin` block it is also an error ("managed mode is edited
+in the portal"). The vault still refuses to start in managed mode until managed mode lands. A
+policy with `mode: declarative` checks as before.
 
 ## 8. Provider notes
 
@@ -2663,9 +2674,10 @@ role, which onboarding needs (§11, "Through the egress role"); both take a rest
 `ZOEYMCP_EGRESS_KEY=...` for the policy's `egress_key_generation` (1 by default), and the
 generation on stderr. The key reads the allowlists and nothing else: the vault refuses it on
 every other path, and on the gateway's link socket, and the gateway's key on the allowlists.
-To change it, raise `egress_key_generation` and reload: the old key is refused at once (there is
-no rotation window), so the role refuses new tunnels within 300 s unless it is given the new key
-(update the file and send it `SIGHUP`, or set the variable and recreate it). The vault's list
+To change it, raise `egress_key_generation` and reload; never lower it (a reload that lowers it
+is refused, `reload_refused`). The old key is refused at once (there is no rotation window), so
+the role refuses new tunnels within 300 s unless it is given the new key (update the file and
+send it `SIGHUP`, or set the variable and recreate it). The vault's list
 is the policy's destinations (`check --emit-egress-allowlist` shows the same), plus each
 onboarding's allowance while it runs (§11, "Through the egress role"). `health` reports
 `egress_allowlist_stale` (§3) when a role stops fetching, when its key is refused, or, with

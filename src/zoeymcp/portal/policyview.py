@@ -62,6 +62,7 @@ def _fields(*shown_names: str, **special: Treatment) -> Mapping[str, Treatment]:
 _UPSTREAM: Final = (
     "tools",
     "review",
+    "declined",
     "on_drift",
     "shared_session",
     "wrap_results",
@@ -162,6 +163,7 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
             "tools",
             "pinning",
             "review",
+            "declined",
             "on_drift",
             "slots",
             "wrap_results",

@@ -827,6 +827,50 @@ def test_a_reload_that_goes_backwards_is_refused(
 PROXY = "http://proxy:3128"
 
 
+def _egress_generation(tmp_path: Path, example_text: str, generation: int) -> str:
+    path = tmp_path / f"egress-{generation}.yaml"
+    text = example_text.replace(
+        "gateway_key_generation: 1",
+        f"gateway_key_generation: 1\negress_key_generation: {generation}",
+    )
+    path.write_bytes(text.encode())
+    return str(path)
+
+
+def test_reload_refuses_a_lower_egress_generation(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """M6 design E.2's declarative exception: the lower generation's key was retired, so a reload
+    that lowers it is refused and the running policy stays; the same or a higher one loads."""
+    environ = env()
+    start = _egress_generation(tmp_path, example_text, 3)
+    runtime = load_runtime(start, tmp_path / "state", environ)
+    app = VaultApp(
+        runtime.policy, runtime.store, runtime.keys, environ={}, gateway_keys=runtime.gateway_keys
+    )
+    before = app.policy
+    server.reload_policy(app, _egress_generation(tmp_path, example_text, 2), environ)
+    line = _log_lines(log_buffer)[-1]
+    assert line["event"] == "reload_refused"
+    assert line["reason"] == (
+        "egress_key_generation 2 is below 3, the running policy's: that would revive a retired key"
+    )
+    assert app.policy is before
+    server.reload_policy(app, start, environ)
+    assert _log_lines(log_buffer)[-1]["event"] == "reload_ok"
+    assert app.policy.egress_key_generation == 3
+    server.reload_policy(app, _egress_generation(tmp_path, example_text, 4), environ)
+    assert _log_lines(log_buffer)[-1]["event"] == "reload_ok"
+    assert app.policy.egress_key_generation == 4
+    # Below the new running generation now, not only below the start's.
+    server.reload_policy(app, start, environ)
+    assert _log_lines(log_buffer)[-1]["reason"] == (
+        "egress_key_generation 3 is below 4, the running policy's: that would revive a retired key"
+    )
+    assert app.policy.egress_key_generation == 4
+    asyncio.run(app.aclose())
+
+
 def test_a_bump_that_cant_be_written_is_refused(
     tmp_path: Path,
     example_text: str,

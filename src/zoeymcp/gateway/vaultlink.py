@@ -28,6 +28,7 @@ import httpx2
 from ..common import canonical
 from ..common.ledgerreport import PATH as REPORT_PATH
 from ..common.logs import refuse_type
+from ..common.policy.fields import VAULT_ONLY_ENV
 from . import logs
 from .egressrules import CallRegistry, Outgoing, Target, check
 
@@ -554,7 +555,7 @@ def review_client(
 
 def environ_has_no_secrets(environ: Mapping[str, str]) -> str | None:
     """G1: the variables that must never be in the gateway's environment, by name, or None."""
-    for name in ("ZOEYMCP_MASTER_KEY", "ZOEYMCP_MASTER_KEY_PREVIOUS", "ZOEYMCP_CONFIG"):
+    for name in VAULT_ONLY_ENV:
         if name in environ:
             return name
     return None

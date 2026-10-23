@@ -359,6 +359,43 @@ def test_empty_blocks_and_every_scalar_kind() -> None:
     assert load_mapping(text) == change.data()
 
 
+def test_a_servers_declined_block_is_written_after_its_pins() -> None:
+    """M6 design A.4: ``declined`` is a review block, a map of tool names to pins like
+    ``review``; a server without one writes none."""
+    pin_b = "sha256:" + "b" * 64
+    server = RemoteServer.model_validate(
+        {
+            "kind": "remote",
+            "route": "r",
+            "tools": {"include": ["read"], "allow": ["read"]},
+            "review": {"read": PIN_A},
+            "declined": {"write": pin_b, "yes": pin_b},
+        }
+    )
+    change = PolicyChange("t", (AddServer("s", server),))
+    text = emit(change)
+    assert (
+        f'      review:\n        "read": "{PIN_A}"\n'
+        f'      declined:\n        "write": "{pin_b}"\n        "yes": "{pin_b}"\n'
+    ) in text
+    assert load_mapping(text) == change.data()
+    assert yaml.safe_load(text)["gateway"]["servers"]["s"]["declined"] == {
+        "write": pin_b,
+        "yes": pin_b,
+    }
+    plain = RemoteServer.model_validate({"kind": "remote", "route": "r"})
+    assert "declined" not in emit(PolicyChange("t", (AddServer("s", plain),)))
+
+
+def test_a_declined_entry_outside_the_rule_is_refused() -> None:
+    assert stub_refused({"gateway": {"servers": {"x": {"declined": {"a": 1}}}}}) == (
+        "gateway.servers.x.declined.a",
+        "type",
+    )
+    server = {"gateway": {"servers": {"x": {"declined": {"\u00e9": PIN_A}}}}}
+    assert stub_refused(server) == ("gateway.servers.x.declined.\u00e9", "characters")
+
+
 def test_names_that_read_as_other_types_stay_strings() -> None:
     """``yes``, ``on``, ``1e3``, ``0x10``, ``.inf`` and ``null`` stay strings even to a YAML 1.1
     loader, as keys and as values (``~``, ``<<`` and ``12:30`` aren't tool names)."""
@@ -720,6 +757,7 @@ def servers(draw: st.DrawFn) -> RemoteServer:
         "call_timeout": st.integers(1, 3600),
         "tools": st.fixed_dictionaries({"include": st.lists(tool_names, max_size=3)}),
         "review": st.dictionaries(tool_names, pins, max_size=3),
+        "declined": st.dictionaries(tool_names, pins, max_size=2),
     }.items():
         if draw(st.booleans()):
             data[key] = draw(strategy)

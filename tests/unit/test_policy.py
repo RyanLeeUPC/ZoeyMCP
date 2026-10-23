@@ -15,7 +15,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from zoeymcp.common.policy import Finding, PolicyError, check, check_policy, parse_policy
+from zoeymcp.common.policy import Finding, PolicyError, check, check_policy, fields, parse_policy
 from zoeymcp.common.policy.schema import (
     Client,
     Gateway,
@@ -28,6 +28,7 @@ from zoeymcp.common.policy.schema import (
     split_scope,
 )
 from zoeymcp.common.policy.view import build_view
+from zoeymcp.gateway.vaultlink import environ_has_no_secrets
 
 Raw = dict[str, Any]
 # agent1's token_sha256 in the example policy.
@@ -2210,7 +2211,7 @@ NO_BRIDGE_KIND = (
 
 
 def old_bridge(**fields: Any) -> Raw:
-    """A ``kind: bridge`` server as M6 wrote it."""
+    """A ``kind: bridge`` server as a policy before M7 wrote it."""
     return {
         "kind": "bridge",
         "url": "http://bridge.example:9000/mcp",
@@ -2917,20 +2918,235 @@ def test_a_program_needs_no_egress(example_raw: Raw) -> None:
     assert (program.egress, program.egress_private, program.holds_secret) == ([], [], False)
 
 
-@pytest.mark.parametrize("capability", ["resources", "completions", "roots"])
-def test_enable_is_an_error(example_raw: Raw, capability: str) -> None:
+TOOLS_ONLY = (
+    "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
+    "the gateway serves tools only"
+)
+NO_ELICITATION = (
+    "the gateway doesn't relay an upstream's elicitation; its own approval prompts are the only "
+    "questions agents see"
+)
+
+
+@pytest.mark.parametrize(
+    ("capability", "message"),
+    [
+        # M6 design A.2 rows 4-4c: the three kinds the gateway will serve keep today's text.
+        ("resources", TOOLS_ONLY),
+        ("prompts", TOOLS_ONLY),
+        ("completions", TOOLS_ONLY),
+        ("sampling", "sampling is deprecated in MCP 2026-07-28 and the gateway never relays it"),
+        ("roots", "roots is deprecated in MCP 2026-07-28 and the gateway never relays it"),
+        ("elicitation", NO_ELICITATION),
+    ],
+)
+def test_enable_is_an_error(example_raw: Raw, capability: str, message: str) -> None:
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
     raw["gateway"]["servers"]["broker-trade"]["enable"] = [capability]
-    message = (
-        "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
-        "the gateway serves tools only"
-    )
     found = errors(run(raw))
     assert found == [
         f"gateway.servers.broker-read.enable: {message}",
         f"gateway.servers.broker-trade.enable: {message}",
     ]
+
+
+def test_each_enabled_capability_has_its_own_error(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["enable"] = ["roots", "prompts", "elicitation"]
+    assert errors(run(raw)) == [
+        f"gateway.servers.broker-read.enable: {TOOLS_ONLY}",
+        "gateway.servers.broker-read.enable: roots is deprecated in MCP 2026-07-28 and the "
+        "gateway never relays it",
+        f"gateway.servers.broker-read.enable: {NO_ELICITATION}",
+    ]
+    raw["gateway"]["servers"]["broker-read"]["enable"] = []
+    assert errors(run(raw)) == []
+
+
+# --- ZoeyMCP's own variables and the mode (M6 design A.2 rows 1, 2 and 7) -----------------------
+
+RESERVED_ENV = "names one of ZoeyMCP's own variables, which no secret may come from"
+
+
+def _set_ref(raw: Raw, path: str, ref: str) -> None:
+    section, name, field = path.split(".")
+    raw[section][name][field] = ref
+
+
+def _at(findings: list[Finding], path: str) -> list[str]:
+    return [f"{f.level} {f.message}" for f in findings if f.path == path]
+
+
+@pytest.mark.parametrize(
+    ("path", "name"),
+    [
+        ("credentials.music-stats.secret", "ZOEYMCP_MASTER_KEY"),
+        ("credentials.broker-mcp.client_id", "ZOEYMCP_GATEWAY_KEY"),
+        ("credentials.broker-mcp.client_secret", "ZOEYMCP_MASTER_KEY_PREVIOUS"),
+        ("credentials.broker-mcp.refresh_token", "ZOEYMCP_CONFIG"),
+        ("connectors.mail-out.username", "ZOEYMCP_BRIDGE_FETCH_TOKEN"),
+        ("connectors.mail-out.password", "ZOEYMCP_EGRESS_KEY"),
+        ("connectors.mail-out.password", "ZOEYMCP_"),
+        # In any case: Windows reads its environment so.
+        ("credentials.music-stats.secret", "zoeymcp_master_key"),
+        ("connectors.mail-out.username", "Zoeymcp_KEY"),
+    ],
+)
+def test_an_env_reference_to_a_zoeymcp_variable_is_an_error(
+    example_raw: Raw, path: str, name: str
+) -> None:
+    """Row 1, in every mode, and the only finding at its path: set or not, the variable is never
+    read as a secret."""
+    for mode in ("declarative", "managed"):
+        raw = copy.deepcopy(example_raw)
+        raw["mode"] = mode
+        _set_ref(raw, path, f"env:{name}")
+        expected = [f"error env:{name} {RESERVED_ENV}"]
+        assert _at(run(raw), path) == expected
+        assert _at(run(raw, environ={}), path) == expected
+        assert _at(run(raw, environ={name: "a\nb"}), path) == expected
+
+
+def test_a_reference_after_a_zoeymcp_variable_is_still_checked(example_raw: Raw) -> None:
+    """Row 1 ends that reference's checks, not the walk: a connector's after it keeps its own."""
+    raw = copy.deepcopy(example_raw)
+    _set_ref(raw, "credentials.music-stats.secret", "env:ZOEYMCP_MASTER_KEY")
+    _set_ref(raw, "connectors.mail-out.username", "env:MAIL_USER")
+    findings = run(raw)
+    assert _at(findings, "credentials.music-stats.secret") == [
+        f"error env:ZOEYMCP_MASTER_KEY {RESERVED_ENV}"
+    ]
+    assert _at(findings, "connectors.mail-out.username") == [
+        "warning secret read from env var MAIL_USER: it isn't encrypted at rest or bound to its "
+        "origins; prefer store:<name>"
+    ]
+
+
+@pytest.mark.parametrize("name", ["MY_ZOEYMCP_KEY", "ZOEYMCP", "ZOEYMCPKEY", "XZOEYMCP_KEY"])
+def test_a_name_that_only_looks_like_one_of_zoeymcps_is_an_ordinary_reference(
+    example_raw: Raw, name: str
+) -> None:
+    raw = copy.deepcopy(example_raw)
+    _set_ref(raw, "credentials.music-stats.secret", f"env:{name}")
+    assert _at(run(raw, environ={name: "x"}), "credentials.music-stats.secret") == [
+        f"warning secret read from env var {name}: it isn't encrypted at rest or bound to its "
+        "origins; prefer store:<name>"
+    ]
+
+
+def test_the_gateway_still_refuses_only_the_vaults_three_variables() -> None:
+    """F-42: G1's three names, from the shared constant. The gateway's own variables start with
+    the prefix row 1 refuses, and still pass its start."""
+    assert fields.VAULT_ONLY_ENV == (
+        "ZOEYMCP_MASTER_KEY",
+        "ZOEYMCP_MASTER_KEY_PREVIOUS",
+        "ZOEYMCP_CONFIG",
+    )
+    assert all(fields.reserved_env(name) for name in fields.VAULT_ONLY_ENV)
+    own = {
+        "ZOEYMCP_GATEWAY_KEY": "k",
+        "ZOEYMCP_GATEWAY_KEY_FILE": "/run/secrets/k",
+        "ZOEYMCP_BRIDGE_FETCH_TOKEN": "t",
+    }
+    assert all(fields.reserved_env(name) for name in own)
+    assert environ_has_no_secrets(own) is None
+    for name in fields.VAULT_ONLY_ENV:
+        assert environ_has_no_secrets({**own, name: "x"}) == name
+    assert not fields.reserved_env("MY_ZOEYMCP_KEY")
+    assert fields.reserved_env("zoeymcp_key")
+
+
+MANAGED_NEEDS_ADMIN = (
+    "mode: managed mode is edited in the portal: add an admin block, or use mode: declarative"
+)
+MANAGED_SEEDS = (
+    "mode: the vault seeds its first revision from this document and ignores it afterwards: "
+    "change policy in the portal, or with zoeymcp policy import (operations.md §34)"
+)
+
+
+def test_managed_mode_needs_an_admin_block(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["mode"] = "managed"
+    del raw["admin"]
+    findings = run(raw)
+    assert errors(findings) == [MANAGED_NEEDS_ADMIN]
+    assert MANAGED_SEEDS in warnings(findings)
+    # Declarative mode needs none: the example less its portal checks clean.
+    raw["mode"] = "declarative"
+    assert errors(run(raw)) == []
+
+
+def test_managed_mode_warns_that_the_document_only_seeds(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["mode"] = "managed"
+    findings = run(raw)
+    assert errors(findings) == []
+    assert warnings(findings) == sorted([*warnings(run(example_raw)), MANAGED_SEEDS])
+    assert not any(f.path == "mode" for f in run(example_raw))
+
+
+# --- declined tools (M6 design A.2 rows 3, 3b) ---------------------------------------------------
+
+PIN_D = "sha256:" + "d" * 64
+
+
+@pytest.mark.parametrize("server", ["broker-read", "mail"])
+def test_a_declined_tool_that_is_also_included_is_an_error(example_raw: Raw, server: str) -> None:
+    raw = copy.deepcopy(example_raw)
+    included = raw["gateway"]["servers"][server]["tools"]["include"][0]
+    raw["gateway"]["servers"][server]["declined"] = {included: PIN_D, "other": PIN_D}
+    assert errors(run(raw)) == [
+        f"gateway.servers.{server}.declined: {included!r} is both included and declined"
+    ]
+    # Declining only what isn't included is clean, and changes no other finding.
+    raw["gateway"]["servers"][server]["declined"] = {"other": PIN_D, "third": PIN_D}
+    assert errors(run(raw)) == []
+    assert warnings(run(raw)) == warnings(run(example_raw))
+
+
+def test_a_declined_tool_on_a_toolkit_without_pinning_warns(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    mail = raw["gateway"]["servers"]["mail"]
+    mail.update(pinning="off", declined={"other": PIN_D})
+    del mail["review"]
+    message = (
+        "gateway.servers.mail.declined: with pinning off a declined tool can't be told apart "
+        "when it changes"
+    )
+    assert message in warnings(run(raw))
+    assert errors(run(raw)) == []
+    del mail["declined"]
+    assert message not in warnings(run(raw))
+    # With pinning required, a declined tool is told apart by its pin.
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["mail"]["declined"] = {"other": PIN_D}
+    assert not any(".declined" in w for w in warnings(run(raw)))
+
+
+def test_declined_is_a_map_of_tool_names_to_pins(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["declined"] = {"t": "sha256:short"}
+    assert [e.split(":")[0] for e in schema_errors(raw)] == [
+        "gateway.servers.broker-read.remote.declined.t"
+    ]
+    raw["gateway"]["servers"]["broker-read"]["declined"] = {"bad name": PIN_D}
+    assert [e.split(":")[0] for e in schema_errors(raw)] == [
+        "gateway.servers.broker-read.remote.declined.bad name.[key]"
+    ]
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["mail"]["declined"] = {"t": "sha256:short"}
+    assert [e.split(":")[0] for e in schema_errors(raw)] == [
+        "gateway.servers.mail.toolkit.declined.t"
+    ]
+    raw["gateway"]["servers"]["mail"]["declined"] = {"bad name": PIN_D}
+    assert [e.split(":")[0] for e in schema_errors(raw)] == [
+        "gateway.servers.mail.toolkit.declined.bad name.[key]"
+    ]
+    policy = parse_policy(yaml.safe_dump(example_raw, sort_keys=False), "test")
+    assert policy.gateway is not None
+    assert all(server.declined == {} for server in policy.gateway.servers.values())
 
 
 def test_unknown_capabilities_are_schema_errors(example_raw: Raw) -> None:

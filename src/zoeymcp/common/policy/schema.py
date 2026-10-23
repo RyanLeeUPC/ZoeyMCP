@@ -704,6 +704,9 @@ class _UpstreamServer(_Model):
     tools: Tools = Tools()
     # "sha256:<hex>" is pin projection v1.
     review: dict[ToolName, Pin] = {}
+    # Tools the operator saw and left out, by their pins: a declined tool whose pin no longer
+    # matches what the server lists is unreviewed again.
+    declined: dict[ToolName, Pin] = {}
     on_drift: Literal["hide", "fail"] = "hide"
     shared_session: bool = False  # legacy upstreams only
     wrap_results: bool = False
@@ -746,6 +749,7 @@ class ToolkitServer(_Model):
     # "off" serves the definitions the image holds; the classification floor still applies.
     pinning: Literal["required", "off"] = "required"
     review: dict[ToolName, Pin] = {}
+    declined: dict[ToolName, Pin] = {}  # as a remote server's; with pinning off, check warns
     on_drift: Literal["hide", "fail"] = "hide"  # treated as "hide" with pinning off
     slots: dict[SlotName, ToolkitSlot] = {}
     wrap_results: bool = False

@@ -262,3 +262,4 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.vault.oauth.tokens" = 95
 "zoeymcp.gateway.access" = 95
 "zoeymcp.gateway.egressrules" = 95
+"zoeymcp.common.yamlload" = 95

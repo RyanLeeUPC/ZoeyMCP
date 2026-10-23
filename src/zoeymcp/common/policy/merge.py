@@ -5,8 +5,8 @@ One function, :func:`merge`, is what the vault runs before it shows a fragment
 see the same merged policy:
 
 - two mappings merge key by key;
-- a ``replace`` path takes the fragment's value whole (a review's ``tools`` and ``review``, a
-  re-registered credential), so a re-review that drops a tool leaves no stale pin;
+- a ``replace`` path takes the fragment's value whole (a review's ``tools``, ``review`` and
+  ``declined``, a re-registered credential), so a re-review that drops a tool leaves no stale pin;
 - the top-level ``routes`` list merges by ``name``: a new name is appended, an existing name
   must be equal, else :class:`MergeConflict` names it;
 - the top-level ``egress_private`` list merges as a set, the base's order first, so "nothing here
@@ -49,7 +49,7 @@ CONTAINERS: Final[frozenset[Path]] = frozenset(
 )
 _NAME = re.compile(NAME_PATTERN)
 # The blocks a server's review replaces whole (E.4).
-REVIEW_BLOCKS: Final = ("tools", "review")
+REVIEW_BLOCKS: Final = ("tools", "review", "declined")
 
 
 @dataclass(frozen=True)

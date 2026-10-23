@@ -29,9 +29,9 @@ COMPOSE_FILES = (
 )
 
 
-def refusal(text: str) -> str:
+def refusal(text: str, **options: int) -> str:
     with pytest.raises(YAMLRejected) as caught:
-        load_mapping(text)
+        load_mapping(text, **options)
     return str(caught.value)
 
 
@@ -177,6 +177,40 @@ def test_a_key_that_isnt_a_string_is_refused_with_its_place(text: str, message: 
     assert refusal(text) == message
 
 
+def test_a_top_level_sequence_is_checked_from_the_root() -> None:
+    # Its items are constructed, and their keys checked, before the top level's type is.
+    assert refusal("- {1: x}") == "key 1 at /0 is not a string"
+    assert refusal("- a\n- [b, {2.5: c}]") == "key 2.5 at /1/1 is not a string"
+    assert refusal("- 1\n- 2\n") == "the top level must be a mapping"
+
+
+def test_the_shallowest_refusal_comes_first() -> None:
+    # A collection's keys are all checked before anything inside its values is constructed.
+    assert refusal("a: {b: {1: x}}\nc: {2: y}") == "key 2 at /c is not a string"
+    assert refusal("a: [[{1: x}]]\nb: [{2: y}]") == "key 2 at /b/0 is not a string"
+
+
+def test_deep_construction_is_passed_on() -> None:
+    # A loader of its own for each, since a constructed node is kept and handed back.
+    text = "a: {b: [1]}\nc: [[2], {d: 3}]\n"
+    loader = StrictLoader(text)
+    try:
+        node = loader.get_single_node()
+        assert isinstance(node, yaml.MappingNode)
+        assert loader.construct_mapping(node, deep=True) == {"a": {"b": [1]}, "c": [[2], {"d": 3}]}
+    finally:
+        loader.dispose()
+    loader = StrictLoader(text)
+    try:
+        node = loader.get_single_node()
+        assert isinstance(node, yaml.MappingNode)
+        sequence = node.value[1][1]
+        assert isinstance(sequence, yaml.SequenceNode)
+        assert loader.construct_sequence(sequence, deep=True) == [[2], {"d": 3}]
+    finally:
+        loader.dispose()
+
+
 def test_a_key_is_checked_before_the_duplicate_rule() -> None:
     assert refusal("1: a\n1: b\n") == "top-level key 1 is not a string"
     assert refusal("a: x\nb:\n  c: 1\n  c: 2\n") == "duplicate key 'c' at line 4, column 3"
@@ -226,6 +260,35 @@ def test_siblings_dont_add_to_the_depth() -> None:
     sibling = "[" * 62 + "]" * 62
     text = "".join(f"k{i}: {sibling}\n" for i in range(100))
     assert len(load_mapping(text)) == 100
+
+
+def test_the_depth_drops_back_one_level_as_a_collection_closes() -> None:
+    # /a/0 closes at the third level, so its sibling /a/1 starts at the third level again.
+    deep = "[" * 62 + "]" * 62
+    assert depth(load_mapping(f"a: [[], {deep}]")) == 64
+    assert refusal(f"a: [[], [{deep}]]") == "nested deeper than 64 levels (line 1)"
+    assert refusal(f"a: {{}}\nb: [[{deep}]]") == "nested deeper than 64 levels (line 2)"
+
+
+class Pathed(StrictLoader):
+    """The strict loader with two path resolvers, which see each node's parent and index.
+
+    The implicit resolvers type a plain scalar first, so the quoted ones show the path resolvers
+    at work.
+    """
+
+
+Pathed.add_path_resolver("tag:yaml.org,2002:int", ["a"], str)
+Pathed.add_path_resolver("tag:yaml.org,2002:int", ["b", "c"], str)
+
+
+def test_a_nodes_parent_and_index_reach_the_path_resolvers() -> None:
+    def load(text: str) -> Any:
+        return yaml.load(text, Loader=Pathed)  # noqa: S506 - a StrictLoader
+
+    assert load("a: '1'\nx: '1'\n") == {"a": 1, "x": "1"}
+    text = "b: {c: '1', x: '1'}\nx: {c: '1'}\n"
+    assert load(text) == {"b": {"c": 1, "x": "1"}, "x": {"c": "1"}}
 
 
 def test_a_key_counts_toward_the_depth() -> None:
@@ -359,14 +422,35 @@ def test_merge_key_text_is_just_a_key() -> None:
     assert load_mapping("<<: 1\n") == {"<<": 1}
 
 
+HINT = (
+    " (hint: in an inline [a, b] list, {name} starts a mapping; "
+    "put each path on its own '- ' line, or quote it)"
+)
+
+
 def test_braces_in_an_inline_list_get_a_hint() -> None:
-    with pytest.raises(YAMLRejected, match="put each path on its own"):
-        load_mapping("paths: [/docs/{doc}/rows]")
+    message = refusal("paths: [/docs/{doc}/rows]")
+    # PyYAML's own message, then the hint once.
+    assert message.startswith("invalid YAML: while parsing a flow sequence\n")
+    assert "but got '{'\n" in message
+    assert message.endswith("^" + HINT)
+    assert message.count("(hint:") == 1
+
+
+def test_an_inline_list_left_open_gets_no_hint() -> None:
+    # A flow sequence, but no brace in the error.
+    message = refusal("a: [1\n")
+    assert message.startswith("invalid YAML: while parsing a flow sequence\n")
+    assert "hint" not in message
 
 
 def test_size_limit() -> None:
-    with pytest.raises(YAMLRejected, match="larger than"):
-        load_mapping("a: " + "x" * 200, max_bytes=100)
+    assert refusal("a: " + "x" * 200, max_bytes=100) == "document is larger than 100 bytes"
+    # The limit is in UTF-8 bytes, and a document of exactly the limit loads.
+    assert load_mapping("a: b", max_bytes=4) == {"a": "b"}
+    assert refusal("a: b", max_bytes=3) == "document is larger than 3 bytes"
+    assert load_mapping("a: é", max_bytes=5) == {"a": "é"}
+    assert refusal("a: é", max_bytes=4) == "document is larger than 4 bytes"
 
 
 # --- every shipped policy loads as before ---------------------------------------------------------

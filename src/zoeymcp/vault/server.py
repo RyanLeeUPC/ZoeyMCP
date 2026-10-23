@@ -656,7 +656,8 @@ def reload_policy(
 
     Synchronous, like every writer of OAuth state: the token manager keeps its slots and tasks,
     so a reload never starts a second refresh (design D.13). A reload that takes effect wakes the
-    gateway's long polls of the view (M3 design D.2).
+    gateway's long polls of the view (M3 design D.2). A policy whose ``egress_key_generation`` is
+    below the running one's is refused, like a gateway key generation that goes backwards.
 
     The portal takes a changed ``admin.origins`` at once, ending the sessions of an origin that
     went away; its listener stays where it is until a restart (M5 design B.3).
@@ -665,6 +666,16 @@ def reload_policy(
         policy = load_policy(config, environ)
     except StartupError as exc:
         logs.event("reload_refused", reason=str(exc))
+        return
+    # The egress role's key generation only goes up: a lower one is a key the vault retired. Only
+    # against the running policy: no floor is kept across a restart.
+    running = app.policy.egress_key_generation
+    if policy.egress_key_generation < running:
+        logs.event(
+            "reload_refused",
+            reason=f"egress_key_generation {policy.egress_key_generation} is below {running}, the "
+            "running policy's: that would revive a retired key",
+        )
         return
     # Against the startup values, which every client, connector and onboarding keeps (M7 design
     # B.2, D-61): the proxy, and whether it is the egress role.
