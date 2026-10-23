@@ -60,7 +60,7 @@ from zoeymcp.common.policy.schema import (
     Route,
     Tools,
 )
-from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.common.yamlload import YAMLRejected, load_mapping
 from zoeymcp.portal import policyview
 
 from .test_policy_change import (
@@ -877,7 +877,7 @@ def test_document_escapes_what_emit_refuses() -> None:
         "yes": True,
         "no": False,
         "admin": None,
-        "numbers": {3: 1.5, "n": -2},
+        "numbers": {"m": 1.5, "n": -2},
         "nested": [[{"a": 1}], [[1, 2]]],
     }
     text = document(data)
@@ -885,7 +885,13 @@ def test_document_escapes_what_emit_refuses() -> None:
     assert all(re.fullmatch(r"[\x20-\x7e]*", line) for line in text.splitlines())
     assert load_mapping(text) == data
     assert '\n"yes": true\n"no": false\nadmin: null\n' in text
-    assert '\n  3: 1.5\n  "n": -2\n' in text
+    assert '\n  "m": 1.5\n  "n": -2\n' in text
+    # A key that isn't a string is written as its value would be, and the strict loader refuses
+    # it there as anywhere (M6 design B3).
+    numbered = document({"numbers": {3: 1.5}})
+    assert numbered == '"numbers":\n  3: 1.5\n'
+    with pytest.raises(YAMLRejected, match=r"^key 3 at /numbers is not a string$"):
+        load_mapping(numbered)
 
 
 def test_document_indents_and_takes_the_compose_form() -> None:

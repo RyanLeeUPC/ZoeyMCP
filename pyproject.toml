@@ -159,6 +159,7 @@ only_mutate = [
     "*zoeymcp/common/pinhash.py",
     "*zoeymcp/common/reviewreport.py",
     "*zoeymcp/common/suggest.py",
+    "*zoeymcp/common/yamlload.py",
     "*zoeymcp/common/policy/check.py",
     "*zoeymcp/common/policy/fields.py",
     "*zoeymcp/common/policy/callback.py",
