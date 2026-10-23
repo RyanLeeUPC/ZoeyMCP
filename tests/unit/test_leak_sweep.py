@@ -43,18 +43,25 @@ The egress role's key (M7 design G.3, O.5, step 17b) reaches the socket's ``GET 
 answer, the key file and the role's own requests, and nothing else: no log line of the vault or
 the role, no answer of the allowlist path or of a path it is refused on, and no health report;
 neither does a retired generation's key, or a key file the role can't use.
+
+A bridge's token (M7 design C.2, M.4, X14, step 18c2), made by ``secret set --generate``, reaches
+the store and the requests the bridge checks, and no answer or log line; neither does its hash,
+which only the generating answer shows. A ``--secret-env`` or ``--env`` value a child prints to
+stderr reaches no log line in the default mode, which counts (TI-13).
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import anyio
@@ -71,6 +78,10 @@ from tests.fakes.oauth_server import (
 )
 from tests.unit import onboard_model
 from tests.unit.report_model import DIGEST, PIN, asked_line
+from zoeymcp.bridge.admit import BridgeTokenHash
+from zoeymcp.bridge.child import Child, Spec
+from zoeymcp.bridge.main import Options, StartupError, check_options
+from zoeymcp.bridge.server import Bridge, Settings
 from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import main
 from zoeymcp.common import ledgerreport, pinhash
@@ -96,8 +107,10 @@ from zoeymcp.vault.secretops import Revoker
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
+from .test_admin import KEYS as ADMIN_KEYS
 from .test_admin import AdminRig, example_policy
 from .test_cli import Reviews as CliReviews
+from .test_netclient import bridges_policy
 from .test_no_secret_answers import Recording, signed_in, step_up
 from .test_no_secret_answers import Reviews as NoSecretReviews
 from .test_oauth_tokens import KEYS, FakeClock
@@ -1793,3 +1806,97 @@ def test_the_egress_key_reaches_the_role_and_nothing_else(tmp_path: Path) -> Non
     for key in (old, new, old[5:], new[5:]):
         assert key not in text, key
         assert [answer for answer in answers if key in answer] == []
+
+
+# --- a bridge's token and its child's stderr (M7 design C.2, C.3, M.4, step 18c2) ----------------
+
+BRIDGE_TOKEN_BYTES = b"leak-bridge-token-sentinel-00001"
+SECRET_ENV_VALUE = "leak-secret-env-sentinel-0001"
+ENV_VALUE = "leak-env-sentinel-0001"
+
+
+async def test_a_bridge_token_reaches_the_store_and_its_bridge_and_nothing_else(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    rig = AdminRig(tmp_path)
+    policy = bridges_policy({"fetch": "unix:/run/zoeymcp-bridge-fetch/mcp.sock"})
+    rig.set_policy(policy)
+    rig.admin = AdminApp(
+        rig.store,
+        ADMIN_KEYS,
+        lambda: rig.policy,
+        rig.setup,
+        rig.tokens,
+        random=lambda size: BRIDGE_TOKEN_BYTES[:size],
+    )
+    token = base64.urlsafe_b64encode(BRIDGE_TOKEN_BYTES).rstrip(b"=").decode()
+    made = await rig.call("PUT", "/secrets/fetch-token", {"generate": True})
+    digest = made.json()["sha256"]
+    answers = [
+        (await rig.call("GET", "/secrets")).text,
+        (await rig.call("GET", "/health")).text,
+    ]
+    await rig.token_client.aclose()
+    # The bridge, holding only the hash, as it would be started with it.
+    settings = Settings(
+        "legacy", Spec(("server",), {}, "/"), BridgeTokenHash(digest), str(tmp_path / "ready")
+    )
+    transport = httpx.ASGITransport(app=Bridge(settings))
+    initialize = b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+    async with httpx.AsyncClient(transport=transport, base_url="http://bridge.invalid") as bridge:
+        for headers in (
+            {"authorization": f"Bearer {token}"},
+            {"authorization": f"Bearer {token}x"},
+            {"authorization": f"Bearer {token}", "origin": "https://elsewhere.example"},
+            {"authorization": f"Bearer {digest}"},
+        ):
+            headers["content-type"] = "application/json"
+            got = await bridge.post("/mcp", headers=headers, content=initialize)
+            answers.append(got.text + repr(got.headers.multi_items()))
+    text = log_lines.getvalue()
+    assert '"event":"bridge_refused"' in text
+    assert '"event":"secret_set"' in text
+    for value in (token, digest, digest.removeprefix("sha256:")):
+        assert value not in text, value
+        assert [answer for answer in answers if value in answer] == []
+    assert token not in made.text
+    binding = {"origins": ["unix:/run/zoeymcp-bridge-fetch/mcp.sock"]}
+    assert rig.store.get_for_binding("fetch-token", binding).reveal() == token
+
+
+async def test_a_childs_stderr_shows_no_env_value_by_default(log_lines: io.StringIO) -> None:
+    """The child's stderr through the bridge's own reader, in the default mode: counted, never
+    shown. ``--stderr text`` is refused beside a ``--secret-env`` (TI-13)."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(f"API_KEY={SECRET_ENV_VALUE}\nBASE={ENV_VALUE}\n".encode())
+    reader.feed_data(b"x" * 5000 + ENV_VALUE.encode() + b"\n" + SECRET_ENV_VALUE.encode())
+    reader.feed_eof()
+    process = SimpleNamespace(pid=4242, stdin=None, stdout=None, stderr=reader, returncode=0)
+    environment = {"API_KEY": SECRET_ENV_VALUE, "BASE": ENV_VALUE}
+    child = Child(
+        cast(Any, process),
+        asyncio.Event(),
+        Spec(("server",), environment, "/"),
+        "legacy",
+        "session",
+        lambda: 0.0,
+    )
+    await child._read_stderr()
+    child._finish()
+    with pytest.raises(StartupError, match="logs stderr as counts only") as refused:
+        check_options(
+            Options(
+                listen="127.0.0.1:9000",
+                era="legacy",
+                command=("server",),
+                secret_env=("API_KEY",),
+                stderr="text",
+            )
+        )
+    text = log_lines.getvalue()
+    assert '"event":"bridge_stderr","pid":4242,"lines":4,' in text
+    assert '"event":"bridge_child_exited"' in text
+    for value in (SECRET_ENV_VALUE, ENV_VALUE):
+        assert value not in text
+        assert value not in str(refused.value)
+        assert value not in repr(child.spec)

@@ -158,3 +158,40 @@ def test_each_get_has_its_own_stream_and_notifications_go_to_the_oldest() -> Non
     session.close_stream(third, 6.0)
     assert session.stream is None
     assert session.idle(16.0, 10.0)
+
+
+def test_a_new_id_has_id_bytes_of_randomness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The size is the bridge's own, not the library's default."""
+    monkeypatch.setattr(sessions, "ID_BYTES", 16)
+    assert len(base64.urlsafe_b64decode(new_id() + "==")) == 16
+
+
+def test_establish_takes_only_its_own_place() -> None:
+    table: Sessions[str] = Sessions(limit=3)
+    assert table.reserve()
+    assert table.reserve()
+    assert table.reserve()
+    table.establish("child", 0.0)
+    # One session and two still starting fill the three places.
+    assert not table.reserve()
+    table.release()
+    assert table.reserve()
+    assert not table.reserve()
+
+
+def test_streams_are_numbered_from_one() -> None:
+    session = Session("s", "c", 0.0)
+    assert [session.open_stream() for _ in range(3)] == [1, 2, 3]
+
+
+def test_each_request_counts_and_begin_is_a_use() -> None:
+    session = Session("s", "c", 0.0)
+    session.begin(5.0)
+    assert session.last_used == 5.0
+    session.begin(6.0)
+    assert session.requests == 2
+    session.finish(7.0)
+    assert session.requests == 1
+    assert not session.idle(100.0, 10.0)
+    session.finish(8.0)
+    assert session.idle(18.0, 10.0)

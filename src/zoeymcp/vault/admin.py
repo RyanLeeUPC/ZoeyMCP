@@ -14,10 +14,14 @@ setup code, ``GET /gateway-key`` the gateway key, and ``GET /egress-key`` the eg
 step-up: host access is the recovery path (M5 design E).
 
 ``PUT/DELETE /secrets/{name}`` decide with :mod:`.secretplan` and write with :mod:`.secretops`,
-which the portal shares (M5 design G). Secrets an oauth2 credential uses are written and deleted
-through the token manager, which first waits for any refresh of that slot (design D.12). If the
-store can't write its file, the change is kept in memory and the answer is a 500 that says so
-(B.4).
+which the portal shares (M5 design G). ``PUT`` with ``{"generate": true}`` in place of a value
+(``zoeymcp secret set NAME --generate``, M7 design C.2, GR-27) stores 32 random bytes in
+base64url through the same put, for a secret the policy binds to origins (a bridge's token, as
+any header credential's), and answers only the token's ``sha256:`` form: the token never leaves
+the vault. An OAuth slot or a connector's secret is refused (``generate_refused``). Secrets an
+oauth2 credential uses are written and deleted through the token manager, which first waits for
+any refresh of that slot (design D.12). If the store can't write its file, the change is kept
+in memory and the answer is a 500 that says so (B.4).
 
 ``zoeymcp gateway-key`` prints the gateway key and any rotation pending; ``--retire-previous``
 retires the previous key at once (M3 design C.2). ``zoeymcp egress-key`` prints the egress role's
@@ -56,6 +60,7 @@ the plan, and ``{"plan": ...}`` runs it if the copy hasn't changed since (M5 des
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import math
@@ -80,7 +85,7 @@ from ..common import files
 # The CLI reads these from common, so the gateway's entry path loads no vault code.
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
-from ..common.policy.schema import Policy
+from ..common.policy.schema import Policy, hash_token
 from ..portal import passkeys as passkey_file
 from ..portal import reviewview, setupcode
 from ..portal.passkeys import PasskeyError, Passkeys
@@ -132,6 +137,14 @@ PASSKEYS_UNAVAILABLE: Final = (
     "run zoeymcp setup-code --reset"
 )
 _FINGERPRINT: Final = re.compile(r"[0-9a-f]{16}")
+# A generated token (M7 design C.2): this many random bytes, in unpadded base64url.
+GENERATED_BYTES: Final = 32
+GENERATE_REFUSED: Final = SecretRefusal(
+    409,
+    "generate_refused",
+    "--generate makes a token for a header, query, path or basic credential; an OAuth or "
+    "connector secret is entered as it was given",
+)
 # Passkey refusals over the socket: status and text.
 _PASSKEY_REFUSALS: Final = {
     "unavailable": (503, PASSKEYS_UNAVAILABLE),
@@ -344,6 +357,17 @@ def _remove_synced(path: Path) -> None:
             os.close(dir_fd)
 
 
+def _connector_secret(policy: Policy, name: str) -> bool:
+    """Whether a connector uses ``store:<name>`` (as ``bindings.derive_binding`` finds it)."""
+    ref = f"store:{name}"
+    return any(ref in (c.password, c.username) for c in policy.connectors.values())
+
+
+def generated_token(random: Callable[[int], bytes]) -> str:
+    """A new token: :data:`GENERATED_BYTES` random bytes in unpadded base64url (C.2)."""
+    return base64.urlsafe_b64encode(random(GENERATED_BYTES)).rstrip(b"=").decode("ascii")
+
+
 def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
 
@@ -494,6 +518,7 @@ class AdminApp:
         revoker: secretops.Revoker | None = None,
         reviews: ReviewQueue | None = None,
         egress_fetched_ago: Callable[[], float | None] | None = None,
+        random: Callable[[int], bytes] = secrets.token_bytes,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -520,8 +545,11 @@ class AdminApp:
         the ``/review`` routes answer 503.
 
         ``egress_fetched_ago`` says how long ago the egress role last fetched its lists, for
-        health (M7 design J). Without it, health has no ``egress_allowlist_stale``."""
+        health (M7 design J). Without it, health has no ``egress_allowlist_stale``.
+
+        ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests)."""
         self._store = store
+        self._random = random
         self._reviews = reviews
         self._revoker = revoker
         self._onboard = onboard
@@ -595,12 +623,28 @@ class AdminApp:
             data: Any = json.loads(body)
         except ValueError:
             return _error(400, "body must be JSON")
-        plan = secretplan.plan_put(name, data, self._policy())
+        token = None
+        if isinstance(data, dict) and "generate" in data:
+            if data["generate"] is not True or not set(data) <= {"generate", "origins"}:
+                return _error(400, "expected {generate: true, origins?}")
+            token = generated_token(self._random)
+            data = {key: value for key, value in data.items() if key != "generate"}
+            data["value"] = token
+        policy = self._policy()
+        plan = secretplan.plan_put(name, data, policy)
         if isinstance(plan, SecretRefusal):
             return _refused(plan)
+        # A connector's secret is refused with or without --origin, which would bind it there.
+        if token is not None and (
+            plan.oauth or "origins" not in plan.binding or _connector_secret(policy, name)
+        ):
+            return _refused(GENERATE_REFUSED)
         binding = await secretops.put(self._store, self._tokens, plan, via="socket")
         if isinstance(binding, SecretRefusal):
             return _refused(binding)
+        if token is not None:
+            # Only the hash: the bridge holds it as ZOEYMCP_BRIDGE_TOKEN_SHA256 (X14).
+            return JSONResponse({"name": name, "binding": binding, "sha256": hash_token(token)})
         return JSONResponse({"name": name, "binding": binding})
 
     async def _delete(self, request: Request) -> Response:

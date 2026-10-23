@@ -48,6 +48,7 @@ Reason = Literal[
     "not_written",
     "not_found",
     "name_taken",
+    "generate_refused",
 ]
 
 _BINDING_REASONS: Final[dict[BindingReason, Reason]] = {

@@ -240,6 +240,17 @@ def test_stderr_counts_by_default_never_text() -> None:
     assert log.close() == []
 
 
+def test_a_lines_size_counts_what_its_reader_kept_back() -> None:
+    """``child.py`` keeps only a line's start; the count is the whole line's (FM-22)."""
+    log = StderrLog("counts", 100.0)
+    assert log.line(b"x" * 10, 100.0, 65537) == []
+    assert log.line(b"y\n", 100.0, None) == []
+    assert log.line(b"", 100.0, 0) == []
+    assert log.close() == [("bridge_stderr", {"lines": 3, "bytes": 65539})]
+    shown = StderrLog("text", 100.0)
+    assert shown.line(b"abc\n", 100.0, 9999) == [("bridge_stderr", {"text": "abc"})]
+
+
 def test_stderr_text_is_rate_limited() -> None:
     log = StderrLog("text", 0.0)
     shown = [log.line(f"line {n}\n".encode(), 1.0) for n in range(STDERR_LINES_MAX + 3)]

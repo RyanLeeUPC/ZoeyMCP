@@ -224,6 +224,8 @@ def test_the_bridge_token_hash_is_refused_nested(lines: io.StringIO) -> None:
     for wrapped in (held, [held], {"outer": [{"inner": (held,)}]}):
         with pytest.raises(TypeError, match=message):
             logs.event("oops", f=wrapped)
+        with pytest.raises(TypeError, match=message):
+            common_logs.Log("bridge").event("oops", f=wrapped)
     assert BridgeTokenHash in common_logs.refused_types()
     assert lines.getvalue() == ""
 
@@ -232,7 +234,7 @@ def test_a_registered_type_is_refused_in_every_role(
     refused_stand_in: None, lines: io.StringIO
 ) -> None:
     message = r"^refusing to log a secret \(ClientTokenLike\) in field 'token'$"
-    for role in ("vault", "gateway", "launcher", "egress"):
+    for role in ("vault", "gateway", "launcher", "egress", "bridge"):
         log = common_logs.Log(role)
         with pytest.raises(TypeError, match=message):
             log.event("oops", token=ClientTokenLike())

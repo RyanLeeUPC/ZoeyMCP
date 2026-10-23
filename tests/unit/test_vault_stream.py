@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import anyio
 import httpx
 import pytest
 from starlette.types import Message
@@ -26,8 +27,10 @@ from tests.fakes.harness import serve
 from zoeymcp.common.policy import Policy
 from zoeymcp.vault import logs
 from zoeymcp.vault.app import (
+    CONNECT_TIMEOUT,
     LISTENER_SCOPE_KEY,
     MAX_SCRUB_BYTES,
+    READ_TIMEOUT,
     REFUSAL_HEADER,
     REFUSAL_MARKER,
     CallerGone,
@@ -822,3 +825,42 @@ def test_a_closed_socket_closes_a_silent_upstream(tmp_path: Path, phase: str, ta
             assert echo.departed.wait(5)
     assert 0 <= echo.departures[0] - left < 1.0
     assert echo.received[0].header("authorization") == f"Bearer {SECRET}"
+
+
+# --- FM-19's in-process half: a bridge-shaped route has no read timeout (M7 design N.1, GR-10) ----
+
+
+@pytest.mark.parametrize("stream", [True, False])
+async def test_stream_route_has_no_read_timeout(tmp_path: Path, stream: bool) -> None:
+    """A bridge's route (a local MCP route, ``stream: true``) is sent with no read timeout, so a
+    call silent within the gateway's ``call_timeout`` isn't cut by the vault; a route that
+    doesn't stream keeps the vault's 60 s. The connect timeout is the same."""
+    pol = make_policy(
+        upstream="http://127.0.0.1:9000",
+        allow_insecure_upstream=True,
+        callers=["gateway"],
+        stream=stream,
+        rules=[{"methods": ["POST"], "paths": ["/mcp"]}],
+    )
+    timeouts: list[dict[str, float | None]] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, headers=SSE, content=b"data: {}\n\n")
+
+    store = SecretStore(tmp_path, KEYS)
+    store.load()
+    store.put("api-key", SECRET, origin_binding(["http://127.0.0.1:9000"]))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    app = VaultApp(pol, store, KEYS, client=client, environ={})
+    transport = httpx.ASGITransport(app=ListenerTag(app, "gateway"), client=("127.0.0.1", 4000))
+    try:
+        with anyio.fail_after(5):
+            async with httpx.AsyncClient(transport=transport, base_url="http://vault") as caller:
+                answer = await caller.post("/api/mcp", content=b"{}")
+    finally:
+        await app.aclose()
+    assert answer.status_code == 200, answer.text
+    [timeout] = timeouts
+    assert timeout["read"] == (None if stream else READ_TIMEOUT)
+    assert timeout["connect"] == CONNECT_TIMEOUT

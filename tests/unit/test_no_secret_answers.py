@@ -9,7 +9,8 @@ Each walk takes its routes from the route table, so a route added later is walke
   URI (D.4), which no answer carries.
   Only ``POST /setup-code`` (a new setup code), ``GET /gateway-key`` (the gateway key) and
   ``GET /egress-key`` (the egress role's key, M7 G.3) may carry a credential, each only its own:
-  the exceptions R61 records (Q23, DD-14).
+  the exceptions R61 records (Q23, DD-14). A token ``secret set --generate`` made (M7 C.2) is in
+  no answer, the one that made it included.
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
   a live slot, a value held by a pending ``secret.put``, a given client secret stored through
@@ -27,6 +28,7 @@ Each walk takes its routes from the route table, so a route added later is walke
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 import inspect
 import pkgutil
@@ -46,7 +48,7 @@ from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES, STATIC, Route
-from zoeymcp.vault.admin import HealthReader
+from zoeymcp.vault.admin import AdminApp, HealthReader
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
@@ -217,6 +219,37 @@ async def test_no_socket_answer_carries_what_a_registration_issued(tmp_path: Pat
         response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
         answers.append(response.text + repr(dict(response.headers)))
     assert [text for text in answers if carried(text, credentials)] == []
+    await rig.token_client.aclose()
+
+
+GENERATED = b"p1-generated-bridge-token-000001"
+
+
+async def test_no_socket_answer_carries_a_generated_token(tmp_path: Path) -> None:
+    """M7 C.2, GR-27: every route walked once ``secret set --generate`` made a token: none
+    carries it, and the answer that made it holds only its ``sha256:`` form."""
+    rig = AdminRig(tmp_path)
+    store_values(rig)
+    rig.admin = AdminApp(
+        rig.store,
+        KEYS,
+        lambda: rig.policy,
+        rig.setup,
+        rig.tokens,
+        random=lambda size: GENERATED[:size],
+    )
+    token = base64.urlsafe_b64encode(GENERATED).rstrip(b"=").decode()
+    made = await rig.call("PUT", "/secrets/music-stats", {"generate": True})
+    assert set(made.json()) == {"name", "binding", "sha256"}
+    answers = [made.text + repr(dict(made.headers))]
+    params = {**SOCKET_PARAMS, "onboarding": "unknown", "job": "unknown-job"}
+    for method, template in socket_routes(rig):
+        if (method, template) == ("PUT", "/secrets/{name}"):
+            continue  # it would replace the token
+        path = template.format(**params)
+        response = await rig.call(method, path, SOCKET_BODIES.get((method, template)))
+        answers.append(response.text + repr(dict(response.headers)))
+    assert [text for text in answers if token in text] == []
     await rig.token_client.aclose()
 
 

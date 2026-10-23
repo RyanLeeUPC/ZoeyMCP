@@ -173,11 +173,13 @@ class StderrLog:
         self._lines = 0
         self._bytes = 0
 
-    def line(self, data: bytes, now: float) -> list[LogLine]:
-        """What to log for one line, as read (its length counts its newline)."""
+    def line(self, data: bytes, now: float, size: int | None = None) -> list[LogLine]:
+        """What to log for one line, as read (its length counts its newline). ``size`` is the
+        whole line's length when ``data`` holds only its start (a reader keeps no more than a
+        logged line shows)."""
         out = self.tick(now)
         self._lines += 1
-        self._bytes += len(data)
+        self._bytes += len(data) if size is None else size
         if self.mode == "text" and self._lines <= STDERR_LINES_MAX:
             out.append(("bridge_stderr", {"text": stderr_line(data)}))
         return out

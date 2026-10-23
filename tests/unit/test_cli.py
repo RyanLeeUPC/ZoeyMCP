@@ -50,13 +50,15 @@ from zoeymcp.common.policy import Finding, Policy, parse_policy
 from zoeymcp.common.policy import change as policy_change
 from zoeymcp.common.policy import emit as policy_emit
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
-from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.common.policy.schema import GatewayLimits, hash_token
 from zoeymcp.common.policy.view import ViewRemoteServer, ViewToolkitServer, build_view
 from zoeymcp.common.reviewreport import fit
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import pins as gateway_pins
 from zoeymcp.gateway import review as gateway_review
+from zoeymcp.vault import admin as admin_module
 from zoeymcp.vault.admin import AdminApp, SetupCodes
+from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.netclient import RESOLVE_TIMEOUT
 from zoeymcp.vault.oauth import fetch
 from zoeymcp.vault.oauth.dcr import NOTES
@@ -66,7 +68,10 @@ from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_resu
 from zoeymcp.vault.store import SecretStore
 
 from .conftest import EXAMPLE_POLICY
+from .test_admin import KEYS as ADMIN_KEYS
+from .test_admin import AdminRig
 from .test_deploy import compose, inline_policy
+from .test_netclient import bridges_policy
 from .test_oauth_tokens import KEYS
 from .test_onboarding import staged as onboarding_staged
 from .test_policy_change import notes_change, review_change
@@ -3799,3 +3804,164 @@ def test_the_counts_line() -> None:
     )
     missing: dict[str, Any] = {"name": "x", "state": "missing", "definition": None, "findings": []}
     assert review_view.report_counts({"tools": [missing]})["tools"] == 0
+
+
+# --- zoeymcp bridge's command line (M7 design C.8, C.10) ----------------------------------------
+
+# What the standard launcher puts first (C.10), before the operator's arguments.
+LAUNCHED = [
+    "bridge",
+    "--control-fd",
+    "5",
+    "--listen",
+    "unix:/run/zoeymcp-bridge-fetch/mcp.sock",
+    "--peer-uid",
+    "10001",
+    "--work-dir",
+    "/run/zoeymcp-bridge-fetch/work",
+]
+
+
+def bridge_parse_error(words: list[str]) -> str:
+    """The parser's refusal of ``words`` (exit 2), as it prints it."""
+    with pytest.raises(SystemExit) as info, contextlib.redirect_stderr(io.StringIO()) as printed:
+        main_module._build_parser().parse_args(words)
+    assert info.value.code == 2
+    return printed.getvalue()
+
+
+@pytest.mark.parametrize("abbreviated", [["--liste", "127.0.0.1:9"], ["--peer=10002"]])
+def test_the_bridge_parser_takes_no_abbreviation(abbreviated: list[str]) -> None:
+    words = ["bridge", *abbreviated, "--era", "legacy", "--", "server"]
+    assert "unrecognized arguments" in bridge_parse_error(words)
+
+
+@pytest.mark.parametrize("option", ["--listen", "--peer-uid", "--work-dir", "--control-fd"])
+@pytest.mark.parametrize("spelling", ["alone", "joined"])
+def test_the_launchers_options_are_refused_a_second_time(option: str, spelling: str) -> None:
+    value = {"--listen": "127.0.0.1:9", "--work-dir": "/run/elsewhere"}.get(option, "7")
+    again = [option, value] if spelling == "alone" else [f"{option}={value}"]
+    words = [*LAUNCHED, "--era", "legacy", *again, "--", "server"]
+    assert f"{option} is given once" in bridge_parse_error(words)
+
+
+def test_the_bridge_parser_leaves_the_commands_words_alone() -> None:
+    args = main_module._build_parser().parse_args(
+        [*LAUNCHED, "--era", "legacy", "--", "server", "--listen=x", "--work-dir", "y"]
+    )
+    assert args.listen == "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+    assert (args.peer_uid, args.control_fd) == (10001, 5)
+    assert args.work_dir == "/run/zoeymcp-bridge-fetch/work"
+    assert args.program == ["server", "--listen=x", "--work-dir", "y"]
+    assert (args.max_procs, args.keepalive, args.stderr) == (64, 15.0, "counts")
+
+
+def test_the_bridge_needs_its_listen_and_era() -> None:
+    code, _, err = cli(["bridge", "--", "server"])
+    assert code == EXIT_UNREADABLE
+    assert err == "zoeymcp bridge: --listen and --era are required\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="--work-dir is a POSIX path")
+def test_ready_check_tests_the_ready_file(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir(mode=0o700)
+    words = ["bridge", "--ready-check", "--work-dir", work.as_posix()]
+    assert cli(words)[0] == EXIT_FINDINGS
+    (work / "ready").write_bytes(b"")
+    assert cli(words)[0] == EXIT_OK
+    assert cli(["bridge", "--ready-check", "--work-dir", "relative"])[0] == EXIT_FINDINGS
+
+
+# --- secret set --generate (M7 design C.2, GR-27) ------------------------------------------------
+
+BRIDGE_UPSTREAM = "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+
+
+def test_generate_prints_only_the_hash(admin: FakeAdmin) -> None:
+    digest = "sha256:" + "ab" * 32
+    binding = {"origins": [BRIDGE_UPSTREAM]}
+    answer = {"name": "fetch-token", "binding": binding, "sha256": digest}
+    admin.answers[("PUT", "/secrets/fetch-token")] = (200, answer)
+    code, out, err = cli(["secret", "set", "fetch-token", "--generate", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out == f"{digest}\n"
+    assert admin.requests == [("PUT", "/secrets/fetch-token", {"generate": True})]
+    assert err == (
+        f"Stored a new token as fetch-token, bound to origins {BRIDGE_UPSTREAM}. Set the line "
+        "above as the bridge's ZOEYMCP_BRIDGE_TOKEN_SHA256.\n"
+    )
+
+
+def generating(rig: AdminRig) -> str:
+    """The rig's admin with fixed random bytes; the token it then generates."""
+    rig.admin = AdminApp(
+        rig.store, ADMIN_KEYS, lambda: rig.policy, rig.setup, rig.tokens, random=bytes
+    )
+    return "A" * 43  # base64url of 32 zero bytes, unpadded
+
+
+@pytest.mark.anyio
+async def test_generate_binds_a_unix_routes_token_to_its_socket(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    policy = bridges_policy({"fetch": BRIDGE_UPSTREAM})
+    rig.set_policy(policy)
+    token = generating(rig)
+    answer = await rig.call("PUT", "/secrets/fetch-token", {"generate": True})
+    await rig.token_client.aclose()
+    binding = {"origins": [BRIDGE_UPSTREAM]}
+    assert derive_binding(policy, "fetch-token") == binding
+    expected = {"name": "fetch-token", "binding": binding, "sha256": hash_token(token)}
+    assert (answer.status_code, answer.json()) == (200, expected)
+    assert token not in answer.text
+    assert rig.store.get_for_binding("fetch-token", binding).reveal() == token
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "body", "status", "error"),
+    [
+        ("broker-refresh", {"generate": True}, 409, admin_module.GENERATE_REFUSED.message),
+        ("broker-client-id", {"generate": True}, 409, admin_module.GENERATE_REFUSED.message),
+        ("mail-pass", {"generate": True}, 409, admin_module.GENERATE_REFUSED.message),
+        # Origins would bind a connector's secret elsewhere; it is still refused.
+        (
+            "mail-pass",
+            {"generate": True, "origins": ["https://x.example"]},
+            409,
+            admin_module.GENERATE_REFUSED.message,
+        ),
+        ("music-stats", {"generate": False}, 400, "expected {generate: true, origins?}"),
+        (
+            "music-stats",
+            {"generate": True, "value": "x"},
+            400,
+            "expected {generate: true, origins?}",
+        ),
+        (
+            "oauth.broker-mcp.live",
+            {"generate": True},
+            409,
+            "managed by the vault; use zoeymcp login",
+        ),
+    ],
+)
+async def test_generate_is_refused_for_an_oauth_or_connector_secret(
+    tmp_path: Path, name: str, body: dict[str, Any], status: int, error: str
+) -> None:
+    rig = AdminRig(tmp_path)
+    generating(rig)
+    answer = await rig.call("PUT", f"/secrets/{name}", body)
+    await rig.token_client.aclose()
+    assert (answer.status_code, answer.json()) == (status, {"error": error})
+    assert rig.store.metadata() == []
+
+
+@pytest.mark.anyio
+async def test_generate_for_a_header_secret_of_the_example(tmp_path: Path) -> None:
+    rig = AdminRig(tmp_path)
+    token = generating(rig)
+    answer = await rig.call("PUT", "/secrets/music-stats", {"generate": True})
+    await rig.token_client.aclose()
+    assert answer.json()["sha256"] == hash_token(token)
+    assert set(answer.json()) == {"name", "binding", "sha256"}

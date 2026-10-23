@@ -79,6 +79,24 @@ HEALTH_ACTIONS = {
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
 GATEWAY_ENVIRONMENT = Path("/opt/zoeymcp-gateway")
+# The bridge's options the launcher sets first, each refused a second time (M7 design C.8, C.10).
+BRIDGE_ONCE = ("--listen", "--peer-uid", "--work-dir", "--control-fd")
+
+
+class _Once(argparse.Action):
+    """An option that may be given once: a later ``--listen`` (or ``--listen=``) among the
+    operator's arguments can't override the one the launcher put first (C.8)."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest) is not None:
+            parser.error(f"{option_string} is given once")
+        setattr(namespace, self.dest, values)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -314,6 +332,87 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close a tunnel open for this long (default 86400)",
     )
 
+    bridge = commands.add_parser(
+        "bridge",
+        allow_abbrev=False,
+        help="run a bridge: one stdio MCP program served as a Streamable HTTP upstream",
+        description=(
+            "Run a bridge: the program after -- is started with a built environment and served "
+            "as one MCP endpoint, /mcp, which only a caller with the route's token (its "
+            "sha256 in ZOEYMCP_BRIDGE_TOKEN_SHA256) reaches. With --ready-check, exit 0 once "
+            "the bridge's readiness probe passed, 1 before."
+        ),
+    )
+    bridge.add_argument(
+        "--listen",
+        action=_Once,
+        metavar="ADDRESS",
+        help="a network alias NAME:PORT, a loopback HOST:PORT, or unix:<path> (with --peer-uid)",
+    )
+    bridge.add_argument(
+        "--peer-uid",
+        action=_Once,
+        type=int,
+        metavar="UID",
+        help="with --listen unix:, the only uid that may connect (the vault's)",
+    )
+    bridge.add_argument("--era", choices=["legacy", "modern"], help="the MCP era it serves")
+    bridge.add_argument(
+        "--egress-proxy",
+        metavar="URL",
+        help="http://host:port: the child's proxy variables (confine only in the hardened tier)",
+    )
+    bridge.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="copy this variable to the child (repeatable)",
+    )
+    bridge.add_argument(
+        "--secret-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="copy this secret to the child (repeatable; must be set; stderr then counts only)",
+    )
+    bridge.add_argument(
+        "--stderr",
+        choices=["counts", "text"],
+        default="counts",
+        help="log the child's stderr as counts (default) or as text, which may show --env values",
+    )
+    for option, kind, default, metavar, what in (
+        ("--max-sessions", int, 8, "N", "legacy sessions at once"),
+        ("--max-message-bytes", int, 8388608, "BYTES", "the longest message, either way"),
+        ("--idle-timeout", float, 600.0, "SECONDS", "stop a legacy session idle this long"),
+        ("--start-timeout", float, 60.0, "SECONDS", "how long the readiness probe waits"),
+        ("--keepalive", float, 15.0, "SECONDS", "an SSE comment this often on a silent answer"),
+        ("--max-procs", int, 64, "N", "RLIMIT_NPROC for the bridge and its children"),
+    ):
+        bridge.add_argument(
+            option, type=kind, default=default, metavar=metavar, help=f"{what} (default {default})"
+        )
+    bridge.add_argument(
+        "--work-dir",
+        action=_Once,
+        metavar="DIR",
+        help="its own 0700 directory for the child (default /tmp/zoeymcp-bridge)",
+    )
+    bridge.add_argument(
+        "--control-fd",
+        action=_Once,
+        type=int,
+        metavar="FD",
+        help="stop on a TERM line from this pipe, or its end (the launcher's)",
+    )
+    bridge.add_argument(
+        "--ready-check", action="store_true", help="exit 0 if the readiness probe passed"
+    )
+    bridge.add_argument(
+        "program", nargs="*", metavar="command", help="after --: the program and its arguments"
+    )
+
     standard = commands.add_parser(
         "standard",
         help="run the standard tier: the vault and the gateway in one container, as two uids",
@@ -361,6 +460,14 @@ def _build_parser() -> argparse.ArgumentParser:
     secret_set.add_argument("name")
     secret_set.add_argument(
         "--origin", action="append", metavar="URL", help="bind to this origin (repeatable)"
+    )
+    secret_set.add_argument(
+        "--generate",
+        action="store_true",
+        help=(
+            "store 32 random bytes instead, for a header credential (a bridge's token), and "
+            "print only their sha256: line; the token never leaves the vault"
+        ),
     )
     secret_commands.add_parser("list", help="list secret names and bindings (never values)")
     secret_delete = secret_commands.add_parser("delete", help="delete a secret")
@@ -819,6 +926,41 @@ def _cmd_egress(args: argparse.Namespace, err: TextIO) -> int:
     return EXIT_OK
 
 
+def _cmd_bridge(args: argparse.Namespace, err: TextIO) -> int:
+    from ..bridge.main import Options, StartupError, ready_check, run
+
+    work_dir = args.work_dir or "/tmp/zoeymcp-bridge"  # noqa: S108 - the bridge's own tmpfs
+    if args.ready_check:
+        return EXIT_OK if ready_check(work_dir) else EXIT_FINDINGS
+    if args.listen is None or args.era is None:
+        err.write("zoeymcp bridge: --listen and --era are required\n")
+        return EXIT_UNREADABLE
+    options = Options(
+        listen=args.listen,
+        era=args.era,
+        command=tuple(args.program),
+        peer_uid=args.peer_uid,
+        egress_proxy=args.egress_proxy,
+        env=tuple(args.env),
+        secret_env=tuple(args.secret_env),
+        stderr=args.stderr,
+        max_sessions=args.max_sessions,
+        max_message_bytes=args.max_message_bytes,
+        idle_timeout=args.idle_timeout,
+        start_timeout=args.start_timeout,
+        keepalive=args.keepalive,
+        max_procs=args.max_procs,
+        work_dir=work_dir,
+        control_fd=args.control_fd,
+    )
+    try:
+        run(options, os.environ)
+    except StartupError as exc:
+        err.write(f"zoeymcp bridge: {exc}\n")
+        return EXIT_UNREADABLE
+    return EXIT_OK
+
+
 def _cmd_standard(args: argparse.Namespace, err: TextIO) -> int:
     from ..entrypoint import launcher
 
@@ -874,6 +1016,15 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
             result = admin_client.egress_key(socket)
             out.write(f"ZOEYMCP_EGRESS_KEY={result['key']}\n")
             err.write(f"Generation {result['generation']}.\n")
+        elif args.action == "set" and args.generate:
+            # Only the hash is printed: the token itself never leaves the vault (C.2).
+            result = admin_client.secret_generate(socket, args.name, args.origin)
+            out.write(f"{result['sha256']}\n")
+            err.write(
+                f"Stored a new token as {result['name']}, bound to "
+                f"{admin_client.describe_binding(result['binding'])}. Set the line above as the "
+                "bridge's ZOEYMCP_BRIDGE_TOKEN_SHA256.\n"
+            )
         elif args.action == "set":
             value = admin_client.read_secret_value(stdin)
             result = admin_client.secret_set(socket, args.name, value, args.origin)
@@ -2095,6 +2246,8 @@ def main(
         return _cmd_gateway(args, err)
     if args.command == "egress":
         return _cmd_egress(args, err)
+    if args.command == "bridge":
+        return _cmd_bridge(args, err)
     if args.command == "standard":
         return _cmd_standard(args, err)
     if args.command == "selftest":

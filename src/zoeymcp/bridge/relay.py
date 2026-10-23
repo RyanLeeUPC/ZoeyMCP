@@ -19,8 +19,10 @@ relayed: ``ping`` is answered ``{}`` and every other method ``-32601``.
 
 A cancel never reaches another client's request. A legacy ``notifications/cancelled`` is resolved
 against this child's requests alone, which are its session's, and only when exactly one matches;
-a modern client sends none (closing the stream is the signal), and :meth:`Relay.disconnect`
-cancels only the requests of the exchange that closed.
+a request whose exchange ended first is still one of them, since a legacy disconnect isn't a
+cancel and the gateway's ``call_timeout`` closes the stream before it cancels (FM-20). A modern
+client sends none (closing the stream is the signal), and :meth:`Relay.disconnect` cancels only
+the requests of the exchange that closed.
 
 Only the id, a progress token or a subscription id is rewritten, in place in the message's bytes,
 so nothing else is re-encoded (CR-6): a large result, a 64-bit number or an escape passes as the
@@ -184,8 +186,9 @@ class Relay:
         self._counter = 0
         self._pending: dict[int, Pending] = {}
         self._tokens: dict[int, int] = {}
-        # Requests whose exchange ended first: their answers are dropped without counting.
-        self._orphans: dict[int, None] = {}
+        # Requests whose exchange ended first, by remapped id: their answers are dropped without
+        # counting, and a legacy cancel still finds them.
+        self._orphans: dict[int, Pending] = {}
 
     def __len__(self) -> int:
         return len(self._pending)
@@ -281,24 +284,27 @@ class Relay:
 
     def cancel(self, message: Message) -> bytes | None:
         """The line for a legacy client's ``notifications/cancelled``, its ``requestId``
-        remapped; None when no request in flight, or more than one, has that id (dropped), and
-        always in the modern era, where a client cancels by closing its stream."""
+        remapped; None when no request in flight or orphaned by its exchange's end, or more than
+        one, has that id (dropped), and always in the modern era, where a client cancels by
+        closing its stream."""
         if self.era != "legacy":
             return None
         request_id = message.value.get("params", {}).get("requestId")
-        found = [p for p in self._pending.values() if _same(p.original_id, request_id)]
+        known = [*self._pending.values(), *self._orphans.values()]
+        found = [p for p in known if _same(p.original_id, request_id)]
         if len(found) != 1:
             return None
         return to_line(rewrite(message.raw, [(REQUEST_ID, str(found[0].remapped))]))
 
     def disconnect(self, exchange: int) -> list[bytes]:
-        """An exchange ended before its answer: forget its requests, whose answers are then
+        """An exchange ended before its answer: its requests are orphaned, and their answers
         dropped. Modern: the disconnect is the cancel, so a ``notifications/cancelled`` line for
-        each; legacy: none ("Disconnection SHOULD NOT be interpreted as the client cancelling")."""
+        each; legacy: none ("Disconnection SHOULD NOT be interpreted as the client cancelling"),
+        and the session's own cancel still finds them (:meth:`cancel`)."""
         lines = []
         for pending in [p for p in self._pending.values() if p.exchange == exchange]:
             self._done(pending)
-            self._orphans[pending.remapped] = None
+            self._orphans[pending.remapped] = pending
             if len(self._orphans) > self.limit:
                 del self._orphans[next(iter(self._orphans))]
             if self.era == "modern":

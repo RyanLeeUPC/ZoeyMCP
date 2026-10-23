@@ -161,6 +161,8 @@ SECOND_RUN = {"already_configured": 409, "onboarding_mismatch": 409, "reregister
 LOGIN7 = {"client_secret_binding_changed": 409}
 # M7's M.2: a required iss missing from the answer (M7 step 9; D.6).
 MIXUP = {"iss_missing": 400}
+# A generated token for an OAuth or connector secret (M7 step 18c2; C.2, GR-27).
+GENERATE = {"generate_refused": 409}
 FETCH = {
     "address_refused": 502,
     "resolve_failed": 502,
@@ -314,7 +316,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR | REPORT | REVIEW
+    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 

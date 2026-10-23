@@ -377,6 +377,30 @@ def test_a_legacy_disconnect_cancels_nothing() -> None:
     assert child.disconnect(99) == []
 
 
+def test_a_legacy_cancel_reaches_a_request_whose_exchange_ended() -> None:
+    """FM-20: the gateway's ``call_timeout`` closes the stream, then cancels; the cancel still
+    reaches the child, and the late answer is still dropped."""
+    child = Relay("legacy")
+    outbound(child, call(5), 1)
+    child.disconnect(1)
+    line = child.cancel(cancel(5))
+    assert line is not None
+    assert sent(line)["params"]["requestId"] == 1
+    assert child.inbound(answer(1)) == Drop("orphaned")
+    # Answered, it is forgotten.
+    assert child.cancel(cancel(5)) is None
+    # One in flight and one orphaned with the same id: ambiguous, dropped.
+    outbound(child, call(6), 2)
+    child.disconnect(2)
+    outbound(child, call(6), 3)
+    assert child.cancel(cancel(6)) is None
+    # A modern relay keeps no orphan for a cancel.
+    modern = Relay("modern")
+    outbound(modern, call(5), 1)
+    modern.disconnect(1)
+    assert modern.cancel(cancel(5)) is None
+
+
 def test_a_modern_disconnect_cancels_that_exchanges_requests() -> None:
     child = Relay("modern")
     outbound(child, call(1), 1)

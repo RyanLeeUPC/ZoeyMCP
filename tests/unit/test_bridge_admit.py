@@ -594,3 +594,75 @@ def test_a_refusals_body() -> None:
         ("content-type", "application/json"),
         ("allow", "POST"),
     ]
+
+
+# --- what each answer carries -------------------------------------------------------------------
+
+
+def said(refused: Head[str] | Admitted | Refusal) -> tuple[int, int, str, Any]:
+    """A refusal's status, and its JSON-RPC error's code, message and id, as the client sees it."""
+    assert isinstance(refused, Refusal)
+    sent = json.loads(refused.body())
+    return refused.status, sent["error"]["code"], sent["error"]["message"], sent["id"]
+
+
+def test_the_token_is_everything_after_the_first_space() -> None:
+    spaced = BridgeTokenHash("sha256:" + hashlib.sha256(b"two words").hexdigest())
+    assert spaced.admits(["Bearer two words"])
+    assert not spaced.admits(["Bearer two"])
+    assert not spaced.admits(["Bearer words"])
+    assert not HASH.admits([f"Bearer two {TOKEN}"])
+
+
+def test_a_modern_head_keeps_its_method() -> None:
+    assert check("modern") == Head(
+        "POST", routing={"mcp-protocol-version": (), "mcp-method": (), "mcp-name": ()}
+    )
+
+
+def test_an_admitted_message_is_the_one_sent() -> None:
+    session: Head[str] = Head("POST", "the session")
+    relayed = body("legacy", session, BODY)
+    assert isinstance(relayed, Admitted)
+    assert relayed.message.raw == BODY
+    for method in ("notifications/initialized", "notifications/cancelled", "notifications/x"):
+        note = request(method, rpc_id=None)
+        accepted = body("legacy", session, note)
+        assert isinstance(accepted, Admitted)
+        assert accepted.message.raw == note
+    seen = modern_head(mcp_protocol_version=MODERN, mcp_method="tools/list")
+    listed = modern("tools/list")
+    modern_relayed = body("modern", seen, listed)
+    assert isinstance(modern_relayed, Admitted)
+    assert modern_relayed.message.raw == listed
+
+
+def test_the_body_refusals_say_why() -> None:
+    session: Head[str] = Head("POST", "the session")
+    assert said(body("legacy", session, b"x")) == (
+        400,
+        -32600,
+        "the body isn't one JSON-RPC request or notification",
+        None,
+    )
+    assert said(body("modern", Head("POST"), b"x")) == said(body("legacy", session, b"x"))
+    initialize = request("initialize", {"protocolVersion": LEGACY})
+    assert said(body("legacy", session, initialize)) == (
+        400,
+        -32600,
+        "Bad Request: initialize is sent without a session",
+        7,
+    )
+    assert said(body("legacy", Head("POST"), BODY)) == (
+        400,
+        -32600,
+        "Bad Request: missing session ID",
+        1,
+    )
+    # From head, before any body: no id to answer.
+    assert said(check("legacy", "GET", sent=headers(post=False))) == (
+        400,
+        -32600,
+        "Bad Request: missing session ID",
+        None,
+    )

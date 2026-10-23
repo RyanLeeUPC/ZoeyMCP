@@ -30,7 +30,11 @@ from tests.gateway.rig import (
     token_for,
     until,
 )
+from zoeymcp.bridge.admit import BridgeTokenHash
+from zoeymcp.bridge.child import Spec
+from zoeymcp.bridge.server import Bridge, Settings
 from zoeymcp.common.canonical import dumps_canonical
+from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.egress import allowlist as egress_allowlist
 from zoeymcp.egress import main as egress_main
 from zoeymcp.gateway import pipeline, upstream
@@ -214,7 +218,8 @@ async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
     answers metadata, a client registration, a token or an authorization endpoint, with or
     without a client token, and the gateway's 401 names no resource metadata. The portal's half
     is ``tests/portal/test_shell.py``. The egress role answers every one of those paths 405,
-    empty and with no challenge, before and after it holds a list (M7 design X17, COV-12).
+    empty and with no challenge, before and after it holds a list, and a bridge's listener 404,
+    empty and with no challenge, with or without its own token (M7 design X17, COV-12).
 
     The agent's side (M7 design step 15): the upstream here offers OAuth itself, publishing its
     protected-resource metadata, and once it stops taking the vault's credential its 401 names
@@ -270,6 +275,28 @@ async def test_no_listener_offers_agents_oauth(tmp_path: Path) -> None:
         assert answer.headers["allow"] == "CONNECT"
         assert "www-authenticate" not in answer.headers
         assert "proxy-authenticate" not in answer.headers
+    bridge = await bridge_answers(bearer)
+    assert len(bridge) == len(OAUTH_PATHS) * 2 * 3
+    for answer in bridge:
+        assert (answer.status_code, answer.content) == (404, b"")
+        assert "www-authenticate" not in answer.headers
+
+
+async def bridge_answers(bearer: dict[str, str]) -> list[httpx.Response]:
+    """Every OAuth path asked of a bridge's listener in process, by GET and POST, with no
+    token, a client token, and the bridge's own token (M7 design C.4's row 1)."""
+    token = "bridge-token-p20-0001"
+    spec = Spec(("server",), {}, "/")
+    settings = Settings("legacy", spec, BridgeTokenHash(hash_token(token)), "ready")
+    transport = httpx.ASGITransport(app=Bridge(settings))
+    own = {"authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://bridge.invalid") as client:
+        return [
+            await client.request(method, path, headers=headers)
+            for path in OAUTH_PATHS
+            for method in ("GET", "POST")
+            for headers in ({}, bearer, own)
+        ]
 
 
 async def egress_role_answers(bearer: dict[str, str]) -> list[httpx.Response]:

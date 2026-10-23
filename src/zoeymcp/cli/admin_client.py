@@ -165,6 +165,20 @@ def secret_set(
     return _request(socket, "PUT", f"/secrets/{name}", body, transport, SECRET_TIMEOUT)
 
 
+def secret_generate(
+    socket: str,
+    name: str,
+    origins: list[str] | None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """A random token stored under ``name`` (M7 design C.2, GR-27): ``{name, binding, sha256}``,
+    never the token, which stays in the vault."""
+    body: dict[str, Any] = {"generate": True}
+    if origins:
+        body["origins"] = origins
+    return _request(socket, "PUT", f"/secrets/{name}", body, transport, SECRET_TIMEOUT)
+
+
 def secret_list(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
     return _request(socket, "GET", "/secrets", transport=transport)
 

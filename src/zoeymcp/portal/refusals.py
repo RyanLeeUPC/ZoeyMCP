@@ -147,6 +147,12 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "no_route": Entry(409, _FIX_POLICY),
         "orphan_slot": Entry(409, _FIX_POLICY),
         "binding_conflict": Entry(409, _FIX_POLICY),
+        # A generated token (M7 design C.2, GR-27), over the socket only.
+        "generate_refused": Entry(
+            409,
+            "Only a header, query, path or basic credential's secret can be generated; enter an "
+            "OAuth or connector secret as it was given.",
+        ),
         # OAuth connect (H); statuses as the socket answers them.
         "not_oauth": Entry(404, "That isn't an OAuth credential in the policy."),
         "flow_unknown": Entry(404, _EXPIRED),

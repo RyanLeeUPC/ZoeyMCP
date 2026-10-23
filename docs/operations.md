@@ -5,8 +5,8 @@ remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SM
 and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
 supported. M7's so far: onboarding a remote MCP server by URL (§11), your own egress proxy
 (§28), fitting ZoeyMCP into a stack that already has one (§29), a first hardened deployment
-end to end (§30), and the egress role (§31). The design and the reasons behind it are in
-[design.md](design.md); this page is the how-to.
+end to end (§30), the egress role (§31) and the bridge (§32). The design and the reasons behind
+it are in [design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -1970,6 +1970,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `no_route` | The policy can't bind it: `<detail>`. Fix the policy. |
 | 409 | `orphan_slot` | The policy can't bind it: `<detail>`. Fix the policy. |
 | 409 | `binding_conflict` | The policy can't bind it: `<detail>`. Fix the policy. |
+| 409 | `generate_refused` | Only a header, query, path or basic credential's secret can be generated; enter an OAuth or connector secret as it was given. |
 | 404 | `not_oauth` | That isn't an OAuth credential in the policy. |
 | 404 | `flow_unknown` | That confirmation, login or passkey prompt expired or was already used. Start again. |
 | 409 | `no_authorize_url` | This credential has no authorize_url, so it can't connect in a browser. |
@@ -2675,3 +2676,99 @@ docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
 - **A new key.** After `egress_key_generation` is raised and the policy reloaded, run
   `zoeymcp egress-key` again, set the new `ZOEYMCP_EGRESS_KEY`, and run the `up -d` above again,
   which recreates the role with it.
+
+## 32. The bridge
+
+`zoeymcp bridge` serves one stdio MCP program as a Streamable HTTP endpoint, `/mcp`. To the rest
+of ZoeyMCP it is one more upstream: a `kind: remote` server behind a vault route whose upstream
+is the bridge and whose header credential holds the bridge's token. It relays JSON-RPC envelopes:
+it rewrites ids and progress tokens so that clients can't collide, and otherwise passes the
+program's bytes through; it parses no tool definition and imports no MCP SDK.
+
+```sh
+zoeymcp bridge --listen unix:/run/zoeymcp-bridge-fetch/mcp.sock --peer-uid 10001 \
+  --era legacy -- /opt/stdio-server/venv/bin/fetch-server
+```
+
+- **`--listen`** is a network alias `NAME:PORT` (it must resolve to exactly one address, never
+  `0.0.0.0` or `::`), a loopback address such as `127.0.0.1:9000` (behind your own TLS front),
+  or `unix:<path>`. With `unix:`, `--peer-uid` is required (and refused with any other form): the
+  socket's directory must exist, be the bridge's own uid's, and give others no access and its
+  group no write; a stale socket at the path is removed and anything else there refuses the
+  start. Every connection on the socket whose peer isn't `--peer-uid` is cut before anything is
+  read (`bridge_peer_refused`).
+- **`--era legacy|modern`** is required: the MCP era it serves, which the server's `era` in the
+  policy should assert. A legacy bridge runs a child per session (`--max-sessions`, 8; a session
+  idle for `--idle-timeout`, 600 s, is stopped); a modern bridge runs one child, started again
+  after it exits.
+- **The child** is the command after `--`, fixed at start, in a session of its own, with
+  `--work-dir` (`/tmp/zoeymcp-bridge` by default; created 0700, or accepted only as the bridge's
+  own 0700 directory) holding its home, temporary and working directories. Its environment is
+  built, not inherited: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TZ`, the proxy variables of
+  `--egress-proxy http://host:port` (which confine only where the bridge has no other way out),
+  then each `--env NAME` and `--secret-env NAME` (which must be set). No `ZOEYMCP_` variable
+  reaches it. The bridge lowers its own `RLIMIT_NPROC` to `--max-procs` (64) and raises its
+  `oom_score_adj` to 1000 before the first child, which inherits both. Stopping a child closes
+  its stdin, then sends its process group `SIGTERM` after 2 s and `SIGKILL` 2 s later.
+- **Lines** from the child are at most `--max-message-bytes` (8 MiB); a longer one, a line that
+  isn't one JSON object, or a batch ends that child, and its calls in flight are answered 502. A
+  request from the child is never relayed: `ping` is answered, everything else (sampling, roots,
+  elicitation) refused with `-32601`. **stderr** is counted (lines and bytes per 10 s) and never
+  shown, because programs print their configuration; `--stderr text` logs lines (2 KiB each, 50
+  per 10 s) and may show `--env` values, and is refused beside `--secret-env`.
+- **Readiness.** At start the bridge asks a child `initialize` (legacy) or `server/discover`
+  (modern); until an answer within `--start-timeout` (60 s) it answers 503, and after it, it
+  writes `<work-dir>/ready`, which `zoeymcp bridge --ready-check [--work-dir DIR]` tests (exit 0,
+  or 1 before).
+- **Answers** are SSE, one event per message as it arrives, with a `: keepalive` comment every
+  `--keepalive` seconds (15) while a call is silent. In the modern era a client that leaves
+  before the answer cancels the call; in the legacy era only its `notifications/cancelled` does,
+  whether it comes before or after the client left.
+- **Stopping.** `SIGTERM`, or with `--control-fd` a `TERM` line on that pipe (or its end), stops
+  every child and the bridge; a `HUP` line is ignored.
+
+**The token.** The bridge holds only the token's hash, `ZOEYMCP_BRIDGE_TOKEN_SHA256`, read before
+its socket exists: unset or not `sha256:` and 64 lower-case hex digits, it refuses to start
+(exit 2). Every request needs exactly one `Authorization: Bearer <token>` whose hash matches, and
+no `Origin`. Make the token in the vault, once the policy names the route and its header
+credential:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp secret set fetch-token --generate
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp secret set fetch-token --generate
+```
+
+`--generate` stores 32 random bytes under that name, bound as any header credential's secret
+(to a `unix:` route's socket), and prints only the `sha256:` line to set as the bridge's
+`ZOEYMCP_BRIDGE_TOKEN_SHA256`: the token never leaves the vault. Run it again for a new token.
+It is refused for an OAuth secret or a connector's, with or without `--origin`
+(`generate_refused`).
+
+What it answers itself: 202 with no body (an accepted notification), 403 with no body (no token,
+a wrong one, or an `Origin`), 404 (any path but `/mcp`, so no OAuth metadata, registration,
+token or authorization path), 405, 411, 413, 415, 400 with a JSON-RPC error (`-32020` when a
+modern request's headers disagree with its body, `-32600`, or a modern bridge's refusal of
+`initialize` naming the versions it serves), 404 for an unknown or ended legacy session, 502
+(the child exited, or didn't answer an `initialize` in time), and 503 (`not_ready`,
+`bridge_busy` at 256 calls in flight, `sessions_full`).
+
+Its log lines (`role: bridge`):
+
+| Event | Fields |
+| --- | --- |
+| `bridge_started` | `era`, `listen`, `command` (its first word, never its arguments), `max_sessions`, `max_message_bytes`, `idle_timeout`, `start_timeout`, `keepalive`, `max_procs`, `stderr` |
+| `bridge_ready`, `bridge_probe_failed` | the readiness probe passed; or `reason` (`spawn_failed`, `timeout`, `exited`, `error`), tried again 5 s later |
+| `bridge_child_started`, `bridge_child_failed` | `pid`, `purpose` (`probe`, `session` or `shared`); or `purpose`, `error_type`: the command couldn't be run |
+| `bridge_child_exited` | `pid`, `purpose`, `code` or `signal` |
+| `bridge_child_violation` | `pid`, `reason` (`too_long`, `invalid_json`, `batch`, `not_object`): the line that ended the child |
+| `bridge_session_started`, `bridge_session_ended` | `session` (8 hex digits of its id's SHA-256, never the id), `pid`; `reason` (`deleted`, `idle`, `child_exited`) |
+| `bridge_stderr`, `bridge_stderr_suppressed` | `pid`, and `lines` and `bytes` (by default) or `text`; `count`: the lines left out of a window |
+| `bridge_client_request_refused` | `pid`, `method` (cut to 64 characters): a request from the child, refused |
+| `bridge_unmatched` | `pid`, `count`: answers to no request in flight, logged at the 1st, 2nd, 4th, 8th... |
+| `bridge_refused` | `reason`, `status`: an answer the bridge made itself |
+| `bridge_peer_refused` | `uid`: a connection to its socket from another uid, cut before anything was read |
+| `bridge_stopped` | |
+| `control_received`, `control_ignored`, `control_failed` | as the vault's and the gateway's, with `--control-fd` |
+
+None holds the token or its hash, a session id, a request's or the child's content, an
+environment value or the command's arguments.

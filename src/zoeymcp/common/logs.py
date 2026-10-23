@@ -19,7 +19,7 @@ import time
 from collections.abc import Iterator
 from typing import Any, Literal, TextIO
 
-Role = Literal["vault", "gateway", "launcher", "egress"]
+Role = Literal["vault", "gateway", "launcher", "egress", "bridge"]
 # Field names every line sets itself.
 RESERVED_FIELDS = frozenset({"ts", "role", "event"})
 
