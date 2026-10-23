@@ -31,6 +31,7 @@ from typing import Any
 
 import anyio
 import certifi
+import httpcore
 import httpx
 import pytest
 
@@ -710,6 +711,37 @@ async def test_a_trailing_dot_name_is_listed_by_its_entry_without_the_dot() -> N
         with pytest.raises(AddressRefused) as caught:
             await backend.connect_tcp(f"{LAN}.", 443)
     assert caught.value.verdict.reason == "private"
+
+
+async def test_the_next_checked_address_is_tried_when_one_does_not_connect() -> None:
+    """A name whose first address doesn't answer (``localhost`` as ``::1`` first, for a service
+    on IPv4 only) is reached at its next checked address, with no second lookup; when none
+    connects, the last failure is raised."""
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        closed = spare.getsockname()[1]  # nothing listens here once the socket is closed
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        port = listener.getsockname()[1]
+        lookups: list[str] = []
+
+        async def lan(host: str, _port: int) -> list[str]:
+            lookups.append(host)
+            return ["10.0.0.5", "10.0.0.6"]
+
+        def dial(address: str, _port: int) -> tuple[str, int]:
+            return "127.0.0.1", port if address == "10.0.0.6" else closed
+
+        backend = netclient.GuardedBackend(lambda: {f"{LAN}:443"}, resolver=lan, dial=dial)
+        stream = await backend.connect_tcp(LAN, 443)
+        await stream.aclose()
+        assert lookups == [LAN]
+
+        def nowhere(_address: str, _port: int) -> tuple[str, int]:
+            return "127.0.0.1", closed
+
+        backend = netclient.GuardedBackend(lambda: {f"{LAN}:443"}, resolver=lan, dial=nowhere)
+        with pytest.raises((OSError, httpcore.ConnectError)):
+            await backend.connect_tcp(LAN, 443)
 
 
 # --- step 18b: local MCP routes and bridges' sockets (X3, FM-29, Q46) ----------------------------

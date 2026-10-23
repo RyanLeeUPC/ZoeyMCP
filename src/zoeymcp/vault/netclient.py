@@ -220,17 +220,26 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
             verdict = netguard.addresses_allowed(addresses, private_ok=listed)
         if not verdict.allowed or verdict.address is None:
             raise AddressRefused(host, port, verdict)
-        # The checked address, never the name again: a second lookup could answer otherwise.
-        address, target_port = verdict.address, port
-        if self._dial is not None:
-            address, target_port = self._dial(address, port)
-        return await self._backend.connect_tcp(
-            address,
-            target_port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
+        # The checked addresses, never the name again: a second lookup could answer otherwise.
+        # Each was checked, so the next is tried when one doesn't connect (an IPv6 address first
+        # for a service that listens on IPv4 only), in the resolver's order.
+        last = len(addresses) - 1
+        for index, checked in enumerate(addresses):
+            address, target_port = checked, port
+            if self._dial is not None:
+                address, target_port = self._dial(address, port)
+            try:
+                return await self._backend.connect_tcp(
+                    address,
+                    target_port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (OSError, httpcore.ConnectError, httpcore.ConnectTimeout):
+                if index == last:
+                    raise
+        raise ResolveFailed(host, port)  # unreachable: the verdict allowed a non-empty list
 
     async def connect_unix_socket(
         self,

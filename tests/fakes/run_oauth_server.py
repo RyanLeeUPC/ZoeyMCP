@@ -59,8 +59,13 @@ LAUNCHER = (
 )
 
 
-def policy(provider: str, portal_port: int, credential: str) -> dict[str, Any]:
+def policy(
+    provider: str, portal_port: int, credential: str, endpoints: str | None = None
+) -> dict[str, Any]:
+    """The vault's policy for this provider; ``endpoints`` is where its endpoints are, when not
+    at its origin (``--endpoint-path``)."""
     origin = f"http://localhost:{portal_port}"
+    base = endpoints or provider
     return {
         "version": 1,
         "mode": "declarative",
@@ -70,8 +75,8 @@ def policy(provider: str, portal_port: int, credential: str) -> dict[str, Any]:
         "credentials": {
             credential: {
                 "kind": "oauth2",
-                "token_url": f"{provider}/token",
-                "authorize_url": f"{provider}/authorize",
+                "token_url": f"{base}/token",
+                "authorize_url": f"{base}/authorize",
                 "client_id": CLIENT_ID,
                 "client_auth": "none",
                 "rotates": True,
@@ -102,6 +107,7 @@ def parse(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--consent", action="store_true")
     parser.add_argument("--metadata", action="store_true")
     parser.add_argument("--issuer-path", default="")
+    parser.add_argument("--endpoint-path", default="")
     parser.add_argument("--iss", action="store_true")
     parser.add_argument("--registration", choices=REGISTRATIONS, default="open")
     parser.add_argument(
@@ -132,6 +138,8 @@ def fake_for(args: argparse.Namespace, address: str) -> FakeAuthServer:
     )
     if args.metadata:
         fake.issuer = provider_of(args) + args.issuer_path
+    if args.endpoint_path:
+        fake.endpoint_base = provider_of(args) + args.endpoint_path
     fake.switches = {AuthSwitch(name) for name in args.switch}
     return fake
 
@@ -143,7 +151,8 @@ def main(argv: Sequence[str]) -> None:
     (directory / "state").mkdir(mode=0o700, exist_ok=True)
     ca = make_ca(directory)
     provider = provider_of(args)
-    document = policy(provider, args.portal_port, args.credential)
+    endpoints = provider + args.endpoint_path if args.endpoint_path else None
+    document = policy(provider, args.portal_port, args.credential, endpoints)
     config = directory / "policy.json"
     config.write_bytes(json.dumps(document, indent=2).encode() + b"\n")
     address = document["credentials"][args.credential]["redirect_uri"]

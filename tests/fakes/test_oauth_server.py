@@ -482,6 +482,23 @@ async def test_metadata_at_the_root() -> None:
     assert (moved["issuer"], moved["token_endpoint"]) == (ISSUER, "https://login.example/token")
 
 
+async def test_endpoints_under_a_path_of_this_server() -> None:
+    """An endpoint_base with a path on the fake's own origin (``--endpoint-path``, manual check
+    17's long URLs) serves the endpoints there, and still at the root."""
+    server = FakeAuthServer(Clock(), client_id="app", issuer=ISSUER)
+    server.endpoint_base = f"{ISSUER}/tenant/a"
+    document = (await get(server, "/.well-known/oauth-authorization-server")).json()
+    assert document["token_endpoint"] == f"{ISSUER}/tenant/a/token"
+    async with client(server) as http:
+        # A token request with no client: refused by the endpoint, the same way at both paths.
+        answers = [
+            (await http.post(path, data={"grant_type": "authorization_code"})).status_code
+            for path in ("/tenant/a/token", "/token")
+        ]
+        assert answers[0] == answers[1] != 404, answers
+        assert (await http.post("/tenant/b/token", data={})).status_code == 404
+
+
 @pytest.mark.parametrize(
     ("forms", "answering"),
     [

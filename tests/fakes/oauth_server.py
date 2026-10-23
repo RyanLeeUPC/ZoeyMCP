@@ -57,7 +57,7 @@ from starlette.responses import (
     Response,
     StreamingResponse,
 )
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 Clock = Callable[[], float]
@@ -381,12 +381,18 @@ class FakeAuthServer:
     # --- test controls -------------------------------------------------------------------------
 
     def app(self) -> Starlette:
+        endpoints = [
+            Route("/authorize", self._authorize, methods=["GET", "POST"]),
+            Route("/token", self._token, methods=["POST"]),
+            Route("/revoke", self._revoke, methods=["POST"]),
+            Route("/register", self._register, methods=["POST"]),
+        ]
+        # An endpoint_base with a path on this server serves the endpoints under it too.
+        prefix = urlsplit(self.endpoint_base).path.rstrip("/") if self.endpoint_base else ""
         return Starlette(
             routes=[
-                Route("/authorize", self._authorize, methods=["GET", "POST"]),
-                Route("/token", self._token, methods=["POST"]),
-                Route("/revoke", self._revoke, methods=["POST"]),
-                Route("/register", self._register, methods=["POST"]),
+                *endpoints,
+                *([Mount(prefix, routes=endpoints)] if prefix else []),
                 Route("/.well-known/{rest:path}", self._metadata, methods=["GET"]),
                 Route("/{prefix:path}" + OIDC_WELL_KNOWN, self._metadata, methods=["GET"]),
             ],
