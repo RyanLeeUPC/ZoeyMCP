@@ -33,6 +33,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import uvicorn
 
@@ -63,6 +64,8 @@ def policy(provider: str, portal_port: int, credential: str) -> dict[str, Any]:
     return {
         "version": 1,
         "mode": "declarative",
+        # The provider is on loopback, which the vault's address guard refuses unless listed.
+        "egress_private": [urlsplit(provider).netloc],
         "admin": {"listen": f"127.0.0.1:{portal_port}", "origins": [origin]},
         "credentials": {
             credential: {

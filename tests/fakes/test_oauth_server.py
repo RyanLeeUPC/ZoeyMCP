@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from zoeymcp.common.policy.load import parse_policy
+from zoeymcp.vault import netclient
 
 from . import run_oauth_server
 from .harness import serve
@@ -406,10 +407,14 @@ def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> No
     assert (fake.consent, fake.issuer, fake.iss_supported) == (True, f"{provider}/tenant", True)
     assert fake.registration == "none"
     assert fake.switches == {AuthSwitch.STALL, AuthSwitch.WRONG_ISSUER}
-    # The policy it writes for a provider on 127.0.0.1 loads.
-    document = run_oauth_server.policy(provider, 8081, "notes")
-    loaded = parse_policy(json.dumps(document), "policy.json")
-    assert loaded.credentials["notes"].token_url == f"{provider}/token"  # type: ignore[union-attr]
+    # The policy it writes loads, and lists the provider in egress_private as the vault's address
+    # guard keys it (the provider is on loopback), on localhost and on 127.0.0.1.
+    for origin in (run_oauth_server.provider_of(plain), provider):
+        document = run_oauth_server.policy(origin, 8081, "notes")
+        loaded = parse_policy(json.dumps(document), "policy.json")
+        token_url = loaded.credentials["notes"].token_url  # type: ignore[union-attr]
+        assert token_url == f"{origin}/token"
+        assert loaded.egress_private == [netclient.destination_key(token_url)]
 
 
 # --- metadata (M7 design O.1) -------------------------------------------------------------------
