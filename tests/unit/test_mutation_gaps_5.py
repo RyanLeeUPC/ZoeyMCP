@@ -128,12 +128,13 @@ EQUIVALENT: Final[dict[str, str]] = {
     # --- vault.reports
     "zoeymcp.vault.reports.x__lines__mutmut_42": _CASE,
     # --- vault.secretplan
-    "zoeymcp.vault.secretplan.x_plan_put__mutmut_45": (
+    # Renumbered in M7 step 19b: the value check moved from plan_put into _value.
+    "zoeymcp.vault.secretplan.x__value__mutmut_18": (
         "`allow_tabs=None` for False: with single_line=True, find_violations refuses a tab "
         "whatever allow_tabs says"
     ),
-    "zoeymcp.vault.secretplan.x_plan_put__mutmut_49": "no allow_tabs: as mutant 45",
-    "zoeymcp.vault.secretplan.x_plan_put__mutmut_51": "`allow_tabs=True`: as mutant 45",
+    "zoeymcp.vault.secretplan.x__value__mutmut_22": "no allow_tabs: as mutant 18",
+    "zoeymcp.vault.secretplan.x__value__mutmut_24": "`allow_tabs=True`: as mutant 18",
     # --- gateway.reporting
     "zoeymcp.gateway.reporting.x_backoff__mutmut_20": (
         "the exponent capped at 17 for 16: FIRST_BACKOFF * 2**16 is already far above "

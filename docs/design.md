@@ -2117,9 +2117,16 @@ at once while the vault and the gateway keep serving.
   - It is meant to run in CI and before every deploy, and to be **mutation-tested**: flip a rule,
     and the suite must fail.
 - **The project's own CI** mutation-tests the security-relevant modules with `mutmut` (the list
-  is `only_mutate` in `pyproject.toml`), gated at 95% overall, with per-module floors (95% for each
-  module M5 and M7 added) under
-  `[tool.zoeymcp.mutation-floors]`:
+  is `only_mutate` in `pyproject.toml`), gated at 95% overall, with per-module floors under
+  `[tool.zoeymcp.mutation-floors]`. The standing rule: every module a milestone adds, and every
+  earlier one it changes for security reasons, has a floor of 95%. A new module joins
+  `only_mutate` under the overall gate in the commit that adds it, since its score is known only
+  from that commit's CI run, and the next commit writes its measured floor: 95%, or a recorded
+  floor of 90% to 95% when every survivor left is one judged equivalent, raised or justified when
+  the milestone closes. A survivor in a module a milestone adds, or in a review-path module it
+  touches, is killed by a unit test or listed as equivalent with its reason in an `EQUIVALENT`
+  table in `tests/unit/test_mutation_gaps_*.py` (mutmut still counts it in the score); an earlier
+  module it changes need only hold its floor. The modules, by milestone:
   - **M1 to M3:** the vault's request handling, store, bindings, OAuth (protocol, PKCE and
     flows, the token manager, login), gateway keys and peer check; the text rules, canonical
     JSON, atomic file writes, policy checks, matching and the gateway's view; the gateway's pins,
@@ -2137,8 +2144,9 @@ at once while the vault and the gateway keep serving.
     and the onboarding records, the vault's internal endpoint table and review jobs, pin hashing,
     the review report and suggestions, the choices file and the portal's review view, the egress
     role's connect rules, the bridge's admission, framing, relay, sessions and child environment,
-    and the launcher's bridge checks. A new module joins `only_mutate` under the overall gate in
-    the commit that adds it, and the next commit writes its measured floor.
+    and the launcher's bridge checks; and earlier modules given their 95% floor in M7: the
+    vault's request handling, store, OAuth protocol, PKCE, login and token manager, the policy
+    checks and the gateway's view, and the gateway's pins, findings, admission and egress rules.
 
   Security-relevant modules that hold mostly I/O (the vault's and gateway's apps and servers, the
   admin socket, the upstream pool, the toolkit loader, the CLI) are covered by effect tests
@@ -2507,7 +2515,7 @@ is built beside paste, not left out.
 | The two socket answers that carry a credential | `POST /setup-code` and `GET /gateway-key`, recorded as R61's scoped exceptions | R61 |
 | Explicit bindings for names the policy uses | allowed; health judges a binding by its effect | operations.md §3 |
 | The static UI's tests | thin script tested through the API, static checks of the files, and a recorded by-hand checklist | §8.2 |
-| Mutation floors | 95% overall and per M5 module (M5 step 19b; survivors judged equivalent are listed in `tests/unit/test_mutation_gaps_5.py`) | §8.2 |
+| Mutation floors | a standing rule: 95% overall, and 95% for every module a milestone adds or changes for security reasons; a new module joins under the overall gate and the next commit writes its measured floor (95%, or a recorded 90% to 95% when only survivors judged equivalent are left, raised or justified when the milestone closes); a survivor in a module a milestone adds, or in a review-path module it touches, is killed by a unit test or listed as equivalent with its reason in `tests/unit/test_mutation_gaps_*.py`; an earlier module it changes need only hold its floor | §8.2 |
 | Order after M5 | an OAuth credential on a remote MCP route without discovery inside M5; then M7, M6, M8 | §11 |
 
 ### 12.1.3 Decided for M7 (2026-10-20)
