@@ -53,11 +53,11 @@ jobs:
       - run: uv run --locked pytest
 
   # The portal on Windows, a development host (M5 design B.5): its effect tests and its unit
-  # files only, since other Windows-only failures are known (register D-92). Not a required
-  # check: branch protection lists the required jobs by name, and this one joins them once it
-  # has stayed green.
+  # files only, since other Windows-only failures are known (register D-92). A required check
+  # since it stayed green over M7's runs: branch protection lists the required jobs by name, so
+  # renaming this job means changing main's protection with it.
   portal-windows:
-    name: portal tests on Windows (not required yet)
+    name: portal tests on Windows
     runs-on: windows-latest
     timeout-minutes: 30
     steps:

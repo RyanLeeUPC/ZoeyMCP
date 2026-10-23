@@ -2594,12 +2594,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-130 | Detect a restore of the state volume from an older backup | M6 (restated with versioned policy); the detection may stay in the backlog |
 | D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | Each milestone (done for M7) |
 
-**M7.**
-
-| Key | Item | Target or trigger |
-| --- | --- | --- |
-| D-154 | A recorded by-hand onboarding run against a real OAuth-protected MCP server | M7 (open): recorded "not run" in [manual-checks.md](manual-checks.md); waits on a suitable public server, else the backlog with D-69 |
-| D-183 | The fake OAuth provider had no consent page, so a by-hand check couldn't show the session cookie held back on the callback | M7 (open): the consent page is built; that line of the check is still to run by hand |
+**M7.** None: every M7 item is done or moved to a later milestone.
 
 **M8.**
 
@@ -2689,6 +2684,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-139 | Two portal origins can share one host and port (`http://` and `https://`); the second is unreachable, and `check` doesn't warn | Backlog: a small `check` warning |
 | D-140 | Cookies planted at longer paths from another `localhost` port can lock the operator out of the portal; a denial only (accepted for now) | Backlog |
 | D-142 | On Windows, asyncio prints connection-reset tracebacks to stderr, outside the JSON log | Backlog: Windows is a development host only |
+| D-154 | A recorded by-hand onboarding run against a real OAuth-protected MCP server | Backlog, with D-69: once before a release (recorded "not run" in [manual-checks.md](manual-checks.md)) |
 | D-155 | The dynamic client registration lifecycle (RFC 7592): registration access tokens, deregistration, cleanup of orphaned registrations | A per-client registration limit, or a provider that rotates registered secrets |
 | D-157 | Revocation on replace and re-login (M7 revokes on delete only) | An operator who hits a provider's per-client token limit, or asks |
 | D-158 | The ledger view rereads every kept archive for its first page, with no cache | M6's history views, M8's second vault chain, or slow first pages |
@@ -2796,6 +2792,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-169 | The hardened smoke's alias probe couldn't tell the vault's name from the portal's alias | Done in M7 |
 | D-170 | CI jobs had no `timeout-minutes` | Done in M7: every CI job has one |
 | D-177 | Two Docker networks per hardened bridge count against Docker's default address pools | Done in M7: [operations.md](operations.md) §33 says how many fit and how to widen the pools |
+| D-183 | The fake OAuth provider had no consent page, so a by-hand check couldn't show the session cookie held back on the callback | Done in M7: the consent page, and item 13 run with it (the callback carries no session cookie) |
 | D-184 | A re-registration fragment couldn't carry `token_headers` or a list value in `extra_params` | Done in M7: such a re-registration is refused, and the operator edits the policy by hand |
 | D-185 | Health didn't report a client secret whose binding login refuses | Done in M7: health and login share the check |
 | D-190 | `check` and the egress role keyed an internationalized destination in its Unicode form | Done in M7: the `xn--` form everywhere |
