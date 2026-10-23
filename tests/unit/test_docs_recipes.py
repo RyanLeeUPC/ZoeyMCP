@@ -1,11 +1,12 @@
-"""The policies in operations.md's egress how-tos load and pass ``check`` (M7 design P.2, steps 3a
-and 17c).
+"""The policies in operations.md's egress and bridge how-tos load and pass ``check`` (M7 design
+P.2, steps 3a, 17c and 18e).
 
 A fenced block whose info string is ``yaml policy`` is a whole policy: every one in "Your own egress
-proxy", "Fitting ZoeyMCP into an existing stack" and "The egress role" must parse with no
-``check`` error, so a recipe can't drift from the schema. The first section's sample output (a
-block starting with the emitter's header) must be what ``check --emit-egress-allowlist`` prints
-for its policy, byte for byte, so the how-to shows the snippet as it really is.
+proxy", "Fitting ZoeyMCP into an existing stack", "The egress role" and "A stdio server behind a
+bridge" must parse with no ``check`` error, so a recipe can't drift from the schema. The first
+section's sample output (a block starting with the emitter's header) must be what ``check
+--emit-egress-allowlist`` prints for its policy, byte for byte, so the how-to shows the snippet
+as it really is.
 """
 
 from __future__ import annotations
@@ -16,10 +17,19 @@ from pathlib import Path
 import pytest
 
 from zoeymcp.common import egresslist
-from zoeymcp.common.policy import Policy, check_policy, parse_policy
+from zoeymcp.common.policy import Policy, check, check_policy, parse_policy
+from zoeymcp.common.policy.schema import RemoteServer
+from zoeymcp.common.yamlload import load_mapping
 
-OPERATIONS = Path(__file__).resolve().parents[2] / "docs" / "operations.md"
-SECTIONS = ("Your own egress proxy", "Fitting ZoeyMCP into an existing stack", "The egress role")
+ROOT = Path(__file__).resolve().parents[2]
+OPERATIONS = ROOT / "docs" / "operations.md"
+BRIDGE_PROFILE = ROOT / "profiles" / "stdio-bridge.yaml"
+SECTIONS = (
+    "Your own egress proxy",
+    "Fitting ZoeyMCP into an existing stack",
+    "The egress role",
+    "A stdio server behind a bridge",
+)
 FENCE = re.compile(r"^( *)```([\w-]*)((?: [\w-]+)*)\n(.*?)^\1```\n", re.MULTILINE | re.DOTALL)
 HEADER = "# zoeymcp egress allowlist, lists "
 
@@ -74,6 +84,34 @@ def test_the_role_recipe_names_the_roles_vault_listener() -> None:
     assert (policy.egress_proxy, policy.egress_proxy_kind) == ("http://egress-vault:3128", "role")
     destinations = {(d.host, d.port) for d in egresslist.derive(policy)["vault"]}
     assert ("smtp.mail.example", 465) in destinations
+
+
+def test_the_bridge_how_to_is_the_profile_in_each_tier() -> None:
+    """The bridge's how-to (M7 design C.9, C.10): its hardened policy is the S11 profile's route
+    and server, and its standard one the same with the launcher's socket as the upstream, no
+    opt-in and no egress list; both are local MCP routes."""
+    hardened, standard = policies(SECTIONS[3])
+    profile = load_mapping(BRIDGE_PROFILE.read_text(encoding="utf-8"))
+    [shipped] = profile["routes"]
+    for policy in (hardened, standard):
+        [route] = policy.routes
+        assert (route.name, route.prefix, route.credential) == (
+            shipped["name"],
+            shipped["prefix"],
+            shipped["credential"],
+        )
+        assert check.local_mcp_routes(policy) == {route.name}
+        assert policy.gateway is not None
+        server = policy.gateway.servers["fetch"]
+        assert isinstance(server, RemoteServer)
+        assert (server.route, server.era) == (route.name, "legacy")
+    [route] = hardened.routes
+    assert route.upstream == shipped["upstream"]
+    assert route.program is not None
+    assert list(route.program.egress) == shipped["program"]["egress"]
+    [route] = standard.routes
+    assert route.upstream == "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+    assert (route.allow_insecure_upstream, route.program) == (False, None)
 
 
 def test_blocks_finds_indented_and_tagged_fences() -> None:

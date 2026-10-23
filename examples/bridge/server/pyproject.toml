@@ -1,0 +1,19 @@
+[project]
+name = "example-fetch-server"
+version = "0.1.0"
+description = "A small stdio MCP server for ZoeyMCP's bridge example: echo, a fetch-like tool and a wait."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# Nothing beyond the standard library, so its wheel is the whole lock (examples/bridge/lock.sh).
+dependencies = []
+
+[project.scripts]
+fetch-server = "example_fetch_server:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/example_fetch_server"]

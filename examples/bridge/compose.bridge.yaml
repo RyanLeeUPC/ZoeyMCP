@@ -1,0 +1,65 @@
+# A stdio MCP server behind a bridge, hardened tier (M7 design C.9; docs/operations.md §33):
+#
+#   docker compose -f deploy/compose.hardened.yaml -f examples/bridge/compose.bridge.yaml \
+#     --profile egress-proxy up -d
+#
+# The bridge runs in a container of its own, from the image built from this directory (README),
+# on two internal networks: bridge-fetch, which it shares with the vault alone, and egress-fetch,
+# which it shares with the egress role alone. It reaches nothing else: not the gateway, not the
+# portal, not the internet but through the role, which allows only its route's program.egress
+# list. The vault reaches it as bridge-fetch-mcp, an alias on bridge-fetch alone, with the route's
+# token (secret set bridge-fetch-token --generate).
+#
+# From a cold start (J7): commit the route, its credential and the server without this file and
+# reload; generate the token and set ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256 to the sha256: line it
+# prints; for a program with egress, start the role with its key; then add this file and
+# `up -d bridge-fetch`, then `up -d vault`. Until the hash is set the bridge refuses to start and
+# compose keeps restarting it; the vault starts regardless.
+#
+# Compose stops the gateway, then the vault, then this bridge (the vault's depends_on below), so a
+# call in flight through the bridge finishes inside the vault's 75 s stop window. An override
+# can't use the base file's x-hardened anchor, so the settings are written out. A program with no
+# egress drops egress-fetch, --egress-proxy and the role's second listener.
+networks:
+  bridge-fetch: {internal: true}   # the vault and this bridge, nothing else
+  egress-fetch: {internal: true}   # this bridge and the egress role, nothing else
+services:
+  vault:
+    networks:
+      bridge-fetch: {}
+    depends_on:
+      # Never service_healthy: third-party code doesn't decide whether the vault starts, and
+      # the bridge's hash exists only once the vault has run (TI-7).
+      bridge-fetch: {condition: service_started}
+  bridge-fetch:
+    image: ${ZOEYMCP_BRIDGE_IMAGE:-zoeymcp-bridge-fetch:local}
+    command: [bridge, --listen, "bridge-fetch-mcp:9000", --era, legacy,
+              --egress-proxy, "http://egress-fetch:3128", --,
+              /opt/stdio-server/venv/bin/fetch-server]
+    user: "10005:10005"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    # PID 1 is an init that reaps the program's orphans (npx- or uvx-style grandchildren).
+    init: true
+    # Its programs stop within 4 s (stdin closed, then SIGTERM and SIGKILL to the group).
+    stop_grace_period: 15s
+    environment:
+      # From `zoeymcp secret set bridge-fetch-token --generate`; the bridge refuses to start
+      # without it, so a cold start sets it first (J7).
+      ZOEYMCP_BRIDGE_TOKEN_SHA256: ${ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256:-}
+    healthcheck:
+      test: [CMD, zoeymcp, bridge, --ready-check]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      bridge-fetch: {aliases: [bridge-fetch-mcp]}   # the route's upstream host, on this network alone
+      egress-fetch: {}
+  egress-proxy:
+    # An override replaces command whole: the vault's listener stays, beside this bridge's, whose
+    # source is the route's name.
+    command: [egress, --vault, "http://vault:8080",
+              --listen, "vault=egress-vault:3128", --listen, "bridge-fetch=egress-fetch:3128"]
+    networks:
+      egress-fetch: {aliases: [egress-fetch]}

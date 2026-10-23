@@ -1,0 +1,31 @@
+# examples/bridge/compose.standard.yaml (M7 design C.10; docs/operations.md §33)
+# docker compose -f deploy/compose.yaml -f examples/bridge/compose.standard.yaml up -d
+# UNCONFINED: this program shares the container with the vault and the gateway. It can reach
+# every TCP listener here, the host's network and the internet, can ignore proxy settings, and can
+# use up the container's memory, processes and CPU. Every process here can read its arguments,
+# so no secret goes in ..._ARGS. Nothing in the standard tier limits where it connects; use the
+# hardened tier for that. This image must pass examples/bridge/verify.sh --bridge.
+#
+# The launcher starts bridge "fetch" as uid 10100 (the first --bridge) after the vault and the
+# gateway, on unix:/run/zoeymcp-bridge-fetch/mcp.sock, the route's upstream. From a cold start
+# (J7): commit the route, its credential and the server, run `zoeymcp secret set
+# bridge-fetch-token --generate` in this container, set ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256 to the
+# sha256: line it prints, and recreate the container. Until then the bridge refuses to start and
+# stays down; its route answers 502.
+services:
+  zoeymcp:
+    image: ${ZOEYMCP_BRIDGE_IMAGE:-zoeymcp-bridge-fetch:local}   # the derived image (C.7)
+    command: [standard, --gateway-listen, "0.0.0.0:8090", --bridge, fetch]
+    # A bridge's programs share the container's process table with the vault and the gateway.
+    pids_limit: 1024
+    environment:
+      ZOEYMCP_BRIDGE_FETCH_ARGS: >-
+        ["--era", "legacy", "--", "/opt/stdio-server/venv/bin/fetch-server"]
+      ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256: ${ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256:-}
+      # A program that needs a real secret gets it here, never in ARGS, with --secret-env NAME in
+      # ARGS and program: {holds_secret: true} on its route (A.4):
+      # ZOEYMCP_BRIDGE_FETCH_ENV_NAME: ${...}
+    tmpfs:
+      # Bridge 0 (uid 10100): its socket, mcp.sock, which only the vault's group (10001) can
+      # reach, and its work directory. The route's upstream is unix:/run/zoeymcp-bridge-fetch/mcp.sock.
+      - /run/zoeymcp-bridge-fetch:size=64m,mode=0750,uid=10100,gid=10001

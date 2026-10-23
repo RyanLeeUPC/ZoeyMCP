@@ -10,8 +10,13 @@ updates:
       actions:
         patterns: ["*"]
   - package-ecosystem: docker
-    directory: /
+    # The official image, and the two example images' uv stages, pinned like the root's: one
+    # group, so all three move in one pull request (a unit test keeps the three pins equal).
+    directories: [/, /examples/bridge, /examples/derived-image]
     schedule:
       interval: weekly
     cooldown:
       default-days: 14
+    groups:
+      images:
+        patterns: ["*"]

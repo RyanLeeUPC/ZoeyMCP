@@ -159,6 +159,12 @@ class Deployment:
     design J). ``extra`` is a policy fragment merged into the profile's, its routes keeping
     their own upstreams (another profile, say). A policy with SMTP connectors gets connectors
     that trust the test CA.
+
+    ``socket_clients`` gives a ``unix:`` route's client by the bridge's name, as ``--bridge``
+    builds them (M7 design B.2); without it the test CA's client serves those routes too. With
+    ``guarded`` the vault reaches its routes on its own guarded clients, as ``zoeymcp vault``
+    does (B.2: certifi's roots, the address guard and ``egress_private``); the test points
+    ``certifi.where`` at its CA first, as ``procs.py``'s launcher does.
     """
 
     def __init__(
@@ -177,8 +183,12 @@ class Deployment:
         portal: bool = False,
         reports: bool = False,
         extra: Mapping[str, Any] | None = None,
+        socket_clients: Callable[[str], httpx.AsyncClient | None] | None = None,
+        guarded: bool = False,
     ) -> None:
         self.state = tmp_path
+        self.socket_clients = socket_clients
+        self.guarded = guarded
         self.with_reports = reports
         self.extra = dict(extra or {})
         self.portal_port = free_port() if portal else None
@@ -252,12 +262,13 @@ class Deployment:
             self.policy,
             store,
             self.keys,
-            client=tls_client(self.ca),
+            client=None if self.guarded else tls_client(self.ca),
             tokens=self.tokens,
             environ=self.environ,
             gateway_link=self.link_socket is not None,
             connectors=connectors,
             reports=self.reports,
+            socket_clients=self.socket_clients,
         )
         self.login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
         self.setup = SetupCodes(self.state, self.keys.portal_key)

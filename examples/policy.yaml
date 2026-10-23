@@ -136,3 +136,36 @@ gateway:
           rules:
             - { methods: [GET], paths: [/config] }
             - { methods: [POST], paths: [/send], approved: true }
+
+# A stdio MCP server behind a bridge (docs/operations.md §33, profiles/stdio-bridge.yaml): a local
+# MCP route to the bridge, with its token as the route's header credential, and a remote server
+# on that route; the gateway can't tell it from any other. Uncommented, each part goes under its
+# section above. As written it is the hardened tier's (examples/bridge/compose.bridge.yaml); in
+# the standard tier the upstream is the bridge's socket, and allow_insecure_upstream and the
+# program's egress list go (nothing there could enforce it).
+#
+# credentials:
+#   bridge-fetch:
+#     kind: header # Authorization: Bearer <token>
+#     secret: store:bridge-fetch-token # zoeymcp secret set bridge-fetch-token --generate
+# routes:
+#   - name: bridge-fetch
+#     prefix: /bridge-fetch
+#     upstream: http://bridge-fetch-mcp:9000 # the bridge's alias, on a network of its own
+#     # upstream: unix:/run/zoeymcp-bridge-fetch/mcp.sock # the standard tier's bridge socket
+#     allow_insecure_upstream: true # plain http: a local target only
+#     credential: bridge-fetch
+#     callers: [gateway]
+#     stream: true
+#     rules:
+#       - methods: [POST, GET, DELETE]
+#         paths: [/mcp]
+#     program:
+#       egress: ["docs.example.org:443"] # what the egress role lets the program reach
+# gateway:
+#   servers:
+#     fetch:
+#       kind: remote
+#       route: bridge-fetch
+#       path: /mcp
+#       era: legacy # the bridge's --era

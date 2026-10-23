@@ -6,10 +6,13 @@ with ``_meta`` the modern one. It is run as a script, ``python tests/fakes/stdio
 [options]``, from the bridge's empty working directory and environment, so it imports only the
 SDK and the standard library.
 
-The ordinary tools are ``time`` and ``fetch`` (fetch-like: it reaches no network), ``echo``, and
-``progress``, which reports progress against the request's own token before it answers (SPEC-3).
+The ordinary tools are ``time`` and ``fetch`` (fetch-like: it reaches no network), ``echo``,
+``progress``, which reports progress against the request's own token before it answers (SPEC-3),
+and ``slow``, which reports progress each step, ``interval`` seconds apart, then answers.
 ``--starts FILE`` counts the starts in FILE, and every second start adds the tool ``extra``: the
-tools toggle per start, as a server upgraded between two runs.
+tools toggle per start, as a server upgraded between two runs. ``--changed FILE`` does the same
+for each start while FILE exists, and changes ``time``'s description too, so a pinned tool drifts
+(S11's restart row, where a legacy bridge's probe and every session each start a child).
 
 The hostile switches are tools too, so one child can be well-behaved until a test asks: ``flood``
 writes 100 MB with no newline; ``stderr_flood`` floods stderr; ``crash`` exits mid-call; ``hang``
@@ -21,7 +24,8 @@ a batch; ``garbage`` prints a line that isn't JSON; ``grandchild`` leaves a proc
 listen stream). At start, ``--print-env NAME`` prints that variable to stderr (the leak sweep's
 case) and ``--ignore-eof`` keeps running after stdin ends, ignoring SIGTERM. Each
 ``notifications/cancelled`` it is sent is noted on stderr as ``cancelled <requestId>``, so a test
-run with ``--stderr text`` sees which request a cancel reached.
+run with ``--stderr text`` sees which request a cancel reached; ``hang`` notes its own as
+``hanging <requestId>`` before it waits.
 """
 
 from __future__ import annotations
@@ -69,6 +73,12 @@ TOOLS: Final = (
     tool("fetch", "Fetch a URL (the fake reaches no network).", url={"type": "string"}),
     tool("echo", "Echo the text.", text={"type": "string"}),
     tool("progress", "Report progress, then answer.", steps={"type": "integer"}),
+    tool(
+        "slow",
+        "Report progress each step, a while apart, then answer.",
+        steps={"type": "integer"},
+        interval={"type": "number"},
+    ),
     tool("flood", "Write 100 MB with no newline."),
     tool("stderr_flood", "Flood stderr, then answer."),
     tool("crash", "Exit mid-call."),
@@ -83,6 +93,7 @@ TOOLS: Final = (
     tool("announce", "Send tools/list_changed."),
 )
 EXTRA: Final = tool("extra", "Present on every second start.")
+CHANGED_TIME: Final = tool("time", "The current time, in UTC.")
 
 
 def err(line: str) -> None:
@@ -144,6 +155,10 @@ class Fake:
             path.write_bytes(str(starts + 1).encode("ascii"))
             if starts % 2:
                 self.tools.append(EXTRA)
+        if options.changed is not None and Path(options.changed).exists():
+            self.tools = [CHANGED_TIME if t.name == "time" else t for t in self.tools]
+            if EXTRA not in self.tools:
+                self.tools.append(EXTRA)
         self.server: Server[Any] = Server(
             "fake-stdio",
             version="1.0.0",
@@ -173,6 +188,13 @@ class Fake:
             for step in range(steps):
                 await ctx.session.report_progress(step, steps, f"step {step}")
             return text(f"done after {steps} steps")
+        if name == "slow":
+            steps = int(arguments.get("steps", 3))
+            interval = float(arguments.get("interval", 0.5))
+            for step in range(steps):
+                await ctx.session.report_progress(step, steps, f"step {step}")
+                await anyio.sleep(interval)
+            return text(f"done after {steps} steps")
         if name == "flood":
             chunk = "x" * MIB
             for _ in range(FLOOD_BYTES // MIB):
@@ -187,6 +209,7 @@ class Fake:
         if name == "crash":
             os._exit(3)
         if name == "hang":
+            err(f"hanging {json.dumps(ctx.request_id)}\n")
             await anyio.sleep_forever()
         if name == "ask":
             return await self.ask()
@@ -256,6 +279,7 @@ class Fake:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="stdio_server")
     parser.add_argument("--starts", metavar="FILE")
+    parser.add_argument("--changed", metavar="FILE")
     parser.add_argument("--print-env", action="append", default=[], metavar="NAME")
     parser.add_argument("--ignore-eof", action="store_true")
     options = parser.parse_args(argv)

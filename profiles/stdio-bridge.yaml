@@ -1,0 +1,57 @@
+# S11: a stdio MCP server behind a bridge (design §8.1, M7; docs/operations.md §33).
+#
+# A bridge is an upstream: a vault route whose upstream is the bridge, with the bridge's token as
+# the route's header credential, and a kind: remote server on that route. The gateway can't tell
+# it from any other remote server. The policy is the same in every placement but the route's
+# upstream; as written it is the hardened tier's (examples/bridge/compose.bridge.yaml): plain
+# http to the bridge's alias on a network only the vault shares with it.
+#
+#   1. Commit this and reload, then make the bridge's token in the vault:
+#        zoeymcp secret set bridge-fetch-token --generate
+#      and give the bridge the sha256: line it prints (ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256 in the
+#      examples). The token never leaves the vault.
+#   2. Make a client token for each agent (zoeymcp client-token) and put its token_sha256 below.
+#   3. Review the server inside the gateway, then commit the snippet it prints:
+#        zoeymcp review fetch --add <tool> --add <tool>
+#      and put each added tool under allow or approve. Nothing is served until then.
+#
+# The standard tier (examples/bridge/compose.standard.yaml), where nothing confines the program:
+#   upstream: unix:/run/zoeymcp-bridge-fetch/mcp.sock
+# with allow_insecure_upstream and program.egress dropped. A remote bridge behind your own TLS
+# front: upstream: https://fetch.bridges.example, with allow_insecure_upstream dropped. Wherever
+# the program holds a real secret (--secret-env), add holds_secret: true to its program block.
+
+credentials:
+  bridge-fetch:
+    kind: header      # Authorization: Bearer <token>
+    secret: store:bridge-fetch-token
+
+routes:
+  - name: bridge-fetch
+    prefix: /bridge-fetch
+    upstream: http://bridge-fetch-mcp:9000   # the alias on bridge-fetch alone
+    allow_insecure_upstream: true            # plain http: a local target only
+    credential: bridge-fetch
+    callers: [gateway]
+    stream: true
+    rules:
+      # POST carries requests; GET and DELETE are a legacy session's stream and its end.
+      - methods: [POST, GET, DELETE]
+        paths: [/mcp]
+    program:
+      # What the egress role lets the program reach, in the hardened tier only.
+      egress: ["docs.example.org:443"]
+
+gateway:
+  clients:
+    agent1:
+      token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      servers: [fetch]
+  servers:
+    fetch:
+      kind: remote
+      route: bridge-fetch
+      path: /mcp
+      era: legacy     # the bridge's --era
+      tools: {include: [], allow: [], approve: []}
+      review: {}

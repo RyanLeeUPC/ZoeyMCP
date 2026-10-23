@@ -133,6 +133,30 @@ async def test_tools_toggle_per_start(tmp_path: Path) -> None:
     assert found == [False, True, False]
 
 
+async def test_a_changed_file_changes_a_pinned_tool(tmp_path: Path) -> None:
+    changed = tmp_path / "changed"
+    found = []
+    for exists in (False, True, True, False):
+        if exists:
+            changed.write_bytes(b"")
+        elif changed.exists():
+            changed.unlink()
+        async with child("--changed", str(changed)) as running:
+            listed = (await running.ask(1, "tools/list", {}))[-1]
+        tools = {tool["name"]: tool["description"] for tool in listed["result"]["tools"]}
+        found.append((tools["time"], "extra" in tools))
+    plain, changed_time = ("The current time.", False), ("The current time, in UTC.", True)
+    assert found == [plain, changed_time, changed_time, plain]
+
+
+async def test_slow_reports_each_step_before_it_answers() -> None:
+    async with child() as running:
+        params = {**call("slow", steps=2, interval=0.01), "_meta": {"progressToken": "s"}}
+        sent = await running.ask(3, "tools/call", params)
+    assert [m["params"]["progress"] for m in sent[:-1]] == [0, 1]
+    assert text_of(sent[-1]) == "done after 2 steps"
+
+
 async def test_progress_carries_the_requests_token() -> None:
     params = {**call("progress", steps=3), "_meta": {"progressToken": "tok"}}
     async with child() as running:
@@ -207,6 +231,7 @@ async def test_a_cancel_is_noted_on_stderr() -> None:
         assert await running.process.wait() == 3
         assert running.process.stderr is not None
         stderr = await running.process.stderr.read()
+    assert b"hanging 9\n" in stderr
     assert b"cancelled 9\n" in stderr
 
 

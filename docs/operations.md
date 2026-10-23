@@ -5,8 +5,9 @@ remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SM
 and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
 supported. M7's so far: onboarding a remote MCP server by URL (§11), your own egress proxy
 (§28), fitting ZoeyMCP into a stack that already has one (§29), a first hardened deployment
-end to end (§30), the egress role (§31) and the bridge (§32). The design and the reasons behind
-it are in [design.md](design.md); this page is the how-to.
+end to end (§30), the egress role (§31), the bridge (§32) and a stdio server behind one in each
+placement (§33). The design and the reasons behind it are in [design.md](design.md); this page is
+the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -559,7 +560,7 @@ same as any other. The old `url` splits in two: its scheme, host and port become
 `upstream` and its path the server's `path` (the vault joins the two, so an upstream that kept
 `/mcp` would send `/mcp/mcp`). The route has `callers: [gateway]`, `stream: true`, rules allowing
 `POST`, `GET` and `DELETE` on that path, and a `header` credential holding the bridge's token; the
-old `egress` list moves to the route's `program.egress`.
+old `egress` list moves to the route's `program.egress`. See §33, A stdio server behind a bridge.
 
 ## 8. Provider notes
 
@@ -630,6 +631,11 @@ profile (§31), ZoeyMCP's own CONNECT-only proxy, held to the allowlists the vau
 the policy. The standard tier has no role: nothing in its one container could make a program
 use it.
 
+**Bridges** (a stdio MCP server behind `zoeymcp bridge`, §33) run in either tier, and only the
+hardened tier confines them: there each bridge has a container and networks of its own and
+reaches out only through the role; in the standard tier a bridge is one more process in the one
+container, unconfined.
+
 **What stops the gateway starting** (it prints one line and exits 2): the master key,
 `ZOEYMCP_MASTER_KEY_PREVIOUS` or `ZOEYMCP_CONFIG` in its environment; running as root; an
 `http://` link without `ZOEYMCP_GATEWAY_KEY` or `ZOEYMCP_GATEWAY_KEY_FILE`; a state directory
@@ -641,8 +647,11 @@ the marks).
 upstream connections close (`policy_stale`): a revoked client can't keep working while the vault
 is unreachable.
 
-**Stopping.** Calls in flight get 10 s. The standard tier's launcher gives both roles 50 s, so
-compose sets `stop_grace_period: 60s`.
+**Stopping.** Calls in flight get 10 s, but an approved call already running finishes (§20). The
+standard tier's launcher stops the gateway first and gives it up to 330 s, then the vault up to
+75 s, then each bridge 10 s, so a call in flight through the vault or a bridge finishes first:
+at most 415 s, inside the `stop_grace_period: 420s` compose sets. In the hardened tier compose
+stops the gateway (330 s), then the vault (75 s), then each bridge (§33).
 
 ## 10. Client tokens
 
@@ -1301,6 +1310,14 @@ session idle timeout takes a gateway restart (`limits_change_needs_restart`).
   way out.
 - **Standard-tier egress:** the gateway shares the vault's network namespace. For anything that
   moves money, sends mail or touches personal data, use the hardened tier.
+- **Bridges** (§33) relay the protocol and nothing else: a program behind one gets no roots,
+  sampling or elicitation from the gateway (the bridge answers its `ping` and refuses every other
+  request it makes), so give it its directories on its command line. Under `shared_session: true`
+  every client shares one legacy child, and a modern bridge always runs one child, which every
+  client shares. A legacy bridge's restart is caught at the gateway's next request (it gets 404, opens a
+  new session, lists and compares the pins); a modern bridge's only at the drift timer (300 s), as
+  for any modern server. A standard-tier bridge is unconfined; only the hardened tier limits
+  where a bridge's program connects.
 
 ## 18. Troubleshooting the gateway
 
@@ -2321,6 +2338,14 @@ shape.
   out beside the proxy, and the allowlist confines nothing. `egress_proxy` names the proxy's
   address on that network, and the emitted snippet (§28) goes into the proxy's configuration,
   with the vault's address on that network as its `src` ACL.
+- **A hardened bridge** (§33) gets networks of its own here too, never one of the stack's:
+  `bridge-<name>`, internal, which it shares with the vault alone, and, when its program has an
+  egress list, an internal network it shares with the stack's proxy alone, through which the
+  program goes out. The emitted snippet gives the bridge's route a source of its own
+  (`zoeymcp_src_<route>`, so `zoeymcp_src_bridge-fetch` for the example's, unless
+  `egress_proxy_acls` names your ACL), whose `src` is the
+  bridge's address on that network, so the program reaches its own list and nothing on the
+  vault's.
 - **The agents** get one entry per server in the runtime's configuration: the URL
   `http://zoeymcp-gateway:8090/s/<server>/mcp`, the header
   `Authorization: Bearer <client token>` (§10), and the runtime's own approval setting for that
@@ -2667,7 +2692,7 @@ docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
   `egress_private` line, as without the role: the role reads the private mark from the vault's
   list, and refuses an unmarked name that resolves to a private address (`address_refused`).
 - **What it protects, honestly.** The role is for programs that can't be trusted to keep their
-  own limits: a hardened bridge (later in M7), confined to its own `host:port` list. For the
+  own limits: a hardened bridge (§33), confined to its own `host:port` list. For the
   vault it adds the allowlist and an address check at connect time behind a proxy, but the vault
   already guards its own connections (§7's upgrade note) and keeps its direct route on `egress`
   for the portal, so the role doesn't confine the vault: sending the vault through it stays
@@ -2687,7 +2712,8 @@ docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
 of ZoeyMCP it is one more upstream: a `kind: remote` server behind a vault route whose upstream
 is the bridge and whose header credential holds the bridge's token. It relays JSON-RPC envelopes:
 it rewrites ids and progress tokens so that clients can't collide, and otherwise passes the
-program's bytes through; it parses no tool definition and imports no MCP SDK.
+program's bytes through; it parses no tool definition and imports no MCP SDK. This section is
+its reference; §33 is the how-to, with the policy, the image and each placement.
 
 ```sh
 zoeymcp bridge --listen unix:/run/zoeymcp-bridge-fetch/mcp.sock --peer-uid 10001 \
@@ -2827,3 +2853,285 @@ The launcher's log lines (`role: launcher`) about bridges:
 | `child_started`, `child_exited` | `child` (`bridge:<name>`), `pid` and `uid`; `status` |
 | `launcher_bridge_refused` | `name` (none for a malformed one), `reasons`: each names a variable, the directory, or for ARGS a position (`ZOEYMCP_BRIDGE_FETCH_ARGS[3]: --listen is the launcher's`), or why it couldn't be spawned (`it couldn't be started: Argument list too long`), never a value |
 | `launcher_bridge_down` | `name`, `status`: after its `child_exited`, a bridge that exited on its own; it isn't restarted and the others keep running |
+
+## 33. A stdio server behind a bridge
+
+A stdio-only MCP server reaches the gateway through `zoeymcp bridge` (§32), which serves it as
+one Streamable HTTP endpoint. **A bridge is an upstream**: in the policy it is a vault route whose
+upstream is the bridge, with the bridge's token as the route's header credential, and a
+`kind: remote` server on that route. The gateway lists, pins, reviews and approves its tools as
+any remote server's. The policy is the same in every placement but the route's upstream, and
+`profiles/stdio-bridge.yaml` (S11) is it; `examples/bridge/` holds the image recipe and both
+tiers' compose overrides.
+
+| | Hardened (A) | Standard (B) | Remote (C) |
+| --- | --- | --- | --- |
+| Where it runs | a container of its own (`compose.bridge.yaml`) | a child of the standard launcher, as a uid of its own (`compose.standard.yaml`) | another host, behind your TLS front |
+| The route's upstream | `http://bridge-<name>-mcp:9000`, with `allow_insecure_upstream: true` | `unix:/run/zoeymcp-bridge-<name>/mcp.sock` | `https://<host>` (plus any prefix your front adds) |
+| Who can reach it | the vault alone, on a network of their own | the vault alone, by file permissions and both ends' peer checks | whatever reaches that host |
+| Where its program connects | only through the egress role, to its route's `program.egress` | **anywhere**: nothing confines it | wherever that host lets it |
+
+Bridges work in both tiers; **only the hardened tier confines them**.
+
+**The token, in every placement.** Every request to a bridge needs its token, which only the
+vault holds: in the hardened tier a container put on the bridge's network by mistake reaches
+nothing without it, in the standard tier it is the second barrier behind the socket's
+permissions, and in front of a remote bridge it is the only one. Once the policy names the route
+and its header credential, the vault makes the token:
+
+```sh
+# hardened tier
+docker compose -f deploy/compose.hardened.yaml -f examples/bridge/compose.bridge.yaml \
+  exec vault zoeymcp secret set bridge-fetch-token --generate
+# standard tier
+docker compose -f deploy/compose.yaml -f examples/bridge/compose.standard.yaml \
+  exec zoeymcp zoeymcp secret set bridge-fetch-token --generate
+```
+
+It prints only the token's `sha256:` line, which the bridge gets as `ZOEYMCP_BRIDGE_TOKEN_SHA256`
+(the examples read it from `ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256`); a hash is configuration, safe to
+keep with your compose files. The token itself never leaves the vault, which adds it to every
+request on the route as `Authorization: Bearer` and never shows it to the gateway. Run it again
+for a new token, and give the bridge the new hash. With override files, set
+`ZOEYMCP_COMPOSE_CMD` (§11) to the command you type, so the commands ZoeyMCP prints name them.
+
+**The route.** `check` takes plain http on an MCP route only to a loopback or private address,
+or a single-label name, with the route's header credential a secret no other credential uses
+(a local MCP route); beyond that, https. A standard-tier bridge's `unix:` socket is the other
+local MCP route, in the standard tier only. The vault reaches a local MCP route directly, never
+through `egress_proxy`, and refuses a plain-http connection whose name resolves anywhere but a
+loopback or private address. Assert the server's `era` (`legacy` or `modern`, the bridge's
+`--era`); `auto` works too, at the cost of a probe.
+
+```yaml policy
+version: 1
+mode: declarative
+credentials:
+  bridge-fetch: {kind: header, secret: "store:bridge-fetch-token"}   # Authorization: Bearer
+routes:
+  - name: bridge-fetch
+    prefix: /bridge-fetch
+    upstream: http://bridge-fetch-mcp:9000     # the bridge's alias, on its network alone
+    allow_insecure_upstream: true              # plain http: a local target only
+    credential: bridge-fetch
+    callers: [gateway]
+    stream: true
+    rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+    program:                                   # what the egress role lets the program reach
+      egress: ["docs.example.org:443"]
+gateway:
+  servers:
+    fetch: {kind: remote, route: bridge-fetch, path: /mcp, era: legacy}
+```
+
+### The image
+
+`examples/bridge/Dockerfile` builds an image from the official one (by its digest, in production) plus one layer:
+the server installed at build time, in a build stage, into its own prefix `/opt/stdio-server`,
+from wheels only and locked by hash (`lock.sh`), so no package's build code runs as root. The
+same image is the hardened tier's bridge container and the whole standard container.
+`examples/bridge/verify.sh --bridge OFFICIAL IMAGE` proves it is the official image plus that
+prefix and nothing else: the official layers in order plus one, the same `User`, `Entrypoint`,
+`Cmd`, `Env` and `WorkingDir`, an added layer that touches only `/opt/stdio-server`, both
+zoeymcp environments byte for byte the official ones, nothing setuid, setgid or world-writable,
+the labels, and emSign ECC Root CA - G3 out of the Debian store (the official image drops it,
+since a bridge's program may read that store). In the standard tier the vault runs from this
+image, so it **must** pass. A Node server is built the same way (`npm ci --ignore-scripts` from a
+lock with integrity hashes, in the build stage), with a pinned Node runtime copied into
+`/opt/node`, which `verify.sh --bridge --node` allows. Keep any package registry out of the
+program's egress list, and turn off its update checks and telemetry where it has a switch. See
+`examples/bridge/README.md`.
+
+### A: the hardened tier
+
+**Confined.** The bridge runs in a container of its own, as uid 10005 (the image's
+`bridge` user, which owns no file), read-only, with no capability, `no-new-privileges`, and
+`init: true`, so PID 1 reaps the orphans a program leaves (an `npx`- or `uvx`-style grandchild).
+`examples/bridge/compose.bridge.yaml` gives it two internal networks:
+
+- `bridge-<name>`, which it shares with the vault alone. It listens on `bridge-<name>-mcp:9000`,
+  an alias declared on that network only, so the name means nothing anywhere else; that is the
+  route's upstream host.
+- `egress-<name>`, which it shares with the egress role alone (§31), only when its program has an
+  egress list. Its child's proxy variables (`--egress-proxy http://egress-<name>:3128`) point at
+  the role's listener there, which allows only the route's `program.egress`. The network has no
+  route out, so a program that ignores the variables reaches nothing: its requests then show no
+  `egress_tunnel` line in the role's log, which is the symptom to look for.
+
+It is on no other network: not `internal` (the gateway's), `agents`, `direct` or `egress` (the
+portal's). The override also restates the role's whole `command` with both listeners, since an
+override replaces a command whole, and gives the vault `depends_on: {bridge-<name>: {condition:
+service_started}}`: never `service_healthy`, so the bridge's code never decides whether the vault
+starts, and compose stops the gateway, then the vault, then the bridge, so a call in flight
+through it finishes inside the vault's window. Each hardened bridge with egress takes two Docker
+networks: Docker's default address pools hold about 30 networks per host, shared with every
+other compose project, and the hardened tier itself uses up to seven, so widen them in the
+daemon's configuration (`"default-address-pools": [{"base": "10.200.0.0/16", "size": 24}]` in
+`/etc/docker/daemon.json` gives 256) before running many bridges.
+
+From a cold start (J7):
+
+1. Build the image from `examples/bridge/` (its README) and verify it.
+2. Commit the route (`upstream: http://bridge-fetch-mcp:9000`, `allow_insecure_upstream: true`,
+   the `program` block if the program needs egress), its header credential and the remote
+   server, **without** the override yet, and reload (§7).
+3. Make the token (above) and set `ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256` to the line it prints.
+4. For a program with egress: start the role (§31) with `--profile egress-proxy` and its key.
+5. Add the override, then `up -d bridge-fetch`, then `up -d vault`:
+
+   ```sh
+   docker compose -f deploy/compose.hardened.yaml -f examples/bridge/compose.bridge.yaml \
+     --profile egress-proxy up -d bridge-fetch
+   docker compose -f deploy/compose.hardened.yaml -f examples/bridge/compose.bridge.yaml \
+     --profile egress-proxy up -d vault
+   ```
+
+6. Review the server (`zoeymcp review fetch`, §11), commit its pins and reload.
+
+A bridge started without its hash refuses to start, and compose keeps restarting it until the
+hash is set; the vault starts regardless. The bridge answers 503 until its readiness probe has
+passed (`zoeymcp bridge --ready-check` is its health check).
+
+### B: the standard tier
+
+> **Unconfined.** In the standard tier the program shares the container's network with the vault
+> and the gateway: it can reach every TCP listener there, your network and the internet, and it
+> can ignore proxy settings. Nothing in this tier limits where it connects. Use the hardened tier
+> for a program you need to confine.
+>
+> It shares more than the network: the container's memory, processes and CPU, which it can use
+> up (the bridge lowers its own process limit to `--max-procs` and makes itself the first to go
+> when memory runs out, and the override sets the container's `pids_limit`, but nothing caps its
+> memory or CPU here), and its arguments, which every process in the container can read. The
+> program's code is installed in the vault's own container, so the image must pass
+> `examples/bridge/verify.sh --bridge`.
+
+`examples/bridge/compose.standard.yaml` runs the image as the standard container and adds
+`--bridge fetch` to the launcher's command (repeat it for each bridge, at most 8). Bridge *i* in
+`--bridge` order runs as uid 10100 + *i* with no other group, so it can't signal or read the
+vault, the gateway or another bridge; health reports `program_unconfined` for its route (§3).
+Its configuration (§32, "Under the standard launcher"):
+
+- `ZOEYMCP_BRIDGE_<NAME>_ARGS`: a JSON array of its `zoeymcp bridge` arguments, with `--era` and
+  the command after `--`. The launcher sets `--listen`, `--peer-uid`, `--work-dir` and
+  `--control-fd` itself and refuses them here, and `--egress-proxy` (nothing here enforces it).
+  **No secret goes in ARGS**: every process in the container can read a command line.
+- `ZOEYMCP_BRIDGE_<NAME>_TOKEN_SHA256`: its token's hash.
+- `ZOEYMCP_BRIDGE_<NAME>_ENV_<VAR>`: handed to it as `<VAR>`, for its `--env` and `--secret-env`.
+  A process's environment is readable only by its own uid, so a placeholder or a secret goes
+  here.
+- Its socket directory: a tmpfs the override mounts at `/run/zoeymcp-bridge-<name>`, with exactly
+  `size=64m,mode=0750,uid=<10100+i>,gid=10001`: owned by the bridge's uid, group the vault's,
+  mode 0750. The bridge creates its socket `mcp.sock` there and its work directory `work/` (0700).
+  Only the vault's group can search the directory, so only the vault can connect to the socket,
+  and only the bridge's uid can write it, so no other process can create, replace or remove a
+  socket there, whether the bridge runs, was refused, waits for its hash or has exited. Both ends
+  check the other's uid as well (`SO_PEERCRED`): the bridge cuts any peer but the vault
+  (`bridge_peer_refused`), and the vault refuses a socket another uid listens on
+  (`address_refused`, verdict `peer_uid`), so even a directory its own program loosened lets no
+  one else in or stand in. The launcher checks the directory before starting the bridge and
+  refuses that bridge alone if it is missing or not exactly so (a reordered `--bridge` list
+  changes its uid: fix the mount too).
+
+The route's upstream is the socket, `unix:/run/zoeymcp-bridge-fetch/mcp.sock`, with no
+`allow_insecure_upstream` and no `program.egress`. Not a loopback port: any process in the
+container could listen on a free port first and take the route's token, so health reports a
+bridge's route to a loopback address as `loopback_bridge_route` (an error).
+
+```yaml policy
+version: 1
+mode: declarative
+credentials:
+  bridge-fetch: {kind: header, secret: "store:bridge-fetch-token"}
+routes:
+  - name: bridge-fetch
+    prefix: /bridge-fetch
+    upstream: unix:/run/zoeymcp-bridge-fetch/mcp.sock
+    credential: bridge-fetch
+    callers: [gateway]
+    stream: true
+    rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+gateway:
+  servers:
+    fetch: {kind: remote, route: bridge-fetch, path: /mcp, era: legacy}
+```
+
+From a cold start (J7): build and verify the image; commit the route, its credential and the
+server, and recreate the container; make the token in it (above) and set
+`ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256`; add the override and recreate the container:
+
+```sh
+docker compose -f deploy/compose.yaml -f examples/bridge/compose.standard.yaml up -d
+```
+
+Then review as in A. Until its hash is set the bridge refuses to start and stays down, and its
+route answers 502.
+
+**A bridge that exits on its own stays down** (FM-29): the launcher logs `child_exited` and
+`launcher_bridge_down` and doesn't restart it, since PID 1 holds no privilege to start a process
+as another uid and third-party code must not be able to restart the trust root. The vault and
+the gateway keep serving every other server. Its route answers 502 at once, with nothing sent,
+and no other uid can create a socket in its directory to take its place. Restarting the
+container brings it back: a fresh tmpfs, the launcher's checks, a new socket.
+
+### C: a remote bridge
+
+On another host, run `zoeymcp bridge --listen 127.0.0.1:9000 --era legacy -- <command>` behind
+your own TLS front, which must pass `Authorization` through, add no `Origin` (the bridge refuses
+every request that has one) and not buffer streamed answers (`flush_interval -1` in Caddy, as
+the `lan` profile has it). The route's upstream is `https://<that host>` plus any prefix the
+front adds (never `/mcp`, which is the server's `path`), with no `allow_insecure_upstream`; the
+vault verifies the front's certificate against certifi like any upstream's, and a front at an
+address the vault resolves non-globally needs its `host:port` in `egress_private` (§7). Plain
+http to a bridge on your LAN at a private address passes `check` too, but the token then
+crosses the LAN in clear: use https there as well. Make the token in the vault (above) and set
+the hash in that bridge's environment. Its program's confinement, secrets and egress are that
+host's: `program.egress` confines nothing there, and `check` says so.
+
+### Secrets the program needs
+
+Where the program takes a base URL for its API, give it a vault route with a placeholder
+instead of the secret: its `--env` carries the placeholder and the base URL (in A,
+`http://vault:8080/<prefix>` on the bridge's network; in B a `--vault-listen 127.0.0.1:<port>`
+address; in C a vault listener that host can reach), and the vault injects the real credential
+as for any placeholder caller. In B the placeholder goes in `ZOEYMCP_BRIDGE_<NAME>_ENV_<VAR>`,
+never in ARGS. Otherwise the program holds the secret itself, R35's exception: pass it with
+`--secret-env NAME` (in B from `ZOEYMCP_BRIDGE_<NAME>_ENV_NAME`) and mark the route
+`program: {holds_secret: true}`. `check` then warns, naming where the program can send it:
+through the role only to its egress list in A, and anywhere in B and C. A bridge with a
+`--secret-env` logs its program's stderr as counts only. In B, health warns
+`program_secret_unflagged` when a bridge's ARGS hold `--secret-env` and its route has no
+`holds_secret`.
+
+### What a bridge doesn't do
+
+- It relays no request from the program to the gateway: it answers `ping` and refuses roots,
+  sampling and elicitation (`-32601`), so pass the directories a program needs on its command
+  line.
+- In the legacy era each MCP session gets a child of its own, but under `shared_session: true`
+  every client shares one; in the modern era every client always shares the one child.
+- A legacy bridge's restart is noticed at the gateway's next request, which gets 404, opens a
+  new session, lists and compares the pins: a changed tool is marked and hidden until
+  `review --repin` (§12). A modern bridge's restart is noticed only at the drift timer (300 s).
+- Its program's stderr is logged as line and byte counts by default, since programs commonly
+  print their configuration. `--stderr text` logs the lines themselves and may show `--env`
+  values: turn it on only to debug.
+- The proxy variables confine only in the hardened tier, where the bridge's networks have no
+  other way out; in B and C a program may ignore them.
+
+### A third-party wrapper instead
+
+Since a bridge is just an upstream, another stdio-to-HTTP wrapper may stand behind the route, in
+A (its own container on the networks above) or C (another host), never in B: the standard
+launcher starts only `zoeymcp bridge`, which listens in a directory of its own and checks its
+peer, and a wrapper started there by other means would listen on a port any process could take
+first. Check that it speaks one MCP era to the gateway; that it checks a bearer token, the
+route's header credential, on every request (a wrapper that can't makes the route's token
+authenticate nothing, and isn't a supported shape in any placement); that it runs only its
+configured command, never one a request names; that it listens on its own network alias (A) or
+on loopback behind your TLS front (C); and that it is installed at build time with hashes, as
+the recipe above. What it may lack, which leaves the gateway's own defences (pins, schemas,
+sanitizing, `max_upstream_message_bytes`, `call_timeout`) to carry the load alone: a cap on each
+line, stderr counted rather than logged, the refusal of the program's own requests, ids and
+progress tokens kept apart between clients, keepalives, readiness, and a built environment for
+the program.

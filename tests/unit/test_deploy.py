@@ -1,7 +1,9 @@
 """The compose files: their inline policies pass ``check``, the standard tier's container is the
 box its launcher insists on (M3 design B.2, B.3), the portal is published on the host's
-loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2), and the
-egress role is a profile of the hardened tier alone, on networks of its own (M7 design I.5, L)."""
+loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2), the
+egress role is a profile of the hardened tier alone, on networks of its own (M7 design I.5, L),
+and the bridge example's overrides add a confined bridge to the hardened tier and an unconfined
+one to the standard tier's box, leaving the rest as it was (M7 design C.9, C.10, L)."""
 
 from __future__ import annotations
 
@@ -12,8 +14,12 @@ from typing import Any
 import pytest
 import yaml
 
+from zoeymcp.bridge import listen as bridge_listen
+from zoeymcp.cli import main as cli_main
 from zoeymcp.cli import onboard as onboard_cli
-from zoeymcp.common.policy import check_policy, parse_policy
+from zoeymcp.common import egresslist
+from zoeymcp.common.policy import check as policy_check
+from zoeymcp.common.policy import check_policy, fields, parse_policy
 from zoeymcp.common.policy.schema import GatewayLimits, Policy
 from zoeymcp.egress import allowlist as egress_allowlist
 from zoeymcp.egress import listen as egress_listen
@@ -30,7 +36,7 @@ EGRESS_UID = 10006
 
 
 # An innermost ${...}: its default holds no other variable.
-_VARIABLE = re.compile(r"\$\{([A-Z_]+)(?::-([^}$]*)|:\?[^}$]*)?\}")
+_VARIABLE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}$]*)|:\?[^}$]*)?\}")
 
 
 def interpolated(text: str, environ: dict[str, str] | None = None) -> str:
@@ -101,8 +107,8 @@ def test_inline_policies_pass_check(path: Path) -> None:
         assert [f for f in findings if f.level == "error"] == []
 
 
-def test_the_standard_container_is_the_launchers_box() -> None:
-    service = compose("compose.yaml")["services"]["zoeymcp"]
+def launchers_box(service: dict[str, Any]) -> None:
+    """The standard container as its launcher insists on it (M3 design B.2, B.3)."""
     assert service["command"][0] == "standard"
     assert service["user"] == "0:0"
     assert service["read_only"] is True
@@ -126,6 +132,10 @@ def test_the_standard_container_is_the_launchers_box() -> None:
     assert volumes == {"/state", "/state-gateway"}
     # The vault's environment holds the master key; the launcher keeps it from the gateway.
     assert "ZOEYMCP_MASTER_KEY" in service["environment"]
+
+
+def test_the_standard_container_is_the_launchers_box() -> None:
+    launchers_box(compose("compose.yaml")["services"]["zoeymcp"])
 
 
 def test_the_hardened_gateway_has_no_egress() -> None:
@@ -435,3 +445,334 @@ def test_the_vaults_policy_names_the_role_commented() -> None:
     # As shipped the lines stay comments: no proxy, so nothing needs the profile.
     shipped = inline_policy(document, "compose.hardened.yaml")
     assert (shipped.egress_proxy, shipped.egress_proxy_kind) == (None, "own")
+
+
+# --- the bridge's compose overrides (M7 design C.7, C.9, C.10, L) -------------------------------
+
+BRIDGE_EXAMPLE = ROOT / "examples" / "bridge"
+BRIDGE_PROFILE = ROOT / "profiles" / "stdio-bridge.yaml"
+BRIDGE_UID = 10005
+# Where a hardened bridge must never be: every network the base file has.
+NOT_A_BRIDGES = {"internal", "agents", "direct", "egress", "egress-ctl", "egress-out", "lan"}
+_UV_STAGE = re.compile(r"^FROM (ghcr\.io/astral-sh/uv:\S+) AS uv$", re.MULTILINE)
+_BRIDGE_LISTEN_VARIABLE = re.compile(r"ZOEYMCP_BRIDGE_\w*_LISTEN")
+
+
+def override(name: str, environ: dict[str, str] | None = None) -> dict[str, Any]:
+    text = (BRIDGE_EXAMPLE / name).read_text(encoding="utf-8")
+    document = yaml.safe_load(interpolated(text, environ))
+    assert isinstance(document, dict)
+    return document
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    """A compose mapping that may be written as a list of names (``networks: [a, b]``)."""
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        return dict.fromkeys(value)
+    assert isinstance(value, dict)
+    return value
+
+
+def _merged_service(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """One service of ``extra`` merged onto ``base`` as compose merges an override file, for the
+    keys the bridge's overrides use: a mapping (``environment``, ``networks``, ``depends_on``)
+    merged by key, ``tmpfs`` concatenated, anything else (``command`` included) replaced."""
+    found = dict(base)
+    for key, value in extra.items():
+        if key in ("environment", "networks", "depends_on"):
+            found[key] = {**_mapping(base.get(key)), **_mapping(value)}
+        elif key == "tmpfs":
+            found[key] = [*base.get(key, []), *[v for v in value if v not in base.get(key, [])]]
+        else:
+            found[key] = value
+    return found
+
+
+def merged(
+    base_name: str, override_name: str, environ: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """``deploy/<base_name>`` with ``examples/bridge/<override_name>`` merged onto it."""
+    base, extra = compose(base_name, environ), override(override_name, environ)
+    services = dict(base["services"])
+    for name, service in extra["services"].items():
+        services[name] = _merged_service(services[name], service) if name in services else service
+    networks = {**base.get("networks", {}), **extra.get("networks", {})}
+    return {**base, "networks": networks, "services": services}
+
+
+def _listens(command: list[str]) -> list[str]:
+    """The egress role's ``--listen`` values, in order."""
+    return [word for i, word in enumerate(command) if i and command[i - 1] == "--listen"]
+
+
+def _bridge_args(command: list[str]) -> Any:
+    """A ``zoeymcp bridge`` command line, as the bridge's own parser reads it."""
+    args = cli_main._build_parser().parse_args(command)
+    assert args.command == "bridge"
+    return args
+
+
+def with_bridge(policy_text: str, *, upstream: str | None = None) -> Policy:
+    """The inline policy with the shipped S11 profile's credential, route and server added; with
+    ``upstream``, the route's upstream swapped as the profile's comment says for a standard-tier
+    bridge (no ``allow_insecure_upstream``, no ``program``)."""
+    document = yaml.safe_load(policy_text)
+    fragment = yaml.safe_load(BRIDGE_PROFILE.read_text(encoding="utf-8"))
+    [route] = fragment["routes"]
+    if upstream is not None:
+        route["upstream"] = upstream
+        del route["allow_insecure_upstream"], route["program"]
+    document.setdefault("credentials", {}).update(fragment["credentials"])
+    document.setdefault("routes", []).append(route)
+    document["gateway"]["servers"].update(fragment["gateway"]["servers"])
+    return Policy.model_validate(document)
+
+
+def _errors(policy: Policy) -> list[str]:
+    return [f"{f.path}: {f.message}" for f in check_policy(policy) if f.level == "error"]
+
+
+def test_the_hardened_bridge_is_a_container_on_networks_of_its_own() -> None:
+    """C.9, L (CR-B3, CR-4): each bridge service the override adds is unprivileged, has an init,
+    and sits on internal networks of its own only, its alias on its vault network alone."""
+    base = compose("compose.hardened.yaml")
+    document = merged("compose.hardened.yaml", "compose.bridge.yaml")
+    networks, services = document["networks"], document["services"]
+    added = sorted(set(services) - set(base["services"]))
+    assert added == ["bridge-fetch"]
+    bridge = services["bridge-fetch"]
+    unprivileged(bridge)
+    assert bridge["user"] == f"{BRIDGE_UID}:{BRIDGE_UID}"
+    # PID 1 reaps the program's orphans (contract 48's other half runs in the image smoke).
+    assert bridge["init"] is True
+    assert bridge["restart"] == "unless-stopped"
+    assert bridge["image"] == "zoeymcp-bridge-fetch:local"
+    image = {"ZOEYMCP_BRIDGE_IMAGE": "zoeymcp-bridge-fetch@sha256:" + "3" * 64}
+    pinned = merged("compose.hardened.yaml", "compose.bridge.yaml", image)["services"]
+    assert pinned["bridge-fetch"]["image"] == image["ZOEYMCP_BRIDGE_IMAGE"]
+    assert bridge["tmpfs"] == ["/tmp:size=64m,mode=1777"]  # noqa: S108 - the container's own tmpfs
+    assert bridge["healthcheck"]["test"] == ["CMD", "zoeymcp", "bridge", "--ready-check"]
+    assert "ports" not in bridge
+    # Its environment holds its token's hash and nothing else; `:-`, so compose config passes
+    # before the vault has made the token.
+    assert list(bridge["environment"]) == [env.BRIDGE_TOKEN]
+    text = (BRIDGE_EXAMPLE / "compose.bridge.yaml").read_text(encoding="utf-8")
+    assert "ZOEYMCP_BRIDGE_TOKEN_SHA256: ${ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256:-}\n" in text
+    # Internal networks of its own, never one the base file has.
+    assert sorted(bridge["networks"]) == ["bridge-fetch", "egress-fetch"]
+    assert all(networks[name] == {"internal": True} for name in bridge["networks"])
+    assert not set(bridge["networks"]) & NOT_A_BRIDGES
+    assert _on(services, "bridge-fetch") == {"vault", "bridge-fetch"}
+    assert _on(services, "egress-fetch") == {"bridge-fetch", "egress-proxy"}
+    # It listens on an alias declared on bridge-fetch alone, which no other service carries and
+    # which is neither a service's nor a network's name (CR-4).
+    args = _bridge_args(bridge["command"])
+    listen = bridge_listen.parse(args.listen)
+    assert isinstance(listen, bridge_listen.Tcp)
+    assert (listen.host, listen.port) == ("bridge-fetch-mcp", 9000)
+    assert bridge["networks"]["bridge-fetch"] == {"aliases": [listen.host]}
+    assert not (bridge["networks"]["egress-fetch"] or {}).get("aliases")
+    assert listen.host not in services
+    assert listen.host not in networks
+    for name, service in services.items():
+        if name != "bridge-fetch" and isinstance(service.get("networks"), dict):
+            for settings in service["networks"].values():
+                assert listen.host not in (settings or {}).get("aliases", [])
+    assert (args.era, args.program) == ("legacy", ["/opt/stdio-server/venv/bin/fetch-server"])
+
+
+def test_the_hardened_override_adds_only_its_own_to_the_vault_and_the_role() -> None:
+    """C.9, L (CR-B3, OPS-10): the vault gains exactly its bridge network and the depends_on, and
+    keeps egress as its one network with a route out; the role gains exactly the bridge's egress
+    network, with its alias, and a whole command that keeps the vault's listener."""
+    base = compose("compose.hardened.yaml")["services"]
+    document = merged("compose.hardened.yaml", "compose.bridge.yaml")
+    networks, services = document["networks"], document["services"]
+    vault, before = services["vault"], base["vault"]
+    assert vault["networks"] == {**before["networks"], "bridge-fetch": {}}
+    assert vault["depends_on"] == {"bridge-fetch": {"condition": "service_started"}}
+    assert {k: v for k, v in vault.items() if k not in ("networks", "depends_on")} == {
+        k: v for k, v in before.items() if k not in ("networks", "depends_on")
+    }
+    assert [n for n in vault["networks"] if networks[n].get("internal") is not True] == ["egress"]
+    assert _on(services, "egress") == {"vault"}
+    role, before = services["egress-proxy"], base["egress-proxy"]
+    assert role["networks"] == {**before["networks"], "egress-fetch": {"aliases": ["egress-fetch"]}}
+    assert _on(services, "egress-out") == {"egress-proxy"}
+    assert role["command"][:4] == before["command"][:4]
+    specs = egress_listen.parse_all(_listens(role["command"]))
+    assert [(s.source, s.host, s.port) for s in specs] == [
+        ("vault", "egress-vault", 3128),
+        ("bridge-fetch", "egress-fetch", 3128),
+    ]
+    assert {k: v for k, v in role.items() if k not in ("networks", "command")} == {
+        k: v for k, v in before.items() if k not in ("networks", "command")
+    }
+    # The bridge's child goes through that listener, on the network it shares with the role.
+    args = _bridge_args(services["bridge-fetch"]["command"])
+    assert args.egress_proxy == f"http://{specs[1].host}:{specs[1].port}"
+    # One uid per container, root aside: the bridge's is the image's bridge user.
+    users = [s["user"] for s in services.values() if not s["user"].startswith("0:")]
+    assert len(set(users)) == len(users)
+
+
+def test_the_hardened_bridges_route_passes_check_and_names_its_listeners() -> None:
+    """C.9: the merged inline policy with the S11 profile's route and server added passes check;
+    the route reaches the bridge's alias, and its name is the role's listener source."""
+    services = merged("compose.hardened.yaml", "compose.bridge.yaml")["services"]
+    policy = with_bridge(services["vault"]["environment"]["ZOEYMCP_CONFIG"])
+    assert _errors(policy) == []
+    [route] = [r for r in policy.routes if r.name == "bridge-fetch"]
+    args = _bridge_args(services["bridge-fetch"]["command"])
+    assert route.upstream == f"http://{args.listen}"
+    assert route.name in policy_check.local_mcp_routes(policy)
+    role = egress_listen.parse_all(_listens(services["egress-proxy"]["command"]))
+    assert [s.source for s in role if s.source != "vault"] == [route.name]
+    lists = egresslist.derive(policy)
+    assert [(d.host, d.port) for d in lists[route.name]] == [("docs.example.org", 443)]
+    # The vault reaches its bridge directly, never through a proxy (I.2).
+    assert ("bridge-fetch-mcp", 9000) not in {(d.host, d.port) for d in lists["vault"]}
+
+
+def test_compose_stops_a_hardened_bridge_after_the_vault() -> None:
+    """BP-14's static half: compose stops a service before what it depends on, so the gateway,
+    then the vault, then the bridge; a call in flight through the bridge finishes inside the
+    vault's window, and the bridge's own stop (its children's 4 s) fits its grace period."""
+    services = merged("compose.hardened.yaml", "compose.bridge.yaml")["services"]
+    assert services["gateway"]["depends_on"] == {"vault": {"condition": "service_started"}}
+    assert services["vault"]["depends_on"] == {"bridge-fetch": {"condition": "service_started"}}
+    assert _seconds(services["vault"]["stop_grace_period"]) >= launcher.VAULT_STOP_WAIT
+    assert _seconds(services["bridge-fetch"]["stop_grace_period"]) >= launcher.BRIDGE_STOP_WAIT
+    assert "depends_on" not in services["bridge-fetch"]
+
+
+def test_the_hardened_bridges_uid_is_the_images_bridge_user() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert f" && groupadd --gid {BRIDGE_UID} bridge \\\n" in dockerfile
+    assert (
+        f" && useradd --uid {BRIDGE_UID} --gid {BRIDGE_UID} --no-create-home "
+        "--home-dir /nonexistent --shell /usr/sbin/nologin bridge \\\n"
+    ) in dockerfile
+    # Below the standard tier's bridge uids, and none of the other roles'.
+    assert BRIDGE_UID < env.BRIDGE_UID_BASE
+    assert BRIDGE_UID not in {env.VAULT_UID, env.GATEWAY_UID, env.INIT_UID, EGRESS_UID}
+
+
+def test_the_official_image_drops_the_distrusted_root() -> None:
+    """Q42, TI-9: the official image disables emSign ECC Root CA - G3 in Debian's store, and the
+    build fails unless the line was there to disable and the root is gone afterwards; the image
+    smoke and verify.sh --bridge check the built store."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "grep -qx 'mozilla/emSign_ECC_Root_CA_-_G3.crt' /etc/ca-certificates.conf" in dockerfile
+    assert "s|^mozilla/emSign_ECC_Root_CA_-_G3\\.crt$|!&|" in dockerfile
+    assert "update-ca-certificates --fresh" in dockerfile
+    assert "test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem" in dockerfile
+    verify = (BRIDGE_EXAMPLE / "verify.sh").read_text(encoding="utf-8")
+    assert 'name = "emSign_ECC_Root_CA_-_G3"' in verify
+
+
+def test_the_example_images_pin_the_same_uv() -> None:
+    """D-162: Dependabot bumps the root's uv stage and the examples' copies in one group."""
+    [root] = _UV_STAGE.findall((ROOT / "Dockerfile").read_text(encoding="utf-8"))
+    assert "@sha256:" in root
+    dependabot = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    assert "directories: [/, /examples/bridge, /examples/derived-image]" in dependabot
+    for example in ("bridge", "derived-image"):
+        path = ROOT / "examples" / example / "Dockerfile"
+        assert _UV_STAGE.findall(path.read_text(encoding="utf-8")) == [root]
+
+
+def _bridge_names(command: list[str]) -> list[str]:
+    return [command[i + 1] for i, word in enumerate(command) if word == "--bridge"]
+
+
+def test_the_standard_bridge_override_keeps_the_launchers_box() -> None:
+    """C.10, L (Q46, CR-B9): the merged container is still the launcher's box, each bridge's
+    arguments leave the launcher's options alone, and each bridge's tmpfs is exactly its uid's,
+    group the vault's, 0750, in --bridge order."""
+    service = merged("compose.yaml", "compose.standard.yaml")["services"]["zoeymcp"]
+    launchers_box(service)
+    assert service["image"] == "zoeymcp-bridge-fetch:local"
+    assert service["pids_limit"] == 1024
+    names = _bridge_names(service["command"])
+    assert names == ["fetch"]
+    assert service["command"][:3] == compose("compose.yaml")["services"]["zoeymcp"]["command"]
+    environ = {name: value or "" for name, value in service["environment"].items()}
+    specs = env.bridge_specs(environ, names)
+    assert [(s.name, s.refusals) for s in specs] == [("fetch", ())]
+    for spec in specs:
+        options = spec.args[: spec.args.index("--")]
+        for option in (*env.LAUNCHER_OPTIONS, "--egress-proxy"):
+            assert not any(word.partition("=")[0] == option for word in options)
+        command = spec.args[spec.args.index("--") + 1 :]
+        assert command == ("/opt/stdio-server/venv/bin/fetch-server",)
+    tmpfs = {entry.split(":")[0]: entry.split(":", 1)[1] for entry in service["tmpfs"]}
+    for spec in specs:
+        wanted = env.bridge_directory(spec.name, spec.index)
+        assert tmpfs[wanted.path] == (
+            f"size=64m,mode={wanted.mode:04o},uid={wanted.uid},gid={wanted.gid}"
+        )
+        assert (wanted.uid, wanted.gid, wanted.mode) == (10100 + spec.index, 10001, 0o750)
+    # The socket's path is the launcher's alone: no variable names it.
+    for path in (BRIDGE_EXAMPLE / "compose.standard.yaml", *COMPOSE_FILES):
+        assert not _BRIDGE_LISTEN_VARIABLE.search(path.read_text(encoding="utf-8"))
+    # Its token hash, `:-`, so compose config passes before the vault has made the token.
+    assert environ[env.bridge_variable("fetch", "TOKEN_SHA256")] == ""
+
+
+def test_the_standard_bridges_route_is_its_socket() -> None:
+    """C.10: the merged policy's route for each bridge is exactly the socket the launcher has
+    that bridge listen on, and passes check without allow_insecure_upstream or program.egress."""
+    service = merged("compose.yaml", "compose.standard.yaml")["services"]["zoeymcp"]
+    environ = {name: value or "" for name, value in service["environment"].items()}
+    for spec in env.bridge_specs(environ, _bridge_names(service["command"])):
+        upstream = f"unix:{spec.directory.path}/mcp.sock"
+        assert upstream == "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
+        assert fields.unix_upstream(upstream) == upstream
+        argv = launcher.bridge_argv(spec, 7)
+        assert argv[argv.index("--listen") + 1] == upstream
+        policy = with_bridge(service["environment"]["ZOEYMCP_CONFIG"], upstream=upstream)
+        assert _errors(policy) == []
+        [route] = [r for r in policy.routes if r.name == "bridge-fetch"]
+        assert route.upstream == upstream
+        assert route.name in policy_check.local_mcp_routes(policy)
+
+
+def test_the_standard_override_says_unconfined_first() -> None:
+    """X21: the override's header says the program is unconfined, what it shares, that no secret
+    goes in ARGS, and that the image must pass verify.sh --bridge."""
+    text = (BRIDGE_EXAMPLE / "compose.standard.yaml").read_text(encoding="utf-8")
+    header = text.split("\nservices:", 1)[0].splitlines()
+    assert header[2].startswith(
+        "# UNCONFINED: this program shares the container with the vault and the gateway."
+    )
+    joined = " ".join(line.removeprefix("# ") for line in header)
+    for phrase in (
+        "can ignore proxy settings",
+        "memory, processes and CPU",
+        "so no secret goes in ..._ARGS",
+        "This image must pass examples/bridge/verify.sh --bridge.",
+    ):
+        assert phrase in joined
+
+
+def test_the_example_policys_bridge_block_passes_check() -> None:
+    """examples/policy.yaml's commented bridge block, uncommented into the policy, passes check;
+    as shipped it stays a comment, so the example keeps its one warning."""
+    text = (ROOT / "examples" / "policy.yaml").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("# A stdio MCP server"))
+    body = lines[lines.index("#", start) + 1 :]
+    assert body
+    assert all(line.startswith("# ") for line in body)
+    fragment = yaml.safe_load("\n".join(line[2:] for line in body))
+    document = yaml.safe_load(text)
+    assert "bridge-fetch" not in document["credentials"]
+    document["credentials"].update(fragment["credentials"])
+    document["routes"] += fragment["routes"]
+    document["gateway"]["servers"].update(fragment["gateway"]["servers"])
+    policy = Policy.model_validate(document)
+    assert _errors(policy) == []
+    assert "bridge-fetch" in policy_check.local_mcp_routes(policy)

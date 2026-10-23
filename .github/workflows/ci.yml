@@ -19,6 +19,7 @@ jobs:
   lint:
     name: lint and types
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,8 +28,8 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
       - run: uv sync --locked --all-extras --python 3.13
-      - run: uv run --locked ruff check src tests examples/toolkits
-      - run: uv run --locked ruff format --check src tests examples/toolkits
+      - run: uv run --locked ruff check src tests examples/toolkits examples/bridge
+      - run: uv run --locked ruff format --check src tests examples/toolkits examples/bridge
       - run: uv run --locked mypy
 
   test:
@@ -81,7 +82,8 @@ jobs:
   image:
     name: image build and smoke test
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # The bridge's rows (both shapes, M7 design L) run in the smoke test too.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,11 +104,20 @@ jobs:
           squid="$(sed -n 's/^squid_image=//p' scripts/smoke-image.sh)"
           test -n "$squid"
           docker pull "$squid"
-      - name: Smoke test (hardened vault, standard tier, Squid)
-        run: sh scripts/smoke-image.sh zoeymcp:ci
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
+      # The bridge example's image (M7 design C.7): the official layers plus /opt/stdio-server,
+      # verified against the official one before anything runs it.
+      - name: Bridge image with the example stdio server, verified against the official one
+        run: |
+          sh examples/bridge/lock.sh
+          docker build -f examples/bridge/Dockerfile \
+            --build-context server=examples/bridge/server/dist \
+            --build-arg OFFICIAL=zoeymcp:ci -t zoeymcp-bridge-fetch:ci examples/bridge
+          sh examples/bridge/verify.sh --bridge zoeymcp:ci zoeymcp-bridge-fetch:ci
+      - name: Smoke test (hardened vault, standard tier, Squid, the bridge in both shapes)
+        run: sh scripts/smoke-image.sh --bridge zoeymcp-bridge-fetch:ci zoeymcp:ci
       - name: Derived image with the example toolkits, verified against the official one
         run: |
           sh examples/derived-image/lock.sh zoeymcp:ci

@@ -8,15 +8,27 @@
 # sends through, and probes show who can reach it and what it refuses (contract 52).
 # With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
 # compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
-# Usage: scripts/smoke-image.sh [--derived OFFICIAL] IMAGE
+# With --bridge BRIDGE, BRIDGE is the bridge example's image built on IMAGE (examples/bridge), and
+# S11's container rows run last (M7 design L, O.5): a stdio server behind a bridge in the hardened
+# tier's shape, with the egress role and contracts 48 and 52's bridge rows, and in the standard
+# tier's, with two bridges under the launcher and the other uids' rows (Q46).
+# Usage: scripts/smoke-image.sh [--derived OFFICIAL | --bridge BRIDGE] IMAGE
 set -eu
 
+usage="usage: smoke-image.sh [--derived OFFICIAL | --bridge BRIDGE] IMAGE"
 official=""
-if [ "${1:-}" = "--derived" ]; then
-    official="${2:?usage: smoke-image.sh [--derived OFFICIAL] IMAGE}"
-    shift 2
-fi
-image="${1:?usage: smoke-image.sh [--derived OFFICIAL] IMAGE}"
+bridge_image=""
+case "${1:-}" in
+    --derived)
+        official="${2:?$usage}"
+        shift 2
+        ;;
+    --bridge)
+        bridge_image="${2:?$usage}"
+        shift 2
+        ;;
+esac
+image="${1:?$usage}"
 name="zoeymcp-smoke-$$"
 volume="zoeymcp-smoke-state-$$"
 project="zoeymcp-smoke-$$"
@@ -343,6 +355,31 @@ found="$(docker run --rm --network none -u 0 --entrypoint find "$image" / -xdev 
 [ -z "$found" ] || fail "the init or egress user owns files: $found"
 found="$(docker run --rm --network none -u 0 --entrypoint find "$image" / -xdev -perm /6000 -type f)"
 [ -z "$found" ] || fail "setuid or setgid files: $found"
+[ "$(docker run --rm --entrypoint id "$image" bridge)" = "uid=10005(bridge) gid=10005(bridge) groups=10005(bridge)" ] \
+    || fail "no bridge user 10005"
+found="$(docker run --rm --network none -u 0 --entrypoint find "$image" / -xdev \
+    \( -user 10005 -o -group 10005 \) -print)"
+[ -z "$found" ] || fail "the bridge user owns files: $found"
+
+step "the Debian store has no emSign ECC Root CA - G3 (Q42), which a bridge's program would read"
+# The root's own file stays, so the check can't pass by finding nothing to look for.
+distrusted='
+import os, ssl, sys
+name = "emSign_ECC_Root_CA_-_G3"
+source = f"/usr/share/ca-certificates/mozilla/{name}.crt"
+if not os.path.isfile(source):
+    sys.exit(f"{source} is gone: name the root again")
+body = "".join(l for l in open(source) if not l.startswith("-----")).replace("\n", "")
+if body in open("/etc/ssl/certs/ca-certificates.crt").read().replace("\n", ""):
+    sys.exit("the root is in /etc/ssl/certs/ca-certificates.crt")
+if os.path.lexists(f"/etc/ssl/certs/{name}.pem"):
+    sys.exit(f"/etc/ssl/certs/{name}.pem exists")
+loaded = ssl.create_default_context().get_ca_certs()
+if any("emSign ECC Root CA - G3" in str(cert.get("subject")) for cert in loaded):
+    sys.exit("the default SSL context loads it")
+'
+docker run --rm --network none --entrypoint /usr/local/bin/python3 "$image" -I -c "$distrusted" \
+    || fail "emSign ECC Root CA - G3 is still trusted"
 
 step "check and selftest --mutate on the example policy"
 # The broker case expects 200: the self-test plays the OAuth token endpoint with dummy values.
@@ -388,12 +425,23 @@ step "Squid parses the emitted snippet, and refuses private answers to listed na
 # network answers for the test names, so nothing leaves the host: a name the snippet lets
 # through gets ERR_CONNECT_FAIL (no route), one it refuses ERR_ACCESS_DENIED. Every Squid here
 # gets a working IPv6 loopback: without one Squid turns IPv6 off ("BCP 177"), drops the IPv6
-# entries of zoeymcp_private_dst and ignores AAAA answers.
+# entries of zoeymcp_private_dst and ignores AAAA answers. A bridge's route program is a source of
+# its own, its Squid names keeping the route's name, hyphen included (zoeymcp_src_bridge-fetch):
+# Squid must take them, and refuse the bridge's destination from the vault's address.
 mkdir "$work/squid"
 cat >"$work/squid/policy.yaml" <<'EOF'
 version: 1
 mode: declarative
+credentials:
+  bridge-fetch: {kind: header, secret: "store:bridge-fetch-token"}
+gateway:
+  servers:
+    fetch: {kind: remote, route: bridge-fetch, path: /mcp, era: legacy}
 routes:
+  - {name: bridge-fetch, prefix: /bridge-fetch, upstream: "http://bridge-fetch-mcp:9000",
+     allow_insecure_upstream: true, credential: bridge-fetch, callers: [gateway], stream: true,
+     rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}],
+     program: {egress: ["bridgeonly.squid.example:443"]}}
   - {name: listed, prefix: /listed, upstream: "https://listed.squid.example",
      callers: [{placeholder: ph-squid-listed-0123456789}], rules: [{methods: [GET], paths: [/v1/**]}]}
   - {name: private, prefix: /private, upstream: "https://private.squid.example",
@@ -404,10 +452,13 @@ routes:
      callers: [{placeholder: ph-squid-mixed-0123456789}], rules: [{methods: [GET], paths: [/v1/**]}]}
 EOF
 squid_subnet=10.231.79.0/24
+# The bridge's network: no container here is on it.
+squid_bridge_subnet=10.231.78.0/24
 cat >"$work/squid/squid.conf" <<EOF
 http_port 3128
 acl CONNECT method CONNECT
 acl zoeymcp_src_vault src $squid_subnet
+acl zoeymcp_src_bridge-fetch src $squid_bridge_subnet
 include /etc/squid/zoeymcp.conf
 http_access deny all
 EOF
@@ -424,6 +475,10 @@ grep -q '^acl zoeymcp_private_dst dst .*127\.0\.0\.0/8' "$work/squid/zoeymcp.con
 if grep -q '::ffff:0:0/96' "$work/squid/zoeymcp.conf"; then
     fail "the snippet refuses ::ffff:0:0/96, which Squid holds every IPv4 address in"
 fi
+grep -qx 'acl zoeymcp_bridge-fetch_1 dstdomain -n bridgeonly.squid.example' "$work/squid/zoeymcp.conf" \
+    && grep -qx 'http_access allow zoeymcp_src_bridge-fetch CONNECT zoeymcp_bridge-fetch_1 zoeymcp_port_443 !zoeymcp_private_dst' \
+        "$work/squid/zoeymcp.conf" \
+    || fail "the snippet doesn't give the bridge's route program a source of its own"
 # squid_conf SNIPPET: the docker run options that give Squid the minimal squid.conf with SNIPPET.
 squid_conf() {
     echo "-v $work/squid/squid.conf:/etc/squid/squid.conf:ro -v $1:/etc/squid/zoeymcp.conf:ro" \
@@ -469,6 +524,7 @@ records = {
     "mapped.squid.example": [v6("::ffff:127.0.0.1")],
     "mixed.squid.example": [v4("1.1.1.1"), v4("10.0.0.9")],
     "unlisted.squid.example": [v4("1.1.1.1")],
+    "bridgeonly.squid.example": [v4("1.1.1.1")],
 }
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 server.bind(("0.0.0.0", 53))
@@ -534,8 +590,9 @@ through() {
 }
 squid_up "$name-squid" 10.231.79.10 "$work/squid/zoeymcp.conf"
 # 1.1.1.1 is public, unlisted, and its PTR name is listed: -n keeps dstdomain from using it.
+# bridgeonly is public and listed, but for the bridge's source alone, not the vault's.
 for refused in private.squid.example mapped.squid.example mixed.squid.example \
-    unlisted.squid.example 1.1.1.1; do
+    unlisted.squid.example 1.1.1.1 bridgeonly.squid.example; do
     found="$(through 10.231.79.10 "$refused:443")"
     echo "$refused: $found"
     [ "$found" = "403 ERR_ACCESS_DENIED" ] || fail "Squid didn't refuse $refused: $found"
@@ -1334,7 +1391,8 @@ hardened_tier down -v >/dev/null 2>&1
 # role's own way out, for this run only. The role's one listener is on egress-ctl alone; it
 # refuses a host the vault's list doesn't hold and a listed name that resolves to a private
 # address without the private mark; and the SMTP connector's CONNECT goes through it (fold-in
-# R6). This block removes all it starts, whatever happens, with its own trap.
+# R6). This block removes all it starts, whatever happens, with its own trap. Contract 52's rows
+# from a hardened bridge and its networks are S11's, at the end (--bridge).
 step "egress role: compose config passes with ZOEYMCP_EGRESS_KEY unset, profile off or on (contract 52)"
 unset ZOEYMCP_EGRESS_KEY
 for egress_profile in "" "--profile egress-proxy"; do
@@ -1662,5 +1720,794 @@ fi
 existing_cleanup
 trap cleanup EXIT
 # --- end of contract 54 -------------------------------------------------------------------------
+
+# --- S11: the bridge in the hardened shape (A) and the standard one (B) -------------------------
+# With --bridge BRIDGE only: the bridge example's image (examples/bridge), the example server
+# behind a bridge, and J7's cold start in each shape. A: deploy/compose.hardened.yaml with
+# examples/bridge/compose.bridge.yaml, the egress-proxy profile and an override of this run's
+# (the policy, the child trusting this run's CA, a fake destination on egress-out, a second
+# bridge on a network of its own); the S11 calls through the gateway, the tunnel row, the
+# negative rows, contract 48's orphan and contract 52's probes from the bridge's networks, and a
+# call in flight finishing on stop. B: deploy/compose.yaml with examples/bridge/compose.standard.yaml
+# and three --bridge names (fetch, other, and spare, whose tmpfs has the wrong mode, so it is
+# refused: FM-31); the same calls through the standard container, the other uids' rows on the
+# sockets (Q46), a killed bridge (FM-29), and a call in flight finishing on stop. Each part removes all it starts,
+# whatever happens, with its own trap.
+if [ -n "$bridge_image" ]; then
+    bridge_command=/opt/stdio-server/venv/bin/fetch-server
+    [ "$(docker image inspect "$bridge_image" \
+        --format '{{ index .Config.Labels "io.zoeymcp.bridge.command" }}')" = "$bridge_command" ] \
+        || fail "the bridge image's io.zoeymcp.bridge.command isn't $bridge_command"
+
+    step "bridge: the example server's pins, from the bridge image"
+    # The example server's tools as it lists them, pinned as the gateway pins them.
+    bridge_pins_script='
+import json, subprocess, sys
+import mcp_types
+from zoeymcp.gateway.pins import project_and_pin
+asked = [
+    {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25",
+     "capabilities": {}, "clientInfo": {"name": "smoke", "version": "1"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+]
+lines = "".join(json.dumps(message) + "\n" for message in asked).encode()
+out = subprocess.run([sys.argv[1]], input=lines, capture_output=True, check=True, timeout=30).stdout
+for line in out.splitlines():
+    answer = json.loads(line)
+    if answer.get("id") == 1:
+        for tool in answer["result"]["tools"]:
+            print(tool["name"], project_and_pin(mcp_types.Tool.model_validate(tool)).pin)
+'
+    bridge_pins="$(docker run --rm --network none --entrypoint /opt/zoeymcp-gateway/bin/python \
+        "$bridge_image" -I -c "$bridge_pins_script" "$bridge_command")" \
+        || fail "the example server's tools couldn't be listed and pinned"
+    echo "$bridge_pins"
+    pin_echo="$(echo "$bridge_pins" | sed -n 's/^echo //p')"
+    pin_fetch="$(echo "$bridge_pins" | sed -n 's/^fetch //p')"
+    pin_wait="$(echo "$bridge_pins" | sed -n 's/^wait //p')"
+    [ -n "$pin_echo" ] && [ -n "$pin_fetch" ] && [ -n "$pin_wait" ] \
+        || fail "no pins for echo, fetch and wait: $bridge_pins"
+
+    # One request from an agent to the gateway at URL, modern, with this run's client token:
+    # METHOD tools/list prints "tools <names>", tools/call TOOL ARGUMENTS prints "ok <text>" or
+    # "error <text>". Exits non-zero on an HTTP or JSON-RPC error.
+    s11_agent='
+import json, sys, urllib.error, urllib.request
+url, token, method = sys.argv[1:4]
+modern = "2026-07-28"
+params = {"_meta": {"io.modelcontextprotocol/protocolVersion": modern,
+                    "io.modelcontextprotocol/clientCapabilities": {}}}
+headers = {"content-type": "application/json", "accept": "application/json, text/event-stream",
+           "authorization": f"Bearer {token}", "mcp-protocol-version": modern,
+           "mcp-method": method}
+if method == "tools/call":
+    params.update(name=sys.argv[4], arguments=json.loads(sys.argv[5]))
+    headers["mcp-name"] = sys.argv[4]
+body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+try:
+    with urllib.request.urlopen(request, timeout=120) as answer:
+        text = answer.read().decode()
+except urllib.error.HTTPError as error:
+    sys.exit(f"status {error.code}")
+events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
+final = events[-1] if events else json.loads(text)
+if "error" in final:
+    sys.exit("error " + json.dumps(final["error"]))
+result = final["result"]
+if method == "tools/list":
+    print("tools", " ".join(sorted(tool["name"] for tool in result["tools"])))
+else:
+    print("error" if result.get("isError") else "ok", result["content"][0]["text"])
+'
+    # s11 NETWORK URL METHOD [TOOL ARGUMENTS]: s11_agent from a container on NETWORK ("host" for
+    # the host's own).
+    s11() {
+        s11_network="$1"
+        shift
+        # shellcheck disable=SC2086
+        docker run --rm $hardened --network "$s11_network" --entrypoint /opt/zoeymcp/bin/python \
+            "$image" -I -c "$s11_agent" "$1" "$token" "$2" ${3:+"$3"} ${4:+"$4"}
+    }
+    # s11_until NETWORK URL EXPECTED METHOD [TOOL ARGUMENTS]: s11 until it prints EXPECTED.
+    s11_until() {
+        s11_until_network="$1"
+        s11_until_url="$2"
+        s11_until_expected="$3"
+        shift 3
+        i=0
+        until [ "$(s11 "$s11_until_network" "$s11_until_url" "$@" 2>/dev/null)" = "$s11_until_expected" ]; do
+            i=$((i + 1))
+            [ "$i" -lt 100 ] || fail "bridge: never '$s11_until_expected' from $*: $(s11 "$s11_until_network" "$s11_until_url" "$@" 2>&1)"
+            sleep 0.5
+        done
+    }
+    # Exits non-zero naming each ADDRESS that takes a connection on PORT within 2 s:
+    # unreachable_on PORT ADDRESS...
+    unreachable_on='
+import socket, sys
+port, reached = int(sys.argv[1]), []
+for address in sys.argv[2:]:
+    try:
+        socket.create_connection((address, port), timeout=2).close()
+    except OSError:
+        continue
+    reached.append(address)
+if reached:
+    sys.exit(f"reached port {port} at " + ", ".join(reached))
+print(port, "unreachable at", " ".join(sys.argv[2:]))
+'
+    # A POST of an initialize to URL, with HEADER=VALUE arguments; prints the status.
+    bridge_post='
+import json, sys, urllib.error, urllib.request
+body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-11-25", "capabilities": {},
+    "clientInfo": {"name": "smoke", "version": "1"}}}).encode()
+headers = dict(arg.split("=", 1) for arg in sys.argv[2:])
+headers["content-type"] = "application/json"
+request = urllib.request.Request(sys.argv[1], data=body, headers=headers, method="POST")
+try:
+    with urllib.request.urlopen(request, timeout=10) as answer:
+        print(answer.status)
+except urllib.error.HTTPError as error:
+    print(error.code, len(error.read()))
+'
+
+    # --- A: the hardened shape ------------------------------------------------------------------
+    step "bridge, hardened: compose config passes with the bridge's hash and the egress key unset"
+    ZOEYMCP_MASTER_KEY=unset ZOEYMCP_GATEWAY_KEY=unset \
+        docker compose -f "$deploy/compose.hardened.yaml" -f "$examples/bridge/compose.bridge.yaml" \
+        --profile egress-proxy config -q \
+        || fail "compose config failed on the hardened bridge override"
+    bridge_project="zoeymcp-smoke-bridge-$$"
+    bridge_tier() {
+        ZOEYMCP_IMAGE="$image" ZOEYMCP_BRIDGE_IMAGE="$bridge_image" \
+            ZOEYMCP_MASTER_KEY="${bridge_master:-unset}" \
+            ZOEYMCP_GATEWAY_KEY="${bridge_gateway_key:-unset}" \
+            ZOEYMCP_EGRESS_KEY="${bridge_egress_key:-}" \
+            ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256="${bridge_hash:-}" \
+            docker compose -p "$bridge_project" -f "$deploy/compose.hardened.yaml" \
+            -f "$examples/bridge/compose.bridge.yaml" -f "$work/bridge.yaml" \
+            --profile egress-proxy "$@"
+    }
+    bridge_cleanup() {
+        bridge_tier down -v >/dev/null 2>&1 || true
+    }
+    trap 'bridge_cleanup; cleanup' EXIT
+    bridge_fail() {
+        bridge_tier logs >&2 2>/dev/null || true
+        fail "bridge, hardened: $*"
+    }
+    # The policy: A.4's route and server, the program's one destination the fake on egress-out
+    # (listed private: it resolves to that network's address), and echo, fetch and wait pinned
+    # and allowed. The child trusts this run's CA through --env SSL_CERT_FILE, and its stderr is
+    # logged as text, so the stop row sees its wait begin. bridge-other is a second bridge on a
+    # network of its own, which bridge-fetch must not reach.
+    cat >"$work/bridge.yaml" <<EOF
+services:
+  vault:
+    environment:
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+        admin:
+          listen: vault-portal:8081
+          origins: [http://localhost:8081]
+        credentials:
+          bridge-fetch: {kind: header, secret: "store:bridge-fetch-token"}
+        routes:
+          - name: bridge-fetch
+            prefix: /bridge-fetch
+            upstream: http://bridge-fetch-mcp:9000
+            allow_insecure_upstream: true
+            credential: bridge-fetch
+            callers: [gateway]
+            stream: true
+            rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
+            program:
+              egress: ["fake-upstream:9000"]
+              egress_private: ["fake-upstream:9000"]
+        gateway:
+          hosts: [gateway, localhost, 127.0.0.1]
+          clients:
+            agent1: {token_sha256: "$token_hash", servers: [fetch]}
+          servers:
+            fetch:
+              kind: remote
+              route: bridge-fetch
+              path: /mcp
+              era: legacy
+              tools: {include: [echo, fetch, wait], allow: [echo, fetch, wait]}
+              review: {echo: "$pin_echo", fetch: "$pin_fetch", wait: "$pin_wait"}
+  bridge-fetch:
+    command: [bridge, --listen, "bridge-fetch-mcp:9000", --era, legacy,
+              --egress-proxy, "http://egress-fetch:3128", --env, SSL_CERT_FILE, --stderr, text,
+              --, $bridge_command]
+    environment:
+      SSL_CERT_FILE: /tls/bundle.pem
+    volumes: ["$work/tls:/tls:ro"]
+  bridge-other:
+    image: $bridge_image
+    command: [bridge, --listen, "bridge-other-mcp:9000", --era, legacy, --, $bridge_command]
+    user: "10005:10005"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    environment:
+      ZOEYMCP_BRIDGE_TOKEN_SHA256: \${ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256:-}
+    tmpfs: [/tmp:size=64m,mode=1777]
+    networks:
+      bridge-other: {aliases: [bridge-other-mcp]}
+$(fake_service)
+    networks: [egress-out]
+networks:
+  bridge-other: {internal: true}
+EOF
+    bridge_keys="$(docker run --rm "$image" keygen)"
+    bridge_master="$(echo "$bridge_keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+    bridge_gateway_key="$(echo "$bridge_keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+
+    step "bridge, hardened: a cold start with no hash: the bridge refuses, the vault and gateway serve (TI-7, FM-30)"
+    bridge_tier up -d vault gateway fake-upstream
+    i=0
+    until bridge_tier exec -T gateway zoeymcp gateway-status 2>/dev/null \
+        | grep -q '^view sha256:[0-9a-f]*  fresh$'; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || bridge_fail "the vault didn't serve the gateway while the bridge had no hash"
+        sleep 0.3
+    done
+    i=0
+    until bridge_tier logs bridge-fetch 2>&1 | grep -q ZOEYMCP_BRIDGE_TOKEN_SHA256; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || bridge_fail "the bridge without its hash didn't say why it refused"
+        sleep 0.3
+    done
+
+    step "bridge, hardened: the token made in the vault, its hash given to the bridge (J7)"
+    bridge_hash="$(bridge_tier exec -T vault zoeymcp secret set bridge-fetch-token --generate \
+        2>"$work/generate")" || bridge_fail "secret set --generate failed: $(cat "$work/generate")"
+    cat "$work/generate"
+    echo "$bridge_hash" | grep -qx 'sha256:[0-9a-f]\{64\}' || bridge_fail "no sha256: line: $bridge_hash"
+    bridge_egress_key="$(bridge_tier exec -T vault zoeymcp egress-key 2>/dev/null \
+        | sed -n 's/^ZOEYMCP_EGRESS_KEY=//p')"
+    [ -n "$bridge_egress_key" ] || bridge_fail "zoeymcp egress-key printed no key"
+    bridge_tier up -d egress-proxy
+    i=0
+    until bridge_tier logs egress-proxy 2>&1 | grep -q '"event":"egress_allowlist_applied"'; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || bridge_fail "the role never applied the vault's lists"
+        sleep 0.3
+    done
+    bridge_tier logs egress-proxy 2>&1 | grep '"event":"egress_started"' | grep -q '"bridge-fetch":"' \
+        || bridge_fail "the role has no listener for the route bridge-fetch"
+    bridge_tier up -d bridge-fetch bridge-other
+    i=0
+    until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(bridge_tier ps -q bridge-fetch)")" = "healthy" ]; do
+        i=$((i + 1))
+        [ "$i" -lt 200 ] || bridge_fail "the bridge never became healthy (--ready-check)"
+        sleep 0.5
+    done
+    i=0
+    until bridge_tier logs bridge-other 2>&1 | grep -q '"event":"bridge_ready"'; do
+        i=$((i + 1))
+        [ "$i" -lt 200 ] || bridge_fail "the second bridge never became ready"
+        sleep 0.5
+    done
+    bridge_id="$(bridge_tier ps -q bridge-fetch)"
+    other_id="$(bridge_tier ps -q bridge-other)"
+    [ "$(bridge_tier exec -T bridge-fetch id -u)" = "10005" ] || bridge_fail "the bridge doesn't run as 10005"
+    if bridge_tier logs 2>&1 | grep -qF "${bridge_hash#sha256:}"; then
+        bridge_fail "the bridge's token hash is in a log"
+    fi
+
+    step "bridge, hardened: tools/list and tools/call through the gateway, the bridge's program behind it (S11)"
+    bridge_url=http://gateway:8090/s/fetch/mcp
+    agents_net="${bridge_project}_agents"
+    s11_until "$agents_net" "$bridge_url" "tools echo fetch wait" tools/list
+    found="$(s11 "$agents_net" "$bridge_url" tools/call echo '{"text":"through the hardened bridge"}')" \
+        || bridge_fail "tools/call echo failed: $found"
+    [ "$found" = "ok through the hardened bridge" ] || bridge_fail "tools/call echo answered: $found"
+
+    step "bridge, hardened: an unauthenticated call is refused, a wrong token and an Origin too (X13)"
+    # From the vault's container, the one other container on the bridge's network: the token
+    # never leaves the vault, so these calls can only lack it or carry another.
+    # refused_with HEADER=VALUE...: the bridge answers 403 with no body.
+    refused_with() {
+        found="$(bridge_tier exec -T vault python -I -c "$bridge_post" \
+            http://bridge-fetch-mcp:9000/mcp "$@")" || bridge_fail "no answer from the bridge"
+        [ "$found" = "403 0" ] || bridge_fail "the bridge answered $found to a call with: ${*:-nothing}"
+    }
+    refused_with
+    refused_with "authorization=Bearer wrong-token"
+    refused_with "authorization=Bearer wrong-token" "origin=https://evil.example"
+    # Each refused for its own reason: the Origin is checked first, so the last call is refused
+    # for it, not for its wrong token.
+    found="$(bridge_tier logs --no-log-prefix bridge-fetch 2>&1 | grep '"event":"bridge_refused"' \
+        | grep '"status":403' | tail -n 3 | sed -n 's/.*"reason":"\([a-z_]*\)".*/\1/p' | tr '\n' ' ')"
+    [ "$found" = "token token origin " ] \
+        || bridge_fail "the refused calls' reasons are not token, token, origin: $found"
+
+    step "bridge, hardened: no sibling reaches the bridge, nor it anything but the vault and its role (X13, contract 52)"
+    bridge_addresses="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$bridge_id")"
+    bridge_egress_address="$(docker inspect -f \
+        "{{(index .NetworkSettings.Networks \"${bridge_project}_egress-fetch\").IPAddress}}" "$bridge_id")"
+    echo "the bridge's addresses: $bridge_addresses; on egress-fetch: $bridge_egress_address"
+    [ -n "$bridge_egress_address" ] || bridge_fail "the bridge has no egress-fetch address"
+    # Every network but the bridge's own vault network, bridge-other's included.
+    for network in internal agents direct egress egress-ctl egress-out egress-fetch bridge-other; do
+        # shellcheck disable=SC2086
+        probe "${bridge_project}_$network" -c "$unreachable_on" 9000 bridge-fetch-mcp $bridge_addresses \
+            || bridge_fail "a container on $network reached the bridge's listener"
+    done
+    # Its alias is on bridge-fetch alone: on its egress network the name means nothing.
+    no_name='
+import socket, sys
+try:
+    socket.getaddrinfo(sys.argv[1], 9000)
+except OSError:
+    sys.exit(0)
+sys.exit(f"{sys.argv[1]} resolves here")
+'
+    probe "${bridge_project}_egress-fetch" -c "$no_name" bridge-fetch-mcp \
+        || bridge_fail "bridge-fetch-mcp resolves on egress-fetch"
+    # From the bridge: the gateway, the portal's address, the role's vault listener, another
+    # bridge and the internet are all out of reach.
+    gateway_addresses="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' \
+        "$(bridge_tier ps -q gateway)")"
+    vault_portal="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${bridge_project}_egress\").IPAddress}}" \
+        "$(bridge_tier ps -q vault)")"
+    role_vault="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${bridge_project}_egress-ctl\").IPAddress}}" \
+        "$(bridge_tier ps -q egress-proxy)")"
+    other_addresses="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$other_id")"
+    # shellcheck disable=SC2086
+    bridge_tier exec -T bridge-fetch python -I -c "$unreachable_on" 8090 gateway $gateway_addresses \
+        || bridge_fail "the bridge reached the gateway"
+    # The control: the portal listens there, as the vault itself can see.
+    bridge_tier exec -T vault python -I -c \
+        'import socket, sys; socket.create_connection((sys.argv[1], 8081), timeout=5).close()' \
+        "$vault_portal" || bridge_fail "the portal isn't listening on the vault's egress address"
+    bridge_tier exec -T bridge-fetch python -I -c "$unreachable_on" 8081 vault-portal "$vault_portal" \
+        || bridge_fail "the bridge reached the portal's address"
+    # The control: the role's vault listener takes the vault's connections.
+    bridge_tier exec -T vault python -I -c \
+        'import socket, sys; socket.create_connection((sys.argv[1], 3128), timeout=5).close()' \
+        "$role_vault" || bridge_fail "the role's vault listener isn't listening on egress-ctl"
+    bridge_tier exec -T bridge-fetch python -I -c "$unreachable_on" 3128 egress-vault "$role_vault" \
+        || bridge_fail "the bridge reached the role's vault listener"
+    # The control: the other bridge listens there, as a container on its network can see.
+    probe "${bridge_project}_bridge-other" -c \
+        'import socket, sys; socket.create_connection((sys.argv[1], 9000), timeout=5).close()' \
+        bridge-other-mcp || bridge_fail "the second bridge isn't listening on its network"
+    # shellcheck disable=SC2086
+    bridge_tier exec -T bridge-fetch python -I -c "$unreachable_on" 9000 bridge-other-mcp $other_addresses \
+        || bridge_fail "the bridge reached another bridge"
+    bridge_tier exec -T bridge-fetch python -I -c "$unreachable_on" 443 1.1.1.1 example.com \
+        || bridge_fail "the bridge reached the internet"
+    # Contract 52 from a bridge network: a container there can't reach the role's vault address.
+    probe "${bridge_project}_bridge-fetch" -c "$unreachable_on" 3128 egress-vault "$role_vault" \
+        || bridge_fail "a container on bridge-fetch reached the role's vault listener"
+
+    step "bridge, hardened: PID 1 is an init that reaps an orphan (contract 48)"
+    # A process whose parent exits at once: an orphan, reparented to PID 1, which only an init
+    # reaps. Run inside the bridge's container, as the bridge's uid.
+    orphan='
+import os, subprocess, sys, time
+argv0 = open("/proc/1/cmdline", "rb").read().split(b"\0")[0]
+if not argv0.endswith(b"docker-init"):
+    sys.exit(f"PID 1 is {argv0!r}, not the init")
+pid = int(subprocess.run(["sh", "-c", "sleep 2 >/dev/null 2>&1 & echo $!"],
+                         capture_output=True, check=True, text=True).stdout)
+status = dict(l.split(":", 1) for l in open(f"/proc/{pid}/status").read().splitlines() if ":" in l)
+parent = status["PPid"].strip()
+if parent != "1":
+    sys.exit(f"the orphan {pid} has parent {parent}")
+deadline = time.monotonic() + 15
+while os.path.exists(f"/proc/{pid}"):
+    if time.monotonic() > deadline:
+        state = open(f"/proc/{pid}/status").read().split("State:")[1].split()[0]
+        sys.exit(f"the orphan {pid} is still there, state {state}")
+    time.sleep(0.2)
+print("orphan", pid, "reaped by PID 1")
+'
+    bridge_tier exec -T bridge-fetch python -I -c "$orphan" || bridge_fail "an orphan wasn't reaped"
+
+    step "bridge, hardened: the program's request goes through the role, and only to its list (fold-in C6)"
+    found="$(s11 "$agents_net" "$bridge_url" tools/call fetch '{"url":"https://fake-upstream:9000/"}')" \
+        || bridge_fail "tools/call fetch failed: $found"
+    echo "$found"
+    case "$found" in
+        "ok status "*) ;;
+        *) bridge_fail "fetch through the role answered: $found" ;;
+    esac
+    found="$(s11 "$agents_net" "$bridge_url" tools/call fetch '{"url":"https://unlisted.example/"}')" \
+        || bridge_fail "tools/call fetch (unlisted) failed: $found"
+    echo "$found"
+    case "$found" in
+        "error "*403*) ;;
+        *) bridge_fail "fetch of an unlisted host answered: $found" ;;
+    esac
+    # A tunnel's line comes when it ends: stop the role, which ends and logs every open one.
+    bridge_tier stop -t 15 egress-proxy >/dev/null 2>&1 || bridge_fail "the role didn't stop"
+    bridge_tier logs egress-proxy >"$work/logs" 2>&1
+    grep '"event":"egress_tunnel"' "$work/logs" | grep '"source":"bridge-fetch"' \
+        | grep '"host":"fake-upstream"' | grep -q '"port":9000' \
+        || bridge_fail "the role logged no tunnel from bridge-fetch to fake-upstream:9000"
+    grep '"event":"egress_refused"' "$work/logs" | grep '"source":"bridge-fetch"' \
+        | grep '"reason":"not_allowed"' | grep -q '"host":"unlisted.example"' \
+        || bridge_fail "the role logged no refusal of unlisted.example for bridge-fetch"
+
+    step "bridge, hardened: a call in flight through the bridge finishes on stop (BP-14)"
+    # Compose stops the gateway, then the vault, then the bridge (the vault's depends_on). The
+    # stop begins once the child has said its wait began, and the wait ends inside the 10 s the
+    # gateway gives a call in flight (operations.md §9).
+    s11 "$agents_net" "$bridge_url" tools/call wait '{"seconds":5}' >"$work/inflight" 2>&1 &
+    inflight=$!
+    i=0
+    until bridge_tier logs bridge-fetch 2>&1 | grep '"event":"bridge_stderr"' | grep -q '"text":"waiting 5 s"'; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || bridge_fail "the call never reached the bridge's child: $(cat "$work/inflight")"
+        sleep 0.2
+    done
+    bridge_tier stop >/dev/null 2>&1 || bridge_fail "the hardened tier didn't stop"
+    wait "$inflight" || bridge_fail "the call in flight failed on stop: $(cat "$work/inflight")"
+    [ "$(cat "$work/inflight")" = "ok waited 5 s" ] \
+        || bridge_fail "the call in flight answered: $(cat "$work/inflight")"
+    bridge_cleanup
+    trap cleanup EXIT
+
+    # --- B: the standard shape --------------------------------------------------------------------
+    step "bridge, standard: compose config passes with the bridges' hashes unset"
+    ZOEYMCP_MASTER_KEY=unset \
+        docker compose -f "$deploy/compose.yaml" -f "$examples/bridge/compose.standard.yaml" config -q \
+        || fail "compose config failed on the standard bridge override"
+    stdb_project="zoeymcp-smoke-stdbridge-$$"
+    stdb() {
+        ZOEYMCP_IMAGE="$image" ZOEYMCP_BRIDGE_IMAGE="$bridge_image" \
+            ZOEYMCP_MASTER_KEY="${stdb_master:-unset}" \
+            ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256="${stdb_fetch_hash:-}" \
+            ZOEYMCP_BRIDGE_OTHER_TOKEN_SHA256="${stdb_other_hash:-}" \
+            docker compose -p "$stdb_project" -f "$deploy/compose.yaml" \
+            -f "$examples/bridge/compose.standard.yaml" -f "$work/standard-bridge.yaml" "$@"
+    }
+    stdb_cleanup() {
+        stdb down -v >/dev/null 2>&1 || true
+    }
+    trap 'stdb_cleanup; cleanup' EXIT
+    stdb_fail() {
+        stdb logs >&2 2>/dev/null || true
+        fail "bridge, standard: $*"
+    }
+    # Two bridges, fetch (uid 10100) and other (10101), each on its socket and route, and a
+    # third, spare (10102), with its ARGS and route but its tmpfs mounted 0770, so the launcher
+    # refuses it (FM-31). other's stderr is logged as text, so the stop row sees its wait begin.
+    cat >"$work/standard-bridge.yaml" <<EOF
+services:
+  zoeymcp:
+    command: [standard, --gateway-listen, "0.0.0.0:8090", --bridge, fetch, --bridge, other,
+              --bridge, spare]
+    environment:
+      ZOEYMCP_CONFIG: |
+        version: 1
+        mode: declarative
+        credentials:
+          bridge-fetch: {kind: header, secret: "store:bridge-fetch-token"}
+          bridge-other: {kind: header, secret: "store:bridge-other-token"}
+          bridge-spare: {kind: header, secret: "store:bridge-spare-token"}
+        routes:
+          - {name: bridge-fetch, prefix: /bridge-fetch, upstream: "unix:/run/zoeymcp-bridge-fetch/mcp.sock",
+             credential: bridge-fetch, callers: [gateway], stream: true,
+             rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]}
+          - {name: bridge-other, prefix: /bridge-other, upstream: "unix:/run/zoeymcp-bridge-other/mcp.sock",
+             credential: bridge-other, callers: [gateway], stream: true,
+             rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]}
+          - {name: bridge-spare, prefix: /bridge-spare, upstream: "unix:/run/zoeymcp-bridge-spare/mcp.sock",
+             credential: bridge-spare, callers: [gateway], stream: true,
+             rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]}
+        gateway:
+          hosts: [localhost, 127.0.0.1]
+          clients:
+            agent1: {token_sha256: "$token_hash", servers: [fetch, other]}
+          servers:
+            fetch:
+              kind: remote
+              route: bridge-fetch
+              path: /mcp
+              era: legacy
+              tools: {include: [echo, wait], allow: [echo, wait]}
+              review: {echo: "$pin_echo", wait: "$pin_wait"}
+            other:
+              kind: remote
+              route: bridge-other
+              path: /mcp
+              era: legacy
+              tools: {include: [echo, wait], allow: [echo, wait]}
+              review: {echo: "$pin_echo", wait: "$pin_wait"}
+      ZOEYMCP_BRIDGE_OTHER_ARGS: >-
+        ["--era", "legacy", "--stderr", "text", "--", "$bridge_command"]
+      ZOEYMCP_BRIDGE_OTHER_TOKEN_SHA256: \${ZOEYMCP_BRIDGE_OTHER_TOKEN_SHA256:-}
+      ZOEYMCP_BRIDGE_SPARE_ARGS: >-
+        ["--era", "legacy", "--", "$bridge_command"]
+    tmpfs:
+      - /run/zoeymcp-bridge-other:size=64m,mode=0750,uid=10101,gid=10001
+      - /run/zoeymcp-bridge-spare:size=64m,mode=0770,uid=10102,gid=10001
+EOF
+    stdb_master="$(docker run --rm "$image" keygen | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+    # healthy: the standard container's gateway answers on the host's loopback.
+    stdb_healthy() {
+        i=0
+        until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/healthz)" = "200" ]; do
+            i=$((i + 1))
+            [ "$i" -lt 100 ] || stdb_fail "the gateway didn't become ready"
+            sleep 0.3
+        done
+    }
+    # stdb_logged COUNT PATTERN...: until the container's log has COUNT lines matching every
+    # PATTERN.
+    stdb_logged() {
+        stdb_count="$1"
+        shift
+        i=0
+        while :; do
+            stdb logs zoeymcp >"$work/stdb-logs" 2>&1
+            for pattern in "$@"; do
+                grep -F "$pattern" "$work/stdb-logs" >"$work/stdb-matched" || true
+                mv "$work/stdb-matched" "$work/stdb-logs"
+            done
+            [ "$(wc -l <"$work/stdb-logs")" -ge "$stdb_count" ] && return 0
+            i=$((i + 1))
+            [ "$i" -lt 100 ] || stdb_fail "fewer than $stdb_count log lines with: $*"
+            sleep 0.3
+        done
+    }
+
+    step "bridge, standard: a cold start with no hashes: the bridges refuse and stay down, spare's directory is refused (FM-30, FM-31)"
+    stdb up -d
+    stdb_healthy
+    std_id="$(stdb ps -q zoeymcp)"
+    for name in fetch other; do
+        stdb_logged 1 '"event":"launcher_bridge_down"' "\"name\":\"$name\""
+    done
+    # spare alone, once, for its directory: it names the path and what it must be.
+    stdb_logged 1 '"event":"launcher_bridge_refused"' '"name":"spare"'
+    [ "$(wc -l <"$work/stdb-logs")" -eq 1 ] || stdb_fail "spare wasn't refused exactly once: $(cat "$work/stdb-logs")"
+    grep -qF '/run/zoeymcp-bridge-spare' "$work/stdb-logs" \
+        && grep -qF 'is 10102:10001 0770; it must be 10102:10001 0750' "$work/stdb-logs" \
+        || stdb_fail "spare's refusal doesn't name its directory and 10102:10001 0750: $(cat "$work/stdb-logs")"
+    stdb_logged 1 '"event":"launcher_bridge_refused"'
+    [ "$(wc -l <"$work/stdb-logs")" -eq 1 ] || stdb_fail "a bridge other than spare was refused"
+
+    step "bridge, standard: the tokens made in the container, the hashes set, the container recreated (J7)"
+    stdb_fetch_hash="$(docker exec "$std_id" zoeymcp secret set bridge-fetch-token --generate 2>/dev/null)" \
+        || stdb_fail "secret set --generate failed for fetch"
+    stdb_other_hash="$(docker exec "$std_id" zoeymcp secret set bridge-other-token --generate 2>/dev/null)" \
+        || stdb_fail "secret set --generate failed for other"
+    # spare's too, so its route fails at the connect, not for a missing credential.
+    docker exec "$std_id" zoeymcp secret set bridge-spare-token --generate >/dev/null 2>&1 \
+        || stdb_fail "secret set --generate failed for spare"
+    echo "$stdb_fetch_hash" | grep -qx 'sha256:[0-9a-f]\{64\}' || stdb_fail "no sha256: line: $stdb_fetch_hash"
+    stdb up -d
+    stdb_healthy
+    std_id="$(stdb ps -q zoeymcp)"
+    stdb_logged 2 '"event":"bridge_ready"'
+    std_url=http://127.0.0.1:8090/s
+
+    step "bridge, standard: tools/list and tools/call through the standard container (S11)"
+    s11_until host "$std_url/fetch/mcp" "tools echo wait" tools/list
+    s11_until host "$std_url/other/mcp" "tools echo wait" tools/list
+    found="$(s11 host "$std_url/fetch/mcp" tools/call echo '{"text":"through the standard bridge"}')" \
+        || stdb_fail "tools/call echo failed: $found"
+    [ "$found" = "ok through the standard bridge" ] || stdb_fail "tools/call echo answered: $found"
+
+    step "bridge, standard: each bridge's socket in a 0750 directory of its uid and the vault's group"
+    # As the vault's uid: the container's root holds no DAC capability, so it can't search them.
+    found="$(docker exec -u 10001 "$std_id" stat -c '%n %u:%g %a' /run/zoeymcp-bridge-fetch \
+        /run/zoeymcp-bridge-fetch/mcp.sock /run/zoeymcp-bridge-other /run/zoeymcp-bridge-spare)" \
+        || stdb_fail "stat of the bridges' directories failed: $found"
+    echo "$found"
+    # spare's is the deliberately wrong mount the launcher refused.
+    expected="$(printf '%s\n' \
+        "/run/zoeymcp-bridge-fetch 10100:10001 750" \
+        "/run/zoeymcp-bridge-fetch/mcp.sock 10100:10100 666" \
+        "/run/zoeymcp-bridge-other 10101:10001 750" \
+        "/run/zoeymcp-bridge-spare 10102:10001 770")"
+    [ "$found" = "$expected" ] || stdb_fail "the sockets' directories or modes differ"
+    # Each bridge runs as its own uid: bridge_process NAME prints its pid and uid.
+    bridge_process='
+import os, sys
+listen = f"unix:/run/zoeymcp-bridge-{sys.argv[1]}/mcp.sock".encode()
+for pid in (p for p in os.listdir("/proc") if p.isdigit()):
+    try:
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        uid = open(f"/proc/{pid}/status").read().split("Uid:")[1].split()[0]
+    except OSError:
+        continue
+    if listen in argv:
+        print(pid, uid)
+'
+    for pair in fetch:10100 other:10101; do
+        found="$(docker exec "$std_id" python -I -c "$bridge_process" "${pair%%:*}")"
+        [ "${found#* }" = "${pair#*:}" ] || stdb_fail "bridge ${pair%%:*} isn't one process as ${pair#*:}: $found"
+    done
+
+    # sock_probe connect|bind PATH: exits 0 when the kernel refuses with EACCES.
+    sock_probe='
+import errno, socket, sys
+how, path = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect(path) if how == "connect" else s.bind(path)
+except OSError as error:
+    if error.errno == errno.EACCES:
+        print(how, path, "EACCES")
+        sys.exit(0)
+    sys.exit(f"{how} {path}: {error}")
+sys.exit(f"{how} {path} succeeded")
+'
+    step "bridge, standard: no other uid can connect to a bridge's socket or create one in its directory (Q46)"
+    for uid in 10002 10101; do
+        docker exec -u "$uid" "$std_id" python -I -c "$sock_probe" connect /run/zoeymcp-bridge-fetch/mcp.sock \
+            || stdb_fail "uid $uid wasn't refused a connect to fetch's socket"
+        docker exec -u "$uid" "$std_id" python -I -c "$sock_probe" bind /run/zoeymcp-bridge-fetch/planted.sock \
+            || stdb_fail "uid $uid wasn't refused a socket in fetch's directory"
+    done
+    # The refused bridge's directory, the same: no socket there, but no search either.
+    for uid in 10002 10101; do
+        docker exec -u "$uid" "$std_id" python -I -c "$sock_probe" connect /run/zoeymcp-bridge-spare/mcp.sock \
+            || stdb_fail "uid $uid wasn't refused a connect in the refused bridge's directory"
+        docker exec -u "$uid" "$std_id" python -I -c "$sock_probe" bind /run/zoeymcp-bridge-spare/mcp.sock \
+            || stdb_fail "uid $uid wasn't refused a socket in the refused bridge's directory"
+    done
+
+    # vault_route ROUTE-PATH: as the gateway's uid, one initialize to the vault's route over the
+    # link socket (the gateway's identity there); prints the status and how long it took, in ms.
+    vault_route='
+import json, socket, sys, time
+body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-11-25", "capabilities": {},
+    "clientInfo": {"name": "smoke", "version": "1"}}}).encode()
+head = (f"POST {sys.argv[1]} HTTP/1.1\r\nHost: vault\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+started = time.monotonic()
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(30)
+s.connect("/run/zoeymcp-link/vault.sock")
+s.sendall(head + body)
+answer = b""
+while b"\r\n" not in answer:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    answer += chunk
+print(answer.split(b" ")[1].decode(), round((time.monotonic() - started) * 1000))
+'
+    step "bridge, standard: a killed bridge stays down, its route fails at once, the rest serve (FM-29, Q44)"
+    other_pid="$(docker exec "$std_id" python -I -c "$bridge_process" other)"
+    other_pid="${other_pid%% *}"
+    [ -n "$other_pid" ] || stdb_fail "no process for bridge other"
+    docker exec -u 10101 "$std_id" python -I -c 'import os, sys; os.kill(int(sys.argv[1]), 9)' "$other_pid"
+    stdb_logged 1 '"event":"child_exited"' '"child":"bridge:other"'
+    stdb_logged 1 '"event":"launcher_bridge_down"' '"name":"other"' '"status":-9'
+    found="$(docker exec -u 10002 "$std_id" python -I -c "$vault_route" /bridge-other/mcp)" \
+        || stdb_fail "no answer from the vault's route to the killed bridge"
+    echo "the killed bridge's route: $found"
+    [ "${found%% *}" = "502" ] && [ "${found#* }" -lt 1000 ] \
+        || stdb_fail "the killed bridge's route didn't fail with 502 within a second: $found"
+    # The refused bridge's route, the same (FM-31).
+    found="$(docker exec -u 10002 "$std_id" python -I -c "$vault_route" /bridge-spare/mcp)" \
+        || stdb_fail "no answer from the vault's route to the refused bridge"
+    echo "the refused bridge's route: $found"
+    [ "${found%% *}" = "502" ] && [ "${found#* }" -lt 1000 ] \
+        || stdb_fail "the refused bridge's route didn't fail with 502 within a second: $found"
+    found="$(s11 host "$std_url/other/mcp" tools/call echo '{"text":"x"}' 2>&1)" || true
+    case "$found" in
+        "ok "*) stdb_fail "a call to the killed bridge answered: $found" ;;
+    esac
+    for uid in 10002 10100; do
+        docker exec -u "$uid" "$std_id" python -I -c "$sock_probe" connect /run/zoeymcp-bridge-other/mcp.sock \
+            || stdb_fail "uid $uid wasn't refused a connect to the killed bridge's socket"
+        docker exec -u "$uid" "$std_id" python -I -c "$sock_probe" bind /run/zoeymcp-bridge-other/mcp.sock \
+            || stdb_fail "uid $uid wasn't refused a socket in the killed bridge's directory"
+    done
+    found="$(s11 host "$std_url/fetch/mcp" tools/call echo '{"text":"still serving"}')" \
+        || stdb_fail "fetch stopped serving when other died: $found"
+    [ "$found" = "ok still serving" ] || stdb_fail "fetch answered: $found"
+
+    step "bridge, standard: a loosened directory still lets no other uid past either peer check (Q46)"
+    # What the bridge's own child could do: its uid owns the directory.
+    docker exec -u 10100 "$std_id" python -I -c 'import os; os.chmod("/run/zoeymcp-bridge-fetch", 0o777)'
+    peer_cut='
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(sys.argv[1])
+try:
+    s.sendall(b"POST /mcp HTTP/1.1\r\nHost: bridge.invalid\r\nContent-Length: 2\r\n\r\n{}")
+    data = s.recv(1024)
+except OSError:
+    data = b""
+if data:
+    sys.exit(f"answered: {data[:80]!r}")
+print("cut")
+'
+    docker exec -u 10002 "$std_id" python -I -c "$peer_cut" /run/zoeymcp-bridge-fetch/mcp.sock \
+        || stdb_fail "the bridge answered the gateway's uid"
+    stdb_logged 1 '"event":"bridge_peer_refused"' '"uid":10002'
+    # The gateway's uid stands in for the bridge: it takes the socket's path, and logs what each
+    # connection sends it.
+    plant='
+import os, socket, sys
+path, log = sys.argv[1], sys.argv[2]
+os.unlink(path)
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+os.chmod(path, 0o777)
+server.listen(8)
+server.settimeout(60)
+open(log, "w").write("listening\n")
+while True:
+    try:
+        conn, _ = server.accept()
+    except OSError:
+        break
+    conn.settimeout(3)
+    try:
+        data = conn.recv(65536)
+    except OSError:
+        data = b""
+    with open(log, "a") as handle:
+        handle.write(f"connection {len(data)}\n")
+    conn.close()
+'
+    docker exec -d -u 10002 "$std_id" python -I -c "$plant" /run/zoeymcp-bridge-fetch/mcp.sock /tmp/planted
+    i=0
+    until docker exec "$std_id" grep -q listening /tmp/planted 2>/dev/null; do
+        i=$((i + 1))
+        [ "$i" -lt 50 ] || stdb_fail "the planted socket never listened"
+        sleep 0.2
+    done
+    # Past the vault's idle keep-alive (5 s), so its next request opens a new connection.
+    sleep 6
+    found="$(docker exec -u 10002 "$std_id" python -I -c "$vault_route" /bridge-fetch/mcp)" \
+        || stdb_fail "no answer from the vault's route to the planted socket"
+    echo "the planted socket's route: $found"
+    [ "${found%% *}" = "502" ] || stdb_fail "the vault's route through the planted socket answered: $found"
+    stdb_logged 1 '"event":"address_refused"' '"bridge":"fetch"' '"verdict":"peer_uid"' '"uid":10002'
+    docker exec "$std_id" cat /tmp/planted
+    if docker exec "$std_id" grep -q '^connection [1-9]' /tmp/planted; then
+        stdb_fail "the vault sent the planted socket a request"
+    fi
+
+    step "bridge, standard: a restarted container brings the bridges back"
+    stdb restart zoeymcp >/dev/null
+    stdb_healthy
+    stdb_logged 4 '"event":"bridge_ready"'
+    s11_until host "$std_url/other/mcp" "ok back" tools/call echo '{"text":"back"}'
+
+    step "bridge, standard: a call in flight through the bridge finishes on stop (BP-14)"
+    # The launcher stops the gateway, then the vault, then each bridge (C.10). The stop begins
+    # once other's child has said its wait began, and the wait ends inside the 10 s the gateway
+    # gives a call in flight (operations.md §9).
+    s11 host "$std_url/other/mcp" tools/call wait '{"seconds":5}' >"$work/inflight" 2>&1 &
+    inflight=$!
+    stdb_logged 1 '"event":"bridge_stderr"' '"text":"waiting 5 s"'
+    stdb stop -t 420 zoeymcp >/dev/null 2>&1 || stdb_fail "the standard container didn't stop"
+    wait "$inflight" || stdb_fail "the call in flight failed on stop: $(cat "$work/inflight")"
+    [ "$(cat "$work/inflight")" = "ok waited 5 s" ] \
+        || stdb_fail "the call in flight answered: $(cat "$work/inflight")"
+    [ "$(docker inspect -f '{{.State.ExitCode}}' "$std_id")" = "0" ] || stdb_fail "the launcher exited non-zero"
+    stdb logs zoeymcp >"$work/stdb-logs" 2>&1
+    vault_exit="$(grep -n '"event":"child_exited","child":"vault"' "$work/stdb-logs" | tail -n 1 | cut -d: -f1)"
+    for name in fetch other; do
+        bridge_exit="$(grep -n "\"event\":\"child_exited\",\"child\":\"bridge:$name\"" "$work/stdb-logs" \
+            | tail -n 1 | cut -d: -f1)"
+        [ -n "$vault_exit" ] && [ -n "$bridge_exit" ] && [ "$vault_exit" -lt "$bridge_exit" ] \
+            || stdb_fail "bridge $name didn't stop after the vault"
+    done
+    stdb_cleanup
+    trap cleanup EXIT
+fi
+# --- end of S11's container rows ------------------------------------------------------------------
 
 echo "SMOKE OK"

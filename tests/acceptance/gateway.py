@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -47,9 +47,15 @@ SERVER = "notes"
 CLIENTS = ("agent1", "agent2")
 NO_TOOLS = "tools: {include: [], allow: [], approve: []}"
 NO_PINS = "review: {}"
-NO_CLIENT = '      token_sha256: "sha256:' + "0" * 64 + '"\n      servers: [notes]\n'
-
 Link = Literal["tcp", "unix"]
+
+
+def no_client(server: str) -> str:
+    """A profile's placeholder client, assigned ``server``."""
+    return '      token_sha256: "sha256:' + "0" * 64 + f'"\n      servers: [{server}]\n'
+
+
+NO_CLIENT = no_client(SERVER)
 
 
 def server_text(tools: Mapping[str, str], pins: Mapping[str, str]) -> dict[str, str]:
@@ -63,14 +69,16 @@ def server_text(tools: Mapping[str, str], pins: Mapping[str, str]) -> dict[str, 
     }
 
 
-def client_text(clients: tuple[str, ...]) -> dict[str, str]:
-    lines = [f'      token_sha256: "{hash_token(token_for(clients[0]))}"\n      servers: [notes]\n']
+def client_text(clients: tuple[str, ...], server: str = SERVER) -> dict[str, str]:
+    lines = [
+        f'      token_sha256: "{hash_token(token_for(clients[0]))}"\n      servers: [{server}]\n'
+    ]
     lines += [
         f'    {name}:\n      token_sha256: "{hash_token(token_for(name))}"\n'
-        "      servers: [notes]\n"
+        f"      servers: [{server}]\n"
         for name in clients[1:]
     ]
-    return {NO_CLIENT: "".join(lines)}
+    return {no_client(server): "".join(lines)}
 
 
 class GatewayAdminTransport(httpx.BaseTransport):
@@ -105,6 +113,11 @@ class GatewayDeployment:
     ``zoeymcp gateway`` does (M5 design J.3), and the portal's Ledger page reads it. ``extra``
     merges another fragment into the profile's (``Deployment``); with ``toolkits`` the gateway
     loads the example toolkits from their entry points, as the toolkit rig does.
+
+    ``server`` is the profile's one server, which its placeholder client is assigned; with
+    ``socket_clients`` the vault reaches a ``unix:`` route's bridge as ``--bridge`` has it (M7
+    design B.2, S11), and with ``guarded`` its routes on its own guarded clients
+    (``Deployment``).
     """
 
     def __init__(
@@ -126,6 +139,9 @@ class GatewayDeployment:
         reporter: bool = False,
         extra: Mapping[str, Any] | None = None,
         toolkits: bool = False,
+        server: str = SERVER,
+        socket_clients: Callable[[str], httpx.AsyncClient | None] | None = None,
+        guarded: bool = False,
     ) -> None:
         self.state = tmp_path / "gateway"
         self.link = link
@@ -143,13 +159,15 @@ class GatewayDeployment:
             upstream,
             ca,
             secrets=dict(secrets or {}),
-            replace={**listed, **client_text(clients), **(replace or {})},
+            replace={**listed, **client_text(clients, server), **(replace or {})},
             link_socket=socket,
             link_uid=link_uid,
             clock=clock,
             portal=portal,
             reports=reporter,
             extra=extra,
+            socket_clients=socket_clients,
+            guarded=guarded,
         )
 
     @property

@@ -81,12 +81,20 @@ select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF", "PT", "C4", "PIE", "
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106"]
 "examples/toolkits/tests/**" = ["S101"]
+"examples/bridge/server/tests/**" = ["S101"]
 
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests", "examples/toolkits/src", "examples/toolkits/tests"]
-mypy_path = "examples/toolkits/src"
+files = [
+    "src",
+    "tests",
+    "examples/toolkits/src",
+    "examples/toolkits/tests",
+    "examples/bridge/server/src",
+    "examples/bridge/server/tests",
+]
+mypy_path = ["examples/toolkits/src", "examples/bridge/server/src"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
@@ -94,9 +102,10 @@ module = ["hypothesis.*"]
 follow_untyped_imports = true
 
 [tool.pytest.ini_options]
-# The example toolkits are tested in place, not installed, so uv.lock stays as it is.
-testpaths = ["tests", "examples/toolkits/tests"]
-pythonpath = ["examples/toolkits/src"]
+# The example toolkits and the bridge example's server are tested in place, not installed, so
+# uv.lock stays as it is.
+testpaths = ["tests", "examples/toolkits/tests", "examples/bridge/server/tests"]
+pythonpath = ["examples/toolkits/src", "examples/bridge/server/src"]
 addopts = ["-q", "--strict-markers", "--strict-config"]
 xfail_strict = true
 
@@ -237,3 +246,4 @@ also_copy = ["Dockerfile", "deploy", "docs", "examples", "profiles", "tests"]
 "zoeymcp.bridge.relay" = 95
 "zoeymcp.bridge.sessions" = 95
 "zoeymcp.bridge.childenv" = 95
+"zoeymcp.entrypoint.env" = 95

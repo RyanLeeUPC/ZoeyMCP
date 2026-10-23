@@ -15,6 +15,8 @@ Every profile here is exercised end to end against a fake that behaves like the 
 where it matters, with only the upstream address swapped: by `tests/acceptance`, and the SMTP
 ones by `tests/unit/test_smtp_connector.py`. `remote-mcp-oauth-discovered.yaml` is compared
 instead with what onboarding by URL writes against the fakes, but for the client ID.
+`stdio-bridge.yaml` runs through a real bridge around a stdio fake (`tests/acceptance`), and in
+both tiers' containers in the image's smoke test.
 
 The portal (its `admin` block, docs/operations.md §26) does these steps in the browser instead
 of the CLI:
@@ -27,6 +29,9 @@ of the CLI:
 - **MCP servers** reviews a server's tools too (**Review tools**) and makes the `tools:` and
   `review:` blocks to commit, as `zoeymcp review` does; assigning the server to clients stays
   yours.
+- **MCP servers** reviews a bridge's tools the same way, since a bridge is a remote server to the
+  gateway; its token is made only by `zoeymcp secret set <name> --generate`, over the admin
+  socket.
 
 | File | Shape | Example provider |
 | --- | --- | --- |
@@ -41,6 +46,7 @@ of the CLI:
 | `remote-mcp-static-key.yaml` | S10: a remote MCP server with a static key, behind the gateway (also a `gateway:` fragment) | any MCP server that takes an API key |
 | `remote-mcp-oauth.yaml` | S6 x S10: a remote MCP server with OAuth behind the gateway: a client registered by hand, PKCE, rotating refresh tokens, the `resource` parameter, one allowed and one approved tool (also a `gateway:` fragment) | any MCP server whose OAuth client you register yourself (no discovery: for discovery, see S9 below) |
 | `remote-mcp-oauth-discovered.yaml` | S9: the same server onboarded by its URL: fragment 1 as `zoeymcp login --mcp` writes it from the server's protected-resource metadata and its authorization server's metadata, with a public client registered by the vault (DCR), the issuer required on the answer, and no tools until the review (also a `gateway:` fragment) | any MCP server that publishes its metadata (RFC 9728) and registers clients (RFC 7591) |
+| `stdio-bridge.yaml` | S11: a stdio MCP server behind a bridge: a vault route to the bridge with its token as the header credential, the program's egress list, and a remote server on that route, the same in every placement but the route's upstream (also a `gateway:` fragment) | any stdio-only MCP server, run by `zoeymcp bridge` (`examples/bridge/`) |
 | `smtp-implicit-tls.yaml` | S13: send mail with an app password, implicit TLS on 465, fixed recipients, optionally through CONNECT | any mail provider with app passwords |
 | `smtp-starttls.yaml` | S14: the same with STARTTLS on 587, required, never optional | any mail provider with app passwords |
 | `toolkit-mail.yaml` | S15: the example mail toolkit, each message approved as shown (with an SMTP profile; a `gateway:` fragment) | any of the SMTP profiles' providers |
