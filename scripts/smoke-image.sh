@@ -1937,7 +1937,7 @@ services:
     init: true
     environment:
       ZOEYMCP_BRIDGE_TOKEN_SHA256: \${ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256:-}
-    tmpfs: [/tmp:size=64m,mode=1777]
+    tmpfs: ["/tmp:size=64m,mode=1777"]
     networks:
       bridge-other: {aliases: [bridge-other-mcp]}
 $(fake_service)

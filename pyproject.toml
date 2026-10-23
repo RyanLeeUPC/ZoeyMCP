@@ -197,7 +197,7 @@ pytest_add_cli_args = [
     "--ignore=tests/unit/test_mutation_scripts.py",
 ]
 # docs: test_refusal_doc.py checks operations.md's table against the refusal catalogue.
-also_copy = ["Dockerfile", "deploy", "docs", "examples", "profiles", "tests"]
+also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", "tests"]
 
 # Per-module minimum mutation scores, checked by scripts/mutation-gate.py on top of the overall
 # minimum: a glob over dotted module names to a percentage, like "zoeymcp.portal.*" = 90.

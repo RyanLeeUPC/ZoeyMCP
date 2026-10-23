@@ -111,6 +111,10 @@ async def test_a_bridge_killed_mid_call(
                     while (after := await echo(client)) is None:
                         await anyio.sleep(0.2)
                     reconnected = gateway.seen.events("upstream_connected")[connected:]
+                    # Taken before the teardown: a request arriving while the bridge closes is
+                    # refused not_ready, which says nothing about the restart.
+                    refused = second.events("bridge_refused")
+                    started = second.events("bridge_session_started")
             failed = [
                 line
                 for line in gateway.seen.events("request")
@@ -130,9 +134,7 @@ async def test_a_bridge_killed_mid_call(
     assert after == "after"
     # A fresh session on the new bridge: the old session's id means nothing there (404, as for
     # any legacy restart), so the gateway initialized a new session after the kill.
-    assert second is not None
-    refused = second.events("bridge_refused")
     assert {line["reason"] for line in refused} <= {"session_unknown"}, refused
     assert reconnected, "the gateway didn't initialize a new session after the kill"
-    assert second.events("bridge_session_started")
+    assert started
     assert TOKEN not in everything
