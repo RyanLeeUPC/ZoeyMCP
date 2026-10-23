@@ -33,6 +33,15 @@ with no key is answered 2xx with no metadata (``not_protected``). The discovery 
 metadata or the challenge hostile, check headers before credentials, answer ``server/discover``
 without them, give GET 405 and DELETE 400 in any mode, or list ``large``'s 96 tools.
 
+For drift review and the new-tool signal (M6 design O.1), ``add_tools`` lists three more tools after
+N listings; ``change_tool`` changes a definition while the fake runs and ``flip_back`` lists the
+reviewed one again; ``announce_before_listen`` changes ``echo`` and announces it just before each
+modern listen stream subscribes, so the stream being opened never sees the announcement (streams
+already open do): the first stream once the connect listing is served, and each reopen after a
+stream ``drop_listens`` ended as a lost one ends once the next listing (the one a client makes on
+the loss) is served; and ``offered`` advertises prompts, resources, completions or logging, none of
+them served.
+
 The fake runs on a uvicorn thread and needs the ASGI lifespan (``serve(..., lifespan=True)``),
 which runs the SDK's session manager.
 """
@@ -85,6 +94,9 @@ DRIFT_MEMBERS: Final[tuple[DriftMember, ...]] = get_args(DriftMember)
 BackChannel = Literal["sampling", "elicit_form", "elicit_url", "roots", "state_only"]
 BACK_CHANNELS: Final[tuple[BackChannel, ...]] = get_args(BackChannel)
 BackChannelStream = Literal["call", "get"]
+# What a server may advertise beyond tools (M6 design J.1's ``offered``).
+Offered = Literal["prompts", "resources", "completions", "logging"]
+OFFERED: Final[tuple[Offered, ...]] = get_args(Offered)
 
 PATH: Final = "/mcp"
 SCHEMA_PATH: Final = "/s.json"
@@ -138,6 +150,15 @@ LARGE_READ: Final = 63
 LARGE_WRITE: Final = 26
 LARGE_WARNED: Final = ("read_01", "read_02", "write_01")
 LARGE_INVALID: Final = "bad_tool"
+# The tools ``add_tools`` adds (M6 design J2): one read-only, one destructive, one unannotated.
+ADDED: Final = ("export_all", "purge", "share")
+# The capabilities ``offered`` advertises, as wire JSON.
+OFFERED_CAPABILITIES: Final[Mapping[Offered, dict[str, Any]]] = {
+    "prompts": {"listChanged": True},
+    "resources": {"subscribe": True, "listChanged": True},
+    "completions": {},
+    "logging": {},
+}
 
 
 class Switch(enum.StrEnum):
@@ -149,6 +170,7 @@ class Switch(enum.StrEnum):
     PER_SESSION = "per_session"
     CLEAN_FIRST_SESSION = "clean_first_session"
     DUPLICATE_TOOL = "duplicate_tool"
+    ANNOUNCE_BEFORE_LISTEN = "announce_before_listen"
     # injection
     INJECT_DEFINITIONS = "inject_definitions"
     INVALID_NAME = "invalid_name"
@@ -227,6 +249,18 @@ class Drift:
     after: int = 1
     notify: bool = False
     flip_back_after: int | None = None
+
+
+@dataclass
+class AddTools:
+    """New tools: after ``after`` listings, every listing also lists :func:`added_tools`.
+
+    ``notify`` sends ``list_changed`` right after the last listing without them. Only first pages
+    count as listings.
+    """
+
+    after: int = 1
+    notify: bool = False
 
 
 @dataclass
@@ -448,6 +482,31 @@ def large_tools() -> list[dict[str, Any]]:
     return tools
 
 
+def added_tools() -> list[dict[str, Any]]:
+    """``add_tools``' three tools, named in :data:`ADDED`: one the server marks read-only, one it
+    marks destructive, and one with no annotations."""
+    record = {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+    return [
+        {
+            "name": "export_all",
+            "description": "Exports every record.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": True},
+        },
+        {
+            "name": "purge",
+            "description": "Deletes every record.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": False, "destructiveHint": True},
+        },
+        {
+            "name": "share",
+            "description": "Shares a record with another user.",
+            "inputSchema": record,
+        },
+    ]
+
+
 def _deep_schema(depth: int) -> dict[str, Any]:
     """An input schema nested ``depth`` JSON levels deep (objects and arrays both count)."""
     schema: dict[str, Any] = {"type": "string"}
@@ -541,8 +600,12 @@ class McpFake:
     key_header: Literal["authorization", "x-api-key"] = "authorization"
     # S6 x S10: whether a bearer token is live (FakeAuthServer.access_ok), used instead of key.
     authorize: Callable[[str], bool] | None = None
-    # drift
+    # drift: by listing count, or now (change_tool and flip_back set tool_change); new tools
     drift: Drift | None = None
+    tool_change: DriftMember | None = None
+    add_tools: AddTools | None = None
+    # what is advertised beyond tools, and never served
+    offered: set[Offered] = field(default_factory=set)
     # back channel: what an echo call asks of the client first, and where (legacy era).
     back_channel: BackChannel | None = None
     back_channel_stream: BackChannelStream = "call"
@@ -570,6 +633,10 @@ class McpFake:
     answers: list[BackChannelAnswer] = field(default_factory=list)
     lists: int = 0
     announced: int = 0
+    # Listen streams asked for, those dropped, and announce_before_listen's changes made.
+    listens: int = 0
+    dropped: int = 0
+    listen_changes: int = 0
     schema_fetches: int = 0
     # When a slow call saw its cancellation, by time.monotonic().
     cancellations: list[float] = field(default_factory=list)
@@ -582,18 +649,29 @@ class McpFake:
     _expired: set[str] = field(default_factory=set, repr=False)
     _counters: Counter[str | None] = field(default_factory=Counter, repr=False)
     _bus: InMemorySubscriptionBus = field(default_factory=InMemorySubscriptionBus, repr=False)
+    # One per open listen stream, so drop_listens can end it.
+    _listen_scopes: set[anyio.CancelScope] = field(default_factory=set, repr=False)
+    # Listings served by the last drop_listens: a reopen's change waits for one more.
+    _lists_at_drop: int = field(default=0, repr=False)
     _loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
     _tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False)
 
     # --- the app -----------------------------------------------------------------------------
 
     def app(self) -> _Wire:
+        listener = ListenHandler(self._bus)
+
+        async def listen(
+            ctx: ServerRequestContext[Any, Any], params: types.SubscriptionsListenRequestParams
+        ) -> types.SubscriptionsListenResult:
+            return await self._listen(listener, ctx, params)
+
         server: Server[Any] = Server(
             "fake-mcp",
             version="1.0.0",
             on_list_tools=_no_tools,
             on_call_tool=_unreachable_call,
-            on_subscriptions_listen=ListenHandler(self._bus),
+            on_subscriptions_listen=listen,
             get_tool_input_schema=self._input_schema,
         )
         # No OpenTelemetry span middleware: the fake shapes tools/list and tools/call itself.
@@ -609,6 +687,25 @@ class McpFake:
         if self._loop is None:
             raise RuntimeError("the fake is not running")
         future = asyncio.run_coroutine_threadsafe(self._announce(count, 0.0), self._loop)
+        future.result(BACK_CHANNEL_TIMEOUT)
+
+    def change_tool(self, member: DriftMember = "description") -> None:
+        """From the next listing on, ``member`` is changed (as :func:`apply_drift` changes it),
+        until :meth:`flip_back`. Nothing is announced: call :meth:`announce` for that. Not for
+        use with a ``drift`` of the same member."""
+        self.tool_change = member
+
+    def flip_back(self) -> None:
+        """From the next listing on, the definitions are the reviewed ones again."""
+        self.tool_change = None
+
+    def drop_listens(self) -> None:
+        """End every open listen stream with an error, as a lost stream ends, from a test's
+        thread. The client sees the stream lost (no graceful close) and may listen again; with
+        ANNOUNCE_BEFORE_LISTEN, the reopen's change waits for the next listing."""
+        if self._loop is None:
+            raise RuntimeError("the fake is not running")
+        future = asyncio.run_coroutine_threadsafe(self._drop_listens(), self._loop)
         future.result(BACK_CHANNEL_TIMEOUT)
 
     def requests(self, rpc_method: str) -> list[Recorded]:
@@ -681,6 +778,15 @@ class McpFake:
             flip = drift.flip_back_after
             if flip is None or listing <= drift.after + flip:
                 tools = apply_drift(tools, drift.member)
+        if self.tool_change is not None:
+            tools = apply_drift(tools, self.tool_change)
+        if self.listen_changes:
+            _tool(tools, "echo")["description"] += (
+                f" Changed before listen stream {self.listen_changes}."
+            )
+        added = self.add_tools
+        if added is not None and listing > added.after:
+            tools.extend(added_tools())
         ordinal = self._session_order.get(session_id or "")
         if Switch.PER_SESSION in self.switches and ordinal is not None:
             _tool(tools, "echo")["description"] += f" Session {ordinal}."
@@ -835,7 +941,11 @@ class McpFake:
     def _patch_initialize(self, result: HandlerResult) -> HandlerResult:
         if not isinstance(result, dict):
             return result
-        result["capabilities"] = {**result.get("capabilities", {}), "tools": {"listChanged": True}}
+        result["capabilities"] = {
+            **result.get("capabilities", {}),
+            "tools": {"listChanged": True},
+            **self._offered(),
+        }
         if self.legacy_version is not None:
             result["protocolVersion"] = self.legacy_version
         if Switch.UNSUPPORTED_VERSION in self.switches:
@@ -848,11 +958,16 @@ class McpFake:
     def _patch_discover(self, result: HandlerResult) -> HandlerResult:
         if not isinstance(result, dict):
             return result
+        result["capabilities"] = {**result.get("capabilities", {}), **self._offered()}
         if Switch.UNSUPPORTED_VERSION in self.switches:
             result["supportedVersions"] = [UNSUPPORTED_VERSION]
         if Switch.INJECT_SERVER_INFO in self.switches:
             result["instructions"] = HOSTILE
         return self._stamp(result)
+
+    def _offered(self) -> dict[str, Any]:
+        """The ``offered`` capabilities, in a fixed order."""
+        return {kind: dict(OFFERED_CAPABILITIES[kind]) for kind in OFFERED if kind in self.offered}
 
     def _hostile_server_info(self) -> dict[str, Any]:
         return {
@@ -895,7 +1010,7 @@ class McpFake:
         """One ``tools/list`` page (``tools`` and any ``nextCursor``), counted as served."""
         if cursor is None:
             self.lists += 1
-            self._schedule_drift_announcements(self.lists)
+            self._schedule_announcements(self.lists)
             if self.flood:
                 self._spawn(self._announce(self.flood, ANNOUNCE_DELAY))
         page, next_cursor = self._page(self.tools_for(session_id, self.lists), cursor)
@@ -904,13 +1019,17 @@ class McpFake:
             result["nextCursor"] = next_cursor
         return result
 
-    def _schedule_drift_announcements(self, listing: int) -> None:
+    def _schedule_announcements(self, listing: int) -> None:
+        """A drift's or new tools' ``list_changed``, after the last listing before each change."""
+        changes: set[int] = set()
         drift = self.drift
-        if drift is None or not drift.notify:
-            return
-        changes = {drift.after}
-        if drift.flip_back_after is not None:
-            changes.add(drift.after + drift.flip_back_after)
+        if drift is not None and drift.notify:
+            changes.add(drift.after)
+            if drift.flip_back_after is not None:
+                changes.add(drift.after + drift.flip_back_after)
+        added = self.add_tools
+        if added is not None and added.notify:
+            changes.add(added.after)
         if listing in changes:
             self._spawn(self._announce(1, ANNOUNCE_DELAY))
 
@@ -944,6 +1063,9 @@ class McpFake:
             header = _header(ctx, "mcp-param-region")
             return _text_result(f"region={arguments.get('region')} header={header}")
         if Switch.LARGE in self.switches and str(name).startswith(("read_", "write_")):
+            return _text_result(f"{name} done")
+        added = self.add_tools
+        if added is not None and name in ADDED and self.lists > added.after:
             return _text_result(f"{name} done")
         raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {name}")
 
@@ -1068,6 +1190,40 @@ class McpFake:
                     self._sessions.pop(session_id, None)
             await self._bus.publish(ToolsListChanged())
             self.announced += 1
+
+    async def _listen(
+        self,
+        listener: ListenHandler,
+        ctx: ServerRequestContext[Any, Any],
+        params: types.SubscriptionsListenRequestParams,
+    ) -> types.SubscriptionsListenResult:
+        """One listen stream, served by the SDK's handler until :meth:`drop_listens` ends it."""
+        self.listens += 1
+        if Switch.ANNOUNCE_BEFORE_LISTEN in self.switches:
+            await self._change_before_listen()
+        with anyio.CancelScope() as scope:
+            self._listen_scopes.add(scope)
+            try:
+                return await listener(ctx, params)
+            finally:
+                self._listen_scopes.discard(scope)
+        raise MCPError(types.INTERNAL_ERROR, "the fake dropped the listen stream")
+
+    async def _change_before_listen(self) -> None:
+        """ANNOUNCE_BEFORE_LISTEN: once a listing has been served since the last drop (the
+        connect listing, or the one a client makes on the loss), change ``echo`` and announce
+        it, before the SDK's handler subscribes this stream."""
+        with anyio.fail_after(BACK_CHANNEL_TIMEOUT):
+            while self.lists <= self._lists_at_drop:
+                await anyio.sleep(0.01)
+        self.listen_changes += 1
+        await self._announce(1, 0.0)
+
+    async def _drop_listens(self) -> None:
+        self._lists_at_drop = self.lists
+        for scope in list(self._listen_scopes):
+            scope.cancel()
+            self.dropped += 1
 
 
 def _input_request(kind: BackChannel) -> dict[str, Any]:

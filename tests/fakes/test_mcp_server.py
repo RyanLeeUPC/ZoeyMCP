@@ -16,6 +16,7 @@ import mcp_types as types
 import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.client.subscriptions import SubscriptionLost
 from mcp.server.session import ServerSession
 from mcp.shared.exceptions import MCPError
 from starlette.types import Message
@@ -27,6 +28,7 @@ from zoeymcp.vault.request import MAX_STREAM_EVENT_BYTES, scrub, secret_variants
 from . import run_mcp_server
 from .harness import serve
 from .mcp_server import (
+    ADDED,
     ANNOUNCE_DELAY,
     ANSI,
     AS_WELL_KNOWN,
@@ -46,6 +48,8 @@ from .mcp_server import (
     LARGE_WARNED,
     MIB,
     MODERN_VERSION,
+    OFFERED,
+    OFFERED_CAPABILITIES,
     OTHER_AS,
     PRIVATE_METADATA,
     PRM_WELL_KNOWN,
@@ -56,15 +60,18 @@ from .mcp_server import (
     TAG_TEXT,
     UNSUPPORTED_VERSION,
     ZERO_WIDTH,
+    AddTools,
     BackChannel,
     BackChannelAnswer,
     BackChannelStream,
     Drift,
     DriftMember,
     McpFake,
+    Offered,
     Recorded,
     Switch,
     _read_body,
+    added_tools,
     apply_drift,
     base_tools,
     encoded_event,
@@ -657,6 +664,268 @@ async def test_a_duplicate_tool() -> None:
     tools = response.json()["result"]["tools"]
     assert [tool["name"] for tool in tools] == [*BASE_NAMES, "echo"]
     assert tools[0]["description"] != tools[-1]["description"]
+
+
+# --- drift review and the new-tool signal (M6 design O.1) ---------------------------------------
+
+
+@pytest.mark.parametrize("member", DRIFT_MEMBERS)
+async def test_change_tool_then_flip_back(member: DriftMember) -> None:
+    """The change shows from the next listing, in the same session, until the flip back."""
+    fake = McpFake()
+    with running(fake) as url:
+        async with connect(url, mode="legacy") as client:
+            reviewed = dumped(await client.list_tools())
+            fake.change_tool(member)
+            changed = dumped(await client.list_tools())
+            again = dumped(await client.list_tools())
+            fake.flip_back()
+            back = dumped(await client.list_tools())
+    assert reviewed == back == wire_tools(base_tools())
+    assert changed == again == wire_tools(apply_drift(base_tools(), member))
+    assert fake.tool_change is None
+    assert fake.announced == 0
+
+
+def test_change_tool_changes_the_description_by_default() -> None:
+    fake = McpFake()
+    fake.change_tool()
+    assert fake.tool_change == "description"
+    assert fake.tools_for(None, 1) == apply_drift(base_tools(), "description")
+
+
+async def test_a_changed_tool_is_announced_when_asked() -> None:
+    fake = McpFake()
+    with running(fake) as url:
+        async with connect(url) as client, client.listen(tools_list_changed=True) as events:
+            await client.list_tools()
+            fake.change_tool("annotations")
+            await anyio.to_thread.run_sync(fake.announce)
+            with anyio.fail_after(5):
+                event = await events.__anext__()
+            after = dumped(await client.list_tools())
+    assert type(event).__name__ == "ToolsListChanged"
+    assert after == wire_tools(apply_drift(base_tools(), "annotations"))
+
+
+def test_the_added_tools() -> None:
+    added = added_tools()
+    assert tuple(tool["name"] for tool in added) == ADDED
+    assert not set(ADDED) & set(BASE_NAMES)
+    annotations = [tool.get("annotations") for tool in added]
+    assert annotations == [
+        {"readOnlyHint": True},
+        {"readOnlyHint": False, "destructiveHint": True},
+        None,
+    ]
+    limits = GatewayLimits()
+    assert all(f.level != "error" for tool in added for f in tool_findings(tool, limits))
+
+
+async def test_add_tools_lists_more_tools_after_n_listings() -> None:
+    fake = McpFake(add_tools=AddTools(after=2))
+    with running(fake) as url:
+        async with connect(url) as client:
+            listings = [dumped(await client.list_tools()) for _ in range(2)]
+            # Not served before it is listed.
+            early = modern_post(url, "tools/call", {"name": "purge", "arguments": {}})
+            listings.append(dumped(await client.list_tools()))
+            purged = text_of(await client.call_tool("purge", {}))
+    assert listings[0] == listings[1] == wire_tools(base_tools())
+    assert listings[2] == wire_tools([*base_tools(), *added_tools()])
+    assert early.json()["error"]["message"] == "Unknown tool: purge"
+    assert purged == "purge done"
+    assert fake.announced == 0
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_added_tools_announced(mode: str) -> None:
+    fake = McpFake(add_tools=AddTools(after=1, notify=True))
+    notifications = Notifications()
+    with running(fake) as url:
+        async with connect(url, mode=mode, message_handler=notifications) as client:
+            if mode == "legacy":
+                await until(
+                    lambda: any(r.method == "GET" and r.status == 200 for r in fake.received)
+                )
+                before = dumped(await client.list_tools())
+                await until(lambda: notifications.count("notifications/tools/list_changed") == 1)
+            else:
+                async with client.listen(tools_list_changed=True) as events:
+                    before = dumped(await client.list_tools())
+                    with anyio.fail_after(5):
+                        await events.__anext__()
+            after = dumped(await client.list_tools())
+    assert before == wire_tools(base_tools())
+    assert [tool["name"] for tool in after] == [*BASE_NAMES, *ADDED]
+    assert fake.announced == 1
+
+
+async def test_added_tools_are_unknown_without_the_setting() -> None:
+    fake = McpFake()
+    with running(fake) as url:
+        response = modern_post(url, "tools/call", {"name": "purge", "arguments": {}})
+    assert response.json()["error"]["message"] == "Unknown tool: purge"
+
+
+# --- listen streams (M6 design K.4) -------------------------------------------------------------
+
+
+def changed_echo(times: int) -> list[dict[str, Any]]:
+    """The base tools after announce_before_listen's ``times``-th change."""
+    tools = base_tools()
+    tools[0]["description"] += f" Changed before listen stream {times}."
+    return wire_tools(tools)
+
+
+async def test_announce_before_listen_is_seen_by_no_stream() -> None:
+    """The change and its announcement come after the connect listing and before the stream
+    subscribes: the next listing shows the change, and the stream never hears of it."""
+    fake = McpFake(switches={Switch.ANNOUNCE_BEFORE_LISTEN})
+    with running(fake) as url:
+        async with connect(url) as client:
+            connected = dumped(await client.list_tools())
+            async with client.listen(tools_list_changed=True) as events:
+                subscribed = dumped(await client.list_tools())
+                with anyio.move_on_after(0.5) as quiet:
+                    await events.__anext__()
+    assert connected == wire_tools(base_tools())
+    assert subscribed == changed_echo(1)
+    assert quiet.cancelled_caught
+    assert (fake.listens, fake.listen_changes, fake.announced) == (1, 1, 1)
+
+
+async def test_announce_before_listen_waits_for_the_connect_listing() -> None:
+    """A stream asked for before any listing is held until one is served, so the change always
+    falls between the connect listing and the subscription."""
+    fake = McpFake(switches={Switch.ANNOUNCE_BEFORE_LISTEN})
+    subscribed = anyio.Event()
+    done = anyio.Event()
+
+    async def listen(client: Client) -> None:
+        async with client.listen(tools_list_changed=True):
+            subscribed.set()
+            await done.wait()
+
+    with running(fake) as url:
+        async with connect(url) as client, anyio.create_task_group() as group:
+            group.start_soon(listen, client)
+            await until(lambda: fake.listens == 1)
+            held = (subscribed.is_set(), fake.announced)
+            connected = dumped(await client.list_tools())
+            with anyio.fail_after(5):
+                await subscribed.wait()
+            after = dumped(await client.list_tools())
+            done.set()
+    assert held == (False, 0)
+    assert connected == wire_tools(base_tools())
+    assert after == changed_echo(1)
+
+
+async def test_a_dropped_stream_is_lost_and_the_reopen_misses_a_change() -> None:
+    """A dropped stream is lost. A reopen asked for before the listing a client makes on the
+    loss is held until that listing is served, so its change always falls between that listing
+    and the subscription, and the reopened stream never hears of it."""
+    fake = McpFake(switches={Switch.ANNOUNCE_BEFORE_LISTEN})
+    subscribed = anyio.Event()
+    quiet: list[bool] = []
+
+    async def reopen(client: Client) -> None:
+        async with client.listen(tools_list_changed=True) as events:
+            subscribed.set()
+            with anyio.move_on_after(0.5) as scope:
+                await events.__anext__()
+            quiet.append(scope.cancelled_caught)
+
+    with running(fake) as url:
+        async with connect(url) as client:
+            await client.list_tools()
+            async with client.listen(tools_list_changed=True) as events:
+                first = dumped(await client.list_tools())
+                await anyio.to_thread.run_sync(fake.drop_listens)
+                with anyio.fail_after(5), pytest.raises(SubscriptionLost):
+                    await events.__anext__()
+            async with anyio.create_task_group() as group:
+                group.start_soon(reopen, client)
+                await until(lambda: fake.listens == 2)
+                held = (subscribed.is_set(), fake.listen_changes, fake.announced)
+                # The listing a client makes on the loss, served after the reopen is asked for.
+                on_loss = dumped(await client.list_tools())
+                with anyio.fail_after(5):
+                    await subscribed.wait()
+                reopened = dumped(await client.list_tools())
+    assert held == (False, 1, 1)
+    assert first == on_loss == changed_echo(1)
+    assert reopened == changed_echo(2)
+    assert quiet == [True]
+    assert (fake.listens, fake.dropped, fake.listen_changes, fake.announced) == (2, 1, 2, 2)
+    # On the wire, the dropped stream ends with an error, not the graceful close's result.
+    dropped = sse_messages(fake.requests("subscriptions/listen")[0].response.decode())
+    assert dropped[0]["method"] == "notifications/subscriptions/acknowledged"
+    assert dropped[-1]["error"]["code"] == types.INTERNAL_ERROR
+
+
+async def test_drop_listens_without_the_switch_changes_nothing() -> None:
+    fake = McpFake()
+    with running(fake) as url:
+        async with connect(url) as client:
+            async with client.listen(tools_list_changed=True) as events:
+                await anyio.to_thread.run_sync(fake.drop_listens)
+                with anyio.fail_after(5), pytest.raises(SubscriptionLost):
+                    await events.__anext__()
+            async with client.listen(tools_list_changed=True) as events:
+                await anyio.to_thread.run_sync(fake.announce)
+                with anyio.fail_after(5):
+                    event = await events.__anext__()
+            listing = dumped(await client.list_tools())
+    assert type(event).__name__ == "ToolsListChanged"
+    assert listing == wire_tools(base_tools())
+    assert (fake.listens, fake.dropped, fake.listen_changes) == (2, 1, 0)
+    with pytest.raises(RuntimeError, match="not running"):
+        McpFake().drop_listens()
+
+
+# --- offered (M6 design J.1) --------------------------------------------------------------------
+
+# A request each offered capability would be used through, with valid params.
+SERVED_BY: dict[Offered, tuple[str, dict[str, Any]]] = {
+    "prompts": ("prompts/list", {}),
+    "resources": ("resources/list", {}),
+    "completions": (
+        "completion/complete",
+        {"ref": {"type": "ref/prompt", "name": "notes"}, "argument": {"name": "q", "value": ""}},
+    ),
+    "logging": ("logging/setLevel", {"level": "info"}),
+}
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+@pytest.mark.parametrize("kind", OFFERED)
+async def test_offered_advertises_a_capability_it_never_serves(mode: str, kind: Offered) -> None:
+    fake = McpFake(offered={kind})
+    with running(fake) as url:
+        async with connect(url, mode=mode) as client:
+            capabilities = client.server_capabilities.model_dump(
+                by_alias=True, exclude_none=True, mode="json"
+            )
+            tools = [tool.name for tool in (await client.list_tools()).tools]
+        served = modern_post(url, *SERVED_BY[kind])
+    assert capabilities[kind] == OFFERED_CAPABILITIES[kind]
+    assert {name for name in OFFERED if name in capabilities} == {kind}
+    assert capabilities["tools"] == {"listChanged": True}
+    assert tools == BASE_NAMES
+    assert served.json()["error"]["code"] == types.METHOD_NOT_FOUND
+
+
+async def test_all_four_offered_and_none_by_default() -> None:
+    offered = McpFake(offered=set(OFFERED))
+    plain = McpFake()
+    with running(offered) as url:
+        all_four = modern_post(url, "server/discover").json()["result"]["capabilities"]
+    with running(plain) as url:
+        none = modern_post(url, "server/discover").json()["result"]["capabilities"]
+    assert {kind: all_four[kind] for kind in OFFERED} == OFFERED_CAPABILITIES
+    assert not set(OFFERED) & set(none)
 
 
 # --- injection ----------------------------------------------------------------------------------
