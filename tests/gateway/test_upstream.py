@@ -149,18 +149,35 @@ async def test_a_flip_back_stays_hidden(tmp_path: Path, quick: None) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("era", "interval", "unchanged", "triggers"),
+    [
+        # A modern connection also lists once its listen stream is open (M6 design K.4), well
+        # before the first timer, so the drift comes after that listing.
+        ("auto", 1.0, 2, ["connect", "subscribed", "timer"]),
+        ("legacy", 0.2, 1, ["connect", "timer"]),
+    ],
+)
 async def test_silent_drift_is_caught_by_the_timer(
-    tmp_path: Path, quick: None, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    quick: None,
+    monkeypatch: pytest.MonkeyPatch,
+    era: str,
+    interval: float,
+    unchanged: int,
+    triggers: list[str],
 ) -> None:
-    monkeypatch.setattr(upstream.Connection, "relist_interval", lambda self: 0.2)
-    fake = McpFake(drift=Drift("parameter", after=1, notify=False))
-    with deployment(tmp_path, fake, include=TOOLS, review=review(fake)) as deployed:
+    monkeypatch.setattr(upstream.Connection, "relist_interval", lambda self: interval)
+    fake = McpFake(drift=Drift("parameter", after=unchanged, notify=False))
+    options = {"include": TOOLS, "review": review(fake), "era": era}
+    with deployment(tmp_path, fake, **options) as deployed:
         async with pool_for(deployed) as pool:
             connection = pool.connection(SERVER, deployed.server, CLIENTS[0])
             await pool.wait_ready(connection)
             await until(lambda: pool.marks.for_server(SERVER))
     assert fake.announced == 0
-    assert [line["trigger"] for line in deployed.events("listing")][:2] == ["connect", "timer"]
+    listed = [line["trigger"] for line in deployed.events("listing")]
+    assert listed[: len(triggers)] == triggers
 
 
 async def test_per_session_drift_is_caught_on_that_session(tmp_path: Path, quick: None) -> None:

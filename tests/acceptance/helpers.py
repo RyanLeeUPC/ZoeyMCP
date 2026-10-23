@@ -101,17 +101,23 @@ async def listening(seen: Seen, fake: McpFake, since: Mark = START) -> None:
     vault picked for it: a token the test may expire (moving the clock) or drop meanwhile. The
     server then answers 401, the vault drops the token or sees a newer one, and the gateway
     takes the stream as lost and lists again, COALESCE (5 s) after its last listing, its calls
-    waiting for that. Once the streams are open, no request is on its way when the test moves
-    the clock or drops the tokens. A connection that has closed since (a review's) is left out.
+    waiting for that. A modern connection also lists once its stream is open (M6 design K.4),
+    COALESCE after its connect listing, so that listing is waited for too. Once the streams are
+    open and listed, no request is on its way when the test moves the clock or drops the tokens.
+    A connection that has closed since (a review's) is left out.
     """
     deadline = anyio.current_time() + 10
     while True:
         opened: dict[str, str] = {}
+        subscribed: set[str] = set()
         for line in seen.events()[since.lines :]:
             if line["event"] == "upstream_connected":
                 opened[line["key"]] = line["era"]
+                subscribed.discard(line["key"])
             elif line["event"] == "upstream_closed":
                 opened.pop(line["key"], None)
+            elif line["event"] == "listing" and line["trigger"] == "subscribed":
+                subscribed.add(line["key"])
         received = fake.received[since.received :]
         listens = [item.status for item in received if item.rpc_method == "subscriptions/listen"]
         streams = [
@@ -120,9 +126,11 @@ async def listening(seen: Seen, fake: McpFake, since: Mark = START) -> None:
         modern = sum(1 for era in opened.values() if era == "modern")
         legacy = len(opened) - modern
         answered = [status for status in [*listens, *streams] if status]
-        if opened and listens.count(200) >= modern and streams.count(200) >= legacy:
+        listed = all(key in subscribed for key, era in opened.items() if era == "modern")
+        if opened and listens.count(200) >= modern and streams.count(200) >= legacy and listed:
             break
         if anyio.current_time() > deadline:
-            raise AssertionError(json.dumps({"opened": opened, "streams": answered}))
+            found = {"opened": opened, "streams": answered, "subscribed": sorted(subscribed)}
+            raise AssertionError(json.dumps(found))
         await anyio.sleep(0.01)
     assert answered == [200] * len(answered), answered

@@ -17,10 +17,20 @@ import httpx
 import pytest
 
 from tests.fakes.mcp_server import C1_CSI, ZERO_WIDTH, Drift, McpFake, Switch
-from tests.gateway.rig import SERVER, Running, agent, deployment, gateway, pin_of_fake, raw_policy
+from tests.gateway.rig import (
+    SERVER,
+    Running,
+    agent,
+    deployment,
+    gateway,
+    pin_of_fake,
+    raw_policy,
+    until,
+)
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy, check_policy
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.gateway import upstream
 
 pytestmark = pytest.mark.anyio
 
@@ -278,13 +288,16 @@ async def test_an_unassigned_server_can_be_reviewed_first(
 
 
 async def test_the_summary_and_status_make_no_upstream_call(
-    tmp_path: Path, cli: Callable[[Running], Cli]
+    tmp_path: Path, cli: Callable[[Running], Cli], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(upstream, "COALESCE", 0.0)
     fake = McpFake()
     options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake), "servers": TOOLKIT}
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         async with agent(running) as client:
             await client.list_tools()
+        # The modern connection lists again once its listen stream is open (M6 design K.4).
+        await until(lambda: any(e["trigger"] == "subscribed" for e in deployed.events("listing")))
         run = cli(running)
         listed = fake.lists
         summary = run("review")

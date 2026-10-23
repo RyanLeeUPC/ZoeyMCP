@@ -1171,7 +1171,9 @@ read at all, and the review fails `review_too_large`, naming the cap. Its log li
 | `review_timeout` | `server`, `job`: the gateway took it and sent no result within 2 minutes |
 
 The gateway's side: it polls with the digest of the policy view it holds, so a job queued at
-another view waits for it to catch up (or fails `review_stale`), and posts the report fitted to
+another view waits for it to catch up (or fails `review_stale`). A poll at the vault's view ends
+as soon as a reload changes that view, so a review asked for right after a reload starts at once;
+a poll at an older view waits as before. The gateway posts the report fitted to
 the vault's caps (an odd tool's long text or oversized definition is cut and marked, never a
 reason to refuse the server's report). A report over the vault's cap isn't sent: the job fails
 `review_too_large`. A post that fails is tried twice more within the 2 minutes, then dropped; a
@@ -1348,9 +1350,11 @@ session idle timeout takes a gateway restart (`limits_change_needs_restart`).
   request it makes), so give it its directories on its command line. Under `shared_session: true`
   every client shares one legacy child, and a modern bridge always runs one child, which every
   client shares. A legacy bridge's restart is caught at the gateway's next request (it gets 404, opens a
-  new session, lists and compares the pins); a modern bridge's only at the drift timer (300 s), as
-  for any modern server. A standard-tier bridge is unconfined; only the hardened tier limits
-  where a bridge's program connects.
+  new session, lists and compares the pins); a modern bridge's when the listen stream the gateway
+  keeps open through it ends: the gateway lists and compares the pins then, and again once it has
+  opened the stream again, about 5 seconds later (listings of one connection are at least 5 s
+  apart), as for any modern server. A standard-tier bridge is unconfined; only the hardened tier
+  limits where a bridge's program connects.
 
 ## 18. Troubleshooting the gateway
 
@@ -3169,7 +3173,10 @@ through the role only to its egress list in A, and anywhere in B and C. A bridge
   every client shares one; in the modern era every client always shares the one child.
 - A legacy bridge's restart is noticed at the gateway's next request, which gets 404, opens a
   new session, lists and compares the pins: a changed tool is marked and hidden until
-  `review --repin` (§12). A modern bridge's restart is noticed only at the drift timer (300 s).
+  `review --repin` (§12). A modern bridge's restart ends the listen stream the gateway keeps open
+  through it, so it is noticed when the stream ends and again when the gateway opens it again,
+  about 5 seconds later (listings of one connection are at least 5 s apart), and a changed tool
+  is marked and hidden the same way.
 - Its program's stderr is logged as line and byte counts by default, since programs commonly
   print their configuration. `--stderr text` logs the lines themselves and may show `--env`
   values: turn it on only to debug.

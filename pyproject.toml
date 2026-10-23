@@ -177,6 +177,7 @@ only_mutate = [
     "*zoeymcp/gateway/egressrules.py",
     "*zoeymcp/gateway/approvals.py",
     "*zoeymcp/gateway/reporting.py",
+    "*zoeymcp/gateway/capabilities.py",
     "*zoeymcp/vault/connectors/mailmsg.py",
     "*zoeymcp/vault/connectors/tunnel.py",
     "*zoeymcp/vault/connectors/smtpflow.py",

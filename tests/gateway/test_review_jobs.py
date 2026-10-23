@@ -73,6 +73,7 @@ from zoeymcp.gateway.vaultlink import (
     UpstreamRedirect,
     parse_link,
     review_client,
+    view_client,
 )
 from zoeymcp.vault import internal, reviewjobs
 from zoeymcp.vault.admin import AdminApp, SetupCodes
@@ -87,6 +88,8 @@ LINKS = ["tcp", pytest.param("unix", marks=pytest.mark.skipif(
 ))]  # fmt: skip
 LINK = "unix:/run/zoeymcp-link/vault.sock"
 SENTINEL = "review-description-sentinel"
+# FM-24: from a review queued right after a reload to its report (K.5).
+STARTS_WITHIN = 2.0
 
 
 @pytest.fixture
@@ -821,6 +824,84 @@ async def test_stale_view_gets_no_job(rig: InProcess) -> None:
     again = await rig.queue()
     await run_one(rig, poller, gateway)
     assert (await rig.read(again)).json()["state"] == "done"
+
+
+def policy_at(era: str) -> Policy:
+    """The notes policy with ``era``: each one a view of its own."""
+    return Policy.model_validate(raw_policy("http://127.0.0.1:9", include=[], review={}, era=era))
+
+
+async def held(snapshot: Snapshot, previous: Snapshot | None) -> None:
+    """The policy client's apply: the poller reads the snapshot it holds, nothing more."""
+
+
+async def test_review_after_reload(rig: InProcess, log: io.StringIO) -> None:
+    """FM-24 (D-189): a poll at the vault's view ends once a reload changes it, so a review
+    queued right after starts within about a second, and not when the old poll's 25 s run out.
+    The gateway's policy client fetches the new view over the same in-process link, after the
+    poller has seen the poll end, so the poller's catch-up is what names the new view. A poll at
+    a view the vault no longer serves still waits, through another change too, so a gateway
+    behind the vault can't spin."""
+    link = parse_link(LINK)
+    views = view_client(link, None, inner=httpx2.ASGITransport(app=rig))
+    gateway = Stub(PolicyClient(views, held))
+    gateway.hold(rig.view)
+    old = gateway.snapshot
+    poller = ReviewPoller(
+        gateway, rig.client(), run_review=reviewing(lambda: answer_for(rig.view, "list_notes"))
+    )
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as group:
+            # The poll waits before the view's long poll, so the vault answers it first and the
+            # poller sees its answer before the policy client holds the new view.
+            group.start_soon(poller.run)
+            await until(lambda: rig.jobs.waiting == 1)
+            group.start_soon(gateway.policy.run)
+            await until(lambda: rig.vault.view_waiters == 1)
+            rig.vault.reload(policy_at("modern"))
+            job_id = await rig.queue()
+            await until(lambda: events(log, "review_job_done"), timeout=STARTS_WITHIN)
+            group.cancel_scope.cancel()
+        assert (await rig.read(job_id)).json()["state"] == "done"
+        assert gateway.snapshot.view.digest == rig.view.digest
+        [done] = events(log, "review_job_done")
+        assert (done["job"], done["outcome"]) == (hash8(job_id), "done")
+
+        # A gateway still at the first view: its poll waits through the vault's next change.
+        rig.vault.reload(policy_at("legacy"))
+        behind = ReviewPoller(gateway, rig.client())
+        async with anyio.create_task_group() as group:
+            group.start_soon(behind.poll_once, old)
+            await until(lambda: rig.jobs.waiting == 1)
+            rig.vault.reload(policy_at("modern"))
+            await anyio.wait_all_tasks_blocked()
+            assert rig.jobs.waiting == 1
+            group.cancel_scope.cancel()
+
+
+async def test_a_poll_at_the_vaults_view_waits_through_the_same_view_again(
+    rig: InProcess,
+) -> None:
+    """A reload that installs the view the poll names isn't a change: the poll goes on waiting,
+    and ends with none at the next real change (D-189)."""
+    gateway = stub(rig.view)
+    poller = ReviewPoller(gateway, rig.client())
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as group:
+            answered: list[tuple[Job, ...]] = []
+
+            async def poll() -> None:
+                answered.append(await poller.poll_once(gateway.snapshot))
+
+            group.start_soon(poll)
+            await until(lambda: rig.jobs.waiting == 1)
+            rig.vault.reload(notes_policy())
+            await anyio.wait_all_tasks_blocked()
+            assert (rig.jobs.waiting, answered) == (1, [])
+            rig.vault.reload(policy_at("modern"))
+            await until(lambda: answered, timeout=STARTS_WITHIN)
+    assert answered == [()]
+    assert rig.jobs.waiting == 0
 
 
 async def test_report_path_down(rig: InProcess, log: io.StringIO) -> None:

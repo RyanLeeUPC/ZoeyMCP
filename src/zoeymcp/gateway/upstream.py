@@ -483,7 +483,9 @@ class Connection:
                 await anyio.sleep(wait)
             self._list_wanted = anyio.Event()
             trigger = self._list_trigger
-            await self._list(trigger, timer=trigger == "timer")
+            # The timer's and a stream open's listings are background re-lists: a failure keeps
+            # a READY connection's grace (on_timer_failed) instead of failing it.
+            await self._list(trigger, timer=trigger in ("timer", "subscribed"))
 
     def relist_interval(self) -> float:
         interval = float(self.policy.drift_check_interval)
@@ -506,6 +508,12 @@ class Connection:
             try:
                 async with client.listen(tools_list_changed=True) as subscription:
                     delay = 1.0
+                    # A change announced before the stream was acknowledged reached no stream:
+                    # list once it is open, and on every reopen (D-46). Not change(), which
+                    # would hold calls until the listing; a listing already wanted absorbs it
+                    # and keeps its trigger.
+                    if not self._list_wanted.is_set():
+                        self.want_listing("subscribed")
                     async for _event in subscription:
                         self.change("list_changed")
             except ListenNotSupportedError:

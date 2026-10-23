@@ -1102,7 +1102,12 @@ class VaultApp:
         """``GET /_zoeymcp/gateway/v1/review/jobs?wait=N&view=<digest>``: the jobs queued at the
         view digest the gateway's policy client holds, now ``sent``, once there are any, or
         none after N seconds (at most 25), at shutdown, or when the caller leaves. One poll
-        waits at a time (429); while it waits the poller counts as seen (CR-15)."""
+        waits at a time (429); while it waits the poller counts as seen (CR-15).
+
+        A poll at the view served when it began also ends, with none, once the view changes,
+        so the gateway polls again at its new view and a review queued right after a reload
+        doesn't wait out the poll (D-189, M6 design K.5). A poll at a view no longer served (a
+        gateway still behind) waits as before, so a lagging gateway can't spin."""
         try:
             wait, digest = internal.jobs_query(parse_query(request.scope.get("query_string", b"")))
         except RequestRejected as exc:
@@ -1114,20 +1119,31 @@ class VaultApp:
         # A queue call waiting for the first poll after the vault started goes on (OPS-20).
         self._wake_reviews()
         gone = asyncio.ensure_future(_disconnected(request.receive))
+        # Set by the next install, if this poll is at the view served now.
+        view_changed = self._view_changed if digest == self._view.digest else None
         left = False
         try:
             deadline = table.now() + wait
             while not table.offered(digest) and not self._view_stopping:
+                if view_changed is not None and view_changed.is_set():
+                    if self._view.digest != digest:
+                        break
+                    view_changed = self._view_changed  # the same view installed again
                 remaining = deadline - table.now()
                 if remaining <= 0:
                     break
                 changed = asyncio.ensure_future(self._reviews_changed.wait())
+                waits = [changed, gone]
+                if view_changed is not None:
+                    waits.append(asyncio.ensure_future(view_changed.wait()))
                 try:
                     await asyncio.wait(
-                        (changed, gone), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                        waits, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
                     )
                 finally:
-                    changed.cancel()
+                    for waiting in waits:
+                        if waiting is not gone:
+                            waiting.cancel()
                 if gone.done():
                     left = log["disconnected"] = True
                     break

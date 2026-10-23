@@ -53,7 +53,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway, ViewToolkitServer
-from . import access, logs, pipeline
+from . import access, capabilities, logs, pipeline
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
 from .committed import Committed
@@ -919,9 +919,12 @@ class GatewayApp:
     async def _listen(
         self, ctx: ServerRequestContext[Any], params: SubscriptionsListenRequestParams
     ) -> SubscriptionsListenResult:
+        """An agent's listen stream, asking only for what this path sends (M6 design K.4): the
+        SDK's handler acknowledges every kind it is asked for."""
         request = _scope()
         handler = self.notifier.listen_handler(request.client, request.server)
-        result: SubscriptionsListenResult = await handler(ctx, params)
+        asked = capabilities.honored(params, capabilities.TOOLS_ONLY)
+        result: SubscriptionsListenResult = await handler(ctx, asked)
         return result
 
     def _input_schema(self, name: str) -> dict[str, Any] | None:

@@ -3,10 +3,14 @@
 The listing needs the SDK, which only the gateway runs, and the vault never connects to the
 gateway (X12), so the gateway asks for work. One task, beside the policy client and the reporter,
 long-polls the jobs path with the digest of the view its policy client holds; the vault answers
-as soon as a job queued at that digest exists, or with none after 25 s. For each job the poller
-checks that the server is a policy name in that view, runs the same review as ``zoeymcp review``
-(:func:`.review.review`, any server kind) under ``app.reviewing``, the lock the admin socket's
-review takes, so one review runs at a time, and posts the result to the report path:
+as soon as a job queued at that digest exists, or with none after 25 s, or at once when its view
+changes (D-189). The policy client may not hold the new view yet when that answer comes, and a
+poll at a view the vault no longer serves waits its whole 25 s, so after a poll the vault ended
+early with nothing the poller waits up to :data:`VIEW_CATCH_UP` for another view first. For
+each job the poller checks that the server is a policy name in that view, runs the same review as
+``zoeymcp review`` (:func:`.review.review`, any server kind) under ``app.reviewing``, the lock the
+admin socket's review takes, so one review runs at a time, and posts the result to the report
+path:
 
 - ``{"v": 1, "job", "server", "report"}``: the review's answer through
   :func:`~zoeymcp.common.reviewreport.fit` under the view's limits, so one odd tool can't make
@@ -57,6 +61,9 @@ POST_TRIES: Final = 3  # a post, and two retries
 # CLAIM_DEADLINE, which the gateway can't import): retries stop there.
 CLAIM_DEADLINE: Final = 120.0
 NO_VIEW_WAIT: Final = 1.0  # before the first view, a poll would have no digest to name
+# After a poll the vault ended early with nothing: how long, and how often, to look for a new view.
+VIEW_CATCH_UP: Final = 1.0
+VIEW_CATCH_UP_STEP: Final = 0.05
 TOO_LARGE: Final = "review_too_large"
 # A job ID the vault issued (43 URL-safe characters) and its post may name (at most 64).
 _JOB_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -181,6 +188,7 @@ class ReviewPoller:
             if snapshot is None:
                 await self._sleep(NO_VIEW_WAIT)
                 continue
+            began = self._clock()
             try:
                 jobs = await self.poll_once(snapshot)
             except _Failed as failed:
@@ -192,10 +200,22 @@ class ReviewPoller:
                 claimed = self._clock()
                 for job in jobs:
                     await self.run_job(job, snapshot, claimed)
+                if not jobs and claimed - began < self._wait:
+                    await self._catch_up(snapshot)
                 continue
             self._failures += 1
             self._poll_failed(reason)
             await self._sleep(backoff(self._failures, 0.5 + self._jitter()))
+
+    async def _catch_up(self, polled: Snapshot) -> None:
+        """Wait up to :data:`VIEW_CATCH_UP` for the policy client to hold a view other than
+        ``polled``'s, so the next poll names the vault's view (D-189, M6 design K.5)."""
+        deadline = self._clock() + VIEW_CATCH_UP
+        while self._clock() < deadline:
+            snapshot: Snapshot | None = self._app.policy.snapshot
+            if snapshot is None or snapshot.view.digest != polled.view.digest:
+                return
+            await self._sleep(VIEW_CATCH_UP_STEP)
 
     async def poll_once(self, snapshot: Snapshot) -> tuple[Job, ...]:
         """One poll at ``snapshot``'s digest: the jobs it claimed, or :class:`_Failed`."""

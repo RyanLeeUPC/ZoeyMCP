@@ -5,8 +5,9 @@ fake authorization server's live access tokens. Both fakes serve real TLS under 
 ``mcp.notes.example`` and ``auth.notes.example``, and every vault connection reaches them by name
 through the fake resolver's dial map (tests/fakes/resolver.py, BP-1), the address guard unchanged
 on every one of the vault's own guarded clients (M7 design B.2). The vault, the authorization
-server and the MCP server read one clock, so a test can let an access token expire, and the
-gateway's review poll is shortened (``short_review_polls``) so no review waits out a poll.
+server and the MCP server read one clock, so a test can let an access token expire. The
+gateway's review poll is the shipped 25 s one: the vault ends it when a reload changes the view,
+so a review queued right after waits out no poll (M6 design K.5).
 
 The operator starts from a policy with an agent and no server, and walks J1 with the real CLI:
 ``login --mcp`` (fragment 1), the fragment merged as ``check --with`` merges it, the reload,
@@ -82,7 +83,6 @@ from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
-from zoeymcp.gateway.reviewpoll import ReviewPoller
 from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import KeySource, parse_link, review_client, view_client
 from zoeymcp.portal.app import PortalApp, Secrets, load_static
@@ -163,17 +163,6 @@ def no_compose_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv(onboard_cli.REVIEW_SERVICE_ENV, raising=False)
-
-
-@pytest.fixture(autouse=True)
-def short_review_polls(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The gateway's review poll asks the vault to wait 1 s, not 25 s. A poll names the view the
-    gateway held when it began, and a job is claimed only at its own view (F.2), so a review
-    queued just after a reload otherwise waits out the poll begun before it: up to 25 s, which
-    every row would spend twice."""
-    defaults = ReviewPoller.__init__.__kwdefaults__
-    assert defaults is not None
-    monkeypatch.setitem(defaults, "wait", 1)
 
 
 # --- the fakes, by name ------------------------------------------------------------------------
