@@ -18,6 +18,8 @@ dependencies = [
     "certifi>=2026.10.19",
     "cryptography>=43",
     "httpx>=0.27",
+    # vault.netclient's guarded backend subclasses its network backend; declared, not only httpx's.
+    "httpcore>=1.0,<2",
     # common.policy.fields encodes hosts with it, as httpx does; declared, not only httpx's.
     "idna>=3.7",
     "pydantic>=2.9",
@@ -67,9 +69,11 @@ packages = ["src/zoeymcp"]
 # Supply-chain cooldown: resolve only releases older than this date. Move it forward
 # deliberately (about two weeks behind today) when updating the lock.
 exclude-newer = "2026-10-03T00:00:00Z"
-# One exception: certifi 2026.10.19 removes the emSign ECC Root CA - G3, whose intermediates
-# had compromised keys (GHSA-6q48-6c7w-9gw2, 2026-10-20). Drop it when exclude-newer passes it.
-exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
+# Two exceptions; drop each when exclude-newer passes it. certifi 2026.10.19 removes the emSign
+# ECC Root CA - G3, whose intermediates had compromised keys (GHSA-6q48-6c7w-9gw2, 2026-10-20).
+# opentelemetry-api 1.45.1 bounds tracestate parsing (GHSA-xcq7-p3pf-p88h, 2026-10-22); the
+# gateway drops the SDK's middleware that parses it, so the fix matters to scanners, not callers.
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z", opentelemetry-api = "2026-10-07T00:00:00Z" }
 
 [tool.ruff]
 line-length = 100

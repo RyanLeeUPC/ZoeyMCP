@@ -732,6 +732,20 @@ async def test_the_upstream_never_sees_the_agents_identity_or_metadata(tmp_path:
     assert initialize.params["capabilities"] == {}
 
 
+def test_the_gateways_server_drops_the_sdks_opentelemetry_middleware(tmp_path: Path) -> None:
+    """The SDK's default middleware parses an agent's traceparent and tracestate (the parser
+    behind GHSA-xcq7-p3pf-p88h) and makes them current upstream; the gateway's list replaces it."""
+    link = parse_link("http://127.0.0.1:9")
+    keys = KeySource(KEYS.gateway_key(1))
+    pool = UpstreamPool(link, keys, DriftMarks.load(tmp_path), DefinitionStore(tmp_path))
+    app = GatewayApp(pool, view_client(link, keys))
+    names = [
+        getattr(middleware, "__name__", type(middleware).__name__)
+        for middleware in app.server.middleware
+    ]
+    assert names == ["server_info_from_path", "_approval_retry_guard"]
+
+
 @pytest.mark.parametrize(
     "switch",
     [
