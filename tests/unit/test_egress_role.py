@@ -12,6 +12,7 @@ import asyncio
 import io
 import json
 import socket
+import time
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -556,6 +557,92 @@ async def test_resolve_and_connect_failures(lines: io.StringIO) -> None:
         "connect_failed",
     ]
     assert "address" in events(lines, "egress_refused")[2]
+
+
+def closed_port() -> int:
+    """A loopback port nothing listens on, so a connect to it is refused."""
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        port: int = spare.getsockname()[1]
+    return port
+
+
+def blackhole(monkeypatch: pytest.MonkeyPatch) -> int:
+    """A loopback port whose connects never answer, as a blackholed address's (a dropped
+    SYN): ``asyncio.open_connection`` to it waits until it is cancelled. Every other connect
+    is a real one. Called inside the rig, so no listener of the rig can take the port."""
+    hole = closed_port()
+    real = asyncio.open_connection
+
+    async def held(
+        host: Any = None, port: Any = None, **kwargs: Any
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if port == hole:
+            await asyncio.Event().wait()
+        return await real(host, port, **kwargs)
+
+    monkeypatch.setattr(asyncio, "open_connection", held)
+    return hole
+
+
+async def test_a_first_address_that_refuses_is_passed_over(lines: io.StringIO) -> None:
+    """D-208: when the first checked address refuses (an AAAA record with no working IPv6
+    route), the next is tried, in the resolver's order, with no second lookup; the tunnel
+    names the address it reached."""
+    with anyio.fail_after(30):
+        async with rig(lists={"vault": [("api.example", 443)]}) as r:
+            first, second = r.resolver.reserve(v6=True), r.resolver.reserve()
+            r.resolver.dials.update({first: closed_port(), second: r.echo})
+            r.resolver.answer("api.example", [first, second])
+            async with tunnel(r.port(), "api.example:443") as (reader, writer):
+                assert await echoes(reader, writer)
+    assert r.resolver.lookups == [("api.example", 443)]
+    assert r.resolver.dialled == [(first, 443), (second, 443)]
+    [tunnelled] = events(lines, "egress_tunnel")
+    assert tunnelled["address"] == second
+    assert refused(lines) == []
+
+
+async def test_a_blackholed_first_address_ends_at_the_deadline(
+    lines: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-207: a first address that never answers holds the connect until its one deadline,
+    then the role answers 502 ``connect_failed`` naming it. The deadline is the connect's, not
+    each address's, so the address after it isn't reached (Happy Eyeballs isn't built)."""
+    monkeypatch.setattr(connect, "CONNECT_TIMEOUT", 0.3)
+    with anyio.fail_after(30):
+        async with rig(lists={"vault": [("api.example", 443)]}) as r:
+            hole = blackhole(monkeypatch)
+            first, second = r.resolver.reserve(), r.resolver.reserve()
+            r.resolver.dials.update({first: hole, second: r.echo})
+            r.resolver.answer("api.example", [first, second])
+            started = time.monotonic()
+            assert await refusal(r.port(), "api.example:443") == 502
+            waited = time.monotonic() - started
+    assert waited >= 0.25
+    assert r.resolver.dialled == [(first, 443)]
+    [failed] = events(lines, "egress_refused")
+    assert (failed["reason"], failed["address"]) == ("connect_failed", first)
+    assert events(lines, "egress_tunnel") == []
+
+
+async def test_one_deadline_bounds_every_address(
+    lines: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-207: a refused first address, then two blackholed: the second spends what is left of
+    the one deadline and the third is never dialled (a deadline per address would wait two and
+    dial all three); the refusal names the address being tried when it passed."""
+    monkeypatch.setattr(connect, "CONNECT_TIMEOUT", 0.3)
+    with anyio.fail_after(30):
+        async with rig(lists={"vault": [("api.example", 443)]}) as r:
+            hole = blackhole(monkeypatch)
+            refusing, second, third = (r.resolver.reserve() for _ in range(3))
+            r.resolver.dials.update({second: hole, third: hole})  # no fake at the first
+            r.resolver.answer("api.example", [refusing, second, third])
+            assert await refusal(r.port(), "api.example:443") == 502
+    assert r.resolver.dialled == [(refusing, 443), (second, 443)]
+    [failed] = events(lines, "egress_refused")
+    assert (failed["reason"], failed["address"]) == ("connect_failed", second)
 
 
 async def test_bytes_sent_with_the_head_reach_the_destination(lines: io.StringIO) -> None:

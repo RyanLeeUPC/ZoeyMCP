@@ -10,7 +10,8 @@ mutation-tested; :mod:`.tunnel` reads, resolves, connects and copies around thes
 4. ``host:port`` is in it, as written (lower case, ASCII): 403 ``not_allowed``;
 5. one lookup, every address allowed (netguard, with the entry's private mark): 502
    ``resolve_failed`` or 403 ``address_refused``;
-6. a connect to the checked address: 502 ``connect_failed``;
+6. a connect to each checked address in turn, in the resolver's order, all within one
+   :data:`CONNECT_TIMEOUT`: 502 ``connect_failed`` when none connects (D-208, D-207);
 7. ``200 Connection established``, within the tunnel caps: 503 ``busy``.
 
 Every answer the role makes itself is :func:`answer`'s: ``Content-Length: 0``, no
@@ -179,12 +180,13 @@ def admit(lists: Lists | None, source: str, target: Target) -> bool | Refusal:
     return entries[target.key]
 
 
-def address(addresses: Sequence[str], private: bool) -> str | Refusal:
-    """Step 5: the address to connect to, if every address the lookup answered is allowed."""
-    verdict = netguard.addresses_allowed(addresses, private_ok=private)
+def addresses(answered: Sequence[str], private: bool) -> tuple[str, ...] | Refusal:
+    """Step 5: the addresses to try, in the resolver's order and once each, if every address
+    the lookup answered is allowed (D-208); the next is tried when one doesn't connect."""
+    verdict = netguard.addresses_allowed(answered, private_ok=private)
     if not verdict.allowed:
         return Refusal("address_refused", verdict.reason)
-    return str(verdict.address)  # the first address: allowed, so there is one
+    return tuple(dict.fromkeys(answered))  # allowed, so there is at least one
 
 
 def has_room(listener: int, total: int, per_listener: int) -> bool:

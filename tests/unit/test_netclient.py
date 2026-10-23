@@ -744,6 +744,75 @@ async def test_the_next_checked_address_is_tried_when_one_does_not_connect() -> 
             await backend.connect_tcp(LAN, 443)
 
 
+class Blackholed(httpcore.AsyncNetworkBackend):
+    """httpcore's own backend, except that a connect to the port ``hole`` never answers, as
+    one to a blackholed address: it waits out its own ``timeout`` and raises what httpcore's
+    does then."""
+
+    def __init__(self, hole: int) -> None:
+        self.hole, self.real = hole, httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if port == self.hole:
+            try:
+                with anyio.fail_after(timeout):
+                    await anyio.sleep_forever()
+            except TimeoutError as exc:
+                raise httpcore.ConnectTimeout(str(exc)) from exc
+        return await self.real.connect_tcp(host, port, timeout=timeout)
+
+
+async def test_one_connect_timeout_bounds_every_checked_address() -> None:
+    """D-207: ``timeout`` is the whole connect's, not each address's, through the ``dial``
+    seam. Two blackholed addresses before one that answers: an attempt per timeout would wait
+    two and connect to the third; one deadline raises ``ConnectTimeout`` when it passes, the
+    first address dialled first. Without a timeout the attempts are unbounded, as before (a
+    refused address before one that answers is the test above)."""
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        hole = spare.getsockname()[1]  # never connected to: Blackholed holds its connects
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        port = listener.getsockname()[1]
+        dialled: list[str] = []
+
+        async def lan(_host: str, _port: int) -> list[str]:
+            return ["10.0.0.5", "10.0.0.6", "10.0.0.7"]
+
+        def dial(address: str, _port: int) -> tuple[str, int]:
+            dialled.append(address)
+            return "127.0.0.1", port if address == "10.0.0.7" else hole
+
+        backend = netclient.GuardedBackend(lambda: {f"{LAN}:443"}, resolver=lan, dial=dial)
+        backend._backend = Blackholed(hole)  # type: ignore[assignment]
+        with anyio.fail_after(10):
+            started = anyio.current_time()
+            with pytest.raises(httpcore.ConnectTimeout):
+                await backend.connect_tcp(LAN, 443, timeout=0.5)
+            waited = anyio.current_time() - started
+        assert dialled[0] == "10.0.0.5"
+        assert waited >= 0.45  # the first address held the connect until the deadline
+        # Without a timeout nothing bounds the attempts, as before (a blackholed address would
+        # wait for ever): the first address that answers is connected to.
+        dialled.clear()
+
+        def answers(address: str, _port: int) -> tuple[str, int]:
+            dialled.append(address)
+            return "127.0.0.1", port
+
+        backend = netclient.GuardedBackend(lambda: {f"{LAN}:443"}, resolver=lan, dial=answers)
+        with anyio.fail_after(10):
+            stream = await backend.connect_tcp(LAN, 443, timeout=None)
+        await stream.aclose()
+        assert dialled == ["10.0.0.5"]
+
+
 # --- step 18b: local MCP routes and bridges' sockets (X3, FM-29, Q46) ----------------------------
 
 MCP_RULES = [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}]

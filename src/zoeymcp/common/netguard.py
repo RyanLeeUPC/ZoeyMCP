@@ -132,9 +132,9 @@ class AddressVerdict:
     """``allowed``, and why: ``global`` or ``private_ok`` when allowed (``local`` by
     :func:`local_only`); ``no_address``, ``unparsable`` or the refused address's class when not
     (``not_local`` by :func:`local_only` for a loopback or private address outside its tables).
-    ``address`` is the first address when allowed (the one to connect to) and the one that
-    refused otherwise. :func:`unix_peer` judges a socket's peer, not an address: ``bridge_uid``,
-    or ``unknown_socket`` or ``peer_uid``, with no address."""
+    ``address`` is the first address when allowed (each checked address is tried in turn,
+    D-208) and the one that refused otherwise. :func:`unix_peer` judges a socket's peer, not an
+    address: ``bridge_uid``, or ``unknown_socket`` or ``peer_uid``, with no address."""
 
     allowed: bool
     reason: str

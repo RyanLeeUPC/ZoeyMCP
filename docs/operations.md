@@ -2636,10 +2636,12 @@ zoeymcp egress --vault http://vault:8080 --listen vault=egress-vault:3128
   keepalives, so a vault that vanishes without closing it is noticed within 15 s.
 - Per connection: one `CONNECT host:port` head (8 KiB, 10 s), the `host:port` exactly as listed
   (lower case; a non-ASCII name is never listed), one lookup (5 s) whose every address is global
-  unless the entry is marked private, and a connect (10 s) to the address it checked, never a
-  second lookup. Tunnels close after `--idle-timeout` (900 s) idle or `--max-tunnel-seconds`
-  (86400) open, and at most `--max-tunnels` (256) run per listener, 1,024 in all. When the lists
-  change, a tunnel whose destination left its source's list is closed.
+  unless the entry is marked private, and a connect to the addresses it checked, never a
+  second lookup: each in turn, in the resolver's order, until one connects, all within 10 s
+  (an IPv6 address with no route is passed over for the next). Tunnels close after
+  `--idle-timeout` (900 s) idle or `--max-tunnel-seconds` (86400) open, and at most
+  `--max-tunnels` (256) run per listener, 1,024 in all. When the lists change, a tunnel whose
+  destination left its source's list is closed.
 - Every answer the role makes itself is empty, with `Content-Length: 0` and no
   `WWW-Authenticate` or `Proxy-Authenticate`. Any method but CONNECT is 405 with `Allow:
   CONNECT`, so plain http can't go through it.
@@ -2651,7 +2653,7 @@ zoeymcp egress --vault http://vault:8080 --listen vault=egress-vault:3128
 | `list_stale` | 503 | no list yet, or none fetched in the last 300 s |
 | `no_list`, `not_allowed` | 403 | the vault's lists don't name this listener's source, or don't list this `host:port` for it |
 | `resolve_failed`, `address_refused` | 502, 403 | the name didn't resolve in 5 s, or resolved to a private, loopback or otherwise non-global address the entry isn't marked private for (`verdict` names its class) |
-| `connect_failed` | 502 | no connection in 10 s |
+| `connect_failed` | 502 | no checked address connected within 10 s (`address` is the last one tried) |
 | `busy` | 503 | the listener's, or the role's, tunnel cap |
 
 Its log lines (`role: egress`):

@@ -16,7 +16,7 @@ from zoeymcp.egress.connect import (
     STATUS,
     Refusal,
     Target,
-    address,
+    addresses,
     admit,
     answer,
     has_room,
@@ -261,20 +261,25 @@ def test_a_non_ascii_host_is_never_allowed() -> None:
 # --- step 5: the addresses ------------------------------------------------------------------------
 
 
-def test_the_first_address_of_an_allowed_answer() -> None:
-    assert address(["11.0.0.1"], False) == "11.0.0.1"
-    assert address(["11.0.0.2", "11.0.0.1"], False) == "11.0.0.2"
-    assert address(["10.0.0.5"], True) == "10.0.0.5"
-    assert address(["11.0.0.2", "10.0.0.5"], True) == "11.0.0.2"
+def test_every_address_of_an_allowed_answer_in_the_resolvers_order() -> None:
+    """D-208: each address is tried in turn, so all of them, in order, once each."""
+    assert addresses(["11.0.0.1"], False) == ("11.0.0.1",)
+    assert addresses(["11.0.0.2", "11.0.0.1"], False) == ("11.0.0.2", "11.0.0.1")
+    assert addresses(["2a00:5a00::1", "11.0.0.1"], False) == ("2a00:5a00::1", "11.0.0.1")
+    assert addresses(["10.0.0.5"], True) == ("10.0.0.5",)
+    assert addresses(["11.0.0.2", "10.0.0.5"], True) == ("11.0.0.2", "10.0.0.5")
+    assert addresses(["11.0.0.2", "11.0.0.1", "11.0.0.2"], False) == ("11.0.0.2", "11.0.0.1")
 
 
 def test_a_refused_answer_names_netguards_verdict() -> None:
-    assert address(["10.0.0.5"], False) == Refusal("address_refused", "private")
-    assert address(["11.0.0.1", "127.0.0.1"], False) == Refusal("address_refused", "loopback")
-    assert address(["::ffff:10.0.0.1"], False) == Refusal("address_refused", "private")
-    assert address([], False) == Refusal("address_refused", "no_address")
-    assert address([], True) == Refusal("address_refused", "no_address")
-    assert address(["not-an-address"], True) == Refusal("address_refused", "unparsable")
+    """One refused address refuses them all: none is tried, the allowed ones included."""
+    assert addresses(["10.0.0.5"], False) == Refusal("address_refused", "private")
+    assert addresses(["11.0.0.1", "127.0.0.1"], False) == Refusal("address_refused", "loopback")
+    assert addresses(["11.0.0.1", "10.0.0.5"], False) == Refusal("address_refused", "private")
+    assert addresses(["::ffff:10.0.0.1"], False) == Refusal("address_refused", "private")
+    assert addresses([], False) == Refusal("address_refused", "no_address")
+    assert addresses([], True) == Refusal("address_refused", "no_address")
+    assert addresses(["not-an-address"], True) == Refusal("address_refused", "unparsable")
 
 
 # --- step 7 and after: the caps, and removed destinations -----------------------------------------

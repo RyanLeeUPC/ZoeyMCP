@@ -2,8 +2,9 @@
 :mod:`.connect`'s decisions.
 
 Each connection on a source's listener reads one request head, is checked against that source's
-list, resolves its name once, connects to the address it checked (never a second lookup), and
-answers ``200 Connection established``; then bytes are copied both ways until either side
+list, resolves its name once, connects to the addresses it checked, each in turn in the
+resolver's order until one connects and all within one connect timeout (never a second lookup),
+and answers ``200 Connection established``; then bytes are copied both ways until either side
 closes, the tunnel is idle for ``--idle-timeout`` or open for ``--max-tunnel-seconds``. A refusal
 is :func:`.connect.answer`'s empty answer and an ``egress_refused`` line with the step's reason;
 each tunnel ends with one ``egress_tunnel`` line. When new lists arrive, tunnels whose
@@ -183,18 +184,15 @@ class Handler:
         except (OSError, TimeoutError, ValueError):
             await _refuse(writer, source, Refusal("resolve_failed"), target)
             return
-        address = connect.address(addresses, private)
-        if isinstance(address, Refusal):
-            await _refuse(writer, source, address, target)
+        checked = connect.addresses(addresses, private)
+        if isinstance(checked, Refusal):
+            await _refuse(writer, source, checked, target)
             return
-        try:
-            async with asyncio.timeout(connect.CONNECT_TIMEOUT):
-                up_reader, up_writer = await asyncio.open_connection(
-                    *self._dial(address, target.port)
-                )
-        except (OSError, TimeoutError, ValueError):
-            await _refuse(writer, source, Refusal("connect_failed"), target, address)
+        opened = await self._connect(checked, target.port)
+        if isinstance(opened, str):
+            await _refuse(writer, source, Refusal("connect_failed"), target, opened)
             return
+        address, up_reader, up_writer = opened
         # The lists may have changed while the name was resolved and connected: check once more.
         # Nothing awaits between this check and the tunnel's registration, so no new list can
         # slip in between and leave the tunnel unpruned.
@@ -228,6 +226,28 @@ class Handler:
                 bytes_down=counts[1],
                 ms=round((time.monotonic() - started) * 1000),
             )
+
+    async def _connect(
+        self, checked: tuple[str, ...], port: int
+    ) -> tuple[str, asyncio.StreamReader, asyncio.StreamWriter] | str:
+        """The first checked address that connects, tried in turn (D-208), with its streams; or
+        the last address tried when none connects. One :data:`.connect.CONNECT_TIMEOUT` bounds
+        every attempt together (D-207), so k blackholed addresses wait it once, not k times."""
+        tried = checked[0]
+        try:
+            async with asyncio.timeout(connect.CONNECT_TIMEOUT):
+                for address in checked:
+                    tried = address
+                    try:
+                        up_reader, up_writer = await asyncio.open_connection(
+                            *self._dial(address, port)
+                        )
+                    except (OSError, ValueError):
+                        continue  # refused or unreachable: the next checked address
+                    return address, up_reader, up_writer
+        except TimeoutError:
+            pass
+        return tried
 
     async def _copy(
         self,
