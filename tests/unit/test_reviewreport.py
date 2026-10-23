@@ -1,5 +1,8 @@
 """The review report the vault accepts from the gateway (M7 design F.4): both shapes, straight
-from the gateway's review code, the caps that follow the limits, and the pins recomputed."""
+from the gateway's review code, the caps that follow the limits, and the pins recomputed; and
+M6's additions (design J.1): a drift entry's reviewed definition, checked against the policy's
+pin, the policy's pins and declines, ``offered``, and an M7 report, with none of them, still
+read."""
 
 from __future__ import annotations
 
@@ -10,10 +13,11 @@ from pathlib import Path
 from typing import Any, get_args
 
 import pytest
-from mcp.types import Implementation, Tool
+from mcp.types import Implementation, ServerCapabilities, Tool
 
 from tests.unit.test_review import LIMITS, pin, policy, reviewed, tool
 from tests.unit.test_review_toolkits import reviewed as toolkit_reviewed
+from zoeymcp.cli import review as cli_review
 from zoeymcp.common import canonical, pinhash
 from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.reviewreport import (
@@ -39,7 +43,7 @@ from zoeymcp.common.reviewreport import (
     read,
     report_max,
 )
-from zoeymcp.gateway import access, pins
+from zoeymcp.gateway import access, pins, review
 
 PIN0 = "sha256:" + "0" * 64
 
@@ -131,6 +135,10 @@ def test_every_state_the_review_writes_reads_back() -> None:
     assert drifts.diff[:2] == ["--- reviewed", "+++ listed"]
     assert report.instructions == "Use the notes tools."
     assert report.marked == ["drifts", "held"]
+    assert drifts.reviewed == old
+    assert [entry.name for entry in report.tools if entry.reviewed is not None] == ["drifts"]
+    assert report.policy.review == {name: pin(name) for name in server.review}
+    assert (report.policy.declined, report.offered) == ({}, None)
 
 
 def test_a_blocked_server_and_server_info() -> None:
@@ -752,3 +760,259 @@ def test_long_listed_names_are_cut_and_stay_apart() -> None:
     assert names == [prefix + "..." + digest for digest in digests]
     assert all(len(name) == LISTED_NAME_MAX for name in names)
     assert [entry.state for entry in read(fitted, LIMITS).tools] == ["duplicate", "invalid"]
+
+
+# --- the reviewed definition, the policy's pins, offered (M6 design J.1) --------------------
+
+
+def drifted(description: str = "Does another thing.", **extra: Any) -> dict[str, Any]:
+    """The report of a server whose one included tool, ``a``, drifted from the definition the
+    gateway's store holds at the policy's pin."""
+    old = pins.project_and_pin(tool("a")).definition
+    server = policy(["a"], {"a": pin("a")})
+    return wired(reviewed([tool("a", description)], server, defs={pin("a"): old}, **extra))
+
+
+def test_a_drift_entry_carries_its_reviewed_definition() -> None:
+    data = drifted(
+        offered={"prompts": True, "resources": False, "completions": False, "logging": True}
+    )
+    [entry] = data["tools"]
+    assert (entry["state"], entry["pinned"]) == ("drift", pin("a"))
+    assert entry["reviewed"] == pins.project(tool("a"))
+    report = read(data, LIMITS)
+    assert isinstance(report, RemoteReport)
+    assert report.tools[0].reviewed == pins.project(tool("a"))
+    assert report.policy.review == {"a": pin("a")}
+    assert report.offered is not None
+    assert report.offered.model_dump() == {
+        "prompts": True,
+        "resources": False,
+        "completions": False,
+        "logging": True,
+    }
+
+
+def test_a_drift_the_store_has_no_copy_of_has_no_reviewed_definition() -> None:
+    """F-41: the store was pruned; the entry reads without one, and without a diff."""
+    server = policy(["a"], {"a": pin("a")})
+    data = wired(reviewed([tool("a", "Does another thing.")], server))
+    [entry] = data["tools"]
+    assert entry["state"] == "drift"
+    assert ("reviewed" in entry, entry["diff"]) == (False, None)
+    assert read(data, LIMITS).tools[0].reviewed is None
+
+
+def test_a_reviewed_definition_whose_pin_isnt_pinned_refuses_the_whole_report() -> None:
+    """Y10: a gateway can leave the old definition out, never fake it. The vault recomputes its
+    pin; one that isn't the entry's ``pinned`` refuses all of the report, naming the tool once
+    even when its listed pin is wrong too."""
+    data = drifted()
+    data["tools"][0]["reviewed"]["description"] = "Does a third thing."
+    refusal = refused(data)
+    assert (refusal.reason, refusal.tools) == ("pin_mismatch", ("a",))
+    assert refusal.detail == "a reported pin isn't the pin of its definition"
+    data = drifted()
+    data["tools"][0]["pinned"] = PIN0
+    assert refused(data).tools == ("a",)
+    data["tools"][0]["pin"] = PIN0
+    assert refused(data).tools == ("a",)
+
+
+def test_a_reviewed_definition_is_the_one_the_policys_pin_names() -> None:
+    """Y10: a reviewed definition whose own ``pinned`` matches it, but isn't the policy's pin,
+    refuses the whole report, as does one for a tool the policy has no pin for."""
+    data = drifted()
+    entry = data["tools"][0]
+    entry["reviewed"]["description"] = "A forged old definition."
+    entry["pinned"] = pinhash.pin_of(entry["reviewed"])
+    assert data["policy"]["review"] == {"a": pin("a")}
+    refusal = refused(data)
+    assert (refusal.reason, refusal.tools) == ("pin_mismatch", ("a",))
+    data["policy"]["review"] = {}
+    assert refused(data).tools == ("a",)
+    data["policy"]["review"] = {"a": entry["pinned"]}  # stale() compares this map (J.2)
+    read(data, LIMITS)
+
+
+def test_a_reviewed_definition_with_no_pin_form_is_a_mismatch() -> None:
+    deep: dict[str, Any] = {}
+    for _ in range(62):
+        deep = {"a": deep}
+    data = drifted()
+    data["tools"][0]["reviewed"]["inputSchema"] = deep
+    assert refused(data).tools == ("a",)
+
+
+def test_a_reviewed_definition_comes_only_with_a_drift_entrys_pinned_pin() -> None:
+    data = drifted()
+    entry = data["tools"][0]
+    for state in ("ok", "marked", "blocked", "unreviewed", "invalid"):
+        entry["state"] = state
+        assert invalid(data) == "at remote.tools[0]"
+    entry["state"] = "drift"
+    entry["pinned"] = None
+    assert invalid(data) == "at remote.tools[0]"
+    data = drifted()
+    data["tools"][0]["reviewed"]["name"] = "b"
+    assert invalid(data) == "at remote.tools[0]"
+    data["tools"][0]["reviewed"] = []
+    assert invalid(data) == "at remote.tools[0].reviewed"
+
+
+def test_the_reviewed_definition_is_capped_like_the_listed_one() -> None:
+    limits = GatewayLimits(max_schema_bytes=64 * 1024)
+    most = definition_max(limits)
+    data = drifted()
+    entry = data["tools"][0]
+    old = entry["reviewed"]
+    old["description"] += "x" * (most - len(canonical.dumps_canonical(old)))
+    entry["pinned"] = data["policy"]["review"]["a"] = pinhash.pin_of(old)
+    read(data, limits)
+    old["description"] += "x"
+    entry["pinned"] = data["policy"]["review"]["a"] = pinhash.pin_of(old)
+    assert invalid(data, limits) == f"at tools[0].reviewed (over {most} bytes)"
+    old["inputSchema"]["maximum"] = 2**53
+    entry["definition"]["inputSchema"]["maximum"] = 2**53
+    assert invalid(data, limits) == (
+        "at tools[0].definition (no canonical form), tools[0].reviewed (no canonical form)"
+    )
+
+
+def test_the_cap_drops_the_reviewed_definition_first() -> None:
+    """An entry whose reviewed definition is over the cap loses that definition, for a note; its
+    listed definition, pin, changed members and diff stay."""
+    most = definition_max(LIMITS)
+    data = drifted()
+    entry = data["tools"][0]
+    old = entry["reviewed"]
+    old["description"] += "x" * (most - len(canonical.dumps_canonical(old)))
+    entry["pinned"] = data["policy"]["review"]["a"] = pinhash.pin_of(old)
+    assert fit(data, LIMITS) == data
+    old["description"] += "x"
+    entry["pinned"] = data["policy"]["review"]["a"] = pinhash.pin_of(old)
+    [fitted] = fit(data, LIMITS)["tools"]
+    assert fitted["reviewed"] is None
+    assert fitted["findings"] == [
+        *entry["findings"],
+        {
+            "level": "note",
+            "pointer": "",
+            "message": "the reviewed definition was too large to report",
+        },
+    ]
+    kept = ("definition", "pin", "pinned", "changed", "diff")
+    assert {key: fitted[key] for key in kept} == {key: entry[key] for key in kept}
+    assert data["tools"][0]["reviewed"] is old  # the answer itself isn't changed
+    read(fit(data, LIMITS), LIMITS)
+
+
+def test_the_policys_pins_and_declines() -> None:
+    """Shape and keys are checked; the maps aren't capped at NAMES_MAX, since a pin for a tool
+    that isn't included is only a warning in the policy, so the gateway can write more."""
+    data = unclassified("a")
+    assert data["policy"]["review"] == {}
+    data["policy"].update(review={"a": pin("a")}, declined={"b": PIN0})
+    report = read(data, LIMITS)
+    assert (report.policy.review, report.policy.declined) == ({"a": pin("a")}, {"b": PIN0})
+    for member in ("review", "declined"):
+        data["policy"][member] = {"a": "sha256:abc"}
+        assert invalid(data) == f"at remote.policy.{member}.a"
+        data["policy"][member] = {"a b": PIN0}
+        assert invalid(data) == f"at remote.policy.{member}.?.?"  # the key, then "[key]"
+        data["policy"][member] = {f"t{index}": PIN0 for index in range(NAMES_MAX + 1)}
+        read(data, LIMITS)
+        data["policy"][member] = {}
+
+
+def test_a_toolkits_policy_carries_its_pins(tmp_path: Path, example_raw: dict[str, Any]) -> None:
+    data = wired(toolkit_reviewed(tmp_path, example_raw))
+    pins_ = example_raw["gateway"]["servers"]["mail"]["review"]
+    assert data["policy"]["review"] == pins_
+    report = read(data, LIMITS)
+    assert report.policy.review == pins_
+    assert all(entry.reviewed is None for entry in report.tools)
+    assert invalid({**data, "offered": None}) == "at toolkit.offered"
+
+
+@pytest.mark.parametrize(
+    ("offered", "location"),
+    [
+        ({"prompts": True, "resources": True, "completions": True}, "remote.offered.logging"),
+        (
+            {"prompts": 1, "resources": True, "completions": True, "logging": True},
+            "remote.offered.prompts",
+        ),
+        (
+            {
+                "prompts": True,
+                "resources": True,
+                "completions": True,
+                "logging": True,
+                "tools": True,
+            },
+            "remote.offered.tools",
+        ),
+        ([], "remote.offered"),
+    ],
+)
+def test_offered_out_of_shape(offered: object, location: str) -> None:
+    data = unclassified("a")
+    data["offered"] = offered
+    assert invalid(data) == f"at {location}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "options"),
+    [
+        ("prompts", {"listChanged": True}),
+        ("resources", {"subscribe": True}),
+        ("completions", {}),
+        ("logging", {}),
+    ],
+)
+def test_offered_from_the_upstreams_capabilities(kind: str, options: dict[str, Any]) -> None:
+    """Each kind the upstream advertises, whatever its options, and only that kind; tools
+    aren't among them."""
+    kinds = ("prompts", "resources", "completions", "logging")
+    assert review.offered(ServerCapabilities()) == dict.fromkeys(kinds, False)
+    assert review.offered(ServerCapabilities.model_validate({"tools": {}})) == dict.fromkeys(
+        kinds, False
+    )
+    advertised = ServerCapabilities.model_validate({"tools": {}, kind: options})
+    assert review.offered(advertised) == {other: other == kind for other in kinds}
+    assert "offered" not in unclassified("a")
+
+
+def test_an_m7_report_still_reads(tmp_path: Path, example_raw: dict[str, Any]) -> None:
+    """CR-6: a report with none of M6's fields, as an M7 gateway writes it, reads with each
+    field at its default."""
+    data = drifted(
+        offered={"prompts": True, "resources": True, "completions": True, "logging": True}
+    )
+    del data["offered"], data["policy"]["review"], data["tools"][0]["reviewed"]
+    report = read(data, LIMITS)
+    assert isinstance(report, RemoteReport)
+    assert report.offered is None
+    assert (report.policy.review, report.policy.declined) == ({}, {})
+    assert report.tools[0].reviewed is None
+    assert report.model_dump(mode="json", exclude_unset=True) == data
+    toolkit = wired(toolkit_reviewed(tmp_path, example_raw))
+    del toolkit["policy"]["review"]
+    assert read(toolkit, LIMITS).policy.review == {}
+
+
+def test_the_clis_review_text_reads_none_of_the_new_fields() -> None:
+    """J.1's acceptance: the CLI prints the gateway's answer as before, so its text and snippet
+    are byte-identical with and without M6's fields."""
+    data = drifted(
+        offered={"prompts": True, "resources": True, "completions": True, "logging": True}
+    )
+    m7 = copy.deepcopy(data)
+    del m7["offered"], m7["policy"]["review"], m7["tools"][0]["reviewed"]
+    for choices in (
+        cli_review.Choices(),
+        cli_review.Choices(show_all=True, repin=frozenset({"a"})),
+    ):
+        assert cli_review.render(data, choices) == cli_review.render(m7, choices)
+        assert cli_review.snippet(data, choices) == cli_review.snippet(m7, choices)

@@ -7,8 +7,10 @@ marks the tool for every client, as drift seen anywhere does (G.3, G.4).
 
 :func:`report` turns one listing into the answer: per tool, its state, its projection and pin,
 the findings, and for drift the changed members and a diff against the reviewed definition from
-the definition store. The upstream's ``instructions`` and ``serverInfo`` are included for display
-only; they are never forwarded to an agent.
+the definition store, and that definition itself (``reviewed``, M6 design J.1), which the vault
+checks against the policy's pin. The policy block carries the server's pins, and ``offered`` what
+the upstream advertises beyond tools, none of it served. The upstream's ``instructions`` and
+``serverInfo`` are included for display only; they are never forwarded to an agent.
 
 ``--clear`` lists again and, only if every included tool matches its pin, clears the server's
 drift marks and re-evaluates the server's live connections, so the tools come back for agents.
@@ -25,7 +27,7 @@ from collections.abc import Callable, Mapping, Sequence, Set
 from typing import Any, Literal
 
 import anyio
-from mcp.types import Implementation, Tool
+from mcp.types import Implementation, ServerCapabilities, Tool
 
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
@@ -58,6 +60,17 @@ class ReviewError(Exception):
 
     def answer(self) -> dict[str, Any]:
         return {"error": str(self), "reason": self.reason, **self.data}
+
+
+def offered(capabilities: ServerCapabilities) -> dict[str, bool]:
+    """What the upstream advertises beyond tools (fold-in 3.8), none of which the gateway serves
+    until the kind is enabled."""
+    return {
+        "prompts": capabilities.prompts is not None,
+        "resources": capabilities.resources is not None,
+        "completions": capabilities.completions is not None,
+        "logging": capabilities.logging is not None,
+    }
 
 
 def classification(policy: pins.Reviewed, tool: str) -> str | None:
@@ -139,6 +152,7 @@ def _tool_entry(
         if old is not None:
             entry["changed"] = changed_members(old, projected.definition)
             entry["diff"] = diff(old, projected.definition)
+            entry["reviewed"] = dict(old)
     return entry
 
 
@@ -155,8 +169,10 @@ def report(
     protocol_version: str | None,
     server_info: Implementation | None,
     instructions: str | None,
+    offered: Mapping[str, bool] | None = None,
 ) -> dict[str, Any]:
-    """The review of one listing (pure, apart from reading the definition store)."""
+    """The review of one listing (pure, apart from reading the definition store). ``offered``
+    goes into the answer when the handshake was seen."""
     marked = {tool for tool, _ in marks}
     by_name: dict[str, list[Tool]] = {}
     for tool in tools:
@@ -184,7 +200,7 @@ def report(
     if instructions is not None and len(instructions) > MAX_INSTRUCTIONS_CHARS:
         instructions = instructions[:MAX_INSTRUCTIONS_CHARS] + "..."
     included = [entry for entry in entries if entry["included"]]
-    return {
+    answer: dict[str, Any] = {
         "server": server,
         "kind": "remote",
         "vault_path": policy.vault_path,
@@ -195,6 +211,7 @@ def report(
             "allow": list(policy.tools.allow),
             "approve": list(policy.tools.approve),
             "on_drift": policy.on_drift,
+            "review": dict(policy.review),
         },
         "protocol_version": protocol_version,
         "server_info": info,
@@ -204,6 +221,9 @@ def report(
         "tools": entries,
         "clean": not marked and all(entry["state"] == "ok" for entry in included),
     }
+    if offered is not None:
+        answer["offered"] = dict(offered)
+    return answer
 
 
 # --- running a review ---------------------------------------------------------------------------
@@ -258,7 +278,9 @@ async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any
         evaluation = await _listed(app, connection, limits)
         tools = list(connection.tools)
         era = connection.era
-        version = connection.client.protocol_version if connection.client is not None else None
+        client = connection.client
+        version = client.protocol_version if client is not None else None
+        advertised = offered(client.server_capabilities) if client is not None else None
         server_info, instructions = connection.server_info, connection.instructions
     finally:
         await _close(connection)
@@ -276,6 +298,7 @@ async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any
             protocol_version=version,
             server_info=server_info,
             instructions=instructions,
+            offered=advertised,
         )
 
     answer = build(evaluation)
@@ -367,6 +390,7 @@ def toolkit_report(
             "allow": list(policy.tools.allow),
             "approve": list(policy.tools.approve),
             "on_drift": policy.on_drift,
+            "review": dict(policy.review),
         },
         "blocked": evaluation.blocked,
         "marked": sorted(marked),

@@ -2,12 +2,15 @@
 
 - ``_ReviewOnly``: the review client reaches the jobs path and the report path, and nothing else;
 - the poller against the real vault app over both links (TCP with the gateway key, and the link
-  socket, which is Linux only), its review replaced: a queued job is claimed, run and reported;
+  socket, which is Linux only), its review replaced: a queued job is claimed, run and reported,
+  a drift report with its reviewed definition, pins and ``offered`` (M6 design J.1) whole;
 - the poller against the vault app in process, on a clock the test moves: the review lock, the
-  report fitted to the caps, a lying report refused whole, a report too large, the review's own
-  error, a toolkit job, and FM-13, FM-14, FM-15 and FM-17;
-- the whole gateway on a real upstream: ``review --via vault`` prints what ``review`` prints, and
-  the gateway closes its vault-link clients at shutdown (D-166).
+  report fitted to the caps, a lying report refused whole (a listed pin, or a reviewed
+  definition), a report too large, the review's own error, a toolkit job, and FM-13, FM-14,
+  FM-15 and FM-17;
+- the whole gateway on a real upstream: ``review --via vault`` prints what ``review`` prints, a
+  drift review's report carries the definition at the policy's pin and what the upstream offers,
+  and the gateway closes its vault-link clients at shutdown (D-166).
 
 The log never names a job by its ID, only by hash8 (M.4).
 """
@@ -32,7 +35,7 @@ import anyio
 import httpx
 import httpx2
 import pytest
-from mcp.types import Tool
+from mcp.types import ServerCapabilities, Tool
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tests.fakes.harness import serve
@@ -148,6 +151,39 @@ def answer_for(view: GatewayView, *names: str) -> dict[str, Any]:
         protocol_version="2026-07-28",
         server_info=None,
         instructions=None,
+    )
+
+
+def drift_answer(view: GatewayView) -> dict[str, Any]:
+    """The gateway's review of a listing in which ``list_notes``, included at its pin, drifted
+    from the definition the store holds at that pin, from an upstream that offers prompts and
+    logging (M6 design J.1)."""
+    served = view.gateway.servers["notes"]
+    assert isinstance(served, ViewRemoteServer)
+    limits = view.gateway.limits
+    old = pins.project_and_pin(tool("list_notes"))
+    server = ViewRemoteServer.model_validate(
+        {
+            **served.model_dump(),
+            "tools": {"include": ["list_notes"], "allow": [], "approve": ["list_notes"]},
+            "review": {"list_notes": old.pin},
+        }
+    )
+    listing = [tool("list_notes", SENTINEL)]
+    capabilities = ServerCapabilities.model_validate({"prompts": {}, "logging": {}})
+    return review.report(
+        "notes",
+        server,
+        listing,
+        pins.evaluate(listing, server, frozenset(), limits),
+        marks=frozenset(),
+        defs={old.pin: dict(old.definition)}.get,
+        limits=limits,
+        era="modern",
+        protocol_version="2026-07-28",
+        server_info=None,
+        instructions=None,
+        offered=review.offered(capabilities),
     )
 
 
@@ -364,12 +400,9 @@ def real_vault(tmp_path: Path, link: str) -> Iterator[Real]:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-@pytest.mark.parametrize("link", LINKS)
-async def test_a_queued_review_is_run_and_reported_over_either_link(
-    tmp_path: Path, link: str, log: io.StringIO
-) -> None:
-    view = build_view(notes_policy())
-    answer = answer_for(view, "list_notes", "delete_note")
+async def reported(tmp_path: Path, link: str, view: GatewayView, answer: dict[str, Any]) -> Any:
+    """The vault's answer for a review job the poller runs over ``link``, its review answering
+    ``answer``."""
     with real_vault(tmp_path, link) as vault:
         async with review_client(vault.link, vault.keys) as http:
             poller = ReviewPoller(stub(view), http, run_review=reviewing(lambda: answer))
@@ -387,7 +420,16 @@ async def test_a_queued_review_is_run_and_reported_over_either_link(
                     group.cancel_scope.cancel()
     assert queued.status_code == 200, queued.text
     assert read.status_code == 200, read.text
-    done = read.json()
+    return read.json()
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_queued_review_is_run_and_reported_over_either_link(
+    tmp_path: Path, link: str, log: io.StringIO
+) -> None:
+    view = build_view(notes_policy())
+    answer = answer_for(view, "list_notes", "delete_note")
+    done = await reported(tmp_path, link, view, answer)
     assert done["state"] == "done"
     assert done["report"] == wired(reviewreport.fit(answer, view.gateway.limits))
     job = done["job"]
@@ -396,6 +438,32 @@ async def test_a_queued_review_is_run_and_reported_over_either_link(
     assert (started["server"], started["job"]) == ("notes", hash8(job))
     assert (finished["job"], finished["outcome"]) == (hash8(job), "done")
     assert job not in log.getvalue()
+    assert SENTINEL not in log.getvalue()
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_drift_report_with_its_reviewed_definition_over_either_link(
+    tmp_path: Path, link: str, log: io.StringIO
+) -> None:
+    """J.1: the reviewed definition, the policy's pins and ``offered`` reach the vault, which
+    checked the reviewed definition against the pin, and read back as the gateway posted them."""
+    view = build_view(notes_policy())
+    answer = drift_answer(view)
+    done = await reported(tmp_path, link, view, answer)
+    assert done["state"] == "done"
+    report = done["report"]
+    assert report == wired(reviewreport.fit(answer, view.gateway.limits))
+    [entry] = report["tools"]
+    assert (entry["state"], entry["changed"]) == ("drift", ["description"])
+    assert entry["reviewed"] == pins.project(tool("list_notes"))
+    assert pinhash.pin_of(entry["reviewed"]) == entry["pinned"]
+    assert report["policy"]["review"] == {"list_notes": entry["pinned"]}
+    assert report["offered"] == {
+        "prompts": True,
+        "resources": False,
+        "completions": False,
+        "logging": True,
+    }
     assert SENTINEL not in log.getvalue()
 
 
@@ -609,6 +677,30 @@ async def test_a_lying_report_is_refused_whole(rig: InProcess, log: io.StringIO)
     assert (done["outcome"], done["level"]) == ("pin_mismatch", "error")
     assert [line["level"] for line in events(log, "review_refused", "vault")] == ["critical"]
     assert rig.posts() == 1
+
+
+@pytest.mark.parametrize("repinned", [False, True])
+async def test_a_faked_reviewed_definition_is_refused_whole(
+    rig: InProcess, log: io.StringIO, repinned: bool
+) -> None:
+    """Y10: a reviewed definition that isn't the one the policy's pin names fails the job
+    pin_mismatch, nothing of the report kept, even when the entry's ``pinned`` is made its pin:
+    a gateway can leave it out, never fake it."""
+    gateway = stub(rig.view)
+    answer = drift_answer(rig.view)
+    entry = answer["tools"][0]
+    entry["reviewed"]["description"] = "Does something it never did."
+    if repinned:
+        entry["pinned"] = pinhash.pin_of(entry["reviewed"])
+    poller = poller_on(rig, gateway, lambda: answer)
+    job_id = await rig.queue()
+    await run_one(rig, poller, gateway)
+    read = await rig.read(job_id)
+    assert (read.status_code, read.json()["reason"]) == (502, "pin_mismatch")
+    assert "report" not in read.json()
+    assert "list_notes" in read.json()["error"]
+    [done] = events(log, "review_job_done")
+    assert (done["outcome"], done["level"]) == ("pin_mismatch", "error")
 
 
 def huge_answer(view: GatewayView, count: int) -> dict[str, Any]:
@@ -1018,3 +1110,46 @@ def test_review_via_vault_prints_the_gateways_review(
     for http in (app.policy_http, app.report_http, app.review_http):
         assert http is not None
         assert http.is_closed
+
+
+def test_a_drift_review_via_vault_carries_the_reviewed_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """J.1 on a real upstream: a clean review stores the definitions at their pins; after the
+    upstream changes ``echo``, the report the vault reads carries the stored one, which is the
+    definition at the policy's pin, the policy's pins and what the upstream offers. The CLI
+    prints the same review either way."""
+    fake = McpFake(offered={"prompts", "logging"})
+    review_pins = {name: pin_of_fake(fake, name) for name in TOOLS}
+    with (
+        deployment(tmp_path, fake, include=TOOLS, review=review_pins) as deployed,
+        gateway(deployed, review=True, report=True) as running,
+    ):
+        socket = ("--socket", "x")
+        clean = run_cli(monkeypatch, running.admin_url, "review", "notes", *socket)
+        fake.change_tool("description")
+        vault, admin = deployed.vault_admin_url, running.admin_url
+        through_vault = run_cli(monkeypatch, vault, "review", "notes", "--via", "vault", *socket)
+        direct = run_cli(monkeypatch, admin, "review", "notes", "--via", "gateway", *socket)
+        as_json = run_cli(
+            monkeypatch, vault, "review", "notes", "--via", "vault", "--format", "json", *socket
+        )
+    assert clean[0] == 0, clean
+    assert through_vault == direct
+    assert through_vault[0] == 1
+    assert "DRIFT" in through_vault[1]
+    code, out, _ = as_json
+    assert code == 1
+    report = json.loads(out)
+    [echo] = [entry for entry in report["tools"] if entry["name"] == "echo"]
+    assert (echo["state"], echo["pinned"]) == ("drift", review_pins["echo"])
+    assert pinhash.pin_of(echo["reviewed"]) == review_pins["echo"]
+    assert echo["reviewed"]["description"] != echo["definition"]["description"]
+    assert all("reviewed" not in entry for entry in report["tools"] if entry["name"] != "echo")
+    assert report["policy"]["review"] == review_pins
+    assert report["offered"] == {
+        "prompts": True,
+        "resources": False,
+        "completions": False,
+        "logging": True,
+    }

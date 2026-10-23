@@ -6,11 +6,19 @@ told apart by ``kind``. :data:`ReviewReport` is a strict model of both, keyed by
 on each entry (``"kind": "tool"``, the only kind in M7; ``review.report()`` doesn't write it, so
 an entry without one is a tool), so M6's drift review of any server kind reads the same shape.
 
+M6 (design J.1) adds what a drift review needs: a drift entry's ``reviewed`` definition, the one
+the policy's pin names, from the gateway's definition store; the policy block's ``review`` and
+``declined`` maps, the server's pins and declines the review ran under; and a remote report's
+``offered``, what the upstream advertises beyond tools (fold-in 3.8). Each has a default, so a
+report from an M7 gateway, which writes none of them, still reads (CR-6).
+
 :func:`read` takes one report under the running limits: the model, the caps that follow
 ``gateway.limits`` (GR-30), then the integrity check (fold-in C25, X11), which recomputes every
-reported pin from the definition beside it and refuses the whole report if any differs. A refusal
-is :class:`ReportRefused`, whose ``reason`` is M.2's. Nothing in a report is trusted further than
-that: its findings and states are shown labelled as the gateway's.
+reported pin from the definition beside it, and the policy's pin from the reviewed definition,
+which its entry's ``pinned`` must be too (Y10), and refuses the whole report if any differs: a
+gateway can leave the old definition out, never fake it. A refusal is :class:`ReportRefused`,
+whose ``reason`` is M.2's. Nothing in a report is trusted further than that: its findings and
+states are shown labelled as the gateway's.
 
 A genuine review can exceed those caps for one odd tool (a definition far over the schema limit, a
 pattern on each of hundreds of properties, a name that isn't a tool name), and one tool mustn't
@@ -86,8 +94,9 @@ Members = Annotated[
 class ReportRefused(ValueError):
     """A report the vault doesn't take: ``review_too_large`` (over the body cap),
     ``review_invalid`` (not the gateway's review shape, or over a cap) or ``pin_mismatch`` (a
-    reported pin that isn't its definition's; ``tools`` names each). ``detail`` names locations
-    and limits, never a value from the report."""
+    reported pin that isn't its definition's, or a reviewed definition that isn't the one the
+    policy's pin names; ``tools`` names each). ``detail`` names locations and limits, never a value
+    from the report."""
 
     def __init__(self, reason: Reason, detail: str, tools: tuple[str, ...] = ()) -> None:
         self.reason: Reason = reason
@@ -120,6 +129,9 @@ class ToolEntry(_Model):
     findings: Annotated[list[Finding], Field(max_length=FINDINGS_MAX)]
     changed: Members | None
     diff: list[str] | None
+    # A drift entry's definition at its pinned pin, from the gateway's definition store; none when
+    # the store doesn't hold it (pruned at a restart, F-41), for a toolkit, or from an M7 gateway.
+    reviewed: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _pinned_definition(self) -> ToolEntry:
@@ -128,6 +140,11 @@ class ToolEntry(_Model):
             raise ValueError("a pin and its definition come together")
         if self.definition is not None and self.definition.get("name") != self.name:
             raise ValueError("the definition is another tool's")
+        if self.reviewed is not None:
+            if self.state != "drift" or self.pinned is None:
+                raise ValueError("a reviewed definition comes with a drift entry's pinned pin")
+            if self.reviewed.get("name") != self.name:
+                raise ValueError("the reviewed definition is another tool's")
         # review.py writes an entry under every name the server lists: one that isn't a tool
         # name can only be the invalid or duplicate tool it reports, with no definition.
         unpinnable = self.definition is None and self.state in _UNPINNABLE
@@ -147,6 +164,21 @@ class ReviewedPolicy(_Model):
     allow: Names
     approve: Names
     on_drift: Literal["hide", "fail"]
+    # The server's pins and declines at review time (M6 J.1), which stale() compares (J.2).
+    # Not capped at NAMES_MAX: a pin for a tool that isn't included is only a warning, so the
+    # map isn't bounded by the tools; the body cap bounds it.
+    review: dict[ToolName, Pin] = {}
+    declined: dict[ToolName, Pin] = {}
+
+
+class Offered(_Model):
+    """What the upstream advertises beyond tools (fold-in 3.8): none of it is served until the
+    kind is enabled (L), so the portal shows it as "offered, not served"."""
+
+    prompts: bool
+    resources: bool
+    completions: bool
+    logging: bool
 
 
 class ServerInfo(_Model):
@@ -171,6 +203,7 @@ class RemoteReport(_Model):
     marked: Names
     tools: Annotated[list[ToolEntry], Field(max_length=2 * NAMES_MAX)]
     clean: bool
+    offered: Offered | None = None  # none when the gateway didn't see the handshake, or is M7's
 
 
 class ToolkitReport(_Model):
@@ -243,39 +276,55 @@ def _within(report: RemoteReport | ToolkitReport, limits: GatewayLimits) -> list
         over.append("tools (a tool twice)")
     most = definition_max(limits)
     for index, entry in enumerate(report.tools):
-        if entry.definition is not None:
-            try:
-                size = len(canonical.dumps_canonical(entry.definition))
-            except canonical.JSONRejected:
-                over.append(f"tools[{index}].definition (no canonical form)")
-                continue
-            if size > most:
-                over.append(f"tools[{index}].definition (over {most} bytes)")
+        # The reviewed definition is capped like the listed one.
+        for member, definition in (("definition", entry.definition), ("reviewed", entry.reviewed)):
+            problem = _oversize(definition, most)
+            if problem is not None:
+                over.append(f"tools[{index}].{member} ({problem})")
         if entry.diff is not None and sum(map(len, entry.diff)) > DIFF_SCALE * most:
             over.append(f"tools[{index}].diff (over {DIFF_SCALE * most} characters)")
     return over
 
 
+def _oversize(definition: dict[str, Any] | None, most: int) -> str | None:
+    """Why ``definition`` is over :func:`definition_max` (``most``), or ``None``."""
+    if definition is None:
+        return None
+    try:
+        size = len(canonical.dumps_canonical(definition))
+    except canonical.JSONRejected:
+        return "no canonical form"
+    return f"over {most} bytes" if size > most else None
+
+
+def _differs(definition: dict[str, Any] | None, pin: str | None) -> bool:
+    """Whether ``pin`` isn't the pin of ``definition``, when there is one."""
+    if definition is None:
+        return False
+    try:
+        return pin_of(definition) != pin
+    except ProjectionError:  # one the gateway couldn't have pinned either
+        return True
+
+
 def _mismatched(report: RemoteReport | ToolkitReport) -> tuple[str, ...]:
-    """Every tool whose reported pin isn't its definition's (X11)."""
-    found = []
-    for entry in report.tools:
-        if entry.definition is None:
-            continue
-        try:
-            pin = pin_of(entry.definition)
-        except ProjectionError:  # one the gateway couldn't have pinned either
-            found.append(entry.name)
-            continue
-        if pin != entry.pin:
-            found.append(entry.name)
-    return tuple(found)
+    """Every tool whose reported pin isn't its definition's (X11), or whose reviewed definition
+    isn't the one the policy's pin names (Y10): its ``pinned`` is that pin, and its own."""
+    review = report.policy.review
+    return tuple(
+        entry.name
+        for entry in report.tools
+        if _differs(entry.definition, entry.pin)
+        or _differs(entry.reviewed, entry.pinned)
+        or (entry.reviewed is not None and entry.pinned != review.get(entry.name))
+    )
 
 
 def read(data: object, limits: GatewayLimits) -> RemoteReport | ToolkitReport:
     """One report, from its parsed JSON, under the running ``limits``. Raises
     :class:`ReportRefused`: ``review_invalid`` for one that fails the model or a cap, then
-    ``pin_mismatch`` if any reported pin isn't its definition's, which refuses all of it."""
+    ``pin_mismatch`` if any reported pin isn't its definition's, or any reviewed definition
+    isn't the one the policy's pin names, which refuses all of it."""
     try:
         report = _REPORT.validate_python(data)
     except ValidationError as exc:
@@ -322,6 +371,11 @@ def _fit_entry(entry: Mapping[str, Any], most: int) -> dict[str, Any]:
         }
         for finding in entry["findings"]
     ]
+    # The reviewed definition goes first: the listed one stays if it is within the cap.
+    reviewed = entry.get("reviewed")
+    if reviewed is not None and len(canonical.dumps_canonical(reviewed)) > most:
+        fitted["reviewed"] = None
+        findings.append(_finding("note", "the reviewed definition was too large to report"))
     definition = entry["definition"]
     if definition is not None and len(canonical.dumps_canonical(definition)) > most:
         fitted.update(definition=None, pin=None, diff=None)
@@ -346,7 +400,8 @@ def fit(answer: Mapping[str, Any], limits: GatewayLimits) -> dict[str, Any]:
     """The gateway's review ``answer`` (``review.report()``'s or ``toolkit_report()``'s) within
     the caps :func:`read` applies under ``limits``. Pure; ``answer`` itself isn't changed.
 
-    Each finding's pointer and message are cut; a definition over :func:`definition_max` goes,
+    Each finding's pointer and message are cut; a drift entry's reviewed definition over
+    :func:`definition_max` goes, for a note that says so; a listed definition over the cap goes,
     with its pin and diff, for an error finding that says so (such a tool has an error finding
     already, so it could never be included); a diff over its cap goes, for a note; findings past
     the 63rd become one, at the most severe level among them; ``server_info``'s strings,
