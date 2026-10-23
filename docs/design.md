@@ -2646,7 +2646,6 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-145 | certifi trusted roots with compromised intermediates: fixed before M7, and the Debian root dropped from the image in M7; two cleanups are left | `exclude-newer` passing 2026-10-19 (drop certifi's exception); a Debian `ca-certificates` without emSign ECC Root CA - G3 (drop the image's line for it) |
 | D-156 | Client ID Metadata Documents aren't supported | An authorization server that offers only them, or refuses both dynamic registration and a given client |
 | D-159 | The portal's reverse-proxy snippets, the `lan-cert.yaml` override and the 421 and 403 probes were never run against a real proxy | The by-hand checklist before the PR into main |
-| D-160 | Make the Windows portal job a required CI check | Met over M7's runs; waits on the owner's branch-protection change |
 | D-163 | No guide to connecting real agent clients to the gateway | The docs pass before the PR into main, with D-108 |
 | D-191 | The stdio fake's self-test once saw the fake's output end early on Linux (not reproduced) | The test failing in CI, or a bridge test seeing a child's output end early |
 
@@ -2787,6 +2786,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-150 | The onboarding YAML: its form, and one emitter for untrusted strings | Done in M7: one change object and one emitter for every fragment |
 | D-151 | How the gateway reaches a bridge: a gateway-only vault route with the bridge's own token, in three placements, with confinement in the hardened tier only | Done in M7, with D-30 |
 | D-152 | [threat-model.md](threat-model.md) had no actors or limits for M7's surfaces | Done in M7 |
+| D-160 | Make the Windows portal job a required CI check | Done in M7: a required check on main since it stayed green over M7's runs |
 | D-164 | No end-to-end guide to a first hardened deployment, and no recipe for an existing stack with its own egress proxy | Done in M7: [operations.md](operations.md) §29 and §30, and `examples/existing-stack/` |
 | D-166 | The gateway's vault-link clients weren't closed at shutdown | Done in M7 |
 | D-169 | The hardened smoke's alias probe couldn't tell the vault's name from the portal's alias | Done in M7 |
