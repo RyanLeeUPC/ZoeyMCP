@@ -23,7 +23,8 @@ concurrency:
 
 # The mutants are split by module across parallel shards (scripts/mutation-shard.py), each on its
 # own runner; "mutation testing" merges their stats and applies the gate. That job's name is the
-# required check on main.
+# required check on main. SHARDS and the matrix change together: a shard's run past 25 minutes
+# adds shards, and scripts/mutation-weights.py regenerates the weights that balance them.
 jobs:
   shard:
     name: mutation shard ${{ matrix.shard }}
@@ -32,9 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      SHARDS: 6
+      SHARDS: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -13,9 +13,11 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+import yaml
 from mutmut.stats import status_by_exit_code
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+WORKFLOW = SCRIPTS.parent / ".github" / "workflows" / "mutation.yml"
 
 
 def load(name: str) -> ModuleType:
@@ -72,8 +74,12 @@ def test_the_weights_name_real_modules() -> None:
     assert set(shard.WEIGHTS) <= set(shard.modules())
 
 
-def test_six_shards_are_balanced() -> None:
-    loads = [sum(part.weight for part in group) for group in shard.shards(shard.modules(), 6)]
+def test_the_workflows_shards_are_balanced() -> None:
+    """mutation.yml's SHARDS names its matrix's shards, and that many shards are balanced."""
+    job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["shard"]
+    count = job["env"]["SHARDS"]
+    assert job["strategy"]["matrix"]["shard"] == list(range(count))
+    loads = [sum(part.weight for part in group) for group in shard.shards(shard.modules(), count)]
     assert max(loads) < 1.05 * min(loads)
 
 

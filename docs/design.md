@@ -2564,11 +2564,10 @@ them.
 | --- | --- | --- |
 | D-44 | Should bare URLs in approval prompts be refused or defanged, for clients that render Markdown and for M8's approvers? | Decided in M8 |
 | D-54 | Is an example mailbox-reader toolkit part of "useful end to end", and in which milestone? | Unscheduled |
-| D-59 | R31's per-server `enable`: next to M6's review and re-pin, after M8, or R31 reworded so that "off, with `enable` reserved" meets it for v1? | M6 |
 | D-64 | R52's reproducible-build check: in M8, or an earlier build-twice CI job? | M8 |
 | D-71 | M4's remaining image-smoke rows (a stop during an accepted forward, approved sends in both tiers): closed early as M4 debt, or in M8? | M8 |
 | D-75 | Do M4's approval rows that need a multi-request fake client block the PR into main, or wait for M8? | M8 |
-| D-96 | Python dependency updates: Dependabot with a cooldown, or the manual process with a staleness reminder? | The manual process, with a reminder |
+| D-96 | Python dependency updates: Dependabot with a cooldown, or the manual process with a staleness reminder? (Dependabot's security alerts are on since 2026-10-20.) | The manual process, with a reminder |
 | D-98 | Claim Python 3.14 support, or cap below 3.14 until it is tested? | Cap until tested |
 | D-108 | Which real MCP clients, and which versions, must be checked in [clients.md](clients.md) before the PR into main? | To be named |
 | D-110 | What is the bar for removing the README banner and opening the PR into main? Is a security review required before the first release? | After M8, with a review |
@@ -2581,37 +2580,28 @@ event that brings it back. Keys are never reused or renumbered; an item that is 
 "Closed" and keeps its key. The register is refreshed at the end of each milestone. The few keys
 not listed concern the maintainers' local setup, not ZoeyMCP.
 
-**M5 (Portal v1).**
-
-| Key | Item | Target or trigger |
-| --- | --- | --- |
-| D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | M5 (open): built; its by-hand checks in [manual-checks.md](manual-checks.md) are still to run |
-
 **M6 (Portal v2).**
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-13 | Tool-drift review and re-pin in the portal | M6 |
-| D-29 | Gateway status, drift and review data in the portal (the transport is D-24) | M6 |
+| D-13 | Tool-drift review and re-pin in the portal (M7 built the first-time review screen they reuse) | M6 |
+| D-29 | Gateway status and drift marks in the portal (the transport is D-24; M7 built the review report path) | M6 |
 | D-46 | A modern upstream's tool-list change announced before the gateway's listen stream opens waits for the next timer check | M6 |
 | D-47 | The SDK session manager's limits are fixed at the first view, and its session cap at 1024 | M6 |
 | D-58 | Managed mode: versioned policy, history, rollback, export and import | M6 |
-| D-59 | R31: per-server enable of resources, prompts, completions, sampling, elicitation and roots | M6, or a named milestone after M8 (§12.2) |
-| D-61 | An `egress_proxy` change needs a restart | M6 (M7's egress profile touches it too) |
-| D-107 | Not every difference between Python's regex and ECMA-262 is listed in the docs | M6, or an earlier docs pass |
+| D-59 | R31: per-server enable of resources, prompts, completions, sampling, elicitation and roots | M6 (decided in M7's questions) |
+| D-61 | An `egress_proxy` change needs a restart | M6 |
 | D-130 | Detect a restore of the state volume from an older backup | M6 (restated with versioned policy); the detection may stay in the backlog |
+| D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | Each milestone (done for M7) |
 
 **M7.**
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-17 | No token revocation at the provider (RFC 7009) on delete or replace | M7, with onboarding by URL (decided: §12.1.3) |
-| D-30 | The bridge for stdio MCP servers (R35, S11) | M7 |
-| D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | M7 |
-| D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML diffs | M7 |
-| D-33 | Provider profiles for S9 and S11 | M7 |
-| D-122 | No how-to for configuring the operator's own egress proxy (R5) | M7, with D-31 |
-| D-136 | No mix-up defence for pasted OAuth answers | M7, with onboarding by URL |
+| D-30 | The bridge for stdio MCP servers (R35, S11) | M7 (open): built; each check of the bridge's image verifier and smoke rows is still to be shown failing under a deliberate break |
+| D-151 | How the gateway reaches a bridge: a gateway-only vault route with the bridge's own token, in three placements, with confinement in the hardened tier only | M7 (open): built; closes with D-30 |
+| D-154 | A recorded by-hand onboarding run against a real OAuth-protected MCP server | M7 (open): recorded "not run" in [manual-checks.md](manual-checks.md); waits on a suitable public server, else the backlog with D-69 |
+| D-183 | The fake OAuth provider had no consent page, so a by-hand check couldn't show the session cookie held back on the callback | M7 (open): the consent page is built; that line of the check is still to run by hand |
 
 **M8.**
 
@@ -2631,12 +2621,14 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-96 | Dependabot doesn't cover Python dependencies | M8, or earlier (§12.2) |
 | D-98 | Python 3.14 isn't in the test matrix | M8, or when 3.14 support is claimed (§12.2) |
 | D-127 | The SMTP send journal records no caller | M8, with D-35 |
+| D-162 | Dependabot's docker entry didn't cover the example images | M8, with D-96: the Caddy pin in the compose files (M7 covered the example Dockerfiles) |
+| D-165 | The ledger view's flag for a send with no ledger record can be wrong near its coverage boundary, and the docs overstate it | M8, with D-35 and D-127 |
 
 **Triggered by an event.**
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-19 | DPoP and other non-Bearer tokens are unsupported (refused) | The first provider that needs them |
+| D-19 | DPoP and other non-Bearer tokens are unsupported (refused; onboarding refuses a server that requires them before registering) | The first provider that needs them |
 | D-21 | Accepted re-consent windows, and no real-process OAuth crash test | The next change to the store's write path or the token persist step |
 | D-27 | Readable ledger summaries (decided against for now) | After the ledger view is in use, if it isn't useful without them |
 | D-42 | Modern approval records have no early idle expiry, and the docs don't state the cost yet | A modern client that drops approvals without retrying, or reports of blocked `approve` tools |
@@ -2651,13 +2643,19 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-77 | End-to-end refusal rows covered only by unit tests | The test-debt pass before the PR into main |
 | D-79 | H16's toolkit-vault size caps are untested | The test-debt pass, or the next change to the toolkit link |
 | D-85 | A recorded by-hand smoke test of a real mail-toolkit deployment | The release checklist |
-| D-86 | Re-check the surviving mutants left as equivalent | An accepted-survivor list |
+| D-86 | Re-check the surviving mutants left as equivalent in M2 and M4 | The test-debt pass before the PR into main |
 | D-95 | The SDK bump procedure, and two pinned SDK-behaviour expected failures | The next `mcp` SDK bump |
 | D-108 | Checks of real MCP clients for approvals | The release checklist (§12.2); revisit at M8 |
 | D-110 | Release readiness: a security review, the first release, versioning, the README banner, the PR into main | "Useful end to end" (§12.2) |
 | D-124 | No `SECURITY.md` or changelog | The release checklist (§12.2) |
 | D-126 | The image smoke can't probe the portal from a real LAN host | The release checklist: one by-hand probe of both tiers from another machine |
-| D-144 | Browser checks of the portal not yet run by hand: Safari, an https origin, the OAuth callback and a security key ([manual-checks.md](manual-checks.md)) | Before the first release |
+| D-144 | Browser checks of the portal not yet run by hand: Safari, an https origin, a security key, and M7's review screen ([manual-checks.md](manual-checks.md)) | Before the PR into main |
+| D-145 | certifi trusted roots with compromised intermediates: fixed before M7, and the Debian root dropped from the image in M7; two cleanups are left | `exclude-newer` passing 2026-10-19 (drop certifi's exception); a Debian `ca-certificates` without emSign ECC Root CA - G3 (drop the image's line for it) |
+| D-156 | Client ID Metadata Documents aren't supported | An authorization server that offers only them, or refuses both dynamic registration and a given client |
+| D-159 | The portal's reverse-proxy snippets, the `lan-cert.yaml` override and the 421 and 403 probes were never run against a real proxy | The by-hand checklist before the PR into main |
+| D-160 | Make the Windows portal job a required CI check | Met over M7's runs; waits on the owner's branch-protection change |
+| D-163 | No guide to connecting real agent clients to the gateway | The docs pass before the PR into main, with D-108 |
+| D-191 | The stdio fake's self-test once saw the fake's output end early on Linux (not reproduced) | The test failing in CI, or a bridge test seeing a child's output end early |
 
 **Backlog.**
 
@@ -2673,26 +2671,47 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-51 | Modern stateful upstreams see one principal for every client (accepted) | If per-client credential binding is ever added |
 | D-52 | Deliberate credential disclosure by an upstream; the standard tier's shared egress (accepted) | Backlog |
 | D-55 | Out-of-process toolkits | After M8's `vault_approval` |
-| D-56 | Toolkits' outbound network in the standard tier is only documented (accepted) | Backlog |
+| D-56 | Toolkits' outbound network in the standard tier is only documented (accepted); the egress role doesn't confine them either | Backlog |
 | D-67 | No live rotation test for Spotify (deliberate) | Backlog |
 | D-69 | Optional live smoke tests for the other shapes | Backlog, or a by-hand check before the PR into main |
-| D-83 | The soak test doesn't check file descriptors | The next change to the upstream pool |
+| D-83 | The gateway's soak test doesn't check file descriptors (the bridge's soak does) | The next change to the upstream pool |
 | D-90 | Mutants are killed only by unit tests, and mutation testing runs only in CI (deliberate) | Backlog |
 | D-91 | No code coverage measurement | Backlog |
 | D-92 | CI runs only on Linux, so Windows-only tests never run there | Outside contributors developing on Windows |
 | D-94 | The image smoke runs only in CI | Backlog |
 | D-97 | No lint, type or shell checks on `scripts/` and the workflows | The next CI hygiene pass, before the PR into main |
 | D-111 | Markdown clients the prompt guard doesn't anticipate (accepted) | With the client checks (D-108) |
-| D-125 | In the standard tier, sibling containers and the gateway can reach the portal's unauthenticated routes (accepted; the hardened tier is the answer) | Backlog |
+| D-125 | In the standard tier, sibling containers and the gateway can reach the portal's unauthenticated routes (accepted; the hardened tier is the answer; ZoeyMCP's own bridges are D-151) | Backlog |
 | D-128 | Enrolment links for a second portal origin | With M8 |
 | D-131 | Mutation testing for the remaining security-relevant modules | Each module when it is next changed for security reasons |
 | D-133 | A liveness probe for static secrets and connectors | Backlog |
-| D-134 | A dev-only headless browser check of the portal's static UI | If the UI's script outgrows its bound, or the manual checks keep finding regressions |
+| D-134 | A dev-only headless browser check of the portal's static UI | A script past its cap (`review.js` 700 lines, `app.js` with `webauthn.js` 1,050) or the static files past 128 KiB in all, or manual checks that keep finding regressions |
 | D-135 | Other accepted limits of the portal, documented with it | Each when its mitigation changes |
 | D-137 | A leaked sign-in link and a page in the operator's browser can return an attacker's OAuth code first (accepted) | If a provider returns the account identity before the exchange |
 | D-139 | Two portal origins can share one host and port (`http://` and `https://`); the second is unreachable, and `check` doesn't warn | Backlog: a small `check` warning |
 | D-140 | Cookies planted at longer paths from another `localhost` port can lock the operator out of the portal; a denial only (accepted for now) | Backlog |
 | D-142 | On Windows, asyncio prints connection-reset tracebacks to stderr, outside the JSON log | Backlog: Windows is a development host only |
+| D-155 | The dynamic client registration lifecycle (RFC 7592): registration access tokens, deregistration, cleanup of orphaned registrations | A per-client registration limit, or a provider that rotates registered secrets |
+| D-157 | Revocation on replace and re-login (M7 revokes on delete only) | An operator who hits a provider's per-client token limit, or asks |
+| D-158 | The ledger view rereads every kept archive for its first page, with no cache | M6's history views, M8's second vault chain, or slow first pages |
+| D-161 | Mutation shards upload a stats file that nothing reads | The next CI hygiene pass, with D-97 |
+| D-167 | The vault binds its listening sockets before the block that closes them on a setup error | The next change to the vault's startup |
+| D-168 | No test for the step-up routes' 503 when the passkey file is unavailable | A later milestone that reloads the passkey file while running |
+| D-171 | `health --json` beside `--format json` in every other command | A CLI consistency pass, possibly with M6 |
+| D-172 | A token the server refuses reaches the agent as a generic "upstream error" | Backlog, or M6 with the health and portal work |
+| D-173 | Two minor paste and callback test gaps in the listener and framing code | Backlog |
+| D-174 | Health findings that need new state: a changed authorization-server metadata document, and a bridge's state on the portal's home page | M6's portal work, or a report of a metadata change that went unnoticed |
+| D-175 | SMTP connections aren't address-guarded by the vault without an egress proxy (accepted: the host is the operator's own) | A connector that takes a host learned from the network |
+| D-176 | A bridge's child runs as the bridge's own uid, so the two are one trust domain (accepted) | Backlog |
+| D-178 | Onboarding by URL for a server that needs no OAuth, or takes a static key | Backlog |
+| D-179 | An initial access token for dynamic client registration (RFC 7591 3.1) | An authorization server an operator needs that requires one |
+| D-180 | An optional name-pattern guard on bulk review | M6's drift review, or reports of servers mis-annotating destructive tools |
+| D-181 | A LAN server whose authorization server is also on a private address can't be onboarded by URL (accepted: it is written by hand) | Backlog |
+| D-182 | Client assignment in the second onboarding fragment | Backlog; M6's managed save may supersede it |
+| D-186 | The portal's paste dialog says "(shown below)" for a changed binding but shows nothing below | The next portal change with script budget to spare |
+| D-187 | A cancelled Connect from a server row leaves that server's review hold set | The next change to the portal's Connect flow |
+| D-188 | The review screen's "not annotated" filter misses a toolkit's unannotated consequential tools | The next change to the review screen's data |
+| D-189 | A review asked for right after a reload can wait up to about 25 s | M6, or the next change to the review poll |
 
 **Closed.**
 
@@ -2713,6 +2732,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-14 | OAuth connect in the portal: pasting the redirected address, and the portal's callback route (D-129) | Done in M5: paste, checked against a real provider, and the callback route (D-129) |
 | D-15 | A fixed-port loopback redirect as the default `redirect_uri` | Declined (§12.1) |
 | D-16 | An upstream "insufficient scope" health finding is kept in memory only, so a restart loses it | Done in M5: labelled "since the vault started" |
+| D-17 | No token revocation at the provider (RFC 7009) | Done in M7: a deleted grant is revoked, best effort, on delete only (§12.1.3); replace and re-login are D-157 |
 | D-20 | Nothing refreshes an idle credential in the background: an "idle for N days" health warning | Done in M5: an idle finding in health |
 | D-22 | A credential stuck after a spurious `invalid_grant`: a "try again" action in the portal | Done in M5: a reset action behind step-up |
 | D-23 | A credential's last failure isn't shown after a restart | Done in M5: the last failure is read from stored metadata |
@@ -2720,7 +2740,10 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-25 | The vault's SMTP send journal shown next to the ledger | Done in M5: the ledger view joins the journal and flags sends with no ledger record |
 | D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records are M8 (D-35) |
 | D-28 | The gateway's entry path still loads vault code | Done in M5 |
-| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | Done in M5: stated, with a test that no listener offers them; the constraint stands through M7 and M8 |
+| D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | Done in M7 |
+| D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML fragments | Done in M7: `login --mcp` and the portal's MCP servers page, walked end to end by S9 |
+| D-33 | Provider profiles for S9 and S11 | Done in M7 |
+| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | Done in M5, and held in M7: registration is the vault's, outbound only, and no new listener offers OAuth; the constraint stands through M8 |
 | D-49 | Designed log events that are never emitted (`server_unsupported`, `vault_link_refused`, `approval_unavailable`) | Done in M7: `server_unsupported` struck as obsolete, since no server kind is left unserved once `kind: bridge` is gone; `vault_link_refused` struck, covered by `policy_fetch_failed` with `status: 403` and `vault_refused`; `approval_unavailable` superseded by `approval_refused` |
 | D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | Done in M5 (the docs); detection is D-130 |
 | D-63 | Network filesystems are unsupported for state | Done |
@@ -2740,10 +2763,11 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-101 | §6.1 and §6.2 contradicted M4 as built | Done in M5 |
 | D-102 | §3.1 claimed an official-image warning that doesn't exist yet | Done in M5 |
 | D-103 | The recovery table in [operations.md](operations.md) lacks the SMTP connector row | Done in M5 |
-| D-104 | The README and the example policy describe unbuilt features as existing | Done in M5: the README says what exists, and M6 and M7 features are marked as planned |
+| D-104 | The README and the example policy describe unbuilt features as existing | Done in M5: the README says what exists, and M6 and M8 features are marked as planned (M7's since it was built) |
 | D-105 | R38's docs note on clients loading tools lazily | Done in M5 |
 | D-106 | The `lan` profile's own-certificate and ACME alternatives are only mentioned | Done in M5: documented in [operations.md](operations.md) |
-| D-109 | This public register | Done in M5; refreshed at the end of each milestone |
+| D-107 | Not every difference between Python's regex and ECMA-262 was listed in the docs | Done in M7: "Reading pinned schemas" in [operations.md](operations.md) §11 |
+| D-109 | This public register | Done in M5; refreshed at the end of each milestone, M7's included |
 | D-112 | Windows hosts' limits aren't recorded as a decision: Linux containers only, Windows and macOS for development | Done in M5: [operations.md](operations.md) lists the supported platforms |
 | D-115 | Two admin socket answers return a secret (the gateway key, a setup code): recorded as scoped exceptions to R61, absent from every portal route | Done in M5: R61 names the two exceptions |
 | D-116 | No acceptance test or profile for an OAuth credential on a gateway-served remote MCP route | Done in M5: a profile and acceptance tests, by CLI paste and by portal paste |
@@ -2752,8 +2776,25 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-119 | Bounds on the portal's unauthenticated endpoints against non-browser callers | Done in M5: caps on unauthenticated requests, rate, connections and bodies |
 | D-120 | The portal shows untrusted text as plain text, with hidden characters revealed | Done in M5 |
 | D-121 | No machine-readable credential health output | Done in M5: `zoeymcp health --json` |
+| D-122 | No how-to for configuring the operator's own egress proxy (R5) | Done in M7: [operations.md](operations.md) §28 |
 | D-123 | How the portal's static UI is tested | Done in M5: a thin script tested through the API, static checks of the files, and a recorded by-hand checklist |
+| D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | Done in M5; its by-hand checks passed at the start of M7 |
+| D-132 | M5's safe cuts, if any was taken | Closed in M5: no cut was taken |
+| D-136 | No mix-up defence for pasted OAuth answers | Done in M7: `iss` checked first, with each registration's own redirect address as a backstop |
 | D-138 | A trailing line break passed checks that must match a whole value | Done in M5: every such check matches the whole value, with a refusal test for each |
 | D-141 | A failed reload stopped the reader of the launcher's control pipe, so a later stop request was lost | Done in M5: the reader logs the failure and goes on |
 | D-143 | The docs didn't say that a phone's passkey provider can report an error after a successful enrolment or sign-in | Done in M5: [operations.md](operations.md) says so |
-| D-132 | M5's safe cuts, if any was taken | Closed in M5: no cut was taken |
+| D-146 | Trust rules for discovery fetches, and the discovery and registration protocol requirements | Done in M7: the fetch rules, and the address guard on every vault connection |
+| D-147 | How onboarding by URL finishes in declarative mode | Done in M7: two fragments, each checked with `check --with` before its commit |
+| D-148 | Where a registered client's secret lives, how it is bound and how it expires | Done in M7: stored at once under the binding the plan predicts, with expiry findings in health |
+| D-149 | The vault's egress allowlist must cover onboarding and the endpoints it pins | Done in M7: one derivation with named sources, and onboarding allowances that expire with the onboarding |
+| D-150 | The onboarding YAML: its form, and one emitter for untrusted strings | Done in M7: one change object and one emitter for every fragment |
+| D-152 | [threat-model.md](threat-model.md) had no actors or limits for M7's surfaces | Done in M7 |
+| D-164 | No end-to-end guide to a first hardened deployment, and no recipe for an existing stack with its own egress proxy | Done in M7: [operations.md](operations.md) §29 and §30, and `examples/existing-stack/` |
+| D-166 | The gateway's vault-link clients weren't closed at shutdown | Done in M7 |
+| D-169 | The hardened smoke's alias probe couldn't tell the vault's name from the portal's alias | Done in M7 |
+| D-170 | CI jobs had no `timeout-minutes` | Done in M7: every CI job has one |
+| D-177 | Two Docker networks per hardened bridge count against Docker's default address pools | Done in M7: [operations.md](operations.md) §33 says how many fit and how to widen the pools |
+| D-184 | A re-registration fragment couldn't carry `token_headers` or a list value in `extra_params` | Done in M7: such a re-registration is refused, and the operator edits the policy by hand |
+| D-185 | Health didn't report a client secret whose binding login refuses | Done in M7: health and login share the check |
+| D-190 | `check` and the egress role keyed an internationalized destination in its Unicode form | Done in M7: the `xn--` form everywhere |
