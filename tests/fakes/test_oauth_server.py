@@ -395,6 +395,8 @@ def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> No
     address = "http://localhost:8081/oauth/callback/notes"
     plain = run_oauth_server.parse(["--dir", str(tmp_path)])
     assert run_oauth_server.provider_of(plain) == "https://localhost:9443"
+    named = run_oauth_server.parse(["--dir", str(tmp_path), "--host", "localtest.me"])
+    assert run_oauth_server.provider_of(named) == "https://localtest.me:9443"
     fake = run_oauth_server.fake_for(plain, address)
     assert (fake.consent, fake.issuer, fake.iss_supported) == (False, None, False)
     assert (fake.registration, fake.switches, fake.registered_redirect) == ("open", set(), address)

@@ -229,20 +229,62 @@ view.
       the selection, and **Generate** counts what is included;
     - **Show definition** shows the whole definition, a long line continuing on marked lines
       under it with nothing cut, and every character outside ASCII as an escape.
-17. **Copy is the exact fragment** (the MCP servers page). Onboard by URL from the portal against
-    the fake provider (`python -m tests.fakes.run_oauth_server --dir ./onboard-check --metadata`,
-    with `--issuer-path` given a path long enough that its token endpoint's URL is 2,048 characters,
-    the longest a policy takes) through a fake MCP server whose protected-resource metadata names
-    it. Make fragment 1, then choose **Copy** and paste into a text editor. Pass: the pasted text is
-    the shown text, line for line and character for character, the 2,048-character URL whole on its
-    line; the same after choosing the compose indent, and for fragment 2.
+17. **Copy is the exact fragment** (the MCP servers page). Onboarding never fetches metadata from
+    or registers with a provider on a private address, and refuses a single-label host such as
+    `localhost` in metadata, so the fakes run under names that a name map gives the vault as
+    public addresses, dialled on loopback (`tests/fakes/resolver.py`, as the acceptance tests do).
+    From the repository root, in the development environment, start the fake provider under
+    `localtest.me` (a public name for 127.0.0.1, so the browser reaches it too) with its endpoints
+    under a path long enough that its authorize URL is 2,048 characters, the longest a policy
+    takes (2,013 characters for this host and port):
+
+    ```sh
+    python -m tests.fakes.run_oauth_server --dir ./onboard-check --host localtest.me --metadata         --endpoint-path "/$(python -c 'print("p" * 2012)')"
+    ```
+
+    Issue a certificate for `mcp.notes.example` from its CA and write the name map
+    (`localtest.me` to 9443, `mcp.notes.example` to 9444):
+
+    ```sh
+    python - <<'PY'
+    from pathlib import Path
+    from tests.acceptance.tls import ProviderCA, issue_cert
+    from tests.fakes.resolver import FakeResolver
+    d = Path("onboard-check")
+    ca = ProviderCA(d / "ca.pem", d / "server.pem", d / "server.key", d / "ca.key")
+    issue_cert(ca, "mcp.notes.example", d)
+    names = FakeResolver()
+    names.serve("localtest.me", 9443)
+    names.serve("mcp.notes.example", 9444)
+    names.save(d / "hooks.json")
+    PY
+    ```
+
+    Then the fake MCP server, protected (a request without its key gets the 401 and the
+    challenge) and naming the provider in its protected-resource metadata:
+
+    ```sh
+    python -m tests.fakes.run_mcp_server onboard-check/mcp.notes.example.pem         onboard-check/mcp.notes.example.key --port 9444 --prm path         --authorization-server https://localtest.me:9443 --static-key any-key
+    ```
+
+    Start a vault with the setup's `portal.yaml` through `tests/acceptance/procs.py`'s launcher,
+    which trusts the CA and installs the name map (`python -c "$LAUNCHER" onboard-check/ca.pem
+    onboard-check/hooks.json "" vault --config portal.yaml ...`, `LAUNCHER` printed by
+    `python -c 'from tests.acceptance.procs import LAUNCHER; print(LAUNCHER)'`), and set up a
+    passkey. Add `https://mcp.notes.example:9444/mcp` by URL, "This server is on my network"
+    unticked, with no client ID. Make fragment 1, then choose **Copy** and paste into a text
+    editor. Pass: the pasted text is the shown text, line for line and character for character,
+    the 2,048-character URL whole on its line; the same after choosing the compose indent, and for
+    fragment 2.
 18. **The callback of a client the vault registered** (item 13 against a client from dynamic
-    registration). With the fake provider of item 17 offering registration (`--registration open`),
-    add the server by URL in the portal with no client ID: the plan's redirect address is this
-    origin's `/oauth/callback/<credential>`. Register (a passkey), commit fragment 1 and reload,
-    then choose **Connect** on its row. Pass: as item 13's first part (the provider sends the
-    tab back to the portal, which asks for the passkey), and once connected the page queues the
-    server's review by itself.
+    registration). Continue from item 17, whose fake offers registration (`--registration open`,
+    the default): the plan's redirect address is this origin's `/oauth/callback/<credential>`.
+    Register (a passkey), commit fragment 1 (`zoeymcp check --config portal.yaml --with
+    fragment-1.yaml --print-merged`), reload (on Windows, restart the vault the same way), accept
+    the certificate warning for `https://localtest.me:9443` once, then choose **Connect** on the
+    server's row. Pass: as item 13's first part (the provider sends the tab back to the portal,
+    which asks for the passkey), and once connected the page queues the server's review by itself
+    (without a gateway polling the vault, the vault answers that request `review_unavailable`).
 
 ## D-66: the live OAuth test against a real provider
 
@@ -348,4 +390,6 @@ such server is available, record it as not run.
 | 13 (https) | 5d45d02 | 2026-10-20 | - | - | Not run | Needs a Web-application client registered with an `https` callback address |
 | 14 | 5d45d02 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | Item 13's Guest-window address after its login was cancelled: typed into the address bar, `Sec-Fetch-Site: none` and the refused page; pasted into a new Connect, "That address belongs to another login" (`state_mismatch`, refused before any passkey prompt) |
 | 16 | 1057bd9 | 2026-10-23 | Chrome 155, Windows | http://localhost:8081 | Pass | The standard tier (deploy/compose.yaml, the image built at a0fd851) with the fake MCP server as `fake`. With `large`: 96 tools, 64 read-only, 32 not annotated, 4 with findings and 1 with an error (the fake's URL descriptions and its invalid schema); the filter, **Select suggested** (the 64, no unannotated tool), **Clear** and **Generate** behaved; definitions whole. With `inject_definitions`, `inject_server_info` and `invalid_name`: the server's name (cut at the cap with `…[+26]`) and instructions, and `summarize`'s title and description, show every hidden character as a visible mark (`[U+200B]`, `[U+202E]` before an unreversed "desrever", `[U+001B]`, `[U+009B]`, the tag characters) and `<IMPORTANT>` as text; `summarize` and `read file!` can't be included (error findings; "name is not a valid tool name"); **Show definition** escapes every character outside ASCII, tag characters as surrogate pairs, nothing cut. No Trusted Types or Content Security Policy violation; the console's only error was the page's first `GET /api/session` 401 after the vault restarted. Seen: a finding gives its position but not which string it is in |
+| 17 | 63c9fb8 | 2026-10-23 | Chrome 155, Windows | http://localhost:8081 | Pass | The setup the item now gives: the fakes under `localtest.me` and `mcp.notes.example` through a name map, the provider's endpoints under a 2,013-character path. The plan showed dynamic registration at `localtest.me`; the registration answered 201; fragment 1 pasted from **Copy** matched the screen, its `authorize_url` 2,048 characters on one line (measured in the pasted text), and `check --with` passed it; the same for the compose indent and fragment 2. The log holds no client secret or registration token. Getting here found three faults, all fixed: the vault connected only to a name's first address (63c9fb8); the item's `--issuer-path` never lengthened an endpoint, and its fakes on `localhost` could never pass onboarding's host rules |
+| 18 | 63c9fb8 | 2026-10-23 | Chrome 155, Windows | http://localhost:8081 | Pass | Item 17's registered client, fragment 1 merged with `check --print-merged`, the vault restarted on it (Windows has no `SIGHUP`): **Connect** sent the tab to the fake and back to the portal's callback, the passkey confirmed, the exchange answered 200 and `notes` showed connected; the page then asked for the server's review by itself, which the vault answered `review_unavailable` (no gateway polled it in this setup). No code or token in the vault's log |
 | Live S9 | cfdeb04 | 2026-10-22 | - | - | Not run | No public server with dynamic registration was used yet; the fakes' run is S9 (`tests/acceptance/test_onboard_shape.py`) |

@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 
 import uvicorn
 
-from tests.acceptance.tls import make_ca
+from tests.acceptance.tls import issue_cert, make_ca
 from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer, Registration
 
 CLIENT_ID = "example-notes-client"
@@ -108,6 +108,7 @@ def parse(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--metadata", action="store_true")
     parser.add_argument("--issuer-path", default="")
     parser.add_argument("--endpoint-path", default="")
+    parser.add_argument("--host", default="")
     parser.add_argument("--iss", action="store_true")
     parser.add_argument("--registration", choices=REGISTRATIONS, default="open")
     parser.add_argument(
@@ -117,8 +118,10 @@ def parse(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def provider_of(args: argparse.Namespace) -> str:
-    """The provider's origin: on ``127.0.0.1`` with a consent page, another site (D-183)."""
-    host = "127.0.0.1" if args.consent else "localhost"
+    """The provider's origin: on ``127.0.0.1`` with a consent page, another site (D-183); at
+    ``--host`` when given, a dotted name for onboarding, which refuses metadata naming a
+    single-label host such as ``localhost``."""
+    host = args.host or ("127.0.0.1" if args.consent else "localhost")
     return f"https://{host}:{args.port}"
 
 
@@ -164,6 +167,11 @@ def main(argv: Sequence[str]) -> None:
     if fake.issuer is not None:
         print(f"Its metadata, for the issuer {fake.issuer}: {', '.join(fake.metadata_paths())}")
     print(f"The policy: {config}; the CA: {ca.ca_file}")
+    cert_file, key_file = ca.cert_file, ca.key_file
+    if args.host:
+        cert_file, key_file = issue_cert(ca, args.host, directory)
+        print(f"Its certificate, for {args.host} only (a fake MCP server there can use it too):")
+        print(f"  {cert_file} {key_file}")
     print("In another shell, with ZOEYMCP_MASTER_KEY set (zoeymcp keygen), start the vault:")
     print(
         f'  {sys.executable} -c "{LAUNCHER}" {ca.ca_file} vault --config {config} '
@@ -177,8 +185,8 @@ def main(argv: Sequence[str]) -> None:
         fake.app(),
         host="127.0.0.1",
         port=args.port,
-        ssl_certfile=str(ca.cert_file),
-        ssl_keyfile=str(ca.key_file),
+        ssl_certfile=str(cert_file),
+        ssl_keyfile=str(key_file),
         log_level="warning",
         proxy_headers=False,
         timeout_graceful_shutdown=SHUTDOWN_GRACE,
