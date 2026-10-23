@@ -3,7 +3,7 @@
 #
 # Secrets never appear in a policy, only references: store:<name> for the vault's encrypted
 # store, or env:<VAR>. The review pins below are illustrative; real ones come from
-# `zoeymcp review` (the portal gains a review screen in a later milestone).
+# `zoeymcp review`, or the portal's review screen, as a fragment to merge here.
 
 version: 1
 mode: declarative

@@ -2,11 +2,11 @@
 
 How to run what is built so far: the vault (M1), OAuth in the vault (M2), the gateway for
 remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SMTP connector
-and toolkits (M4, §19 onwards), and the admin portal (M5, §26). §27 says which hosts are
-supported. M7's so far: onboarding a remote MCP server by URL (§11), your own egress proxy
-(§28), fitting ZoeyMCP into a stack that already has one (§29), a first hardened deployment
-end to end (§30), the egress role (§31), the bridge (§32) and a stdio server behind one in each
-placement (§33). The design and the reasons behind it are in [design.md](design.md); this page is
+and toolkits (M4, §19 onwards), the admin portal (M5, §26), and M7: onboarding a remote MCP
+server by URL (§11), your own egress proxy (§28), fitting ZoeyMCP into a stack that already has
+one (§29), a first hardened deployment end to end (§30), the egress role (§31), the bridge
+(§32) and a stdio server behind one in each placement (§33). §27 says which hosts are
+supported. The design and the reasons behind it are in [design.md](design.md); this page is
 the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
@@ -39,6 +39,14 @@ The vault keeps its state in one directory (`/state`, the `vault-state` volume):
   `portal/passkeys.rejected-<ms>.json` a `--reset` enrolment moved aside;
 - `ledger-reported/`: the vault's copy of the gateway's approval ledger (§21).
 
+Onboarding by URL (§11) keeps its client in the store too, under names it reserves for the
+credential: `<credential>-client-secret` (a confidential client's secret, given or registered,
+bound to the token endpoint and the server's origin like any OAuth secret) and
+`<credential>-client-id` (a public client the vault registered, kept only until the second run).
+Their metadata says where they came from and, for a registered secret, when the provider says it
+expires (§3). Nothing else from an onboarding is written: onboardings, review jobs and bridge
+sessions live in memory, and a restart drops them.
+
 **Setup codes.** `zoeymcp setup-code` prints a one-time code that enrols a passkey in the portal.
 It works once, for 15 minutes, and a new one replaces the last. Enrolling with it adds a passkey;
 with `--reset` it removes every other passkey and ends every session (for a lost or stolen
@@ -69,6 +77,14 @@ aside. Drop with care: `ledger-reported/` (the gateway refills what it still hol
 is lost) and the connectors' send journals (the daily limit and the record of what was sent).
 Back up the gateway's `/state-gateway` separately; restoring one volume and not the other shows
 as a fork in the reported copy (§21).
+
+**Restoring an older backup** isn't detected: the vault takes the volume as it finds it. Besides
+the passkeys above, a restored `store.json` holds the client secrets of its day. A client the
+vault registered since the backup is gone from the store, but stays registered at the provider
+(remove it in the provider's own console), and its credential needs a new one (`login --mcp URL
+--reregister`, §11); a client re-registered since is back to its old secret, which the provider
+may no longer take (`oauth_client_rejected`, §4): register again the same way. A rotating refresh
+token that rotated since the backup is spent: sign in again (§6).
 
 **One vault per state volume.** A second vault on the same directory refuses to start ("another
 vault is using this state directory"). Network filesystems are unsupported: without `flock` the
@@ -471,6 +487,8 @@ page) or **Connect** (Credentials page) does the same (§26).
 | OAuth env seed, not rotating | automatic: the seed is promoted again | — |
 | OAuth env seed, rotating | `zoeymcp login` | `zoeymcp login` |
 | `client_credentials` | `secret set` the client secret | — |
+| a client secret you gave `login --mcp` (`<credential>-client-secret`) | `secret set` it again, then `zoeymcp login` | — |
+| a client the vault registered (`<credential>-client-secret`, or none for a public client) | `login --mcp URL --reregister` (§11), commit the fragment, then `zoeymcp login`; remove the old client in the provider's own console | — |
 | SMTP connector | a new app password at the provider, then `secret set` it; after a change of recipient, host, port or From, `secret set` again (the old binding no longer matches) | — |
 
 The portal's own state recovers from the host, never from the portal:
@@ -483,7 +501,7 @@ The portal's own state recovers from the host, never from the portal:
 | the passkey file can't be verified (`passkey_store_tampered`, `passkeys_unavailable`) | `zoeymcp setup-code --reset`: the file is moved aside as `portal/passkeys.rejected-<ms>.json`, never overwritten |
 | the state volume lost | the store's recovery above, then `zoeymcp setup-code` for a first passkey |
 | the master key lost (or replaced without `ZOEYMCP_MASTER_KEY_PREVIOUS`), the volume kept | the store's recovery above, then `zoeymcp setup-code --reset`: the passkey file can't be verified under another key |
-| the state volume restored from a backup | `zoeymcp passkeys`, and remove every passkey that shouldn't be there: the backup brings back passkeys removed since (§1) |
+| the state volume restored from a backup | `zoeymcp passkeys`, and remove every passkey that shouldn't be there: the backup brings back passkeys removed since; then check the clients onboarding registered since (§1) |
 
 A rotation is lost when the vault never saved the newest refresh token: a crash between the
 token answer and the write, a store that couldn't be written followed by a restart, or an answer
@@ -1073,7 +1091,7 @@ file alone.
 | It restarts during the sign-in | the sign-in is lost (§2): run it again; a stored client secret stays |
 | The store is lost | the client secret with it: onboard again with a new client (`--reregister` once the policy names the credential); the old client stays registered at the provider |
 
-The admin socket's routes behind it (M7 design M.1): `POST /onboard/discover` answers the plan,
+The admin socket's routes behind it: `POST /onboard/discover` answers the plan,
 or the second run's comparison (`stage: committed`); `POST /onboard/<onboarding>/register` stores
 a given client's secret, or registers a client for an onboarding with no client ID, and answers
 fragment 1 (with the registered `client_id` and its secret's `client_secret_expires_at`);
@@ -1105,7 +1123,7 @@ with `via` and its binding, as any secret does.
 
 ### The review job path
 
-A review can also run through the vault (M7 design F.2): the vault queues a job, and the gateway,
+A review can also run through the vault: the vault queues a job, and the gateway,
 which asks the vault for work and never takes a connection from it, runs the same review as
 `zoeymcp review` and posts its result back: `zoeymcp review <server> --via vault` in the vault's
 container (both tiers: `docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review
@@ -1310,6 +1328,10 @@ session idle timeout takes a gateway restart (`limits_change_needs_restart`).
   way out.
 - **Standard-tier egress:** the gateway shares the vault's network namespace. For anything that
   moves money, sends mail or touches personal data, use the hardened tier.
+- **Identical calls at once:** the gateway lets a `tools/call` out only for a call it validated,
+  counted by tool and arguments. If two calls with the same tool and arguments run at once and
+  one fails after it was sent, its withdrawal can take the other's place in that count, and the
+  other is then refused at the gateway's egress check and fails. It fails closed: call again.
 - **Bridges** (§33) relay the protocol and nothing else: a program behind one gets no roots,
   sampling or elicitation from the gateway (the bridge answers its `ping` and refuses every other
   request it makes), so give it its directories on its command line. Under `shared_session: true`
@@ -1917,14 +1939,16 @@ removes every other passkey and ends every session; the old authenticator may be
 enrol again. After restoring the state volume from a backup, check `zoeymcp passkeys`: a passkey
 removed since the backup is back, and works (§1, §6).
 
-**What a stolen session can and can't do.** A session is the cookie and the tab's token
-together; a page on another `localhost` port receives the cookie (cookies ignore ports) but not
-the token, and gets 401. Someone holding both halves, within the session's limits, can read what
-the portal shows (names, bindings, health, the policy view, the ledger, the passkey and session
-lists), start an OAuth sign-in, and end other sessions. They can't write or delete a secret,
-complete a connect, reset a credential, enrol, rename or remove a passkey, or restart the ledger
-chain: each needs a fresh passkey prompt bound to that change. If you think a session was taken,
-**End the other sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
+**What a stolen session can and can't do.** A session is the cookie and the tab's token together; a
+page on another `localhost` port receives the cookie (cookies ignore ports) but not the token, and
+gets 401. Someone holding both halves, within the session's limits, can read what the portal shows
+(names, bindings, health, the policy view, the ledger, the passkey and session lists, review
+reports), start an OAuth sign-in, start onboarding a server by URL (the vault then fetches that
+server's public metadata, through its address guard), queue a review, and end other sessions. They
+can't write or delete a secret, complete a connect, reset a credential, register a client, discover
+a server on your own network, enrol, rename or remove a passkey, or restart the ledger chain: each
+needs a fresh passkey prompt bound to that change. If you think a session was taken, **End the other
+sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
 ([threat-model.md](threat-model.md)) has the rest.
 
 **Checks for a verify script.** None of these changes anything:
@@ -2105,11 +2129,12 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 
 ## 27. Supported platforms
 
-**Deployments run in Linux containers**, from the official image, on Docker Engine 28.0 or later
-in both tiers. Older engines let other hosts on the same network segment reach ports published
-on `127.0.0.1`, and connect to a container's published ports directly, which would put the
-portal and the standard tier's gateway on the LAN. The image smoke test refuses an older engine,
-but ZoeyMCP can't check the host's engine at run time: check `docker version` yourself.
+**Deployments run in Linux containers**, from the official image, on Docker Engine 28.0 or later in
+both tiers; so do the egress role and every bridge, from the official or a derived image. Older
+engines let other hosts on the same network segment reach ports published on `127.0.0.1`, and
+connect to a container's published ports directly, which would put the portal and the standard
+tier's gateway on the LAN. The image smoke test refuses an older engine, but ZoeyMCP can't check the
+host's engine at run time: check `docker version` yourself.
 
 **Windows and macOS hosts are for development and tests only.** Running the vault or the gateway
 outside a container there works for trying things out, with these differences:
@@ -2123,6 +2148,9 @@ outside a container there works for trying things out, with these differences:
 | Windows | when a browser drops a connection, Python's event loop may print `ConnectionResetError` tracebacks to stderr, outside the JSON log; they are noise |
 | Windows, macOS | the standard tier's launcher (`zoeymcp standard`) refuses to run: it needs a Linux container |
 | Windows, macOS | the link socket's peer check needs Linux: the gateway uses a gateway key over TCP |
+| Windows | the bridge (§32) refuses to start: it needs a POSIX platform |
+| Windows | the egress role (§31) has no `SIGTERM`, `SIGINT` or `SIGHUP` handlers, as above |
+| Windows, macOS | a bridge can't listen on a Unix socket, and the vault refuses `--bridge` (both peer checks need Linux), so a route's `unix:` upstream answers 502: the standard tier's bridges need its launcher anyway |
 
 On a development host, `localhost` may resolve to `::1` first; bind the portal to
 `127.0.0.1:8081` and browsers fall back to it.
@@ -2290,7 +2318,7 @@ emitted snippet: it parses it, refuses a listed name answering `10.x`, `::ffff:1
 of public and private, and an address whose PTR name is listed, and lets a listed public name
 through.
 
-**Onboarding through it.** With onboarding by URL (`zoeymcp login --mcp`, as M7 lands), the
+**Onboarding through it.** With onboarding by URL (`zoeymcp login --mcp`, §11), the
 proxy refuses the hosts the policy doesn't name yet. The vault then stops and answers
 `proxy_refused` with every host it has learned so far and the Squid lines that allow them, in
 the snippet's shape, reusing its `zoeymcp_private_dst` and its `zoeymcp_port_<n>` ACLs (a port
@@ -2346,6 +2374,10 @@ shape.
   `egress_proxy_acls` names your ACL), whose `src` is the
   bridge's address on that network, so the program reaches its own list and nothing on the
   vault's.
+- **The egress role** (§31) is for a stack without a proxy of its own. Beside the stack's proxy,
+  leave `egress_proxy_kind` unset (or `own`): the vault then takes `egress_proxy` for your
+  proxy, and onboarding asks you to allow its hosts there (§11). A hardened bridge's program
+  goes out through the stack's proxy too (above), not the role.
 - **The agents** get one entry per server in the runtime's configuration: the URL
   `http://zoeymcp-gateway:8090/s/<server>/mcp`, the header
   `Authorization: Bearer <client token>` (§10), and the runtime's own approval setting for that
@@ -2547,6 +2579,19 @@ committed. Assigning the server to the agent is still yours (step 8).
 
 Through your own egress proxy (§28), step 7 may stop at `proxy_refused`, naming the hosts to
 allow and the same command to run again, which carries on where it stopped once they are allowed.
+Through the egress role (§31: the `egress-proxy` profile, its key from `zoeymcp egress-key`, and
+`egress_proxy` with `egress_proxy_kind: role` in the policy) there is nothing to allow by hand:
+the vault widens its own list while the onboarding runs.
+
+**A stdio server** joins behind a bridge, in §33's cold-start order: build the derived bridge
+image; commit the bridge's route, its header credential and the server (step 6) without the
+override yet; make its token with `$c exec vault zoeymcp secret set bridge-<name>-token
+--generate` and set `ZOEYMCP_BRIDGE_<NAME>_TOKEN_SHA256` to the line it prints (without it the
+bridge refuses to start, and compose keeps restarting it); then add
+`examples/bridge/compose.bridge.yaml` beside the compose file (`c` then names both files, and so
+should `ZOEYMCP_COMPOSE_CMD`), with the role running (§31) when its program needs egress, and run
+`$c up -d bridge-<name>`, then `$c up -d vault`. Its program reaches only its own egress list,
+through the role. Review it as in step 8 and assign it to the agent.
 
 ## 31. The egress role
 
@@ -2969,7 +3014,7 @@ other compose project, and the hardened tier itself uses up to seven, so widen t
 daemon's configuration (`"default-address-pools": [{"base": "10.200.0.0/16", "size": 24}]` in
 `/etc/docker/daemon.json` gives 256) before running many bridges.
 
-From a cold start (J7):
+From a cold start:
 
 1. Build the image from `examples/bridge/` (its README) and verify it.
 2. Commit the route (`upstream: http://bridge-fetch-mcp:9000`, `allow_insecure_upstream: true`,
@@ -3056,7 +3101,7 @@ gateway:
     fetch: {kind: remote, route: bridge-fetch, path: /mcp, era: legacy}
 ```
 
-From a cold start (J7): build and verify the image; commit the route, its credential and the
+From a cold start: build and verify the image; commit the route, its credential and the
 server, and recreate the container; make the token in it (above) and set
 `ZOEYMCP_BRIDGE_FETCH_TOKEN_SHA256`; add the override and recreate the container:
 
@@ -3067,7 +3112,7 @@ docker compose -f deploy/compose.yaml -f examples/bridge/compose.standard.yaml u
 Then review as in A. Until its hash is set the bridge refuses to start and stays down, and its
 route answers 502.
 
-**A bridge that exits on its own stays down** (FM-29): the launcher logs `child_exited` and
+**A bridge that exits on its own stays down**: the launcher logs `child_exited` and
 `launcher_bridge_down` and doesn't restart it, since PID 1 holds no privilege to start a process
 as another uid and third-party code must not be able to restart the trust root. The vault and
 the gateway keep serving every other server. Its route answers 502 at once, with nothing sent,

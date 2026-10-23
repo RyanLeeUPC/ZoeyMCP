@@ -18,7 +18,7 @@ For each client, and each version you deploy:
 | --- | --- | --- |
 | Shows the whole message, and up to what length | a client that truncates shows less than was approved | `approvals.budget_chars` (per client, lower only) |
 | Shows plain text or renders Markdown | Markdown can hide text or fake structure | `approvals.renders`: `plain` only if it never renders |
-| Renders URLs as links | a link's target can differ from its text | `renders: markdown` refuses `](` |
+| Renders URLs as links | a link's target can differ from its text | `renders: markdown` refuses `](`; a bare `http(s)://` URL isn't refused for any `renders` value, so check whether the client makes one a link |
 | Can auto-accept (by default, or through hooks or settings) | an auto-accepting client approves anything; the prompt protects nothing | don't mark such a client `attended`; `confirm_code: true` stops blind hooks only |
 | Offers a persistent "always allow" for elicitations | one click would approve every later call | as above |
 | Merges identical prompts | two calls could share one answer | each prompt carries its own ref; check the footer |

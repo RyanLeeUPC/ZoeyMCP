@@ -93,6 +93,14 @@ $c run --rm --no-deps -T vault check --emit-egress-allowlist --allowlist-format 
 operations.md §28 has the rest: what goes through the proxy, how the snippet's rules work, and
 onboarding through it.
 
+**Bridges and the egress role.** A stdio server behind a hardened bridge (operations.md §33) gets
+networks of its own here too, never one of the stack's: one it shares with the vault alone and,
+when its program has an egress list, one it shares with the stack's proxy alone. The snippet then
+gives the bridge's route a source of its own, whose `src` ACL is the bridge's address on that
+network (operations.md §29). ZoeyMCP's own egress role (operations.md §31) is for a stack without
+a proxy; here the policy leaves `egress_proxy_kind` unset, so the vault takes `egress_proxy` for
+the stack's proxy.
+
 ## The portal
 
 Docker publishes a port only through a non-internal network, so a vault on internal networks alone

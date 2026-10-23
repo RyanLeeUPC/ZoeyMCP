@@ -4,9 +4,9 @@ A self-hosted proxy that lets AI agents use outside APIs and MCP servers **witho
 real credential**, and that asks a human to approve the **exact arguments** of every consequential
 action.
 
-> **Not ready for use.** Early development: the vault, the gateway, approvals, toolkits and the
-> admin portal work, but the bridge, onboarding by URL, managed mode and out-of-band approvers
-> don't exist yet, and nothing has been reviewed or released.
+> **Not ready for use.** Early development: the vault, the gateway, approvals, toolkits, the
+> admin portal, onboarding by URL, the egress role and the bridge work, but managed mode and
+> out-of-band approvers don't exist yet, and nothing has been reviewed or released.
 > Don't deploy it. See [docs/design.md](docs/design.md) for where it's going,
 > [docs/threat-model.md](docs/threat-model.md) for what it defends against, and
 > [docs/operations.md](docs/operations.md) for running what exists.
@@ -46,6 +46,22 @@ Built so far:
   `zoeymcp health`); the gateway's approval ledger pushed to an append-only copy in the vault,
   with the sends no call explains; and a read-only view of the declarative policy. An OAuth
   credential for a remote MCP server whose client you register yourself.
+- **M7, onboarding, the egress role and the bridge:** `zoeymcp login --mcp URL` and the portal's MCP
+  servers page add an OAuth-protected remote MCP server from its URL: discovery of its
+  protected-resource and authorization-server metadata through a guarded client, a client the
+  provider registered for you or one the vault registers (dynamic client registration), with any
+  client secret stored at once and bound to the endpoints the plan names, and mix-up checks on the
+  answer. Each step ends in a policy fragment to merge (`check --with` proves it first): the
+  credential, route and server, then the tools picked and classified in a first-time review that the
+  gateway runs for the vault, with the server's own annotations as labelled suggestions (`review
+  --choose` and `--choices` for a server with many tools). Every vault connection made without an
+  egress proxy refuses a private, loopback or other non-global address unless `egress_private`
+  lists it (with one, the check is the proxy's), and deleting a grant
+  revokes it at the provider, best effort. `check --emit-egress-allowlist` turns the policy into an
+  allowlist for your own egress proxy; the hardened tier's `egress-proxy` profile runs ZoeyMCP's own
+  CONNECT-only proxy, held to the lists the vault derives. `zoeymcp bridge` serves a stdio MCP
+  server over HTTP behind a vault route with a token of its own, in its own container (hardened), as
+  a process of the standard tier's container (unconfined), or on another host.
 
 ## Quickstart (standard tier)
 
@@ -53,7 +69,7 @@ One container, the gateway on `localhost:8090`, for one remote MCP server that t
 key. Build the image (`docker build -t zoeymcp:local .`), then:
 
 ```sh
-docker run --rm zoeymcp:local keygen          # keep ZOEYMCP_MASTER_KEY; the gateway key isn't
+docker run --rm zoeymcp:local keygen          # keep ZOEYMCP_MASTER_KEY; this tier needs only that
 docker run --rm zoeymcp:local client-token    # for the agent; put token_sha256 in the policy
 ```
 
@@ -75,10 +91,33 @@ container, and point the agent at the server:
                           "headers": {"Authorization": "Bearer zgc1-..."}}}}
 ```
 
+**A server that signs in with OAuth** is added by its URL instead, in two commits (operations.md
+§11). Remove the example `notes` server, its route and its credential first (and `notes` from
+the client's `servers`), then:
+
+```sh
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp login \
+  --mcp https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
+docker compose -f deploy/compose.yaml run --rm --no-deps -v "$PWD:/w:ro" zoeymcp \
+  check --with /w/onboard-notes-1.yaml
+```
+
+The plan shows every host the vault contacts and what it will register; fragment 1 adds the
+credential, its route and the server with no tools. Merge it into the policy, check the edited
+file, recreate the container, and run the same `login --mcp` command again: it signs in (paste
+the address the provider sends you to) and has the gateway review the server's tools. The two
+commands it prints next make fragment 2, the tools you pick and classify; commit it as the
+first, put `notes` back in the client's `servers`, and the agent's configuration above stays as
+it is. The portal's MCP servers page does the same in a browser. In the hardened tier the
+commands run in the `vault` service instead (operations.md §30 walks a first hardened deployment
+end to end).
+
 **When to move to the hardened tier** ([deploy/compose.hardened.yaml](deploy/compose.hardened.yaml)):
 for anything that moves money, sends mail or touches personal data. In the standard tier the
 gateway shares the vault's network namespace, so a compromised gateway has a way out; in the
-hardened tier it has none. Both are in [docs/operations.md](docs/operations.md) (§9 onwards).
+hardened tier it has none. Bridges work in both tiers; only the hardened tier confines them. Both
+are in [docs/operations.md](docs/operations.md) (§9 onwards); a stdio server behind a bridge, in
+each tier, is §33.
 
 **The portal** is at `http://localhost:8081` in a browser on the same host, in both tiers. Issue
 the one-time code that enrols your first passkey with
@@ -101,15 +140,19 @@ rest, including reaching it from another machine.
   - Write-only secret entry: values go in and are never shown again.
   - OAuth connect in the browser (PKCE), with tokens stored straight into the encrypted store.
   - Credential health, and the approval ledger as the vault received it.
-  - Planned for M7: onboarding an MCP server by URL (discovery and client registration), ending
-    in a first-time tool review and, in declarative mode, the YAML diff to commit. For M6: tool
-    drift review and re-pinning in the browser, and managed mode (the portal as the policy's
-    source, with versions and rollback). Until then, `zoeymcp review` does the reviewing.
-- **Bridge (planned for M7):** runs a stdio-only MCP server in its own container and exposes it
-  over HTTP.
+  - Onboarding an MCP server by URL (discovery and client registration), ending in a first-time
+    tool review and the policy fragment to commit.
+  - Planned for M6: tool drift review and re-pinning in the browser, and managed mode (the portal
+    as the policy's source, with versions and rollback). Until then, `zoeymcp review` reviews
+    drift.
+- **Bridge:** serves a stdio-only MCP server over HTTP, reached only through a vault route that
+  injects its own token: in a container of its own on networks of its own (hardened), as a
+  process of the standard tier's one container (unconfined), or on another host.
 - **Two deployment tiers:** a single container to get started, and a hardened compose, where the
   gateway has no internet access at all, for anything that moves money, sends mail or touches
-  personal data.
+  personal data. The hardened tier can also send the vault and its bridges out through ZoeyMCP's
+  own egress proxy (or yours), each held to the hosts its policy names. Bridges work in both;
+  only the hardened tier confines them.
 
 Built for one operator running a few agents. Multi-tenant features and SSO are non-goals.
 
@@ -134,7 +177,8 @@ shipped `profiles/`), the portal's effect tests over real sockets (`tests/portal
 contract tests for the MCP SDK and what the portal relies on (`tests/sdk`), a by-hand browser
 checklist ([docs/manual-checks.md](docs/manual-checks.md)), an image smoke test of both
 deployment tiers (`scripts/smoke-image.sh`), and mutation testing of the security-critical
-modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and 95% for each module M5 added).
+modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and for each module M5 and
+M7 added).
 
 ## License
 

@@ -13,16 +13,20 @@ fail. Record no account names, addresses or other personal details.
 
 ## When each item runs
 
-| Items | Run before the acceptance of |
+Each item checks one feature of the portal's page. Run the items of a feature before a release,
+and again after any change to that feature's page code or to what the vault sends it.
+
+| Items | Feature |
 | --- | --- |
-| 1-7, 10, 11 | step 11 (setup, enrolment, login, logout and sessions) |
-| 8, 9 | step 14a (OAuth connect by paste) |
-| D-66 | step 14a: the live OAuth test against a real provider (its own section below) |
-| 13, 14 | step 14b (the OAuth callback) |
-| 12 | no step waits on it (the portal tests cover it); run it with 1-7 |
-| 15 | step 13 (secrets) |
-| 16-18 | M7 step 14b (the MCP servers page) |
-| Live S9 | M7 step 15: onboarding by URL against a real server (its own section below) |
+| 1-7, 10, 11 | setup, enrolment, sign-in, sign-out and sessions |
+| 12 | a second `localhost` port (the portal tests cover it too; run it with 1-7) |
+| 8, 9 | OAuth connect by paste, and step-up |
+| D-66 | OAuth against a real provider (its own section below) |
+| 13, 14 | the OAuth callback |
+| 15 | secrets |
+| 16, 17 | the MCP servers page: the review screen and the fragments |
+| 18 | the OAuth callback of a client the vault registered |
+| Live S9 | onboarding by URL against a real server (its own section below) |
 
 ## The setup for every item
 
@@ -80,7 +84,7 @@ view.
    open `https://zoeymcp.tailnet.example/` and choose **Sign in with a passkey**. Pass: the
    browser doesn't offer the `localhost` passkey (it offers none, or only ones enrolled on that
    name).
-8. **Step-up shows the summary first** (step 14a). With two passkeys enrolled, open
+8. **Step-up shows the summary first** (OAuth connect, step-up). With two passkeys enrolled, open
    **Passkeys**, choose **Rename** on one and give a new name. Pass: the dialog shows what the
    vault will do (the passkey, its name now, the new name) before any passkey prompt; choose
    **Confirm with your passkey** and cancel the browser's prompt: the dialog says the prompt was
@@ -88,7 +92,7 @@ view.
    Then, with the policy below, open **Credentials**, choose **Connect** on `demo`, paste
    `http://127.0.0.1/callback?code=x&state=wrong` and choose **Check the address**. Pass: the
    dialog says the address belongs to another login, and no passkey prompt opens.
-9. **The authorization link** (step 14a). Add the policy below to `portal.yaml`, restart the
+9. **The authorization link** (OAuth connect). Add the policy below to `portal.yaml`, restart the
    vault and sign in. Open **Credentials** and choose **Connect** on `demo`, then the dialog's
    link. Pass: it opens example.com in a new tab, and in that tab's console `window.opener` is
    `null`; the Network panel shows the request to example.com without a `Referer` header. Close
@@ -144,9 +148,9 @@ view.
     the vault, then forward that port to the portal's listener, keeping the browser's `Host`:
     `ssh -N -L 8082:127.0.0.1:8081 localhost`. Pass: a passkey enrolled through
     `http://localhost:8081` is offered and accepted on `http://localhost:8082`.
-13. **The callback** (step 14b). Stop the vault of the setup above. From the repository root,
-    in the development environment, start the fake provider, which makes a throwaway CA, serves
-    a fake OAuth server at `https://localhost:9443` whose registered redirect is
+13. **The callback** (the OAuth callback). Stop the vault of the setup above. From the repository
+    root, in the development environment, start the fake provider, which makes a throwaway CA,
+    serves a fake OAuth server at `https://localhost:9443` whose registered redirect is
     `http://localhost:8081/oauth/callback/notes`, and writes a policy for it:
 
     ```sh
@@ -170,8 +174,8 @@ view.
       connected.
 
     The fake as started above answers `/authorize` with an immediate redirect, so the navigation
-    starts and ends on the portal and the browser sends `zoeymcp-8081-session` anyway (register
-    D-183). For the no-session-cookie line, stop it and start it again with `--consent`:
+    starts and ends on the portal and the browser sends `zoeymcp-8081-session` anyway. For the
+    no-session-cookie line, stop it and start it again with `--consent`:
 
     ```sh
     python -m tests.fakes.run_oauth_server --dir ./callback-check --consent
@@ -195,22 +199,22 @@ view.
     `redirect_uri` to that origin's `/oauth/callback/<credential>`, reload, and repeat the first
     part from a session on that origin; the cookie is then `__Secure-zoeymcp-cb`, with `Secure`.
     Without such a client, record this part as not run.
-14. **A stale callback address** (step 14b). Take a callback address from item 13 whose login
-    has ended (confirmed, cancelled or more than 10 minutes old) and type or paste it into the
-    address bar. Pass: the request carries `Sec-Fetch-Site: none`; the refused page shows, with
-    the address intact. Start a new **Connect** and paste that address into its dialog. Pass:
-    refused as belonging to another login (`state_mismatch`) or as expired (`flow_unknown`),
-    with no passkey prompt.
-15. **The secret field isn't saved** (step 13). Sign in, open **Secrets**, enter a name and a
+14. **A stale callback address** (the OAuth callback). Take a callback address from item 13 whose
+    login has ended (confirmed, cancelled or more than 10 minutes old) and type or paste it into the
+    address bar. Pass: the request carries `Sec-Fetch-Site: none`; the refused page shows, with the
+    address intact. Start a new **Connect** and paste that address into its dialog. Pass: refused as
+    belonging to another login (`state_mismatch`) or as expired (`flow_unknown`), with no passkey
+    prompt.
+15. **The secret field isn't saved** (secrets). Sign in, open **Secrets**, enter a name and a
     value, choose **Set the secret**, confirm with the passkey. Pass: the value shows as dots while
     typed (in Chrome, Edge and Safari; other browsers may show it as typed); the browser doesn't
     offer to save it as a password (and no password manager fills or stores it); after the confirm
     the value field is empty; the page's elements (developer tools, Elements) hold no copy of it.
-16. **The review screen with hostile text, under Trusted Types** (M7 step 14b). A vault with its
-    portal and a gateway that polls it (either tier's compose file with an `admin` block, say),
-    whose policy serves the fake MCP server as a remote server, connected. Start the fake from
-    the repository root with a certificate the route trusts, once as
-    `python -m tests.fakes.run_mcp_server CERT KEY --switch large` (J4's 96 tools) and once with
+16. **The review screen with hostile text, under Trusted Types** (the MCP servers page). A vault
+    with its portal and a gateway that polls it (either tier's compose file with an `admin` block,
+    say), whose policy serves the fake MCP server as a remote server, connected. Start the fake
+    from the repository root with a certificate the route trusts, once as
+    `python -m tests.fakes.run_mcp_server CERT KEY --switch large` (96 tools) and once with
     `--switch inject_definitions --switch inject_server_info --switch invalid_name`, reloading
     the gateway between. In Chrome or Edge with the Console open, open **MCP servers** and choose
     **Review tools** (or **Review again**). Pass, for each:
@@ -225,15 +229,15 @@ view.
       the selection, and **Generate** counts what is included;
     - **Show definition** shows the whole definition, a long line continuing on marked lines
       under it with nothing cut, and every character outside ASCII as an escape.
-17. **Copy is the exact fragment** (M7 step 14b). Onboard by URL from the portal against the fake
-    provider (`python -m tests.fakes.run_oauth_server --dir ./onboard-check --metadata`, with
-    `--issuer-path` given a path long enough that its token endpoint's URL is 2,048 characters,
-    the longest a policy takes) through a fake MCP server whose protected-resource metadata
-    names it. Make fragment 1, then choose **Copy** and paste into a text editor. Pass: the pasted
-    text is the shown text, line for line and character for character, the 2,048-character URL
-    whole on its line; the same after choosing the compose indent, and for fragment 2.
-18. **The callback of a client the vault registered** (M7 step 14b; item 13 against a DCR
-    client). With the fake provider of item 17 offering registration (`--registration open`),
+17. **Copy is the exact fragment** (the MCP servers page). Onboard by URL from the portal against
+    the fake provider (`python -m tests.fakes.run_oauth_server --dir ./onboard-check --metadata`,
+    with `--issuer-path` given a path long enough that its token endpoint's URL is 2,048 characters,
+    the longest a policy takes) through a fake MCP server whose protected-resource metadata names
+    it. Make fragment 1, then choose **Copy** and paste into a text editor. Pass: the pasted text is
+    the shown text, line for line and character for character, the 2,048-character URL whole on its
+    line; the same after choosing the compose indent, and for fragment 2.
+18. **The callback of a client the vault registered** (item 13 against a client from dynamic
+    registration). With the fake provider of item 17 offering registration (`--registration open`),
     add the server by URL in the portal with no client ID: the plan's redirect address is this
     origin's `/oauth/callback/<credential>`. Register (a passkey), commit fragment 1 and reload,
     then choose **Connect** on its row. Pass: as item 13's first part (the provider sends the
@@ -242,7 +246,7 @@ view.
 
 ## D-66: the live OAuth test against a real provider
 
-Run once before step 14a's acceptance, with a provider client of your own; CI never runs it.
+Run once for each release, with a provider client of your own; CI never runs it.
 Record it in the results table as item `D-66`: the commit, the date, the provider and client
 type (for example "Google, Desktop app client"), pass or fail per part, and what the provider
 showed when something failed. Record no account name, email address, client ID or secret, and
@@ -339,7 +343,7 @@ such server is available, record it as not run.
 | 9 | 9575a87 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | The authorization link opened Google's page in a new tab with `window.opener` null |
 | 15 | 9575a87 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Fail | Chrome offered to save the secret's value as a password after the step-up confirm, despite `autocomplete="off"` and no `name`. The owner chose a text area, masked where the browser supports it; to be run again |
 | 15 | becd428 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | Re-run with the masked text area: the value showed as dots, Chrome didn't offer to save it, and the field was empty after the confirm |
-| 13 | 5d45d02 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass, with findings | Against `tests.fakes.run_oauth_server`. A clicked link arrives `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`; the provider's link pasted into the address bar arrives `none` (accepted by C.7). The request carries `zoeymcp-8081-cb` (HttpOnly, `SameSite=Lax`), which isn't listed under Application after the confirm because the confirm expires it. It also carries `zoeymcp-8081-session`: the fake answers `/authorize` with an immediate redirect, so the navigation starts and ends on the portal and Chrome treats it as same-site for `SameSite`, with the fake at `https://localhost:9443` and again at `https://127.0.0.1:9443`. The callback reads only the binding cookie; the no-session-cookie line needs a provider with a consent page (D-183). The tab ends on `/callback/received`, the history list has no entry for the address that held the code, and Back doesn't return to it. The passkey summary showed where and when the sign-in came back and the "Confirm only if" line; `notes` then showed `ok`. The callback address opened in a Guest window: the refused page, the address intact, the first browser's dialog still waiting (`callback_not_taken`) |
+| 13 | 5d45d02 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass, with findings | Against `tests.fakes.run_oauth_server`. A clicked link arrives `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`; the provider's link pasted into the address bar arrives `none` (accepted by the callback's rules). The request carries `zoeymcp-8081-cb` (HttpOnly, `SameSite=Lax`), which isn't listed under Application after the confirm because the confirm expires it. It also carries `zoeymcp-8081-session`: the fake answers `/authorize` with an immediate redirect, so the navigation starts and ends on the portal and Chrome treats it as same-site for `SameSite`, with the fake at `https://localhost:9443` and again at `https://127.0.0.1:9443`. The callback reads only the binding cookie; the no-session-cookie line needs a provider with a consent page (the fake's `--consent`). The tab ends on `/callback/received`, the history list has no entry for the address that held the code, and Back doesn't return to it. The passkey summary showed where and when the sign-in came back and the "Confirm only if" line; `notes` then showed `ok`. The callback address opened in a Guest window: the refused page, the address intact, the first browser's dialog still waiting (`callback_not_taken`) |
 | 13 (https) | 5d45d02 | 2026-10-20 | - | - | Not run | Needs a Web-application client registered with an `https` callback address |
 | 14 | 5d45d02 | 2026-10-20 | Chrome 155.0.8059.85, Windows | http://localhost:8081 | Pass | Item 13's Guest-window address after its login was cancelled: typed into the address bar, `Sec-Fetch-Site: none` and the refused page; pasted into a new Connect, "That address belongs to another login" (`state_mismatch`, refused before any passkey prompt) |
-| Live S9 | cfdeb04 | 2026-10-22 | - | - | Not run | No public server with dynamic registration was used yet (D-154); the fakes' run is S9 (`tests/acceptance/test_onboard_shape.py`) |
+| Live S9 | cfdeb04 | 2026-10-22 | - | - | Not run | No public server with dynamic registration was used yet; the fakes' run is S9 (`tests/acceptance/test_onboard_shape.py`) |

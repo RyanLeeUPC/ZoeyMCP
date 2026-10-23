@@ -1,9 +1,9 @@
 # ZoeyMCP threat model
 
 Who might attack a deployment, what each can reach, and the most each can gain once everything
-built so far (M1 to M5) holds. The mechanisms are in [design.md](design.md); the invariants the
-tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, and the portal's are P1 to
-P22 (M5) (§8.2).
+built so far (M1 to M7) holds. The mechanisms are in [design.md](design.md); the invariants the
+tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, the portal's are P1 to
+P22 (M5), and onboarding's, the egress role's and the bridge's are X1 to X24 (M7) (§8.2).
 
 ## Actors
 
@@ -70,7 +70,8 @@ At most:
   gateway-bound routes; toolkits aren't isolated from each other. What still holds is in the
   vault: fixed sender and recipients, the expected-recipient check, the rolling limit, `paused`,
   route allowlists, and the send journal, which the gateway can't edit. In the standard tier a
-  toolkit dependency also has the gateway's egress. The derived-image recipe lowers the chance of
+  toolkit dependency also has the gateway's egress, which M7's egress role doesn't confine: it
+  confines hardened bridges only. The derived-image recipe lowers the chance of
   T6; M8's vault-side approvals close the gap.
 - **T7** sees names, refs, outcomes, counts and keyed digests; never argument values, prompt
   text, subjects, bodies, recipients, handles or secrets.
@@ -174,22 +175,137 @@ At most:
   them); the code is single use and useless without the vault's PKCE verifier, and the `state`
   without the binding cookie. The `localhost` and SSH-tunnel paths have no proxy.
 
+## Onboarding, the egress role and bridges (M7)
+
+M7 lets the vault fetch and register at servers the operator names by URL, adds a review path
+between the gateway and the vault, ZoeyMCP's own egress proxy, and bridges that run third-party
+stdio programs. It restates T2, T4, T7, T10, T13 and T14 for these surfaces and adds six actors.
+A bridge runs in one of three placements: **A**, the hardened tier, a container of its own;
+**B**, the standard tier, a process of the one container with a uid of its own, listening on a
+Unix socket; **C**, another host, reached over https.
+
+| # | Actor | Has | Wants |
+| --- | --- | --- | --- |
+| T2 | **A hostile upstream MCP server, after review** (restated) | as before, plus its own DNS: it can make its committed host name resolve anywhere at any time | to turn the vault's route into a request to the vault's networks (the host's LAN, `internal`, `direct`, cloud metadata), carrying its own credential and the gateway's body |
+| T18 | **A hostile MCP server met at onboarding** | the probe's answer (status, `WWW-Authenticate`), its protected-resource metadata, its DNS, redirects, documents of any size and type, timing | to make the vault fetch or post to an internal address; to name an authorization server it controls; to inject YAML into a fragment; to hide text on the review screen; to be onboarded with a wider audience than its own URL |
+| T19 | **A hostile authorization server met at onboarding**, or an honest one impersonated by T18's metadata | its metadata (issuer, endpoints, flags), its registration answer (client ID, secret, redirect addresses, authentication method, grant types, error text), its authorization answers (`iss`, `error`, `code`), its DNS | to get a code or refresh token meant for another authorization server (mix-up); to make the vault send a client secret or code to an internal service; to plant hostile strings in the committed policy; to downgrade PKCE or the flow |
+| T20 | **Third-party code in a bridge**, possibly holding a real secret, in any placement | code execution as the bridge's uid: the program and, through same-uid tracing and `/proc`, the bridge process; the bridge's environment. **A**: whatever its container's networks reach. **B**: the standard container's network namespace (every TCP listener there, the host's network and the internet, with proxy settings it may ignore), not other uids' memory, files or sockets, every other bridge's socket included. **C**: whatever its host gives it | to call another bridge's tools around the gateway's include lists, pins and approvals; to reach the gateway, the portal, the vault's other routes or the internet beyond its list; to exhaust the bridge or the vault; to leak its secret |
+| T21 | **A compromised egress role** | the egress key (read-only allowlists), every tunnel's TLS bytes, each listener's network | to read secrets, misroute or deny tunnels, reach the vault's other paths or a bridge's MCP listener |
+| T22 | **A hostile resolver path**: DNS rebinding by anyone who controls a name the vault or the role resolves | answers that change between lookups; mixes of public and private addresses | to pass a check with one address and connect to another |
+| T23 | **A peer that can reach a bridge's listener**: **A**, anything put on a bridge's networks by mistake; **B**, any other process in the standard container (the gateway's uid, a toolkit, another bridge's program); **C**, anything on the remote host's network path | any bytes to the listener; in B, any socket call its own uid allows | to call the bridge's tools without the gateway; to tunnel out as that bridge; in B, to stand in for the bridge and receive the vault's requests with its token |
+| T4 | **A compromised gateway** (restated) | as before, plus the review-job poll and the review report path | to show the operator one definition and pin another; to hide findings; to flood the vault with reports |
+| T10 | **A stolen portal session** (restated) | as before | to make the vault fetch arbitrary URLs, register clients at arbitrary servers, read review reports |
+| T13 | **A hostile authorization answer, paste or callback** (restated) | `iss`, `error`, `error_description` | to have provider text shown from an answer that came from the wrong authorization server |
+| T14 | **Text someone else controls** (restated) | tool definitions, metadata strings, registration error text | to run script, fake a line on the review screen or in the CLI, smuggle a line into a fragment |
+| T7 | **A curious reader** (restated) | logs, CLI output, fragments | a client secret, a registration token, a code, a verifier, the egress key, a bridge token |
+
+At most:
+
+- **T2** gains no new reach: every vault connection (routes, tokens, revocation, discovery,
+  registration) made without an egress proxy resolves the name once, refuses if any address is
+  loopback, private, CGNAT, link-local, multicast, reserved or unspecified, or an IPv4-mapped,
+  IPv4-compatible, 6to4, Teredo or NAT64 form of one, unless the policy lists that exact
+  `host:port` in `egress_private` (or it is a local MCP route's upstream), and connects to the
+  address it checked. With an egress proxy, the address check is the proxy's (see the accepted
+  limits). It still holds its own credential.
+- **T18** can make the vault send, before the operator confirms anything, at most two fixed POSTs
+  to the URL the operator typed (the probe and, on a 400, one legacy `initialize` probe) and GETs
+  of well-known, challenge-named or issuer-derived metadata URLs, nine requests in all within
+  30 s, each over https to a global address with a public-looking name, with no redirect followed,
+  no cookie kept, nothing secret sent and at most 64 KiB read. It can make onboarding fail, with a
+  reason. It can't name an authorization server the operator doesn't see: every issuer, endpoint
+  and host is in the plan, and a second authorization server is refused until the operator names
+  one. It can't widen the audience: the `resource` sent is the one its metadata published, which
+  must equal the URL (or origin) it was fetched for. Its strings reach the operator only with
+  hidden characters revealed, and reach a fragment only as validated URLs and scope tokens.
+- **T19** can refuse or misanswer registration, and onboarding stops with its cleaned, capped
+  error. It can't downgrade: no S256, no `code` flow, a non-https endpoint, an issuer that differs
+  by one byte, an authentication method the vault doesn't speak, or a redirect address changed in
+  the answer each refuse it, and a client ID that reads as a secret reference (`store:`, `env:`)
+  is refused. It can't steer an honest server's answer into its own flow when that server sends
+  `iss`: the answer is refused before its `error` is read. Without `iss`, mix-up stays possible
+  (below); each registration's own redirect address then narrows it to an attacker who can also
+  register at the honest server with that address. The first request that carries a code,
+  verifier, client secret or token goes only to a token endpoint written in the committed, loaded
+  policy, through the same address guard; a client secret is stored at registration under the
+  binding the plan predicts, and a committed policy that derives another can't use it.
+- **T20** in every placement can lie in every answer, which the gateway treats as it treats any
+  hostile upstream (pins, schemas, sanitizing, approvals), and can take over its own bridge
+  process (same uid), which gives it little: the bridge holds only a hash of its token, but every
+  request carries the token, so the program can read its own bridge's token from memory. That
+  token reaches nothing but its own bridge, since `check` requires a store secret no other route
+  or connector uses; it holds no other bridge's token, gateway key or client token. **In A** it
+  reaches only its own networks: the vault's listener on `bridge-<name>`, where it has no identity,
+  and, through the egress role, the `host:port` entries of its route's own egress list. It can't
+  reach another bridge, the gateway or the portal. **In B** it is unconfined: it reaches every TCP
+  listener in the container and the internet, but each listener still asks what it asks of anyone
+  (the gateway a client token, the portal a passkey session, a vault TCP listener a placeholder),
+  and its own uid keeps it out of the vault's and the gateway's memory, files and Unix sockets. It
+  can't reach or stand in for another bridge: each bridge's socket sits in a directory only that
+  bridge's uid may write and only the vault's group may enter, and the vault accepts on it only a
+  peer running as that bridge's uid. It shares the container's memory, processes and CPU, so it can
+  starve the vault and the gateway. **In C** it has what its host gives it; ZoeyMCP's reach to it is
+  the route alone. Holding a real secret, it can send it to its own egress hosts (A) or anywhere
+  (B, C); `check` warns and names them.
+- **T21** can deny or misroute (a tunnel to the right name but an address it chose, which the
+  endpoint's TLS check then refuses) and can see which hosts each source uses. It can't read TLS,
+  can't present the gateway's or any route's identity (its key is accepted on one path only), and
+  shares no network with a bridge's MCP listener or with the vault's plaintext hop to a bridge.
+- **T22** gets nothing: one lookup, every answer checked, a refusal if any address fails, a connect
+  to a checked address and no second lookup, in the vault and in the role.
+- **T23** needs the bridge's token, which only the vault holds, in every placement: an
+  unauthenticated call is refused before any byte reaches the program. In A the role's listener it
+  reached gives it at most that source's egress list. In C the token is the only barrier, and
+  `check` refuses plain http beyond a loopback or private address, so the token never crosses a
+  public network in clear. In B file permissions come first: the socket's directory is a tmpfs of
+  the bridge's own (its uid, the vault's group, mode 0750), so the kernel refuses every other uid's
+  connect, and only the bridge's uid can create a socket there, whether the bridge runs, was
+  refused or has exited. The bridge also cuts any peer that isn't the vault's uid, and the vault any
+  peer that isn't that bridge's uid, so a directory the bridge's own program loosens lets no other
+  uid call it or stand in for it. A route to a loopback TCP address there, which any process could
+  answer, is a health error.
+- **T4** can report false listings for a review the operator asked for, but the vault recomputes
+  every pin from the definition beside it, so the operator approves what they read. It can omit
+  findings (they are heuristics; reading the definition is the control). It reaches only the new
+  paths' caps: one waiting poll, two jobs, a report capped by the gateway's limits. It still can't
+  write policy.
+- **T10** can start discovery of any public URL, which the address guard and the fetch caps bound,
+  and read review reports. A discovery that lifts the guard for a private server, a registration
+  and a client secret's write each need a fresh passkey prompt, so a stolen session can't probe
+  the vault's networks, register a client, store a secret or change policy.
+- **T13** sees no provider text from an answer whose `iss` doesn't match.
+- **T14** reaches the page only as text, the CLI only with hidden characters revealed, and a
+  fragment only as validated values: every scalar is a double-quoted string of printable ASCII
+  that passed its schema check, a `$` from the network is refused, and the compose form writes
+  every `$` as `$$`.
+- **T7** sees in logs and output no client secret, registration token or address, code,
+  verifier, `state`, egress key, bridge token, registration answer body or URL query; a bridge's
+  program's stderr is logged as text only when the operator asks for it (and it may then print
+  the program's environment values).
+
 ## The confused deputy
 
 ZoeyMCP issues no OAuth tokens to agents and has no dynamic client registration on the agent's
 side: client tokens are static and set by the operator. So the MCP specification's
 confused-deputy precondition (a proxy that lets MCP clients register dynamically) doesn't hold.
 The portal's OAuth connect is the operator's, for the vault's own credentials, and a test checks
-that neither the proxy listener nor the portal serves authorization-server metadata, a
-registration endpoint or a token endpoint. Later milestones must keep it that way, or add
-per-client consent first.
+that no listener (the proxy, the portal, the gateway, a bridge or the egress role) serves
+authorization-server metadata, a registration endpoint or a token endpoint; the vault drops an
+upstream's `WWW-Authenticate` before the gateway sees it, so no agent is ever pointed at one. M7's
+dynamic client registration is the other way round: the vault registers itself at a server's
+authorization server, from an operator's action, for the vault's own credential, and agents still
+get only their static tokens. Later milestones must keep it that way, or add per-client consent
+first.
 
 ## Accepted limits
 
 - **Silent drift** between timer checks, as above.
 - **Modern stateful servers** see one principal for every client.
 - **Deliberate disclosure** of a credential by the server that was given it.
-- **Standard-tier egress:** a compromised gateway can send what it sees anywhere.
+- **Standard-tier egress:** a compromised gateway can send what it sees anywhere, and so can a
+  toolkit or its dependencies: they run in the gateway, which shares the vault's network
+  namespace there. The egress role doesn't change that; the hardened tier, where the gateway has
+  no route out, does.
 - **A restore of the whole state volume** from an older backup is not detected (the gateway-key
   ratchet and, from M6, managed policy versions both assume the volume moves forward). For the
   portal it brings back every passkey removed since the backup, with its older counter: a removed
@@ -235,3 +351,60 @@ per-client consent first.
   - **Browsers below the floor** (Chrome or Edge 85, Firefox 119, Safari 16.4) are refused: they
     don't send the Fetch metadata headers the portal requires. Trusted Types is enforced only by
     browsers that support it.
+- **Onboarding by URL and the egress role (M7):**
+  - **An authorization server that doesn't send `iss`** can't be defended against mix-up by
+    `iss`. Each registration's own redirect address leaves an attacker needing a registration at
+    the honest server with that address, which open registration allows. The plan says when `iss`
+    isn't advertised.
+  - **Discovery and registration reach public hosts the server chooses.** The address guard
+    keeps them off the vault's networks; it doesn't stop a hostile server from making the vault
+    contact a public host of its choice once the operator starts onboarding it.
+  - **With your own egress proxy, the address check is the proxy's.** The vault can't resolve
+    names behind an internal-only network; the emitted Squid snippet carries the
+    private-destination rule, rendered from the vault's own tables. An IPv6 answer under the NAT64
+    prefix that embeds a private IPv4 address isn't caught by a Squid `dst` rule; the egress role
+    catches it.
+  - **The egress role confines hardened bridges, not the vault.** The vault keeps its direct
+    route out on `egress` for the portal, so sending it through the role adds the allowlist and an
+    address check at connect time, not confinement. The role confines nothing in the standard tier:
+    not the gateway, toolkits or a bridge there, which all share the vault's network namespace.
+  - **Domain fronting** through an allowlisted shared host: the role and the emitted snippet match
+    the CONNECT `host:port`, not the name inside TLS.
+  - **SMTP connections aren't address-guarded by the vault** without an egress proxy; the guard
+    covers HTTP.
+  - **A server on your network whose authorization server is also private** can't be onboarded by
+    URL, since metadata hosts never get the private exception; write its policy by hand.
+  - **Registrations left behind:** an abandoned onboarding, or a lost store, leaves its client
+    registered at the provider (the vault keeps no registration token, so it can't delete it), and
+    a restored volume brings back older client secrets.
+  - **A compromised gateway can fake a review report** with consistent pins, and hide findings.
+  - **A leaked sign-in link** works against a callback flow that onboarding set up as it does
+    against any (the portal's limit above); standard-tier siblings reach the portal as before; and
+    the approval-bypass gaps stay open until M8.
+- **Bridges (M7):**
+  - **A bridge and its program are one trust domain** (the same uid). The bridge defends the vault
+    and the gateway from the program, not itself; a program that ignores proxy settings or skips
+    certificate checks is held only by its networks.
+  - **A standard-tier bridge is unconfined.** Its program shares the container's network namespace
+    with the vault and the gateway: it can reach every TCP listener there (the gateway's port, the
+    portal, a vault TCP listener; not another bridge's socket), the host's network and the
+    internet, and it can ignore proxy settings, so nothing limits where it sends what it holds. It
+    has the trust of a toolkit there: its own uid keeps it out of the vault's and the gateway's
+    memory, files and sockets, and every listener still asks for its token, session or key. It
+    shares the container's memory, processes and CPU and can starve the vault and the gateway; its
+    own process limit, a kernel OOM preference that picks it first, its own work tmpfs and the
+    container's process limit bound some of that, but no memory or CPU cap per bridge exists in
+    that tier. Every process in the container can read its command line, so a secret never goes in
+    its arguments. Its image is a derived one, so the program's install-time code would join the
+    vault's trusted base unless the image passes `verify.sh --bridge`, which this placement
+    requires. A program that outlives its bridge (same uid) could listen on the bridge's socket in
+    its place and receive the vault's requests with the token, which it could read from the
+    bridge's memory anyway. Use the hardened tier for a program you need to confine.
+  - **A remote bridge** is as confined as its host makes it; ZoeyMCP sees only the route.
+  - **A third-party stdio-to-HTTP wrapper** behind a route has whatever admission it has. It must
+    check the route's bearer token; `check` can't tell whether it does, since the route sends the
+    token either way, so one that ignores it leaves the hop unauthenticated without a warning.
+  - **A bridge holding a real secret** can send it to any host on its own egress list (hardened)
+    or anywhere (standard, remote); `check` warns and names them.
+  - **One modern bridge program serves every client,** as a modern remote server sees one
+    principal.
