@@ -129,7 +129,7 @@ class Prefix:
     def line(self, command: str, via: str | None, *, piped: bool = False) -> str:
         """``command`` (already shell-quoted) as typed on the host, by its ``via``: in the
         running service (``-T`` when stdin is piped), a one-off container (with the working
-        directory at /w), or the service recreated; with no ``via``, as it is."""
+        directory at /w), the service recreated or restarted; with no ``via``, as it is."""
         service = shlex.quote(self.service)
         if via == "exec":
             return f"{self.compose} exec{' -T' if piped else ''} {service} {command}"
@@ -139,6 +139,8 @@ class Prefix:
             return f'{self.compose} run --rm --no-deps -v "$PWD:/w:ro" {service} {command}'
         if via == "up":
             return f"{self.compose} up -d {service}"
+        if via == "restart":
+            return f"{self.compose} restart {service}"
         return command
 
 

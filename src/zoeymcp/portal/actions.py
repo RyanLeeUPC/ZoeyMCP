@@ -78,8 +78,22 @@ KINDS: Final[dict[str, Kind]] = {
         # M6 J.4: clearing a server's drift marks un-hides its tools, so it is stepped up (Y27);
         # its run queues a clear job, which the gateway runs only if every included tool matches.
         Kind("tool.clear", _DEFAULT_CAP, frozenset({"server"})),
+        # M6 G.3, G.4, M.3: a managed review save, held as a draft by the review diff route, is
+        # prepared by its ID and the revision it was planned on; tool.repin is one whose diff
+        # only re-pins. tool.allow is one tool moved from approve to allow: from a server's page
+        # by the tool and the pin the operator was shown, or a draft whose only change it is.
+        Kind("policy.save", _DEFAULT_CAP, frozenset({"draft", "base"})),
+        Kind("tool.repin", _DEFAULT_CAP, frozenset({"draft", "base"})),
+        Kind(
+            "tool.allow",
+            _DEFAULT_CAP,
+            frozenset({"base"}),
+            frozenset({"server", "kind", "name", "pin", "draft"}),
+        ),
     )
 }
+# tool.allow's two forms of data (M6 J.4, M.3): its optional keys come all from one.
+ALLOW_FORMS: Final = (frozenset({"server", "kind", "name", "pin"}), frozenset({"draft"}))
 
 
 @dataclass(frozen=True)

@@ -316,6 +316,39 @@ view.
       under `declined:` at its pin (not `summarize`, which has an error finding); unticked,
       **Decline** on one tool writes that one alone; and after another fragment for the server is
       committed and reloaded, **Generate** on the old review is refused `review_stale`.
+20. **Managed saves: the re-pin and approve -> allow summaries** (the review screen's **Save**,
+    M6). Item 19's setup with the vault's policy set to `mode: managed` on a fresh state
+    directory, so its first start seeds revision 1 from the file (operations.md §34), the fake
+    started with `--switch large --switch markup_echo`. Review the server and include `echo` as
+    allow and `add`, `slow`, `read_01` and `read_02` as approve, then **Save**: the dialog's first row reads
+    "Revision 2, from 1 (by the seed, ...: 1 is the head)", and a passkey writes it. Then, in
+    Chrome or Edge with the Console open (no Trusted Types or Content Security Policy violation
+    throughout). Pass:
+    - the page's texts say the policy is managed and each save asks for a passkey, and no text
+      says to commit, reload or generate; **Generate** is gone and **Save** is there;
+    - restarted with `--switch large --switch markup_echo --drift description`, **Review again**
+      and **Accept the new definition** on `echo`, **Save**: the dialog's row shows both pins
+      and "re-pinned: you read both definitions", and "No restart needed"; confirmed, the vault's
+      log line `step_up_confirmed` names the kind `tool.repin`, the answer says the gateway takes
+      the new view within seconds, and the server's row is `reviewed` again;
+    - **Review again**, change `add` and `slow` from approve to allow, **Save**: the dialog lists
+      the two moves first, each with "approve -> allow. Calls to ... will run with no prompt" and
+      every chunk of its definition below it (the first naming the pin), the markup in `echo`'s
+      shown as text if it is moved too; **Close** (a cancel) writes nothing: the Policy page
+      still shows revision 3's tools; **Save** again and confirm: both are allow;
+    - on the MCP servers page, **Allow read_01 without asking**: the dialog shows read_01's move
+      and its definition as pinned; confirmed, it is allow (`step_up_confirmed` names
+      `tool.allow`);
+    - restart the vault (it holds reviews in memory only), sign in, and on the MCP servers page
+      **Allow read_02 without asking**: the page reviews the server first, then opens the same
+      dialog for read_02; **Close** writes nothing;
+    - **Review again**, untick `read_02` (approve, read-only), **Save** and confirm; then
+      **Review again**, **Clear** and **Select suggested**: `read_02`, dropped and once approve,
+      comes back ticked at approve, every tool the policy includes at its classification and
+      the other read-only tools at allow, and **Save** shows no "approve -> allow" or "was
+      approve in an earlier revision" row;
+    - a second browser signed in on the same origin saves first: this browser's confirm shows
+      "The policy moved to revision N ... press Save again", and nothing is written.
 
 ## D-66: the live OAuth test against a real provider
 

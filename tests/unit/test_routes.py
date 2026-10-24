@@ -5,7 +5,8 @@ Step 6a built the static map and the route shape, and each of steps 11 to 15 add
 built. From step 15 the table is M.1's, written here in the shape, and from M7 step 14a M.1's
 with K.2's, the route table M7 publishes (fold-in R27), before the step-up rows: the table equals
 them, and matching finds each row. M6 adds M.2's rows as each step builds them, after K.2's:
-step 7 Home's attention list, and the static map ``drift.js``.
+step 7 Home's attention list, and the static map ``drift.js``. Step 15a adds no route: in managed
+mode the review diff route answers a draft instead of fragment 2, and the saves are actions.
 """
 
 from __future__ import annotations

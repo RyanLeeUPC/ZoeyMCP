@@ -27,6 +27,12 @@ housekeeping, as at a start), the head's policy through the gate with this vault
 the head installed when it isn't the one running, and the configured source compared with the
 seed and the head (F.5). It never applies the source (DD-7, Y19).
 
+The portal's saves (G.3, G.4, J.4) plan and write here too: :meth:`ManagedPolicy.marked` gives
+the planner the tools the gateway's latest status marks, :attr:`ManagedPolicy.ratchet` the head
+ratchet whose ``approved`` set the review rows' ``prefill`` reads, and :func:`allow_pin` the pin
+a move from a server's page shows a definition at. Health's ``gateway_view_behind`` is a gateway
+still on another view than the head's :data:`GATEWAY_APPLY_GRACE` after the install (K.1).
+
 :class:`DeclarativeStore` is a declarative start's view of a store it found (F.4): the head it
 parked, what the running policy brings back that the parked ratchet retired (T-16), or why the
 store wasn't read. :func:`commands` builds the host's commands a start refusal names from
@@ -65,7 +71,7 @@ from ..common.policy.plan import (
 from ..common.policy.ratchet import DefKey, Grants, Ratchet, violations
 from ..common.policy.restart import Effect
 from ..common.policy.reviewchange import Lines
-from ..common.policy.schema import Policy
+from ..common.policy.schema import Policy, ToolkitServer
 from ..common.suggest import Suggestion
 from ..portal import policydiffview
 from ..portal.policyview import saved
@@ -110,6 +116,8 @@ _SAVED_EVENTS: Final = {
     "policy.acknowledge": "policy_acknowledged",
 }
 _SERVER_MODELS: Final = frozenset({"RemoteServer", "ToolkitServer"})
+# How long the gateway may take a new view before health says it is behind (K.1, M.5, N.4).
+GATEWAY_APPLY_GRACE: Final = 30.0
 
 
 def commands(environ: Mapping[str, str], state: str, *, standard: bool) -> Commands:
@@ -395,6 +403,15 @@ def moved(header: Mapping[str, Any] | None, revision: int) -> str:
     return f"the policy moved to {said} since you started"
 
 
+def allow_pin(policy: Policy, server: str, name: str) -> tuple[str | None, bool]:
+    """What a move to allow from a server's page shows a definition at (J.4, T-11): ``policy``'s
+    pin for the tool, if any, and whether the server is a ``pinning: off`` toolkit, which holds
+    none (the dialog's pin is then the one to show)."""
+    entry = None if policy.gateway is None else policy.gateway.servers.get(server)
+    off = isinstance(entry, ToolkitServer) and entry.pinning == "off"
+    return (None if entry is None else entry.review.get(name)), off
+
+
 def author_shown(author: Mapping[str, str]) -> str:
     """The author as a log line names it: a passkey's fingerprint's first 8, or ``host``."""
     return _author(author)
@@ -451,6 +468,8 @@ class ManagedPolicy:
         self._raised_at: dict[str, float] = {}
         # Each revision this process installed, and the view digest the install built (K.1).
         self._digests: dict[int, str] = {head.revision: app.view_digest}
+        # When the running head was installed, for gateway_view_behind's grace (K.1, M.5).
+        self._installed_at = wall()
 
     def __repr__(self) -> str:
         return f"ManagedPolicy(revision={self.revision}, not_running={self._not_running})"
@@ -486,6 +505,23 @@ class ManagedPolicy:
         """The vault's environment, which every candidate is checked with (C)."""
         return self._environ
 
+    @property
+    def ratchet(self) -> Ratchet:
+        """The head's ratchet: the portal's review rows read its ``approved`` set (J.3)."""
+        return self._ratchet
+
+    def marked(self) -> frozenset[DefKey]:
+        """The tools the gateway's latest status report says a drift mark hides (K.1), for the
+        planner's ``allow_marked`` (G.5 rule 1, J.4); none before the first report."""
+        report = self._app.gateway_status().report
+        if report is None:
+            return frozenset()
+        return frozenset(
+            (server, "tool", name)
+            for server, entry in report.servers.items()
+            for name in entry.marked
+        )
+
     def gateway(self) -> dict[str, Any]:
         """Which revision the gateway runs (G-23, K.1), from its latest status report's view
         digest and the revision-to-view-digest map: ``applied`` when it is the head's,
@@ -517,6 +553,13 @@ class ManagedPolicy:
                 return True
             return started < self._raised_at[effect.path]
 
+        # The gateway still on another view than the head's, past the grace (K.1, FM-18).
+        gateway = self.gateway()
+        behind = (
+            gateway["state"] == "pending"
+            and self._not_running is None
+            and self._wall() - self._installed_at > GATEWAY_APPLY_GRACE
+        )
         return health.PolicyState(
             "managed",
             revision=head.revision,
@@ -528,6 +571,8 @@ class ManagedPolicy:
             ),
             unreadable=tuple(n for n in range(head.oldest, head.revision) if n not in kept),
             quarantine=self._store.quarantined(),
+            gateway_behind=behind,
+            gateway_revision=gateway["revision"] if behind else None,
         )
 
     # --- the write (G.6) ---------------------------------------------------------------------
@@ -822,6 +867,7 @@ class ManagedPolicy:
         self._not_running = None
         self._running = head_digest
         self._running_header = self._store.header
+        self._installed_at = self._wall()
         self._digests[revision] = self._app.view_digest
         for number in sorted(self._digests)[:-KEEP]:
             del self._digests[number]

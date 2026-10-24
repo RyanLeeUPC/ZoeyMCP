@@ -122,9 +122,10 @@ Do = Literal[
 ]
 # Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
 # container that reads the inline policy from the service's environment; ``run_mount``, the same
-# with the working directory mounted at /w, for a fragment file; ``up``, the service recreated.
-# None: as written, where the policy file is.
-Via = Literal["exec", "run", "run_mount", "up"]
+# with the working directory mounted at /w, for a fragment file; ``up``, the service recreated;
+# ``restart``, the service restarted (M6 design J15: a managed save the vault applies only at its
+# restart). None: as written, where the policy file is.
+Via = Literal["exec", "run", "run_mount", "up", "restart"]
 # Whether a committed credential holds a refresh token (D.12, OPS-13): ``stored`` in its store
 # slot (by login, a seeding secret set, or an env seed promoted), ``seeded`` from an env: seed
 # not used yet, or ``none``.
@@ -1027,7 +1028,10 @@ _DELIVER: Final[Mapping[str, NextStep]] = {
         "exec",
     ),
 }
-RESTART_VAULT: Final = NextStep("restart", "Restart the vault: the change waits for it")
+# The vault's own restart, by the host's compose command (J15's line, M.7).
+RESTART_VAULT: Final = NextStep(
+    "restart", "Restart the vault: the change waits for it", via="restart"
+)
 WAIT_GATEWAY: Final = NextStep("wait_gateway", "The gateway takes the new view within seconds")
 
 

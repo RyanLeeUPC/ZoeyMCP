@@ -53,7 +53,7 @@ from zoeymcp.common.policy import emit as policy_emit
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import GatewayLimits, hash_token
 from zoeymcp.common.policy.view import ViewRemoteServer, ViewToolkitServer, build_view
-from zoeymcp.common.reviewreport import fit
+from zoeymcp.common.reviewreport import RemoteReport, ToolkitReport, fit
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import pins as gateway_pins
 from zoeymcp.gateway import review as gateway_review
@@ -2754,6 +2754,8 @@ def test_each_way_a_command_runs() -> None:
         "dc run --rm --no-deps -v \"$PWD:/w:ro\" 'my vault' check"
     )
     assert prefix.line("", "up") == "dc up -d 'my vault'"
+    # J15's line: a managed save the vault applies only at its restart (M6 design M.7).
+    assert prefix.line("", "restart") == "dc restart 'my vault'"
     assert prefix.line("zoeymcp check --config p.yaml", None) == "zoeymcp check --config p.yaml"
     assert onboard_cli.Prefix.from_environ({}) == onboard_cli.Prefix(
         "docker compose -f deploy/compose.hardened.yaml", "vault"
@@ -3269,6 +3271,9 @@ class Reviews:
 
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
         return self.jobs.get(job_id, owner)
+
+    def held_reports(self, server: str) -> tuple[RemoteReport | ToolkitReport, ...]:
+        return self.jobs.reports(server)
 
 
 class Vault(httpx.BaseTransport):
@@ -3853,6 +3858,14 @@ def test_review_via_vault_clear_refused_shows_what_doesnt_match(admin: FakeAdmin
         "zoeymcp review: --clear refused: These still don't match their pins: get_note."
     )
     assert out.startswith("server notes  (remote, vault path /notes/mcp")  # the review, printed
+    assert admin.requests[-1] == ("GET", "/policy", None)  # the refusal names no mode (14b)
+    # In managed mode the refused clear's review prints no snippet to commit (Y25, step 15a).
+    declarative = out
+    admin.answers[("GET", "/policy")] = (200, {"mode": "managed", "revision": 3})
+    code, out, err = cli(["review", "notes", "--via", "vault", "--clear", "--socket", "x"])
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    assert out != declarative
+    assert declarative.startswith(out)  # the review, without the snippet after it
     unsupported = {
         "error": "The gateway is older than the vault: run zoeymcp review notes --clear in the "
         "gateway's container.",
@@ -3862,6 +3875,37 @@ def test_review_via_vault_clear_refused_shows_what_doesnt_match(admin: FakeAdmin
     code, out, err = cli(["review", "notes", "--via", "vault", "--clear", "--socket", "x"])
     assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
     assert err == f"zoeymcp review: {unsupported['error']}\n"
+
+
+def test_a_refused_clears_way_on_stays_on_stderr_in_declarative_mode(admin: FakeAdmin) -> None:
+    """Step 15a's managed fix leaves declarative output as it was: the vault's way on after a
+    refused clear follows on stderr, never inside the JSON document, which has no ``next``."""
+    step = {
+        "do": "review",
+        "label": "Review again",
+        "command": "zoeymcp review notes --via vault --fresh",
+        "via": "exec",
+    }
+    report = {**vault_report(), "not_clean": ["get_note"]}
+    admin.answers[("POST", "/review/notes/clear")] = (200, job_answer("queued"))
+    refused = job_answer(
+        "failed",
+        report=report,
+        error="These still don't match their pins: get_note.",
+        reason="clear_not_clean",
+        next=[step],
+    )
+    admin.answers[("GET", "/review/jobs/job-0001?wait=30")] = (409, refused)
+    admin.answers[("GET", "/policy")] = (200, {"mode": "declarative", "revision": None})
+    argv = ["review", "notes", "--via", "vault", "--clear", "--socket", "x", "--format", "json"]
+    code, out, err = cli(argv)
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    document = json.loads(out)
+    assert "next" not in document
+    assert "snippet" in document
+    prefix = onboard_cli.Prefix.from_environ(os.environ)
+    assert err.endswith("\n".join(onboard_cli.next_lines([step], prefix)) + "\n")
+    assert err.startswith("zoeymcp review: --clear refused: ")
 
 
 def test_a_reused_review_is_read_from_the_queue_answer(admin: FakeAdmin) -> None:

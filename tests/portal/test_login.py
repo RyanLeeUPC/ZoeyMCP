@@ -85,6 +85,7 @@ def test_a_login(rig: PortalRig) -> None:
         "origin",
         "rp_id",
         "mode",
+        "revision",  # the head's in managed mode, None here (M6 design M.1, step 15a)
         "idle",
         "expires_at",
         "session",
@@ -95,8 +96,9 @@ def test_a_login(rig: PortalRig) -> None:
         "banners",
         "health_summary",
     }
-    assert (session["mode"], session["banners"], session["credential"]) == (
+    assert (session["mode"], session["revision"], session["banners"], session["credential"]) == (
         "declarative",
+        None,
         [],
         fingerprint,
     )

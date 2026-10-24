@@ -69,8 +69,8 @@ reseeds (step 13c) print, log and write none of the values a revision encrypts, 
 or its hash. Over the admin socket (step 14a) an export, an import planned and committed, the
 history, a diff, the head and a refused rollback show none of the values the policy view hides,
 nor the client token's hash, except the export, which holds the hash (R61's fourth exception);
-nor does a log line. The portal's saves and rollbacks join the sweep in the steps that build
-them.
+nor does a log line. A portal review save (step 15a) leaves none, nor the token's hash, in a log
+line, an answer, its draft or a file; the portal's rollbacks join the sweep in 15b.
 """
 
 from __future__ import annotations
@@ -2461,3 +2461,51 @@ async def test_the_hosts_socket_commands_show_no_policy_value(
     for value in [*(VAULT_SIDE[name] for name in POLICY_VIEW_HIDES), hash_token(LITERAL_TOKEN)]:
         assert not any(value in text for text in shown), value
     await rig.aclose()
+
+
+# --- the portal's managed saves (M6 design G.4, O.6, Y3, step 15a) ------------------------------
+
+
+async def test_a_portal_save_leaks_no_policy_value(tmp_path: Path, log_lines: io.StringIO) -> None:
+    """O.6: a review save planned as a draft, prepared and confirmed with a passkey, on a
+    managed deployment whose seed held a client's literal token and a caller's placeholder.
+    No log line, portal answer, plan, draft or file under the state directory holds the token,
+    its hash or the placeholder, and neither a draft nor a held action can be logged."""
+    from zoeymcp.common import logs as logs_module
+    from zoeymcp.portal.actions import Action
+    from zoeymcp.portal.drafts import Draft
+
+    from .test_no_secret_answers import (
+        MANAGED_PLACEHOLDER,
+        MANAGED_TOKEN,
+        Recording,
+        managed_portal,
+        signed_in,
+    )
+    from .test_no_secret_answers import step_up as portal_step_up
+
+    app, vault, reviews = await managed_portal(tmp_path)
+    answers: list[str] = []
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
+    page = Recording(client, answers)
+    authenticator = SoftAuthenticator()
+    await signed_in(page, app, authenticator)
+    job = reviews.portal_done.id
+    choices = {"include": ["list_notes"], "allow": [], "approve": ["list_notes"]}
+    draft = (await page.call("POST", f"/api/review/jobs/{job}/diff", choices)).json()
+    [(_, held)] = list(app.drafts._by_session.items())
+    data = {"draft": draft["draft"], "base": draft["base"]}
+    saved = await portal_step_up(page, authenticator, "policy.save", data)
+    assert saved.status_code == 200, saved.text
+    held_repr = repr(held)
+    for kept in (Draft, Action):
+        assert kept in logs_module.refused_types()
+    files = [p.read_bytes() for p in (tmp_path / "state").rglob("*") if p.is_file()]
+    shown = [*files, log_lines.getvalue().encode(), *(a.encode() for a in [*answers, held_repr])]
+    assert {"policy_saved", "step_up_confirmed"} <= {
+        json.loads(line)["event"] for line in log_lines.getvalue().splitlines()
+    }
+    for value in (MANAGED_TOKEN, hash_token(MANAGED_TOKEN), MANAGED_PLACEHOLDER):
+        assert not any(value.encode() in text for text in shown), value
+    await client.aclose()
+    await vault.app.aclose()

@@ -38,6 +38,8 @@ from zoeymcp.vault.reviewjobs import Work, read_result
 
 from .flows import prepared_action, set_up, status_reason, step_up
 from .rig import PortalRig, rig_policy, running
+from .test_policy_managed import drafted, head, managed, saved, world_of
+from .test_policy_managed import reviewed_job as managed_job
 from .test_review import World, gateway_answers, notes_entries, poller
 
 RLO = "\u202e"
@@ -365,3 +367,46 @@ def test_hostile_text_on_both_sides(tmp_path: Path) -> None:
     ):
         assert any(escape in chunk for chunks in lines for chunk in chunks), escape
     assert any(MARKUP.replace('"', '\\"') in "".join(c) for c in found["reviewed_lines"])
+
+
+# --- managed mode (step 15a): J1's re-pin and J2's declines are saves ---------------------------
+
+
+def test_a_server_changes_a_tool_after_review_managed(tmp_path: Path) -> None:
+    """J1, managed: **Accept the new definition** on the drifted row is a ``tool.repin`` draft
+    whose plan names both pins (re-pinned: you read both definitions) and no restart; one
+    passkey writes revision 2 with the new pin, logged ``tool_repinned``. The old review is then
+    stale: a draft from it would undo the re-pin (J.2)."""
+    entry = {**served(projected(OLD)), "era": "modern"}
+    with world_of(tmp_path, managed(**entry)) as world:
+        rig = world.rig
+        old, new = projected(OLD), projected(NEW)
+        job, read = managed_job(world, drift_report(old))
+        assert row(read, "search")["state"] == "drift"
+        draft = drafted(world, job, include=["search"], allow=["search"], repin=["search"])
+        assert (draft["kind"], draft["base"]) == ("tool.repin", 1)
+        summary = draft["summary"]
+        changed = f"{pin_of(old)} -> {pin_of(new)} (re-pinned: you read both definitions)"
+        assert ["gateway.servers.notes.review.search", changed] in summary
+        assert summary[-1] == ["No restart needed", ""]
+        done = saved(world, draft)
+        assert done["revision"] == 2
+        assert head(rig)["review"] == {"search": pin_of(new)}
+        [line] = rig.lines("tool_repinned")
+        assert (line["server"], line["name"], line["revision"]) == ("notes", "search", 2)
+        body = {"include": ["search"], "allow": ["search"], "approve": [], "repin": ["search"]}
+        stale = world.page.fetch("POST", f"/api/review/jobs/{job}/diff", json=body)
+        assert status_reason(stale) == (409, "review_stale")
+
+
+def test_new_tools_declined_in_a_save(tmp_path: Path) -> None:
+    """J2, managed: **Record the rest as declined** writes every listed tool left out to
+    ``declined`` at the pin shown, in a ``policy.save`` (a decline is a change of its own)."""
+    entry = {**served(projected(OLD)), "era": "modern"}
+    with world_of(tmp_path, managed(**entry)) as world:
+        job, _ = managed_job(world, drift_report(projected(OLD)))
+        draft = drafted(world, job, include=["search"], allow=["search"], decline_rest=True)
+        assert draft["kind"] == "policy.save"
+        assert ["gateway.servers.notes.declined.other", "added"] in draft["summary"]
+        saved(world, draft)
+        assert head(world.rig)["declined"] == {"other": pin("other")}

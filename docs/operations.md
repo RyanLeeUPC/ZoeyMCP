@@ -362,6 +362,7 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `server_blocked` | warning | (§13) the gateway reports that `on_drift: fail` blocked the server (a tool drifted, a drift mark held, or an included tool listed invalid): none of its tools is served until it is reviewed (§12) |
 | `server_listing_invalid` | warning | (§13) the server lists tools the gateway can't serve, or whose names aren't valid, counted and not named; or the vault couldn't read the gateway's status for that server |
 | `gateway_status_stale` | info | (§13) the gateway hasn't pushed its status for 3 minutes (it does at least every minute): the `gateway` section's other findings are that old. Check that the gateway runs and reaches the vault |
+| `gateway_view_behind` | info | (managed mode, §34) the gateway still reports another revision's view than the head's 30 s after a save: it usually takes a new view within seconds. Check that the gateway runs and reaches the vault |
 
 Findings marked `(from stored metadata)` (`advisory` in JSON) come from the store's clear
 metadata, which anyone with the state file can edit: they are shown, and nothing the vault
@@ -1790,8 +1791,10 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 ## 26. The portal
 
 The admin portal is the vault's own web page for what needs a person: the first passkey,
-secrets, OAuth connect, health, the ledger and the policy, in that order below. Everything here
-can also be done with the CLI (§1, §2, §3, §21), and recovery is done only from the host.
+secrets, OAuth connect, health, the MCP servers page and its review screen (§11, §12), the
+ledger and the policy, in that order below. Everything here can also be done with the CLI (§1,
+§2, §3, §11, §21, §34), and recovery is done only from the host. In managed mode (§34) the page
+says so where a declarative page says to commit or reload, and the review screen saves.
 
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
@@ -2094,6 +2097,47 @@ declined** record what you leave out (§12). **Generate (n tools: a allow, b app
 **Copy**, the indent and its steps, ending with the `gateway.clients.<client>.servers` line to
 add yourself: fragment 2 assigns no client. Nothing is saved.
 
+**Saving a review, in managed mode.** In managed mode (§34) the review screen has **Save** where
+it has **Generate**. The vault builds the change from your choices (the same change fragment 2
+would carry), plans it on the policy's head and holds it for 5 minutes, one per session (a
+second **Save** replaces it), then asks for your passkey with the plan: "Revision 18, from 17 (by
+you, `<when>`: 17 is the head)", then every move to allow first, each on its own row with its
+sentence ("approve -> allow. Calls to `<tool>` will run with no prompt"; "`<tool>` was approve in
+an earlier revision: calls will run with no prompt"; a re-pinned allow tool whose new definition
+the server no longer marks read-only, kept allow: "`<tool>`'s new definition isn't marked
+read-only and stays allow") and every line of the definition it allows below it, nothing cut;
+then the other changes (a re-pin shows both pins: "re-pinned: you read both definitions"), and
+whether a restart is needed. The vault, not the page, decides the save's kind from the change,
+and the passkey confirms that kind (the log's `step_up_confirmed` names it): a save whose only
+change is re-pins is `tool.repin`, one whose only change is one included approve tool moved to
+allow is `tool.allow`, and anything else is `policy.save` (a review that learns the server's era
+for the first time writes it too, so that first save is a `policy.save`). One passkey writes the
+revision; the answer names it, says the gateway takes the new view within seconds (health says
+`gateway_view_behind` if it hasn't after 30 s, §3) and whether a restart is needed, with each
+step's command and where it runs (the vault's own restart is your compose command's `restart` of
+the vault's service, §34). **Select suggested** never moves a tool to allow: a tool the policy
+includes, or one it once had as approve, starts at approve; a move is always your choice on its
+row. **Allow without asking** on the MCP servers page is `tool.allow` for that one tool, with the
+definition pinned for it from a review the vault still holds (reviews are kept 30 minutes; for a
+tool that drifted, the reviewed definition, not the one the server lists now; on a `pinning: off`
+toolkit the listed one, followed by "pinning is off for `<server>`: the image can change this
+definition with no review"); with none, the page reviews the server again first, then opens the
+dialog. A tool the policy no longer has as approve at the pin the page showed is `changed`: open
+the server's page again. A definition too long for the dialog (more than 400 rows) is
+`summary_too_large`: make that move on the host (`zoeymcp policy export`, edit, `zoeymcp policy
+import`). Nothing moves to allow for a tool the gateway marks drifted, or a toolkit's
+consequential tool. If the policy moved between the plan and your passkey (another session
+saved, or the host imported), the dialog shows "The policy moved to revision 19, saved `<when>`
+by `<who>` since you planned this: press Save again to plan it on revision 19", then the plan
+**Save** would make on revision 19, and nothing is written; any other change the vault finds at
+that moment shows in the dialog the same way, its first row the reason. If the vault writes the
+revision but can't apply it, the answer is `saved_not_running` (send SIGHUP to the vault or
+restart it), and every save waits for that. A change older than 5 minutes is `draft_unknown`
+("press Save again"). A save that would leave a stored secret
+unused lists it first: delete it on the Secrets page before the save, while it can still be
+revoked at the provider. Logs: `step_up_confirmed` with the kind, then `policy_saved`, and
+`tool_allowed` (with `kept: true` for a kept allow) and `tool_repinned` per tool (§34).
+
 When a review doesn't come back: `review_unavailable` means the gateway isn't polling the vault
 (check that it runs and reaches it, then review again); `review_stale` means the policy was
 reloaded since (the gateway didn't take the job within 60 s, or the server's tools changed since
@@ -2157,10 +2201,12 @@ page on another `localhost` port receives the cookie (cookies ignore ports) but 
 gets 401. Someone holding both halves, within the session's limits, can read what the portal shows
 (names, bindings, health, the policy view, the ledger, the passkey and session lists, review
 reports), start an OAuth sign-in, start onboarding a server by URL (the vault then fetches that
-server's public metadata, through its address guard), queue a review, and end other sessions. They
-can't write or delete a secret, complete a connect, reset a credential, register a client, discover
-a server on your own network, enrol, rename or remove a passkey, or restart the ledger chain: each
-needs a fresh passkey prompt bound to that change. If you think a session was taken, **End the other
+server's public metadata, through its address guard), queue a review, plan a review save (managed
+mode: the plan is held, nothing is written), and end other sessions. They can't write or delete
+a secret, complete a connect, reset a credential, register a client, discover a server on your
+own network, enrol, rename or remove a passkey, restart the ledger chain, or, in managed mode,
+save a review, re-pin a tool or move one to allow: each needs a fresh passkey prompt bound to
+that change. If you think a session was taken, **End the other
 sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
 ([threat-model.md](threat-model.md)) has the rest.
 
@@ -2309,7 +2355,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 429 | `review_jobs_full` | At most 2 reviews can be under way at once. Wait for one, then review again. |
 | 503 | `review_unavailable` | The gateway isn't asking the vault for review jobs (`<detail>`), so nothing was queued. Check that the gateway is running and reaches the vault. |
 | 409 | `job_unknown` | That review isn't known to the vault: it finished more than 30 minutes ago, the vault restarted, or its result came already. Review again. |
-| 409 | `review_stale` | The policy changed since this review (a reload): the gateway didn't take it within 60 seconds, holding another version, or the server's tools changed since its report. Review again once the gateway has caught up. |
+| 409 | `review_stale` | The policy changed since this review: the gateway didn't take it within 60 seconds, holding another version, or the server's tools changed since its report. Review again once the gateway has caught up. |
 | 504 | `review_timeout` | The gateway took the review but sent no result within 2 minutes. Check the gateway's log, then review again. |
 | 502 | `review_failed` | The gateway couldn't review the server (`<code>`). Its log says why; review again once that is fixed. |
 | 409 | `clear_unsupported` | The gateway is older than the vault: run zoeymcp review `<server>` --clear in the gateway's container. |
@@ -2337,6 +2383,8 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `policy_moved` | Nothing was written: `<detail>`. For an import, export again and redo your edit; for a rollback, run it again. |
 | 409 | `plan_changed` | The plan changed since you read it: plan the change again and read it first. |
 | 400 | `import_refused` | The policy is refused: `<detail>`. |
+| 404 | `draft_unknown` | That change expired: press Save again. |
+| 422 | `save_invalid` | The running policy with this change fails check (`<detail>`), so it can't be saved. |
 | 500 | `saved_not_running` | Saved as revision `<revision>`, but the vault couldn't apply it: send SIGHUP to the vault or restart it. |
 | 400 | `state_as_root` | This command won't run as root: the vault's uid couldn't read what it writes. Run it as the vault's uid: add --user 10001:10001. |
 | 409 | `state_locked` | The state directory is in use: stop the vault first (`<command>`), then run this again. |

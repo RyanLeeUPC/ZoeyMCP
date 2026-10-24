@@ -494,9 +494,9 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         # no longer has as the review found it (F.6, GR-11): a reload since, either way.
         "review_stale": Entry(
             409,
-            "The policy changed since this review (a reload): the gateway didn't take it within "
-            "60 seconds, holding another version, or the server's tools changed since its "
-            "report. Review again once the gateway has caught up.",
+            "The policy changed since this review: the gateway didn't take it within 60 "
+            "seconds, holding another version, or the server's tools changed since its report. "
+            "Review again once the gateway has caught up.",
         ),
         "review_timeout": Entry(
             504,
@@ -609,6 +609,14 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             409, "The plan changed since you read it: plan the change again and read it first."
         ),
         "import_refused": Entry(400, "The policy is refused: {detail}."),
+        # M6's G.4: a managed review save, held as a draft until its step-up (portal/drafts.py),
+        # and one whose policy the gate refuses (the portal's word for import_refused and
+        # diff_invalid in managed mode, where nothing makes a fragment).
+        "draft_unknown": Entry(404, "That change expired: press Save again."),
+        "save_invalid": Entry(
+            422,
+            "The running policy with this change fails check ({detail}), so it can't be saved.",
+        ),
         "saved_not_running": Entry(
             500,
             "Saved as revision {revision}, but the vault couldn't apply it: send SIGHUP to the "
@@ -734,6 +742,21 @@ ISSUER_CHANGED: Final = (
     "The policy changed this credential's issuer since the sign-in started: it was {old}, it is "
     "now {new}. Nothing was stored. Connect again."
 )
+
+
+# policy_moved as the portal's review save words it (M6 design N.2, OPS-18): the socket's text
+# says to export again, which a save never needs.
+SAVE_MOVED: Final = (
+    "The policy moved to {said} since you planned this: press Save again to plan it on revision "
+    "{revision}."
+)
+
+
+def save_moved(*, said: str, revision: int) -> Refusal:
+    """``policy_moved`` in the portal (G.7, OPS-18): the catalogue's status, and
+    :data:`SAVE_MOVED` naming the head (``policyview.saved``'s words)."""
+    status = CATALOGUE["policy_moved"].status
+    return Refusal(status, "policy_moved", SAVE_MOVED.format(said=said, revision=revision))
 
 
 def refusal(reason: str, **fields: str) -> Refusal:

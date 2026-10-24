@@ -112,6 +112,7 @@ from ..common.policy.gate import GateRefused
 from ..common.policy.plan import WritePlan
 from ..common.policy.ratchet import Grants
 from ..common.policy.schema import Policy, hash_token
+from ..common.reviewreport import RemoteReport, ToolkitReport
 from ..portal import passkeys as passkey_file
 from ..portal import reviewview, setupcode
 from ..portal.passkeys import PasskeyError, Passkeys
@@ -259,6 +260,8 @@ class ReviewQueue(Protocol):
     async def queue_clear(self, server: str, owner: Owner) -> Job: ...
 
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job: ...
+
+    def held_reports(self, server: str) -> tuple[RemoteReport | ToolkitReport, ...]: ...
 
 
 class AdminSocketError(Exception):

@@ -768,6 +768,7 @@ def build_portal(
     policy_header: Callable[[], Mapping[str, object] | None] | None = None,
     onboard: OnboardService | None = None,
     reviews: ReviewQueue | None = None,
+    managed: ManagedPolicy | None = None,
     lookup: Lookup = lookup_addresses,
 ) -> Portal | None:
     """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
@@ -780,7 +781,8 @@ def build_portal(
     ``source`` where the policy came from, for its policy view, and in managed mode
     ``policy_header`` the running revision's header (M6 design A.4); and ``onboard`` and
     ``reviews`` the onboardings and review jobs its MCP servers section shares with the socket
-    (M7 K)."""
+    (M7 K); and in managed mode ``managed``, the policy's holder its saves write through (M6
+    design G.6)."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -808,6 +810,7 @@ def build_portal(
         policy_header=policy_header,
         onboard=onboard,
         reviews=reviews,
+        managed=managed,
     )
     return Portal(app, address)
 
@@ -1300,6 +1303,8 @@ def build(
         # The same onboardings and review jobs as the socket's (M7 design D.8, F.2).
         onboard=onboard,
         reviews=app,
+        # Its managed saves write through the policy's holder (M6 design G.6).
+        managed=managed,
     )
     admin = None
     if admin_socket is not None:

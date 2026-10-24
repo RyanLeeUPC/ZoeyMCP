@@ -98,6 +98,7 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from ..common.policy.view import MODE_HEADER, build_view, dump_view
+from ..common.reviewreport import RemoteReport, ToolkitReport
 from . import internal, logs, netclient, secretops, statusreport
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
@@ -1394,6 +1395,11 @@ class VaultApp:
             "review_requested", server=server, job=queued.hash8, owner=owner, reused=reused, **clear
         )
         return queued
+
+    def held_reports(self, server: str) -> tuple[RemoteReport | ToolkitReport, ...]:
+        """The reports the vault holds of ``server``'s done review jobs, newest first (M6 design
+        J.4: the definition a move to allow shows)."""
+        return self._reviews.reports(server)
 
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
         """The ``owner``'s surface's job, once it is ``done`` or ``failed``, after ``wait``

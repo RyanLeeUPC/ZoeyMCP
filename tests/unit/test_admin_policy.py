@@ -867,7 +867,7 @@ def test_saved_next() -> None:
     assert saved_next(()) == (wait,)
     assert saved_next((), applied=True) == ()
     assert saved_next([effect("live")], applied=True) == ()
-    restart = NextStep("restart", "Restart the vault: the change waits for it")
+    restart = NextStep("restart", "Restart the vault: the change waits for it", via="restart")
     found = saved_next(
         [
             effect("redeliver_gateway_key"),
@@ -901,6 +901,7 @@ def test_saved_next() -> None:
     assert restart.answer() == {
         "do": "restart",
         "label": "Restart the vault: the change waits for it",
+        "via": "restart",
     }
 
 

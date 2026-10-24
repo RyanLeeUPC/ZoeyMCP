@@ -341,6 +341,18 @@ class JobTable:
             raise ReviewRefused("job_unknown", "no such review job")
         return job
 
+    def reports(self, server: str) -> tuple[RemoteReport | ToolkitReport, ...]:
+        """The reports of ``server``'s ``done`` jobs, any surface's, newest first: what a move to
+        allow from a server's page shows a definition from (M6 design J.4, OPS-13)."""
+        self._expire()
+        done = [
+            job
+            for job in self._jobs.values()
+            if job.server == server and job.state == "done" and job.report is not None
+        ]
+        done.sort(key=lambda job: job.ended_at or 0.0, reverse=True)
+        return tuple(job.report for job in done if job.report is not None)
+
     def deadline(self, job: Job) -> float | None:
         """When the clock ends an active job, on the table's clock; None for a finished one."""
         if job.state == "queued":

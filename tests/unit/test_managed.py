@@ -31,6 +31,7 @@ from zoeymcp.common.policy.ratchet import Grants
 from zoeymcp.common.policy.schema import Policy
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.vault import gatewaykeys, logs, policystore
+from zoeymcp.vault import managed as managed_module
 from zoeymcp.vault.admin import HealthReader
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.keys import generate_master_key
@@ -47,7 +48,7 @@ from zoeymcp.vault.managed import (
 from zoeymcp.vault.policystart import Commands
 from zoeymcp.vault.policystore import PolicyStore
 from zoeymcp.vault.server import Runtime, load_runtime
-from zoeymcp.vault.statusreport import Report
+from zoeymcp.vault.statusreport import Report, ServerStatus
 
 HOST = {"by": "host", "via": "socket"}
 OTHER = {"by": "host", "via": "offline"}
@@ -670,6 +671,64 @@ def test_a_restart_note_stays_until_the_restart(tmp_path: Path) -> None:
     assert paths() == {"admin.listen", limit}
     rig.app.keep_status(status(3000))
     assert paths() == {"admin.listen"}
+    close(rig)
+
+
+def test_a_gateway_behind_after_the_grace(tmp_path: Path) -> None:
+    """K.1, M.5, FM-18 (step 15a): health's ``gateway_view_behind`` once the gateway's reported
+    view has been another revision's for longer than GATEWAY_APPLY_GRACE after the install,
+    naming that revision when this vault installed it; never before a report, within the grace,
+    or once the gateway runs the head's view."""
+    rig = start(tmp_path)
+    now = [1000.0]
+    rig.managed._wall = lambda: now[0]
+    assert managed_module.GATEWAY_APPLY_GRACE == 30.0
+    first = rig.app.view_digest
+    hide = edited(lambda data: data["gateway"]["servers"]["broker-trade"].update(on_drift="hide"))
+    assert isinstance(import_(rig, hide), Written)
+    assert rig.app.view_digest != first
+
+    def behind() -> tuple[bool, int | None]:
+        found = rig.managed.state()
+        return found.gateway_behind, found.gateway_revision
+
+    assert behind() == (False, None)  # no report yet: unknown, not behind
+    rig.app.keep_status(Report(view=first, started=1, servers={}))
+    assert behind() == (False, None)  # within the grace
+    now[0] = 1030.0
+    assert behind() == (False, None)
+    now[0] = 1030.5
+    assert behind() == (True, 1)
+    rig.app.keep_status(Report(view="sha256:" + "0" * 64, started=1, servers={}))
+    assert behind() == (True, None)  # a view this vault didn't install
+    rig.app.keep_status(Report(view=rig.app.view_digest, started=1, servers={}))
+    assert behind() == (False, None)
+    close(rig)
+
+
+def test_the_marks_the_gateway_reports_and_the_head_ratchet(tmp_path: Path) -> None:
+    """J.4 (step 15a): the planner's ``marked`` reads the gateway's latest status, every
+    server's marked tools as definitions; the portal's rows read the head's ratchet; and a move
+    from a server's page shows a definition at the head's pin for the tool."""
+    rig = start(tmp_path)
+    assert rig.managed.marked() == frozenset()
+    marked = ServerStatus("remote", ("ready",), "modern", 2, 1, marked=("a", "b"))
+    rig.app.keep_status(Report(view="sha256:" + "0" * 64, started=1, servers={"notes": marked}))
+    assert rig.managed.marked() == {("notes", "tool", "a"), ("notes", "tool", "b")}
+    assert rig.managed.ratchet == rig.runtime.ratchet
+    policy = rig.managed.policy
+    assert policy.gateway is not None
+    [(server, entry)] = [
+        (name, entry) for name, entry in policy.gateway.servers.items() if entry.review
+    ][:1]
+    tool, pin = next(iter(entry.review.items()))
+    assert managed_module.allow_pin(policy, server, tool) == (pin, False)
+    assert managed_module.allow_pin(policy, server, "nope") == (None, False)
+    assert managed_module.allow_pin(policy, "nope", tool) == (None, False)
+    off = {"kind": "toolkit", "module": "examples.kit", "pinning": "off"}
+    data = policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    data["gateway"]["servers"]["kit"] = off
+    assert managed_module.allow_pin(Policy.model_validate(data), "kit", "x") == (None, True)
     close(rig)
 
 

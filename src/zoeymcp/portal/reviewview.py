@@ -42,7 +42,9 @@ included tool left unclassified, a classified one not included, an unpinnable to
 included, a toolkit's consequential tool in ``allow``, a re-pin of a tool that hasn't drifted,
 can't be pinned or isn't included, a decline of a tool included or that can't be pinned, or a
 merged policy that fails ``check``.
-Nothing is saved: declarative mode.
+Nothing is saved: declarative mode. In managed mode the same choices give :func:`change_of`, the
+change itself, with the same refusals but ``check``'s, which the vault's gate runs on the
+candidate when it plans the save (M6 design G.4, J.3): the portal holds it as a draft.
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ from collections.abc import Mapping, Set
 from dataclasses import dataclass, replace
 from typing import Any, Final
 
-from ..common.policy.change import ChangeRefused, validate
+from ..common.policy.change import ChangeRefused, PolicyChange, validate
 from ..common.policy.emit import COMPOSE_INDENT, INDENT_MAX, EmitRefused, Target, emit
 from ..common.policy.findings import Finding
 
@@ -466,6 +468,26 @@ def diff(
         "diff": {"yaml": text, "check": _found(findings)},
         "next": [step.answer() for step in reviewed_next(name, source)],
     }
+
+
+def change_of(
+    report: Mapping[str, Any], server: Listed | None, body: Mapping[str, Any], *, most: int
+) -> PolicyChange | Refusal:
+    """A managed review save's change for the operator's choices (M6 design G.4, J.3): what
+    :func:`diff` would write as fragment 2, as a change for the planner; the indent is a
+    fragment's and is ignored. The refusals are :func:`diff`'s, but ``check``'s."""
+    chosen = choices(body, most)
+    if isinstance(chosen, Refusal):
+        return chosen
+    if stale(report, server):
+        return refusal("review_stale")
+    made = changes(report, chosen)
+    if isinstance(made, Refusal):
+        return made
+    try:
+        return fragment(report, made)
+    except ValueError as exc:  # ChangeRefused is one
+        return _invalid(str(exc))
 
 
 def _found(findings: list[Finding]) -> list[dict[str, str]]:

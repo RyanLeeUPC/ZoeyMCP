@@ -75,7 +75,9 @@ agree (Y29); a tool nobody reviewed is counted, not named, since its upstream ch
 reports invalid and no drift finding names already (counted), or whose status the vault refused
 (T-7).
 A gateway that hasn't reported for :data:`STATUS_STALE` seconds is ``gateway_status_stale``
-(info): its findings are then as old.
+(info): its findings are then as old. In managed mode, a gateway whose reported view is still
+another revision's than the head's after ``vault/managed.py``'s ``GATEWAY_APPLY_GRACE`` is
+``gateway_view_behind`` (info), naming that revision when this vault installed it (K.1, FM-18).
 
 The ``policy`` section (M6 design M.5, F.4-F.6, G.6) reads the policy store's state
 (:class:`PolicyState`), only while there is a store: a declarative deployment that never ran
@@ -248,6 +250,10 @@ class PolicyState:
     unverified: str | None = None
     # Files in /state/policy/quarantine.
     quarantine: int = 0
+    # The gateway still on another view than the head's past the grace (K.1, M.5), and the
+    # revision whose view it is, when this vault installed it.
+    gateway_behind: bool = False
+    gateway_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -318,7 +324,7 @@ def assess(inputs: Inputs) -> dict[str, Any]:
         report["policy"] = _policy(inputs.policy_state)
         sections.append(report["policy"])
     if inputs.gateway_status is not None and policy.gateway is not None:
-        report["gateway"] = _gateway(policy, inputs.gateway_status)
+        report["gateway"] = _gateway(policy, inputs.gateway_status, inputs.policy_state)
         sections.append(report["gateway"])
     summary = {
         level: sum(f["level"] == level for s in sections for f in s["findings"]) for level in LEVELS
@@ -904,14 +910,22 @@ def _policy(state: PolicyState) -> dict[str, Any]:
 # --- the gateway's status (M6 design K.1, M.5) ------------------------------------------------
 
 
-def _gateway(policy: Policy, status: GatewayStatus) -> dict[str, Any]:
+def _gateway(
+    policy: Policy, status: GatewayStatus, state: PolicyState | None = None
+) -> dict[str, Any]:
     """What the gateway's latest status says needs the operator, per server the running policy
-    names: each row with the attention decision as the gateway made it, and the findings."""
+    names: each row with the attention decision as the gateway made it, and the findings; and,
+    from the policy store's ``state``, a gateway still on an older revision's view."""
     findings: list[Finding] = []
     servers: list[dict[str, Any]] = []
     if status.age > STATUS_STALE:
         text = f"the gateway hasn't reported its status for {int(status.age) // 60} minutes"
         findings.append(_finding("gateway_status_stale", "info", text, {"kind": "check_gateway"}))
+    if state is not None and state.gateway_behind:
+        number = state.gateway_revision
+        said = "an older view" if number is None else f"revision {number}"
+        text = f"the gateway is still on {said}, not revision {state.revision}"
+        findings.append(_finding("gateway_view_behind", "info", text, {"kind": "check_gateway"}))
     report = status.report
     gateway = policy.gateway
     if report is not None and gateway is not None:

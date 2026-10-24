@@ -957,3 +957,46 @@ def test_a_change_or_fragment_the_policy_cant_take(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(reviewview, "emit", too_big)
     assert "(document): size" in detail(run_diff(held(large()), body))
+
+
+# --- a managed review save's change (M6 design G.4, J.3; step 15a) ----------------------------
+
+
+def test_a_managed_save_is_the_change_fragment_2_would_write() -> None:
+    """G.4: the same change as fragment 2, its title the snippet's, for the planner to plan;
+    the indent, a fragment's, is ignored; nothing is checked here (the vault's gate checks the
+    candidate)."""
+    report = held(large())
+    body = {"include": ["read_01", "add"], "allow": ["read_01"], "approve": ["add"]}
+    made = reviewview.change_of(report, NOTES, {**body, "indent": 4}, most=512)
+    assert not isinstance(made, Refusal)
+    chosen_ = reviewview.choices(body, 512)
+    assert not isinstance(chosen_, Refusal)
+    changes_ = reviewview.changes(report, chosen_)
+    assert not isinstance(changes_, Refusal)
+    assert made == cli_review.fragment(report, changes_)
+    assert made.title == cli_review.title("notes")
+
+
+def test_a_managed_save_refuses_as_the_diff_does() -> None:
+    report = held(large())
+    bad = {"include": "x", "allow": [], "approve": []}
+    assert detail(reviewview.change_of(report, None, bad, most=512), "bad_body") == (
+        "include is a list of tool names"
+    )
+    tight = {"include": ["echo", "add"], "allow": ["echo"], "approve": ["add"]}
+    assert detail(reviewview.change_of(report, NOTES, tight, most=1), "bad_body") == (
+        "include names at most 1 tools (max_tools_per_server)"
+    )
+    good = {"include": ["echo"], "allow": ["echo"], "approve": []}
+    refused(reviewview.change_of(report, None, good, most=512), "review_stale")
+    unknown = {"include": ["nope"], "allow": [], "approve": ["nope"]}
+    found = reviewview.change_of(report, NOTES, unknown, most=512)
+    assert "the server lists no tool nope" in detail(found)
+    # A server whose name the policy can't hold: the change itself refuses it.
+    renamed = {**report, "server": "no such name"}
+    named = listed_server(committed(), "notes")
+    assert named is not None
+    listed_ = replace(named, name="no such name")
+    empty: dict[str, list[str]] = {"include": [], "allow": [], "approve": []}
+    assert "isn't a policy name" in detail(reviewview.change_of(renamed, listed_, empty, most=512))

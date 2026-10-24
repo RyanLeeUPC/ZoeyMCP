@@ -22,7 +22,10 @@ Each walk takes its routes from the route table, so a route added later is walke
   OAuth list, connect and policy routes read the same store, token manager, logins and policy,
   and its ledger a copy.
   No answer carries a value, a setup code, the gateway key, the egress key, or a session half
-  beyond the one answer that mints it.
+  beyond the one answer that mints it. A managed portal (M6 design G.4, O.6, step 15a), whose
+  seed held a client's literal token and a caller's placeholder, walked once a review save was
+  made: no answer, the drafts' and the plans' included, carries the token, its hash
+  or the placeholder.
 - **The portal's code**: an AST check finds no reference to ``SetupCodes.issue``, the gateway key,
   the egress key or a store read of a value anywhere in ``portal/``, so no portal route can reach
   an exception. Under mutmut the source also holds every function's mutants, named with
@@ -50,10 +53,11 @@ import zoeymcp.portal
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.unit import onboard_model
 from zoeymcp.common.policy.schema import GatewayLimits, hash_token
+from zoeymcp.common.reviewreport import RemoteReport, ToolkitReport
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES, STATIC, Route
-from zoeymcp.vault.admin import AdminApp, HealthReader
+from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
@@ -162,6 +166,9 @@ class Reviews:
 
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
         return self.table.get(job_id, owner)
+
+    def held_reports(self, server: str) -> tuple[RemoteReport | ToolkitReport, ...]:
+        return self.table.reports(server)
 
 
 def socket_routes(rig: AdminRig | PolicyRig) -> list[tuple[str, str]]:
@@ -599,3 +606,111 @@ def test_no_portal_code_reaches_a_setup_code_issue_or_a_key() -> None:
         assert "setup-code" not in route.path
         assert "gateway" not in route.path
         assert "egress-key" not in route.path
+
+
+# --- a managed portal's saves (M6 design G.4, O.6; step 15a) -----------------------------------
+
+MANAGED_TOKEN = "p1-managed-agent2-token-0001"
+MANAGED_PLACEHOLDER = "ph-agent1-stats-0001"
+# A managed deployment whose seed holds a client's literal token and a caller's placeholder,
+# with notes including nothing yet, as the fake review's report runs under.
+MANAGED_PORTAL = f"""version: 1
+mode: managed
+admin:
+  listen: 127.0.0.1:8081
+  origins: [{ORIGIN}]
+credentials:
+  notes-key: {{kind: header, header: X-Key, format: "{{secret}}", secret: "store:notes-key"}}
+  stats-key: {{kind: header, header: X-Key, format: "{{secret}}", secret: "store:stats-key"}}
+routes:
+  - name: notes
+    prefix: /notes
+    upstream: https://mcp.notes.example
+    credential: notes-key
+    callers: [gateway]
+    stream: true
+    rules: [{{methods: [POST, GET, DELETE], paths: [/mcp]}}]
+  - name: stats
+    prefix: /stats
+    upstream: https://api.stats.example
+    credential: stats-key
+    callers: [{{placeholder: {MANAGED_PLACEHOLDER}}}]
+    rules: [{{methods: [GET], paths: ["/**"]}}]
+gateway:
+  clients:
+    agent2:
+      token: {MANAGED_TOKEN}
+      servers: [notes]
+  servers:
+    notes: {{kind: remote, route: notes, path: /mcp, era: modern}}
+"""
+
+
+async def managed_portal(tmp_path: Path) -> tuple[PortalApp, Any, Reviews]:
+    """A managed vault (``test_managed.start``) and its portal, whose review jobs hold a done
+    review of notes for the portal."""
+    from .test_managed import start
+
+    vault = start(tmp_path, MANAGED_PORTAL)
+    (tmp_path / "portal").mkdir(mode=0o700)
+    passkeys = Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json")
+    reviews = Reviews()
+    app = PortalApp(
+        [ORIGIN],
+        static=load_static(),
+        setup=SetupCodes(tmp_path, KEYS.portal_key),
+        passkeys=passkeys,
+        login=LoginService(vault.app.tokens),
+        secrets=Secrets(vault.runtime.store, vault.app.tokens, lambda: vault.app.policy),
+        health=HealthReader(
+            vault.runtime.store,
+            lambda: vault.app.policy,
+            passkeys=passkeys,
+            policy_state=vault.managed.state,
+        ).report,
+        source="managed",
+        policy_header=lambda: vault.managed.header,
+        onboard=onboard_model.onboard_service(
+            vault.runtime.store, vault.app.tokens, lambda: vault.app.policy
+        ),
+        reviews=reviews,
+        managed=vault.managed,
+    )
+    return app, vault, reviews
+
+
+async def test_no_managed_portal_answer_carries_a_token_or_a_placeholder(tmp_path: Path) -> None:
+    """O.6: a review save planned as a draft and saved with a passkey, a refused prepare and a
+    stale draft, then every route walked: no answer carries the client's literal token, its
+    hash or the caller's placeholder, the draft's and the plan's summaries included."""
+    app, vault, reviews = await managed_portal(tmp_path)
+    answers: list[str] = []
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
+    page = Recording(client, answers)
+    authenticator = SoftAuthenticator()
+    await signed_in(page, app, authenticator)
+    job = reviews.portal_done.id
+    choices = {"include": ["list_notes"], "allow": [], "approve": ["list_notes"]}
+    draft = (await page.call("POST", f"/api/review/jobs/{job}/diff", choices)).json()
+    assert draft["kind"] == "policy.save", draft
+    data = {"draft": draft["draft"], "base": draft["base"]}
+    saved = await step_up(page, authenticator, "policy.save", data)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["revision"] == 2
+    refused = await page.call("POST", "/api/actions", {"kind": "policy.save", "data": data})
+    assert refused.json()["reason"] == "draft_unknown"
+    # The head moved since that review ran: a draft from it is refused, stale.
+    again = await page.call("POST", f"/api/review/jobs/{job}/diff", choices)
+    assert again.json()["reason"] == "review_stale", again.text
+    params = {**PORTAL_PARAMS, "job": job}
+    await walk([page], [r for r in ROUTES if r.path not in ENDINGS], params)
+    credentials = {
+        MANAGED_TOKEN: "client token",
+        hash_token(MANAGED_TOKEN): "token hash",
+        MANAGED_PLACEHOLDER: "placeholder",
+    }
+    assert len(answers) > len(ROUTES)
+    for text in answers:
+        assert carried(text, credentials) == set()
+    await client.aclose()
+    await vault.app.aclose()

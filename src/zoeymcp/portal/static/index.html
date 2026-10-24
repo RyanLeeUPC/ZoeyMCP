@@ -80,7 +80,8 @@ shows. Now sign in with it, to check that it works.</p>
 <p id="attention-text"></p>
 <ul id="attention"></ul>
 </div>
-<p>This deployment's policy is declarative: the portal can't change it.</p>
+<p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
+<p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
 </section>
 
 <section id="credentials" hidden>
@@ -91,7 +92,8 @@ for a credential registered with the portal's callback address, the provider sen
 itself); the vault stores the grant after you confirm with your passkey. Nothing here shows a
 secret or a token.</p>
 <ul id="credential-list"></ul>
-<p>This deployment's policy is declarative: the portal can't change it.</p>
+<p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
+<p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
 </section>
 
 <section id="servers" hidden>
@@ -99,7 +101,11 @@ secret or a token.</p>
 <p>Every remote and toolkit server in the policy, and the one you are adding, each with its state
 and what to do next. The vault discovers a server by its URL, registers its client after you
 confirm with your passkey, and makes the YAML; review then shows the server's tools for you to
-choose. Nothing here changes the policy: you commit each fragment and reload.</p>
+choose.</p>
+<p data-mode="declarative">Nothing here changes the policy: you commit each fragment and
+reload.</p>
+<p data-mode="managed" hidden>Each save asks for your passkey and takes effect when it is
+written.</p>
 <ul id="server-list"></ul>
 <ul id="refusal-next"></ul>
 <ul id="refusal-check"></ul>
@@ -173,7 +179,8 @@ judgement by ZoeyMCP: allow lets agents call the tool with no prompt, approve as
 declined: every listed tool you don't include, at the definition shown, so it counts again only
 if the server changes it</label>
 <p id="review-drift"></p>
-<button type="button" id="review-generate">Generate</button>
+<button type="button" id="review-generate" data-mode="declarative">Generate</button>
+<button type="button" id="review-save" data-mode="managed" hidden>Save</button>
 </div>
 </div>
 
@@ -192,7 +199,9 @@ if the server changes it</label>
 <pre id="fragment-text"></pre>
 <ul id="fragment-check"></ul>
 <p>Then, in order.</p>
-<p id="fragment-carries">After fragment 1's commit and reload, this section carries on by itself.</p>
+<p id="fragment-carries"><span data-mode="declarative">After fragment 1's commit and reload, this
+section carries on by itself.</span><span data-mode="managed" hidden>After the save, this section
+carries on by itself.</span></p>
 <ul id="fragment-next" class="steps"></ul>
 </div>
 </section>
@@ -256,13 +265,17 @@ container.</p>
 <ul id="ledger-orphans"></ul>
 <h3>Archived chains</h3>
 <ul id="ledger-archives"></ul>
-<p>This deployment's policy is declarative: the portal can't change it.</p>
+<p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
+<p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
 </section>
 
 <section id="policy" hidden>
 <h2>Policy</h2>
-<p>This deployment's policy is declarative: change it in its source and reload. The portal can't
-change it. It was read from <span id="policy-source"></span>.</p>
+<p data-mode="declarative">This deployment's policy is declarative: change it in its source and
+reload. The portal can't change it.</p>
+<p data-mode="managed" hidden>This deployment's policy is managed: the portal's saves and the
+host's imports write each revision.</p>
+<p>It was read from <span id="policy-source"></span>.</p>
 <p id="policy-hidden"></p>
 <pre id="policy-text"></pre>
 </section>

@@ -85,6 +85,21 @@ without asking**, which in declarative mode opens the review screen with that to
 Home's attention list (M6 design M.7), ``GET /api/attention``, is what the gateway's status
 report says needs the operator, read from health's ``gateway`` section (``attention_items``).
 
+Managed mode (M6 design G.3-G.7, J.3, J.4, M.1-M.3): the mode is the running policy's, and the
+session answer names it with the head's revision. The review diff route builds a review save's
+change from the operator's choices instead of fragment 2, plans it on the head and holds it as a
+draft (``portal/drafts.py``), answering the kind the planner requires and its summary; the
+page then prepares ``policy.save``, ``tool.repin`` or ``tool.allow`` with the draft's ID and
+base. **Allow without asking** prepares ``tool.allow`` with the tool and the pin it was shown,
+whose definition comes from a review the vault holds for the server at that pin (J.4). Each
+plans through ``vault/managed.py``'s ``ManagedPolicy.plan`` and runs through its ``write``, the
+one synchronous write path, with the evidence the review showed and the tools the gateway's
+latest status marks; the summary is the planner's rows, the revision row naming who saved the
+head and when, and the store entries the save leaves unused first. At confirm, a refusal the
+re-plan or the write meets that has rows (a head that moved, a planner rule) is answered as
+``409 changed`` with them, the first naming the real reason (G.7, CR-3). A done job's way on is
+the managed one (``onboarding.managed_next``).
+
 The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
 a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
 origin. A start for one sets the flow's binding cookie (``SameSite=Lax``, its ``Path`` the
@@ -125,18 +140,32 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard, get_args
 from urllib.parse import parse_qsl
 
 from starlette.types import Receive, Scope, Send
 
 from ..common import netguard
+from ..common.canonical import digest
 from ..common.policy import attention
 from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
+from ..common.policy.change import MoveToAllow, PolicyChange, apply, from_portal
 from ..common.policy.fields import URL_MAX
+from ..common.policy.plan import Reason as PlanReason
+from ..common.policy.plan import WriteKind, WritePlan
+from ..common.policy.ratchet import DefKey
+from ..common.policy.reviewchange import AllowRefused, definition_lines, listed
 from ..common.policy.schema import OAuth2Credential, split_scope
 from ..vault import ledgerview, logs, secretops, secretplan
 from ..vault.bindings import VAULT_PREFIX
+from ..vault.managed import (
+    Evidence,
+    WriteRefused,
+    Written,
+    allow_pin,
+    refused_answer,
+    written_answer,
+)
 from ..vault.oauth.login import LoginError
 from ..vault.oauth.pkce import FLOW_TTL, CallbackBinder
 from ..vault.onboard import OnboardError, check_request
@@ -146,7 +175,9 @@ from ..vault.onboarding import (
     listed_next,
     listed_server,
     listed_servers,
+    managed_next,
     refusal_next,
+    review_again,
     server_host_port,
     tools_max,
 )
@@ -159,10 +190,11 @@ from ..vault.reportstore import (
 )
 from ..vault.reviewjobs import Job, Owner, ReviewRefused
 from ..vault.secretplan import PutPlan, SecretRefusal
+from . import drafts as drafts_
 from . import passkeys as passkey_file
 from . import reviewview
 from . import routes as api
-from .actions import Action, ActionRefusal, Actions, changed, parse_request
+from .actions import ALLOW_FORMS, Action, ActionRefusal, Actions, changed, parse_request
 from .admission import (
     Admitted,
     Callback,
@@ -181,11 +213,12 @@ from .admission import (
     values,
 )
 from .display import NAME_LIMIT, SUMMARY_LIMIT, shown
+from .drafts import Draft, Drafts, Facts
 from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
-from .policyview import Source
+from .policyview import Source, saved
 from .policyview import view as policy_view
-from .refusals import Refusal, enrolment, issuer_changed, refusal, secret
+from .refusals import Refusal, enrolment, issuer_changed, refusal, save_moved, secret
 from .refusals import login as login_refusal
 from .routes import (
     CALLBACK,
@@ -222,6 +255,7 @@ if TYPE_CHECKING:
     from ..common.policy.schema import Policy
     from ..vault.admin import ReviewQueue, SetupCodes
     from ..vault.connectors.smtp import SmtpConnectors
+    from ..vault.managed import ManagedPolicy
     from ..vault.oauth.login import LoginService
     from ..vault.oauth.tokens import TokenManager
     from ..vault.onboard import OnboardService
@@ -240,8 +274,31 @@ SETUP_HINT: Final = "run zoeymcp setup-code in the vault's container"
 RESET_HINT: Final = "run zoeymcp setup-code --reset in the vault's container"
 # setup_code_refused is logged at most once a minute, with a count (M.4).
 SETUP_REFUSED_LOG_EVERY: Final = 60.0
-# M5 refuses a managed policy at start (P9), so every portal is declarative for now.
-MODE: Final = "declarative"
+# A managed save's kinds (M6 design G.3, M.3): planned and run through the managed policy.
+MANAGED_KINDS: Final[tuple[WriteKind, ...]] = ("policy.save", "tool.repin", "tool.allow")
+# The refusals a managed save's dialog shows as rows when its confirm meets them (G.7, CR-3):
+# the commit section's policy_moved, and the planner's and the gate's, which a re-plan meets.
+# Every other one (saved_not_running, policy_write_failed, policy_not_running, a lowered
+# generation) is the vault's own, answered with its catalogued status and text (N.2).
+IN_THE_DIALOG: Final = (frozenset(get_args(PlanReason)) - {"generation_lowered"}) | {
+    "policy_moved",
+    "import_refused",
+    "portal_env_ref",
+    "route_reuses_credential",
+}
+# What a summary row that the save leaves a store entry unused says, shown first (G.7 row 7).
+UNUSED_LABEL: Final = "Delete this first (it needs its own passkey)"
+UNUSED_WORDS: Final = (
+    "{name} is left unused: after this save it can't be revoked at the provider. Cancel, "
+    "delete it on the Secrets page, then save again"
+)
+# A move to allow from a server's page, as its change's title (J3); and its row when the head
+# no longer holds the tool included as approve at the pin the page showed (J.4).
+ALLOW_TITLE: Final = "allow {name} without asking"
+ALLOW_MOVED: Final = (
+    "the policy no longer holds this tool included as approve at the pin you were shown: open "
+    "the server's page again"
+)
 # A counter that went back shows as a banner for this long (I.1's passkey_counter).
 REGRESSED_FOR: Final = 30 * 86_400
 COUNTER_BANNER: Final = (
@@ -431,11 +488,15 @@ class Plan:
 
 @dataclass(frozen=True)
 class Step:
-    """Where an action is planned and run: the origin entry, the session and the passkey file."""
+    """Where an action is planned and run: the origin entry, the session and the passkey file;
+    at the run, the fingerprint of the passkey that confirmed it and the plan it confirmed (a
+    managed save's author and expected plan, M6 design G.6)."""
 
     entry: Origin
     session: Session
     holder: Passkeys
+    credential: str | None = None
+    planned: Plan | None = None
 
 
 @dataclass(frozen=True)
@@ -520,7 +581,9 @@ class PortalApp:
     ``policy_header`` gives the running revision's header, which the view names (M6 design A.4).
     ``onboard`` is onboarding by
     URL's service and ``reviews`` the review jobs, both shared with the admin socket (M7 design
-    K); without them, the MCP servers routes and actions are a 500.
+    K); without them, the MCP servers routes and actions are a 500. ``managed`` is a managed
+    vault's policy holder (M6 design G.6), which every managed save plans and writes through;
+    without it the managed kinds refuse ``policy_not_managed``.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
     class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
     limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
@@ -545,6 +608,7 @@ class PortalApp:
         policy_header: Callable[[], Mapping[str, Any] | None] | None = None,
         onboard: OnboardService | None = None,
         reviews: ReviewQueue | None = None,
+        managed: ManagedPolicy | None = None,
         routes: Sequence[Route] = ROUTES,
         handlers: Mapping[Route, Handler] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -563,6 +627,7 @@ class PortalApp:
         self.policy_header = policy_header
         self.onboard = onboard
         self.reviews = reviews
+        self.managed = managed
         self._routes = tuple(routes)
         self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
@@ -571,6 +636,7 @@ class PortalApp:
         self.sessions = Sessions()
         self.ceremonies = Ceremonies()
         self.actions = Actions()
+        self.drafts = Drafts()
         self._kinds = self._own_kinds()
         self._gate = InFlight()
         self._bucket = Bucket()
@@ -587,6 +653,11 @@ class PortalApp:
     def action_kinds(self) -> frozenset[str]:
         """The kinds of action this portal plans and runs, each one in ``actions.KINDS``."""
         return frozenset(self._kinds)
+
+    @property
+    def mode(self) -> Literal["declarative", "managed"]:
+        """The running policy's mode (M6 design M.1): managed only with a managed holder."""
+        return "managed" if self.managed is not None else "declarative"
 
     @property
     def in_flight(self) -> tuple[int, int]:
@@ -722,6 +793,7 @@ class PortalApp:
         # expired actions drop the data they hold.
         self._finish(self.sessions.sweep(self._wall()))
         self.actions.sweep(self._wall())
+        self.drafts.sweep(self._wall())
         if route.unauthenticated:
             slot = self._gate.enter_unauthenticated(ticket)
             refused = admit_unauthenticated(slot=slot, token=slot and self._bucket.take(started))
@@ -840,6 +912,7 @@ class PortalApp:
             session = item.session
             self.ceremonies.drop_session(session.id)
             self.actions.drop_session(session.id)
+            self.drafts.drop_session(session.id)
             if self.login is not None:
                 self.login.cancel_owner(session.owner)
             if self.onboard is not None:
@@ -1008,7 +1081,8 @@ class PortalApp:
             "scope": session.scope,
             "origin": session.origin,
             "rp_id": session.rp_id,
-            "mode": MODE,
+            "mode": self.mode,
+            "revision": None if self.managed is None else self.managed.revision,
             "idle": int(SESSION_IDLE) if session.scope == "full" else None,
             "expires_at": int(session.expires_at),
             "session": session.fingerprint,
@@ -1170,7 +1244,8 @@ class PortalApp:
         entry = call.entry
         plan = kind.plan(request.data, Step(entry, session, holder))
         if isinstance(plan, Refusal):
-            return plan
+            # The rows a confirm would show in its dialog (G.7); before it opens, the text.
+            return replace(plan, more=tuple((k, v) for k, v in plan.more if k != "rows"))
         action = self.actions.prepare(
             kind=request.kind.name,
             data=request.data,
@@ -1229,10 +1304,14 @@ class PortalApp:
         if isinstance(plan, Refusal) or changed(action, plan):
             reason = plan.reason if isinstance(plan, Refusal) else "changed"
             logs.event("action_changed", action=action.kind, credential=credential, reason=reason)
-            return plan if isinstance(plan, Refusal) else _changed(action, plan)
+            return (
+                _refused_at_confirm(action.plan, plan)
+                if isinstance(plan, Refusal)
+                else (_changed(action, plan))
+            )
         holder.touch(asserted)
         logs.event("step_up_confirmed", action=action.kind, credential=credential)
-        return await kind.run(data, step)
+        return await kind.run(data, replace(step, credential=credential, planned=plan))
 
     async def _cancel(self, call: Call) -> Reply | Refusal:
         """F.4 step 4: drop this session's pending action and the data it holds."""
@@ -1261,6 +1340,11 @@ class PortalApp:
             ),
             "onboard.register": ActionKind(self._plan_register, self._run_register),
             "tool.clear": ActionKind(self._plan_clear, self._run_clear),
+            # M6 G.3, M.3: managed saves, through the managed policy's write path (G.6).
+            **{
+                name: ActionKind(self._plan_write(name), self._run_write(name))
+                for name in MANAGED_KINDS
+            },
         }
 
     def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1793,7 +1877,10 @@ class PortalApp:
         own = self._onboard_service().owned(_session(call).owner)
         found = [] if own is None else [_onboarding_row(own)]
         names = self._secret_store().store.names()
-        found += [_server_row(listed) for listed in listed_servers(policy, names)]
+        found += [
+            _server_row(listed, self._allow_pins(policy, listed))
+            for listed in listed_servers(policy, names)
+        ]
         return Reply({"servers": found})
 
     async def _onboard_discover(self, call: Call) -> Reply | Refusal:
@@ -1914,7 +2001,7 @@ class PortalApp:
             job = await self._review_jobs().queue_review(server, REVIEW_OWNER, fresh=fresh)
         except ReviewRefused as exc:
             return _review_refusal(exc.reason, exc.fields, server)
-        return Reply({**_job_view(job), "reused": job.state == "done"})
+        return Reply({**_job_view(job, self.mode), "reused": job.state == "done"})
 
     async def _review_read(self, call: Call) -> Reply | Refusal:
         """The portal's job, as the page polls it: its state, and once done F.6's rows; a
@@ -1924,16 +2011,17 @@ class PortalApp:
             return job
         if job.report is not None:
             report = job.report.model_dump(mode="json", exclude_unset=True)
-            read = {**_job_view(job), **reviewview.rows(report)}
+            approved = self._approved(job.server)
+            read = {**_job_view(job, self.mode), **reviewview.rows(report, approved)}
             if job.work == "clear":  # the tools whose marks it cleared (M6 design J.4)
                 read["cleared_shown"] = [shown(name, NAME_LIMIT) for name in report["cleared"]]
             return Reply(read)
-        return Reply(_job_view(job))
+        return Reply(_job_view(job, self.mode))
 
     async def _review_diff(self, call: Call) -> Reply | Refusal:
         """Fragment 2 from the operator's choices (F.6, E.4), against the running policy; or
-        ``review_stale`` after a reload that changed the server's tools (GR-11). It writes
-        nothing, so it needs no step-up."""
+        ``review_stale`` after a reload that changed the server's tools (GR-11). In managed mode,
+        the save's draft instead (:meth:`_draft`). It writes nothing, so it needs no step-up."""
         job = await self._review_job(call)
         if isinstance(job, Refusal):
             return job
@@ -1941,6 +2029,8 @@ class PortalApp:
             return replace(refusal("bad_body"), more=(("detail", "the review isn't done yet"),))
         report = job.report.model_dump(mode="json", exclude_unset=True)
         policy = self._policy()
+        if self.managed is not None:
+            return self._draft(call, job, report, policy)
         answer = reviewview.diff(
             report,
             listed_server(policy, job.server),
@@ -1963,7 +2053,7 @@ class PortalApp:
             return _review_refusal(exc.reason, exc.fields, None)
         if job.failure is not None:
             refused = _review_refusal(job.failure, dict(job.fields), job.server)
-            return replace(refused, more=(*_job_view(job).items(), *refused.more))
+            return replace(refused, more=(*_job_view(job, self.mode).items(), *refused.more))
         return job
 
     def _plan_clear(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1990,7 +2080,304 @@ class PortalApp:
             job = await self._review_jobs().queue_clear(server, REVIEW_OWNER)
         except ReviewRefused as exc:
             return _review_refusal(exc.reason, exc.fields, server)
-        return Reply(_job_view(job))
+        return Reply(_job_view(job, self.mode))
+
+    # --- managed saves (M6 design G.3-G.7, J.3, J.4, M.3) ---------------------------------------
+
+    def _draft(
+        self, call: Call, job: Job, report: Mapping[str, Any], policy: Policy
+    ) -> Reply | Refusal:
+        """A review save (G.4, J.3): the change the choices make, the evidence its report shows,
+        planned on the head with the kind the planner requires, held as this session's draft.
+        Its answer names the draft, the base, the kind to prepare and the summary."""
+        managed = self._managed()
+        session = _session(call)
+        made = reviewview.change_of(
+            report, listed_server(policy, job.server), _body(call), most=tools_max(policy)
+        )
+        if isinstance(made, Refusal):
+            return _saving(made)
+        op = drafts_.the_review(made)
+        if op is None:  # reviewchange.fragment always holds one
+            raise RuntimeError("a review's change holds the server's review")
+        found = drafts_.facts(report, op)
+        if isinstance(found, AllowRefused):
+            return refusal(found.reason, detail=found.name)
+        save, planned = self._as_required(
+            _Save("policy.save", managed.revision, made, self._evidence(found))
+        )
+        if isinstance(planned, WriteRefused):
+            return _unrowed(self._write_refused(planned, job.server))
+        draft = self.drafts.hold(
+            session=session.id,
+            base=save.base,
+            change=made,
+            job=job.id,
+            report_digest=digest(report),
+            kind=save.kind,
+            facts=found,
+            now=self._wall(),
+        )
+        return Reply(drafts_.answer(draft, _summary(self._plan_of(planned, session))))
+
+    def _plan_write(self, kind: WriteKind) -> Callable[[Mapping[str, Any], Step], Plan | Refusal]:
+        """A managed kind's plan (M.3): its data read (:meth:`_save_of`), then planned on the
+        head as the write will plan it, nothing written."""
+
+        def plan(data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+            save = self._save_of(kind, data, step)
+            if isinstance(save, Refusal):
+                return save
+            planned = self._write_plan(save)
+            if isinstance(planned, WriteRefused):
+                return self._write_refused(planned, save.server, again=(save, step.session))
+            return self._plan_of(planned, step.session)
+
+        return plan
+
+    def _run_write(
+        self, kind: WriteKind
+    ) -> Callable[[Mapping[str, Any], Step], Awaitable[Reply | Refusal]]:
+        """A managed kind's run (G.6): ``ManagedPolicy.write``, synchronous from the head's check
+        to the install, authored by the passkey that confirmed it, against the plan it
+        confirmed. A refusal with rows is shown in the dialog as ``changed`` (G.7); one of the
+        vault's own (a revision saved and not installed, a store that couldn't write) is its own
+        catalogued answer."""
+
+        async def run(data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+            save = self._save_of(kind, data, step)
+            confirmed = step.planned
+            if isinstance(save, Refusal):
+                return save if confirmed is None else _refused_at_confirm(confirmed, save)
+            expected = None if confirmed is None else confirmed.facts[0]
+            author = {"by": "passkey", "fingerprint": str(step.credential)}
+            written: Written | WriteRefused
+            try:
+                written = self._managed().write(
+                    save.kind,
+                    "portal",
+                    save.base,
+                    _candidate(save.change),
+                    author=author,
+                    expected=expected,
+                    evidence=save.evidence,
+                )
+            except ValueError as exc:  # the change itself refused (ChangeRefused)
+                written = _change_refused(exc)
+            if isinstance(written, WriteRefused):
+                if written.reason == "changed" and written.plan is not None and confirmed:
+                    now = self._plan_of(written.plan, step.session)
+                    return _changed_plans(confirmed, now)
+                refused = self._write_refused(written, save.server, again=(save, step.session))
+                return refused if confirmed is None else _refused_at_confirm(confirmed, refused)
+            if save.draft is not None:
+                self.drafts.drop(save.draft.id, session=step.session.id)
+            return Reply(written_answer(written))
+
+        return run
+
+    def _save_of(self, kind: WriteKind, data: Mapping[str, Any], step: Step) -> _Save | Refusal:
+        """A managed kind's data as a save (M.3): ``{draft, base}``, this session's live draft
+        planned on that base; or for ``tool.allow`` from a server's page ``{base, server,
+        kind, name, pin}``, the move with the definition the vault holds for it (J.4).
+        ``policy_not_managed`` in declarative mode."""
+        if self.managed is None:
+            return refusal("policy_not_managed")
+        base = data["base"]
+        if type(base) is not int or base < 1:
+            return refusal("bad_body")
+        if kind == "tool.allow":
+            given = frozenset(data) - {"base"}
+            if given not in ALLOW_FORMS:
+                return refusal("bad_body")
+            if "draft" not in given:
+                return self._move(base, data)
+        draft_id = data["draft"]
+        if not isinstance(draft_id, str):
+            return refusal("bad_body")
+        draft = self.drafts.get(draft_id, session=step.session.id, now=self._wall())
+        if draft is None:
+            return refusal("draft_unknown")
+        if draft.base != base:
+            return refusal("bad_body")
+        op = drafts_.the_review(draft.change)
+        server = None if op is None else op.name
+        return _Save(kind, base, draft.change, self._evidence(draft.facts), draft, server)
+
+    def _move(self, base: int, data: Mapping[str, Any]) -> _Save | Refusal:
+        """**Allow without asking** from a server's page (J3, J.4): the move, and the definition
+        whose pin is the head's for the tool, the listed one or the reviewed one, from the
+        newest review the vault holds for the server at that pin (OPS-13); on a ``pinning: off``
+        toolkit the listed one at the pin the dialog showed. With none, the planner refuses
+        ``allow_needs_review`` and the way on is a fresh review."""
+        try:
+            op = MoveToAllow(data["server"], data["kind"], data["name"], data["pin"])
+        except (TypeError, ValueError):
+            return refusal("bad_body")
+        policy = self._managed().policy
+        pinned, off = allow_pin(policy, op.server, op.name)
+        if not _approves(policy, op.server, op.name) or (not off and pinned != op.pin):
+            # The head no longer holds what the page showed (J.4): look again.
+            where = f"gateway.servers.{op.server}.tools.{op.name}"
+            answer = refusal("changed")
+            rows = [[f"Refused ({answer.reason})", answer.error], [where, ALLOW_MOVED]]
+            return replace(answer, more=(("rows", rows),))
+        wanted = op.pin if off else pinned
+        key: DefKey = (op.server, op.kind, op.name)
+        found = Facts()
+        held = None if wanted is None else _held_at(self._held(op.server), op.name, wanted, off)
+        if held is not None:
+            tool, definition = held
+            lines = tuple(tuple(chunks) for chunks in definition_lines(definition))
+            consequential = tool.get("consequential") is True
+            found = Facts(
+                definitions={key: lines},
+                consequential=frozenset([key] if consequential else []),
+                marked=frozenset([key] if tool["state"] == "marked" else []),
+            )
+        change = PolicyChange(ALLOW_TITLE.format(name=op.name), (op,))
+        return _Save("tool.allow", base, change, self._evidence(found), None, op.server)
+
+    def _held(self, server: str) -> list[dict[str, dict[str, Any]]]:
+        """The tools each review the vault holds for ``server`` lists, newest first (J.4)."""
+        reports = () if self.reviews is None else self.reviews.held_reports(server)
+        return [listed(held.model_dump(mode="json", exclude_unset=True)) for held in reports]
+
+    def _allow_pins(self, policy: Policy, server: Listed) -> dict[str, tuple[str | None, bool]]:
+        """Each included approve tool's pin for **Allow without asking**, and whether a review
+        the vault holds shows its definition at that pin (J.4): the policy's pin, or on a
+        ``pinning: off`` toolkit, which holds none, the one the newest held review lists. When
+        none is held, the button reviews the server first."""
+        held = self._held(server.name)
+        found: dict[str, tuple[str | None, bool]] = {}
+        for name in server.tools.approve:
+            pinned, off = allow_pin(policy, server.name, name)
+            tool = held[0].get(name) if held and off else None
+            pin = (None if tool is None else tool.get("pin")) if off else pinned
+            found[name] = (pin, pin is not None and _held_at(held, name, pin, off) is not None)
+        return found
+
+    def _evidence(self, found: Facts) -> Evidence:
+        """What the planner reads besides the policy (G.5): the review's facts, and the tools
+        the gateway's latest status marks besides the report's (J.4)."""
+        return Evidence(
+            verified=found.verified,
+            drifted=found.drifted,
+            definitions=found.definitions,
+            suggested=found.suggested,
+            marked=found.marked | self._managed().marked(),
+            consequential=found.consequential,
+        )
+
+    def _write_plan(self, save: _Save) -> WritePlan | WriteRefused:
+        """``save`` planned on the head as the write will plan it (G.6 steps 1-5)."""
+        try:
+            planned = self._managed().plan(
+                save.kind, "portal", save.base, _candidate(save.change), evidence=save.evidence
+            )
+        except ValueError as exc:  # the change itself refused (ChangeRefused)
+            return _change_refused(exc)
+        if isinstance(planned, Written):  # only for a retry by an author, which none names here
+            raise RuntimeError("a portal plan names no author")
+        return planned
+
+    def _as_required(self, save: _Save) -> tuple[_Save, WritePlan | WriteRefused]:
+        """``save`` planned as the kind the planner requires of its diff (Y7), as a draft
+        carries it: a review save's kind is decided by the planner, never the page."""
+        planned = self._write_plan(save)
+        if (
+            isinstance(planned, WriteRefused)
+            and planned.reason == "kind_mismatch"
+            and planned.subjects[0] in MANAGED_KINDS
+        ):
+            save = replace(save, kind=_kind(planned.subjects[0]))
+            planned = self._write_plan(save)
+        return save, planned
+
+    def _write_refused(
+        self,
+        refused: WriteRefused,
+        server: str | None,
+        *,
+        again: tuple[_Save, Session] | None = None,
+    ) -> Refusal:
+        """A managed save's refusal in the portal's words (N.2), with ``rows`` for a confirm's
+        dialog when it is one the dialog shows (G.7, CR-3, :data:`IN_THE_DIALOG`): a head that
+        moved is the revision row ("press Save again", OPS-18), then the plan the same save
+        (``again``) makes on the new head; any other names its reason and the paths or tools
+        it is about. A refusal whose way on is the host's (``portal_widens``,
+        ``summary_too_large``) carries the export and the import; a move with no reviewed
+        definition, a fresh review of its server."""
+        if refused.reason == "policy_moved":
+            header = self._managed().store.header
+            number = refused.revision or 0
+            said = f"revision {number}" if header is None else saved(header)
+            moved = save_moved(said=said, revision=number)
+            rows = [["Revision", moved.error]]
+            if again is not None and number:
+                rows += self._replanned(again[0], number, again[1])
+            return replace(moved, more=(("rows", rows),))
+        if refused.reason == "import_refused":
+            answer = refusal("save_invalid", detail=refused.detail)
+        else:
+            answer = refused_answer(refused)
+        steps: list[dict[str, Any]] = []
+        if refused.next is not None:
+            steps = [step.answer() for step in managed_next()[1:]]
+        elif refused.reason == "allow_needs_review" and server is not None:
+            steps = [review_again(server).answer()]
+        rows = [[f"Refused ({answer.reason})", answer.error]]
+        rows += [[subject, answer.reason] for subject in refused.subjects]
+        more: list[tuple[str, Any]] = [("subjects", list(refused.subjects))]
+        if refused.reason in IN_THE_DIALOG:
+            more.append(("rows", rows))
+        if steps:
+            more.append(("next", steps))
+        return replace(answer, more=tuple(more))
+
+    def _replanned(self, save: _Save, head: int, session: Session) -> list[list[str]]:
+        """What the dialog shows below a head that moved (G.7): ``save`` planned again on
+        revision ``head``, as **Save** would plan it, or the refusal that plan meets."""
+        _, planned = self._as_required(replace(save, base=head))
+        if isinstance(planned, WritePlan):
+            return _summary(self._plan_of(planned, session))
+        found = dict(self._write_refused(planned, save.server).more).get("rows", [])
+        rows: list[list[str]] = found
+        return rows
+
+    def _plan_of(self, planned: WritePlan, session: Session) -> Plan:
+        """The plan the dialog shows (G.7): the planner's rows, the revision row naming who saved
+        the head and when, the entries the save leaves unused first, every value shown and none
+        cut (a definition's chunks are at most ``reviewchange.CHUNK``). Its fact is the write
+        plan, which the confirm compares whole."""
+        rows = list(planned.rows)
+        header = self._managed().store.header
+        label, value = rows[0]
+        if header is not None:
+            value += f" ({_saved_by(header, session)}: {planned.base} is the head)"
+        unused = [
+            (UNUSED_LABEL, UNUSED_WORDS.format(name=name))
+            for kind, name in rows[1:]
+            if kind == "Left unused"
+        ]
+        others = [row for row in rows[1:] if row[0] != "Left unused"]
+        summary = tuple(
+            (_whole(each), _whole(said)) for each, said in [(label, value), *unused, *others]
+        )
+        return Plan(summary, (planned,))
+
+    def _managed(self) -> ManagedPolicy:
+        if self.managed is None:
+            raise RuntimeError("this portal has no managed policy")
+        return self.managed
+
+    def _approved(self, server: str) -> frozenset[str]:
+        """``server``'s tools in the head ratchet's ``approved`` set, for the review rows'
+        ``prefill`` (J.3); none in declarative mode, where no ratchet exists."""
+        if self.managed is None:
+            return frozenset()
+        approved = self.managed.ratchet.approved
+        return frozenset(name for at, kind, name in approved if (at, kind) == (server, "tool"))
 
     def _onboard_service(self) -> OnboardService:
         if self.onboard is None:
@@ -2859,11 +3246,15 @@ def _onboarding_row(answer: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _server_row(listed: Listed) -> dict[str, Any]:
+def _server_row(
+    listed: Listed, pins: Mapping[str, tuple[str | None, bool]] | None = None
+) -> dict[str, Any]:
     """A server of the running policy as a row (K.1): its state, the tools it serves and to
-    which clients, its included ``approve`` tools (each with **Allow without asking**, M6 design
-    J3), and what to do next."""
+    which clients, its included ``approve`` tools (each with **Allow without asking**, the pin
+    it allows and whether a review the vault holds shows that definition, ``pins``; M6 design
+    J3, J.4), and what to do next."""
     approve = [name for name in listed.tools.approve if name in listed.tools.include]
+    pins = pins or {}
     return {
         "server": listed.name,
         "name_shown": shown(listed.name, NAME_LIMIT),
@@ -2872,22 +3263,157 @@ def _server_row(listed: Listed) -> dict[str, Any]:
         "credential": listed.credential,
         "tools": len(listed.tools.include),
         "clients_shown": [shown(client, NAME_LIMIT) for client in listed.clients],
-        "approve": [{"name": name, "name_shown": shown(name, NAME_LIMIT)} for name in approve],
+        "approve": [
+            {
+                "name": name,
+                "name_shown": shown(name, NAME_LIMIT),
+                "pin": pins.get(name, (listed.review.get(name), False))[0],
+                "held": pins.get(name, (None, False))[1],
+            }
+            for name in approve
+        ],
         "next": [step.answer() for step in listed_next(listed)],
     }
 
 
-def _job_view(job: Job) -> dict[str, Any]:
+def _job_view(job: Job, mode: str = "declarative") -> dict[str, Any]:
     """A review job as the page polls it: never its digest or times; once done, its way on
-    (M6 design M.7, D-200)."""
+    (M6 design M.7, D-200), in managed ``mode`` a save rather than a fragment (Y25)."""
     view: dict[str, Any] = {
         "job": job.id,
         "server_shown": shown(job.server, NAME_LIMIT),
         "state": job.state,
     }
     if job.state == "done":
-        view["next"] = [step.answer() for step in job_next(job.server, clear=job.work == "clear")]
+        steps = job_next(job.server, clear=job.work == "clear", managed=mode == "managed")
+        view["next"] = [step.answer() for step in steps]
     return view
+
+
+# --- managed saves (M6 design G.4-G.7, J.3, J.4) --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Save:
+    """A managed save as the write path takes it: its kind, the head revision it was planned on,
+    the change, what the planner reads besides, its draft, and the server it is about."""
+
+    kind: WriteKind
+    base: int
+    change: PolicyChange = field(repr=False)
+    evidence: Evidence = field(repr=False)
+    draft: Draft | None = None
+    server: str | None = None
+
+
+def _kind(name: str) -> WriteKind:
+    """The kind a ``kind_mismatch`` names as required, one of a review save's three (G.3)."""
+    for kind in MANAGED_KINDS:
+        if name == kind:
+            return kind
+    raise ValueError(f"{name} isn't a review save's kind")
+
+
+def _candidate(change: PolicyChange) -> Callable[[Policy], Policy]:
+    """A portal save's candidate from a head: the change within the portal's bounds on its ops
+    (``from_portal``), applied as a managed write writes it (``declined`` whole, J.3)."""
+
+    def candidate_of(policy: Policy) -> Policy:
+        from_portal(change)
+        return apply(policy, change, managed=True)
+
+    return candidate_of
+
+
+def _change_refused(exc: ValueError) -> WriteRefused:
+    """A change the head can't take, as a write's refusal: the portal's own bounds by their
+    reasons, anything else ``import_refused`` (worded ``save_invalid`` in the portal)."""
+    reason = getattr(exc, "reason", None)
+    path = getattr(exc, "path", "")
+    messages = getattr(exc, "messages", ())
+    if reason in ("portal_env_ref", "route_reuses_credential"):
+        return WriteRefused(reason, path)
+    return WriteRefused("import_refused", "; ".join(messages) or path or str(exc))
+
+
+def _saving(refused: Refusal) -> Refusal:
+    """A review save's refusal from the choices (``reviewview.change_of``): ``diff_invalid``
+    in managed mode's words, ``save_invalid`` (no fragment is made, Y25)."""
+    if refused.reason != "diff_invalid":
+        return refused
+    detail = refused.error.partition("fails check (")[2].rpartition("), so no fragment")[0]
+    return replace(refusal("save_invalid", detail=detail), more=refused.more)
+
+
+def _unrowed(refused: Refusal) -> Refusal:
+    """A refusal before any dialog opens: its text, without the rows a confirm shows."""
+    return replace(refused, more=tuple((k, v) for k, v in refused.more if k != "rows"))
+
+
+def _approves(policy: Policy, server: str, name: str) -> bool:
+    """Whether ``policy`` includes ``server``'s tool ``name`` as approve (J.4)."""
+    found = listed_server(policy, server)
+    return found is not None and name in found.tools.include and name in found.tools.approve
+
+
+def _held_at(
+    held: Sequence[Mapping[str, Mapping[str, Any]]], name: str, pin: str, off: bool
+) -> tuple[Mapping[str, Any], Any] | None:
+    """The newest held review's entry for tool ``name`` whose definition is at ``pin``, with
+    that definition (J.4, OPS-13: any review whose pin for the tool is the head's), or None."""
+    for tools in held:
+        tool = tools.get(name)
+        definition = None if tool is None else _at_pin(tool, pin, off)
+        if tool is not None and definition is not None:
+            return tool, definition
+    return None
+
+
+def _at_pin(tool: Mapping[str, Any], pin: str, off: bool) -> Any:
+    """A listed tool's definition at ``pin`` (J.4, T-11): the listed one at its pin, or the
+    reviewed one a drift entry carries at its pinned pin; with pinning off, the listed one at
+    the pin the dialog showed."""
+    if tool["pin"] == pin:
+        return tool["definition"]
+    if not off and tool["pinned"] == pin:
+        return tool.get("reviewed")
+    return None
+
+
+def _saved_by(header: Mapping[str, Any], session: Session) -> str:
+    """Who saved the head and when (G.7 row 1): "you" for this session's passkey, else as the
+    policy view names an author; the time in UTC to the minute, so a confirm plans the same."""
+    when = datetime.fromtimestamp(header["created"], UTC).strftime("%Y-%m-%d %H:%M UTC")
+    author = header["author"]
+    if author["by"] == "passkey" and author["fingerprint"] == session.credential:
+        who = "you"
+    else:
+        who = saved(header).partition(" by ")[2]
+    return f"by {who}, {when}"
+
+
+def _whole(text: str) -> str:
+    """A summary value shown with nothing cut (G.7): the planner's rows are the vault's own
+    words, names and chunks of at most ``reviewchange.CHUNK``."""
+    return shown(text, max(len(text), 1))
+
+
+def _refused_at_confirm(was: Plan, refused: Refusal) -> Reply | Refusal:
+    """A refusal the confirm meets (G.7, CR-3): one with rows is ``409 changed`` with them as
+    ``now``, the first naming the real reason, so the open dialog shows it; any other as it
+    is."""
+    rows = dict(refused.more).get("rows")
+    if rows is None:
+        return refused
+    body = {**refusal("changed").body(), "was": _summary(was), "now": rows}
+    return Reply(body, status=409, reason="changed")
+
+
+def _changed_plans(was: Plan, now: Plan) -> Reply:
+    """409 ``changed`` from the write's own re-plan (G.6 step 4): the plan confirmed beside the
+    plan as it is now."""
+    body = {**refusal("changed").body(), "was": _summary(was), "now": _summary(now)}
+    return Reply(body, status=409, reason="changed")
 
 
 def _review_refusal(reason: str, fields: Mapping[str, str], server: str | None) -> Refusal:

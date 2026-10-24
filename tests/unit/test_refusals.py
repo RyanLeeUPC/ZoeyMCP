@@ -28,12 +28,14 @@ from zoeymcp.portal import passkeys, webauthn
 from zoeymcp.portal.refusals import (
     CATALOGUE,
     KEPT_IN_MEMORY,
+    SAVE_MOVED,
     WEBAUTHN,
     Refusal,
     enrolment,
     issuer_changed,
     reasons,
     refusal,
+    save_moved,
     secret,
     wrong_host_literal,
 )
@@ -259,6 +261,8 @@ SOCKET = {
     "revision_unreadable": 409,
     "revision_unknown": 409,
 }
+# A managed review save in the portal (M6 design G.4, N.2; portal/drafts.py, step 15a).
+SAVE = {"draft_unknown": 404, "save_invalid": 422}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -352,6 +356,7 @@ FIELDS = {
     "policy_not_running": {"revision"},
     "policy_moved": {"detail"},
     "import_refused": {"detail"},
+    "save_invalid": {"detail"},
     "saved_not_running": {"revision"},
     "state_locked": {"command"},
     "policy_store_present": {"state"},
@@ -411,7 +416,7 @@ def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
-    expected |= SOCKET
+    expected |= SOCKET | SAVE
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -457,6 +462,22 @@ def test_a_changed_issuer_names_both_terms() -> None:
         "https://a.example, iss required, it is now no issuer, iss x. Nothing was stored. "
         "Connect again.",
     )
+    assert not find_violations(made.error, max_chars=300, single_line=True, allow_tabs=False)
+
+
+def test_a_save_on_a_moved_head_says_save_again() -> None:
+    """OPS-18, N.2: in the portal a review save planned on a head that moved is policy_moved,
+    worded for a save (the socket's text says to export again), each value shown."""
+    made = save_moved(
+        said="revision 19, saved 2026-10-24 09:00 UTC by the host (socket)", revision=19
+    )
+    assert made == Refusal(
+        409,
+        "policy_moved",
+        "The policy moved to revision 19, saved 2026-10-24 09:00 UTC by the host (socket) since "
+        "you planned this: press Save again to plan it on revision 19.",
+    )
+    assert SAVE_MOVED.count("{") == 2
     assert not find_violations(made.error, max_chars=300, single_line=True, allow_tabs=False)
 
 

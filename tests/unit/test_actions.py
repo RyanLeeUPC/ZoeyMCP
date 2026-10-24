@@ -102,9 +102,18 @@ def test_the_registry_holds_f4s_kinds() -> None:
         "onboard.register": (131072, ["onboarding"], ["client_secret"]),
         # M6 J.4: clearing a server's drift marks, stepped up in both modes (Y27).
         "tool.clear": (4096, ["server"], []),
+        # M6 G.4, M.3 (step 15a): a managed review save by its draft, and a move to allow from
+        # a server's page or a draft.
+        "policy.save": (4096, ["base", "draft"], []),
+        "tool.repin": (4096, ["base", "draft"], []),
+        "tool.allow": (4096, ["base"], ["draft", "kind", "name", "pin", "server"]),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
     assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS
+    # tool.allow's optional keys are its two forms' (M.3): a server's page's, or a draft.
+    forms = (frozenset({"server", "kind", "name", "pin"}), frozenset({"draft"}))
+    assert forms == actions.ALLOW_FORMS
+    assert frozenset().union(*actions.ALLOW_FORMS) == KINDS["tool.allow"].optional
 
 
 def test_a_kinds_optional_keys_default_to_empty() -> None:

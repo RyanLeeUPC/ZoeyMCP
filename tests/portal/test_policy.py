@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from tests.fakes.authenticator import SoftAuthenticator
+from zoeymcp.portal.actions import KINDS
 from zoeymcp.portal.routes import ROUTES
 
 from .flows import issue, redeem, set_up, status_reason
@@ -74,5 +75,9 @@ def test_only_a_full_session_reads_it(rig: PortalRig) -> None:
 
 
 def test_no_route_writes_the_policy() -> None:
-    """P9: the policy has one route, a GET."""
+    """P9, per mode (M6 design M.2, 0.4): the policy has one route, a GET. A declarative policy
+    is changed in its source; in managed mode a save is an action (``policy.save``,
+    ``tool.repin``, ``tool.allow``, confirmed with a passkey), and no route writes the policy
+    outside ``/api/actions``."""
     assert [(r.method, r.path) for r in ROUTES if "polic" in r.path] == [("GET", "/api/policy")]
+    assert {"policy.save", "tool.repin", "tool.allow"} <= set(KINDS)

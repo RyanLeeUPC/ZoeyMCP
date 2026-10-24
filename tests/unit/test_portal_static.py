@@ -527,7 +527,12 @@ def test_review_js_clicks_go_through_app_js_guard() -> None:
         assert re.search(rf"function {helper}\(|const {helper} = \(", app), helper
     # The one call app.js makes into review.js: a server row's Connect, once it completes.
     assert re.findall(r"window\.zoeyReview\.(\w+)\(", app) == ["connected"]
-    assert "window.zoeyReview = Object.freeze({ connected: connected });" in code
+    assert (
+        "window.zoeyReview = Object.freeze({ connected: connected, stepText: stepText });" in code
+    )
+    # drift.js words a managed save's next steps as review.js words every one (M.7, J15).
+    drift = code_of(read("drift.js"))
+    assert re.findall(r"window\.zoeyReview\.(\w+)\(", drift) == ["stepText"]
     # And into drift.js (M6 M.4, Q14): Home's hook in enter(), after the checklist, and a gateway
     # finding's Review.
     assert re.findall(r"window\.zoeyDrift\.(\w+)\(", app) == ["home", "review"]
@@ -623,7 +628,8 @@ def test_select_suggested_makes_no_move() -> None:
     # drift.js sets a choice in two places only: accepting a proposed tool's new definition
     # chooses approve (Q8), and unticking it puts the vault's prefill back; and Allow without
     # asking moves the one tool whose button was pressed (J3, declarative), in move(), called for
-    # that tool alone once the review of the job it queued draws: no bulk control moves a tool.
+    # that tool alone once the review of the job it queued draws: no bulk control moves a tool. In
+    # managed mode it moves none on the screen: it opens that one tool's tool.allow dialog (J.4).
     assert re.findall(r"\bchoice\.value = (.*);", drift) == [
         "entry.repin.checked ? APPROVE : tool.prefill",
         "ALLOW",
@@ -633,19 +639,25 @@ def test_select_suggested_makes_no_move() -> None:
     start = drift.index("function move(entry) {")
     assert "entry.choice.value = ALLOW;" in drift[start : drift.index("\n  }\n", start)]
     assert re.findall(r"\bmove\((.*)\);", drift) == [
-        "drawn.entries.find((entry) => entry.tool.name === name)",
-        "held.entries.find((entry) => entry.tool.name === asked.name)",
+        "held.entries.find((entry) => entry.tool.name === asked.named.name)",
     ]
     # The pending move is that job's alone: allow() drops any earlier one and keeps none when the
     # vault refused the review (queueReview answers its job, or nothing), and footer() moves only
-    # on that job's review, so a refused, failed or replaced review leaves no move behind.
-    start = drift.index("async function allow(server, name, queue) {")
+    # on that job's review, so a refused, failed or replaced review leaves no move behind. In
+    # managed mode a review the vault holds opens the dialog at once; else the review is fresh.
+    start = drift.index("async function allow(server, named, queue) {")
     body = drift[start : drift.index("\n  }\n", start)]
-    assert body.index("moving = null;") < body.index("await queue(server);")
+    assert body.index("moving = null;") < body.index('await queue(server, mode === "managed");')
+    held = 'if (mode === "managed" && named.held) {\n      return allowSaved(server, named);'
+    assert held in body
     assert "if (job === undefined) {\n      return;" in body
     assert "drawn !== null && drawn.job === job" in body
-    assert "moving = { job: job, name: name };" in body
+    assert "const asked = { job: job, server: server, named: named };" in body
+    assert "moving = asked;" in body
     assert "asked !== null && asked.job === held.job" in drift
+    start = drift.index("function then(asked, held) {")
+    body = drift[start : drift.index("\n  }\n", start)]
+    assert body.index('if (mode === "managed") {') < body.index("return allowReviewed(asked);")
     assert "return pollReview().then(() => job.job);" in code_of(read("review.js"))
     assert "entry.tool.classification !== APPROVE || entry.tool.consequential === true" in drift
 
@@ -715,7 +727,9 @@ def test_drift_js_clicks_go_through_app_js_guard() -> None:
     """drift.js draws its buttons with app.js's button(), shared through window.zoeyPortal, and
     listens for one thing only, the re-pin box of a proposed tool, which sets its row's choice
     and calls nothing (Q8); Clear the marks and Allow without asking are button()s too (M6
-    J.4, J3), a clear through app.js's step-up (prepare); it publishes window.zoeyDrift, frozen,
+    J.4, J3), a clear through app.js's step-up (prepare); its one click handler of its own,
+    Save, goes through app.js's on() (step 15a), and a managed save is prepared as each kind a
+    draft can be, or as tool.allow from a server's row; it publishes window.zoeyDrift, frozen,
     and nothing else: Home's hooks (step 7) and review.js's (M6 J.2, step 8)."""
     code = code_of(read("drift.js"))
     assert re.findall(r"(\S+)\.addEventListener\(", code) == ["entry.repin"]
@@ -732,10 +746,18 @@ def test_drift_js_clicks_go_through_app_js_guard() -> None:
         "button",
         "prepare",
         "closeConfirm",
+        "on",
     }
+    assert re.findall(r"\bon\(\"([a-z-]+)\", (\w+)\)", code) == [("review-save", "save")]
     # Each new control is a button(): Clear the marks three times (Home's item through act(),
     # a server row, the review screen) and Allow without asking once per approve tool.
-    assert re.findall(r'prepare\("([a-z.]+)"', code) == ["tool.clear"]
+    assert re.findall(r'prepare\("([a-z.]+)"', code) == [
+        "tool.clear",
+        "policy.save",
+        "tool.repin",
+        "tool.allow",
+        "tool.allow",
+    ]
     assert code.count("button(ACTION_TEXT.clear, ") == 2
     assert 'button("Allow " + named.name_shown + " without asking",' in code
     # A clear job is read on a timer that runs a function, never a string (K.2).

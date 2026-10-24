@@ -152,6 +152,7 @@ only_mutate = [
     "*zoeymcp/portal/policyview.py",
     "*zoeymcp/portal/reviewview.py",
     "*zoeymcp/portal/policydiffview.py",
+    "*zoeymcp/portal/drafts.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/approvaltext.py",

@@ -507,6 +507,34 @@ def test_a_finished_job_is_kept_thirty_minutes() -> None:
     assert len(jobs) == 0
 
 
+def test_a_servers_held_reports_newest_first() -> None:
+    """M6 J.4 (step 15a): a move to allow from a server's page reads the reports the vault holds
+    for the server, any surface's, newest first; a failed, active or expired job gives none."""
+    jobs, clock = table()
+    assert jobs.reports("notes") == ()
+    first = sent(jobs)
+    clock.now += 1
+    post(jobs, posted(first, report("notes", "first")))
+    queued(jobs, owner="portal", fresh=True)
+    [second] = jobs.claim(A)
+    clock.now += 1
+    post(jobs, posted(second, report("notes", "second")))
+    other = sent(jobs, "files")
+    post(jobs, posted(other, report("files", "elsewhere")))
+    failing = sent(jobs, "mail", digest=B)
+    error = {"status": 502, "code": "x", "message": ""}
+    post(jobs, {"v": 1, "job": failing.id, "error": error})
+    queued(jobs, "mail", digest=B)  # active
+    names = [[entry.name for entry in found.tools] for found in jobs.reports("notes")]
+    assert names == [["second"], ["first"]]
+    assert [entry.name for entry in jobs.reports("files")[0].tools] == ["elsewhere"]
+    assert jobs.reports("mail") == ()
+    clock.now += RESULT_TTL - 1
+    assert len(jobs.reports("notes")) == 1
+    clock.now += 1
+    assert jobs.reports("notes") == ()
+
+
 def test_a_failed_job_is_kept_as_long() -> None:
     jobs, clock = table()
     job = queued(jobs)

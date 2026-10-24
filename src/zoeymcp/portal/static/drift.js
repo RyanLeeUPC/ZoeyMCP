@@ -5,18 +5,24 @@
 // and every row, its two definitions and their diff from the review's report, each string shown
 // through textContent; a clear is the vault's tool.clear action, and the gateway's own check. It
 // uses app.js's API, step-up and guard() (window.zoeyPortal), and review.js calls it when it draws
-// (window.zoeyDrift).
+// (window.zoeyDrift). In managed mode (M.1, G.3, G.4) it shows the page's managed texts (the
+// data-mode pairs), and Save and Allow without asking are saves: the vault holds the review's
+// change as a draft and plans it, and one passkey confirms the plan it shows, each move to allow
+// first with its definition (Q27).
 "use strict";
 
 (function () {
-  const { api, fill, afterFailure, button, prepare, closeConfirm } = window.zoeyPortal;
+  const { api, fill, afterFailure, button, prepare, closeConfirm, on } = window.zoeyPortal;
 
   // The buttons for an item's action; an unknown kind draws none.
   const ACTION_TEXT = { review: "Review", clear: "Clear the marks" };
   const MISSING = "The gateway no longer has the reviewed copy: the new definition is shown whole.";
-  // A re-pinned allow tool whose new definition the server no longer marks read-only (Q8).
+  // A re-pinned allow tool whose new definition the server no longer marks read-only (Q8): the
+  // fragment says it was kept; in managed mode the save's plan lists it as its own row (Q27).
   const PROPOSED = "The new definition isn't marked read-only: approve is proposed. Choose " +
     "allow above to keep it, and the fragment says you kept it.";
+  const PROPOSED_SAVED = "The new definition isn't marked read-only: approve is proposed. " +
+    "Choose allow above to keep it: the save's plan lists it as its own row.";
   // What accepting it chooses: the stricter classification, never a move toward allow (Q27-1).
   const APPROVE = "approve";
   // Allow without asking moves one included approve tool, the one whose button was pressed (J3).
@@ -33,10 +39,14 @@
   const CLEAR_EVERY = 2000;
   const CLEAR_READS = 90;
 
-  // Allow without asking: the job whose review screen moves a tool, and the tool, while it waits;
-  // and the review screen footer() drew last (review.js's held), which it moves once drawn.
+  // Allow without asking: the job whose review it waits for, the server and the tool; and the
+  // review screen footer() drew last (review.js's held), which it moves once drawn.
   let moving = null;
   let drawn = null;
+  // The running policy's mode, from the session (M.1): declarative until it says otherwise.
+  let mode = "declarative";
+  // review.js's queueReview, which footer() was given: Save reviews the server again with it.
+  let again = null;
 
   function $(id) {
     return document.getElementById(id);
@@ -106,8 +116,17 @@
     return action.kind === "clear" ? () => clear(action.server, after) : review;
   }
 
+  // The data-mode pairs (M.1, BP-7): each block shown in its mode only.
+  async function toggle() {
+    mode = (await api("GET", "/api/session")).mode;
+    for (const block of document.querySelectorAll("[data-mode]")) {
+      block.hidden = block.dataset.mode !== mode;
+    }
+  }
+
   // Home's list (M.7): each item with its one action, below the checklist.
   async function home() {
+    await toggle();
     const answer = await api("GET", "/api/attention");
     $("attention-block").hidden = !answer.gateway;
     $("attention-text").textContent = reported(answer);
@@ -124,21 +143,36 @@
     }
   }
 
-  // Allow without asking, declarative (J3): the review screen opens with that one tool moved
-  // from approve to allow on its own row, and Generate's fragment says so. The move is that job's
-  // alone: a review the vault refused queues nothing, and a job that fails or is replaced by
-  // another review never draws, so no later review of the server moves the tool.
-  async function allow(server, name, queue) {
+  // Allow without asking (J3). Declarative: the review screen opens with that one tool moved
+  // from approve to allow on its own row, and Generate's fragment says so. Managed (J.4): the
+  // tool.allow dialog, at once when a review the vault holds shows the definition, else once a
+  // fresh review of the server is done. The move is that job's alone: a review the vault refused
+  // queues nothing, and a job that fails or is replaced by another review never draws, so no
+  // later review of the server moves the tool.
+  async function allow(server, named, queue) {
     moving = null;
-    const job = await queue(server); // none when the vault refused it
+    if (mode === "managed" && named.held) {
+      return allowSaved(server, named);
+    }
+    const job = await queue(server, mode === "managed"); // none when the vault refused it
     if (job === undefined) {
       return;
     }
+    const asked = { job: job, server: server, named: named };
     if (drawn !== null && drawn.job === job) {
-      move(drawn.entries.find((entry) => entry.tool.name === name));
+      then(asked, drawn);
     } else {
-      moving = { job: job, name: name }; // footer() moves it when the job's review draws
+      moving = asked; // footer() takes it on when the job's review draws
     }
+  }
+
+  // What Allow without asking does once the review it waited for draws: the move on its row, or
+  // in managed mode the dialog.
+  function then(asked, held) {
+    if (mode === "managed") {
+      return allowReviewed(asked);
+    }
+    move(held.entries.find((entry) => entry.tool.name === asked.named.name));
   }
 
   // The MCP servers rows (review.js's listServers, one item per row in order): under each server,
@@ -149,7 +183,7 @@
     rows.forEach((row, index) => {
       for (const named of typeof row.server === "string" ? row.approve : []) {
         list.children[index].append(button("Allow " + named.name_shown + " without asking",
-          () => allow(row.server, named.name, queue)));
+          () => allow(row.server, named, queue)));
       }
     });
     let answer;
@@ -210,7 +244,7 @@
       if (tool.pinnable && tool.name !== null) {
         entry.repin = check(place, "Accept the new definition");
         if (tool.proposed) {
-          place.append(make("p", PROPOSED));
+          place.append(make("p", mode === "managed" ? PROPOSED_SAVED : PROPOSED));
           entry.repin.addEventListener("change", () => {
             entry.choice.value = entry.repin.checked ? APPROVE : tool.prefill;
           });
@@ -224,8 +258,8 @@
 
   // review.js's footer hook: Review again, a fresh review that never reuses the done one, since
   // a server can change a tool with no change to the policy (J.2); Clear the marks when a tool is
-  // marked, enabled only when every included tool matches its pin (J13); and the tool Allow
-  // without asking asked to move, if this is the review of the job it queued (J3).
+  // marked, enabled only when every included tool matches its pin (J13); and what Allow without
+  // asking waited for, if this is the review of the job it queued (J3, J.4).
   function footer(held, view, queue) {
     const drifted = view.tools.filter((tool) => tool.state === "drift").length;
     $("review-drift").replaceChildren(drifted ? drifted + (drifted === 1 ? " tool" : " tools") +
@@ -238,10 +272,11 @@
       $("review-drift").append(" ", clearing);
     }
     drawn = held;
+    again = queue;
     const asked = moving;
     moving = null;
     if (asked !== null && asked.job === held.job) {
-      move(held.entries.find((entry) => entry.tool.name === asked.name));
+      then(asked, held);
     }
   }
 
@@ -256,6 +291,93 @@
     const place = entry.item; // the row's list item
     entry.choice.value = ALLOW;
     place.append(make("p", MOVED));
+  }
+
+  // --- managed saves (G.3, G.4, J3, J.4) --------------------------------------------------------
+
+  // What a save's answer says: its revision, and each step left (a restart, the gateway), with
+  // its command and where it runs, as review.js words every next step (M.7, J15).
+  function savedText(done) {
+    return ["Saved as revision " + done.revision + "."].concat(done.next.map((step) =>
+      window.zoeyReview.stepText(step, true) + ".")).join(" ");
+  }
+
+  // Each kind a draft can be, prepared with its ID and base (G.4): the vault answered the kind.
+  const SAVES = {
+    "policy.save": (draft, done) => prepare("policy.save", { draft: draft.draft,
+      base: draft.base }, done),
+    "tool.repin": (draft, done) => prepare("tool.repin", { draft: draft.draft,
+      base: draft.base }, done),
+    "tool.allow": (draft, done) => prepare("tool.allow", { draft: draft.draft,
+      base: draft.base }, done),
+  };
+
+  // Save (G.4, J1-J3 managed): the review's choices, as Generate sends them, made into a draft
+  // the vault plans; the step-up shows the plan and one passkey writes it. The screen then
+  // reviews the server again at the new revision.
+  async function save() {
+    const held = drawn;
+    if (held === null) {
+      return;
+    }
+    const lists = picked(held);
+    let draft;
+    try {
+      draft = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
+        include: lists.include, allow: lists.allow, approve: lists.approve, repin: lists.repin,
+        decline: lists.decline, decline_rest: lists.decline_rest
+      });
+    } catch (error) {
+      return afterFailure(error);
+    }
+    await SAVES[draft.kind](draft, async (done) => {
+      closeConfirm();
+      $("status").textContent = savedText(done);
+      await again(held.server, true);
+    });
+  }
+
+  // Allow without asking once the fresh review it asked for is done (J.4): the server's row
+  // again, for the pin that review lists on a pinning: off toolkit, then the dialog.
+  async function allowReviewed(asked) {
+    let found;
+    try {
+      found = await api("GET", "/api/servers");
+    } catch (error) {
+      return afterFailure(error);
+    }
+    const row = found.servers.find((each) => each.server === asked.server);
+    const named = row ? row.approve.find((each) => each.name === asked.named.name) : undefined;
+    if (named === undefined) {
+      $("status").textContent = NOT_MOVED;
+      return;
+    }
+    await allowSaved(asked.server, named);
+  }
+
+  // Allow without asking, managed (J3, J.4): tool.allow for the tool and the pin it was shown, on
+  // the revision the session names; the plan shows the definition the vault holds for that pin.
+  // With none held still, the vault says to review the server again, then allow it.
+  async function allowSaved(server, named) {
+    const session = await api("GET", "/api/session");
+    await prepare("tool.allow", { base: session.revision, server: server, kind: "tool",
+      name: named.name, pin: named.pin }, (done) => {
+      closeConfirm();
+      $("status").textContent = savedText(done);
+    });
+  }
+
+  // Every choice on the screen: the lists below, with the included tools and how each is
+  // classified, as review.js's chosen() reads them.
+  function picked(held) {
+    const found = lists(held);
+    for (const entry of held.entries) {
+      if (entry.box !== null && entry.box.checked) {
+        found.include.push(entry.tool.name);
+        found[entry.choice.value === "allow" ? "allow" : "approve"].push(entry.tool.name);
+      }
+    }
+    return found;
   }
 
   // The lists Generate sends (review.js's chosen() adds the included ones): the drifted tools
@@ -275,6 +397,7 @@
     return found;
   }
 
+  on("review-save", save);
   window.zoeyDrift = Object.freeze({
     home: home, review: review, servers: servers, row: row, footer: footer, lists: lists,
   });

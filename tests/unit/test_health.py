@@ -2477,6 +2477,39 @@ def test_a_gateway_that_stopped_reporting(age: float, minutes: int | None) -> No
     assert health.STATUS_STALE == 180
 
 
+def test_a_gateway_still_on_an_older_view() -> None:
+    """M.5, FM-18 (step 15a): past the grace, ``vault/managed.py`` says the gateway is behind,
+    with the revision whose view it runs when this vault installed it; info only (Y21)."""
+    status = GatewayStatus(StatusReport(view=VIEW, started=1, servers={}), 10.0)
+
+    def found(state: PolicyState) -> list[dict[str, Any]]:
+        section = report(gateway_policy(), gateway_status=status, policy_state=state)["gateway"]
+        listed: list[dict[str, Any]] = section["findings"]
+        return listed
+
+    action = {"kind": "check_gateway"}
+    assert found(PolicyState("managed", revision=5)) == []
+    assert found(PolicyState("managed", revision=5, gateway_revision=4)) == []
+    behind = PolicyState("managed", revision=5, gateway_behind=True, gateway_revision=4)
+    assert found(behind) == [
+        finding(
+            "gateway_view_behind",
+            "info",
+            "the gateway is still on revision 4, not revision 5",
+            action,
+        )
+    ]
+    older = PolicyState("managed", revision=5, gateway_behind=True)
+    assert found(older) == [
+        finding(
+            "gateway_view_behind",
+            "info",
+            "the gateway is still on an older view, not revision 5",
+            action,
+        )
+    ]
+
+
 def test_a_toolkits_row_reads_the_gateways_blocked() -> None:
     """A toolkit is blocked as the gateway says (a ``pinning: off`` one never is there)."""
     raw = gateway_policy().model_dump(mode="json", exclude_defaults=True, by_alias=True)

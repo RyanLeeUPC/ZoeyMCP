@@ -29,6 +29,7 @@
     run_mount: "in a one-off vault container with this directory at /w: docker compose run " +
       "--rm --no-deps -v \"$PWD:/w:ro\"",
     up: "recreate the vault: docker compose up -d",
+    restart: "restart the vault: docker compose restart",
   };
   const STAGES = {
     discovered: "What the vault found",
@@ -694,5 +695,5 @@
   $("add-url").addEventListener("input", clearNames);
   $("fragment-indent").addEventListener("change", reindent);
   setInterval(tick, 2000);
-  window.zoeyReview = Object.freeze({ connected: connected });
+  window.zoeyReview = Object.freeze({ connected: connected, stepText: stepText });
 })();

@@ -1661,10 +1661,27 @@ def _review_through_vault(
     except admin_client.AdminUnavailable as exc:
         steps = exc.data.get("next") or []
         if exc.reason == "clear_not_clean" and isinstance(exc.data.get("report"), dict):
-            # The gateway refused the clear: show what doesn't match, as --via gateway does.
+            # The gateway refused the clear: show what doesn't match, as --via gateway does, with
+            # no snippet to commit in managed mode (Y25): the refusal names no mode, so ask. In
+            # managed mode the vault's way on stands in the snippet's place; in declarative mode
+            # it follows on stderr, as it always has.
             err.write(f"zoeymcp review: --clear refused: {review_view.untrusted(exc)}\n")
-            code = _review_output(exc.data["report"], choices, args, out, err)
-            review_view.write_lines(onboard_cli.next_lines(steps, prefix), err)
+            try:
+                mode = str(admin_client.policy_head(socket)["mode"])
+            except admin_client.AdminUnavailable:
+                mode = "declarative"  # as before the vault said: the review is read-only
+            managed = mode == "managed"
+            code = _review_output(
+                exc.data["report"],
+                choices,
+                args,
+                out,
+                err,
+                mode=mode,
+                steps=steps if managed else None,
+            )
+            if not managed:
+                review_view.write_lines(onboard_cli.next_lines(steps, prefix), err)
             return max(code, review_view.EXIT_NEEDS_OPERATOR)
         err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
         review_view.write_lines(onboard_cli.next_lines(steps, prefix), err)
