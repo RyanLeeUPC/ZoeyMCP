@@ -42,6 +42,7 @@ from typing import Any, Final, Literal
 
 from ..suggest import Suggestion, suggestion
 from .change import Comment, PolicyChange, SetServerReview
+from .ratchet import DefKey
 from .schema import Tools
 
 TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
@@ -56,8 +57,6 @@ MOVED_TO_ALLOW: Final = "approve -> allow: calls to {name} will run with no prom
 Classification = Literal["allow", "approve"]
 # An included tool in these states is listed as its pin holds it.
 MATCHING_STATES: Final = ("ok", "marked", "blocked")
-# A definition by (server, kind, name); kind: tool, and from step 19 prompt or resource (E.1).
-DefKey = tuple[str, str, str]
 # A definition's lines, each its chunks (:func:`definition_lines`), as the planner keeps them.
 Lines = tuple[tuple[str, ...], ...]
 AllowReason = Literal["allow_needs_review", "allow_marked", "consequential_allow"]

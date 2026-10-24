@@ -21,7 +21,7 @@ from tests.unit.report_model import asked_line
 from zoeymcp.common import ledgerreport, pinhash
 from zoeymcp.common.canonical import dumps_canonical, loads_strict
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
-from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy import Policy, ratchet
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.gateway import pins
 from zoeymcp.gateway.pins import PIN_TAG, project, project_and_pin
@@ -482,8 +482,24 @@ GOLDEN_POLICY_REVISION = Path(__file__).parent / "data" / "golden-policy-revisio
 GOLDEN_POLICY_HEAD = Path(__file__).parent / "data" / "golden-policy-head.json"
 GOLDEN_POLICY_ANCHOR = Path(__file__).parent / "data" / "golden-policy-anchor.json"
 POLICY_DEPLOYMENT = bytes(range(16)).hex()
-# The seal reads the ratchet as an object; its form is common.policy.ratchet's.
-POLICY_RATCHET = {"egress_key_floor": 1, "gateway_key_floor": 1}
+# The ratchet after revision 2's re-pin of search_notes, in common.policy.ratchet's plain form
+# (Ratchet.as_dict, read back by ratchet.loaded below); the seal itself reads it as an object.
+POLICY_RATCHET: dict[str, Any] = {
+    "gateway_key_floor": 1,
+    "egress_key_floor": 1,
+    "retired_pins": [
+        {
+            "server": "notes-read",
+            "kind": "tool",
+            "name": "search_notes",
+            "pins": ["sha256:" + "9" * 64],
+        }
+    ],
+    "retired_clients": [],
+    "retired_callers": [],
+    "approved": [],
+    "env": {},
+}
 POLICY_HEADER: dict[str, Any] = {
     "v": 1,
     "deployment": POLICY_DEPLOYMENT,
@@ -497,8 +513,8 @@ POLICY_HEADER: dict[str, Any] = {
     "target": None,
     "jumped_from": None,
 }
-POLICY_DIGEST = "sha256:334143ac7652d5cb6cead4a45de8293777f46cd1f568fe25d2fb18979d087817"
-POLICY_BODY_DIGEST = "sha256:60b6661887969ada0f3154bc04db9ae4a242a5e8511c7ca54eb4e4d79727c5f3"
+POLICY_DIGEST = "sha256:14891b953b5501855db5975f9e35492ec527b37efec7cf24dbbf6bdb2a1ba8df"
+POLICY_BODY_DIGEST = "sha256:e492bd5e50ad4781986f373e1cdd077cc35dfbf7cfce4a5d1b16d130b1808eed"
 
 
 def golden_policy_body() -> bytes:
@@ -546,6 +562,7 @@ def test_the_golden_policy_revision_still_unseals() -> None:
     assert found.header == {**POLICY_HEADER, "body_digest": POLICY_BODY_DIGEST}
     assert found.body.policy == VIEW_POLICY
     assert found.body.ratchet == POLICY_RATCHET
+    assert ratchet.loaded(found.body.ratchet).as_dict() == POLICY_RATCHET
     assert (found.body.salt, found.body.reason) == (bytes(range(32)), "golden revision")
     assert found.key_id == keys.key_id
 
