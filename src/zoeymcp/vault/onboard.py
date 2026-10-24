@@ -53,7 +53,9 @@ run's comparison in ``onboarding.py``, the fragment in ``common/policy``; the re
   refused ``reregister_by_hand`` at discovery, before anything is confirmed or stored (D-184).
 - **The portal** (K.1-K.3) reads an onboarding as it stands, and plans its ``onboard.register``
   action with :meth:`OnboardService.register_facts`, which checks what register will check
-  with nothing sent or stored, so a mistake shows before the passkey prompt.
+  with nothing sent or stored, so a mistake shows before the passkey prompt. In managed mode
+  (M6 design G.9) every ``next`` list is managed mode's, fragment 1 a save, and the portal
+  plans a registered onboarding's change (:meth:`OnboardService.registered_change`) as a draft.
 
 Every refusal is the catalogue's (``portal/refusals.py``): one status and one text on every
 surface. Nothing here logs an onboarding's ID, a secret, a URL path or query, or a body (X19);
@@ -1117,6 +1119,16 @@ class OnboardService:
         record = self._table.owned(owner)
         return None if record is None else self._stood(record, self._policy())
 
+    def registered_change(self, onboarding: str, *, owner: str = CLI_OWNER) -> PolicyChange:
+        """A registered onboarding's fragment 1 as its change, never rendered: in managed mode
+        the portal's **Save** plans it as a draft (M6 design G.4, G.9). One not registered yet
+        is a ``bad_body``: its register, or for a given public client its fragment, comes
+        first."""
+        record = self._ready(onboarding, owner)
+        if record.change is None:
+            raise _bad_body("this onboarding has no change yet: register it first")
+        return record.change
+
     def register_facts(
         self, onboarding: str, *, owner: str = CLI_OWNER, secret: str | None = None
     ) -> dict[str, Any]:
@@ -1413,6 +1425,7 @@ class OnboardService:
             own_proxy=self._egress_proxy is not None and not self._through_role,
             acl_names=policy.egress_proxy_acls,
             emitted_ports=emitted,
+            managed=policy.mode == "managed",
         )
         return [step.answer() for step in steps]
 

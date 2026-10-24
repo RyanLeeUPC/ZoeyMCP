@@ -30,12 +30,15 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
   credential: its onboarding ends once the running policy holds the credential its fragment
   sets, not merely one by that name.
 - :func:`next_for` (M.7): what the operator does next, each command an argument list shown
-  shell-quoted and without a container prefix, which the CLI adds.
+  shell-quoted and without a container prefix, which the CLI adds. In managed mode (M6 design
+  G.9, Y25) fragment 1 is a save: the portal's **Save** writes it, then a sign-in.
 - :func:`widen_scope` (D.5's step-up, SPEC-11): health's fragment for a scope an upstream asked
   for, the union of the committed scope and the challenged one.
 - :func:`listed_servers` (K.1, GR-21): the running policy's servers as the portal's rows list
   them, each with its state and, from :func:`listed_next`, what to do next; and
-  :func:`reviewed_next`, the steps after fragment 2 (E.4), on every surface.
+  :func:`reviewed_next`, the steps after fragment 2 (E.4), on every surface, or in managed
+  mode after the review's save: giving the server to its clients (**Give to clients**, G.3),
+  whose boxes :func:`listed_clients` lists.
 
 Nothing here does I/O; the clock and the ID source are injected. An onboarding's ID is never
 logged and is compared in constant time.
@@ -86,6 +89,16 @@ GENERIC_LABELS: Final = frozenset({"mcp", "api", "www", "app", "server"})
 ADDRESS_NAME: Final = "server"
 # The Squid source an onboarding's lines are written for, so their ACLs read zoeymcp_onboard_<n>.
 ONBOARD_SOURCE: Final = "onboard"
+# A discovered onboarding's one action, by how its client comes (D.4, D.10); in managed mode
+# fragment 1 is a save, the portal's Save (M6 design G.9, Y25), and after the review's save the
+# server is given to its clients there (G.3, J14).
+REGISTER_LABEL: Final = "Register and make the YAML"
+STORE_LABEL: Final = "Store the secret and make the YAML"
+SAVE_LABEL: Final = "Save the server's credential, route and server"
+GIVE_LABEL: Final = (
+    "Then give {server} to each client that should reach it: Give to clients, on the MCP "
+    "servers page"
+)
 
 Stage = Literal["discovering", "blocked", "discovered", "registered"]
 Ending = Literal["registered", "cancelled", "expired", "owner_gone"]
@@ -1141,6 +1154,13 @@ def listed_server(policy: Policy, name: str, store_names: Collection[str] = ()) 
     return next((s for s in listed_servers(policy, store_names) if s.name == name), None)
 
 
+def listed_clients(policy: Policy) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Every client of the running policy, by name, with the servers it reaches, as **Give to
+    clients** lists them (M6 design G.3, J14): never its token or its hash."""
+    clients = {} if policy.gateway is None else policy.gateway.clients
+    return tuple((name, tuple(client.servers)) for name, client in sorted(clients.items()))
+
+
 def tools_max(policy: Policy) -> int:
     """``gateway.limits.max_tools_per_server``: the most tools a list of a server's may name."""
     limits = GatewayLimits() if policy.gateway is None else policy.gateway.limits
@@ -1218,7 +1238,7 @@ def _login_again(record: OnboardingRecord) -> tuple[str, ...]:
     return tuple(command)
 
 
-def _make(record: OnboardingRecord) -> tuple[NextStep, ...]:
+def _make(record: OnboardingRecord, managed: bool) -> tuple[NextStep, ...]:
     errors = sum(1 for finding in record.draft_check if finding.level == "error")
     if errors:
         return (
@@ -1229,9 +1249,11 @@ def _make(record: OnboardingRecord) -> tuple[NextStep, ...]:
         )
     options = record.options
     if options.client_id is None:
-        return (NextStep("register", "Register and make the YAML"),)
+        return (NextStep("register", "Register its client" if managed else REGISTER_LABEL),)
     if options.secret_given:
-        return (NextStep("register", "Store the secret and make the YAML"),)
+        return (NextStep("register", "Store the secret" if managed else STORE_LABEL),)
+    if managed:  # nothing to send or store: the save is the one step (G.9)
+        return (NextStep("save", SAVE_LABEL),)
     return (NextStep("make_fragment", "Make the YAML"),)
 
 
@@ -1268,6 +1290,19 @@ def _applied(server: str, number: int, source: str, merge: str) -> list[NextStep
     ]
 
 
+def _saved(record: OnboardingRecord) -> tuple[NextStep, ...]:
+    """Fragment 1's steps in managed mode (M6 design G.9, Y25): the portal's **Save** writes the
+    credential, the route and the server as a revision (``policy.save``, its own passkey), which
+    the vault applies itself; then a sign-in, plain ``login``, since ``login --mcp`` refuses in
+    managed mode. A proxy's allowlist, when the save needs it, is the save's own way on."""
+    login: tuple[str, ...] = ("zoeymcp", "login", record.names.credential)
+    if record.options.reregister:
+        label, login = "Then sign in with the new client", (*login, "--rebind")
+    else:
+        label = "Then connect, and review its tools"
+    return (NextStep("save", SAVE_LABEL), NextStep("connect", label, login, "exec"))
+
+
 def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[NextStep, ...]:
     if source == INLINE_SOURCE:
         merge = (
@@ -1302,10 +1337,14 @@ def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[Nex
     return tuple(steps)
 
 
-def reviewed_next(server: str, source: str) -> tuple[NextStep, ...]:
+def reviewed_next(server: str, source: str, *, managed: bool = False) -> tuple[NextStep, ...]:
     """What the operator does after fragment 2 of ``server`` (E.4, M.7), the same words on every
     surface: apply it as fragment 1 was, its two blocks replacing the server's, then assign the
-    server to its clients, which fragment 2 never does (GR-D2, Q33)."""
+    server to its clients, which fragment 2 never does (GR-D2, Q33). In managed mode, after the
+    review's save: give the server to its clients, the MCP servers page's **Give to clients**
+    (``client.servers``, M6 design G.3, J14 step 5)."""
+    if managed:
+        return (NextStep("assign_clients", GIVE_LABEL.format(server=server)),)
     blocks = f"the tools: and review: blocks of gateway.servers.{server}"
     if source == INLINE_SOURCE:
         merge = (
@@ -1328,17 +1367,19 @@ def next_for(
     own_proxy: bool = False,
     acl_names: Mapping[str, str] | None = None,
     emitted_ports: Collection[int] = (),
+    managed: bool = False,
 ) -> tuple[NextStep, ...]:
     """What the operator does next for ``record`` (M.7), the same words on every surface.
     ``source`` is the running policy's (``load.read_source``'s label: a file path,
     ``<stdin>`` or ``$ZOEYMCP_CONFIG``); ``own_proxy`` is an ``egress_proxy`` that isn't the
     built-in role; ``acl_names`` its Squid source ACLs; ``emitted_ports`` the ports whose ACLs
     the policy's emitted Squid file defines. A blocked onboarding's ``retry`` is the CLI's own,
-    from its argv (D.11)."""
+    from its argv (D.11). ``managed``: the running policy is managed, so fragment 1 is a save
+    (M6 design G.9, Y25)."""
     if record.stage == "blocked":
         return (allow_hosts(record.needed_hosts, acl_names or {}, emitted_ports),)
     if record.stage == "discovered":
-        return _make(record)
+        return _make(record, managed)
     if record.stage == "registered":
-        return _commit(record, source, own_proxy)
+        return _saved(record) if managed else _commit(record, source, own_proxy)
     return ()

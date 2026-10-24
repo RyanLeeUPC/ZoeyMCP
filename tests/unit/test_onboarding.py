@@ -66,6 +66,7 @@ from zoeymcp.vault.onboarding import (
     fragment_file,
     in_use,
     job_next,
+    listed_clients,
     listed_next,
     listed_server,
     listed_servers,
@@ -1829,3 +1830,82 @@ def test_the_steps_after_fragment_2_for_a_policy_file_or_stdin() -> None:
     piped = reviewed_next("notes", STDIN_SOURCE)
     assert piped[0].command[:4] == ("zoeymcp", "check", "--config", "-")
     assert piped[3].label == "Commit, then restart the vault with the new policy"
+
+
+# --- managed mode (M6 design G.9, G.3, Y25; step 15c) --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("options", "do", "label"),
+    [
+        (Options(), "register", "Register its client"),
+        (Options(client_id="c", secret_given=True), "register", "Store the secret"),
+        (Options(client_id="c"), "save", "Save the server's credential, route and server"),
+    ],
+)
+def test_a_discovered_onboardings_one_action_in_managed_mode(
+    options: Options, do: str, label: str
+) -> None:
+    """G.9: a client the vault registers, or a given secret, is still register's (the first
+    passkey); a given public client's sends and stores nothing, so its one step is the save. No
+    step says to make YAML."""
+    found = next_for(staged("discovered", options), INLINE_SOURCE, managed=True)
+    assert found == (NextStep(do, label),)  # type: ignore[arg-type]
+
+
+def test_a_draft_check_error_comes_first_in_managed_mode_too() -> None:
+    record = replace(staged("discovered"), draft_check=(Finding("routes", "error", "bad"),))
+    assert [step.do for step in next_for(record, INLINE_SOURCE, managed=True)] == ["fix_policy"]
+
+
+def test_the_steps_after_registering_in_managed_mode() -> None:
+    """G.9, Y25 (the managed form of fragment 1's steps): the portal's Save, then a sign-in with
+    plain login, since login --mcp refuses in managed mode; nothing to check, merge, commit or
+    reload, whatever the policy's source or proxy."""
+    for source in (INLINE_SOURCE, "policy.yaml", STDIN_SOURCE):
+        steps = next_for(staged("registered"), source, own_proxy=True, managed=True)
+        assert [step.answer() for step in steps] == [
+            {"do": "save", "label": "Save the server's credential, route and server"},
+            {
+                "do": "connect",
+                "label": "Then connect, and review its tools",
+                "command": "zoeymcp login notes",
+                "via": "exec",
+            },
+        ]
+    again = staged("registered", Options(client_id="zc_new", reregister=True))
+    steps = next_for(again, "p.yaml", managed=True)
+    login = ("zoeymcp", "login", "notes", "--rebind")
+    assert steps == (
+        NextStep("save", "Save the server's credential, route and server"),
+        NextStep("connect", "Then sign in with the new client", login, "exec"),
+    )
+    # A blocked one is the same in either mode (D.11).
+    blocked = staged("blocked")
+    assert next_for(blocked, INLINE_SOURCE, managed=True) == next_for(blocked, INLINE_SOURCE)
+
+
+def test_the_step_after_a_reviews_save_in_managed_mode() -> None:
+    """G.3, J14 step 5: Give to clients, for every source."""
+    for source in (INLINE_SOURCE, "/config/my policy.yaml"):
+        assert [step.answer() for step in reviewed_next("notes", source, managed=True)] == [
+            {
+                "do": "assign_clients",
+                "label": "Then give notes to each client that should reach it: Give to clients, "
+                "on the MCP servers page",
+            }
+        ]
+
+
+def test_every_client_is_listed_with_its_servers() -> None:
+    """G.3: Give to clients' boxes, by name, with the servers each reaches; never a token."""
+    policy = committed()
+    assert listed_clients(policy) == (("agent1", ("broker-read", "broker-trade", "mail")),)
+    assert policy.gateway is not None
+    other = policy.gateway.clients["agent1"].model_copy(update={"servers": []})
+    clients = {"zeta": other, **policy.gateway.clients, "alpha": other}
+    gateway = policy.gateway.model_copy(update={"clients": clients})
+    found = listed_clients(policy.model_copy(update={"gateway": gateway}))
+    assert [name for name, _ in found] == ["agent1", "alpha", "zeta"]
+    assert found[1] == ("alpha", ())
+    assert listed_clients(Policy.model_validate({"version": 1, "mode": "managed"})) == ()

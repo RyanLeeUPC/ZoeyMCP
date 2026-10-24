@@ -124,7 +124,7 @@ from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.egress.allowlist import Allowlist, KeySource
 from zoeymcp.entrypoint import launcher
-from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
+from zoeymcp.portal.app import Ledger, PortalApp, Secrets, connectors_view, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policydiffview import rows as policy_diff_rows
 from zoeymcp.portal.policyview import view as policy_view
@@ -1058,6 +1058,13 @@ def test_the_portals_policy_view_hides_what_it_must() -> None:
     served = json.dumps(policy_view(policy, "env"))
     for where in POLICY_VIEW_HIDES:
         assert VAULT_SIDE[where] not in served, where
+    # The managed Policy page's connector rows (M6 G.3, step 15c): its pause and limits only,
+    # not even what the view shows of its binding (the host, the password's reference).
+    rows = json.dumps(connectors_view(policy))
+    for where in (*POLICY_VIEW_HIDES, "smtp host"):
+        assert VAULT_SIDE[where] not in rows, where
+    assert "store:leak-ref-smtp" not in rows
+    assert '"name": "leak-connector"' in rows
     assert "sha256:" + "3" * 64 not in served  # nor the other client's token hash
     assert hash_token(LITERAL_TOKEN) not in served
     # Secret references show as written: they name a secret, never hold one.
@@ -2471,9 +2478,10 @@ async def test_a_portal_save_leaks_no_policy_value(tmp_path: Path, log_lines: io
     """O.6: a review save planned as a draft, prepared and confirmed with a passkey, on a
     managed deployment whose seed held a client's literal token and a caller's placeholder; then
     the history, each revision's diff (the seed's from an empty policy holds the client and the
-    caller) and a rollback to the seed, planned and confirmed (step 15b). No log line, portal
-    answer, plan, draft or file under the state directory holds the token, its hash or the
-    placeholder, and neither a draft nor a held action can be logged."""
+    caller) and a rollback to the seed, planned and confirmed (step 15b); and Give to clients
+    taking notes from that client, and the servers page's client list (step 15c). No log line,
+    portal answer, plan, draft or file under the state directory holds the token, its hash or
+    the placeholder, and neither a draft nor a held action can be logged."""
     from zoeymcp.common import logs as logs_module
     from zoeymcp.portal.actions import Action
     from zoeymcp.portal.drafts import Draft
@@ -2508,6 +2516,14 @@ async def test_a_portal_save_leaks_no_policy_value(tmp_path: Path, log_lines: io
         page, authenticator, "policy.rollback", {"base": 2, "revision": 1}
     )
     assert rolled.status_code == 200, rolled.text
+    # Give to clients (step 15c): the client with the literal token loses notes, then the
+    # servers page lists every client by name.
+    taken = {"base": 3, "client": "agent2", "servers": []}
+    given = await portal_step_up(page, authenticator, "client.servers", taken)
+    assert given.status_code == 200, given.text
+    assert (await page.call("GET", "/api/servers")).json()["clients"] == [
+        {"name": "agent2", "name_shown": "agent2", "servers": []}
+    ]
     for kept in (Draft, Action):
         assert kept in logs_module.refused_types()
     files = [p.read_bytes() for p in (tmp_path / "state").rglob("*") if p.is_file()]

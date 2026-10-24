@@ -100,13 +100,12 @@ secret or a token.</p>
 <section id="servers" hidden>
 <h2>MCP servers</h2>
 <p>Every remote and toolkit server in the policy, and the one you are adding, each with its state
-and what to do next. The vault discovers a server by its URL, registers its client after you
-confirm with your passkey, and makes the YAML; review then shows the server's tools for you to
-choose.</p>
-<p data-mode="declarative">Nothing here changes the policy: you commit each fragment and
-reload.</p>
-<p data-mode="managed" hidden>Each save asks for your passkey and takes effect when it is
-written.</p>
+and what to do next. The vault discovers a server by its URL and registers its client after you
+confirm with your passkey; review then shows the server's tools for you to choose.</p>
+<p data-mode="declarative">The vault makes the YAML, and nothing here changes the policy: you
+commit each fragment and reload.</p>
+<p data-mode="managed" hidden>Each save writes its change to the policy: it asks for your passkey
+and takes effect when it is written.</p>
 <ul id="server-list"></ul>
 <ul id="refusal-next"></ul>
 <ul id="refusal-check"></ul>
@@ -281,6 +280,13 @@ host's imports write each revision.</p>
 <p id="policy-head"></p>
 <p id="policy-gateway"></p>
 <p id="policy-export"></p>
+<h3>Connectors</h3>
+<p>Each SMTP connector, with whether it sends and its limits. <b>Pause</b> refuses every send
+at once and <b>Resume</b> lets them go out again; <b>Save limits</b> sets how many sends a day and
+how long a subject and a body may be. Each asks for your passkey and writes a revision. Its
+recipients, mail server and sender are the host's to change (zoeymcp policy import): its password
+is bound to them.</p>
+<ul id="policy-connectors"></ul>
 <h3>History</h3>
 <p>Every revision the vault keeps, newest first: what made it, who and when. <b>Show the
 changes</b> lists what a revision changed from the one before it, each change marked wider,

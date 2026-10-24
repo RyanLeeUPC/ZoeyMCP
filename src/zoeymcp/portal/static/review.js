@@ -14,8 +14,9 @@
   // A row's state, in words (K.1); the vault decides which.
   const STATES = {
     discovering: "being discovered",
-    needs_register: "discovered: register its client, or make the YAML",
+    needs_register: "discovered, nothing sent or stored yet",
     needs_commit: "fragment 1 made, not yet in the running policy",
+    needs_save: "registered, its credential, route and server not saved yet",
     needs_connect: "in the policy, not connected yet",
     needs_review: "connected, its tools not reviewed yet",
     reviewed: "reviewed",
@@ -107,6 +108,7 @@
   function runner(step, context) {
     const runs = {
       register: context.boarding && (() => prepareRegister(context.boarding)),
+      save: context.boarding && (() => window.zoeyDrift.saveOnboarding(context.boarding)), // M6 G.9
       make_fragment: context.boarding && (() => makeFragment(context.boarding, 0)),
       show_fragment: context.boarding && (() => makeFragment(context.boarding, 0)),
       allow_hosts: context.boarding && context.row && (() => openOnboarding(context.boarding)),
@@ -174,9 +176,8 @@
     if (row.state !== "reviewed") {
       return text + ".";
     }
-    const clients = row.clients_shown.join(", ") || "no client yet";
     return text + ": " + row.tools + (row.tools === 1 ? " tool" : " tools") + " served to " +
-      clients + ".";
+      (row.clients_shown.join(", ") || "no client yet") + ".";
   }
 
   async function listServers() {
@@ -299,8 +300,7 @@
     }
   }
 
-  // Another URL typed empties them, so a second server never takes the first one's names; a
-  // cancel always does.
+  // Another URL typed, or a cancel, empties them: a second server never takes the first's names.
   function clearNames(always) {
     if (always === true || (namedFor !== null && $("add-url").value.trim() !== namedFor)) {
       namedFor = null;
@@ -356,7 +356,7 @@
     const sent = prepare(
       "onboard.register",
       { onboarding: boarding, client_secret: $("add-client-secret").value || undefined },
-      afterRegistered
+      window.zoeyDrift.registered(afterRegistered) // in managed mode, the save comes next
     );
     $("add-client-secret").value = "";
     await sent;

@@ -757,10 +757,18 @@ ROLLBACK_MOVED: Final = (
     "revision {revision}."
 )
 
+# policy_moved as the Policy page's connector row words it (G.3, step 15c): Pause, Resume and Save
+# limits, each drawn again at the head it finds.
+CONNECTOR_MOVED: Final = (
+    "The policy moved to {said} since you planned this: the page is drawn again, so press the "
+    "connector's button again to plan it on revision {revision}."
+)
+
 
 def save_moved(*, said: str, revision: int, words: str = SAVE_MOVED) -> Refusal:
     """``policy_moved`` in the portal (G.7, OPS-18): the catalogue's status, and ``words``
-    (:data:`SAVE_MOVED`, or :data:`ROLLBACK_MOVED` for a rollback) naming the head
+    (:data:`SAVE_MOVED`, :data:`ROLLBACK_MOVED` for a rollback, or :data:`CONNECTOR_MOVED`
+    for a connector's limits) naming the head
     (``policyview.saved``'s words)."""
     status = CATALOGUE["policy_moved"].status
     return Refusal(status, "policy_moved", words.format(said=said, revision=revision))

@@ -681,10 +681,11 @@ async def managed_portal(tmp_path: Path) -> tuple[PortalApp, Any, Reviews]:
 
 
 async def test_no_managed_portal_answer_carries_a_token_or_a_placeholder(tmp_path: Path) -> None:
-    """O.6: a review save planned as a draft and saved with a passkey, a refused prepare and a
-    stale draft, then every route walked, the history and the seed's diff from an empty policy
-    among them (step 15b): no answer carries the client's literal token, its hash or the
-    caller's placeholder, the draft's and the plan's summaries included."""
+    """O.6: a review save planned as a draft and saved with a passkey, Give to clients taking
+    a server from the client with the token (step 15c), a refused prepare and a stale draft,
+    then every route walked, the history and the seed's diff from an empty policy among them
+    (step 15b): no answer carries the client's literal token, its hash or the caller's
+    placeholder, the draft's and the plan's summaries included."""
     app, vault, reviews = await managed_portal(tmp_path)
     answers: list[str] = []
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
@@ -699,6 +700,10 @@ async def test_no_managed_portal_answer_carries_a_token_or_a_placeholder(tmp_pat
     saved = await step_up(page, authenticator, "policy.save", data)
     assert saved.status_code == 200, saved.text
     assert saved.json()["revision"] == 2
+    # Give to clients (step 15c): its plan and answer name the client, never its token.
+    taken = {"base": 2, "client": "agent2", "servers": []}
+    given = await step_up(page, authenticator, "client.servers", taken)
+    assert given.status_code == 200, given.text
     refused = await page.call("POST", "/api/actions", {"kind": "policy.save", "data": data})
     assert refused.json()["reason"] == "draft_unknown"
     # The head moved since that review ran: a draft from it is refused, stale.

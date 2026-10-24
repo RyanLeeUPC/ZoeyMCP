@@ -811,6 +811,30 @@ docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp policy export \
   | docker compose -f deploy/compose.yaml run --rm --no-deps -T zoeymcp check --config -
 ```
 
+**Onboarding by URL in the portal, in managed mode,** ends in saves, not commits. It takes five
+passkey prompts, each for a different thing (§26, "MCP servers"):
+
+1. **Add a server by URL**, the plan, then **Register its client** (or **Store the secret**, for a
+   client you registered with a secret): `onboard.register`, as in declarative mode. The client
+   secret, if any, is stored at once under the binding the plan predicts. No fragment is shown;
+   the row reads `needs_save`.
+2. **Save** on that row: the vault plans the server's credential, route and server (the change
+   fragment 1 would carry, the route called by the gateway alone) on the head and shows the plan,
+   "Revision 2, from 1 (...)", one row per thing it adds; one passkey writes it (`policy.save`),
+   and the vault applies it itself. The row is `needs_connect` at once. A public client you
+   registered (`--client-id` alone) needs no registration: **Save** is its one step.
+3. **Connect** (§2); the page queues the review.
+4. The review screen's **Save** (`policy.save`), each tool newly allowed on its own row first. Its
+   answer ends with "Then give notes to each client that should reach it": nothing reaches the
+   server yet.
+5. **Give to clients** on the server's row (every server's row has it, so a server can be taken
+   from a client at any time): a box per client, ticked where it reaches the server, and **Save** (`client.servers`, one save per client whose box changed): "agents holding
+   client agent1's token can call notes's 12 included tools".
+
+Adding a client, changing its token, or the server's route or credential once saved are host
+imports (§34). The CLI's `login --mcp` refuses in managed mode (above), so this walk is the
+portal's; `zoeymcp login <credential>` still signs in from the host.
+
 The rest of this section is declarative mode.
 
 1. **The route and credential,** for the gateway only (`profiles/remote-mcp-static-key.yaml` is
@@ -1095,9 +1119,13 @@ host.
   with `--issuer`.
 - **More options**: `--scope "a b"` requests your scopes instead of the server's; `--allow-private`
   lets the typed server's own `host:port` resolve to a private address (fragment 1 then adds it to
-  `egress_private`); `--client-name` is the name a provider may show for the client; `--indent N`
-  or `--for compose` lays fragment 1 out for an inline policy; `--format json` prints the vault's
-  answers as one JSON document on stdout instead.
+  `egress_private`), and that one `host:port` alone: a registration endpoint on a private address
+  passes discovery's checks when the policy lists its host in `egress_private`, but the
+  registration is refused at the connection (`address_refused`, purpose `registration`), since
+  the vault makes no exception for a registration host; register the client in the provider's
+  console and give its client ID instead. `--client-name` is the name a provider may show for
+  the client; `--indent N` or `--for compose` lays fragment 1 out for an inline policy; `--format
+  json` prints the vault's answers as one JSON document on stdout instead.
 
 **Committing fragment 1.** The `Next:` list gives the commands for the policy's source: `check
 --with` proves the fragment merges and says what it adds, then you merge it, prove the edited
@@ -1724,6 +1752,14 @@ only the gateway, and only `GET /config` and `POST /send`.
 - **Kill switches**, fastest first: `paused: true` and reload (sends refused at once, no password
   needed to resume); drop the tool from the toolkit's `include`; revoke the app password at the
   provider.
+- **In managed mode** (§34) the Policy page lists each connector with whether it sends and its
+  three limits. **Pause** (and **Resume**) and **Save limits** (`max_per_day`,
+  `max_subject_chars`, `max_body_chars`) are saves of their own, `connector.limits`, each with
+  one passkey: a pause is the first kill switch there, and needs no password to undo. The
+  dialog marks what widens: "sends can go out again" for a resume, "20 -> 50: raised" for a
+  raised limit. The host, port, sender and recipients the password is bound to are never the
+  portal's: change them with `zoeymcp policy import`, whose plan says the password stops
+  matching (set it again after it).
 
 | Code | Meaning |
 | --- | --- |
@@ -2033,9 +2069,14 @@ compose command in front, `docker compose -f deploy/compose.hardened.yaml exec v
 
 - `needs_register`: discovered, nothing sent or stored yet. **Register and make the YAML** (the
   vault registers a client), **Store the secret and make the YAML** (a client you registered,
-  with its secret) or **Make the YAML** (a public client you registered).
+  with its secret) or **Make the YAML** (a public client you registered). In managed mode
+  **Register its client**, **Store the secret**, or for a public client you registered **Save**
+  at once (below).
 - `needs_commit`: fragment 1 is made but the running policy doesn't name its credential yet.
   **Show fragment 1** makes it again, at any indent, until the commit or for 30 minutes.
+- `needs_save` (managed mode, in place of `needs_commit`): registered, its credential, route and
+  server not saved yet. **Save** plans them on the head and asks for your passkey (below), for
+  30 minutes.
 - `needs_connect`: in the policy, with no refresh token yet. **Connect** opens the Credentials
   page's dialog (§2); once it completes, the page queues the server's review by itself.
 - `needs_review`: connected, and the policy includes none of its tools. **Review tools**.
@@ -2046,6 +2087,9 @@ compose command in front, `docker compose -f deploy/compose.hardened.yaml exec v
   them with the Squid lines; allow them, then **Try again**: it puts the onboarding's own URL and
   names back in the form and discovers again (with the form's other options), so the onboarding
   carries on where it stopped.
+
+In managed mode every server's row, `needs_connect`, `needs_review` or `reviewed`, has **Give to
+clients** (below).
 
 **Add a server by URL** takes the URL; **More options** holds the names (empty, the vault picks
 free ones from the server's host name and fills them in; typing another URL empties them), a
@@ -2069,6 +2113,25 @@ the reload. The page reads the rows again while a server waits on its commit, so
 itself once the vault sees the commit; after a recreate, sign in and it is there. A server that
 names several authorization servers asks you to choose one (a button for each). **Cancel** drops
 an onboarding in progress; signing out drops it too.
+
+**Onboarding and Give to clients, in managed mode.** In managed mode (§34) onboarding by URL ends
+in saves (§11's five prompts): after **Register its client** the page shows no fragment, and the
+row's **Save** asks the vault to plan the server's credential, route and server as one change on
+the head; the dialog lists what it adds ("Revision 2, from 1 (...)", then `credentials.notes`,
+`routes.notes` and `gateway.servers.notes`, each added, and whether a restart is needed), and one
+passkey writes it as `policy.save`. The vault holds that change for 5 minutes, as a review's
+(`draft_unknown`: press **Save** again). The route it adds is called by the gateway alone and uses
+the credential the same save adds; nothing in it can take an `env:` reference. A given public
+client's plan has **Save** as its one button. A server's **Give to clients**, reviewed or not,
+shows a box per client in the policy, ticked where the client reaches the server at the revision
+the page read; **Save** writes each client whose box changed as a save of its own
+(`client.servers`, one passkey each), its servers given whole and planned on that revision, so a
+change written since (another session's, a host import) is `policy_moved`: the boxes are drawn
+again at the head, and **Save** plans on it. Giving a server is a weakening,
+its row first: "agents holding client agent1's token can call notes's 12 included tools"; taking
+one away is a narrowing. Saving nothing changed is `no_change`; a change to a second client in the
+same save is `kind_mismatch`. A client is added, or its token changed, only by a host import
+(§34, §10). A review saved for a server no client reaches says to give it to them.
 
 **The review screen.** **Review tools** (or **Review again**) queues a fresh review for the
 gateway's poll (§11, "The review job path"), never a finished one handed back, since a server can
@@ -2145,7 +2208,8 @@ its report): review again once the gateway has the new policy; `job_unknown` mea
 expired (30 minutes), the vault restarted or it was already used: review again. Logs:
 `onboard_started` (`owner: portal`), `onboard_planned`, `onboard_refused`, `onboard_registered`,
 `onboard_blocked` and `onboard_ended` (§11), `step_up_confirmed` with the action
-`onboard.register` or `onboard.discover_private`, and `review_requested` with `owner: portal`;
+`onboard.register` or `onboard.discover_private` (in managed mode `policy.save` and
+`client.servers` too, each then `policy_saved`), and `review_requested` with `owner: portal`;
 never a client secret, a fragment or a tool's definition.
 
 **Ledger.** The Ledger page is the vault's copy of the gateway's approval ledger (§21), newest
@@ -2213,6 +2277,17 @@ does when the policy moved meanwhile (`policy_moved`: the page is drawn again at
 press **Roll back** again to plan it there). Logs: `step_up_confirmed` with the action
 `policy.rollback`, then `policy_rolled_back` with its `target` (§34).
 
+**Connectors, in managed mode.** The managed Policy page lists each SMTP connector with whether
+it sends and its three limits, each in a field (§22). **Pause** refuses every send at once and
+**Resume** lets them go out again; **Save limits** writes the three fields. Each is
+`connector.limits`, planned on the head the page shows and confirmed with a passkey: a pause or a
+lowered limit is narrower, a resume ("sends can go out again") and a raised limit ("20 -> 50:
+raised") are weakenings. A value outside the schema's range is `bad_body`, the same values again
+`no_change`. If the policy moved since the page showed it, the page is drawn again first ("press
+the connector's button again"). Its recipients, mail server and sender are bound to its password
+and are the host's to change (§34, "Importing a change"). Logs: `step_up_confirmed` with the
+action `connector.limits`, then `policy_saved` with `write_kind: connector.limits`.
+
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A
 different host name has its own: issue a setup code and redeem it **on the new origin**.
@@ -2236,8 +2311,9 @@ guard), queue a review, plan a review save (managed mode: the plan is held, noth
 and end other sessions. They can't write or delete
 a secret, complete a connect, reset a credential, register a client, discover a server on your
 own network, enrol, rename or remove a passkey, restart the ledger chain, or, in managed mode,
-save a review, re-pin a tool, move one to allow or roll back the policy: each needs a fresh
-passkey prompt bound to that change. If you think a session was taken, **End the other
+save a review or an onboarding's server, re-pin a tool, move one to allow, give a server to a
+client or take it away, pause, resume or change a connector's limits, or roll back the policy:
+each needs a fresh passkey prompt bound to that change. If you think a session was taken, **End the other
 sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
 ([threat-model.md](threat-model.md)) has the rest.
 

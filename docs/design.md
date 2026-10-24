@@ -1744,6 +1744,13 @@ have passed:
   - Onboardings are memory only, owned by the CLI or one portal session, at most 4 (one per
     owner) and 30 minutes each; a restart ends them, and the only thing one can leave is a stored
     client secret no policy names, which health reports as unreferenced.
+  - **In managed mode** (M6) nothing is committed: in the portal, registering keeps its own
+    passkey prompt, then **Save** plans fragment 1's change (the credential, the route for the
+    gateway alone and the server) on the policy's head and writes it as a revision with a second
+    prompt, before the sign-in; the review's choices are a save of their own, and **Give to
+    clients** gives the server to a client, one client per save. Five prompts, each for one
+    thing; adding a client or changing its token stays a host import. The CLI's `login --mcp`
+    refuses in managed mode, since it would print a fragment nothing applies.
 - **Provider quirks:** some providers accept loopback redirects only for "desktop/native" client
   types. Provider profiles (§8.1) say which client type to register.
 

@@ -5,7 +5,9 @@
 // through textContent, and a rollback is its policy.rollback action, which plans the target's
 // content on the head the page showed and refuses anything wider before any prompt, or in the
 // dialog at the confirm (G.5, G.7). The plan lists the store entries the rollback leaves unused
-// first (G.7 row 7). It draws
+// first (G.7 row 7). Each connector's row has Pause or Resume and its limits (G.3), and Give to
+// clients, which drift.js draws on the MCP servers page's server rows, is here (J14 step 5):
+// both are saves of one thing, connector.limits and client.servers. It draws
 // when the Policy page opens, beside app.js's view of the policy, through app.js's guard() (on()
 // and button(), window.zoeyPortal), and words a next step as review.js does (window.zoeyReview).
 "use strict";
@@ -40,6 +42,18 @@
   const ONE = "?limit=1";
   const MOVED = "The policy moved to revision {now} since this page showed revision {head}: it " +
     "is drawn again, so press Roll back again to plan it on revision {now}.";
+  const LIMITS_MOVED = "The policy moved to revision {now} since this page showed revision " +
+    "{head}: it is drawn again, so press the connector's button again.";
+  // A connector's row (G.3): whether it sends, and its limits, by the field each sets.
+  const PAUSED = "paused: every send is refused.";
+  const SENDING = "sending.";
+  const LIMIT_TEXT = {
+    max_per_day: "Sends a day",
+    max_subject_chars: "Subject characters",
+    max_body_chars: "Body characters",
+  };
+  const NO_CLIENTS = "The policy has no client: a client is added on the host (zoeymcp policy " +
+    "export, edit, zoeymcp policy import).";
 
   // The next page's before (H.1), and what the last rollback's answer said, shown once drawn.
   let older = null;
@@ -78,8 +92,102 @@
     $("policy-gateway").textContent = GATEWAY_TEXT[gateway.state] +
       (gateway.revision === null ? "" : " Its view is revision " + gateway.revision + "'s.");
     $("policy-export").textContent = window.zoeyReview.stepText(view.export, true) + ".";
+    $("policy-connectors").replaceChildren(...view.connectors.map((each) =>
+      connectorRow(each, view.revision)));
     $("policy-diff").hidden = true;
     await history();
+  }
+
+  // A connector's row (M.1, G.3): whether it sends, and its three limits, each in a field; Pause or
+  // Resume, and Save limits with the fields' values, each connector.limits on the head the page
+  // shows. Its recipients, host, port and sender are the host's (an import, COV-1).
+  function connectorRow(connector, head) {
+    const item = make("li", connector.name_shown + ": " + (connector.paused ? PAUSED : SENDING));
+    const fields = Object.keys(LIMIT_TEXT).map((name) => {
+      const field = document.createElement("input");
+      field.type = "number";
+      field.value = String(connector[name]);
+      item.append(" " + LIMIT_TEXT[name] + " ", field);
+      return field;
+    });
+    item.append(" ", button(connector.paused ? "Resume" : "Pause", () => limits(head, (done) =>
+      prepare("connector.limits", { base: head, connector: connector.name,
+        paused: !connector.paused }, done))), " ", button("Save limits", () => limits(head,
+      (done) => prepare("connector.limits", { base: head, connector: connector.name,
+        max_per_day: Number(fields[0].value), max_subject_chars: Number(fields[1].value),
+        max_body_chars: Number(fields[2].value) }, done))));
+    return item;
+  }
+
+  // Pause, Resume or Save limits (G.3): a head that moved since the page showed it is found
+  // first and the page drawn again at it, as for Roll back; confirmed, the page is drawn again at
+  // the new head, and so it is after a refused prepare.
+  async function limits(head, ask) {
+    const now = await api("GET", "/api/policy/revisions" + ONE).catch(afterFailure);
+    if (now === undefined) {
+      return;
+    }
+    if (now.head !== head) {
+      said = LIMITS_MOVED.replace("{now}", now.head).replace("{head}", head);
+      return draw();
+    }
+    await ask((done) => {
+      closeConfirm();
+      said = wrote(done);
+      $("nav-policy").click();
+    });
+    if (!$("confirm").open) {
+      await draw();
+    }
+  }
+
+  // What a save's answer says: the new revision, and each step left, as review.js words them.
+  function wrote(done) {
+    return ["Revision " + done.revision + " written."].concat(done.next.map((step) =>
+      window.zoeyReview.stepText(step, true) + ".")).join(" ");
+  }
+
+  // Give to clients (G.3, J14 step 5), drawn by drift.js under each server's row: a box per
+  // client, ticked where it reaches the server at the revision the vault read them at, and Save,
+  // planned on that revision, so a head that moved since is policy_moved, never a merge (G.10).
+  async function give(server, block) {
+    const found = await api("GET", "/api/servers").catch(afterFailure);
+    if (found === undefined) {
+      return;
+    }
+    block.replaceChildren(found.clients.length ? "" : NO_CLIENTS);
+    const boxes = found.clients.map((client) => {
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = client.servers.includes(server);
+      const label = make("label", " " + client.name_shown);
+      label.prepend(box);
+      block.append(label, " ");
+      return { client: client, box: box };
+    });
+    block.append(button("Save", () => gave(server, block, boxes.filter((each) =>
+      each.box.checked !== each.client.servers.includes(server)), found.revision)));
+  }
+
+  // client.servers changes one client's servers, sent whole (G.3), so each client whose box
+  // changed is a save of its own, one passkey each, in turn; then the MCP servers page is drawn
+  // again. A refused prepare (a head that moved since the boxes were drawn) draws them again at
+  // the head now, so the next Save plans on it.
+  async function gave(server, block, changed, base) {
+    if (!changed.length) {
+      return $("nav-servers").click();
+    }
+    const kept = changed[0].client.servers.filter((name) => name !== server);
+    const servers = changed[0].box.checked ? kept.concat([server]) : kept;
+    await prepare("client.servers", { base: base, client: changed[0].client.name,
+      servers: servers }, (done) => {
+      closeConfirm();
+      $("status").textContent = wrote(done);
+      return gave(server, block, changed.slice(1), done.revision);
+    });
+    if (!$("confirm").open) {
+      await give(server, block);
+    }
   }
 
   // A page of history (H.1), newest first: from the head, or below ``before`` for Older
@@ -211,4 +319,5 @@
 
   on("nav-policy", draw);
   on("policy-older", () => history(older));
+  window.zoeyPolicy = Object.freeze({ give: give });
 })();

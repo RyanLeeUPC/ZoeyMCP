@@ -21,6 +21,7 @@ from typing import Any, Final, Literal
 
 from ..common.canonical import digest
 from ..common.logs import refuse_type
+from ..common.policy.change import CONNECTOR_LIMITS
 from .routes import BODY_DEFAULT, BODY_PASTE, BODY_SECRET, DISCOVER_KEYS
 from .sessions import NONCE_BYTES, RandomBytes, challenge, new_id
 
@@ -93,6 +94,15 @@ KINDS: Final[dict[str, Kind]] = {
         # M6 H.3, M.3: a managed rollback, from the Policy page, to a kept revision, planned on
         # the head revision the page showed.
         Kind("policy.rollback", _DEFAULT_CAP, frozenset({"base", "revision"})),
+        # M6 G.3, M.3 (step 15c): Give to clients, one existing client's servers whole; and a
+        # connector's pause and limits, each field optional, never its bound constraints.
+        Kind("client.servers", _DEFAULT_CAP, frozenset({"base", "client", "servers"})),
+        Kind(
+            "connector.limits",
+            _DEFAULT_CAP,
+            frozenset({"base", "connector"}),
+            frozenset(CONNECTOR_LIMITS),
+        ),
     )
 }
 # tool.allow's two forms of data (M6 J.4, M.3): its optional keys come all from one.

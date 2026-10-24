@@ -109,6 +109,14 @@ def test_the_registry_holds_f4s_kinds() -> None:
         "tool.allow": (4096, ["base"], ["draft", "kind", "name", "pin", "server"]),
         # M6 H.3, M.3 (step 15b): a managed rollback to a kept revision, on the head shown.
         "policy.rollback": (4096, ["base", "revision"], []),
+        # M6 G.3, M.3 (step 15c): Give to clients, one client's servers whole; a connector's
+        # pause and limits, each optional, never its bound constraints.
+        "client.servers": (4096, ["base", "client", "servers"], []),
+        "connector.limits": (
+            4096,
+            ["base", "connector"],
+            ["max_body_chars", "max_per_day", "max_subject_chars", "paused"],
+        ),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
     assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS

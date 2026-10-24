@@ -21,9 +21,11 @@ import pytest
 
 from tests.unit.test_review_choices import large
 from tests.unit.test_reviewview import held
+from zoeymcp.common.policy.change import CONNECTOR_LIMITS
 from zoeymcp.common.policy.diff import Change
 from zoeymcp.common.policy.emit import INDENT_MAX
 from zoeymcp.common.policy.plan import WriteKind
+from zoeymcp.common.policy.schema import Policy
 from zoeymcp.portal import app as portal_app
 from zoeymcp.portal import policydiffview, reviewview
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
@@ -43,8 +45,8 @@ MAX_ASSETS = 128 * 1024
 # it, and gives review.js, the MCP servers section, its own. M6 (M.4, Q14): the owner raised
 # app.js and webauthn.js to 1,060 for the few lines Home and health need (1,048 before step 7,
 # 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450;
-# policy.js, the Policy page's managed half (step 15b), its own 500. The static total after 15b
-# is 115 KiB (117,443 bytes), below M.4's 124 KiB, so MAX_ASSETS stays 128 KiB.
+# policy.js, the Policy page's managed half (step 15b), its own 500. The static total after 15c
+# is 122 KiB (125,162 bytes), below M.4's 124 KiB, so MAX_ASSETS stays 128 KiB.
 LINE_CAPS = {
     ("app.js", "webauthn.js"): 1060,
     ("review.js",): 700,
@@ -53,6 +55,16 @@ LINE_CAPS = {
 }
 
 LT, GT, QUOTE = chr(0x3C), chr(0x3E), chr(0x22)
+# An SMTP connector, for the Policy page's connector row (M6 G.3, step 15c).
+MAIL = {
+    "kind": "smtp",
+    "host": "smtp.mail.example",
+    "port": 465,
+    "username": "user",
+    "password": "store:mail-pass",
+    "from": "zoeymcp@mail.example",
+    "to": ["ops@mail.example"],
+}
 FORBIDDEN_TAGS = frozenset({"style", "form", "iframe", "base", "object", "embed", "frame"})
 # K.2's sinks and the rest the page must never use.
 SINKS = (
@@ -552,9 +564,23 @@ def test_review_js_clicks_go_through_app_js_guard() -> None:
     enter = enter[: enter.index("\n  }\n")]
     assert enter.index('renderFindings($("checklist")') < enter.index("zoeyDrift.home()")
     assert enter.index("zoeyDrift.home()") < enter.index('show("home");')
-    # review.js's hooks into drift.js (M6 J.2, M.4): the servers rows, the review's footer, a
-    # tool's row, and the lists Generate sends; each read when called, since drift.js loads after.
-    assert re.findall(r"window\.zoeyDrift\.(\w+)\(", code) == ["servers", "footer", "row", "lists"]
+    # review.js's hooks into drift.js (M6 J.2, M.4): the servers rows, what a registration's
+    # confirm does next (managed mode's save, step 15c), the review's footer, a tool's row, and
+    # the lists Generate sends; each read when called, since drift.js loads after.
+    assert re.findall(r"window\.zoeyDrift\.(\w+)\(", code) == [
+        "saveOnboarding",
+        "servers",
+        "registered",
+        "footer",
+        "row",
+        "lists",
+    ]
+    # A managed onboarding's save is its first step's button on the row and on the plan alike
+    # (step 15c): a given public client's plan has no other.
+    assert (
+        "save: context.boarding && (() => window.zoeyDrift.saveOnboarding(context.boarding)),"
+        in code
+    )
 
 
 def test_a_client_secret_is_write_only_in_the_page() -> None:
@@ -597,9 +623,15 @@ def test_the_page_words_every_row_state_and_where_every_command_runs() -> None:
     """K.1's row states are the vault's (vault/onboarding.py's and the portal's own onboarding
     rows'); M.7's next steps show every via, and the piped and redirect keys of J1's commands."""
     code = code_of(read("review.js"))
-    # A server's states, and an onboarding's: each stage as the portal's row names it.
+    # A server's states, and an onboarding's: each stage as the portal's row names it, in each
+    # mode (managed mode's needs_save, M6 G.9).
     stages = typing.get_args(onboarding.Stage)
-    states = {portal_app.ROW_STATES.get(stage, stage) for stage in stages}
+    states = {
+        by_stage.get(stage, stage)
+        for by_stage in portal_app.ROW_STATES.values()
+        for stage in stages
+    }
+    assert {"needs_commit", "needs_save"} <= states
     assert keys("STATES") == set(typing.get_args(onboarding.RowState)) | states
     assert keys("VIA") == set(typing.get_args(onboarding.Via))
     assert "step.piped" in code
@@ -741,7 +773,10 @@ def test_drift_js_clicks_go_through_app_js_guard() -> None:
     J.4, J3), a clear through app.js's step-up (prepare); its one click handler of its own,
     Save, goes through app.js's on() (step 15a), and a managed save is prepared as each kind a
     draft can be, or as tool.allow from a server's row; it publishes window.zoeyDrift, frozen,
-    and nothing else: Home's hooks (step 7) and review.js's (M6 J.2, step 8)."""
+    and nothing else: Home's hooks (step 7) and review.js's (M6 J.2, step 8; a registration's
+    confirm, step 15c). In managed mode an onboarding's Save is a draft's save, which review.js's
+    runner calls from the row and the plan alike, and Give to clients is policy.js's, under every
+    server's row, reviewed or not (step 15c)."""
     code = code_of(read("drift.js"))
     assert re.findall(r"(\S+)\.addEventListener\(", code) == ["entry.repin"]
     assert "onclick" not in code
@@ -777,7 +812,23 @@ def test_drift_js_clicks_go_through_app_js_guard() -> None:
     shared = re.search(r"window\.zoeyDrift = Object\.freeze\(\{([^}]*)\}\);", code)
     assert shared
     members = [word.split(":")[0].strip() for word in shared.group(1).split(",") if word.strip()]
-    assert members == ["home", "review", "servers", "row", "footer", "lists"]
+    assert members == [
+        "home",
+        "review",
+        "servers",
+        "row",
+        "footer",
+        "lists",
+        "registered",
+        "saveOnboarding",
+    ]
+    assert re.findall(r"window\.zoeyPolicy\.(\w+)\(", code) == ["give"]
+    assert "await SAVES[draft.kind](draft, (done) => saved(savedText(done)));" in code
+    start = code.index("async function servers(list, rows, queue) {")
+    rows = code[start : code.index("\n  }\n", start)]
+    assert 'if (mode === "managed" && typeof row.server === "string") {' in rows
+    assert "saveOnboarding" not in rows
+    assert '"reviewed"' not in rows
     for member in members:
         assert f"function {member}(" in code, member
 
@@ -856,14 +907,18 @@ def test_record_the_rest_as_declined_is_ticked_by_default() -> None:
 def test_policy_js_clicks_go_through_app_js_guard() -> None:
     """policy.js draws its buttons with app.js's button() and binds its two clicks through on():
     the Policy page's nav button, beside app.js's own, so the page's managed half draws as it
-    opens, and Older revisions. It listens for nothing else, prepares one kind, policy.rollback,
-    publishes nothing, and words a next step and the export command as review.js does (M.7). Its
-    one click of its own is the nav button's, after a rollback, so app.js's view and the history
-    draw again at the new head. Roll back is on every history entry but the head, so a revision
+    opens, and Older revisions. It listens for nothing else, prepares policy.rollback, a
+    connector's limits (twice: Pause or Resume, and Save limits) and client.servers (Give to
+    clients, step 15c), publishes only Give to clients for drift.js, and words a next step and
+    the export command as review.js does (M.7). Its clicks of its own are the nav buttons', after
+    a rollback or a connector's save, so app.js's view and the history draw again at the new
+    head, and after Give to clients, so the MCP servers rows do. Roll back is on every history
+    entry but the head, so a revision
     whose changes can't be shown is still a target (D.8); a press first finds a head that moved
     since the page showed it, and draws the page again at the head now instead of preparing, and
     a refused prepare draws it again too, so pressing Roll back again plans on the head it finds
-    (N.2's rollback wording)."""
+    (N.2's rollback wording). Give to clients plans on the revision the vault read the clients at,
+    and a refused prepare draws its boxes again (G.10)."""
     code = code_of(read("policy.js"))
     assert "addEventListener(" not in code
     assert "function button(" not in code
@@ -880,10 +935,27 @@ def test_policy_js_clicks_go_through_app_js_guard() -> None:
         "on",
     }
     assert re.findall(r"\bon\(\"([a-z-]+)\", ", code) == ["nav-policy", "policy-older"]
-    assert re.findall(r'prepare\("([a-z.]+)"', code) == ["policy.rollback"]
-    assert re.findall(r"window\.(zoey\w+) =", code) == []
-    assert re.findall(r"window\.zoeyReview\.(\w+)\(", code) == ["stepText", "stepText"]
-    assert re.findall(r"\$\(\"([a-z-]+)\"\)\.click\(\)", code) == ["nav-policy"]
+    assert re.findall(r'prepare\("([a-z.]+)"', code) == [
+        "connector.limits",
+        "connector.limits",
+        "client.servers",
+        "policy.rollback",
+    ]
+    assert re.findall(r"window\.(zoey\w+) =", code) == ["zoeyPolicy"]
+    assert "window.zoeyPolicy = Object.freeze({ give: give });" in code
+    assert re.findall(r"window\.zoeyReview\.(\w+)\(", code) == ["stepText"] * 3
+    assert re.findall(r"\$\(\"([a-z-]+)\"\)\.click\(\)", code) == [
+        "nav-policy",
+        "nav-servers",
+        "nav-policy",
+    ]
+    # A connector's save, like a rollback, is planned on the head the page showed: a head that
+    # moved draws the page again first, and so does a refused prepare (G.3, N.2).
+    start = code.index("async function limits(head, ask) {")
+    body = code[start : code.index("\n  }\n", start)]
+    asked = body.index('now = await api("GET", "/api/policy/revisions" + ONE)')
+    assert asked < body.index("if (now.head !== head) {") < body.index("return draw();")
+    assert body.index("return draw();") < body.index("await ask(") < body.index('$("confirm")')
     start = code.index("async function rollback(target, head) {")
     body = code[start : code.index("\n  }\n", start)]
     assert body.index("closeConfirm();") < body.index('$("nav-policy").click();')
@@ -899,6 +971,13 @@ def test_policy_js_clicks_go_through_app_js_guard() -> None:
     drawn = code[start : code.index("\n  }\n", start)]
     assert "if (entry.revision !== head) {" in drawn
     assert "() => rollback(entry.revision, head)));" in drawn
+    # Give to clients: the boxes and the save's base are one answer's, never the head now.
+    assert "each.box.checked !== each.client.servers.includes(server)), found.revision)));" in code
+    assert "/api/session" not in code
+    start = code.index("async function gave(server, block, changed, base) {")
+    body = code[start : code.index("\n  }\n", start)]
+    assert body.index('prepare("client.servers", { base: base,') < body.index('$("confirm")')
+    assert body.rstrip().endswith("await give(server, block);\n    }")
 
 
 def test_policy_js_reads_what_the_vault_sends() -> None:
@@ -941,6 +1020,20 @@ def test_policy_js_reads_what_the_vault_sends() -> None:
         "not_running",
         "gateway",
         "export",
+        "connectors",
+    }
+    # A connector's row reads the fields connectors_view sends, each limit by its name (G.3).
+    sent = portal_app.connectors_view(
+        Policy.model_validate({"version": 1, "mode": "managed", "connectors": {"mail": MAIL}})
+    )
+    # "connector.limits" is the action's kind, not a field.
+    found = set(re.findall(r'(?<!")\bconnector\.([a-z_]+)', code))
+    assert found == {"name", "name_shown", "paused"}
+    assert found <= set(sent[0])
+    limits = code[code.index("const LIMIT_TEXT = {") :]
+    limits = limits[: limits.index("};")]
+    assert set(re.findall(r"^\s+([a-z_]+):", limits, flags=re.M)) == set(CONNECTOR_LIMITS) - {
+        "paused"
     }
     assert set(re.findall(r"\bpage\.([a-z_]+)", code)) == {"revisions", "head", "next"}
     assert set(re.findall(r"\bnow\.([a-z_]+)", code)) == {"head"}

@@ -33,7 +33,11 @@ refreshes an expired access token, rotating the refresh token. Rows:
 - J2 in the portal: a setup code and a passkey, **Add a server by URL**, the registration with a
   passkey, the commit, **Connect** through the callback, the review the page queues, **Select
   suggested** on the ``large`` server, fragment 2 and its commit; and a given public client's
-  **Make the YAML** with no passkey, connected by paste.
+  **Make the YAML** with no passkey, connected by paste;
+- J14 in the portal of a managed vault (M6 design G.9, G.3; step 15c): its first policy seeds
+  revision 1, and five passkey prompts, each for one thing (register, **Save**, **Connect**, the
+  review's **Save**, **Give to clients**), take the server to the agent's calls with no fragment
+  committed.
 
 Every test ends with the sweep: no token, code or client secret the fakes issued, no given secret,
 no client token or its hash and no gateway key reached a log line, an answer the operator or the
@@ -74,7 +78,7 @@ from tests.portal.flows import connect_by_callback, enrol, login, redeem, step_u
 from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import main
 from zoeymcp.common import egresslist, logs
-from zoeymcp.common.policy import Policy, check_policy
+from zoeymcp.common.policy import Policy, check_policy, restart
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view
@@ -92,13 +96,15 @@ from zoeymcp.vault import netclient
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import VaultApp, without_cookies
 from zoeymcp.vault.keys import KeySet, generate_master_key
+from zoeymcp.vault.managed import ManagedPolicy
 from zoeymcp.vault.oauth.discovery import ISSUER_LABELS, NOTES
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.protocol import MIN_401_AGE
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.onboard import BACKSTOP_OFF, OnboardService
 from zoeymcp.vault.peer import peer_checked
-from zoeymcp.vault.server import ListenerTag
+from zoeymcp.vault.policystore import PolicyStore
+from zoeymcp.vault.server import ListenerTag, load_runtime
 from zoeymcp.vault.store import STORE_FILE, SecretStore
 
 from .conftest import (
@@ -310,7 +316,10 @@ class Vault:
     """The vault as ``zoeymcp vault`` wires it (``server.build``): one store, token manager,
     logins, onboardings and review jobs for the admin socket and the portal, served here on
     loopback ports (the socket's routes on TCP, as conftest's ``Deployment`` serves them), and
-    with ``link``, the gateway's link socket (Linux). The clocks are the world's."""
+    with ``link``, the gateway's link socket (Linux). The clocks are the world's. A policy that
+    says ``mode: managed`` is read as a managed start reads it (``server.load_runtime``): its
+    first start seeds revision 1, and the portal saves through the policy's holder (M6 design
+    F.2, G.6)."""
 
     def __init__(
         self,
@@ -324,7 +333,8 @@ class Vault:
         self.state = state
         self.world = world
         self.document = document
-        self.keys = KeySet.from_text(generate_master_key())
+        self.master = generate_master_key()
+        self.keys = KeySet.from_text(self.master)
         self.portal_port = portal_port
         self.link_socket: Path | None = None
         if link == "unix":
@@ -338,10 +348,17 @@ class Vault:
     def _build(self) -> None:
         """A new process on the same state directory: only the store carries over."""
         clock = self.world.clock
-        self.policy = checked(self.document)
+        runtime = None
+        if self.document["mode"] == "managed":
+            config = self.state.parent / "policy.json"
+            config.write_bytes(json.dumps(self.document).encode())
+            runtime = load_runtime(str(config), self.state, {"ZOEYMCP_MASTER_KEY": self.master})
+            self.policy, self.store = runtime.policy, runtime.store
+        else:
+            self.policy = checked(self.document)
+            self.store = SecretStore(self.state, self.keys)
+            self.store.load()
         proxy = self.policy.egress_proxy
-        self.store = SecretStore(self.state, self.keys)
-        self.store.load()
         # The token manager reads the world's clock, so it is made here, on the vault's own
         # token client (B.2); VaultApp builds its other clients itself.
         self.token_client = without_cookies(
@@ -356,8 +373,30 @@ class Vault:
             self.keys,
             tokens=self.tokens,
             environ={},
+            gateway_keys=None if runtime is None else runtime.gateway_keys,
             gateway_link=self.link_socket is not None,
         )
+        self.managed: ManagedPolicy | None = None
+        if runtime is not None:
+            assert runtime.policy_store is not None
+            assert runtime.ratchet is not None
+            admin_block = runtime.policy.admin
+            store_keys, previous = runtime.keys, runtime.previous
+            self.managed = ManagedPolicy(
+                runtime.policy_store,
+                app,
+                policy=runtime.policy,
+                ratchet=runtime.ratchet,
+                secrets=runtime.store,
+                environ={},
+                started=restart.Started(
+                    app.egress_proxy,
+                    app.egress_proxy_kind,
+                    None if admin_block is None else admin_block.listen,
+                    frozenset(),
+                ),
+                reopen=lambda: PolicyStore.open(self.state, store_keys, previous, strays=False),
+            )
         self.login = LoginService(self.tokens, clock=clock.monotonic, wall=clock.wall)
         self.onboard = OnboardService(
             self.store,
@@ -394,7 +433,14 @@ class Vault:
                 ).report,
                 onboard=self.onboard,
                 reviews=app,
+                source="managed" if self.managed is not None else "env",
+                policy_header=None if self.managed is None else self._header,
+                managed=self.managed,
             )
+
+    def _header(self) -> Mapping[str, Any] | None:
+        assert self.managed is not None
+        return self.managed.header
 
     @property
     def portal_origin(self) -> str:
@@ -577,8 +623,13 @@ class S9:
             self.vault.restart()
             return
         self.vault.reload(document)
+        self.applied()
+
+    def applied(self) -> None:
+        """The gateway on the vault's running view: after a reload, or a managed save the
+        vault installed itself (M6 design G.6)."""
         assert self.running is not None
-        digest = build_view(self.vault.policy).digest
+        digest = build_view(self.vault.app.policy).digest
         app = self.running.app
         wait_for(
             lambda: app.policy.snapshot is not None and app.policy.snapshot.view.digest,
@@ -810,10 +861,12 @@ def deployed(
     *,
     link: str = "tcp",
     portal: bool = False,
+    managed: bool = False,
     proxy: ConnectProxy | None = None,
     **options: Any,
 ) -> Iterator[S9]:
-    """The fakes made by ``options``, and a vault on the operator's first policy."""
+    """The fakes made by ``options``, and a vault on the operator's first policy, which with
+    ``managed`` seeds a managed vault's revision 1."""
     clock = Clock()
     with (
         world(tmp_path, ca, monkeypatch, fakes(clock, **options), clock) as made,
@@ -829,13 +882,10 @@ def deployed(
         portal_port = free_port() if portal else None
         state = tmp_path / "vault"
         state.mkdir(mode=0o700)
-        vault = Vault(
-            state,
-            made,
-            base_policy(portal_port=portal_port, proxy=proxy_url),
-            link=link,
-            portal_port=portal_port,
-        )
+        document = base_policy(portal_port=portal_port, proxy=proxy_url)
+        if managed:
+            document["mode"] = "managed"
+        vault = Vault(state, made, document, link=link, portal_port=portal_port)
         gateway_state = tmp_path / "gateway"
         gateway_state.mkdir(mode=0o700)
         yield S9(made, vault, gateway_state)
@@ -1225,4 +1275,80 @@ async def test_j2_a_given_public_client_with_no_passkey_prompt_until_connect(
         await the_calls(s9, running, [ALLOWED, APPROVED])
     assert [line["action"] for line in s9.seen.events("step_up_confirmed")] == ["oauth.complete"]
     assert s9.world.auth.registrations == []
+    sweep(s9)
+
+
+async def test_j14_a_managed_vaults_portal_onboards_in_five_prompts(
+    tmp_path: Path, ca: ProviderCA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """J14h in the portal of a managed vault (M6 design G.9, G.3; D-147's obligation): register
+    (prompt 1), Save of fragment 1's change, a draft the vault plans (prompt 2: nothing secret
+    reached the fakes before it, X1), Connect through the callback (3), the review's Save (4,
+    its way on Give to clients) and Give to clients (5); then the agent lists and calls the
+    tools. No fragment is shown or committed: each change is a revision the vault installs."""
+    options: dict[str, Any] = {"registration": "open"}
+    with (
+        deployed(tmp_path, ca, monkeypatch, portal=True, managed=True, **options) as s9,
+        s9.up() as running,
+    ):
+        assert s9.vault.managed is not None
+        assert s9.vault.managed.revision == 1
+        passkey = SoftAuthenticator()
+        with (
+            s9.world.provider() as provider,
+            Browser(address=loopback, remote={ISSUER: provider}) as browser,
+        ):
+            page = signed_in(s9, passkey, browser)
+            plan = fetched(s9, page, "POST", "/api/onboard/discover", {"url": SERVER_URL})
+            assert plan["next"] == [{"do": "register", "label": "Register its client"}]
+            onboarding = plan["onboarding"]
+            made = step_up(page, passkey, "onboard.register", {"onboarding": onboarding})
+            assert made.status_code == 200, made.text
+            s9.seen.outputs.append(made.text)
+            assert "diff" not in made.json()
+            assert (row(s9, page)["state"], made.json()["next"][0]["do"]) == ("needs_save", "save")
+            nothing_secret_yet(s9.world)
+            draft = fetched(s9, page, "POST", f"/api/onboard/{onboarding}/fragment", {})
+            assert (draft["kind"], draft["base"]) == ("policy.save", 1)
+            data = {"draft": draft["draft"], "base": 1}
+            saved = step_up(page, passkey, "policy.save", data)
+            assert saved.status_code == 200, saved.text
+            s9.seen.outputs.append(saved.text)
+            assert row(s9, page)["state"] == "needs_connect"
+            s9.applied()
+            begun, connected = connect_by_callback(page, passkey, SERVER)
+            assert connected.status_code == 200, connected.text
+            s9.seen.outputs += [json.dumps(begun), connected.text]
+            assert row(s9, page)["state"] == "needs_review"
+            job, _ = reviewed_in_the_portal(s9, page)
+            choices = {
+                "include": [ALLOWED, APPROVED],
+                "allow": [ALLOWED],
+                "approve": [APPROVED],
+                "decline_rest": True,
+            }
+            draft = fetched(s9, page, "POST", f"/api/review/jobs/{job}/diff", choices)
+            assert draft["kind"] == "policy.save"
+            reviewed = step_up(page, passkey, "policy.save", {"draft": draft["draft"], "base": 2})
+            assert reviewed.status_code == 200, reviewed.text
+            s9.seen.outputs.append(reviewed.text)
+            assert reviewed.json()["next"][-1]["do"] == "assign_clients"
+            assert (row(s9, page)["state"], row(s9, page)["clients_shown"]) == ("reviewed", [])
+            give = {"base": 3, "client": CLIENT, "servers": [SERVER]}
+            given = step_up(page, passkey, "client.servers", give)
+            assert given.status_code == 200, given.text
+            s9.seen.outputs.append(given.text)
+            assert row(s9, page)["clients_shown"] == [CLIENT]
+            s9.applied()
+            confirmed = s9.seen.events("step_up_confirmed", at_least=5)
+            assert [line["action"] for line in confirmed] == [
+                "onboard.register",
+                "policy.save",
+                "oauth.complete",
+                "policy.save",
+                "client.servers",
+            ]
+        await the_calls(s9, running, [ALLOWED, APPROVED])
+    assert s9.vault.managed.revision == 4
+    assert len(s9.world.auth.registrations) == 1
     sweep(s9)

@@ -380,6 +380,68 @@ view.
     - **Roll back to revision N** on the revision with `add` and `slow` at allow, now wider than
       the head: refused before any passkey prompt, "The portal can't widen ... through a
       rollback", with the host's export and import, and nothing is written.
+22. **A connector's pause and limits** (the Policy page in managed mode, M6). Item 21's vault,
+    stopped, given an SMTP connector by a host import: `zoeymcp policy export --state ./state >
+    policy.yaml`, add under `connectors` a connector `mail` in the shape of
+    `profiles/smtp-implicit-tls.yaml` (any host, sender and recipient; its password
+    `store:mail-pass`, which needn't be set), `zoeymcp policy import --state ./state - --yes
+    --accept-widening < policy.yaml`, then start the vault. In Chrome or Edge with the Console open
+    (no Trusted Types or Content Security Policy violation throughout), open **Policy**. Pass:
+    - **Connectors** lists `mail: sending.` with its three limits in fields (20 sends a day, 150
+      subject characters, 2200 body characters), and nothing of its host, sender or recipients;
+      no text says to commit, reload or generate;
+    - **Pause**: the dialog's rows read "Revision N, from N-1 (by you, ...: N-1 is the head)",
+      `connectors.mail.paused` "changed" and "No restart needed"; confirmed, the row reads paused,
+      the history's newest revision is "a connector's limits", and the vault's log has
+      `step_up_confirmed` with `connector.limits` and `policy_saved` with `write_kind:
+      connector.limits`;
+    - **Resume**: the dialog's row reads "sends can go out again"; **Close** writes nothing (the
+      row still reads paused); **Resume** again and confirm: sending;
+    - "Sends a day" set to 50, **Save limits**: the dialog's row reads "20 -> 50: raised";
+      confirmed, the field shows 50; with 0 in a field, **Save limits** is refused before any
+      passkey prompt, and with the same values again, "Nothing would change.";
+    - a second browser signed in on the same origin pauses it first: this browser's **Resume**
+      draws the page again, saying the policy moved to revision N since it showed revision M
+      ("press the connector's button again"), and nothing more is written.
+23. **Onboarding in managed mode, and Give to clients** (the MCP servers page in managed mode,
+    M6). A managed vault on a fresh state directory with a gateway that polls it (item 20's
+    setup), started through `tests/acceptance/procs.py`'s launcher with item 17's CA and name map
+    and its two fakes running, its policy giving a client `agent1` (a `token_sha256` from
+    `zoeymcp client-token`) no server. In Chrome or Edge with the Console open (no Trusted Types
+    or Content Security Policy violation throughout), set up a passkey and open **MCP servers**.
+    Pass:
+    - **Add a server by URL** with `https://mcp.notes.example:9444/mcp` and, in **More options**,
+      client ID `public-check` and no secret (a public client): the row reads "discovered, nothing
+      sent or stored yet", and the plan's one button, like the row's, is **Save**, with no
+      registration and no passkey prompt before it; **Cancel** it (nothing is written);
+    - **Add a server by URL** with `https://mcp.notes.example:9444/mcp` and no client ID: the
+      plan's one button is **Register its client**; registered with a passkey, the page shows no
+      fragment, and the row reads `needs_save` with **Save**; no text says to commit, reload,
+      generate or make a fragment;
+    - **Save**: the dialog's first row reads "Revision 2, from 1 (by the seed, ...: 1 is the
+      head)", then `credentials.notes`, `routes.notes` and `gateway.servers.notes`, each "added
+      (wider)", and "No restart needed"; confirmed, the row reads `needs_connect` with no reload
+      or restart;
+    - **Connect** (accept the certificate warning for `https://localtest.me:9443` once): the
+      provider sends the tab back to the portal, a passkey confirms, and the page queues the
+      server's review by itself; Home's attention list names the tools nobody reviewed, with
+      **Review**; the row, not reviewed yet, already has **Give to clients**;
+    - the review, `echo` included as allow and `add` as approve, **Save**: the answer ends "Then
+      give notes to each client that should reach it: Give to clients, on the MCP servers page",
+      and the row reads reviewed, served to no client yet; Home's list no longer names notes;
+    - **Give to clients**: one box, `agent1`, unticked; ticked, **Save**: the dialog's row reads
+      "agents holding client agent1's token can call notes's 2 included tools"; **Close** writes
+      nothing; **Save** again and confirm: the row says served to agent1; unticked and saved
+      again, the dialog shows `notes removed` and no row ending "(wider)";
+    - **Give to clients** with the boxes shown, while a second browser signed in on the same
+      origin gives notes to `agent1` first: this browser's `agent1` ticked and **Save** is
+      refused before any passkey prompt ("press Save again to plan it on revision N"), the boxes
+      are drawn again with `agent1` ticked, and nothing more is written;
+    - the vault's log has `step_up_confirmed` with `onboard.register`, `policy.save`,
+      `oauth.complete`, `policy.save` and `client.servers`, in that order.
+
+    A `policy_behind_witness` banner on Home joins this item once the vault can raise it (the
+    restore witness, not built yet).
 
 ## D-66: the live OAuth test against a real provider
 

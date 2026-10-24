@@ -8,7 +8,8 @@
 // (window.zoeyDrift). In managed mode (M.1, G.3, G.4) it shows the page's managed texts (the
 // data-mode pairs), and Save and Allow without asking are saves: the vault holds the review's
 // change as a draft and plans it, and one passkey confirms the plan it shows, each move to allow
-// first with its definition (Q27).
+// first with its definition (Q27); so is an onboarding's Save (G.9), and Give to clients is
+// policy.js's (G.3).
 "use strict";
 
 (function () {
@@ -31,6 +32,8 @@
     "run with no prompt. Generate's fragment says so in a comment.";
   const NOT_MOVED = "Allow without asking: the review shows that tool not included as approve " +
     "(or the toolkit declares it consequential), so nothing was moved.";
+  // A managed registration done (G.9, J14): Save on its row comes next.
+  const REGISTERED = "Registered. Save on its row adds it to the policy, with your passkey.";
   // A tool in these states matches its pin (gateway/review.py's MATCHING): Clear the marks is
   // enabled only when every included tool is in one, and one is marked (J13).
   const MATCHING = ["ok", "marked", "blocked"];
@@ -178,12 +181,20 @@
   // The MCP servers rows (review.js's listServers, one item per row in order): under each server,
   // Allow without asking for each included approve tool; and where the gateway reports on it,
   // what it reports (Home's items for that server) with Clear the marks for marked tools, above
-  // the row's own Review again, which asks for a fresh review (J.2).
+  // the row's own Review again, which asks for a fresh review (J.2). In managed mode, Give to
+  // clients on every server's row, reviewed or not, so a server can be taken from a client at
+  // any time (J14, OPS-4); an onboarding's Save is its first step's button (review.js's runner).
   async function servers(list, rows, queue) {
     rows.forEach((row, index) => {
+      const place = list.children[index];
       for (const named of typeof row.server === "string" ? row.approve : []) {
-        list.children[index].append(button("Allow " + named.name_shown + " without asking",
+        place.append(button("Allow " + named.name_shown + " without asking",
           () => allow(row.server, named, queue)));
+      }
+      if (mode === "managed" && typeof row.server === "string") {
+        const block = make("div");
+        place.append(button("Give to clients", () => window.zoeyPolicy.give(row.server, block)),
+          block);
       }
     });
     let answer;
@@ -367,6 +378,30 @@
     });
   }
 
+  // A registration's confirm (review.js's prepareRegister): in managed mode the rows are drawn
+  // again, the onboarding's with Save (G.9); else review.js's own, fragment 1.
+  function registered(after) {
+    return (result) => mode === "managed" ? saved(REGISTERED) : after(result);
+  }
+
+  // A save from the MCP servers page done: the dialog closed, its words said, the rows again.
+  function saved(text) {
+    closeConfirm();
+    $("plan").hidden = true;
+    $("status").textContent = text;
+    review();
+  }
+
+  // Save on an onboarding's row or its plan (G.4, G.9; J14 step 2), review.js's runner: the vault
+  // makes its change a draft and plans it, and one passkey writes it; then the row needs Connect.
+  async function saveOnboarding(boarding) {
+    const draft = await api("POST", fill("/api/onboard/{onboarding}/fragment",
+      { onboarding: boarding }), {}).catch(afterFailure);
+    if (draft !== undefined) {
+      await SAVES[draft.kind](draft, (done) => saved(savedText(done)));
+    }
+  }
+
   // Every choice on the screen: the lists below, with the included tools and how each is
   // classified, as review.js's chosen() reads them.
   function picked(held) {
@@ -400,5 +435,6 @@
   on("review-save", save);
   window.zoeyDrift = Object.freeze({
     home: home, review: review, servers: servers, row: row, footer: footer, lists: lists,
+    registered: registered, saveOnboarding: saveOnboarding,
   });
 })();

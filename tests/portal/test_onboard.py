@@ -20,6 +20,12 @@ what a step sent, or that it sent nothing.
   session's end cancels its own.
 - **A private discovery** (TI-3) only through ``onboard.discover_private``: refused on the
   route, and nothing reaches the network before the passkey.
+- **J14 in managed mode** (M6 design G.9, G.3; step 15c): five passkey prompts, each for one
+  thing: register; **Save** of fragment 1's change, a draft the fragment route plans
+  (``policy.save``), the row ``needs_save`` until then and ``needs_connect`` at once after;
+  Connect; the review's **Save**; **Give to clients** (``client.servers``). Each answer's
+  ``next`` is asserted; no fragment is shown or committed. A given public client's one step is
+  the save itself, with no prompt before it.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +54,8 @@ from zoeymcp.vault.store import SecretStore
 
 from .flows import connect_by_callback, prepared_action, set_up, status_reason, step_up
 from .rig import PortalRig, running
+from .test_policy_managed import GET, LIST, WRITE, report_of
+from .test_review import gateway_answers, poller
 
 SERVER_URL = onboard_model.SERVER_URL
 ISSUER = onboard_model.ISSUER
@@ -126,8 +135,11 @@ def onboarding_service(hosts: Hosts) -> Callable[[server.Vault], OnboardService]
     return make
 
 
-@pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+@contextmanager
+def a_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: dict[str, Any] | None = None
+) -> Iterator[World]:
+    """The vault, its portal and the fakes, the vault's policy the rig's with ``policy``."""
     auth = FakeAuthServer(
         time.time,
         client_id=CLIENT_ID,
@@ -144,7 +156,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
         "token_client",
         lambda *_: httpx.AsyncClient(transport=httpx.ASGITransport(app=auth.app())),
     )
-    with running(tmp_path, onboard=onboarding_service(hosts)) as rig:
+    with running(tmp_path, policy=policy, onboard=onboarding_service(hosts)) as rig:
         provider = asgi_client(auth.app(), ISSUER)
         browser = Browser(address=loopback, remote={ISSUER: provider})
         rig.browsers.append(browser)
@@ -155,6 +167,25 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
             yield World(rig, auth, hosts, page, passkey, browser, provider)
         finally:
             provider.close()
+
+
+@pytest.fixture
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    with a_world(tmp_path, monkeypatch) as found:
+        yield found
+
+
+# A managed deployment (M6 design J14h): its seed holds agent1, given no server yet (OPS-3).
+MANAGED = {
+    "mode": "managed",
+    "gateway": {"clients": {"agent1": {"token_sha256": "sha256:" + "1" * 64, "servers": []}}},
+}
+
+
+@pytest.fixture
+def managed_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    with a_world(tmp_path, monkeypatch, MANAGED) as found:
+        yield found
 
 
 def discovered(world: World, page: Page | None = None, **body: Any) -> dict[str, Any]:
@@ -401,6 +432,191 @@ def test_j3_a_given_public_clients_fragment_needs_no_action(world: World) -> Non
     )
     assert world.store.names() == []
     assert world.servers()[0]["state"] == "needs_commit"
+
+
+# --- J14: onboarding in managed mode (M6 design G.9, G.3; step 15c) -----------------------------
+
+SAVE = {"do": "save", "label": "Save the server's credential, route and server"}
+GIVE = (
+    "Then give notes to each client that should reach it: Give to clients, on the MCP servers page"
+)
+
+
+def revision_of(world: World) -> int:
+    managed = world.rig.vault.managed
+    assert managed is not None
+    return managed.revision
+
+
+def confirmed(world: World, held: dict[str, Any]) -> dict[str, Any]:
+    """A prepared action confirmed with the passkey, as the dialog does."""
+    assertion = world.passkey.get(held["options"], world.page.origin).body()
+    done = world.page.fetch(
+        "POST", f"/api/actions/{held['action']}/confirm", json={"credential": assertion}
+    )
+    assert done.status_code == 200, done.text
+    answer: dict[str, Any] = done.json()
+    return answer
+
+
+def test_j14_five_prompts_each_for_one_thing(managed_world: World) -> None:
+    """J14h's portal walk, prompt for prompt (G.9, G.3): register, Save, Connect, the review's
+    Save and Give to clients, each its own passkey prompt and kind; each answer's way on."""
+    world = managed_world
+    rig = world.rig
+    plan = discovered(world, url=SERVER_URL)
+    assert plan["next"] == [{"do": "register", "label": "Register its client"}]
+    onboarding = plan["onboarding"]
+    # 1. Register: the client is registered and its ID stored; no fragment, the save next.
+    made = step_up(world.page, world.passkey, "onboard.register", {"onboarding": onboarding})
+    assert made.status_code == 200, made.text
+    registered = made.json()
+    assert "diff" not in registered
+    connect = {
+        "do": "connect",
+        "label": "Then connect, and review its tools",
+        "command": "zoeymcp login notes",
+        "via": "exec",
+    }
+    assert registered["next"] == [SAVE, connect]
+    [row] = world.servers()
+    assert (row["onboarding"], row["state"], row["next"]) == (
+        onboarding,
+        "needs_save",
+        [SAVE, connect],
+    )
+    assert revision_of(world) == 1
+    # 2. Save: fragment 1's change as this session's draft, planned on the head.
+    asked = world.page.fetch("POST", f"/api/onboard/{onboarding}/fragment", json={})
+    assert asked.status_code == 200, asked.text
+    draft = asked.json()
+    assert set(draft) == {"draft", "base", "kind", "summary"}
+    assert (draft["kind"], draft["base"]) == ("policy.save", 1)
+    assert draft["summary"][0][1].startswith("2, from 1 (by the seed, ")
+    assert draft["summary"][1:] == [
+        ["credentials.notes", "added (wider)"],
+        ["routes.notes", "added (wider)"],
+        ["gateway.servers.notes", "added (wider)"],
+        ["No restart needed", ""],
+    ]
+    held = prepared_action(world.page, "policy.save", {"draft": draft["draft"], "base": 1})
+    assert held["summary"] == draft["summary"]
+    saved = confirmed(world, held)
+    wait = {"do": "wait_gateway", "label": "The gateway takes the new view within seconds"}
+    assert (saved["revision"], saved["next"]) == (2, [wait])
+    assert revision_of(world) == 2
+    [row] = world.servers()
+    assert (row["server"], row["state"]) == ("notes", "needs_connect")
+    assert status_reason(world.page.fetch("GET", f"/api/onboard/{onboarding}")) == (
+        404,
+        "onboarding_unknown",
+    )
+    # 3. Connect, through the portal's callback with the registered client.
+    _, connected = connect_by_callback(world.page, world.passkey, "notes")
+    assert connected.status_code == 200, connected.text
+    [row] = world.servers()
+    assert row["state"] == "needs_review"
+    # 4. The review, and its Save.
+    poller(rig)
+    queued = world.page.fetch("POST", "/api/review/notes", json={"fresh": True})
+    assert queued.status_code == 200, queued.text
+    gateway_answers(rig, report_of([LIST, GET, WRITE], []))
+    job = queued.json()["job"]
+    read = world.page.fetch("GET", f"/api/review/jobs/{job}").json()
+    assert read["state"] == "done", read
+    choices = {
+        "include": ["list", "get", "write"],
+        "allow": ["list", "get"],
+        "approve": ["write"],
+        "decline_rest": True,
+    }
+    asked = world.page.fetch("POST", f"/api/review/jobs/{job}/diff", json=choices)
+    assert asked.status_code == 200, asked.text
+    draft = asked.json()
+    assert (draft["kind"], draft["base"]) == ("policy.save", 2)
+    weakenings = [value for _, value in draft["summary"] if value.endswith("with no prompt")]
+    assert weakenings == ["get will run with no prompt", "list will run with no prompt"]
+    held = prepared_action(world.page, draft["kind"], {"draft": draft["draft"], "base": 2})
+    saved = confirmed(world, held)
+    # A review saved for a server no client reaches: give it to them (J14 step 5).
+    assert (saved["revision"], saved["next"]) == (
+        3,
+        [wait, {"do": "assign_clients", "label": GIVE}],
+    )
+    assert revision_of(world) == 3
+    [row] = world.servers()
+    assert (row["state"], row["clients_shown"]) == ("reviewed", [])
+    # 5. Give to clients: agent1 gains notes.
+    listed = world.page.fetch("GET", "/api/servers").json()
+    assert listed["clients"] == [{"name": "agent1", "name_shown": "agent1", "servers": []}]
+    assert listed["revision"] == 3  # the save's base: the revision the boxes are drawn at
+    data = {"base": listed["revision"], "client": "agent1", "servers": ["notes"]}
+    held = prepared_action(world.page, "client.servers", data)
+    assert held["summary"][1:] == [
+        [
+            "gateway.clients.agent1.servers",
+            "agents holding client agent1's token can call notes's 3 included tools",
+        ],
+        ["No restart needed", ""],
+    ]
+    given = confirmed(world, held)
+    assert (given["revision"], given["next"]) == (4, [wait])
+    [row] = world.servers()
+    assert (row["state"], row["clients_shown"]) == ("reviewed", ["agent1"])
+    listed = world.page.fetch("GET", "/api/servers").json()
+    assert listed["clients"][0]["servers"] == ["notes"]
+    # Five prompts, each for a different thing, and three revisions saved from the portal.
+    actions = [line["action"] for line in rig.lines("step_up_confirmed")]
+    assert actions == [
+        "onboard.register",
+        "policy.save",
+        "oauth.complete",
+        "policy.save",
+        "client.servers",
+    ]
+    saves = [(line["revision"], line["write_kind"]) for line in rig.lines("policy_saved")]
+    assert saves == [(2, "policy.save"), (3, "policy.save"), (4, "client.servers")]
+    assert [line["why"] for line in rig.lines("onboard_ended")] == ["registered"]
+
+
+def test_a_given_public_clients_save_is_its_one_step(managed_world: World) -> None:
+    """G.9: a given public client's onboarding sends and stores nothing, so in managed mode its
+    one step is the save, from the plan on: its draft registers the onboarding with nothing sent
+    or stored, and the row's Save writes it. A secret's client still registers first: its
+    fragment route is refused, as in declarative mode."""
+    world = managed_world
+    plan = discovered(world, url=SERVER_URL, client_id=CLIENT_ID)
+    assert plan["next"] == [SAVE]
+    [row] = world.servers()
+    assert (row["state"], row["next"]) == ("needs_register", [SAVE])
+    sent = len(world.hosts.sent)
+    asked = world.page.fetch("POST", f"/api/onboard/{plan['onboarding']}/fragment", json={})
+    assert asked.status_code == 200, asked.text
+    draft = asked.json()
+    assert (draft["kind"], draft["base"]) == ("policy.save", 1)
+    assert world.hosts.sent[sent:] == []
+    assert world.store.names() == []
+    [row] = world.servers()
+    assert row["state"] == "needs_save"
+    held = prepared_action(world.page, "policy.save", {"draft": draft["draft"], "base": 1})
+    assert confirmed(world, held)["revision"] == 2
+    [row] = world.servers()
+    assert (row["server"], row["state"]) == ("notes", "needs_connect")
+    # The saved draft is dropped, as a review's is.
+    assert len(world.rig.app.drafts) == 0
+    secret = discovered(
+        world,
+        url=SERVER_URL.replace("notes", "other"),
+        client_id=CLIENT_ID,
+        issuer=ISSUER,
+        client_auth="basic",
+        credential="other",
+        route="other",
+        server="other",
+    )
+    assert secret["next"] == [{"do": "register", "label": "Store the secret"}]
+    alone = world.page.fetch("POST", f"/api/onboard/{secret['onboarding']}/fragment", json={})
+    assert status_reason(alone) == (400, "bad_body")
 
 
 # --- owners (D.8, X24) ---------------------------------------------------------------------------

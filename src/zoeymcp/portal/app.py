@@ -112,6 +112,18 @@ planner refuses a target that brings back what the ratchet retired (``rollback_r
 wider change (``portal_widens``), and a target in quarantine or pruned is
 ``revision_unreadable`` or ``revision_unknown``, in the dialog at the confirm.
 
+Giving servers to clients, a connector's limits and onboarding, in managed mode (M6 design G.3,
+G.8, G.9, J14): **Give to clients** is the ``client.servers`` action, ``{base, client, servers}``,
+one existing client's servers whole (the servers answer lists every client with the servers it
+reaches); a connector's **Pause**, **Resume** and limits on the Policy page are
+``connector.limits``, ``{base, connector}`` and the fields it changes, never its bound
+constraints. Both are planned and written as a save is: the planner takes a change to a second
+client, or anything else, as ``kind_mismatch``. A registered onboarding's row is ``needs_save``:
+the fragment route answers the draft of fragment 1's change instead of the fragment, and its
+**Save** is ``policy.save``, so onboarding a server takes five passkey prompts, each for one
+thing (register, save, connect, the review's save, Give to clients); a review saved for a server
+no client reaches says to give it to them.
+
 The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
 a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
 origin. A start for one sets the flow's binding cookie (``SameSite=Lax``, its ``Path`` the
@@ -161,7 +173,15 @@ from ..common import netguard
 from ..common.canonical import digest
 from ..common.policy import attention
 from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
-from ..common.policy.change import MoveToAllow, PolicyChange, apply, from_portal
+from ..common.policy.change import (
+    CONNECTOR_LIMITS,
+    MoveToAllow,
+    PolicyChange,
+    SetClientServers,
+    SetConnectorLimits,
+    apply,
+    from_portal,
+)
 from ..common.policy.fields import URL_MAX
 from ..common.policy.plan import Reason as PlanReason
 from ..common.policy.plan import WriteKind, WritePlan, carry_forward
@@ -188,12 +208,14 @@ from ..vault.onboard import OnboardError, check_request
 from ..vault.onboarding import (
     Listed,
     job_next,
+    listed_clients,
     listed_next,
     listed_server,
     listed_servers,
     managed_next,
     refusal_next,
     review_again,
+    reviewed_next,
     server_host_port,
     tools_max,
 )
@@ -237,6 +259,7 @@ from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
 from .policyview import Source, saved
 from .policyview import view as policy_view
 from .refusals import (
+    CONNECTOR_MOVED,
     ROLLBACK_MOVED,
     SAVE_MOVED,
     Refusal,
@@ -306,6 +329,16 @@ MANAGED_KINDS: Final[tuple[WriteKind, ...]] = ("policy.save", "tool.repin", "too
 # A rollback from the Policy page (M6 design H.3, M.3), planned and run the same way: the target
 # revision's policy carried forward on the head (H.4), never wider than the head (G.5 rule 2).
 ROLLBACK: Final[WriteKind] = "policy.rollback"
+# Give to clients and a connector's limits (M6 design G.3, M.3; step 15c): one op each, from the
+# MCP servers page and the Policy page, planned and run as a save is; each change's title.
+OWN_OPS: Final[tuple[WriteKind, ...]] = ("client.servers", "connector.limits")
+GIVE_TITLE: Final = "the servers client {name} reaches"
+LIMITS_TITLE: Final = "the limits of connector {name}"
+# A head that moved, in the words of the page the save came from (N.2, OPS-18): Save, Roll back,
+# or a connector's own button.
+MOVED_WORDS: Final[Mapping[str, str]] = MappingProxyType(
+    {ROLLBACK: ROLLBACK_MOVED, "connector.limits": CONNECTOR_MOVED}
+)
 # The history page's query (H.1, M.2): each at most once, both optional; a diff's (H.2).
 HISTORY_QUERY: Final = frozenset({"before", "limit"})
 DIFF_QUERY: Final = frozenset({"against"})
@@ -434,9 +467,16 @@ CLIENT_LIMIT: Final = 512
 # may give.
 SECRET_AUTHS: Final = frozenset({"basic", "post"})
 NAME_KEYS: Final = ("credential", "route", "server")
-# An onboarding's row state by its stage (K.1); a server's comes from onboarding.Listed.
-ROW_STATES: Final[Mapping[str, str]] = MappingProxyType(
-    {"discovered": "needs_register", "registered": "needs_commit"}
+# An onboarding's row state by the mode and its stage (K.1); a server's comes from
+# onboarding.Listed. In managed mode fragment 1 is a save, so a registered one needs it (M6 design
+# G.9, CR-18).
+ROW_STATES: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
+    {
+        "declarative": MappingProxyType(
+            {"discovered": "needs_register", "registered": "needs_commit"}
+        ),
+        "managed": MappingProxyType({"discovered": "needs_register", "registered": "needs_save"}),
+    }
 )
 # A ``needs_commit`` row's primary step (K.1): fragment 1 again, at any indent (OPS-2), ahead of
 # the steps that apply it.
@@ -1385,11 +1425,11 @@ class PortalApp:
             ),
             "onboard.register": ActionKind(self._plan_register, self._run_register),
             "tool.clear": ActionKind(self._plan_clear, self._run_clear),
-            # M6 G.3, H.3, M.3: managed saves and rollbacks, through the managed policy's write
-            # path (G.6).
+            # M6 G.3, H.3, M.3: managed saves, rollbacks, Give to clients and a connector's
+            # limits, through the managed policy's write path (G.6).
             **{
                 name: ActionKind(self._plan_write(name), self._run_write(name))
-                for name in (*MANAGED_KINDS, ROLLBACK)
+                for name in (*MANAGED_KINDS, ROLLBACK, *OWN_OPS)
             },
         }
 
@@ -1815,13 +1855,14 @@ class PortalApp:
         (``portal/policyview.py``). The portal can't change it: it is declarative (P9); in
         managed mode the view names the revision it shows (M6 design A.4, G.10), and beside it
         the head's revision, which one the gateway runs (``applied``, ``pending`` or
-        ``unknown``, K.1), a revision saved and not running, and the host's export command
-        (M.1)."""
+        ``unknown``, K.1), a revision saved and not running, the host's export command and each
+        connector's limits for its row (M.1, :func:`connectors_view`)."""
         header = None if self.policy_header is None else self.policy_header()
         answer = policy_view(self._policy(), self.source, header=header)
         if self.managed is not None:
             export = replace(managed_next()[1], label=EXPORT_LABEL)
             answer |= policy_status(self.managed) | {"export": export.answer()}
+            answer["connectors"] = connectors_view(self._policy())
         return Reply(answer)
 
     async def _revisions(self, call: Call) -> Reply | Refusal:
@@ -1960,16 +2001,28 @@ class PortalApp:
     async def _servers(self, call: Call) -> Reply | Refusal:
         """K.1's rows: this session's onboarding first, while it lasts, then every server a
         review can be queued for, each with its state and what to do next (M.7), the first of
-        which is the row's button."""
+        which is the row's button. In managed mode, every client too, with the servers it
+        reaches, for **Give to clients** (M6 design G.3, J14): its name, never its token; and the
+        head's revision they were read at, which that save is planned on, so a head that moved
+        since is ``policy_moved`` (G.10)."""
         policy = self._policy()
         own = self._onboard_service().owned(_session(call).owner)
-        found = [] if own is None else [_onboarding_row(own)]
+        found = [] if own is None else [_onboarding_row(own, self.mode)]
         names = self._secret_store().store.names()
         found += [
             _server_row(listed, self._allow_pins(policy, listed))
             for listed in listed_servers(policy, names)
         ]
-        return Reply({"servers": found})
+        answer: dict[str, Any] = {"servers": found}
+        if self.managed is not None:  # for Give to clients (M6 design G.3, J14)
+            # The revision first: a write between the two reads leaves clients newer than it,
+            # which the save meets as policy_moved, never older clients on a newer base.
+            answer["revision"] = self.managed.revision
+            answer["clients"] = [
+                {"name": name, "name_shown": shown(name, NAME_LIMIT), "servers": list(servers)}
+                for name, servers in listed_clients(self.managed.policy)
+            ]
+        return Reply(answer)
 
     async def _onboard_discover(self, call: Call) -> Reply | Refusal:
         """Add by URL (K.1 item 2): discovery's plan, nothing sent but its GETs and the probe,
@@ -1998,11 +2051,15 @@ class PortalApp:
     async def _onboard_fragment(self, call: Call) -> Reply | Refusal:
         """Fragment 1 for a given public client, with nothing sent or stored, or a registered
         onboarding's again at any indent (OPS-2): the ``needs_commit`` row's "Show fragment 1".
-        It writes nothing, so it needs no step-up."""
+        It writes nothing, so it needs no step-up. In managed mode the answer is the save's draft
+        instead (:meth:`_onboard_draft`): the ``needs_save`` row's **Save**."""
+        onboarding, owner = call.params["onboarding"], _session(call).owner
+        service = self._onboard_service()
         try:
-            answer = await self._onboard_service().fragment(
-                call.params["onboarding"], dict(_body(call)), owner=_session(call).owner
-            )
+            answer = await service.fragment(onboarding, dict(_body(call)), owner=owner)
+            if self.managed is not None:
+                change = service.registered_change(onboarding, owner=owner)
+                return self._onboard_draft(call, onboarding, change)
         except OnboardError as exc:
             return exc.answer
         return Reply(_onboard_view(answer))
@@ -2066,7 +2123,8 @@ class PortalApp:
     async def _run_register(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
         """D.4's registration or D.7's write, then fragment 1 (E.2). The secret, from the held
         data, goes to the store and nowhere else; a registered client's comes from its
-        authorization server."""
+        authorization server. In managed mode the answer holds no fragment: its ``next`` is the
+        save (M6 design G.9, Y25)."""
         body = {} if data.get("client_secret") is None else {"client_secret": data["client_secret"]}
         try:
             answer = await self._onboard_service().register(
@@ -2074,7 +2132,10 @@ class PortalApp:
             )
         except OnboardError as exc:
             return exc.answer
-        return Reply(_onboard_view(answer))
+        view = _onboard_view(answer)
+        if self.managed is not None:  # fragment 1 is a save: Save's draft shows its plan (G.9)
+            view.pop("diff", None)
+        return Reply(view)
 
     async def _review_queue(self, call: Call) -> Reply | Refusal:
         """K.1 item 4: queue a review of a served server for the gateway's poll (F.2), or hand
@@ -2208,6 +2269,31 @@ class PortalApp:
         )
         return Reply(drafts_.answer(draft, _summary(self._plan_of(planned, session))))
 
+    def _onboard_draft(self, call: Call, onboarding: str, change: PolicyChange) -> Reply | Refusal:
+        """Fragment 1 as a save (G.4, G.9; D-147's obligation): the onboarding's change planned
+        on the head as the planner requires it (``policy.save``), held as this session's draft,
+        answered as a review save's is. The planner holds the portal's bounds on it (G.3): a
+        route only the gateway calls, with the credential the same change adds, and no ``env:``
+        reference. Its **Save** is the registration's second passkey prompt."""
+        managed = self._managed()
+        session = _session(call)
+        save, planned = self._as_required(
+            _Save("policy.save", managed.revision, change, self._evidence(Facts()))
+        )
+        if isinstance(planned, WriteRefused):
+            return _unrowed(self._write_refused(planned, None))
+        draft = self.drafts.hold(
+            session=session.id,
+            base=save.base,
+            change=change,
+            job=onboarding,
+            report_digest=digest(change.data()),
+            kind=save.kind,
+            facts=Facts(),
+            now=self._wall(),
+        )
+        return Reply(drafts_.answer(draft, _summary(self._plan_of(planned, session))))
+
     def _plan_write(self, kind: WriteKind) -> Callable[[Mapping[str, Any], Step], Plan | Refusal]:
         """A managed kind's plan (M.3): its data read (:meth:`_save_of`), then planned on the
         head as the write will plan it, nothing written."""
@@ -2260,7 +2346,12 @@ class PortalApp:
                 return refused if confirmed is None else _refused_at_confirm(confirmed, refused)
             if save.draft is not None:
                 self.drafts.drop(save.draft.id, session=step.session.id)
-            return Reply(written_answer(written))
+            answer = written_answer(written)
+            if save.draft is not None and save.server is not None and self._unassigned(save.server):
+                # A review saved for a server no client reaches: give it to them (J14 step 5).
+                steps = reviewed_next(save.server, self._onboard_service().source, managed=True)
+                answer["next"] += [step.answer() for step in steps]
+            return Reply(answer)
 
         return run
 
@@ -2268,8 +2359,9 @@ class PortalApp:
         """A managed kind's data as a save (M.3): ``{draft, base}``, this session's live draft
         planned on that base; or for ``tool.allow`` from a server's page ``{base, server,
         kind, name, pin}``, the move with the definition the vault holds for it (J.4); or for
-        ``policy.rollback`` ``{base, revision}``, the target (:meth:`_rollback`).
-        ``policy_not_managed`` in declarative mode."""
+        ``policy.rollback`` ``{base, revision}``, the target (:meth:`_rollback`); or Give to
+        clients and a connector's limits (:meth:`_own_op`). ``policy_not_managed`` in
+        declarative mode."""
         if self.managed is None:
             return refusal("policy_not_managed")
         base = data["base"]
@@ -2277,6 +2369,8 @@ class PortalApp:
             return refusal("bad_body")
         if kind == ROLLBACK:
             return self._rollback(base, data["revision"])
+        if kind in OWN_OPS:
+            return self._own_op(kind, base, data)
         if kind == "tool.allow":
             given = frozenset(data) - {"base"}
             if given not in ALLOW_FORMS:
@@ -2342,6 +2436,44 @@ class PortalApp:
             return replace(read, more=(("rows", rows),))
         evidence = Evidence(target=read[1], target_revision=number)
         return _Save(ROLLBACK, base, None, evidence)
+
+    def _own_op(self, kind: WriteKind, base: int, data: Mapping[str, Any]) -> _Save | Refusal:
+        """**Give to clients** (``client.servers``, J14 step 5): ``{base, client, servers}``, one
+        existing client's servers whole; or a connector's row on the Policy page
+        (``connector.limits``): ``{base, connector}`` and the fields it changes, each as the
+        schema checks it (G.3, F-15). M.3's checks besides the planner's: one that changes
+        nothing on the head is ``no_change`` (the planner would name the empty diff's kind,
+        ``policy.save``); a client, server or connector the head doesn't have is
+        ``save_invalid``. The planner holds the rest (G.5): one client or connector, and
+        nothing else."""
+        policy = self._managed().policy
+        try:
+            if kind == "client.servers":
+                servers = data["servers"]
+                if not isinstance(servers, list):
+                    return refusal("bad_body")
+                given = SetClientServers(data["client"], tuple(servers))
+                change = PolicyChange(GIVE_TITLE.format(name=given.client), (given,))
+                held = dict(listed_clients(policy)).get(given.client)
+                same = held is not None and set(held) == set(given.servers)
+            else:
+                fields = {name: data[name] for name in CONNECTOR_LIMITS if name in data}
+                limits = SetConnectorLimits(data["connector"], **fields)
+                change = PolicyChange(LIMITS_TITLE.format(name=limits.name), (limits,))
+                connector = policy.connectors.get(limits.name)
+                same = connector is not None and all(
+                    getattr(connector, name) == value for name, value in limits.limits().items()
+                )
+        except (TypeError, ValueError):  # a name, a list or a limit the schema refuses
+            return refusal("bad_body")
+        if same and base == self._managed().revision:
+            return refusal("no_change")
+        return _Save(kind, base, change, self._evidence(Facts()))
+
+    def _unassigned(self, server: str) -> bool:
+        """Whether the head gives ``server`` to no client (J14 step 5)."""
+        found = listed_server(self._managed().policy, server)
+        return found is not None and not found.clients
 
     def _held(self, server: str) -> list[dict[str, dict[str, Any]]]:
         """The tools each review the vault holds for ``server`` lists, newest first (J.4)."""
@@ -2409,16 +2541,15 @@ class PortalApp:
         """A managed save's refusal in the portal's words (N.2), with ``rows`` for a confirm's
         dialog when it is one the dialog shows (G.7, CR-3, :data:`IN_THE_DIALOG`): a head that
         moved is the revision row ("press Save again", OPS-18, or for a rollback "press Roll back
-        again"), then the plan the same save (``again``) makes on the new head; any other names
-        its reason and the paths or tools it is about. A refusal whose way on is the host's
-        (``portal_widens``, ``summary_too_large``) carries the export and the import; a move
-        with no reviewed definition, a fresh review of its server."""
+        again", :data:`MOVED_WORDS`), then the plan the same save (``again``) makes on the new
+        head; any other names its reason and the paths or tools it is about. A refusal whose way
+        on is the host's (``portal_widens``, ``summary_too_large``) carries the export and the
+        import; a move with no reviewed definition, a fresh review of its server."""
         if refused.reason == "policy_moved":
             header = self._managed().store.header
             number = refused.revision or 0
             said = f"revision {number}" if header is None else saved(header)
-            rollback = again is not None and again[0].kind == ROLLBACK
-            words = ROLLBACK_MOVED if rollback else SAVE_MOVED
+            words = SAVE_MOVED if again is None else MOVED_WORDS.get(again[0].kind, SAVE_MOVED)
             moved = save_moved(said=said, revision=number, words=words)
             rows = [["Revision", moved.error]]
             if again is not None and number:
@@ -3369,21 +3500,22 @@ def _refusal_shown(refused: Refusal) -> Refusal:
     return replace(refused, more=tuple(more.items()))
 
 
-def _onboarding_row(answer: Mapping[str, Any]) -> dict[str, Any]:
+def _onboarding_row(answer: Mapping[str, Any], mode: str = "declarative") -> dict[str, Any]:
     """This session's onboarding as a row (K.1): ``needs_register`` with its plan,
     ``needs_commit`` once fragment 1 is issued, or ``blocked`` (D.11), with what to do next:
-    for ``needs_commit``, "Show fragment 1" first, then how to apply it."""
+    for ``needs_commit``, "Show fragment 1" first, then how to apply it. In managed ``mode``
+    (M6 design G.9) a registered one is ``needs_save``, its first step the save."""
     stage = answer["stage"]
     url = answer["plan"]["server_url"] if "plan" in answer else answer["server_url"]
     names = answer["names"]
     steps = answer["next"]
-    if stage == "registered":
+    if stage == "registered" and mode == "declarative":
         steps = [dict(SHOW_FRAGMENT), *steps]
     return {
         "onboarding": answer["onboarding"],
         "name_shown": shown(names["server"], NAME_LIMIT),
         "kind": "remote",
-        "state": ROW_STATES.get(stage, stage),
+        "state": ROW_STATES[mode].get(stage, stage),
         "server_url": url,
         "expires": answer["expires"],
         "next": steps,
@@ -3418,6 +3550,21 @@ def _server_row(
         ],
         "next": [step.answer() for step in listed_next(listed)],
     }
+
+
+def connectors_view(policy: Policy) -> list[dict[str, Any]]:
+    """Each connector's row on the managed Policy page (M6 design M.1, G.3): its name, shown,
+    and the fields a portal save may change, whether it is paused and its three limits; never
+    its host, port, sender, recipients, username or password, which its secret's binding names
+    and only a host import changes (F-15, COV-1)."""
+    return [
+        {
+            "name": name,
+            "name_shown": shown(name, NAME_LIMIT),
+            **{field_name: getattr(connector, field_name) for field_name in CONNECTOR_LIMITS},
+        }
+        for name, connector in sorted(policy.connectors.items())
+    ]
 
 
 def _job_view(job: Job, mode: str = "declarative") -> dict[str, Any]:

@@ -388,8 +388,9 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("passkey.rename", {"name": "x"}) == (400, "bad_body")
     # Every registered kind is built (ledger.restart was M5's last; M7's step 14a built
     # onboard.register and onboard.discover_private; M6's step 9, tool.clear; step 15a,
-    # policy.save, tool.repin and tool.allow; step 15b, policy.rollback), so none answers
-    # bad_body for being a later step's. A managed save or rollback in this declarative rig is
+    # policy.save, tool.repin and tool.allow; step 15b, policy.rollback; step 15c,
+    # client.servers and connector.limits), so none answers bad_body for being a later step's.
+    # A managed save, rollback, Give to clients or connector's limits in this declarative rig is
     # policy_not_managed (M.3).
     assert rig.app.action_kinds == set(KINDS)
     assert refused("ledger.restart", {"x": 1}) == (400, "bad_body")
@@ -400,6 +401,15 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("tool.allow", {"base": 1, "draft": "x"}) == (409, "policy_not_managed")
     assert refused("policy.rollback", {"base": 1}) == (400, "bad_body")
     assert refused("policy.rollback", {"base": 2, "revision": 1}) == (409, "policy_not_managed")
+    assert refused("client.servers", {"base": 1, "client": "agent"}) == (400, "bad_body")
+    give = {"base": 1, "client": "agent", "servers": ["notes"]}
+    assert refused("client.servers", give) == (409, "policy_not_managed")
+    assert refused("connector.limits", {"base": 1, "connector": "mail", "to": []}) == (
+        400,
+        "bad_body",
+    )
+    paused = {"base": 1, "connector": "mail", "paused": True}
+    assert refused("connector.limits", paused) == (409, "policy_not_managed")
     assert refused("tool.clear", {}) == (400, "bad_body")
     assert refused("tool.clear", {"server": "notes", "kind": "tool"}) == (400, "bad_body")
     assert refused("tool.clear", {"server": ["notes"]}) == (400, "bad_body")

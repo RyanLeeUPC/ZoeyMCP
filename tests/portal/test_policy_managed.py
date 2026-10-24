@@ -26,6 +26,14 @@ the dialog at the confirm, while one whose parent is in quarantine is still a ta
 moved is worded for the Policy page; and a 400-row plan is confirmed whole, a 401st row refused
 (Y9). The
 host's revisions they start from are written as the admin socket writes an import.
+
+Give to clients and a connector's limits (step 15c; G.3, G.5, M.3): ``client.servers`` adding a
+server to a client is a weakening row ("agents holding client <c>'s token can call ..."), taking
+one away a narrowing, and a change to a second client in the same save is ``kind_mismatch``
+(Y7); a connector's Pause is narrower, Resume and a raised limit are weakening rows, a value the
+schema refuses, a bound constraint or nothing changed is refused before any prompt, and a head
+that moved is worded for the connector's row (N.2). The Policy page lists each connector's
+limits and nothing of its binding.
 """
 
 from __future__ import annotations
@@ -69,6 +77,7 @@ from zoeymcp.vault.managed import (
     import_shaped,
     read_revision,
 )
+from zoeymcp.vault.onboarding import GIVE_LABEL
 from zoeymcp.vault.policystart import revision_file
 from zoeymcp.vault.statusreport import Report, ServerStatus
 
@@ -398,8 +407,10 @@ def test_gateway_down(tmp_path: Path) -> None:
             world, drafted(world, job, include=["list"], approve=["list"], decline_rest=True)
         )
         assert (done["revision"], done["gateway"]) == (2, "pending")
+        # No client reaches notes, so the way on ends with Give to clients (step 15c, J14).
         assert done["next"] == [
-            {"do": "wait_gateway", "label": "The gateway takes the new view within seconds"}
+            {"do": "wait_gateway", "label": "The gateway takes the new view within seconds"},
+            {"do": "assign_clients", "label": GIVE_LABEL.format(server="notes")},
         ]
         assert head(rig)["declined"] == {"get": pin_of(GET)}
         quiet = ServerStatus("remote", ("ready",), "modern", 1, 1)
@@ -1338,6 +1349,217 @@ def test_a_400_row_plan_is_confirmed_whole(tmp_path: Path) -> None:
         assert summary[-1][0] == "No restart needed"
         done = confirmed(world, held.json())
         assert done.status_code == 200, done.text
+        assert revision(rig) == 4
+
+
+# --- G.3: Give to clients and a connector's limits (step 15c) -----------------------------------
+
+MAIL = {
+    "kind": "smtp",
+    "host": "smtp.mail.example",
+    "port": 465,
+    "username": "mail-account-user",
+    "password": "store:mail-pass",
+    "from": "zoeymcp@mail.example",
+    "to": ["ops@mail.example"],
+}
+
+
+def two_clients(**server: Any) -> dict[str, Any]:
+    """``guarded``'s deployment with a second client, given no server, and an SMTP connector."""
+    policy = guarded(**server)
+    policy["gateway"]["clients"]["other"] = {"token_sha256": "sha256:" + "2" * 64, "servers": []}
+    policy["connectors"] = {"mail": MAIL}
+    return policy
+
+
+def clients(rig: PortalRig) -> dict[str, list[str]]:
+    managed_ = rig.vault.managed
+    assert managed_ is not None
+    gateway = managed_.policy.gateway
+    assert gateway is not None
+    return {name: list(client.servers) for name, client in gateway.clients.items()}
+
+
+def mail(rig: PortalRig) -> dict[str, Any]:
+    managed_ = rig.vault.managed
+    assert managed_ is not None
+    found: dict[str, Any] = managed_.policy.connectors["mail"].model_dump(mode="json")
+    return found
+
+
+def test_give_to_clients(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """G.3, G.7 row 2, J14 step 5: giving notes to ``other`` is ``client.servers`` whose first
+    row after the revision is its weakening sentence, written with one passkey and logged with
+    its kind; taking it from ``agent`` is a narrowing; servers sent unchanged are ``no_change``;
+    a client or server the head doesn't have is ``save_invalid``, a list that isn't one
+    ``bad_body``; and a candidate that also changes a second client's servers is
+    ``kind_mismatch`` (Y7, one client per save). Nothing is written by a refusal."""
+    with world_of(tmp_path, two_clients(**entry([LIST]))) as world:
+        rig = world.rig
+        give = {"base": 1, "client": "other", "servers": ["notes"]}
+        held = prepared(world, "client.servers", give)
+        assert held["summary"][1:] == [
+            [
+                "gateway.clients.other.servers",
+                "agents holding client other's token can call notes's 1 included tools",
+            ],
+            ["No restart needed", ""],
+        ]
+        done = confirmed(world, held)
+        assert done.status_code == 200, done.text
+        assert done.json()["revision"] == 2
+        assert clients(rig) == {"agent": ["notes"], "other": ["notes"]}
+        [line] = rig.lines("policy_saved")
+        assert (line["write_kind"], line["revision"]) == ("client.servers", 2)
+        take = {"base": 2, "client": "agent", "servers": []}
+        held = prepared(world, "client.servers", take)
+        assert held["summary"][1] == ["gateway.clients.agent.servers", "notes removed"]
+        assert not any(value.endswith("(wider)") for _, value in held["summary"])
+        assert confirmed(world, held).json()["revision"] == 3
+        assert clients(rig) == {"agent": [], "other": ["notes"]}
+        before = state_files(rig)
+        cases = [
+            ({"base": 3, "client": "other", "servers": ["notes"]}, (400, "no_change")),
+            ({"base": 3, "client": "nobody", "servers": []}, (422, "save_invalid")),
+            ({"base": 3, "client": "other", "servers": ["absent"]}, (422, "save_invalid")),
+            ({"base": 3, "client": "other", "servers": "notes"}, (400, "bad_body")),
+            ({"base": 3, "client": "other", "servers": ["notes", "notes"]}, (400, "bad_body")),
+            ({"base": 3, "client": "Other!", "servers": []}, (400, "bad_body")),
+            ({"base": 0, "client": "other", "servers": []}, (400, "bad_body")),
+        ]
+        for data, refused in cases:
+            answer = world.page.fetch(
+                "POST", "/api/actions", json={"kind": "client.servers", "data": data}
+            )
+            assert status_reason(answer) == refused, (data, answer.text)
+        # One client per save: a candidate that gives notes to agent too isn't client.servers.
+
+        def second(data: dict[str, Any]) -> None:
+            data["gateway"]["clients"]["agent"]["servers"] = ["notes"]
+
+        monkeypatch.setattr(portal_app, "_candidate", widening(second))
+        both = world.page.fetch(
+            "POST",
+            "/api/actions",
+            json={"kind": "client.servers", "data": {"base": 3, "client": "other", "servers": []}},
+        )
+        assert status_reason(both) == (400, "kind_mismatch")
+        assert both.json()["error"].startswith("This change is policy.save, not client.servers")
+        assert len(rig.app.actions) == 0
+        assert state_files(rig) == before
+        assert revision(rig) == 3
+
+
+def test_give_to_clients_plans_on_the_revision_it_drew(tmp_path: Path) -> None:
+    """G.10, J14 step 5: the MCP servers answer names the revision it read the clients at, and
+    Give to clients plans on it. A host import that gives ``other`` a server after the boxes were
+    drawn makes the page's save, which sends ``other``'s servers whole, ``policy_moved`` worded
+    for Save, so the import's server is never quietly taken away; nothing is written."""
+    with world_of(tmp_path, two_clients(**entry([LIST]))) as world:
+        rig = world.rig
+        drawn = world.page.fetch("GET", "/api/servers").json()
+        assert drawn["revision"] == 1
+        reached = {each["name"]: each["servers"] for each in drawn["clients"]}
+        assert reached == {"agent": ["notes"], "other": []}
+
+        def extra(data: dict[str, Any]) -> None:
+            data["gateway"]["servers"]["extra"] = {"kind": "remote", "route": "notes"}
+            data["gateway"]["clients"]["other"]["servers"] = ["extra"]
+
+        assert host_import(rig, extra) == 2
+        before = state_files(rig)
+        give = {"base": drawn["revision"], "client": "other", "servers": ["notes"]}
+        stale = world.page.fetch(
+            "POST", "/api/actions", json={"kind": "client.servers", "data": give}
+        )
+        assert status_reason(stale) == (409, "policy_moved")
+        assert stale.json()["error"].endswith("press Save again to plan it on revision 2.")
+        assert len(rig.app.actions) == 0
+        assert state_files(rig) == before
+        assert clients(rig)["other"] == ["extra"]
+        assert world.page.fetch("GET", "/api/servers").json()["revision"] == 2
+
+
+def test_a_connectors_limits(tmp_path: Path) -> None:
+    """G.3, G.7 row 2, M.1: the Policy page lists the connector's pause and limits, nothing of
+    its binding; Pause is narrower and Resume says "sends can go out again", a raised limit
+    "old -> new: raised", each a revision of kind ``connector.limits``. A value the schema
+    refuses, a bound constraint, an unknown connector or nothing changed is refused before any
+    prompt; a head that moved is worded for the connector's row (N.2). Nothing is written by a
+    refusal."""
+    with world_of(tmp_path, two_clients(**entry([LIST]))) as world:
+        rig = world.rig
+        view = world.page.fetch("GET", "/api/policy").json()
+        assert view["connectors"] == [
+            {
+                "name": "mail",
+                "name_shown": "mail",
+                "paused": False,
+                "max_per_day": 20,
+                "max_subject_chars": 150,
+                "max_body_chars": 2200,
+            }
+        ]
+        for hidden in ("smtp.mail.example", "mail-account-user", "ops@mail.example"):
+            assert hidden not in json.dumps(view["connectors"])
+        held = prepared(world, "connector.limits", {"base": 1, "connector": "mail", "paused": True})
+        assert held["summary"][1:] == [
+            ["connectors.mail.paused", "changed"],
+            ["No restart needed", ""],
+        ]
+        assert confirmed(world, held).json()["revision"] == 2
+        assert mail(rig)["paused"] is True
+        resume = {"base": 2, "connector": "mail", "paused": False}
+        held = prepared(world, "connector.limits", resume)
+        assert held["summary"][1] == ["connectors.mail.paused", "sends can go out again"]
+        assert confirmed(world, held).json()["revision"] == 3
+        raised = {"base": 3, "connector": "mail", "max_per_day": 50, "max_body_chars": 1000}
+        held = prepared(world, "connector.limits", raised)
+        assert held["summary"][1:3] == [
+            ["connectors.mail.max_per_day", "20 -> 50: raised"],
+            ["connectors.mail.max_body_chars", "changed"],
+        ]
+        assert confirmed(world, held).json()["revision"] == 4
+        assert (mail(rig)["paused"], mail(rig)["max_per_day"], mail(rig)["max_body_chars"]) == (
+            False,
+            50,
+            1000,
+        )
+        kinds = [line["write_kind"] for line in rig.lines("policy_saved")]
+        assert kinds == ["connector.limits"] * 3
+        actions = [line["action"] for line in rig.lines("step_up_confirmed")]
+        assert actions == ["connector.limits"] * 3
+        before = state_files(rig)
+        cases = [
+            ({"base": 4, "connector": "mail", "max_per_day": 50}, (400, "no_change")),
+            ({"base": 4, "connector": "post", "paused": True}, (422, "save_invalid")),
+            ({"base": 4, "connector": "mail"}, (400, "bad_body")),
+            ({"base": 4, "connector": "mail", "max_per_day": 0}, (400, "bad_body")),
+            ({"base": 4, "connector": "mail", "max_per_day": "50"}, (400, "bad_body")),
+            ({"base": 4, "connector": "mail", "max_per_day": True}, (400, "bad_body")),
+            ({"base": 4, "connector": "mail", "paused": "yes"}, (400, "bad_body")),
+            ({"base": 4, "connector": "mail", "to": ["x@mail.example"]}, (400, "bad_body")),
+        ]
+        for data, refused in cases:
+            answer = world.page.fetch(
+                "POST", "/api/actions", json={"kind": "connector.limits", "data": data}
+            )
+            assert status_reason(answer) == refused, (data, answer.text)
+        stale = world.page.fetch(
+            "POST",
+            "/api/actions",
+            json={
+                "kind": "connector.limits",
+                "data": {"base": 3, "connector": "mail", "paused": True},
+            },
+        )
+        assert status_reason(stale) == (409, "policy_moved")
+        assert (
+            "press the connector's button again to plan it on revision 4" in stale.json()["error"]
+        )
+        assert len(rig.app.actions) == 0
+        assert state_files(rig) == before
         assert revision(rig) == 4
 
 

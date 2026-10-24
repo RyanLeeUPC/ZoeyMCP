@@ -1,13 +1,13 @@
 """The words each mode shows (M6 design Y25, M.1, M.7; CR-15, OPS-18; step 15a).
 
 In managed mode nothing the operator is shown says to commit, reload, generate or make a
-fragment: every ``next`` list a managed answer carries, the refusal text of every reason a
-managed save meets, and ``index.html``'s static text outside its ``data-mode="declarative"``
-blocks; in declarative mode nothing says to save. ``index.html``'s six mode-bound texts and
-Generate are pairs of blocks, one per mode, which ``drift.js`` shows from the session's mode
-(BP-7); the Policy page's managed half (step 15b) is a block of managed mode's alone, and
-``policy.js``, which draws it, says nothing of declarative mode's. The repository's own files
-are read, so mutmut skips this file (``pytest_add_cli_args``).
+fragment or the YAML: every ``next`` list a managed answer carries, the refusal text of every
+reason a managed save meets, and ``index.html``'s static text outside its
+``data-mode="declarative"`` blocks; in declarative mode nothing says to save. ``index.html``'s
+six mode-bound texts and Generate are pairs of blocks, one per mode, which ``drift.js`` shows
+from the session's mode (BP-7); the Policy page's managed half (step 15b) is a block of managed
+mode's alone, and ``policy.js``, which draws it, says nothing of declarative mode's. The
+repository's own files are read, so mutmut skips this file (``pytest_add_cli_args``).
 """
 
 from __future__ import annotations
@@ -17,16 +17,33 @@ import typing
 from html.parser import HTMLParser
 from pathlib import Path
 
+from tests.unit.test_onboarding import staged
 from tests.unit.test_portal_static import code_of
 from tests.unit.test_portal_static import read as static
 from zoeymcp.common.policy import plan, restart
 from zoeymcp.portal import app as portal_app
-from zoeymcp.portal.refusals import CATALOGUE, ROLLBACK_MOVED, SAVE_MOVED, refusal
+from zoeymcp.portal.refusals import (
+    CATALOGUE,
+    CONNECTOR_MOVED,
+    ROLLBACK_MOVED,
+    SAVE_MOVED,
+    refusal,
+)
 from zoeymcp.vault import managed, onboarding
-from zoeymcp.vault.onboarding import NextStep, job_next, managed_next, saved_next
+from zoeymcp.vault.onboarding import (
+    INLINE_SOURCE,
+    NextStep,
+    Options,
+    job_next,
+    managed_next,
+    next_for,
+    reviewed_next,
+    saved_next,
+)
 
 INDEX = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static" / "index.html"
-MANAGED_WORDS = re.compile(r"commit|fragment|reload|generate", re.IGNORECASE)
+# "The YAML" too (step 15c), but not the host's export file, policy.yaml (H.6).
+MANAGED_WORDS = re.compile(r"commit|fragment|reload|generate|(?<!\.)\byaml\b", re.IGNORECASE)
 DECLARATIVE_WORDS = re.compile(r"\bsav(e|ed|es|ing)\b", re.IGNORECASE)
 # The reasons a managed save can meet in the portal (N.2): the planner's, the write's, the
 # store's, a draft's, a rollback's target's (H.3), and the review's own refusals of the choices,
@@ -78,6 +95,16 @@ def texts() -> _Texts:
     parser = _Texts()
     parser.feed(INDEX.read_bytes().decode("utf-8"))
     return parser
+
+
+# An onboarding at each stage a next step names, with each kind of client (D.4, D.10, OPS-3).
+STAGES = ("discovered", "registered")
+ONBOARDING_OPTIONS = (
+    Options(),
+    Options(client_id="c", secret_given=True),
+    Options(client_id="c"),
+    Options(client_id="c", reregister=True),
+)
 
 
 def steps_words(steps: typing.Iterable[NextStep]) -> list[str]:
@@ -132,7 +159,10 @@ def test_drift_js_says_each_modes_words() -> None:
     shown = constant.sub(
         lambda match: "" if match.group(1) in declarative_only else match.group(0), code
     )
-    literals = re.findall(r'"((?:[^"\\]|\\.)*)"', shown)
+    # A route's path is no text the page shows: an onboarding's Save asks the fragment route,
+    # which in managed mode answers the save's draft (step 15c).
+    quoted = re.findall(r'"((?:[^"\\]|\\.)*)"', shown)
+    literals = [text for text in quoted if not text.startswith("/api/")]
     assert "Choose allow above to keep it: the save's plan lists it as its own row." in "".join(
         literals
     )
@@ -140,7 +170,8 @@ def test_drift_js_says_each_modes_words() -> None:
 
 
 def test_managed_next_lists_say_save() -> None:
-    """M.7, Y25: a managed done review's way on, and a save's for every effect, name no commit,
+    """M.7, Y25: a managed done review's way on, a save's for every effect, an onboarding's at
+    each stage (G.9, step 15c) and a review's save's (Give to clients) name no commit,
     fragment, reload or generate."""
     # Every effect kind, with each of I.2's fixed texts, a restart's step reads.
     words_of = [v for k, v in vars(restart).items() if k.endswith("_TEXT") and isinstance(v, str)]
@@ -150,6 +181,8 @@ def test_managed_next_lists_say_save() -> None:
         for kind in typing.get_args(restart.EffectKind)
         for text in words_of
     ]
+    # An onboarding's steps in managed mode, at each stage, and a review's save's (step 15c).
+    records = [staged(stage, options) for stage in STAGES for options in ONBOARDING_OPTIONS]
     lists = [
         managed_next(),
         managed_next(None),
@@ -157,6 +190,8 @@ def test_managed_next_lists_say_save() -> None:
         job_next("notes", clear=True, managed=True),
         saved_next(effects),
         saved_next(effects, applied=True),
+        reviewed_next("notes", INLINE_SOURCE, managed=True),
+        *(next_for(record, INLINE_SOURCE, own_proxy=True, managed=True) for record in records),
     ]
     words = [word for steps in lists for word in steps_words(steps)]
     assert words
@@ -170,13 +205,15 @@ def test_managed_next_lists_say_save() -> None:
 
 def test_a_managed_saves_refusals_say_save() -> None:
     """Y25, OPS-18: every reason a managed save meets in the portal is catalogued and says no
-    commit, fragment, reload or generate; ``policy_moved`` is worded for a save, and for a
-    rollback (H.3); and the review's ``diff_invalid`` is ``save_invalid`` in managed mode."""
+    commit, fragment, reload or generate; ``policy_moved`` is worded for a save, for a
+    rollback (H.3) and for a connector's row (step 15c); and the review's ``diff_invalid`` is
+    ``save_invalid`` in managed mode."""
     for reason in MANAGED_REASONS:
         assert reason in CATALOGUE, reason
         assert not MANAGED_WORDS.search(CATALOGUE[reason].text), reason
     assert not MANAGED_WORDS.search(SAVE_MOVED)
     assert not MANAGED_WORDS.search(ROLLBACK_MOVED)
+    assert not MANAGED_WORDS.search(CONNECTOR_MOVED)
     made = portal_app._saving(refusal("diff_invalid", detail="list is unknown"))
     assert (made.reason, made.error) == (
         "save_invalid",
