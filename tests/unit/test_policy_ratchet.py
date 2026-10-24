@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -242,6 +243,22 @@ def test_advance_retires_removed_and_retokened_clients() -> None:
     assert advance(START, BASE, BASE, verified=NONE).retired_clients == frozenset()
 
 
+def test_advance_to_a_policy_without_a_gateway_retires_its_client_and_every_pin() -> None:
+    found = advance(START, BASE, make(no_gateway), verified=NONE)
+    assert found.retired_clients == {TOKEN_CI}
+    assert found.retired_pins == {READ: {PIN_READ}, WRITE: {PIN_WRITE}}
+
+
+def test_advance_keeps_the_pin_of_a_tool_no_longer_included() -> None:
+    """Every pin in ``review`` counts, included or not: one still there isn't replaced or
+    removed."""
+
+    def unincluded(raw: dict[str, Any]) -> None:
+        notes(raw)["tools"].update(include=["write"], allow=[])
+
+    assert advance(START, BASE, make(unincluded), verified=NONE).retired_pins == {}
+
+
 def test_advance_retires_a_removed_placeholder_as_a_digest() -> None:
     removed = advance(START, BASE, make(no_placeholder), verified=NONE)
     expected = (
@@ -406,6 +423,14 @@ def test_e5_a_new_env_name() -> None:
         raw["credentials"]["spare"] = {"kind": "header", "secret": "env:SPARE_KEY"}
 
     assert check(make(unused)) == (Violation("env_name_new", "SPARE_KEY"),)
+    # A granted name is passed over, not the end of the check: the other name still counts.
+    both = make(env_secret("NOTES_KEY"), unused)
+    assert check(both, grants=Grants(env=frozenset({"NOTES_KEY"}))) == (
+        Violation("env_name_new", "SPARE_KEY"),
+    )
+    assert check(both, grants=Grants(env=frozenset({"SPARE_KEY"}))) == (
+        Violation("env_name_new", "NOTES_KEY"),
+    )
 
 
 def test_e6_an_env_name_sent_further() -> None:
@@ -594,6 +619,15 @@ def test_the_plain_form_is_canonical_and_sorted() -> None:
     dumps_canonical(ratchet.as_dict())
 
 
+FIELDS_REFUSED = (
+    "a ratchet has exactly the fields approved, egress_key_floor, env, gateway_key_floor, "
+    "retired_callers, retired_clients, retired_pins"
+)
+WHOLE_NUMBER = " is a generation, a whole number from 1"
+ENTRY_FORM = "a retired_pins entry is a server, kind, name and pins"
+ENTRY_NEW = "a retired_pins entry names a new definition and one pin or more"
+
+
 def plain(**changes: Any) -> dict[str, Any]:
     found = copy.deepcopy(sized(4).as_dict())
     found.update(changes)
@@ -603,20 +637,17 @@ def plain(**changes: Any) -> dict[str, Any]:
 @pytest.mark.parametrize(
     ("data", "message"),
     [
-        ({**plain(), "extra": 1}, "exactly the fields"),
-        ({k: v for k, v in plain().items() if k != "env"}, "exactly the fields"),
-        (plain(gateway_key_floor=0), "gateway_key_floor is a generation"),
-        (plain(egress_key_floor=True), "egress_key_floor is a generation"),
-        (plain(egress_key_floor="1"), "egress_key_floor is a generation"),
+        ({**plain(), "extra": 1}, FIELDS_REFUSED),
+        ({k: v for k, v in plain().items() if k != "env"}, FIELDS_REFUSED),
+        (plain(gateway_key_floor=0), "gateway_key_floor" + WHOLE_NUMBER),
+        (plain(egress_key_floor=True), "egress_key_floor" + WHOLE_NUMBER),
+        (plain(egress_key_floor="1"), "egress_key_floor" + WHOLE_NUMBER),
         (plain(retired_pins={}), "retired_pins is a list"),
-        (plain(retired_pins=[["notes", "tool", "read", [PIN_READ]]]), "a retired_pins entry is"),
-        (
-            plain(retired_pins=[{"server": "notes", "kind": "tool", "name": "read"}]),
-            "a retired_pins entry is",
-        ),
+        (plain(retired_pins=[["notes", "tool", "read", [PIN_READ]]]), ENTRY_FORM),
+        (plain(retired_pins=[{"server": "notes", "kind": "tool", "name": "read"}]), ENTRY_FORM),
         (
             plain(retired_pins=[{"server": "notes", "kind": "tool", "name": "read", "pins": []}]),
-            "one pin or more",
+            ENTRY_NEW,
         ),
         (
             plain(
@@ -625,34 +656,47 @@ def plain(**changes: Any) -> dict[str, Any]:
                     {"server": "notes", "kind": "tool", "name": "read", "pins": [PIN_NEW]},
                 ]
             ),
-            "names a new definition",
+            ENTRY_NEW,
         ),
         (
             plain(
                 retired_pins=[{"server": "notes", "kind": "tool", "name": "read", "pins": ["x"]}]
             ),
-            "sha256 digests only",
+            "retired_pins holds sha256 digests only",
         ),
         (
             plain(
                 retired_pins=[{"server": "notes", "kind": "skill", "name": "r", "pins": [PIN_READ]}]
             ),
-            "names a definition by server, kind and name",
+            "retired_pins names a definition by server, kind and name",
         ),
-        (plain(retired_clients=["sha256:" + "A" * 64]), "retired_clients holds sha256 digests"),
+        (
+            plain(retired_clients=["sha256:" + "A" * 64]),
+            "retired_clients holds sha256 digests only",
+        ),
         (plain(retired_clients=[1]), "retired_clients holds text only"),
+        (
+            plain(retired_callers=["sha256:" + "B" * 64]),
+            "retired_callers holds sha256 digests only",
+        ),
         (plain(retired_callers=[""]), "retired_callers holds text only"),
         (plain(retired_callers="sha256:" + "1" * 64), "retired_callers is a list"),
-        (plain(approved=[["notes", "tool"]]), "approved names a definition"),
+        (plain(approved={}), "approved is a list"),
+        (plain(approved=["notes/tool/read"]), "approved is a list"),
+        (
+            plain(approved=[["notes", "tool"]]),
+            "approved names a definition by server, kind and name",
+        ),
         (plain(approved=[["notes", "tool", 3]]), "approved holds text only"),
         (plain(approved=[[None, "tool", "read"]]), "approved holds text only"),
-        (plain(env=[]), "env maps each name"),
+        (plain(env=[]), "env maps each name to its origins"),
         (plain(env={"": ["a"]}), "env holds text only"),
         (plain(env={"A": "https://a.example:443"}), "env is a list"),
     ],
 )
 def test_loaded_refuses_anything_but_the_plain_form(data: dict[str, Any], message: str) -> None:
-    with pytest.raises(ValueError, match=message):
+    # The whole message: it names the field, and each entry is the first one it reaches.
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         loaded(data)
 
 

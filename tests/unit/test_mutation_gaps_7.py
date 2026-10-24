@@ -1,6 +1,7 @@
 """The mutants left alive on purpose in M6's modules: the strict YAML loader (step 1,
-``common.yamlload``) and the change a review makes (step 8, ``common.policy.reviewchange``, whose
-``definition_lines`` moved from ``portal.reviewview`` with its two equivalents).
+``common.yamlload``), the change a review makes (step 8, ``common.policy.reviewchange``, whose
+``definition_lines`` moved from ``portal.reviewview`` with its two equivalents), and the
+ratchet's plain form (step 11b, ``common.policy.ratchet``).
 
 The loader's killing tests are in ``test_yamlload.py``. The mutants no test can tell from the
 original are in :data:`EQUIVALENT`, each with why; :func:`test_each_equivalent_names_a_function`
@@ -27,6 +28,19 @@ EQUIVALENT: Final[dict[str, str]] = {
     ),
     "zoeymcp.common.policy.reviewchange.x_definition_lines__mutmut_22": (
         '`or ["XXXX"]` for an empty line: json.dumps with an indent writes no empty line'
+    ),
+    # --- common.policy.ratchet
+    "zoeymcp.common.policy.ratchet.x_loaded__mutmut_13": (
+        "`zip(GENERATIONS, floors, strict=None)`: floors is built from GENERATIONS, one per "
+        "generation, so the two are never of different lengths"
+    ),
+    "zoeymcp.common.policy.ratchet.x_loaded__mutmut_16": (
+        "strict=True dropped from the floors' zip: floors is built from GENERATIONS, so the "
+        "two are never of different lengths"
+    ),
+    "zoeymcp.common.policy.ratchet.x_loaded__mutmut_17": (
+        "strict=False in the floors' zip: floors is built from GENERATIONS, so the two are "
+        "never of different lengths"
     ),
 }
 

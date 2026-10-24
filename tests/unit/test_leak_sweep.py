@@ -72,7 +72,7 @@ import os
 import re
 import stat
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -103,6 +103,7 @@ from zoeymcp.common.canonical import digest as canonical_digest
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
+from zoeymcp.common.policy.ratchet import initial
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.common.yamlload import load_mapping
@@ -112,7 +113,7 @@ from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
-from zoeymcp.vault import logs, policyseal, reviewjobs
+from zoeymcp.vault import logs, policyseal, policystart, reviewjobs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import EGRESS_HEADER, VaultApp
 from zoeymcp.vault.oauth.login import LoginService
@@ -2022,12 +2023,10 @@ SEALED_SENTINELS = {
 }
 
 
-def test_a_sealed_revision_holds_no_policy_value_in_clear(log_lines: io.StringIO) -> None:
-    """A revision's body is encrypted (Q6 (b)): its file, the head and the anchor show no value of
-    the policy, the salted ``body_digest`` confirms no guessed policy (E-10), and neither the
-    unsealed revision nor its body can be logged."""
+def sealed_policy() -> dict[str, Any]:
+    """A revision's policy holding every value D.4 encrypts, each a sentinel."""
     found = SEALED_SENTINELS
-    policy = {
+    return {
         "gateway": {"clients": {"agent1": {"token": found["token"]}}},
         "routes": [
             {
@@ -2039,6 +2038,14 @@ def test_a_sealed_revision_holds_no_policy_value_in_clear(log_lines: io.StringIO
         ],
         "connectors": {"mail": {"username": found["username"], "recipients": [found["recipient"]]}},
     }
+
+
+def test_a_sealed_revision_holds_no_policy_value_in_clear(log_lines: io.StringIO) -> None:
+    """A revision's body is encrypted (Q6 (b)): its file, the head and the anchor show no value of
+    the policy, the salted ``body_digest`` confirms no guessed policy (E-10), and neither the
+    unsealed revision nor its body can be logged."""
+    found = SEALED_SENTINELS
+    policy = sealed_policy()
     seed = canonical_digest(policy)
     plaintext = policyseal.make_body(
         salt=os.urandom(32), policy=policy, ratchet={}, seed_digest=seed, reason=None
@@ -2075,4 +2082,59 @@ def test_a_sealed_revision_holds_no_policy_value_in_clear(log_lines: io.StringIO
     for secret in (unsealed, unsealed.body):
         with pytest.raises(TypeError, match=r"refusing to log a secret"):
             logs.event("oops", f=secret)
+    assert log_lines.getvalue() == ""
+
+
+def test_the_start_verdict_shows_no_policy_value(log_lines: io.StringIO) -> None:
+    """The store's verdict holds the head's policy and ratchet (D.6): its ``repr``, and every
+    start refusal over that store, show no value of either, nor the policy's unsalted digest
+    (E-10), and it can't be logged."""
+    retired = hash_token(SEALED_SENTINELS["token"])
+    ratchet = initial(Policy.model_validate({"version": 1, "mode": "declarative"}))
+    plaintext = policyseal.make_body(
+        salt=os.urandom(32),
+        policy=sealed_policy(),
+        ratchet=replace(ratchet, retired_clients=frozenset({retired})).as_dict(),
+        seed_digest="sha256:" + "5" * 64,
+        reason=None,
+    )
+    header = {
+        "v": 1,
+        "deployment": "ab" * 16,
+        "revision": 1,
+        "parent": None,
+        "created": 1_792_900_000,
+        "origin": "seed",
+        "kind": "policy.seed",
+        "author": {"by": "seed"},
+        "base": None,
+        "target": None,
+        "jumped_from": None,
+        "body_digest": policyseal.body_digest(plaintext),
+    }
+    data = policyseal.seal_revision(header, plaintext, keys=KEYS, nonce=os.urandom(12))
+    top = policyseal.unseal_revision(data, KEYS, None, deployment=None)
+    head = policyseal.Head("ab" * 16, 1, top.digest, 1, None, KEYS.key_id)
+    anchor = policyseal.Anchor("ab" * 16, 1, None, None, KEYS.key_id)
+    found = policystart.verdict(anchor, head, {1: top}, [], ())
+    assert isinstance(found, policystart.Ok)
+    assert found.ratchet.retired_clients == {retired}
+    assert found.policy_digest == canonical_digest(sealed_policy())
+    commands = policystart.Commands("docker compose", "vault")
+    refusals = [
+        policystart.verdict(anchor, replace(head, digest="sha256:" + "0" * 64), {1: top}, [], ()),
+        policystart.verdict(anchor, head, {1: top, 3: top}, [], ()),
+        policystart.verdict(
+            policyseal.Anchor("ab" * 16, 2, None, None, KEYS.key_id), head, {1: top}, [], ()
+        ),
+    ]
+    texts = [
+        refused.text(commands) for refused in refusals if isinstance(refused, policystart.Refused)
+    ]
+    assert len(texts) == len(refusals)
+    shown = [repr(found), *texts]
+    for value in [*SEALED_SENTINELS.values(), canonical_digest(sealed_policy()), retired]:
+        assert not any(value in text for text in shown), value
+    with pytest.raises(TypeError, match=r"refusing to log a secret"):
+        logs.event("oops", f=found)
     assert log_lines.getvalue() == ""
