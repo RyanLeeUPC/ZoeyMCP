@@ -5,7 +5,7 @@ A hundred tools don't fit on a command line, so ``--choose`` writes one line per
 lists, ``git rebase -i`` style, and ``--choices FILE`` reads the edited file back into the same
 change the options make, which the emitter writes as fragment 2 (E.4):
 
-    # zoeymcp review notes: 96 tools. Keep "skip", or write "allow" or "approve", on each line.
+    # zoeymcp review notes: 96 tools. Keep "skip", or write "allow", "approve" or "decline", ...
     # report 3f9c... sha256:aa41... policy sha256:5e07...
     allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
     skip     delete_note  sha256:0b7d...   # not annotated: approve suggested if you include it
@@ -23,6 +23,11 @@ change the options make, which the emitter writes as fragment 2 (E.4):
   ``skip`` with its suggestion in the comment, so an unedited file never includes an unannotated
   or destructive tool (OPS-12, PC-2). A tool the policy already includes says its classification,
   so an unedited file changes nothing; ``skip`` on it takes it out.
+- ``decline`` leaves a tool out and records it under the server's ``declined`` at the line's pin
+  (M6 design J.3, J.5), so ``review`` stays quiet about it until its definition changes; on an
+  included tool it takes it out too. A tool the policy declined at the pin listed says
+  ``decline``, so again an unedited file changes nothing, and ``skip`` on it takes it out of
+  ``declined``.
 - A tool with an error finding has no line, only a comment: it can't be pinned (design 7.5). An
   included tool whose listing isn't the one its pin holds (drifted, missing, invalid) has no line
   either and stays as the policy has it; ``review <server> --repin`` is how a drifted one's pin
@@ -52,6 +57,7 @@ from .review import (
     Added,
     Changes,
     Classification,
+    declined_block,
     listed,
     pinnable,
     suggested,
@@ -59,7 +65,7 @@ from .review import (
     untrusted,
 )
 
-Word = Literal["skip", "allow", "approve"]
+Word = Literal["skip", "allow", "approve", "decline"]
 Reason = Literal["choices_invalid", "choices_stale"]
 WORDS: Final = get_args(Word)
 # The job ID of a review that ran over the gateway's own socket, which keeps no job.
@@ -97,9 +103,13 @@ def report_digest(report: Mapping[str, Any]) -> str:
 
 def policy_digest(report: Mapping[str, Any]) -> str:
     """The digest of the server's tools in the policy the report was made against: its
-    ``include``, ``allow`` and ``approve``, each sorted."""
+    ``include``, ``allow`` and ``approve``, each sorted, and its ``declined`` once it has one
+    (so a file written before a decline can't undo it, and an M7 file's digest stays)."""
     policy = report["policy"]
-    return report_digest({kind: sorted(policy[kind]) for kind in ("include", "allow", "approve")})
+    tools: dict[str, Any] = {kind: sorted(policy[kind]) for kind in ("include", "allow", "approve")}
+    if policy.get("declined"):
+        tools["declined"] = dict(policy["declined"])
+    return report_digest(tools)
 
 
 def _lined(entry: Mapping[str, Any]) -> bool:
@@ -122,8 +132,8 @@ def render(report: Mapping[str, Any], job: str, *, suggest: bool) -> list[str]:
     tools = listed(report)
     count = f"{len(tools)} tool{'' if len(tools) == 1 else 's'}"
     lines = [
-        f'# zoeymcp review {server}: {count}. Keep "skip", or write "allow" or "approve", on '
-        "each line.",
+        f'# zoeymcp review {server}: {count}. Keep "skip", or write "allow", "approve" or '
+        '"decline", on each line.',
         f"# report {job} {report_digest(report)} policy {policy_digest(report)}",
         "# allow: agents call it with no prompt. approve: every call asks you first.",
         "# The suggestions are the server's own annotations, not a judgement by ZoeyMCP.",
@@ -145,6 +155,8 @@ def _word(entry: Mapping[str, Any], *, suggest: bool) -> Word:
     if entry["included"]:
         classification: Word = entry["classification"]
         return classification
+    if entry["state"] == "declined":
+        return "decline"
     if suggest and not entry.get("consequential") and suggested(entry) == "allow":
         return "allow"
     return "skip"
@@ -154,6 +166,8 @@ def _comment(entry: Mapping[str, Any]) -> str:
     words = suggested_words(entry)
     if entry["included"]:
         words = f"in the policy as {entry['classification']}; {words}"
+    elif entry["state"] == "declined":
+        words = f"declined in the policy; {words}"
     findings = [
         finding
         for finding in entry["findings"]
@@ -252,7 +266,7 @@ def _line(number: int, line: str, seen: dict[str, int]) -> Line:
         raise _invalid(number, "write a word, the tool's name and its pin")
     word, tool, pin = parts
     if word not in WORDS:
-        raise _invalid(number, f'"{untrusted(word, 20)}" isn\'t skip, allow or approve')
+        raise _invalid(number, f'"{untrusted(word, 20)}" isn\'t skip, allow, approve or decline')
     if not TOOL_NAME.fullmatch(tool):
         raise _invalid(number, f"{untrusted(tool, 128)} isn't a tool name")
     if tool in seen:
@@ -266,8 +280,9 @@ def _line(number: int, line: str, seen: dict[str, int]) -> Line:
 def decide(report: Mapping[str, Any], job: str, parsed: Parsed) -> Changes:
     """The changes ``parsed`` asks of ``report``'s server, the review job ``job`` answered: a
     line for a tool not yet included includes it, ``skip`` on an included one takes it out,
-    another word on one classifies it anew, and a tool with no line stays as it is. Raises
-    :class:`ChoicesRefused`."""
+    another word on one classifies it anew, ``decline`` records the tool declined at its pin
+    (taking it out if included), ``skip`` on a declined one takes it out of ``declined``, and a
+    tool with no line stays as it is. Raises :class:`ChoicesRefused`."""
     server = report["server"]
     if parsed.server != server:
         raise ChoicesRefused(
@@ -286,6 +301,8 @@ def decide(report: Mapping[str, Any], job: str, parsed: Parsed) -> Changes:
     added: dict[str, Added] = {}
     dropped: set[str] = set()
     moved: dict[str, Classification] = {}
+    declines: dict[str, str] = {}
+    undeclined: list[str] = []
     stale: list[str] = []
     for line in parsed.lines:
         entry = tools.get(line.tool)
@@ -300,11 +317,18 @@ def decide(report: Mapping[str, Any], job: str, parsed: Parsed) -> Changes:
         if line.word == "skip":
             if entry["included"]:
                 dropped.add(line.tool)
+            elif entry["state"] == "declined":
+                undeclined.append(line.tool)
             continue
         if entry["included"] and not _lined(entry):
             raise _invalid(line.number, _stays(server, entry))
         if not _lined(entry):
             raise _invalid(line.number, f"{line.tool} has an error finding, so it can't be pinned")
+        if line.word == "decline":
+            declines[line.tool] = line.pin
+            if entry["included"]:
+                dropped.add(line.tool)
+            continue
         if line.word == "allow" and entry.get("consequential"):
             raise _invalid(
                 line.number,
@@ -323,7 +347,8 @@ def decide(report: Mapping[str, Any], job: str, parsed: Parsed) -> Changes:
             f"(review {server} --show TOOL), then write the file again",
             tuple(names),
         )
-    return Changes(added=added, dropped=frozenset(dropped), moved=moved)
+    declined = declined_block(report, declines, undeclined=undeclined, included=tuple(added))
+    return Changes(added=added, dropped=frozenset(dropped), moved=moved, declined=declined)
 
 
 def _unlisted(tool: str, entry: Mapping[str, Any] | None) -> str:

@@ -3409,7 +3409,8 @@ def test_j1_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
         "otherwise, 2 not annotated, 1 with an error finding).\n"
         f"Next:\n  Choose its tools:\n    {HARDENED} exec vault zoeymcp review notes --via vault "
         "--choose --suggest > notes.choices\n"
-        "  Edit notes.choices (skip, allow or approve on each line), then make fragment 2:\n"
+        "  Edit notes.choices (skip, allow, approve or decline on each line; decline the tools "
+        "you leave out), then make fragment 2:\n"
         f"    {SECOND_CHOICES}\n"
     )
     assert vault.store.names() == ["notes-refresh"]
@@ -3583,7 +3584,8 @@ def test_login_then_two_reviews_read_one_report(vault: Vault) -> None:
     shown = []
     for _ in range(2):
         code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
-        assert (code, err) == (EXIT_OK, "")
+        # Nothing is included yet, so the server lists tools nobody reviewed (M6 design J.5).
+        assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
         shown.append(out)
     assert shown[0] == shown[1]
     assert vault.reviews.queued == ["notes"]
@@ -3592,9 +3594,11 @@ def test_login_then_two_reviews_read_one_report(vault: Vault) -> None:
     assert any(
         line.startswith("  bad_tool: error /description: control character") for line in lines
     )
+    # bad_tool has an error finding, so it can't be pinned: the attention decision leaves it out.
+    assert "3 listed that nobody reviewed: delete_note, export_all, list_notes" in lines
     assert "# YAML to commit (declarative mode). Review the changes above first." in lines
     code, _, _ = cli(["review", "notes", "--via", "vault", "--fresh", "--socket", "x"])
-    assert code == EXIT_OK
+    assert code == review_view.EXIT_NEEDS_OPERATOR
     assert vault.reviews.queued == ["notes", "notes"]
 
 
@@ -3609,14 +3613,14 @@ def test_j1_choose_then_choices_makes_a_fragment_check_with_accepts(
     assert onboarded(vault, J1)[0] == EXIT_OK
     review = ["review", "notes", "--via", "vault", "--socket", "x"]
     code, written, err = cli([*review, "--choose", "--suggest"])
-    assert (code, err) == (EXIT_OK, "")
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")  # fragment 2 isn't committed yet
     rows = {line.split()[1]: line.split()[0] for line in written.splitlines() if line[0] != "#"}
     # Only the tool the server marks read-only is allowed; the error finding has no line.
     assert rows == {"delete_note": "skip", "export_all": "skip", "list_notes": "allow"}
     assert "# bad_tool can't be included: error finding (" in written
     choices = written.replace("skip     export_all", "approve  export_all")
     code, fragment_2, err = cli([*review, "--choices", "-"], io.StringIO(choices))
-    assert code == EXIT_OK, err
+    assert code == review_view.EXIT_NEEDS_OPERATOR, err
     assert vault.reviews.queued == ["notes"]  # one report for the second run and both
     assert err == (
         "zoeymcp review: the file includes 2 tools (1 allow, 1 approve). Prove it with check "
@@ -3646,6 +3650,44 @@ def test_j1_choose_then_choices_makes_a_fragment_check_with_accepts(
     code, out, err = cli([*review, "--choices", "-"], io.StringIO(stale))
     assert (code, out) == (2, "")
     assert err.startswith("zoeymcp review: choices_invalid: line ")
+
+
+def test_j1_a_choices_file_that_declines_the_rest(vault: Vault, tmp_path: Path) -> None:
+    """J2's CLI half on J1's commands (M6 design J.3, J.5): a choices file that writes decline
+    on the tools the operator leaves out gives fragment 2 a declined block, replaced whole, and
+    check --with merges it with no error."""
+    code, fragment, _, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    vault.commit(fragment)
+    assert onboarded(vault, J1)[0] == EXIT_OK
+    review = ["review", "notes", "--via", "vault", "--socket", "x"]
+    _, written, _ = cli([*review, "--choose", "--suggest"])
+    choices = written.replace("skip     export_all", "approve  export_all")
+    choices = choices.replace("skip     delete_note", "decline  delete_note")
+    code, fragment_2, err = cli([*review, "--choices", "-"], io.StringIO(choices))
+    assert code == review_view.EXIT_NEEDS_OPERATOR, err  # nothing is committed yet
+    assert err == (
+        "zoeymcp review: the file includes 2 tools (1 allow, 1 approve), and leaves 1 declined. "
+        "Prove it with check --with, commit it and reload, then assign the server to its "
+        "clients.\n"
+    )
+    assert fragment_2.startswith(
+        "# zoeymcp: review of notes (2 of 2). Replace the tools:, review: and declined: blocks "
+        "of gateway.servers.notes, then assign notes to its clients.\n"
+        "# zoeymcp replace: gateway.servers.notes.tools gateway.servers.notes.review "
+        "gateway.servers.notes.declined\n"
+    )
+    entry = load_mapping(fragment_2)["gateway"]["servers"]["notes"]
+    [pin] = [line.split()[2] for line in choices.splitlines() if "delete_note" in line[:20]]
+    assert entry["declined"] == {"delete_note": pin}
+    assert "# declined: delete_note (" + pin + ")" in fragment_2
+    policy_file, fragment_file = tmp_path / "policy.yaml", tmp_path / "onboard-notes-2.yaml"
+    base = vault.policy.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    policy_file.write_bytes(policy_emit.document(base).encode())
+    fragment_file.write_bytes(fragment_2.encode())
+    code, out, err = cli(["check", "--config", str(policy_file), "--with", str(fragment_file)])
+    assert code == EXIT_OK, out + err
+    assert "with onboard-notes-2.yaml merged: 0 errors, " in out + err
+    assert "gateway.servers.notes.declined" in out + err
 
 
 def test_the_second_run_as_json_carries_the_counts(vault: Vault) -> None:
@@ -3709,7 +3751,7 @@ def test_review_via_vault_queues_then_reads_the_job(admin: FakeAdmin) -> None:
         job_answer("done", report=report),
     )
     code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
-    assert (code, err) == (EXIT_OK, "")
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")  # it includes nothing yet
     assert admin.requests == [
         ("POST", "/review/notes", {"fresh": False}),
         ("GET", "/review/jobs/job-0001?wait=30", None),
@@ -3732,7 +3774,7 @@ def test_a_reused_review_is_read_from_the_queue_answer(admin: FakeAdmin) -> None
         job_answer("done", reused=True, report=vault_report()),
     )
     code, _, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
-    assert (code, err) == (EXIT_OK, "")
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
     assert [path for _, path, _ in admin.requests] == ["/review/notes"]
 
 

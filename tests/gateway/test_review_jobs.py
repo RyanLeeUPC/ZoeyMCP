@@ -46,6 +46,7 @@ from tests.gateway.rig import (
     deployment,
     gateway,
     pin_of_fake,
+    pins_of_the_rest,
     raw_policy,
     until,
 )
@@ -1073,8 +1074,10 @@ def test_review_via_vault_prints_the_gateways_review(
     client at shutdown (D-166)."""
     fake = McpFake()
     review_pins = {name: pin_of_fake(fake, name) for name in TOOLS}
+    rest = pins_of_the_rest(fake, TOOLS)
     with (
-        deployment(tmp_path, fake, include=TOOLS, review=review_pins) as deployed,
+        # The rest declined: nothing is left that nobody reviewed (M6 design J.5).
+        deployment(tmp_path, fake, include=TOOLS, review=review_pins, declined=rest) as deployed,
         gateway(deployed, review=True, report=True) as running,
     ):
         through_vault = run_cli(
@@ -1121,8 +1124,10 @@ def test_a_drift_review_via_vault_carries_the_reviewed_definition(
     prints the same review either way."""
     fake = McpFake(offered={"prompts", "logging"})
     review_pins = {name: pin_of_fake(fake, name) for name in TOOLS}
+    rest = pins_of_the_rest(fake, TOOLS)
     with (
-        deployment(tmp_path, fake, include=TOOLS, review=review_pins) as deployed,
+        # The rest declined: nothing is left that nobody reviewed (M6 design J.5).
+        deployment(tmp_path, fake, include=TOOLS, review=review_pins, declined=rest) as deployed,
         gateway(deployed, review=True, report=True) as running,
     ):
         socket = ("--socket", "x")
@@ -1147,6 +1152,14 @@ def test_a_drift_review_via_vault_carries_the_reviewed_definition(
     assert echo["reviewed"]["description"] != echo["definition"]["description"]
     assert all("reviewed" not in entry for entry in report["tools"] if entry["name"] != "echo")
     assert report["policy"]["review"] == review_pins
+    assert report["policy"]["declined"] == rest
+    assert report["attention"] == {
+        "drifted": ["echo"],
+        "marked": [],
+        "new": [],
+        "changed_declined": [],
+        "missing": [],
+    }
     assert report["offered"] == {
         "prompts": True,
         "resources": False,

@@ -991,15 +991,18 @@ def test_an_m7_report_still_reads(tmp_path: Path, example_raw: dict[str, Any]) -
         offered={"prompts": True, "resources": True, "completions": True, "logging": True}
     )
     del data["offered"], data["policy"]["review"], data["tools"][0]["reviewed"]
+    del data["policy"]["declined"], data["attention"]
     report = read(data, LIMITS)
     assert isinstance(report, RemoteReport)
     assert report.offered is None
+    assert report.attention is None
     assert (report.policy.review, report.policy.declined) == ({}, {})
     assert report.tools[0].reviewed is None
     assert report.model_dump(mode="json", exclude_unset=True) == data
     toolkit = wired(toolkit_reviewed(tmp_path, example_raw))
-    del toolkit["policy"]["review"]
-    assert read(toolkit, LIMITS).policy.review == {}
+    del toolkit["policy"]["review"], toolkit["policy"]["declined"], toolkit["attention"]
+    read_toolkit = read(toolkit, LIMITS)
+    assert (read_toolkit.policy.review, read_toolkit.attention) == ({}, None)
 
 
 def test_the_clis_review_text_reads_none_of_the_new_fields() -> None:
@@ -1010,9 +1013,68 @@ def test_the_clis_review_text_reads_none_of_the_new_fields() -> None:
     )
     m7 = copy.deepcopy(data)
     del m7["offered"], m7["policy"]["review"], m7["tools"][0]["reviewed"]
+    del m7["policy"]["declined"], m7["attention"]
     for choices in (
         cli_review.Choices(),
         cli_review.Choices(show_all=True, repin=frozenset({"a"})),
     ):
         assert cli_review.render(data, choices) == cli_review.render(m7, choices)
         assert cli_review.snippet(data, choices) == cli_review.snippet(m7, choices)
+
+
+# --- the attention decision (M6 design J.5) ------------------------------------------------------
+
+
+def test_the_attention_decision_reads_back() -> None:
+    """The review writes it for the whole listing; a tool the policy declined at its pin is
+    ``declined``, and one declined at another pin is new to the decision again."""
+    server = policy(["a"], {"a": pin("a")})
+    server = server.model_copy(update={"declined": {"b": pin("b"), "c": PIN0}})
+    data = wired(reviewed([tool("a"), tool("b"), tool("c"), tool("d")], server))
+    assert [(entry["name"], entry["state"]) for entry in data["tools"]] == [
+        ("a", "ok"),
+        ("b", "declined"),
+        ("c", "unreviewed"),
+        ("d", "unreviewed"),
+    ]
+    report = read(data, LIMITS)
+    assert report.policy.declined == {"b": pin("b"), "c": PIN0}
+    assert report.attention is not None
+    assert report.attention.model_dump() == {
+        "drifted": [],
+        "marked": [],
+        "new": ["d"],
+        "changed_declined": ["c"],
+        "missing": [],
+    }
+    assert [entry.state for entry in report.tools] == ["ok", "declined", "unreviewed", "unreviewed"]
+
+
+def test_a_toolkits_attention_reads_back(tmp_path: Path, example_raw: dict[str, Any]) -> None:
+    data = wired(toolkit_reviewed(tmp_path, example_raw))
+    report = read(data, LIMITS)
+    assert report.attention is not None
+    assert report.attention.model_dump() == data["attention"]
+    data["attention"]["new"] = ["a b"]
+    assert invalid(data) == "at toolkit.attention.new[0]"
+
+
+@pytest.mark.parametrize("member", ["drifted", "marked", "new", "changed_declined", "missing"])
+def test_attention_out_of_shape(member: str) -> None:
+    data = unclassified("a")
+    data["attention"][member] = ["a b"]
+    assert invalid(data) == f"at remote.attention.{member}[0]"
+    data["attention"][member] = [f"t{index}" for index in range(NAMES_MAX)]
+    read(data, LIMITS)
+    data["attention"][member].append("t")
+    assert invalid(data) == f"at remote.attention.{member}"
+    del data["attention"][member]
+    assert invalid(data) == f"at remote.attention.{member}"
+
+
+def test_attention_holds_only_its_lists() -> None:
+    data = unclassified("a")
+    data["attention"]["unreviewed"] = []
+    assert invalid(data) == "at remote.attention.unreviewed"
+    data["attention"] = []
+    assert invalid(data) == "at remote.attention"

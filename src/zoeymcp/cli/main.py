@@ -571,9 +571,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "the policy. With no server, one line per server and no upstream call. Inside the "
             "vault, --via vault asks the gateway through the vault's review jobs, and reads the "
             "last finished review again unless --fresh. --choose prints a choices file, one line "
-            "per tool (skip, allow or approve), and --choices FILE reads the edited file back "
-            "into the snippet. Exit 0 when every included tool matches and nothing is marked, 1 "
-            "when something needs you, 2 when the review couldn't run."
+            "per tool (skip, allow, approve or decline), and --choices FILE reads the edited file "
+            "back into the snippet. Exit 0 when every included tool matches, nothing is marked "
+            "and every listed tool is included or declined, 1 when something needs you (a tool "
+            "nobody reviewed among them), 2 when the review couldn't run."
         ),
     )
     review.add_argument("server", nargs="?")
@@ -616,6 +617,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "include as allow every tool the server marks read-only and not destructive (its "
             "own annotations, not a judgement by ZoeyMCP); never an unannotated tool"
         ),
+    )
+    review.add_argument(
+        "--decline",
+        action="append",
+        default=[],
+        metavar="TOOL",
+        help="record TOOL as declined at its pin: left out, and quiet until it changes",
+    )
+    review.add_argument(
+        "--decline-rest",
+        action="store_true",
+        help="record every listed tool the snippet doesn't include as declined at its pin",
     )
     review.add_argument(
         "--choose",
@@ -1374,7 +1387,15 @@ def _cmd_review(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextI
 
 def _review_usage(args: argparse.Namespace) -> str | None:
     """What's wrong with ``review``'s options as given, before anything is asked."""
-    picked = args.add or args.allow or args.approve or args.allow_read_only or args.repin
+    picked = (
+        args.add
+        or args.allow
+        or args.approve
+        or args.allow_read_only
+        or args.repin
+        or args.decline
+        or args.decline_rest
+    )
     shown = args.tool or args.show or args.all
     if args.server is None and (picked or shown or args.clear or args.choose or args.choices):
         return "these options need a server"
@@ -1434,6 +1455,8 @@ def _review_choices(args: argparse.Namespace) -> review_view.Choices:
         allow=tuple(dict.fromkeys(args.allow)),
         approve=tuple(dict.fromkeys(args.approve)),
         allow_read_only=args.allow_read_only,
+        decline=tuple(dict.fromkeys(args.decline)),
+        decline_rest=args.decline_rest,
     )
 
 
@@ -1456,7 +1479,9 @@ def _review_output(
     try:
         if read is not None:
             changes = review_choices.decide(result, job, read)
-            heading = review_view.second_title(result["server"])
+            heading = review_view.second_title(
+                result["server"], declined=changes.declined is not None
+            )
             out.write(policy_emit.emit(review_view.fragment(result, changes, heading=heading)))
             err.write(
                 f"zoeymcp review: {_classified(changes)}. Prove it with check --with, commit it "
@@ -1490,6 +1515,8 @@ def _classified(changes: review_view.Changes) -> str:
         said += f", takes out {len(changes.dropped)}"
     if changes.moved:
         said += f", classifies {len(changes.moved)} anew"
+    if changes.declined is not None:
+        said += f", and leaves {len(changes.declined)} declined"
     return said
 
 

@@ -298,6 +298,8 @@ def test_an_egress_private_entry_is_the_schemas(entry: Any) -> None:
 def test_a_review_holds_tool_names_and_pins(review: dict[str, str]) -> None:
     with pytest.raises(ValidationError):
         SetServerReview("notes", Tools(), review)
+    with pytest.raises(ValidationError):  # a declined block is the same map (M6 design J.3)
+        SetServerReview("notes", Tools(), {}, declined=review)
 
 
 @pytest.mark.parametrize("era", ["Modern", "bridge", ""])
@@ -308,11 +310,16 @@ def test_an_era_is_the_schemas(era: str) -> None:
 
 def test_a_review_is_a_copy_no_caller_can_change() -> None:
     pins = {"get_quote": PIN_A}
-    op = SetServerReview("notes", Tools(), pins)
+    op = SetServerReview("notes", Tools(), pins, declined=pins)
     pins["cancel_order"] = PIN_B
     assert dict(op.review) == {"get_quote": PIN_A}
+    assert op.declined is not None
+    assert dict(op.declined) == {"get_quote": PIN_A}
     with pytest.raises(TypeError):
         op.review["x"] = PIN_B  # type: ignore[index]
+    with pytest.raises(TypeError):
+        op.declined["x"] = PIN_B  # type: ignore[index]
+    assert SetServerReview("notes", Tools(), pins).declined is None
 
 
 @pytest.mark.parametrize("subject", ["get quote", "", "a\nb", "x" * 129, "caf\u00e9", b"x"])
@@ -421,8 +428,9 @@ def test_a_review_replaces_tools_and_review_whole() -> None:
 
 
 def test_a_review_keeps_the_servers_declined_block() -> None:
-    """No op writes ``declined`` yet (M6 design step 12a makes the review write it): a review
-    that includes a declined tool fails check (row 3) until the entry is deleted by hand."""
+    """An op with no ``declined`` (M7's fragment) leaves the server's block as it is, so a
+    review that includes a declined tool fails check (row 3) until the entry is deleted by hand;
+    the CLI's review writes the block whole once the server has one (M6 design J.3), below."""
     raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
     raw["gateway"]["servers"]["broker-read"]["declined"] = {"get_news": PIN_B}
     policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
@@ -436,6 +444,26 @@ def test_a_review_keeps_the_servers_declined_block() -> None:
     assert [(f.path, f.message) for f in validate(policy, change) if f.level == "error"] == [
         ("gateway.servers.broker-read.declined", "'get_news' is both included and declined")
     ]
+
+
+def test_a_review_with_a_declined_block_replaces_it_whole() -> None:
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    raw["gateway"]["servers"]["broker-read"]["declined"] = {"get_news": PIN_B, "old": PIN_B}
+    policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
+    tools = Tools(include=["get_quote", "get_news"], allow=["get_quote", "get_news"])
+    pins = {"get_quote": PIN_A, "get_news": PIN_A}
+    for declined, kept in (({"other": PIN_A}, {"other": PIN_A}), ({}, {})):
+        op = SetServerReview("broker-read", tools, pins, era="modern", declined=declined)
+        change = PolicyChange("t", (op,))
+        assert change.replace() == tuple(
+            ("gateway", "servers", "broker-read", block)
+            for block in ("tools", "review", "declined")
+        )
+        assert change.data()["gateway"]["servers"]["broker-read"]["declined"] == kept
+        merged = apply(policy, change)
+        assert merged.gateway is not None
+        assert merged.gateway.servers["broker-read"].declined == kept
+        assert [f for f in validate(policy, change) if f.level == "error"] == []
 
 
 def test_a_review_without_an_era_keeps_the_servers() -> None:

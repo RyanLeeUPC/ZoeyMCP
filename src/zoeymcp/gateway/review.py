@@ -8,9 +8,11 @@ marks the tool for every client, as drift seen anywhere does (G.3, G.4).
 :func:`report` turns one listing into the answer: per tool, its state, its projection and pin,
 the findings, and for drift the changed members and a diff against the reviewed definition from
 the definition store, and that definition itself (``reviewed``, M6 design J.1), which the vault
-checks against the policy's pin. The policy block carries the server's pins, and ``offered`` what
-the upstream advertises beyond tools, none of it served. The upstream's ``instructions`` and
-``serverInfo`` are included for display only; they are never forwarded to an agent.
+checks against the policy's pin. The policy block carries the server's pins and declines, and
+``offered`` what the upstream advertises beyond tools, none of it served. ``clean`` is about the
+included tools; ``attention`` is the attention decision for the whole listing (M6 design J.5),
+which also counts a tool nobody reviewed. The upstream's ``instructions`` and ``serverInfo`` are
+included for display only; they are never forwarded to an agent.
 
 ``--clear`` lists again and, only if every included tool matches its pin, clears the server's
 drift marks and re-evaluates the server's live connections, so the tools come back for agents.
@@ -29,6 +31,7 @@ from typing import Any, Literal
 import anyio
 from mcp.types import Implementation, ServerCapabilities, Tool
 
+from ..common.policy.attention import attention
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from . import logs, pins
@@ -42,9 +45,9 @@ MAX_INSTRUCTIONS_CHARS = 16_384
 WAIT_EXTRA = 15.0  # seconds beyond list_timeout a review waits for its listing
 
 # ok: exposed. marked: matches its pin, hidden by a drift mark. blocked: matches its pin, hidden
-# because on_drift: fail blocked the server. The rest are G.2's report kinds.
+# because on_drift: fail blocked the server. The rest are G.2's report kinds, declined among them.
 ToolState = Literal[
-    "ok", "marked", "blocked", "drift", "unreviewed", "invalid", "duplicate", "missing"
+    "ok", "marked", "blocked", "drift", "unreviewed", "declined", "invalid", "duplicate", "missing"
 ]
 MATCHING: frozenset[str] = frozenset({"ok", "marked", "blocked"})
 
@@ -93,7 +96,7 @@ def _state(
         return "ok"
     kinds = {report.kind for report in reports}
     kind: ToolState
-    for kind in ("duplicate", "invalid", "drift", "unreviewed"):
+    for kind in ("duplicate", "invalid", "drift", "unreviewed", "declined"):
         if kind in kinds:
             return kind
     if pin is None or policy.review.get(name) != pin:
@@ -212,6 +215,7 @@ def report(
             "approve": list(policy.tools.approve),
             "on_drift": policy.on_drift,
             "review": dict(policy.review),
+            "declined": dict(policy.declined),
         },
         "protocol_version": protocol_version,
         "server_info": info,
@@ -220,6 +224,7 @@ def report(
         "marked": sorted(marked),
         "tools": entries,
         "clean": not marked and all(entry["state"] == "ok" for entry in included),
+        "attention": attention(evaluation.listed, policy, marks).as_dict(),
     }
     if offered is not None:
         answer["offered"] = dict(offered)
@@ -337,6 +342,15 @@ def _no_reviewed_copy(pin: str) -> Mapping[str, Any] | None:
     return None
 
 
+def toolkit_reviewed(policy: ViewToolkitServer, evaluation: pins.Evaluation) -> pins.Reviewed:
+    """The toolkit server as its review reads it: with ``pinning: off`` every exposed tool is
+    pinned to its own definition."""
+    if policy.pinning == "off":
+        exposed = {name: tool.pin for name, tool in evaluation.exposed.items()}
+        return SelfPinned(policy.tools, exposed, declined=policy.declined)
+    return policy
+
+
 def toolkit_report(
     server: str,
     loaded: Loaded,
@@ -348,9 +362,7 @@ def toolkit_report(
     """The review of a loaded toolkit: its own definitions, no upstream involved."""
     marked = {tool for tool, _ in marks}
     evaluation: pins.Evaluation = loaded.evaluation
-    reviewed: pins.Reviewed = policy
-    if policy.pinning == "off":
-        reviewed = SelfPinned(policy.tools, {n: e.pin for n, e in evaluation.exposed.items()})
+    reviewed = toolkit_reviewed(policy, evaluation)
     entries = []
     for name, spec in sorted(loaded.toolkit.tools.items()):
         tool = Tool.model_validate(spec.definition())
@@ -391,11 +403,13 @@ def toolkit_report(
             "approve": list(policy.tools.approve),
             "on_drift": policy.on_drift,
             "review": dict(policy.review),
+            "declined": dict(policy.declined),
         },
         "blocked": evaluation.blocked,
         "marked": sorted(marked),
         "tools": entries,
         "clean": not marked and all(entry["state"] == "ok" for entry in included),
+        "attention": attention(evaluation.listed, reviewed, marks).as_dict(),
     }
 
 

@@ -683,14 +683,15 @@ def second_run(s9: S9) -> str:
 
 def review(s9: S9, err: str, edit: Callable[[str], str]) -> str:
     """The second run's ``Next:`` commands, as printed: the choices file, ``edit`` as the
-    operator's, and fragment 2 from it."""
+    operator's, and fragment 2 from it. Both exit 1: until fragment 2 is committed, the server
+    lists tools nobody reviewed (M6 design J.5)."""
     files: dict[str, str] = {}
     choose, make = [command for command in printed(err) if command[0][0] == "review"]
     for argv, source, target in (choose, make):
         assert argv[:4] == ["review", SERVER, "--via", "vault"], argv
         stdin = io.StringIO(files[source]) if source is not None else None
         code, out, problem = s9.cli(argv, stdin)
-        assert code == 0, problem
+        assert code == 1, problem
         assert target is not None
         files[target] = edit(out) if target == f"{SERVER}.choices" else out
     assert (choose[2], make[1:]) == (
@@ -709,18 +710,21 @@ def plan_row(label: str, value: str) -> str:
 
 def reviewed_clean(s9: S9) -> None:
     """J1's last step: once fragment 2 is committed and the server assigned, ``review notes``
-    exits 0, here through the vault's review jobs, the surface the vault's container has."""
+    exits 0, here through the vault's review jobs, the surface the vault's container has: the
+    choices file declined the tools it left out (M6 design J.5)."""
     code, out, err = s9.cli(["review", SERVER, "--via", "vault", "--fresh"])
     assert code == 0, out + err
 
 
 def approve(tool: str) -> Callable[[str], str]:
-    """The operator's edit of a choices file: ``tool`` approved, the rest as suggested."""
+    """The operator's edit of a choices file: ``tool`` approved, the rest as suggested, and
+    every tool left out declined, so the review is quiet once fragment 2 is committed (M6 design
+    J.5)."""
 
     def edit(choices: str) -> str:
         edited, count = re.subn(rf"^skip(?=\s+{tool}\s)", "approve", choices, flags=re.M)
         assert count == 1, choices
-        return edited
+        return re.sub(r"^skip(?=\s)", "decline", edited, flags=re.M)
 
     return edit
 

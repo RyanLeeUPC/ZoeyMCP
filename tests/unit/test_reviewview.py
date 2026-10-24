@@ -403,6 +403,26 @@ def test_a_report_is_stale_once_the_servers_tools_changed() -> None:
     assert stale(report, replace(same, tools=other))
 
 
+def test_a_report_is_stale_once_the_servers_declines_changed() -> None:
+    """Fragment 2 writes the report's declined block whole (M6 design J.5): a report made before
+    a decline would undo it (J.2's rule for declines)."""
+    report = held(large())
+    assert not stale(report, NOTES)
+    later = replace(NOTES, declined={"read_01": entry(report, "read_01")["pin"]})
+    assert stale(report, later)
+    body: dict[str, Any] = {"include": [], "allow": [], "approve": []}
+    assert detail(run_diff(report, body, server=later), "review_stale")
+    declined = held(large(declined=["read_01"]))
+    assert not stale(declined, later)
+    assert stale(declined, NOTES)  # undeclined since
+    moved = {"read_01": entry(report, "read_02")["pin"]}
+    assert stale(declined, replace(later, declined=moved))
+    m7 = copy.deepcopy(report)
+    m7["policy"].pop("declined", None)  # an M7 gateway's report ran under no declines
+    assert not stale(m7, NOTES)
+    assert stale(m7, later)
+
+
 # --- the changes (F.6) ---------------------------------------------------------------------------
 
 
@@ -428,6 +448,31 @@ def test_a_review_again_moves_and_drops_and_keeps() -> None:
     )
     kept = changes(report, chosen(["echo", "add", "slow"], ["echo"], ["add", "slow"]))
     assert kept == cli_review.Changes()
+
+
+def test_an_included_tool_leaves_the_servers_declined_block() -> None:
+    """M6 design J.5: the block is written whole once the server has one, so including a
+    declined tool can't leave it in both; with none, the change is M7's."""
+    report = held(large(declined=["read_01", "read_02"]))
+    pins = {name: entry(report, name)["pin"] for name in ("read_01", "read_02")}
+    made = changes(report, chosen(["read_01"], ["read_01"]))
+    assert made == cli_review.Changes(
+        added={"read_01": cli_review.Added("allow", "allow, chosen in the portal")},
+        declined={"read_02": pins["read_02"]},
+    )
+    assert changes(report, chosen([])) == cli_review.Changes(declined=pins)
+    body = {"include": ["read_01"], "allow": ["read_01"], "approve": []}
+    answer = run_diff(report, body, server=replace(NOTES, declined=pins))
+    assert isinstance(answer, dict)
+    assert not [f for f in answer["diff"]["check"] if f["level"] == "error"]
+    entry_ = load_mapping(answer["diff"]["yaml"])["gateway"]["servers"]["notes"]
+    assert entry_["declined"] == {"read_02": pins["read_02"]}
+    # Its title names the three blocks it replaces, as the CLI's choices file does.
+    assert answer["diff"]["yaml"].startswith(
+        "# zoeymcp: review of notes (2 of 2). Replace the tools:, review: and declined: blocks "
+        "of gateway.servers.notes,"
+    )
+    assert changes(held(large()), chosen([])) == cli_review.Changes()
 
 
 def test_a_tool_the_server_no_longer_lists_may_stay_or_go() -> None:
@@ -511,7 +556,9 @@ def test_fragment_2_from_the_choices() -> None:
         heading=cli_review.second_title("notes"),
     )
     assert answer["diff"]["yaml"] == emit(made)
-    assert answer["diff"]["yaml"].startswith("# zoeymcp: review of notes (2 of 2).")
+    assert answer["diff"]["yaml"].startswith(
+        "# zoeymcp: review of notes (2 of 2). Replace the tools: and review: blocks of "
+    )
     entry_ = load_mapping(answer["diff"]["yaml"])["gateway"]["servers"]["notes"]
     assert entry_["tools"] == {
         "include": ["read_01", "add"],

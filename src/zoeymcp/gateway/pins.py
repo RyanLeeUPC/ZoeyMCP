@@ -21,7 +21,7 @@ import re
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence, Set
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from mcp.types import Tool
@@ -169,7 +169,8 @@ def text_problems(definition: Mapping[str, Any]) -> list[TextProblem]:
 
 # --- evaluating a listing (G.2) ------------------------------------------------------------------
 
-ReportKind = Literal["drift", "unreviewed", "missing", "invalid", "duplicate"]
+# declined: listed, not included, and declined at the pin it has now (M6 design J.5).
+ReportKind = Literal["drift", "unreviewed", "declined", "missing", "invalid", "duplicate"]
 # (tool, the policy pin it drifted from). A mark hides the tool until that pin changes.
 Mark = tuple[str, str]
 
@@ -195,6 +196,9 @@ class Evaluation:
     reports: tuple[Report, ...]
     marks: frozenset[Mark]  # every mark that holds for the server after this listing
     blocked: bool  # on_drift: fail was triggered, so nothing is exposed
+    # Every name listed, with its pin; None for a tool reported invalid or duplicate, which
+    # can't be pinned (what the attention decision reads, M6 design J.5).
+    listed: Mapping[str, str | None] = field(default_factory=dict)
 
 
 def tool_problems(definition: Mapping[str, Any], limits: GatewayLimits) -> list[str]:
@@ -223,6 +227,9 @@ class Reviewed(Protocol):
     def review(self) -> Mapping[str, str]: ...
 
     @property
+    def declined(self) -> Mapping[str, str]: ...
+
+    @property
     def on_drift(self) -> Literal["hide", "fail"]: ...
 
 
@@ -235,16 +242,19 @@ def evaluate(
     """Decide which of a listing's tools are exposed (G.2).
 
     ``marks`` are the server's drift marks so far. A mark whose pin is no longer the policy's pin
-    for that tool has cleared, and isn't returned.
+    for that tool has cleared, and isn't returned. A tool that isn't included is ``declined``
+    when the policy declined it at the pin it has now, else ``unreviewed`` (J.5).
     """
     included = set(server.tools.include)
-    review = server.review
+    review, declined = server.review, server.declined
     held = {(tool, pinned) for tool, pinned in marks if review.get(tool) == pinned}
     counts = Counter(_name(tool) for tool in listing)
     exposed: dict[str, ExposedTool] = {}
     reports: list[Report] = []
+    listed: dict[str, str | None] = {}
     for tool in listing:
         name = _name(tool)
+        listed[name] = None
         if counts[name] > 1:
             if not any(report.kind == "duplicate" and report.tool == name for report in reports):
                 reports.append(Report("duplicate", name))
@@ -258,7 +268,11 @@ def evaluate(
         if problems:
             reports.append(Report("invalid", name, pin=projected.pin, reasons=tuple(problems)))
             continue
+        listed[name] = projected.pin
         pinned = review.get(name)
+        if name not in included and declined.get(name) == projected.pin:
+            reports.append(Report("declined", name, pin=projected.pin))
+            continue
         if name not in included or pinned is None:
             reports.append(Report("unreviewed", name, pin=projected.pin))
             continue
@@ -284,4 +298,5 @@ def evaluate(
         reports=tuple(reports),
         marks=frozenset(held),
         blocked=blocked,
+        listed=listed,
     )

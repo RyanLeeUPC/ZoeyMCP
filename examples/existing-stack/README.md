@@ -140,7 +140,7 @@ with a route out, which is how a stack network created without `--internal` show
 c="docker compose -f examples/existing-stack/compose.yaml"
 $c run --rm --no-deps -T -v "$PWD/examples/existing-stack:/p:ro" vault \
     check --emit-egress-allowlist --allowlist-format squid --check /p/zoeymcp-squid.conf
-$c exec -T gateway zoeymcp review notes            # exit 0 for each server
+$c exec -T gateway zoeymcp review notes            # exit 0 once it lists no tool nobody reviewed (include or decline each)
 $c exec -T vault zoeymcp health --json --strict > /dev/null
 $c exec -T gateway zoeymcp gateway-status
 curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: wrong.example' http://127.0.0.1:8081/   # 421

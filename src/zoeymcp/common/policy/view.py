@@ -8,6 +8,9 @@ path). A toolkit server carries its module, which the gateway imports, and its s
 route prefix, the connector's kind (never its name) and the toolkit's rules as full vault paths.
 
 ``digest`` is the canonical digest of everything else, so it changes exactly when the view does.
+A field M6 added (``declined``, M6 design A.3) is left out of both the digest and the served bytes
+while it is empty, so a policy that doesn't use it keeps the view an M7 vault served, digest and
+all, and an older gateway meets the field only once the operator uses it (CR-6, CR-7).
 The module is pure and needs only pydantic, so the vault builds the view without the gateway's
 dependencies, and the gateway parses it with the same models.
 """
@@ -16,7 +19,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Annotated, Literal
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import Field, StringConstraints, ValidationError, field_validator
 
@@ -81,6 +84,8 @@ class ViewRemoteServer(_Model):
     vault_path: VaultPath
     tools: Tools
     review: dict[ToolName, Pin]
+    # M6 A.3: left out of the digest and the served bytes while empty (_OMITTED_WHEN_EMPTY).
+    declined: dict[ToolName, Pin] = Field(default_factory=dict)
     on_drift: Literal["hide", "fail"]
     shared_session: bool
     wrap_results: bool
@@ -108,6 +113,7 @@ class ViewToolkitServer(_Model):
     tools: Tools
     pinning: Literal["required", "off"]
     review: dict[ToolName, Pin]
+    declined: dict[ToolName, Pin] = Field(default_factory=dict)  # as a remote server's
     on_drift: Literal["hide", "fail"]
     slots: dict[SlotName, ViewSlot]
     wrap_results: bool
@@ -146,9 +152,23 @@ class GatewayView(_Model):
     gateway: ViewGateway
 
 
+# A server's fields M6 added, which the digest and the served bytes leave out while empty (A.3).
+_OMITTED_WHEN_EMPTY: Final = ("declined",)
+
+
+def _dumped(gateway: ViewGateway) -> dict[str, Any]:
+    """The view's content as plain data, with each of a server's new fields left out while empty."""
+    data = gateway.model_dump()
+    for server in data["servers"].values():
+        for member in _OMITTED_WHEN_EMPTY:
+            if not server[member]:
+                del server[member]
+    return data
+
+
 def view_digest(gateway: ViewGateway) -> str:
     """The digest of a view with this content."""
-    return canonical.digest({"v": VIEW_VERSION, "gateway": gateway.model_dump()})
+    return canonical.digest({"v": VIEW_VERSION, "gateway": _dumped(gateway)})
 
 
 def _toolkit(name: str, server: ToolkitServer, policy: Policy) -> ViewToolkitServer:
@@ -177,6 +197,7 @@ def _toolkit(name: str, server: ToolkitServer, policy: Policy) -> ViewToolkitSer
         tools=server.tools,
         pinning=server.pinning,
         review=dict(server.review),
+        declined=dict(server.declined),
         on_drift=server.on_drift,
         slots=slots,
         wrap_results=server.wrap_results,
@@ -195,6 +216,7 @@ def _server(name: str, server: Server, policy: Policy, prefixes: dict[str, str])
         vault_path=prefix + server.path,
         tools=server.tools,
         review=dict(server.review),
+        declined=dict(server.declined),
         on_drift=server.on_drift,
         shared_session=server.shared_session,
         wrap_results=server.wrap_results,
@@ -236,7 +258,9 @@ def build_view(policy: Policy) -> GatewayView:
 
 def dump_view(view: GatewayView) -> bytes:
     """The view as canonical JSON, as the vault serves it."""
-    return canonical.dumps_canonical(view.model_dump())
+    return canonical.dumps_canonical(
+        {"v": view.v, "digest": view.digest, "gateway": _dumped(view.gateway)}
+    )
 
 
 def _location(location: Sequence[int | str]) -> str:

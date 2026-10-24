@@ -26,7 +26,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from .check import check_policy
 from .findings import Finding, format_location
-from .merge import Merged, Path, describe, merge
+from .merge import REVIEW_BLOCKS, Merged, Path, describe, merge
 from .schema import (
     _SCOPE_TOKEN,
     MAX_SCOPES,
@@ -44,7 +44,14 @@ from .schema import (
 
 Reason = Literal["name_taken", "diff_invalid"]
 CommentKind = Literal[
-    "added", "changed_was", "kept", "not_included", "error_finding", "suggested", "merge_hint"
+    "added",
+    "changed_was",
+    "kept",
+    "not_included",
+    "declined",
+    "error_finding",
+    "suggested",
+    "merge_hint",
 ]
 Era = Literal["auto", "modern", "legacy"]
 ScopeSeparator = Literal[" ", ","]
@@ -55,8 +62,8 @@ _TOOL_NAME: Final = TypeAdapter(ToolName)
 _ENTRY: Final = TypeAdapter(PrivateHostPort)
 _ERA: Final[TypeAdapter[Era]] = TypeAdapter(Era)
 _SEPARATOR: Final[TypeAdapter[ScopeSeparator]] = TypeAdapter(ScopeSeparator)
-# The blocks a review's op writes, each replaced whole. A fragment may also replace a server's
-# declined block (merge.REVIEW_BLOCKS), which no op writes yet.
+# The blocks a review's op writes, each replaced whole: its declined block too
+# (merge.REVIEW_BLOCKS) when the op holds one (M6 design J.3).
 _REVIEW_WRITES: Final = ("tools", "review")
 
 
@@ -111,19 +118,24 @@ class AddEgressPrivate:
 
 @dataclass(frozen=True)
 class SetServerReview:
-    """A review's result for one server: its ``tools`` and ``review`` replaced whole, and its
-    ``era`` when the review learned it."""
+    """A review's result for one server: its ``tools`` and ``review`` replaced whole, its
+    ``declined`` too unless it is ``None`` (left as it is), and its ``era`` when the review
+    learned it."""
 
     name: str
     tools: Tools
     review: Mapping[str, str]
     era: str | None = None
+    declined: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         _name(self.name)
         # A copy no caller holds, checked as the schema checks a server's review.
         pins = _REVIEW.validate_python(dict(self.review), strict=True)
         object.__setattr__(self, "review", MappingProxyType(pins))
+        if self.declined is not None:  # the same map of names to pins
+            declined = _REVIEW.validate_python(dict(self.declined), strict=True)
+            object.__setattr__(self, "declined", MappingProxyType(declined))
         if self.era is not None:
             _ERA.validate_python(self.era)  # a Literal takes only its own strings
 
@@ -217,6 +229,8 @@ class PolicyChange:
                 out.setdefault("egress_private", []).append(op.entry)
             elif isinstance(op, SetServerReview):
                 block: dict[str, Any] = {"tools": _plain(op.tools), "review": dict(op.review)}
+                if op.declined is not None:
+                    block["declined"] = dict(op.declined)
                 if op.era is not None:
                     block["era"] = op.era
                 _servers(out)[op.name] = block
@@ -227,7 +241,8 @@ class PolicyChange:
         paths: list[Path] = []
         for op in self.ops:
             if isinstance(op, SetServerReview):
-                paths += [("gateway", "servers", op.name, block) for block in _REVIEW_WRITES]
+                blocks = _REVIEW_WRITES if op.declined is None else REVIEW_BLOCKS
+                paths += [("gateway", "servers", op.name, block) for block in blocks]
             elif isinstance(op, SetCredential):
                 paths.append(("credentials", op.name))
         return tuple(paths)

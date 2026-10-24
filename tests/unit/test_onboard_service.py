@@ -1974,8 +1974,8 @@ async def test_the_second_run_compares_and_stores_nothing(
         },
         {
             "do": "make_fragment",
-            "label": "Edit notes.choices (skip, allow or approve on each line), then make "
-            "fragment 2",
+            "label": "Edit notes.choices (skip, allow, approve or decline on each line; decline "
+            "the tools you leave out), then make fragment 2",
             "command": "zoeymcp review notes --via vault --choices -",
             "via": "exec",
             "piped": True,

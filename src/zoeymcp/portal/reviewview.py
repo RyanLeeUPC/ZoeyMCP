@@ -16,12 +16,14 @@ classification on the page, and never includes a tool (E-9).
 
 :func:`diff` builds fragment 2 (E.4) from the operator's choices, ``{"include", "allow",
 "approve", "indent"?}``, as the CLI's choices file does: the same change (``cli/review.py``'s
-:func:`~zoeymcp.cli.review.fragment`, its two blocks replacing the server's), checked merged into
-the running policy, then written by the emitter. It refuses ``bad_body`` for choices of the wrong
-shape, ``review_stale`` when the server's tools in the running policy aren't the ones the review
-ran under (a reload since, GR-11), and ``diff_invalid`` for an unknown tool, a tool in both lists,
-an included tool left unclassified, a classified one not included, an unpinnable tool newly
-included, a toolkit's consequential tool in ``allow``, or a merged policy that fails ``check``.
+:func:`~zoeymcp.cli.review.fragment`, its two blocks replacing the server's, and its ``declined``
+block too once the server has one, M6 design J.5, its title then naming all three), checked
+merged into the running policy, then written by the emitter. It refuses ``bad_body`` for choices
+of the wrong shape, ``review_stale`` when the server's tools or declines in the running policy
+aren't the ones the review ran under (a reload since, GR-11), and ``diff_invalid`` for an
+unknown tool, a tool in both lists, an included tool left unclassified, a classified one not
+included, an unpinnable tool newly included, a toolkit's consequential tool in ``allow``, or a
+merged policy that fails ``check``.
 Nothing is saved: declarative mode.
 """
 
@@ -37,6 +39,7 @@ from ..cli.review import (
     Added,
     Changes,
     Classification,
+    declined_block,
     fragment,
     listed,
     pinnable,
@@ -268,7 +271,9 @@ def choices(body: Mapping[str, Any], most: int) -> Choices | Refusal:
 
 def stale(report: Mapping[str, Any], server: Listed | None) -> bool:
     """Whether the running policy's entry for the server isn't the one the review ran under
-    (GR-11): gone, of another kind, or other tools, classifications or ``on_drift``."""
+    (GR-11): gone, of another kind, or other tools, classifications, ``on_drift`` or declines
+    (fragment 2 writes the report's ``declined`` block, which would undo a later decline; M6
+    design J.2, J.5; a report without the block ran under none)."""
     if server is None or server.kind != report["kind"]:
         return True
     ran, tools = report["policy"], server.tools
@@ -277,6 +282,7 @@ def stale(report: Mapping[str, Any], server: Listed | None) -> bool:
         or sorted(tools.allow) != sorted(ran["allow"])
         or sorted(tools.approve) != sorted(ran["approve"])
         or server.on_drift != ran["on_drift"]
+        or dict(server.declined) != dict(ran.get("declined") or {})
     )
 
 
@@ -319,7 +325,10 @@ def changes(report: Mapping[str, Any], chosen: Choices) -> Changes | Refusal:
         if name in included and held.get(name) != chosen.classified(name)
     }
     dropped = frozenset(name for name in included if name not in picked)
-    return Changes(added=added, dropped=dropped, moved=moved)
+    # The server's declined block, an included tool leaving it, as the CLI's snippet writes it
+    # (M6 design J.5); none while the server has none, so the fragment stays M7's.
+    declined = declined_block(report, {}, included=tuple(added))
+    return Changes(added=added, dropped=dropped, moved=moved, declined=declined)
 
 
 def diff(
@@ -344,7 +353,8 @@ def diff(
         return made
     name = report["server"]
     try:
-        change = fragment(report, made, heading=second_title(name))
+        heading = second_title(name, declined=made.declined is not None)
+        change = fragment(report, made, heading=heading)
         findings = validate(policy, change)
         text = emit(change, indent=chosen.indent, target=chosen.target)
     except ChangeRefused as exc:

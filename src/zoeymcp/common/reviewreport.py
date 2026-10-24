@@ -8,9 +8,11 @@ an entry without one is a tool), so M6's drift review of any server kind reads t
 
 M6 (design J.1) adds what a drift review needs: a drift entry's ``reviewed`` definition, the one
 the policy's pin names, from the gateway's definition store; the policy block's ``review`` and
-``declined`` maps, the server's pins and declines the review ran under; and a remote report's
-``offered``, what the upstream advertises beyond tools (fold-in 3.8). Each has a default, so a
-report from an M7 gateway, which writes none of them, still reads (CR-6).
+``declined`` maps, the server's pins and declines the review ran under; a remote report's
+``offered``, what the upstream advertises beyond tools (fold-in 3.8); and both kinds'
+``attention``, the attention decision for the listing (J.5), with the ``declined`` state for a
+tool the policy declined at the pin it has. Each has a default, so a report from an M7 gateway,
+which writes none of them, still reads (CR-6).
 
 :func:`read` takes one report under the running limits: the model, the caps that follow
 ``gateway.limits`` (GR-30), then the integrity check (fold-in C25, X11), which recomputes every
@@ -81,7 +83,9 @@ _UNPINNABLE: Final = ("invalid", "duplicate")
 _LEVELS: Final = ("error", "warning", "note")
 _LOCATIONS_SHOWN = 5
 
-State = Literal["ok", "marked", "blocked", "drift", "unreviewed", "invalid", "duplicate", "missing"]
+State = Literal[
+    "ok", "marked", "blocked", "drift", "unreviewed", "declined", "invalid", "duplicate", "missing"
+]
 ProtocolVersion = Literal["2026-07-28", "2025-11-25", "2025-06-18"]
 Names = Annotated[list[ToolName], Field(max_length=NAMES_MAX)]
 Text = Annotated[str, Field(max_length=TEXT_MAX)]
@@ -181,6 +185,17 @@ class Offered(_Model):
     logging: bool
 
 
+class Attention(_Model):
+    """The attention decision for the listing (``common/policy/attention.py``, J.5): the tools
+    that drifted, are marked, are new, were declined at another pin, and are missing."""
+
+    drifted: Names
+    marked: Names
+    new: Names
+    changed_declined: Names
+    missing: Names
+
+
 class ServerInfo(_Model):
     name: Text
     version: Text
@@ -204,6 +219,7 @@ class RemoteReport(_Model):
     tools: Annotated[list[ToolEntry], Field(max_length=2 * NAMES_MAX)]
     clean: bool
     offered: Offered | None = None  # none when the gateway didn't see the handshake, or is M7's
+    attention: Attention | None = None  # none from an M7 gateway
 
 
 class ToolkitReport(_Model):
@@ -221,6 +237,7 @@ class ToolkitReport(_Model):
     marked: Names
     tools: Annotated[list[ToolkitEntry], Field(max_length=2 * NAMES_MAX)]
     clean: bool
+    attention: Attention | None = None  # none from an M7 gateway
 
 
 ReviewReport = Annotated[RemoteReport | ToolkitReport, Field(discriminator="kind")]

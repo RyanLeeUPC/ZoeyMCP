@@ -19,6 +19,14 @@ operator: ``check`` fails until it is in ``allow`` or ``approve`` (nothing is im
 line is ever written for a tool with an error finding. The snippet's comments are the emitter's
 fixed kinds, so no upstream text reaches it.
 
+``--decline TOOL`` records a listed tool the operator leaves out under the server's ``declined``
+at the pin shown, and ``--decline-rest`` every listed tool the snippet doesn't include (M6 design
+J.3, J.5; G-19), so the server ends quiet: a tool that is neither included nor declined at the
+pin it has now is one nobody reviewed, and ``review`` exits 1 for it, naming it on a line of its
+own ("3 listed that nobody reviewed: ..."), as for drift, a mark or a missing tool (the attention
+decision, ``common/policy/attention.py``). A snippet writes ``declined`` whole once the server
+has one or the options decline a tool, an included tool leaving it; otherwise it is M7's.
+
 For a toolkit server (M4 design H.6), ``--add TOOL`` puts a tool its code declares consequential
 into ``approve`` ("declared by the toolkit") and leaves a routine one to the operator, as for a
 remote tool. With ``pinning: off`` the snippet has no pins, and every definition is printed, so an
@@ -43,6 +51,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal, TextIO
 
+from ..common.policy import attention
 from ..common.policy.change import Comment, PolicyChange, SetServerReview
 from ..common.policy.emit import emit
 from ..common.policy.schema import Tools
@@ -63,6 +72,7 @@ STATE_LABELS = {
     "blocked": "BLOCKED",
     "drift": "DRIFT",
     "unreviewed": "unreviewed",
+    "declined": "declined",
     "invalid": "INVALID",
     "duplicate": "DUPLICATE",
     "missing": "MISSING",
@@ -106,6 +116,8 @@ class Choices:
     allow: tuple[str, ...] = ()
     approve: tuple[str, ...] = ()
     allow_read_only: bool = False
+    decline: tuple[str, ...] = ()
+    decline_rest: bool = False
 
 
 def listed(review: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -146,17 +158,21 @@ def read_only(review: Mapping[str, Any]) -> list[str]:
 
 
 def check_choices(review: dict[str, Any], choices: Choices) -> None:
-    """Refuse an ``--add``, ``--allow``, ``--approve`` or ``--repin`` that the review doesn't
-    allow."""
+    """Refuse an ``--add``, ``--allow``, ``--approve``, ``--decline`` or ``--repin`` that the
+    review doesn't allow."""
     by_name = {entry["name"]: entry for entry in review["tools"]}
     named = [*choices.add, *choices.allow, *choices.approve]
     twice = sorted({name for name in named if named.count(name) > 1})
     if twice:
         raise UsageError(f"{', '.join(twice)}: name it in one of --add, --allow and --approve")
+    both = sorted(set(choices.decline) & set(named))
+    if both:
+        raise UsageError(f"{', '.join(both)}: --decline leaves a tool out, so don't include it")
     for option, names in (
         ("--add", choices.add),
         ("--allow", choices.allow),
         ("--approve", choices.approve),
+        ("--decline", choices.decline),
     ):
         for name in names:
             _check_new(option, name, by_name.get(name))
@@ -205,12 +221,34 @@ class Added:
 class Changes:
     """What a snippet changes in the server's entry: ``added`` tools included, in order;
     ``dropped`` ones taken out; ``moved`` ones, included already, classified anew; ``repin``
-    ones, drifted, given their new pin. Every other tool stays as the policy has it."""
+    ones, drifted, given their new pin; ``declined``, the server's whole ``declined`` block
+    (:func:`declined_block`), or ``None`` to leave it as it is. Every other tool stays as the
+    policy has it."""
 
     added: Mapping[str, Added] = field(default_factory=dict)
     dropped: frozenset[str] = frozenset()
     moved: Mapping[str, Classification] = field(default_factory=dict)
     repin: frozenset[str] = frozenset()
+    declined: Mapping[str, str] | None = None
+
+
+def declined_block(
+    review: Mapping[str, Any],
+    declines: Mapping[str, str],
+    *,
+    undeclined: Sequence[str] = (),
+    included: Sequence[str] = (),
+) -> dict[str, str] | None:
+    """The server's ``declined`` block once ``declines`` (tool, the pin shown) are recorded,
+    ``undeclined`` tools taken out of it and ``included`` ones leave it (J.3), or ``None`` when
+    the server has none and nothing is declined, so the snippet stays M7's."""
+    before: Mapping[str, str] = review["policy"].get("declined") or {}
+    if not before and not declines:
+        return None
+    block = {**before, **declines}
+    for name in (*undeclined, *included):
+        block.pop(name, None)
+    return dict(sorted(block.items()))
 
 
 def planned(review: Mapping[str, Any], choices: Choices) -> Changes:
@@ -228,19 +266,32 @@ def planned(review: Mapping[str, Any], choices: Choices) -> Changes:
         added[name] = Added("approve", "approve")
     if choices.allow_read_only:
         for name in read_only(review):
-            added.setdefault(name, Added("allow", "allowed because the server marks it read-only"))
-    return Changes(added=added, repin=choices.repin)
+            if name not in choices.decline:
+                added.setdefault(
+                    name, Added("allow", "allowed because the server marks it read-only")
+                )
+    declines = {name: by_name[name]["pin"] for name in choices.decline}
+    if choices.decline_rest:
+        for name, entry in by_name.items():
+            if not entry["included"] and name not in added and pinnable(entry):
+                declines.setdefault(name, entry["pin"])
+    declined = declined_block(review, declines, included=tuple(added))
+    return Changes(added=added, repin=choices.repin, declined=declined)
 
 
-def title(server: str) -> str:
+def _blocks(declined: bool) -> str:
+    return "tools:, review: and declined: blocks" if declined else "tools: and review: blocks"
+
+
+def title(server: str, *, declined: bool = False) -> str:
     """The snippet's title: what to do with it."""
-    return f"review of {server}. Replace the tools: and review: blocks of gateway.servers.{server}."
+    return f"review of {server}. Replace the {_blocks(declined)} of gateway.servers.{server}."
 
 
-def second_title(server: str) -> str:
+def second_title(server: str, *, declined: bool = False) -> str:
     """Fragment 2's title (E.4): the choices file's fragment, after onboarding's fragment 1."""
     return (
-        f"review of {server} (2 of 2). Replace the tools: and review: blocks of "
+        f"review of {server} (2 of 2). Replace the {_blocks(declined)} of "
         f"gateway.servers.{server}, then assign {server} to its clients."
     )
 
@@ -249,12 +300,13 @@ def fragment(
     review: Mapping[str, Any], changes: Changes, *, heading: str | None = None
 ) -> PolicyChange:
     """The server's entry with ``changes`` made, as a change for the emitter: its ``tools`` and
-    ``review`` replaced whole, and its ``era`` when the review learned it. A tool with an error
-    finding gets no pin; a drifted, missing or unpinnable included tool keeps the pin it has, so
-    it stays hidden. Raises ``ValueError`` for a name the policy can't hold."""
+    ``review`` replaced whole, its ``declined`` too when ``changes`` hold it, and its ``era``
+    when the review learned it. A tool with an error finding gets no pin; a drifted, missing or
+    unpinnable included tool keeps the pin it has, so it stays hidden. Raises ``ValueError`` for
+    a name the policy can't hold."""
     server, policy = review["server"], review["policy"]
     by_name = {e["name"]: e for e in review["tools"] if TOOL_NAME.fullmatch(e["name"])}
-    dropped, moved = changes.dropped, changes.moved
+    dropped, moved, declined = changes.dropped, changes.moved, changes.declined
     include = [name for name in policy["include"] if name not in dropped]
     include += [name for name in changes.added if name not in include]
     classes: dict[Classification, list[str]] = {"allow": [], "approve": []}
@@ -287,18 +339,20 @@ def fragment(
                 pins[name] = pinned
                 kept.append(Comment("kept", name, _kept_why(server, name, entry)))
         elif state != "missing":
-            if pinnable(entry):
-                others.append(Comment("not_included", name, f"{pin}; {suggested_words(entry)}"))
-            else:
+            if not pinnable(entry):
                 others.append(Comment("error_finding", name, f"review {server} --show {name}"))
+            elif declined is not None and declined.get(name) == pin:
+                others.append(Comment("declined", name, pin))
+            else:
+                others.append(Comment("not_included", name, f"{pin}; {suggested_words(entry)}"))
     notes += [*changed, *kept, *others]
     if review.get("kind") == "toolkit" and review.get("pinning") == "off":
         pins = {}
         notes.append(Comment("merge_hint", server, "pinning: off: definitions follow the image"))
     tools = Tools(include=include, allow=classes["allow"], approve=classes["approve"])
     era = review.get("era") if review.get("era") in ("modern", "legacy") else None
-    op = SetServerReview(server, tools, pins, era=era)
-    return PolicyChange(heading or title(server), (*notes, op))
+    op = SetServerReview(server, tools, pins, era=era, declined=declined)
+    return PolicyChange(heading or title(server, declined=declined is not None), (*notes, op))
 
 
 def _kept_why(server: str, name: str, entry: Mapping[str, Any]) -> str:
@@ -331,7 +385,7 @@ def _tool_line(entry: dict[str, Any], width: int) -> str:
     detail = short_pin(entry["pin"])
     if entry.get("consequential"):
         detail += "  consequential"
-    if not entry["included"] and state == "unreviewed":
+    if not entry["included"] and state in ("unreviewed", "declined"):
         detail += "  not included"
     elif state == "marked":
         detail += "  hidden: a drift mark holds (review --clear once it matches)"
@@ -369,6 +423,9 @@ def render(review: dict[str, Any], choices: Choices) -> list[str]:
     ]
     width = max((len(untrusted(entry["name"], 128)) for entry in shown), default=0)
     lines += [_tool_line(entry, width) for entry in shown]
+    unreviewed = unreviewed_line(review.get("attention"))
+    if unreviewed is not None:
+        lines.append(unreviewed)
     if review.get("cleared"):
         lines.append(f"cleared drift marks: {', '.join(review['cleared'])}")
     findings = [(entry["name"], finding) for entry in shown for finding in entry["findings"]]
@@ -394,8 +451,24 @@ def render(review: dict[str, Any], choices: Choices) -> list[str]:
     return lines
 
 
+def _quiet(found: Mapping[str, Any] | None) -> bool:
+    """The attention decision a review or status carries: quiet when there is none (an M7
+    gateway's, or a server not listed yet)."""
+    return found is None or attention.quiet(attention.loaded(found))
+
+
+def unreviewed_line(found: Mapping[str, Any] | None) -> str | None:
+    """``3 listed that nobody reviewed: a, b, c`` (J2), or ``None`` when there are none."""
+    if found is None:
+        return None
+    names = attention.loaded(found).unreviewed()
+    return f"{len(names)} listed that nobody reviewed: {', '.join(names)}" if names else None
+
+
 def exit_code(review: dict[str, Any]) -> int:
-    return EXIT_CLEAN if review.get("clean") else EXIT_NEEDS_OPERATOR
+    """0 when every included tool matches and the attention decision is quiet (J.5)."""
+    clean = review.get("clean") and _quiet(review.get("attention"))
+    return EXIT_CLEAN if clean else EXIT_NEEDS_OPERATOR
 
 
 def write_lines(lines: Sequence[str], out: TextIO) -> None:
@@ -500,13 +573,18 @@ def counts_line(counts: Mapping[str, int]) -> str:
 
 
 def summary(status: dict[str, Any]) -> tuple[list[str], int]:
-    """``review`` with no server: one line per server, from the gateway's status."""
+    """``review`` with no server: one line per server, from the gateway's status, with the
+    tools it lists that nobody reviewed under it. Exit 1 when any server needs the operator, the
+    attention decision's not being quiet included (J.5)."""
     lines: list[str] = []
     code = EXIT_CLEAN
     for name, server in sorted(status["servers"].items()):
+        unreviewed = unreviewed_line(server.get("attention"))
+        if not _quiet(server.get("attention")):
+            code = EXIT_NEEDS_OPERATOR
         if server["kind"] == "toolkit":
             line, needs_operator = _toolkit_summary(name, server)
-            lines.append(line)
+            lines += [line] if unreviewed is None else [line, f"  {unreviewed}"]
             if needs_operator:
                 code = EXIT_NEEDS_OPERATOR
             continue
@@ -524,6 +602,8 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
             f"{counts['missing']}  unreviewed {counts['unreviewed']}  invalid {counts['invalid']}"
             f"  {listed}"
         )
+        if unreviewed is not None:
+            lines.append(f"  {unreviewed}")
     if not status["servers"]:
         lines.append("no gateway servers")
     if not status["fresh"]:

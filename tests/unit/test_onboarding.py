@@ -1419,7 +1419,8 @@ def test_the_second_runs_steps() -> None:
         },
         {
             "do": "make_fragment",
-            "label": "Edit s.choices (skip, allow or approve on each line), then make fragment 2",
+            "label": "Edit s.choices (skip, allow, approve or decline on each line; decline the "
+            "tools you leave out), then make fragment 2",
             "command": "zoeymcp review s --via vault --choices -",
             "via": "exec",
             "piped": True,

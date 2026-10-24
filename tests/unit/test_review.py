@@ -24,6 +24,11 @@ from zoeymcp.gateway.review import ReviewError, report
 
 LIMITS = GatewayLimits()
 C1 = "\x9b"
+# The attention decision with nothing in it (M6 design J.5), as a report or the status carries it.
+QUIET: dict[str, list[str]] = {
+    member: [] for member in ("drifted", "marked", "new", "changed_declined", "missing")
+}
+PIN_OLD = "sha256:" + "0" * 64
 BIDI = "\u202e"
 
 
@@ -407,8 +412,34 @@ def test_tool_lines() -> None:
 
 
 def test_exit_codes() -> None:
-    assert view.exit_code({"clean": True}) == 0
+    assert view.exit_code({"clean": True}) == 0  # an M7 gateway's: no attention decision
     assert view.exit_code({"clean": False}) == 1
+    # M6 design J.5: anything the attention decision holds needs the operator too.
+    assert view.exit_code({"clean": True, "attention": QUIET}) == 0
+    assert view.exit_code({"clean": False, "attention": QUIET}) == 1
+    for member in QUIET:
+        assert view.exit_code({"clean": True, "attention": {**QUIET, member: ["x"]}}) == 1
+
+
+def test_a_tool_nobody_reviewed_is_named_and_needs_the_operator() -> None:
+    """J2: the review prints the line and exits 1; a declined tool is quiet and says so."""
+    server = policy(["a"], {"a": pin("a")}).model_copy(update={"declined": {"c": pin("c")}})
+    answer = reviewed([tool("a"), tool("b"), tool("c"), tool("d")], server)
+    assert states(answer) == {"a": "ok", "b": "unreviewed", "c": "declined", "d": "unreviewed"}
+    assert answer["clean"] is True
+    assert answer["attention"] == {**QUIET, "new": ["b", "d"]}
+    assert view.exit_code(answer) == 1
+    lines = view.render(answer, view.Choices())
+    assert "2 listed that nobody reviewed: b, d" in lines
+    assert lines[3] == f"  c  declined    {view.short_pin(pin('c'))}  not included"
+    # A changed declined tool counts again, under the same line.
+    moved = server.model_copy(update={"declined": {"c": pin("c", "Old.")}})
+    answer = reviewed([tool("a"), tool("c")], moved)
+    assert answer["attention"] == {**QUIET, "changed_declined": ["c"]}
+    assert "1 listed that nobody reviewed: c" in view.render(answer, view.Choices())
+    quiet = reviewed([tool("a"), tool("c")], server)
+    assert view.exit_code(quiet) == 0
+    assert not any("nobody reviewed" in line for line in view.render(quiet, view.Choices()))
 
 
 # --- the summary and gateway-status --------------------------------------------------------------
@@ -427,17 +458,32 @@ REMOTE = {
     "exposed": 2,
     "marked": [],
     "reports": {"unreviewed": ["x"]},
+    "attention": {**QUIET, "new": ["x"]},
     "listed_s_ago": 12.4,
 }
 
 
 def test_the_summary() -> None:
     lines, code = view.summary(status(notes=REMOTE))
-    assert code == 0
+    assert code == 1  # x is a tool nobody reviewed (M6 design J.5)
     assert lines == [
         "notes  modern  exposed 2/2  drift 0  marked 0  missing 0  unreviewed 1  invalid 0  "
         "listed 12 s ago",
+        "  1 listed that nobody reviewed: x",
     ]
+    declined = {**REMOTE, "reports": {"declined": ["x"]}, "attention": QUIET}
+    assert view.summary(status(notes=declined)) == (
+        [
+            "notes  modern  exposed 2/2  drift 0  marked 0  missing 0  unreviewed 0  invalid 0  "
+            "listed 12 s ago"
+        ],
+        0,
+    )
+    # An M7 gateway's status carries no decision: its unreviewed tools need nothing.
+    m7 = {key: value for key, value in REMOTE.items() if key != "attention"}
+    assert view.summary(status(notes=m7)) == (lines[:1], 0)
+    none_yet = {**REMOTE, "attention": None}
+    assert view.summary(status(notes=none_yet)) == (lines[:1], 0)
     marked = {**REMOTE, "marked": ["a"], "listed_s_ago": None, "era": None}
     lines, code = view.summary(status(notes=marked))
     assert code == 1
@@ -500,7 +546,8 @@ def test_review_and_status_use_the_gateway_socket(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv(admin_client.GATEWAY_SOCKET_ENV, "/elsewhere/admin.sock")
     out, err = io.StringIO(), io.StringIO()
     assert main(["gateway-status"], stdin=io.StringIO(), out=out, err=err) == 0
-    assert main(["review", "--socket", "/x.sock"], stdin=io.StringIO(), out=out, err=err) == 0
+    # REMOTE lists a tool nobody reviewed (M6 design J.5).
+    assert main(["review", "--socket", "/x.sock"], stdin=io.StringIO(), out=out, err=err) == 1
     assert seen == ["/elsewhere/admin.sock", "/x.sock"]
 
 
@@ -551,7 +598,8 @@ def test_review_classifies_through_the_cli(monkeypatch: pytest.MonkeyPatch) -> N
     code, out, err = run_cli(
         monkeypatch, fake, "review", "notes", "--allow-read-only", "--approve", "plain"
     )
-    assert (code, err) == (0, "")
+    # Until the snippet is committed, the server lists tools nobody reviewed (M6 design J.5).
+    assert (code, err) == (1, "")
     snippet = out[out.index("# YAML to commit") :].splitlines()[1:]
     assert snippet_entry(snippet)["tools"] == {
         "include": ["plain", "ro"],
@@ -598,7 +646,7 @@ def test_choose_and_choices_over_the_gateways_socket(
     answer = classifying()
     fake = FakeGateway({("POST", "/review/notes"): (200, answer)})
     code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choose", "--suggest")
-    assert (code, err) == (0, "")
+    assert (code, err) == (1, "")  # nothing is reviewed yet (M6 design J.5)
     assert out.splitlines()[1].startswith("# report - sha256:")
     lines = [
         "approve" + line[4:] if line.split()[:2] == ["skip", "plain"] else line
@@ -607,7 +655,7 @@ def test_choose_and_choices_over_the_gateways_socket(
     path = tmp_path / "notes.choices"
     path.write_bytes(("\n".join(lines) + "\n").encode())
     code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choices", str(path))
-    assert code == 0
+    assert code == 1
     assert err.startswith("zoeymcp review: the file includes 2 tools (1 allow, 1 approve). ")
     assert load_mapping(out)["gateway"]["servers"]["notes"]["tools"] == {
         "include": ["plain", "ro"],
@@ -760,9 +808,131 @@ def test_toolkit_servers_in_the_summary_and_status() -> None:
     )
     marked = {**TOOLKIT, "marked": ["send_note"], "reports": {"drift": ["send_note"]}}
     assert view.summary(status(mail=marked))[1] == 1
+    unreviewed = {**TOOLKIT, "attention": {**QUIET, "changed_declined": ["b"], "new": ["a"]}}
+    lines, code = view.summary(status(mail=unreviewed))
+    assert (lines[1:], code) == (["  2 listed that nobody reviewed: a, b"], 1)
+    assert view.summary(status(mail={**TOOLKIT, "attention": QUIET}))[1] == 0
     assert view.status_lines(status(mail=marked, odd=unavailable), None)[1:] == [
         "mail  toolkit  example_toolkits.mail 0.1.0  pinning required  exposed 1/1",
         "  marked: send_note",
         "  drift: send_note",
         "odd  toolkit  unavailable (not_registered)",
     ]
+
+
+# --- --decline and --decline-rest (M6 design J.3, J.5; G-19) -----------------------------------
+
+
+def test_decline_records_a_tool_at_its_pin() -> None:
+    answer = classifying()
+    found = listed_pins(answer)
+    choices = view.Choices(approve=("plain",), decline=("rw",))
+    view.check_choices(answer, choices)
+    lines = view.snippet(answer, choices)
+    assert lines[0] == (
+        "# zoeymcp: review of notes. Replace the tools:, review: and declined: blocks of "
+        "gateway.servers.notes."
+    )
+    assert lines[1] == (
+        "# zoeymcp replace: gateway.servers.notes.tools gateway.servers.notes.review "
+        "gateway.servers.notes.declined"
+    )
+    entry = snippet_entry(lines)
+    assert entry["tools"] == {"include": ["plain"], "allow": [], "approve": ["plain"]}
+    assert entry["declined"] == {"rw": found["rw"]}
+    assert f"# declined: rw ({found['rw']})" in lines
+    assert f"# not included: ro ({found['ro']}; read-only (the server's suggestion))" in lines
+
+
+def test_decline_rest_declines_every_listed_tool_left_out() -> None:
+    """Not one with an error finding, which can't be pinned, so the attention decision leaves
+    it out too."""
+    answer = classifying()
+    found = listed_pins(answer)
+    entry = snippet_entry(
+        view.snippet(answer, view.Choices(allow_read_only=True, decline_rest=True))
+    )
+    assert entry["tools"] == {"include": ["ro"], "allow": ["ro"], "approve": []}
+    assert entry["declined"] == {name: found[name] for name in ("both", "plain", "rw")}
+    # --decline beside it adds nothing, and a declined tool stays out of the bulk allow.
+    choices = view.Choices(allow_read_only=True, decline=("ro",), decline_rest=True)
+    entry = snippet_entry(view.snippet(answer, choices))
+    assert entry["tools"]["include"] == []
+    assert entry["declined"] == {name: found[name] for name in ("both", "plain", "ro", "rw")}
+
+
+def test_a_snippet_writes_declined_once_the_server_has_one() -> None:
+    """Whole: an included tool leaves it, and a declined tool whose pin moved is declined again
+    at the new pin by --decline-rest."""
+    hints = {"readOnlyHint": True}
+    server = policy([], {}).model_copy(
+        update={"declined": {"ro": pins_of_hinted("ro"), "rw": PIN_OLD, "gone": PIN_OLD}}
+    )
+    answer = reviewed([hinted("ro", **hints), hinted("rw", readOnlyHint=False), tool("x")], server)
+    found = listed_pins(answer)
+    entry = snippet_entry(view.snippet(answer, view.Choices()))
+    assert entry["declined"] == {"gone": PIN_OLD, "ro": found["ro"], "rw": PIN_OLD}
+    entry = snippet_entry(view.snippet(answer, view.Choices(allow=("ro",))))
+    assert entry["declined"] == {"gone": PIN_OLD, "rw": PIN_OLD}
+    entry = snippet_entry(view.snippet(answer, view.Choices(add=("x",), decline_rest=True)))
+    assert entry["declined"] == {"gone": PIN_OLD, "ro": found["ro"], "rw": found["rw"]}
+    lines = view.snippet(answer, view.Choices(allow=("ro",)))
+    assert lines[0].endswith(
+        "Replace the tools:, review: and declined: blocks of gateway.servers.notes."
+    )
+    emptied = policy([], {}).model_copy(update={"declined": {"ro": pins_of_hinted("ro")}})
+    included = reviewed([hinted("ro", **hints)], emptied)
+    assert snippet_entry(view.snippet(included, view.Choices(allow=("ro",))))["declined"] == {}
+
+
+def test_no_decline_and_none_in_the_policy_is_m7s_snippet() -> None:
+    lines = view.snippet(classifying(), view.Choices(approve=("plain",)))
+    assert lines[0] == (
+        "# zoeymcp: review of notes. Replace the tools: and review: blocks of "
+        "gateway.servers.notes."
+    )
+    assert "declined" not in snippet_entry(lines)
+    assert not any("declined" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("choices", "message"),
+    [
+        (view.Choices(decline=("nothing",)), "--decline nothing: the server doesn't list it"),
+        (view.Choices(decline=("bad",)), "--decline bad: it has error findings"),
+        (view.Choices(allow=("ro",), decline=("ro",)), "ro: --decline leaves a tool out, so"),
+        (view.Choices(add=("rw",), decline=("rw", "ro")), "rw: --decline leaves a tool out"),
+    ],
+)
+def test_decline_options_that_dont_fit(choices: view.Choices, message: str) -> None:
+    with pytest.raises(view.UsageError, match=message):
+        view.check_choices(classifying(), choices)
+    server = policy(["ro"], {"ro": pins_of_hinted("ro")})
+    included = reviewed([hinted("ro", readOnlyHint=True)], server)
+    with pytest.raises(view.UsageError, match="--decline ro: it is already included"):
+        view.check_choices(included, view.Choices(decline=("ro",)))
+
+
+def test_decline_through_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeGateway({("POST", "/review/notes"): (200, classifying())})
+    code, out, err = run_cli(
+        monkeypatch, fake, "review", "notes", "--approve", "plain", "--decline-rest"
+    )
+    assert (code, err) == (1, "")  # until the snippet is committed
+    assert "4 listed that nobody reviewed: both, plain, ro, rw" in out.splitlines()
+    snippet = out[out.index("# YAML to commit") :].splitlines()[1:]
+    assert sorted(snippet_entry(snippet)["declined"]) == ["both", "ro", "rw"]
+    code, out, err = run_cli(
+        monkeypatch, fake, "review", "notes", "--decline", "rw", "--decline", "rw"
+    )
+    assert code == 1
+    assert sorted(
+        snippet_entry(out[out.index("# YAML to commit") :].splitlines()[1:])["declined"]
+    ) == ["rw"]
+    for option in (["--decline", "rw"], ["--decline-rest"]):
+        assert run_cli(monkeypatch, fake, "review", *option)[2] == (
+            "zoeymcp review: these options need a server\n"
+        )
+        code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choose", *option)
+        assert (code, out) == (2, "")
+        assert "--choose and --choices print text and take no other choices" in err

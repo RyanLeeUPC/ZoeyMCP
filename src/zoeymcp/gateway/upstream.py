@@ -852,7 +852,8 @@ class UpstreamPool:
         for exposed in evaluation.exposed.values():
             self.defs.put(exposed.pin, exposed.definition)
         for report in evaluation.reports:
-            self._report(server, report)
+            if report.kind != "declined":  # the operator's own record: nothing to log
+                self._report(server, report)
         if evaluation.blocked:
             self._report(server, pins.Report("drift", "*", pin="blocked"), kind="server_blocked")
         return evaluation
@@ -941,4 +942,9 @@ def _reopen(old: ViewRemoteServer, new: ViewRemoteServer) -> bool:
 
 
 def _repinned(old: ViewRemoteServer, new: ViewRemoteServer) -> bool:
-    return old.tools != new.tools or old.review != new.review or old.on_drift != new.on_drift
+    return (
+        old.tools != new.tools
+        or old.review != new.review
+        or old.declined != new.declined
+        or old.on_drift != new.on_drift
+    )

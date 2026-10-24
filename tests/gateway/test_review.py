@@ -24,11 +24,13 @@ from tests.gateway.rig import (
     deployment,
     gateway,
     pin_of_fake,
+    pins_of_the_rest,
     raw_policy,
     until,
 )
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy import Policy, check_policy
+from zoeymcp.common.policy.merge import REVIEW_BLOCKS
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import upstream
 
@@ -48,6 +50,16 @@ def anyio_backend() -> str:
 
 def review_pins(fake: McpFake, names: list[str] = TOOLS) -> dict[str, str]:
     return {name: pin_of_fake(fake, name) for name in names}
+
+
+def reviewed_once(fake: McpFake) -> dict[str, Any]:
+    """The rig's options for a server reviewed once: TOOLS included at their pins, and the rest
+    declined, so nothing is left that nobody reviewed (M6 design J.5)."""
+    return {
+        "include": TOOLS,
+        "review": review_pins(fake),
+        "declined": pins_of_the_rest(fake, TOOLS),
+    }
 
 
 @pytest.fixture
@@ -84,10 +96,13 @@ def snippet_of(output: str) -> dict[str, Any]:
 
 
 def merged(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    """``patch`` pasted over ``base``: mappings merge, everything else is replaced."""
+    """``patch`` pasted over ``base``: mappings merge, everything else is replaced, and a
+    server's review blocks are replaced whole, as the snippet's header says."""
     out = dict(base)
     for key, value in patch.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
+        if key in REVIEW_BLOCKS:
+            out[key] = value
+        elif isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = merged(out[key], value)
         else:
             out[key] = value
@@ -115,7 +130,7 @@ async def test_a_clean_server_exits_0_and_its_snippet_changes_nothing(
     tmp_path: Path, cli: Callable[[Running], Cli]
 ) -> None:
     fake = McpFake()
-    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake)}
+    options = reviewed_once(fake)
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         code, out, err = cli(running)("review", SERVER)
         before = raw_policy(deployed.fake_url, **options)
@@ -125,23 +140,49 @@ async def test_a_clean_server_exits_0_and_its_snippet_changes_nothing(
     for name in TOOLS:
         assert any(line.split()[:2] == [name, "ok"] for line in lines)
     assert any(
-        line.split()[:2] == ["counter", "unreviewed"] and line.endswith("not included")
+        line.split()[:2] == ["counter", "declined"] and line.endswith("not included")
         for line in lines
     )
+    assert not any("nobody reviewed" in line for line in lines)
     patch = snippet_of(out)
     server = patch["gateway"]["servers"][SERVER]
     assert server["era"] == "modern"
     assert server["review"] == options["review"]
+    assert server["declined"] == options["declined"]
     assert check_errors(merged(before, patch)) == check_errors(before)
     # Unincluded tools are comments, with their pins.
-    assert f"# not included: counter ({pin_of_fake(fake, 'counter')}; " in out
+    assert f"# declined: counter ({pin_of_fake(fake, 'counter')})" in out
+
+
+async def test_tools_nobody_reviewed_exit_1_until_declined(
+    tmp_path: Path, cli: Callable[[Running], Cli]
+) -> None:
+    """J2's CLI half on the running gateway (M6 design J.5): the tools the policy leaves out are
+    named and the review exits 1; --decline-rest writes them under declined at their pins, and
+    the snippet merged makes the policy the clean test above runs."""
+    fake = McpFake()
+    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake)}
+    with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
+        code, out, err = cli(running)("review", SERVER, "--decline-rest")
+        before = raw_policy(deployed.fake_url, **options)
+    assert (code, err) == (1, ""), err
+    assert "3 listed that nobody reviewed: counter, lookup, report" in out.splitlines()
+    assert any(
+        line.split()[:2] == ["counter", "unreviewed"] and line.endswith("not included")
+        for line in out.splitlines()
+    )
+    server = snippet_of(out)["gateway"]["servers"][SERVER]
+    assert server["declined"] == pins_of_the_rest(fake, TOOLS)
+    after = merged(before, snippet_of(out))
+    assert check_errors(after) == check_errors(before)
+    assert after["gateway"]["servers"][SERVER]["declined"] == reviewed_once(fake)["declined"]
 
 
 async def test_drift_is_shown_with_a_diff_and_marks_the_tool(
     tmp_path: Path, cli: Callable[[Running], Cli]
 ) -> None:
     fake = McpFake(drift=Drift("description", after=1))
-    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake)}
+    options = reviewed_once(fake)
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         async with agent(running) as client:
             assert "echo" in [tool.name for tool in (await client.list_tools()).tools]
@@ -181,7 +222,7 @@ async def test_clear_is_refused_while_drifted_and_restores_once_matching(
 ) -> None:
     # Listing 1 (the agent's) is clean, 2 (a review) drifted, 3 (the next review) clean again.
     fake = McpFake(drift=Drift("description", after=1, flip_back_after=1))
-    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake)}
+    options = reviewed_once(fake)
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         run = cli(running)
         async with agent(running) as client:
@@ -203,12 +244,14 @@ async def test_hostile_definitions_reach_the_terminal_visible_and_unpinned(
     tmp_path: Path, cli: Callable[[Running], Cli]
 ) -> None:
     fake = McpFake(switches={Switch.INJECT_DEFINITIONS, Switch.INJECT_SERVER_INFO})
-    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake)}
+    options = reviewed_once(fake)
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         run = cli(running)
         code, out, err = run("review", SERVER, "--all")
         json_code, json_out, _ = run("review", SERVER, "--format", "json")
-    assert code == 0, err  # the included tools match; the hostile ones aren't included
+    # The included tools match, the rest are declined; a hostile one can't be pinned, so
+    # nothing counts it as nobody's review either.
+    assert code == 0, err
     no_hidden(out)
     assert ZERO_WIDTH not in out
     assert C1_CSI not in out
@@ -232,7 +275,7 @@ async def test_add_includes_a_tool_and_leaves_its_classification_to_the_operator
     tmp_path: Path, cli: Callable[[Running], Cli]
 ) -> None:
     fake = McpFake()
-    options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake)}
+    options = reviewed_once(fake)
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         run = cli(running)
         code, out, _ = run("review", SERVER, "--add", "counter")
@@ -243,6 +286,8 @@ async def test_add_includes_a_tool_and_leaves_its_classification_to_the_operator
     server = snippet_of(out)["gateway"]["servers"][SERVER]
     assert server["tools"]["include"] == [*TOOLS, "counter"]
     assert server["review"]["counter"] == pin_of_fake(fake, "counter")
+    # counter leaves declined, so check finds it in neither block twice.
+    assert "counter" not in server["declined"]
     added = check_errors(merged(before, snippet_of(out))) - check_errors(before)
     assert [path for path, _ in added] == [f"gateway.servers.{SERVER}.tools"]
     assert (bad[0], bad[2]) == (2, "zoeymcp review: --add echo: it is already included\n")
@@ -277,8 +322,10 @@ async def test_an_unassigned_server_can_be_reviewed_first(
     options: dict[str, Any] = {"include": TOOLS, "review": review_pins(fake), "servers": UNASSIGNED}
     with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
         code, out, _ = cli(running)("review", "spare", "--add", "echo")
-    # Nothing is included yet, so nothing needs the operator; --add starts the entry.
-    assert code == 0
+    # Nothing is included yet, so every tool is one nobody reviewed (M6 design J.5); --add
+    # starts the entry.
+    assert code == 1
+    assert "6 listed that nobody reviewed: add, counter, echo, lookup, report, slow" in out
     spare = snippet_of(out)["gateway"]["servers"]["spare"]
     assert spare["tools"] == {"include": ["echo"], "allow": [], "approve": []}
     assert spare["review"] == {"echo": pin_of_fake(fake, "echo")}
@@ -311,6 +358,7 @@ async def test_the_summary_and_status_make_no_upstream_call(
     assert "exposed 3/3" in notes
     assert "marked 0" in notes
     assert "unreviewed 3" in notes
+    assert "  3 listed that nobody reviewed: counter, lookup, report" in summary[1].splitlines()
     assert "mail  toolkit unavailable (not_registered)" in summary[1]
     assert status[0] == 0
     assert status[1].startswith("view sha256:")

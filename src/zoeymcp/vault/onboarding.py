@@ -905,7 +905,9 @@ def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
         ),
         NextStep(
             "make_fragment",
-            f"Edit {choices} (skip, allow or approve on each line), then make fragment 2",
+            # Declining the rest ends the review quiet (M6 design J.5).
+            f"Edit {choices} (skip, allow, approve or decline on each line; decline the tools "
+            "you leave out), then make fragment 2",
             (*review, "--choices", "-"),
             "exec",
             piped=True,
@@ -937,7 +939,9 @@ class Listed:
     ``on_drift`` as the policy has them, the clients it is assigned to, and for a remote server
     whose route has an oauth2 credential, that credential, the resource it names (D.12) and,
     for a ``refresh_token`` grant, whether it holds a refresh token (OPS-13): a
-    ``client_credentials`` grant never holds one, and needs no sign-in."""
+    ``client_credentials`` grant never holds one, and needs no sign-in. ``declined`` is the
+    policy's declined block, which a review report made before a decline no longer matches (M6
+    design J.2, J.5)."""
 
     name: str
     kind: ServerKind
@@ -947,6 +951,7 @@ class Listed:
     credential: str | None = None
     resource: str | None = None
     held: TokenState | None = None
+    declined: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def state(self) -> RowState:
@@ -964,13 +969,16 @@ def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed
     found = []
     for name, server in sorted(_servers(policy).items()):
         assigned = tuple(sorted(c for c, client in clients.items() if name in client.servers))
+        declined = dict(server.declined)
         if isinstance(server, ToolkitServer):
-            found.append(Listed(name, "toolkit", server.tools, server.on_drift, assigned))
+            found.append(
+                Listed(name, "toolkit", server.tools, server.on_drift, assigned, declined=declined)
+            )
             continue
         route = routes.get(server.route)
         credential = None if route is None else route.credential
         cred = None if credential is None else policy.credentials.get(credential)
-        listed = Listed(name, "remote", server.tools, server.on_drift, assigned)
+        listed = Listed(name, "remote", server.tools, server.on_drift, assigned, declined=declined)
         if credential is not None and isinstance(cred, OAuth2Credential):
             held = None
             if cred.grant == "refresh_token":

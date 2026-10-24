@@ -1699,10 +1699,12 @@ async def test_an_onboarding_through_the_socket_and_the_portal_leaks_nothing(
         assert code == 0, err
         assert "Stored the refresh token for notes as notes-refresh.\n" in out
         review = ["review", "notes", "--via", "vault", "--socket", "x"]
+        # Both exit 1 until fragment 2 is committed: the server lists tools nobody reviewed
+        # (M6 design J.5).
         code, choices, err = await world.cli(monkeypatch, [*review, "--choose", "--suggest"], "")
-        assert code == 0, err
+        assert code == 1, err
         code, _, err = await world.cli(monkeypatch, [*review, "--choices", "-"], choices)
-        assert code == 0, err
+        assert code == 1, err
         # The portal: the row, the committed URL again, a Connect by paste and the review.
         answers: list[str] = []
         transport = httpx.ASGITransport(app=world.portal_app)

@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 from mcp.types import Tool
 
 from zoeymcp.common import canonical
+from zoeymcp.common.policy.attention import Attention, attention, quiet
 from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.gateway import pins
@@ -409,6 +410,7 @@ def server(
     include: list[str],
     review: dict[str, str],
     on_drift: str = "hide",
+    declined: dict[str, str] | None = None,
 ) -> ViewRemoteServer:
     return ViewRemoteServer.model_validate(
         {
@@ -416,6 +418,7 @@ def server(
             "vault_path": "/notes/mcp",
             "tools": {"include": include, "allow": include, "approve": []},
             "review": review,
+            "declined": declined or {},
             "on_drift": on_drift,
             "shared_session": False,
             "wrap_results": False,
@@ -518,6 +521,63 @@ def test_a_pin_without_include_is_unreviewed() -> None:
     result = evaluate([named("a")], server([], {"a": pin("a")}), set(), LIMITS)
     assert kinds(result) == [("unreviewed", "a")]
     assert result.exposed == {}
+
+
+def test_a_tool_declined_at_its_pin_is_declined_and_hidden() -> None:
+    """M6 design J.5: the operator saw it and left it out, at this pin."""
+    result = evaluate(
+        [named("a"), named("b")],
+        server(["b"], {"b": pin("b")}, declined={"a": pin("a")}),
+        set(),
+        LIMITS,
+    )
+    assert result.reports == (Report("declined", "a", pin=pin("a")),)
+    assert set(result.exposed) == {"b"}
+    assert result.marks == frozenset()
+
+
+def test_a_declined_tool_that_changed_is_unreviewed_again() -> None:
+    old = pin("a", description="Old.")
+    result = evaluate([named("a")], server([], {}, declined={"a": old}), set(), LIMITS)
+    assert result.reports == (Report("unreviewed", "a", pin=pin("a")),)
+    assert result.exposed == {}
+
+
+def test_an_included_tool_isnt_declined() -> None:
+    """Included and declined both (check refuses it): the include and its pin decide."""
+    policy = server(["a"], {"a": pin("a")}, declined={"a": pin("a")})
+    result = evaluate([named("a")], policy, set(), LIMITS)
+    assert (set(result.exposed), result.reports) == ({"a"}, ())
+    drifted = server(["a"], {"a": pin("a", description="Old.")}, declined={"a": pin("a")})
+    assert kinds(evaluate([named("a")], drifted, set(), LIMITS)) == [("drift", "a")]
+
+
+def test_a_declined_tool_that_cant_be_pinned_is_invalid() -> None:
+    bad = named("a", description="\u200b")
+    policy = server([], {}, declined={"a": project_and_pin(bad).pin})
+    assert kinds(evaluate([bad], policy, set(), LIMITS)) == [("invalid", "a")]
+
+
+def test_every_listed_name_with_its_pin() -> None:
+    """What the attention decision reads: None for a tool that can't be pinned."""
+    broken = named("x").model_copy(update={"input_schema": {"type": "array"}})
+    listing = [named("a"), named("d"), named("d"), named("b", description="\u200b"), broken]
+    result = evaluate(listing, server(["a"], {"a": pin("a")}), set(), LIMITS)
+    assert result.listed == {"a": pin("a"), "d": None, "b": None, "x": None}
+    assert evaluate([], server(["a"], {"a": pin("a")}), set(), LIMITS).listed == {}
+
+
+@pytest.mark.parametrize("on_drift", ["hide", "fail"])
+@pytest.mark.parametrize("bad", ["invalid", "duplicate"])
+def test_an_included_tool_that_cant_be_pinned_needs_the_operator(on_drift: str, bad: str) -> None:
+    """Hidden (or the server blocked), so the attention decision isn't quiet (J.5, Y29)."""
+    listing = [named("a", description="\u200b")] if bad == "invalid" else [named("a")] * 2
+    policy = server(["a"], {"a": pin("a")}, on_drift)
+    result = evaluate(listing, policy, set(), LIMITS)
+    assert (result.exposed, result.blocked) == ({}, on_drift == "fail")
+    found = attention(result.listed, policy, result.marks)
+    assert found == Attention(drifted=("a",))
+    assert not quiet(found)
 
 
 def test_a_drift_mark_is_sticky() -> None:

@@ -11,6 +11,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
@@ -246,6 +247,46 @@ def test_the_gateway_view_is_pinned() -> None:
 
 def test_the_pinned_view_still_parses() -> None:
     assert parse_view(VIEW_BYTES).digest == VIEW_DIGEST
+
+
+# M6 design A.3 (CR-7): a server's declined block, which an M7 policy doesn't have, is in the
+# digest and the bytes only once it holds a tool, so the view above, an M7 policy's, is unchanged.
+VIEW_POLICY_DECLINED: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+VIEW_POLICY_DECLINED["gateway"]["servers"]["notes-read"]["declined"] = {
+    "delete_note": "sha256:" + "2" * 64
+}
+VIEW_POLICY_DECLINED["gateway"]["servers"]["mail"]["declined"] = {"send_mail": "sha256:" + "3" * 64}
+VIEW_DIGEST_DECLINED = "sha256:0224e86bdbba375baffe849e015be4ef1c309e0f373a6780ef86c972f1ba069c"
+VIEW_BYTES_DECLINED = (
+    VIEW_BYTES.replace(VIEW_DIGEST.encode(), VIEW_DIGEST_DECLINED.encode())
+    .replace(
+        b'"mail":{"call_timeout":null,',
+        b'"mail":{"call_timeout":null,"declined":{"send_mail":"sha256:' + b"3" * 64 + b'"},',
+    )
+    .replace(
+        b'"notes-read":{"call_timeout":null,',
+        b'"notes-read":{"call_timeout":null,"declined":{"delete_note":"sha256:'
+        + b"2" * 64
+        + b'"},',
+    )
+)
+
+
+def test_a_view_with_declined_tools_is_pinned() -> None:
+    view = build_view(Policy.model_validate(VIEW_POLICY_DECLINED))
+    assert view.digest == VIEW_DIGEST_DECLINED
+    assert dump_view(view) == VIEW_BYTES_DECLINED
+    assert parse_view(VIEW_BYTES_DECLINED).digest == VIEW_DIGEST_DECLINED
+
+
+def test_an_empty_declined_block_leaves_the_m7_view() -> None:
+    """Declined in the policy but empty: the M7 digest and bytes, which an M7 gateway parses."""
+    policy: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+    for server in policy["gateway"]["servers"].values():
+        server["declined"] = {}
+    view = build_view(Policy.model_validate(policy))
+    assert (view.digest, dump_view(view)) == (VIEW_DIGEST, VIEW_BYTES)
+    assert b"declined" not in VIEW_BYTES
 
 
 # --- tool pins (M3 design G.1) ------------------------------------------------------------------

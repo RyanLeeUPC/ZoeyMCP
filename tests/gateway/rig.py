@@ -27,14 +27,14 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import McpFake
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.schema import hash_token
+from zoeymcp.common.policy.schema import GatewayLimits, hash_token
 from zoeymcp.common.policy.view import GatewayView, ViewRemoteServer, build_view
 from zoeymcp.gateway import logs
 from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
-from zoeymcp.gateway.pins import project_and_pin
+from zoeymcp.gateway.pins import ProjectionError, project_and_pin, tool_problems
 from zoeymcp.gateway.server import AdminApp
 from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import (
@@ -55,6 +55,7 @@ from zoeymcp.vault.store import SecretStore
 KEYS = KeySet.from_master(bytes(range(64, 96)))
 SERVER = "notes"
 CLIENTS = ("agent1", "agent2")
+LIMITS = GatewayLimits()
 
 
 def pin_of_fake(fake: McpFake, name: str, *, session: str | None = None, listing: int = 1) -> str:
@@ -62,6 +63,21 @@ def pin_of_fake(fake: McpFake, name: str, *, session: str | None = None, listing
     tools = fake.tools_for(session, listing)
     wire = next(tool for tool in tools if tool["name"] == name)
     return project_and_pin(Tool.model_validate(copy.deepcopy(wire))).pin
+
+
+def pins_of_the_rest(fake: McpFake, include: list[str]) -> dict[str, str]:
+    """The pins of every tool the fake lists that ``include`` leaves out and that can be pinned:
+    the declined block of a server reviewed once, so nothing is left that nobody reviewed (M6
+    design J.5)."""
+    rest = {}
+    for wire in fake.tools_for(None, 1):
+        try:
+            projected = project_and_pin(Tool.model_validate(copy.deepcopy(wire)))
+        except ProjectionError:
+            continue
+        if wire["name"] not in include and not tool_problems(projected.definition, LIMITS):
+            rest[wire["name"]] = projected.pin
+    return rest
 
 
 def raw_policy(
@@ -84,9 +100,11 @@ def raw_policy(
     origins: list[str] | None = None,
     approvals: dict[str, dict[str, Any]] | None = None,
     gateway_approvals: dict[str, Any] | None = None,
+    declined: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """The rig's policy. ``servers`` adds gateway servers; ``assigned`` overrides a client's
-    server list (each client gets ``[SERVER]`` otherwise)."""
+    server list (each client gets ``[SERVER]`` otherwise); ``declined`` is the server's
+    declined block (M6 design J.5), left out when not given."""
     approve = approve or []
     gateway: dict[str, Any] = {
         "limits": limits or {},
@@ -114,6 +132,7 @@ def raw_policy(
                     "approve": approve,
                 },
                 "review": review,
+                **({"declined": declined} if declined is not None else {}),
             },
             **(servers or {}),
         },

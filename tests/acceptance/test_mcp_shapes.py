@@ -34,6 +34,7 @@ from tests.fakes.mcp_server import (
     McpFake,
     Mode,
     Switch,
+    base_tools,
     encoded_form,
 )
 from tests.gateway.rig import agent, pin_of_fake, token_for, until
@@ -70,18 +71,29 @@ def pins(fake: McpFake, names: list[str] | None = None) -> dict[str, str]:
     return {name: pin_of_fake(fake, name) for name in names or sorted(TOOLS)}
 
 
+def declined_rest(fake: McpFake, tools: dict[str, str]) -> dict[str, str]:
+    """The fake's well-behaved tools that ``tools`` leaves out, declined at their pins, as a
+    server reviewed once has them (M6 design J.5); a switch's extra tools stay unreviewed."""
+    rest = [tool["name"] for tool in base_tools() if tool["name"] not in tools]
+    return {name: pin_of_fake(fake, name) for name in rest}
+
+
 @contextlib.contextmanager
 def deployed(
     tmp_path: Path, ca: ProviderCA, fake: McpFake, *, link: str = "tcp", **options: Any
 ) -> Iterator[GatewayDeployment]:
     with serve_tls(fake.app(), ca, lifespan=True) as upstream:
+        tools = options.pop("tools", TOOLS)
         gateway = GatewayDeployment(
             tmp_path,
             upstream,
             ca,
             secrets={"notes-key": KEY},
-            tools=options.pop("tools", TOOLS),
+            tools=tools,
             pins=options.pop("pins") if "pins" in options else pins(fake),
+            declined=(
+                options.pop("declined") if "declined" in options else declined_rest(fake, tools)
+            ),
             link=link,  # type: ignore[arg-type]
             link_uid=own_uid() if link == "unix" else None,
             **options,
@@ -221,24 +233,39 @@ async def test_s10_an_expired_upstream_session_is_opened_again(
 
 
 async def test_s10_onboarding_with_review(tmp_path: Path, ca: ProviderCA) -> None:
-    """Nothing is served until the operator reviews, adds, classifies and commits the pins."""
+    """Nothing is served until the operator reviews, adds, classifies and commits the pins; a
+    server's tools nobody reviewed need the operator until they are declined (M6 design J.5)."""
     fake = McpFake(key=KEY, key_header="x-api-key")
     with (
-        deployed(tmp_path, ca, fake, tools={}, pins={}) as gateway,
+        deployed(tmp_path, ca, fake, tools={}, pins={}, declined={}) as gateway,
         gateway.running() as running,
     ):
         async with agent(running) as client:
             assert (await client.list_tools()).tools == []
         code, out, _ = gateway.cli(running, "review", SERVER)
-        assert code == 0
+        assert code == 1
         assert "echo" in out
+        assert "6 listed that nobody reviewed: add, counter, echo, lookup, report, slow" in (
+            out.splitlines()
+        )
         code, out, _ = gateway.cli(
-            running, "review", SERVER, "--add", "echo", "--add", "add", "--format", "json"
+            running,
+            "review",
+            SERVER,
+            "--add",
+            "echo",
+            "--add",
+            "add",
+            "--decline-rest",
+            "--format",
+            "json",
         )
         snippet = load_mapping("\n".join(json.loads(out)["snippet"]))
         added = snippet["gateway"]["servers"][SERVER]["review"]
         assert sorted(added) == ["add", "echo"]
-        gateway.reload({"echo": "allow", "add": "allow"}, added)
+        declined = snippet["gateway"]["servers"][SERVER]["declined"]
+        assert sorted(declined) == ["counter", "lookup", "report", "slow"]
+        gateway.reload({"echo": "allow", "add": "allow"}, added, declined)
         await until(lambda: running.app.policy.snapshot is not None and "echo" in (
             running.app.policy.snapshot.view.gateway.servers[SERVER].tools.include
         ))  # fmt: skip

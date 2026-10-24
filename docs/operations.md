@@ -591,6 +591,13 @@ ignores it afterwards, and without an `admin` block it is also an error ("manage
 in the portal"). The vault still refuses to start in managed mode until managed mode lands. A
 policy with `mode: declarative` checks as before.
 
+**Upgrading to M6: review.** A tool a server lists that the policy neither includes nor declines
+is one nobody reviewed, and `zoeymcp review` now exits 1 for it, naming it ("3 listed that nobody
+reviewed: ..."), where it exited 0 before. Record the tools you leave out once, with `review
+<server> --decline-rest` (§11) or `decline` lines in a choices file, and commit the snippet. A
+policy with a `declined` block needs the gateway on M6 too: recreate the vault first, then the
+gateway.
+
 ## 8. Provider notes
 
 **Any provider.** A `token_url` or `authorize_url` may carry a query, such as a tenant or a
@@ -787,8 +794,17 @@ agent that reads a JSON MCP config, typically:
    (§19). For many tools, use the choices file (below).
 7. **Reload** again. Agents see the tools at once (their clients are told the list changed).
 
-`review` exits 0 when every included tool matches its pin and nothing is marked, 1 when
-something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown, the
+**Declined tools.** A tool the server lists that the policy neither includes nor declines is one
+nobody reviewed: `review` names it ("3 listed that nobody reviewed: export_all, purge, share"),
+and the summary (`review` with no server) prints the same line under the server's row.
+`--decline TOOL` records a tool you leave out under the server's `declined`, at the pin listed,
+and `--decline-rest` every listed tool the snippet doesn't include; a declined tool is hidden, as
+an unreviewed one is, and logs nothing. Once the server has a `declined` block, or the options
+decline a tool, the snippet replaces that block whole too (an included tool leaves it). If the
+server later changes a declined tool's definition, its pin no longer matches and it counts again.
+
+`review` exits 0 when every included tool matches its pin, nothing is marked and every listed tool
+is included or declined, 1 when something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown, the
 vault refused, the upstream failed or a listing limit was hit) or an option
 doesn't fit what it found. The message says which. `--format json` prints the same, with the
 snippet as a list of lines.
@@ -836,7 +852,7 @@ container; in the vault's they go through the review job path (below), so `--cho
 # hardened tier
 docker compose -f deploy/compose.hardened.yaml exec vault \
   zoeymcp review notes --choose --suggest > notes.choices
-# edit notes.choices: skip, allow or approve on each line, then:
+# edit notes.choices: skip, allow, approve or decline on each line, then:
 docker compose -f deploy/compose.hardened.yaml exec -T vault \
   zoeymcp review notes --choices - < notes.choices > onboard-notes-2.yaml
 # standard tier
@@ -847,7 +863,7 @@ docker compose -f deploy/compose.yaml exec -T zoeymcp \
 ```
 
 ```text
-# zoeymcp review notes: 96 tools. Keep "skip", or write "allow" or "approve", on each line.
+# zoeymcp review notes: 96 tools. Keep "skip", or write "allow", "approve" or "decline", on each line.
 # report 3f9c... sha256:aa41... policy sha256:5e07...
 # allow: agents call it with no prompt. approve: every call asks you first.
 # The suggestions are the server's own annotations, not a judgement by ZoeyMCP.
@@ -856,9 +872,11 @@ skip     delete_note  sha256:0b7d...   # not annotated: approve suggested if you
 allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
 ```
 
-- **Each line** is a word (`skip`, `allow` or `approve`), the tool's name and its full pin, then a
-  comment; `#` lines are comments, and a line you delete counts as no change. Write the word you
-  want; leave the rest alone.
+- **Each line** is a word (`skip`, `allow`, `approve` or `decline`), the tool's name and its full
+  pin, then a comment; `#` lines are comments, and a line you delete counts as no change. Write the
+  word you want; leave the rest alone. `decline` leaves the tool out and records it declined at the
+  line's pin (taking it out first if it is included); a tool the policy declined at that pin says
+  `decline`, and `skip` on it takes it out of `declined`.
 - **Without `--suggest`** every tool not yet included says `skip`. With it, a tool the server
   marks read-only and not destructive says `allow`, and every other line stays `skip` with the
   server's suggestion in its comment (`approve` for an unannotated or destructive tool), so an
@@ -872,7 +890,8 @@ allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
   CRLF line endings or a byte order mark (as Windows editors and PowerShell 5.1 save it) reads the
   same.
 - **The header** names the report: its job (`-` for a review over the gateway's socket), its
-  digest, and the digest of the server's `include`, `allow` and `approve` in the policy. If the
+  digest, and the digest of the server's `include`, `allow` and `approve` in the policy, and its
+  `declined` once it has one. If the
   policy's tools for the server changed since `--choose` (you included, took out or reclassified
   one), `--choices` refuses the file `choices_stale`: its `skip` lines would take out what you
   included since. Write the file again. `--choices` checks every `allow` and `approve` line's pin against the report it reads
@@ -1027,7 +1046,7 @@ Reviewing through the gateway: 96 tools (64 the server marks read-only, 32 not a
 Next:
   Choose its tools:
     docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review notes --via vault --choose --suggest > notes.choices
-  Edit notes.choices (skip, allow or approve on each line), then make fragment 2:
+  Edit notes.choices (skip, allow, approve or decline on each line; decline the tools you leave out), then make fragment 2:
     docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp review notes --via vault --choices - < notes.choices > onboard-notes-2.yaml
 ```
 
@@ -2555,7 +2574,7 @@ docker build -t zoeymcp:local .
 
    ```sh
    $c exec vault zoeymcp review notes --via vault --choose --suggest > notes.choices
-   # edit notes.choices: skip, allow or approve on each line
+   # edit notes.choices: skip, allow, approve or decline on each line
    $c exec -T vault zoeymcp review notes --via vault --choices - < notes.choices > onboard-notes-2.yaml
    ```
 

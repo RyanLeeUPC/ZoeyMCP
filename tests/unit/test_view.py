@@ -270,13 +270,46 @@ def test_the_vault_path_joins_prefix_and_path() -> None:
 # --- the digest --------------------------------------------------------------------------------
 
 
+def without_empty_declined(view: GatewayView) -> Raw:
+    """The view's content as M7 had it: a server's empty ``declined`` left out (M6 design A.3)."""
+    gateway: Raw = view.gateway.model_dump(mode="json")
+    for server in gateway["servers"].values():
+        if not server["declined"]:
+            del server["declined"]
+    return gateway
+
+
 def test_the_digest_covers_everything_else() -> None:
     view = built()
     assert view.digest == view_digest(view.gateway)
     assert view.digest == canonical.digest(
-        {"v": VIEW_VERSION, "gateway": view.gateway.model_dump(mode="json")}
+        {"v": VIEW_VERSION, "gateway": without_empty_declined(view)}
     )
     assert VIEW_VERSION == 1
+    raw = raw_policy()
+    raw["gateway"]["servers"]["notes-read"]["declined"] = {"other": PIN_A}
+    declined = built(raw)
+    assert "declined" in without_empty_declined(declined)["servers"]["notes-read"]
+    assert declined.digest == canonical.digest(
+        {"v": VIEW_VERSION, "gateway": without_empty_declined(declined)}
+    )
+
+
+def test_an_empty_declined_block_is_left_out_of_the_digest_and_the_bytes() -> None:
+    """M6 design A.3, CR-7: a policy that doesn't use it keeps M7's view, digest and bytes, so
+    an M7 gateway parses it; the block is in both once it holds a tool."""
+    raw = raw_policy()
+    for server in raw["gateway"]["servers"].values():
+        server["declined"] = {}
+    assert built(raw) == built()
+    assert dump_view(built(raw)) == dump_view(built())
+    assert b"declined" not in dump_view(built())
+    raw["gateway"]["servers"]["notes-read"]["declined"] = {"other": PIN_A}
+    data = json.loads(dump_view(built(raw)))
+    assert data["gateway"]["servers"]["notes-read"]["declined"] == {"other": PIN_A}
+    assert all("declined" not in server for name, server in data["gateway"]["servers"].items()
+               if name != "notes-read")  # fmt: skip
+    assert parse_view(dump_view(built(raw))) == built(raw)
 
 
 def test_the_digest_ignores_document_order() -> None:
@@ -311,8 +344,20 @@ def _change_tool_order(raw: Raw) -> None:
     raw["gateway"]["servers"]["notes-read"]["tools"]["include"] = ["get", "search"]
 
 
+def _change_declined(raw: Raw) -> None:
+    raw["gateway"]["servers"]["notes-read"]["declined"] = {"other": PIN_A}
+
+
 @pytest.mark.parametrize(
-    "change", [_change_pin, _change_limit, _change_prefix, _change_token, _change_tool_order]
+    "change",
+    [
+        _change_pin,
+        _change_limit,
+        _change_prefix,
+        _change_token,
+        _change_tool_order,
+        _change_declined,
+    ],
 )
 def test_the_digest_follows_the_content(change: Any) -> None:
     raw = raw_policy()
@@ -341,7 +386,8 @@ def test_a_toolkit_module_is_gateway_side() -> None:
 def test_the_served_form_is_canonical_and_round_trips() -> None:
     view = built()
     data = dump_view(view)
-    assert data == canonical.dumps_canonical(view.model_dump(mode="json"))
+    served = {"v": view.v, "digest": view.digest, "gateway": without_empty_declined(view)}
+    assert data == canonical.dumps_canonical(served)
     assert parse_view(data) == view
 
 

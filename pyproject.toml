@@ -168,6 +168,7 @@ only_mutate = [
     "*zoeymcp/common/policy/change.py",
     "*zoeymcp/common/policy/emit.py",
     "*zoeymcp/common/policy/merge.py",
+    "*zoeymcp/common/policy/attention.py",
     "*zoeymcp/gateway/pins.py",
     "*zoeymcp/gateway/findings.py",
     "*zoeymcp/gateway/schemas.py",

@@ -128,6 +128,7 @@ COMMENTS: Final[Mapping[CommentKind, str]] = MappingProxyType(
         "changed_was": "changed",
         "kept": "kept",
         "not_included": "not included",
+        "declined": "declined",
         "error_finding": "can't be included, error finding",
         "suggested": "suggested",
         "merge_hint": "merge",

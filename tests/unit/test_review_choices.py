@@ -30,7 +30,11 @@ OTHER_PIN = "sha256:" + "0" * 64
 DIGESTS = f"{OTHER_PIN} policy {OTHER_PIN}"
 
 
-def served(include: list[str] = [], **classes: list[str]) -> ViewRemoteServer:  # noqa: B006
+def served(
+    include: list[str] = [],  # noqa: B006
+    declined: list[str] = [],  # noqa: B006
+    **classes: list[str],
+) -> ViewRemoteServer:
     review = {name: pins.project_and_pin(Tool.model_validate(wire)).pin for name, wire in WIRES}
     return ViewRemoteServer.model_validate(
         {
@@ -38,6 +42,7 @@ def served(include: list[str] = [], **classes: list[str]) -> ViewRemoteServer:  
             "vault_path": "/notes/mcp",
             "tools": {"include": include, "allow": [], "approve": [], **classes},
             "review": {name: review[name] for name in include},
+            "declined": {name: review[name] for name in declined},
             "on_drift": "hide",
             "shared_session": False,
             "wrap_results": False,
@@ -71,9 +76,14 @@ LARGE = [*base_tools(), *large_tools()]
 WIRES = [(wire["name"], wire) for wire in LARGE]
 
 
-def large(include: list[str] = [], **classes: list[str]) -> dict[str, Any]:  # noqa: B006
-    """The ``large`` fake's 96 tools, reviewed against a server including ``include``."""
-    return reviewed(copy.deepcopy(LARGE), served(include, **classes))
+def large(
+    include: list[str] = [],  # noqa: B006
+    declined: list[str] = [],  # noqa: B006
+    **classes: list[str],
+) -> dict[str, Any]:
+    """The ``large`` fake's 96 tools, reviewed against a server including ``include`` and
+    declining ``declined`` at the pins listed."""
+    return reviewed(copy.deepcopy(LARGE), served(include, declined, **classes))
 
 
 def by_name(answer: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -121,8 +131,8 @@ def test_the_header_and_one_line_per_listed_tool() -> None:
     text = file_of(answer)
     lines = text.splitlines()
     assert lines[:4] == [
-        '# zoeymcp review notes: 96 tools. Keep "skip", or write "allow" or "approve", on each '
-        "line.",
+        '# zoeymcp review notes: 96 tools. Keep "skip", or write "allow", "approve" or '
+        '"decline", on each line.',
         f"# report {JOB} {choices.report_digest(answer)} policy {choices.policy_digest(answer)}",
         "# allow: agents call it with no prompt. approve: every call asks you first.",
         "# The suggestions are the server's own annotations, not a judgement by ZoeyMCP.",
@@ -344,8 +354,8 @@ def test_a_tool_gone_from_a_newer_listing_is_stale_unless_skipped() -> None:
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        (lambda t: edited(t, "read_01", "alow"), '"alow" isn\'t skip, allow or approve'),
-        (lambda t: edited(t, "read_01", "Allow"), '"Allow" isn\'t skip, allow or approve'),
+        (lambda t: edited(t, "read_01", "alow"), '"alow" isn\'t skip, allow, approve or decline'),
+        (lambda t: edited(t, "read_01", "Allow"), '"Allow" isn\'t skip, allow, approve or decline'),
         (lambda t: t + f"skip read_01 {OTHER_PIN}\n", "read_01 is on line "),
         (lambda t: t + "allow read_99\n", "write a word, the tool's name and its pin"),
         (lambda t: t + "allow read_99 sha256:abc\n", "read_99's pin isn't sha256: and 64 hex"),
@@ -609,7 +619,7 @@ def test_a_refusal_in_parsing_says_its_line_and_cuts_what_it_quotes() -> None:
 
     word, cut_word = "w" * 21, "w" * 20 + "..."
     assert message(f"{word} read_01 {OTHER_PIN}") == (
-        f'line {end}: "{cut_word}" isn\'t skip, allow or approve'
+        f'line {end}: "{cut_word}" isn\'t skip, allow, approve or decline'
     )
     tool, cut_tool = "t" * 129, "t" * 128 + "..."
     assert message(f"allow {tool} {OTHER_PIN}") == f"line {end}: {cut_tool} isn't a tool name"
@@ -678,3 +688,103 @@ def test_a_long_name_is_cut_in_a_comment_line() -> None:
         f"# {unpinned_name} can't be included: error finding ({'m' * 100}...); review notes "
         f"--show {unpinned_name}",
     ]
+
+
+# --- decline (M6 design J.3, J.5) ----------------------------------------------------------------
+
+
+def test_decline_records_a_tool_at_its_pin() -> None:
+    answer = large()
+    text = file_of(answer)
+    pin = by_name(answer)["read_01"]["pin"]
+    changes = choices.decide(answer, JOB, choices.parse(edited(text, "read_01", "decline")))
+    assert changes == view.Changes(declined={"read_01": pin})
+    change = view.fragment(answer, changes, heading=view.second_title("notes", declined=True))
+    emitted = emit(change)
+    assert emitted.startswith(
+        "# zoeymcp: review of notes (2 of 2). Replace the tools:, review: and declined: blocks of "
+        "gateway.servers.notes, then assign notes to its clients.\n"
+    )
+    assert f"# declined: read_01 ({pin})" in emitted.splitlines()
+    assert f"# not included: read_01 ({pin}; " not in emitted
+    entry = load_mapping(emitted)["gateway"]["servers"]["notes"]
+    assert (entry["tools"]["include"], entry["review"]) == ([], {})
+    assert entry["declined"] == {"read_01": pin}
+
+
+def test_a_file_that_declines_nothing_writes_m7s_fragment() -> None:
+    answer = large()
+    changes = choices.decide(answer, JOB, choices.parse(file_of(answer)))
+    assert changes == view.Changes()
+    assert "declined" not in fragment_of(answer, file_of(answer))
+    assert "declined" not in emit(view.fragment(answer, changes))
+
+
+def test_a_declined_tools_line_says_decline_so_an_unedited_file_keeps_it() -> None:
+    answer = large(declined=["read_01", "write_01"])
+    text = file_of(answer, suggest=True)
+    found = {row[1]: row[0] for row in rows(text)}
+    assert (found["read_01"], found["write_01"], found["read_02"]) == (
+        "decline",
+        "decline",
+        "allow",
+    )
+    [line] = [line for line in text.splitlines() if line.split()[1:2] == ["write_01"]]
+    assert "# declined in the policy; " in line
+    pins_ = {name: by_name(answer)[name]["pin"] for name in ("read_01", "write_01")}
+    assert fragment_of(answer, edited(text, "read_02", "skip"))["declined"] == pins_
+    # skip takes a tool out of declined; including it does too.
+    entry = fragment_of(answer, edited(edited(text, "read_01", "skip"), "write_01", "approve"))
+    assert entry["declined"] == {}
+    assert entry["tools"]["approve"] == ["write_01"]
+    assert "read_01" not in entry["tools"]["include"]
+
+
+def test_decline_on_an_included_tool_takes_it_out() -> None:
+    answer = large(["read_01", "echo"], allow=["read_01"], approve=["echo"])
+    text = edited(file_of(answer), "echo", "decline")
+    changes = choices.decide(answer, JOB, choices.parse(text))
+    pin = by_name(answer)["echo"]["pin"]
+    assert (changes.dropped, changes.declined) == (frozenset({"echo"}), {"echo": pin})
+    entry = fragment_of(answer, text)
+    assert entry["tools"] == {"include": ["read_01"], "allow": ["read_01"], "approve": []}
+    assert entry["declined"] == {"echo": pin}
+
+
+def test_a_declined_tool_that_changed_is_unreviewed_and_says_skip() -> None:
+    """Its pin moved, so the policy's decline no longer holds: the file offers it again."""
+    answer = large(declined=["read_01"])
+    changed = copy.deepcopy(LARGE)
+    for wire in changed:
+        if wire["name"] == "read_01":
+            wire["description"] += " Changed."
+    later = reviewed(changed, served(declined=["read_01"]))
+    assert by_name(later)["read_01"]["state"] == "unreviewed"
+    text = file_of(later)
+    assert {row[1]: row[0] for row in rows(text)}["read_01"] == "skip"
+    # Declined again at the new pin, the old one replaced.
+    new = by_name(later)["read_01"]["pin"]
+    assert new != by_name(answer)["read_01"]["pin"]
+    assert fragment_of(later, edited(text, "read_01", "decline"))["declined"] == {"read_01": new}
+
+
+def test_a_tool_with_an_error_finding_cant_be_declined() -> None:
+    answer = large()
+    bad = by_name(answer)[LARGE_INVALID]["pin"]
+    caught = refused(answer, head_of(answer) + f"decline {LARGE_INVALID} {bad}\n")
+    assert str(caught) == f"line 5: {LARGE_INVALID} has an error finding, so it can't be pinned"
+    caught = refused(answer, head_of(answer) + f"decline read_01 {OTHER_PIN}\n")
+    assert str(caught) == "line 5: read_01's pin isn't the one the server lists"
+
+
+def test_the_policys_digest_holds_declined_once_it_has_one() -> None:
+    """A file written before a decline would undo it (skip), so it is stale after one."""
+    before = large()
+    assert choices.policy_digest(before) == choices.policy_digest(
+        {**before, "policy": {**before["policy"], "declined": {}}}
+    )
+    after = large(declined=["read_01"])
+    pin = by_name(after)["read_01"]["pin"]
+    text = '{"allow":[],"approve":[],"declined":{"read_01":"' + pin + '"},"include":[]}'
+    assert choices.policy_digest(after) == "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    assert refused(after, file_of(before), job="another-job").reason == "choices_stale"

@@ -723,8 +723,7 @@ issue_cert(ca, "fake-upstream", out)
 issue_cert(ca, "fake-smtp", out)  # the mail server of contract 52
 (out / "bundle.pem").write_text(Path(certifi.where()).read_text() + ca.ca_file.read_text())
 for tool in base_tools():
-    if tool["name"] in ("echo", "slow"):
-        print(tool["name"], project_and_pin(mcp_types.Tool.model_validate(tool)).pin)
+    print(tool["name"], project_and_pin(mcp_types.Tool.model_validate(tool)).pin)
 '
 mkdir "$work/tls"
 pins="$(docker run --rm --network none -u "$(id -u):$(id -g)" -e PYTHONPATH=/opt/src \
@@ -735,6 +734,10 @@ chmod 0644 "$work/tls/"*
 echo_pin="$(echo "$pins" | sed -n 's/^echo //p')"
 slow_pin="$(echo "$pins" | sed -n 's/^slow //p')"
 [ -n "$echo_pin" ] && [ -n "$slow_pin" ] || fail "no pins for echo and slow: $pins"
+# The fake's other tools (add, counter, report, lookup), which the smoke's policy leaves out,
+# declined at their pins: a tool nobody reviewed makes review exit 1 (M6 design J.5).
+declined="$(echo "$pins" | awk '$1 != "echo" && $1 != "slow" { printf "%s%s: \"%s\"", sep, $1, $2; sep = ", " }')"
+[ -n "$declined" ] || fail "no pins for the fake's other tools: $pins"
 certifi_bundle="$(in_env /opt/zoeymcp -c 'import certifi; print(certifi.where())')"
 [ -n "$certifi_bundle" ] || fail "the vault's environment has no certifi bundle"
 # With --derived, the example mail toolkit as a server, with the connector and route its slot
@@ -773,7 +776,8 @@ mail_toolkit() {
     esac
 }
 # The smoke's policy after its first lines, indented for ZOEYMCP_CONFIG: the shipped notes
-# server, and a fake server routed to the fake upstream, with echo and slow pinned and allowed.
+# server, and a fake server routed to the fake upstream, with echo and slow pinned and allowed
+# and the rest declined.
 # The fake upstream's name resolves to a compose network's private address, which the vault's
 # address guard refuses unless egress_private lists it (M7 design B.2).
 smoke_policy() {
@@ -809,6 +813,7 @@ $(mail_toolkit routes)
               path: /mcp
               tools: {include: [echo, slow], allow: [echo, slow]}
               review: {echo: "$echo_pin", slow: "$slow_pin"}
+              declined: {$declined}
 $(mail_toolkit servers)
 EOF
 }

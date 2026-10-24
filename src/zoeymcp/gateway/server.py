@@ -33,6 +33,7 @@ import uvicorn
 from starlette.types import Receive, Scope, Send
 
 from ..common import canonical, control
+from ..common.policy.attention import attention, combined
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewToolkitServer
 from . import logs, review
@@ -156,7 +157,9 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
 
 
 def status(app: GatewayApp) -> dict[str, Any]:
-    """G.5's status: per server, never definitions or token hashes."""
+    """G.5's status: per server, never definitions or token hashes. The reports count
+    ``unreviewed`` and ``declined`` tools apart, and ``attention`` is the attention decision for
+    the server's latest listings (M6 design J.5), ``None`` before any listing."""
     snapshot = app.policy.snapshot
     servers: dict[str, Any] = {}
     if snapshot is not None:
@@ -169,12 +172,15 @@ def status(app: GatewayApp) -> dict[str, Any]:
             exposed = set()
             reports: dict[str, set[str]] = {}
             verified = [c.state.verified_at for c in connections if c.state.verified_at is not None]
+            marks = app.pool.marks.for_server(name)
+            found = []
             for connection in connections:
                 evaluation = connection.state.evaluation
                 if evaluation is not None:
                     exposed |= set(evaluation.exposed)
                     for report in evaluation.reports:
                         reports.setdefault(report.kind, set()).add(report.tool)
+                    found.append(attention(evaluation.listed, server, marks))
             servers[name] = {
                 "kind": "remote",
                 "state": phases or ["idle"],
@@ -184,6 +190,7 @@ def status(app: GatewayApp) -> dict[str, Any]:
                 "exposed": len(exposed),
                 "marked": sorted(tool for tool, _ in app.pool.marks.for_server(name)),
                 "reports": {kind: sorted(tools) for kind, tools in sorted(reports.items())},
+                "attention": combined(found).as_dict() if found else None,
                 "listed_s_ago": round(app.clock() - max(verified), 1) if verified else None,
             }
     return {
@@ -205,6 +212,10 @@ def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> di
     reports: dict[str, set[str]] = {}
     for report in found.evaluation.reports:
         reports.setdefault(report.kind, set()).add(report.tool)
+    marks = app.pool.marks.for_server(name)
+    decided = attention(
+        found.evaluation.listed, review.toolkit_reviewed(server, found.evaluation), marks
+    )
     return {
         "kind": "toolkit",
         "state": "loaded",
@@ -214,8 +225,9 @@ def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> di
         "pinning": server.pinning,
         "included": len(server.tools.include),
         "exposed": len(found.evaluation.exposed),
-        "marked": sorted(tool for tool, _ in app.pool.marks.for_server(name)),
+        "marked": sorted(tool for tool, _ in marks),
         "reports": {kind: sorted(tools) for kind, tools in sorted(reports.items())},
+        "attention": decided.as_dict(),
     }
 
 

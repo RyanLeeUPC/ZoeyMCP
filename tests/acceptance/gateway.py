@@ -58,14 +58,22 @@ def no_client(server: str) -> str:
 NO_CLIENT = no_client(SERVER)
 
 
-def server_text(tools: Mapping[str, str], pins: Mapping[str, str]) -> dict[str, str]:
-    """The profile's replacements for these tools (name -> allow or approve) and pins."""
+def server_text(
+    tools: Mapping[str, str],
+    pins: Mapping[str, str],
+    declined: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The profile's replacements for these tools (name -> allow or approve) and pins, and the
+    server's declined block when ``declined`` is given (M6 design J.5)."""
     include = sorted(tools)
     allow = [name for name in include if tools[name] == "allow"]
     approve = [name for name in include if tools[name] == "approve"]
+    review = "review: " + json.dumps(dict(pins))
+    if declined is not None:
+        review += "\n      declined: " + json.dumps(dict(declined))
     return {
         NO_TOOLS: "tools: " + json.dumps({"include": include, "allow": allow, "approve": approve}),
-        NO_PINS: "review: " + json.dumps(dict(pins)),
+        NO_PINS: review,
     }
 
 
@@ -105,6 +113,7 @@ class GatewayDeployment:
     set, and a client per name in ``clients``.
 
     ``tools`` and ``pins`` fill in S10's empty lists; leave both out to keep a profile's own.
+    ``declined`` is the server's declined block beside them (M6 design J.5).
     ``secrets`` go into the store before the vault starts, and the vault's token manager reads
     ``clock``, which a test can move along with the fakes' clocks. With ``portal`` the vault
     serves its portal too, over either link (M5 design O.1, review finding R9).
@@ -130,6 +139,7 @@ class GatewayDeployment:
         secrets: Mapping[str, str] | None = None,
         tools: Mapping[str, str] | None = None,
         pins: Mapping[str, str] | None = None,
+        declined: Mapping[str, str] | None = None,
         clients: tuple[str, ...] = CLIENTS,
         link: Link = "tcp",
         link_uid: int | None = None,
@@ -152,7 +162,9 @@ class GatewayDeployment:
         socket = tmp_path / "link" / "vault.sock" if link == "unix" else None
         if socket is not None:
             socket.parent.mkdir(mode=0o700)
-        listed = {} if tools is None and pins is None else server_text(tools or {}, pins or {})
+        listed = (
+            {} if tools is None and pins is None else server_text(tools or {}, pins or {}, declined)
+        )
         self.vault = Deployment(
             tmp_path / "vault",
             profile,
@@ -174,9 +186,15 @@ class GatewayDeployment:
     def policy(self) -> Policy:
         return self.vault.app.policy
 
-    def reload(self, tools: Mapping[str, str], pins: Mapping[str, str]) -> None:
-        """A new policy with these tools and pins, swapped into the running vault (SIGHUP)."""
-        policy = self.vault.load(server_text(tools, pins))
+    def reload(
+        self,
+        tools: Mapping[str, str],
+        pins: Mapping[str, str],
+        declined: Mapping[str, str] | None = None,
+    ) -> None:
+        """A new policy with these tools, pins and declined tools, swapped into the running
+        vault (SIGHUP)."""
+        policy = self.vault.load(server_text(tools, pins, declined))
         self.vault.call(lambda: self.vault.app.reload(policy))
 
     @contextmanager

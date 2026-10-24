@@ -26,7 +26,7 @@ import importlib.metadata
 import os
 import sys
 import sysconfig
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -68,6 +68,7 @@ class SelfPinned:
     tools: Tools
     review: dict[str, str]
     on_drift: Literal["hide", "fail"] = "hide"
+    declined: Mapping[str, str] = field(default_factory=dict)  # the policy's (M6 design J.5)
 
 
 @dataclass
@@ -204,7 +205,7 @@ class Toolkits:
                     own[tool.name] = pins.project_and_pin(tool).pin
                 except pins.ProjectionError:
                     continue
-            reviewed = SelfPinned(policy.tools, own)
+            reviewed = SelfPinned(policy.tools, own, declined=policy.declined)
             # An old mark whose pin equals a self-pin would keep the tool hidden: none are kept.
             self.marks.replace(server, frozenset())
             return pins.evaluate(listing, reviewed, frozenset(), self.limits)
@@ -217,6 +218,8 @@ class Toolkits:
                 "drift_cleared", server=server, tools=sorted(t for t, _ in removed), by="policy"
             )
         for report in evaluation.reports:
+            if report.kind == "declined":
+                continue  # the operator's own record: nothing to log
             if report.kind != "unreviewed" or report.tool in policy.tools.include:
                 self._once(
                     f"tool_{report.kind}", server, {"tool": report.tool, "observed": report.pin}
@@ -242,6 +245,7 @@ class Toolkits:
             reports=evaluation.reports,
             marks=evaluation.marks,
             blocked=evaluation.blocked,
+            listed=evaluation.listed,
         )
 
     def _vault(self, server: str, policy: ViewToolkitServer) -> ToolkitVault:
