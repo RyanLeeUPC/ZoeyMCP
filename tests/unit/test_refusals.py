@@ -37,8 +37,9 @@ from zoeymcp.portal.refusals import (
     wrong_host_literal,
 )
 from zoeymcp.portal.refusals import login as login_refusal
-from zoeymcp.vault import admin, onboard, onboarding, reviewjobs, secretplan, store
+from zoeymcp.vault import admin, onboard, onboarding, policystore, reviewjobs, secretplan, store
 from zoeymcp.vault.oauth import dcr, discovery, fetch, login, pkce
+from zoeymcp.vault.policyseal import REVISION_MAX
 from zoeymcp.vault.secretplan import SecretRefusal
 
 ZWSP = chr(0x200B)
@@ -213,6 +214,8 @@ PLAN = {
     "summary_too_large": 413,
     "no_change": 400,
 }
+# M6's N.2: a managed write the policy store didn't make (vault/policystore.py, step 13a).
+STORE = {"policy_write_failed": 500, "revision_out_of_range": 400}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -350,7 +353,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN
+    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -490,6 +493,19 @@ def test_the_plan_texts_name_the_planners_limits() -> None:
     assert f"holds {RATCHET_MAX:,} retired entries" in CATALOGUE["ratchet_full"].text
     assert plan.HOST_NEXT in CATALOGUE["summary_too_large"].text
     assert CATALOGUE["env_name_new"] == CATALOGUE["env_reach_grows"]
+
+
+def test_every_store_reason_is_catalogued() -> None:
+    """M6 N.2: the scan widens to the policy store's refusals (D.9, T-4), each a literal of its
+    Reason type."""
+    found = literal_reasons(policystore, "StoreRefused")
+    assert found == set(get_args(policystore.Reason))
+    assert found == set(STORE)
+    assert found <= set(CATALOGUE)
+
+
+def test_the_store_texts_name_its_limits() -> None:
+    assert f"above {REVISION_MAX:,}." in CATALOGUE["revision_out_of_range"].text
 
 
 def test_every_onboarding_reason_is_catalogued() -> None:

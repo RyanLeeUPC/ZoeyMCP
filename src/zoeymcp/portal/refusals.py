@@ -585,6 +585,9 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "edit, zoeymcp policy import), where all of it is shown.",
         ),
         "no_change": Entry(400, "Nothing would change."),
+        # M6's N.2: a managed write the policy store didn't make (vault/policystore.py).
+        "policy_write_failed": Entry(500, "The revision couldn't be written; nothing changed."),
+        "revision_out_of_range": Entry(400, "A revision can't go above 9,999,999,999."),
     }
 )
 

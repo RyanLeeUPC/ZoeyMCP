@@ -1,14 +1,14 @@
 """The mutants left alive on purpose in M6's modules: the strict YAML loader (step 1,
 ``common.yamlload``), the change a review makes (step 8, ``common.policy.reviewchange``, whose
 ``definition_lines`` moved from ``portal.reviewview`` with its two equivalents), the ratchet's
-plain form (step 11b, ``common.policy.ratchet``), and the planner and the change's managed ops
+plain form (step 11b, ``common.policy.ratchet``), the planner and the change's managed ops
 (step 12a, ``common.policy.plan`` and ``common.policy.change``, whose earlier equivalents stay in
-``test_mutation_gaps_6.py``).
+``test_mutation_gaps_6.py``), and the host's export (step 12b, ``common.policy.export``).
 
-The loader's killing tests are in ``test_yamlload.py``. The mutants no test can tell from the
-original are in :data:`EQUIVALENT`, each with why; :func:`test_each_equivalent_names_a_function`
-keeps the list honest when a function is renamed or removed. mutmut still counts them as
-survivors, so they stay in each module's score.
+The loader's killing tests are in ``test_yamlload.py``, the export's in ``test_policy_export.py``.
+The mutants no test can tell from the original are in :data:`EQUIVALENT`, each with why;
+:func:`test_each_equivalent_names_a_function` keeps the list honest when a function is renamed or
+removed. mutmut still counts them as survivors, so they stay in each module's score.
 """
 
 from __future__ import annotations
@@ -40,6 +40,14 @@ _HAS_DEFINITION: Final = (
     "the definition looked up with no () default at rule 5: from the portal every move and kept "
     "allow counted there has one (allow_needs_review held each to it, and a portal rollback has "
     "none: rule 2 refused its moves, and its carried pins re-pin no allow tool)"
+)
+_PLAIN: Final = (
+    'a target default other than "plain": the target is only ever compared with "compose", in '
+    "export and in emit's document, so any other default writes the plain form"
+)
+_MANAGED: Final = (
+    'a mode default other than "managed": notes only compares the mode with "declarative", so '
+    "any other default writes the managed notes"
 )
 
 EQUIVALENT: Final[dict[str, str]] = {
@@ -132,6 +140,13 @@ EQUIVALENT: Final[dict[str, str]] = {
     ),
     "zoeymcp.common.policy.plan.x_plan__mutmut_323": _HAS_DEFINITION,
     "zoeymcp.common.policy.plan.x_plan__mutmut_325": _HAS_DEFINITION,
+    # --- common.policy.export
+    "zoeymcp.common.policy.export.x_export__mutmut_3": _PLAIN,
+    "zoeymcp.common.policy.export.x_export__mutmut_4": _PLAIN,
+    "zoeymcp.common.policy.export.x_notes__mutmut_1": _MANAGED,
+    "zoeymcp.common.policy.export.x_notes__mutmut_2": _MANAGED,
+    "zoeymcp.common.policy.export.x_notes__mutmut_3": _PLAIN,
+    "zoeymcp.common.policy.export.x_notes__mutmut_4": _PLAIN,
 }
 
 

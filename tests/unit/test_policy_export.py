@@ -576,6 +576,11 @@ def policies(draw: st.DrawFn) -> Policy:
             "clients": {"agent": {"token": "zq-" + draw(tokens), "servers": sorted(servers)}},
         },
     }
+    for route in rest:
+        # check refuses a forced query value named as the route's query credential's param.
+        cred = raw["credentials"].get(route.get("credential", ""))
+        if isinstance(cred, dict) and cred["kind"] == "query" and "query" in route:
+            route["query"]["force"].pop(cred["param"], None)
     if draw(st.booleans()):
         raw["connectors"] = {
             "mail": {
@@ -628,3 +633,29 @@ def test_a_generated_policy_comes_back_the_same(policy: Policy) -> None:
     compose = exported(policy, target="compose")
     assert dedented(compose, COMPOSE_INDENT).replace("$$", "$") == plain
     assert exported(back, target="compose") == compose
+
+
+# --- a model inside a mapping or a list ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("model", "last"),
+    [
+        ("Client", "approvals"),  # gateway.clients, a mapping of models
+        ("Route", "program"),  # routes, a list of models
+    ],
+)
+def test_a_model_inside_a_mapping_or_a_list_is_written_by_the_table(
+    monkeypatch: pytest.MonkeyPatch, example_raw: dict[str, Any], model: str, last: str
+) -> None:
+    """The table governs a model reached through a mapping's values or a list's items as it does a
+    field's model: one it doesn't name, or one of whose fields it doesn't name, raises."""
+    policy = made(raw_policy(example_raw))
+    tables = dict(EXPORT_FIELDS)
+    monkeypatch.setattr(export_module, "EXPORT_FIELDS", tables)
+    del tables[model]
+    with pytest.raises(KeyError, match=f"^'{model}'$"):
+        exported(policy)
+    tables[model] = tuple(field for field in EXPORT_FIELDS[model] if field != last)
+    with pytest.raises(KeyError, match=re.escape(f"{model}.{last}")):
+        exported(policy)

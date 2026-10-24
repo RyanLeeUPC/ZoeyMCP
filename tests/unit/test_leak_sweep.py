@@ -59,8 +59,10 @@ token, a placeholder, a token header, a forced query value, a connector username
 holds none of them in its file, its head or its anchor, and its salted ``body_digest`` differs
 from another seal of the same policy; the unsealed revision and its body refuse to be logged. A
 diff between two revisions (step 12b) holds nothing the policy view hides, and the host's export
-holds a client token only as its hash. The store's I/O, and the saves, rollbacks, imports and
-exports that write and read it, join the sweep in the steps that build them.
+holds a client token only as its hash. The store's I/O (step 13a: a seed, a save, a master-key
+rotation, a quarantine move and a prune) leaves no vault-side value of the policy, nor the client
+token's hash, in a file in clear, a log line, a commit's header or the store's repr. The saves,
+rollbacks, imports and exports that write and read it join the sweep in the steps that build them.
 """
 
 from __future__ import annotations
@@ -106,7 +108,7 @@ from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.diff import structured
 from zoeymcp.common.policy.export import export
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
-from zoeymcp.common.policy.plan import normalize
+from zoeymcp.common.policy.plan import WritePlan, normalize
 from zoeymcp.common.policy.ratchet import initial
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
@@ -118,9 +120,10 @@ from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policydiffview import rows as policy_diff_rows
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
-from zoeymcp.vault import logs, policyseal, policystart, reviewjobs
+from zoeymcp.vault import logs, policyseal, policystart, policystore, reviewjobs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import EGRESS_HEADER, VaultApp
+from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.reportstore import ReportStore
@@ -2165,3 +2168,60 @@ def test_the_start_verdict_shows_no_policy_value(log_lines: io.StringIO) -> None
     with pytest.raises(TypeError, match=r"refusing to log a secret"):
         logs.event("oops", f=found)
     assert log_lines.getvalue() == ""
+
+
+def test_the_policy_stores_files_and_logs_hold_no_policy_value(
+    tmp_path: Path, log_lines: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's I/O (M6 design D.1, D.7-D.9, O.6, Y3, step 13a): the secret-heavy policy
+    seeded and saved under the previous master key, rotated to the current one, a revision
+    quarantined and the history pruned (four revisions kept, to stay quick); no vault-side value,
+    nor the client token's hash, is in any file under the state directory, a log line, a
+    commit's header or the store's repr, and the store can't be logged."""
+    monkeypatch.setattr(policystore, "KEEP", 4)
+    policy = secret_heavy_policy()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    previous = KeySet.from_master(bytes(range(7, 39)))
+    store = policystore.PolicyStore.open(state, previous, None)
+    seeded = store.seed(policy, ratchet=initial(policy), seed_digest="sha256:" + "5" * 64)
+    headers = [seeded.header]
+    for _ in range(5):
+        head = store.head
+        assert head is not None
+        plan = WritePlan(
+            kind="policy.save",
+            base=head.revision,
+            base_digest=head.digest,
+            changes=(),
+            effects=(),
+            breaks=(),
+            kept=(),
+            unused_slots=(),
+            moves=(),
+            kept_allow=(),
+            ratchet=initial(policy),
+            rows=(),
+            policy=policy,
+        )
+        fingerprint = {"by": "passkey", "fingerprint": "0123456789abcdef"}
+        headers.append(store.commit(plan, author=fingerprint).header)
+    (state / policystart.revision_file(4)).write_bytes(b"{}")
+    rotated = policystore.PolicyStore.open(state, KEYS, previous)
+    assert isinstance(rotated.verdict, policystart.Ok)
+    assert rotated.verdict.quarantined == (policystart.Quarantined(4, "not_a_revision"),)
+    events = [json.loads(line)["event"] for line in log_lines.getvalue().splitlines()]
+    assert events.count("policy_pruned") == 2
+    assert {"policy_revision_quarantined", "policy_rekeyed"} <= set(events)
+    written = [path.read_bytes() for path in state.rglob("*") if path.is_file()]
+    shown = [
+        *written,
+        log_lines.getvalue().encode(),
+        json.dumps(headers).encode(),
+        repr(store).encode(),
+        repr(rotated).encode(),
+    ]
+    for value in [*VAULT_SIDE.values(), hash_token(LITERAL_TOKEN)]:
+        assert not any(value.encode() in text for text in shown), value
+    with pytest.raises(TypeError, match=r"refusing to log a secret"):
+        logs.event("oops", store=rotated)

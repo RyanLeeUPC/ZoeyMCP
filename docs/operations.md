@@ -2254,6 +2254,8 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 403 | `generation_raise_from_portal` | A key rotation is done on the host: raise `<detail>` with zoeymcp policy import. |
 | 413 | `summary_too_large` | This change is too long to confirm in the portal: `<detail>` (zoeymcp policy export, edit, zoeymcp policy import), where all of it is shown. |
 | 400 | `no_change` | Nothing would change. |
+| 500 | `policy_write_failed` | The revision couldn't be written; nothing changed. |
+| 400 | `revision_out_of_range` | A revision can't go above 9,999,999,999. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |
@@ -3350,3 +3352,65 @@ sanitizing, `max_upstream_message_bytes`, `call_timeout`) to carry the load alon
 line, stderr counted rather than logged, the refusal of the program's own requests, ids and
 progress tokens kept apart between clients, keepalives, readiness, and a built environment for
 the program.
+
+## 34. Managed policy
+
+### The revision store
+
+In managed mode the vault keeps the policy itself, as numbered revisions in its state volume:
+
+- `/state/policy/head.json`: which revision is the newest; writing it is what commits a change;
+- `/state/policy/revisions/<10 digits>.json`: one file per revision, the newest 64 kept;
+- `/state/policy/quarantine/`: files a start moved aside and never reads again (see below);
+- `/state/policy-anchor.json`, beside the directory: the highest revision ever committed, so a
+  `/state/policy` restored or deleted on its own is noticed.
+
+A revision's policy and its record of what may only move forward (retired keys, tokens,
+placeholders and pins) are encrypted under a key derived from the master key, and every file is
+MAC'd. Revision numbers, times, kinds, digests and passkey fingerprints are in clear. A save writes
+the revision, then the head, then the anchor, then removes revisions older than the newest 64; a
+crash between any two leaves a store the next start sorts out. Every write is a temporary
+`.policy-*` file renamed into place, and a start removes any it finds.
+
+At each start the vault reads every kept revision, then:
+
+- a revision one above the head that names the head as its parent is a save that never answered:
+  it goes to `quarantine/<n>.uncommitted.json` and the head runs (`policy_save_uncommitted`);
+- an older revision that doesn't verify (changed, under an unknown or retired master key, from
+  another deployment, or not chaining to its neighbours) goes to `quarantine/<n>.unreadable.json`
+  and the head still runs (`policy_revision_quarantined`): it is lost from the history only;
+- a head one above the anchor is a crash between the two writes: the anchor is rewritten;
+- revisions below the oldest kept are a removal cut short: they are removed (`policy_pruned`);
+- a name the vault doesn't write in `/state/policy` is logged (`policy_stray_file`) and left alone.
+
+Quarantined files stay until you delete them; a later file of the same name is kept beside
+the first as `<n>.<why>.2.json`, then `.3`, and so on.
+
+**Rotating the master key.** Start the vault with the new `ZOEYMCP_MASTER_KEY` and the old one in
+`ZOEYMCP_MASTER_KEY_PREVIOUS`: it re-seals every kept revision under the new key, oldest first,
+then the head, then the anchor, which records the old key as retired (`policy_rekeyed`). No
+revision's digest changes. If the vault stops midway, start it again with both keys set and it
+finishes. Once `policy_rekeyed` is logged, remove `ZOEYMCP_MASTER_KEY_PREVIOUS`: from then on a
+file sealed under the old key is refused at start, or quarantined if it is an older revision,
+even while the old key is still set. While a save that never answered can't be moved to
+quarantine, the rotation waits for the next start. A previous key equal to the current one is
+ignored.
+
+**When the store can't be written** (a full or read-only volume), a change is refused with
+`policy_write_failed` and nothing changes. If only the anchor can't be written, the change is
+saved and `policy_anchor_write_failed` is logged; the next change writes the anchor first, and is
+refused while it still can't.
+
+Its log lines:
+
+| Event | Fields |
+| --- | --- |
+| `policy_save_uncommitted` | `revision`: a save that never answered, moved to quarantine (warning) |
+| `policy_revision_quarantined` | `revision`, `reason` (`tampered`, `not_a_revision`, `unreadable`, `body`, `key_unknown`, `key_retired`, `deployment`, `misplaced` or `chain`), moved to quarantine (warning) |
+| `policy_stray_file` | `name`, with hidden characters shown: a file the vault doesn't write, left alone; once per start |
+| `policy_pruned` | `revisions` (how many were removed), `below` (the oldest kept) |
+| `policy_rekeyed` | `revisions` (how many were re-sealed), `key_id` (the new master key's ID), `next`: remove `ZOEYMCP_MASTER_KEY_PREVIOUS` now |
+| `policy_anchor_write_failed` | `revision`, `error_type`: the anchor wasn't written (warning) |
+| `policy_housekeeping_failed` | `action` (`quarantine`, `prune`, `rekey` or `remove`), `error_type`, and `revision` for a quarantine or a prune: the next start tries again (warning) |
+
+None holds a policy value or anything a file holds; `policy_stray_file` names the stray file only.
