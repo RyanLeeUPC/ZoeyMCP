@@ -309,8 +309,9 @@ finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `co
 `set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
 `check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys`,
 `reset_passkeys`, `onboard_again` (with the `command`, `login --mcp URL --reregister`),
-`widen_scope` (with the `scope` and the `fragment` that sets it) or `check_egress_role`, and the
-name it applies to). For a deployment's verify script:
+`widen_scope` (with the `scope` and the `fragment` that sets it), `check_egress_role` or `review`
+(with the `server`: `zoeymcp review <server>`), and the name it applies to). For a deployment's
+verify script:
 
 ```sh
 docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp health --json --strict > /dev/null
@@ -347,6 +348,11 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `ledger_copy_refused`, `ledger_copy_broken`, `ledger_copy_unavailable` | error | the copy refuses reports after a fork, gap or full; its files stop chaining at a seq; its directory can't be read (§21) |
 | `passkeys_unavailable` | error | (with an `admin` block) the passkey file can't be verified, so portal sign-in is off: `zoeymcp setup-code --reset` (§26) |
 | `passkey_counter`, `passkey_single` | warning, info | a passkey's signature counter went back in the last 30 days (the authenticator may have been copied: check `zoeymcp passkeys`); only one passkey is enrolled, so losing it means a reset |
+| `tools_unreviewed` | warning | (with a `gateway` section; from the gateway's status report, §13) the server lists tools nobody reviewed: new ones, and declined ones whose definition changed, counted here and named by `zoeymcp review <server>`. Review the server, and include or decline each (§11) |
+| `drift_marked` | warning | (§13) included tools that changed since the review, that a drift mark hides, or that the server no longer lists (§12): review the server |
+| `server_blocked` | warning | (§13) the gateway reports that `on_drift: fail` blocked the server (a tool drifted, a drift mark held, or an included tool listed invalid): none of its tools is served until it is reviewed (§12) |
+| `server_listing_invalid` | warning | (§13) the server lists tools the gateway can't serve, or whose names aren't valid, counted and not named; or the vault couldn't read the gateway's status for that server |
+| `gateway_status_stale` | info | (§13) the gateway hasn't pushed its status for 3 minutes (it does at least every minute): the `gateway` section's other findings are that old. Check that the gateway runs and reaches the vault |
 
 Findings marked `(from stored metadata)` (`advisory` in JSON) come from the store's clear
 metadata, which anyone with the state file can edit: they are shown, and nothing the vault
@@ -1247,8 +1253,42 @@ notes  remote  ready  era modern  connections 1  exposed 2/2
 ```
 
 `zoeymcp review` with no server prints one line per server from the same data, and exits 1 if
-anything is drifted, marked, missing or invalid. Neither makes an upstream call, and neither
-shows definitions or token hashes. `--format json` for both.
+anything is drifted, marked, missing or invalid, or listed and nobody reviewed it. Neither makes
+an upstream call, and neither shows definitions or token hashes. `--format json` for both.
+
+**The status in the portal and in `health`.** The vault never connects to the gateway, so the
+gateway pushes a summary of the same data to the vault: per server its kind, state, era,
+whether it is blocked, and counts, and the names its attention decision sorts out (the tools that drifted, that a drift
+mark hides, that it no longer lists, and the tools nobody reviewed with the pin each is listed
+at), never a definition, a token hash or a client name. It pushes when that changes, at most
+once every 5 seconds, and at least once a minute; the vault keeps the latest in memory only, so
+after a vault restart the next push, within a minute, fills it again. Nothing the vault decides
+reads it: it is shown, labelled as what the gateway reports.
+
+- **`zoeymcp health`** shows it as the `gateway` section (`tools_unreviewed`, `drift_marked`,
+  `server_blocked`, `server_listing_invalid`, `gateway_status_stale`; §3), each with
+  `run: zoeymcp review <server>`. `review`'s exit code, these findings and the portal's list
+  come from the one decision, so a server `review <server>` exits 1 for has a finding here.
+- **The portal's Home page** lists the same, per server, under the checklist: drifted, missing
+  and marked tools, the tools nobody reviewed, a blocked server, and a bridge's state while it
+  isn't ready, each with **Review**, which opens the MCP servers page (at most 64 items; the
+  rest are in `zoeymcp health`).
+- The upstream reports a tool it can't serve under the name it lists, which often isn't a tool
+  name: those are counted, not named. A report the vault can't read for one server leaves that
+  server out (`server_listing_invalid`) and keeps the rest.
+
+The vault takes the report on its own path, `POST /_zoeymcp/gateway/v1/report/status`, the
+gateway's alone (its key on the TCP listener, or the link socket): at most 256 KiB, one at a
+time, and at most one accepted every 5 seconds (429 sooner). Its log lines:
+
+| Event | Fields |
+| --- | --- |
+| `status_received` | `servers` (how many the report names), `bytes`: at most once a minute |
+| `status_refused` | `reason`: `too_soon` (429), `too_large` (413), `witness_range` (a witness revision above 9,999,999,999), or `invalid` (anything else the vault couldn't read): at most once a minute |
+
+The gateway's side logs `status_push_failed` with the `reason` (a vault code, a status, or the
+error's type), at most once a minute; it backs off from 1 s up to 30 s, and waits 5 s after a
+429. None of these holds a tool's name or anything else from the report.
 
 ## 14. Rotating the gateway key (hardened tier)
 

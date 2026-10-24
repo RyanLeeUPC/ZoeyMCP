@@ -13,11 +13,13 @@ gateway, proved by the kernel; on TCP it is whoever presents a placeholder or a 
 when the link socket is configured TCP refuses gateway keys altogether (M3 design C.1).
 
 Paths under ``/_zoeymcp/`` are the vault's own and never reach a route (no route prefix can start
-with ``_``). :mod:`.internal`'s table decides them. Four are for the gateway only: its policy
+with ``_``). :mod:`.internal`'s table decides them. Five are for the gateway only: its policy
 view, a long poll that a reload wakes (M3 design D.1, D.2); the report path, where it pushes its
-ledger to the vault's copy (M5 design J.2); and the review job path (M7 design F.2), a long poll
-of the review jobs queued at the view it holds and the path it posts each job's result to. The
-fifth is the egress role's allowlists (M7 design G.2), for its key alone and never on the link
+ledger to the vault's copy (M5 design J.2); the review job path (M7 design F.2), a long poll
+of the review jobs queued at the view it holds and the path it posts each job's result to; and
+the status path (M6 design K.1), where it pushes a summary of its status, which the vault keeps
+in memory for health and Home (:meth:`VaultApp.gateway_status`). The sixth is the egress role's
+allowlists (M7 design G.2), for its key alone and never on the link
 socket: a long poll that a reload or an onboarding's allowance change wakes (I.3). The vault
 keeps when the role last fetched and the digest it holds, for health's
 ``egress_allowlist_stale`` (J) and for an onboarding through the role, which waits for it to
@@ -95,7 +97,7 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from ..common.policy.view import build_view, dump_view
-from . import internal, logs, netclient, secretops
+from . import internal, logs, netclient, secretops, statusreport
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .keys import KeySet
@@ -144,15 +146,18 @@ REFUSAL_MARKER = "refused"
 LISTENER_SCOPE_KEY = "zoeymcp.listener"
 Listener = Literal["gateway", "tcp"]
 # The vault's own endpoints (M7 design G.1): the gateway's view (M3 design D.1), its report path
-# (M5 J.2) and the review job path (M7 F.2).
+# (M5 J.2), the review job path (M7 F.2) and its status path (M6 K.1).
 INTERNAL_SEGMENT = internal.SEGMENT
 VIEW_PATH = internal.VIEW.path
 REPORT_PATH = internal.LEDGER.path
 REVIEW_JOBS_PATH = internal.REVIEW_JOBS.path
 REVIEW_REPORT_PATH = internal.REVIEW_REPORT.path
+STATUS_PATH = internal.STATUS.path
 ALLOWLIST_PATH = internal.ALLOWLISTS.path
 # A report's body is read within this many seconds (M5 design J.2).
 REPORT_DEADLINE = 10.0
+# status_received and status_refused are logged at most this often (M6 design N.3).
+STATUS_LOG_EVERY = 60.0
 # The longest ``?wait=`` in seconds, and how many may wait at once (M3 design D.2).
 VIEW_MAX_WAIT = internal.VIEW_MAX_WAIT
 VIEW_MAX_WAITERS = internal.VIEW_MAX_WAITERS
@@ -502,6 +507,13 @@ class VaultApp:
         self._role_asked_at: float | None = None
         self._role_digest: str | None = None
         self._role_poll = asyncio.Event()
+        # The gateway's latest status report and its arrival (monotonic), for health and Home
+        # (M6 design K.1); none since the vault started counts from the start. Reports are read
+        # one at a time, at most one accepted per 5 s; status_received and status_refused are
+        # logged at most once a minute each.
+        self._status: tuple[statusreport.Report, float] | None = None
+        self._status_gate = internal.StatusGate()
+        self._status_logged: dict[str, float] = {}
         self._started = time.monotonic()
         self._install(policy)
 
@@ -651,6 +663,18 @@ class VaultApp:
         if since is None:
             return None
         return max(0.0, time.monotonic() - since)
+
+    def gateway_status(self) -> statusreport.GatewayStatus:
+        """The gateway's latest status report and its age, for health and Home (K.1): the
+        seconds since it arrived, or since the vault started when none has."""
+        if self._status is None:
+            return statusreport.GatewayStatus(None, max(0.0, time.monotonic() - self._started))
+        report, at = self._status
+        return statusreport.GatewayStatus(report, max(0.0, time.monotonic() - at))
+
+    def keep_status(self, report: statusreport.Report) -> None:
+        """Keep ``report`` as the gateway's latest, arrived now."""
+        self._status = (report, time.monotonic())
 
     async def role_fetched(self, wait: float) -> bool:
         """Wake every allowlist poll, then wait up to ``wait`` seconds for the egress role to
@@ -994,6 +1018,8 @@ class VaultApp:
             return await self._review_jobs(request, log)
         if decided is internal.REVIEW_REPORT:
             return await self._review_report(request, log)
+        if decided is internal.STATUS:
+            return await self._status_report(request, log)
         return await self._view_answer(request, log)
 
     def _egress_key_presented(self, request: Request) -> bool:
@@ -1222,6 +1248,72 @@ class VaultApp:
         logs.event("review_reported", **event)
         answer = {"v": 1, "job": job.id, "state": job.state}
         return JSONResponse(answer, headers={"cache-control": "no-store"})
+
+    # --- the gateway's status report (M6 design K.1) -----------------------------------------
+
+    async def _status_report(self, request: Request, log: dict[str, Any]) -> Response:
+        """``POST /_zoeymcp/gateway/v1/report/status``: the gateway's status (K.1, FM-19).
+
+        Before any body byte is read: no query (400), exactly one ``Content-Type:
+        application/json`` (415) and one ``Content-Length`` (411) of at most 256 KiB (413
+        ``too_large``). Then one report at a time, and at most one accepted per 5 s (429
+        ``too_soon``, :class:`.internal.StatusGate`). The body is read within 256 KiB and 10 s
+        (408) and parsed strictly; :func:`.statusreport.read` refuses a report whole (400
+        ``invalid`` or ``witness_range``), or keeps it as the latest, its bad entries dropped.
+        Refusals log ``status_refused`` and accepted reports ``status_received``, each at most
+        once a minute."""
+        if request.scope.get("query_string"):
+            raise Refused(400, "the status path takes no query")
+        most = internal.STATUS_MAX_BYTES
+        try:
+            if _json_length(request, kind="a status report") > most:
+                raise Refused(413, "a status report is at most 256 KiB", code="too_large")
+            refused = self._status_gate.begin(time.monotonic())
+            if refused is not None:
+                raise Refused(refused.status, refused.reason, code="too_soon", retry_after=1)
+        except Refused as exc:
+            self._status_refused(exc.code)
+            raise
+        accepted = False
+        try:
+            too_large = ("a status report is at most 256 KiB", "too_large")
+            body = await _read_json_body(
+                request, most, REPORT_DEADLINE, too_large, kind="the status report"
+            )
+            try:
+                data = canonical.loads_strict(body, max_bytes=most)
+            except ValueError as exc:
+                raise Refused(400, "the status report isn't strict JSON", code="invalid") from exc
+            try:
+                report = statusreport.read(data, self._limits().max_tools_per_server)
+            except statusreport.StatusRefused as exc:
+                raise Refused(400, exc.detail, code=exc.reason) from exc
+            self.keep_status(report)
+            accepted = True
+        except Refused as exc:
+            self._status_refused(exc.code)
+            raise
+        finally:
+            self._status_gate.end(time.monotonic(), accepted=accepted)
+        log["servers"] = len(report.servers)
+        if self._status_sparse("received"):
+            logs.event("status_received", servers=len(report.servers), bytes=len(body))
+        return JSONResponse({"v": 1}, headers={"cache-control": "no-store"})
+
+    def _status_refused(self, code: str | None) -> None:
+        """``status_refused`` with N.3's reason, at most once a minute."""
+        reason = code if code in ("too_large", "too_soon", "witness_range") else "invalid"
+        if self._status_sparse("refused"):
+            logs.event("status_refused", reason=reason, level="warning")
+
+    def _status_sparse(self, kind: str) -> bool:
+        """Whether a status event of ``kind`` may be logged now: at most once a minute."""
+        now = time.monotonic()
+        last = self._status_logged.get(kind)
+        if last is not None and now - last < STATUS_LOG_EVERY:
+            return False
+        self._status_logged[kind] = now
+        return True
 
     def _limits(self) -> GatewayLimits:
         gateway = self._policy.gateway

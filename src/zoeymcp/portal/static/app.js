@@ -43,9 +43,10 @@
   // The buttons for health's actions (I.1); the vault words every other action (todo).
   const ACTION_TEXT = { connect: "Connect", reset: "Try again", add_passkey: "Add a passkey",
     set_secret: "Set it on the Secrets page", delete_secret: "See the Secrets page",
-    review_passkeys: "Review the passkeys" };
+    review_passkeys: "Review the passkeys", review: "Review" };
   const SECTION = { credential: "Credential", connector: "Connector", store: "The store",
-    egress: "Egress", passkeys: "Passkeys", ledger_copy: "The reported ledger" };
+    egress: "Egress", passkeys: "Passkeys", ledger_copy: "The reported ledger",
+    gateway: "The gateway reports", policy: "The policy" };
 
   let pending = null; // the action being confirmed: its ID, step-up options and what follows
   let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created
@@ -232,6 +233,7 @@
       $("home-ready").textContent = health.summary.error + health.summary.warning ?
         "What needs you, errors first:" : "Everything is ready.";
       renderFindings($("checklist"), health.checklist);
+      if (window.zoeyDrift) await window.zoeyDrift.home(); // M6 M.7: Home's attention list
       show("home");
     } catch (error) {
       afterFailure(error);
@@ -248,6 +250,7 @@
       delete_secret: () => showSecrets(action.secret),
       add_passkey: showPasskeys,
       review_passkeys: showPasskeys,
+      review: () => window.zoeyDrift.review(action.server),
     };
     const run = action ? runs[action.kind] : undefined;
     return run === undefined ? "" : button(ACTION_TEXT[action.kind], run);

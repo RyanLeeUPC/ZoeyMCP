@@ -1071,14 +1071,14 @@ def test_review_via_vault_prints_the_gateways_review(
 ) -> None:
     """The gateway's poller runs the same review as its admin socket, on a real upstream; the
     second read through the vault is the same report, and the gateway closes every vault-link
-    client at shutdown (D-166)."""
+    client at shutdown (D-166), the status pusher's among them (M6 design K.1)."""
     fake = McpFake()
     review_pins = {name: pin_of_fake(fake, name) for name in TOOLS}
     rest = pins_of_the_rest(fake, TOOLS)
     with (
         # The rest declined: nothing is left that nobody reviewed (M6 design J.5).
         deployment(tmp_path, fake, include=TOOLS, review=review_pins, declined=rest) as deployed,
-        gateway(deployed, review=True, report=True) as running,
+        gateway(deployed, review=True, report=True, status_push=True) as running,
     ):
         through_vault = run_cli(
             monkeypatch,
@@ -1110,7 +1110,7 @@ def test_review_via_vault_prints_the_gateways_review(
     assert again == through_vault
     assert text.count('"event":"review_job_done"') == 1
     assert '"event":"review_requested"' in text
-    for http in (app.policy_http, app.report_http, app.review_http):
+    for http in (app.policy_http, app.report_http, app.review_http, app.status_http):
         assert http is not None
         assert http.is_closed
 

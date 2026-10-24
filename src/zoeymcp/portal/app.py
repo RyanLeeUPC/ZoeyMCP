@@ -76,6 +76,8 @@ address guard for the typed ``host:port``, is the ``onboard.discover_private`` a
 The review queues a job of the portal's surface for the gateway's poll (``POST
 /api/review/{server}``), answers a done job's rows (``portal/reviewview.py``), and makes
 fragment 2 from the operator's choices (``POST /api/review/jobs/{job}/diff``), saving nothing.
+Home's attention list (M6 design M.7), ``GET /api/attention``, is what the gateway's status
+report says needs the operator, read from health's ``gateway`` section (``attention_items``).
 
 The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
 a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
@@ -123,6 +125,7 @@ from urllib.parse import parse_qsl
 from starlette.types import Receive, Scope, Send
 
 from ..common import netguard
+from ..common.policy import attention
 from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
 from ..common.policy.fields import URL_MAX
 from ..common.policy.schema import OAuth2Credential, split_scope
@@ -854,6 +857,7 @@ class PortalApp:
             api.REVIEW: self._review_queue,
             api.REVIEW_JOB: self._review_read,
             api.REVIEW_DIFF: self._review_diff,
+            api.ATTENTION: self._attention,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -1440,6 +1444,14 @@ class PortalApp:
         if self.health is None:
             raise RuntimeError("this portal has no health reader")
         return Reply(_health_view(self.health()))
+
+    async def _attention(self, call: Call) -> Reply | Refusal:
+        """Home's attention list (M6 design M.7): what the gateway reports needs the operator,
+        per server, built from health's ``gateway`` section, so the list, the health findings
+        and ``zoeymcp review``'s exit code read the one attention decision (Y29)."""
+        if self.health is None:
+            raise RuntimeError("this portal has no health reader")
+        return Reply(attention_items(self.health()))
 
     async def _oauth_list(self, call: Call) -> Reply | Refusal:
         """Every oauth2 credential as the logins see it (``LoginService.status``), and what the
@@ -2291,7 +2303,7 @@ def _health_view(report: Mapping[str, Any]) -> dict[str, Any]:
     view: dict[str, Any] = {"summary": report["summary"]}
     for key, kind in (("credentials", "credential"), ("connectors", "connector")):
         view[key] = [_health_section(kind, item, checklist) for item in report[key]]
-    for key in ("store", "egress", "passkeys", "ledger_copy"):
+    for key in ("store", "egress", "passkeys", "ledger_copy", "gateway"):
         if key in report:
             view[key] = _health_section(key, report[key], checklist)
     rank = {"error": 0, "warning": 1, "info": 2}
@@ -2303,8 +2315,11 @@ def _health_section(
     kind: str, section: Mapping[str, Any], checklist: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """One section of the report fit to show, its findings added to ``checklist``. A secret
-    reference's row stays out: the finding's text names it."""
-    view = {key: value for key, value in section.items() if key not in ("findings", "refs")}
+    reference's row stays out: the finding's text names it, and so do the gateway's server
+    rows (Home's list reads them, :func:`attention_items`)."""
+    view = {
+        key: value for key, value in section.items() if key not in ("findings", "refs", "servers")
+    }
     name = section.get("name")
     name_shown = shown(name, NAME_LIMIT) if isinstance(name, str) else None
     if name_shown is not None:
@@ -2323,6 +2338,56 @@ def _health_section(
     view["findings"] = findings
     checklist.extend(findings)
     return view
+
+
+# Home's attention list (M6 design M.7, N.4): at most this many items, and each server's in this
+# order, from the gateway's attention decision.
+ATTENTION_MAX: Final = 64
+# A bridge's state is an item unless every connection is one of these (D-174's bridge half).
+BRIDGE_QUIET: Final = frozenset({"ready", "idle"})
+
+
+def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Home's list from a health report (M.7): per server the gateway reports, its drifted,
+    missing and marked tools, the tools nobody reviewed, a blocked server and a bridge's state,
+    each an item ``{kind, server_shown, count, text, action}`` whose one action is a review of
+    the server; at most :data:`ATTENTION_MAX`, with how many more. ``gateway`` says whether
+    health has a gateway section (a policy with a gateway), and ``reported_ago`` is the seconds
+    since the gateway's report, or None without one."""
+    section = report.get("gateway")
+    items: list[dict[str, Any]] = []
+    for server in [] if section is None else section["servers"]:
+        name = server["name"]
+        found = attention.loaded(server["attention"])  # the gateway's decision, as made
+        rows = [
+            ("drifted", len(found.drifted), "changed {n} included {tools} since the review"),
+            ("missing", len(found.missing), "no longer lists {n} included {tools}"),
+            ("marked", len(found.marked), "has {n} included {tools} hidden by a drift mark"),
+            ("unreviewed", len(found.unreviewed()), "lists {n} {tools} nobody reviewed"),
+            ("blocked", int(server["blocked"]), "is blocked (on_drift: fail): it serves no tool"),
+        ]
+        state = server["state"]
+        if server["bridge"] and not set(state) <= BRIDGE_QUIET:
+            rows.append(("bridge", 1, "(a bridge): " + ", ".join(state)))
+        for kind, count, words in rows:
+            if count:
+                tools = "tool" if count == 1 else "tools"
+                text = f"{name} " + words.format(n=count, tools=tools)
+                items.append(
+                    {
+                        "kind": kind,
+                        "server_shown": shown(name, NAME_LIMIT),
+                        "count": count,
+                        "text_shown": shown(text, SUMMARY_LIMIT),
+                        "action": {"kind": "review", "server": name},
+                    }
+                )
+    return {
+        "gateway": section is not None,
+        "items": items[:ATTENTION_MAX],
+        "more": max(0, len(items) - ATTENTION_MAX),
+        "reported_ago": None if section is None else section["reported_ago"],
+    }
 
 
 def _oauth_view(item: Mapping[str, Any], cred: OAuth2Credential, policy: Policy) -> dict[str, Any]:

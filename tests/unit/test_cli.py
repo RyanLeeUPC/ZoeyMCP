@@ -2089,6 +2089,38 @@ def test_health_shows_the_ledger_copy(admin: FakeAdmin) -> None:
     )
 
 
+def test_health_shows_what_the_gateway_reports(admin: FakeAdmin) -> None:
+    """M6 design M.5: the gateway section, with when the gateway last reported and each
+    finding's review command; ``--strict`` fails on its warnings."""
+    finding = {
+        "code": "tools_unreviewed",
+        "level": "warning",
+        "advisory": False,
+        "text": "notes lists 1 tool nobody reviewed",
+        "action": {"kind": "review", "server": "notes"},
+    }
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    section: dict[str, Any] = {"reported_ago": 42, "view": None, "servers": []}
+    report = {
+        "summary": {"error": 0, "warning": 1, "info": 0},
+        "credentials": [],
+        "connectors": [],
+        "store": empty,
+        "gateway": {**section, "level": "warning", "findings": [finding]},
+    }
+    admin.answers[("GET", "/health")] = (200, report)
+    code, out, _ = cli(["health", "--socket", "x"])
+    assert code == EXIT_OK
+    assert out.splitlines()[1:4] == [
+        "gateway: warning (the gateway reported 42 s ago)",
+        "  warning tools_unreviewed: notes lists 1 tool nobody reviewed",
+        "          run: zoeymcp review notes",
+    ]
+    assert cli(["health", "--socket", "x", "--strict"])[0] == EXIT_FINDINGS
+    report["gateway"] = {**section, "reported_ago": None, "level": "ok", "findings": []}
+    assert "gateway: ok (no status yet)" in cli(["health", "--socket", "x"])[1].splitlines()
+
+
 def test_health_shows_the_egress_section_only_with_findings(admin: FakeAdmin) -> None:
     """A route with no credential that the guard refused (M7 design J); a quiet section is
     not printed."""

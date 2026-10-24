@@ -245,7 +245,7 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.vault.onboarding.x_allow_hosts__mutmut_17": "other reasons: as mutant 10",
     "zoeymcp.vault.onboarding.x_allow_hosts__mutmut_18": "other reasons: as mutant 10",
     "zoeymcp.vault.onboarding.x_committed_for__mutmut_10": _NO_NAME,
-    "zoeymcp.vault.onboarding.x_listed_servers__mutmut_34": _NO_NAME,
+    "zoeymcp.vault.onboarding.x_listed_servers__mutmut_38": _NO_NAME,
     "zoeymcp.vault.onboarding.x_served_at__mutmut_19": _NO_NAME,
     "zoeymcp.vault.onboarding.x_token_state__mutmut_3": (
         '`refresh_token or "XXXX"`: "XXXX" starts with neither "store:" nor "env:", as "" doesn\'t'
@@ -274,11 +274,11 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.portal.reviewview.x_definition_lines__mutmut_22": (
         '`or ["XXXX"]` for an empty line: json.dumps with an indent writes no empty line'
     ),
-    "zoeymcp.portal.reviewview.x_diff__mutmut_37": (
+    "zoeymcp.portal.reviewview.x_diff__mutmut_42": (
         "the target None for compose: compose's indent is already 8, which the plain form takes "
         'as it is, and fragment 2 holds no "$" to double (names, pins and fixed comment texts)'
     ),
-    "zoeymcp.portal.reviewview.x_diff__mutmut_40": "the target left out: as mutant 37",
+    "zoeymcp.portal.reviewview.x_diff__mutmut_45": "the target left out: as mutant 42",
     # --- bridge.admit
     "zoeymcp.bridge.admit.x__values__mutmut_4": _CASE,
     "zoeymcp.bridge.admit.x__values__mutmut_8": _CASE,

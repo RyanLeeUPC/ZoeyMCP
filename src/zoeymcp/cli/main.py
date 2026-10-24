@@ -75,6 +75,7 @@ HEALTH_ACTIONS = {
         "check that the egress role runs, reaches the vault, and has the key zoeymcp egress-key "
         "prints"
     ),
+    "review": "run: zoeymcp review {server}",
 }
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
@@ -1877,7 +1878,8 @@ def _cmd_health(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
     """The lines ``health`` prints: per credential, connector and the store, its findings, each
     with what to do, then the routes with no credential the guard refused (``egress``, only when
-    there are some), then the counts."""
+    there are some), the passkeys, the ledger copy and what the gateway reports (``gateway``, M6
+    design M.5), then the counts."""
     lines: list[str] = []
     for item in report["credentials"]:
         lines.append(f"{item['name']} ({item['kind']}): {item['level']}")
@@ -1907,6 +1909,12 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
         head = "nothing reported" if copy["head_seq"] is None else f"head seq {copy['head_seq']}"
         lines.append(f"ledger copy: {copy['level']} ({copy['state']}, {head})")
         lines += _finding_lines(copy["findings"])
+    gateway = report.get("gateway")
+    if gateway is not None:
+        ago = gateway["reported_ago"]
+        said = "no status yet" if ago is None else f"the gateway reported {duration(ago)} ago"
+        lines.append(f"gateway: {gateway['level']} ({said})")
+        lines += _finding_lines(gateway["findings"])
     counts = report["summary"]
     lines.append(
         f"health: {'ok' if ok else 'FAILED'} ({counts['error']} error(s), "

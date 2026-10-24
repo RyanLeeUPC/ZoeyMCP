@@ -34,9 +34,16 @@ from zoeymcp.gateway.app import GatewayApp
 from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
+from zoeymcp.gateway.server import pushed_status
 from zoeymcp.gateway.toolkits import Toolkits
 from zoeymcp.gateway.upstream import UpstreamPool
-from zoeymcp.gateway.vaultlink import KeySource, parse_link, report_client, view_client
+from zoeymcp.gateway.vaultlink import (
+    KeySource,
+    parse_link,
+    report_client,
+    status_client,
+    view_client,
+)
 
 from .conftest import Clock, Deployment, _HTTPTransport
 from .helpers import Seen, wait_until
@@ -119,9 +126,10 @@ class GatewayDeployment:
     serves its portal too, over either link (M5 design O.1, review finding R9).
 
     With ``reporter`` the gateway reports its ledger to the vault's copy over the link, as
-    ``zoeymcp gateway`` does (M5 design J.3), and the portal's Ledger page reads it. ``extra``
-    merges another fragment into the profile's (``Deployment``); with ``toolkits`` the gateway
-    loads the example toolkits from their entry points, as the toolkit rig does.
+    ``zoeymcp gateway`` does (M5 design J.3), and the portal's Ledger page reads it; with
+    ``status_push`` it pushes its status report, which health and Home read (M6 design K.1).
+    ``extra`` merges another fragment into the profile's (``Deployment``); with ``toolkits`` the
+    gateway loads the example toolkits from their entry points, as the toolkit rig does.
 
     ``server`` is the profile's one server, which its placeholder client is assigned; with
     ``socket_clients`` the vault reaches a ``unix:`` route's bridge as ``--bridge`` has it (M7
@@ -147,6 +155,7 @@ class GatewayDeployment:
         clock: Clock | None = None,
         portal: bool = False,
         reporter: bool = False,
+        status_push: bool = False,
         extra: Mapping[str, Any] | None = None,
         toolkits: bool = False,
         server: str = SERVER,
@@ -156,6 +165,7 @@ class GatewayDeployment:
         self.state = tmp_path / "gateway"
         self.link = link
         self.reporter = reporter
+        self.status_push = status_push
         self.toolkits = toolkits
         self.clients = clients
         self.seen = Seen()
@@ -226,6 +236,8 @@ class GatewayDeployment:
                     policy_wait=1,
                     toolkits=toolkits,
                     report_http=report_client(link, keys) if self.reporter else None,
+                    status_http=status_client(link, keys) if self.status_push else None,
+                    status=pushed_status,
                 )
                 app.ledger, _ = Ledger.open_at(self.state, max_bytes=limits.ledger_max_bytes)
                 with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:

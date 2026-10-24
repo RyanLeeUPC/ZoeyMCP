@@ -1,9 +1,11 @@
-"""The portal's route table and static map (M5 design M.1, O.2 ``routes``; M7 design K.2).
+"""The portal's route table and static map (M5 design M.1, O.2 ``routes``; M7 design K.2; M6
+design M.2).
 
 Step 6a built the static map and the route shape, and each of steps 11 to 15 added the rows it
 built. From step 15 the table is M.1's, written here in the shape, and from M7 step 14a M.1's
 with K.2's, the route table M7 publishes (fold-in R27), before the step-up rows: the table equals
-them, and matching finds each row.
+them, and matching finds each row. M6 adds M.2's rows as each step builds them, after K.2's:
+step 7 Home's attention list, and the static map ``drift.js``.
 """
 
 from __future__ import annotations
@@ -106,7 +108,9 @@ K2 = (
         frozenset({"indent"}),
     ),
 )
-TABLE = (*M1, *K2, *ACTION_ROWS)
+# M6 M.2's rows, as each step builds them: step 7's attention list.
+M6 = (Route("GET", "/api/attention", FULL),)
+TABLE = (*M1, *K2, *M6, *ACTION_ROWS)
 SAMPLE = {
     "credential": "github",
     "flow": "Zm9vYmFyLWZsb3ctaWQx",
@@ -123,6 +127,7 @@ def test_the_static_map_is_fixed() -> None:
         "/app.js": StaticFile("app.js", "text/javascript; charset=utf-8"),
         "/webauthn.js": StaticFile("webauthn.js", "text/javascript; charset=utf-8"),
         "/review.js": StaticFile("review.js", "text/javascript; charset=utf-8"),
+        "/drift.js": StaticFile("drift.js", "text/javascript; charset=utf-8"),
         "/app.css": StaticFile("app.css", "text/css; charset=utf-8"),
         "/callback/received": StaticFile("callback-received.html", "text/html; charset=utf-8"),
         "/callback/refused": StaticFile("callback-refused.html", "text/html; charset=utf-8"),
@@ -139,7 +144,8 @@ def test_the_static_map_is_fixed() -> None:
 
 def test_the_table_is_m1s_with_k2s() -> None:
     # Steps 11 to 15 each added the rows they built (verifier V40); step 15's were the policy
-    # view and the ledger, the last of M.1's. M7's step 14a added K.2's, before the actions.
+    # view and the ledger, the last of M.1's. M7's step 14a added K.2's, before the actions, and
+    # M6's step 7 the attention list after them.
     assert ROUTES == TABLE
     assert [r.path for r in ROUTES if r.method == "POST" and r.cap == BODY_EMPTY] == [
         "/api/login/begin",

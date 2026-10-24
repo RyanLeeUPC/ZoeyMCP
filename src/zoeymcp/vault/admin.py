@@ -111,6 +111,7 @@ from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportSto
 from .reviewjobs import Job, Owner, ReviewRefused
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
 from .secretplan import SecretRefusal
+from .statusreport import GatewayStatus
 from .store import SecretStore
 
 MAX_BODY = 128 * 1024
@@ -424,7 +425,9 @@ class HealthReader:
     address guard's refusals come from the logins' token manager (J), and the egress role's last
     fetch from ``egress_fetched_ago`` (``VaultApp``'s; without it, no
     ``egress_allowlist_stale``). ``bridges`` is the tier and the bridges the vault was started
-    with (M7 design C.10, J; by default the hardened tier's: no link socket, no bridge)."""
+    with (M7 design C.10, J; by default the hardened tier's: no link socket, no bridge).
+    ``gateway_status`` is the gateway's latest status report (``VaultApp``'s, M6 design K.1);
+    without it, the report has no ``gateway`` section."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -436,6 +439,7 @@ class HealthReader:
     wall: Callable[[], float] = time.time
     egress_fetched_ago: Callable[[], float | None] | None = None
     bridges: health.Bridges = field(default_factory=health.Bridges)
+    gateway_status: Callable[[], GatewayStatus] | None = None
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -455,6 +459,7 @@ class HealthReader:
             if self.egress_fetched_ago is None
             else self.egress_fetched_ago(),
             bridges=self.bridges,
+            gateway_status=None if self.gateway_status is None else self.gateway_status(),
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report
@@ -522,6 +527,7 @@ class AdminApp:
         reviews: ReviewQueue | None = None,
         egress_fetched_ago: Callable[[], float | None] | None = None,
         bridges: health.Bridges | None = None,
+        gateway_status: Callable[[], GatewayStatus] | None = None,
         random: Callable[[int], bytes] = secrets.token_bytes,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
@@ -554,6 +560,9 @@ class AdminApp:
         ``bridges`` is the tier and the bridges the vault was started with, for health's route
         findings (M7 design C.10, J). Without it, health judges routes as the hardened tier's.
 
+        ``gateway_status`` is the gateway's latest status report, for health's ``gateway``
+        section (M6 design K.1, M.5). Without it, health has none.
+
         ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests)."""
         self._store = store
         self._random = random
@@ -582,6 +591,7 @@ class AdminApp:
             passkeys=passkeys,
             egress_fetched_ago=egress_fetched_ago,
             bridges=bridges or health.Bridges(),
+            gateway_status=gateway_status,
         )
         self.app = Starlette(
             routes=[

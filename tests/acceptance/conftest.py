@@ -279,6 +279,7 @@ class Deployment:
             self.setup,
             self.tokens,
             self.login,
+            gateway_status=self.app.gateway_status,
         )
         self.portal: PortalApp | None = None
         if self.portal_port is not None:
@@ -296,7 +297,12 @@ class Deployment:
                 login=self.login,
                 secrets=Secrets(store, self.tokens, lambda: self.app.policy),
                 health=HealthReader(
-                    store, lambda: self.app.policy, self.login, passkeys=passkeys, **copy
+                    store,
+                    lambda: self.app.policy,
+                    self.login,
+                    passkeys=passkeys,
+                    gateway_status=self.app.gateway_status,
+                    **copy,
                 ).report,
                 ledger=ledger,
             )

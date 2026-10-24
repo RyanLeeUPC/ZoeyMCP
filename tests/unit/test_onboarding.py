@@ -1551,6 +1551,24 @@ def test_a_rows_state() -> None:
     assert (bare.clients, bare.credential, bare.resource, bare.held) == ((), None, None, None)
 
 
+def test_a_row_carries_its_servers_declines() -> None:
+    """Each row holds its server's ``declined`` block, remote or toolkit, so the portal can tell
+    a report made before a decline (J.2's stale check)."""
+    policy = committed()
+    assert policy.gateway is not None
+    pin = "sha256:" + "ab" * 32
+    servers = policy.gateway.servers
+    policy = with_servers(
+        policy,
+        mail=servers["mail"].model_copy(update={"declined": {"draft": pin}}),
+        notes=servers["notes"].model_copy(update={"declined": {"export_all": pin}}),
+    )
+    found = {s.name: s for s in listed_servers(policy, set())}
+    assert (found["mail"].kind, dict(found["mail"].declined)) == ("toolkit", {"draft": pin})
+    assert (found["notes"].kind, dict(found["notes"].declined)) == ("remote", {"export_all": pin})
+    assert dict(found["broker-read"].declined) == {}
+
+
 def test_rows_without_an_oauth2_credential() -> None:
     """A remote server on a route with another kind of credential, or none, has no credential
     to connect; a server whose route is gone is still listed."""

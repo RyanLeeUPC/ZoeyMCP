@@ -1,6 +1,8 @@
 """The vault's own endpoints (M7 design G.1; O.2 ``test_internal.py``): one table, decided before
-any body byte is read, the review jobs poll's query (F.2, CR-8), and (step 17b) the egress
-role's allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21)."""
+any body byte is read, the review jobs poll's query (F.2, CR-8), (step 17b) the egress role's
+allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21), and (M6 step 7)
+the gateway's status path, one report at a time and at most one accepted per 5 s (K.1, T-12,
+FM-19)."""
 
 from __future__ import annotations
 
@@ -17,9 +19,11 @@ from zoeymcp.vault.internal import (
     LEDGER,
     REVIEW_JOBS,
     REVIEW_REPORT,
+    STATUS,
     VIEW,
     Endpoint,
     Refusal,
+    StatusGate,
     _egress_path,
     _path,
     allowlist_wait,
@@ -30,7 +34,7 @@ from zoeymcp.vault.internal import (
 )
 
 DIGEST = "sha256:" + "ab" * 32
-GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT)
+GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS)
 
 
 def path(text: str) -> NormalizedPath:
@@ -41,8 +45,8 @@ def path(text: str) -> NormalizedPath:
 
 
 def test_the_table_is_g1s() -> None:
-    """Path, methods, identity, body cap and waiters, as G.1 lists them, the egress row last
-    (step 17b)."""
+    """Path, methods, identity, body cap and waiters, as G.1 lists them, M6 K.1's status path
+    after the gateway's other rows, the egress row last (step 17b)."""
     rows = [
         (e.path.text, e.methods, e.identity, e.body_cap, e.waiters, e.name, e.label)
         for e in ENDPOINTS
@@ -77,6 +81,15 @@ def test_the_table_is_g1s() -> None:
             "the review report path",
         ),
         (
+            "/_zoeymcp/gateway/v1/report/status",
+            ("POST",),
+            "gateway",
+            256 * 1024,
+            None,
+            "gateway_status",
+            "the status path",
+        ),
+        (
             "/_zoeymcp/egress/v1/allowlists",
             ("GET",),
             "egress",
@@ -89,6 +102,7 @@ def test_the_table_is_g1s() -> None:
     assert LEDGER.body_cap == ledgerreport.MAX_BODY_BYTES
     assert REVIEW_JOBS.waiters == internal.REVIEW_WAITERS
     assert ALLOWLISTS.waiters == internal.ALLOWLIST_WAITERS
+    assert STATUS.body_cap == internal.STATUS_MAX_BYTES
     assert (*GATEWAY_ENDPOINTS, ALLOWLISTS) == ENDPOINTS
 
 
@@ -116,6 +130,8 @@ def test_the_constants() -> None:
     assert app.REPORT_PATH is LEDGER.path
     assert app.REVIEW_JOBS_PATH.text == "/_zoeymcp/gateway/v1/review/jobs"
     assert app.REVIEW_REPORT_PATH.text == "/_zoeymcp/gateway/v1/report/review"
+    assert app.STATUS_PATH is STATUS.path
+    assert (internal.STATUS_MAX_BYTES, internal.STATUS_MIN_INTERVAL) == (256 * 1024, 5.0)
     assert app.INTERNAL_SEGMENT == internal.SEGMENT == "_zoeymcp"
 
 
@@ -154,6 +170,12 @@ def test_anything_else_is_404(text: str) -> None:
     assert decide(path(text), "GET", "tcp", "egress") == Refusal(404, "no such vault endpoint")
 
 
+def test_the_status_path_is_its_own() -> None:
+    for text in ("/_zoeymcp/gateway/v1/report/Status", "/_zoeymcp/gateway/v1/status"):
+        assert find(path(text)) is None
+    assert find(path("/_zoeymcp/gateway/v1/report/status")) is STATUS
+
+
 def test_a_trailing_slash_is_another_path() -> None:
     slashed = NormalizedPath(REVIEW_JOBS.path.segments, trailing_slash=True)
     assert find(slashed) is None
@@ -176,6 +198,7 @@ def test_the_gateway_reaches_each_method(endpoint: Endpoint, listener: internal.
         (LEDGER, "the report path is for the gateway only"),
         (REVIEW_JOBS, "the review jobs path is for the gateway only"),
         (REVIEW_REPORT, "the review report path is for the gateway only"),
+        (STATUS, "the status path is for the gateway only"),
     ],
 )
 @pytest.mark.parametrize("listener", ["gateway", "tcp"])
@@ -195,6 +218,8 @@ def test_no_identity_is_the_bare_403_before_the_method(
         (REVIEW_JOBS, "POST", "the review jobs path takes GET only", "GET"),
         (REVIEW_REPORT, "GET", "the review report path takes POST only", "POST"),
         (REVIEW_REPORT, "post", "the review report path takes POST only", "POST"),
+        (STATUS, "GET", "the status path takes POST only", "POST"),
+        (STATUS, "PUT", "the status path takes POST only", "POST"),
     ],
 )
 def test_another_method_is_405_with_allow(
@@ -368,3 +393,50 @@ def test_wait_seconds(value: str, most: int, seconds: int | None) -> None:
 def test_a_wait_of_non_ascii_digits_is_refused() -> None:
     with pytest.raises(RequestRejected):
         wait_seconds("٣", 25)  # ARABIC-INDIC DIGIT THREE: a digit, not ASCII
+
+
+# --- the status path's admission (K.1, T-12, FM-19) ----------------------------------------------
+
+
+def test_the_first_status_report_is_read() -> None:
+    gate = StatusGate()
+    assert gate.reading is False
+    assert gate.accepted_at is None
+    assert gate.begin(100.0) is None
+    assert gate.reading is True
+
+
+def test_one_status_report_at_a_time() -> None:
+    gate = StatusGate()
+    assert gate.begin(100.0) is None
+    assert gate.begin(100.0) == Refusal(429, "a status report is being read")
+    gate.end(100.0, accepted=False)
+    assert gate.reading is False
+    assert gate.begin(100.0) is None
+
+
+def test_at_most_one_accepted_per_interval() -> None:
+    """T-12: enforced by the vault, whatever the gateway's debounce: a report 5 s after the last
+    accepted one is read, one a moment sooner is 429."""
+    gate = StatusGate()
+    assert gate.begin(100.0) is None
+    gate.end(100.0, accepted=True)
+    assert gate.accepted_at == 100.0
+    too_soon = Refusal(429, "a status report came too soon after the last")
+    assert gate.begin(104.99) == too_soon
+    assert gate.begin(100.0) == too_soon
+    assert gate.reading is False
+    assert gate.begin(105.0) is None
+    gate.end(105.5, accepted=True)
+    assert gate.accepted_at == 105.5
+    assert gate.begin(110.4) == too_soon
+
+
+def test_a_refused_report_doesnt_start_the_interval() -> None:
+    gate = StatusGate()
+    assert gate.begin(100.0) is None
+    gate.end(100.0, accepted=True)
+    assert gate.begin(106.0) is None
+    gate.end(106.5, accepted=False)  # refused: invalid, say
+    assert gate.accepted_at == 100.0
+    assert gate.begin(106.5) is None

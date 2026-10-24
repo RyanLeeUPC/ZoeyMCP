@@ -9,6 +9,7 @@ it is for, its body cap and how many of its long polls may wait.
 | ``/_zoeymcp/gateway/v1/report/ledger`` | GET, POST | gateway | 1 MiB | (one report at a time) |
 | ``/_zoeymcp/gateway/v1/review/jobs`` | GET | gateway | 0 | 1 |
 | ``/_zoeymcp/gateway/v1/report/review`` | POST | gateway | from the limits | (one at a time) |
+| ``/_zoeymcp/gateway/v1/report/status`` | POST | gateway | 256 KiB | (one at a time) |
 | ``/_zoeymcp/egress/v1/allowlists`` | GET | egress | 0 | 2 |
 
 Anything else under ``/_zoeymcp/`` is 404. :func:`decide` takes the identity the listener and the
@@ -17,6 +18,10 @@ one bare 403 for every identity failure (design.md 4.1 step 2), whose reason goe
 only. The egress role's key reaches the allowlists alone, the gateway's never does, and the
 allowlists are never served on the gateway's link socket (X21). The review report's cap follows
 the running limits (:func:`.reviewreport.report_max`, GR-30).
+
+The gateway's status report (M6 design K.1, D-29) is read one at a time, and at most one is
+accepted per :data:`STATUS_MIN_INTERVAL`, whatever the gateway's own debounce: a report sooner
+is a 429 (:class:`StatusGate`, T-12).
 """
 
 from __future__ import annotations
@@ -48,6 +53,10 @@ REVIEW_READ_DEADLINE: Final = 30.0
 ALLOWLIST_WAIT: Final = 25
 ALLOWLIST_WAITERS: Final = 2
 ALLOWLIST_MAX_STALE: Final = 300
+# The gateway's status report (M6 design K.1, N.4): its body cap, and the seconds between two
+# accepted reports.
+STATUS_MAX_BYTES: Final = 256 * 1024
+STATUS_MIN_INTERVAL: Final = 5.0
 
 _DIGEST: Final[TypeAdapter[str]] = TypeAdapter(Digest)
 # How a refusal names who an endpoint is for.
@@ -117,6 +126,15 @@ REVIEW_REPORT: Final = Endpoint(
     None,
     None,
 )
+STATUS: Final = Endpoint(
+    "gateway_status",
+    "the status path",
+    _path("report", "status"),
+    ("POST",),
+    "gateway",
+    STATUS_MAX_BYTES,
+    None,
+)
 ALLOWLISTS: Final = Endpoint(
     "egress_allowlists",
     "the allowlist path",
@@ -126,7 +144,7 @@ ALLOWLISTS: Final = Endpoint(
     0,
     ALLOWLIST_WAITERS,
 )
-ENDPOINTS: Final = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, ALLOWLISTS)
+ENDPOINTS: Final = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS, ALLOWLISTS)
 
 
 def find(path: NormalizedPath) -> Endpoint | None:
@@ -195,3 +213,29 @@ def allowlist_wait(params: list[tuple[str, str]]) -> int:
     if len(params) > 1 or params[0][0] != "wait":
         raise RequestRejected("the allowlist path takes one parameter, wait")
     return wait_seconds(params[0][1], ALLOWLIST_WAIT)
+
+
+class StatusGate:
+    """The status path's admission (K.1, T-12): one report read at a time, and at most one
+    accepted per :data:`STATUS_MIN_INTERVAL`. :meth:`begin` admits a report or answers the 429;
+    :meth:`end` lets the next one in, and starts the interval again when this one was accepted.
+    A refused report doesn't count toward the interval. ``now`` is monotonic seconds."""
+
+    def __init__(self) -> None:
+        self.reading = False
+        self.accepted_at: float | None = None
+
+    def begin(self, now: float) -> Refusal | None:
+        """None, with the report now being read; or the refusal, for one being read already or
+        an accepted one too recently."""
+        if self.reading:
+            return Refusal(429, "a status report is being read")
+        if self.accepted_at is not None and now - self.accepted_at < STATUS_MIN_INTERVAL:
+            return Refusal(429, "a status report came too soon after the last")
+        self.reading = True
+        return None
+
+    def end(self, now: float, *, accepted: bool) -> None:
+        self.reading = False
+        if accepted:
+            self.accepted_at = now

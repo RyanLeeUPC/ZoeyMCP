@@ -63,6 +63,7 @@ from .notify import Notifier
 from .policyclient import PolicyClient, Snapshot
 from .reporter import Reporter
 from .reviewpoll import ReviewPoller
+from .statuspush import Status, StatusPusher
 from .toolkits import Toolkits
 from .toolkitsource import ToolkitSource, ToolkitUnavailable
 from .toolsource import RemoteSource, ServedServer, ToolSource
@@ -250,8 +251,10 @@ MAX_ANSWER_BYTES = 64 * 1024  # an agent's answer to a prompt (M4 design D.3)
 class GatewayApp:
     """The gateway as one ASGI app. Its lifespan runs the pool, the notifier, the policy client,
     the ledger's reporter (with ``report_http``), the review poller (with ``review_http``, M7
-    design F.3) and, once the first view has arrived, the SDK's session manager. At shutdown it
-    closes every client it holds on the vault link (D-166)."""
+    design F.3), the status pusher (with ``status_http`` and ``status``, which reads the app's
+    status: ``server.pushed_status``; M6 design K.1) and, once the first view has arrived, the
+    SDK's session manager. At shutdown it closes every client it holds on the vault link
+    (D-166)."""
 
     def __init__(
         self,
@@ -264,6 +267,8 @@ class GatewayApp:
         toolkits: Toolkits | None = None,
         report_http: httpx2.AsyncClient | None = None,
         review_http: httpx2.AsyncClient | None = None,
+        status_http: httpx2.AsyncClient | None = None,
+        status: Status | None = None,
     ) -> None:
         self.pool = pool
         self.policy_http = policy_http
@@ -273,6 +278,10 @@ class GatewayApp:
         # The review jobs the vault queues (M7 design F.3), polled for in the lifespan.
         self.review_http = review_http
         self.review_poller: ReviewPoller | None = None
+        # The status report to the vault (M6 design K.1), pushed from the lifespan.
+        self.status_http = status_http
+        self.status = status
+        self.status_pusher: StatusPusher | None = None
         # One review at a time, the admin socket's or a review job's (GR-12).
         self.reviewing = anyio.Lock()
         self.toolkits = toolkits or Toolkits(pool.link, pool.keys, pool.marks)
@@ -465,6 +474,9 @@ class GatewayApp:
                 if self.review_http is not None:
                     self.review_poller = ReviewPoller(self, self.review_http)
                     group.start_soon(self._run_reviews, first_view, self.review_poller)
+                if self.status_http is not None and self.status is not None:
+                    self.status_pusher = StatusPusher(self, self.status_http, self.status)
+                    group.start_soon(self._run_status, first_view, self.status_pusher)
                 # Committed calls run in this group, out of reach of uvicorn's request cancels.
                 self.committed.attach(group)
                 group.start_soon(self.approvals.sweep_forever)
@@ -495,10 +507,15 @@ class GatewayApp:
         await first_view.wait()
         await poller.run()
 
+    async def _run_status(self, first_view: anyio.Event, pusher: StatusPusher) -> None:
+        # The report names the view the policy client holds: there is none before.
+        await first_view.wait()
+        await pusher.run()
+
     async def _close_vault_clients(self) -> None:
-        """The view's, the reporter's and the review poller's clients (D-166); the pool and
-        the toolkits close their own."""
-        for http in (self.policy_http, self.report_http, self.review_http):
+        """The view's, the reporter's, the review poller's and the status pusher's clients
+        (D-166); the pool and the toolkits close their own."""
+        for http in (self.policy_http, self.report_http, self.review_http, self.status_http):
             if http is not None:
                 await http.aclose()
 

@@ -35,13 +35,14 @@ from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import ProjectionError, project_and_pin, tool_problems
-from zoeymcp.gateway.server import AdminApp
+from zoeymcp.gateway.server import AdminApp, pushed_status
 from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import (
     KeySource,
     parse_link,
     report_client,
     review_client,
+    status_client,
     view_client,
 )
 from zoeymcp.vault.admin import AdminApp as VaultAdmin
@@ -174,6 +175,8 @@ class Deployed:
     log: io.StringIO = field(default_factory=io.StringIO)
     fake_url: str = ""
     options: dict[str, Any] = field(default_factory=dict)
+    # The vault app, for what it keeps in memory (the gateway's status report, M6 design K.1).
+    vault: VaultApp | None = None
 
     @property
     def server(self) -> ViewRemoteServer:
@@ -273,7 +276,14 @@ def deployment_with(
                 policy, store, KEYS, client=httpx.AsyncClient(), environ={}, reports=reports
             )
             setup = SetupCodes(tmp_path / "vault", KEYS.portal_key)
-            admin = VaultAdmin(store, KEYS, lambda: app.policy, setup, reviews=app)
+            admin = VaultAdmin(
+                store,
+                KEYS,
+                lambda: app.policy,
+                setup,
+                reviews=app,
+                gateway_status=app.gateway_status,
+            )
             served: ASGIApp = Reloadable(app, admin.app)
             with serve(wrap(served) if wrap is not None else served) as vault_url:
                 yield Deployed(
@@ -285,6 +295,7 @@ def deployment_with(
                     log,
                     fake_url=fake_url,
                     options=options,
+                    vault=app,
                 )
     finally:
         logs.set_stream(None)
@@ -377,11 +388,17 @@ class Running:
 
 @contextmanager
 def gateway(
-    deployed: Deployed, *, policy_wait: int = 1, report: bool = False, review: bool = False
+    deployed: Deployed,
+    *,
+    policy_wait: int = 1,
+    report: bool = False,
+    review: bool = False,
+    status_push: bool = False,
 ) -> Iterator[Running]:
     """The gateway app on a uvicorn thread, on the deployment's vault, once it is ready.
-    With ``report``, it reports its ledger to the vault, and with ``review`` it polls for the
-    vault's review jobs, as ``zoeymcp gateway`` does."""
+    With ``report``, it reports its ledger to the vault, with ``review`` it polls for the
+    vault's review jobs, and with ``status_push`` it pushes its status report (M6 design K.1),
+    as ``zoeymcp gateway`` does."""
     pool = UpstreamPool(
         parse_link(deployed.vault_url),
         KeySource(KEYS.gateway_key(1)),
@@ -398,6 +415,8 @@ def gateway(
         policy_wait=policy_wait,
         report_http=reporting,
         review_http=reviewing,
+        status_http=status_client(link, keys) if status_push else None,
+        status=pushed_status,
     )
     app.ledger, _ = Ledger.open_at(
         deployed.state, max_bytes=deployed.view.gateway.limits.ledger_max_bytes

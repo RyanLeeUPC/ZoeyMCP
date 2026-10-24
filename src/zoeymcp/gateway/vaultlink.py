@@ -553,6 +553,64 @@ def review_client(
     )
 
 
+STATUS_PATH = "/_zoeymcp/gateway/v1/report/status"
+STATUS_MAX_ANSWER_BYTES = 4096  # an acknowledgment, or a refusal (M6 design K.1)
+
+
+class _StatusOnly(httpx2.AsyncBaseTransport):
+    """The status pusher's transport (M6 design K.1): a POST of exactly the status path, with
+    no query, on the link's scheme, host and port, and nothing else. An answer is cut off past
+    :data:`STATUS_MAX_ANSWER_BYTES`."""
+
+    def __init__(self, inner: httpx2.AsyncBaseTransport, link: Link) -> None:
+        self._inner = inner
+        self._link = link
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        url = request.url
+        if (
+            request.method != "POST"
+            or (url.scheme, url.host, url.port)
+            != (self._link.scheme, self._link.host, self._link.port)
+            or url.raw_path != STATUS_PATH.encode()
+        ):
+            raise UpstreamBlocked("the status pusher only reaches the status path")
+        response = await self._inner.handle_async_request(request)
+        if is_redirect(response.status_code):
+            await response.aclose()
+            raise UpstreamRedirect(str(response.status_code))
+        return httpx2.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=_Capped(response.stream, STATUS_MAX_ANSWER_BYTES),  # type: ignore[arg-type]
+            extensions=response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+# The vault reads a status report within 10 s; its answer is small.
+STATUS_TIMEOUT = httpx2.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+
+
+def status_client(
+    link: Link, keys: KeySource | None, inner: httpx2.AsyncBaseTransport | None = None
+) -> httpx2.AsyncClient:
+    """The HTTP client that pushes the gateway's status to the vault (M6 design K.1), built like
+    :func:`report_client`."""
+    return httpx2.AsyncClient(
+        transport=_StatusOnly(inner if inner is not None else _inner_transport(link), link),
+        base_url=link.base_url,
+        follow_redirects=False,
+        max_redirects=0,
+        trust_env=False,
+        timeout=STATUS_TIMEOUT,
+        event_hooks=_hooks(link, keys),
+    )
+
+
 def environ_has_no_secrets(environ: Mapping[str, str]) -> str | None:
     """G1: the variables that must never be in the gateway's environment, by name, or None."""
     for name in VAULT_ONLY_ENV:

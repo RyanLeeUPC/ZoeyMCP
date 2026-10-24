@@ -38,8 +38,10 @@ MAX_ASSETS = 128 * 1024
 # webauthn.js together. Step 15's Ledger and Policy pages took them past it (998 before, 1,041
 # after) although every line they show is made by the server and the existing pages were folded
 # onto one helper, so the cap moved by 50 lines rather than squeeze the script further. M7 keeps
-# it, and gives review.js, the MCP servers section, its own.
-LINE_CAPS = {("app.js", "webauthn.js"): 1050, ("review.js",): 700}
+# it, and gives review.js, the MCP servers section, its own. M6 (M.4, Q14): the owner raised
+# app.js and webauthn.js to 1,060 for the few lines Home and health need (1,048 before step 7,
+# 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450.
+LINE_CAPS = {("app.js", "webauthn.js"): 1060, ("review.js",): 700, ("drift.js",): 450}
 
 LT, GT, QUOTE = chr(0x3C), chr(0x3E), chr(0x22)
 FORBIDDEN_TAGS = frozenset({"style", "form", "iframe", "base", "object", "embed", "frame"})
@@ -173,7 +175,13 @@ def test_index_html() -> None:
     page = parsed(read("index.html"))
     assert page.problems == []
     # Every asset it loads is in the static map, and it loads every script and the stylesheet.
-    assert sorted(page.assets) == ["/app.css", "/app.js", "/review.js", "/webauthn.js"]
+    assert sorted(page.assets) == [
+        "/app.css",
+        "/app.js",
+        "/drift.js",
+        "/review.js",
+        "/webauthn.js",
+    ]
     assert set(page.assets) <= set(STATIC)
 
 
@@ -200,7 +208,7 @@ def test_the_refused_page_says_what_the_catalogue_says() -> None:
     assert text not in read("callback-received.html")
 
 
-@pytest.mark.parametrize("name", ["app.js", "review.js"])
+@pytest.mark.parametrize("name", ["app.js", "review.js", "drift.js"])
 def test_every_element_the_script_names_exists(name: str) -> None:
     ids = parsed(read("index.html")).ids
     script = read(name)
@@ -275,10 +283,10 @@ def test_the_scripts_are_small_strict_and_hand_written() -> None:
 
 def test_the_scripts_are_derived_from_the_static_map() -> None:
     """M7 K.4: SCRIPTS is every text/javascript file the map serves, and index.html loads each
-    of them, review.js after the app.js whose helpers it uses."""
-    assert SCRIPTS == ("app.js", "webauthn.js", "review.js")
+    of them, review.js and drift.js (M6 M.4) after the app.js whose helpers they use."""
+    assert SCRIPTS == ("app.js", "webauthn.js", "review.js", "drift.js")
     order = re.findall(r'<script src="/([a-z]+\.js)" defer></script>', read("index.html"))
-    assert order == ["webauthn.js", "app.js", "review.js"]
+    assert order == ["webauthn.js", "app.js", "review.js", "drift.js"]
 
 
 def test_every_button_runs_its_handler_once_at_a_time() -> None:
@@ -520,6 +528,14 @@ def test_review_js_clicks_go_through_app_js_guard() -> None:
     # The one call app.js makes into review.js: a server row's Connect, once it completes.
     assert re.findall(r"window\.zoeyReview\.(\w+)\(", app) == ["connected"]
     assert "window.zoeyReview = Object.freeze({ connected: connected });" in code
+    # And into drift.js (M6 M.4, Q14): Home's hook in enter(), after the checklist, and a gateway
+    # finding's Review.
+    assert re.findall(r"window\.zoeyDrift\.(\w+)\(", app) == ["home", "review"]
+    assert "if (window.zoeyDrift) await window.zoeyDrift.home();" in app
+    enter = app[app.index("async function enter() {") :]
+    enter = enter[: enter.index("\n  }\n")]
+    assert enter.index('renderFindings($("checklist")') < enter.index("zoeyDrift.home()")
+    assert enter.index("zoeyDrift.home()") < enter.index('show("home");')
 
 
 def test_a_client_secret_is_write_only_in_the_page() -> None:
@@ -626,3 +642,68 @@ def test_the_review_screen_reads_what_the_vault_sends() -> None:
     assert len(warned) == view["counts"]["with_findings"]
     errors = [tool for tool in tools if any(f["level"] == "error" for f in tool["findings"])]
     assert len(errors) == view["counts"]["with_errors"] == 1
+
+
+# --- Home's attention list (M6 M.4, M.7) ---------------------------------------------------------
+
+
+def test_drift_js_clicks_go_through_app_js_guard() -> None:
+    """drift.js draws its buttons with app.js's button(), shared through window.zoeyPortal, and
+    listens for nothing itself; it publishes window.zoeyDrift and nothing else."""
+    code = code_of(read("drift.js"))
+    assert "addEventListener(" not in code
+    assert "function button(" not in code
+    assert "function guard(" not in code
+    taken = re.search(r"const \{([^}]*)\} = window\.zoeyPortal;", code)
+    assert taken
+    assert {word.strip() for word in taken.group(1).split(",")} == {"api", "button"}
+    assert re.findall(r"window\.(zoey\w+) =", code) == ["zoeyDrift"]
+    assert "window.zoeyDrift = Object.freeze({ home: home, review: review });" in code
+
+
+def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
+    """Q14: app.js's checklist words health's gateway and policy sections, else a finding would
+    read "warning, undefined: ..."; a gateway finding's review action draws a button, and so does
+    an attention item's in drift.js."""
+    app = code_of(read("app.js"))
+    section = app[app.index("const SECTION = {") :]
+    section = section[: section.index("};")]
+    assert 'gateway: "The gateway reports"' in section
+    assert 'policy: "The policy"' in section
+    texts = app[app.index("const ACTION_TEXT = {") :]
+    assert 'review: "Review"' in texts[: texts.index("};")]
+    runs = app[app.index("const runs = {") :]
+    assert "review: () => window.zoeyDrift.review(action.server)," in runs[: runs.index("};")]
+    drift = code_of(read("drift.js"))
+    assert 'const ACTION_TEXT = { review: "Review" };' in drift
+    # Each item is shown through textContent, from the vault's text_shown alone, and every field
+    # the script reads of the answer and its items is one the vault sends.
+    assert 'entry.textContent = item.text_shown + ". ";' in drift
+    assert set(re.findall(r"\banswer\.([a-z_]+)", drift)) == set(portal_app.attention_items({}))
+    report = {"gateway": {"reported_ago": 1, "servers": [gateway_row()]}}
+    [item] = portal_app.attention_items(report)["items"]
+    assert set(re.findall(r"\bitem\.([a-z_]+)", drift)) == {"text_shown", "action"}
+    assert re.findall(r"\bitem\.action\.([a-z_]+)", drift) == ["kind"]
+    assert item["action"] == {"kind": "review", "server": "notes"}
+    assert set(item) == {"kind", "server_shown", "count", "text_shown", "action"}
+
+
+def gateway_row() -> dict[str, object]:
+    """A server row of health's gateway section with one tool nobody reviewed."""
+    return {
+        "name": "notes",
+        "kind": "remote",
+        "bridge": False,
+        "state": ["ready"],
+        "era": "modern",
+        "attention": {
+            "drifted": [],
+            "marked": [],
+            "new": ["purge"],
+            "changed_declined": [],
+            "missing": [],
+        },
+        "blocked": False,
+        "invalid": [],
+        "unnamed": 0,
+    }

@@ -6,7 +6,8 @@ It refuses to start with a master key or ``ZOEYMCP_CONFIG`` in its environment (
 and re-reads the key file; ``SIGTERM`` (or ``TERM``, or the pipe's end) stops, giving calls in
 flight 10 seconds. The admin socket answers ``GET /status``, ``POST /review/<server>`` and
 ``POST /review/<server>/clear`` (:mod:`.review`); the same reviews run for the vault's review
-jobs, one at a time with the socket's (:mod:`.reviewpoll`, M7 design F.3).
+jobs, one at a time with the socket's (:mod:`.reviewpoll`, M7 design F.3). A summary of the
+status is pushed to the vault (:mod:`.statuspush`, M6 design K.1).
 
 The SDK's own loggers are silenced: they log session ids and request headers (G20).
 """
@@ -33,7 +34,7 @@ import uvicorn
 from starlette.types import Receive, Scope, Send
 
 from ..common import canonical, control
-from ..common.policy.attention import attention, combined
+from ..common.policy.attention import Attention, attention, combined
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewToolkitServer
 from . import logs, review
@@ -52,6 +53,7 @@ from .vaultlink import (
     report_client,
     review_client,
     running_as_root,
+    status_client,
     view_client,
 )
 
@@ -147,6 +149,8 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
         toolkits=toolkits,
         report_http=report_client(link, keys),
         review_http=review_client(link, keys),
+        status_http=status_client(link, keys),
+        status=pushed_status,
     )
     try:
         # The view's limit applies once the first view arrives.
@@ -156,16 +160,20 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
     return Gateway(app, link, keys)
 
 
-def status(app: GatewayApp) -> dict[str, Any]:
+def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
     """G.5's status: per server, never definitions or token hashes. The reports count
     ``unreviewed`` and ``declined`` tools apart, and ``attention`` is the attention decision for
-    the server's latest listings (M6 design J.5), ``None`` before any listing."""
+    the server's latest listings (M6 design J.5), ``None`` before any listing; ``blocked`` is
+    whether ``on_drift: fail`` stopped any of its connections (``pins.evaluate``). ``offered`` is
+    what a remote upstream advertises beyond tools, ``None`` before a connection has one
+    (fold-in 3.8). With ``pins``, each server's ``unreviewed_pins`` is the pin each of its
+    unreviewed tools is listed at, for the status report (:func:`pushed_status`)."""
     snapshot = app.policy.snapshot
     servers: dict[str, Any] = {}
     if snapshot is not None:
         for name, server in snapshot.view.gateway.servers.items():
             if isinstance(server, ViewToolkitServer):
-                servers[name] = _toolkit_status(app, name, server)
+                servers[name] = _toolkit_status(app, name, server, pins=pins)
                 continue
             connections = [c for c in app.pool.connections() if c.server == name]
             phases = sorted({c.state.phase.value for c in connections})
@@ -174,13 +182,23 @@ def status(app: GatewayApp) -> dict[str, Any]:
             verified = [c.state.verified_at for c in connections if c.state.verified_at is not None]
             marks = app.pool.marks.for_server(name)
             found = []
+            listed: dict[str, str] = {}
+            offers: list[dict[str, bool]] = []
+            blocked = False
             for connection in connections:
                 evaluation = connection.state.evaluation
                 if evaluation is not None:
+                    blocked = blocked or evaluation.blocked
                     exposed |= set(evaluation.exposed)
                     for report in evaluation.reports:
                         reports.setdefault(report.kind, set()).add(report.tool)
                     found.append(attention(evaluation.listed, server, marks))
+                    for tool, pin in evaluation.listed.items():
+                        if pin is not None:
+                            listed.setdefault(tool, pin)
+                if connection.client is not None:
+                    offers.append(review.offered(connection.client.server_capabilities))
+            decided = combined(found) if found else None
             servers[name] = {
                 "kind": "remote",
                 "state": phases or ["idle"],
@@ -190,9 +208,17 @@ def status(app: GatewayApp) -> dict[str, Any]:
                 "exposed": len(exposed),
                 "marked": sorted(tool for tool, _ in app.pool.marks.for_server(name)),
                 "reports": {kind: sorted(tools) for kind, tools in sorted(reports.items())},
-                "attention": combined(found).as_dict() if found else None,
+                "attention": decided.as_dict() if decided is not None else None,
+                "blocked": blocked,
+                "offered": (
+                    {kind: any(offer[kind] for offer in offers) for kind in offers[0]}
+                    if offers
+                    else None
+                ),
                 "listed_s_ago": round(app.clock() - max(verified), 1) if verified else None,
             }
+            if pins:
+                servers[name]["unreviewed_pins"] = _pins_of(decided, listed)
     return {
         "version": VERSION,
         "view": snapshot.view.digest if snapshot is not None else None,
@@ -201,7 +227,9 @@ def status(app: GatewayApp) -> dict[str, Any]:
     }
 
 
-def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> dict[str, Any]:
+def _toolkit_status(
+    app: GatewayApp, name: str, server: ViewToolkitServer, *, pins: bool
+) -> dict[str, Any]:
     found = app.toolkits.get(name)
     if not isinstance(found, Loaded):
         return {
@@ -216,7 +244,7 @@ def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> di
     decided = attention(
         found.evaluation.listed, review.toolkit_reviewed(server, found.evaluation), marks
     )
-    return {
+    entry: dict[str, Any] = {
         "kind": "toolkit",
         "state": "loaded",
         "module": found.module,
@@ -228,7 +256,24 @@ def _toolkit_status(app: GatewayApp, name: str, server: ViewToolkitServer) -> di
         "marked": sorted(tool for tool, _ in marks),
         "reports": {kind: sorted(tools) for kind, tools in sorted(reports.items())},
         "attention": decided.as_dict(),
+        "blocked": found.evaluation.blocked,
     }
+    if pins:
+        entry["unreviewed_pins"] = _pins_of(decided, found.evaluation.listed)
+    return entry
+
+
+def pushed_status(app: GatewayApp) -> dict[str, Any]:
+    """The status the gateway pushes to the vault is drawn from (M6 design K.1): :func:`status`
+    with each unreviewed tool's pin."""
+    return status(app, pins=True)
+
+
+def _pins_of(decided: Attention | None, listed: Mapping[str, str | None]) -> dict[str, str]:
+    """The pin each tool nobody reviewed is listed at, by name."""
+    if decided is None:
+        return {}
+    return {tool: pin for tool in decided.unreviewed() if (pin := listed.get(tool)) is not None}
 
 
 class AdminApp:

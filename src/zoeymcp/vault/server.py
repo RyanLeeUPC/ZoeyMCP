@@ -858,6 +858,7 @@ def build(
         passkeys=passkeys,
         egress_fetched_ago=app.allowlist_fetched_ago,
         bridges=tier,
+        gateway_status=app.gateway_status,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
     # (M5 design J.5); the policy view says where the policy came from (L).
@@ -898,6 +899,7 @@ def build(
             reviews=app,
             egress_fetched_ago=app.allowlist_fetched_ago,
             bridges=tier,
+            gateway_status=app.gateway_status,
         )
     return Vault(
         app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal

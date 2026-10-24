@@ -6,7 +6,9 @@ onboarding's secret waiting for its credential; (step 11) a registered client's 
 past its expiry, on the wall clock; (step 16) the address guard's refusals, ``address_refused``;
 (step 17b) an egress role that stopped fetching its lists, ``egress_allowlist_stale`` (COV-7);
 (step 18d) the bridges' routes: ``program_unconfined``, ``loopback_bridge_route``,
-``bridge_socket_unknown`` and ``program_secret_unflagged`` (C.10, Q46).
+``bridge_socket_unknown`` and ``program_secret_unflagged`` (C.10, Q46). M6 (design M.5, step 7):
+the ``gateway`` section from the gateway's status report: ``tools_unreviewed``, ``drift_marked``,
+``server_blocked``, ``server_listing_invalid`` and ``gateway_status_stale``.
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -46,6 +48,8 @@ from zoeymcp.vault.health import (
     sends,
 )
 from zoeymcp.vault.internal import ALLOWLIST_MAX_STALE
+from zoeymcp.vault.statusreport import GatewayStatus, ServerStatus
+from zoeymcp.vault.statusreport import Report as StatusReport
 from zoeymcp.vault.store import EntryMeta, origin_binding, smtp_binding
 
 TOKEN_URL = "https://accounts.example/token"
@@ -2227,3 +2231,291 @@ def test_the_summary_counts_the_ledger_copy() -> None:
     assert found["summary"] == {"error": 2, "warning": 0, "info": 0}
     assert list(found)[-1] == "ledger_copy"
     assert "ledger_copy" not in report(make_policy({}))
+
+
+# --- the gateway's status (M6 design K.1, M.5; Y21, Y29, T-7) ------------------------------------
+
+PIN_A, PIN_B = ("sha256:" + digit * 64 for digit in "ab")
+VIEW = "sha256:" + "cd" * 32
+REVIEW_NOTES = {"kind": "review", "server": "notes"}
+
+
+def gateway_policy(on_drift: str = "hide", fetch_on_drift: str = "hide") -> Policy:
+    """Two gateway servers: notes, a remote server over https, and fetch, a bridge."""
+    policy = bridge_policy(
+        {"notes": "https://mcp.notes.example", "fetch": "unix:/run/zoeymcp-bridge-fetch/mcp.sock"}
+    )
+    raw = policy.model_dump(mode="json", exclude_defaults=True, by_alias=True)
+    raw["gateway"]["servers"]["notes"]["on_drift"] = on_drift
+    raw["gateway"]["servers"]["fetch"]["on_drift"] = fetch_on_drift
+    return Policy.model_validate(raw)
+
+
+def server_status(**fields: Any) -> ServerStatus:
+    values: dict[str, Any] = {
+        "kind": "remote",
+        "state": ("ready",),
+        "era": "modern",
+        "included": 2,
+        "exposed": 2,
+    }
+    return ServerStatus(**{**values, **fields})
+
+
+def gateway(
+    servers: Mapping[str, ServerStatus] | None = None,
+    age: float = 10.0,
+    policy: Policy | None = None,
+    **report_fields: Any,
+) -> dict[str, Any]:
+    status = GatewayStatus(
+        None
+        if servers is None
+        else StatusReport(view=VIEW, started=1, servers=dict(servers), **report_fields),
+        age,
+    )
+    section: dict[str, Any] = report(policy or gateway_policy(), gateway_status=status)["gateway"]
+    return section
+
+
+def test_no_gateway_section_without_a_status_or_a_gateway() -> None:
+    assert "gateway" not in report(gateway_policy())
+    status = GatewayStatus(None, 0.0)
+    assert "gateway" not in report(make_policy({}), gateway_status=status)
+    found = report(gateway_policy(), gateway_status=status)
+    assert list(found)[-1] == "gateway"
+
+
+def test_a_quiet_gateway() -> None:
+    section = gateway({"notes": server_status(), "fetch": server_status()})
+    assert (section["level"], section["findings"]) == ("ok", [])
+    assert (section["reported_ago"], section["view"]) == (10, VIEW)
+    assert [row["name"] for row in section["servers"]] == ["fetch", "notes"]
+    notes = section["servers"][1]
+    assert notes == {
+        "name": "notes",
+        "kind": "remote",
+        "bridge": False,
+        "state": ["ready"],
+        "era": "modern",
+        "attention": {
+            "drifted": [],
+            "marked": [],
+            "new": [],
+            "changed_declined": [],
+            "missing": [],
+        },
+        "blocked": False,
+        "invalid": [],
+        "unnamed": 0,
+    }
+    assert section["servers"][0]["bridge"] is True
+
+
+def test_tools_nobody_reviewed() -> None:
+    """J.5: the new tools and the declined ones that changed, through the one decision; counted,
+    not named, since the upstream chose the names (M.5)."""
+    entry = server_status(
+        unreviewed=(("purge", PIN_A), ("echo", PIN_B), ("share", PIN_A)),
+        declined_changed=("echo",),
+    )
+    section = gateway({"notes": entry})
+    assert section["findings"] == [
+        finding(
+            "tools_unreviewed",
+            "warning",
+            "notes lists 3 tools nobody reviewed",
+            REVIEW_NOTES,
+        )
+    ]
+    assert section["servers"][0]["attention"]["new"] == ["purge", "share"]
+    assert section["servers"][0]["attention"]["changed_declined"] == ["echo"]
+    one_tool = gateway({"notes": server_status(unreviewed=(("purge", PIN_A),))})
+    assert one_tool["findings"][0]["text"] == "notes lists 1 tool nobody reviewed"
+
+
+def test_drifted_marked_and_missing_tools_are_one_finding() -> None:
+    entry = server_status(drift=("a",), marked=("b", "c"), missing=("d",))
+    [found] = gateway({"notes": entry})["findings"]
+    assert found == finding(
+        "drift_marked",
+        "warning",
+        "notes: included tools 1 changed since the review (a); 2 hidden by a drift mark (b, c); "
+        "1 no longer listed (d)",
+        REVIEW_NOTES,
+    )
+    for fields, text in (
+        ({"drift": ("a",)}, "notes: included tools 1 changed since the review (a)"),
+        ({"marked": ("b",)}, "notes: included tools 1 hidden by a drift mark (b)"),
+        ({"missing": ("d",)}, "notes: included tools 1 no longer listed (d)"),
+    ):
+        [only] = gateway({"notes": server_status(**fields)})["findings"]
+        assert only["text"] == text
+
+
+def test_a_long_list_names_ten() -> None:
+    names = tuple(f"t{n:02}" for n in range(12))
+    [found] = gateway({"notes": server_status(drift=names)})["findings"]
+    assert found["text"] == (
+        "notes: included tools 12 changed since the review ("
+        + ", ".join(names[:10])
+        + " and 2 more)"
+    )
+    [ten] = gateway({"notes": server_status(drift=names[:10])})["findings"]
+    assert ten["text"].endswith("(" + ", ".join(names[:10]) + ")")
+
+
+@pytest.mark.parametrize(
+    ("on_drift", "fields", "blocked"),
+    [
+        ("fail", {"drift": ("a",), "blocked": True}, True),
+        # A held mark on a tool no longer listed, or an included tool listed invalid.
+        ("fail", {"missing": ("a",), "blocked": True}, True),
+        ("fail", {"blocked": True}, True),
+        # The gateway's word, not the vault's reading of the lists or of the policy.
+        ("fail", {"drift": ("a",)}, False),
+        ("fail", {"marked": ("a",)}, False),
+        ("hide", {"blocked": True}, True),
+    ],
+)
+def test_a_blocked_server(on_drift: str, fields: dict[str, Any], blocked: bool) -> None:
+    section = gateway({"notes": server_status(**fields)}, policy=gateway_policy(on_drift))
+    assert section["servers"][0]["blocked"] is blocked
+    found = [f for f in section["findings"] if f["code"] == "server_blocked"]
+    expected = finding(
+        "server_blocked",
+        "warning",
+        "notes is blocked (on_drift: fail): none of its tools are served",
+        REVIEW_NOTES,
+    )
+    assert found == ([expected] if blocked else [])
+
+
+def test_a_listing_it_cant_name() -> None:
+    """T-7: counted, not named; an included tool listed invalid is drifted, named once there."""
+    entry = server_status(drift=("list_notes",), invalid=("list_notes", "odd"), invalid_unnamed=2)
+    section = gateway({"notes": entry})
+    assert codes(section) == ["drift_marked", "server_listing_invalid"]
+    assert section["findings"][1] == finding(
+        "server_listing_invalid",
+        "warning",
+        "notes lists 1 tool the gateway can't serve; others' names aren't valid, so they are "
+        "counted, not named",
+        REVIEW_NOTES,
+    )
+    assert section["servers"][0]["invalid"] == ["odd"]
+    assert section["servers"][0]["unnamed"] == 2
+    only_drifted = gateway({"notes": server_status(drift=("a",), invalid=("a",))})
+    assert codes(only_drifted) == ["drift_marked"]
+    unnamed = "notes lists tools whose names aren't valid; they are counted, not named"
+    for fields, text in (
+        ({"invalid": ("odd", "other")}, "notes lists 2 tools the gateway can't serve"),
+        ({"duplicate_unnamed": 1}, unnamed),
+        ({"invalid_unnamed": 1}, unnamed),
+        ({"dropped": 3}, unnamed),
+    ):
+        [found] = gateway({"notes": server_status(**fields)})["findings"]
+        assert (found["code"], found["text"]) == ("server_listing_invalid", text)
+
+
+def test_a_server_whose_status_was_refused() -> None:
+    section = gateway({"fetch": server_status()}, refused_servers=("notes",))
+    assert section["findings"] == [
+        finding(
+            "server_listing_invalid",
+            "warning",
+            "notes: the gateway's status for it isn't one the vault reads",
+            REVIEW_NOTES,
+        )
+    ]
+    assert [row["name"] for row in section["servers"]] == ["fetch"]
+    # A refused server ends only its own row: the next one still reads.
+    first = gateway({"notes": server_status(drift=("a",))}, refused_servers=("fetch",))
+    assert codes(first) == ["server_listing_invalid", "drift_marked"]
+    assert [row["name"] for row in first["servers"]] == ["notes"]
+    unnamed = gateway({}, unnamed_servers=2)
+    assert unnamed["findings"] == [
+        finding(
+            "server_listing_invalid",
+            "warning",
+            "the gateway's status names 2 server(s) by names that aren't policy names; they are "
+            "left out",
+            {"kind": "check_gateway"},
+        )
+    ]
+
+
+def test_a_server_the_policy_no_longer_has_is_left_out() -> None:
+    section = gateway({"gone": server_status(drift=("a",)), "notes": server_status()})
+    assert (section["findings"], [row["name"] for row in section["servers"]]) == ([], ["notes"])
+
+
+@pytest.mark.parametrize(
+    ("age", "minutes"), [(180.0, None), (180.5, 3), (3600.0, 60), (1e9, 16666666)]
+)
+def test_a_gateway_that_stopped_reporting(age: float, minutes: int | None) -> None:
+    """Info only: a stale status isn't a decision (Y21); none since the vault started counts
+    from its start."""
+    for servers in (None, {"notes": server_status()}):
+        section = gateway(servers, age=age)
+        expected = (
+            []
+            if minutes is None
+            else [
+                finding(
+                    "gateway_status_stale",
+                    "info",
+                    f"the gateway hasn't reported its status for {minutes} minutes",
+                    {"kind": "check_gateway"},
+                )
+            ]
+        )
+        assert section["findings"] == expected
+    assert gateway(None, age=30.0)["reported_ago"] is None
+    assert health.STATUS_STALE == 180
+
+
+def test_a_toolkits_row_reads_the_gateways_blocked() -> None:
+    """A toolkit is blocked as the gateway says (a ``pinning: off`` one never is there)."""
+    raw = gateway_policy().model_dump(mode="json", exclude_defaults=True, by_alias=True)
+    raw["gateway"]["servers"]["kit"] = {
+        "kind": "toolkit",
+        "module": "examples.kit",
+        "pinning": "off",
+        "on_drift": "fail",
+    }
+    raw["gateway"]["servers"]["pinned"] = {
+        "kind": "toolkit",
+        "module": "examples.kit",
+        "on_drift": "fail",
+    }
+    policy = Policy.model_validate(raw)
+    toolkit = {"kind": "toolkit", "state": ("loaded",), "era": None, "marked": ("a",)}
+    servers = {"kit": server_status(**toolkit), "pinned": server_status(**toolkit, blocked=True)}
+    section = gateway(servers, policy=policy)
+    assert [(row["name"], row["blocked"], row["bridge"]) for row in section["servers"]] == [
+        ("kit", False, False),
+        ("pinned", True, False),
+    ]
+
+
+def test_the_summary_counts_the_gateway() -> None:
+    status = GatewayStatus(
+        StatusReport(
+            view=VIEW,
+            started=1,
+            servers={
+                "notes": server_status(unreviewed=(("a", PIN_A),), drift=("b",), blocked=True)
+            },
+        ),
+        200.0,
+    )
+    policy = gateway_policy("fail")
+    without = report(policy)["summary"]
+    found = report(policy, gateway_status=status)
+    assert found["summary"] == {
+        "error": without["error"],
+        "warning": without["warning"] + 3,
+        "info": without["info"] + 1,
+    }
+    assert found["gateway"]["level"] == "warning"

@@ -8,7 +8,8 @@ script names. Every other path outside ``/api/`` is 404 (C.2 row 3).
 The API table grew with the build: each of steps 11 to 15 added the rows it built, so a walk of
 the table or a drift check against the page never met a route that wasn't built (verifier V40);
 from step 15 it is M.1's whole table, and a test checks that it equals M.1. M7 publishes its
-own rows, the MCP servers section's (M7 design K.2), which the same test pins. A path parameter is
+own rows, the MCP servers section's (M7 design K.2), which the same test pins, and M6 its own
+(M6 design M.2), each in the step that builds it. A path parameter is
 checked against its pattern before a route matches, so a handler never sees a name the policy
 couldn't hold. A query string isn't part of a route: the one route that reads one, the ledger,
 checks it itself.
@@ -50,6 +51,8 @@ STATIC: Final[Mapping[str, StaticFile]] = MappingProxyType(
         "/webauthn.js": StaticFile("webauthn.js", JAVASCRIPT),
         # M7 step 14b: the MCP servers section's script (M7 K.4), with a line cap of its own.
         "/review.js": StaticFile("review.js", JAVASCRIPT),
+        # M6 step 7: Home's attention list, then the drift review (M6 M.4), with its own cap.
+        "/drift.js": StaticFile("drift.js", JAVASCRIPT),
         "/app.css": StaticFile("app.css", CSS),
         # Step 14b: where the callback sends the tab (C.7). No script, no text from the query.
         "/callback/received": StaticFile("callback-received.html", HTML),
@@ -202,6 +205,8 @@ REVIEW_DIFF: Final = Route(
     frozenset({"include", "allow", "approve"}),
     frozenset({"indent"}),
 )
+# M6 step 7: Home's attention list (M6 M.2, M.7), from health's gateway section.
+ATTENTION: Final = Route("GET", "/api/attention", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -230,6 +235,7 @@ ROUTES: Final[tuple[Route, ...]] = (
     REVIEW,
     REVIEW_JOB,
     REVIEW_DIFF,
+    ATTENTION,
     ACTIONS,
     CONFIRM,
     CANCEL,

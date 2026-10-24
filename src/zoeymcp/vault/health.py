@@ -16,7 +16,8 @@ command. The kinds are :func:`~.oauth.login.hint_action`'s (``connect``, ``reset
 ``review_passkeys`` and ``reset_passkeys``, and for the reported ledger ``check_gateway`` and
 ``read_ledger``; from M7, ``onboard_again`` with the ``command`` (``login --mcp URL
 --reregister``, OPS-3), ``widen_scope`` with the union ``scope`` and the ``fragment`` that
-sets it (D.5's step-up, SPEC-11), which ``connect`` follows, and ``check_egress_role``.
+sets it (D.5's step-up, SPEC-11), which ``connect`` follows, and ``check_egress_role``; from
+M6, ``review`` with the ``server`` (M6 design M.5).
 
 Stored bindings are judged by effect, not by equality (verifier V9), because the socket may store
 an explicit ``origins`` binding for any name: ``binding_changed`` means a use the policy makes now
@@ -60,6 +61,21 @@ receive the route's token); and a route to the socket of a bridge whose ARGS hol
 ``--secret-env`` without ``program.holds_secret`` is ``program_secret_unflagged`` (warning). In
 either tier, a ``unix:`` upstream naming a bridge the launcher didn't start is
 ``bridge_socket_unknown`` (error: the route answers 502).
+
+The ``gateway`` section (M6 design M.5, K.1) reads the gateway's latest status report
+(:class:`~.statusreport.GatewayStatus`), labelled as the gateway's: nothing in it drives a
+decision (Y21). Per server the running policy names, the gateway's attention decision (J.5,
+read back with :meth:`~.statusreport.ServerStatus.attention`, never decided here) gives
+``tools_unreviewed`` for the tools nobody reviewed and ``drift_marked`` for the included tools
+that drifted, are hidden by a drift mark or are no longer listed, each a warning whose action is
+``review`` with the ``server``, so ``zoeymcp review``'s exit code, these findings and Home's list
+agree (Y29); a tool nobody reviewed is counted, not named, since its upstream chose the name.
+``server_blocked`` is a server the gateway says ``on_drift: fail`` blocked;
+``server_listing_invalid`` a server the gateway lists tools for that it can't name, or that it
+reports invalid and no drift finding names already (counted), or whose status the vault refused
+(T-7).
+A gateway that hasn't reported for :data:`STATUS_STALE` seconds is ``gateway_status_stale``
+(info): its findings are then as old.
 """
 
 from __future__ import annotations
@@ -75,7 +91,14 @@ from urllib.parse import urlsplit
 from ..common import egresslist
 from ..common.policy import fields as policy_fields
 from ..common.policy.check import local_mcp_routes, secret_references
-from ..common.policy.schema import Credential, OAuth2Credential, Policy, Route, SMTPConnector
+from ..common.policy.schema import (
+    Credential,
+    OAuth2Credential,
+    Policy,
+    RemoteServer,
+    Route,
+    SMTPConnector,
+)
 from .bindings import (
     VAULT_PREFIX,
     BindingError,
@@ -90,6 +113,7 @@ from .netclient import destination_key, guard_key, private_hint
 from .oauth.protocol import GRANT_WARN_DAYS
 from .onboarding import onboard_again, widen_scope
 from .secretplan import binding_refusal
+from .statusreport import GatewayStatus
 from .store import EntryMeta, canonical_origin
 
 Level = Literal["error", "warning", "info"]
@@ -107,6 +131,11 @@ DISPLAY_ONLY: Final = ("source", "consented_at", "rotations", "last_ok_ago")
 REGRESSION_DAYS: Final = 30
 # The gateway asks for the copy's head at least every 60 s while it takes reports (J.3).
 STALE_SECONDS: Final = 300
+# The gateway's status report is stale after this many seconds (M6 design K.1, N.4); it comes
+# at least every 60 s.
+STATUS_STALE: Final = 180
+# A finding names at most this many tools, then says how many more.
+NAMED_MAX: Final = 10
 # The entries an onboarding stores before its fragment is committed: a confidential client's
 # secret (M7 design D.7) and a public client's ID (D.8), each named after the credential.
 ONBOARDING_SUFFIXES: Final = ("-client-secret", "-client-id")
@@ -175,6 +204,9 @@ class Inputs:
     egress_fetched_ago: float | None = None
     # The tier and the bridges, for the routes' findings in the egress section.
     bridges: Bridges = Bridges()
+    # The gateway's latest status report and its age (M6 design K.1), or None without one to
+    # report: the report then has no gateway section (VaultApp.gateway_status).
+    gateway_status: GatewayStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -207,8 +239,9 @@ class _Use:
 
 
 def assess(inputs: Inputs) -> dict[str, Any]:
-    """The health of every credential, connector and store entry, and of the routes with no
-    credential the guard refused and the egress role (``egress``), and a count per level."""
+    """The health of every credential, connector and store entry, of the routes with no
+    credential the guard refused and the egress role (``egress``), and of what the gateway
+    reports (``gateway``, M6 design M.5), and a count per level."""
     policy = inputs.policy
     stored = {entry.name: entry for entry in inputs.entries}
     status = {item["credential"]: item for item in inputs.oauth or ()}
@@ -239,6 +272,9 @@ def assess(inputs: Inputs) -> dict[str, Any]:
     if inputs.ledger_copy is not None:
         report["ledger_copy"] = _ledger_copy(inputs.ledger_copy)
         sections.append(report["ledger_copy"])
+    if inputs.gateway_status is not None and policy.gateway is not None:
+        report["gateway"] = _gateway(policy, inputs.gateway_status)
+        sections.append(report["gateway"])
     summary = {
         level: sum(f["level"] == level for s in sections for f in s["findings"]) for level in LEVELS
     }
@@ -742,6 +778,105 @@ def _ledger_copy(copy: LedgerCopy) -> dict[str, Any]:
         "level": _level(findings),
         "findings": findings,
     }
+
+
+# --- the gateway's status (M6 design K.1, M.5) ------------------------------------------------
+
+
+def _gateway(policy: Policy, status: GatewayStatus) -> dict[str, Any]:
+    """What the gateway's latest status says needs the operator, per server the running policy
+    names: each row with the attention decision as the gateway made it, and the findings."""
+    findings: list[Finding] = []
+    servers: list[dict[str, Any]] = []
+    if status.age > STATUS_STALE:
+        text = f"the gateway hasn't reported its status for {int(status.age) // 60} minutes"
+        findings.append(_finding("gateway_status_stale", "info", text, {"kind": "check_gateway"}))
+    report = status.report
+    gateway = policy.gateway
+    if report is not None and gateway is not None:
+        upstreams = {route.name: route.upstream for route in policy.routes}
+        for name, server in sorted(gateway.servers.items()):
+            review = _act("review", "server", name)
+            if name in report.refused_servers:
+                text = f"{name}: the gateway's status for it isn't one the vault reads"
+                findings.append(_finding("server_listing_invalid", "warning", text, review))
+                continue
+            entry = report.servers.get(name)
+            if entry is None:
+                continue
+            found = entry.attention()
+            unreviewed = found.unreviewed()
+            if unreviewed:
+                # Counted, not named: the upstream chose the names (M.5, Y13); review names them.
+                text = f"{name} lists {_tools(len(unreviewed))} nobody reviewed"
+                findings.append(_finding("tools_unreviewed", "warning", text, review))
+            parts = [
+                f"{len(names)} {words} ({_some(names)})"
+                for names, words in (
+                    (found.drifted, "changed since the review"),
+                    (found.marked, "hidden by a drift mark"),
+                    (found.missing, "no longer listed"),
+                )
+                if names
+            ]
+            if parts:
+                text = f"{name}: included tools {'; '.join(parts)}"
+                findings.append(_finding("drift_marked", "warning", text, review))
+            # The gateway's own word (pins.evaluate): a held mark on a tool no longer listed, or an
+            # included tool listed invalid, blocks it too.
+            if entry.blocked:
+                text = f"{name} is blocked (on_drift: fail): none of its tools are served"
+                findings.append(_finding("server_blocked", "warning", text, review))
+            # An included tool the gateway lists invalid is drifted already: counted once, there.
+            invalid = sorted(set(entry.invalid) - set(found.drifted))
+            if entry.unnamed or invalid:
+                text = f"{name} lists tools whose names aren't valid; they are counted, not named"
+                if invalid:
+                    text = f"{name} lists {_tools(len(invalid))} the gateway can't serve" + (
+                        "; others' names aren't valid, so they are counted, not named"
+                        if entry.unnamed
+                        else ""
+                    )
+                findings.append(_finding("server_listing_invalid", "warning", text, review))
+            upstream = upstreams.get(server.route) if isinstance(server, RemoteServer) else None
+            servers.append(
+                {
+                    "name": name,
+                    "kind": entry.kind,
+                    "bridge": upstream is not None and _bridge_of(upstream) is not None,
+                    "state": list(entry.state),
+                    "era": entry.era,
+                    "attention": found.as_dict(),
+                    "blocked": entry.blocked,
+                    "invalid": invalid,
+                    "unnamed": entry.unnamed,
+                }
+            )
+        if report.unnamed_servers:
+            text = (
+                f"the gateway's status names {report.unnamed_servers} server(s) by names that "
+                "aren't policy names; they are left out"
+            )
+            action = {"kind": "check_gateway"}
+            findings.append(_finding("server_listing_invalid", "warning", text, action))
+    return {
+        "reported_ago": None if report is None else int(status.age),
+        "view": None if report is None else report.view,
+        "servers": servers,
+        "level": _level(findings),
+        "findings": findings,
+    }
+
+
+def _tools(count: int) -> str:
+    return f"{count} tool{'' if count == 1 else 's'}"
+
+
+def _some(names: Sequence[str]) -> str:
+    """Up to :data:`NAMED_MAX` names, then how many more."""
+    named = ", ".join(names[:NAMED_MAX])
+    more = len(names) - NAMED_MAX
+    return named if more <= 0 else f"{named} and {more} more"
 
 
 def sends(journal: Journal, now_ms: int) -> Sends:

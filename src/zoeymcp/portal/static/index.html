@@ -8,6 +8,7 @@
 <script src="/webauthn.js" defer></script>
 <script src="/app.js" defer></script>
 <script src="/review.js" defer></script>
+<script src="/drift.js" defer></script>
 </head>
 <body>
 <header id="bar" hidden>
@@ -74,6 +75,11 @@ shows. Now sign in with it, to check that it works.</p>
 <p id="home-text"></p>
 <p id="home-ready"></p>
 <ul id="checklist"></ul>
+<div id="attention-block" hidden>
+<h3>The gateway's servers</h3>
+<p id="attention-text"></p>
+<ul id="attention"></ul>
+</div>
 <p>This deployment's policy is declarative: the portal can't change it.</p>
 </section>
 
