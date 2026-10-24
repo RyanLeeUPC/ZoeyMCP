@@ -237,6 +237,25 @@ def test_a_value_of_no_known_kind_raises() -> None:
         policyview._value(1.5, "x.y", [])
 
 
+def test_one_value_is_rendered_as_the_view_shows_its_field() -> None:
+    """The diff's renderer (M6 design H.2): a model by the table, any other value shown, a field
+    not shown as its treatment says."""
+    policy = Policy.model_validate(document())
+    answer = rendered()["policy"]
+    assert policyview.rendered(policy.connectors["mail-out"]) == answer["connectors"]["mail-out"]
+    assert policyview.rendered(policy.routes[0].callers) == answer["routes"][0]["callers"]
+    assert policyview.rendered("a" + chr(0x202E) + "b") == "a[U+202E]b"
+    assert policyview.rendered("x" * 3000) == "x" * VALUE_LIMIT + ELLIPSIS + "[+952]"
+    assert policyview.rendered({"a" + chr(0x200B): 1}) == {"a[U+200B]": 1}
+    assert policyview.rendered(list(SMTP_TO), "addresses") == "(2 addresses)"
+    assert policyview.rendered({"X-Extra": TOKEN_HEADER}, "names") == {"X-Extra": SET}
+    assert policyview.rendered(LITERAL_TOKEN, "hidden") == SET
+    assert policyview.rendered(None, "hidden") is None
+    assert policyview.rendered(None) is None
+    with pytest.raises(TypeError, match=r"^: a float has no rendering$"):  # the path is ""
+        policyview.rendered(1.5)
+
+
 # --- redaction ----------------------------------------------------------------------------------
 
 

@@ -73,7 +73,8 @@ jobs:
           tests/unit/test_actions.py tests/unit/test_admission.py tests/unit/test_display.py
           tests/unit/test_limits.py tests/unit/test_listen.py tests/unit/test_mutation_gaps_5.py
           tests/unit/test_no_secret_answers.py tests/unit/test_passkeys.py
-          tests/unit/test_policy_callback.py tests/unit/test_policyview.py
+          tests/unit/test_policy_callback.py tests/unit/test_policydiffview.py
+          tests/unit/test_policyview.py
           tests/unit/test_portal_static.py tests/unit/test_portal_windows_list.py
           tests/unit/test_portal_wire.py
           tests/unit/test_refusal_doc.py tests/unit/test_refusals.py tests/unit/test_reviewview.py

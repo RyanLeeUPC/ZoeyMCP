@@ -156,16 +156,16 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.common.egresslist.x_compare__mutmut_32": "strict=False: as mutant 28",
     "zoeymcp.common.egresslist.x_derive__mutmut_41": f"a connector's plain http: {_TRUTH}",
     "zoeymcp.common.egresslist.x_derive__mutmut_63": f"an allowance's plain http: {_TRUTH}",
-    # --- common.policy.change (judged in step 8a1)
+    # --- common.policy.change (judged in step 8a1; apply's renumbered in M6 step 12a)
     "zoeymcp.common.policy.change.x__plain__mutmut_2": _MODE,
     "zoeymcp.common.policy.change.x__plain__mutmut_5": _MODE,
     "zoeymcp.common.policy.change.x__plain__mutmut_8": _MODE,
     "zoeymcp.common.policy.change.x__plain__mutmut_9": _MODE,
-    "zoeymcp.common.policy.change.x_apply__mutmut_6": _MODE,
-    "zoeymcp.common.policy.change.x_apply__mutmut_9": _MODE,
     "zoeymcp.common.policy.change.x_apply__mutmut_12": _MODE,
-    "zoeymcp.common.policy.change.x_apply__mutmut_13": _MODE,
-    "zoeymcp.common.policy.change.x_apply__mutmut_32": (
+    "zoeymcp.common.policy.change.x_apply__mutmut_15": _MODE,
+    "zoeymcp.common.policy.change.x_apply__mutmut_18": _MODE,
+    "zoeymcp.common.policy.change.x_apply__mutmut_19": _MODE,
+    "zoeymcp.common.policy.change.x_apply__mutmut_59": (
         "include_url=True adds a url to each error, and the messages read only loc and msg"
     ),
     # --- common.policy.emit (judged in step 8a1)

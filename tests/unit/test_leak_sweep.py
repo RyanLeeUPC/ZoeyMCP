@@ -57,9 +57,10 @@ hash or an ``ENV_*`` variable, whatever shape refused it.
 A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
 token, a placeholder, a token header, a forced query value, a connector username and a recipient,
 holds none of them in its file, its head or its anchor, and its salted ``body_digest`` differs
-from another seal of the same policy; the unsealed revision and its body refuse to be logged. The
-store's I/O, and the saves, rollbacks, imports and exports that write and read it, join the
-sweep in the steps that build them.
+from another seal of the same policy; the unsealed revision and its body refuse to be logged. A
+diff between two revisions (step 12b) holds nothing the policy view hides, and the host's export
+holds a client token only as its hash. The store's I/O, and the saves, rollbacks, imports and
+exports that write and read it, join the sweep in the steps that build them.
 """
 
 from __future__ import annotations
@@ -102,7 +103,10 @@ from zoeymcp.common import ledgerreport, pinhash
 from zoeymcp.common.canonical import digest as canonical_digest
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy.diff import structured
+from zoeymcp.common.policy.export import export
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
+from zoeymcp.common.policy.plan import normalize
 from zoeymcp.common.policy.ratchet import initial
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
@@ -111,6 +115,7 @@ from zoeymcp.egress.allowlist import Allowlist, KeySource
 from zoeymcp.entrypoint import launcher
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
+from zoeymcp.portal.policydiffview import rows as policy_diff_rows
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
 from zoeymcp.vault import logs, policyseal, policystart, reviewjobs
@@ -1045,6 +1050,28 @@ def test_the_portals_policy_view_hides_what_it_must() -> None:
     assert hash_token(LITERAL_TOKEN) not in served
     # Secret references show as written: they name a secret, never hold one.
     assert "store:leak-ref-oauth-client" in served
+
+
+def test_a_policy_diff_hides_what_the_view_hides() -> None:
+    """A diff between two revisions (M6 design H.2, Y13): its rows, from no policy to this one and
+    back, and from the literal token to its hash, hold nothing the policy view hides."""
+    policy = secret_heavy_policy()
+    empty = Policy.model_validate({"version": 1, "mode": "managed"})
+    for old, new in ((empty, policy), (policy, empty), (policy, normalize(policy))):
+        served = json.dumps(policy_diff_rows(structured(old, new)))
+        for where in POLICY_VIEW_HIDES:
+            assert VAULT_SIDE[where] not in served, where
+        assert "sha256:" + "3" * 64 not in served
+        assert hash_token(LITERAL_TOKEN) not in served
+
+
+def test_an_export_holds_a_client_token_only_as_its_hash() -> None:
+    """The host's export is R61's fourth exception (M6 design H.6, DD-4): it holds placeholders and
+    token hashes, never a literal client token."""
+    text = export(secret_heavy_policy(), revision=1, deployment="ab" * 16, created=0)
+    assert LITERAL_TOKEN not in text
+    assert hash_token(LITERAL_TOKEN) in text
+    assert VAULT_SIDE["placeholder"] in text
 
 
 def test_the_gateway_view_holds_nothing_from_the_vault_side() -> None:

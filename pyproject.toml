@@ -151,6 +151,7 @@ only_mutate = [
     "*zoeymcp/portal/listen.py",
     "*zoeymcp/portal/policyview.py",
     "*zoeymcp/portal/reviewview.py",
+    "*zoeymcp/portal/policydiffview.py",
     "*zoeymcp/common/textrules.py",
     "*zoeymcp/common/canonical.py",
     "*zoeymcp/common/approvaltext.py",
@@ -178,6 +179,7 @@ only_mutate = [
     "*zoeymcp/common/policy/ratchet.py",
     "*zoeymcp/common/policy/diff.py",
     "*zoeymcp/common/policy/plan.py",
+    "*zoeymcp/common/policy/export.py",
     "*zoeymcp/gateway/pins.py",
     "*zoeymcp/gateway/findings.py",
     "*zoeymcp/gateway/schemas.py",
@@ -275,6 +277,8 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.common.policy.ratchet" = 95
 "zoeymcp.common.policy.diff" = 95
 "zoeymcp.vault.policystart" = 95
+"zoeymcp.common.policy.plan" = 95
+"zoeymcp.vault.gatewaykeys" = 95
 "zoeymcp.vault.request" = 95
 "zoeymcp.vault.store" = 95
 "zoeymcp.vault.oauth.pkce" = 95

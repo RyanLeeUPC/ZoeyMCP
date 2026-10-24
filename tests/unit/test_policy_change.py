@@ -648,6 +648,19 @@ def test_a_move_to_allow_moves_one_included_approve_tool() -> None:
         change.data()
 
 
+def test_a_move_keeps_the_blocks_the_other_ops_replace_whole() -> None:
+    """The move's own tools block adds to the paths the change replaces, so a credential set in
+    the same change is still replaced whole, not merged."""
+    oauth = OAuth2Credential.model_validate(
+        {**NOTES_CREDENTIAL, "token_url": "https://auth.broker.example/oauth/token"}
+    )
+    move = MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL)
+    merged = apply(example(), PolicyChange("t", (SetCredential("broker-mcp", oauth), move)))
+    assert merged.credentials["broker-mcp"] == oauth  # expected_scopes gone, not kept
+    assert merged.gateway is not None
+    assert merged.gateway.servers["broker-trade"].tools.allow == ["cancel_order"]
+
+
 @pytest.mark.parametrize(
     ("op", "path", "message"),
     [
@@ -708,10 +721,19 @@ def test_a_move_needs_the_tool_included_and_a_pin_unless_pinning_is_off() -> Non
         (lambda: MoveToAllow("notes", "prompt", "x", PIN_A), "'prompt' isn't a kind a move"),
         (lambda: MoveToAllow("notes", "tool", "a b", PIN_A), "pattern"),
         (lambda: MoveToAllow("notes", "tool", "x", "sha256:" + "A" * 64), "pattern"),
+        # strict: only a str
+        (lambda: MoveToAllow("notes", "tool", b"x", PIN_A), "valid string"),  # type: ignore[arg-type]
+        (lambda: MoveToAllow("notes", "tool", "x", PIN_A.encode()), "valid string"),  # type: ignore[arg-type]
         (lambda: SetClientServers("Agent", ()), "isn't a policy name"),
         (lambda: SetClientServers("agent1", ("mail", "Mail")), "isn't a policy name"),
-        (lambda: SetClientServers("agent1", ("mail", "mail")), "name each server once"),
-        (lambda: SetConnectorLimits("mail-out"), "sets one field or more"),
+        (
+            lambda: SetClientServers("agent1", ("mail", "mail")),
+            "^a client's servers name each server once$",
+        ),
+        (
+            lambda: SetConnectorLimits("mail-out"),
+            "^a connector's limits change sets one field or more$",
+        ),
         (lambda: SetConnectorLimits("Mail", paused=True), "isn't a policy name"),
         (lambda: SetConnectorLimits("mail-out", max_per_day=0), "greater than or equal to 1"),
         (lambda: SetConnectorLimits("mail-out", max_per_day=10_001), "less than or equal"),
@@ -725,6 +747,8 @@ def test_a_move_needs_the_tool_included_and_a_pin_unless_pinning_is_off() -> Non
         "move-kind",
         "move-name",
         "move-pin",
+        "move-name-bytes",
+        "move-pin-bytes",
         "client-name",
         "client-server",
         "client-twice",

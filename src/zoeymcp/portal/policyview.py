@@ -225,6 +225,13 @@ def view(policy: Policy, source: Source) -> dict[str, Any]:
     }
 
 
+def rendered(value: Any, treatment: Treatment = "shown") -> Any:
+    """One field's value as :func:`view` shows a field of ``treatment``: a model by
+    :data:`FIELDS`, any other value shown, a hidden one only as set (M6 design H.2: the diff's
+    renderer, ``portal/policydiffview.py``)."""
+    return _value(value, "", []) if treatment == "shown" else _hidden(treatment, value)
+
+
 def _model(model: BaseModel, path: str, hidden: list[str]) -> dict[str, Any]:
     """One model's fields in the schema's order, each as :data:`FIELDS` says, under its name in
     the document (``from``, not ``from_``)."""

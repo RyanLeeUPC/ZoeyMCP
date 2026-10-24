@@ -41,7 +41,7 @@ from zoeymcp.common.policy.plan import (
     plan,
     required_kind,
 )
-from zoeymcp.common.policy.ratchet import RATCHET_MAX, Grants, Violation, initial
+from zoeymcp.common.policy.ratchet import RATCHET_MAX, Grants, Violation, caller_digest, initial
 from zoeymcp.common.policy.restart import Started
 from zoeymcp.common.policy.reviewchange import Lines, definition_lines
 from zoeymcp.common.policy.schema import Policy, hash_token
@@ -269,6 +269,17 @@ def test_the_normalized_digest_is_the_documents() -> None:
     assert normalized_digest(policy) != normalized_digest(HEAD)
 
 
+def test_normalize_leaves_a_default_unset_and_takes_a_policy_with_no_gateway() -> None:
+    """The round trip through the document form (D.5, F-17): a default the policy leaves out stays
+    unset, as ``change.apply`` loads its merge."""
+    held = normalize(HEAD)
+    assert held.model_fields_set == HEAD.model_fields_set
+    assert held.model_dump(mode="json", by_alias=True, exclude_unset=True) == document(HEAD)
+    bare = Policy.model_validate({"version": 1, "mode": "managed"})
+    assert normalize(bare) == bare
+    assert normalize(bare).model_fields_set == {"version", "mode"}
+
+
 # --- rule 1: the kind is its diff ---------------------------------------------------------------
 
 
@@ -306,6 +317,10 @@ def test_required_kind_for_each_op() -> None:
     assert kind_of(make(servers, other)) == "policy.save"  # two clients
     assert kind_of(HEAD) == "policy.save"  # nothing: rule 6 answers it
     assert kind_of(make(drop("read"))) == "policy.save"
+    # Two existing clients each given servers: two clients, so a save.
+    two = make(other)
+    both = make(other, servers, setting("gateway", "clients", "cd", "servers", value=["notes"]))
+    assert required_kind(structured(two, normalize(both)), two, initial(two)) == "policy.save"
 
 
 def test_a_move_of_a_tool_not_included_is_no_tool_allow() -> None:
@@ -447,6 +462,28 @@ def test_a_rollback_is_its_targets_carry_forward() -> None:
     found = refused(carried, target=stale)
     assert found.subjects == ("policy.rollback", "policy.save")
     assert ok(carried, kind="policy.import", surface="socket", target=stale)
+
+
+def test_a_rollback_that_isnt_a_carry_forward_names_its_diffs_kind() -> None:
+    """With no target, a rollback's kind is read from its diff, with the head, the ratchet and
+    the review's drifted and verified pins as any write's (G.5 rule 1)."""
+    found = refused(make(move("write")), kind="policy.rollback")
+    assert found == PlanRefused(
+        "kind_mismatch",
+        "tool.allow, not policy.rollback: gateway.servers.notes.tools.allow, "
+        "gateway.servers.notes.tools.approve",
+        ("tool.allow", "policy.rollback"),
+    )
+    repinned = refused(
+        make(repin("read", PIN_NEW)),
+        kind="policy.rollback",
+        drifted=frozenset({READ}),
+        verified=frozenset({(READ, PIN_NEW)}),
+    )
+    assert repinned.subjects == ("tool.repin", "policy.rollback")
+    # A fresh include as allow asks the ratchet whether it is a re-include.
+    fresh = refused(make(include("fresh", "allow", PIN_NEW)), kind="policy.rollback")
+    assert fresh.subjects == ("policy.save", "policy.rollback")
 
 
 # --- rule 1: the moves -------------------------------------------------------------------------
@@ -653,6 +690,12 @@ def test_a_pin_the_review_didnt_verify_is_review_stale() -> None:
     added = setting("gateway", "servers", "other", value=other)
     found = refused(make(added))
     assert found == PlanRefused("review_stale", "other.x", ("other/tool/x",))
+    # Beside a re-pin, both are checked.
+    found = refused(
+        make(added, repin("write", PIN_OLD)),
+        verified=frozenset({(("other", "tool", "x"), PIN_NEW)}),
+    )
+    assert found == PlanRefused("review_stale", "notes.write", ("notes/tool/write",))
     # The host isn't held to it; a portal rollback carries the head's pins (H.4), and one that
     # doesn't is no rollback.
     assert ok(candidate, kind="policy.import", surface="socket")
@@ -806,6 +849,102 @@ def test_the_other_violations_keep_their_names() -> None:
         grants=Grants(env=frozenset({"NOTES_KEY"})),
     )
     assert found.reason == "env_reach_grows"
+
+
+def test_a_refusal_names_each_violation_of_its_reason() -> None:
+    """Two retired pins, two new env names, two new origins, a client and a caller revived:
+    each refusal's detail joins them all (N.2)."""
+    retired = replace(
+        initial(HEAD), retired_pins={WRITE: frozenset({PIN_OLD}), LIST: frozenset({PIN_NEW})}
+    )
+    back = make(repin("write", PIN_OLD), repin("list", PIN_NEW))
+    found = refused(back, kind="policy.import", surface="socket", ratchet=retired)
+    assert found == PlanRefused(
+        "pin_retired",
+        "notes's tool write, notes's tool list",
+        ("pin:notes/tool/write", "pin:notes/tool/list"),
+    )
+    env = setting("credentials", "notes-key", value={"kind": "header", "secret": "env:NOTES_KEY"})
+    files = setting("credentials", "files-key", value={"kind": "header", "secret": "env:FILES_KEY"})
+    used = setting(
+        "routes", value=[raw()["routes"][0], {**raw()["routes"][1], "credential": "files-key"}]
+    )
+    found = refused(make(env, files, used), kind="policy.import", surface="socket")
+    assert found == PlanRefused(
+        "env_name_new", "NOTES_KEY is new; env:FILES_KEY is new", ("NOTES_KEY", "FILES_KEY")
+    )
+    head = make(env)
+    extra = {**ROUTE, "name": "extra", "prefix": "/extra", "upstream": "https://b.example"}
+    wider = setting(
+        "routes",
+        value=[
+            {**raw()["routes"][0], "upstream": "https://a.example"},
+            raw()["routes"][1],
+            {**extra, "credential": "notes-key"},
+        ],
+    )
+    found = refused(
+        make(env, wider), head=head, ratchet=initial(head), kind="policy.import", surface="socket"
+    )
+    assert found == PlanRefused(
+        "env_reach_grows",
+        "NOTES_KEY would also be sent to https://a.example:443, https://b.example:443",
+        ("NOTES_KEY",),
+    )
+    ratchet = replace(
+        initial(HEAD),
+        retired_clients=frozenset({TOKEN_OLD}),
+        retired_callers=frozenset({caller_digest("ph-old-00001")}),
+    )
+    caller = {**raw()["routes"][1], "callers": ["gateway", {"placeholder": "ph-old-00001"}]}
+    target = make(
+        setting("gateway", "clients", "old", value={"token_sha256": TOKEN_OLD}),
+        setting("routes", value=[raw()["routes"][0], caller]),
+    )
+    candidate = carry_forward(HEAD, target)
+    removed = {"client:old": 21}.get
+    found = refused(
+        candidate,
+        kind="policy.rollback",
+        ratchet=ratchet,
+        target=target,
+        target_revision=20,
+        removed_in=removed,
+    )
+    assert found == PlanRefused(
+        "rollback_revives",
+        "revision 20 brings back client old, removed in revision 21; caller files/1",
+        ("client:old", "caller:files/1"),
+    )
+    found = refused(
+        candidate, kind="policy.import", surface="socket", ratchet=ratchet, removed_in=removed
+    )
+    assert found == PlanRefused(
+        "revives_client",
+        "client old, removed in revision 21; caller files/1",
+        ("client:old", "caller:files/1"),
+    )
+
+
+def test_a_host_write_back_to_a_retired_pin_it_verified_needs_no_grant() -> None:
+    """A retired pin the review verified again isn't a violation (E.2), so the host's plan has no
+    "Granted by the host" row for it."""
+    retired = replace(initial(HEAD), retired_pins={WRITE: frozenset({PIN_OLD})})
+    found = ok(
+        make(repin("write", PIN_OLD)),
+        kind="policy.import",
+        surface="socket",
+        ratchet=retired,
+        verified=frozenset({(WRITE, PIN_OLD)}),
+    )
+    assert found.rows == (
+        ("Revision", "18, from 17"),
+        (
+            "gateway.servers.notes.review.write",
+            f"{PIN_WRITE} -> {PIN_OLD} (re-pinned: you read both definitions)",
+        ),
+        NO_RESTART,
+    )
 
 
 def test_a_retired_pins_name_may_hold_a_slash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1035,6 +1174,32 @@ def test_portal_widens_names_every_path() -> None:
     assert found.subjects == ("admin.origins", "gateway.servers.notes.shared_session")
 
 
+def test_the_portal_may_remove_a_connector_and_a_caller() -> None:
+    """A removal is narrower: neither a connector's whole entry nor a caller taken away is a
+    bound field or an added caller (G.5 rule 2)."""
+    gone = ok(make(setting("connectors", value={})))
+    assert gone.rows == (
+        ("Revision", "18, from 17"),
+        ("connectors.mail", "removed"),
+        NO_RESTART,
+        ("Left unused", "mail-password"),
+    )
+    files = {**raw()["routes"][1], "callers": ["gateway"]}
+    found = ok(make(setting("routes", value=[raw()["routes"][0], files])))
+    assert found.rows[1] == ("routes.files.callers.1", "removed")
+
+
+def test_a_routes_query_allow_is_no_tools_allow() -> None:
+    """A save permits a tool's ``allow`` addition, not a route's wider ``query.allow``."""
+    query = {**raw()["routes"][0], "query": {"allow": ["a"]}}
+    head = make(setting("routes", value=[query, raw()["routes"][1]]))
+    wider = {**raw()["routes"][0], "query": {"allow": ["a", "b"]}}
+    found = refused(
+        make(setting("routes", value=[wider, raw()["routes"][1]])), head=head, ratchet=initial(head)
+    )
+    assert (found.reason, found.detail) == ("portal_widens", "widen routes.notes-mcp.query.allow")
+
+
 def test_onboarding_and_each_kinds_widening_are_permitted() -> None:
     """``policy.save``: onboarding's credential, route (callers gateway), server and private
     entry, a re-registration's credential and a review's include, declines and era;
@@ -1064,6 +1229,37 @@ def test_onboarding_and_each_kinds_widening_are_permitted() -> None:
         "gateway.clients.ci.servers",
         "agents holding client ci's token can call notes's 3 included tools",
     )
+
+
+def test_a_decline_taken_back_is_a_weakening_a_save_permits() -> None:
+    """A review's declines (G.5 rule 2): a declined tool included again says so, with the
+    revision it was declined in; a decline dropped for a tool left out is wider too; an include
+    is a weakening of its own, no allow (G.7 row 2)."""
+    fresh = ("notes", "tool", "fresh")
+    declined = {"fresh": PIN_NEW, "gone": PIN_OLD}
+    head = make(setting("gateway", "servers", "notes", "declined", value=declined))
+    found = ok(
+        make(include("fresh", "approve", PIN_NEW)),
+        head=head,
+        ratchet=initial(head),
+        verified=frozenset({(fresh, PIN_NEW)}),
+    )
+    assert found.rows == (
+        ("Revision", "18, from 17"),
+        ("gateway.servers.notes.tools.include", "fresh added (wider)"),
+        ("gateway.servers.notes.declined.fresh", "fresh: declined in revision 17, included again"),
+        ("gateway.servers.notes.declined.gone", "removed (wider)"),
+        ("gateway.servers.notes.tools.approve", "fresh added"),
+        ("gateway.servers.notes.review.fresh", "added"),
+        NO_RESTART,
+    )
+
+
+def test_a_connectors_wider_recipients_are_no_raised_limit() -> None:
+    """Only a connector's limits read "raised"; its other wider fields are plain weakenings."""
+    grown = setting("connectors", "mail", "to", value=["ops@mail.example", "x@mail.example"])
+    found = ok(make(grown), kind="policy.import", surface="socket")
+    assert found.rows[1] == ("connectors.mail.to", "changed (wider)")
 
 
 def test_a_portal_rollback_narrows_and_removes_but_never_widens() -> None:
@@ -1133,6 +1329,13 @@ def test_a_single_move_over_the_cap_goes_to_the_host() -> None:
     assert HOST_NEXT == "zoeymcp policy export, edit, zoeymcp policy import"
     assert ok(
         make(move("write")), kind="policy.import", surface="socket", definitions={WRITE: rows}
+    )
+    # A definition of exactly 400 rows isn't over on its own: the whole plan is.
+    at = {WRITE: (("x",),) * SUMMARY_ROWS_MAX}
+    found = refused(make(move("write")), kind="tool.allow", definitions=at)
+    assert (found.detail, found.subjects) == (
+        "it has more than 400 lines: save fewer moves to allow at once, or make it on the host",
+        (),
     )
 
 
@@ -1365,6 +1568,25 @@ def test_the_carry_forward_normalizes_and_keeps_a_server_only_the_target_has() -
     assert found == normalize(found)
 
 
+def test_the_carry_forward_of_policies_missing_a_block() -> None:
+    """A head or a target with no gateway, a target whose gateway has no servers, a server with
+    no tools (every tool declined) and a target with no admin: each block absent is empty."""
+    bare = Policy.model_validate({"version": 1, "mode": "managed"})
+    assert carry_forward(HEAD, bare).gateway is None
+    assert carry_forward(HEAD, bare).admin == HEAD.admin
+    from_bare = carry_forward(bare, HEAD)
+    assert (from_bare.gateway, from_bare.admin) == (HEAD.gateway, None)
+    serverless = carry_forward(HEAD, make(setting("gateway", "servers", value={})))
+    assert serverless.gateway is not None
+    assert serverless.gateway.servers == {}
+    all_declined = {"kind": "remote", "route": "notes-mcp", "declined": {"read": PIN_READ}}
+    found = carry_forward(HEAD, make(setting("gateway", "servers", "notes", value=all_declined)))
+    assert found.gateway is not None
+    notes = found.gateway.servers["notes"]
+    assert (notes.tools.include, notes.review, notes.declined) == ([], {}, {"read": PIN_READ})
+    assert carry_forward(HEAD, make(setting("admin", value=None))).admin == HEAD.admin
+
+
 def test_the_plans_effects_breaks_and_unused_entries() -> None:
     def bindings(policy: Policy) -> dict[str, BindingState]:
         found: dict[str, BindingState] = {"mail-password": "ok"}
@@ -1410,3 +1632,18 @@ def test_inputs_carry_their_defaults() -> None:
     assert (i.verified, i.drifted, i.marked, i.consequential) == ((frozenset(),) * 4)
     assert (dict(i.definitions), dict(i.suggested), i.grants) == ({}, {}, Grants())
     assert (i.target, i.target_revision, i.removed_in("client:x")) == (None, None, None)
+
+
+def test_a_server_the_policy_lacks_has_no_tools_pin_or_pinning() -> None:
+    """The planner's readers of one server, given one the policy lacks or a policy with no
+    gateway: no tools, no pin, pinning not off."""
+    bare = Policy.model_validate({"version": 1, "mode": "managed"})
+    absent = ("absent", "tool", "x")
+    assert planner._tools(bare, "notes") == planner._tools(HEAD, "absent") == ([], [])
+    assert planner._tools(HEAD, "notes") == (["read", "write", "list"], ["read"])
+    assert planner._pin(bare, READ) is None
+    assert planner._pin(HEAD, absent) is None
+    assert planner._pin(HEAD, READ) == PIN_READ
+    assert planner._pinning_off(bare, "kit") is False
+    assert planner._pinning_off(HEAD, "absent") is False
+    assert planner._pinning_off(HEAD, "kit") is True
