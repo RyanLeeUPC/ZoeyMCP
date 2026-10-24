@@ -2,15 +2,18 @@
 
 The listing needs the SDK, which only the gateway runs, and the vault never connects to the
 gateway (X12), so the gateway asks for work. One task, beside the policy client and the reporter,
-long-polls the jobs path with the digest of the view its policy client holds; the vault answers
-as soon as a job queued at that digest exists, or with none after 25 s, or at once when its view
-changes (D-189). The policy client may not hold the new view yet when that answer comes, and a
-poll at a view the vault no longer serves waits its whole 25 s, so after a poll the vault ended
-early with nothing the poller waits up to :data:`VIEW_CATCH_UP` for another view first. For
-each job the poller checks that the server is a policy name in that view, runs the same review as
-``zoeymcp review`` (:func:`.review.review`, any server kind) under ``app.reviewing``, the lock the
-admin socket's review takes, so one review runs at a time, and posts the result to the report
-path:
+long-polls the jobs path with the digest of the view its policy client holds and the job kinds it
+runs (``kinds=review,clear``, M6 design J.4); the vault answers as soon as a job queued at that
+digest exists, or with none after 25 s, or at once when its view changes (D-189). The policy
+client may not hold the new view yet when that answer comes, and a poll at a view the vault no
+longer serves waits its whole 25 s, so after a poll the vault ended early with nothing the poller
+waits up to :data:`VIEW_CATCH_UP` for another view first. For each job the poller checks that the
+server is a policy name in that view, runs the same review as ``zoeymcp review``
+(:func:`.review.review`, any server kind) under ``app.reviewing``, the lock the admin socket's
+review takes, so one review runs at a time, and posts the result to the report path. A clear job
+runs ``review --clear`` (logged ``drift_cleared`` with ``by: portal``), whose report names the
+marks it cleared; one the review refuses ``not_clean`` posts the review that found the tools not
+matching, with their names, rather than an error:
 
 - ``{"v": 1, "job", "server", "report"}``: the review's answer through
   :func:`~zoeymcp.common.reviewreport.fit` under the view's limits, so one odd tool can't make
@@ -65,6 +68,9 @@ NO_VIEW_WAIT: Final = 1.0  # before the first view, a poll would have no digest 
 VIEW_CATCH_UP: Final = 1.0
 VIEW_CATCH_UP_STEP: Final = 0.05
 TOO_LARGE: Final = "review_too_large"
+# The job kinds this poller runs, as its polls advertise them (M6 design J.4, G-8): an older
+# vault's strict query refuses the key, and the poll backs off until the vault is recreated.
+KINDS: Final = "review,clear"
 # A job ID the vault issued (43 URL-safe characters) and its post may name (at most 64).
 _JOB_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _NAME: Final = re.compile(NAME_PATTERN)
@@ -73,15 +79,21 @@ _ENDED: Final = ("done", "failed")
 # The reasons a report the vault read and refused fails its job with (common/reviewreport.py).
 _REFUSED: Final = ("review_invalid", "pin_mismatch")
 
-Review = Callable[[Any, str], Awaitable[dict[str, Any]]]
+# review.review: (app, server), and for a clear job clear=True and by="portal" besides.
+Review = Callable[..., Awaitable[dict[str, Any]]]
+# A poll's job, exactly: a review's, or a clear's (M6 design J.4).
+_REVIEW_JOB: Final = frozenset({"id", "server"})
+_CLEAR_JOB: Final = frozenset({"id", "server", "kind"})
 
 
 @dataclass(frozen=True, repr=False)
 class Job:
-    """One job a poll answered: its ID, which is never logged, and the server it names."""
+    """One job a poll answered: its ID, which is never logged, the server it names, and whether
+    it asks for a clear of the server's drift marks rather than a review."""
 
     id: str
     server: str
+    clear: bool = False
 
     @property
     def hash8(self) -> str:
@@ -124,7 +136,8 @@ def _encoded(document: dict[str, Any]) -> bytes:
 
 
 def _jobs(body: bytes) -> tuple[Job, ...]:
-    """The jobs in a poll's answer, ``{"v": 1, "jobs": [{"id", "server"}, ...]}``."""
+    """The jobs in a poll's answer, ``{"v": 1, "jobs": [...]}``, each ``{"id", "server"}`` (a
+    review) or ``{"id", "server", "kind": "clear"}``, and nothing else."""
     try:
         value = canonical.loads_strict(body, max_bytes=REVIEW_MAX_ANSWER_BYTES)
     except canonical.JSONRejected as exc:
@@ -136,12 +149,15 @@ def _jobs(body: bytes) -> tuple[Job, ...]:
         raise _Failed("bad_answer")
     jobs = []
     for item in listed:
-        if not isinstance(item, dict) or set(item) != {"id", "server"}:
+        if not isinstance(item, dict) or set(item) not in (_REVIEW_JOB, _CLEAR_JOB):
             raise _Failed("bad_answer")
         job_id, server = item["id"], item["server"]
         if not isinstance(job_id, str) or not isinstance(server, str):
             raise _Failed("bad_answer")
-        jobs.append(Job(job_id, server))
+        clear = "kind" in item
+        if clear and item["kind"] != "clear":
+            raise _Failed("bad_answer")
+        jobs.append(Job(job_id, server, clear))
     return tuple(jobs)
 
 
@@ -219,7 +235,7 @@ class ReviewPoller:
 
     async def poll_once(self, snapshot: Snapshot) -> tuple[Job, ...]:
         """One poll at ``snapshot``'s digest: the jobs it claimed, or :class:`_Failed`."""
-        params = {"wait": str(self._wait), "view": snapshot.view.digest}
+        params = {"wait": str(self._wait), "view": snapshot.view.digest, "kinds": KINDS}
         response = await self._http.get(REVIEW_JOBS_PATH, params=params)
         body = await response.aread()
         if response.status_code != 200:
@@ -250,12 +266,19 @@ class ReviewPoller:
             )
 
     async def _reviewed(self, job: Job, limits: GatewayLimits) -> dict[str, Any]:
-        """The job's result: the fitted report, or the review's error."""
+        """The job's result: the fitted report, or the review's error. A clear the review
+        refused ``not_clean`` is reported, with the tools that don't match (M6 design J.4)."""
         async with self._app.reviewing:
             try:
-                answer = await self._review(self._app, job.server)
+                if job.clear:
+                    answer = await self._review(self._app, job.server, clear=True, by="portal")
+                else:
+                    answer = await self._review(self._app, job.server)
             except review.ReviewError as exc:
-                return _error(job, exc.status, exc.reason, str(exc))
+                found = exc.data.get("review")
+                if not (job.clear and exc.reason == review.NOT_CLEAN and isinstance(found, dict)):
+                    return _error(job, exc.status, exc.reason, str(exc))
+                answer = found
             except Exception as exc:  # the job fails, not the poller
                 return _crashed(job, exc)
         try:

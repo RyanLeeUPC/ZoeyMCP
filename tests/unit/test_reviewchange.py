@@ -23,6 +23,7 @@ from zoeymcp.common.policy.change import PolicyChange, SetServerReview
 from zoeymcp.common.policy.emit import emit
 from zoeymcp.common.policy.reviewchange import (
     CHUNK,
+    MOVED_TO_ALLOW,
     PROPOSED,
     AllowRefused,
     Changes,
@@ -129,6 +130,36 @@ def test_the_states_the_report_shows() -> None:
 def test_the_constants() -> None:
     assert CHUNK == 200
     assert PROPOSED == "the new definition isn't marked read-only: proposed approve"
+    assert MOVED_TO_ALLOW == "approve -> allow: calls to {name} will run with no prompt"
+
+
+# --- approve -> allow (J3, declarative; COV-3) ---------------------------------------------------
+
+
+def test_a_move_from_approve_to_allow_says_what_it_allows() -> None:
+    """Allow without asking in declarative mode: an included approve tool moved to allow gets
+    the sentence as a comment, ahead of the other changes; a move to approve, or a tool
+    already in allow, gets none, and a dropped tool isn't a move."""
+    report = drifting()
+    moved = emit(fragment(report, Changes(moved={"m": "allow", "b": "allow"})))
+    lines = moved.splitlines()
+    said = [line for line in lines if "will run with no prompt" in line]
+    assert said == [
+        "# changed: b (approve -> allow: calls to b will run with no prompt)",
+        "# changed: m (approve -> allow: calls to m will run with no prompt)",
+    ]
+    assert lines.index(said[1]) < lines.index(next(x for x in lines if x.startswith("# kept: ")))
+    assert sorted(op_of(fragment(report, Changes(moved={"m": "allow"}))).tools.allow) == [
+        "a",
+        "c",
+        "m",
+    ]
+    for changes in (
+        Changes(moved={"a": "approve"}),
+        Changes(moved={"c": "allow"}),
+        Changes(moved={"m": "allow"}, dropped=frozenset({"m"})),
+    ):
+        assert "will run with no prompt" not in emit(fragment(report, changes)), changes
 
 
 # --- re-pin (J.3, Q8 (a)) ------------------------------------------------------------------------

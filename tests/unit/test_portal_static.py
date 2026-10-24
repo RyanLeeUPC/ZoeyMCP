@@ -620,12 +620,34 @@ def test_select_suggested_makes_no_move() -> None:
         assert re.search(r"\bchoice\.value = (?:entry\.)?tool\.prefill;", body), function
     assert not re.search(r"\bchoice\.value = [\"'`]", code)
     drift = code_of(read("drift.js"))
-    # drift.js sets a choice in one place only: accepting a proposed tool's new definition
-    # chooses approve (Q8), and unticking it puts the vault's prefill back
+    # drift.js sets a choice in two places only: accepting a proposed tool's new definition
+    # chooses approve (Q8), and unticking it puts the vault's prefill back; and Allow without
+    # asking moves the one tool whose button was pressed (J3, declarative), in move(), called for
+    # that tool alone once the review of the job it queued draws: no bulk control moves a tool.
     assert re.findall(r"\bchoice\.value = (.*);", drift) == [
-        "entry.repin.checked ? APPROVE : tool.prefill"
+        "entry.repin.checked ? APPROVE : tool.prefill",
+        "ALLOW",
     ]
     assert 'const APPROVE = "approve";' in drift
+    assert 'const ALLOW = "allow";' in drift
+    start = drift.index("function move(entry) {")
+    assert "entry.choice.value = ALLOW;" in drift[start : drift.index("\n  }\n", start)]
+    assert re.findall(r"\bmove\((.*)\);", drift) == [
+        "drawn.entries.find((entry) => entry.tool.name === name)",
+        "held.entries.find((entry) => entry.tool.name === asked.name)",
+    ]
+    # The pending move is that job's alone: allow() drops any earlier one and keeps none when the
+    # vault refused the review (queueReview answers its job, or nothing), and footer() moves only
+    # on that job's review, so a refused, failed or replaced review leaves no move behind.
+    start = drift.index("async function allow(server, name, queue) {")
+    body = drift[start : drift.index("\n  }\n", start)]
+    assert body.index("moving = null;") < body.index("await queue(server);")
+    assert "if (job === undefined) {\n      return;" in body
+    assert "drawn !== null && drawn.job === job" in body
+    assert "moving = { job: job, name: name };" in body
+    assert "asked !== null && asked.job === held.job" in drift
+    assert "return pollReview().then(() => job.job);" in code_of(read("review.js"))
+    assert "entry.tool.classification !== APPROVE || entry.tool.consequential === true" in drift
 
 
 def test_a_registrations_notes_are_worded() -> None:
@@ -656,13 +678,19 @@ def test_the_review_screen_reads_what_the_vault_sends() -> None:
     view = reviewview.rows(held(large()))
     code = code_of(read("review.js"))
     assert set(re.findall(r"\btool\.([a-z_]+)", code)) <= {*view["tools"][0], "consequential"}
-    # drift.js draws a row's drift columns and controls from the same row (M6 J.2).
+    # drift.js draws a row's drift columns and controls from the same row (M6 J.2), a toolkit
+    # row's consequential flag among them (J3's move never takes such a tool); "tool.clear" is
+    # the action it prepares, not a row's field.
     drift = code_of(read("drift.js"))
-    assert set(re.findall(r"\btool\.([a-z_]+)", drift)) <= set(view["tools"][0])
+    fields = set(re.findall(r'(?<!")\btool\.([a-z_]+)', drift))
+    assert fields <= {*view["tools"][0], "consequential"}
     assert "tool.reviewed_lines" in drift
     assert "if (tool.proposed) {" in drift  # Q8's proposal is the vault's flag, not the page's
-    # What the gateway reports of a server sits above its row's steps, Review among them.
-    assert '.querySelector("ul.steps").before(make("p", "The gateway reports: " +' in drift
+    # What the gateway reports of a server sits above its row's steps, Review among them, and
+    # Clear the marks with it when a tool is marked (M6 J.4).
+    assert 'const steps = list.children[index].querySelector("ul.steps");' in drift
+    assert 'steps.before(make("p", "The gateway reports: " +' in drift
+    assert "steps.before(button(ACTION_TEXT.clear, () => clear(row.server, () => queue(" in drift
     assert set(re.findall(r"\bcounts\.([a-z_]+)", code)) == set(view["counts"])
     assert reads("renderReview", "answer") <= set(view)
     tools = view["tools"]
@@ -686,8 +714,9 @@ def test_the_review_screen_reads_what_the_vault_sends() -> None:
 def test_drift_js_clicks_go_through_app_js_guard() -> None:
     """drift.js draws its buttons with app.js's button(), shared through window.zoeyPortal, and
     listens for one thing only, the re-pin box of a proposed tool, which sets its row's choice
-    and calls nothing (Q8); it publishes window.zoeyDrift, frozen, and nothing else: Home's
-    hooks (step 7) and review.js's (M6 J.2, step 8)."""
+    and calls nothing (Q8); Clear the marks and Allow without asking are button()s too (M6
+    J.4, J3), a clear through app.js's step-up (prepare); it publishes window.zoeyDrift, frozen,
+    and nothing else: Home's hooks (step 7) and review.js's (M6 J.2, step 8)."""
     code = code_of(read("drift.js"))
     assert re.findall(r"(\S+)\.addEventListener\(", code) == ["entry.repin"]
     assert "onclick" not in code
@@ -696,7 +725,21 @@ def test_drift_js_clicks_go_through_app_js_guard() -> None:
     assert "function guard(" not in code
     taken = re.search(r"const \{([^}]*)\} = window\.zoeyPortal;", code)
     assert taken
-    assert {word.strip() for word in taken.group(1).split(",")} == {"api", "button"}
+    assert {word.strip() for word in taken.group(1).split(",")} == {
+        "api",
+        "fill",
+        "afterFailure",
+        "button",
+        "prepare",
+        "closeConfirm",
+    }
+    # Each new control is a button(): Clear the marks three times (Home's item through act(),
+    # a server row, the review screen) and Allow without asking once per approve tool.
+    assert re.findall(r'prepare\("([a-z.]+)"', code) == ["tool.clear"]
+    assert code.count("button(ACTION_TEXT.clear, ") == 2
+    assert 'button("Allow " + named.name_shown + " without asking",' in code
+    # A clear job is read on a timer that runs a function, never a string (K.2).
+    assert re.findall(r"setTimeout\((\w+)", code) == ["resolve"]
     assert re.findall(r"window\.(zoey\w+) =", code) == ["zoeyDrift"]
     shared = re.search(r"window\.zoeyDrift = Object\.freeze\(\{([^}]*)\}\);", code)
     assert shared
@@ -720,7 +763,8 @@ def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
     runs = app[app.index("const runs = {") :]
     assert "review: () => window.zoeyDrift.review(action.server)," in runs[: runs.index("};")]
     drift = code_of(read("drift.js"))
-    assert 'const ACTION_TEXT = { review: "Review" };' in drift
+    assert 'const ACTION_TEXT = { review: "Review", clear: "Clear the marks" };' in drift
+    assert "act(item.action, home)" in drift
     # Each item is shown through textContent, from the vault's text_shown alone, and every field
     # the script reads of the answer and its items is one the vault sends.
     assert 'entry.textContent = item.text_shown + ". ";' in drift
@@ -732,6 +776,14 @@ def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
     assert re.findall(r"\bitem\.action\.([a-z_]+)", drift) == ["kind", "server"]
     assert item["action"] == {"kind": "review", "server": "notes"}
     assert set(item) == {"kind", "server_shown", "count", "text_shown", "action"}
+    # A marked tool's one action is a clear of the server's marks (M6 J.4, J13), the only kind
+    # besides review, and drift.js words both.
+    marked = gateway_row()
+    lists = ("drifted", "marked", "new", "changed_declined", "missing")
+    marked["attention"] = {name: ["echo"] if name == "marked" else [] for name in lists}
+    report = {"gateway": {"reported_ago": 1, "servers": [marked]}}
+    [clear] = portal_app.attention_items(report)["items"]
+    assert (clear["kind"], clear["action"]) == ("marked", {"kind": "clear", "server": "notes"})
 
 
 def gateway_row() -> dict[str, object]:

@@ -111,6 +111,7 @@ Do = Literal[
     "widen_scope",
     "check_egress_role",
     "onboard_again",
+    "clear",
 ]
 # Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
 # container that reads the inline policy from the service's environment; ``run_mount``, the same
@@ -892,9 +893,16 @@ def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
     steps = []
     if held == "none":
         steps.append(NextStep("connect", "Sign in", ("zoeymcp", "login", found.credential), "exec"))
-    review = ("zoeymcp", "review", found.server, "--via", "vault")
-    choices = choices_file(found.server)
-    steps += [
+    return (*steps, *choose_next(found.server))
+
+
+def choose_next(server: str) -> tuple[NextStep, ...]:
+    """Choosing a reviewed server's tools (J1, F.5): the choices file and, once edited, fragment
+    2 from it, both through the vault's job path, which reads the review queued last once it is
+    done (OPS-11)."""
+    review = ("zoeymcp", "review", server, "--via", "vault")
+    choices = choices_file(server)
+    return (
         NextStep(
             "choose",
             "Choose its tools",
@@ -910,10 +918,52 @@ def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
             (*review, "--choices", "-"),
             "exec",
             piped=True,
-            redirect=f" < {choices} > {fragment_file(found.server, 2)}",
+            redirect=f" < {choices} > {fragment_file(server, 2)}",
         ),
-    ]
-    return tuple(steps)
+    )
+
+
+# The review job refusals whose way on is a fresh review (M6 design M.7, D-200): a server busy
+# or a queue full once the other review ends, a job its clock, the gateway or its report ended,
+# and a clear that found an included tool not matching its pin, which the review shows.
+REVIEW_AGAIN: Final = frozenset(
+    {
+        "review_busy",
+        "review_jobs_full",
+        "review_stale",
+        "review_timeout",
+        "review_failed",
+        "review_invalid",
+        "review_too_large",
+        "pin_mismatch",
+        "clear_not_clean",
+    }
+)
+
+
+def review_again(server: str) -> NextStep:
+    """A fresh review of ``server`` through the vault's job path, never the finished one."""
+    review = ("zoeymcp", "review", server, "--via", "vault", "--fresh")
+    return NextStep("review", "Review again", review, "exec")
+
+
+def job_next(server: str, *, clear: bool) -> tuple[NextStep, ...]:
+    """A finished job's way on (D-200): after a review, choosing the server's tools; after a
+    clear, nothing."""
+    return () if clear else choose_next(server)
+
+
+def refusal_next(server: str | None, reason: str) -> tuple[NextStep, ...]:
+    """A review job refusal's way on (D-200): a fresh review for :data:`REVIEW_AGAIN`'s; the
+    clear in the gateway's own container, as before, while the gateway runs no clear jobs
+    (``clear_unsupported``); else nothing the CLI can do (a name the policy doesn't have, a
+    gateway that isn't polling, an unknown job). None when no server is known."""
+    if server is None:
+        return ()
+    if reason == "clear_unsupported":
+        clear = ("zoeymcp", "review", server, "--clear")
+        return (NextStep("clear", "Clear the marks in the gateway's container", clear),)
+    return (review_again(server),) if reason in REVIEW_AGAIN else ()
 
 
 def onboard_again(server_url: str) -> NextStep:

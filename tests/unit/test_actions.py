@@ -100,6 +100,8 @@ def test_the_registry_holds_f4s_kinds() -> None:
             ],
         ),
         "onboard.register": (131072, ["onboarding"], ["client_secret"]),
+        # M6 J.4: clearing a server's drift marks, stepped up in both modes (Y27).
+        "tool.clear": (4096, ["server"], []),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
     assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS

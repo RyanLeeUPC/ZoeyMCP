@@ -98,6 +98,10 @@ def review(server: str) -> dict[str, str]:
     return {"kind": "review", "server": server}
 
 
+def clear(server: str) -> dict[str, str]:
+    return {"kind": "clear", "server": server}
+
+
 def test_nothing_before_the_gateway_reports(home: tuple[PortalRig, Page]) -> None:
     _, page = home
     assert attention(page) == {"gateway": True, "items": [], "more": 0, "reported_ago": None}
@@ -105,7 +109,8 @@ def test_nothing_before_the_gateway_reports(home: tuple[PortalRig, Page]) -> Non
 
 def test_the_attention_list_one_action_each(home: tuple[PortalRig, Page]) -> None:
     """M.7: drifted, missing and marked tools, the tools nobody reviewed (a declined one that
-    changed among them), a blocked server and a bridge's state, each with Review."""
+    changed among them), a blocked server and a bridge's state, each with Review, or for marked
+    tools Clear the marks (J.4, J13)."""
     rig, page = home
     reported(
         rig,
@@ -130,7 +135,14 @@ def test_the_attention_list_one_action_each(home: tuple[PortalRig, Page]) -> Non
         ("unreviewed", 2, "notes lists 2 tools nobody reviewed"),
         ("blocked", 1, "notes is blocked (on_drift: fail): it serves no tool"),
     ]
-    assert [item["action"] for item in found["items"]] == [review("fetch")] + [review("notes")] * 5
+    assert [item["action"] for item in found["items"]] == [
+        review("fetch"),
+        review("notes"),
+        review("notes"),
+        clear("notes"),
+        review("notes"),
+        review("notes"),
+    ]
     assert {item["server_shown"] for item in found["items"]} == {"fetch", "notes"}
 
 

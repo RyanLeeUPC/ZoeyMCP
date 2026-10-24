@@ -127,7 +127,7 @@ class Reviews:
 
     def __init__(self) -> None:
         self.table = JobTable(lambda: 1000.0, started=0.0)
-        self.table.poll_began()
+        self.table.poll_began(frozenset({"review", "clear"}))
         self.done = self.finished("cli")
         self.portal_done = self.finished("portal")
 
@@ -140,6 +140,11 @@ class Reviews:
 
     async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job:
         queued = self.table.queue(server, owner, self.DIGEST, self.SERVERS, fresh=fresh)
+        assert isinstance(queued, Job)
+        return queued
+
+    async def queue_clear(self, server: str, owner: Owner) -> Job:
+        queued = self.table.queue(server, owner, self.DIGEST, self.SERVERS, work="clear")
         assert isinstance(queued, Job)
         return queued
 
@@ -186,7 +191,10 @@ async def test_no_socket_answer_carries_a_credential_but_the_exceptions(
         answers.append(((method, template), response.text + repr(dict(response.headers))))
         if (method, template) == ("POST", "/setup-code"):
             credentials[response.json()["code"]] = "setup code"
-        if template.startswith("/review") and not template.endswith("/diff"):
+        if template.endswith("/clear"):
+            # A clear job queued (M6 design J.4): its report comes once the gateway runs it.
+            assert response.json()["state"] == "queued", response.text
+        elif template.startswith("/review") and not template.endswith("/diff"):
             # The done job's report, answered whole (and handed back again on a queue call).
             assert response.json()["report"]["server"] == "notes", response.text
     answers.append((("POST", "/onboard/discover"), discovered.text + stored.text))

@@ -245,7 +245,7 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.vault.onboarding.x_allow_hosts__mutmut_17": "other reasons: as mutant 10",
     "zoeymcp.vault.onboarding.x_allow_hosts__mutmut_18": "other reasons: as mutant 10",
     "zoeymcp.vault.onboarding.x_committed_for__mutmut_10": _NO_NAME,
-    "zoeymcp.vault.onboarding.x_listed_servers__mutmut_38": _NO_NAME,
+    "zoeymcp.vault.onboarding.x_listed_servers__mutmut_45": _NO_NAME,
     "zoeymcp.vault.onboarding.x_served_at__mutmut_19": _NO_NAME,
     "zoeymcp.vault.onboarding.x_token_state__mutmut_3": (
         '`refresh_token or "XXXX"`: "XXXX" starts with neither "store:" nor "env:", as "" doesn\'t'
@@ -261,13 +261,13 @@ EQUIVALENT: Final[dict[str, str]] = {
     ),
     # --- portal.reviewview
     "zoeymcp.portal.reviewview.x__info__mutmut_17": _SHOWN,
-    "zoeymcp.portal.reviewview.x__row__mutmut_99": _SHOWN,
-    "zoeymcp.portal.reviewview.x__row__mutmut_108": f"single_line: {_TRUTH}",
-    "zoeymcp.portal.reviewview.x_rows__mutmut_18": (
+    "zoeymcp.portal.reviewview.x__row__mutmut_170": _SHOWN,
+    "zoeymcp.portal.reviewview.x__row__mutmut_179": f"single_line: {_TRUTH}",
+    "zoeymcp.portal.reviewview.x_rows__mutmut_21": (
         "the server's name at shown's default 200 for NAME_LIMIT: a report's server is a policy "
         "name, at most 64 characters"
     ),
-    "zoeymcp.portal.reviewview.x_rows__mutmut_48": f"single_line: {_TRUTH}",
+    "zoeymcp.portal.reviewview.x_rows__mutmut_51": f"single_line: {_TRUTH}",
     # definition_lines' two moved with it to common.policy.reviewchange (M6 step 8):
     # test_mutation_gaps_7.py.
     "zoeymcp.portal.reviewview.x_diff__mutmut_42": (

@@ -3251,6 +3251,9 @@ class Reviews:
             self.jobs.post(read_result(body, view.gateway.limits))
         return job
 
+    async def queue_clear(self, server: str, owner: Owner) -> Job:
+        raise AssertionError("the CLI's second run never clears marks")
+
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
         return self.jobs.get(job_id, owner)
 
@@ -3794,6 +3797,57 @@ def test_review_via_vault_queues_then_reads_the_job(admin: FakeAdmin) -> None:
     assert json.loads(out)["tools"] == report["tools"]
 
 
+def test_review_via_vault_clear_queues_a_clear_job(admin: FakeAdmin) -> None:
+    """M6 J.4: ``--via vault --clear`` queues a clear job (no longer refused), reads it as a
+    review job, and prints the review after the clear with the marks it cleared."""
+    report = {**vault_report(), "cleared": ["get_note"]}
+    admin.answers[("POST", "/review/notes/clear")] = (200, job_answer("queued"))
+    admin.answers[("GET", "/review/jobs/job-0001?wait=30")] = (
+        200,
+        job_answer("done", report=report, next=[]),
+    )
+    code, out, err = cli(["review", "notes", "--via", "vault", "--clear", "--socket", "x"])
+    assert admin.requests == [
+        ("POST", "/review/notes/clear", {}),
+        ("GET", "/review/jobs/job-0001?wait=30", None),
+    ]
+    assert admin.timeouts == [60.0, 40.0]
+    assert "cleared drift marks: get_note\n" in out
+    assert err == ""
+    assert code == review_view.EXIT_NEEDS_OPERATOR  # it still includes nothing
+
+
+def test_review_via_vault_clear_refused_shows_what_doesnt_match(admin: FakeAdmin) -> None:
+    """FM-28 at the CLI: a clear the gateway refused prints the review that found the tools
+    and exits 1, as ``--clear`` on the gateway's own socket does; ``clear_unsupported`` says
+    to run it in the gateway's container (exit 2)."""
+    report = {**vault_report(), "not_clean": ["get_note"]}
+    admin.answers[("POST", "/review/notes/clear")] = (200, job_answer("queued"))
+    refused = job_answer(
+        "failed",
+        report=report,
+        error="These still don't match their pins: get_note. No mark was cleared; review the "
+        "server again.",
+        reason="clear_not_clean",
+    )
+    admin.answers[("GET", "/review/jobs/job-0001?wait=30")] = (409, refused)
+    code, out, err = cli(["review", "notes", "--via", "vault", "--clear", "--socket", "x"])
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    assert err.startswith(
+        "zoeymcp review: --clear refused: These still don't match their pins: get_note."
+    )
+    assert out.startswith("server notes  (remote, vault path /notes/mcp")  # the review, printed
+    unsupported = {
+        "error": "The gateway is older than the vault: run zoeymcp review notes --clear in the "
+        "gateway's container.",
+        "reason": "clear_unsupported",
+    }
+    admin.answers[("POST", "/review/notes/clear")] = (409, unsupported)
+    code, out, err = cli(["review", "notes", "--via", "vault", "--clear", "--socket", "x"])
+    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert err == f"zoeymcp review: {unsupported['error']}\n"
+
+
 def test_a_reused_review_is_read_from_the_queue_answer(admin: FakeAdmin) -> None:
     admin.answers[("POST", "/review/notes")] = (
         200,
@@ -3831,7 +3885,7 @@ def test_a_review_job_still_running_when_the_wait_ends(
     ("argv", "message"),
     [
         (["review", "--via", "vault"], "through the vault, name the server to review"),
-        (["review", "notes", "--via", "vault", "--clear"], "--clear runs in the gateway's"),
+        (["review", "--via", "vault", "--clear"], "these options need a server"),
         (["review", "notes", "--via", "gateway", "--fresh"], "--fresh goes with --via vault"),
         (["review", "notes", "--fresh"], "--fresh goes with --via vault"),  # auto, on the gateway's
     ],

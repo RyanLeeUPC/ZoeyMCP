@@ -34,6 +34,7 @@ from pydantic import TypeAdapter, ValidationError
 from ..common import ledgerreport
 from ..common.policy.match import NormalizedPath, RequestRejected
 from ..common.policy.view import Digest
+from .reviewjobs import OLDER, WORKS, Work
 
 Identity = Literal["gateway", "egress"]
 Listener = Literal["gateway", "tcp"]
@@ -187,13 +188,15 @@ def wait_seconds(value: str, most: int) -> int:
     return min(int(seconds or "0"), most)
 
 
-def jobs_query(params: list[tuple[str, str]]) -> tuple[int, str]:
-    """A review jobs poll's ``(wait, view)``: ``view`` is required, the digest of the view the
-    gateway's policy client holds (``sha256:`` and 64 hex, CR-8); ``wait`` at most
-    :data:`REVIEW_WAIT`, or 0. Any other parameter, or one given twice, is refused."""
+def jobs_query(params: list[tuple[str, str]]) -> tuple[int, str, frozenset[Work]]:
+    """A review jobs poll's ``(wait, view, kinds)``: ``view`` is required, the digest of the view
+    the gateway's policy client holds (``sha256:`` and 64 hex, CR-8); ``wait`` at most
+    :data:`REVIEW_WAIT`, or 0; ``kinds`` the job kinds the gateway runs, ``review`` and then
+    ``clear`` if it runs clear jobs (M6 design J.4, G-8), or reviews only when it advertises
+    none, as an older gateway does. Any other parameter, or one given twice, is refused."""
     names = [name for name, _ in params]
-    if len(set(names)) != len(names) or not set(names) <= {"wait", "view"}:
-        raise RequestRejected("the review jobs path takes wait and view, once each")
+    if len(set(names)) != len(names) or not set(names) <= {"wait", "view", "kinds"}:
+        raise RequestRejected("the review jobs path takes wait, view and kinds, once each")
     given = dict(params)
     if "view" not in given:
         raise RequestRejected("the review jobs path needs the view's digest")
@@ -202,7 +205,13 @@ def jobs_query(params: list[tuple[str, str]]) -> tuple[int, str]:
     except ValidationError as exc:
         raise RequestRejected("view must be sha256: and 64 hex digits") from exc
     wait = wait_seconds(given["wait"], REVIEW_WAIT) if "wait" in given else 0
-    return wait, digest
+    kinds = OLDER
+    if "kinds" in given:
+        listed = given["kinds"].split(",")
+        if listed not in (["review"], ["review", "clear"]):
+            raise RequestRejected("kinds is review, or review,clear")
+        kinds = frozenset(work for work in WORKS if work in listed)
+    return wait, digest, kinds
 
 
 def allowlist_wait(params: list[tuple[str, str]]) -> int:

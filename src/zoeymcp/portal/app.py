@@ -76,6 +76,12 @@ address guard for the typed ``host:port``, is the ``onboard.discover_private`` a
 The review queues a job of the portal's surface for the gateway's poll (``POST
 /api/review/{server}``), answers a done job's rows (``portal/reviewview.py``), and makes
 fragment 2 from the operator's choices (``POST /api/review/jobs/{job}/diff``), saving nothing.
+A done job's answer and a review refusal carry ``next``, the way on (M6 design M.7, D-200).
+Clearing a server's drift marks (M6 design J.4) un-hides tools, so it is the ``tool.clear``
+action, whose run queues a clear job the page reads as it reads a review: the gateway lists the
+server again and clears its marks only if every included tool matches its pin, else the job
+fails ``clear_not_clean``. A server row names its included ``approve`` tools, for **Allow
+without asking**, which in declarative mode opens the review screen with that tool moved (J3).
 Home's attention list (M6 design M.7), ``GET /api/attention``, is what the gateway's status
 report says needs the operator, read from health's ``gateway`` section (``attention_items``).
 
@@ -136,9 +142,11 @@ from ..vault.oauth.pkce import FLOW_TTL, CallbackBinder
 from ..vault.onboard import OnboardError, check_request
 from ..vault.onboarding import (
     Listed,
+    job_next,
     listed_next,
     listed_server,
     listed_servers,
+    refusal_next,
     server_host_port,
     tools_max,
 )
@@ -310,6 +318,11 @@ ORPHAN_FLAGS: Final[Mapping[str, str]] = MappingProxyType(
 LEDGER_QUERY: Final = frozenset({"archive", "before", "limit"})
 # The MCP servers section (M7 K). The portal's review jobs are its own surface's (F.2).
 REVIEW_OWNER: Final[Owner] = "portal"
+# What tool.clear's plan says it will do (M6 design J.4).
+CLEAR_WORDS: Final = (
+    "The gateway lists the server's tools again and clears its drift marks only if every "
+    "included tool matches its pin; the tools the marks hid are then served again."
+)
 # A plan row's value is a validated URL at most (URL_MAX) with its label's words; a client ID is
 # at most the schema's 512 characters.
 ROW_LIMIT: Final = 2 * URL_MAX
@@ -1240,6 +1253,7 @@ class PortalApp:
                 self._plan_discover_private, self._run_discover_private
             ),
             "onboard.register": ActionKind(self._plan_register, self._run_register),
+            "tool.clear": ActionKind(self._plan_clear, self._run_clear),
         }
 
     def _plan_enrol(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
@@ -1890,7 +1904,7 @@ class PortalApp:
         try:
             job = await self._review_jobs().queue_review(server, REVIEW_OWNER, fresh=fresh)
         except ReviewRefused as exc:
-            return refusal(exc.reason, **exc.fields)
+            return _review_refusal(exc.reason, exc.fields, server)
         return Reply({**_job_view(job), "reused": job.state == "done"})
 
     async def _review_read(self, call: Call) -> Reply | Refusal:
@@ -1901,7 +1915,10 @@ class PortalApp:
             return job
         if job.report is not None:
             report = job.report.model_dump(mode="json", exclude_unset=True)
-            return Reply({**_job_view(job), **reviewview.rows(report)})
+            read = {**_job_view(job), **reviewview.rows(report)}
+            if job.work == "clear":  # the tools whose marks it cleared (M6 design J.4)
+                read["cleared_shown"] = [shown(name, NAME_LIMIT) for name in report["cleared"]]
+            return Reply(read)
         return Reply(_job_view(job))
 
     async def _review_diff(self, call: Call) -> Reply | Refusal:
@@ -1934,11 +1951,37 @@ class PortalApp:
         try:
             job = await self._review_jobs().review_job(call.params["job"], REVIEW_OWNER)
         except ReviewRefused as exc:
-            return refusal(exc.reason, **exc.fields)
+            return _review_refusal(exc.reason, exc.fields, None)
         if job.failure is not None:
-            refused = refusal(job.failure, **dict(job.fields))
-            return replace(refused, more=tuple(_job_view(job).items()))
+            refused = _review_refusal(job.failure, dict(job.fields), job.server)
+            return replace(refused, more=(*_job_view(job).items(), *refused.more))
         return job
+
+    def _plan_clear(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``tool.clear`` (M6 design J.4, Q26; Y27): a server of the running policy, remote or
+        toolkit. Whether its tools match their pins again is the gateway's to say, on a fresh
+        listing, when the job runs; the plan changes nothing."""
+        server = data["server"]
+        if not isinstance(server, str):
+            return refusal("bad_body")
+        if listed_server(self._policy(), server) is None:
+            return _review_refusal("review_unknown_server", {"server": server}, None)
+        summary = (
+            ("Clear the drift marks of", shown(server, NAME_LIMIT)),
+            ("What happens", CLEAR_WORDS),
+        )
+        return Plan(summary, (server,))
+
+    async def _run_clear(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """Queue the clear job: the page reads it as a review job, done with the marks cleared
+        or failed ``clear_not_clean`` with the tools that don't match; ``clear_unsupported``
+        while only an older gateway polls."""
+        server = data["server"]
+        try:
+            job = await self._review_jobs().queue_clear(server, REVIEW_OWNER)
+        except ReviewRefused as exc:
+            return _review_refusal(exc.reason, exc.fields, server)
+        return Reply(_job_view(job))
 
     def _onboard_service(self) -> OnboardService:
         if self.onboard is None:
@@ -2345,7 +2388,8 @@ def _health_section(
 
 
 # Home's attention list (M6 design M.7, N.4): at most this many items, and each server's in this
-# order, from the gateway's attention decision.
+# order, from the gateway's attention decision. A marked tool's action is a clear (J.4, J13); the
+# rest are a review.
 ATTENTION_MAX: Final = 64
 # A bridge's state is an item unless every connection is one of these (D-174's bridge half).
 BRIDGE_QUIET: Final = frozenset({"ready", "idle"})
@@ -2355,9 +2399,10 @@ def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
     """Home's list from a health report (M.7): per server the gateway reports, its drifted,
     missing and marked tools, the tools nobody reviewed, a blocked server and a bridge's state,
     each an item ``{kind, server_shown, count, text, action}`` whose one action is a review of
-    the server; at most :data:`ATTENTION_MAX`, with how many more. ``gateway`` says whether
-    health has a gateway section (a policy with a gateway), and ``reported_ago`` is the seconds
-    since the gateway's report, or None without one."""
+    the server, or for marked tools a clear of its marks (J.4); at most :data:`ATTENTION_MAX`,
+    with how many more. ``gateway`` says whether health has a gateway section (a policy with a
+    gateway), and ``reported_ago`` is the seconds since the gateway's report, or None without
+    one."""
     section = report.get("gateway")
     items: list[dict[str, Any]] = []
     for server in [] if section is None else section["servers"]:
@@ -2383,7 +2428,10 @@ def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
                         "server_shown": shown(name, NAME_LIMIT),
                         "count": count,
                         "text_shown": shown(text, SUMMARY_LIMIT),
-                        "action": {"kind": "review", "server": name},
+                        "action": {
+                            "kind": "clear" if kind == "marked" else "review",
+                            "server": name,
+                        },
                     }
                 )
     return {
@@ -2804,7 +2852,9 @@ def _onboarding_row(answer: Mapping[str, Any]) -> dict[str, Any]:
 
 def _server_row(listed: Listed) -> dict[str, Any]:
     """A server of the running policy as a row (K.1): its state, the tools it serves and to
-    which clients, and what to do next."""
+    which clients, its included ``approve`` tools (each with **Allow without asking**, M6 design
+    J3), and what to do next."""
+    approve = [name for name in listed.tools.approve if name in listed.tools.include]
     return {
         "server": listed.name,
         "name_shown": shown(listed.name, NAME_LIMIT),
@@ -2813,13 +2863,28 @@ def _server_row(listed: Listed) -> dict[str, Any]:
         "credential": listed.credential,
         "tools": len(listed.tools.include),
         "clients_shown": [shown(client, NAME_LIMIT) for client in listed.clients],
+        "approve": [{"name": name, "name_shown": shown(name, NAME_LIMIT)} for name in approve],
         "next": [step.answer() for step in listed_next(listed)],
     }
 
 
 def _job_view(job: Job) -> dict[str, Any]:
-    """A review job as the page polls it: never its digest or times."""
-    return {"job": job.id, "server_shown": shown(job.server, NAME_LIMIT), "state": job.state}
+    """A review job as the page polls it: never its digest or times; once done, its way on
+    (M6 design M.7, D-200)."""
+    view: dict[str, Any] = {
+        "job": job.id,
+        "server_shown": shown(job.server, NAME_LIMIT),
+        "state": job.state,
+    }
+    if job.state == "done":
+        view["next"] = [step.answer() for step in job_next(job.server, clear=job.work == "clear")]
+    return view
+
+
+def _review_refusal(reason: str, fields: Mapping[str, str], server: str | None) -> Refusal:
+    """A review job refusal, with its way on for ``server`` when it is about one (D-200)."""
+    steps = [step.answer() for step in refusal_next(server, reason)]
+    return replace(refusal(reason, **fields), more=(("next", steps),))
 
 
 def _session(call: Call) -> Session:

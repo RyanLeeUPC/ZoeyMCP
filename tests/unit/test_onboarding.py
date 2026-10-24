@@ -44,6 +44,7 @@ from zoeymcp.vault.onboarding import (
     NAME_SOURCES,
     ONBOARDING_TTL,
     ONBOARDINGS_MAX,
+    REVIEW_AGAIN,
     STDIN_SOURCE,
     Client,
     Committed,
@@ -57,12 +58,14 @@ from zoeymcp.vault.onboarding import (
     Served,
     allow_hosts,
     choose_names,
+    choose_next,
     client_options,
     committed_for,
     committed_next,
     default_name,
     fragment_file,
     in_use,
+    job_next,
     listed_next,
     listed_server,
     listed_servers,
@@ -70,7 +73,9 @@ from zoeymcp.vault.onboarding import (
     name_taken,
     next_for,
     onboard_again,
+    refusal_next,
     remove_first,
+    review_again,
     reviewed_next,
     secret_names,
     served_at,
@@ -1433,6 +1438,57 @@ def test_the_second_runs_steps() -> None:
     ]
     assert [step.answer() for step in committed_next(found, "stored")] == review
     assert [step.answer() for step in committed_next(found, "seeded")] == review
+    # A finished review job's way on is the same choosing (M6 design M.7, D-200); a clear's is
+    # nothing.
+    assert [step.answer() for step in choose_next("s")] == review
+    assert job_next("s", clear=False) == choose_next("s")
+    assert job_next("s", clear=True) == ()
+
+
+AGAIN = {
+    "do": "review",
+    "label": "Review again",
+    "command": "zoeymcp review notes --via vault --fresh",
+    "via": "exec",
+}
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "review_busy",
+        "review_jobs_full",
+        "review_stale",
+        "review_timeout",
+        "review_failed",
+        "review_invalid",
+        "review_too_large",
+        "pin_mismatch",
+        "clear_not_clean",
+    ],
+)
+def test_a_review_refusal_a_fresh_review_answers(reason: str) -> None:
+    """D-200: each refusal whose way on is a fresh review names it, never the finished one."""
+    assert reason in REVIEW_AGAIN
+    assert [step.answer() for step in refusal_next("notes", reason)] == [AGAIN]
+    assert refusal_next(None, reason) == ()
+
+
+def test_the_other_review_refusals_way_on() -> None:
+    """A clear the gateway can't run is the gateway's own --clear, in its container; a name the
+    policy lacks, no poller or an unknown job leave nothing for a command to do."""
+    assert len(REVIEW_AGAIN) == 9
+    assert [step.answer() for step in refusal_next("notes", "clear_unsupported")] == [
+        {
+            "do": "clear",
+            "label": "Clear the marks in the gateway's container",
+            "command": "zoeymcp review notes --clear",
+        }
+    ]
+    assert refusal_next(None, "clear_unsupported") == ()
+    for reason in ("review_unknown_server", "review_unavailable", "job_unknown", "bad_body"):
+        assert refusal_next("notes", reason) == (), reason
+    assert review_again("notes").answer() == AGAIN
 
 
 def test_what_to_remove_before_onboarding_a_url_already_served() -> None:

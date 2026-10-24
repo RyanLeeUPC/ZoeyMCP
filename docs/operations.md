@@ -604,6 +604,13 @@ reviewed: ..."), where it exited 0 before. Record the tools you leave out once, 
 policy with a `declined` block needs the gateway on M6 too: recreate the vault first, then the
 gateway.
 
+**Upgrading to M6: clearing marks.** An M6 gateway's review polls say which job kinds it runs
+(`kinds=review,clear`), and an M7 vault refuses that query: the gateway's polls back off and
+retry until the vault is on M6, so recreate the vault first, then the gateway. Until the gateway
+is on M6 too, it runs review jobs only, and clearing marks through the vault (the portal's
+**Clear the marks**, or `review --via vault --clear`) is refused `clear_unsupported`: run
+`zoeymcp review <server> --clear` in the gateway's container instead.
+
 ## 8. Provider notes
 
 **Any provider.** A `token_url` or `authorize_url` may carry a query, such as a tenant or a
@@ -1165,15 +1172,24 @@ container (both tiers: `docker compose -f deploy/compose.hardened.yaml exec vaul
 notes --via vault`, or `docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes
 --via vault`), and the second `login --mcp`. `--via auto`, the default, takes the gateway's admin
 socket when the container has it, as the standard tier's does, else the vault's; `--via gateway`
-is the review over the gateway's socket as before, and `--clear` and the summary (`review` with
-no server) are only that. One review runs at a time in the gateway, a job's or the socket's.
-Behind it are the admin socket's routes: `POST /review/<server>` queues a review of a remote or toolkit server in the running policy, or
-answers the CLI's finished review of it at the current policy view again (send `{"fresh": true}` for
-a new one); `GET /review/jobs/<job>?wait=N` (at most 30 s) answers the job's state, and its report
-once it is done; `POST /review/jobs/<job>/diff` makes fragment 2 from `{"include": [...], "allow":
-[...], "approve": [...]}` (and `"indent"`, 0 to 16 or `"compose"`), as the portal's review screen
-does, saving nothing, or refuses `review_stale` when the server's tools, pins or declines in the
-running policy changed since the review. At most two reviews are under way at once, one per server. A queue call is refused
+is the review over the gateway's socket as before, and the summary (`review` with no server) is
+only that. `review <server> --via vault --clear` queues a clear job: the gateway lists the server
+again and clears its drift marks only if every included tool matches its pin, as `--clear` on its
+own socket does, and otherwise refuses `clear_not_clean`, naming the tools, with the review that
+found them (exit 1). One review runs at a time in the gateway, a job's or the socket's.
+Behind it are the admin socket's routes: `POST /review/<server>` queues a review of a remote or
+toolkit server in the running policy, or answers the CLI's finished review of it at the current
+policy view again (send `{"fresh": true}` for a new one); `POST /review/<server>/clear` queues a
+clear of its marks, always a new job; `GET /review/jobs/<job>?wait=N` (at most 30 s) answers the
+job's state, and its report once it is done; `POST /review/jobs/<job>/diff` makes fragment 2 from
+`{"include": [...], "allow": [...], "approve": [...]}` (and `"indent"`, 0 to 16 or `"compose"`),
+as the portal's review screen does, saving nothing, or refuses `review_stale` when the server's
+tools, pins or declines in the running policy changed since the review. A finished job's answer
+and every refusal carry `next`, the way on: after a review, choosing its tools; after a refusal
+that a fresh review answers, `zoeymcp review <server> --via vault --fresh`. A clear job goes only
+to a gateway whose polls say it runs one (`kinds=review,clear`); while an older gateway polls, a
+clear is refused `clear_unsupported`, and its review jobs work as before. At most two reviews
+are under way at once, one per server. A queue call is refused
 `review_unavailable` while the gateway isn't polling (no poll waiting, no review it took still
 running, and no poll or result in the last 15 s); in the first 45 s after the vault starts it waits
 for the gateway's first poll instead. A job the gateway doesn't take within 60 s, because it holds
@@ -1187,8 +1203,8 @@ read at all, and the review fails `review_too_large`, naming the cap. Its log li
 
 | Event | Fields |
 | --- | --- |
-| `review_requested` | `server`, `job` (the first 8 hex digits of the job ID's SHA-256), `owner` (`cli` or `portal`), `reused` (a finished review handed back) |
-| `review_reported` | `server`, `job`, `tools` (how many the report lists); or, when the gateway couldn't review it, `reason` (`review_failed`, or `review_too_large` when the vault refused its report as too large) and the gateway's `code` |
+| `review_requested` | `server`, `job` (the first 8 hex digits of the job ID's SHA-256), `owner` (`cli` or `portal`), `reused` (a finished review handed back); `clear: true` for a clear job |
+| `review_reported` | `server`, `job`, `tools` (how many the report lists); or, when the gateway couldn't review it, `reason` (`review_failed`, or `review_too_large` when the vault refused its report as too large) and the gateway's `code`; `clear: true` for a clear job, and `reason` `clear_not_clean`, with `tools`, when the gateway refused the clear and posted the review that found the tools |
 | `review_refused` | `reason` (`job_unknown`, `review_invalid` or `pin_mismatch`), with `server` and `job` for a known job, and `tools` (how many pins differ) for `pin_mismatch` |
 | `review_unavailable` | `server`: a queue call refused because the gateway isn't polling, or the vault is stopping |
 | `review_stale` | `server`, `job`: the gateway didn't take it within 60 s |
@@ -1206,7 +1222,7 @@ poll that fails backs off from 1 s up to 30 s. Its log lines:
 | Event | Fields |
 | --- | --- |
 | `review_job_started` | `server`, `job` |
-| `review_job_done` | `server`, `job`, `outcome`: `done`, or `failed` (the gateway's review couldn't run, and its error was posted), or `review_invalid` or `pin_mismatch` (the vault refused the report, logged at `error`) |
+| `review_job_done` | `server`, `job`, `outcome`: `done`, or `failed` (the gateway's review couldn't run, and its error was posted; or it refused a clear job and posted the review that found the tools, which the vault failed `clear_not_clean`), or `review_invalid` or `pin_mismatch` (the vault refused the report, logged at `error`) |
 | `review_job_post_failed` | `server`, `job`, `outcome`: `job_unknown` (the vault restarted, or the job ended), or why the last try failed |
 | `review_poll_failed` | `reason`: why a poll failed, at most once a minute |
 
@@ -1216,7 +1232,10 @@ None holds a job's ID, a tool's name or definition, or anything else from a repo
 
 When an included tool's definition changes, the gateway hides it from every client of the
 server, logs `tool_drift` (with the members that changed), and marks it. The mark holds even if
-the server changes the tool back: a server that changed a tool once can do it again.
+the server changes the tool back: a server that changed a tool once can do it again. Marks that
+go log `drift_cleared`, with `server`, `tools` (the marks cleared) and `by`: `review` (`--clear`
+on the gateway's socket), `portal` (a clear job through the vault: the portal's **Clear the
+marks**, or `review --via vault --clear`), or `policy` (a reload that changed the pin).
 
 ```text
 $ zoeymcp review notes
@@ -1252,7 +1271,16 @@ server no longer marks read-only says approve is proposed, and ticking the box c
 its row; choose allow there to keep it, and the fragment says you kept it (`# kept: <tool> (allow: ...)`), as `--repin` does.
 **Generate** gives fragment 2 with the new pin and a `# changed:` line; commit it and reload, and
 the mark clears when the pin changes. A tool that flipped back to its reviewed definition reads
-`marked`, and its mark stays until `review --clear`.
+`marked`, and its mark stays until it is cleared: **Clear the marks** under the tools (enabled
+once every included tool matches its pin), on the server's row, or on Home's item, asks for your
+passkey, then the gateway lists the server again and clears the marks only if every included tool
+still matches (else the portal names those that don't: `clear_not_clean`), as `review --clear`
+does.
+
+**Allow without asking** (declarative mode). Each server row has a button per included `approve`
+tool. It opens the review screen with that tool moved to `allow` on its row; Generate's fragment
+says so (`# changed: <tool> (approve -> allow: calls to <tool> will run with no prompt)`), and
+the move takes effect once you commit it and reload. **Select suggested** never moves a tool.
 
 **Declined tools in the portal.** **Decline** on a tool's row leaves it out and records it under
 the server's `declined` at the definition shown; **Record the rest as declined** (ticked by
@@ -1295,8 +1323,8 @@ reads it: it is shown, labelled as what the gateway reports.
   come from the one decision, so a server `review <server>` exits 1 for has a finding here.
 - **The portal's Home page** lists the same, per server, under the checklist: drifted, missing
   and marked tools, the tools nobody reviewed, a blocked server, and a bridge's state while it
-  isn't ready, each with **Review**, which opens the MCP servers page (at most 64 items; the
-  rest are in `zoeymcp health`).
+  isn't ready, each with **Review**, which opens the MCP servers page, or, for marked tools,
+  **Clear the marks** (§12) (at most 64 items; the rest are in `zoeymcp health`).
 - The upstream reports a tool it can't serve under the name it lists, which often isn't a tool
   name: those are counted, not named. A report the vault can't read for one server leaves that
   server out (`server_listing_invalid`) and keeps the rest.
@@ -2203,6 +2231,8 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `review_stale` | The policy changed since this review (a reload): the gateway didn't take it within 60 seconds, holding another version, or the server's tools changed since its report. Review again once the gateway has caught up. |
 | 504 | `review_timeout` | The gateway took the review but sent no result within 2 minutes. Check the gateway's log, then review again. |
 | 502 | `review_failed` | The gateway couldn't review the server (`<code>`). Its log says why; review again once that is fixed. |
+| 409 | `clear_unsupported` | The gateway is older than the vault: run zoeymcp review `<server>` --clear in the gateway's container. |
+| 409 | `clear_not_clean` | These still don't match their pins: `<tools>`. No mark was cleared; review the server again. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

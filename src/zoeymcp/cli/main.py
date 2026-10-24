@@ -1421,20 +1421,24 @@ def _review_through_vault(
     err: TextIO,
 ) -> int:
     """``review <server> --via vault`` (M7 design F.5): the gateway's review, as a job the vault
-    queued and the gateway ran, printed as the gateway's own answer is."""
+    queued and the gateway ran, printed as the gateway's own answer is; with ``--clear``, a
+    clear job (M6 design J.4), refused as the gateway's own ``--clear`` is when an included
+    tool doesn't match its pin."""
     if args.server is None:
         # The summary is the gateway's status, which only its own socket answers.
         err.write("zoeymcp review: through the vault, name the server to review\n")
         return review_view.EXIT_COULD_NOT_RUN
-    if args.clear:
-        err.write("zoeymcp review: --clear runs in the gateway's container, with --via gateway\n")
-        return review_view.EXIT_COULD_NOT_RUN
     choices = _review_choices(args)
     try:
         job = review_view.vault_review(
-            admin_client.socket_path(args.socket), args.server, fresh=args.fresh
+            admin_client.socket_path(args.socket), args.server, fresh=args.fresh, clear=args.clear
         )
     except admin_client.AdminUnavailable as exc:
+        if exc.reason == "clear_not_clean" and isinstance(exc.data.get("report"), dict):
+            # The gateway refused the clear: show what doesn't match, as --via gateway does.
+            err.write(f"zoeymcp review: --clear refused: {review_view.untrusted(exc)}\n")
+            code = _review_output(exc.data["report"], choices, args, out, err)
+            return max(code, review_view.EXIT_NEEDS_OPERATOR)
         err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
         return review_view.EXIT_COULD_NOT_RUN
     except review_view.StillRunning:

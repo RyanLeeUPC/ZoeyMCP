@@ -497,6 +497,18 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "The gateway couldn't review the server ({code}). Its log says why; review again "
             "once that is fixed.",
         ),
+        # Clearing a server's drift marks (M6 design J.4; vault/reviewjobs.py maps the gateway's
+        # not_clean to clear_not_clean, CR-8).
+        "clear_unsupported": Entry(
+            409,
+            "The gateway is older than the vault: run zoeymcp review {server} --clear in the "
+            "gateway's container.",
+        ),
+        "clear_not_clean": Entry(
+            409,
+            "These still don't match their pins: {tools}. No mark was cleared; review the server "
+            "again.",
+        ),
     }
 )
 

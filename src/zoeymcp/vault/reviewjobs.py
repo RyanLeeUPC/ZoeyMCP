@@ -22,12 +22,19 @@ holds the jobs in the vault's memory, on a monotonic clock:
   which become ``sent``. A job no poll at its digest claims within :data:`QUEUE_TTL` fails
   ``review_stale`` (FM-12, FM-15); a claimed one with no result within :data:`CLAIM_DEADLINE`
   fails ``review_timeout`` (FM-13).
+- **Clear jobs** (M6 design J.4, G-8): a job is a review or a ``clear``, which asks the gateway to
+  list the server again and clear its drift marks only if every included tool matches its pin.
+  A poll advertises the kinds it runs (``kinds=review,clear``), and a clear job is offered only to
+  one that advertised ``clear``; an older gateway advertises nothing and gets review jobs only,
+  so a clear asked while only it polls is refused ``clear_unsupported`` (FM-29). A clear is never
+  handed back done, and leaves the server's finished reviews alone.
 - **The result**: :func:`read_result` reads a post, its report with
   :func:`.reviewreport.read`, which refuses the whole of it ``review_invalid`` or
   ``pin_mismatch`` (X11); then :meth:`JobTable.post` ends the job it names, which must be
   ``sent``, once (``job_unknown`` otherwise, FM-14). A refused report, and a gateway's
-  ``error``, end the job ``failed``. A finished job stays readable for
-  :data:`RESULT_TTL` seconds, so a hundred tools can be classified before it goes.
+  ``error``, end the job ``failed``; so does a clear the gateway refused, its ``not_clean``
+  mapped to the portal's ``clear_not_clean`` here and nowhere else (CR-8). A finished job stays
+  readable for :data:`RESULT_TTL` seconds, so a hundred tools can be classified before it goes.
 
 A job's ID is 256 random bits, compared in constant time, never logged (only :attr:`Job.hash8`,
 M.4) and refused by the logger. Nothing here does I/O; the clock and the ID source are injected.
@@ -71,13 +78,30 @@ _ERROR_STATUS: Final = range(400, 600)
 
 # What a queue call, a read or a post is refused with.
 Reason = Literal[
-    "review_busy", "review_unknown_server", "job_unknown", "review_jobs_full", "review_unavailable"
+    "review_busy",
+    "review_unknown_server",
+    "job_unknown",
+    "review_jobs_full",
+    "review_unavailable",
+    "clear_unsupported",
 ]
 Owner = Literal["cli", "portal"]
 State = Literal["queued", "sent", "done", "failed"]
-# Why a job failed: on the clock, by the gateway, or a report the vault refused.
-Failure = Literal["review_stale", "review_timeout", "review_failed"] | reviewreport.Reason
+# Why a job failed: on the clock, by the gateway, a report the vault refused, or a clear the
+# gateway refused because an included tool doesn't match its pin.
+Failure = (
+    Literal["review_stale", "review_timeout", "review_failed", "clear_not_clean"]
+    | reviewreport.Reason
+)
 ServerKind = Literal["remote", "toolkit"]
+# What a job asks the gateway to run (M6 design J.4): a review, or a clear of the server's marks.
+Work = Literal["review", "clear"]
+WORKS: Final[tuple[Work, ...]] = ("review", "clear")
+# What a poll that advertises no kinds runs: an older gateway's, reviews only (G-8).
+OLDER: Final[frozenset[Work]] = frozenset({"review"})
+# The portal's name for the gateway's ``not_clean`` (a clear it refused: gateway/review.py, whose
+# admin socket and ``zoeymcp review --clear`` keep the word), mapped in _cleared() only (CR-8).
+CLEAR_NOT_CLEAN: Final[Failure] = "clear_not_clean"
 _ACTIVE: Final = ("queued", "sent")
 _FINISHED: Final = ("done", "failed")
 
@@ -95,7 +119,9 @@ class ReviewRefused(Exception):
 @dataclass(frozen=True, repr=False)
 class Job:
     """One review job. ``digest`` is the view digest it was queued at; ``report`` is set when it
-    is ``done``, ``failure`` (with the ``fields`` its refusal names) when it ``failed``."""
+    is ``done`` (and when a clear failed ``clear_not_clean``: the review that found it),
+    ``failure`` (with the ``fields`` its refusal names) when it ``failed``. ``work`` is what the
+    gateway runs for it, a review or a clear."""
 
     id: str
     server: str
@@ -109,6 +135,7 @@ class Job:
     report: RemoteReport | ToolkitReport | None = None
     failure: Failure | None = None
     fields: tuple[tuple[str, str], ...] = ()
+    work: Work = "review"
 
     @property
     def hash8(self) -> str:
@@ -169,6 +196,7 @@ class JobTable:
         self._ended: list[Ended] = []
         self._waiting = 0
         self._last_poll: float | None = None
+        self._kinds = OLDER
 
     def now(self) -> float:
         return self._clock()
@@ -180,8 +208,15 @@ class JobTable:
         """How many polls are waiting now."""
         return self._waiting
 
-    def poll_began(self) -> None:
+    @property
+    def kinds(self) -> frozenset[Work]:
+        """What the latest poll advertised it runs: reviews only before any poll."""
+        return self._kinds
+
+    def poll_began(self, kinds: frozenset[Work] = OLDER) -> None:
+        """A poll began, advertising ``kinds`` (an older gateway advertises none: reviews)."""
         self._waiting += 1
+        self._kinds = kinds
 
     def poll_ended(self) -> None:
         self._waiting -= 1
@@ -225,11 +260,13 @@ class JobTable:
         servers: Mapping[str, ServerKind],
         *,
         fresh: bool = False,
+        work: Work = "review",
     ) -> Job | Wait:
         """A job for ``server``, one of the running view's ``servers`` (name to kind), queued at
-        ``digest``, or the owner's surface's ``done`` one at that digest unless ``fresh``. Raises
-        ``review_unknown_server``, ``review_busy``, ``review_jobs_full`` or
-        ``review_unavailable``; :class:`Wait` means ask again once the first poll came or the
+        ``digest``, or the owner's surface's ``done`` review at that digest unless ``fresh``; a
+        ``clear`` is always queued anew. Raises ``review_unknown_server``, ``review_busy``,
+        ``review_jobs_full``, ``review_unavailable`` or, for a clear the polling gateway doesn't
+        run, ``clear_unsupported``; :class:`Wait` means ask again once the first poll came or the
         grace ended. Nothing is queued on a refusal or a wait."""
         self._expire()
         kind = servers.get(server)
@@ -238,13 +275,14 @@ class JobTable:
                 "review_unknown_server", "no remote or toolkit server by that name", server=server
             )
         jobs = list(self._jobs.values())
-        if not fresh:
+        if not fresh and work == "review":
             for job in jobs:
-                if (job.server, job.owner, job.digest, job.state) == (
+                if (job.server, job.owner, job.digest, job.state, job.work) == (
                     server,
                     owner,
                     digest,
                     "done",
+                    "review",
                 ):
                     return job
         active = [job for job in jobs if job.state in _ACTIVE]
@@ -257,8 +295,14 @@ class JobTable:
         wait = self.availability()
         if wait is not None:
             return wait
+        if work not in self._kinds:
+            raise ReviewRefused(
+                "clear_unsupported", "the polling gateway runs no clear jobs", server=server
+            )
         for job in jobs:
-            if job.server == server and job.owner == owner and job.state in _FINISHED:
+            if (job.server, job.owner, job.work) == (server, owner, work) and (
+                job.state in _FINISHED
+            ):
                 del self._jobs[job.id]
         job = Job(
             id=self._token(ID_BYTES),
@@ -267,22 +311,24 @@ class JobTable:
             owner=owner,
             digest=digest,
             queued_at=self._clock(),
+            work=work,
         )
         self._jobs[job.id] = job
         return job
 
-    def offered(self, digest: str) -> bool:
-        """Whether a job is queued at ``digest``, for a poll there to claim."""
+    def offered(self, digest: str, kinds: frozenset[Work] = OLDER) -> bool:
+        """Whether a job of ``kinds`` is queued at ``digest``, for a poll there to claim."""
         self._expire()
-        return any(job.state == "queued" and job.digest == digest for job in self._jobs.values())
+        return any(_takes(job, digest, kinds) for job in self._jobs.values())
 
-    def claim(self, digest: str) -> tuple[Job, ...]:
-        """Every job queued at ``digest``, now ``sent``, in the order they were queued."""
+    def claim(self, digest: str, kinds: frozenset[Work] = OLDER) -> tuple[Job, ...]:
+        """Every job of ``kinds`` queued at ``digest``, now ``sent``, in the order they were
+        queued: a poll that advertised no ``clear`` never takes a clear job."""
         self._expire()
         now = self._clock()
         claimed = []
         for job in list(self._jobs.values()):
-            if job.state == "queued" and job.digest == digest:
+            if _takes(job, digest, kinds):
                 claimed.append(self._put(replace(job, state="sent", sent_at=now)))
         return tuple(claimed)
 
@@ -316,8 +362,9 @@ class JobTable:
         """End the ``sent`` job ``result`` is for (:meth:`sent` refuses any other): ``done``
         with its report, or ``failed`` with the gateway's error or the report's refusal. A
         report of another server, or of another kind, is ``review_invalid``; the gateway's
-        ``review_too_large`` fails the job so, with the vault's cap. The post is the poller's
-        last sign of life."""
+        ``review_too_large`` fails the job so, with the vault's cap. A clear job's report is
+        read by :meth:`_cleared`, and a review job's that clears anything is ``review_invalid``.
+        The post is the poller's last sign of life."""
         job = self.sent(result.job)
         self._last_poll = self._clock()
         if result.refused is not None:
@@ -331,6 +378,26 @@ class JobTable:
         if result.server != job.server or report.server != job.server or report.kind != job.kind:
             detail = "at server (another server's report, or another kind's)"
             return self._refused(job, ReportRefused("review_invalid", detail))
+        if job.work == "clear":
+            return self._cleared(job, report)
+        if report.cleared is not None or report.not_clean is not None:
+            detail = "at cleared (a review job's report clears nothing)"
+            return self._refused(job, ReportRefused("review_invalid", detail))
+        done = replace(job, state="done", ended_at=self._clock(), report=report)
+        return Posted(self._put(done))
+
+    def _cleared(self, job: Job, report: RemoteReport | ToolkitReport) -> Posted:
+        """A clear job's report (J.4): it ends ``done`` with the tools whose marks the gateway
+        ``cleared``; the gateway's ``not_clean``, its refusal to clear while an included tool
+        doesn't match its pin, fails it ``clear_not_clean``, the portal's name for it (CR-8),
+        naming the tools and keeping the review that found them. A report with neither, or
+        both, is ``review_invalid``."""
+        if (report.cleared is None) == (report.not_clean is None):
+            detail = "at cleared (a clear job's report says what it cleared, or what didn't match)"
+            return self._refused(job, ReportRefused("review_invalid", detail))
+        if report.not_clean is not None:
+            tools = _named(tuple(report.not_clean))
+            return Posted(self._fail(job, CLEAR_NOT_CLEAN, report=report, tools=tools))
         done = replace(job, state="done", ended_at=self._clock(), report=report)
         return Posted(self._put(done))
 
@@ -353,19 +420,24 @@ class JobTable:
 
     def _refused(self, job: Job, refusal: ReportRefused) -> Posted:
         if refusal.reason == "pin_mismatch":
-            shown = refusal.tools[:TOOLS_SHOWN]
-            more = len(refusal.tools) - len(shown)
-            tools = ", ".join(shown) + (f" and {more} more" if more > 0 else "")
-            return Posted(self._fail(job, "pin_mismatch", tools=tools), refusal)
+            return Posted(self._fail(job, "pin_mismatch", tools=_named(refusal.tools)), refusal)
         return Posted(self._fail(job, refusal.reason, detail=refusal.detail), refusal)
 
-    def _fail(self, job: Job, failure: Failure, **fields: str) -> Job:
+    def _fail(
+        self,
+        job: Job,
+        failure: Failure,
+        *,
+        report: RemoteReport | ToolkitReport | None = None,
+        **fields: str,
+    ) -> Job:
         failed = replace(
             job,
             state="failed",
             ended_at=self._clock(),
             failure=failure,
             fields=tuple(fields.items()),
+            report=report,
         )
         return self._put(failed)
 
@@ -408,6 +480,18 @@ class Result:
     code: str | None = None
     refused: ReportRefused | None = None
     too_large: str | None = None
+
+
+def _takes(job: Job, digest: str, kinds: frozenset[Work]) -> bool:
+    """Whether a poll at ``digest`` that runs ``kinds`` claims ``job``."""
+    return job.state == "queued" and job.digest == digest and job.work in kinds
+
+
+def _named(tools: tuple[str, ...]) -> str:
+    """Tools as a refusal names them: the first :data:`TOOLS_SHOWN`, and how many more."""
+    shown = tools[:TOOLS_SHOWN]
+    more = len(tools) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
 
 
 def named_job(data: object) -> str:

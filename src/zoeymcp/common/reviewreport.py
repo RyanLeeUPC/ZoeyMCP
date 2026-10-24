@@ -11,8 +11,10 @@ the policy's pin names, from the gateway's definition store; the policy block's 
 ``declined`` maps, the server's pins and declines the review ran under; a remote report's
 ``offered``, what the upstream advertises beyond tools (fold-in 3.8); and both kinds'
 ``attention``, the attention decision for the listing (J.5), with the ``declined`` state for a
-tool the policy declined at the pin it has. Each has a default, so a report from an M7 gateway,
-which writes none of them, still reads (CR-6).
+tool the policy declined at the pin it has. A clear job's report (J.4) says what it did: the tools
+whose drift marks it ``cleared``, or the included tools that didn't match their pins
+(``not_clean``, the gateway's refusal to clear). Each has a default, so a report from an M7
+gateway, which writes none of them, still reads (CR-6).
 
 :func:`read` takes one report under the running limits: the model, the caps that follow
 ``gateway.limits`` (GR-30), then the integrity check (fold-in C25, X11), which recomputes every
@@ -220,6 +222,9 @@ class RemoteReport(_Model):
     clean: bool
     offered: Offered | None = None  # none when the gateway didn't see the handshake, or is M7's
     attention: Attention | None = None  # none from an M7 gateway
+    # A clear job's outcome (M6 J.4): the marks it cleared, or the tools that don't match.
+    cleared: Names | None = None
+    not_clean: Names | None = None
 
 
 class ToolkitReport(_Model):
@@ -238,6 +243,8 @@ class ToolkitReport(_Model):
     tools: Annotated[list[ToolkitEntry], Field(max_length=2 * NAMES_MAX)]
     clean: bool
     attention: Attention | None = None  # none from an M7 gateway
+    cleared: Names | None = None  # a clear job's outcome (M6 J.4), as a remote report's
+    not_clean: Names | None = None
 
 
 ReviewReport = Annotated[RemoteReport | ToolkitReport, Field(discriminator="kind")]

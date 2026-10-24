@@ -387,10 +387,13 @@ def test_a_request_the_registry_or_the_plan_refuses(rig: PortalRig) -> None:
     assert refused("passkey.enrol", {"name": "x", "extra": 1}) == (400, "bad_body")
     assert refused("passkey.rename", {"name": "x"}) == (400, "bad_body")
     # Every registered kind is built (ledger.restart was M5's last; M7's step 14a built
-    # onboard.register and onboard.discover_private), so none answers bad_body for being a later
-    # step's.
+    # onboard.register and onboard.discover_private; M6's step 9, tool.clear), so none answers
+    # bad_body for being a later step's.
     assert rig.app.action_kinds == set(KINDS)
     assert refused("ledger.restart", {"x": 1}) == (400, "bad_body")
+    assert refused("tool.clear", {}) == (400, "bad_body")
+    assert refused("tool.clear", {"server": "notes", "kind": "tool"}) == (400, "bad_body")
+    assert refused("tool.clear", {"server": ["notes"]}) == (400, "bad_body")
     # Each kind's cap: 4 KiB for a passkey's (M.1), within the route's 128 KiB.
     assert refused("passkey.enrol", {"name": "x" * 5000}) == (413, "too_large")
     assert refused("passkey.enrol", {"name": "a\tb"}) == (400, "bad_name")

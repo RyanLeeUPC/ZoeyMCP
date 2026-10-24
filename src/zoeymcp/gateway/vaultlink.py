@@ -476,12 +476,14 @@ def report_client(
 
 REVIEW_JOBS_PATH = "/_zoeymcp/gateway/v1/review/jobs"
 REVIEW_REPORT_PATH = "/_zoeymcp/gateway/v1/report/review"
-REVIEW_QUERY_KEYS = frozenset({"wait", "view"})
+# ``kinds``: the job kinds the poller runs, a clear among them (M6 design J.4).
+REVIEW_QUERY_KEYS = frozenset({"wait", "view", "kinds"})
 REVIEW_MAX_ANSWER_BYTES = 4096  # a list of jobs, a job's state, or a refusal (M7 design F.3)
 
 
 def _jobs_query(query: bytes) -> bool:
-    """A jobs poll's query: ``wait`` and ``view``, each at most once, and nothing else."""
+    """A jobs poll's query: ``wait``, ``view`` and ``kinds``, each at most once, and nothing
+    else."""
     try:
         params = parse_qsl(query.decode("ascii"), keep_blank_values=True, strict_parsing=True)
     except (UnicodeDecodeError, ValueError):
@@ -492,8 +494,8 @@ def _jobs_query(query: bytes) -> bool:
 
 class _ReviewOnly(httpx2.AsyncBaseTransport):
     """The review poller's transport (M7 design F.3): a GET of exactly the jobs path, with only
-    the ``wait`` and ``view`` query keys, or a POST of exactly the review report path, on the
-    link's scheme, host and port, and nothing else. An answer is cut off past
+    the ``wait``, ``view`` and ``kinds`` query keys, or a POST of exactly the review report path,
+    on the link's scheme, host and port, and nothing else. An answer is cut off past
     :data:`REVIEW_MAX_ANSWER_BYTES`."""
 
     def __init__(self, inner: httpx2.AsyncBaseTransport, link: Link) -> None:

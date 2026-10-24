@@ -75,6 +75,9 @@ KINDS: Final[dict[str, Kind]] = {
         Kind(
             "onboard.register", BODY_SECRET, frozenset({"onboarding"}), frozenset({"client_secret"})
         ),
+        # M6 J.4: clearing a server's drift marks un-hides its tools, so it is stepped up (Y27);
+        # its run queues a clear job, which the gateway runs only if every included tool matches.
+        Kind("tool.clear", _DEFAULT_CAP, frozenset({"server"})),
     )
 }
 

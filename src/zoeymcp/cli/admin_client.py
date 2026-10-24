@@ -359,6 +359,16 @@ def review_queue(
     return _request(socket, "POST", path, {"fresh": fresh}, transport, REVIEW_QUEUE_TIMEOUT)
 
 
+def review_clear(
+    socket: str, server: str, *, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Queue a clear of ``server``'s drift marks for the gateway's poll (M6 design J.4): ``{job,
+    server, state}``, always a new job, read as a review job is. A queue call may wait for the
+    gateway's first poll after the vault started."""
+    path = f"/review/{quote(server, safe='')}/clear"
+    return _request(socket, "POST", path, {}, transport, REVIEW_QUEUE_TIMEOUT)
+
+
 def review_job(
     socket: str, job: str, *, wait: int, transport: httpx.BaseTransport | None = None
 ) -> dict[str, Any]:

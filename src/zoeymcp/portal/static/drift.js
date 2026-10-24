@@ -1,22 +1,42 @@
 // Home's attention list (M6 design M.7, K.1), what the gateway reports on the MCP servers rows, and
-// the review screen's drift columns and controls (J.2, J.3), drawn through review.js's hooks. Like
-// app.js it holds no decision: the vault builds every item from the gateway's status report and
-// the one attention decision (J.5), and every row, its two definitions and their diff from the
-// review's report, each string shown through textContent. It uses app.js's API and guard()
-// (window.zoeyPortal), and review.js calls it when it draws (window.zoeyDrift).
+// the review screen's drift columns and controls (J.2, J.3), drawn through review.js's hooks; and
+// Clear the marks and Allow without asking (J.4, J3, J13). Like app.js it holds no decision: the
+// vault builds every item from the gateway's status report and the one attention decision (J.5),
+// and every row, its two definitions and their diff from the review's report, each string shown
+// through textContent; a clear is the vault's tool.clear action, and the gateway's own check. It
+// uses app.js's API, step-up and guard() (window.zoeyPortal), and review.js calls it when it draws
+// (window.zoeyDrift).
 "use strict";
 
 (function () {
-  const { api, button } = window.zoeyPortal;
+  const { api, fill, afterFailure, button, prepare, closeConfirm } = window.zoeyPortal;
 
   // The buttons for an item's action; an unknown kind draws none.
-  const ACTION_TEXT = { review: "Review" };
+  const ACTION_TEXT = { review: "Review", clear: "Clear the marks" };
   const MISSING = "The gateway no longer has the reviewed copy: the new definition is shown whole.";
   // A re-pinned allow tool whose new definition the server no longer marks read-only (Q8).
   const PROPOSED = "The new definition isn't marked read-only: approve is proposed. Choose " +
     "allow above to keep it, and the fragment says you kept it.";
   // What accepting it chooses: the stricter classification, never a move toward allow (Q27-1).
   const APPROVE = "approve";
+  // Allow without asking moves one included approve tool, the one whose button was pressed (J3).
+  const ALLOW = "allow";
+  const MOVED = "Moved from approve to allow by Allow without asking: calls to this tool will " +
+    "run with no prompt. Generate's fragment says so in a comment.";
+  const NOT_MOVED = "Allow without asking: the review shows that tool not included as approve " +
+    "(or the toolkit declares it consequential), so nothing was moved.";
+  // A tool in these states matches its pin (gateway/review.py's MATCHING): Clear the marks is
+  // enabled only when every included tool is in one, and one is marked (J13).
+  const MATCHING = ["ok", "marked", "blocked"];
+  // A clear job is read every 2 s, for at most 3 minutes: the gateway takes it within 60 s and
+  // answers within 2 minutes (vault/reviewjobs.py).
+  const CLEAR_EVERY = 2000;
+  const CLEAR_READS = 90;
+
+  // Allow without asking: the job whose review screen moves a tool, and the tool, while it waits;
+  // and the review screen footer() drew last (review.js's held), which it moves once drawn.
+  let moving = null;
+  let drawn = null;
 
   function $(id) {
     return document.getElementById(id);
@@ -55,6 +75,37 @@
     return said + (answer.items.length ? "" : "nothing needs you.") + more;
   }
 
+  // Clear the marks (J.4, J13): a passkey, then the vault queues a clear job, which the gateway
+  // runs only if every included tool matches its pin again. The page reads the job as it reads a
+  // review: done, it says which marks went and draws again (``after``); refused, the vault's
+  // sentence names the tools that still don't match (clear_not_clean).
+  async function clear(server, after) {
+    await prepare("tool.clear", { server: server }, async (job) => {
+      closeConfirm();
+      $("status").textContent = "The gateway is listing the server's tools again.";
+      for (let reads = 0; reads < CLEAR_READS; reads += 1) {
+        let read;
+        try {
+          read = await api("GET", fill("/api/review/jobs/{job}", { job: job.job }));
+        } catch (error) {
+          return afterFailure(error);
+        }
+        if (read.state === "done") {
+          $("status").textContent = "Cleared the drift marks of " + read.server_shown +
+            (read.cleared_shown.length ? ": " + read.cleared_shown.join(", ") : "") + ".";
+          return after();
+        }
+        await new Promise((resolve) => setTimeout(resolve, CLEAR_EVERY));
+      }
+      $("status").textContent = "The gateway hasn't answered the clear yet: review the server.";
+    });
+  }
+
+  // What an item's button does: a review opens the MCP servers page; a clear asks for a passkey.
+  function act(action, after) {
+    return action.kind === "clear" ? () => clear(action.server, after) : review;
+  }
+
   // Home's list (M.7): each item with its one action, below the checklist.
   async function home() {
     const answer = await api("GET", "/api/attention");
@@ -67,16 +118,40 @@
       entry.textContent = item.text_shown + ". ";
       const label = ACTION_TEXT[item.action.kind];
       if (label !== undefined) {
-        entry.append(button(label, review));
+        entry.append(button(label, act(item.action, home)));
       }
       list.append(entry);
     }
   }
 
-  // The MCP servers rows (review.js's listServers, one item per row in order): under each server
-  // the gateway reports on, what it reports (Home's items for that server), above the row's own
-  // Review again, which asks for a fresh review (J.2). Without the gateway's report, nothing.
-  async function servers(list, rows) {
+  // Allow without asking, declarative (J3): the review screen opens with that one tool moved
+  // from approve to allow on its own row, and Generate's fragment says so. The move is that job's
+  // alone: a review the vault refused queues nothing, and a job that fails or is replaced by
+  // another review never draws, so no later review of the server moves the tool.
+  async function allow(server, name, queue) {
+    moving = null;
+    const job = await queue(server); // none when the vault refused it
+    if (job === undefined) {
+      return;
+    }
+    if (drawn !== null && drawn.job === job) {
+      move(drawn.entries.find((entry) => entry.tool.name === name));
+    } else {
+      moving = { job: job, name: name }; // footer() moves it when the job's review draws
+    }
+  }
+
+  // The MCP servers rows (review.js's listServers, one item per row in order): under each server,
+  // Allow without asking for each included approve tool; and where the gateway reports on it,
+  // what it reports (Home's items for that server) with Clear the marks for marked tools, above
+  // the row's own Review again, which asks for a fresh review (J.2).
+  async function servers(list, rows, queue) {
+    rows.forEach((row, index) => {
+      for (const named of typeof row.server === "string" ? row.approve : []) {
+        list.children[index].append(button("Allow " + named.name_shown + " without asking",
+          () => allow(row.server, named.name, queue)));
+      }
+    });
     let answer;
     try {
       answer = await api("GET", "/api/attention");
@@ -86,8 +161,13 @@
     rows.forEach((row, index) => {
       const said = answer.items.filter((item) => item.action.server === row.server);
       if (typeof row.server === "string" && said.length) {
-        list.children[index].querySelector("ul.steps").before(make("p", "The gateway reports: " +
+        const steps = list.children[index].querySelector("ul.steps");
+        steps.before(make("p", "The gateway reports: " +
           said.map((each) => each.text_shown).join("; ") + "."));
+        if (said.some((each) => each.action.kind === "clear")) {
+          steps.before(button(ACTION_TEXT.clear, () => clear(row.server, () => queue(row.server,
+            true))));
+        }
       }
     });
   }
@@ -143,11 +223,39 @@
   }
 
   // review.js's footer hook: Review again, a fresh review that never reuses the done one, since
-  // a server can change a tool with no change to the policy (J.2).
+  // a server can change a tool with no change to the policy (J.2); Clear the marks when a tool is
+  // marked, enabled only when every included tool matches its pin (J13); and the tool Allow
+  // without asking asked to move, if this is the review of the job it queued (J3).
   function footer(held, view, queue) {
     const drifted = view.tools.filter((tool) => tool.state === "drift").length;
     $("review-drift").replaceChildren(drifted ? drifted + (drifted === 1 ? " tool" : " tools") +
       " changed since the review. " : "", button("Review again", () => queue(held.server, true)));
+    const included = view.tools.filter((tool) => tool.included);
+    if (included.some((tool) => tool.state === "marked")) {
+      const clearing = button(ACTION_TEXT.clear, () => clear(held.server, () => queue(held.server,
+        true)));
+      clearing.disabled = !included.every((tool) => MATCHING.includes(tool.state));
+      $("review-drift").append(" ", clearing);
+    }
+    drawn = held;
+    const asked = moving;
+    moving = null;
+    if (asked !== null && asked.job === held.job) {
+      move(held.entries.find((entry) => entry.tool.name === asked.name));
+    }
+  }
+
+  // The one move Allow without asking makes: an included approve tool's choice, set to allow on
+  // its row, which says so; never a toolkit's consequential tool (J3).
+  function move(entry) {
+    if (entry === undefined || entry.choice === null || !entry.box.checked ||
+      entry.tool.classification !== APPROVE || entry.tool.consequential === true) {
+      $("status").textContent = NOT_MOVED;
+      return;
+    }
+    const place = entry.item; // the row's list item
+    entry.choice.value = ALLOW;
+    place.append(make("p", MOVED));
   }
 
   // The lists Generate sends (review.js's chosen() adds the included ones): the drifted tools

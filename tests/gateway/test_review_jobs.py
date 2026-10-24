@@ -10,7 +10,12 @@
   FM-15 and FM-17;
 - the whole gateway on a real upstream: ``review --via vault`` prints what ``review`` prints, a
   drift review's report carries the definition at the policy's pin and what the upstream offers,
-  and the gateway closes its vault-link clients at shutdown (D-166).
+  and the gateway closes its vault-link clients at shutdown (D-166);
+- clear jobs (M6 design J.4): the poll advertises ``kinds=review,clear`` and the strict parse
+  takes exactly a review job's shape or a clear job's; a review job's wire stays M7's byte for
+  byte (FM-29); a clear job runs ``review --clear`` (``by: portal``) over either link, and a
+  clear the review refuses ``not_clean`` fails ``clear_not_clean`` with the mark kept (FM-28),
+  in process and on the whole gateway.
 
 The log never names a job by its ID, only by hash8 (M.4).
 """
@@ -265,6 +270,7 @@ def test_the_pollers_timings_are_the_vaults() -> None:
 
 ALLOWED = [
     ("GET", f"{REVIEW_JOBS_PATH}?wait=25&view=sha256:{'a' * 64}"),
+    ("GET", f"{REVIEW_JOBS_PATH}?wait=25&view=sha256:{'a' * 64}&kinds=review%2Cclear"),
     ("GET", f"{REVIEW_JOBS_PATH}?view=x"),
     ("GET", REVIEW_JOBS_PATH),
     ("POST", REVIEW_REPORT_PATH),
@@ -282,6 +288,7 @@ REFUSED = [
     ("GET", REVIEW_JOBS_PATH + "/"),
     ("GET", f"{REVIEW_JOBS_PATH}?wait=1&x=1"),
     ("GET", f"{REVIEW_JOBS_PATH}?view=a&view=b"),
+    ("GET", f"{REVIEW_JOBS_PATH}?view=a&kinds=review&kinds=clear"),
     ("GET", f"{REVIEW_JOBS_PATH}?wait"),
     ("GET", f"{REVIEW_JOBS_PATH}?"),
     ("GET", "/_zoeymcp/gateway/v1/review/jobs/x"),
@@ -1044,6 +1051,171 @@ async def test_a_post_retries_within_the_claim_deadline_only(
     assert events(log, "review_job_post_failed")[0]["outcome"] == "ConnectError"
 
 
+# --- clear jobs (M6 design J.4) ------------------------------------------------------------------
+
+BOTH: frozenset[reviewjobs.Work] = frozenset({"review", "clear"})
+
+
+@pytest.mark.parametrize(
+    ("item", "job"),
+    [
+        ({"id": "j1", "server": "notes"}, Job("j1", "notes")),
+        ({"id": "j1", "server": "notes", "kind": "clear"}, Job("j1", "notes", clear=True)),
+    ],
+)
+def test_a_poll_answer_holds_review_jobs_and_clear_jobs(item: dict[str, Any], job: Job) -> None:
+    """The strict parse takes exactly the two shapes (J.4)."""
+    body = json.dumps({"v": 1, "jobs": [item]}).encode()
+    assert reviewpoll._jobs(body) == (job,)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"id": "j1", "server": "notes", "kind": "review"},
+        {"id": "j1", "server": "notes", "kind": "Clear"},
+        {"id": "j1", "server": "notes", "kind": None},
+        {"id": "j1", "server": "notes", "kind": "clear", "x": 1},
+        {"id": "j1", "server": "notes", "x": 1},
+        {"id": "j1", "kind": "clear"},
+        {"id": 1, "server": "notes", "kind": "clear"},
+    ],
+)
+def test_any_other_job_shape_is_a_bad_answer(item: dict[str, Any]) -> None:
+    body = json.dumps({"v": 1, "jobs": [item]}).encode()
+    with pytest.raises(reviewpoll._Failed, match="bad_answer"):
+        reviewpoll._jobs(body)
+
+
+async def test_review_wire_unchanged(rig: InProcess) -> None:
+    """FM-29: a review job's wire is M7's exactly, which an M7 gateway's strict parse (``set(item)
+    == {"id", "server"}``) reads, though the poll advertises clears; and the poll does advertise
+    them, so the vault offers this gateway clear jobs."""
+    job_id = await rig.queue()
+    query = {"wait": "0", "view": rig.view.digest, "kinds": reviewpoll.KINDS}
+    async with rig.client() as http:
+        answer = await http.get(REVIEW_JOBS_PATH, params=query)
+    wire = {"v": 1, "jobs": [{"id": job_id, "server": "notes"}]}
+    body = await answer.aread()
+    assert body == json.dumps(wire, separators=(",", ":")).encode()
+    [item] = json.loads(body)["jobs"]
+    assert set(item) == {"id", "server"}  # the M7 gateway's check
+    assert reviewpoll._jobs(body) == (Job(job_id, "notes"),)
+    assert rig.jobs.kinds == BOTH
+    assert reviewpoll.KINDS == "review,clear"
+
+
+async def queue_clear(rig: InProcess) -> str:
+    """A clear of notes queued over the socket, a poll advertising clears seen."""
+    rig.jobs.poll_began(BOTH)
+    rig.jobs.poll_ended()
+    queued = await rig.socket("POST", "/review/notes/clear", {})
+    assert queued.status_code == 200, queued.text
+    job: str = queued.json()["job"]
+    return job
+
+
+async def test_a_clear_job_runs_review_clear(rig: InProcess, log: io.StringIO) -> None:
+    """A clear job is claimed by the new poller's poll, run as ``review --clear`` cleared by the
+    portal, and its report names the marks it cleared."""
+    gateway = stub(rig.view)
+    asked: list[tuple[str, dict[str, Any]]] = []
+
+    async def clearing(app: Any, server: str, **options: Any) -> dict[str, Any]:
+        asked.append((server, options))
+        return {**answer_for(rig.view, "list_notes"), "cleared": ["list_notes"]}
+
+    poller = ReviewPoller(gateway, rig.client(), wait=0, run_review=clearing, sleep=Sleeps())
+    job_id = await queue_clear(rig)
+    job = await run_one(rig, poller, gateway)
+    assert (job.id, job.clear) == (job_id, True)
+    assert asked == [("notes", {"clear": True, "by": "portal"})]
+    read = await rig.read(job_id)
+    assert read.status_code == 200, read.text
+    assert (read.json()["state"], read.json()["report"]["cleared"]) == ("done", ["list_notes"])
+    assert events(log, "review_job_done")[0]["outcome"] == "done"
+
+
+async def test_clear_not_clean(rig: InProcess, log: io.StringIO) -> None:
+    """FM-28 in process: the review refuses the clear ``not_clean``; the poller posts the review
+    that found it, and the vault fails the job ``clear_not_clean``, naming the tools. Any other
+    refusal of the clear is the job's error, as a review's is."""
+    gateway = stub(rig.view)
+    found = {**answer_for(rig.view, "list_notes"), "not_clean": ["list_notes"]}
+
+    async def refusing(app: Any, server: str, **options: Any) -> dict[str, Any]:
+        raise review.ReviewError(409, "not_clean", "no", tools=["list_notes"], review=found)
+
+    poller = ReviewPoller(gateway, rig.client(), wait=0, run_review=refusing, sleep=Sleeps())
+    job_id = await queue_clear(rig)
+    await run_one(rig, poller, gateway)
+    read = await rig.read(job_id)
+    assert (read.status_code, read.json()["reason"]) == (409, "clear_not_clean")
+    assert "These still don't match their pins: list_notes." in read.json()["error"]
+    assert read.json()["report"]["not_clean"] == ["list_notes"]
+
+    async def unavailable(app: Any, server: str, **options: Any) -> dict[str, Any]:
+        raise review.ReviewError(409, "toolkit_unavailable", "the toolkit isn't loaded")
+
+    poller = ReviewPoller(gateway, rig.client(), wait=0, run_review=unavailable, sleep=Sleeps())
+    job_id = await queue_clear(rig)
+    await run_one(rig, poller, gateway)
+    read = await rig.read(job_id)
+    assert (read.status_code, read.json()["reason"]) == (502, "review_failed")
+    assert "(toolkit_unavailable)" in read.json()["error"]
+
+
+async def test_a_review_job_never_runs_a_clear(rig: InProcess) -> None:
+    """A review job's review is called as M7's was, with no clear, and a not_clean it can't
+    raise would be its error, never a report."""
+    gateway = stub(rig.view)
+    asked: list[dict[str, Any]] = []
+
+    async def reviewing_only(app: Any, server: str, **options: Any) -> dict[str, Any]:
+        asked.append(options)
+        raise review.ReviewError(409, "not_clean", "no", tools=[], review={})
+
+    poller = ReviewPoller(gateway, rig.client(), wait=0, run_review=reviewing_only, sleep=Sleeps())
+    job_id = await rig.queue()
+    await run_one(rig, poller, gateway)
+    assert asked == [{}]
+    read = await rig.read(job_id)
+    assert (read.status_code, read.json()["reason"]) == (502, "review_failed")
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_clear_job_is_run_and_reported_over_either_link(
+    tmp_path: Path, link: str, log: io.StringIO
+) -> None:
+    view = build_view(notes_policy())
+    answer = {**answer_for(view, "list_notes"), "cleared": ["list_notes"]}
+
+    async def clearing(app: Any, server: str, **options: Any) -> dict[str, Any]:
+        assert options == {"clear": True, "by": "portal"}
+        return answer
+
+    with real_vault(tmp_path, link) as vault:
+        async with review_client(vault.link, vault.keys) as http:
+            poller = ReviewPoller(stub(view), http, run_review=clearing)
+            with anyio.fail_after(30):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(poller.run)
+                    await until(lambda: vault.jobs.waiting == 1)
+
+                    def queue_and_read() -> tuple[httpx.Response, httpx.Response]:
+                        queued = vault.admin.post("/_test_admin/review/notes/clear", json={})
+                        job = queued.json()["job"]
+                        return queued, vault.admin.get(f"/_test_admin/review/jobs/{job}?wait=20")
+
+                    queued, read = await anyio.to_thread.run_sync(queue_and_read)
+                    group.cancel_scope.cancel()
+    assert queued.status_code == 200, queued.text
+    assert read.status_code == 200, read.text
+    done = read.json()
+    assert (done["state"], done["report"]["cleared"], done["next"]) == ("done", ["list_notes"], [])
+    assert events(log, "review_job_done")[0]["outcome"] == "done"
+
+
 # --- the whole gateway ---------------------------------------------------------------------------
 
 TOOLS = ["echo", "add", "slow"]
@@ -1113,6 +1285,48 @@ def test_review_via_vault_prints_the_gateways_review(
     for http in (app.policy_http, app.report_http, app.review_http, app.status_http):
         assert http is not None
         assert http.is_closed
+
+
+def test_clear_marks_via_vault_on_the_whole_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-28 and J13 on a real upstream: a clear while ``echo`` still drifts is refused
+    ``clear_not_clean``, naming it, and the mark stays; once the upstream flips back, the clear
+    job clears it, logged ``drift_cleared`` by the portal's path, and the review exits 0."""
+    fake = McpFake()
+    review_pins = {name: pin_of_fake(fake, name) for name in TOOLS}
+    rest = pins_of_the_rest(fake, TOOLS)
+    with (
+        deployment(tmp_path, fake, include=TOOLS, review=review_pins, declined=rest) as deployed,
+        gateway(deployed, review=True, report=True) as running,
+    ):
+        socket = ("--socket", "x")
+        vault = deployed.vault_admin_url
+        fake.change_tool("description")
+        refused = run_cli(
+            monkeypatch, vault, "review", "notes", "--via", "vault", "--clear", *socket
+        )
+        marks = running.app.pool.marks.for_server("notes")
+        fake.flip_back()
+        cleared = run_cli(
+            monkeypatch, vault, "review", "notes", "--via", "vault", "--clear", *socket
+        )
+        left = running.app.pool.marks.for_server("notes")
+        text = deployed.log.getvalue()
+    code, out, err = refused
+    assert code == 1
+    assert err.startswith(
+        "zoeymcp review: --clear refused: These still don't match their pins: echo."
+    )
+    assert "DRIFT" in out
+    assert [tool for tool, _ in marks] == ["echo"]
+    code, out, err = cleared
+    assert (code, err) == (0, ""), cleared
+    assert "cleared drift marks: echo" in out
+    assert left == frozenset()
+    [line] = [json.loads(x) for x in text.splitlines() if '"event":"drift_cleared"' in x]
+    assert (line["server"], line["tools"], line["by"]) == ("notes", ["echo"], "portal")
+    assert '"clear":true' in text  # review_requested, for the clear jobs
 
 
 def test_a_drift_review_via_vault_carries_the_reviewed_definition(

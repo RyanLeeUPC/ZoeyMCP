@@ -183,6 +183,9 @@ REVIEW = {
     "review_jobs_full": 429,
     "review_unavailable": 503,
     "review_stale": 409,
+    # M6 J.4: a clear the polling gateway can't run, and one it refused (N.2).
+    "clear_unsupported": 409,
+    "clear_not_clean": 409,
 }
 
 # M.2's quoted texts, exactly.
@@ -269,6 +272,8 @@ FIELDS = {
     "review_busy": {"server"},
     "review_unavailable": {"detail"},
     "review_failed": {"code"},
+    "clear_unsupported": {"server"},
+    "clear_not_clean": {"tools"},
 }
 
 
@@ -501,11 +506,12 @@ def test_every_review_report_reason_is_catalogued() -> None:
 
 def test_every_review_job_reason_is_catalogued() -> None:
     """M7 M.2: the scan widens to vault/reviewjobs.py, each refusal a literal of its Reason type;
-    a job's failures are the clock's, the gateway's and the review report's refusals."""
+    a job's failures are the clock's, the gateway's (a clear it refused among them, M6 J.4) and
+    the review report's refusals."""
     found = literal_reasons(reviewjobs, "ReviewRefused")
     assert found == set(get_args(reviewjobs.Reason))
     failures = {reason for part in get_args(reviewjobs.Failure) for reason in get_args(part)}
-    own = {"review_stale", "review_timeout", "review_failed"}
+    own = {"review_stale", "review_timeout", "review_failed", "clear_not_clean"}
     assert failures == own | set(REPORT)
     assert found | own == set(REVIEW)
     assert found | failures <= set(CATALOGUE)

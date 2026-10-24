@@ -12,6 +12,8 @@ rules, from the report the vault checked (``common/reviewreport.py``):
 - A re-pin keeps the classification (Q8 (a)): an ``allow`` tool whose new definition the shared
   rule (``common/suggest.py``) no longer suggests ``allow`` is proposed ``approve``
   (:data:`PROPOSED`), and kept ``allow``, the fragment says so in a comment line.
+- An included ``approve`` tool moved to ``allow`` (**Allow without asking** in declarative mode,
+  J3) gets the comment line :data:`MOVED_TO_ALLOW`: calls to it will run with no prompt.
 - A tool the operator leaves out is recorded under the server's ``declined`` at the pin shown,
   one by one or the rest at once (J.5); an included tool leaves ``declined``. The block is written
   whole once the server has one or the change declines a tool, otherwise the change is M7's.
@@ -48,6 +50,8 @@ PIN = re.compile(r"sha256:[0-9a-f]{64}")
 CHUNK: Final = 200
 # What a re-pinned allow tool whose new definition isn't suggested allow is labelled (Q8 (a)).
 PROPOSED: Final = "the new definition isn't marked read-only: proposed approve"
+# The sentence an included approve tool moved to allow carries (J3, G.7 row 2; COV-3).
+MOVED_TO_ALLOW: Final = "approve -> allow: calls to {name} will run with no prompt"
 
 Classification = Literal["allow", "approve"]
 # An included tool in these states is listed as its pin holds it.
@@ -252,8 +256,9 @@ def fragment(
     ``review`` replaced whole, its ``declined`` too when ``changes`` hold it, and its ``era``
     when the review learned it. A tool with an error finding gets no pin; a drifted, missing or
     unpinnable included tool keeps the pin it has, so it stays hidden; a re-pinned one kept in
-    ``allow`` though its new definition isn't suggested ``allow`` says so (Q8 (a)). Raises
-    ``ValueError`` for a name the policy can't hold."""
+    ``allow`` though its new definition isn't suggested ``allow`` says so (Q8 (a)), and an
+    included ``approve`` tool moved to ``allow`` says calls to it will run with no prompt
+    (:data:`MOVED_TO_ALLOW`, J3). Raises ``ValueError`` for a name the policy can't hold."""
     server, policy = review["server"], review["policy"]
     by_name = {e["name"]: e for e in review["tools"] if TOOL_NAME.fullmatch(e["name"])}
     dropped, moved, declined = changes.dropped, changes.moved, changes.declined
@@ -272,7 +277,12 @@ def fragment(
         notes.append(Comment("added", name, why.why))
         if why.classification is None:
             notes.append(Comment("suggested", name, suggested_words(by_name[name])))
-    changed: list[Comment] = []
+    # A move from approve to allow says what it allows first (J3, COV-3).
+    changed = [
+        Comment("changed_was", name, MOVED_TO_ALLOW.format(name=name))
+        for name, chosen in sorted(moved.items())
+        if chosen == "allow" and name in policy["approve"] and name not in dropped
+    ]
     kept: list[Comment] = []
     others: list[Comment] = []
     for name, entry in sorted(by_name.items()):

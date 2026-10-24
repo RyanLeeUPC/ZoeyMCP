@@ -25,8 +25,9 @@ keeps when the role last fetched and the digest it holds, for health's
 ``egress_allowlist_stale`` (J) and for an onboarding through the role, which waits for it to
 fetch a widened list (:meth:`VaultApp.role_fetched`). Whether ``egress_proxy`` is the role is
 the startup policy's ``egress_proxy_kind``, never guessed from the fetches. The rest are 404.
-:meth:`VaultApp.queue_review` and :meth:`VaultApp.review_job` queue and read the jobs for the
-admin socket and the portal, on :mod:`.reviewjobs`' table.
+:meth:`VaultApp.queue_review`, :meth:`VaultApp.queue_clear` and :meth:`VaultApp.review_job` queue
+and read the jobs for the admin socket and the portal, on :mod:`.reviewjobs`' table; a clear job
+(M6 design J.4) goes only to a poll that advertised it runs one.
 
 OAuth routes get an access token from the :class:`TokenManager`. An upstream 401 that says the
 token is bad drops it, and a request that's safe to repeat is sent once more with a new token
@@ -129,6 +130,7 @@ from .reviewjobs import (
     Result,
     ReviewRefused,
     ServerKind,
+    Work,
     named_job,
     read_result,
 )
@@ -1125,23 +1127,28 @@ class VaultApp:
     # --- review jobs (M7 design F.2) -----------------------------------------------------------
 
     async def _review_jobs(self, request: Request, log: dict[str, Any]) -> Response:
-        """``GET /_zoeymcp/gateway/v1/review/jobs?wait=N&view=<digest>``: the jobs queued at the
-        view digest the gateway's policy client holds, now ``sent``, once there are any, or
-        none after N seconds (at most 25), at shutdown, or when the caller leaves. One poll
-        waits at a time (429); while it waits the poller counts as seen (CR-15).
+        """``GET /_zoeymcp/gateway/v1/review/jobs?wait=N&view=<digest>&kinds=review,clear``: the
+        jobs queued at the view digest the gateway's policy client holds, of the kinds it runs,
+        now ``sent``, once there are any, or none after N seconds (at most 25), at shutdown, or
+        when the caller leaves. One poll waits at a time (429); while it waits the poller counts
+        as seen (CR-15). A review job is ``{"id", "server"}`` exactly, as an older gateway reads
+        it, and a clear job adds ``"kind": "clear"``; a poll that advertises no kinds gets
+        review jobs only (M6 design J.4, G-8).
 
         A poll at the view served when it began also ends, with none, once the view changes,
         so the gateway polls again at its new view and a review queued right after a reload
         doesn't wait out the poll (D-189, M6 design K.5). A poll at a view no longer served (a
         gateway still behind) waits as before, so a lagging gateway can't spin."""
         try:
-            wait, digest = internal.jobs_query(parse_query(request.scope.get("query_string", b"")))
+            wait, digest, kinds = internal.jobs_query(
+                parse_query(request.scope.get("query_string", b""))
+            )
         except RequestRejected as exc:
             raise Refused(400, exc.reason) from exc
         table = self._reviews
         if table.waiting >= internal.REVIEW_WAITERS:
             raise Refused(429, "a review poll is already waiting", retry_after=1)
-        table.poll_began()
+        table.poll_began(kinds)
         # A queue call waiting for the first poll after the vault started goes on (OPS-20).
         self._wake_reviews()
         gone = asyncio.ensure_future(_disconnected(request.receive))
@@ -1150,7 +1157,7 @@ class VaultApp:
         left = False
         try:
             deadline = table.now() + wait
-            while not table.offered(digest) and not self._view_stopping:
+            while not table.offered(digest, kinds) and not self._view_stopping:
                 if view_changed is not None and view_changed.is_set():
                     if self._view.digest != digest:
                         break
@@ -1179,11 +1186,11 @@ class VaultApp:
             gone.cancel()
             self._log_review_ends()
         # A job is sent only to a poll that is still there to take it.
-        claimed = () if left else table.claim(digest)
+        claimed = () if left else table.claim(digest, kinds)
         if claimed:
             self._wake_reviews()
         log["jobs"] = len(claimed)
-        jobs = [{"id": job.id, "server": job.server} for job in claimed]
+        jobs = [_job_wire(job) for job in claimed]
         return JSONResponse({"v": 1, "jobs": jobs}, headers={"cache-control": "no-store"})
 
     async def _review_report(self, request: Request, log: dict[str, Any]) -> Response:
@@ -1241,10 +1248,14 @@ class VaultApp:
                 event.update(tools=len(refused.tools), level="critical")
             logs.event("review_refused", **event)
             raise Refused(502, refused.detail, code=refused.reason)
-        if job.report is not None:
-            event["tools"] = len(job.report.tools)
-        else:
+        if job.work == "clear":
+            event["clear"] = True
+        if job.report is None:
             event.update(reason=job.failure, code=result.code)
+        else:
+            event["tools"] = len(job.report.tools)
+            if job.failure is not None:  # clear_not_clean keeps the review that found them (J.4)
+                event["reason"] = job.failure
         logs.event("review_reported", **event)
         answer = {"v": 1, "job": job.id, "state": job.state}
         return JSONResponse(answer, headers={"cache-control": "no-store"})
@@ -1337,12 +1348,23 @@ class VaultApp:
         Raises :class:`.reviewjobs.ReviewRefused`. In the first 45 s after the vault started,
         with no poll seen yet, it waits for the first one before it answers (OPS-20), unless
         the vault is stopping: no poll comes then, and it is ``review_unavailable`` at once."""
+        return await self._queue(server, owner, fresh=fresh, work="review")
+
+    async def queue_clear(self, server: str, owner: Owner) -> Job:
+        """Queue a clear of ``server``'s drift marks for the ``owner``'s surface (M6 design
+        J.4): the gateway lists the server again and clears them only if every included tool
+        matches its pin. Always a new job; offered only to a poll that advertised it runs
+        clears, and refused ``clear_unsupported`` while the polling gateway doesn't. Raises
+        and waits as :meth:`queue_review` does."""
+        return await self._queue(server, owner, fresh=True, work="clear")
+
+    async def _queue(self, server: str, owner: Owner, *, fresh: bool, work: Work) -> Job:
         table = self._reviews
         while True:
             changed = self._reviews_changed
             try:
                 queued = table.queue(
-                    server, owner, self._view.digest, self._reviewable(), fresh=fresh
+                    server, owner, self._view.digest, self._reviewable(), fresh=fresh, work=work
                 )
             except ReviewRefused as exc:
                 if exc.reason == "review_unavailable":
@@ -1362,7 +1384,10 @@ class VaultApp:
         reused = queued.state == "done"
         if not reused:
             self._wake_reviews()
-        logs.event("review_requested", server=server, job=queued.hash8, owner=owner, reused=reused)
+        clear = {"clear": True} if work == "clear" else {}
+        logs.event(
+            "review_requested", server=server, job=queued.hash8, owner=owner, reused=reused, **clear
+        )
         return queued
 
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job:
@@ -1844,6 +1869,15 @@ async def _disconnected(receive: Receive) -> None:
     """Return once the caller has gone. A GET's body is empty, so nothing else is expected."""
     while (await receive())["type"] != "http.disconnect":
         pass
+
+
+def _job_wire(job: Job) -> dict[str, str]:
+    """A claimed job as a poll's answer lists it: a review's ``{"id", "server"}`` exactly, the
+    only shape an older gateway reads, and a clear's with ``"kind": "clear"`` (M6 design J.4)."""
+    wire = {"id": job.id, "server": job.server}
+    if job.work == "clear":
+        wire["kind"] = "clear"
+    return wire
 
 
 def _bearer(grant: Grant) -> tuple[str, str]:

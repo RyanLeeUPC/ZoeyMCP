@@ -31,7 +31,7 @@ from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.portal import reviewview
 from zoeymcp.portal.reviewview import rows
-from zoeymcp.vault.onboarding import reviewed_next
+from zoeymcp.vault.onboarding import job_next, reviewed_next
 from zoeymcp.vault.reviewjobs import read_result
 
 from .flows import set_up, status_reason
@@ -157,7 +157,9 @@ def test_a_hundred_tools_from_queue_to_fragment_2(world: World) -> None:
     assert waiting.json() == {"job": job, "server_shown": "notes", "state": "queued"}
     gateway_answers(rig)
     read = page.fetch("GET", f"/api/review/jobs/{job}").json()
-    assert read == {"job": job, **rows(held(large()))}
+    # Done, its way on is choosing the tools (M6 design M.7, D-200).
+    steps = [step.answer() for step in job_next("notes", clear=False)]
+    assert read == {"job": job, **rows(held(large())), "next": steps}
     assert (read["counts"]["tools"], read["counts"]["read_only"]) == (96, 64)
     # Asked again at the same view, the portal's finished review is handed back (OPS-11).
     again = page.fetch("POST", "/api/review/notes", json={}).json()

@@ -32,8 +32,11 @@ from zoeymcp.vault.internal import (
     jobs_query,
     wait_seconds,
 )
+from zoeymcp.vault.reviewjobs import OLDER
 
 DIGEST = "sha256:" + "ab" * 32
+TAKES = "the review jobs path takes wait, view and kinds, once each"
+KINDS = "kinds is review, or review,clear"
 GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS)
 
 
@@ -313,17 +316,27 @@ def test_a_bad_allowlist_query_is_refused(params: list[tuple[str, str]], reason:
 
 
 def test_the_view_digest_and_a_wait() -> None:
-    assert jobs_query([("wait", "25"), ("view", DIGEST)]) == (25, DIGEST)
-    assert jobs_query([("view", DIGEST), ("wait", "3")]) == (3, DIGEST)
+    assert jobs_query([("wait", "25"), ("view", DIGEST)]) == (25, DIGEST, OLDER)
+    assert jobs_query([("view", DIGEST), ("wait", "3")]) == (3, DIGEST, OLDER)
 
 
 def test_without_a_wait_the_poll_answers_at_once() -> None:
-    assert jobs_query([("view", DIGEST)]) == (0, DIGEST)
+    assert jobs_query([("view", DIGEST)]) == (0, DIGEST, OLDER)
 
 
 @pytest.mark.parametrize(("value", "seconds"), [("26", 25), ("0" * 40 + "7", 7), ("9" * 400, 25)])
 def test_the_wait_is_capped(value: str, seconds: int) -> None:
-    assert jobs_query([("wait", value), ("view", DIGEST)]) == (seconds, DIGEST)
+    assert jobs_query([("wait", value), ("view", DIGEST)]) == (seconds, DIGEST, OLDER)
+
+
+def test_the_kinds_a_poll_advertises() -> None:
+    """M6 J.4 (G-8): a poll that advertises no kinds is an older gateway's, which runs reviews
+    only; a new one runs reviews and clears; review alone is the same as none."""
+    both = frozenset({"review", "clear"})
+    assert frozenset({"review"}) == OLDER
+    assert jobs_query([("view", DIGEST), ("kinds", "review,clear")]) == (0, DIGEST, both)
+    query = [("wait", "5"), ("kinds", "review"), ("view", DIGEST)]
+    assert jobs_query(query) == (5, DIGEST, OLDER)
 
 
 @pytest.mark.parametrize(
@@ -331,15 +344,17 @@ def test_the_wait_is_capped(value: str, seconds: int) -> None:
     [
         ([], "the review jobs path needs the view's digest"),
         ([("wait", "1")], "the review jobs path needs the view's digest"),
-        (
-            [("view", DIGEST), ("view", DIGEST)],
-            "the review jobs path takes wait and view, once each",
-        ),
-        (
-            [("wait", "1"), ("wait", "1"), ("view", DIGEST)],
-            "the review jobs path takes wait and view, once each",
-        ),
-        ([("view", DIGEST), ("other", "1")], "the review jobs path takes wait and view, once each"),
+        ([("view", DIGEST), ("view", DIGEST)], TAKES),
+        ([("wait", "1"), ("wait", "1"), ("view", DIGEST)], TAKES),
+        ([("view", DIGEST), ("other", "1")], TAKES),
+        ([("view", DIGEST), ("kinds", "review"), ("kinds", "review")], TAKES),
+        ([("view", DIGEST), ("kinds", "clear")], KINDS),
+        ([("view", DIGEST), ("kinds", "clear,review")], KINDS),
+        ([("view", DIGEST), ("kinds", "review,clear,")], KINDS),
+        ([("view", DIGEST), ("kinds", "review,review")], KINDS),
+        ([("view", DIGEST), ("kinds", "review,clear,other")], KINDS),
+        ([("view", DIGEST), ("kinds", "")], KINDS),
+        ([("view", DIGEST), ("kinds", "Review")], KINDS),
         ([("view", DIGEST), ("wait", "x")], "wait must be a number of seconds"),
         ([("view", DIGEST), ("wait", "-1")], "wait must be a number of seconds"),
         ([("view", DIGEST), ("wait", "")], "wait must be a number of seconds"),

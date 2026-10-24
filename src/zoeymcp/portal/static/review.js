@@ -196,7 +196,7 @@
       }
       list.append(item);
     }
-    await window.zoeyDrift.servers(list, rows); // what the gateway reports of each server
+    await window.zoeyDrift.servers(list, rows, queueReview); // what the gateway reports, Allow
     if (rows.length === 0) {
       list.append(make("li", "The policy has no remote or toolkit server yet."));
     }
@@ -449,7 +449,7 @@
     $("review-state").textContent = WAITING[job.state] || "";
     $("review-body").hidden = true;
     $("review").hidden = false;
-    await pollReview();
+    return pollReview().then(() => job.job); // the job, for drift.js's Allow without asking
   }
 
   async function pollReview() {

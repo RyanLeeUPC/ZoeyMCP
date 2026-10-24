@@ -15,8 +15,12 @@ which also counts a tool nobody reviewed. The upstream's ``instructions`` and ``
 included for display only; they are never forwarded to an agent.
 
 ``--clear`` lists again and, only if every included tool matches its pin, clears the server's
-drift marks and re-evaluates the server's live connections, so the tools come back for agents.
-A connection whose own last listing still shows drift marks the tool again.
+drift marks and re-evaluates the server's live connections, so the tools come back for agents,
+and the answer names them (``cleared``). Otherwise it refuses ``not_clean``, and the review it
+carries names the tools that don't match (``not_clean``), so a clear job's report says either
+(M6 design J.4). A connection whose own last listing still shows drift marks the tool again. A
+clear asked through the vault's job path, the portal's **Clear the marks** among them, logs
+``drift_cleared`` with ``by: portal``.
 
 A toolkit server is reviewed without any upstream call (M4 design H.6): its definitions are the
 ones the loaded module generates, and the answer adds the distribution, its version, and each
@@ -50,6 +54,12 @@ ToolState = Literal[
     "ok", "marked", "blocked", "drift", "unreviewed", "declined", "invalid", "duplicate", "missing"
 ]
 MATCHING: frozenset[str] = frozenset({"ok", "marked", "blocked"})
+# Who cleared a server's marks, as drift_cleared logs it: the admin socket's review, or a clear
+# job the vault queued (M6 design J.4).
+ClearedBy = Literal["review", "portal"]
+# The reason a clear is refused while an included tool doesn't match its pin; the vault maps it
+# to the portal's clear_not_clean (vault/reviewjobs.py, CR-8).
+NOT_CLEAN = "not_clean"
 
 
 class ReviewError(Exception):
@@ -268,12 +278,14 @@ async def _close(connection: Connection) -> None:
         await connection.done.wait()
 
 
-async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any]:
+async def review(
+    app: Any, server: str, *, clear: bool = False, by: ClearedBy = "review"
+) -> dict[str, Any]:
     """Review ``server`` on a fresh connection; with ``clear``, also clear its drift marks if
-    every included tool matches. Raises :class:`ReviewError`."""
+    every included tool matches, logged as cleared ``by``. Raises :class:`ReviewError`."""
     policy, limits = _policy(app, server)
     if isinstance(policy, ViewToolkitServer):
-        return review_toolkit(app, server, policy, limits, clear=clear)
+        return review_toolkit(app, server, policy, limits, clear=clear, by=by)
     pool = app.pool
     try:
         connection = pool.review_connection(server, policy)
@@ -310,22 +322,10 @@ async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any
     logs.event("review", server=server, tools=len(tools), clean=answer["clean"], clear=clear)
     if not clear:
         return answer
-    unmatched = [
-        entry["name"]
-        for entry in answer["tools"]
-        if entry["included"] and entry["state"] not in MATCHING
-    ]
-    if unmatched:
-        raise ReviewError(
-            409,
-            "not_clean",
-            "not every included tool matches its pin: " + ", ".join(unmatched),
-            tools=unmatched,
-            review=answer,
-        )
+    _refuse_unless_clean(answer)
     removed = pool.marks.replace(server, frozenset())[1]
     if removed:
-        logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by="review")
+        logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by=by)
     for live in pool.connections():
         if live.server == server:
             live.reevaluate(live.policy)
@@ -333,6 +333,25 @@ async def review(app: Any, server: str, *, clear: bool = False) -> dict[str, Any
     answer = build(pins.evaluate(tools, policy, pool.marks.for_server(server), limits))
     answer["cleared"] = sorted(tool for tool, _ in removed)
     return answer
+
+
+def _refuse_unless_clean(answer: dict[str, Any]) -> None:
+    """Refuse a clear (``not_clean``, 409) while an included tool doesn't match its pin, the
+    review that found them carrying their names."""
+    unmatched = [
+        entry["name"]
+        for entry in answer["tools"]
+        if entry["included"] and entry["state"] not in MATCHING
+    ]
+    if unmatched:
+        answer["not_clean"] = unmatched
+        raise ReviewError(
+            409,
+            NOT_CLEAN,
+            "not every included tool matches its pin: " + ", ".join(unmatched),
+            tools=unmatched,
+            review=answer,
+        )
 
 
 # --- toolkits (M4 design H.6) -------------------------------------------------------------------
@@ -414,10 +433,16 @@ def toolkit_report(
 
 
 def review_toolkit(
-    app: Any, server: str, policy: ViewToolkitServer, limits: GatewayLimits, *, clear: bool
+    app: Any,
+    server: str,
+    policy: ViewToolkitServer,
+    limits: GatewayLimits,
+    *,
+    clear: bool,
+    by: ClearedBy = "review",
 ) -> dict[str, Any]:
     """Review a toolkit server; with ``clear``, clear its drift marks if every included tool
-    matches, and evaluate it again. Raises :class:`ReviewError`."""
+    matches, logged as cleared ``by``, and evaluate it again. Raises :class:`ReviewError`."""
     found = app.toolkits.get(server)
     if not isinstance(found, Loaded):
         reason = found.reason if found is not None else "not_loaded"
@@ -431,22 +456,10 @@ def review_toolkit(
     )
     if not clear:
         return answer
-    unmatched = [
-        entry["name"]
-        for entry in answer["tools"]
-        if entry["included"] and entry["state"] not in MATCHING
-    ]
-    if unmatched:
-        raise ReviewError(
-            409,
-            "not_clean",
-            "not every included tool matches its pin: " + ", ".join(unmatched),
-            tools=unmatched,
-            review=answer,
-        )
+    _refuse_unless_clean(answer)
     removed = marks.replace(server, frozenset())[1]
     if removed:
-        logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by="review")
+        logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by=by)
     snapshot = app.policy.fresh()
     if snapshot is not None:
         app.toolkits.apply(snapshot.view.gateway)

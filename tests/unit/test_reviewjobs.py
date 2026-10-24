@@ -1,11 +1,15 @@
-"""Review jobs (M7 design F.1, F.2, F.4; O.2 ``test_reviewjobs.py``).
+"""Review jobs (M7 design F.1, F.2, F.4; O.2 ``test_reviewjobs.py``; M6 design J.4, M.7).
 
 The table on an injected monotonic clock: queueing at the view digest, the active-job caps and
 ``done``-job reuse by surface (OPS-11), the poller counted as seen while it waits or for 15 s
 after (CR-15) with a queue call 20 s into a waiting poll, the start grace (OPS-20, FM-16b), the
 claim at a digest and ``review_stale`` after 60 s (FM-12, FM-15), ``review_timeout`` after 120 s,
-no poller (FM-16), results kept 30 minutes, and a post's result read whole (X11). Then the
-vault's two endpoints and the admin socket's routes, in process, over the real ``VaultApp``.
+no poller (FM-16), results kept 30 minutes, and a post's result read whole (X11). Clear jobs (M6
+J.4): offered only to a poll that advertises them, ``clear_unsupported`` while only an older
+gateway polls (FM-29), never handed back, and a clear the gateway refused failed
+``clear_not_clean`` (CR-8). Then the vault's two endpoints and the admin socket's routes, in
+process, over the real ``VaultApp``, a review job's wire byte for byte, and each answer's
+``next`` (D-200).
 """
 
 from __future__ import annotations
@@ -827,6 +831,187 @@ def test_the_reason_types() -> None:
     assert str(ReviewRefused("job_unknown", "m")) == "job_unknown: m"
 
 
+# --- clear jobs (M6 design J.4, G-8) -------------------------------------------------------------
+
+BOTH: frozenset[reviewjobs.Work] = frozenset({"review", "clear"})
+
+
+def advertised(jobs: JobTable, kinds: frozenset[reviewjobs.Work] = BOTH) -> None:
+    """A poll that just finished, advertising ``kinds`` (a newer gateway's, by default)."""
+    jobs.poll_began(kinds)
+    jobs.poll_ended()
+
+
+def outcome(**said: list[str]) -> dict[str, Any]:
+    """The gateway's report, with what a clear did: ``cleared`` or ``not_clean``."""
+    return {**report(), **said}
+
+
+def clear_sent(jobs: JobTable) -> Job:
+    advertised(jobs)
+    queued(jobs, work="clear")
+    [job] = jobs.claim(A, BOTH)
+    return job
+
+
+def test_the_kinds_are_j4s() -> None:
+    assert reviewjobs.WORKS == ("review", "clear")
+    assert frozenset({"review"}) == reviewjobs.OLDER
+    assert reviewjobs.CLEAR_NOT_CLEAN == "clear_not_clean"
+    jobs = JobTable(Clock(), started=0.0)
+    assert jobs.kinds == reviewjobs.OLDER  # before any poll: reviews only
+    jobs.poll_began(BOTH)
+    assert jobs.kinds == BOTH
+    jobs.poll_ended()
+    jobs.poll_began()  # an older gateway's poll advertises nothing
+    assert jobs.kinds == reviewjobs.OLDER
+
+
+def test_a_clear_is_offered_only_to_a_poll_that_runs_it() -> None:
+    jobs, _ = table()
+    advertised(jobs)
+    clear = queued(jobs, work="clear")
+    assert (clear.work, clear.state, clear.server) == ("clear", "queued", "notes")
+    review = queued(jobs, "files")
+    assert review.work == "review"
+    [taken] = jobs.claim(A)  # a poll that runs reviews only
+    assert taken.id == review.id
+    assert not jobs.offered(A)
+    assert not jobs.offered(B, BOTH)
+    assert jobs.offered(A, BOTH)
+    [cleared] = jobs.claim(A, BOTH)
+    assert (cleared.id, cleared.state, cleared.work) == (clear.id, "sent", "clear")
+    assert not jobs.offered(A, BOTH)
+    assert jobs.claim(A, BOTH) == ()
+
+
+def test_old_gateway() -> None:
+    """FM-29: a clear asked while only an older gateway polls (it advertises no kinds) is
+    refused clear_unsupported and nothing is queued; its review jobs keep working."""
+    jobs, _ = table()  # its poll advertised nothing
+    caught = refused(jobs.queue, "notes", "portal", A, SERVERS, work="clear")
+    assert (caught.reason, caught.fields) == ("clear_unsupported", {"server": "notes"})
+    assert str(caught) == "clear_unsupported: the polling gateway runs no clear jobs"
+    assert len(jobs) == 0
+    review = queued(jobs)
+    [taken] = jobs.claim(A)
+    assert taken.id == review.id
+    assert post(jobs, posted(taken)).job.state == "done"
+    # A newer gateway's poll takes clears; once an older one polls again, they're refused.
+    advertised(jobs)
+    assert queued(jobs, "files", work="clear").work == "clear"
+    advertised(jobs, reviewjobs.OLDER)
+    late = refused(jobs.queue, "mail", "cli", A, SERVERS, work="clear")
+    assert late.reason == "clear_unsupported"
+
+
+def test_the_queue_rules_come_before_unsupported() -> None:
+    """An unknown server, a busy one, a full queue and no poller are said first, and in the
+    start grace a clear waits for the first poll, as a review does."""
+    jobs, clock = table()
+    unknown = refused(jobs.queue, "x", "cli", A, SERVERS, work="clear")
+    assert unknown.reason == "review_unknown_server"
+    queued(jobs)
+    assert refused(jobs.queue, "notes", "cli", A, SERVERS, work="clear").reason == "review_busy"
+    queued(jobs, "files")
+    assert refused(jobs.queue, "mail", "cli", A, SERVERS, work="clear").reason == (
+        "review_jobs_full"
+    )
+    clock.now += QUEUE_TTL + REVIEW_SEEN
+    gone = refused(jobs.queue, "mail", "cli", A, SERVERS, work="clear")
+    assert gone.reason == "review_unavailable"
+    fresh = JobTable(Clock(), started=LATER)
+    waited = fresh.queue("notes", "cli", A, SERVERS, work="clear")
+    assert waited == Wait(LATER + REVIEW_START_GRACE)
+    assert len(fresh) == 0
+
+
+def test_a_clear_is_never_handed_back_and_leaves_the_reviews() -> None:
+    """A clear is a new job every time, even with a finished one at the digest; it replaces
+    only its surface's finished clears, and a review asked for is never a clear."""
+    jobs, _ = table()
+    advertised(jobs)
+    review = sent(jobs)
+    post(jobs, posted(review))
+    clear = queued(jobs, work="clear")
+    assert clear.id != review.id
+    assert jobs.get(review.id, "cli").state == "done"
+    [taken] = jobs.claim(A, BOTH)
+    post(jobs, posted(taken, outcome(cleared=["list_notes"])))
+    again = queued(jobs, work="clear", fresh=False)
+    assert again.id not in (review.id, clear.id)
+    assert refused(jobs.get, clear.id, "cli").reason == "job_unknown"
+    assert jobs.get(review.id, "cli").state == "done"
+    assert queued(jobs).id == review.id  # the done review, handed back
+
+
+def test_a_clear_ends_done_with_what_it_cleared() -> None:
+    jobs, _ = table()
+    job = clear_sent(jobs)
+    ended = post(jobs, posted(job, outcome(cleared=["list_notes"])))
+    assert ended.refused is None
+    assert (ended.job.state, ended.job.failure) == ("done", None)
+    assert ended.job.report is not None
+    assert (ended.job.report.cleared, ended.job.report.not_clean) == (["list_notes"], None)
+    # A clear with no mark to clear ends done too, clearing nothing.
+    jobs, _ = table()
+    nothing = post(jobs, posted(clear_sent(jobs), outcome(cleared=[])))
+    assert (nothing.job.state, nothing.refused) == ("done", None)
+
+
+@pytest.mark.parametrize(
+    ("count", "tools"),
+    [(1, "t0"), (5, "t0, t1, t2, t3, t4"), (7, "t0, t1, t2, t3, t4 and 2 more")],
+)
+def test_clear_not_clean(count: int, tools: str) -> None:
+    """FM-28 at the table: the gateway's not_clean fails the job clear_not_clean, the portal's
+    name for it (CR-8), naming the tools as a pin_mismatch does and keeping the review."""
+    jobs, _ = table()
+    job = clear_sent(jobs)
+    names = [f"t{n}" for n in range(count)]
+    ended = post(jobs, posted(job, outcome(not_clean=names)))
+    assert ended.refused is None
+    failed = ended.job
+    assert (failed.state, failed.failure) == ("failed", "clear_not_clean")
+    assert dict(failed.fields) == {"tools": tools}
+    assert failed.report is not None
+    assert failed.report.not_clean == names
+    assert jobs.get(job.id, "cli") == failed
+
+
+@pytest.mark.parametrize(
+    ("work", "said", "detail"),
+    [
+        ("clear", {}, "a clear job's report says what it cleared, or what didn't match"),
+        (
+            "clear",
+            {"cleared": [], "not_clean": ["a"]},
+            "a clear job's report says what it cleared, or what didn't match",
+        ),
+        ("review", {"cleared": []}, "a review job's report clears nothing"),
+        ("review", {"not_clean": ["a"]}, "a review job's report clears nothing"),
+    ],
+)
+def test_a_report_that_doesnt_say_what_its_job_did_is_review_invalid(
+    work: reviewjobs.Work, said: dict[str, list[str]], detail: str
+) -> None:
+    jobs, _ = table()
+    advertised(jobs)
+    queued(jobs, work=work)
+    [job] = jobs.claim(A, BOTH)
+    ended = post(jobs, posted(job, outcome(**said)))
+    assert ended.refused is not None
+    assert (ended.refused.reason, ended.refused.detail) == (
+        "review_invalid",
+        f"at cleared ({detail})",
+    )
+    assert (ended.job.state, ended.job.failure, ended.job.report) == (
+        "failed",
+        "review_invalid",
+        None,
+    )
+
+
 # --- the vault's endpoints, in process ------------------------------------------------------------
 
 
@@ -889,9 +1074,12 @@ class Rig:
         async with httpx.AsyncClient(transport=transport, base_url="http://vault") as client:
             return await client.request(method, path, headers=headers, content=content)
 
-    async def poll(self, wait: int = 0, digest: str | None = None) -> httpx.Response:
+    async def poll(
+        self, wait: int = 0, digest: str | None = None, kinds: str | None = None
+    ) -> httpx.Response:
         view = digest or self.app.view_digest
-        return await self.call(f"/_zoeymcp/gateway/v1/review/jobs?wait={wait}&view={view}")
+        more = "" if kinds is None else f"&kinds={kinds}"
+        return await self.call(f"/_zoeymcp/gateway/v1/review/jobs?wait={wait}&view={view}{more}")
 
     async def post(self, body: object, **headers: str) -> httpx.Response:
         content = json.dumps(body).encode()
@@ -1072,6 +1260,7 @@ async def test_a_report_through_the_vault(rig: Rig, captured: io.StringIO) -> No
     assert rig.jobs.get(job.id, "cli").state == "done"
     [line] = lines(captured, "review_reported")
     assert (line["server"], line["job"], line["tools"]) == ("notes", job.hash8, 2)
+    assert "clear" not in line
     # A second result for it is job_unknown, logged.
     again = await rig.post(posted(rig.jobs.get(job.id, "cli")))
     assert again.status_code == 409
@@ -1411,6 +1600,152 @@ async def test_a_failed_job_has_no_fragment_2(rig: Rig) -> None:
     refused = await rig.socket("POST", f"/review/jobs/{job.id}/diff", CHOSEN)
     assert (refused.status_code, refused.json()["reason"]) == (502, "review_failed")
     assert refused.json()["state"] == "failed"
+
+
+# --- clear jobs through the vault (M6 design J.4) and each answer's next (D-200) -------------
+
+AGAIN = {
+    "do": "review",
+    "label": "Review again",
+    "command": "zoeymcp review notes --via vault --fresh",
+    "via": "exec",
+}
+
+
+async def test_a_poll_that_runs_clears_takes_the_clear_job(rig: Rig, captured: io.StringIO) -> None:
+    advertised(rig.jobs)
+    clear = await rig.app.queue_clear("notes", "portal")
+    assert (clear.work, clear.state) == ("clear", "queued")
+    older = await rig.poll()  # an older gateway's poll, advertising nothing
+    assert older.json() == {"v": 1, "jobs": []}
+    assert rig.jobs.get(clear.id, "portal").state == "queued"
+    newer = await rig.poll(kinds="review,clear")
+    assert newer.json() == {"v": 1, "jobs": [{"id": clear.id, "server": "notes", "kind": "clear"}]}
+    assert rig.jobs.get(clear.id, "portal").state == "sent"
+    [line] = lines(captured, "review_requested")
+    assert line == {
+        **line,
+        "server": "notes",
+        "job": clear.hash8,
+        "owner": "portal",
+        "reused": False,
+        "clear": True,
+    }
+
+
+async def test_review_wire_unchanged(rig: Rig, captured: io.StringIO) -> None:
+    """FM-29 at the vault: a review job's wire is exactly M7's, ``{"id", "server"}``, whatever
+    the poll advertises, so an older gateway's strict parse keeps reading it; and a review's
+    request line has no clear."""
+    for kinds in (None, "review", "review,clear"):
+        job = await rig.app.queue_review("notes", "cli", fresh=True)
+        response = await rig.poll(kinds=kinds)
+        wire = {"v": 1, "jobs": [{"id": job.id, "server": "notes"}]}
+        assert response.content == json.dumps(wire, separators=(",", ":")).encode(), kinds
+        await rig.post(posted(rig.jobs.get(job.id, "cli")))
+    assert all("clear" not in line for line in lines(captured, "review_requested"))
+
+
+async def test_a_poll_with_bad_kinds_is_refused(rig: Rig) -> None:
+    for kinds in ("clear", "review,review", "review,clear,x"):
+        assert (await rig.poll(kinds=kinds)).status_code == 400, kinds
+
+
+async def test_the_socket_queues_a_clear_and_reads_it(rig: Rig, captured: io.StringIO) -> None:
+    advertised(rig.jobs)
+    queued_answer = await rig.socket("POST", "/review/notes/clear")
+    assert queued_answer.status_code == 200, queued_answer.text
+    job = queued_answer.json()["job"]
+    assert queued_answer.json() == {"job": job, "server": "notes", "state": "queued"}
+    await rig.poll(kinds="review,clear")
+    said = outcome(cleared=["list_notes"])
+    assert (await rig.post(posted(rig.jobs.get(job, "cli"), said))).status_code == 200
+    [line] = lines(captured, "review_reported")
+    assert (line["clear"], line["tools"], "reason" in line) == (True, 2, False)
+    with anyio.fail_after(5):
+        done = (await rig.socket("GET", f"/review/jobs/{job}?wait=30")).json()
+    assert (done["state"], done["report"]["cleared"], done["next"]) == ("done", ["list_notes"], [])
+    # A clear is a new job each time, and takes an empty body only.
+    again = (await rig.socket("POST", "/review/notes/clear", {})).json()
+    assert again["job"] != job
+    busy = await rig.socket("POST", "/review/notes/clear")
+    assert (busy.status_code, busy.json()["reason"], busy.json()["next"]) == (
+        409,
+        "review_busy",
+        [AGAIN],
+    )
+    for body in ({"fresh": True}, {"x": 1}):
+        refused_body = await rig.socket("POST", "/review/files/clear", body)
+        assert (refused_body.status_code, refused_body.json()["reason"]) == (400, "bad_body")
+    unknown = await rig.socket("POST", "/review/other/clear")
+    assert (unknown.status_code, unknown.json()["reason"], unknown.json()["next"]) == (
+        404,
+        "review_unknown_server",
+        [],
+    )
+
+
+async def test_clear_not_clean_over_the_socket(rig: Rig, captured: io.StringIO) -> None:
+    """FM-28 over the socket: the refusal names the tools, with the review that found them and
+    a fresh review as the way on; the vault logs it as the failure it is, not a review."""
+    advertised(rig.jobs)
+    job = await rig.app.queue_clear("notes", "cli")
+    await rig.poll(kinds="review,clear")
+    said = outcome(not_clean=["list_notes"])
+    assert (await rig.post(posted(rig.jobs.get(job.id, "cli"), said))).status_code == 200
+    [line] = lines(captured, "review_reported")
+    assert (line["job"], line["reason"], line["clear"], line["tools"]) == (
+        job.hash8,
+        "clear_not_clean",
+        True,
+        2,
+    )
+    assert "code" not in line
+    assert "list_notes" not in captured.getvalue()
+    read = await rig.socket("GET", f"/review/jobs/{job.id}")
+    assert read.status_code == 409
+    body = read.json()
+    assert (body["reason"], body["state"], body["server"]) == ("clear_not_clean", "failed", "notes")
+    assert body["error"] == (
+        "These still don't match their pins: list_notes. No mark was cleared; review the server "
+        "again."
+    )
+    assert body["report"]["not_clean"] == ["list_notes"]
+    assert body["next"] == [AGAIN]
+
+
+async def test_a_clear_the_polling_gateway_cant_run(rig: Rig) -> None:
+    """FM-29 over the socket: the rig's poll advertised nothing, so a clear is refused, with the
+    gateway's own --clear as the way on; a review is queued as before."""
+    refused_clear = await rig.socket("POST", "/review/notes/clear")
+    assert (refused_clear.status_code, refused_clear.json()["reason"]) == (409, "clear_unsupported")
+    assert refused_clear.json()["error"] == (
+        "The gateway is older than the vault: run zoeymcp review notes --clear in the gateway's "
+        "container."
+    )
+    assert refused_clear.json()["next"] == [
+        {
+            "do": "clear",
+            "label": "Clear the marks in the gateway's container",
+            "command": "zoeymcp review notes --clear",
+        }
+    ]
+    assert len(rig.jobs) == 0
+    assert (await rig.socket("POST", "/review/notes")).status_code == 200
+
+
+async def test_a_done_review_and_a_failed_one_say_what_next(rig: Rig) -> None:
+    """D-200: a done review's answer names choosing the tools; a failed job's refusal, a fresh
+    review."""
+    job = await done_job(rig)
+    done = (await rig.socket("GET", f"/review/jobs/{job.id}")).json()
+    assert [step["do"] for step in done["next"]] == ["choose", "make_fragment"]
+    assert done["next"][0]["command"] == "zoeymcp review notes --via vault --choose --suggest"
+    failed = await rig.app.queue_review("notes", "cli", fresh=True)
+    rig.clock.now += QUEUE_TTL
+    stale = (await rig.socket("GET", f"/review/jobs/{failed.id}")).json()
+    assert (stale["reason"], stale["next"]) == ("review_stale", [AGAIN])
+    assert (await rig.socket("GET", "/review/jobs/nope")).json()["next"] == []
 
 
 def test_the_listener_scope_key_is_the_apps() -> None:

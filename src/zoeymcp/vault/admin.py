@@ -39,14 +39,16 @@ phase 1 (M7 design M.1), owned by the CLI: :class:`.onboard.OnboardService`, whi
 shares, answers them, and a refusal is the catalogue's ``{"error", "reason"}`` with its own
 status (M.2). A given client secret comes in the register body, and no answer carries it.
 
-``POST /review/{server}``, ``GET /review/jobs/{job}?wait=N`` and ``POST
-/review/jobs/{job}/diff`` are the review job path's (M7 design F.2, F.6, M.1), owned by the CLI:
-the first queues a review of a server in the running view for the gateway's poll, or answers the
-CLI's ``done`` job at the current view digest unless the body says ``{"fresh": true}`` (OPS-11);
-the second answers the job's state, and its report once it is done, or a failed job's refusal;
-the third makes fragment 2 from ``{include, allow, approve, indent?}`` as the portal does
-(``portal/reviewview.py``), saving nothing. A refusal is the catalogue's ``{"error", "reason"}``
-(M.2).
+``POST /review/{server}``, ``POST /review/{server}/clear``, ``GET /review/jobs/{job}?wait=N``
+and ``POST /review/jobs/{job}/diff`` are the review job path's (M7 design F.2, F.6, M.1), owned by
+the CLI: the first queues a review of a server in the running view for the gateway's poll, or
+answers the CLI's ``done`` job at the current view digest unless the body says ``{"fresh":
+true}`` (OPS-11); the second queues a clear of its drift marks, which the gateway runs only if
+every included tool matches its pin (M6 design J.4); the third answers the job's state, and its
+report once it is done, or a failed job's refusal; the fourth makes fragment 2 from ``{include,
+allow, approve, indent?}`` as the portal does (``portal/reviewview.py``), saving nothing. A
+refusal is the catalogue's ``{"error", "reason"}`` (M.2), with ``next``, its way on, as a done
+job's answer has (M6 design M.7, D-200).
 
 ``zoeymcp health`` uses ``GET /health``: :mod:`.health`'s findings, from metadata only (M5
 design I), gathered by :class:`HealthReader`, which the portal's ``GET /api/health`` shares.
@@ -106,7 +108,7 @@ from .onboard import (
     OnboardError,
     OnboardService,
 )
-from .onboarding import INLINE_SOURCE, listed_server, tools_max
+from .onboarding import INLINE_SOURCE, job_next, listed_server, refusal_next, tools_max
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
 from .reviewjobs import Job, Owner, ReviewRefused
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
@@ -184,6 +186,8 @@ class ReviewQueue(Protocol):
     from (M7 design F.2)."""
 
     async def queue_review(self, server: str, owner: Owner, *, fresh: bool = False) -> Job: ...
+
+    async def queue_clear(self, server: str, owner: Owner) -> Job: ...
 
     async def review_job(self, job_id: str, owner: Owner, *, wait: float = 0) -> Job: ...
 
@@ -619,6 +623,7 @@ class AdminApp:
                 Route("/review/jobs/{job}", self._review_read, methods=["GET"]),
                 Route("/review/jobs/{job}/diff", self._review_diff, methods=["POST"]),
                 Route("/review/{server}", self._review_queue, methods=["POST"]),
+                Route("/review/{server}/clear", self._review_clear, methods=["POST"]),
                 Route("/health", self._health, methods=["GET"]),
                 Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
                 Route("/ledger/reported/restart", self._ledger_restart, methods=["POST"]),
@@ -928,15 +933,33 @@ class AdminApp:
         fresh = data.get("fresh", False)
         if not set(data) <= {"fresh"} or not isinstance(fresh, bool):
             return _review_refused("bad_body", {})
+        server = request.path_params["server"]
         try:
-            job = await self._reviews.queue_review(
-                request.path_params["server"], _REVIEW_OWNER, fresh=fresh
-            )
+            job = await self._reviews.queue_review(server, _REVIEW_OWNER, fresh=fresh)
         except ReviewRefused as exc:
-            return _review_refused(exc.reason, exc.fields)
+            return _review_refused(exc.reason, exc.fields, server=server)
         answer = _job_answer(job)
         answer["reused"] = job.state == "done"
         return JSONResponse(answer)
+
+    async def _review_clear(self, request: Request) -> Response:
+        """``{}``: ``{job, server, state}``, a clear of the server's drift marks queued for the
+        gateway's poll (M6 design J.4), always a new job; ``clear_unsupported`` while the
+        polling gateway runs no clear jobs. It reads as a review job does: a clear the gateway
+        refused, since an included tool doesn't match its pin, fails ``clear_not_clean``."""
+        if self._reviews is None:
+            return _reason(503, NO_REVIEWS, "unavailable")
+        data = await _json_object(request, REVIEW_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        if data:
+            return _review_refused("bad_body", {})
+        server = request.path_params["server"]
+        try:
+            job = await self._reviews.queue_clear(server, _REVIEW_OWNER)
+        except ReviewRefused as exc:
+            return _review_refused(exc.reason, exc.fields, server=server)
+        return JSONResponse(_job_answer(job))
 
     async def _review_read(self, request: Request) -> Response:
         """``?wait=N``: the CLI's job once it is done or failed, or after N seconds (at most
@@ -957,8 +980,7 @@ class AdminApp:
         except ReviewRefused as exc:
             return _review_refused(exc.reason, exc.fields)
         if job.state == "failed":
-            assert job.failure is not None  # noqa: S101 - every failed job has one
-            return _review_refused(job.failure, dict(job.fields), _job_answer(job))
+            return _failed(job)
         return JSONResponse(_job_answer(job))
 
     async def _review_diff(self, request: Request) -> Response:
@@ -977,8 +999,7 @@ class AdminApp:
         except ReviewRefused as exc:
             return _review_refused(exc.reason, exc.fields)
         if job.state == "failed":
-            assert job.failure is not None  # noqa: S101 - every failed job has one
-            return _review_refused(job.failure, dict(job.fields), _job_answer(job))
+            return _failed(job)
         if job.report is None:
             return _reason(400, "the review isn't done yet", "bad_body")
         policy = self._policy()
@@ -1095,19 +1116,36 @@ def _onboard_refused(exc: OnboardError) -> JSONResponse:
 
 def _job_answer(job: Job) -> dict[str, Any]:
     """A job as the socket answers it: never its digest or times; its report once ``done``, as
-    the gateway posted it."""
+    the gateway posted it (or the review a clear the gateway refused rests on), and once done
+    its way on (M6 design M.7, D-200)."""
     answer: dict[str, Any] = {"job": job.id, "server": job.server, "state": job.state}
     if job.report is not None:
         answer["report"] = job.report.model_dump(mode="json", exclude_unset=True)
+    if job.state == "done":
+        steps = job_next(job.server, clear=job.work == "clear")
+        answer["next"] = [step.answer() for step in steps]
     return answer
 
 
+def _failed(job: Job) -> JSONResponse:
+    """A failed job's refusal, beside the job's answer, with its way on."""
+    assert job.failure is not None  # noqa: S101 - every failed job has one
+    return _review_refused(job.failure, dict(job.fields), _job_answer(job), server=job.server)
+
+
 def _review_refused(
-    reason: str, fields: Mapping[str, str], more: Mapping[str, Any] | None = None
+    reason: str,
+    fields: Mapping[str, str],
+    more: Mapping[str, Any] | None = None,
+    *,
+    server: str | None = None,
 ) -> JSONResponse:
-    """The catalogue's refusal (M.2), its text filled with ``fields``, beside ``more``."""
+    """The catalogue's refusal (M.2), its text filled with ``fields``, beside ``more``, with its
+    way on (``next``) when it is about ``server`` (D-200)."""
     answer = refusal(reason, **fields)
-    return JSONResponse({**(more or {}), **answer.body()}, status_code=answer.status)
+    steps = [step.answer() for step in refusal_next(server, reason)]
+    body = {**(more or {}), **answer.body(), "next": steps}
+    return JSONResponse(body, status_code=answer.status)
 
 
 def _reason(status: int, message: str, reason: str) -> JSONResponse:

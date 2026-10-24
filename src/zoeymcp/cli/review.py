@@ -305,15 +305,20 @@ def vault_review(
     server: str,
     *,
     fresh: bool,
+    clear: bool = False,
     wait: float | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """A review of ``server`` through the vault's job path: queued, or the CLI's finished one
-    handed back unless ``fresh``, then read until it is done or ``wait`` seconds pass (by
-    default :data:`JOB_WAIT_MAX`). The job's answer, with its ``report``. Raises
-    :class:`.admin_client.AdminUnavailable` for a refusal or a failed job, and
-    :class:`StillRunning`."""
-    job = admin_client.review_queue(socket, server, fresh=fresh)
+    handed back unless ``fresh``; with ``clear``, a clear of its drift marks, always a new job
+    (M6 design J.4). Then read until it is done or ``wait`` seconds pass (by default
+    :data:`JOB_WAIT_MAX`). The job's answer, with its ``report``. Raises
+    :class:`.admin_client.AdminUnavailable` for a refusal or a failed job (a clear the gateway
+    refused is ``clear_not_clean``, with the review that found it), and :class:`StillRunning`."""
+    if clear:
+        job = admin_client.review_clear(socket, server)
+    else:
+        job = admin_client.review_queue(socket, server, fresh=fresh)
     deadline = clock() + (JOB_WAIT_MAX if wait is None else wait)
     while job.get("state") != "done":
         left = deadline - clock()

@@ -6,14 +6,18 @@ and pinned, changed after the review. **Review again** asks for a fresh review, 
 one handed back (a drift changes no policy); the rows show the definition the policy pinned
 (which the vault checked against the pin) and the one listed, with the vault's diff; **Accept the
 new definition** re-pins in fragment 2, which a later re-pin makes stale; a tool that flipped
-back reads ``marked`` (J13's screen half; clearing it is step 9's); hostile text shows as text on
-both sides. The page's script isn't run here (``tests.fakes.browser.Page`` runs none): what it
-reads of these answers is pinned by ``tests/unit/test_portal_static.py``.
+back reads ``marked``, and **Clear the marks** is the ``tool.clear`` action, whose job the gateway
+runs (J13, M6 design J.4): done with the marks cleared, ``clear_not_clean`` while a tool still
+doesn't match (FM-28), ``clear_unsupported`` while only an older gateway polls (FM-29); hostile
+text shows as text on both sides. The page's script isn't run here (``tests.fakes.browser.Page``
+runs none): what it reads of these answers is pinned here and by
+``tests/unit/test_portal_static.py``.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -21,14 +25,19 @@ from typing import Any
 import pytest
 
 from tests.fakes.authenticator import SoftAuthenticator
+from tests.unit.test_portal_static import code_of
+from tests.unit.test_portal_static import read as static
 from tests.unit.test_review import pin, reviewed, tool
 from tests.unit.test_reviewchange import server as view_server
 from zoeymcp.common.pinhash import pin_of
+from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import pins
+from zoeymcp.portal.app import CLEAR_WORDS
+from zoeymcp.vault.reviewjobs import Work, read_result
 
-from .flows import set_up, status_reason
-from .rig import rig_policy, running
+from .flows import prepared_action, set_up, status_reason, step_up
+from .rig import PortalRig, rig_policy, running
 from .test_review import World, gateway_answers, notes_entries, poller
 
 RLO = "\u202e"
@@ -184,6 +193,140 @@ def test_a_tool_that_flipped_back_reads_marked(world: World) -> None:
     )
     assert status_reason(refused) == (422, "diff_invalid")
     assert "search hasn't drifted" in refused.json()["error"]
+
+
+# --- Clear the marks (J13, M6 design J.4) ---------------------------------------------------------
+
+AGAIN = {
+    "do": "review",
+    "label": "Review again",
+    "command": "zoeymcp review notes --via vault --fresh",
+    "via": "exec",
+}
+
+
+def flipped_back(*, marked: bool = True) -> dict[str, Any]:
+    """The gateway's review of notes with ``search`` listed at its pin again, still marked."""
+    old = projected(OLD)
+    policy = view_server(["search"], [], {"search": pin_of(old)})
+    marks = frozenset({("search", pin_of(old))}) if marked else frozenset()
+    return reviewed([tool("search", OLD), tool("other")], policy, marks=marks)
+
+
+def advertise(rig: PortalRig, kinds: frozenset[Work]) -> None:
+    """The gateway's poll waiting, advertising ``kinds``."""
+    rig.call(lambda: rig.vault.app._reviews.poll_began(kinds))
+
+
+def gateway_clears(rig: PortalRig, said: dict[str, list[str]]) -> None:
+    """The gateway's side of a clear job, on the vault's loop: claimed by a poll that runs
+    clears, and answered with the review after it and what it did (``cleared`` or
+    ``not_clean``)."""
+    marked = "not_clean" in said
+    report = {**json.loads(json.dumps(flipped_back(marked=marked))), **said}
+
+    def run() -> None:
+        app = rig.vault.app
+        table = app._reviews
+        for job in table.claim(app.view_digest, frozenset({"review", "clear"})):
+            body = {"v": 1, "job": job.id, "server": job.server, "report": report}
+            table.post(read_result(body, GatewayLimits()))
+        app._wake_reviews()
+
+    rig.call(run)
+
+
+def test_clear(tmp_path: Path) -> None:
+    """J13: the tool flipped back reads marked; Clear the marks asks for a passkey (tool.clear),
+    the vault queues a clear job, the gateway clears the marks once every included tool
+    matches, and the page reads the job as a review: done, naming the marks cleared. While the
+    tool still doesn't match, the job fails clear_not_clean, naming it, with a fresh review as
+    the way on (FM-28)."""
+    authenticator = SoftAuthenticator()
+    with running(tmp_path, policy=notes_entries(**served(projected(OLD)))) as rig:
+        page = rig.browser().page(rig.origin)
+        set_up(rig, page, authenticator)
+        advertise(rig, frozenset({"review", "clear"}))
+        world = World(rig, page)
+        _, read = review_again(world, flipped_back())
+        assert row(read, "search")["state"] == "marked"
+        held = prepared_action(page, "tool.clear", {"server": "notes"})
+        assert held["summary"] == [
+            ["Clear the drift marks of", "notes"],
+            ["What happens", CLEAR_WORDS],
+        ]
+        before = rig.policy_file.read_bytes()
+        confirmed = step_up(page, authenticator, "tool.clear", {"server": "notes"})
+        assert confirmed.status_code == 200, confirmed.text
+        job = confirmed.json()["job"]
+        assert confirmed.json() == {"job": job, "server_shown": "notes", "state": "queued"}
+        gateway_clears(rig, {"cleared": ["search"]})
+        answer = page.fetch("GET", f"/api/review/jobs/{job}")
+        assert answer.status_code == 200, answer.text
+        done = answer.json()
+        assert (done["state"], done["cleared_shown"], done["next"]) == ("done", ["search"], [])
+        assert row(done, "search")["state"] == "ok"
+        # What drift.js reads of a clear job's answer is what the portal sends.
+        fields = set(re.findall(r"\bread\.([a-z_]+)", code_of(static("drift.js"))))
+        assert fields <= set(done)
+        assert {"state", "server_shown", "cleared_shown"} <= fields
+        # FM-28: a clear while the tool still drifts; the vault's sentence names it.
+        again = step_up(page, authenticator, "tool.clear", {"server": "notes"})
+        gateway_clears(rig, {"not_clean": ["search"]})
+        refused = page.fetch("GET", f"/api/review/jobs/{again.json()['job']}")
+        assert status_reason(refused) == (409, "clear_not_clean")
+        assert refused.json()["error"] == (
+            "These still don't match their pins: search. No mark was cleared; review the server "
+            "again."
+        )
+        assert refused.json()["next"] == [AGAIN]
+        assert refused.json()["state"] == "failed"
+        assert rig.policy_file.read_bytes() == before  # a clear never changes the policy
+        assert rig.logged("step_up_confirmed", lambda line: line["action"] == "tool.clear")
+        assert rig.logged(
+            "review_requested", lambda line: line.get("clear") is True and line["owner"] == "portal"
+        )
+
+
+def test_clear_unsupported_and_unknown(tmp_path: Path) -> None:
+    """FM-29 in the portal: while only an older gateway polls, the clear's run is refused
+    clear_unsupported, with the gateway's own --clear as the way on, and nothing is queued; a
+    server the policy doesn't have is refused at the plan, before any passkey."""
+    authenticator = SoftAuthenticator()
+    with running(tmp_path, policy=notes_entries(**served(projected(OLD)))) as rig:
+        page = rig.browser().page(rig.origin)
+        set_up(rig, page, authenticator)
+        poller(rig)  # an older gateway's poll: it advertises nothing
+        refused = step_up(page, authenticator, "tool.clear", {"server": "notes"})
+        assert status_reason(refused) == (409, "clear_unsupported")
+        assert (
+            "run zoeymcp review notes --clear in the gateway's container" in refused.json()["error"]
+        )
+        assert refused.json()["next"] == [
+            {
+                "do": "clear",
+                "label": "Clear the marks in the gateway's container",
+                "command": "zoeymcp review notes --clear",
+            }
+        ]
+        assert rig.call(lambda: len(rig.vault.app._reviews)) == 0
+        unknown = page.fetch(
+            "POST", "/api/actions", json={"kind": "tool.clear", "data": {"server": "other"}}
+        )
+        assert status_reason(unknown) == (404, "review_unknown_server")
+        assert unknown.json()["next"] == []
+
+
+def test_review_refusals_carry_next(world: World) -> None:
+    """D-200 in the portal: a refusal about a server names its way on, which the page's refusal
+    renders as a button (review.js's renderSteps): a busy server, a fresh review."""
+    page = world.page
+    assert page.fetch("POST", "/api/review/notes", json={"fresh": True}).status_code == 200
+    busy = page.fetch("POST", "/api/review/notes", json={"fresh": True})
+    assert status_reason(busy) == (409, "review_busy")
+    assert busy.json()["next"] == [AGAIN]
+    unknown = page.fetch("POST", "/api/review/other", json={})
+    assert (status_reason(unknown), unknown.json()["next"]) == ((404, "review_unknown_server"), [])
 
 
 def test_record_the_rest_as_declined(world: World) -> None:
