@@ -30,7 +30,9 @@ written first, and the new revision, with no parent, is one above every number t
 records the head a declarative start parked, with ``highest`` the head's too (F.4).
 :meth:`PolicyStore.removed_lookup` finds in the kept history the revision that retired a client's
 token or a caller's placeholder, which the ratchet doesn't keep (E.1), for the planner's refusal
-texts.
+texts. :meth:`PolicyStore.history` pages the kept revisions' headers, newest first, a revision
+in quarantine as a gap (H.1); :meth:`PolicyStore.revision` and :meth:`PolicyStore.policy` read a
+kept one again, and :meth:`PolicyStore.missing` says why one can't be (H.3).
 
 Every write goes through a module-level seam (:func:`write_revision`, :func:`write_head`,
 :func:`write_anchor`, :func:`move`, :func:`remove`): unit tests make them fail, and
@@ -56,6 +58,7 @@ from ..common.logs import refuse_type
 from ..common.policy.plan import WritePlan, document
 from ..common.policy.ratchet import Ratchet, caller_digest
 from ..common.policy.schema import PlaceholderCaller, Policy
+from ..common.textrules import reveal_hidden
 from . import logs
 from .keys import POLICY_NONCE_BYTES, KeySet
 from .policyseal import (
@@ -101,6 +104,11 @@ Reason = Literal["policy_write_failed", "revision_out_of_range", "reseed_incompl
 
 # The revisions kept, the head's included (D.8, Q25).
 KEEP: Final = 64
+# The most entries one page of history holds (H.1, N.4).
+HISTORY_PAGE_MAX: Final = 50
+# A revision a rollback or an export names that isn't kept (H.3): one in quarantine (or missing)
+# between the oldest kept and the head, or one pruned or never written.
+Missing = Literal["revision_unreadable", "revision_unknown"]
 # The store's directories are the vault's alone (D.1).
 DIRECTORY_MODE: Final = 0o700
 # The vault's own seed's author; the host's offline seed and reseed are by the host (D.2, F.3).
@@ -653,7 +661,19 @@ class PolicyStore:
 
     def policy(self, number: int) -> Policy | None:
         """Kept revision ``number``'s policy, read and verified now, or ``None`` when it isn't
-        kept or doesn't verify: a retry's base (G.6 step 2, MISS-9)."""
+        kept or doesn't verify: a retry's base (G.6 step 2, MISS-9), a rollback's target (H.3),
+        an export (H.6) or a side of a diff (H.2)."""
+        found = self.revision(number)
+        if found is None:
+            return None
+        try:
+            return Policy.model_validate(dict(found.body.policy))
+        except ValueError:
+            return None
+
+    def revision(self, number: int) -> Unsealed | None:
+        """Kept revision ``number``, read and verified now, or ``None`` when it isn't kept or
+        doesn't verify."""
         if number not in self._parents:
             return None
         head = self._running()
@@ -666,10 +686,38 @@ class PolicyStore:
         )
         if not isinstance(found, Unsealed) or found.revision != number:
             return None
-        try:
-            return Policy.model_validate(dict(found.body.policy))
-        except ValueError:
+        return found
+
+    def missing(self, number: int) -> Missing | None:
+        """Why revision ``number`` can't be read (H.3), or ``None`` when it is kept: between the
+        oldest kept and the head it went to quarantine (``revision_unreadable``); below it, it
+        was pruned, and above the head it was never written (``revision_unknown``)."""
+        if number in self._parents:
             return None
+        head = self._running()
+        if head.oldest <= number <= head.revision:
+            return "revision_unreadable"
+        return "revision_unknown"
+
+    def history(
+        self, before: int | None = None, limit: int = HISTORY_PAGE_MAX
+    ) -> list[dict[str, Any]]:
+        """A page of history (H.1), newest first: each revision from the head (or from
+        ``before`` less one) down to the oldest kept, at most ``limit`` of them (1 to
+        :data:`HISTORY_PAGE_MAX`). A kept revision is its header as :func:`history_entry` shows
+        it, read and verified now; one in quarantine, or that no longer verifies, is a gap
+        (``{"revision": n, "gap": true}``)."""
+        head = self._running()
+        top = head.revision if before is None else min(before - 1, head.revision)
+        count = max(1, min(limit, HISTORY_PAGE_MAX))
+        found: list[dict[str, Any]] = []
+        for number in range(top, max(head.oldest, top - count + 1) - 1, -1):
+            entry = self.revision(number)
+            if entry is None:
+                found.append({"revision": number, "gap": True})
+            else:
+                found.append(history_entry(entry.header, entry.body.reason))
+        return found
 
     def quarantined(self) -> int:
         """How many files ``quarantine/`` holds (health's ``policy_quarantine_kept``, D.8)."""
@@ -948,6 +996,23 @@ class PolicyStore:
 
 
 refuse_type(PolicyStore)
+
+
+def history_entry(header: Mapping[str, Any], reason: str | None) -> dict[str, Any]:
+    """A revision as history shows it (H.1, Y13): its number, when, origin, kind, author, base,
+    target and jump, and the host's reason with hidden characters revealed. Never a digest or
+    anything the body holds besides the reason."""
+    return {
+        "revision": header["revision"],
+        "created": header["created"],
+        "origin": header["origin"],
+        "kind": header["kind"],
+        "author": dict(header["author"]),
+        "base": header["base"],
+        "target": header["target"],
+        "jumped_from": header["jumped_from"],
+        "reason": None if reason is None else reveal_hidden(reason),
+    }
 
 
 def _nonce() -> bytes:

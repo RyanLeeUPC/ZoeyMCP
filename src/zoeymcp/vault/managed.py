@@ -37,13 +37,17 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from string import Formatter
 from typing import Any, Final, Literal
+from urllib.parse import urlsplit
 
 from ..common.canonical import digest
 from ..common.logs import refuse_type
-from ..common.policy import gate, restart
+from ..common.policy import diff, gate, restart
+from ..common.policy.emit import Target
+from ..common.policy.export import Mode, export, notes
 from ..common.policy.gate import GateRefused
 from ..common.policy.plan import (
     BindingState,
@@ -52,6 +56,9 @@ from ..common.policy.plan import (
     Surface,
     WriteKind,
     WritePlan,
+    carry_forward,
+    document,
+    normalize,
     normalized_digest,
     plan,
 )
@@ -60,13 +67,16 @@ from ..common.policy.restart import Effect
 from ..common.policy.reviewchange import Lines
 from ..common.policy.schema import Policy
 from ..common.suggest import Suggestion
+from ..portal import policydiffview
 from ..portal.policyview import saved
+from ..portal.refusals import CATALOGUE, Refusal, refusal
 from . import gatewaykeys, health, logs
 from .app import VaultApp
 from .gatewaykeys import GatewayKeyError
-from .policyseal import Head
+from .onboarding import NextStep, saved_next
+from .policyseal import Head, Unsealed
 from .policystart import Commands, Ok, Refused, SeedIgnored, Source
-from .policystore import KEEP, PolicyStore, StoreRefused
+from .policystore import HISTORY_PAGE_MAX, KEEP, Committed, PolicyStore, StoreRefused
 from .store import SecretStore
 
 # The refusals a write itself gives; the planner's and the store's pass through by their own
@@ -194,15 +204,18 @@ class Evidence:
 
 @dataclass(frozen=True)
 class Written:
-    """A committed write: its revision and digest, the plan's effects (I.2), and the gateway's
-    state, ``pending`` until its status shows the new view (K.1). ``already_saved`` answers a
-    retry of the write that made the head (G.6 step 2)."""
+    """A committed write: its revision and digest, the plan's effects (I.2), the gateway's
+    state, ``pending`` until its status shows the new view (K.1), and what the operator does
+    next (M.7). ``already_saved`` answers a retry of the write that made the head (G.6 step 2).
+    ``captured`` is what the write's ``capture`` took inside the section (G.8)."""
 
     revision: int
     digest: str
     effects: tuple[Effect, ...] = ()
     already_saved: bool = False
     gateway: str = "pending"
+    next: tuple[NextStep, ...] = ()
+    captured: Any = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -218,6 +231,173 @@ class WriteRefused:
     next: str | None = None
     revision: int | None = None
     plan: WritePlan | None = field(default=None, repr=False)
+
+
+def refused_answer(refused: WriteRefused) -> Refusal:
+    """A write's refusal as the catalogue words it (N.2): its text filled with the fields it
+    names, of the refusal's ``detail`` and ``revision``."""
+    text = CATALOGUE[refused.reason].text
+    wanted = {name for _, name, _, _ in Formatter().parse(text) if name is not None}
+    offered = {"detail": refused.detail, "revision": str(refused.revision)}
+    return refusal(refused.reason, **{k: v for k, v in offered.items() if k in wanted})
+
+
+@dataclass(frozen=True)
+class Lockout:
+    """A host write's lockout row (I.1, G-17): what it does, and what the operator types to
+    confirm it (the origin it removes, or where the portal will listen)."""
+
+    text: str
+    confirm: str
+
+
+def _host(origin: str) -> str:
+    return (urlsplit(origin).hostname or "").lower()
+
+
+def lockout_rows(
+    head: Policy, candidate: Policy, rp_ids: Iterable[str] | None
+) -> tuple[Lockout, ...]:
+    """The rows of a host write that can lock the portal out (I.1, G-17, Y17): each ``admin``
+    origin it removes whose host is the RP ID of an enrolled passkey (``rp_ids``, every
+    passkey's) and no origin it keeps has, and a changed ``admin.listen``. ``rp_ids`` None means
+    the passkey file can't be read: every such removed origin is a row then (fail closed)."""
+    before, after = head.admin, candidate.admin
+    if before is None:
+        return ()
+    kept = [] if after is None else after.origins
+    hosts = {_host(origin) for origin in kept}
+    enrolled = None if rp_ids is None else [rp_id.lower() for rp_id in rp_ids]
+    rows: list[Lockout] = []
+    for origin in before.origins:
+        if origin in kept or _host(origin) in hosts:
+            continue
+        if enrolled is None:
+            text = (
+                f"removes {origin}: the passkey file can't be read, so passkeys enrolled "
+                "through it may stop working"
+            )
+            rows.append(Lockout(text, origin))
+            continue
+        count = enrolled.count(_host(origin))
+        if count == 1:
+            text = f"removes {origin}, where 1 passkey was enrolled: it stops working"
+            rows.append(Lockout(text, origin))
+        elif count:
+            text = f"removes {origin}, where {count} passkeys were enrolled: they stop working"
+            rows.append(Lockout(text, origin))
+    if after is not None and after.listen != before.listen:
+        text = (
+            f"moves the portal from {before.listen} to {after.listen}: after the vault's "
+            "restart it listens there"
+        )
+        rows.append(Lockout(text, str(after.listen)))
+    return tuple(rows)
+
+
+def widenings(planned: WritePlan) -> list[str]:
+    """A plan's widening rows by path (G.7 row 2, Q41): each move to allow, and each change the
+    direction table calls wider (a new client, caller or origin among them)."""
+    moved = [f"{server}.{name}" for server, _, name in planned.moves]
+    wider = [
+        ".".join(str(part) for part in change.path)
+        for change in planned.changes
+        if diff.direction(change) == "wider"
+    ]
+    return moved + [path for path in wider if path not in moved]
+
+
+def widens(planned: WritePlan) -> bool:
+    """Whether a plan holds a widening row (:func:`widenings`)."""
+    return bool(widenings(planned))
+
+
+def imported(head: Policy, given: Policy) -> Policy:
+    """An import's candidate (H.5 step 4): the document with, from the head, the pin of every
+    definition both hold (an import can't re-pin: that is a review) and ``declined`` the union
+    less what the document includes (T-9), as a host rollback's carry-forward takes them, with
+    ``admin`` and the key generations as the document gives them: an import is how the host
+    changes ``admin`` (I.1) and rotates a key (J15), and the ratchet refuses a lower
+    generation (E1)."""
+    data = document(carry_forward(head, given, host=True))
+    for name in ("gateway_key_generation", "egress_key_generation"):
+        data[name] = getattr(given, name)
+    return Policy.model_validate(data)
+
+
+def plan_on(
+    store: PolicyStore,
+    head: Policy,
+    ratchet: Ratchet,
+    kind: WriteKind,
+    surface: Surface,
+    candidate_of: Callable[[Policy], Policy],
+    *,
+    environ: Mapping[str, str],
+    started: restart.Started,
+    bindings: Callable[[Policy], Mapping[str, BindingState]],
+    grants: Grants,
+    evidence: Evidence,
+) -> WritePlan | WriteRefused:
+    """G.6 steps 3 and 4 on the store's head (``head``, with its ``ratchet``): the candidate
+    ``candidate_of`` builds from it, through the gate with ``environ`` (C), then the planner
+    (G.5), with the history lookup for its refusal texts. The running vault's write and the
+    host's offline forms (``cli/policy.py``) both plan here. ``candidate_of``'s own errors
+    (``ValueError``) pass through."""
+    top = store.head
+    if top is None:
+        raise ValueError("a write needs a store with a head")
+    try:
+        candidate = gate.admit(candidate_of(head), f"revision {top.revision + 1}", environ=environ)
+    except GateRefused as exc:
+        return WriteRefused("import_refused", str(exc))
+    planned = plan(
+        PlanInput(
+            kind=kind,
+            surface=surface,
+            head=head,
+            head_revision=top.revision,
+            head_digest=top.digest,
+            ratchet=ratchet,
+            candidate=candidate.policy,
+            started=started,
+            bindings=bindings,
+            verified=evidence.verified,
+            drifted=evidence.drifted,
+            definitions=evidence.definitions,
+            suggested=evidence.suggested,
+            marked=evidence.marked,
+            consequential=evidence.consequential,
+            grants=grants,
+            target=evidence.target,
+            target_revision=evidence.target_revision,
+            removed_in=store.removed_lookup(candidate.policy),
+        )
+    )
+    if isinstance(planned, PlanRefused):
+        return WriteRefused(planned.reason, planned.detail, planned.subjects, planned.next)
+    return planned
+
+
+def lowered(state: gatewaykeys.State | None, planned: WritePlan) -> WriteRefused | None:
+    """G.6 step 5 (G-4): a gateway key generation below the gateway-key state, refused before
+    any file is written; None without a state to compare."""
+    if state is None:
+        return None
+    found = gatewaykeys.check(state, planned.policy.gateway_key_generation)
+    return None if found is None else WriteRefused("generation_lowered", found.reason)
+
+
+def moved(header: Mapping[str, Any] | None, revision: int) -> str:
+    """``policy_moved``'s detail (G.6 step 2, N.2): the head ``revision`` with when and by whom
+    it was written, as the policy view names it (A.4), from its ``header``."""
+    said = f"revision {revision}" if header is None else saved(header)
+    return f"the policy moved to {said} since you started"
+
+
+def author_shown(author: Mapping[str, str]) -> str:
+    """The author as a log line names it: a passkey's fingerprint's first 8, or ``host``."""
+    return _author(author)
 
 
 class ManagedPolicy:
@@ -292,6 +472,33 @@ class ManagedPolicy:
         return self._running_header
 
     @property
+    def store(self) -> PolicyStore:
+        """The store whose head this vault runs (history, diffs and exports read it, H)."""
+        return self._store
+
+    @property
+    def policy(self) -> Policy:
+        """The head's policy (while a saved revision isn't running, that one's)."""
+        return self._policy
+
+    @property
+    def environ(self) -> Mapping[str, str]:
+        """The vault's environment, which every candidate is checked with (C)."""
+        return self._environ
+
+    def gateway(self) -> dict[str, Any]:
+        """Which revision the gateway runs (G-23, K.1), from its latest status report's view
+        digest and the revision-to-view-digest map: ``applied`` when it is the head's,
+        ``pending`` when it is another's or none this process installed, ``unknown`` before any
+        report; with the newest revision whose view it is, when there is one."""
+        report = self._app.gateway_status().report
+        if report is None:
+            return {"state": "unknown", "revision": None}
+        found = [n for n, view in self._digests.items() if view == report.view]
+        applied = self._digests.get(self.revision) == report.view
+        return {"state": "applied" if applied else "pending", "revision": max(found, default=None)}
+
+    @property
     def view_digests(self) -> Mapping[int, str]:
         """Each revision this process installed, newest :data:`~.policystore.KEEP`, and the
         view digest its install built (K.1's map)."""
@@ -339,15 +546,20 @@ class ManagedPolicy:
         evidence: Evidence | None = None,
         seed_digest: str | None = None,
         jumped_from: int | None = None,
+        capture: Callable[[WritePlan], Any] | None = None,
+        logged: Mapping[str, Any] | None = None,
     ) -> Written | WriteRefused:
         """One write, planned on revision ``base``: ``candidate_of`` builds the candidate from a
         policy (the head's, or for a retry its parent's; G.6 step 3), ``author`` is the header's
         (D.2), ``expected`` the plan the portal's action holds or the socket's plan digest
         (None: none to compare). ``grants`` are the host's (the portal passes none),
         ``evidence`` what the surface read for the planner, ``seed_digest`` a new seed digest
-        (F.5) and ``jumped_from`` an acknowledged restore's (K.3). Synchronous, with no await:
-        nothing else on the event loop runs until it returns. ``candidate_of``'s own errors
-        (``ValueError``) pass through, with nothing written."""
+        (F.5) and ``jumped_from`` an acknowledged restore's (K.3). ``capture`` runs on the final
+        plan inside the section, before the commit, from the policy still running (a host
+        write's revocation material, G.8, CR-5); what it returns is the answer's ``captured``.
+        ``logged`` adds fields to the write's log line (an import's ``from_env``, N.3).
+        Synchronous, with no await: nothing else on the event loop runs until it returns.
+        ``candidate_of``'s own errors (``ValueError``) pass through, with nothing written."""
         with self._lock:
             return self._write(
                 kind,
@@ -361,7 +573,42 @@ class ManagedPolicy:
                 evidence=evidence or Evidence(),
                 seed_digest=seed_digest,
                 jumped_from=jumped_from,
+                capture=capture,
+                logged=logged or {},
             )
+
+    def plan(
+        self,
+        kind: WriteKind,
+        surface: Surface,
+        base: int,
+        candidate_of: Callable[[Policy], Policy],
+        *,
+        author: Mapping[str, str] | None = None,
+        grants: Grants | None = None,
+        evidence: Evidence | None = None,
+    ) -> WritePlan | WriteRefused | Written:
+        """What :meth:`write` would commit, and nothing written (the socket's ``?plan=1``, H.5):
+        G.6 steps 1 to 5, a write on another head ``policy_moved``, unless it is the write by
+        ``author`` that made the head, whose answer was lost: that is ``already_saved``, as
+        :meth:`write` answers it (MISS-9, FM-16; the CLI plans before it commits, so its rerun
+        meets it here). Synchronous."""
+        with self._lock:
+            head = self._head()
+            if (
+                author is not None
+                and self._not_running is None
+                and base != head.revision
+                and self._retried(kind, base, candidate_of, author)
+            ):
+                return Written(head.revision, head.digest, already_saved=True)
+            refused = self._refused_first(head, base)
+            if refused is not None:
+                return refused
+            planned = self._planned(kind, surface, candidate_of, grants or Grants(), evidence)
+            if isinstance(planned, WriteRefused):
+                return planned
+            return lowered(self._app.gateway_keys.state, planned) or planned
 
     def _write(
         self,
@@ -377,66 +624,36 @@ class ManagedPolicy:
         evidence: Evidence,
         seed_digest: str | None,
         jumped_from: int | None,
+        capture: Callable[[WritePlan], Any] | None,
+        logged: Mapping[str, Any],
     ) -> Written | WriteRefused:
         head = self._head()
-        # Step 1: a revision saved and not running refuses every write until it runs.
-        if self._not_running is not None:
-            number = self._not_running
-            detail = (
-                f"revision {number} is saved but not running: send SIGHUP to the vault or "
-                "restart it"
-            )
-            return WriteRefused("policy_not_running", detail, revision=number)
-        # Step 2: a retry whose answer was lost, or a write on a head that moved.
-        if base != head.revision:
-            if self._retried(kind, base, candidate_of, author):
-                return Written(head.revision, head.digest, already_saved=True)
-            header = self._store.header
-            said = f"revision {head.revision}" if header is None else saved(header)
-            detail = f"the policy moved to {said} since you started"
-            return WriteRefused("policy_moved", detail, revision=head.revision)
-        # Step 3: the candidate, built on the head, through the gate (C).
-        try:
-            label = f"revision {head.revision + 1}"
-            candidate = gate.admit(candidate_of(self._policy), label, environ=self._environ)
-        except GateRefused as exc:
-            return WriteRefused("import_refused", str(exc))
-        # Step 4: the plan, and the one the caller confirmed.
-        planned = plan(
-            PlanInput(
-                kind=kind,
-                surface=surface,
-                head=self._policy,
-                head_revision=head.revision,
-                head_digest=head.digest,
-                ratchet=self._ratchet,
-                candidate=candidate.policy,
-                started=self._started,
-                bindings=self._bindings,
-                verified=evidence.verified,
-                drifted=evidence.drifted,
-                definitions=evidence.definitions,
-                suggested=evidence.suggested,
-                marked=evidence.marked,
-                consequential=evidence.consequential,
-                grants=grants,
-                target=evidence.target,
-                target_revision=evidence.target_revision,
-                removed_in=self._store.removed_lookup(candidate.policy),
-            )
-        )
-        if isinstance(planned, PlanRefused):
-            return WriteRefused(planned.reason, planned.detail, planned.subjects, planned.next)
+        # Step 2: a retry whose answer was lost (step 1 refuses it too while not running).
+        if (
+            self._not_running is None
+            and base != head.revision
+            and self._retried(kind, base, candidate_of, author)
+        ):
+            return Written(head.revision, head.digest, already_saved=True)
+        # Steps 1 and 2: a revision saved and not running, or a head that moved.
+        refused = self._refused_first(head, base)
+        if refused is not None:
+            return refused
+        # Steps 3 and 4: the candidate through the gate (C) and the planner, and the plan the
+        # caller confirmed.
+        planned = self._planned(kind, surface, candidate_of, grants, evidence)
+        if isinstance(planned, WriteRefused):
+            return planned
         if isinstance(expected, WritePlan) and expected != planned:
             return WriteRefused("changed", "the plan changed", plan=planned)
         if isinstance(expected, str) and expected != plan_digest(planned):
             return WriteRefused("plan_changed", "the plan changed", plan=planned)
         # Step 5: the gateway key generation, before any file is written (G-4).
-        lowered = gatewaykeys.check(
-            self._app.gateway_keys.state, planned.policy.gateway_key_generation
-        )
-        if lowered is not None:
-            return WriteRefused("generation_lowered", lowered.reason)
+        refused = lowered(self._app.gateway_keys.state, planned)
+        if refused is not None:
+            return refused
+        # What the write takes from the policy still running, before it changes (G.8, CR-5).
+        captured = None if capture is None else capture(planned)
         # Steps 6 and 7: the commit (D.9), the anchor first when it is dirty.
         target = evidence.target_revision if planned.kind == "policy.rollback" else None
         try:
@@ -454,27 +671,59 @@ class ManagedPolicy:
         # Step 8: the install.
         failed = self._install(committed.revision, committed.digest, planned.policy)
         # Step 9: the log lines.
-        event = _SAVED_EVENTS.get(planned.kind, "policy_saved")
-        logs.event(
-            event,
-            revision=committed.revision,
-            write_kind=planned.kind,  # "kind" is the logger's own argument
-            origin=committed.header["origin"],
-            author=_author(author),
-            base=planned.base,
-            digest=_digest8(committed.digest),
-            effects=[effect.kind for effect in planned.effects],
-            **({"target": target} if target is not None else {}),
-            **({"jumped_from": jumped_from} if jumped_from is not None else {}),
-        )
-        _log_tools(planned, committed.revision)
+        log_saved(planned, committed, author, jumped_from=jumped_from, logged=logged)
         if failed is not None:
             detail = (
                 f"saved as revision {committed.revision}, but the vault couldn't apply it: send "
                 "SIGHUP to the vault or restart it"
             )
             return WriteRefused("saved_not_running", detail, revision=committed.revision)
-        return Written(committed.revision, committed.digest, planned.effects)
+        return Written(
+            committed.revision,
+            committed.digest,
+            planned.effects,
+            next=saved_next(planned.effects),
+            captured=captured,
+        )
+
+    def _refused_first(self, head: Head, base: int) -> WriteRefused | None:
+        """G.6 steps 1 and 2's refusals: a revision saved and not running refuses every write
+        until it runs; a write planned on another revision is ``policy_moved``, naming when and
+        by whom the head was written (:func:`moved`)."""
+        if self._not_running is not None:
+            number = self._not_running
+            detail = (
+                f"revision {number} is saved but not running: send SIGHUP to the vault or "
+                "restart it"
+            )
+            return WriteRefused("policy_not_running", detail, revision=number)
+        if base != head.revision:
+            detail = moved(self._store.header, head.revision)
+            return WriteRefused("policy_moved", detail, revision=head.revision)
+        return None
+
+    def _planned(
+        self,
+        kind: WriteKind,
+        surface: Surface,
+        candidate_of: Callable[[Policy], Policy],
+        grants: Grants,
+        evidence: Evidence | None,
+    ) -> WritePlan | WriteRefused:
+        """G.6 steps 3 and 4 on the head (:func:`plan_on`)."""
+        return plan_on(
+            self._store,
+            self._policy,
+            self._ratchet,
+            kind,
+            surface,
+            candidate_of,
+            environ=self._environ,
+            started=self._started,
+            bindings=self._bindings,
+            grants=grants,
+            evidence=evidence or Evidence(),
+        )
 
     def _retried(
         self,
@@ -595,6 +844,35 @@ class ManagedPolicy:
 refuse_type(ManagedPolicy)
 
 
+def log_saved(
+    planned: WritePlan,
+    committed: Committed,
+    author: Mapping[str, str],
+    *,
+    jumped_from: int | None = None,
+    logged: Mapping[str, Any] | None = None,
+) -> None:
+    """G.6 step 9's lines (N.3): the revision's event, by its kind, with a rollback's target and
+    an acknowledged restore's jump, and ``logged``'s fields; then one line per tool moved to
+    allow, kept allow or re-pinned. The running vault's writes and the host's offline ones log
+    alike."""
+    target = committed.header["target"]
+    logs.event(
+        _SAVED_EVENTS.get(planned.kind, "policy_saved"),
+        revision=committed.revision,
+        write_kind=planned.kind,  # "kind" is the logger's own argument
+        origin=committed.header["origin"],
+        author=_author(author),
+        base=planned.base,
+        digest=_digest8(committed.digest),
+        effects=[effect.kind for effect in planned.effects],
+        **({"target": target} if target is not None else {}),
+        **({"jumped_from": jumped_from} if jumped_from is not None else {}),
+        **(logged or {}),
+    )
+    _log_tools(planned, committed.revision)
+
+
 def _log_tools(planned: WritePlan, revision: int) -> None:
     """``tool_allowed`` per move to allow and, with ``kept``, per kept allow; ``tool_repinned``
     per re-pin, whatever the write's kind (G.6 step 9, N.3, Q27). The definition's kind is
@@ -611,6 +889,205 @@ def _log_tools(planned: WritePlan, revision: int) -> None:
             logs.event(
                 "tool_repinned", server=server, def_kind="tool", name=name, revision=revision
             )
+
+
+# --- what the host reads and is answered (H.1-H.6, N.1) --------------------------------------
+#
+# The admin socket's policy routes and the host's offline forms (``cli/policy.py``) answer in
+# these shapes, from the same store, so the two read alike.
+
+
+def history_page(
+    store: PolicyStore, before: int | None = None, limit: int = HISTORY_PAGE_MAX
+) -> dict[str, Any]:
+    """A page of history (H.1): the entries, newest first, and ``next``, the ``before`` of the
+    next page, or None at the oldest kept revision."""
+    entries = store.history(before, limit)
+    head = store.head
+    last = entries[-1]["revision"] if entries else None
+    more = last is not None and head is not None and last > head.oldest
+    return {"revisions": entries, "next": last if more else None}
+
+
+def read_revision(store: PolicyStore, number: int) -> tuple[Unsealed, Policy] | Refusal:
+    """Kept revision ``number`` and its policy, or why it can't be read (H.3:
+    ``revision_unreadable`` in quarantine or no longer verifying, ``revision_unknown`` pruned
+    or never written)."""
+    found = store.revision(number)
+    policy = store.policy(number) if found is not None else None
+    if found is None or policy is None:
+        why = store.missing(number) or "revision_unreadable"
+        return refusal(why, revision=str(number))
+    return found, policy
+
+
+def diff_answer(
+    store: PolicyStore, number: int, against: int | None = None
+) -> dict[str, Any] | Refusal:
+    """Revision ``number``'s diff from ``against``, by default its parent (H.2): every row
+    through the policy view's renderer (``portal/policydiffview.py``), hidden fields hidden
+    (Y13). A revision with no parent (the seed, a reseed) is diffed from an empty policy."""
+    read = read_revision(store, number)
+    if isinstance(read, Refusal):
+        return read
+    entry, new = read
+    if against is None and entry.header["parent"] is not None:
+        against = number - 1
+    if against is None:
+        old = Policy.model_validate({"version": 1, "mode": "managed"})
+    else:
+        other = read_revision(store, against)
+        if isinstance(other, Refusal):
+            return other
+        old = other[1]
+    changes = diff.structured(normalize(old), normalize(new))
+    return {"revision": number, "against": against, "rows": policydiffview.rows(changes)}
+
+
+def export_answer(
+    store: PolicyStore, number: int, *, mode: Mode = "managed", target: Target = "plain"
+) -> dict[str, Any] | Refusal:
+    """Revision ``number`` exported (H.6, R61's fourth exception): the document and the notes
+    the CLI writes beside it."""
+    read = read_revision(store, number)
+    if isinstance(read, Refusal):
+        return read
+    entry, policy = read
+    deployment = str(entry.header["deployment"])
+    return {
+        "revision": number,
+        "deployment": deployment[:8],
+        "export": export(
+            policy,
+            revision=number,
+            deployment=deployment,
+            created=entry.header["created"],
+            mode=mode,
+            target=target,
+        ),
+        "notes": notes(policy, revision=number, deployment=deployment, mode=mode, target=target),
+    }
+
+
+def plan_answer(planned: WritePlan, lockout: Iterable[Lockout]) -> dict[str, Any]:
+    """A host write's plan (H.5 step 5): its rows in G.7's order, widenings first, its
+    effects, whether it widens (``import_widens``, Q41), its lockout rows (I.1), the store
+    entries it leaves unused (G.8) and the digest the commit names in ``X-ZoeyMCP-Plan``."""
+    return {
+        "kind": planned.kind,
+        "base": planned.base,
+        "revision": planned.base + 1,
+        "rows": [list(row) for row in planned.rows],
+        "effects": [
+            {"kind": effect.kind, "path": effect.path, "text": effect.text}
+            for effect in planned.effects
+        ],
+        "widens": widens(planned),
+        "widenings": widenings(planned),
+        "lockout": [{"text": row.text, "confirm": row.confirm} for row in lockout],
+        "unused": list(planned.unused_slots),
+        "digest": plan_digest(planned),
+    }
+
+
+@dataclass(frozen=True)
+class Shaped:
+    """A host write as the write path takes it: its kind, the candidate it builds on a head,
+    what the planner reads besides, a new seed digest (F.5) and the log line's extra fields."""
+
+    kind: WriteKind
+    candidate_of: Callable[[Policy], Policy] = field(repr=False)
+    evidence: Evidence = field(default_factory=Evidence, repr=False)
+    seed_digest: str | None = field(default=None, repr=False)
+    logged: Mapping[str, Any] = field(default_factory=dict)
+
+
+def import_shaped(
+    seed_digest: str | None,
+    basis: Policy,
+    given: Policy,
+    *,
+    from_env: bool = False,
+    baseline_only: bool = False,
+) -> Shaped | Refusal:
+    """An import of ``given``, admitted by the gate (H.5): ``import_declarative`` unless it is
+    managed; else planned as :func:`imported` builds it, the document its target (the plan's
+    "Kept" rows). ``from_env`` (G-14): ``given`` is the configured policy, whose normalized
+    digest becomes the seed digest, and one equal to ``basis`` is the baseline write rather
+    than ``no_change``, or ``nothing_to_acknowledge`` when it is already the seed's; with
+    ``baseline_only`` it changes nothing and records that digest (``policy.acknowledge``, F.5,
+    OPS-7), ``nothing_to_acknowledge`` when it is already the seed's or ``basis``'s. ``basis``
+    and ``seed_digest`` are the revision the import is planned on, its policy and seed digest:
+    a retry whose answer was lost is shaped as its first try was, so the write can tell it
+    (``already_saved``, G.6 step 2)."""
+    if given.mode != "managed":
+        return refusal("import_declarative")
+    digest_of = normalized_digest(given)
+    logged = {"from_env": from_env, "baseline_only": baseline_only}
+    seed = digest_of if from_env else None
+    if baseline_only:
+        if digest_of in (seed_digest, normalized_digest(basis)):
+            detail = "the configured policy already matches the one seeded, or the head"
+            return refusal("nothing_to_acknowledge", detail=detail)
+        return Shaped("policy.acknowledge", _same, seed_digest=seed, logged=logged)
+    if from_env and normalized_digest(imported(basis, given)) == normalized_digest(basis):
+        if digest_of == seed_digest:
+            detail = "the configured policy is the head's, and already its seed's"
+            return refusal("nothing_to_acknowledge", detail=detail)
+        return Shaped("policy.acknowledge", _same, seed_digest=seed, logged=logged)
+
+    def candidate_of(policy: Policy) -> Policy:
+        return imported(policy, given)
+
+    return Shaped(
+        "policy.import", candidate_of, Evidence(target=given), seed_digest=seed, logged=logged
+    )
+
+
+def rollback_shaped(store: PolicyStore, number: int) -> Shaped | Refusal:
+    """A host rollback to kept revision ``number`` (H.3): its policy carried forward on the head
+    as a host's (H.4: the target's ``admin``, the head's key generations and pins), or why the
+    target can't be read."""
+    read = read_revision(store, number)
+    if isinstance(read, Refusal):
+        return read
+    target = read[1]
+
+    def candidate_of(policy: Policy) -> Policy:
+        return carry_forward(policy, target, host=True)
+
+    return Shaped("policy.rollback", candidate_of, Evidence(target=target, target_revision=number))
+
+
+def _same(policy: Policy) -> Policy:
+    return policy
+
+
+def written_answer(written: Written, removed: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
+    """A committed host write (N.1): the revision, a retry's ``already_saved``, its effects,
+    the gateway's state, ``next`` (M.7), and the store entries ``--revoke-removed`` deleted,
+    each ``{name, revoked}``: whether its provider was asked to revoke it (G.8)."""
+    return {
+        "revision": written.revision,
+        "already_saved": written.already_saved,
+        "effects": [
+            {"kind": effect.kind, "path": effect.path, "text": effect.text}
+            for effect in written.effects
+        ],
+        "gateway": written.gateway,
+        "next": [step.answer() for step in written.next],
+        "removed": [dict(entry) for entry in removed],
+    }
+
+
+def refused_body(refused: WriteRefused) -> tuple[int, dict[str, Any]]:
+    """A write's refusal as an answer: its status and body, with the planner's ``subjects``
+    (each grant a ``--allow-revive`` or ``--allow-env`` names) and the head's revision. A head
+    that moved is 412 on the socket (N.1)."""
+    answer = refused_answer(refused)
+    status = 412 if refused.reason == "policy_moved" else answer.status
+    body = {**answer.body(), "subjects": list(refused.subjects), "revision": refused.revision}
+    return status, body
 
 
 class DeclarativeStore:

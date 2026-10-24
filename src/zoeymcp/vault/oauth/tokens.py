@@ -468,6 +468,19 @@ class TokenManager:
             self._reset(users, "secret_set")
         return binding
 
+    def revocation(self, name: str) -> RevocationMaterial | None:
+        """What revoking the refresh token in slot ``name`` needs, read now from the policy this
+        manager runs, with no await: a host write that removes the credential takes it inside
+        its commit section, before the install drops the credential (M6 design G.8, G-18,
+        CR-5). None as :meth:`forget` has none."""
+        return self._revocation(name, self._users(name))
+
+    async def settled(self, name: str) -> None:
+        """Until no refresh of slot ``name`` is in flight, so a removal after a host write isn't
+        written over by a refresh that started before it (M6 design G.8)."""
+        while (slot := self._slots.get(name)) is not None and slot.task is not None:
+            await asyncio.wait([slot.task])
+
     async def forget(
         self, name: str, *, take_revocation: bool = True
     ) -> tuple[bool, RevocationMaterial | None]:

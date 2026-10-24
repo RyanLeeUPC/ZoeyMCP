@@ -1,4 +1,5 @@
-"""No endpoint returns a secret (invariant P1; R61 and its three scoped exceptions, D-115, DD-14).
+"""No endpoint returns a secret (invariant P1; R61 and its four scoped exceptions, D-115, DD-14,
+DD-4).
 
 Each walk takes its routes from the route table, so a route added later is walked too:
 
@@ -10,7 +11,10 @@ Each walk takes its routes from the route table, so a route added later is walke
   Only ``POST /setup-code`` (a new setup code), ``GET /gateway-key`` (the gateway key) and
   ``GET /egress-key`` (the egress role's key, M7 G.3) may carry a credential, each only its own:
   the exceptions R61 records (Q23, DD-14). A token ``secret set --generate`` made (M7 C.2) is in
-  no answer, the one that made it included.
+  no answer, the one that made it included. With a managed policy (M6 design O.6, step 14a),
+  every ``/policy`` route of the table is walked once a client's literal token was seeded and
+  an import and its plan were made: the literal token is in no answer, and the token's hash and
+  a caller's placeholder only in ``GET /policy/export``, R61's fourth scoped exception (DD-4).
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
   a live slot, a value held by a pending ``secret.put``, a given client secret stored through
@@ -31,6 +35,7 @@ import ast
 import base64
 import importlib
 import inspect
+import json
 import pkgutil
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -44,7 +49,7 @@ from starlette.routing import Route as StarletteRoute
 import zoeymcp.portal
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.unit import onboard_model
-from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.common.policy.schema import GatewayLimits, hash_token
 from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.routes import ROUTES, STATIC, Route
@@ -54,6 +59,8 @@ from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
 
 from .test_admin import BROKER_BINDING, KEYS, AdminRig
+from .test_admin_policy import YAML, PolicyRig
+from .test_cli_policy import AGENT2, TOKEN, managed_text
 from .test_portal_wire import ORIGIN, Page
 from .test_reviewreport import unclassified
 
@@ -72,6 +79,10 @@ EXCEPTIONS = {
     ("GET", "/gateway-key"): "gateway key",
     ("GET", "/egress-key"): "egress key",
 }
+# The fourth: the host's export holds placeholders and client token hashes (M6 design H.6, DD-4).
+POLICY_EXCEPTION = ("GET", "/policy/export")
+# A caller's placeholder in the example policy's stats route.
+PLACEHOLDER = "ph-agent1-stats-4c1f9b27"
 
 
 @pytest.fixture
@@ -101,6 +112,7 @@ SOCKET_PARAMS = {
     "fingerprint": "0" * 16,
     "flow": "0123456789abcdef",
     "credential": "broker-mcp",
+    "revision": "1",
 }
 SOCKET_BODIES: dict[tuple[str, str], Any] = {
     ("PUT", "/secrets/{name}"): {"value": STATIC_VALUE},
@@ -152,7 +164,7 @@ class Reviews:
         return self.table.get(job_id, owner)
 
 
-def socket_routes(rig: AdminRig) -> list[tuple[str, str]]:
+def socket_routes(rig: AdminRig | PolicyRig) -> list[tuple[str, str]]:
     """Every method and path template of the socket's table, in its order."""
     walked = []
     for route in rig.admin.app.routes:
@@ -231,6 +243,59 @@ async def test_no_socket_answer_carries_what_a_registration_issued(tmp_path: Pat
 
 
 GENERATED = b"p1-generated-bridge-token-000001"
+
+
+def edited(first: str, data: Mapping[str, Any]) -> bytes:
+    """An edited export: its header line, then the document (JSON is YAML)."""
+    return (first + "\n" + json.dumps(data) + "\n").encode()
+
+
+async def test_no_policy_answer_carries_a_policy_secret_but_the_export(tmp_path: Path) -> None:
+    """O.6, DD-4: every /policy route of the socket's table, walked on a managed vault seeded
+    with a literal client token, after an import that removed that client: no answer carries
+    the literal token, and only the export (of revision 1, which has the client) carries its
+    hash and a caller's placeholder. The import and the rollback are planned for real, each
+    bringing the client back with its grant, so their plans are walked, not a refusal."""
+    rig = PolicyRig(tmp_path, managed_text(), K="v")
+    assert AGENT2 in managed_text()
+    export = (await rig.call("GET", "/policy/export")).json()["export"]
+    first = export.splitlines()[0]
+    seeded = rig.document()
+    data = rig.document()
+    del data["gateway"]["clients"]["agent2"]
+    _, done = await rig.write("/policy/import", body=edited(first, data), base=1)
+    assert done is not None
+    assert done.status_code == 200, done.text
+    credentials = {
+        TOKEN: "client token",
+        hash_token(TOKEN): "token hash",
+        PLACEHOLDER: "placeholder",
+    }
+    walked = [route for route in socket_routes(rig) if route[1].startswith("/policy")]
+    assert len(walked) == 7
+    answers: list[tuple[tuple[str, str], str]] = []
+    for method, template in walked:
+        path = template.format(revision="1")
+        if method == "POST":
+            # Revision 1's content again: agent2 comes back, with its token's hash.
+            document = edited(first, seeded) if template == "/policy/import" else b""
+            headers = YAML if document else {}
+            grants = [("allow_revive", "client:agent2"), ("accept_widening", "1")]
+            response = await rig.call(
+                method, path, content=document, headers=headers, params=[("plan", "1"), *grants]
+            )
+            assert response.status_code == 200, (template, response.text)
+            assert "digest" in response.json(), template
+        else:
+            params = [("revision", "1")] if template == "/policy/export" else []
+            response = await rig.call(method, path, params=params)
+            assert response.status_code == 200, (template, response.text)
+        answers.append(((method, template), response.text + repr(dict(response.headers))))
+    found = {route: carried(text, credentials) for route, text in answers}
+    assert {route: kinds for route, kinds in found.items() if kinds} == {
+        POLICY_EXCEPTION: {"token hash", "placeholder"}
+    }
+    await rig.aclose()
 
 
 async def test_no_socket_answer_carries_a_generated_token(tmp_path: Path) -> None:

@@ -249,3 +249,36 @@ async def delete(
         return "none"
     revoker.request(material)
     return "requested"
+
+
+async def remove_unused(
+    store: SecretStore,
+    tokens: TokenManager | None,
+    name: str,
+    material: RevocationMaterial | None,
+    *,
+    via: Via,
+    revoker: Revoker | None,
+) -> Revocation | None:
+    """A slot a committed host write left unused, with ``--revoke-removed`` (M6 design G.8,
+    G-18, CR-5): deleted once no refresh of it is in flight, then its refresh token revoked with
+    ``material``, which the write took from the policy still running before it removed the
+    credential. Best effort, each logged as a delete is. Returns None when nothing was deleted;
+    else whether a revocation was ``requested`` or there was ``none`` to ask for (no material,
+    as for an API key or a credential without a ``revocation_url``)."""
+    if tokens is not None:
+        await tokens.settled(name)
+    try:
+        existed = store.delete(name)
+    except StoreWriteError as exc:
+        logs.event(
+            "secret_deleted", name=name, persisted=False, error_type=type(exc).__name__, via=via
+        )
+        return None
+    if not existed:
+        return None
+    logs.event("secret_deleted", name=name, via=via)
+    if material is None or revoker is None:
+        return "none"
+    revoker.request(material)
+    return "requested"

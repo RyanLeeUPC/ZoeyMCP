@@ -1325,6 +1325,10 @@ def build(
             bridges=tier,
             gateway_status=app.gateway_status,
             policy_state=policy_state,
+            # The host's policy commands (M6 design H, N.1): the managed holder, and the
+            # configured policy for an import from it; standard input was read once, at start.
+            managed=managed,
+            source=None if config == "-" else (lambda: read_source(config, environ)),
         )
     return Vault(
         app,

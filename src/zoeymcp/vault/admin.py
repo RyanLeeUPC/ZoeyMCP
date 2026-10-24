@@ -57,6 +57,25 @@ design I), gathered by :class:`HealthReader`, which the portal's ``GET /api/heal
 ledger, a page of :mod:`.ledgerview` rows with the send journals joined in, and the archived
 epochs. ``--restart-chain`` uses ``POST /ledger/reported/restart``: ``{"dry_run": true}`` answers
 the plan, and ``{"plan": ...}`` runs it if the copy hasn't changed since (M5 design J.4).
+
+``zoeymcp policy`` uses the ``/policy`` routes (M6 design H, M.6, N.1), the host's managed
+policy: ``GET /policy`` the mode and the head (in declarative mode, the mode alone);
+``GET /policy/revisions`` a page of history, ``GET /policy/revisions/{revision}`` one header and
+``.../diff?against=M`` a diff through the policy view's renderer (no exception: hidden fields stay
+hidden); ``GET /policy/export`` the export, **R61's fourth scoped exception** (DD-4: it holds
+placeholders and client token hashes), ``cache-control: no-store``, logged ``policy_exported``;
+``POST /policy/import`` (a YAML body of at most :data:`IMPORT_MAX`, or ``from_env=1`` for the
+vault's own configured policy, with ``baseline_only=1`` to record its digest and apply nothing)
+and ``POST /policy/rollback/{revision}``, each first with ``plan=1`` (the plan, its lockout rows
+and its digest), then committed with ``If-Match: "<base>"`` (428 ``base_required`` without it,
+412 ``policy_moved`` on a head that moved) and ``X-ZoeyMCP-Plan`` (``plan_changed`` on a
+re-plan that differs); a retry of a write whose answer was lost is ``already_saved``, at its
+plan as at its commit, the import shaped on the revision ``If-Match`` names. A plan
+that widens commits only with ``accept_widening=1`` (``import_widens``, Q41), one with a lockout
+row only with ``lockout_ok=1`` (``lockout_unconfirmed``, I.1); ``revoke_removed=1`` deletes the
+store entries the write leaves unused and revokes their grants after the commit, with what the
+write took from the policy still running (G.8, CR-5). Every write is the host's, through
+``ManagedPolicy.write`` (G.6); in declarative mode each answers ``policy_not_managed``.
 """
 
 from __future__ import annotations
@@ -75,6 +94,7 @@ import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol
 
 from starlette.applications import Starlette
@@ -87,6 +107,10 @@ from ..common import files
 # The CLI reads these from common, so the gateway's entry path loads no vault code.
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
+from ..common.policy import PolicyError, gate
+from ..common.policy.gate import GateRefused
+from ..common.policy.plan import WritePlan
+from ..common.policy.ratchet import Grants
 from ..common.policy.schema import Policy, hash_token
 from ..portal import passkeys as passkey_file
 from ..portal import reviewview, setupcode
@@ -99,7 +123,25 @@ from . import health, ledgerview, logs, secretops, secretplan
 from .connectors.smtp import SmtpConnectors
 from .gatewaykeys import GatewayKeyError, GatewayKeys
 from .keys import KeySet, PortalKey
+from .managed import (
+    ManagedPolicy,
+    Shaped,
+    WriteRefused,
+    Written,
+    diff_answer,
+    export_answer,
+    history_page,
+    import_shaped,
+    lockout_rows,
+    plan_answer,
+    read_revision,
+    refused_body,
+    rollback_shaped,
+    widenings,
+    written_answer,
+)
 from .oauth.login import LoginError, LoginService
+from .oauth.protocol import RevocationMaterial
 from .oauth.tokens import TokenManager
 from .onboard import (
     DISCOVER_BODY_MAX,
@@ -109,6 +151,8 @@ from .onboard import (
     OnboardService,
 )
 from .onboarding import INLINE_SOURCE, job_next, listed_server, refusal_next, tools_max
+from .policyseal import REASON_MAX
+from .policystore import HISTORY_PAGE_MAX
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
 from .reviewjobs import Job, Owner, ReviewRefused
 from .secretplan import NOT_WRITTEN as NOT_WRITTEN
@@ -140,6 +184,31 @@ PASSKEYS_UNAVAILABLE: Final = (
     "run zoeymcp setup-code --reset"
 )
 _FINGERPRINT: Final = re.compile(r"[0-9a-f]{16}")
+# The socket's own refusals of the host's policy commands (M6 design N.2); portal/refusals.py
+# catalogues each, and the managed write's, the store's and the planner's pass through by their
+# own reasons, as do an import's and a rollback's (vault/managed.py's shapes).
+PolicyReason = Literal[
+    "policy_not_managed",
+    "base_required",
+    "import_refused",
+    "import_widens",
+    "lockout_unconfirmed",
+    "plan_changed",
+]
+# An import's body: the loader's own cap (M6 design N.4).
+IMPORT_MAX: Final = 1_048_576
+IMPORT_TYPE: Final = "application/yaml"
+# The host's author over the socket (D.2).
+SOCKET_AUTHOR: Final = MappingProxyType({"by": "host", "via": "socket"})
+# What the policy routes' queries may hold (N.1): flags are "1"; the grants repeat.
+_FLAGS: Final = frozenset(
+    {"plan", "from_env", "baseline_only", "lockout_ok", "revoke_removed", "accept_widening"}
+)
+_GRANTS: Final = frozenset({"allow_revive", "allow_env"})
+_IMPORT_QUERY: Final = _FLAGS | _GRANTS | {"reason"}
+_ROLLBACK_QUERY: Final = _IMPORT_QUERY - {"from_env", "baseline_only"}
+_IF_MATCH: Final = re.compile(r'"([1-9][0-9]{0,9})"')
+_EXPORT_MODES: Final = frozenset({"managed", "declarative"})
 # A generated token (M7 design C.2): this many random bytes, in unpadded base64url.
 GENERATED_BYTES: Final = 32
 GENERATE_REFUSED: Final = SecretRefusal(
@@ -537,6 +606,8 @@ class AdminApp:
         bridges: health.Bridges | None = None,
         gateway_status: Callable[[], GatewayStatus] | None = None,
         policy_state: Callable[[], health.PolicyState | None] | None = None,
+        managed: ManagedPolicy | None = None,
+        source: Callable[[], tuple[str, str]] | None = None,
         random: Callable[[int], bytes] = secrets.token_bytes,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
@@ -573,9 +644,17 @@ class AdminApp:
         section (M6 design K.1, M.5). Without it, health has none. ``policy_state`` is the
         policy store's, for health's ``policy`` section (M.5); without it, health has none.
 
+        ``managed`` is a managed vault's policy (``vault/managed.py``), which the ``/policy``
+        routes read and write (M6 design H, N.1); without it the policy is declarative and they
+        answer ``policy_not_managed``. ``source`` reads the policy the vault was configured with
+        (its text and label), for ``import?from_env=1`` (H.5, G-14); without it (the policy came
+        on standard input, read once) that import is refused.
+
         ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests)."""
         self._store = store
         self._random = random
+        self._managed = managed
+        self._source = source
         self._reviews = reviews
         self._revoker = revoker
         self._onboard = onboard
@@ -634,6 +713,13 @@ class AdminApp:
                 Route("/health", self._health, methods=["GET"]),
                 Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
                 Route("/ledger/reported/restart", self._ledger_restart, methods=["POST"]),
+                Route("/policy", self._policy_head, methods=["GET"]),
+                Route("/policy/revisions", self._policy_history, methods=["GET"]),
+                Route("/policy/revisions/{revision}", self._policy_revision, methods=["GET"]),
+                Route("/policy/revisions/{revision}/diff", self._policy_diff, methods=["GET"]),
+                Route("/policy/export", self._policy_export, methods=["GET"]),
+                Route("/policy/import", self._policy_import, methods=["POST"]),
+                Route("/policy/rollback/{revision}", self._policy_rollback, methods=["POST"]),
             ]
         )
 
@@ -1115,6 +1201,379 @@ class AdminApp:
             except OSError:
                 return _reason(500, NOT_WRITTEN, "not_written")
         return JSONResponse({"restarted": done.to_json(), "head": copy.head().to_json()})
+
+    # --- the managed policy (M6 design H, M.6, N.1) -------------------------------------------
+
+    async def _policy_head(self, request: Request) -> Response:
+        """The mode and, in managed mode, the head (N.1): its revision, digest and deployment
+        (8 characters each), when, how and by whom it was written, the revision the gateway
+        runs (K.1), and a saved revision that isn't running. No hidden field (Y13). The
+        witness is step 17's."""
+        managed = self._managed
+        if managed is None:
+            return JSONResponse({"mode": self._policy().mode, "revision": None})
+        store = managed.store
+        head, header = store.head, store.header
+        assert head is not None  # noqa: S101 - a managed store has one
+        assert header is not None  # noqa: S101
+        answer = {
+            "mode": "managed",
+            "revision": head.revision,
+            "digest8": head.digest.removeprefix("sha256:")[:8],
+            "deployment8": head.deployment[:8],
+            "created": header["created"],
+            "origin": header["origin"],
+            "kind": header["kind"],
+            "author": dict(header["author"]),
+            "witness": None,
+            "gateway": managed.gateway(),
+            "not_running": managed.not_running,
+        }
+        return JSONResponse(answer)
+
+    async def _policy_history(self, request: Request) -> Response:
+        """``?before=N&limit=N``: a page of history, newest first (H.1), and the next page's
+        ``before``; a revision in quarantine is a gap."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        query = dict(request.query_params)
+        if set(query) - {"before", "limit"} or len(request.query_params.multi_items()) != len(
+            query
+        ):
+            return _reason(400, "expected ?before=N&limit=N", "bad_query")
+        try:
+            before, limit = _number(query.get("before")), _number(query.get("limit"))
+        except _BadNumber:
+            return _reason(400, "before and limit are numbers", "bad_query")
+        if limit is not None and not 1 <= limit <= HISTORY_PAGE_MAX:
+            return _reason(400, f"limit is 1 to {HISTORY_PAGE_MAX}", "bad_query")
+        page = history_page(managed.store, before, limit or HISTORY_PAGE_MAX)
+        return JSONResponse(page)
+
+    async def _policy_revision(self, request: Request) -> Response:
+        """One revision's header, as history shows it (H.1)."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        number = _revision(request.path_params["revision"])
+        if isinstance(number, Response):
+            return number
+        if request.query_params:
+            return _reason(400, "this route takes no query", "bad_query")
+        found = managed.store.history(number + 1, 1)
+        if not found or found[0]["revision"] != number or found[0].get("gap"):
+            why = managed.store.missing(number) or "revision_unreadable"
+            return _answer(refusal(why, revision=str(number)))
+        return JSONResponse(found[0])
+
+    async def _policy_diff(self, request: Request) -> Response:
+        """``?against=M``: revision N's diff from M, by default its parent (H.2), through the
+        policy view's renderer: no hidden value, as in the portal (Y13)."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        number = _revision(request.path_params["revision"])
+        if isinstance(number, Response):
+            return number
+        query = dict(request.query_params)
+        if set(query) - {"against"} or len(request.query_params.multi_items()) != len(query):
+            return _reason(400, "expected ?against=M", "bad_query")
+        try:
+            against = _number(query.get("against"))
+        except _BadNumber:
+            return _reason(400, "against is a revision number", "bad_query")
+        answer = diff_answer(managed.store, number, against)
+        if isinstance(answer, Refusal):
+            return _answer(answer)
+        return JSONResponse(answer)
+
+    async def _policy_export(self, request: Request) -> Response:
+        """``?revision=N&mode=managed|declarative&for=compose``: the head's policy, or a kept
+        revision's, as ``zoeymcp policy import`` takes it back (H.6). R61's fourth scoped
+        exception: it holds placeholders and client token hashes (DD-4); never stored by a
+        cache, and logged."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        query = dict(request.query_params)
+        if set(query) - {"revision", "mode", "for"} or len(
+            request.query_params.multi_items()
+        ) != len(query):
+            return _reason(400, "expected ?revision=N&mode=M&for=compose", "bad_query")
+        try:
+            number = _number(query.get("revision"))
+        except _BadNumber:
+            return _reason(400, "revision is a number", "bad_query")
+        mode = query.get("mode", "managed")
+        target = query.get("for")
+        if mode not in _EXPORT_MODES or target not in (None, "compose"):
+            return _reason(400, "mode is managed or declarative; for is compose", "bad_query")
+        revision = managed.revision if number is None else number
+        answer = export_answer(
+            managed.store,
+            revision,
+            mode="declarative" if mode == "declarative" else "managed",
+            target="compose" if target == "compose" else "plain",
+        )
+        if isinstance(answer, Refusal):
+            return _answer(answer)
+        logs.event("policy_exported", revision=revision, via="socket")
+        return JSONResponse(answer, headers={"cache-control": "no-store"})
+
+    async def _policy_import(self, request: Request) -> Response:
+        """``POST /policy/import``: a YAML body, or ``from_env=1`` with none (H.5), planned
+        with ``plan=1``, else committed (the module docstring)."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        query = _write_query(request, _IMPORT_QUERY)
+        if isinstance(query, Response):
+            return query
+        if query.baseline_only and not query.from_env:
+            return _reason(400, "baseline_only=1 goes with from_env=1", "bad_query")
+        body = await request.body()
+        if query.from_env:
+            if body:
+                return _reason(400, "from_env=1 takes no body", "bad_body")
+            if self._source is None:
+                detail = "the vault's policy came on standard input, which it read once at start"
+                return _answer(refusal("import_refused", detail=detail))
+            try:
+                text, label = self._source()
+            except PolicyError as exc:
+                found = gate.refused_text(exc.source, exc.findings)
+                return _answer(refusal("import_refused", detail=found))
+        else:
+            kind = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if kind != IMPORT_TYPE:
+                return _reason(415, f"send the policy as {IMPORT_TYPE}", "content_type")
+            if len(body) > IMPORT_MAX:
+                return _reason(413, "an import is at most 1 MiB", "too_large")
+            try:
+                text, label = body.decode("utf-8"), "the import"
+            except UnicodeDecodeError:
+                return _answer(refusal("import_refused", detail="the import isn't UTF-8"))
+        try:
+            given = gate.admit_text(text, label, environ=managed.environ).policy
+        except GateRefused as exc:
+            return _answer(refusal("import_refused", detail=str(exc)))
+        base = _if_match(request)
+        if isinstance(base, Response):
+            return base
+        # Shaped on the revision it is planned on, so a retry whose answer was lost is shaped
+        # as its first try was (already_saved, G.6 step 2); a base no longer readable leaves
+        # the head's, and the write answers policy_moved.
+        basis, seed = managed.policy, managed.store.seed_digest
+        if base is not None and base != managed.revision:
+            read = read_revision(managed.store, base)
+            if not isinstance(read, Refusal):
+                basis, seed = read[1], read[0].body.seed_digest
+        shaped = import_shaped(
+            seed,
+            basis,
+            given,
+            from_env=query.from_env,
+            baseline_only=query.baseline_only,
+        )
+        if isinstance(shaped, Refusal):
+            return _answer(shaped)
+        return await self._policy_write(request, query, shaped)
+
+    async def _policy_rollback(self, request: Request) -> Response:
+        """``POST /policy/rollback/{revision}``: the target's policy carried forward (H.4: the
+        key generations and every pin the head has kept from the head, ``admin`` the target's,
+        since this is the host's), planned with ``plan=1``, else committed (H.3)."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        number = _revision(request.path_params["revision"])
+        if isinstance(number, Response):
+            return number
+        query = _write_query(request, _ROLLBACK_QUERY)
+        if isinstance(query, Response):
+            return query
+        if await request.body():
+            return _reason(400, "a rollback takes no body", "bad_body")
+        shaped = rollback_shaped(managed.store, number)
+        if isinstance(shaped, Refusal):
+            return _answer(shaped)
+        return await self._policy_write(request, query, shaped)
+
+    async def _policy_write(self, request: Request, query: _WriteQuery, shaped: Shaped) -> Response:
+        """A host write over the socket (H.5 step 5, G.6): the plan on ``If-Match``'s base (the
+        head without one) answered for ``plan=1``; else, with ``If-Match`` and the plan's
+        digest, the plan's confirmations checked and the write committed, then the entries it
+        left unused removed when asked (G.8). A commit on a base the head has moved past is the
+        write's to answer: a retry of the write that made the head is ``already_saved``."""
+        managed = self._managed
+        assert managed is not None  # noqa: S101 - the routes check it
+        match = _if_match(request)
+        if isinstance(match, Response):
+            return match
+        if match is None and not query.plan:
+            return _answer(refusal("base_required"))
+        base = managed.revision if match is None else match
+        grants = Grants(revive=frozenset(query.revive), env=frozenset(query.env))
+        digest = request.headers.get("x-zoeymcp-plan")
+        if query.plan or base == managed.revision:
+            # The plan of a retry whose answer was lost is already_saved, as its commit is:
+            # the CLI plans before it commits (MISS-9, FM-16).
+            planned = managed.plan(
+                shaped.kind,
+                "socket",
+                base,
+                shaped.candidate_of,
+                author=SOCKET_AUTHOR,
+                grants=grants,
+                evidence=shaped.evidence,
+            )
+            if isinstance(planned, WriteRefused):
+                return _write_refused(planned)
+            if isinstance(planned, Written):
+                return JSONResponse(written_answer(planned))
+            lockout = lockout_rows(managed.policy, planned.policy, self._rp_ids())
+            if query.plan:
+                return JSONResponse(plan_answer(planned, lockout))
+            if digest is None:
+                return _answer(refusal("plan_changed"))
+            wider = widenings(planned)
+            if wider and not query.accept_widening:
+                return _answer(refusal("import_widens", detail=", ".join(wider)))
+            if lockout and not query.lockout_ok:
+                detail = "; ".join(row.text for row in lockout)
+                return _answer(refusal("lockout_unconfirmed", detail=detail))
+        elif digest is None:
+            return _answer(refusal("plan_changed"))
+        # On another base the write answers a retry whose answer was lost (already_saved, its
+        # confirmations given the first time) or policy_moved (G.6 step 2).
+        capture = self._capture if query.revoke_removed else None
+        written = managed.write(
+            shaped.kind,
+            "socket",
+            base,
+            shaped.candidate_of,
+            author=SOCKET_AUTHOR,
+            expected=digest,
+            grants=grants,
+            reason=query.reason,
+            evidence=shaped.evidence,
+            seed_digest=shaped.seed_digest,
+            capture=capture,
+            logged=shaped.logged,
+        )
+        if isinstance(written, WriteRefused):
+            return _write_refused(written)
+        removed: list[dict[str, Any]] = []
+        for name, material in sorted((written.captured or {}).items()):
+            done = await secretops.remove_unused(
+                self._store, self._tokens, name, material, via="socket", revoker=self._revoker
+            )
+            if done is not None:
+                removed.append({"name": name, "revoked": done == "requested"})
+        return JSONResponse(written_answer(written, removed))
+
+    def _capture(self, planned: WritePlan) -> dict[str, RevocationMaterial | None]:
+        """Inside the write's section, from the policy still running: what revoking each
+        store entry the write leaves unused needs (G.8, CR-5)."""
+        tokens = self._tokens
+        return {
+            name: None if tokens is None else tokens.revocation(name)
+            for name in planned.unused_slots
+        }
+
+    def _rp_ids(self) -> list[str] | None:
+        """Every enrolled passkey's RP ID, for the lockout rows (I.1): none without a passkey
+        file, None when it can't be verified."""
+        holder = self._passkeys
+        if holder is None:
+            return []
+        if holder.unavailable:
+            return None
+        return [passkey.rp_id for passkey in holder.document.credentials]
+
+
+@dataclass(frozen=True)
+class _WriteQuery:
+    """A host write's query (N.1)."""
+
+    plan: bool = False
+    from_env: bool = False
+    baseline_only: bool = False
+    lockout_ok: bool = False
+    revoke_removed: bool = False
+    accept_widening: bool = False
+    revive: tuple[str, ...] = ()
+    env: tuple[str, ...] = ()
+    reason: str | None = None
+
+
+def _write_query(request: Request, allowed: frozenset[str]) -> _WriteQuery | Response:
+    """The query of an import or a rollback: each flag at most once and ``1``, the grants
+    repeated, the reason 1 to 200 printable characters."""
+    flags: set[str] = set()
+    grants: dict[str, list[str]] = {"allow_revive": [], "allow_env": []}
+    reason = None
+    for key, value in request.query_params.multi_items():
+        if key not in allowed:
+            return _reason(400, f"{key} isn't a query this route takes", "bad_query")
+        if key in _GRANTS:
+            grants[key].append(value)
+        elif key == "reason":
+            if reason is not None or not (1 <= len(value) <= REASON_MAX and value.isprintable()):
+                return _reason(
+                    400, f"reason is 1 to {REASON_MAX} printable characters", "bad_query"
+                )
+            reason = value
+        elif key in flags or value != "1":
+            return _reason(400, f"{key} is 1, once", "bad_query")
+        else:
+            flags.add(key)
+    return _WriteQuery(
+        plan="plan" in flags,
+        from_env="from_env" in flags,
+        baseline_only="baseline_only" in flags,
+        lockout_ok="lockout_ok" in flags,
+        revoke_removed="revoke_removed" in flags,
+        accept_widening="accept_widening" in flags,
+        revive=tuple(grants["allow_revive"]),
+        env=tuple(grants["allow_env"]),
+        reason=reason,
+    )
+
+
+def _if_match(request: Request) -> int | Response | None:
+    """The revision a host write names in ``If-Match`` (N.1), None without one."""
+    match = request.headers.get("if-match")
+    if match is None:
+        return None
+    found = _IF_MATCH.fullmatch(match.strip())
+    if found is None:
+        return _reason(400, 'If-Match is "N", the revision planned on', "bad_query")
+    return int(found[1])
+
+
+def _revision(value: str) -> int | Response:
+    """A revision number from a path."""
+    try:
+        number = _number(value)
+    except _BadNumber:
+        return _reason(400, "a revision is a number", "bad_query")
+    assert number is not None  # noqa: S101 - a path segment is never empty
+    return number
+
+
+def _answer(refused: Refusal) -> JSONResponse:
+    return JSONResponse(refused.body(), status_code=refused.status)
+
+
+def _not_managed() -> JSONResponse:
+    return _answer(refusal("policy_not_managed"))
+
+
+def _write_refused(refused: WriteRefused) -> JSONResponse:
+    status, body = refused_body(refused)
+    return JSONResponse(body, status_code=status)
 
 
 def _onboard_refused(exc: OnboardError) -> JSONResponse:

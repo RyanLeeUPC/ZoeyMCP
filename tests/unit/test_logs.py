@@ -67,6 +67,26 @@ def test_quiet_discards_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [json.loads(line)["event"] for line in replacement.getvalue().splitlines()] == ["shown"]
 
 
+def test_off_stdout_moves_only_what_would_reach_stdout(
+    monkeypatch: pytest.MonkeyPatch, lines: io.StringIO
+) -> None:
+    """M6 design H.6: the host's export keeps its stdout for the YAML; lines already sent
+    elsewhere stay there, and the stream comes back after."""
+    elsewhere = io.StringIO()
+    with common_logs.off_stdout(elsewhere):
+        logs.event("kept")
+    assert [record["event"] for record in records(lines)] == ["kept"]
+    assert elsewhere.getvalue() == ""
+    logs.set_stream(None)
+    replacement = io.StringIO()
+    monkeypatch.setattr("sys.stdout", replacement)
+    with common_logs.off_stdout(elsewhere):
+        logs.event("moved")
+    logs.event("back")
+    assert [json.loads(line)["event"] for line in elsewhere.getvalue().splitlines()] == ["moved"]
+    assert [json.loads(line)["event"] for line in replacement.getvalue().splitlines()] == ["back"]
+
+
 def test_the_vault_reexports_the_shared_module() -> None:
     assert logs.quiet is common_logs.quiet
     assert logs.set_stream is common_logs.set_stream

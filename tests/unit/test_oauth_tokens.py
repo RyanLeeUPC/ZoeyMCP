@@ -1656,6 +1656,53 @@ async def test_no_material_without_something_to_revoke(tmp_path: Path, clock: Fa
     assert await seeded.manager.forget(live_slot("music")) == (True, None)
 
 
+# --- a host write's removal (M6 design G.8, G-18, CR-5) -----------------------------------------
+
+
+async def test_revocation_reads_the_material_and_keeps_the_slot(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """The material a host write takes inside its commit section, from the policy running, with
+    no await and no delete; none for a name the manager doesn't keep a grant in, or a
+    credential without revocation_url."""
+    rig = spotify_rig(state(tmp_path, "revoking"), clock, revocation_url=REVOKE)
+    token = rig.seed()
+    material = rig.manager.revocation("music-refresh")
+    assert isinstance(material, RevocationMaterial)
+    assert (material.credential, material.url, material.token_origin) == (
+        "music",
+        REVOKE,
+        "https://accounts.example:443",
+    )
+    assert material.refresh_token.reveal() == token
+    assert rig.stored() == token
+    assert rig.manager.revocation("other-refresh") is None
+    plain = spotify_rig(state(tmp_path, "plain"), clock)
+    plain.seed()
+    assert plain.manager.revocation("music-refresh") is None
+
+
+async def test_settled_waits_for_the_refresh_in_flight(tmp_path: Path, clock: FakeClock) -> None:
+    """A removal after a host write waits until no refresh of the slot is in flight, so the
+    refresh's own write can't land after the delete; with none in flight, or for a name with
+    no slot, it returns at once."""
+    rig = spotify_rig(tmp_path, clock)
+    rig.seed()
+    await asyncio.wait_for(rig.manager.settled("music-refresh"), 5)
+    await asyncio.wait_for(rig.manager.settled("other-refresh"), 5)
+    gate = rig.server.hold()
+    waiter = asyncio.create_task(rig.grant())
+    await rig.server.arrived()
+    settling = asyncio.create_task(rig.manager.settled("music-refresh"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not settling.done()
+    gate.set()
+    await waiter
+    await asyncio.wait_for(settling, 5)
+    assert rig.manager._slots["music-refresh"].task is None
+
+
 async def test_replace_secret_of_a_client_secret_clears_its_users(
     tmp_path: Path, clock: FakeClock
 ) -> None:

@@ -48,6 +48,21 @@ def set_stream(stream: TextIO | None) -> None:
 
 
 @contextlib.contextmanager
+def off_stdout(stream: TextIO) -> Iterator[None]:
+    """Write log lines to ``stream`` for the duration, when they would go to stdout: a command
+    whose stdout is its output (the host's policy export, M6 design H.6) keeps it clean. Lines
+    already sent elsewhere stay there."""
+    global _stream
+    previous = _stream
+    if previous is None:
+        _stream = stream
+    try:
+        yield
+    finally:
+        _stream = previous
+
+
+@contextlib.contextmanager
 def quiet() -> Iterator[None]:
     """Discard log lines for the duration (self-tests run thousands of requests)."""
     global _stream

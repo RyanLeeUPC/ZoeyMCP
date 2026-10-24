@@ -870,14 +870,73 @@ def _build_parser() -> argparse.ArgumentParser:
 
     policy = commands.add_parser(
         "policy",
-        help="a managed policy's store, on the host (with the vault stopped, --state)",
+        help="a managed policy on the host: its head, history, diffs, export, import, rollback",
         description=(
-            "Seed or replace a managed policy's store in a state directory, with the vault "
-            "stopped. Each needs ZOEYMCP_MASTER_KEY, refuses to run as root, and prints what it "
-            "will write and asks first, unless --yes."
+            "A managed policy's revisions, on the host: over the vault's admin socket, or with "
+            "--state DIR on its state directory with the vault stopped (as the vault's uid, with "
+            "ZOEYMCP_MASTER_KEY). With no action, the mode and the head. A write prints its plan "
+            "and asks first, unless --yes."
         ),
     )
-    policy_commands = policy.add_subparsers(dest="action", required=True, metavar="action")
+    policy.set_defaults(action=None, format="text", socket=None, state=None)
+    policy_commands = policy.add_subparsers(dest="action", metavar="action")
+
+    def policy_reader(parser: argparse.ArgumentParser, *, offline: bool = True) -> None:
+        parser.add_argument("--socket", metavar="PATH", help="admin socket path")
+        if offline:
+            parser.add_argument(
+                "--state", metavar="DIR", help="the state directory, with the vault stopped"
+            )
+
+    policy_head = policy_commands.add_parser(
+        "head",
+        help="the mode, the head and the revision the gateway runs (the default)",
+        description="The mode and, in managed mode, the head: when, how and by whom it was "
+        "written, its deployment, and the revision the gateway runs.",
+    )
+    policy_head.add_argument("--format", choices=("text", "json"), default="text")
+    policy_reader(policy_head, offline=False)
+    policy_history = policy_commands.add_parser(
+        "history",
+        help="the kept revisions, newest first",
+        description="The kept revisions, newest first: when, what made each and by whom, its "
+        "base and the host's reason. A revision in quarantine shows as a gap.",
+    )
+    policy_history.add_argument("--before", type=int, metavar="N", help="older than revision N")
+    policy_history.add_argument(
+        "--limit", type=int, metavar="N", help="at most N revisions (1 to 50, 50 by default)"
+    )
+    policy_history.add_argument("--format", choices=("text", "json"), default="text")
+    policy_reader(policy_history)
+    policy_diff = policy_commands.add_parser(
+        "diff",
+        help="what a revision changed, hidden fields hidden",
+        description="What revision N changed from its parent (or from --against M), as the "
+        "portal shows it: a hidden field only as set, changed or removed.",
+    )
+    policy_diff.add_argument("revision", type=int, metavar="N")
+    policy_diff.add_argument("--against", type=int, metavar="M", help="another kept revision")
+    policy_diff.add_argument("--format", choices=("text", "json"), default="text")
+    policy_reader(policy_diff)
+    policy_export = policy_commands.add_parser(
+        "export",
+        help="the policy as YAML to stdout, to edit and import (keep it like a secret)",
+        description="The head's policy, or --revision N's, as YAML on stdout for policy import "
+        "(notes on stderr). It holds placeholders and client token hashes: keep it like a "
+        "secret. --mode declarative writes it to run declaratively; --for compose indents it "
+        "for an inline ZOEYMCP_CONFIG with every $ as $$.",
+    )
+    policy_export.add_argument("--revision", type=int, metavar="N", help="a kept revision")
+    policy_export.add_argument(
+        "--mode", choices=("managed", "declarative"), default="managed", help="the mode it says"
+    )
+    policy_export.add_argument(
+        "--for", dest="target", choices=("compose",), help="indented for an inline compose block"
+    )
+    policy_export.add_argument(
+        "--force-tty", action="store_true", help="print it to a terminal anyway"
+    )
+    policy_reader(policy_export)
     policy_seed = policy_commands.add_parser(
         "seed",
         help="seed revision 1 on a state volume used before, from the policy given",
@@ -891,14 +950,53 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     policy_seed.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
     policy_seed.add_argument("--yes", action="store_true", help="write it without asking")
+
+    def policy_writer(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--base", type=int, metavar="N", help="the revision it is planned on")
+        parser.add_argument("--yes", action="store_true", help="write it without asking")
+        parser.add_argument(
+            "--accept-widening",
+            action="store_true",
+            help="with --yes, write a plan that widens the policy",
+        )
+        parser.add_argument("--reason", metavar="TEXT", help="kept with the revision")
+        parser.add_argument(
+            "--allow-revive",
+            action="append",
+            default=[],
+            metavar="X",
+            help="bring back client:NAME, caller:ROUTE/INDEX or pin:SERVER/KIND/NAME (repeatable)",
+        )
+        parser.add_argument(
+            "--allow-env",
+            action="append",
+            default=[],
+            metavar="NAME",
+            help="allow env:NAME, new or sent somewhere new (repeatable)",
+        )
+        parser.add_argument(
+            "--lockout-ok",
+            action="store_true",
+            help="with --yes, write a change that can lock the portal out",
+        )
+        parser.add_argument(
+            "--revoke-removed",
+            action="store_true",
+            help="delete the store entries it leaves unused, and revoke their grants",
+        )
+        policy_reader(parser)
+
     policy_import = policy_commands.add_parser(
         "import",
-        help="replace a store with the policy given (--state DIR --reseed)",
+        help="write the policy given as the next revision (or replace the store: --reseed)",
         description=(
-            "With --state DIR --reseed: replace the store with the policy given, planned against "
-            "the old head and what it retired when that head verifies (each revival needs its "
-            "--allow-revive or --allow-env), or with --new-ratchet, from the policy's own. The "
-            "old files go to quarantine."
+            "Write the policy given (an edited export) as the next revision, planned on the "
+            "revision its export header names, or --base N; --from-env takes the vault's own "
+            "ZOEYMCP_CONFIG, and --baseline-only records it without applying it. With --state "
+            "DIR --reseed: replace the store with the policy given, planned against the old head "
+            "and what it retired when that head verifies (each revival needs its --allow-revive "
+            "or --allow-env), or with --new-ratchet, from the policy's own. The old files go to "
+            "quarantine."
         ),
     )
     policy_import.add_argument(
@@ -907,7 +1005,11 @@ def _build_parser() -> argparse.ArgumentParser:
     policy_import.add_argument(
         "--from-env", action="store_true", help="the policy in ZOEYMCP_CONFIG instead"
     )
-    policy_import.add_argument("--state", metavar="DIR", help="the vault's state directory")
+    policy_import.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="with --from-env: record it as the seed's baseline, and apply nothing",
+    )
     policy_import.add_argument(
         "--reseed", action="store_true", help="replace the store in --state, with the vault stopped"
     )
@@ -916,22 +1018,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="forget what the old store retired (listed), and start from the policy's own",
     )
-    policy_import.add_argument(
-        "--allow-revive",
-        action="append",
-        default=[],
-        metavar="X",
-        help="bring back client:NAME, caller:ROUTE/INDEX or pin:SERVER/KIND/NAME (repeatable)",
+    policy_writer(policy_import)
+    policy_rollback = policy_commands.add_parser(
+        "rollback",
+        help="write a kept revision's content as the next revision",
+        description="Write revision N's content as the next revision, with the head's key "
+        "generations and pins and N's admin block (a lockout's way back); each thing the "
+        "store retired that it brings back needs its --allow-revive or --allow-env.",
     )
-    policy_import.add_argument(
-        "--allow-env",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="allow env:NAME, new or sent somewhere new (repeatable)",
-    )
-    policy_import.add_argument("--reason", metavar="TEXT", help="kept with the revision")
-    policy_import.add_argument("--yes", action="store_true", help="write it without asking")
+    policy_rollback.add_argument("revision", type=int, metavar="N")
+    policy_writer(policy_rollback)
 
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")
@@ -1171,10 +1267,10 @@ def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -
 # --- the managed policy on the host (M6 design M.6) --------------------------------------------
 
 
-def _cmd_policy(args: argparse.Namespace, stdin: TextIO, err: TextIO) -> int:
+def _cmd_policy(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
     from . import policy as policy_cli
 
-    return policy_cli.run(args, os.environ, stdin, err, as_root=running_as_root())
+    return policy_cli.run(args, os.environ, stdin, out, err, as_root=running_as_root())
 
 
 # --- setup codes, passkeys and sessions (M5 design E) ------------------------------------------
@@ -2406,7 +2502,7 @@ def main(
     if args.command == "health":
         return _cmd_health(args, out, err)
     if args.command == "policy":
-        return _cmd_policy(args, stdin, err)
+        return _cmd_policy(args, stdin, out, err)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 

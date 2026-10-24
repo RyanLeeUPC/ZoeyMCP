@@ -602,8 +602,8 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         ),
         "policy_moved": Entry(
             409,
-            "The policy moved to revision {revision} since you started: plan your change again "
-            "on revision {revision}.",
+            "Nothing was written: {detail}. For an import, export again and redo your edit; for "
+            "a rollback, run it again.",
         ),
         "plan_changed": Entry(
             409, "The plan changed since you read it: plan the change again and read it first."
@@ -644,6 +644,36 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "The old policy head doesn't verify ({detail}), so there is no ratchet to plan the "
             "reseed against: add --new-ratchet, which forgets what the old store retired.",
         ),
+        # M6's H, N.1: the admin socket's policy routes and the host's commands on them, over
+        # the socket or with the vault stopped (vault/admin.py, cli/policy.py, step 14a).
+        "policy_not_managed": Entry(
+            409, "This deployment's policy is declarative: commit a fragment instead."
+        ),
+        "base_required": Entry(
+            428,
+            "Say which revision this change is planned on: pass --base N (the revision you "
+            "exported; zoeymcp policy head shows the current one).",
+        ),
+        "export_other_deployment": Entry(
+            400,
+            "This export is from deployment {detail}, not this one: export from this deployment "
+            "and redo your edit there.",
+        ),
+        "import_widens": Entry(
+            400,
+            "This plan widens the policy ({detail}): with --yes it needs --accept-widening too, "
+            "or run it without --yes to read the plan and confirm it.",
+        ),
+        "lockout_unconfirmed": Entry(
+            400,
+            "This change {detail}: type the confirmation at the prompt, or pass --yes "
+            "--lockout-ok.",
+        ),
+        "nothing_to_acknowledge": Entry(409, "There is nothing to record: {detail}."),
+        "revision_unreadable": Entry(
+            409, "Revision {revision} is in quarantine: it can't be read, so it can't be used."
+        ),
+        "revision_unknown": Entry(409, "Revision {revision} is no longer kept, or never was."),
     }
 )
 

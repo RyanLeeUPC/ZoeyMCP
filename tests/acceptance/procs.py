@@ -162,9 +162,10 @@ def managed_policy(portal: int, **changes: Any) -> dict[str, Any]:
 @dataclass
 class ManagedVault:
     """A vault process on ``state``, its policy in ``ZOEYMCP_CONFIG`` (``policy``, or none), its
-    master key in ``env``. :meth:`start` returns once the portal listens; :meth:`refused` once a
-    start refused, with its output. :meth:`cli` runs ``zoeymcp`` beside it, in its own process with
-    the same environment, as ``docker compose run`` does with the vault's service."""
+    master key in ``env``. :meth:`start` returns once the portal listens (and, with
+    ``admin_socket``, the admin socket is there); :meth:`refused` once a start refused, with its
+    output. :meth:`cli` runs ``zoeymcp`` beside it, in its own process with the same environment,
+    as ``docker compose run`` does with the vault's service, or ``exec`` over the admin socket."""
 
     tmp: Path
     env: dict[str, str]
@@ -172,10 +173,16 @@ class ManagedVault:
     port: int = field(default_factory=free_port)
     portal: int = field(default_factory=free_port)
     process: Process | None = None
+    # With an admin socket (a Unix socket, so not on Windows), which :meth:`cli` reaches.
+    admin_socket: bool = False
 
     @property
     def state(self) -> Path:
         return self.tmp / "state"
+
+    @property
+    def socket(self) -> Path:
+        return self.tmp / "admin" / "admin.sock"
 
     @property
     def log(self) -> Path:
@@ -185,6 +192,8 @@ class ManagedVault:
         found = dict(self.env)
         if self.policy is not None:
             found["ZOEYMCP_CONFIG"] = json.dumps(self.policy)
+        if self.admin_socket:
+            found["ZOEYMCP_ADMIN_SOCKET"] = str(self.socket)
         return found
 
     def launch(self, *, holds: Mapping[str, Path] | None = None) -> Process:
@@ -197,13 +206,15 @@ class ManagedVault:
             held = self.tmp / "holds.json"
             save(held, **holds)
         argv = ["vault", "--listen", f"127.0.0.1:{self.port}", "--state", str(self.state)]
-        argv += ["--admin-socket", "none"]
+        argv += ["--admin-socket", str(self.socket) if self.admin_socket else "none"]
         self.process = start(argv, env=self.environ(), log=self.log, holds=held)
         return self.process
 
     def start(self) -> Process:
         process = self.launch()
         wait_port(self.portal, process)
+        if self.admin_socket:
+            wait_file(self.socket, process)
         return process
 
     def refused(self, timeout: float = 30.0) -> str:

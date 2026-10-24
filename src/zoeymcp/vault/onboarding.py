@@ -59,6 +59,7 @@ from ..common.logs import refuse_type
 from ..common.policy.change import PolicyChange, SetCredential, SetScope, apply
 from ..common.policy.emit import emit
 from ..common.policy.findings import Finding
+from ..common.policy.restart import Effect
 from ..common.policy.schema import (
     NAME_PATTERN,
     ClientAuth,
@@ -112,6 +113,9 @@ Do = Literal[
     "check_egress_role",
     "onboard_again",
     "clear",
+    "restart",
+    "deliver_key",
+    "wait_gateway",
 ]
 # Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
 # container that reads the inline policy from the service's environment; ``run_mount``, the same
@@ -964,6 +968,48 @@ def refusal_next(server: str | None, reason: str) -> tuple[NextStep, ...]:
         clear = ("zoeymcp", "review", server, "--clear")
         return (NextStep("clear", "Clear the marks in the gateway's container", clear),)
     return (review_again(server),) if reason in REVIEW_AGAIN else ()
+
+
+# A managed write's effects as the operator's steps (M6 design I.2, M.7): the kinds a step
+# names by its own words; the rest say it in the effect's text.
+_DELIVER: Final[Mapping[str, NextStep]] = {
+    "redeliver_gateway_key": NextStep(
+        "deliver_key",
+        "Give the gateway its new key within 5 minutes",
+        ("zoeymcp", "gateway-key"),
+        "exec",
+    ),
+    "redeliver_egress_key": NextStep(
+        "deliver_key",
+        "Write the egress role's new key, then restart the role",
+        ("zoeymcp", "egress-key"),
+        "exec",
+    ),
+}
+RESTART_VAULT: Final = NextStep("restart", "Restart the vault: the change waits for it")
+WAIT_GATEWAY: Final = NextStep("wait_gateway", "The gateway takes the new view within seconds")
+
+
+def saved_next(effects: Iterable[Effect], *, applied: bool = False) -> tuple[NextStep, ...]:
+    """A managed write's way on (M6 design M.7, I.2, Y16): the vault's restart first, once,
+    when any effect needs it; then a step per other effect that asks something of the operator,
+    in order (a key to give, the gateway or a bridge to restart, a proxy's allowlist); and, until
+    the gateway has applied the revision, that it takes the new view within seconds. A ``live``
+    effect asks nothing."""
+    steps: list[NextStep] = []
+    for effect in effects:
+        if effect.kind == "vault_restart":
+            if RESTART_VAULT not in steps:
+                steps.insert(0, RESTART_VAULT)
+        elif effect.kind in _DELIVER:
+            steps.append(_DELIVER[effect.kind])
+        elif effect.kind == "reemit_proxy_allowlist":
+            steps.append(NextStep("update_proxy_allowlist", effect.text))
+        elif effect.kind != "live":
+            steps.append(NextStep("restart", effect.text))
+    if not applied:
+        steps.append(WAIT_GATEWAY)
+    return tuple(steps)
 
 
 def onboard_again(server_url: str) -> NextStep:

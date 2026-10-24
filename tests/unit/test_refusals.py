@@ -246,6 +246,19 @@ OFFLINE = {
     "policy_store_present": 409,
     "reseed_needs_new_ratchet": 409,
 }
+# The admin socket's policy routes and the host's commands on them (M6 design H, N.1, N.2;
+# vault/admin.py, cli/policy.py, step 14a); import_declarative, import_refused and plan_changed
+# among them, catalogued already.
+SOCKET = {
+    "policy_not_managed": 409,
+    "base_required": 428,
+    "export_other_deployment": 400,
+    "import_widens": 400,
+    "lockout_unconfirmed": 400,
+    "nothing_to_acknowledge": 409,
+    "revision_unreadable": 409,
+    "revision_unknown": 409,
+}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -337,13 +350,19 @@ FIELDS = {
     "route_reuses_credential": {"detail"},
     **{reason: {"detail"} for reason in set(PLAN) - {"ratchet_full", "no_change"}},
     "policy_not_running": {"revision"},
-    "policy_moved": {"revision"},
+    "policy_moved": {"detail"},
     "import_refused": {"detail"},
     "saved_not_running": {"revision"},
     "state_locked": {"command"},
     "policy_store_present": {"state"},
     "reseed_needs_new_ratchet": {"detail"},
     "reseed_incomplete": {"detail"},
+    "export_other_deployment": {"detail"},
+    "import_widens": {"detail"},
+    "lockout_unconfirmed": {"detail"},
+    "nothing_to_acknowledge": {"detail"},
+    "revision_unreadable": {"revision"},
+    "revision_unknown": {"revision"},
 }
 
 
@@ -392,6 +411,7 @@ def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
+    expected |= SOCKET
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -552,14 +572,37 @@ def test_every_managed_write_reason_is_catalogued() -> None:
 
 
 def test_every_offline_reason_is_catalogued() -> None:
-    """M6 N.2: the scan widens to the host's offline commands' refusals (F.3), each a literal of
+    """M6 N.2: the scan widens to the host's commands' refusals (F.3, H), each a literal of
     their Reason type; the gate's and the generation's pass through by their own reasons, and
-    the planner's and the store's by theirs."""
+    the planner's, the store's and the vault's by theirs."""
     found = literal_reasons(policy_cli, "OfflineRefused")
     assert found == set(get_args(policy_cli.Reason)) | {"import_refused", "generation_lowered"}
-    assert set(get_args(policy_cli.Reason)) == set(OFFLINE)
+    assert set(get_args(policy_cli.Reason)) == set(OFFLINE) | {
+        "policy_not_managed",
+        "base_required",
+        "export_other_deployment",
+        "import_widens",
+        "lockout_unconfirmed",
+        "plan_changed",
+    }
     assert found <= set(CATALOGUE)
     assert set(policy_cli.GRANT_FLAGS) <= set(get_args(plan.Reason))
+
+
+def test_every_socket_policy_reason_is_catalogued() -> None:
+    """M6 N.2: the admin socket's policy routes (N.1) refuse with the catalogue's reasons: its
+    own (a literal of its PolicyReason type), an import's shape's (``vault/managed.py``), and
+    the managed write's, the store's and the planner's, which pass through;
+    ``revision_unreadable`` and ``revision_unknown`` are the store's ``Missing``."""
+    found = literal_reasons(admin, "refusal")
+    assert found == set(get_args(admin.PolicyReason))
+    shaped = literal_reasons(managed, "refusal")
+    assert shaped == {"import_declarative", "nothing_to_acknowledge"}
+    missing = set(get_args(policystore.Missing))
+    assert missing == {"revision_unreadable", "revision_unknown"}
+    # export_other_deployment is the CLI's own (the export header it reads, OPS-8).
+    assert set(SOCKET) <= found | shaped | missing | {"export_other_deployment"}
+    assert found | shaped | missing <= set(CATALOGUE)
 
 
 def test_the_offline_texts_name_the_vaults_uid() -> None:

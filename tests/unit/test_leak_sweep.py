@@ -66,8 +66,11 @@ start (step 13b: the seed from ZOEYMCP_CONFIG with a literal client token, a cha
 park and the resume) and a write through the managed holder leave none in a file, a log line,
 health's policy section, a start refusal or a write's answer. The host's offline seed and
 reseeds (step 13c) print, log and write none of the values a revision encrypts, nor a client token
-or its hash. The saves, rollbacks, imports and exports the socket and the portal make join the
-sweep in the steps that build them.
+or its hash. Over the admin socket (step 14a) an export, an import planned and committed, the
+history, a diff, the head and a refused rollback show none of the values the policy view hides,
+nor the client token's hash, except the export, which holds the hash (R61's fourth exception);
+nor does a log line. The portal's saves and rollbacks join the sweep in the steps that build
+them.
 """
 
 from __future__ import annotations
@@ -2388,6 +2391,7 @@ def test_the_hosts_offline_seed_and_reseed_show_no_policy_value(
     monkeypatch.setattr(main_module, "running_as_root", lambda: False)
     printed = []
     reseed = ["policy", "import", "--from-env", "--state", str(state), "--reseed", "--yes"]
+    reseed.append("--accept-widening")  # the token changed: a widening (Q41)
     for argv, source in (
         (["policy", "seed", "--state", str(state), "--yes"], document),
         (reseed, retokened),
@@ -2407,3 +2411,53 @@ def test_the_hosts_offline_seed_and_reseed_show_no_policy_value(
     values = [VAULT_SIDE[name] for name in POLICY_VALUES]
     for value in [*values, hash_token(LITERAL_TOKEN), new_token, hash_token(new_token)]:
         assert not any(value.encode() in text for text in shown), value
+
+
+async def test_the_hosts_socket_commands_show_no_policy_value(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """The host's commands over the admin socket (M6 design H, O.6, Y13, step 14a): the
+    secret-heavy policy, with its literal client token, seeded; exported, then an edited export
+    imported (its plan, then its commit), the history, a diff and the head read, and a rollback
+    refused for what it brings back. The export holds the client token only as its hash (R61's
+    fourth exception, DD-4); no other answer and no log line holds a value the policy view
+    hides, nor the hash."""
+    from .test_admin_policy import PolicyRig
+
+    document = secret_heavy_policy().model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    local = ("leak-route-bridge", "leak-route-socket")
+    document["routes"] = [route for route in document["routes"] if route["name"] not in local]
+    for name in ("srv-bridge", "srv-socket"):
+        del document["gateway"]["servers"][name]
+    document["gateway"]["clients"]["hashed"]["servers"] = ["srv-remote", "srv-toolkit"]
+    rig = PolicyRig(tmp_path, json.dumps(document), LEAK_REF_REFRESH="v", LEAK_REF_Q="v")
+    exported = (await rig.call("GET", "/policy/export")).json()["export"]
+    assert LITERAL_TOKEN not in exported
+    assert hash_token(LITERAL_TOKEN) in exported
+    edited = rig.document()
+    del edited["gateway"]["clients"]["literal"]
+    edited["egress_key_generation"] = 2
+    text = (exported.splitlines()[0] + "\n" + json.dumps(edited) + "\n").encode()
+    planned, committed = await rig.write("/policy/import", body=text, base=1)
+    assert committed is not None
+    assert committed.status_code == 200, committed.text
+    answers = [planned.text, committed.text]
+    for path in (
+        "/policy",
+        "/policy/revisions",
+        "/policy/revisions/2",
+        "/policy/revisions/2/diff",
+    ):
+        answer = await rig.call("GET", path)
+        assert answer.status_code == 200, answer.text
+        answers.append(answer.text)
+    refused = await rig.call("POST", "/policy/rollback/1", params=[("plan", "1")])
+    assert refused.json()["reason"] == "revives_client"
+    answers.append(refused.text)
+    assert '"(set)"' in answers[5]
+    events = [json.loads(line)["event"] for line in log_lines.getvalue().splitlines()]
+    assert {"policy_exported", "policy_imported"} <= set(events)
+    shown = [*answers, log_lines.getvalue()]
+    for value in [*(VAULT_SIDE[name] for name in POLICY_VIEW_HIDES), hash_token(LITERAL_TOKEN)]:
+        assert not any(value in text for text in shown), value
+    await rig.aclose()

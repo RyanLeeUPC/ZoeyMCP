@@ -2281,7 +2281,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 400 | `revision_out_of_range` | A revision can't go above 9,999,999,999. |
 | 500 | `reseed_incomplete` | The reseed failed and couldn't put the old store back, so the vault won't start (`<detail>`). Put each file named back, then run the reseed again; if the old anchor can't be put back, run it with --new-ratchet. |
 | 409 | `policy_not_running` | Revision `<revision>` is saved but not running: send SIGHUP to the vault or restart it, then save again. |
-| 409 | `policy_moved` | The policy moved to revision `<revision>` since you started: plan your change again on revision `<revision>`. |
+| 409 | `policy_moved` | Nothing was written: `<detail>`. For an import, export again and redo your edit; for a rollback, run it again. |
 | 409 | `plan_changed` | The plan changed since you read it: plan the change again and read it first. |
 | 400 | `import_refused` | The policy is refused: `<detail>`. |
 | 500 | `saved_not_running` | Saved as revision `<revision>`, but the vault couldn't apply it: send SIGHUP to the vault or restart it. |
@@ -2291,6 +2291,14 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 400 | `import_declarative` | An import is a managed revision; to go declarative, put an export made with --mode declarative in ZOEYMCP_CONFIG. |
 | 409 | `policy_store_present` | The state directory `<state>` already holds a policy store or its anchor: replace it with zoeymcp policy import --state `<state>` --reseed. |
 | 409 | `reseed_needs_new_ratchet` | The old policy head doesn't verify (`<detail>`), so there is no ratchet to plan the reseed against: add --new-ratchet, which forgets what the old store retired. |
+| 409 | `policy_not_managed` | This deployment's policy is declarative: commit a fragment instead. |
+| 428 | `base_required` | Say which revision this change is planned on: pass --base N (the revision you exported; zoeymcp policy head shows the current one). |
+| 400 | `export_other_deployment` | This export is from deployment `<detail>`, not this one: export from this deployment and redo your edit there. |
+| 400 | `import_widens` | This plan widens the policy (`<detail>`): with --yes it needs --accept-widening too, or run it without --yes to read the plan and confirm it. |
+| 400 | `lockout_unconfirmed` | This change `<detail>`: type the confirmation at the prompt, or pass --yes --lockout-ok. |
+| 409 | `nothing_to_acknowledge` | There is nothing to record: `<detail>`. |
+| 409 | `revision_unreadable` | Revision `<revision>` is in quarantine: it can't be read, so it can't be used. |
+| 409 | `revision_unknown` | Revision `<revision>` is no longer kept, or never was. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |
@@ -3561,7 +3569,9 @@ replaces the store:
   against its floor, and every change. Bringing back a client's token, a caller's placeholder or a
   pin the store retired, or a new `env:` name or a new place one is sent, is refused until you name
   it: `--allow-revive client:<name>` (or `caller:<route>/<index>`, `pin:<server>/<kind>/<name>`),
-  `--allow-env <NAME>`;
+  `--allow-env <NAME>`. As for an import (below), with `--yes` a plan that widens needs
+  `--accept-widening`, and a reseed that drops the origin a passkey was enrolled through or
+  moves `admin.listen` asks you to type it, or needs `--lockout-ok`;
 - `--new-ratchet` starts instead from the policy's own record of what may only move forward, and
   lists what it forgets. It is the only way when the old head doesn't verify, and the way out of
   `ratchet_full`. While the old head verifies, it never lowers a key generation below that head's
@@ -3574,6 +3584,132 @@ shows, so no number is used twice. The deployment ID is kept while the anchor ve
 one is made when it doesn't. `--reason TEXT` is kept with the revision. A reseed that fails before
 its new head is written puts the old store back as it was; if even that fails, it says which files
 are still in quarantine (`reseed_incomplete`).
+
+### The head, history and diffs
+
+Run these in the vault's container over its admin socket (`docker compose -f
+deploy/compose.hardened.yaml exec vault zoeymcp policy ...`, or `exec zoeymcp` in the standard
+tier); `--format json` prints the vault's answer instead:
+
+- `zoeymcp policy` (or `policy head`): the mode and, in managed mode, the head: when, how and by
+  whom it was written, its deployment and digest (8 characters each), and the revision the
+  gateway runs (`applied`, `pending`, or `unknown` before its first status report);
+- `zoeymcp policy history [--before N] [--limit N]`: the kept revisions, newest first, each with
+  what made it (`policy.seed`, `policy.save`, `policy.import`, `policy.rollback`, ...), by whom
+  (a passkey's fingerprint, the host and how, or the seed), its base, a rollback's target and the
+  host's `--reason`. A revision in quarantine shows as a gap;
+- `zoeymcp policy diff N [--against M]`: what revision N changed from its parent (or from M), one
+  row per field with its direction (wider, narrower or neutral). It is rendered as the portal
+  renders the policy: a client's token hash, a placeholder, an account name or a recipient shows
+  only as `(set)`, `(changed)` or `(removed)`.
+
+### Exporting the policy
+
+`zoeymcp policy export [--revision N] [--mode managed|declarative] [--for compose]` writes the
+head's policy, or a kept revision's, as YAML on stdout, and what it exported on stderr. It holds
+placeholders and client token hashes, so keep it like a secret: it refuses a terminal unless
+`--force-tty`, so redirect it to a file (`exec -T vault zoeymcp policy export > policy.yaml`).
+Its first line names the revision and the deployment it came from; `policy import` reads it back
+(below). The export is logged (`policy_exported revision=N via=socket|offline`), and the portal
+has none.
+
+`--mode declarative --for compose` is the way back to a declarative deployment: the document says
+`mode: declarative`, is indented for an inline `ZOEYMCP_CONFIG` block with every `$` written as
+`$$`, and stderr names each field the shipped compose files take from a variable that is now a
+literal (`gateway_key_generation`, the admin port in `admin.origins`), then the next commands:
+replace the policy under `ZOEYMCP_CONFIG` with it, `run --rm --no-deps vault check`, `up -d
+vault`. The recreated vault runs it declaratively and parks the store (above).
+
+### Importing a change
+
+Everything the portal can't change (a client and its token, a caller, `admin`, the egress
+settings, a key generation, a connector's account) is an export, an edit and an import:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp policy export > policy.yaml
+$EDITOR policy.yaml
+docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp policy import - < policy.yaml
+docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp policy import --yes - < policy.yaml
+```
+
+The import is planned on the revision the export's first line names, never on whatever the head
+is now: if a portal save made a newer revision meanwhile, it is refused (`policy_moved`, 412), so
+export again and redo your edit. A document from another deployment is refused, and one with no
+export line needs `--base N` (`base_required`). The policy goes through the vault's own checks
+with its environment, so an `env:` name the vault's container lacks is refused before any plan.
+Each client token written as a literal is stored as its hash. An import can't re-pin a tool: the
+head's pin is kept for every definition both have (a re-pin is a review), and a tool it includes
+leaves the server's `declined` list.
+
+The plan goes to stderr: the revision, then each change that widens the policy (a new client,
+caller or origin, a move to `allow`), then the rest, what needs a restart, the secrets whose
+binding stops matching, what the head kept and each grant you gave, and the store entries it
+leaves unused. Answer `[y/N]`; piped on standard input there is no answer to read, so the plan is
+printed and nothing is written until you run it again with `--yes`. With `--yes` a plan that
+widens is refused (`import_widens`) unless `--accept-widening` is given too, so a script can't
+widen by accident. The write then names the plan it showed: if anything changed since, it is
+refused (`plan_changed`) and nothing is written; if its answer was lost and you run it again, it
+says it was already written. The answer lists what to do next (a restart, a key to give the
+gateway) and that the gateway takes the new view within seconds.
+
+- **What the store retired** stays retired: bringing back a client's token, a caller's placeholder
+  or a pin a later revision removed is refused, naming each, until you name it:
+  `--allow-revive client:<name>` (or `caller:<route>/<index>`, `pin:<server>/<kind>/<name>`); a
+  new `env:` name, or one sent somewhere new, needs `--allow-env <NAME>`, and the variable must be
+  set in the vault's container first.
+- **A removed credential's store entries** are named in the plan with their `zoeymcp secret
+  delete` lines: once the import removes the credential, a refresh token can't be revoked at its
+  provider any more, so delete them first, or add `--revoke-removed`, which deletes each after the
+  import is written and revokes its grant with what the vault read before the import (a refused
+  import deletes nothing); the answer says which it asked the provider to revoke (an entry with
+  no grant, or whose credential names no `revocation_url`, is only deleted).
+- **`--reason TEXT`** is kept with the revision and shown in history.
+- **`--from-env`** imports the policy in the vault's own `ZOEYMCP_CONFIG` (the one it was seeded
+  from, as the compose file renders it now): its plan shows every difference from the head,
+  portal saves it would undo included, and once written its digest becomes the seed's, so
+  `policy_seed_ignored` ends; when the head and the seed already match it, it is refused, as
+  there is nothing to record. **`--from-env --baseline-only`** records that digest without
+  applying anything (a revision of kind `policy.acknowledge` with the head's content), for a
+  compose policy you changed only to match the deployment (a new admin port, a rotated key
+  generation); it is refused when there is nothing to record.
+
+### Rolling back
+
+`zoeymcp policy rollback N` writes revision N's content as the next revision, with from the
+head the key generations (a rotation is never undone) and the pin of every tool both have; it
+takes N's `admin` block, so a rollback to the revision before a bad import is the way back from
+a lockout. It is planned and confirmed as an import is, with the same flags (`--base`, `--yes`,
+`--accept-widening`, `--allow-revive`, `--allow-env`, `--lockout-ok`, `--revoke-removed`,
+`--reason`): a rollback past the removal of a client asks for its `--allow-revive`. A revision in
+quarantine can't be rolled back to (`revision_unreadable`), nor one no longer kept
+(`revision_unknown`). The portal's rollback keeps the head's `admin` and refuses anything wider.
+
+### A lockout, with and without a socket
+
+An import or rollback that removes the last origin of a host where passkeys were enrolled, or
+moves `admin.listen`, says so in its plan ("removes http://localhost:8081, where 2 passkeys were
+enrolled: they stop working"), and after `[y/N]` asks you to type the origin (or the new address).
+With `--yes` it needs `--lockout-ok` too (`lockout_unconfirmed`), and since a changed `admin`
+widens the policy, `--accept-widening` as well (`import_widens`). If the portal is lost anyway,
+roll back over the socket, or export, fix `admin` and import. Where there is no socket (Windows,
+or `--admin-socket none`), the same commands take `--state /state` with the vault stopped, as the
+seed and the reseed do (above: they refuse root and wait for the lock); `history`, `diff`,
+`export`, `import` and `rollback` all have the form, and are written by the host offline:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml stop vault
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault policy export --state /state > fixed.yaml
+$EDITOR fixed.yaml
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault policy import --state /state --yes --accept-widening --lockout-ok - < fixed.yaml
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps vault setup-code --state /state
+docker compose -f deploy/compose.hardened.yaml up -d vault
+```
+
+(`policy rollback N --state /state --yes --accept-widening --lockout-ok` replaces the export,
+the edit and the import while the revision before the lockout is kept; in the standard tier each
+`run` adds `--user 10001:10001`.) An offline import or rollback takes no `--revoke-removed`:
+revoking needs the running vault. A store a declarative start parked is read but not written
+offline.
 
 ### Upgrading to M6
 
@@ -3657,7 +3793,8 @@ Its log lines:
 | `policy_store_unverified` | `reason`: a declarative start found a store that doesn't verify, and left it (warning) |
 | `policy_resumed` | `revision`, `parked_at`, `revived` and, above 0, `names` (warning then): a managed start resumed a parked store |
 | `policy_refused` | `reason`, and `file` or `revision`: a start refused over the store or its head (critical) |
-| `policy_saved`, `policy_imported`, `policy_rolled_back`, `policy_acknowledged` | `revision`, `write_kind`, `origin`, `author` (a passkey's fingerprint, 8 characters, or `host`), `base`, `digest` (8), `effects` (what needs a restart or a step), and `target` for a rollback |
+| `policy_saved`, `policy_imported`, `policy_rolled_back`, `policy_acknowledged` | `revision`, `write_kind`, `origin`, `author` (a passkey's fingerprint, 8 characters, or `host`), `base`, `digest` (8), `effects` (what needs a restart or a step), `target` for a rollback, and `from_env` and `baseline_only` for a host import |
+| `policy_exported` | `revision`, `via` (`socket`, or `offline` for `--state`): the host exported the policy |
 | `policy_imported` (a reseed) | `revision`, `write_kind` (`policy.reseed`), `origin` (`reseed`), `author` (`host`), `base` (the old head it was planned against, or none), `digest` and `deployment` (8 characters each), `effects` (none), `reseed` (true), `new_ratchet`, `from_env` |
 | `tool_allowed`, `tool_repinned` | `server`, `def_kind`, `name`, `revision`; `tool_allowed` also `kept` for an `allow` tool kept through a re-pin: one line per tool, whatever the change |
 | `policy_not_installed` | `revision`, `reason`: a saved revision couldn't be applied, and the previous one runs (critical) |

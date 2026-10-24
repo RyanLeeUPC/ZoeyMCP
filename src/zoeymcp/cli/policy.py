@@ -1,4 +1,31 @@
-"""``zoeymcp policy``: the host's commands on a managed policy (M6 design M.6). I/O.
+"""``zoeymcp policy``: the host's commands on a managed policy (M6 design H, M.6, F.3). I/O.
+
+Over the vault's admin socket (``docker compose exec vault zoeymcp policy ...``), or, with
+``--state DIR``, on the state directory with the vault stopped (I.1's recovery where there is no
+socket, COV-5):
+
+- ``policy`` / ``policy head`` (socket): the mode and the head, the revision the gateway runs;
+- ``policy history [--before N] [--limit N]`` and ``policy diff N [--against M]``: H.1 and H.2,
+  each row of a diff through the policy view's renderer, hidden fields hidden; both and ``head``
+  take ``--format text|json`` (D-171);
+- ``policy export [--revision N] [--mode managed|declarative] [--for compose]``: H.6, R61's
+  fourth scoped exception. The YAML alone goes to stdout and the notes (what was exported, the
+  compose form's interpolated fields, and for a declarative compose export the way back, J10)
+  to stderr; a terminal stdout is refused without ``--force-tty``, so a placeholder doesn't
+  scroll by;
+- ``policy import FILE|-`` (or ``--from-env``, the vault's own configured policy, G-14, with
+  ``--baseline-only`` to record its digest and apply nothing, F.5) and ``policy rollback N``
+  (H.3, the target's ``admin`` with it, H.4): a host write. The plan goes to stderr, widenings
+  first; each store entry it leaves unused is named with its ``secret delete`` line unless
+  ``--revoke-removed`` (G.8); ``[y/N]`` unless ``--yes``, and a lockout row (I.1, G-17) asks
+  its second, typed confirmation. With ``--yes`` a plan that widens needs ``--accept-widening``
+  (``import_widens``, Q41) and one with a lockout row ``--lockout-ok``
+  (``lockout_unconfirmed``). An import's base is ``--base N``, else the revision and deployment
+  of the export's first line (OPS-8): a header from another deployment is refused
+  (``export_other_deployment``), no header and no ``--base`` is ``base_required``; a rollback's
+  and ``--from-env``'s base is the head as the plan read it. The write then names its base and
+  the plan's digest, so a head that moved meanwhile is ``policy_moved`` and a plan that changed
+  is ``plan_changed``; a retry whose answer was lost is ``already_saved``.
 
 The offline forms that make a policy store or replace one, run with the vault stopped (F.3):
 
@@ -16,42 +43,84 @@ The offline forms that make a policy store or replace one, run with the vault st
   (``--allow-revive``, ``--allow-env``); the new ratchet is the old one advanced.
   ``--new-ratchet`` starts from the document's own ratchet instead, and lists what it forgets;
   it is the one way out of ``ratchet_full``, and the only way when the old head doesn't verify.
-  The old head and revisions go to ``quarantine/`` (``vault/policystore.py``).
+  Against a head that verifies, a planned reseed that widens needs ``--accept-widening`` with
+  ``--yes``, and any reseed that drops a passkey's origin or moves ``admin.listen`` asks the
+  typed confirmation, or ``--lockout-ok`` with ``--yes`` (I.1, Q41). The old head and revisions
+  go to ``quarantine/`` (``vault/policystore.py``).
 
-Every form refuses to run as root, since the vault's uid couldn't read what it wrote
+Every ``--state`` form refuses to run as root, since the vault's uid couldn't read what it wrote
 (``state_as_root``, OPS-5), and takes the state lock a running vault holds (``state_locked``:
 stop the vault first, in the host's own commands, OPS-6). It needs the vault's master key in its
 environment, which is the vault's compose service's, so ``env:`` names resolve as the vault's
 will; checks the document through the gate (C); and refuses a gateway key generation below the
-gateway-key state before anything is written (``gatewaykeys.check``, G-4). What it will write goes
-to stderr, with ``[y/N]`` unless ``--yes``; a policy read from standard input leaves no answer to
-read, so without ``--yes`` the plan is printed and nothing is written. Every refusal is the
-portal's catalogued sentence (``portal/refusals.py``, N.2), so operations.md's table names each.
-The other ``policy`` commands, and the import over the admin socket, are step 14a's.
+gateway-key state before anything is written (``gatewaykeys.check``, G-4). An offline import or
+rollback is planned and written as the running vault's is (``vault/managed.py``'s
+``plan_on``), by the host offline, on a store a declarative start hasn't parked; it takes no
+``--revoke-removed``, since revoking needs the running vault's token manager. What it will write
+goes to stderr, with ``[y/N]`` unless ``--yes``; a policy read from standard input leaves no
+answer to read, so without ``--yes`` the plan is printed and nothing is written. Every refusal is
+the catalogue's sentence (``portal/refusals.py``, N.2), so operations.md's table names each.
+``acknowledge-restore`` is step 17's, with the witness it acknowledges.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, Literal, TextIO
+from typing import Any, Final, Literal, Protocol, TextIO
 
+from ..common.logs import off_stdout
 from ..common.policy import PolicyError, gate, read_source, restart
 from ..common.policy.export import header as export_header
 from ..common.policy.gate import GateRefused
-from ..common.policy.plan import PlanInput, PlanRefused, normalize, normalized_digest, plan
+from ..common.policy.plan import (
+    PlanInput,
+    PlanRefused,
+    WritePlan,
+    normalize,
+    normalized_digest,
+    plan,
+)
 from ..common.policy.ratchet import Grants, Ratchet, initial, reach, violations
 from ..common.policy.schema import Policy
 from ..common.textrules import reveal_hidden
-from ..portal.refusals import refusal
+from ..portal import passkeys as passkey_file
+from ..portal.refusals import Refusal, refusal
 from ..vault import gatewaykeys, logs
 from ..vault.keys import KeySet
-from ..vault.managed import commands, head_policy
+from ..vault.managed import (
+    Shaped,
+    WriteRefused,
+    Written,
+    bindings,
+    commands,
+    diff_answer,
+    export_answer,
+    head_policy,
+    history_page,
+    import_shaped,
+    lockout_rows,
+    log_saved,
+    lowered,
+    moved,
+    plan_answer,
+    plan_digest,
+    plan_on,
+    refused_answer,
+    rollback_shaped,
+    widenings,
+    written_answer,
+)
+from ..vault.onboarding import RESTART_VAULT, saved_next
 from ..vault.policyseal import REASON_MAX
 from ..vault.policystart import POLICY_DIR, QUARANTINE, Commands, Fresh, Ok, Refused
-from ..vault.policystore import OFFLINE, PolicyStore, StoreRefused
+from ..vault.policystore import HISTORY_PAGE_MAX, OFFLINE, PolicyStore, StoreRefused
 from ..vault.server import (
     StartupError,
     StateLocked,
@@ -59,6 +128,10 @@ from ..vault.server import (
     gateway_key_state,
     load_keys,
 )
+from ..vault.store import SecretStore, StoreError
+from . import admin_client
+from .onboard import Prefix, next_lines
+from .review import write_json
 
 # The refusals only these commands give; portal/refusals.py catalogues each (N.2).
 Reason = Literal[
@@ -68,12 +141,19 @@ Reason = Literal[
     "import_declarative",
     "policy_store_present",
     "reseed_needs_new_ratchet",
+    "policy_not_managed",
+    "base_required",
+    "export_other_deployment",
+    "import_widens",
+    "lockout_unconfirmed",
+    "plan_changed",
 ]
 
 EXIT_OK: Final = 0
 # Refused, or not confirmed: nothing was written.
 EXIT_REFUSED: Final = 1
-# It can't run: root, the lock, the master key, a policy that can't be read or is refused.
+# It can't run: root, the lock, the master key, a policy that can't be read or is refused, a
+# vault that can't be reached.
 EXIT_UNREADABLE: Final = 2
 # The planner's refusals whose subjects are grants, and the flag that grants each (H.5).
 GRANT_FLAGS: Final = {
@@ -83,20 +163,47 @@ GRANT_FLAGS: Final = {
     "env_name_new": "--allow-env",
     "env_reach_grows": "--allow-env",
 }
+# The actions whose stdout is their answer, kept free of log lines.
+_READS: Final = frozenset({"head", "history", "diff", "export"})
+# What the export's notes add for a declarative compose export: the way back (J10).
+COMPOSE_NEXT: Final = (
+    "Next: replace the policy under ZOEYMCP_CONFIG in your compose file with it, then:"
+)
 
 
 class OfflineRefused(Exception):
-    """A refusal from the catalogue: its ``reason`` and the fields its sentence names."""
+    """A refusal from the catalogue: its ``reason`` and the fields its sentence names, or the
+    sentence ``said`` as the vault filled it in."""
 
-    def __init__(self, reason: str, *, unreadable: bool = False, **fields: str) -> None:
+    def __init__(
+        self, reason: str, *, unreadable: bool = False, said: str | None = None, **fields: str
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.fields = fields
         self.unreadable = unreadable
+        self.said = said
         self.flags: list[str] = []
 
     def text(self) -> str:
-        return refusal(self.reason, **self.fields).error
+        return self.said if self.said is not None else refusal(self.reason, **self.fields).error
+
+    @classmethod
+    def answered(cls, reason: str, said: str, subjects: Sequence[str] = ()) -> OfflineRefused:
+        """A refusal the vault (or the write path offline) answered: its sentence, and the flag
+        each grant subject needs (H.5)."""
+        refused = cls(reason, said=said)
+        flag = GRANT_FLAGS.get(reason)
+        if flag is not None:
+            refused.flags = [f"{flag} {subject}" for subject in subjects]
+        return refused
+
+    @classmethod
+    def of(cls, answer: Refusal | WriteRefused) -> OfflineRefused:
+        if isinstance(answer, WriteRefused):
+            filled = refused_answer(answer)
+            return cls.answered(filled.reason, filled.error, answer.subjects)
+        return cls(answer.reason, said=answer.error)
 
 
 def _shown(value: str) -> str:
@@ -108,34 +215,27 @@ def run(
     args: argparse.Namespace,
     environ: Mapping[str, str],
     stdin: TextIO,
+    out: TextIO,
     err: TextIO,
     *,
     as_root: bool,
 ) -> int:
-    """``zoeymcp policy <action>``: ``seed``, or ``import`` with ``--state`` and ``--reseed``."""
-    name = f"zoeymcp policy {args.action}"
-    if args.action == "import":
-        usage = _import_usage(args)
-        if usage is not None:
-            err.write(f"{name}: {usage}\n")
-            return EXIT_UNREADABLE
-    state = Path(args.state)
-    hosted = commands(environ, args.state, standard=False)
+    """``zoeymcp policy [<action>]``: over the admin socket, or with ``--state`` offline."""
+    action = getattr(args, "action", None) or "head"
+    name = f"zoeymcp policy {action}"
+    usage = _usage(action, args, out)
+    if usage is not None:
+        err.write(f"{name}: {usage}\n")
+        return EXIT_UNREADABLE
+    # A read's stdout is its answer alone (the export's YAML, a JSON document): the store's log
+    # lines (an offline form's housekeeping, the export's own) go to stderr meanwhile.
+    quiet = off_stdout(err) if action in _READS else contextlib.nullcontext()
     try:
-        if as_root:
-            raise OfflineRefused("state_as_root", unreadable=True)
-        keys, previous = load_keys(environ)
-        try:
-            fd = acquire_state_lock(state)
-        except StateLocked as exc:
-            raise OfflineRefused("state_locked", unreadable=True, command=hosted.stop()) from exc
-        try:
-            if args.action == "seed":
-                return _seed(args, state, environ, stdin, err, keys, previous, hosted)
-            return _reseed(args, state, environ, stdin, err, keys, previous, hosted)
-        finally:
-            if fd is not None:
-                os.close(fd)
+        with quiet:
+            if getattr(args, "state", None) is None:
+                socket = admin_client.socket_path(getattr(args, "socket", None))
+                return _act(action, args, _Socket(socket), environ, stdin, out, err)
+            return _offline(action, args, environ, stdin, out, err, as_root=as_root)
     except OfflineRefused as exc:
         err.write(f"{name}: {exc.text()}\n")
         for flag in exc.flags:
@@ -144,18 +244,87 @@ def run(
     except StartupError as exc:
         err.write(f"{name}: {exc}\n")
         return EXIT_UNREADABLE
+    except admin_client.AdminUnavailable as exc:
+        if exc.reason is None:
+            err.write(f"{name}: {exc}\n")
+            return EXIT_UNREADABLE
+        refused = OfflineRefused.answered(exc.reason, str(exc), exc.data.get("subjects") or ())
+        err.write(f"{name}: {refused.text()}\n")
+        for flag in refused.flags:
+            err.write(f"  {flag}\n")
+        return EXIT_REFUSED
 
 
-def _import_usage(args: argparse.Namespace) -> str | None:
-    """What is wrong with ``import``'s arguments, if anything."""
-    if args.state is None or not args.reseed:
-        return "this version imports only offline, with the vault stopped: --state DIR --reseed"
+def _offline(
+    action: str,
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    stdin: TextIO,
+    out: TextIO,
+    err: TextIO,
+    *,
+    as_root: bool,
+) -> int:
+    """A ``--state`` form, with the vault stopped: as the vault's uid, under the state lock."""
+    state = Path(args.state)
+    hosted = commands(environ, args.state, standard=False)
+    if as_root:
+        raise OfflineRefused("state_as_root", unreadable=True)
+    keys, previous = load_keys(environ)
+    try:
+        fd = acquire_state_lock(state)
+    except StateLocked as exc:
+        raise OfflineRefused("state_locked", unreadable=True, command=hosted.stop()) from exc
+    try:
+        if action == "seed":
+            return _seed(args, state, environ, stdin, err, keys, previous, hosted)
+        if action == "import" and args.reseed:
+            return _reseed(args, state, environ, stdin, err, keys, previous, hosted)
+        vault = _Offline(state, environ, keys, previous, hosted)
+        return _act(action, args, vault, environ, stdin, out, err)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _usage(action: str, args: argparse.Namespace, out: TextIO) -> str | None:
+    """What is wrong with the arguments, if anything."""
+    state = getattr(args, "state", None)
+    reason = getattr(args, "reason", None)
+    if reason is not None and not (1 <= len(reason) <= REASON_MAX and reason.isprintable()):
+        return f"--reason is 1 to {REASON_MAX} printable characters"
+    limit = getattr(args, "limit", None)
+    if limit is not None and not 1 <= limit <= HISTORY_PAGE_MAX:
+        return f"--limit is 1 to {HISTORY_PAGE_MAX}"
+    if action == "export" and out.isatty() and not args.force_tty:
+        return (
+            "the export holds placeholders and client token hashes: redirect it to a file "
+            "(> policy.yaml), or pass --force-tty to print it here"
+        )
+    if action != "import":
+        if action == "rollback" and args.revoke_removed and state is not None:
+            return "--revoke-removed needs the running vault: run it over the socket"
+        return None
+    if args.reseed:
+        if state is None:
+            return "--reseed replaces the store with the vault stopped: add --state DIR"
+        for flag, given in (
+            ("--baseline-only", args.baseline_only),
+            ("--base", args.base is not None),
+            ("--revoke-removed", args.revoke_removed),
+        ):
+            if given:
+                return f"{flag} isn't a reseed's: a reseed replaces the store whole"
+    elif args.new_ratchet:
+        return "--new-ratchet goes with --reseed"
     if (args.source is None) == (not args.from_env):
         return "give the policy as FILE (- for standard input) or --from-env, one of them"
-    if args.reason is not None and not (
-        1 <= len(args.reason) <= REASON_MAX and args.reason.isprintable()
-    ):
-        return f"--reason is 1 to {REASON_MAX} printable characters"
+    if args.baseline_only and not args.from_env:
+        return "--baseline-only goes with --from-env"
+    if args.from_env and args.base is not None:
+        return "--from-env is planned on the head: drop --base"
+    if args.revoke_removed and state is not None:
+        return "--revoke-removed needs the running vault: run it over the socket"
     return None
 
 
@@ -235,7 +404,9 @@ def _rows(rows: Sequence[tuple[str, str]]) -> str:
     )
 
 
-def _confirmed(yes: bool, piped: bool, stdin: TextIO, err: TextIO) -> bool:
+def _confirmed(
+    yes: bool, piped: bool, stdin: TextIO, err: TextIO, question: str = "Write it?"
+) -> bool:
     """``[y/N]`` unless ``--yes``. A policy read from standard input leaves no answer to read:
     the plan was printed, and nothing is written."""
     if yes:
@@ -246,7 +417,7 @@ def _confirmed(yes: bool, piped: bool, stdin: TextIO, err: TextIO) -> bool:
             "Read the plan above, then run this again with --yes.\n"
         )
         return False
-    err.write("Write it? [y/N] ")
+    err.write(f"{question} [y/N] ")
     err.flush()
     if stdin.readline().strip().lower() in ("y", "yes"):
         return True
@@ -341,9 +512,10 @@ def _reseed(
     old, why = _old_head(found)
     anchor = store.trusted_anchor
     kept = "its deployment kept" if anchor is not None else "a new deployment"
+    wider: list[str] = []
     if old is not None and not args.new_ratchet:
         head = head_policy(old)
-        ratchet, rows = _planned(args, store, old, head, candidate, text, floor)
+        ratchet, rows, wider = _planned(args, store, old, head, candidate, text, floor)
         err.write(
             f"Reseeding as revision {number}, {kept}, planned against revision {old.revision} "
             "and what it retired:\n"
@@ -361,11 +533,25 @@ def _reseed(
             said = f"the old store doesn't verify ({why})"
         err.write(f"Reseeding as revision {number}, {kept}, with a new ratchet, {said}:\n")
     err.write(_rows(rows))
+    # What can lock the portal out, against the old head when it verifies (I.1, G-17).
+    lockout = (
+        ()
+        if old is None
+        else lockout_rows(head_policy(old), candidate, _passkey_rp_ids(state, keys, previous))
+    )
+    for row in lockout:
+        err.write(f"  Lockout: this {_shown(row.text)}\n")
     err.write(
         f"The old head and its revisions go to {args.state}/{POLICY_DIR}/{QUARANTINE}/, never "
         "deleted.\n"
     )
-    if not _confirmed(args.yes, args.source == "-", stdin, err):
+    asked = {
+        "revision": number,
+        "widens": bool(wider),
+        "widenings": wider,
+        "lockout": [{"text": row.text, "confirm": row.confirm} for row in lockout],
+    }
+    if _confirm_write(args, asked, args.source == "-", stdin, err, question="Write it?") is None:
         return EXIT_REFUSED
     try:
         committed = store.reseed(
@@ -421,10 +607,10 @@ def _planned(
     candidate: Policy,
     text: str,
     floor: gatewaykeys.State | None,
-) -> tuple[Ratchet, list[tuple[str, str]]]:
+) -> tuple[Ratchet, list[tuple[str, str]], list[str]]:
     """The reseed planned as a host write against the old head (T-8): the planner's refusal, or
-    the ratchet after it and the rows to show, the revisions it undoes and the key generations
-    against their floors first."""
+    the ratchet after it, the rows to show (the revisions it undoes and the key generations
+    against their floors first) and its widening rows (``import_widens``, Q41)."""
     admin = candidate.admin
     planned = plan(
         PlanInput(
@@ -470,7 +656,7 @@ def _planned(
     ]
     # The planner's first row names head + 1; the reseed's number is above every one shown.
     rows += list(planned.rows[1:])
-    return planned.ratchet, rows
+    return planned.ratchet, rows, widenings(planned)
 
 
 def _detail(planned: PlanRefused) -> dict[str, str]:
@@ -529,3 +715,611 @@ def _forgotten(before: Ratchet, after: Ratchet) -> list[tuple[str, str]]:
         elif gone:
             rows.append(("Forgets", f"env:{name} sent to {', '.join(gone)}"))
     return rows or [("Forgets", "nothing: the old ratchet retired nothing")]
+
+
+# --- the host's commands on the head and its history (H, M.6) ------------------------------------
+
+
+@dataclass(frozen=True)
+class _Write:
+    """An import or a rollback, as the host asked for it."""
+
+    action: Literal["import", "rollback"]
+    target: int | None = None  # a rollback's
+    text: str | None = None  # an import's document; None with --from-env
+    from_env: bool = False
+    baseline_only: bool = False
+    revive: tuple[str, ...] = ()
+    env: tuple[str, ...] = ()
+    reason: str | None = None
+    revoke_removed: bool = False
+
+    def query(
+        self, *, plan: bool, accept: bool = False, lockout: bool = False
+    ) -> list[tuple[str, str]]:
+        """The socket's query (N.1)."""
+        flags = (
+            ("plan", plan),
+            ("from_env", self.from_env),
+            ("baseline_only", self.baseline_only),
+            ("revoke_removed", self.revoke_removed),
+            ("accept_widening", accept),
+            ("lockout_ok", lockout),
+        )
+        found = [(name, "1") for name, given in flags if given]
+        found += [("allow_revive", value) for value in self.revive]
+        found += [("allow_env", value) for value in self.env]
+        if self.reason is not None:
+            found.append(("reason", self.reason))
+        return found
+
+
+class _Vault(Protocol):
+    """Where the commands read and write: the running vault over its socket, or the store with
+    the vault stopped. Each answers in the socket's shapes (N.1)."""
+
+    via: str
+
+    def head(self) -> dict[str, Any]: ...
+
+    def history(self, before: int | None, limit: int | None) -> dict[str, Any]: ...
+
+    def diff(self, revision: int, against: int | None) -> dict[str, Any]: ...
+
+    def export(self, revision: int | None, mode: str, target: str | None) -> dict[str, Any]: ...
+
+    def plan(self, write: _Write, base: int) -> dict[str, Any]: ...
+
+    def commit(
+        self, write: _Write, base: int, digest: str, *, accept: bool, lockout: bool
+    ) -> dict[str, Any]: ...
+
+
+class _Socket:
+    """The running vault, over its admin socket."""
+
+    via = "socket"
+
+    def __init__(self, socket: str) -> None:
+        self._socket = socket
+
+    def head(self) -> dict[str, Any]:
+        return admin_client.policy_head(self._socket)
+
+    def history(self, before: int | None, limit: int | None) -> dict[str, Any]:
+        return admin_client.policy_history(self._socket, before=before, limit=limit)
+
+    def diff(self, revision: int, against: int | None) -> dict[str, Any]:
+        return admin_client.policy_diff(self._socket, revision, against=against)
+
+    def export(self, revision: int | None, mode: str, target: str | None) -> dict[str, Any]:
+        return admin_client.policy_export(self._socket, revision=revision, mode=mode, target=target)
+
+    def plan(self, write: _Write, base: int) -> dict[str, Any]:
+        return admin_client.policy_write(
+            self._socket, _path(write), write.query(plan=True), body=_body(write), base=base
+        )
+
+    def commit(
+        self, write: _Write, base: int, digest: str, *, accept: bool, lockout: bool
+    ) -> dict[str, Any]:
+        return admin_client.policy_write(
+            self._socket,
+            _path(write),
+            write.query(plan=False, accept=accept, lockout=lockout),
+            body=_body(write),
+            base=base,
+            plan_digest=digest,
+        )
+
+
+def _path(write: _Write) -> str:
+    if write.action == "rollback":
+        return f"/policy/rollback/{write.target}"
+    return "/policy/import"
+
+
+def _body(write: _Write) -> bytes:
+    return b"" if write.text is None else write.text.encode("utf-8")
+
+
+class _Offline:
+    """The store in a state directory, with the vault stopped: read, planned and written as the
+    running vault would (``vault/managed.py``), by the host offline. A store that refuses to
+    start refuses here too, with its recoveries; one a declarative start parked is read, and
+    refuses every write (``policy_not_managed``)."""
+
+    via = "offline"
+
+    def __init__(
+        self,
+        state: Path,
+        environ: Mapping[str, str],
+        keys: KeySet,
+        previous: KeySet | None,
+        hosted: Commands,
+    ) -> None:
+        self._state = state
+        self._environ = environ
+        self._keys = keys
+        self._previous = previous
+        self._hosted = hosted
+        self._store = _open(state, keys, previous)
+        found = self._store.verdict
+        if isinstance(found, Refused):
+            raise StartupError(found.text(hosted))
+        if not isinstance(found, Ok):
+            raise StartupError(
+                f"there is no policy store in {state}: seed it with zoeymcp policy seed --state "
+                f"{state}"
+            )
+        try:
+            self._head = head_policy(found)
+        except ValueError as exc:
+            raise StartupError(
+                f"the head's policy, revision {found.revision}, isn't one this version reads"
+            ) from exc
+        self._ratchet = found.ratchet
+        self._parked = found.parked is not None
+
+    def head(self) -> dict[str, Any]:
+        top = self._store.head
+        assert top is not None  # noqa: S101 - an Ok store has one
+        return {"mode": "managed", "revision": top.revision, "deployment8": top.deployment[:8]}
+
+    def history(self, before: int | None, limit: int | None) -> dict[str, Any]:
+        return history_page(self._store, before, limit or HISTORY_PAGE_MAX)
+
+    def diff(self, revision: int, against: int | None) -> dict[str, Any]:
+        return _or_refused(diff_answer(self._store, revision, against))
+
+    def export(self, revision: int | None, mode: str, target: str | None) -> dict[str, Any]:
+        top = self._store.head
+        assert top is not None  # noqa: S101 - an Ok store has one
+        number = top.revision if revision is None else revision
+        answer = _or_refused(
+            export_answer(
+                self._store,
+                number,
+                mode="declarative" if mode == "declarative" else "managed",
+                target="compose" if target == "compose" else "plain",
+            )
+        )
+        logs.event("policy_exported", revision=number, via="offline")
+        return answer
+
+    def plan(self, write: _Write, base: int) -> dict[str, Any]:
+        planned, _ = self._planned(write, base)
+        return plan_answer(planned, self._lockout(planned))
+
+    def commit(
+        self, write: _Write, base: int, digest: str, *, accept: bool, lockout: bool
+    ) -> dict[str, Any]:
+        planned, shaped = self._planned(write, base)
+        if plan_digest(planned) != digest:
+            raise OfflineRefused("plan_changed")
+        wider = widenings(planned)
+        if wider and not accept:
+            raise OfflineRefused("import_widens", detail=", ".join(wider))
+        rows = self._lockout(planned)
+        if rows and not lockout:
+            raise OfflineRefused("lockout_unconfirmed", detail="; ".join(r.text for r in rows))
+        refused = lowered(gateway_key_state(self._state, self._keys, self._previous), planned)
+        if refused is not None:
+            raise OfflineRefused.of(refused)
+        target = shaped.evidence.target_revision if planned.kind == "policy.rollback" else None
+        try:
+            committed = self._store.commit(
+                planned,
+                author=OFFLINE,
+                reason=write.reason,
+                target=target,
+                seed_digest=shaped.seed_digest,
+            )
+        except StoreRefused as exc:
+            raise OfflineRefused(exc.reason) from exc
+        log_saved(planned, committed, OFFLINE, logged=shaped.logged)
+        # The vault isn't running: its own restart is the start the host makes next.
+        steps = tuple(s for s in saved_next(planned.effects, applied=True) if s != RESTART_VAULT)
+        written = Written(committed.revision, committed.digest, planned.effects, next=steps)
+        return written_answer(written)
+
+    def _planned(self, write: _Write, base: int) -> tuple[WritePlan, Shaped]:
+        """The write planned on the head (G.6 steps 2-5), as the running vault plans it."""
+        if self._parked:
+            raise OfflineRefused("policy_not_managed")
+        top = self._store.head
+        assert top is not None  # noqa: S101 - an Ok store has one
+        if base != top.revision:
+            detail = moved(self._store.header, top.revision)
+            raise OfflineRefused.of(WriteRefused("policy_moved", detail, revision=top.revision))
+        shaped = self._shaped(write)
+        try:
+            started = _started(shaped.candidate_of(self._head))
+        except ValueError as exc:
+            raise OfflineRefused("import_refused", detail=str(exc)) from exc
+        planned = plan_on(
+            self._store,
+            self._head,
+            self._ratchet,
+            shaped.kind,
+            "offline",
+            shaped.candidate_of,
+            environ=self._environ,
+            started=started,
+            bindings=self._bindings(),
+            grants=Grants(revive=frozenset(write.revive), env=frozenset(write.env)),
+            evidence=shaped.evidence,
+        )
+        if isinstance(planned, WriteRefused):
+            raise OfflineRefused.of(planned)
+        refused = lowered(gateway_key_state(self._state, self._keys, self._previous), planned)
+        if refused is not None:
+            raise OfflineRefused.of(refused)
+        return planned, shaped
+
+    def _shaped(self, write: _Write) -> Shaped:
+        if write.action == "rollback":
+            assert write.target is not None  # noqa: S101 - the parser requires it
+            found = rollback_shaped(self._store, write.target)
+        else:
+            text, label = (
+                _configured(self._environ) if write.text is None else (write.text, "the import")
+            )
+            try:
+                given = gate.admit_text(text, label, environ=self._environ).policy
+            except GateRefused as exc:
+                raise OfflineRefused("import_refused", detail=str(exc)) from exc
+            found = import_shaped(
+                self._store.seed_digest,
+                self._head,
+                given,
+                from_env=write.from_env,
+                baseline_only=write.baseline_only,
+            )
+        if isinstance(found, Refusal):
+            raise OfflineRefused.of(found)
+        return found
+
+    def _bindings(self) -> Callable[[Policy], Mapping[str, Any]]:
+        """``PlanInput.bindings`` from the secret store in the state directory (D-10's preview,
+        the entries a write leaves unused, G.8); none when it can't be read."""
+        secrets = SecretStore(self._state, self._keys, self._previous)
+        try:
+            secrets.load()
+        except StoreError:
+            return lambda policy: {}
+        return bindings(secrets)
+
+    def _lockout(self, planned: WritePlan) -> list[Any]:
+        return list(lockout_rows(self._head, planned.policy, self._rp_ids()))
+
+    def _rp_ids(self) -> list[str] | None:
+        return _passkey_rp_ids(self._state, self._keys, self._previous)
+
+
+def _passkey_rp_ids(state: Path, keys: KeySet, previous: KeySet | None) -> list[str] | None:
+    """Every enrolled passkey's RP ID, read from the passkey file without writing it; None when
+    it can't be verified (I.1's rows then fail closed)."""
+    path = state / passkey_file.DIRECTORY / passkey_file.FILE
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(passkey_file.MAX_FILE_BYTES + 1)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    portal = None if previous is None else previous.portal_key
+    try:
+        document, _ = passkey_file.unseal(data, keys.portal_key, portal)
+    except passkey_file.PasskeyFileError:
+        return None
+    return [passkey.rp_id for passkey in document.credentials]
+
+
+def _or_refused(answer: dict[str, Any] | Refusal) -> dict[str, Any]:
+    if isinstance(answer, Refusal):
+        raise OfflineRefused.of(answer)
+    return answer
+
+
+def _configured(environ: Mapping[str, str]) -> tuple[str, str]:
+    """The policy the vault's service is configured with (``ZOEYMCP_CONFIG``, G-14)."""
+    try:
+        return read_source(None, environ)
+    except PolicyError as exc:
+        found = gate.refused_text(exc.source, exc.findings)
+        raise OfflineRefused("import_refused", detail=found) from exc
+
+
+def _started(candidate: Policy) -> restart.Started:
+    """What the vault, stopped, will start with: the candidate's own values (I.2), so nothing
+    in it waits for the vault's restart; the bridges are the launcher's, unknown here."""
+    admin = candidate.admin
+    bridges = frozenset(
+        route.upstream.removeprefix("unix:/run/zoeymcp-bridge-").split("/", 1)[0]
+        for route in candidate.routes
+        if route.upstream is not None and route.upstream.startswith("unix:/run/zoeymcp-bridge-")
+    )
+    return restart.Started(
+        candidate.egress_proxy,
+        candidate.egress_proxy_kind,
+        None if admin is None else admin.listen,
+        bridges,
+    )
+
+
+def _act(
+    action: str,
+    args: argparse.Namespace,
+    vault: _Vault,
+    environ: Mapping[str, str],
+    stdin: TextIO,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    if action == "head":
+        return _head(args, vault, out)
+    if action == "history":
+        return _history(args, vault, out)
+    if action == "diff":
+        return _diff(args, vault, out)
+    if action == "export":
+        return _export(args, vault, environ, out, err)
+    return _write(action, args, vault, environ, stdin, err)
+
+
+def _head(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
+    """The mode and the head (M.6's first row)."""
+    answer = vault.head()
+    if args.format == "json":
+        write_json(answer, out)
+        return EXIT_OK
+    if answer["mode"] != "managed" or answer.get("revision") is None:
+        out.write(
+            "Mode: declarative: the policy is the file or ZOEYMCP_CONFIG the vault was given.\n"
+        )
+        return EXIT_OK
+    out.write("Mode: managed\n")
+    out.write(f"Revision {answer['revision']}, {_who(answer)}, {_shown(answer['kind'])}\n")
+    out.write(f"Deployment {answer['deployment8']}, digest {answer['digest8']}\n")
+    gateway = answer["gateway"]
+    if gateway["state"] == "unknown":
+        out.write("Gateway: unknown (no status report yet)\n")
+    elif gateway["revision"] is None:
+        out.write(f"Gateway: {gateway['state']} (on a view this vault didn't install)\n")
+    else:
+        out.write(f"Gateway: {gateway['state']} (on revision {gateway['revision']})\n")
+    if answer["not_running"] is not None:
+        out.write(
+            f"Revision {answer['not_running']} is saved but not running: send SIGHUP to the vault "
+            "or restart it.\n"
+        )
+    return EXIT_OK
+
+
+def _when(created: int) -> str:
+    return datetime.fromtimestamp(created, UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _who(entry: Mapping[str, Any]) -> str:
+    """When and by whom, as the portal's policy view says it (A.4)."""
+    author = entry["author"]
+    if author["by"] == "passkey":
+        who = f"passkey {_shown(author['fingerprint'][:8])}"
+    elif author["by"] == "host":
+        who = f"the host ({_shown(author['via'])})"
+    else:
+        who = "the seed"
+    return f"saved {_when(entry['created'])} by {who}"
+
+
+def _history(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
+    """H.1: one line per revision, newest first; a revision in quarantine is a gap."""
+    page = vault.history(args.before, args.limit)
+    if args.format == "json":
+        write_json(page, out)
+        return EXIT_OK
+    for entry in page["revisions"]:
+        if entry.get("gap"):
+            out.write(f"{entry['revision']}  (in quarantine, or no longer readable)\n")
+            continue
+        line = f"{entry['revision']}  {_shown(entry['kind'])}  {_who(entry)}"
+        if entry["base"] is not None:
+            line += f"  base {entry['base']}"
+        if entry["target"] is not None:
+            line += f"  target {entry['target']}"
+        if entry["jumped_from"] is not None:
+            line += f"  jumped from {entry['jumped_from']}"
+        if entry["reason"] is not None:
+            line += f": {_shown(entry['reason'])}"
+        out.write(line + "\n")
+    if page["next"] is not None:
+        out.write(f"More: zoeymcp policy history --before {page['next']}\n")
+    return EXIT_OK
+
+
+def _value(value: Any) -> str:
+    if isinstance(value, str):
+        return _shown(value)
+    return _shown(json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(", ", ": ")))
+
+
+def _diff(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
+    """H.2's rows, hidden fields hidden, each with its direction."""
+    answer = vault.diff(args.revision, args.against)
+    if args.format == "json":
+        write_json(answer, out)
+        return EXIT_OK
+    against = answer["against"]
+    said = "an empty policy" if against is None else f"revision {against}"
+    out.write(f"Revision {answer['revision']} against {said}:\n")
+    for row in answer["rows"]:
+        path = ".".join(_shown(str(part)) for part in row["path_shown"])
+        if row["hidden"]:
+            change = _value(row["new"])
+        elif row["op"] == "added":
+            change = f"added {_value(row['new'])}"
+        elif row["op"] == "removed":
+            change = f"removed {_value(row['old'])}"
+        else:
+            change = f"{_value(row['old'])} -> {_value(row['new'])}"
+        out.write(f"  {path}: {change} ({row['direction']})\n")
+    if not answer["rows"]:
+        out.write("  no change\n")
+    return EXIT_OK
+
+
+def _export(
+    args: argparse.Namespace, vault: _Vault, environ: Mapping[str, str], out: TextIO, err: TextIO
+) -> int:
+    """H.6: the YAML alone on stdout, the notes on stderr; for a declarative compose export,
+    the way back in the host's own commands (J10)."""
+    answer = vault.export(args.revision, args.mode, args.target)
+    out.write(answer["export"])
+    for note in answer["notes"]:
+        err.write(f"{_shown(note)}\n")
+    if args.mode == "declarative" and args.target == "compose":
+        hosted = commands(environ, "/state", standard=False)
+        err.write(f"{COMPOSE_NEXT}\n  {hosted.run('check')}\n  {hosted.up()}\n")
+    return EXIT_OK
+
+
+def _write(
+    action: str,
+    args: argparse.Namespace,
+    vault: _Vault,
+    environ: Mapping[str, str],
+    stdin: TextIO,
+    err: TextIO,
+) -> int:
+    """An import or a rollback (H.3, H.5): the base, the plan on stderr, the confirmations,
+    then the write, which names the base and the plan's digest."""
+    head = vault.head()
+    if head["mode"] != "managed" or head.get("revision") is None:
+        raise OfflineRefused("policy_not_managed")
+    text = None
+    if action == "import" and not args.from_env:
+        text = _document(args.source, environ, stdin)
+    write = _Write(
+        "rollback" if action == "rollback" else "import",
+        target=getattr(args, "revision", None),
+        text=text,
+        from_env=action == "import" and args.from_env,
+        baseline_only=action == "import" and args.baseline_only,
+        revive=tuple(args.allow_revive),
+        env=tuple(args.allow_env),
+        reason=args.reason,
+        revoke_removed=args.revoke_removed,
+    )
+    base, said = _base(args, head, text)
+    answer = vault.plan(write, base)
+    if answer.get("already_saved"):
+        # The same write made the head, and its answer was lost (MISS-9, FM-16).
+        err.write(f"This was already written as revision {answer['revision']}.\n")
+        return EXIT_OK
+    err.write(f"Planned on revision {base} ({said}):\n")
+    err.write(_rows([(str(label), str(value)) for label, value in answer["rows"]]))
+    for row in answer["lockout"]:
+        err.write(f"  Lockout: this {_shown(row['text'])}\n")
+    if answer["unused"] and not write.revoke_removed:
+        err.write(
+            "Each store entry it leaves unused can't be revoked at its provider after it: run "
+            "these first, or add --revoke-removed:\n"
+        )
+        for name in answer["unused"]:
+            err.write(f"  zoeymcp secret delete {_shown(name)}\n")
+    piped = write.text is not None and args.source == "-"
+    confirmed = _confirm_write(args, answer, piped, stdin, err)
+    if confirmed is None:
+        return EXIT_REFUSED
+    accept, lockout = confirmed
+    done = vault.commit(write, base, answer["digest"], accept=accept, lockout=lockout)
+    revision = done["revision"]
+    if done["already_saved"]:
+        err.write(f"This was already written as revision {revision}.\n")
+    else:
+        err.write(f"{_written(answer['kind'])} revision {revision}.\n")
+    for entry in done["removed"]:
+        if entry["revoked"]:
+            err.write(f"Deleted {_shown(entry['name'])}, and asked its provider to revoke it.\n")
+        else:
+            err.write(f"Deleted {_shown(entry['name'])}.\n")
+    lines = next_lines(done["next"], Prefix.from_environ(environ))
+    if vault.via == "offline":
+        hosted = commands(environ, args.state, standard=False)
+        lines = [*lines, "Start the vault:", f"  {hosted.up()}"]
+    err.write("".join(f"{line}\n" for line in lines))
+    return EXIT_OK
+
+
+def _written(kind: str) -> str:
+    if kind == "policy.rollback":
+        return "Rolled back as"
+    if kind == "policy.acknowledge":
+        return "Recorded the configured policy as the seed's baseline in"
+    return "Imported as"
+
+
+def _document(source: str, environ: Mapping[str, str], stdin: TextIO) -> str:
+    """The document an import names (FILE, or - for standard input)."""
+    try:
+        text, _ = read_source(source, environ, stdin)
+    except PolicyError as exc:
+        found = gate.refused_text(exc.source, exc.findings)
+        raise OfflineRefused("import_refused", unreadable=True, detail=found) from exc
+    return text
+
+
+def _base(args: argparse.Namespace, head: Mapping[str, Any], text: str | None) -> tuple[int, str]:
+    """The revision a write is planned on (H.5, OPS-8), and how it was found: ``--base``; for an
+    import of a document, its export header's, of this deployment; else the head's."""
+    if getattr(args, "base", None) is not None:
+        return int(args.base), "--base"
+    if text is None:
+        return int(head["revision"]), "the head"
+    found = export_header(text)
+    if found is None:
+        raise OfflineRefused("base_required")
+    if found.deployment != head["deployment8"]:
+        raise OfflineRefused("export_other_deployment", detail=found.deployment)
+    return found.revision, "from the export's header"
+
+
+def _confirm_write(
+    args: argparse.Namespace,
+    answer: Mapping[str, Any],
+    piped: bool,
+    stdin: TextIO,
+    err: TextIO,
+    *,
+    question: str | None = None,
+) -> tuple[bool, bool] | None:
+    """The confirmations a write needs (H.5, I.1): with ``--yes``, ``--accept-widening`` for a
+    plan that widens and ``--lockout-ok`` for a lockout row; else ``[y/N]``, then each lockout
+    row typed. Returns what to send (``accept_widening``, ``lockout_ok``), or None when not
+    confirmed (nothing written)."""
+    lockout = answer["lockout"]
+    if args.yes:
+        if answer["widens"] and not args.accept_widening:
+            raise OfflineRefused("import_widens", detail=_widened(answer))
+        if lockout and not args.lockout_ok:
+            detail = "; ".join(row["text"] for row in lockout)
+            raise OfflineRefused("lockout_unconfirmed", detail=detail)
+        return True, bool(lockout)
+    asked = question or f"Write revision {answer['revision']}?"
+    if not _confirmed(False, piped, stdin, err, asked):
+        return None
+    for row in lockout:
+        what = "the address" if row["text"].startswith("moves") else "the origin"
+        err.write(f"This {_shown(row['text'])}. Type {what} to continue: ")
+        err.flush()
+        if stdin.readline().strip() != row["confirm"]:
+            err.write("Nothing written.\n")
+            return None
+    return True, bool(lockout)
+
+
+def _widened(answer: Mapping[str, Any]) -> str:
+    """The widening rows' paths, as the refusal names them."""
+    return ", ".join(str(path) for path in answer["widenings"])

@@ -14,6 +14,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+from collections.abc import Mapping, Sequence
 from typing import Any, Final, TextIO
 from urllib.parse import quote
 
@@ -38,6 +39,9 @@ SECRET_TIMEOUT: Final = REFRESH_BUDGET + 15
 # A discovery waits for its fetches (the vault's DISCOVERY_DEADLINE, 30 s) and for the endpoint
 # check's lookups (RESOLVE_TIMEOUT, 5 s for each of three endpoints), plus time to answer.
 ONBOARD_TIMEOUT: Final = 30 + 3 * 5 + 15
+# A host write does its file writes, with their fsyncs, and the install (M6 design G.6), then
+# deletes the entries --revoke-removed names, each waiting for a refresh in flight.
+POLICY_TIMEOUT: Final = REFRESH_BUDGET + 30
 
 
 class AdminUnavailable(Exception):
@@ -99,6 +103,9 @@ def _request(
     timeout: float = DEFAULT_TIMEOUT,
     *,
     role: str = "vault",
+    content: bytes | None = None,
+    headers: Mapping[str, str] | None = None,
+    params: Sequence[tuple[str, str | int | float | bool | None]] | None = None,
 ) -> dict[str, Any]:
     if transport is None:
         become_socket_owner(socket)
@@ -107,7 +114,13 @@ def _request(
         with httpx.Client(
             transport=transport, base_url=f"http://{role}-admin", timeout=timeout
         ) as client:
-            response = client.request(method, path, json=body)
+            if content is not None or headers is not None or params is not None:
+                query = None if params is None else list(params)
+                response = client.request(
+                    method, path, content=content, headers=headers, params=query
+                )
+            else:
+                response = client.request(method, path, json=body)
     except (httpx.HTTPError, OSError, RuntimeError) as exc:
         # RuntimeError: httpx on Windows, where Unix sockets aren't supported.
         raise AdminUnavailable(f"can't reach the {role}'s admin socket at {socket}: {exc}") from exc
@@ -431,3 +444,84 @@ def describe_binding(binding: dict[str, Any]) -> str:
         named = "no issuer" if issuer is None else f"issuer {issuer}"
         return f"{named}, iss {'required' if binding['require_iss'] else 'not required'}"
     return json.dumps(binding)
+
+
+# --- the managed policy (M6 design H, M.6, N.1) -------------------------------------------------
+
+
+def policy_head(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    """The mode and, in managed mode, the head: ``{mode, revision, ...}``."""
+    return _request(socket, "GET", "/policy", transport=transport)
+
+
+def policy_history(
+    socket: str,
+    *,
+    before: int | None = None,
+    limit: int | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """A page of history, newest first: ``{revisions, next}``."""
+    params = [(k, str(v)) for k, v in (("before", before), ("limit", limit)) if v is not None]
+    return _request(socket, "GET", "/policy/revisions", transport=transport, params=params)
+
+
+def policy_diff(
+    socket: str,
+    revision: int,
+    *,
+    against: int | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """Revision ``revision``'s diff from ``against`` (its parent by default): ``{revision,
+    against, rows}``, hidden fields hidden."""
+    params = [] if against is None else [("against", str(against))]
+    path = f"/policy/revisions/{revision}/diff"
+    return _request(socket, "GET", path, transport=transport, params=params)
+
+
+def policy_export(
+    socket: str,
+    *,
+    revision: int | None = None,
+    mode: str = "managed",
+    target: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """The export (R61's fourth scoped exception): ``{revision, deployment, export, notes}``."""
+    params = [("mode", mode)]
+    if revision is not None:
+        params.append(("revision", str(revision)))
+    if target is not None:
+        params.append(("for", target))
+    return _request(socket, "GET", "/policy/export", transport=transport, params=params)
+
+
+def policy_write(
+    socket: str,
+    path: str,
+    query: Sequence[tuple[str, str]],
+    *,
+    body: bytes = b"",
+    base: int | None = None,
+    plan_digest: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """``POST /policy/import`` or ``/policy/rollback/{n}``: with ``plan=1`` in ``query`` the
+    plan, else the commit, which names ``base`` in ``If-Match`` and the plan's digest. A body
+    goes as YAML."""
+    headers = {"content-type": "application/yaml"} if body else {}
+    if base is not None:
+        headers["if-match"] = f'"{base}"'
+    if plan_digest is not None:
+        headers["x-zoeymcp-plan"] = plan_digest
+    return _request(
+        socket,
+        "POST",
+        path,
+        transport=transport,
+        timeout=POLICY_TIMEOUT,
+        content=body,
+        headers=headers,
+        params=list(query),
+    )
