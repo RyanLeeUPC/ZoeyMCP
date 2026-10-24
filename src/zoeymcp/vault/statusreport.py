@@ -9,8 +9,9 @@ read it, labelled as the gateway's, and nothing in it drives a decision (Y21).
 :func:`read` takes one parsed report under the running limits. The report's frame is strict:
 ``{"v": 1, "view", "started", "servers", "witness", "deployments_seen", "policy_mode"}``, each
 of the right type, or the whole report is refused ``invalid`` (:class:`StatusRefused`). A witness
-revision above :data:`REVISION_MAX` refuses it whole too, ``witness_range`` (T-4), so no number
-the gateway claims can reach the vault's own revision counter.
+revision above :data:`REVISION_MAX`, the store's own bound (``policyseal``, D.2), refuses it
+whole too, ``witness_range`` (T-4), so no number the gateway claims can reach the vault's own
+revision counter.
 
 A server is judged on its own (T-7): one whose name isn't a policy name is counted, not named
 (``unnamed_servers``); one whose entry isn't a server's (another key, such as a definition, a wrong
@@ -40,11 +41,10 @@ from typing import Any, Final, Literal
 from ..common.policy.attention import Attention, loaded
 from ..common.policy.schema import NAME_PATTERN
 from ..common.reviewreport import NAMES_MAX
+from .policyseal import REVISION_MAX as REVISION_MAX
 
 Reason = Literal["invalid", "witness_range"]
 
-# The highest revision number a witness may claim (the ten-digit file names; D.2, T-4).
-REVISION_MAX: Final = 9_999_999_999
 # How many deployments the gateway's witness keeps (K.3).
 WITNESS_DEPLOYMENTS_MAX: Final = 8
 # A count the report carries (deployments seen) is at most this.

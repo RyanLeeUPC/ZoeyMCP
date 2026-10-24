@@ -1,5 +1,5 @@
-"""Contracts 57 to 61 (M6 design O.2): what M6's code relies on in the MCP SDK. Each lands in the
-step before the code that leans on it.
+"""Contracts 57 to 61 (M6 design O.2): what M6's code relies on in the MCP SDK, and in
+``cryptography`` for 61. Each lands in the step before the code that leans on it.
 
 Contract 59 (step 3a): the SDK's ``ListenHandler`` acknowledges every kind a listen asks for,
 whether or not the server will ever send it, and then delivers only the kinds it acknowledged.
@@ -9,7 +9,12 @@ gateway never sends; design K.4's filter narrows the params first (step 3b). The
 shaped as the gateway's client-facing side is (``test_server_contract.Shaped``), and the stream
 is read raw, since the SDK client also drops on its own side whatever wasn't acknowledged.
 
-They join D-95's re-run list: run again on every SDK bump.
+Contract 61 (step 11a): ``cryptography``'s ``AESGCM``, which encrypts the managed policy's
+revision bodies (``vault/policyseal.py``, design D.2), refuses a ciphertext whose associated data or
+nonce changed, so a body moved under another header doesn't decrypt. It takes any nonce from 8 to
+128 bytes, not only the 12 D.2 names, so ``keys.PolicyKey`` checks the length itself.
+
+They join D-95's re-run list: run again on every SDK bump, and 61 on every ``cryptography`` bump.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ from typing import Any
 import anyio
 import httpx
 import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp.server.subscriptions import (
     SUBSCRIPTION_ID_META_KEY,
     PromptsListChanged,
@@ -145,3 +152,42 @@ async def test_59_listen_handler_delivers_only_the_kinds_it_acknowledged() -> No
     assert delivered[0]["params"]["uri"] == NOTES
     assert all(frame["params"]["_meta"] == {SUBSCRIPTION_ID_META_KEY: 7} for frame in delivered)
     assert quiet.cancelled_caught
+
+
+# --- 61. AES-GCM, as the policy store's revision bodies use it ------------------------------------
+
+KEY = bytes(range(32))
+NONCE = bytes(range(12))
+ASSOCIATED = b"zoeymcp/policy-body/v1\nsha256:" + b"0" * 64
+
+
+def test_61_aesgcm_refuses_a_changed_associated_data_or_nonce() -> None:
+    """The associated data binds a revision's body to its header (D.2): a body moved under another
+    header, or decrypted with another nonce, fails as a whole, with no plaintext."""
+    sealed = AESGCM(KEY).encrypt(NONCE, b"body", ASSOCIATED)
+    assert len(sealed) == len(b"body") + 16
+    assert AESGCM(KEY).decrypt(NONCE, sealed, ASSOCIATED) == b"body"
+    for nonce, associated in (
+        (NONCE, ASSOCIATED[:-1] + b"1"),
+        (NONCE, b""),
+        (NONCE, None),
+        (bytes(range(1, 13)), ASSOCIATED),
+    ):
+        with pytest.raises(InvalidTag):
+            AESGCM(KEY).decrypt(nonce, sealed, associated)
+    with pytest.raises(InvalidTag):
+        AESGCM(bytes(range(1, 33))).decrypt(NONCE, sealed, ASSOCIATED)
+    with pytest.raises(InvalidTag):
+        AESGCM(KEY).decrypt(NONCE, sealed[:-1] + bytes([sealed[-1] ^ 1]), ASSOCIATED)
+
+
+def test_61_aesgcm_takes_nonces_of_8_to_128_bytes_so_the_policy_key_checks_for_12() -> None:
+    """D.2 names a 12-byte nonce, but ``AESGCM`` doesn't require one: any length from 8 to 128
+    bytes is accepted. ``keys.PolicyKey`` refuses every length but 12 itself."""
+    for size in (8, 12, 13, 16, 128):
+        assert AESGCM(KEY).encrypt(bytes(size), b"body", None)
+    for size in (0, 7, 129):
+        with pytest.raises(ValueError, match=r"^Nonce must be between 8 and 128 bytes$"):
+            AESGCM(KEY).encrypt(bytes(size), b"body", None)
+    with pytest.raises(ValueError, match=r"^AESGCM key must be 128, 192, or 256 bits.$"):
+        AESGCM(KEY[:31])

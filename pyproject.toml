@@ -133,6 +133,7 @@ only_mutate = [
     "*zoeymcp/vault/onboarding.py",
     "*zoeymcp/vault/internal.py",
     "*zoeymcp/vault/statusreport.py",
+    "*zoeymcp/vault/policyseal.py",
     "*zoeymcp/vault/reviewjobs.py",
     "*zoeymcp/vault/gatewaykeys.py",
     "*zoeymcp/vault/peer.py",
@@ -264,6 +265,8 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.common.policy.attention" = 95
 "zoeymcp.vault.statusreport" = 95
 "zoeymcp.common.policy.reviewchange" = 95
+"zoeymcp.common.policy.gate" = 95
+"zoeymcp.common.policy.restart" = 95
 "zoeymcp.vault.request" = 95
 "zoeymcp.vault.store" = 95
 "zoeymcp.vault.oauth.pkce" = 95

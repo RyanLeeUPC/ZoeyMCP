@@ -6,6 +6,8 @@ import hmac
 import io
 
 import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from zoeymcp.common import logs
 from zoeymcp.egress.allowlist import KEY_PATTERN, EgressKey
@@ -15,10 +17,14 @@ from zoeymcp.vault.keys import (
     CONTEXT_EGRESS,
     CONTEXT_GATEWAY,
     CONTEXT_KEY_ID,
+    CONTEXT_POLICY,
     CONTEXT_PORTAL,
     CONTEXT_STORE,
+    POLICY_NONCE_BYTES,
+    ConfigMac,
     KeySet,
     MasterKeyError,
+    PolicyKey,
     PortalKey,
     derive,
     generate_master_key,
@@ -64,10 +70,11 @@ def test_contexts_give_independent_keys() -> None:
         keys.gateway_key(2).encode(),
         derive(MASTER, CONTEXT_AUDIT),
         derive(MASTER, CONTEXT_PORTAL),
+        derive(MASTER, CONTEXT_POLICY),
         keys.egress_key(1).encode(),
         keys.egress_key(2).encode(),
     }
-    assert len(derived) == 9
+    assert len(derived) == 10
     assert MASTER not in derived
     assert keys.store_key == derive(MASTER, CONTEXT_STORE)
     assert keys.config_key == derive(MASTER, CONTEXT_CONFIG)
@@ -157,3 +164,75 @@ def test_the_egress_key_is_what_the_role_takes() -> None:
     assert KeySet.from_master(bytes(32)).egress_key(1) != keys.egress_key(1)
     with pytest.raises(ValueError, match="start at 1"):
         keys.egress_key(0)
+
+
+# --- the managed policy's keys (M6 design D.2, D.3) ----------------------------------------------
+
+NONCE = bytes(range(12))
+
+
+def test_the_policy_key_is_its_own_and_pinned() -> None:
+    assert CONTEXT_POLICY == "zoeymcp/policy/v1"
+    assert POLICY_NONCE_BYTES == 12
+    keys = KeySet.from_master(MASTER)
+    policy = keys.policy_key
+    assert isinstance(policy, PolicyKey)
+    assert policy.key_id == keys.key_id
+    assert derive(MASTER, CONTEXT_POLICY).hex() == (
+        "b3c1355c83e95091bb870d0fe31143353799ad0183a4a7c1a39c2aac1e8e73f9"
+    )
+    sealed = policy.encrypt(NONCE, b"body", b"bound")
+    assert sealed == AESGCM(derive(MASTER, CONTEXT_POLICY)).encrypt(NONCE, b"body", b"bound")
+    assert policy.decrypt(NONCE, sealed, b"bound") == b"body"
+    other = KeySet.from_master(bytes(32)).policy_key
+    assert other.key_id != policy.key_id
+    for key, nonce, associated in ((policy, NONCE, b"other"), (policy, bytes(12), b"bound")):
+        with pytest.raises(InvalidTag):
+            key.decrypt(nonce, sealed, associated)
+    with pytest.raises(InvalidTag):
+        other.decrypt(NONCE, sealed, b"bound")
+
+
+def test_the_policy_key_takes_only_twelve_byte_nonces() -> None:
+    """``AESGCM`` takes 8 to 128 bytes (contract 61); the policy key holds to D.2's 12."""
+    policy = KeySet.from_master(MASTER).policy_key
+    sealed = policy.encrypt(NONCE, b"body", b"")
+    for size in (8, 11, 13, 16):
+        with pytest.raises(ValueError, match=rf"^a policy nonce is 12 bytes, not {size}$"):
+            policy.encrypt(bytes(size), b"body", b"")
+        with pytest.raises(ValueError, match=rf"^a policy nonce is 12 bytes, not {size}$"):
+            policy.decrypt(bytes(size), sealed, b"")
+
+
+def test_the_config_mac_is_k_config_under_a_context_line() -> None:
+    keys = KeySet.from_master(MASTER)
+    config = keys.config_mac
+    assert isinstance(config, ConfigMac)
+    assert config.key_id == keys.key_id
+    context = b"zoeymcp/policy-head/v1\n"
+    expected = hmac.new(keys.config_key, context + b"data", hashlib.sha256).digest()
+    assert config.mac(context, b"data") == expected
+    assert config.mac(b"\n", b"data") == hmac.new(keys.config_key, b"\ndata", "sha256").digest()
+    assert KeySet.from_master(bytes(32)).config_mac.mac(context, b"data") != expected
+    for bad in (b"", b"zoeymcp/policy-head/v1", b"two\nlines\n", b"\n\n"):
+        with pytest.raises(ValueError, match=r"^a MAC context is one line, ending in a newline$"):
+            config.mac(bad, b"data")
+
+
+@pytest.mark.parametrize("name", ["policy_key", "config_mac"])
+def test_the_policy_keys_never_show(name: str) -> None:
+    key = getattr(KeySet.from_master(MASTER), name)
+    kind = type(key).__name__
+    assert repr(key) == f"{kind}(key_id={key.key_id}, <hidden>)"
+    for material in (derive(MASTER, CONTEXT_POLICY), derive(MASTER, CONTEXT_CONFIG)):
+        assert material.hex() not in repr(key)
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        for value in (key, [key], {"k": (key,)}):
+            with pytest.raises(TypeError, match=rf"refusing to log a secret \({kind}\)"):
+                logs.Log("vault").event("probe", key=value)
+    finally:
+        logs.set_stream(None)
+    assert buffer.getvalue() == ""
+    assert {PolicyKey, ConfigMac} <= set(logs.refused_types())

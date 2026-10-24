@@ -26,6 +26,7 @@ from zoeymcp.common.policy.view import build_view, dump_view, parse_view
 from zoeymcp.gateway import pins
 from zoeymcp.gateway.pins import PIN_TAG, project, project_and_pin
 from zoeymcp.portal.passkeys import Passkey, PasskeyFile, fingerprint, seal, unseal
+from zoeymcp.vault import policyseal
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.oauth.protocol import encode_envelope, parse_envelope
 from zoeymcp.vault.reportstore import ReportStore
@@ -470,3 +471,90 @@ def test_the_pinned_reported_head_still_loads(tmp_path: Path) -> None:
     assert head.read_bytes() == GOLDEN_REPORTED_HEAD.read_bytes()  # nothing rebuilt
     assert (again.state, again.held, again.refused) == (store.state, store.held, store.refused)
     assert again.archives() == store.archives()
+
+
+# --- the managed policy's revision, head and anchor (M6 design D.2) -----------------------------
+# Written by the seal code under MASTER with a fixed salt and nonce. If these fail, the revision's
+# format, its digest, the body's encryption or associated data, a MAC context or K_policy changed,
+# and every managed deployment's start would refuse its own store.
+
+GOLDEN_POLICY_REVISION = Path(__file__).parent / "data" / "golden-policy-revision.json"
+GOLDEN_POLICY_HEAD = Path(__file__).parent / "data" / "golden-policy-head.json"
+GOLDEN_POLICY_ANCHOR = Path(__file__).parent / "data" / "golden-policy-anchor.json"
+POLICY_DEPLOYMENT = bytes(range(16)).hex()
+# The seal reads the ratchet as an object; its form is common.policy.ratchet's.
+POLICY_RATCHET = {"egress_key_floor": 1, "gateway_key_floor": 1}
+POLICY_HEADER: dict[str, Any] = {
+    "v": 1,
+    "deployment": POLICY_DEPLOYMENT,
+    "revision": 2,
+    "parent": "sha256:" + "1" * 64,
+    "created": 1_792_900_000,
+    "origin": "save",
+    "kind": "tool.repin",
+    "author": {"by": "passkey", "fingerprint": "06b228ec0ef3c431"},
+    "base": 1,
+    "target": None,
+    "jumped_from": None,
+}
+POLICY_DIGEST = "sha256:334143ac7652d5cb6cead4a45de8293777f46cd1f568fe25d2fb18979d087817"
+POLICY_BODY_DIGEST = "sha256:60b6661887969ada0f3154bc04db9ae4a242a5e8511c7ca54eb4e4d79727c5f3"
+
+
+def golden_policy_body() -> bytes:
+    return policyseal.make_body(
+        salt=bytes(range(32)),
+        policy=VIEW_POLICY,
+        ratchet=POLICY_RATCHET,
+        seed_digest="sha256:" + "5" * 64,
+        reason="golden revision",
+    )
+
+
+def golden_policy_revision() -> bytes:
+    body = golden_policy_body()
+    header = {**POLICY_HEADER, "body_digest": policyseal.body_digest(body)}
+    keys = KeySet.from_master(MASTER)
+    return policyseal.seal_revision(header, body, keys=keys, nonce=bytes(range(12)))
+
+
+def golden_policy_head() -> bytes:
+    keys = KeySet.from_master(MASTER)
+    head = policyseal.Head(POLICY_DEPLOYMENT, 2, POLICY_DIGEST, 1, None, keys.key_id)
+    return policyseal.seal_head(head, keys)
+
+
+def golden_policy_anchor() -> bytes:
+    keys = KeySet.from_master(MASTER)
+    anchor = policyseal.Anchor(POLICY_DEPLOYMENT, 2, None, None, keys.key_id)
+    return policyseal.seal_anchor(anchor, keys)
+
+
+def test_the_policy_revision_format_is_pinned() -> None:
+    assert golden_policy_revision() == GOLDEN_POLICY_REVISION.read_bytes()
+    assert policyseal.body_digest(golden_policy_body()) == POLICY_BODY_DIGEST
+    header = {**POLICY_HEADER, "body_digest": POLICY_BODY_DIGEST}
+    assert policyseal.revision_digest(header) == POLICY_DIGEST
+
+
+def test_the_golden_policy_revision_still_unseals() -> None:
+    keys = KeySet.from_master(MASTER)
+    found = policyseal.unseal_revision(
+        GOLDEN_POLICY_REVISION.read_bytes(), keys, None, deployment=POLICY_DEPLOYMENT
+    )
+    assert found.digest == POLICY_DIGEST
+    assert found.header == {**POLICY_HEADER, "body_digest": POLICY_BODY_DIGEST}
+    assert found.body.policy == VIEW_POLICY
+    assert found.body.ratchet == POLICY_RATCHET
+    assert (found.body.salt, found.body.reason) == (bytes(range(32)), "golden revision")
+    assert found.key_id == keys.key_id
+
+
+def test_the_policy_head_and_anchor_formats_are_pinned() -> None:
+    keys = KeySet.from_master(MASTER)
+    assert golden_policy_head() == GOLDEN_POLICY_HEAD.read_bytes()
+    assert golden_policy_anchor() == GOLDEN_POLICY_ANCHOR.read_bytes()
+    head = policyseal.unseal_head(GOLDEN_POLICY_HEAD.read_bytes(), keys, None)
+    assert (head.revision, head.digest, head.oldest) == (2, POLICY_DIGEST, 1)
+    anchor = policyseal.unseal_anchor(GOLDEN_POLICY_ANCHOR.read_bytes(), keys, None)
+    assert (anchor.highest, anchor.parked, anchor.retired_key_id) == (2, None, None)

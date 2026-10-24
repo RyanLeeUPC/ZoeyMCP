@@ -15,6 +15,7 @@ import os
 from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ..common.logs import refuse_type
@@ -36,6 +37,10 @@ CONTEXT_EGRESS = "zoeymcp/egress/v1/gen-{generation}"
 CONTEXT_AUDIT = "zoeymcp/audit/v1"
 # The portal's state files are MAC'd with this, and passkey fingerprints keyed (M5 design D.4, E.2).
 CONTEXT_PORTAL = "zoeymcp/portal/v1"
+# The managed policy's revisions are encrypted with this (M6 design D.2, D.3).
+CONTEXT_POLICY = "zoeymcp/policy/v1"
+# AES-GCM's nonce for a policy revision. ``AESGCM`` itself takes 8 to 128 bytes (contract 61).
+POLICY_NONCE_BYTES = 12
 
 
 class MasterKeyError(ValueError):
@@ -115,9 +120,75 @@ class PortalKey:
 refuse_type(PortalKey)
 
 
+class PolicyKey:
+    """``K_policy``: the AES-256-GCM key of the managed policy's revision bodies (M6 design D.2),
+    with the ID of the master key it comes from. Its ``repr`` hides the key, and logging it
+    raises."""
+
+    __slots__ = ("_key", "key_id")
+
+    def __init__(self, key: bytes, key_id: str) -> None:
+        self._key = key
+        self.key_id = key_id
+
+    def encrypt(self, nonce: bytes, plaintext: bytes, associated: bytes) -> bytes:
+        """The ciphertext and its tag. ``nonce`` is 12 fresh random bytes, never reused."""
+        return AESGCM(self._key).encrypt(_policy_nonce(nonce), plaintext, associated)
+
+    def decrypt(self, nonce: bytes, ciphertext: bytes, associated: bytes) -> bytes:
+        """The plaintext. Raises ``cryptography.exceptions.InvalidTag`` for a ciphertext, nonce or
+        associated data that isn't what :meth:`encrypt` was given."""
+        return AESGCM(self._key).decrypt(_policy_nonce(nonce), ciphertext, associated)
+
+    def __repr__(self) -> str:
+        return f"PolicyKey(key_id={self.key_id}, <hidden>)"
+
+
+def _policy_nonce(nonce: bytes) -> bytes:
+    if len(nonce) != POLICY_NONCE_BYTES:
+        raise ValueError(f"a policy nonce is {POLICY_NONCE_BYTES} bytes, not {len(nonce)}")
+    return nonce
+
+
+refuse_type(PolicyKey)
+
+
+class ConfigMac:
+    """``K_config`` as a MAC, with the ID of the master key it comes from. Each use names its own
+    context line, which goes first (M6 design D.3). Its ``repr`` hides the key, and logging it
+    raises."""
+
+    __slots__ = ("_key", "key_id")
+
+    def __init__(self, key: bytes, key_id: str) -> None:
+        self._key = key
+        self.key_id = key_id
+
+    def mac(self, context: bytes, data: bytes) -> bytes:
+        """HMAC-SHA256 of ``context`` and then ``data``. ``context`` is one line, ending in a
+        newline, so no use's message can be read as another's."""
+        if not context.endswith(b"\n") or b"\n" in context[:-1]:
+            raise ValueError("a MAC context is one line, ending in a newline")
+        return hmac.new(self._key, context + data, hashlib.sha256).digest()
+
+    def __repr__(self) -> str:
+        return f"ConfigMac(key_id={self.key_id}, <hidden>)"
+
+
+refuse_type(ConfigMac)
+
+
 @dataclass(frozen=True)
 class KeySet:
-    """The keys derived from one master key. ``repr`` never shows key material."""
+    """The keys derived from one master key. ``repr`` never shows key material.
+
+    ``K_config`` (``config_key``, :attr:`config_mac`) authenticates four kinds of file, each under
+    its own context line: the gateway-key state (``zoeymcp/gateway-key-state/v1``,
+    ``gatewaykeys``, which reads the raw bytes) and the managed policy's revisions, head and
+    anchor (``zoeymcp/policy-revision/v1``, ``zoeymcp/policy-head/v1`` and
+    ``zoeymcp/policy-anchor/v1``, ``policyseal``). ``K_policy`` (:attr:`policy_key`) encrypts the
+    revisions' bodies.
+    """
 
     store_key: bytes = field(repr=False)
     config_key: bytes = field(repr=False)
@@ -148,6 +219,16 @@ class KeySet:
     def portal_key(self) -> PortalKey:
         """The key the portal's passkey file and setup code record are MAC'd under."""
         return PortalKey(derive(self._master, CONTEXT_PORTAL), self.key_id)
+
+    @property
+    def policy_key(self) -> PolicyKey:
+        """The key the managed policy's revision bodies are encrypted under (M6 design D.2)."""
+        return PolicyKey(derive(self._master, CONTEXT_POLICY), self.key_id)
+
+    @property
+    def config_mac(self) -> ConfigMac:
+        """``config_key`` as a MAC for the managed policy's files (M6 design D.2, D.3)."""
+        return ConfigMac(self.config_key, self.key_id)
 
     def gateway_key(self, generation: int) -> str:
         """The gateway's credential for one key generation (hardened tier)."""

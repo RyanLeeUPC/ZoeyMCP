@@ -53,6 +53,13 @@ Under the standard launcher (M7 design C.10, TI-B7, step 18d), a bridge's ``ENV_
 reaches that bridge's environment and the vault's, never the gateway's, another bridge's, a
 command line or a log line; and ``launcher_bridge_refused`` holds no value from ARGS, a token
 hash or an ``ENV_*`` variable, whatever shape refused it.
+
+A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
+token, a placeholder, a token header, a forced query value, a connector username and a recipient,
+holds none of them in its file, its head or its anchor, and its salted ``body_digest`` differs
+from another seal of the same policy; the unsealed revision and its body refuse to be logged. The
+store's I/O, and the saves, rollbacks, imports and exports that write and read it, join the
+sweep in the steps that build them.
 """
 
 from __future__ import annotations
@@ -92,6 +99,7 @@ from zoeymcp.bridge.server import Bridge, Settings
 from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import main
 from zoeymcp.common import ledgerreport, pinhash
+from zoeymcp.common.canonical import digest as canonical_digest
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
@@ -104,7 +112,7 @@ from zoeymcp.portal.app import Ledger, PortalApp, Secrets, load_static
 from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
-from zoeymcp.vault import logs, reviewjobs
+from zoeymcp.vault import logs, policyseal, reviewjobs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import EGRESS_HEADER, VaultApp
 from zoeymcp.vault.oauth.login import LoginService
@@ -2000,3 +2008,71 @@ def test_no_args_value_reaches_a_refused_bridges_line(log_lines: io.StringIO) ->
     text = log_lines.getvalue()
     assert text.count('"event":"launcher_bridge_refused"') == 4
     assert sentinel not in text
+
+
+# --- the managed policy's sealed files (M6 design D.4, O.6, Y3, step 11a) ----------------------
+
+SEALED_SENTINELS = {
+    "token": "leak-policy-token-sentinel-0001",
+    "placeholder": "leak-policy-placeholder-sentinel-01",
+    "token_header": "leak-policy-token-header-sentinel-1",
+    "query": "leak-policy-query-sentinel-0001",
+    "username": "leak-policy-username-sentinel-01",
+    "recipient": "leak-policy-recipient-sentinel@mail.example",
+}
+
+
+def test_a_sealed_revision_holds_no_policy_value_in_clear(log_lines: io.StringIO) -> None:
+    """A revision's body is encrypted (Q6 (b)): its file, the head and the anchor show no value of
+    the policy, the salted ``body_digest`` confirms no guessed policy (E-10), and neither the
+    unsealed revision nor its body can be logged."""
+    found = SEALED_SENTINELS
+    policy = {
+        "gateway": {"clients": {"agent1": {"token": found["token"]}}},
+        "routes": [
+            {
+                "name": "notes",
+                "placeholder": found["placeholder"],
+                "token_headers": [found["token_header"]],
+                "query": {"force": {"key": found["query"]}},
+            }
+        ],
+        "connectors": {"mail": {"username": found["username"], "recipients": [found["recipient"]]}},
+    }
+    seed = canonical_digest(policy)
+    plaintext = policyseal.make_body(
+        salt=os.urandom(32), policy=policy, ratchet={}, seed_digest=seed, reason=None
+    )
+    again = policyseal.make_body(
+        salt=os.urandom(32), policy=policy, ratchet={}, seed_digest=seed, reason=None
+    )
+    header = {
+        "v": 1,
+        "deployment": "ab" * 16,
+        "revision": 1,
+        "parent": None,
+        "created": 1_792_900_000,
+        "origin": "seed",
+        "kind": "policy.seed",
+        "author": {"by": "seed"},
+        "base": None,
+        "target": None,
+        "jumped_from": None,
+        "body_digest": policyseal.body_digest(plaintext),
+    }
+    data = policyseal.seal_revision(header, plaintext, keys=KEYS, nonce=os.urandom(12))
+    name = policyseal.revision_digest(header)
+    head = policyseal.seal_head(policyseal.Head("ab" * 16, 1, name, 1, None, KEYS.key_id), KEYS)
+    anchor = policyseal.seal_anchor(policyseal.Anchor("ab" * 16, 1, None, None, KEYS.key_id), KEYS)
+    unsealed = policyseal.unseal_revision(data, KEYS, None, deployment=None)
+    assert unsealed.body.policy == policy
+    shown = (data, head, anchor, repr(unsealed).encode(), repr(unsealed.body).encode())
+    for value in found.values():
+        assert not any(value.encode() in text for text in shown), value
+    assert policyseal.body_digest(again) != header["body_digest"]
+    # The seed digest hashes the policy alone: it is in the body, never in clear or in a repr.
+    assert not any(seed.encode() in text for text in shown)
+    for secret in (unsealed, unsealed.body):
+        with pytest.raises(TypeError, match=r"refusing to log a secret"):
+            logs.event("oops", f=secret)
+    assert log_lines.getvalue() == ""
