@@ -70,7 +70,8 @@ or its hash. Over the admin socket (step 14a) an export, an import planned and c
 history, a diff, the head and a refused rollback show none of the values the policy view hides,
 nor the client token's hash, except the export, which holds the hash (R61's fourth exception);
 nor does a log line. A portal review save (step 15a) leaves none, nor the token's hash, in a log
-line, an answer, its draft or a file; the portal's rollbacks join the sweep in 15b.
+line, an answer, its draft or a file; nor do the portal's history, its diffs, or a rollback's plan
+and its write (step 15b).
 """
 
 from __future__ import annotations
@@ -2468,9 +2469,11 @@ async def test_the_hosts_socket_commands_show_no_policy_value(
 
 async def test_a_portal_save_leaks_no_policy_value(tmp_path: Path, log_lines: io.StringIO) -> None:
     """O.6: a review save planned as a draft, prepared and confirmed with a passkey, on a
-    managed deployment whose seed held a client's literal token and a caller's placeholder.
-    No log line, portal answer, plan, draft or file under the state directory holds the token,
-    its hash or the placeholder, and neither a draft nor a held action can be logged."""
+    managed deployment whose seed held a client's literal token and a caller's placeholder; then
+    the history, each revision's diff (the seed's from an empty policy holds the client and the
+    caller) and a rollback to the seed, planned and confirmed (step 15b). No log line, portal
+    answer, plan, draft or file under the state directory holds the token, its hash or the
+    placeholder, and neither a draft nor a held action can be logged."""
     from zoeymcp.common import logs as logs_module
     from zoeymcp.portal.actions import Action
     from zoeymcp.portal.drafts import Draft
@@ -2498,11 +2501,18 @@ async def test_a_portal_save_leaks_no_policy_value(tmp_path: Path, log_lines: io
     saved = await portal_step_up(page, authenticator, "policy.save", data)
     assert saved.status_code == 200, saved.text
     held_repr = repr(held)
+    assert (await page.call("GET", "/api/policy/revisions")).status_code == 200
+    for path in ("/api/policy/revisions/1", "/api/policy/revisions/2", "/api/policy"):
+        assert (await page.call("GET", path)).status_code == 200, path
+    rolled = await portal_step_up(
+        page, authenticator, "policy.rollback", {"base": 2, "revision": 1}
+    )
+    assert rolled.status_code == 200, rolled.text
     for kept in (Draft, Action):
         assert kept in logs_module.refused_types()
     files = [p.read_bytes() for p in (tmp_path / "state").rglob("*") if p.is_file()]
     shown = [*files, log_lines.getvalue().encode(), *(a.encode() for a in [*answers, held_repr])]
-    assert {"policy_saved", "step_up_confirmed"} <= {
+    assert {"policy_saved", "policy_rolled_back", "step_up_confirmed"} <= {
         json.loads(line)["event"] for line in log_lines.getvalue().splitlines()
     }
     for value in (MANAGED_TOKEN, hash_token(MANAGED_TOKEN), MANAGED_PLACEHOLDER):

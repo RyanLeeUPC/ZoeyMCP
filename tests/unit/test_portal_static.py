@@ -21,9 +21,11 @@ import pytest
 
 from tests.unit.test_review_choices import large
 from tests.unit.test_reviewview import held
+from zoeymcp.common.policy.diff import Change
 from zoeymcp.common.policy.emit import INDENT_MAX
+from zoeymcp.common.policy.plan import WriteKind
 from zoeymcp.portal import app as portal_app
-from zoeymcp.portal import reviewview
+from zoeymcp.portal import policydiffview, reviewview
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
 from zoeymcp.portal.routes import JAVASCRIPT, ROUTES, STATIC
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
@@ -40,8 +42,15 @@ MAX_ASSETS = 128 * 1024
 # onto one helper, so the cap moved by 50 lines rather than squeeze the script further. M7 keeps
 # it, and gives review.js, the MCP servers section, its own. M6 (M.4, Q14): the owner raised
 # app.js and webauthn.js to 1,060 for the few lines Home and health need (1,048 before step 7,
-# 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450.
-LINE_CAPS = {("app.js", "webauthn.js"): 1060, ("review.js",): 700, ("drift.js",): 450}
+# 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450;
+# policy.js, the Policy page's managed half (step 15b), its own 500. The static total after 15b
+# is 115 KiB (117,443 bytes), below M.4's 124 KiB, so MAX_ASSETS stays 128 KiB.
+LINE_CAPS = {
+    ("app.js", "webauthn.js"): 1060,
+    ("review.js",): 700,
+    ("drift.js",): 450,
+    ("policy.js",): 500,
+}
 
 LT, GT, QUOTE = chr(0x3C), chr(0x3E), chr(0x22)
 FORBIDDEN_TAGS = frozenset({"style", "form", "iframe", "base", "object", "embed", "frame"})
@@ -179,6 +188,7 @@ def test_index_html() -> None:
         "/app.css",
         "/app.js",
         "/drift.js",
+        "/policy.js",
         "/review.js",
         "/webauthn.js",
     ]
@@ -208,7 +218,7 @@ def test_the_refused_page_says_what_the_catalogue_says() -> None:
     assert text not in read("callback-received.html")
 
 
-@pytest.mark.parametrize("name", ["app.js", "review.js", "drift.js"])
+@pytest.mark.parametrize("name", ["app.js", "review.js", "drift.js", "policy.js"])
 def test_every_element_the_script_names_exists(name: str) -> None:
     ids = parsed(read("index.html")).ids
     script = read(name)
@@ -283,10 +293,11 @@ def test_the_scripts_are_small_strict_and_hand_written() -> None:
 
 def test_the_scripts_are_derived_from_the_static_map() -> None:
     """M7 K.4: SCRIPTS is every text/javascript file the map serves, and index.html loads each
-    of them, review.js and drift.js (M6 M.4) after the app.js whose helpers they use."""
-    assert SCRIPTS == ("app.js", "webauthn.js", "review.js", "drift.js")
+    of them, review.js, drift.js and policy.js (M6 M.4) after the app.js whose helpers they
+    use."""
+    assert SCRIPTS == ("app.js", "webauthn.js", "review.js", "drift.js", "policy.js")
     order = re.findall(r'<script src="/([a-z]+\.js)" defer></script>', read("index.html"))
-    assert order == ["webauthn.js", "app.js", "review.js", "drift.js"]
+    assert order == ["webauthn.js", "app.js", "review.js", "drift.js", "policy.js"]
 
 
 def test_every_button_runs_its_handler_once_at_a_time() -> None:
@@ -837,3 +848,137 @@ def test_record_the_rest_as_declined_is_ticked_by_default() -> None:
     box = parser.inputs["review-decline-rest"]
     assert (box["type"], "checked" in box) == ("checkbox", True)
     assert 'decline_rest: $("review-decline-rest").checked' in code_of(read("drift.js"))
+
+
+# --- the Policy page's managed half (M6 M.1, M.4, H.1-H.4; step 15b) -----------------------------
+
+
+def test_policy_js_clicks_go_through_app_js_guard() -> None:
+    """policy.js draws its buttons with app.js's button() and binds its two clicks through on():
+    the Policy page's nav button, beside app.js's own, so the page's managed half draws as it
+    opens, and Older revisions. It listens for nothing else, prepares one kind, policy.rollback,
+    publishes nothing, and words a next step and the export command as review.js does (M.7). Its
+    one click of its own is the nav button's, after a rollback, so app.js's view and the history
+    draw again at the new head. Roll back is on every history entry but the head, so a revision
+    whose changes can't be shown is still a target (D.8); a press first finds a head that moved
+    since the page showed it, and draws the page again at the head now instead of preparing, and
+    a refused prepare draws it again too, so pressing Roll back again plans on the head it finds
+    (N.2's rollback wording)."""
+    code = code_of(read("policy.js"))
+    assert "addEventListener(" not in code
+    assert "function button(" not in code
+    assert "function guard(" not in code
+    taken = re.search(r"const \{([^}]*)\} = window\.zoeyPortal;", code)
+    assert taken
+    assert {word.strip() for word in taken.group(1).split(",")} == {
+        "api",
+        "fill",
+        "afterFailure",
+        "button",
+        "prepare",
+        "closeConfirm",
+        "on",
+    }
+    assert re.findall(r"\bon\(\"([a-z-]+)\", ", code) == ["nav-policy", "policy-older"]
+    assert re.findall(r'prepare\("([a-z.]+)"', code) == ["policy.rollback"]
+    assert re.findall(r"window\.(zoey\w+) =", code) == []
+    assert re.findall(r"window\.zoeyReview\.(\w+)\(", code) == ["stepText", "stepText"]
+    assert re.findall(r"\$\(\"([a-z-]+)\"\)\.click\(\)", code) == ["nav-policy"]
+    start = code.index("async function rollback(target, head) {")
+    body = code[start : code.index("\n  }\n", start)]
+    assert body.index("closeConfirm();") < body.index('$("nav-policy").click();')
+    # A rollback is planned on the head the page showed, never on whatever the head is now.
+    assert 'prepare("policy.rollback", { base: head, revision: target },' in body
+    assert 'const ONE = "?limit=1";' in code
+    asked = body.index('now = await api("GET", "/api/policy/revisions" + ONE);')
+    moved = body.index("if (now.head !== head) {")
+    assert asked < moved < body.index("return draw();") < body.index('prepare("policy.rollback"')
+    assert body.index('prepare("policy.rollback"') < body.index('if (!$("confirm").open) {')
+    assert body.rstrip().endswith("await draw();\n    }")
+    start = code.index("function revision(entry, head) {")
+    drawn = code[start : code.index("\n  }\n", start)]
+    assert "if (entry.revision !== head) {" in drawn
+    assert "() => rollback(entry.revision, head)));" in drawn
+
+
+def test_policy_js_reads_what_the_vault_sends() -> None:
+    """H.1, H.2, M.1: every field policy.js reads of a history entry, a diff row and the
+    answers is one the vault sends, and every kind a revision's header can name has its words."""
+    code = code_of(read("policy.js"))
+    kinds = code[code.index("const KIND_TEXT = {") :]
+    kinds = kinds[: kinds.index("};")]
+    assert set(re.findall(r'"([a-z.]+)":', kinds)) == set(typing.get_args(WriteKind))
+    states = code[code.index("const GATEWAY_TEXT = {") :]
+    states = states[: states.index("};")]
+    assert set(re.findall(r"^\s+([a-z]+):", states, flags=re.M)) == {
+        "applied",
+        "pending",
+        "unknown",
+    }
+    header = {
+        "revision": 3,
+        "created": 1_700_000_000,
+        "origin": "rollback",
+        "kind": "policy.rollback",
+        "author": {"by": "passkey", "fingerprint": "ab" * 16},
+        "base": 2,
+        "target": 1,
+        "jumped_from": None,
+        "reason": None,
+    }
+    entry = portal_app._history_view(header)
+    gap = portal_app._history_view({"revision": 2, "gap": True})
+    assert set(re.findall(r"\bentry\.([a-z_]+)", code)) <= set(entry) | set(gap)
+    change = Change(
+        ("gateway", "servers", "notes", "path"), "changed", "/a", "/b", "RemoteServer", "path"
+    )
+    [row] = policydiffview.rows([change])
+    assert set(re.findall(r"\bchange\.([a-z_]+)", code)) <= set(row)
+    # The view's managed fields, a history page's and a diff's (tests/portal pins each set).
+    assert set(re.findall(r"\bview\.([a-z_]+)", code)) == {
+        "mode",
+        "revision",
+        "not_running",
+        "gateway",
+        "export",
+    }
+    assert set(re.findall(r"\bpage\.([a-z_]+)", code)) == {"revisions", "head", "next"}
+    assert set(re.findall(r"\bnow\.([a-z_]+)", code)) == {"head"}
+    assert set(re.findall(r"\banswer\.([a-z_]+)", code)) == {"revision", "against", "rows", "head"}
+    assert set(re.findall(r"\bgateway\.([a-z_]+)", code)) == {"state", "revision"}
+
+
+def test_policy_js_shows_a_count_old_to_new() -> None:
+    """H.2: recipients, shown as a count, send both counts with ``hidden`` set; a hidden field
+    sends only its marker, as ``new``, and no ``old``. policy.js keys on whether ``old`` came,
+    not on ``hidden``, so a changed count reads old -> new (a removed row with an ``old`` shows
+    it, never "null"), and a hidden field only its marker."""
+    code = code_of(read("policy.js"))
+    start = code.index("function row(change) {")
+    body = code[start : code.index("\n  }\n", start)]
+    assert "const marked = change.hidden && change.old === null;" in body
+    assert body.count("change.hidden") == 1
+    assert "values = marked ? change.new : value(change.old);" in body
+    assert 'change.op === "changed" && !marked' in body
+    to = ("connectors", "mail-out", "to")
+    token = ("gateway", "clients", "agent", "token_sha256")
+    hashes = ("sha256:" + "1" * 64, "sha256:" + "2" * 64)
+    rows = policydiffview.rows(
+        [
+            Change(
+                to,
+                "changed",
+                ["a@mail.example"],
+                ["a@mail.example", "b@mail.example"],
+                "SMTPConnector",
+                "to",
+            ),
+            Change(token, "changed", *hashes, "Client", "token_sha256"),
+            Change(token, "removed", hashes[0], None, "Client", "token_sha256"),
+        ]
+    )
+    assert [(row["hidden"], row["old"], row["new"]) for row in rows] == [
+        (True, "(1 address)", "(2 addresses)"),
+        (True, None, "(changed)"),
+        (True, None, "(removed)"),
+    ]

@@ -11,8 +11,8 @@ from step 15 it is M.1's whole table, and a test checks that it equals M.1. M7 p
 own rows, the MCP servers section's (M7 design K.2), which the same test pins, and M6 its own
 (M6 design M.2), each in the step that builds it. A path parameter is
 checked against its pattern before a route matches, so a handler never sees a name the policy
-couldn't hold. A query string isn't part of a route: the one route that reads one, the ledger,
-checks it itself.
+couldn't hold. A query string isn't part of a route: the routes that read one, the ledger and
+the policy's history and diffs, check it themselves.
 """
 
 from __future__ import annotations
@@ -53,6 +53,8 @@ STATIC: Final[Mapping[str, StaticFile]] = MappingProxyType(
         "/review.js": StaticFile("review.js", JAVASCRIPT),
         # M6 step 7: Home's attention list, then the drift review (M6 M.4), with its own cap.
         "/drift.js": StaticFile("drift.js", JAVASCRIPT),
+        # M6 step 15b: the Policy page's managed half (M6 M.4), with its own cap.
+        "/policy.js": StaticFile("policy.js", JAVASCRIPT),
         "/app.css": StaticFile("app.css", CSS),
         # Step 14b: where the callback sends the tab (C.7). No script, no text from the query.
         "/callback/received": StaticFile("callback-received.html", HTML),
@@ -100,7 +102,8 @@ class Route:
 
 
 # What a path parameter may be: a credential or a server is a policy name; a flow, an action, an
-# onboarding or a review job is the ID the vault gave it (base64url or hex).
+# onboarding or a review job is the ID the vault gave it (base64url or hex); a revision is a
+# policy revision's number, ten digits at most (M6 design M.2, REVISION_MAX).
 PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
     {
         "credential": re.compile(NAME_PATTERN),
@@ -109,6 +112,7 @@ PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
         "onboarding": re.compile(r"[A-Za-z0-9_-]{1,64}"),
         "job": re.compile(r"[A-Za-z0-9_-]{1,64}"),
         "server": re.compile(NAME_PATTERN),
+        "revision": re.compile(r"[1-9][0-9]{0,9}"),
     }
 )
 
@@ -211,6 +215,11 @@ REVIEW_DIFF: Final = Route(
 )
 # M6 step 7: Home's attention list (M6 M.2, M.7), from health's gateway section.
 ATTENTION: Final = Route("GET", "/api/attention", FULL)
+# M6 step 15b: the managed policy's history, 50 revisions a page (query before and limit), and a
+# revision's diff from its parent or another kept revision (query against) (M6 M.2, H.1, H.2).
+# Rolling back is the policy.rollback action.
+REVISIONS: Final = Route("GET", "/api/policy/revisions", FULL)
+REVISION: Final = Route("GET", "/api/policy/revisions/{revision}", FULL)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -240,6 +249,8 @@ ROUTES: Final[tuple[Route, ...]] = (
     REVIEW_JOB,
     REVIEW_DIFF,
     ATTENTION,
+    REVISIONS,
+    REVISION,
     ACTIONS,
     CONFIRM,
     CANCEL,

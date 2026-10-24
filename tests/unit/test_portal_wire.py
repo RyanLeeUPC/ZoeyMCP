@@ -109,8 +109,8 @@ def test_the_page_posts_exactly_each_routes_body() -> None:
 
 def test_the_page_prepares_each_kind_with_its_data(tmp_path: Path) -> None:
     """Every action the page prepares is a kind the portal runs, with the data keys the registry
-    takes; and the page prepares every kind the portal runs, M7 K.3's in review.js and M6 J.4's
-    tool.clear in drift.js."""
+    takes; and the page prepares every kind the portal runs, M7 K.3's in review.js, M6 J.4's
+    tool.clear and step 15a's saves in drift.js, and step 15b's policy.rollback in policy.js."""
     script = scripts()
     prepared = PREPARED.findall(script)
     assert prepared

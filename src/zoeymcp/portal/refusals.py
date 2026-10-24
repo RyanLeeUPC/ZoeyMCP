@@ -750,13 +750,20 @@ SAVE_MOVED: Final = (
     "The policy moved to {said} since you planned this: press Save again to plan it on revision "
     "{revision}."
 )
+# policy_moved as the Policy page's rollback words it (H.3): that page has no Save, and draws
+# Roll back again at the head it finds.
+ROLLBACK_MOVED: Final = (
+    "The policy moved to {said} since you planned this: press Roll back again to plan it on "
+    "revision {revision}."
+)
 
 
-def save_moved(*, said: str, revision: int) -> Refusal:
-    """``policy_moved`` in the portal (G.7, OPS-18): the catalogue's status, and
-    :data:`SAVE_MOVED` naming the head (``policyview.saved``'s words)."""
+def save_moved(*, said: str, revision: int, words: str = SAVE_MOVED) -> Refusal:
+    """``policy_moved`` in the portal (G.7, OPS-18): the catalogue's status, and ``words``
+    (:data:`SAVE_MOVED`, or :data:`ROLLBACK_MOVED` for a rollback) naming the head
+    (``policyview.saved``'s words)."""
     status = CATALOGUE["policy_moved"].status
-    return Refusal(status, "policy_moved", SAVE_MOVED.format(said=said, revision=revision))
+    return Refusal(status, "policy_moved", words.format(said=said, revision=revision))
 
 
 def refusal(reason: str, **fields: str) -> Refusal:

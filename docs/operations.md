@@ -2183,6 +2183,36 @@ recipients as a count), and the values of an OAuth credential's `token_headers` 
 forced query parameters, which could hold a literal credential. Secret references (`store:x`,
 `env:X`) show as written; the policy never holds a secret value.
 
+**The Policy page, in managed mode.** In managed mode (§34) the page shows the head (the revision
+it shows, when and by whom it was saved), which revision the gateway runs (or that it hasn't taken
+the head yet, or hasn't reported since the vault started), a revision saved and not running, and
+the host's `zoeymcp policy export` command, as you run it in the vault's container. **History**
+lists the kept revisions, newest first, 50 a page (**Older revisions** for more): each with when
+and by whom it was saved (a passkey's fingerprint, the host and how, or the seed), what made it (a
+save, a re-pin, a move to allow, a rollback with its target, an import, the seed, ...) and the
+host's reason, as `zoeymcp policy history` shows them (§34); a revision in quarantine shows as a
+gap. **Show the changes** lists what a revision changed from the one before it, one row per field
+with its direction (wider, narrower or neutral), rendered as the policy view is, so a hidden field
+shows only as `(set)`, `(changed)` or `(removed)`, and text from the policy with every hidden
+character revealed. **Roll back to revision N**, on any kept revision but the head (also one whose
+changes can't be shown because the revision before it is no longer kept or is in quarantine),
+plans a new revision with N's content, keeping from the head its key generations, its `admin`
+block and the pin of every tool both have, and the declines less what N includes (§34, "Rolling
+back"); the dialog lists every change, the store entries it leaves unused first ("delete it on the
+Secrets page, then roll back again": after the rollback a removed credential's secret can't be
+revoked at the provider), and one passkey writes it. The portal rolls back only when every change
+is narrower or neutral, so it can undo an onboarding, a tool's inclusion, a move to allow or a
+raised limit. A rollback that would bring back a client or a caller a later revision removed is
+refused `rollback_revives`, naming it and the revision that removed it; anything wider (a dropped
+`sources` pin, a re-pointed server, a raised timeout, `wrap_results` turned off, a tool moved to
+allow, ...) is refused `portal_widens`, naming each path: both before any passkey prompt, and both
+are the host's to do, with `zoeymcp policy rollback N` and its flags (§34). A revision in
+quarantine or no longer kept is `revision_unreadable` or `revision_unknown`; if it goes to
+quarantine between the plan and your passkey, the dialog says so and nothing is written, as it
+does when the policy moved meanwhile (`policy_moved`: the page is drawn again at the new head, so
+press **Roll back** again to plan it there). Logs: `step_up_confirmed` with the action
+`policy.rollback`, then `policy_rolled_back` with its `target` (§34).
+
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A
 different host name has its own: issue a setup code and redeem it **on the new origin**.
@@ -2199,14 +2229,15 @@ removed since the backup is back, and works (§1, §6).
 **What a stolen session can and can't do.** A session is the cookie and the tab's token together; a
 page on another `localhost` port receives the cookie (cookies ignore ports) but not the token, and
 gets 401. Someone holding both halves, within the session's limits, can read what the portal shows
-(names, bindings, health, the policy view, the ledger, the passkey and session lists, review
-reports), start an OAuth sign-in, start onboarding a server by URL (the vault then fetches that
-server's public metadata, through its address guard), queue a review, plan a review save (managed
-mode: the plan is held, nothing is written), and end other sessions. They can't write or delete
+(names, bindings, health, the policy view and, in managed mode, its history and diffs, the
+ledger, the passkey and session lists, review reports), start an OAuth sign-in, start onboarding
+a server by URL (the vault then fetches that server's public metadata, through its address
+guard), queue a review, plan a review save (managed mode: the plan is held, nothing is written),
+and end other sessions. They can't write or delete
 a secret, complete a connect, reset a credential, register a client, discover a server on your
 own network, enrol, rename or remove a passkey, restart the ledger chain, or, in managed mode,
-save a review, re-pin a tool or move one to allow: each needs a fresh passkey prompt bound to
-that change. If you think a session was taken, **End the other
+save a review, re-pin a tool, move one to allow or roll back the policy: each needs a fresh
+passkey prompt bound to that change. If you think a session was taken, **End the other
 sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
 ([threat-model.md](threat-model.md)) has the rest.
 
@@ -3704,6 +3735,8 @@ tier); `--format json` prints the vault's answer instead:
   renders the policy: a client's token hash, a placeholder, an account name or a recipient shows
   only as `(set)`, `(changed)` or `(removed)`.
 
+The portal's Policy page shows the same head, history and diffs (§26).
+
 ### Exporting the policy
 
 `zoeymcp policy export [--revision N] [--mode managed|declarative] [--for compose]` writes the
@@ -3783,7 +3816,9 @@ a lockout. It is planned and confirmed as an import is, with the same flags (`--
 `--accept-widening`, `--allow-revive`, `--allow-env`, `--lockout-ok`, `--revoke-removed`,
 `--reason`): a rollback past the removal of a client asks for its `--allow-revive`. A revision in
 quarantine can't be rolled back to (`revision_unreadable`), nor one no longer kept
-(`revision_unknown`). The portal's rollback keeps the head's `admin` and refuses anything wider.
+(`revision_unknown`). The portal's rollback (**Roll back to revision N** on the Policy page,
+§26) keeps the head's `admin` and refuses anything wider, and a rollback past a client's or a
+caller's removal (`rollback_revives`): both are this command's.
 
 ### A lockout, with and without a socket
 

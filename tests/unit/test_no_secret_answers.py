@@ -399,6 +399,7 @@ PORTAL_PARAMS = {
     "onboarding": "0" * 16,
     "job": "0" * 16,
     "server": "notes",
+    "revision": "1",
 }
 PORTAL_BODIES: dict[str, Any] = {
     "/api/onboard/discover": {"url": onboard_model.SERVER_URL},
@@ -681,8 +682,9 @@ async def managed_portal(tmp_path: Path) -> tuple[PortalApp, Any, Reviews]:
 
 async def test_no_managed_portal_answer_carries_a_token_or_a_placeholder(tmp_path: Path) -> None:
     """O.6: a review save planned as a draft and saved with a passkey, a refused prepare and a
-    stale draft, then every route walked: no answer carries the client's literal token, its
-    hash or the caller's placeholder, the draft's and the plan's summaries included."""
+    stale draft, then every route walked, the history and the seed's diff from an empty policy
+    among them (step 15b): no answer carries the client's literal token, its hash or the
+    caller's placeholder, the draft's and the plan's summaries included."""
     app, vault, reviews = await managed_portal(tmp_path)
     answers: list[str] = []
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)

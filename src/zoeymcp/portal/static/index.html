@@ -9,6 +9,7 @@
 <script src="/app.js" defer></script>
 <script src="/review.js" defer></script>
 <script src="/drift.js" defer></script>
+<script src="/policy.js" defer></script>
 </head>
 <body>
 <header id="bar" hidden>
@@ -275,6 +276,26 @@ container.</p>
 reload. The portal can't change it.</p>
 <p data-mode="managed" hidden>This deployment's policy is managed: the portal's saves and the
 host's imports write each revision.</p>
+<div id="policy-managed" data-mode="managed" hidden>
+<p id="policy-saved" role="status"></p>
+<p id="policy-head"></p>
+<p id="policy-gateway"></p>
+<p id="policy-export"></p>
+<h3>History</h3>
+<p>Every revision the vault keeps, newest first: what made it, who and when. <b>Show the
+changes</b> lists what a revision changed from the one before it, each change marked wider,
+narrower or neutral. <b>Roll back</b> plans a new revision with that revision's content, keeping
+the head's key generations, admin block and pins, and lists every change before your passkey
+confirms it. The portal rolls back only when nothing gets wider: a rollback that brings back
+something the policy removed, or widens anything, is the host's (zoeymcp policy rollback).</p>
+<ul id="policy-history"></ul>
+<button type="button" id="policy-older" hidden>Older revisions</button>
+<div id="policy-diff" hidden>
+<h3 id="policy-diff-title"></h3>
+<ul id="policy-diff-rows"></ul>
+<p id="policy-diff-actions"></p>
+</div>
+</div>
 <p>It was read from <span id="policy-source"></span>.</p>
 <p id="policy-hidden"></p>
 <pre id="policy-text"></pre>

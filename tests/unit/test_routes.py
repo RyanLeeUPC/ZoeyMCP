@@ -6,7 +6,9 @@ built. From step 15 the table is M.1's, written here in the shape, and from M7 s
 with K.2's, the route table M7 publishes (fold-in R27), before the step-up rows: the table equals
 them, and matching finds each row. M6 adds M.2's rows as each step builds them, after K.2's:
 step 7 Home's attention list, and the static map ``drift.js``. Step 15a adds no route: in managed
-mode the review diff route answers a draft instead of fragment 2, and the saves are actions.
+mode the review diff route answers a draft instead of fragment 2, and the saves are actions. Step
+15b adds the policy's history and a revision's diff, whose ``revision`` is a policy revision's
+number, and the static map ``policy.js``; a rollback is an action.
 """
 
 from __future__ import annotations
@@ -110,8 +112,13 @@ K2 = (
         frozenset({"indent", "repin", "decline", "decline_rest"}),
     ),
 )
-# M6 M.2's rows, as each step builds them: step 7's attention list.
-M6 = (Route("GET", "/api/attention", FULL),)
+# M6 M.2's rows, as each step builds them: step 7's attention list, and step 15b's history and
+# a revision's diff (H.1, H.2).
+M6 = (
+    Route("GET", "/api/attention", FULL),
+    Route("GET", "/api/policy/revisions", FULL),
+    Route("GET", "/api/policy/revisions/{revision}", FULL),
+)
 TABLE = (*M1, *K2, *M6, *ACTION_ROWS)
 SAMPLE = {
     "credential": "github",
@@ -120,6 +127,7 @@ SAMPLE = {
     "onboarding": "o32x0000000000000000000000000000000000000001",
     "job": "jQx_-000000000000000000000000000000000000001",
     "server": "notes",
+    "revision": "17",
 }
 
 
@@ -130,6 +138,7 @@ def test_the_static_map_is_fixed() -> None:
         "/webauthn.js": StaticFile("webauthn.js", "text/javascript; charset=utf-8"),
         "/review.js": StaticFile("review.js", "text/javascript; charset=utf-8"),
         "/drift.js": StaticFile("drift.js", "text/javascript; charset=utf-8"),
+        "/policy.js": StaticFile("policy.js", "text/javascript; charset=utf-8"),
         "/app.css": StaticFile("app.css", "text/css; charset=utf-8"),
         "/callback/received": StaticFile("callback-received.html", "text/html; charset=utf-8"),
         "/callback/refused": StaticFile("callback-refused.html", "text/html; charset=utf-8"),
@@ -324,9 +333,46 @@ def test_a_flow_action_onboarding_or_job_is_an_id(value: str, ok: bool) -> None:
 
 
 def test_the_parameters() -> None:
-    assert set(PARAMS) == {"credential", "flow", "action", "onboarding", "job", "server"}
+    assert set(PARAMS) == {
+        "credential",
+        "flow",
+        "action",
+        "onboarding",
+        "job",
+        "server",
+        "revision",
+    }
     assert PARAMS["server"].pattern == PARAMS["credential"].pattern
     assert PARAMS["onboarding"].pattern == PARAMS["job"].pattern == PARAMS["flow"].pattern
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [
+        ("1", True),
+        ("17", True),
+        ("9999999999", True),  # REVISION_MAX: ten digits (M6 design D.2, T-4)
+        ("10000000000", False),
+        ("0", False),
+        ("017", False),
+        ("-1", False),
+        ("1a", False),
+        ("", False),
+        ("1\n", False),
+        ("%31", False),
+    ],
+)
+def test_a_revision_is_a_revisions_number(value: str, ok: bool) -> None:
+    """M6 M.2: ``PARAMS["revision"]`` is ``[1-9][0-9]{0,9}``, so the diff's handler never sees a
+    revision a store can't hold; the history's route takes no parameter, and a path one segment
+    longer or shorter matches neither."""
+    found = match(ROUTES, "GET", f"/api/policy/revisions/{value}")
+    assert (found is not None) == ok
+    if ok:
+        assert found == (M6[2], {"revision": value})
+    assert match(ROUTES, "GET", "/api/policy/revisions") == (M6[1], {})
+    assert match(ROUTES, "GET", "/api/policy/revisions/1/diff") is None
+    assert match(ROUTES, "POST", "/api/policy/revisions/1") is None
 
 
 def test_the_first_route_that_matches_wins() -> None:

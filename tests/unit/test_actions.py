@@ -107,6 +107,8 @@ def test_the_registry_holds_f4s_kinds() -> None:
         "policy.save": (4096, ["base", "draft"], []),
         "tool.repin": (4096, ["base", "draft"], []),
         "tool.allow": (4096, ["base"], ["draft", "kind", "name", "pin", "server"]),
+        # M6 H.3, M.3 (step 15b): a managed rollback to a kept revision, on the head shown.
+        "policy.rollback": (4096, ["base", "revision"], []),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
     assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS

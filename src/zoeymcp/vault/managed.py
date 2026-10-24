@@ -1015,6 +1015,18 @@ def export_answer(
     }
 
 
+def policy_status(managed: ManagedPolicy) -> dict[str, Any]:
+    """What the portal's Policy page says beside the view (M.1, K.1): the head's revision, which
+    one the gateway runs (:meth:`ManagedPolicy.gateway`) and a revision saved and not running.
+    Built here, vault-side, as health's sections are: the portal's code names nothing of the
+    gateway's (D-115's check, ``tests/unit/test_no_secret_answers.py``)."""
+    return {
+        "revision": managed.revision,
+        "gateway": managed.gateway(),
+        "not_running": managed.not_running,
+    }
+
+
 def plan_answer(planned: WritePlan, lockout: Iterable[Lockout]) -> dict[str, Any]:
     """A host write's plan (H.5 step 5): its rows in G.7's order, widenings first, its
     effects, whether it widens (``import_widens``, Q41), its lockout rows (I.1), the store

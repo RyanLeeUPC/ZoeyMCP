@@ -75,9 +75,14 @@ def test_only_a_full_session_reads_it(rig: PortalRig) -> None:
 
 
 def test_no_route_writes_the_policy() -> None:
-    """P9, per mode (M6 design M.2, 0.4): the policy has one route, a GET. A declarative policy
-    is changed in its source; in managed mode a save is an action (``policy.save``,
-    ``tool.repin``, ``tool.allow``, confirmed with a passkey), and no route writes the policy
-    outside ``/api/actions``."""
-    assert [(r.method, r.path) for r in ROUTES if "polic" in r.path] == [("GET", "/api/policy")]
-    assert {"policy.save", "tool.repin", "tool.allow"} <= set(KINDS)
+    """P9, per mode (M6 design M.2, 0.4): the policy's routes are GETs, the view, the history
+    and a revision's diff. A declarative policy is changed in its source; in managed mode a save
+    or a rollback is an action (``policy.save``, ``tool.repin``, ``tool.allow``,
+    ``policy.rollback``, confirmed with a passkey), and no route writes the policy outside
+    ``/api/actions``."""
+    assert [(r.method, r.path) for r in ROUTES if "polic" in r.path] == [
+        ("GET", "/api/policy"),
+        ("GET", "/api/policy/revisions"),
+        ("GET", "/api/policy/revisions/{revision}"),
+    ]
+    assert {"policy.save", "tool.repin", "tool.allow", "policy.rollback"} <= set(KINDS)

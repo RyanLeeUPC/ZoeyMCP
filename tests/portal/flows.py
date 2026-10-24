@@ -27,6 +27,7 @@ SAMPLE_PARAMS = {
     "onboarding": "0123456789abcdef",
     "job": "0123456789abcdef",
     "server": "notes",
+    "revision": "1",
 }
 LOGIN_BEGIN = "/api/login/begin"
 LOGIN_FINISH = "/api/login/finish"

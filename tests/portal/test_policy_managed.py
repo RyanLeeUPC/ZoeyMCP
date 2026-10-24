@@ -17,10 +17,21 @@ the answer says ``pending``, and health says so after the grace (FM-18). A revis
 saved and couldn't install is its own ``500 saved_not_running``, not a dialog's ``changed``
 (N.2). What the portal can't widen is refused before any prompt, or at the confirm with a valid
 assertion, with nothing written (Y6, Y7, Y11, Y17).
+
+The Policy page (step 15b; H.1-H.4, J6): the history and a revision's diff, hostile text shown
+revealed; a rollback that undoes an onboarding is the portal's, its unused store entry listed
+first; one that brings back a removed client is ``rollback_revives``, and one per wider row of
+H.2's table a rollback reaches is ``portal_widens`` (Y6); a target in quarantine is refused, in
+the dialog at the confirm, while one whose parent is in quarantine is still a target; a head that
+moved is worded for the Policy page; and a 400-row plan is confirmed whole, a 401st row refused
+(Y9). The
+host's revisions they start from are written as the admin socket writes an import.
 """
 
 from __future__ import annotations
 
+import copy
+import json
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -43,12 +54,22 @@ from zoeymcp.common.policy.change import (
     PolicyChange,
     SetServerReview,
 )
-from zoeymcp.common.policy.plan import KEPT_ALLOW_TEXT, MOVE_TEXT, REINCLUDE_TEXT
+from zoeymcp.common.policy.plan import KEPT_ALLOW_TEXT, MOVE_TEXT, REINCLUDE_TEXT, document
 from zoeymcp.common.policy.schema import OAuth2Credential, Policy, Route, Tools
 from zoeymcp.portal import app as portal_app
+from zoeymcp.portal.app import UNUSED_LABEL, UNUSED_ROLLBACK
 from zoeymcp.portal.drafts import Facts
+from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.gatewaykeys import GatewayKeyError
-from zoeymcp.vault.managed import GATEWAY_APPLY_GRACE
+from zoeymcp.vault.managed import (
+    GATEWAY_APPLY_GRACE,
+    Shaped,
+    WriteRefused,
+    Written,
+    import_shaped,
+    read_revision,
+)
+from zoeymcp.vault.policystart import revision_file
 from zoeymcp.vault.statusreport import Report, ServerStatus
 
 from .flows import login, set_up, status_reason
@@ -751,3 +772,582 @@ def test_a_confirm_whose_moves_changed(tmp_path: Path) -> None:
         assert "notes.get" not in now
         assert revision(rig) == 2
         assert head(rig)["tools"]["allow"] == ["get"]
+
+
+# --- J6: history, diffs and rollback (M6 design H.1-H.4, M.1, M.2; step 15b) ---------------------
+
+HOST = {"by": "host", "via": "socket"}
+# Text a policy may hold that hides or fakes content: markup, and a bidi override (D-120).
+HOSTILE = 'notes <img src=x onerror=alert(1)> & "q" \u202eevil'
+
+
+def host_import(rig: PortalRig, edit: Callable[[dict[str, Any]], None], reason: str = "") -> int:
+    """A host's import (H.5) as the admin socket writes one: the head's document with ``edit``
+    made, planned on the head and written, on the vault's loop. Its revision."""
+    managed_ = rig.vault.managed
+    assert managed_ is not None
+
+    def write() -> Written | WriteRefused:
+        data = document(managed_.policy)
+        edit(data)
+        given = Policy.model_validate(data)
+        shaped = import_shaped(managed_.store.seed_digest, managed_.policy, given)
+        assert isinstance(shaped, Shaped), shaped
+        return managed_.write(
+            shaped.kind,
+            "socket",
+            managed_.revision,
+            shaped.candidate_of,
+            author=HOST,
+            expected=None,
+            evidence=shaped.evidence,
+            reason=reason or None,
+        )
+
+    written = rig.call(write)
+    assert isinstance(written, Written), written
+    return written.revision
+
+
+def as_given(given: dict[str, Any]) -> Callable[[dict[str, Any]], None]:
+    """An edit that makes the document ``given``, whatever it was."""
+
+    def edit(data: dict[str, Any]) -> None:
+        data.clear()
+        data.update(copy.deepcopy(given))
+
+    return edit
+
+
+def roll_back(world: World, target: int, base: int | None = None) -> httpx.Response:
+    """**Roll back to this** prepared, on the head the page showed (``base``)."""
+    data = {"base": revision(world.rig) if base is None else base, "revision": target}
+    return world.page.fetch("POST", "/api/actions", json={"kind": "policy.rollback", "data": data})
+
+
+def history(world: World, query: str = "") -> dict[str, Any]:
+    answer = world.page.fetch("GET", "/api/policy/revisions" + query)
+    assert answer.status_code == 200, answer.text
+    page: dict[str, Any] = answer.json()
+    return page
+
+
+def test_history_and_a_diff_show_what_each_revision_did(tmp_path: Path) -> None:
+    """H.1, H.2, M.1, J6, Y13 (D-120): the view names the head, the revision the gateway runs and
+    the host's export command; the history lists each revision newest first (what made it, who
+    and when, the host's reason shown), pages by ``before``
+    and ``limit``, and a revision's diff from its parent shows a hostile value revealed and no
+    client token hash. (A host's reason is printable text, so its markup is all it can hide.)"""
+    with world_of(tmp_path, guarded(**entry([LIST]))) as world:
+        rig = world.rig
+        reason = 'rotate <b onclick="x()">now</b> & "q"'
+
+        def hostile(data: dict[str, Any]) -> None:
+            data["credentials"]["notes"]["client_id"] = HOSTILE
+
+        assert host_import(rig, hostile, reason) == 2
+        view = world.page.fetch("GET", "/api/policy").json()
+        assert (view["mode"], view["revision"], view["not_running"]) == ("managed", 2, None)
+        assert view["gateway"] == {"state": "unknown", "revision": None}
+        assert view["export"]["do"] == "export_policy"
+        assert view["export"]["label"] == "Export the policy"
+        assert view["export"]["command"] == "zoeymcp policy export"
+        page = history(world)
+        assert set(page) == {"head", "revisions", "next"}
+        assert (page["head"], page["next"]) == (2, None)
+        newest, seed = page["revisions"]
+        assert set(newest) == {
+            "revision",
+            "gap",
+            "saved_shown",
+            "origin",
+            "kind",
+            "base",
+            "target",
+            "jumped_from",
+            "reason_shown",
+        }
+        assert (newest["revision"], newest["kind"], newest["base"]) == (2, "policy.import", 1)
+        assert newest["saved_shown"].startswith("revision 2, saved ")
+        assert newest["saved_shown"].endswith(" by the host (socket)")
+        assert newest["reason_shown"] == reason
+        assert (seed["revision"], seed["kind"], seed["reason_shown"]) == (1, "policy.seed", None)
+        # A page of one, then the next below it.
+        first = history(world, "?limit=1")
+        assert ([e["revision"] for e in first["revisions"]], first["next"]) == ([2], 2)
+        rest = history(world, "?before=2&limit=1")
+        assert ([e["revision"] for e in rest["revisions"]], rest["next"]) == ([1], None)
+        for query in ("?limit=51", "?limit=0", "?before=0", "?x=1", "?limit=1&limit=2", "?limit=a"):
+            refused = world.page.fetch("GET", "/api/policy/revisions" + query)
+            assert status_reason(refused) == (400, "bad_body"), query
+        diffed = world.page.fetch("GET", "/api/policy/revisions/2")
+        assert diffed.status_code == 200, diffed.text
+        answer = diffed.json()
+        assert set(answer) == {"revision", "against", "rows", "head"}
+        assert (answer["revision"], answer["against"], answer["head"]) == (2, 1, 2)
+        [row] = answer["rows"]
+        assert row["path_shown"] == ["credentials", "notes", "client_id"]
+        assert (row["op"], row["direction"], row["old"]) == ("changed", "wider", "notes-client")
+        assert row["new"] == 'notes <img src=x onerror=alert(1)> & "q" [U+202E]evil'
+        # The seed's diff from an empty policy: the client's token hash only as set (Y13).
+        seeded = world.page.fetch("GET", "/api/policy/revisions/1?against=2").json()
+        assert seeded["against"] == 2
+        whole = world.page.fetch("GET", "/api/policy/revisions/1").json()
+        assert whole["against"] is None
+        assert CLIENT_HASH not in json.dumps(whole)
+        assert "\u202e" not in diffed.text + json.dumps(page)
+        unknown = world.page.fetch("GET", "/api/policy/revisions/7")
+        assert status_reason(unknown) == (409, "revision_unknown")
+        assert status_reason(world.page.fetch("GET", "/api/policy/revisions/1?against=x")) == (
+            400,
+            "bad_body",
+        )
+
+
+def test_rollback_undoes_onboarding(tmp_path: Path) -> None:
+    """J6, Y6, G.7 rows 6-7, G.8: revision 2 onboarded notes (its credential, route and server)
+    from the host; **Roll back to this** on revision 1 removes all three, a narrowing the portal
+    may make. The dialog lists the stored refresh token it leaves unused first, then the revision
+    row naming the target, and one passkey writes revision 3, logged ``policy_rolled_back`` with
+    its target; the history says what made it, and its diff is every removal, narrower."""
+    seed = {"mode": "managed", "gateway": {"clients": {"agent": {"token_sha256": CLIENT_HASH}}}}
+    with world_of(tmp_path, seed) as world:
+        rig = world.rig
+        onboarded = copy.deepcopy(notes_entries(**entry([LIST])))
+
+        def onboard(data: dict[str, Any]) -> None:
+            data["credentials"] = onboarded["credentials"]
+            data["routes"] = onboarded["routes"]
+            data["gateway"]["servers"] = onboarded["gateway"]["servers"]
+
+        assert host_import(rig, onboard) == 2
+        managed_ = rig.vault.managed
+        assert managed_ is not None
+        secrets = rig.app.secrets
+        assert secrets is not None
+        binding = derive_binding(managed_.policy, "notes-refresh")
+        rig.call(lambda: secrets.store.put("notes-refresh", "r" * 24, binding))
+        prepared_ = roll_back(world, 1)
+        assert prepared_.status_code == 200, prepared_.text
+        held = prepared_.json()
+        summary = held["summary"]
+        assert summary[0][0] == "Revision"
+        assert summary[0][1].startswith("3, from 2: the content of revision 1 (by the host ")
+        assert summary[1] == [
+            UNUSED_LABEL,
+            UNUSED_ROLLBACK.format(name="notes-refresh"),
+        ]
+        removed = {label for label, value in summary if value == "removed"}
+        assert {"credentials.notes", "routes.notes", "gateway.servers.notes"} <= removed
+        assert not [label for label, value in summary if value.endswith("(wider)")]
+        done = confirmed(world, held)
+        assert done.status_code == 200, done.text
+        assert (done.json()["revision"], revision(rig)) == (3, 3)
+        assert managed_.policy.credentials == {}
+        assert managed_.policy.routes == []
+        [line] = rig.lines("policy_rolled_back")
+        assert (line["revision"], line["write_kind"], line["base"], line["target"]) == (
+            3,
+            "policy.rollback",
+            2,
+            1,
+        )
+        [newest, *_] = history(world)["revisions"]
+        assert (newest["kind"], newest["origin"], newest["target"]) == (
+            "policy.rollback",
+            "rollback",
+            1,
+        )
+        rows = world.page.fetch("GET", "/api/policy/revisions/3").json()["rows"]
+        assert rows
+        assert {row["direction"] for row in rows} == {"narrower"}
+        # The head itself is no target: nothing would change.
+        assert status_reason(roll_back(world, 3)) == (400, "no_change")
+
+
+def test_a_reviving_rollback_is_the_hosts(tmp_path: Path) -> None:
+    """J6, E3, Y5, G.5 rule 1c (verifier C1): revision 2 gave client ci-runner a token, and
+    revision 3 removed it. A portal rollback to revision 2 is ``rollback_revives``, naming the
+    client and the revision that removed it, before any prompt (the ratchet's reason, not the
+    direction rule's ``portal_widens``); nothing is written."""
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+
+        def add(data: dict[str, Any]) -> None:
+            data["gateway"]["clients"] = {"ci-runner": {"token_sha256": CLIENT_HASH}}
+
+        def remove(data: dict[str, Any]) -> None:
+            del data["gateway"]["clients"]
+
+        assert (host_import(rig, add), host_import(rig, remove)) == (2, 3)
+        before = state_files(rig)
+        refused = roll_back(world, 2)
+        assert status_reason(refused) == (409, "rollback_revives")
+        assert refused.json()["error"] == (
+            "Rolling back to revision 2 brings back client ci-runner, removed in revision 3: "
+            "only the host can, with zoeymcp policy rollback and --allow-revive."
+        )
+        assert refused.json()["subjects"] == ["client:ci-runner"]
+        assert "rows" not in refused.json()
+        assert len(rig.app.actions) == 0
+        assert (state_files(rig), revision(rig)) == (before, 3)
+
+
+def fenced() -> dict[str, Any]:
+    """A managed deployment narrow in each place a rollback could widen (H.2's wider rows that a
+    rollback reaches, O.4's Y6): a client pinned to its sources whose prompts need a confirmation
+    code, a route allowing one query parameter and constraining a capture, an https route, a
+    program with one egress entry, an MCP route no server uses, a toolkit slot of one unapproved
+    GET, a server wrapping its results with a 30 s timeout, including list as approve and
+    declining get (its review keeps the pins of get and old, so a rollback that includes either
+    again meets the direction rule, not ``pin_retired``, E2), and a route with the first of two
+    credentials."""
+    policy = guarded(**entry([LIST]), call_timeout=30, wrap_results=True)
+    notes = policy["gateway"]["servers"]["notes"]
+    notes["declined"] = {"get": pin_of(GET)}
+    notes["review"] |= {"get": pin_of(GET), "old": pin_of(OLD)}
+    header = {"kind": "header", "header": "X-Key", "format": "{secret}"}
+    policy["credentials"]["api-key"] = {**header, "secret": "store:api-key"}
+    policy["credentials"]["api-key-2"] = {**header, "secret": "store:api-key-2"}
+    notes = policy["routes"][0]
+    notes["query"] = {"allow": ["q"]}
+    notes["rules"][0]["paths"] = ["/mcp", "/other"]
+    notes["rules"].append({"methods": ["GET"], "paths": ["/x/{id}"], "params": {"id": ["a"]}})
+    api = policy["routes"][1]
+    api["credential"] = "api-key"
+    api["rules"] = [{"methods": ["GET", "POST"], "paths": ["/x"]}]
+    get = [{"methods": ["GET"], "paths": ["/x"]}]
+    policy["routes"] += [
+        {
+            "name": "plain",
+            "prefix": "/plain",
+            "upstream": "https://plain.example",
+            "callers": ["gateway"],
+            "rules": get,
+        },
+        {
+            "name": "prog",
+            "prefix": "/prog",
+            "upstream": "http://prog:8080",
+            "allow_insecure_upstream": True,
+            "callers": ["gateway"],
+            "rules": get,
+            "program": {"egress": ["a.example:443"]},
+        },
+        {
+            "name": "mirror",
+            "prefix": "/mirror",
+            "upstream": "https://mirror.example",
+            "callers": ["gateway"],
+            "stream": True,
+            "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": ["/mcp"]}],
+        },
+    ]
+    agent = policy["gateway"]["clients"]["agent"]
+    agent["sources"] = ["10.0.0.0/8"]
+    agent["approvals"] = {"attended": False, "confirm_code": True}
+    policy["gateway"]["servers"]["kit"] = {
+        "kind": "toolkit",
+        "module": "examples.toolkit",
+        "slots": {"main": {"route": "api", "rules": get}},
+    }
+    return policy
+
+
+def _route(data: dict[str, Any], name: str) -> dict[str, Any]:
+    found: dict[str, Any] = next(route for route in data["routes"] if route["name"] == name)
+    return found
+
+
+def _sources(data: dict[str, Any]) -> None:
+    del data["gateway"]["clients"]["agent"]["sources"]
+
+
+def _query_allow(data: dict[str, Any]) -> None:
+    del _route(data, "notes")["query"]
+
+
+def _params(data: dict[str, Any]) -> None:
+    del _route(data, "notes")["rules"][1]["params"]
+
+
+def _confirm_code(data: dict[str, Any]) -> None:
+    data["gateway"]["clients"]["agent"]["approvals"]["confirm_code"] = False
+
+
+def _insecure(data: dict[str, Any]) -> None:
+    _route(data, "plain").update(upstream="http://plain.example", allow_insecure_upstream=True)
+
+
+def _shared_session(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["notes"]["shared_session"] = True
+
+
+def _wrap_results(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["notes"]["wrap_results"] = False
+
+
+def _egress(data: dict[str, Any]) -> None:
+    _route(data, "prog")["program"]["egress"].append("b.example:443")
+
+
+def _slots(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["kit"]["slots"]["main"]["rules"][0]["methods"].append("POST")
+
+
+def _approved(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["kit"]["slots"]["main"]["rules"][0]["approved"] = True
+
+
+def _path(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["notes"]["path"] = "/other"
+
+
+def _credential(data: dict[str, Any]) -> None:
+    _route(data, "api")["credential"] = "api-key-2"
+
+
+def _timeout(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["notes"]["call_timeout"] = 60
+
+
+def _route_repointed(data: dict[str, Any]) -> None:
+    data["gateway"]["servers"]["notes"]["route"] = "mirror"
+
+
+def _allow(data: dict[str, Any]) -> None:
+    tools = data["gateway"]["servers"]["notes"]["tools"]
+    tools["approve"].remove("list")
+    tools.setdefault("allow", []).append("list")
+
+
+def _include(data: dict[str, Any]) -> None:
+    notes = data["gateway"]["servers"]["notes"]
+    notes["tools"]["include"].append("old")
+    notes["tools"]["approve"].append("old")
+
+
+def _reinclude(data: dict[str, Any]) -> None:
+    """get included again: the target includes what the head declines, so the rollback takes it
+    out of ``declined`` (H.4), a row of its own."""
+    notes = data["gateway"]["servers"]["notes"]
+    notes["tools"]["include"].append("get")
+    notes["tools"]["approve"].append("get")
+    del notes["declined"]
+
+
+# Each wider row of H.2's table a rollback can reach (O.4's Y6), and the path its refusal names.
+ROLLBACK_WIDENINGS = (
+    (_sources, "gateway.clients.agent.sources"),
+    (_query_allow, "routes.notes.query.allow"),
+    (_params, "routes.notes.rules.1.params.id"),
+    (_confirm_code, "gateway.clients.agent.approvals.confirm_code"),
+    (_insecure, "routes.plain.allow_insecure_upstream"),
+    (_shared_session, "gateway.servers.notes.shared_session"),
+    (_wrap_results, "gateway.servers.notes.wrap_results"),
+    (_egress, "routes.prog.program.egress"),
+    (_slots, "gateway.servers.kit.slots.main.rules.0.methods"),
+    (_approved, "gateway.servers.kit.slots.main.rules.0.approved"),
+    (_path, "gateway.servers.notes.path"),
+    (_credential, "routes.api.credential"),
+    (_timeout, "gateway.servers.notes.call_timeout"),
+    (_route_repointed, "gateway.servers.notes.route"),
+    (_allow, "gateway.servers.notes.tools.allow"),
+    (_include, "gateway.servers.notes.tools.include"),
+    (_reinclude, "gateway.servers.notes.declined.get"),
+)
+
+
+def test_no_portal_rollback_widens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Y6, T-1, CR-4 (G.5 rule 2, H.4; 15a's deviation 13): for each wider row of H.2's table a
+    rollback can reach, the host widens the policy (revision 2k), then narrows it back (2k+1);
+    a portal rollback to the wider revision is ``403 portal_widens`` before any prompt, naming
+    the path and the host's export and import, and nothing is written. Prepared on a narrowing
+    target and confirmed with a valid assertion after the target's policy reads as a wider one,
+    it is ``409 changed``, its first row ``portal_widens``."""
+    with world_of(tmp_path, fenced()) as world:
+        rig = world.rig
+        managed_ = rig.vault.managed
+        assert managed_ is not None
+        narrow = document(managed_.policy)
+        for edit, path in ROLLBACK_WIDENINGS:
+            wide = host_import(rig, edit)
+            assert host_import(rig, as_given(narrow)) == wide + 1
+            before = state_files(rig)
+            refused = roll_back(world, wide)
+            assert status_reason(refused) == (403, "portal_widens"), path
+            answer = refused.json()
+            assert path in answer["subjects"], (path, answer["subjects"])
+            assert "through a rollback" in answer["error"] or "change " in answer["error"]
+            assert [step["do"] for step in answer["next"]] == ["export_policy", "import_policy"]
+            assert len(rig.app.actions) == 0
+            assert (state_files(rig), revision(rig)) == (before, wide + 1)
+        # At the confirm: prepared on revision 1, a narrowing (the head added the toolkit's
+        # POST), then read back as the wider policy the last row's import wrote.
+        head = host_import(rig, _slots)
+        held = roll_back(world, 1)
+        assert held.status_code == 200, held.text
+        wider = managed_.store.policy(head - 2)
+        assert wider is not None
+        real = read_revision
+        monkeypatch.setattr(
+            portal_app,
+            "read_revision",
+            lambda store, number: (real(store, number)[0], wider),  # type: ignore[index]
+        )
+        before = state_files(rig)
+        swapped = confirmed(world, held.json())
+        assert status_reason(swapped) == (409, "changed")
+        assert swapped.json()["now"][0][0] == "Refused (portal_widens)"
+        assert (state_files(rig), revision(rig)) == (before, head)
+
+
+def test_a_target_in_quarantine_is_refused(tmp_path: Path) -> None:
+    """H.3, FM-6: a kept revision that no longer verifies is a gap in the history and refused
+    ``revision_unreadable``, by its diff and by a rollback before any prompt; prepared while it
+    still verified, the confirm's dialog shows the refusal as its first row (G.7)."""
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+
+        def add(data: dict[str, Any]) -> None:
+            data["gateway"]["servers"]["notes"] |= entry([LIST, GET])
+
+        assert host_import(rig, add) == 2
+        held = roll_back(world, 1)
+        assert held.status_code == 200, held.text
+        first = rig.state / revision_file(1)
+        first.write_bytes(first.read_bytes().replace(b'"', b"'", 1))
+        before = state_files(rig)
+        refused = confirmed(world, held.json())
+        assert status_reason(refused) == (409, "changed")
+        assert refused.json()["now"][0][0] == "Refused (revision_unreadable)"
+        assert history(world)["revisions"][1] == {"revision": 1, "gap": True}
+        unreadable = world.page.fetch("GET", "/api/policy/revisions/1")
+        assert status_reason(unreadable) == (409, "revision_unreadable")
+        again = roll_back(world, 1)
+        assert status_reason(again) == (409, "revision_unreadable")
+        assert again.json()["error"] == (
+            "Revision 1 is in quarantine: it can't be read, so it can't be used."
+        )
+        assert "rows" not in again.json()
+        assert (state_files(rig), revision(rig)) == (before, 2)
+
+
+def included(*tools: Tool) -> Callable[[dict[str, Any]], None]:
+    """An edit that makes notes include list and ``tools``, as approve."""
+
+    def edit(data: dict[str, Any]) -> None:
+        data["gateway"]["servers"]["notes"] |= entry([LIST, *tools])
+
+    return edit
+
+
+def test_a_target_whose_parent_is_gone(tmp_path: Path) -> None:
+    """D.8, H.3, M.1: a rollback needs no diff. Revision 2's parent is in quarantine, so its
+    changes can't be shown (``revision_unreadable``, naming revision 1); it is still listed
+    whole in the history, which ``policy.js`` draws **Roll back** from, and rolling back to it
+    from revision 3 is planned and written."""
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+        assert (host_import(rig, included(GET)), host_import(rig, included(GET, OLD))) == (2, 3)
+        first = rig.state / revision_file(1)
+        first.write_bytes(first.read_bytes().replace(b'"', b"'", 1))
+        page = history(world)
+        assert [(e["revision"], e["gap"]) for e in page["revisions"]] == [
+            (3, False),
+            (2, False),
+            (1, True),
+        ]
+        unshown = world.page.fetch("GET", "/api/policy/revisions/2")
+        assert status_reason(unshown) == (409, "revision_unreadable")
+        assert unshown.json()["error"].startswith("Revision 1 is in quarantine")
+        held = roll_back(world, 2, base=page["head"])
+        assert held.status_code == 200, held.text
+        assert held.json()["summary"][0][1].startswith("4, from 3: the content of revision 2")
+        done = confirmed(world, held.json())
+        assert done.status_code == 200, done.text
+        assert revision(rig) == 4
+        assert head(rig)["tools"]["include"] == ["list", "get"]
+
+
+def test_a_rollback_on_a_moved_head(tmp_path: Path) -> None:
+    """G.7, N.2, Y8: a rollback prepared on revision 2 meets the host's import of revision 3 at
+    the confirm: ``409 changed``, its first row the head that moved, worded for the Policy page
+    ("press Roll back again"; it has no Save), then the same rollback planned on revision 3.
+    Prepared again on revision 2, before any prompt, it is ``policy_moved`` in the same words;
+    on revision 3, which the page shows once drawn again, it is written."""
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+        assert host_import(rig, included(GET)) == 2
+        held = roll_back(world, 1)
+        assert held.status_code == 200, held.text
+        assert host_import(rig, included(GET, OLD)) == 3
+        refused = confirmed(world, held.json())
+        assert status_reason(refused) == (409, "changed")
+        moved, *rest = refused.json()["now"]
+        assert moved[0] == "Revision"
+        assert moved[1].startswith("The policy moved to revision 3, saved ")
+        assert moved[1].endswith("press Roll back again to plan it on revision 3.")
+        assert "Save" not in moved[1]
+        assert rest[0][1].startswith("4, from 3: the content of revision 1")
+        assert revision(rig) == 3
+        again = roll_back(world, 1, base=2)
+        assert status_reason(again) == (409, "policy_moved")
+        assert again.json()["error"].endswith("press Roll back again to plan it on revision 3.")
+        assert history(world)["head"] == 3
+        done = confirmed(world, roll_back(world, 1, base=3).json())
+        assert done.status_code == 200, done.text
+        assert revision(rig) == 4
+        assert head(rig)["tools"]["include"] == ["list"]
+
+
+def test_a_400_row_plan_is_confirmed_whole(tmp_path: Path) -> None:
+    """Y9 (O.4, G.5 rule 5; 15a's deviation 14): a rollback whose plan has 400 rows (the
+    revision, one removal per server, and no restart) is confirmed in the portal with every row
+    shown, nothing cut; one row more is ``413 summary_too_large`` with the host's way, before any
+    prompt."""
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+
+        def servers(count: int) -> Callable[[dict[str, Any]], None]:
+            def edit(data: dict[str, Any]) -> None:
+                extra = data["gateway"]["servers"]
+                for name in [name for name in extra if name.startswith("s")]:
+                    del extra[name]
+                for index in range(count):
+                    extra[f"s{index:03d}"] = {"kind": "remote", "route": "notes"}
+
+            return edit
+
+        assert host_import(rig, servers(399)) == 2
+        too_long = roll_back(world, 1)
+        assert status_reason(too_long) == (413, "summary_too_large")
+        assert [step["do"] for step in too_long.json()["next"]] == [
+            "export_policy",
+            "import_policy",
+        ]
+        assert host_import(rig, servers(398)) == 3
+        held = roll_back(world, 1)
+        assert held.status_code == 200, held.text
+        summary = held.json()["summary"]
+        assert len(summary) == 400
+        assert summary[0][1].startswith("4, from 3: the content of revision 1")
+        assert [label for label, _ in summary[1:-1]] == [
+            f"gateway.servers.s{index:03d}" for index in range(398)
+        ]
+        assert summary[-1][0] == "No restart needed"
+        done = confirmed(world, held.json())
+        assert done.status_code == 200, done.text
+        assert revision(rig) == 4
+
+
+def test_a_declarative_policy_has_no_history(tmp_path: Path) -> None:
+    """M.2, M.3: in declarative mode the history, a diff and a rollback are
+    ``policy_not_managed``, and the view names no revision."""
+    with world_of(tmp_path, notes_entries(**entry([LIST]))) as world:
+        for path in ("/api/policy/revisions", "/api/policy/revisions/1"):
+            assert status_reason(world.page.fetch("GET", path)) == (409, "policy_not_managed")
+        assert status_reason(roll_back(world, 1, base=1)) == (409, "policy_not_managed")
+        view = world.page.fetch("GET", "/api/policy").json()
+        assert view["mode"] == "declarative"
+        assert "revision" not in view

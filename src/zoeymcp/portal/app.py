@@ -100,6 +100,18 @@ re-plan or the write meets that has rows (a head that moved, a planner rule) is 
 ``409 changed`` with them, the first naming the real reason (G.7, CR-3). A done job's way on is
 the managed one (``onboarding.managed_next``).
 
+The managed Policy page (M6 design H.1-H.4, M.1, M.2): ``GET /api/policy`` also names the head's
+revision, the one the gateway runs and the host's export command; ``GET /api/policy/revisions``
+pages the history, newest first, 50 at most, a revision in quarantine a gap; ``GET
+/api/policy/revisions/{revision}`` is its diff from its parent, or from ``?against=``, through
+the policy view's renderer (``portal/policydiffview.py``: no hidden value, Y13). Both read the
+store on the event loop, as the write does, never in a thread. **Roll back to this** is the
+``policy.rollback`` action, ``{base, revision}``: the target's policy carried forward on the head
+(H.4: the head's key generations, ``admin`` and pins), planned and written as a save is, so the
+planner refuses a target that brings back what the ratchet retired (``rollback_revives``) or any
+wider change (``portal_widens``), and a target in quarantine or pruned is
+``revision_unreadable`` or ``revision_unknown``, in the dialog at the confirm.
+
 The OAuth callback (C.7, H.6), ``GET /oauth/callback/<credential>``, is the one route that takes
 a cross-site navigation, for a credential whose ``redirect_uri`` is its callback address on this
 origin. A start for one sets the flow's binding cookie (``SameSite=Lax``, its ``Path`` the
@@ -152,7 +164,7 @@ from ..common.policy.callback import CALLBACK_PREFIX, callback_origin
 from ..common.policy.change import MoveToAllow, PolicyChange, apply, from_portal
 from ..common.policy.fields import URL_MAX
 from ..common.policy.plan import Reason as PlanReason
-from ..common.policy.plan import WriteKind, WritePlan
+from ..common.policy.plan import WriteKind, WritePlan, carry_forward
 from ..common.policy.ratchet import DefKey
 from ..common.policy.reviewchange import AllowRefused, definition_lines, listed
 from ..common.policy.schema import OAuth2Credential, split_scope
@@ -163,6 +175,10 @@ from ..vault.managed import (
     WriteRefused,
     Written,
     allow_pin,
+    diff_answer,
+    history_page,
+    policy_status,
+    read_revision,
     refused_answer,
     written_answer,
 )
@@ -181,6 +197,8 @@ from ..vault.onboarding import (
     server_host_port,
     tools_max,
 )
+from ..vault.policyseal import REVISION_MAX
+from ..vault.policystore import HISTORY_PAGE_MAX
 from ..vault.reportstore import (
     CopyUnavailable,
     NotRestartable,
@@ -218,7 +236,16 @@ from .limits import Bucket, InFlight, Sparse, Ticket
 from .passkeys import ALGORITHM_NAMES, Passkey, PasskeyError
 from .policyview import Source, saved
 from .policyview import view as policy_view
-from .refusals import Refusal, enrolment, issuer_changed, refusal, save_moved, secret
+from .refusals import (
+    ROLLBACK_MOVED,
+    SAVE_MOVED,
+    Refusal,
+    enrolment,
+    issuer_changed,
+    refusal,
+    save_moved,
+    secret,
+)
 from .refusals import login as login_refusal
 from .routes import (
     CALLBACK,
@@ -276,22 +303,38 @@ RESET_HINT: Final = "run zoeymcp setup-code --reset in the vault's container"
 SETUP_REFUSED_LOG_EVERY: Final = 60.0
 # A managed save's kinds (M6 design G.3, M.3): planned and run through the managed policy.
 MANAGED_KINDS: Final[tuple[WriteKind, ...]] = ("policy.save", "tool.repin", "tool.allow")
+# A rollback from the Policy page (M6 design H.3, M.3), planned and run the same way: the target
+# revision's policy carried forward on the head (H.4), never wider than the head (G.5 rule 2).
+ROLLBACK: Final[WriteKind] = "policy.rollback"
+# The history page's query (H.1, M.2): each at most once, both optional; a diff's (H.2).
+HISTORY_QUERY: Final = frozenset({"before", "limit"})
+DIFF_QUERY: Final = frozenset({"against"})
 # The refusals a managed save's dialog shows as rows when its confirm meets them (G.7, CR-3):
 # the commit section's policy_moved, and the planner's and the gate's, which a re-plan meets.
 # Every other one (saved_not_running, policy_write_failed, policy_not_running, a lowered
-# generation) is the vault's own, answered with its catalogued status and text (N.2).
+# generation) is the vault's own, answered with its catalogued status and text (N.2). A
+# rollback's target that went to quarantine or was pruned meanwhile carries its own row
+# (:meth:`PortalApp._rollback`).
 IN_THE_DIALOG: Final = (frozenset(get_args(PlanReason)) - {"generation_lowered"}) | {
     "policy_moved",
     "import_refused",
     "portal_env_ref",
     "route_reuses_credential",
 }
-# What a summary row that the save leaves a store entry unused says, shown first (G.7 row 7).
+# What a summary row that the save leaves a store entry unused says, shown first (G.7 row 7);
+# a rollback's row says it of the rollback (J6).
 UNUSED_LABEL: Final = "Delete this first (it needs its own passkey)"
 UNUSED_WORDS: Final = (
     "{name} is left unused: after this save it can't be revoked at the provider. Cancel, "
     "delete it on the Secrets page, then save again"
 )
+UNUSED_ROLLBACK: Final = (
+    "{name} is left unused: after this rollback it can't be revoked at the provider. Cancel, "
+    "delete it on the Secrets page, then roll back again"
+)
+# The Policy page's export command (M.1): managed_next's export step, which a save's refusal
+# offers as the other way ("Or export the policy"), on its own here.
+EXPORT_LABEL: Final = "Export the policy"
 # A move to allow from a server's page, as its change's title (J3); and its row when the head
 # no longer holds the tool included as approve at the pin the page showed (J.4).
 ALLOW_TITLE: Final = "allow {name} without asking"
@@ -951,6 +994,8 @@ class PortalApp:
             api.REVIEW_JOB: self._review_read,
             api.REVIEW_DIFF: self._review_diff,
             api.ATTENTION: self._attention,
+            api.REVISIONS: self._revisions,
+            api.REVISION: self._revision_diff,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -1340,10 +1385,11 @@ class PortalApp:
             ),
             "onboard.register": ActionKind(self._plan_register, self._run_register),
             "tool.clear": ActionKind(self._plan_clear, self._run_clear),
-            # M6 G.3, M.3: managed saves, through the managed policy's write path (G.6).
+            # M6 G.3, H.3, M.3: managed saves and rollbacks, through the managed policy's write
+            # path (G.6).
             **{
                 name: ActionKind(self._plan_write(name), self._run_write(name))
-                for name in MANAGED_KINDS
+                for name in (*MANAGED_KINDS, ROLLBACK)
             },
         }
 
@@ -1767,9 +1813,51 @@ class PortalApp:
         """The running policy, read-only: built from an allowlist of the schema's fields, every
         string shown, and no token, token hash, placeholder, account detail or recipient
         (``portal/policyview.py``). The portal can't change it: it is declarative (P9); in
-        managed mode the view names the revision it shows (M6 design A.4, G.10)."""
+        managed mode the view names the revision it shows (M6 design A.4, G.10), and beside it
+        the head's revision, which one the gateway runs (``applied``, ``pending`` or
+        ``unknown``, K.1), a revision saved and not running, and the host's export command
+        (M.1)."""
         header = None if self.policy_header is None else self.policy_header()
-        return Reply(policy_view(self._policy(), self.source, header=header))
+        answer = policy_view(self._policy(), self.source, header=header)
+        if self.managed is not None:
+            export = replace(managed_next()[1], label=EXPORT_LABEL)
+            answer |= policy_status(self.managed) | {"export": export.answer()}
+        return Reply(answer)
+
+    async def _revisions(self, call: Call) -> Reply | Refusal:
+        """H.1: ``?before=N&limit=N``, a page of history, newest first, at most
+        :data:`~..vault.policystore.HISTORY_PAGE_MAX`, and the next page's ``before`` (None at
+        the oldest kept revision); a revision in quarantine is a gap. Each entry is its header
+        as the page shows it, never a digest, with the host's reason shown."""
+        if self.managed is None:
+            return refusal("policy_not_managed")
+        query = _numbers(call.query, HISTORY_QUERY)
+        if isinstance(query, Refusal):
+            return query
+        limit = query.get("limit", HISTORY_PAGE_MAX)
+        if not 1 <= limit <= HISTORY_PAGE_MAX or query.get("before", 1) < 1:
+            return refusal("bad_body")
+        page = history_page(self.managed.store, query.get("before"), limit)
+        revisions = [_history_view(entry) for entry in page["revisions"]]
+        return Reply({"head": self.managed.revision, "revisions": revisions, "next": page["next"]})
+
+    async def _revision_diff(self, call: Call) -> Reply | Refusal:
+        """H.2: revision N's diff from its parent, or from ``?against=M``, every row through
+        the policy view's renderer (no hidden value, Y13); ``revision_unreadable`` or
+        ``revision_unknown`` for either side that isn't kept. ``head`` is the head's revision,
+        which the page offers no rollback to."""
+        if self.managed is None:
+            return refusal("policy_not_managed")
+        query = _numbers(call.query, DIFF_QUERY)
+        if isinstance(query, Refusal):
+            return query
+        against = query.get("against")
+        if against is not None and not 1 <= against <= REVISION_MAX:
+            return refusal("bad_body")
+        answer = diff_answer(self.managed.store, int(call.params["revision"]), against)
+        if isinstance(answer, Refusal):
+            return answer
+        return Reply({**answer, "head": self.managed.revision})
 
     async def _ledger_page(self, call: Call) -> Reply | Refusal:
         """J.5: a page of the vault's copy, newest first, ``?before=SEQ&limit=N``; with
@@ -2157,7 +2245,7 @@ class PortalApp:
                     save.kind,
                     "portal",
                     save.base,
-                    _candidate(save.change),
+                    _built(save),
                     author=author,
                     expected=expected,
                     evidence=save.evidence,
@@ -2179,13 +2267,16 @@ class PortalApp:
     def _save_of(self, kind: WriteKind, data: Mapping[str, Any], step: Step) -> _Save | Refusal:
         """A managed kind's data as a save (M.3): ``{draft, base}``, this session's live draft
         planned on that base; or for ``tool.allow`` from a server's page ``{base, server,
-        kind, name, pin}``, the move with the definition the vault holds for it (J.4).
+        kind, name, pin}``, the move with the definition the vault holds for it (J.4); or for
+        ``policy.rollback`` ``{base, revision}``, the target (:meth:`_rollback`).
         ``policy_not_managed`` in declarative mode."""
         if self.managed is None:
             return refusal("policy_not_managed")
         base = data["base"]
         if type(base) is not int or base < 1:
             return refusal("bad_body")
+        if kind == ROLLBACK:
+            return self._rollback(base, data["revision"])
         if kind == "tool.allow":
             given = frozenset(data) - {"base"}
             if given not in ALLOW_FORMS:
@@ -2238,6 +2329,20 @@ class PortalApp:
         change = PolicyChange(ALLOW_TITLE.format(name=op.name), (op,))
         return _Save("tool.allow", base, change, self._evidence(found), None, op.server)
 
+    def _rollback(self, base: int, number: object) -> _Save | Refusal:
+        """**Roll back to this** (H.3, J6): kept revision ``number``'s policy, the target the
+        planner checks the carry-forward against (H.4, rule 1); one in quarantine or pruned is
+        ``revision_unreadable`` or ``revision_unknown``, with its row for a confirm's dialog
+        (G.7), since it can go there between the prepare and the confirm."""
+        if type(number) is not int or not 1 <= number <= REVISION_MAX:
+            return refusal("bad_body")
+        read = read_revision(self._managed().store, number)
+        if isinstance(read, Refusal):
+            rows = [[f"Refused ({read.reason})", read.error]]
+            return replace(read, more=(("rows", rows),))
+        evidence = Evidence(target=read[1], target_revision=number)
+        return _Save(ROLLBACK, base, None, evidence)
+
     def _held(self, server: str) -> list[dict[str, dict[str, Any]]]:
         """The tools each review the vault holds for ``server`` lists, newest first (J.4)."""
         reports = () if self.reviews is None else self.reviews.held_reports(server)
@@ -2273,7 +2378,7 @@ class PortalApp:
         """``save`` planned on the head as the write will plan it (G.6 steps 1-5)."""
         try:
             planned = self._managed().plan(
-                save.kind, "portal", save.base, _candidate(save.change), evidence=save.evidence
+                save.kind, "portal", save.base, _built(save), evidence=save.evidence
             )
         except ValueError as exc:  # the change itself refused (ChangeRefused)
             return _change_refused(exc)
@@ -2303,16 +2408,18 @@ class PortalApp:
     ) -> Refusal:
         """A managed save's refusal in the portal's words (N.2), with ``rows`` for a confirm's
         dialog when it is one the dialog shows (G.7, CR-3, :data:`IN_THE_DIALOG`): a head that
-        moved is the revision row ("press Save again", OPS-18), then the plan the same save
-        (``again``) makes on the new head; any other names its reason and the paths or tools
-        it is about. A refusal whose way on is the host's (``portal_widens``,
-        ``summary_too_large``) carries the export and the import; a move with no reviewed
-        definition, a fresh review of its server."""
+        moved is the revision row ("press Save again", OPS-18, or for a rollback "press Roll back
+        again"), then the plan the same save (``again``) makes on the new head; any other names
+        its reason and the paths or tools it is about. A refusal whose way on is the host's
+        (``portal_widens``, ``summary_too_large``) carries the export and the import; a move
+        with no reviewed definition, a fresh review of its server."""
         if refused.reason == "policy_moved":
             header = self._managed().store.header
             number = refused.revision or 0
             said = f"revision {number}" if header is None else saved(header)
-            moved = save_moved(said=said, revision=number)
+            rollback = again is not None and again[0].kind == ROLLBACK
+            words = ROLLBACK_MOVED if rollback else SAVE_MOVED
+            moved = save_moved(said=said, revision=number, words=words)
             rows = [["Revision", moved.error]]
             if again is not None and number:
                 rows += self._replanned(again[0], number, again[1])
@@ -2355,8 +2462,9 @@ class PortalApp:
         label, value = rows[0]
         if header is not None:
             value += f" ({_saved_by(header, session)}: {planned.base} is the head)"
+        words = UNUSED_ROLLBACK if planned.kind == ROLLBACK else UNUSED_WORDS
         unused = [
-            (UNUSED_LABEL, UNUSED_WORDS.format(name=name))
+            (UNUSED_LABEL, words.format(name=name))
             for kind, name in rows[1:]
             if kind == "Left unused"
         ]
@@ -2953,6 +3061,42 @@ def _ledger_query(raw: bytes) -> tuple[str | None, int | None, int | None] | Ref
     return found.get("archive"), numbers[0], numbers[1]
 
 
+def _numbers(raw: bytes, allowed: frozenset[str]) -> dict[str, int] | Refusal:
+    """A query of numbers (the history's and a diff's, M6 design M.2): each of ``allowed`` at
+    most once and optional, as plain digits. Anything else is ``bad_body``."""
+    try:
+        pairs = parse_qsl(raw.decode("ascii"), keep_blank_values=True, strict_parsing=bool(raw))
+    except (UnicodeDecodeError, ValueError):
+        return refusal("bad_body")
+    found = dict(pairs)
+    if len(found) != len(pairs) or not found.keys() <= allowed:
+        return refusal("bad_body")
+    if not all(v.isascii() and v.isdigit() and len(v) <= 15 for v in found.values()):
+        return refusal("bad_body")
+    return {key: int(value) for key, value in found.items()}
+
+
+def _history_view(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A history entry as the Policy page shows it (H.1, J6): the revision, a gap for one in
+    quarantine, else what made it (the origin and kind), who and when as the policy view names
+    them (``saved``), its base, a rollback's target, an acknowledged restore's jump, and the
+    host's reason, shown."""
+    if entry.get("gap"):
+        return {"revision": entry["revision"], "gap": True}
+    reason = entry["reason"]
+    return {
+        "revision": entry["revision"],
+        "gap": False,
+        "saved_shown": saved(entry),
+        "origin": entry["origin"],
+        "kind": entry["kind"],
+        "base": entry["base"],
+        "target": entry["target"],
+        "jumped_from": entry["jumped_from"],
+        "reason_shown": None if reason is None else shown(reason, SUMMARY_LIMIT),
+    }
+
+
 def _journals(connectors: SmtpConnectors | None, policy: Policy) -> dict[str, list[dict[str, Any]]]:
     """Each connector's send journal records, for the join; one that can't be read is left
     out, as the socket's ``GET /ledger/reported`` leaves it."""
@@ -3296,11 +3440,12 @@ def _job_view(job: Job, mode: str = "declarative") -> dict[str, Any]:
 @dataclass(frozen=True)
 class _Save:
     """A managed save as the write path takes it: its kind, the head revision it was planned on,
-    the change, what the planner reads besides, its draft, and the server it is about."""
+    the change (none for a rollback, whose target is in ``evidence``), what the planner reads
+    besides, its draft, and the server it is about."""
 
     kind: WriteKind
     base: int
-    change: PolicyChange = field(repr=False)
+    change: PolicyChange | None = field(repr=False)
     evidence: Evidence = field(repr=False)
     draft: Draft | None = None
     server: str | None = None
@@ -3323,6 +3468,22 @@ def _candidate(change: PolicyChange) -> Callable[[Policy], Policy]:
         return apply(policy, change, managed=True)
 
     return candidate_of
+
+
+def _built(save: _Save) -> Callable[[Policy], Policy]:
+    """A save's candidate from a head: a rollback's target carried forward as the portal carries
+    it (H.4: the head's key generations, ``admin`` and pins, Y17), else the change
+    (:func:`_candidate`)."""
+    target = save.evidence.target
+    if save.change is not None:
+        return _candidate(save.change)
+    if target is None:
+        raise ValueError("a rollback names its target")
+
+    def carried(policy: Policy) -> Policy:
+        return carry_forward(policy, target)
+
+    return carried
 
 
 def _change_refused(exc: ValueError) -> WriteRefused:

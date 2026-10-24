@@ -90,6 +90,9 @@ KINDS: Final[dict[str, Kind]] = {
             frozenset({"base"}),
             frozenset({"server", "kind", "name", "pin", "draft"}),
         ),
+        # M6 H.3, M.3: a managed rollback, from the Policy page, to a kept revision, planned on
+        # the head revision the page showed.
+        Kind("policy.rollback", _DEFAULT_CAP, frozenset({"base", "revision"})),
     )
 }
 # tool.allow's two forms of data (M6 J.4, M.3): its optional keys come all from one.

@@ -349,6 +349,37 @@ view.
       approve in an earlier revision" row;
     - a second browser signed in on the same origin saves first: this browser's confirm shows
       "The policy moved to revision N ... press Save again", and nothing is written.
+21. **History, a diff and a rollback** (the Policy page in managed mode, M6). Item 20's vault
+    after its saves, the fake started with `--switch large --switch markup_echo`, and a client
+    added and then removed by two host imports, so the history has a client to bring back: stop
+    the vault, `zoeymcp policy export --state ./state > policy.yaml`, add under `gateway.clients`
+    a client `ci-runner` with a `token_sha256` (`zoeymcp client-token` prints one), `zoeymcp
+    policy import --state ./state - --yes --accept-widening --reason 'add ci-runner <b>x</b>' <
+    policy.yaml`, then remove it, import again, and start the vault (operations.md §34, "A
+    lockout, with and without a socket", gives the offline forms). In Chrome or Edge with the
+    Console open (no Trusted Types or Content Security Policy violation throughout), open
+    **Policy**. Pass:
+    - the page names the head's revision and which revision the gateway runs, and "Export the
+      policy" with its command, `docker compose exec` and `-T`; no text says to commit, reload or
+      generate; every revision but the head has **Roll back to revision N**;
+    - **History** lists every revision newest first, each with when, by whom (a passkey's
+      fingerprint, "the host (offline)", or the seed) and what made it, the import's reason with
+      its markup shown as text; **Show the changes** on the revision that moved `add` and
+      `slow` to allow lists those rows, each "wider", and on the seed lists the whole policy from
+      an empty one, the client's token hash only as `(set)`;
+    - **Roll back to revision N** on the revision before the moves to allow: the dialog's first
+      row reads "Revision M, from M-1: the content of revision N (by ..., ...: M-1 is the head)",
+      the moves undone are listed and no row ends "(wider)"; **Close** writes nothing (the
+      history is unchanged); again, and confirmed: `add` and `slow` are approve, the
+      history's newest revision is the rollback with its target, and the vault's log has
+      `step_up_confirmed` with `policy.rollback` and `policy_rolled_back` with `target`;
+    - **Roll back to revision N** on the revision that added `ci-runner`: refused before any
+      passkey prompt, "Rolling back to revision N brings back client ci-runner, removed in
+      revision M: only the host can, with zoeymcp policy rollback and --allow-revive.", and
+      nothing is written;
+    - **Roll back to revision N** on the revision with `add` and `slow` at allow, now wider than
+      the head: refused before any passkey prompt, "The portal can't widen ... through a
+      rollback", with the host's export and import, and nothing is written.
 
 ## D-66: the live OAuth test against a real provider
 

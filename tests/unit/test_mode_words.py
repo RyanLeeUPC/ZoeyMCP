@@ -5,8 +5,9 @@ fragment: every ``next`` list a managed answer carries, the refusal text of ever
 managed save meets, and ``index.html``'s static text outside its ``data-mode="declarative"``
 blocks; in declarative mode nothing says to save. ``index.html``'s six mode-bound texts and
 Generate are pairs of blocks, one per mode, which ``drift.js`` shows from the session's mode
-(BP-7). The repository's own files are read, so mutmut skips this file
-(``pytest_add_cli_args``).
+(BP-7); the Policy page's managed half (step 15b) is a block of managed mode's alone, and
+``policy.js``, which draws it, says nothing of declarative mode's. The repository's own files
+are read, so mutmut skips this file (``pytest_add_cli_args``).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from tests.unit.test_portal_static import code_of
 from tests.unit.test_portal_static import read as static
 from zoeymcp.common.policy import plan, restart
 from zoeymcp.portal import app as portal_app
-from zoeymcp.portal.refusals import CATALOGUE, SAVE_MOVED, refusal
+from zoeymcp.portal.refusals import CATALOGUE, ROLLBACK_MOVED, SAVE_MOVED, refusal
 from zoeymcp.vault import managed, onboarding
 from zoeymcp.vault.onboarding import NextStep, job_next, managed_next, saved_next
 
@@ -28,12 +29,15 @@ INDEX = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "st
 MANAGED_WORDS = re.compile(r"commit|fragment|reload|generate", re.IGNORECASE)
 DECLARATIVE_WORDS = re.compile(r"\bsav(e|ed|es|ing)\b", re.IGNORECASE)
 # The reasons a managed save can meet in the portal (N.2): the planner's, the write's, the
-# store's, a draft's, and the review's own refusals of the choices, in managed mode's words.
+# store's, a draft's, a rollback's target's (H.3), and the review's own refusals of the choices,
+# in managed mode's words.
 MANAGED_REASONS = (
     *typing.get_args(plan.Reason),
     *typing.get_args(managed.Reason),
     "policy_write_failed",
     "revision_out_of_range",
+    "revision_unreadable",
+    "revision_unknown",
     "draft_unknown",
     "save_invalid",
     "review_stale",
@@ -82,10 +86,14 @@ def steps_words(steps: typing.Iterable[NextStep]) -> list[str]:
 
 def test_index_html_says_each_modes_words() -> None:
     """CR-15: the four "declarative" sentences and the two that say to commit are each a pair,
-    and so is Generate, Save its managed half; in managed mode nothing shown says to commit,
-    reload, generate or make a fragment, and in declarative mode nothing says save."""
+    and so is Generate, Save its managed half; the Policy page's history and rollback (step 15b)
+    are managed mode's alone. In managed mode nothing shown says to commit, reload, generate or
+    make a fragment, and in declarative mode nothing says save."""
     found = texts()
-    assert found.blocks.count("managed") == found.blocks.count("declarative") == 7
+    assert found.blocks.count("declarative") == 7
+    assert found.blocks.count("managed") == 7 + 1
+    page = INDEX.read_bytes().decode("utf-8")
+    assert '<div id="policy-managed" data-mode="managed" hidden>' in page
     managed_shown = [text for mode, text in found.found if mode != "declarative"]
     declarative_shown = [text for mode, text in found.found if mode != "managed"]
     assert [t for t in managed_shown if MANAGED_WORDS.search(t)] == []
@@ -162,12 +170,13 @@ def test_managed_next_lists_say_save() -> None:
 
 def test_a_managed_saves_refusals_say_save() -> None:
     """Y25, OPS-18: every reason a managed save meets in the portal is catalogued and says no
-    commit, fragment, reload or generate; ``policy_moved`` is worded for a save; and the
-    review's ``diff_invalid`` is ``save_invalid`` in managed mode."""
+    commit, fragment, reload or generate; ``policy_moved`` is worded for a save, and for a
+    rollback (H.3); and the review's ``diff_invalid`` is ``save_invalid`` in managed mode."""
     for reason in MANAGED_REASONS:
         assert reason in CATALOGUE, reason
         assert not MANAGED_WORDS.search(CATALOGUE[reason].text), reason
     assert not MANAGED_WORDS.search(SAVE_MOVED)
+    assert not MANAGED_WORDS.search(ROLLBACK_MOVED)
     made = portal_app._saving(refusal("diff_invalid", detail="list is unknown"))
     assert (made.reason, made.error) == (
         "save_invalid",
@@ -176,3 +185,13 @@ def test_a_managed_saves_refusals_say_save() -> None:
     assert portal_app._saving(refusal("review_stale")).reason == "review_stale"
     # The declarative refusal a managed kind meets there says no save.
     assert not DECLARATIVE_WORDS.search(CATALOGUE["policy_not_managed"].text)
+
+
+def test_policy_js_says_managed_modes_words() -> None:
+    """Y25 (step 15b): policy.js draws the Policy page's managed half only, so no text it can
+    show says to commit, reload, generate or make a fragment."""
+    code = code_of(static("policy.js"))
+    literals = re.findall(r'"((?:[^"\\]|\\.)*)"', code)
+    assert "The head is revision " in literals
+    assert [text for text in literals if MANAGED_WORDS.search(text)] == []
+    assert 'if (view.mode !== "managed") {' in code

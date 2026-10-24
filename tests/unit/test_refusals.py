@@ -28,6 +28,7 @@ from zoeymcp.portal import passkeys, webauthn
 from zoeymcp.portal.refusals import (
     CATALOGUE,
     KEPT_IN_MEMORY,
+    ROLLBACK_MOVED,
     SAVE_MOVED,
     WEBAUTHN,
     Refusal,
@@ -478,6 +479,19 @@ def test_a_save_on_a_moved_head_says_save_again() -> None:
         "you planned this: press Save again to plan it on revision 19.",
     )
     assert SAVE_MOVED.count("{") == 2
+    assert not find_violations(made.error, max_chars=300, single_line=True, allow_tabs=False)
+
+
+def test_a_rollback_on_a_moved_head_says_roll_back_again() -> None:
+    """H.3, N.2: the Policy page has no Save, so a rollback's policy_moved says Roll back."""
+    made = save_moved(said="revision 19", revision=19, words=ROLLBACK_MOVED)
+    assert made == Refusal(
+        409,
+        "policy_moved",
+        "The policy moved to revision 19 since you planned this: press Roll back again to plan "
+        "it on revision 19.",
+    )
+    assert ROLLBACK_MOVED.count("{") == 2
     assert not find_violations(made.error, max_chars=300, single_line=True, allow_tabs=False)
 
 
