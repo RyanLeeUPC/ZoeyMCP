@@ -1104,7 +1104,7 @@ step "standard tier: a container on the compose network gets only the shell and 
 # on the operator's origin would send.
 sibling='
 import collections, http.client, json, sys
-from zoeymcp.portal.routes import ROUTES, STATIC
+from zoeymcp.portal.routes import PARAMS, ROUTES, STATIC
 def ask(method, path, body=None):
     headers = {"Host": "localhost:8081", "Origin": "http://localhost:8081",
                "Sec-Fetch-Site": "same-origin"}
@@ -1119,6 +1119,8 @@ def ask(method, path, body=None):
     connection.close()
     print(method, path, status)
     return status, text
+# A sample each parameter pattern accepts, so the route is matched and its session checked.
+samples = {name: "x" if pattern.fullmatch("x") else "1" for name, pattern in PARAMS.items()}
 problems = []
 for path in STATIC:
     if ask("GET", path)[0] != 200:
@@ -1136,7 +1138,7 @@ elif status != 429:
 for route in ROUTES:
     if route.path == "/api/login/begin":
         continue
-    path = route.path.format_map(collections.defaultdict(lambda: "x"))
+    path = route.path.format_map(collections.defaultdict(lambda: "x", samples))
     body = None
     if route.method == "POST":
         body = bodies.get(route.path, {key: "x" for key in route.body})
