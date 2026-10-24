@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import io
 import json
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -82,6 +83,12 @@ POLICY: dict[str, Any] = {
     "routes": [{"name": "notes", "placeholder": SENTINEL}],
 }
 RATCHET: dict[str, Any] = {"egress_key_floor": 1, "gateway_key_floor": 1}
+
+
+def plain_id(value: Any) -> str:
+    """A test ID pytest can find again by its node ID: escapes, line breaks and characters
+    outside ASCII in a ``repr`` make mutmut's rerun by ID fail ("not found")."""
+    return re.sub(r"[^A-Za-z0-9_.:=, -]+", "_", repr(value))[:60]
 
 
 def body(**changes: Any) -> bytes:
@@ -262,7 +269,7 @@ def test_two_bodies_of_one_policy_differ_by_their_salt() -> None:
         {"reason": "hidden \u202e text"},
         {"policy": {"big": "x" * REVISION_BODY_MAX}},
     ],
-    ids=lambda changes: repr(changes)[:40],
+    ids=plain_id,
 )
 def test_make_body_refuses_what_unseal_would(changes: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match=r"^a revision body is a 32-byte salt, a policy"):
@@ -648,7 +655,7 @@ def test_seal_checks_the_body_digest_and_the_nonce() -> None:
         {"nonce": b64(NONCE), "ciphertext": "AAA"},
         {"nonce": b64(NONCE), "ciphertext": 1},
     ],
-    ids=repr,
+    ids=plain_id,
 )
 def test_a_sealed_body_that_isnt_one_is_refused(sealed_body: Any) -> None:
     error = refused(forged(REVISION_CONTEXT, {**header(), "body": sealed_body}))
