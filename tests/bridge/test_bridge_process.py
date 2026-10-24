@@ -676,7 +676,7 @@ async def test_a_term_from_the_control_pipe_stops_it(short_dir: Path) -> None:
     words = argv(directory, options=["--control-fd", str(read)])
     with log.open("ab") as handle:
         popen = subprocess.Popen(  # noqa: S603 - our own interpreter and arguments
-            [sys.executable, "-c", LAUNCHER, "", "", "", *words],
+            [sys.executable, "-c", LAUNCHER, "", "", "", "", *words],
             env={**environment, TOKEN_ENV: HASH},
             stdout=handle,
             stderr=subprocess.STDOUT,

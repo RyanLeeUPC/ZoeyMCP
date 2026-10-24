@@ -64,8 +64,10 @@ rotation, a quarantine move and a prune) leaves no vault-side value of the polic
 token's hash, in a file in clear, a log line, a commit's header or the store's repr. A managed
 start (step 13b: the seed from ZOEYMCP_CONFIG with a literal client token, a changed source, the
 park and the resume) and a write through the managed holder leave none in a file, a log line,
-health's policy section, a start refusal or a write's answer. The saves, rollbacks, imports and
-exports the socket and the portal make join the sweep in the steps that build them.
+health's policy section, a start refusal or a write's answer. The host's offline seed and
+reseeds (step 13c) print, log and write none of the values a revision encrypts, nor a client token
+or its hash. The saves, rollbacks, imports and exports the socket and the portal make join the
+sweep in the steps that build them.
 """
 
 from __future__ import annotations
@@ -2336,3 +2338,72 @@ def test_a_managed_start_and_its_writes_show_no_policy_value(
         with pytest.raises(TypeError, match=r"refusing to log a secret"):
             logs.event("oops", holder=holder)
     asyncio.run(app.aclose())
+
+
+# What a revision encrypts (D.4) of the secret-heavy policy, by VAULT_SIDE's name: the host's own
+# commands print the policy's names (Y13), never these.
+POLICY_VALUES = (
+    "client token",
+    "placeholder",
+    "token header",
+    "forced query",
+    "basic username",
+    "smtp user",
+    "smtp to",
+    "extra param",
+    "authorize param",
+    "placeholder source",
+    "rule param",
+)
+
+
+def test_the_hosts_offline_seed_and_reseed_show_no_policy_value(
+    tmp_path: Path, log_lines: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host's offline forms (M6 design F.3, O.6, Y3, Y13, step 13c): the secret-heavy policy,
+    with its literal client token, seeded on a used volume with ``policy seed --state``, reseeded
+    planned against it with the client's token changed, then reseeded with ``--new-ratchet``. No
+    value a revision encrypts, nor either token or its hash, is in what the commands print, a
+    log line, or a file under the state directory, quarantine's included."""
+    from zoeymcp.cli import main as main_module
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "store.json").write_bytes(b"{}")  # a used volume (F.1)
+    document = secret_heavy_policy().model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    local = ("leak-route-bridge", "leak-route-socket")
+    document["routes"] = [route for route in document["routes"] if route["name"] not in local]
+    for name in ("srv-bridge", "srv-socket"):
+        del document["gateway"]["servers"][name]
+    document["gateway"]["clients"]["hashed"]["servers"] = ["srv-remote", "srv-toolkit"]
+    retokened = json.loads(json.dumps(document))
+    new_token = "leak-client-token-literal-0002"
+    retokened["gateway"]["clients"]["literal"]["token"] = new_token
+    monkeypatch.setenv(
+        "ZOEYMCP_MASTER_KEY", base64.urlsafe_b64encode(bytes(range(9, 41))).decode().rstrip("=")
+    )
+    monkeypatch.delenv("ZOEYMCP_MASTER_KEY_PREVIOUS", raising=False)
+    monkeypatch.setenv("LEAK_REF_REFRESH", "v")
+    monkeypatch.setenv("LEAK_REF_Q", "v")
+    monkeypatch.setattr(main_module, "running_as_root", lambda: False)
+    printed = []
+    reseed = ["policy", "import", "--from-env", "--state", str(state), "--reseed", "--yes"]
+    for argv, source in (
+        (["policy", "seed", "--state", str(state), "--yes"], document),
+        (reseed, retokened),
+        ([*reseed, "--new-ratchet"], document),
+    ):
+        monkeypatch.setenv("ZOEYMCP_CONFIG", json.dumps(source))
+        err = io.StringIO()
+        assert main(argv, stdin=io.StringIO(), out=io.StringIO(), err=err) == 0, err.getvalue()
+        printed.append(err.getvalue())
+    assert "  Forgets: 1 retired client token(s)" in printed[2]
+    events = [json.loads(line)["event"] for line in log_lines.getvalue().splitlines()]
+    assert events.count("policy_imported") == 2
+    assert "policy_seeded" in events
+    files = [path.read_bytes() for path in state.rglob("*") if path.is_file()]
+    assert len(list((state / "policy" / "quarantine").iterdir())) == 4
+    shown = [*files, log_lines.getvalue().encode(), *(text.encode() for text in printed)]
+    values = [VAULT_SIDE[name] for name in POLICY_VALUES]
+    for value in [*values, hash_token(LITERAL_TOKEN), new_token, hash_token(new_token)]:
+        assert not any(value.encode() in text for text in shown), value

@@ -588,6 +588,12 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         # M6's N.2: a managed write the policy store didn't make (vault/policystore.py).
         "policy_write_failed": Entry(500, "The revision couldn't be written; nothing changed."),
         "revision_out_of_range": Entry(400, "A revision can't go above 9,999,999,999."),
+        "reseed_incomplete": Entry(
+            500,
+            "The reseed failed and couldn't put the old store back, so the vault won't start "
+            "({detail}). Put each file named back, then run the reseed again; if the old anchor "
+            "can't be put back, run it with --new-ratchet.",
+        ),
         # M6's G.6: a managed write its one synchronous section refused (vault/managed.py).
         "policy_not_running": Entry(
             409,
@@ -607,6 +613,36 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             500,
             "Saved as revision {revision}, but the vault couldn't apply it: send SIGHUP to the "
             "vault or restart it.",
+        ),
+        # M6's F.3: the host's offline seed and reseed, with the vault stopped (cli/policy.py).
+        "state_as_root": Entry(
+            400,
+            "This command won't run as root: the vault's uid couldn't read what it writes. Run it "
+            "as the vault's uid: add --user 10001:10001.",
+        ),
+        "state_locked": Entry(
+            409,
+            "The state directory is in use: stop the vault first ({command}), then run this again.",
+        ),
+        "seed_declarative": Entry(
+            400,
+            "The policy given says mode: declarative, and a seed is managed mode's first "
+            "revision: set mode: managed, check it, then seed.",
+        ),
+        "import_declarative": Entry(
+            400,
+            "An import is a managed revision; to go declarative, put an export made with --mode "
+            "declarative in ZOEYMCP_CONFIG.",
+        ),
+        "policy_store_present": Entry(
+            409,
+            "The state directory {state} already holds a policy store or its anchor: replace it "
+            "with zoeymcp policy import --state {state} --reseed.",
+        ),
+        "reseed_needs_new_ratchet": Entry(
+            409,
+            "The old policy head doesn't verify ({detail}), so there is no ratchet to plan the "
+            "reseed against: add --new-ratchet, which forgets what the old store retired.",
         ),
     }
 )

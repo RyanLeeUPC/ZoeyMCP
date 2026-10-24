@@ -118,11 +118,17 @@ class StartupError(Exception):
     """The vault can't start; the message says why and is safe to print."""
 
 
+class StateLocked(StartupError):
+    """Another process holds the state directory's lock: a running vault, or a host command
+    with ``--state`` (M6 design F.3's ``state_locked``)."""
+
+
 def acquire_state_lock(state_dir: Path) -> int | None:
     """Take ``<state>/vault.lock``, so only one vault uses the state directory.
 
-    Returns the lock's file descriptor. It is never closed, so the lock lasts as long as the
-    process. A held lock and a filesystem without locks are refused with different messages.
+    Returns the lock's file descriptor. The vault never closes it, so the lock lasts as long as
+    the process. A held lock (:class:`StateLocked`) and a filesystem without locks are refused
+    with different messages.
     Windows has no ``flock``: there the lock is skipped (development only), with a log line, and
     ``None`` is returned.
     """
@@ -137,7 +143,7 @@ def acquire_state_lock(state_dir: Path) -> int | None:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             os.close(fd)
-            raise StartupError(f"another vault is using this state directory ({path})") from exc
+            raise StateLocked(f"another vault is using this state directory ({path})") from exc
         except OSError as exc:
             # No lock support (ENOLCK, EOPNOTSUPP), as on some network filesystems.
             os.close(fd)
@@ -383,7 +389,7 @@ def start_policy(
         if isinstance(decision, policystart.Seed):
             return _seed(source, store, state_dir, environ)
         assert isinstance(found, Ok)  # noqa: S101 - a parked head resumes
-        floor = _gateway_key_state(state_dir, keys, previous)
+        floor = gateway_key_state(state_dir, keys, previous)
         return _resume(source, store, found, environ, bridges, floor)
     assert isinstance(found, Ok)  # noqa: S101 - the head runs
     try:
@@ -434,13 +440,14 @@ def _declarative(
     return _Start(policy, store if known else None)
 
 
-def _gateway_key_state(
+def gateway_key_state(
     state_dir: Path, keys: KeySet, previous: KeySet | None
 ) -> gatewaykeys.State | None:
-    """The gateway-key state as :meth:`GatewayKeys.load` reads it, for a resume to refuse a
-    lower generation before any policy file is written (G-4, G.6 step 5); None when there is
-    none, or when it can't be read, which the load after refuses with its own text. A start's
-    seed never meets one: the file makes the volume used (F.1, ``policy_seed_needs_host``)."""
+    """The gateway-key state as :meth:`GatewayKeys.load` reads it, for a resume, or the host's
+    offline seed and reseed (``cli/policy.py``, F.3), to refuse a lower generation before any
+    policy file is written (G-4, G.6 step 5); None when there is none, or when it can't be read,
+    which the vault's load refuses with its own text. A start's seed never meets one: the file
+    makes the volume used (F.1, ``policy_seed_needs_host``)."""
     try:
         data = (state_dir / gatewaykeys.STATE_FILE).read_bytes()
     except OSError:

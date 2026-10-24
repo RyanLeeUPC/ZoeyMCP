@@ -203,6 +203,7 @@ def test_the_constants() -> None:
         "policy.acknowledge",
     } == KINDS
     assert {"socket", "offline", "source"} == VIAS
+    assert policyseal.SEED_AUTHORS == ({"by": "seed"}, {"by": "host", "via": "offline"})
     assert set(header()) == HEADER_FIELDS
     assert HEADER_FIELDS | {"body", "key_id", "mac"} == REVISION_FIELDS
     assert {"nonce", "ciphertext"} == policyseal.SEALED_FIELDS
@@ -568,9 +569,12 @@ BAD_HEADERS: list[dict[str, Any]] = [
         for origin in sorted(ORIGINS)
         for kind in sorted(KINDS - ORIGIN_KINDS[origin])
     ),
-    # Only the seed is the vault's own, and only as revision 1 (F.3).
+    # Only the seed is the vault's own, and only as revision 1; the host seeds only offline (F.3).
     {"author": {"by": "seed"}},
     {**form("seed"), "author": {"by": "host", "via": "socket"}},
+    {**form("seed"), "author": {"by": "host", "via": "source"}},
+    {**form("seed"), "author": {"by": "passkey", "fingerprint": FINGERPRINT}},
+    {**form("seed"), "author": {"by": "host", "via": "offline"}, "revision": 2, "parent": PARENT},
     {**form("seed"), "revision": 17, "parent": PARENT, "base": 16},
     {"body_digest": "sha256:" + "0" * 63},
 ]
@@ -611,6 +615,8 @@ def test_a_header_with_another_field_is_refused() -> None:
             for kind in sorted(ORIGIN_KINDS[origin])
         ),
         *({"author": {"by": "host", "via": via}} for via in sorted(VIAS)),
+        # policy seed --state on a used volume (F.3).
+        {**form("seed"), "author": {"by": "host", "via": "offline"}},
     ],
     ids=repr,
 )

@@ -19,6 +19,7 @@ from typing import get_args
 
 import pytest
 
+from zoeymcp.cli import policy as policy_cli
 from zoeymcp.common import reviewreport
 from zoeymcp.common.policy import change, plan
 from zoeymcp.common.policy.ratchet import RATCHET_MAX
@@ -223,8 +224,9 @@ PLAN = {
     "summary_too_large": 413,
     "no_change": 400,
 }
-# M6's N.2: a managed write the policy store didn't make (vault/policystore.py, step 13a).
-STORE = {"policy_write_failed": 500, "revision_out_of_range": 400}
+# M6's N.2: a managed write or a reseed the policy store didn't make (vault/policystore.py,
+# steps 13a and 13c).
+STORE = {"policy_write_failed": 500, "revision_out_of_range": 400, "reseed_incomplete": 500}
 # A managed write's own refusals (M6 design G.6, N.2; vault/managed.py), changed and
 # generation_lowered among them, catalogued already.
 MANAGED = {
@@ -233,6 +235,16 @@ MANAGED = {
     "plan_changed": 409,
     "import_refused": 400,
     "saved_not_running": 500,
+}
+# The host's offline seed and reseed (M6 design F.3, N.2; cli/policy.py, step 13c);
+# import_refused and generation_lowered among them, catalogued already.
+OFFLINE = {
+    "state_as_root": 400,
+    "state_locked": 409,
+    "seed_declarative": 400,
+    "import_declarative": 400,
+    "policy_store_present": 409,
+    "reseed_needs_new_ratchet": 409,
 }
 
 # M.2's quoted texts, exactly.
@@ -328,6 +340,10 @@ FIELDS = {
     "policy_moved": {"revision"},
     "import_refused": {"detail"},
     "saved_not_running": {"revision"},
+    "state_locked": {"command"},
+    "policy_store_present": {"state"},
+    "reseed_needs_new_ratchet": {"detail"},
+    "reseed_incomplete": {"detail"},
 }
 
 
@@ -375,7 +391,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED
+    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -535,8 +551,26 @@ def test_every_managed_write_reason_is_catalogued() -> None:
     assert found <= set(CATALOGUE)
 
 
+def test_every_offline_reason_is_catalogued() -> None:
+    """M6 N.2: the scan widens to the host's offline commands' refusals (F.3), each a literal of
+    their Reason type; the gate's and the generation's pass through by their own reasons, and
+    the planner's and the store's by theirs."""
+    found = literal_reasons(policy_cli, "OfflineRefused")
+    assert found == set(get_args(policy_cli.Reason)) | {"import_refused", "generation_lowered"}
+    assert set(get_args(policy_cli.Reason)) == set(OFFLINE)
+    assert found <= set(CATALOGUE)
+    assert set(policy_cli.GRANT_FLAGS) <= set(get_args(plan.Reason))
+
+
+def test_the_offline_texts_name_the_vaults_uid() -> None:
+    assert "--user 10001:10001." in CATALOGUE["state_as_root"].text
+    assert "--reseed." in CATALOGUE["policy_store_present"].text
+    assert "--new-ratchet" in CATALOGUE["reseed_needs_new_ratchet"].text
+
+
 def test_the_store_texts_name_its_limits() -> None:
     assert f"above {REVISION_MAX:,}." in CATALOGUE["revision_out_of_range"].text
+    assert "--new-ratchet." in CATALOGUE["reseed_incomplete"].text
 
 
 def test_every_onboarding_reason_is_catalogued() -> None:

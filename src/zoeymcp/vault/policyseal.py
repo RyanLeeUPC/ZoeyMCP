@@ -99,6 +99,8 @@ ORIGIN_KINDS: Final[Mapping[str, frozenset[str]]] = {
 }
 # How a host write came: over the admin socket, offline with --state, or a resume's source (F.4).
 VIAS: Final = frozenset({"socket", "offline", "source"})
+# Who writes a seed: the vault at a fresh volume's start, or the host's policy seed --state (F.3).
+SEED_AUTHORS: Final = ({"by": "seed"}, {"by": "host", "via": "offline"})
 
 HEADER_FIELDS: Final = frozenset(
     {
@@ -268,9 +270,12 @@ def _header(header: Mapping[str, Any]) -> bool:
         return False
     if not (isinstance(kind, str) and kind in ORIGIN_KINDS[origin]):
         return False
-    # The vault writes the seed itself, as revision 1 on a fresh volume, and nothing else (F.3).
+    # The seed is revision 1, written by the vault itself on a fresh volume or by the host offline
+    # on a used one (F.3); nothing else is the vault's own.
     seed = origin == "seed"
-    if (header["author"] == {"by": "seed"}) != seed or (seed and revision != 1):
+    if header["author"] == {"by": "seed"} and not seed:
+        return False
+    if seed and (revision != 1 or header["author"] not in SEED_AUTHORS):
         return False
     # base, target and jumped_from each name an earlier revision.
     earlier = (header[name] for name in ("base", "target", "jumped_from"))

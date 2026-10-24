@@ -2279,11 +2279,18 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 400 | `no_change` | Nothing would change. |
 | 500 | `policy_write_failed` | The revision couldn't be written; nothing changed. |
 | 400 | `revision_out_of_range` | A revision can't go above 9,999,999,999. |
+| 500 | `reseed_incomplete` | The reseed failed and couldn't put the old store back, so the vault won't start (`<detail>`). Put each file named back, then run the reseed again; if the old anchor can't be put back, run it with --new-ratchet. |
 | 409 | `policy_not_running` | Revision `<revision>` is saved but not running: send SIGHUP to the vault or restart it, then save again. |
 | 409 | `policy_moved` | The policy moved to revision `<revision>` since you started: plan your change again on revision `<revision>`. |
 | 409 | `plan_changed` | The plan changed since you read it: plan the change again and read it first. |
 | 400 | `import_refused` | The policy is refused: `<detail>`. |
 | 500 | `saved_not_running` | Saved as revision `<revision>`, but the vault couldn't apply it: send SIGHUP to the vault or restart it. |
+| 400 | `state_as_root` | This command won't run as root: the vault's uid couldn't read what it writes. Run it as the vault's uid: add --user 10001:10001. |
+| 409 | `state_locked` | The state directory is in use: stop the vault first (`<command>`), then run this again. |
+| 400 | `seed_declarative` | The policy given says mode: declarative, and a seed is managed mode's first revision: set mode: managed, check it, then seed. |
+| 400 | `import_declarative` | An import is a managed revision; to go declarative, put an export made with --mode declarative in ZOEYMCP_CONFIG. |
+| 409 | `policy_store_present` | The state directory `<state>` already holds a policy store or its anchor: replace it with zoeymcp policy import --state `<state>` --reseed. |
+| 409 | `reseed_needs_new_ratchet` | The old policy head doesn't verify (`<detail>`), so there is no ratchet to plan the reseed against: add --new-ratchet, which forgets what the old store retired. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |
@@ -3520,6 +3527,54 @@ stopped: keep an export (`zoeymcp policy export`) somewhere safe, since it holds
 secrets as the store does. Its last resort, `--reseed --from-env`, takes your compose policy as it
 is now, usually older than the head. The vault never falls back to the seed by itself.
 
+### Seeding and reseeding with the vault stopped
+
+Both commands run in a one-off container of the vault's service, with the vault stopped: they take
+the lock a running vault holds, and while it runs they refuse with "The state directory is in use:
+stop the vault first", naming the stop in your own commands. They need the vault's master key,
+which the service has, and refuse to run as root, since the vault's uid couldn't read what they
+wrote: in the standard tier add `--user 10001:10001` after `--no-deps`. Each checks the policy as
+the vault would, with the service's environment, refuses a `gateway_key_generation` below the one
+`gateway-key.json` holds before it writes anything, prints what it will write to stderr and asks
+`[y/N]`, unless `--yes`. A policy piped on standard input leaves no answer to read: without `--yes`
+the plan is printed and nothing is written, so run it once to read the plan, then again with
+`--yes`:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml stop vault
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault policy import --state /state --reseed - < policy-export.yaml
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault policy import --state /state --reseed --yes - < policy-export.yaml
+docker compose -f deploy/compose.hardened.yaml up -d vault
+```
+
+**`policy seed --state /state [--config FILE|-]`** seeds revision 1 on a volume the vault won't seed
+by itself (the guard above), from `ZOEYMCP_CONFIG` unless `--config` names another. It shows the
+clients, routes and servers, the `env:` names the policy allows and how many literal client tokens
+it writes as their hash, and records the host as the seed's author (`policy_seeded ...
+via=offline`). With a store or its anchor present it refuses and names the reseed.
+
+**`policy import --state /state --reseed FILE|-`** (or `--reseed --from-env`, your compose policy)
+replaces the store:
+
+- when the old head verifies, the reseed is planned against it and what it retired, as a host
+  import: the plan names the revisions it undoes (`Undoes: revisions 13..24`), each key generation
+  against its floor, and every change. Bringing back a client's token, a caller's placeholder or a
+  pin the store retired, or a new `env:` name or a new place one is sent, is refused until you name
+  it: `--allow-revive client:<name>` (or `caller:<route>/<index>`, `pin:<server>/<kind>/<name>`),
+  `--allow-env <NAME>`;
+- `--new-ratchet` starts instead from the policy's own record of what may only move forward, and
+  lists what it forgets. It is the only way when the old head doesn't verify, and the way out of
+  `ratchet_full`. While the old head verifies, it never lowers a key generation below that head's
+  floors; when it doesn't, only the gateway key generation is checked, against
+  `gateway-key.json`.
+
+The old head and every revision move to `/state/policy/quarantine/` (`head.reseeded.json`,
+`<n>.reseeded.json`), never deleted, and the new revision is numbered one above any the volume
+shows, so no number is used twice. The deployment ID is kept while the anchor verifies, and a new
+one is made when it doesn't. `--reason TEXT` is kept with the revision. A reseed that fails before
+its new head is written puts the old store back as it was; if even that fails, it says which files
+are still in quarantine (`reseed_incomplete`).
+
 ### Upgrading to M6
 
 A declarative deployment keeps working as before: nothing is written to `/state/policy`, and the
@@ -3595,7 +3650,7 @@ Its log lines:
 | `policy_anchor_write_failed` | `revision`, `error_type`: the anchor wasn't written (warning) |
 | `policy_housekeeping_failed` | `action` (`quarantine`, `prune`, `rekey` or `remove`), `error_type`, and `revision` for a quarantine or a prune: the next start tries again (warning) |
 | `master_key_previous_same` | `key_id`: `ZOEYMCP_MASTER_KEY_PREVIOUS` is the current key again, and is ignored (warning) |
-| `policy_seeded` | `revision` (1), `deployment` (8 characters), `tokens_hashed` (literal client tokens written as their hash), `via` (`start`) |
+| `policy_seeded` | `revision` (1), `deployment` (8 characters), `tokens_hashed` (literal client tokens written as their hash), `via` (`start`, or `offline` for `policy seed --state`) |
 | `policy_head` | `revision`, `digest` and `deployment` (8 characters each), `write_kind` (how the head was written): at every managed start |
 | `policy_seed_ignored` | `revision`, `reason` (`changed`, `unreadable` or `fails_check`): the policy given is ignored (warning) |
 | `policy_store_parked` | `revision`: a declarative start parked the store (warning); critical with `revived` and `names` when the file brings back what the store retired |
@@ -3603,6 +3658,7 @@ Its log lines:
 | `policy_resumed` | `revision`, `parked_at`, `revived` and, above 0, `names` (warning then): a managed start resumed a parked store |
 | `policy_refused` | `reason`, and `file` or `revision`: a start refused over the store or its head (critical) |
 | `policy_saved`, `policy_imported`, `policy_rolled_back`, `policy_acknowledged` | `revision`, `write_kind`, `origin`, `author` (a passkey's fingerprint, 8 characters, or `host`), `base`, `digest` (8), `effects` (what needs a restart or a step), and `target` for a rollback |
+| `policy_imported` (a reseed) | `revision`, `write_kind` (`policy.reseed`), `origin` (`reseed`), `author` (`host`), `base` (the old head it was planned against, or none), `digest` and `deployment` (8 characters each), `effects` (none), `reseed` (true), `new_ratchet`, `from_env` |
 | `tool_allowed`, `tool_repinned` | `server`, `def_kind`, `name`, `revision`; `tool_allowed` also `kept` for an `allow` tool kept through a re-pin: one line per tool, whatever the change |
 | `policy_not_installed` | `revision`, `reason`: a saved revision couldn't be applied, and the previous one runs (critical) |
 | `reload_ok` | in managed mode `source` (`head`), `revision`, `installed` |

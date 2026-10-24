@@ -269,7 +269,7 @@ view.
 
     Start a vault with the setup's `portal.yaml` through `tests/acceptance/procs.py`'s launcher,
     which trusts the CA and installs the name map (`python -c "$LAUNCHER" onboard-check/ca.pem
-    onboard-check/hooks.json "" vault --config portal.yaml ...`, `LAUNCHER` printed by
+    onboard-check/hooks.json "" "" vault --config portal.yaml ...`, `LAUNCHER` printed by
     `python -c 'from tests.acceptance.procs import LAUNCHER; print(LAUNCHER)'`), and set up a
     passkey. Add `https://mcp.notes.example:9444/mcp` by URL, "This server is on my network"
     unticked, with no client ID. Make fragment 1, then choose **Copy** and paste into a text

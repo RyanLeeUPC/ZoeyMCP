@@ -2,7 +2,9 @@
 the commit's order and what each failed step leaves (FM-4, FM-30), the seed's anchor at 0 first
 (FM-25), retention (D.8), the start's housekeeping (rows 5, 12-16: temporaries, quarantine moves,
 strays, prune leftovers, a stale anchor), the master-key rotation's order, a rotation cut short
-(FM-3) and the retired key (T-13), the park (F.4), the history lookup behind the planner's
+(FM-3) and the retired key (T-13), the park (F.4), the host's offline seed of a used volume and
+its reseed (F.3: the old store set aside, the anchor first, a number never used before, Y4), the
+history lookup behind the planner's
 "removed in revision M", and a byte search of every file the store writes for the values a
 revision encrypts (Y3).
 
@@ -212,9 +214,9 @@ def test_the_seed_writes_the_anchor_at_zero_before_revision_one(
     reopened = fresh(state)
     assert ok(reopened).revision == 1
     assert reopened.seed_digest == SEED
-    with pytest.raises(ValueError, match="only a fresh store is seeded"):
+    with pytest.raises(ValueError, match="only a store with nothing in it is seeded"):
         store.seed(POLICY, ratchet=initial(POLICY), seed_digest=SEED)
-    with pytest.raises(ValueError, match="only a fresh store is seeded"):
+    with pytest.raises(ValueError, match="only a store with nothing in it is seeded"):
         reopened.seed(POLICY, ratchet=initial(POLICY), seed_digest=SEED)
 
 
@@ -672,7 +674,7 @@ def test_a_refused_store_is_left_as_it_is(state: Path, seams: list[tuple[str, st
         refused.commit(plan_on(store), author=PASSKEY)
     with pytest.raises(ValueError, match="no head"):
         refused.park()
-    with pytest.raises(ValueError, match="only a fresh store"):
+    with pytest.raises(ValueError, match="only a store with nothing in it"):
         refused.seed(POLICY, ratchet=initial(POLICY), seed_digest=SEED)
 
 
@@ -858,6 +860,235 @@ def test_the_park_writes_highest_and_parked_as_the_head(
     assert stale.anchor_dirty is False
     parked = ok(fresh(state))
     assert (parked.parked, parked.anchor_stale) == (2, False)
+
+
+# --- the host's offline seed and reseed (F.3) ---------------------------------------------------
+
+
+def test_the_host_seeds_a_used_volume(state: Path) -> None:
+    """F.3, Y18: a used volume with no store is the host's to seed (``policy seed --state``), as
+    revision 1 by the host offline; the vault's own seed stays by the seed, and the store refuses
+    it there too, writing nothing (D-130's backstop)."""
+    (state / "store.json").write_bytes(b"{}")
+    store = fresh(state)
+    assert isinstance(store.verdict, Refused)
+    assert store.verdict.reason == "policy_seed_needs_host"
+    for author in ({}, {"author": policystore.SEED_AUTHOR}, {"author": SOCKET}):
+        with pytest.raises(ValueError, match="only a store with nothing in it is seeded"):
+            store.seed(POLICY, ratchet=initial(POLICY), seed_digest=SEED, **author)
+    assert sorted(path.name for path in state.iterdir()) == ["store.json"]
+    committed = store.seed(
+        POLICY, ratchet=initial(POLICY), seed_digest=SEED, author=policystore.OFFLINE
+    )
+    assert (committed.revision, committed.header["origin"]) == (1, "seed")
+    assert committed.header["author"] == {"by": "host", "via": "offline"}
+    reopened = ok(fresh(state))
+    assert reopened.top.header["author"] == {"by": "host", "via": "offline"}
+    assert dict(policystore.SEED_AUTHOR) == {"by": "seed"}
+
+
+def test_a_reseed_sets_the_old_store_aside(
+    state: Path, seams: list[tuple[str, str]], log_buffer: io.StringIO
+) -> None:
+    """F.3: the old head and revisions move to quarantine, never deleted; the anchor is written
+    first, under the same deployment, then D.9's steps write the revision one above the highest,
+    with no parent, as its own oldest; the next start runs it."""
+    store = seeded(state)
+    saved(store, 2)
+    deployment = anchor_on_disk(state).deployment
+    reopened = fresh(state)
+    assert reopened.reseed_revision == 4
+    seams.clear()
+    committed = reopened.reseed(POLICY, ratchet=initial(POLICY), seed_digest=FROM_ENV, base=3)
+    assert seams == [
+        ("move", "head.json"),
+        ("move", name(1)),
+        ("move", name(2)),
+        ("move", name(3)),
+        ("write_anchor", "policy-anchor.json"),
+        ("write_revision", name(4)),
+        ("write_head", "head.json"),
+        ("write_anchor", "policy-anchor.json"),
+    ]
+    header = committed.header
+    assert (committed.revision, header["origin"], header["kind"]) == (4, "reseed", "policy.reseed")
+    assert (header["parent"], header["base"], header["author"]) == (
+        None,
+        3,
+        {"by": "host", "via": "offline"},
+    )
+    head = head_on_disk(state)
+    assert (head.revision, head.oldest, head.oldest_parent, head.deployment) == (
+        4,
+        4,
+        None,
+        deployment,
+    )
+    assert (anchor_on_disk(state).highest, reopened.kept) == (4, (4,))
+    quarantine = sorted(path.name for path in (state / "policy" / "quarantine").iterdir())
+    assert quarantine == [f"{n}.reseeded.json" for n in (1, 2, 3)] + ["head.reseeded.json"]
+    again = ok(fresh(state))
+    assert (again.revision, again.kept, again.seed_digest) == (4, (4,), FROM_ENV)
+    assert events(log_buffer) == []
+    # The next reseed counts what quarantine holds too (Y4): never 4 again.
+    (state / "policy" / "quarantine" / "9.unreadable.json").write_bytes(b"{}")
+    assert fresh(state).reseed_revision == 10
+
+
+def test_a_reseed_without_a_trusted_anchor_is_a_new_deployment(state: Path) -> None:
+    """F.3: an anchor that doesn't verify, or is under its own retired key, keeps nothing: the
+    reseed makes a new deployment, numbered above every revision file still there (Y4)."""
+    store = seeded(state)
+    saved(store, 1)
+    deployment = anchor_on_disk(state).deployment
+    (state / "policy-anchor.json").write_bytes(b"x")
+    refused = fresh(state)
+    assert refused.trusted_anchor is None
+    assert refused.reseed_revision == 3
+    committed = refused.reseed(POLICY, ratchet=initial(POLICY), seed_digest=SEED)
+    assert committed.revision == 3
+    assert committed.header["base"] is None
+    assert anchor_on_disk(state).deployment not in (deployment, "")
+    assert ok(fresh(state)).revision == 3
+    anchor = anchor_on_disk(state)
+    retired = Anchor(anchor.deployment, 3, None, KEYS.key_id, KEYS.key_id)
+    (state / "policy-anchor.json").write_bytes(seal_anchor(retired, KEYS))
+    assert fresh(state).trusted_anchor is None
+
+
+def test_a_reseed_the_seal_refuses_touches_nothing(
+    state: Path, seams: list[tuple[str, str]]
+) -> None:
+    """The revision is sealed before anything moves: a body ``policyseal`` refuses (here a seed
+    digest that isn't one) leaves the store as it was."""
+    store = seeded(state)
+    saved(store, 1)
+    reopened = fresh(state)
+    seams.clear()
+    with pytest.raises(StoreRefused) as refused:
+        reopened.reseed(POLICY, ratchet=initial(POLICY), seed_digest="sha256:none")
+    assert refused.value.reason == "policy_write_failed"
+    assert seams == []
+    assert ok(fresh(state)).revision == 2
+
+
+# Each write a reseed makes before its head: the seam, the call of it that fails, and the detail.
+FAILS = {
+    "second-move": ("move", 2, "the old store can't be moved to quarantine (PermissionError)"),
+    "anchor": ("write_anchor", 1, "the anchor can't be written (PermissionError)"),
+    "revision": ("write_revision", 1, "revision 3 can't be written (PermissionError)"),
+    "head": ("write_head", 1, "revision 3 can't be written (PermissionError)"),
+}
+
+
+def files_in(state: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(state).as_posix(): path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("step", sorted(FAILS))
+def test_a_reseed_that_fails_before_its_head_puts_the_old_store_back(
+    state: Path, monkeypatch: pytest.MonkeyPatch, step: str
+) -> None:
+    """A write that fails before the new head puts back every file moved and the anchor, and
+    removes the new revision: the store is as it was ("nothing changed" holds), the old head
+    verifies, and the reseed runs again on it."""
+    store = seeded(state)
+    saved(store, 1)
+    before = files_in(state)
+    seam, failing, detail = FAILS[step]
+    real: Callable[..., None] = getattr(policystore, seam)
+    calls: list[str] = []
+
+    def fails(*args: Any) -> None:
+        calls.append(Path(args[0]).name)
+        if len(calls) == failing:
+            raise OSError(errno.EACCES, "Permission denied")
+        real(*args)
+
+    monkeypatch.setattr(policystore, seam, fails)
+    with pytest.raises(StoreRefused) as refused:
+        fresh(state).reseed(POLICY, ratchet=initial(POLICY), seed_digest=SEED, base=2)
+    assert (refused.value.reason, refused.value.detail) == ("policy_write_failed", detail)
+    monkeypatch.setattr(policystore, seam, real)
+    assert files_in(state) == before
+    again = fresh(state)
+    assert ok(again).revision == 2
+    assert again.reseed(POLICY, ratchet=initial(POLICY), seed_digest=SEED, base=2).revision == 3
+    assert ok(fresh(state)).revision == 3
+
+
+def test_a_reseed_that_cant_put_the_old_store_back_names_what_is_left(
+    state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When even the way back fails, ``reseed_incomplete`` names each file still out of place
+    and where it goes, and the anchor that couldn't be rewritten."""
+    store = seeded(state)
+    saved(store, 1)
+    real_move, real_anchor = policystore.move, policystore.write_anchor
+    anchors: list[str] = []
+
+    def move_in_only(source: Path, target: Path) -> None:
+        if source.parent.name == "quarantine":
+            raise OSError(errno.EACCES, "Permission denied")
+        real_move(source, target)
+
+    def anchor_once(path: Path, data: bytes) -> None:
+        anchors.append(path.name)
+        if len(anchors) > 1:
+            raise OSError(errno.EACCES, "Permission denied")
+        real_anchor(path, data)
+
+    monkeypatch.setattr(policystore, "move", move_in_only)
+    monkeypatch.setattr(policystore, "write_anchor", anchor_once)
+    monkeypatch.setattr(policystore, "write_head", broken)
+    with pytest.raises(StoreRefused) as refused:
+        fresh(state).reseed(POLICY, ratchet=initial(POLICY), seed_digest=SEED)
+    assert refused.value.reason == "reseed_incomplete"
+    assert refused.value.detail == "; ".join(
+        [
+            "revision 3 can't be written (OSError)",
+            "the old policy-anchor.json can't be put back",
+            "policy/quarantine/2.reseeded.json goes back to policy/revisions/0000000002.json",
+            "policy/quarantine/1.reseeded.json goes back to policy/revisions/0000000001.json",
+            "policy/quarantine/head.reseeded.json goes back to policy/head.json",
+        ]
+    )
+    assert not (state / revision_file(3)).exists()
+
+
+def test_a_reseed_numbers_above_a_refused_head(state: Path) -> None:
+    """Y4: a head that unsealed but is refused still counts. Here its revision file is gone and
+    the anchor is restored from before it: the reseed's number is above the head's, never one a
+    head committed."""
+    store = seeded(state)
+    saved(store, 6)
+    deployment = anchor_on_disk(state).deployment
+    stale = Anchor(deployment, 5, None, None, KEYS.key_id)
+    (state / "policy-anchor.json").write_bytes(seal_anchor(stale, KEYS))
+    (state / revision_file(7)).unlink()
+    refused = fresh(state)
+    assert isinstance(refused.verdict, Refused)
+    assert (refused.verdict.reason, refused.verdict.revision) == ("head_dangling", 7)
+    assert refused.reseed_revision == 8
+    assert refused.reseed(POLICY, ratchet=initial(POLICY), seed_digest=SEED).revision == 8
+    assert ok(fresh(state)).revision == 8
+
+
+def test_a_reseed_past_the_counter_is_refused(state: Path) -> None:
+    """T-4: a reseed above the ten-digit file names is refused before anything moves."""
+    seeded(state)
+    quarantine = state / "policy" / "quarantine"
+    quarantine.mkdir(mode=0o700)
+    (quarantine / f"{REVISION_MAX}.unreadable.json").write_bytes(b"{}")
+    store = fresh(state)
+    with pytest.raises(StoreRefused) as refused:
+        store.reseed(POLICY, ratchet=initial(POLICY), seed_digest=SEED)
+    assert refused.value.reason == "revision_out_of_range"
+    assert (state / "policy" / "head.json").is_file()
 
 
 # --- the history lookup (PlanInput.removed_in) --------------------------------------------------

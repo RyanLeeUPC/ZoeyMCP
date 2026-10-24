@@ -868,6 +868,71 @@ def _build_parser() -> argparse.ArgumentParser:
     health.add_argument("--json", action="store_true", help="print the whole report as JSON")
     health.add_argument("--strict", action="store_true", help="also exit 1 for a warning")
 
+    policy = commands.add_parser(
+        "policy",
+        help="a managed policy's store, on the host (with the vault stopped, --state)",
+        description=(
+            "Seed or replace a managed policy's store in a state directory, with the vault "
+            "stopped. Each needs ZOEYMCP_MASTER_KEY, refuses to run as root, and prints what it "
+            "will write and asks first, unless --yes."
+        ),
+    )
+    policy_commands = policy.add_subparsers(dest="action", required=True, metavar="action")
+    policy_seed = policy_commands.add_parser(
+        "seed",
+        help="seed revision 1 on a state volume used before, from the policy given",
+        description=(
+            "Seed revision 1 of a managed policy on a state volume a vault used before, which "
+            "the vault won't seed by itself: from --config, or ZOEYMCP_CONFIG."
+        ),
+    )
+    policy_seed.add_argument(
+        "--state", metavar="DIR", required=True, help="the vault's state directory"
+    )
+    policy_seed.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
+    policy_seed.add_argument("--yes", action="store_true", help="write it without asking")
+    policy_import = policy_commands.add_parser(
+        "import",
+        help="replace a store with the policy given (--state DIR --reseed)",
+        description=(
+            "With --state DIR --reseed: replace the store with the policy given, planned against "
+            "the old head and what it retired when that head verifies (each revival needs its "
+            "--allow-revive or --allow-env), or with --new-ratchet, from the policy's own. The "
+            "old files go to quarantine."
+        ),
+    )
+    policy_import.add_argument(
+        "source", nargs="?", metavar="FILE", help="policy file, or - for stdin"
+    )
+    policy_import.add_argument(
+        "--from-env", action="store_true", help="the policy in ZOEYMCP_CONFIG instead"
+    )
+    policy_import.add_argument("--state", metavar="DIR", help="the vault's state directory")
+    policy_import.add_argument(
+        "--reseed", action="store_true", help="replace the store in --state, with the vault stopped"
+    )
+    policy_import.add_argument(
+        "--new-ratchet",
+        action="store_true",
+        help="forget what the old store retired (listed), and start from the policy's own",
+    )
+    policy_import.add_argument(
+        "--allow-revive",
+        action="append",
+        default=[],
+        metavar="X",
+        help="bring back client:NAME, caller:ROUTE/INDEX or pin:SERVER/KIND/NAME (repeatable)",
+    )
+    policy_import.add_argument(
+        "--allow-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="allow env:NAME, new or sent somewhere new (repeatable)",
+    )
+    policy_import.add_argument("--reason", metavar="TEXT", help="kept with the revision")
+    policy_import.add_argument("--yes", action="store_true", help="write it without asking")
+
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")
     for name in (
@@ -1101,6 +1166,15 @@ def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -
         err.write(
             f"rotation pending: {generations}{master} accepted until {utc(previous['until'])}\n"
         )
+
+
+# --- the managed policy on the host (M6 design M.6) --------------------------------------------
+
+
+def _cmd_policy(args: argparse.Namespace, stdin: TextIO, err: TextIO) -> int:
+    from . import policy as policy_cli
+
+    return policy_cli.run(args, os.environ, stdin, err, as_root=running_as_root())
 
 
 # --- setup codes, passkeys and sessions (M5 design E) ------------------------------------------
@@ -2331,6 +2405,8 @@ def main(
         return _cmd_oauth(args, out, err)
     if args.command == "health":
         return _cmd_health(args, out, err)
+    if args.command == "policy":
+        return _cmd_policy(args, stdin, err)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 
