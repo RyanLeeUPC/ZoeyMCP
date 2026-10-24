@@ -41,6 +41,17 @@ reports (F.2), so the vault's container reviews too; ``auto`` (the default) take
 socket when the container has it. Through the vault the CLI's finished review of the server at
 the current policy view is read again, so one report serves several runs, unless ``--fresh``
 (OPS-11). Either way the answer is the gateway's review, printed alike.
+
+In managed mode the policy isn't a file the operator commits, so the options that make a fragment
+(``--add``, ``--allow``, ``--approve``, ``--allow-read-only``, ``--repin``, ``--decline``,
+``--decline-rest`` and ``--choices``) refuse, naming the portal and the host's export and import
+(M6 design G.9, Y25). Through the vault the CLI asks the vault's mode (``GET /policy``) before it
+queues anything; over the gateway's socket, which is all the gateway's container has, the review
+answer names the mode the vault last stated beside the view (``policy_mode``), and ``unknown``
+before the gateway's first view refuses too. A read-only review works in either mode; in managed
+mode it prints no snippet to commit, and the way on (the vault's ``next``, or over the gateway's
+socket the same save, export and import) stands in its place. The mode is no part of the review:
+it is left out of what is printed and of the choices file's digest.
 """
 
 from __future__ import annotations
@@ -182,8 +193,10 @@ def _tool_line(entry: dict[str, Any], width: int) -> str:
     return f"  {name}  {label:<10}  {detail}"
 
 
-def render(review: dict[str, Any], choices: Choices) -> list[str]:
-    """The text ``review <server>`` prints, before :func:`untrusted` is applied to each line."""
+def render(review: dict[str, Any], choices: Choices, *, managed: bool = False) -> list[str]:
+    """The text ``review <server>`` prints, before :func:`untrusted` is applied to each line;
+    ``managed``, without the snippet to commit, which a managed policy has no use for (M6 design
+    Y25): the way on, a save or an import, stands in its place."""
     era = " ".join(
         part
         for part in (review.get("era") or "era unknown", review.get("protocol_version"))
@@ -234,6 +247,8 @@ def render(review: dict[str, Any], choices: Choices) -> list[str]:
             lines.append(f"definition {untrusted(entry['name'], 128)} ({entry['pin']}):")
             rendered = json.dumps(entry["definition"], indent=2, sort_keys=True, ensure_ascii=False)
             lines += [f"  {untrusted(line, 1_000_000)}" for line in rendered.splitlines()]
+    if managed:
+        return lines
     lines += ["", "# YAML to commit (declarative mode). Review the changes above first."]
     lines += snippet(review, choices)
     return lines
@@ -267,6 +282,30 @@ def write_lines(lines: Sequence[str], out: TextIO) -> None:
 def write_json(data: Any, out: TextIO) -> None:
     json.dump(data, out, indent=2, sort_keys=True, ensure_ascii=True)
     out.write("\n")
+
+
+# --- the mode (M6 design G.9, E-7) -------------------------------------------------------------
+
+MANAGED_REFUSED: Final = (
+    "this deployment is managed: save it in the portal, or export, edit and import"
+)
+MODE_UNKNOWN: Final = "the gateway hasn't received the policy from the vault yet: try again"
+
+
+def answered_mode(answer: Mapping[str, Any]) -> str:
+    """The mode a gateway's status or review answer names (``policy_mode``): ``managed``,
+    ``declarative`` or ``unknown``. An answer without one is from a gateway older than managed
+    mode, which only a declarative vault runs; a value it doesn't know is ``unknown``. A gateway
+    that lies can only make the CLI print a fragment nothing applies, or refuse (G.9)."""
+    mode = answer.get("policy_mode", "declarative")
+    return mode if mode in ("managed", "declarative") else "unknown"
+
+
+def fragment_refused(mode: str) -> str | None:
+    """Why a command that prints a fragment refuses in ``mode``, or None in declarative mode."""
+    if mode == "declarative":
+        return None
+    return MANAGED_REFUSED if mode == "managed" else MODE_UNKNOWN
 
 
 # --- where the review runs (M7 design F.5) -----------------------------------------------------

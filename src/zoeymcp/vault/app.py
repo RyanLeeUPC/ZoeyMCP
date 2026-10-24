@@ -97,7 +97,7 @@ from ..common.policy.schema import (
     SMTPConnector,
     is_secret_ref,
 )
-from ..common.policy.view import build_view, dump_view
+from ..common.policy.view import MODE_HEADER, build_view, dump_view
 from . import internal, logs, netclient, secretops, statusreport
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
@@ -1065,7 +1065,8 @@ class VaultApp:
     async def _view_answer(self, request: Request, log: dict[str, Any]) -> Response:
         """``GET /_zoeymcp/gateway/v1/view``: the view with its digest as the ``ETag``, or 304
         while the digest is one the caller named in ``If-None-Match``. With ``?wait=N`` a 304
-        waits up to N seconds for a reload that changes the view (M3 design D.2)."""
+        waits up to N seconds for a reload that changes the view (M3 design D.2). Both carry the
+        policy's mode, outside the view and its digest (M6 design K.3)."""
         try:
             wait = view_wait(parse_query(request.scope.get("query_string", b"")))
         except RequestRejected as exc:
@@ -1075,7 +1076,11 @@ class VaultApp:
         if wait and self._view.digest in tags and not self._view_stopping:
             await self._wait_for_view(tags, started + wait, request.receive, log)
         view = self._view
-        headers = {"etag": f'"{view.digest}"', "cache-control": "no-store"}
+        headers = {
+            "etag": f'"{view.digest}"',
+            "cache-control": "no-store",
+            MODE_HEADER: self._policy.mode,
+        }
         if view.digest in tags:
             return Response(status_code=304, headers=headers)
         waited_ms = round((time.monotonic() - started) * 1000)

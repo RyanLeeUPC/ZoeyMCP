@@ -19,9 +19,9 @@ blocked it, counts, ``offered`` and the attention decision's lists (``drift``, `
 definition, a token hash or a client name, every list at most ``max_tools_per_server`` long, and the
 two tool counts at most that limit's own ceiling. The upstream reports invalid and duplicate tools
 under their raw names, which often aren't tool names: only names that are go in ``invalid``, and the
-rest are counted (``invalid_unnamed``, ``duplicate_unnamed``; T-7). The witness (``witness``,
-``deployments_seen``) is empty and the policy mode ``unknown`` until the gateway learns them from
-the view's headers (K.3; steps 14b and 17).
+rest are counted (``invalid_unnamed``, ``duplicate_unnamed``; T-7). ``policy_mode`` is the mode
+the vault last stated beside the view (K.3), as the status names it. The witness (``witness``,
+``deployments_seen``) is empty until the gateway learns it from the view's headers (step 17).
 
 A post that fails, or is refused, backs off from 1 s up to 30 s, logged ``status_push_failed`` at
 most once a minute; a 429 waits the debounce. Nothing the gateway serves waits for it.
@@ -68,7 +68,7 @@ def content(status: Mapping[str, Any], *, started: int, max_tools: int) -> dict[
         "servers": servers,
         "witness": {},
         "deployments_seen": 0,
-        "policy_mode": "unknown",
+        "policy_mode": status.get("policy_mode", "unknown"),
     }
 
 

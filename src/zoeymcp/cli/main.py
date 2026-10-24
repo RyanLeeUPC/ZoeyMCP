@@ -9,7 +9,7 @@ import json
 import os
 import secrets
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -79,6 +79,13 @@ HEALTH_ACTIONS = {
     "reload_vault": "send SIGHUP to the vault, or restart it",
     "import_from_env": "remove ZOEYMCP_CONFIG, or run: zoeymcp policy import --from-env",
 }
+
+# check and selftest of a managed document, on stderr (M6 design M.6): they run in a throwaway
+# container with no socket, so what they read is the document they are given, never the head.
+NOT_THE_HEAD = (
+    "checking this document, not the running revision: to check what runs, pipe zoeymcp policy "
+    "export into this command with --config -"
+)
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
 GATEWAY_ENVIRONMENT = Path("/opt/zoeymcp-gateway")
@@ -1550,17 +1557,24 @@ def _cmd_review(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextI
         if exc.reason == "not_clean" and isinstance(exc.data.get("review"), dict):
             # --clear refused: show what doesn't match, and why.
             err.write(f"zoeymcp review: --clear refused: {review_view.untrusted(exc)}\n")
-            code = _review_output(exc.data["review"], choices, args, out, err)
+            mode = review_view.answered_mode(exc.data)
+            code = _review_output(exc.data["review"], choices, args, out, err, mode=mode)
             return max(code, review_view.EXIT_NEEDS_OPERATOR)
         err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
         return review_view.EXIT_COULD_NOT_RUN
-    # The gateway's own socket keeps no job: the choices file names none.
-    return _review_output(result, choices, args, out, err, job=review_choices.NO_JOB, read=parsed)
+    # The gateway's own socket keeps no job: the choices file names none. Its answer names the
+    # mode the vault last stated (M6 design G.9), which is no part of the review: it is printed
+    # alike through the vault, and the choices file's digest doesn't move with the mode.
+    mode = review_view.answered_mode(result)
+    report = {key: value for key, value in result.items() if key != "policy_mode"}
+    return _review_output(
+        report, choices, args, out, err, job=review_choices.NO_JOB, read=parsed, mode=mode
+    )
 
 
-def _review_usage(args: argparse.Namespace) -> str | None:
-    """What's wrong with ``review``'s options as given, before anything is asked."""
-    picked = (
+def _picked(args: argparse.Namespace) -> bool:
+    """Whether ``review``'s options include, classify, re-pin or decline a tool."""
+    return bool(
         args.add
         or args.allow
         or args.approve
@@ -1569,6 +1583,30 @@ def _review_usage(args: argparse.Namespace) -> str | None:
         or args.decline
         or args.decline_rest
     )
+
+
+def _fragment_refused(
+    mode: str, args: argparse.Namespace, err: TextIO, *, in_vault: bool = True
+) -> int | None:
+    """In managed mode, or with the mode ``unknown``, the options that make a fragment refuse
+    (M6 design G.9, Y25): exit 2, naming the portal and the host's export and import, whose
+    commands run in the vault's service when this container is the vault's (``in_vault``). None
+    when the options make no fragment, or the mode is declarative."""
+    if not _picked(args) and args.choices is None:
+        return None
+    from . import onboard as onboard_cli
+
+    prefix = onboard_cli.Prefix.from_environ(os.environ)
+    lines = onboard_cli.refused_lines("review", mode, prefix, in_vault=in_vault)
+    if lines is None:
+        return None
+    review_view.write_lines(lines, err)
+    return review_view.EXIT_COULD_NOT_RUN
+
+
+def _review_usage(args: argparse.Namespace) -> str | None:
+    """What's wrong with ``review``'s options as given, before anything is asked."""
+    picked = _picked(args)
     shown = args.tool or args.show or args.all
     if args.server is None and (picked or shown or args.clear or args.choose or args.choices):
         return "these options need a server"
@@ -1595,23 +1633,41 @@ def _review_through_vault(
     """``review <server> --via vault`` (M7 design F.5): the gateway's review, as a job the vault
     queued and the gateway ran, printed as the gateway's own answer is; with ``--clear``, a
     clear job (M6 design J.4), refused as the gateway's own ``--clear`` is when an included
-    tool doesn't match its pin."""
+    tool doesn't match its pin. Options that make a fragment first ask the vault's mode, and
+    refuse in managed mode (G.9). The way on is the vault's ``next`` (M.7, D-200), on stderr:
+    a refusal's, and a finished review's after its text (in its JSON, as ``next``), unless the
+    options already made fragment 2, which is where a review's way on leads. A ``next`` that
+    names a save is a managed vault's (Y25): the review prints no snippet to commit."""
     if args.server is None:
         # The summary is the gateway's status, which only its own socket answers.
         err.write("zoeymcp review: through the vault, name the server to review\n")
         return review_view.EXIT_COULD_NOT_RUN
+    from . import onboard as onboard_cli
+
+    socket = admin_client.socket_path(args.socket)
+    prefix = onboard_cli.Prefix.from_environ(os.environ)
+    if _picked(args) or args.choices is not None:
+        try:
+            mode = admin_client.policy_head(socket)["mode"]
+        except admin_client.AdminUnavailable as exc:
+            err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+            return review_view.EXIT_COULD_NOT_RUN
+        refused = _fragment_refused(mode, args, err)
+        if refused is not None:
+            return refused
     choices = _review_choices(args)
     try:
-        job = review_view.vault_review(
-            admin_client.socket_path(args.socket), args.server, fresh=args.fresh, clear=args.clear
-        )
+        job = review_view.vault_review(socket, args.server, fresh=args.fresh, clear=args.clear)
     except admin_client.AdminUnavailable as exc:
+        steps = exc.data.get("next") or []
         if exc.reason == "clear_not_clean" and isinstance(exc.data.get("report"), dict):
             # The gateway refused the clear: show what doesn't match, as --via gateway does.
             err.write(f"zoeymcp review: --clear refused: {review_view.untrusted(exc)}\n")
             code = _review_output(exc.data["report"], choices, args, out, err)
+            review_view.write_lines(onboard_cli.next_lines(steps, prefix), err)
             return max(code, review_view.EXIT_NEEDS_OPERATOR)
         err.write(f"zoeymcp review: {review_view.untrusted(exc)}\n")
+        review_view.write_lines(onboard_cli.next_lines(steps, prefix), err)
         return review_view.EXIT_COULD_NOT_RUN
     except review_view.StillRunning:
         err.write(
@@ -1619,7 +1675,20 @@ def _review_through_vault(
             "minute to read it\n"
         )
         return review_view.EXIT_COULD_NOT_RUN
-    return _review_output(job["report"], choices, args, out, err, job=job["job"], read=parsed)
+    # Fragment 2, made here, is where a review's way on leads; a way on that saves is managed.
+    steps = None if _picked(args) or parsed is not None else job.get("next")
+    saved = any(step.get("do") == "save" for step in steps or ())
+    return _review_output(
+        job["report"],
+        choices,
+        args,
+        out,
+        err,
+        job=job["job"],
+        read=parsed,
+        mode="managed" if saved else "declarative",
+        steps=steps,
+    )
 
 
 def _review_choices(args: argparse.Namespace) -> review_view.Choices:
@@ -1646,9 +1715,24 @@ def _review_output(
     *,
     job: str = review_choices.NO_JOB,
     read: review_choices.Parsed | None = None,
+    mode: str = "declarative",
+    steps: Sequence[Mapping[str, Any]] | None = None,
 ) -> int:
-    """Print the review as asked: the text and snippet (or JSON), the choices file
-    (``--choose``), or the snippet a choices file makes (``--choices``)."""
+    """Print the review as asked: the text and snippet, then the vault's ``steps`` on stderr (or
+    JSON, with them as ``next`` when it gave them), the choices file (``--choose``), or the
+    snippet a choices file makes (``--choices``); or, with options that make a fragment and
+    ``mode`` not declarative, the refusal (M6 design G.9). In managed mode there is no snippet:
+    the way on stands in its place, the vault's or, without it, the save, export and import
+    (Y25, M.7)."""
+    from . import onboard as onboard_cli
+
+    in_vault = os.path.exists(admin_client.socket_path(None))
+    refused = _fragment_refused(mode, args, err, in_vault=in_vault)
+    if refused is not None:
+        return refused
+    managed = mode == "managed"
+    if managed and steps is None:
+        steps = onboard_cli.managed_steps(mode, in_vault=in_vault)
     if args.choose:
         lines = review_choices.render(result, job, suggest=args.suggest)
         review_view.write_lines(lines, out)
@@ -1667,10 +1751,16 @@ def _review_output(
             return review_view.exit_code(result)
         review_view.check_choices(result, choices)
         if args.format == "json":
-            snippet = review_view.snippet(result, choices)
-            review_view.write_json({**result, "snippet": snippet}, out)
+            document = dict(result)
+            if not managed:
+                document["snippet"] = review_view.snippet(result, choices)
+            if steps is not None:
+                document["next"] = list(steps)
+            review_view.write_json(document, out)
         else:
-            review_view.write_lines(review_view.render(result, choices), out)
+            review_view.write_lines(review_view.render(result, choices, managed=managed), out)
+            prefix = onboard_cli.Prefix.from_environ(os.environ)
+            review_view.write_lines(onboard_cli.next_lines(steps or (), prefix), err)
     except review_choices.ChoicesRefused as exc:
         err.write(f"zoeymcp review: {exc.reason}: {review_view.untrusted(exc)}\n")
         return review_view.EXIT_COULD_NOT_RUN
@@ -2145,7 +2235,7 @@ def duration(seconds: float) -> str:
     return f"{value // 86400} days"
 
 
-def _cmd_selftest(args: argparse.Namespace, stdin: TextIO, out: TextIO) -> int:
+def _cmd_selftest(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
     import asyncio
 
     from pydantic import ValidationError
@@ -2160,6 +2250,8 @@ def _cmd_selftest(args: argparse.Namespace, stdin: TextIO, out: TextIO) -> int:
     except PolicyError as exc:
         _report(exc.source, exc.findings, "text", out, readable=exc.readable)
         return EXIT_UNREADABLE
+    if policy.mode == "managed":
+        err.write(f"zoeymcp selftest: {NOT_THE_HEAD}\n")
     errors = [f for f in check_policy(policy) if f.level == "error"]
     if errors:
         _report(source, errors, "text", out)
@@ -2261,6 +2353,8 @@ def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     except PolicyError as exc:
         _report(exc.source, exc.findings, args.format, findings_out, readable=exc.readable)
         return EXIT_FINDINGS if exc.readable else EXIT_UNREADABLE
+    if policy.mode == "managed":
+        err.write(f"zoeymcp check: {NOT_THE_HEAD}\n")
     findings = check_policy(policy, environ=os.environ if args.resolve_env else None)
     _report(source, findings, args.format, findings_out)
     if any(f.level == "error" for f in findings):
@@ -2287,6 +2381,8 @@ def _check_with(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextI
     except ValueError as exc:
         _report(source, [Finding("(document)", "error", str(exc))], args.format, findings_out)
         return EXIT_FINDINGS
+    if data.get("mode") == "managed":
+        err.write(f"zoeymcp check: {NOT_THE_HEAD}\n")
     flags: list[Finding] = []
     added: list[policy_merge.Path] = []
     replaced: list[policy_merge.Path] = []
@@ -2480,7 +2576,7 @@ def main(
     if args.command == "standard":
         return _cmd_standard(args, err)
     if args.command == "selftest":
-        return _cmd_selftest(args, stdin, out)
+        return _cmd_selftest(args, stdin, out, err)
     if args.command in ("secret", "gateway-key", "egress-key"):
         return _cmd_admin(args, stdin, out, err)
     if args.command == "setup-code":

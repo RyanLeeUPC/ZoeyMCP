@@ -7,25 +7,34 @@ agent request gets 503 until contact resumes: revocation can't lapse while the v
 
 A view the gateway can't parse (from a newer vault, say) is refused and the last good one stays.
 Failures back off 1, 2, 4 ... 30 s, jittered. SIGHUP asks for a fetch at once.
+
+The vault states its mode beside every view answer, the 200 and the 304, in the header
+``x-zoeymcp-policy-mode`` (M6 design K.3, G.9). The client keeps the last one it read with
+contact as :attr:`PolicyClient.mode`, ``unknown`` before its first view, so the gateway's
+status and review answers can tell the CLI in its container, which has no vault socket, that the
+deployment is managed. An answer without a mode it knows keeps the last.
 """
 
 from __future__ import annotations
 
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import Final
 
 import anyio
 import httpx2
 
-from ..common.policy.view import GatewayView, ViewError, parse_view
+from ..common.policy.view import MODE_HEADER, GatewayView, PolicyMode, ViewError, parse_view
 from . import logs
 from .vaultlink import VIEW_PATH
 
 WAIT = 25
 BACKOFF_START = 1.0
 BACKOFF_MAX = 30.0
+# The modes a view answer may state; anything else keeps the last.
+STATED: Final[Mapping[str, PolicyMode]] = {"managed": "managed", "declarative": "declarative"}
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,8 @@ class PolicyClient:
         self._clock = clock
         self._wait = wait
         self.snapshot: Snapshot | None = None
+        # The vault's mode, read with the snapshot and on each 304 after it.
+        self.mode: PolicyMode = "unknown"
         self.last_contact: float | None = None
         self._failures = 0
         # Made in run(): an anyio event needs the loop it will be used on.
@@ -104,6 +115,7 @@ class PolicyClient:
             logs.event("policy_fetch_failed", error_type=type(exc).__name__)
             return False
         if response.status_code == 304 and self.snapshot is not None:
+            self._read_mode(response)
             self._contact()
             return True
         if response.status_code != 200:
@@ -117,6 +129,7 @@ class PolicyClient:
         previous = self.snapshot
         snapshot = Snapshot(view, self._clock())
         self.snapshot = snapshot
+        self._read_mode(response)
         self._contact()
         if previous is None or previous.view.digest != view.digest:
             logs.event(
@@ -127,6 +140,9 @@ class PolicyClient:
             )
             await self._apply(snapshot, previous)
         return True
+
+    def _read_mode(self, response: httpx2.Response) -> None:
+        self.mode = STATED.get(response.headers.get(MODE_HEADER, ""), self.mode)
 
     def _contact(self) -> None:
         self.last_contact = self._clock()

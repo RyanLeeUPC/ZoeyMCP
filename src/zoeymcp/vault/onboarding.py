@@ -116,6 +116,9 @@ Do = Literal[
     "restart",
     "deliver_key",
     "wait_gateway",
+    "save",
+    "export_policy",
+    "import_policy",
 ]
 # Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
 # container that reads the inline policy from the service's environment; ``run_mount``, the same
@@ -951,10 +954,48 @@ def review_again(server: str) -> NextStep:
     return NextStep("review", "Review again", review, "exec")
 
 
-def job_next(server: str, *, clear: bool) -> tuple[NextStep, ...]:
-    """A finished job's way on (D-200): after a review, choosing the server's tools; after a
-    clear, nothing."""
-    return () if clear else choose_next(server)
+# The host's copy of the policy in managed_next's commands (M6 design H.5, H.6).
+EXPORT_FILE: Final = "policy.yaml"
+
+
+def managed_next(via: Via | None = "exec") -> tuple[NextStep, ...]:
+    """In managed mode, the way to change the policy that a fragment is in declarative mode (M6
+    design G.9, Y25): a save in the portal, or the host's export, edit and import. ``via`` is
+    where the two commands run: ``exec`` in the vault's service, or None where the CLI can't name
+    that service (the gateway's container), saying where in the label instead. Both take ``-T``:
+    the export's stdout and the import's stdin are files. Without ``--yes`` the import shows its
+    plan and writes nothing."""
+    where = "" if via is not None else " (in the vault's container)"
+    export = ("zoeymcp", "policy", "export")
+    imported = ("zoeymcp", "policy", "import", "-")
+    return (
+        NextStep("save", "Save the change in the portal"),
+        NextStep(
+            "export_policy",
+            f"Or export the policy{where}",
+            export,
+            via,
+            piped=True,
+            redirect=f" > {EXPORT_FILE}",
+        ),
+        NextStep(
+            "import_policy",
+            f"Edit {EXPORT_FILE}, then import it{where}; it shows the plan, and the same with "
+            "--yes writes it",
+            imported,
+            via,
+            piped=True,
+            redirect=f" < {EXPORT_FILE}",
+        ),
+    )
+
+
+def job_next(server: str, *, clear: bool, managed: bool = False) -> tuple[NextStep, ...]:
+    """A finished job's way on (D-200): after a review, choosing the server's tools, or in
+    managed mode saving them (:func:`managed_next`, Y25); after a clear, nothing."""
+    if clear:
+        return ()
+    return managed_next() if managed else choose_next(server)
 
 
 def refusal_next(server: str | None, reason: str) -> tuple[NextStep, ...]:

@@ -311,6 +311,18 @@ def test_a_server_never_listed_reports_nothing_to_attend_to() -> None:
     assert [entry[key] for key in ("marked", "unreviewed", "drift", "missing")] == [[]] * 4
 
 
+def test_the_report_names_the_mode_the_gateway_last_saw() -> None:
+    """``policy_mode`` is the status's, the mode the vault last stated beside the view (M6 design
+    K.3); a status naming none reports ``unknown``."""
+    for mode in ("managed", "declarative", "unknown"):
+        document = content({**status_of(), "policy_mode": mode}, started=1, max_tools=10)
+        assert document is not None
+        assert document["policy_mode"] == mode
+    document = content(status_of(), started=1, max_tools=10)
+    assert document is not None
+    assert document["policy_mode"] == "unknown"
+
+
 # --- the pusher against a scripted vault --------------------------------------------------------
 
 

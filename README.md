@@ -112,6 +112,12 @@ it is. The portal's MCP servers page does the same in a browser. In the hardened
 commands run in the `vault` service instead (operations.md §30 walks a first hardened deployment
 end to end).
 
+**In managed mode** (`mode: managed`, operations.md §34) the vault keeps the policy as numbered
+revisions, so nothing above that prints a fragment applies: `review` with `--add` or another
+choosing option, and `login --mcp`, refuse and name the portal, or `zoeymcp policy export`, an
+edit and `zoeymcp policy import`, instead (operations.md §11); `check` says it checks the
+document it is given, not the running revision.
+
 **When to move to the hardened tier** ([deploy/compose.hardened.yaml](deploy/compose.hardened.yaml)):
 for anything that moves money, sends mail or touches personal data. In the standard tier the
 gateway shares the vault's network namespace, so a compromised gateway has a way out; in the

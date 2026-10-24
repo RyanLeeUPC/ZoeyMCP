@@ -13,7 +13,7 @@ import pytest
 
 from zoeymcp.common import canonical
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.view import build_view, dump_view
+from zoeymcp.common.policy.view import MODE_HEADER, build_view, dump_view
 from zoeymcp.gateway import logs, policyclient
 from zoeymcp.gateway.egressrules import CallRegistry
 from zoeymcp.gateway.policyclient import PolicyClient, Snapshot
@@ -603,6 +603,64 @@ async def test_stale_and_fresh_again_are_logged_once(captured: io.StringIO) -> N
     await client.fetch_once()
     assert client.fresh() is not None
     assert len(events(captured, "policy_fresh")) == 1
+
+
+# --- the mode the vault states beside the view (M6 design K.3, G.9) -----------------------------
+
+
+def stating(mode: str | None, status: int = 304, content: bytes = b"") -> httpx2.Response:
+    headers = {} if mode is None else {MODE_HEADER: mode}
+    return httpx2.Response(status, content=content, headers=headers)
+
+
+async def test_the_mode_comes_with_the_view_and_each_304() -> None:
+    """``unknown`` until the first view; then the mode its 200 states, and each 304's, since a
+    mode alone moves no view; a 304 stating none, or a mode the gateway doesn't know, keeps the
+    last."""
+    vault, applied, now = scripted()
+    client = policy_client(vault, applied, now)
+    assert client.mode == "unknown"
+    vault.answers = [stating("managed")]  # a 304 before any view isn't contact
+    assert await client.fetch_once() is False
+    assert client.mode == "unknown"
+    vault.answers = [
+        stating("declarative", 200, view_bytes()),
+        stating("managed"),
+        stating(None),
+        stating("Managed"),
+        stating("unknown"),
+        stating("declarative"),
+    ]
+    modes = []
+    for _ in range(6):
+        assert await client.fetch_once() is True
+        modes.append(client.mode)
+    assert modes == ["declarative", "managed", "managed", "managed", "managed", "declarative"]
+    assert len(applied) == 1  # the view itself never moved
+
+
+async def test_a_refused_view_brings_no_mode() -> None:
+    """A view the gateway can't parse is no contact: the mode beside it isn't taken either."""
+    vault, applied, now = scripted()
+    client = policy_client(vault, applied, now)
+    good = view_bytes()
+    tampered = good.replace(b'"agent0"', b'"agent9"')
+    vault.answers = [stating(None, 200, good), stating("managed", 200, tampered)]
+    modes = []
+    # A view stating no mode (nothing to keep yet), a refused one, a refusal, then a good one.
+    for answers in ([], [stating("managed", 403), stating("declarative", 200, good)]):
+        vault.answers += answers
+        for _ in range(2):
+            fetched = await client.fetch_once()
+            modes.append((fetched, client.mode))
+    assert modes == [
+        (True, "unknown"),
+        (False, "unknown"),
+        (False, "unknown"),
+        (True, "declarative"),
+    ]
+    assert len(applied) == 1
+    assert policyclient.STATED == {"managed": "managed", "declarative": "declarative"}
 
 
 def test_backoff() -> None:

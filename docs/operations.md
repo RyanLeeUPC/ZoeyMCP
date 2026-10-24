@@ -764,6 +764,54 @@ agent that reads a JSON MCP config, typically:
 
 ## 11. Adding a remote MCP server
 
+**In managed mode** (§34) the policy isn't a file you commit, so this section's fragments don't
+apply: add the route, the credential and the server, and choose the server's tools, in the portal,
+which saves each change, or export the policy, edit it and import it on the host (§34, "Importing
+a change"). The CLI knows which mode runs and prints no fragment for a managed deployment: `review`
+with `--add`, `--allow`, `--approve`, `--allow-read-only`, `--repin`, `--decline`,
+`--decline-rest` or `--choices`, and `login --mcp`, refuse (exit 2) and name the way instead:
+
+```text
+$ zoeymcp review notes --add search_notes
+zoeymcp review: this deployment is managed: save it in the portal, or export, edit and import
+Next:
+  Save the change in the portal
+  Or export the policy (in the vault's container):
+    zoeymcp policy export > policy.yaml
+  Edit policy.yaml, then import it (in the vault's container); it shows the plan, and the same with --yes writes it:
+    zoeymcp policy import - < policy.yaml
+```
+
+Through the vault's socket (`--via vault`, and `login --mcp`) the CLI asks the vault's mode
+(`GET /policy`) before anything else, and the commands it names carry the compose prefix. In the
+gateway's container, which has no vault socket, the gateway's answer names the mode: the vault
+states it beside every view it serves (the `x-zoeymcp-policy-mode` header, outside the view and
+its digest, so a mode alone changes no view), and the gateway passes on the last one it saw as
+`policy_mode`, in its status (§13) and on every review answer of its socket. Until the gateway has
+its first view the mode is `unknown`, and the same options refuse: "the gateway hasn't received
+the policy from the vault yet: try again". A review that only reads (`review`, `review <server>`
+with `--show`, `--all`, `--choose` or `--clear`) works in either mode. In managed mode it prints
+no YAML snippet to commit: a plain review (text or JSON) ends with the way on instead, which is
+that save or import (through the vault, the vault's own `next`, below); `--choose` prints the
+file alone, and a clear that goes through has no next step. The JSON of a review never carries
+`policy_mode`: the mode is beside the review, not part of it.
+
+`check` (with `--with` or `--emit-egress-allowlist` too) and `selftest` run in a throwaway
+container with no socket, so they read the document you give them, never the running revision.
+Given a managed document, they say so on stderr: "checking this document, not the running
+revision: to check what runs, pipe zoeymcp policy export into this command with --config -":
+
+```sh
+# hardened tier
+docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp policy export \
+  | docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault check --config -
+# standard tier
+docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp policy export \
+  | docker compose -f deploy/compose.yaml run --rm --no-deps -T zoeymcp check --config -
+```
+
+The rest of this section is declarative mode.
+
 1. **The route and credential,** for the gateway only (`profiles/remote-mcp-static-key.yaml` is
    the shape): `callers: [gateway]`, `stream: true`, an `https` upstream, and rules for `POST`,
    `GET` and `DELETE` on the server's path. `check` refuses anything less.
@@ -1208,11 +1256,14 @@ job's state, and its report once it is done; `POST /review/jobs/<job>/diff` make
 `{"include": [...], "allow": [...], "approve": [...]}` (and `"indent"`, 0 to 16 or `"compose"`),
 as the portal's review screen does, saving nothing, or refuses `review_stale` when the server's
 tools, pins or declines in the running policy changed since the review. A finished job's answer
-and every refusal carry `next`, the way on: after a review, choosing its tools; after a refusal
-that a fresh review answers, `zoeymcp review <server> --via vault --fresh`. A clear job goes only
-to a gateway whose polls say it runs one (`kinds=review,clear`); while an older gateway polls, a
-clear is refused `clear_unsupported`, and its review jobs work as before. At most two reviews
-are under way at once, one per server. A queue call is refused
+and every refusal carry `next`, the way on: after a review, choosing its tools (in managed mode,
+the portal's save or the host's export and import, §11); after a refusal that a fresh review
+answers, `zoeymcp review <server> --via vault --fresh`. `review <server> --via vault` prints it
+on stderr, after the review (in its JSON as `next`; not after `--choose`, `--choices` or an
+option that makes fragment 2, which are that way already) and after a refusal. A clear job
+goes only to a gateway whose polls say it runs one (`kinds=review,clear`); while an older
+gateway polls, a clear is refused `clear_unsupported`, and its review jobs work as before. At
+most two reviews are under way at once, one per server. A queue call is refused
 `review_unavailable` while the gateway isn't polling (no poll waiting, no review it took still
 running, and no poll or result in the last 15 s); in the first 45 s after the vault starts it waits
 for the gateway's first poll instead. A job the gateway doesn't take within 60 s, because it holds
@@ -1329,11 +1380,13 @@ notes  remote  ready  era modern  connections 1  exposed 2/2
 
 `zoeymcp review` with no server prints one line per server from the same data, and exits 1 if
 anything is drifted, marked, missing or invalid, or listed and nobody reviewed it. Neither makes
-an upstream call, and neither shows definitions or token hashes. `--format json` for both.
+an upstream call, and neither shows definitions or token hashes. `--format json` for both; its
+`policy_mode` is the mode the vault last stated beside the view, `managed` or `declarative`, or
+`unknown` before the gateway's first view (§11).
 
 **The status in the portal and in `health`.** The vault never connects to the gateway, so the
 gateway pushes a summary of the same data to the vault: per server its kind, state, era,
-whether it is blocked, and counts, and the names its attention decision sorts out (the tools that drifted, that a drift
+whether it is blocked, and counts, the mode it last saw, and the names its attention decision sorts out (the tools that drifted, that a drift
 mark hides, that it no longer lists, and the tools nobody reviewed with the pin each is listed
 at), never a definition, a token hash or a client name. It pushes when that changes, at most
 once every 5 seconds, and at least once a minute; the vault keeps the latest in memory only, so

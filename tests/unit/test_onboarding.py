@@ -69,6 +69,7 @@ from zoeymcp.vault.onboarding import (
     listed_next,
     listed_server,
     listed_servers,
+    managed_next,
     mismatches,
     name_taken,
     next_for,
@@ -1443,6 +1444,56 @@ def test_the_second_runs_steps() -> None:
     assert [step.answer() for step in choose_next("s")] == review
     assert job_next("s", clear=False) == choose_next("s")
     assert job_next("s", clear=True) == ()
+    # In managed mode the way on is a save, never a fragment (M6 design G.9, Y25).
+    assert job_next("s", clear=False, managed=True) == managed_next()
+    assert job_next("s", clear=True, managed=True) == ()
+
+
+def test_the_managed_way_on() -> None:
+    """A save in the portal, or the host's export, edit and import, in the vault's service (the
+    export's stdout and the import's stdin files, so ``-T``), or as typed in the vault's container
+    where the CLI can't name that service; no word of a fragment (M6 design G.9, Y25)."""
+    tail = "; it shows the plan, and the same with --yes writes it"
+    assert [step.answer() for step in managed_next()] == [
+        {"do": "save", "label": "Save the change in the portal"},
+        {
+            "do": "export_policy",
+            "label": "Or export the policy",
+            "command": "zoeymcp policy export",
+            "via": "exec",
+            "piped": True,
+            "redirect": " > policy.yaml",
+        },
+        {
+            "do": "import_policy",
+            "label": f"Edit policy.yaml, then import it{tail}",
+            "command": "zoeymcp policy import -",
+            "via": "exec",
+            "piped": True,
+            "redirect": " < policy.yaml",
+        },
+    ]
+    where = " (in the vault's container)"
+    assert [step.answer() for step in managed_next(None)] == [
+        {"do": "save", "label": "Save the change in the portal"},
+        {
+            "do": "export_policy",
+            "label": f"Or export the policy{where}",
+            "command": "zoeymcp policy export",
+            "piped": True,
+            "redirect": " > policy.yaml",
+        },
+        {
+            "do": "import_policy",
+            "label": f"Edit policy.yaml, then import it{where}{tail}",
+            "command": "zoeymcp policy import -",
+            "piped": True,
+            "redirect": " < policy.yaml",
+        },
+    ]
+    for step in managed_next():
+        for word in ("commit", "fragment", "reload", "generate"):
+            assert word not in step.label.lower()
 
 
 AGAIN = {

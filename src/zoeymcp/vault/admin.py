@@ -1031,7 +1031,7 @@ class AdminApp:
             job = await self._reviews.queue_review(server, _REVIEW_OWNER, fresh=fresh)
         except ReviewRefused as exc:
             return _review_refused(exc.reason, exc.fields, server=server)
-        answer = _job_answer(job)
+        answer = _job_answer(job, managed=self._managed is not None)
         answer["reused"] = job.state == "done"
         return JSONResponse(answer)
 
@@ -1052,7 +1052,7 @@ class AdminApp:
             job = await self._reviews.queue_clear(server, _REVIEW_OWNER)
         except ReviewRefused as exc:
             return _review_refused(exc.reason, exc.fields, server=server)
-        return JSONResponse(_job_answer(job))
+        return JSONResponse(_job_answer(job, managed=self._managed is not None))
 
     async def _review_read(self, request: Request) -> Response:
         """``?wait=N``: the CLI's job once it is done or failed, or after N seconds (at most
@@ -1074,7 +1074,7 @@ class AdminApp:
             return _review_refused(exc.reason, exc.fields)
         if job.state == "failed":
             return _failed(job)
-        return JSONResponse(_job_answer(job))
+        return JSONResponse(_job_answer(job, managed=self._managed is not None))
 
     async def _review_diff(self, request: Request) -> Response:
         """``{include, allow, approve, indent?}``: fragment 2 for the CLI's done job, against
@@ -1580,15 +1580,15 @@ def _onboard_refused(exc: OnboardError) -> JSONResponse:
     return JSONResponse(exc.answer.body(), status_code=exc.answer.status)
 
 
-def _job_answer(job: Job) -> dict[str, Any]:
+def _job_answer(job: Job, *, managed: bool = False) -> dict[str, Any]:
     """A job as the socket answers it: never its digest or times; its report once ``done``, as
     the gateway posted it (or the review a clear the gateway refused rests on), and once done
-    its way on (M6 design M.7, D-200)."""
+    its way on (M6 design M.7, D-200), a save rather than a fragment when ``managed`` (Y25)."""
     answer: dict[str, Any] = {"job": job.id, "server": job.server, "state": job.state}
     if job.report is not None:
         answer["report"] = job.report.model_dump(mode="json", exclude_unset=True)
     if job.state == "done":
-        steps = job_next(job.server, clear=job.work == "clear")
+        steps = job_next(job.server, clear=job.work == "clear", managed=managed)
         answer["next"] = [step.answer() for step in steps]
     return answer
 

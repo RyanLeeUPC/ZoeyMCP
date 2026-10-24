@@ -44,6 +44,7 @@ from zoeymcp.vault.app import (
     Listener,
     VaultApp,
 )
+from zoeymcp.vault.onboarding import managed_next
 from zoeymcp.vault.reviewjobs import (
     CLAIM_DEADLINE,
     ID_BYTES,
@@ -1042,9 +1043,16 @@ def lines(buffer: io.StringIO, kind: str | None = None) -> list[dict[str, Any]]:
 
 class Rig:
     """A vault on the review policy, its job table on a test clock, and an admin socket app on
-    the same vault, as server.py wires them."""
+    the same vault, as server.py wires them; ``managed`` is the admin app's managed policy."""
 
-    def __init__(self, tmp_path: Path, *, started: float = 0.0, policy: Policy | None = None):
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        started: float = 0.0,
+        policy: Policy | None = None,
+        managed: Any = None,
+    ):
         self.clock = Clock()
         self.jobs = JobTable(self.clock, started=started)
         store = SecretStore(tmp_path, KEYS)
@@ -1054,7 +1062,9 @@ class Rig:
             policy or review_policy(), store, KEYS, client=client, environ={}, review_jobs=self.jobs
         )
         setup = SetupCodes(tmp_path, KEYS.portal_key)
-        self.admin = AdminApp(store, KEYS, lambda: self.app.policy, setup, reviews=self.app)
+        self.admin = AdminApp(
+            store, KEYS, lambda: self.app.policy, setup, reviews=self.app, managed=managed
+        )
 
     @staticmethod
     def unreachable(request: httpx.Request) -> httpx.Response:
@@ -1746,6 +1756,28 @@ async def test_a_done_review_and_a_failed_one_say_what_next(rig: Rig) -> None:
     stale = (await rig.socket("GET", f"/review/jobs/{failed.id}")).json()
     assert (stale["reason"], stale["next"]) == ("review_stale", [AGAIN])
     assert (await rig.socket("GET", "/review/jobs/nope")).json()["next"] == []
+
+
+async def test_a_managed_vaults_done_review_names_a_save(tmp_path: Path) -> None:
+    """In managed mode a done review's way on is a save in the portal, or the host's export and
+    import, never a fragment, whether queued, handed back again or read (M6 design G.9, Y25); a
+    refusal's way on is the same fresh review."""
+    # A stand-in: the review routes only ask whether the vault is managed.
+    rig = Rig(tmp_path, managed=object())
+    rig.seen()
+    try:
+        job = await done_job(rig)
+        managed = [step.answer() for step in managed_next()]
+        read = (await rig.socket("GET", f"/review/jobs/{job.id}")).json()
+        assert read["next"] == managed
+        again = (await rig.socket("POST", "/review/notes", {})).json()
+        assert (again["reused"], again["next"]) == (True, managed)
+        failed = await rig.app.queue_review("notes", "cli", fresh=True)
+        rig.clock.now += QUEUE_TTL
+        stale = (await rig.socket("GET", f"/review/jobs/{failed.id}")).json()
+        assert (stale["reason"], stale["next"]) == ("review_stale", [AGAIN])
+    finally:
+        await rig.app.aclose()
 
 
 def test_the_listener_scope_key_is_the_apps() -> None:

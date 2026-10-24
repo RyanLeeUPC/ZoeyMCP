@@ -663,7 +663,8 @@ async def test_the_admin_socket_and_the_poller_take_the_gateways_one_lock(
             assert ran == ["socket"]
             release.set()
     await http.aclose()
-    assert answered == [(200, {"server": "notes"})]
+    # The socket's answer names the mode the vault last stated: none yet here (M6 design G.9).
+    assert answered == [(200, {"server": "notes", "policy_mode": "unknown"})]
     assert ran == ["socket", "job"]
     assert (await rig.read(job_id)).status_code == 200
 
@@ -1277,7 +1278,10 @@ def test_review_via_vault_prints_the_gateways_review(
         )
         app = running.app
         text = deployed.log.getvalue()
-    assert through_vault == direct
+    # The same review; through the vault, its way on after it (M6 design M.7, D-200).
+    assert through_vault[:2] == direct[:2]
+    assert direct[2] == ""
+    assert through_vault[2].startswith("Next:\n  Choose its tools:\n")
     assert through_vault[0] == 0
     assert again == through_vault
     assert text.count('"event":"review_job_done"') == 1
@@ -1354,7 +1358,8 @@ def test_a_drift_review_via_vault_carries_the_reviewed_definition(
             monkeypatch, vault, "review", "notes", "--via", "vault", "--format", "json", *socket
         )
     assert clean[0] == 0, clean
-    assert through_vault == direct
+    assert through_vault[:2] == direct[:2]
+    assert through_vault[2].startswith("Next:\n  Choose its tools:\n")
     assert through_vault[0] == 1
     assert "DRIFT" in through_vault[1]
     code, out, _ = as_json

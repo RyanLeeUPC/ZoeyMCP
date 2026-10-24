@@ -21,12 +21,14 @@ from tests.fakes.mcp_server import ZERO_WIDTH, Drift, McpFake, Switch, encoded_f
 from tests.gateway.rig import (
     CLIENTS,
     KEYS,
+    RELOAD_PATH,
     SERVER,
     Running,
     agent,
     deployment,
     gateway,
     pin_of_fake,
+    raw_policy,
     token_for,
     until,
 )
@@ -984,6 +986,29 @@ async def test_the_status_names_servers_and_counts_never_secrets(tmp_path: Path)
     assert report["fresh"] is True
     dumped = json.dumps(report)
     assert "sha256:" not in dumped.replace(report["view"], "")
+
+
+async def test_the_status_and_reviews_carry_the_mode_the_vault_states(tmp_path: Path) -> None:
+    """The gateway keeps the mode the vault states beside the view and names it in its status
+    and on each review answer of its socket, a refusal included (M6 design K.3, G.9). A mode
+    alone moves no view, so the gateway reads the new one on a 304, the view kept."""
+    fake = McpFake()
+    with (
+        deployment(tmp_path, fake, include=TOOLS, review=review(fake)) as deployed,
+        gateway(deployed) as running,
+    ):
+        assert status(running.app)["policy_mode"] == "declarative"
+        answer = httpx.post(f"{running.admin_url}/review/{SERVER}", timeout=60)
+        assert (answer.status_code, answer.json()["policy_mode"]) == (200, "declarative")
+        snapshot = running.app.policy.snapshot
+        managed = {**raw_policy(deployed.fake_url, **deployed.options), "mode": "managed"}
+        reloaded = httpx.post(deployed.vault_url + RELOAD_PATH, json=managed, timeout=10)
+        assert reloaded.status_code == 204
+        await until(lambda: running.app.policy.mode == "managed")
+        assert running.app.policy.snapshot is snapshot  # no new view: a 304 carried it
+        assert status(running.app)["policy_mode"] == "managed"
+        refused = httpx.post(f"{running.admin_url}/review/elsewhere", timeout=60)
+        assert (refused.status_code, refused.json()["policy_mode"]) == (404, "managed")
 
 
 # --- D.3: revocation stops what is in flight ------------------------------------------------------

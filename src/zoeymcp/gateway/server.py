@@ -7,7 +7,10 @@ and re-reads the key file; ``SIGTERM`` (or ``TERM``, or the pipe's end) stops, g
 flight 10 seconds. The admin socket answers ``GET /status``, ``POST /review/<server>`` and
 ``POST /review/<server>/clear`` (:mod:`.review`); the same reviews run for the vault's review
 jobs, one at a time with the socket's (:mod:`.reviewpoll`, M7 design F.3). A summary of the
-status is pushed to the vault (:mod:`.statuspush`, M6 design K.1).
+status is pushed to the vault (:mod:`.statuspush`, M6 design K.1). The status and every review
+answer on the socket carry ``policy_mode``, the mode the vault last stated beside the view
+(``unknown`` before the first), so the CLI in this container, which has no vault socket, knows
+not to print a fragment for a managed deployment (M6 design G.9, E-7).
 
 The SDK's own loggers are silenced: they log session ids and request headers (G20).
 """
@@ -167,7 +170,8 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
     whether ``on_drift: fail`` stopped any of its connections (``pins.evaluate``). ``offered`` is
     what a remote upstream advertises beyond tools, ``None`` before a connection has one
     (fold-in 3.8). With ``pins``, each server's ``unreviewed_pins`` is the pin each of its
-    unreviewed tools is listed at, for the status report (:func:`pushed_status`)."""
+    unreviewed tools is listed at, for the status report (:func:`pushed_status`). ``policy_mode``
+    is the mode the vault last stated beside the view (M6 design K.3)."""
     snapshot = app.policy.snapshot
     servers: dict[str, Any] = {}
     if snapshot is not None:
@@ -224,6 +228,7 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
         "view": snapshot.view.digest if snapshot is not None else None,
         "fresh": app.policy.fresh() is not None,
         "servers": servers,
+        "policy_mode": app.policy.mode,
     }
 
 
@@ -298,11 +303,12 @@ class AdminApp:
             return 405, {"error": "use POST"}
         async with self.app.reviewing:
             try:
-                return 200, await review.review(
+                answer = await review.review(
                     self.app, found.group(1), clear=found.group(2) is not None
                 )
             except review.ReviewError as exc:
-                return exc.status, exc.answer()
+                return exc.status, {**exc.answer(), "policy_mode": self.app.policy.mode}
+        return 200, {**answer, "policy_mode": self.app.policy.mode}
 
     async def _ledger(
         self, method: str, path: str, query: str, body: bytes

@@ -24,6 +24,10 @@ M.7). The vault does the work over its admin socket; this module asks, prompts a
 
 ``--format json`` prints the vault's answers as one ASCII JSON document on stdout instead
 (D-171): ``discover``, then ``fragment`` or ``refused``.
+
+In managed mode the policy is the vault's, not a file to commit: a run first asks the vault's mode
+(``GET /policy``) and, when it is managed, refuses before anything is discovered, naming the
+portal and the host's export and import (M6 design G.9, Y25; :func:`managed_steps`).
 """
 
 from __future__ import annotations
@@ -40,9 +44,17 @@ from urllib.parse import urlsplit
 from ..common.policy import fields
 from ..common.policy.emit import INDENT_MAX
 from ..vault.oauth import dcr
-from ..vault.onboarding import ONBOARDING_TTL, fragment_file
+from ..vault.onboarding import ONBOARDING_TTL, fragment_file, managed_next
 from . import admin_client
-from .review import StillRunning, counts_line, report_counts, untrusted, vault_review, write_json
+from .review import (
+    StillRunning,
+    counts_line,
+    fragment_refused,
+    report_counts,
+    untrusted,
+    vault_review,
+    write_json,
+)
 
 EXIT_OK = 0
 EXIT_FINDINGS = 1
@@ -152,6 +164,27 @@ def next_lines(steps: Sequence[Mapping[str, Any]], prefix: Prefix) -> list[str]:
     for step in steps:
         lines += step_lines(step, prefix)
     return lines
+
+
+def managed_steps(mode: str, *, in_vault: bool = True) -> list[dict[str, Any]]:
+    """In managed mode, the way to change the policy instead of a fragment (``managed_next``, M6
+    design G.9): its commands run in the vault's service when this container is the vault's
+    (``in_vault``), else as typed there. Nothing in another mode."""
+    if mode != "managed":
+        return []
+    return [step.answer() for step in managed_next("exec" if in_vault else None)]
+
+
+def refused_lines(
+    command: str, mode: str, prefix: Prefix, *, in_vault: bool = True
+) -> list[str] | None:
+    """Why ``zoeymcp <command>`` prints no fragment in ``mode`` (G.9), and :func:`managed_steps`
+    after it; None in declarative mode."""
+    reason = fragment_refused(mode)
+    if reason is None:
+        return None
+    steps = managed_steps(mode, in_vault=in_vault)
+    return [f"zoeymcp {command}: {reason}", *next_lines(steps, prefix)]
 
 
 def plan_lines(answer: Mapping[str, Any]) -> list[str]:
@@ -304,6 +337,18 @@ class _Run:
         return code
 
     def start(self) -> int:
+        try:
+            mode = admin_client.policy_head(self.socket)["mode"]
+        except admin_client.AdminUnavailable as exc:
+            return self.refused(exc)
+        reason = fragment_refused(mode)
+        if reason is not None:
+            # A managed policy is changed by a save or an import, never a fragment (G.9).
+            steps = managed_steps(mode)
+            self.answers["refused"] = {"error": reason, "mode": mode, "next": steps}
+            if not self.json:
+                self.say(f"zoeymcp login: {reason}", *next_lines(steps, self.prefix))
+            return self.finish(EXIT_USAGE)
         try:
             plan = admin_client.onboard_discover(self.socket, discover_body(self.args))
         except admin_client.AdminUnavailable as exc:

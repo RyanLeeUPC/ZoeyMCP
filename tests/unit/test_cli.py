@@ -23,6 +23,7 @@ from mcp.types import Tool
 from tests.fakes.oauth_server import AuthSwitch, FakeAuthServer
 from tests.unit import onboard_model
 from zoeymcp.cli import admin_client
+from zoeymcp.cli import choices as review_choices
 from zoeymcp.cli import main as main_module
 from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli import review as review_view
@@ -63,7 +64,14 @@ from zoeymcp.vault.netclient import RESOLVE_TIMEOUT
 from zoeymcp.vault.oauth import fetch
 from zoeymcp.vault.oauth.dcr import NOTES
 from zoeymcp.vault.oauth.tokens import TokenManager
-from zoeymcp.vault.onboarding import INLINE_SOURCE, allow_hosts, next_for, onboard_again
+from zoeymcp.vault.onboarding import (
+    INLINE_SOURCE,
+    allow_hosts,
+    job_next,
+    managed_next,
+    next_for,
+    onboard_again,
+)
 from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
 from zoeymcp.vault.store import SecretStore
 
@@ -889,6 +897,8 @@ class FakeAdmin:
             ("POST", "/oauth/music/login"): (200, STARTED),
             ("POST", "/oauth/music/complete"): (200, COMPLETED),
             ("DELETE", "/oauth/flows/flow-0001"): (200, {"cancelled": True}),
+            # The mode a fragment-printing command asks first (M6 design G.9).
+            ("GET", "/policy"): (200, {"mode": "declarative", "revision": None}),
         }
         self.requests: list[tuple[str, str, Any]] = []
         self.timeouts: list[float] = []
@@ -2686,6 +2696,7 @@ def test_login_mcp_writes_fragment_1_to_stdout_and_the_rest_to_stderr(
     code, out, err = cli([*PUBLIC_ARGV, "--yes"])
     assert (code, out) == (EXIT_OK, FRAGMENT)
     assert onboard_admin.requests == [
+        ("GET", "/policy", None),  # the mode first (M6 design G.9)
         (
             "POST",
             "/onboard/discover",
@@ -2693,8 +2704,8 @@ def test_login_mcp_writes_fragment_1_to_stdout_and_the_rest_to_stderr(
         ),
         ("POST", "/onboard/ob-0001/fragment", {"indent": 0}),
     ]
-    # Discovery waits for its fetches and lookups (the vault's 30 s and 3 x 5 s).
-    assert onboard_admin.timeouts == [60.0, 60.0]
+    # Discovery waits for its fetches and lookups (the vault's 30 s and 3 x 5 s); the mode, 10 s.
+    assert onboard_admin.timeouts == [10.0, 60.0, 60.0]
     assert admin_client.ONBOARD_TIMEOUT == fetch.DISCOVERY_DEADLINE + 3 * RESOLVE_TIMEOUT + 15
     assert err == (
         f"Discovering {URL}\n"
@@ -2820,6 +2831,7 @@ def test_a_piped_client_secret_with_yes_goes_only_to_register(onboard_admin: Fak
     code, out, err = cli([*SECRET_ARGV, "--yes", "--for", "compose"], io.StringIO(secret + "\n"))
     assert (code, out) == (EXIT_OK, " " * 8 + FRAGMENT)
     assert onboard_admin.requests == [
+        ("GET", "/policy", None),
         (
             "POST",
             "/onboard/discover",
@@ -2942,7 +2954,7 @@ def test_a_draft_check_error_stops_before_anything_is_asked(onboard_admin: FakeA
     assert (code, out) == (EXIT_FINDINGS, "")
     assert "  error   routes[3].prefix: /notes is taken[U+0007]\n" in err
     assert err.endswith(f"Next:\n  {fix['label']}\n")
-    assert [request[1] for request in onboard_admin.requests] == ["/onboard/discover"]
+    assert [request[1] for request in onboard_admin.requests] == ["/policy", "/onboard/discover"]
 
 
 def test_plan_only_stops_after_the_plan(onboard_admin: FakeAdmin) -> None:
@@ -2952,7 +2964,7 @@ def test_plan_only_stops_after_the_plan(onboard_admin: FakeAdmin) -> None:
         "Plan only: nothing was registered or stored. The same command without --plan-only "
         "carries on from this plan within 30 minutes.\n"
     )
-    assert [request[1] for request in onboard_admin.requests] == ["/onboard/discover"]
+    assert [request[1] for request in onboard_admin.requests] == ["/policy", "/onboard/discover"]
 
 
 def proxy_refusal() -> dict[str, Any]:
@@ -3108,6 +3120,7 @@ def test_a_registration_from_the_cli(onboard_admin: FakeAdmin) -> None:
     code, out, err = cli([*argv, "--yes", "--indent", "4"])
     assert (code, out) == (EXIT_OK, FRAGMENT)
     assert onboard_admin.requests == [
+        ("GET", "/policy", None),
         ("POST", "/onboard/discover", {"url": URL, "name": "notes", "callback_origin": origin}),
         ("POST", "/onboard/ob-0001/register", {}),
         ("POST", "/onboard/ob-0001/fragment", {"indent": 4}),
@@ -3614,7 +3627,10 @@ def test_login_then_two_reviews_read_one_report(vault: Vault) -> None:
     for _ in range(2):
         code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
         # Nothing is included yet, so the server lists tools nobody reviewed (M6 design J.5).
-        assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+        assert code == review_view.EXIT_NEEDS_OPERATOR
+        # The vault's way on, the second run's own (M6 design M.7, D-200): choose the tools.
+        assert err.startswith("Next:\n  Choose its tools:\n")
+        assert err.endswith(f"    {SECOND_CHOICES}\n")
         shown.append(out)
     assert shown[0] == shown[1]
     assert vault.reviews.queued == ["notes"]
@@ -3913,6 +3929,373 @@ def test_auto_takes_the_gateways_socket_when_the_container_has_it(
         assert review_view.pick_via("auto", socket, present.__contains__) == picked
     assert review_view.pick_via("vault", None, lambda path: False) == "vault"
     assert review_view.pick_via("gateway", None, lambda path: True) == "gateway"
+
+
+# --- the mode: no fragment in managed mode (M6 design G.9, M.6, Y25; step 14b) ------------------
+
+# Every review option that makes a fragment; each ID is the option's name.
+FRAGMENT_OPTIONS = [
+    ["--add", "list_notes"],
+    ["--allow", "list_notes"],
+    ["--approve", "export_all"],
+    ["--allow-read-only"],
+    ["--repin", "list_notes"],
+    ["--decline", "export_all"],
+    ["--decline-rest"],
+    ["--choices", "-"],
+]
+
+
+def option_id(options: list[str]) -> str:
+    return options[0].removeprefix("--")
+
+
+def managed_refusal(command: str, run: str = "") -> str:
+    """The managed refusal as the CLI prints it: the reason, then the portal and the host's
+    export and import, each command after ``run`` (the vault's service), or with none, as typed
+    in the vault's container."""
+    where = " (in the vault's container)" if not run else ""
+    return (
+        f"zoeymcp {command}: this deployment is managed: save it in the portal, or export, edit "
+        "and import\n" + managed_way_on(run, where)
+    )
+
+
+def managed_way_on(run: str, where: str = "") -> str:
+    return (
+        "Next:\n"
+        "  Save the change in the portal\n"
+        f"  Or export the policy{where}:\n"
+        f"    {run}zoeymcp policy export > policy.yaml\n"
+        f"  Edit policy.yaml, then import it{where}; it shows the plan, and the same with --yes "
+        "writes it:\n"
+        f"    {run}zoeymcp policy import - < policy.yaml\n"
+    )
+
+
+IN_VAULT = f"{HARDENED} exec -T vault "
+
+
+def choices_for(report: dict[str, Any], job: str = review_choices.NO_JOB) -> io.StringIO:
+    """An unedited choices file for ``report``, as ``--choose`` writes it."""
+    return io.StringIO(
+        "".join(f"{line}\n" for line in review_choices.render(report, job, suggest=False))
+    )
+
+
+@pytest.fixture
+def no_prefix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """No compose variables, and the vault's socket where nothing is: the gateway's container.
+    Returns that socket's path."""
+    for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    socket = tmp_path / "vault-admin.sock"
+    monkeypatch.setenv(SOCKET_ENV, str(socket))
+    return socket
+
+
+@pytest.mark.parametrize("options", FRAGMENT_OPTIONS, ids=option_id)
+@pytest.mark.parametrize("mode", ["managed", "unknown", "declarative"])
+def test_a_fragment_over_the_gateways_socket_follows_the_mode_it_names(
+    admin: FakeAdmin, no_prefix: Path, options: list[str], mode: str
+) -> None:
+    """Y25's CLI half in the gateway's container: the review answer names the mode the vault
+    last stated; managed refuses with the way on, as typed in the vault's container, and
+    ``unknown`` (no view yet) refuses to guess. Declarative prints the fragment as before."""
+    report = vault_report()
+    admin.answers[("POST", "/review/notes")] = (200, {**report, "policy_mode": mode})
+    argv = ["review", "notes", "--via", "gateway", *options, "--socket", "x"]
+    code, out, err = cli(argv, choices_for(report))
+    if mode == "declarative":
+        assert "this deployment is managed" not in err
+        assert review_view.MODE_UNKNOWN not in err
+        assert (code, "zoeymcp review: --repin" in err) == (
+            (2, True) if "--repin" in options else (1, False)
+        )
+        return
+    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    if mode == "managed":
+        assert err == managed_refusal("review")
+    else:
+        assert err == f"zoeymcp review: {review_view.MODE_UNKNOWN}\n"
+
+
+def test_the_standard_tiers_container_names_the_vaults_service(
+    admin: FakeAdmin, no_prefix: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the vault's socket is in the same container (the standard tier's one), the way on
+    runs in that service, as the compose variables name it."""
+    no_prefix.write_bytes(b"")
+    monkeypatch.setenv(onboard_cli.COMPOSE_CMD_ENV, "docker compose -f deploy/compose.yaml")
+    monkeypatch.setenv(onboard_cli.EXEC_SERVICE_ENV, "zoeymcp")
+    admin.answers[("POST", "/review/notes")] = (200, {**vault_report(), "policy_mode": "managed"})
+    code, out, err = cli(["review", "notes", "--add", "list_notes", "--socket", "x"])
+    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert err == managed_refusal(
+        "review", "docker compose -f deploy/compose.yaml exec -T zoeymcp "
+    )
+
+
+def test_a_gateway_that_names_no_mode_is_older_than_managed_mode(admin: FakeAdmin) -> None:
+    """An answer without ``policy_mode`` is from a gateway older than managed mode, which only a
+    declarative vault runs; a value the CLI doesn't know is ``unknown``."""
+    assert review_view.answered_mode({}) == "declarative"
+    for mode in ("managed", "declarative", "unknown"):
+        assert review_view.answered_mode({"policy_mode": mode}) == mode
+    assert review_view.answered_mode({"policy_mode": "Managed"}) == "unknown"
+    assert review_view.answered_mode({"policy_mode": None}) == "unknown"
+    assert review_view.fragment_refused("declarative") is None
+    assert review_view.fragment_refused("managed") == review_view.MANAGED_REFUSED
+    assert review_view.fragment_refused("unknown") == review_view.MODE_UNKNOWN
+
+
+def test_a_clear_refused_on_the_gateways_socket_follows_the_mode_too(
+    admin: FakeAdmin, no_prefix: Path
+) -> None:
+    """``--clear`` with an option that makes a fragment: the refused clear's review is printed
+    only as the mode allows."""
+    refused = {
+        "error": "not every included tool matches its pin: a",
+        "reason": "not_clean",
+        "review": vault_report(),
+        "policy_mode": "managed",
+    }
+    admin.answers[("POST", "/review/notes/clear")] = (409, refused)
+    code, out, err = cli(["review", "notes", "--clear", "--add", "list_notes", "--socket", "x"])
+    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert err == (
+        "zoeymcp review: --clear refused: not every included tool matches its pin: a\n"
+        + managed_refusal("review")
+    )
+    # Without one, the refused clear's review is printed with the way on for its snippet.
+    code, out, err = cli(["review", "notes", "--clear", "--socket", "x"])
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    assert out == without_snippet(vault_report())
+    assert err == (
+        "zoeymcp review: --clear refused: not every included tool matches its pin: a\n"
+        + managed_way_on("", " (in the vault's container)")
+    )
+
+
+@pytest.mark.parametrize("options", FRAGMENT_OPTIONS, ids=option_id)
+def test_a_fragment_through_the_vault_asks_its_mode_first(
+    admin: FakeAdmin, no_prefix: Path, options: list[str]
+) -> None:
+    """Through the vault the CLI asks ``GET /policy`` before anything is queued: in managed mode
+    it refuses, with the way on in the vault's service; nothing reaches the gateway."""
+    admin.answers[("GET", "/policy")] = (200, {"mode": "managed", "revision": 3})
+    argv = ["review", "notes", "--via", "vault", *options, "--socket", "x"]
+    code, out, err = cli(argv, choices_for(vault_report(), "job-0001"))
+    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert err == managed_refusal("review", IN_VAULT)
+    assert admin.requests == [("GET", "/policy", None)]
+
+
+def test_a_declarative_vault_queues_the_review_after_its_mode(
+    admin: FakeAdmin, no_prefix: Path
+) -> None:
+    report = vault_report()
+    admin.answers[("POST", "/review/notes")] = (200, job_answer("done", report=report, next=[]))
+    code, out, err = cli(
+        ["review", "notes", "--via", "vault", "--add", "list_notes", "--socket", "x"]
+    )
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+    assert "# YAML to commit (declarative mode). Review the changes above first.\n" in out
+    assert [path for _, path, _ in admin.requests] == ["/policy", "/review/notes"]
+    admin.answers[("GET", "/policy")] = (503, {"error": "the vault is starting"})
+    code, out, err = cli(["review", "notes", "--via", "vault", "--decline-rest", "--socket", "x"])
+    assert (code, out, err) == (2, "", "zoeymcp review: the vault is starting\n")
+
+
+@pytest.mark.parametrize("output", ["text", "json"])
+def test_fragment_2_made_through_the_vault_ends_without_the_way_to_it(
+    admin: FakeAdmin, no_prefix: Path, output: str
+) -> None:
+    """After options that made fragment 2, the vault's ``next`` (choosing the tools, which leads
+    to fragment 2) is behind the operator: neither stderr nor the JSON carries it."""
+    report = vault_report()
+    steps = [step.answer() for step in job_next("notes", clear=False)]
+    assert steps
+    admin.answers[("POST", "/review/notes")] = (
+        200,
+        job_answer("done", report=report, next=steps),
+    )
+    argv = ["review", "notes", "--via", "vault", "--add", "list_notes", "--format", output]
+    code, out, err = cli([*argv, "--socket", "x"])
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+    if output == "json":
+        document = json.loads(out)
+        assert "next" not in document
+        assert "list_notes" in "\n".join(document["snippet"])
+    else:
+        assert "# YAML to commit (declarative mode). Review the changes above first.\n" in out
+    # Without them, the same review ends with the way on, as before.
+    code, out, err = cli(["review", "notes", "--via", "vault", "--format", output, "--socket", "x"])
+    if output == "json":
+        assert (err, json.loads(out)["next"]) == ("", steps)
+    else:
+        assert err == "".join(f"{line}\n" for line in next_lines(steps))
+
+
+def next_lines(steps: list[dict[str, Any]]) -> list[str]:
+    return onboard_cli.next_lines(steps, onboard_cli.Prefix.from_environ(os.environ))
+
+
+def without_snippet(report: dict[str, Any]) -> str:
+    """The managed text of a review: the declarative one without its snippet to commit."""
+    lines = review_view.render(report, review_view.Choices(), managed=True)
+    return "".join(f"{review_view.untrusted(line, 1_000_000)}\n" for line in lines)
+
+
+def test_a_read_only_review_works_in_managed_mode_with_the_vaults_way_on(
+    admin: FakeAdmin, no_prefix: Path
+) -> None:
+    """A review that makes no fragment asks no mode and works in managed mode, without the
+    snippet to commit (Y25); through the vault the vault's ``next``, the save or the host's
+    import (M.7, D-200), stands in its place on stderr, or in its JSON."""
+    report = vault_report()
+    steps = [step.answer() for step in managed_next()]
+    admin.answers[("POST", "/review/notes")] = (
+        200,
+        job_answer("done", reused=True, report=report, next=steps),
+    )
+    code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    assert out == without_snippet(report)
+    assert "commit" not in out
+    assert err == managed_way_on(IN_VAULT)
+    code, out, err = cli(["review", "notes", "--via", "vault", "--format", "json", "--socket", "x"])
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+    assert json.loads(out) == {**report, "next": steps}
+    code, out, err = cli(["review", "notes", "--via", "vault", "--choose", "--socket", "x"])
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")  # the file alone, as before
+    assert out.startswith("# zoeymcp review notes: ")
+    assert "/policy" not in [path for _, path, _ in admin.requests]
+
+
+def test_a_read_only_review_on_the_gateways_socket_names_the_way_on_itself(
+    admin: FakeAdmin, no_prefix: Path
+) -> None:
+    """Over the gateway's socket, which has no vault ``next``, a managed review's way on is the
+    CLI's own save, export and import, as typed in the vault's container; declarative prints the
+    snippet as before."""
+    report = vault_report()
+    admin.answers[("POST", "/review/notes")] = (200, {**report, "policy_mode": "managed"})
+    code, out, err = cli(["review", "notes", "--via", "gateway", "--socket", "x"])
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    assert (out, err) == (
+        without_snippet(report),
+        managed_way_on("", " (in the vault's container)"),
+    )
+    code, out, err = cli(
+        ["review", "notes", "--via", "gateway", "--format", "json", "--socket", "x"]
+    )
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+    steps = [step.answer() for step in managed_next(None)]
+    assert json.loads(out) == {**report, "next": steps}
+    admin.answers[("POST", "/review/notes")] = (200, {**report, "policy_mode": "declarative"})
+    code, out, err = cli(["review", "notes", "--via", "gateway", "--socket", "x"])
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+    assert out == "".join(
+        f"{review_view.untrusted(line, 1_000_000)}\n"
+        for line in review_view.render(report, review_view.Choices())
+    )
+
+
+@pytest.mark.parametrize("mode", ["managed", "unknown", "declarative", None])
+def test_the_mode_is_no_part_of_the_review_the_cli_prints(
+    admin: FakeAdmin, no_prefix: Path, mode: str | None
+) -> None:
+    """The gateway's ``policy_mode`` is beside its review, not in it: the JSON leaves it out
+    (as the same review through the vault does), and the choices file ``--choose`` writes, its
+    report digest included, is the same whatever mode the gateway named."""
+    report = vault_report()
+    answer = report if mode is None else {**report, "policy_mode": mode}
+    admin.answers[("POST", "/review/notes")] = (200, answer)
+    code, out, _ = cli(["review", "notes", "--via", "gateway", "--format", "json", "--socket", "x"])
+    assert code == review_view.EXIT_NEEDS_OPERATOR
+    assert "policy_mode" not in json.loads(out)
+    code, out, err = cli(["review", "notes", "--via", "gateway", "--choose", "--socket", "x"])
+    assert (code, err) == (review_view.EXIT_NEEDS_OPERATOR, "")
+    assert out == choices_for(report).getvalue()
+    assert review_choices.report_digest(report) in out
+
+
+def test_a_refusal_through_the_vault_prints_its_way_on(admin: FakeAdmin, no_prefix: Path) -> None:
+    """D-200: a review refusal's ``next`` is printed after it, in the vault's words."""
+    again = {
+        "do": "review",
+        "label": "Review again",
+        "command": "zoeymcp review notes --via vault --fresh",
+        "via": "exec",
+    }
+    busy = {"error": "Another review of notes is running.", "reason": "review_busy"}
+    admin.answers[("POST", "/review/notes")] = (409, {**busy, "next": [again]})
+    code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
+    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert err == (
+        "zoeymcp review: Another review of notes is running.\n"
+        "Next:\n"
+        "  Review again:\n"
+        f"    {HARDENED} exec vault zoeymcp review notes --via vault --fresh\n"
+    )
+
+
+def test_login_mcp_refuses_in_managed_mode(onboard_admin: FakeAdmin) -> None:
+    """Fragment 1 is a declarative commit: in managed mode ``login --mcp`` asks the vault's mode
+    and refuses before anything is discovered, naming the portal and the host's import."""
+    onboard_admin.answers[("GET", "/policy")] = (200, {"mode": "managed", "revision": 2})
+    code, out, err = cli([*PUBLIC_ARGV, "--yes"])
+    assert (code, out) == (onboard_cli.EXIT_USAGE, "")
+    assert err == managed_refusal("login", IN_VAULT)
+    code, out, err = cli([*PUBLIC_ARGV, "--yes", "--format", "json"])
+    assert (code, err) == (onboard_cli.EXIT_USAGE, "")
+    assert json.loads(out) == {
+        "refused": {
+            "error": review_view.MANAGED_REFUSED,
+            "mode": "managed",
+            "next": [step.answer() for step in managed_next()],
+        }
+    }
+    assert [request[1] for request in onboard_admin.requests] == ["/policy", "/policy"]
+    onboard_admin.answers[("GET", "/policy")] = (503, {"error": "the vault is stopping"})
+    code, out, err = cli([*PUBLIC_ARGV, "--yes"])
+    assert (code, out, err) == (EXIT_FINDINGS, "", "zoeymcp login: the vault is stopping\n")
+
+
+def managed_example() -> str:
+    return EXAMPLE_POLICY.read_text(encoding="utf-8").replace("mode: declarative", "mode: managed")
+
+
+def test_check_of_a_managed_document_says_it_isnt_the_running_revision(tmp_path: Path) -> None:
+    """``check`` (with ``--with`` and ``--emit-egress-allowlist`` too) and ``selftest`` read the
+    document they are given, never the head: of a managed one they say so on stderr (M.6)."""
+    said = f"zoeymcp check: {main_module.NOT_THE_HEAD}\n"
+    assert main_module.NOT_THE_HEAD == (
+        "checking this document, not the running revision: to check what runs, pipe zoeymcp "
+        "policy export into this command with --config -"
+    )
+    code, out, err = cli(["check", "--config", "-"], io.StringIO(managed_example()))
+    assert (code, err) == (EXIT_OK, said)
+    assert out.endswith(": ok (0 error(s), 2 warning(s))\n")
+    assert cli(["check", "--config", str(EXAMPLE_POLICY)])[2] == ""
+    code, out, err = cli(
+        ["check", "--config", "-", "--emit-egress-allowlist"], io.StringIO(managed_example())
+    )
+    assert (code, out.startswith("# zoeymcp egress allowlist, lists ")) == (EXIT_OK, True)
+    assert err.startswith(said)
+    fragment = tmp_path / "onboard-notes-2.yaml"
+    fragment.write_bytes(b"gateway:\n  clients: {}\n")
+    argv = ["check", "--config", "-", "--with", str(fragment)]
+    assert cli(argv, io.StringIO(managed_example()))[2] == said
+    assert cli(["check", "--config", str(EXAMPLE_POLICY), "--with", str(fragment)])[2] == ""
+    cases = str(tmp_path / "no-cases.yaml")
+    code, out, err = cli(
+        ["selftest", "--config", "-", "--cases", cases], io.StringIO(managed_example())
+    )
+    assert err == f"zoeymcp selftest: {main_module.NOT_THE_HEAD}\n"
+    assert (code, out.startswith(f"zoeymcp selftest: can't use {cases}: ")) == (2, True)
+    assert cli(["selftest", "--config", str(EXAMPLE_POLICY), "--cases", cases])[2] == ""
 
 
 def test_the_counts_line() -> None:

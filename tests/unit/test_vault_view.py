@@ -26,7 +26,7 @@ from tests.unit.report_model import asked_line
 from zoeymcp.common import ledgerreport
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.view import build_view, dump_view
+from zoeymcp.common.policy.view import MODE_HEADER, build_view, dump_view
 from zoeymcp.vault import app as app_module
 from zoeymcp.vault import logs, reportstore
 from zoeymcp.vault.app import (
@@ -251,6 +251,34 @@ async def test_an_encoded_path_is_the_same_view(rig: Rig) -> None:
     response = await rig.call("/%5Fzoeymcp/gateway/v1/%76iew")
     assert response.status_code == 200
     assert response.headers["etag"] == f'"{rig.app.view_digest}"'
+
+
+# --- the mode header (M6 design K.3, G.9) ------------------------------------------------------
+
+
+async def test_the_mode_is_stated_beside_the_view_and_outside_its_digest(tmp_path: Path) -> None:
+    """The 200 and the 304 both state the policy's mode, so a gateway learns it whichever it
+    gets; a mode alone moves no view, digest or review job; a refusal states none."""
+    rigs = {}
+    for mode in ("declarative", "managed"):
+        folder = tmp_path / mode
+        folder.mkdir(mode=0o700)
+        rigs[mode] = Rig(folder, Policy.model_validate({**raw_policy(), "mode": mode}))
+    try:
+        served = {}
+        for mode, rig in rigs.items():
+            whole = await rig.call()
+            assert (whole.status_code, whole.headers[MODE_HEADER]) == (200, mode)
+            same = await rig.call(headers=rig.tag())
+            assert (same.status_code, same.headers[MODE_HEADER]) == (304, mode)
+            refused = await rig.call(listener=None)
+            assert refused.headers.get_list(REFUSAL_HEADER) == [REFUSAL_MARKER]
+            assert MODE_HEADER not in refused.headers
+            served[mode] = (rig.app.view_digest, whole.content, whole.headers["etag"])
+        assert served["managed"] == served["declarative"]
+    finally:
+        for rig in rigs.values():
+            await rig.app.aclose()
 
 
 async def test_a_policy_without_a_gateway_section_has_the_default_view(tmp_path: Path) -> None:

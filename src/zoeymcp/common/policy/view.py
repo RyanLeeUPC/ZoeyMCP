@@ -10,7 +10,9 @@ route prefix, the connector's kind (never its name) and the toolkit's rules as f
 ``digest`` is the canonical digest of everything else, so it changes exactly when the view does.
 A field M6 added (``declined``, M6 design A.3) is left out of both the digest and the served bytes
 while it is empty, so a policy that doesn't use it keeps the view an M7 vault served, digest and
-all, and an older gateway meets the field only once the operator uses it (CR-6, CR-7).
+all, and an older gateway meets the field only once the operator uses it (CR-6, CR-7). The
+policy's mode isn't in the view: the vault states it beside every view answer, in the header
+:data:`MODE_HEADER` (M6 design K.3, G.9), so a mode alone moves no view, digest or review job.
 The module is pure and needs only pydantic, so the vault builds the view without the gateway's
 dependencies, and the gateway parses it with the same models.
 """
@@ -52,6 +54,10 @@ from .schema import (
 
 VIEW_VERSION: Literal[1] = 1
 MAX_VIEW_BYTES = 8 * 2**20
+# The vault's mode, on the view's 200 and 304, outside the body and its digest (M6 design K.3).
+# The gateway keeps the last one it read, ``unknown`` before its first view (G.9).
+MODE_HEADER: Final = "x-zoeymcp-policy-mode"
+PolicyMode = Literal["managed", "declarative", "unknown"]
 # A route prefix and a server path, as the schema and check allow them.
 VaultPath = Annotated[
     str, StringConstraints(pattern=r"^/[a-z0-9][a-z0-9_-]{0,62}/[A-Za-z0-9._~/-]{0,1023}$")
