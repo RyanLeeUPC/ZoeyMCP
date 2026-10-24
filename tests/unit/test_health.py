@@ -8,7 +8,8 @@ past its expiry, on the wall clock; (step 16) the address guard's refusals, ``ad
 (step 18d) the bridges' routes: ``program_unconfined``, ``loopback_bridge_route``,
 ``bridge_socket_unknown`` and ``program_secret_unflagged`` (C.10, Q46). M6 (design M.5, step 7):
 the ``gateway`` section from the gateway's status report: ``tools_unreviewed``, ``drift_marked``,
-``server_blocked``, ``server_listing_invalid`` and ``gateway_status_stale``.
+``server_blocked``, ``server_listing_invalid`` and ``gateway_status_stale``; (step 13b) the
+``policy`` section from the policy store's state, in managed and declarative mode.
 
 :func:`assess` takes clear metadata only, so nothing here has a value to decrypt; the admin
 socket's test checks that against a store whose decryption raises.
@@ -37,6 +38,7 @@ from zoeymcp.vault.health import (
     Inputs,
     LedgerCopy,
     PasskeyState,
+    PolicyState,
     Sends,
     assess,
     failure_text,
@@ -2519,3 +2521,160 @@ def test_the_summary_counts_the_gateway() -> None:
         "info": without["info"] + 1,
     }
     assert found["gateway"]["level"] == "warning"
+
+
+# --- the policy store (M6 design M.5, step 13b) ------------------------------------------------
+
+EMPTY = Policy.model_validate({"version": 1, "mode": "managed"})
+IGNORED_NEXT = (
+    "Remove ZOEYMCP_CONFIG; or accept it as it is, without applying it: zoeymcp policy import "
+    "--from-env --baseline-only; or apply it: zoeymcp policy import --from-env (the plan shows "
+    "what it undoes)"
+)
+
+
+def policy_section(state: PolicyState) -> dict[str, Any]:
+    section: dict[str, Any] = report(EMPTY, policy_state=state)["policy"]
+    return section
+
+
+def test_no_store_no_policy_section() -> None:
+    """A declarative deployment that never ran managed has no store: its report is as before."""
+    assert "policy" not in report(EMPTY)
+
+
+def test_a_managed_head_running_as_saved_is_quiet() -> None:
+    assert policy_section(PolicyState("managed", revision=4)) == {
+        "mode": "managed",
+        "revision": 4,
+        "level": "ok",
+        "findings": [],
+    }
+
+
+def test_every_managed_finding() -> None:
+    """M.5's managed rows, in order, each with its text and action; the summary counts them."""
+    state = PolicyState(
+        "managed",
+        revision=9,
+        oldest=3,
+        not_running=9,
+        seed_ignored="changed",
+        restart_needed=(("admin.listen", "the portal keeps listening where it started"),),
+        unreadable=(4, 6),
+        quarantine=3,
+    )
+    found = report(EMPTY, policy_state=state)
+    section = found["policy"]
+    assert section["level"] == "error"
+    assert [
+        (f["code"], f["level"], f["text"], f["action"], f["advisory"]) for f in section["findings"]
+    ] == [
+        (
+            "policy_not_running",
+            "error",
+            "revision 9 is saved but not running: send SIGHUP to the vault or restart it",
+            {"kind": "reload_vault"},
+            False,
+        ),
+        (
+            "policy_seed_ignored",
+            "warning",
+            "ZOEYMCP_CONFIG has changed since the policy was seeded from it and is ignored: the "
+            f"policy is revision 9. {IGNORED_NEXT}",
+            {"kind": "import_from_env"},
+            False,
+        ),
+        (
+            "policy_restart_needed",
+            "warning",
+            "admin.listen: the portal keeps listening where it started",
+            None,
+            False,
+        ),
+        (
+            "revisions_unreadable",
+            "warning",
+            "revisions 4, 6 failed to verify and are in quarantine: rollback to them is refused",
+            None,
+            False,
+        ),
+        (
+            "policy_quarantine_kept",
+            "info",
+            "3 file(s) in /state/policy/quarantine: delete them once you don't need them",
+            None,
+            False,
+        ),
+    ]
+    assert found["summary"] == {"error": 1, "warning": 3, "info": 1}
+
+
+@pytest.mark.parametrize(
+    ("reason", "said"),
+    [
+        ("changed", "has changed since the policy was seeded from it"),
+        ("unreadable", "doesn't load"),
+        ("fails_check", "fails check"),
+    ],
+    ids=["changed", "unreadable", "fails_check"],
+)
+def test_the_seed_ignored_text_says_why(reason: str, said: str) -> None:
+    [finding] = policy_section(PolicyState("managed", revision=2, seed_ignored=reason))["findings"]
+    assert finding[
+        "text"
+    ] == f"ZOEYMCP_CONFIG {said} and is ignored: the policy is revision 2. " + (IGNORED_NEXT)
+
+
+def test_a_parked_store_and_what_the_declarative_policy_revives() -> None:
+    """F.4, T-16: the parked store is information; what the running declarative policy brings
+    back that the parked ratchet retired is a warning naming each, by its grant subject."""
+    state = PolicyState(
+        "declarative", revision=9, oldest=2, revived=("client:agent2", "pin:notes/tool/list")
+    )
+    section = policy_section(state)
+    assert (section["mode"], section["revision"], section["level"]) == ("declarative", 9, "warning")
+    assert [(f["code"], f["level"], f["text"], f["action"]) for f in section["findings"]] == [
+        (
+            "policy_store_parked",
+            "info",
+            "revisions 2-9 are kept and unused while the mode is declarative; to return, set "
+            "mode: managed: the policy you run then becomes revision 10",
+            None,
+        ),
+        (
+            "policy_declarative_revives",
+            "warning",
+            "the declarative policy brings back client:agent2, pin:notes/tool/list, which "
+            "managed mode had removed",
+            {"kind": "fix_policy"},
+        ),
+    ]
+
+
+def test_a_parked_store_counts_from_revision_one_by_default() -> None:
+    [finding] = policy_section(PolicyState("declarative", revision=1))["findings"]
+    assert finding["text"].startswith("revisions 1-1 are kept")
+
+
+def test_a_store_a_declarative_start_couldnt_read() -> None:
+    section = policy_section(PolicyState("declarative", unverified="key_unknown", quarantine=1))
+    assert [(f["code"], f["level"], f["text"]) for f in section["findings"]] == [
+        (
+            "policy_store_unverified",
+            "warning",
+            "the policy store doesn't verify (key_unknown): a return to managed will refuse",
+        ),
+        (
+            "policy_quarantine_kept",
+            "info",
+            "1 file(s) in /state/policy/quarantine: delete them once you don't need them",
+        ),
+    ]
+    assert section["revision"] is None
+
+
+def test_the_declarative_findings_are_declaratives_only() -> None:
+    """A managed state never says parked, revived or unverified, whatever it holds."""
+    state = PolicyState("managed", revision=3, revived=("client:a",), unverified="tampered")
+    assert policy_section(state)["findings"] == []

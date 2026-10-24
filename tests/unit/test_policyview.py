@@ -398,9 +398,43 @@ def test_the_answer_shape_and_the_source() -> None:
         "env": "the ZOEYMCP_CONFIG environment variable",
         "file": "the file given with --config",
         "stdin": "standard input, read once at start",
+        "managed": "the vault's policy store (managed mode)",
     }
     for source in get_args(Source):
         assert rendered(source=source)["source_shown"] == SOURCES[source]
+
+
+# A head revision's header, as the store keeps it (M6 design D.2): 2026-10-24T09:05:59Z.
+HEADER = {"revision": 18, "created": 1_792_832_759}
+
+
+@pytest.mark.parametrize(
+    ("author", "who"),
+    [
+        ({"by": "passkey", "fingerprint": "0123456789abcdef"}, "passkey 01234567"),
+        ({"by": "host", "via": "socket"}, "the host (socket)"),
+        ({"by": "host", "via": "offline"}, "the host (offline)"),
+        ({"by": "seed"}, "the seed"),
+    ],
+    ids=["passkey", "socket", "offline", "seed"],
+)
+def test_a_managed_policy_names_its_revision(author: dict[str, str], who: str) -> None:
+    """M6 design A.4: in managed mode the view says which revision runs, when it was saved (UTC,
+    to the minute) and by whom; without a header it says the store."""
+    header = {**HEADER, "author": author}
+    expected = f"revision 18, saved 2026-10-24 09:05 UTC by {who}"
+    assert policyview.saved(header) == expected
+    admin = {"listen": "127.0.0.1:8081", "origins": ["http://localhost:8081"]}
+    policy = Policy.model_validate({"version": 1, "mode": "managed", "admin": admin})
+    answer = view(policy, "managed", header=header)
+    assert (answer["mode"], answer["source"], answer["source_shown"]) == (
+        "managed",
+        "managed",
+        expected,
+    )
+    assert view(policy, "managed")["source_shown"] == SOURCES["managed"]
+    # A declarative source never reads a header.
+    assert view(policy, "env", header=header)["source_shown"] == SOURCES["env"]
 
 
 def test_everything_else_is_shown_as_written_in_the_schemas_order() -> None:

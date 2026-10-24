@@ -431,7 +431,9 @@ class HealthReader:
     ``egress_allowlist_stale``). ``bridges`` is the tier and the bridges the vault was started
     with (M7 design C.10, J; by default the hardened tier's: no link socket, no bridge).
     ``gateway_status`` is the gateway's latest status report (``VaultApp``'s, M6 design K.1);
-    without it, the report has no ``gateway`` section."""
+    without it, the report has no ``gateway`` section. ``policy_state`` is the policy store's
+    (``vault/managed.py``, M6 design M.5); without it, or while it answers None (no store), the
+    report has no ``policy`` section."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -444,6 +446,7 @@ class HealthReader:
     egress_fetched_ago: Callable[[], float | None] | None = None
     bridges: health.Bridges = field(default_factory=health.Bridges)
     gateway_status: Callable[[], GatewayStatus] | None = None
+    policy_state: Callable[[], health.PolicyState | None] | None = None
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -464,6 +467,7 @@ class HealthReader:
             else self.egress_fetched_ago(),
             bridges=self.bridges,
             gateway_status=None if self.gateway_status is None else self.gateway_status(),
+            policy_state=None if self.policy_state is None else self.policy_state(),
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report
@@ -532,6 +536,7 @@ class AdminApp:
         egress_fetched_ago: Callable[[], float | None] | None = None,
         bridges: health.Bridges | None = None,
         gateway_status: Callable[[], GatewayStatus] | None = None,
+        policy_state: Callable[[], health.PolicyState | None] | None = None,
         random: Callable[[int], bytes] = secrets.token_bytes,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
@@ -565,7 +570,8 @@ class AdminApp:
         findings (M7 design C.10, J). Without it, health judges routes as the hardened tier's.
 
         ``gateway_status`` is the gateway's latest status report, for health's ``gateway``
-        section (M6 design K.1, M.5). Without it, health has none.
+        section (M6 design K.1, M.5). Without it, health has none. ``policy_state`` is the
+        policy store's, for health's ``policy`` section (M.5); without it, health has none.
 
         ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests)."""
         self._store = store
@@ -596,6 +602,7 @@ class AdminApp:
             egress_fetched_ago=egress_fetched_ago,
             bridges=bridges or health.Bridges(),
             gateway_status=gateway_status,
+            policy_state=policy_state,
         )
         self.app = Starlette(
             routes=[

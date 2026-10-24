@@ -76,6 +76,19 @@ reports invalid and no drift finding names already (counted), or whose status th
 (T-7).
 A gateway that hasn't reported for :data:`STATUS_STALE` seconds is ``gateway_status_stale``
 (info): its findings are then as old.
+
+The ``policy`` section (M6 design M.5, F.4-F.6, G.6) reads the policy store's state
+(:class:`PolicyState`), only while there is a store: a declarative deployment that never ran
+managed has none, and its report is as before. In managed mode: ``policy_not_running`` (error), a
+revision saved but not running since its install failed, until a ``SIGHUP`` or a restart installs
+it; ``policy_seed_ignored`` (warning), a configured source that differs from the seed and the head
+(F.5; the OAuth seed's ``seed_ignored`` keeps its name); ``policy_restart_needed`` (warning), each
+change installed since the start that needs a restart (I.2); ``revisions_unreadable`` (warning),
+kept revisions that failed to verify. In declarative mode: ``policy_store_parked`` (info),
+``policy_declarative_revives`` (warning) for what the running policy brings back that the parked
+ratchet retired (T-16), and ``policy_store_unverified`` (warning), a store the start couldn't read.
+In both, ``policy_quarantine_kept`` (info) counts the quarantine's files. Every text holds revision
+numbers, grant subjects (policy names) and fixed words only (Y13).
 """
 
 from __future__ import annotations
@@ -207,6 +220,34 @@ class Inputs:
     # The gateway's latest status report and its age (M6 design K.1), or None without one to
     # report: the report then has no gateway section (VaultApp.gateway_status).
     gateway_status: GatewayStatus | None = None
+    # The policy store's state (M6 design M.5), or None without a store: the report then has no
+    # policy section (vault/managed.py).
+    policy_state: PolicyState | None = None
+
+
+@dataclass(frozen=True)
+class PolicyState:
+    """The policy store, summed up for health (M6 design M.5): revision numbers, a reason code
+    and grant subjects (policy names), never a policy value."""
+
+    mode: Literal["declarative", "managed"]
+    # The head running (managed) or parked (declarative), and the oldest revision kept.
+    revision: int | None = None
+    oldest: int = 1
+    # A revision saved but not running: its install failed (G.6 step 8).
+    not_running: int | None = None
+    # Why the configured source is ignored (F.5): changed, unreadable or fails_check.
+    seed_ignored: str | None = None
+    # Each change installed since the start that needs a restart: its path and I.2's text.
+    restart_needed: tuple[tuple[str, str], ...] = ()
+    # Kept revisions below the head that failed to verify (D.6 row 14).
+    unreadable: tuple[int, ...] = ()
+    # What the declarative policy brings back that the parked ratchet retired, by grant subject.
+    revived: tuple[str, ...] = ()
+    # The store's refusal a declarative start didn't meet (policy_store_unverified).
+    unverified: str | None = None
+    # Files in /state/policy/quarantine.
+    quarantine: int = 0
 
 
 @dataclass(frozen=True)
@@ -240,8 +281,9 @@ class _Use:
 
 def assess(inputs: Inputs) -> dict[str, Any]:
     """The health of every credential, connector and store entry, of the routes with no
-    credential the guard refused and the egress role (``egress``), and of what the gateway
-    reports (``gateway``, M6 design M.5), and a count per level."""
+    credential the guard refused and the egress role (``egress``), of the policy store
+    (``policy``) and of what the gateway reports (``gateway``, M6 design M.5), and a count per
+    level."""
     policy = inputs.policy
     stored = {entry.name: entry for entry in inputs.entries}
     status = {item["credential"]: item for item in inputs.oauth or ()}
@@ -272,6 +314,9 @@ def assess(inputs: Inputs) -> dict[str, Any]:
     if inputs.ledger_copy is not None:
         report["ledger_copy"] = _ledger_copy(inputs.ledger_copy)
         sections.append(report["ledger_copy"])
+    if inputs.policy_state is not None:
+        report["policy"] = _policy(inputs.policy_state)
+        sections.append(report["policy"])
     if inputs.gateway_status is not None and policy.gateway is not None:
         report["gateway"] = _gateway(policy, inputs.gateway_status)
         sections.append(report["gateway"])
@@ -775,6 +820,82 @@ def _ledger_copy(copy: LedgerCopy) -> dict[str, Any]:
         "head_seq": copy.head_seq,
         "reported_ago": copy.reported_ago,
         "broken_at": copy.broken_at,
+        "level": _level(findings),
+        "findings": findings,
+    }
+
+
+# --- the policy store (M6 design M.5) ----------------------------------------------------------
+
+# F.5's ways on, after the sentence that says why the source is ignored.
+SEED_IGNORED_NEXT: Final = (
+    "Remove ZOEYMCP_CONFIG; or accept it as it is, without applying it: zoeymcp policy import "
+    "--from-env --baseline-only; or apply it: zoeymcp policy import --from-env (the plan shows "
+    "what it undoes)"
+)
+_SEED_IGNORED: Final = {
+    "changed": "has changed since the policy was seeded from it",
+    "unreadable": "doesn't load",
+    "fails_check": "fails check",
+}
+
+
+def _policy(state: PolicyState) -> dict[str, Any]:
+    """What the policy store's state needs of the operator (M.5's ``policy`` rows)."""
+    findings: list[Finding] = []
+    revision = state.revision
+    declarative = state.mode == "declarative"
+    if state.not_running is not None:
+        text = (
+            f"revision {state.not_running} is saved but not running: send SIGHUP to the vault "
+            "or restart it"
+        )
+        findings.append(_finding("policy_not_running", "error", text, {"kind": "reload_vault"}))
+    if state.seed_ignored is not None:
+        said = _SEED_IGNORED[state.seed_ignored]
+        text = (
+            f"ZOEYMCP_CONFIG {said} and is ignored: the policy is revision {revision}. "
+            f"{SEED_IGNORED_NEXT}"
+        )
+        action = {"kind": "import_from_env"}
+        findings.append(_finding("policy_seed_ignored", "warning", text, action))
+    for path, said in state.restart_needed:
+        findings.append(_finding("policy_restart_needed", "warning", f"{path}: {said}", None))
+    if state.unreadable:
+        numbers = ", ".join(str(number) for number in state.unreadable)
+        text = (
+            f"revisions {numbers} failed to verify and are in quarantine: rollback to them is "
+            "refused"
+        )
+        findings.append(_finding("revisions_unreadable", "warning", text, None))
+    if declarative and revision is not None:
+        text = (
+            f"revisions {state.oldest}-{revision} are kept and unused while the mode is "
+            "declarative; to return, set mode: managed: the policy you run then becomes "
+            f"revision {revision + 1}"
+        )
+        findings.append(_finding("policy_store_parked", "info", text, None))
+    if declarative and state.revived:
+        text = (
+            f"the declarative policy brings back {_some(state.revived)}, which managed mode had "
+            "removed"
+        )
+        action = {"kind": "fix_policy"}
+        findings.append(_finding("policy_declarative_revives", "warning", text, action))
+    if declarative and state.unverified is not None:
+        text = (
+            f"the policy store doesn't verify ({state.unverified}): a return to managed will refuse"
+        )
+        findings.append(_finding("policy_store_unverified", "warning", text, None))
+    if state.quarantine:
+        text = (
+            f"{state.quarantine} file(s) in /state/policy/quarantine: delete them once you don't "
+            "need them"
+        )
+        findings.append(_finding("policy_quarantine_kept", "info", text, None))
+    return {
+        "mode": state.mode,
+        "revision": revision,
         "level": _level(findings),
         "findings": findings,
     }

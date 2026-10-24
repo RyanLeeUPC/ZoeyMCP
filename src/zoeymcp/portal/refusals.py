@@ -588,6 +588,26 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         # M6's N.2: a managed write the policy store didn't make (vault/policystore.py).
         "policy_write_failed": Entry(500, "The revision couldn't be written; nothing changed."),
         "revision_out_of_range": Entry(400, "A revision can't go above 9,999,999,999."),
+        # M6's G.6: a managed write its one synchronous section refused (vault/managed.py).
+        "policy_not_running": Entry(
+            409,
+            "Revision {revision} is saved but not running: send SIGHUP to the vault or restart "
+            "it, then save again.",
+        ),
+        "policy_moved": Entry(
+            409,
+            "The policy moved to revision {revision} since you started: plan your change again "
+            "on revision {revision}.",
+        ),
+        "plan_changed": Entry(
+            409, "The plan changed since you read it: plan the change again and read it first."
+        ),
+        "import_refused": Entry(400, "The policy is refused: {detail}."),
+        "saved_not_running": Entry(
+            500,
+            "Saved as revision {revision}, but the vault couldn't apply it: send SIGHUP to the "
+            "vault or restart it.",
+        ),
     }
 )
 

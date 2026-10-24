@@ -37,7 +37,16 @@ from zoeymcp.portal.refusals import (
     wrong_host_literal,
 )
 from zoeymcp.portal.refusals import login as login_refusal
-from zoeymcp.vault import admin, onboard, onboarding, policystore, reviewjobs, secretplan, store
+from zoeymcp.vault import (
+    admin,
+    managed,
+    onboard,
+    onboarding,
+    policystore,
+    reviewjobs,
+    secretplan,
+    store,
+)
 from zoeymcp.vault.oauth import dcr, discovery, fetch, login, pkce
 from zoeymcp.vault.policyseal import REVISION_MAX
 from zoeymcp.vault.secretplan import SecretRefusal
@@ -216,6 +225,15 @@ PLAN = {
 }
 # M6's N.2: a managed write the policy store didn't make (vault/policystore.py, step 13a).
 STORE = {"policy_write_failed": 500, "revision_out_of_range": 400}
+# A managed write's own refusals (M6 design G.6, N.2; vault/managed.py), changed and
+# generation_lowered among them, catalogued already.
+MANAGED = {
+    "policy_not_running": 409,
+    "policy_moved": 409,
+    "plan_changed": 409,
+    "import_refused": 400,
+    "saved_not_running": 500,
+}
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -306,6 +324,10 @@ FIELDS = {
     "portal_env_ref": {"detail"},
     "route_reuses_credential": {"detail"},
     **{reason: {"detail"} for reason in set(PLAN) - {"ratchet_full", "no_change"}},
+    "policy_not_running": {"revision"},
+    "policy_moved": {"revision"},
+    "import_refused": {"detail"},
+    "saved_not_running": {"revision"},
 }
 
 
@@ -353,7 +375,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE
+    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -501,6 +523,15 @@ def test_every_store_reason_is_catalogued() -> None:
     found = literal_reasons(policystore, "StoreRefused")
     assert found == set(get_args(policystore.Reason))
     assert found == set(STORE)
+    assert found <= set(CATALOGUE)
+
+
+def test_every_managed_write_reason_is_catalogued() -> None:
+    """M6 N.2: the scan widens to the managed write's own refusals (G.6), each a literal of its
+    Reason type; the planner's and the store's pass through by their own reasons."""
+    found = literal_reasons(managed, "WriteRefused")
+    assert found == set(get_args(managed.Reason))
+    assert found == set(MANAGED) | {"changed", "generation_lowered"}
     assert found <= set(CATALOGUE)
 
 

@@ -283,6 +283,9 @@ ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
         "the policy, then connect.",
         "check_egress_role": "Check that the egress role is running, reaches the vault and has "
         "the key zoeymcp egress-key prints.",
+        "reload_vault": "Send SIGHUP to the vault, or restart it, with host access.",
+        "import_from_env": "Remove ZOEYMCP_CONFIG, or import it on the host with zoeymcp policy "
+        "import --from-env.",
     }
 )
 # The banner while the reported copy refuses reports (K.3), by its state (J.2 rows 8-10).
@@ -513,7 +516,9 @@ class PortalApp:
     ``GET /api/health`` is a 500 and the session answer has no counts. ``ledger`` is what the
     Ledger page reads and ``ledger.restart`` restarts (J); without it, those are a 500 and no
     page shows the copy's banner. ``source`` is where the running policy came from, for the
-    policy view (L), which reads the policy through ``secrets``. ``onboard`` is onboarding by
+    policy view (L), which reads the policy through ``secrets``; in managed mode
+    ``policy_header`` gives the running revision's header, which the view names (M6 design A.4).
+    ``onboard`` is onboarding by
     URL's service and ``reviews`` the review jobs, both shared with the admin socket (M7 design
     K); without them, the MCP servers routes and actions are a 500.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
@@ -537,6 +542,7 @@ class PortalApp:
         health: Callable[[], dict[str, Any]] | None = None,
         ledger: Ledger | None = None,
         source: Source = "file",
+        policy_header: Callable[[], Mapping[str, Any] | None] | None = None,
         onboard: OnboardService | None = None,
         reviews: ReviewQueue | None = None,
         routes: Sequence[Route] = ROUTES,
@@ -554,6 +560,7 @@ class PortalApp:
         self.health = health
         self.ledger = ledger
         self.source: Source = source
+        self.policy_header = policy_header
         self.onboard = onboard
         self.reviews = reviews
         self._routes = tuple(routes)
@@ -1675,8 +1682,10 @@ class PortalApp:
     async def _policy_view(self, call: Call) -> Reply | Refusal:
         """The running policy, read-only: built from an allowlist of the schema's fields, every
         string shown, and no token, token hash, placeholder, account detail or recipient
-        (``portal/policyview.py``). The portal can't change it: it is declarative (P9)."""
-        return Reply(policy_view(self._policy(), self.source))
+        (``portal/policyview.py``). The portal can't change it: it is declarative (P9); in
+        managed mode the view names the revision it shows (M6 design A.4, G.10)."""
+        header = None if self.policy_header is None else self.policy_header()
+        return Reply(policy_view(self._policy(), self.source, header=header))
 
     async def _ledger_page(self, call: Call) -> Reply | Refusal:
         """J.5: a page of the vault's copy, newest first, ``?before=SEQ&limit=N``; with
@@ -2350,7 +2359,7 @@ def _health_view(report: Mapping[str, Any]) -> dict[str, Any]:
     view: dict[str, Any] = {"summary": report["summary"]}
     for key, kind in (("credentials", "credential"), ("connectors", "connector")):
         view[key] = [_health_section(kind, item, checklist) for item in report[key]]
-    for key in ("store", "egress", "passkeys", "ledger_copy", "gateway"):
+    for key in ("store", "egress", "passkeys", "ledger_copy", "policy", "gateway"):
         if key in report:
             view[key] = _health_section(key, report[key], checklist)
     rank = {"error": 0, "warning": 1, "info": 2}

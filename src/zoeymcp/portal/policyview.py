@@ -19,11 +19,15 @@ Hidden fields show only that they are set, never their value:
 Secret references (``store:x``, ``env:X``) show as written: they name a secret, never hold one.
 Every string, dictionary keys included, goes through :func:`~.display.shown`. The answer lists
 the path of each value it hid, in the policy's own path form (``routes[0].callers[1].placeholder``).
+
+In managed mode the policy is the store's head (M6 design A.4), and the page says which revision
+it is, when it was saved and by whom (:func:`saved`), from the head revision's header.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
@@ -32,7 +36,7 @@ from pydantic import BaseModel
 from ..common.policy.schema import Policy
 from .display import NAME_LIMIT, shown
 
-Source = Literal["env", "file", "stdin"]
+Source = Literal["env", "file", "stdin", "managed"]
 # How a field shows: as it is (every string shown), "(set)", a count of addresses, or the names
 # of a mapping with each value "(set)".
 Treatment = Literal["shown", "hidden", "addresses", "names"]
@@ -49,6 +53,7 @@ SOURCES: Final[Mapping[Source, str]] = MappingProxyType(
         "env": "the ZOEYMCP_CONFIG environment variable",
         "file": "the file given with --config",
         "stdin": "standard input, read once at start",
+        "managed": "the vault's policy store (managed mode)",
     }
 )
 
@@ -212,17 +217,36 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
 )
 
 
-def view(policy: Policy, source: Source) -> dict[str, Any]:
+def view(
+    policy: Policy, source: Source, *, header: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     """``GET /api/policy``'s answer: the mode, where the policy came from (and the page's
-    sentence about it), the policy by :data:`FIELDS`, and the paths of the values hidden."""
+    sentence about it: in managed mode, :func:`saved` of the head's ``header``), the policy by
+    :data:`FIELDS`, and the paths of the values hidden."""
     hidden: list[str] = []
+    said = SOURCES[source] if source != "managed" or header is None else saved(header)
     return {
         "mode": policy.mode,
         "source": source,
-        "source_shown": SOURCES[source],
+        "source_shown": said,
         "policy": _model(policy, "", hidden),
         "hidden": hidden,
     }
+
+
+def saved(header: Mapping[str, Any]) -> str:
+    """A revision as the page names it (M6 design A.4): ``revision N, saved <when> by <who>``,
+    the time in UTC to the minute, and the author a passkey by its fingerprint's first 8, the
+    host and how it came (``socket``, ``offline``, ``source``), or the seed (D.2)."""
+    when = datetime.fromtimestamp(header["created"], UTC).strftime("%Y-%m-%d %H:%M UTC")
+    author = header["author"]
+    if author["by"] == "passkey":
+        who = f"passkey {author['fingerprint'][:8]}"
+    elif author["by"] == "host":
+        who = f"the host ({author['via']})"
+    else:
+        who = "the seed"
+    return f"revision {header['revision']}, saved {when} by {who}"
 
 
 def rendered(value: Any, treatment: Treatment = "shown") -> Any:

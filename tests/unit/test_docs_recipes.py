@@ -1,9 +1,10 @@
-"""The policies in operations.md's egress and bridge how-tos load and pass ``check`` (M7 design
-P.2, steps 3a, 17c and 18e).
+"""The policies in operations.md's egress, bridge and managed policy how-tos load and pass
+``check`` (M7 design P.2, steps 3a, 17c and 18e; M6 design P.1, BP-8, step 13b).
 
 A fenced block whose info string is ``yaml policy`` is a whole policy: every one in "Your own egress
-proxy", "Fitting ZoeyMCP into an existing stack", "The egress role" and "A stdio server behind a
-bridge" must parse with no ``check`` error, so a recipe can't drift from the schema. The first
+proxy", "Fitting ZoeyMCP into an existing stack", "The egress role", "A stdio server behind a
+bridge" and "Managed policy" must parse with no ``check`` error, so a recipe can't drift from the
+schema. The first
 section's sample output (a block starting with the emitter's header) must be what ``check
 --emit-egress-allowlist`` prints for its policy, byte for byte, so the how-to shows the snippet
 as it really is.
@@ -29,6 +30,7 @@ SECTIONS = (
     "Fitting ZoeyMCP into an existing stack",
     "The egress role",
     "A stdio server behind a bridge",
+    "Managed policy",
 )
 FENCE = re.compile(r"^( *)```([\w-]*)((?: [\w-]+)*)\n(.*?)^\1```\n", re.MULTILINE | re.DOTALL)
 HEADER = "# zoeymcp egress allowlist, lists "

@@ -5,8 +5,9 @@ remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SM
 and toolkits (M4, §19 onwards), the admin portal (M5, §26), and M7: onboarding a remote MCP
 server by URL (§11), your own egress proxy (§28), fitting ZoeyMCP into a stack that already has
 one (§29), a first hardened deployment end to end (§30), the egress role (§31), the bridge
-(§32) and a stdio server behind one in each placement (§33). §27 says which hosts are
-supported. The design and the reasons behind it are in [design.md](design.md); this page is
+(§32) and a stdio server behind one in each placement (§33). M6, in progress: drift review in
+the portal (§12) and managed policy (§34), the vault keeping the policy as revisions. §27 says
+which hosts are supported. The design and the reasons behind it are in [design.md](design.md); this page is
 the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
@@ -37,7 +38,9 @@ The vault keeps its state in one directory (`/state`, the `vault-state` volume):
   derived from the master key (the code itself is never stored);
 - `portal/passkeys.json`: the portal's passkeys, MAC'd the same way, and any
   `portal/passkeys.rejected-<ms>.json` a `--reset` enrolment moved aside;
-- `ledger-reported/`: the vault's copy of the gateway's approval ledger (§21).
+- `ledger-reported/`: the vault's copy of the gateway's approval ledger (§21);
+- in managed mode, `policy/` (the policy's revisions, encrypted and MAC'd) and
+  `policy-anchor.json` beside it (the highest revision committed), §34.
 
 Onboarding by URL (§11) keeps its client in the store too, under names it reserves for the
 credential: `<credential>-client-secret` (a confidential client's secret, given or registered,
@@ -69,7 +72,11 @@ needs the vault's `ZOEYMCP_MASTER_KEY` in its environment, and refuses to run as
 leave a file the vault's uid can't read. A running vault reads the file at the next redemption.
 
 **Backups.** Back up `store.json`, `gateway-key.json` and `portal/passkeys.json` together: they
-are all sealed under the same master key, and none is any use without it. A backup restored with
+are all sealed under the same master key, and none is any use without it. In managed mode
+`policy/` and `policy-anchor.json` belong with them: back up the vault's volume whole, at one
+moment, since a `policy/` restored without its anchor, or from another backup than it, refuses
+the start (§34). Keep a policy export too (`zoeymcp policy export`): it is the way back when the
+store itself is lost. A backup restored with
 an older passkey file brings back passkeys removed since, so after any restore run
 `zoeymcp passkeys` and remove what shouldn't be there. Safe to drop: `setup.json` (issue a new
 code), `portal/passkeys.rejected-*.json`, and the `torn-*.bin` files the reported copy keeps
@@ -78,7 +85,9 @@ is lost) and the connectors' send journals (the daily limit and the record of wh
 Back up the gateway's `/state-gateway` separately; restoring one volume and not the other shows
 as a fork in the reported copy (§21).
 
-**Restoring an older backup** isn't detected: the vault takes the volume as it finds it. Besides
+**Restoring an older backup** isn't detected: the vault takes the volume as it finds it. (In
+managed mode the anchor catches a `/state/policy` restored on its own; the whole volume restored
+from one backup brings back the policy of its day, as every other file here.) Besides
 the passkeys above, a restored `store.json` holds the client secrets of its day. A client the
 vault registered since the backup is gone from the store, but stays registered at the provider
 (remove it in the provider's own console), and its credential needs a new one (`login --mcp URL
@@ -509,6 +518,16 @@ The portal's own state recovers from the host, never from the portal:
 | the master key lost (or replaced without `ZOEYMCP_MASTER_KEY_PREVIOUS`), the volume kept | the store's recovery above, then `zoeymcp setup-code --reset`: the passkey file can't be verified under another key |
 | the state volume restored from a backup | `zoeymcp passkeys`, and remove every passkey that shouldn't be there: the backup brings back passkeys removed since; then check the clients onboarding registered since (§1) |
 
+In managed mode the policy recovers from the host too (§34): keep an export, since a reseed
+starts from it.
+
+| What happened | Recovery |
+| --- | --- |
+| the state volume lost | reseed from your latest export (`policy import --state /state --reseed`), then the recoveries above |
+| the master key lost, or replaced without `ZOEYMCP_MASTER_KEY_PREVIOUS` | the store refuses the start (`key_unknown`): reseed from your latest export |
+| the head, a revision's file or the anchor fails to verify | the head and the anchor refuse the start, naming the file: restore `/state` from one backup, or reseed; an older revision is moved to `quarantine/` and the start goes on |
+| `/state/policy` or the anchor deleted, or restored on its own | refused (`policy_store_missing`, `policy_anchor_missing`, `policy_head_behind`): restore the whole of `/state` from one backup |
+
 A rotation is lost when the vault never saved the newest refresh token: a crash between the
 token answer and the write, a store that couldn't be written followed by a restart, or an answer
 lost in transit by a provider without a grace window (`oauth_rotation_lost`).
@@ -522,7 +541,11 @@ docker compose -f deploy/compose.yaml kill -s HUP zoeymcp      # standard tier: 
 
 On `SIGHUP` the vault loads and checks its policy file again, and the gateway sees the result
 within a second or two (it long-polls its view, §9). In the standard tier the launcher passes
-`HUP` on to both. The vault:
+`HUP` on to both. This is declarative mode. In managed mode (§34) a `SIGHUP` never applies the
+file: it verifies the store again and installs its newest revision if that isn't the one running,
+which is how a saved change that couldn't be applied is retried, and it logs `reload_ok
+source=head`. In either mode the mode itself is chosen at start: a declarative vault's reload of a
+file that now says `mode: managed` is refused. The vault, in declarative mode:
 
 - A policy that fails is refused (`reload_refused` in the log), and the running one stays.
   So is a policy whose `egress_key_generation` is below the running policy's: the lower
@@ -594,8 +617,8 @@ now an error in every mode, at start and on reload: keep that secret in the stor
 variable of its own name. No shipped policy has one. `check` now reads `mode` for two findings:
 `mode: managed` is a warning that the vault seeds its first revision from the document and
 ignores it afterwards, and without an `admin` block it is also an error ("managed mode is edited
-in the portal"). The vault still refuses to start in managed mode until managed mode lands. A
-policy with `mode: declarative` checks as before.
+in the portal"). A managed start, and switching a deployment to it, is §34's. A policy with
+`mode: declarative` checks as before.
 
 **Upgrading to M6: review.** A tool a server lists that the policy neither includes nor declines
 is one nobody reviewed, and `zoeymcp review` now exits 1 for it, naming it ("3 listed that nobody
@@ -2256,6 +2279,11 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 400 | `no_change` | Nothing would change. |
 | 500 | `policy_write_failed` | The revision couldn't be written; nothing changed. |
 | 400 | `revision_out_of_range` | A revision can't go above 9,999,999,999. |
+| 409 | `policy_not_running` | Revision `<revision>` is saved but not running: send SIGHUP to the vault or restart it, then save again. |
+| 409 | `policy_moved` | The policy moved to revision `<revision>` since you started: plan your change again on revision `<revision>`. |
+| 409 | `plan_changed` | The plan changed since you read it: plan the change again and read it first. |
+| 400 | `import_refused` | The policy is refused: `<detail>`. |
+| 500 | `saved_not_running` | Saved as revision `<revision>`, but the vault couldn't apply it: send SIGHUP to the vault or restart it. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |
@@ -3355,6 +3383,160 @@ the program.
 
 ## 34. Managed policy
 
+**In managed mode, every "edit the policy and reload" in this guide is an export, an edit and
+`zoeymcp policy import`, or the portal's own change where there is one.** The policy's `mode` says
+which of two ways the vault runs:
+
+- `mode: declarative`: the policy is the file or `ZOEYMCP_CONFIG` you give it, read at start and
+  on every `SIGHUP`, as in every section before this one;
+- `mode: managed`: the vault keeps the policy itself, as numbered revisions (below). The file you
+  give it seeds revision 1, once, and is ignored afterwards; changes are made in the portal or
+  imported on the host.
+
+The mode is chosen at start: a `SIGHUP` never changes it (a reload of a declarative vault whose
+file now says `mode: managed` is refused, "the mode is chosen at start; restart to change it").
+
+### Starting managed: the seed and its guard
+
+On a fresh state volume (nothing in `/state` but `vault.lock`, or a `setup.json` from
+`setup-code --state`), a vault started with `mode: managed` **seeds** revision 1 from the policy it
+is given: it checks it, writes every client's literal `token` as its `token_sha256` (the literal
+never reaches the store), writes the anchor, then revision 1, and runs it (`policy_seeded
+revision=1 deployment=<8> tokens_hashed=<n> via=start`). This is the policy seed, not §5's OAuth
+seed. A managed policy needs an `admin` block, since the portal is where it is changed:
+
+```yaml policy
+version: 1
+mode: managed
+admin:
+  listen: 0.0.0.0:8081
+  origins: [http://localhost:8081]
+gateway:
+  hosts: [localhost]
+  clients:
+    agent1:
+      # From `zoeymcp client-token`: set it before the first start. No portal change can set a
+      # client's token, so after the seed a new one is a host import.
+      token_sha256: sha256:8ca973db011281c88e678afeb86d1955579aed24fd7deeae43155fe7aabb0f43
+      servers: []
+```
+
+So set what you would otherwise edit later **before the first `up -d`**: each client's
+`token_sha256`, your servers' URLs, `gateway.hosts` and the egress settings. After the seed each of
+those is a host import.
+
+**The guard.** A volume a vault already used (a `store.json`, `gateway-key.json`, `portal/`,
+`ledger-reported/` or `connectors/`, or any name the vault doesn't know) with no revisions and no
+anchor is never seeded by itself: a deleted `/state/policy` and anchor beside an intact store is
+how someone would make the vault reseed from an older `ZOEYMCP_CONFIG`. The start is refused, with
+the way on in your own commands (from `ZOEYMCP_COMPOSE_CMD`, §11; the standard tier adds
+`--user 10001:10001`):
+
+```text
+refused to start: managed mode with no policy revisions, on a state volume that was used before
+(gateway-key.json, store.json). If you are switching this deployment to managed mode, seed revision 1
+from ZOEYMCP_CONFIG once:
+  docker compose -f deploy/compose.hardened.yaml stop vault
+  docker compose -f deploy/compose.hardened.yaml run --rm --no-deps vault policy seed --state /state
+  docker compose -f deploy/compose.hardened.yaml up -d vault
+If you didn't, /state/policy and /state/policy-anchor.json may have been deleted: restore /state from
+one backup.
+```
+
+**At every managed start** the vault logs `policy_head revision=N digest=<8> deployment=<8>
+write_kind=<kind>`, so logs kept off the host carry the revision. The head's policy is checked with
+the vault's environment as a declarative policy is: a head that now fails (an `env:` variable this
+container lacks) refuses the start, naming the path, and the store is left as it is.
+
+### The policy you give after the seed
+
+You may remove the policy from `ZOEYMCP_CONFIG` after the seed: a managed start runs the head. If
+you leave it, every start and every `SIGHUP` compares it with the policy it seeded and with the
+head. While it matches either, nothing is said; once it differs, doesn't load or fails `check`,
+it is ignored, never applied: `policy_seed_ignored revision=N reason=changed|unreadable|fails_check`
+(warning) and the health finding of the same name, "ZOEYMCP_CONFIG has changed since the policy
+was seeded from it and is ignored: the policy is revision N". Remove it; or record it as it is,
+without applying it, with `zoeymcp policy import --from-env --baseline-only`; or apply it with
+`zoeymcp policy import --from-env` (its plan shows what it undoes).
+
+### Back to declarative, and back again
+
+A declarative start on a volume with revisions runs its file as before and **parks** the store: the
+anchor records the head it parked (`policy_store_parked revision=N`, warning, once), and health
+shows `policy_store_parked` (info) while it stays parked. A parked store is never read as policy.
+If the file brings back what managed mode had removed (a client's token, a caller's placeholder, a
+pin the store retired), the park says so at once: `policy_store_parked` is critical, with
+`revived` and the `names`, and health raises `policy_declarative_revives` (warning) naming each,
+while the file you run does. A store a declarative start can't verify is left as it is
+(`policy_store_unverified`, warning, and in health): a return to managed will meet its refusal.
+
+Coming back is the one-line change to `mode: managed`. The vault **resumes**: the file it is given
+becomes the next revision (`origin: resume`), planned against the parked head and what may only
+move forward, so nothing stale runs and the history is kept. What the declarative period brought
+back that the store had retired (a client token, a pin, an `env:` name or where it may be sent) is
+accepted, since the host ran it, and named once: `policy_resumed revision=N+1 parked_at=N
+revived=<n>`, a warning with the `names` when `revived` is above 0. A key generation below the
+highest the store ran, or below the gateway key generation the declarative period moved to,
+still refuses the start, naming the field, with nothing written and the store still parked
+(`resume_generation_lowered`). A managed start with no policy given, or one that doesn't load,
+can't resume: `policy_resume_needs_source`.
+
+### Reloading, and a change that couldn't be applied
+
+In managed mode `SIGHUP` reads the store again, verifies it and checks the head with the vault's
+environment, and installs the head if it isn't the one running. It never applies the policy you
+gave it: it only compares it (above). It logs `reload_ok source=head revision=N installed=true|false`,
+or `reload_refused` with the running policy kept (its `reason` is the store's refusal, or
+`policy_store_parked` for a store parked under it). Stray names in `/state/policy` are logged at a
+start only, not at each `SIGHUP`.
+
+A change is saved first and then applied. If applying it fails (the gateway key state can't be
+written), the revision stays saved and the previous one keeps running: `policy_not_installed`
+(critical), the change's answer "saved as revision N, but the vault couldn't apply it", and health's
+`policy_not_running` (error). Every later change is refused (`policy_not_running`) until a
+`SIGHUP` or a restart applies it: fix the volume, then send `SIGHUP`. A change that needs a restart
+(`egress_proxy`, `admin.listen`, a raised gateway limit) says so, and health keeps
+`policy_restart_needed` until the restart; for a raised gateway limit, until the gateway's status
+says it started after the change that raised it. The policy view names the revision that runs:
+while a saved one isn't running, the one before it.
+
+### When a start is refused
+
+Every refusal names the file and the way on, as commands for your host. In short:
+
+| Refused | What happened | Recovery |
+| --- | --- | --- |
+| `policy_seed_needs_host` | a used volume, no revisions and no anchor | switching to managed: `policy seed --state /state` once; otherwise restore `/state` |
+| `policy_store_missing` | `/state/policy` is gone, the anchor names revisions | restore `/state` from one backup, or reseed from your latest export |
+| `policy_anchor_missing` | the anchor beside `/state/policy` is gone | the same |
+| `policy_head_behind`, `policy_anchor_behind` | the head or the anchor was restored from an older backup | restore the whole of `/state` from one backup |
+| `tampered`, `policy_anchor_tampered`, `head_dangling`, `files_above_head`, `policy_deployment_mismatch` | a file changed, or put back, outside the vault | restore `/state`, or reseed from your latest export |
+| `key_unknown`, `key_retired` | a file is sealed under another master key | after a rotation, set `ZOEYMCP_MASTER_KEY_PREVIOUS` to the old key and recreate the vault; otherwise restore or reseed |
+| `fails_check` | the head fails `check` in this container | set what it names (an `env:` variable), then start again |
+| `policy_resume_needs_source`, `resume_generation_lowered` | a parked store with no usable policy, or one that would lower a key generation | give the policy to resume from, with the generation at the floor or above |
+
+The reseed is `policy import --state /state --reseed - < policy-export.yaml`, with the vault
+stopped: keep an export (`zoeymcp policy export`) somewhere safe, since it holds your policy's
+secrets as the store does. Its last resort, `--reseed --from-env`, takes your compose policy as it
+is now, usually older than the head. The vault never falls back to the seed by itself.
+
+### Upgrading to M6
+
+A declarative deployment keeps working as before: nothing is written to `/state/policy`, and the
+portal reads as it did. What is new for it is in §7's "Upgrading to M6" notes (the `ZOEYMCP_`
+reference and YAML tag refusals, tools nobody reviewed, clearing marks). To switch a used volume to
+managed mode: set `mode: managed` (with an `admin` block), run `check`, then
+
+```sh
+docker compose -f deploy/compose.hardened.yaml stop vault
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps vault policy seed --state /state
+docker compose -f deploy/compose.hardened.yaml up -d vault
+```
+
+(in the standard tier: `docker compose -f deploy/compose.yaml run --rm --no-deps --user
+10001:10001 zoeymcp policy seed --state /state`). Recreate the vault before the gateway, and keep
+the gateway on M6 too once a policy declines a tool or enables another kind.
+
 ### The revision store
 
 In managed mode the vault keeps the policy itself, as numbered revisions in its state volume:
@@ -3394,7 +3576,7 @@ finishes. Once `policy_rekeyed` is logged, remove `ZOEYMCP_MASTER_KEY_PREVIOUS`:
 file sealed under the old key is refused at start, or quarantined if it is an older revision,
 even while the old key is still set. While a save that never answered can't be moved to
 quarantine, the rotation waits for the next start. A previous key equal to the current one is
-ignored.
+ignored, and the start logs `master_key_previous_same` (warning) with its `key_id`.
 
 **When the store can't be written** (a full or read-only volume), a change is refused with
 `policy_write_failed` and nothing changes. If only the anchor can't be written, the change is
@@ -3412,5 +3594,19 @@ Its log lines:
 | `policy_rekeyed` | `revisions` (how many were re-sealed), `key_id` (the new master key's ID), `next`: remove `ZOEYMCP_MASTER_KEY_PREVIOUS` now |
 | `policy_anchor_write_failed` | `revision`, `error_type`: the anchor wasn't written (warning) |
 | `policy_housekeeping_failed` | `action` (`quarantine`, `prune`, `rekey` or `remove`), `error_type`, and `revision` for a quarantine or a prune: the next start tries again (warning) |
+| `master_key_previous_same` | `key_id`: `ZOEYMCP_MASTER_KEY_PREVIOUS` is the current key again, and is ignored (warning) |
+| `policy_seeded` | `revision` (1), `deployment` (8 characters), `tokens_hashed` (literal client tokens written as their hash), `via` (`start`) |
+| `policy_head` | `revision`, `digest` and `deployment` (8 characters each), `write_kind` (how the head was written): at every managed start |
+| `policy_seed_ignored` | `revision`, `reason` (`changed`, `unreadable` or `fails_check`): the policy given is ignored (warning) |
+| `policy_store_parked` | `revision`: a declarative start parked the store (warning); critical with `revived` and `names` when the file brings back what the store retired |
+| `policy_store_unverified` | `reason`: a declarative start found a store that doesn't verify, and left it (warning) |
+| `policy_resumed` | `revision`, `parked_at`, `revived` and, above 0, `names` (warning then): a managed start resumed a parked store |
+| `policy_refused` | `reason`, and `file` or `revision`: a start refused over the store or its head (critical) |
+| `policy_saved`, `policy_imported`, `policy_rolled_back`, `policy_acknowledged` | `revision`, `write_kind`, `origin`, `author` (a passkey's fingerprint, 8 characters, or `host`), `base`, `digest` (8), `effects` (what needs a restart or a step), and `target` for a rollback |
+| `tool_allowed`, `tool_repinned` | `server`, `def_kind`, `name`, `revision`; `tool_allowed` also `kept` for an `allow` tool kept through a re-pin: one line per tool, whatever the change |
+| `policy_not_installed` | `revision`, `reason`: a saved revision couldn't be applied, and the previous one runs (critical) |
+| `reload_ok` | in managed mode `source` (`head`), `revision`, `installed` |
 
-None holds a policy value or anything a file holds; `policy_stray_file` names the stray file only.
+None holds a policy value or anything a file holds; `policy_stray_file` names the stray file only,
+and `policy_store_parked` and `policy_resumed` name clients (`client:<name>`), callers
+(`caller:<route>/<index>`), pins (`pin:<server>/<kind>/<name>`) and `env:` names only.

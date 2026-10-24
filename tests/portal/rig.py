@@ -203,6 +203,7 @@ def running(
                 health=app.health,
                 ledger=app.ledger,
                 source=app.source,
+                policy_header=app.policy_header,
                 onboard=app.onboard if onboard is None else onboard(vault),
                 reviews=app.reviews,
                 routes=routes,

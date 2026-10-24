@@ -15,6 +15,14 @@ instead; the end of that pipe stops the vault too. The launcher also names each 
 (``--bridge NAME=UID``, M7 design C.10): the vault reaches a ``unix:`` route's bridge only on that
 bridge's socket, and only when its listener is that uid (B.2, Q46).
 
+The policy's mode is chosen at start (M6 design F.1): the store (``vault/policystore.py``) is
+opened, and ``policystart.decide`` takes the configured source and the store's verdict. A
+declarative start runs the source as before, parking a store it finds (F.4); a managed one runs
+the store's head, after seeding revision 1 on a fresh volume (F.3) or resuming a parked store
+from the source (F.4), and its writes and ``SIGHUP`` are ``vault/managed.py``'s (G.6, F.6). A
+start refused over the store names its recoveries in the host's own commands
+(``ZOEYMCP_COMPOSE_CMD``, J16).
+
 Every TCP listener's sockets are bound before any server starts (M5 design B.3, D17), so an
 address in use is a ``StartupError`` that names it; uvicorn would otherwise call ``sys.exit``
 inside the servers' gather, with no line of the vault's.
@@ -38,9 +46,10 @@ import socket
 import stat
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 import httpx
 import uvicorn
@@ -52,6 +61,9 @@ from ..common.control import CONTROL_RELOAD as CONTROL_RELOAD
 from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
 from ..common.policy import Policy, PolicyError, gate, read_source, restart
+from ..common.policy.gate import GateRefused
+from ..common.policy.plan import PlanInput, PlanRefused, normalize, normalized_digest, plan
+from ..common.policy.ratchet import Grants, Ratchet, initial, violations
 from ..entrypoint.env import holds_secret_env
 from ..portal import listen as portal_listen
 from ..portal.app import Ledger, PortalApp, Secrets, StaticMissing, load_static
@@ -59,7 +71,7 @@ from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
 from ..portal.passkeys import Passkeys
 from ..portal.policyview import Source
 from ..portal.server import HEAD_LIMIT, HEADER_DEADLINE, portal_protocol
-from . import logs
+from . import gatewaykeys, logs, policystart
 from .admin import (
     AdminApp,
     AdminSocketError,
@@ -72,12 +84,16 @@ from .admin import (
 from .app import CONNECT_TIMEOUT, LISTENER_SCOPE_KEY, READ_TIMEOUT, Listener, VaultApp
 from .connectors.smtp import connector_names
 from .gatewaykeys import GatewayKeyError, GatewayKeys
-from .health import Bridges
+from .health import Bridges, PolicyState
 from .keys import MASTER_KEY_ENV, PREVIOUS_MASTER_KEY_ENV, KeySet, MasterKeyError
+from .managed import REVIVALS, DeclarativeStore, ManagedPolicy, head_policy, revived
+from .managed import commands as host_commands
 from .netclient import SocketClients
 from .oauth.login import LoginService
 from .onboard import OnboardService, policy_source
 from .peer import link_supported, peer_checked
+from .policystart import Commands, Ok, Refused, SeedIgnored
+from .policystore import PolicyStore, StoreRefused
 from .reportstore import ReportStore
 from .store import SecretStore, StoreError
 
@@ -85,6 +101,8 @@ if sys.platform != "win32":
     import fcntl
 
 LOCK_FILE = "vault.lock"
+# A managed source met at a declarative reload (M6 design F.6).
+MODE_AT_START = "the mode is chosen at start; restart to change it"
 # Binds a listen address's host and port: its sockets, bound and not yet listening.
 Binder = Callable[[str, int], list[socket.socket]]
 # A name's addresses (portal.listen.Lookup); raises OSError when it doesn't resolve.
@@ -237,9 +255,18 @@ class Runtime:
     gateway_keys: GatewayKeys
     # The previous master key's, during a master-key rotation.
     previous: KeySet | None = None
+    # The policy store (M6 design D, F): the one whose head runs in managed mode, the one found
+    # (parked, or unverified) in declarative mode, or None when there is none.
+    policy_store: PolicyStore | None = None
+    # The head's ratchet, in managed mode, and why the configured source is ignored (F.5).
+    ratchet: Ratchet | None = field(default=None, repr=False)
+    seed_ignored: SeedIgnored | None = None
 
 
 def load_keys(environ: Mapping[str, str]) -> tuple[KeySet, KeySet | None]:
+    """The master key and the previous one. A previous key with the current one's ID is the
+    current key again, which every store treats as unset: logged ``master_key_previous_same``
+    (M6 design D.7)."""
     text = environ.get(MASTER_KEY_ENV)
     if not text:
         raise StartupError(f"{MASTER_KEY_ENV} is not set; generate one with `zoeymcp keygen`")
@@ -249,13 +276,15 @@ def load_keys(environ: Mapping[str, str]) -> tuple[KeySet, KeySet | None]:
         previous = KeySet.from_text(previous_text) if previous_text else None
     except MasterKeyError as exc:
         raise StartupError(str(exc)) from exc
+    if previous is not None and previous.key_id == keys.key_id:
+        logs.event("master_key_previous_same", level="warning", key_id=keys.key_id)
     return keys, previous
 
 
 def load_policy(config: str | None, environ: Mapping[str, str]) -> Policy:
-    """The declarative start's policy, through the gate (M6 design C.2). A source that can't be
-    read, or none given, is refused with the gate's text but isn't the gate's refusal: F.1 keeps
-    ``none`` apart from ``unreadable``."""
+    """The configured source's policy, through the gate (M6 design C.2), for a declarative
+    reload. A source that can't be read, or none given, is refused with the gate's text but
+    isn't the gate's refusal: F.1 keeps ``none`` apart from ``unreadable``."""
     try:
         text, source = read_source(config, environ)
     except PolicyError as exc:
@@ -264,14 +293,305 @@ def load_policy(config: str | None, environ: Mapping[str, str]) -> Policy:
         policy = gate.admit_text(text, source, environ=environ).policy
     except gate.GateRefused as exc:
         raise StartupError(str(exc)) from exc
-    if policy.mode == "managed":
-        raise StartupError("managed mode arrives in M6; use mode: declarative for now")
     return policy
 
 
-def load_runtime(config: str | None, state_dir: Path, environ: Mapping[str, str]) -> Runtime:
+def configured(config: str | None, environ: Mapping[str, str]) -> policystart.Source | None:
+    """The configured source as the start reads it (F.1): its mode, the gate's answer and its
+    normalized digest, or None when none is given or it can't be read."""
+    try:
+        text, label = read_source(config, environ)
+    except PolicyError:
+        return None
+    return policystart.read_source(text, label, environ=environ, normalized=normalized_digest)
+
+
+@dataclass(frozen=True)
+class _Start:
+    """What the start decided to run (F.1): the policy, and the store with its head's ratchet."""
+
+    policy: Policy
+    store: PolicyStore | None = None
+    ratchet: Ratchet | None = field(default=None, repr=False)
+    seed_ignored: SeedIgnored | None = None
+
+
+def _refuse(reason: str, message: str, **where: object) -> NoReturn:
+    """A start refused over the policy store or its head: logged ``policy_refused`` (N.3)."""
+    logs.event("policy_refused", level="critical", reason=reason, **where)
+    raise StartupError(message)
+
+
+def _digest8(value: str) -> str:
+    return value.removeprefix("sha256:")[:8]
+
+
+def _log_head(store: PolicyStore) -> None:
+    """``policy_head`` at every managed start, so off-host logs carry the counter (F.2, 0.5)."""
+    head, header = store.head, store.header
+    assert head is not None  # noqa: S101 - a managed store has one
+    assert header is not None  # noqa: S101 - and its header
+    logs.event(
+        "policy_head",
+        revision=head.revision,
+        digest=_digest8(head.digest),
+        deployment=head.deployment[:8],
+        write_kind=header["kind"],  # "kind" is the logger's own argument
+    )
+
+
+def start_policy(
+    config: str | None,
+    state_dir: Path,
+    environ: Mapping[str, str],
+    keys: KeySet,
+    previous: KeySet | None,
+    *,
+    commands: Commands,
+    bridges: Collection[str] = (),
+) -> _Start:
+    """F.1's start: the source read, the store opened (its housekeeping, D.6-D.8), and the
+    decision carried out: refused, declarative (parking an ``Ok`` store, F.4), the head (F.2),
+    revision 1 seeded from the source (F.3), or a parked store resumed from it (F.4)."""
+    try:
+        text, label = read_source(config, environ)
+    except PolicyError as exc:
+        source, unread = None, gate.refused_text(exc.source, exc.findings)
+    else:
+        source = policystart.read_source(text, label, environ=environ, normalized=normalized_digest)
+        unread = policystart.NO_POLICY
+    try:
+        store = PolicyStore.open(state_dir, keys, previous)
+    except OSError as exc:
+        raise StartupError(f"can't read the policy store in {state_dir}: {exc}") from exc
+    found = store.verdict
+    decision = policystart.decide(policystart.StartFacts(source, found, commands, unread))
+    if isinstance(decision, policystart.Refuse):
+        if decision.reason in ("no_policy", "unreadable", "invalid", "fails_check"):
+            raise StartupError(decision.message)  # the source's own refusal, as before
+        where: dict[str, object] = {}
+        if isinstance(found, Refused):
+            where["file"] = found.file
+        elif isinstance(found, Ok):
+            where["revision"] = found.revision
+        _refuse(decision.reason, decision.message, **where)
+    if not isinstance(decision, policystart.Managed):
+        # The source runs, seeds or resumes: only the head runs without one.
+        assert source is not None  # noqa: S101 - decide refused the rest
+        if isinstance(decision, policystart.Declarative):
+            return _declarative(decision, source, store)
+        if isinstance(decision, policystart.Seed):
+            return _seed(source, store, state_dir, environ)
+        assert isinstance(found, Ok)  # noqa: S101 - a parked head resumes
+        floor = _gateway_key_state(state_dir, keys, previous)
+        return _resume(source, store, found, environ, bridges, floor)
+    assert isinstance(found, Ok)  # noqa: S101 - the head runs
+    try:
+        policy = gate.admit(head_policy(found), f"revision {found.revision}", environ=environ)
+    except GateRefused as exc:
+        # FM-23: the head now fails check here (an env: variable this container lacks).
+        _refuse("fails_check", str(exc), revision=found.revision)
+    except ValueError:
+        _refuse("tampered", "refused to start: the head's policy isn't one this version reads")
+    ignored = decision.seed_ignored
+    if ignored is not None:
+        logs.event("policy_seed_ignored", level="warning", revision=found.revision, reason=ignored)
+    _log_head(store)
+    return _Start(policy.policy, store, found.ratchet, ignored)
+
+
+def _declarative(
+    decision: policystart.Declarative, source: policystart.Source, store: PolicyStore
+) -> _Start:
+    """F.1's declarative rows: the source runs as before; a store whose head verifies is parked
+    (F.4), its ``policy_store_parked`` critical when the source brings back what the parked
+    ratchet retired (T-16); a store that doesn't verify is left as it is (``unverified``)."""
+    assert isinstance(source.admitted, gate.Admitted)  # noqa: S101 - decide refused the rest
+    policy = source.admitted.policy
+    found = store.verdict
+    if decision.park and isinstance(found, Ok):
+        try:
+            store.park()
+        except StoreRefused as exc:
+            _refuse(exc.reason, f"refused to start: the policy store can't be parked: {exc}")
+        try:
+            names = revived(found.ratchet, head_policy(found), policy)
+        except ValueError:
+            names = ()
+        if names:
+            logs.event(
+                "policy_store_parked",
+                level="critical",
+                revision=found.revision,
+                revived=len(names),
+                names=list(names),
+            )
+        else:
+            logs.event("policy_store_parked", level="warning", revision=found.revision)
+    if decision.unverified is not None:
+        logs.event("policy_store_unverified", level="warning", reason=decision.unverified)
+    known = isinstance(found, Ok) or decision.unverified is not None
+    return _Start(policy, store if known else None)
+
+
+def _gateway_key_state(
+    state_dir: Path, keys: KeySet, previous: KeySet | None
+) -> gatewaykeys.State | None:
+    """The gateway-key state as :meth:`GatewayKeys.load` reads it, for a resume to refuse a
+    lower generation before any policy file is written (G-4, G.6 step 5); None when there is
+    none, or when it can't be read, which the load after refuses with its own text. A start's
+    seed never meets one: the file makes the volume used (F.1, ``policy_seed_needs_host``)."""
+    try:
+        data = (state_dir / gatewaykeys.STATE_FILE).read_bytes()
+    except OSError:
+        return None
+    try:
+        return gatewaykeys.unseal(data, keys, previous)
+    except GatewayKeyError:
+        return None
+
+
+def _seed(
+    source: policystart.Source, store: PolicyStore, state_dir: Path, environ: Mapping[str, str]
+) -> _Start:
+    """F.3: a fresh volume's revision 1, from the source as a revision holds it, with the
+    ratchet of a seed (the host accepted the document whole)."""
+    assert isinstance(source.admitted, gate.Admitted)  # noqa: S101 - decide refused the rest
+    given = source.admitted.policy
+    policy = normalize(given)
+    try:
+        gate.admit(policy, "revision 1", environ=environ)
+    except GateRefused as exc:
+        raise StartupError(str(exc)) from exc
+    try:
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        store.seed(policy, ratchet=initial(policy), seed_digest=source.digest or "")
+    except (OSError, StoreRefused) as exc:
+        reason = exc.reason if isinstance(exc, StoreRefused) else "policy_write_failed"
+        _refuse(reason, f"refused to start: the policy store can't be seeded: {exc}")
+    head = store.head
+    assert head is not None  # noqa: S101 - just seeded
+    clients = {} if given.gateway is None else given.gateway.clients
+    logs.event(
+        "policy_seeded",
+        revision=head.revision,
+        deployment=head.deployment[:8],
+        tokens_hashed=sum(client.token is not None for client in clients.values()),
+        via="start",
+    )
+    _log_head(store)
+    return _Start(policy, store, initial(policy))
+
+
+def _resume(
+    source: policystart.Source,
+    store: PolicyStore,
+    found: Ok,
+    environ: Mapping[str, str],
+    bridges: Collection[str],
+    floor: gatewaykeys.State | None,
+) -> _Start:
+    """F.4: the source planned as revision ``parked + 1`` against the parked head and its
+    ratchet, as the host's write (``policy.resume``): what it brings back that the ratchet
+    retired, and its ``env:`` names and reach, are its own grants, named once in
+    ``policy_resumed``; a key generation below a floor refuses the start (E1), the ratchet's
+    or the gateway-key state's (``floor``: the declarative run may have raised it), before
+    anything is written (G-4)."""
+    assert isinstance(source.admitted, gate.Admitted)  # noqa: S101 - decide refused the rest
+    candidate = normalize(source.admitted.policy)
+    try:
+        head = head_policy(found)
+        gate.admit(candidate, f"revision {found.revision + 1}", environ=environ)
+    except GateRefused as exc:
+        raise StartupError(str(exc)) from exc
+    except ValueError:
+        _refuse(
+            "tampered", "refused to start: the parked head's policy isn't one this version reads"
+        )
+    found_now = violations(found.ratchet, head, candidate, verified=frozenset(), grants=Grants())
+    for violation in found_now:
+        if violation.reason == "generation_lowered":
+            text = (
+                f"refused to start: the policy given sets {violation.subject} below "
+                f"{violation.floor}, the parked store's floor: that would bring back a retired "
+                f"key. Set {violation.subject} to {violation.floor} or more."
+            )
+            _refuse("resume_generation_lowered", text, revision=found.revision)
+    wanted = candidate.gateway_key_generation
+    if floor is not None and gatewaykeys.check(floor, wanted) is not None:
+        text = (
+            f"refused to start: the policy given sets gateway_key_generation below "
+            f"{floor.current}, the generation {gatewaykeys.STATE_FILE} holds: that would bring "
+            f"back a retired key. Set gateway_key_generation to {floor.current} or more."
+        )
+        _refuse("resume_generation_lowered", text, revision=found.revision)
+    granted = [v for v in found_now if v.reason != "generation_lowered"]
+    grants = Grants(
+        revive=frozenset(v.subject for v in granted if v.reason in REVIVALS),
+        env=frozenset(v.subject for v in granted if v.reason not in REVIVALS),
+    )
+    admin = candidate.admin
+    planned = plan(
+        PlanInput(
+            kind="policy.resume",
+            surface="host",
+            head=head,
+            head_revision=found.revision,
+            head_digest=found.head.digest,
+            ratchet=found.ratchet,
+            candidate=candidate,
+            # The vault starts with the candidate's own values: nothing in it waits for a restart.
+            started=restart.Started(
+                candidate.egress_proxy,
+                candidate.egress_proxy_kind,
+                None if admin is None else admin.listen,
+                frozenset(bridges),
+            ),
+            bindings=lambda policy: {},
+            grants=grants,
+            removed_in=store.removed_lookup(candidate),
+        )
+    )
+    if isinstance(planned, PlanRefused):
+        text = f"refused to start: the policy given can't resume the parked store: {planned.detail}"
+        _refuse(planned.reason, text, revision=found.revision)
+    try:
+        committed = store.commit(
+            planned, author={"by": "host", "via": "source"}, seed_digest=source.digest
+        )
+    except StoreRefused as exc:
+        _refuse(exc.reason, f"refused to start: the policy store can't be written: {exc}")
+    names = [v.subject for v in granted]
+    logs.event(
+        "policy_resumed",
+        level="warning" if names else "info",
+        revision=committed.revision,
+        parked_at=found.revision,
+        revived=len(names),
+        **({"names": names} if names else {}),
+    )
+    _log_head(store)
+    return _Start(planned.policy, store, planned.ratchet)
+
+
+def load_runtime(
+    config: str | None,
+    state_dir: Path,
+    environ: Mapping[str, str],
+    *,
+    standard: bool = False,
+    bridges: Collection[str] = (),
+) -> Runtime:
+    """With the state lock held: the keys, the policy (F.1, :func:`start_policy`), the secret
+    store and the gateway keys at the policy's generation. ``standard`` says the vault runs in
+    the standard tier (the gateway link socket), for the recoveries a refusal names;
+    ``bridges`` are the launcher's (a resume's restart classifier, I.2)."""
     keys, previous = load_keys(environ)
-    policy = load_policy(config, environ)
+    commands = host_commands(environ, state_dir.as_posix(), standard=standard)
+    start = start_policy(
+        config, state_dir, environ, keys, previous, commands=commands, bridges=bridges
+    )
+    policy = start.policy
     store = SecretStore(state_dir, keys, previous)
     try:
         rotated = store.load()
@@ -283,7 +603,16 @@ def load_runtime(config: str | None, state_dir: Path, environ: Mapping[str, str]
         gateway_keys = GatewayKeys.load(state_dir, keys, previous, policy.gateway_key_generation)
     except GatewayKeyError as exc:
         raise StartupError(str(exc)) from exc
-    return Runtime(policy, store, keys, gateway_keys, previous)
+    return Runtime(
+        policy,
+        store,
+        keys,
+        gateway_keys,
+        previous,
+        policy_store=start.store,
+        ratchet=start.ratchet,
+        seed_ignored=start.seed_ignored,
+    )
 
 
 class _Server(uvicorn.Server):
@@ -429,6 +758,7 @@ def build_portal(
     health: HealthReader | None = None,
     ledger: Ledger | None = None,
     source: Source = "file",
+    policy_header: Callable[[], Mapping[str, object] | None] | None = None,
     onboard: OnboardService | None = None,
     reviews: ReviewQueue | None = None,
     lookup: Lookup = lookup_addresses,
@@ -440,8 +770,10 @@ def build_portal(
     area writes through, the admin socket's store, token manager and policy; ``health`` what
     its health checklist reads, as the socket's ``GET /health`` does; ``ledger`` the reported
     copy and the send journals its Ledger page reads, as ``zoeymcp ledger --vault`` does;
-    ``source`` where the policy came from, for its policy view; and ``onboard`` and ``reviews``
-    the onboardings and review jobs its MCP servers section shares with the socket (M7 K)."""
+    ``source`` where the policy came from, for its policy view, and in managed mode
+    ``policy_header`` the running revision's header (M6 design A.4); and ``onboard`` and
+    ``reviews`` the onboardings and review jobs its MCP servers section shares with the socket
+    (M7 K)."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -466,6 +798,7 @@ def build_portal(
         health=None if health is None else health.report,
         ledger=ledger,
         source=source,
+        policy_header=policy_header,
         onboard=onboard,
         reviews=reviews,
     )
@@ -500,11 +833,13 @@ async def serve(
     gateway_uid: int | None = None,
     control_fd: int | None = None,
     portal: Portal | None = None,
+    managed: ManagedPolicy | None = None,
     binder: Binder = bind_tcp,
     stopper: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
     """Serve every listener until a stop. ``stopper`` is for a caller off the main thread (tests):
-    it is handed the stop function, and no signal handler is installed."""
+    it is handed the stop function, and no signal handler is installed. A reload is
+    ``managed``'s in managed mode (F.6), else the declarative one."""
     # Before any server starts, so an address in use stops the start with its name (B.3).
     bound = bind_listens(listens, binder)
     portal_sockets: list[socket.socket] | None = None
@@ -596,7 +931,10 @@ async def serve(
             server.should_exit = True
 
     def reload() -> None:
-        reload_policy(app, config, environ, portal=portal)
+        if managed is not None:
+            reload_managed(managed, config, environ)
+        else:
+            reload_policy(app, config, environ, portal=portal)
 
     loop = asyncio.get_running_loop()
     if stopper is not None:
@@ -664,11 +1002,18 @@ def reload_policy(
 
     The portal takes a changed ``admin.origins`` at once, ending the sessions of an origin that
     went away; its listener stays where it is until a restart (M5 design B.3).
+
+    This is the declarative reload: a policy that now says ``mode: managed`` is refused, since the
+    mode is chosen at start (M6 design F.6). A managed vault reloads with :func:`reload_managed`.
     """
     try:
         policy = load_policy(config, environ)
     except StartupError as exc:
         logs.event("reload_refused", reason=str(exc))
+        return
+    if policy.mode == "managed":
+        # The process's mode never changes while it runs (M6 design F.6).
+        logs.event("reload_refused", reason=MODE_AT_START)
         return
     # The egress role's key generation only goes up: a lower one is a key the vault retired. Only
     # against the running policy: no floor is kept across a restart.
@@ -715,9 +1060,24 @@ def reload_policy(
     logs.event("reload_ok", oauth_reset=reset)
 
 
+def reload_managed(managed: ManagedPolicy, config: str | None, environ: Mapping[str, str]) -> None:
+    """``SIGHUP`` in managed mode (M6 design F.6): the store verified again and its head
+    installed when it isn't the one running, which is the retry after a failed install (G-5);
+    the configured source is compared with the seed and the head (F.5), never applied (DD-7).
+    Logs ``reload_ok source=head revision=N installed=...``, or ``reload_refused`` with the
+    running policy kept. The portal takes a new head's ``admin.origins`` as at a declarative
+    reload (``ManagedPolicy``'s ``installed``)."""
+    # Standard input is read once, at start: nothing to compare again.
+    source = configured(config, environ) if config != "-" else None
+    installed = managed.reverify(source, recheck=config != "-")
+    if installed is not None:
+        logs.event("reload_ok", source="head", revision=managed.revision, installed=installed)
+
+
 @dataclass(frozen=True)
 class Vault:
-    """Everything :func:`run` serves, built in the start-up order of M5 design B.4."""
+    """Everything :func:`run` serves, built in the start-up order of M5 design B.4. ``managed``
+    is the managed policy's holder, in managed mode."""
 
     app: VaultApp
     gateway_keys: GatewayKeys
@@ -728,6 +1088,7 @@ class Vault:
     admin: AdminApp | None
     admin_socket: Path | None
     portal: Portal | None
+    managed: ManagedPolicy | None = None
 
 
 def run(
@@ -774,6 +1135,7 @@ def run(
             gateway_uid=gateway_uid,
             control_fd=control_fd,
             portal=vault.portal,
+            managed=vault.managed,
         )
     )
 
@@ -790,8 +1152,13 @@ def build(
 ) -> Vault:
     """With the state lock held: keys, policy, store, gateway keys, the link directory, the
     journals and the copy, the portal's state files, then the portal (M5 design B.4). Nothing
-    listens yet. ``bridges`` are the bridges the launcher started, by name, with their uids."""
-    runtime = load_runtime(config, state_dir, environ)
+    listens yet. ``bridges`` are the bridges the launcher started, by name, with their uids.
+    In managed mode the policy's holder (``vault/managed.py``) is built on the app, with the
+    revision-to-view-digest map's first entry, the head's (M6 design F.2, K.1)."""
+    named = frozenset(bridges or ())
+    runtime = load_runtime(
+        config, state_dir, environ, standard=gateway_socket is not None, bridges=named
+    )
     if gateway_socket is not None:
         check_link_dir(gateway_socket)
     # Before any listener opens: a torn tail is cut and the head rebuilt from the lines (M5 J.4).
@@ -833,6 +1200,39 @@ def build(
         source=policy_source(config),
     )
     app.use_allowances(onboard.allowances, onboard.allowances_expire_in)
+    # The policy's holder: in managed mode every write and SIGHUP goes through it (M6 design
+    # G.6, F.6); in declarative mode a store the start found is health's to show (F.4).
+    portal: Portal | None = None
+    managed: ManagedPolicy | None = None
+    policy_state: Callable[[], PolicyState | None] | None = None
+    held = runtime.policy_store
+    if held is not None and runtime.policy.mode == "managed":
+        assert runtime.ratchet is not None  # noqa: S101 - a managed start reads it
+        admin_block = runtime.policy.admin
+        managed = ManagedPolicy(
+            held,
+            app,
+            policy=runtime.policy,
+            ratchet=runtime.ratchet,
+            secrets=runtime.store,
+            environ=environ,
+            # Where the portal listens is admin.listen as it started (B.3); the launcher's
+            # bridges reach the plan (I.2).
+            started=restart.Started(
+                app.egress_proxy,
+                app.egress_proxy_kind,
+                None if admin_block is None else admin_block.listen,
+                named,
+            ),
+            reopen=lambda: PolicyStore.open(
+                state_dir, runtime.keys, runtime.previous, strays=False
+            ),
+            seed_ignored=runtime.seed_ignored,
+            installed=lambda policy: _new_origins(portal, policy),
+        )
+        policy_state = managed.state
+    elif held is not None:
+        policy_state = DeclarativeStore(held, lambda: app.policy).state
     # The portal's state files, one holder each for the socket and the portal. Built on every
     # platform: on Windows, or with --admin-socket none, the portal still redeems a code issued
     # offline with zoeymcp setup-code --state (M5 design E.2, verifier V12).
@@ -853,8 +1253,8 @@ def build(
     # P10; M7 design D.9).
     secrets = Secrets(runtime.store, app.tokens, lambda: app.policy, app.revoker)
     # Health from the same sources as the socket's GET /health (M5 design I.2), with the tier
-    # and the bridges this vault was started with (M7 design C.10, J).
-    named = frozenset(bridges or ())
+    # and the bridges this vault was started with (M7 design C.10, J), and the policy store's
+    # state (M6 design M.5).
     tier = Bridges(
         link=gateway_socket is not None,
         named=named,
@@ -871,10 +1271,14 @@ def build(
         egress_fetched_ago=app.allowlist_fetched_ago,
         bridges=tier,
         gateway_status=app.gateway_status,
+        policy_state=policy_state,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
-    # (M5 design J.5); the policy view says where the policy came from (L).
+    # (M5 design J.5); the policy view says where the policy came from (L), in managed mode the
+    # revision that runs (M6 design A.4, G.10).
     source: Source = "stdin" if config == "-" else "env" if config is None else "file"
+    if managed is not None:
+        source = "managed"
     portal = build_portal(
         runtime.policy,
         listens,
@@ -885,6 +1289,7 @@ def build(
         health=health,
         ledger=Ledger(reports, app.connectors),
         source=source,
+        policy_header=None if managed is None else (lambda: _header(managed)),
         # The same onboardings and review jobs as the socket's (M7 design D.8, F.2).
         onboard=onboard,
         reviews=app,
@@ -912,7 +1317,28 @@ def build(
             egress_fetched_ago=app.allowlist_fetched_ago,
             bridges=tier,
             gateway_status=app.gateway_status,
+            policy_state=policy_state,
         )
     return Vault(
-        app, runtime.gateway_keys, login, onboard, setup, passkeys, admin, admin_socket, portal
+        app,
+        runtime.gateway_keys,
+        login,
+        onboard,
+        setup,
+        passkeys,
+        admin,
+        admin_socket,
+        portal,
+        managed,
     )
+
+
+def _header(managed: ManagedPolicy | None) -> Mapping[str, object] | None:
+    return None if managed is None else managed.header
+
+
+def _new_origins(portal: Portal | None, policy: Policy) -> None:
+    """A managed install's ``admin.origins`` taken by the portal, as a declarative reload's are
+    (M6 design G.6 step 8, F.6); its listener stays where it is until a restart."""
+    if portal is not None and policy.admin is not None:
+        portal.app.reload(policy.admin.origins)

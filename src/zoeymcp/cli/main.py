@@ -76,6 +76,8 @@ HEALTH_ACTIONS = {
         "prints"
     ),
     "review": "run: zoeymcp review {server}",
+    "reload_vault": "send SIGHUP to the vault, or restart it",
+    "import_from_env": "remove ZOEYMCP_CONFIG, or run: zoeymcp policy import --from-env",
 }
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
@@ -1913,6 +1915,12 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
         head = "nothing reported" if copy["head_seq"] is None else f"head seq {copy['head_seq']}"
         lines.append(f"ledger copy: {copy['level']} ({copy['state']}, {head})")
         lines += _finding_lines(copy["findings"])
+    policy = report.get("policy")
+    if policy is not None:
+        revision = policy["revision"]
+        said = policy["mode"] if revision is None else f"{policy['mode']}, revision {revision}"
+        lines.append(f"policy: {policy['level']} ({said})")
+        lines += _finding_lines(policy["findings"])
     gateway = report.get("gateway")
     if gateway is not None:
         ago = gateway["reported_ago"]

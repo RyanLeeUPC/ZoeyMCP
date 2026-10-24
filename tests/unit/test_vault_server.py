@@ -19,7 +19,9 @@ import pytest
 
 from tests.unit.report_model import asked_line
 from zoeymcp.common.ledgerformat import GENESIS
-from zoeymcp.vault import gatewaykeys, logs, server
+from zoeymcp.common.policy.schema import hash_token
+from zoeymcp.portal.policyview import view as policy_view
+from zoeymcp.vault import gatewaykeys, logs, policystart, server
 from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.app import GATEWAY_HEADER, VaultApp
 from zoeymcp.vault.connectors import sendjournal
@@ -27,7 +29,9 @@ from zoeymcp.vault.connectors.smtp import Answer, SmtpConnectors
 from zoeymcp.vault.gatewaykeys import BACKWARDS, STATE_FILE, TAMPERED, State
 from zoeymcp.vault.health import Bridges
 from zoeymcp.vault.keys import KeySet, generate_master_key
+from zoeymcp.vault.managed import DeclarativeStore, ManagedPolicy
 from zoeymcp.vault.oauth.login import LoginService
+from zoeymcp.vault.policyseal import unseal_anchor
 from zoeymcp.vault.server import (
     LOCK_FILE,
     ListenerTag,
@@ -67,11 +71,434 @@ def test_refuses_a_policy_that_fails_check(tmp_path: Path, example_text: str) ->
         load_runtime(str(policy_file), tmp_path, env())
 
 
-def test_refuses_managed_mode_for_now(tmp_path: Path, example_text: str) -> None:
-    policy_file = tmp_path / "managed.yaml"
-    policy_file.write_text(example_text.replace("mode: declarative", "mode: managed"), "utf-8")
-    with pytest.raises(StartupError, match="managed mode arrives in M6"):
-        load_runtime(str(policy_file), tmp_path, env())
+# --- the start's decision (M6 design F.1-F.5) --------------------------------------------------
+
+# A client written with a literal token, which the seed writes as its hash (D.5).
+AGENT2 = "  clients:\n    agent2:\n      token: example-agent2-token-0123\n"
+# A credential whose secret comes from env:K.
+ENV_K = 'credentials:\n  k: {kind: header, header: X-Key, format: "{secret}", secret: "env:K"}\n'
+
+
+def _managed(example_text: str) -> str:
+    return example_text.replace("mode: declarative", "mode: managed")
+
+
+def _config(tmp_path: Path, text: str, name: str = "policy.yaml") -> str:
+    path = tmp_path / name
+    path.write_bytes(text.encode())
+    return str(path)
+
+
+def _state(tmp_path: Path) -> Path:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    return state
+
+
+def _policy_events(buffer: io.StringIO) -> list[dict[str, Any]]:
+    """The policy store's log lines, without their time and role."""
+    return [
+        {key: value for key, value in line.items() if key not in ("ts", "role")}
+        for line in _log_lines(buffer)
+        if line["event"].startswith("policy_")
+    ]
+
+
+def _start_refusal(config: str | None, state: Path, environ: dict[str, str], **kw: Any) -> str:
+    with pytest.raises(StartupError) as refused:
+        load_runtime(config, state, environ, **kw)
+    return str(refused.value)
+
+
+def test_managed_mode_seeds_a_fresh_volume(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """J4, F.3 (M6 step 13b; was test_refuses_managed_mode_for_now): on a fresh volume a managed
+    start seeds revision 1 from the source as a revision holds it (a literal client token as its
+    hash), writes the anchor and runs it; a second start runs the head and seeds nothing."""
+    master = env()
+    state = _state(tmp_path)
+    config = _config(tmp_path, _managed(example_text).replace("  clients:\n", AGENT2, 1))
+    runtime = load_runtime(config, state, master)
+    store = runtime.policy_store
+    assert store is not None
+    head, header = store.head, store.header
+    assert head is not None
+    assert header is not None
+    assert runtime.policy.mode == "managed"
+    assert (head.revision, header["origin"], header["author"]) == (1, "seed", {"by": "seed"})
+    assert runtime.ratchet is not None
+    assert runtime.seed_ignored is None
+    assert runtime.policy.gateway is not None
+    agent2 = runtime.policy.gateway.clients["agent2"]
+    assert (agent2.token, agent2.token_sha256) == (None, hash_token("example-agent2-token-0123"))
+    assert (state / "policy-anchor.json").is_file()
+    assert _policy_events(log_buffer) == [
+        {
+            "event": "policy_seeded",
+            "revision": 1,
+            "deployment": head.deployment[:8],
+            "tokens_hashed": 1,
+            "via": "start",
+        },
+        {
+            "event": "policy_head",
+            "revision": 1,
+            "digest": head.digest.removeprefix("sha256:")[:8],
+            "deployment": head.deployment[:8],
+            "write_kind": "policy.seed",
+        },
+    ]
+    again = load_runtime(config, state, master)
+    assert again.policy_store is not None
+    assert again.policy_store.head == head
+    assert again.seed_ignored is None
+    assert [line["event"] for line in _policy_events(log_buffer)][2:] == ["policy_head"]
+
+
+def test_managed_mode_refuses_a_used_volume(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """J5b, Y18, FM-9 (M6 step 13b; was test_refuses_managed_mode_for_now): a volume a vault used
+    with no store and no anchor is refused, naming the files and the host's own commands
+    (ZOEYMCP_COMPOSE_CMD, the service and the standard tier's --user); nothing is written."""
+    master = env()
+    state = _state(tmp_path)
+    load_runtime(str(EXAMPLE_POLICY), state, master)
+    hosted = {
+        **master,
+        "ZOEYMCP_COMPOSE_CMD": "docker compose -f deploy/compose.yaml",
+        "ZOEYMCP_EXEC_SERVICE": "zoeymcp",
+    }
+    config = _config(tmp_path, _managed(example_text))
+    where = state.as_posix()
+    assert _start_refusal(config, state, hosted, standard=True) == "\n".join(
+        [
+            "refused to start: managed mode with no policy revisions, on a state volume that was "
+            "used before (gateway-key.json). If you are switching this deployment to managed "
+            "mode, seed revision 1 from ZOEYMCP_CONFIG once:",
+            "  docker compose -f deploy/compose.yaml stop zoeymcp",
+            "  docker compose -f deploy/compose.yaml run --rm --no-deps --user 10001:10001 zoeymcp "
+            f"policy seed --state {where}",
+            "  docker compose -f deploy/compose.yaml up -d zoeymcp",
+            f"If you didn't, {where}/policy and {where}/policy-anchor.json may have been deleted: "
+            f"restore {where} from one backup.",
+        ]
+    )
+    hardened = _start_refusal(config, state, master)
+    assert "  docker compose -f deploy/compose.hardened.yaml stop vault\n" in hardened
+    assert f"run --rm --no-deps vault policy seed --state {where}\n" in hardened
+    assert _policy_events(log_buffer)[-1] == {
+        "event": "policy_refused",
+        "level": "critical",
+        "reason": "policy_seed_needs_host",
+        "file": "policy",
+    }
+    assert not (state / "policy").exists()
+    assert not (state / "policy-anchor.json").exists()
+
+
+def test_a_declarative_start_is_as_before(tmp_path: Path, log_buffer: io.StringIO) -> None:
+    """F.1's declarative row with no store: nothing of the store is written or logged."""
+    state = _state(tmp_path)
+    runtime = load_runtime(str(EXAMPLE_POLICY), state, env())
+    assert runtime.policy_store is None
+    assert runtime.ratchet is None
+    names = {path.name for path in state.iterdir()}
+    assert not names & {"policy", "policy-anchor.json"}
+    assert _policy_events(log_buffer) == []
+
+
+def test_back_to_declarative_and_resume(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """FM-26 in process (J10, F.4): a declarative start on a managed volume parks the store
+    (``policy_store_parked``, once) and runs its file; the next managed start resumes from its
+    source as the next revision, planned against the parked head, and nothing stale runs."""
+    master = env()
+    state = _state(tmp_path)
+    load_runtime(_config(tmp_path, _managed(example_text)), state, master)
+    declarative = load_runtime(str(EXAMPLE_POLICY), state, master)
+    assert declarative.policy.mode == "declarative"
+    assert declarative.policy_store is not None
+    keys = KeySet.from_text(master["ZOEYMCP_MASTER_KEY"])
+    anchor = unseal_anchor((state / "policy-anchor.json").read_bytes(), keys, None)
+    assert (anchor.highest, anchor.parked) == (1, 1)
+    load_runtime(str(EXAMPLE_POLICY), state, master)
+    parked = [line for line in _policy_events(log_buffer) if line["event"] == "policy_store_parked"]
+    assert parked == [{"event": "policy_store_parked", "level": "warning", "revision": 1}]
+    text = _managed(example_text).replace("timeout: 300", "timeout: 120")
+    changed = _config(tmp_path, text, "changed.yaml")
+    resumed = load_runtime(changed, state, master)
+    store = resumed.policy_store
+    assert store is not None
+    assert store.head is not None
+    assert store.header is not None
+    assert store.head.revision == 2
+    header = {key: store.header[key] for key in ("origin", "kind", "author", "base")}
+    assert header == {
+        "origin": "resume",
+        "kind": "policy.resume",
+        "author": {"by": "host", "via": "source"},
+        "base": 1,
+    }
+    assert resumed.policy.gateway is not None
+    assert resumed.policy.gateway.approvals is not None
+    assert resumed.policy.gateway.approvals.timeout == 120
+    [line] = [line for line in _policy_events(log_buffer) if line["event"] == "policy_resumed"]
+    assert line == {
+        "event": "policy_resumed",
+        "level": "info",
+        "revision": 2,
+        "parked_at": 1,
+        "revived": 0,
+    }
+    anchor = unseal_anchor((state / "policy-anchor.json").read_bytes(), keys, None)
+    assert (anchor.highest, anchor.parked) == (2, None)
+    # The source it resumed from is the seed now: starting with it again is no finding.
+    again = load_runtime(changed, state, master)
+    assert again.seed_ignored is None
+    assert again.policy_store is not None
+    assert again.policy_store.head == store.head
+
+
+def test_a_declarative_policy_that_brings_back_a_client_is_named(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """F.4, T-16: a declarative file that brings back a client managed mode removed parks the
+    store at critical, naming it, and health names it while it runs; the resume grants it, as
+    the host ran it, and names it once."""
+    from .test_managed import edited, import_
+    from .test_managed import start as managed_start
+
+    text = _managed(example_text).replace("  clients:\n", AGENT2, 1)
+    rig = managed_start(tmp_path, text)
+    removed = import_(rig, edited(lambda data: data["gateway"]["clients"].pop("agent2")))
+    assert (type(removed).__name__, removed.revision) == ("Written", 2)
+    asyncio.run(rig.app.aclose())
+    master = rig.environ
+    state = rig.state
+    declarative = example_text.replace("  clients:\n", AGENT2, 1)
+    runtime = load_runtime(_config(tmp_path, declarative, "back.yaml"), state, master)
+    [parked] = [
+        line for line in _policy_events(log_buffer) if line["event"] == "policy_store_parked"
+    ]
+    assert parked == {
+        "event": "policy_store_parked",
+        "level": "critical",
+        "revision": 2,
+        "revived": 1,
+        "names": ["client:agent2"],
+    }
+    assert runtime.policy_store is not None
+    found = DeclarativeStore(runtime.policy_store, lambda: runtime.policy).state()
+    assert found is not None
+    assert found.revived == ("client:agent2",)
+    resumed = load_runtime(_config(tmp_path, text, "again.yaml"), state, master)
+    assert resumed.policy_store is not None
+    assert resumed.policy_store.head is not None
+    assert resumed.policy_store.head.revision == 3
+    [line] = [line for line in _policy_events(log_buffer) if line["event"] == "policy_resumed"]
+    assert (line["level"], line["revived"], line["names"]) == ("warning", 1, ["client:agent2"])
+
+
+def test_a_store_a_declarative_start_cant_read_is_left_as_it_is(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """F.1: a declarative start over a store that doesn't verify runs its file and says so
+    (``policy_store_unverified``); a managed start meets the refusal (D.6), logged
+    ``policy_refused``."""
+    master = env()
+    state = _state(tmp_path)
+    managed = _config(tmp_path, _managed(example_text))
+    load_runtime(managed, state, master)
+    (state / "policy" / "head.json").write_bytes(b"{}")
+    runtime = load_runtime(str(EXAMPLE_POLICY), state, master)
+    assert runtime.policy.mode == "declarative"
+    assert _policy_events(log_buffer)[-1] == {
+        "event": "policy_store_unverified",
+        "level": "warning",
+        "reason": "tampered",
+    }
+    assert runtime.policy_store is not None
+    found = DeclarativeStore(runtime.policy_store, lambda: runtime.policy).state()
+    assert found is not None
+    assert found.unverified == "tampered"
+    refused = _start_refusal(managed, state, master)
+    assert refused.startswith(f"refused to start: {state.as_posix()}/policy/head.json ")
+    assert _policy_events(log_buffer)[-1] == {
+        "event": "policy_refused",
+        "level": "critical",
+        "reason": "tampered",
+        "file": "policy/head.json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("deleted", "reason"),
+    [("policy", "policy_store_missing"), ("policy-anchor.json", "policy_anchor_missing")],
+)
+def test_a_store_or_anchor_deleted_is_refused(
+    tmp_path: Path, example_text: str, deleted: str, reason: str, log_buffer: io.StringIO
+) -> None:
+    """FM-10, FM-11 in process: /state/policy deleted beside its anchor, or the anchor beside
+    the store, refuses the start; the vault never seeds again by itself."""
+    master = env()
+    state = _state(tmp_path)
+    managed = _config(tmp_path, _managed(example_text))
+    load_runtime(managed, state, master)
+    target = state / deleted
+    if target.is_dir():
+        for path in sorted(target.rglob("*"), reverse=True):
+            path.rmdir() if path.is_dir() else path.unlink()
+        target.rmdir()
+    else:
+        target.unlink()
+    _start_refusal(managed, state, master)
+    assert _policy_events(log_buffer)[-1]["reason"] == reason
+
+
+def test_the_source_beside_a_running_head(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """F.1's managed rows with a store: the head runs whatever the source, which may be removed
+    after the seed; a source that changed, doesn't load or fails check is ignored, logged
+    ``policy_seed_ignored`` (F.5), never applied."""
+    master = env()
+    state = _state(tmp_path)
+    load_runtime(_config(tmp_path, _managed(example_text)), state, master)
+    none = load_runtime(None, state, master)
+    assert (none.policy.mode, none.seed_ignored) == ("managed", None)
+    sources = {
+        "changed": _managed(example_text).replace("timeout: 300", "timeout: 120"),
+        "unreadable": "version: 1\nmode: [\n",
+        "fails_check": _managed(example_text).replace("credentials:\n", ENV_K, 1),
+    }
+    for reason, text in sources.items():
+        runtime = load_runtime(_config(tmp_path, text, f"{reason}.yaml"), state, master)
+        assert runtime.seed_ignored == reason
+        assert runtime.policy.gateway is not None
+        assert runtime.policy.gateway.approvals is not None
+        assert runtime.policy.gateway.approvals.timeout == 300
+        assert _policy_events(log_buffer)[-2] == {
+            "event": "policy_seed_ignored",
+            "level": "warning",
+            "revision": 1,
+            "reason": reason,
+        }
+
+
+def test_a_parked_store_needs_a_source_to_resume(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """F.1: a parked store with no source, or one that doesn't load, is refused
+    ``policy_resume_needs_source``; with no store, no source is today's refusal and a failing
+    source is the gate's, and nothing is seeded."""
+    master = env()
+    state = _state(tmp_path)
+    load_runtime(_config(tmp_path, _managed(example_text)), state, master)
+    load_runtime(str(EXAMPLE_POLICY), state, master)
+    parked = (
+        "refused to start: this store was parked by a declarative start at revision 1: give the "
+        "policy to resume from, with mode: managed"
+    )
+    assert _start_refusal(None, state, master) == parked
+    bad = _config(tmp_path, "version: 1\nmode: [\n", "bad.yaml")
+    assert _start_refusal(bad, state, master).startswith(f"{parked}; the policy given is refused")
+    assert _policy_events(log_buffer)[-1] == {
+        "event": "policy_refused",
+        "level": "critical",
+        "reason": "policy_resume_needs_source",
+        "revision": 1,
+    }
+    fresh = tmp_path / "fresh"
+    fresh.mkdir(mode=0o700)
+    assert _start_refusal(None, fresh, master) == policystart.NO_POLICY
+    failing = _config(tmp_path, _managed(example_text).replace("credentials:\n", ENV_K, 1))
+    assert "fails check" in _start_refusal(failing, fresh, master)
+    assert not (fresh / "policy-anchor.json").exists()
+
+
+def test_head_fails_check(tmp_path: Path, example_text: str, log_buffer: io.StringIO) -> None:
+    """FM-23 (F.2): a head whose policy now fails check here (an env: variable this container
+    lacks) refuses the start naming the path, and the store is unchanged."""
+    master = env(K="v")
+    state = _state(tmp_path)
+    load_runtime(
+        _config(tmp_path, _managed(example_text).replace("credentials:\n", ENV_K, 1)), state, master
+    )
+    head = (state / "policy" / "head.json").read_bytes()
+    del master["K"]
+    assert _start_refusal(None, state, master) == (
+        "policy revision 1 fails check (1 error(s)): credentials.k.secret: env var K is not set"
+    )
+    assert _policy_events(log_buffer)[-1] == {
+        "event": "policy_refused",
+        "level": "critical",
+        "reason": "fails_check",
+        "revision": 1,
+    }
+    assert (state / "policy" / "head.json").read_bytes() == head
+
+
+def test_a_resume_below_a_floor_is_refused(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """F.4, E1 (verifier C8): a resume whose source sets a key generation below the parked
+    ratchet's floor refuses the start, naming the field."""
+    master = env()
+    state = _state(tmp_path)
+    two = example_text.replace("gateway_key_generation: 1", "gateway_key_generation: 2")
+    load_runtime(_config(tmp_path, _managed(two)), state, master)
+    load_runtime(_config(tmp_path, two, "declarative.yaml"), state, master)
+    refused = _start_refusal(_config(tmp_path, _managed(example_text), "one.yaml"), state, master)
+    assert refused == (
+        "refused to start: the policy given sets gateway_key_generation below 2, the parked "
+        "store's floor: that would bring back a retired key. Set gateway_key_generation to 2 or "
+        "more."
+    )
+    assert _policy_events(log_buffer)[-1]["reason"] == "resume_generation_lowered"
+
+
+def test_a_resume_below_the_gateway_key_state_writes_nothing(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """G-4 (G.6 step 5) at a resume: the declarative run raised gateway-key.json's generation
+    above the parked ratchet's floor; a source below it refuses the start before the resume's
+    revision is written, so the store stays parked and a corrected source still resumes."""
+    master = env()
+    state = _state(tmp_path)
+    two = example_text.replace("gateway_key_generation: 1", "gateway_key_generation: 2")
+    load_runtime(_config(tmp_path, _managed(example_text)), state, master)
+    load_runtime(_config(tmp_path, two, "declarative.yaml"), state, master)
+    refused = _start_refusal(_config(tmp_path, _managed(example_text), "one.yaml"), state, master)
+    assert refused == (
+        "refused to start: the policy given sets gateway_key_generation below 2, the generation "
+        "gateway-key.json holds: that would bring back a retired key. Set gateway_key_generation "
+        "to 2 or more."
+    )
+    assert _policy_events(log_buffer)[-1]["reason"] == "resume_generation_lowered"
+    keys = KeySet.from_text(master["ZOEYMCP_MASTER_KEY"])
+    anchor = unseal_anchor((state / "policy-anchor.json").read_bytes(), keys, None)
+    assert (anchor.highest, anchor.parked) == (1, 1)
+    assert not (state / "policy" / "revisions" / "0000000002.json").exists()
+    resumed = load_runtime(_config(tmp_path, _managed(two), "two.yaml"), state, master)
+    assert resumed.policy.gateway_key_generation == 2
+    assert resumed.policy_store is not None
+    assert resumed.policy_store.head.revision == 2  # type: ignore[union-attr]
+
+
+def test_a_previous_master_key_equal_to_the_current_one_is_logged(
+    tmp_path: Path, log_buffer: io.StringIO
+) -> None:
+    """13a's review F1: the policy store treats it as unset; the start says so and goes on."""
+    master = env()
+    master["ZOEYMCP_MASTER_KEY_PREVIOUS"] = master["ZOEYMCP_MASTER_KEY"]
+    load_runtime(str(EXAMPLE_POLICY), _state(tmp_path), master)
+    key_id = KeySet.from_text(master["ZOEYMCP_MASTER_KEY"]).key_id
+    found = _log_lines(log_buffer)
+    [line] = [each for each in found if each["event"] == "master_key_previous_same"]
+    assert (line["level"], line["key_id"]) == ("warning", key_id)
 
 
 def _refusal(config: str | None, environ: dict[str, str]) -> str:
@@ -203,7 +630,7 @@ def test_run_keeps_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         held.append(fd)
         return fd
 
-    def load(*args: object) -> None:
+    def load(*args: object, **kwargs: object) -> None:
         raise StartupError("stop here")
 
     monkeypatch.setattr(server, "acquire_state_lock", lock)
@@ -317,7 +744,7 @@ def test_run_locks_the_state_directory_before_loading(
         calls.append("lock")
         raise StartupError("another vault is using this state directory")
 
-    def load(*args: object) -> None:
+    def load(*args: object, **kwargs: object) -> None:
         calls.append("load")
         raise StartupError("stop here")
 
@@ -377,9 +804,92 @@ def test_reload_refuses_a_bad_policy(
     server.reload_policy(app, str(bad), env())
     line = _log_lines(log_buffer)[-1]
     assert line["event"] == "reload_refused"
-    assert "managed mode arrives in M6" in line["reason"]
+    # M6 step 13b (F.6): the process's mode never changes while it runs.
+    assert line["reason"] == "the mode is chosen at start; restart to change it"
     assert app.policy is before
     asyncio.run(app.aclose())
+
+
+def test_a_managed_sighup_is_the_heads(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """F.6: a managed SIGHUP installs the head when it isn't running and logs
+    ``reload_ok source=head``; it never reads standard input again, and never applies the
+    source."""
+    from .test_managed import start as managed_start
+
+    rig = managed_start(tmp_path, _managed(example_text))
+    config = str(tmp_path / "policy.yaml")
+    server.reload_managed(rig.managed, config, rig.environ)
+    assert _log_lines(log_buffer)[-1] == {
+        "ts": _log_lines(log_buffer)[-1]["ts"],
+        "role": "vault",
+        "event": "reload_ok",
+        "source": "head",
+        "revision": 1,
+        "installed": False,
+    }
+    stdin = io.StringIO("version: 1\nmode: [\n")
+    sys_stdin = sys.stdin
+    sys.stdin = stdin
+    try:
+        server.reload_managed(rig.managed, "-", rig.environ)
+    finally:
+        sys.stdin = sys_stdin
+    assert stdin.tell() == 0
+    assert rig.managed.state().seed_ignored is None
+    asyncio.run(rig.app.aclose())
+
+
+def test_a_managed_vault_is_built_on_its_head(
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F.2, K.1, M.5, A.4: in managed mode ``run`` serves the holder, the map starts with the
+    head's view, health (socket and portal) has the policy section, and the portal's policy
+    view names the head revision."""
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs, app=app)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    config = _config(tmp_path, _managed(example_text))
+    server.run(config, ["127.0.0.1:8080"], _state(tmp_path), env(), tmp_path / "admin.sock")
+    managed, portal, admin = seen["managed"], seen["portal"], seen["admin"]
+    assert isinstance(managed, ManagedPolicy)
+    assert managed.view_digests == {1: seen["app"].view_digest}
+    section = {"mode": "managed", "revision": 1, "level": "ok", "findings": []}
+    assert admin._health_reader.report()["policy"] == section
+    assert portal.app.health()["policy"] == section
+    assert portal.app.source == "managed"
+    header = portal.app.policy_header()
+    assert header["revision"] == 1
+    shown = policy_view(seen["app"].policy, "managed", header=header)["source_shown"]
+    assert shown.startswith("revision 1, saved ")
+    assert shown.endswith(" by the seed")
+
+
+def test_a_declarative_vault_over_no_store_has_no_policy_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def serve(app: VaultApp, listens: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        await app.aclose()
+
+    monkeypatch.setattr(server, "acquire_state_lock", lambda state_dir: None)
+    monkeypatch.setattr(server, "socket_supported", lambda: True)
+    monkeypatch.setattr(server, "check_socket_dir", lambda path: None)
+    monkeypatch.setattr(server, "serve", serve)
+    server.run(str(EXAMPLE_POLICY), ["127.0.0.1:8080"], tmp_path, env(), tmp_path / "admin.sock")
+    assert seen["managed"] is None
+    assert "policy" not in seen["admin"]._health_reader.report()
+    assert seen["portal"].app.source == "file"
 
 
 def _with_proxy(example_text: str, proxy: str | None, kind: str | None = None) -> str:

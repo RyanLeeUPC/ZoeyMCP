@@ -61,8 +61,11 @@ from another seal of the same policy; the unsealed revision and its body refuse 
 diff between two revisions (step 12b) holds nothing the policy view hides, and the host's export
 holds a client token only as its hash. The store's I/O (step 13a: a seed, a save, a master-key
 rotation, a quarantine move and a prune) leaves no vault-side value of the policy, nor the client
-token's hash, in a file in clear, a log line, a commit's header or the store's repr. The saves,
-rollbacks, imports and exports that write and read it join the sweep in the steps that build them.
+token's hash, in a file in clear, a log line, a commit's header or the store's repr. A managed
+start (step 13b: the seed from ZOEYMCP_CONFIG with a literal client token, a changed source, the
+park and the resume) and a write through the managed holder leave none in a file, a log line,
+health's policy section, a start refusal or a write's answer. The saves, rollbacks, imports and
+exports the socket and the portal make join the sweep in the steps that build them.
 """
 
 from __future__ import annotations
@@ -2225,3 +2228,111 @@ def test_the_policy_stores_files_and_logs_hold_no_policy_value(
         assert not any(value.encode() in text for text in shown), value
     with pytest.raises(TypeError, match=r"refusing to log a secret"):
         logs.event("oops", store=rotated)
+
+
+def test_a_managed_start_and_its_writes_show_no_policy_value(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """Managed start (M6 design F, G.6, O.6, Y3, step 13b): the secret-heavy policy, with its
+    literal client token, seeded from ZOEYMCP_CONFIG, started again from a changed source,
+    parked by a declarative start and resumed by a managed one, then saved through the holder
+    (a write, a refused one, a SIGHUP). No vault-side value, nor the client token's hash, is in
+    a log line, a file under the state directory, health's policy section, a start refusal or a
+    write's answer; the portal's policy view of the head hides what it always hides; neither
+    holder can be logged."""
+    from zoeymcp.common.policy import restart as restart_classes
+    from zoeymcp.portal.policyview import saved
+    from zoeymcp.vault.managed import DeclarativeStore, ManagedPolicy
+    from zoeymcp.vault.server import StartupError as VaultStartupError
+    from zoeymcp.vault.server import load_runtime
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    document = secret_heavy_policy().model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    # Without the two local MCP routes, which check refuses with a real credential (they show
+    # the gateway view's sweep what a program holds): the rest passes the gate.
+    local = ("leak-route-bridge", "leak-route-socket")
+    document["routes"] = [route for route in document["routes"] if route["name"] not in local]
+    for name in ("srv-bridge", "srv-socket"):
+        del document["gateway"]["servers"][name]
+    document["gateway"]["clients"]["hashed"]["servers"] = ["srv-remote", "srv-toolkit"]
+    master = KeySet.from_master(bytes(range(9, 41)))
+    environ = {
+        "ZOEYMCP_MASTER_KEY": base64.urlsafe_b64encode(bytes(range(9, 41))).decode().rstrip("="),
+        "LEAK_REF_REFRESH": "v",
+        "LEAK_REF_Q": "v",
+        "ZOEYMCP_CONFIG": json.dumps(document),
+    }
+    seeded = load_runtime(None, state, environ)
+    assert seeded.policy_store is not None
+    assert seeded.policy.gateway is not None
+    assert seeded.policy.gateway.clients["literal"].token is None
+    changed = {**document, "egress_key_generation": 2}
+    restarted = load_runtime(None, state, {**environ, "ZOEYMCP_CONFIG": json.dumps(changed)})
+    assert restarted.seed_ignored == "changed"
+    declarative = {**document, "mode": "declarative"}
+    parked = load_runtime(None, state, {**environ, "ZOEYMCP_CONFIG": json.dumps(declarative)})
+    assert parked.policy_store is not None
+    parked_state = DeclarativeStore(parked.policy_store, lambda: parked.policy).state()
+    refusals = []
+    try:
+        load_runtime(None, state, {**environ, "ZOEYMCP_CONFIG": "version: 1\nmode: [\n"})
+    except VaultStartupError as exc:
+        refusals.append(str(exc))
+    runtime = load_runtime(None, state, environ)
+    store = runtime.policy_store
+    assert store is not None
+    assert store.head is not None
+    assert store.head.revision == 2
+    assert runtime.ratchet is not None
+    app = VaultApp(runtime.policy, runtime.store, runtime.keys, environ={})
+    managed = ManagedPolicy(
+        store,
+        app,
+        policy=runtime.policy,
+        ratchet=runtime.ratchet,
+        secrets=runtime.store,
+        environ=environ,
+        started=restart_classes.Started(
+            app.egress_proxy, app.egress_proxy_kind, "127.0.0.1:8081", frozenset()
+        ),
+        reopen=lambda: policystore.PolicyStore.open(state, master, None),
+    )
+    host = {"by": "host", "via": "socket"}
+
+    def raised(given: Policy) -> Policy:
+        return given.model_copy(update={"gateway_key_generation": 2})
+
+    written = managed.write("policy.import", "socket", 2, raised, author=host, expected=None)
+    moved = managed.write("policy.import", "socket", 1, raised, author=host, expected=None)
+    assert (type(written).__name__, getattr(moved, "reason", None)) == ("Written", "policy_moved")
+    assert managed.reverify(None) is False
+    answers = [repr(written), repr(moved), repr(managed), repr(store)]
+    header = managed.header
+    assert header is not None
+    served = json.dumps(policy_view(app.policy, "managed", header=header))
+    assert saved(header) in served
+    health = HealthReader(runtime.store, lambda: app.policy, policy_state=managed.state)
+    sections = [json.dumps(health.report()["policy"]), repr(parked_state)]
+    policy_files = [
+        path.read_bytes() for path in state.rglob("*") if path.is_file() and "policy" in path.name
+    ]
+    policy_files += [path.read_bytes() for path in (state / "policy").rglob("*") if path.is_file()]
+    assert len(policy_files) > 3
+    events = [json.loads(line)["event"] for line in log_lines.getvalue().splitlines()]
+    assert {"policy_seeded", "policy_seed_ignored", "policy_store_parked"} <= set(events)
+    assert {"policy_resumed", "policy_imported", "policy_refused"} <= set(events)
+    shown = [
+        *policy_files,
+        log_lines.getvalue().encode(),
+        *(text.encode() for text in [*answers, *sections, *refusals]),
+    ]
+    for value in [*VAULT_SIDE.values(), hash_token(LITERAL_TOKEN)]:
+        assert not any(value.encode() in text for text in shown), value
+    for where in POLICY_VIEW_HIDES:
+        assert VAULT_SIDE[where] not in served, where
+    assert hash_token(LITERAL_TOKEN) not in served
+    for holder in (managed, DeclarativeStore(store, lambda: app.policy)):
+        with pytest.raises(TypeError, match=r"refusing to log a secret"):
+            logs.event("oops", holder=holder)
+    asyncio.run(app.aclose())

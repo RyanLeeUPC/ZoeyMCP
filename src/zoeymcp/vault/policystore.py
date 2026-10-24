@@ -265,10 +265,12 @@ class PolicyStore:
         previous: KeySet | None,
         *,
         clock: Callable[[], float] = time.time,
+        strays: bool = True,
     ) -> PolicyStore:
         """Read the store in ``state`` at start, take D.6's verdict and do its housekeeping.
         Never raises for what the files hold: a store that can't be used is a ``Refused``
-        verdict, for the start to refuse with."""
+        verdict, for the start to refuse with. ``strays`` false leaves out the stray names'
+        lines, which are once per start (row 15, Q35): a managed ``SIGHUP`` reads it again."""
         if previous is not None and previous.key_id == keys.key_id:
             # The current key set again as the previous one: there is nothing to re-seal, and a
             # rotation would record the vault's own key as retired (D.7).
@@ -310,7 +312,7 @@ class PolicyStore:
         if isinstance(store.verdict, Ok):
             chained = set(store.verdict.kept)
             kept = {n: e for n, e in read.items() if n in chained and isinstance(e, Unsealed)}
-            store._housekeep(store.verdict, kept)
+            store._housekeep(store.verdict, kept, strays=strays)
         elif isinstance(store.verdict, Fresh):
             # Row 5: a seed that never committed.
             for number in store.verdict.uncommitted:
@@ -493,6 +495,34 @@ class PolicyStore:
 
         return removed_in
 
+    def policy(self, number: int) -> Policy | None:
+        """Kept revision ``number``'s policy, read and verified now, or ``None`` when it isn't
+        kept or doesn't verify: a retry's base (G.6 step 2, MISS-9)."""
+        if number not in self._parents:
+            return None
+        head = self._running()
+        found = _unsealed(
+            self._path(number),
+            REVISION_FILE_MAX,
+            lambda data: unseal_revision(
+                data, self._keys, self._previous, deployment=head.deployment
+            ),
+        )
+        if not isinstance(found, Unsealed) or found.revision != number:
+            return None
+        try:
+            return Policy.model_validate(dict(found.body.policy))
+        except ValueError:
+            return None
+
+    def quarantined(self) -> int:
+        """How many files ``quarantine/`` holds (health's ``policy_quarantine_kept``, D.8)."""
+        directory = self._state / POLICY_DIR / QUARANTINE
+        try:
+            return sum(entry.is_file() for entry in _entries(directory))
+        except OSError:
+            return 0
+
     # --- internals ---------------------------------------------------------------------------
 
     def _path(self, number: int) -> Path:
@@ -507,7 +537,7 @@ class PolicyStore:
         for directory in (self._state / POLICY_DIR, self._state / POLICY_DIR / REVISIONS):
             directory.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
 
-    def _housekeep(self, ok: Ok, kept: Mapping[int, Unsealed]) -> None:
+    def _housekeep(self, ok: Ok, kept: Mapping[int, Unsealed], *, strays: bool) -> None:
         """An ``Ok`` store's rows 12-16, the rotation, and the anchor last."""
         self._head, self._header, self._seed_digest = ok.head, ok.top.header, ok.seed_digest
         self._parents = {number: entry.header["parent"] for number, entry in kept.items()}
@@ -524,7 +554,8 @@ class PolicyStore:
                 reason=found.reason,
             )
         for name in ok.stray:
-            logs.event("policy_stray_file", name=name)
+            if strays:
+                logs.event("policy_stray_file", name=name)
         self._prune(ok.pruned, below=ok.head.oldest)
         # A file left above the head may be under the previous key: retiring that key now would
         # make it files_above_head at the next start, so the rotation waits for the move.
