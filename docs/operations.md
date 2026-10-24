@@ -2198,6 +2198,8 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `code_flow_unsupported` | The authorization server doesn't advertise the authorization code flow. |
 | 409 | `name_taken` | The policy, the vault's store or another onboarding already has `<name>`. Choose another name. |
 | 422 | `diff_invalid` | The running policy with this change merged fails check (`<detail>`), so no fragment is shown. |
+| 403 | `portal_env_ref` | A credential the portal adds or changes takes its secret from the store, not from env: (`<detail>`). Only the host can use an env: reference. |
+| 403 | `route_reuses_credential` | A route the portal adds calls as the gateway alone, with a credential the same change adds; `<detail>` doesn't. Only the host can add it. |
 | 404 | `onboarding_unknown` | That onboarding isn't in progress: it finished, expired or was started elsewhere. Start it again. |
 | 429 | `onboarding_busy` | At most 4 onboardings can be in progress. Finish or cancel one, or wait for one to expire (30 minutes). |
 | 409 | `onboarding_options_changed` | The onboarding in progress for this URL and these names stopped at your proxy and was started with other options. Run it with the same options to carry on, or start again once it expires (30 minutes). |
@@ -2236,6 +2238,22 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `review_failed` | The gateway couldn't review the server (`<code>`). Its log says why; review again once that is fixed. |
 | 409 | `clear_unsupported` | The gateway is older than the vault: run zoeymcp review `<server>` --clear in the gateway's container. |
 | 409 | `clear_not_clean` | These still don't match their pins: `<tools>`. No mark was cleared; review the server again. |
+| 400 | `kind_mismatch` | This change is `<detail>`. Prepare it again from the page. |
+| 409 | `allow_needs_review` | There is no reviewed definition of `<detail>` at its pin to show you: review the server again, then allow it. |
+| 409 | `allow_marked` | The gateway marks `<detail>` as drifted: its classification waits for its review. |
+| 409 | `consequential_allow` | The toolkit declares `<detail>` consequential: it stays approve, never allow. |
+| 400 | `generation_lowered` | The policy's `<detail>`: that would bring back a retired key. |
+| 409 | `pin_retired` | This would put `<detail>` back on a definition it was re-pinned away from: review it. |
+| 409 | `rollback_revives` | Rolling back to `<detail>`: only the host can, with zoeymcp policy rollback and --allow-revive. |
+| 409 | `revives_client` | This brings back `<detail>`: refused without --allow-revive client:NAME for each. |
+| 409 | `revives_caller` | This brings back `<detail>`: refused without --allow-revive caller:ROUTE/INDEX for each. |
+| 403 | `env_name_new` | The reference env:`<detail>`: only the host can allow that, with zoeymcp policy import --allow-env. |
+| 403 | `env_reach_grows` | The reference env:`<detail>`: only the host can allow that, with zoeymcp policy import --allow-env. |
+| 409 | `ratchet_full` | The ratchet holds 10,000 retired entries: reseed with --new-ratchet on the host (operations.md section 34). |
+| 403 | `portal_widens` | The portal can't `<detail>`: export, edit and import with zoeymcp policy import. |
+| 403 | `generation_raise_from_portal` | A key rotation is done on the host: raise `<detail>` with zoeymcp policy import. |
+| 413 | `summary_too_large` | This change is too long to confirm in the portal: `<detail>` (zoeymcp policy export, edit, zoeymcp policy import), where all of it is shown. |
+| 400 | `no_change` | Nothing would change. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

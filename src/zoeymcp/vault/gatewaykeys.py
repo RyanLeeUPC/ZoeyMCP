@@ -122,6 +122,14 @@ def advance(state: State, generation: int, now: float) -> State | Refusal:
     return State(key_id=state.key_id, current=generation, floor=state.current, previous=previous)
 
 
+def check(state: State, generation: int) -> Refusal | None:
+    """:func:`advance`'s refusal of ``generation``, or None when it would take it (M6 design G.6
+    step 5, G-4). A managed write asks before any policy file is written, so the install after
+    the commit can fail only on I/O. The refusal doesn't depend on the time."""
+    found = advance(state, generation, 0)
+    return found if isinstance(found, Refusal) else None
+
+
 def rekey(state: State, key_id: str, now: float) -> State:
     """The master key changed to ``key_id``.
 

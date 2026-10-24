@@ -1,21 +1,26 @@
-"""The change object (M7 design H.1, O.2 ``test_policy_change.py``).
+"""The change object (M7 design H.1, O.2 ``test_policy_change.py``; M6 design G.3, J.3).
 
 A change holds the schema's own models, so every value in it has passed its validator; its plain
 form is what fragment 1 and fragment 2 load back to (E.2, E.4); ``apply`` merges it into the
 running policy with the merge ``check --with`` runs, refusing a taken name (``name_taken``) and a
-change the merged policy can't take (``diff_invalid``).
+change the merged policy can't take (``diff_invalid``). M6: managed mode's three portal ops
+(``MoveToAllow``, ``SetClientServers``, ``SetConnectorLimits``), a managed review's ``declined``
+block written whole, and the portal's bounds on its ops (``portal_env_ref``,
+``route_reuses_credential``), a test per op.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from zoeymcp.common.policy import Policy, parse_policy
+from zoeymcp.common.policy import Policy, check_policy, parse_policy
 from zoeymcp.common.policy.change import (
     AddCredential,
     AddEgressPrivate,
@@ -23,12 +28,16 @@ from zoeymcp.common.policy.change import (
     AddServer,
     ChangeRefused,
     Comment,
+    MoveToAllow,
     Op,
     PolicyChange,
+    SetClientServers,
+    SetConnectorLimits,
     SetCredential,
     SetScope,
     SetServerReview,
     apply,
+    from_portal,
     validate,
 )
 from zoeymcp.common.policy.schema import (
@@ -608,3 +617,322 @@ def test_apply_reads_the_policy_by_its_document_names() -> None:
     """The mail connector's from: field is from_ in the model; the merge writes it back as from."""
     merged = apply(example(), notes_change())
     assert merged.connectors == example().connectors
+
+
+# --- managed mode's ops (M6 design G.3) ---------------------------------------------------------
+
+PLACE = "sha256:f317bc9db239b40a77b4c454dd6dae362008d39485fcb2359844c73cd998ef97"
+CANCEL = "sha256:26c3ac15931603b2f20397630050036633fd11d56ea08bd91e52895e92313ac7"
+SEND = "sha256:34aecee572ddd193955a4678774a9dc8cdd8c3a08f05f84c89e38b1c3631db32"
+
+
+def test_a_move_to_allow_moves_one_included_approve_tool() -> None:
+    """J3, J.4: the tool leaves approve for allow at the pin the operator was shown; nothing
+    else changes, and the change has no fragment."""
+    change = PolicyChange("t", (MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL),))
+    policy = example()
+    merged = apply(policy, change)
+    assert merged.gateway is not None
+    assert policy.gateway is not None
+    server = merged.gateway.servers["broker-trade"]
+    assert server.tools == Tools(
+        include=["place_order", "cancel_order"], allow=["cancel_order"], approve=["place_order"]
+    )
+    before = policy.gateway.servers["broker-trade"]
+    assert server.model_dump(exclude={"tools"}) == before.model_dump(exclude={"tools"})
+    for name, other in policy.gateway.servers.items():
+        if name != "broker-trade":
+            assert merged.gateway.servers[name] == other
+    assert change.replace() == ()
+    with pytest.raises(ValueError, match=r"^a move to allow has no fragment"):
+        change.data()
+
+
+@pytest.mark.parametrize(
+    ("op", "path", "message"),
+    [
+        (
+            MoveToAllow("absent", "tool", "x", CANCEL),
+            "gateway.servers.absent",
+            "the policy has no such server",
+        ),
+        (
+            MoveToAllow("broker-read", "tool", "get_quote", PIN_A),
+            "gateway.servers.broker-read.tools",
+            "get_quote isn't an included approve tool",
+        ),
+        (
+            MoveToAllow("broker-trade", "tool", "cancel_order", PIN_A),
+            "gateway.servers.broker-trade.review.cancel_order",
+            "the policy pins another definition",
+        ),
+    ],
+    ids=["no-server", "not-approve", "other-pin"],
+)
+def test_a_move_the_policy_cant_take_is_diff_invalid(op: Any, path: str, message: str) -> None:
+    with pytest.raises(ChangeRefused) as caught:
+        apply(example(), PolicyChange("t", (op,)))
+    assert (caught.value.reason, caught.value.path, caught.value.messages) == (
+        "diff_invalid",
+        path,
+        (message,),
+    )
+
+
+def test_a_move_needs_the_tool_included_and_a_pin_unless_pinning_is_off() -> None:
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    raw["gateway"]["servers"]["broker-trade"]["tools"]["include"] = ["place_order"]
+    loose = parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
+    op = MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL)
+    with pytest.raises(ChangeRefused, match="cancel_order isn't an included approve tool"):
+        apply(loose, PolicyChange("t", (op,)))
+    # A toolkit with pinning on holds its pin; with pinning off any reported pin is the one.
+    mail = MoveToAllow("mail", "tool", "send_note", PIN_A)
+    with pytest.raises(ChangeRefused, match="the policy pins another definition"):
+        apply(example(), PolicyChange("t", (mail,)))
+    assert apply(example(), PolicyChange("t", (replace(mail, pin=SEND),)))
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    raw["gateway"]["servers"]["mail"]["pinning"] = "off"
+    del raw["gateway"]["servers"]["mail"]["review"]
+    off = parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
+    merged = apply(off, PolicyChange("t", (mail,)))
+    assert merged.gateway is not None
+    tools = merged.gateway.servers["mail"].tools
+    assert tools == Tools(include=["send_note"], allow=["send_note"])
+
+
+@pytest.mark.parametrize(
+    ("make", "match"),
+    [
+        (lambda: MoveToAllow("Notes", "tool", "x", PIN_A), "isn't a policy name"),
+        (lambda: MoveToAllow("notes", "prompt", "x", PIN_A), "'prompt' isn't a kind a move"),
+        (lambda: MoveToAllow("notes", "tool", "a b", PIN_A), "pattern"),
+        (lambda: MoveToAllow("notes", "tool", "x", "sha256:" + "A" * 64), "pattern"),
+        (lambda: SetClientServers("Agent", ()), "isn't a policy name"),
+        (lambda: SetClientServers("agent1", ("mail", "Mail")), "isn't a policy name"),
+        (lambda: SetClientServers("agent1", ("mail", "mail")), "name each server once"),
+        (lambda: SetConnectorLimits("mail-out"), "sets one field or more"),
+        (lambda: SetConnectorLimits("Mail", paused=True), "isn't a policy name"),
+        (lambda: SetConnectorLimits("mail-out", max_per_day=0), "greater than or equal to 1"),
+        (lambda: SetConnectorLimits("mail-out", max_per_day=10_001), "less than or equal"),
+        (lambda: SetConnectorLimits("mail-out", max_subject_chars=999), "less than or equal"),
+        (lambda: SetConnectorLimits("mail-out", max_body_chars=100_001), "less than or equal"),
+        (lambda: SetConnectorLimits("mail-out", max_per_day=True), "valid integer"),
+        (lambda: SetConnectorLimits("mail-out", paused=1), "valid boolean"),  # type: ignore[arg-type]
+    ],
+    ids=[
+        "move-server",
+        "move-kind",
+        "move-name",
+        "move-pin",
+        "client-name",
+        "client-server",
+        "client-twice",
+        "limits-none",
+        "limits-name",
+        "limits-low",
+        "limits-day",
+        "limits-subject",
+        "limits-body",
+        "limits-bool",
+        "limits-paused",
+    ],
+)
+def test_the_managed_ops_hold_the_schemas_values(make: Callable[[], Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        make()
+
+
+def test_set_client_servers_replaces_the_list_whole() -> None:
+    """G.3, G-13: one existing client's servers, a server taken away as well as given."""
+    op = SetClientServers("agent1", ["mail", "broker-read"])  # type: ignore[arg-type]
+    assert op.servers == ("mail", "broker-read")
+    change = PolicyChange("t", (op,))
+    assert change.data() == {
+        "gateway": {"clients": {"agent1": {"servers": ["mail", "broker-read"]}}}
+    }
+    merged = apply(example(), change)
+    assert merged.gateway is not None
+    client = merged.gateway.clients["agent1"]
+    assert client.servers == ["mail", "broker-read"]
+    assert client.sources == ["192.0.2.0/24"]  # the rest of the client kept
+    emptied = apply(example(), PolicyChange("t", (SetClientServers("agent1", ()),)))
+    assert emptied.gateway is not None
+    assert emptied.gateway.clients["agent1"].servers == []
+
+
+@pytest.mark.parametrize(
+    ("op", "path", "message"),
+    [
+        (SetClientServers("ci", ("mail",)), "gateway.clients.ci", "the policy has no such client"),
+        (
+            SetClientServers("agent1", ("mail", "absent")),
+            "gateway.servers.absent",
+            "the policy has no such server",
+        ),
+        (
+            SetConnectorLimits("absent", paused=True),
+            "connectors.absent",
+            "the policy has no such connector",
+        ),
+    ],
+    ids=["client", "server", "connector"],
+)
+def test_a_managed_op_on_what_isnt_there_is_diff_invalid(op: Any, path: str, message: str) -> None:
+    with pytest.raises(ChangeRefused) as caught:
+        apply(example(), PolicyChange("t", (op,)))
+    assert (caught.value.reason, caught.value.path, caught.value.messages) == (
+        "diff_invalid",
+        path,
+        (message,),
+    )
+
+
+def test_set_client_servers_in_a_policy_without_a_gateway() -> None:
+    bare = Policy.model_validate({"version": 1, "mode": "managed"})
+    with pytest.raises(ChangeRefused, match=r"^diff_invalid: gateway\.clients\.agent1"):
+        apply(bare, PolicyChange("t", (SetClientServers("agent1", ()),)))
+
+
+def test_set_connector_limits_changes_only_its_fields() -> None:
+    """F-15: the pause and the limits sit outside the password's binding; the rest is kept."""
+    op = SetConnectorLimits("mail-out", paused=True, max_body_chars=900)
+    assert op.limits() == {"paused": True, "max_body_chars": 900}
+    change = PolicyChange("t", (op,))
+    assert change.data() == {
+        "connectors": {"mail-out": {"kind": "smtp", "paused": True, "max_body_chars": 900}}
+    }
+    assert change.replace() == ()
+    before = example().connectors["mail-out"]
+    after = apply(example(), change).connectors["mail-out"]
+    assert (after.paused, after.max_body_chars) == (True, 900)
+    kept = {"paused", "max_body_chars"}
+    assert after.model_dump(exclude=kept) == before.model_dump(exclude=kept)
+    unpaused = SetConnectorLimits("mail-out", paused=False, max_per_day=1, max_subject_chars=998)
+    assert unpaused.limits() == {"paused": False, "max_per_day": 1, "max_subject_chars": 998}
+    merged = apply(apply(example(), change), PolicyChange("t", (unpaused,)))
+    assert merged.connectors["mail-out"].paused is False
+    assert merged.connectors["mail-out"].max_per_day == 1
+
+
+def test_each_managed_op_names_what_it_changes_once() -> None:
+    move = MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL)
+    with pytest.raises(
+        ValueError, match=r"^the change names gateway\.servers\.broker-trade twice$"
+    ):
+        PolicyChange("t", (move, SetServerReview("broker-trade", Tools(), {})))
+    with pytest.raises(
+        ValueError, match=r"^the change names gateway\.servers\.broker-trade twice$"
+    ):
+        PolicyChange("t", (move, MoveToAllow("broker-trade", "tool", "place_order", PLACE)))
+    with pytest.raises(ValueError, match=r"^the change names gateway\.clients\.agent1 twice$"):
+        PolicyChange("t", (SetClientServers("agent1", ()), SetClientServers("agent1", ("mail",))))
+    with pytest.raises(ValueError, match=r"^the change names connectors\.mail-out twice$"):
+        PolicyChange("t", (SetConnectorLimits("mail-out", paused=True),) * 2)
+    limits = SetConnectorLimits("mail-out", paused=True)
+    PolicyChange("t", (move, SetClientServers("agent1", ()), limits))
+
+
+# --- a managed review writes its declined block (M6 J.3, H.4; CR-17) ----------------------------
+
+
+def declined_example(declined: dict[str, str]) -> Policy:
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    raw["gateway"]["servers"]["broker-read"]["declined"] = declined
+    return parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
+
+
+def read_declined(policy: Policy) -> dict[str, str]:
+    assert policy.gateway is not None
+    return dict(policy.gateway.servers["broker-read"].declined)
+
+
+def test_a_managed_review_writes_the_servers_declined_block_less_its_includes() -> None:
+    """With no block of its own, the server's is written, less the tools the review includes, so
+    the candidate never holds a tool both included and declined (check row 3)."""
+    policy = declined_example({"get_news": PIN_B, "old": PIN_B})
+    tools = Tools(include=["get_quote", "get_news"], allow=["get_quote", "get_news"])
+    pins = {"get_quote": PIN_A, "get_news": PIN_A}
+    change = PolicyChange("t", (SetServerReview("broker-read", tools, pins),))
+    merged = apply(policy, change, managed=True)
+    assert read_declined(merged) == {"old": PIN_B}
+    assert [f for f in check_policy(merged) if f.level == "error"] == []
+    # The same change as a fragment keeps the block (M7's fragment, M6 step 6).
+    assert read_declined(apply(policy, change)) == {"get_news": PIN_B, "old": PIN_B}
+    # Its own block is written less its includes; an empty one clears the server's.
+    own = SetServerReview("broker-read", tools, pins, declined={"get_news": PIN_B, "new": PIN_A})
+    assert read_declined(apply(policy, PolicyChange("t", (own,)), managed=True)) == {"new": PIN_A}
+    cleared = PolicyChange("t", (replace(own, declined={}),))
+    assert read_declined(apply(policy, cleared, managed=True)) == {}
+    # A server with no block gets none, and the other ops are as they were.
+    assert apply(example(), review_change(), managed=True) == apply(example(), review_change())
+    assert apply(example(), notes_change(), managed=True) == apply(example(), notes_change())
+
+
+# --- the portal's bounds on its ops (M6 G.3, I.3; CR-16, MISS-1) -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("credential", "field"),
+    [
+        ({"kind": "header", "secret": "env:NOTES_KEY"}, "secret"),
+        ({**NOTES_CREDENTIAL, "client_id": "env:NOTES_ID"}, "client_id"),
+        (
+            {**NOTES_CREDENTIAL, "client_auth": "post", "client_secret": "env:NOTES_SECRET"},
+            "client_secret",
+        ),
+        ({**NOTES_CREDENTIAL, "refresh_token": "env:NOTES_REFRESH"}, "refresh_token"),
+    ],
+    ids=["header-secret", "client-id", "client-secret", "refresh-token"],
+)
+def test_a_portal_credential_takes_no_env_reference(credential: dict[str, Any], field: str) -> None:
+    model: Any = (
+        HeaderCredential.model_validate(credential)
+        if credential["kind"] == "header"
+        else OAuth2Credential.model_validate(credential)
+    )
+    ops: list[Any] = [AddCredential("notes", model)]
+    if isinstance(model, OAuth2Credential):
+        ops.append(SetCredential("notes", model))
+    for op in ops:
+        with pytest.raises(ChangeRefused) as caught:
+            from_portal(PolicyChange("t", (op,)))
+        assert (caught.value.reason, caught.value.path) == (
+            "portal_env_ref",
+            f"credentials.notes.{field}",
+        )
+
+
+def test_a_portal_credential_from_the_store_or_a_literal_client_id_passes() -> None:
+    from_portal(notes_change())
+    literal = OAuth2Credential.model_validate({**NOTES_CREDENTIAL, "client_id": "env:not a ref"})
+    from_portal(PolicyChange("t", (SetCredential("notes", literal),)))
+    header = HeaderCredential(kind="header", secret="store:notes-key")
+    from_portal(PolicyChange("t", (AddCredential("notes", header),)))
+
+
+@pytest.mark.parametrize(
+    ("route", "with_credential"),
+    [
+        ({**NOTES_ROUTE, "callers": ["gateway", {"placeholder": "ph-notes-00000001"}]}, True),
+        ({**NOTES_ROUTE, "callers": [{"placeholder": "ph-notes-00000001"}]}, True),
+        (NOTES_ROUTE, False),
+        ({**NOTES_ROUTE, "credential": "broker-mcp"}, True),
+    ],
+    ids=["placeholder-too", "placeholder-only", "credential-not-added", "other-credential"],
+)
+def test_a_portal_route_calls_as_the_gateway_with_a_credential_it_adds(
+    route: dict[str, Any], with_credential: bool
+) -> None:
+    ops: list[Any] = [AddRoute(Route.model_validate(route))]
+    if with_credential:
+        ops.insert(0, AddCredential("notes", OAuth2Credential.model_validate(NOTES_CREDENTIAL)))
+    with pytest.raises(ChangeRefused) as caught:
+        from_portal(PolicyChange("t", tuple(ops)))
+    assert (caught.value.reason, caught.value.path) == ("route_reuses_credential", "routes notes")
+
+
+def test_a_portal_route_with_no_credential_passes() -> None:
+    bare = {key: value for key, value in NOTES_ROUTE.items() if key != "credential"}
+    from_portal(PolicyChange("t", (AddRoute(Route.model_validate(bare)),)))
+    from_portal(PolicyChange("t", (MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL),)))

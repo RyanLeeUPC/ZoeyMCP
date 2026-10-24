@@ -36,6 +36,7 @@ from zoeymcp.vault.gatewaykeys import (
     State,
     accepted_keys,
     advance,
+    check,
     expired,
     initial,
     matching,
@@ -107,6 +108,20 @@ def test_advance_refuses_a_lower_generation() -> None:
     assert advance(State(KID, 3, 3), 0, NOW) == Refusal(
         f"gateway_key_generation 0 is below 3: {BACKWARDS}"
     )
+
+
+def test_check_is_advances_refusal_alone() -> None:
+    """A managed write's pre-check (M6 design G.6 step 5, G-4): a lower generation is refused
+    with advance's text, the same or a higher one passes, at any time, and nothing moves."""
+    state = State(KID, 3, 2, Previous(2, KID, 500))
+    assert check(state, 2) == Refusal(f"gateway_key_generation 2 is below 3: {BACKWARDS}")
+    assert check(State(KID, 3, 3), 1) == Refusal(
+        f"gateway_key_generation 1 is below 3: {BACKWARDS}"
+    )
+    assert check(state, 3) is None
+    assert check(state, 4) is None
+    assert check(State(KID, 1, 1), 1) is None
+    assert state == State(KID, 3, 2, Previous(2, KID, 500))
 
 
 def test_advance_keeps_the_current_key_for_the_window() -> None:

@@ -319,6 +319,17 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "The running policy with this change merged fails check ({detail}), so no fragment "
             "is shown.",
         ),
+        # What the portal's own ops may not hold (M6 design G.3, I.3; CR-16, MISS-1).
+        "portal_env_ref": Entry(
+            403,
+            "A credential the portal adds or changes takes its secret from the store, not from "
+            "env: ({detail}). Only the host can use an env: reference.",
+        ),
+        "route_reuses_credential": Entry(
+            403,
+            "A route the portal adds calls as the gateway alone, with a credential the same "
+            "change adds; {detail} doesn't. Only the host can add it.",
+        ),
         # Onboardings in progress (M7 D.8; vault/onboarding.py).
         "onboarding_unknown": Entry(
             404,
@@ -509,6 +520,71 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "These still don't match their pins: {tools}. No mark was cleared; review the server "
             "again.",
         ),
+        # A managed save the planner refuses (M6 design G.5, N.2; common/policy/plan.py), each
+        # filled with what the plan names.
+        "kind_mismatch": Entry(400, "This change is {detail}. Prepare it again from the page."),
+        "allow_needs_review": Entry(
+            409,
+            "There is no reviewed definition of {detail} at its pin to show you: review the "
+            "server again, then allow it.",
+        ),
+        "allow_marked": Entry(
+            409,
+            "The gateway marks {detail} as drifted: its classification waits for its review.",
+        ),
+        "consequential_allow": Entry(
+            409, "The toolkit declares {detail} consequential: it stays approve, never allow."
+        ),
+        "generation_lowered": Entry(
+            400, "The policy's {detail}: that would bring back a retired key."
+        ),
+        "pin_retired": Entry(
+            409,
+            "This would put {detail} back on a definition it was re-pinned away from: review it.",
+        ),
+        "rollback_revives": Entry(
+            409,
+            "Rolling back to {detail}: only the host can, with zoeymcp policy rollback and "
+            "--allow-revive.",
+        ),
+        # The socket's and offline's own names for what the portal answers as rollback_revives.
+        "revives_client": Entry(
+            409,
+            "This brings back {detail}: refused without --allow-revive client:NAME for each.",
+        ),
+        "revives_caller": Entry(
+            409,
+            "This brings back {detail}: refused without --allow-revive caller:ROUTE/INDEX for "
+            "each.",
+        ),
+        "env_name_new": Entry(
+            403,
+            "The reference env:{detail}: only the host can allow that, with zoeymcp policy "
+            "import --allow-env.",
+        ),
+        "env_reach_grows": Entry(
+            403,
+            "The reference env:{detail}: only the host can allow that, with zoeymcp policy "
+            "import --allow-env.",
+        ),
+        "ratchet_full": Entry(
+            409,
+            "The ratchet holds 10,000 retired entries: reseed with --new-ratchet on the host "
+            "(operations.md section 34).",
+        ),
+        "portal_widens": Entry(
+            403,
+            "The portal can't {detail}: export, edit and import with zoeymcp policy import.",
+        ),
+        "generation_raise_from_portal": Entry(
+            403, "A key rotation is done on the host: raise {detail} with zoeymcp policy import."
+        ),
+        "summary_too_large": Entry(
+            413,
+            "This change is too long to confirm in the portal: {detail} (zoeymcp policy export, "
+            "edit, zoeymcp policy import), where all of it is shown.",
+        ),
+        "no_change": Entry(400, "Nothing would change."),
     }
 )
 

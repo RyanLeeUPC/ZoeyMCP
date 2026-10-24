@@ -20,7 +20,8 @@ from typing import get_args
 import pytest
 
 from zoeymcp.common import reviewreport
-from zoeymcp.common.policy import change
+from zoeymcp.common.policy import change, plan
+from zoeymcp.common.policy.ratchet import RATCHET_MAX
 from zoeymcp.common.textrules import find_violations
 from zoeymcp.portal import passkeys, webauthn
 from zoeymcp.portal.refusals import (
@@ -127,8 +128,14 @@ DISCOVERY = {
     "pkce_unsupported": 502,
     "code_flow_unsupported": 502,
 }
-# M7's M.2: a policy change's refusals (M7 step 7).
-CHANGE = {"name_taken": 409, "diff_invalid": 422}
+# M7's M.2: a policy change's refusals (M7 step 7), and what the portal's ops may not hold (M6
+# design G.3, N.2).
+CHANGE = {
+    "name_taken": 409,
+    "diff_invalid": 422,
+    "portal_env_ref": 403,
+    "route_reuses_credential": 403,
+}
 # M7's M.2: an onboarding's own refusals and phase 1's requests' (M7 step 8a1).
 ONBOARDING = {
     "onboarding_unknown": 404,
@@ -186,6 +193,25 @@ REVIEW = {
     # M6 J.4: a clear the polling gateway can't run, and one it refused (N.2).
     "clear_unsupported": 409,
     "clear_not_clean": 409,
+}
+# M6's N.2: a managed save the planner refuses (common/policy/plan.py; review_stale is above).
+PLAN = {
+    "kind_mismatch": 400,
+    "allow_needs_review": 409,
+    "allow_marked": 409,
+    "consequential_allow": 409,
+    "generation_lowered": 400,
+    "pin_retired": 409,
+    "rollback_revives": 409,
+    "revives_client": 409,
+    "revives_caller": 409,
+    "env_name_new": 403,
+    "env_reach_grows": 403,
+    "ratchet_full": 409,
+    "portal_widens": 403,
+    "generation_raise_from_portal": 403,
+    "summary_too_large": 413,
+    "no_change": 400,
 }
 
 # M.2's quoted texts, exactly.
@@ -274,6 +300,9 @@ FIELDS = {
     "review_failed": {"code"},
     "clear_unsupported": {"server"},
     "clear_not_clean": {"tools"},
+    "portal_env_ref": {"detail"},
+    "route_reuses_credential": {"detail"},
+    **{reason: {"detail"} for reason in set(PLAN) - {"ratchet_full", "no_change"}},
 }
 
 
@@ -321,7 +350,7 @@ def literal_reasons(module: ModuleType, exception: str) -> set[str]:
 def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
-    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE
+    expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -443,6 +472,24 @@ def test_every_change_reason_is_catalogued() -> None:
     assert found == set(get_args(change.Reason))
     assert found == set(CHANGE)
     assert found <= set(CATALOGUE)
+
+
+def test_every_plan_reason_is_catalogued() -> None:
+    """M6 N.2: the scan widens to the planner's refusals, each a literal of its Reason type; the
+    socket's own names for a revived client or caller (which reach the portal as
+    rollback_revives) are catalogued too, since the admin socket answers through the catalogue."""
+    found = literal_reasons(plan, "PlanRefused")
+    reasons = set(get_args(plan.Reason))
+    assert found <= reasons
+    assert reasons == set(PLAN) | {"review_stale"}
+    assert {"revives_client", "revives_caller"} == plan.HOST_ONLY
+    assert reasons <= set(CATALOGUE)
+
+
+def test_the_plan_texts_name_the_planners_limits() -> None:
+    assert f"holds {RATCHET_MAX:,} retired entries" in CATALOGUE["ratchet_full"].text
+    assert plan.HOST_NEXT in CATALOGUE["summary_too_large"].text
+    assert CATALOGUE["env_name_new"] == CATALOGUE["env_reach_grows"]
 
 
 def test_every_onboarding_reason_is_catalogued() -> None:
