@@ -14,7 +14,9 @@ For out-of-process onboarding tests (M7 design O.1), options change that state: 
 ``--mode``, ``--static-key`` (required as ``Authorization: Bearer``, so a request without it gets
 the 401 and its challenge), ``--prm`` with ``--authorization-server`` and ``--scope`` (each
 repeatable), ``--as-metadata`` (a JSON file served at the server URL as an issuer when ``--prm``
-is ``none``), and ``--switch`` (repeatable) with a switch's name from ``Switch``.
+is ``none``), ``--switch`` (repeatable) with a switch's name from ``Switch``, and ``--drift``
+with a drift member's name (``DriftMember``), listed changed from the start (the fake's
+``change_tool``), for manual check 19's drift review (M6 design O.5).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from typing import Any
 
 import uvicorn
 
-from tests.fakes.mcp_server import McpFake, Switch
+from tests.fakes.mcp_server import DRIFT_MEMBERS, McpFake, Switch
 
 # Every interface: the smoke's vault reaches it by its service name on a compose network.
 HOST = "0.0.0.0"  # noqa: S104
@@ -47,6 +49,7 @@ def parse(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--scope", action="append", default=[])
     parser.add_argument("--as-metadata", type=Path)
     parser.add_argument("--switch", action="append", default=[], choices=[s.value for s in Switch])
+    parser.add_argument("--drift", choices=DRIFT_MEMBERS)
     return parser.parse_args(argv)
 
 
@@ -63,6 +66,7 @@ def fake_for(args: argparse.Namespace) -> McpFake:
     if args.as_metadata is not None:
         document: dict[str, Any] = json.loads(args.as_metadata.read_bytes())
         fake.as_metadata = lambda: document
+    fake.tool_change = args.drift
     return fake
 
 

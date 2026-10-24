@@ -536,6 +536,9 @@ def test_review_js_clicks_go_through_app_js_guard() -> None:
     enter = enter[: enter.index("\n  }\n")]
     assert enter.index('renderFindings($("checklist")') < enter.index("zoeyDrift.home()")
     assert enter.index("zoeyDrift.home()") < enter.index('show("home");')
+    # review.js's hooks into drift.js (M6 J.2, M.4): the servers rows, the review's footer, a
+    # tool's row, and the lists Generate sends; each read when called, since drift.js loads after.
+    assert re.findall(r"window\.zoeyDrift\.(\w+)\(", code) == ["servers", "footer", "row", "lists"]
 
 
 def test_a_client_secret_is_write_only_in_the_page() -> None:
@@ -592,11 +595,37 @@ def test_the_page_words_every_row_state_and_where_every_command_runs() -> None:
     assert {"register", "make_fragment", "connect", "review", "allow_hosts"} <= taken
 
 
-def test_the_not_annotated_chip_is_the_vaults_reason() -> None:
-    """K.1's "not annotated" chip keeps the tools whose suggestion the vault gave as unannotated
-    (F.6): the page compares the reason, so its text is reviewview's."""
+def test_the_chips_read_the_vaults_flags() -> None:
+    """K.1's chips keep the tools the counts count (D-188): the page reads each row's
+    ``read_only_hint`` and ``annotated`` flags, never the suggestion or its reason, so a
+    toolkit's unannotated consequential tool is a not-annotated one too."""
     code = code_of(read("review.js"))
-    assert f'const UNANNOTATED = "{reviewview.WHY_UNANNOTATED}";' in code
+    assert "UNANNOTATED" not in code
+    assert "suggested_why ===" not in code
+    assert '[$("review-chip-read-only").checked, (tool) => tool.read_only_hint],' in code
+    assert '[$("review-chip-unannotated").checked, (tool) => !tool.annotated],' in code
+
+
+def test_select_suggested_makes_no_move() -> None:
+    """M6 J.3, Q27 (D-180): the three places review.js sets a tool's choice (a row drawn, a box
+    ticked, Select suggested) each set it from the vault's ``tool.prefill``, and no code line
+    sets a choice to a literal, so Select suggested, after Clear or not, never moves a tool from
+    approve to allow (tests/portal's browser runs no script, so the page is pinned here)."""
+    code = code_of(read("review.js"))
+    assigned = re.findall(r"\bchoice\.value = (.*);", code)
+    assert assigned == ["tool.prefill", "entry.tool.prefill", "entry.tool.prefill"]
+    for function in ("toolEntry", "changed", "selectSuggested"):
+        start = code.index(f"function {function}(")
+        body = code[start : code.index("\n  }\n", start)]
+        assert re.search(r"\bchoice\.value = (?:entry\.)?tool\.prefill;", body), function
+    assert not re.search(r"\bchoice\.value = [\"'`]", code)
+    drift = code_of(read("drift.js"))
+    # drift.js sets a choice in one place only: accepting a proposed tool's new definition
+    # chooses approve (Q8), and unticking it puts the vault's prefill back
+    assert re.findall(r"\bchoice\.value = (.*);", drift) == [
+        "entry.repin.checked ? APPROVE : tool.prefill"
+    ]
+    assert 'const APPROVE = "approve";' in drift
 
 
 def test_a_registrations_notes_are_worded() -> None:
@@ -627,15 +656,22 @@ def test_the_review_screen_reads_what_the_vault_sends() -> None:
     view = reviewview.rows(held(large()))
     code = code_of(read("review.js"))
     assert set(re.findall(r"\btool\.([a-z_]+)", code)) <= {*view["tools"][0], "consequential"}
+    # drift.js draws a row's drift columns and controls from the same row (M6 J.2).
+    drift = code_of(read("drift.js"))
+    assert set(re.findall(r"\btool\.([a-z_]+)", drift)) <= set(view["tools"][0])
+    assert "tool.reviewed_lines" in drift
+    assert "if (tool.proposed) {" in drift  # Q8's proposal is the vault's flag, not the page's
+    # What the gateway reports of a server sits above its row's steps, Review among them.
+    assert '.querySelector("ul.steps").before(make("p", "The gateway reports: " +' in drift
     assert set(re.findall(r"\bcounts\.([a-z_]+)", code)) == set(view["counts"])
     assert reads("renderReview", "answer") <= set(view)
     tools = view["tools"]
     found = {key for tool in tools for finding in tool["findings"] for key in finding}
-    assert reads("toolEntry", "finding") <= found == {"level", "message_shown"}
-    assert '(tool) => tool.suggested === "allow"]' in code
-    assert sum(tool["suggested"] == "allow" for tool in tools) == view["counts"]["read_only"]
-    assert "(tool) => tool.suggested_why === UNANNOTATED]" in code
-    unannotated = [tool for tool in tools if tool["suggested_why"] == reviewview.WHY_UNANNOTATED]
+    assert reads("toolEntry", "finding") <= found == {"level", "pointer_shown", "message_shown"}
+    assert "(tool) => tool.read_only_hint]" in code
+    assert sum(tool["read_only_hint"] for tool in tools) == view["counts"]["read_only"]
+    assert "(tool) => !tool.annotated]" in code
+    unannotated = [tool for tool in tools if not tool["annotated"]]
     assert len(unannotated) == view["counts"]["not_annotated"]
     assert '(tool) => tool.findings.some((found) => found.level === "warning")]' in code
     warned = [tool for tool in tools if any(f["level"] == "warning" for f in tool["findings"])]
@@ -649,16 +685,25 @@ def test_the_review_screen_reads_what_the_vault_sends() -> None:
 
 def test_drift_js_clicks_go_through_app_js_guard() -> None:
     """drift.js draws its buttons with app.js's button(), shared through window.zoeyPortal, and
-    listens for nothing itself; it publishes window.zoeyDrift and nothing else."""
+    listens for one thing only, the re-pin box of a proposed tool, which sets its row's choice
+    and calls nothing (Q8); it publishes window.zoeyDrift, frozen, and nothing else: Home's
+    hooks (step 7) and review.js's (M6 J.2, step 8)."""
     code = code_of(read("drift.js"))
-    assert "addEventListener(" not in code
+    assert re.findall(r"(\S+)\.addEventListener\(", code) == ["entry.repin"]
+    assert "onclick" not in code
+    assert "onchange" not in code
     assert "function button(" not in code
     assert "function guard(" not in code
     taken = re.search(r"const \{([^}]*)\} = window\.zoeyPortal;", code)
     assert taken
     assert {word.strip() for word in taken.group(1).split(",")} == {"api", "button"}
     assert re.findall(r"window\.(zoey\w+) =", code) == ["zoeyDrift"]
-    assert "window.zoeyDrift = Object.freeze({ home: home, review: review });" in code
+    shared = re.search(r"window\.zoeyDrift = Object\.freeze\(\{([^}]*)\}\);", code)
+    assert shared
+    members = [word.split(":")[0].strip() for word in shared.group(1).split(",") if word.strip()]
+    assert members == ["home", "review", "servers", "row", "footer", "lists"]
+    for member in members:
+        assert f"function {member}(" in code, member
 
 
 def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
@@ -683,7 +728,8 @@ def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
     report = {"gateway": {"reported_ago": 1, "servers": [gateway_row()]}}
     [item] = portal_app.attention_items(report)["items"]
     assert set(re.findall(r"\bitem\.([a-z_]+)", drift)) == {"text_shown", "action"}
-    assert re.findall(r"\bitem\.action\.([a-z_]+)", drift) == ["kind"]
+    # Home's button by the action's kind; the MCP servers rows take each server's items.
+    assert re.findall(r"\bitem\.action\.([a-z_]+)", drift) == ["kind", "server"]
     assert item["action"] == {"kind": "review", "server": "notes"}
     assert set(item) == {"kind", "server_shown", "count", "text_shown", "action"}
 
@@ -707,3 +753,13 @@ def gateway_row() -> dict[str, object]:
         "invalid": [],
         "unnamed": 0,
     }
+
+
+def test_record_the_rest_as_declined_is_ticked_by_default() -> None:
+    """M6 J.3 (G-19): the review screen's box is on unless the operator unticks it, and drift.js
+    reads it into the lists Generate sends."""
+    parser = Inputs()
+    parser.feed(read("index.html"))
+    box = parser.inputs["review-decline-rest"]
+    assert (box["type"], "checked" in box) == ("checkbox", True)
+    assert 'decline_rest: $("review-decline-rest").checked' in code_of(read("drift.js"))

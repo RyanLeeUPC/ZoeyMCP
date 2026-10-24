@@ -1,9 +1,11 @@
-"""The mutants left alive on purpose in M6's strict YAML loader (step 1, ``common.yamlload``).
+"""The mutants left alive on purpose in M6's modules: the strict YAML loader (step 1,
+``common.yamlload``) and the change a review makes (step 8, ``common.policy.reviewchange``, whose
+``definition_lines`` moved from ``portal.reviewview`` with its two equivalents).
 
-Its killing tests are in ``test_yamlload.py``. The mutants no test can tell from the original are
-in :data:`EQUIVALENT`, each with why; :func:`test_each_equivalent_names_a_function` keeps the list
-honest when a function is renamed or removed. mutmut still counts them as survivors, so they stay
-in the module's score.
+The loader's killing tests are in ``test_yamlload.py``. The mutants no test can tell from the
+original are in :data:`EQUIVALENT`, each with why; :func:`test_each_equivalent_names_a_function`
+keeps the list honest when a function is renamed or removed. mutmut still counts them as
+survivors, so they stay in each module's score.
 """
 
 from __future__ import annotations
@@ -18,6 +20,13 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.common.yamlload.x_load_mapping__mutmut_8": (
         '`text.count("\\n", None, found.start())`: str.count takes None for its start as a '
         "slice does, the same as 0"
+    ),
+    # --- common.policy.reviewchange (moved from portal.reviewview's in step 8)
+    "zoeymcp.common.policy.reviewchange.x_definition_lines__mutmut_7": (
+        "ensure_ascii=True dropped: it is json.dumps' default"
+    ),
+    "zoeymcp.common.policy.reviewchange.x_definition_lines__mutmut_22": (
+        '`or ["XXXX"]` for an empty line: json.dumps with an indent writes no empty line'
     ),
 }
 

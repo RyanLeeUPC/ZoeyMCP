@@ -17,7 +17,10 @@ the server marks read-only and not destructive (the shared rule, CR-3), and noth
 unannotated tool in bulk (PC-2). ``--add TOOL`` includes a tool, leaving its classification to the
 operator: ``check`` fails until it is in ``allow`` or ``approve`` (nothing is implied). No pin
 line is ever written for a tool with an error finding. The snippet's comments are the emitter's
-fixed kinds, so no upstream text reaches it.
+fixed kinds, so no upstream text reaches it. The change itself is built by
+``common/policy/reviewchange.py`` (M6 design J.3), which the portal's fragment 2 shares: a
+re-pinned ``allow`` tool whose new definition the server no longer marks read-only stays
+``allow``, with a comment proposing ``approve`` (Q8).
 
 ``--decline TOOL`` records a listed tool the operator leaves out under the server's ``declined``
 at the pin shown, and ``--decline-rest`` every listed tool the snippet doesn't include (M6 design
@@ -45,17 +48,26 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import Any, Final, Literal, TextIO
 
 from ..common.policy import attention
-from ..common.policy.change import Comment, PolicyChange, SetServerReview
 from ..common.policy.emit import emit
-from ..common.policy.schema import Tools
-from ..common.suggest import Suggestion, suggestion
+
+# The change the snippet makes moved to a pure module (M6 design J.3), named here as before.
+from ..common.policy.reviewchange import Added as Added
+from ..common.policy.reviewchange import Changes as Changes
+from ..common.policy.reviewchange import Choices as Choices
+from ..common.policy.reviewchange import fragment as fragment
+from ..common.policy.reviewchange import pinnable
+from ..common.policy.reviewchange import planned as planned
+from ..common.policy.reviewchange import read_only as read_only
+from ..common.policy.reviewchange import second_title as second_title
+from ..common.policy.reviewchange import suggested_words as suggested_words
+from ..common.policy.reviewchange import title as title
+from ..common.suggest import suggestion
 from ..common.textrules import reveal_hidden
 from . import admin_client
 
@@ -63,8 +75,6 @@ EXIT_CLEAN = 0
 EXIT_NEEDS_OPERATOR = 1
 EXIT_COULD_NOT_RUN = 2
 
-TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
-PIN = re.compile(r"sha256:[0-9a-f]{64}")
 MAX_SHOWN_CHARS = 2000
 STATE_LABELS = {
     "ok": "ok",
@@ -93,68 +103,6 @@ def untrusted(text: object, limit: int = MAX_SHOWN_CHARS) -> str:
 
 def short_pin(pin: str | None) -> str:
     return "(no pin)" if pin is None else pin[: len("sha256:") + 12] + "..."
-
-
-def pinnable(entry: Mapping[str, Any]) -> bool:
-    """A pin line may be written: a valid name and pin, and no error finding."""
-    pin = entry.get("pin")
-    return (
-        isinstance(pin, str)
-        and PIN.fullmatch(pin) is not None
-        and TOOL_NAME.fullmatch(entry["name"]) is not None
-        and not any(finding["level"] == "error" for finding in entry["findings"])
-    )
-
-
-@dataclass(frozen=True)
-class Choices:
-    tools: frozenset[str] = frozenset()  # show only these (empty: all)
-    show: frozenset[str] = frozenset()  # print these definitions in full
-    show_all: bool = False
-    add: tuple[str, ...] = ()
-    repin: frozenset[str] = field(default_factory=frozenset)
-    allow: tuple[str, ...] = ()
-    approve: tuple[str, ...] = ()
-    allow_read_only: bool = False
-    decline: tuple[str, ...] = ()
-    decline_rest: bool = False
-
-
-def listed(review: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """The tools the server lists, by name: every entry but a missing one."""
-    return {entry["name"]: entry for entry in review["tools"] if entry["state"] != "missing"}
-
-
-def suggested(entry: Mapping[str, Any]) -> Suggestion | None:
-    """The classification a tool's own annotations suggest (the shared rule, CR-3)."""
-    definition = entry.get("definition")
-    return suggestion(definition.get("annotations") if isinstance(definition, dict) else None)
-
-
-def suggested_words(entry: Mapping[str, Any]) -> str:
-    """What the server's annotations suggest for a tool, labelled as the server's (E-9)."""
-    if entry.get("consequential"):
-        return "declared consequential by the toolkit: approve, never allow"
-    found = suggested(entry)
-    if found == "allow":
-        return "read-only (the server's suggestion)"
-    if found == "approve":
-        return "not read-only (the server's hints): approve suggested if you include it"
-    return "not annotated: approve suggested if you include it"
-
-
-def read_only(review: Mapping[str, Any]) -> list[str]:
-    """``--allow-read-only``'s tools: every listed, pinnable tool not yet included that the
-    shared rule suggests ``allow`` for (``readOnlyHint`` and not ``destructiveHint``, F-52),
-    never one a toolkit declares consequential. An unannotated tool is never one (PC-2)."""
-    return [
-        name
-        for name, entry in listed(review).items()
-        if not entry["included"]
-        and pinnable(entry)
-        and not entry.get("consequential")
-        and suggested(entry) == "allow"
-    ]
 
 
 def check_choices(review: dict[str, Any], choices: Choices) -> None:
@@ -201,167 +149,7 @@ def _check_new(option: str, name: str, entry: Mapping[str, Any] | None) -> None:
         raise UsageError(f"{option} {name}: it has error findings, so it can't be pinned")
 
 
-# --- the YAML snippet (M7 design F.5, H; DD-13) -------------------------------------------------
-
-Classification = Literal["allow", "approve"]
-# An included tool in these states is listed as its pin holds it.
-MATCHING_STATES: Final = ("ok", "marked", "blocked")
-
-
-@dataclass(frozen=True)
-class Added:
-    """A tool the snippet includes: its classification (None leaves it to the operator, and
-    ``check`` fails until it is given) and what its ``added`` comment says."""
-
-    classification: Classification | None
-    why: str
-
-
-@dataclass(frozen=True)
-class Changes:
-    """What a snippet changes in the server's entry: ``added`` tools included, in order;
-    ``dropped`` ones taken out; ``moved`` ones, included already, classified anew; ``repin``
-    ones, drifted, given their new pin; ``declined``, the server's whole ``declined`` block
-    (:func:`declined_block`), or ``None`` to leave it as it is. Every other tool stays as the
-    policy has it."""
-
-    added: Mapping[str, Added] = field(default_factory=dict)
-    dropped: frozenset[str] = frozenset()
-    moved: Mapping[str, Classification] = field(default_factory=dict)
-    repin: frozenset[str] = frozenset()
-    declined: Mapping[str, str] | None = None
-
-
-def declined_block(
-    review: Mapping[str, Any],
-    declines: Mapping[str, str],
-    *,
-    undeclined: Sequence[str] = (),
-    included: Sequence[str] = (),
-) -> dict[str, str] | None:
-    """The server's ``declined`` block once ``declines`` (tool, the pin shown) are recorded,
-    ``undeclined`` tools taken out of it and ``included`` ones leave it (J.3), or ``None`` when
-    the server has none and nothing is declined, so the snippet stays M7's."""
-    before: Mapping[str, str] = review["policy"].get("declined") or {}
-    if not before and not declines:
-        return None
-    block = {**before, **declines}
-    for name in (*undeclined, *included):
-        block.pop(name, None)
-    return dict(sorted(block.items()))
-
-
-def planned(review: Mapping[str, Any], choices: Choices) -> Changes:
-    """The changes the options ask for, once :func:`check_choices` accepts them."""
-    by_name = listed(review)
-    added: dict[str, Added] = {}
-    for name in choices.add:
-        if review.get("kind") == "toolkit" and by_name[name].get("consequential"):
-            added[name] = Added("approve", "approve, declared by the toolkit")
-        else:
-            added[name] = Added(None, "put it in allow or approve; nothing is implied")
-    for name in choices.allow:
-        added[name] = Added("allow", "allow")
-    for name in choices.approve:
-        added[name] = Added("approve", "approve")
-    if choices.allow_read_only:
-        for name in read_only(review):
-            if name not in choices.decline:
-                added.setdefault(
-                    name, Added("allow", "allowed because the server marks it read-only")
-                )
-    declines = {name: by_name[name]["pin"] for name in choices.decline}
-    if choices.decline_rest:
-        for name, entry in by_name.items():
-            if not entry["included"] and name not in added and pinnable(entry):
-                declines.setdefault(name, entry["pin"])
-    declined = declined_block(review, declines, included=tuple(added))
-    return Changes(added=added, repin=choices.repin, declined=declined)
-
-
-def _blocks(declined: bool) -> str:
-    return "tools:, review: and declined: blocks" if declined else "tools: and review: blocks"
-
-
-def title(server: str, *, declined: bool = False) -> str:
-    """The snippet's title: what to do with it."""
-    return f"review of {server}. Replace the {_blocks(declined)} of gateway.servers.{server}."
-
-
-def second_title(server: str, *, declined: bool = False) -> str:
-    """Fragment 2's title (E.4): the choices file's fragment, after onboarding's fragment 1."""
-    return (
-        f"review of {server} (2 of 2). Replace the {_blocks(declined)} of "
-        f"gateway.servers.{server}, then assign {server} to its clients."
-    )
-
-
-def fragment(
-    review: Mapping[str, Any], changes: Changes, *, heading: str | None = None
-) -> PolicyChange:
-    """The server's entry with ``changes`` made, as a change for the emitter: its ``tools`` and
-    ``review`` replaced whole, its ``declined`` too when ``changes`` hold it, and its ``era``
-    when the review learned it. A tool with an error finding gets no pin; a drifted, missing or
-    unpinnable included tool keeps the pin it has, so it stays hidden. Raises ``ValueError`` for
-    a name the policy can't hold."""
-    server, policy = review["server"], review["policy"]
-    by_name = {e["name"]: e for e in review["tools"] if TOOL_NAME.fullmatch(e["name"])}
-    dropped, moved, declined = changes.dropped, changes.moved, changes.declined
-    include = [name for name in policy["include"] if name not in dropped]
-    include += [name for name in changes.added if name not in include]
-    classes: dict[Classification, list[str]] = {"allow": [], "approve": []}
-    for kind, names in classes.items():
-        names += [n for n in policy[kind] if n not in dropped and moved.get(n, kind) == kind]
-    news = [*moved.items(), *((name, why.classification) for name, why in changes.added.items())]
-    for name, chosen in news:
-        if chosen is not None and name not in classes[chosen]:
-            classes[chosen].append(name)
-    pins: dict[str, str] = {}
-    notes: list[Comment] = []
-    for name, why in changes.added.items():
-        notes.append(Comment("added", name, why.why))
-        if why.classification is None:
-            notes.append(Comment("suggested", name, suggested_words(by_name[name])))
-    changed: list[Comment] = []
-    kept: list[Comment] = []
-    others: list[Comment] = []
-    for name, entry in sorted(by_name.items()):
-        state, pin, pinned = entry["state"], entry["pin"], entry["pinned"]
-        if name in changes.added:
-            pins[name] = pin
-        elif entry["included"] and name not in dropped:
-            if state in MATCHING_STATES and pinnable(entry):
-                pins[name] = pin
-            elif state == "drift" and name in changes.repin and pinnable(entry):
-                pins[name] = pin
-                changed.append(Comment("changed_was", name, f"was {pinned}"))
-            elif pinned is not None and PIN.fullmatch(pinned):
-                pins[name] = pinned
-                kept.append(Comment("kept", name, _kept_why(server, name, entry)))
-        elif state != "missing":
-            if not pinnable(entry):
-                others.append(Comment("error_finding", name, f"review {server} --show {name}"))
-            elif declined is not None and declined.get(name) == pin:
-                others.append(Comment("declined", name, pin))
-            else:
-                others.append(Comment("not_included", name, f"{pin}; {suggested_words(entry)}"))
-    notes += [*changed, *kept, *others]
-    if review.get("kind") == "toolkit" and review.get("pinning") == "off":
-        pins = {}
-        notes.append(Comment("merge_hint", server, "pinning: off: definitions follow the image"))
-    tools = Tools(include=include, allow=classes["allow"], approve=classes["approve"])
-    era = review.get("era") if review.get("era") in ("modern", "legacy") else None
-    op = SetServerReview(server, tools, pins, era=era, declined=declined)
-    return PolicyChange(heading or title(server, declined=declined is not None), (*notes, op))
-
-
-def _kept_why(server: str, name: str, entry: Mapping[str, Any]) -> str:
-    state = entry["state"]
-    if state == "drift":
-        return f"drift: the server lists {entry['pin']}; review {server} --repin {name} takes it"
-    if state == "missing":
-        return "missing: the server doesn't list it"
-    return f"{state}: not pinnable, kept hidden"
+# --- the YAML snippet (M7 design F.5, H; DD-13) ------------------------------------------------
 
 
 def snippet(review: dict[str, Any], choices: Choices) -> list[str]:

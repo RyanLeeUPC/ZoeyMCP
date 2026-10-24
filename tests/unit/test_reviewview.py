@@ -1,11 +1,14 @@
-"""The portal's review data (M7 design F.6, K.1, K.5; O.2 ``test_reviewview.py``).
+"""The portal's review data (M7 design F.6, K.1, K.5; O.2 ``test_reviewview.py``; M6 J.2, J.3).
 
 A done job's rows, from reports straight from the gateway's review code (the ``large`` fake's 96
 tools, a toolkit's), read and dumped as the vault holds them; the definition in chunks with
 nothing cut, a 16 KiB description shown whole (CR-2, TI-5); every server string shown, hostile
 fixtures built from escapes in this source (S12 style, fold-in R23); the shared suggestion
 (CR-3); and fragment 2 from the operator's choices, with each refusal: ``bad_body``,
-``review_stale`` (GR-11) and every ``diff_invalid``.
+``review_stale`` (GR-11) and every ``diff_invalid``. M6: every row's ``prefill`` (so **Select
+suggested** makes no move, Q27), the chips' flags (D-188), a finding's pointer (D-199), a drifted
+tool's two definitions and the vault's diff, re-pin and decline in fragment 2, and a report made
+before a re-pin is stale (J.2).
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import pytest
 from mcp.types import Tool
 
 from tests.unit.test_onboarding import committed
-from tests.unit.test_review import LIMITS, reviewed
+from tests.unit.test_review import LIMITS, pin, reviewed, tool
 from tests.unit.test_review import policy as reviewed_policy
 from tests.unit.test_review_choices import LARGE, large, served
 from tests.unit.test_review_choices import reviewed as choices_reviewed
@@ -32,6 +35,7 @@ from zoeymcp.common.policy.emit import EmitRefused, emit
 from zoeymcp.common.policy.schema import Tools
 from zoeymcp.common.reviewreport import read
 from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.gateway import pins
 from zoeymcp.portal import reviewview
 from zoeymcp.portal.refusals import CATALOGUE, Refusal
 from zoeymcp.portal.reviewview import (
@@ -49,6 +53,7 @@ from zoeymcp.portal.reviewview import (
     counts,
     definition_lines,
     diff,
+    drift_diff,
     notes,
     rows,
     stale,
@@ -109,10 +114,41 @@ def detail(found: object, reason: str = "diff_invalid") -> str:
     return answer.error
 
 
-def chosen(include: list[str], allow: list[str] = [], approve: list[str] = []) -> Choices:  # noqa: B006
-    made = choices({"include": include, "allow": allow, "approve": approve}, 512)
+def chosen(
+    include: list[str],
+    allow: list[str] = [],  # noqa: B006
+    approve: list[str] = [],  # noqa: B006
+    **more: Any,
+) -> Choices:
+    made = choices({"include": include, "allow": allow, "approve": approve, **more}, 512)
     assert isinstance(made, Choices)
     return made
+
+
+OTHER_PIN = "sha256:" + "0" * 64
+# Text that would be markup if a page parsed it: the review screen shows it as text.
+MARKUP = '<img src=x onerror=alert(1)> & "quoted"'
+OLD = f"Finds notes. {MARKUP}"
+NEW = f"Finds notes, and sends them on. {MARKUP}"
+
+
+def drifted(*, kept: bool = True) -> dict[str, Any]:
+    """notes includes ``search`` (allow), which the server changed after the review, and lists
+    ``other`` and ``third`` besides; the gateway holds the reviewed copy unless not ``kept``."""
+    old = tool("search", OLD)
+    defs = {pin("search", OLD): pins.project_and_pin(old).definition} if kept else {}
+    server = reviewed_policy(["search"], {"search": pin("search", OLD)})
+    listed = [tool("search", NEW), tool("other"), tool("third")]
+    return held(reviewed(listed, server, defs=defs))
+
+
+SEARCH = Listed(
+    "notes",
+    "remote",
+    Tools(include=["search"], allow=["search"]),
+    "hide",
+    review={"search": pin("search", OLD)},
+)
 
 
 # --- the rows (F.6, K.1) -------------------------------------------------------------------------
@@ -161,13 +197,25 @@ def test_the_large_fakes_96_tools() -> None:
         "classification": None,
         "suggested": "allow",
         "suggested_why": WHY_READ_ONLY,
+        "prefill": "allow",
+        "annotated": True,
+        "read_only_hint": True,
         "pinnable": True,
         "not_pinnable": None,
         "pin": entry(large(), "echo")["pin"],
+        "pinned": None,
         "title_shown": "Echo",
         "description_shown": "Returns the text it is given.",
+        "reviewed_lines": [],
+        "reviewed_missing": False,
+        "proposed": False,
+        "diff_lines": [],
         "findings": [
-            {"level": "note", "message_shown": "suggested by the server: allow (readOnlyHint=true)"}
+            {
+                "level": "note",
+                "pointer_shown": "/annotations",
+                "message_shown": "suggested by the server: allow (readOnlyHint=true)",
+            }
         ],
     }
     add = row(view, "add")
@@ -175,7 +223,9 @@ def test_the_large_fakes_96_tools() -> None:
     bad = row(view, "bad_tool")
     assert (bad["pinnable"], bad["not_pinnable"]) == (False, ERROR_FINDING)
     assert [finding["level"] for finding in bad["findings"]] == ["error"]
-    assert all(set(finding) == {"level", "message_shown"} for finding in bad["findings"])
+    assert all(
+        set(finding) == {"level", "pointer_shown", "message_shown"} for finding in bad["findings"]
+    )
     assert "consequential" not in echo
 
 
@@ -376,11 +426,28 @@ def test_choices_of_the_right_shape() -> None:
         ({"indent": -1}, "indent is 0 to 16, or compose"),
         ({"indent": True}, "indent is 0 to 16, or compose"),
         ({"indent": "4"}, "indent is 0 to 16, or compose"),
+        ({"repin": "a"}, "repin is a list of tool names"),
+        ({"repin": ["a", "b", "c"]}, "repin names at most 2 tools (max_tools_per_server)"),
+        ({"decline": ["b", "b"]}, "decline names a tool twice"),
+        ({"decline": ["a b"]}, "decline is a list of tool names"),
+        ({"decline_rest": 1}, "decline_rest is true or false"),
+        ({"decline_rest": "true"}, "decline_rest is true or false"),
     ],
 )
 def test_choices_of_the_wrong_shape(change: dict[str, Any], said: str) -> None:
     body = {"include": ["a", "b"], "allow": ["a"], "approve": ["b"], **change}
     assert detail(choices(body, 2), "bad_body") == said
+
+
+def test_choices_take_repins_declines_and_the_rest() -> None:
+    """M6 J.2, J.3: the three optional keys, none of them needed."""
+    body = {"include": ["a"], "allow": ["a"], "approve": [], "repin": ["a"], "decline": ["b"]}
+    assert choices({**body, "decline_rest": True}, 2) == Choices(
+        ("a",), frozenset({"a"}), frozenset(), 0, "plain", frozenset({"a"}), ("b",), True
+    )
+    assert choices({"include": [], "allow": [], "approve": []}, 2) == Choices(
+        (), frozenset(), frozenset(), 0, "plain", frozenset(), (), False
+    )
 
 
 # --- stale (GR-11) -------------------------------------------------------------------------------
@@ -389,7 +456,7 @@ def test_choices_of_the_wrong_shape(change: dict[str, Any], said: str) -> None:
 def test_a_report_is_stale_once_the_servers_tools_changed() -> None:
     report = held(large(["echo", "add"], allow=["echo"], approve=["add"]))
     tools = Tools(include=["add", "echo"], allow=["echo"], approve=["add"])
-    same = Listed("notes", "remote", tools, "hide")
+    same = Listed("notes", "remote", tools, "hide", review=report["policy"]["review"])
     assert not stale(report, same)  # the order of a list isn't a change
     assert stale(report, None)
     assert stale(report, replace(same, kind="toolkit"))
@@ -421,6 +488,23 @@ def test_a_report_is_stale_once_the_servers_declines_changed() -> None:
     m7["policy"].pop("declined", None)  # an M7 gateway's report ran under no declines
     assert not stale(m7, NOTES)
     assert stale(m7, later)
+
+
+def test_a_report_is_stale_once_the_servers_pins_changed() -> None:
+    """M6 J.2: fragment 2 writes the report's pins, which would undo a re-pin made since; an M7
+    gateway's report, with no pins, ran under none."""
+    report = drifted()
+    assert not stale(report, SEARCH)
+    assert stale(report, replace(SEARCH, review={"search": pin("search", NEW)}))
+    assert stale(report, replace(SEARCH, review={}))
+    assert stale(report, replace(SEARCH, review={**SEARCH.review, "other": OTHER_PIN}))
+    m7 = copy.deepcopy(report)
+    m7["policy"].pop("review")
+    assert stale(m7, SEARCH)
+    assert not stale(m7, replace(SEARCH, review={}))
+    body = {"include": ["search"], "allow": ["search"], "approve": [], "repin": ["search"]}
+    repinned = replace(SEARCH, review={"search": pin("search", NEW)})
+    assert detail(run_diff(report, body, server=repinned), "review_stale")
 
 
 # --- the changes (F.6) ---------------------------------------------------------------------------
@@ -517,6 +601,230 @@ def test_a_toolkits_consequential_tool_is_never_in_allow(
     text = detail(changes(report, chosen(["send_note"], ["send_note"])))
     assert "the toolkit declares send_note consequential, so it can't be in allow" in text
     assert changes(report, chosen(["send_note"], [], ["send_note"])) == cli_review.Changes()
+
+
+def test_a_repin_takes_the_new_pin_and_keeps_the_classification() -> None:
+    """M6 J.2, J.3, Q8 (a): Accept the new definition re-pins a drifted tool, its
+    classification kept; an allow tool whose new definition isn't marked read-only stays allow,
+    and fragment 2 says so."""
+    report = drifted()
+    made = changes(report, chosen(["search"], ["search"], repin=["search"]))
+    assert made == cli_review.Changes(repin=frozenset({"search"}))
+    body = {"include": ["search"], "allow": ["search"], "approve": [], "repin": ["search"]}
+    answer = run_diff(report, body, server=SEARCH)
+    assert isinstance(answer, dict)
+    text = answer["diff"]["yaml"]
+    entry_ = load_mapping(text)["gateway"]["servers"]["notes"]
+    assert entry_["review"] == {"search": pin("search", NEW)}
+    assert entry_["tools"] == {"include": ["search"], "allow": ["search"], "approve": []}
+    assert f"# changed: search (was {pin('search', OLD)})" in text
+    assert "# kept: search (allow: the new definition isn't marked read-only: proposed" in text
+    kept = run_diff(report, {**body, "repin": []}, server=SEARCH)
+    assert isinstance(kept, dict)
+    assert load_mapping(kept["diff"]["yaml"])["gateway"]["servers"]["notes"]["review"] == {
+        "search": pin("search", OLD)
+    }
+
+
+def test_declines_one_by_one_and_the_rest() -> None:
+    """M6 J.3, J.5: Decline records a tool left out at the pin shown; Record the rest as
+    declined, every listed tool not included; an included tool is never declined."""
+    report = drifted()
+    one = changes(report, chosen(["search"], ["search"], decline=["other"]))
+    assert one == cli_review.Changes(declined={"other": pin("other")})
+    rest = changes(report, chosen(["search"], ["search"], decline_rest=True))
+    assert rest == cli_review.Changes(declined={"other": pin("other"), "third": pin("third")})
+    dropped = changes(report, chosen([], decline_rest=True))
+    assert isinstance(dropped, cli_review.Changes)
+    assert dropped.declined == {
+        "search": pin("search", NEW),
+        "other": pin("other"),
+        "third": pin("third"),
+    }
+    body = {"include": ["search"], "allow": ["search"], "approve": [], "decline_rest": True}
+    answer = run_diff(report, body, server=SEARCH)
+    assert isinstance(answer, dict)
+    assert not [f for f in answer["diff"]["check"] if f["level"] == "error"]
+    assert answer["diff"]["yaml"].startswith(
+        "# zoeymcp: review of notes (2 of 2). Replace the tools:, review: and declined: blocks "
+    )
+    entry_ = load_mapping(answer["diff"]["yaml"])["gateway"]["servers"]["notes"]
+    assert entry_["declined"] == {"other": pin("other"), "third": pin("third")}
+
+
+@pytest.mark.parametrize(
+    ("more", "said"),
+    [
+        ({"repin": ["other"]}, "other hasn't drifted, so there is no new definition to accept"),
+        ({"repin": ["ghost"]}, "ghost hasn't drifted, so there is no new definition to accept"),
+        ({"decline": ["ghost"]}, "the server lists no tool ghost"),
+        ({"decline": ["search"]}, "search is declined but included"),
+    ],
+)
+def test_what_cant_be_repinned_or_declined(more: dict[str, Any], said: str) -> None:
+    assert said in detail(changes(drifted(), chosen(["search"], ["search"], **more)))
+
+
+def test_a_repin_of_a_tool_left_out_or_unpinnable_and_an_unpinnable_decline() -> None:
+    report = drifted()
+    left = detail(changes(report, chosen([], repin=["search"])))
+    assert "search is re-pinned but not included" in left
+    broken = copy.deepcopy(report)
+    entry(broken, "search")["findings"].append({"level": "error", "pointer": "", "message": "m"})
+    said = detail(changes(broken, chosen(["search"], ["search"], repin=["search"])))
+    assert "search can't be pinned, so its new definition can't be accepted" in said
+    bad = detail(changes(held(large()), chosen([], decline=["bad_tool"])))
+    assert "bad_tool can't be pinned, so it can't be declined" in bad
+
+
+# --- prefill, the chips' flags and a finding's pointer (M6 J.3, D-188, D-199) --------------------
+
+
+def test_prefill_is_where_a_ticked_box_starts() -> None:
+    """M6 J.3, Q27: an included tool's classification whatever its suggestion (read_01, which
+    the server marks read-only, stays approve); a tool not included whose name is in the
+    ratchet's approved set, approve; any other, its suggestion. With nothing approved passed
+    (declarative mode), every row's prefill is its classification or its suggestion."""
+    report = held(large(["read_01", "add"], approve=["read_01", "add"]))
+    view = rows(report)
+    assert (row(view, "read_01")["suggested"], row(view, "read_01")["prefill"]) == (
+        "allow",
+        "approve",
+    )
+    assert (row(view, "read_02")["prefill"], row(view, "write_01")["prefill"]) == (
+        "allow",
+        "approve",
+    )
+    assert all(r["prefill"] == (r["classification"] or r["suggested"]) for r in view["tools"])
+    once = rows(report, approved=frozenset({"read_02", "read_01"}))
+    assert [row(once, name)["prefill"] for name in ("read_01", "read_02", "read_03")] == [
+        "approve",
+        "approve",
+        "allow",
+    ]
+
+
+def test_select_suggested_after_clear_makes_no_move() -> None:
+    """M6 J.3, Q27: the choices Select suggested gives after Clear (every pinnable tool the
+    server marks read-only, each at its row's prefill, as review.js sets them) move no included
+    approve tool to allow."""
+    report = held(large(["read_01", "add"], approve=["read_01", "add"]))
+    picked = [r for r in rows(report)["tools"] if r["pinnable"] and r["suggested"] == "allow"]
+    allow = [r["name"] for r in picked if r["prefill"] == "allow"]
+    approve = [r["name"] for r in picked if r["prefill"] == "approve"]
+    assert approve == ["read_01"]
+    made = changes(report, chosen([r["name"] for r in picked], allow, approve))
+    assert isinstance(made, cli_review.Changes)
+    assert made.moved == {}
+    assert "read_01" not in made.added
+
+
+def test_the_chips_flags_count_what_the_counts_count(
+    tmp_path: Path, example_raw: dict[str, Any]
+) -> None:
+    """D-188: the chips read annotated and read_only_hint, the counts' own rules, so a
+    toolkit's consequential tool with no annotations is a not-annotated tool though it is
+    suggested approve as consequential."""
+    view = rows(held(large()))
+    assert sum(not r["annotated"] for r in view["tools"]) == view["counts"]["not_annotated"]
+    assert sum(r["read_only_hint"] for r in view["tools"]) == view["counts"]["read_only"]
+    report = held(toolkit_reviewed(tmp_path, example_raw))
+    send = entry(report, "send_note")
+    send["definition"] = {k: v for k, v in send["definition"].items() if k != "annotations"}
+    view = rows(report)
+    found = row(view, "send_note")
+    assert (found["suggested_why"], found["annotated"]) == (WHY_CONSEQUENTIAL, False)
+    assert view["counts"]["not_annotated"] == 1
+    send["definition"]["annotations"] = {"readOnlyHint": True}
+    found = row(rows(report), "send_note")
+    assert (found["suggested"], found["read_only_hint"], found["annotated"]) == (
+        "approve",
+        True,
+        True,
+    )
+
+
+def test_a_findings_pointer_is_shown() -> None:
+    """D-199: "(definition)" for the whole definition, the server's pointer revealed and
+    capped like a message."""
+    report = held(large())
+    entry(report, "echo")["findings"] = [
+        {"level": "warning", "pointer": "", "message": "m"},
+        {"level": "warning", "pointer": f"/description{RLO}", "message": "m"},
+        {"level": "warning", "pointer": "/" + "p" * 300, "message": "m"},
+    ]
+    shown_ = [f["pointer_shown"] for f in row(rows(report), "echo")["findings"]]
+    assert shown_[:2] == ["(definition)", "/description[U+202E]"]
+    assert shown_[2] == "/" + "p" * 255 + "…[+45]"
+
+
+# --- a drifted tool's two definitions (M6 J.2) ---------------------------------------------------
+
+
+def test_a_drifted_tool_shows_both_definitions_and_the_vaults_diff() -> None:
+    report = drifted()
+    found = row(rows(report), "search")
+    assert (found["state"], found["pinned"], found["pin"]) == (
+        "drift",
+        pin("search", OLD),
+        pin("search", NEW),
+    )
+    assert found["reviewed_lines"] == definition_lines(entry(report, "search")["reviewed"])
+    assert found["definition_lines"] == definition_lines(entry(report, "search")["definition"])
+    assert found["reviewed_missing"] is False
+    # search is allow and its new definition isn't marked read-only: a re-pin proposes approve (Q8).
+    assert found["proposed"] is True
+    joined = ["".join(chunks) for chunks in found["diff_lines"]]
+    assert joined[:2] == ["--- reviewed", "+++ now"]
+    assert any(line.startswith("-") and "Finds notes. <img" in line for line in joined)
+    assert any(line.startswith("+") and "and sends them on" in line for line in joined)
+    # The markup is text on both sides and in the diff: the page shows it through textContent.
+    assert any("<img src=x onerror=alert(1)>" in "".join(c) for c in found["reviewed_lines"])
+    others = row(rows(report), "other")
+    assert (others["reviewed_lines"], others["diff_lines"], others["reviewed_missing"]) == (
+        [],
+        [],
+        False,
+    )
+    assert others["proposed"] is False
+
+
+def test_hidden_characters_on_both_sides_are_escapes() -> None:
+    """K.5 on both columns and the diff: a definition the server or the reviewed copy holds is
+    ASCII JSON, so a bidi control is a visible escape everywhere, never the character."""
+    report = drifted()
+    search = entry(report, "search")
+    search["reviewed"]["description"] += RLO
+    search["definition"]["description"] += ZWSP
+    found = row(rows(report), "search")
+    assert RLO not in json.dumps(found, ensure_ascii=False)
+    assert ZWSP not in json.dumps(found, ensure_ascii=False)
+    for lines, escape in (
+        (found["reviewed_lines"], "\\u202e"),
+        (found["definition_lines"], "\\u200b"),
+        (found["diff_lines"], "\\u202e"),
+        (found["diff_lines"], "\\u200b"),
+    ):
+        assert any(escape in chunk for chunks in lines for chunk in chunks), escape
+
+
+def test_without_the_reviewed_copy_the_new_definition_is_shown_whole() -> None:
+    found = row(rows(drifted(kept=False)), "search")
+    assert (found["reviewed_missing"], found["reviewed_lines"], found["diff_lines"]) == (
+        True,
+        [],
+        [],
+    )
+    assert found["definition_lines"]
+
+
+def test_the_diff_is_shown_in_chunks_with_nothing_cut() -> None:
+    long = "y" * 450
+    lines = drift_diff(definition_lines({"d": "x"}), definition_lines({"d": long}))
+    assert f'+  "d": "{long}"' in ["".join(chunks) for chunks in lines]
+    assert all(0 < len(chunk) <= CHUNK for chunks in lines for chunk in chunks)
+    hidden = drift_diff([["a"]], [[f"b{RLO}"]])
+    assert "+b[U+202E]" in ["".join(chunks) for chunks in hidden]
 
 
 # --- fragment 2 (F.6, E.4, H) --------------------------------------------------------------------

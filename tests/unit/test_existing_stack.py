@@ -248,10 +248,8 @@ def test_the_printed_commands_name_this_file() -> None:
     assert vault[onboard_cli.COMPOSE_CMD_ENV] == (
         "docker compose -f examples/existing-stack/compose.yaml"
     )
-    assert (vault[onboard_cli.EXEC_SERVICE_ENV], vault[onboard_cli.REVIEW_SERVICE_ENV]) == (
-        "vault",
-        "gateway",
-    )
+    assert vault[onboard_cli.EXEC_SERVICE_ENV] == "vault"
+    assert "ZOEYMCP_REVIEW_SERVICE" not in vault  # no printed command used it (D-201)
     assert gateway[onboard_cli.EXEC_SERVICE_ENV] == "gateway"
     given = compose({onboard_cli.COMPOSE_CMD_ENV: "docker compose -f stack.yaml"})
     assert given["services"]["vault"]["environment"][onboard_cli.COMPOSE_CMD_ENV] == (

@@ -112,12 +112,11 @@ Do = Literal[
     "check_egress_role",
     "onboard_again",
 ]
-# Where the CLI runs a command (M.7): ``exec`` in the running service; ``exec_gateway`` in the
-# gateway's (a review over its admin socket); ``run``, a one-off container that
-# reads the inline policy from the service's environment; ``run_mount``, the same with the working
-# directory mounted at /w, for a fragment file; ``up``, the service recreated. None: as written,
-# where the policy file is.
-Via = Literal["exec", "exec_gateway", "run", "run_mount", "up"]
+# Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
+# container that reads the inline policy from the service's environment; ``run_mount``, the same
+# with the working directory mounted at /w, for a fragment file; ``up``, the service recreated.
+# None: as written, where the policy file is.
+Via = Literal["exec", "run", "run_mount", "up"]
 # Whether a committed credential holds a refresh token (D.12, OPS-13): ``stored`` in its store
 # slot (by login, a seeding secret set, or an env seed promoted), ``seeded`` from an env: seed
 # not used yet, or ``none``.
@@ -939,9 +938,9 @@ class Listed:
     ``on_drift`` as the policy has them, the clients it is assigned to, and for a remote server
     whose route has an oauth2 credential, that credential, the resource it names (D.12) and,
     for a ``refresh_token`` grant, whether it holds a refresh token (OPS-13): a
-    ``client_credentials`` grant never holds one, and needs no sign-in. ``declined`` is the
-    policy's declined block, which a review report made before a decline no longer matches (M6
-    design J.2, J.5)."""
+    ``client_credentials`` grant never holds one, and needs no sign-in. ``review`` and
+    ``declined`` are the policy's pins and declined block, which a review report made before a
+    re-pin or a decline no longer matches (M6 design J.2, J.5)."""
 
     name: str
     kind: ServerKind
@@ -952,6 +951,7 @@ class Listed:
     resource: str | None = None
     held: TokenState | None = None
     declined: Mapping[str, str] = field(default_factory=dict)
+    review: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def state(self) -> RowState:
@@ -969,16 +969,21 @@ def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed
     found = []
     for name, server in sorted(_servers(policy).items()):
         assigned = tuple(sorted(c for c, client in clients.items() if name in client.servers))
-        declined = dict(server.declined)
+        listed = Listed(
+            name,
+            "toolkit" if isinstance(server, ToolkitServer) else "remote",
+            server.tools,
+            server.on_drift,
+            assigned,
+            declined=dict(server.declined),
+            review=dict(server.review),
+        )
         if isinstance(server, ToolkitServer):
-            found.append(
-                Listed(name, "toolkit", server.tools, server.on_drift, assigned, declined=declined)
-            )
+            found.append(listed)
             continue
         route = routes.get(server.route)
         credential = None if route is None else route.credential
         cred = None if credential is None else policy.credentials.get(credential)
-        listed = Listed(name, "remote", server.tools, server.on_drift, assigned, declined=declined)
         if credential is not None and isinstance(cred, OAuth2Credential):
             held = None
             if cred.grant == "refresh_token":

@@ -297,27 +297,28 @@ def test_interpolation_resolves_nested_defaults() -> None:
         (
             "compose.hardened.yaml",
             "docker compose -f deploy/compose.hardened.yaml",
-            {"vault": ("vault", "gateway"), "gateway": ("gateway", None)},
+            {"vault": ("vault", True), "gateway": ("gateway", False)},
         ),
         (
             "compose.yaml",
             "docker compose -f deploy/compose.yaml",
-            {"zoeymcp": ("zoeymcp", "zoeymcp")},
+            {"zoeymcp": ("zoeymcp", True)},
         ),
     ],
 )
 def test_the_printed_commands_name_the_tier_and_its_services(
-    name: str, command: str, services: dict[str, tuple[str, str | None]]
+    name: str, command: str, services: dict[str, tuple[str, bool]]
 ) -> None:
     """M7 design M.7 (OPS-17): ``login --mcp`` prints its commands after ZOEYMCP_COMPOSE_CMD,
-    this file's own command unless .env sets another, and the services each service names."""
+    this file's own command unless .env sets another, and the service it runs in. No service
+    sets ZOEYMCP_REVIEW_SERVICE, which no printed command used (D-201)."""
     found = compose(name)["services"]
-    for service, (own, review) in services.items():
+    for service, (own, prints) in services.items():
         environment = found[service]["environment"]
         assert environment[onboard_cli.EXEC_SERVICE_ENV] == own
-        assert environment.get(onboard_cli.REVIEW_SERVICE_ENV) == review
+        assert "ZOEYMCP_REVIEW_SERVICE" not in environment
         has_command = onboard_cli.COMPOSE_CMD_ENV in environment
-        assert has_command == (review is not None)
+        assert has_command == prints
         if has_command:
             assert environment[onboard_cli.COMPOSE_CMD_ENV] == command
     given = compose(name, {onboard_cli.COMPOSE_CMD_ENV: "docker compose -f a.yaml -p mine"})

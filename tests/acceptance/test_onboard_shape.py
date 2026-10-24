@@ -162,7 +162,6 @@ def no_compose_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     """The printed commands as the shipped hardened file gives them (M.7)."""
     for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv(onboard_cli.REVIEW_SERVICE_ENV, raising=False)
 
 
 # --- the fakes, by name ------------------------------------------------------------------------

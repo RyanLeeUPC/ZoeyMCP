@@ -17,10 +17,10 @@ M.7). The vault does the work over its admin socket; this module asks, prompts a
   ``review <server> --via vault --choose --suggest`` and ``--choices -``, the choices file and
   fragment 2 (J1), which read that same report (OPS-11).
 - **Commands** in a ``next`` list are the vault's argument lists, shell-quoted (TI-14), printed
-  after the prefix ``ZOEYMCP_COMPOSE_CMD`` names and the service ``ZOEYMCP_EXEC_SERVICE`` (or,
-  for ``review``, ``ZOEYMCP_REVIEW_SERVICE``) names, as the entry's ``via`` says (OPS-17). A
-  refusal by the operator's own proxy gets a ``retry`` command rebuilt from this run's argv
-  (D.11), with ``--squid-src`` naming the vault's source ACL in its Squid lines (OPS-7).
+  after the prefix ``ZOEYMCP_COMPOSE_CMD`` names and the service ``ZOEYMCP_EXEC_SERVICE`` names,
+  as the entry's ``via`` says (OPS-17). A refusal by the operator's own proxy gets a ``retry``
+  command rebuilt from this run's argv (D.11), with ``--squid-src`` naming the vault's source ACL
+  in its Squid lines (OPS-7).
 
 ``--format json`` prints the vault's answers as one ASCII JSON document on stdout instead
 (D-171): ``discover``, then ``fragment`` or ``refused``.
@@ -50,11 +50,9 @@ EXIT_USAGE = 2
 
 COMPOSE_CMD_ENV: Final = "ZOEYMCP_COMPOSE_CMD"
 EXEC_SERVICE_ENV: Final = "ZOEYMCP_EXEC_SERVICE"
-REVIEW_SERVICE_ENV: Final = "ZOEYMCP_REVIEW_SERVICE"
 # The shipped hardened file's, when the container's environment names nothing (M.7).
 DEFAULT_COMPOSE_CMD: Final = "docker compose -f deploy/compose.hardened.yaml"
 DEFAULT_EXEC_SERVICE: Final = "vault"
-DEFAULT_REVIEW_SERVICE: Final = "gateway"
 # How long the second run waits for the review it queued (M.6).
 REPORT_WAIT: Final = 120
 # The onboarding's flags, which a login of a named credential doesn't take: (dest, flag).
@@ -103,30 +101,26 @@ Connect = Callable[[str, TextIO], int]
 
 @dataclass(frozen=True)
 class Prefix:
-    """How a ``next`` command is run from the host (M.7): the compose command, the service this
-    CLI runs in, and the gateway's, for ``review``."""
+    """How a ``next`` command is run from the host (M.7): the compose command and the service this
+    CLI runs in."""
 
     compose: str = DEFAULT_COMPOSE_CMD
     service: str = DEFAULT_EXEC_SERVICE
-    review: str = DEFAULT_REVIEW_SERVICE
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> Prefix:
         return cls(
             environ.get(COMPOSE_CMD_ENV) or DEFAULT_COMPOSE_CMD,
             environ.get(EXEC_SERVICE_ENV) or DEFAULT_EXEC_SERVICE,
-            environ.get(REVIEW_SERVICE_ENV) or DEFAULT_REVIEW_SERVICE,
         )
 
     def line(self, command: str, via: str | None, *, piped: bool = False) -> str:
         """``command`` (already shell-quoted) as typed on the host, by its ``via``: in the
-        running service (``-T`` when stdin is piped), the gateway's, a one-off container (with
-        the working directory at /w), or the service recreated; with no ``via``, as it is."""
+        running service (``-T`` when stdin is piped), a one-off container (with the working
+        directory at /w), or the service recreated; with no ``via``, as it is."""
         service = shlex.quote(self.service)
         if via == "exec":
             return f"{self.compose} exec{' -T' if piped else ''} {service} {command}"
-        if via == "exec_gateway":
-            return f"{self.compose} exec {shlex.quote(self.review)} {command}"
         if via == "run":
             return f"{self.compose} run --rm --no-deps {service} {command}"
         if via == "run_mount":

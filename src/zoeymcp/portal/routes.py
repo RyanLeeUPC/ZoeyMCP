@@ -195,7 +195,11 @@ ONBOARD_FRAGMENT: Final = Route(
     "POST", "/api/onboard/{onboarding}/fragment", FULL, BODY_EMPTY, optional=frozenset({"indent"})
 )
 ONBOARD_CANCEL: Final = Route("DELETE", "/api/onboard/{onboarding}", FULL)
-REVIEW: Final = Route("POST", "/api/review/{server}", FULL, BODY_EMPTY)
+# M6 step 8 (M6 M.2, J.2): a review may be asked for fresh, never a done one handed back, and
+# fragment 2 takes the re-pins, the declines and Record the rest as declined.
+REVIEW: Final = Route(
+    "POST", "/api/review/{server}", FULL, BODY_EMPTY, optional=frozenset({"fresh"})
+)
 REVIEW_JOB: Final = Route("GET", "/api/review/jobs/{job}", FULL)
 REVIEW_DIFF: Final = Route(
     "POST",
@@ -203,7 +207,7 @@ REVIEW_DIFF: Final = Route(
     FULL,
     BODY_CHOICES,
     frozenset({"include", "allow", "approve"}),
-    frozenset({"indent"}),
+    frozenset({"indent", "repin", "decline", "decline_rest"}),
 )
 # M6 step 7: Home's attention list (M6 M.2, M.7), from health's gateway section.
 ATTENTION: Final = Route("GET", "/api/attention", FULL)

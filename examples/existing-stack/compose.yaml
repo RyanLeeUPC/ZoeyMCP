@@ -64,12 +64,11 @@ services:
     stop_grace_period: 75s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
-      # The commands `zoeymcp login --mcp` prints start with this compose command and name these
-      # services (docs/operations.md §11). Your stack runs compose another way? Set
+      # The commands `zoeymcp login --mcp` prints start with this compose command and name this
+      # service (docs/operations.md §11). Your stack runs compose another way? Set
       # ZOEYMCP_COMPOSE_CMD in .env to the command you type.
       ZOEYMCP_COMPOSE_CMD: "${ZOEYMCP_COMPOSE_CMD:-docker compose -f examples/existing-stack/compose.yaml}"
       ZOEYMCP_EXEC_SERVICE: vault
-      ZOEYMCP_REVIEW_SERVICE: gateway
       ZOEYMCP_CONFIG: |
         version: 1
         mode: declarative

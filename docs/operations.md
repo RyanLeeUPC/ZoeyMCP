@@ -1110,9 +1110,8 @@ that host the exception: onboard such a server with `egress_proxy` unset, or wri
 by hand.
 
 **Your own compose command.** The printed commands start with `ZOEYMCP_COMPOSE_CMD` and name the
-service in `ZOEYMCP_EXEC_SERVICE`, which the shipped compose files set. They also set
-`ZOEYMCP_REVIEW_SERVICE`, which is kept for compatibility: no printed command uses it now that the
-review runs through the vault. If you run compose with override files, a project directory or a project name, set
+service in `ZOEYMCP_EXEC_SERVICE`, which the shipped compose files set. If you run compose with
+override files, a project directory or a project name, set
 `ZOEYMCP_COMPOSE_CMD` in `.env` to the command you type (`docker compose -f
 deploy/compose.hardened.yaml -f my-override.yaml`), or every printed command names the shipped
 file alone.
@@ -1173,8 +1172,8 @@ answers the CLI's finished review of it at the current policy view again (send `
 a new one); `GET /review/jobs/<job>?wait=N` (at most 30 s) answers the job's state, and its report
 once it is done; `POST /review/jobs/<job>/diff` makes fragment 2 from `{"include": [...], "allow":
 [...], "approve": [...]}` (and `"indent"`, 0 to 16 or `"compose"`), as the portal's review screen
-does, saving nothing, or refuses `review_stale` when the server's tools in the running policy
-changed since the review. At most two reviews are under way at once, one per server. A queue call is refused
+does, saving nothing, or refuses `review_stale` when the server's tools, pins or declines in the
+running policy changed since the review. At most two reviews are under way at once, one per server. A queue call is refused
 `review_unavailable` while the gateway isn't polling (no poll waiting, no review it took still
 running, and no poll or result in the last 15 s); in the first 45 s after the vault starts it waits
 for the gateway's first poll instead. A job the gateway doesn't take within 60 s, because it holds
@@ -1237,6 +1236,31 @@ diff search_notes:
 - **`on_drift: fail`** hides the whole server instead (`server_blocked`); its tools show
   `BLOCKED`.
 - A tool the server no longer lists is `MISSING`. It comes back when it is listed again.
+
+**In the portal** (declarative mode). Home says "notes changed 1 included tool since the review",
+and the server's row on **MCP servers** says what the gateway reports, above **Review again**,
+which asks for a fresh review, never the finished one handed back, since a server changes a tool
+without the policy changing (so does **Review again** under the review screen's tools). On the review screen the tool's row is `drift`, with two columns: **Reviewed**,
+the definition the policy pinned, which the vault checked against the pin, and **Now**, the one
+the server lists, which the vault pinned itself, each whole in marked chunks, and under them the
+vault's line diff between the two. When the gateway no longer holds the reviewed copy (it keeps
+it in memory, so not across its restart) the row says so and the new definition is shown whole.
+Each finding names the field it is about ("warning at /inputSchema/properties/q/description:
+..."; "(definition)" for the whole definition). Tick **Accept the new definition** to take the
+new pin: the tool keeps its classification, except that an `allow` tool whose new definition the
+server no longer marks read-only says approve is proposed, and ticking the box chooses approve on
+its row; choose allow there to keep it, and the fragment says you kept it (`# kept: <tool> (allow: ...)`), as `--repin` does.
+**Generate** gives fragment 2 with the new pin and a `# changed:` line; commit it and reload, and
+the mark clears when the pin changes. A tool that flipped back to its reviewed definition reads
+`marked`, and its mark stays until `review --clear`.
+
+**Declined tools in the portal.** **Decline** on a tool's row leaves it out and records it under
+the server's `declined` at the definition shown; **Record the rest as declined** (ticked by
+default) does that for every listed tool you don't include, as `--decline-rest` does (§11), so
+a server reviewed once ends quiet. A declined tool you include later leaves `declined`.
+Generate is refused `review_stale` when the policy's tools, pins or declines for the server
+changed since the review (another fragment committed meanwhile, which this one would undo):
+review again.
 
 The gateway checks for drift when the server says its list changed, when a session changes or
 reconnects, and every `drift_check_interval` (300 s) regardless, since a hostile server won't
@@ -1936,22 +1960,30 @@ itself once the vault sees the commit; after a recreate, sign in and it is there
 names several authorization servers asks you to choose one (a button for each). **Cancel** drops
 an onboarding in progress; signing out drops it too.
 
-**The review screen.** **Review tools** (or **Review again**) queues a review for the gateway's
-poll (§11, "The review job path") and shows it once the gateway reports: the server's own name
+**The review screen.** **Review tools** (or **Review again**) queues a fresh review for the
+gateway's poll (§11, "The review job path"), never a finished one handed back, since a server can
+change a tool without the policy changing (§12), and shows it once the gateway reports: the
+server's own name
 and instructions, the counts ("96 tools: 64 the server marks read-only, 32 not annotated, ..."),
 three chips (suggested read-only, not annotated, with findings: a tool shows when it matches any
 chip ticked) and a filter on the name and title. "With findings" is a warning, as in the counts (a
-tool with an error finding is counted apart); a toolkit's consequential tool is suggested approve,
-so the first two chips leave it out. Each tool has its state, the server's suggestion
-and why, its description, its findings and **Show definition**, the pinned definition as JSON
-with every character outside ASCII escaped and nothing cut (a long line wraps onto marked lines
-under it). Nothing is included by default: tick **Include** on a tool, and its allow or approve
-choice starts at the server's suggestion, labelled as the server's (allow: agents call it with no
-prompt; approve: every call asks you first). A tool that can't be pinned has no box, and says
-why. **Select suggested** includes every pinnable tool the server marks read-only and not
-destructive, as allow; it is the only bulk allow. **Clear** takes every tool out. Tools the policy
-includes already start included, at their classification, so generating unchanged keeps them;
-taking one out drops it. **Generate (n tools: a allow, b approve)** makes fragment 2, with
+tool with an error finding is counted apart); the first two chips read the server's own
+annotations, as the counts do, so a toolkit's consequential tool shows under them by its
+annotations though it is suggested approve. Each tool has its state, the server's suggestion
+and why, its description, its findings (each naming the field it is about) and **Show
+definition**, the pinned definition as JSON with every character outside ASCII escaped and
+nothing cut (a long line wraps onto marked lines under it); a drifted tool has its two
+definitions and their diff (§12). Nothing is included by default: tick **Include** on a tool, and
+its allow or approve choice starts at the policy's classification for a tool the policy includes,
+else at the server's suggestion, labelled as the server's (allow: agents call it with no prompt;
+approve: every call asks you first). A tool that can't be pinned has no box, and says why.
+**Select suggested** includes every unticked, pinnable tool the server marks read-only and not
+destructive, each where its own box starts: as allow for a new tool, at its classification for
+one the policy includes, so **Clear** then **Select suggested** gives each tool back its
+classification and never moves one from approve to allow; it is the only bulk allow. **Clear**
+takes every tool out. Tools the policy includes already start included, at their classification,
+so generating unchanged keeps them; taking one out drops it. **Decline** and **Record the rest as
+declined** record what you leave out (§12). **Generate (n tools: a allow, b approve)** makes fragment 2, with
 **Copy**, the indent and its steps, ending with the `gateway.clients.<client>.servers` line to
 add yourself: fragment 2 assigns no client. Nothing is saved.
 

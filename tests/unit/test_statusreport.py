@@ -153,6 +153,40 @@ def test_a_witness_above_revision_max_is_refused_whole() -> None:
     assert "9,999,999,999" in caught.detail
 
 
+@pytest.mark.parametrize(
+    ("data", "reason", "detail"),
+    [
+        (
+            report(extra=1),
+            "invalid",
+            "a status report has exactly deployments_seen, policy_mode, servers, started, v, "
+            "view, witness",
+        ),
+        (report(v=2), "invalid", "the status report's version isn't 1"),
+        (report(view=None), "invalid", "view must be sha256: and 64 hex digits"),
+        (report(started=-1), "invalid", "started must be a whole number of seconds"),
+        (report(witness=[]), "invalid", "witness must be an object of at most 8 deployments"),
+        (report(witness={DEPLOYMENT: 0}), "invalid", "a witness maps a deployment to a revision"),
+        (
+            report(witness={DEPLOYMENT: REVISION_MAX + 1}),
+            "witness_range",
+            "a witness revision is above 9,999,999,999",
+        ),
+        (report(deployments_seen=-1), "invalid", "deployments_seen must be a count"),
+        (
+            report(policy_mode="other"),
+            "invalid",
+            "policy_mode must be managed, declarative or unknown",
+        ),
+        (report(servers=[]), "invalid", "servers must be an object"),
+    ],
+)
+def test_each_refusal_says_why(data: Any, reason: str, detail: str) -> None:
+    """The detail is the vault's 400 answer to the gateway, so each refusal's is its own."""
+    caught = refused(data)
+    assert (caught.reason, caught.detail, str(caught)) == (reason, detail, detail)
+
+
 # --- a server on its own (T-7) ------------------------------------------------------------------
 
 
@@ -220,6 +254,22 @@ def test_a_bad_unreviewed_pair_is_dropped_and_counted(pair: Any) -> None:
         report(servers={"notes": server(unreviewed=[["ok", B], pair])}), MAX_TOOLS
     ).servers["notes"]
     assert (entry.unreviewed, entry.dropped) == ((("ok", B),), 1)
+
+
+def test_every_bad_pair_and_name_is_counted() -> None:
+    """Each bad unreviewed pair counts, and adds to the bad names the lists dropped."""
+    entry = read(
+        report(servers={"notes": server(unreviewed=[["a b", A], "tool"], drift=["x y"])}),
+        MAX_TOOLS,
+    ).servers["notes"]
+    assert (entry.unreviewed, entry.dropped) == ((), 3)
+
+
+def test_the_unnamed_counts_are_each_their_own() -> None:
+    entry = read(
+        report(servers={"notes": server(invalid_unnamed=1, duplicate_unnamed=3)}), MAX_TOOLS
+    ).servers["notes"]
+    assert (entry.invalid_unnamed, entry.duplicate_unnamed, entry.unnamed) == (1, 3, 4)
 
 
 def test_names_are_sorted_once() -> None:
@@ -344,10 +394,12 @@ def test_blocked_is_the_gateways_word() -> None:
 
 
 def test_a_server_without_a_policy_name_is_counted_not_named() -> None:
-    found = read(report(servers={"Not A Name": server(), "notes": server()}), MAX_TOOLS)
+    found = read(
+        report(servers={"Not A Name": server(), "notes": server(), "-x": server()}), MAX_TOOLS
+    )
     assert (list(found.servers), found.unnamed_servers, found.refused_servers) == (
         ["notes"],
-        1,
+        2,
         (),
     )
 

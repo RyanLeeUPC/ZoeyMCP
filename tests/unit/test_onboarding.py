@@ -1569,6 +1569,24 @@ def test_a_row_carries_its_servers_declines() -> None:
     assert dict(found["broker-read"].declined) == {}
 
 
+def test_a_row_carries_its_servers_pins() -> None:
+    """Each row holds its server's pins too, remote or toolkit, so a report made before a re-pin
+    is stale (M6 design J.2)."""
+    policy = committed()
+    assert policy.gateway is not None
+    servers = policy.gateway.servers
+    pin = "sha256:" + "cd" * 32
+    policy = with_servers(
+        policy,
+        mail=servers["mail"].model_copy(update={"review": {"send_note": pin}}),
+        notes=servers["notes"].model_copy(update={"review": {"search": pin}}),
+    )
+    found = {s.name: s for s in listed_servers(policy, set())}
+    assert (found["mail"].kind, dict(found["mail"].review)) == ("toolkit", {"send_note": pin})
+    assert (found["notes"].kind, dict(found["notes"].review)) == ("remote", {"search": pin})
+    assert dict(found["notes"].declined) == {}
+
+
 def test_rows_without_an_oauth2_credential() -> None:
     """A remote server on a route with another kind of credential, or none, has no credential
     to connect; a server whose route is gone is still listed."""

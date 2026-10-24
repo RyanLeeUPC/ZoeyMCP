@@ -268,12 +268,8 @@ EQUIVALENT: Final[dict[str, str]] = {
         "name, at most 64 characters"
     ),
     "zoeymcp.portal.reviewview.x_rows__mutmut_48": f"single_line: {_TRUTH}",
-    "zoeymcp.portal.reviewview.x_definition_lines__mutmut_7": (
-        "ensure_ascii=True dropped: it is json.dumps' default"
-    ),
-    "zoeymcp.portal.reviewview.x_definition_lines__mutmut_22": (
-        '`or ["XXXX"]` for an empty line: json.dumps with an indent writes no empty line'
-    ),
+    # definition_lines' two moved with it to common.policy.reviewchange (M6 step 8):
+    # test_mutation_gaps_7.py.
     "zoeymcp.portal.reviewview.x_diff__mutmut_42": (
         "the target None for compose: compose's indent is already 8, which the plain form takes "
         'as it is, and fragment 2 holds no "$" to double (names, pins and fixed comment texts)'
@@ -731,7 +727,9 @@ def test_a_long_name_and_finding_are_cut_at_their_own_limits() -> None:
     report = _odd(held(large()), name, findings=findings)
     [row] = [r for r in rows(report)["tools"] if r["name_shown"].startswith("bbb")]
     assert row["name_shown"] == "b" * 128 + "…[+172]"
-    assert row["findings"] == [{"level": "error", "message_shown": message}]
+    assert row["findings"] == [
+        {"level": "error", "pointer_shown": "(definition)", "message_shown": message}
+    ]
 
 
 def test_long_instructions_are_shown_whole() -> None:

@@ -46,6 +46,7 @@ from .mcp_server import (
     INVALID_NAME,
     LARGE_INVALID,
     LARGE_WARNED,
+    MARKUP,
     MIB,
     MODERN_VERSION,
     OFFERED,
@@ -948,6 +949,19 @@ async def test_injected_definitions() -> None:
     assert BIDI_OVERRIDE in properties["path"]["description"]
     enum = properties[f"mode{TAG_TEXT}"]["enum"]
     assert enum == ["short", f"long{ZERO_WIDTH}", f"{ANSI}all", f"{C1_CSI}x"]
+
+
+def test_markup_echo_is_on_both_sides_of_a_drift() -> None:
+    """Manual check 19: echo's description carries markup a pin can hold (ASCII, nothing
+    hidden), before a change and after it."""
+    fake = McpFake(switches={Switch.MARKUP_ECHO})
+    before = next(tool for tool in fake.tools_for(None, 1) if tool["name"] == "echo")
+    fake.change_tool()
+    after = next(tool for tool in fake.tools_for(None, 2) if tool["name"] == "echo")
+    assert before["description"] == f"Returns the text it is given. {MARKUP}"
+    assert after["description"] == f"Returns the text it is given, and keeps a copy. {MARKUP}"
+    assert MARKUP.isascii()
+    assert MARKUP.isprintable()
 
 
 async def test_an_invalid_tool_name() -> None:
@@ -1890,16 +1904,19 @@ async def test_large_lists_96_tools_for_review() -> None:
 def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> None:
     plain = run_mcp_server.fake_for(run_mcp_server.parse(["cert.pem", "key.pem"]))
     assert (plain.mode, plain.switches, plain.key, plain.prm) == ("dual", set(), None, "none")
+    assert plain.tool_change is None
     metadata = tmp_path / "as.json"
     metadata.write_bytes(b'{"issuer": "https://mcp.example/mcp"}\n')
     argv = ["cert.pem", "key.pem", "--mode", "legacy", "--static-key", "fake-key-1"]
     argv += ["--prm", "root", "--authorization-server", ISSUER, "--scope", "notes.read"]
     argv += ["--as-metadata", str(metadata), "--switch", "large", "--switch", "two_bearer"]
+    argv += ["--drift", "annotations"]
     args = run_mcp_server.parse(argv)
     fake = run_mcp_server.fake_for(args)
     assert (args.cert, args.key, args.port) == ("cert.pem", "key.pem", 9000)
     assert (fake.mode, fake.key, fake.prm) == ("legacy", "fake-key-1", "root")
     assert (fake.authorization_servers, fake.scopes) == ([ISSUER], ("notes.read",))
     assert fake.switches == {Switch.LARGE, Switch.TWO_BEARER}
+    assert fake.tool_change == "annotations"  # listed changed from the start (manual check 19)
     assert fake.as_metadata is not None
     assert fake.as_metadata() == {"issuer": "https://mcp.example/mcp"}

@@ -50,7 +50,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal, cast, get_args
 
-from .review import (
+from ..common.policy.reviewchange import (
     MATCHING_STATES,
     PIN,
     TOOL_NAME,
@@ -62,8 +62,8 @@ from .review import (
     pinnable,
     suggested,
     suggested_words,
-    untrusted,
 )
+from .review import untrusted
 
 Word = Literal["skip", "allow", "approve", "decline"]
 Reason = Literal["choices_invalid", "choices_stale"]

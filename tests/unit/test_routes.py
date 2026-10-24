@@ -97,7 +97,8 @@ K2 = (
     Route("GET", "/api/onboard/{onboarding}", FULL),
     Route("POST", "/api/onboard/{onboarding}/fragment", FULL, 64, optional=frozenset({"indent"})),
     Route("DELETE", "/api/onboard/{onboarding}", FULL),
-    Route("POST", "/api/review/{server}", FULL, 64),
+    # M6 step 8 (M.2, J.2): a fresh review, and fragment 2's re-pins and declines.
+    Route("POST", "/api/review/{server}", FULL, 64, optional=frozenset({"fresh"})),
     Route("GET", "/api/review/jobs/{job}", FULL),
     Route(
         "POST",
@@ -105,7 +106,7 @@ K2 = (
         FULL,
         512 * KIB,
         frozenset({"include", "allow", "approve"}),
-        frozenset({"indent"}),
+        frozenset({"indent", "repin", "decline", "decline_rest"}),
     ),
 )
 # M6 M.2's rows, as each step builds them: step 7's attention list.

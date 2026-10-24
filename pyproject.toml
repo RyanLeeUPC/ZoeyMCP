@@ -170,6 +170,7 @@ only_mutate = [
     "*zoeymcp/common/policy/emit.py",
     "*zoeymcp/common/policy/merge.py",
     "*zoeymcp/common/policy/attention.py",
+    "*zoeymcp/common/policy/reviewchange.py",
     "*zoeymcp/gateway/pins.py",
     "*zoeymcp/gateway/findings.py",
     "*zoeymcp/gateway/schemas.py",
@@ -197,12 +198,13 @@ only_mutate = [
     "*zoeymcp/bridge/childenv.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/unit"]
-# The hygiene, import-guard and mutation-script tests check the repository itself (the lock, the
-# smoke script, scripts/), which mutmut only partly copies.
+# The hygiene, import-guard, mutation-script and Windows-list tests check the repository itself
+# (the lock, the smoke script, scripts/, the workflows), which mutmut only partly copies.
 pytest_add_cli_args = [
     "--ignore=tests/unit/test_source_hygiene.py",
     "--ignore=tests/unit/test_import_guards.py",
     "--ignore=tests/unit/test_mutation_scripts.py",
+    "--ignore=tests/unit/test_portal_windows_list.py",
 ]
 # docs: test_refusal_doc.py checks operations.md's table against the refusal catalogue.
 also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", "tests"]
@@ -258,6 +260,7 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.common.policy.check" = 95
 "zoeymcp.common.policy.view" = 95
 "zoeymcp.common.policy.attention" = 95
+"zoeymcp.vault.statusreport" = 95
 "zoeymcp.vault.request" = 95
 "zoeymcp.vault.store" = 95
 "zoeymcp.vault.oauth.pkce" = 95

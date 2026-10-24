@@ -1,9 +1,10 @@
 // The MCP servers section (M7 design K.1, K.4, K.5). Like app.js it holds no decision: the vault
 // decides every row's state, words every plan line, refusal and next step, and builds both
 // fragments, each string shown through textContent. It lists the servers, adds one by URL and runs
-// the review screen (the vault's rows filtered in memory), through app.js's API, step-up, Connect
-// and guard() (window.zoeyPortal). A client secret typed here is write-only, as the Secrets page's
-// is: sent once, in onboard.register's prepare, its field emptied as soon as that request is made.
+// the review screen (the vault's rows filtered in memory; drift.js's parts through its hooks),
+// through app.js's API, step-up, Connect and guard() (window.zoeyPortal). A client secret typed
+// here is write-only, as the Secrets page's is: sent once, in onboard.register's prepare, its
+// field emptied as soon as that request is made.
 "use strict";
 
 (function () {
@@ -24,7 +25,6 @@
   // its files, which only the host knows (ZOEYMCP_COMPOSE_CMD): put yours in front.
   const VIA = {
     exec: "in the vault's container: docker compose exec",
-    exec_gateway: "in the gateway's container: docker compose exec",
     run: "in a one-off vault container: docker compose run --rm --no-deps",
     run_mount: "in a one-off vault container with this directory at /w: docker compose run " +
       "--rm --no-deps -v \"$PWD:/w:ro\"",
@@ -50,9 +50,6 @@
       "authorization code alone is assumed, and sign-in refuses an answer with no refresh token.",
   };
   const FIRST = "Fragment 1 of 2";
-  // The vault's reason for a tool the server doesn't annotate (portal/reviewview.py's
-  // WHY_UNANNOTATED, kept equal by test_portal_static.py): the "not annotated" chip's tools.
-  const UNANNOTATED = "the server doesn't annotate it";
 
   let rows = []; // the rows last read
   let shownBoarding = null; // the onboarding the plan shows, for its Cancel
@@ -113,7 +110,7 @@
       show_fragment: context.boarding && (() => makeFragment(context.boarding, 0)),
       allow_hosts: context.boarding && context.row && (() => openOnboarding(context.boarding)),
       connect: context.credential && context.server && (() => connectFor(context)),
-      review: context.server && (() => queueReview(context.server)),
+      review: context.server && (() => queueReview(context.server, true)), // fresh (M6 J.2)
       choose: context.server && (() => queueReview(context.server)),
     };
     return runs[step.do] || null;
@@ -199,6 +196,7 @@
       }
       list.append(item);
     }
+    await window.zoeyDrift.servers(list, rows); // what the gateway reports of each server
     if (rows.length === 0) {
       list.append(make("li", "The policy has no remote or toolkit server yet."));
     }
@@ -433,15 +431,15 @@
 
   // --- the review (K.1 item 4, F.6) ----------------------------------------------------------
 
-  // Queue a review for the gateway's poll (F.2), then ask how it stands until it is done.
-  async function queueReview(server) {
+  // Queue a review for the gateway's poll (F.2), or a fresh one (M6 J.2), then poll until done.
+  async function queueReview(server, fresh) {
     if ($("servers").hidden) {
       await visit("servers", listServers);
     }
     clearRefusal();
     let job;
     try {
-      job = await api("POST", fill("/api/review/{server}", { server: server }), {});
+      job = await api("POST", fill("/api/review/{server}", { server: server }), { fresh: !!fresh });
     } catch (error) {
       return refused(error, { server: server });
     }
@@ -500,14 +498,15 @@
     $("review-counts").textContent = countText(answer.counts);
     held.entries = answer.tools.map(toolEntry);
     $("review-tools").replaceChildren(...held.entries.map((entry) => entry.item));
+    window.zoeyDrift.footer(held, answer, queueReview); // Review again, under the tools
     $("review-body").hidden = false;
     filter();
     tally();
   }
 
-  // One tool (K.1): its include box, or why it can't be included; its classification, at the
-  // server's suggestion once included and labelled as the server's (E-9); its badges, its
-  // findings, and its definition on request.
+  // One tool (K.1): its include box, or why it can't be included; its classification, at its
+  // row's prefill (M6 J.3) beside the server's suggestion, labelled as the server's (E-9); its
+  // badges, its findings, its definition on request, and drift.js's columns and controls.
   function toolEntry(tool) {
     const item = make("li");
     const entry = { tool: tool, item: item, box: null, choice: null };
@@ -533,7 +532,7 @@
         option.disabled = kind === "allow" && tool.consequential === true;
         entry.choice.append(option);
       }
-      entry.choice.value = tool.classification || tool.suggested;
+      entry.choice.value = tool.prefill;
       entry.choice.hidden = !tool.included;
       item.append(entry.choice, make("span", " suggested by the server: " + tool.suggested +
         " (" + tool.suggested_why + ")"));
@@ -542,9 +541,8 @@
       item.append(make("p", tool.description_shown, "description"));
     }
     const findings = make("ul");
-    for (const finding of tool.findings) {
-      findings.append(make("li", finding.level + ": " + finding.message_shown));
-    }
+    tool.findings.forEach((finding) => findings.append(make("li", finding.level + " at " +
+      finding.pointer_shown + ": " + finding.message_shown)));
     item.append(findings);
     if (tool.definition_lines.length) {
       const definition = make("pre", "", "definition");
@@ -558,6 +556,7 @@
       });
       item.append(toggle, definition);
     }
+    window.zoeyDrift.row(entry); // a drifted tool's two columns, re-pin and decline (M6 J.2)
     return entry;
   }
 
@@ -574,8 +573,8 @@
   function filter() {
     const text = $("review-filter").value.trim().toLowerCase();
     const chips = [
-      [$("review-chip-read-only").checked, (tool) => tool.suggested === "allow"],
-      [$("review-chip-unannotated").checked, (tool) => tool.suggested_why === UNANNOTATED],
+      [$("review-chip-read-only").checked, (tool) => tool.read_only_hint],
+      [$("review-chip-unannotated").checked, (tool) => !tool.annotated],
       [$("review-chip-findings").checked,
         (tool) => tool.findings.some((found) => found.level === "warning")],
     ].filter((chip) => chip[0]);
@@ -588,7 +587,7 @@
   }
 
   function chosen() {
-    const lists = { include: [], allow: [], approve: [] };
+    const lists = window.zoeyDrift.lists(reviewing); // with its re-pins and declines
     for (const entry of reviewing === null ? [] : reviewing.entries) {
       if (entry.box !== null && entry.box.checked) {
         lists.include.push(entry.tool.name);
@@ -609,26 +608,26 @@
     $("review-generate").disabled = lists.allow.length + lists.approve.length < count;
   }
 
-  // An include box ticked starts at the server's suggestion, or the policy's classification.
+  // An include box ticked starts at its row's prefill: the policy's classification (M6 J.3).
   function changed(event) {
     const entry = reviewing === null ? undefined :
       reviewing.entries.find((each) => each.box === event.target);
     if (entry !== undefined) {
       entry.choice.hidden = !entry.box.checked;
-      entry.choice.value = entry.tool.classification || entry.tool.suggested;
+      entry.choice.value = entry.tool.prefill;
     }
     tally();
   }
 
-  // Select suggested includes every pinnable tool the shared rule suggests allow: the server
-  // marks it read-only and not destructive (CR-3). It is the only bulk allow (C26).
+  // Select suggested includes every pinnable tool the shared rule suggests allow (CR-3), each at
+  // its row's prefill, so it never moves a tool to allow (M6 J.3, Q27). The only bulk allow.
   function selectSuggested() {
     for (const entry of reviewing === null ? [] : reviewing.entries) {
       if (entry.box !== null && entry.tool.pinnable && entry.tool.suggested === "allow" &&
         !entry.box.checked) {
         entry.box.checked = true;
         entry.choice.hidden = false;
-        entry.choice.value = "allow";
+        entry.choice.value = entry.tool.prefill;
       }
     }
     tally();
@@ -652,7 +651,8 @@
     let answer;
     try {
       answer = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
-        include: lists.include, allow: lists.allow, approve: lists.approve, indent: indent
+        include: lists.include, allow: lists.allow, approve: lists.approve, indent: indent,
+        repin: lists.repin, decline: lists.decline, decline_rest: lists.decline_rest
       });
     } catch (error) {
       return refused(error, { server: held.server });

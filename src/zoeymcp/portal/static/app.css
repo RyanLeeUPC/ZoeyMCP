@@ -170,3 +170,20 @@ input[type="checkbox"] {
   padding-left: 1ch;
   border-left: 0.25rem solid GrayText;
 }
+
+/* A drifted tool (M6 J.2): the reviewed and the listed definition side by side, the vault's
+   diff under both. */
+.drift {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 1rem;
+}
+
+.drift > * {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.drift .diff {
+  grid-column: 1 / -1;
+}

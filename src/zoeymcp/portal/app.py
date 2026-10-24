@@ -1880,11 +1880,15 @@ class PortalApp:
 
     async def _review_queue(self, call: Call) -> Reply | Refusal:
         """K.1 item 4: queue a review of a served server for the gateway's poll (F.2), or hand
-        back the portal's done one at the current view digest (OPS-11). It holds a job in memory
-        and changes nothing."""
+        back the portal's done one at the current view digest (OPS-11) unless the body says
+        ``{"fresh": true}`` (**Review again**, M6 design J.2: a drift happens with no view
+        change). It holds a job in memory and changes nothing."""
         server = call.params["server"]
+        fresh = _body(call).get("fresh", False)
+        if not isinstance(fresh, bool):
+            return refusal("bad_body")
         try:
-            job = await self._review_jobs().queue_review(server, REVIEW_OWNER)
+            job = await self._review_jobs().queue_review(server, REVIEW_OWNER, fresh=fresh)
         except ReviewRefused as exc:
             return refusal(exc.reason, **exc.fields)
         return Reply({**_job_view(job), "reused": job.state == "done"})

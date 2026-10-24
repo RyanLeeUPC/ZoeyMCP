@@ -285,6 +285,37 @@ view.
     server's row. Pass: as item 13's first part (the provider sends the tab back to the portal,
     which asks for the passkey), and once connected the page queues the server's review by itself
     (without a gateway polling the vault, the vault answers that request `review_unavailable`).
+19. **The drift review, under Trusted Types** (the review screen's drift rows, M6). Item 16's
+    setup, the fake started as `python -m tests.fakes.run_mcp_server CERT KEY --switch large
+    --switch markup_echo`, so `echo`'s description ends in markup a pin can hold (`<img src=x
+    onerror=alert(1)> & "quoted"`). Review the server and include `echo` as allow and `add`,
+    `slow` and `read_01` as approve; commit fragment 2 and reload. Restart the fake with
+    `--switch large --switch markup_echo --switch inject_definitions --drift description`:
+    `echo`'s description changes with the markup still at its end, so it drifts, and `summarize`
+    comes with item 16's hostile text. In Chrome or Edge with the Console and Network panels
+    open, choose **Review again** on the server's row, under what the gateway reports. Pass:
+    - no Trusted Types or Content Security Policy violation in the console, no alert, and no
+      request for `x`;
+    - `echo` reads `drift`, with **Reviewed** and **Now** side by side, each the whole definition
+      in marked chunks with nothing cut and the markup shown as text in both, and the vault's
+      diff under them, its `-` and `+` description lines each showing the markup as text;
+      `summarize`'s text shows as item 16 says; a finding reads "warning at /pointer: ...", or
+      "(definition)" for the whole definition;
+    - restarted with `--drift annotations` in place of `--drift description`, **Review again**:
+      `echo` now says it is destructive and not read-only (the markup as text in both columns
+      again), and **Accept the new definition** on it says approve is proposed and sets its row to
+      approve (unticking it puts allow back); **Generate** with allow chosen again gives the new pin under `review:`, `# changed: echo (was sha256:...)` and
+      `# kept: echo (allow: ...)`, and with approve left as accepted, `echo` under `approve:`;
+    - after a restart of the gateway (it keeps reviewed copies in memory) and **Review again**,
+      `echo`'s row says the gateway no longer has the reviewed copy and shows the new definition
+      whole;
+    - **Clear** then **Select suggested**: `read_01` comes back ticked at approve, its
+      classification, the other read-only tools at allow, and **Generate** puts no tool the
+      policy has in `approve:` under `allow:`;
+    - with **Record the rest as declined** ticked, **Generate** writes every listed tool left out
+      under `declined:` at its pin (not `summarize`, which has an error finding); unticked,
+      **Decline** on one tool writes that one alone; and after another fragment for the server is
+      committed and reloaded, **Generate** on the old review is refused `review_stale`.
 
 ## D-66: the live OAuth test against a real provider
 

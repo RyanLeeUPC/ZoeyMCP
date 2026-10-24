@@ -2669,7 +2669,6 @@ def onboard_admin(admin: FakeAdmin, monkeypatch: pytest.MonkeyPatch) -> FakeAdmi
     """The admin socket answering one public client's onboarding, with no compose variables."""
     for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv(onboard_cli.REVIEW_SERVICE_ENV, raising=False)
     admin.answers[("POST", "/onboard/discover")] = (200, discovered())
     admin.answers[("POST", "/onboard/ob-0001/fragment")] = (200, made())
     admin.answers[("DELETE", "/onboard/ob-0001")] = (204, {})
@@ -2736,10 +2735,9 @@ def test_the_prefix_comes_from_the_compose_variables(
 
 
 def test_each_way_a_command_runs() -> None:
-    prefix = onboard_cli.Prefix("dc", "my vault", "gw")
+    prefix = onboard_cli.Prefix("dc", "my vault")
     assert prefix.line("zoeymcp x", "exec") == "dc exec 'my vault' zoeymcp x"
     assert prefix.line("zoeymcp x", "exec", piped=True) == "dc exec -T 'my vault' zoeymcp x"
-    assert prefix.line("zoeymcp review s", "exec_gateway") == "dc exec gw zoeymcp review s"
     assert prefix.line("check", "run") == "dc run --rm --no-deps 'my vault' check"
     assert prefix.line("check", "run_mount") == (
         "dc run --rm --no-deps -v \"$PWD:/w:ro\" 'my vault' check"
@@ -2747,7 +2745,7 @@ def test_each_way_a_command_runs() -> None:
     assert prefix.line("", "up") == "dc up -d 'my vault'"
     assert prefix.line("zoeymcp check --config p.yaml", None) == "zoeymcp check --config p.yaml"
     assert onboard_cli.Prefix.from_environ({}) == onboard_cli.Prefix(
-        "docker compose -f deploy/compose.hardened.yaml", "vault", "gateway"
+        "docker compose -f deploy/compose.hardened.yaml", "vault"
     )
 
 
@@ -3388,11 +3386,7 @@ class Browser(io.StringIO):
 
 @pytest.fixture
 def vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Vault]:
-    for name in (
-        onboard_cli.COMPOSE_CMD_ENV,
-        onboard_cli.EXEC_SERVICE_ENV,
-        onboard_cli.REVIEW_SERVICE_ENV,
-    ):
+    for name in (onboard_cli.COMPOSE_CMD_ENV, onboard_cli.EXEC_SERVICE_ENV):
         monkeypatch.delenv(name, raising=False)
     with start_blocking_portal() as portal:
         rig = Vault(tmp_path, portal)
