@@ -4,7 +4,9 @@ Startup refuses to run with a missing or malformed master key, a policy that fai
 store written under an unknown key, a gateway key state that fails its MAC or would go backwards,
 or a state directory another vault is using. ``SIGHUP`` reloads the policy; a policy that fails
 validation, or whose gateway key generation went backwards or can't be written, is rejected and
-the running one stays.
+the running one stays. Both read the policy through the one gate (``common/policy/gate.py``,
+M6 design C), and a reload names what needs a restart from the restart classifier
+(``common/policy/restart.py``, I.2).
 
 In the standard tier (M3 design B.2, C.1) the vault also listens on the link socket, where only
 the gateway's uid may connect, and may have no TCP listener at all (``--listen none``). The
@@ -49,7 +51,7 @@ from ..common.control import CONTROL_LINE_LIMIT as CONTROL_LINE_LIMIT
 from ..common.control import CONTROL_RELOAD as CONTROL_RELOAD
 from ..common.control import CONTROL_STOP as CONTROL_STOP
 from ..common.control import open_control as open_control
-from ..common.policy import Policy, PolicyError, check_policy, parse_policy, read_source
+from ..common.policy import Policy, PolicyError, gate, read_source, restart
 from ..entrypoint.env import holds_secret_env
 from ..portal import listen as portal_listen
 from ..portal.app import Ledger, PortalApp, Secrets, StaticMissing, load_static
@@ -251,16 +253,17 @@ def load_keys(environ: Mapping[str, str]) -> tuple[KeySet, KeySet | None]:
 
 
 def load_policy(config: str | None, environ: Mapping[str, str]) -> Policy:
+    """The declarative start's policy, through the gate (M6 design C.2). A source that can't be
+    read, or none given, is refused with the gate's text but isn't the gate's refusal: F.1 keeps
+    ``none`` apart from ``unreadable``."""
     try:
         text, source = read_source(config, environ)
-        policy = parse_policy(text, source)
     except PolicyError as exc:
-        details = "; ".join(f"{f.path}: {f.message}" for f in exc.findings[:5])
-        raise StartupError(f"policy {exc.source} refused: {details}") from exc
-    errors = [f for f in check_policy(policy, environ=environ) if f.level == "error"]
-    if errors:
-        details = "; ".join(f"{f.path}: {f.message}" for f in errors[:5])
-        raise StartupError(f"policy {source} fails check ({len(errors)} error(s)): {details}")
+        raise StartupError(gate.refused_text(exc.source, exc.findings)) from exc
+    try:
+        policy = gate.admit_text(text, source, environ=environ).policy
+    except gate.GateRefused as exc:
+        raise StartupError(str(exc)) from exc
     if policy.mode == "managed":
         raise StartupError("managed mode arrives in M6; use mode: declarative for now")
     return policy
@@ -677,26 +680,35 @@ def reload_policy(
             "running policy's: that would revive a retired key",
         )
         return
-    # Against the startup values, which every client, connector and onboarding keeps (M7 design
-    # B.2, D-61): the proxy, and whether it is the egress role.
-    egress_changed = (policy.egress_proxy, policy.egress_proxy_kind) != (
-        app.egress_proxy,
-        app.egress_proxy_kind,
-    )
-    # Where the portal listens: its listener's address, else the running policy's (none).
+    # The changes a reload can't apply, from the restart classifier (M6 design I.2), against the
+    # startup values, which every client, connector and onboarding keeps (M7 design B.2, D-61):
+    # the proxy, and whether it is the egress role. Where the portal listens: its listener's
+    # address, else the running policy's (none). A reload logs only the vault's own two lines,
+    # so the bridges, which only a managed plan names, aren't passed.
     before = app.policy.admin
-    listening = portal.address.listen if portal is not None else before and before.listen
+    if portal is not None:
+        listening: str | None = portal.address.listen
+    else:
+        listening = None if before is None else before.listen
+    started = restart.Started(
+        egress_proxy=app.egress_proxy,
+        egress_proxy_kind=app.egress_proxy_kind,
+        admin_listen=listening,
+        bridges=frozenset(),
+    )
+    effects = restart.classify(app.policy, policy, started)
+    needs = {effect.path for effect in effects if effect.kind == "vault_restart"}
     try:
         # The gateway key generation moves first, and is written before the policy is used.
         reset = app.reload(policy)
     except GatewayKeyError as exc:
         logs.event("reload_refused", reason=str(exc))
         return
-    if egress_changed:
+    if needs & {"egress_proxy", "egress_proxy_kind"}:
         # The HTTP clients were built with the startup proxy, and SMTP sends keep it too;
         # onboarding keeps the startup kind.
         logs.event("egress_proxy_change_needs_restart")
-    if listening != (policy.admin and policy.admin.listen):
+    if "admin.listen" in needs:
         logs.event("admin_listen_change_needs_restart")
     if portal is not None and policy.admin is not None:
         portal.app.reload(policy.admin.origins)

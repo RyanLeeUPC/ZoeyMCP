@@ -1437,8 +1437,11 @@ Under `gateway.limits`, all with defaults: request bodies (1 MiB), arguments (25
 (16) per client, upstream sessions (64), idle timeouts (1800 s for agents' sessions, 600 s
 upstream), the call and listing deadlines (300 s, 30 s), listing pages (32), tools (512) and
 bytes (4 MiB), schema size (64 KiB), depth (32) and subschemas (512), and `policy_max_stale`
-(300 s). A server's `call_timeout` overrides the call deadline. Changing the body limit or the
-session idle timeout takes a gateway restart (`limits_change_needs_restart`).
+(300 s). A server's `call_timeout` overrides the call deadline. The body limit and the session
+idle timeout are the two the gateway's session manager keeps from its start: a lower value
+applies at once, since the gateway's own checks follow every policy, but a higher one takes a
+gateway restart. The gateway logs `limits_change_needs_restart` when either differs from the
+value it started with.
 
 ## 17. What the gateway can't do
 
@@ -2350,8 +2353,15 @@ routes:
 - **Changing it needs a restart.** `egress_proxy` and `egress_proxy_kind` are read when the vault
   starts, and every vault connection (routes, token requests, onboarding and SMTP sends) keeps
   that proxy. A reload whose `egress_proxy` or `egress_proxy_kind` differs from the one the vault
-  started with logs `egress_proxy_change_needs_restart`, again on every reload until the restart:
-  recreate the vault right after changing it (§7).
+  started with logs `egress_proxy_change_needs_restart`, again on every reload until the restart,
+  and only once the reload takes effect (a refused reload logs none): recreate the vault right
+  after changing it (§7).
+- **A policy change can outdate the allowlist.** A route upstream, token or revocation endpoint,
+  connector or `egress_private` entry added, changed or removed changes the vault's list; a route
+  program's `egress` or `egress_private` changes that program's list; and `egress_proxy_acls`
+  changes the Squid form's names. The vault can't tell your proxy: after such a change, run
+  `--check` (below) and regenerate the file if it differs. The egress role
+  (`egress_proxy_kind: role`) takes its lists from the vault, so it needs none of this.
 
 **Emitting the allowlist.** Run the image, which reads the service's own inline policy (add
 `--config FILE` for a policy file). The policy is checked first: its findings go to stderr, the

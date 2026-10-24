@@ -74,6 +74,59 @@ def test_refuses_managed_mode_for_now(tmp_path: Path, example_text: str) -> None
         load_runtime(str(policy_file), tmp_path, env())
 
 
+def _refusal(config: str | None, environ: dict[str, str]) -> str:
+    with pytest.raises(StartupError) as refused:
+        server.load_policy(config, environ)
+    return str(refused.value)
+
+
+def _env_credentials(count: int) -> bytes:
+    """A policy with ``count`` header credentials, each read from ``env:K<n>``."""
+    lines = [
+        f'  k{n}: {{kind: header, header: X-Key, format: "{{secret}}", secret: "env:K{n}"}}\n'
+        for n in range(1, count + 1)
+    ]
+    return ("version: 1\nmode: declarative\ncredentials:\n" + "".join(lines)).encode()
+
+
+def test_the_starts_refusals_read_as_before_the_gate(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """M6 step 10 moved the start's parse and check into the gate (M6 design C.2): each refusal
+    reads as it did, byte for byte, the environment still reaches check, and a reload logs the
+    same reason."""
+    missing = tmp_path / "missing.yaml"
+    refused = f"policy {missing} refused: (document): can't read: "
+    assert _refusal(str(missing), env()).startswith(refused)
+    assert _refusal(None, env()) == (
+        "policy (none) refused: (document): no policy given: use --config or set ZOEYMCP_CONFIG"
+    )
+    binary = tmp_path / "binary.yaml"
+    binary.write_bytes(b"version: 1\n\xff\n")
+    assert _refusal(str(binary), env()) == f"policy {binary} refused: (document): not valid UTF-8"
+    tagged = env(ZOEYMCP_CONFIG="version: !!int 1\n")
+    assert _refusal(None, tagged) == (
+        "policy $ZOEYMCP_CONFIG refused: (document): tags are not allowed (line 1)"
+    )
+    invalid = tmp_path / "invalid.yaml"
+    invalid.write_bytes(b"version: 2\nmode: declarative\n")
+    assert _refusal(str(invalid), env()) == f"policy {invalid} refused: version: Input should be 1"
+    unset = tmp_path / "unset.yaml"
+    unset.write_bytes(_env_credentials(6))
+    assert _refusal(str(unset), env()) == f"policy {unset} fails check (6 error(s)): " + "; ".join(
+        f"credentials.k{n}.secret: env var K{n} is not set" for n in range(1, 6)
+    )
+    assert server.load_policy(str(unset), env(**{f"K{n}": "v" for n in range(1, 7)}))
+    app = _app(tmp_path)
+    before = app.policy
+    server.reload_policy(app, str(invalid), env())
+    line = _log_lines(log_buffer)[-1]
+    assert line["event"] == "reload_refused"
+    assert line["reason"] == f"policy {invalid} refused: version: Input should be 1"
+    assert app.policy is before
+    asyncio.run(app.aclose())
+
+
 def test_refuses_a_store_from_another_key(tmp_path: Path) -> None:
     old = generate_master_key()
     store = SecretStore(tmp_path, KeySet.from_text(old))
@@ -470,6 +523,44 @@ def test_the_restart_note_compares_with_the_startup_proxy(
     assert noted == [True, True, False]
     events = [line["event"] for line in _log_lines(log_buffer)]
     assert events.count("egress_proxy_change_needs_restart") == 2
+    asyncio.run(app.aclose())
+
+
+def test_a_reload_logs_only_the_vaults_two_restart_lines(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """The restart classifier (M6 design I.2) gives a declarative reload its two lines, in their
+    order, and no line for the rest of what it names (a raised gateway limit, a raised egress key
+    generation): those are a managed plan's."""
+    app = _app(tmp_path)
+
+    def reload(text: str) -> list[str]:
+        path = tmp_path / "next.yaml"
+        path.write_bytes(text.encode())
+        start = len(_log_lines(log_buffer))
+        server.reload_policy(app, str(path), env())
+        return [line["event"] for line in _log_lines(log_buffer)[start:]]
+
+    both = _with_proxy(example_text, PROXY).replace(
+        "listen: 127.0.0.1:8081", "listen: 127.0.0.1:8082"
+    )
+    assert reload(both) == [
+        "egress_proxy_change_needs_restart",
+        "admin_listen_change_needs_restart",
+        "reload_ok",
+    ]
+    # Without a portal, the listen compared is the running policy's, now 8082.
+    moved = example_text.replace("listen: 127.0.0.1:8081", "listen: 127.0.0.1:8082")
+    rest = moved.replace(
+        "gateway_key_generation: 1",
+        "gateway_key_generation: 1\negress_key_generation: 2",
+    ).replace(
+        "\ngateway:\n",
+        "\ngateway:\n  limits: {max_request_bytes: 2097152, session_idle_timeout: 3600}\n",
+    )
+    assert rest.count("2097152") == 1
+    assert reload(rest) == ["reload_ok"]
+    assert app.policy.egress_key_generation == 2
     asyncio.run(app.aclose())
 
 
