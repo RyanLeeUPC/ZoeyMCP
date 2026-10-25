@@ -175,6 +175,8 @@ class ManagedVault:
     process: Process | None = None
     # With an admin socket (a Unix socket, so not on Windows), which :meth:`cli` reaches.
     admin_socket: bool = False
+    # The CA file its TLS clients trust instead of certifi's (a route to a fake upstream).
+    ca: Path | None = None
 
     @property
     def state(self) -> Path:
@@ -207,7 +209,7 @@ class ManagedVault:
             save(held, **holds)
         argv = ["vault", "--listen", f"127.0.0.1:{self.port}", "--state", str(self.state)]
         argv += ["--admin-socket", str(self.socket) if self.admin_socket else "none"]
-        self.process = start(argv, env=self.environ(), log=self.log, holds=held)
+        self.process = start(argv, env=self.environ(), log=self.log, ca=self.ca, holds=held)
         return self.process
 
     def start(self) -> Process:

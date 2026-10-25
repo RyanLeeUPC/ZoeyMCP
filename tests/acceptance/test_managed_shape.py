@@ -16,7 +16,8 @@ or as ``docker compose exec`` runs them over the vault's admin socket.
   and seeded again, while a real gateway process on its own volume witnessed the newer
   revisions, is flagged (``policy_behind_witness``, ``policy_deployment_changed``) and cleared
   by ``policy acknowledge-restore``, with the vault stopped or, where there is an admin socket,
-  over it (the re-review J11 names comes with step 17's fix commit);
+  over it; a tool re-pinned in the portal since the copy is drifted again on the restored head
+  until the portal's review saves it again (H.5), the gateway listing a real fake upstream;
 - J6-J8 and J10's export (step 14a): an export edited and imported over the socket, the compose
   policy recorded or imported with --from-env, a diff and a rollback, a broken admin rolled
   back, an import with the vault stopped, and a declarative export that starts the vault
@@ -37,9 +38,18 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+import anyio
+import httpx2
 import pytest
 import yaml
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 
+from tests.fakes.authenticator import SoftAuthenticator
+from tests.fakes.browser import Browser, Page
+from tests.fakes.mcp_server import PATH, McpFake, base_tools
+from tests.gateway.rig import pin_of_fake
+from tests.portal.flows import enrol, login, redeem
 from zoeymcp.gateway import witness
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.managed import head_policy
@@ -47,7 +57,10 @@ from zoeymcp.vault.policyseal import unseal_anchor, unseal_head
 from zoeymcp.vault.policystart import Ok
 from zoeymcp.vault.policystore import PolicyStore
 
+from .conftest import serve_tls
 from .procs import ManagedVault, Process, free_port, managed_policy, start, wait_port
+from .test_portal_shapes import setup_code
+from .tls import ProviderCA
 
 HARDENED = "docker compose -f deploy/compose.hardened.yaml"
 OFFLINE = {"by": "host", "via": "offline"}
@@ -507,11 +520,12 @@ def test_offline_import(tmp_path: Path) -> None:
 WITNESS_WAIT = 150.0  # a vault restart, the gateway's backoff, and its status within the minute
 
 
-def gateway_on(made: ManagedVault, state: Path) -> Process:
+def gateway_on(made: ManagedVault, state: Path, port: int | None = None) -> Process:
     """The gateway on the vault's TCP listener with the gateway key, as the hardened tier runs
-    it, on its own volume ``state``: kept when the vault's is restored or wiped."""
+    it, on its own volume ``state``: kept when the vault's is restored or wiped. Its agents'
+    listener is on ``port`` (any free one by default)."""
     state.mkdir(mode=0o700, exist_ok=True)
-    port = free_port()
+    port = port or free_port()
     keys = KeySet.from_text(made.env["ZOEYMCP_MASTER_KEY"])
     argv = [
         "gateway", "--vault", f"http://127.0.0.1:{made.port}", "--listen", f"127.0.0.1:{port}",
@@ -595,77 +609,223 @@ VIA = [pytest.param(False, id="offline"), pytest.param(True, id="socket", marks=
 SOCKET_AUTHOR = {"by": "host", "via": "socket"}
 
 
-@pytest.mark.parametrize("over_socket", VIA)
-def test_restored_volume_is_flagged(tmp_path: Path, over_socket: bool) -> None:
-    """J11's second case, FM-8's witness half, Y24: the whole /state put back from a copy at
-    revision 1 while the gateway, on its own volume, has applied revision 3: the vault starts,
-    the gateway logs the regression and keeps 3, and the vault raises policy_behind_witness from
-    its status report. Acknowledged, revision 4 jumps past the claim: with the vault stopped,
-    the number given with --to; over the socket, the gateway's claim named and the number typed.
-    The finding is not raised again, and the gateway records 4."""
-    made = socket_vault(tmp_path) if over_socket else vault(tmp_path)
-    made.start()
-    gateway_state = tmp_path / "gateway-state"
-    gateway = gateway_on(made, gateway_state)
+# J11's re-review: notes, on a fake upstream through the vault's route, which the gateway lists,
+# and the portal's review Save with a passkey, the only write that re-pins in managed mode (H.5).
+SERVER = "notes"
+AGENT_TOKEN = "managed-client-token-0001"
+DRIFTED = "add"  # the tool the fake changes (its rounding enum, change_tool("enum"))
+
+
+def notes_policy(portal: int, upstream: str, pins: dict[str, str]) -> dict[str, Any]:
+    """The smallest managed policy with a remote server: notes on the fake at ``upstream`` (no
+    credential; the loopback upstream listed in ``egress_private``), every tool in ``pins``
+    included as approve at its pin, and agent1 given it."""
+    tools = sorted(pins)
+    route = {
+        "name": SERVER,
+        "prefix": f"/{SERVER}",
+        "upstream": upstream,
+        "callers": ["gateway"],
+        "stream": True,
+        "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": [PATH]}],
+    }
+    server = {
+        "kind": "remote",
+        "route": SERVER,
+        "path": PATH,
+        "era": "modern",
+        "tools": {"include": tools, "allow": [], "approve": tools},
+        "review": pins,
+    }
+    return managed_policy(
+        portal,
+        egress_private=[upstream.removeprefix("https://")],
+        routes=[route],
+        gateway={
+            "clients": {"agent1": {"token": AGENT_TOKEN, "servers": [SERVER]}},
+            "servers": {SERVER: server},
+        },
+    )
+
+
+def served(port: int) -> list[str] | None:
+    """The tools the gateway on ``port`` serves agent1 from notes, as an agent lists them; None
+    while it can't answer (the vault restarting, the gateway's backoff)."""
+
+    async def listing() -> list[str]:
+        headers = {"authorization": f"Bearer {AGENT_TOKEN}"}
+        async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0)) as http:
+            url = f"http://127.0.0.1:{port}/s/{SERVER}/mcp"
+            async with Client(streamable_http_client(url, http_client=http), cache=None) as agent:
+                return sorted(tool.name for tool in (await agent.list_tools()).tools)
+
     try:
-        assert made.process is not None
-        deployment = deployment_of(made)
-        wait_for(lambda: seen_by(gateway_state) == {deployment: 1}, "revision 1 seen", gateway)
-        made.stop()
-        backup = tmp_path / "state-backup"
-        shutil.copytree(made.state, backup)
-        assert add_client(made, "agent2", "2") == 2
-        assert add_client(made, "agent3", "3") == 3
-        made.start()
-        wait_for(lambda: seen_by(gateway_state) == {deployment: 3}, "revision 3 seen", gateway)
-        made.stop()
-        put_back(made, backup)
-        before = len(made.output())
-        made.start()
-        assert made.process is not None
+        return anyio.run(listing)
+    except Exception:  # the SDK's errors arrive in exception groups
+        return None
 
-        def flagged() -> bool:
-            return bool(events(made.output()[before:], "policy_behind_witness"))
 
-        wait_for(flagged, "policy_behind_witness", gateway, made.process)
-        [line] = events(made.output()[before:], "policy_behind_witness")
-        assert (line["level"], line["head"], line["witness"]) == ("critical", 1, 3)
-        regressed = events(gateway.output(), "policy_revision_regressed")
-        assert [(r["seen"], r["now"]) for r in regressed] == [(3, 1)]
-        assert regressed[0]["deployment"] == deployment[:8]
-        assert seen_by(gateway_state) == {deployment: 3}
-        if over_socket:
-            code, _, err = made.cli(["policy", "acknowledge-restore"], "4\n")
-            assert code == 0, err
-            assert err.splitlines()[:2] == [
-                "Revision 1 jumps to 4: one above the gateway's claim of 3; the number comes "
-                "from the gateway.",
-                "Type 4 to write it: Planned on revision 1 (the head):",
-            ]
-            after = len(made.output())
-        else:
+def shown(page: Page) -> tuple[set[str], list[tuple[str, str]]]:
+    """What the portal shows: the codes on health's checklist, and Home's attention items (each
+    its kind and the server its button reviews)."""
+    health = page.fetch("GET", "/api/health")
+    home = page.fetch("GET", "/api/attention")
+    assert (health.status_code, home.status_code) == (200, 200), health.text + home.text
+    codes = {finding["code"] for finding in health.json()["checklist"]}
+    items = [(item["kind"], item["action"]["server"]) for item in home.json()["items"]]
+    return codes, items
+
+
+def review_saved(
+    page: Page, passkey: SoftAuthenticator, tools: list[str], *processes: Process
+) -> tuple[str, dict[str, Any]]:
+    """**Review again** on notes in the portal, which the gateway runs against the upstream; the
+    drifted tool re-pinned and every tool kept approve, saved with the passkey: the kind the
+    draft named and the confirm's answer."""
+    queued = page.fetch("POST", f"/api/review/{SERVER}", json={"fresh": True})
+    assert queued.status_code == 200, queued.text
+    path = f"/api/review/jobs/{queued.json()['job']}"
+    read: dict[str, Any] = {}
+
+    def done() -> bool:
+        answer = page.fetch("GET", path)
+        assert answer.status_code == 200, answer.text
+        read.update(answer.json())
+        return bool(read["state"] == "done")
+
+    wait_for(done, "the review", *processes)
+    assert {row["name"]: row["state"] for row in read["tools"]}[DRIFTED] == "drift"
+    choices = {"include": tools, "allow": [], "approve": tools, "repin": [DRIFTED]}
+    drafted = page.fetch("POST", f"{path}/diff", json={**choices, "decline_rest": False})
+    assert drafted.status_code == 200, drafted.text
+    draft = drafted.json()
+    data = {"draft": draft["draft"], "base": draft["base"]}
+    held = page.fetch("POST", "/api/actions", json={"kind": draft["kind"], "data": data})
+    assert held.status_code == 200, held.text
+    assertion = passkey.get(held.json()["options"], page.origin).body()
+    confirm = f"/api/actions/{held.json()['action']}/confirm"
+    saved = page.fetch("POST", confirm, json={"credential": assertion})
+    assert saved.status_code == 200, saved.text
+    answer: dict[str, Any] = saved.json()
+    return str(draft["kind"]), answer
+
+
+@pytest.mark.parametrize("over_socket", VIA)
+def test_restored_volume_is_flagged(tmp_path: Path, ca: ProviderCA, over_socket: bool) -> None:
+    """J11's second case, FM-8's witness half, Y24, OPS-10: the whole /state put back from a copy
+    at revision 1 while the gateway, on its own volume, has applied revision 3 (an import, then
+    the portal's re-pin of ``add``, which the fake changed): the vault starts, the gateway logs
+    the regression and keeps 3, and the vault raises policy_behind_witness from its status
+    report. The restored head pins ``add`` at its old definition, so the gateway hides it again
+    and Home and health list notes as drifted, until the portal's review saves the re-pin again
+    (revision 2, still behind the witness). Acknowledged, revision 4 jumps past the claim: with
+    the vault stopped, the number given with --to; over the socket, the gateway's claim named
+    and the number typed. The finding is not raised again, the gateway records 4, and ``add`` is
+    served at the pin the review saved."""
+    fake = McpFake(mode="modern")
+    pins = {wire["name"]: pin_of_fake(fake, wire["name"]) for wire in base_tools()}
+    tools = sorted(pins)
+    hidden = [name for name in tools if name != DRIFTED]
+    made = socket_vault(tmp_path) if over_socket else vault(tmp_path)
+    made.ca = ca.ca_file
+    gateway_state = tmp_path / "gateway-state"
+    port = free_port()
+    passkey = SoftAuthenticator()
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser() as browser:
+        made.policy = notes_policy(made.portal, upstream, pins)
+        page = browser.page(f"http://localhost:{made.portal}")
+        running = made.start()
+        gateway = gateway_on(made, gateway_state, port)
+        try:
+            deployment = deployment_of(made)
+            assert redeem(page, setup_code(made.state, made.env)).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            wait_for(lambda: seen_by(gateway_state) == {deployment: 1}, "revision 1 seen", gateway)
             made.stop()
-            state = ["--state", str(made.state)]
-            argv = ["policy", "acknowledge-restore", *state, "--to", "4", "--yes"]
-            code, _, err = made.cli(argv)
-            assert code == 0, err
-            after = len(made.output())
-            made.start()
-        assert "Acknowledged the restore as revision 4." in err
-        wait_for(lambda: seen_by(gateway_state) == {deployment: 4}, "revision 4 seen", gateway)
-        wait_for(
-            lambda: bool(events(made.output()[after:], "status_received")),
-            "a status report after the acknowledgment",
-            gateway,
-        )
-        assert events(made.output()[after:], "policy_behind_witness") == []
-    finally:
-        gateway.stop()
-        made.stop()
+            backup = tmp_path / "state-backup"
+            shutil.copytree(made.state, backup)
+            assert add_client(made, "agent2", "2") == 2
+            running = made.start()
+            assert login(page, passkey).status_code == 200
+            fake.change_tool("enum")
+            repinned = pin_of_fake(fake, DRIFTED)
+            wait_for(lambda: served(port) == hidden, "add hidden", gateway, running)
+            wait_for(lambda: shown(page)[1] == [("drifted", SERVER)], "drift", gateway, running)
+            assert review_saved(page, passkey, tools, gateway, running)[0] == "tool.repin"
+            wait_for(lambda: seen_by(gateway_state) == {deployment: 3}, "revision 3 seen", gateway)
+            wait_for(lambda: served(port) == tools, "add served", gateway, running)
+            made.stop()
+            put_back(made, backup)
+            before = len(made.output())
+            running = made.start()
+
+            def flagged() -> bool:
+                return bool(events(made.output()[before:], "policy_behind_witness"))
+
+            wait_for(flagged, "policy_behind_witness", gateway, running)
+            [line] = events(made.output()[before:], "policy_behind_witness")
+            assert (line["level"], line["head"], line["witness"]) == ("critical", 1, 3)
+            regressed = events(gateway.output(), "policy_revision_regressed")
+            assert [(r["seen"], r["now"]) for r in regressed] == [(3, 1)]
+            assert regressed[0]["deployment"] == deployment[:8]
+            assert seen_by(gateway_state) == {deployment: 3}
+            # The restored head pins add as it was: drifted again, until it is reviewed again.
+            assert login(page, passkey).status_code == 200
+            wait_for(lambda: served(port) == hidden, "add hidden again", gateway, running)
+            wait_for(lambda: shown(page)[1] == [("drifted", SERVER)], "drift", gateway, running)
+            assert {"policy_behind_witness", "drift_marked"} <= shown(page)[0]
+            kind, answer = review_saved(page, passkey, tools, gateway, running)
+            assert (kind, answer["revision"]) == ("tool.repin", 2)
+            wait_for(lambda: served(port) == tools, "add served again", gateway, running)
+            wait_for(lambda: shown(page)[1] == [], "no drift", gateway, running)
+            codes = shown(page)[0]
+            assert "drift_marked" not in codes
+            assert "policy_behind_witness" in codes  # 2 is still behind the witness's 3
+            regressed = events(gateway.output(), "policy_revision_regressed")
+            assert [(r["seen"], r["now"]) for r in regressed] == [(3, 1), (3, 2)]
+            if over_socket:
+                code, _, err = made.cli(["policy", "acknowledge-restore"], "4\n")
+                assert code == 0, err
+                assert err.splitlines()[:2] == [
+                    "Revision 2 jumps to 4: one above the gateway's claim of 3; the number comes "
+                    "from the gateway.",
+                    "Type 4 to write it: Planned on revision 2 (the head):",
+                ]
+                after = len(made.output())
+            else:
+                made.stop()
+                state = ["--state", str(made.state)]
+                argv = ["policy", "acknowledge-restore", *state, "--to", "4", "--yes"]
+                code, _, err = made.cli(argv)
+                assert code == 0, err
+                after = len(made.output())
+                running = made.start()
+                assert login(page, passkey).status_code == 200
+            assert "Acknowledged the restore as revision 4." in err
+            wait_for(lambda: seen_by(gateway_state) == {deployment: 4}, "revision 4 seen", gateway)
+            wait_for(
+                lambda: bool(events(made.output()[after:], "status_received")),
+                "a status report after the acknowledgment",
+                gateway,
+            )
+            assert events(made.output()[after:], "policy_behind_witness") == []
+            wait_for(lambda: served(port) == tools, "add served at 4", gateway, running)
+
+            def quiet() -> bool:
+                codes, items = shown(page)
+                return not items and not {"policy_behind_witness", "drift_marked"} & codes
+
+            wait_for(quiet, "nothing left to review or acknowledge", gateway, running)
+        finally:
+            gateway.stop()
+            made.stop()
     acknowledged = opened(made)
     header = acknowledged.top.header
-    assert (acknowledged.revision, header["origin"], header["jumped_from"]) == (4, "acknowledge", 1)
+    assert (acknowledged.revision, header["origin"], header["jumped_from"]) == (4, "acknowledge", 2)
     assert header["author"] == (SOCKET_AUTHOR if over_socket else OFFLINE)
+    saved = head_policy(acknowledged).gateway
+    assert saved is not None
+    assert saved.servers[SERVER].review[DRIFTED] == repinned != pins[DRIFTED]
 
 
 @pytest.mark.parametrize("over_socket", VIA)
