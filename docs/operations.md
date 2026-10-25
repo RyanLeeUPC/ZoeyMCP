@@ -1824,6 +1824,29 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 | `toolkit unavailable (ref ...)` | the module isn't registered, failed to import, or its slots don't match | `toolkit_unavailable` with `reason` |
 | `toolkit error: vault answered 403 blocked_<reason>` | the toolkit tried something its slots don't allow | `toolkit_vault_blocked` |
 
+**A change while a prompt waits.** A save, an import or a reload can land while a prompt is
+still waiting. What the waiting call gets depends on the change, and on whether the client speaks
+a legacy protocol version (2025-11-25, 2025-06-18: the prompt waits on the call's own stream) or
+the modern one (2026-07-28: the client answers by retrying the call with the prompt's handle):
+
+- **The tool changed upstream, or was re-pinned** (`tool.repin`): nothing is sent, since the call
+  was shown under the old definition. A legacy accept is refused `refused: the tool or policy
+  changed while waiting for approval`. A modern retry meets the change itself: `refused: this
+  approval belongs to a different call` after a re-pin, or `Unknown tool` while the tool is
+  hidden.
+- **The tool moved from `approve` to `allow`** (**Allow without asking**, or a review save that
+  moves it): the prompt is withdrawn, as it is when the tool goes, and nothing is sent for the
+  waiting call, whatever the human answers. A legacy call is answered `refused: the policy
+  changed; call the tool again`. A modern answer comes back as a retry of what is now an `allow`
+  tool, and is refused `refused: approval expired or already used` (a handle is good only for an
+  `approve` tool). The ledger records the prompt as `withdrawn` straight away, so it no longer
+  holds the client's pending slot or the tool's lock, and the agent's next call to the moved tool
+  runs with no prompt.
+- **The tool, the client's assignment or its attendance went:** the prompt is withdrawn either
+  way. A legacy call is answered `refused: the policy changed; call the tool again`. A modern
+  retry is answered `refused: approval expired or already used`, or `Unknown tool` if the tool is
+  no longer listed for the client.
+
 ## 26. The portal
 
 The admin portal is the vault's own web page for what needs a person: the first passkey,

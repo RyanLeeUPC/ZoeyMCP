@@ -568,12 +568,22 @@ class Approvals:
     async def withdraw(self, matches: Callable[[Pending], bool], decision: Decision) -> int:
         """Decide every waiting prompt ``matches`` picks. A legacy handler wakes and records it;
         a modern record has no handler, so it is closed here."""
-        found = self.table.withdraw(matches, decision, self.clock())
+        retrying: set[str] = set()
+
+        def picks(record: Pending) -> bool:
+            # Seen before deciding: deciding clears the handle, so the record can't tell after.
+            if not matches(record):
+                return False
+            if record.handle_sha256 is None:
+                retrying.add(record.ref)
+            return True
+
+        found = self.table.withdraw(picks, decision, self.clock())
         for record in found:
             wait = self._waits.get(record.ref)
             if wait is not None:
                 wait.cancel()
-            elif record.era == "modern" and record.handle_sha256 is None:
+            elif record.era == "modern" and record.ref in retrying:
                 # Mid-retry: its handler sees the decision when it looks.
                 continue
             elif record.era == "modern":
@@ -595,7 +605,8 @@ class Approvals:
         return True
 
     async def withdraw_unallowed(self, gateway: ViewGateway) -> int:
-        """After a policy change: prompts whose tool, assignment or attendance went (M3 D.3)."""
+        """After a policy change: prompts whose tool left ``approve`` (removed, or moved to
+        ``allow``: Q32 (b)), or whose assignment or attendance went (M3 D.3)."""
         return await self.withdraw(lambda p: not _still_allowed(gateway, p.key), "withdrawn")
 
     async def sweep(self) -> None:
@@ -648,7 +659,7 @@ def _still_allowed(gateway: ViewGateway, key: Key) -> bool:
     if client.approvals is None or not client.approvals.attended:
         return False
     tools = getattr(server, "tools", None)
-    return tools is not None and (key.tool in tools.approve or key.tool in tools.allow)
+    return tools is not None and key.tool in tools.approve
 
 
 def _decide(answer: Any, code: ConfirmCode | None) -> Decision:
