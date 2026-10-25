@@ -15,6 +15,15 @@ gateway never sends; design K.4's filter narrows the params first (step 3b). The
 shaped as the gateway's client-facing side is (``test_server_contract.Shaped``), and the stream
 is read raw, since the SDK client also drops on its own side whatever wasn't acknowledged.
 
+Contract 60 (step 19): the SDK client, as the gateway opens it (``input_required_max_rounds=0``,
+``gateway/upstream.py``), raises ``InputRequiredRoundsExceededError`` when ``get_prompt`` or
+``read_resource`` meets an ``InputRequiredResult``, so an upstream that asks for input is refused
+as a tool call that asks is (H13); ``complete()`` sends a modern request with the per-request
+``_meta`` every modern request has, which the egress filter checks; and an upstream's -32021
+(a client capability it needs) surfaces as ``MCPError`` with that code, for both eras, so the
+gateway can answer it with its own text (L.6). The upstream is ``tests/fakes/mcp_server.py``'s
+prompts and resources modes.
+
 Contract 61 (step 11a): ``cryptography``'s ``AESGCM``, which encrypts the managed policy's
 revision bodies (``vault/policyseal.py``, design D.2), refuses a ciphertext whose associated data or
 nonce changed, so a body moved under another header doesn't decrypt. It takes any nonce from 8 to
@@ -32,9 +41,13 @@ from typing import Any
 
 import anyio
 import httpx
+import httpx2
+import mcp_types
 import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from mcp import Client, InputRequiredRoundsExceededError
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.subscriptions import (
     SUBSCRIPTION_ID_META_KEY,
     PromptsListChanged,
@@ -43,8 +56,12 @@ from mcp.server.subscriptions import (
     ServerEvent,
     ToolsListChanged,
 )
-from mcp.types import Prompt, Resource, ResourceTemplate
+from mcp.shared.exceptions import MCPError
+from mcp.types import Prompt, PromptReference, Resource, ResourceTemplate
 from pydantic import BaseModel
+
+from tests.fakes.harness import serve
+from tests.fakes.mcp_server import ASSISTANT_PROMPT, FIXED, PATH, McpFake, Switch
 
 from .test_server_contract import Shaped, modern_body, modern_headers, modern_post, running
 
@@ -268,6 +285,79 @@ async def test_59_listen_handler_delivers_only_the_kinds_it_acknowledged() -> No
     assert delivered[0]["params"]["uri"] == NOTES
     assert all(frame["params"]["_meta"] == {SUBSCRIPTION_ID_META_KEY: 7} for frame in delivered)
     assert quiet.cancelled_caught
+
+
+# --- 60. prompts and resources, as the gateway's client asks for them ----------------------------
+
+
+@asynccontextmanager
+async def upstream(fake: McpFake, mode: str = "auto") -> AsyncIterator[Client]:
+    """An SDK client opened as the gateway opens one, on the fake with prompts and resources."""
+    fake.prompts = fake.resources = True
+    with serve(fake.app(), lifespan=True) as url:
+        async with httpx2.AsyncClient(timeout=httpx2.Timeout(10.0)) as http:
+            transport = streamable_http_client(url + PATH, http_client=http)
+            client = Client(transport, mode=mode, cache=None, input_required_max_rounds=0)
+            async with client as connected:
+                yield connected
+
+
+async def ask(client: Client, call: str) -> object:
+    """One get, read or completion of the fake's first prompt or its fixed resource."""
+    if call == "get_prompt":
+        return await client.get_prompt(ASSISTANT_PROMPT, {"topic": "notes"})
+    if call == "read_resource":
+        return await client.read_resource(FIXED)
+    return await client.complete(
+        PromptReference(type="ref/prompt", name=ASSISTANT_PROMPT), {"name": "topic", "value": "no"}
+    )
+
+
+@pytest.mark.parametrize("call", ["get_prompt", "read_resource"])
+async def test_60_an_input_required_result_raises_with_no_rounds(call: str) -> None:
+    fake = McpFake(switches={Switch.INPUT_REQUIRED})
+    async with upstream(fake) as client:
+        assert client.protocol_version == "2026-07-28"
+        with anyio.fail_after(DEADLINE), pytest.raises(InputRequiredRoundsExceededError):
+            await ask(client, call)
+    method = "prompts/get" if call == "get_prompt" else "resources/read"
+    # Asked once: no round answered, nothing retried with inputResponses or requestState.
+    [asked] = fake.requests(method)
+    assert not {"inputResponses", "requestState"} & set(asked.params)
+
+
+async def test_60_complete_carries_the_modern_per_request_meta() -> None:
+    fake = McpFake()
+    async with upstream(fake) as client:
+        with anyio.fail_after(DEADLINE):
+            result = await client.complete(
+                PromptReference(type="ref/prompt", name=ASSISTANT_PROMPT),
+                {"name": "topic", "value": "no"},
+                context_arguments={"style": "short"},
+            )
+    assert result.completion.values == ["no-0", "no-1"]
+    [asked] = fake.requests("completion/complete")
+    assert asked.meta_keys == sorted(
+        [
+            mcp_types.PROTOCOL_VERSION_META_KEY,
+            mcp_types.CLIENT_CAPABILITIES_META_KEY,
+            mcp_types.CLIENT_INFO_META_KEY,
+        ]
+    )
+    assert asked.params["_meta"][mcp_types.CLIENT_CAPABILITIES_META_KEY] == {}
+    assert asked.params["context"] == {"arguments": {"style": "short"}}
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+@pytest.mark.parametrize("call", ["get_prompt", "read_resource", "complete"])
+async def test_60_a_missing_client_capability_is_an_mcp_error_with_its_code(
+    mode: str, call: str
+) -> None:
+    fake = McpFake(switches={Switch.MISSING_CAPABILITY})
+    async with upstream(fake, mode) as client:
+        with anyio.fail_after(DEADLINE), pytest.raises(MCPError) as caught:
+            await ask(client, call)
+    assert caught.value.error.code == mcp_types.MISSING_REQUIRED_CLIENT_CAPABILITY == -32021
 
 
 # --- 61. AES-GCM, as the policy store's revision bodies use it ------------------------------------

@@ -9,7 +9,9 @@ The decisions live in pure modules: :mod:`.connstate` says whether a call may go
 :mod:`.pins` evaluates each listing, :mod:`.egressrules` checks every request on the wire. This
 module does the I/O around them:
 
-- **connect** lazily, on the first request that needs the connection, then list and evaluate;
+- **connect** lazily, on the first request that needs the connection, then list and evaluate,
+  every kind the server enables after its tools (M6 design L.4): prompts, resource templates and
+  fixed resources, each walk under its own caps and failing on its own, never the tools;
 - **watch** for drift: ``list_changed`` on a legacy session's stream, a ``subscriptions/listen``
   stream on a modern one, a new session id in any answer, and a timer, since a hostile server
   won't announce its changes. Any change signal makes the connection ``STALE`` at once, and
@@ -27,10 +29,10 @@ from __future__ import annotations
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 import anyio
 import mcp_types
@@ -41,7 +43,7 @@ from mcp.client.subscriptions import ListenNotSupportedError, SubscriptionLost
 from mcp.shared.dispatcher import ProgressFnT
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, Implementation, Tool
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from ..common import canonical
 from ..common.policy.schema import GatewayLimits
@@ -82,6 +84,11 @@ REAP_INTERVAL = 30.0
 PROGRESS_INTERVAL = 0.1  # at most 10 progress notifications a second
 LISTEN_BACKOFF_MAX = 300.0
 REVIEW_KEY = "review"
+# A legacy session's list_changed for a kind beyond tools, by the enable entry that lists it.
+LIST_CHANGED: Final[Mapping[str, str]] = {
+    "notifications/prompts/list_changed": "prompts",
+    "notifications/resources/list_changed": "resources",
+}
 
 Progress = Callable[[float, float | None], Awaitable[None]]
 
@@ -119,8 +126,8 @@ class _ConnectRefused(Exception):
         super().__init__(reason)
 
 
-def listing_bytes(tool: Tool) -> int:
-    """The canonical size of one listed tool, for ``max_list_bytes``."""
+def listing_bytes(tool: BaseModel) -> int:
+    """The canonical size of one listed tool, or prompt or resource, for ``max_list_bytes``."""
     dumped = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
     try:
         return len(canonical.dumps_canonical(dumped))
@@ -152,6 +159,8 @@ class Connection:
         self.client: Client | None = None
         self.era: Era | None = None
         self.tools: list[Tool] = []
+        # The latest listing of each kind beyond tools the server enables (L.4).
+        self.listings: dict[pins.DefinitionKind, pins.KindListing] = {}
         self.instructions: str | None = None
         self.server_info: Implementation | None = None
         self.session_id: str | None = None
@@ -173,6 +182,8 @@ class Connection:
         self._last_listing = -math.inf
         self._ttl_ms: int | None = None
         self._expired = False
+        # The session's scope, whose deadline bounds the connect and its first listing.
+        self._scope: anyio.CancelScope | None = None
 
     # --- state --------------------------------------------------------------------------
 
@@ -258,8 +269,12 @@ class Connection:
                 self._end_session.set()
 
     async def message(self, message: object) -> None:
-        """The SDK's message handler: only ``tools/list_changed`` matters; the rest is dropped."""
-        if getattr(message, "method", None) == "notifications/tools/list_changed":
+        """The SDK's message handler: only ``tools/list_changed`` matters, and the prompts' and
+        resources' when the server enables them; the rest is dropped."""
+        method = getattr(message, "method", None)
+        if method == "notifications/tools/list_changed" or (
+            isinstance(method, str) and LIST_CHANGED.get(method) in self.policy.enable
+        ):
             self.change("list_changed")
 
     # --- the owner task ---------------------------------------------------------------------
@@ -314,12 +329,14 @@ class Connection:
             max_json_bytes=limits.max_upstream_message_bytes,
             on_response=self.noted,
             inner=self.pool.inner_transport(),
+            enabled=frozenset(self.policy.enable),
         )
         url = self.pool.link.base_url + self.policy.vault_path
         # One scope holds the whole session, so every context is left in the task and scope
         # that entered it. Its deadline bounds the connect and first listing (list_timeout), is
         # lifted while the session runs, and bounds the close (CLOSE_GRACE).
         scope = anyio.CancelScope(deadline=anyio.current_time() + limits.list_timeout)
+        self._scope = scope
         listed = False
         try:
             with scope:
@@ -426,6 +443,103 @@ class Connection:
                 raise ListingFailed("cursor_loop")
             seen.add(cursor)
 
+    async def _page(
+        self, client: Client, kind: pins.DefinitionKind, cursor: str | None
+    ) -> tuple[list[BaseModel], str | None]:
+        """One page of a kind beyond tools."""
+        if kind == "prompt":
+            prompts = await client.list_prompts(cursor=cursor)
+            return list(prompts.prompts), prompts.next_cursor
+        if kind == "resource_template":
+            templates = await client.list_resource_templates(cursor=cursor)
+            return list(templates.resource_templates), templates.next_cursor
+        resources = await client.list_resources(cursor=cursor)
+        return list(resources.resources), resources.next_cursor
+
+    async def _walk_kind(self, client: Client, kind: pins.DefinitionKind) -> pins.KindListing:
+        """One kind's listing under ``max_list_pages``, ``max_list_bytes`` and a cap of
+        ``max_tools_per_server``, counted apart from the tools (L.4). Over a cap it fails that
+        kind, except ``resources/list``, which keeps what it listed by then, cut: a review's, so a
+        fixed resource can be included at a pin the review learned (OPS-11), and to serve, so an
+        included URI not seen by then is missing and the ones seen still match their pins. To
+        serve, the ``resources/list`` walk stops once every included fixed URI is listed."""
+        limits = self.pool.limits
+        review = self.key[1] == REVIEW_KEY
+        wanted = (
+            set(self.policy.resources.fixed.include) if kind == "resource" and not review else None
+        )
+        items: list[BaseModel] = []
+        size = 0
+        seen: set[str] = set()
+        cursor: str | None = None
+        pages = 0
+        while not (wanted is not None and not wanted):
+            if pages >= limits.max_list_pages:
+                return self._over(kind, items, "pages")
+            page, cursor = await self._page(client, kind, cursor)
+            pages += 1
+            for item in page:
+                more = listing_bytes(item)
+                if len(items) >= limits.max_tools_per_server:
+                    return self._over(kind, items, "entries")
+                if size + more > limits.max_list_bytes:
+                    return self._over(kind, items, "bytes")
+                items.append(item)
+                size += more
+                if wanted is not None:
+                    wanted.discard(pins.key_of(kind, item))
+                    if not wanted:  # every included fixed URI is listed: enough to serve
+                        break
+            if cursor is None:
+                break
+            if cursor in seen:
+                raise ListingFailed("cursor_loop")
+            seen.add(cursor)
+        return pins.KindListing(items)
+
+    def _over(
+        self, kind: pins.DefinitionKind, items: list[BaseModel], reason: str
+    ) -> pins.KindListing:
+        if kind == "resource":
+            logs.event(
+                "kind_list_cut",
+                server=self.server,
+                key=self.label,
+                definition_kind=kind,
+                reason=reason,
+                listed=len(items),
+            )
+            return pins.KindListing(items, cut=True)
+        raise ListingFailed(reason)
+
+    async def _list_kinds(self, client: Client) -> dict[pins.DefinitionKind, pins.KindListing]:
+        """Every kind beyond tools the server enables, each walk failing on its own (SPEC-7):
+        a failed kind lists nothing, so its included entries are missing, and the tools stand."""
+        listings: dict[pins.DefinitionKind, pins.KindListing] = {}
+        for kind in pins.enabled_kinds(self.policy.enable):
+            scope = self._scope
+            if scope is not None and scope.deadline != math.inf:
+                # The connect's deadline covers its tools; each kind's walk has its own, so a
+                # slow kind fails alone instead of the connect.
+                wanted = anyio.current_time() + self.pool.limits.list_timeout + CLOSE_GRACE
+                scope.deadline = max(scope.deadline, wanted)
+            try:
+                with anyio.fail_after(self.pool.limits.list_timeout):
+                    listings[kind] = await self._walk_kind(client, kind)
+            except (ListingFailed, MCPError, TimeoutError, ValidationError) as exc:
+                reason = exc.reason if isinstance(exc, ListingFailed) else type(exc).__name__
+                if isinstance(exc, TimeoutError):
+                    reason = "timeout"
+                logs.event(
+                    "kind_list_failed",
+                    server=self.server,
+                    key=self.label,
+                    definition_kind=kind,
+                    reason=reason,
+                )
+                listings[kind] = pins.KindListing(failure=reason)
+        return listings
+
     async def _list(self, trigger: str, *, timer: bool) -> None:
         client = self.client
         if client is None:
@@ -451,9 +565,11 @@ class Connection:
             if failed.phase is Phase.FAILED:
                 self._end_session.set()
             return
+        listings = await self._list_kinds(client)
         self.tools = listing.tools
+        self.listings = listings
         self._ttl_ms = listing.ttl_ms
-        evaluation = self.pool.evaluate(self.server, self.policy, listing.tools)
+        evaluation = self.pool.evaluate(self.server, self.policy, listing.tools, listings)
         logs.event(
             "listing",
             server=self.server,
@@ -463,16 +579,24 @@ class Connection:
             tools=len(listing.tools),
             bytes=listing.size,
             result="ok",
+            **{f"{kind}s": len(found.items) for kind, found in listings.items()},
         )
         self._set(on_listed(self.state, evaluation, self.pool.clock()))
 
     def reevaluate(self, policy: ViewRemoteServer) -> None:
-        """A policy change to include, review or on_drift: compare the last listing again."""
+        """A policy change to include, review or on_drift: compare the last listing again. The
+        serving walk of ``resources/list`` stops at the URIs the old policy included, so a newly
+        included one it didn't list wants a listing too, rather than waiting for the timer."""
         self.policy = policy
         if self.state.evaluation is None or self.state.phase is not Phase.READY:
             return
-        evaluation = self.pool.evaluate(self.server, policy, self.tools)
+        evaluation = self.pool.evaluate(self.server, policy, self.tools, self.listings)
         self._set(on_listed(self.state, evaluation, self.state.verified_at or self.pool.clock()))
+        found = self.listings.get("resource")
+        if found is not None:
+            listed = {pins.key_of("resource", item) for item in found.items}
+            if not set(policy.resources.fixed.include) <= listed:
+                self.want_listing("policy")
 
     async def _lister(self) -> None:
         """Runs wanted listings, at most one at a time and :data:`COALESCE` seconds apart."""
@@ -483,9 +607,9 @@ class Connection:
                 await anyio.sleep(wait)
             self._list_wanted = anyio.Event()
             trigger = self._list_trigger
-            # The timer's and a stream open's listings are background re-lists: a failure keeps
-            # a READY connection's grace (on_timer_failed) instead of failing it.
-            await self._list(trigger, timer=trigger in ("timer", "subscribed"))
+            # The timer's, a stream open's and a new include's listings are background re-lists:
+            # a failure keeps a READY connection's grace (on_timer_failed) instead of failing it.
+            await self._list(trigger, timer=trigger in ("timer", "subscribed", "policy"))
 
     def relist_interval(self) -> float:
         interval = float(self.policy.drift_check_interval)
@@ -504,9 +628,14 @@ class Connection:
         if client is None:
             return
         delay = 1.0
+        enabled = self.policy.enable
         while True:
             try:
-                async with client.listen(tools_list_changed=True) as subscription:
+                async with client.listen(
+                    tools_list_changed=True,
+                    prompts_list_changed="prompts" in enabled,
+                    resources_list_changed="resources" in enabled,
+                ) as subscription:
                     delay = 1.0
                     # A change announced before the stream was acknowledged reached no stream:
                     # list once it is open, and on every reopen (D-46). Not change(), which
@@ -840,27 +969,72 @@ class UpstreamPool:
 
     # --- evaluation and reports ----------------------------------------------------------------
 
-    def evaluate(self, server: str, policy: ViewRemoteServer, tools: list[Tool]) -> pins.Evaluation:
-        evaluation = pins.evaluate(tools, policy, self.marks.for_server(server), self.limits)
-        added, removed = self.marks.replace(server, evaluation.marks)
-        for tool, _ in sorted(added):
-            logs.event("drift_marked", server=server, tool=tool)
-        if removed:
-            logs.event(
-                "drift_cleared", server=server, tools=sorted(t for t, _ in removed), by="policy"
-            )
-        for exposed in evaluation.exposed.values():
-            self.defs.put(exposed.pin, exposed.definition)
-        for report in evaluation.reports:
-            if report.kind != "declined":  # the operator's own record: nothing to log
-                self._report(server, report)
+    def evaluate(
+        self,
+        server: str,
+        policy: ViewRemoteServer,
+        tools: list[Tool],
+        listings: Mapping[pins.DefinitionKind, pins.KindListing] | None = None,
+    ) -> pins.Evaluation:
+        """Every kind of one listing (L.4), with each kind's marks updated, its matching
+        definitions kept, and its reports logged."""
+        listings = listings or {}
+        marks = {kind: self.marks.for_server(server, kind) for kind in ("tool", *listings)}
+        evaluation = pins.evaluate_server(tools, listings, policy, marks, self.limits)
+        evaluated: list[tuple[pins.DefinitionKind, pins.Evaluation]] = [("tool", evaluation)]
+        for kind, found in [*evaluated, *evaluation.kinds.items()]:
+            added, removed = self.marks.replace(server, found.marks, kind)
+            for name, _ in sorted(added):
+                # A tool's lines keep their M3 fields; another kind's name its kind too.
+                named = (
+                    {"tool": name} if kind == "tool" else {"definition_kind": kind, "name": name}
+                )
+                logs.event("drift_marked", server=server, **named)
+            if removed:
+                cleared = sorted(name for name, _ in removed)
+                which: dict[str, Any] = (
+                    {"tools": cleared}
+                    if kind == "tool"
+                    else {"definition_kind": kind, "names": cleared}
+                )
+                logs.event("drift_cleared", server=server, **which, by="policy")
+            for exposed in found.exposed.values():
+                self.defs.put(exposed.pin, exposed.definition, kind)
+            for report in found.reports:
+                if report.kind != "declined":  # the operator's own record: nothing to log
+                    self._report(server, report, definition=kind)
         if evaluation.blocked:
             self._report(server, pins.Report("drift", "*", pin="blocked"), kind="server_blocked")
         return evaluation
 
-    def _report(self, server: str, report: pins.Report, kind: str | None = None) -> None:
-        """One log line per (server, tool, kind, observed pin) per process."""
-        event = kind or f"tool_{report.kind}"
+    def _now_listed(
+        self, server: str, kind: pins.DefinitionKind, name: str
+    ) -> Mapping[str, Any] | None:
+        """The projection of ``name`` as a live connection to ``server`` lists it now, if one
+        does: another server's same name is another definition."""
+        for connection in self._connections.values():
+            if connection.server != server:
+                continue
+            found = connection.listings.get(kind)
+            items = connection.tools if kind == "tool" else (found.items if found else ())
+            for item in items:
+                if pins.key_of(kind, item) == name:
+                    try:
+                        return pins.project_kind(kind, item).definition
+                    except pins.ProjectionError:
+                        continue
+        return None
+
+    def _report(
+        self,
+        server: str,
+        report: pins.Report,
+        kind: str | None = None,
+        definition: pins.DefinitionKind = "tool",
+    ) -> None:
+        """One log line per (server, tool, kind, observed pin) per process. Another kind's line
+        is ``<kind>_<report>`` (``prompt_drift``), with its name as ``name`` (L.4)."""
+        event = kind or f"{definition}_{report.kind}"
         key = (server, report.tool, event, report.pin)
         if key in self._reported:
             return
@@ -868,21 +1042,15 @@ class UpstreamPool:
         fields: dict[str, Any] = {"server": server}
         if event == "server_blocked":
             fields["reason"] = "on_drift"
-        else:
+        elif definition == "tool":
             fields["tool"] = report.tool
+        else:
+            fields["name"] = report.tool
         if report.kind == "drift" and event != "server_blocked":
             fields.update(pinned=report.pinned, observed=report.pin)
-            old = self.defs.get(report.pinned) if report.pinned else None
+            old = self.defs.get(report.pinned, definition) if report.pinned else None
             if old is not None:
-                new = next(
-                    (
-                        pins.project_and_pin(tool).definition
-                        for connection in self._connections.values()
-                        for tool in connection.tools
-                        if tool.name == report.tool
-                    ),
-                    None,
-                )
+                new = self._now_listed(server, definition, report.tool)
                 if new is not None:
                     fields["changed"] = changed_members(old, new)
         elif report.kind in ("unreviewed",):
@@ -938,6 +1106,8 @@ def _reopen(old: ViewRemoteServer, new: ViewRemoteServer) -> bool:
         or old.shared_session != new.shared_session
         or old.call_timeout != new.call_timeout
         or old.drift_check_interval != new.drift_check_interval
+        # What is listed, and what the egress filter lets the connection ask for (L.4).
+        or old.enable != new.enable
     )
 
 
@@ -947,4 +1117,6 @@ def _repinned(old: ViewRemoteServer, new: ViewRemoteServer) -> bool:
         or old.review != new.review
         or old.declined != new.declined
         or old.on_drift != new.on_drift
+        or old.prompts != new.prompts
+        or old.resources != new.resources
     )

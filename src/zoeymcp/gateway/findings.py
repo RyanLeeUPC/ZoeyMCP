@@ -1,4 +1,5 @@
-"""Review findings for one tool's definition (M3 design I).
+"""Review findings for one tool's definition (M3 design I), and for a prompt's or a resource's
+(M6 design L.4), which hold no schema.
 
 Errors come from the rules that decide: the text rules (J.3) and schema acceptance (H.1). A tool
 with an error is never exposed, and review prints no pin line for it. Warnings and notes are
@@ -128,6 +129,34 @@ def _text_warnings(pointer: str, text: str) -> list[ReviewFinding]:
     return found
 
 
+def _text_findings(definition: Mapping[str, Any]) -> list[ReviewFinding]:
+    """The warnings about every string in a definition, and its description's length."""
+    found: list[ReviewFinding] = []
+    for path, text, _ in pins.walk_strings(dict(definition)):
+        found.extend(_text_warnings(schemas.json_pointer(path), text))
+    description = definition.get("description")
+    if isinstance(description, str) and len(description) > MAX_DESCRIPTION_CHARS:
+        found.append(
+            ReviewFinding(
+                "warning",
+                "/description",
+                f"the description is {len(description)} characters, over {MAX_DESCRIPTION_CHARS}",
+            )
+        )
+    return found
+
+
+def definition_findings(definition: Mapping[str, Any]) -> list[ReviewFinding]:
+    """Every finding for one projected prompt, resource template or fixed resource, errors
+    first: the text rules' errors and a tool's text warnings."""
+    found = [
+        ReviewFinding("error", problem.pointer, str(problem.violation))
+        for problem in pins.text_problems(definition)
+    ]
+    found.extend(_text_findings(definition))
+    return sorted(found, key=ReviewFinding.sort_key)
+
+
 def tool_findings(definition: Mapping[str, Any], limits: GatewayLimits) -> list[ReviewFinding]:
     """Every finding for one projected tool, errors first."""
     found = [
@@ -171,17 +200,7 @@ def tool_findings(definition: Mapping[str, Any], limits: GatewayLimits) -> list[
                 for pointer, _ in schemas.mcp_headers(schema)
                 if f"{pointer}/{schemas.HEADER_KEY}" not in refused
             )
-    for path, text, _ in pins.walk_strings(dict(definition)):
-        found.extend(_text_warnings(schemas.json_pointer(path), text))
-    description = definition.get("description")
-    if isinstance(description, str) and len(description) > MAX_DESCRIPTION_CHARS:
-        found.append(
-            ReviewFinding(
-                "warning",
-                "/description",
-                f"the description is {len(description)} characters, over {MAX_DESCRIPTION_CHARS}",
-            )
-        )
+    found.extend(_text_findings(definition))
     annotations = definition.get("annotations")
     if isinstance(annotations, Mapping):
         suggestion = _suggested(annotations)

@@ -16,6 +16,13 @@ whose drift marks it ``cleared``, or the included tools that didn't match their 
 (``not_clean``, the gateway's refusal to clear). Each has a default, so a report from an M7
 gateway, which writes none of them, still reads (CR-6).
 
+A remote server that enables prompts or resources (M6 design L.4, L.7) is reported with entries of
+those kinds beside its tools: ``kind`` is ``prompt``, ``resource_template`` or ``resource``, the
+name is the prompt's name, the template or the URI, and each is pinned under its kind's tag. The
+policy block then carries the server's ``prompts`` and ``resources`` blocks, and ``listings`` says
+how each kind's walk went: why it failed, or the finding that a review's ``resources/list`` was
+cut at a cap. Each kind is counted against the caps on its own.
+
 :func:`read` takes one report under the running limits: the model, the caps that follow
 ``gateway.limits`` (GR-30), then the integrity check (fold-in C25, X11), which recomputes every
 reported pin from the definition beside it, and the policy's pin from the reviewed definition,
@@ -44,9 +51,19 @@ from typing import Annotated, Any, Final, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from . import canonical
-from .pinhash import ProjectionError, pin_of
+from .pinhash import KEY_MEMBERS, KINDS, DefinitionKind, ProjectionError, pin_for
+from .policy import fields
 from .policy.findings import format_location
-from .policy.schema import GatewayLimits, ModulePath, Name, Pin, SlotName, ToolName
+from .policy.schema import (
+    GatewayLimits,
+    ModulePath,
+    Name,
+    Pin,
+    PromptsPolicy,
+    ResourcesPolicy,
+    SlotName,
+    ToolName,
+)
 from .policy.view import VaultPath
 
 Reason = Literal["review_invalid", "pin_mismatch", "review_too_large"]
@@ -81,6 +98,14 @@ DIFF_SCALE: Final = 16
 PROTOCOL_VERSIONS: Final = ("2026-07-28", "2025-11-25", "2025-06-18")
 # A tool name (schema.py's ToolName), and the only location key a refusal shows as it is.
 _PLAIN_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+# The kinds beyond tools a remote report may list (L.4), and how the caps' refusals name each.
+ListedKind = Literal["prompt", "resource_template", "resource"]
+_NOUNS: Final[Mapping[DefinitionKind, str]] = {
+    "tool": "",
+    "prompt": " prompts",
+    "resource_template": " resource templates",
+    "resource": " resources",
+}
 _UNPINNABLE: Final = ("invalid", "duplicate")
 _LEVELS: Final = ("error", "warning", "note")
 _LOCATIONS_SHOWN = 5
@@ -121,10 +146,24 @@ class Finding(_Model):
     message: Annotated[str, Field(max_length=MESSAGE_MAX)]
 
 
-class ToolEntry(_Model):
-    """One listed or included tool, as review.py's ``_tool_entry`` writes it."""
+def _is_key(kind: DefinitionKind, name: str) -> bool:
+    """Whether ``name`` is a key an entry of ``kind`` can be pinned under: a tool's or a prompt's
+    name, a template or a fixed URI in the form the policy holds (L.1)."""
+    if kind in ("tool", "prompt"):
+        return _PLAIN_NAME.fullmatch(name) is not None
+    rule = fields.uri_template if kind == "resource_template" else fields.resource_uri
+    try:
+        rule(name)
+    except ValueError:
+        return False
+    return True
 
-    kind: Literal["tool"] = "tool"
+
+class ToolEntry(_Model):
+    """One listed or included tool, as review.py's ``_tool_entry`` writes it, or a prompt or a
+    resource (``kind``, M6 design L.4), which is never classified."""
+
+    kind: DefinitionKind = "tool"
     name: Annotated[str, Field(max_length=LISTED_NAME_MAX)]
     state: State
     included: bool
@@ -142,24 +181,28 @@ class ToolEntry(_Model):
     @model_validator(mode="after")
     def _pinned_definition(self) -> ToolEntry:
         # A pin is only ever reported beside the definition it is checked against.
+        key = KEY_MEMBERS[self.kind]
         if (self.pin is None) != (self.definition is None):
             raise ValueError("a pin and its definition come together")
-        if self.definition is not None and self.definition.get("name") != self.name:
+        if self.definition is not None and self.definition.get(key) != self.name:
             raise ValueError("the definition is another tool's")
         if self.reviewed is not None:
             if self.state != "drift" or self.pinned is None:
                 raise ValueError("a reviewed definition comes with a drift entry's pinned pin")
-            if self.reviewed.get("name") != self.name:
+            if self.reviewed.get(key) != self.name:
                 raise ValueError("the reviewed definition is another tool's")
+        if self.kind != "tool" and self.classification is not None:
+            raise ValueError("only a tool is classified")
         # review.py writes an entry under every name the server lists: one that isn't a tool
         # name can only be the invalid or duplicate tool it reports, with no definition.
         unpinnable = self.definition is None and self.state in _UNPINNABLE
-        if not unpinnable and _PLAIN_NAME.fullmatch(self.name) is None:
+        if not unpinnable and not _is_key(self.kind, self.name):
             raise ValueError("not a tool name")
         return self
 
 
 class ToolkitEntry(ToolEntry):
+    kind: Literal["tool"] = "tool"  # a toolkit lists tools only
     consequential: bool
 
 
@@ -175,6 +218,31 @@ class ReviewedPolicy(_Model):
     # map isn't bounded by the tools; the body cap bounds it.
     review: dict[ToolName, Pin] = {}
     declined: dict[ToolName, Pin] = {}
+    # A remote server's prompts and resources blocks, when it enables the kind (L.4).
+    prompts: PromptsPolicy = PromptsPolicy()
+    resources: ResourcesPolicy = ResourcesPolicy()
+
+
+def _policy_of(policy: ReviewedPolicy, kind: DefinitionKind) -> tuple[list[str], dict[str, str]]:
+    """The ``include`` and ``review`` of ``kind`` in the policy block."""
+    if kind == "tool":
+        return policy.include, policy.review
+    block = (
+        policy.prompts
+        if kind == "prompt"
+        else policy.resources.templates
+        if kind == "resource_template"
+        else policy.resources.fixed
+    )
+    return block.include, block.review
+
+
+class KindListing(_Model):
+    """How one kind's walk went (L.4): why it failed, so every included entry is missing
+    (SPEC-7), or the finding that a review's ``resources/list`` stopped at a cap (OPS-11)."""
+
+    failure: Annotated[str, Field(max_length=MEMBER_MAX)] | None = None
+    findings: Annotated[list[Finding], Field(max_length=FINDINGS_MAX)] = []
 
 
 class Offered(_Model):
@@ -218,8 +286,11 @@ class RemoteReport(_Model):
     instructions: Annotated[str, Field(max_length=INSTRUCTIONS_MAX)] | None
     blocked: bool
     marked: Names
-    tools: Annotated[list[ToolEntry], Field(max_length=2 * NAMES_MAX)]
+    # Tools first, then the other kinds' entries (each kind its listing and its missing).
+    tools: Annotated[list[ToolEntry], Field(max_length=2 * NAMES_MAX * len(KINDS))]
     clean: bool
+    # Each enabled kind beyond tools: how its walk went (L.4). None for a tools-only server.
+    listings: dict[ListedKind, KindListing] | None = None
     offered: Offered | None = None  # none when the gateway didn't see the handshake, or is M7's
     attention: Attention | None = None  # none from an M7 gateway
     # A clear job's outcome (M6 J.4): the marks it cleared, or the tools that don't match.
@@ -289,17 +360,25 @@ def _invalid(locations: Sequence[str]) -> ReportRefused:
 
 
 def _within(report: RemoteReport | ToolkitReport, limits: GatewayLimits) -> list[str]:
-    """Where ``report`` exceeds what ``limits`` allow, or repeats a tool."""
+    """Where ``report`` exceeds what ``limits`` allow, or repeats a tool: each kind on its own."""
     over: list[str] = []
-    missing = sum(entry.state == "missing" for entry in report.tools)
-    if len(report.tools) - missing > limits.max_tools_per_server:
-        over.append("tools (more than gateway.limits.max_tools_per_server listed)")
-    if missing > len(report.policy.include):
-        over.append("tools (more missing than the policy includes)")
-    if len({entry.name for entry in report.tools}) != len(report.tools):
+    for kind in KINDS:
+        entries = [entry for entry in report.tools if entry.kind == kind]
+        missing = sum(entry.state == "missing" for entry in entries)
+        noun = _NOUNS[kind]
+        if len(entries) - missing > limits.max_tools_per_server:
+            over.append(f"tools (more than gateway.limits.max_tools_per_server{noun} listed)")
+        if missing > len(_policy_of(report.policy, kind)[0]):
+            over.append(f"tools (more missing{noun} than the policy includes)")
+    if len({(entry.kind, entry.name) for entry in report.tools}) != len(report.tools):
         over.append("tools (a tool twice)")
+    # review.py writes ``listings`` for exactly the kinds the server enables, so a tools-only (or
+    # an M7) report holds tools alone: an entry of another kind there is refused, not read.
+    listed = set(report.listings or {}) if isinstance(report, RemoteReport) else set()
     most = definition_max(limits)
     for index, entry in enumerate(report.tools):
+        if entry.kind != "tool" and entry.kind not in listed:
+            over.append(f"tools[{index}].kind (the server isn't listed for{_NOUNS[entry.kind]})")
         # The reviewed definition is capped like the listed one.
         for member, definition in (("definition", entry.definition), ("reviewed", entry.reviewed)):
             problem = _oversize(definition, most)
@@ -321,26 +400,29 @@ def _oversize(definition: dict[str, Any] | None, most: int) -> str | None:
     return f"over {most} bytes" if size > most else None
 
 
-def _differs(definition: dict[str, Any] | None, pin: str | None) -> bool:
-    """Whether ``pin`` isn't the pin of ``definition``, when there is one."""
+def _differs(kind: DefinitionKind, definition: dict[str, Any] | None, pin: str | None) -> bool:
+    """Whether ``pin`` isn't the pin of ``definition`` as ``kind``, when there is one."""
     if definition is None:
         return False
     try:
-        return pin_of(definition) != pin
+        return pin_for(kind, definition) != pin
     except ProjectionError:  # one the gateway couldn't have pinned either
         return True
 
 
 def _mismatched(report: RemoteReport | ToolkitReport) -> tuple[str, ...]:
     """Every tool whose reported pin isn't its definition's (X11), or whose reviewed definition
-    isn't the one the policy's pin names (Y10): its ``pinned`` is that pin, and its own."""
-    review = report.policy.review
+    isn't the one the policy's pin names (Y10): its ``pinned`` is that pin, and its own. Each
+    entry is pinned as its kind, against its kind's pins."""
     return tuple(
         entry.name
         for entry in report.tools
-        if _differs(entry.definition, entry.pin)
-        or _differs(entry.reviewed, entry.pinned)
-        or (entry.reviewed is not None and entry.pinned != review.get(entry.name))
+        if _differs(entry.kind, entry.definition, entry.pin)
+        or _differs(entry.kind, entry.reviewed, entry.pinned)
+        or (
+            entry.reviewed is not None
+            and entry.pinned != _policy_of(report.policy, entry.kind)[1].get(entry.name)
+        )
     )
 
 

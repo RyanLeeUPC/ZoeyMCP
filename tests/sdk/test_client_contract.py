@@ -58,6 +58,11 @@ REQUEST_METHODS: dict[BackChannel, str] = {
 EGRESS_REQUESTS = frozenset(
     {"initialize", "server/discover", "tools/list", "tools/call", "subscriptions/listen", "ping"}
 )
+# The list requests of a server that enables prompts or resources (M6 design L.4), by entry.
+EGRESS_KIND_REQUESTS = {
+    "prompts": frozenset({"prompts/list"}),
+    "resources": frozenset({"resources/list", "resources/templates/list"}),
+}
 EGRESS_NOTIFICATIONS = frozenset({"notifications/initialized", "notifications/cancelled"})
 EGRESS_CALL_PARAMS = frozenset({"name", "arguments", "_meta"})
 EGRESS_META_KEYS = frozenset(

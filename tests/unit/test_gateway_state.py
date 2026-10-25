@@ -1,4 +1,5 @@
-"""The gateway's state files: drift marks and the definition store (M3 design G.4, G.5)."""
+"""The gateway's state files: drift marks and the definition store (M3 design G.4, G.5), each
+keyed by definition kind (M6 design L.4)."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from zoeymcp.common import canonical
+from zoeymcp.common import canonical, pinhash
 from zoeymcp.gateway import defstore, logs, marks
 from zoeymcp.gateway.defstore import DefinitionStore, changed_members, diff
 from zoeymcp.gateway.marks import DriftMarks, MarksError
@@ -21,7 +22,11 @@ from zoeymcp.gateway.pins import pin_of
 
 PIN_A = "sha256:" + "a" * 64
 PIN_B = "sha256:" + "b" * 64
+PIN_C = "sha256:" + "c" * 64
 DEFINITION: dict[str, Any] = {"name": "echo", "inputSchema": {"type": "object"}}
+PROMPT: dict[str, Any] = {"name": "summarize", "description": "Summarizes a note."}
+TEMPLATE = "notes://notes/{id}"
+FIXED = "notes://index"
 
 
 @pytest.fixture
@@ -61,7 +66,7 @@ def test_the_file_is_canonical_and_sorted(tmp_path: Path) -> None:
     DriftMarks.load(tmp_path).replace("notes", {("echo", PIN_A), ("add", PIN_B)})
     data = (tmp_path / marks.MARKS_FILE).read_bytes()
     assert data == canonical.dumps_canonical(
-        {"v": 1, "marks": {"notes": [["add", PIN_B], ["echo", PIN_A]]}}
+        {"v": 2, "marks": {"notes": [["tool", "add", PIN_B], ["tool", "echo", PIN_A]]}}
     )
 
 
@@ -82,7 +87,7 @@ def test_removing_the_last_mark_drops_the_server(tmp_path: Path) -> None:
     assert held.replace("notes", set()) == (frozenset(), frozenset({("echo", PIN_A)}))
     assert held.servers() == frozenset()
     assert DriftMarks.load(tmp_path).servers() == frozenset()
-    assert json.loads((tmp_path / marks.MARKS_FILE).read_bytes()) == {"v": 1, "marks": {}}
+    assert json.loads((tmp_path / marks.MARKS_FILE).read_bytes()) == {"v": 2, "marks": {}}
 
 
 def test_clear_some_tools(tmp_path: Path) -> None:
@@ -91,6 +96,72 @@ def test_clear_some_tools(tmp_path: Path) -> None:
     assert held.clear("notes", {"echo", "other"}) == {("echo", PIN_A)}
     assert held.for_server("notes") == {("add", PIN_B)}
     assert held.clear("missing", {"echo"}) == frozenset()
+
+
+def test_v1_upgrade(tmp_path: Path) -> None:
+    """FM-21: an M7 gateway's version 1 file loads as tool marks, and is rewritten as version 2
+    at the next change, the tool marks kept."""
+    path = tmp_path / marks.MARKS_FILE
+    v1 = canonical.dumps_canonical({"v": 1, "marks": {"notes": [["echo", PIN_A]]}})
+    path.write_bytes(v1)
+    held = DriftMarks.load(tmp_path)
+    assert held.for_server("notes") == {("echo", PIN_A)}
+    assert held.for_server("notes", "prompt") == frozenset()
+    assert path.read_bytes() == v1  # loading writes nothing
+    assert held.replace("notes", {("echo", PIN_A)}) == (frozenset(), frozenset())
+    assert path.read_bytes() == v1  # nor does a change that changes nothing
+    held.replace("notes", {("summarize", PIN_B)}, "prompt")
+    assert path.read_bytes() == canonical.dumps_canonical(
+        {"v": 2, "marks": {"notes": [["prompt", "summarize", PIN_B], ["tool", "echo", PIN_A]]}}
+    )
+    again = DriftMarks.load(tmp_path)
+    assert again.for_server("notes") == {("echo", PIN_A)}
+    assert again.for_server("notes", "prompt") == {("summarize", PIN_B)}
+
+
+def test_marks_are_kept_per_kind(tmp_path: Path) -> None:
+    """M6 design L.4: each kind's marks are its own; replacing one kind leaves the others."""
+    held = DriftMarks.load(tmp_path)
+    held.replace("notes", {("echo", PIN_A)})
+    assert held.replace("notes", {("echo", PIN_B)}, "prompt") == (
+        frozenset({("echo", PIN_B)}),
+        frozenset(),
+    )
+    held.replace("notes", {(TEMPLATE, PIN_C)}, "resource_template")
+    held.replace("notes", {(FIXED, PIN_A)}, "resource")
+    assert held.for_server("notes") == {("echo", PIN_A)}
+    assert held.for_server("notes", "prompt") == {("echo", PIN_B)}
+    assert held.for_server("notes", "resource_template") == {(TEMPLATE, PIN_C)}
+    assert held.for_server("notes", "resource") == {(FIXED, PIN_A)}
+    assert held.pins() == {PIN_A, PIN_B, PIN_C}
+    # Removing the prompt's mark keeps every other kind's, on disk too.
+    assert held.replace("notes", set(), "prompt") == (frozenset(), frozenset({("echo", PIN_B)}))
+    again = DriftMarks.load(tmp_path)
+    assert again.for_server("notes", "prompt") == frozenset()
+    assert again.for_server("notes") == {("echo", PIN_A)}
+    assert again.for_server("notes", "resource") == {(FIXED, PIN_A)}
+    assert again.servers() == {"notes"}
+    assert json.loads((tmp_path / marks.MARKS_FILE).read_bytes())["marks"]["notes"] == [
+        ["resource", FIXED, PIN_A],
+        ["resource_template", TEMPLATE, PIN_C],
+        ["tool", "echo", PIN_A],
+    ]
+
+
+def test_the_last_mark_of_any_kind_drops_the_server(tmp_path: Path) -> None:
+    held = DriftMarks.load(tmp_path)
+    held.replace("notes", {(FIXED, PIN_A)}, "resource")
+    held.replace("notes", set(), "resource")
+    assert held.servers() == frozenset()
+    assert held.pins() == frozenset()
+
+
+def test_clear_clears_tool_marks_only(tmp_path: Path) -> None:
+    held = DriftMarks.load(tmp_path)
+    held.replace("notes", {("echo", PIN_A)})
+    held.replace("notes", {("echo", PIN_B)}, "prompt")
+    assert held.clear("notes", {"echo"}) == {("echo", PIN_A)}
+    assert held.for_server("notes", "prompt") == {("echo", PIN_B)}
 
 
 def test_servers_are_separate(tmp_path: Path) -> None:
@@ -135,7 +206,9 @@ def test_the_temporary_file_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         b"{",
         b"[]",
         b'{"v":1}',
-        b'{"v":2,"marks":{}}',
+        b'{"v":3,"marks":{}}',
+        b'{"v":0,"marks":{}}',
+        b'{"v":"2","marks":{}}',
         b'{"v":1,"marks":[]}',
         b'{"v":1,"marks":{},"x":1}',
         b'{"v":1,"marks":{"Bad Name":[]}}',
@@ -146,6 +219,18 @@ def test_the_temporary_file_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         b'{"v":1,"marks":{"notes":[[1,2]]}}',
         b'{"v":1,"marks":{"notes":["echo"]}}',
         b'{"v":1,"v":1,"marks":{}}',
+        # A version 1 mark is (tool, pin), a version 2 mark (kind, name, pin), each in its form.
+        b'{"v":1,"marks":{"notes":[["tool","echo","' + PIN_A.encode() + b'"]]}}',
+        b'{"v":2,"marks":{"notes":[["echo","' + PIN_A.encode() + b'"]]}}',
+        b'{"v":2,"marks":{"notes":[["tools","echo","' + PIN_A.encode() + b'"]]}}',
+        b'{"v":2,"marks":{"notes":[["prompt","bad prompt","' + PIN_A.encode() + b'"]]}}',
+        b'{"v":2,"marks":{"notes":[["resource","notes://h/{id}","' + PIN_A.encode() + b'"]]}}',
+        b'{"v":2,"marks":{"notes":[["resource_template","notes://h/{+p}","'
+        + PIN_A.encode()
+        + b'"]]}}',
+        b'{"v":2,"marks":{"notes":[["tool","echo","sha256:abc"]]}}',
+        b'{"v":2,"marks":{"notes":[["tool","echo",1]]}}',
+        b'{"v":2,"marks":{"notes":[["tool","echo","' + PIN_A.encode() + b'","x"]]}}',
     ],
 )
 def test_an_unusable_file_stops_the_gateway(tmp_path: Path, content: bytes) -> None:
@@ -157,6 +242,36 @@ def test_an_unusable_file_stops_the_gateway(tmp_path: Path, content: bytes) -> N
 def test_a_server_with_no_marks_in_the_file_is_left_out(tmp_path: Path) -> None:
     (tmp_path / marks.MARKS_FILE).write_bytes(b'{"v":1,"marks":{"notes":[]}}')
     assert DriftMarks.load(tmp_path).servers() == frozenset()
+    (tmp_path / marks.MARKS_FILE).write_bytes(b'{"v":2,"marks":{"notes":[]}}')
+    assert DriftMarks.load(tmp_path).servers() == frozenset()
+
+
+def test_a_version_2_file_of_every_kind_loads(tmp_path: Path) -> None:
+    body = {
+        "v": 2,
+        "marks": {
+            "notes": [
+                ["prompt", "summarize", PIN_A],
+                ["resource", FIXED, PIN_B],
+                ["resource_template", TEMPLATE, PIN_C],
+                ["tool", "echo", PIN_A],
+            ]
+        },
+    }
+    (tmp_path / marks.MARKS_FILE).write_bytes(canonical.dumps_canonical(body))
+    held = DriftMarks.load(tmp_path)
+    assert held.for_server("notes", "prompt") == {("summarize", PIN_A)}
+    assert held.for_server("notes", "resource") == {(FIXED, PIN_B)}
+    assert held.for_server("notes", "resource_template") == {(TEMPLATE, PIN_C)}
+    assert held.for_server("notes") == {("echo", PIN_A)}
+
+
+def test_an_unknown_version_names_both_known_ones(tmp_path: Path) -> None:
+    (tmp_path / marks.MARKS_FILE).write_bytes(b'{"v":3,"marks":{}}')
+    with pytest.raises(MarksError) as caught:
+        DriftMarks.load(tmp_path)
+    assert str(caught.value) == "version 3 is not 1 or 2"
+    assert (marks.VERSION, marks.LEGACY_VERSION) == (2, 1)
 
 
 @pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="POSIX permissions")
@@ -181,6 +296,28 @@ def test_put_and_get(tmp_path: Path) -> None:
     path = tmp_path / "defs" / (pin.removeprefix("sha256:") + ".json")
     assert path.read_bytes() == canonical.dumps_canonical(DEFINITION)
     assert store.get(pin) == DEFINITION
+
+
+def test_a_prompt_or_resource_is_kept_by_its_kinds_pin(tmp_path: Path) -> None:
+    """M6 design L.4: each kind is checked against its own pin, so a drift's reviewed side is
+    there for every kind, and a definition read as another kind doesn't match."""
+    store = DefinitionStore(tmp_path)
+    cases: list[tuple[pinhash.DefinitionKind, dict[str, Any]]] = [
+        ("prompt", PROMPT),
+        ("resource", {"uri": FIXED, "name": "index"}),
+    ]
+    for kind, definition in cases:
+        pin = pinhash.pin_for(kind, definition)
+        store.put(pin, definition)  # as a tool, it doesn't match
+        assert not (tmp_path / "defs" / (pin.removeprefix("sha256:") + ".json")).exists()
+        store.put(pin, definition, kind)
+        assert store.get(pin, kind) == definition
+        assert store.get(pin) is None
+    template = {"uriTemplate": TEMPLATE, "name": "note"}
+    pin = pinhash.template_pin_of(template)
+    store.put(pin, template, "resource_template")
+    assert store.get(pin, "resource_template") == template
+    assert store.get(pin, "resource") is None
 
 
 def test_put_refuses_a_definition_that_doesnt_match_its_pin(tmp_path: Path) -> None:

@@ -60,8 +60,10 @@ class Link:
     def hardened(self) -> bool:
         return self.kind == "http"
 
-    def target(self, path: str) -> Target:
-        return Target(self.scheme, self.host, self.port, path, hardened=self.hardened)
+    def target(self, path: str, enabled: frozenset[str] = frozenset()) -> Target:
+        return Target(
+            self.scheme, self.host, self.port, path, hardened=self.hardened, enabled=enabled
+        )
 
 
 def parse_link(spec: str) -> Link:
@@ -353,11 +355,13 @@ def upstream_client(
     max_json_bytes: int,
     on_response: ResponseNote | None = None,
     inner: httpx2.AsyncBaseTransport | None = None,
+    enabled: frozenset[str] = frozenset(),
 ) -> httpx2.AsyncClient:
-    """The HTTP client for one upstream connection, behind its egress filter."""
+    """The HTTP client for one upstream connection, behind its egress filter; ``enabled`` is the
+    server's enable entries, whose kinds it is listed for (M6 design L.4)."""
     transport = EgressTransport(
         inner if inner is not None else _inner_transport(link),
-        link.target(vault_path),
+        link.target(vault_path, enabled),
         registry,
         server=server,
         max_json_bytes=max_json_bytes,

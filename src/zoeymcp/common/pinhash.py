@@ -13,8 +13,8 @@ This module is pure and imports only :mod:`.canonical`: the vault and the gatewa
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Final
+from collections.abc import Callable, Mapping
+from typing import Any, Final, Literal
 
 from . import canonical
 
@@ -22,6 +22,17 @@ PIN_TAG: Final = "tool-pin/1"
 PROMPT_PIN_TAG: Final = "prompt-pin/1"
 TEMPLATE_PIN_TAG: Final = "resource-template-pin/1"
 RESOURCE_PIN_TAG: Final = "resource-pin/1"
+# The kinds of definition a server lists (M6 design L.4): its tools, prompts, resource templates
+# and fixed resources, each pinned under its own tag.
+DefinitionKind = Literal["tool", "prompt", "resource_template", "resource"]
+KINDS: Final[tuple[DefinitionKind, ...]] = ("tool", "prompt", "resource_template", "resource")
+# The member of each kind's projection it is listed, included and pinned under.
+KEY_MEMBERS: Final[Mapping[DefinitionKind, str]] = {
+    "tool": "name",
+    "prompt": "name",
+    "resource_template": "uriTemplate",
+    "resource": "uri",
+}
 
 
 class ProjectionError(ValueError):
@@ -58,3 +69,16 @@ def template_pin_of(projection: Mapping[str, Any]) -> str:
 def resource_pin_of(projection: Mapping[str, Any]) -> str:
     """The pin of a fixed resource's projection (L.2: ``uri`` and its metadata)."""
     return _pinned(RESOURCE_PIN_TAG, "resource", projection)
+
+
+PIN_FUNCTIONS: Final[Mapping[DefinitionKind, Callable[[Mapping[str, Any]], str]]] = {
+    "tool": pin_of,
+    "prompt": prompt_pin_of,
+    "resource_template": template_pin_of,
+    "resource": resource_pin_of,
+}
+
+
+def pin_for(kind: DefinitionKind, projection: Mapping[str, Any]) -> str:
+    """The pin of a projection of ``kind``, under that kind's tag."""
+    return PIN_FUNCTIONS[kind](projection)

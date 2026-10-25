@@ -1,18 +1,20 @@
-"""The pin projection, pins, definition text rules and listing evaluation (M3 design G, J.3)."""
+"""The pin projection, pins, definition text rules and listing evaluation (M3 design G, J.3), and
+the same for prompts, resource templates and fixed resources (M6 design L.2, L.4)."""
 
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-from mcp.types import Tool
+from mcp.types import Prompt, Resource, ResourceTemplate, Tool
 
-from zoeymcp.common import canonical
+from zoeymcp.common import canonical, pinhash
+from zoeymcp.common.policy import fields
 from zoeymcp.common.policy.attention import Attention, attention, quiet
-from zoeymcp.common.policy.schema import GatewayLimits
+from zoeymcp.common.policy.schema import GatewayLimits, Tools
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.gateway import pins
 from zoeymcp.gateway.pins import (
@@ -26,8 +28,11 @@ from zoeymcp.gateway.pins import (
     text_problems,
     tool_problems,
 )
+from zoeymcp.gateway.toolkits import SelfPinned
 
 LIMITS = GatewayLimits()
+PIN_X = "sha256:" + "a" * 64
+PIN_Y = "sha256:" + "b" * 64
 
 WIRE: dict[str, Any] = {
     "name": "get_note",
@@ -676,3 +681,524 @@ def test_schema_limits_come_from_the_limits() -> None:
     [report] = result.reports
     assert report.kind == "invalid"
     assert report.reasons == ("/inputSchema: nested 6 levels, limit 4",)
+
+
+# --- prompts and resources: projections (M6 design L.2) -----------------------------------------
+
+PROMPT_WIRE: dict[str, Any] = {
+    "name": "summarize",
+    "title": "Summarize",
+    "description": "Summarizes a note.",
+    "arguments": [
+        {"name": "style", "title": "Style", "description": "How.", "required": False},
+        {"name": "id", "required": True},
+        {"name": "lang"},
+    ],
+}
+TEMPLATE_WIRE: dict[str, Any] = {
+    "uriTemplate": "notes://notes/{id}",
+    "name": "note",
+    "title": "A note",
+    "description": "One note.",
+    "mimeType": "text/markdown",
+    "annotations": {"audience": ["assistant", "user"], "priority": 0.25},
+}
+RESOURCE_WIRE: dict[str, Any] = {
+    "uri": "notes://index",
+    "name": "index",
+    "title": "Index",
+    "description": "Every note.",
+    "mimeType": "application/json",
+    "annotations": {"audience": ["user"], "priority": 0.5},
+}
+UNPINNED = {"icons": [{"src": "https://icons.example/p.png"}], "_meta": {"k": "v"}, "x": 1}
+
+
+def prompt(**changes: Any) -> Prompt:
+    wire = copy.deepcopy(PROMPT_WIRE)
+    wire.update(changes)
+    return Prompt.model_validate({key: value for key, value in wire.items() if value is not ...})
+
+
+def template(**changes: Any) -> ResourceTemplate:
+    wire = copy.deepcopy(TEMPLATE_WIRE)
+    wire.update(changes)
+    return ResourceTemplate.model_validate(
+        {key: value for key, value in wire.items() if value is not ...}
+    )
+
+
+def resource(**changes: Any) -> Resource:
+    wire = copy.deepcopy(RESOURCE_WIRE)
+    wire.update(changes)
+    return Resource.model_validate({key: value for key, value in wire.items() if value is not ...})
+
+
+def test_a_prompts_pinned_members_are_projected_in_listed_order() -> None:
+    assert pins.project_prompt(prompt(**UNPINNED)) == PROMPT_WIRE
+    assert pins.project_prompt(prompt(title=None, description=None, arguments=None)) == {
+        "name": "summarize"
+    }
+    assert pins.project_prompt(prompt(arguments=[]))["arguments"] == []
+
+
+def test_a_prompt_argument_drops_its_null_members_and_keeps_required_false() -> None:
+    raw = prompt(arguments=[{"name": "a", "title": None, "description": None, "required": None}])
+    assert pins.project_prompt(raw)["arguments"] == [{"name": "a"}]
+    raw = prompt(arguments=[{"name": "a", "required": False}])
+    assert pins.project_prompt(raw)["arguments"] == [{"name": "a", "required": False}]
+
+
+@pytest.mark.parametrize(
+    "name", ["", "a b", "x" * 129, "a\n"], ids=["empty", "space", "long", "line-break"]
+)
+def test_a_prompt_needs_a_prompt_name(name: str) -> None:
+    with pytest.raises(ProjectionError) as caught:
+        pins.project_prompt(prompt(name=name))
+    assert str(caught.value) == "name is not a valid prompt name"
+    with pytest.raises(ProjectionError):
+        pins.project_prompt(prompt().model_copy(update={"name": 5}))
+
+
+def test_a_prompt_whose_members_arent_what_the_sdk_parses_is_refused() -> None:
+    raw = prompt()
+    assert raw.arguments is not None
+    cases = [
+        (raw.model_copy(update={"title": 5}), "title is not a string"),
+        (
+            raw.model_copy(update={"arguments": [raw.arguments[0].model_copy(update={"name": 1})]}),
+            "arguments[0].name is not a string",
+        ),
+        (
+            raw.model_copy(
+                update={
+                    "arguments": [
+                        *raw.arguments[:1],
+                        raw.arguments[1].model_copy(update={"required": 1}),
+                    ]
+                }
+            ),
+            "arguments[1].required is not a boolean",
+        ),
+        (
+            raw.model_copy(
+                update={"arguments": [raw.arguments[0].model_copy(update={"title": 2})]}
+            ),
+            "title is not a string",
+        ),
+    ]
+    for broken, message in cases:
+        with pytest.raises(ProjectionError) as caught:
+            pins.project_prompt(broken)
+        assert str(caught.value) == message
+
+
+def test_a_templates_pinned_members_are_projected() -> None:
+    raw = template(**UNPINNED, annotations={**TEMPLATE_WIRE["annotations"], "lastModified": "x"})
+    assert pins.project_template(raw) == TEMPLATE_WIRE
+    minimal = template(title=None, description=None, mimeType=None, annotations=None)
+    assert pins.project_template(minimal) == {"uriTemplate": "notes://notes/{id}", "name": "note"}
+
+
+def test_a_fixed_resources_pinned_members_are_projected() -> None:
+    raw = resource(**UNPINNED, size=12)
+    assert pins.project_resource(raw) == RESOURCE_WIRE
+    assert pins.project_resource(resource(annotations={"lastModified": "x"})) == {
+        key: value for key, value in RESOURCE_WIRE.items() if key != "annotations"
+    }
+
+
+@pytest.mark.parametrize("make", [template, resource], ids=["template", "resource"])
+def test_a_whole_priority_is_projected_as_the_float_the_sdk_parsed(make: Any) -> None:
+    """Step 18's review S18-1: canonical JSON writes 1 and 1.0 apart, so the projection reads the
+    parsed model's float, never the wire's number."""
+    raw = make(annotations={"priority": 1})
+    projected = pins.PROJECTIONS["resource" if make is resource else "resource_template"](raw)
+    assert projected["annotations"] == {"priority": 1.0}
+    assert type(projected["annotations"]["priority"]) is float
+    assert b'"priority":1.0' in canonical.dumps_canonical(projected)
+    forced = raw.model_copy(
+        update={"annotations": raw.annotations.model_copy(update={"priority": 1})}
+    )
+    assert (
+        type(
+            pins.PROJECTIONS["resource" if make is resource else "resource_template"](forced)[
+                "annotations"
+            ]["priority"]
+        )
+        is float
+    )
+
+
+@pytest.mark.parametrize("value", [True, "1"])
+def test_a_priority_that_isnt_a_number_is_refused(value: object) -> None:
+    raw = resource()
+    assert raw.annotations is not None
+    broken = raw.model_copy(
+        update={"annotations": raw.annotations.model_copy(update={"priority": value})}
+    )
+    with pytest.raises(ProjectionError) as caught:
+        pins.project_resource(broken)
+    assert str(caught.value) == "annotations.priority is not a number"
+
+
+def test_an_audience_is_kept_in_its_order() -> None:
+    assert pins.project_resource(resource(annotations={"audience": ["assistant", "user"]}))[
+        "annotations"
+    ] == {"audience": ["assistant", "user"]}
+
+
+@pytest.mark.parametrize(
+    "uri_template",
+    ["notes://files/{+path}", "notes://n/{id}?q=1", "notes", "notes://n/x{id}", "notes://n/{a b}"],
+)
+def test_a_template_outside_the_level_1_form_is_refused(uri_template: str) -> None:
+    with pytest.raises(ProjectionError) as caught:
+        pins.project_template(template(uriTemplate=uri_template))
+    assert str(caught.value).startswith("uriTemplate: a resource template here is ")
+    assert uri_template not in str(caught.value)
+
+
+@pytest.mark.parametrize("uri", ["notes://u@h/x", "notes://index#top", "index", "notes://in dex"])
+def test_a_fixed_uri_outside_the_form_is_refused(uri: str) -> None:
+    with pytest.raises(ProjectionError) as caught:
+        pins.project_resource(resource(uri=uri))
+    assert str(caught.value) == f"uri: {fields.RESOURCE_URI_FORM}"
+
+
+def test_a_resource_whose_members_arent_strings_is_refused() -> None:
+    cases = [
+        (template().model_copy(update={"uri_template": 1}), "uriTemplate is not a string"),
+        (resource().model_copy(update={"uri": 1}), "uri is not a string"),
+        (resource().model_copy(update={"name": 1}), "name is not a string"),
+        (template().model_copy(update={"name": None}), "name is not a string"),
+        (resource().model_copy(update={"mime_type": 1}), "mimeType is not a string"),
+    ]
+    for broken, message in cases:
+        kind: pins.DefinitionKind = (
+            "resource_template" if isinstance(broken, ResourceTemplate) else "resource"
+        )
+        with pytest.raises(ProjectionError) as caught:
+            pins.project_kind(kind, broken)
+        assert str(caught.value) == message
+
+
+def test_each_kind_pins_under_its_own_tag() -> None:
+    cases: list[tuple[pins.DefinitionKind, Any, Any]] = [
+        ("tool", tool(), pinhash.pin_of),
+        ("prompt", prompt(), pinhash.prompt_pin_of),
+        ("resource_template", template(), pinhash.template_pin_of),
+        ("resource", resource(), pinhash.resource_pin_of),
+    ]
+    for kind, item, pin_of_kind in cases:
+        projected = pins.project_kind(kind, item)
+        assert projected.definition == pins.PROJECTIONS[kind](item)
+        assert projected.pin == pin_of_kind(projected.definition)
+        assert pinhash.pin_for(kind, projected.definition) == projected.pin
+
+
+def test_the_key_of_each_kind() -> None:
+    assert pins.key_of("tool", tool()) == "get_note"
+    assert pins.key_of("prompt", prompt()) == "summarize"
+    assert pins.key_of("resource_template", template()) == "notes://notes/{id}"
+    assert pins.key_of("resource", resource()) == "notes://index"
+    assert pins.key_of("resource", resource().model_copy(update={"uri": 5})) == ""
+    assert pinhash.KEY_MEMBERS == {
+        "tool": "name",
+        "prompt": "name",
+        "resource_template": "uriTemplate",
+        "resource": "uri",
+    }
+
+
+def test_the_kinds_text_rules() -> None:
+    """A prompt argument's name and title, and a mimeType, are single-line like a tool's name and
+    title; an argument's description is held to the schema text limit."""
+    definition = pins.project_prompt(prompt())
+    definition["arguments"][0].update(
+        name="a\tb", title="t" * 257, description="line\n" + "d" * (pins.MAX_SCHEMA_TEXT_CHARS - 5)
+    )
+    definition["arguments"][1]["name"] = "n" * 129
+    assert problems_of(definition) == [
+        ("/arguments/0/name", "tab not allowed here"),
+        ("/arguments/0/title", f"too long: 257 characters, limit {pins.MAX_TITLE_CHARS}"),
+        ("/arguments/1/name", f"too long: 129 characters, limit {pins.MAX_NAME_CHARS}"),
+    ]
+    definition = pins.project_prompt(prompt())
+    definition["arguments"][0]["title"] = "a\nb"
+    assert problems_of(definition) == [("/arguments/0/title", "line break in a single-line field")]
+    resource_definition = pins.project_resource(resource())
+    resource_definition["mimeType"] = "text/plain\n"
+    assert problems_of(resource_definition) == [("/mimeType", "line break in a single-line field")]
+    resource_definition["mimeType"] = "m" * 257
+    [problem] = text_problems(resource_definition)
+    assert "too long" in problem.violation.reason
+    # Under an argument, a key named like a member gets the schema limit, not that member's.
+    assert pins._text_limits(("arguments", 0, "name"), True) == (pins.MAX_SCHEMA_TEXT_CHARS, False)
+    assert pins._text_limits(("arguments", 0, "description"), False) == (
+        pins.MAX_SCHEMA_TEXT_CHARS,
+        False,
+    )
+    assert pins._text_limits(("x", 0, "name"), False) == (pins.MAX_SCHEMA_TEXT_CHARS, False)
+    assert pins._text_limits(("arguments", "name"), False) == (pins.MAX_SCHEMA_TEXT_CHARS, False)
+
+
+def test_definition_problems_are_a_tools_or_the_text_rules() -> None:
+    definition = project(tool(description="\u200b"))
+    definition["inputSchema"]["$id"] = "https://x.example/s"
+    assert pins.definition_problems("tool", definition, LIMITS) == tool_problems(definition, LIMITS)
+    held = {"name": "a", "description": "\u200b", "inputSchema": {"$id": "x"}}
+    assert pins.definition_problems("prompt", held, LIMITS) == [
+        "/description: format character (zero-width, bidi or tag) U+200B (ZERO WIDTH SPACE) at "
+        "position 0"
+    ]
+
+
+# --- prompts and resources: evaluating (M6 design L.4) ------------------------------------------
+
+
+def kinds_server(
+    on_drift: str = "hide",
+    *,
+    tools: tuple[list[str], dict[str, str]] = ([], {}),
+    prompts: dict[str, Any] | None = None,
+    templates: dict[str, Any] | None = None,
+    fixed: dict[str, Any] | None = None,
+    enable: list[str] | None = None,
+) -> ViewRemoteServer:
+    include, review = tools
+    return ViewRemoteServer.model_validate(
+        {
+            "kind": "remote",
+            "vault_path": "/notes/mcp",
+            "tools": {"include": include, "allow": include, "approve": []},
+            "review": review,
+            "on_drift": on_drift,
+            "shared_session": False,
+            "wrap_results": False,
+            "enable": ["prompts", "resources"] if enable is None else enable,
+            "prompts": prompts or {},
+            "resources": {"templates": templates or {}, "fixed": fixed or {}},
+            "era": "auto",
+            "drift_check_interval": 300,
+            "call_timeout": None,
+        }
+    )
+
+
+def named_prompt(name: str, **changes: Any) -> Prompt:
+    return prompt(name=name, **changes)
+
+
+def prompt_pin(name: str, **changes: Any) -> str:
+    return pins.project_kind("prompt", named_prompt(name, **changes)).pin
+
+
+def test_the_kinds_an_enable_lists() -> None:
+    assert pins.enabled_kinds([]) == ()
+    assert pins.enabled_kinds(["prompts"]) == ("prompt",)
+    assert pins.enabled_kinds(["resources"]) == ("resource_template", "resource")
+    assert pins.enabled_kinds(["completions", "resources", "prompts", "prompts"]) == (
+        "prompt",
+        "resource_template",
+        "resource",
+    )
+
+
+def test_each_kinds_policy_entries() -> None:
+    policy = kinds_server(
+        tools=(["t"], {"t": PIN_X}),
+        prompts={"include": ["p"], "review": {"p": PIN_X}, "declined": {"q": PIN_Y}},
+        templates={"include": ["notes://n/{id}"], "review": {}, "declined": {}},
+        fixed={"include": [], "review": {"notes://i": PIN_Y}},
+    )
+    assert pins.entries(policy) == pins.Entries(["t"], {"t": PIN_X}, {})
+    assert pins.entries(policy, "prompt") == pins.Entries(["p"], {"p": PIN_X}, {"q": PIN_Y})
+    assert pins.entries(policy, "resource_template") == pins.Entries(["notes://n/{id}"], {}, {})
+    assert pins.entries(policy, "resource") == pins.Entries([], {"notes://i": PIN_Y}, {})
+
+
+def test_only_a_remote_server_has_other_kinds() -> None:
+    toolkit = SelfPinned(Tools(), {}, declined={})
+    assert pins.entries(toolkit).include == []
+    with pytest.raises(ValueError, match="only a remote server lists a prompt"):
+        pins.entries(toolkit, "prompt")
+
+
+def test_every_report_kind_for_prompts() -> None:
+    bad = named_prompt("bad", description="\u200b")
+    listing = [
+        named_prompt("ok"),
+        named_prompt("new"),
+        named_prompt("dup"),
+        named_prompt("dup"),
+        named_prompt("changed"),
+        bad,
+        named_prompt("seen"),
+    ]
+    policy = kinds_server(
+        prompts={
+            "include": ["ok", "dup", "changed", "bad", "gone"],
+            "review": {
+                "ok": prompt_pin("ok"),
+                "dup": prompt_pin("dup"),
+                "changed": prompt_pin("changed", description="Old."),
+                "bad": prompt_pin("bad"),
+                "gone": prompt_pin("gone"),
+            },
+            "declined": {"seen": prompt_pin("seen")},
+        }
+    )
+    result = evaluate(listing, policy, set(), LIMITS, "prompt")
+    assert set(result.exposed) == {"ok"}
+    assert result.exposed["ok"] == pins.ExposedTool(
+        pins.project_prompt(named_prompt("ok")), prompt_pin("ok")
+    )
+    assert kinds(result) == [
+        ("unreviewed", "new"),
+        ("duplicate", "dup"),
+        ("drift", "changed"),
+        ("invalid", "bad"),
+        ("declined", "seen"),
+        ("missing", "gone"),
+    ]
+    assert result.marks == {("changed", prompt_pin("changed", description="Old."))}
+    assert result.listed["ok"] == prompt_pin("ok")
+    assert result.listed["bad"] is None
+    assert result.blocked is False
+
+
+def test_a_template_and_a_fixed_resource_are_evaluated_by_their_uris() -> None:
+    held = template()
+    pin_t = pins.project_kind("resource_template", held).pin
+    fixed_one = resource()
+    pin_r = pins.project_kind("resource", fixed_one).pin
+    policy = kinds_server(
+        templates={"include": ["notes://notes/{id}"], "review": {"notes://notes/{id}": pin_t}},
+        fixed={"include": ["notes://index", "notes://gone"], "review": {"notes://index": pin_r}},
+    )
+    found = evaluate([held], policy, set(), LIMITS, "resource_template")
+    assert set(found.exposed) == {"notes://notes/{id}"}
+    found = evaluate([fixed_one], policy, set(), LIMITS, "resource")
+    assert set(found.exposed) == {"notes://index"}
+    assert kinds(found) == [("missing", "notes://gone")]
+    operator = template(uriTemplate="notes://files/{+path}")
+    report, missing = evaluate([operator], policy, set(), LIMITS, "resource_template").reports
+    assert (report.kind, report.tool, report.pin) == ("invalid", "notes://files/{+path}", None)
+    assert (missing.kind, missing.tool) == ("missing", "notes://notes/{id}")
+
+
+def test_a_kinds_mark_is_sticky_and_clears_with_its_pin() -> None:
+    old = prompt_pin("p", description="Old.")
+    policy = kinds_server(prompts={"include": ["p"], "review": {"p": old}})
+    first = evaluate([named_prompt("p")], policy, set(), LIMITS, "prompt")
+    assert first.marks == {("p", old)}
+    back = evaluate([named_prompt("p", description="Old.")], policy, first.marks, LIMITS, "prompt")
+    assert back.exposed == {}
+    assert back.marks == {("p", old)}
+    repinned = kinds_server(prompts={"include": ["p"], "review": {"p": prompt_pin("p")}})
+    cleared = evaluate([named_prompt("p")], repinned, {("p", old)}, LIMITS, "prompt")
+    assert (set(cleared.exposed), cleared.marks) == ({"p"}, frozenset())
+
+
+def listings(**items: Any) -> dict[pins.DefinitionKind, pins.KindListing]:
+    return {
+        cast(pins.DefinitionKind, kind): pins.KindListing(found) for kind, found in items.items()
+    }
+
+
+def test_a_server_with_no_other_kind_evaluates_as_its_tools() -> None:
+    policy = server(["a"], {"a": pin("a")})
+    whole = pins.evaluate_server([named("a")], {}, policy, {}, LIMITS)
+    assert whole == evaluate([named("a")], policy, set(), LIMITS)
+    assert whole.kinds == {}
+
+
+def test_every_kind_is_evaluated_with_its_own_marks() -> None:
+    old = prompt_pin("p", description="Old.")
+    policy = kinds_server(
+        tools=(["a"], {"a": pin("a")}),
+        prompts={"include": ["p", "q"], "review": {"p": old, "q": prompt_pin("q")}},
+    )
+    marks: dict[pins.DefinitionKind, set[tuple[str, str]]] = {
+        "tool": {("a", pin("a"))},
+        "prompt": {("q", prompt_pin("q"))},
+    }
+    whole = pins.evaluate_server(
+        [named("a")], listings(prompt=[named_prompt("p"), named_prompt("q")]), policy, marks, LIMITS
+    )
+    assert whole.exposed == {}
+    assert whole.marks == {("a", pin("a"))}
+    assert whole.blocked is False
+    prompts = whole.kinds["prompt"]
+    assert prompts.exposed == {}
+    assert prompts.marks == {("p", old), ("q", prompt_pin("q"))}
+    assert kinds(prompts) == [("drift", "p")]
+
+
+def test_a_failed_kind_lists_nothing_so_its_entries_are_missing() -> None:
+    """SPEC-7: the kind fails on its own; the tools are served."""
+    policy = kinds_server(
+        tools=(["a"], {"a": pin("a")}),
+        fixed={"include": ["notes://index"], "review": {"notes://index": PIN_X}},
+    )
+    failed: dict[pins.DefinitionKind, pins.KindListing] = {
+        "resource": pins.KindListing(failure="entries")
+    }
+    whole = pins.evaluate_server([named("a")], failed, policy, {}, LIMITS)
+    assert set(whole.exposed) == {"a"}
+    assert kinds(whole.kinds["resource"]) == [("missing", "notes://index")]
+
+
+@pytest.mark.parametrize("drifted", ["tool", "prompt", "resource_template", "resource"])
+def test_on_drift_fail_blocks_every_kind_when_any_kind_drifts(drifted: str) -> None:
+    """Q20 (a): a server that rug-pulls one kind is no more trustworthy for the others."""
+    old = "sha256:" + "0" * 64
+    review = {
+        "tool": {"a": pin("a")},
+        "prompt": {"p": prompt_pin("p")},
+        "resource_template": {
+            "notes://notes/{id}": pins.project_kind("resource_template", template()).pin
+        },
+        "resource": {"notes://index": pins.project_kind("resource", resource()).pin},
+    }
+    key = next(iter(review[drifted]))
+    review[drifted][key] = old
+    for on_drift in ("fail", "hide"):
+        policy = kinds_server(
+            on_drift,
+            tools=(["a"], review["tool"]),
+            prompts={"include": ["p"], "review": review["prompt"]},
+            templates={"include": ["notes://notes/{id}"], "review": review["resource_template"]},
+            fixed={"include": ["notes://index"], "review": review["resource"]},
+        )
+        found = listings(
+            prompt=[named_prompt("p")], resource_template=[template()], resource=[resource()]
+        )
+        whole = pins.evaluate_server([named("a")], found, policy, {}, LIMITS)
+        evaluations = [whole, *whole.kinds.values()]
+        if on_drift == "fail":
+            assert all(e.blocked and e.exposed == {} for e in evaluations)
+        else:
+            assert not any(e.blocked for e in evaluations)
+            assert sum(len(e.exposed) for e in evaluations) == 3
+        assert {
+            drifted_kind for drifted_kind, e in [("tool", whole), *whole.kinds.items()] if e.marks
+        } == {drifted}
+
+
+def test_on_drift_fail_blocks_every_kind_on_another_kinds_held_mark() -> None:
+    p_pin = prompt_pin("p")
+    policy = kinds_server(
+        "fail", tools=(["a"], {"a": pin("a")}), prompts={"include": ["p"], "review": {"p": p_pin}}
+    )
+    whole = pins.evaluate_server(
+        [named("a")],
+        listings(prompt=[named_prompt("p")]),
+        policy,
+        {"prompt": {("p", p_pin)}},
+        LIMITS,
+    )
+    assert (whole.blocked, whole.exposed) == (True, {})
+    assert (whole.kinds["prompt"].blocked, whole.kinds["prompt"].exposed) == (True, {})
+    assert whole.kinds["prompt"].reports == ()

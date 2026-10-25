@@ -1397,6 +1397,21 @@ The gateway checks for drift when the server says its list changed, when a sessi
 reconnects, and every `drift_check_interval` (300 s) regardless, since a hostile server won't
 announce its changes. A silent change between two checks is caught at the next one.
 
+**Prompts and resources** (not enabled yet: `check` still refuses `enable` of prompts, resources
+and completions). A server that enables them is listed for them after its tools, and they drift,
+are marked and are logged as tools are, each kind on its own: `prompt_drift`,
+`resource_template_drift` and `resource_drift` (and `_unreviewed`, `_missing`, `_invalid`,
+`_duplicate`), with `name` (the prompt's name, the template or the URI) where a tool's line has
+`tool`; `drift_marked` and `drift_cleared` carry `definition_kind` and `name` (`names`) for them,
+and `listing` counts `prompts`, `resource_templates` and `resources`. A kind's listing that fails,
+or lists more than the listing limits allow (§16), fails that kind alone (`kind_list_failed`, with
+`definition_kind` and `reason`): its included entries are missing, and the server's tools are
+still served. `resources/list` over a limit instead keeps what it listed by then
+(`kind_list_cut`, with `reason` and `listed`): an included resource it didn't reach is missing,
+and the ones it did are checked as usual. To serve, the gateway lists resources only until every
+included one is found, so including another lists them again at once. With `on_drift: fail` a
+drift of any kind blocks the whole server.
+
 ## 13. `gateway-status`
 
 ```text

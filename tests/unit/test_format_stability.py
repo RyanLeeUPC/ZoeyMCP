@@ -17,7 +17,8 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
-from mcp.types import Tool
+from mcp.types import Prompt, Resource, ResourceTemplate, Tool
+from pydantic import BaseModel
 
 from tests.unit.report_model import asked_line
 from zoeymcp.common import canonical, ledgerreport, pinhash
@@ -537,6 +538,53 @@ def test_a_projection_with_no_canonical_form_has_no_pin(pin_of: PinOf) -> None:
         "the definition has no canonical form (an unsafe integer, a lone surrogate or too deep)"
     )
     assert isinstance(caught.value.__cause__, canonical.JSONRejected)
+
+
+# The wire each kind's golden starts from, through the SDK's model and the gateway's projection
+# (step 19's gateway/pins.py): members never pinned are listed too, and the full resource's
+# priority is a whole 1 on the wire, which the SDK reads as the float the golden holds (S18-1).
+UNPINNED_WIRE = '"icons":[{"src":"https://icons.example/p.png"}],"_meta":{"k":"v"},"x-unknown":1'
+KIND_WIRE_VECTORS: dict[str, tuple[pinhash.DefinitionKind, type[BaseModel], str]] = {
+    "prompt_minimal": ("prompt", Prompt, '{"name":"summarize"}'),
+    "prompt_full": (
+        "prompt",
+        Prompt,
+        r'{"name":"summarize","title":"Caf\u00e9 \u65e5\u672c","description":"Summarizes a '
+        r'note.\nOne paragraph.","arguments":[{"name":"id","title":"Note","description":'
+        r'"The note\u0027s ID.","required":true},{"name":"style","required":false}],'
+        + UNPINNED_WIRE
+        + "}",
+    ),
+    "template_minimal": (
+        "resource_template",
+        ResourceTemplate,
+        '{"uriTemplate":"notes://notes/{id}","name":"note"}',
+    ),
+    "template_full": (
+        "resource_template",
+        ResourceTemplate,
+        '{"uriTemplate":"notes://notes/{id}","name":"note","title":"A note","description":'
+        '"One note, by its ID.","mimeType":"text/markdown","annotations":{"audience":["user",'
+        '"assistant"],"priority":0.5,"lastModified":"2026-10-01T00:00:00Z"},' + UNPINNED_WIRE + "}",
+    ),
+    "resource_minimal": ("resource", Resource, '{"uri":"notes://index","name":"index"}'),
+    "resource_full": (
+        "resource",
+        Resource,
+        r'{"uri":"notes://index","name":"index","title":"Index \ud83d\uddc2","description":'
+        r'"Every note.","mimeType":"application/json","size":12,"annotations":{"audience":'
+        r'["assistant"],"priority":1},' + UNPINNED_WIRE + "}",
+    ),
+}
+
+
+def test_the_gateways_projections_give_the_kind_pins() -> None:
+    """Step 18's pin goldens hold against the real projections, from the wire."""
+    assert set(KIND_WIRE_VECTORS) == set(KIND_PIN_VECTORS)
+    for name, (kind, model, wire) in KIND_WIRE_VECTORS.items():
+        projected = pins.project_kind(kind, model.model_validate_json(wire))
+        assert projected.definition == KIND_PIN_VECTORS[name][1], name
+        assert projected.pin == KIND_PIN_VECTORS[name][2], name
 
 
 # --- the passkey file (M5 design D.4) ------------------------------------------------------------

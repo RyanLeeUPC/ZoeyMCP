@@ -10,6 +10,9 @@ headers, and have one of a few body shapes. A ``tools/call`` must carry exactly 
 pipeline validated: its ``(name, digest(arguments))`` must match a registration, which it uses up
 (G9). Nothing that would open a back channel goes out: no declared client capability, no
 ``requestState`` or ``inputResponses`` retry, no trace context.
+
+A server that enables prompts or resources is also listed for them (M6 design L.4): its
+connection's target names what it enables, and only those kinds' list requests go out on it.
 """
 
 from __future__ import annotations
@@ -46,6 +49,11 @@ CACHE_CONTROL = ("cache-control", "no-store")
 REQUESTS = frozenset(
     {"initialize", "server/discover", "tools/list", "tools/call", "subscriptions/listen", "ping"}
 )
+# The list requests of the kinds beyond tools, by the enable entry that allows them (L.4).
+KIND_REQUESTS: Mapping[str, frozenset[str]] = {
+    "prompts": frozenset({"prompts/list"}),
+    "resources": frozenset({"resources/list", "resources/templates/list"}),
+}
 NOTIFICATIONS = frozenset({"notifications/initialized", "notifications/cancelled"})
 META_KEYS = frozenset(
     {
@@ -83,6 +91,8 @@ class Target:
     port: int | None
     path: str
     hardened: bool = False
+    # The server's enable entries: the kinds beyond tools it is listed for (KIND_REQUESTS).
+    enabled: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -156,10 +166,17 @@ def _check_meta(params: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _check_request(message: Mapping[str, Any], registry: CallRegistry) -> Verdict:
+def requests_for(enabled: frozenset[str]) -> frozenset[str]:
+    """The requests a connection to a server that enables ``enabled`` may send."""
+    return REQUESTS.union(*(KIND_REQUESTS.get(entry, frozenset()) for entry in enabled))
+
+
+def _check_request(
+    message: Mapping[str, Any], registry: CallRegistry, enabled: frozenset[str]
+) -> Verdict:
     method = message["method"]
     kind = f"request {method}"
-    if method not in REQUESTS:
+    if method not in requests_for(enabled):
         return _refuse("request method not allowed", kind)
     params = message.get("params", {})
     if not isinstance(params, dict):
@@ -181,7 +198,7 @@ def _check_request(message: Mapping[str, Any], registry: CallRegistry) -> Verdic
     return Verdict(True, kind=kind)
 
 
-def _check_body(body: bytes, registry: CallRegistry) -> Verdict:
+def _check_body(body: bytes, registry: CallRegistry, enabled: frozenset[str]) -> Verdict:
     try:
         message = canonical.loads_strict(body, max_bytes=MAX_BODY_BYTES)
     except canonical.JSONRejected:
@@ -200,7 +217,7 @@ def _check_body(body: bytes, registry: CallRegistry) -> Verdict:
     if not isinstance(method, str):
         return _refuse("method is not a string")
     if "id" in message:
-        return _check_request(message, registry)
+        return _check_request(message, registry, enabled)
     kind = f"notification {method}"
     if method not in NOTIFICATIONS:
         return _refuse("notification not allowed", kind)
@@ -229,4 +246,4 @@ def check(request: Outgoing, target: Target, registry: CallRegistry) -> Verdict:
         return _refuse(problem)
     if request.method != "POST":
         return Verdict(True) if not request.body else _refuse(f"{request.method} with a body")
-    return _check_body(request.body, registry)
+    return _check_body(request.body, registry, target.enabled)

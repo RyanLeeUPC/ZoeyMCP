@@ -2,7 +2,8 @@
 from the gateway's review code, the caps that follow the limits, and the pins recomputed; and
 M6's additions (design J.1): a drift entry's reviewed definition, checked against the policy's
 pin, the policy's pins and declines, ``offered``, and an M7 report, with none of them, still
-read."""
+read; and the entries of a server's prompts and resources (design L.4), each kind pinned and
+capped as its own."""
 
 from __future__ import annotations
 
@@ -13,8 +14,9 @@ from pathlib import Path
 from typing import Any, get_args
 
 import pytest
-from mcp.types import Implementation, ServerCapabilities, Tool
+from mcp.types import Implementation, Prompt, Resource, ResourceTemplate, ServerCapabilities, Tool
 
+from tests.unit.test_pins import kinds_server, named_prompt, prompt_pin, resource, template
 from tests.unit.test_review import LIMITS, pin, policy, reviewed, tool
 from tests.unit.test_review_toolkits import reviewed as toolkit_reviewed
 from zoeymcp.cli import review as cli_review
@@ -195,8 +197,11 @@ def test_the_entry_kind_is_a_tool() -> None:
     data = unclassified("a")
     data["tools"][0]["kind"] = "tool"
     assert read(data, LIMITS).tools[0].kind == "tool"
-    data["tools"][0]["kind"] = "resource"
+    data["tools"][0]["kind"] = "bridge"
     assert invalid(data) == "at remote.tools[0].kind"
+    # M6 L.4: a resource is a kind now, keyed by its URI, which "a" isn't.
+    data["tools"][0]["kind"] = "resource"
+    assert invalid(data) == "at remote.tools[0]"
 
 
 @pytest.mark.parametrize(
@@ -433,11 +438,14 @@ def test_missing_tools_beside_a_full_listing() -> None:
 
 
 def test_the_entry_list_is_capped_before_the_limits() -> None:
-    """Twice the most tools a server may list, for the missing ones; any more isn't counted."""
+    """Twice the most tools a server may list, for the missing ones, for each of the four kinds
+    (M6 L.4); any more isn't counted."""
     limits = GatewayLimits(max_tools_per_server=NAMES_MAX)
     data = unclassified("a")
     entry = {**data["tools"][0], "pin": None, "definition": None}
-    data["tools"] = [{**entry, "name": f"t{index}"} for index in range(2 * NAMES_MAX)]
+    most = 2 * NAMES_MAX * len(pinhash.KINDS)
+    assert most == 80_000
+    data["tools"] = [{**entry, "name": f"t{index}"} for index in range(most)]
     assert invalid(data, limits) == (
         "at tools (more than gateway.limits.max_tools_per_server listed)"
     )
@@ -1078,3 +1086,282 @@ def test_attention_holds_only_its_lists() -> None:
     assert invalid(data) == "at remote.attention.unreviewed"
     data["attention"] = []
     assert invalid(data) == "at remote.attention"
+
+
+# --- prompts and resources (M6 design L.4) -------------------------------------------------------
+
+
+def kinds_report(
+    prompts: list[Prompt],
+    *,
+    templates: list[ResourceTemplate] | None = None,
+    resources: list[Resource] | None = None,
+    policy_kinds: dict[str, Any] | None = None,
+    defs: dict[str, Any] | None = None,
+    failure: str | None = None,
+    cut: bool = False,
+    tools: list[Tool] | None = None,
+) -> dict[str, Any]:
+    """The report of a server enabling prompts and resources, through JSON."""
+    server = kinds_server(tools=(["a"], {"a": pin("a")}), **(policy_kinds or {}))
+    found: dict[pins.DefinitionKind, pins.KindListing] = {
+        "prompt": pins.KindListing(prompts, failure=failure),
+        "resource_template": pins.KindListing(templates or []),
+        "resource": pins.KindListing(resources or [], cut=cut),
+    }
+    listed = [tool("a")] if tools is None else tools
+    evaluation = pins.evaluate_server(listed, found, server, {}, LIMITS)
+    answer = review.report(
+        "notes",
+        server,
+        listed,
+        evaluation,
+        marks=frozenset(),
+        defs=lambda pin_: None,
+        limits=LIMITS,
+        era="modern",
+        protocol_version="2026-07-28",
+        server_info=None,
+        instructions=None,
+        kinds={kind: review.KindReview(listing) for kind, listing in found.items()},
+        kind_defs=lambda pin_, kind: (defs or {}).get(pin_),
+    )
+    return wired(answer)
+
+
+def prompt_entries(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {entry["name"]: entry for entry in data["tools"] if entry.get("kind") == "prompt"}
+
+
+def test_a_report_with_prompts_and_resources_reads_back() -> None:
+    old = pins.project_prompt(named_prompt("drifts", description="Old."))
+    data = kinds_report(
+        [named_prompt("fine"), named_prompt("drifts"), named_prompt("new")],
+        templates=[template()],
+        resources=[resource()],
+        policy_kinds={
+            "prompts": {
+                "include": ["fine", "drifts", "gone"],
+                "review": {
+                    "fine": prompt_pin("fine"),
+                    "drifts": prompt_pin("drifts", description="Old."),
+                    "gone": PIN0,
+                },
+                "assistant": ["fine"],
+            },
+            "templates": {
+                "include": ["notes://notes/{id}"],
+                "review": {
+                    "notes://notes/{id}": pins.project_kind("resource_template", template()).pin
+                },
+            },
+        },
+        defs={prompt_pin("drifts", description="Old."): old},
+    )
+    report = read(data, LIMITS)
+    assert isinstance(report, RemoteReport)
+    assert [(e.kind, e.name, e.state) for e in report.tools] == [
+        ("tool", "a", "ok"),
+        ("prompt", "drifts", "drift"),
+        ("prompt", "fine", "ok"),
+        ("prompt", "new", "unreviewed"),
+        ("prompt", "gone", "missing"),
+        ("resource_template", "notes://notes/{id}", "ok"),
+        ("resource", "notes://index", "unreviewed"),
+    ]
+    drifts = report.tools[1]
+    assert (drifts.reviewed, drifts.changed) == (old, ["description"])
+    assert drifts.pin == pinhash.prompt_pin_of(pins.project_prompt(named_prompt("drifts")))
+    assert all(entry.classification is None for entry in report.tools[1:])
+    assert report.policy.prompts.assistant == ["fine"]
+    assert report.policy.resources.templates.include == ["notes://notes/{id}"]
+    assert report.listings is not None
+    assert set(report.listings) == {"prompt", "resource_template", "resource"}
+    for listing in report.listings.values():
+        assert (listing.failure, listing.findings) == (None, [])
+    assert report.clean is False  # a prompt drifted
+
+
+def test_a_tools_only_report_writes_no_kind_field() -> None:
+    """The M7 shape stays: no listings, no prompts or resources block, no entry kind."""
+    data = unclassified("a")
+    assert "listings" not in data
+    assert set(data["policy"]) == {"include", "allow", "approve", "on_drift", "review", "declined"}
+    assert "kind" not in data["tools"][0]
+
+
+def test_a_failed_kind_and_a_cut_list_are_reported() -> None:
+    data = kinds_report(
+        [],
+        failure="entries",
+        cut=True,
+        resources=[resource()],
+        policy_kinds={"prompts": {"include": ["p"], "review": {"p": PIN0}}},
+    )
+    report = read(data, LIMITS)
+    assert isinstance(report, RemoteReport)
+    assert report.listings is not None
+    assert report.listings["prompt"].failure == "entries"
+    [note] = report.listings["resource"].findings
+    assert note.level == "warning"
+    assert note.message == (
+        "the server lists more than the review could take under gateway.limits: the first 1 are "
+        "shown"
+    )
+    assert [(e.kind, e.name, e.state) for e in report.tools if e.kind == "prompt"] == [
+        ("prompt", "p", "missing")
+    ]
+
+
+def test_a_kind_entry_pinned_as_a_tool_refuses_the_whole_report() -> None:
+    data = kinds_report([named_prompt("new")])
+    entry = prompt_entries(data)["new"]
+    entry["pin"] = pinhash.pin_of(entry["definition"])
+    refusal = refused(data)
+    assert (refusal.reason, refusal.tools) == ("pin_mismatch", ("new",))
+
+
+def test_a_kind_entrys_reviewed_definition_is_checked_against_its_kinds_pins() -> None:
+    old = pins.project_prompt(named_prompt("p", description="Old."))
+    old_pin = prompt_pin("p", description="Old.")
+    policy_kinds = {"prompts": {"include": ["p"], "review": {"p": old_pin}}}
+    data = kinds_report([named_prompt("p")], policy_kinds=policy_kinds, defs={old_pin: old})
+    assert read(data, LIMITS).tools[1].reviewed == old
+    data["policy"]["prompts"]["review"]["p"] = PIN0
+    data["tools"][1]["pinned"] = PIN0
+    assert refused(data).tools == ("p",)
+    data = kinds_report([named_prompt("p")], policy_kinds=policy_kinds, defs={old_pin: old})
+    data["policy"]["prompts"]["review"]["p"] = PIN0  # the entry's pinned isn't the policy's
+    assert refused(data).tools == ("p",)
+
+
+@pytest.mark.parametrize(
+    ("change", "location"),
+    [
+        ({"classification": "allow"}, "remote.tools[1]"),
+        ({"name": "other"}, "remote.tools[1]"),
+        ({"kind": "bridge"}, "remote.tools[1].kind"),
+    ],
+)
+def test_a_kind_entry_out_of_shape(change: dict[str, Any], location: str) -> None:
+    data = kinds_report([named_prompt("new")])
+    data["tools"][1].update(change)
+    assert invalid(data) == f"at {location}"
+
+
+def test_a_kind_entrys_name_is_its_kinds_key() -> None:
+    data = kinds_report([], templates=[template()], resources=[resource()])
+    template_entry, resource_entry = data["tools"][1:]
+    assert (template_entry["name"], template_entry["definition"]["uriTemplate"]) == (
+        "notes://notes/{id}",
+        "notes://notes/{id}",
+    )
+    read(data, LIMITS)
+    resource_entry["definition"]["uri"] = "notes://other"
+    assert invalid(data) == "at remote.tools[2]"
+    # An unpinnable entry may be listed under a name outside the form, with no definition.
+    data = kinds_report([], templates=[template(uriTemplate="notes://f/{+path}")])
+    [entry] = [e for e in data["tools"] if e.get("kind") == "resource_template"]
+    assert (entry["name"], entry["state"], entry["definition"]) == (
+        "notes://f/{+path}",
+        "invalid",
+        None,
+    )
+    read(data, LIMITS)
+    entry["state"] = "unreviewed"
+    assert invalid(data) == "at remote.tools[1]"
+
+
+@pytest.mark.parametrize(
+    ("kind", "key"),
+    [("prompt", "p"), ("resource_template", "notes://n/{id}"), ("resource", "notes://i")],
+)
+def test_each_kinds_names_are_its_keys(kind: str, key: str) -> None:
+    data = kinds_report([])
+    entry = {**data["tools"][0], "kind": kind, "name": key, "pin": None, "definition": None}
+    entry["classification"] = None
+    data["tools"].append(entry)
+    read(data, LIMITS)
+    data["tools"][1]["name"] = "a b" if kind == "prompt" else "not a uri"
+    assert invalid(data) == "at remote.tools[1]"
+
+
+@pytest.mark.parametrize(
+    ("kind", "key", "noun"),
+    [
+        ("prompt", "a", "prompts"),
+        ("resource_template", "notes://n/{id}", "resource templates"),
+        ("resource", "notes://i", "resources"),
+    ],
+)
+def test_a_kind_entry_needs_its_kind_listed(kind: str, key: str, noun: str) -> None:
+    """A tools-only report (no ``listings``) holds tools alone, as before step 19: a gateway's
+    prompt entry there can't stand in for a tool of the same name on the vault's side."""
+    data = unclassified("a")
+    entry = {**data["tools"][0], "kind": kind, "name": key, "pin": None, "definition": None}
+    entry["classification"] = None
+    data["tools"].append(entry)
+    assert invalid(data) == f"at tools[1].kind (the server isn't listed for {noun})"
+    # Nor in a report that lists other kinds but not this one.
+    data = kinds_report([])
+    del data["listings"][kind]
+    data["tools"].append(entry)
+    assert invalid(data) == f"at tools[1].kind (the server isn't listed for {noun})"
+
+
+def test_each_kind_is_capped_on_its_own() -> None:
+    limits = GatewayLimits(max_tools_per_server=1)
+    read(kinds_report([named_prompt("p")]), limits)
+    assert invalid(kinds_report([named_prompt("p"), named_prompt("q")]), limits) == (
+        "at tools (more than gateway.limits.max_tools_per_server prompts listed)"
+    )
+    two = kinds_report([], resources=[resource(), resource(uri="notes://other")])
+    assert invalid(two, limits) == (
+        "at tools (more than gateway.limits.max_tools_per_server resources listed)"
+    )
+    templates = kinds_report([], templates=[template(), template(uriTemplate="notes://m/{id}")])
+    assert invalid(templates, limits) == (
+        "at tools (more than gateway.limits.max_tools_per_server resource templates listed)"
+    )
+
+
+def test_missing_entries_are_counted_per_kind() -> None:
+    data = kinds_report([], policy_kinds={"prompts": {"include": ["p"], "review": {"p": PIN0}}})
+    read(data, LIMITS)
+    data["policy"]["prompts"]["include"] = []
+    assert invalid(data) == "at tools (more missing prompts than the policy includes)"
+    data = kinds_report([], policy_kinds={"fixed": {"include": ["notes://index"], "review": {}}})
+    read(data, LIMITS)
+    data["policy"]["resources"]["fixed"]["include"] = []
+    assert invalid(data) == "at tools (more missing resources than the policy includes)"
+    data = kinds_report(
+        [], policy_kinds={"templates": {"include": ["notes://notes/{id}"], "review": {}}}
+    )
+    data["policy"]["resources"]["templates"]["include"] = []
+    assert invalid(data) == "at tools (more missing resource templates than the policy includes)"
+
+
+def test_the_same_name_in_two_kinds_is_two_entries() -> None:
+    data = kinds_report([named_prompt("a")])
+    assert [(e.get("kind", "tool"), e["name"]) for e in data["tools"]] == [
+        ("tool", "a"),
+        ("prompt", "a"),
+    ]
+    read(data, LIMITS)
+    data["tools"].append(copy.deepcopy(data["tools"][1]))
+    assert invalid(data) == "at tools (a tool twice)"
+
+
+def test_listings_out_of_shape() -> None:
+    data = kinds_report([])
+    data["listings"]["tool"] = {"failure": None, "findings": []}
+    assert invalid(data) == "at remote.listings.tool.?"
+    data = kinds_report([])
+    data["listings"]["prompt"]["failure"] = "x" * 129
+    assert invalid(data) == "at remote.listings.prompt.failure"
+
+
+def test_a_toolkit_entry_is_a_tool(tmp_path: Path, example_raw: dict[str, Any]) -> None:
+    data = wired(toolkit_reviewed(tmp_path, example_raw))
+    data["tools"][0]["kind"] = "prompt"
+    assert invalid(data) == "at toolkit.tools[0].kind"

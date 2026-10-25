@@ -13,6 +13,7 @@ import httpx
 import pytest
 from mcp.types import Implementation, Tool
 
+from tests.unit.test_pins import kinds_server, named_prompt, prompt_pin
 from zoeymcp.cli import admin_client
 from zoeymcp.cli import review as view
 from zoeymcp.cli.main import main
@@ -20,6 +21,7 @@ from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import pins
+from zoeymcp.gateway import review as gateway_review
 from zoeymcp.gateway.review import ReviewError, report
 
 LIMITS = GatewayLimits()
@@ -936,3 +938,51 @@ def test_decline_through_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:
         code, out, err = run_cli(monkeypatch, fake, "review", "notes", "--choose", *option)
         assert (code, out) == (2, "")
         assert "--choose and --choices print text and take no other choices" in err
+
+
+# --- prompts and resources (M6 design L.4) -------------------------------------------------------
+
+
+def kinds_answer(prompt_marks: frozenset[pins.Mark] = frozenset()) -> dict[str, Any]:
+    """A server whose tool matches and whose included prompt drifted (or is marked)."""
+    server = kinds_server(
+        tools=(["a"], {"a": pin("a")}),
+        prompts={"include": ["p"], "review": {"p": prompt_pin("p", description="Old.")}},
+    )
+    found: dict[pins.DefinitionKind, pins.KindListing] = {
+        "prompt": pins.KindListing([named_prompt("p")])
+    }
+    evaluation = pins.evaluate_server([tool("a")], found, server, {"prompt": prompt_marks}, LIMITS)
+    return report(
+        "notes",
+        server,
+        [tool("a")],
+        evaluation,
+        marks=frozenset(),
+        defs=lambda pin_: None,
+        limits=LIMITS,
+        era="modern",
+        protocol_version="2026-07-28",
+        server_info=None,
+        instructions=None,
+        kinds={"prompt": gateway_review.KindReview(found["prompt"], prompt_marks)},
+    )
+
+
+def test_a_clear_is_refused_while_an_included_prompt_doesnt_match() -> None:
+    """Every included entry of every kind must match; ``not_clean`` names tools only (a report's
+    name lists are tool names), the refusal's text names the prompt."""
+    answer = kinds_answer()
+    assert answer["clean"] is False
+    with pytest.raises(ReviewError) as caught:
+        gateway_review._refuse_unless_clean(answer)
+    assert (caught.value.status, caught.value.reason) == (409, "not_clean")
+    assert str(caught.value) == "not every included tool matches its pin: p"
+    assert answer["not_clean"] == []
+
+
+def test_a_kinds_mark_makes_the_review_unclean() -> None:
+    marked = frozenset({("p", prompt_pin("p", description="Old."))})
+    answer = kinds_answer(marked)
+    assert answer["marked"] == []  # tools only
+    assert answer["clean"] is False

@@ -52,8 +52,8 @@ from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewGateway, ViewToolkitServer
-from . import access, capabilities, logs, pipeline
+from ..common.policy.view import ViewGateway, ViewRemoteServer, ViewToolkitServer
+from . import access, capabilities, logs, pins, pipeline
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
 from .committed import Committed
@@ -394,8 +394,12 @@ class GatewayApp:
                 logs.event("approvals_withdrawn", count=withdrawn)
         if previous is None:
             keep = {pin for server in gateway.servers.values() for pin in server.review.values()}
-            for server_name in self.pool.marks.servers():
-                keep |= {pin for _, pin in self.pool.marks.for_server(server_name)}
+            # A remote server's prompts and resources are kept by their pins too (M6 L.4).
+            for listed in gateway.servers.values():
+                if isinstance(listed, ViewRemoteServer):
+                    for kind in pins.enabled_kinds(listed.enable):
+                        keep |= set(pins.entries(listed, kind).review.values())
+            keep |= self.pool.marks.pins()
             self.pool.defs.prune(keep)
             if self.first_view is not None:
                 self.first_view.set()

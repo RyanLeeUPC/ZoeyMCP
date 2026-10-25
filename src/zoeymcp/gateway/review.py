@@ -14,13 +14,21 @@ included tools; ``attention`` is the attention decision for the whole listing (M
 which also counts a tool nobody reviewed. The upstream's ``instructions`` and ``serverInfo`` are
 included for display only; they are never forwarded to an agent.
 
+A server that enables prompts or resources (M6 design L.4) is reported with an entry per prompt,
+resource template and fixed resource beside its tools, each with the states a tool has, its
+projection and pin, and its findings; the policy block carries its ``prompts`` and ``resources``
+blocks, and ``listings`` how each kind's walk went. The review's ``resources/list`` is the
+upstream's whole list under the listing caps, so a fixed resource nobody included yet shows as
+``unreviewed`` at the pin the review learned (OPS-11); a list cut at a cap says so.
+
 ``--clear`` lists again and, only if every included tool matches its pin, clears the server's
 drift marks and re-evaluates the server's live connections, so the tools come back for agents,
 and the answer names them (``cleared``). Otherwise it refuses ``not_clean``, and the review it
 carries names the tools that don't match (``not_clean``), so a clear job's report says either
-(M6 design J.4). A connection whose own last listing still shows drift marks the tool again. A
-clear asked through the vault's job path, the portal's **Clear the marks** among them, logs
-``drift_cleared`` with ``by: portal``.
+(M6 design J.4). An included prompt or resource that doesn't match refuses it too, and a clear
+clears every kind's marks; ``cleared`` and ``not_clean`` name tools only. A connection whose own
+last listing still shows drift marks the tool again. A clear asked through the vault's job path,
+the portal's **Clear the marks** among them, logs ``drift_cleared`` with ``by: portal``.
 
 A toolkit server is reviewed without any upstream call (M4 design H.6): its definitions are the
 ones the loaded module generates, and the answer adds the distribution, its version, and each
@@ -30,6 +38,7 @@ tool's classification as the code declares it.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence, Set
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import anyio
@@ -41,7 +50,7 @@ from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from . import logs, pins
 from .connstate import WAITING, Phase
 from .defstore import changed_members, diff
-from .findings import tool_findings
+from .findings import definition_findings, tool_findings
 from .toolkits import Loaded, SelfPinned
 from .upstream import CLOSE_GRACE, Connection, UpstreamError
 
@@ -60,6 +69,17 @@ ClearedBy = Literal["review", "portal"]
 # The reason a clear is refused while an included tool doesn't match its pin; the vault maps it
 # to the portal's clear_not_clean (vault/reviewjobs.py, CR-8).
 NOT_CLEAN = "not_clean"
+# Each kind's definition at a pin, from the definition store.
+KindDefinitions = Callable[[str, pins.DefinitionKind], Mapping[str, Any] | None]
+
+
+@dataclass(frozen=True)
+class KindReview:
+    """One kind beyond tools as a review listed it (M6 design L.4): the listing, and the
+    server's drift marks of that kind."""
+
+    listing: pins.KindListing
+    marks: Set[pins.Mark] = frozenset()
 
 
 class ReviewError(Exception):
@@ -99,7 +119,7 @@ def _state(
     evaluation: pins.Evaluation,
     reports: Sequence[pins.Report],
     pin: str | None,
-    policy: pins.Reviewed,
+    review: Mapping[str, str],
     marked: Set[str],
 ) -> ToolState:
     if name in evaluation.exposed:
@@ -109,7 +129,7 @@ def _state(
     for kind in ("duplicate", "invalid", "drift", "unreviewed", "declined"):
         if kind in kinds:
             return kind
-    if pin is None or policy.review.get(name) != pin:
+    if pin is None or review.get(name) != pin:
         return "unreviewed"
     if name in marked:
         return "marked"
@@ -159,14 +179,118 @@ def _tool_entry(
     entry["findings"] = [
         finding.as_dict() for finding in tool_findings(projected.definition, limits)
     ]
+    _drift(entry, state, projected.definition, defs)
+    return entry
+
+
+def _drift(
+    entry: dict[str, Any],
+    state: ToolState,
+    definition: Mapping[str, Any],
+    defs: Callable[[str], Mapping[str, Any] | None],
+) -> None:
+    """A drift entry's changed members, diff and reviewed definition, when the store has it."""
     pinned = entry["pinned"]
     if state == "drift" and pinned is not None:
         old = defs(pinned)
         if old is not None:
-            entry["changed"] = changed_members(old, projected.definition)
-            entry["diff"] = diff(old, projected.definition)
+            entry["changed"] = changed_members(old, definition)
+            entry["diff"] = diff(old, definition)
             entry["reviewed"] = dict(old)
+
+
+def _kind_entry(
+    kind: pins.DefinitionKind,
+    name: str,
+    item: Any,
+    state: ToolState,
+    policy: pins.Entries,
+    defs: Callable[[str], Mapping[str, Any] | None],
+) -> dict[str, Any]:
+    """A prompt's or a resource's entry: a tool's shape, with its kind and no classification."""
+    entry: dict[str, Any] = {
+        "kind": kind,
+        "name": name,
+        "state": state,
+        "included": name in policy.include,
+        "classification": None,
+        "pin": None,
+        "pinned": policy.review.get(name),
+        "definition": None,
+        "findings": [],
+        "changed": None,
+        "diff": None,
+    }
+    if state == "missing":
+        return entry
+    if state == "duplicate":
+        message = "the server lists this name more than once"
+        entry["findings"] = [{"level": "error", "pointer": "", "message": message}]
+        return entry
+    try:
+        projected = pins.project_kind(kind, item)
+    except pins.ProjectionError as exc:
+        entry["findings"] = [{"level": "error", "pointer": "", "message": str(exc)}]
+        return entry
+    entry["pin"] = projected.pin
+    entry["definition"] = dict(projected.definition)
+    entry["findings"] = [finding.as_dict() for finding in definition_findings(projected.definition)]
+    _drift(entry, state, projected.definition, defs)
     return entry
+
+
+def _kind_entries(
+    kind: pins.DefinitionKind,
+    review: KindReview,
+    evaluation: pins.Evaluation,
+    policy: ViewRemoteServer,
+    defs: KindDefinitions,
+) -> list[dict[str, Any]]:
+    """One kind's entries, as a listing's tools' are: every name listed, then every included
+    one it doesn't list."""
+    entries = pins.entries(policy, kind)
+    marked = {name for name, _ in review.marks}
+    by_name: dict[str, list[Any]] = {}
+    for item in review.listing.items:
+        by_name.setdefault(pins.key_of(kind, item), []).append(item)
+    out = []
+    for name in sorted(by_name):
+        reports = [r for r in evaluation.reports if r.tool == name]
+        listed = by_name[name]
+        pin = None
+        if len(listed) == 1:
+            try:
+                pin = pins.project_kind(kind, listed[0]).pin
+            except pins.ProjectionError:
+                pin = None
+        state = _state(name, evaluation, reports, pin, entries.review, marked)
+        single = listed[0] if len(listed) == 1 else None
+        out.append(_kind_entry(kind, name, single, state, entries, lambda p: defs(p, kind)))
+    for name in sorted(set(entries.include) - set(by_name)):
+        out.append(_kind_entry(kind, name, None, "missing", entries, lambda p: defs(p, kind)))
+    return out
+
+
+def _listing_note(review: KindReview) -> dict[str, Any]:
+    """How one kind's walk went, for the report's ``listings``."""
+    findings = []
+    if review.listing.cut:
+        count = len(review.listing.items)
+        findings.append(
+            {
+                "level": "warning",
+                "pointer": "",
+                "message": (
+                    f"the server lists more than the review could take under gateway.limits: "
+                    f"the first {count} are shown"
+                ),
+            }
+        )
+    return {"failure": review.listing.failure, "findings": findings}
+
+
+def _no_definition(pin: str, kind: pins.DefinitionKind) -> Mapping[str, Any] | None:
+    return None
 
 
 def report(
@@ -183,9 +307,13 @@ def report(
     server_info: Implementation | None,
     instructions: str | None,
     offered: Mapping[str, bool] | None = None,
+    kinds: Mapping[pins.DefinitionKind, KindReview] | None = None,
+    kind_defs: KindDefinitions = _no_definition,
 ) -> dict[str, Any]:
     """The review of one listing (pure, apart from reading the definition store). ``offered``
-    goes into the answer when the handshake was seen."""
+    goes into the answer when the handshake was seen; ``kinds`` holds the kinds beyond tools
+    the server enables, each evaluated in ``evaluation.kinds`` (M6 design L.4)."""
+    kinds = kinds or {}
     marked = {tool for tool, _ in marks}
     by_name: dict[str, list[Tool]] = {}
     for tool in tools:
@@ -200,11 +328,14 @@ def report(
                 pin = pins.project_and_pin(listed[0]).pin
             except pins.ProjectionError:
                 pin = None
-        state = _state(name, evaluation, reports, pin, policy, marked)
+        state = _state(name, evaluation, reports, pin, policy.review, marked)
         single = listed[0] if len(listed) == 1 else None
         entries.append(_tool_entry(name, single, state, policy, defs, limits))
     for name in sorted(set(policy.tools.include) - set(by_name)):
         entries.append(_tool_entry(name, None, "missing", policy, defs, limits))
+    for kind, review in kinds.items():
+        found = evaluation.kinds.get(kind, pins.Evaluation({}, (), frozenset(), False))
+        entries.extend(_kind_entries(kind, review, found, policy, kind_defs))
     info = None
     if server_info is not None:
         info = {"name": server_info.name, "version": server_info.version}
@@ -213,29 +344,36 @@ def report(
     if instructions is not None and len(instructions) > MAX_INSTRUCTIONS_CHARS:
         instructions = instructions[:MAX_INSTRUCTIONS_CHARS] + "..."
     included = [entry for entry in entries if entry["included"]]
+    block: dict[str, Any] = {
+        "include": list(policy.tools.include),
+        "allow": list(policy.tools.allow),
+        "approve": list(policy.tools.approve),
+        "on_drift": policy.on_drift,
+        "review": dict(policy.review),
+        "declined": dict(policy.declined),
+    }
+    for member in ("prompts", "resources"):
+        if member in policy.enable:
+            block[member] = getattr(policy, member).model_dump()
+    held = bool(marked) or any(review.marks for review in kinds.values())
     answer: dict[str, Any] = {
         "server": server,
         "kind": "remote",
         "vault_path": policy.vault_path,
         "era": era,
         "asserted_era": policy.era,
-        "policy": {
-            "include": list(policy.tools.include),
-            "allow": list(policy.tools.allow),
-            "approve": list(policy.tools.approve),
-            "on_drift": policy.on_drift,
-            "review": dict(policy.review),
-            "declined": dict(policy.declined),
-        },
+        "policy": block,
         "protocol_version": protocol_version,
         "server_info": info,
         "instructions": instructions,
         "blocked": evaluation.blocked,
         "marked": sorted(marked),
         "tools": entries,
-        "clean": not marked and all(entry["state"] == "ok" for entry in included),
+        "clean": not held and all(entry["state"] == "ok" for entry in included),
         "attention": attention(evaluation.listed, policy, marks).as_dict(),
     }
+    if kinds:
+        answer["listings"] = {kind: _listing_note(review) for kind, review in kinds.items()}
     if offered is not None:
         answer["offered"] = dict(offered)
     return answer
@@ -294,6 +432,7 @@ async def review(
     try:
         evaluation = await _listed(app, connection, limits)
         tools = list(connection.tools)
+        listings = dict(connection.listings)
         era = connection.era
         client = connection.client
         version = client.protocol_version if client is not None else None
@@ -316,6 +455,11 @@ async def review(
             server_info=server_info,
             instructions=instructions,
             offered=advertised,
+            kinds={
+                kind: KindReview(listing, pool.marks.for_server(server, kind))
+                for kind, listing in listings.items()
+            },
+            kind_defs=pool.defs.get,
         )
 
     answer = build(evaluation)
@@ -326,11 +470,17 @@ async def review(
     removed = pool.marks.replace(server, frozenset())[1]
     if removed:
         logs.event("drift_cleared", server=server, tools=sorted(t for t, _ in removed), by=by)
+    for kind in listings:
+        gone = pool.marks.replace(server, frozenset(), kind)[1]
+        if gone:
+            names = sorted(name for name, _ in gone)
+            logs.event("drift_cleared", server=server, definition_kind=kind, names=names, by=by)
     for live in pool.connections():
         if live.server == server:
             live.reevaluate(live.policy)
     # The review's own listing, as it evaluates with the marks gone.
-    answer = build(pins.evaluate(tools, policy, pool.marks.for_server(server), limits))
+    marks = {kind: pool.marks.for_server(server, kind) for kind in ("tool", *listings)}
+    answer = build(pins.evaluate_server(tools, listings, policy, marks, limits))
     answer["cleared"] = sorted(tool for tool, _ in removed)
     return answer
 
@@ -344,7 +494,13 @@ def _refuse_unless_clean(answer: dict[str, Any]) -> None:
         if entry["included"] and entry["state"] not in MATCHING
     ]
     if unmatched:
-        answer["not_clean"] = unmatched
+        answer["not_clean"] = [
+            entry["name"]
+            for entry in answer["tools"]
+            if entry.get("kind", "tool") == "tool"
+            and entry["included"]
+            and entry["state"] not in MATCHING
+        ]
         raise ReviewError(
             409,
             NOT_CLEAN,
@@ -391,7 +547,7 @@ def toolkit_report(
         except pins.ProjectionError:
             pin = None
         floor = spec.consequential and name in policy.tools.allow
-        state = _state(name, evaluation, reports, pin, reviewed, marked)
+        state = _state(name, evaluation, reports, pin, reviewed.review, marked)
         if floor and name not in evaluation.exposed and not reports:
             state = "invalid"  # hidden by the classification floor (H.2 step 7)
         entry = _tool_entry(name, tool, state, reviewed, _no_reviewed_copy, limits)

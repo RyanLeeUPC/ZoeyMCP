@@ -4,6 +4,10 @@ When a listed tool matches its pin, its canonical projection is written to ``def
 if it isn't there yet. The store is content-addressed: a file whose content doesn't hash to its
 name is ignored, so it checks itself even after a gateway compromise. It lets ``review`` and the
 ``tool_drift`` line say which members changed, with a diff. **No decision reads it.**
+
+Prompts and resources are kept the same way (M6 design L.4), each checked against its kind's pin
+(``put`` and ``get`` take the kind, ``tool`` when none is given), so a drift's reviewed side is
+there for every kind. Each kind pins under its own tag, so the kinds share one directory.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from typing import Any
 
 from ..common import canonical, files, textrules
 from . import logs
-from .pins import ProjectionError, pin_of
+from .pins import DefinitionKind, ProjectionError, pin_for
 
 DEFS_DIR = "defs"
 MAX_FILES = 4096
@@ -33,13 +37,14 @@ class DefinitionStore:
     def __init__(self, state_dir: Path) -> None:
         self._dir = state_dir / DEFS_DIR
 
-    def put(self, pin: str, definition: Mapping[str, Any]) -> None:
-        """Keep ``definition``, which must hash to ``pin``. A failed write is logged, not raised."""
+    def put(self, pin: str, definition: Mapping[str, Any], kind: DefinitionKind = "tool") -> None:
+        """Keep ``definition``, which must hash to ``pin`` as ``kind``. A failed write is logged,
+        not raised."""
         path = self._dir / _file_name(pin)
         if path.exists():
             return
         try:
-            if pin_of(definition) != pin:
+            if pin_for(kind, definition) != pin:
                 return
         except ProjectionError:
             return
@@ -48,8 +53,9 @@ class DefinitionStore:
         except OSError as exc:
             logs.event("defstore_write_failed", error=exc.strerror or "error")
 
-    def get(self, pin: str) -> dict[str, Any] | None:
-        """The definition for ``pin``, or None if it's missing, unreadable, or doesn't match."""
+    def get(self, pin: str, kind: DefinitionKind = "tool") -> dict[str, Any] | None:
+        """The definition of ``kind`` for ``pin``, or None if it's missing, unreadable, or
+        doesn't match."""
         try:
             data = (self._dir / _file_name(pin)).read_bytes()
         except OSError:
@@ -61,7 +67,7 @@ class DefinitionStore:
         if not isinstance(definition, dict):
             return None
         try:
-            return definition if pin_of(definition) == pin else None
+            return definition if pin_for(kind, definition) == pin else None
         except ProjectionError:
             return None
 
