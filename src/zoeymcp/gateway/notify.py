@@ -1,31 +1,54 @@
-"""Telling agents their tool list changed (M3 design E.7).
+"""Telling agents their tool list changed (M3 design E.7), and their prompt and resource lists
+(M6 design L.5, SPEC-1).
 
 A registry per (client, server) of downstream listeners: legacy sessions (by session id,
 registered on their requests, dropped on DELETE, at most :data:`MAX_SESSIONS` per pair) and
 modern ``subscriptions/listen`` streams that asked for ``toolsListChanged``. The SDK's session
 object for a request doesn't outlive the request otherwise, so the registry holds it.
 
-When a client's view of a server changes, only that client's listeners are told. Nothing about
-the change is sent: the agent lists again and sees the new view.
+When a client's view of a server changes, only that client's listeners are told, and only of the
+lists that changed: a legacy session gets each kind's ``list_changed`` notification, a modern
+stream each kind's bus event, which the SDK delivers only where the listen acknowledged it.
+Nothing about the change is sent: the agent lists again and sees the new view.
 """
 
 from __future__ import annotations
 
 import contextlib
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from typing import Final
 
 import anyio
 from anyio.abc import TaskGroup
 from mcp.server.session import ServerSession
-from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler, ToolsListChanged
+from mcp.server.subscriptions import (
+    InMemorySubscriptionBus,
+    ListenHandler,
+    PromptsListChanged,
+    ResourcesListChanged,
+    ServerEvent,
+    ToolsListChanged,
+)
 
 from . import logs
+from .capabilities import ServedKinds
 
 SEND_TIMEOUT = 5.0
 MAX_SESSIONS = 256  # per (client, server): the most max_sessions_per_client allows
 
 Key = tuple[str, str]  # (client, server)
+# Each list's bus event for a modern stream, and its notification for a legacy session.
+EVENTS: Final[Mapping[str, Callable[[], ServerEvent]]] = {
+    "tools": ToolsListChanged,
+    "prompts": PromptsListChanged,
+    "resources": ResourcesListChanged,
+}
+LEGACY: Final[Mapping[str, Callable[[ServerSession], Awaitable[None]]]] = {
+    "tools": ServerSession.send_tool_list_changed,
+    "prompts": ServerSession.send_prompt_list_changed,
+    "resources": ServerSession.send_resource_list_changed,
+}
 
 
 class Notifier:
@@ -71,8 +94,9 @@ class Notifier:
             handler = self._handlers[key] = ListenHandler(bus)
         return handler
 
-    def changed(self, client: str, server: str) -> None:
-        """The client's view of the server changed: tell its listeners."""
+    def changed(self, client: str, server: str, kinds: ServedKinds) -> None:
+        """The client's view of the server changed, in the lists ``kinds`` names (a drift, a
+        hide, a re-pin, an include): tell its listeners, one ``<kind>_changed_sent`` line each."""
         if self._group is None:
             return
         key = (client, server)
@@ -80,20 +104,21 @@ class Notifier:
         bus = self._buses.get(key)
         if not sessions and bus is None:
             return
-        logs.event("tools_changed_sent", client=client, server=server, sessions=len(sessions))
-        for session in sessions:
-            self._group.start_soon(self._send, session)
-        if bus is not None:
-            self._group.start_soon(bus.publish, ToolsListChanged())
+        for kind in sorted(set(kinds) & set(EVENTS)):
+            logs.event(f"{kind}_changed_sent", client=client, server=server, sessions=len(sessions))
+            for session in sessions:
+                self._group.start_soon(self._send, session, kind)
+            if bus is not None:
+                self._group.start_soon(bus.publish, EVENTS[kind]())
 
-    def changed_for(self, clients: Iterable[str], server: str) -> None:
+    def changed_for(self, clients: Iterable[str], server: str, kinds: ServedKinds) -> None:
         for client in clients:
-            self.changed(client, server)
+            self.changed(client, server, kinds)
 
-    async def _send(self, session: ServerSession) -> None:
+    async def _send(self, session: ServerSession, kind: str) -> None:
         # A session that has gone neither hangs nor raises here (SDK contract test 11).
         with anyio.move_on_after(SEND_TIMEOUT), contextlib.suppress(Exception):
-            await session.send_tool_list_changed()
+            await LEGACY[kind](session)
 
     def forget(self, client: str, server: str | None = None) -> None:
         """Drop a client's listeners: it was removed or unassigned."""

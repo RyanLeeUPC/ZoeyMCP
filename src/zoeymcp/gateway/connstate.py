@@ -6,6 +6,9 @@ change signal (``list_changed``, a new session id, an era change, a reconnect) m
 at once, and nothing is admitted until the listing has been compared again (G8). A call admitted
 before the signal is already on the wire and finishes.
 
+The version moves when the view a connection exposes changes, of any kind it lists (M6 design
+L.5): :func:`changed_kinds` names the lists that changed, which the agents on the path are told.
+
 Everything here is pure: transitions take the current state and return the next one, and time is
 passed in. ``upstream.py`` owns the tasks and the I/O.
 """
@@ -17,8 +20,10 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Literal
 
+from ..common.pinhash import KINDS, DefinitionKind
 from ..common.policy.view import ViewRemoteServer
 from .access import SUPPORTED_VERSIONS
+from .capabilities import LISTED_IN, ServedKinds
 from .pins import Evaluation, Mark
 
 Era = Literal["modern", "legacy"]
@@ -74,18 +79,32 @@ class ConnState:
     retry_at: float | None = None  # FAILED: no new connection before this
 
 
-def _view(evaluation: Evaluation | None) -> tuple[frozenset[tuple[str, str]], bool]:
+def _exposed(evaluation: Evaluation | None, kind: DefinitionKind) -> frozenset[tuple[str, str]]:
+    """The (name, pin) pairs ``evaluation`` exposes of one definition kind."""
     if evaluation is None:
-        return frozenset(), False
-    pins = frozenset((name, tool.pin) for name, tool in evaluation.exposed.items())
-    return pins, evaluation.blocked
+        return frozenset()
+    found = evaluation if kind == "tool" else evaluation.kinds.get(kind)
+    if found is None:
+        return frozenset()
+    return frozenset((name, exposed.pin) for name, exposed in found.exposed.items())
+
+
+def changed_kinds(old: Evaluation | None, new: Evaluation | None) -> ServedKinds:
+    """The lists whose exposed view differs between two evaluations: a kind whose exposed names
+    or pins changed, and tools when the server was blocked or unblocked (M3 kept that)."""
+    kinds = {LISTED_IN[kind] for kind in KINDS if _exposed(old, kind) != _exposed(new, kind)}
+    old_blocked = old is not None and old.blocked
+    new_blocked = new is not None and new.blocked
+    if old_blocked != new_blocked:
+        kinds.add("tools")
+    return frozenset(kinds)
 
 
 def on_listed(state: ConnState, evaluation: Evaluation, now: float) -> ConnState:
     """A listing succeeded and was evaluated: ``READY`` with that view."""
     if state.phase is Phase.CLOSED:
         return state
-    changed = _view(evaluation) != _view(state.evaluation)
+    changed = bool(changed_kinds(state.evaluation, evaluation))
     return ConnState(
         phase=Phase.READY,
         evaluation=evaluation,

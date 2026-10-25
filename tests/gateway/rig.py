@@ -440,11 +440,24 @@ async def agent(
     *,
     server: str = SERVER,
     headers: dict[str, str] | None = None,
+    opened: anyio.Event | None = None,
     **options: Any,
 ) -> AsyncIterator[Client]:
-    """An SDK client as an agent uses it, with the client's bearer token."""
+    """An SDK client as an agent uses it, with the client's bearer token. ``opened`` is set once
+    the gateway has answered the agent's GET stream, so a test waits for that, never sleeps."""
     headers = {"authorization": f"Bearer {token_for(client)}", **(headers or {})}
-    async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0)) as http:
+    hooks: dict[str, list[Any]] = {}
+    if opened is not None:
+        event = opened
+
+        async def answered(response: httpx2.Response) -> None:
+            if response.request.method == "GET" and response.status_code == 200:
+                event.set()
+
+        hooks["response"] = [answered]
+    async with httpx2.AsyncClient(
+        headers=headers, timeout=httpx2.Timeout(30.0), event_hooks=hooks
+    ) as http:
         transport = streamable_http_client(running.mcp(server), http_client=http)
         async with Client(transport, mode=mode, cache=None, **options) as connected:
             yield connected

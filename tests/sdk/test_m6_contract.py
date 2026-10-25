@@ -1,6 +1,14 @@
 """Contracts 57 to 61 (M6 design O.2): what M6's code relies on in the MCP SDK, and in
 ``cryptography`` for 61. Each lands in the step before the code that leans on it.
 
+Contract 57 (step 20): the SDK's low-level ``Server`` derives its capabilities from the handlers
+registered on it, for every session alike, in the legacy ``initialize`` result and the default
+``server/discover`` answer; ``add_request_handler("server/discover", ...)`` replaces the default
+answer, and ``initialize`` can't be replaced (it raises), but a middleware sees its result as the
+wire dict and what it writes there is what the agent gets. The gateway serves prompts and
+resources on some paths only, so it answers ``server/discover`` itself and rewrites the
+``initialize`` result's capabilities per path (``gateway/app.py``, design L.5).
+
 Contract 58 (step 18): ``mcp_types`` parse a prompt, a resource template and a resource with
 every member design L.2 pins, each under the member the projection reads, and drop a member
 they don't know, so a projection that reads L.2's members by name reads all of them and
@@ -48,6 +56,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp import Client, InputRequiredRoundsExceededError
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.subscriptions import (
     SUBSCRIPTION_ID_META_KEY,
     PromptsListChanged,
@@ -58,12 +67,21 @@ from mcp.server.subscriptions import (
 )
 from mcp.shared.exceptions import MCPError
 from mcp.types import Prompt, PromptReference, Resource, ResourceTemplate
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import BaseModel
 
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import ASSISTANT_PROMPT, FIXED, PATH, McpFake, Switch
 
-from .test_server_contract import Shaped, modern_body, modern_headers, modern_post, running
+from .test_server_contract import (
+    Shaped,
+    legacy_init,
+    modern_body,
+    modern_headers,
+    modern_post,
+    rpc_result,
+    running,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -106,6 +124,101 @@ async def listening(url: str, notifications: dict[str, Any]) -> AsyncIterator[Fr
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
         yield Frames(response.aiter_lines())
+
+
+# --- 57. capabilities, server/discover and initialize ---------------------------------------------
+
+
+async def list_prompts(
+    ctx: ServerRequestContext[Any], params: mcp_types.PaginatedRequestParams
+) -> mcp_types.ListPromptsResult:
+    return mcp_types.ListPromptsResult(prompts=[])
+
+
+async def own_discover(
+    ctx: ServerRequestContext[Any], params: mcp_types.RequestParams
+) -> mcp_types.DiscoverResult:
+    capabilities = mcp_types.ServerCapabilities(
+        tools=mcp_types.ToolsCapability(list_changed=True),
+        completions=mcp_types.CompletionsCapability(),
+    )
+    return mcp_types.DiscoverResult(
+        supported_versions=list(MODERN_PROTOCOL_VERSIONS), capabilities=capabilities
+    )
+
+
+def with_prompts() -> Shaped:
+    """The gateway's shape with a prompts list registered, as step 20 registers one."""
+    shaped = Shaped()
+    shaped.server.add_request_handler(
+        "prompts/list", mcp_types.PaginatedRequestParams, list_prompts
+    )
+    return shaped
+
+
+async def test_57_capabilities_come_from_the_handlers_for_every_session() -> None:
+    """A prompts handler puts prompts in what every client is told, in both eras."""
+    shaped = with_prompts()
+    with running(shaped) as url:
+        legacy = [rpc_result(legacy_init(url, client))["capabilities"] for client in ("a", "b")]
+        modern = [
+            rpc_result(modern_post(url, "server/discover", client=client))["capabilities"]
+            for client in ("a", "b")
+        ]
+    assert (
+        legacy[0]
+        == legacy[1]
+        == {
+            "prompts": {"listChanged": False},
+            "tools": {"listChanged": True},
+        }
+    )
+    # Modern: listChanged follows from serving subscriptions/listen, for prompts too.
+    assert (
+        modern[0]
+        == modern[1]
+        == {
+            "prompts": {"listChanged": True},
+            "tools": {"listChanged": True},
+        }
+    )
+
+
+async def test_57_server_discover_can_be_replaced() -> None:
+    shaped = with_prompts()
+    shaped.server.add_request_handler("server/discover", mcp_types.RequestParams, own_discover)
+    entry = shaped.server.get_request_handler("server/discover")
+    assert entry is not None
+    assert entry.handler is own_discover
+    with running(shaped) as url:
+        discovered = rpc_result(modern_post(url, "server/discover"))
+    assert discovered["capabilities"] == {"completions": {}, "tools": {"listChanged": True}}
+    assert discovered["supportedVersions"] == list(MODERN_PROTOCOL_VERSIONS)
+
+
+def test_57_initialize_cant_be_replaced() -> None:
+    shaped = Shaped()
+    with pytest.raises(ValueError, match="'initialize' is handled by the server runner"):
+        shaped.server.add_request_handler("initialize", mcp_types.RequestParams, own_discover)
+
+
+async def test_57_a_middleware_rewrites_the_initialize_result_on_the_wire() -> None:
+    """The result reaches a middleware as the wire dict, and its rewrite is what is sent."""
+    seen: list[str] = []
+
+    async def rewrite(ctx: ServerRequestContext[Any], call_next: CallNext) -> HandlerResult:
+        result = await call_next(ctx)
+        seen.append(ctx.method)
+        if ctx.method == "initialize" and isinstance(result, dict):
+            result["capabilities"] = {"tools": {"listChanged": True}}
+        return result
+
+    shaped = with_prompts()
+    shaped.server.middleware = [rewrite]
+    with running(shaped) as url:
+        initialized = rpc_result(legacy_init(url))
+    assert initialized["capabilities"] == {"tools": {"listChanged": True}}
+    assert seen == ["initialize"]
 
 
 # --- 58. a prompt, a resource template and a resource, as L.2 pins them --------------------------

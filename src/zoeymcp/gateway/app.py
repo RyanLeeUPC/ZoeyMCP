@@ -11,8 +11,17 @@ path: handlers read who is asking from a contextvar the glue sets per request, n
 also refuses another client's session id; :class:`~.access.SessionBindings` adds the server
 path, which the SDK's binding doesn't cover.
 
-The capabilities are computed, never copied from upstream: ``tools: {listChanged: true}`` and
-nothing else. The server is named ``zoeymcp/<server>``, and no ``instructions`` are sent.
+The capabilities are computed per path, never copied from upstream (M6 design L.5):
+``tools: {listChanged: true}``, and ``prompts`` and ``resources`` (``listChanged``, never
+``subscribe``) and ``completions`` only for a path that serves them
+(:func:`.capabilities.served`). The SDK derives its own from the handlers it was given, for
+every path at once, so the gateway answers ``server/discover`` itself and rewrites the legacy
+``initialize`` result's (:func:`capabilities_from_path`), which can't be replaced. The server is
+named ``zoeymcp/<server>``, and no ``instructions`` are sent.
+
+Prompts, resources and completions (L.6) are served from the connection's latest evaluation:
+what is included, pinned, matching and unmarked of each kind, each answer rebuilt by
+:mod:`.sanitize`, a read only of a URI :mod:`.resourcematch` allows.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ import anyio
 import httpx2
 import mcp_types
 import pydantic
+from mcp import Client
 from mcp.server import Server
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -41,19 +51,38 @@ from mcp.shared.message import ServerMessageMetadata
 from mcp.types import (
     CallToolRequestParams,
     CallToolResult,
+    CompleteRequestParams,
+    CompleteResult,
+    DiscoverResult,
+    GetPromptRequestParams,
+    GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
     ListToolsResult,
     PaginatedRequestParams,
+    Prompt,
+    PromptReference,
+    ReadResourceRequestParams,
+    ReadResourceResult,
+    RequestParams,
+    Resource,
+    ResourceTemplate,
+    ResourceTemplateReference,
     SubscriptionsListenRequestParams,
     SubscriptionsListenResult,
     Tool,
 )
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
+from ..common import canonical
+from ..common.pinhash import DefinitionKind
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway, ViewRemoteServer, ViewToolkitServer
-from . import access, capabilities, logs, pins, pipeline
+from . import access, capabilities, logs, pins, pipeline, resourcematch, sanitize
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
 from .committed import Committed
@@ -72,6 +101,13 @@ from .upstream import NotAdmitted, UpstreamError, UpstreamPool
 HEALTH_PATH = "/healthz"
 SDK_MAX_SESSIONS = 1024
 LISTING_TTL_MS = 60_000
+# The fixed refusals of a prompt or completion the path doesn't serve, or arguments it refuses;
+# none echoes what the agent sent (M6 design L.6).
+UNKNOWN_PROMPT = "Unknown prompt"
+UNKNOWN_REFERENCE = "Unknown reference"
+NOT_DECLARED = "arguments refused: not a declared argument"
+TOO_LARGE = "arguments refused: too large"
+NOT_PLAIN = "arguments refused: not plain JSON"
 
 
 @dataclass(frozen=True)
@@ -125,6 +161,26 @@ async def server_info_from_path(
     meta = result.get("_meta")
     if isinstance(meta, dict) and mcp_types.SERVER_INFO_META_KEY in meta:
         result["_meta"] = {**meta, mcp_types.SERVER_INFO_META_KEY: info}
+    return result
+
+
+async def capabilities_from_path(
+    ctx: ServerRequestContext[Any], call_next: CallNext
+) -> HandlerResult:
+    """The legacy ``initialize`` result's capabilities, the path's own (M6 design L.5): the SDK
+    states the ones its handlers give every path, and ``initialize`` can't be replaced (SDK
+    contract 57). Every list it advertises with ``listChanged`` is one the gateway sends.
+
+    It fails closed: with no request scope, or no result to rewrite, the SDK's set would name
+    every path's kinds (Y22), so ``initialize`` is refused instead."""
+    if ctx.method != "initialize":
+        return await call_next(ctx)
+    request = _scope()
+    result = await call_next(ctx)
+    if not isinstance(result, dict):  # SDK contract 57 pins a dict
+        raise MCPError(mcp_types.INTERNAL_ERROR, "no initialize result")
+    served = capabilities.advertised(capabilities.served(request.policy))
+    result["capabilities"] = served.model_dump(by_alias=True, exclude_none=True, mode="json")
     return result
 
 
@@ -303,9 +359,21 @@ class GatewayApp:
             on_list_tools=self._list_tools,
             on_call_tool=self._call_tool,
             on_subscriptions_listen=self._listen,
+            on_list_prompts=self._list_prompts,
+            on_get_prompt=self._get_prompt,
+            on_list_resources=self._list_resources,
+            on_list_resource_templates=self._list_templates,
+            on_read_resource=self._read_resource,
+            on_completion=self._complete,
             get_tool_input_schema=self._input_schema,
         )
-        self.server.middleware = [server_info_from_path, self._approval_retry_guard]
+        # The path's capabilities, never the SDK's for every path (L.5; SDK contract 57).
+        self.server.add_request_handler("server/discover", RequestParams, self._discover)
+        self.server.middleware = [
+            server_info_from_path,
+            capabilities_from_path,
+            self._approval_retry_guard,
+        ]
         self.sessions = access.SessionBindings(idle_timeout=1800)
         self.counters = access.ClientCounters()
         self.in_flight = pipeline.InFlight()
@@ -418,10 +486,12 @@ class GatewayApp:
                 after = gateway.servers.get(server_name)
                 was_assigned = client in old.clients and server_name in old.clients[client].servers
                 if before != after or not was_assigned:
-                    self.notifier.changed(client, server_name)
+                    kinds = capabilities.notified(before, after)
+                    self.notifier.changed(client, server_name, kinds)
 
-    def _connection_changed(self, connection: Any) -> None:
-        """A connection's exposed view changed: tell the clients that see it (E.7)."""
+    def _connection_changed(self, connection: Any, kinds: capabilities.ServedKinds) -> None:
+        """A connection's exposed view changed, in the lists ``kinds`` names: tell the clients
+        that see it (E.7; M6 design L.5)."""
         snapshot = self.policy.snapshot
         if snapshot is None:
             return
@@ -429,10 +499,12 @@ class GatewayApp:
         clients = snapshot.view.gateway.clients
         if holder == "*":
             self.notifier.changed_for(
-                (c for c, a in clients.items() if connection.server in a.servers), connection.server
+                (c for c, a in clients.items() if connection.server in a.servers),
+                connection.server,
+                kinds,
             )
         elif holder in clients:
-            self.notifier.changed(holder, connection.server)
+            self.notifier.changed(holder, connection.server, kinds)
 
     async def _run_manager(self, first_view: anyio.Event, stopping: anyio.Event) -> None:
         await first_view.wait()
@@ -717,7 +789,13 @@ class GatewayApp:
                 and len(body) <= MAX_ANSWER_BYTES
                 and self.approvals.table.legacy_waiting(handle_sha256(session_id))
             )
-            refusal = access.check_rpc(parsed, version, modern, answer_expected=answer_expected)
+            refusal = access.check_rpc(
+                parsed,
+                version,
+                modern,
+                answer_expected=answer_expected,
+                served=capabilities.served(request.policy),
+            )
             if refusal is not None:
                 await self._refuse(send, refusal, "method", server=name, client=client)
                 return stream
@@ -948,9 +1026,322 @@ class GatewayApp:
         SDK's handler acknowledges every kind it is asked for."""
         request = _scope()
         handler = self.notifier.listen_handler(request.client, request.server)
-        asked = capabilities.honored(params, capabilities.TOOLS_ONLY)
+        asked = capabilities.honored(params, capabilities.served(request.policy))
         result: SubscriptionsListenResult = await handler(ctx, asked)
         return result
+
+    async def _discover(
+        self, ctx: ServerRequestContext[Any], params: RequestParams
+    ) -> DiscoverResult:
+        """``server/discover``, as the SDK's own answers it but with the path's capabilities
+        (L.5; SDK contract 57)."""
+        request = _scope()
+        return DiscoverResult(
+            supported_versions=list(MODERN_PROTOCOL_VERSIONS),
+            capabilities=capabilities.advertised(capabilities.served(request.policy)),
+            instructions=None,
+        )
+
+    # --- prompts, resources and completions (M6 design L.6) ---------------------------------
+
+    async def _kinds(
+        self, ctx: ServerRequestContext[Any], request: RequestScope, rpc: str
+    ) -> tuple[ViewRemoteServer, pins.Evaluation]:
+        """The path's remote server and its connection's latest evaluation, once there is one.
+        Only a remote path serves these kinds: :func:`.access.check_rpc` refused the rest."""
+        self._register(ctx, request)
+        policy = request.policy
+        assert isinstance(policy, ViewRemoteServer)  # noqa: S101 - see check_rpc
+        try:
+            evaluation = await self.remote.exposed(request.client, request.server, policy)
+        except (NotAdmitted, UpstreamError) as exc:
+            ref = pipeline.new_ref()
+            logs.event(
+                "request",
+                client=request.client,
+                server=request.server,
+                rpc=rpc,
+                outcome="upstream_error",
+                reason=str(exc),
+                ref=ref,
+            )
+            raise MCPError(mcp_types.INTERNAL_ERROR, f"upstream unavailable (ref {ref})") from exc
+        return policy, evaluation
+
+    def _entries(
+        self, server: str, evaluation: pins.Evaluation, kind: DefinitionKind
+    ) -> dict[str, pins.ExposedTool]:
+        """What an evaluation serves of ``kind``: its exposed entries that no drift mark holds,
+        since another connection may have marked one after this one listed."""
+        found = evaluation.kinds.get(kind)
+        if found is None:
+            return {}
+        marks = self.pool.marks.for_server(server, kind)
+        return {
+            name: exposed
+            for name, exposed in found.exposed.items()
+            if (name, exposed.pin) not in marks
+        }
+
+    def _readable(self, server: str, evaluation: pins.Evaluation) -> Callable[[str], bool]:
+        """Whether a URI may be read: one of the served fixed resources, or one a served
+        template names (:func:`.resourcematch.allowed`)."""
+        fixed = self._entries(server, evaluation, "resource")
+        templates = self._entries(server, evaluation, "resource_template")
+        return lambda uri: resourcematch.allowed(uri, fixed, templates)
+
+    def _served(
+        self, server: str, kind: DefinitionKind, key: str, pin: str
+    ) -> Callable[[pins.Evaluation], bool]:
+        """Whether an evaluation still serves ``key`` of ``kind`` at ``pin``: a request goes out
+        only on those terms (:meth:`.UpstreamPool.request`)."""
+
+        def admitted(evaluation: pins.Evaluation) -> bool:
+            found = self._entries(server, evaluation, kind).get(key)
+            return found is not None and found.pin == pin
+
+        return admitted
+
+    def _logger(self, request: RequestScope, rpc: str, ref: str) -> Callable[..., None]:
+        started = time.monotonic()
+
+        def log(outcome: str, reason: str | None = None, **fields: Any) -> None:
+            logs.event(
+                "request",
+                client=request.client,
+                server=request.server,
+                rpc=rpc,
+                era=request.era,
+                outcome=outcome,
+                reason=reason,
+                ref=ref,
+                duration_ms=round((time.monotonic() - started) * 1000, 1),
+                **fields,
+            )
+
+        return log
+
+    @staticmethod
+    def _failed(
+        exc: NotAdmitted | UpstreamError, log: Callable[..., None], ref: str, *, not_found: int
+    ) -> MCPError:
+        """The agent's error for a request that went no further, with the fixed text
+        :func:`.sanitize.kind_error` gives; never the upstream's message."""
+        if isinstance(exc, NotAdmitted):
+            log("refused", exc.reason)
+            return MCPError(not_found, sanitize.NOT_FOUND)
+        log("timeout" if exc.outcome == "timeout" else "upstream_error", exc.detail or exc.outcome)
+        code, text = sanitize.kind_error(exc.outcome, exc.code, ref, not_found=not_found)
+        return MCPError(code, text)
+
+    async def _listed(
+        self,
+        ctx: ServerRequestContext[Any],
+        params: PaginatedRequestParams | None,
+        rpc: str,
+        kind: DefinitionKind,
+    ) -> tuple[RequestScope, list[dict[str, Any]]]:
+        """One kind's list: the served entries' pinned projections, by name or URI."""
+        request = _scope()
+        if params is not None and params.cursor is not None:
+            raise MCPError(mcp_types.INVALID_PARAMS, "the listing has one page")
+        _, evaluation = await self._kinds(ctx, request, rpc)
+        entries = self._entries(request.server, evaluation, kind)
+        logs.event(
+            "request",
+            client=request.client,
+            server=request.server,
+            rpc=rpc,
+            era=request.era,
+            outcome="ok",
+            entries=len(entries),
+        )
+        return request, [dict(entries[key].definition) for key in sorted(entries)]
+
+    async def _list_prompts(
+        self, ctx: ServerRequestContext[Any], params: PaginatedRequestParams | None
+    ) -> ListPromptsResult:
+        request, found = await self._listed(ctx, params, "prompts/list", "prompt")
+        prompts = [Prompt.model_validate(definition) for definition in found]
+        if request.era == "modern":
+            return ListPromptsResult(prompts=prompts, ttl_ms=LISTING_TTL_MS, cache_scope="private")
+        return ListPromptsResult(prompts=prompts)
+
+    async def _list_templates(
+        self, ctx: ServerRequestContext[Any], params: PaginatedRequestParams | None
+    ) -> ListResourceTemplatesResult:
+        rpc = "resources/templates/list"
+        request, found = await self._listed(ctx, params, rpc, "resource_template")
+        templates = [ResourceTemplate.model_validate(definition) for definition in found]
+        if request.era == "modern":
+            return ListResourceTemplatesResult(
+                resource_templates=templates, ttl_ms=LISTING_TTL_MS, cache_scope="private"
+            )
+        return ListResourceTemplatesResult(resource_templates=templates)
+
+    async def _list_resources(
+        self, ctx: ServerRequestContext[Any], params: PaginatedRequestParams | None
+    ) -> ListResourcesResult:
+        # The upstream's own list is never relayed: only the reviewed fixed resources (L.6).
+        request, found = await self._listed(ctx, params, "resources/list", "resource")
+        resources = [Resource.model_validate(definition) for definition in found]
+        if request.era == "modern":
+            return ListResourcesResult(
+                resources=resources, ttl_ms=LISTING_TTL_MS, cache_scope="private"
+            )
+        return ListResourcesResult(resources=resources)
+
+    async def _get_prompt(
+        self, ctx: ServerRequestContext[Any], params: GetPromptRequestParams
+    ) -> GetPromptResult:
+        request = _scope()
+        ref = pipeline.new_ref()
+        log = self._logger(request, "prompts/get", ref)
+        policy, evaluation = await self._kinds(ctx, request, "prompts/get")
+        name = params.name
+        exposed = self._entries(request.server, evaluation, "prompt").get(name)
+        if exposed is None:
+            log("refused", "unknown_prompt")
+            raise MCPError(mcp_types.INVALID_PARAMS, UNKNOWN_PROMPT)
+        declared = [argument["name"] for argument in exposed.definition.get("arguments", ())]
+        arguments = dict(params.arguments or {})
+        limits = request.snapshot.view.gateway.limits
+        problem = _arguments_problem(arguments, declared, arguments, limits)
+        if problem is not None:
+            log("refused", "arguments")
+            raise MCPError(mcp_types.INVALID_PARAMS, problem)
+
+        async def send(client: Client) -> GetPromptResult:
+            return await client.get_prompt(name, arguments or None)
+
+        try:
+            raw = await self.pool.request(
+                request.server,
+                policy,
+                request.client,
+                send,
+                admitted=self._served(request.server, "prompt", name, exposed.pin),
+            )
+        except (NotAdmitted, UpstreamError) as exc:
+            raise self._failed(exc, log, ref, not_found=mcp_types.INVALID_PARAMS) from exc
+        result = sanitize.sanitize_prompt(
+            raw,
+            assistant=name in policy.prompts.assistant,
+            allowed=self._readable(request.server, evaluation),
+            max_result_bytes=limits.max_result_bytes,
+        )
+        if result == "assistant":
+            log("refused", "assistant")
+            raise MCPError(mcp_types.INTERNAL_ERROR, sanitize.assistant_refused(name))
+        if isinstance(result, str):
+            log("refused", result)
+            raise _too_large(ref)
+        prompt, stats = result
+        _log_sanitized(request.server, stats, ref, name=name)
+        log("ok", messages=len(prompt.messages))
+        if request.era == "modern":
+            prompt.result_type = "complete"
+        return prompt
+
+    async def _read_resource(
+        self, ctx: ServerRequestContext[Any], params: ReadResourceRequestParams
+    ) -> ReadResourceResult:
+        request = _scope()
+        ref = pipeline.new_ref()
+        log = self._logger(request, "resources/read", ref)
+        # Not found, with the era's code, unless the URI may be read (SPEC-2, SPEC-4).
+        not_found = sanitize.not_found_code(request.era)
+        policy, evaluation = await self._kinds(ctx, request, "resources/read")
+        uri = params.uri
+        if not self._readable(request.server, evaluation)(uri):
+            log("refused", "not_readable")
+            raise MCPError(not_found, sanitize.NOT_FOUND)
+
+        async def send(client: Client) -> ReadResourceResult:
+            return await client.read_resource(uri)
+
+        try:
+            raw = await self.pool.request(
+                request.server,
+                policy,
+                request.client,
+                send,
+                admitted=lambda found: self._readable(request.server, found)(uri),
+            )
+        except (NotAdmitted, UpstreamError) as exc:
+            raise self._failed(exc, log, ref, not_found=not_found) from exc
+        limits = request.snapshot.view.gateway.limits
+        result = sanitize.sanitize_read(raw, uri=uri, max_result_bytes=limits.max_result_bytes)
+        if result == "not_found":
+            # Nothing of what was asked for is left: never an empty answer.
+            log("refused", "nothing_left")
+            raise MCPError(not_found, sanitize.NOT_FOUND)
+        if isinstance(result, str):
+            log("refused", result)
+            raise _too_large(ref)
+        read, stats = result
+        _log_sanitized(request.server, stats, ref)
+        log("ok", contents=len(read.contents))
+        if request.era == "modern":
+            # A read's contents are live: not cached (SPEC-3).
+            read.ttl_ms = 0
+            read.cache_scope = "private"
+            read.result_type = "complete"
+        return read
+
+    async def _complete(
+        self, ctx: ServerRequestContext[Any], params: CompleteRequestParams
+    ) -> CompleteResult:
+        request = _scope()
+        ref = pipeline.new_ref()
+        log = self._logger(request, "completion/complete", ref)
+        policy, evaluation = await self._kinds(ctx, request, "completion/complete")
+        asked = params.ref
+        upstream_ref: PromptReference | ResourceTemplateReference
+        if isinstance(asked, PromptReference):
+            kind: DefinitionKind = "prompt"
+            key = asked.name
+            upstream_ref = PromptReference(type="ref/prompt", name=key)
+        else:
+            kind, key = "resource_template", asked.uri
+            upstream_ref = ResourceTemplateReference(type="ref/resource", uri=key)
+        exposed = self._entries(request.server, evaluation, kind).get(key)
+        if exposed is None:
+            log("refused", "unknown_reference")
+            raise MCPError(mcp_types.INVALID_PARAMS, UNKNOWN_REFERENCE)
+        if kind == "prompt":
+            names = [argument["name"] for argument in exposed.definition.get("arguments", ())]
+        else:
+            names = list(resourcematch.variables(key))
+        argument = params.argument
+        context = dict(params.context.arguments or {}) if params.context is not None else {}
+        sent = {"argument": {"name": argument.name, "value": argument.value}, "context": context}
+        limits = request.snapshot.view.gateway.limits
+        given = {argument.name: argument.value, **context}
+        problem = _arguments_problem(given, names, sent, limits)
+        if problem is not None:
+            log("refused", "arguments")
+            raise MCPError(mcp_types.INVALID_PARAMS, problem)
+
+        async def send(client: Client) -> CompleteResult:
+            value = {"name": argument.name, "value": argument.value}
+            return await client.complete(upstream_ref, value, context or None)
+
+        try:
+            raw = await self.pool.request(
+                request.server,
+                policy,
+                request.client,
+                send,
+                admitted=self._served(request.server, kind, key, exposed.pin),
+            )
+        except (NotAdmitted, UpstreamError) as exc:
+            raise self._failed(exc, log, ref, not_found=mcp_types.INVALID_PARAMS) from exc
+        completed, stats = sanitize.sanitize_completion(raw)
+        log("ok", values=len(completed.completion.values), dropped=stats.dropped_blocks)
+        if request.era == "modern":
+            completed.result_type = "complete"
+        return completed
 
     def _input_schema(self, name: str) -> dict[str, Any] | None:
         """The pinned input schema, so the SDK checks ``Mcp-Param-*`` headers against it."""
@@ -970,6 +1361,37 @@ class GatewayApp:
             self.notifier.register_session(
                 request.client, request.server, request.session_id, ctx.session
             )
+
+
+def _arguments_problem(
+    names: dict[str, str], declared: list[str], sent: object, limits: GatewayLimits
+) -> str | None:
+    """Why a prompt's or a completion's arguments are refused (L.6, SPEC-6): a name that isn't
+    one the prompt declares or the template holds, or ``sent`` over ``max_argument_bytes``. The
+    SDK's own parse already made every value a string."""
+    if not set(names) <= set(declared):
+        return NOT_DECLARED
+    try:
+        size = len(canonical.dumps_canonical(sent))
+    except canonical.JSONRejected:
+        return NOT_PLAIN
+    return TOO_LARGE if size > limits.max_argument_bytes else None
+
+
+def _too_large(ref: str) -> MCPError:
+    return MCPError(mcp_types.INTERNAL_ERROR, f"{sanitize.MESSAGES['too_large']} (ref {ref})")
+
+
+def _log_sanitized(server: str, stats: sanitize.Stats, ref: str, **fields: Any) -> None:
+    logs.event(
+        "result_sanitized",
+        server=server,
+        revealed=stats.revealed,
+        dropped_blocks=stats.dropped_blocks,
+        wrapped=stats.wrapped,
+        ref=ref,
+        **fields,
+    )
 
 
 def _short(session_id: str) -> str:

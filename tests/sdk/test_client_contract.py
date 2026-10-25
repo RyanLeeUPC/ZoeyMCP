@@ -32,7 +32,9 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import (
+    ASSISTANT_PROMPT,
     BACK_CHANNELS,
+    FIXED,
     REQUEST_STATE,
     BackChannel,
     BackChannelAnswer,
@@ -58,10 +60,17 @@ REQUEST_METHODS: dict[BackChannel, str] = {
 EGRESS_REQUESTS = frozenset(
     {"initialize", "server/discover", "tools/list", "tools/call", "subscriptions/listen", "ping"}
 )
-# The list requests of a server that enables prompts or resources (M6 design L.4), by entry.
+# The requests of a server that enables prompts, resources or completions (M6 design L.4, L.6),
+# by entry, and the params each request that names something carries.
 EGRESS_KIND_REQUESTS = {
-    "prompts": frozenset({"prompts/list"}),
-    "resources": frozenset({"resources/list", "resources/templates/list"}),
+    "prompts": frozenset({"prompts/list", "prompts/get"}),
+    "resources": frozenset({"resources/list", "resources/templates/list", "resources/read"}),
+    "completions": frozenset({"completion/complete"}),
+}
+EGRESS_KIND_PARAMS = {
+    "prompts/get": frozenset({"name", "arguments", "_meta"}),
+    "resources/read": frozenset({"uri", "_meta"}),
+    "completion/complete": frozenset({"ref", "argument", "context", "_meta"}),
 }
 EGRESS_NOTIFICATIONS = frozenset({"notifications/initialized", "notifications/cancelled"})
 EGRESS_CALL_PARAMS = frozenset({"name", "arguments", "_meta"})
@@ -871,7 +880,31 @@ async def test_nothing_beyond_the_egress_allowlists_is_sent(mode: str) -> None:
     assert sent == expected
 
 
-def is_egress_shape(item: Recorded) -> bool:
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_a_get_read_and_complete_fit_the_egress_allowlists(mode: str) -> None:
+    """M6 design L.6: what the gateway's client sends for a prompt, a read and a completion is
+    the egress filter's kind request with only that request's own params, and no capability."""
+    fake = McpFake(prompts=True, resources=True)
+    with running(fake) as url:
+        async with connect(url, mode, input_required_max_rounds=0) as client:
+            await client.get_prompt(ASSISTANT_PROMPT, {"topic": "notes"})
+            await client.read_resource(FIXED)
+            await client.complete(
+                types.PromptReference(type="ref/prompt", name=ASSISTANT_PROMPT),
+                {"name": "topic", "value": "no"},
+                context_arguments={"topic": "n"},
+            )
+    allowed = frozenset().union(*EGRESS_KIND_REQUESTS.values())
+    asked = [item for item in fake.received if item.rpc_method in EGRESS_KIND_PARAMS]
+    assert sorted(item.rpc_method or "" for item in asked) == sorted(EGRESS_KIND_PARAMS)
+    for item in asked:
+        assert item.rpc_method in allowed
+        assert set(item.params) <= EGRESS_KIND_PARAMS[item.rpc_method or ""], item
+        assert set(item.meta_keys) <= EGRESS_META_KEYS, item
+        assert is_egress_shape(item, kinds=True), item
+
+
+def is_egress_shape(item: Recorded, *, kinds: bool = False) -> bool:
     """One of the POST body shapes the egress filter allows (design F.2)."""
     message = item.message
     if not isinstance(message, dict):
@@ -880,6 +913,8 @@ def is_egress_shape(item: Recorded) -> bool:
     if method is None:
         return "error" in message or message.get("result") == {}
     allowed = EGRESS_REQUESTS if "id" in message else EGRESS_NOTIFICATIONS
+    if kinds and "id" in message:
+        allowed = allowed.union(*EGRESS_KIND_REQUESTS.values())
     if method not in allowed:
         return False
     params = message.get("params", {})

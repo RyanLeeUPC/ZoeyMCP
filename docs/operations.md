@@ -1412,6 +1412,19 @@ and the ones it did are checked as usual. To serve, the gateway lists resources 
 included one is found, so including another lists them again at once. With `on_drift: fail` a
 drift of any kind blocks the whole server.
 
+Each server path states and answers only the kinds it serves: prompts or resources when the
+server enables the kind and includes at least one of it, and completions beside a served prompt
+or template; on any other path their methods get `-32601`, as an unknown method does. Agents are
+given the included entries that match their pins. A prompt's text is shown with its hidden
+characters revealed, and a prompt whose messages speak as the assistant is refused unless it is
+listed in `prompts.assistant`. A read is "not found" (`-32002` before 2026-07-28, `-32602` from
+it) unless the URI is an included fixed resource, or one an included template names with each
+value 1 to 128 letters, digits or `-._~`, never `.` or `..` and never percent-encoded; only that
+URI's contents are passed on. What the gateway drops is counted under the answer's
+`_meta["zoeymcp/dropped"]`. Each answer logs `request` with its `rpc`, and a changed list is
+announced to the agents per kind (`prompts_changed_sent`, `resources_changed_sent`, beside
+`tools_changed_sent`).
+
 ## 13. `gateway-status`
 
 ```text

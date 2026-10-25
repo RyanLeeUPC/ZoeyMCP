@@ -26,6 +26,7 @@ from ..common import canonical
 from ..common.logs import refuse_type
 from ..common.policy.schema import NAME_PATTERN
 from ..common.policy.view import ViewClient, ViewGateway, ViewRemoteServer, ViewToolkitServer
+from .capabilities import TOOLS_ONLY, Kind, ServedKinds
 
 MODERN_VERSION = "2026-07-28"
 SUPPORTED_VERSIONS = frozenset({MODERN_VERSION, "2025-11-25", "2025-06-18"})
@@ -40,8 +41,24 @@ RPC_METHODS = frozenset(
         "tools/call",
         "subscriptions/listen",
         "notifications/cancelled",
+        "prompts/list",
+        "prompts/get",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+        "completion/complete",
     }
 )
+# The kind each method beyond tools belongs to: a path that doesn't serve the kind answers it
+# -32601, as an unknown method (M6 design L.5). Every other method is a tools path's.
+KIND_METHODS: Mapping[str, Kind] = {
+    "prompts/list": "prompts",
+    "prompts/get": "prompts",
+    "resources/list": "resources",
+    "resources/templates/list": "resources",
+    "resources/read": "resources",
+    "completion/complete": "completions",
+}
 MAX_BODY_DEPTH = 64
 SESSION_CAPACITY = 4096
 
@@ -472,13 +489,15 @@ def check_rpc(
     modern: bool,
     *,
     answer_expected: bool = False,
+    served: ServedKinds = TOOLS_ONLY,
 ) -> Refusal | None:
     """Step 12: a request or notification this gateway serves, or an agent's answer.
 
     A client response (no ``method``) is admitted only with ``answer_expected``: on a legacy
     session bound to this client and server, with a prompt waiting on it, in a small body
     (M4 design D.3). An unknown method gets ``-32601``, with HTTP 404 on modern requests and
-    200 on legacy ones, as each era expects.
+    200 on legacy ones, as each era expects, and so does a method of a kind the path doesn't
+    serve (``served``, from the view: M6 design L.5), before any handler runs.
     """
     method = message.get("method")
     if method is None:
@@ -487,6 +506,8 @@ def check_rpc(
         return Refusal(400, "a client response, and no prompt is waiting for one")
     if not isinstance(method, str) or method not in RPC_METHODS:
         return Refusal(404 if modern else 200, "method not served", rpc_code=-32601)
+    if KIND_METHODS.get(method, "tools") not in served:
+        return Refusal(404 if modern else 200, "kind not served", rpc_code=-32601)
     if version == "needs_initialize" and method != "initialize":
         return Refusal(400, "no protocol version")
     return None

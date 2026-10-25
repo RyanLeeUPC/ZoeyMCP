@@ -11,8 +11,9 @@ pipeline validated: its ``(name, digest(arguments))`` must match a registration,
 (G9). Nothing that would open a back channel goes out: no declared client capability, no
 ``requestState`` or ``inputResponses`` retry, no trace context.
 
-A server that enables prompts or resources is also listed for them (M6 design L.4): its
-connection's target names what it enables, and only those kinds' list requests go out on it.
+A server that enables prompts, resources or completions is also asked for them (M6 design L.4,
+L.6): its connection's target names what it enables, and only those kinds' requests go out on
+it, each with only its own params (no ``requestState`` or ``inputResponses`` retry).
 """
 
 from __future__ import annotations
@@ -49,10 +50,11 @@ CACHE_CONTROL = ("cache-control", "no-store")
 REQUESTS = frozenset(
     {"initialize", "server/discover", "tools/list", "tools/call", "subscriptions/listen", "ping"}
 )
-# The list requests of the kinds beyond tools, by the enable entry that allows them (L.4).
+# The requests of the kinds beyond tools, by the enable entry that allows them (L.4, L.6).
 KIND_REQUESTS: Mapping[str, frozenset[str]] = {
-    "prompts": frozenset({"prompts/list"}),
-    "resources": frozenset({"resources/list", "resources/templates/list"}),
+    "prompts": frozenset({"prompts/list", "prompts/get"}),
+    "resources": frozenset({"resources/list", "resources/templates/list", "resources/read"}),
+    "completions": frozenset({"completion/complete"}),
 }
 NOTIFICATIONS = frozenset({"notifications/initialized", "notifications/cancelled"})
 META_KEYS = frozenset(
@@ -65,6 +67,12 @@ META_KEYS = frozenset(
 )
 CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 CALL_PARAMS = frozenset({"name", "arguments", "_meta"})
+# What each request beyond tools that names something may carry (L.6).
+KIND_PARAMS: Mapping[str, frozenset[str]] = {
+    "prompts/get": frozenset({"name", "arguments", "_meta"}),
+    "resources/read": frozenset({"uri", "_meta"}),
+    "completion/complete": frozenset({"ref", "argument", "context", "_meta"}),
+}
 MAX_BODY_BYTES = 16 * 2**20
 
 
@@ -186,6 +194,8 @@ def _check_request(
         return _refuse(problem, kind)
     if method == "initialize" and not _capabilities_empty(params.get("capabilities", {})):
         return _refuse("a client capability is declared", kind)
+    if method in KIND_PARAMS and not set(params) <= KIND_PARAMS[method]:
+        return _refuse(f"{method} carries more than its own params", kind)
     if method == "tools/call":
         if not set(params) <= CALL_PARAMS:
             return _refuse("tools/call carries more than name and arguments", kind)

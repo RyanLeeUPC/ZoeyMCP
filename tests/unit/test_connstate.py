@@ -1,13 +1,15 @@
-"""Connection keys and the connection state machine (M3 design F.3, F.4)."""
+"""Connection keys and the connection state machine (M3 design F.3, F.4), and the lists a new
+evaluation changes, of every kind a server lists (M6 design L.5)."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from zoeymcp.common.pinhash import DefinitionKind
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.gateway import connstate
 from zoeymcp.gateway.connstate import (
@@ -18,6 +20,7 @@ from zoeymcp.gateway.connstate import (
     Wait,
     admit,
     backoff,
+    changed_kinds,
     connection_key,
     era_of,
     on_change,
@@ -154,6 +157,69 @@ def test_the_version_moves_only_when_the_view_changes() -> None:
     assert blocked.version == 4
     # Blocked with nothing exposed differs from not blocked with nothing exposed.
     assert on_listed(blocked, evaluation(), now=9).version == 5
+
+
+def with_kinds(
+    tools: dict[str, str] | None = None, blocked: bool = False, **kinds: dict[str, str]
+) -> Evaluation:
+    """An evaluation exposing ``tools``, and each other kind's entries by its name."""
+    base = exposing(tools or {}, blocked=blocked)
+    others: dict[DefinitionKind, Evaluation] = {
+        cast("DefinitionKind", kind): exposing(entries, blocked=blocked)
+        for kind, entries in kinds.items()
+    }
+    return Evaluation(
+        exposed=base.exposed, reports=(), marks=frozenset(), blocked=blocked, kinds=others
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        (with_kinds({"a": PIN_A}), with_kinds({"a": PIN_A}), set()),
+        (with_kinds({"a": PIN_A}), with_kinds({"a": PIN_B}), {"tools"}),
+        (with_kinds(prompt={"p": PIN_A}), with_kinds(prompt={"p": PIN_B}), {"prompts"}),
+        (with_kinds(prompt={"p": PIN_A}), with_kinds(prompt={}), {"prompts"}),
+        (with_kinds(prompt={"p": PIN_A}), with_kinds(), {"prompts"}),
+        (
+            with_kinds(resource_template={"t": PIN_A}),
+            with_kinds(resource_template={"u": PIN_A}),
+            {"resources"},
+        ),
+        (with_kinds(resource={"r": PIN_A}), with_kinds(resource={"r": PIN_B}), {"resources"}),
+        (
+            with_kinds({"a": PIN_A}, prompt={"p": PIN_A}, resource={"r": PIN_A}),
+            with_kinds({"a": PIN_B}, prompt={"p": PIN_A}, resource={"r": PIN_B}),
+            {"tools", "resources"},
+        ),
+        # Blocked or unblocked with nothing exposed is a tools change, as M3 had it.
+        (with_kinds(), with_kinds(blocked=True), {"tools"}),
+        (with_kinds(blocked=True), with_kinds(), {"tools"}),
+        (with_kinds(blocked=True), with_kinds(blocked=True), set()),
+        # A first evaluation, or a reconnect's, changes every list it exposes anything of.
+        (None, with_kinds({"a": PIN_A}, prompt={"p": PIN_A}), {"tools", "prompts"}),
+        (None, with_kinds(resource={"r": PIN_A}), {"resources"}),
+        (None, with_kinds(blocked=True), {"tools"}),
+        (with_kinds(prompt={"p": PIN_A}), None, {"prompts"}),
+        (None, None, set()),
+    ],
+)
+def test_the_lists_a_new_evaluation_changes(
+    old: Evaluation | None, new: Evaluation | None, expected: set[str]
+) -> None:
+    assert changed_kinds(old, new) == frozenset(expected)
+
+
+def test_the_version_moves_when_another_kind_changes() -> None:
+    state = on_listed(ConnState(), with_kinds({"a": PIN_A}, prompt={"p": PIN_A}), now=0)
+    same = on_listed(state, with_kinds({"a": PIN_A}, prompt={"p": PIN_A}), now=1)
+    assert same.version == state.version == 1
+    prompt = on_listed(same, with_kinds({"a": PIN_A}, prompt={"p": PIN_B}), now=2)
+    assert prompt.version == 2
+    resource = on_listed(
+        prompt, with_kinds({"a": PIN_A}, prompt={"p": PIN_B}, resource={"r": PIN_A}), now=3
+    )
+    assert resource.version == 3
 
 
 def test_a_listing_resets_failures() -> None:

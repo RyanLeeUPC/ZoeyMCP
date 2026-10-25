@@ -93,6 +93,7 @@ def test_the_allowlists_are_the_contract_tests() -> None:
     assert egressrules.NOTIFICATIONS == contract.EGRESS_NOTIFICATIONS
     assert egressrules.META_KEYS == contract.EGRESS_META_KEYS
     assert egressrules.CALL_PARAMS == contract.EGRESS_CALL_PARAMS
+    assert egressrules.KIND_PARAMS == contract.EGRESS_KIND_PARAMS
     assert egressrules.CAPABILITIES_META_KEY == types.CLIENT_CAPABILITIES_META_KEY
 
 
@@ -234,62 +235,97 @@ def test_other_requests_are_refused(method: str) -> None:
     )
 
 
-KIND_LISTS = [
-    ("prompts", "prompts/list"),
-    ("resources", "resources/list"),
-    ("resources", "resources/templates/list"),
+# Each request of a kind beyond tools, the enable entry that allows it, and params it may carry.
+KIND_REQUESTS = [
+    ("prompts", "prompts/list", {"cursor": "c"}),
+    ("prompts", "prompts/get", {"name": "brainstorm", "arguments": {"topic": "x"}}),
+    ("resources", "resources/list", {"cursor": "c"}),
+    ("resources", "resources/templates/list", {"cursor": "c"}),
+    ("resources", "resources/read", {"uri": "notes://index"}),
+    (
+        "completions",
+        "completion/complete",
+        {
+            "ref": {"type": "ref/prompt", "name": "brainstorm"},
+            "argument": {"name": "topic", "value": "a"},
+            "context": {"arguments": {}},
+        },
+    ),
 ]
 
 
-@pytest.mark.parametrize(("entry", "method"), KIND_LISTS)
-def test_a_kinds_list_goes_out_only_where_the_server_enables_it(entry: str, method: str) -> None:
-    """M6 design L.4: a server's connection is listed for the kinds it enables, and only those."""
-    allowed = Target(scheme="http", host="vault.invalid", port=None, path="/notes/mcp")
-    enabled = Target(
+def enabling(*entries: str) -> Target:
+    return Target(
         scheme="http",
         host="vault.invalid",
         port=None,
         path="/notes/mcp",
-        enabled=frozenset({entry, "completions"}),
+        enabled=frozenset(entries),
     )
-    other = "resources" if entry == "prompts" else "prompts"
-    wrong = Target(
-        scheme="http",
-        host="vault.invalid",
-        port=None,
-        path="/notes/mcp",
-        enabled=frozenset({other, "completions"}),
-    )
-    outgoing = request(rpc(method, {"cursor": "c"}))
-    assert verdict(outgoing, target=enabled) == Verdict(True, kind=f"request {method}")
-    for target in (allowed, wrong):
+
+
+@pytest.mark.parametrize(("entry", "method", "params"), KIND_REQUESTS)
+def test_a_kinds_request_goes_out_only_where_the_server_enables_it(
+    entry: str, method: str, params: dict[str, Any]
+) -> None:
+    """M6 design L.4, L.6: a server's connection asks for the kinds it enables, and only
+    those; the other entries never stand in for one."""
+    others = {"prompts", "resources", "completions", "sampling"} - {entry}
+    meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", CAPS: {}}
+    outgoing = request(rpc(method, {**params, "_meta": meta}))
+    assert verdict(outgoing, target=enabling(entry)) == Verdict(True, kind=f"request {method}")
+    for target in (TARGET, enabling(*others)):
         assert verdict(outgoing, target=target) == Verdict(
             False, "request method not allowed", f"request {method}"
         )
 
 
-@pytest.mark.parametrize("method", ["prompts/get", "resources/read", "completion/complete"])
-def test_a_kinds_other_requests_are_still_refused(method: str) -> None:
-    """Only the lists go out in step 19: getting, reading and completing are step 20's."""
-    target = Target(
-        scheme="http",
-        host="vault.invalid",
-        port=None,
-        path="/notes/mcp",
-        enabled=frozenset({"prompts", "resources", "completions"}),
+@pytest.mark.parametrize(
+    ("entry", "method"),
+    [
+        ("prompts", "prompts/get"),
+        ("resources", "resources/read"),
+        ("completions", "completion/complete"),
+    ],
+)
+@pytest.mark.parametrize("extra", ["requestState", "inputResponses", "task", "other"])
+def test_a_get_read_or_complete_carries_only_its_own_params(
+    entry: str, method: str, extra: str
+) -> None:
+    """No requestState or inputResponses retry, nor anything else, goes out on them (L.6)."""
+    outgoing = request(rpc(method, {extra: "x"}))
+    assert verdict(outgoing, target=enabling(entry)) == Verdict(
+        False, f"{method} carries more than its own params", f"request {method}"
     )
-    assert verdict(request(rpc(method, {})), target=target) == Verdict(
-        False, "request method not allowed", f"request {method}"
+
+
+def test_each_kinds_params() -> None:
+    assert {
+        "prompts/get": frozenset({"name", "arguments", "_meta"}),
+        "resources/read": frozenset({"uri", "_meta"}),
+        "completion/complete": frozenset({"ref", "argument", "context", "_meta"}),
+    } == egressrules.KIND_PARAMS
+
+
+def test_a_kinds_request_still_refuses_a_declared_capability() -> None:
+    outgoing = request(rpc("prompts/get", {"name": "a", "_meta": {CAPS: {"sampling": {}}}}))
+    assert verdict(outgoing, target=enabling("prompts")) == Verdict(
+        False, "a client capability is declared", "request prompts/get"
     )
 
 
 def test_the_requests_for_each_enable_list() -> None:
     assert egressrules.requests_for(frozenset()) == egressrules.REQUESTS
-    assert egressrules.requests_for(frozenset({"prompts", "completions", "sampling"})) == (
-        egressrules.REQUESTS | {"prompts/list"}
+    assert egressrules.requests_for(frozenset({"prompts", "sampling"})) == (
+        egressrules.REQUESTS | {"prompts/list", "prompts/get"}
+    )
+    assert egressrules.requests_for(frozenset({"completions"})) == (
+        egressrules.REQUESTS | {"completion/complete"}
     )
     assert egressrules.requests_for(frozenset({"resources", "prompts"})) == (
-        egressrules.REQUESTS | {"prompts/list", "resources/list", "resources/templates/list"}
+        egressrules.REQUESTS
+        | {"prompts/list", "prompts/get", "resources/list", "resources/templates/list"}
+        | {"resources/read"}
     )
 
 

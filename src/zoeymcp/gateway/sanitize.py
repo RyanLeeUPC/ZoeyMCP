@@ -16,6 +16,24 @@ A result is rebuilt block by block, never passed through:
 
 Upstream error text never reaches the agent: :func:`map_upstream` gives each outcome a fixed
 message with a reference the log also carries.
+
+Prompts, resources and completions (M6 design L.6, Q19) are rebuilt the same way:
+
+- a prompt's messages have their text revealed and are not wrapped (a prompt is meant to
+  instruct); an ``assistant`` message refuses the whole answer unless the operator listed the
+  prompt in ``assistant``; images and audio follow the result rules above; ``resource`` and
+  ``resource_link`` blocks are kept only for a URI the path allows to be read, else dropped,
+  never as a message;
+- a read keeps only the contents of the URI asked for, text revealed and a blob only of an
+  allowed media type in valid base64, never turned into text; nothing left is "not found";
+- what is dropped is counted under the result's ``_meta["zoeymcp/dropped"]``, a gateway-owned
+  key outside the protocol's reserved prefixes, never as content;
+- a completion keeps at most :data:`MAX_COMPLETION_VALUES` values of at most
+  :data:`MAX_COMPLETION_CHARS` characters each, revealed, and ``total`` and ``hasMore`` only as
+  an integer and a boolean.
+
+Every ``annotations`` and upstream ``_meta`` is stripped, and the whole answer stays under
+``max_result_bytes``. An upstream's error answers with :func:`kind_error`'s fixed text.
 """
 
 from __future__ import annotations
@@ -25,9 +43,24 @@ import binascii
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
-from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
+import mcp_types
+from mcp.types import (
+    AudioContent,
+    BlobResourceContents,
+    CallToolResult,
+    CompleteResult,
+    Completion,
+    EmbeddedResource,
+    GetPromptResult,
+    ImageContent,
+    PromptMessage,
+    ReadResourceResult,
+    ResourceLink,
+    TextContent,
+    TextResourceContents,
+)
 
 from ..common import canonical, textrules
 from .connstate import Era
@@ -196,24 +229,9 @@ def sanitize_result(
                 )
             content.append(TextContent(type="text", text=text))
         elif isinstance(block, ImageContent | AudioContent):
-            kind = "image" if isinstance(block, ImageContent) else "audio"
-            if (
-                block.mime_type in MEDIA_TYPES
-                and block.mime_type.startswith(kind + "/")
-                and valid_base64(block.data)
-                and budget.take(len(block.data))
-            ):
-                if isinstance(block, ImageContent):
-                    content.append(
-                        ImageContent(type="image", data=block.data, mime_type=block.mime_type)
-                    )
-                else:
-                    content.append(
-                        AudioContent(type="audio", data=block.data, mime_type=block.mime_type)
-                    )
-            else:
-                omitted += 1
-                content.append(TextContent(type="text", text=f"[{kind} omitted by the gateway]"))
+            media = _media(block, budget)
+            omitted += int(isinstance(media, TextContent))
+            content.append(media)
         else:
             dropped += 1
     if dropped:
@@ -240,6 +258,22 @@ def sanitize_result(
     )
 
 
+def _media(block: ImageContent | AudioContent, budget: _Budget) -> Block:
+    """An image or audio block rebuilt, if its media type is allowed for its kind, its data is
+    valid base64 and the budget has room; else a note saying it was omitted."""
+    kind = "image" if isinstance(block, ImageContent) else "audio"
+    if (
+        block.mime_type in MEDIA_TYPES
+        and block.mime_type.startswith(kind + "/")
+        and valid_base64(block.data)
+        and budget.take(len(block.data))
+    ):
+        if isinstance(block, ImageContent):
+            return ImageContent(type="image", data=block.data, mime_type=block.mime_type)
+        return AudioContent(type="audio", data=block.data, mime_type=block.mime_type)
+    return TextContent(type="text", text=f"[{kind} omitted by the gateway]")
+
+
 _REFUSED = object()
 
 
@@ -252,3 +286,189 @@ def _structured(value: Any, era: Era, output_check: OutputCheck | None) -> Any:
     if era == "legacy" and not isinstance(value, dict):
         return None
     return value
+
+
+# --- prompts, resources and completions (M6 design L.6) ---------------------------------------
+
+DROPPED_META_KEY: Final = "zoeymcp/dropped"
+NOT_FOUND: Final = "not found"
+CAPABILITY_REFUSED: Final = "the server needs a capability this gateway doesn't offer"
+MAX_COMPLETION_VALUES: Final = 100
+MAX_COMPLETION_CHARS: Final = 256
+# The upstream's not-found codes: -32002 (resources, before 2026-07-28) and -32602.
+UPSTREAM_NOT_FOUND: Final = frozenset({-32002, mcp_types.INVALID_PARAMS})
+# Why a prompt or a read is refused whole.
+Refused = Literal["assistant", "too_large", "not_found"]
+
+ResourceContents = TextResourceContents | BlobResourceContents
+
+
+class _TooLarge(Exception):
+    """The answer went over ``max_result_bytes``."""
+
+
+def assistant_refused(name: str) -> str:
+    """The answer to a prompt whose messages speak as the assistant, for a prompt the operator
+    didn't list in ``assistant`` (``name`` is a served prompt's, never the upstream's text)."""
+    return f"the server's prompt speaks as the assistant, which this gateway refuses for {name}"
+
+
+def not_found_code(era: Era) -> int:
+    """The not-found error code of the agent's era (SPEC-4): -32002 before 2026-07-28."""
+    return mcp_types.INVALID_PARAMS if era == "modern" else -32002
+
+
+def kind_error(outcome: Outcome, code: int | None, ref: str, *, not_found: int) -> tuple[int, str]:
+    """The error code and fixed text an agent gets for an upstream that didn't answer a prompt,
+    a read or a completion: its -32021 (a client capability it needs) and its not-found codes
+    each have their own text, with ``not_found`` as the code; anything else is the outcome's
+    message and the log's reference, as for tools."""
+    if code == mcp_types.MISSING_REQUIRED_CLIENT_CAPABILITY:
+        return code, CAPABILITY_REFUSED
+    if code in UPSTREAM_NOT_FOUND:
+        return not_found, NOT_FOUND
+    return mcp_types.INTERNAL_ERROR, f"{MESSAGES[outcome]} (ref {ref})"
+
+
+def _dropped_meta(dropped: int) -> dict[str, Any] | None:
+    return {DROPPED_META_KEY: dropped} if dropped else None
+
+
+def _contents(item: ResourceContents, budget: _Budget) -> tuple[ResourceContents | None, int]:
+    """A resource's contents rebuilt, and whether its text had something revealed: text
+    revealed, a blob only of an allowed media type in valid base64 (None otherwise: dropped,
+    never turned into text). Over the budget raises :class:`_TooLarge`."""
+    if isinstance(item, TextResourceContents):
+        text = clean_text(item.text)
+        mime_type = clean_text(item.mime_type) if item.mime_type is not None else None
+        if not budget.take(len(text.encode()) + len((mime_type or "").encode())):
+            raise _TooLarge
+        kept = TextResourceContents(uri=item.uri, mime_type=mime_type, text=text)
+        return kept, int(_was_revealed(item.text, text))
+    if item.mime_type not in MEDIA_TYPES or not valid_base64(item.blob):
+        return None, 0
+    if not budget.take(len(item.blob)):
+        raise _TooLarge
+    return BlobResourceContents(uri=item.uri, mime_type=item.mime_type, blob=item.blob), 0
+
+
+def _link(link: ResourceLink, budget: _Budget) -> tuple[ResourceLink, int]:
+    """A ``resource_link`` block with its URI, name, title, description and media type, the
+    text revealed; its size, icons, annotations and ``_meta`` are dropped."""
+    kept: dict[str, str | None] = {}
+    revealed = 0
+    for member in ("name", "title", "description", "mime_type"):
+        value = getattr(link, member)
+        if value is None:
+            kept[member] = None
+            continue
+        text = clean_text(value)
+        revealed += int(_was_revealed(value, text))
+        if not budget.take(len(text.encode())):
+            raise _TooLarge
+        kept[member] = text
+    rebuilt = ResourceLink(type="resource_link", uri=link.uri, **kept)
+    return rebuilt, revealed
+
+
+def sanitize_prompt(
+    raw: GetPromptResult,
+    *,
+    assistant: bool,
+    allowed: Callable[[str], bool],
+    max_result_bytes: int,
+) -> tuple[GetPromptResult, Stats] | Refused:
+    """A fresh ``prompts/get`` answer built from ``raw`` (L.6): ``assistant`` when the prompt is
+    listed in ``assistant``, ``allowed`` the URIs the path allows to be read."""
+    if not assistant and any(message.role == "assistant" for message in raw.messages):
+        return "assistant"
+    budget = _Budget(max_result_bytes)
+    messages: list[PromptMessage] = []
+    revealed = dropped = omitted = 0
+    description = None
+    try:
+        if raw.description is not None:
+            description = clean_text(raw.description)
+            revealed += int(_was_revealed(raw.description, description))
+            if not budget.take(len(description.encode())):
+                raise _TooLarge
+        for message in raw.messages:
+            block = message.content
+            kept: Any = None
+            if isinstance(block, TextContent):
+                text = clean_text(block.text)
+                revealed += int(_was_revealed(block.text, text))
+                if not budget.take(len(text.encode())):
+                    raise _TooLarge
+                kept = TextContent(type="text", text=text)
+            elif isinstance(block, ImageContent | AudioContent):
+                kept = _media(block, budget)
+                omitted += int(isinstance(kept, TextContent))
+            elif isinstance(block, EmbeddedResource) and allowed(block.resource.uri):
+                contents, count = _contents(block.resource, budget)
+                revealed += count
+                if contents is not None:
+                    kept = EmbeddedResource(type="resource", resource=contents)
+            elif isinstance(block, ResourceLink) and allowed(block.uri):
+                kept, count = _link(block, budget)
+                revealed += count
+            if kept is None:
+                dropped += 1
+                continue
+            messages.append(PromptMessage(role=message.role, content=kept))
+    except _TooLarge:
+        return "too_large"
+    result = GetPromptResult(
+        description=description, messages=messages, meta=_dropped_meta(dropped)
+    )
+    return result, Stats(revealed, dropped, omitted, wrapped=False)
+
+
+def sanitize_read(
+    raw: ReadResourceResult, *, uri: str, max_result_bytes: int
+) -> tuple[ReadResourceResult, Stats] | Refused:
+    """A fresh ``resources/read`` answer built from ``raw``: only the contents of ``uri``, the
+    one asked for (MISS-7, SPEC-5); nothing left is ``not_found``, never an empty answer."""
+    budget = _Budget(max_result_bytes)
+    contents: list[ResourceContents] = []
+    revealed = dropped = 0
+    try:
+        for item in raw.contents:
+            kept, count = _contents(item, budget) if item.uri == uri else (None, 0)
+            revealed += count
+            if kept is None:
+                dropped += 1
+                continue
+            contents.append(kept)
+    except _TooLarge:
+        return "too_large"
+    if not contents:
+        return "not_found"
+    result = ReadResourceResult(contents=contents, meta=_dropped_meta(dropped))
+    return result, Stats(revealed, dropped, 0, wrapped=False)
+
+
+def sanitize_completion(raw: CompleteResult) -> tuple[CompleteResult, Stats]:
+    """A fresh ``completion/complete`` answer: each value revealed and kept if it is at most
+    :data:`MAX_COMPLETION_CHARS` characters then, at most :data:`MAX_COMPLETION_VALUES` of them
+    (``hasMore`` when some were cut), and ``total`` and ``hasMore`` only as an integer and a
+    boolean."""
+    found = raw.completion
+    values: list[str] = []
+    revealed = dropped = 0
+    for value in found.values:
+        text = clean_text(value)
+        if len(text) > MAX_COMPLETION_CHARS:
+            dropped += 1
+            continue
+        revealed += int(_was_revealed(value, text))
+        values.append(text)
+    cut = len(values) > MAX_COMPLETION_VALUES
+    total = found.total
+    has_more = found.has_more
+    completion = Completion(
+        values=values[:MAX_COMPLETION_VALUES],
+        total=total if isinstance(total, int) and not isinstance(total, bool) else None,
+        has_more=True if cut else (has_more if isinstance(has_more, bool) else None),
+    )
+    return CompleteResult(completion=completion), Stats(revealed, dropped, 0, wrapped=False)

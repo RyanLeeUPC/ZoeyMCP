@@ -36,6 +36,7 @@ from zoeymcp.gateway.access import (
     server_from_path,
     source_allowed,
 )
+from zoeymcp.gateway.capabilities import TOOLS_ONLY, Kind, ServedKinds
 
 TOKENS = {"alpha": "zgc1-alpha-token", "beta": "zgc1-beta-token", "gamma": "zgc1-gamma-token"}
 REMOTE: dict[str, Any] = {
@@ -613,18 +614,61 @@ def test_a_batch_or_non_object_is_refused(body: bytes) -> None:
     assert parse_message(body, 1000) == Refusal(400, "not one JSON-RPC object")
 
 
+EVERY_KIND: ServedKinds = frozenset({"tools", "prompts", "resources", "completions"})
+# The methods of a tools-only path: every one but the kinds' (M6 design L.5).
+TOOLS_METHODS = sorted(access.RPC_METHODS - set(access.KIND_METHODS))
+
+
 @pytest.mark.parametrize("method", sorted(access.RPC_METHODS))
 def test_served_methods(method: str) -> None:
+    assert check_rpc({"method": method}, "ok", modern=True, served=EVERY_KIND) is None
+
+
+@pytest.mark.parametrize("method", TOOLS_METHODS)
+def test_a_tools_only_path_serves_every_method_but_the_kinds(method: str) -> None:
     assert check_rpc({"method": method}, "ok", modern=True) is None
+    assert check_rpc({"method": method}, "ok", modern=False, served=TOOLS_ONLY) is None
+
+
+def test_the_kinds_methods() -> None:
+    assert dict(access.KIND_METHODS) == {
+        "prompts/list": "prompts",
+        "prompts/get": "prompts",
+        "resources/list": "resources",
+        "resources/templates/list": "resources",
+        "resources/read": "resources",
+        "completion/complete": "completions",
+    }
+    assert set(access.KIND_METHODS) <= access.RPC_METHODS
+
+
+@pytest.mark.parametrize(("method", "kind"), sorted(access.KIND_METHODS.items()))
+@pytest.mark.parametrize("modern", [True, False])
+def test_a_kinds_method_is_refused_on_a_path_that_doesnt_serve_it(
+    method: str, kind: Kind, modern: bool
+) -> None:
+    """The per-path refusal (L.5): -32601, as an unknown method of the era, unless the path
+    serves the method's kind; another kind never stands in for it."""
+    refused = Refusal(404 if modern else 200, "kind not served", rpc_code=-32601)
+    others: ServedKinds = EVERY_KIND - {kind}
+    assert check_rpc({"method": method}, "ok", modern=modern) == refused
+    assert check_rpc({"method": method}, "ok", modern=modern, served=others) == refused
+    assert check_rpc({"method": method}, "ok", modern=modern, served=TOOLS_ONLY | {kind}) is None
+
+
+def test_a_kinds_method_still_needs_a_protocol_version() -> None:
+    assert check_rpc(
+        {"method": "prompts/list"}, "needs_initialize", modern=False, served=EVERY_KIND
+    ) == Refusal(400, "no protocol version")
 
 
 def test_unknown_methods_by_era() -> None:
     assert check_rpc({"method": "sampling/createMessage"}, "ok", modern=True) == Refusal(
         404, "method not served", rpc_code=-32601
     )
-    assert check_rpc({"method": "resources/list"}, "ok", modern=False) == Refusal(
-        200, "method not served", rpc_code=-32601
-    )
+    assert check_rpc(
+        {"method": "resources/subscribe"}, "ok", modern=False, served=EVERY_KIND
+    ) == Refusal(200, "method not served", rpc_code=-32601)
     assert check_rpc({"method": 5}, "ok", modern=False) == Refusal(
         200, "method not served", rpc_code=-32601
     )

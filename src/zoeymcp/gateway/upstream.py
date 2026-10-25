@@ -18,7 +18,9 @@ module does the I/O around them:
   nothing is admitted until the listing has been compared again;
 - **call** with the validated arguments registered with the egress filter first, under a hard
   deadline. A legacy session that expired is re-opened, and the call that hit the 404 is retried
-  once if the tool is still admitted with the same pin. Nothing else is ever retried;
+  once if the tool is still admitted with the same pin. Nothing else is ever retried but the
+  requests of the kinds beyond tools (M6 design L.6: ``prompts/get``, ``resources/read`` and
+  ``completion/complete``), which change nothing, and are retried the same way;
 - **close** idle connections, the least recently used at the session limit, and those a policy
   change affects. A close cuts the connection's calls at once, except committed ones (approved
   calls, M4 design B.6): the session ends only after they finish, each within its deadline.
@@ -32,7 +34,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 
 import anyio
 import mcp_types
@@ -49,6 +51,7 @@ from ..common import canonical
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway, ViewRemoteServer
 from . import logs, pins
+from .capabilities import ServedKinds
 from .connstate import (
     ADMIT_WAIT,
     WAITING,
@@ -58,6 +61,7 @@ from .connstate import (
     Phase,
     Refuse,
     admit,
+    changed_kinds,
     connection_key,
     era_of,
     on_change,
@@ -91,14 +95,18 @@ LIST_CHANGED: Final[Mapping[str, str]] = {
 }
 
 Progress = Callable[[float, float | None], Awaitable[None]]
+T = TypeVar("T")
 
 
 class UpstreamError(Exception):
-    """A call or listing that didn't produce a result. ``outcome`` picks the agent's message."""
+    """A call or listing that didn't produce a result. ``outcome`` picks the agent's message;
+    ``code`` is an upstream JSON-RPC error's, which a prompt, resource or completion request
+    maps to its own fixed answer (M6 design L.6), never the upstream's message."""
 
-    def __init__(self, outcome: Outcome, detail: str = "") -> None:
+    def __init__(self, outcome: Outcome, detail: str = "", code: int | None = None) -> None:
         self.outcome = outcome
         self.detail = detail
+        self.code = code
         super().__init__(outcome)
 
 
@@ -197,7 +205,7 @@ class Connection:
         self.changed = anyio.Event()
         # The first listing creates the view rather than changing it: nobody has seen another.
         if state.version != old.version and old.version > 0:
-            self.pool.view_changed(self)
+            self.pool.view_changed(self, changed_kinds(old.evaluation, state.evaluation))
 
     def idle(self, now: float, timeout: float) -> bool:
         return self.in_flight == 0 and self.holds == 0 and now - self.last_used > timeout
@@ -703,6 +711,35 @@ class Connection:
             raise UpstreamError("unsupported_result", str(result.result_type))
         return result
 
+    async def request(self, send: Callable[[Client], Awaitable[T]], *, timeout: float) -> T:
+        """One request of a kind beyond tools (M6 design L.6): ``send`` asks the open client.
+        Nothing is registered (the egress filter allows these methods by the server's
+        ``enable``); a close cuts it, as it cuts an uncommitted call."""
+        client = self.client
+        if client is None or self.closing:
+            raise UpstreamError("unavailable", "not connected")
+        self.in_flight += 1
+        self.last_used = self.pool.clock()
+        scope = anyio.CancelScope()
+        self._calls[scope] = None
+        try:
+            with scope:
+                try:
+                    with anyio.fail_after(timeout):
+                        result = await send(client)
+                except BaseException as exc:
+                    raise self._call_error(exc) from exc
+        finally:
+            self.in_flight -= 1
+            self.last_used = self.pool.clock()
+            del self._calls[scope]
+        if scope.cancelled_caught:
+            raise UpstreamError("connection_lost", "closed")
+        result_type = getattr(result, "result_type", None)
+        if result_type not in (None, "complete"):
+            raise UpstreamError("unsupported_result", str(result_type))
+        return result
+
     def _call_error(self, exc: BaseException) -> BaseException:
         if isinstance(exc, anyio.get_cancelled_exc_class()):
             return exc
@@ -722,7 +759,7 @@ class Connection:
                 code=exc.error.code,
                 message_bytes=len(exc.error.message.encode()),
             )
-            return UpstreamError("rpc_error")
+            return UpstreamError("rpc_error", code=exc.error.code)
         if isinstance(exc, ValidationError):
             return UpstreamError("unsupported_result", "invalid result")
         return UpstreamError("connection_lost", type(exc).__name__)
@@ -775,7 +812,8 @@ class UpstreamPool:
     defs: DefinitionStore
     limits: GatewayLimits = field(default_factory=GatewayLimits)
     clock: Callable[[], float] = time.monotonic
-    on_view_change: Callable[[Connection], None] | None = None
+    # A connection's exposed view changed, in the lists named (M6 design L.5).
+    on_view_change: Callable[[Connection, ServedKinds], None] | None = None
     # Tests swap in a transport that reaches the vault differently; None is the real one.
     transport_factory: Callable[[], Any] | None = None
     eras: dict[str, Era] = field(default_factory=dict)
@@ -967,6 +1005,31 @@ class UpstreamPool:
         except _SessionExpired as exc:
             raise UpstreamError("connection_lost", "session expired twice") from exc
 
+    async def request(
+        self,
+        server: str,
+        policy: ViewRemoteServer,
+        client: str,
+        send: Callable[[Client], Awaitable[T]],
+        *,
+        admitted: Callable[[pins.Evaluation], bool],
+    ) -> T:
+        """A prompt, resource or completion request (M6 design L.6) on the client's connection,
+        once it is READY and ``admitted`` says its evaluation still serves what is asked for (a
+        prompt, a URI, a reference); :class:`NotAdmitted` otherwise. A legacy session that
+        expired is re-opened and the request sent once more, on the same terms."""
+        timeout = float(policy.call_timeout or self.limits.call_timeout)
+        for attempt in range(2):
+            connection = self.connection(server, policy, client)
+            if not admitted(await self.wait_ready(connection)):
+                raise NotAdmitted("not served")
+            try:
+                return await connection.request(send, timeout=timeout)
+            except _SessionExpired as exc:
+                if attempt:
+                    raise UpstreamError("connection_lost", "session expired twice") from exc
+        raise UpstreamError("connection_lost", "session expired twice")  # never reached
+
     # --- evaluation and reports ----------------------------------------------------------------
 
     def evaluate(
@@ -1059,9 +1122,9 @@ class UpstreamPool:
             fields["reason"] = "projection" if report.pin is None else "rules"
         logs.event(event, **fields)
 
-    def view_changed(self, connection: Connection) -> None:
+    def view_changed(self, connection: Connection, kinds: ServedKinds) -> None:
         if self.on_view_change is not None:
-            self.on_view_change(connection)
+            self.on_view_change(connection, kinds)
 
     # --- policy changes (D.3) ----------------------------------------------------------------
 
