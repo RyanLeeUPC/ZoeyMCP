@@ -150,6 +150,35 @@ def test_the_export_is_admitted_as_the_normalized_policy(example_raw: dict[str, 
     assert load_mapping(text) == load_mapping(exported(back))
 
 
+def test_prompts_and_resources_blocks_are_exported(example_raw: dict[str, Any]) -> None:
+    """Step 18: a server's prompts and resources blocks, in the table's order, read back as the
+    same policy. Not admitted: the gate refuses an enabled kind until step 21b (L.11)."""
+    raw = raw_policy(example_raw)
+    raw["gateway"]["servers"]["broker-read"].update(
+        prompts={
+            "include": ["summarize"],
+            "review": {"summarize": PIN},
+            "assistant": ["summarize"],
+        },
+        resources={"fixed": {"declined": {"notes://index": PIN}}},
+    )
+    policy = made(raw)
+    text = exported(policy)
+    assert made(load_mapping(text)) == normalize(policy)
+    lines = [
+        "      prompts:",
+        '        include: ["summarize"]',
+        "        review:",
+        f'          "summarize": "{PIN}"',
+        '        assistant: ["summarize"]',
+        "      resources:",
+        "        fixed:",
+        "          declined:",
+        f'            "notes://index": "{PIN}"',
+    ]
+    assert "".join(f"{line}\n" for line in lines) in text
+
+
 def test_every_hidden_field_is_exported(example_raw: dict[str, Any]) -> None:
     """The host's export holds what the portal hides: R61's fourth exception (DD-4)."""
     text = exported(made(raw_policy(example_raw)))

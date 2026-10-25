@@ -23,6 +23,11 @@ decisions M7 adds to the schema are tested without putting all of ``schema.py`` 
   ``env:`` reference may name one (``check``, by the prefix), and the gateway refuses to start
   with the vault's three in its environment (its own ``ZOEYMCP_GATEWAY_KEY`` and the bridges'
   variables pass that check, so it names the three, not the prefix).
+- :func:`uri_template` and :func:`resource_uri`: a server's resource templates and fixed resources
+  (M6 design L.1). A template is RFC 6570 level 1 with every expression a whole path segment, so
+  the gateway's matcher never has to decide where a value ends, and it has no query; a fixed
+  resource is an absolute URI with no user info. Both hold only the characters RFC 3986 lets a URI
+  hold (so printable ASCII, every ``%`` a whole escape), with no fragment.
 
 Every pattern here is used with ``fullmatch``.
 """
@@ -58,6 +63,30 @@ _UNIX_UPSTREAM = re.compile(r"unix:/run/zoeymcp-bridge-([a-z0-9]{1,16})/mcp\.soc
 UNIX_UPSTREAM_FORM: Final = (
     "a unix: upstream is a standard-tier bridge's socket, unix:/run/zoeymcp-bridge-<name>/mcp.sock"
 )
+
+# A resource template (M6 design L.1): scheme://authority/segment/..., where an expression is a
+# whole path segment {name}. Any other brace is an operator, a partial segment or an expression
+# outside the path, all refused.
+TEMPLATE_MAX: Final = 1024
+TEMPLATE_EXPRESSIONS_MAX: Final = 8
+TEMPLATE_FORM: Final = (
+    "a resource template here is scheme://host/path with {name} as whole path segments only"
+)
+_TEMPLATE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/{}]*((?:/[^/]*)*)")
+_EXPRESSION = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]{0,31}\}")
+# A fixed resource: an absolute URI (RFC 3986 4.3), its authority, when it has one, without "@".
+RESOURCE_URI_MAX: Final = 2048
+RESOURCE_URI_FORM: Final = (
+    "a fixed resource here is an absolute URI of printable ASCII, at most 2048 characters, "
+    "with no user info or fragment"
+)
+_RESOURCE_URI = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:([^#]+)")
+# One character a URI may hold (RFC 3986 2.1-2.3): unreserved, reserved, or a whole "%" escape. No
+# space, quote, angle bracket, backslash, caret, backtick, bar or brace, and nothing outside ASCII.
+_URI_CHARACTER = r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=]|%[0-9A-Fa-f]{2}"
+_URI_CHARACTERS = re.compile(f"(?:{_URI_CHARACTER})*")
+# A template's: the same, and the braces its form then places.
+_TEMPLATE_CHARACTERS = re.compile(f"(?:{_URI_CHARACTER}|[{{}}])*")
 
 # Every variable ZoeyMCP reads starts with this: the master keys, the policy, the gateway's key, the
 # bridges' variables, and any later one.
@@ -142,6 +171,43 @@ def reserved_env(name: str) -> bool:
     from. In any case: Windows reads its environment so, and ``env:zoeymcp_master_key`` there is
     the master key."""
     return name.upper().startswith(RESERVED_ENV_PREFIX)
+
+
+def uri_template(value: str) -> str:
+    """A resource template in L.1's level-1 form; a ``ValueError`` naming the form otherwise."""
+    if len(value) > TEMPLATE_MAX:
+        raise ValueError(f"{TEMPLATE_FORM}, at most {TEMPLATE_MAX} characters")
+    if not _TEMPLATE_CHARACTERS.fullmatch(value) or "?" in value or "#" in value:
+        raise ValueError(
+            f"{TEMPLATE_FORM}, in characters a URI may hold, with no query or fragment"
+        )
+    found = _TEMPLATE.fullmatch(value)
+    if found is None:  # no scheme://, or a brace in the scheme or the authority
+        raise ValueError(TEMPLATE_FORM)
+    expressions = 0
+    for segment in found.group(1).split("/"):
+        if _EXPRESSION.fullmatch(segment):
+            expressions += 1
+        elif "{" in segment or "}" in segment:  # an operator, or part of a segment
+            raise ValueError(TEMPLATE_FORM)
+    if expressions > TEMPLATE_EXPRESSIONS_MAX:
+        raise ValueError(f"{TEMPLATE_FORM}, at most {TEMPLATE_EXPRESSIONS_MAX} of them")
+    return value
+
+
+def resource_uri(value: str) -> str:
+    """A fixed resource's URI; a ``ValueError`` naming the form otherwise."""
+    if len(value) > RESOURCE_URI_MAX or not _URI_CHARACTERS.fullmatch(value):
+        raise ValueError(RESOURCE_URI_FORM)
+    found = _RESOURCE_URI.fullmatch(value)
+    if found is None:  # no scheme, nothing after it, or a fragment
+        raise ValueError(RESOURCE_URI_FORM)
+    rest = found.group(1)
+    if rest.startswith("//"):
+        authority = rest[2:].partition("/")[0].partition("?")[0]
+        if "@" in authority:
+            raise ValueError(RESOURCE_URI_FORM)
+    return value
 
 
 def is_squid_acl_name(value: str) -> bool:

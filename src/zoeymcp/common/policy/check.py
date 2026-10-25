@@ -27,8 +27,10 @@ from .schema import (
     PathCredential,
     PlaceholderCaller,
     Policy,
+    PromptsPolicy,
     QueryCredential,
     RemoteServer,
+    ResourcesPolicy,
     Route,
     RouteProgram,
     Rule,
@@ -120,6 +122,15 @@ _ENABLE_REFUSED: Mapping[str, str] = {
         "only questions agents see"
     ),
 }
+# M6 design A.2 rows 5c and 5d. Built dark (L.11): row 4c above still refuses enabling prompts,
+# resources and completions, so these rows and the blocks' own (5, 5b) meet only a refused policy.
+_COMPLETIONS_NEED = (
+    "completions complete prompt arguments or resource-template variables: enable prompts, or "
+    "resources with a template"
+)
+_SHARED_KINDS = (
+    "a shared legacy session serves every client's prompts and reads the same upstream session"
+)
 
 
 class _Report:
@@ -1242,13 +1253,19 @@ def _check_toolkit(
 
 
 def _check_declined(path: str, server: RemoteServer | ToolkitServer, report: _Report) -> None:
-    for tool in sorted(set(server.declined) & set(server.tools.include)):
-        report.error(f"{path}.declined", f"{tool!r} is both included and declined")
+    _check_included_and_declined(path, server.tools.include, server.declined, report)
     if isinstance(server, ToolkitServer) and server.pinning == "off" and server.declined:
         report.warning(
             f"{path}.declined",
             "with pinning off a declined tool can't be told apart when it changes",
         )
+
+
+def _check_included_and_declined(
+    path: str, include: list[str], declined: Mapping[str, str], report: _Report
+) -> None:
+    for name in sorted(set(declined) & set(include)):
+        report.error(f"{path}.declined", f"{name!r} is both included and declined")
 
 
 def _check_toolkit_rule(path: str, rule: ToolkitRule, route: Route, report: _Report) -> None:
@@ -1444,6 +1461,39 @@ def _check_upstream_server(path: str, server: RemoteServer, report: _Report) -> 
             f"{path}.shared_session",
             "legacy servers only: every client shares one upstream session, so server-side "
             "state leaks between agents",
+        )
+    _check_kinds(path, server, report)
+
+
+def _check_kinds(path: str, server: RemoteServer, report: _Report) -> None:
+    """A.2 rows 5-5d: what is enabled, and the prompts and resources blocks, each as a tools
+    block is checked (its pins, and nothing both included and declined)."""
+    enable = server.enable
+    for capability in sorted({c for c in enable if enable.count(c) > 1}):
+        report.error(f"{path}.enable", f"{capability} is listed twice")
+    templates = "resources" in enable and server.resources.templates.include
+    if "completions" in enable and "prompts" not in enable and not templates:
+        report.error(f"{path}.enable", _COMPLETIONS_NEED)
+    if enable and server.shared_session:
+        report.warning(f"{path}.enable", _SHARED_KINDS)
+    prompts, resources = server.prompts, server.resources
+    for kind, written in (
+        ("prompts", prompts != PromptsPolicy()),
+        ("resources", resources != ResourcesPolicy()),
+    ):
+        if written and kind not in enable:
+            report.error(f"{path}.{kind}", f"{kind} isn't enabled for this server")
+    for where, block in (
+        (f"{path}.prompts", prompts),
+        (f"{path}.resources.templates", resources.templates),
+        (f"{path}.resources.fixed", resources.fixed),
+    ):
+        _check_pins(where, block.include, block.review, report)
+        _check_included_and_declined(where, block.include, block.declined, report)
+    for prompt in sorted(set(prompts.assistant) - set(prompts.include)):
+        report.error(
+            f"{path}.prompts.assistant",
+            f"{prompt!r} may speak as the assistant but isn't included",
         )
 
 

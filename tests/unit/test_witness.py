@@ -216,9 +216,20 @@ def document(**changes: Any) -> dict[str, Any]:
     return {"v": 1, "deployments": [entry()], "counted": 1, **changes}
 
 
+def padded(size: int) -> bytes:
+    """A file that would be one but for its size: a document, then spaces up to ``size`` bytes.
+    Strict JSON under the library's own bound, so only the witness's bound refuses it."""
+    data = canonical.dumps_canonical(document())
+    return data + b" " * (size - len(data))
+
+
 def case(name: str, data: bytes | dict[str, Any], said: str) -> Any:
     raw = data if isinstance(data, bytes) else canonical.dumps_canonical(data)
     return pytest.param(raw, said, id=name)
+
+
+MALFORMED = "a deployment entry is malformed"
+COUNTED = "counted is not a count of the deployments seen"
 
 
 @pytest.mark.parametrize(
@@ -226,46 +237,52 @@ def case(name: str, data: bytes | dict[str, Any], said: str) -> Any:
     [
         case("empty", b"", "not strict JSON"),
         case("repeated-key", b'{"v":1,"v":1}', "not strict JSON"),
-        case("too-large", b" " * (MAX_BYTES + 1), "not strict JSON"),
+        case("too-large", padded(MAX_BYTES + 1), "not strict JSON"),
         case("a-list", b"[]", "not a witness document"),
         case("no-count", {"v": 1, "deployments": []}, "not a witness document"),
         case("another-key", document(extra=1), "not a witness document"),
         case("version-2", document(v=2), "version 2 is not 1"),
         case("version-true", document(v=True), "version True is not 1"),
-        case("deployments-object", document(deployments={}), "deployments is not a list"),
+        case(
+            "deployments-object",
+            document(deployments={}),
+            "deployments is not a list of at most 8",
+        ),
         case(
             "nine",
             document(deployments=[entry(deployment=deployment(n)) for n in range(9)], counted=9),
             "deployments is not a list of at most 8",
         ),
-        case("entry-list", document(deployments=[[]]), "malformed"),
-        case("entry-short", document(deployments=[{"deployment": A}]), "malformed"),
-        case("deployment-number", document(deployments=[entry(deployment=1)]), "malformed"),
-        case("deployment-upper", document(deployments=[entry(deployment=A.upper())]), "malformed"),
-        case("deployment-twice", document(deployments=[entry(), entry()], counted=2), "malformed"),
-        case("revision-0", document(deployments=[entry(revision=0)]), "malformed"),
+        case("entry-list", document(deployments=[[]]), MALFORMED),
+        case("entry-short", document(deployments=[{"deployment": A}]), MALFORMED),
+        case("deployment-number", document(deployments=[entry(deployment=1)]), MALFORMED),
+        case("deployment-upper", document(deployments=[entry(deployment=A.upper())]), MALFORMED),
+        case("deployment-twice", document(deployments=[entry(), entry()], counted=2), MALFORMED),
+        case("revision-0", document(deployments=[entry(revision=0)]), MALFORMED),
         case(
             "revision-over",
             document(deployments=[entry(revision=REVISION_MAX + 1)]),
-            "malformed",
+            MALFORMED,
         ),
-        case("revision-true", document(deployments=[entry(revision=True)]), "malformed"),
-        case("revision-text", document(deployments=[entry(revision="3")]), "malformed"),
-        case("first-seen-negative", document(deployments=[entry(first_seen=-1)]), "malformed"),
-        case("first-seen-false", document(deployments=[entry(first_seen=False)]), "malformed"),
-        case("counted-0", document(counted=0), "counted is not a count"),
-        case("counted-true", document(counted=True), "counted is not a count"),
-        case("counted-text", document(counted="1"), "counted is not a count"),
+        case("revision-true", document(deployments=[entry(revision=True)]), MALFORMED),
+        case("revision-text", document(deployments=[entry(revision="3")]), MALFORMED),
+        case("first-seen-negative", document(deployments=[entry(first_seen=-1)]), MALFORMED),
+        case("first-seen-false", document(deployments=[entry(first_seen=False)]), MALFORMED),
+        case("counted-0", document(counted=0), COUNTED),
+        case("counted-true", document(counted=True), COUNTED),
+        case("counted-text", document(counted="1"), COUNTED),
     ],
 )
 def test_anything_else_isnt_a_witness_file(data: bytes, said: str) -> None:
-    with pytest.raises(WitnessError, match=said):
+    """Each refusal says what it is, whole."""
+    with pytest.raises(WitnessError) as raised:
         loads(data)
+    assert str(raised.value) == said
 
 
 def test_the_bounds_of_a_file_are_held_exactly() -> None:
-    """Revision 9,999,999,999, first seen at 0, a count above the deployments kept and eight
-    deployments are all a file's."""
+    """Revision 9,999,999,999, first seen at 0, a count above the deployments kept, eight
+    deployments and 64 KiB are all a file's."""
     data = document(
         deployments=[
             entry(deployment=deployment(n), revision=REVISION_MAX, first_seen=0) for n in range(8)
@@ -274,6 +291,7 @@ def test_the_bounds_of_a_file_are_held_exactly() -> None:
     )
     found = loads(canonical.dumps_canonical(data))
     assert (len(found.deployments), found.counted) == (8, 20)
+    assert loads(padded(MAX_BYTES)).report() == {A: 3}
     assert loads(canonical.dumps_canonical(document(deployments=[entry(revision=1)]))).report() == {
         A: 1
     }

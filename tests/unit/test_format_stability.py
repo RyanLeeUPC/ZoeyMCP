@@ -10,15 +10,17 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from mcp.types import Tool
 
 from tests.unit.report_model import asked_line
-from zoeymcp.common import ledgerreport, pinhash
+from zoeymcp.common import canonical, ledgerreport, pinhash
 from zoeymcp.common.canonical import dumps_canonical, loads_strict
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy, ratchet
@@ -290,6 +292,77 @@ def test_an_empty_declined_block_leaves_the_m7_view() -> None:
     assert b"declined" not in VIEW_BYTES
 
 
+# M6 design A.3, L.3 (step 18): a remote server's prompts and resources blocks are in the digest and
+# the bytes only once one holds an entry, so the M7 view above is unchanged; enable always was.
+VIEW_POLICY_KINDS: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+VIEW_POLICY_KINDS["gateway"]["servers"]["notes-read"].update(
+    enable=["prompts", "resources", "completions"],
+    prompts={
+        "include": ["summarize"],
+        "review": {"summarize": "sha256:" + "4" * 64},
+        "assistant": ["summarize"],
+    },
+    resources={
+        "templates": {
+            "include": ["notes://notes/{id}"],
+            "review": {"notes://notes/{id}": "sha256:" + "5" * 64},
+        },
+        "fixed": {"declined": {"notes://index": "sha256:" + "6" * 64}},
+    },
+)
+VIEW_DIGEST_KINDS = "sha256:1cd951b694cd02d12721e4d665549ac41ddcab6f77df553706b3540ac3026baa"
+VIEW_BYTES_KINDS = (
+    VIEW_BYTES.replace(VIEW_DIGEST.encode(), VIEW_DIGEST_KINDS.encode())
+    .replace(b'"enable":[],', b'"enable":["prompts","resources","completions"],')
+    .replace(
+        b'"on_drift":"hide","review":{"search_notes"',
+        b'"on_drift":"hide","prompts":{"assistant":["summarize"],"declined":{},'
+        b'"include":["summarize"],"review":{"summarize":"sha256:' + b"4" * 64 + b'"}},'
+        b'"resources":{"fixed":{"declined":{"notes://index":"sha256:' + b"6" * 64 + b'"},'
+        b'"include":[],"review":{}},"templates":{"declined":{},"include":["notes://notes/{id}"],'
+        b'"review":{"notes://notes/{id}":"sha256:' + b"5" * 64 + b'"}}},'
+        b'"review":{"search_notes"',
+    )
+)
+
+
+def test_a_view_with_prompts_and_resources_is_pinned() -> None:
+    view = build_view(Policy.model_validate(VIEW_POLICY_KINDS))
+    assert view.digest == VIEW_DIGEST_KINDS
+    assert dump_view(view) == VIEW_BYTES_KINDS
+    assert parse_view(VIEW_BYTES_KINDS).digest == VIEW_DIGEST_KINDS
+
+
+def test_empty_prompts_and_resources_blocks_leave_the_m7_view() -> None:
+    """Written but empty, or holding only empty sets: the M7 digest and bytes."""
+    policy: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+    policy["gateway"]["servers"]["notes-read"].update(
+        prompts={"include": [], "review": {}, "declined": {}, "assistant": []},
+        resources={"templates": {"include": []}, "fixed": {}},
+    )
+    view = build_view(Policy.model_validate(policy))
+    assert (view.digest, dump_view(view)) == (VIEW_DIGEST, VIEW_BYTES)
+    assert b'"prompts"' not in VIEW_BYTES
+    assert b'"resources"' not in VIEW_BYTES
+
+
+def test_one_entry_puts_its_whole_block_in_the_view() -> None:
+    """A block is left out only while every set in it is empty: one declined fixed resource
+    brings in the resources block, its empty template set too, and not the prompts block."""
+    policy: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+    policy["gateway"]["servers"]["notes-read"]["resources"] = {
+        "fixed": {"declined": {"notes://index": "sha256:" + "6" * 64}}
+    }
+    served = canonical.loads_strict(dump_view(build_view(Policy.model_validate(policy))))
+    server = served["gateway"]["servers"]["notes-read"]
+    assert "prompts" not in server
+    assert server["resources"] == {
+        "fixed": {"declined": {"notes://index": "sha256:" + "6" * 64}, "include": [], "review": {}},
+        "templates": {"declined": {}, "include": [], "review": {}},
+    }
+    assert served["digest"] not in (VIEW_DIGEST, VIEW_DIGEST_KINDS)
+
+
 # --- tool pins (M3 design G.1) ------------------------------------------------------------------
 # Fixed wire JSON, parsed by the pinned SDK, to fixed pins. An SDK bump that changes parsing, or a
 # change to the projection or the canonical form, fails here instead of showing as drift on every
@@ -350,6 +423,120 @@ def test_the_shared_pin_function_gives_the_same_pins() -> None:
     assert pinhash.PIN_TAG == "tool-pin/1"
     for name, (wire, pin) in TOOL_PIN_VECTORS.items():
         assert pinhash.pin_of(project(Tool.model_validate_json(wire))) == pin, name
+
+
+# --- prompt, resource-template and resource pins (M6 design L.2) ------------------------------
+# The projection is the gateway's (step 19); these are its pins, beside the tool pins above, which
+# are unchanged (CR-14). Contract 58 ties the members to the SDK's parsing. Each kind has its own
+# tag and its own member, so the same projection pins differently as each kind.
+
+PinOf = Callable[[Mapping[str, Any]], str]
+KIND_PIN_VECTORS: dict[str, tuple[PinOf, dict[str, Any], str]] = {
+    "prompt_minimal": (
+        pinhash.prompt_pin_of,
+        {"name": "summarize"},
+        "sha256:2d8a96566c39e1297b8534d84369db7d7fd30246046da7a0bdd9a684070df2e5",
+    ),
+    "prompt_full": (
+        pinhash.prompt_pin_of,
+        {
+            "name": "summarize",
+            "title": "Caf\u00e9 \u65e5\u672c",
+            "description": "Summarizes a note.\nOne paragraph.",
+            "arguments": [
+                {"name": "id", "title": "Note", "description": "The note's ID.", "required": True},
+                {"name": "style", "required": False},
+            ],
+        },
+        "sha256:3079d8665e90fc526731be9a0f4002a6a8496de0798ae413306be4f879c1bd16",
+    ),
+    "template_minimal": (
+        pinhash.template_pin_of,
+        {"uriTemplate": "notes://notes/{id}", "name": "note"},
+        "sha256:9364d62caf0887d6bcc231ac1825b17afe79c45f485ef0a16d40379bd282f21f",
+    ),
+    "template_full": (
+        pinhash.template_pin_of,
+        {
+            "uriTemplate": "notes://notes/{id}",
+            "name": "note",
+            "title": "A note",
+            "description": "One note, by its ID.",
+            "mimeType": "text/markdown",
+            "annotations": {"audience": ["user", "assistant"], "priority": 0.5},
+        },
+        "sha256:34090964945ed534b0f3654e067e2ef114c10e428f914e93e2785312ab34a2f5",
+    ),
+    "resource_minimal": (
+        pinhash.resource_pin_of,
+        {"uri": "notes://index", "name": "index"},
+        "sha256:5a57d6b0aaeeecc6bd4b75ddf51dc6d8f5179de37308b5df6244c41981b13ddd",
+    ),
+    "resource_full": (
+        pinhash.resource_pin_of,
+        {
+            "uri": "notes://index",
+            "name": "index",
+            "title": "Index \U0001f5c2",
+            "description": "Every note.",
+            "mimeType": "application/json",
+            # The SDK reads a priority as a float, a wire 1 included (contract 58), and canonical
+            # JSON writes 1.0 and 1 apart, so the projection holds 1.0.
+            "annotations": {"audience": ["assistant"], "priority": 1.0},
+        },
+        "sha256:32c6249fa0ebd5275a4d58ba2ef6d78b819cf59b3fea053d27439531116ba211",
+    ),
+}
+
+
+def test_prompt_and_resource_pins_are_pinned() -> None:
+    for name, (pin_of, projection, pin) in KIND_PIN_VECTORS.items():
+        assert pin_of(projection) == pin, name
+
+
+def test_the_kind_tags_are_pinned() -> None:
+    assert (pinhash.PROMPT_PIN_TAG, pinhash.TEMPLATE_PIN_TAG, pinhash.RESOURCE_PIN_TAG) == (
+        "prompt-pin/1",
+        "resource-template-pin/1",
+        "resource-pin/1",
+    )
+    encodings = {
+        "prompt_minimal": b'{"prompt":{"name":"summarize"},"zoeymcp":"prompt-pin/1"}',
+        "template_minimal": (
+            b'{"resource_template":{"name":"note","uriTemplate":"notes://notes/{id}"},'
+            b'"zoeymcp":"resource-template-pin/1"}'
+        ),
+        "resource_minimal": (
+            b'{"resource":{"name":"index","uri":"notes://index"},"zoeymcp":"resource-pin/1"}'
+        ),
+    }
+    for name, encoded in encodings.items():
+        assert "sha256:" + hashlib.sha256(encoded).hexdigest() == KIND_PIN_VECTORS[name][2], name
+
+
+def test_one_projection_pins_differently_as_each_kind() -> None:
+    projection = {"name": "summarize"}
+    kinds = (
+        pinhash.pin_of,
+        pinhash.prompt_pin_of,
+        pinhash.template_pin_of,
+        pinhash.resource_pin_of,
+    )
+    assert len({pin_of(projection) for pin_of in kinds}) == 4
+
+
+@pytest.mark.parametrize(
+    "pin_of",
+    [pinhash.prompt_pin_of, pinhash.template_pin_of, pinhash.resource_pin_of],
+    ids=["prompt", "template", "resource"],
+)
+def test_a_projection_with_no_canonical_form_has_no_pin(pin_of: PinOf) -> None:
+    with pytest.raises(pinhash.ProjectionError) as caught:
+        pin_of({"name": "n", "n": 2**53})
+    assert str(caught.value) == (
+        "the definition has no canonical form (an unsafe integer, a lone surrogate or too deep)"
+    )
+    assert isinstance(caught.value.__cause__, canonical.JSONRejected)
 
 
 # --- the passkey file (M5 design D.4) ------------------------------------------------------------

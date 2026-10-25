@@ -10,6 +10,13 @@ A server written ``kind: bridge``: listed by name, so the schema refuses each at
 
 A route's ``unix:`` upstream (Q46): ``unix:/run/zoeymcp-bridge-<name>/mcp.sock`` exactly, by
 ``fullmatch``, and the bridge's name read back from it.
+
+A server's resource templates and fixed resources (M6 design L.1, A.2 row 6): a template is
+``scheme://authority/segment/...`` with every expression a whole path segment ``{name}``, at most 8,
+no operator, query or fragment, at most 1,024 characters; a fixed resource an absolute URI, at most
+2,048 characters, without user info or a fragment. Both hold only the characters RFC 3986 lets a URI
+hold, every ``%`` a whole escape. The schema-level rows (each entry and key at its path) are in
+``test_policy.py``.
 """
 
 from __future__ import annotations
@@ -24,6 +31,11 @@ from zoeymcp.common.policy import fields
 from zoeymcp.common.policy.fields import (
     AUTHORIZE_PARAMS,
     MAX_QUERY_PARAMS,
+    RESOURCE_URI_FORM,
+    RESOURCE_URI_MAX,
+    TEMPLATE_EXPRESSIONS_MAX,
+    TEMPLATE_FORM,
+    TEMPLATE_MAX,
     TOKEN_PARAMS,
     UNIX_UPSTREAM_FORM,
     URL_MAX,
@@ -37,7 +49,9 @@ from zoeymcp.common.policy.fields import (
     is_numeric_label,
     is_squid_acl_name,
     no_bridge_kind,
+    resource_uri,
     unix_upstream,
+    uri_template,
 )
 from zoeymcp.common.policy.schema import RemoteServer
 
@@ -413,3 +427,170 @@ def test_the_form_is_named_in_the_refusal() -> None:
         "unix:/run/zoeymcp-bridge-<name>/mcp.sock"
     )
     assert fields.UNIX_PREFIX == "unix:"
+
+
+# --- resource templates and fixed resources (M6 design L.1) -------------------------------------
+
+
+def plain_id(value: object) -> str:
+    """A test ID pytest can find again by its node ID (as test_policyseal.py's): no escapes, line
+    breaks or characters outside ASCII."""
+    return re.sub(r"[^A-Za-z0-9_.:=, -]+", "_", repr(value))[:60]
+
+
+LONG_TEMPLATE = "notes://h/" + "a" * (TEMPLATE_MAX - len("notes://h//{id}")) + "/{id}"
+EIGHT = "notes://h/" + "/".join(f"{{v{n}}}" for n in range(TEMPLATE_EXPRESSIONS_MAX))
+# What uri_template says, by the rule a template breaks.
+REFUSALS = {
+    "form": TEMPLATE_FORM,
+    "chars": f"{TEMPLATE_FORM}, in characters a URI may hold, with no query or fragment",
+    "count": f"{TEMPLATE_FORM}, at most 8 of them",
+    "length": f"{TEMPLATE_FORM}, at most 1024 characters",
+}
+LONG_URI = "notes://h/" + "a" * (RESOURCE_URI_MAX - len("notes://h/"))
+
+
+def test_the_resource_forms_are_pinned() -> None:
+    assert (TEMPLATE_MAX, TEMPLATE_EXPRESSIONS_MAX, RESOURCE_URI_MAX) == (1024, 8, 2048)
+    assert TEMPLATE_FORM == (
+        "a resource template here is scheme://host/path with {name} as whole path segments only"
+    )
+    assert RESOURCE_URI_FORM == (
+        "a fixed resource here is an absolute URI of printable ASCII, at most 2048 characters, "
+        "with no user info or fragment"
+    )
+    assert (len(LONG_TEMPLATE), len(LONG_URI)) == (TEMPLATE_MAX, RESOURCE_URI_MAX)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "notes://notes/{id}",
+        "file:///notes/{name}",  # an empty authority
+        "notes://h",  # no path, and no expression
+        "notes://h/",
+        "notes://h:8080/a/{a}/b/{b_2}/",
+        "a+b.c-d://h/{A9}",
+        "notes://h/{_}",
+        "notes://h/{" + "a" * 32 + "}",
+        "notes://h//{id}",  # an empty segment
+        "notes://h/a,b;c=d/%41/{id}",  # sub-delims and an escape in a literal segment
+        EIGHT,
+        LONG_TEMPLATE,
+    ],
+    ids=plain_id,
+)
+def test_a_level_one_template_is_accepted(template: str) -> None:
+    assert uri_template(template) == template
+
+
+@pytest.mark.parametrize(
+    ("template", "refusal"),
+    [
+        *(
+            (f"notes://h/{{{operator}id}}", "form")
+            for operator in ("+", ".", "/", ";", "&", "=", ",", "!", "@")
+        ),
+        ("notes://h/{|id}", "chars"),  # "|" is no URI character
+        ("notes://h/{?id}", "chars"),
+        ("notes://h/{#id}", "chars"),
+        ("notes://h/a{id}", "form"),  # part of a segment
+        ("notes://h/{id}.json", "form"),
+        ("notes://h/{a}{b}", "form"),
+        ("notes://h/{a,b}", "form"),  # a list of variables
+        ("notes://h/{id:3}", "form"),  # a prefix modifier
+        ("notes://h/{id*}", "form"),  # an explode modifier
+        ("notes://{host}/x", "form"),  # outside the path
+        ("notes://h{x}/y", "form"),
+        ("{s}://h/x", "form"),
+        ("notes://h/{1a}", "form"),
+        ("notes://h/{a-b}", "form"),
+        ("notes://h/{}", "form"),
+        ("notes://h/{" + "a" * 33 + "}", "form"),
+        ("notes://h/{id", "form"),
+        ("notes://h/id}", "form"),
+        ("notes://h/{{id}}", "form"),
+        ("/notes/{id}", "form"),  # no scheme
+        ("notes:/n/{id}", "form"),  # no authority
+        ("notes:{id}", "form"),
+        ("1notes://h/{id}", "form"),
+        ("://h/{id}", "form"),
+        ("", "form"),
+        ("notes://h/{id}?q=1", "chars"),
+        ("notes://h/{id}?", "chars"),
+        ("notes://h/{id}#f", "chars"),
+        ("notes://h/a b/{id}", "chars"),
+        ("notes://h/\u00e9/{id}", "chars"),
+        ("notes://h/\t/{id}", "chars"),
+        ("notes://h/\x7f/{id}", "chars"),
+        ("notes://h/{id}\n", "chars"),
+        *((f"notes://h/a{c}b/{{id}}", "chars") for c in '<>"\\^`|'),  # outside RFC 3986
+        ("notes://h/%4/{id}", "chars"),  # a cut escape
+        ("notes://h/%g0/{id}", "chars"),
+        ("notes://h/100%/{id}", "chars"),
+        ("notes://h/%{id}", "chars"),
+        (EIGHT + "/{v8}", "count"),
+        (LONG_TEMPLATE + "a", "length"),
+        ("x" * 2000 + "?", "length"),
+    ],
+    ids=plain_id,
+)
+def test_any_other_template_is_refused(template: str, refusal: str) -> None:
+    with pytest.raises(ValueError, match=f"^{re.escape(REFUSALS[refusal])}$"):
+        uri_template(template)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "notes://index",
+        "file:///notes.txt",
+        "urn:isbn:0451450523",
+        "notes:a@b.example",  # no authority, so no user info
+        "notes://h/x?a=b",
+        "notes://h?x@y",  # an @ in the query
+        "notes://h/p@q",  # an @ in the path
+        "notes://h:8080/a%2Fb%c3%a9",  # escapes, in either case
+        "notes://[::1]/x",  # an IP literal
+        "notes://h/a-._~!$&'()*+,;=:@/?/",  # every other character a URI may hold
+        "a+b.c-d:x",
+        LONG_URI,
+    ],
+    ids=plain_id,
+)
+def test_a_fixed_resource_is_an_absolute_uri(uri: str) -> None:
+    assert resource_uri(uri) == uri
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "notes://user@h/x",
+        "notes://@h/x",
+        "notes://u:p@h",
+        "notes://u@h?x",
+        "notes://h/x#top",
+        "notes://h/x#",
+        "notes:",
+        "notes",
+        "/notes/x",
+        "1x:y",
+        ":x",
+        "",
+        "notes://h/a b",
+        "notes://h/\u00e9",
+        "notes://h/\t",
+        "notes://h/x\n",
+        "notes://h/{id}",  # a template's braces
+        "x:{a}",
+        *(f"notes://h/a{c}b" for c in '<>"\\^`|'),  # outside RFC 3986
+        "notes://h/%4",  # a cut escape
+        "notes://h/%g0",
+        "notes://h/100%",
+        LONG_URI + "a",
+    ],
+    ids=plain_id,
+)
+def test_any_other_fixed_resource_is_refused(uri: str) -> None:
+    with pytest.raises(ValueError, match=f"^{re.escape(RESOURCE_URI_FORM)}$"):
+        resource_uri(uri)

@@ -1,6 +1,12 @@
 """Contracts 57 to 61 (M6 design O.2): what M6's code relies on in the MCP SDK, and in
 ``cryptography`` for 61. Each lands in the step before the code that leans on it.
 
+Contract 58 (step 18): ``mcp_types`` parse a prompt, a resource template and a resource with
+every member design L.2 pins, each under the member the projection reads, and drop a member
+they don't know, so a projection that reads L.2's members by name reads all of them and
+nothing else. A priority is a float even when the wire writes a whole number, as the pins read
+it. The pin golden vectors in ``tests/unit/test_format_stability.py`` start from those members.
+
 Contract 59 (step 3a): the SDK's ``ListenHandler`` acknowledges every kind a listen asks for,
 whether or not the server will ever send it, and then delivers only the kinds it acknowledged.
 The gateway hands an agent's listen to that handler as it came (``gateway/app.py``'s
@@ -37,6 +43,8 @@ from mcp.server.subscriptions import (
     ServerEvent,
     ToolsListChanged,
 )
+from mcp.types import Prompt, Resource, ResourceTemplate
+from pydantic import BaseModel
 
 from .test_server_contract import Shaped, modern_body, modern_headers, modern_post, running
 
@@ -81,6 +89,114 @@ async def listening(url: str, notifications: dict[str, Any]) -> AsyncIterator[Fr
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
         yield Frames(response.aiter_lines())
+
+
+# --- 58. a prompt, a resource template and a resource, as L.2 pins them --------------------------
+
+ICONS = '"icons":[{"src":"https://icons.example/p.png"}],"_meta":{"k":"v"},"x-unknown":1'
+PROMPT_WIRE = (
+    '{"name":"summarize","title":"Summarize","description":"Summarizes a note.","arguments":'
+    '[{"name":"style","title":"Style","description":"How.","required":false,"x-unknown":1},'
+    '{"name":"id","required":true}],' + ICONS + "}"
+)
+ANNOTATIONS = (
+    '"annotations":{"audience":["user","assistant"],"priority":0.5,'
+    '"lastModified":"2026-10-01T00:00:00Z","x-unknown":1}'
+)
+TEMPLATE_WIRE = (
+    '{"uriTemplate":"notes://notes/{id}","name":"note","title":"A note","description":"One note.",'
+    '"mimeType":"text/markdown",' + ANNOTATIONS + "," + ICONS + "}"
+)
+RESOURCE_WIRE = (
+    '{"uri":"notes://index","name":"index","title":"Index","description":"Every note.",'
+    '"mimeType":"application/json","size":12,' + ANNOTATIONS + "," + ICONS + "}"
+)
+
+
+def plain(model: BaseModel) -> dict[str, Any]:
+    """A parsed model under its wire names, members left unset left out."""
+    found: dict[str, Any] = model.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return found
+
+
+def test_58_a_prompt_keeps_every_member_l2_pins_and_no_unknown_one() -> None:
+    """L.2's prompt projection reads ``name``, ``title``, ``description`` and each argument's
+    ``name``, ``title``, ``description`` and ``required``, in listed order; ``icons`` and
+    ``_meta`` are parsed into members of their own, never pinned; an unknown member is dropped."""
+    prompt = Prompt.model_validate_json(PROMPT_WIRE)
+    assert (prompt.name, prompt.title, prompt.description) == (
+        "summarize",
+        "Summarize",
+        "Summarizes a note.",
+    )
+    assert prompt.arguments is not None
+    assert [(a.name, a.title, a.description, a.required) for a in prompt.arguments] == [
+        ("style", "Style", "How.", False),
+        ("id", None, None, True),
+    ]
+    assert set(plain(prompt)) == {"name", "title", "description", "arguments", "icons", "_meta"}
+    assert set(plain(prompt.arguments[0])) == {"name", "title", "description", "required"}
+    assert "x-unknown" not in json.dumps(plain(prompt))
+
+
+def test_58_a_resource_template_keeps_every_member_l2_pins_and_no_unknown_one() -> None:
+    """``uriTemplate``, ``name``, ``title``, ``description``, ``mimeType`` and the annotations'
+    ``audience`` and ``priority``; ``lastModified`` is a member of its own, never pinned."""
+    template = ResourceTemplate.model_validate_json(TEMPLATE_WIRE)
+    assert (template.uri_template, template.name, template.title, template.description) == (
+        "notes://notes/{id}",
+        "note",
+        "A note",
+        "One note.",
+    )
+    assert template.mime_type == "text/markdown"
+    assert template.annotations is not None
+    assert (template.annotations.audience, template.annotations.priority) == (
+        ["user", "assistant"],
+        0.5,
+    )
+    assert template.annotations.last_modified == "2026-10-01T00:00:00Z"
+    pinned = {"uriTemplate", "name", "title", "description", "mimeType", "annotations"}
+    assert set(plain(template)) == {*pinned, "icons", "_meta"}
+    assert set(plain(template.annotations)) == {"audience", "priority", "lastModified"}
+    assert "x-unknown" not in json.dumps(plain(template))
+
+
+def test_58_a_resource_keeps_every_member_l2_pins_and_no_unknown_one() -> None:
+    """``uri`` and the same metadata as a template; ``size`` is a member of its own, never
+    pinned."""
+    resource = Resource.model_validate_json(RESOURCE_WIRE)
+    assert (resource.uri, resource.name, resource.title, resource.description) == (
+        "notes://index",
+        "index",
+        "Index",
+        "Every note.",
+    )
+    assert (resource.mime_type, resource.size) == ("application/json", 12)
+    assert resource.annotations is not None
+    assert (resource.annotations.audience, resource.annotations.priority) == (
+        ["user", "assistant"],
+        0.5,
+    )
+    pinned = {"uri", "name", "title", "description", "mimeType", "annotations"}
+    assert set(plain(resource)) == {*pinned, "size", "icons", "_meta"}
+    assert "x-unknown" not in json.dumps(plain(resource))
+
+
+@pytest.mark.parametrize(
+    ("model", "wire"),
+    [
+        (ResourceTemplate, '{"uriTemplate":"notes://notes/{id}","name":"note",'),
+        (Resource, '{"uri":"notes://index","name":"index",'),
+    ],
+    ids=["template", "resource"],
+)
+def test_58_a_whole_priority_is_read_as_a_float(model: type[BaseModel], wire: str) -> None:
+    """A wire ``1`` is the float ``1.0``, which canonical JSON writes apart from ``1``: the pin
+    golden vectors hold the float, so a parse that kept the integer would move every such pin."""
+    parsed = model.model_validate_json(wire + '"annotations":{"priority":1}}')
+    priority = plain(parsed)["annotations"]["priority"]
+    assert (type(priority), priority) == (float, 1.0)
 
 
 # --- 59. the listen acknowledgment -------------------------------------------------------------

@@ -700,6 +700,65 @@ class Tools(_Model):
     approve: list[ToolName] = []
 
 
+# A server's prompts and resources (M6 design L.1), each kind as its tools are: included, pinned
+# by review, or declined. check refuses enabling either kind until the gateway serves them (L.11).
+PromptName = ToolName  # the same pattern and length
+
+
+class PromptsPolicy(_Model):
+    include: list[PromptName] = []
+    review: dict[PromptName, Pin] = {}
+    declined: dict[PromptName, Pin] = {}
+    # Prompts whose messages may carry role "assistant" (L.6); none by default.
+    assistant: list[PromptName] = []
+
+
+class ResourceSet(_Model):
+    """Templates or fixed resources, by their URI template or URI: :class:`ResourcesPolicy`
+    checks each entry and each key as the kind it holds."""
+
+    include: list[str] = []
+    review: dict[str, Pin] = {}
+    declined: dict[str, Pin] = {}
+
+
+class ResourcesPolicy(_Model):
+    templates: ResourceSet = ResourceSet()  # each a fields.uri_template
+    fixed: ResourceSet = ResourceSet()  # each a fields.resource_uri
+
+    @model_validator(mode="after")
+    def _valid_entries(self) -> ResourcesPolicy:
+        """Every included entry and every key of ``review`` and ``declined``, in the form of its
+        set. Reported at the entry, so each one refused is named."""
+        problems = []
+        for name, form, rule in (
+            ("templates", "resource_template", fields.uri_template),
+            ("fixed", "resource_uri", fields.resource_uri),
+        ):
+            entries: ResourceSet = getattr(self, name)
+            values: list[tuple[tuple[str | int, ...], str]] = [
+                ((name, "include", index), value) for index, value in enumerate(entries.include)
+            ]
+            values += [
+                ((name, block, key), key)
+                for block in ("review", "declined")
+                for key in getattr(entries, block)
+            ]
+            for place, value in values:
+                try:
+                    rule(value)
+                except ValueError as exc:
+                    problems.append(
+                        InitErrorDetails(
+                            type=PydanticCustomError(form, str(exc)), loc=place, input=value
+                        )
+                    )
+        if problems:
+            # A ValidationError raised here keeps each error's own path, under the server's.
+            raise ValidationError.from_exception_data("ResourcesPolicy", problems)
+        return self
+
+
 class _UpstreamServer(_Model):
     tools: Tools = Tools()
     # "sha256:<hex>" is pin projection v1.
@@ -711,6 +770,8 @@ class _UpstreamServer(_Model):
     shared_session: bool = False  # legacy upstreams only
     wrap_results: bool = False
     enable: list[Capability] = []  # check refuses a non-empty list: tools only for now
+    prompts: PromptsPolicy = PromptsPolicy()
+    resources: ResourcesPolicy = ResourcesPolicy()
     # An assertion about the protocol era the upstream speaks, not a transport mode.
     era: Literal["auto", "modern", "legacy"] = "auto"
     drift_check_interval: Annotated[int, Field(ge=60, le=86400)] = 300

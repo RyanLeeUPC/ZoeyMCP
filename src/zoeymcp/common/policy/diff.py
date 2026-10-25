@@ -44,6 +44,9 @@ NAME_SETS: Final = frozenset(
         ("Tools", "approve"),
         ("Client", "servers"),
         ("RemoteServer", "enable"),
+        ("PromptsPolicy", "include"),
+        ("PromptsPolicy", "assistant"),
+        ("ResourceSet", "include"),
     }
 )
 # Lists of models, compared by position (``routes`` is compared by name).
@@ -241,6 +244,8 @@ _UPSTREAM: Final[Mapping[str, Rule]] = MappingProxyType(
         "shared_session": _to_true,
         "wrap_results": _to_false,
         "enable": _name,
+        "prompts": _into,
+        "resources": _into,
         "era": _wider,
         "drift_check_interval": _neutral,
         "call_timeout": _raised,
@@ -341,6 +346,16 @@ _RULES: Final[dict[str, Mapping[str, Rule]]] = {
         "max_prompts_per_hour": _raised,
     },
     "Tools": {"include": _name, "allow": _name, "approve": _neutral},
+    # Prompts and resources as tools (M6 design L.1): an include, or a prompt allowed to speak as
+    # the assistant, added is wider; a re-pin neutral; a decline as a tool's.
+    "PromptsPolicy": {
+        "include": _name,
+        "review": _neutral,
+        "declined": _declined,
+        "assistant": _name,
+    },
+    "ResourceSet": {"include": _name, "review": _neutral, "declined": _declined},
+    "ResourcesPolicy": {"templates": _into, "fixed": _into},
     "_UpstreamServer": _UPSTREAM,
     "RemoteServer": {**dict.fromkeys(("kind", "route", "path"), _wider), **_UPSTREAM},
     "ToolkitRule": {"methods": _grows, "paths": _grows, "approved": _to_true},

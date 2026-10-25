@@ -21,7 +21,10 @@ from zoeymcp.common.policy.schema import (
     Gateway,
     GatewayLimits,
     OAuth2Credential,
+    PromptsPolicy,
     RemoteServer,
+    ResourceSet,
+    ResourcesPolicy,
     hash_token,
     is_secret_ref,
     param_values,
@@ -2945,9 +2948,11 @@ def test_enable_is_an_error(example_raw: Raw, capability: str, message: str) -> 
     raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
     raw["gateway"]["servers"]["broker-trade"]["enable"] = [capability]
     found = errors(run(raw))
+    # Row 5c (step 18): completions alone have nothing to complete.
+    messages = sorted([message, COMPLETIONS_NEED] if capability == "completions" else [message])
     assert found == [
-        f"gateway.servers.broker-read.enable: {message}",
-        f"gateway.servers.broker-trade.enable: {message}",
+        *(f"gateway.servers.broker-read.enable: {text}" for text in messages),
+        *(f"gateway.servers.broker-trade.enable: {text}" for text in messages),
     ]
 
 
@@ -3147,6 +3152,219 @@ def test_declined_is_a_map_of_tool_names_to_pins(example_raw: Raw) -> None:
     policy = parse_policy(yaml.safe_dump(example_raw, sort_keys=False), "test")
     assert policy.gateway is not None
     assert all(server.declined == {} for server in policy.gateway.servers.values())
+
+
+# --- prompts and resources, built dark (M6 design A.2 rows 5-6, L.1, L.11) ---------------------
+
+PIN_P = "sha256:" + "e" * 64
+TEMPLATE = "notes://notes/{id}"
+FIXED = "notes://index"
+NOT_ENABLED = "{} isn't enabled for this server"
+COMPLETIONS_NEED = (
+    "completions complete prompt arguments or resource-template variables: enable prompts, or "
+    "resources with a template"
+)
+
+
+def kinds(raw: Raw, enable: list[str] | None = None) -> Raw:
+    """broker-read with a prompt, a template and a fixed resource, each included at its pin."""
+    raw = copy.deepcopy(raw)
+    server = raw["gateway"]["servers"]["broker-read"]
+    server["prompts"] = {"include": ["summarize"], "review": {"summarize": PIN_P}}
+    server["resources"] = {
+        "templates": {"include": [TEMPLATE], "review": {TEMPLATE: PIN_P}},
+        "fixed": {"include": [FIXED], "review": {FIXED: PIN_P}},
+    }
+    if enable is not None:
+        server["enable"] = enable
+    return raw
+
+
+def test_prompts_and_resources_are_empty_by_default(example_raw: Raw) -> None:
+    policy = parse_policy(yaml.safe_dump(example_raw, sort_keys=False), "test")
+    assert policy.gateway is not None
+    server = policy.gateway.servers["broker-read"]
+    assert isinstance(server, RemoteServer)
+    assert server.prompts == PromptsPolicy(include=[], review={}, declined={}, assistant=[])
+    assert server.resources == ResourcesPolicy(templates=ResourceSet(), fixed=ResourceSet())
+    assert server.resources.templates == ResourceSet(include=[], review={}, declined={})
+    # A block written empty is no block: nothing to enable.
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["prompts"] = {}
+    raw["gateway"]["servers"]["broker-read"]["resources"] = {"templates": {}, "fixed": {}}
+    assert listed(raw) == listed(example_raw)
+
+
+def test_a_block_with_entries_needs_its_kind_enabled(example_raw: Raw) -> None:
+    """Row 5, at the block; the entries are otherwise clean (rows 5b)."""
+    assert errors(run(kinds(example_raw))) == [
+        f"gateway.servers.broker-read.prompts: {NOT_ENABLED.format('prompts')}",
+        f"gateway.servers.broker-read.resources: {NOT_ENABLED.format('resources')}",
+    ]
+    for block, entries in (
+        ("prompts", {"declined": {"other": PIN_P}}),
+        ("prompts", {"assistant": ["summarize"], "include": ["summarize"]}),
+        ("resources", {"fixed": {"declined": {FIXED: PIN_P}}}),
+        ("resources", {"templates": {"review": {TEMPLATE: PIN_P}}}),
+    ):
+        raw = copy.deepcopy(example_raw)
+        raw["gateway"]["servers"]["broker-read"][block] = entries
+        assert f"gateway.servers.broker-read.{block}: {NOT_ENABLED.format(block)}" in errors(
+            run(raw)
+        ), entries
+
+
+def test_enabling_a_kind_is_still_refused(example_raw: Raw) -> None:
+    """L.11: built dark. With each kind enabled and its block clean, the only errors are row 4c's,
+    today's sentence; check still refuses every enabled R31 kind."""
+    raw = kinds(example_raw, ["prompts", "resources", "completions"])
+    assert errors(run(raw)) == [f"gateway.servers.broker-read.enable: {TOOLS_ONLY}"]
+    assert warnings(run(raw)) == warnings(run(example_raw))
+
+
+@pytest.mark.parametrize(
+    ("where", "others"),
+    [
+        ("prompts", ("second", "third", "fourth")),
+        ("resources.templates", ("notes://b/{id}", "notes://c/{id}", "notes://d/{id}")),
+        ("resources.fixed", ("notes://b", "notes://c", "notes://d")),
+    ],
+)
+def test_each_block_is_pinned_as_tools_are(
+    example_raw: Raw, where: str, others: tuple[str, str, str]
+) -> None:
+    """Row 5b: an included entry without a pin, a pin for an entry not included (a warning), an
+    entry both included and declined."""
+    raw = kinds(example_raw, ["prompts", "resources"])
+    entries = raw["gateway"]["servers"]["broker-read"]
+    for part in where.split("."):
+        entries = entries[part]
+    name = entries["include"][0]
+    second, third, fourth = others
+    entries["include"].append(second)
+    entries["review"][third] = PIN_P
+    entries["declined"] = {name: PIN_P, fourth: PIN_P}
+    found = mcp_findings(raw)
+    path = f"gateway.servers.broker-read.{where}"
+    assert f"error {path}.review: {second!r} is included but has no review pin" in found
+    assert f"warning {path}.review: pin for {third!r}, which isn't included" in found
+    assert f"error {path}.declined: {name!r} is both included and declined" in found
+    assert not any(fourth in finding for finding in found)
+    assert len([f for f in found if f.split(" ", 1)[1].startswith(f"{path}.")]) == 3
+
+
+def test_an_assistant_prompt_must_be_included(example_raw: Raw) -> None:
+    raw = kinds(example_raw, ["prompts"])
+    raw["gateway"]["servers"]["broker-read"]["prompts"]["assistant"] = ["summarize", "draft"]
+    assert errors(run(raw)) == [
+        "gateway.servers.broker-read.enable: " + TOOLS_ONLY,
+        "gateway.servers.broker-read.prompts.assistant: 'draft' may speak as the assistant but "
+        "isn't included",
+        "gateway.servers.broker-read.resources: " + NOT_ENABLED.format("resources"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("enable", "templates", "refused"),
+    [
+        (["completions"], True, True),
+        (["completions", "prompts"], False, False),
+        (["completions", "resources"], True, False),
+        # Fixed resources have no arguments to complete (SPEC-6).
+        (["completions", "resources"], False, True),
+        (["prompts"], False, False),
+    ],
+)
+def test_completions_need_prompts_or_a_template(
+    example_raw: Raw, enable: list[str], templates: bool, refused: bool
+) -> None:
+    """Row 5c."""
+    raw = kinds(example_raw, enable)
+    if not templates:
+        del raw["gateway"]["servers"]["broker-read"]["resources"]["templates"]
+    message = f"error gateway.servers.broker-read.enable: {COMPLETIONS_NEED}"
+    assert (message in mcp_findings(raw)) is refused
+
+
+def test_a_capability_listed_twice_is_an_error(example_raw: Raw) -> None:
+    raw = kinds(example_raw, ["prompts", "resources", "prompts", "resources", "prompts"])
+    assert errors(run(raw)) == [
+        "gateway.servers.broker-read.enable: prompts is listed twice",
+        "gateway.servers.broker-read.enable: resources is listed twice",
+        f"gateway.servers.broker-read.enable: {TOOLS_ONLY}",
+    ]
+
+
+def test_a_kind_on_a_shared_session_warns(example_raw: Raw) -> None:
+    """Row 5d, beside the shared session's own warning."""
+    message = (
+        "warning gateway.servers.broker-read.enable: a shared legacy session serves every "
+        "client's prompts and reads the same upstream session"
+    )
+    raw = kinds(example_raw, ["prompts", "resources"])
+    raw["gateway"]["servers"]["broker-read"]["shared_session"] = True
+    assert message in mcp_findings(raw)
+    raw["gateway"]["servers"]["broker-read"]["shared_session"] = False
+    assert message not in mcp_findings(raw)
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["shared_session"] = True
+    assert message not in mcp_findings(raw)
+
+
+def test_a_template_must_be_level_one(example_raw: Raw) -> None:
+    """Row 6, in the type: each entry and key refused is named at its path, with the form."""
+    raw = kinds(example_raw)
+    templates = raw["gateway"]["servers"]["broker-read"]["resources"]["templates"]
+    templates["include"] += ["notes://notes/{+id}", "notes://notes/n{id}"]
+    templates["review"]["notes://notes/{id}?q"] = PIN_P
+    templates["declined"] = {"notes://{host}/x": PIN_P}
+    form = fields.TEMPLATE_FORM
+    prefix = "gateway.servers.broker-read.remote.resources.templates"
+    assert schema_errors(raw) == [
+        f"{prefix}.declined.notes://{{host}}/x: {form}",
+        f"{prefix}.include[1]: {form}",
+        f"{prefix}.include[2]: {form}",
+        f"{prefix}.review.notes://notes/{{id}}?q: {form}, in characters a URI may hold, with no "
+        "query or fragment",
+    ]
+
+
+def test_a_fixed_resource_must_be_an_absolute_uri(example_raw: Raw) -> None:
+    raw = kinds(example_raw)
+    fixed = raw["gateway"]["servers"]["broker-read"]["resources"]["fixed"]
+    fixed["include"] += ["notes://user@host/x", "index"]
+    fixed["declined"] = {"notes://host/x#top": PIN_P}
+    form = fields.RESOURCE_URI_FORM
+    prefix = "gateway.servers.broker-read.remote.resources.fixed"
+    assert schema_errors(raw) == [
+        f"{prefix}.declined.notes://host/x#top: {form}",
+        f"{prefix}.include[1]: {form}",
+        f"{prefix}.include[2]: {form}",
+    ]
+    # Each set is checked as the kind it holds: a fixed URI needs no authority, and a template's
+    # braces are no fixed URI's.
+    raw = kinds(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["resources"]["templates"]["include"] += [FIXED]
+    raw["gateway"]["servers"]["broker-read"]["resources"]["fixed"]["include"] += ["x:a"]
+    parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
+    raw["gateway"]["servers"]["broker-read"]["resources"]["fixed"]["include"] += [TEMPLATE]
+    assert schema_errors(raw) == [f"{prefix}.include[2]: {form}"]
+
+
+def test_a_prompt_is_named_as_a_tool_is(example_raw: Raw) -> None:
+    raw = kinds(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["prompts"]["assistant"] = ["bad name"]
+    raw["gateway"]["servers"]["broker-read"]["prompts"]["review"]["t"] = "sha256:short"
+    assert [e.split(":")[0] for e in schema_errors(raw)] == [
+        "gateway.servers.broker-read.remote.prompts.assistant[0]",
+        "gateway.servers.broker-read.remote.prompts.review.t",
+    ]
+
+
+def test_a_toolkit_has_no_prompts_or_resources(example_raw: Raw) -> None:
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["mail"]["prompts"] = {"include": ["p"]}
+    assert [e.split(":")[0] for e in schema_errors(raw)] == ["gateway.servers.mail.toolkit.prompts"]
 
 
 def test_unknown_capabilities_are_schema_errors(example_raw: Raw) -> None:

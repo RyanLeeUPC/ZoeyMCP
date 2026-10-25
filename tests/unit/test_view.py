@@ -220,6 +220,23 @@ def test_enable_is_carried() -> None:
     assert built(raw).gateway.servers["notes-read"].model_dump()["enable"] == ["resources"]
 
 
+PIN = "sha256:" + "9" * 64
+
+
+def test_prompts_and_resources_are_carried() -> None:
+    """Step 18 (L.3): the blocks as the policy writes them, through the served form and back."""
+    raw = raw_policy()
+    prompts = {"include": ["summarize"], "review": {"summarize": PIN}, "assistant": ["summarize"]}
+    resources = {"fixed": {"include": ["notes://index"], "review": {"notes://index": PIN}}}
+    raw["gateway"]["servers"]["notes-read"].update(prompts=prompts, resources=resources)
+    served = parse_view(dump_view(built(raw))).gateway.servers["notes-read"].model_dump()
+    assert served["prompts"] == {**prompts, "declined": {}}
+    assert served["resources"] == {
+        "templates": {"include": [], "review": {}, "declined": {}},
+        "fixed": {**resources["fixed"], "declined": {}},
+    }
+
+
 @pytest.mark.parametrize("era", ["auto", "modern", "legacy"])
 @pytest.mark.parametrize("on_drift", ["hide", "fail"])
 def test_every_era_and_drift_choice_round_trips(era: str, on_drift: str) -> None:
@@ -270,12 +287,21 @@ def test_the_vault_path_joins_prefix_and_path() -> None:
 # --- the digest --------------------------------------------------------------------------------
 
 
-def without_empty_declined(view: GatewayView) -> Raw:
-    """The view's content as M7 had it: a server's empty ``declined`` left out (M6 design A.3)."""
+EMPTY_PROMPTS: Raw = {"include": [], "review": {}, "declined": {}, "assistant": []}
+EMPTY_SET: Raw = {"include": [], "review": {}, "declined": {}}
+
+
+def without_empty_m6_fields(view: GatewayView) -> Raw:
+    """The view's content as M7 had it: a server's empty ``declined`` left out, and a remote
+    server's ``prompts`` and ``resources`` while every set in them is empty (M6 design A.3)."""
     gateway: Raw = view.gateway.model_dump(mode="json")
     for server in gateway["servers"].values():
         if not server["declined"]:
             del server["declined"]
+        if server.get("prompts") == EMPTY_PROMPTS:
+            del server["prompts"]
+        if server.get("resources") == {"templates": EMPTY_SET, "fixed": EMPTY_SET}:
+            del server["resources"]
     return gateway
 
 
@@ -283,15 +309,15 @@ def test_the_digest_covers_everything_else() -> None:
     view = built()
     assert view.digest == view_digest(view.gateway)
     assert view.digest == canonical.digest(
-        {"v": VIEW_VERSION, "gateway": without_empty_declined(view)}
+        {"v": VIEW_VERSION, "gateway": without_empty_m6_fields(view)}
     )
     assert VIEW_VERSION == 1
     raw = raw_policy()
     raw["gateway"]["servers"]["notes-read"]["declined"] = {"other": PIN_A}
     declined = built(raw)
-    assert "declined" in without_empty_declined(declined)["servers"]["notes-read"]
+    assert "declined" in without_empty_m6_fields(declined)["servers"]["notes-read"]
     assert declined.digest == canonical.digest(
-        {"v": VIEW_VERSION, "gateway": without_empty_declined(declined)}
+        {"v": VIEW_VERSION, "gateway": without_empty_m6_fields(declined)}
     )
 
 
@@ -386,7 +412,7 @@ def test_a_toolkit_module_is_gateway_side() -> None:
 def test_the_served_form_is_canonical_and_round_trips() -> None:
     view = built()
     data = dump_view(view)
-    served = {"v": view.v, "digest": view.digest, "gateway": without_empty_declined(view)}
+    served = {"v": view.v, "digest": view.digest, "gateway": without_empty_m6_fields(view)}
     assert data == canonical.dumps_canonical(served)
     assert parse_view(data) == view
 
@@ -490,6 +516,22 @@ REMOTE = "gateway/servers/notes-read"
         (_set(f"{REMOTE}/on_drift", "ignore"), "gateway.servers.notes-read.remote.on_drift"),
         (_set(f"{REMOTE}/enable", ["tasks"]), "gateway.servers.notes-read.remote.enable[0]"),
         (_set(f"{REMOTE}/era", "2025"), "gateway.servers.notes-read.remote.era"),
+        (
+            _set(f"{REMOTE}/prompts", {"include": ["bad name"]}),
+            "gateway.servers.notes-read.remote.prompts.include[0]",
+        ),
+        (
+            _set(f"{REMOTE}/prompts", {"surprise": []}),
+            "gateway.servers.notes-read.remote.prompts.surprise",
+        ),
+        (
+            _set(f"{REMOTE}/resources", {"templates": {"include": ["notes://n/{+id}"]}}),
+            "gateway.servers.notes-read.remote.resources.templates.include[0]",
+        ),
+        (
+            _set(f"{REMOTE}/resources", {"fixed": {"include": ["notes://u@h/x"]}}),
+            "gateway.servers.notes-read.remote.resources.fixed.include[0]",
+        ),
         (_set(f"{REMOTE}/wrap_results", "yes"), "gateway.servers.notes-read.remote.wrap_results"),
         (_drop(f"{REMOTE}/call_timeout"), "gateway.servers.notes-read.remote.call_timeout"),
         (_set("gateway/limits/max_request_bytes", 4095), "gateway.limits.max_request_bytes"),

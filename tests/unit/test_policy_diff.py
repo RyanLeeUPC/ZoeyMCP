@@ -320,6 +320,39 @@ def test_a_pin_and_a_from_field_by_their_document_names() -> None:
     )
 
 
+def test_prompts_and_resources_are_walked_as_tools_are() -> None:
+    """Step 18: an include and an assistant prompt are names in a set, and a template's pin a
+    mapping entry, each under its own model."""
+
+    def kinds(raw: dict[str, Any]) -> None:
+        server = raw["gateway"]["servers"]["notes"]
+        server["prompts"] = {"include": ["summarize"], "assistant": ["summarize"]}
+        server["resources"] = {"templates": {"review": {"notes://notes/{id}": PIN_NEW}}}
+
+    where = ("gateway", "servers", "notes")
+    assert structured(BASE, make(kinds)) == (
+        Change(
+            (*where, "prompts", "include"), "added", None, "summarize", "PromptsPolicy", "include"
+        ),
+        Change(
+            (*where, "prompts", "assistant"),
+            "added",
+            None,
+            "summarize",
+            "PromptsPolicy",
+            "assistant",
+        ),
+        Change(
+            (*where, "resources", "templates", "review", "notes://notes/{id}"),
+            "added",
+            None,
+            PIN_NEW,
+            "ResourceSet",
+            "review",
+        ),
+    )
+
+
 def test_the_walk_tables_name_schema_fields() -> None:
     found = models()
     for model, field in NAME_SETS | BY_INDEX:
@@ -383,8 +416,9 @@ ALWAYS_WIDER: dict[str, tuple[str, ...]] = {
     "ClientApprovals": ("renders",),
     "Client": ("token", "token_sha256"),
     "Approvals": ("approver",),
-    "_UpstreamServer": ("tools", "era"),
-    "RemoteServer": ("tools", "era", "kind", "route", "path"),
+    "_UpstreamServer": ("tools", "prompts", "resources", "era"),
+    "RemoteServer": ("tools", "prompts", "resources", "era", "kind", "route", "path"),
+    "ResourcesPolicy": ("templates", "fixed"),
     "ToolkitSlot": ("route",),
     "ToolkitServer": ("kind", "module", "tools"),
     "Gateway": ("approvals", "limits"),
@@ -475,6 +509,18 @@ ROWS: list[Row] = [
     ("Tools", "include", "added", None, "read", "wider", "narrower"),
     ("Tools", "allow", "added", None, "read", "wider", "narrower"),
     ("Tools", "approve", "added", None, "read", "neutral", "neutral"),
+    # Prompts and resources (step 18): an include or an assistant prompt added is wider (H.2).
+    ("PromptsPolicy", "include", "added", None, "summarize", "wider", "narrower"),
+    ("PromptsPolicy", "assistant", "added", None, "summarize", "wider", "narrower"),
+    ("PromptsPolicy", "review", "changed", PIN_READ, PIN_NEW, "neutral", "neutral"),
+    ("PromptsPolicy", "review", "added", None, PIN_READ, "neutral", "neutral"),
+    ("PromptsPolicy", "declined", "added", None, PIN_READ, "neutral", "wider"),
+    ("PromptsPolicy", "declined", "changed", PIN_READ, PIN_NEW, "neutral", "neutral"),
+    ("ResourceSet", "include", "added", None, "notes://index", "wider", "narrower"),
+    ("ResourceSet", "review", "changed", PIN_READ, PIN_NEW, "neutral", "neutral"),
+    ("ResourceSet", "review", "added", None, PIN_READ, "neutral", "neutral"),
+    ("ResourceSet", "declined", "added", None, PIN_READ, "neutral", "wider"),
+    ("ResourceSet", "declined", "changed", PIN_READ, PIN_NEW, "neutral", "neutral"),
     *upstream_rows("_UpstreamServer"),
     *upstream_rows("RemoteServer"),
     *upstream_rows("ToolkitServer"),

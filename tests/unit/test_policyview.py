@@ -158,6 +158,17 @@ def document() -> dict[str, Any]:
                     "route": "api",
                     "review": {"t": "sha256:" + "5" * 64},
                     "declined": {"u": "sha256:" + "6" * 64},
+                    "prompts": {
+                        "include": ["p"],
+                        "review": {"p": "sha256:" + "7" * 64},
+                        "assistant": ["p"],
+                    },
+                    "resources": {
+                        "templates": {
+                            "include": ["notes://n/{id}"],
+                            "review": {"notes://n/{id}": "sha256:" + "8" * 64},
+                        }
+                    },
                 },
                 "bridge": {"kind": "remote", "route": "api", "path": "/bridge/mcp"},
                 "kit": {
@@ -464,6 +475,23 @@ def test_everything_else_is_shown_as_written_in_the_schemas_order() -> None:
     # A declined tool's pin is shown as a review pin is (M6 design A.4).
     assert servers["remote"]["declined"] == {"u": "sha256:" + "6" * 64}
     assert (servers["bridge"]["declined"], servers["kit"]["declined"]) == ({}, {})
+    # Prompts and resources show as tools do: names, URIs and pins (A.4, step 18).
+    assert servers["remote"]["prompts"] == {
+        "include": ["p"],
+        "review": {"p": "sha256:" + "7" * 64},
+        "declined": {},
+        "assistant": ["p"],
+    }
+    assert servers["remote"]["resources"] == {
+        "templates": {
+            "include": ["notes://n/{id}"],
+            "review": {"notes://n/{id}": "sha256:" + "8" * 64},
+            "declined": {},
+        },
+        "fixed": {"include": [], "review": {}, "declined": {}},
+    }
+    assert servers["bridge"]["prompts"]["include"] == []
+    assert "prompts" not in servers["kit"]
     assert servers["bridge"]["path"] == "/bridge/mcp"
     # A route's program and a unix: upstream are configuration, shown as written (M7 design A.1).
     bridge = policy["routes"][2]

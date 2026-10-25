@@ -8,9 +8,10 @@ path). A toolkit server carries its module, which the gateway imports, and its s
 route prefix, the connector's kind (never its name) and the toolkit's rules as full vault paths.
 
 ``digest`` is the canonical digest of everything else, so it changes exactly when the view does.
-A field M6 added (``declined``, M6 design A.3) is left out of both the digest and the served bytes
-while it is empty, so a policy that doesn't use it keeps the view an M7 vault served, digest and
-all, and an older gateway meets the field only once the operator uses it (CR-6, CR-7). The
+A field M6 added (``declined``, and a remote server's ``prompts`` and ``resources``, M6 design A.3,
+L.3) is left out of both the digest and the served bytes while it is empty (a block, while every
+list and map in it is), so a policy that doesn't use it keeps the view an M7 vault served, digest
+and all, and an older gateway meets the field only once the operator uses it (CR-6, CR-7). The
 policy's mode isn't in the view: the vault states it beside every view answer, in the header
 :data:`MODE_HEADER` (M6 design K.3, G.9), so a mode alone moves no view, digest or review job;
 a managed vault states its head the same way (:data:`REVISION_HEADER`), so a save that doesn't
@@ -41,6 +42,8 @@ from .schema import (
     Origin,
     Pin,
     Policy,
+    PromptsPolicy,
+    ResourcesPolicy,
     Server,
     SlotName,
     TokenHash,
@@ -101,6 +104,9 @@ class ViewRemoteServer(_Model):
     shared_session: bool
     wrap_results: bool
     enable: list[Capability]
+    # M6 L.3: what the gateway would serve of each kind, left out while empty, as declined is.
+    prompts: PromptsPolicy = Field(default_factory=PromptsPolicy)
+    resources: ResourcesPolicy = Field(default_factory=ResourcesPolicy)
     era: Literal["auto", "modern", "legacy"]
     drift_check_interval: Annotated[int, Field(ge=60, le=86400)]
     call_timeout: Annotated[int, Field(ge=1, le=3600)] | None
@@ -164,7 +170,15 @@ class GatewayView(_Model):
 
 
 # A server's fields M6 added, which the digest and the served bytes leave out while empty (A.3).
-_OMITTED_WHEN_EMPTY: Final = ("declined",)
+# A toolkit server has only the first.
+_OMITTED_WHEN_EMPTY: Final = ("declined", "prompts", "resources")
+
+
+def _empty(value: Any) -> bool:
+    """Whether a field's plain value is empty: a map (a block) is when every value in it is."""
+    if isinstance(value, dict):
+        return all(_empty(item) for item in value.values())
+    return not value
 
 
 def _dumped(gateway: ViewGateway) -> dict[str, Any]:
@@ -172,7 +186,7 @@ def _dumped(gateway: ViewGateway) -> dict[str, Any]:
     data = gateway.model_dump()
     for server in data["servers"].values():
         for member in _OMITTED_WHEN_EMPTY:
-            if not server[member]:
+            if member in server and _empty(server[member]):
                 del server[member]
     return data
 
@@ -232,6 +246,8 @@ def _server(name: str, server: Server, policy: Policy, prefixes: dict[str, str])
         shared_session=server.shared_session,
         wrap_results=server.wrap_results,
         enable=list(server.enable),
+        prompts=server.prompts,
+        resources=server.resources,
         era=server.era,
         drift_check_interval=server.drift_check_interval,
         call_timeout=server.call_timeout,
