@@ -12,6 +12,11 @@ or as ``docker compose exec`` runs them over the vault's admin socket.
   key as retired, so a head put back under it is refused even with the old key set (T-13);
 - J16: a start refused over the head, its reseed (planned on the old store when it verifies, with
   a new ratchet when it doesn't), and the start after it;
+- J11 (step 17): /state/policy put back alone is refused; the whole /state put back, or wiped
+  and seeded again, while a real gateway process on its own volume witnessed the newer
+  revisions, is flagged (``policy_behind_witness``, ``policy_deployment_changed``) and cleared
+  by ``policy acknowledge-restore``, with the vault stopped or, where there is an admin socket,
+  over it (the re-review J11 names comes with step 17's fix commit);
 - J6-J8 and J10's export (step 14a): an export edited and imported over the socket, the compose
   policy recorded or imported with --from-env, a diff and a rollback, a broken admin rolled
   back, an import with the vault stopped, and a declarative export that starts the vault
@@ -24,8 +29,10 @@ is one.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import textwrap
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -33,13 +40,14 @@ from typing import Any
 import pytest
 import yaml
 
+from zoeymcp.gateway import witness
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.managed import head_policy
-from zoeymcp.vault.policyseal import unseal_anchor
+from zoeymcp.vault.policyseal import unseal_anchor, unseal_head
 from zoeymcp.vault.policystart import Ok
 from zoeymcp.vault.policystore import PolicyStore
 
-from .procs import ManagedVault, free_port, managed_policy
+from .procs import ManagedVault, Process, free_port, managed_policy, start, wait_port
 
 HARDENED = "docker compose -f deploy/compose.hardened.yaml"
 OFFLINE = {"by": "host", "via": "offline"}
@@ -492,3 +500,240 @@ def test_offline_import(tmp_path: Path) -> None:
     made.portal = moved
     made.start()
     made.stop()
+
+
+# --- a restored volume and the gateway as witness (J11; M6 design D.6, K.3; T-5, Y24) ----------
+
+WITNESS_WAIT = 150.0  # a vault restart, the gateway's backoff, and its status within the minute
+
+
+def gateway_on(made: ManagedVault, state: Path) -> Process:
+    """The gateway on the vault's TCP listener with the gateway key, as the hardened tier runs
+    it, on its own volume ``state``: kept when the vault's is restored or wiped."""
+    state.mkdir(mode=0o700, exist_ok=True)
+    port = free_port()
+    keys = KeySet.from_text(made.env["ZOEYMCP_MASTER_KEY"])
+    argv = [
+        "gateway", "--vault", f"http://127.0.0.1:{made.port}", "--listen", f"127.0.0.1:{port}",
+        "--state", str(state), "--admin-socket", "none",
+    ]  # fmt: skip
+    process = start(
+        argv, env={"ZOEYMCP_GATEWAY_KEY": keys.gateway_key(1)}, log=state.parent / "gateway.log"
+    )
+    wait_port(port, process)
+    return process
+
+
+def deployment_of(made: ManagedVault) -> str:
+    """The deployment the vault's head names, read without opening the store under it."""
+    keys = KeySet.from_text(made.env["ZOEYMCP_MASTER_KEY"])
+    return unseal_head((made.state / "policy" / "head.json").read_bytes(), keys, None).deployment
+
+
+def seen_by(state: Path) -> dict[str, int]:
+    """What the gateway's witness holds: each deployment's highest revision."""
+    path = state / witness.FILE
+    return witness.loads(path.read_bytes()).report() if path.exists() else {}
+
+
+def wait_for(check: Callable[[], bool], what: str, *processes: Process) -> None:
+    """Until ``check`` holds; fails with the processes' output if one exits or time runs out."""
+    deadline = time.monotonic() + WITNESS_WAIT
+    while not check():
+        for process in processes:
+            if process.popen.poll() is not None:
+                raise RuntimeError(f"a process exited before {what}:\n{process.output()}")
+        if time.monotonic() > deadline:
+            said = "\n".join(process.output() for process in processes)
+            raise AssertionError(f"{what} never happened:\n{said}")
+        time.sleep(0.2)
+
+
+def add_client(made: ManagedVault, name: str, digit: str) -> int:
+    """An offline import, the vault stopped, adding client ``name`` (a change to the gateway's
+    view); the revision it wrote."""
+
+    def change(data: dict[str, Any]) -> None:
+        data["gateway"]["clients"][name] = {"token_sha256": "sha256:" + digit * 64}
+
+    state = ["--state", str(made.state)]
+    text = edited_export(made, change, state)
+    code, _, err = made.cli(["policy", "import", "-", *state, "--yes", "--accept-widening"], text)
+    assert code == 0, err
+    return opened(made).revision
+
+
+def put_back(made: ManagedVault, copy: Path, relative: str = "") -> None:
+    """The vault's volume, or one directory in it, replaced by ``copy``, as a restore does."""
+    target = made.state / relative if relative else made.state
+    shutil.rmtree(target)
+    shutil.copytree(copy, target)
+
+
+def test_policy_dir_restored_alone(tmp_path: Path) -> None:
+    """J11's first case, D.6 row 9: /state/policy put back from an older backup, the anchor
+    beside it kept: the vault refuses to start, naming the recoveries."""
+    made = vault(tmp_path)
+    made.start()
+    made.stop()
+    backup = tmp_path / "policy-backup"
+    shutil.copytree(made.state / "policy", backup)
+    assert add_client(made, "agent2", "2") == 2
+    put_back(made, backup, "policy")
+    said = made.refused()
+    assert "the policy head is revision 1, but revision 2 was committed" in said
+    assert "restored from an older backup?" in said
+    assert (
+        f"Restore {made.state.as_posix()} from one backup, or start from your latest export:"
+        in said
+    )
+    assert f"policy import --state {made.state.as_posix()} --reseed - < policy-export.yaml" in said
+
+
+# How the host acknowledges: with the vault stopped (--state), or over its admin socket.
+VIA = [pytest.param(False, id="offline"), pytest.param(True, id="socket", marks=UNIX)]
+SOCKET_AUTHOR = {"by": "host", "via": "socket"}
+
+
+@pytest.mark.parametrize("over_socket", VIA)
+def test_restored_volume_is_flagged(tmp_path: Path, over_socket: bool) -> None:
+    """J11's second case, FM-8's witness half, Y24: the whole /state put back from a copy at
+    revision 1 while the gateway, on its own volume, has applied revision 3: the vault starts,
+    the gateway logs the regression and keeps 3, and the vault raises policy_behind_witness from
+    its status report. Acknowledged, revision 4 jumps past the claim: with the vault stopped,
+    the number given with --to; over the socket, the gateway's claim named and the number typed.
+    The finding is not raised again, and the gateway records 4."""
+    made = socket_vault(tmp_path) if over_socket else vault(tmp_path)
+    made.start()
+    gateway_state = tmp_path / "gateway-state"
+    gateway = gateway_on(made, gateway_state)
+    try:
+        assert made.process is not None
+        deployment = deployment_of(made)
+        wait_for(lambda: seen_by(gateway_state) == {deployment: 1}, "revision 1 seen", gateway)
+        made.stop()
+        backup = tmp_path / "state-backup"
+        shutil.copytree(made.state, backup)
+        assert add_client(made, "agent2", "2") == 2
+        assert add_client(made, "agent3", "3") == 3
+        made.start()
+        wait_for(lambda: seen_by(gateway_state) == {deployment: 3}, "revision 3 seen", gateway)
+        made.stop()
+        put_back(made, backup)
+        before = len(made.output())
+        made.start()
+        assert made.process is not None
+
+        def flagged() -> bool:
+            return bool(events(made.output()[before:], "policy_behind_witness"))
+
+        wait_for(flagged, "policy_behind_witness", gateway, made.process)
+        [line] = events(made.output()[before:], "policy_behind_witness")
+        assert (line["level"], line["head"], line["witness"]) == ("critical", 1, 3)
+        regressed = events(gateway.output(), "policy_revision_regressed")
+        assert [(r["seen"], r["now"]) for r in regressed] == [(3, 1)]
+        assert regressed[0]["deployment"] == deployment[:8]
+        assert seen_by(gateway_state) == {deployment: 3}
+        if over_socket:
+            code, _, err = made.cli(["policy", "acknowledge-restore"], "4\n")
+            assert code == 0, err
+            assert err.splitlines()[:2] == [
+                "Revision 1 jumps to 4: one above the gateway's claim of 3; the number comes "
+                "from the gateway.",
+                "Type 4 to write it: Planned on revision 1 (the head):",
+            ]
+            after = len(made.output())
+        else:
+            made.stop()
+            state = ["--state", str(made.state)]
+            argv = ["policy", "acknowledge-restore", *state, "--to", "4", "--yes"]
+            code, _, err = made.cli(argv)
+            assert code == 0, err
+            after = len(made.output())
+            made.start()
+        assert "Acknowledged the restore as revision 4." in err
+        wait_for(lambda: seen_by(gateway_state) == {deployment: 4}, "revision 4 seen", gateway)
+        wait_for(
+            lambda: bool(events(made.output()[after:], "status_received")),
+            "a status report after the acknowledgment",
+            gateway,
+        )
+        assert events(made.output()[after:], "policy_behind_witness") == []
+    finally:
+        gateway.stop()
+        made.stop()
+    acknowledged = opened(made)
+    header = acknowledged.top.header
+    assert (acknowledged.revision, header["origin"], header["jumped_from"]) == (4, "acknowledge", 1)
+    assert header["author"] == (SOCKET_AUTHOR if over_socket else OFFLINE)
+
+
+@pytest.mark.parametrize("over_socket", VIA)
+def test_wiped_state_is_flagged(tmp_path: Path, over_socket: bool) -> None:
+    """J11's third case, T-5: /state wiped whole while the gateway's volume is kept: the vault
+    seeds revision 1 under a new deployment, the gateway records it beside the old one at 2
+    (policy_deployment_seen, a warning), and the vault raises policy_deployment_changed from
+    the status report. Acknowledged past the old one's revision (with --to and --yes, the vault
+    stopped or over the socket, where the line names the other deployment), it isn't raised
+    again."""
+    made = socket_vault(tmp_path) if over_socket else vault(tmp_path)
+    made.start()
+    made.stop()
+    assert add_client(made, "agent2", "2") == 2
+    old = opened(made).head.deployment
+    made.start()
+    gateway_state = tmp_path / "gateway-state"
+    gateway = gateway_on(made, gateway_state)
+    try:
+        wait_for(lambda: seen_by(gateway_state) == {old: 2}, "revision 2 seen", gateway)
+        made.stop()
+        shutil.rmtree(made.state)
+        before = len(made.output())
+        made.start()
+        assert made.process is not None
+        wait_for(lambda: (made.state / "policy" / "head.json").exists(), "the seed", gateway)
+        new = deployment_of(made)
+        assert new != old
+        wait_for(lambda: seen_by(gateway_state) == {old: 2, new: 1}, "the new one", gateway)
+        seen_lines = events(gateway.output(), "policy_deployment_seen")
+        assert [(s["level"], s["deployment"]) for s in seen_lines] == [
+            ("info", old[:8]),
+            ("warning", new[:8]),
+        ]
+
+        def flagged() -> bool:
+            return bool(events(made.output()[before:], "policy_deployment_changed"))
+
+        wait_for(flagged, "policy_deployment_changed", gateway, made.process)
+        [line] = events(made.output()[before:], "policy_deployment_changed")
+        assert (line["deployment"], line["other"], line["revision"]) == (new[:8], old[:8], 2)
+        if over_socket:
+            code, _, err = made.cli(["policy", "acknowledge-restore", "--to", "3", "--yes"])
+            assert code == 0, err
+            assert err.splitlines()[0] == (
+                "Revision 1 jumps to 3: one above the gateway's claim of 2 for another "
+                f"deployment of this vault ({old[:8]}); the number comes from the gateway."
+            )
+            after = len(made.output())
+        else:
+            made.stop()
+            state = ["--state", str(made.state)]
+            argv = ["policy", "acknowledge-restore", *state, "--to", "3", "--yes"]
+            code, _, err = made.cli(argv)
+            assert code == 0, err
+            after = len(made.output())
+            made.start()
+        assert "Acknowledged the restore as revision 3." in err
+        wait_for(lambda: seen_by(gateway_state) == {old: 2, new: 3}, "revision 3 seen", gateway)
+        wait_for(
+            lambda: bool(events(made.output()[after:], "status_received")),
+            "a status report after the acknowledgment",
+            gateway,
+        )
+        assert events(made.output()[after:], "policy_deployment_changed") == []
+    finally:
+        gateway.stop()
+        made.stop()
+    acknowledged = opened(made)
+    assert (acknowledged.revision, acknowledged.top.header["jumped_from"]) == (3, 1)
+    assert acknowledged.top.header["author"] == (SOCKET_AUTHOR if over_socket else OFFLINE)

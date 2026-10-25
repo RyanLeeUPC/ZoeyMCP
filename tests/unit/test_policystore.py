@@ -1235,3 +1235,187 @@ def test_the_store_can_be_shown(state: Path) -> None:
     store = seeded(state)
     assert repr(store) == "PolicyStore(revision=1, anchor_dirty=False)"
     assert isinstance(store.commit(plan_on(store), author=PASSKEY), Committed)
+
+
+# --- an acknowledged restore's jump (K.3, Y4) --------------------------------------------------
+
+
+def acknowledge(store: PolicyStore, to: int, policy: Policy = POLICY) -> Committed:
+    head = store.head
+    assert head is not None
+    return store.commit(
+        plan_on(store, policy, kind="policy.acknowledge"),
+        author=SOCKET,
+        jumped_from=head.revision,
+        revision=to,
+    )
+
+
+def numbers(page: list[dict[str, Any]]) -> list[tuple[int, bool]]:
+    return [(entry["revision"], bool(entry.get("gap"))) for entry in page]
+
+
+def test_an_acknowledgment_jumps_past_the_gateways_claim(state: Path) -> None:
+    """K.3: the revision is numbered as asked, names the head as its parent and in
+    ``jumped_from``, and the anchor moves with it; the numbers between were never written, so
+    history steps over them, they are ``revision_unknown``, never unreadable, and the next save
+    follows the jump; a start reads it all back the same."""
+    store = seeded(state)
+    saved(store, 2)
+    third = revision_on_disk(state, 3)
+    committed = acknowledge(store, 8)
+    assert committed.revision == 8
+    header = committed.header
+    assert (header["origin"], header["kind"], header["base"], header["jumped_from"]) == (
+        "acknowledge",
+        "policy.acknowledge",
+        3,
+        3,
+    )
+    assert header["parent"] == third.digest
+    head = head_on_disk(state)
+    assert (head.revision, head.oldest, head.oldest_parent) == (8, 1, None)
+    assert anchor_on_disk(state).highest == 8
+    assert store.kept == (1, 2, 3, 8)
+    assert numbers(store.history()) == [(8, False), (3, False), (2, False), (1, False)]
+    assert numbers(store.history(before=6)) == [(3, False), (2, False), (1, False)]
+    assert numbers(store.history(before=9, limit=2)) == [(8, False), (3, False)]
+    assert [store.missing(n) for n in (3, 4, 7, 8, 9)] == [
+        None,
+        "revision_unknown",
+        "revision_unknown",
+        None,
+        "revision_unknown",
+    ]
+    assert store.unreadable() == ()
+    saved(store, 1)
+    assert revision_on_disk(state, 9).header["parent"] == committed.digest
+    reopened = fresh(state)
+    found = ok(reopened)
+    assert (found.kept, found.quarantined, found.anchor_stale) == ((1, 2, 3, 8, 9), (), False)
+    assert numbers(reopened.history()) == [
+        (9, False),
+        (8, False),
+        (3, False),
+        (2, False),
+        (1, False),
+    ]
+    assert reopened.unreadable() == ()
+    assert reopened.missing(5) == "revision_unknown"
+
+
+def test_a_revision_lost_beside_a_jump_is_still_unreadable(state: Path) -> None:
+    store = seeded(state)
+    saved(store, 2)
+    acknowledge(store, 8)
+    saved(store, 1)
+    (state / revision_file(2)).write_bytes(b"{}")
+    reopened = fresh(state)
+    assert ok(reopened).quarantined == (Quarantined(2, "not_a_revision"),)
+    assert reopened.unreadable() == (2,)
+    assert reopened.missing(2) == "revision_unreadable"
+    assert reopened.missing(5) == "revision_unknown"
+    assert numbers(reopened.history()) == [
+        (9, False),
+        (8, False),
+        (3, False),
+        (2, True),
+        (1, False),
+    ]
+
+
+def test_a_jump_in_quarantine_leaves_its_numbers_unwritten(state: Path) -> None:
+    """Row 14 and K.3: with the jump's own file in quarantine, what it passed over is still never
+    written, at every start: only the jump is unreadable, and nothing walks the numbers."""
+    store = seeded(state)
+    saved(store, 2)
+    jump = 9_000_000_000
+    acknowledge(store, jump)
+    saved(store, 1)
+    (state / revision_file(jump)).write_bytes(b"{}")
+    # In revisions/ at the first start, in quarantine/ at the second, named by the head.
+    for missing in (0, 1):
+        reopened = fresh(state)
+        assert (ok(reopened).kept, ok(reopened).missing) == ((1, 2, 3, jump + 1), missing)
+        assert reopened.unreadable() == (jump,)
+        assert [reopened.missing(n) for n in (jump, 4, jump - 1)] == [
+            "revision_unreadable",
+            "revision_unknown",
+            "revision_unknown",
+        ]
+        assert numbers(reopened.history()) == [
+            (jump + 1, False),
+            (jump, True),
+            (3, False),
+            (2, False),
+            (1, False),
+        ]
+
+
+def test_revisions_in_quarantine_stay_unreadable(state: Path) -> None:
+    """Row 14: a revision quarantined at one start is still unreadable at the next, its file in
+    quarantine/, whether or not a kept one names it."""
+    store = seeded(state)
+    saved(store, 3)
+    for number in (2, 3):
+        (state / revision_file(number)).write_bytes(b"{}")
+    for _ in range(2):
+        reopened = fresh(state)
+        assert reopened.kept == (1, 4)
+        assert reopened.unreadable() == (2, 3)
+        assert numbers(reopened.history()) == [(4, False), (3, True), (2, True), (1, False)]
+    assert ok(reopened).quarantined == ()
+
+
+def test_a_jump_is_above_the_head_and_at_most_the_maximum(
+    state: Path, seams: list[tuple[str, str]]
+) -> None:
+    store = seeded(state)
+    seams.clear()
+    with pytest.raises(ValueError, match="numbered above the head"):
+        acknowledge(store, 1)
+    with pytest.raises(StoreRefused) as refused:
+        acknowledge(store, REVISION_MAX + 1)
+    assert refused.value.reason == "revision_out_of_range"
+    assert seams == []
+    assert acknowledge(store, 2).revision == 2  # no jump at all: the head's next
+    assert acknowledge(store, REVISION_MAX).revision == REVISION_MAX
+    assert ok(fresh(state)).revision == REVISION_MAX
+
+
+def test_retention_counts_the_revisions_written(
+    state: Path, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    """D.8 with a jump: the newest KEEP written are kept, the jump's numbers not counted, so a
+    jump far past the head prunes nothing more than a save would."""
+    monkeypatch.setattr(policystore, "KEEP", 4)
+    store = seeded(state)
+    saved(store, 2)
+    acknowledge(store, 100)
+    assert store.kept == (1, 2, 3, 100)
+    assert head_on_disk(state).oldest == 1
+    first, third = revision_on_disk(state, 1), revision_on_disk(state, 3)
+    saved(store, 1)
+    head = head_on_disk(state)
+    assert (head.revision, head.oldest, head.oldest_parent) == (101, 2, first.digest)
+    assert store.kept == (2, 3, 100, 101)
+    saved(store, 2)
+    head = head_on_disk(state)
+    assert (head.revision, head.oldest, head.oldest_parent) == (103, 100, third.digest)
+    assert store.kept == (100, 101, 102, 103)
+    found = ok(fresh(state))
+    assert (found.kept, found.pruned, found.quarantined) == ((100, 101, 102, 103), (), ())
+    assert [line["below"] for line in events(log_buffer) if line["event"] == "policy_pruned"] == [
+        2,
+        3,
+        100,
+    ]
+
+
+def test_the_lookup_reads_across_a_jump(state: Path) -> None:
+    """A token the jumped revision no longer holds was retired by it."""
+    store = seeded(state, with_clients({"a": "1", "b": "2"}))
+    saved(store, 1, with_clients({"a": "1", "b": "2"}))
+    acknowledge(store, 9, with_clients({"b": "2"}))
+    assert store.removed_lookup(with_clients({"a": "1"}))("client:a") == 9
+    assert fresh(state).removed_lookup(with_clients({"a": "1"}))("client:a") == 9

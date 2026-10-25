@@ -84,6 +84,8 @@ fails ``clear_not_clean``. A server row names its included ``approve`` tools, fo
 without asking**, which in declarative mode opens the review screen with that tool moved (J3).
 Home's attention list (M6 design M.7), ``GET /api/attention``, is what the gateway's status
 report says needs the operator, read from health's ``gateway`` section (``attention_items``).
+Health's restore witness findings (M6 design K.3, J11: ``policy_behind_witness``,
+``policy_deployment_changed``) are banners on every page of a full session, with their text.
 
 Managed mode (M6 design G.3-G.7, J.3, J.4, M.1-M.3): the mode is the running policy's, and the
 session answer names it with the head's revision. The review diff route builds a review save's
@@ -382,6 +384,9 @@ COUNTER_BANNER: Final = (
     "been copied. Check the passkeys with zoeymcp passkeys."
 )
 HEALTH_BANNER: Final = "{count} problem(s) need you: see the checklist on Home."
+# Health's restore witness findings, each its own banner on every page with its text (M6 design
+# K.3, J11): the vault's head is behind what the deployment ran, or another deployment ran here.
+RESTORE_BANNERS: Final = ("policy_behind_witness", "policy_deployment_changed")
 # The callback's refusals logged as oauth_callback_refused (M.4); busy and rate_limited there
 # are portal_refused, as on any route.
 CALLBACK_REFUSALS: Final = frozenset(
@@ -419,6 +424,8 @@ ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
         "reload_vault": "Send SIGHUP to the vault, or restart it, with host access.",
         "import_from_env": "Remove ZOEYMCP_CONFIG, or import it on the host with zoeymcp policy "
         "import --from-env.",
+        "acknowledge_restore": "Re-apply and review as it says, then acknowledge on the host "
+        "with zoeymcp policy acknowledge-restore.",
     }
 )
 # The banner while the reported copy refuses reports (K.3), by its state (J.2 rows 8-10).
@@ -1156,9 +1163,16 @@ class PortalApp:
             here = sum(1 for c in holder.document.credentials if c.rp_id == session.rp_id)
         # Health's counts, shown on every page, and a banner for its errors: a full session's.
         counts = None
+        restored: list[dict[str, str]] = []
         if session.scope == "full" and self.health is not None:
-            counts = dict(self.health()["summary"])
-        banners = self._banners()
+            report = self.health()
+            counts = dict(report["summary"])
+            restored = [
+                {"code": finding["code"], "text": finding["text"]}
+                for finding in (report.get("policy") or {}).get("findings", ())
+                if finding["code"] in RESTORE_BANNERS
+            ]
+        banners = self._banners() + restored
         if counts is not None and counts["error"]:
             text = HEALTH_BANNER.format(count=counts["error"])
             banners.append({"code": "health_errors", "text": text})

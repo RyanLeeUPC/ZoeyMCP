@@ -13,6 +13,13 @@ The vault states its mode beside every view answer, the 200 and the 304, in the 
 contact as :attr:`PolicyClient.mode`, ``unknown`` before its first view, so the gateway's
 status and review answers can tell the CLI in its container, which has no vault socket, that the
 deployment is managed. An answer without a mode it knows keeps the last.
+
+A managed vault states its head beside the mode, in ``x-zoeymcp-policy-revision`` (K.3, CR-9).
+With a :class:`Witness`, the client hands each statement it reads with contact to it: the
+restore witness keeps the highest revision seen of each deployment in ``policy-seen.json``
+(:mod:`.witness`), logs ``policy_deployment_seen`` for a new deployment beside others (warning)
+and ``policy_revision_regressed`` (critical, once per regression) for a revision below the one
+it holds, and the status report carries what it holds. The view is applied either way.
 """
 
 from __future__ import annotations
@@ -21,13 +28,22 @@ import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 import anyio
 import httpx2
 
-from ..common.policy.view import MODE_HEADER, GatewayView, PolicyMode, ViewError, parse_view
-from . import logs
+from ..common import files
+from ..common.policy.view import (
+    MODE_HEADER,
+    REVISION_HEADER,
+    GatewayView,
+    PolicyMode,
+    ViewError,
+    parse_view,
+)
+from . import logs, witness
 from .vaultlink import VIEW_PATH
 
 WAIT = 25
@@ -48,6 +64,70 @@ class Snapshot:
 Apply = Callable[[Snapshot, Snapshot | None], Awaitable[None]]
 
 
+class Witness:
+    """The restore witness's file in the gateway's state (K.3): what :mod:`.witness` decides,
+    kept in memory and written atomically on each change. ``wall`` dates a new deployment."""
+
+    def __init__(
+        self,
+        path: Path,
+        found: witness.Seen | None = None,
+        *,
+        wall: Callable[[], float] = time.time,
+    ) -> None:
+        self._path = path
+        self.seen = found or witness.Seen()
+        self._wall = wall
+        # The last regression logged, so a long poll that states it again every 25 s logs once.
+        self._regressed: witness.Regressed | None = None
+
+    @classmethod
+    def load(cls, state_dir: Path) -> Witness:
+        """The file in ``state_dir``, or an empty witness without one. Raises
+        :class:`~.witness.WitnessError` for a file that can't be read or used."""
+        path = state_dir / witness.FILE
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return cls(path)
+        except OSError as exc:
+            raise witness.WitnessError(f"can't read {path.name}: {exc.strerror}") from exc
+        return cls(path, witness.loads(data))
+
+    def note(self, header: str | None) -> None:
+        """A view answer's revision header, read with contact."""
+        stated = witness.stated(header)
+        if stated is None:
+            return
+        old = self.seen
+        found = witness.seen(old, stated, int(self._wall()))
+        if isinstance(found, witness.Regressed):
+            if found != self._regressed:
+                self._regressed = found
+                logs.event(
+                    "policy_revision_regressed",
+                    level="critical",
+                    deployment=found.deployment[:8],
+                    seen=found.seen,
+                    now=found.now,
+                )
+            return
+        if found is old:
+            return
+        if stated.deployment not in old.deployments:
+            logs.event(
+                "policy_deployment_seen",
+                level="warning" if old.deployments else "info",
+                deployment=stated.deployment[:8],
+            )
+        self.seen = found
+        try:
+            files.write_atomic(self._path, witness.dumps(found), prefix=".policy-seen-")
+        except OSError as exc:
+            # The record still holds in memory, and the next change writes it whole again.
+            logs.event("policy_seen_not_written", level="warning", error=exc.strerror or "error")
+
+
 def backoff(failures: int, jitter: float) -> float:
     """1, 2, 4 ... 30 s, times ``jitter`` (0.5 to 1.5)."""
     return min(BACKOFF_MAX, BACKOFF_START * float(2 ** max(0, failures - 1))) * jitter
@@ -61,11 +141,13 @@ class PolicyClient:
         *,
         clock: Callable[[], float] = time.monotonic,
         wait: int = WAIT,
+        witness: Witness | None = None,
     ) -> None:
         self._http = http
         self._apply = apply
         self._clock = clock
         self._wait = wait
+        self.witness = witness
         self.snapshot: Snapshot | None = None
         # The vault's mode, read with the snapshot and on each 304 after it.
         self.mode: PolicyMode = "unknown"
@@ -143,6 +225,8 @@ class PolicyClient:
 
     def _read_mode(self, response: httpx2.Response) -> None:
         self.mode = STATED.get(response.headers.get(MODE_HEADER, ""), self.mode)
+        if self.witness is not None:
+            self.witness.note(response.headers.get(REVISION_HEADER))
 
     def _contact(self) -> None:
         self.last_contact = self._clock()

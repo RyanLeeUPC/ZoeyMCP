@@ -63,7 +63,7 @@ from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
 
 from .test_admin import BROKER_BINDING, KEYS, AdminRig
-from .test_admin_policy import YAML, PolicyRig
+from .test_admin_policy import YAML, PolicyRig, deployment_of, witness_of
 from .test_cli_policy import AGENT2, TOKEN, managed_text
 from .test_portal_wire import ORIGIN, Page
 from .test_reviewreport import unclassified
@@ -262,7 +262,8 @@ async def test_no_policy_answer_carries_a_policy_secret_but_the_export(tmp_path:
     with a literal client token, after an import that removed that client: no answer carries
     the literal token, and only the export (of revision 1, which has the client) carries its
     hash and a caller's placeholder. The import and the rollback are planned for real, each
-    bringing the client back with its grant, so their plans are walked, not a refusal."""
+    bringing the client back with its grant, so their plans are walked, not a refusal; so is an
+    acknowledgment, the gateway's witness claiming a revision above the head (K.3)."""
     rig = PolicyRig(tmp_path, managed_text(), K="v")
     assert AGENT2 in managed_text()
     export = (await rig.call("GET", "/policy/export")).json()["export"]
@@ -278,8 +279,9 @@ async def test_no_policy_answer_carries_a_policy_secret_but_the_export(tmp_path:
         hash_token(TOKEN): "token hash",
         PLACEHOLDER: "placeholder",
     }
+    witness_of(rig, {deployment_of(rig): 5})
     walked = [route for route in socket_routes(rig) if route[1].startswith("/policy")]
-    assert len(walked) == 7
+    assert len(walked) == 8
     answers: list[tuple[tuple[str, str], str]] = []
     for method, template in walked:
         path = template.format(revision="1")
@@ -288,6 +290,8 @@ async def test_no_policy_answer_carries_a_policy_secret_but_the_export(tmp_path:
             document = edited(first, seeded) if template == "/policy/import" else b""
             headers = YAML if document else {}
             grants = [("allow_revive", "client:agent2"), ("accept_widening", "1")]
+            if template == "/policy/acknowledge-restore":
+                grants = []
             response = await rig.call(
                 method, path, content=document, headers=headers, params=[("plan", "1"), *grants]
             )

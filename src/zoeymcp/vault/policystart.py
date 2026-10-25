@@ -27,6 +27,11 @@ names; past the first that isn't, from ``oldest`` up, from the parent the head n
 that one. So one bad file costs that revision alone; with two, the revisions between them can't be
 shown to chain either way and are quarantined too.
 
+An acknowledged restore (K.3) numbers its revision one above the gateway's claim, not one above
+the head, and names the head in ``jumped_from``: the numbers between are never written. Its
+revision follows the one it jumped from (:func:`before`), in the chain, as the one file above the
+head a save that never answered leaves, and as the head one above the anchor's ``highest``.
+
 :func:`decide` then takes F.1's table: the configured source's mode, read from the text even when
 the gate refuses it (:func:`source_mode`; T-14), the gate's answer, and the verdict, and gives one
 :data:`StartDecision`: refuse, run declaratively (parking an ``Ok`` store, F.4), run the head,
@@ -89,6 +94,8 @@ HEAD_FILE: Final = "policy/head.json"
 ANCHOR_FILE: Final = "policy-anchor.json"
 REVISIONS: Final = "revisions"
 QUARANTINE: Final = "quarantine"
+# A quarantined file's revision, from its name (<n>.<why>.json, <n>.<why>.<k>.json).
+_QUARANTINED: Final = re.compile(r"([0-9]{1,10})\.[a-z]+(?:\.[0-9]+)?\.json")
 # What write_atomic names its temporary files in the store (D.1).
 TEMPORARY_PREFIX: Final = ".policy-"
 # What a vault writes in /state that doesn't make a volume used (F.1, CR-12): its lock
@@ -286,6 +293,7 @@ class Ok:
     uncommitted: int | None = None  # row 12: quarantine/<n>.uncommitted.json
     quarantined: tuple[Quarantined, ...] = ()  # row 14
     kept: tuple[int, ...] = ()  # the revisions History shows, the head's included
+    absent: tuple[int, ...] = ()  # row 14: below the head, named and with no file at all
     stray: tuple[str, ...] = ()  # row 15, revealed
     pruned: tuple[int, ...] = ()  # row 16
 
@@ -299,8 +307,8 @@ class Ok:
 
     @property
     def missing(self) -> int:
-        """How many kept revisions below the head have no file at all."""
-        return self.head.revision - self.head.oldest + 1 - len(self.kept) - len(self.quarantined)
+        """How many kept revisions below the head have no file at all (:func:`_absent`)."""
+        return len(self.absent)
 
 
 StoreVerdict = Fresh | Refused | Ok
@@ -339,22 +347,51 @@ def _stray(listed: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
+GONE_MAX: Final = 64
+"""The longest run of files gone that :func:`_absent` counts below one named: ``policystore``
+keeps its newest 64 written, so a longer run holds numbers a lost jump passed over."""
+
+
+def set_aside(names: Iterable[str]) -> frozenset[int]:
+    """The revision each ``quarantine/`` file in ``names`` was, by its name."""
+    found = set()
+    for name in names:
+        number = _QUARANTINED.fullmatch(name)
+        if number is not None:
+            found.add(int(number.group(1)))
+    return frozenset(found)
+
+
+def before(entry: Unsealed) -> int:
+    """The revision ``entry`` follows: the one an acknowledged restore jumped from (K.3), else
+    the one below it. The numbers between a jump's two are never written."""
+    jumped: int | None = entry.header["jumped_from"]
+    return entry.revision - 1 if jumped is None else jumped
+
+
 def _chain(
     head: Head, top: Unsealed, files: Mapping[int, Unsealed | SealRefused], anchor: Anchor
 ) -> tuple[tuple[int, ...], tuple[Quarantined, ...]]:
     """The revisions that chain to the head, the head's included, and the older files that don't
-    (row 14), each with its fault, or ``chain``."""
+    (row 14), each with its fault, or ``chain``. Each revision follows the one :func:`before`
+    names."""
     kept = [head.revision]
     expected = top.header["parent"]
-    number = head.revision - 1
+    number = before(top)
     while number >= head.oldest and number in files:
         entry = _checked(files[number], number, anchor)
         if not isinstance(entry, Unsealed) or entry.digest != expected:
             break
         kept.append(number)
         expected = entry.header["parent"]
-        number -= 1
-    # Below the first that doesn't chain down, up from the parent the head names for oldest.
+        number = before(entry)
+    # Below the first that doesn't chain down, up from the parent the head names for oldest,
+    # past each jump to the revision that names its start.
+    jumps = {
+        entry.header["jumped_from"]: n
+        for n, entry in files.items()
+        if isinstance(entry, Unsealed) and entry.header["jumped_from"] is not None
+    }
     expected = head.oldest_parent
     low = head.oldest
     while low < number and low in files:
@@ -363,7 +400,7 @@ def _chain(
             break
         kept.append(low)
         expected = entry.digest
-        low += 1
+        low = jumps.get(low, low + 1)
     quarantined = []
     for n in sorted(files):
         if head.oldest <= n < head.revision and n not in kept:
@@ -371,6 +408,34 @@ def _chain(
             fault: Fault = "chain" if isinstance(entry, Unsealed) else entry[0]
             quarantined.append(Quarantined(n, fault))
     return tuple(sorted(kept)), tuple(quarantined)
+
+
+def _absent(
+    head: Head,
+    files: Mapping[int, Unsealed | SealRefused],
+    anchor: Anchor,
+    aside: Collection[int],
+) -> tuple[int, ...]:
+    """The revisions below the head that have no file at all (row 14): each one something read
+    names (the oldest the head names, and the one each revision of this store follows,
+    :func:`before`), and the run of files gone below it, down to the next file, one in
+    quarantine (``aside``) or the oldest, at most :data:`GONE_MAX` of it. A number nothing names
+    or reaches isn't counted: one a jump passed over was never written, and a jump whose own file
+    is unreadable names nothing (K.3)."""
+    named = {head.oldest}
+    for number, found in files.items():
+        entry = _checked(found, number, anchor)
+        if isinstance(entry, Unsealed):
+            named.add(before(entry))
+    gone: set[int] = set()
+    for top in named:
+        number = top
+        while number >= head.oldest and number not in files and top - number < GONE_MAX:
+            gone.add(number)
+            if number in aside:
+                break
+            number -= 1
+    return tuple(sorted(gone))
 
 
 def verdict(
@@ -382,7 +447,8 @@ def verdict(
 ) -> StoreVerdict:
     """D.6's verdict on what ``policystore`` read: the anchor and the head (``None`` when absent),
     every ``revisions/`` file by the number its name holds, every name in ``/state/policy``
-    relative to it (``revisions/<name>`` for the files there), and :func:`volume_used`'s names."""
+    relative to it (``revisions/<name>`` and ``quarantine/<name>`` for the files there), and
+    :func:`volume_used`'s names."""
     # Row 1.
     if isinstance(anchor, SealRefused):
         reason: StoreReason = (
@@ -431,18 +497,20 @@ def verdict(
         return Refused(
             "policy_head_behind", HEAD_FILE, revision=head.revision, highest=anchor.highest
         )
-    if head.revision > anchor.highest + 1:
+    # A head an acknowledged restore jumped to follows the anchor's highest as head + 1 does.
+    if head.revision > anchor.highest + 1 and before(entry) != anchor.highest:
         return Refused(
             "policy_anchor_behind", ANCHOR_FILE, revision=head.revision, highest=anchor.highest
         )
-    # Rows 11 and 12: above the head, at most the one file a save that never answered leaves.
+    # Rows 11 and 12: above the head, at most the one file a save that never answered leaves:
+    # head + 1, or the revision an acknowledged restore jumped to from the head.
     above = sorted(n for n in files if n > head.revision)
-    found = files.get(head.revision + 1)
-    following = None if found is None else _checked(found, head.revision + 1, anchor)
+    found = files.get(above[0]) if len(above) == 1 else None
+    following = None if found is None else _checked(found, above[0], anchor)
     if above and not (
-        len(above) == 1
-        and isinstance(following, Unsealed)
+        isinstance(following, Unsealed)
         and following.header["parent"] == head.digest
+        and before(following) == head.revision
     ):
         shown = _names([str(n) for n in above])
         detail = f"revision {shown}" if len(above) == 1 else f"revisions {shown}"
@@ -461,6 +529,14 @@ def verdict(
         uncommitted=above[0] if above else None,
         quarantined=quarantined,
         kept=kept,
+        absent=_absent(
+            head,
+            files,
+            anchor,
+            set_aside(
+                name.partition("/")[2] for name in listed if name.partition("/")[0] == QUARANTINE
+            ),
+        ),
         stray=_stray(listed),
         pruned=tuple(sorted(n for n in files if n < head.oldest)),
     )

@@ -438,10 +438,18 @@ view.
       refused before any passkey prompt ("press Save again to plan it on revision N"), the boxes
       are drawn again with `agent1` ticked, and nothing more is written;
     - the vault's log has `step_up_confirmed` with `onboard.register`, `policy.save`,
-      `oauth.complete`, `policy.save` and `client.servers`, in that order.
-
-    A `policy_behind_witness` banner on Home joins this item once the vault can raise it (the
-    restore witness, not built yet).
+      `oauth.complete`, `policy.save` and `client.servers`, in that order;
+    - the restore banner (`policy_behind_witness`): with the vault stopped right after the first
+      **Save** above, copy `./state` aside (`state.saved`), and carry on to the end; then stop the
+      vault, put the copy back in place of `./state` (the gateway's volume as it is), and start it.
+      Within a minute (the gateway's next status report) every page, Home first, shows the banner
+      "the gateway has applied revision N; this vault holds 2. Was the state volume restored? ..."
+      with N the last save's revision, as text, its command `docker compose ... exec vault zoeymcp
+      policy acknowledge-restore`; Home's count of problems includes it. Stop the vault, run
+      `zoeymcp policy acknowledge-restore --state ./state` (it asks for the number: type N + 1,
+      which it writes as "Acknowledged the restore as revision N + 1."), start the vault: once the
+      gateway reports again the banner is gone, and **Policy**'s history shows N + 1 straight after
+      2.
 
 ## D-66: the live OAuth test against a real provider
 

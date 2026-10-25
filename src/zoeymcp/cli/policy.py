@@ -60,7 +60,15 @@ rollback is planned and written as the running vault's is (``vault/managed.py``'
 goes to stderr, with ``[y/N]`` unless ``--yes``; a policy read from standard input leaves no
 answer to read, so without ``--yes`` the plan is printed and nothing is written. Every refusal is
 the catalogue's sentence (``portal/refusals.py``, N.2), so operations.md's table names each.
-``acknowledge-restore`` is step 17's, with the witness it acknowledges.
+
+``policy acknowledge-restore [--to N] [--yes]`` (K.3, J11), over the socket or with ``--state``,
+records that the host saw a restore the gateway's witness shows (``policy_behind_witness``,
+``policy_deployment_changed``): a revision with the head's content, numbered one above the
+gateway's claim, so the counter passes it and the finding clears. The number is the gateway's
+claim (T-4), so the command says where it comes from and takes it only typed at the terminal or
+as ``--to N``, which must be the number the vault plans (with ``--yes``, ``--to`` is required).
+With the vault stopped there is no claim to read: the number is the host's, typed or ``--to``,
+from what health showed.
 """
 
 from __future__ import annotations
@@ -98,6 +106,7 @@ from ..vault.managed import (
     Shaped,
     WriteRefused,
     Written,
+    acknowledge_shaped,
     bindings,
     commands,
     diff_answer,
@@ -105,6 +114,7 @@ from ..vault.managed import (
     head_policy,
     history_page,
     import_shaped,
+    jumped,
     lockout_rows,
     log_saved,
     lowered,
@@ -118,7 +128,7 @@ from ..vault.managed import (
     written_answer,
 )
 from ..vault.onboarding import RESTART_VAULT, saved_next
-from ..vault.policyseal import REASON_MAX
+from ..vault.policyseal import REASON_MAX, REVISION_MAX
 from ..vault.policystart import POLICY_DIR, QUARANTINE, Commands, Fresh, Ok, Refused
 from ..vault.policystore import HISTORY_PAGE_MAX, OFFLINE, PolicyStore, StoreRefused
 from ..vault.server import (
@@ -147,6 +157,8 @@ Reason = Literal[
     "import_widens",
     "lockout_unconfirmed",
     "plan_changed",
+    "nothing_to_acknowledge",
+    "revision_out_of_range",
 ]
 
 EXIT_OK: Final = 0
@@ -163,6 +175,8 @@ GRANT_FLAGS: Final = {
     "env_name_new": "--allow-env",
     "env_reach_grows": "--allow-env",
 }
+# The socket's route for acknowledge-restore (N.1, K.3).
+ACKNOWLEDGE_PATH: Final = "/policy/acknowledge-restore"
 # The actions whose stdout is their answer, kept free of log lines.
 _READS: Final = frozenset({"head", "history", "diff", "export"})
 # What the export's notes add for a declarative compose export: the way back (J10).
@@ -296,6 +310,13 @@ def _usage(action: str, args: argparse.Namespace, out: TextIO) -> str | None:
     limit = getattr(args, "limit", None)
     if limit is not None and not 1 <= limit <= HISTORY_PAGE_MAX:
         return f"--limit is 1 to {HISTORY_PAGE_MAX}"
+    if action == "acknowledge-restore":
+        # One above REVISION_MAX is refused, revision_out_of_range, as the vault refuses it (K.3).
+        if args.to is not None and args.to < 1:
+            return f"--to is a revision, 1 to {REVISION_MAX:,}"
+        if args.yes and args.to is None:
+            return "with --yes, give the revision with --to N: the number is never taken unseen"
+        return None
     if action == "export" and out.isatty() and not args.force_tty:
         return (
             "the export holds placeholders and client token hashes: redirect it to a file "
@@ -774,6 +795,11 @@ class _Vault(Protocol):
         self, write: _Write, base: int, digest: str, *, accept: bool, lockout: bool
     ) -> dict[str, Any]: ...
 
+    def acknowledge(self, base: int, to: int | None, digest: str | None) -> dict[str, Any]:
+        """``acknowledge-restore`` (K.3): its plan without ``digest``, numbered ``to`` (over the
+        socket, the vault's own from the witness), else its commit."""
+        ...
+
 
 class _Socket:
     """The running vault, over its admin socket."""
@@ -810,6 +836,12 @@ class _Socket:
             body=_body(write),
             base=base,
             plan_digest=digest,
+        )
+
+    def acknowledge(self, base: int, to: int | None, digest: str | None) -> dict[str, Any]:
+        query = [("plan", "1")] if digest is None else [("to", str(to))]
+        return admin_client.policy_write(
+            self._socket, ACKNOWLEDGE_PATH, query, base=base, plan_digest=digest
         )
 
 
@@ -924,8 +956,36 @@ class _Offline:
         written = Written(committed.revision, committed.digest, planned.effects, next=steps)
         return written_answer(written)
 
-    def _planned(self, write: _Write, base: int) -> tuple[WritePlan, Shaped]:
-        """The write planned on the head (G.6 steps 2-5), as the running vault plans it."""
+    def acknowledge(self, base: int, to: int | None, digest: str | None) -> dict[str, Any]:
+        """``acknowledge-restore`` with the vault stopped (K.3): no witness to read, so the
+        number is the host's, ``to``, above the head and at most ``REVISION_MAX``."""
+        assert to is not None  # noqa: S101 - the command asks for it first offline
+        top = self._store.head
+        assert top is not None  # noqa: S101 - an Ok store has one
+        if to <= top.revision:
+            detail = f"revision {to} isn't above the head, revision {top.revision}"
+            raise OfflineRefused("nothing_to_acknowledge", detail=detail)
+        if to > REVISION_MAX:
+            raise OfflineRefused("revision_out_of_range")
+        shaped = acknowledge_shaped()
+        planned, _ = self._planned(_Write("import"), base, shaped)
+        planned = jumped(planned, to)
+        if digest is None:
+            return plan_answer(planned, (), to) | {"witness": None}
+        if plan_digest(planned) != digest:
+            raise OfflineRefused("plan_changed")
+        try:
+            committed = self._store.commit(planned, author=OFFLINE, jumped_from=base, revision=to)
+        except StoreRefused as exc:
+            raise OfflineRefused(exc.reason) from exc
+        log_saved(planned, committed, OFFLINE, jumped_from=base)
+        return written_answer(Written(committed.revision, committed.digest))
+
+    def _planned(
+        self, write: _Write, base: int, shaped: Shaped | None = None
+    ) -> tuple[WritePlan, Shaped]:
+        """The write planned on the head (G.6 steps 2-5), as the running vault plans it;
+        ``shaped`` when the command shaped it itself (an acknowledgment)."""
         if self._parked:
             raise OfflineRefused("policy_not_managed")
         top = self._store.head
@@ -933,7 +993,8 @@ class _Offline:
         if base != top.revision:
             detail = moved(self._store.header, top.revision)
             raise OfflineRefused.of(WriteRefused("policy_moved", detail, revision=top.revision))
-        shaped = self._shaped(write)
+        if shaped is None:
+            shaped = self._shaped(write)
         try:
             started = _started(shaped.candidate_of(self._head))
         except ValueError as exc:
@@ -1066,6 +1127,8 @@ def _act(
         return _diff(args, vault, out)
     if action == "export":
         return _export(args, vault, environ, out, err)
+    if action == "acknowledge-restore":
+        return _acknowledge(args, vault, environ, stdin, err)
     return _write(action, args, vault, environ, stdin, err)
 
 
@@ -1090,6 +1153,18 @@ def _head(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
         out.write(f"Gateway: {gateway['state']} (on a view this vault didn't install)\n")
     else:
         out.write(f"Gateway: {gateway['state']} (on revision {gateway['revision']})\n")
+    witness = answer["witness"]
+    if witness is None:
+        out.write("Witness: unknown (no status report yet)\n")
+    elif witness["revision"] is None:
+        out.write("Witness: the gateway has seen no revision of this deployment yet\n")
+    else:
+        out.write(f"Witness: the gateway has seen revision {witness['revision']}\n")
+    if witness is not None and witness["target"] is not None:
+        out.write(
+            f"The gateway's witness shows a restore: see zoeymcp health, then zoeymcp policy "
+            f"acknowledge-restore (revision {witness['target']}).\n"
+        )
     if answer["not_running"] is not None:
         out.write(
             f"Revision {answer['not_running']} is saved but not running: send SIGHUP to the vault "
@@ -1251,6 +1326,89 @@ def _write(
         lines = [*lines, "Start the vault:", f"  {hosted.up()}"]
     err.write("".join(f"{line}\n" for line in lines))
     return EXIT_OK
+
+
+def _acknowledge(
+    args: argparse.Namespace,
+    vault: _Vault,
+    environ: Mapping[str, str],
+    stdin: TextIO,
+    err: TextIO,
+) -> int:
+    """K.3's acknowledge-restore: the number, where it comes from, the plan, then the write,
+    which names the head as its base and the plan's digest. A number above ``REVISION_MAX``,
+    given or typed, is refused (``revision_out_of_range``)."""
+    if args.to is not None and args.to > REVISION_MAX:
+        raise OfflineRefused("revision_out_of_range")
+    head = vault.head()
+    if head["mode"] != "managed" or head.get("revision") is None:
+        raise OfflineRefused("policy_not_managed")
+    base = int(head["revision"])
+    to: int | None = args.to
+    if vault.via == "offline":
+        if to is None:
+            to = _typed(
+                stdin,
+                err,
+                "The vault is stopped, so its witness can't be read here. "
+                "Type the revision to jump to, the one zoeymcp health named: ",
+            )
+            if to is None:
+                return EXIT_REFUSED
+        answer = vault.acknowledge(base, to, None)
+        err.write(f"Revision {base} jumps to {to}: the number you gave.\n")
+    else:
+        answer = vault.acknowledge(base, None, None)
+        target = int(answer["revision"])
+        err.write(_jump(base, target, answer["witness"]) + "\n")
+        if to is None:
+            typed = _typed(stdin, err, f"Type {target} to write it: ")
+            if typed != target:
+                err.write("Nothing written.\n")
+                return EXIT_REFUSED
+            to = typed
+        elif to != target:
+            err.write(f"Nothing written: the vault plans revision {target}, not {to}.\n")
+            return EXIT_REFUSED
+    err.write(f"Planned on revision {base} (the head):\n")
+    err.write(_rows([(str(label), str(value)) for label, value in answer["rows"]]))
+    if args.to is not None and not _confirmed(args.yes, False, stdin, err, f"Write revision {to}?"):
+        return EXIT_REFUSED
+    done = vault.acknowledge(base, to, answer["digest"])
+    err.write(f"Acknowledged the restore as revision {done['revision']}.\n")
+    lines = next_lines(done["next"], Prefix.from_environ(environ))
+    if vault.via == "offline":
+        hosted = commands(environ, args.state, standard=False)
+        lines = [*lines, "Start the vault:", f"  {hosted.up()}"]
+    err.write("".join(f"{line}\n" for line in lines))
+    return EXIT_OK
+
+
+def _jump(base: int, target: int, witness: Mapping[str, Any]) -> str:
+    """Where an acknowledgment's number comes from (K.3, T-4): the gateway's claim."""
+    claim = target - 1
+    whose = ""
+    other = witness.get("other")
+    if not (witness.get("behind") and witness.get("revision") == claim) and other is not None:
+        whose = f" for another deployment of this vault ({_shown(str(other['deployment8']))})"
+    return (
+        f"Revision {base} jumps to {target}: one above the gateway's claim of {claim}{whose}; "
+        "the number comes from the gateway."
+    )
+
+
+def _typed(stdin: TextIO, err: TextIO, question: str) -> int | None:
+    """A revision number typed at the terminal, or None (nothing written); one above
+    ``REVISION_MAX`` is refused (``revision_out_of_range``)."""
+    err.write(question)
+    err.flush()
+    answer = stdin.readline().strip()
+    if not (answer.isascii() and answer.isdigit()):
+        err.write("Nothing written.\n")
+        return None
+    if len(answer.lstrip("0")) > len(str(REVISION_MAX)):
+        raise OfflineRefused("revision_out_of_range")
+    return int(answer)
 
 
 def _written(kind: str) -> str:

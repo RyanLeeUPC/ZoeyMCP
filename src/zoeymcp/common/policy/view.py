@@ -12,7 +12,9 @@ A field M6 added (``declined``, M6 design A.3) is left out of both the digest an
 while it is empty, so a policy that doesn't use it keeps the view an M7 vault served, digest and
 all, and an older gateway meets the field only once the operator uses it (CR-6, CR-7). The
 policy's mode isn't in the view: the vault states it beside every view answer, in the header
-:data:`MODE_HEADER` (M6 design K.3, G.9), so a mode alone moves no view, digest or review job.
+:data:`MODE_HEADER` (M6 design K.3, G.9), so a mode alone moves no view, digest or review job;
+a managed vault states its head the same way (:data:`REVISION_HEADER`), so a save that doesn't
+change the gateway's part doesn't change the view either.
 The module is pure and needs only pydantic, so the vault builds the view without the gateway's
 dependencies, and the gateway parses it with the same models.
 """
@@ -58,6 +60,9 @@ MAX_VIEW_BYTES = 8 * 2**20
 # The gateway keeps the last one it read, ``unknown`` before its first view (G.9).
 MODE_HEADER: Final = "x-zoeymcp-policy-mode"
 PolicyMode = Literal["managed", "declarative", "unknown"]
+# A managed vault's head beside the mode, ``<deployment, 32 hex>.<revision>``, outside the body
+# and its digest too: the gateway keeps the highest it has seen, as the restore witness (K.3).
+REVISION_HEADER: Final = "x-zoeymcp-policy-revision"
 # A route prefix and a server path, as the schema and check allow them.
 VaultPath = Annotated[
     str, StringConstraints(pattern=r"^/[a-z0-9][a-z0-9_-]{0,62}/[A-Za-z0-9._~/-]{0,1023}$")

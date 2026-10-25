@@ -78,6 +78,8 @@ HEALTH_ACTIONS = {
     "review": "run: zoeymcp review {server}",
     "reload_vault": "send SIGHUP to the vault, or restart it",
     "import_from_env": "remove ZOEYMCP_CONFIG, or run: zoeymcp policy import --from-env",
+    "acknowledge_restore": "re-apply and review as it says, then run: zoeymcp policy "
+    "acknowledge-restore",
 }
 
 # check and selftest of a managed document, on stderr (M6 design M.6): they run in a throwaway
@@ -877,7 +879,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     policy = commands.add_parser(
         "policy",
-        help="a managed policy on the host: its head, history, diffs, export, import, rollback",
+        help="a managed policy on the host: its head, history, diffs, export, import, rollback, "
+        "acknowledge-restore",
         description=(
             "A managed policy's revisions, on the host: over the vault's admin socket, or with "
             "--state DIR on its state directory with the vault stopped (as the vault's uid, with "
@@ -1035,6 +1038,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     policy_rollback.add_argument("revision", type=int, metavar="N")
     policy_writer(policy_rollback)
+    policy_acknowledge = policy_commands.add_parser(
+        "acknowledge-restore",
+        help="record that you saw the restore the gateway's witness shows",
+        description="Record that you saw a restore the gateway's witness shows (health's "
+        "policy_behind_witness or policy_deployment_changed): a revision with the head's "
+        "content, numbered one above the gateway's claim, so the finding clears. The number is "
+        "the gateway's: type it when asked, or give it with --to N.",
+    )
+    policy_acknowledge.add_argument(
+        "--to", type=int, metavar="N", help="the revision to jump to (required with --yes)"
+    )
+    policy_acknowledge.add_argument("--yes", action="store_true", help="write it without asking")
+    policy_reader(policy_acknowledge)
 
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
         sub.add_argument("--socket", metavar="PATH", help="admin socket path")

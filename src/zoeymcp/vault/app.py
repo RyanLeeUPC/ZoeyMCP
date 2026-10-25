@@ -97,7 +97,7 @@ from ..common.policy.schema import (
     SMTPConnector,
     is_secret_ref,
 )
-from ..common.policy.view import MODE_HEADER, build_view, dump_view
+from ..common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
 from ..common.reviewreport import RemoteReport, ToolkitReport
 from . import internal, logs, netclient, secretops, statusreport
 from .connectors.smtp import Answer, SmtpConnectors
@@ -515,9 +515,12 @@ class VaultApp:
         # one at a time, at most one accepted per 5 s; status_received and status_refused are
         # logged at most once a minute each.
         self._status: tuple[statusreport.Report, float] | None = None
+        self._status_watcher: Callable[[statusreport.Report], None] | None = None
         self._status_gate = internal.StatusGate()
         self._status_logged: dict[str, float] = {}
         self._started = time.monotonic()
+        # A managed vault's head as its view answers state it (M6 design K.3); None: no header.
+        self._head_stated: str | None = None
         self._install(policy)
 
     def _install(self, policy: Policy) -> list[str]:
@@ -676,8 +679,20 @@ class VaultApp:
         return statusreport.GatewayStatus(report, max(0.0, time.monotonic() - at))
 
     def keep_status(self, report: statusreport.Report) -> None:
-        """Keep ``report`` as the gateway's latest, arrived now."""
+        """Keep ``report`` as the gateway's latest, arrived now, and tell the watcher."""
         self._status = (report, time.monotonic())
+        if self._status_watcher is not None:
+            self._status_watcher(report)
+
+    def watch_status(self, watcher: Callable[[statusreport.Report], None]) -> None:
+        """Call ``watcher`` with each status report kept (a managed vault's restore witness,
+        M6 design K.3)."""
+        self._status_watcher = watcher
+
+    def state_head(self, deployment: str, revision: int) -> None:
+        """State ``revision`` of ``deployment`` beside every view answer from now on (M6 design
+        K.3): a managed vault's running head. A declarative vault never states one."""
+        self._head_stated = f"{deployment}.{revision}"
 
     async def role_fetched(self, wait: float) -> bool:
         """Wake every allowlist poll, then wait up to ``wait`` seconds for the egress role to
@@ -1067,7 +1082,8 @@ class VaultApp:
         """``GET /_zoeymcp/gateway/v1/view``: the view with its digest as the ``ETag``, or 304
         while the digest is one the caller named in ``If-None-Match``. With ``?wait=N`` a 304
         waits up to N seconds for a reload that changes the view (M3 design D.2). Both carry the
-        policy's mode, outside the view and its digest (M6 design K.3)."""
+        policy's mode, outside the view and its digest, and in managed mode the head the vault
+        runs, for the gateway's restore witness (M6 design K.3)."""
         try:
             wait = view_wait(parse_query(request.scope.get("query_string", b"")))
         except RequestRejected as exc:
@@ -1082,6 +1098,8 @@ class VaultApp:
             "cache-control": "no-store",
             MODE_HEADER: self._policy.mode,
         }
+        if self._head_stated is not None:
+            headers[REVISION_HEADER] = self._head_stated
         if view.digest in tags:
             return Response(status_code=304, headers=headers)
         waited_ms = round((time.monotonic() - started) * 1000)

@@ -37,7 +37,7 @@ from zoeymcp.vault.policystore import PolicyStore
 from zoeymcp.vault.server import acquire_state_lock, load_runtime
 
 from .conftest import EXAMPLE_POLICY
-from .test_admin_policy import Holder, PolicyRig, serve
+from .test_admin_policy import Holder, PolicyRig, deployment_of, serve, witness_of
 from .test_managed import edited, import_
 from .test_managed import start as managed_start
 
@@ -745,6 +745,7 @@ def test_head_history_and_diff(
         f"Deployment {store.head.deployment[:8]}, digest "
         f"{store.head.digest.removeprefix('sha256:')[:8]}",
         "Gateway: unknown (no status report yet)",
+        "Witness: unknown (no status report yet)",
     ]
     code, out, _ = run_cli(["policy", "head", "--format", "json"])
     assert json.loads(out)["revision"] == 1
@@ -1185,4 +1186,144 @@ def test_every_offline_form_waits_for_the_vault(
         2,
         f"zoeymcp policy {argv[1]}: The state directory is in use: stop the vault first ("
         f"{HARDENED} stop vault), then run this again.\n",
+    )
+
+
+# --- policy acknowledge-restore (K.3, J11, T-4) --------------------------------------------------
+
+WITNESS_OTHER = "fedcba9876543210" * 2
+
+
+def test_acknowledge_over_the_socket(
+    tmp_path: Path, master: dict[str, str], monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """J11's acknowledgment: the number and where it comes from (the gateway's claim), typed to
+    write it; a mistyped one, or a --to other than the vault's, writes nothing; the head names
+    the witness."""
+    rig = socket_rig(tmp_path, master, monkeypatch, portal)
+    code, _, err = run_cli(["policy", "acknowledge-restore"])
+    assert (code, err) == (
+        1,
+        "zoeymcp policy acknowledge-restore: There is nothing to record: the gateway reports no "
+        "revision of this deployment above the head, and no other deployment it hasn't passed.\n",
+    )
+    deployment = deployment_of(rig)
+    witness_of(rig, {deployment: 31})
+    code, out, _ = run_cli(["policy"])
+    assert out.splitlines()[-2:] == [
+        "Witness: the gateway has seen revision 31",
+        "The gateway's witness shows a restore: see zoeymcp health, then zoeymcp policy "
+        "acknowledge-restore (revision 32).",
+    ]
+    jump = (
+        "Revision 1 jumps to 32: one above the gateway's claim of 31; the number comes from the "
+        "gateway."
+    )
+    code, _, err = run_cli(["policy", "acknowledge-restore"], "31\n")
+    assert (code, err) == (1, f"{jump}\nType 32 to write it: Nothing written.\n")
+    code, _, err = run_cli(["policy", "acknowledge-restore", "--to", "30", "--yes"])
+    assert (code, err) == (1, f"{jump}\nNothing written: the vault plans revision 32, not 30.\n")
+    code, _, err = run_cli(["policy", "acknowledge-restore", "--to", "10000000000", "--yes"])
+    assert (code, err) == (
+        1,
+        "zoeymcp policy acknowledge-restore: A revision can't go above 9,999,999,999.\n",
+    )
+    code, _, err = run_cli(["policy", "acknowledge-restore"], "000000000000\n")
+    assert (code, err) == (1, f"{jump}\nType 32 to write it: Nothing written.\n")
+    assert rig.vault.managed.revision == 1
+    code, _, err = run_cli(["policy", "acknowledge-restore"], "32\n")
+    assert code == 0, err
+    assert err.splitlines()[:5] == [
+        jump,
+        "Type 32 to write it: Planned on revision 1 (the head):",
+        "  Revision: 32, from 1, past 2-31, which are never written",
+        "Acknowledged the restore as revision 32.",
+        "Next:",
+    ]
+    assert rig.vault.managed.revision == 32
+    code, out, _ = run_cli(["policy"])
+    assert out.splitlines()[-1] == "Witness: the gateway has seen revision 31"
+
+
+def test_acknowledge_another_deployment_with_to(
+    tmp_path: Path, master: dict[str, str], monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """T-5: the claim is another deployment's, which the line names; --to the vault's number
+    asks [y/N], and --yes writes it."""
+    rig = socket_rig(tmp_path, master, monkeypatch, portal)
+    witness_of(rig, {WITNESS_OTHER: 31, deployment_of(rig): 1})
+    code, _, err = run_cli(["policy", "acknowledge-restore", "--to", "32"], "n\n")
+    assert code == 1
+    assert err.splitlines()[0] == (
+        "Revision 1 jumps to 32: one above the gateway's claim of 31 for another deployment of "
+        "this vault (fedcba98); the number comes from the gateway."
+    )
+    assert err.splitlines()[-1] == "Write revision 32? [y/N] Nothing written."
+    code, _, err = run_cli(["policy", "acknowledge-restore", "--to", "32", "--yes"])
+    assert code == 0, err
+    assert "Acknowledged the restore as revision 32." in err.splitlines()
+    store = rig.vault.store
+    assert store.header is not None
+    assert (store.header["revision"], store.header["jumped_from"]) == (32, 1)
+
+
+def test_acknowledge_offline(
+    tmp_path: Path, master: dict[str, str], log_buffer: io.StringIO
+) -> None:
+    """With the vault stopped there is no claim to read: the number is the host's, typed or
+    --to, above the head and at most 9,999,999,999; then the vault's start."""
+    state = with_two_revisions(tmp_path, master)
+    argv = ["policy", "acknowledge-restore", "--state", str(state)]
+    code, _, err = run_cli([*argv, "--to", "2", "--yes"])
+    assert (code, err.splitlines()[-1]) == (
+        1,
+        "zoeymcp policy acknowledge-restore: There is nothing to record: revision 2 isn't above "
+        "the head, revision 2.",
+    )
+    code, _, err = run_cli(argv, "x\n")
+    assert code == 1
+    assert err.endswith("the one zoeymcp health named: Nothing written.\n")
+    # K.3: a number above 9,999,999,999, given or typed, is revision_out_of_range.
+    out_of_range = "zoeymcp policy acknowledge-restore: A revision can't go above 9,999,999,999.\n"
+    code, _, err = run_cli([*argv, "--to", "10000000000", "--yes"])
+    assert (code, err) == (1, out_of_range)
+    code, _, err = run_cli(argv, "10000000000\n")
+    assert (code, err.endswith(f"the one zoeymcp health named: {out_of_range}")) == (1, True)
+    code, _, err = run_cli(argv, "9\n")
+    assert code == 0, err
+    lines = err.splitlines()
+    assert lines[0] == (
+        "The vault is stopped, so its witness can't be read here. Type the revision to jump to, "
+        "the one zoeymcp health named: Revision 2 jumps to 9: the number you gave."
+    )
+    assert lines[1:] == [
+        "Planned on revision 2 (the head):",
+        "  Revision: 9, from 2, past 3-8, which are never written",
+        "Acknowledged the restore as revision 9.",
+        "Start the vault:",
+        f"  {HARDENED} up -d vault",
+    ]
+    store = reopened(state, master)
+    assert isinstance(store.verdict, Ok)
+    header = store.verdict.top.header
+    assert (header["revision"], header["origin"], header["jumped_from"]) == (9, "acknowledge", 2)
+    assert header["author"] == OFFLINE
+    [line] = events(log_buffer, "policy_acknowledged")
+    assert (line["revision"], line["jumped_from"], line["author"]) == (9, 2, "host")
+    code, _, err = run_cli([*argv, "--to", "10", "--yes"])
+    assert code == 0, err
+
+
+@pytest.mark.parametrize(
+    ("argv", "said"),
+    [
+        (["--yes"], "with --yes, give the revision with --to N: the number is never taken unseen"),
+        (["--to", "0"], "--to is a revision, 1 to 9,999,999,999"),
+    ],
+    ids=["yes-without-to", "to-zero"],
+)
+def test_acknowledge_usage(master: dict[str, str], argv: list[str], said: str) -> None:
+    assert cli(["policy", "acknowledge-restore", *argv]) == (
+        2,
+        f"zoeymcp policy acknowledge-restore: {said}\n",
     )

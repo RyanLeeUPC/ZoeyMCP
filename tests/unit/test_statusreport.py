@@ -463,3 +463,86 @@ def test_the_gateway_status_holds_the_report_and_its_age() -> None:
     held = GatewayStatus(read(report(), MAX_TOOLS), 3.5)
     assert held.age == 3.5
     assert GatewayStatus(None, 0.0).report is None
+
+
+# --- the restore witness (K.3; T-4, T-5, Y24) --------------------------------------------------
+
+OLD = "fedcba9876543210" * 2
+THIRD = "00112233445566778899aabbccddeeff"
+
+
+def test_the_witness_keeps_the_order_the_gateway_first_saw() -> None:
+    """The gateway sends its deployments first seen first (gateway/witness.py); the vault keeps
+    that order, which ``policy_deployment_changed`` reads."""
+    given = {OLD: 31, DEPLOYMENT: 1, THIRD: 2}
+    found = read(report(witness=given), MAX_TOOLS)
+    assert list(found.witness) == [OLD, DEPLOYMENT, THIRD]
+    assert list(read(report(witness={THIRD: 2, OLD: 31}), MAX_TOOLS).witness) == [THIRD, OLD]
+
+
+@pytest.mark.parametrize(
+    ("witness", "head", "claim", "behind", "target"),
+    [
+        ({}, 27, None, False, None),
+        ({DEPLOYMENT: 26}, 27, 26, False, None),
+        ({DEPLOYMENT: 27}, 27, 27, False, None),
+        ({DEPLOYMENT: 28}, 27, 28, True, 29),
+        ({DEPLOYMENT: 31}, 27, 31, True, 32),
+        ({DEPLOYMENT: REVISION_MAX}, 1, REVISION_MAX, True, REVISION_MAX + 1),
+    ],
+)
+def test_the_head_behind_the_witness(
+    witness: dict[str, int], head: int, claim: int | None, behind: bool, target: int | None
+) -> None:
+    """J11: the gateway has applied a revision of this deployment above the head (the whole
+    ``/state`` put back); the acknowledgment's number is one above the claim (T-4: up to one
+    above REVISION_MAX, which the write refuses)."""
+    found = statusreport.witnessed(witness, DEPLOYMENT, head)
+    assert (found.claim, found.behind, found.other, found.target) == (claim, behind, None, target)
+
+
+@pytest.mark.parametrize(
+    ("witness", "head", "other"),
+    [
+        # /state wiped whole: a new deployment at 1 after the old one at 31 (T-5).
+        ({OLD: 31, DEPLOYMENT: 1}, 1, (OLD, 31)),
+        # Not seen yet by the gateway: still raised at revision 1, and after a later one.
+        ({OLD: 31}, 1, (OLD, 31)),
+        ({OLD: 31}, 5, (OLD, 31)),
+        # Seen after it, the head grown since, still not past it.
+        ({OLD: 31, DEPLOYMENT: 5}, 5, (OLD, 31)),
+        ({OLD: 31, DEPLOYMENT: 31}, 31, (OLD, 31)),
+        # Past it: an acknowledged restore jumped to 32.
+        ({OLD: 31, DEPLOYMENT: 32}, 32, None),
+        # The other deployment never got past revision 1: a seed alone, nothing undone.
+        ({OLD: 1, DEPLOYMENT: 1}, 1, None),
+        ({OLD: 2, DEPLOYMENT: 1}, 1, (OLD, 2)),
+        # Seen before the other one, and past revision 1: the gateway moved, not this vault.
+        ({DEPLOYMENT: 5, OLD: 31}, 5, None),
+        ({DEPLOYMENT: 2, OLD: 31}, 2, None),
+        # ... but at revision 1 it is raised whichever came first.
+        ({DEPLOYMENT: 1, OLD: 31}, 1, (OLD, 31)),
+        ({DEPLOYMENT: 1, OLD: 2}, 1, (OLD, 2)),
+        # Of several, the highest claim; one this deployment came before doesn't count.
+        ({OLD: 31, THIRD: 40, DEPLOYMENT: 3}, 3, (THIRD, 40)),
+        ({OLD: 31, DEPLOYMENT: 3, THIRD: 40}, 3, (OLD, 31)),
+        ({OLD: 40, THIRD: 40, DEPLOYMENT: 3}, 3, (OLD, 40)),
+    ],
+)
+def test_another_deployment_seen_before_this_one(
+    witness: dict[str, int], head: int, other: tuple[str, int] | None
+) -> None:
+    """T-5: another deployment at revision 2 or more, not passed by this one's head, which was
+    first seen after it (or is at revision 1): ``policy_deployment_changed``."""
+    found = statusreport.witnessed(witness, DEPLOYMENT, head)
+    assert found.other == other
+    assert found.target == (None if other is None else other[1] + 1)
+
+
+def test_the_target_passes_every_claim_that_raises_a_finding() -> None:
+    both = statusreport.witnessed({OLD: 31, DEPLOYMENT: 40}, DEPLOYMENT, 20)
+    assert (both.behind, both.other, both.target) == (True, (OLD, 31), 41)
+    higher = statusreport.witnessed({OLD: 50, DEPLOYMENT: 40}, DEPLOYMENT, 20)
+    assert higher.target == 51
+    assert statusreport.Witnessed().target is None
+    assert statusreport.Witnessed(claim=9, behind=False).target is None

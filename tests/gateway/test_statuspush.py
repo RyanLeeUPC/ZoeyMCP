@@ -44,7 +44,7 @@ from zoeymcp.common import logs
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.attention import Attention
 from zoeymcp.common.policy.view import build_view
-from zoeymcp.gateway import statuspush
+from zoeymcp.gateway import statuspush, witness
 from zoeymcp.gateway.statuspush import DEBOUNCE, EVERY, StatusPusher, content
 from zoeymcp.gateway.vaultlink import (
     STATUS_MAX_ANSWER_BYTES,
@@ -311,6 +311,25 @@ def test_a_server_never_listed_reports_nothing_to_attend_to() -> None:
     assert [entry[key] for key in ("marked", "unreviewed", "drift", "missing")] == [[]] * 4
 
 
+def test_the_report_carries_the_witness_first_seen_first() -> None:
+    """K.3: the restore witness's record, in the order the gateway first saw each deployment
+    (the vault reads that order), and how many it has recorded; none before a managed view."""
+    held = {"b" * 32: 4, "a" * 32: 31}
+    document = content(
+        {**status_of(), "witness": held, "deployments_seen": 3}, started=1, max_tools=10
+    )
+    assert document is not None
+    assert (document["witness"], document["deployments_seen"]) == (held, 3)
+    assert list(document["witness"]) == ["b" * 32, "a" * 32]
+    assert (
+        '"witness":{"' + "b" * 32 + '":4,"' + "a" * 32 + '":31}'
+        in statuspush.encoded(document).decode()
+    )
+    bare = content(status_of(), started=1, max_tools=10)
+    assert bare is not None
+    assert (bare["witness"], bare["deployments_seen"]) == ({}, 0)
+
+
 def test_the_report_names_the_mode_the_gateway_last_saw() -> None:
     """``policy_mode`` is the status's, the mode the vault last stated beside the view (M6 design
     K.3); a status naming none reports ``unknown``."""
@@ -572,7 +591,10 @@ def health(deployed: Any) -> dict[str, Any]:
 
 async def test_restart(tmp_path: Path) -> None:
     """FM-20: the gateway pushes once it holds a view, and the vault's health reads it; a new
-    gateway process pushes again within the minute (at most one debounce after the last)."""
+    gateway process pushes again within the minute (at most one debounce after the last). The
+    restore witness (K.3): the head the vault states is in the report, kept in
+    ``policy-seen.json``, and read again by the new process, which keeps the higher revision
+    when the vault now states a lower one."""
     fake = McpFake()
     tools = [tool["name"] for tool in base_tools()]
     include = tools[:2]
@@ -584,17 +606,25 @@ async def test_restart(tmp_path: Path) -> None:
     ) as deployed:
         vault = deployed.vault
         assert vault is not None
+        stated = "ab" * 16
+        vault.state_head(stated, 7)
         with gateway(deployed, status_push=True):
             await until(lambda: vault.gateway_status().report is not None, timeout=20)
         first = vault.gateway_status().report
         assert first is not None
         assert "notes" in first.servers
+        assert (dict(first.witness), first.deployments_seen) == ({stated: 7}, 1)
+        assert witness.loads((deployed.state / witness.FILE).read_bytes()).report() == {stated: 7}
+        vault.state_head(stated, 5)
         section = health(deployed)["gateway"]
         assert [row["name"] for row in section["servers"]] == ["notes"]
         started = time.monotonic()
         with gateway(deployed, status_push=True):
             await until(lambda: vault.gateway_status().report is not first, timeout=20)
         assert time.monotonic() - started < EVERY
+        again = vault.gateway_status().report
+        assert again is not None
+        assert (dict(again.witness), again.deployments_seen) == ({stated: 7}, 1)
 
 
 async def test_the_status_path_checks_before_it_reads(tmp_path: Path, log: io.StringIO) -> None:

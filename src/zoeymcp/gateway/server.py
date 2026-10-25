@@ -7,7 +7,10 @@ and re-reads the key file; ``SIGTERM`` (or ``TERM``, or the pipe's end) stops, g
 flight 10 seconds. The admin socket answers ``GET /status``, ``POST /review/<server>`` and
 ``POST /review/<server>/clear`` (:mod:`.review`); the same reviews run for the vault's review
 jobs, one at a time with the socket's (:mod:`.reviewpoll`, M7 design F.3). A summary of the
-status is pushed to the vault (:mod:`.statuspush`, M6 design K.1). The status and every review
+status is pushed to the vault (:mod:`.statuspush`, M6 design K.1), with what the restore witness
+holds: the highest revision of each deployment the vault's view answers stated, kept in
+``policy-seen.json`` beside the drift marks, and read again at every start (M6 design K.3,
+FM-20); a file that can't be read stops the start. The status and every review
 answer on the socket carry ``policy_mode``, the mode the vault last stated beside the view
 (``unknown`` before the first), so the CLI in this container, which has no vault socket, knows
 not to print a fragment for a managed deployment (M6 design G.9, E-7).
@@ -45,6 +48,7 @@ from .app import GatewayApp
 from .defstore import DefinitionStore
 from .ledger import Ledger
 from .marks import DriftMarks, MarksError
+from .policyclient import Witness
 from .toolkits import Loaded, Toolkits
 from .upstream import UpstreamPool
 from .vaultlink import (
@@ -59,6 +63,8 @@ from .vaultlink import (
     status_client,
     view_client,
 )
+from .witness import FILE as WITNESS_FILE
+from .witness import WitnessError
 
 STOP_GRACE = 10
 KEEP_ALIVE = 5
@@ -144,6 +150,12 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
         marks = DriftMarks.load(options.state)
     except MarksError as exc:
         raise StartupError(f"drift marks: {exc} (move the file aside to start over)") from exc
+    try:
+        seen = Witness.load(options.state)
+    except WitnessError as exc:
+        raise StartupError(
+            f"the restore witness: {exc} (move {WITNESS_FILE} aside to start over)"
+        ) from exc
     pool = UpstreamPool(link, keys, marks, DefinitionStore(options.state))
     toolkits = Toolkits(link, keys, marks, allow_writable=options.allow_writable_toolkits)
     app = GatewayApp(
@@ -154,6 +166,7 @@ def prepare(options: Options, environ: Mapping[str, str]) -> Gateway:
         review_http=review_client(link, keys),
         status_http=status_client(link, keys),
         status=pushed_status,
+        witness=seen,
     )
     try:
         # The view's limit applies once the first view arrives.
@@ -270,8 +283,13 @@ def _toolkit_status(
 
 def pushed_status(app: GatewayApp) -> dict[str, Any]:
     """The status the gateway pushes to the vault is drawn from (M6 design K.1): :func:`status`
-    with each unreviewed tool's pin."""
-    return status(app, pins=True)
+    with each unreviewed tool's pin, and the restore witness (K.3): the highest revision seen of
+    each deployment, first seen first, and how many deployments it has recorded."""
+    found = status(app, pins=True)
+    held = app.policy.witness
+    found["witness"] = {} if held is None else held.seen.report()
+    found["deployments_seen"] = 0 if held is None else held.seen.counted
+    return found
 
 
 def _pins_of(decided: Attention | None, listed: Mapping[str, str | None]) -> dict[str, str]:

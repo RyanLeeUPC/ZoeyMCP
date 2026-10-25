@@ -619,6 +619,8 @@ def test_every_offline_reason_is_catalogued() -> None:
         "import_widens",
         "lockout_unconfirmed",
         "plan_changed",
+        "nothing_to_acknowledge",
+        "revision_out_of_range",
     }
     assert found <= set(CATALOGUE)
     assert set(policy_cli.GRANT_FLAGS) <= set(get_args(plan.Reason))

@@ -26,7 +26,7 @@ from tests.unit.report_model import asked_line
 from zoeymcp.common import ledgerreport
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.view import MODE_HEADER, build_view, dump_view
+from zoeymcp.common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
 from zoeymcp.vault import app as app_module
 from zoeymcp.vault import logs, reportstore
 from zoeymcp.vault.app import (
@@ -279,6 +279,30 @@ async def test_the_mode_is_stated_beside_the_view_and_outside_its_digest(tmp_pat
     finally:
         for rig in rigs.values():
             await rig.app.aclose()
+
+
+async def test_a_managed_head_is_stated_beside_the_view(tmp_path: Path) -> None:
+    """K.3: a managed vault states its running head on the 200 and the 304, outside the view and
+    its digest, so the gateway's witness learns it whichever it gets; a declarative vault states
+    none (step 17's acceptance), and a refusal states none."""
+    rig = Rig(tmp_path, Policy.model_validate({**raw_policy(), "mode": "managed"}))
+    try:
+        before = await rig.call()
+        assert REVISION_HEADER not in before.headers
+        digest = rig.app.view_digest
+        rig.app.state_head("ab" * 16, 27)
+        whole = await rig.call()
+        assert (whole.status_code, whole.headers[REVISION_HEADER]) == (200, "ab" * 16 + ".27")
+        same = await rig.call(headers=rig.tag())
+        assert (same.status_code, same.headers[REVISION_HEADER]) == (304, "ab" * 16 + ".27")
+        assert rig.app.view_digest == digest
+        assert whole.content == before.content
+        refused = await rig.call(listener=None)
+        assert REVISION_HEADER not in refused.headers
+        rig.app.state_head("ab" * 16, 28)
+        assert (await rig.call(headers=rig.tag())).headers[REVISION_HEADER] == "ab" * 16 + ".28"
+    finally:
+        await rig.app.aclose()
 
 
 async def test_a_policy_without_a_gateway_section_has_the_default_view(tmp_path: Path) -> None:

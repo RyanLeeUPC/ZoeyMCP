@@ -11,7 +11,17 @@ read it, labelled as the gateway's, and nothing in it drives a decision (Y21).
 of the right type, or the whole report is refused ``invalid`` (:class:`StatusRefused`). A witness
 revision above :data:`REVISION_MAX`, the store's own bound (``policyseal``, D.2), refuses it
 whole too, ``witness_range`` (T-4), so no number the gateway claims can reach the vault's own
-revision counter.
+revision counter. The witness keeps the order the gateway gives, the order it first saw each
+deployment.
+
+:func:`witnessed` compares the witness with this vault's head (K.3): the revision of this
+deployment the gateway has seen above the head is ``policy_behind_witness`` (the whole ``/state``
+put back from an older backup while the gateway's volume wasn't); another deployment the gateway
+has seen at revision 2 or more, and at least at the head, is ``policy_deployment_changed`` when
+this deployment was first seen after it or the head is revision 1 (a ``/state`` wiped and seeded
+again, T-5). Either is cleared by ``zoeymcp policy acknowledge-restore``, which numbers its
+revision :attr:`Witnessed.target`, one above the claim, so the counter passes it. The number is
+the gateway's claim, and the host types it (T-4).
 
 A server is judged on its own (T-7): one whose name isn't a policy name is counted, not named
 (``unnamed_servers``); one whose entry isn't a server's (another key, such as a definition, a wrong
@@ -96,6 +106,42 @@ _NAME: Final = re.compile(NAME_PATTERN)
 _TOOL: Final = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _DIGEST: Final = re.compile(r"sha256:[0-9a-f]{64}")
 _DEPLOYMENT: Final = re.compile(r"[0-9a-f]{32}")
+
+
+@dataclass(frozen=True)
+class Witnessed:
+    """What the gateway's witness says of this vault's head (K.3): ``claim``, the highest revision
+    of this deployment it has seen (None: none), and when above the head, ``behind``; ``other``,
+    another deployment (its 32 hex) and its revision, when it raises
+    ``policy_deployment_changed``."""
+
+    claim: int | None = None
+    behind: bool = False
+    other: tuple[str, int] | None = None
+
+    @property
+    def target(self) -> int | None:
+        """The revision ``acknowledge-restore`` writes: one above the highest claim that raises a
+        finding, or None when none does."""
+        claims = [self.claim] if self.behind and self.claim is not None else []
+        if self.other is not None:
+            claims.append(self.other[1])
+        return max(claims) + 1 if claims else None
+
+
+def witnessed(witness: Mapping[str, int], deployment: str, head: int) -> Witnessed:
+    """The witness (deployments first seen first) against this vault's ``deployment`` at revision
+    ``head``."""
+    claim = witness.get(deployment)
+    others: list[tuple[str, int]] = []
+    for name, revision in witness.items():
+        # Past revision 1, only the deployments seen before this one count.
+        if name == deployment and head > 1:
+            break
+        if name != deployment and revision >= max(2, head):
+            others.append((name, revision))
+    other = max(others, key=lambda found: found[1]) if others else None
+    return Witnessed(claim, claim is not None and claim > head, other)
 
 
 class StatusRefused(ValueError):
@@ -224,8 +270,9 @@ def read(data: Any, max_tools: int) -> Report:
 
 
 def _witness(value: Any) -> dict[str, int]:
-    """The deployments the gateway has seen and the highest revision of each (K.3): at most
-    :data:`WITNESS_DEPLOYMENTS_MAX`, each revision from 1 to :data:`REVISION_MAX`."""
+    """The deployments the gateway has seen and the highest revision of each (K.3), in the order
+    it first saw them: at most :data:`WITNESS_DEPLOYMENTS_MAX`, each revision from 1 to
+    :data:`REVISION_MAX`."""
     if not isinstance(value, dict) or len(value) > WITNESS_DEPLOYMENTS_MAX:
         raise StatusRefused("invalid", "witness must be an object of at most 8 deployments")
     found: dict[str, int] = {}
@@ -235,7 +282,7 @@ def _witness(value: Any) -> dict[str, int]:
         if revision > REVISION_MAX:
             raise StatusRefused("witness_range", "a witness revision is above 9,999,999,999")
         found[deployment] = revision
-    return dict(sorted(found.items()))
+    return found
 
 
 def _server(entry: Any, max_tools: int) -> ServerStatus:

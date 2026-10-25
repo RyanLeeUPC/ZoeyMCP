@@ -13,10 +13,10 @@ import pytest
 
 from zoeymcp.common import canonical
 from zoeymcp.common.policy import Policy
-from zoeymcp.common.policy.view import MODE_HEADER, build_view, dump_view
-from zoeymcp.gateway import logs, policyclient
+from zoeymcp.common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
+from zoeymcp.gateway import logs, policyclient, witness
 from zoeymcp.gateway.egressrules import CallRegistry
-from zoeymcp.gateway.policyclient import PolicyClient, Snapshot
+from zoeymcp.gateway.policyclient import PolicyClient, Snapshot, Witness
 from zoeymcp.gateway.vaultlink import (
     GATEWAY_HEADER,
     GatewayKey,
@@ -791,3 +791,39 @@ async def test_refresh_wakes_the_backoff() -> None:
                 await anyio.sleep(0.01)
         group.cancel_scope.cancel()
     assert len(vault.requests) >= 2  # then it went on to long-poll
+
+
+# --- the head a managed vault states beside the view (M6 design K.3, CR-9) ---------------------
+
+
+async def test_the_witness_reads_the_head_with_each_contact(tmp_path: Path) -> None:
+    """The restore witness takes the head each usable 200 and each 304 states; a 304 before any
+    view, and a refused view, are no contact, so their header isn't taken; the view is applied
+    whatever the header says."""
+    vault, applied, now = scripted()
+    client = policy_client(vault, applied, now)
+    held = Witness(tmp_path / "policy-seen.json", wall=lambda: 7.0)
+    client.witness = held
+    deployment = "ab" * 16
+
+    def at(revision: int, status: int = 304, content: bytes = b"") -> httpx2.Response:
+        stated = {REVISION_HEADER: f"{deployment}.{revision}"}
+        return httpx2.Response(status, content=content, headers=stated)
+
+    good = view_bytes()
+    vault.answers = [at(9)]
+    assert await client.fetch_once() is False
+    assert held.seen.report() == {}
+    vault.answers = [
+        at(3, 200, good.replace(b'"agent0"', b'"agent9"')),
+        at(2, 200, good),
+        at(4),
+        at(1),
+    ]
+    found = []
+    for _ in range(4):
+        await client.fetch_once()
+        found.append(held.seen.report())
+    assert found == [{}, {deployment: 2}, {deployment: 4}, {deployment: 4}]
+    assert len(applied) == 1
+    assert witness.loads((tmp_path / "policy-seen.json").read_bytes()).report() == {deployment: 4}

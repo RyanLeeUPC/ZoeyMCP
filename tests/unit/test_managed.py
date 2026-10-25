@@ -769,3 +769,196 @@ def test_the_holder_can_be_shown_and_never_logged(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match=r"refusing to log a secret"):
         logs.event("oops", held=rig.managed)
     close(rig)
+
+
+# --- the restore witness (K.3; J11, T-4, T-5) ------------------------------------------------
+
+OTHER_DEPLOYMENT = "fedcba9876543210" * 2
+
+
+def witnessed(witness: dict[str, int]) -> Report:
+    """A status report whose gateway has seen ``witness``, first seen first."""
+    return Report(view="sha256:" + "0" * 64, started=1, servers={}, witness=witness)
+
+
+def test_the_view_answers_state_the_running_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K.3: from the start, and after each install, the view answers name the running head; a
+    revision saved but not running isn't stated (FM-5) until a SIGHUP installs it."""
+    rig = start(tmp_path)
+    deployment = rig.store.head.deployment  # type: ignore[union-attr]
+    assert rig.app._head_stated == f"{deployment}.1"
+    assert isinstance(import_(rig, generation(2)), Written)
+    assert rig.app._head_stated == f"{deployment}.2"
+
+    def broken(*args: Any) -> None:
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    real = gatewaykeys.write_atomic
+    monkeypatch.setattr(gatewaykeys, "write_atomic", broken)
+    assert isinstance(import_(rig, generation(3)), WriteRefused)
+    assert rig.app._head_stated == f"{deployment}.2"
+    monkeypatch.setattr(gatewaykeys, "write_atomic", real)
+    assert rig.managed.reverify(None) is True
+    assert rig.app._head_stated == f"{deployment}.3"
+    close(rig)
+
+
+def test_a_head_behind_the_witness_is_found_logged_once_and_acknowledged(
+    tmp_path: Path, log_buffer: io.StringIO
+) -> None:
+    """J11: the whole /state put back, the gateway's volume not: health's
+    ``policy_behind_witness`` (error) with J11's text and the host's exec command, logged
+    critical when a report first shows it; acknowledged by a revision with the head's content,
+    numbered one above the gateway's claim, the finding gone."""
+    rig = start(tmp_path, ZOEYMCP_COMPOSE_CMD="docker compose -f deploy/compose.yaml")
+    health = HealthReader(rig.runtime.store, lambda: rig.app.policy, policy_state=rig.managed.state)
+    deployment = rig.store.head.deployment  # type: ignore[union-attr]
+    assert rig.managed.witness() is None
+    rig.app.keep_status(witnessed({deployment: 1}))
+    found = rig.managed.witness()
+    assert found is not None
+    assert (found.claim, found.behind, found.target) == (1, False, None)
+    assert health.report()["policy"]["findings"] == []
+    rig.app.keep_status(witnessed({deployment: 31}))
+    rig.app.keep_status(witnessed({deployment: 31}))
+    state = rig.managed.state()
+    assert (state.witness_behind, state.witness_other) == (31, None)
+    [finding] = health.report()["policy"]["findings"]
+    assert (finding["code"], finding["level"]) == ("policy_behind_witness", "error")
+    assert finding["action"] == {"kind": "acknowledge_restore"}
+    assert finding["text"] == (
+        "the gateway has applied revision 31; this vault holds 1. Was the state volume restored? "
+        "Removed clients and moves back to approve since 1 are undone. Re-apply them (import "
+        "your latest export: it restores clients, classifications and declines, not pins), "
+        "review again each server Home lists as drifted, then acknowledge: docker compose -f "
+        "deploy/compose.yaml exec vault zoeymcp policy acknowledge-restore"
+    )
+    rig.app.keep_status(witnessed({deployment: 32}))
+    lines = [line for line in events(log_buffer) if line["event"] == "policy_behind_witness"]
+    assert lines == [
+        {"event": "policy_behind_witness", "level": "critical", "head": 1, "witness": 31},
+        {"event": "policy_behind_witness", "level": "critical", "head": 1, "witness": 32},
+    ]
+    written = rig.managed.write(
+        "policy.acknowledge",
+        "socket",
+        1,
+        managed_module.acknowledge_shaped().candidate_of,
+        author=HOST,
+        expected=None,
+        jumped_from=1,
+        revision=33,
+    )
+    assert isinstance(written, Written)
+    assert (written.revision, rig.store.header["jumped_from"]) == (33, 1)  # type: ignore[index]
+    assert rig.app._head_stated == f"{deployment}.33"
+    assert rig.managed.state().witness_behind is None
+    assert health.report()["policy"]["findings"] == []
+    [line] = [line for line in events(log_buffer) if line["event"] == "policy_acknowledged"]
+    assert (line["revision"], line["base"], line["jumped_from"]) == (33, 1, 1)
+    close(rig)
+
+
+def test_a_deployment_changed_under_the_witness(tmp_path: Path, log_buffer: io.StringIO) -> None:
+    """J11, T-5: /state wiped whole and seeded again under a new deployment while the gateway
+    holds the old one at 31: ``policy_deployment_changed`` (error), logged critical once, with
+    both deployments by their first 8; an acknowledgment past the old one's revision clears it."""
+    rig = start(tmp_path)
+    health = HealthReader(rig.runtime.store, lambda: rig.app.policy, policy_state=rig.managed.state)
+    deployment = rig.store.head.deployment  # type: ignore[union-attr]
+    rig.app.keep_status(witnessed({OTHER_DEPLOYMENT: 31, deployment: 1}))
+    rig.app.keep_status(witnessed({OTHER_DEPLOYMENT: 31, deployment: 1}))
+    state = rig.managed.state()
+    assert (state.witness_behind, state.witness_other) == (None, 31)
+    [finding] = health.report()["policy"]["findings"]
+    assert (finding["code"], finding["level"]) == ("policy_deployment_changed", "error")
+    assert finding["text"] == (
+        "the gateway has seen revision 31 of another deployment of this vault, and this one "
+        "starts at 1. Was /state deleted? Everything removed since the seed is back. "
+        "Restore /state from one backup, or import your latest export, then acknowledge: docker "
+        "compose -f deploy/compose.hardened.yaml exec vault zoeymcp policy acknowledge-restore"
+    )
+    lines = [line for line in events(log_buffer) if line["event"] == "policy_deployment_changed"]
+    assert lines == [
+        {
+            "event": "policy_deployment_changed",
+            "level": "critical",
+            "deployment": deployment[:8],
+            "other": OTHER_DEPLOYMENT[:8],
+            "revision": 31,
+        }
+    ]
+    assert managed_module.witness_answer(rig.managed.witness()) == {
+        "revision": 1,
+        "behind": False,
+        "other": {"deployment8": OTHER_DEPLOYMENT[:8], "revision": 31},
+        "target": 32,
+    }
+    assert isinstance(import_(rig, generation(2)), Written)
+    [finding] = health.report()["policy"]["findings"]
+    assert "and this one is at revision 2." in finding["text"]
+    written = rig.managed.write(
+        "policy.acknowledge",
+        "socket",
+        2,
+        managed_module.acknowledge_shaped().candidate_of,
+        author=HOST,
+        expected=None,
+        jumped_from=2,
+        revision=32,
+    )
+    assert isinstance(written, Written)
+    assert health.report()["policy"]["findings"] == []
+    assert managed_module.witness_answer(rig.managed.witness()) == {
+        "revision": 1,
+        "behind": False,
+        "other": None,
+        "target": None,
+    }
+    assert managed_module.witness_answer(None) is None
+    close(rig)
+
+
+def test_an_acknowledgment_plan_names_its_jump(tmp_path: Path) -> None:
+    """K.3: the plan's first row says where the number jumps from and what is never written, so
+    the plan's digest names the number; the same plan at another number is another digest."""
+    rig = start(tmp_path)
+    shaped = managed_module.acknowledge_shaped()
+    planned = rig.managed.plan(
+        "policy.acknowledge", "socket", 1, shaped.candidate_of, author=HOST, revision=32
+    )
+    assert isinstance(planned, WritePlan)
+    assert planned.rows[0] == ("Revision", "32, from 1, past 2-31, which are never written")
+    assert managed_module.plan_answer(planned, (), 32)["revision"] == 32
+    next_one = rig.managed.plan(
+        "policy.acknowledge", "socket", 1, shaped.candidate_of, author=HOST, revision=2
+    )
+    assert isinstance(next_one, WritePlan)
+    assert next_one.rows[0] == ("Revision", "2, from 1")
+    assert plan_digest(planned) != plan_digest(next_one)
+    one_past = rig.managed.plan(
+        "policy.acknowledge", "socket", 1, shaped.candidate_of, author=HOST, revision=3
+    )
+    assert isinstance(one_past, WritePlan)
+    assert one_past.rows[0] == ("Revision", "3, from 1, past 2, which is never written")
+    plain = rig.managed.plan("policy.acknowledge", "socket", 1, shaped.candidate_of, author=HOST)
+    assert isinstance(plain, WritePlan)
+    assert plain.rows[0] == ("Revision", "2, from 1")
+    assert managed_module.plan_answer(plain, ())["revision"] == 2
+    close(rig)
+
+
+def test_the_acknowledge_command_is_the_hosts_exec() -> None:
+    assert managed_module.acknowledge_command({}) == (
+        "docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp policy "
+        "acknowledge-restore"
+    )
+    environ = {
+        managed_module.COMPOSE_CMD_ENV: "docker compose -f deploy/compose.yaml",
+        managed_module.EXEC_SERVICE_ENV: "zoeymcp",
+    }
+    assert managed_module.acknowledge_command(environ) == (
+        "docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp policy acknowledge-restore"
+    )

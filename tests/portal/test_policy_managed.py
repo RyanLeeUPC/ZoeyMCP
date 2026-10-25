@@ -538,6 +538,74 @@ def test_a_managed_session_says_its_mode(tmp_path: Path) -> None:
         assert [step["do"] for step in read["next"]] == ["save", "export_policy", "import_policy"]
 
 
+def test_the_restore_witness_is_a_banner(tmp_path: Path) -> None:
+    """K.3, J11 (step 17): health's ``policy_behind_witness`` and ``policy_deployment_changed``
+    are banners on every page of a full session, with their text, and count among health's
+    errors; acknowledged on the host, they are gone."""
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+        managed_policy = rig.app.managed
+        assert managed_policy is not None
+        head = managed_policy.store.head
+        assert head is not None
+        other = "fedcba9876543210" * 2
+
+        def banners() -> list[dict[str, str]]:
+            answer = world.page.fetch("GET", "/api/session")
+            assert answer.status_code == 200, answer.text
+            found: list[dict[str, str]] = answer.json()["banners"]
+            return found
+
+        def errors() -> int:
+            summary: dict[str, int] = world.page.fetch("GET", "/api/session").json()[
+                "health_summary"
+            ]
+            return summary["error"]
+
+        before, counted = banners(), errors()
+        assert not {b["code"] for b in before} & {
+            "policy_behind_witness",
+            "policy_deployment_changed",
+        }
+        claimed = {other: 40, head.deployment: 9}
+        rig.call(lambda: rig.vault.app.keep_status(Report(VIEW, 1, {}, witness=claimed)))
+        found = banners()
+        assert [b["code"] for b in found] == [
+            *[b["code"] for b in before if b["code"] != "health_errors"],
+            "policy_behind_witness",
+            "policy_deployment_changed",
+            "health_errors",
+        ]
+        shown = {b["code"]: b["text"] for b in found}
+        assert shown["policy_behind_witness"].startswith(
+            "the gateway has applied revision 9; this vault holds 1. Was the state volume restored?"
+        )
+        assert shown["policy_behind_witness"].endswith(
+            " exec vault zoeymcp policy acknowledge-restore"
+        )
+        assert shown["policy_deployment_changed"].startswith(
+            "the gateway has seen revision 40 of another deployment of this vault, and this one"
+        )
+        assert errors() == counted + 2
+        assert shown["health_errors"] == (
+            f"{counted + 2} problem(s) need you: see the checklist on Home."
+        )
+        written = rig.call(
+            lambda: managed_policy.write(
+                "policy.acknowledge",
+                "socket",
+                1,
+                lambda policy: policy,
+                author={"by": "host", "via": "socket"},
+                expected=None,
+                jumped_from=1,
+                revision=41,
+            )
+        )
+        assert isinstance(written, Written)
+        assert banners() == before
+
+
 def test_managed_kinds_refuse_in_declarative_mode(tmp_path: Path) -> None:
     """M.3: a managed kind in declarative mode is ``policy_not_managed``; the session's mode is
     declarative and names no revision."""

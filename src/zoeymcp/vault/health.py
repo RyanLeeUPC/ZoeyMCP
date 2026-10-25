@@ -86,11 +86,17 @@ revision saved but not running since its install failed, until a ``SIGHUP`` or a
 it; ``policy_seed_ignored`` (warning), a configured source that differs from the seed and the head
 (F.5; the OAuth seed's ``seed_ignored`` keeps its name); ``policy_restart_needed`` (warning), each
 change installed since the start that needs a restart (I.2); ``revisions_unreadable`` (warning),
-kept revisions that failed to verify. In declarative mode: ``policy_store_parked`` (info),
+kept revisions that failed to verify; and the restore witness's two (K.3, J11), each an error
+(health has no critical level) whose action is ``acknowledge_restore``: ``policy_behind_witness``,
+the gateway has applied a revision of this deployment above the head (the whole ``/state`` put
+back from an older backup), and ``policy_deployment_changed``, it has seen another deployment
+of this vault at a revision this one hasn't passed (``/state`` wiped and seeded again, T-5). In
+declarative mode: ``policy_store_parked`` (info),
 ``policy_declarative_revives`` (warning) for what the running policy brings back that the parked
 ratchet retired (T-16), and ``policy_store_unverified`` (warning), a store the start couldn't read.
 In both, ``policy_quarantine_kept`` (info) counts the quarantine's files. Every text holds revision
-numbers, grant subjects (policy names) and fixed words only (Y13).
+numbers, grant subjects (policy names) and fixed words only (Y13), and the witness's the host's
+own command from the container's environment.
 """
 
 from __future__ import annotations
@@ -254,6 +260,13 @@ class PolicyState:
     # revision whose view it is, when this vault installed it.
     gateway_behind: bool = False
     gateway_revision: int | None = None
+    # The restore witness (K.3): the revision of this deployment the gateway has seen above the
+    # head, and the revision it saw another deployment at, each None when none (the finding
+    # texts name revisions only, Y13); and how the host acknowledges either (the exec form,
+    # OPS-10).
+    witness_behind: int | None = None
+    witness_other: int | None = None
+    acknowledge: str = "zoeymcp policy acknowledge-restore"
 
 
 @dataclass(frozen=True)
@@ -857,6 +870,27 @@ def _policy(state: PolicyState) -> dict[str, Any]:
             "or restart it"
         )
         findings.append(_finding("policy_not_running", "error", text, {"kind": "reload_vault"}))
+    if state.witness_behind is not None:
+        claim = state.witness_behind
+        text = (
+            f"the gateway has applied revision {claim}; this vault holds {revision}. Was the "
+            f"state volume restored? Removed clients and moves back to approve since {revision} "
+            "are undone. Re-apply them (import your latest export: it restores clients, "
+            "classifications and declines, not pins), review again each server Home lists as "
+            f"drifted, then acknowledge: {state.acknowledge}"
+        )
+        action = {"kind": "acknowledge_restore"}
+        findings.append(_finding("policy_behind_witness", "error", text, action))
+    if state.witness_other is not None:
+        starts = "starts at 1" if revision == 1 else f"is at revision {revision}"
+        text = (
+            f"the gateway has seen revision {state.witness_other} of another deployment of this "
+            f"vault, and this one {starts}. Was /state deleted? Everything removed since the "
+            "seed is back. Restore /state from one backup, or import your latest export, then "
+            f"acknowledge: {state.acknowledge}"
+        )
+        action = {"kind": "acknowledge_restore"}
+        findings.append(_finding("policy_deployment_changed", "error", text, action))
     if state.seed_ignored is not None:
         said = _SEED_IGNORED[state.seed_ignored]
         text = (

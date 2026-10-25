@@ -19,20 +19,22 @@ rewritten with ``highest`` the head's (row 13). A ``Fresh`` store's half-written
 quarantine (row 5). A refused store is left as it is.
 
 :meth:`PolicyStore.commit` is D.9: revision ``head + 1``, then the head (the commit), then the
-anchor, then the prune (D.8). A failure before the head's rename leaves nothing in effect
-(``policy_write_failed``); an anchor that can't be written leaves the save committed and the anchor
-dirty, so the next commit writes it first or refuses (FM-30). :meth:`PolicyStore.seed` writes the
-anchor at 0 before revision 1 (FM-25): the vault's own seed on a fresh volume, or the host's
-``policy seed --state`` on a used one (F.3). :meth:`PolicyStore.reseed` is the host's ``policy
-import --state --reseed`` (F.3, G-25): the old head and revisions go to quarantine, the anchor is
-written first, and the new revision, with no parent, is one above every number the volume shows
-(Y4); a write that fails before its head puts the old store back. :meth:`PolicyStore.park`
-records the head a declarative start parked, with ``highest`` the head's too (F.4).
-:meth:`PolicyStore.removed_lookup` finds in the kept history the revision that retired a client's
-token or a caller's placeholder, which the ratchet doesn't keep (E.1), for the planner's refusal
-texts. :meth:`PolicyStore.history` pages the kept revisions' headers, newest first, a revision
-in quarantine as a gap (H.1); :meth:`PolicyStore.revision` and :meth:`PolicyStore.policy` read a
-kept one again, and :meth:`PolicyStore.missing` says why one can't be (H.3).
+anchor, then the prune (D.8). An acknowledged restore's revision jumps past the gateway's claim
+instead (K.3, Y4): it names the head in ``jumped_from``, the numbers between are never written, and
+history, the prune's count and the lookups below step over them. A failure before the head's rename
+leaves nothing in effect (``policy_write_failed``); an anchor that can't be written leaves the save
+committed and the anchor dirty, so the next commit writes it first or refuses (FM-30).
+:meth:`PolicyStore.seed` writes the anchor at 0 before revision 1 (FM-25): the vault's own seed on a
+fresh volume, or the host's ``policy seed --state`` on a used one (F.3). :meth:`PolicyStore.reseed`
+is the host's ``policy import --state --reseed`` (F.3, G-25): the old head and revisions go to
+quarantine, the anchor is written first, and the new revision, with no parent, is one above every
+number the volume shows (Y4); a write that fails before its head puts the old store back.
+:meth:`PolicyStore.park` records the head a declarative start parked, with ``highest`` the head's
+too (F.4). :meth:`PolicyStore.removed_lookup` finds in the kept history the revision that retired a
+client's token or a caller's placeholder, which the ratchet doesn't keep (E.1), for the planner's
+refusal texts. :meth:`PolicyStore.history` pages the kept revisions' headers, newest first, a
+revision in quarantine as a gap (H.1); :meth:`PolicyStore.revision` and :meth:`PolicyStore.policy`
+read a kept one again, and :meth:`PolicyStore.missing` says why one can't be (H.3).
 
 Every write goes through a module-level seam (:func:`write_revision`, :func:`write_head`,
 :func:`write_anchor`, :func:`move`, :func:`remove`): unit tests make them fail, and
@@ -44,7 +46,6 @@ from __future__ import annotations
 
 import errno
 import os
-import re
 import secrets
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -93,8 +94,10 @@ from .policystart import (
     Ok,
     Refused,
     StoreVerdict,
+    before,
     revision_file,
     revision_number,
+    set_aside,
     verdict,
     volume_used,
 )
@@ -114,8 +117,6 @@ DIRECTORY_MODE: Final = 0o700
 # The vault's own seed's author; the host's offline seed and reseed are by the host (D.2, F.3).
 SEED_AUTHOR: Final[Mapping[str, str]] = MappingProxyType({"by": "seed"})
 OFFLINE: Final[Mapping[str, str]] = MappingProxyType({"by": "host", "via": "offline"})
-# A quarantined file's revision, from its name (<n>.<why>.json, <n>.<why>.<k>.json).
-_QUARANTINED: Final = re.compile(r"([0-9]{1,10})\.[a-z]+(?:\.[0-9]+)?\.json")
 
 
 class StoreRefused(Exception):
@@ -216,6 +217,11 @@ def _entries(directory: Path) -> list[Path]:
     return sorted(directory.iterdir()) if directory.is_dir() else []
 
 
+def _set_aside(state: Path) -> list[int]:
+    """The revision each file in ``quarantine/`` was, by its name."""
+    return sorted(set_aside(entry.name for entry in _entries(state / POLICY_DIR / QUARANTINE)))
+
+
 def _failed(action: str, exc: OSError, **where: Any) -> None:
     """A housekeeping step that didn't happen; the next start tries it again."""
     logs.event(
@@ -285,9 +291,15 @@ class PolicyStore:
         self._seed_digest: str | None = None
         # Each kept revision's parent digest, by number: the head names its oldest's (D.8).
         self._parents: dict[int, str | None] = {}
+        # Each kept revision an acknowledged restore jumped to, and the one it jumped from (K.3):
+        # the numbers between were never written.
+        self._jumps: dict[int, int] = {}
         # Every revision number a file in revisions/ is named by, read or not, and the revision of
         # a head that unsealed, whatever the verdict (a reseed's, Y4).
         self._numbers: tuple[int, ...] = ()
+        # The revisions below the head at the start that aren't kept (row 14): each had a file,
+        # in quarantine now, or is named by one with none; never a number a jump passed over.
+        self._lost: frozenset[int] = frozenset()
         self._seen: int | None = None
 
     def __repr__(self) -> str:
@@ -324,6 +336,8 @@ class PolicyStore:
         read: dict[int, Unsealed | SealRefused] = {}
         for entry in _entries(directory):
             listed.append(entry.name)
+            if entry.name == QUARANTINE and entry.is_dir():
+                listed.extend(f"{QUARANTINE}/{child.name}" for child in _entries(entry))
             if entry.name != REVISIONS or not entry.is_dir():
                 continue
             for child in _entries(entry):
@@ -405,15 +419,20 @@ class PolicyStore:
         target: int | None = None,
         jumped_from: int | None = None,
         seed_digest: str | None = None,
+        revision: int | None = None,
     ) -> Committed:
-        """Commit ``plan`` as revision ``head + 1`` (D.9), inside G.6's section. ``author``,
-        ``reason``, ``target`` and ``jumped_from`` go to the header as D.2 says; ``seed_digest``
-        replaces the head's (an ``import --from-env``, a resume, F.5). Raises
-        :class:`StoreRefused`, with nothing in effect, and ``ValueError`` for a plan made on
-        another head or a header ``policyseal`` refuses."""
+        """Commit ``plan`` as revision ``head + 1`` (D.9), inside G.6's section, or as
+        ``revision``, an acknowledged restore's jump past the gateway's claim (K.3, Y4).
+        ``author``, ``reason``, ``target`` and ``jumped_from`` go to the header as D.2 says;
+        ``seed_digest`` replaces the head's (an ``import --from-env``, a resume, F.5). Raises
+        :class:`StoreRefused`, with nothing in effect (``revision_out_of_range`` above
+        :data:`~.policyseal.REVISION_MAX`), and ``ValueError`` for a plan made on another head, a
+        ``revision`` not above the head, or a header ``policyseal`` refuses."""
         head = self._running()
         if (plan.base, plan.base_digest) != (head.revision, head.digest):
             raise ValueError("the plan was made on another head")
+        if revision is not None and revision <= head.revision:
+            raise ValueError("a revision is numbered above the head")
         if plan.kind in ("policy.seed", "policy.reseed"):
             raise ValueError(f"{plan.kind} isn't written on the head")
         if self.anchor_dirty and not self._save_anchor(logged=False):
@@ -435,6 +454,7 @@ class PolicyStore:
             plan.ratchet,
             seed_digest or self._seed_digest or "",  # an Ok store's head names one
             reason,
+            number=revision,
         )
 
     def seed(
@@ -510,15 +530,11 @@ class PolicyStore:
         file's in ``revisions/`` and ``quarantine/``, verified or not), so no number is used twice
         (Y4)."""
         anchor = self.trusted_anchor
-        found = [0 if anchor is None else anchor.highest, *self._numbers]
+        found = [0 if anchor is None else anchor.highest, *self._numbers, *_set_aside(self._state)]
         if self._head is not None:
             found.append(self._head.revision)
         if self._seen is not None:
             found.append(self._seen)
-        for entry in _entries(self._state / POLICY_DIR / QUARANTINE):
-            number = _QUARANTINED.fullmatch(entry.name)
-            if number is not None:
-                found.append(int(number.group(1)))
         return max(found) + 1
 
     def reseed(
@@ -598,6 +614,7 @@ class PolicyStore:
                 raise StoreRefused("reseed_incomplete", f"{failed}; {'; '.join(left)}") from exc
             raise StoreRefused("policy_write_failed", failed) from exc
         self._head, self._header, self._parents, self._numbers = None, None, {}, ()
+        self._lost = frozenset()
         self._anchor, self.anchor_dirty = wanted, False
         return self._committed(sealed, seed_digest)
 
@@ -635,7 +652,8 @@ class PolicyStore:
         (``client:<name>``, ``caller:<route>/<index>``) it answers the newest kept revision that
         retired the value ``candidate`` holds under that subject, as ``ratchet.advance`` did:
         ``n + 1`` when revision ``n`` held the token hash or placeholder digest anywhere and
-        ``n + 1`` held it nowhere, so a rename or a shifted index isn't a removal. ``None`` when
+        ``n + 1`` (or the revision an acknowledged restore jumped to from ``n``) held it nowhere,
+        so a rename or a shifted index isn't a removal. ``None`` when
         the kept history doesn't show it (a gap, a pruned revision, a pin). Each kept revision is
         read once per kind of subject."""
         found: dict[str, dict[int, frozenset[str] | None]] = {}
@@ -651,10 +669,12 @@ class PolicyStore:
             if what not in found:
                 found[what] = {number: self._held(number, held) for number in self._parents}
             values = found[what]
+            following = {start: number for number, start in self._jumps.items()}
             for number in sorted(values, reverse=True):
-                older, newer = values[number], values.get(number + 1)
+                after = following.get(number, number + 1)
+                older, newer = values[number], values.get(after)
                 if older is not None and newer is not None and value in older - newer:
-                    return number + 1
+                    return after
             return None
 
         return removed_in
@@ -690,14 +710,21 @@ class PolicyStore:
 
     def missing(self, number: int) -> Missing | None:
         """Why revision ``number`` can't be read (H.3), or ``None`` when it is kept: between the
-        oldest kept and the head it went to quarantine (``revision_unreadable``); below it, it
-        was pruned, and above the head it was never written (``revision_unknown``)."""
+        oldest kept and the head it went to quarantine or its file is gone
+        (``revision_unreadable``, :meth:`unreadable`); below it, it was pruned, and above the
+        head or inside an acknowledged restore's jump it was never written
+        (``revision_unknown``)."""
         if number in self._parents:
             return None
-        head = self._running()
-        if head.oldest <= number <= head.revision:
-            return "revision_unreadable"
-        return "revision_unknown"
+        return "revision_unreadable" if number in self.unreadable() else "revision_unknown"
+
+    def unreadable(self) -> tuple[int, ...]:
+        """The revisions between the oldest kept and the head that aren't kept (health's
+        ``revisions_unreadable``), oldest first: each had a file, in quarantine now, or a kept
+        one names it (row 14). A jump's numbers were never written, so they aren't among them,
+        nor are they when the jump's own file is in quarantine."""
+        oldest = self._running().oldest
+        return tuple(sorted(n for n in self._lost if n >= oldest))
 
     def history(
         self, before: int | None = None, limit: int = HISTORY_PAGE_MAX
@@ -705,13 +732,16 @@ class PolicyStore:
         """A page of history (H.1), newest first: each revision from the head (or from
         ``before`` less one) down to the oldest kept, at most ``limit`` of them (1 to
         :data:`HISTORY_PAGE_MAX`). A kept revision is its header as :func:`history_entry` shows
-        it, read and verified now; one in quarantine, or that no longer verifies, is a gap
-        (``{"revision": n, "gap": true}``)."""
+        it, read and verified now; one in quarantine or whose file is gone (:meth:`unreadable`),
+        or that no longer verifies, is a gap (``{"revision": n, "gap": true}``). A number a jump
+        passed over was never written, so it isn't shown, not even as a gap."""
         head = self._running()
         top = head.revision if before is None else min(before - 1, head.revision)
         count = max(1, min(limit, HISTORY_PAGE_MAX))
+        numbers = {*self._parents, *self.unreadable()}
+        shown = sorted((n for n in numbers if head.oldest <= n <= top), reverse=True)
         found: list[dict[str, Any]] = []
-        for number in range(top, max(head.oldest, top - count + 1) - 1, -1):
+        for number in shown[:count]:
             entry = self.revision(number)
             if entry is None:
                 found.append({"revision": number, "gap": True})
@@ -737,6 +767,14 @@ class PolicyStore:
             raise ValueError("the store has no head")
         return self._head
 
+    def _before(self, number: int) -> int:
+        """The revision ``number`` follows: the one a jump started from, else the one below."""
+        return self._jumps.get(number, number - 1)
+
+    def _skipped(self, number: int) -> bool:
+        """Whether ``number`` is inside a kept revision's jump: never written."""
+        return any(start < number < jumped for jumped, start in self._jumps.items())
+
     def _directories(self) -> None:
         for directory in (self._state / POLICY_DIR, self._state / POLICY_DIR / REVISIONS):
             directory.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
@@ -745,6 +783,18 @@ class PolicyStore:
         """An ``Ok`` store's rows 12-16, the rotation, and the anchor last."""
         self._head, self._header, self._seed_digest = ok.head, ok.top.header, ok.seed_digest
         self._parents = {number: entry.header["parent"] for number, entry in kept.items()}
+        self._jumps = {
+            number: start
+            for number, entry in kept.items()
+            if (start := before(entry)) != number - 1
+        }
+        self._lost = frozenset(
+            number
+            for number in (*self._numbers, *_set_aside(self._state), *ok.absent)
+            if ok.head.oldest <= number < ok.head.revision
+            and number not in self._parents
+            and not self._skipped(number)
+        )
         moved = True
         if ok.uncommitted is not None:
             moved = self._quarantine(ok.uncommitted, "uncommitted")
@@ -856,6 +906,7 @@ class PolicyStore:
                 _failed("prune", exc, revision=number)
                 break
             self._parents.pop(number, None)
+            self._jumps.pop(number, None)
             removed += 1
         if removed:
             logs.event("policy_pruned", revisions=removed, below=below)
@@ -887,12 +938,15 @@ class PolicyStore:
         ratchet: Ratchet,
         seed_digest: str,
         reason: str | None,
+        *,
+        number: int | None = None,
     ) -> Committed:
-        """D.9's steps 1-4 for revision ``head + 1`` (1 for a seed), ``fields`` its header's
-        origin, kind, author, base, target, jumped_from and parent."""
+        """D.9's steps 1-4 for revision ``head + 1`` (1 for a seed) or ``number``, ``fields`` its
+        header's origin, kind, author, base, target, jumped_from and parent."""
         head, anchor = self._head, self._anchor
         assert anchor is not None  # noqa: S101 - a seed writes it first
-        number = 1 if head is None else head.revision + 1
+        if number is None:
+            number = 1 if head is None else head.revision + 1
         sealed = self._sealed(
             fields,
             policy,
@@ -950,13 +1004,22 @@ class PolicyStore:
         data = seal_revision(header, body, keys=self._keys, nonce=_nonce())
         digest = revision_digest(header)
         parent = fields["parent"]
-        oldest = number if head is None else max(head.oldest, number - KEEP + 1)
+        oldest = number if head is None else self._oldest(number, head)
         if head is not None and oldest == head.oldest:
             oldest_parent = head.oldest_parent
         else:
             oldest_parent = parent if oldest == number else self._parents.get(oldest)
         new = Head(deployment, number, digest, oldest, oldest_parent, self._keys.key_id)
         return _Sealed(data, header, digest, new, seal_head(new, self._keys))
+
+    def _oldest(self, number: int, head: Head) -> int:
+        """The oldest revision kept once ``number`` follows ``head`` (D.8): the newest
+        :data:`KEEP` written, counted down through what each follows, so a jump's numbers,
+        never written, don't count; never below the head's oldest."""
+        oldest, count, following = number, 1, head.revision
+        while count < KEEP and following >= head.oldest:
+            oldest, count, following = following, count + 1, self._before(following)
+        return oldest
 
     def _put(self, sealed: _Sealed) -> None:
         """D.9's steps 1 and 2: the revision, then the head, whose rename is the commit. Raises
@@ -971,6 +1034,9 @@ class PolicyStore:
         assert anchor is not None  # noqa: S101 - written before the revision
         self._head, self._header, self._seed_digest = new, sealed.header, seed_digest
         self._parents[new.revision] = sealed.header["parent"]
+        start = sealed.header["jumped_from"]
+        if start is not None and start != new.revision - 1:
+            self._jumps[new.revision] = start
         self._anchor = replace(anchor, highest=new.revision, parked=None, key_id=self._keys.key_id)
         written = self._save_anchor()
         self._prune([n for n in self._parents if n < new.oldest], below=new.oldest)

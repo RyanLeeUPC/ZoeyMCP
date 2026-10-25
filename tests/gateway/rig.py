@@ -35,6 +35,7 @@ from zoeymcp.gateway.defstore import DefinitionStore
 from zoeymcp.gateway.ledger import Ledger
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.pins import ProjectionError, project_and_pin, tool_problems
+from zoeymcp.gateway.policyclient import Witness
 from zoeymcp.gateway.server import AdminApp, pushed_status
 from zoeymcp.gateway.upstream import UpstreamPool
 from zoeymcp.gateway.vaultlink import (
@@ -398,7 +399,7 @@ def gateway(
     """The gateway app on a uvicorn thread, on the deployment's vault, once it is ready.
     With ``report``, it reports its ledger to the vault, with ``review`` it polls for the
     vault's review jobs, and with ``status_push`` it pushes its status report (M6 design K.1),
-    as ``zoeymcp gateway`` does."""
+    as ``zoeymcp gateway`` does; its restore witness is the deployment's state's (K.3)."""
     pool = UpstreamPool(
         parse_link(deployed.vault_url),
         KeySource(KEYS.gateway_key(1)),
@@ -417,6 +418,7 @@ def gateway(
         review_http=reviewing,
         status_http=status_client(link, keys) if status_push else None,
         status=pushed_status,
+        witness=Witness.load(deployed.state),
     )
     app.ledger, _ = Ledger.open_at(
         deployed.state, max_bytes=deployed.view.gateway.limits.ledger_max_bytes

@@ -1415,7 +1415,8 @@ an upstream call, and neither shows definitions or token hashes. `--format json`
 
 **The status in the portal and in `health`.** The vault never connects to the gateway, so the
 gateway pushes a summary of the same data to the vault: per server its kind, state, era,
-whether it is blocked, and counts, the mode it last saw, and the names its attention decision sorts out (the tools that drifted, that a drift
+whether it is blocked, and counts, the mode it last saw, the highest revision it has seen of each
+deployment of a managed vault (its restore witness, §34), and the names its attention decision sorts out (the tools that drifted, that a drift
 mark hides, that it no longer lists, and the tools nobody reviewed with the pin each is listed
 at), never a definition, a token hash or a client name. It pushes when that changes, at most
 once every 5 seconds, and at least once a minute; the vault keeps the latest in memory only, so
@@ -3766,6 +3767,71 @@ stopped: keep an export (`zoeymcp policy export`) somewhere safe, since it holds
 secrets as the store does. Its last resort, `--reseed --from-env`, takes your compose policy as it
 is now, usually older than the head. The vault never falls back to the seed by itself.
 
+### A restored volume: the gateway as witness
+
+The anchor catches `/state/policy` restored or deleted on its own: the start is refused (above).
+It can't catch the whole of `/state` put back from one backup, since the head and the anchor
+then agree, nor `/state` wiped and seeded again from `ZOEYMCP_CONFIG`, which looks like a fresh
+install. The gateway can: in managed mode every view answer states the vault's deployment and
+the revision it runs (`x-zoeymcp-policy-revision`, outside the view), and the gateway keeps the
+highest revision it has seen of each deployment in its own volume
+(`/state-gateway/policy-seen.json`, at most 8 deployments). Its status report carries them, and
+the vault compares them with its head. Nothing is refused on it: the gateway applies the view
+either way, and the vault keeps running. Back up the vault's volume and the gateway's apart, so a
+restore of one leaves the other to notice.
+
+**The whole `/state` restored, the gateway's volume not.** The vault starts on revision 27, the
+gateway has seen 31. Health (and a banner on every portal page) shows `policy_behind_witness`
+(error): "the gateway has applied revision 31; this vault holds 27. Was the state volume
+restored? Removed clients and moves back to approve since 27 are undone. Re-apply them (import
+your latest export: it restores clients, classifications and declines, not pins), review again
+each server Home lists as drifted, then acknowledge: docker compose -f
+deploy/compose.hardened.yaml exec vault zoeymcp policy acknowledge-restore" (the command from
+`ZOEYMCP_COMPOSE_CMD` and `ZOEYMCP_EXEC_SERVICE`). An import can't re-pin, so every tool re-pinned
+after 27 is served as drift until you review it again; Home lists each.
+
+**`/state` wiped whole, the gateway's volume kept.** The vault seeds revision 1 under a new
+deployment; the gateway has seen revision 31 of the old one. Health shows
+`policy_deployment_changed` (error): "the gateway has seen revision 31 of another deployment of
+this vault, and this one starts at 1. Was /state deleted? Everything removed since
+the seed is back. Restore /state from one backup, or import your latest export, then acknowledge:
+...". It is raised while the other deployment's revision is 2 or more and at least this one's,
+and this deployment was seen after it (or is still at revision 1).
+
+**Acknowledging.** Once you have re-applied what the restore undid:
+
+```text
+$ docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp policy acknowledge-restore
+Revision 27 jumps to 32: one above the gateway's claim of 31; the number comes from the gateway.
+Type 32 to write it: 32
+Planned on revision 27 (the head):
+  Revision: 32, from 27, past 28-31, which are never written
+Acknowledged the restore as revision 32.
+Next:
+  The gateway takes the new view within seconds
+```
+
+It writes a revision with the head's content (`policy.acknowledge`, `jumped_from` 27), numbered
+one above the gateway's claim, so the counter passes it and the finding clears; the anchor moves
+with it, and history shows 32 straight after 27. Since the number is only the gateway's claim,
+you type it, or give it as `--to 32` (then `[y/N]`, or `--yes`; with `--yes`, `--to` is
+required, and a `--to` other than the vault's number writes nothing). A claim above
+9,999,999,999 is refused when the report arrives (`status_refused reason=witness_range`), and a
+number past it, the vault's or one you give or type, is `revision_out_of_range`. With nothing to acknowledge the vault answers
+`nothing_to_acknowledge`. The same command takes `--state /state` with the vault stopped, where
+there is no claim to read: type the number health named, or give `--to`. It changes no policy:
+it records that you saw the restore.
+
+**What the witness can't see.** A restore of both volumes from one snapshot looks like nothing
+happened. A compromised gateway can stay silent, or raise a false alarm; it can't make the vault
+take a number you didn't type. The gateway's side logs:
+
+| Event | Fields |
+| --- | --- |
+| `policy_revision_regressed` | `deployment` (8 characters), `seen` (the highest it recorded), `now` (the lower one stated): once per regression (critical) |
+| `policy_deployment_seen` | `deployment` (8 characters): a deployment recorded for the first time; a warning beside others, info for the first |
+| `policy_seen_not_written` | `error`: the record couldn't be written; it holds in memory, and the next change writes it whole (warning) |
+
 ### Seeding and reseeding with the vault stopped
 
 Both commands run in a one-off container of the vault's service, with the vault stopped: they take
@@ -3823,8 +3889,9 @@ deploy/compose.hardened.yaml exec vault zoeymcp policy ...`, or `exec zoeymcp` i
 tier); `--format json` prints the vault's answer instead:
 
 - `zoeymcp policy` (or `policy head`): the mode and, in managed mode, the head: when, how and by
-  whom it was written, its deployment and digest (8 characters each), and the revision the
-  gateway runs (`applied`, `pending`, or `unknown` before its first status report);
+  whom it was written, its deployment and digest (8 characters each), the revision the
+  gateway runs (`applied`, `pending`, or `unknown` before its first status report), and the
+  highest revision of this deployment the gateway has seen (its witness, below);
 - `zoeymcp policy history [--before N] [--limit N]`: the kept revisions, newest first, each with
   what made it (`policy.seed`, `policy.save`, `policy.import`, `policy.rollback`, ...), by whom
   (a passkey's fingerprint, the host and how, or the seed), its base, a rollback's target and the
@@ -3983,11 +4050,13 @@ crash between any two leaves a store the next start sorts out. Every write is a 
 At each start the vault reads every kept revision, then:
 
 - a revision one above the head that names the head as its parent is a save that never answered:
-  it goes to `quarantine/<n>.uncommitted.json` and the head runs (`policy_save_uncommitted`);
+  it goes to `quarantine/<n>.uncommitted.json` and the head runs (`policy_save_uncommitted`); so
+  is an acknowledged restore's revision that jumped from the head (above, "A restored volume");
 - an older revision that doesn't verify (changed, under an unknown or retired master key, from
   another deployment, or not chaining to its neighbours) goes to `quarantine/<n>.unreadable.json`
   and the head still runs (`policy_revision_quarantined`): it is lost from the history only;
-- a head one above the anchor is a crash between the two writes: the anchor is rewritten;
+- a head one above the anchor (or an acknowledged restore's, jumped from the anchor's revision)
+  is a crash between the two writes: the anchor is rewritten;
 - revisions below the oldest kept are a removal cut short: they are removed (`policy_pruned`);
 - a name the vault doesn't write in `/state/policy` is logged (`policy_stray_file`) and left alone.
 
@@ -4028,11 +4097,13 @@ Its log lines:
 | `policy_store_unverified` | `reason`: a declarative start found a store that doesn't verify, and left it (warning) |
 | `policy_resumed` | `revision`, `parked_at`, `revived` and, above 0, `names` (warning then): a managed start resumed a parked store |
 | `policy_refused` | `reason`, and `file` or `revision`: a start refused over the store or its head (critical) |
-| `policy_saved`, `policy_imported`, `policy_rolled_back`, `policy_acknowledged` | `revision`, `write_kind`, `origin`, `author` (a passkey's fingerprint, 8 characters, or `host`), `base`, `digest` (8), `effects` (what needs a restart or a step), `target` for a rollback, and `from_env` and `baseline_only` for a host import |
+| `policy_saved`, `policy_imported`, `policy_rolled_back`, `policy_acknowledged` | `revision`, `write_kind`, `origin`, `author` (a passkey's fingerprint, 8 characters, or `host`), `base`, `digest` (8), `effects` (what needs a restart or a step), `target` for a rollback, `jumped_from` for an acknowledged restore, and `from_env` and `baseline_only` for a host import |
 | `policy_exported` | `revision`, `via` (`socket`, or `offline` for `--state`): the host exported the policy |
 | `policy_imported` (a reseed) | `revision`, `write_kind` (`policy.reseed`), `origin` (`reseed`), `author` (`host`), `base` (the old head it was planned against, or none), `digest` and `deployment` (8 characters each), `effects` (none), `reseed` (true), `new_ratchet`, `from_env` |
 | `tool_allowed`, `tool_repinned` | `server`, `def_kind`, `name`, `revision`; `tool_allowed` also `kept` for an `allow` tool kept through a re-pin: one line per tool, whatever the change |
 | `policy_not_installed` | `revision`, `reason`: a saved revision couldn't be applied, and the previous one runs (critical) |
+| `policy_behind_witness` | `head`, `witness` (the revision the gateway has seen): when a status report first shows the head behind it, or behind another number (critical) |
+| `policy_deployment_changed` | `deployment` and `other` (8 characters each), `revision` (the other's, as the gateway saw it): when a status report first shows it (critical) |
 | `reload_ok` | in managed mode `source` (`head`), `revision`, `installed` |
 
 None holds a policy value or anything a file holds; `policy_stray_file` names the stray file only,

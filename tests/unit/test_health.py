@@ -2711,3 +2711,47 @@ def test_the_declarative_findings_are_declaratives_only() -> None:
     """A managed state never says parked, revived or unverified, whatever it holds."""
     state = PolicyState("managed", revision=3, revived=("client:a",), unverified="tampered")
     assert policy_section(state)["findings"] == []
+
+
+def test_the_restore_witness_findings() -> None:
+    """K.3, J11, T-5: the head behind what the gateway applied, and another deployment the
+    gateway saw first, each an error (health has no critical level) acknowledged on the host;
+    the command is the plain one unless the vault names its exec form; both come before the
+    seed's."""
+    state = PolicyState(
+        "managed",
+        revision=27,
+        witness_behind=31,
+        witness_other=40,
+        seed_ignored="changed",
+    )
+    section = policy_section(state)
+    assert section["level"] == "error"
+    findings = [(f["code"], f["level"], f["action"]) for f in section["findings"]]
+    assert findings == [
+        ("policy_behind_witness", "error", {"kind": "acknowledge_restore"}),
+        ("policy_deployment_changed", "error", {"kind": "acknowledge_restore"}),
+        ("policy_seed_ignored", "warning", {"kind": "import_from_env"}),
+    ]
+    behind, other = (f["text"] for f in section["findings"][:2])
+    assert behind == (
+        "the gateway has applied revision 31; this vault holds 27. Was the state volume "
+        "restored? Removed clients and moves back to approve since 27 are undone. Re-apply them "
+        "(import your latest export: it restores clients, classifications and declines, not "
+        "pins), review again each server Home lists as drifted, then acknowledge: zoeymcp policy "
+        "acknowledge-restore"
+    )
+    assert other == (
+        "the gateway has seen revision 40 of another deployment of this vault, and this one is "
+        "at revision 27. Was /state deleted? Everything removed since the seed is "
+        "back. Restore /state from one backup, or import your latest export, then acknowledge: "
+        "zoeymcp policy acknowledge-restore"
+    )
+    fresh = PolicyState("managed", revision=1, witness_other=31, acknowledge="X")
+    [finding] = policy_section(fresh)["findings"]
+    assert finding["text"].endswith(
+        "and this one starts at 1. Was /state deleted? Everything "
+        "removed since the seed is back. Restore /state from one "
+        "backup, or import your latest export, then acknowledge: X"
+    )
+    assert report(EMPTY, policy_state=state)["summary"]["error"] == 2

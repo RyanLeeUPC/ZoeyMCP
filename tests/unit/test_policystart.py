@@ -37,6 +37,7 @@ from zoeymcp.vault.policyseal import (
 )
 from zoeymcp.vault.policystart import (
     ANCHOR_FILE,
+    GONE_MAX,
     HEAD_FILE,
     NAMES_SHOWN,
     NO_POLICY,
@@ -54,14 +55,17 @@ from zoeymcp.vault.policystart import (
     Seed,
     Source,
     StartFacts,
+    before,
     decide,
     read_source,
     revision_file,
     revision_number,
+    set_aside,
     source_mode,
     verdict,
     volume_used,
 )
+from zoeymcp.vault.policystore import KEEP
 
 KEYS = KeySet.from_master(bytes(range(32)))
 OLD = KeySet.from_master(bytes(range(1, 33)))
@@ -1058,3 +1062,144 @@ def test_a_refusal_names_the_hosts_commands() -> None:
     assert isinstance(found, Refuse)
     assert found.message == GUARD.text(STANDARD)
     assert "--user 10001:10001 zoeymcp policy seed" in found.message
+
+
+# --- an acknowledged restore's jump (K.3, Y4) --------------------------------------------------
+
+
+def acknowledged(number: int, parent: str, start: int) -> Unsealed:
+    """Revision ``number``, an acknowledged restore that jumped from ``start``: the numbers
+    between are never written."""
+    plaintext = make_body(
+        salt=bytes([7]) * 32, policy=POLICY, ratchet=RATCHET, seed_digest=SEED, reason=None
+    )
+    header: dict[str, Any] = {
+        "v": 1,
+        "deployment": DEPLOYMENT,
+        "revision": number,
+        "parent": parent,
+        "created": 1_792_900_000 + number,
+        "origin": "acknowledge",
+        "kind": "policy.acknowledge",
+        "author": {"by": "host", "via": "socket"},
+        "base": start,
+        "target": None,
+        "jumped_from": start,
+        "body_digest": body_digest(plaintext),
+    }
+    return unsealed(seal_revision(header, plaintext, keys=KEYS, nonce=bytes(12)))
+
+
+JUMPED = acknowledged(9, FILES[5].digest, 5)
+AFTER = unsealed(sealed(10, JUMPED.digest))
+
+
+def test_a_revision_follows_its_jump_or_the_one_below() -> None:
+    assert before(FILES[5]) == 4
+    assert before(FILES[1]) == 0
+    assert before(JUMPED) == 5
+    assert before(acknowledged(6, FILES[5].digest, 5)) == 5
+
+
+def test_a_jump_chains_to_the_revision_it_jumped_from() -> None:
+    files: dict[int, Any] = {**FILES, 9: JUMPED, 10: AFTER}
+    found = ok(store(anchor_of(10), head_of(files, 10), files))
+    assert found.kept == (1, 2, 3, 4, 5, 9, 10)
+    assert (found.quarantined, found.uncommitted, found.anchor_stale) == ((), None, False)
+    # 6-8 were never written: none is missing.
+    assert (found.absent, found.missing) == ((), 0)
+
+
+def test_what_is_missing_is_what_a_revision_names() -> None:
+    """Row 14 after a jump: a file gone is counted where the oldest the head names, or a revision
+    of this store, names it, with the run of files gone below it; a number only an unreadable
+    jump passed over isn't."""
+    files: dict[int, Any] = {n: FILES[n] for n in (3, 5)}
+    found = ok(store(ANCHOR, head_of(FILES, 5, oldest=2), files))
+    assert (found.absent, found.missing) == ((2, 4), 2)
+    files = {**{n: FILES[n] for n in (1, 2, 5)}, 9: JUMPED, 10: AFTER}
+    found = ok(store(anchor_of(10), head_of(files, 10), files))
+    assert (found.absent, found.missing) == ((3, 4), 2)
+    files = {n: FILES[n] for n in (1, 5)}
+    found = ok(store(ANCHOR, HEAD, files))
+    assert (found.absent, found.missing) == ((2, 3, 4), 3)
+    files = {**FILES, 9: SealRefused("tampered", "was tampered with"), 10: AFTER}
+    found = ok(store(anchor_of(10), head_of(files, 10), files))
+    assert (found.kept, found.quarantined) == ((1, 2, 3, 4, 5, 10), (Quarantined(9, "tampered"),))
+    assert (found.absent, found.missing) == ((), 0)
+
+
+def test_a_run_of_files_gone_is_counted_at_most_gone_max() -> None:
+    """Past :data:`GONE_MAX` below the one named, a run of numbers is a lost jump's."""
+    files: dict[int, Any] = {1: FILES[1], 100: unsealed(sealed(100, FILES[5].digest))}
+    found = ok(store(anchor_of(100), head_of(files, 100), files))
+    assert GONE_MAX == KEEP
+    assert found.absent == tuple(range(100 - GONE_MAX, 100))
+    files = {1: FILES[1], 66: unsealed(sealed(66, FILES[5].digest))}
+    found = ok(store(anchor_of(66), head_of(files, 66), files))
+    assert found.absent == tuple(range(2, 66))
+
+
+def test_a_run_of_files_gone_stops_at_one_in_quarantine() -> None:
+    files: dict[int, Any] = {n: FILES[n] for n in (1, 5)}
+    names = [*listed(files), "quarantine/3.unreadable.json", "revisions/2.unreadable.json"]
+    assert ok(store(ANCHOR, HEAD, files, names=names)).absent == (3, 4)
+
+
+def test_set_aside_reads_the_revision_from_a_quarantined_name() -> None:
+    names = [
+        "3.unreadable.json",
+        "0000000007.uncommitted.2.json",
+        "9999999999.unreadable.json",
+        "12345678901.unreadable.json",
+        "4.json",
+        "x.unreadable.json",
+        "5.Unreadable.json",
+        "6.unreadable.json.tmp",
+    ]
+    assert set_aside(names) == {3, 7, 9_999_999_999}
+
+
+def test_the_walk_up_steps_over_a_jump() -> None:
+    """Below a break above the jump, the walk up from the oldest crosses it to the revision that
+    names its start."""
+    eleven = unsealed(sealed(11, AFTER.digest))
+    files: dict[int, Any] = {
+        **FILES,
+        9: JUMPED,
+        10: SealRefused("tampered", "was tampered with"),
+        11: eleven,
+    }
+    found = ok(store(anchor_of(11), head_of(files, 11), files))
+    assert found.kept == (1, 2, 3, 4, 5, 9, 11)
+    assert found.quarantined == (Quarantined(10, "tampered"),)
+
+
+def test_a_jumped_head_one_step_above_the_anchor_rewrites_it() -> None:
+    """FM-2 for an acknowledgment, row 13: killed after the jumped head, before the anchor."""
+    files: dict[int, Any] = {**FILES, 9: JUMPED}
+    found = ok(store(ANCHOR, head_of(files, 9), files))
+    assert (found.revision, found.anchor_stale, found.kept) == (9, True, (1, 2, 3, 4, 5, 9))
+    behind = refused(store(anchor_of(4), head_of(files, 9), files))
+    assert behind == Refused("policy_anchor_behind", ANCHOR_FILE, revision=9, highest=4)
+
+
+def test_a_jumped_save_that_never_answered_is_uncommitted() -> None:
+    """FM-1 for an acknowledgment, row 12: the one file above the head is the jump from it."""
+    found = ok(store(ANCHOR, HEAD, {**FILES, 9: JUMPED}))
+    assert (found.uncommitted, found.revision, found.kept) == (9, 5, (1, 2, 3, 4, 5))
+
+
+@pytest.mark.parametrize(
+    ("above", "detail"),
+    [
+        ({9: acknowledged(9, FILES[5].digest, 4)}, "revision 9"),
+        ({9: unsealed(sealed(9, FILES[5].digest))}, "revision 9"),
+        ({9: acknowledged(9, FILES[4].digest, 5)}, "revision 9"),
+        ({9: JUMPED, 10: AFTER}, "revisions 9, 10"),
+    ],
+    ids=["jumped-from-another", "no-jump", "not-the-heads-child", "two"],
+)
+def test_a_jump_above_the_head_that_doesnt_follow_it(above: dict[int, Any], detail: str) -> None:
+    found = refused(store(ANCHOR, HEAD, {**FILES, **above}))
+    assert found == Refused("files_above_head", "policy/revisions", detail, revision=5)

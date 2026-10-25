@@ -74,8 +74,14 @@ plan as at its commit, the import shaped on the revision ``If-Match`` names. A p
 that widens commits only with ``accept_widening=1`` (``import_widens``, Q41), one with a lockout
 row only with ``lockout_ok=1`` (``lockout_unconfirmed``, I.1); ``revoke_removed=1`` deletes the
 store entries the write leaves unused and revokes their grants after the commit, with what the
-write took from the policy still running (G.8, CR-5). Every write is the host's, through
-``ManagedPolicy.write`` (G.6); in declarative mode each answers ``policy_not_managed``.
+write took from the policy still running (G.8, CR-5). ``POST /policy/acknowledge-restore``
+(K.3) is the host's acknowledgment of a restore the gateway's witness shows: with ``plan=1``
+the plan of a revision with the head's content numbered one above the gateway's claim, and the
+claim (``nothing_to_acknowledge`` when the head is behind no claim and no other deployment's,
+``revision_out_of_range`` past 9,999,999,999); committed as an import is, with ``to=N``, the
+number the host typed, which must be that plan's (``plan_changed`` otherwise). ``GET /policy``
+names what the witness holds. Every write is the host's, through ``ManagedPolicy.write`` (G.6);
+in declarative mode each answers ``policy_not_managed``.
 """
 
 from __future__ import annotations
@@ -129,6 +135,7 @@ from .managed import (
     Shaped,
     WriteRefused,
     Written,
+    acknowledge_shaped,
     diff_answer,
     export_answer,
     history_page,
@@ -139,6 +146,7 @@ from .managed import (
     refused_body,
     rollback_shaped,
     widenings,
+    witness_answer,
     written_answer,
 )
 from .oauth.login import LoginError, LoginService
@@ -152,7 +160,7 @@ from .onboard import (
     OnboardService,
 )
 from .onboarding import INLINE_SOURCE, job_next, listed_server, refusal_next, tools_max
-from .policyseal import REASON_MAX
+from .policyseal import REASON_MAX, REVISION_MAX
 from .policystore import HISTORY_PAGE_MAX
 from .reportstore import CopyUnavailable, NotRestartable, PlanChanged, ReportStore
 from .reviewjobs import Job, Owner, ReviewRefused
@@ -195,6 +203,8 @@ PolicyReason = Literal[
     "import_widens",
     "lockout_unconfirmed",
     "plan_changed",
+    "nothing_to_acknowledge",
+    "revision_out_of_range",
 ]
 # An import's body: the loader's own cap (M6 design N.4).
 IMPORT_MAX: Final = 1_048_576
@@ -208,6 +218,8 @@ _FLAGS: Final = frozenset(
 _GRANTS: Final = frozenset({"allow_revive", "allow_env"})
 _IMPORT_QUERY: Final = _FLAGS | _GRANTS | {"reason"}
 _ROLLBACK_QUERY: Final = _IMPORT_QUERY - {"from_env", "baseline_only"}
+# An acknowledgment's (K.3): the number the host typed, once.
+_ACKNOWLEDGE_QUERY: Final = frozenset({"plan", "reason", "to"})
 _IF_MATCH: Final = re.compile(r'"([1-9][0-9]{0,9})"')
 _EXPORT_MODES: Final = frozenset({"managed", "declarative"})
 # A generated token (M7 design C.2): this many random bytes, in unpadded base64url.
@@ -723,6 +735,7 @@ class AdminApp:
                 Route("/policy/export", self._policy_export, methods=["GET"]),
                 Route("/policy/import", self._policy_import, methods=["POST"]),
                 Route("/policy/rollback/{revision}", self._policy_rollback, methods=["POST"]),
+                Route("/policy/acknowledge-restore", self._policy_acknowledge, methods=["POST"]),
             ]
         )
 
@@ -1210,8 +1223,8 @@ class AdminApp:
     async def _policy_head(self, request: Request) -> Response:
         """The mode and, in managed mode, the head (N.1): its revision, digest and deployment
         (8 characters each), when, how and by whom it was written, the revision the gateway
-        runs (K.1), and a saved revision that isn't running. No hidden field (Y13). The
-        witness is step 17's."""
+        runs (K.1), what the gateway's restore witness holds (K.3), and a saved revision that
+        isn't running. No hidden field (Y13)."""
         managed = self._managed
         if managed is None:
             return JSONResponse({"mode": self._policy().mode, "revision": None})
@@ -1228,7 +1241,7 @@ class AdminApp:
             "origin": header["origin"],
             "kind": header["kind"],
             "author": dict(header["author"]),
-            "witness": None,
+            "witness": witness_answer(managed.witness()),
             "gateway": managed.gateway(),
             "not_running": managed.not_running,
         }
@@ -1403,12 +1416,56 @@ class AdminApp:
             return _answer(shaped)
         return await self._policy_write(request, query, shaped)
 
-    async def _policy_write(self, request: Request, query: _WriteQuery, shaped: Shaped) -> Response:
+    async def _policy_acknowledge(self, request: Request) -> Response:
+        """``POST /policy/acknowledge-restore`` (K.3): the head's content written again, numbered
+        one above the claim the gateway's witness makes, so the counter passes it; planned with
+        ``plan=1``, else committed with ``to``, the number the host typed (T-4)."""
+        managed = self._managed
+        if managed is None:
+            return _not_managed()
+        query = _write_query(request, _ACKNOWLEDGE_QUERY)
+        if isinstance(query, Response):
+            return query
+        if await request.body():
+            return _reason(400, "an acknowledgment takes no body", "bad_body")
+        found = managed.witness()
+        target = None if found is None else found.target
+        if found is None or target is None:
+            detail = (
+                "the gateway reports no revision of this deployment above the head, and no "
+                "other deployment it hasn't passed"
+            )
+            return _answer(refusal("nothing_to_acknowledge", detail=detail))
+        if target > REVISION_MAX:
+            return _answer(refusal("revision_out_of_range"))
+        if not query.plan and query.to is None:
+            return _reason(400, "to=N names the revision the host typed", "bad_query")
+        if not query.plan and query.to != target:
+            return _answer(refusal("plan_changed"))
+        return await self._policy_write(
+            request,
+            query,
+            acknowledge_shaped(),
+            revision=target,
+            shown={"witness": witness_answer(found)},
+        )
+
+    async def _policy_write(
+        self,
+        request: Request,
+        query: _WriteQuery,
+        shaped: Shaped,
+        *,
+        revision: int | None = None,
+        shown: Mapping[str, Any] | None = None,
+    ) -> Response:
         """A host write over the socket (H.5 step 5, G.6): the plan on ``If-Match``'s base (the
         head without one) answered for ``plan=1``; else, with ``If-Match`` and the plan's
         digest, the plan's confirmations checked and the write committed, then the entries it
         left unused removed when asked (G.8). A commit on a base the head has moved past is the
-        write's to answer: a retry of the write that made the head is ``already_saved``."""
+        write's to answer: a retry of the write that made the head is ``already_saved``.
+        ``revision`` numbers an acknowledged restore past the gateway's claim, jumped from the
+        head (K.3), whose plan also ``shown``, the claim."""
         managed = self._managed
         assert managed is not None  # noqa: S101 - the routes check it
         match = _if_match(request)
@@ -1417,6 +1474,7 @@ class AdminApp:
         if match is None and not query.plan:
             return _answer(refusal("base_required"))
         base = managed.revision if match is None else match
+        jumped_from = None if revision is None else base
         grants = Grants(revive=frozenset(query.revive), env=frozenset(query.env))
         digest = request.headers.get("x-zoeymcp-plan")
         if query.plan or base == managed.revision:
@@ -1430,6 +1488,7 @@ class AdminApp:
                 author=SOCKET_AUTHOR,
                 grants=grants,
                 evidence=shaped.evidence,
+                revision=revision,
             )
             if isinstance(planned, WriteRefused):
                 return _write_refused(planned)
@@ -1437,7 +1496,7 @@ class AdminApp:
                 return JSONResponse(written_answer(planned))
             lockout = lockout_rows(managed.policy, planned.policy, self._rp_ids())
             if query.plan:
-                return JSONResponse(plan_answer(planned, lockout))
+                return JSONResponse(plan_answer(planned, lockout, revision) | dict(shown or {}))
             if digest is None:
                 return _answer(refusal("plan_changed"))
             wider = widenings(planned)
@@ -1462,8 +1521,10 @@ class AdminApp:
             reason=query.reason,
             evidence=shaped.evidence,
             seed_digest=shaped.seed_digest,
+            jumped_from=jumped_from,
             capture=capture,
             logged=shaped.logged,
+            revision=revision,
         )
         if isinstance(written, WriteRefused):
             return _write_refused(written)
@@ -1509,18 +1570,29 @@ class _WriteQuery:
     revive: tuple[str, ...] = ()
     env: tuple[str, ...] = ()
     reason: str | None = None
+    to: int | None = None  # an acknowledgment's (K.3)
 
 
 def _write_query(request: Request, allowed: frozenset[str]) -> _WriteQuery | Response:
-    """The query of an import or a rollback: each flag at most once and ``1``, the grants
-    repeated, the reason 1 to 200 printable characters."""
+    """The query of an import, a rollback or an acknowledgment: each flag at most once and
+    ``1``, the grants repeated, the reason 1 to 200 printable characters, ``to`` a revision
+    number, once."""
     flags: set[str] = set()
     grants: dict[str, list[str]] = {"allow_revive": [], "allow_env": []}
     reason = None
+    to = None
     for key, value in request.query_params.multi_items():
         if key not in allowed:
             return _reason(400, f"{key} isn't a query this route takes", "bad_query")
-        if key in _GRANTS:
+        if key == "to":
+            try:
+                number = _number(value)
+            except _BadNumber:
+                number = None
+            if to is not None or not number:
+                return _reason(400, "to is a revision number, once", "bad_query")
+            to = number
+        elif key in _GRANTS:
             grants[key].append(value)
         elif key == "reason":
             if reason is not None or not (1 <= len(value) <= REASON_MAX and value.isprintable()):
@@ -1542,6 +1614,7 @@ def _write_query(request: Request, allowed: frozenset[str]) -> _WriteQuery | Res
         revive=tuple(grants["allow_revive"]),
         env=tuple(grants["allow_env"]),
         reason=reason,
+        to=to,
     )
 
 

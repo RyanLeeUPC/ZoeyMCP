@@ -27,6 +27,14 @@ housekeeping, as at a start), the head's policy through the gate with this vault
 the head installed when it isn't the one running, and the configured source compared with the
 seed and the head (F.5). It never applies the source (DD-7, Y19).
 
+The vault states its running head beside every view answer, and the gateway's status report
+carries what the gateway has seen of it (the restore witness, K.3): :meth:`ManagedPolicy.witness`
+compares the two (``statusreport.witnessed``); health raises ``policy_behind_witness`` or
+``policy_deployment_changed`` from it, and the vault logs either (critical) when a report first
+shows it. :func:`acknowledge_shaped` is ``zoeymcp policy acknowledge-restore``'s write: the
+head's content, numbered one above the gateway's claim (:func:`jumped`), so the counter passes
+it and the finding clears.
+
 The portal's saves (G.3, G.4, J.4) plan and write here too: :meth:`ManagedPolicy.marked` gives
 the planner the tools the gateway's latest status marks, :attr:`ManagedPolicy.ratchet` the head
 ratchet whose ``approved`` set the review rows' ``prefill`` reads, and :func:`allow_pin` the pin
@@ -44,7 +52,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from string import Formatter
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
@@ -81,8 +89,9 @@ from .app import VaultApp
 from .gatewaykeys import GatewayKeyError
 from .onboarding import NextStep, saved_next
 from .policyseal import Head, Unsealed
-from .policystart import Commands, Ok, Refused, SeedIgnored, Source
+from .policystart import Commands, Ok, Refused, SeedIgnored, Source, before
 from .policystore import HISTORY_PAGE_MAX, KEEP, Committed, PolicyStore, StoreRefused
+from .statusreport import Report, Witnessed, witnessed
 from .store import SecretStore
 
 # The refusals a write itself gives; the planner's and the store's pass through by their own
@@ -130,6 +139,14 @@ def commands(environ: Mapping[str, str], state: str, *, standard: bool) -> Comma
         STANDARD_USER if standard else None,
         state,
     )
+
+
+def acknowledge_command(environ: Mapping[str, str]) -> str:
+    """``acknowledge-restore`` as the host runs it in the vault's service (J11, OPS-10): the
+    compose command and service from the container's environment."""
+    compose = environ.get(COMPOSE_CMD_ENV) or DEFAULT_COMPOSE_CMD
+    service = environ.get(EXEC_SERVICE_ENV) or DEFAULT_SERVICE
+    return f"{compose} exec {service} zoeymcp policy acknowledge-restore"
 
 
 def head_policy(found: Ok) -> Policy:
@@ -470,6 +487,11 @@ class ManagedPolicy:
         self._digests: dict[int, str] = {head.revision: app.view_digest}
         # When the running head was installed, for gateway_view_behind's grace (K.1, M.5).
         self._installed_at = wall()
+        # What the restore witness last showed of the head, once logged (K.3, N.3).
+        self._witness_logged: tuple[int | None, tuple[str, int] | None] = (None, None)
+        # The view answers state the running head; each status report is compared with it.
+        app.state_head(head.deployment, head.revision)
+        app.watch_status(self._witness_seen)
 
     def __repr__(self) -> str:
         return f"ManagedPolicy(revision={self.revision}, not_running={self._not_running})"
@@ -534,6 +556,38 @@ class ManagedPolicy:
         applied = self._digests.get(self.revision) == report.view
         return {"state": "applied" if applied else "pending", "revision": max(found, default=None)}
 
+    def witness(self) -> Witnessed | None:
+        """What the gateway's latest status report says it has seen, against the head (K.3):
+        None before any report."""
+        report = self._app.gateway_status().report
+        if report is None:
+            return None
+        head = self._head()
+        return witnessed(report.witness, head.deployment, head.revision)
+
+    def _witness_seen(self, report: Report) -> None:
+        """A status report kept: ``policy_behind_witness`` and ``policy_deployment_changed``
+        (critical) logged when it first shows either, or shows it at another revision (N.3)."""
+        head = self._head()
+        found = witnessed(report.witness, head.deployment, head.revision)
+        shown = (found.claim if found.behind else None, found.other)
+        if shown == self._witness_logged:
+            return
+        self._witness_logged = shown
+        if found.behind:
+            logs.event(
+                "policy_behind_witness", level="critical", head=head.revision, witness=found.claim
+            )
+        if found.other is not None:
+            other, revision = found.other
+            logs.event(
+                "policy_deployment_changed",
+                level="critical",
+                deployment=head.deployment[:8],
+                other=other[:8],
+                revision=revision,
+            )
+
     @property
     def view_digests(self) -> Mapping[int, str]:
         """Each revision this process installed, newest :data:`~.policystore.KEEP`, and the
@@ -543,7 +597,6 @@ class ManagedPolicy:
     def state(self) -> health.PolicyState:
         """Health's ``policy`` section's input (M.5)."""
         head = self._head()
-        kept = set(self._store.kept)
         report = self._app.gateway_status().report
         started = None if report is None else report.started
 
@@ -555,6 +608,7 @@ class ManagedPolicy:
 
         # The gateway still on another view than the head's, past the grace (K.1, FM-18).
         gateway = self.gateway()
+        found = self.witness() or Witnessed()
         behind = (
             gateway["state"] == "pending"
             and self._not_running is None
@@ -569,10 +623,13 @@ class ManagedPolicy:
             restart_needed=tuple(
                 (effect.path, effect.text) for effect in self._effects if waiting(effect)
             ),
-            unreadable=tuple(n for n in range(head.oldest, head.revision) if n not in kept),
+            unreadable=self._store.unreadable(),
             quarantine=self._store.quarantined(),
             gateway_behind=behind,
             gateway_revision=gateway["revision"] if behind else None,
+            witness_behind=found.claim if found.behind else None,
+            witness_other=None if found.other is None else found.other[1],
+            acknowledge=acknowledge_command(self._environ),
         )
 
     # --- the write (G.6) ---------------------------------------------------------------------
@@ -593,6 +650,7 @@ class ManagedPolicy:
         jumped_from: int | None = None,
         capture: Callable[[WritePlan], Any] | None = None,
         logged: Mapping[str, Any] | None = None,
+        revision: int | None = None,
     ) -> Written | WriteRefused:
         """One write, planned on revision ``base``: ``candidate_of`` builds the candidate from a
         policy (the head's, or for a retry its parent's; G.6 step 3), ``author`` is the header's
@@ -603,8 +661,10 @@ class ManagedPolicy:
         plan inside the section, before the commit, from the policy still running (a host
         write's revocation material, G.8, CR-5); what it returns is the answer's ``captured``.
         ``logged`` adds fields to the write's log line (an import's ``from_env``, N.3).
-        Synchronous, with no await: nothing else on the event loop runs until it returns.
-        ``candidate_of``'s own errors (``ValueError``) pass through, with nothing written."""
+        ``revision`` numbers an acknowledged restore's revision past the gateway's claim (K.3,
+        :func:`jumped`), the head in ``jumped_from``. Synchronous, with no await: nothing else
+        on the event loop runs until it returns. ``candidate_of``'s own errors (``ValueError``)
+        pass through, with nothing written."""
         with self._lock:
             return self._write(
                 kind,
@@ -620,6 +680,7 @@ class ManagedPolicy:
                 jumped_from=jumped_from,
                 capture=capture,
                 logged=logged or {},
+                revision=revision,
             )
 
     def plan(
@@ -632,12 +693,14 @@ class ManagedPolicy:
         author: Mapping[str, str] | None = None,
         grants: Grants | None = None,
         evidence: Evidence | None = None,
+        revision: int | None = None,
     ) -> WritePlan | WriteRefused | Written:
         """What :meth:`write` would commit, and nothing written (the socket's ``?plan=1``, H.5):
         G.6 steps 1 to 5, a write on another head ``policy_moved``, unless it is the write by
         ``author`` that made the head, whose answer was lost: that is ``already_saved``, as
         :meth:`write` answers it (MISS-9, FM-16; the CLI plans before it commits, so its rerun
-        meets it here). Synchronous."""
+        meets it here). ``revision`` is an acknowledged restore's number (:func:`jumped`).
+        Synchronous."""
         with self._lock:
             head = self._head()
             if (
@@ -653,6 +716,8 @@ class ManagedPolicy:
             planned = self._planned(kind, surface, candidate_of, grants or Grants(), evidence)
             if isinstance(planned, WriteRefused):
                 return planned
+            if revision is not None:
+                planned = jumped(planned, revision)
             return lowered(self._app.gateway_keys.state, planned) or planned
 
     def _write(
@@ -671,6 +736,7 @@ class ManagedPolicy:
         jumped_from: int | None,
         capture: Callable[[WritePlan], Any] | None,
         logged: Mapping[str, Any],
+        revision: int | None,
     ) -> Written | WriteRefused:
         head = self._head()
         # Step 2: a retry whose answer was lost (step 1 refuses it too while not running).
@@ -689,6 +755,8 @@ class ManagedPolicy:
         planned = self._planned(kind, surface, candidate_of, grants, evidence)
         if isinstance(planned, WriteRefused):
             return planned
+        if revision is not None:
+            planned = jumped(planned, revision)
         if isinstance(expected, WritePlan) and expected != planned:
             return WriteRefused("changed", "the plan changed", plan=planned)
         if isinstance(expected, str) and expected != plan_digest(planned):
@@ -709,6 +777,7 @@ class ManagedPolicy:
                 target=target,
                 jumped_from=jumped_from,
                 seed_digest=seed_digest,
+                revision=revision,
             )
         except StoreRefused as exc:
             return WriteRefused(exc.reason, exc.detail)
@@ -867,6 +936,7 @@ class ManagedPolicy:
         self._not_running = None
         self._running = head_digest
         self._running_header = self._store.header
+        self._app.state_head(self._head().deployment, revision)
         self._installed_at = self._wall()
         self._digests[revision] = self._app.view_digest
         for number in sorted(self._digests)[:-KEEP]:
@@ -978,7 +1048,7 @@ def diff_answer(
         return read
     entry, new = read
     if against is None and entry.header["parent"] is not None:
-        against = number - 1
+        against = before(entry)
     if against is None:
         old = Policy.model_validate({"version": 1, "mode": "managed"})
     else:
@@ -1027,14 +1097,17 @@ def policy_status(managed: ManagedPolicy) -> dict[str, Any]:
     }
 
 
-def plan_answer(planned: WritePlan, lockout: Iterable[Lockout]) -> dict[str, Any]:
+def plan_answer(
+    planned: WritePlan, lockout: Iterable[Lockout], revision: int | None = None
+) -> dict[str, Any]:
     """A host write's plan (H.5 step 5): its rows in G.7's order, widenings first, its
     effects, whether it widens (``import_widens``, Q41), its lockout rows (I.1), the store
-    entries it leaves unused (G.8) and the digest the commit names in ``X-ZoeyMCP-Plan``."""
+    entries it leaves unused (G.8) and the digest the commit names in ``X-ZoeyMCP-Plan``.
+    ``revision`` is an acknowledged restore's number, else the head's next."""
     return {
         "kind": planned.kind,
         "base": planned.base,
-        "revision": planned.base + 1,
+        "revision": planned.base + 1 if revision is None else revision,
         "rows": [list(row) for row in planned.rows],
         "effects": [
             {"kind": effect.kind, "path": effect.path, "text": effect.text}
@@ -1115,6 +1188,39 @@ def rollback_shaped(store: PolicyStore, number: int) -> Shaped | Refusal:
         return carry_forward(policy, target, host=True)
 
     return Shaped("policy.rollback", candidate_of, Evidence(target=target, target_revision=number))
+
+
+def acknowledge_shaped() -> Shaped:
+    """``acknowledge-restore``'s write (K.3): the head's content again, ``policy.acknowledge``,
+    which the planner writes with no change (G.5 rule 6); its number is :func:`jumped`'s."""
+    return Shaped("policy.acknowledge", _same)
+
+
+def jumped(planned: WritePlan, revision: int) -> WritePlan:
+    """``planned`` numbered ``revision``, an acknowledged restore's jump past the gateway's claim
+    (K.3, Y4): its first row says so, so the plan's digest names the number too."""
+    said = f"{revision}, from {planned.base}"
+    if revision == planned.base + 2:
+        said += f", past {planned.base + 1}, which is never written"
+    elif revision > planned.base + 2:
+        said += f", past {planned.base + 1}-{revision - 1}, which are never written"
+    return replace(planned, rows=(("Revision", said), *planned.rows[1:]))
+
+
+def witness_answer(found: Witnessed | None) -> dict[str, Any] | None:
+    """``GET /policy``'s ``witness`` (N.1, K.3): the revision of this deployment the gateway has
+    seen, whether the head is behind it, another deployment's claim that raises
+    ``policy_deployment_changed`` (8 characters and its revision), and the revision an
+    acknowledgment would write; None before any status report."""
+    if found is None:
+        return None
+    other = found.other
+    return {
+        "revision": found.claim,
+        "behind": found.behind,
+        "other": None if other is None else {"deployment8": other[0][:8], "revision": other[1]},
+        "target": found.target,
+    }
 
 
 def _same(policy: Policy) -> Policy:

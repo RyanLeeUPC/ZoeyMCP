@@ -32,6 +32,10 @@ from zoeymcp.vault import logs
 from zoeymcp.vault.admin import AdminApp, SetupCodes
 from zoeymcp.vault.managed import Lockout, WriteRefused, Written, lockout_rows
 from zoeymcp.vault.onboarding import NextStep, saved_next
+from zoeymcp.vault.policyseal import REVISION_MAX
+from zoeymcp.vault.policystart import Ok
+from zoeymcp.vault.policystore import PolicyStore
+from zoeymcp.vault.statusreport import Report
 
 from .test_managed import Rig, edited, import_, managed_text, start
 
@@ -998,3 +1002,164 @@ async def test_a_revision_that_no_longer_verifies_is_a_gap(tmp_path: Path) -> No
 def generation_of(value: int) -> Callable[[Policy], Policy]:
     """A candidate builder: the egress key generation raised to ``value``."""
     return edited(lambda data: data.update(egress_key_generation=value))
+
+
+# --- acknowledging a restore (K.3, J11, T-4) ------------------------------------------------------
+
+OTHER_DEPLOYMENT = "fedcba9876543210" * 2
+
+
+def witness_of(rig: PolicyRig, witness: dict[str, int]) -> None:
+    """The gateway's status report as the vault keeps it, its witness ``witness``."""
+    rig.vault.app.keep_status(
+        Report(view="sha256:" + "0" * 64, started=1, servers={}, witness=witness)
+    )
+
+
+def deployment_of(rig: PolicyRig) -> str:
+    head = rig.vault.store.head
+    assert head is not None
+    return head.deployment
+
+
+async def test_the_head_names_the_witness(tmp_path: Path) -> None:
+    """N.1: ``GET /policy``'s ``witness`` is null before any status report, then what the
+    gateway has seen of this deployment, whether the head is behind it, another deployment's
+    claim, and the acknowledgment's number."""
+    rig = PolicyRig(tmp_path)
+    assert (await rig.call("GET", "/policy")).json()["witness"] is None
+    witness_of(rig, {OTHER_DEPLOYMENT: 31, deployment_of(rig): 4})
+    assert (await rig.call("GET", "/policy")).json()["witness"] == {
+        "revision": 4,
+        "behind": True,
+        "other": {"deployment8": OTHER_DEPLOYMENT[:8], "revision": 31},
+        "target": 32,
+    }
+    await rig.aclose()
+
+
+async def test_an_acknowledgment_planned_then_committed(
+    tmp_path: Path, log_buffer: io.StringIO
+) -> None:
+    """K.3: the plan names the revision one above the gateway's claim and the claim; the commit
+    takes the number the host typed (``to``), the base and the plan's digest, and writes the
+    head's content there, ``jumped_from`` the head; then there is nothing to acknowledge."""
+    rig = PolicyRig(tmp_path)
+    nothing = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert (nothing.status_code, nothing.json()["reason"]) == (409, "nothing_to_acknowledge")
+    assert nothing.json()["error"] == (
+        "There is nothing to record: the gateway reports no revision of this deployment above "
+        "the head, and no other deployment it hasn't passed."
+    )
+    witness_of(rig, {deployment_of(rig): 1})
+    still = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert still.json()["reason"] == "nothing_to_acknowledge"
+    witness_of(rig, {deployment_of(rig): 31})
+    planned = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert planned.status_code == 200, planned.text
+    plan = planned.json()
+    assert (plan["kind"], plan["base"], plan["revision"]) == ("policy.acknowledge", 1, 32)
+    assert plan["rows"][0] == ["Revision", "32, from 1, past 2-31, which are never written"]
+    assert plan["witness"] == {"revision": 31, "behind": True, "other": None, "target": 32}
+    assert (plan["widens"], plan["lockout"]) == (False, [])
+    headers = {"if-match": '"1"', "x-zoeymcp-plan": plan["digest"]}
+    untyped = await rig.call("POST", "/policy/acknowledge-restore", headers=headers)
+    assert (untyped.status_code, untyped.json()["reason"]) == (400, "bad_query")
+    other = await rig.call(
+        "POST", "/policy/acknowledge-restore", headers=headers, params=[("to", "40")]
+    )
+    assert (other.status_code, other.json()["reason"]) == (409, "plan_changed")
+    unbased = await rig.call(
+        "POST",
+        "/policy/acknowledge-restore",
+        headers={"x-zoeymcp-plan": plan["digest"]},
+        params=[("to", "32")],
+    )
+    assert (unbased.status_code, unbased.json()["reason"]) == (428, "base_required")
+    done = await rig.call(
+        "POST", "/policy/acknowledge-restore", headers=headers, params=[("to", "32")]
+    )
+    assert done.status_code == 200, done.text
+    assert (done.json()["revision"], done.json()["already_saved"]) == (32, False)
+    store = rig.vault.store
+    assert store.header is not None
+    assert (store.header["origin"], store.header["jumped_from"]) == ("acknowledge", 1)
+    head = (await rig.call("GET", "/policy")).json()
+    assert (head["revision"], head["kind"]) == (32, "policy.acknowledge")
+    assert head["witness"] == {"revision": 31, "behind": False, "other": None, "target": None}
+    history = (await rig.call("GET", "/policy/revisions")).json()["revisions"]
+    assert [entry["revision"] for entry in history] == [32, 1]
+    gone = await rig.call("GET", "/policy/revisions/5")
+    assert (gone.status_code, gone.json()["reason"]) == (409, "revision_unknown")
+    [line] = events(log_buffer, "policy_acknowledged")
+    assert (line["revision"], line["base"], line["jumped_from"], line["author"]) == (
+        32,
+        1,
+        1,
+        "host",
+    )
+    again = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert again.json()["reason"] == "nothing_to_acknowledge"
+    await rig.aclose()
+
+
+async def test_a_claim_at_the_maximum_is_out_of_range(tmp_path: Path) -> None:
+    """T-4: the claim the status reader admits goes up to 9,999,999,999; its acknowledgment
+    would be one above, which no revision can be, and no claim makes the next start fail."""
+    rig = PolicyRig(tmp_path)
+    witness_of(rig, {deployment_of(rig): REVISION_MAX})
+    refused = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert (refused.status_code, refused.json()["reason"]) == (400, "revision_out_of_range")
+    witness_of(rig, {deployment_of(rig): REVISION_MAX - 1})
+    planned, done = await rig.write("/policy/acknowledge-restore", base=1)
+    assert planned.status_code == 200, planned.text
+    assert done is not None
+    assert (done.status_code, done.json()["reason"]) == (400, "bad_query")  # no to=N
+    headers = {"if-match": '"1"', "x-zoeymcp-plan": planned.json()["digest"]}
+    done = await rig.call(
+        "POST", "/policy/acknowledge-restore", headers=headers, params=[("to", str(REVISION_MAX))]
+    )
+    assert done.status_code == 200, done.text
+    keys = rig.vault.runtime.keys
+    reopened = PolicyStore.open(rig.vault.state, keys, None)
+    assert isinstance(reopened.verdict, Ok)
+    assert reopened.verdict.revision == REVISION_MAX
+    await rig.aclose()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        [("to", "x")],
+        [("to", "0")],
+        [("to", "1"), ("to", "2")],
+        [("from_env", "1")],
+        [("allow_revive", "client:a")],
+    ],
+    ids=["not-a-number", "zero", "twice", "from-env", "a-grant"],
+)
+async def test_what_an_acknowledgment_query_refuses(
+    tmp_path: Path, query: list[tuple[str, str]]
+) -> None:
+    rig = PolicyRig(tmp_path)
+    witness_of(rig, {deployment_of(rig): 5})
+    answer = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1"), *query])
+    assert (answer.status_code, answer.json()["reason"]) == (400, "bad_query")
+    body = await rig.call(
+        "POST", "/policy/acknowledge-restore", content=b"x", params=[("plan", "1")]
+    )
+    assert (body.status_code, body.json()["reason"]) == (400, "bad_body")
+    await rig.aclose()
+
+
+async def test_a_declarative_vault_has_nothing_to_acknowledge(tmp_path: Path) -> None:
+    rig = PolicyRig(tmp_path)
+    rig.admin = AdminApp(
+        rig.vault.runtime.store,
+        rig.vault.runtime.keys,
+        lambda: Policy.model_validate({"version": 1, "mode": "declarative"}),
+        SetupCodes(rig.vault.state, rig.vault.runtime.keys.portal_key),
+    )
+    answer = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert (answer.status_code, answer.json()["reason"]) == (409, "policy_not_managed")
+    await rig.aclose()

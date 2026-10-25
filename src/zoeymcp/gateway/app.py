@@ -60,7 +60,7 @@ from .committed import Committed
 from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier
-from .policyclient import PolicyClient, Snapshot
+from .policyclient import PolicyClient, Snapshot, Witness
 from .reporter import Reporter
 from .reviewpoll import ReviewPoller
 from .statuspush import Status, StatusPusher
@@ -253,8 +253,9 @@ class GatewayApp:
     the ledger's reporter (with ``report_http``), the review poller (with ``review_http``, M7
     design F.3), the status pusher (with ``status_http`` and ``status``, which reads the app's
     status: ``server.pushed_status``; M6 design K.1) and, once the first view has arrived, the
-    SDK's session manager. At shutdown it closes every client it holds on the vault link
-    (D-166)."""
+    SDK's session manager. With ``witness``, the policy client hands it the head each view
+    answer states (the restore witness, M6 design K.3). At shutdown it closes every client it
+    holds on the vault link (D-166)."""
 
     def __init__(
         self,
@@ -269,6 +270,7 @@ class GatewayApp:
         review_http: httpx2.AsyncClient | None = None,
         status_http: httpx2.AsyncClient | None = None,
         status: Status | None = None,
+        witness: Witness | None = None,
     ) -> None:
         self.pool = pool
         self.policy_http = policy_http
@@ -288,7 +290,9 @@ class GatewayApp:
         self.notifier = notifier if notifier is not None else Notifier()
         self.clock = clock
         options = {"wait": policy_wait} if policy_wait is not None else {}
-        self.policy = PolicyClient(policy_http, self._on_view, clock=clock, **options)
+        self.policy = PolicyClient(
+            policy_http, self._on_view, clock=clock, witness=witness, **options
+        )
         # Made in the lifespan: an anyio event needs the loop it will be used on.
         self.first_view: anyio.Event | None = None
         self.stopping: anyio.Event | None = None
