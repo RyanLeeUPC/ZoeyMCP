@@ -765,9 +765,14 @@ def test_restored_volume_is_flagged(tmp_path: Path, ca: ProviderCA, over_socket:
             wait_for(flagged, "policy_behind_witness", gateway, running)
             [line] = events(made.output()[before:], "policy_behind_witness")
             assert (line["level"], line["head"], line["witness"]) == ("critical", 1, 3)
-            regressed = events(gateway.output(), "policy_revision_regressed")
-            assert [(r["seen"], r["now"]) for r in regressed] == [(3, 1)]
-            assert regressed[0]["deployment"] == deployment[:8]
+
+            def regressions() -> list[tuple[int, int]]:
+                found = events(gateway.output(), "policy_revision_regressed")
+                assert {r["deployment"] for r in found} <= {deployment[:8]}
+                return [(r["seen"], r["now"]) for r in found]
+
+            # The status push that raised the finding can come before the gateway's next fetch.
+            wait_for(lambda: regressions() == [(3, 1)], "the regression to 1", gateway, running)
             assert seen_by(gateway_state) == {deployment: 3}
             # The restored head pins add as it was: drifted again, until it is reviewed again.
             assert login(page, passkey).status_code == 200
@@ -781,8 +786,9 @@ def test_restored_volume_is_flagged(tmp_path: Path, ca: ProviderCA, over_socket:
             codes = shown(page)[0]
             assert "drift_marked" not in codes
             assert "policy_behind_witness" in codes  # 2 is still behind the witness's 3
-            regressed = events(gateway.output(), "policy_revision_regressed")
-            assert [(r["seen"], r["now"]) for r in regressed] == [(3, 1), (3, 2)]
+            wait_for(
+                lambda: regressions() == [(3, 1), (3, 2)], "the regression to 2", gateway, running
+            )
             if over_socket:
                 code, _, err = made.cli(["policy", "acknowledge-restore"], "4\n")
                 assert code == 0, err
