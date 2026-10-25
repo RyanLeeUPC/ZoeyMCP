@@ -731,7 +731,8 @@ def test_restored_volume_is_flagged(tmp_path: Path, ca: ProviderCA, over_socket:
     gateway_state = tmp_path / "gateway-state"
     port = free_port()
     passkey = SoftAuthenticator()
-    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser() as browser:
+    # A review queued in the vault's first 45 s waits for the gateway's first poll (OPS-20).
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser(timeout=60.0) as browser:
         made.policy = notes_policy(made.portal, upstream, pins)
         page = browser.page(f"http://localhost:{made.portal}")
         running = made.start()
