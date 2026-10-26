@@ -701,7 +701,7 @@ class Tools(_Model):
 
 
 # A server's prompts and resources (M6 design L.1), each kind as its tools are: included, pinned
-# by review, or declined. check refuses enabling either kind until the gateway serves them (L.11).
+# by review, or declined. Each is served only once the server enables it.
 PromptName = ToolName  # the same pattern and length
 
 
@@ -769,7 +769,7 @@ class _UpstreamServer(_Model):
     on_drift: Literal["hide", "fail"] = "hide"
     shared_session: bool = False  # legacy upstreams only
     wrap_results: bool = False
-    enable: list[Capability] = []  # check refuses a non-empty list: tools only for now
+    enable: list[Capability] = []  # prompts, resources, completions; check refuses the rest
     prompts: PromptsPolicy = PromptsPolicy()
     resources: ResourcesPolicy = ResourcesPolicy()
     # An assertion about the protocol era the upstream speaks, not a transport mode.

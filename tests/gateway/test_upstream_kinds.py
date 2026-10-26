@@ -4,8 +4,7 @@ through a real vault: every enabled kind listed after the tools, each walk faili
 listed, the review's walk listing the upstream's whole list under the caps (OPS-11), drift marks
 by kind, and ``on_drift: fail`` blocking the whole server for any kind (Q20 (a)).
 
-Built dark (L.11): ``check`` still refuses ``enable`` of these kinds, so each test builds the
-server's view directly.
+Each test builds the server's view directly, with no ``check`` and no review first.
 """
 
 from __future__ import annotations
@@ -85,7 +84,7 @@ def with_kinds(
     fixed: dict[str, Any] | None = None,
     on_drift: str | None = None,
 ) -> ViewRemoteServer:
-    """``server`` enabling prompts and resources, with these blocks (built dark: no ``check``)."""
+    """``server`` enabling prompts and resources, with these blocks (no ``check``)."""
     data = server.model_dump()
     data.update(
         enable=["prompts", "resources"] if enable is None else enable,

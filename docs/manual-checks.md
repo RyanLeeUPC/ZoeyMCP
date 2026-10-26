@@ -450,6 +450,39 @@ view.
       which it writes as "Acknowledged the restore as revision N + 1."), start the vault: once the
       gateway reports again the banner is gone, and **Policy**'s history shows N + 1 straight after
       2.
+24. **Prompts and resources on the review screen, under Trusted Types** (the review screen's kind
+    rows, M6). Item 16's setup, the fake started as `python -m tests.fakes.run_mcp_server CERT KEY
+    --prompts --resources --switch inject_kinds`, so it lists two prompts (`brainstorm`,
+    `summarize_note`), a resource template (`notes://notes/{id}`) and a fixed resource
+    (`notes://index`), and one more of each kind carrying item 16's hostile text
+    (`hostile_prompt`, `notes://hostile/{id}`, `notes://hostile`). Add `enable: [prompts,
+    resources, completions]` to the server (operations.md §12), commit it and reload. In Chrome or
+    Edge with the Console open (no Trusted Types or Content Security Policy violation throughout),
+    choose **Review again** on the server's row. Pass:
+    - after the tools, the rows sit under the headings **Prompts**, **Resource templates** and
+      **Resources**, each row with its include box, **Show definition** and **Decline**, and no
+      allow or approve control; the counts and the footer's "N tools changed" count tools only;
+    - the three hostile rows show every hidden character as the visible mark the vault gives it
+      and `<IMPORTANT>` as text, in the title, the description and an argument's title and
+      description (the prompt), the description (the template), and the title and description
+      (the fixed resource), and can't be included (an error finding); **Show definition** shows each definition whole,
+      every character outside ASCII as an escape;
+    - tick `brainstorm`, `summarize_note`, `notes://notes/{id}` and `notes://index`, **Generate**:
+      fragment 2's title names the `prompts:` and `resources:` blocks, its comments read `# added:
+      brainstorm (prompt)` and so on, and `# can't be included, error finding: hostile_prompt
+      (prompt; ...)` for each hostile entry; commit it and reload, and `zoeymcp review notes`
+      shows the four `ok`;
+    - restarted with `--change-kind prompt --change-kind resource_template` added, **Review
+      again**: `brainstorm` and `notes://notes/{id}` read `drift`, with **Reviewed** and **Now**
+      side by side and the vault's diff under them, every string shown as text; **Accept the new
+      definition** on both and **Generate**: the new pins under each block's `review:`, each with
+      a `# changed:` line; **Clear** unticks every kind's box as it does the tools';
+    - in managed mode (item 20's vault, `enable` added by a host export, edit and import as
+      operations.md §12 says), the same review and **Save**: the dialog's rows name
+      `gateway.servers.notes.prompts.include` and each kind's `review` pin, an accepted re-pin
+      showing both pins and "re-pinned: you read both definitions"; confirmed with a passkey, the
+      vault's log has `step_up_confirmed` with `policy.save`, and an agent on `/s/notes/mcp` lists
+      the included prompts.
 
 ## D-66: the live OAuth test against a real provider
 

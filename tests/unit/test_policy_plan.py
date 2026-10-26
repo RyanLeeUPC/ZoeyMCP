@@ -1049,6 +1049,157 @@ def test_a_retired_pins_name_may_hold_a_slash(monkeypatch: pytest.MonkeyPatch) -
     )
 
 
+# Another entry of each kind: a name a block may hold beside KIND_NAMES's.
+KIND_OTHERS: Final = {
+    "prompt": "draft",
+    "resource_template": "notes://drafts/{id}",
+    "resource": "notes://drafts",
+}
+ENABLED = setting("gateway", "servers", "notes", "enable", value=["prompts", "resources"])
+
+
+@pytest.mark.parametrize("kind", list(KIND_BLOCKS))
+def test_a_retired_pin_of_every_kind_is_refused_on_rollback_and_import(kind: str) -> None:
+    """E2 for a prompt, a template and a fixed resource (step 21b, H.4, H.5): the head no
+    longer pins the entry, the ratchet retired its old pin, and a rollback or an import that
+    includes it at that pin again is ``pin_retired`` from the portal and the socket alike,
+    unless the host grants it."""
+    name = KIND_NAMES[kind]
+    subject = f"pin:notes/{kind}/{name}"
+    retired = PlanRefused("pin_retired", f"notes's {kind} {name}", (subject,))
+    head = make(ENABLED)
+    target = make(ENABLED, kind_block(kind, include=[name], review={name: PIN_OLD}))
+    ratchet = replace(initial(head), retired_pins={("notes", kind, name): frozenset({PIN_OLD})})
+    on_head: dict[str, Any] = {"head": head, "ratchet": ratchet}
+    candidate = carry_forward(head, target)
+    assert refused(candidate, kind="policy.rollback", target=target, **on_head) == retired
+    host = carry_forward(head, target, host=True)
+    socket: dict[str, Any] = {"surface": "socket", **on_head}
+    assert refused(host, kind="policy.rollback", target=target, **socket) == retired
+    assert refused(target, kind="policy.import", **socket) == retired
+    granted = Grants(revive=frozenset({subject}))
+    found = ok(target, kind="policy.import", grants=granted, **socket)
+    assert ("Granted by the host", f"pin_retired: {subject}") in found.rows
+    # Another kind's pin of the same name, or one never retired, is no violation.
+    other = replace(initial(head), retired_pins={("notes", "tool", name): frozenset({PIN_OLD})})
+    assert ok(target, kind="policy.import", surface="socket", head=head, ratchet=other)
+
+
+@pytest.mark.parametrize("kind", list(KIND_BLOCKS))
+def test_the_carry_forward_of_every_kind(kind: str) -> None:
+    """H.4 for a prompt, a template and a fixed resource: the head's pin of an entry it pins
+    replaces the target's, an entry only the target pins keeps its own, and the block's
+    ``declined`` is both less what the target includes, where the target enables the kind."""
+    name, other = KIND_NAMES[kind], KIND_OTHERS[kind]
+    head = make(
+        ENABLED, kind_block(kind, include=[name], review={name: PIN_NEW}, declined={other: PIN_OLD})
+    )
+    target = make(ENABLED, kind_block(kind, include=[name], review={name: PIN_OLD}))
+    blocks = KIND_BLOCKS[kind]
+
+    def block(policy: Policy) -> Any:
+        assert policy.gateway is not None
+        here: Any = policy.gateway.servers["notes"]
+        for key in blocks:
+            here = getattr(here, key)
+        return here
+
+    for host in (False, True):
+        carried = block(carry_forward(head, target, host=host))
+        assert (carried.review, carried.declined) == ({name: PIN_NEW}, {other: PIN_OLD})
+    including = make(
+        ENABLED, kind_block(kind, include=[name, other], review={name: PIN_OLD, other: PIN_LIST})
+    )
+    carried = block(carry_forward(head, including))
+    assert (carried.include, carried.declined) == ([name, other], {})
+    assert carried.review == {name: PIN_NEW, other: PIN_LIST}
+    # The target's own declines stay, beside the head's.
+    declining = make(ENABLED, kind_block(kind, declined={name: PIN_LIST}))
+    assert block(carry_forward(head, declining)).declined == {name: PIN_LIST, other: PIN_OLD}
+    # A target that doesn't enable the kind holds none of it (check row 5).
+    assert block(carry_forward(head, HEAD)) == block(HEAD)
+    assert carry_forward(head, HEAD) == carry_forward(HEAD, HEAD)
+
+
+def test_the_carry_forward_onto_a_toolkit_of_the_heads_remote_servers_name() -> None:
+    """A target whose server of the head's name is a toolkit takes nothing of the remote one's
+    prompts or resources (a toolkit has none)."""
+    head = make(ENABLED, kind_block("prompt", include=["brief"], review={"brief": PIN_NEW}))
+    kit = {
+        "kind": "toolkit",
+        "module": "kits.notes",
+        "tools": {"include": ["send"], "approve": ["send"]},
+        "review": {"send": PIN_OLD},
+    }
+    target = make(setting("gateway", "servers", "notes", value=kit))
+    found = carry_forward(head, target)
+    assert found.gateway is not None
+    assert target.gateway is not None
+    assert found.gateway.servers["notes"] == target.gateway.servers["notes"]
+
+
+def declined_at(kind: str, name: str) -> str:
+    """The path of a decline of ``name`` in the block of ``kind`` on notes."""
+    return ".".join(("gateway", "servers", "notes", *KIND_BLOCKS[kind], "declined", name))
+
+
+@pytest.mark.parametrize("kind", list(KIND_BLOCKS))
+def test_a_kinds_decline_taken_back_says_so(kind: str) -> None:
+    """H.4's row for every kind: an entry the head declined that a rollback includes again is
+    "declined in revision N, included again", wider, so the portal's rollback is refused and
+    the host's shows it; a decline dropped for an entry left out of a kind still enabled is a
+    plain weakening."""
+    from zoeymcp.vault.managed import widenings
+
+    name, other = KIND_NAMES[kind], KIND_OTHERS[kind]
+    head = make(ENABLED, kind_block(kind, declined={name: PIN_NEW, other: PIN_OLD}))
+    target = make(ENABLED, kind_block(kind, include=[name], review={name: PIN_NEW}))
+    on_head: dict[str, Any] = {"head": head, "ratchet": initial(head), "target": target}
+    host = carry_forward(head, target, host=True)
+    found = ok(host, kind="policy.rollback", surface="socket", **on_head)
+    again = (declined_at(kind, name), f"{name}: declined in revision 17, included again")
+    assert again in found.rows
+    assert declined_at(kind, name) in widenings(found)
+    portal = refused(carry_forward(head, target), kind="policy.rollback", **on_head)
+    assert portal.reason == "portal_widens"
+    assert declined_at(kind, name) in portal.subjects
+    dropped = ok(make(ENABLED), kind="policy.import", surface="socket", head=head)
+    assert (declined_at(kind, other), "removed (wider)") in dropped.rows
+    assert (declined_at(kind, name), "removed (wider)") in dropped.rows
+
+
+@pytest.mark.parametrize("kind", list(KIND_BLOCKS))
+def test_a_rollback_to_before_a_kinds_enable_narrows(kind: str) -> None:
+    """A decline of a kind the candidate doesn't enable widens nothing, since nothing of the
+    kind is served: the portal may roll back past an ``enable``, the head's declines dropped as
+    check row 5 requires, and an import that turns the kind off has no widening row; with the
+    kind still enabled, the same decline dropped is wider."""
+    from zoeymcp.vault.managed import widenings
+
+    name, other = KIND_NAMES[kind], KIND_OTHERS[kind]
+    head = make(
+        ENABLED, kind_block(kind, include=[name], review={name: PIN_NEW}, declined={other: PIN_OLD})
+    )
+    on_head: dict[str, Any] = {"head": head, "ratchet": initial(head)}
+    dropped = (declined_at(kind, other), "removed")
+    found = ok(carry_forward(head, HEAD), kind="policy.rollback", target=HEAD, **on_head)
+    assert dropped in found.rows
+    assert widenings(found) == []
+    imported = ok(HEAD, kind="policy.import", surface="socket", **on_head)
+    assert dropped in imported.rows
+    assert widenings(imported) == []
+    # The other kind left enabled serves nothing of this one.
+    rest = ["resources"] if kind == "prompt" else ["prompts"]
+    target = make(setting("gateway", "servers", "notes", "enable", value=rest))
+    assert (
+        dropped
+        in ok(carry_forward(head, target), kind="policy.rollback", target=target, **on_head).rows
+    )
+    kept = ok(make(ENABLED), kind="policy.import", surface="socket", **on_head)
+    assert (declined_at(kind, other), "removed (wider)") in kept.rows
+    assert widenings(kept) == [declined_at(kind, other)]
+
+
 def test_a_ratchet_past_its_bound_is_ratchet_full() -> None:
     from zoeymcp.common.policy.ratchet import RATCHET_MAX
 

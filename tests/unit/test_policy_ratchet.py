@@ -381,6 +381,83 @@ def test_e2_only_an_included_pin_that_differs_from_the_heads() -> None:
     assert check(make(repin("read", PIN_NEW), repin("write", PIN_NEW)), ratchet, head) == ()
 
 
+# A prompt, a template and a fixed resource of notes (L.1), by kind: its block and its name.
+KIND_BLOCKS = {
+    "prompt": ("prompts",),
+    "resource_template": ("resources", "templates"),
+    "resource": ("resources", "fixed"),
+}
+KIND_NAMES = {
+    "prompt": "brief",
+    "resource_template": "notes://notes/{id}",
+    "resource": "notes://index",
+}
+
+
+def kind_at(kind: str, pin: str | None, *, included: bool = True) -> Edit:
+    """notes enabling prompts and resources, with ``kind``'s entry pinned at ``pin`` (none: no
+    block) and, unless not ``included``, included."""
+
+    def edit(raw: dict[str, Any]) -> None:
+        notes(raw)["enable"] = ["prompts", "resources"]
+        if pin is None:
+            return
+        here = notes(raw)
+        for key in KIND_BLOCKS[kind]:
+            here = here.setdefault(key, {})
+        name = KIND_NAMES[kind]
+        here.update(include=[name] if included else [], review={name: pin})
+
+    return edit
+
+
+@pytest.mark.parametrize("kind", list(KIND_BLOCKS))
+def test_every_kinds_pin_is_retired_and_refused_brought_back(kind: str) -> None:
+    """E2 for a prompt, a template and a fixed resource as for a tool (step 21b): a replaced or
+    removed pin is retired under the definition's kind, and an included one brought back is
+    ``pin_retired``, unless verified or granted; one not included is no violation."""
+    key = ("notes", kind, KIND_NAMES[kind])
+    subject = "pin:" + "/".join(key)
+    old, new = make(kind_at(kind, PIN_READ)), make(kind_at(kind, PIN_NEW))
+    ratchet = advance(initial(old), old, new, verified=NONE)
+    assert ratchet.retired_pins == {key: {PIN_READ}}
+    removed = advance(initial(old), old, make(kind_at(kind, None)), verified=NONE)
+    assert removed.retired_pins == {key: {PIN_READ}}
+    # The tools' pins are where they were: only this kind's moved.
+    assert all(found[1] == kind for found in ratchet.retired_pins)
+    assert check(old, ratchet, new) == (Violation("pin_retired", subject),)
+    assert check(old, removed, make(kind_at(kind, None))) == (Violation("pin_retired", subject),)
+    assert check(old, ratchet, new, verified=frozenset({(key, PIN_READ)})) == ()
+    assert check(old, ratchet, new, grants=Grants(revive=frozenset({subject}))) == ()
+    # The tool of the same name, or another kind, is another definition.
+    other = "pin:notes/tool/" + KIND_NAMES[kind]
+    assert check(old, ratchet, new, grants=Grants(revive=frozenset({other}))) != ()
+    unincluded = make(kind_at(kind, PIN_READ, included=False))
+    assert check(unincluded, ratchet, new) == ()
+    assert check(new, ratchet, new) == ()
+
+
+def test_a_toolkit_has_tool_pins_only() -> None:
+    """A toolkit server holds no prompt or resource (L.1): its tools' pins are retired as a
+    remote server's are."""
+
+    def toolkit(pin: str) -> Edit:
+        def edit(raw: dict[str, Any]) -> None:
+            raw["gateway"]["servers"]["kit"] = {
+                "kind": "toolkit",
+                "module": "kits.notes",
+                "tools": {"include": ["send"], "approve": ["send"]},
+                "review": {"send": pin},
+            }
+
+        return edit
+
+    old, new = make(toolkit(PIN_READ)), make(toolkit(PIN_NEW))
+    found = advance(initial(old), old, new, verified=NONE)
+    assert found.retired_pins == {("kit", "tool", "send"): {PIN_READ}}
+    assert check(old, found, new) == (Violation("pin_retired", "pin:kit/tool/send"),)
+
+
 def test_e3_a_retired_client_brought_back() -> None:
     head = make(no_client)
     ratchet = advance(START, BASE, head, verified=NONE)

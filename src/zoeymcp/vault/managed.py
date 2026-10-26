@@ -71,6 +71,7 @@ from ..common.policy.plan import (
     WriteKind,
     WritePlan,
     carry_forward,
+    direction,
     document,
     normalize,
     normalized_digest,
@@ -322,12 +323,12 @@ def lockout_rows(
 
 def widenings(planned: WritePlan) -> list[str]:
     """A plan's widening rows by path (G.7 row 2, Q41): each move to allow, and each change the
-    direction table calls wider (a new client, caller or origin among them)."""
+    planner's direction calls wider (a new client, caller or origin among them)."""
     moved = [f"{server}.{name}" for server, _, name in planned.moves]
     wider = [
         ".".join(str(part) for part in change.path)
         for change in planned.changes
-        if diff.direction(change) == "wider"
+        if direction(change, planned.policy) == "wider"
     ]
     return moved + [path for path in wider if path not in moved]
 

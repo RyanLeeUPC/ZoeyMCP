@@ -994,7 +994,7 @@ allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
 - **No line**: a tool with an error finding (it can't be pinned), and an included tool that has
   drifted, is missing or no longer pins; it stays as the policy has it (`review <server> --repin
   TOOL` takes a drifted tool's new pin).
-- **Prompts and resources** (not enabled yet, §12): a server that enables them has a `prompt:`
+- **Prompts and resources** (§12): a server that enables them has a `prompt:`
   line per prompt and a `resource:` line per resource template and fixed resource after its
   tools, each with `skip`, `include` or `decline`, its name or URI and its pin, by the rules
   above; they are never classified. Fragment 2 then replaces the server's `prompts:` and
@@ -1402,9 +1402,55 @@ The gateway checks for drift when the server says its list changed, when a sessi
 reconnects, and every `drift_check_interval` (300 s) regardless, since a hostile server won't
 announce its changes. A silent change between two checks is caught at the next one.
 
-**Prompts and resources** (not enabled yet: `check` still refuses `enable` of prompts, resources
-and completions). A server that enables them is listed for them after its tools, and they drift,
-are marked and are logged as tools are, each kind on its own: `prompt_drift`,
+**Prompts and resources.** A remote server may serve its prompts, resource templates and fixed
+resources too, and completions of their arguments, once you turn each kind on with `enable` and
+review it. Nothing is served until an entry is included at its pin, as for tools:
+
+```yaml
+gateway:
+  servers:
+    notes:
+      kind: remote
+      route: notes-mcp
+      enable: [prompts, resources, completions]
+      tools: {include: [get_note], allow: [get_note], approve: []}
+      review: {get_note: "sha256:..."}
+      prompts:
+        include: [summarize]
+        review: {summarize: "sha256:..."}
+        assistant: []          # prompts allowed to return assistant-role messages
+      resources:
+        templates:
+          include: ["notes://notes/{id}"]
+          review: {"notes://notes/{id}": "sha256:..."}
+        fixed:
+          include: ["notes://index"]
+          review: {"notes://index": "sha256:..."}
+```
+
+- **Declarative:** add `enable: [prompts, resources]` (and `completions` if agents should
+  complete their arguments) to the server, commit it and reload. `zoeymcp review notes` then lists
+  the server's prompts, resource templates and fixed resources after its tools, each with its
+  pin (`--show NAME` prints its definition, every hidden character revealed); include them with
+  `--choose` and `--choices` (§11), or on the portal's review screen and **Generate**, and commit
+  fragment 2, which writes the server's `prompts:` and `resources:` blocks whole. To let a prompt
+  speak as the assistant, add its name to `prompts.assistant` yourself.
+- **Managed:** `enable` and `prompts.assistant` are the host's: export the policy, add only the
+  `enable` line to the server, and import it (§34). That serves nothing yet, since nothing of the
+  kind is included; then **Review again** on the server in the portal, tick the entries under
+  **Prompts**, **Resource templates** and **Resources**, and **Save** with your passkey: the save
+  includes them at the pins the review verified. A later export, edit and import lists a prompt
+  in `assistant`.
+
+`check` refuses `sampling` and `roots` (deprecated by MCP 2026-07-28) and `elicitation` in
+`enable`, a block with entries for a kind the server doesn't enable, an included entry with no
+pin, an entry both included and declined, an `assistant` prompt that isn't included, and
+`completions` with nothing to complete (no prompts, and no resource template); it warns of a pin
+for an entry not included, and of any kind on a `shared_session` server. A resource template is
+`scheme://host/path` with `{name}` only as a whole path segment.
+
+A server that enables them is listed for them after its tools, and they drift, are marked and
+are logged as tools are, each kind on its own: `prompt_drift`,
 `resource_template_drift` and `resource_drift` (and `_unreviewed`, `_missing`, `_invalid`,
 `_duplicate`), with `name` (the prompt's name, the template or the URI) where a tool's line has
 `tool`; `drift_marked` and `drift_cleared` carry `definition_kind` and `name` (`names`) for them,

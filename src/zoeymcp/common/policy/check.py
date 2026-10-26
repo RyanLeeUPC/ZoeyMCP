@@ -109,11 +109,8 @@ STOP_WINDOW_CALL_TIMEOUT = 300
 PROMPT_FRAME_CHARS = 200
 PROMPT_REPLY_LINE_CHARS = 264
 PROMPT_CODE_LINE_CHARS = 44
-# Why each capability can't be enabled. Prompts, resources and completions aren't served yet.
-_TOOLS_ONLY = (
-    "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
-    "the gateway serves tools only"
-)
+# Why each capability the gateway never serves can't be enabled (M6 design A.2 rows 4 and 4b);
+# prompts, resources and completions may be, from step 21b (L.11).
 _ENABLE_REFUSED: Mapping[str, str] = {
     "sampling": "sampling is deprecated in MCP 2026-07-28 and the gateway never relays it",
     "roots": "roots is deprecated in MCP 2026-07-28 and the gateway never relays it",
@@ -122,8 +119,7 @@ _ENABLE_REFUSED: Mapping[str, str] = {
         "only questions agents see"
     ),
 }
-# M6 design A.2 rows 5c and 5d. Built dark (L.11): row 4c above still refuses enabling prompts,
-# resources and completions, so these rows and the blocks' own (5, 5b) meet only a refused policy.
+# M6 design A.2 rows 5c and 5d.
 _COMPLETIONS_NEED = (
     "completions complete prompt arguments or resource-template variables: enable prompts, or "
     "resources with a template"
@@ -1455,7 +1451,8 @@ def _check_mcp_route(
 
 def _check_upstream_server(path: str, server: RemoteServer, report: _Report) -> None:
     for capability in server.enable:
-        report.error(f"{path}.enable", _ENABLE_REFUSED.get(capability, _TOOLS_ONLY))
+        if capability in _ENABLE_REFUSED:
+            report.error(f"{path}.enable", _ENABLE_REFUSED[capability])
     if server.shared_session:
         report.warning(
             f"{path}.shared_session",

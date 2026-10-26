@@ -16,7 +16,9 @@ the 401 and its challenge), ``--prm`` with ``--authorization-server`` and ``--sc
 repeatable), ``--as-metadata`` (a JSON file served at the server URL as an issuer when ``--prm``
 is ``none``), ``--switch`` (repeatable) with a switch's name from ``Switch``, and ``--drift``
 with a drift member's name (``DriftMember``), listed changed from the start (the fake's
-``change_tool``), for manual check 19's drift review (M6 design O.5).
+``change_tool``), for manual check 19's drift review (M6 design O.5); ``--prompts`` and
+``--resources`` serve those kinds, and ``--change-kind`` (repeatable) lists a kind's first
+definition changed from the start, for manual check 24.
 """
 
 from __future__ import annotations
@@ -31,6 +33,9 @@ from typing import Any
 import uvicorn
 
 from tests.fakes.mcp_server import DRIFT_MEMBERS, McpFake, Switch
+
+# The kinds --change-kind names (the fake's ListedKind).
+KINDS = ("prompt", "resource_template", "resource")
 
 # Every interface: the smoke's vault reaches it by its service name on a compose network.
 HOST = "0.0.0.0"  # noqa: S104
@@ -50,6 +55,9 @@ def parse(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--as-metadata", type=Path)
     parser.add_argument("--switch", action="append", default=[], choices=[s.value for s in Switch])
     parser.add_argument("--drift", choices=DRIFT_MEMBERS)
+    parser.add_argument("--prompts", action="store_true")
+    parser.add_argument("--resources", action="store_true")
+    parser.add_argument("--change-kind", action="append", default=[], choices=KINDS)
     return parser.parse_args(argv)
 
 
@@ -62,6 +70,9 @@ def fake_for(args: argparse.Namespace) -> McpFake:
         prm=args.prm,
         authorization_servers=list(args.authorization_server),
         scopes=tuple(args.scope),
+        prompts=args.prompts,
+        resources=args.resources,
+        changed_kinds=set(args.change_kind),
     )
     if args.as_metadata is not None:
         document: dict[str, Any] = json.loads(args.as_metadata.read_bytes())

@@ -152,9 +152,10 @@ def test_the_export_is_admitted_as_the_normalized_policy(example_raw: dict[str, 
 
 def test_prompts_and_resources_blocks_are_exported(example_raw: dict[str, Any]) -> None:
     """Step 18: a server's prompts and resources blocks, in the table's order, read back as the
-    same policy. Not admitted: the gate refuses an enabled kind until step 21b (L.11)."""
+    same policy; from step 21b (L.11) the gate admits it, the kinds enabled."""
     raw = raw_policy(example_raw)
     raw["gateway"]["servers"]["broker-read"].update(
+        enable=["prompts", "resources"],
         prompts={
             "include": ["summarize"],
             "review": {"summarize": PIN},
@@ -165,7 +166,9 @@ def test_prompts_and_resources_blocks_are_exported(example_raw: dict[str, Any]) 
     policy = made(raw)
     text = exported(policy)
     assert made(load_mapping(text)) == normalize(policy)
+    assert admitted(text) == normalize(policy)
     lines = [
+        '      enable: ["prompts", "resources"]',
         "      prompts:",
         '        include: ["summarize"]',
         "        review:",

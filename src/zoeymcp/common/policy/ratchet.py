@@ -40,7 +40,7 @@ from . import fields
 from .check import secret_references
 from .schema import OAuth2Credential, PlaceholderCaller, Policy, RemoteServer, ToolkitServer
 
-# A definition by (server, kind, name); kind: tool, and from step 19 prompt or resource (E.1).
+# A definition by (server, kind, name), of any kind a server pins (E.1, L.1).
 DefKey = tuple[str, str, str]
 DEF_KINDS: Final = ("tool", "prompt", "resource_template", "resource")
 # The retired sets and approved together (N.4).
@@ -341,16 +341,35 @@ def _servers(policy: Policy) -> Iterable[tuple[str, RemoteServer | ToolkitServer
 
 
 def _pins(policy: Policy, *, included: bool = False) -> dict[DefKey, str]:
-    """Every definition's pin in the policy's ``review`` maps, or only the included ones'."""
+    """Every definition's pin in the policy's ``review`` maps, of every kind, or only the
+    included ones'."""
     return {
-        (server, "tool", tool): pin
+        (server, kind, name): pin
         for server, entry in _servers(policy)
-        for tool, pin in entry.review.items()
-        if not included or tool in entry.tools.include
+        for kind, review, include in _blocks(entry)
+        for name, pin in review.items()
+        if not included or name in include
     }
 
 
+def _blocks(entry: RemoteServer | ToolkitServer) -> list[tuple[str, Mapping[str, str], list[str]]]:
+    """Each kind's pins and included names on a server: its tools', and a remote server's
+    prompts', resource templates' and fixed resources' (L.1; a toolkit has tools only)."""
+    found: list[tuple[str, Mapping[str, str], list[str]]] = [
+        ("tool", entry.review, entry.tools.include)
+    ]
+    if isinstance(entry, RemoteServer):
+        templates, fixed = entry.resources.templates, entry.resources.fixed
+        found += [
+            ("prompt", entry.prompts.review, entry.prompts.include),
+            ("resource_template", templates.review, templates.include),
+            ("resource", fixed.review, fixed.include),
+        ]
+    return found
+
+
 def _approved(policy: Policy) -> frozenset[DefKey]:
+    """Every tool classified ``approve``: a prompt or a resource is never classified (L.1)."""
     return frozenset(
         (server, "tool", tool) for server, entry in _servers(policy) for tool in entry.tools.approve
     )

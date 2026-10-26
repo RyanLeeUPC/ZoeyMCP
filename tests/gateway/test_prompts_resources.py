@@ -2,9 +2,10 @@
 SPEC-1 to SPEC-6), from an agent's SDK client through a real vault to the fake upstream's
 prompts and resources modes.
 
-Built dark (L.11): ``check`` still refuses ``enable`` of these kinds, so the vault serves a view
-built directly: :func:`kinds` wraps the vault's ``build_view`` and replaces the server's entry
-with one that enables and includes them. The policy the vault routes by is the rig's own.
+The vault serves a view built directly, so a case needs no review first: :func:`changes` wraps
+the vault's ``build_view`` and replaces the server's entry with one that enables and includes
+them. The policy the vault routes by is the rig's own. S18
+(``tests/acceptance/test_prompts_resources_shape.py``) serves them from a checked policy.
 """
 
 from __future__ import annotations

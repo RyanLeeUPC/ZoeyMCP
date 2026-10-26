@@ -10,7 +10,7 @@ suggested** makes no move, Q27), the chips' flags (D-188), a finding's pointer (
 tool's two definitions and the vault's diff, re-pin and decline in fragment 2, and a report made
 before a re-pin is stale (J.2). M6 L.7: a server's prompts and resources as rows by kind under
 their headings, each kind's choices, its refusals, its blocks in fragment 2 (which ``check``
-refuses until step 21b, L.11) and in a managed save, and a report made before either block
+accepts from step 21b, L.11) and in a managed save, and a report made before either block
 changed is stale.
 """
 
@@ -1376,19 +1376,12 @@ def kinds_policy(report: dict[str, Any]) -> Policy:
     return policy.model_copy(update={"gateway": gateway})
 
 
-def test_fragment_2_writes_the_kinds_blocks_and_check_still_refuses_them(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Built dark (L.11): until step 21b ``check`` refuses enable of prompts and resources, so
-    fragment 2 for such a server is ``diff_invalid``; the fragment itself names both blocks."""
+def test_fragment_2_writes_the_kinds_blocks() -> None:
+    """From step 21b (L.11) ``check`` accepts a server that enables prompts and resources, so
+    fragment 2 for it passes the merged check; its title names both blocks."""
     report = kinds_held()
     body = {**TOOL_A, "kinds": {"prompt": {"include": ["fine", "new"]}}}
     policy = kinds_policy(report)
-    found = run_diff(report, body, policy, server=as_listed(report))
-    said = detail(found)
-    assert "gateway.servers.notes.enable: " in said
-    assert "can't be enabled: the gateway serves tools only" in said
-    monkeypatch.setattr(reviewview, "validate", lambda policy, change: [])
     answer = run_diff(report, body, policy, server=as_listed(report))
     assert isinstance(answer, dict)
     text = answer["diff"]["yaml"]

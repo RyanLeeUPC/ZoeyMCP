@@ -2921,10 +2921,6 @@ def test_a_program_needs_no_egress(example_raw: Raw) -> None:
     assert (program.egress, program.egress_private, program.holds_secret) == ([], [], False)
 
 
-TOOLS_ONLY = (
-    "resources, prompts, completions, sampling, elicitation and roots can't be enabled: "
-    "the gateway serves tools only"
-)
 NO_ELICITATION = (
     "the gateway doesn't relay an upstream's elicitation; its own approval prompts are the only "
     "questions agents see"
@@ -2934,10 +2930,7 @@ NO_ELICITATION = (
 @pytest.mark.parametrize(
     ("capability", "message"),
     [
-        # M6 design A.2 rows 4-4c: the three kinds the gateway will serve keep today's text.
-        ("resources", TOOLS_ONLY),
-        ("prompts", TOOLS_ONLY),
-        ("completions", TOOLS_ONLY),
+        # M6 design A.2 rows 4 and 4b: what the gateway never relays.
         ("sampling", "sampling is deprecated in MCP 2026-07-28 and the gateway never relays it"),
         ("roots", "roots is deprecated in MCP 2026-07-28 and the gateway never relays it"),
         ("elicitation", NO_ELICITATION),
@@ -2947,20 +2940,33 @@ def test_enable_is_an_error(example_raw: Raw, capability: str, message: str) -> 
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
     raw["gateway"]["servers"]["broker-trade"]["enable"] = [capability]
-    found = errors(run(raw))
-    # Row 5c (step 18): completions alone have nothing to complete.
-    messages = sorted([message, COMPLETIONS_NEED] if capability == "completions" else [message])
-    assert found == [
+    assert errors(run(raw)) == [
+        f"gateway.servers.broker-read.enable: {message}",
+        f"gateway.servers.broker-trade.enable: {message}",
+    ]
+
+
+@pytest.mark.parametrize("capability", ["resources", "prompts", "completions"])
+def test_the_kinds_the_gateway_serves_may_be_enabled(example_raw: Raw, capability: str) -> None:
+    """Row 4c, lifted in step 21b (L.11): enabling prompts, resources or completions is no error
+    of its own and warns of nothing; completions alone still have nothing to complete (row
+    5c)."""
+    raw = copy.deepcopy(example_raw)
+    raw["gateway"]["servers"]["broker-read"]["enable"] = [capability]
+    raw["gateway"]["servers"]["broker-trade"]["enable"] = [capability]
+    found = run(raw)
+    messages = [COMPLETIONS_NEED] if capability == "completions" else []
+    assert errors(found) == [
         *(f"gateway.servers.broker-read.enable: {text}" for text in messages),
         *(f"gateway.servers.broker-trade.enable: {text}" for text in messages),
     ]
+    assert warnings(found) == warnings(run(example_raw))
 
 
 def test_each_enabled_capability_has_its_own_error(example_raw: Raw) -> None:
     raw = copy.deepcopy(example_raw)
     raw["gateway"]["servers"]["broker-read"]["enable"] = ["roots", "prompts", "elicitation"]
     assert errors(run(raw)) == [
-        f"gateway.servers.broker-read.enable: {TOOLS_ONLY}",
         "gateway.servers.broker-read.enable: roots is deprecated in MCP 2026-07-28 and the "
         "gateway never relays it",
         f"gateway.servers.broker-read.enable: {NO_ELICITATION}",
@@ -3154,7 +3160,7 @@ def test_declined_is_a_map_of_tool_names_to_pins(example_raw: Raw) -> None:
     assert all(server.declined == {} for server in policy.gateway.servers.values())
 
 
-# --- prompts and resources, built dark (M6 design A.2 rows 5-6, L.1, L.11) ---------------------
+# --- prompts and resources (M6 design A.2 rows 4c-6, L.1, L.11) --------------------------------
 
 PIN_P = "sha256:" + "e" * 64
 TEMPLATE = "notes://notes/{id}"
@@ -3214,11 +3220,11 @@ def test_a_block_with_entries_needs_its_kind_enabled(example_raw: Raw) -> None:
         ), entries
 
 
-def test_enabling_a_kind_is_still_refused(example_raw: Raw) -> None:
-    """L.11: built dark. With each kind enabled and its block clean, the only errors are row 4c's,
-    today's sentence; check still refuses every enabled R31 kind."""
+def test_an_enabled_kind_with_clean_blocks_checks_clean(example_raw: Raw) -> None:
+    """L.11, from step 21b: each kind enabled, its block clean, checks with no error and no
+    warning the example hasn't, as tools do."""
     raw = kinds(example_raw, ["prompts", "resources", "completions"])
-    assert errors(run(raw)) == [f"gateway.servers.broker-read.enable: {TOOLS_ONLY}"]
+    assert errors(run(raw)) == []
     assert warnings(run(raw)) == warnings(run(example_raw))
 
 
@@ -3257,7 +3263,6 @@ def test_an_assistant_prompt_must_be_included(example_raw: Raw) -> None:
     raw = kinds(example_raw, ["prompts"])
     raw["gateway"]["servers"]["broker-read"]["prompts"]["assistant"] = ["summarize", "draft"]
     assert errors(run(raw)) == [
-        "gateway.servers.broker-read.enable: " + TOOLS_ONLY,
         "gateway.servers.broker-read.prompts.assistant: 'draft' may speak as the assistant but "
         "isn't included",
         "gateway.servers.broker-read.resources: " + NOT_ENABLED.format("resources"),
@@ -3291,7 +3296,6 @@ def test_a_capability_listed_twice_is_an_error(example_raw: Raw) -> None:
     assert errors(run(raw)) == [
         "gateway.servers.broker-read.enable: prompts is listed twice",
         "gateway.servers.broker-read.enable: resources is listed twice",
-        f"gateway.servers.broker-read.enable: {TOOLS_ONLY}",
     ]
 
 

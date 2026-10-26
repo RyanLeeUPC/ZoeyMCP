@@ -7,8 +7,8 @@ A result is rebuilt block by block, never passed through:
   still read, so hidden content is shown, not refused;
 - images and audio are kept only with an allowed media type, valid base64, and room in the
   result budget; SVG is never allowed;
-- resource blocks (resources are off in M3) and unknown block types are dropped and counted in
-  one note;
+- resource and ``resource_link`` blocks (a tool's result is no way to read a resource, even on
+  a path that serves resources) and unknown block types are dropped and counted in one note;
 - block ``annotations`` and every ``_meta`` are stripped (``audience: ["user"]`` could hide
   content from the model);
 - ``structuredContent`` is kept only when the tool has a pinned ``outputSchema`` it passes, and

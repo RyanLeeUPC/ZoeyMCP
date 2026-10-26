@@ -41,7 +41,10 @@ from .mcp_server import (
     FAKE_END_MARKER,
     FILE_REF,
     HOSTILE,
+    HOSTILE_FIXED,
     HOSTILE_PARAMETER,
+    HOSTILE_PROMPT,
+    HOSTILE_TEMPLATE,
     IMPORTANT,
     INVALID_NAME,
     LARGE_INVALID,
@@ -67,6 +70,7 @@ from .mcp_server import (
     BackChannelStream,
     Drift,
     DriftMember,
+    ListedKind,
     McpFake,
     Offered,
     Recorded,
@@ -949,6 +953,25 @@ async def test_injected_definitions() -> None:
     assert BIDI_OVERRIDE in properties["path"]["description"]
     enum = properties[f"mode{TAG_TEXT}"]["enum"]
     assert enum == ["short", f"long{ZERO_WIDTH}", f"{ANSI}all", f"{C1_CSI}x"]
+
+
+def test_injected_kinds_list_one_hostile_entry_of_each_kind() -> None:
+    """S18 (M6 design L.9): each kind's list ends in an entry with S12's hostile text in the
+    members a review shows; the base entries are as before."""
+    plain, fake = McpFake(prompts=True, resources=True), McpFake(switches={Switch.INJECT_KINDS})
+    kinds: tuple[ListedKind, ...] = ("prompt", "resource_template", "resource")
+    found = {kind: fake.definitions(kind) for kind in kinds}
+    for kind, entries in found.items():
+        assert entries[:-1] == plain.definitions(kind)
+    prompt, template, fixed = (entries[-1] for entries in found.values())
+    assert (prompt["name"], prompt["title"], prompt["description"]) == (
+        HOSTILE_PROMPT,
+        HOSTILE,
+        HOSTILE,
+    )
+    assert prompt["arguments"] == [{"name": "topic", "title": HOSTILE, "description": HOSTILE}]
+    assert (template["uriTemplate"], template["description"]) == (HOSTILE_TEMPLATE, HOSTILE)
+    assert (fixed["uri"], fixed["title"], fixed["description"]) == (HOSTILE_FIXED, HOSTILE, HOSTILE)
 
 
 def test_markup_echo_is_on_both_sides_of_a_drift() -> None:
@@ -1905,12 +1928,14 @@ def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> No
     plain = run_mcp_server.fake_for(run_mcp_server.parse(["cert.pem", "key.pem"]))
     assert (plain.mode, plain.switches, plain.key, plain.prm) == ("dual", set(), None, "none")
     assert plain.tool_change is None
+    assert (plain.prompts, plain.resources, plain.changed_kinds) == (False, False, set())
     metadata = tmp_path / "as.json"
     metadata.write_bytes(b'{"issuer": "https://mcp.example/mcp"}\n')
     argv = ["cert.pem", "key.pem", "--mode", "legacy", "--static-key", "fake-key-1"]
     argv += ["--prm", "root", "--authorization-server", ISSUER, "--scope", "notes.read"]
     argv += ["--as-metadata", str(metadata), "--switch", "large", "--switch", "two_bearer"]
-    argv += ["--drift", "annotations"]
+    argv += ["--drift", "annotations", "--prompts", "--resources", "--change-kind", "prompt"]
+    argv += ["--change-kind", "resource_template"]
     args = run_mcp_server.parse(argv)
     fake = run_mcp_server.fake_for(args)
     assert (args.cert, args.key, args.port) == ("cert.pem", "key.pem", 9000)
@@ -1918,5 +1943,7 @@ def test_the_runner_builds_the_fake_its_arguments_describe(tmp_path: Path) -> No
     assert (fake.authorization_servers, fake.scopes) == ([ISSUER], ("notes.read",))
     assert fake.switches == {Switch.LARGE, Switch.TWO_BEARER}
     assert fake.tool_change == "annotations"  # listed changed from the start (manual check 19)
+    assert (fake.prompts, fake.resources) == (True, True)  # manual check 24
+    assert fake.changed_kinds == {"prompt", "resource_template"}
     assert fake.as_metadata is not None
     assert fake.as_metadata() == {"issuer": "https://mcp.example/mcp"}

@@ -24,7 +24,7 @@ operator confirms and the commit writes, or the first :class:`PlanRefused` of G.
    a portal rollback that brings back a client or a caller is ``rollback_revives`` (verifier
    C1); then a ratchet past ``RATCHET_MAX`` is ``ratchet_full`` (E.1).
 2. ``portal_widens`` (Y6, G-11): a portal write that changes a host field at all, adds a client,
-   a token or a caller, or makes a change :func:`.diff.direction` calls wider that its kind doesn't
+   a token or a caller, or makes a change :func:`direction` calls wider that its kind doesn't
    permit (a rollback permits none).
 4. ``generation_raise_from_portal``: a key rotation is the host's (I.2).
 5. ``summary_too_large`` (Y9): a portal plan of more than :data:`SUMMARY_ROWS_MAX` rows, or one
@@ -62,7 +62,7 @@ from .diff import Change
 from .ratchet import DefKey, Grants, Ratchet, Violation, advance, full, violations
 from .restart import Effect, Started, classify
 from .reviewchange import Lines
-from .schema import Policy, ToolkitServer
+from .schema import Policy, PromptsPolicy, RemoteServer, ResourceSet, ToolkitServer
 
 WriteKind = Literal[
     "policy.save",
@@ -132,6 +132,12 @@ _SERVER_MODELS: Final = frozenset({"RemoteServer", "ToolkitServer"})
 _KIND_MODELS: Final = frozenset({"PromptsPolicy", "ResourceSet"})
 _BLOCK_KINDS: Final[Mapping[str, str]] = MappingProxyType(
     {"prompts": "prompt", "templates": "resource_template", "fixed": "resource"}
+)
+# What holds a server's pins and declines: the server itself for its tools, or a kind's block.
+_Pinned = RemoteServer | ToolkitServer | PromptsPolicy | ResourceSet
+# The ``enable`` entry that serves each kind of definition but a tool (L.1).
+_ENABLES: Final[Mapping[str, str]] = MappingProxyType(
+    {"prompt": "prompts", "resource_template": "resources", "resource": "resources"}
 )
 _GENERATIONS: Final = ("gateway_key_generation", "egress_key_generation")
 # G.7's fixed sentences.
@@ -267,8 +273,9 @@ def normalized_digest(policy: Policy) -> str:
 def carry_forward(head: Policy, target: Policy, *, host: bool = False) -> Policy:
     """A rollback's candidate: ``target``'s policy with, from ``head``, the two key generations
     (never lower, Y5), ``admin`` unless the rollback is the ``host``'s (Y17, T-6), and the pin of
-    every definition the head pins (Y11, G-24); each server's ``declined`` is the head's and the
-    target's less the tools the candidate includes (T-9, CR-17). The ratchet checks the result
+    every definition the head pins, of every kind (Y11, G-24); each server's ``declined``, and
+    each of its prompts' and resource sets' where the target enables the kind, is the head's and
+    the target's less what the candidate includes (T-9, CR-17). The ratchet checks the result
     (G.5 rule 1c): a pin only the target holds may be a retired one (``pin_retired``)."""
     data = document(target)
     for name in _GENERATIONS:
@@ -280,14 +287,33 @@ def carry_forward(head: Policy, target: Policy, *, host: bool = False) -> Policy
     held = {} if head.gateway is None else head.gateway.servers
     for name, entry in data.get("gateway", {}).get("servers", {}).items():
         before = held.get(name)
-        review = entry.get("review", {})
-        if before is not None:
-            for tool in review:
-                review[tool] = before.review.get(tool, review[tool])
-        declined = {**entry.get("declined", {}), **({} if before is None else before.declined)}
-        include = entry.get("tools", {}).get("include", [])
-        entry["declined"] = {t: pin for t, pin in sorted(declined.items()) if t not in include}
+        entry["declined"] = _carry(entry, entry.get("tools", {}).get("include", []), before)
+        if entry["kind"] == "remote" and isinstance(before, RemoteServer):
+            enable = entry.get("enable", [])
+            for keys, kind, kept in (
+                (("prompts",), "prompts", before.prompts),
+                (("resources", "templates"), "resources", before.resources.templates),
+                (("resources", "fixed"), "resources", before.resources.fixed),
+            ):
+                block = entry
+                for key in keys:
+                    block = block.setdefault(key, {})
+                # A kind the target doesn't enable holds nothing (check row 5).
+                carried = kept if kind in enable else None
+                block["declined"] = _carry(block, block.get("include", []), carried)
     return normalize(Policy.model_validate(data))
+
+
+def _carry(block: dict[str, Any], include: list[str], before: _Pinned | None) -> dict[str, str]:
+    """H.4 for one pinned block of a server, its tools' or a kind's: the pin ``before`` (the
+    head's block, if any) holds for a name replaces the target's, and the ``declined`` answered
+    is both blocks' less the names ``include`` holds."""
+    review = block.get("review", {})
+    if before is not None:
+        for name in review:
+            review[name] = before.review.get(name, review[name])
+    declined = {**block.get("declined", {}), **({} if before is None else before.declined)}
+    return {name: pin for name, pin in sorted(declined.items()) if name not in include}
 
 
 # --- the kind (rule 1) -------------------------------------------------------------------------
@@ -318,6 +344,26 @@ def _tools(policy: Policy, server: str) -> tuple[list[str], list[str]]:
     """A server's included and ``allow`` tools (none for a server the policy hasn't)."""
     entry = None if policy.gateway is None else policy.gateway.servers.get(server)
     return ([], []) if entry is None else (entry.tools.include, entry.tools.allow)
+
+
+def _served(policy: Policy, server: str, kind: str) -> list[str] | None:
+    """The names of definition ``kind`` a server includes, or None where it serves no such
+    kind: a server the policy hasn't, a toolkit's prompts and resources, or a kind its
+    ``enable`` leaves out (check row 5 then holds it to no block, L.1)."""
+    entry = None if policy.gateway is None else policy.gateway.servers.get(server)
+    if entry is None:
+        return None
+    if kind == "tool":
+        return entry.tools.include
+    if not isinstance(entry, RemoteServer) or _ENABLES[kind] not in entry.enable:
+        return None
+    templates, fixed = entry.resources.templates, entry.resources.fixed
+    blocks: dict[str, PromptsPolicy | ResourceSet] = {
+        "prompt": entry.prompts,
+        "resource_template": templates,
+        "resource": fixed,
+    }
+    return blocks[kind].include
 
 
 def _moves(changes: tuple[Change, ...], ratchet: Ratchet) -> tuple[list[DefKey], list[DefKey]]:
@@ -384,6 +430,18 @@ def _dotted(path: tuple[str | int, ...]) -> str:
     return ".".join(str(part) for part in path)
 
 
+def direction(change: Change, candidate: Policy) -> diff.Direction:
+    """A change's direction in a write to ``candidate``: :func:`.diff.direction`'s, but a
+    prompt's or a resource's decline dropped where the candidate serves none of its kind (a
+    rollback or an import to before its ``enable``, which check row 5 holds to no block, H.4)
+    is neutral: nothing it covered can be served unreviewed."""
+    if change.model in _KIND_MODELS and change.field == "declined" and change.op == "removed":
+        server, kind, _ = _key(change)
+        if _served(candidate, server, kind) is None:
+            return "neutral"
+    return diff.direction(change)
+
+
 def _permits(kind: str, change: Change) -> bool:
     """Whether ``kind`` permits a wider ``change`` (G.5 rule 2 (c)): a save, a review's includes
     (at verified pins, rule 1b), moves, declines, its learned era, and onboarding's credential,
@@ -408,9 +466,9 @@ def _permits(kind: str, change: Change) -> bool:
     return False
 
 
-def _widening(kind: str, change: Change) -> str | None:
-    """What a portal write of ``kind`` may not do in ``change`` (G.5 rule 2), as its refusal
-    says it, or None."""
+def _widening(kind: str, change: Change, candidate: Policy) -> str | None:
+    """What a portal write of ``kind`` to ``candidate`` may not do in ``change`` (G.5 rule 2),
+    as its refusal says it, or None."""
     path, where = change.path, _dotted(change.path)
     if path[0] in _HOST_FIELDS or (path[0] == "gateway" and path[1:2] and path[1] in _HOST_GATEWAY):
         return f"change {where}"
@@ -428,7 +486,7 @@ def _widening(kind: str, change: Change) -> str | None:
         and change.new["callers"] != ["gateway"]
     ):
         return f"add a caller to route {path[1]}"
-    if diff.direction(change) == "wider" and not _permits(kind, change):
+    if direction(change, candidate) == "wider" and not _permits(kind, change):
         return f"widen {where}" + (" through a rollback" if kind == "policy.rollback" else "")
     return None
 
@@ -550,9 +608,9 @@ def _weakening(change: Change, i: PlanInput, candidate: Policy) -> str:
         return UNPAUSED_TEXT
     if change.model == "SMTPConnector" and change.field in CONNECTOR_LIMITS:
         return f"{change.old} -> {change.new}: raised"
-    if change.model in _SERVER_MODELS and change.field == "declined":
-        server, _, name = _key(change)
-        if name in _tools(candidate, server)[0]:
+    if change.model in _SERVER_MODELS | _KIND_MODELS and change.field == "declined":
+        server, kind, name = _key(change)
+        if name in (_served(candidate, server, kind) or ()):
             return DECLINED_TEXT.format(name=name, revision=i.head_revision)
     return f"{_said(change)} (wider)"
 
@@ -597,7 +655,7 @@ def _rows(
         for c in parts["changes"]
         if c.model == "Tools" and c.field == "allow" and _key(c) in parts["moves"]
     ]
-    wider = [c for c in parts["changes"] if diff.direction(c) == "wider" and c not in moved]
+    wider = [c for c in parts["changes"] if direction(c, candidate) == "wider" and c not in moved]
     rows += [(_dotted(c.path), _weakening(c, i, candidate)) for c in wider]
     rows += [
         (_dotted(c.path), _other(c, i))
@@ -681,7 +739,7 @@ def plan(i: PlanInput) -> WritePlan | PlanRefused:
         return PlanRefused("ratchet_full")
     # Rule 2: what the portal may widen.
     if portal:
-        widens = [(c, _widening(required, c)) for c in changes]
+        widens = [(c, _widening(required, c, candidate)) for c in changes]
         refused = [(c, said) for c, said in widens if said is not None]
         if refused:
             subjects = tuple(_dotted(c.path) for c, _ in refused)
