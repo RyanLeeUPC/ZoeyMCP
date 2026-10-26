@@ -421,7 +421,8 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             409,
             "The server {server} already reaches this URL, with a credential of kind {kind}, "
             "not oauth2. Remove it, its route and that credential from the policy and reload "
-            "first.",
+            "first; in managed mode, export the policy, remove them and import it with zoeymcp "
+            "policy import.",
         ),
         "onboarding_mismatch": Entry(
             409,

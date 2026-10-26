@@ -895,16 +895,22 @@ def allow_hosts(
     )
 
 
-def remove_first(served: Served) -> NextStep:
+def remove_first(served: Served, *, managed: bool = False) -> NextStep:
     """``already_configured``'s entry (OPS-14): what to take out of the policy before the URL
-    can be onboarded."""
+    can be onboarded. In managed mode (M6 design G.9, Y25) that is the host's export, edit and
+    import, since no portal change removes a server, and only the portal's Add a server by URL
+    gets this far (``login --mcp`` refuses managed mode before discovery)."""
     parts = [f"gateway.servers.{served.server}", f"routes {served.route}"]
     if served.credential is not None:
         parts.append(f"credentials.{served.credential}")
+    if managed:
+        how = (
+            ": export it, edit it and import it (zoeymcp policy import), then add the server by URL"
+        )
+    else:
+        how = ", reload, then run this command"
     return NextStep(
-        "fix_policy",
-        f"Remove {', '.join(parts[:-1])} and {parts[-1]} from the policy, reload, then run this "
-        "command again",
+        "fix_policy", f"Remove {', '.join(parts[:-1])} and {parts[-1]} from the policy{how} again"
     )
 
 

@@ -1553,6 +1553,21 @@ def test_what_to_remove_before_onboarding_a_url_already_served() -> None:
         "Remove gateway.servers.notes and routes notes-mcp from the policy, reload, then run "
         "this command again"
     )
+    # In managed mode (M6 design G.9, Y25) there is nothing to reload: the host's export, edit
+    # and import is the way, since no portal change removes a server; only the portal's Add a
+    # server by URL shows it, so there is no command to run again.
+    assert remove_first(Served("notes", "notes-mcp", "notes-key", "header"), managed=True) == (
+        NextStep(
+            "fix_policy",
+            "Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key from the "
+            "policy: export it, edit it and import it (zoeymcp policy import), then add the "
+            "server by URL again",
+        )
+    )
+    assert remove_first(Served("notes", "notes-mcp", None, "none"), managed=False).label == (
+        "Remove gateway.servers.notes and routes notes-mcp from the policy, reload, then run "
+        "this command again"
+    )
 
 
 # --- a re-registration (D.12, OPS-3) -------------------------------------------------------------

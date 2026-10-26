@@ -2055,26 +2055,35 @@ async def test_the_shipped_static_key_notes_is_already_configured(
     tmp_path: Path, names: FakeResolver, name: str
 ) -> None:
     """OPS-14: J1 walked verbatim meets the compose files' example notes server, whose route has a
-    static key; nothing is fetched."""
+    static key; nothing is fetched. As shipped the policy is managed (M6 step 23), so the way on
+    is the host's export, edit and import, then the portal's Add a server by URL (M6 design G.9,
+    Y25); with ``mode: declarative`` it is the edit, a reload and the command again."""
+    shipped = inline_policy(compose(name), name)
+    assert shipped.mode == "managed"
+    answers = []
     async with running(tmp_path) as rig:
-        rig.policy = inline_policy(compose(name), name)
-        status, body = await rig.refused(**PUBLIC)
-        assert len(rig.service._table) == 0
-    assert (status, body["reason"]) == (409, "already_configured")
-    assert (body["server"], body["route"], body["credential"], body["kind"]) == (
-        "notes",
-        "notes-mcp",
-        "notes-key",
-        "header",
+        for policy in (shipped, shipped.model_copy(update={"mode": "declarative"})):
+            rig.policy = policy
+            answers.append(await rig.refused(**PUBLIC))
+            assert len(rig.service._table) == 0
+    removed = (
+        "Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key from the policy"
     )
-    assert "with a credential of kind header, not oauth2" in body["error"]
-    assert body["next"] == [
-        {
-            "do": "fix_policy",
-            "label": "Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key "
-            "from the policy, reload, then run this command again",
-        }
-    ]
+    hows = (
+        ": export it, edit it and import it (zoeymcp policy import), then add the server by URL",
+        ", reload, then run this command",
+    )
+    for (status, body), how in zip(answers, hows, strict=True):
+        assert (status, body["reason"]) == (409, "already_configured")
+        assert (body["server"], body["route"], body["credential"], body["kind"]) == (
+            "notes",
+            "notes-mcp",
+            "notes-key",
+            "header",
+        )
+        assert "with a credential of kind header, not oauth2" in body["error"]
+        assert "in managed mode, export the policy, remove them and import it" in body["error"]
+        assert body["next"] == [{"do": "fix_policy", "label": f"{removed}{how} again"}]
     assert names.lookups == []
 
 

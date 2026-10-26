@@ -3,7 +3,8 @@
 Who might attack a deployment, what each can reach, and the most each can gain once everything
 built so far (M1 to M7) holds. The mechanisms are in [design.md](design.md); the invariants the
 tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, the portal's are P1 to
-P22 (M5), and onboarding's, the egress role's and the bridge's are X1 to X24 (M7) (§8.2).
+P22 (M5), onboarding's, the egress role's and the bridge's are X1 to X24 (M7), and managed
+policy's, drift review's and prompts' and resources' are Y1 to Y29 (M6) (§8.2).
 
 ## Actors
 
@@ -35,9 +36,10 @@ P22 (M5), and onboarding's, the egress role's and the bridge's are X1 to X24 (M7
   The `lan` proxy terminates TLS, so it sees client tokens, and holds no other secret.
 - **T4** can call any route bound to `caller: gateway`, inside that route's policy, until
   vault-enforced approvals (M8). It can't read a secret, the store, the master key or the vault's
-  environment, and it can't write policy. Recovery: restart (standard tier), or rotate the
-  gateway key (hardened), then rotate client tokens. In the standard tier it shares the vault's
-  network namespace, so it has egress; the hardened tier has none.
+  environment, and it can't write policy, in either mode (M6, below). Recovery: restart
+  (standard tier), or rotate the gateway key (hardened), then rotate client tokens. In the
+  standard tier it shares the vault's network namespace, so it has egress; the hardened tier has
+  none.
 
 ## Approvals, mail and toolkits (M4)
 
@@ -205,9 +207,9 @@ At most:
   registration) made without an egress proxy resolves the name once, refuses if any address is
   loopback, private, CGNAT, link-local, multicast, reserved or unspecified, or an IPv4-mapped,
   IPv4-compatible, 6to4, Teredo or NAT64 form of one, unless the policy lists that exact
-  `host:port` in `egress_private` (or it is a local MCP route's upstream), and connects to the
-  address it checked. With an egress proxy, the address check is the proxy's (see the accepted
-  limits). It still holds its own credential.
+  `host:port` in `egress_private` (or it is a local MCP route's upstream), and connects only to
+  the addresses it checked, each in turn within one deadline. With an egress proxy, the address
+  check is the proxy's (see the accepted limits). It still holds its own credential.
 - **T18** can make the vault send, before the operator confirms anything, at most two fixed POSTs
   to the URL the operator typed (the probe and, on a 400, one legacy `initialize` probe) and GETs
   of well-known, challenge-named or issuer-derived metadata URLs, nine requests in all within
@@ -252,7 +254,8 @@ At most:
   can't present the gateway's or any route's identity (its key is accepted on one path only), and
   shares no network with a bridge's MCP listener or with the vault's plaintext hop to a bridge.
 - **T22** gets nothing: one lookup, every answer checked, a refusal if any address fails, a connect
-  to a checked address and no second lookup, in the vault and in the role.
+  only to the checked addresses (each in turn, within one deadline) and no second lookup, in the
+  vault and in the role.
 - **T23** needs the bridge's token, which only the vault holds, in every placement: an
   unauthenticated call is refused before any byte reaches the program. In A the role's listener it
   reached gives it at most that source's egress list. In C the token is the only barrier, and
@@ -283,6 +286,109 @@ At most:
   program's stderr is logged as text only when the operator asks for it (and it may then print
   the program's environment values).
 
+## Managed policy, drift review, prompts and resources (M6)
+
+M6 lets the vault write policy in **managed mode**: sealed revisions under the vault's state
+volume, changed through stepped-up portal saves or by the host over the admin socket (an export,
+an edit and `zoeymcp policy import`, or the offline `--state` forms). Declarative mode is
+unchanged: no portal or socket route writes policy there. M6 also adds the gateway's status
+report and restore witness, drift review in the portal, and prompts, resources and completions a
+server may enable. It restates T2, T4, T10, T14, T15 and T16 and adds seven actors.
+
+| # | Actor | Has | Wants |
+| --- | --- | --- | --- |
+| T15 | **A passkey holder** (restated: a thief of the authenticator or of the passkey provider's account, or anyone with a session and one fresh assertion) | step-up on one origin, now including **policy saves** in managed mode | to give an agent of theirs access (a client token, a placeholder caller, another server for an admitted client); to move tools to `allow`; to send an `env:` secret to a host they control; to lower a key generation; to roll back to a revision that revives a revoked agent or a re-pinned definition; to lock the operator out (remove `admin` or its origin); to clear drift marks |
+| T10 | **A stolen session** (restated) | as before | everything in T15's list without a passkey: to prepare saves and read their plans (which show what a save would change), to read history and diffs, to queue fresh reviews |
+| T16 | **A writer of `/state` without the master key** (restated) | every file in `/state`, now `/state/policy/` and `/state/policy-anchor.json` too | to replay an older revision or head, delete the newest revisions, delete the whole store so the vault seeds again from an older `ZOEYMCP_CONFIG`, restore `/state/policy` alone from a backup, mix files from two backups, or plant a revision from another deployment that shares the master key |
+| T24 | **A reader of `/state` or of a backup of it, without the master key** | every byte of the volume, at rest | placeholders, connector account details, `token_headers` and forced query values, client token hashes, the history of every policy the deployment ran |
+| T25 | **A crafted policy document** handed to `policy import` (a shared example, an export someone else edited, an attacker's file), parsed by the host's command | any bytes up to the cap | YAML that means something other than it looks (tags, NEL line breaks, deep nesting that crashes the parser); an `env:` reference to a `ZOEYMCP_` variable; a new client, caller or `admin` origin hidden in a long document; a lowered key generation; a pin set back to a retired definition |
+| T26 | **A thief of an export file** | the export at rest (the operator's disk, a git repository, a chat paste) | placeholders and token hashes (the agents' route credentials, the clients' identities), connector account details |
+| T27 | **A hostile upstream's other surfaces** (T2 restated for prompts, resources and completions) | prompt and resource-template definitions, prompt messages (user and assistant roles), resource contents and the URIs they name, completion values, list changes timed around a review | to inject instructions in the user's or the assistant's voice; to smuggle unreviewed resources inside a read of a reviewed one; to probe unreviewed names through completions; to change a prompt after review; to hide text in a definition |
+| T28 | **Hostile text in a drift diff or a plan** (T14 restated) | both sides of a drift diff, every policy name in a plan, imported strings | to run script on the review screen or the Policy page, fake a line of the plan the operator confirms, hide a character that changes what is pinned |
+| T4 | **A compromised gateway** (restated) | as before, plus the status report path and the witness | to hide drift from the portal, report a false status, claim a revision it never saw (a false restore alarm), stay silent about one it did see, show a false old definition |
+| T29 | **A concurrent writer** (not an adversary: a second portal session, the socket, a stale tab) | a save prepared against an older revision | to overwrite a newer revision it never read |
+| T30 | **The operator's own mistake** (not an adversary) | a save, rollback or import that removes the portal's origin, moves `admin.listen`, raises a key generation without giving the new key, or breaks a binding | an outage or a lockout with no way back |
+
+At most:
+
+- **T15** gains, in managed mode, exactly the portal's edit set: it can include, re-pin and
+  classify tools of servers already in the policy (a re-pin only to a definition the vault itself
+  verified in a review of the running policy), move tools from `approve` to `allow` (one from a
+  server's page, or
+  any number in one review save, each a sentence of its own in the plan the assertion confirms
+  and each logged `tool_allowed`), decline tools, onboard a new server whose route accepts only
+  the gateway and whose credential is a new store or OAuth secret, open egress to a private
+  address for that onboarded server (after a stepped-up private discovery; it takes effect at
+  once), give an existing client an existing server (one client per prompt, a logged weakening),
+  pause or limit a connector, clear marks the gateway agrees are clean, and roll back to a
+  revision that is narrower or neutral (which may remove what was added since). It **can't** add
+  a client token or a placeholder caller, name a new `env:` variable or send an existing one to a
+  new origin, change `admin`, lower a key generation, restore a retired pin, revive a removed
+  client, move a tool to `allow` without that move's own row in the plan (a re-include as `allow`
+  of a definition once classified `approve` is a move too), widen anything through a rollback,
+  or change approvals settings, `gateway.limits`, the egress proxy settings or a connector's bound
+  constraints (its host, port, sender and recipients stay the host's, changed by an import). So
+  it can widen what *the agents already admitted* may call without a prompt, and what an
+  onboarded server may reach on the private network; it can't admit a new agent or move a
+  secret. Recovery stays `setup-code --reset`, then a host rollback to a revision before the
+  theft.
+- **T10** can read plans, history and diffs, which show only what the policy view shows, and
+  queue reviews; it changes nothing without a passkey.
+- **T16** can't forge a revision, the head or the anchor (each is MAC'd under a key derived from
+  the master key) and can't decrypt a revision. An older revision replayed below the head fails
+  the chain and is quarantined (history shows the gap); a head behind the anchor is refused at
+  start; `/state/policy` deleted beside the anchor, or the anchor beside the store, refuses the
+  start, and both deleted on a used volume refuse to seed until the host says so; `/state/policy`
+  restored alone is behind the anchor and refused. A revision from another deployment fails on
+  its deployment ID even under a shared master key, and once a master-key rotation is recorded, a
+  file under the retired key is refused even while the old key is still set. What the volume
+  can't catch is in the limits below; the gateway's witness catches most of it.
+- **T24** reads only ciphertext for every revision's policy and ratchet; the headers it can read
+  hold revision numbers, times, kinds, salted digests (which confirm no guessed policy) and the
+  passkey fingerprint of each save.
+- **T25** meets the strict loader first: a tag, an NEL or line or paragraph separator, a key that
+  isn't a string, nesting deeper than 64, an integer of 33 digits or more, or any parser failure
+  is a refusal with a reason. What loads goes through `check` with the vault's own environment,
+  so a `ZOEYMCP_` reference is refused; the plan then shows every changed path through the policy
+  view, widenings first (a new client, caller or origin is a widening row); bringing back what the
+  store retired, or a new `env:` name or reach, is refused unless the host names it
+  (`--allow-revive`, `--allow-env`); dropping a passkey origin or moving `admin.listen` asks for
+  the origin typed; and `--yes` refuses any plan that widens unless `--accept-widening` is given
+  too, so a script that pipes in someone else's edit can't admit a new agent by accident. A new
+  client, caller or origin needs no named grant: reading the plan, or `--accept-widening`, is the
+  host's confirmation.
+- **T26** gets placeholders and token hashes, never a secret value (the policy holds none), the
+  master key or a store entry. The export's first lines say so, and operations.md says to keep it
+  like a secret.
+- **T27** reaches an agent only through a server that enables the kind, for an included and
+  pinned definition served exactly as pinned. Prompt messages pass the text rules with hidden
+  characters revealed; an assistant-role message is refused unless the operator listed that
+  prompt; an embedded resource is dropped unless its URI is allowed; a read answers only for an
+  allowed URI, and contents naming another URI are dropped; a completion must name an included,
+  pinned prompt or template. With `on_drift: fail`, a drift in any kind blocks the whole server.
+  It can still write a
+  pinned prompt whose output changes with its arguments (below).
+- **T28** reaches the page only as text, with hidden characters shown, and the plan only as rows
+  the vault built, through the policy view's hiding rules.
+- **T4** can hide or invent status, drift marks, the policy mode and witness claims, which only
+  ever raise warnings or a CLI refusal, never a vault decision: a witness revision is bounded, and
+  an acknowledgment asks the host to type the target number, so a false claim can't make the vault
+  jump its counter by itself; a hostile upstream's names can't blind the report, since the
+  gateway sends only valid names and counts the rest, and the vault drops a bad entry, not the
+  report. It can't show a false old definition (the vault recomputes its pin) or a false new
+  one, and it still can't write policy.
+- **T29** is refused at the plan or at the write (`policy_moved`): every save names the revision
+  it was planned on, and the write checks it again in one section with nothing in between. Its
+  own retry after a lost answer is recognized as already saved.
+- **T30** can't lock the portal out from the portal (no portal save changes `admin`) and always
+  has the socket and the offline `--state` forms; every restart, redeploy or broken binding a
+  write causes is in its plan before the passkey or the `[y/N]`.
+
+What doesn't change: **declarative mode** keeps every earlier statement (the operator's commit is
+the guard, and no route writes policy); **T1, T4 and T6 stay open until M8**: moving a tool to
+`allow` closes no approval gap, and a compromised gateway or toolkit can still skip the gateway's
+approvals.
+
 ## The confused deputy
 
 ZoeyMCP issues no OAuth tokens to agents and has no dynamic client registration on the agent's
@@ -306,8 +412,9 @@ first.
   toolkit or its dependencies: they run in the gateway, which shares the vault's network
   namespace there. The egress role doesn't change that; the hardened tier, where the gateway has
   no route out, does.
-- **A restore of the whole state volume** from an older backup is not detected (the gateway-key
-  ratchet and, from M6, managed policy versions both assume the volume moves forward). For the
+- **A restore of the whole state volume** from an older backup is not refused: the gateway-key
+  ratchet and managed policy's revisions both assume the volume moves forward. In managed mode
+  the gateway's witness flags it (M6, below); otherwise nothing does. For the
   portal it brings back every passkey removed since the backup, with its older counter: a removed
   passkey that was lost or stolen works again. The vault logs the passkey file's `generation` at
   start (`passkeys_loaded`), so a lower number shows a restore. **After any restore, run
@@ -408,3 +515,63 @@ first.
     or anywhere (standard, remote); `check` warns and names them.
   - **One modern bridge program serves every client,** as a modern remote server sees one
     principal.
+- **Managed policy, drift review, prompts and resources (M6):**
+  - **A passkey widens what admitted agents may do.** In managed mode one assertion can include a
+    tool, move it to `allow`, onboard a server (with, after a stepped-up private discovery,
+    egress to a private address that takes effect at once) or give an admitted client another
+    server, which is more than a declarative deployment's passkey can do. It can't admit a new
+    agent, move a secret or lock the operator out. **One passkey covers every approve->allow move
+    a review save lists:** each is its own row in the plan, with its sentence and the pinned
+    definition, and each is logged `tool_allowed`, but whoever holds the passkey can make every
+    included tool unprompted in one save, as they could in several. M8's vault-enforced approvals
+    don't change this (a passkey could switch them off too); the hardened tier and the passkey's
+    own protection are the answer.
+  - **A relayed setup code now yields a passkey that can save policy** (T3, T12): in the standard
+    tier the gateway and sibling containers still reach the portal's unauthenticated routes, and a
+    code redeemed by one of them enrols a passkey that passes step-up for managed saves, within the
+    portal's edit set above. This stays accepted: the hardened tier, which publishes the portal on
+    the host's loopback only, is the answer.
+  - **The authenticator shows nothing about the plan.** WebAuthn shows no transaction text: a
+    save's plan, however long (every changed field, restart and binding, a rollback's whole
+    difference), is rendered by the portal from the action it holds, so script running in the
+    portal's origin could show one plan and confirm another. The CSP, Trusted Types and
+    text-only rendering keep script off the page.
+  - **Who sets what, per mode.** In declarative mode the file's author sets everything, as
+    before. In managed mode the settings the earlier limits leave to that author (a client's
+    `renders` and the other approvals settings, `drift_check_interval`, a connector's host and
+    recipients) are the host's, changed by an import; a passkey holder chooses a connector's
+    limits and pause, never its hosts.
+  - **The volume is its own witness only partly.** The anchor refuses a head behind it and a
+    store or anchor deleted or restored alone. A head and the anchor restored together by exactly
+    one revision look like a crash and drop the newest revision; `head.json` and the anchor put
+    back together by any number of revisions, with the revision files above that head deleted,
+    are accepted, and the older policy runs with its older record of what may only move forward,
+    so removed clients and retired pins come back; a whole `/state` restored is accepted; a whole
+    `/state` deleted seeds again from `ZOEYMCP_CONFIG` under a new deployment, bringing back
+    everything removed since the seed. The gateway's witness catches each of these when the
+    gateway's volume wasn't restored with it (`policy_behind_witness`,
+    `policy_deployment_changed`); restoring both volumes from one snapshot hides it. An older copy
+    of the anchor put back after a declarative period undoes the park, so the next managed start
+    runs the parked head instead of resuming from the file; `policy_seed_ignored` then says so.
+    Back up and restore the vault's volume on its own, and compare the head with your latest
+    export after any restore (operations.md §34).
+  - **A compromised gateway can stay silent** about drift, new tools and the witness, or raise
+    false alarms; it can't make the vault accept a false definition, pin or policy.
+  - **Prompt output depends on its arguments,** so a pinned prompt can still produce new text
+    later; it is sanitized, not pinned. Content pins for prompts without arguments aren't built.
+  - **An export is a sensitive file:** it holds placeholders and token hashes, and the vault
+    can't protect a copy once it leaves the socket.
+  - **Windows has no state lock and no directory fsync:** two vaults could fork the revisions,
+    and a crash right after a save may lose it. Windows hosts are for development only.
+  - **The ratchet is bounded** (10,000 entries): a deployment that re-pins and removes that much
+    is refused `ratchet_full`, and the only way on is a reseed with `--new-ratchet`, which drops
+    the old record and prints every entry it forgets: the host's explicit act.
+  - **A retired master key stays dangerous until its rotation is recorded.** While
+    `ZOEYMCP_MASTER_KEY_PREVIOUS` is set, a `/state` writer holding the old key could plant files
+    under it for the vault to seal again; once a rotation finishes, the anchor records the old key
+    as retired and files under it are refused or quarantined even with the variable still set.
+    Remove `ZOEYMCP_MASTER_KEY_PREVIOUS` right after the rotation (operations.md §34).
+  - **A save blocks the vault for its few writes and fsyncs,** a few milliseconds on a local disk,
+    longer on a slow one, so that saves are serial with no second locking scheme.
+  - **Host access is total,** as before: anyone who can run the admin socket or the offline form
+    can write any policy `check` accepts, flags included.

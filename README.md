@@ -5,8 +5,8 @@ real credential**, and that asks a human to approve the **exact arguments** of e
 action.
 
 > **Not ready for use.** Early development: the vault, the gateway, approvals, toolkits, the
-> admin portal, onboarding by URL, the egress role and the bridge work, but managed mode and
-> out-of-band approvers don't exist yet, and nothing has been reviewed or released.
+> admin portal, onboarding by URL, drift review, managed mode, the egress role and the bridge
+> work, but out-of-band approvers don't exist yet, and nothing has been reviewed or released.
 > Don't deploy it. See [docs/design.md](docs/design.md) for where it's going,
 > [docs/threat-model.md](docs/threat-model.md) for what it defends against, and
 > [docs/operations.md](docs/operations.md) for running what exists.
@@ -62,6 +62,21 @@ Built so far:
   CONNECT-only proxy, held to the lists the vault derives. `zoeymcp bridge` serves a stdio MCP
   server over HTTP behind a vault route with a token of its own, in its own container (hardened), as
   a process of the standard tier's container (unconfined), or on another host.
+- **M6, drift review and managed mode:** the gateway reports what needs the operator (a tool
+  changed since review, a tool nobody reviewed, a mark), and Home and `zoeymcp health` show it; a
+  server that adds tools makes `zoeymcp review` exit 1 until each is included or declined, and a
+  declined tool counts again when it changes. The review screen shows a drifted tool's reviewed
+  and current definitions side by side, each checked by the vault against its pin, with a diff;
+  accept the new definition, decline it, clear a mark the gateway agrees is clean, or move a tool
+  from `approve` to `allow` with a sentence of its own in the plan. **Managed mode**, which the
+  shipped compose files use: the vault keeps the policy as encrypted, MAC'd and chained
+  revisions, seeded once from the compose policy; the portal saves review choices, onboarding,
+  which servers a client reaches and connector limits, each planned in full and confirmed with a
+  passkey; history, diffs, and rollbacks that widen nothing; everything wider (clients, `admin`,
+  the egress settings) is an export, an edit and `zoeymcp policy import` on the host, refused
+  when it would bring back what was removed unless the host names it. A gateway volume that
+  remembers the revisions it saw flags a restored vault. Servers may enable prompts, resources
+  and completions, pinned and drift-reviewed like tools.
 
 ## Quickstart (standard tier)
 
@@ -159,7 +174,7 @@ has the rest, including reaching it from another machine.
     use it.
 - **Gateway:** an MCP server in front of your MCP servers, holding no secrets.
   - Per-agent tool allowlists, and pinned tool definitions, so a changed tool is hidden until you
-    re-review it.
+    re-review it; prompts and resources too, on a server that enables them.
   - Approvals that show you the exact arguments before a consequential call runs.
   - Your own Python tools, which run with no secrets.
 - **Admin portal:** passkey login, and a passkey prompt for every change.
@@ -167,10 +182,11 @@ has the rest, including reaching it from another machine.
   - OAuth connect in the browser (PKCE), with tokens stored straight into the encrypted store.
   - Credential health, and the approval ledger as the vault received it.
   - Onboarding an MCP server by URL (discovery and client registration), ending in a first-time
-    tool review and the policy fragment to commit.
-  - Planned for M6: tool drift review and re-pinning in the browser, and managed mode (the portal
-    as the policy's source, with versions and rollback). Until then, `zoeymcp review` reviews
-    drift.
+    tool review and a save (managed mode) or the policy fragment to commit (declarative).
+  - Tool drift review and re-pinning in the browser, side by side, and moving a tool from
+    `approve` to `allow`, each confirmed with a passkey.
+  - In managed mode, the portal is where the policy changes: revisions, history, diffs and
+    rollback; the host exports and imports what the portal can't change.
 - **Bridge:** serves a stdio-only MCP server over HTTP, reached only through a vault route that
   injects its own token: in a container of its own on networks of its own (hardened), as a
   process of the standard tier's one container (unconfined), or on another host.
@@ -203,8 +219,8 @@ shipped `profiles/`), the portal's effect tests over real sockets (`tests/portal
 contract tests for the MCP SDK and what the portal relies on (`tests/sdk`), a by-hand browser
 checklist ([docs/manual-checks.md](docs/manual-checks.md)), an image smoke test of both
 deployment tiers (`scripts/smoke-image.sh`), and mutation testing of the security-critical
-modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and for each module M5 and
-M7 added).
+modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and at a floor for each
+module, listed in `pyproject.toml`).
 
 ## License
 

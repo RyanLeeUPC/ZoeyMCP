@@ -3602,7 +3602,8 @@ def test_the_shipped_static_key_notes_is_already_configured(vault: Vault) -> Non
     assert err.splitlines() == [
         "zoeymcp login: The server notes already reaches this URL, with a credential of kind "
         "header, not oauth2. Remove it, its route and that credential from the policy and reload "
-        "first.",
+        "first; in managed mode, export the policy, remove them and import it with zoeymcp policy "
+        "import.",
         "Next:",
         "  Remove gateway.servers.notes, routes notes-mcp and credentials.notes-key from the "
         "policy, reload, then run this command again",

@@ -409,7 +409,7 @@ class OnboardService:
                 return await self._second_run(url, given, options, found, owner)
             served = served_at(policy, url)
             if served is not None:
-                raise OnboardError(_already_configured(served))
+                raise OnboardError(_already_configured(served, managed=policy.mode == "managed"))
         own = self._table.owned(owner)
         kept: _Kept | None = None
         if (
@@ -1794,15 +1794,16 @@ def _discovery_refusal(found: Refusal) -> Answer:
     return replace(answer, more=more) if more else answer
 
 
-def _already_configured(served: Served) -> Answer:
-    """D.12 (OPS-14): a server reaches this URL with a credential that isn't oauth2."""
+def _already_configured(served: Served, *, managed: bool) -> Answer:
+    """D.12 (OPS-14): a server reaches this URL with a credential that isn't oauth2; the way on
+    is the mode's (M6 design G.9)."""
     answer = refusal("already_configured", server=served.server, kind=served.kind)
     more = (
         ("server", served.server),
         ("route", served.route),
         ("credential", served.credential),
         ("kind", served.kind),
-        ("next", [remove_first(served).answer()]),
+        ("next", [remove_first(served, managed=managed).answer()]),
     )
     return replace(answer, more=more)
 

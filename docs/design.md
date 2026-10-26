@@ -4,10 +4,13 @@ Status: **draft for review**. M1 (the vault core), M2 (OAuth in the vault, `zoey
 gateway for remote MCP servers, both deployment tiers, `zoeymcp review`), M4 (approvals through
 elicitation, the approval ledger, the SMTP connector, toolkits and the derived image), M5 (the
 admin portal v1: passkeys, step-up, write-only secrets, OAuth connect, credential health, the ledger
-view and the read-only policy view) and M7 (onboarding a remote MCP server by URL with its
+view and the read-only policy view), M7 (onboarding a remote MCP server by URL with its
 first-time tool review and policy fragments, the vault's address guard, revocation on delete, the
-egress role and the allowlist emitter, and the bridge in three placements) are built; everything
-else here is not yet (§11 says which milestone plans it). Operating the built parts is in
+egress role and the allowlist emitter, and the bridge in three placements) and M6 (drift review,
+re-pinning, declined tools and clearing marks in the portal, the gateway's status report, moving a
+tool from `approve` to `allow`, managed mode with sealed revisions, history, rollback, export and
+import, the restore witness, and prompts, resources and completions) are built; everything else
+here is not yet (§11 says which milestone plans it). Operating the built parts is in
 [operations.md](operations.md), and the threat model in [threat-model.md](threat-model.md).
 
 ZoeyMCP is a self-hosted proxy that lets AI agents use outside services and MCP servers **without
@@ -74,7 +77,7 @@ say so.
 | ID | Requirement | Kind |
 | --- | --- | --- |
 | R30 | Agents reach upstream MCP servers only through the gateway, and the gateway reaches them only through the vault. Vault routes for upstream MCP servers accept only the **gateway's identity**, so the tool filter can't be bypassed | Must |
-| R31 | Each server has an explicit **tool allowlist**. Resources, prompts, sampling and server-initiated elicitation are **off** unless enabled per server | Must |
+| R31 | Each server has an explicit **tool allowlist**. Resources, prompts and completions are **off** unless enabled per server, and then included, pinned and drift-reviewed like tools (M6, §5.1). Sampling and roots are refused for good (MCP 2026-07-28 deprecates them), and server-initiated elicitation stays refused | Must |
 | R32 | **Per-client scoping:** each client (agent) sees only the servers and tools assigned to it | Must |
 | R33 | **Tool pinning:** the gateway records a hash of each reviewed tool definition (name, title, description, input and output schemas, annotations). A new or changed tool is hidden and reported until re-reviewed; this blocks "rug pull" changes and description poisoning. Members that aren't pinned are never served. A toolkit server may set `pinning: off` (the default is `required`), serving the definitions its image holds and logging their pins; `check` warns (§5.3) | Must |
 | R34 | **Native toolkits:** the operator's own Python tools run in the gateway, with no secrets, reaching the vault only through named slots, each mapped by the policy to a gateway-only route with the methods and paths listed per toolkit (§5.3). They are installed in a **gateway-only image**; the vault always runs the official image, unmodified (§3.1) | Must |
@@ -102,13 +105,13 @@ say so.
 
 | ID | Requirement | Kind |
 | --- | --- | --- |
-| R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, and (in managed mode) policy editing | Must |
-| R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only, and its secret entry is write-only. Three scoped exceptions, on the admin socket only and reached by no portal route: `POST /setup-code` answers the new setup code (R65), `GET /gateway-key` the gateway key (§7.5), and `GET /egress-key` the egress role's key (M7, §4.7) | Must |
-| R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion, bound to the one change it confirms) for every security-relevant change; the step-up column of §7.1's table is the list: writing or deleting a secret, completing or resetting an OAuth connection, enrolling, renaming or removing a passkey, registering a client at a server being onboarded and discovering a server on the operator's own network (M7), and, as they are built, changing policy, re-pinning a tool, moving a tool from `approve` to `allow` and changing a connector's constraints | Must |
+| R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, the gateway's status, and (in managed mode) policy saves, history and rollback (M6, §7.1) | Must |
+| R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only, and its secret entry is write-only. Four scoped exceptions, on the admin socket only and reached by no portal route: `POST /setup-code` answers the new setup code (R65), `GET /gateway-key` the gateway key (§7.5), `GET /egress-key` the egress role's key (M7, §4.7), and `GET /policy/export` the managed policy as a document, which holds placeholders and client token hashes (M6, §4.6) | Must |
+| R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion, bound to the one change it confirms) for every security-relevant change; the step-up column of §7.1's table is the list: writing or deleting a secret, completing or resetting an OAuth connection, enrolling, renaming or removing a passkey, registering a client at a server being onboarded and discovering a server on the operator's own network (M7), clearing drift marks, and every managed **save** (M6). Step-up guards saves: in declarative mode a fragment that re-pins or reclassifies is guarded by the operator's commit, and in managed mode a move from `approve` to `allow` is stepped up as its own save (`tool.allow`) or inside a review save whose one assertion covers every move it lists, each a row of its own in the plan. A connector's bound constraints are changed only by the host (§4.6) | Must |
 | R63 | **Browser hardening:** the exact origins the operator lists drive the `Host` and `Origin` checks (stopping DNS rebinding); every API request needs `Sec-Fetch-Site: same-origin`, and every state change is a `fetch()` with `POST` or `DELETE` carrying the page's own `Origin` (no forms); every answer carries a CSP with no inline script or style, `form-action 'none'`, `frame-ancestors 'none'` and Trusted Types, plus `nosniff`, `no-referrer`, `no-store`, COOP, CORP and `X-Frame-Options: DENY`; `SameSite=Strict` session cookies; no third-party assets. The OAuth callback is the only exception (§7.3) | Must |
-| R64 | **One source of truth for policy**, chosen per deployment: **managed** (the portal is the source; export/import YAML) or **declarative** (a config file or env var is the source; the portal can't edit policy and produces diffs to commit instead). Never both | Must |
+| R64 | **One source of truth for policy**, chosen per deployment: **managed** (the vault's revisions are the source, changed by the portal's saves within a bounded edit set, or by the host's export, edit and import over the admin socket) or **declarative** (a config file or env var is the source; the portal can't edit policy and produces diffs to commit instead). Never both: `mode` is required and chosen at start (§4.6) | Must |
 | R65 | **Bootstrap:** a random **one-time setup code**, issued on demand with `docker exec` (none exists until then), never logged, valid for 15 minutes, spent when it is redeemed, and invalidated when the first passkey is enrolled. Whether enrolling with it replaces every passkey is decided when it is issued (`--reset`). Recovery from lost passkeys follows the same path, so it needs host access | Must |
-| R66 | Managed policy is **versioned**: every save is a new version with its diff, authenticated with a config key (§4.5) and a monotonic counter, so a replayed older version is refused. One-click rollback creates a new version | Must |
+| R66 | Managed policy is **versioned**: every save is a new **revision** (the document's `version: 1` stays its schema version), encrypted under `K_policy`, MAC'd under `K_config` (§4.5) and chained to its parent, with a monotonic counter and an anchor beside the store, so a replayed older revision is refused or quarantined; its diff is recomputed from adjacent revisions. A rollback creates a new revision, planned against what may only move forward | Must |
 
 ### 2.7 Deployment and verification
 
@@ -159,12 +162,12 @@ say so.
 
 | Role | Command | Holds secrets | State | Image |
 | --- | --- | --- | --- | --- |
-| **vault** | `zoeymcp vault` | yes (store + master key) | the store, gateway-key state, the connectors' send journals, the portal's passkeys and setup code (MAC'd), the reported copy of the gateway's ledger; policy versions from M6 | official, unmodified |
-| **gateway** | `zoeymcp gateway` | no | drift marks, reviewed definitions, the approval ledger | official, or a derived gateway-only image with toolkits |
+| **vault** | `zoeymcp vault` | yes (store + master key) | the store, gateway-key state, the connectors' send journals, the portal's passkeys and setup code (MAC'd), the reported copy of the gateway's ledger; in managed mode the policy's sealed revisions, their head and the anchor (§4.6) | official, unmodified |
+| **gateway** | `zoeymcp gateway` | no | drift marks, reviewed definitions, the approval ledger, and the highest policy revision it has seen per deployment (the restore witness, §4.6) | official, or a derived gateway-only image with toolkits |
 | **bridge** | `zoeymcp bridge -- <cmd> …` | no: the SHA-256 of its token; its program may hold a real secret, a flagged exception (R35) | a work directory on tmpfs | derived per stdio server |
 | **egress** (optional, hardened) | `zoeymcp egress` | no; it only tunnels TLS and never sees plaintext; its key reads the allowlists and nothing else | none | official |
 | **launcher** | `zoeymcp standard` | no, once the vault, the gateway and its bridges are started | none | official, or the derived bridge image |
-| **CLI** | `zoeymcp keygen / client-token / gateway-key / egress-key / setup-code / passkeys / sessions / secret set [--generate] / secret list / secret delete / login / login --mcp / oauth / health / review / gateway-status / ledger / ledger --vault / check [--with] / selftest` | only while running, never written | none | official, or installed with `pip` |
+| **CLI** | `zoeymcp keygen / client-token / gateway-key / egress-key / setup-code / passkeys / sessions / secret set [--generate] / secret list / secret delete / login / login --mcp / oauth / health / review / gateway-status / ledger / ledger --vault / policy / check [--with] / selftest` | only while running, never written | none | official, or installed with `pip` |
 
 ### 3.1 Why the vault is separate from the gateway
 
@@ -732,7 +735,8 @@ it with HKDF-SHA256, with a separate context for each purpose:
 | Key | HKDF context | Use |
 | --- | --- | --- |
 | `K_store` | `zoeymcp/store/v1` | AES-256-GCM encryption of store entries |
-| `K_config` | `zoeymcp/config/v1` | HMAC over managed policy versions and their counter (§4.6) |
+| `K_config` | `zoeymcp/config/v1` | HMAC-SHA256 over four kinds of file, each under a context line of its own: the gateway-key state `gateway-key.json` (`zoeymcp/gateway-key-state/v1`, below), and the managed policy's revisions, head and anchor (`zoeymcp/policy-revision/v1`, `zoeymcp/policy-head/v1`, `zoeymcp/policy-anchor/v1`; §4.6) |
+| `K_policy` | `zoeymcp/policy/v1` | AES-256-GCM encryption of each managed revision's body (its policy and ratchet), with a random 12-byte nonce and the revision's header as authenticated data (M6, §4.6) |
 | `K_gateway` | `zoeymcp/gateway/v1/gen-<N>` | the gateway key in the hardened tier. Rotated by bumping `gateway_key_generation` |
 | `K_egress` | `zoeymcp/egress/v1/gen-<N>` | the egress role's key (M7, `zeg1-`): reads the allowlists, nothing else. Changed by bumping `egress_key_generation`; the old key is refused at once, with no rotation window |
 | `K_audit` | `zoeymcp/audit/v1` | HMAC keying the request digests in an SMTP connector's send journal (§4.4) |
@@ -767,8 +771,8 @@ under `K_portal`, so no enroller can make one that shows as another's.
 - `zoeymcp gateway-key --retire-previous` (design notes once called it `--immediate`) retires N-1
   at once, for a suspected leak. While N-1 is still accepted, `gateway-key` prints
   `rotation pending: generation N-1 accepted until <time>` on stderr.
-- A restore of the whole volume from an older backup isn't detected, as with managed versions
-  (§4.6).
+- A restore of the whole volume from an older backup isn't detected by the vault; in managed mode
+  the gateway's restore witness flags one (§4.6).
 
 There is no derived admin credential: admin access starts from a one-time setup code (§7.2), so
 it can be revoked without touching the master key.
@@ -837,8 +841,9 @@ by it and then reads the entry only under the binding it predicts again, so the 
 binding still decides.
 
 **What bindings don't cover:** widening path or method rules on the **same** origin, adding
-callers, or moving a tool from `approve` to `allow`. Those are policy changes, guarded by passkey
-step-up (R62) and versioning (R66).
+callers, or moving a tool from `approve` to `allow`. Those are policy changes: in declarative mode
+guarded by the operator's commit, in managed mode by the host's import or a stepped-up save
+within the portal's edit set (R62), each a revision (R66, §4.6).
 
 **Secret sources** in config: `store:<name>` (the default, encrypted and bound) or `env:<VAR>`
 (allowed for simple setups and seeds; not bound). `check` warns on `env:` for a long-lived secret.
@@ -846,8 +851,11 @@ step-up (R62) and versioning (R66).
 **Key rotation:**
 
 1. Set `ZOEYMCP_MASTER_KEY_PREVIOUS` to the old key and `ZOEYMCP_MASTER_KEY` to the new one.
-2. On start, the vault re-encrypts every entry and re-authenticates the gateway-key state (and,
-   from M6, the policy versions). The portal's passkey file is verified under the previous key
+2. On start, the vault re-encrypts every entry and re-authenticates the gateway-key state, and in
+   managed mode re-seals every kept revision, oldest first, then the head, then the anchor, which
+   records the old key as retired (no revision's digest changes; a start cut short finishes at
+   the next one, and from then on a file under the retired key is refused even with the variable
+   still set). The portal's passkey file is verified under the previous key
    and sealed again under the new one; a pending setup code sealed under the old key counts as no
    code, so issue a new one. The gateway key changes too, so update it at the same time; the old
    one follows the same ratchet-or-5-minutes rule as a generation bump.
@@ -862,16 +870,23 @@ own (R14; [operations.md](operations.md) has the table per kind).
 ### 4.6 Policy: managed and declarative modes
 
 Policy covers routes, credentials (minus their values), connectors, clients, servers, tool
-selections and pins, and approval settings. It is **one document**, owned by the vault. The
-gateway fetches its part over its authenticated link at start and whenever policy changes. That
-part contains no secrets, and the gateway can't write policy.
+selections, declines and pins (and a server's enabled prompts and resources, M6), approval
+settings, the `admin` block, the egress settings (`egress_proxy`, `egress_proxy_kind`,
+`egress_proxy_acls`, `egress_private`) and the gateway and egress key generations. It is **one
+document**, owned by the vault. The gateway fetches its part over its authenticated link at
+start and whenever policy changes. That part contains no secrets, and the gateway can't write
+policy, in either mode.
 
 **The gateway's view** (`GET /_zoeymcp/gateway/v1/view`, `common/policy/view.py`): the hosts,
 origins, limits and approval settings; each client's `token_sha256`, servers and source pins
 (a literal `token` is hashed first); and per server its kind (`remote` or `toolkit`: a bridge is
-a remote server), `vault_path` (the route's prefix plus the server's path), tools, pins and
-settings. No routes, credentials, connectors, secret references, placeholders, upstream URLs,
-route programs or admin settings. A `digest` covers the rest.
+a remote server), `vault_path` (the route's prefix plus the server's path), tools, pins,
+declines, enabled kinds with their prompts and resources (each left out while empty, so an
+older policy's digest is unchanged) and settings. No routes, credentials, connectors, secret
+references, placeholders, upstream URLs, route programs or admin settings. A `digest` covers the
+rest. Beside the view, outside its body and digest, the vault states the mode it runs
+(`x-zoeymcp-policy-mode`) and, in managed mode, its deployment and the revision it runs
+(`x-zoeymcp-policy-revision`), on every 200 and 304.
 
 - **Long poll:** the gateway sends `If-None-Match: "<digest>"` and `?wait=25`; the vault answers
   200 once the digest differs, or 304 after 25 s, and a reload wakes the waiters at once. At most
@@ -908,7 +923,8 @@ rewrite what the vault already holds, and the head is also in the vault's own lo
 the chain archives the live chain, still readable on the Ledger page, and keeps each dropped
 epoch's head as an anchor. The Ledger page shows the copy newest first, each call with its SMTP
 sends and the sends no call explains, never a keyed digest; the Policy page shows the declarative
-policy read-only, from a list of the fields it may show. A copy that can't be read refuses reports (503) and the
+policy read-only, from a list of the fields it may show (and in managed mode the head, history and
+diffs through the same list, §7.1). A copy that can't be read refuses reports (503) and the
 proxy runs anyway; nothing in the gateway's approval path waits for a report. The gateway's
 reporter runs beside the policy client: it asks for the head at least once a minute and as soon as
 a record is fsynced, reads its stored lines from the copy's head itself (so a restored or lost
@@ -916,25 +932,66 @@ gateway volume shows as a fork on the next report), and sends what the copy lack
 1 MiB, over a link client that reaches only the report path. While the copy refuses it asks every
 5 minutes; other failures back off up to 5 minutes, logged at most once per 5 minutes.
 
-| | **Managed** (default) | **Declarative** |
+The policy's `mode` is required and names one of two ways the vault runs, chosen at start (a
+reload never changes it). The shipped compose files and the README's quickstart say `managed`;
+the examples and profiles stay declarative, as merge sources.
+
+| | **Managed** | **Declarative** |
 | --- | --- | --- |
-| Source of truth | versions in `/state/policy/`, edited in the portal | `ZOEYMCP_CONFIG` (YAML in env), `--config <file>`, or stdin, read at start and on `SIGHUP` |
-| Portal policy editing | yes, with step-up | **no**: the portal shows the policy, and onboarding and review produce a **fragment to merge** (§7.4), which `check --with` proves before the commit |
-| History | every save a version, with its diff; rollback creates a new version | the operator's git |
-| Export / import | YAML export and import | n/a |
-| Seed | `ZOEYMCP_CONFIG`, if set, seeds version 1 on first start only | n/a |
+| Source of truth | sealed **revisions** in `/state/policy/` (M6), written only through one writer: a stepped-up portal save, or a host command over the admin socket or offline with `--state` | `ZOEYMCP_CONFIG` (YAML in env), `--config <file>`, or stdin, read at start and on `SIGHUP` |
+| Portal policy editing | stepped-up saves within a bounded edit set (§7.1): review saves, onboarding's adds, which servers an existing client reaches, a connector's limits and pause, and rollbacks the direction table finds narrower or neutral; everything wider is the host's import | **no**: the portal shows the policy, and onboarding and review produce a **fragment to merge** (§7.4), which `check --with` proves before the commit |
+| History | every write a revision; a diff is structured, by field path, recomputed from adjacent revisions and rendered through the policy view's allowlist, never a text diff and never stored; the newest 64 kept | the operator's git |
+| Rollback | a new revision with the target's content, planned against the ratchet (below): the head's key generations and pins carried, revivals refused in the portal and granted by name on the socket; a portal rollback keeps the head's `admin` and may narrow and remove, never widen | n/a |
+| Export / import | over the admin socket and offline only (`policy export`, `policy import`): the export is R61's fourth exception, and an import is planned against the head with every widening listed first | n/a |
+| Seed | `ZOEYMCP_CONFIG` seeds revision 1 only into a **fresh** volume; a used volume needs `zoeymcp policy seed --state` once, and a store without its anchor, or an anchor without its store, refuses the start. After the seed it is ignored (`policy_seed_ignored` while it differs) and may be removed; `policy import --from-env` applies it on purpose | n/a |
+| `SIGHUP` | re-verifies the store and installs the head if it isn't the one running, which is how a saved change that couldn't be applied is retried; it never reads the source as policy | reloads the source |
+| Switching | a declarative start **parks** the store; a later managed start **resumes**: the running file becomes the next revision, history and deployment kept | from managed: the head exported with `--mode declarative` becomes the source; to managed: `mode: managed`, a resume or, on a volume used before, `policy seed --state` once |
 
-- **Integrity:** each managed version, and the counter, are authenticated with `K_config`. The
-  vault refuses a version older than the highest it has seen, which catches a replayed file.
-  This doesn't help if the whole volume is restored from a backup, or if the vault's own uid is
-  compromised. It is a cheap integrity check, not a boundary.
-- **Validation:** every save (managed) or load (declarative) runs `check` first. A policy that
-  fails is rejected, and the running one stays.
+- **Integrity** (M6): a revision is canonical JSON whose body (the policy and its ratchet, with a
+  random salt) is encrypted under `K_policy` and whose whole is MAC'd under `K_config`; it names
+  its deployment, its parent's digest and how it was written. `head.json` names the newest, and
+  the anchor `/state/policy-anchor.json`, beside the directory, records the highest revision ever
+  committed, each MAC'd under a context of its own. A head, its revision or the anchor that fails
+  to verify, decrypt or match the deployment, a head behind the anchor, or more than one
+  uncommitted file above the head refuses the start, naming the recovery; an older revision that
+  fails is quarantined and history shows the gap; stray files are logged and never read. The
+  anchor can't see `/state` restored or wiped whole, so the gateway is a **restore witness**: it
+  keeps the highest revision it has seen per deployment on its own volume and reports it in its
+  status report, and a vault behind it raises `policy_behind_witness`, or
+  `policy_deployment_changed` when its deployment is new to a gateway that saw another at revision
+  2 or more. Nothing refuses on the witness; `policy acknowledge-restore` clears it with a revision
+  numbered past the claim, which the host types. None of this helps if the vault's own uid is
+  compromised.
+- **The ratchet:** each revision carries, sealed, what may only move forward: the key-generation
+  floors, the pins re-pins retired, the client token hashes and placeholder digests removed,
+  every definition ever classified `approve`, and every `env:` name with the origins it may
+  reach. Every write is checked against it and may only advance it; only the host may name an
+  entry back (`--allow-revive`, `--allow-env`), or drop the whole ratchet with a reseed's
+  `--new-ratchet`, which lists what it forgets. So no rollback or import revives a retired key, a
+  revoked token or a re-pinned definition, or opens a new path for an `env:` secret.
+- **Validation:** one gate for every policy that can run, in either mode: the strict loader, the
+  schema, `check` with the vault's own environment, and the managed rules. It runs at a
+  declarative load and reload, at the seed, at every managed start on the head, and at every
+  save, rollback and import. A policy that fails is refused, and the running one stays.
+- **Writes** (managed): every write names the revision it was planned on, and its plan lists
+  every changed field path (through the policy view's hiding rules), every restart or redeploy it
+  needs (the restart classifier: live, a vault restart, a gateway restart, a key to deliver) and
+  every binding it breaks; the plan that runs is the plan confirmed. The write runs in one
+  synchronous section: the head checked again (`policy_moved` if it moved), then the revision,
+  the head and the anchor written and fsynced, and only then installed, so a crash leaves the old
+  head or the new. A retry whose answer was lost is `already_saved`; an install that fails leaves
+  the revision saved and the previous one running, refusing every later write until a `SIGHUP`
+  or a restart applies it.
 - **Read at start only:** `egress_proxy` and `egress_proxy_kind` build the vault's HTTP clients
-  once; a reload that changes either logs `egress_proxy_change_needs_restart` and keeps the old.
+  once, and `admin.listen` the portal's listener; in declarative mode a reload that changes one
+  logs a `..._change_needs_restart` line and keeps the old, and in managed mode a write's plan and
+  answer say so and health keeps `policy_restart_needed` until the restart.
 
-**Fragments (M7).** The vault never writes policy and keeps no policy text, so onboarding and
-review end in a **fragment**: YAML that `common/policy/emit.py` writes from a structured change
+**Fragments (M7).** In declarative mode the vault never writes policy and keeps no policy text,
+so onboarding and review end in a **fragment**; in managed mode the same change object is
+planned against the head and saved as a revision instead, and the host's export
+(`common/policy/export.py`) has its own field table and the same quoting rule. A fragment is
+YAML that `common/policy/emit.py` writes from a structured change
 object (`common/policy/change.py`), one quoting rule for the CLI, the socket and the portal. Every
 scalar is a double-quoted string of printable ASCII that passed its schema check, or a boolean or
 integer; keys are fixed field names or quoted policy names; a value learned from the network
@@ -942,8 +999,9 @@ holds no `$`, and the compose form (`--for compose`, indented 8) writes every `$
 compose interpolation can't turn a fragment into another policy. A fragment loads with the strict
 loader to exactly its change, never holds a secret, placeholder, client token or a field the
 policy view hides, and is shown only once the running policy with it merged passes `check`. A
-header line names the paths it replaces whole (`credentials.<c>`, or a server's `tools` and
-`review`); everything else merges by name (`common/policy/merge.py`), and `check --with FRAGMENT`
+header line names the paths it replaces whole (`credentials.<c>`, or a server's `tools`,
+`review` and, when the change writes them, `declined`, `prompts` and `resources`); everything
+else merges by name (`common/policy/merge.py`), and `check --with FRAGMENT`
 shows what a merge adds or replaces and checks the result.
 
 ### 4.7 The egress role
@@ -995,8 +1053,10 @@ emitter and the self-test):
 3. Resolve once (5 s), then refuse if any address is loopback, private, CGNAT, link-local,
    multicast, reserved or unspecified, or a mapped, compatible, 6to4, Teredo or NAT64 form of
    one, unless the entry is marked private.
-4. Connect (10 s) to **the address that was checked**: no second lookup, so a name can't be made
-   to resolve elsewhere between the check and the connection (DNS rebinding).
+4. Connect to **the addresses that were checked**, each in turn in the resolver's order, all
+   within one 10 s deadline (M6): no second lookup, so a name can't be made to resolve elsewhere
+   between the check and the connection (DNS rebinding). A first address that never answers
+   uses the whole deadline.
 5. Answer `200`, then copy bytes both ways, closing after 900 s idle or 86,400 s open. Every
    answer the role makes itself is empty, with no `WWW-Authenticate` or `Proxy-Authenticate`.
 
@@ -1044,7 +1104,8 @@ The gateway holds no secret, imports nothing from the vault, and reaches upstrea
 vault routes that accept only its identity. The SDK is boxed in on both edges: the admission
 checks before it sees a request, and an egress filter on everything it sends upstream. Every
 security decision lives in a small pure module under mutation testing (`access`, `pins`,
-`schemas`, `sanitize`, `connstate`, `findings`, `egressrules`).
+`schemas`, `sanitize`, `connstate`, `findings`, `egressrules`, and from M6 `capabilities`,
+`resourcematch` and `witness`).
 
 ### 5.0 Protocol eras
 
@@ -1055,8 +1116,8 @@ older, batching and the HTTP+SSE transport are refused.
 | Feature | Legacy | Modern |
 | --- | --- | --- |
 | Agent → gateway | `initialize`; an SDK-minted session id, bound to (client, server) | per-request `_meta`; `server/discover`; no session |
-| Capabilities offered | `tools: {listChanged: true}` | the same, in the discover result |
-| List change to the agent | `notifications/tools/list_changed` on the session | on the agent's `subscriptions/listen` stream |
+| Capabilities offered | `tools: {listChanged: true}`, and per path what it serves (M6, §5.0.1) | the same, in the discover result |
+| List change to the agent | `notifications/tools/list_changed` on the session (and the prompt and resource lists' own, on a path that serves them) | on the agent's `subscriptions/listen` stream, which acknowledges only what the path serves |
 | Gateway → upstream | a session per (client, server); `shared_session` shares one | one connection per server |
 | Upstream change signal | `list_changed` on the session's stream; a new session id; the timer | `subscriptions/listen`; the timer |
 | Upstream session expiry | 404 → initialize, list and compare again, retry the call once | n/a |
@@ -1101,8 +1162,10 @@ Refusals are JSON-RPC errors with fixed text per status; the 401 adds
 `WWW-Authenticate: Bearer realm="zoeymcp"` with no `resource_metadata`. The reason goes to the
 log only (`auth_refused`). The SDK's own Host and Origin checks get the same lists.
 
-**Capabilities** are computed, never copied from upstream: `tools: {listChanged: true}`,
-nothing else. The server is `zoeymcp/<server>`, and no `instructions` are sent.
+**Capabilities** are computed per path, never copied from upstream: `tools: {listChanged:
+true}`, and, only on the path of a server that enables and includes them (M6), `prompts` and
+`resources` with `listChanged` (never `subscribe`) and `completions`. A path asked for a kind it
+doesn't serve answers `-32601`. The server is `zoeymcp/<server>`, and no `instructions` are sent.
 
 **Sessions.** A legacy session id is bound to its (client, server), and a session used by another
 client or on another server path gets 404; it is never an identity (step 6 runs on every
@@ -1139,7 +1202,8 @@ fixed pins, so an SDK bump that parses differently fails CI instead of causing f
    violation makes the tool `invalid`, since invisible content can't be reviewed. This runs for
    pinned tools too, since a pin can be written by hand.
 4. Schema safety (§5.2) on both schemas, and `x-mcp-header` validity; a failure is `invalid`.
-5. Not in `tools.include`, or with no pin: `unreviewed`.
+5. Not in `tools.include`, or with no pin: `declined` when the server's `declined` map holds it
+   at the pin it lists now (M6), else `unreviewed`.
 6. In `include` with another pin: `drift`, and a **drift mark** for (tool, pinned pin).
 7. Otherwise exposed, unless a drift mark holds.
 
@@ -1153,8 +1217,11 @@ shows clean definitions to `review` and others to an agent's session is caught o
 **Drift marks are sticky.** One connection seeing drift hides the tool for every client of the
 server, and the mark stays when the upstream flips back: a server that changed a tool and changed
 it back has shown it can. A mark clears when the policy's pin for the tool changes, or when
-`zoeymcp review <server> --clear` lists fresh and finds every included tool matching. Marks are
-written atomically to `/state-gateway/drift.json`, so a restart doesn't clear them.
+`zoeymcp review <server> --clear`, or the portal's **Clear the marks** (M6: a stepped-up action
+run as a gateway job), lists fresh and finds every included tool matching. Marks are written
+atomically to `/state-gateway/drift.json`, keyed by kind, name and pin, so a restart doesn't clear
+them; and since no rollback or import sets a pin the ratchet retired (§4.6), no history operation
+clears one by bringing back a replaced definition.
 
 **Re-check before use** (`connstate`, a pure state machine). A connection admits a call only when
 it is `READY` and the tool is exposed in its latest evaluation with no mark. Any change signal (a
@@ -1174,17 +1241,67 @@ Exceeding any fails the listing (`server_list_failed`) and exposes nothing.
 `tool_drift` (with the changed members), `tool_unreviewed`, `tool_missing`, `tool_invalid`,
 `tool_duplicate`, `server_blocked`.
 
+**What needs the operator (M6).** One pure function (`common/policy/attention.py`) decides, for a
+server's listing, which included tools drifted, are marked or went missing, which listed tools
+nobody reviewed (neither included nor declined at their current pin), and which declined tools
+changed; `zoeymcp review` exits 1 unless it finds nothing. The gateway pushes a small status
+report to the vault, over the link it already opens and through a client locked to that one
+path (`/_zoeymcp/gateway/v1/report/status`, at most 256 KiB, one every 5 s), with those lists by
+tool name, each server's state and offered kinds, the policy mode and revision it runs, and its
+witness; the vault parses it strictly, drops a bad entry rather than the report, keeps it in
+memory, and shows it labelled as the gateway's claim: health's `gateway` section and Home's
+attention list come from the same decision. It drives warnings and display only, never a vault
+decision.
+
 **The definition store.** When a tool matches its pin, its projection is written to
 `/state-gateway/defs/<hex>.json`. The store is content-addressed (a file that doesn't hash to its
 name is ignored), and gives `review` and `tool_drift` the changed members and a diff. **No
-decision reads it.**
+decision reads it**: in a review report the gateway sends a drifted tool's reviewed definition
+beside the listed one, and the vault shows each only when its own pin of it is the policy's and
+the reported pin, and computes the diff itself (M6).
 
-**What else is off.** `resources`, `prompts`, `completions`, `sampling`, `elicitation` and
-`roots` stay off: `enable` must be empty, since the gateway serves tools only (`check` refuses
-anything else). Upstreams are offered no capability at all. A legacy upstream's server → client
-request gets an error answer from the SDK; a modern `input_required` result ends the call with
-`isError` "refused: the server asked for input this gateway doesn't relay"; nothing of either
-reaches the agent.
+**Prompts, resources and completions (M6).** A remote server may list `prompts`, `resources` and
+`completions` in `enable`; toolkits have none. Each kind is listed after the tools, under the
+same caps counted apart, and an over-cap or failed walk fails only that kind. Its entries are
+included and pinned like tools, under their own blocks:
+
+```yaml
+      enable: [prompts, resources, completions]
+      prompts:
+        include: [summarize]
+        review: {summarize: "sha256:..."}
+        assistant: []          # prompts allowed to return assistant-role messages
+      resources:
+        templates: {include: ["notes://notes/{id}"], review: {"notes://notes/{id}": "sha256:..."}}
+        fixed: {include: ["notes://index"], review: {"notes://index": "sha256:..."}}
+```
+
+A prompt's pin covers `name`, `title`, `description` and its arguments; a resource template's
+and a fixed resource's cover the URI or template, `name`, `title`, `description`, `mimeType`
+and `annotations` (`audience`, `priority`), each under a domain tag of its own (`prompt-pin/1`,
+`resource-template-pin/1`, `resource-pin/1`), so no two kinds share a pin. Templates are level
+1 only (a whole path segment per expression, at most 8, no operator, query or fragment). Each
+kind drifts, declines and marks like tools, and with `on_drift: fail` a drift in any kind blocks
+the whole server. A path serves a kind only when it is enabled and something of it is included
+(completions when a prompt or a template is served), and a request for another kind answers
+`-32601`:
+
+| Agent asks | The gateway answers |
+| --- | --- |
+| `prompts/list`, `resources/templates/list`, `resources/list` | the included, pinned, matching entries' projections; never the upstream's own list |
+| `prompts/get` | only a served prompt, with only its declared argument names; each message's text revealed; a message in the assistant's role refuses the answer unless the prompt is in `assistant`; images and audio per the result allowlist; an embedded resource kept only for an allowed URI, else dropped and counted in `_meta["zoeymcp/dropped"]` |
+| `resources/read` | "not found" (the era's code) unless the URI equals an included fixed URI or matches an included template, each value 1-128 of `[A-Za-z0-9._~-]` and neither `.` nor `..`, no percent-encoding; contents naming another URI dropped and counted; a read left with nothing allowed is "not found" |
+| `completion/complete` | only for a served prompt's declared argument or a served template's variable, `context.arguments` limited the same way; at most 100 values of at most 256 characters, revealed |
+
+Upstream errors become fixed texts; an `input_required` result is refused as for tools; resource
+subscriptions are not served (the listen acknowledgment names only what the path serves).
+
+**What else is off.** `sampling` and `roots` are refused for good (`check` says MCP 2026-07-28
+deprecates them), and `elicitation` stays refused. Enabling prompts or resources adds methods
+the gateway calls, never a capability it declares: upstreams are offered no capability at all. A
+legacy upstream's server → client request gets an error answer from the SDK; a modern
+`input_required` result ends the call with `isError` "refused: the server asked for input this
+gateway doesn't relay"; nothing of either reaches the agent.
 `notifications/message` and progress text are dropped.
 
 ### 5.2 Approvals
@@ -1307,10 +1424,15 @@ Results are rebuilt block by block (`gateway/sanitize.py`), never passed through
 | --- | --- |
 | `text` | `\r\n` → `\n`, then every hidden character shown as `[U+XXXX]` |
 | `image`, `audio` | kept if PNG, JPEG, GIF, WebP, WAV, MP3 or Ogg with valid base64 within the result budget; else `[image omitted by the gateway]` (or `audio`). Never SVG |
-| `resource_link`, `resource`, unknown types | dropped while resources are off, with one note counting them |
+| `resource_link`, `resource`, unknown types | dropped from a tool's result, even on a path that serves resources (a tool's result is no way to read a resource), with one note counting them; in a prompt's messages (M6) a resource block is kept only for a URI the path allows to be read, else dropped and counted in `_meta["zoeymcp/dropped"]`, never as a message |
 | block `annotations`, every `_meta` | stripped (`audience: ["user"]` could hide content from the model) |
 | `structuredContent` | validated against a pinned `outputSchema`, else dropped; then every string revealed. Keys that would merge once revealed refuse the result |
 | `isError` | kept; its text treated the same |
+
+A prompt's messages, a read's contents and completion values (M6) are rebuilt the same way:
+text revealed (a prompt's messages are never wrapped: a prompt is meant to instruct), media per
+the same allowlist, a read keeping only the contents of the URI asked for, every `annotations`
+and `_meta` stripped, all under `max_result_bytes` (§5.1).
 
 **Revealing, not refusing.** Results are data the model still has to read, so they aren't refused
 for hidden characters: format characters (zero-width, bidi, tags, ZWJ), controls other than `\n`
@@ -1444,19 +1566,20 @@ Served by the vault on its own listener (`admin.listen`), from static files in t
 image. It is plain HTML/JS with no third-party assets, calling a JSON API on the same origin. The
 step-up column is the list of R62's security-relevant changes: each runs only after a fresh
 passkey assertion bound to it (§7.2). Reading anything, starting an OAuth connect, discovering a
-public server by URL, queueing a review, signing out and ending other sessions need none.
+public server by URL, queueing a review, preparing a managed save and reading its plan, signing
+out and ending other sessions need none.
 
 | Area | What it does | Step-up | Milestone |
 | --- | --- | --- | --- |
-| Home | what needs the operator: every health finding, errors first, with the action for each | — | M5 |
+| Home | what needs the operator: every health finding, errors first, with the action for each; the gateway's attention list (servers with drifted, marked, missing or unreviewed tools, blocked servers, a bridge that isn't ready), labelled as the gateway's report, each with its action | — | M5; M6 (the attention list) |
 | Secrets | list names, bindings and health, enter, replace, delete. **Never shows a value** | write, delete | M5 |
 | Credentials | per credential its routes, health and OAuth state; connect (paste, or the portal's callback), test a `client_credentials` grant, reset a failure state ("Try again") | complete a connect, reset | M5 |
 | Passkeys | enrol, rename and remove passkeys; the portal never removes the last one | enrol, rename, remove (a setup session's one enrolment has the setup code as its step-up) | M5 |
 | Sessions | list the signed-in browsers; end the others | — | M5 |
 | Ledger | the vault's copy of the gateway's ledger: each call's decision and result with its sends, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain | M5 |
 | Policy (declarative) | read-only view, built from a list of the fields it may show (no client token, placeholder, account detail or recipient) | — | M5 |
-| MCP servers | every remote and toolkit server with its state; onboard by URL (§7.4), with the plan and fragment 1; connect; the first-time tool review (filter, suggestions, each definition whole), classify `allow`/`approve`, fragment 2; re-pin drifted tools with a side-by-side diff | register a client (it may store a client secret), discover a server on the operator's network; save (managed) | M7 (onboarding and review), M6 (drift review and re-pin) |
-| Policy (managed) | edit routes, connectors, clients and approvals; history with diffs; rollback; export/import YAML | every save, moving a tool from `approve` to `allow`, a connector's constraints | M6 |
+| MCP servers | every remote and toolkit server with its state and what the gateway reports for it; onboard by URL (§7.4), with the plan and fragment 1; connect; the first-time tool review (filter, suggestions, each definition whole), classify `allow`/`approve`, fragment 2; drifted tools side by side (**Reviewed** and **Now**, each verified by the vault against its pin, with the vault's diff), **Accept the new definition**, decline, **Record the rest as declined**; prompts and resources under headings of their own; **Clear the marks**; **Allow without asking**; in managed mode **Save** in place of fragments, and **Give to clients** (which servers an existing client reaches, one client per save) | register a client (it may store a client secret), discover a server on the operator's network; clear the marks; in managed mode every save: a review's (with each move to `allow` a row of its own), a re-pin, a move to `allow`, onboarding's, giving a server to a client | M7 (onboarding and review), M6 (drift review, re-pin, declines, clearing, approve->allow, saves) |
+| Policy (managed) | the head (when, how and by whom it was written) and the revision the gateway runs; history with structured diffs; **Roll back** to any kept revision whose every difference is narrower or neutral (the head's `admin` kept); each SMTP connector's **Pause**, **Resume** and limits; the export command to run on the host. The portal edits nothing wider: new clients and callers, `admin`, approvals settings, `gateway.limits`, the egress settings and a connector's bound constraints (recipients, host, port, From) are the host's import, and there is no portal export or import | a rollback, a connector's limits or pause | M6 |
 | Approvals | the queue of pending vault-held and out-of-band approvals (§6.3, §6.4) | approve | M8 |
 
 ### 7.2 Authentication and bootstrap
@@ -1769,15 +1892,21 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp sessions [--end-all]` | `docker exec` in the vault | lists the portal's sessions; `--end-all` ends every one |
 | `zoeymcp secret set NAME [--origin URL …] [--generate]` | `docker exec` in the vault | reads the value from a prompt or stdin (never argv), stores it with its binding: the policy's, or the given origins for a name no route or connector uses. `--generate` (M7) stores 32 random bytes instead and prints only their `sha256:` line, for a bridge's token; it is refused for an OAuth secret or a connector's |
 | `zoeymcp secret list` / `secret delete NAME` | `docker exec` in the vault | lists each name, when it was last updated and its binding, never a value; deletes one entry (a live slot `oauth.<credential>.live` too, which forces a re-seed) |
-| `zoeymcp health [--json] [--strict]` | `docker exec` in the vault | what needs the operator, per credential, connector, store entry, the passkeys and the reported ledger copy, from metadata only; exit 0 with no error (`--strict`: no warning either), 1 otherwise, 2 when the vault can't be asked |
+| `zoeymcp health [--json] [--strict]` | `docker exec` in the vault | what needs the operator, per credential, connector, store entry, the passkeys, the reported ledger copy, and from M6 the gateway's status report and the managed policy (a restart needed, a seed ignored, a store parked, a restore the witness flags), from metadata only; exit 0 with no error (`--strict`: no warning either), 1 otherwise, 2 when the vault can't be asked |
 | `zoeymcp login <credential> [--rebind] [--start \| --flow ID]` | `docker exec` in the vault | the OAuth onboarding of §7.4; tokens go straight into the store. `--start` prints the URL and the flow ID and exits, and `--flow ID` completes that flow from stdin. For `client_credentials`, a test fetch that stores nothing |
 | `zoeymcp oauth status [<credential>]` / `oauth reset <credential>` | `docker exec` in the vault | per credential: state, code, a hint, time since the last success, re-consent and scope warnings, never a value; `reset` clears a failure state so the next request tries once |
 | `zoeymcp login --mcp <url>` | `docker exec` in the vault | MCP onboarding by URL (§7.4, M7): the plan on stderr, then fragment 1 on stdout and the `Next:` commands, each as typed on the host (`ZOEYMCP_COMPOSE_CMD`). `--name` or `--credential`/`--route`/`--server`, `--client-id`, `--client-secret` (piped, with `--issuer` and `--client-auth`), `--redirect-uri`, `--callback-origin`, `--scope`, `--allow-private`, `--client-name`, `--plan-only`, `--yes`, `--reregister`, `--no-connect`, `--squid-src`, `--indent N` / `--for compose`, `--format json`. The second run compares, signs in and queues the review |
-| `zoeymcp review [<server>]` | `docker exec` in the gateway, or in the vault with `--via vault` | with no server, one line per server from the gateway's status, with no upstream call. With one, the running gateway lists it on a fresh connection and shows per tool its state, pin and findings, a diff for drift, the upstream's `instructions` and `serverInfo` marked "never forwarded", and a YAML snippet to commit. `--tool T` shows only T, `--show T` / `--all` print definitions, `--add T` includes a tool (you still classify it), `--allow T` / `--approve T` / `--allow-read-only` classify as it includes (M7), `--repin T` takes a drifted tool's new pin, `--clear` clears the drift marks if every included tool matches, `--format json`. `--via vault` (M7) queues the review as a job on the vault's socket and reads its report (`--fresh` for a new one); `--choose [--suggest]` writes a choices file with a line per tool, and `--choices FILE` turns the edited file into fragment 2. Exit 0 when every included tool matches and nothing is marked, 1 when something needs you, 2 when the review couldn't run |
+| `zoeymcp review [<server>]` | `docker exec` in the gateway, or in the vault with `--via vault` | with no server, one line per server from the gateway's status, with no upstream call. With one, the running gateway lists it on a fresh connection and shows per tool its state, pin and findings, a diff for drift, the upstream's `instructions` and `serverInfo` marked "never forwarded", and a YAML snippet to commit. `--tool T` shows only T, `--show T` / `--all` print definitions, `--add T` includes a tool (you still classify it), `--allow T` / `--approve T` / `--allow-read-only` classify as it includes (M7), `--repin T` takes a drifted tool's new pin, `--clear` clears the drift marks if every included tool matches, `--format json`. `--via vault` (M7) queues the review as a job on the vault's socket and reads its report (`--fresh` for a new one); `--choose [--suggest]` writes a choices file with a line per tool, and `--choices FILE` turns the edited file into fragment 2. `--decline T` and `--decline-rest` (M6) record the tools left out, with their pins; in managed mode every option that would print a fragment refuses and names the portal's save or the export and import (M6). Exit 0 when every included tool matches, nothing is marked and every listed tool is included or declined at its pin, 1 when something needs you, 2 when the review couldn't run |
 | `zoeymcp gateway-status [<server>]` | `docker exec` in the gateway | the view's digest and freshness, and per server its connections, era, exposed and included tools, reports and marks; never definitions or token hashes |
 | `zoeymcp ledger [--since AGE] [--client C] [--server S] [--tool T] [--verify]` / `ledger check REF FILE` | `docker exec` in the gateway | one line per call in the gateway's ledger (when, ref, client, server and tool, era, decision, outcome), never a value; `--verify` walks the hash chain and prints its head; `check` says whether FILE holds the arguments that call was shown with, without the key leaving the gateway |
 | `zoeymcp ledger --vault [--before SEQ] [--restart-chain]` | `docker exec` in the vault | the vault's reported copy (§4.6): its state, then the newest calls with their sends and the orphan sends; `--restart-chain` shows the plan and asks before archiving a refused chain |
-| `zoeymcp policy export / import` | `docker exec` | managed-mode YAML round trip (M6) |
+| `zoeymcp policy [head]` | `docker exec` in the vault | the mode and, in managed mode, the head (revision, when, how and by whom, its deployment and digest), the revision the gateway runs and its witness (M6) |
+| `zoeymcp policy history [--before N] [--limit N]` / `policy diff N [--against M]` | `docker exec` in the vault | the kept revisions, newest first, a quarantined one as a gap; one revision's structured diff, rendered as the portal's policy view renders values (M6) |
+| `zoeymcp policy export [--revision N] [--mode managed\|declarative] [--for compose] [--force-tty]` | `docker exec -T` in the vault | the head's (or a kept revision's) policy as YAML, its first line naming the revision and deployment; it holds placeholders and token hashes, so it refuses a terminal; `--mode declarative --for compose` is the way back to a declarative deployment (M6) |
+| `zoeymcp policy import FILE\|- [--from-env [--baseline-only]] [--base N] [--yes] [--accept-widening] [--lockout-ok] [--allow-revive ...] [--allow-env NAME] [--revoke-removed] [--reason TEXT]` | `docker exec -T` in the vault | plans the document against the revision its export line names (widenings first, every restart and broken binding, what the head kept), asks `[y/N]`, and writes it; `--yes` refuses a plan that widens without `--accept-widening`, and one that drops a passkey origin or moves `admin.listen` without `--lockout-ok`; `--from-env` imports the vault's own `ZOEYMCP_CONFIG`, and `--baseline-only` records it without applying anything (M6) |
+| `zoeymcp policy rollback N` | `docker exec` in the vault | revision N's content as the next revision, with the head's key generations and pins, and N's `admin`; the import's flags (M6) |
+| `zoeymcp policy acknowledge-restore [--to N] [--yes]` | `docker exec` in the vault | after a restore the gateway flagged, a revision numbered past its claim, the number typed or given (M6) |
+| `zoeymcp policy seed --state DIR` / `policy import --state DIR --reseed FILE\|- [--new-ratchet]` | a one-off container of the vault's service, with the vault stopped | seed revision 1 on a used volume; replace the store, planned against the old ratchet unless `--new-ratchet` (M6). `history`, `diff`, `export`, `import`, `rollback` and `acknowledge-restore` take `--state DIR` too, for a host with no admin socket; each refuses root and a running vault's lock |
 | `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --with FRAGMENT` (M7) checks the policy with a fragment merged and says what it adds or replaces, `--print-merged [--for compose]` prints the result; `check --emit-egress-allowlist` (M7) prints the per-source allowlists (`--allowlist-format text`, `json` or `squid`, `--squid-src`) for operators who run their own proxy, and `--check FILE` compares an emitted file with the policy |
 | `zoeymcp egress-key` | `docker exec` in the vault | prints `ZOEYMCP_EGRESS_KEY=...` for the policy's `egress_key_generation` (M7, §4.7) |
 | `zoeymcp egress` / `bridge` | the image's commands | run the egress role (`--vault`, `--listen SOURCE=NAME:PORT`, §4.7); run a bridge (`--listen`, `--era`, `--peer-uid`, `--env`, `--secret-env`, `--egress-proxy`, limits, then `-- <program>`; §5) (M7) |
@@ -1829,7 +1958,9 @@ The built shapes ship as profiles in `profiles/`; S5 is `google-oauth.yaml`, S6
 | S9 | Remote MCP with OAuth discovery, client registration, `resource` parameter, rotating tokens | Linear, Notion, Atlassian remote MCP | M7 |
 | S10 | Remote MCP with a static API key (`remote-mcp-static-key.yaml`) | many hosted servers | M3 |
 | S11 | stdio server behind the bridge | reference servers (`time`, `fetch`) | M7 |
-| S12 | **Hostile server** (fake only): tool definitions that change after review, injected instructions in descriptions and results, unrequested sampling and elicitation, secrets echoed in errors | — | M3 (refusals), M4 (approvals) |
+| S12 | **Hostile server** (fake only): tool definitions that change after review, injected instructions in descriptions and results, unrequested sampling and elicitation, secrets echoed in errors | — | M3 (refusals), M4 (approvals), M6 (the portal's review) |
+| S17 | **Managed policy lifecycle** (fake only): seed, saves of every kind, history, a rollback, export, edit and import, a rotation, a crash during a save, back to declarative and back, a restored volume | — | M6 |
+| S18 | **Prompts, resources and completions** (fake only): enabled and reviewed, served per path, hostile entries and contents, a prompt changed after review | — | M6 |
 | **SMTP** | | | |
 | S13 | Implicit TLS (465) via CONNECT, fixed recipient | Gmail app password | M4 |
 | S14 | STARTTLS (587) | generic | M4 |
@@ -1909,6 +2040,26 @@ tier two bridges, the kernel refusing other uids' connect and create in a bridge
 directory, both peer checks with that directory loosened, and a killed bridge's route failing 502
 at once while the vault and the gateway keep serving.
 
+**M6's shapes as built.** **S12** (`tests/acceptance/test_mcp_shapes.py`) gains portal rows, in
+both modes, as processes: the drift row and the flip-back row go through the portal's review
+screen, **Accept the new definition** and **Clear the marks**, with S12's hostile strings shown
+revealed on both sides of the diff; a rollback across the re-pin is refused, so no history
+operation brings a replaced definition back. **S17** (`tests/acceptance/test_managed_shape.py`)
+runs managed mode as processes: a fresh volume's seed and a used one's refusal, saves of every
+kind with a real assertion (the test authenticator), history, a diff, rollbacks (one that removes
+an onboarded server, one that revives a client, refused in the portal and done on the socket),
+an export, an edit and an import, `--from-env` and `--baseline-only`, lockout recovery with and
+without a socket, a master-key rotation, a save that needs a restart and the gateway key's
+rotation by import, going back to declarative and resuming, a restored volume (the anchor's
+refusal, and the witness with its acknowledgment), and the quickstart walked prompt by prompt in
+both tiers. `tests/acceptance/test_policy_crash.py` (Linux) kills the vault between a save's
+writes and checks the next start. **S18** (`tests/acceptance/test_prompts_resources_shape.py`)
+enables prompts, resources and completions on the fake, in both eras: nothing but tools served
+until they are included, `review --choose` listing each kind, hostile entries revealed and not
+includable, the refusals of §5.1's table, a prompt changed after review hidden and marked, and,
+in managed mode, a portal save that makes a prompt served. The image smoke test runs the
+README's managed quickstart in both tiers.
+
 ### 8.2 Other tests
 
 - **Unit and property tests:**
@@ -1917,7 +2068,8 @@ at once while the vault and the gateway keep serving.
   - **store crypto:** a tampered ciphertext, a swapped entry name, a changed binding and the wrong
     key all fail to decrypt;
   - HKDF contexts are distinct;
-  - a policy-version replay is refused.
+  - a replayed older revision or head is refused or quarantined, and a flipped byte in any field
+    of a revision, the head or the anchor fails its MAC (M6).
 - **Effect tests** for each Must, run against real processes:
   - a gateway-only route refuses a placeholder and a spoofed source address;
   - a wrong placeholder is refused;
@@ -1954,8 +2106,12 @@ at once while the vault and the gateway keep serving.
     lookups), and one source's destinations on another source's listener; with a stale list it
     refuses every tunnel;
   - no admin endpoint returns a secret: a walk of every portal and admin socket route, where only
-    the socket's `POST /setup-code`, `GET /gateway-key` and `GET /egress-key` may carry a
-    credential (R61's three exceptions), and no portal code reaches any of them;
+    the socket's `POST /setup-code`, `GET /gateway-key`, `GET /egress-key` and `GET
+    /policy/export` may carry a credential or placeholder (R61's four exceptions), and no portal
+    code reaches any of them; a leak sweep of managed mode (revisions, drafts, plans, history,
+    diffs, refusals, health, the status report and every host command) finds no seeded
+    placeholder, token, account detail or forced value in any answer, log line or revision file's
+    bytes (M6);
   - in the **standard tier**, the gateway uid can't read `/state`, the vault's environ or its
     admin socket (the image smoke test);
   - in the **hardened tier**, the gateway can't reach the internet or the admin listener (the
@@ -1990,8 +2146,9 @@ at once while the vault and the gateway keep serving.
 
   M5 restates two of them: **G2**, the gateway has one more vault path, the ledger report
   (§4.1), through its own pinned transport that carries ledger lines and reaches nothing else;
-  **G17**, the gateway still can't write policy, and the only thing it writes in the vault is its
-  reported copy of the ledger.
+  **G17**, the gateway still can't write policy. As restated after M7 and M6, what it writes in
+  the vault is its reported copy of the ledger, review reports (M7) and status reports (M6),
+  never policy.
 - **The approval invariants (M4)**, each with effect tests on real processes (`tests/gateway/`,
   `tests/acceptance/`) or against the SMTP and toolkit fakes (`tests/unit/`). The stress tests for
   H3 and H7, and a test of H16's toolkit-vault size caps, are still to come (§12.3: D-78, D-79).
@@ -2049,7 +2206,7 @@ at once while the vault and the gateway keep serving.
 
   | ID | Invariant |
   | --- | --- |
-  | P1 | **No secret out.** No portal answer, page or header carries a secret value, token, code, verifier, `state`, client secret, setup code, gateway key, placeholder, client token or hash, or passkey private material. The one bearer it hands out is a new session's own header half, in the answer that mints it; a callback flow's binding cookie goes only in that flow's start answer, as an HttpOnly cookie. The socket's `POST /setup-code` and `GET /gateway-key` are the only endpoints anywhere that return a credential |
+  | P1 | **No secret out.** No portal answer, page or header carries a secret value, token, code, verifier, `state`, client secret, setup code, gateway key, placeholder, client token or hash, or passkey private material. The one bearer it hands out is a new session's own header half, in the answer that mints it; a callback flow's binding cookie goes only in that flow's start answer, as an HttpOnly cookie. The socket's `POST /setup-code`, `GET /gateway-key`, `GET /egress-key` (M7) and `GET /policy/export` (M6) are the only endpoints anywhere that return a credential or a placeholder. From M6 this covers history, diffs, plans and the status report too |
   | P2 | **Minimal unauthenticated surface.** Without a session the portal answers only its static files, login, setup redemption and the OAuth callback; every other route gives one 401 before its body is read |
   | P3 | **Admission before routing:** one `Host` naming a listed origin; on `/api/`, `Sec-Fetch-Site: same-origin`; on `POST` and `DELETE`, an `Origin` equal to that origin; method and body within the route's caps. The callback is the one route under other rules (§7.3). The proxy listener never serves the portal |
   | P4 | **Passkeys are the only way in:** a full session comes only from a verified assertion with user verification, or from the enrolment a redeemed setup code allowed |
@@ -2057,7 +2214,7 @@ at once while the vault and the gateway keep serving.
   | P6 | **Step-up runs what it confirmed:** every change runs only from an action the vault holds, after a fresh assertion whose challenge commits to session, action, kind, origin and the held data; single use, 300 s, re-planned before it runs |
   | P7 | **Sessions:** in memory, bound to one origin, both halves needed, minted fresh, bounded in time, ended by logout, restart, "end other sessions", removal of their passkey, a reset enrolment or their origin leaving the policy |
   | P8 | **Setup codes:** only a MAC'd hash stored; 15 minutes; spent when redeemed, before the setup session opens; never logged or shown by the portal |
-  | P9 | **Declarative policy:** no portal or socket route writes policy |
+  | P9 | **Policy writes, per mode:** in declarative mode no portal or socket route writes policy; in managed mode (M6) policy is written only through one writer: a stepped-up portal action within its edit set, or a host-access socket or offline command, each planned, checked and sealed |
   | P10 | **Same rules as the CLI:** secret writes and deletes and OAuth starts and completions go through the socket's own functions |
   | P11 | **Flows are owned:** a flow completes or cancels only for its owner; the callback only holds a code for a portal session's flow |
   | P12 | **One callback, and it only holds:** the only route that takes a provider's redirect is `/oauth/callback/<credential>` on a listed origin, for that credential's own address; it exchanges nothing, and a second, different answer fails the flow |
@@ -2086,13 +2243,13 @@ at once while the vault and the gateway keep serving.
   | X6 | **Mix-up.** A flow records `issuer` and `require_iss` when it starts, and an answer is checked against that record; while a reload has removed or changed `issuer` or loosened `require_iss`, every answer is refused. With `require_iss` an answer without `iss` is refused, and with `issuer` a different `iss` is refused, both before `error` or `code` is read, so no provider text from a mismatched answer is shown or logged. Every registration the vault makes uses the credential's own redirect address unless the operator names another, which the plan flags |
   | X7 | **Registration answers are checked, not trusted.** The redirect addresses exactly the one requested; an authentication method the vault speaks, consistent with whether a secret came back; `grant_types`, when present, holding `authorization_code` and `refresh_token`; a client ID of 1-255 printable ASCII without space, quote, backslash or `$`, and not starting `store:` or `env:`; a secret of 1-512 printable ASCII. The registration access token and URI are dropped unread |
   | X8 | **Onboarding secrets.** A client secret, registered or given, exists only in the store, under the OAuth binding predicted from the discovered token endpoint and the server's origin, never injectable, written after a passkey prompt (portal) or with host access (socket); a committed policy that derives another binding can't use it. It never appears in an answer, a log line, a fragment or CLI output |
-  | X9 | **Declarative stays declarative.** No portal or socket route writes policy; onboarding and review produce fragments only |
+  | X9 | **Declarative stays declarative.** In declarative mode no portal or socket route writes policy, and onboarding and review produce fragments only; in managed mode (M6) they produce drafts the portal saves, each planned and stepped up (P9) |
   | X10 | **The fragment is safe to commit.** No network-learned value holds `$`, and the compose form writes every `$` as `$$`. Every scalar is a double-quoted string of printable ASCII that passed its schema check, or a boolean or integer; keys are fixed field names or quoted policy names; the output loads with the strict loader to exactly the change it was made from; the running policy with the change merged passes `check` before the fragment is shown; the change never holds a secret value, a placeholder, a client token or a field the policy view hides |
   | X11 | **What the operator reads is what is pinned.** The definition is shown whole, a long line continued with nothing cut; every pin the vault shows or writes equals its own hash of the definition it shows, recomputed from the report; the choices file carries each tool's pin and its report's id, and `--choices` refuses `choices_stale` for a tool whose pin changed; no pin is written for a tool with an error finding; a tool is included only by the operator's act, and a classification is written only as the operator left it; the server's read-only hint pre-fills an included tool's classification as a labelled suggestion and never includes a tool |
   | X12 | **The gateway stays the initiator.** The vault never opens a connection to the gateway; review jobs ride a long poll the gateway starts; each new gateway client is locked to its paths and methods |
   | X13 | **Bridge reach.** In every placement the gateway reaches a bridge only through a vault route that accepts only the gateway and injects that bridge's own token; a bridge checks the token's SHA-256 in constant time and refuses any `Origin`; the hop is plain http only to a loopback or private address or over a standard-tier bridge's Unix socket, and https beyond. Hardened: a bridge is on `bridge-<name>` (vault and bridge only) and, with egress, `egress-<name>` (bridge and role only), never on `internal`, `agents`, `direct` or `egress`, and listens on its `bridge-<name>` address only. Standard: it listens on `mcp.sock` in a tmpfs directory of its own (the bridge's uid, the vault's group, `0750`), so only the vault's uid can connect and only the bridge's uid can create a socket there, whether it runs, was refused or is down; the bridge cuts any peer that isn't the vault's uid, and the vault any peer that isn't that bridge's uid. Remote: the route is https |
   | X14 | **Bridge containment.** A bridge spawns only the program on its own command line; the program's environment holds only listed names and never a `ZOEYMCP_*` one; the bridge's own environment holds nothing the program may not have (its token as a hash only); stdout lines are capped, and a longer line, invalid JSON or a batch ends that program; stderr is capped, rate-limited and only counted unless the operator opts in to text (refused when the bridge holds a secret); the program's requests to the client are answered by the bridge and never relayed; ids and progress tokens are remapped per exchange, and an answer to an id the bridge didn't send is dropped |
-  | X15 | **The egress role.** CONNECT only (else 405); the `host:port` must match the listener's source list exactly; X3's address rule with that source's private marks; a connect to the checked address; one listener per source, bound to that source's network address only; lists from the vault, and every tunnel refused once they are older than 300 s; tunnels to a removed destination closed; no TLS inspection, no cache, no secret but its read-only key |
+  | X15 | **The egress role.** CONNECT only (else 405); the `host:port` must match the listener's source list exactly; X3's address rule with that source's private marks; a connect only to the checked addresses, each in turn within one deadline (M6); one listener per source, bound to that source's network address only; lists from the vault, and every tunnel refused once they are older than 300 s; tunnels to a removed destination closed; no TLS inspection, no cache, no secret but its read-only key |
   | X16 | **One allowlist derivation.** One pure function with named sources (routes, tokens, revocation, connectors, route programs, onboarding) produces the role's lists, the emitter's output and the self-test's expectations; an onboarding allowance holds only that onboarding's hosts before commit, lives in memory, expires with it, and is shown in its plan |
   | X17 | **No agent-facing OAuth.** No listener (proxy, portal, gateway, bridge, egress role) serves authorization-server or protected-resource metadata, a registration, authorization or token endpoint, or a `resource_metadata` challenge; the vault drops an upstream's `WWW-Authenticate` before the gateway sees it |
   | X18 | **Revocation never blocks, and sends secrets only to the token origin.** On a delete of an OAuth refresh-token slot, the vault revokes the token it actually deleted after the delete has been saved, best effort, once, within 10 s, logging only the outcome; a failure changes nothing. `revocation_url` must be on `token_url`'s origin (`check`), and the send checks it again |
@@ -2112,6 +2269,57 @@ at once while the vault and the gateway keep serving.
   **P20**, extended to the bridge's and the role's listeners. G1, G12 and G14 hold on the bridge
   hop unchanged, since a bridge is a remote server: the view holds its `vault_path`, never its
   address, and the vault turns a bridge's 3xx into 502.
+- **Managed policy, drift review, prompts and resources (M6)**, each invariant with effect tests
+  on real sockets or processes (`tests/unit/`, `tests/gateway/`, `tests/portal/`,
+  `tests/acceptance/`). "Refused" means nothing was written, nothing took effect, and the answer
+  names a reason from the refusal catalogue (operations.md §26).
+
+  | ID | Invariant |
+  | --- | --- |
+  | Y1 | **Durable before effect.** In managed mode a policy takes effect only after its revision, then the head naming it, then the anchor are written and fsynced; a crash leaves the old head or the new, never a running policy that isn't the head, except that a write whose install then fails (the gateway-key state can't be written) leaves the head ahead of what runs, with the finding `policy_not_running`, the answer `saved_not_running`, and every later write refused `policy_not_running` until a `SIGHUP` or a restart installs the head |
+  | Y2 | **One gate.** Every policy that can run, in either mode, passed the same function: the strict loader (Y15), the schema, `check` with the vault's own environment, and the managed rules. It runs at a declarative load and reload, at the seed, at every managed start on the head, and at every save, rollback and import, and an error refuses |
+  | Y3 | **Sealed revisions.** A revision is canonical JSON whose body (with a random salt) is AES-256-GCM under `K_policy` and whose whole is HMAC-SHA256 under `K_config` with the context `zoeymcp/policy-revision/v1`; the head and the anchor have their own contexts; all carry the deployment ID. A head, the revision it names or the anchor that fails to verify, decrypt or match the deployment refuses the start; an older revision that does is quarantined and history shows the gap; nothing is skipped silently or replaced by the seed |
+  | Y4 | **Forward-only revisions.** Revision numbers rise by one per write and are never reused or lowered, except that `acknowledge-restore` jumps forward and a reseed starts above every number the volume shows (each recorded as such); each revision names its parent's digest; a rollback, an import and a resume are new revisions; a head behind the anchor, or files above the head beyond one uncommitted revision, refuse the start |
+  | Y5 | **The ratchet.** Each revision carries a sealed ratchet: the gateway and egress key-generation floors, the pins retired by re-pins, the client token hashes and placeholder digests removed, every definition ever classified `approve`, and every `env:` name with the origins it may reach. Every write's candidate is checked against it and may only advance it, except where the **host** names an entry with `--allow-revive` or `--allow-env` (or drops it whole with a reseed's `--new-ratchet`, which prints every entry it forgets); the portal never can; a resume is a host write whose grants are the source's own entries, each named |
+  | Y6 | **The portal's power is bounded.** A portal write is built only from its own operations (review saves, onboarding's adds with gateway-only routes and new store or OAuth credentials, one existing client's servers, one connector's limits and pause, the `tool.*` kinds) or is a rollback whose every change the direction table finds narrower or neutral; no portal write adds a client, a token, a placeholder caller, an `env:` name or reach, changes `admin`, an approvals setting, `gateway.limits`, the egress proxy settings or a connector's bound constraints, or widens anything its kind doesn't name; the one egress change it may make is onboarding's `egress_private` entry after a stepped-up private discovery |
+  | Y7 | **A kind is its diff, and every move to `allow` is listed.** Each write's kind is derived from its structured diff, and a prepared kind that differs, under or over, is refused (`kind_mismatch`): `tool.allow` moves exactly one included tool to `allow` at its current pin and changes nothing else; `tool.repin` changes only pins of tools the report shows drifted, to the pins the vault computed; `policy.save` from a review may also make any number of moves to `allow`; `connector.limits` changes only `paused` and the `max_*` fields of one connector; `client.servers` changes only one existing client's servers. Every move to `allow` a portal write makes (from `approve`, or a re-include as `allow` of a definition once classified `approve`), and every re-pinned `allow` tool kept `allow` though the server no longer marks it read-only, is a row of its own in the plan, listed first among the weakenings with its sentence and the definition at the pin the write sets, every chunk of it; the planner refuses one with no such definition (`allow_needs_review`), or of a marked or consequential tool (`allow_marked`, `consequential_allow`); no bulk control on the review screen makes a move (**Select suggested** starts each box at the row's `prefill`: the head's classification for an included tool, `approve` for a definition once classified so, else the server's suggestion) |
+  | Y8 | **Base revision and one writer.** Every write names the revision it was planned on, so a moved head is refused at confirm, and the write path checks it again in one synchronous section with no `await` from the head check to the install (`policy_moved`), so two writers can't interleave; a retry whose answer was lost is `already_saved`; the plan that runs is the plan confirmed, compared by equality |
+  | Y9 | **What is confirmed is complete.** A write's plan lists every changed field path (through the policy view's allowlist), every restart or redeploy class (Y16), every binding that will stop matching, every forward-only field kept and every revival; nothing is cut: a plan over 400 rows is refused in the portal (`summary_too_large`, with the host's import as the way on) and printed whole on the socket |
+  | Y10 | **Both sides verified.** A drift row shows the reviewed definition only when the vault's own pin of it equals the policy's pin, and the listed one only when it equals the reported pin (X11); the diff between them is computed by the vault; a missing old definition shows the new one whole, labelled |
+  | Y11 | **A pin moves only by a verified re-pin.** A write changes an included entry's pin only to the pin the vault computed from the definition it showed in a review of the running revision (`review_stale` otherwise), checked by the planner for every portal write; rollback and import keep the head's pin for every definition the head has |
+  | Y12 | **Sticky marks survive history.** No rollback or import sets a pin the ratchet retired, so no history operation clears a drift mark by restoring a replaced definition |
+  | Y13 | **No secret on a public surface.** History, diffs, plans, refusals, logs, health and the status report carry no secret value, placeholder, client token or token hash, connector account detail or hidden field value (P1, through the policy view's field list); the full export is R61's fourth scoped exception, admin socket and offline only, and no portal route reaches it |
+  | Y14 | **`env:` is bound.** `check` refuses an `env:` reference to any name under `ZOEYMCP_` in every mode; in managed mode no write may add an `env:` name or widen the set of origins an existing one can be sent to, except a host import or rollback that names it with `--allow-env` |
+  | Y15 | **Strict loading.** Every policy text (a declarative source, the seed, an import) goes through the strict loader: no explicit tag, no alias, no duplicate key, string keys at every depth, no U+0085, U+2028 or U+2029, depth at most 64, integers of at most 32 digits, one document, at most 1 MiB, and every parser exception becomes a refusal with a reason |
+  | Y16 | **Restart honesty.** Every write's plan and answer give each changed path's effect (live, a vault restart, a gateway restart, a key to deliver, an allowlist to re-emit), and no answer says a restart-only change applied; a write that lowers a key generation is refused |
+  | Y17 | **No lockout from the portal.** No portal write changes `admin`; a portal rollback carries the head's `admin` block, and a host rollback takes the target's, its `admin` change shown with the lockout rows and the typed confirmation; the host always has a way back (the socket's `policy import` and `rollback`, and the offline `--state` forms where there is no socket); a host write that drops an origin passkeys were enrolled through, or moves `admin.listen`, asks a second, typed confirmation (`--lockout-ok` without a terminal) |
+  | Y18 | **The seed is a fresh volume's, or the host's.** The vault seeds revision 1 by itself only into a volume holding no state file; on a used volume with no revisions and no anchor it refuses to start until `zoeymcp policy seed --state` runs; a store without its anchor, or an anchor without its store, refuses the start; a parked store is never read as policy |
+  | Y19 | **One source of truth.** The configured source names the mode: a declarative source runs declaratively and parks any revisions; a managed source runs the head and never applies the source again (it may only raise `policy_seed_ignored`, or be imported on purpose with `--from-env`), except that a parked store resumes from it once, as the next revision |
+  | Y20 | **Unreviewed tools are a signal.** A tool a server lists that is neither included nor declined at its current pin makes `zoeymcp review` exit 1, raises `tools_unreviewed`, and marks the server on Home; a declined tool whose pin changes counts again |
+  | Y21 | **Status is the gateway's claim.** The status report is strictly parsed, capped, never holds a definition or a token hash, is shown labelled as the gateway's, and drives only warnings and display; a bad entry drops that entry or server, never the report; its witness revisions are bounded, and the one host act it can prompt (`acknowledge-restore`) takes its target number typed by the host; no vault decision trusts it |
+  | Y22 | **Beyond tools, off unless enabled, pinned and per path.** A server's prompts, resource templates, fixed resources and completions are served only when enabled, included and pinned, are advertised only on that server's path, and are served as their pinned projection; a read answers only for an allowed URI and drops contents for others; prompt and resource contents are sanitized; sampling, roots and upstream elicitation are never relayed and the gateway declares no client capability upstream |
+  | Y23 | **Listen honesty.** The gateway's listen acknowledgment names only notification kinds that path serves; resource subscriptions aren't served |
+  | Y24 | **A restore is visible.** The anchor refuses a head behind it and a store or anchor deleted alone; in managed mode the vault states its deployment and the revision it runs on every view answer; the gateway keeps the highest it has seen per deployment and reports it; a vault behind it raises `policy_behind_witness`, and a vault whose deployment changed under a gateway that saw another at revision 2 or more raises `policy_deployment_changed` (both health errors, logged critical); nothing refuses on it |
+  | Y25 | **Mode-true words.** No answer, page or way on tells a managed operator to commit a fragment, or a declarative one to save; a CLI command that prints a fragment learns the mode from the vault (`GET /policy`) or the gateway (the view's mode header) and refuses when it is managed or unknown |
+  | Y26 | **Bounded.** Revisions kept: 64; drafts: one per session, 300 s; a revision body: 1 MiB; the ratchet: 10,000 entries, refused beyond (`ratchet_full`); a plan: 400 rows in the portal; the status report: 256 KiB, one per 5 s enforced by the vault; history pages: 50 rows; the head and the anchor: 4 KiB each; Home's attention list: 64 items |
+  | Y27 | **Clearing marks.** A portal clear is a step-up action whose run is a gateway job that lists fresh and clears only when every included entry matches (`clear_not_clean` otherwise) |
+  | Y28 | **Waiting approvals.** A re-pin or a drift while an approval waits refuses the call with nothing sent; a move from `approve` to `allow` while it waits (by `tool.allow` or inside a review save) withdraws the prompt in both protocol eras, so nothing is sent for the waiting call whatever the human answers, the ledger records it withdrawn at once (freeing the client's pending slot and the tool's lock), and the next call runs unprompted |
+  | Y29 | **One attention decision.** `common/policy/attention.py` alone decides drifted, marked, unreviewed, changed-declined and missing for a server's tool listing; the gateway's `review` exit code and status report and the vault's health findings and Home items all call it, so they agree |
+
+  M6 restates these earlier invariants: **P1**, extended to history, diffs, plans and the status
+  report, with `GET /policy/export` as the socket's fourth credential-bearing answer; **P6**,
+  seven more step-up kinds (`policy.save`, `tool.repin`, `tool.allow`, `tool.clear`,
+  `client.servers`, `policy.rollback`, `connector.limits`), every managed one bound to its base
+  revision; **P9** and **X9**, per mode (above); **P16**, extended by Y26; **P19**, extended by Y1;
+  **P21**, clarified: policy state is not portal state, and a revision or head that fails to
+  verify stops the vault; **G1**, the view gains `declined` and a server's enabled kinds and their
+  pins, while the mode and revision headers stay outside the view and its digest; **G2**, the
+  gateway gains one vault path, the status report, through its own locked client, and its review
+  poll names the job kinds it runs; **G10**, unchanged: enabling prompts or resources declares no
+  capability upstream; **G17**, above; **H13**, an `input_required` from `prompts/get` or
+  `resources/read` is refused like a tool's; **X11**, extended to the reviewed side (Y10) and to
+  prompts and resources; **X10**, holds for fragments, and the export has its own field table
+  and the same quoting rule.
 - **`zoeymcp selftest --cases cases.yaml`** starts the vault with the operator's **real** policy,
   with every upstream replaced by an echo server that reports what it received, token endpoints
   by an in-process stand-in and mail servers by a recorder, so a self-test never reaches the
@@ -2154,10 +2362,20 @@ at once while the vault and the gateway keep serving.
     and the launcher's bridge checks; and earlier modules given their 95% floor in M7: the
     vault's request handling, store, OAuth protocol, PKCE, login and token manager, the policy
     checks and the gateway's view, and the gateway's pins, findings, admission and egress rules.
+  - **M6:** the strict YAML loader, the parse-and-check gate, the restart classifier, the
+    attention decision, the review change, the ratchet, the structured diff and its direction
+    table, the planner, the export's field table, the seal (revisions, head and anchor) and the
+    start decision, the status report's reader, the portal's drafts and diff rows, the gateway's
+    capability filter, resource matcher and restore witness; and earlier modules M6 changed for
+    security reasons hold or gain their 95% floor (the policy checks, view, change object,
+    emitter and merge, the review report, pin hashing, the review view, routes, actions,
+    refusals and policy view, the vault's internal endpoint table, review jobs, health and
+    gateway keys, and the gateway's pins, egress rules and admission, and the egress role's
+    connect rules).
 
   Security-relevant modules that hold mostly I/O (the vault's and gateway's apps and servers, the
-  admin socket, the upstream pool, the toolkit loader, the CLI) are covered by effect tests
-  instead.
+  admin socket, the upstream pool, the toolkit loader, the CLI, and from M6 the policy store and
+  the managed write path) are covered by effect tests instead.
 - **SDK contract tests** (`tests/sdk/`) pin what the gateway relies on in the MCP SDK (no
   capability declared without a callback, server → client requests answered with errors,
   cancellation, concurrent calls, session expiry, parsed schemas, golden wire output, session
@@ -2165,7 +2383,9 @@ at once while the vault and the gateway keep serving.
   run on every SDK bump. The same directory pins what the SMTP connector relies on in `smtplib`
   (M4), and what the portal relies on in `cryptography` (key loading and signature checks for the
   verifier), h11, uvicorn and Starlette (one `Host`, raw cookies, uvicorn's own answers, the
-  header deadline and connection cap, pre-bound sockets) (M5).
+  header deadline and connection cap, pre-bound sockets) (M5); and, from M6, what the strict
+  loader relies on in PyYAML, what the revisions' encryption relies on in `cryptography`'s
+  AES-GCM, and the SDK's prompt, resource and completion parsing and handlers.
 - **Release checks:** dependency hashes, image content-hash label, SBOM, and a reproducible-build
   check.
 
@@ -2176,7 +2396,7 @@ live in the store.
 
 ```yaml
 version: 1
-mode: declarative
+mode: declarative                           # or managed (§4.6): this then seeds revision 1, once
 egress_proxy: http://egress-vault:3128      # optional: your proxy, or the egress role's listener
 egress_proxy_kind: role                     # `own` (the default) or `role`, ZoeyMCP's own (§4.7)
 egress_private: []                          # host:port a vault connection may resolve privately
@@ -2292,6 +2512,13 @@ gateway:
         include: [get_quote, list_positions]
         allow: [get_quote, list_positions]
       review: {get_quote: "sha256:…", list_positions: "sha256:…"}
+      declined: {get_history: "sha256:…"}   # left out on purpose, at this pin (M6)
+      enable: [prompts, resources]          # off unless listed (M6, §5.1)
+      prompts:
+        include: [daily_brief]
+        review: {daily_brief: "sha256:…"}
+      resources:
+        fixed: {include: ["broker://positions"], review: {"broker://positions": "sha256:…"}}
 
     broker-trade:
       kind: remote
@@ -2329,15 +2556,16 @@ gateway:
 
 Unknown keys are errors. Source-address pins, where wanted, are an optional `sources:` list on a
 caller or client. A remote server also takes `on_drift`, `shared_session`, `wrap_results`,
-`drift_check_interval`, `call_timeout` and `enable` (which must stay empty: resources, prompts
-and the rest stay off until a later milestone).
+`drift_check_interval`, `call_timeout`, `declined`, and `enable` with the `prompts` and
+`resources` blocks it governs (M6, below).
 
 M3's `check` rules for the gateway, beyond the classification and pin rules: a client has
 `token` or `token_sha256`, not both and not neither, and no two clients share one (a literal
 whose hash matches another's counts); a literal `token` warns; a client with no servers, or a
 server assigned to nobody, warns; a server's route must set `stream: true`, use `https` (or, from
 M7, be a local MCP route, below), and
-allow `POST <path>` (and warns without `GET` and `DELETE`); `enable` must be empty; two included
+allow `POST <path>` (and warns without `GET` and `DELETE`); `enable` must be empty (until M6,
+below); two included
 tools may not differ only in case; `max_result_bytes` can't exceed
 `max_upstream_message_bytes`.
 
@@ -2359,7 +2587,23 @@ block is refused on a connector route or a route named `vault`; its `egress` ent
 and may name a private host only when its own `egress_private` lists it too; an egress list where
 nothing could enforce it (a `unix:` upstream, a host that isn't a container alias) warns; and
 `holds_secret: true` always warns, naming where the program could send its secret. `kind: bridge`
-is refused with what to write instead. `enable` is refused with "the gateway serves tools only".
+is refused with what to write instead. `enable` was refused with "the gateway serves tools only"
+until M6.
+
+M6's `check` rules. `mode` is required: `managed` warns that the document seeds the first
+revision and is ignored afterwards, and needs an `admin` block (an error without one). An `env:`
+reference to any name under `ZOEYMCP_` is an error in every mode. `enable` may hold `prompts`,
+`resources` and `completions`, each at most once; `completions` needs `prompts`, or `resources`
+with a template, to complete; `sampling` and `roots` are errors for good, since MCP 2026-07-28
+deprecates them, and `elicitation` stays one; any of them on a `shared_session` server warns. A
+`prompts` or `resources` block with entries needs its kind enabled. Each included prompt,
+template or fixed resource needs a pin, and a pin for an entry not included warns; a template
+is level 1 (whole-segment expressions, at most 8, no operator, query or fragment, at most 1,024
+characters) and a fixed URI absolute with no user info or fragment (at most 2,048), each in the
+characters a URI may hold; `assistant` may name only an included prompt. A tool, prompt or
+resource may not be both included and declined, and a toolkit with `pinning: off` that declines
+a tool warns. A declarative reload that lowers `egress_key_generation` is refused, since it
+would revive a retired key.
 
 M5's `admin` block is optional: without it there is no portal. `admin.origins` lists the exact
 origins the browser uses, 1 to 8 of them, each in browser form (lower case, no path, no default
@@ -2385,12 +2629,17 @@ src/zoeymcp/
                 JSON, the approval text, the ledger format, its report wire format and the
                 per-call join, pin hashing, the review report and suggestions, the address
                 guard's tables (netguard) and the allowlist derivation, logging, the control
-                pipe, admin socket names
+                pipe, admin socket names; from M6 the strict YAML loader, and in common/policy/
+                the gate, the restart classifier, the attention decision, the review change, the
+                ratchet, the structured diff and its directions, the planner and the export
   vault/        app, request handling, the guarded HTTP clients (netclient), credentials, store +
                 keys, bindings, gateway and egress keys, the link socket's peer check, admin
                 socket, the internal endpoint table, secret writes (plan, then run), onboarding
                 (records and the service), review jobs, health, the reported ledger copy
-                (reports, reportstore) and its view, server (start-up and listeners)
+                (reports, reportstore) and its view, server (start-up and listeners); from M6
+                the gateway's status report (statusreport), managed policy: the seal
+                (policyseal), the start decision (policystart), the store (policystore) and
+                the write path (managed)
     oauth/      OAuth: protocol (pure), PKCE and flows, the token manager, login, discovery,
                 fetch, client registration
     connectors/ the SMTP connector: message, CONNECT tunnel, session flow, send journal
@@ -2398,16 +2647,20 @@ src/zoeymcp/
                 egressrules, upstream (pool and connections), vaultlink, policyclient, notify,
                 marks, defstore, review and the review-job poller, approvals and approve,
                 committed calls, the ledger and its reporter, toolkits (loader, source, vault
-                client), server
+                client), server; from M6 the capability filter (capabilities), the resource
+                matcher (resourcematch), the restore witness (witness) and the status pusher
+                (statuspush)
   portal/       the admin portal, served by the vault: admission, routes, refusals, display,
                 sessions, limits, actions (step-up), WebAuthn, passkeys, setup codes, the
-                listener, the policy view, the review view, the app, and static/ (the page, its
-                scripts, the review screen's script and stylesheet, the callback pages)
+                listener, the policy view, the review view, the app, from M6 drafts and the
+                policy diff's rows (policydiffview), and static/ (the page, its scripts, the
+                review screen's, the drift rows' and the managed Policy page's scripts and the
+                stylesheet, the callback pages)
   toolkit/      the toolkit SDK: parameters, plans, slot rules, results, context, testing
   selftest/     the route self-test: cases, echo server, runner
   entrypoint/   the standard tier's launcher (env: pure checks, bridges' included; launcher: I/O)
   cli/          every command (main), the admin-socket client, review and ledger rendering,
-                onboarding's commands, the choices file
+                onboarding's commands, the choices file, the policy commands (policy, M6)
   bridge/       stdio ↔ streamable HTTP: admission, framing, the relay, sessions, the program's
                 environment (pure); the program, the listener, the server, main (I/O)
   egress/       the CONNECT-only allowlist proxy: connect rules (pure), allowlist, listeners,
@@ -2441,14 +2694,16 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | M4 | **Approvals:** elicitation back end, locks, ledger; toolkit SDK and the derived-image example; SMTP connector + example toolkits | S12 (sampling, elicitation), S13–S16 |
 | M5 | **Portal v1:** the admin listener (opt-in `admin` block, exact origins), setup codes issued from the host, passkeys with our own verifier, two-half sessions, step-up actions, browser hardening, write-only secrets, OAuth connect by paste and by the portal's callback (owned flows, completed with a passkey), credential health (`zoeymcp health` and the Home page), the gateway's ledger pushed to an append-only copy in the vault and its Ledger page, the read-only declarative policy view; an OAuth credential on a gateway-served remote MCP route without discovery; the image smoke's portal checks, one `tools/list` and `tools/call` per tier and SSE through the `lan` proxy | portal tests; S6 on S10 (`remote-mcp-oauth.yaml`) |
 | M7 | **Onboarding, the egress role and the bridge:** MCP onboarding by URL (discovery, a given client or dynamic client registration, mix-up checks) in the CLI and the portal, ending in the first-time tool review (pick, classify, pin) run by the gateway as a job for the vault, and policy fragments with `check --with`; the vault's address guard on every connection; revocation on delete; the allowlist emitter and the built-in `egress` role with the `egress-proxy` profile; `bridge` as an upstream behind a vault route, in its own container (hardened), under the standard launcher (unconfined) or on another host; the existing-stack recipe | S9, S11 |
-| M6 | **Portal v2:** tool-drift review and re-pin, reusing M7's review screen and fragments; moving a tool from `approve` to `allow`; **managed mode** with versioning, history, rollback, export/import | portal tests |
+| M6 | **Portal v2:** tool-drift review and re-pin, reusing M7's review screen and fragments, with both definitions verified by the vault; declined tools and the new-tool signal; the gateway's status report on Home and in health; clearing marks from the portal; moving a tool from `approve` to `allow`; the strict YAML loader; **managed mode** with sealed revisions, the seed and its guard, history, structured diffs, rollback, export and import over the admin socket and offline, the ratchet, lockout recovery and the restore witness; the portal's edit set (review saves, onboarding's saves, giving a server to an existing client, a connector's limits and pause), with connector constraints a host import; prompts, resources and completions per server; the shipped compose files in managed mode | S12 (the portal's review), S17, S18; portal tests |
 | M8 | **Vault-enforced approvals** (§6.4); out-of-band approvers in the vault (Telegram, the portal queue); image publishing with digests and SBOM | S3 end to end as the approver; S13/S15 again under `vault_approval` |
 
-M1 to M5 and M7 are built. After M5 the order is **M7, then M6, then M8**: an OAuth-protected remote
+M1 to M7 are built. After M5 the order was **M7, then M6, then M8**: an OAuth-protected remote
 MCP server matters more to a declarative deployment than managed mode, and M7's first-time review
 and fragments are what M6's drift review and re-pin reuse. Each milestone ships with its effect
 tests and its shapes' acceptance tests. Nothing merges with a failing mutation run on the policy
-modules. Managed mode is the default from M6 on; until then, only declarative mode exists.
+modules. From M6 `mode` stays required, so nothing switches silently: the README's quickstart and
+both `deploy/` compose files say `managed`, while the examples (the existing-stack compose file
+among them) and the profiles stay declarative, and a git-driven deployment stays first-class.
 
 ## 12. Decisions and open questions
 
@@ -2473,7 +2728,7 @@ modules. Managed mode is the default from M6 on; until then, only declarative mo
 | Default `redirect_uri` (M2) | `http://127.0.0.1/callback`, no port: RFC 8252 and Spotify accept it, and one string is registered once | §7.4 |
 | CLI consent (M2) | paste the redirected address; the CLI never listens on a port | §7.4 |
 | MCP library (M3) | the official `mcp` SDK 2.3.0, low-level API, hash-pinned, in the gateway's environment only; accepted with `httpx2` and about a dozen packages. Dual-era support is the hard part, and the SDK is boxed in by our admission checks and egress filter | §5 |
-| Scope in M3 | tools only; `enable` is a `check` error until a later milestone | §5.1 |
+| Scope in M3 | tools only; `enable` is a `check` error until a later milestone (M6 lifted it for prompts, resources and completions, and refuses sampling and roots for good: §12.1.4) | §5.1 |
 | Protocol floor (M3) | 2026-07-28, 2025-11-25 and 2025-06-18 in both directions; 2025-03-26 and HTTP+SSE refused | §5.0 |
 | Packaging (M3) | one image with two virtual environments; the vault's interpreter never has `mcp` or `httpx2` | §3.3 |
 | Client tokens (M3) | stored as SHA-256 hashes (`token_sha256`); tokens are random, so no slow KDF; no `X-Forwarded-For` trust | §3.2, §5.0.1 |

@@ -5,10 +5,12 @@ remote MCP servers in both deployment tiers (M3, §9 onwards), approvals, the SM
 and toolkits (M4, §19 onwards), the admin portal (M5, §26), and M7: onboarding a remote MCP
 server by URL (§11), your own egress proxy (§28), fitting ZoeyMCP into a stack that already has
 one (§29), a first hardened deployment end to end (§30), the egress role (§31), the bridge
-(§32) and a stdio server behind one in each placement (§33). M6, in progress: drift review in
-the portal (§12) and managed policy (§34), the vault keeping the policy as revisions. §27 says
-which hosts are supported. The design and the reasons behind it are in [design.md](design.md); this page is
-the how-to.
+(§32) and a stdio server behind one in each placement (§33); and M6: drift review, re-pinning,
+declined tools and clearing marks in the portal (§12), the gateway's status on Home (§13), moving
+a tool from `approve` to `allow` (§12, §26), prompts, resources and completions (§12), and
+managed policy (§34), the vault keeping the policy as revisions, which the shipped compose files
+use. §27 says which hosts are supported, and §35 lists the fast ways to stop something. The
+design and the reasons behind it are in [design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the
@@ -587,8 +589,8 @@ refuses.
 to any destination whose name resolves to a private, loopback, link-local or otherwise non-global
 address, for every route's upstream, every token endpoint and every revocation endpoint, as it
 already did for onboarding, unless `egress_private` lists its `host:port`. It resolves the name
-once per connection and connects to the address it checked, so a name can't be pointed at the
-vault's own networks after you added it. A route on your own network then answers 502
+once per connection and connects only to the addresses it checked, so a name can't be pointed at
+the vault's own networks after you added it. A route on your own network then answers 502
 `address_refused` (§4) and a login or refresh fails with the reason `address_refused` (§3), each
 logged as `address_refused` with the destination (§11), and `health` reports it. Add one line per
 such destination and reload; no restart is needed:
@@ -634,6 +636,12 @@ retry until the vault is on M6, so recreate the vault first, then the gateway. U
 is on M6 too, it runs review jobs only, and clearing marks through the vault (the portal's
 **Clear the marks**, or `review --via vault --clear`) is refused `clear_unsupported`: run
 `zoeymcp review <server> --clear` in the gateway's container instead.
+
+**Upgrading to M6: every address.** The egress role (§31) now tries each address a name resolves
+to, in the resolver's order, where it tried only the first, so a host whose first address
+refuses is still reached through the next. In the role and in the vault one connect timeout
+(10 s in the role) covers every attempt together: a first address that never answers uses all of
+it, and the next isn't tried. A name with one address behaves as before.
 
 ## 8. Provider notes
 
@@ -758,6 +766,12 @@ agent that reads a JSON MCP config, typically:
   the policy. The gateway refuses it from its next request, stops its calls and streams in
   flight there (`requests_stopped` in the log; the upstream calls are cancelled), and closes its
   sessions and upstream connections.
+- **In managed mode** (§34) a client and its token are the host's: adding a client, giving it a
+  new token or revoking one is an export, an edit and `zoeymcp policy import`, and no portal
+  change can do it. To cut a leaked token off in a hurry, first take every server from its client
+  in the portal: on the MCP servers page, **Give to clients** on each server it reaches, its box
+  unticked, **Save** (one passkey each, and the gateway refuses it there at once); then import
+  the client's removal.
 - A literal `token:` in the policy still works, with a `check` warning: anyone who reads the
   policy can act as that client.
 - Source pins (`sources:`) match the direct peer address only. Behind the `lan` proxy the peer is
@@ -1592,7 +1606,9 @@ docker compose -f deploy/compose.yaml cp \
   as trusted on each client (`NODE_EXTRA_CA_CERTS=./zoeymcp-lan-root.crt` for Node-based ones).
   The CA lives in the `lan-data` volume, so it survives restarts.
 - `gateway.hosts` must list the name: the shipped policies list `zoeymcp.lan.example`. A 421
-  from the gateway means it isn't listed.
+  from the gateway means it isn't listed. In managed mode (§34) `gateway.hosts` is the host's:
+  set it in the compose policy before the first `up -d`, or later with an export, an edit and
+  `zoeymcp policy import`.
 - `ZOEYMCP_LAN_BIND` (default `0.0.0.0`) picks the host address to publish on.
 - Caddy sees client tokens (it terminates TLS) and holds no other secret.
 - The `lan` proxy forwards only `/s/*` to the gateway: it doesn't front the portal (§26).
@@ -1748,6 +1764,11 @@ mail toolkit: From, To, Subject, then the body as it will be sent).
   hook, not software that reads the message, and not a holder of the client's token.
 - **Approve only what you read.** Keep routine calls in `allow`, so prompts stay rare enough to
   read.
+- **In managed mode** (§34) these settings (`gateway.approvals`, a client's `approvals`: whether
+  it is attended, its `renders`, `confirm_code` and its lower limits) are the host's: an export,
+  an edit and `zoeymcp policy import`. The portal classifies a tool `allow` or `approve` in a
+  review save, and moves one from `approve` to `allow` with a sentence of its own in the plan
+  (§12, §26).
 
 ## 20. Stopping with approved calls running
 
@@ -1904,6 +1925,10 @@ gateway**: code in the gateway process can skip the gateway's approvals.
   toolkit you build yourself; keep `required` otherwise.
 - **Configuration** comes only from the policy (slots and rules) and what the vault answers: the
   standard tier's launcher passes the gateway no other environment.
+- **In managed mode** (§34) adding a toolkit server (its `gateway.servers` entry with its slots,
+  and the routes they name) is an export, an edit and `zoeymcp policy import`, since no portal
+  change adds a route of that kind; review its tools afterwards on the portal's review screen and
+  **Save**, as for any server.
 
 ## 24. What approvals can't do
 
@@ -2578,7 +2603,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `proxy_refused` | Your egress proxy refused the vault's connection to `<host>`. Allow the hosts listed here in it for the vault, then run the same command again. |
 | 502 | `egress_refused` | The egress role refused the vault's connection to `<host>`: it hadn't fetched the onboarding's hosts yet, its key is out of date, or it refused or couldn't reach the host's address. Its egress_refused log line names which; if it hadn't fetched yet, run the same command again. |
 | 409 | `private_needs_direct` | A server on your network can't be onboarded through the egress role, which can't keep its private exception to this onboarding. Onboard it with egress_proxy unset, or add it to the policy by hand. |
-| 409 | `already_configured` | The server `<server>` already reaches this URL, with a credential of kind `<kind>`, not oauth2. Remove it, its route and that credential from the policy and reload first. |
+| 409 | `already_configured` | The server `<server>` already reaches this URL, with a credential of kind `<kind>`, not oauth2. Remove it, its route and that credential from the policy and reload first; in managed mode, export the policy, remove them and import it with zoeymcp policy import. |
 | 409 | `onboarding_mismatch` | The committed policy differs from what the server publishes now, at `<fields>`. Revert the edit, or register a new client with zoeymcp login --mcp URL --reregister. |
 | 409 | `reregister_by_hand` | The credential `<credential>` sets `<field>`, which a re-registration's fragment can't carry (`<why>`). Re-register by hand: edit the credential in the policy. |
 | 502 | `address_refused` | The vault doesn't connect to `<host>`: its name resolves to a private, loopback or reserved address. Nothing was sent to it. |
@@ -2685,7 +2710,9 @@ outside a container there works for trying things out, with these differences:
 | On | What differs |
 | --- | --- |
 | Windows | no admin socket, so no admin CLI against a running vault: issue a setup code with `zoeymcp setup-code --state DIR` (§1), and use the portal for the rest |
-| Windows | no state lock (`state_lock_unavailable` in the log): nothing stops two vaults sharing a state directory |
+| Windows | no state lock (`state_lock_unavailable` in the log): nothing stops two vaults sharing a state directory, and in managed mode two vaults could each write the next revision, forking the policy's history and its counter |
+| Windows | no directory fsync: a crash right after a managed save may lose it, the store falling back to the revision before (§34) |
+| Windows | in managed mode, with no admin socket, `zoeymcp policy` reaches the store only offline: `history`, `diff`, `export`, `import`, `rollback` and `acknowledge-restore` take `--state DIR` with the vault stopped (§34), and the portal does the rest |
 | Windows | toolkits are refused (`no_ownership_on_this_platform`): file ownership can't be checked |
 | Windows | no `SIGTERM`, `SIGINT` or `SIGHUP` handlers: stop with Ctrl-C, and restart to reload the policy |
 | Windows | when a browser drops a connection, Python's event loop may print `ConnectionResetError` tracebacks to stderr, outside the JSON log; they are noise |
@@ -2766,6 +2793,13 @@ routes:
   changes the Squid form's names. The vault can't tell your proxy: after such a change, run
   `--check` (below) and regenerate the file if it differs. The egress role
   (`egress_proxy_kind: role`) takes its lists from the vault, so it needs none of this.
+- **In managed mode** (§34) `egress_proxy`, `egress_proxy_kind` and `egress_proxy_acls` are the
+  host's, as is `egress_private` beyond the entry onboarding adds for a server on your own network:
+  set them in the compose policy before the first `up -d`, or later with an export, an edit and
+  `zoeymcp policy import`, whose plan says when the vault needs a restart (`docker compose -f
+  deploy/compose.hardened.yaml restart vault`). The compose policy is then only the seed, so emit
+  and check the allowlist from the running revision instead: pipe `exec -T vault zoeymcp policy
+  export` into `run --rm --no-deps -T vault check --config - --emit-egress-allowlist ...`.
 
 **Emitting the allowlist.** Run the image, which reads the service's own inline policy (add
 `--config FILE` for a policy file). The policy is checked first: its findings go to stderr, the
@@ -3377,6 +3411,12 @@ docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
 - **A new key.** After `egress_key_generation` is raised and the policy reloaded, run
   `zoeymcp egress-key` again, set the new `ZOEYMCP_EGRESS_KEY`, and run the `up -d` above again,
   which recreates the role with it.
+- **In managed mode** (§34) the two lines and `egress_key_generation` are the host's: uncomment
+  the lines in the compose policy before the first `up -d`, or later export the policy, add them
+  and `zoeymcp policy import` it, then restart the vault as its plan says (`docker compose -f
+  deploy/compose.hardened.yaml restart vault`). A new egress key is the same import with the
+  generation raised (never lowered: the import refuses it); its plan names the key to give the
+  role, and the role's steps above follow it.
 
 ## 32. The bridge
 
@@ -3385,7 +3425,8 @@ of ZoeyMCP it is one more upstream: a `kind: remote` server behind a vault route
 is the bridge and whose header credential holds the bridge's token. It relays JSON-RPC envelopes:
 it rewrites ids and progress tokens so that clients can't collide, and otherwise passes the
 program's bytes through; it parses no tool definition and imports no MCP SDK. This section is
-its reference; §33 is the how-to, with the policy, the image and each placement.
+its reference; §33 is the how-to, with the policy, the image and each placement. In managed mode
+(§34) that route and server are the host's to add, with an import (§33).
 
 ```sh
 zoeymcp bridge --listen unix:/run/zoeymcp-bridge-fetch/mcp.sock --peer-uid 10001 \
@@ -3544,6 +3585,12 @@ tiers' compose overrides.
 | Where its program connects | only through the egress role, to its route's `program.egress` | **anywhere**: nothing confines it | wherever that host lets it |
 
 Bridges work in both tiers; **only the hardened tier confines them**.
+
+**In managed mode** (§34) the bridge's route, its credential and its server are an export, an
+edit and `zoeymcp policy import`, since the portal adds only the routes onboarding by URL makes:
+where a step below says to edit the policy and reload or recreate, that import is the edit, and
+where it says to commit the pins, review the server's tools in the portal and **Save** them. The
+token, the image, the overrides and the bridge's own settings are the same in both modes.
 
 **The token, in every placement.** Every request to a bridge needs its token, which only the
 vault holds: in the hardened tier a container put on the bridge's network by mistake reaches
@@ -4065,6 +4112,27 @@ one is made when it doesn't. `--reason TEXT` is kept with the revision. A reseed
 its new head is written puts the old store back as it was; if even that fails, it says which files
 are still in quarantine (`reseed_incomplete`).
 
+### What writes a revision
+
+Every revision records how it was written, its kind, which the plan, history and the log name.
+The portal writes five, each a save confirmed with one passkey, planned on the head it names,
+and each limited to what its kind may change (a change outside it is refused `kind_mismatch`):
+
+| Kind | Made by | Changes |
+| --- | --- | --- |
+| `policy.save` | a review's **Save**; an onboarding's **Save** (§11, §26) | a server's tools: included, classified, declined, re-pinned, any number moved from `approve` to `allow` (each a row of its own in the plan, with the pinned definition); its prompts' and resources' blocks; onboarding's credential, route for the gateway alone and server, and the `egress_private` entry after a private discovery |
+| `tool.repin` | a review **Save** whose only change is re-pins | drifted tools' pins, only to the pins the vault computed in that review |
+| `tool.allow` | **Allow without asking**, or a review **Save** whose only change is that move | one included `approve` tool moved to `allow`, at its current pin |
+| `client.servers` | **Give to clients** (§11) | one existing client's servers |
+| `connector.limits` | **Pause**, **Resume** and **Save limits** on the Policy page (§22) | one connector's `paused` and its three limits |
+
+and a sixth, `policy.rollback` from the Policy page, only to a revision whose every difference is
+narrower or neutral, keeping the head's `admin` (below). **Clear the marks** writes no revision:
+it is a gateway job, stepped up the same way. Everything else is the host's: `policy.import`
+(below), `policy.rollback` over the socket, `policy.acknowledge` (a restore, or `--from-env
+--baseline-only`), `policy.seed`, `policy.reseed` and `policy.resume` (a return from declarative
+mode). A save takes effect when it is written, except what its plan says needs a restart.
+
 ### The head, history and diffs
 
 Run these in the vault's container over its admin socket (`docker compose -f
@@ -4200,7 +4268,8 @@ offline.
 
 A declarative deployment keeps working as before: nothing is written to `/state/policy`, and the
 portal reads as it did. What is new for it is in §7's "Upgrading to M6" notes (the `ZOEYMCP_`
-reference and YAML tag refusals, tools nobody reviewed, clearing marks). To switch a used volume to
+reference and YAML tag refusals, tools nobody reviewed, clearing marks, the egress role trying
+every address). To switch a used volume to
 managed mode: set `mode: managed` (with an `admin` block), run `check`, then
 
 ```sh
@@ -4296,3 +4365,29 @@ Its log lines:
 None holds a policy value or anything a file holds; `policy_stray_file` names the stray file only,
 and `policy_store_parked` and `policy_resumed` name clients (`client:<name>`), callers
 (`caller:<route>/<index>`), pins (`pin:<server>/<kind>/<name>`) and `env:` names only.
+
+## 35. Emergency stops
+
+When something is going wrong now (an agent doing what it shouldn't, a server that turned
+hostile, a token that leaked), these stop it, fastest first. Each is undone the way it is done.
+
+- **Stop the gateway.** No agent reaches any server while it is down:
+  `docker compose -f deploy/compose.hardened.yaml stop gateway`. The standard tier has one
+  container for both roles, so stop it whole: `docker compose -f deploy/compose.yaml stop
+  zoeymcp`. An approved call already running is let finish first (§20).
+- **Delete a credential's or a connector's secret** on the portal's Secrets page, with a passkey
+  (or `zoeymcp secret delete NAME`): every route or connector that uses it answers
+  `credential_unavailable` from the next request, and a deleted OAuth refresh token is revoked
+  at its provider, best effort (§2). Entering the secret again undoes it; an OAuth grant needs
+  `zoeymcp login` or the portal's Connect.
+- **Pause a connector.** In managed mode, **Pause** on the Policy page, one passkey, at once
+  (§22); in declarative mode, `paused: true` in the policy and a reload or a recreate (§7). Sends
+  are refused at once (`connector_paused`), and resuming needs no password.
+- **Cut a leaked agent token off** by taking every server from its client. In managed mode, on
+  the MCP servers page, **Give to clients** on each server the client reaches, its box unticked,
+  then **Save** (one passkey each); the gateway refuses the client there at once. Then remove the
+  client, or give it a new `token_sha256`, with an export, an edit and `zoeymcp policy import`
+  (§10). In declarative mode, remove the client (or its `token_sha256`) and reload (§10).
+
+After any of these, read what happened: `zoeymcp health`, the ledger (§21) and the vault's and
+the gateway's logs.
