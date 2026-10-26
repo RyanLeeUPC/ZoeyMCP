@@ -13,7 +13,10 @@ The vault runs in its own interpreter (``procs.py``), killed (SIGKILL) while a h
 - a write killed after its head, before the anchor, runs the new head, and the anchor is
   rewritten (FM-2);
 - a master-key rotation killed after its first re-sealed revision is refused without the
-  previous key, naming the key the files were written under, and finishes with it (FM-3).
+  previous key, naming the key the files were written under, and finishes with it (FM-3);
+- the host's own save, an import over the admin socket from its own process, killed after its
+  revision (FM-1) or after its head (FM-2): the caller gets no answer, and the same import
+  again is a fresh write after the first kill and ``already_saved`` after the second (FM-16).
 
 Then J16's refusals, each naming its cause and the way out in the host's commands. The stores
 are made in this process (``load_runtime``), the way a vault makes them. Linux only: these are
@@ -28,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.vault.keys import KeySet, generate_master_key
@@ -36,7 +40,7 @@ from zoeymcp.vault.policystart import Ok, revision_file
 from zoeymcp.vault.policystore import PolicyStore
 from zoeymcp.vault.server import load_runtime
 
-from .procs import ManagedVault, managed_policy, wait_file
+from .procs import ManagedVault, Process, managed_policy, start, wait_file, wait_port
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="the process crash tests run on Linux (M6 design P.2)"
@@ -164,6 +168,101 @@ def test_kill_before_anchor(tmp_path: Path) -> None:
     output = made.output()
     assert events(output, "policy_resumed") == []
     assert [line["revision"] for line in events(output, "policy_head")] == [2]
+
+
+def socket_vault(tmp_path: Path) -> ManagedVault:
+    """A vault seeded at revision 1 by its first start, stopped, with an admin socket the host's
+    commands reach."""
+    made = vault(tmp_path)
+    made.admin_socket = True
+    made.start()
+    made.stop()
+    return made
+
+
+def held_save(made: ManagedVault, hold: str, tmp_path: Path) -> tuple[Path, Process]:
+    """The vault started with ``hold``, and the host's import of an edited export (agent2
+    added, revision 2) sent over its socket from its own process, which the hold keeps waiting
+    for its answer until the vault is killed. The edited export, and the import's process."""
+    marker = tmp_path / "held"
+    process = made.launch(holds={hold: marker})
+    wait_port(made.portal, process)
+    wait_file(made.socket, process)
+    code, out, err = made.cli(["policy", "export"])
+    assert code == 0, err
+    first, _, rest = out.partition("\n")
+    data = yaml.safe_load(rest)
+    data["gateway"]["clients"]["agent2"] = {"token_sha256": "sha256:" + "2" * 64}
+    edited = tmp_path / "policy-export.yaml"
+    edited.write_bytes((first + "\n" + json.dumps(data) + "\n").encode())
+    argv = ["policy", "import", str(edited), "--yes", "--accept-widening"]
+    caller = start(argv, env=made.environ(), log=tmp_path / "import.log")
+    wait_file(marker, process)
+    made.kill()
+    code = caller.popen.wait(60)
+    assert code != 0, caller.output()
+    assert "Imported as revision" not in caller.output()
+    return edited, caller
+
+
+def test_kill_before_head_of_a_save(tmp_path: Path) -> None:
+    """FM-1, Y1, Y4 for a host's save: an import over the socket killed after revision 2's file,
+    before the head: its caller gets no answer; the next start runs revision 1 and moves the
+    file to quarantine as uncommitted; the same import again is a fresh write of revision 2."""
+    made = socket_vault(tmp_path)
+    edited, _ = held_save(made, "pause_after_revision", tmp_path)
+    held = (made.state / revision_file(2)).read_bytes()
+    made.start()
+    try:
+        assert opened_running(made) == 1
+        argv = ["policy", "import", str(edited), "--yes", "--accept-widening"]
+        code, _, err = made.cli(argv)
+        assert code == 0, err
+        assert "Imported as revision 2." in err
+    finally:
+        made.stop()
+    found = opened(made)
+    assert (found.revision, found.top.header["kind"]) == (2, "policy.import")
+    assert (made.state / "policy" / "quarantine" / "2.uncommitted.json").read_bytes() == held
+    assert (made.state / revision_file(2)).read_bytes() != held
+    output = made.output()
+    assert [line["revision"] for line in events(output, "policy_save_uncommitted")] == [2]
+    assert [line["revision"] for line in events(output, "policy_imported")] == [2]
+
+
+def test_kill_before_anchor_of_a_save(tmp_path: Path) -> None:
+    """FM-2 and FM-16 for a host's save: an import over the socket killed after its head, before
+    the anchor: its caller gets no answer; the next start runs revision 2 and rewrites the
+    anchor; the same import again is ``already_saved`` as revision 2, and writes nothing."""
+    made = socket_vault(tmp_path)
+    edited, _ = held_save(made, "pause_after_head", tmp_path)
+    anchor = unseal_anchor((made.state / "policy-anchor.json").read_bytes(), keys(made), None)
+    assert anchor.highest == 1
+    made.start()
+    try:
+        argv = ["policy", "import", str(edited), "--yes", "--accept-widening"]
+        code, _, err = made.cli(argv)
+        assert code == 0, err
+        assert "This was already written as revision 2." in err
+    finally:
+        made.stop()
+    found = opened(made)
+    assert (found.revision, found.anchor_stale) == (2, False)
+    anchor = unseal_anchor((made.state / "policy-anchor.json").read_bytes(), keys(made), None)
+    assert anchor.highest == 2
+    output = made.output()
+    # The killed save is logged only once committed whole; the retry wrote nothing.
+    assert events(output, "policy_imported") == []
+    # The seed's start, the held one, and the start after the kill.
+    assert [line["revision"] for line in events(output, "policy_head")] == [1, 1, 2]
+
+
+def opened_running(made: ManagedVault) -> int:
+    """The head revision the running vault answers over its socket."""
+    code, out, err = made.cli(["policy", "head", "--format", "json"])
+    assert code == 0, err
+    revision: int = json.loads(out)["revision"]
+    return revision
 
 
 def test_kill_during_rekey(tmp_path: Path) -> None:

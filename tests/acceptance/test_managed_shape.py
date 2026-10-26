@@ -1,7 +1,9 @@
-"""S17, Managed policy lifecycle (M6 design O.5; J4-J10 and J16 here, to the point the steps so
-far reach, the rest in the steps that build them): real vault processes on one state directory,
-with the host's ``zoeymcp policy`` commands run beside them as ``docker compose run`` runs them,
-or as ``docker compose exec`` runs them over the vault's admin socket.
+"""S17, Managed policy lifecycle (M6 design O.5; J4-J11, J14-J16 here, J12 in
+``test_prompts_resources_shape.py``, the crash during a save in ``test_policy_crash.py``): real
+vault processes on one state directory, with the host's ``zoeymcp policy`` commands run beside
+them as ``docker compose run`` runs them, or as ``docker compose exec`` runs them over the
+vault's admin socket, and a real gateway process where a journey needs one, over the hardened
+tier's TCP link with the gateway key or, on Linux, the standard tier's link socket.
 
 - J4: a fresh volume seeds revision 1 from ``ZOEYMCP_CONFIG`` by itself, then runs the head with
   the policy removed, and names a changed one ignored (F.5);
@@ -21,7 +23,23 @@ or as ``docker compose exec`` runs them over the vault's admin socket.
 - J6-J8 and J10's export (step 14a): an export edited and imported over the socket, the compose
   policy recorded or imported with --from-env, a diff and a rollback, a broken admin rolled
   back, an import with the vault stopped, and a declarative export that starts the vault
-  declaratively. The admin socket is a Unix socket, so its rows run where there is one.
+  declaratively. The admin socket is a Unix socket, so its rows run where there is one;
+- Y19 (step 22): F.1's rows as processes: the mode comes from the source, a source that doesn't
+  load or fails check is ignored beside a head and refused beside a parked store, and a store
+  that doesn't verify is left alone by a declarative start;
+- J10 (step 22): back to declarative, parking the store, and back to managed, resuming it as the
+  next revision; a stale declarative file that brings back a removed client is named at the
+  park and at the resume (FM-26, T-16);
+- J15 (step 22): an import that needs a vault restart, health's ``policy_restart_needed`` until
+  it; the gateway key rotated by an import, not by the compose variable;
+- Y12 (step 22): a removed client's token refused; the portal's rollback that would revive it
+  refused, the host's with --allow-revive done, and the token works again;
+- S17's saves (step 22): **Allow without asking**, a rollback from the Policy page and a
+  connector's Pause, each with the test authenticator's passkey (the review saves, the clear
+  and Give to clients are J11's, J12's, J14's and S12's);
+- J14 (step 22): the quickstart in both tiers, prompt for prompt: J14s's seed, ``secret set``,
+  ``setup-code`` and the review's Save over the link socket; J14h's five prompts for an OAuth
+  server added by its URL (the fakes on their names through a resolver map, as S9's).
 
 The state lock is ``flock``, which Windows lacks, so the seed's wait for the vault runs where there
 is one.
@@ -50,6 +68,7 @@ from tests.fakes.browser import Browser, Page
 from tests.fakes.mcp_server import PATH, McpFake, base_tools
 from tests.gateway.rig import pin_of_fake
 from tests.portal.flows import enrol, login, redeem
+from zoeymcp.common.policy.schema import RemoteServer, hash_token
 from zoeymcp.gateway import witness
 from zoeymcp.vault.keys import KeySet, generate_master_key
 from zoeymcp.vault.managed import head_policy
@@ -520,20 +539,25 @@ def test_offline_import(tmp_path: Path) -> None:
 WITNESS_WAIT = 150.0  # a vault restart, the gateway's backoff, and its status within the minute
 
 
-def gateway_on(made: ManagedVault, state: Path, port: int | None = None) -> Process:
-    """The gateway on the vault's TCP listener with the gateway key, as the hardened tier runs
-    it, on its own volume ``state``: kept when the vault's is restored or wiped. Its agents'
+def gateway_on(
+    made: ManagedVault, state: Path, port: int | None = None, *, generation: int = 1
+) -> Process:
+    """The gateway on the vault's TCP listener with the gateway key of ``generation``, as the
+    hardened tier runs it, or on the vault's link socket when it has one, as the standard tier
+    does; on its own volume ``state``: kept when the vault's is restored or wiped. Its agents'
     listener is on ``port`` (any free one by default)."""
     state.mkdir(mode=0o700, exist_ok=True)
     port = port or free_port()
-    keys = KeySet.from_text(made.env["ZOEYMCP_MASTER_KEY"])
+    link, env = f"unix:{made.link}", {}
+    if not made.link_socket:
+        keys = KeySet.from_text(made.env["ZOEYMCP_MASTER_KEY"])
+        link = f"http://127.0.0.1:{made.port}"
+        env = {"ZOEYMCP_GATEWAY_KEY": keys.gateway_key(generation)}
     argv = [
-        "gateway", "--vault", f"http://127.0.0.1:{made.port}", "--listen", f"127.0.0.1:{port}",
-        "--state", str(state), "--admin-socket", "none",
+        "gateway", "--vault", link, "--listen", f"127.0.0.1:{port}", "--state", str(state),
+        "--admin-socket", "none",
     ]  # fmt: skip
-    process = start(
-        argv, env={"ZOEYMCP_GATEWAY_KEY": keys.gateway_key(1)}, log=state.parent / "gateway.log"
-    )
+    process = start(argv, env=env, log=state.parent / "gateway.log")
     wait_port(port, process)
     return process
 
@@ -648,12 +672,13 @@ def notes_policy(portal: int, upstream: str, pins: dict[str, str]) -> dict[str, 
     )
 
 
-def served(port: int) -> list[str] | None:
-    """The tools the gateway on ``port`` serves agent1 from notes, as an agent lists them; None
-    while it can't answer (the vault restarting, the gateway's backoff)."""
+def served(port: int, token: str = AGENT_TOKEN) -> list[str] | None:
+    """The tools the gateway on ``port`` serves the client of ``token`` (agent1's by default)
+    from notes, as an agent lists them; None while it can't answer (the vault restarting, the
+    gateway's backoff, a token it refuses)."""
 
     async def listing() -> list[str]:
-        headers = {"authorization": f"Bearer {AGENT_TOKEN}"}
+        headers = {"authorization": f"Bearer {token}"}
         async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0)) as http:
             url = f"http://127.0.0.1:{port}/s/{SERVER}/mcp"
             async with Client(streamable_http_client(url, http_client=http), cache=None) as agent:
@@ -663,6 +688,20 @@ def served(port: int) -> list[str] | None:
         return anyio.run(listing)
     except Exception:  # the SDK's errors arrive in exception groups
         return None
+
+
+def refused_with(port: int, token: str) -> int | None:
+    """The status the gateway on ``port`` answers an agent's first request with ``token``, or
+    None while it can't answer."""
+    headers = {"authorization": f"Bearer {token}", "accept": "application/json, text/event-stream"}
+    hello = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+    try:
+        answer = httpx2.post(
+            f"http://127.0.0.1:{port}/s/{SERVER}/mcp", headers=headers, json=hello, timeout=30
+        )
+    except httpx2.HTTPError:
+        return None
+    return answer.status_code
 
 
 def shown(page: Page) -> tuple[set[str], list[tuple[str, str]]]:
@@ -904,3 +943,672 @@ def test_wiped_state_is_flagged(tmp_path: Path, over_socket: bool) -> None:
     acknowledged = opened(made)
     assert (acknowledged.revision, acknowledged.top.header["jumped_from"]) == (3, 1)
     assert acknowledged.top.header["author"] == (SOCKET_AUTHOR if over_socket else OFFLINE)
+
+
+# --- the source's mode, and back to declarative (J10, F.1, F.4; Y19, FM-26) --------------------
+
+
+def test_mode_comes_from_the_source(tmp_path: Path) -> None:
+    """Y19, F.1's rows as processes: on a managed store, a source that doesn't load, a managed
+    one that fails check, and none at all each start the head, the first two saying the source
+    is ignored; a declarative one that fails check refuses and parks nothing; a valid one runs
+    declaratively and parks the store, and the next declarative start parks nothing again;
+    parked, no source, one that doesn't load and a managed one that fails check are refused,
+    naming the resume; a store that doesn't verify is left alone by a declarative start
+    (``policy_store_unverified``), its files as they were; and on a fresh volume no source, one
+    that doesn't load and a managed one that fails check are each refused, nothing seeded."""
+    made = vault(tmp_path)
+    made.start()
+    made.stop()
+    before = opened(made)
+    kept = declarative(made)
+    made.config = "version: 1\nmode: [\n"
+    made.start()
+    made.stop()
+    made.config = None
+    made.policy = {"version": 1, "mode": "managed"}  # no admin block: check refuses (A.2 row 2)
+    made.start()
+    made.stop()
+    made.policy = None
+    made.start()
+    made.stop()
+    assert unchanged(made, before)
+    ignored = [line["reason"] for line in events(made.output(), "policy_seed_ignored")]
+    assert ignored == ["unreadable", "fails_check"]
+    made.policy = {**kept, "bogus": 1}
+    assert "bogus" in made.refused()
+    assert opened(made).parked is None
+    made.policy = kept
+    for _ in range(2):
+        made.start()
+        made.stop()
+    assert [line["revision"] for line in events(made.output(), "policy_store_parked")] == [1]
+    assert opened(made).parked == 1
+    parked_text = (
+        "refused to start: this store was parked by a declarative start at revision 1: give the "
+        "policy to resume from, with mode: managed"
+    )
+    made.policy = None
+    assert parked_text in made.refused()
+    made.config = "version: 1\nmode: [\n"
+    assert f"{parked_text}; the policy given is refused: " in made.refused()
+    made.config = None
+    made.policy = {"version": 1, "mode": "managed"}
+    said = made.refused()
+    assert f"{parked_text}; the policy given is refused: " in said
+    assert FAILS_CHECK in said
+    assert opened(made).parked == 1
+    made.policy = kept
+    head = made.state / "policy" / "head.json"
+    good = head.read_bytes()
+    at = good.index(b'"mac":"') + len(b'"mac":"')
+    head.write_bytes(good[:at] + (b"1" if good[at : at + 1] == b"0" else b"0") + good[at + 1 :])
+    tampered = store_bytes(made)
+    made.start()
+    made.stop()
+    [unverified] = events(made.output(), "policy_store_unverified")
+    assert unverified["reason"] == "tampered"
+    assert store_bytes(made) == tampered
+    head.write_bytes(good)
+    fresh = ManagedVault(tmp_path / "fresh", dict(made.env))
+    fresh.tmp.mkdir(mode=0o700)
+    assert "no policy given: use --config or set ZOEYMCP_CONFIG" in fresh.refused()
+    fresh.config = "version: 1\nmode: [\n"
+    assert "invalid YAML" in fresh.refused()
+    fresh.config = None
+    fresh.policy = {"version": 1, "mode": "managed"}
+    assert FAILS_CHECK in fresh.refused()
+    assert not (fresh.state / "policy-anchor.json").exists()
+    assert not (fresh.state / "policy").exists()
+    assert '"event":"policy_seeded"' not in fresh.output()
+
+
+# The gate's finding for a managed policy with no admin block (A.2 row 2).
+FAILS_CHECK = "fails check (1 error(s)): mode: managed mode is edited in the portal"
+
+
+def store_bytes(made: ManagedVault) -> dict[str, bytes]:
+    """The anchor's and every policy/ file's bytes, by path."""
+    found = {"policy-anchor.json": (made.state / "policy-anchor.json").read_bytes()}
+    for path in sorted((made.state / "policy").rglob("*")):
+        if path.is_file():
+            found[path.relative_to(made.state).as_posix()] = path.read_bytes()
+    return found
+
+
+def test_back_to_declarative_and_resume(tmp_path: Path) -> None:
+    """J10, FM-26, F.4, T-16: the head exported as a declarative policy runs declaratively,
+    parking the store; back to managed, the vault resumes: the file it is given becomes the next
+    revision, planned against the parked head, and nothing stale runs. A stale declarative file
+    that brings back a client managed mode removed says so at the park (critical, naming it)
+    and in health while it runs (``policy_declarative_revives``, beside the park's info), and
+    the resume accepts it, the host having run it, and names it once."""
+    made = vault(tmp_path)
+    made.start()
+    made.stop()
+    state = ["--state", str(made.state)]
+    assert add_client(made, "agent2", "2") == 2
+    code, stale, err = made.cli(["policy", "export", "--mode", "declarative", *state])
+    assert code == 0, err
+
+    def remove(data: dict[str, Any]) -> None:
+        del data["gateway"]["clients"]["agent2"]
+
+    text = edited_export(made, remove, state)
+    code, _, err = made.cli(["policy", "import", "-", *state, "--yes"], text)
+    assert code == 0, err
+    code, out, err = made.cli(["policy", "export", "--mode", "declarative", *state])
+    assert code == 0, err
+    current = yaml.safe_load(out)
+    assert (current["mode"], sorted(current["gateway"]["clients"])) == ("declarative", ["agent1"])
+    made.policy = current
+    made.start()
+    made.stop()
+    [parked] = events(made.output(), "policy_store_parked")
+    assert (parked["level"], parked["revision"]) == ("warning", 3)
+    assert opened(made).parked == 3
+    made.policy = {**current, "mode": "managed"}
+    made.start()
+    made.stop()
+    found = opened(made)
+    assert (found.revision, found.parked, found.top.header["origin"]) == (4, None, "resume")
+    [resumed] = events(made.output(), "policy_resumed")
+    assert (resumed["level"], resumed["revision"], resumed["parked_at"]) == ("info", 4, 3)
+    assert resumed["revived"] == 0
+    # A stale file, from before agent2 was removed, flipped to declarative by hand.
+    made.policy = yaml.safe_load(stale)
+    passkey = SoftAuthenticator()
+    with Browser(timeout=60.0) as browser:
+        page = browser.page(f"http://localhost:{made.portal}")
+        made.start()
+        try:
+            assert redeem(page, setup_code(made.state, made.env)).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            assert login(page, passkey).status_code == 200
+            health = page.fetch("GET", "/api/health")
+        finally:
+            made.stop()
+    assert health.status_code == 200, health.text
+    checklist = {finding["code"]: finding for finding in health.json()["checklist"]}
+    assert checklist["policy_store_parked"]["level"] == "info"
+    revives = checklist["policy_declarative_revives"]
+    assert revives["level"] == "warning"
+    assert "client:agent2" in revives["text_shown"]
+    revived = events(made.output(), "policy_store_parked")[-1]
+    assert (revived["level"], revived["revision"], revived["revived"]) == ("critical", 4, 1)
+    assert revived["names"] == ["client:agent2"]
+    made.policy = {**yaml.safe_load(stale), "mode": "managed"}
+    made.start()
+    made.stop()
+    found = opened(made)
+    assert found.revision == 5
+    gateway = head_policy(found).gateway
+    assert gateway is not None
+    assert sorted(gateway.clients) == ["agent1", "agent2"]
+    resumed = events(made.output(), "policy_resumed")[-1]
+    assert (resumed["level"], resumed["revision"], resumed["parked_at"]) == ("warning", 5, 4)
+    assert (resumed["revived"], resumed["names"]) == (1, ["client:agent2"])
+
+
+# --- a save that needs a restart, and the gateway key in managed mode (J15; I.2, Y16) ----------
+
+PROXY_TEXT = (
+    "egress_proxy: the vault's HTTP clients keep the proxy they started with: restart the vault"
+)
+
+
+def restart_findings(made: ManagedVault) -> list[str]:
+    """Health's ``policy_restart_needed`` texts, over the socket."""
+    code, out, err = made.cli(["health", "--json"])
+    assert code in (0, 1), err
+    findings = json.loads(out)["policy"]["findings"]
+    return [f["text"] for f in findings if f["code"] == "policy_restart_needed"]
+
+
+@UNIX
+def test_restart_needed(tmp_path: Path) -> None:
+    """J15, Y16, I.2: an import over the socket that changes egress_proxy says a vault restart
+    is needed, in its plan; health keeps ``policy_restart_needed`` naming the path until the
+    vault restarts, and not after."""
+    made = socket_vault(tmp_path)
+    made.start()
+    try:
+
+        def proxied(data: dict[str, Any]) -> None:
+            data["egress_proxy"] = "http://127.0.0.1:3128"
+
+        argv = ["policy", "import", "-", "--yes", "--accept-widening"]
+        code, _, err = made.cli(argv, edited_export(made, proxied))
+        assert code == 0, err
+        assert f"  Restart needed: {PROXY_TEXT}\n" in err
+        assert restart_findings(made) == [PROXY_TEXT]
+    finally:
+        made.stop()
+    made.start()
+    try:
+        assert restart_findings(made) == []
+    finally:
+        made.stop()
+    assert head_policy(opened(made)).egress_proxy == "http://127.0.0.1:3128"
+
+
+def test_gateway_key_rotation_managed(tmp_path: Path) -> None:
+    """J15's rotation, F-46, OPS-7: in managed mode the compose policy's gateway_key_generation
+    is read only at the seed, so raising it and recreating changes no generation (the source is
+    ignored); an export with the generation raised, imported with the vault stopped, plans the
+    key's delivery, and the gateway then reaches the vault with the new generation's key."""
+    made = vault(tmp_path)
+    assert made.policy is not None
+    gateway_state = tmp_path / "gateway-state"
+    running = made.start()
+    deployment = deployment_of(made)
+    gateway = gateway_on(made, gateway_state)
+    try:
+        wait_for(lambda: seen_by(gateway_state) == {deployment: 1}, "revision 1", gateway, running)
+    finally:
+        gateway.stop()
+        made.stop()
+    made.policy = {**made.policy, "gateway_key_generation": 2}
+    made.start()
+    made.stop()
+    [ignored] = events(made.output(), "policy_seed_ignored")
+    assert ignored["reason"] == "changed"
+    assert head_policy(opened(made)).gateway_key_generation == 1
+
+    def raised(data: dict[str, Any]) -> None:
+        data["gateway_key_generation"] = 2
+
+    state = ["--state", str(made.state)]
+    text = edited_export(made, raised, state)
+    code, _, err = made.cli(["policy", "import", "-", *state, "--yes", "--accept-widening"], text)
+    assert code == 0, err
+    assert "give the gateway key(2) within 5 minutes (zoeymcp gateway-key), or it is refused" in err
+    assert head_policy(opened(made)).gateway_key_generation == 2
+    running = made.start()
+    gateway = gateway_on(made, gateway_state, generation=2)
+    try:
+        wait_for(lambda: seen_by(gateway_state) == {deployment: 2}, "revision 2", gateway, running)
+    finally:
+        gateway.stop()
+        made.stop()
+
+
+# --- a reviving rollback is the host's (Y5, Y12; J6) ------------------------------------------
+
+OTHER_TOKEN = "managed-client-token-0002"
+
+
+def opened_live(made: ManagedVault) -> int:
+    """The head revision the running vault answers over its socket."""
+    code, out, err = made.cli(["policy", "head", "--format", "json"])
+    assert code == 0, err
+    revision: int = json.loads(out)["revision"]
+    return revision
+
+
+@UNIX
+def test_revive_needs_the_host(tmp_path: Path, ca: ProviderCA) -> None:
+    """Y5, Y12, J6: agent2's token, removed by an import over the socket, is refused (401) while
+    agent1's is served; a portal rollback to the revision before is refused
+    ``rollback_revives``, before any prompt; the host's rollback with --allow-revive brings
+    agent2 back, and its token works again."""
+    fake = McpFake(mode="modern")
+    pins = {wire["name"]: pin_of_fake(fake, wire["name"]) for wire in base_tools()}
+    tools = sorted(pins)
+    made = socket_vault(tmp_path)
+    made.ca = ca.ca_file
+    port = free_port()
+    passkey = SoftAuthenticator()
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser(timeout=60.0) as browser:
+        made.policy = notes_policy(made.portal, upstream, pins)
+        made.policy["gateway"]["clients"]["agent2"] = {"token": OTHER_TOKEN, "servers": [SERVER]}
+        page = browser.page(f"http://localhost:{made.portal}")
+        running = made.start()
+        gateway = gateway_on(made, tmp_path / "gateway-state", port)
+        try:
+            assert redeem(page, setup_code(made.state, made.env)).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            assert login(page, passkey).status_code == 200
+            wait_for(lambda: served(port, OTHER_TOKEN) == tools, "agent2 served", gateway, running)
+
+            def remove(data: dict[str, Any]) -> None:
+                del data["gateway"]["clients"]["agent2"]
+
+            code, _, err = made.cli(["policy", "import", "-", "--yes"], edited_export(made, remove))
+            assert code == 0, err
+
+            def agent2_refused() -> bool:
+                return refused_with(port, OTHER_TOKEN) == 401 and served(port) == tools
+
+            wait_for(agent2_refused, "agent2 refused, agent1 served", gateway, running)
+            rollback = {"kind": "policy.rollback", "data": {"base": 2, "revision": 1}}
+            refused = page.fetch("POST", "/api/actions", json=rollback)
+            assert (refused.status_code, refused.json()["reason"]) == (409, "rollback_revives")
+            assert refused.json()["subjects"] == ["client:agent2"]
+            assert opened_live(made) == 2
+            argv = ["policy", "rollback", "1", "--yes", "--accept-widening"]
+            code, _, err = made.cli([*argv, "--allow-revive", "client:agent2"])
+            assert code == 0, err
+            wait_for(lambda: served(port, OTHER_TOKEN) == tools, "agent2 again", gateway, running)
+        finally:
+            gateway.stop()
+            made.stop()
+    found = opened(made)
+    assert (found.revision, found.top.header["target"]) == (3, 1)
+    assert events(made.output(), "step_up_confirmed") == []
+
+
+# --- the quickstart, managed, prompt by prompt (J14; F.3, G.3, G.9) -------------------------
+
+LINK = pytest.mark.skipif(
+    sys.platform != "linux", reason="the standard tier's link socket and admin socket are Linux's"
+)
+API_KEY = "quickstart-notes-key-0001"
+STANDARD = "docker compose -f deploy/compose.yaml"
+
+
+def one_row(page: Page) -> dict[str, Any]:
+    """The MCP servers page's one row."""
+    answer = page.fetch("GET", "/api/servers")
+    assert answer.status_code == 200, answer.text
+    [found] = answer.json()["servers"]
+    row: dict[str, Any] = found
+    return row
+
+
+def portal_review(
+    page: Page, *processes: Process, fresh: bool = True
+) -> tuple[str, dict[str, Any]]:
+    """**Review** on notes in the portal, which the gateway runs: the job's path and its done
+    answer."""
+    queued = page.fetch("POST", f"/api/review/{SERVER}", json={"fresh": True} if fresh else {})
+    assert queued.status_code == 200, queued.text
+    path = f"/api/review/jobs/{queued.json()['job']}"
+    read: dict[str, Any] = {}
+
+    def done() -> bool:
+        answer = page.fetch("GET", path)
+        assert answer.status_code == 200, answer.text
+        read.update(answer.json())
+        return bool(read["state"] == "done")
+
+    wait_for(done, "the review", *processes)
+    return path, read
+
+
+def stepped_up(
+    page: Page, passkey: SoftAuthenticator, kind: str, data: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """An action prepared, its passkey prompt answered and confirmed, as the page's dialog does
+    it: the plan the dialog showed and the confirm's answer."""
+    held = page.fetch("POST", "/api/actions", json={"kind": kind, "data": data})
+    assert held.status_code == 200, held.text
+    assertion = passkey.get(held.json()["options"], page.origin).body()
+    confirm = f"/api/actions/{held.json()['action']}/confirm"
+    saved = page.fetch("POST", confirm, json={"credential": assertion})
+    assert saved.status_code == 200, saved.text
+    plan: dict[str, Any] = held.json()
+    answer: dict[str, Any] = saved.json()
+    return plan, answer
+
+
+def quickstart_policy(portal: int, upstream: str) -> dict[str, Any]:
+    """The standard compose file's policy with ``mode: managed``, edited as J14s says before the
+    first ``up -d``: the server's URL (the fake's, listed in ``egress_private``) and agent1's
+    ``token_sha256``."""
+    route = {
+        "name": "notes-mcp",
+        "prefix": "/notes",
+        "upstream": upstream,
+        "credential": "notes-key",
+        "callers": ["gateway"],
+        "stream": True,
+        "rules": [{"methods": ["POST", "GET", "DELETE"], "paths": [PATH]}],
+    }
+    key = {"kind": "header", "header": "X-API-Key", "format": "{secret}"}
+    server = {
+        "kind": "remote",
+        "route": "notes-mcp",
+        "path": PATH,
+        "tools": {"include": [], "allow": [], "approve": []},
+        "review": {},
+    }
+    return managed_policy(
+        portal,
+        egress_private=[upstream.removeprefix("https://")],
+        credentials={"notes-key": {**key, "secret": "store:notes-key"}},
+        routes=[route],
+        gateway={
+            "clients": {"agent1": {"token_sha256": hash_token(AGENT_TOKEN), "servers": [SERVER]}},
+            "servers": {SERVER: server},
+        },
+    )
+
+
+def standard_walk(tmp_path: Path, ca: ProviderCA) -> None:
+    """J14s, the README's quickstart in the standard tier: the seed from the compose policy, the
+    key set and the setup code issued in the container, then one prompt: the review's Save."""
+    fake = McpFake(mode="modern", key=API_KEY, key_header="x-api-key")
+    made = vault(tmp_path)
+    made.admin_socket = True
+    made.link_socket = True
+    made.ca = ca.ca_file
+    made.env["ZOEYMCP_COMPOSE_CMD"] = STANDARD
+    made.env["ZOEYMCP_EXEC_SERVICE"] = "zoeymcp"
+    port = free_port()
+    passkey = SoftAuthenticator()
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser(timeout=60.0) as browser:
+        made.policy = quickstart_policy(made.portal, upstream)
+        page = browser.page(f"http://localhost:{made.portal}")
+        running = made.start()
+        gateway = gateway_on(made, tmp_path / "gateway-state", port)
+        try:
+            [seeded] = events(made.output(), "policy_seeded")
+            assert (seeded["revision"], seeded["tokens_hashed"], seeded["via"]) == (1, 0, "start")
+            code, _, err = made.cli(["secret", "set", "notes-key"], API_KEY)
+            assert code == 0, err
+            code, out, err = made.cli(["setup-code"])
+            assert code == 0, err
+            assert err.splitlines()[0] == (
+                "One-time code, valid for 15 minutes. "
+                f"Open http://localhost:{made.portal} and choose Set up."
+            )
+            assert redeem(page, out.strip()).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            assert login(page, passkey).status_code == 200
+            path, read = portal_review(page, gateway, running)
+            rows = [row for row in read["tools"] if row["pinnable"]]
+            allow = sorted(row["name"] for row in rows if row["suggested"] == "allow")
+            approve = ["add"]
+            assert allow
+            assert "add" not in allow
+            choices = {"include": [*allow, *approve], "allow": allow, "approve": approve}
+            drafted = page.fetch("POST", f"{path}/diff", json={**choices, "decline_rest": True})
+            assert drafted.status_code == 200, drafted.text
+            draft = drafted.json()
+            # The managed ending: a draft to save, no fragment and no commit or recreate.
+            assert set(draft) == {"draft", "base", "kind", "summary"}
+            assert (draft["kind"], draft["base"]) == ("policy.save", 1)
+            data = {"draft": draft["draft"], "base": 1}
+            plan, saved = stepped_up(page, passkey, "policy.save", data)
+            assert plan["summary"][0][0] == "Revision"
+            assert plan["summary"][0][1].startswith("2, from 1")
+            assert plan["summary"][-1] == ["No restart needed", ""]
+            # agent1 already reaches notes: no Give to clients, only the gateway's new view.
+            wait = {"do": "wait_gateway", "label": "The gateway takes the new view within seconds"}
+            assert (saved["revision"], saved["next"]) == (2, [wait])
+            wanted = sorted([*allow, *approve])
+            wait_for(lambda: served(port) == wanted, "notes served", gateway, running)
+        finally:
+            gateway.stop()
+            made.stop()
+    assert [line["action"] for line in events(made.output(), "step_up_confirmed")] == [
+        "policy.save"
+    ]
+    notes = head_policy(opened(made)).gateway
+    assert notes is not None
+    server = notes.servers[SERVER]
+    assert isinstance(server, RemoteServer)
+    assert sorted(server.declined) == sorted(
+        wire["name"] for wire in base_tools() if wire["name"] not in wanted
+    )
+    assert API_KEY not in made.output()
+
+
+def hardened_walk(tmp_path: Path, ca: ProviderCA) -> None:
+    """J14h, the hardened tier's portal walk for an OAuth server added by its URL: five prompts,
+    each for one thing (register, the Save that adds the server, Connect, the review's Save,
+    Give to clients), the vault and the gateway linked over TCP with the gateway key; then the
+    agent lists the server's tools. No fragment is shown or committed."""
+    # Imported here: test_onboard_shape imports test_mcp_shapes, which imports this module.
+    from contextlib import ExitStack
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    from tests.fakes.browser import loopback
+    from tests.fakes.harness import serve
+    from tests.fakes.resolver import FakeResolver
+    from tests.gateway.rig import token_for
+    from tests.portal.flows import connect_by_callback
+
+    from .conftest import Clock
+    from .test_onboard_shape import (
+        ALLOWED,
+        APPROVED,
+        AUTH,
+        CLIENT,
+        ISSUER,
+        MCP,
+        SERVER_URL,
+        ByName,
+        base_policy,
+        fakes,
+    )
+    from .tls import issue_cert
+
+    auth, mcp = fakes(Clock(), registration="open")
+    certs = tmp_path / "certs"
+    certs.mkdir(mode=0o700)
+    resolver = FakeResolver()
+    ports: dict[str, int] = {}
+    made = vault(tmp_path)
+    made.ca = ca.ca_file
+    made.hooks = tmp_path / "hooks.json"
+    made.policy = {**base_policy(portal_port=made.portal), "mode": "managed"}
+    port = free_port()
+    passkey = SoftAuthenticator()
+    with ExitStack() as stack:
+        for name, app, lifespan in ((MCP, mcp.app(), True), (AUTH, auth.app(), False)):
+            url = stack.enter_context(
+                serve(app, lifespan=lifespan, tls=issue_cert(ca, name, certs))
+            )
+            ports[name] = int(str(urlsplit(url).port))
+            resolver.serve(name, ports[name])
+        resolver.save(made.hooks)
+        provider = httpx.Client(transport=ByName(ports, ca), base_url=ISSUER, trust_env=False)
+        stack.callback(provider.close)
+        browser = stack.enter_context(
+            Browser(address=loopback, remote={ISSUER: provider}, timeout=60.0)
+        )
+        page = browser.page(f"http://localhost:{made.portal}")
+        running = made.start()
+        gateway = gateway_on(made, tmp_path / "gateway-state", port)
+        try:
+            [seeded] = events(made.output(), "policy_seeded")
+            assert (seeded["revision"], seeded["tokens_hashed"], seeded["via"]) == (1, 0, "start")
+            assert redeem(page, setup_code(made.state, made.env)).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            assert login(page, passkey).status_code == 200
+            found = page.fetch("POST", "/api/onboard/discover", json={"url": SERVER_URL})
+            assert found.status_code == 200, found.text
+            plan = found.json()
+            assert plan["next"] == [{"do": "register", "label": "Register its client"}]
+            onboarding = plan["onboarding"]
+            _, made_client = stepped_up(
+                page, passkey, "onboard.register", {"onboarding": onboarding}
+            )
+            assert "diff" not in made_client
+            assert made_client["next"][0]["do"] == "save"
+            assert one_row(page)["state"] == "needs_save"
+            drafted = page.fetch("POST", f"/api/onboard/{onboarding}/fragment", json={})
+            assert drafted.status_code == 200, drafted.text
+            draft = drafted.json()
+            assert (draft["kind"], draft["base"]) == ("policy.save", 1)
+            _, saved = stepped_up(
+                page, passkey, "policy.save", {"draft": draft["draft"], "base": 1}
+            )
+            assert saved["revision"] == 2
+            assert one_row(page)["state"] == "needs_connect"
+            _, connected = connect_by_callback(page, passkey, SERVER)
+            assert connected.status_code == 200, connected.text
+            assert one_row(page)["state"] == "needs_review"
+            path, _ = portal_review(page, gateway, running, fresh=False)
+            choices = {"include": [ALLOWED, APPROVED], "allow": [ALLOWED], "approve": [APPROVED]}
+            drafted = page.fetch("POST", f"{path}/diff", json={**choices, "decline_rest": True})
+            assert drafted.status_code == 200, drafted.text
+            draft = drafted.json()
+            assert (draft["kind"], draft["base"]) == ("policy.save", 2)
+            data = {"draft": draft["draft"], "base": 2}
+            _, reviewed = stepped_up(page, passkey, "policy.save", data)
+            assert reviewed["next"][-1]["do"] == "assign_clients"
+            assert (one_row(page)["state"], one_row(page)["clients_shown"]) == ("reviewed", [])
+            give = {"base": 3, "client": CLIENT, "servers": [SERVER]}
+            _, given = stepped_up(page, passkey, "client.servers", give)
+            assert given["revision"] == 4
+            assert one_row(page)["clients_shown"] == [CLIENT]
+            wanted = sorted([ALLOWED, APPROVED])
+            token = token_for(CLIENT)
+            wait_for(lambda: served(port, token) == wanted, "notes served", gateway, running)
+        finally:
+            gateway.stop()
+            made.stop()
+    assert [line["action"] for line in events(made.output(), "step_up_confirmed")] == [
+        "onboard.register",
+        "policy.save",
+        "oauth.complete",
+        "policy.save",
+        "client.servers",
+    ]
+    assert opened(made).revision == 4
+    assert len(auth.registrations) == 1
+
+
+@pytest.mark.parametrize("tier", [pytest.param("standard", marks=LINK), "hardened"])
+def test_quickstart_managed(tmp_path: Path, ca: ProviderCA, tier: str) -> None:
+    """J14, both shipped tiers as processes, prompt for prompt: J14s (the standard tier, the
+    vault and the gateway on the link socket) and J14h (the hardened tier, over TCP with the
+    gateway key). Each starts from a fresh volume that seeds revision 1 from the compose
+    policy."""
+    if tier == "standard":
+        standard_walk(tmp_path, ca)
+    else:
+        hardened_walk(tmp_path, ca)
+
+
+# --- the portal's other saves, each with a passkey (S17; G.3, H.3, J.4) -----------------------
+
+MAIL = {
+    "kind": "smtp",
+    "host": "smtp.mail.example",
+    "port": 465,
+    "username": "mail-account-user",
+    "password": "store:mail-pass",
+    "from": "zoeymcp@mail.example",
+    "to": ["ops@mail.example"],
+}
+
+
+def test_saves_of_each_kind(tmp_path: Path, ca: ProviderCA) -> None:
+    """S17's saves with a real assertion, as processes: **Allow without asking** on one approve
+    tool (``tool.allow``, its definition from the review the vault holds, logged
+    ``tool_allowed``), a rollback from the Policy page to the revision before it
+    (``policy.rollback``: narrower, so the portal may), and a connector's Pause
+    (``connector.limits``), each one passkey prompt and one revision the vault installs. The
+    review saves (``policy.save``, ``tool.repin``), ``tool.clear`` and ``client.servers`` are
+    walked by J11, J12, J14 and S12's portal rows."""
+    fake = McpFake(mode="modern")
+    pins = {wire["name"]: pin_of_fake(fake, wire["name"]) for wire in base_tools()}
+    made = vault(tmp_path)
+    made.ca = ca.ca_file
+    port = free_port()
+    passkey = SoftAuthenticator()
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser(timeout=60.0) as browser:
+        made.policy = {**notes_policy(made.portal, upstream, pins), "connectors": {"mail": MAIL}}
+        page = browser.page(f"http://localhost:{made.portal}")
+        running = made.start()
+        gateway = gateway_on(made, tmp_path / "gateway-state", port)
+        try:
+            assert redeem(page, setup_code(made.state, made.env)).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            assert login(page, passkey).status_code == 200
+            portal_review(page, gateway, running)  # the definition the move shows
+            moved = {"base": 1, "server": SERVER, "kind": "tool", "name": "echo"}
+            plan, allowed = stepped_up(page, passkey, "tool.allow", {**moved, "pin": pins["echo"]})
+            assert plan["summary"][0][1].startswith("2, from 1")
+            assert allowed["revision"] == 2
+            plan, rolled = stepped_up(page, passkey, "policy.rollback", {"base": 2, "revision": 1})
+            assert plan["summary"][0][1].startswith("3, from 2: the content of revision 1")
+            assert rolled["revision"] == 3
+            paused = {"base": 3, "connector": "mail", "paused": True}
+            plan, limited = stepped_up(page, passkey, "connector.limits", paused)
+            assert ["connectors.mail.paused", "changed"] in plan["summary"]
+            assert limited["revision"] == 4
+            wait_for(lambda: served(port) == sorted(pins), "notes served", gateway, running)
+        finally:
+            gateway.stop()
+            made.stop()
+    assert [line["action"] for line in events(made.output(), "step_up_confirmed")] == [
+        "tool.allow",
+        "policy.rollback",
+        "connector.limits",
+    ]
+    [line] = events(made.output(), "tool_allowed")
+    assert (line["server"], line["name"], line["revision"]) == (SERVER, "echo", 2)
+    found = opened(made)
+    assert [found.top.header["kind"], found.revision] == ["connector.limits", 4]
+    head = head_policy(found)
+    assert head.connectors["mail"].paused is True
+    notes = head.gateway.servers[SERVER] if head.gateway is not None else None
+    assert isinstance(notes, RemoteServer)
+    assert notes.tools.allow == []

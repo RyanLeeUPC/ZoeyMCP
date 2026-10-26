@@ -5,6 +5,12 @@ Agent (the SDK client, both eras) -> gateway -> vault -> the fake MCP server, us
 fake runs in each of its three modes. Every test ends with the sweeps of G13 and G20: the key,
 the client tokens and their hashes, the gateway key and the session ids appear nowhere an agent,
 an operator or a log reader could see them.
+
+S12's drift and flip-back rows also run through the portal's review screen (M6 design O.5, step
+22), in both modes, as processes (``procs.py``'s vault with its portal, a gateway polling it):
+**Clear the marks** (``tool.clear``) and **Accept the new definition** (``tool.repin``, or the
+fragment in declarative mode), the hostile markup on both sides of the diff, and a rollback
+across the re-pin refused (Y12).
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ import json
 import os
 import sys
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -495,6 +501,203 @@ async def test_s12_a_redirect_to_another_route_is_refused(tmp_path: Path, ca: Pr
     assert gateway.seen.events("upstream_redirect_refused") or [
         line for line in gateway.seen.events("request") if line.get("reason") == "redirect refused"
     ]
+
+
+# --- S12 through the portal's review screen (M6 design O.5; J1, J13; Y5, Y12) ----------------
+
+DRIFTED_TOOL = "echo"  # change_tool("description") changes echo's description
+
+
+def joined(lines: list[list[str]]) -> str:
+    """A definition's or a diff's rows as the screen shows them, each line's chunks joined."""
+    return "\n".join("".join(chunks) for chunks in lines)
+
+
+@pytest.mark.parametrize("mode", ["managed", "declarative"])
+def test_s12_drift_and_flip_back_through_the_portal(
+    tmp_path: Path, ca: ProviderCA, mode: str
+) -> None:
+    """S12's drift and flip-back rows through the portal's review screen, as processes (the
+    vault with its portal, a gateway polling it, the fake upstream), in both modes. The tool
+    that flips back stays hidden, marked, until **Clear the marks** (``tool.clear``, a passkey)
+    has the gateway clear it. Changed again, the review shows the row ``drift`` with both
+    definitions and the vault's diff, S12's markup shown as text on both sides; **Accept the
+    new definition** re-pins it: managed, a ``tool.repin`` save with a passkey; declarative, the
+    fragment committed and the vault recreated on it. Managed, the upstream then flips back to
+    the old definition: the tool is hidden again; a portal rollback to before the re-pin keeps
+    the head's pin (H.4), so changes nothing, and once a review save has dropped the tool it is
+    refused ``pin_retired`` (Y12): the old definition stays hidden."""
+    # Imported here: test_managed_shape imports, through test_portal_shapes, this module.
+    from tests.fakes.authenticator import SoftAuthenticator
+    from tests.fakes.browser import Browser
+    from tests.fakes.mcp_server import MARKUP
+    from tests.portal.flows import enrol, login, redeem
+
+    from .procs import free_port
+    from .test_managed_shape import (
+        gateway_on,
+        notes_policy,
+        opened,
+        portal_review,
+        served,
+        stepped_up,
+        vault,
+        wait_for,
+    )
+    from .test_portal_shapes import setup_code
+
+    fake = McpFake(mode="modern", switches={Switch.MARKUP_ECHO})
+    pins = {wire["name"]: pin_of_fake(fake, wire["name"]) for wire in base_tools()}
+    tools = sorted(pins)
+    hidden = [name for name in tools if name != DRIFTED_TOOL]
+    made = vault(tmp_path)
+    made.ca = ca.ca_file
+    port = free_port()
+    passkey = SoftAuthenticator()
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream, Browser(timeout=60.0) as browser:
+        policy = {**notes_policy(made.portal, upstream, pins), "mode": mode}
+        made.policy = policy
+        page = browser.page(f"http://localhost:{made.portal}")
+        running = made.start()
+        gateway = gateway_on(made, tmp_path / "gateway-state", port)
+        try:
+            assert redeem(page, setup_code(made.state, made.env)).status_code == 200
+            assert enrol(page, passkey).status_code == 200
+            assert login(page, passkey).status_code == 200
+            wait_for(lambda: served(port) == tools, "notes served", gateway, running)
+
+            def relisted(change: Callable[[], None], what: str) -> None:
+                """The upstream changes and announces it; the agents' connection lists again.
+
+                A listing that fails (the vault's pooled connection to the fake closed by its
+                keep-alive just then) ends the agents' connection, which only an agent opens
+                again: an agent lists until it is open (past the backoff), and its connect
+                listing, after the change, is a listing of the changed definition."""
+                before = len(served_listings(gateway.output()))
+                failed = len(served_failures(gateway.output()))
+                change()
+                fake.announce()
+
+                def listed() -> bool:
+                    if len(served_failures(gateway.output())) > failed:
+                        served(port)
+                    return len(served_listings(gateway.output())) > before
+
+                wait_for(listed, what, gateway, running)
+
+            # The flip-back row: changed, then the reviewed definition again; the mark holds.
+            relisted(lambda: fake.change_tool("description"), "the listing of the change")
+            wait_for(lambda: served(port) == hidden, "echo hidden", gateway, running)
+            relisted(fake.flip_back, "the listing of the flip back")
+            _, read = portal_review(page, gateway, running)
+            assert {row["name"]: row["state"] for row in read["tools"]}[DRIFTED_TOOL] == "marked"
+            assert served(port) == hidden
+            plan, queued = stepped_up(page, passkey, "tool.clear", {"server": SERVER})
+            assert plan["summary"][0] == ["Clear the drift marks of", SERVER]
+            assert queued["state"] == "queued"
+            cleared: dict[str, Any] = {}
+
+            def clear_done() -> bool:
+                answer = page.fetch("GET", f"/api/review/jobs/{queued['job']}")
+                assert answer.status_code == 200, answer.text
+                cleared.update(answer.json())
+                return bool(cleared["state"] == "done")
+
+            wait_for(clear_done, "the clear", gateway, running)
+            assert cleared["cleared_shown"] == [DRIFTED_TOOL]
+            wait_for(lambda: served(port) == tools, "echo served again", gateway, running)
+            # The drift row: the two definitions and the diff, the markup on both sides.
+            relisted(lambda: fake.change_tool("description"), "the listing of the change again")
+            wait_for(lambda: served(port) == hidden, "echo hidden again", gateway, running)
+            path, read = portal_review(page, gateway, running)
+            [row] = [row for row in read["tools"] if row["name"] == DRIFTED_TOOL]
+            assert row["state"] == "drift"
+            reviewed, now = joined(row["reviewed_lines"]), joined(row["definition_lines"])
+            shown = json.dumps(MARKUP)[1:-1]  # as the JSON lines hold it
+            assert shown in reviewed
+            assert shown in now
+            assert "keeps a copy" in now
+            assert "keeps a copy" not in reviewed
+            diff = joined(row["diff_lines"]).splitlines()
+            assert any(line.startswith("-") and shown in line for line in diff[2:])
+            assert any(line.startswith("+") and "keeps a copy" in line for line in diff[2:])
+            choices = {"include": tools, "allow": [], "approve": tools, "repin": [DRIFTED_TOOL]}
+            drafted = page.fetch("POST", f"{path}/diff", json={**choices, "decline_rest": False})
+            assert drafted.status_code == 200, drafted.text
+            if mode == "managed":
+                draft = drafted.json()
+                assert draft["kind"] == "tool.repin"
+                data = {"draft": draft["draft"], "base": draft["base"]}
+                _, saved = stepped_up(page, passkey, "tool.repin", data)
+                assert saved["revision"] == 2
+            else:
+                fragment = load_mapping(drafted.json()["diff"]["yaml"])
+                given = fragment["gateway"]["servers"][SERVER]
+                assert given["review"][DRIFTED_TOOL] == pin_of_fake(fake, DRIFTED_TOOL)
+                made.stop()
+                policy["gateway"]["servers"][SERVER].update(given)
+                running = made.start()
+            wait_for(lambda: served(port) == tools, "echo re-pinned and served", gateway, running)
+            if mode == "managed":
+                # The upstream undoes the change: the re-pinned definition no longer matches.
+                relisted(fake.flip_back, "the listing of the undone change")
+                wait_for(lambda: served(port) == hidden, "echo hidden at its new pin", gateway)
+
+                def rolled_back(base: int) -> tuple[int, str]:
+                    data = {"base": base, "revision": 1}
+                    answer = page.fetch(
+                        "POST", "/api/actions", json={"kind": "policy.rollback", "data": data}
+                    )
+                    return answer.status_code, answer.json()["reason"]
+
+                # A rollback carries the head's pin of every tool both hold (H.4): nothing moves.
+                assert rolled_back(2) == (400, "no_change")
+                # Once a review save drops echo, a rollback to 1 would bring back its old pin.
+                path, read = portal_review(page, gateway, running)
+                kept = {"include": hidden, "allow": [], "approve": hidden, "decline_rest": False}
+                drafted = page.fetch("POST", f"{path}/diff", json=kept)
+                assert drafted.status_code == 200, drafted.text
+                draft = drafted.json()
+                data = {"draft": draft["draft"], "base": draft["base"]}
+                _, saved = stepped_up(page, passkey, draft["kind"], data)
+                assert saved["revision"] == 3
+                assert rolled_back(3) == (409, "pin_retired")
+                assert served(port) == hidden
+        finally:
+            gateway.stop()
+            made.stop()
+    confirmed = [line["action"] for line in events_of(made.output(), "step_up_confirmed")]
+    managed = ["tool.clear", "tool.repin", "policy.save"]
+    assert confirmed == (managed if mode == "managed" else ["tool.clear"])
+    # The portal's clear; a re-pin's own clear is the policy's (by=policy).
+    by_portal = [
+        line for line in events_of(gateway.output(), "drift_cleared") if line["by"] == "portal"
+    ]
+    assert [line["tools"] for line in by_portal] == [[DRIFTED_TOOL]]
+    if mode == "managed":
+        assert opened(made).revision == 3
+
+
+def served_listings(text: str) -> list[dict[str, Any]]:
+    """The gateway's listings of the agents' upstream connection (not a review's)."""
+    return [line for line in events_of(text, "listing") if line["key"] == "*"]
+
+
+def served_failures(text: str) -> list[dict[str, Any]]:
+    """The failed listings and closes of the agents' upstream connection."""
+    lines = events_of(text, "server_list_failed") + events_of(text, "upstream_closed")
+    return [line for line in lines if line["key"] == "*"]
+
+
+def events_of(text: str, name: str) -> list[dict[str, Any]]:
+    """The log lines named ``name`` in a process's output."""
+    found = []
+    for line in text.splitlines():
+        if line.startswith("{"):
+            record = json.loads(line)
+            if record.get("event") == name:
+                found.append(record)
+    return found
 
 
 @pytest.mark.parametrize(

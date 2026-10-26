@@ -12,7 +12,10 @@
   refusal logged at most once a minute (FM-19); a query, another content type and a body that
   isn't a report are refused before anything is kept;
 - the whole gateway: it pushes after its first view, the vault's health reads it, and a new
-  gateway process pushes again within the minute (FM-20).
+  gateway process pushes again within the minute (FM-20);
+- the report's leak sweep (O.6, Y13): on a policy holding the secret-heavy policy's values, the
+  report, what the vault keeps of it and the gateway's ``GET /status`` hold none of them, no
+  token or its hash, no client name and no definition; health holds none the policy view hides.
 """
 
 from __future__ import annotations
@@ -38,13 +41,33 @@ import pytest
 
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import McpFake, base_tools
-from tests.gateway.rig import KEYS, deployment, gateway, pin_of_fake, raw_policy, until
+from tests.gateway.rig import (
+    CLIENTS,
+    KEYS,
+    RELOAD_PATH,
+    SERVER,
+    agent,
+    deployment,
+    gateway,
+    pin_of_fake,
+    raw_policy,
+    token_for,
+    until,
+)
+from tests.unit.test_leak_sweep import (
+    LITERAL_TOKEN,
+    POLICY_VIEW_HIDES,
+    VAULT_SIDE,
+    secret_heavy_policy,
+)
 from tests.unit.test_peer import my_uid, serve_link
 from zoeymcp.common import logs
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.attention import Attention
-from zoeymcp.common.policy.view import build_view
+from zoeymcp.common.policy.schema import hash_token
+from zoeymcp.common.policy.view import build_view, dump_view
 from zoeymcp.gateway import statuspush, witness
+from zoeymcp.gateway.server import pushed_status
 from zoeymcp.gateway.statuspush import DEBOUNCE, EVERY, StatusPusher, content
 from zoeymcp.gateway.vaultlink import (
     STATUS_MAX_ANSWER_BYTES,
@@ -655,3 +678,112 @@ async def test_the_status_path_checks_before_it_reads(tmp_path: Path, log: io.St
                 assert anonymous.status_code == 403
     [refused] = events(log, "status_refused")
     assert refused["reason"] == "invalid"
+
+
+# --- the report's leak sweep (M6 design O.6, Y13; D-117's M6 obligation, step 22) ---------------
+
+# The secret-heavy policy's values the merged policy below leaves out: its local routes, and so
+# their programs and upstreams, as the vault's other sweeps leave them out.
+LOCAL_ONLY = ("program egress", "program private egress", "local upstream", "unix upstream")
+
+
+def secret_heavy_beside(raw: dict[str, Any]) -> dict[str, Any]:
+    """The rig's policy, ``raw``, with the leak sweep's secret-heavy policy beside it: its egress
+    proxy, admin block, credentials, connector and routes, and its two clients (the literal
+    token's among them) on the rig's server."""
+    heavy = secret_heavy_policy().model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    local = ("leak-route-bridge", "leak-route-socket")
+    routes = [route for route in heavy["routes"] if route["name"] not in local]
+    clients = {
+        name: {**client, "servers": [SERVER]}
+        for name, client in heavy["gateway"]["clients"].items()
+    }
+    return {
+        **raw,
+        "egress_proxy": heavy["egress_proxy"],
+        "admin": heavy["admin"],
+        "credentials": {**raw["credentials"], **heavy["credentials"]},
+        "connectors": heavy["connectors"],
+        "routes": [*raw["routes"], *routes],
+        "gateway": {**raw["gateway"], "clients": {**raw["gateway"]["clients"], **clients}},
+    }
+
+
+async def test_the_status_report_shows_no_policy_value(tmp_path: Path) -> None:
+    """O.6 for the status kind (Y13): a gateway on a policy holding the secret-heavy policy's
+    values and its literal client token, with a drifted tool and tools nobody reviewed. The
+    report it would push (:func:`content` of :func:`pushed_status`), the report the vault keeps
+    and the gateway's ``GET /status`` hold no vault-side value, no client token or its hash, no
+    client name and no tool's definition, only names, pins and counts; and the vault's health
+    after it holds no value the policy view hides, nor a token's hash or a definition."""
+    fake = McpFake()
+    tools = [tool["name"] for tool in base_tools()]
+    include = tools[:2]  # echo, which drifts, and add; the rest nobody reviewed
+    review = {name: pin_of_fake(fake, name) for name in include}
+    with deployment(tmp_path, fake, include=include, review=review) as deployed:
+        vault = deployed.vault
+        assert vault is not None
+        merged = secret_heavy_beside(raw_policy(deployed.fake_url, include=include, review=review))
+        text = json.dumps(merged, separators=(",", ":"))
+        kept = {where: value for where, value in VAULT_SIDE.items() if where not in LOCAL_ONLY}
+        for where, value in kept.items():
+            assert value in text, where  # every sentinel is really in the policy
+        answer = httpx.post(deployed.vault_url + RELOAD_PATH, json=merged, timeout=10)
+        assert answer.status_code == 204, answer.text
+        policy = Policy.model_validate(merged)
+        view = build_view(policy)
+        assert view.gateway is not None
+        assert hash_token(LITERAL_TOKEN) in dump_view(view).decode()  # the gateway holds it
+        fake.change_tool("description")
+        with gateway(deployed, status_push=True) as running:
+
+            def attended() -> bool:
+                report = vault.gateway_status().report
+                if report is None:
+                    return False
+                server = report.servers.get(SERVER)
+                return server is not None and bool(server.drift) and bool(server.unreviewed)
+
+            async with agent(running) as connected:  # the server's connection opens
+                listed = sorted(tool.name for tool in (await connected.list_tools()).tools)
+            assert listed == ["add"]
+            await until(attended, timeout=20)
+            pushed = content(
+                pushed_status(running.app),
+                started=1,
+                max_tools=view.gateway.limits.max_tools_per_server,
+            )
+            assert pushed is not None
+            served = httpx.get(running.admin_url + "/status", timeout=10)
+            assert served.status_code == 200, served.text
+            report = vault.gateway_status().report
+        checked = health(deployed)
+    assert pushed["servers"][SERVER]["drift"] == ["echo"]
+    unreviewed = pushed["servers"][SERVER]["unreviewed"]
+    assert unreviewed
+    assert all(name in tools and pin.startswith("sha256:") for name, pin in unreviewed)
+    shown = {
+        "pushed": statuspush.encoded(pushed).decode(),
+        "kept": repr(report),
+        "status": served.text,
+    }
+    clients = [*CLIENTS, *secret_heavy_policy().model_dump()["gateway"]["clients"]]
+    hashes = {
+        "the literal token's hash": hash_token(LITERAL_TOKEN),
+        "the other token's hash": "3" * 64,
+        **{f"{name}'s hash": hash_token(token_for(name)) for name in CLIENTS},
+        **{f"{wire['name']}'s description": wire["description"] for wire in base_tools()},
+    }
+    hidden = {**kept, **hashes, **{f"client {name}": f'"{name}"' for name in clients}}
+    for where, text in shown.items():
+        for what, value in hidden.items():
+            assert value not in text, f"{what} in {where}"
+    # Health is the vault's own answer to its host, which names credentials, routes and clients
+    # (M.5): it holds nothing the policy view hides, as the vault's sweeps check.
+    answered = json.dumps(checked)
+    assert '"name": "notes"' in answered
+    for what, value in {
+        **{where: VAULT_SIDE[where] for where in POLICY_VIEW_HIDES},
+        **hashes,
+    }.items():
+        assert value not in answered, f"{what} in health"

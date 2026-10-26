@@ -11,7 +11,8 @@ the managed policy store holds after a write until it is killed (``tests/fakes/p
 M6 design O.1). All happen in the launcher below, never in ZoeyMCP's code.
 
 :class:`ManagedVault` is a managed vault on one state directory, started, killed and started
-again, with the host's ``zoeymcp`` commands run beside it (M6 design O.1, O.5).
+again, with the host's ``zoeymcp`` commands run beside it (M6 design O.1, O.5), and, on Linux,
+the gateway's link socket of the standard tier.
 """
 
 from __future__ import annotations
@@ -59,6 +60,13 @@ def free_port() -> int:
         probe.bind(("127.0.0.1", 0))
         port: int = probe.getsockname()[1]
         return port
+
+
+def own_uid() -> int:
+    """This process's uid, which the link socket lets in (Linux only; 0 elsewhere)."""
+    if sys.platform == "win32":
+        return 0
+    return os.getuid()
 
 
 @dataclass
@@ -177,6 +185,12 @@ class ManagedVault:
     admin_socket: bool = False
     # The CA file its TLS clients trust instead of certifi's (a route to a fake upstream).
     ca: Path | None = None
+    # ZOEYMCP_CONFIG's text as given, in place of ``policy`` (a source that doesn't load).
+    config: str | None = None
+    # With the gateway's link socket (Linux), the standard tier's link, for this uid only.
+    link_socket: bool = False
+    # A fake resolver's saved map, for the guarded clients (``start``'s ``hooks``).
+    hooks: Path | None = None
 
     @property
     def state(self) -> Path:
@@ -187,12 +201,18 @@ class ManagedVault:
         return self.tmp / "admin" / "admin.sock"
 
     @property
+    def link(self) -> Path:
+        return self.tmp / "link" / "vault.sock"
+
+    @property
     def log(self) -> Path:
         return self.tmp / "vault.log"
 
     def environ(self) -> dict[str, str]:
         found = dict(self.env)
-        if self.policy is not None:
+        if self.config is not None:
+            found["ZOEYMCP_CONFIG"] = self.config
+        elif self.policy is not None:
             found["ZOEYMCP_CONFIG"] = json.dumps(self.policy)
         if self.admin_socket:
             found["ZOEYMCP_ADMIN_SOCKET"] = str(self.socket)
@@ -209,7 +229,12 @@ class ManagedVault:
             save(held, **holds)
         argv = ["vault", "--listen", f"127.0.0.1:{self.port}", "--state", str(self.state)]
         argv += ["--admin-socket", str(self.socket) if self.admin_socket else "none"]
-        self.process = start(argv, env=self.environ(), log=self.log, ca=self.ca, holds=held)
+        if self.link_socket:
+            self.link.parent.mkdir(mode=0o700, exist_ok=True)
+            argv += ["--gateway-socket", str(self.link), "--gateway-uid", str(own_uid())]
+        self.process = start(
+            argv, env=self.environ(), log=self.log, ca=self.ca, hooks=self.hooks, holds=held
+        )
         return self.process
 
     def start(self) -> Process:
@@ -217,6 +242,8 @@ class ManagedVault:
         wait_port(self.portal, process)
         if self.admin_socket:
             wait_file(self.socket, process)
+        if self.link_socket:
+            wait_file(self.link, process)
         return process
 
     def refused(self, timeout: float = 30.0) -> str:

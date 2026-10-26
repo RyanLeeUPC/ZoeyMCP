@@ -71,7 +71,10 @@ history, a diff, the head and a refused rollback show none of the values the pol
 nor the client token's hash, except the export, which holds the hash (R61's fourth exception);
 nor does a log line. A portal review save (step 15a) leaves none, nor the token's hash, in a log
 line, an answer, its draft or a file; nor do the portal's history, its diffs, or a rollback's plan
-and its write (step 15b).
+and its write (step 15b). Nor do the host's last paths (step 22): the configured policy recorded
+with ``--baseline-only`` and applied with ``--from-env``, an acknowledgment, and health. The
+gateway's status report needs a running gateway: its sweep is in
+``tests/gateway/test_statuspush.py``.
 """
 
 from __future__ import annotations
@@ -2468,6 +2471,76 @@ async def test_the_hosts_socket_commands_show_no_policy_value(
     shown = [*answers, log_lines.getvalue()]
     for value in [*(VAULT_SIDE[name] for name in POLICY_VIEW_HIDES), hash_token(LITERAL_TOKEN)]:
         assert not any(value in text for text in shown), value
+    await rig.aclose()
+
+
+async def test_the_hosts_other_policy_paths_show_no_policy_value(
+    tmp_path: Path, log_lines: io.StringIO
+) -> None:
+    """O.6 end to end (D-117's M6 obligation, step 22): the host's paths the sweeps above leave
+    out, on the secret-heavy policy with its literal client token: the configured policy changed
+    and recorded with ``--baseline-only``, changed again and applied with ``--from-env`` (each
+    planned, then committed), an acknowledgment with nothing to acknowledge, then one of the
+    gateway's claim above the head (planned, then committed: the jump), and health over the
+    socket, its policy section included. No answer and no log line holds a value the policy view
+    hides, nor the client token's hash; no file under the state directory holds a value a
+    revision encrypts, nor the hash."""
+    from .test_admin_policy import PolicyRig, deployment_of, witness_of
+
+    document = secret_heavy_policy().model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    local = ("leak-route-bridge", "leak-route-socket")
+    document["routes"] = [route for route in document["routes"] if route["name"] not in local]
+    for name in ("srv-bridge", "srv-socket"):
+        del document["gateway"]["servers"][name]
+    document["gateway"]["clients"]["hashed"]["servers"] = ["srv-remote", "srv-toolkit"]
+    rig = PolicyRig(tmp_path, json.dumps(document), LEAK_REF_REFRESH="v", LEAK_REF_Q="v")
+    answers = []
+    rig.configured = json.dumps({**document, "egress_key_generation": 2})
+    baseline = [("from_env", "1"), ("baseline_only", "1")]
+    planned, committed = await rig.write("/policy/import", query=baseline)
+    assert committed is not None
+    assert committed.status_code == 200, committed.text
+    answers += [planned.text, committed.text]
+    rig.configured = json.dumps({**document, "egress_key_generation": 3})
+    planned, committed = await rig.write("/policy/import", query=[("from_env", "1")])
+    assert committed is not None
+    assert committed.status_code == 200, committed.text
+    answers += [planned.text, committed.text]
+    nothing = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert nothing.json()["reason"] == "nothing_to_acknowledge"
+    head = rig.vault.store.head
+    assert head is not None
+    witness_of(rig, {deployment_of(rig): head.revision + 5})
+    claimed = await rig.call("POST", "/policy/acknowledge-restore", params=[("plan", "1")])
+    assert claimed.status_code == 200, claimed.text
+    plan = claimed.json()
+    assert plan["revision"] == head.revision + 6
+    headers = {"if-match": f'"{plan["base"]}"', "x-zoeymcp-plan": plan["digest"]}
+    to = [("to", str(plan["revision"]))]
+    jumped = await rig.call("POST", "/policy/acknowledge-restore", headers=headers, params=to)
+    assert jumped.status_code == 200, jumped.text
+    assert rig.vault.store.header is not None
+    assert rig.vault.store.header["jumped_from"] == head.revision
+    answers += [claimed.text, jumped.text]
+    health = await rig.call("GET", "/health")
+    assert health.status_code == 200, health.text
+    vault = rig.vault
+    reader = HealthReader(
+        vault.runtime.store, lambda: vault.app.policy, policy_state=vault.managed.state
+    )
+    section = json.dumps(reader.report()["policy"])
+    assert '"mode": "managed"' in section
+    answers += [nothing.text, health.text, section]
+    lines = [json.loads(line) for line in log_lines.getvalue().splitlines()]
+    assert {"policy_acknowledged", "policy_imported"} <= {line["event"] for line in lines}
+    assert any(line.get("jumped_from") == head.revision for line in lines)
+    shown = [*answers, log_lines.getvalue()]
+    for value in [*(VAULT_SIDE[name] for name in POLICY_VIEW_HIDES), hash_token(LITERAL_TOKEN)]:
+        assert not any(value in text for text in shown), value
+    files = [path.read_bytes() for path in (tmp_path / "state").rglob("*") if path.is_file()]
+    assert files
+    for value in [*(VAULT_SIDE[name] for name in POLICY_VALUES), hash_token(LITERAL_TOKEN)]:
+        assert not any(value.encode() in data for data in files), value
     await rig.aclose()
 
 

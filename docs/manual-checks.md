@@ -27,6 +27,14 @@ and again after any change to that feature's page code or to what the vault send
 | 16, 17 | the MCP servers page: the review screen and the fragments |
 | 18 | the OAuth callback of a client the vault registered |
 | Live S9 | onboarding by URL against a real server (its own section below) |
+| 19 | the review screen's drift rows: the two definitions, their diff, **Clear** and **Select suggested** |
+| 20 | the review screen's **Save** in managed mode: the re-pin and approve -> allow summaries |
+| 21 | the Policy page in managed mode: history, a diff and a rollback |
+| 22 | the Policy page in managed mode: a connector's pause and limits |
+| 23 | the MCP servers page in managed mode: onboarding, **Give to clients**, Home's attention list and the restore banner |
+| 24 | the review screen's prompts and resources |
+
+Items 19-24 are also M6's exit check: each runs once in Chrome or Edge before M6 is done.
 
 ## The setup for every item
 
