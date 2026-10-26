@@ -717,3 +717,72 @@ def test_the_gateways_own_keys_and_texts() -> None:
     assert sanitize.DROPPED_META_KEY == "zoeymcp/dropped"
     assert sanitize.NOT_FOUND == "not found"
     assert {-32002, -32602} == sanitize.UPSTREAM_NOT_FOUND
+
+
+# --- the counts each answer returns ----------------------------------------------------------
+# sanitize_result returns its Stats whether the result is kept or refused (result_sanitized logs
+# revealed, dropped_blocks and wrapped; no log reads omitted_media), so each count sums over
+# every block, and a refused result gives the counts as they stood when it was refused.
+
+SVG = ImageContent(type="image", data=PNG, mime_type="image/svg+xml")
+LINK = ResourceLink(type="resource_link", name="n", uri="file:///etc/passwd")
+# One revealed text block (9 bytes once revealed), one dropped link, one omitted image.
+COUNTED = (text("a" + HIDDEN), LINK, SVG)
+
+
+def test_each_count_sums_over_every_block() -> None:
+    image = ImageContent(type="image", data=PNG, mime_type="image/png")
+    result, stats = run(
+        text("a" + HIDDEN), text("b"), SVG, image, LINK, structured={"k": "v"}, output_check=passes
+    )
+    assert texts(result) == [
+        "a[U+200B]",
+        "b",
+        "[image omitted by the gateway]",
+        "[1 blocks omitted by the gateway]",
+    ]
+    assert stats == Stats(revealed=1, dropped_blocks=1, omitted_media=1, wrapped=False)
+
+
+@pytest.mark.parametrize(
+    ("extra", "options", "outcome", "revealed"),
+    [
+        ((text("x" * 20),), {"max_result_bytes": 28}, "too_large", 1),
+        ((), {"structured": {"a": 1}, "output_check": fails}, "output_refused", 1),
+        (
+            (),
+            {"structured": {"a" + HIDDEN: 1, "a[U+200B]": 2}, "output_check": passes},
+            "output_refused",
+            1,
+        ),
+        # The structured content's revealed string counts too; its 17 bytes are over the 15 left.
+        (
+            (),
+            {"structured": {"s": "v" + HIDDEN}, "output_check": passes, "max_result_bytes": 24},
+            "too_large",
+            2,
+        ),
+    ],
+    ids=["text-over-the-budget", "check-fails", "keys-merge", "structured-over-the-budget"],
+)
+def test_a_refused_result_logs_the_counts_so_far(
+    extra: tuple[Any, ...], options: dict[str, Any], outcome: sanitize.Outcome, revealed: int
+) -> None:
+    result, stats = run(*COUNTED, *extra, **options)
+    assert refused(result, outcome)
+    assert stats == Stats(revealed=revealed, dropped_blocks=1, omitted_media=1, wrapped=False)
+
+
+def test_a_prompts_and_a_reads_counts_sum_over_every_block() -> None:
+    embedded = EmbeddedResource(type="resource", resource=TextResourceContents(uri=URI, text="n"))
+    _, stats = prompt(
+        message("user", text("a" + HIDDEN)), message("user", embedded), description="About"
+    )
+    # A plain description reveals nothing, and a plain resource after a revealed text keeps it.
+    assert stats == Stats(revealed=1, dropped_blocks=0, omitted_media=0, wrapped=False)
+    # A blob, kept or dropped, reveals nothing.
+    _, stats = read(
+        BlobResourceContents(uri=URI, mimeType="image/png", blob=PNG),
+        BlobResourceContents(uri=URI, mimeType="application/pdf", blob=PNG),
+    )
+    assert stats == Stats(revealed=0, dropped_blocks=1, omitted_media=0, wrapped=False)

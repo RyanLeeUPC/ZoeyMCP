@@ -2370,8 +2370,8 @@ README's managed quickstart in both tiers.
     security reasons hold or gain their 95% floor (the policy checks, view, change object,
     emitter and merge, the review report, pin hashing, the review view, routes, actions,
     refusals and policy view, the vault's internal endpoint table, review jobs, health and
-    gateway keys, and the gateway's pins, egress rules and admission, and the egress role's
-    connect rules).
+    gateway keys, and the gateway's pins, egress rules, admission, sanitizing and connection
+    states, and the egress role's connect rules).
 
   Security-relevant modules that hold mostly I/O (the vault's and gateway's apps and servers, the
   admin socket, the upstream pool, the toolkit loader, the CLI, and from M6 the policy store and

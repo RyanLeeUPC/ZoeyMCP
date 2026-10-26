@@ -141,6 +141,7 @@ def test_freshness() -> None:
         ("::1:8090", None),
         ("[::1", None),
         ("[::1]x", None),
+        ("[::1]]", None),  # the first "]" closes the address
         ("[::1]:", None),
         ("[::1]:80a", None),
         ("[localhost]", None),  # brackets are for IPv6 only
@@ -271,6 +272,13 @@ def test_the_first_match_wins_when_hashes_repeat() -> None:
 )
 def test_source_allowed(peer: str | None, allowed: bool) -> None:
     assert source_allowed(peer, ["10.0.0.0/8", "fd00::/8"]) is allowed
+
+
+def test_a_source_may_have_host_bits_set() -> None:
+    # The policy takes a network with host bits set (as schema.py reads it, strict=False), and
+    # so does the check: 10.1.2.3/8 is 10.0.0.0/8.
+    assert source_allowed("10.200.0.1", ["10.1.2.3/8"])
+    assert not source_allowed("11.0.0.1", ["10.1.2.3/8"])
 
 
 def test_no_sources_means_any_peer() -> None:
@@ -475,6 +483,28 @@ def test_bindings_are_bounded_least_recently_used_first() -> None:
     assert sessions.allowed("s3", "alpha", "notes", now=4)
 
 
+def test_binding_a_live_session_again_makes_it_the_most_recent() -> None:
+    sessions = SessionBindings(idle_timeout=1800, capacity=2)
+    sessions.bind("s1", "alpha", "notes", now=0)
+    sessions.bind("s2", "alpha", "notes", now=1)
+    sessions.bind("s1", "alpha", "notes", now=2)  # the same owner: s1 is now the most recent
+    sessions.bind("s3", "alpha", "notes", now=3)
+    assert sessions.allowed("s1", "alpha", "notes", now=4)
+    assert not sessions.allowed("s2", "alpha", "notes", now=4)
+
+
+def test_each_request_in_flight_counts_until_it_ends() -> None:
+    sessions = SessionBindings(idle_timeout=100)
+    sessions.bind("s1", "alpha", "notes", now=0)
+    sessions.begin("s1", now=0)  # an open GET stream
+    sessions.begin("s1", now=0)  # and a POST beside it
+    sessions.end("s1", now=0)
+    assert sessions.allowed("s1", "alpha", "notes", now=10_000)  # the stream is still open
+    sessions.end("s1", now=10_000)
+    assert sessions.allowed("s1", "alpha", "notes", now=10_100)
+    assert not sessions.allowed("s1", "alpha", "notes", now=10_101)
+
+
 def test_a_session_in_flight_is_never_evicted() -> None:
     sessions = SessionBindings(idle_timeout=1800, capacity=1)
     sessions.bind("s1", "alpha", "notes", now=0)
@@ -537,6 +567,19 @@ def test_a_counted_request_can_become_a_stream() -> None:
     assert counters.streams["alpha"] == 0
 
 
+def test_counts_move_one_at_a_time() -> None:
+    counters = ClientCounters()
+    assert counters.try_acquire("alpha", stream=False, max_requests=1, max_streams=1)
+    assert not counters.try_acquire("alpha", stream=False, max_requests=1, max_streams=1)
+    assert counters.try_acquire("beta", stream=True, max_requests=5, max_streams=3)
+    assert counters.try_acquire("beta", stream=True, max_requests=5, max_streams=3)
+    assert counters.try_add_stream("beta", max_streams=3)
+    assert counters.streams == {"beta": 3}
+    counters.release("beta", stream=True)
+    assert counters.requests == {"alpha": 1, "beta": 1}
+    assert counters.streams == {"beta": 2}
+
+
 def test_release_never_goes_below_zero() -> None:
     counters = ClientCounters()
     counters.release("alpha", stream=True)
@@ -589,6 +632,13 @@ def test_parse_message() -> None:
         "method": "ping",
     }
     assert parse_message(b"{}" + b" " * 99, 100) == Refusal(413, "body over the limit")
+
+
+def test_parse_message_takes_a_body_of_exactly_its_limit() -> None:
+    assert parse_message(b'{"a":1}', 7) == {"a": 1}
+    # The limit is the caller's, even past the strict parser's own default of 1 MiB.
+    big = b'{"a":"' + b"x" * 2**20 + b'"}'
+    assert parse_message(big, len(big)) == {"a": "x" * 2**20}
 
 
 @pytest.mark.parametrize(

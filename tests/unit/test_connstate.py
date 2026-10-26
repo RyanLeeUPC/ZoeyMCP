@@ -272,6 +272,12 @@ def test_a_timer_failure_keeps_ready_for_one_more_interval() -> None:
     assert failed.failures == 1
 
 
+def test_the_interval_runs_from_the_last_verified_listing() -> None:
+    state = on_listed(ConnState(), exposing({"a": PIN_A}), now=1000)
+    assert on_timer_failed(state, now=1600, interval=300) == state
+    assert on_timer_failed(state, now=1600.5, interval=300).phase is Phase.FAILED
+
+
 def test_a_timer_failure_without_a_verified_listing_fails() -> None:
     state = ConnState(phase=Phase.READY, evaluation=evaluation())
     assert on_timer_failed(state, now=0, interval=300).phase is Phase.FAILED
