@@ -7,6 +7,10 @@
 #
 #   ZOEYMCP_MASTER_KEY=...  docker compose -f deploy/compose.yaml up -d
 #
+# The policy below is managed (docs/operations.md §34): on a fresh volume it seeds the vault's
+# revision 1, and after that the portal and `zoeymcp policy import` change the policy, not this
+# file. Edit it before the first `up -d`.
+#
 # Agents connect to http://localhost:8090/s/<server>/mcp with "Authorization: Bearer <token>"
 # (zoeymcp client-token makes one). Admin commands run inside the container; started as root,
 # the CLI becomes the uid that owns the socket it needs:
@@ -16,13 +20,15 @@
 #   docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes
 #
 # The portal (docs/operations.md, "The portal") is at http://localhost:8081 in a browser on this
-# host; ZOEYMCP_ADMIN_PORT=9000 moves it to http://localhost:9000 (the origin below follows).
+# host; ZOEYMCP_ADMIN_PORT=9000 moves it to http://localhost:9000. The origin below follows it
+# only at the seed: a port change after it is a host import first (docs/operations.md §30).
 # Issue the first setup code with:
 #
 #   docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp setup-code
 #
 # From another machine, tunnel the same port number (ssh -N -L 8081:127.0.0.1:8081 host), or put
-# an HTTPS proxy of your own in front (operations.md); leave the admin block out for no portal.
+# an HTTPS proxy of your own in front (operations.md). A managed policy needs the admin block;
+# for no portal, set mode: declarative and leave the block out.
 #
 # What this tier gives up: the gateway shares the vault's network namespace, so it has egress
 # of its own, and it reaches the portal's listener, as does any container on this project's
@@ -57,24 +63,32 @@ services:
     stop_grace_period: 420s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
-      # The commands `zoeymcp login --mcp` prints start with this compose command and name this
-      # service (docs/operations.md §11). Run compose with override files, a project directory
-      # or a project name? Set ZOEYMCP_COMPOSE_CMD in .env to the command you type.
+      # The commands ZoeyMCP prints (a refused start's way out, the policy commands' next
+      # steps, and in declarative mode those of `zoeymcp login --mcp`) start with this compose
+      # command and name this service (docs/operations.md §11). Run compose with override
+      # files, a project directory or a project name? Set ZOEYMCP_COMPOSE_CMD in .env to the
+      # command you type.
       ZOEYMCP_COMPOSE_CMD: "${ZOEYMCP_COMPOSE_CMD:-docker compose -f deploy/compose.yaml}"
       # The vault and the gateway are both this container.
       ZOEYMCP_EXEC_SERVICE: zoeymcp
-      # The policy, inline: no bind mounts needed. `docker compose kill -s HUP zoeymcp` reloads
-      # a file-based policy; for this inline one, recreate the container.
+      # The policy, inline: no bind mounts needed. It seeds revision 1 of the managed policy on
+      # a fresh volume and is ignored afterwards (docs/operations.md §34), so set agent1's
+      # token_sha256, the server's URL and gateway.hosts here before the first `up -d`. After
+      # that, change the policy in the portal, or export, edit and `zoeymcp policy import` it:
+      # an edit here only logs policy_seed_ignored.
       ZOEYMCP_CONFIG: |
         version: 1
-        mode: declarative
-        # The portal. Leave this block out for no portal.
+        # mode: declarative instead makes this the policy itself, as before M6: a recreate
+        # applies an edit (docs/operations.md §7).
+        mode: managed
+        # The portal, where a managed policy is changed.
         admin:
           # Every address in the container, since a container's loopback can't be published;
           # the ports line below publishes it on the host's loopback only.
           listen: 0.0.0.0:8081
           # The exact addresses a browser uses, the published port included. Add a tunnel's
-          # other local port, or your HTTPS proxy's https://<name>, here.
+          # other local port, or your HTTPS proxy's https://<name>, here before the first
+          # `up -d`, or later with an import. ZOEYMCP_ADMIN_PORT is read only at the seed.
           origins: ["http://localhost:${ZOEYMCP_ADMIN_PORT:-8081}"]
         credentials:
           notes-key: {kind: header, header: X-API-Key, format: "{secret}", secret: "store:notes-key"}
@@ -87,11 +101,13 @@ services:
             stream: true
             rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
         gateway:
-          # Add the lan profile's name if you use it.
+          # Add the lan profile's name here before the first `up -d` if you use it, or later
+          # with an import.
           hosts: [localhost, 127.0.0.1, "::1", zoeymcp.lan.example]
           clients:
             agent1:
-              # From `zoeymcp client-token`. This one matches no token anyone has.
+              # From `zoeymcp client-token`: replace it before the first `up -d`, since no
+              # portal change sets a token. This one matches no token anyone has.
               token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
               servers: [notes]
           servers:
@@ -99,8 +115,8 @@ services:
               kind: remote
               route: notes-mcp
               path: /mcp
-              # Nothing is served until you review it: `zoeymcp review notes --add <tool>`,
-              # then classify each tool under allow or approve and commit the pins.
+              # Nothing is served until you review it: in the portal, MCP servers, then Review
+              # on notes; classify each tool under allow or approve and Save.
               tools: {include: [], allow: [], approve: []}
               review: {}
     # Loopback only: agents on 8090, and the portal (container port 8081, the listen above).

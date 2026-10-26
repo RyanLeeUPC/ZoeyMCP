@@ -66,34 +66,58 @@ Built so far:
 ## Quickstart (standard tier)
 
 One container, the gateway on `localhost:8090`, for one remote MCP server that takes an API
-key. Build the image (`docker build -t zoeymcp:local .`), then:
+key. The shipped compose file runs the policy in managed mode
+([docs/operations.md](docs/operations.md) §34): its inline policy seeds the vault's first
+revision on a fresh volume, and from then on the portal is where the policy changes. Build the
+image (`docker build -t zoeymcp:local .`), then:
 
 ```sh
 docker run --rm zoeymcp:local keygen          # keep ZOEYMCP_MASTER_KEY; this tier needs only that
 docker run --rm zoeymcp:local client-token    # for the agent; put token_sha256 in the policy
 ```
 
-Edit the policy inside [deploy/compose.yaml](deploy/compose.yaml): the server's URL in
-`routes`, the client's `token_sha256`. Then:
+Before the first `up -d`, edit the policy inside [deploy/compose.yaml](deploy/compose.yaml): the
+server's URL in `routes`, agent1's `token_sha256`. It is read once, to seed revision 1; after that
+an edit there is ignored (and logged as `policy_seed_ignored`), and the token, the URL or the
+hosts change with an export, an edit and `zoeymcp policy import` (operations.md §34). Then:
 
 ```sh
 export ZOEYMCP_MASTER_KEY=...
-docker compose -f deploy/compose.yaml up -d
+docker compose -f deploy/compose.yaml up -d      # seeds revision 1: policy_seeded in the log
 printf '%s' "$API_KEY" | docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp secret set notes-key
-docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes --add <tool>
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp setup-code
 ```
 
-Commit the snippet `review` prints, classifying each tool as `allow` or `approve`, recreate the
-container, and point the agent at the server:
+Open `http://localhost:8081` in a browser on the same host, choose **Set up**, enter the code and
+enrol a passkey. On **MCP servers**, **Review** the `notes` server: include and classify each tool
+you want as `allow` or `approve`, leave **Record the rest as declined** ticked, and **Save**. One
+passkey prompt confirms the plan it shows ("Revision 2, from 1. ..."); no commit and no recreate.
+The gateway serves the tools within seconds. Point the agent at the server:
 
 ```json
 {"mcpServers": {"notes": {"type": "http", "url": "http://localhost:8090/s/notes/mcp",
                           "headers": {"Authorization": "Bearer zgc1-..."}}}}
 ```
 
-**A server that signs in with OAuth** is added by its URL instead, in two commits (operations.md
-§11). Remove the example `notes` server, its route and its credential first (and `notes` from
-the client's `servers`), then:
+**A server that signs in with OAuth** is added by its URL in the portal instead. Remove the
+example `notes` server, its route and its credential (and `notes` from the client's `servers`)
+before the first `up -d`; then, on **MCP servers**, **Add a server by URL**: register its client,
+**Save** it, **Connect** to sign in, review its tools and **Save**, then **Give to clients**, one
+passkey prompt each (operations.md §11). In the hardened tier the same commands run in the
+`vault` service (operations.md §30 walks a first hardened deployment end to end, managed, and
+declarative too).
+
+**Declarative instead.** Set `mode: declarative` in the compose policy before the first `up -d`,
+and the policy is the compose file itself, as before managed mode (the portal is optional then:
+leave the `admin` block out for none). After the same first commands, review the server with
+
+```sh
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes --add <tool>
+```
+
+commit the snippet `review` prints, classifying each tool as `allow` or `approve`, and recreate
+the container. A server that signs in with OAuth is then added by its URL in two commits
+(operations.md §11), with the example `notes` removed as above:
 
 ```sh
 docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp login \
@@ -108,15 +132,10 @@ file, recreate the container, and run the same `login --mcp` command again: it s
 the address the provider sends you to) and has the gateway review the server's tools. The two
 commands it prints next make fragment 2, the tools you pick and classify; commit it as the
 first, put `notes` back in the client's `servers`, and the agent's configuration above stays as
-it is. The portal's MCP servers page does the same in a browser. In the hardened tier the
-commands run in the `vault` service instead (operations.md §30 walks a first hardened deployment
-end to end).
-
-**In managed mode** (`mode: managed`, operations.md §34) the vault keeps the policy as numbered
-revisions, so nothing above that prints a fragment applies: `review` with `--add` or another
-choosing option, and `login --mcp`, refuse and name the portal, or `zoeymcp policy export`, an
-edit and `zoeymcp policy import`, instead (operations.md §11); `check` says it checks the
-document it is given, not the running revision.
+it is. The portal's MCP servers page does the same in a browser. In managed mode none of this
+prints a fragment: `review` with `--add` or another choosing option, and `login --mcp`, refuse
+and name the portal, or `zoeymcp policy export`, an edit and `zoeymcp policy import`, instead
+(operations.md §11); `check` says it checks the document it is given, not the running revision.
 
 **When to move to the hardened tier** ([deploy/compose.hardened.yaml](deploy/compose.hardened.yaml)):
 for anything that moves money, sends mail or touches personal data. In the standard tier the
@@ -127,8 +146,9 @@ each tier, is §33.
 
 **The portal** is at `http://localhost:8081` in a browser on the same host, in both tiers. Issue
 the one-time code that enrols your first passkey with
-`docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp setup-code`; operations.md §26 has the
-rest, including reaching it from another machine.
+`docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp setup-code` (in the hardened tier,
+`docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp setup-code`); operations.md §26
+has the rest, including reaching it from another machine.
 
 ## What it does
 

@@ -1534,9 +1534,34 @@ error's type), at most once a minute; it backs off from 1 s up to 30 s, and wait
 
 ## 14. Rotating the gateway key (hardened tier)
 
-1. Raise `gateway_key_generation` in the policy (the shipped compose takes it from
-   `ZOEYMCP_GATEWAY_KEY_GENERATION`) and reload or recreate the vault. The old key now works for
-   at most 5 more minutes.
+1. Raise `gateway_key_generation` in the policy. The old key now works for at most 5 more
+   minutes.
+   - **In managed mode** (the shipped compose files, §34) that is a host import, since the
+     compose file's `ZOEYMCP_GATEWAY_KEY_GENERATION` is read only when the policy is seeded:
+     raising it and recreating the vault changes no generation, and only logs
+     `policy_seed_ignored`. Export the policy, raise `gateway_key_generation` in the export, and
+     import it; the plan says "give the gateway key(N) within 5 minutes (zoeymcp gateway-key), or
+     it is refused":
+
+     ```sh
+     c="docker compose -f deploy/compose.hardened.yaml"
+     $c exec -T vault zoeymcp policy export > policy.yaml
+     $EDITOR policy.yaml      # gateway_key_generation: N
+     $c exec -T vault zoeymcp policy import - < policy.yaml
+     $c exec -T vault zoeymcp policy import --yes - < policy.yaml
+     ```
+
+     If you also raise `ZOEYMCP_GATEWAY_KEY_GENERATION` to N, so the compose policy matches, and
+     health then shows `policy_seed_ignored` after the recreate, record it with
+     `$c exec vault zoeymcp policy import --from-env --baseline-only --yes` (§34).
+
+     Or, if the compose policy is the one you keep: raise `ZOEYMCP_GATEWAY_KEY_GENERATION` to N,
+     recreate the vault (`ZOEYMCP_GATEWAY_KEY_GENERATION=N $c up -d vault`; it logs
+     `policy_seed_ignored`), then run `$c exec vault zoeymcp policy import --from-env`. Its plan
+     shows the rotation and any portal saves it would undo; run it again with `--yes` to write it
+     (and `--accept-widening` if the plan lists a wider row).
+   - **In declarative mode** raise it in the policy (the shipped compose takes it from
+     `ZOEYMCP_GATEWAY_KEY_GENERATION`) and reload or recreate the vault.
 2. `zoeymcp gateway-key` in the vault prints the new key. While the old one is still accepted, it
    also prints `rotation pending: generation N-1 accepted until <time>` on stderr.
 3. Give the gateway the new key and recreate it (with a key file, `kill -s HUP gateway` is
@@ -3014,15 +3039,21 @@ it on, if you do.
 
 ## 30. A first hardened deployment, end to end
 
-The steps above in the order a first deployment takes them, in the hardened tier: the keys, a
-client token, the policy, a secret, the reload, a remote MCP server onboarded by its URL, its
-review, and an agent's container attached. Every command runs on the host, from the repository's
-root; `c` is the compose command, which the commands ZoeyMCP prints start with too (§11):
+The steps above in the order a first deployment takes them, in the hardened tier as the shipped
+compose file runs it: in managed mode (§34), where the compose policy seeds revision 1 and the
+portal is where the policy changes after that. The keys, a client token, the policy, the first
+start, a secret, the portal, a remote MCP server onboarded by its URL, its review, and an agent's
+container attached. Every command runs on the host, from the repository's root; `c` is the
+compose command, which the commands ZoeyMCP prints start with too (§11):
 
 ```sh
 c="docker compose -f deploy/compose.hardened.yaml"
 docker build -t zoeymcp:local .
 ```
+
+To follow the declarative walk instead (fragments you commit, and a recreate for each change),
+set `mode: declarative` in the compose policy before the first start: "Declarative instead",
+below.
 
 1. **The keys.** `docker run --rm zoeymcp:local keygen` prints `ZOEYMCP_MASTER_KEY` and
    `ZOEYMCP_GATEWAY_KEY`. Keep both as deployment secrets (an `.env` file only you can read, say):
@@ -3030,6 +3061,109 @@ docker build -t zoeymcp:local .
    again (§6).
 2. **A client token** for each agent: `docker run --rm zoeymcp:local client-token` (§10). The
    agent gets `client_token`; the policy gets `token_sha256`.
+3. **The policy, before the first start.** The compose file's `ZOEYMCP_CONFIG` is read once, to
+   seed revision 1, and ignored afterwards, so make every edit to it now. Put the agent's
+   `token_sha256` under `gateway.clients.agent1` (no portal change can set a token), and give it
+   no servers yet (`servers: []`). Remove the example `notes` server, its route `notes-mcp` and
+   its credential `notes-key` before you onboard a server at that URL: onboarding refuses a URL a
+   server already reaches with another kind of credential (`already_configured`). Keep or remove
+   the `stats` route; if you keep it, replace its placeholder with a long random value. Add the
+   `lan` profile's name to `gateway.hosts` (§15), and `egress_proxy` (§31), if you use them. Then
+   prove the file: `$c run --rm --no-deps vault check`. Its two warnings say that the document
+   seeds the first revision and is ignored afterwards, and that `agent1` reaches no server yet.
+4. **Start**: `$c up -d`. On its fresh volume the vault seeds revision 1 from the compose policy:
+   `$c logs vault | grep policy_` shows `policy_seeded` (revision 1, `via` `start`) and
+   `policy_head` (revision 1, `write_kind` `policy.seed`). `$c exec vault zoeymcp health` lists
+   what still needs you, and `$c exec gateway zoeymcp gateway-status` shows the gateway's view,
+   `fresh` once it has one.
+5. **A secret** for a route that holds one, piped in, never typed on the command line:
+   `printf '%s' "$KEY" | $c exec -T vault zoeymcp secret set music-stats`. No reload: the policy
+   names the secret, never its value.
+6. **The portal.** `$c exec vault zoeymcp setup-code` issues a one-time code, valid for 15
+   minutes: open `http://localhost:8081`, choose **Set up**, and enrol a passkey (§26). From now
+   on the portal and `zoeymcp policy import` are where the policy changes. Keep an export as a
+   backup, and keep it like a secret: `$c exec -T vault zoeymcp policy export >
+   policy-export.yaml` (§34).
+7. **A remote MCP server, by its URL**, in the portal (§11, "Onboarding by URL in the portal, in
+   managed mode"): on **MCP servers**, **Add a server by URL** discovers the server and shows the
+   plan, and **Register its client** registers a client after your passkey (a client you
+   registered yourself goes under **More options**). **Save** on its row writes the credential,
+   its route and the server as the next revision after your passkey, and the vault applies it at
+   once: the row says `needs_connect`, with no commit and no recreate. **Connect** signs in, with
+   your passkey at the end, then queues the review, which the gateway runs. A server that offers
+   neither a client you registered nor dynamic registration stops at `registration_unavailable`:
+   register a client there first.
+8. **The review.** The review screen lists the tools with the server's suggestions: include and
+   classify each you want (`allow` or `approve`), read the definitions you include, leave
+   **Record the rest as declined** ticked, and **Save** after your passkey; the plan lists each
+   tool that will run with no prompt first. The row then says `reviewed, given to no client`:
+   **Give to clients**, tick `agent1`, and **Save** after your passkey. `$c exec gateway zoeymcp
+   review notes` then exits 0.
+9. **The agent's container** joins the `agents` network, `zoeymcp_agents` to Docker (the compose
+   project is `zoeymcp`), and nothing else of ZoeyMCP's. In the agent's own compose file:
+
+   ```yaml
+   services:
+     agent:
+       networks: [zoeymcp]
+   networks:
+     zoeymcp:
+       external: true
+       name: zoeymcp_agents
+   ```
+
+   or `docker network connect zoeymcp_agents <container>` for one already running. Its MCP
+   client takes `http://gateway:8090/s/notes/mcp` with the header `Authorization: Bearer
+   <client_token>` (§10). The `agents` network has no route out, so an agent that needs the
+   internet keeps a network of its own for that; it still reaches the server only through the
+   gateway, and never holds the server's token.
+
+**After the seed**, what the portal can't change (a client and its token, `gateway.hosts`, the
+egress settings, a key generation) is an export, an edit and an import (§34, "Importing a
+change"); a rotation of the gateway key is §14's. **The admin port** is one of those:
+`ZOEYMCP_ADMIN_PORT` is read into `admin.origins` only at the seed. To move the portal to another
+port, import the new origin first. The plan lists the origin change as wider, so the `--yes` run
+needs `--accept-widening`. A passkey belongs to the origin's host, not its port, so passkeys
+enrolled at `localhost` keep working; only a change of host also needs `--lockout-ok`, when
+passkeys were enrolled through the old one:
+
+```sh
+$c exec -T vault zoeymcp policy export > policy.yaml
+$EDITOR policy.yaml      # admin.origins: [http://localhost:9000]
+$c exec -T vault zoeymcp policy import - < policy.yaml
+$c exec -T vault zoeymcp policy import --yes --accept-widening - < policy.yaml
+```
+
+Then recreate the vault with the new port (`ZOEYMCP_ADMIN_PORT=9000 $c up -d vault`), then record
+the compose policy the recreate rendered, which would otherwise leave `policy_seed_ignored` on for
+good: `$c exec vault zoeymcp policy import --from-env --baseline-only --yes`. In the standard tier
+the same commands run in `docker compose -f deploy/compose.yaml exec -T zoeymcp`.
+
+Through your own egress proxy (§28), step 7 may stop at `proxy_refused`, naming the hosts to
+allow, and carries on where it stopped once they are allowed. Through the egress role (§31: the
+`egress-proxy` profile, its key from `zoeymcp egress-key`, and `egress_proxy` with
+`egress_proxy_kind: role` in the policy) there is nothing to allow by hand: the vault widens its
+own list while the onboarding runs.
+
+**A stdio server** joins behind a bridge, in §33's cold-start order: build the derived bridge
+image; add the bridge's route, its header credential and the server without the override yet (an
+import, §34; in declarative mode, a commit and step 6's recreate, below); make its token with
+`$c exec vault zoeymcp secret set bridge-<name>-token --generate` and set
+`ZOEYMCP_BRIDGE_<NAME>_TOKEN_SHA256` to the line it prints (without it the bridge refuses to
+start, and compose keeps restarting it); then add `examples/bridge/compose.bridge.yaml` beside
+the compose file (`c` then names both files, and so should `ZOEYMCP_COMPOSE_CMD`), with the role
+running (§31) when its program needs egress, and run `$c up -d bridge-<name>`, then
+`$c up -d vault`. Its program reaches only its own egress list, through the role. Review it as in
+step 8 and assign it to the agent.
+
+### Declarative instead
+
+With `mode: declarative` the compose policy is the policy itself: every change is an edit of
+`ZOEYMCP_CONFIG` and a recreate of the vault, and the portal is optional (leave the `admin` block
+out for none). The steps:
+
+1. **The keys**, as above.
+2. **A client token**, as above.
 3. **The policy.** The compose file's `ZOEYMCP_CONFIG` is the policy (or put it in a file, §7).
    Put the agent's `token_sha256` under `gateway.clients.agent1`, and give it no servers yet
    (`servers: []`). Remove the example `notes` server, its route `notes-mcp` and its credential
@@ -3039,9 +3173,7 @@ docker build -t zoeymcp:local .
    file: `$c run --rm --no-deps vault check`.
 4. **Start**: `$c up -d`. `$c exec vault zoeymcp health` lists what still needs you, and
    `$c exec gateway zoeymcp gateway-status` shows the gateway's view, `fresh` once it has one.
-5. **A secret** for a route that holds one, piped in, never typed on the command line:
-   `printf '%s' "$KEY" | $c exec -T vault zoeymcp secret set music-stats`. No reload: the policy
-   names the secret, never its value.
+5. **A secret**, as above.
 6. **The reload.** An inline policy is part of the vault's environment, so a changed one is
    applied by recreating the vault: `$c up -d vault`. The gateway carries on, and sees the new
    view once the vault is back (§9). Nothing the next step needs lives only in the vault's memory,
@@ -3073,24 +3205,7 @@ docker build -t zoeymcp:local .
    TOOL`). Commit fragment 2 as fragment 1 (`check --with`, the merge, `check`, the recreate),
    then add `notes` to `gateway.clients.agent1.servers` and recreate once more: fragment 2 never
    assigns a server to a client. `$c exec gateway zoeymcp review notes` then exits 0.
-9. **The agent's container** joins the `agents` network, `zoeymcp_agents` to Docker (the compose
-   project is `zoeymcp`), and nothing else of ZoeyMCP's. In the agent's own compose file:
-
-   ```yaml
-   services:
-     agent:
-       networks: [zoeymcp]
-   networks:
-     zoeymcp:
-       external: true
-       name: zoeymcp_agents
-   ```
-
-   or `docker network connect zoeymcp_agents <container>` for one already running. Its MCP
-   client takes `http://gateway:8090/s/notes/mcp` with the header `Authorization: Bearer
-   <client_token>` (§10). The `agents` network has no route out, so an agent that needs the
-   internet keeps a network of its own for that; it still reaches the server only through the
-   gateway, and never holds the server's token.
+9. **The agent's container**, as above.
 
 **The same in the portal.** Steps 7 and 8 can run in the portal instead (§26): issue a code with
 `$c exec vault zoeymcp setup-code`, open `http://localhost:8081`, and enrol a passkey. On **MCP
@@ -3101,22 +3216,6 @@ recreate, sign in again: the server's row says `needs_connect`, and **Connect** 
 your passkey at the end, then queues the review by itself. **Review tools** shows the tools with
 the server's suggestions, **Generate** makes fragment 2, and the row says `reviewed` once it is
 committed. Assigning the server to the agent is still yours (step 8).
-
-Through your own egress proxy (§28), step 7 may stop at `proxy_refused`, naming the hosts to
-allow and the same command to run again, which carries on where it stopped once they are allowed.
-Through the egress role (§31: the `egress-proxy` profile, its key from `zoeymcp egress-key`, and
-`egress_proxy` with `egress_proxy_kind: role` in the policy) there is nothing to allow by hand:
-the vault widens its own list while the onboarding runs.
-
-**A stdio server** joins behind a bridge, in §33's cold-start order: build the derived bridge
-image; commit the bridge's route, its header credential and the server (step 6) without the
-override yet; make its token with `$c exec vault zoeymcp secret set bridge-<name>-token
---generate` and set `ZOEYMCP_BRIDGE_<NAME>_TOKEN_SHA256` to the line it prints (without it the
-bridge refuses to start, and compose keeps restarting it); then add
-`examples/bridge/compose.bridge.yaml` beside the compose file (`c` then names both files, and so
-should `ZOEYMCP_COMPOSE_CMD`), with the role running (§31) when its program needs egress, and run
-`$c up -d bridge-<name>`, then `$c up -d vault`. Its program reaches only its own egress list,
-through the role. Review it as in step 8 and assign it to the agent.
 
 ## 31. The egress role
 
@@ -4113,6 +4212,10 @@ docker compose -f deploy/compose.hardened.yaml up -d vault
 (in the standard tier: `docker compose -f deploy/compose.yaml run --rm --no-deps --user
 10001:10001 zoeymcp policy seed --state /state`). Recreate the vault before the gateway, and keep
 the gateway on M6 too once a policy declines a tool or enables another kind.
+
+The shipped compose files now say `mode: managed`. If you pull them over a copy you edited, keep
+`mode: declarative` in yours to carry on as before, or switch with the seed above: a volume the
+vault used before is never seeded by itself, so the start is refused until you do.
 
 ### The revision store
 

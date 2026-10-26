@@ -63,6 +63,26 @@ hardened_tier() {
         docker compose -p "$hardened_project" -f "$deploy/compose.hardened.yaml" \
         -f "$work/override.yaml" --profile lan "$@"
 }
+# The README's quickstart as shipped, managed (M6 design J14s): quick/compose.yaml is
+# deploy/compose.yaml edited as the README says before the first up -d, and quick/extra.yaml adds
+# the fake upstream and the vault's trust in its CA, and no policy.
+quick_project="zoeymcp-smoke-quick-$$"
+quick() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${quick_master:-unset}" \
+        ZOEYMCP_ADMIN_PORT="${quick_port:-8081}" \
+        docker compose -p "$quick_project" -f "$work/quick/compose.yaml" \
+        -f "$work/quick/extra.yaml" "$@"
+}
+# The hardened tier as shipped, managed (J14h, J15): deploy/compose.hardened.yaml with the token
+# edited in. The generation's 1 renders as the variable's default does.
+quick_hardened_project="zoeymcp-smoke-quick-hardened-$$"
+quick_hardened() {
+    ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${quick_hardened_master:-unset}" \
+        ZOEYMCP_GATEWAY_KEY="${quick_gateway_key:-unset}" \
+        ZOEYMCP_GATEWAY_KEY_GENERATION="${quick_generation:-1}" \
+        docker compose -p "$quick_hardened_project" \
+        -f "$work/quick-hardened/compose.hardened.yaml" "$@"
+}
 
 cleanup() {
     docker rm -f "$name" >/dev/null 2>&1 || true
@@ -70,6 +90,12 @@ cleanup() {
     standard down -v >/dev/null 2>&1 || true
     if [ -f "$work/override.yaml" ]; then
         hardened_tier down -v >/dev/null 2>&1 || true
+    fi
+    if [ -f "$work/quick/extra.yaml" ]; then
+        quick down -v >/dev/null 2>&1 || true
+    fi
+    if [ -f "$work/quick-hardened/compose.hardened.yaml" ]; then
+        quick_hardened down -v >/dev/null 2>&1 || true
     fi
     docker network rm "$probe_net" >/dev/null 2>&1 || true
     docker rm -f "$name-dns" "$name-squid" "$name-squid-mapped" "$name-squid-lookup" \
@@ -89,6 +115,12 @@ fail() {
     standard logs >&2 2>/dev/null || true
     if [ -f "$work/override.yaml" ]; then
         hardened_tier logs >&2 2>/dev/null || true
+    fi
+    if [ -f "$work/quick/extra.yaml" ]; then
+        quick logs >&2 2>/dev/null || true
+    fi
+    if [ -f "$work/quick-hardened/compose.hardened.yaml" ]; then
+        quick_hardened logs >&2 2>/dev/null || true
     fi
     exit 1
 }
@@ -845,15 +877,18 @@ meta_keys="$meta_keys"',"io.modelcontextprotocol/clientCapabilities":{}'
 list_tools='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{'"$meta_keys"'}}}'
 call_echo='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo",'
 call_echo="$call_echo"'"arguments":{"text":"smoke-echo"},"_meta":{'"$meta_keys"'}}}'
-# fake_mcp BASE BODY CURL-OPTIONS...: a POST of BODY to BASE/s/fake/mcp with the client token;
+# fake_mcp BASE BODY CURL-OPTIONS...: a POST of BODY to BASE/s/fake/mcp with the client token
+# (BASE/s/$mcp_server/mcp, when mcp_server names the server routed to the fake upstream);
 # prints the status, and the answer lands in $work/body.
+mcp_server=fake
 fake_mcp() {
     fake_base="$1"
     fake_body="$2"
     shift 2
     curl -s -o "$work/body" -w '%{http_code}' -X POST -H 'content-type: application/json' \
         -H 'accept: application/json, text/event-stream' -H "authorization: Bearer $token" \
-        -H "mcp-protocol-version: $modern" -d "$fake_body" "$@" "$fake_base/s/fake/mcp" || true
+        -H "mcp-protocol-version: $modern" -d "$fake_body" "$@" "$fake_base/s/$mcp_server/mcp" \
+        || true
 }
 # fake_round BASE CURL-OPTIONS...: tools/list shows echo and slow but no tool the policy leaves
 # out, and tools/call echo answers, through the vault and the fake upstream.
@@ -1174,6 +1209,32 @@ for child in vault gateway; do
         || fail "the $child didn't stop cleanly"
 done
 
+step "standard tier: policy seed --state on the used volume, refused as root, run as 10001 (OPS-5)"
+# The volume the declarative rows used, its container stopped: a managed start never seeds a
+# volume a vault used (M6 design F.3), so the host does, once, with the smoke's policy made
+# managed on standard input (operations.md §34, "Upgrading to M6"). As root it is refused: the
+# vault's uid couldn't read what it wrote.
+{
+    printf '%s\n' "version: 1" "mode: managed" "admin:" "  listen: 0.0.0.0:8081" \
+        "  origins: [http://localhost:8081]"
+    smoke_policy | sed 's/^        //'
+} >"$work/seed.yaml"
+status=0
+standard run --rm --no-deps -T zoeymcp policy seed --state /state --config - --yes \
+    <"$work/seed.yaml" >"$work/seed.out" 2>&1 || status=$?
+cat "$work/seed.out"
+[ "$status" != 0 ] || fail "policy seed --state ran as root"
+grep -qF 'add --user 10001:10001' "$work/seed.out" \
+    || fail "policy seed --state as root wasn't refused naming --user 10001:10001"
+if grep -q '^Seeded ' "$work/seed.out"; then
+    fail "policy seed --state as root wrote revision 1"
+fi
+standard run --rm --no-deps -T --user 10001:10001 zoeymcp policy seed --state /state --config - \
+    --yes <"$work/seed.yaml" >"$work/seed.out" 2>&1 || status=$?
+cat "$work/seed.out"
+grep -q '^Seeded revision 1 of deployment [0-9a-f]\{8\}\. Start the vault:$' "$work/seed.out" \
+    || fail "policy seed --state as uid 10001 didn't seed revision 1"
+
 step "hardened tier: up, from deploy/compose.hardened.yaml with the lan profile"
 keys="$(docker run --rm "$image" keygen)"
 hardened_master="$(echo "$keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
@@ -1391,6 +1452,315 @@ sys.exit("the old key was accepted")
 hardened_tier exec -T gateway python -I -c "$old_key_view" "$first_key" \
     || fail "the retired key wasn't refused"
 hardened_tier down -v >/dev/null 2>&1
+
+# --- the shipped default: managed (M6 design J4, J14, J15, step 23) -----------------------------
+# Each tier from its compose file as shipped, edited only as the README and operations.md §30 say
+# before the first up -d, on fresh volumes: the inline policy seeds revision 1 and is ignored
+# afterwards, and later changes are host imports over the vault's socket. The portal's review
+# Save needs a passkey, so a socket import stands in for it here; the rows above stay
+# declarative, each with a policy of its own.
+
+# The export on standard input with the YAML in the first argument merged into it (a mapping by
+# key, any other value replaced) and its comment lines kept first, so the import reads its base
+# from them: the edit an operator makes in $EDITOR.
+edit_export='
+import itertools, sys, yaml
+text = sys.stdin.read()
+header = "".join(itertools.takewhile(lambda line: line.startswith("#"), text.splitlines(True)))
+def merge(into, patch):
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(into.get(key), dict):
+            merge(into[key], value)
+        else:
+            into[key] = value
+document = yaml.safe_load(text)
+merge(document, yaml.safe_load(sys.argv[1]))
+sys.stdout.write(header + yaml.safe_dump(document, sort_keys=False, width=4096))
+'
+# edited EXPORT PATCH: the file EXPORT with the YAML file PATCH merged in, by the vault's own
+# interpreter.
+edited() {
+    docker run --rm -i --network none --entrypoint /opt/zoeymcp/bin/python "$image" -I \
+        -c "$edit_export" "$(cat "$2")" <"$1"
+}
+# wait_log WHAT PATTERN LOGS-COMMAND...: waits for a line matching PATTERN in what LOGS-COMMAND
+# prints, failing with WHAT.
+wait_log() {
+    wait_what="$1"
+    wait_pattern="$2"
+    shift 2
+    i=0
+    until "$@" 2>&1 | grep -q "$wait_pattern"; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || fail "$wait_what"
+        sleep 0.3
+    done
+}
+# seed_ignored EXEC-COMMAND...: whether the vault's health holds policy_seed_ignored, asked with
+# EXEC-COMMAND (a compose exec into the vault's container); fails unless health answers.
+seed_ignored() {
+    "$@" zoeymcp health --json >"$work/health" 2>&1 || true
+    grep -q '"summary"' "$work/health" || fail "health didn't answer: $(cat "$work/health")"
+    grep -q '"policy_seed_ignored"' "$work/health"
+}
+# The vault's start lines for revision 1 seeded from the compose policy, as J14h shows them.
+seeded_line='"event":"policy_seeded","revision":1,"deployment":"[0-9a-f]\{8\}","tokens_hashed":0,"via":"start"'
+seed_head_line='"event":"policy_head","revision":1,"digest":"[0-9a-f]\{8\}","deployment":"[0-9a-f]\{8\}","write_kind":"policy.seed"'
+# quick_ready: the standard tier's gateway answers, and so does the vault's socket; the head as
+# `zoeymcp policy` prints it lands in $work/head.
+quick_ready() {
+    i=0
+    until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/healthz)" = "200" ] \
+        && quick exec -T zoeymcp zoeymcp policy >"$work/head" 2>/dev/null; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || fail "managed, standard tier: the container didn't become ready"
+        sleep 0.3
+    done
+}
+
+step "managed, standard tier: the README's quickstart, the token and URL edited: a fresh volume seeds revision 1 (J4, J14s)"
+# The README's edit before the first up -d: agent1's token_sha256, and the server's URL, here the
+# fake upstream's. Its address is private, so it goes in egress_private too (M7 design B.2).
+mkdir "$work/quick"
+sed -e "s/sha256:0\{64\}/$token_hash/" -e 's#https://mcp\.notes\.example#https://fake-upstream:9000#' \
+    "$deploy/compose.yaml" \
+    | awk '{ print } /^        mode: managed$/ { print "        egress_private: [\"fake-upstream:9000\"]" }' \
+    >"$work/quick/compose.yaml"
+grep -qF "token_sha256: \"$token_hash\"" "$work/quick/compose.yaml" \
+    || fail "managed, standard tier: the client token wasn't edited in"
+grep -qF 'egress_private: ["fake-upstream:9000"]' "$work/quick/compose.yaml" \
+    || fail "managed, standard tier: deploy/compose.yaml's policy doesn't say mode: managed"
+cat >"$work/quick/extra.yaml" <<EOF
+services:
+  zoeymcp:
+$(vault_trust)
+$(fake_service)
+EOF
+quick_master="$(docker run --rm "$image" keygen | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+[ -n "$quick_master" ] || fail "keygen printed no key"
+quick up -d
+quick_ready
+quick logs zoeymcp >"$work/logs" 2>&1
+grep "policy_" "$work/logs" || true
+grep -q "$seeded_line" "$work/logs" \
+    || fail "managed, standard tier: no policy_seeded line for revision 1 from the start"
+grep -q "$seed_head_line" "$work/logs" \
+    || fail "managed, standard tier: no policy_head line for the seeded revision 1"
+cat "$work/head"
+grep -qx 'Mode: managed' "$work/head" && grep -q '^Revision 1, ' "$work/head" \
+    || fail "managed, standard tier: zoeymcp policy doesn't show revision 1 in managed mode"
+
+step "managed, standard tier: the secret set and a setup code, with the README's commands"
+out="$(printf '%s' 'notes-smoke-0123456789' | quick exec -T zoeymcp zoeymcp secret set notes-key)"
+echo "$out"
+echo "$out" | grep -q "^stored notes-key" || fail "managed, standard tier: secret set failed"
+code="$(quick exec -T zoeymcp zoeymcp setup-code)" \
+    || fail "managed, standard tier: setup-code didn't reach the vault"
+portal_code "managed, standard tier" "$code" quick logs zoeymcp
+
+step "managed, standard tier: a socket import of the review (echo and slow allowed, the rest declined)"
+quick exec -T zoeymcp zoeymcp policy export >"$work/quick/export.yaml" \
+    || fail "managed, standard tier: policy export failed"
+grep -q '^# zoeymcp policy export: revision 1 of deployment [0-9a-f]\{8\}, ' "$work/quick/export.yaml" \
+    || fail "managed, standard tier: the export's first line doesn't name revision 1"
+cat >"$work/quick/review-patch.yaml" <<EOF
+gateway:
+  servers:
+    notes:
+      tools: {include: [echo, slow], allow: [echo, slow]}
+      review: {echo: "$echo_pin", slow: "$slow_pin"}
+      declined: {$declined}
+EOF
+edited "$work/quick/export.yaml" "$work/quick/review-patch.yaml" >"$work/quick/review.yaml" \
+    || fail "managed, standard tier: the export couldn't be edited"
+quick exec -T zoeymcp zoeymcp policy import --yes --accept-widening - <"$work/quick/review.yaml" \
+    >"$work/out" 2>&1 || { cat "$work/out"; fail "managed, standard tier: the import failed"; }
+cat "$work/out"
+grep -qx 'Imported as revision 2.' "$work/out" \
+    || fail "managed, standard tier: the import didn't write revision 2"
+mcp_server=notes
+fake_round http://127.0.0.1:8090
+mcp_server=fake
+
+step "managed, standard tier: a restart keeps the head, and health says nothing of the compose policy"
+quick restart zoeymcp
+quick_ready
+grep -q '^Revision 2, ' "$work/head" || fail "managed, standard tier: the restart didn't keep revision 2"
+wait_log "managed, standard tier: the restart logged no policy_head for revision 2" \
+    '"event":"policy_head","revision":2,' quick logs zoeymcp
+if seed_ignored quick exec -T zoeymcp; then
+    fail "managed, standard tier: health shows policy_seed_ignored for an unchanged compose policy"
+fi
+mcp_server=notes
+fake_round http://127.0.0.1:8090
+mcp_server=fake
+
+step "managed, standard tier: a port change after the seed: the origin imported, the recreate, --baseline-only, no warning (OPS-7)"
+quick exec -T zoeymcp zoeymcp policy export >"$work/quick/export.yaml" \
+    || fail "managed, standard tier: policy export failed"
+printf '%s\n' 'admin: {origins: ["http://localhost:18181"]}' >"$work/quick/port-patch.yaml"
+edited "$work/quick/export.yaml" "$work/quick/port-patch.yaml" >"$work/quick/port.yaml" \
+    || fail "managed, standard tier: the export couldn't be edited"
+quick exec -T zoeymcp zoeymcp policy import --yes --accept-widening - <"$work/quick/port.yaml" \
+    >"$work/out" 2>&1 || { cat "$work/out"; fail "managed, standard tier: the origin's import failed"; }
+cat "$work/out"
+grep -qx 'Imported as revision 3.' "$work/out" \
+    || fail "managed, standard tier: the origin's import didn't write revision 3"
+quick_port=18181
+quick up -d
+quick_ready
+wait_log "managed, standard tier: the recreate with the new port logged no policy_seed_ignored" \
+    '"event":"policy_seed_ignored",.*"revision":3,"reason":"changed"' quick logs zoeymcp
+seed_ignored quick exec -T zoeymcp \
+    || fail "managed, standard tier: health doesn't show policy_seed_ignored after the port change"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: localhost:18181' http://127.0.0.1:18181/)" \
+    = "200" ] || fail "managed, standard tier: the portal doesn't answer at its new origin"
+quick exec -T zoeymcp zoeymcp policy import --from-env --baseline-only --yes >"$work/out" 2>&1 \
+    || { cat "$work/out"; fail "managed, standard tier: --from-env --baseline-only failed"; }
+cat "$work/out"
+grep -qx "Recorded the configured policy as the seed's baseline in revision 4." "$work/out" \
+    || fail "managed, standard tier: --baseline-only didn't write revision 4"
+if seed_ignored quick exec -T zoeymcp; then
+    fail "managed, standard tier: policy_seed_ignored stayed after --baseline-only"
+fi
+
+step "managed, standard tier: an edited compose policy logs policy_seed_ignored, and import --from-env ends it"
+sed 's/zoeymcp\.lan\.example\]$/zoeymcp.lan.example, agents.lan.example]/' "$work/quick/compose.yaml" \
+    >"$work/quick/edited.yaml"
+mv "$work/quick/edited.yaml" "$work/quick/compose.yaml"
+grep -qF 'zoeymcp.lan.example, agents.lan.example]' "$work/quick/compose.yaml" \
+    || fail "managed, standard tier: gateway.hosts wasn't edited"
+quick up -d
+quick_ready
+wait_log "managed, standard tier: the edited compose policy logged no policy_seed_ignored" \
+    '"event":"policy_seed_ignored",.*"revision":4,"reason":"changed"' quick logs zoeymcp
+quick exec -T zoeymcp zoeymcp policy import --from-env --yes --accept-widening >"$work/out" 2>&1 \
+    || { cat "$work/out"; fail "managed, standard tier: import --from-env failed"; }
+cat "$work/out"
+grep -qx 'Imported as revision 5.' "$work/out" \
+    || fail "managed, standard tier: import --from-env didn't write revision 5"
+if seed_ignored quick exec -T zoeymcp; then
+    fail "managed, standard tier: policy_seed_ignored stayed after import --from-env"
+fi
+quick exec -T zoeymcp zoeymcp policy export | grep -qF 'agents.lan.example' \
+    || fail "managed, standard tier: the head doesn't hold the compose policy's new host"
+quick down -v >/dev/null 2>&1
+
+step "managed, hardened tier: operations.md §30's start, steps 2 to 6: the edit before the first up -d, a fresh volume seeds revision 1 (J4, J14h)"
+# §30 step 3's edit: agent1's token_sha256 and no servers yet, the example notes server, its
+# route and its credential removed (J14h onboards an OAuth server at that URL in the portal),
+# and the stats route's placeholder replaced.
+mkdir "$work/quick-hardened"
+sed "s/sha256:0\{64\}/$token_hash/" "$deploy/compose.hardened.yaml" | awk '
+    /^          notes-key: [{]kind: header,/ { next }
+    /^          # A remote MCP server, for the gateway only\.$/ { skip = 1 }
+    skip == 1 && /^        gateway:$/ { skip = 0 }
+    skip == 1 { next }
+    /^          servers:$/ { print "          servers: {}"; skip = 2; next }
+    skip == 2 && /^    [^ ]/ { skip = 0 }
+    skip == 2 { next }
+    {
+        sub(/servers: \[notes\]$/, "servers: []")
+        sub(/ph-replace-me-with-a-long-random-value/, "ph-smoke-0123456789abcdef0123456789abcdef")
+        print
+    }' >"$work/quick-hardened/compose.hardened.yaml"
+grep -qF "token_sha256: \"$token_hash\"" "$work/quick-hardened/compose.hardened.yaml" \
+    || fail "managed, hardened tier: the client token wasn't edited in"
+if grep -qE '^ +(notes-key: |- name: notes-mcp$|notes:$)|ph-replace-me' \
+    "$work/quick-hardened/compose.hardened.yaml"; then
+    fail "managed, hardened tier: §30 step 3's edit left the example notes server or the placeholder"
+fi
+keys="$(docker run --rm "$image" keygen)"
+quick_hardened_master="$(echo "$keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+quick_gateway_key="$(echo "$keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+quick_first_key="$quick_gateway_key"
+quick_hardened run --rm --no-deps -T vault check >"$work/out" 2>&1 \
+    || { cat "$work/out"; fail "managed, hardened tier: check refused §30 step 3's policy"; }
+cat "$work/out"
+grep -qx '\$ZOEYMCP_CONFIG: ok (0 error(s), 2 warning(s))' "$work/out" \
+    && grep -q '^warning mode: the vault seeds its first revision from this document' "$work/out" \
+    && grep -q '^warning gateway.clients.agent1.servers: no servers' "$work/out" \
+    || fail "managed, hardened tier: check didn't give §30's two warnings"
+quick_hardened up -d
+i=0
+until quick_hardened exec -T gateway zoeymcp gateway-status 2>/dev/null \
+    | grep -q '^view sha256:[0-9a-f]*  fresh$'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "managed, hardened tier: the gateway never got a fresh view"
+    sleep 0.3
+done
+quick_hardened logs vault 2>&1 | grep policy_ >"$work/logs" \
+    || fail "managed, hardened tier: no policy_ line in the vault's log"
+cat "$work/logs"
+grep -q "$seeded_line" "$work/logs" \
+    || fail "managed, hardened tier: no policy_seeded line for revision 1 from the start"
+grep -q "$seed_head_line" "$work/logs" \
+    || fail "managed, hardened tier: no policy_head line for the seeded revision 1"
+out="$(printf '%s' 'stats-smoke-0123456789' | quick_hardened exec -T vault zoeymcp secret set music-stats)"
+echo "$out"
+echo "$out" | grep -q "^stored music-stats" || fail "managed, hardened tier: secret set failed"
+code="$(quick_hardened exec -T vault zoeymcp setup-code)" \
+    || fail "managed, hardened tier: setup-code didn't reach the vault"
+portal_code "managed, hardened tier" "$code" quick_hardened logs vault
+
+step "managed, hardened tier: a raised ZOEYMCP_GATEWAY_KEY_GENERATION changes no generation until the import (J15)"
+quick_generation=2
+quick_hardened up -d vault
+wait_log "managed, hardened tier: the raised generation logged no policy_seed_ignored" \
+    '"event":"policy_seed_ignored",.*"revision":1,"reason":"changed"' quick_hardened logs vault
+i=0
+until found="$(quick_hardened exec -T vault zoeymcp gateway-key 2>&1)"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "managed, hardened tier: gateway-key didn't answer after the recreate"
+    sleep 0.3
+done
+if echo "$found" | grep -q '^rotation pending'; then
+    fail "managed, hardened tier: the recreate started a rotation"
+fi
+[ "$(echo "$found" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')" = "$quick_first_key" ] \
+    || fail "managed, hardened tier: the recreate changed the gateway key"
+seed_ignored quick_hardened exec -T vault \
+    || fail "managed, hardened tier: health doesn't show policy_seed_ignored for the raised generation"
+
+step "managed, hardened tier: the generation raised by an import, the new key given to the gateway (J15, operations.md §14)"
+quick_hardened exec -T vault zoeymcp policy export >"$work/quick-hardened/export.yaml" \
+    || fail "managed, hardened tier: policy export failed"
+printf '%s\n' 'gateway_key_generation: 2' >"$work/quick-hardened/patch.yaml"
+edited "$work/quick-hardened/export.yaml" "$work/quick-hardened/patch.yaml" \
+    >"$work/quick-hardened/generation.yaml" || fail "managed, hardened tier: the export couldn't be edited"
+quick_hardened exec -T vault zoeymcp policy import --yes - <"$work/quick-hardened/generation.yaml" \
+    >"$work/out" 2>&1 || { cat "$work/out"; fail "managed, hardened tier: the import failed"; }
+cat "$work/out"
+grep -qF 'give the gateway key(2) within 5 minutes' "$work/out" \
+    || fail "managed, hardened tier: the plan doesn't say to give the gateway its new key"
+grep -qx 'Imported as revision 2.' "$work/out" \
+    || fail "managed, hardened tier: the import didn't write revision 2"
+wait_log "managed, hardened tier: the import started no rotation window" \
+    '^rotation pending: generation 1 accepted until' quick_hardened exec -T vault zoeymcp gateway-key
+quick_gateway_key="$(quick_hardened exec -T vault zoeymcp gateway-key 2>/dev/null \
+    | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+[ -n "$quick_gateway_key" ] && [ "$quick_gateway_key" != "$quick_first_key" ] \
+    || fail "managed, hardened tier: no new gateway key after the import"
+quick_hardened up -d gateway
+wait_log "managed, hardened tier: the new key's first use didn't retire the old one" \
+    '"event":"gateway_key_retired","generation":1,"reason":"new_key_used"' quick_hardened logs vault
+
+step "managed, hardened tier: a restart keeps the head, which the raised compose policy now matches"
+quick_hardened restart vault
+wait_log "managed, hardened tier: the restart logged no policy_head for revision 2" \
+    '"event":"policy_head","revision":2,' quick_hardened logs vault
+i=0
+until quick_hardened exec -T vault zoeymcp policy >"$work/head" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || fail "managed, hardened tier: the vault didn't answer after the restart"
+    sleep 0.3
+done
+cat "$work/head"
+grep -q '^Revision 2, ' "$work/head" || fail "managed, hardened tier: the restart didn't keep revision 2"
+if seed_ignored quick_hardened exec -T vault; then
+    fail "managed, hardened tier: policy_seed_ignored stayed though the head matches the compose policy"
+fi
+quick_hardened down -v >/dev/null 2>&1
 
 # --- contract 52: the egress role ---------------------------------------------------------------
 # deploy/compose.hardened.yaml with the egress-proxy profile, and an override whose policy sends

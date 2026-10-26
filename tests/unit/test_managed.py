@@ -562,6 +562,38 @@ def test_a_sighup_never_applies_the_source(tmp_path: Path, log_buffer: io.String
     close(rig)
 
 
+def test_a_write_that_records_the_seed_ends_the_finding(tmp_path: Path) -> None:
+    """F.5, H.5 (G-14): a write that records the configured policy's digest as the seed's (an
+    ``import --from-env``, or its ``--baseline-only``) ends ``policy_seed_ignored`` at the write,
+    with no SIGHUP; a write that records none leaves it."""
+    from zoeymcp.vault.server import configured
+
+    rig = start(tmp_path)
+    (tmp_path / "policy.yaml").write_bytes(
+        managed_text().replace("timeout: 300", "timeout: 120").encode()
+    )
+    source = configured(str(tmp_path / "policy.yaml"), rig.environ)
+    assert source is not None
+    assert source.digest is not None
+    assert rig.managed.reverify(source) is False
+    assert rig.managed.state().seed_ignored == "changed"
+    fewer = edited(lambda data: data["gateway"]["clients"]["agent1"].update(servers=["mail"]))
+    assert isinstance(import_(rig, fewer), Written)
+    assert rig.managed.state().seed_ignored == "changed"
+    written = rig.managed.write(
+        "policy.acknowledge",
+        "socket",
+        rig.managed.revision,
+        lambda policy: policy,
+        author=HOST,
+        expected=None,
+        seed_digest=source.digest,
+    )
+    assert isinstance(written, Written)
+    assert rig.managed.state().seed_ignored is None
+    close(rig)
+
+
 def test_a_sighup_logs_no_stray_and_names_a_parked_store(
     tmp_path: Path, log_buffer: io.StringIO
 ) -> None:

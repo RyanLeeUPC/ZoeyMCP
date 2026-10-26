@@ -3,7 +3,8 @@
 #
 # Secrets never appear in a policy, only references: store:<name> for the vault's encrypted
 # store, or env:<VAR>. The review pins below are illustrative; real ones come from
-# `zoeymcp review`, or the portal's review screen, as a fragment to merge here.
+# `zoeymcp review`, or the portal's review screen, as a fragment to merge here: this example is
+# declarative, a merge source. The shipped compose files are managed instead (operations.md §34).
 
 version: 1
 mode: declarative

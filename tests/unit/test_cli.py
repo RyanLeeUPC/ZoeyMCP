@@ -3584,8 +3584,19 @@ def test_the_second_run_names_each_field_that_differs(vault: Vault) -> None:
 
 
 def test_the_shipped_static_key_notes_is_already_configured(vault: Vault) -> None:
-    """OPS-14: J1 walked verbatim against the shipped compose file's policy."""
-    vault.set_policy(inline_policy(compose("compose.hardened.yaml"), "compose.hardened.yaml"))
+    """OPS-14: J1 walked verbatim against the shipped compose file's policy. As shipped it is
+    managed (M6 step 23), so ``login --mcp`` refuses before discovery and names the portal; with
+    ``mode: declarative`` (the README's "Declarative instead") it meets the example notes."""
+    shipped = inline_policy(compose("compose.hardened.yaml"), "compose.hardened.yaml")
+    assert shipped.mode == "managed"
+    vault.set_policy(shipped)
+    code, out, err, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err.splitlines()[0] == (
+        "zoeymcp login: this deployment is managed: save it in the portal, or export, edit and "
+        "import"
+    )
+    vault.set_policy(shipped.model_copy(update={"mode": "declarative"}))
     code, out, err, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
     assert (code, out) == (EXIT_FINDINGS, "")
     assert err.splitlines() == [

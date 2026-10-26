@@ -1,4 +1,5 @@
-"""The compose files: their inline policies pass ``check``, the standard tier's container is the
+"""The compose files: their inline policies pass ``check``, are managed and say what the seed
+reads (M6 design Q2 (a), step 23), the standard tier's container is the
 box its launcher insists on (M3 design B.2, B.3), the portal is published on the host's
 loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2), the
 egress role is a profile of the hardened tier alone, on networks of its own (M7 design I.5, L),
@@ -105,6 +106,82 @@ def test_inline_policies_pass_check(path: Path) -> None:
     for text in policies:
         findings = check_policy(parse_policy(text, path.name))
         assert [f for f in findings if f.level == "error"] == []
+
+
+# --- the shipped default: managed (M6 design Q2 (a), step 23; OPS-3, J14, J15, Q36) ------------
+
+SEED_COMMENT = (
+    "It seeds revision 1 of the managed policy on a fresh volume and is ignored afterwards"
+)
+# What a managed compose file's comments no longer say (OPS-3).
+STALE_COMMENTS = (
+    "commit the pins",
+    "review notes --add",
+    "recreate the container for this inline one",
+    "Leave this block out for no portal",
+    "The commands `zoeymcp login --mcp` prints start with this compose command",
+)
+
+
+def comments(text: str) -> str:
+    """Every comment of a YAML file, the inline policy's included, as one line of words, so a
+    comment wrapped over several lines reads as one."""
+    found = [line.split("#", 1)[1] for line in text.splitlines() if line.lstrip().startswith("#")]
+    return " ".join(" ".join(found).split())
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES, ids=lambda path: path.name)
+def test_the_shipped_policies_are_managed(path: Path) -> None:
+    """Q2 (a): both compose files say ``mode: managed``, so the inline policy seeds revision 1
+    and is ignored afterwards; ``check`` says so in exactly one warning, row 7's."""
+    policy = inline_policy(compose(path.name), path.name)
+    assert policy.mode == "managed"
+    findings = check_policy(policy)
+    assert [(f.level, f.path) for f in findings] == [("warning", "mode")]
+    assert findings[0].message.startswith(
+        "the vault seeds its first revision from this document and ignores it afterwards"
+    )
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES, ids=lambda path: path.name)
+def test_the_comments_say_what_the_seed_reads(path: Path) -> None:
+    """OPS-3, J14, Q36: the comments say the inline policy seeds revision 1 and is ignored
+    afterwards, what to set before the first ``up -d``, that the admin port's origin is read only
+    at the seed, and that a later change is a host import; none says to commit a fragment or to
+    recreate for an edit, that the managed policy may go without its portal, or that the compose
+    command is only for what ``login --mcp`` prints."""
+    said = comments((DEPLOY / path.name).read_text(encoding="utf-8"))
+    assert SEED_COMMENT in said
+    assert "so set agent1's token_sha256, the server's URL" in said
+    assert "here before the first `up -d`" in said
+    assert "change the policy in the portal, or export, edit and `zoeymcp policy import` it" in said
+    assert "ZOEYMCP_ADMIN_PORT is read only at the seed" in said
+    assert "a port change after it is a host import first (docs/operations.md §30)" in said
+    assert "replace it before the first `up -d`, since no portal change sets a token" in said
+    for stale in STALE_COMMENTS:
+        assert stale not in said
+
+
+def test_the_hardened_rotation_is_a_host_import() -> None:
+    """J15, E-8: the generation the compose file interpolates is read only at the seed, so the
+    rotation comment says to raise it with an import (an edited export, or ``--from-env`` when the
+    compose policy is the one kept), not with the variable and a recreate alone, and the field's
+    own comment says the same."""
+    said = comments((DEPLOY / "compose.hardened.yaml").read_text(encoding="utf-8"))
+    assert (
+        "ZOEYMCP_GATEWAY_KEY_GENERATION is read only at the seed, so raising it and recreating "
+        "the vault changes no generation. Raise gateway_key_generation with a host import"
+    ) in said
+    assert "raise ZOEYMCP_GATEWAY_KEY_GENERATION and recreate the vault" not in said
+    assert (
+        "if this file is the policy you keep, raise the variable, recreate the vault, and run "
+        "`zoeymcp policy import --from-env` in it, whose plan shows the rotation"
+    ) in said
+    vault = compose("compose.hardened.yaml")["services"]["vault"]
+    assert (
+        "# Read only at the seed: a rotation later is a host import (docs/operations.md §14).\n"
+        "gateway_key_generation: 1\n"
+    ) in vault["environment"]["ZOEYMCP_CONFIG"]
 
 
 def launchers_box(service: dict[str, Any]) -> None:

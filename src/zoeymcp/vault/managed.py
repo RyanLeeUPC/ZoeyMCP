@@ -783,6 +783,9 @@ class ManagedPolicy:
         except StoreRefused as exc:
             return WriteRefused(exc.reason, exc.detail)
         self._policy, self._ratchet = planned.policy, planned.ratchet
+        if seed_digest is not None:
+            # The configured policy's digest is the seed's now: F.5's finding ends (H.5).
+            self._seed_ignored = None
         # Step 8: the install.
         failed = self._install(committed.revision, committed.digest, planned.policy)
         # Step 9: the log lines.

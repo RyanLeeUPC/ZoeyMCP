@@ -12,15 +12,20 @@
 # `zoeymcp keygen` prints both keys. Agents' containers join the agents network and use
 # http://gateway:8090/s/<server>/mcp with "Authorization: Bearer <client token>".
 #
-# Set secrets through the vault's admin socket, never in this file, and review servers through
-# the gateway's:
+# The policy below is managed (docs/operations.md §34): on a fresh volume it seeds the vault's
+# revision 1, and after that the portal and `zoeymcp policy import` change the policy, not this
+# file. Edit it before the first `up -d`.
+#
+# Set secrets through the vault's admin socket, never in this file, and see what a server lists
+# through the gateway's (a review is saved in the portal):
 #
 #   printf '%s' "$VALUE" | docker compose -f deploy/compose.hardened.yaml exec -T vault \
 #     zoeymcp secret set notes-key
 #   docker compose -f deploy/compose.hardened.yaml exec gateway zoeymcp review notes
 #
 # The portal (docs/operations.md, "The portal") is at http://localhost:8081 in a browser on this
-# host; ZOEYMCP_ADMIN_PORT=9000 moves it to http://localhost:9000 (the origin below follows).
+# host; ZOEYMCP_ADMIN_PORT=9000 moves it to http://localhost:9000. The origin below follows it
+# only at the seed: a port change after it is a host import first (docs/operations.md §30).
 # The vault listens for it on its egress address only, published on the host's loopback, so the
 # gateway and anything on the internal, direct or agents networks can't reach it. Issue the
 # first setup code with:
@@ -28,12 +33,18 @@
 #   docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp setup-code
 #
 # From another machine, tunnel the same port number (ssh -N -L 8081:127.0.0.1:8081 host), or put
-# an HTTPS proxy of your own in front (operations.md); leave the admin block out for no portal.
+# an HTTPS proxy of your own in front (operations.md). A managed policy needs the admin block;
+# for no portal, set mode: declarative and leave the block out.
 #
-# Rotating the gateway key (docs/operations.md): raise ZOEYMCP_GATEWAY_KEY_GENERATION and
-# recreate the vault; the old key then works for at most 5 minutes. Print the new key with
-# `docker compose exec vault zoeymcp gateway-key`, set it as ZOEYMCP_GATEWAY_KEY, and recreate
-# the gateway. Its first request with the new key retires the old one.
+# Rotating the gateway key (docs/operations.md §14): ZOEYMCP_GATEWAY_KEY_GENERATION is read only
+# at the seed, so raising it and recreating the vault changes no generation. Raise
+# gateway_key_generation with a host import instead: `zoeymcp policy export` in the vault, raise
+# it in the export, and `zoeymcp policy import` it (or, if this file is the policy you keep, raise
+# the variable, recreate the vault, and run `zoeymcp policy import --from-env` in it, whose plan
+# shows the rotation and any portal saves it would undo); the old key then works for at most 5
+# minutes. Print the new key with `docker compose exec vault zoeymcp gateway-key`, set it as
+# ZOEYMCP_GATEWAY_KEY, and recreate the gateway. Its first request with the new key retires the
+# old one.
 #
 # The lan profile (`--profile lan`) adds a TLS reverse proxy for agents on other hosts; see
 # below.
@@ -47,7 +58,7 @@
 #     --profile egress-proxy up -d
 #
 # To send the vault's own traffic through it, uncomment egress_proxy and egress_proxy_kind in
-# the policy below and recreate the vault.
+# the policy below before the first `up -d`; after the seed, import them and restart the vault.
 
 name: zoeymcp
 
@@ -96,29 +107,38 @@ services:
     stop_grace_period: 75s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
-      # The commands `zoeymcp login --mcp` prints start with this compose command and name this
-      # service (docs/operations.md §11). Run compose with override files, a project directory
-      # or a project name? Set ZOEYMCP_COMPOSE_CMD in .env to the command you type.
+      # The commands ZoeyMCP prints (a refused start's way out, the policy commands' next
+      # steps, and in declarative mode those of `zoeymcp login --mcp`) start with this compose
+      # command and name this service (docs/operations.md §11). Run compose with override
+      # files, a project directory or a project name? Set ZOEYMCP_COMPOSE_CMD in .env to the
+      # command you type.
       ZOEYMCP_COMPOSE_CMD: "${ZOEYMCP_COMPOSE_CMD:-docker compose -f deploy/compose.hardened.yaml}"
       ZOEYMCP_EXEC_SERVICE: vault
-      # The policy, inline: no bind mounts needed. Reload it with `docker compose kill -s HUP vault`
-      # after changing a file-based policy, or recreate the container for this inline one.
+      # The policy, inline: no bind mounts needed. It seeds revision 1 of the managed policy on
+      # a fresh volume and is ignored afterwards (docs/operations.md §34), so set agent1's
+      # token_sha256, the server's URL, the stats placeholder, gateway.hosts and egress_proxy
+      # here before the first `up -d`. After that, change the policy in the portal, or export,
+      # edit and `zoeymcp policy import` it: an edit here only logs policy_seed_ignored.
       ZOEYMCP_CONFIG: |
         version: 1
-        mode: declarative
+        # mode: declarative instead makes this the policy itself, as before M6: a recreate
+        # applies an edit (docs/operations.md §7).
+        mode: managed
+        # Read only at the seed: a rotation later is a host import (docs/operations.md §14).
         gateway_key_generation: ${ZOEYMCP_GATEWAY_KEY_GENERATION:-1}
         # Through the egress role (--profile egress-proxy): its vault listener, and that it is
-        # the role, not a proxy of your own, so onboarding needs no proxy edit. Both take a
-        # restart (recreate the vault) to change.
+        # the role, not a proxy of your own, so onboarding needs no proxy edit. Uncomment both
+        # before the first `up -d`; after the seed, a change is an import, then a vault restart.
         # egress_proxy: http://egress-vault:3128
         # egress_proxy_kind: role
-        # The portal. Leave this block out for no portal.
+        # The portal, where a managed policy is changed.
         admin:
           # The vault's alias on egress (below), resolved at start to exactly one address, so
           # the portal listens on that network alone: not on internal or direct.
           listen: vault-portal:8081
           # The exact addresses a browser uses, the published port included. Add a tunnel's
-          # other local port, or your HTTPS proxy's https://<name>, here.
+          # other local port, or your HTTPS proxy's https://<name>, here before the first
+          # `up -d`, or later with an import. ZOEYMCP_ADMIN_PORT is read only at the seed.
           origins: ["http://localhost:${ZOEYMCP_ADMIN_PORT:-8081}"]
         credentials:
           music-stats: {kind: query, param: api_key, secret: store:music-stats}
@@ -145,11 +165,13 @@ services:
             stream: true
             rules: [{methods: [POST, GET, DELETE], paths: [/mcp]}]
         gateway:
-          # Agents use the service name. Add the lan profile's name if you use it.
+          # Agents use the service name. Add the lan profile's name here before the first
+          # `up -d` if you use it, or later with an import.
           hosts: [gateway, localhost, 127.0.0.1, zoeymcp.lan.example]
           clients:
             agent1:
-              # From `zoeymcp client-token`. This one matches no token anyone has.
+              # From `zoeymcp client-token`: replace it before the first `up -d`, since no
+              # portal change sets a token. This one matches no token anyone has.
               token_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
               servers: [notes]
           servers:
@@ -157,8 +179,8 @@ services:
               kind: remote
               route: notes-mcp
               path: /mcp
-              # Nothing is served until you review it: `zoeymcp review notes --add <tool>`,
-              # then classify each tool under allow or approve and commit the pins.
+              # Nothing is served until you review it: in the portal, MCP servers, then Review
+              # on notes; classify each tool under allow or approve and Save.
               tools: {include: [], allow: [], approve: []}
               review: {}
     tmpfs:

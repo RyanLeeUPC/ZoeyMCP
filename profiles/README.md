@@ -1,7 +1,9 @@
 # Provider profiles
 
 Each file is a ready-made `credentials:` + `routes:` fragment for one service shape (design
-§8.1); the MCP ones have a `gateway:` part too. Copy the parts you need into your policy, then:
+§8.1); the MCP ones have a `gateway:` part too. They are declarative merge sources: copy the parts
+you need into your policy file (in managed mode, into an export you then import, as
+[docs/operations.md](../docs/operations.md) §34 says), then:
 
 - replace every `ph-replace-...` placeholder with a long random value
   (`python -c "import secrets; print(secrets.token_urlsafe(24))"`);
