@@ -440,8 +440,8 @@ def test_the_default_table_is_the_built_routes() -> None:
 @pytest.mark.parametrize(
     ("route", "path", "length", "ok"),
     [
-        (REVIEW_DIFF, "/api/review/jobs/j1/diff", "524288", True),
-        (REVIEW_DIFF, "/api/review/jobs/j1/diff", "524289", False),
+        (REVIEW_DIFF, "/api/review/jobs/j1/diff", "4194304", True),
+        (REVIEW_DIFF, "/api/review/jobs/j1/diff", "4194305", False),
         (ONBOARD_DISCOVER, "/api/onboard/discover", "4096", True),
         (ONBOARD_DISCOVER, "/api/onboard/discover", "4097", False),
         (ONBOARD_FRAGMENT, "/api/onboard/o1/fragment", "64", True),
@@ -451,8 +451,8 @@ def test_the_default_table_is_the_built_routes() -> None:
     ],
 )
 def test_the_k2_caps_on_the_default_table(route: Route, path: str, length: str, ok: bool) -> None:
-    """M7 K.2: a review's choices up to 512 KiB, its own cap; the others at the M.1 caps they
-    share."""
+    """M7 K.2: a review's choices up to 4 MiB (each kind's URIs too, M6 L.7), its own cap; the
+    others at the M.1 caps they share."""
     decision = admit(request(path=path, length=length), ENTRIES)
     if ok:
         assert isinstance(decision, Admitted)
@@ -484,6 +484,8 @@ def test_the_k2_caps_on_the_default_table(route: Route, path: str, length: str, 
             True,
         ),
         (REVIEW_DIFF, b'{"include":[],"allow":[],"approve":[],"indent":4}', True),
+        # M6 L.7: a server's prompts and resources, under kinds.
+        (REVIEW_DIFF, b'{"include":[],"allow":[],"approve":[],"kinds":{"prompt":{}}}', True),
         (REVIEW_DIFF, b'{"include":[],"allow":[]}', False),
     ],
 )

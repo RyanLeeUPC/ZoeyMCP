@@ -1,7 +1,8 @@
 """The change a review makes (M6 design J.3, O.3; Q8, Q27): re-pin, the allow proposal and a kept
 ``allow``, declines, and a definition recorded for every name classified ``allow`` at a
 (classification, pin) the policy doesn't hold, with ``allow_needs_review``, ``allow_marked`` and
-``consequential_allow`` each refused by name.
+``consequential_allow`` each refused by name. M6 L.7: a server's prompts and resources, each
+kind's block written whole by the same rules, never classified.
 
 The reports come from the gateway's own review code (``tests/unit/test_review.py``'s helpers), held
 as the vault holds them; the CLI's snippet cases stay in ``test_review.py`` and
@@ -16,27 +17,53 @@ from typing import Any
 
 from mcp.types import Tool
 
+from tests.unit.test_pins import prompt_pin
 from tests.unit.test_review import pin, reviewed, tool, wire
+from tests.unit.test_review_choices import (
+    INDEX,
+    INDEX_PIN,
+    OLD,
+    OTHER_URI,
+    OTHER_URI_PIN,
+    TEMPLATE,
+    TEMPLATE_PIN,
+    kinds,
+)
 from tests.unit.test_review_toolkits import reviewed as toolkit_reviewed
+from tests.unit.test_reviewreport import PIN0
 from tests.unit.test_reviewview import held
 from zoeymcp.common.policy.change import PolicyChange, SetServerReview
 from zoeymcp.common.policy.emit import emit
 from zoeymcp.common.policy.reviewchange import (
     CHUNK,
     MOVED_TO_ALLOW,
+    NOUNS,
     PROPOSED,
     AllowRefused,
     Changes,
     Choices,
+    KindChanges,
+    block_of,
+    declined_block,
     definition_lines,
     definitions,
+    enabled,
     fragment,
+    is_key,
+    kind_blocks,
+    kind_of,
+    listed,
+    pinnable,
     planned,
     proposed,
+    second_title,
     the_rest,
+    title,
     verified,
 )
+from zoeymcp.common.policy.schema import PromptsPolicy, ResourceSet, ResourcesPolicy
 from zoeymcp.common.policy.view import ViewRemoteServer
+from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import pins
 
 READ_ONLY = {"readOnlyHint": True}
@@ -314,3 +341,246 @@ def test_a_definition_in_chunks_with_nothing_cut() -> None:
     assert ["".join(chunks) for chunks in lines] == ["{", f'  "d": "{long}"', "}"]
     assert [len(chunk) for chunk in lines[1]] == [CHUNK, CHUNK, len(f'  "d": "{long}"') - 400]
     assert definition_lines({}) == [["{}"]]
+
+
+# --- prompts and resources (M6 design L.7) -------------------------------------------------------
+
+
+def kinds_held() -> dict[str, Any]:
+    return held(kinds())
+
+
+def kind_entry(report: dict[str, Any], kind: str, name: str) -> dict[str, Any]:
+    found: dict[str, Any] = next(
+        e for e in report["tools"] if e.get("kind", "tool") == kind and e["name"] == name
+    )
+    return found
+
+
+def test_each_kinds_key_block_and_whether_it_is_enabled() -> None:
+    report = kinds_held()
+    assert [is_key("tool", name) for name in ("a", "a b", INDEX)] == [True, False, False]
+    assert [is_key("prompt", name) for name in ("fine", "x" * 129)] == [True, False]
+    assert [is_key("resource_template", name) for name in (TEMPLATE, "a", "x://h/{a}{b}")] == [
+        True,
+        False,
+        False,
+    ]
+    assert [is_key("resource", name) for name in (INDEX, TEMPLATE, "a")] == [True, False, False]
+    assert kind_of({"name": "a"}) == "tool"
+    assert kind_of({"kind": "prompt"}) == "prompt"
+    assert block_of(report, "tool") is report["policy"]
+    assert block_of(report, "prompt")["assistant"] == ["fine", "gone"]
+    assert block_of(report, "resource_template")["include"] == [TEMPLATE]
+    assert block_of(report, "resource")["include"] == []
+    assert enabled(report) == ("prompt", "resource_template", "resource")
+    assert kind_blocks(report) == ("prompts", "resources")
+    tools_only = drifting()
+    assert (enabled(tools_only), kind_blocks(tools_only)) == ((), ())
+    assert block_of(tools_only, "prompt") == {
+        "include": [],
+        "review": {},
+        "declined": {},
+        "assistant": [],
+    }
+    assert block_of(tools_only, "resource") == {"include": [], "review": {}, "declined": {}}
+    prompts_only = copy.deepcopy(report)
+    del prompts_only["policy"]["resources"]
+    assert (enabled(prompts_only), kind_blocks(prompts_only)) == (("prompt",), ("prompts",))
+    assert NOUNS == {
+        "tool": "tool",
+        "prompt": "prompt",
+        "resource_template": "resource template",
+        "resource": "resource",
+    }
+
+
+def test_a_block_member_the_report_leaves_out_is_its_default() -> None:
+    """The vault holds a report as the gateway set it (``exclude_unset``): a member a kind's
+    block leaves out is read as its default, never a KeyError."""
+    raw = kinds()
+    prompts = raw["policy"]["prompts"]
+    raw["policy"]["prompts"] = {"include": prompts["include"], "review": prompts["review"]}
+    raw["policy"]["resources"] = {"templates": {"review": {TEMPLATE: TEMPLATE_PIN}}}
+    report = held(raw)
+    assert set(report["policy"]["prompts"]) == {"include", "review"}
+    assert block_of(report, "prompt")["assistant"] == []
+    assert block_of(report, "prompt")["declined"] == {}
+    assert block_of(report, "resource_template") == {
+        "include": [],
+        "review": {TEMPLATE: TEMPLATE_PIN},
+        "declined": {},
+    }
+    op = op_of(fragment(report, Changes()))
+    assert op.prompts is not None
+    assert op.resources is not None
+    assert (op.prompts.include, op.prompts.declined, op.prompts.assistant) == (
+        ["fine", "drifts", "gone"],
+        {},
+        [],
+    )
+    assert op.resources.templates == ResourceSet()
+
+
+def test_listed_and_the_rest_by_kind() -> None:
+    """A tool and a prompt of one name are two entries: the tools' lists are the tools' alone."""
+    report = kinds_held()
+    assert set(listed(report)) == {"a"}
+    assert set(listed(report, "prompt")) == {"fine", "drifts", "new", "old", "bad"}  # not gone
+    assert set(listed(report, "resource")) == {INDEX, OTHER_URI}
+    assert pinnable(kind_entry(report, "resource_template", TEMPLATE))
+    assert not pinnable(kind_entry(report, "prompt", "bad"))  # an error finding
+    assert the_rest(report, ["fine", "drifts"], "prompt") == {
+        "new": kind_entry(report, "prompt", "new")["pin"],
+        "old": prompt_pin("old"),
+    }
+    assert the_rest(report, [INDEX], "resource") == {OTHER_URI: OTHER_URI_PIN}
+    named = copy.deepcopy(report)
+    twin = {**kind_entry(named, "prompt", "fine"), "name": "a"}
+    named["tools"].append(twin)
+    assert listed(named)["a"] == entry(named, "a")  # the tool, listed first
+    assert listed(named, "prompt")["a"] == twin
+    assert op_of(fragment(named, Changes())).review["a"] == entry(report, "a")["pin"]
+
+
+def test_a_kind_the_change_doesnt_name_stays_as_the_policy_has_it() -> None:
+    """Its block written whole: the included entries at their pins (a drifted one at its old
+    pin, one gone at the pin it has), the declined block and ``assistant`` as they are; the
+    comments name each kind, and the title names the blocks."""
+    report = kinds_held()
+    change = fragment(report, Changes())
+    op = op_of(change)
+    assert op.prompts == PromptsPolicy(
+        include=["fine", "drifts", "gone"],
+        review={
+            "drifts": prompt_pin("drifts", description=OLD),
+            "fine": prompt_pin("fine"),
+            "gone": PIN0,
+        },
+        declined={"old": prompt_pin("old")},
+        assistant=["fine", "gone"],
+    )
+    assert op.resources == ResourcesPolicy(
+        templates=ResourceSet(include=[TEMPLATE], review={TEMPLATE: TEMPLATE_PIN}),
+        fixed=ResourceSet(),
+    )
+    assert op.blocks() == ("tools", "review", "prompts", "resources")
+    new_pin = kind_entry(report, "prompt", "new")["pin"]
+    drifts_pin = kind_entry(report, "prompt", "drifts")["pin"]
+    assert [(c.kind, c.subject, c.detail) for c in change.comments()] == [
+        (
+            "kept",
+            "drifts",
+            f"prompt; drift: the server lists {drifts_pin}; accept its new definition to take it",
+        ),
+        ("kept", "gone", "prompt; missing: the server doesn't list it"),
+        ("error_finding", "bad", "prompt; review notes shows why"),
+        ("not_included", "new", f"prompt: {new_pin}"),
+        ("declined", "old", f"prompt: {prompt_pin('old')}"),
+        ("not_included", INDEX, f"resource: {INDEX_PIN}"),
+        ("not_included", OTHER_URI, f"resource: {OTHER_URI_PIN}"),
+    ]
+    assert change.title == (
+        "review of notes. Replace the tools:, review:, prompts: and resources: blocks of "
+        "gateway.servers.notes."
+    )
+
+
+def test_a_kinds_include_repin_and_decline() -> None:
+    """An entry included anew at the pin listed, a drifted one re-pinned at its new pin, a
+    declined block whole; ``assistant`` keeps only the prompts still included."""
+    report = kinds_held()
+    new_pin = kind_entry(report, "prompt", "new")["pin"]
+    drifts_pin = kind_entry(report, "prompt", "drifts")["pin"]
+    made = Changes(
+        kinds={
+            "prompt": KindChanges(("fine", "drifts", "new"), frozenset({"drifts"}), {"bad": PIN0}),
+            "resource": KindChanges((INDEX,), declined={}),
+        }
+    )
+    change = fragment(report, made)
+    op = op_of(change)
+    assert op.prompts == PromptsPolicy(
+        include=["fine", "drifts", "new"],
+        review={"drifts": drifts_pin, "fine": prompt_pin("fine"), "new": new_pin},
+        declined={"bad": PIN0},
+        assistant=["fine"],
+    )
+    assert op.resources is not None
+    assert op.resources.fixed == ResourceSet(include=[INDEX], review={INDEX: INDEX_PIN})
+    assert op.resources.templates.include == [TEMPLATE]  # the kind not named stays
+    said = [(c.kind, c.subject, c.detail) for c in change.comments()]
+    assert said[:3] == [
+        ("changed_was", "drifts", f"prompt, was {prompt_pin('drifts', description=OLD)}"),
+        ("added", "new", "prompt"),
+        ("error_finding", "bad", "prompt; review notes shows why"),
+    ]
+    assert ("not_included", "old", f"prompt: {prompt_pin('old')}") in said  # declined no more
+    assert ("added", INDEX, "resource") in said
+    # A re-pin of an entry that didn't drift is the listed pin anyway; one left out, nothing.
+    repinned = Changes(kinds={"prompt": KindChanges(("fine",), frozenset({"fine", "new"}))})
+    prompts = op_of(fragment(report, repinned)).prompts
+    assert prompts is not None
+    assert dict(prompts.review) == {"fine": prompt_pin("fine")}
+
+
+def test_a_kinds_declined_block_less_what_it_includes() -> None:
+    report = kinds_held()
+    made = Changes(kinds={"prompt": KindChanges(("fine", "old"))})
+    op = op_of(fragment(report, made))
+    assert op.prompts is not None
+    assert (dict(op.prompts.declined), op.prompts.review["old"]) == ({}, prompt_pin("old"))
+    assert declined_block(report, {}, kind="resource") is None
+    assert declined_block(report, {"new": PIN0}, kind="prompt", undeclined=["old"]) == {"new": PIN0}
+
+
+def test_the_title_names_every_block_written() -> None:
+    assert title("notes") == "review of notes. Replace the tools: and review: blocks of " + (
+        "gateway.servers.notes."
+    )
+    assert title("notes", declined=True, kinds=("prompts", "resources")) == (
+        "review of notes. Replace the tools:, review:, declined:, prompts: and resources: "
+        "blocks of gateway.servers.notes."
+    )
+    assert second_title("notes", kinds=("prompts",)) == (
+        "review of notes (2 of 2). Replace the tools:, review: and prompts: blocks of "
+        "gateway.servers.notes, then assign notes to its clients."
+    )
+
+
+def test_a_kinds_fragment_round_trips_through_the_emitter() -> None:
+    report = kinds_held()
+    change = fragment(report, Changes(kinds={"resource": KindChanges((INDEX, OTHER_URI))}))
+    text = emit(change)
+    assert load_mapping(text) == change.data()
+    assert (
+        "# zoeymcp replace: gateway.servers.notes.tools gateway.servers.notes.review "
+        "gateway.servers.notes.prompts gateway.servers.notes.resources"
+    ) in text
+    assert f"# added: {INDEX} (resource)\n" in text
+    assert "# kept: gone (prompt; missing: the server doesn't list it)\n" in text
+
+
+def test_verified_names_the_pins_of_every_kind() -> None:
+    report = kinds_held()
+    made = Changes(kinds={"prompt": KindChanges(("fine", "drifts", "new"), frozenset({"drifts"}))})
+    op = op_of(fragment(report, made))
+    server = "notes"
+    assert verified(report, op) == frozenset(
+        {
+            ((server, "tool", "a"), entry(report, "a")["pin"]),
+            ((server, "prompt", "fine"), prompt_pin("fine")),
+            ((server, "prompt", "drifts"), kind_entry(report, "prompt", "drifts")["pin"]),
+            ((server, "prompt", "new"), kind_entry(report, "prompt", "new")["pin"]),
+            ((server, "resource_template", TEMPLATE), TEMPLATE_PIN),
+        }
+    )
+    kept = op_of(fragment(report, Changes()))  # drifts kept at its old pin: not verified
+    assert ((server, "prompt", "drifts"), prompt_pin("drifts", description=OLD)) not in verified(
+        report, kept
+    )
+    prompts_only = copy.deepcopy(report)
+    del prompts_only["policy"]["resources"]
+    alone = op_of(fragment(prompts_only, Changes()))
+    assert alone.resources is None
+    assert all(key[1] in ("tool", "prompt") for key, _ in verified(prompts_only, alone))

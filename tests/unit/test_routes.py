@@ -100,16 +100,17 @@ K2 = (
     Route("GET", "/api/onboard/{onboarding}", FULL),
     Route("POST", "/api/onboard/{onboarding}/fragment", FULL, 64, optional=frozenset({"indent"})),
     Route("DELETE", "/api/onboard/{onboarding}", FULL),
-    # M6 step 8 (M.2, J.2): a fresh review, and fragment 2's re-pins and declines.
+    # M6 step 8 (M.2, J.2): a fresh review, and fragment 2's re-pins and declines; step 21a
+    # (L.7): the same for a server's prompts and resources, under kinds.
     Route("POST", "/api/review/{server}", FULL, 64, optional=frozenset({"fresh"})),
     Route("GET", "/api/review/jobs/{job}", FULL),
     Route(
         "POST",
         "/api/review/jobs/{job}/diff",
         FULL,
-        512 * KIB,
+        4 * 1024 * KIB,
         frozenset({"include", "allow", "approve"}),
-        frozenset({"indent", "repin", "decline", "decline_rest"}),
+        frozenset({"indent", "repin", "decline", "decline_rest", "kinds"}),
     ),
 )
 # M6 M.2's rows, as each step builds them: step 7's attention list, and step 15b's history and
@@ -167,7 +168,7 @@ def test_the_table_is_m1s_with_k2s() -> None:
         "/api/review/{server}",
     ]
     assert (BODY_EMPTY, BODY_DEFAULT, BODY_WEBAUTHN) == (64, 4 * KIB, 16 * KIB)
-    assert (BODY_SECRET, BODY_PASTE, BODY_CHOICES) == (128 * KIB, 8 * KIB, 512 * KIB)
+    assert (BODY_SECRET, BODY_PASTE, BODY_CHOICES) == (128 * KIB, 8 * KIB, 4 * 1024 * KIB)
 
 
 def test_k2_takes_no_private_discovery() -> None:

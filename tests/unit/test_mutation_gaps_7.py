@@ -88,25 +88,24 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.common.policy.change.x_apply__mutmut_41": _MOVE_TOOLS,
     "zoeymcp.common.policy.change.x_apply__mutmut_42": _MOVE_TOOLS,
     # --- common.policy.plan
-    "zoeymcp.common.policy.plan.x__permits__mutmut_59": (
+    # Renumbered in M6 step 21a (a save's prompt and resource includes and declines came first):
+    # _permits 59, 70 and 79. _pins_added's 27 and 29 (an added server's review with no default)
+    # went: a toolkit added whole has no prompts or resources block, which the default reads, so
+    # test_policy_plan.py's added-whole test kills them.
+    "zoeymcp.common.policy.plan.x__permits__mutmut_67": (
         "`or` for `and` in tool.allow's permit: required_kind makes a write tool.allow only when "
         "its diff is one move, two Tools changes, and of those only the allow addition is wider, "
         "the one change asked about, for which both are true"
     ),
-    "zoeymcp.common.policy.plan.x__permits__mutmut_70": (
+    "zoeymcp.common.policy.plan.x__permits__mutmut_78": (
         "`or` for `and` in connector.limits' permit: required_kind makes a write connector.limits "
         "only when every change is to one SMTPConnector's CONNECTOR_LIMITS fields, so both halves "
         "are true for every change asked about"
     ),
-    "zoeymcp.common.policy.plan.x__permits__mutmut_79": (
+    "zoeymcp.common.policy.plan.x__permits__mutmut_87": (
         "`or` for `and` in client.servers' permit: every change of a client.servers write is a "
-        "Client's servers (required_kind), as mutant 70"
+        "Client's servers (required_kind), as mutant 78"
     ),
-    "zoeymcp.common.policy.plan.x__pins_added__mutmut_27": (
-        "an added server's review read with no {} default: the change's value is the server's "
-        "model dumped with every default filled in (diff._plain), so it always holds review"
-    ),
-    "zoeymcp.common.policy.plan.x__pins_added__mutmut_29": "no default: as mutant 27",
     "zoeymcp.common.policy.plan.x__refused__mutmut_73": _ONE_COLON,
     "zoeymcp.common.policy.plan.x__refused__mutmut_74": _ONE_COLON,
     "zoeymcp.common.policy.plan.x__refused__mutmut_76": _ONE_COLON,

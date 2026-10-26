@@ -1774,7 +1774,9 @@ def _review_output(
         if read is not None:
             changes = review_choices.decide(result, job, read)
             heading = review_view.second_title(
-                result["server"], declined=changes.declined is not None
+                result["server"],
+                declined=changes.declined is not None,
+                kinds=review_view.kind_blocks(result),
             )
             out.write(policy_emit.emit(review_view.fragment(result, changes, heading=heading)))
             err.write(

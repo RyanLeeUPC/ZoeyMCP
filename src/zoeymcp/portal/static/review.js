@@ -651,10 +651,8 @@
     clearRefusal();
     let answer;
     try {
-      answer = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
-        include: lists.include, allow: lists.allow, approve: lists.approve, indent: indent,
-        repin: lists.repin, decline: lists.decline, decline_rest: lists.decline_rest
-      });
+      answer = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }),
+        Object.assign({ indent: indent }, lists)); // every list drift.js's lists() holds
     } catch (error) {
       return refused(error, { server: held.server });
     }

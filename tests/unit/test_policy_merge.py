@@ -288,6 +288,10 @@ def test_egress_private_that_is_not_a_list_is_replaced() -> None:
         (("gateway", "servers", "notes", "tools"), True),
         (("gateway", "servers", "notes", "review"), True),
         (("gateway", "servers", "notes", "declined"), True),
+        # M6 design L.7: a review of a server enabling prompts or resources writes those too.
+        (("gateway", "servers", "notes", "prompts"), True),
+        (("gateway", "servers", "notes", "resources"), True),
+        (("gateway", "servers", "notes", "enable"), False),
         (("credentials",), False),
         (("credentials", "Notes"), False),
         (("connectors", "notes"), False),

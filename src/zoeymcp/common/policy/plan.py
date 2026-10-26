@@ -127,6 +127,12 @@ HOST_NEXT: Final = "zoeymcp policy export, edit, zoeymcp policy import"
 _HOST_FIELDS: Final = frozenset({"admin", "egress_proxy", "egress_proxy_kind", "egress_proxy_acls"})
 _HOST_GATEWAY: Final = frozenset({"approvals", "limits", "hosts", "origins"})
 _SERVER_MODELS: Final = frozenset({"RemoteServer", "ToolkitServer"})
+# A server's prompts and its resource sets, each pinned and declined as its tools are (L.1); the
+# kind of definition a change under each block is about, a tool's elsewhere.
+_KIND_MODELS: Final = frozenset({"PromptsPolicy", "ResourceSet"})
+_BLOCK_KINDS: Final[Mapping[str, str]] = MappingProxyType(
+    {"prompts": "prompt", "templates": "resource_template", "fixed": "resource"}
+)
 _GENERATIONS: Final = ("gateway_key_generation", "egress_key_generation")
 # G.7's fixed sentences.
 MOVE_TEXT: Final = "approve -> allow. Calls to {name} will run with no prompt."
@@ -288,9 +294,14 @@ def carry_forward(head: Policy, target: Policy, *, host: bool = False) -> Policy
 
 
 def _key(change: Change) -> DefKey:
-    """The tool a server's ``tools``, ``review`` or ``declined`` change is about."""
-    name = change.path[4] if change.model in _SERVER_MODELS else _item(change)
-    return (str(change.path[2]), "tool", str(name))
+    """The definition a server's ``tools``, ``review`` or ``declined`` change is about, or one
+    under its ``prompts`` or a ``resources.<set>`` (L.1): the name a list of names gains or
+    loses, or the map's key."""
+    path = change.path
+    block = path[4] if path[3] == "resources" else path[3]
+    named = (change.model, change.field) in diff.NAME_SETS
+    name = _item(change) if named else path[-1]
+    return (str(path[2]), _BLOCK_KINDS.get(str(block), "tool"), str(name))
 
 
 def _item(change: Change) -> Any:
@@ -383,6 +394,7 @@ def _permits(kind: str, change: Change) -> bool:
         return (
             (change.model == "Tools" and change.field in ("include", "allow"))
             or (change.model in _SERVER_MODELS and change.field in ("declined", "era"))
+            or (change.model in _KIND_MODELS and change.field in ("include", "declined"))
             or path[0] in ("credentials", "egress_private")
             or (path[0] == "routes" and len(path) == 2 and change.op == "added")
             or (path[:2] == ("gateway", "servers") and len(path) == 3 and change.op == "added")
@@ -433,16 +445,26 @@ def _subjects(keys: list[DefKey]) -> tuple[str, ...]:
 
 
 def _pins_added(changes: tuple[Change, ...]) -> list[tuple[DefKey, str]]:
-    """Every pin the candidate adds or changes: a ``review`` entry, or one of a server added."""
+    """Every pin the candidate adds or changes, of every kind (a tool's, a prompt's, a
+    template's or a fixed resource's, G.5 rule 1b): a ``review`` entry, or one of a server
+    added."""
     found = [
         (_key(c), c.new)
         for c in changes
-        if c.model in _SERVER_MODELS and c.field == "review" and c.op != "removed"
+        if c.model in _SERVER_MODELS | _KIND_MODELS and c.field == "review" and c.op != "removed"
     ]
     for c in changes:
         if c.path[:2] == ("gateway", "servers") and len(c.path) == 3 and c.op == "added":
-            pins = c.new.get("review", {})
-            found += [((str(c.path[2]), "tool", name), pin) for name, pin in sorted(pins.items())]
+            server = str(c.path[2])
+            resources = c.new.get("resources", {})
+            for kind, block in (
+                ("tool", c.new),
+                ("prompt", c.new.get("prompts", {})),
+                ("resource_template", resources.get("templates", {})),
+                ("resource", resources.get("fixed", {})),
+            ):
+                pins = block.get("review", {})
+                found += [((server, kind, name), pin) for name, pin in sorted(pins.items())]
     return found
 
 
@@ -536,8 +558,9 @@ def _weakening(change: Change, i: PlanInput, candidate: Policy) -> str:
 
 
 def _other(change: Change, i: PlanInput) -> str:
-    """Any other change's value (G.7 row 3): a re-pin shows both pins."""
-    if change.model in _SERVER_MODELS and change.field == "review" and change.op == "changed":
+    """Any other change's value (G.7 row 3): a re-pin, of any kind, shows both pins."""
+    pinned = change.model in _SERVER_MODELS | _KIND_MODELS
+    if pinned and change.field == "review" and change.op == "changed":
         if (_key(change), change.new) in i.verified:
             return REPINNED_TEXT.format(old=change.old, new=change.new)
         return f"{change.old} -> {change.new}"

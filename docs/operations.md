@@ -994,6 +994,11 @@ allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
 - **No line**: a tool with an error finding (it can't be pinned), and an included tool that has
   drifted, is missing or no longer pins; it stays as the policy has it (`review <server> --repin
   TOOL` takes a drifted tool's new pin).
+- **Prompts and resources** (not enabled yet, §12): a server that enables them has a `prompt:`
+  line per prompt and a `resource:` line per resource template and fixed resource after its
+  tools, each with `skip`, `include` or `decline`, its name or URI and its pin, by the rules
+  above; they are never classified. Fragment 2 then replaces the server's `prompts:` and
+  `resources:` blocks too, and the header's policy digest covers them.
 - **Comments** show the server's text cut to 100 characters, with every line break and hidden
   character made visible, so a description can't start a line of its own. A file saved with
   CRLF line endings or a byte order mark (as Windows editors and PowerShell 5.1 save it) reads the
@@ -1410,7 +1415,12 @@ still served. `resources/list` over a limit instead keeps what it listed by then
 (`kind_list_cut`, with `reason` and `listed`): an included resource it didn't reach is missing,
 and the ones it did are checked as usual. To serve, the gateway lists resources only until every
 included one is found, so including another lists them again at once. With `on_drift: fail` a
-drift of any kind blocks the whole server.
+drift of any kind blocks the whole server. The review screen shows a server's prompts, resource
+templates and fixed resources after its tools, under a heading per kind, each with Include,
+Accept the new definition and Decline as a tool has but no classification, and says when a
+kind's listing failed or was cut; Generate then writes the server's `prompts:` and `resources:`
+blocks whole, as the choices file does (§11), and in managed mode Save plans them, every pin
+it adds or changes one the review verified, as for tools.
 
 Each server path states and answers only the kinds it serves: prompts or resources when the
 server enables the kind and includes at least one of it, and completions beside a served prompt

@@ -69,7 +69,9 @@ from ..common.policy.schema import (
     GatewayLimits,
     OAuth2Credential,
     Policy,
+    PromptsPolicy,
     RemoteServer,
+    ResourcesPolicy,
     Route,
     ToolkitServer,
     Tools,
@@ -1094,7 +1096,8 @@ class Listed:
     for a ``refresh_token`` grant, whether it holds a refresh token (OPS-13): a
     ``client_credentials`` grant never holds one, and needs no sign-in. ``review`` and
     ``declined`` are the policy's pins and declined block, which a review report made before a
-    re-pin or a decline no longer matches (M6 design J.2, J.5)."""
+    re-pin or a decline no longer matches (M6 design J.2, J.5), and a remote server's
+    ``prompts`` and ``resources`` its blocks, which a review writes whole (L.7)."""
 
     name: str
     kind: ServerKind
@@ -1106,6 +1109,8 @@ class Listed:
     held: TokenState | None = None
     declined: Mapping[str, str] = field(default_factory=dict)
     review: Mapping[str, str] = field(default_factory=dict)
+    prompts: PromptsPolicy = field(default_factory=PromptsPolicy)
+    resources: ResourcesPolicy = field(default_factory=ResourcesPolicy)
 
     @property
     def state(self) -> RowState:
@@ -1135,6 +1140,7 @@ def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed
         if isinstance(server, ToolkitServer):
             found.append(listed)
             continue
+        listed = replace(listed, prompts=server.prompts, resources=server.resources)
         route = routes.get(server.route)
         credential = None if route is None else route.credential
         cred = None if credential is None else policy.credentials.get(credential)

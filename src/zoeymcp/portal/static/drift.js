@@ -244,12 +244,18 @@
     return block;
   }
 
-  // review.js's row hook: a drifted tool's columns and Accept the new definition (a re-pin, which
-  // keeps its classification, Q8); Decline for a pinnable tool the policy doesn't include, which
-  // records it left out at the definition shown (J.3).
+  // review.js's row hook: a drifted tool's columns and Accept the new definition (a re-pin keeping
+  // its classification, Q8); Decline for a pinnable tool not included, recorded at the definition
+  // shown (J.3); a prompt or a resource (L.7): its kind's heading, no classification, its box ours.
   function row(entry) {
     const tool = entry.tool;
     const place = entry.item; // the row's list item
+    if (tool.kind !== "tool") {
+      place.prepend(...(tool.heading ? [make("h3", tool.heading)] : []));
+      place.querySelectorAll(".badge")[1].remove(); // the server's suggestion, a tool's
+      [entry.choice?.nextSibling, entry.choice].forEach((node) => node?.remove());
+      [entry.pick, entry.box, entry.choice] = [entry.box, null, null]; // review.js's: the tools'
+    }
     if (tool.state === "drift") {
       place.append(columns(tool));
       if (tool.pinnable && tool.name !== null) {
@@ -262,7 +268,7 @@
         }
       }
     }
-    if (entry.box !== null && tool.pinnable && !tool.included) {
+    if ((entry.box || entry.pick) && tool.pinnable && !tool.included) {
       entry.decline = check(place, "Decline: leave it out, recorded at this definition");
     }
   }
@@ -272,7 +278,7 @@
   // marked, enabled only when every included tool matches its pin (J13); and what Allow without
   // asking waited for, if this is the review of the job it queued (J3, J.4).
   function footer(held, view, queue) {
-    const drifted = view.tools.filter((tool) => tool.state === "drift").length;
+    const drifted = view.tools.filter((t) => t.kind === "tool" && t.state === "drift").length;
     $("review-drift").replaceChildren(drifted ? drifted + (drifted === 1 ? " tool" : " tools") +
       " changed since the review. " : "", button("Review again", () => queue(held.server, true)));
     const included = view.tools.filter((tool) => tool.included);
@@ -331,13 +337,10 @@
     if (held === null) {
       return;
     }
-    const lists = picked(held);
     let draft;
     try {
-      draft = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
-        include: lists.include, allow: lists.allow, approve: lists.approve, repin: lists.repin,
-        decline: lists.decline, decline_rest: lists.decline_rest
-      });
+      draft = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }),
+        picked(held));
     } catch (error) {
       return afterFailure(error);
     }
@@ -415,24 +418,30 @@
     return found;
   }
 
-  // The lists Generate sends (review.js's chosen() adds the included ones): the drifted tools
+  // The lists Generate sends (review.js's chosen() adds the included tools): the drifted tools
   // whose new definition is accepted and still included, the tools declined and not included, and
-  // whether the rest are recorded as declined.
+  // decline_rest; and each kind's, its included ones too (L.7), which Clear unticks below.
   function lists(held) {
     const found = { include: [], allow: [], approve: [], repin: [], decline: [],
-      decline_rest: $("review-decline-rest").checked };
+      decline_rest: $("review-decline-rest").checked, kinds: {} };
     for (const entry of held === null ? [] : held.entries) {
-      if (entry.repin && entry.repin.checked && entry.box.checked) {
-        found.repin.push(entry.tool.name);
+      const into = entry.tool.kind === "tool" ? found : (found.kinds[entry.tool.kind] =
+        found.kinds[entry.tool.kind] || { include: [], repin: [], decline: [] });
+      if (entry.pick && entry.pick.checked) {
+        into.include.push(entry.tool.name);
       }
-      if (entry.decline && entry.decline.checked && !entry.box.checked) {
-        found.decline.push(entry.tool.name);
+      if (entry.repin && entry.repin.checked && (entry.box || entry.pick).checked) {
+        into.repin.push(entry.tool.name);
+      }
+      if (entry.decline && entry.decline.checked && !(entry.box || entry.pick).checked) {
+        into.decline.push(entry.tool.name);
       }
     }
     return found;
   }
 
   on("review-save", save);
+  on("review-clear", () => drawn?.entries.forEach((e) => e.pick && (e.pick.checked = false)));
   window.zoeyDrift = Object.freeze({
     home: home, review: review, servers: servers, row: row, footer: footer, lists: lists,
     registered: registered, saveOnboarding: saveOnboarding,

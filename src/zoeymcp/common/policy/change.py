@@ -21,6 +21,9 @@ else's (M6 G.3): :class:`MoveToAllow` (one included ``approve`` tool to ``allow`
   included, less the tools it includes (M6 J.3, H.4; CR-17), so a candidate never holds a tool
   both included and declined. A declarative fragment stays M7's (M6 step 6). A refusal is
   :class:`ChangeRefused`, whose ``reason`` is M.2's.
+- A review of a server that enables prompts or resources (M6 design L.7) writes those blocks
+  whole too (:class:`SetServerReview`'s ``prompts`` and ``resources``), and a comment may name a
+  prompt or a resource by its URI.
 - :func:`from_portal` holds the portal's bounds on the ops themselves (M6 G.3, I.3): a credential
   the portal adds or changes takes no ``env:`` reference (``portal_env_ref``, CR-16), and a route
   it adds calls as the gateway with a credential the same change adds
@@ -29,6 +32,7 @@ else's (M6 G.3): :class:`MoveToAllow` (one included ``approve`` tool to ``allow`
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -37,6 +41,7 @@ from typing import Any, Final, Literal
 
 from pydantic import TypeAdapter, ValidationError
 
+from . import fields
 from .check import check_policy
 from .findings import Finding, format_location
 from .merge import REVIEW_BLOCKS, Merged, Path, describe, merge
@@ -49,7 +54,9 @@ from .schema import (
     Pin,
     Policy,
     PrivateHostPort,
+    PromptsPolicy,
     RemoteServer,
+    ResourcesPolicy,
     Route,
     SMTPConnector,
     ToolkitServer,
@@ -79,9 +86,6 @@ _PIN: Final = TypeAdapter(Pin)
 _ENTRY: Final = TypeAdapter(PrivateHostPort)
 _ERA: Final[TypeAdapter[Era]] = TypeAdapter(Era)
 _SEPARATOR: Final[TypeAdapter[ScopeSeparator]] = TypeAdapter(ScopeSeparator)
-# The blocks a review's op writes, each replaced whole: its declined block too
-# (merge.REVIEW_BLOCKS) when the op holds one (M6 design J.3).
-_REVIEW_WRITES: Final = ("tools", "review")
 # A connector's fields outside its secret's binding (F-15): the only ones the portal changes.
 CONNECTOR_LIMITS: Final = ("paused", "max_per_day", "max_subject_chars", "max_body_chars")
 # The fields of a credential the portal adds or changes that may hold a secret reference.
@@ -140,14 +144,16 @@ class AddEgressPrivate:
 @dataclass(frozen=True)
 class SetServerReview:
     """A review's result for one server: its ``tools`` and ``review`` replaced whole, its
-    ``declined`` too unless it is ``None`` (left as it is), and its ``era`` when the review
-    learned it."""
+    ``declined``, ``prompts`` and ``resources`` too unless each is ``None`` (left as it is; M6
+    design J.3, L.7), and its ``era`` when the review learned it."""
 
     name: str
     tools: Tools
     review: Mapping[str, str]
     era: str | None = None
     declined: Mapping[str, str] | None = None
+    prompts: PromptsPolicy | None = None
+    resources: ResourcesPolicy | None = None
 
     def __post_init__(self) -> None:
         _name(self.name)
@@ -159,6 +165,11 @@ class SetServerReview:
             object.__setattr__(self, "declined", MappingProxyType(declined))
         if self.era is not None:
             _ERA.validate_python(self.era)  # a Literal takes only its own strings
+
+    def blocks(self) -> tuple[str, ...]:
+        """The server's blocks the op replaces whole (``merge.REVIEW_BLOCKS``): ``tools`` and
+        ``review``, and each of the others it holds."""
+        return tuple(block for block in REVIEW_BLOCKS if getattr(self, block) is not None)
 
 
 @dataclass(frozen=True)
@@ -266,7 +277,18 @@ class Comment:
     detail: str | None = None
 
     def __post_init__(self) -> None:
-        _TOOL_NAME.validate_python(self.subject, strict=True)  # a policy name is one too
+        _subject(self.subject)
+
+
+def _subject(value: str) -> None:
+    """A comment's subject: a tool's name (a policy's and a prompt's are one too), or a resource
+    template's or a fixed resource's URI (M6 design L.1), each printable ASCII on one line."""
+    if isinstance(value, str):
+        for rule in (fields.uri_template, fields.resource_uri):
+            with contextlib.suppress(ValueError):
+                rule(value)
+                return
+    _TOOL_NAME.validate_python(value, strict=True)
 
 
 Op = (
@@ -321,6 +343,10 @@ class PolicyChange:
                 block: dict[str, Any] = {"tools": _plain(op.tools), "review": dict(op.review)}
                 if op.declined is not None:
                     block["declined"] = dict(op.declined)
+                for name in ("prompts", "resources"):
+                    held: PromptsPolicy | ResourcesPolicy | None = getattr(op, name)
+                    if held is not None:  # every field written: the block is replaced whole
+                        block[name] = held.model_dump(mode="json")
                 if op.era is not None:
                     block["era"] = op.era
                 _servers(out)[op.name] = block
@@ -337,8 +363,7 @@ class PolicyChange:
         paths: list[Path] = []
         for op in self.ops:
             if isinstance(op, SetServerReview):
-                blocks = _REVIEW_WRITES if op.declined is None else REVIEW_BLOCKS
-                paths += [("gateway", "servers", op.name, block) for block in blocks]
+                paths += [("gateway", "servers", op.name, block) for block in op.blocks()]
             elif isinstance(op, SetCredential):
                 paths.append(("credentials", op.name))
         return tuple(paths)

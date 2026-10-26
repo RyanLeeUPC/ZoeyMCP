@@ -113,8 +113,16 @@ FIELDS: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
             tools="Tools",
             review=STRING_MAP,
             declined=STRING_MAP,
+            prompts="PromptsPolicy",
+            resources="ResourcesPolicy",
         ),
         "Tools": _table(include=STRINGS, allow=STRINGS, approve=STRINGS),
+        # A review's prompts and resources blocks (M6 design A.4, L.7), each written whole.
+        "PromptsPolicy": _table(
+            include=STRINGS, review=STRING_MAP, declined=STRING_MAP, assistant=STRINGS
+        ),
+        "ResourcesPolicy": _table(templates="ResourceSet", fixed="ResourceSet"),
+        "ResourceSet": _table(include=STRINGS, review=STRING_MAP, declined=STRING_MAP),
     }
 )
 # The model a credential's kind names; any other kind is never in a fragment.

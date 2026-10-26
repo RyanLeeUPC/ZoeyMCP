@@ -66,13 +66,14 @@ from typing import Any, Final, Literal, TextIO
 
 from ..common.policy import attention
 from ..common.policy.emit import emit
+from ..common.policy.reviewchange import NOUNS, kind_of, pinnable
 
 # The change the snippet makes moved to a pure module (M6 design J.3), named here as before.
 from ..common.policy.reviewchange import Added as Added
 from ..common.policy.reviewchange import Changes as Changes
 from ..common.policy.reviewchange import Choices as Choices
 from ..common.policy.reviewchange import fragment as fragment
-from ..common.policy.reviewchange import pinnable
+from ..common.policy.reviewchange import kind_blocks as kind_blocks
 from ..common.policy.reviewchange import planned as planned
 from ..common.policy.reviewchange import read_only as read_only
 from ..common.policy.reviewchange import second_title as second_title
@@ -118,8 +119,11 @@ def short_pin(pin: str | None) -> str:
 
 def check_choices(review: dict[str, Any], choices: Choices) -> None:
     """Refuse an ``--add``, ``--allow``, ``--approve``, ``--decline`` or ``--repin`` that the
-    review doesn't allow."""
-    by_name = {entry["name"]: entry for entry in review["tools"]}
+    review doesn't allow. Each names a tool: a prompt or a resource of the name (M6 L.7) is a
+    choices file's line, never checked in a tool's place; ``--tool`` and ``--show`` may name any
+    kind."""
+    by_name = {entry["name"]: entry for entry in review["tools"] if kind_of(entry) == "tool"}
+    others = {entry["name"]: kind_of(entry) for entry in review["tools"]}
     named = [*choices.add, *choices.allow, *choices.approve]
     twice = sorted({name for name in named if named.count(name) > 1})
     if twice:
@@ -127,6 +131,20 @@ def check_choices(review: dict[str, Any], choices: Choices) -> None:
     both = sorted(set(choices.decline) & set(named))
     if both:
         raise UsageError(f"{', '.join(both)}: --decline leaves a tool out, so don't include it")
+    for option, names in (
+        ("--add", choices.add),
+        ("--allow", choices.allow),
+        ("--approve", choices.approve),
+        ("--decline", choices.decline),
+        ("--repin", sorted(choices.repin)),
+    ):
+        for name in names:
+            if name not in by_name and name in others:
+                noun = NOUNS[others[name]]
+                raise UsageError(
+                    f"{option} {name}: the server lists it as a {noun}: choose it in the file "
+                    "--choose writes"
+                )
     for option, names in (
         ("--add", choices.add),
         ("--allow", choices.allow),
@@ -146,7 +164,7 @@ def check_choices(review: dict[str, Any], choices: Choices) -> None:
             raise UsageError(f"--repin {name}: it hasn't drifted")
         if not pinnable(entry):
             raise UsageError(f"--repin {name}: it has error findings, so it can't be pinned")
-    unknown = sorted((choices.tools | choices.show) - set(by_name))
+    unknown = sorted((choices.tools | choices.show) - set(others))
     if unknown:
         raise UsageError(f"the server lists no tool named {', '.join(unknown)}")
 

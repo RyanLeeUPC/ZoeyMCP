@@ -16,7 +16,7 @@ import copy
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import pytest
 
@@ -701,6 +701,98 @@ def test_a_pin_the_review_didnt_verify_is_review_stale() -> None:
     assert ok(candidate, kind="policy.import", surface="socket")
     stale = make(repin("write", PIN_OLD))
     assert refused(stale, kind="policy.rollback", target=stale).reason == "kind_mismatch"
+
+
+# A prompt, a template and a fixed resource of notes (L.1), by kind: its block and its name.
+KIND_BLOCKS: Final = {
+    "prompt": ("prompts",),
+    "resource_template": ("resources", "templates"),
+    "resource": ("resources", "fixed"),
+}
+KIND_NAMES: Final = {
+    "prompt": "brief",
+    "resource_template": "notes://notes/{id}",
+    "resource": "notes://index",
+}
+
+
+def kind_block(kind: str, server: str = "notes", **members: Any) -> Edit:
+    """``members`` set in the server's block for ``kind``."""
+
+    def edit(data: dict[str, Any]) -> None:
+        here = data["gateway"]["servers"][server]
+        for key in KIND_BLOCKS[kind]:
+            here = here.setdefault(key, {})
+        here.update(members)
+
+    return edit
+
+
+@pytest.mark.parametrize("kind", list(KIND_BLOCKS))
+def test_a_prompt_or_a_resource_pin_the_review_didnt_verify_is_review_stale(kind: str) -> None:
+    """Rule 1b holds every kind's pins as the tools' (G.5, Y11): a re-pin or an include of a
+    prompt, a template or a fixed resource at a pin the review didn't verify is
+    ``review_stale``; at a verified pin it is a ``policy.save`` rule 2 permits, as a dropped
+    decline is; a prompt let speak as the assistant stays the host's (L.6)."""
+    name = KIND_NAMES[kind]
+    key = ("notes", kind, name)
+    stale = PlanRefused("review_stale", f"notes.{name}", (f"notes/{kind}/{name}",))
+    head = make(kind_block(kind, include=[name], review={name: PIN_OLD}))
+    repinned = make(kind_block(kind, include=[name], review={name: PIN_NEW}))
+    on_head: dict[str, Any] = {"head": head, "ratchet": initial(head)}
+    assert refused(repinned, **on_head) == stale
+    assert refused(repinned, **on_head, verified=frozenset({(key, PIN_OLD)})) == stale
+    found = ok(repinned, **on_head, verified=frozenset({(key, PIN_NEW)}))
+    where = ".".join(("gateway", "servers", "notes", *KIND_BLOCKS[kind], "review", name))
+    assert found.kind == "policy.save"
+    assert (where, f"{PIN_OLD} -> {PIN_NEW} (re-pinned: you read both definitions)") in found.rows
+    unverified = ok(repinned, kind="policy.import", surface="socket", **on_head)
+    assert (where, f"{PIN_OLD} -> {PIN_NEW}") in unverified.rows
+    included = make(kind_block(kind, include=[name], review={name: PIN_NEW}))
+    assert refused(included) == stale
+    assert ok(included, verified=frozenset({(key, PIN_NEW)})).kind == "policy.save"
+    declined = make(kind_block(kind, declined={name: PIN_OLD}))
+    assert ok(make(), head=declined, ratchet=initial(declined)).kind == "policy.save"
+    if kind == "prompt":
+        spoken = make(kind_block(kind, include=[name], review={name: PIN_OLD}, assistant=[name]))
+        found_wider = refused(spoken, **on_head)
+        assert (found_wider.reason, found_wider.detail) == (
+            "portal_widens",
+            "widen gateway.servers.notes.prompts.assistant",
+        )
+
+
+def test_a_server_added_whole_brings_every_kinds_pins() -> None:
+    """Each pin a server added whole holds is checked, its tools', prompts' and resources'; a
+    toolkit added whole has tools only."""
+    template = KIND_NAMES["resource_template"]
+    other: dict[str, Any] = {
+        "kind": "remote",
+        "route": "files",
+        "tools": {"include": ["x"], "approve": ["x"]},
+        "review": {"x": PIN_NEW},
+        "prompts": {"include": ["brief"], "review": {"brief": PIN_NEW}},
+        "resources": {
+            "templates": {"include": [template], "review": {template: PIN_NEW}},
+            "fixed": {"include": ["notes://index"], "review": {"notes://index": PIN_NEW}},
+        },
+    }
+    found = refused(make(setting("gateway", "servers", "other", value=other)))
+    assert found.reason == "review_stale"
+    assert found.subjects == (
+        "other/tool/x",
+        "other/prompt/brief",
+        "other/resource_template/notes://notes/{id}",
+        "other/resource/notes://index",
+    )
+    kit = {
+        "kind": "toolkit",
+        "module": "kits.other",
+        "tools": {"include": ["y"], "approve": ["y"]},
+        "review": {"y": PIN_NEW},
+    }
+    found = refused(make(setting("gateway", "servers", "kit2", value=kit)))
+    assert (found.reason, found.subjects) == ("review_stale", ("kit2/tool/y",))
 
 
 def test_rule_1c_comes_before_rule_2() -> None:

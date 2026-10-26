@@ -185,7 +185,7 @@ EQUIVALENT: Final[dict[str, str]] = {
         '`split("#")` with no limit for `split("#", 1)`: only the part before the first "#" is read'
     ),
     "zoeymcp.cli.choices.x__line__mutmut_8": '`split("#", 2)`: as mutant 5',
-    "zoeymcp.cli.choices.x__line__mutmut_60": _CAST,
+    "zoeymcp.cli.choices.x__line__mutmut_69": _CAST,  # 60 before M6 step 21a's kind lines
     "zoeymcp.cli.choices.x_parse__mutmut_20": (
         '"\\uFEFF" for "\\ufeff": the same character, spelled in upper case'
     ),
@@ -245,7 +245,7 @@ EQUIVALENT: Final[dict[str, str]] = {
     "zoeymcp.vault.onboarding.x_allow_hosts__mutmut_17": "other reasons: as mutant 10",
     "zoeymcp.vault.onboarding.x_allow_hosts__mutmut_18": "other reasons: as mutant 10",
     "zoeymcp.vault.onboarding.x_committed_for__mutmut_10": _NO_NAME,
-    "zoeymcp.vault.onboarding.x_listed_servers__mutmut_45": _NO_NAME,
+    "zoeymcp.vault.onboarding.x_listed_servers__mutmut_52": _NO_NAME,  # 45 before M6 step 21a
     "zoeymcp.vault.onboarding.x_served_at__mutmut_19": _NO_NAME,
     "zoeymcp.vault.onboarding.x_token_state__mutmut_3": (
         '`refresh_token or "XXXX"`: "XXXX" starts with neither "store:" nor "env:", as "" doesn\'t'
@@ -261,20 +261,18 @@ EQUIVALENT: Final[dict[str, str]] = {
     ),
     # --- portal.reviewview
     "zoeymcp.portal.reviewview.x__info__mutmut_17": _SHOWN,
-    "zoeymcp.portal.reviewview.x__row__mutmut_170": _SHOWN,
-    "zoeymcp.portal.reviewview.x__row__mutmut_179": f"single_line: {_TRUTH}",
-    "zoeymcp.portal.reviewview.x_rows__mutmut_21": (
+    # Renumbered in M6 step 21a (its kinds, headings and per-kind name caps came first): _row 170
+    # and 179, rows 21 and 51. diff's 42 and 45 (the compose target dropped) went: a resource's
+    # URI may hold "$", so test_reviewview.py's compose test kills them.
+    "zoeymcp.portal.reviewview.x__row__mutmut_182": _SHOWN,
+    "zoeymcp.portal.reviewview.x__row__mutmut_191": f"single_line: {_TRUTH}",
+    "zoeymcp.portal.reviewview.x_rows__mutmut_44": (
         "the server's name at shown's default 200 for NAME_LIMIT: a report's server is a policy "
         "name, at most 64 characters"
     ),
-    "zoeymcp.portal.reviewview.x_rows__mutmut_51": f"single_line: {_TRUTH}",
+    "zoeymcp.portal.reviewview.x_rows__mutmut_74": f"single_line: {_TRUTH}",
     # definition_lines' two moved with it to common.policy.reviewchange (M6 step 8):
     # test_mutation_gaps_7.py.
-    "zoeymcp.portal.reviewview.x_diff__mutmut_42": (
-        "the target None for compose: compose's indent is already 8, which the plain form takes "
-        'as it is, and fragment 2 holds no "$" to double (names, pins and fixed comment texts)'
-    ),
-    "zoeymcp.portal.reviewview.x_diff__mutmut_45": "the target left out: as mutant 42",
     # --- bridge.admit
     "zoeymcp.bridge.admit.x__values__mutmut_4": _CASE,
     "zoeymcp.bridge.admit.x__values__mutmut_8": _CASE,

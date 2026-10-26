@@ -29,7 +29,7 @@ from zoeymcp.common.policy.schema import Policy
 from zoeymcp.portal import app as portal_app
 from zoeymcp.portal import policydiffview, reviewview
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
-from zoeymcp.portal.routes import JAVASCRIPT, ROUTES, STATIC
+from zoeymcp.portal.routes import JAVASCRIPT, REVIEW_DIFF, ROUTES, STATIC
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
 from zoeymcp.vault import onboarding
 from zoeymcp.vault.oauth import dcr
@@ -46,7 +46,8 @@ MAX_ASSETS = 128 * 1024
 # app.js and webauthn.js to 1,060 for the few lines Home and health need (1,048 before step 7,
 # 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450;
 # policy.js, the Policy page's managed half (step 15b), its own 500. The static total after 15c
-# is 122 KiB (125,162 bytes), below M.4's 124 KiB, so MAX_ASSETS stays 128 KiB.
+# is 122 KiB (125,162 bytes) and after 21a's per-kind rows 122.8 KiB (125,785 bytes), below M.4's
+# 124 KiB, so MAX_ASSETS stays 128 KiB.
 LINE_CAPS = {
     ("app.js", "webauthn.js"): 1060,
     ("review.js",): 700,
@@ -899,6 +900,43 @@ def test_record_the_rest_as_declined_is_ticked_by_default() -> None:
     box = parser.inputs["review-decline-rest"]
     assert (box["type"], "checked" in box) == ("checkbox", True)
     assert 'decline_rest: $("review-decline-rest").checked' in code_of(read("drift.js"))
+
+
+def test_prompts_and_resources_are_rows_whose_choices_go_under_kinds() -> None:
+    """M6 L.7 (BP-3): a server's prompts and resources are review.js's rows, drawn by its row
+    renderer; drift.js's row hook draws the kind's heading over the first of each kind (the
+    vault's ``heading``, as text) and takes away the classification, and the box is drift.js's
+    alone, so review.js's lists stay the tools'; drift.js's lists() puts each kind's choices
+    under ``kinds``, every kind shown named, and Generate and Save send what it holds; Clear
+    unticks them too, and the footer counts only tools as tools."""
+    drift = code_of(read("drift.js"))
+    start = drift.index("function row(entry) {")
+    body = drift[start : drift.index("\n  }\n", start)]
+    head = body[: body.index('if (tool.state === "drift") {')]
+    assert 'if (tool.kind !== "tool") {' in head
+    assert 'place.prepend(...(tool.heading ? [make("h3", tool.heading)] : []));' in head
+    removed = "[entry.choice?.nextSibling, entry.choice].forEach((node) => node?.remove());"
+    taken = "[entry.pick, entry.box, entry.choice] = [entry.box, null, null];"
+    assert head.index(removed) < head.index(taken)
+    assert "if ((entry.box || entry.pick) && tool.pinnable && !tool.included) {" in body
+    start = drift.index("function lists(held) {")
+    lists = drift[start : drift.index("\n  }\n", start)]
+    assert 'decline_rest: $("review-decline-rest").checked, kinds: {} };' in lists
+    assert "found.kinds[entry.tool.kind] || { include: [], repin: [], decline: [] });" in lists
+    assert lists.index("const into =") < lists.index("if (entry.pick && entry.pick.checked) {")
+    assert "into.include.push(entry.tool.name);" in lists
+    assert "into.repin.push(entry.tool.name);" in lists
+    assert "into.decline.push(entry.tool.name);" in lists
+    assert "picked(held));" in drift  # Save posts every list picked() holds
+    # Clear unticks the kinds' boxes too (review.js's unticks the tools'), and the footer's
+    # "tools changed" counts tools only.
+    cleared = "drawn?.entries.forEach((e) => e.pick && (e.pick.checked = false)));"
+    assert f'on("review-clear", () => {cleared}' in drift
+    assert 'view.tools.filter((t) => t.kind === "tool" && t.state === "drift").length;' in drift
+    review = code_of(read("review.js"))
+    assert "Object.assign({ indent: indent }, lists)" in review  # and so does Generate
+    assert set(REVIEW_DIFF.optional) == {"indent", "repin", "decline", "decline_rest", "kinds"}
+    assert "entry.pick" not in review
 
 
 # --- the Policy page's managed half (M6 M.1, M.4, H.1-H.4; step 15b) -----------------------------

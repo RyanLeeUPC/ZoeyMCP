@@ -27,6 +27,13 @@ reviewed lines to the listed ones, each line shown and in chunks; ``proposed`` w
 is labelled proposed ``approve`` (Q8). A finding carries its pointer shown, "(definition)" for the
 whole definition (D-199).
 
+A server that enables prompts or resources (M6 design L.7) has a row for each of its prompts,
+resource templates and fixed resources too, after its tools and grouped by kind: each row says its
+``kind``, the first of each kind carries the kind's ``heading``, and the page draws them with the
+same row renderer, an include box and the drift columns, re-pin and decline, but never a
+classification. The counts stay the tools'. How each kind's walk went (``listings``) is one of
+the ``notes``: why it failed, or the gateway's finding that it was cut at a cap, shown.
+
 :func:`diff` builds fragment 2 (E.4) from the operator's choices, ``{"include", "allow",
 "approve", "repin"?, "decline"?, "decline_rest"?, "indent"?}``, as the CLI's choices file does:
 the same change (``common/policy/reviewchange.py``'s
@@ -35,13 +42,17 @@ its ``declined`` block too once the server has one or the choices decline a tool
 J.5, its title then naming all three), checked merged into the running policy, then written by
 the emitter. ``repin`` takes a drifted tool's new pin; ``decline`` records a listed tool left
 out at the pin shown, and ``decline_rest`` (**Record the rest as declined**) every listed tool
-not included. It refuses ``bad_body`` for choices of the wrong shape, ``review_stale`` when the
-server's tools, pins or declines in the running policy aren't the ones the review ran under (a
-reload since, GR-11; J.2), and ``diff_invalid`` for an unknown tool, a tool in both lists, an
-included tool left unclassified, a classified one not included, an unpinnable tool newly
-included, a toolkit's consequential tool in ``allow``, a re-pin of a tool that hasn't drifted,
-can't be pinned or isn't included, a decline of a tool included or that can't be pinned, or a
-merged policy that fails ``check``.
+not included. ``kinds`` holds the same choices for each kind beyond tools (L.7), ``{"prompt":
+{"include", "repin", "decline"}, "resource_template": ..., "resource": ...}``, each list
+optional; a kind it doesn't name stays as the policy has it, but for ``decline_rest``, and the
+server's ``prompts`` and ``resources`` blocks are written whole. It refuses ``bad_body`` for
+choices of the wrong shape, ``review_stale`` when the server's tools, pins, declines, prompts or
+resources in the running policy aren't the ones the review ran under (a reload since, GR-11;
+J.2), and ``diff_invalid`` for an unknown tool, a tool in both lists, an included tool left
+unclassified, a classified one not included, an unpinnable tool newly included, a toolkit's
+consequential tool in ``allow``, a re-pin of a tool that hasn't drifted, can't be pinned or
+isn't included, a decline of a tool included or that can't be pinned, the same for a prompt or a
+resource, a kind the server doesn't enable, or a merged policy that fails ``check``.
 Nothing is saved: declarative mode. In managed mode the same choices give :func:`change_of`, the
 change itself, with the same refusals but ``check``'s, which the vault's gate runs on the
 candidate when it plans the save (M6 design G.4, J.3): the portal holds it as a draft.
@@ -50,23 +61,31 @@ candidate when it plans the save (M6 design G.4, J.3): the portal holds it as a 
 from __future__ import annotations
 
 import difflib
-from collections.abc import Mapping, Set
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence, Set
+from dataclasses import dataclass, field, replace
 from typing import Any, Final
 
 from ..common.policy.change import ChangeRefused, PolicyChange, validate
 from ..common.policy.emit import COMPOSE_INDENT, INDENT_MAX, EmitRefused, Target, emit
+from ..common.policy.fields import RESOURCE_URI_MAX, TEMPLATE_MAX
 from ..common.policy.findings import Finding
 
 # definition_lines and CHUNK moved to the change's pure module (M6 design J.3), named here too.
 from ..common.policy.reviewchange import CHUNK as CHUNK
 from ..common.policy.reviewchange import (
-    TOOL_NAME,
+    KINDS,
+    NOUNS,
     Added,
     Changes,
     Classification,
+    KindChanges,
+    block_of,
     declined_block,
+    enabled,
     fragment,
+    is_key,
+    kind_blocks,
+    kind_of,
     listed,
     pinnable,
     proposed,
@@ -74,8 +93,14 @@ from ..common.policy.reviewchange import (
     the_rest,
 )
 from ..common.policy.reviewchange import definition_lines as definition_lines
-from ..common.policy.schema import Policy
-from ..common.reviewreport import INSTRUCTIONS_MAX, MESSAGE_MAX, POINTER_MAX, TEXT_MAX
+from ..common.policy.schema import Policy, PromptsPolicy, ResourcesPolicy
+from ..common.reviewreport import (
+    INSTRUCTIONS_MAX,
+    MEMBER_MAX,
+    MESSAGE_MAX,
+    POINTER_MAX,
+    TEXT_MAX,
+)
 from ..common.suggest import Suggestion, suggestion
 from ..vault.onboarding import Listed, reviewed_next
 from .display import DEFAULT_LIMIT, NAME_LIMIT, shown
@@ -94,6 +119,17 @@ NO_PIN: Final = "the server gave no definition the vault can pin"
 # detail names.
 LISTS: Final = ("include", "allow", "approve")
 OPTIONAL_LISTS: Final = ("repin", "decline")
+# A kind beyond tools takes these lists, each optional (L.7).
+KIND_LISTS: Final = ("include", "repin", "decline")
+# The heading over the first row of each kind beyond tools (L.7).
+HEADINGS: Final = {
+    "prompt": "Prompts",
+    "resource_template": "Resource templates",
+    "resource": "Resources",
+}
+# A row's name is shown whole up to the longest the policy can hold: a resource's URI is longer
+# than a name, and two cut at a name's cap could look alike (L.1).
+NAME_LIMITS: Final = {"resource_template": TEMPLATE_MAX, "resource": RESOURCE_URI_MAX}
 # A finding about the whole definition has an empty pointer (D-199).
 WHOLE: Final = "(definition)"
 DETAIL_FINDINGS: Final = 5
@@ -105,8 +141,15 @@ DETAIL_FINDINGS: Final = 5
 def rows(report: Mapping[str, Any], approved: Set[str] = frozenset()) -> dict[str, Any]:
     """A done job's report as the review screen renders it: the server, what the review learned
     of it, the counts, and one row per tool. ``approved`` names the server's tools in the head
-    ratchet's ``approved`` set (none in declarative mode, where no ratchet exists)."""
-    tools = [_row(entry, approved) for entry in report["tools"]]
+    ratchet's ``approved`` set (none in declarative mode, where no ratchet exists). Rows are
+    grouped by kind, tools first (L.7)."""
+    order = ("tool", *KINDS)
+    entries = sorted(report["tools"], key=lambda entry: order.index(kind_of(entry)))
+    tools = [_row(entry, approved) for entry in entries]
+    for kind in KINDS:
+        first = next((row for row in tools if row["kind"] == kind), None)
+        if first is not None:
+            first["heading"] = HEADINGS[kind]
     instructions = report.get("instructions")
     return {
         "state": "done",
@@ -137,12 +180,25 @@ def _info(info: Mapping[str, Any] | None) -> str | None:
 
 def notes(report: Mapping[str, Any]) -> list[str]:
     """What the screen says of the server as a whole: ``blocked`` when a marked tool blocks it,
-    and ``pinning_off`` for a toolkit served without pins."""
+    and ``pinning_off`` for a toolkit served without pins; then, for each kind beyond tools in
+    ``listings``, why the gateway couldn't list it and each of its findings, as sentences (L.4,
+    L.7)."""
     found = []
     if report["blocked"]:
         found.append("blocked")
     if report.get("pinning") == "off":
         found.append("pinning_off")
+    listings = report.get("listings") or {}
+    for kind in (kind for kind in KINDS if kind in listings):
+        listing, heading = listings[kind], HEADINGS[kind]
+        failure = listing.get("failure")
+        if failure is not None:
+            why = shown(failure, MEMBER_MAX)
+            found.append(f"{heading}: the gateway couldn't list them ({why}), so none is served.")
+        found += [
+            f"{heading}: {shown(finding['message'], MESSAGE_MAX)}."
+            for finding in listing.get("findings") or []
+        ]
     return found
 
 
@@ -164,13 +220,16 @@ def counts(report: Mapping[str, Any]) -> dict[str, int]:
 def _row(entry: Mapping[str, Any], approved: Set[str]) -> dict[str, Any]:
     definition = entry["definition"]
     reviewed = entry.get("reviewed")
-    name = entry["name"]
+    name, kind = entry["name"], kind_of(entry)
     suggested, why = suggested_for(entry)
     hinted = _hinted(entry)
     row: dict[str, Any] = {
-        # The name the page posts: only a tool name, never one the server listed as invalid.
-        "name": name if TOOL_NAME.fullmatch(name) else None,
-        "name_shown": shown(name, NAME_LIMIT),
+        # The name the page posts: only a tool's (or a prompt's) name or a resource's URI in the
+        # policy's form, never one the server listed as invalid.
+        "name": name if is_key(kind, name) else None,
+        "name_shown": shown(name, NAME_LIMITS.get(kind, NAME_LIMIT)),
+        "kind": kind,
+        "heading": None,  # the kind's, over its first row (rows)
         "state": entry["state"],
         "included": entry["included"],
         "classification": entry["classification"],
@@ -218,9 +277,11 @@ def _text(value: object) -> str | None:
 
 
 def _annotations(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    """A tool's annotations; none for a prompt or a resource, whose annotations hint nothing
+    about calls (L.2)."""
     definition = entry["definition"]
     found = definition.get("annotations") if isinstance(definition, Mapping) else None
-    return found if isinstance(found, Mapping) else {}
+    return found if isinstance(found, Mapping) and kind_of(entry) == "tool" else {}
 
 
 def _hinted(entry: Mapping[str, Any]) -> Suggestion | None:
@@ -271,11 +332,22 @@ def _chunks(line: str) -> list[str]:
 
 
 @dataclass(frozen=True)
+class KindChoice:
+    """What the operator chose among one kind's entries beyond tools (L.7): the entries to
+    include, in order, the drifted ones whose new definition is accepted, and the ones declined
+    one by one."""
+
+    include: tuple[str, ...] = ()
+    repin: frozenset[str] = frozenset()
+    decline: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Choices:
     """What the operator chose: the tools to include, in order, those of them in ``allow`` and
     in ``approve``, and the fragment's indent (H.2); the drifted tools whose new definition is
     accepted, the tools declined one by one, and whether the rest are declined (M6 design J.2,
-    J.3)."""
+    J.3); and each kind beyond tools it names (L.7)."""
 
     include: tuple[str, ...]
     allow: frozenset[str]
@@ -285,27 +357,61 @@ class Choices:
     repin: frozenset[str] = frozenset()
     decline: tuple[str, ...] = ()
     decline_rest: bool = False
+    kinds: Mapping[str, KindChoice] = field(default_factory=dict)
 
     def classified(self, name: str) -> Classification:
         return "allow" if name in self.allow else "approve"
 
 
+def _names_in(value: object, where: str, kind: str, most: int) -> list[str] | Refusal:
+    """``value`` as a list of distinct names (or URIs) of ``kind``, at most ``most`` long, or
+    ``bad_body`` naming ``where``."""
+    noun = NOUNS[kind]
+    if not isinstance(value, list) or not all(
+        isinstance(name, str) and is_key(kind, name) for name in value
+    ):
+        return _bad_body(f"{where} is a list of {noun} names")
+    if len(value) > most:
+        return _bad_body(f"{where} names at most {most} {noun}s (max_tools_per_server)")
+    if len(set(value)) != len(value):
+        return _bad_body(f"{where} names a {noun} twice")
+    return value
+
+
+def _kind_choices(value: object, most: int) -> dict[str, KindChoice] | Refusal:
+    """``kinds``: each kind beyond tools it names, with its lists (L.7)."""
+    if not isinstance(value, Mapping) or not set(value) <= set(KINDS):
+        return _bad_body("kinds maps prompt, resource_template or resource to its lists")
+    found: dict[str, KindChoice] = {}
+    for kind, given in value.items():
+        if not isinstance(given, Mapping) or not set(given) <= set(KIND_LISTS):
+            return _bad_body(f"kinds.{kind} holds include, repin and decline")
+        lists: dict[str, list[str]] = {}
+        for key in KIND_LISTS:
+            names = _names_in(given.get(key, []), f"kinds.{kind}.{key}", kind, most)
+            if isinstance(names, Refusal):
+                return names
+            lists[key] = names
+        found[kind] = KindChoice(
+            tuple(lists["include"]), frozenset(lists["repin"]), tuple(lists["decline"])
+        )
+    return found
+
+
 def choices(body: Mapping[str, Any], most: int) -> Choices | Refusal:
     """The diff's body: each list a list of distinct tool names, at most ``most`` long
-    (``max_tools_per_server``), ``decline_rest`` true or false, and an indent of 0 to 16 or
-    ``compose``. Its keys were checked against the route's."""
+    (``max_tools_per_server``), ``decline_rest`` true or false, an indent of 0 to 16 or
+    ``compose``, and ``kinds`` with each kind's lists, its names or URIs (L.7). Its keys were
+    checked against the route's."""
     lists: dict[str, list[str]] = {}
     for key in (*LISTS, *OPTIONAL_LISTS):
-        value = body.get(key, [])
-        if not isinstance(value, list) or not all(
-            isinstance(name, str) and TOOL_NAME.fullmatch(name) for name in value
-        ):
-            return _bad_body(f"{key} is a list of tool names")
-        if len(value) > most:
-            return _bad_body(f"{key} names at most {most} tools (max_tools_per_server)")
-        if len(set(value)) != len(value):
-            return _bad_body(f"{key} names a tool twice")
-        lists[key] = value
+        names = _names_in(body.get(key, []), key, "tool", most)
+        if isinstance(names, Refusal):
+            return names
+        lists[key] = names
+    kinds = _kind_choices(body.get("kinds", {}), most)
+    if isinstance(kinds, Refusal):
+        return kinds
     indent = body.get("indent", 0)
     target: Target = "plain"
     if indent == "compose":
@@ -324,6 +430,7 @@ def choices(body: Mapping[str, Any], most: int) -> Choices | Refusal:
         frozenset(lists["repin"]),
         tuple(lists["decline"]),
         rest,
+        kinds,
     )
 
 
@@ -332,7 +439,8 @@ def stale(report: Mapping[str, Any], server: Listed | None) -> bool:
     (GR-11): gone, of another kind, or other tools, classifications, ``on_drift``, pins or
     declines (fragment 2 writes the report's pins and ``declined`` block, which would undo a
     later re-pin or decline; M6 design J.2, J.5; a report without either block, an M7
-    gateway's, ran under none)."""
+    gateway's, ran under none), or another ``prompts`` or ``resources`` block where the report
+    holds one (fragment 2 writes those whole, L.7)."""
     if server is None or server.kind != report["kind"]:
         return True
     ran, tools = report["policy"], server.tools
@@ -343,6 +451,11 @@ def stale(report: Mapping[str, Any], server: Listed | None) -> bool:
         or server.on_drift != ran["on_drift"]
         or dict(server.review) != dict(ran.get("review") or {})
         or dict(server.declined) != dict(ran.get("declined") or {})
+        or ("prompts" in ran and PromptsPolicy.model_validate(ran["prompts"]) != server.prompts)
+        or (
+            "resources" in ran
+            and ResourcesPolicy.model_validate(ran["resources"]) != server.resources
+        )
     )
 
 
@@ -375,9 +488,14 @@ def changes(report: Mapping[str, Any], chosen: Choices) -> Changes | Refusal:
     declared = _names(n for n in chosen.allow if by_name.get(n, {}).get("consequential") is True)
     if declared:
         return _invalid(f"the toolkit declares {declared} consequential, so it can't be in allow")
-    refused = _repins(by_name, chosen) or _declines(by_name, chosen)
+    refused = _repins(by_name, chosen.include, chosen.repin) or _declines(
+        by_name, chosen.include, chosen.decline
+    )
     if refused is not None:
         return refused
+    kinds = _kinds(report, chosen)
+    if isinstance(kinds, Refusal):
+        return kinds
     added = {
         name: Added(chosen.classified(name), f"{chosen.classified(name)}, chosen in the portal")
         for name in new
@@ -396,35 +514,86 @@ def changes(report: Mapping[str, Any], chosen: Choices) -> Changes | Refusal:
     if chosen.decline_rest:
         declines = {**the_rest(report, chosen.include), **declines}
     declined = declined_block(report, declines, included=chosen.include)
-    return Changes(added=added, dropped=dropped, moved=moved, repin=chosen.repin, declined=declined)
+    return Changes(
+        added=added,
+        dropped=dropped,
+        moved=moved,
+        repin=chosen.repin,
+        declined=declined,
+        kinds=kinds,
+    )
 
 
-def _repins(by_name: Mapping[str, Mapping[str, Any]], chosen: Choices) -> Refusal | None:
-    """``diff_invalid`` for a re-pin of a tool that isn't listed drifted, can't be pinned, or
-    isn't included (J.2, as the CLI's ``--repin`` refuses)."""
-    names = sorted(chosen.repin)
+def _kinds(report: Mapping[str, Any], chosen: Choices) -> dict[str, KindChanges] | Refusal:
+    """What ``chosen`` changes among each kind beyond tools the server enables (L.7), by the
+    tools' rules, or ``diff_invalid``. A kind ``chosen`` doesn't name keeps the policy's
+    include; with ``decline_rest`` its other listed entries are declined too."""
+    on = enabled(report)
+    off = _names(NOUNS[kind] + "s" for kind in KINDS if kind in chosen.kinds and kind not in on)
+    if off:
+        return _invalid(f"the server doesn't enable {off}")
+    found: dict[str, KindChanges] = {}
+    for kind in on:
+        given = chosen.kinds.get(kind)
+        if given is None and not chosen.decline_rest:
+            continue  # as the policy has it
+        included: list[str] = block_of(report, kind)["include"]
+        picked = given or KindChoice(tuple(included))
+        by_name, noun = listed(report, kind), NOUNS[kind]
+        unknown = _names(n for n in picked.include if n not in by_name and n not in included)
+        if unknown:
+            return _invalid(f"the server lists no {noun} {unknown}")
+        new = [name for name in picked.include if name not in included]
+        unpinned = _names(name for name in new if not pinnable(by_name[name]))
+        if unpinned:
+            return _invalid(f"{unpinned} can't be pinned, so it can't be included")
+        refused = _repins(by_name, picked.include, picked.repin) or _declines(
+            by_name, picked.include, picked.decline, noun
+        )
+        if refused is not None:
+            return refused
+        declines = {name: by_name[name]["pin"] for name in picked.decline}
+        if chosen.decline_rest:
+            declines = {**the_rest(report, picked.include, kind), **declines}
+        declined = declined_block(report, declines, included=picked.include, kind=kind)
+        found[kind] = KindChanges(picked.include, picked.repin, declined)
+    return found
+
+
+def _repins(
+    by_name: Mapping[str, Mapping[str, Any]], include: Sequence[str], repin: Set[str]
+) -> Refusal | None:
+    """``diff_invalid`` for a re-pin of a tool (or a prompt or a resource) that isn't listed
+    drifted, can't be pinned, or isn't included (J.2, as the CLI's ``--repin`` refuses)."""
+    names = sorted(repin)
     still = _names(n for n in names if by_name.get(n, {}).get("state") != "drift")
     if still:
         return _invalid(f"{still} hasn't drifted, so there is no new definition to accept")
     unpinned = _names(n for n in names if not pinnable(by_name[n]))
     if unpinned:
         return _invalid(f"{unpinned} can't be pinned, so its new definition can't be accepted")
-    left = _names(n for n in names if n not in chosen.include)
+    left = _names(n for n in names if n not in include)
     if left:
         return _invalid(f"{left} is re-pinned but not included")
     return None
 
 
-def _declines(by_name: Mapping[str, Mapping[str, Any]], chosen: Choices) -> Refusal | None:
-    """``diff_invalid`` for a decline of a tool the server doesn't list, one included, or one
-    that can't be pinned (J.3, as the CLI's ``--decline`` refuses)."""
-    unknown = _names(n for n in chosen.decline if n not in by_name)
+def _declines(
+    by_name: Mapping[str, Mapping[str, Any]],
+    include: Sequence[str],
+    decline: Sequence[str],
+    noun: str = "tool",
+) -> Refusal | None:
+    """``diff_invalid`` for a decline of a tool (or a prompt or a resource) the server doesn't
+    list, one included, or one that can't be pinned (J.3, as the CLI's ``--decline``
+    refuses)."""
+    unknown = _names(n for n in decline if n not in by_name)
     if unknown:
-        return _invalid(f"the server lists no tool {unknown}")
-    both = _names(n for n in chosen.decline if n in chosen.include)
+        return _invalid(f"the server lists no {noun} {unknown}")
+    both = _names(n for n in decline if n in include)
     if both:
         return _invalid(f"{both} is declined but included")
-    unpinned = _names(n for n in chosen.decline if not pinnable(by_name[n]))
+    unpinned = _names(n for n in decline if not pinnable(by_name[n]))
     if unpinned:
         return _invalid(f"{unpinned} can't be pinned, so it can't be declined")
     return None
@@ -452,7 +621,8 @@ def diff(
         return made
     name = report["server"]
     try:
-        heading = second_title(name, declined=made.declined is not None)
+        blocks = kind_blocks(report)
+        heading = second_title(name, declined=made.declined is not None, kinds=blocks)
         change = fragment(report, made, heading=heading)
         findings = validate(policy, change)
         text = emit(change, indent=chosen.indent, target=chosen.target)

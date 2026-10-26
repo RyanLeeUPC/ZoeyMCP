@@ -55,8 +55,11 @@ from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import (
     HeaderCredential,
     OAuth2Credential,
+    PromptsPolicy,
     QueryCredential,
     RemoteServer,
+    ResourceSet,
+    ResourcesPolicy,
     Route,
     Tools,
 )
@@ -385,6 +388,84 @@ def test_a_servers_declined_block_is_written_after_its_pins() -> None:
     }
     plain = RemoteServer.model_validate({"kind": "remote", "route": "r"})
     assert "declined" not in emit(PolicyChange("t", (AddServer("s", plain),)))
+
+
+def test_a_reviews_prompts_and_resources_blocks_are_written_whole() -> None:
+    """M6 design A.4, L.7: a review of a server that enables prompts and resources writes both
+    blocks after its declined block, every field of each, and replaces them; a comment may name
+    a resource by its URI."""
+    template = "notes://notes/{id}"
+    prompts = PromptsPolicy(
+        include=["summarize"], review={"summarize": PIN_A}, assistant=["summarize"]
+    )
+    resources = ResourcesPolicy(
+        templates=ResourceSet(include=[template], review={template: PIN_A}),
+        fixed=ResourceSet(declined={"notes://index": PIN_A}),
+    )
+    op = SetServerReview(
+        "existing",
+        Tools(include=["old"]),
+        {"old": PIN_A},
+        declined={},
+        prompts=prompts,
+        resources=resources,
+    )
+    change = PolicyChange("t", (Comment("added", template, "resource template"), op))
+    text = emit(change)
+    where = "gateway.servers.existing"
+    assert text == (
+        "# zoeymcp: t\n"
+        f"# zoeymcp replace: {where}.tools {where}.review {where}.declined {where}.prompts "
+        f"{where}.resources\n"
+        "# added: notes://notes/{id} (resource template)\n"
+        "gateway:\n"
+        "  servers:\n"
+        '    "existing":\n'
+        "      tools:\n"
+        '        include: ["old"]\n'
+        "      review:\n"
+        f'        "old": "{PIN_A}"\n'
+        "      declined: {}\n"
+        "      prompts:\n"
+        '        include: ["summarize"]\n'
+        "        review:\n"
+        f'          "summarize": "{PIN_A}"\n'
+        "        declined: {}\n"
+        '        assistant: ["summarize"]\n'
+        "      resources:\n"
+        "        templates:\n"
+        '          include: ["notes://notes/{id}"]\n'
+        "          review:\n"
+        f'            "notes://notes/{{id}}": "{PIN_A}"\n'
+        "          declined: {}\n"
+        "        fixed:\n"
+        "          include: []\n"
+        "          review: {}\n"
+        "          declined:\n"
+        f'            "notes://index": "{PIN_A}"\n'
+    )
+    assert load_mapping(text) == change.data()
+    assert fragment_applied(property_base(), text) == apply(property_base(), change)
+    applied = apply(property_base(), change).gateway
+    assert applied is not None
+    existing = applied.servers["existing"]
+    assert isinstance(existing, RemoteServer)
+    assert (existing.prompts, existing.resources) == (prompts, resources)
+    assert op.blocks() == ("tools", "review", "declined", "prompts", "resources")
+    assert SetServerReview("s", Tools(), {}).blocks() == ("tools", "review")
+    alone = SetServerReview("s", Tools(), {}, prompts=PromptsPolicy())
+    assert alone.blocks() == ("tools", "review", "prompts")
+    assert "resources" not in PolicyChange("t", (alone,)).data()["gateway"]["servers"]["s"]
+
+
+def test_a_comment_names_a_tool_a_policy_name_or_a_resources_uri() -> None:
+    for subject in ("old", "existing", "notes://notes/{id}", "notes://index"):
+        assert Comment("added", subject).subject == subject
+    for bad in ("a b", "notes://x#y", "notes://x/{a", ""):
+        with pytest.raises(ValueError):  # noqa: PT011 - the schema's own errors
+            Comment("added", bad)
+    with pytest.raises(ValueError):  # noqa: PT011
+        Comment("added", 3)  # type: ignore[arg-type]
 
 
 def test_a_declined_entry_outside_the_rule_is_refused() -> None:

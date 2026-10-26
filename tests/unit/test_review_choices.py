@@ -1,10 +1,13 @@
 """The choices file of ``review <server> --choose`` and ``--choices`` (M7 design F.5; GR-2, TI-6,
-TI-12, OPS-12): rendered from a report, read back, and refused when it is wrong or stale."""
+TI-12, OPS-12): rendered from a report, read back, and refused when it is wrong or stale. M6
+(design L.7): a server's prompts and resources have ``prompt:`` and ``resource:`` lines, read by
+the same rules, never classified (:func:`kinds` is the report the review screen's tests share)."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from typing import Any
 
 import pytest
@@ -13,9 +16,12 @@ from hypothesis import strategies as st
 from mcp.types import Tool
 
 from tests.fakes.mcp_server import LARGE_INVALID, LARGE_READ, LARGE_WRITE, base_tools, large_tools
+from tests.unit.test_pins import named_prompt, prompt_pin, resource, template
+from tests.unit.test_reviewreport import kinds_report
 from zoeymcp.cli import choices
 from zoeymcp.cli import review as view
 from zoeymcp.common.policy.emit import emit
+from zoeymcp.common.policy.reviewchange import KindChanges
 from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.common.suggest import suggestion
@@ -84,6 +90,52 @@ def large(
     """The ``large`` fake's 96 tools, reviewed against a server including ``include`` and
     declining ``declined`` at the pins listed."""
     return reviewed(copy.deepcopy(LARGE), served(include, declined, **classes))
+
+
+# A server's prompts and resources (M6 design L.7).
+TEMPLATE, INDEX, OTHER_URI = "notes://notes/{id}", "notes://index", "notes://other"
+TEMPLATE_PIN = pins.project_kind("resource_template", template()).pin
+INDEX_PIN = pins.project_kind("resource", resource()).pin
+OTHER_URI_PIN = pins.project_kind("resource", resource(uri=OTHER_URI, name="other")).pin
+OLD = "Old."
+
+
+def kinds(*, failure: str | None = None, cut: bool = False) -> dict[str, Any]:
+    """notes enabling prompts and resources, through JSON: tool ``a`` included; the prompts
+    ``fine`` (included, and in ``assistant``), ``drifts`` (included, changed since its review;
+    the gateway holds the reviewed copy), ``new`` (listed, a URL in its description, which is a
+    warning), ``old`` (declined at the pin
+    listed), ``bad`` (an error finding) and ``gone`` (included, not listed); the template
+    included; the fixed resources ``notes://index`` and ``notes://other`` listed. ``failure``
+    fails the prompts' walk, and ``cut`` cuts the fixed resources' at a cap."""
+    reviewed_drifts = pins.project_prompt(named_prompt("drifts", description=OLD))
+    return kinds_report(
+        [
+            named_prompt("fine"),
+            named_prompt("drifts"),
+            named_prompt("new", description="Mails https://mail.example/x to a note."),
+            named_prompt("old"),
+            named_prompt("bad", description="x\u202ey"),
+        ],
+        templates=[template()],
+        resources=[resource(), resource(uri=OTHER_URI, name="other")],
+        policy_kinds={
+            "prompts": {
+                "include": ["fine", "drifts", "gone"],
+                "review": {
+                    "fine": prompt_pin("fine"),
+                    "drifts": prompt_pin("drifts", description=OLD),
+                    "gone": OTHER_PIN,
+                },
+                "declined": {"old": prompt_pin("old")},
+                "assistant": ["fine", "gone"],
+            },
+            "templates": {"include": [TEMPLATE], "review": {TEMPLATE: TEMPLATE_PIN}},
+        },
+        defs={prompt_pin("drifts", description=OLD): reviewed_drifts},
+        failure=failure,
+        cut=cut,
+    )
 
 
 def by_name(answer: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -788,3 +840,319 @@ def test_the_policys_digest_holds_declined_once_it_has_one() -> None:
     text = '{"allow":[],"approve":[],"declined":{"read_01":"' + pin + '"},"include":[]}'
     assert choices.policy_digest(after) == "sha256:" + hashlib.sha256(text.encode()).hexdigest()
     assert refused(after, file_of(before), job="another-job").reason == "choices_stale"
+
+
+# --- prompts and resources (M6 design L.7) -------------------------------------------------------
+
+
+def kind_pins(answer: dict[str, Any]) -> dict[str, str]:
+    """Each listed prompt's and resource's pin, by name or URI."""
+    return {
+        entry["name"]: entry["pin"]
+        for entry in answer["tools"]
+        if entry.get("kind", "tool") != "tool" and entry["pin"] is not None
+    }
+
+
+def kind_edited(text: str, name: str, word: str) -> str:
+    """``text`` with the word of ``name``'s ``prompt:`` or ``resource:`` line replaced."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        parts = line.split()
+        if parts[:1] in (["prompt:"], ["resource:"]) and parts[2] == name:
+            line = f"{parts[0]} {word} {parts[2]} {parts[3]}\n"
+        out.append(line)
+    return "".join(out)
+
+
+def test_prompt_and_resource_lines_follow_the_tools() -> None:
+    answer = kinds()
+    pinned = kind_pins(answer)
+    lines = file_of(answer).splitlines()
+    assert lines[0].startswith("# zoeymcp review notes: 1 tool. Keep")  # the tools' count
+    assert lines[5:] == [
+        '# prompt: and resource: lines: keep "skip", or write "include" or "decline".',
+        "# prompt bad can't be included: error finding (format character (zero-width, bidi or "
+        "tag) U+202E (RIGHT-TO-LEFT OVERRIDE) at position 1); review notes --show bad",
+        "# prompt drifts stays as the policy has it (drift); review notes shows why, and the "
+        "portal's review screen takes a new pin",
+        f"prompt:   include  fine                {pinned['fine']}   # prompt, in the policy",
+        f"prompt:   skip     new                 {pinned['new']}   # prompt; finding: a URL "
+        '"https://mail.example/x to a note."',
+        f"prompt:   decline  old                 {pinned['old']}   # prompt, declined in the "
+        "policy",
+        f"resource: include  {TEMPLATE}  {TEMPLATE_PIN}   # resource template, in the policy",
+        f"resource: skip     {INDEX}       {INDEX_PIN}   # resource",
+        f"resource: skip     {OTHER_URI}       {OTHER_URI_PIN}   # resource",
+    ]
+    assert "prompt:" not in file_of(large())  # a tools-only server's file is M7's
+
+
+def test_an_unedited_kinds_file_changes_nothing() -> None:
+    answer = kinds()
+    changes = choices.decide(answer, JOB, choices.parse(file_of(answer)))
+    assert changes.kinds == {
+        "prompt": KindChanges(("fine", "drifts", "gone"), declined={"old": prompt_pin("old")}),
+        "resource_template": KindChanges((TEMPLATE,)),
+        "resource": KindChanges(()),
+    }
+    entry = fragment_of(answer, file_of(answer))
+    assert entry["prompts"] == {
+        "include": ["fine", "drifts", "gone"],
+        "review": {
+            "drifts": prompt_pin("drifts", description=OLD),
+            "fine": prompt_pin("fine"),
+            "gone": OTHER_PIN,
+        },
+        "declined": {"old": prompt_pin("old")},
+        "assistant": ["fine", "gone"],
+    }
+    assert entry["resources"] == {
+        "templates": {"include": [TEMPLATE], "review": {TEMPLATE: TEMPLATE_PIN}, "declined": {}},
+        "fixed": {"include": [], "review": {}, "declined": {}},
+    }
+
+
+def test_kind_lines_include_decline_and_skip() -> None:
+    """``include`` adds an entry at its pin, ``skip`` takes an included one out and an earlier
+    decline back, ``decline`` records one at its pin; ``assistant`` keeps only the prompts still
+    included."""
+    answer = kinds()
+    pinned = kind_pins(answer)
+    text = file_of(answer)
+    for name, word in (
+        ("new", "include"),
+        ("fine", "skip"),
+        ("old", "skip"),
+        (INDEX, "include"),
+        (OTHER_URI, "decline"),
+        (TEMPLATE, "skip"),
+    ):
+        text = kind_edited(text, name, word)
+    changes = choices.decide(answer, JOB, choices.parse(text))
+    assert changes.kinds == {
+        "prompt": KindChanges(("drifts", "gone", "new"), declined={}),
+        "resource_template": KindChanges(()),
+        "resource": KindChanges((INDEX,), declined={OTHER_URI: OTHER_URI_PIN}),
+    }
+    assert (changes.added, changes.dropped, changes.declined) == ({}, frozenset(), None)
+    entry = fragment_of(answer, text)
+    assert entry["prompts"]["include"] == ["drifts", "gone", "new"]
+    assert entry["prompts"]["review"]["new"] == pinned["new"]
+    assert (entry["prompts"]["declined"], entry["prompts"]["assistant"]) == ({}, ["gone"])
+    assert entry["resources"]["fixed"] == {
+        "include": [INDEX],
+        "review": {INDEX: INDEX_PIN},
+        "declined": {OTHER_URI: OTHER_URI_PIN},
+    }
+    assert entry["resources"]["templates"]["include"] == []
+
+
+def test_decline_on_an_included_prompt_takes_it_out() -> None:
+    answer = kinds()
+    text = kind_edited(file_of(answer), "fine", "decline")
+    changes = choices.decide(answer, JOB, choices.parse(text))
+    assert changes.kinds["prompt"] == KindChanges(
+        ("drifts", "gone"), declined={"fine": prompt_pin("fine"), "old": prompt_pin("old")}
+    )
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        ("prompt: include fine", "after prompt: write a word, its name or URI and its pin"),
+        (f"prompt: allow fine {OTHER_PIN}", '"allow" isn\'t skip, include or decline'),
+        (f"resource: approve {INDEX} {OTHER_PIN}", '"approve" isn\'t skip, include or decline'),
+        (f"prompt: include b@d {OTHER_PIN}", "b@d isn't a prompt name"),
+        (f"prompt: include {INDEX} {OTHER_PIN}", "notes://index isn't a prompt name"),
+        (f"resource: include index {OTHER_PIN}", "index isn't a resource template or URI"),
+        ("prompt: include fine sha256:abc", "fine's pin isn't sha256: and 64 hex digits"),
+        (f"include fine {OTHER_PIN}", '"include" isn\'t skip, allow, approve or decline'),
+    ],
+    ids=[
+        "no-pin",
+        "a-tools-word",
+        "a-tools-word-for-a-resource",
+        "not-a-name",
+        "a-uri-for-a-prompt",
+        "not-a-uri",
+        "bad-pin",
+        "include-on-a-tools-line",
+    ],
+)
+def test_a_kind_line_that_doesnt_parse(line: str, message: str) -> None:
+    answer = kinds()
+    with pytest.raises(choices.ChoicesRefused) as caught:
+        choices.parse(head_of(answer) + line + "\n")
+    assert (caught.value.reason, str(caught.value)) == ("choices_invalid", f"line 5: {message}")
+
+
+def test_a_kind_line_twice_but_a_uri_listed_as_a_template_and_a_resource() -> None:
+    """A prompt named like a tool has its own line; a prompt twice is refused; one URI may be a
+    template and a fixed resource, told apart by its pin."""
+    answer = kinds()
+    head = head_of(answer)
+    both = choices.parse(head + f"allow fine {OTHER_PIN}\nprompt: include fine {OTHER_PIN}\n")
+    assert [(line.kind, line.tool) for line in both.lines] == [("tool", "fine"), ("prompt", "fine")]
+    twice = f"prompt: include fine {OTHER_PIN}\nprompt:   skip  fine {INDEX_PIN}\n"
+    with pytest.raises(choices.ChoicesRefused) as caught:
+        choices.parse(head + twice)
+    assert str(caught.value) == "line 6: prompt: fine is on line 5 too"
+    again = f"resource: include {INDEX} {INDEX_PIN}\nresource: skip {INDEX} {INDEX_PIN}\n"
+    with pytest.raises(choices.ChoicesRefused) as caught:
+        choices.parse(head + again)
+    assert str(caught.value) == f"line 6: resource: {INDEX} {INDEX_PIN} is on line 5 too"
+    # notes://index, a template with no expression and a fixed resource both.
+    template_pin = pins.project_kind("resource_template", template(uriTemplate=INDEX)).pin
+    flat = kinds_report(
+        [],
+        templates=[template(uriTemplate=INDEX)],
+        resources=[resource()],
+        policy_kinds={"templates": {"include": [INDEX], "review": {INDEX: template_pin}}},
+    )
+    lines = [line for line in file_of(flat).splitlines() if line.startswith("resource:")]
+    assert [line.split()[1:4] for line in lines] == [
+        ["include", INDEX, template_pin],
+        ["skip", INDEX, INDEX_PIN],
+    ]
+    text = kind_edited(file_of(flat), INDEX, "include")
+    changes = choices.decide(flat, JOB, choices.parse(text))
+    assert changes.kinds["resource"] == KindChanges((INDEX,))
+    assert changes.kinds["resource_template"] == KindChanges((INDEX,))
+    skipped = "".join(
+        line.replace("include", "skip") if template_pin in line else line
+        for line in file_of(flat).splitlines(keepends=True)
+    )
+    changes = choices.decide(flat, JOB, choices.parse(skipped))
+    assert (changes.kinds["resource_template"], changes.kinds["resource"]) == (
+        KindChanges(()),
+        KindChanges(()),
+    )
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        (f"prompt: include nope {OTHER_PIN}", "the server lists no prompt nope"),
+        (
+            f"resource: include notes://nope {OTHER_PIN}",
+            "the server lists no resource notes://nope",
+        ),
+        (f"prompt: include new {OTHER_PIN}", "new's pin isn't the one the server lists"),
+        (
+            f"resource: skip {INDEX} {OTHER_PIN}",
+            "notes://index's pin isn't the one the server lists",
+        ),
+    ],
+    ids=["unknown-prompt", "unknown-resource", "another-pin", "another-resource-pin"],
+)
+def test_a_kind_line_for_this_report_must_match_it(line: str, message: str) -> None:
+    answer = kinds()
+    caught = refused(answer, head_of(answer) + line + "\n")
+    assert (caught.reason, str(caught)) == ("choices_invalid", f"line 5: {message}")
+
+
+def test_a_drifted_or_unpinnable_prompt_cant_be_included() -> None:
+    answer = kinds()
+    pinned = kind_pins(answer)
+    caught = refused(answer, head_of(answer) + f"prompt: include drifts {pinned['drifts']}\n")
+    assert str(caught) == (
+        "line 5: drifts stays as the policy has it (drift); review notes shows why, and the "
+        "portal's review screen takes a new pin"
+    )
+    caught = refused(answer, head_of(answer) + f"prompt: decline bad {pinned['bad']}\n")
+    assert str(caught) == "line 5: bad has an error finding, so it can't be pinned"
+
+
+def test_a_kind_line_from_another_report_is_stale_unless_skipped() -> None:
+    """Read against a newer listing, a line whose pin changed is stale, but skip on an included
+    entry still takes it out, and skip on one no longer listed changes nothing."""
+    answer = kinds()
+    text = head_of(answer) + "".join(
+        f"{line}\n"
+        for line in (
+            f"prompt: skip fine {OTHER_PIN}",
+            f"prompt: skip nope {OTHER_PIN}",
+            f"resource: skip {TEMPLATE} {OTHER_PIN}",
+        )
+    )
+    changes = choices.decide(answer, "another-job", choices.parse(text))
+    assert changes.kinds["prompt"].include == ("drifts", "gone")
+    assert changes.kinds["resource_template"].include == ()
+    stale = text + f"prompt: include new {OTHER_PIN}\nresource: decline {INDEX} {OTHER_PIN}\n"
+    caught = refused(answer, stale, job="another-job")
+    assert (caught.reason, caught.tools) == ("choices_stale", ("new", INDEX))
+    # A tools-only server's report has no prompt to name.
+    tools_only = large()
+    caught = refused(tools_only, head_of(tools_only) + f"prompt: include a {OTHER_PIN}\n")
+    assert str(caught) == "line 5: the server lists no prompt a"
+    skip = head_of(tools_only) + f"prompt: skip a {OTHER_PIN}\n"
+    assert choices.decide(tools_only, "another-job", choices.parse(skip)).kinds == {}
+
+
+def test_the_policys_digest_holds_its_prompts_and_resources() -> None:
+    """A file written before the server's prompts or resources changed would undo the change,
+    so it is stale after one."""
+    answer = kinds()
+    tools = {key: sorted(answer["policy"][key]) for key in ("include", "allow", "approve")}
+    blocks = {block: answer["policy"][block] for block in ("prompts", "resources")}
+    assert choices.policy_digest(answer) == choices.report_digest({**tools, **blocks})
+    fewer = copy.deepcopy(answer)
+    fewer["policy"]["prompts"]["include"] = ["fine"]
+    assert refused(fewer, file_of(answer), job="another-job").reason == "choices_stale"
+    fewer = copy.deepcopy(answer)
+    fewer["policy"]["resources"]["templates"]["include"] = []
+    assert refused(fewer, file_of(answer), job="another-job").reason == "choices_stale"
+
+
+# --- the CLI's tool options beside prompts and resources (M6 L.7) ---------------------------------
+
+CHOOSE = "choose it in the file --choose writes"
+
+
+@pytest.mark.parametrize(
+    ("chosen", "message"),
+    [
+        (view.Choices(add=("new",)), f"--add new: the server lists it as a prompt: {CHOOSE}"),
+        (view.Choices(allow=("new",)), f"--allow new: the server lists it as a prompt: {CHOOSE}"),
+        (
+            view.Choices(approve=("new",)),
+            f"--approve new: the server lists it as a prompt: {CHOOSE}",
+        ),
+        (
+            view.Choices(decline=("new",)),
+            f"--decline new: the server lists it as a prompt: {CHOOSE}",
+        ),
+        (
+            view.Choices(repin=frozenset({"drifts"})),
+            f"--repin drifts: the server lists it as a prompt: {CHOOSE}",
+        ),
+        (
+            view.Choices(add=(TEMPLATE,)),
+            f"--add {TEMPLATE}: the server lists it as a resource template: {CHOOSE}",
+        ),
+        (
+            view.Choices(add=(INDEX,)),
+            f"--add {INDEX}: the server lists it as a resource: {CHOOSE}",
+        ),
+    ],
+)
+def test_a_tool_option_naming_a_prompt_or_a_resource_is_refused(
+    chosen: view.Choices, message: str
+) -> None:
+    """``--add``, ``--allow``, ``--approve``, ``--decline`` and ``--repin`` name tools: a
+    prompt's or a resource's name is refused, never checked or written as a tool's."""
+    with pytest.raises(view.UsageError, match=re.escape(message)):
+        view.check_choices(kinds(), chosen)
+
+
+def test_a_tool_of_a_prompts_name_is_checked_as_the_tool() -> None:
+    """A tool and a prompt of one name: the options check the tool's entry, whichever the
+    report lists last; ``--tool`` and ``--show`` may name a prompt or a resource."""
+    report = kinds()
+    twin = {**next(e for e in report["tools"] if e["name"] == "new"), "name": "a"}
+    report["tools"].append(twin)  # a prompt "a", not included, after the tool "a", included
+    with pytest.raises(view.UsageError, match="--add a: it is already included"):
+        view.check_choices(report, view.Choices(add=("a",)))
+    view.check_choices(report, view.Choices(show=frozenset({"a"})))
+    view.check_choices(kinds(), view.Choices(tools=frozenset({INDEX}), show=frozenset({"new"})))

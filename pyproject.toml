@@ -296,3 +296,4 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.common.yamlload" = 95
 "zoeymcp.gateway.capabilities" = 95
 "zoeymcp.gateway.witness" = 95
+"zoeymcp.gateway.resourcematch" = 95

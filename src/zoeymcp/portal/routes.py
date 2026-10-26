@@ -118,13 +118,16 @@ PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
 
 # Body caps in bytes (F.1, M.1): an empty object, the default, a passkey's answer, a secret
 # (M1's MAX_BODY, and what POST /api/actions reads before it knows the kind), a paste, and a
-# review's choices (M7 K.2: three lists of tool names).
+# review's choices (M7 K.2: lists of tool names; M6 L.7: each kind's too, under kinds). At
+# max_tools_per_server's default a kind lists 512 entries, each included or declined and maybe
+# re-pinned, so a resource set's lists hold up to 1,024 URIs of up to 2,048 characters: about
+# 3.5 MB in all, the tools' lists included.
 BODY_EMPTY: Final = 64
 BODY_DEFAULT: Final = 4 * 1024
 BODY_WEBAUTHN: Final = 16 * 1024
 BODY_SECRET: Final = 128 * 1024
 BODY_PASTE: Final = 8 * 1024
-BODY_CHOICES: Final = 512 * 1024
+BODY_CHOICES: Final = 4 * 1024 * 1024
 
 NONE: Final[frozenset[Scope]] = frozenset()
 SETUP: Final[frozenset[Scope]] = frozenset({"setup"})
@@ -200,7 +203,8 @@ ONBOARD_FRAGMENT: Final = Route(
 )
 ONBOARD_CANCEL: Final = Route("DELETE", "/api/onboard/{onboarding}", FULL)
 # M6 step 8 (M6 M.2, J.2): a review may be asked for fresh, never a done one handed back, and
-# fragment 2 takes the re-pins, the declines and Record the rest as declined.
+# fragment 2 takes the re-pins, the declines and Record the rest as declined; from step 21a the
+# same choices for a server's prompts and resources, under kinds (L.7).
 REVIEW: Final = Route(
     "POST", "/api/review/{server}", FULL, BODY_EMPTY, optional=frozenset({"fresh"})
 )
@@ -211,7 +215,7 @@ REVIEW_DIFF: Final = Route(
     FULL,
     BODY_CHOICES,
     frozenset({"include", "allow", "approve"}),
-    frozenset({"indent", "repin", "decline", "decline_rest"}),
+    frozenset({"indent", "repin", "decline", "decline_rest", "kinds"}),
 )
 # M6 step 7: Home's attention list (M6 M.2, M.7), from health's gateway section.
 ATTENTION: Final = Route("GET", "/api/attention", FULL)
