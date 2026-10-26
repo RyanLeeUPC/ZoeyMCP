@@ -927,14 +927,16 @@ def test_prompts_and_resources_are_rows_whose_choices_go_under_kinds() -> None:
     assert "into.include.push(entry.tool.name);" in lists
     assert "into.repin.push(entry.tool.name);" in lists
     assert "into.decline.push(entry.tool.name);" in lists
-    assert "picked(held));" in drift  # Save posts every list picked() holds
+    # Save posts every list picked() holds, each key named (test_portal_wire reads the body).
+    assert "decline_rest: chosen.decline_rest, kinds: chosen.kinds });" in drift
     # Clear unticks the kinds' boxes too (review.js's unticks the tools'), and the footer's
     # "tools changed" counts tools only.
     cleared = "drawn?.entries.forEach((e) => e.pick && (e.pick.checked = false)));"
     assert f'on("review-clear", () => {cleared}' in drift
     assert 'view.tools.filter((t) => t.kind === "tool" && t.state === "drift").length;' in drift
     review = code_of(read("review.js"))
-    assert "Object.assign({ indent: indent }, lists)" in review  # and so does Generate
+    # And so does Generate.
+    assert "decline_rest: lists.decline_rest,\n        kinds: lists.kinds });" in review
     assert set(REVIEW_DIFF.optional) == {"indent", "repin", "decline", "decline_rest", "kinds"}
     assert "entry.pick" not in review
 

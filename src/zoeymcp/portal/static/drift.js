@@ -5,11 +5,10 @@
 // and every row, its two definitions and their diff from the review's report, each string shown
 // through textContent; a clear is the vault's tool.clear action, and the gateway's own check. It
 // uses app.js's API, step-up and guard() (window.zoeyPortal), and review.js calls it when it draws
-// (window.zoeyDrift). In managed mode (M.1, G.3, G.4) it shows the page's managed texts (the
-// data-mode pairs), and Save and Allow without asking are saves: the vault holds the review's
-// change as a draft and plans it, and one passkey confirms the plan it shows, each move to allow
-// first with its definition (Q27); so is an onboarding's Save (G.9), and Give to clients is
-// policy.js's (G.3).
+// (window.zoeyDrift). In managed mode (M.1, G.3, G.4) it shows the page's data-mode managed texts,
+// and Save and Allow without asking are saves: the vault holds the review's change as a draft and
+// plans it, and one passkey confirms the plan it shows, each move to allow first with its
+// definition (Q27); so is an onboarding's Save (G.9), and Give to clients is policy.js's (G.3).
 "use strict";
 
 (function () {
@@ -65,8 +64,7 @@
 
   // A checkbox with its words, appended to ``place``; the box, for lists() to read.
   function check(place, text) {
-    const box = document.createElement("input");
-    box.type = "checkbox";
+    const box = Object.assign(document.createElement("input"), { type: "checkbox" });
     const label = make("label", "", "check");
     label.append(box, " " + text);
     place.append(label);
@@ -337,10 +335,12 @@
     if (held === null) {
       return;
     }
+    const chosen = picked(held);
     let draft;
     try {
-      draft = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }),
-        picked(held));
+      draft = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
+        include: chosen.include, allow: chosen.allow, approve: chosen.approve, repin: chosen.repin,
+        decline: chosen.decline, decline_rest: chosen.decline_rest, kinds: chosen.kinds });
     } catch (error) {
       return afterFailure(error);
     }

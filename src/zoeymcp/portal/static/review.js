@@ -513,8 +513,7 @@
     const entry = { tool: tool, item: item, box: null, choice: null };
     const head = make("p");
     if (tool.name !== null && (tool.pinnable || tool.included)) {
-      entry.box = document.createElement("input");
-      entry.box.type = "checkbox";
+      entry.box = Object.assign(document.createElement("input"), { type: "checkbox" });
       entry.box.checked = tool.included;
       const label = make("label", "", "include");
       label.append(entry.box, " Include ");
@@ -651,8 +650,10 @@
     clearRefusal();
     let answer;
     try {
-      answer = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }),
-        Object.assign({ indent: indent }, lists)); // every list drift.js's lists() holds
+      answer = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
+        include: lists.include, allow: lists.allow, approve: lists.approve, indent: indent,
+        repin: lists.repin, decline: lists.decline, decline_rest: lists.decline_rest,
+        kinds: lists.kinds });
     } catch (error) {
       return refused(error, { server: held.server });
     }
