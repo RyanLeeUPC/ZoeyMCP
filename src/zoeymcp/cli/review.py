@@ -28,7 +28,10 @@ J.3, J.5; G-19), so the server ends quiet: a tool that is neither included nor d
 pin it has now is one nobody reviewed, and ``review`` exits 1 for it, naming it on a line of its
 own ("3 listed that nobody reviewed: ..."), as for drift, a mark or a missing tool (the attention
 decision, ``common/policy/attention.py``). A snippet writes ``declined`` whole once the server
-has one or the options decline a tool, an included tool leaving it; otherwise it is M7's.
+has one or the options decline a tool, an included tool leaving it; otherwise it is M7's. When
+the upstream offers prompts, resources or completions the server's ``enable`` doesn't list, a
+line after the tools says so, with J12's way to serve them in the deployment's mode
+(:func:`offered_line`).
 
 For a toolkit server (M4 design H.6), ``--add TOOL`` puts a tool its code declares consequential
 into ``approve`` ("declared by the toolkit") and leaves a routine one to the operator, as for a
@@ -66,7 +69,7 @@ from typing import Any, Final, Literal, TextIO
 
 from ..common.policy import attention
 from ..common.policy.emit import emit
-from ..common.policy.reviewchange import NOUNS, kind_of, pinnable
+from ..common.policy.reviewchange import NOUNS, OFFERABLE, kind_of, not_served_line, pinnable
 
 # The change the snippet makes moved to a pure module (M6 design J.3), named here as before.
 from ..common.policy.reviewchange import Added as Added
@@ -245,6 +248,9 @@ def render(review: dict[str, Any], choices: Choices, *, managed: bool = False) -
     unreviewed = unreviewed_line(review.get("attention"))
     if unreviewed is not None:
         lines.append(unreviewed)
+    offered = offered_line(review, managed=managed)
+    if offered is not None:
+        lines.append(offered)
     if review.get("cleared"):
         lines.append(f"cleared drift marks: {', '.join(review['cleared'])}")
     findings = [(entry["name"], finding) for entry in shown for finding in entry["findings"]]
@@ -270,6 +276,35 @@ def render(review: dict[str, Any], choices: Choices, *, managed: bool = False) -
     lines += ["", "# YAML to commit (declarative mode). Review the changes above first."]
     lines += snippet(review, choices)
     return lines
+
+
+# The enable entry that lists each kind a review's ``listings`` names (M6 design L.4).
+ENABLED_BY: Final = {"prompt": "prompts", "resource_template": "resources", "resource": "resources"}
+
+
+def offered_line(review: Mapping[str, Any], *, managed: bool = False) -> str | None:
+    """``notes offers prompts and resources, not served: <J12's way to serve them>`` (M6 design
+    J12, D-216), or ``None``: what a remote server's upstream offers (``offered``) that its
+    ``enable`` doesn't list, read from the report alone, whose policy block holds the server's
+    ``enable`` once it lists any. A report without it, an older gateway's, tells what the server
+    enables by its ``listings``, which name exactly the kinds it enables: completions can't be
+    told there, so they are named only for a server that enables neither, where ``check``
+    refuses them (A.2 row 5c). Completions join J12's way only where ``check`` takes them."""
+    offered = review.get("offered")
+    if review.get("kind") != "remote" or not offered:
+        return None
+    policy = review["policy"]
+    if "enable" in policy:
+        enable = set(policy["enable"])
+    else:
+        enable = {ENABLED_BY[kind] for kind in review.get("listings") or {} if kind in ENABLED_BY}
+        if enable:
+            enable.add("completions")
+    kinds = [kind for kind in OFFERABLE if offered.get(kind) and kind not in enable]
+    if not kinds:
+        return None
+    templates = bool(policy.get("resources", {}).get("templates", {}).get("include"))
+    return not_served_line(review["server"], kinds, enable, templates=templates, managed=managed)
 
 
 def _quiet(found: Mapping[str, Any] | None) -> bool:

@@ -31,6 +31,8 @@ from zoeymcp.common.policy.schema import (
     HeaderCredential,
     OAuth2Credential,
     RemoteServer,
+    ResourceSet,
+    ResourcesPolicy,
     Route,
     Tools,
 )
@@ -74,6 +76,7 @@ from zoeymcp.vault.onboarding import (
     mismatches,
     name_taken,
     next_for,
+    offered_not_served,
     onboard_again,
     refusal_next,
     remove_first,
@@ -1793,6 +1796,99 @@ def test_each_rows_next_steps() -> None:
     assert [step.do for step in listed_next(replace(reviewed, resource=None))] == ["review"]
     # needs_connect without a credential can't happen; a row without one reviews.
     assert listed_next(replace(bare, held="none"))[0].do == "review"
+
+
+# --- what an upstream offers and the row doesn't serve (M6 design J12, D-216) ------------------
+
+
+def test_a_remote_rows_enable_is_its_servers() -> None:
+    """The row holds the server's ``enable``, as the policy lists it; a toolkit has none."""
+    policy = committed()
+    assert policy.gateway is not None
+    notes = policy.gateway.servers["notes"]
+    kinds = notes.model_copy(update={"enable": ["resources", "prompts"]})
+    found = {s.name: s for s in listed_servers(with_servers(policy, notes=kinds), set())}
+    assert found["notes"].enable == ("resources", "prompts")
+    assert found["mail"].enable == ()
+    assert found["broker-read"].enable == ()
+    assert onboarding.Listed("notes", "remote", Tools(), "hide").enable == ()
+
+
+def test_what_is_offered_and_not_served() -> None:
+    """The ``OFFERABLE`` entries the gateway's status says the upstream offers, that
+    ``enable`` doesn't list, in that order: never ``logging``; nothing with no report, and
+    nothing for a toolkit."""
+    bare = onboarding.Listed("notes", "remote", Tools(), "hide")
+    everything = ["logging", "completions", "resources", "prompts"]
+    assert offered_not_served(bare, everything) == ("prompts", "resources", "completions")
+    assert offered_not_served(bare, ["logging"]) == ()
+    assert offered_not_served(bare, []) == ()
+    assert offered_not_served(bare, None) == ()
+    assert offered_not_served(bare, {"resources"}) == ("resources",)
+    some = replace(bare, enable=("prompts", "completions"))
+    assert offered_not_served(some, everything) == ("resources",)
+    every = replace(bare, enable=("completions", "resources", "prompts"))
+    assert offered_not_served(every, everything) == ()
+    kit = onboarding.Listed("kit", "toolkit", Tools(), "hide")
+    assert offered_not_served(kit, everything) == ()
+
+
+def test_a_row_offering_more_ends_with_j12s_step() -> None:
+    """Whatever the row's state, a row with kinds offered and not served ends with one step,
+    text only (no command: the page can't take it), worded for the mode; one without any has
+    none."""
+    bare = onboarding.Listed("notes", "remote", Tools(), "hide")
+    reviewed = replace(
+        bare,
+        tools=Tools(include=["list_notes"], allow=["list_notes"]),
+        credential="notes",
+        held="stored",
+        resource=SERVER,
+    )
+    connect = replace(bare, credential="notes", held="none")
+    declarative = NextStep(
+        "enable_kinds", "Add enable: [prompts, resources] to notes in your policy and reload"
+    )
+    managed = NextStep("enable_kinds", "Export, add enable: [prompts, resources] to notes, import")
+    for listed in (bare, reviewed, connect):
+        before = listed_next(listed)
+        assert listed_next(listed, ("prompts", "resources")) == (*before, declarative)
+        found = listed_next(listed, ("prompts", "resources"), managed=True)
+        assert found == (*before, managed)
+        assert listed_next(listed, (), managed=True) == before
+    assert listed_next(replace(bare, enable=("prompts",)), ("completions",))[-1].answer() == {
+        "do": "enable_kinds",
+        "label": "Add enable: [completions] to notes in your policy and reload",
+    }
+
+
+def test_j12s_step_adds_completions_only_where_check_takes_them() -> None:
+    """A.2 row 5c: completions need prompts, or resources with a template included. Before the
+    review no template is included, so an upstream offering resources and completions but no
+    prompts gets ``resources`` alone, and completions once a template is included; with neither
+    possible the step says what completions need."""
+    bare = onboarding.Listed("notes", "remote", Tools(), "hide")
+    assert offered_not_served(bare, ["resources", "completions"]) == ("resources", "completions")
+    assert listed_next(bare, ("resources", "completions"))[-1] == NextStep(
+        "enable_kinds", "Add enable: [resources] to notes in your policy and reload"
+    )
+    assert listed_next(bare, ("resources", "completions"), managed=True)[-1] == NextStep(
+        "enable_kinds", "Export, add enable: [resources] to notes, import"
+    )
+    served = replace(bare, enable=("resources",))
+    assert listed_next(served, ("completions",))[-1] == NextStep(
+        "enable_kinds", "Completions need prompts enabled, or a resource template included"
+    )
+    templated = replace(
+        served, resources=ResourcesPolicy(templates=ResourceSet(include=["notes://notes/{id}"]))
+    )
+    assert listed_next(templated, ("completions",))[-1] == NextStep(
+        "enable_kinds", "Add enable: [completions] to notes in your policy and reload"
+    )
+    unserved = replace(templated, enable=())
+    assert listed_next(unserved, ("resources", "completions"))[-1].label == (
+        "Add enable: [resources, completions] to notes in your policy and reload"
+    )
 
 
 def test_the_steps_after_fragment_2_for_an_inline_policy() -> None:

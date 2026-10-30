@@ -2,7 +2,8 @@
 ``allow``, declines, and a definition recorded for every name classified ``allow`` at a
 (classification, pin) the policy doesn't hold, with ``allow_needs_review``, ``allow_marked`` and
 ``consequential_allow`` each refused by name. M6 L.7: a server's prompts and resources, each
-kind's block written whole by the same rules, never classified.
+kind's block written whole by the same rules, never classified. M6 J12 (D-216): the text for what
+an upstream offers that the server doesn't serve, and J12's way to serve it.
 
 The reports come from the gateway's own review code (``tests/unit/test_review.py``'s helpers), held
 as the vault holds them; the CLI's snippet cases stay in ``test_review.py`` and
@@ -15,6 +16,7 @@ import copy
 from pathlib import Path
 from typing import Any
 
+import pytest
 from mcp.types import Tool
 
 from tests.unit.test_pins import prompt_pin
@@ -36,8 +38,10 @@ from zoeymcp.common.policy.change import PolicyChange, SetServerReview
 from zoeymcp.common.policy.emit import emit
 from zoeymcp.common.policy.reviewchange import (
     CHUNK,
+    COMPLETIONS_NEED,
     MOVED_TO_ALLOW,
     NOUNS,
+    OFFERABLE,
     PROPOSED,
     AllowRefused,
     Changes,
@@ -47,16 +51,20 @@ from zoeymcp.common.policy.reviewchange import (
     declined_block,
     definition_lines,
     definitions,
+    enable_text,
+    enableable,
     enabled,
     fragment,
     is_key,
     kind_blocks,
     kind_of,
     listed,
+    not_served_line,
     pinnable,
     planned,
     proposed,
     second_title,
+    serve_text,
     the_rest,
     title,
     verified,
@@ -584,3 +592,91 @@ def test_verified_names_the_pins_of_every_kind() -> None:
     alone = op_of(fragment(prompts_only, Changes()))
     assert alone.resources is None
     assert all(key[1] in ("tool", "prompt") for key, _ in verified(prompts_only, alone))
+
+
+# --- what is offered and not served (M6 design J12, D-216) -------------------------------------
+
+
+def test_the_kinds_an_upstream_may_offer() -> None:
+    assert OFFERABLE == ("prompts", "resources", "completions")  # never logging
+    assert COMPLETIONS_NEED == "completions need prompts enabled, or a resource template included"
+
+
+def test_j12s_way_to_serve_them_in_each_mode() -> None:
+    assert enable_text("notes", ["prompts"], managed=False) == (
+        "add enable: [prompts] to notes in your policy and reload"
+    )
+    assert enable_text("notes", ["prompts"], managed=True) == (
+        "export, add enable: [prompts] to notes, import"
+    )
+    assert enable_text("notes", ["prompts", "resources"], managed=True) == (
+        "export, add enable: [prompts, resources] to notes, import"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kinds", "enable", "templates", "added"),
+    [
+        (
+            ("prompts", "resources", "completions"),
+            (),
+            False,
+            ("prompts", "resources", "completions"),
+        ),
+        (("prompts", "completions"), (), False, ("prompts", "completions")),
+        (("completions",), ("prompts",), False, ("completions",)),
+        (("completions",), ("prompts", "resources"), False, ("completions",)),
+        (("resources", "completions"), (), False, ("resources",)),
+        (("resources", "completions"), (), True, ("resources", "completions")),
+        (("completions",), ("resources",), True, ("completions",)),
+        (("completions",), ("resources",), False, ()),
+        (("completions",), (), True, ()),
+        (("completions",), (), False, ()),
+        (("prompts",), (), False, ("prompts",)),
+        (("resources",), (), False, ("resources",)),
+    ],
+)
+def test_completions_join_only_where_check_takes_them(
+    kinds: tuple[str, ...], enable: tuple[str, ...], templates: bool, added: tuple[str, ...]
+) -> None:
+    """A.2 row 5c refuses ``completions`` without ``prompts`` and without ``resources`` that
+    includes a template: J12's step adds them only where the ``enable`` it leads to passes."""
+    assert enableable(kinds, enable, templates=templates) == added
+
+
+def test_the_way_is_the_check_rule_when_nothing_can_be_added() -> None:
+    assert serve_text("notes", ["completions"], ["resources"], templates=False, managed=True) == (
+        COMPLETIONS_NEED
+    )
+    assert serve_text("notes", ["completions"], ["resources"], templates=True, managed=True) == (
+        "export, add enable: [completions] to notes, import"
+    )
+    assert serve_text(
+        "notes", ["resources", "completions"], [], templates=False, managed=False
+    ) == ("add enable: [resources] to notes in your policy and reload")
+
+
+def test_the_review_line_lists_the_kinds() -> None:
+    """Every kind offered is named; J12's way adds the ones ``check`` takes."""
+    assert not_served_line("notes", ["prompts"], [], templates=False, managed=False) == (
+        "notes offers prompts, not served: add enable: [prompts] to notes in your policy and reload"
+    )
+    assert not_served_line(
+        "notes", ["prompts", "resources"], ["completions"], templates=False, managed=True
+    ) == (
+        "notes offers prompts and resources, not served: export, add enable: [prompts, "
+        "resources] to notes, import"
+    )
+    assert not_served_line("docs", list(OFFERABLE), [], templates=False, managed=False) == (
+        "docs offers prompts, resources and completions, not served: add enable: [prompts, "
+        "resources, completions] to docs in your policy and reload"
+    )
+    assert not_served_line(
+        "notes", ["resources", "completions"], [], templates=False, managed=False
+    ) == (
+        "notes offers resources and completions, not served: add enable: [resources] to notes "
+        "in your policy and reload"
+    )
+    assert not_served_line(
+        "notes", ["completions"], ["resources"], templates=False, managed=False
+    ) == (f"notes offers completions, not served: {COMPLETIONS_NEED}")

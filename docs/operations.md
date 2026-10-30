@@ -359,9 +359,9 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `ledger_copy_refused`, `ledger_copy_broken`, `ledger_copy_unavailable` | error | the copy refuses reports after a fork, gap or full; its files stop chaining at a seq; its directory can't be read (§21) |
 | `passkeys_unavailable` | error | (with an `admin` block) the passkey file can't be verified, so portal sign-in is off: `zoeymcp setup-code --reset` (§26) |
 | `passkey_counter`, `passkey_single` | warning, info | a passkey's signature counter went back in the last 30 days (the authenticator may have been copied: check `zoeymcp passkeys`); only one passkey is enrolled, so losing it means a reset |
-| `tools_unreviewed` | warning | (with a `gateway` section; from the gateway's status report, §13) the server lists tools nobody reviewed: new ones, and declined ones whose definition changed, counted here and named by `zoeymcp review <server>`. Review the server, and include or decline each (§11) |
-| `drift_marked` | warning | (§13) included tools that changed since the review, that a drift mark hides, or that the server no longer lists (§12): review the server |
-| `server_blocked` | warning | (§13) the gateway reports that `on_drift: fail` blocked the server (a tool drifted, a drift mark held, or an included tool listed invalid): none of its tools is served until it is reviewed (§12) |
+| `tools_unreviewed` | warning | (with a `gateway` section; from the gateway's status report, §13) the server lists tools nobody reviewed: new ones, and declined ones whose definition changed, counted here and named by `zoeymcp review <server>`. Review the server, and include or decline each (§11). A server that enables prompts or resources has one more for each kind with entries nobody reviewed, its text naming the kind ("notes lists 2 prompts nobody reviewed", §12) |
+| `drift_marked` | warning | (§13) included tools that changed since the review, that a drift mark hides, or that the server no longer lists (§12): review the server. Likewise for each kind of prompt and resource the server enables, its text naming the kind ("notes: included resource templates 1 changed since the review (notes://notes/{id})") |
+| `server_blocked` | warning | (§13) the gateway reports that `on_drift: fail` blocked the server (a tool, prompt or resource drifted, a drift mark held, or an included tool listed invalid): none of its tools, nor of its prompts and resources when it enables them, is served until it is reviewed (§12) |
 | `server_listing_invalid` | warning | (§13) the server lists tools the gateway can't serve, or whose names aren't valid, counted and not named; or the vault couldn't read the gateway's status for that server |
 | `gateway_status_stale` | info | (§13) the gateway hasn't pushed its status for 3 minutes (it does at least every minute): the `gateway` section's other findings are that old. Check that the gateway runs and reaches the vault |
 | `gateway_view_behind` | info | (managed mode, §34) the gateway still reports another revision's view than the head's 30 s after a save: it usually takes a new view within seconds. Check that the gateway runs and reaches the vault |
@@ -1495,6 +1495,26 @@ URI's contents are passed on. What the gateway drops is counted under the answer
 announced to the agents per kind (`prompts_changed_sent`, `resources_changed_sent`, beside
 `tools_changed_sent`).
 
+**What Home, health and the server's row show for them.** For a server that enables prompts or
+resources, the gateway's status report (§13) carries each kind it enables as it carries the
+tools, names only: the included entries that drifted, that a drift mark hides and that it no
+longer lists, and the ones nobody reviewed. `zoeymcp health` raises `tools_unreviewed` and
+`drift_marked` for each kind as for the tools, the text naming the kind ("notes lists 2 prompts
+nobody reviewed"; "notes: included resource templates 1 changed since the review
+(notes://notes/{id})"), and Home lists an item for each ("notes changed 1 included prompt since
+the review"), with **Review**, or **Clear the marks** for marked entries, which clears every
+kind's. A blocked server serves none of its tools, prompts or resources. Until a kind is
+enabled, the server's row on **MCP servers** says what its upstream offers and isn't served
+("offered, not served: prompts, resources, completions"; never logging, which `enable` doesn't
+name), from the gateway's latest status, which knows it once the gateway has connected to the
+server, and its last step is the way to serve them: in declarative mode "Add enable: [prompts]
+to notes in your policy and reload", in managed mode "Export, add enable: [prompts] to notes,
+import". The step adds `completions` only where `check` takes them, beside prompts or a
+resource template the server includes; otherwise it says "completions need prompts enabled, or a
+resource template included". `zoeymcp review notes` prints the same after the tools ("notes
+offers prompts and resources, not served: ..."), from the review alone, which holds the server's
+`enable`.
+
 ## 13. `gateway-status`
 
 ```text
@@ -1516,7 +1536,8 @@ gateway pushes a summary of the same data to the vault: per server its kind, sta
 whether it is blocked, and counts, the mode it last saw, the highest revision it has seen of each
 deployment of a managed vault (its restore witness, §34), and the names its attention decision sorts out (the tools that drifted, that a drift
 mark hides, that it no longer lists, and the tools nobody reviewed with the pin each is listed
-at), never a definition, a token hash or a client name. It pushes when that changes, at most
+at, and the same names, without pins, for each kind of prompt and resource the server enables,
+§12), what the upstream offers beyond tools, never a definition, a token hash or a client name. It pushes when that changes, at most
 once every 5 seconds, and at least once a minute; the vault keeps the latest in memory only, so
 after a vault restart the next push, within a minute, fills it again. Nothing the vault decides
 reads it: it is shown, labelled as what the gateway reports.
@@ -1526,9 +1547,10 @@ reads it: it is shown, labelled as what the gateway reports.
   `run: zoeymcp review <server>`. `review`'s exit code, these findings and the portal's list
   come from the one decision, so a server `review <server>` exits 1 for has a finding here.
 - **The portal's Home page** lists the same, per server, under the checklist: drifted, missing
-  and marked tools, the tools nobody reviewed, a blocked server, and a bridge's state while it
-  isn't ready, each with **Review**, which opens the MCP servers page, or, for marked tools,
-  **Clear the marks** (§12) (at most 64 items; the rest are in `zoeymcp health`).
+  and marked tools, the tools nobody reviewed, then the same for each kind of prompt and resource
+  the server enables, a blocked server, and a bridge's state while it isn't ready, each with
+  **Review**, which opens the MCP servers page, or, for marked entries, **Clear the marks** (§12)
+  (at most 64 items; the rest are in `zoeymcp health`).
 - The upstream reports a tool it can't serve under the name it lists, which often isn't a tool
   name: those are counted, not named. A report the vault can't read for one server leaves that
   server out (`server_listing_invalid`) and keeps the rest.

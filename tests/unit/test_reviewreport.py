@@ -1005,6 +1005,7 @@ def test_an_m7_report_still_reads(tmp_path: Path, example_raw: dict[str, Any]) -
     assert report.offered is None
     assert report.attention is None
     assert (report.policy.review, report.policy.declined) == ({}, {})
+    assert report.policy.enable is None
     assert report.tools[0].reviewed is None
     assert report.model_dump(mode="json", exclude_unset=True) == data
     toolkit = wired(toolkit_reviewed(tmp_path, example_raw))
@@ -1014,19 +1015,28 @@ def test_an_m7_report_still_reads(tmp_path: Path, example_raw: dict[str, Any]) -
 
 
 def test_the_clis_review_text_reads_none_of_the_new_fields() -> None:
-    """J.1's acceptance: the CLI prints the gateway's answer as before, so its text and snippet
-    are byte-identical with and without M6's fields."""
+    """J.1's acceptance: the CLI prints the gateway's answer as before, so its snippet is
+    byte-identical with and without M6's fields, and its text too but for J12's line for what
+    the upstream ``offered`` that the server doesn't serve (D-216), after the tools."""
     data = drifted(
         offered={"prompts": True, "resources": True, "completions": True, "logging": True}
     )
     m7 = copy.deepcopy(data)
     del m7["offered"], m7["policy"]["review"], m7["tools"][0]["reviewed"]
     del m7["policy"]["declined"], m7["attention"]
+    offered = cli_review.offered_line(data)
+    assert offered == (
+        "notes offers prompts, resources and completions, not served: add enable: [prompts, "
+        "resources, completions] to notes in your policy and reload"
+    )
+    assert cli_review.offered_line(m7) is None
     for choices in (
         cli_review.Choices(),
         cli_review.Choices(show_all=True, repin=frozenset({"a"})),
     ):
-        assert cli_review.render(data, choices) == cli_review.render(m7, choices)
+        lines = cli_review.render(data, choices)
+        assert lines[2] == offered
+        assert [line for line in lines if line != offered] == cli_review.render(m7, choices)
         assert cli_review.snippet(data, choices) == cli_review.snippet(m7, choices)
 
 
@@ -1175,6 +1185,7 @@ def test_a_report_with_prompts_and_resources_reads_back() -> None:
     assert all(entry.classification is None for entry in report.tools[1:])
     assert report.policy.prompts.assistant == ["fine"]
     assert report.policy.resources.templates.include == ["notes://notes/{id}"]
+    assert report.policy.enable == ["prompts", "resources"]  # J12: what the CLI says isn't served
     assert report.listings is not None
     assert set(report.listings) == {"prompt", "resource_template", "resource"}
     for listing in report.listings.values():
@@ -1233,6 +1244,24 @@ def test_a_kind_entrys_reviewed_definition_is_checked_against_its_kinds_pins() -
     data = kinds_report([named_prompt("p")], policy_kinds=policy_kinds, defs={old_pin: old})
     data["policy"]["prompts"]["review"]["p"] = PIN0  # the entry's pinned isn't the policy's
     assert refused(data).tools == ("p",)
+
+
+@pytest.mark.parametrize(
+    ("enable", "location"),
+    [
+        (["logging"], "remote.policy.enable[0]"),
+        (["prompts"] * 7, "remote.policy.enable"),
+        ("prompts", "remote.policy.enable"),
+    ],
+    ids=["not_an_entry", "too_many", "not_a_list"],
+)
+def test_the_policys_enable_out_of_shape(enable: object, location: str) -> None:
+    """``enable`` holds the policy's entries only, and no more of them than there are."""
+    data = kinds_report([named_prompt("new")])
+    data["policy"]["enable"] = enable
+    assert invalid(data) == f"at {location}"
+    data["policy"]["enable"] = ["prompts", "resources", "completions"]
+    assert read(data, LIMITS).policy.enable == ["prompts", "resources", "completions"]
 
 
 @pytest.mark.parametrize(

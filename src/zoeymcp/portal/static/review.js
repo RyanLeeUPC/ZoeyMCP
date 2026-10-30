@@ -173,11 +173,10 @@
     if ("onboarding" in row) {
       return text + ", until " + when(row.expires) + ". " + row.server_url;
     }
-    if (row.state !== "reviewed") {
-      return text + ".";
-    }
-    return text + ": " + row.tools + (row.tools === 1 ? " tool" : " tools") + " served to " +
-      (row.clients_shown.join(", ") || "no client yet") + ".";
+    const kinds = (row.offered_not_served || []).join(", "); // M6 J12, as the gateway reports
+    const served = row.state !== "reviewed" ? "" : ": " + row.tools + " tool" + (row.tools === 1 ?
+      "" : "s") + " served to " + (row.clients_shown.join(", ") || "no client yet");
+    return text + served + (kinds && "; offered, not served: " + kinds) + ".";
   }
 
   async function listServers() {

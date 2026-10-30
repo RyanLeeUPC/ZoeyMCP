@@ -2878,7 +2878,6 @@ them.
 | D-108 | Which real MCP clients, and which versions, must be checked in [clients.md](clients.md) before the PR into main? | To be named |
 | D-110 | What is the bar for removing the README banner and opening the PR into main? Is a security review required before the first release? | After M8, with a review |
 | D-124 | Should a `SECURITY.md` point at GitHub's private vulnerability reporting? | Yes |
-| D-216 | Should the gateway's status report, health and Home show drifted prompts and resources per kind, and a server's row say what it offers but isn't served, before M6 closes or later? | Not built until answered |
 
 ### 12.3 Register of deferred work
 
@@ -2887,12 +2886,7 @@ event that brings it back. Keys are never reused or renumbered; an item that is 
 "Closed" and keeps its key. The register is refreshed at the end of each milestone. The few keys
 not listed concern the maintainers' local setup, not ZoeyMCP.
 
-**M6 (Portal v2).**
-
-| Key | Item | Target or trigger |
-| --- | --- | --- |
-| D-59 | R31: per-server enable of prompts, resources and completions (built in M6; sampling and roots refused for good); a server's row doesn't say yet what it offers but isn't served (D-216) | M6, with D-216 |
-| D-216 | Drifted prompts and resources aren't shown per kind in the gateway's status report, health and Home (they carry tool names only), and a server's row doesn't say what it offers but isn't served | M6 if the owner takes it (§12.2); otherwise M8 or the backlog |
+**M6 (Portal v2).** None: every M6 item is done or moved to a later milestone.
 
 **M7.** None: every M7 item is done or moved to a later milestone.
 
@@ -3049,7 +3043,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-25 | The vault's SMTP send journal shown next to the ledger | Done in M5: the ledger view joins the journal and flags sends with no ledger record |
 | D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records are M8 (D-35) |
 | D-28 | The gateway's entry path still loads vault code | Done in M5 |
-| D-29 | Gateway status and drift marks in the portal | Done in M6: a status report the gateway pushes, shown on Home and in health (tool names only: D-216) |
+| D-29 | Gateway status and drift marks in the portal | Done in M6: a status report the gateway pushes, shown on Home and in health, for tools and for each kind of prompt and resource a server enables (D-216) |
 | D-30 | The bridge for stdio MCP servers (R35, S11) | Done in M7: `zoeymcp bridge`, local MCP routes and `unix:` upstreams, the standard launcher's bridges, the bridge image and its verifier, S11 in every placement; each verifier check and smoke row shown failing under a deliberate break |
 | D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | Done in M7 |
 | D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML fragments | Done in M7: `login --mcp` and the portal's MCP servers page, walked end to end by S9 |
@@ -3058,6 +3052,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-46 | A modern upstream's tool-list change announced before the gateway's listen stream opened waited for the next timer check | Done in M6: a listing after every open of the stream |
 | D-49 | Designed log events that are never emitted (`server_unsupported`, `vault_link_refused`, `approval_unavailable`) | Done in M7: `server_unsupported` struck as obsolete, since no server kind is left unserved once `kind: bridge` is gone; `vault_link_refused` struck, covered by `policy_fetch_failed` with `status: 403` and `vault_refused`; `approval_unavailable` superseded by `approval_refused` |
 | D-58 | Managed mode: versioned policy, history, rollback, export and import | Done in M6 (§4.6) |
+| D-59 | R31: per-server enable of prompts, resources and completions | Done in M6: each kind enabled per server, pinned, drift-reviewed and served as tools are; sampling and roots refused for good; a server's row says what its upstream offers and isn't served, and how to serve it; resource subscriptions and content pins for prompts without arguments stay out (§12.1.4) |
 | D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | Done in M5 (the docs); detection is D-130 |
 | D-63 | Network filesystems are unsupported for state | Done |
 | D-66 | The live OAuth smoke test has never been run against a real provider: run it once and record the result | Done in M5: the portless redirect works with a real provider, recorded in [manual-checks.md](manual-checks.md) |
@@ -3132,3 +3127,4 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-208 | The built-in egress role connected only to the first allowed address | Done in M6: each allowed address in turn, under one deadline |
 | D-209 | Deliberate-break runs weren't done for the egress role's smoke rows, the portal alias's row and the hardened bridge's stop order | Done in M6: each shown failing under a break and passing once restored |
 | D-212 | Docs: a registration endpoint on a host in `egress_private` passes discovery's check but is refused at connect | Done in M6: [operations.md](operations.md) §11 |
+| D-216 | Drifted prompts and resources weren't shown per kind in the gateway's status report, health and Home, and a server's row didn't say what it offers but isn't served | Done in M6: the status report carries each enabled kind's attention lists, health's findings and Home's items name the kind, and the server's row and `zoeymcp review` name what is offered and not served, with the way to serve it in each mode |

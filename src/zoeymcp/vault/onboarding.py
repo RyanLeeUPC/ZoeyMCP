@@ -35,7 +35,9 @@ and one per owner, each for :data:`ONBOARDING_TTL` seconds from its start, on a 
 - :func:`widen_scope` (D.5's step-up, SPEC-11): health's fragment for a scope an upstream asked
   for, the union of the committed scope and the challenged one.
 - :func:`listed_servers` (K.1, GR-21): the running policy's servers as the portal's rows list
-  them, each with its state and, from :func:`listed_next`, what to do next; and
+  them, each with its state and, from :func:`listed_next`, what to do next (with, for a remote
+  server, what its upstream offers beyond tools that its ``enable`` doesn't serve,
+  :func:`offered_not_served`, and J12's way to serve it, M6 design D-216); and
   :func:`reviewed_next`, the steps after fragment 2 (E.4), on every surface, or in managed
   mode after the review's save: giving the server to its clients (**Give to clients**, G.3),
   whose boxes :func:`listed_clients` lists.
@@ -51,7 +53,7 @@ import ipaddress
 import re
 import secrets
 import shlex
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal
 from urllib.parse import urlsplit
@@ -63,8 +65,10 @@ from ..common.policy.change import PolicyChange, SetCredential, SetScope, apply
 from ..common.policy.emit import emit
 from ..common.policy.findings import Finding
 from ..common.policy.restart import Effect
+from ..common.policy.reviewchange import OFFERABLE, serve_text
 from ..common.policy.schema import (
     NAME_PATTERN,
+    Capability,
     ClientAuth,
     GatewayLimits,
     OAuth2Credential,
@@ -134,6 +138,7 @@ Do = Literal[
     "save",
     "export_policy",
     "import_policy",
+    "enable_kinds",
 ]
 # Where the CLI runs a command (M.7): ``exec`` in the running service; ``run``, a one-off
 # container that reads the inline policy from the service's environment; ``run_mount``, the same
@@ -1102,8 +1107,9 @@ class Listed:
     for a ``refresh_token`` grant, whether it holds a refresh token (OPS-13): a
     ``client_credentials`` grant never holds one, and needs no sign-in. ``review`` and
     ``declined`` are the policy's pins and declined block, which a review report made before a
-    re-pin or a decline no longer matches (M6 design J.2, J.5), and a remote server's
-    ``prompts`` and ``resources`` its blocks, which a review writes whole (L.7)."""
+    re-pin or a decline no longer matches (M6 design J.2, J.5), a remote server's ``prompts``
+    and ``resources`` its blocks, which a review writes whole (L.7), and its ``enable``, the
+    kinds beyond tools it serves (J12)."""
 
     name: str
     kind: ServerKind
@@ -1117,6 +1123,7 @@ class Listed:
     review: Mapping[str, str] = field(default_factory=dict)
     prompts: PromptsPolicy = field(default_factory=PromptsPolicy)
     resources: ResourcesPolicy = field(default_factory=ResourcesPolicy)
+    enable: tuple[Capability, ...] = ()
 
     @property
     def state(self) -> RowState:
@@ -1146,7 +1153,12 @@ def listed_servers(policy: Policy, store_names: Collection[str]) -> tuple[Listed
         if isinstance(server, ToolkitServer):
             found.append(listed)
             continue
-        listed = replace(listed, prompts=server.prompts, resources=server.resources)
+        listed = replace(
+            listed,
+            prompts=server.prompts,
+            resources=server.resources,
+            enable=tuple(server.enable),
+        )
         route = routes.get(server.route)
         credential = None if route is None else route.credential
         cred = None if credential is None else policy.credentials.get(credential)
@@ -1179,19 +1191,38 @@ def tools_max(policy: Policy) -> int:
     return limits.max_tools_per_server
 
 
-def listed_next(listed: Listed) -> tuple[NextStep, ...]:
+def offered_not_served(listed: Listed, offered: Collection[str] | None) -> tuple[Capability, ...]:
+    """The :data:`~zoeymcp.common.policy.reviewchange.OFFERABLE` entries the upstream of a
+    remote server offers, as the gateway's latest status says (``offered``, None with no
+    report), that its ``enable`` doesn't list."""
+    if listed.kind != "remote" or offered is None:
+        return ()
+    return tuple(kind for kind in OFFERABLE if kind in offered and kind not in listed.enable)
+
+
+def listed_next(
+    listed: Listed, offered: Sequence[str] = (), *, managed: bool = False
+) -> tuple[NextStep, ...]:
     """A row's steps (K.1): connect, else review its tools, else review them again, and for an
     onboarded credential register a new client (OPS-3). The page's button does the first; each
-    command is the CLI's way to the same."""
+    command is the CLI's way to the same. A row whose upstream ``offered`` kinds (from
+    :func:`offered_not_served`) ends with J12's way to serve them, text only: a host's edit in
+    the ``managed`` mode or the policy's, which the page can't take, adding ``completions`` only
+    where ``check`` takes them (``serve_text``, A.2 row 5c)."""
     review = ("zoeymcp", "review", listed.name, "--via", "vault")
     if listed.state == "needs_connect" and listed.credential is not None:
         login = ("zoeymcp", "login", listed.credential)
-        return (NextStep("connect", "Connect", login, "exec"),)
-    if listed.state == "needs_review":
-        return (NextStep("review", "Review tools", review, "exec"),)
-    steps = [NextStep("review", "Review again", review, "exec")]
-    if listed.resource is not None:
-        steps.append(onboard_again(listed.resource))
+        steps = [NextStep("connect", "Connect", login, "exec")]
+    elif listed.state == "needs_review":
+        steps = [NextStep("review", "Review tools", review, "exec")]
+    else:
+        steps = [NextStep("review", "Review again", review, "exec")]
+        if listed.resource is not None:
+            steps.append(onboard_again(listed.resource))
+    if offered:
+        templates = bool(listed.resources.templates.include)
+        text = serve_text(listed.name, offered, listed.enable, templates=templates, managed=managed)
+        steps.append(NextStep("enable_kinds", text[0].upper() + text[1:]))
     return tuple(steps)
 
 

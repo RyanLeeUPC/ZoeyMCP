@@ -42,15 +42,16 @@ from starlette.types import Receive, Scope, Send
 from ..common import canonical, control
 from ..common.policy.attention import Attention, attention, combined
 from ..common.policy.schema import GatewayLimits
-from ..common.policy.view import ViewToolkitServer
+from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from . import logs, review
 from .app import GatewayApp
 from .defstore import DefinitionStore
 from .ledger import Ledger
 from .marks import DriftMarks, MarksError
+from .pins import Entries, enabled_kinds, entries
 from .policyclient import Witness
 from .toolkits import Loaded, Toolkits
-from .upstream import UpstreamPool
+from .upstream import Connection, UpstreamPool
 from .vaultlink import (
     KeySource,
     Link,
@@ -182,9 +183,13 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
     the server's latest listings (M6 design J.5), ``None`` before any listing; ``blocked`` is
     whether ``on_drift: fail`` stopped any of its connections (``pins.evaluate``). ``offered`` is
     what a remote upstream advertises beyond tools, ``None`` before a connection has one
-    (fold-in 3.8). With ``pins``, each server's ``unreviewed_pins`` is the pin each of its
-    unreviewed tools is listed at, for the status report (:func:`pushed_status`). ``policy_mode``
-    is the mode the vault last stated beside the view (M6 design K.3)."""
+    (fold-in 3.8). A remote server whose view enables prompts or resources also has ``kinds``:
+    for each kind it enables (``pins.enabled_kinds``), the attention decision over that kind's
+    listings, its block and its marks, combined across connections as the tools' is (M6 design
+    K.1, Y29), names only; a server that enables neither has no ``kinds``. With ``pins``, each
+    server's ``unreviewed_pins`` is the pin each of its unreviewed tools is listed at, for the
+    status report (:func:`pushed_status`). ``policy_mode`` is the mode the vault last stated
+    beside the view (M6 design K.3)."""
     snapshot = app.policy.snapshot
     servers: dict[str, Any] = {}
     if snapshot is not None:
@@ -234,6 +239,9 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
                 ),
                 "listed_s_ago": round(app.clock() - max(verified), 1) if verified else None,
             }
+            kinds = _kinds_status(app, name, server, connections)
+            if kinds:
+                servers[name]["kinds"] = kinds
             if pins:
                 servers[name]["unreviewed_pins"] = _pins_of(decided, listed)
     return {
@@ -243,6 +251,36 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
         "servers": servers,
         "policy_mode": app.policy.mode,
     }
+
+
+@dataclass(frozen=True)
+class _KindPolicy:
+    """One kind's block of a remote server (``pins.entries``), as the attention decision reads
+    a server's tools: its ``include`` in ``tools``, its pins and its declines."""
+
+    tools: Entries
+    review: Mapping[str, str]
+    declined: Mapping[str, str]
+
+
+def _kinds_status(
+    app: GatewayApp, name: str, server: ViewRemoteServer, connections: list[Connection]
+) -> dict[str, dict[str, list[str]]]:
+    """Each kind beyond tools the server enables, with the attention decision over its
+    connections' latest listings of it (empty lists before any), in ``pins.KINDS`` order."""
+    found: dict[str, dict[str, list[str]]] = {}
+    for kind in enabled_kinds(server.enable):
+        block = entries(server, kind)
+        policy = _KindPolicy(block, block.review, block.declined)
+        marks = app.pool.marks.for_server(name, kind)
+        decided = [
+            attention(listing.listed, policy, marks)
+            for connection in connections
+            if connection.state.evaluation is not None
+            and (listing := connection.state.evaluation.kinds.get(kind)) is not None
+        ]
+        found[kind] = combined(decided).as_dict()
+    return found
 
 
 def _toolkit_status(

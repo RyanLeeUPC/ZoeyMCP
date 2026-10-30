@@ -15,9 +15,17 @@ reaches that path and nothing else:
 :func:`content` is the report: ``{"v": 1, "view", "started", "servers", "witness",
 "deployments_seen", "policy_mode"}``, per server its kind, state, era, whether ``on_drift: fail``
 blocked it, counts, ``offered`` and the attention decision's lists (``drift``, ``marked``,
-``unreviewed`` with each tool's pin, ``declined_changed``, ``missing``), plus ``invalid``. Never a
-definition, a token hash or a client name, every list at most ``max_tools_per_server`` long, and the
-two tool counts at most that limit's own ceiling. The upstream reports invalid and duplicate tools
+``unreviewed`` with each tool's pin, ``declined_changed``, ``missing``), plus ``invalid``. A
+server that enables prompts or resources also has ``kinds``: per kind it enables, the attention
+decision for that kind in its plain form (``drifted``, ``marked``, ``new``, ``changed_declined``,
+``missing``), names only and no pins; a server that enables neither, and every toolkit, has no
+``kinds``, so its entry is as before (M6 design K.1, D-216). A kind's names can be URIs of up to
+2,048 characters, where a tool's are 128, so ``kinds`` alone never takes a report over
+:data:`MAX_BYTES`: its lists are cut from the end until it fits (:func:`_fitted`), first the names
+health and Home only count (``new``, ``changed_declined``), then those they name, each list
+keeping one name while any other can go, so every finding still fires. Never a definition, a
+token hash or a client name, every list at most ``max_tools_per_server`` long, and the two tool
+counts at most that limit's own ceiling. The upstream reports invalid and duplicate tools
 under their raw names, which often aren't tool names: only names that are go in ``invalid``, and the
 rest are counted (``invalid_unnamed``, ``duplicate_unnamed``; T-7). ``policy_mode`` is the mode
 the vault last stated beside the view (K.3), as the status names it. ``witness`` is the restore
@@ -63,7 +71,7 @@ def content(status: Mapping[str, Any], *, started: int, max_tools: int) -> dict[
     if view is None:
         return None
     servers = {name: _server(entry, max_tools) for name, entry in sorted(status["servers"].items())}
-    return {
+    document = {
         "v": 1,
         "view": view,
         "started": started,
@@ -72,6 +80,37 @@ def content(status: Mapping[str, Any], *, started: int, max_tools: int) -> dict[
         "deployments_seen": status.get("deployments_seen", 0),
         "policy_mode": status.get("policy_mode", "unknown"),
     }
+    return _fitted(document)
+
+
+# The order a kind's lists give up names in when the report is over MAX_BYTES (D-216): those
+# health and Home only count first, then the included names they name.
+CUT_ORDER: Final = ("new", "changed_declined", "missing", "marked", "drifted")
+
+
+def _fitted(document: dict[str, Any]) -> dict[str, Any]:
+    """``document`` with its servers' ``kinds`` cut until it is at most :data:`MAX_BYTES`, or
+    until they hold no name (the tools' lists are never cut): in :data:`CUT_ORDER`, each time
+    the last name of the list of that member with the most names across servers (the first
+    such, by server name), every list kept to one name before any is emptied."""
+    over = len(encoded(document)) - MAX_BYTES
+    lists = [
+        (member, decided[member])
+        for entry in document["servers"].values()
+        for decided in entry.get("kinds", {}).values()
+        for member in CUT_ORDER
+    ]
+    for keep in (1, 0):
+        for member in CUT_ORDER:
+            named = [names for each, names in lists if each == member]
+            while over > 0 and named:
+                longest = max(named, key=len)
+                if len(longest) <= keep:
+                    break
+                name = longest.pop()
+                # What dropping it saves: the name, quoted, and its comma while another is left.
+                over -= len(json.dumps(name, ensure_ascii=True)) + bool(longest)
+    return document
 
 
 def _server(entry: Mapping[str, Any], max_tools: int) -> dict[str, Any]:
@@ -84,7 +123,7 @@ def _server(entry: Mapping[str, Any], max_tools: int) -> dict[str, Any]:
     def capped(names: Any) -> list[str]:
         return sorted(set(names))[:max_tools]
 
-    return {
+    sent: dict[str, Any] = {
         "kind": entry["kind"],
         "state": [state] if isinstance(state, str) else list(state),
         "era": entry.get("era"),
@@ -101,6 +140,13 @@ def _server(entry: Mapping[str, Any], max_tools: int) -> dict[str, Any]:
         "duplicate_unnamed": min(_unnamed(reports.get("duplicate", ())), max_tools),
         "offered": entry.get("offered"),
     }
+    kinds: Mapping[str, Mapping[str, Any]] = entry.get("kinds") or {}
+    if kinds:  # only a server that enables a kind beyond tools: the rest as before, byte for byte
+        sent["kinds"] = {
+            kind: {member: capped(names) for member, names in loaded(lists).as_dict().items()}
+            for kind, lists in kinds.items()
+        }
+    return sent
 
 
 def _unnamed(names: Any) -> int:

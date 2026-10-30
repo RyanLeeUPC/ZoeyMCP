@@ -15,11 +15,17 @@
   gateway process pushes again within the minute (FM-20);
 - the report's leak sweep (O.6, Y13): on a policy holding the secret-heavy policy's values, the
   report, what the vault keeps of it and the gateway's ``GET /status`` hold none of them, no
-  token or its hash, no client name and no definition; health holds none the policy view hides.
+  token or its hash, no client name and no definition; health holds none the policy view hides;
+- prompts and resources (D-216): a server enabling them has ``kinds`` in the gateway's status,
+  each kind's attention decision over its connections' listings, and in the report, each list
+  capped; a tools-only server's entry and every toolkit's are as before, with no ``kinds``;
+  ``kinds`` carries names alone, no pin and no definition; and long URIs never take the report
+  over its size, the kinds' lists cut in their order.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -38,9 +44,20 @@ import anyio
 import httpx
 import httpx2
 import pytest
+from mcp.types import Prompt, Resource, ResourceTemplate
 
 from tests.fakes.harness import serve
-from tests.fakes.mcp_server import McpFake, base_tools
+from tests.fakes.mcp_server import (
+    ASSISTANT_PROMPT,
+    FIXED,
+    HIDDEN_PROMPT,
+    TEMPLATE,
+    McpFake,
+    base_prompts,
+    base_resources,
+    base_templates,
+    base_tools,
+)
 from tests.gateway.rig import (
     CLIENTS,
     KEYS,
@@ -54,6 +71,7 @@ from tests.gateway.rig import (
     token_for,
     until,
 )
+from tests.gateway.test_upstream_kinds import FIXED_PIN, PROMPT_PIN, TEMPLATE_PIN, with_kinds
 from tests.unit.test_leak_sweep import (
     LITERAL_TOKEN,
     POLICY_VIEW_HIDES,
@@ -64,10 +82,16 @@ from tests.unit.test_peer import my_uid, serve_link
 from zoeymcp.common import logs
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.attention import Attention
-from zoeymcp.common.policy.schema import hash_token
-from zoeymcp.common.policy.view import build_view, dump_view
-from zoeymcp.gateway import statuspush, witness
-from zoeymcp.gateway.server import pushed_status
+from zoeymcp.common.policy.schema import GatewayLimits, hash_token
+from zoeymcp.common.policy.view import (
+    GatewayView,
+    ViewRemoteServer,
+    build_view,
+    dump_view,
+    view_digest,
+)
+from zoeymcp.gateway import pins, statuspush, witness
+from zoeymcp.gateway.server import pushed_status, status
 from zoeymcp.gateway.statuspush import DEBOUNCE, EVERY, StatusPusher, content
 from zoeymcp.gateway.vaultlink import (
     STATUS_MAX_ANSWER_BYTES,
@@ -363,6 +387,301 @@ def test_the_report_names_the_mode_the_gateway_last_saw() -> None:
     document = content(status_of(), started=1, max_tools=10)
     assert document is not None
     assert document["policy_mode"] == "unknown"
+
+
+# --- prompts and resources (D-216) -------------------------------------------------------------
+
+WRONG = "sha256:" + "0" * 64
+KIND_ORDER = ["prompt", "resource_template", "resource"]
+
+
+def test_a_server_enabling_kinds_sends_each_kinds_lists_capped() -> None:
+    """Each kind's five lists go as the gateway decided them, each sorted and capped at
+    max_tools_per_server, beside the tools' own; nothing else of the kind goes."""
+    many = [f"p{n}" for n in range(5)]
+    kinds = {
+        "prompt": Attention(new=tuple(reversed(many)), drifted=("summarize",)).as_dict(),
+        "resource_template": Attention(marked=(TEMPLATE,)).as_dict(),
+        "resource": Attention(
+            missing=(FIXED,), changed_declined=("notes://b", "notes://a")
+        ).as_dict(),
+    }
+    tools = Attention(drifted=("echo",)).as_dict()
+    document = content(
+        status_of(notes=remote(kinds=kinds, attention=tools)), started=1, max_tools=3
+    )
+    assert document is not None
+    entry = document["servers"]["notes"]
+    assert entry["kinds"] == {
+        "prompt": {
+            "drifted": ["summarize"],
+            "marked": [],
+            "new": ["p0", "p1", "p2"],
+            "changed_declined": [],
+            "missing": [],
+        },
+        "resource_template": {
+            "drifted": [],
+            "marked": [TEMPLATE],
+            "new": [],
+            "changed_declined": [],
+            "missing": [],
+        },
+        "resource": {
+            "drifted": [],
+            "marked": [],
+            "new": [],
+            "changed_declined": ["notes://a", "notes://b"],
+            "missing": [FIXED],
+        },
+    }
+    assert entry["drift"] == ["echo"]
+    plain = content(status_of(notes=remote()), started=1, max_tools=3)
+    assert plain is not None
+    assert list(entry) == [*plain["servers"]["notes"], "kinds"]
+
+
+def test_a_tools_only_entry_is_todays() -> None:
+    """A server that enables nothing beyond tools sends no ``kinds`` (an empty one is none), so
+    its entry, and the report's version, are as before."""
+    plain = content(status_of(notes=remote()), started=1, max_tools=3)
+    empty = content(status_of(notes=remote(kinds={})), started=1, max_tools=3)
+    assert plain is not None
+    assert plain == empty
+    assert "kinds" not in plain["servers"]["notes"]
+    assert plain["v"] == 1
+
+
+def long_uri(n: int) -> str:
+    """A fixed resource's URI near the policy's 2,048 characters."""
+    return f"notes://notes/{n:04d}/" + "x" * 2020
+
+
+def test_long_uris_never_take_the_report_over_its_size() -> None:
+    """A server listing max_tools_per_server fixed resources of near 2,048 characters, none
+    reviewed, would be about 1 MB of ``new``: its ``kinds`` are cut until the report fits, the
+    names nobody reviewed going first, so the other servers' entries, its tools and its
+    included names are as they were."""
+    uris = [long_uri(n) for n in range(512)]
+    kinds = {
+        "resource": Attention(new=tuple(uris), marked=(uris[0],), missing=(FIXED,)).as_dict(),
+        "prompt": Attention(new=("p",)).as_dict(),
+    }
+    other = {"prompt": Attention(drifted=("summarize",), new=("q",)).as_dict()}
+    tools = Attention(drifted=("echo",)).as_dict()
+    found = status_of(
+        big=remote(kinds=kinds, attention=tools), notes=remote(kinds=other, attention=tools)
+    )
+    document = content(found, started=1, max_tools=512)
+    assert document is not None
+    assert len(statuspush.encoded(document)) <= statuspush.MAX_BYTES
+    alone = content(status_of(notes=remote(kinds=other, attention=tools)), started=1, max_tools=512)
+    assert alone is not None
+    assert document["servers"]["notes"] == alone["servers"]["notes"]
+    big = document["servers"]["big"]
+    assert big["drift"] == ["echo"]
+    assert (big["kinds"]["resource"]["marked"], big["kinds"]["resource"]["missing"]) == (
+        [uris[0]],
+        [FIXED],
+    )
+    assert big["kinds"]["prompt"]["new"] == ["p"]
+    kept = big["kinds"]["resource"]["new"]
+    assert 0 < len(kept) < 512
+    assert kept == uris[: len(kept)]  # the last cut first
+
+
+def cut_status() -> dict[str, Any]:
+    """Two servers' kinds: ``a``'s resources with four new, two declined at another pin and two
+    marked; ``b``'s prompts with five new."""
+    resources = Attention(
+        new=("n1", "n2", "n3", "n4"), changed_declined=("c1", "c2"), marked=("m1", "m2")
+    )
+    prompts = Attention(new=("q1", "q2", "q3", "q4", "q5"))
+    return status_of(
+        a=remote(kinds={"resource": resources.as_dict()}),
+        b=remote(kinds={"prompt": prompts.as_dict()}),
+    )
+
+
+def kinds_cut(document: dict[str, Any] | None) -> dict[str, dict[str, list[str]]]:
+    assert document is not None
+    return {
+        name: {member: names for member, names in entry["kinds"].popitem()[1].items() if names}
+        for name, entry in document["servers"].items()
+    }
+
+
+def test_the_kinds_are_cut_in_their_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exactly what the size needs, from the end: the longest ``new`` first, each list kept to
+    one name, then ``changed_declined``, and only then any list emptied; the tools are never
+    cut."""
+    full = content(cut_status(), started=1, max_tools=10)
+    assert full is not None
+    size = len(statuspush.encoded(full))
+    monkeypatch.setattr(statuspush, "MAX_BYTES", size)
+    assert content(cut_status(), started=1, max_tools=10) == full
+    monkeypatch.setattr(statuspush, "MAX_BYTES", size - 1)
+    assert kinds_cut(content(cut_status(), started=1, max_tools=10)) == {
+        "a": {
+            "new": ["n1", "n2", "n3", "n4"],
+            "changed_declined": ["c1", "c2"],
+            "marked": ["m1", "m2"],
+        },
+        "b": {"new": ["q1", "q2", "q3", "q4"]},
+    }
+    one_new = copy.deepcopy(full)
+    for entry in one_new["servers"].values():
+        for decided in entry["kinds"].values():
+            del decided["new"][1:]
+    monkeypatch.setattr(statuspush, "MAX_BYTES", len(statuspush.encoded(one_new)))
+    assert content(cut_status(), started=1, max_tools=10) == one_new
+    monkeypatch.setattr(statuspush, "MAX_BYTES", len(statuspush.encoded(one_new)) - 1)
+    assert kinds_cut(content(cut_status(), started=1, max_tools=10)) == {
+        "a": {"new": ["n1"], "changed_declined": ["c1"], "marked": ["m1", "m2"]},
+        "b": {"new": ["q1"]},
+    }
+    one_each = copy.deepcopy(one_new)
+    for entry in one_each["servers"].values():
+        for decided in entry["kinds"].values():
+            for names in decided.values():
+                del names[1:]
+    monkeypatch.setattr(statuspush, "MAX_BYTES", len(statuspush.encoded(one_each)) - 1)
+    assert kinds_cut(content(cut_status(), started=1, max_tools=10)) == {
+        "a": {"changed_declined": ["c1"], "marked": ["m1"]},
+        "b": {"new": ["q1"]},
+    }
+    monkeypatch.setattr(statuspush, "MAX_BYTES", 0)
+    emptied = content(cut_status(), started=1, max_tools=10)
+    assert kinds_cut(emptied) == {"a": {}, "b": {}}
+    assert emptied is not None
+    assert {name: entry["drift"] for name, entry in emptied["servers"].items()} == {
+        "a": [],
+        "b": [],
+    }
+
+
+def kinds_app(server: ViewRemoteServer, *evaluations: pins.Evaluation | None) -> Any:
+    """A gateway app holding ``server`` (as ``notes``) and the tools-only ``plain``, with one
+    connection of ``notes`` per evaluation (None: not listed yet), and the fixed resource's
+    mark."""
+    policy = Policy.model_validate(raw_policy("http://127.0.0.1:9", include=[], review={}))
+    view = build_view(policy)
+    assert view.gateway is not None
+    plain = view.gateway.servers[SERVER].model_copy()
+    gateway = view.gateway.model_copy(update={"servers": {SERVER: server, "plain": plain}})
+    held = {"resource": frozenset({(FIXED, FIXED_PIN)})}
+
+    def connection(found: pins.Evaluation | None) -> SimpleNamespace:
+        state = SimpleNamespace(
+            phase=SimpleNamespace(value="ready"), verified_at=None, evaluation=found
+        )
+        return SimpleNamespace(server=SERVER, state=state, client=None)
+
+    def for_server(name: str, kind: str = "tool") -> frozenset[tuple[str, str]]:
+        return held.get(kind, frozenset())
+
+    built = GatewayView(v=view.v, digest=view_digest(gateway), gateway=gateway)
+    snapshot = SimpleNamespace(view=built)
+    connections = [connection(found) for found in evaluations]
+    return SimpleNamespace(
+        policy=SimpleNamespace(
+            snapshot=snapshot, fresh=lambda: snapshot, mode="declarative", witness=None
+        ),
+        pool=SimpleNamespace(
+            connections=lambda: connections,
+            marks=SimpleNamespace(for_server=for_server),
+            eras={},
+        ),
+        clock=lambda: 10.0,
+    )
+
+
+def listed_kinds(server: ViewRemoteServer, prompts: int = 2) -> pins.Evaluation:
+    """One listing of the fake's prompts (the first ``prompts`` of them), template and fixed
+    resource, evaluated with the fixed resource's mark."""
+    listings: dict[pins.DefinitionKind, pins.KindListing] = {
+        "prompt": pins.KindListing([Prompt.model_validate(p) for p in base_prompts()[:prompts]]),
+        "resource_template": pins.KindListing(
+            [ResourceTemplate.model_validate(t) for t in base_templates()]
+        ),
+        "resource": pins.KindListing([Resource.model_validate(r) for r in base_resources()]),
+    }
+    marks: dict[pins.DefinitionKind, frozenset[pins.Mark]] = {
+        "resource": frozenset({(FIXED, FIXED_PIN)})
+    }
+    return pins.evaluate_server([], listings, server, marks, GatewayLimits())
+
+
+def kinds_server() -> ViewRemoteServer:
+    """``notes`` enabling prompts and resources: the first prompt at its pin, the template at
+    a pin it isn't listed at (drifted), the fixed resource at its pin (marked by the app)."""
+    policy = Policy.model_validate(raw_policy("http://127.0.0.1:9", include=[], review={}))
+    view = build_view(policy)
+    assert view.gateway is not None
+    server = view.gateway.servers[SERVER]
+    assert isinstance(server, ViewRemoteServer)
+    return with_kinds(
+        server,
+        prompts={"include": [ASSISTANT_PROMPT], "review": {ASSISTANT_PROMPT: PROMPT_PIN}},
+        templates={"include": [TEMPLATE], "review": {TEMPLATE: WRONG}},
+        fixed={"include": [FIXED], "review": {FIXED: FIXED_PIN}},
+    )
+
+
+def test_the_gateways_status_has_each_kinds_decision() -> None:
+    """``status``'s ``kinds``: per enabled kind, the one attention decision over that kind's
+    listings, its block and its marks, combined across connections as the tools' is (Y29); a
+    connection not listed yet adds nothing; the tools-only server has none."""
+    server = kinds_server()
+    found = status(kinds_app(server, listed_kinds(server), None, listed_kinds(server, prompts=1)))
+    notes = found["servers"][SERVER]
+    assert notes["kinds"] == {
+        "prompt": Attention(new=(HIDDEN_PROMPT,)).as_dict(),
+        "resource_template": Attention(drifted=(TEMPLATE,)).as_dict(),
+        "resource": Attention(marked=(FIXED,)).as_dict(),
+    }
+    assert list(notes["kinds"]) == KIND_ORDER
+    assert notes["attention"] == Attention().as_dict()  # the tools' decision is its own
+    assert "kinds" not in found["servers"]["plain"]
+    # Only what the server enables: prompts alone.
+    prompts = with_kinds(
+        server,
+        enable=["prompts"],
+        prompts={"include": [ASSISTANT_PROMPT], "review": {ASSISTANT_PROMPT: PROMPT_PIN}},
+    )
+    alone = status(kinds_app(prompts, listed_kinds(prompts)))
+    assert alone["servers"][SERVER]["kinds"] == {
+        "prompt": Attention(new=(HIDDEN_PROMPT,)).as_dict()
+    }
+
+
+def test_before_any_listing_each_kind_is_quiet() -> None:
+    server = kinds_server()
+    quiet = Attention().as_dict()
+    for app in (kinds_app(server, None), kinds_app(server)):
+        assert status(app)["servers"][SERVER]["kinds"] == dict.fromkeys(KIND_ORDER, quiet)
+
+
+def test_the_kinds_carry_names_alone() -> None:
+    """The leak sweep over ``kinds`` (O.6, Y13): the report a server enabling every kind pushes
+    names its prompts, templates and resources, and holds none of their pins, the policy's or
+    the listed ones, nor any member of a definition but its name."""
+    server = kinds_server()
+    pushed = content(
+        pushed_status(kinds_app(server, listed_kinds(server))), started=1, max_tools=10
+    )
+    assert pushed is not None
+    kinds = statuspush.encoded(pushed["servers"][SERVER]["kinds"]).decode()
+    for name in (HIDDEN_PROMPT, TEMPLATE, FIXED):
+        assert name in kinds
+    whole = statuspush.encoded(pushed).decode()
+    assert "sha256:" not in kinds
+    for pin in (PROMPT_PIN, TEMPLATE_PIN, FIXED_PIN, WRONG):
+        assert pin not in whole
+    for wire in [*base_prompts(), *base_templates(), *base_resources()]:
+        for member, value in wire.items():
+            if member not in ("name", "uri", "uriTemplate") and isinstance(value, str):
+                assert value not in whole, member
 
 
 # --- the pusher against a scripted vault --------------------------------------------------------

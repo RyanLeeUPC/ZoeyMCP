@@ -19,9 +19,9 @@ gateway, which writes none of them, still reads (CR-6).
 A remote server that enables prompts or resources (M6 design L.4, L.7) is reported with entries of
 those kinds beside its tools: ``kind`` is ``prompt``, ``resource_template`` or ``resource``, the
 name is the prompt's name, the template or the URI, and each is pinned under its kind's tag. The
-policy block then carries the server's ``prompts`` and ``resources`` blocks, and ``listings`` says
-how each kind's walk went: why it failed, or the finding that a review's ``resources/list`` was
-cut at a cap. Each kind is counted against the caps on its own.
+policy block then carries the server's ``enable`` (J12) and its ``prompts`` and ``resources``
+blocks, and ``listings`` says how each kind's walk went: why it failed, or the finding that a
+review's ``resources/list`` was cut at a cap. Each kind is counted against the caps on its own.
 
 :func:`read` takes one report under the running limits: the model, the caps that follow
 ``gateway.limits`` (GR-30), then the integrity check (fold-in C25, X11), which recomputes every
@@ -46,7 +46,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
@@ -55,6 +55,7 @@ from .pinhash import KEY_MEMBERS, KINDS, DefinitionKind, ProjectionError, pin_fo
 from .policy import fields
 from .policy.findings import format_location
 from .policy.schema import (
+    Capability,
     GatewayLimits,
     ModulePath,
     Name,
@@ -218,7 +219,9 @@ class ReviewedPolicy(_Model):
     # map isn't bounded by the tools; the body cap bounds it.
     review: dict[ToolName, Pin] = {}
     declined: dict[ToolName, Pin] = {}
-    # A remote server's prompts and resources blocks, when it enables the kind (L.4).
+    # A remote server's ``enable``, when it lists any (J12; none from an older gateway), and its
+    # prompts and resources blocks, when it enables the kind (L.4).
+    enable: Annotated[list[Capability], Field(max_length=len(get_args(Capability)))] | None = None
     prompts: PromptsPolicy = PromptsPolicy()
     resources: ResourcesPolicy = ResourcesPolicy()
 

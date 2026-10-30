@@ -14,7 +14,11 @@ prompt's argument and is refused the rest; a prompt changed after review is hidd
 and a legacy session is told. Managed (J12's second half, as processes like S17): an export
 with only ``enable`` added, imported with the vault stopped, serves no prompt; the portal's
 review shows the kinds' rows revealed, and its Save (``policy.save``, one passkey) includes them
-at their verified pins, which the gateway serves.
+at their verified pins, which the gateway serves. The server's row (D-216): before ``enable``
+names a kind, the MCP servers row says what the upstream offers and isn't served, with J12's
+way to serve it in the mode, and ``review notes`` says so too; once a prompt and a template
+drift, the status report the gateway pushes carries them, health's ``drift_marked`` names each
+and Home's list has one item for each, with **Review**.
 Every declarative test ends with S12's sweeps (``test_mcp_shapes.sweep``).
 """
 
@@ -50,14 +54,17 @@ from tests.fakes.mcp_server import (
     base_prompts,
     base_tools,
 )
-from tests.gateway.rig import Running, agent, pin_of_fake, until
+from tests.gateway.rig import CLIENTS, Running, agent, pin_of_fake, until
 from tests.gateway.test_upstream_kinds import FIXED_PIN, PROMPT_PIN, TEMPLATE_PIN, kind_pin
 from tests.portal.flows import enrol, login, redeem
 from zoeymcp.common.policy.schema import RemoteServer
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import upstream as upstream_module
+from zoeymcp.portal import app as portal_app
+from zoeymcp.vault.admin import HealthReader
 from zoeymcp.vault.managed import head_policy
+from zoeymcp.vault.onboarding import listed_server
 
 from .conftest import serve_tls
 from .gateway import NO_PINS, SERVER, GatewayDeployment, server_text
@@ -385,6 +392,108 @@ async def test_s18_a_changed_prompt_is_hidden_marked_and_told(
     assert line.endswith("changed: description    hidden, marked"), out
 
 
+# --- the server's row, health and Home per kind (D-216) ----------------------------------------
+
+OFFERED_TEXT = (
+    "notes offers prompts, resources and completions, not served: add enable: [prompts, "
+    "resources, completions] to notes in your policy and reload"
+)
+
+
+def vault_reads(gateway: GatewayDeployment) -> tuple[dict[str, Any], dict[str, Any]]:
+    """What the vault makes of the gateway's latest status report: the health report, and
+    notes's row on the MCP servers page as the portal builds it from that report."""
+    vault = gateway.vault
+    reader = HealthReader(
+        vault.store, lambda: vault.app.policy, gateway_status=vault.app.gateway_status
+    )
+    report: dict[str, Any] = vault.call(reader.report)
+    listed = listed_server(vault.app.policy, SERVER)
+    assert listed is not None
+    row = portal_app._server_row(listed, None, portal_app._offered(report).get(SERVER))
+    return report, row
+
+
+def reported_kinds(gateway: GatewayDeployment) -> dict[str, Any]:
+    """The kinds of notes in the vault's latest status report, as their plain lists."""
+    report = gateway.vault.app.gateway_status().report
+    entry = None if report is None else report.servers.get(SERVER)
+    return {} if entry is None else {k: v.as_dict() for k, v in entry.kinds.items()}
+
+
+async def test_s18_the_row_health_and_home_name_each_kind(tmp_path: Path, ca: ProviderCA) -> None:
+    """J12's row and D-216, declarative: before ``enable``, notes's row and ``review notes`` say
+    the upstream offers prompts, resources and completions that aren't served, with the
+    declarative way to serve them; enabled and included, nothing is left out; then a prompt and
+    the template change (a legacy upstream lists again for the second client's connection),
+    and the gateway's status, health's ``drift_marked`` and Home's list name each, Home's items
+    with **Review**."""
+    fake = McpFake(key=KEY, key_header="x-api-key", mode="legacy", prompts=True, resources=True)
+    blocks = {
+        "prompts": {"include": [ASSISTANT_PROMPT], "review": {ASSISTANT_PROMPT: PROMPT_PIN}},
+        "resources": {"templates": {"include": [TEMPLATE], "review": {TEMPLATE: TEMPLATE_PIN}}},
+    }
+    with (
+        deployed(tmp_path, ca, fake, status_push=True) as gateway,
+        gateway.running() as running,
+        anyio.fail_after(WHOLE),
+    ):
+        async with agent(running, CLIENTS[0]) as client:
+            await client.list_tools()
+        await until(lambda: "offered" in str(vault_reads(gateway)[0]["gateway"]["servers"]), 20)
+        _, row = vault_reads(gateway)
+        assert row["offered_not_served"] == ["prompts", "resources", "completions"]
+        assert row["next"][-1] == {
+            "do": "enable_kinds",
+            "label": "Add enable: [prompts, resources, completions] to notes in your policy "
+            "and reload",
+        }
+        code, out, _ = gateway.cli(running, "review", SERVER)
+        assert OFFERED_TEXT in out.splitlines(), out
+        reload(gateway, with_kinds(fake, blocks))
+        await until(lambda: (server := in_view(running)) is not None and server.enable == KINDS)
+        assert vault_reads(gateway)[1]["offered_not_served"] == []
+        async with agent(running, CLIENTS[0]) as client:
+            assert [p.name for p in (await client.list_prompts()).prompts] == [ASSISTANT_PROMPT]
+        fake.change_kind("prompt")
+        fake.change_kind("resource_template")
+        async with agent(running, CLIENTS[1]) as client:
+            assert (await client.list_prompts()).prompts == []  # hidden, marked
+        drifted = {
+            "prompt": [ASSISTANT_PROMPT],
+            "resource_template": [TEMPLATE],
+        }
+        await until(
+            lambda: (
+                {k: v["drifted"] for k, v in reported_kinds(gateway).items()}
+                == {**drifted, "resource": []}
+            ),
+            20,
+        )
+        report, row = vault_reads(gateway)
+        code, out, _ = gateway.cli(running, "review", SERVER)
+    assert row["offered_not_served"] == []
+    assert code == 1, out  # the drift needs the operator
+    assert not any("not served" in line for line in out.splitlines()), out
+    # The first client's connection still lists the old definitions, which the new marks
+    # hide: the decision combines both connections (Y29), as for tools.
+    findings = [f["text"] for f in report["gateway"]["findings"] if f["code"] == "drift_marked"]
+    assert [text.split(";")[0] for text in findings] == [
+        f"notes: included prompts 1 changed since the review ({ASSISTANT_PROMPT})",
+        f"notes: included resource templates 1 changed since the review ({TEMPLATE})",
+    ]
+    items = portal_app.attention_items(report)["items"]
+    review = {"kind": "review", "server": SERVER}
+    seen = [(item["subject"], item["text_shown"], item["action"]) for item in items]
+    assert ("prompt", "notes changed 1 included prompt since the review", review) in seen
+    assert (
+        "resource_template",
+        "notes changed 1 included resource template since the review",
+        review,
+    ) in seen
+    assert {item["subject"] for item in items} == {"prompt", "resource_template"}
+
+
 # --- J12 in managed mode (processes, as S17) ----------------------------------------------------
 
 
@@ -406,6 +515,20 @@ def kinds_seen(port: int) -> tuple[list[str], list[str]] | None:
         return anyio.run(walked)
     except Exception:  # the SDK's errors arrive in exception groups
         return None
+
+
+def tools_listed(port: int) -> None:
+    """agent1 lists notes's tools through the gateway on ``port``, so the gateway connects to the
+    upstream and sees what it offers (its status's ``offered``)."""
+
+    async def listed() -> None:
+        headers = {"authorization": f"Bearer {AGENT_TOKEN}"}
+        async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0)) as http:
+            url = f"http://127.0.0.1:{port}/s/{SERVER}/mcp"
+            async with Client(streamable_http_client(url, http_client=http), cache=None) as agent:
+                await agent.list_tools()
+
+    anyio.run(listed)
 
 
 def saved_with_kinds(
@@ -446,6 +569,20 @@ def saved_with_kinds(
     return str(draft["kind"]), read, answer
 
 
+def row_of(page: Page) -> dict[str, Any]:
+    """notes's row on the MCP servers page."""
+    answer = page.fetch("GET", "/api/servers")
+    assert answer.status_code == 200, answer.text
+    [row] = [row for row in answer.json()["servers"] if row.get("server") == SERVER]
+    found: dict[str, Any] = row
+    return found
+
+
+def offered_row(page: Page) -> list[str]:
+    found: list[str] = row_of(page)["offered_not_served"]
+    return found
+
+
 def test_j12_managed(tmp_path: Path, ca: ProviderCA) -> None:
     """J12 managed: ``enable`` is the host's, so an export with only ``enable: [prompts,
     resources]`` added is imported with the vault stopped (revision 2) and serves no prompt, none
@@ -471,6 +608,15 @@ def test_j12_managed(tmp_path: Path, ca: ProviderCA) -> None:
             assert enrol(page, passkey).status_code == 200
             wait_for(lambda: kinds_seen(port) is not None, "notes served", gateway, running)
             assert kinds_seen(port) == (["tools"], [])
+            # J12's row (D-216): what the upstream offers and isn't served, the managed way.
+            assert login(page, passkey).status_code == 200
+            tools_listed(port)
+            every = ["prompts", "resources", "completions"]
+            wait_for(lambda: offered_row(page) == every, "the row's offer", gateway, running)
+            assert row_of(page)["next"][-1] == {
+                "do": "enable_kinds",
+                "label": "Export, add enable: [prompts, resources, completions] to notes, import",
+            }
             made.stop()
 
             def enable(data: dict[str, Any]) -> None:
@@ -489,6 +635,11 @@ def test_j12_managed(tmp_path: Path, ca: ProviderCA) -> None:
             deployment = deployment_of(made)
             wait_for(lambda: seen_by(state_of_gateway) == {deployment: 2}, "revision 2", gateway)
             assert kinds_seen(port) == (["tools"], [])
+            tools_listed(port)
+            wait_for(lambda: offered_row(page) == ["completions"], "completions", gateway, running)
+            assert row_of(page)["next"][-1]["label"] == (
+                "Export, add enable: [completions] to notes, import"
+            )
             kind, read, answer = saved_with_kinds(page, passkey, tools, gateway, running)
             assert (kind, answer["revision"]) == ("policy.save", 3)
             rows = {row["name_shown"]: row for row in read["tools"] if row["kind"] != "tool"}

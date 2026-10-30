@@ -161,7 +161,7 @@ import asyncio
 import importlib.resources
 import json
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
@@ -215,6 +215,7 @@ from ..vault.onboarding import (
     listed_server,
     listed_servers,
     managed_next,
+    offered_not_served,
     refusal_next,
     review_again,
     reviewed_next,
@@ -2018,13 +2019,20 @@ class PortalApp:
         which is the row's button. In managed mode, every client too, with the servers it
         reaches, for **Give to clients** (M6 design G.3, J14): its name, never its token; and the
         head's revision they were read at, which that save is planned on, so a head that moved
-        since is ``policy_moved`` (G.10)."""
+        since is ``policy_moved`` (G.10). What each server's upstream offers beyond tools is the
+        gateway's latest status, read through health as Home reads it (J12, D-216)."""
         policy = self._policy()
         own = self._onboard_service().owned(_session(call).owner)
         found = [] if own is None else [_onboarding_row(own, self.mode)]
         names = self._secret_store().store.names()
+        offered = {} if self.health is None else _offered(self.health())
         found += [
-            _server_row(listed, self._allow_pins(policy, listed))
+            _server_row(
+                listed,
+                self._allow_pins(policy, listed),
+                offered.get(listed.name),
+                managed=self.mode == "managed",
+            )
             for listed in listed_servers(policy, names)
         ]
         answer: dict[str, Any] = {"servers": found}
@@ -3044,36 +3052,62 @@ ATTENTION_MAX: Final = 64
 BRIDGE_QUIET: Final = frozenset({"ready", "idle"})
 
 
+# What each subject is called in an item's text, one and more than one (M6 design D-216).
+SUBJECT_NOUNS: Final[Mapping[str, tuple[str, str]]] = {
+    "tool": ("tool", "tools"),
+    "prompt": ("prompt", "prompts"),
+    "resource_template": ("resource template", "resource templates"),
+    "resource": ("resource", "resources"),
+}
+# A subject's items, in this order, by what each counts and its words.
+SUBJECT_WORDS: Final = (
+    ("drifted", "changed {n} included {noun} since the review"),
+    ("missing", "no longer lists {n} included {noun}"),
+    ("marked", "has {n} included {noun} hidden by a drift mark"),
+    ("unreviewed", "lists {n} {noun} nobody reviewed"),
+)
+
+
 def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
     """Home's list from a health report (M.7): per server the gateway reports, its drifted,
-    missing and marked tools, the tools nobody reviewed, a blocked server and a bridge's state,
-    each an item ``{kind, server_shown, count, text, action}`` whose one action is a review of
-    the server, or for marked tools a clear of its marks (J.4); at most :data:`ATTENTION_MAX`,
-    with how many more. ``gateway`` says whether health has a gateway section (a policy with a
-    gateway), and ``reported_ago`` is the seconds since the gateway's report, or None without
-    one."""
+    missing and marked tools, the tools nobody reviewed, then the same for each kind beyond tools
+    it enables (its row's ``kinds``, D-216), a blocked server and a bridge's state, each an item
+    ``{kind, subject, server_shown, count, text, action}`` whose one action is a review of the
+    server, or for marked entries of any kind a clear of its marks (J.4; the clear job clears
+    every kind); ``subject`` is what the item counts (``tool``, ``prompt``,
+    ``resource_template`` or ``resource``; a blocked server and a bridge are the server's own,
+    ``tool``). At most :data:`ATTENTION_MAX`, with how many more. ``gateway`` says whether
+    health has a gateway section (a policy with a gateway), and ``reported_ago`` is the seconds
+    since the gateway's report, or None without one."""
     section = report.get("gateway")
     items: list[dict[str, Any]] = []
     for server in [] if section is None else section["servers"]:
         name = server["name"]
-        found = attention.loaded(server["attention"])  # the gateway's decision, as made
-        rows = [
-            ("drifted", len(found.drifted), "changed {n} included {tools} since the review"),
-            ("missing", len(found.missing), "no longer lists {n} included {tools}"),
-            ("marked", len(found.marked), "has {n} included {tools} hidden by a drift mark"),
-            ("unreviewed", len(found.unreviewed()), "lists {n} {tools} nobody reviewed"),
-            ("blocked", int(server["blocked"]), "is blocked (on_drift: fail): it serves no tool"),
-        ]
+        kinds: Mapping[str, Mapping[str, Any]] = server.get("kinds") or {}
+        rows: list[tuple[str, str, int, str]] = []
+        for subject, decided in [("tool", server["attention"]), *kinds.items()]:
+            found = attention.loaded(decided)  # the gateway's decision, as made
+            counts = {
+                "drifted": len(found.drifted),
+                "missing": len(found.missing),
+                "marked": len(found.marked),
+                "unreviewed": len(found.unreviewed()),
+            }
+            rows += [(kind, subject, counts[kind], words) for kind, words in SUBJECT_WORDS]
+        serves = "no tool, prompt or resource" if kinds else "no tool"
+        blocked = f"is blocked (on_drift: fail): it serves {serves}"
+        rows.append(("blocked", "tool", int(server["blocked"]), blocked))
         state = server["state"]
         if server["bridge"] and not set(state) <= BRIDGE_QUIET:
-            rows.append(("bridge", 1, "(a bridge): " + ", ".join(state)))
-        for kind, count, words in rows:
+            rows.append(("bridge", "tool", 1, "(a bridge): " + ", ".join(state)))
+        for kind, subject, count, words in rows:
             if count:
-                tools = "tool" if count == 1 else "tools"
-                text = f"{name} " + words.format(n=count, tools=tools)
+                noun = SUBJECT_NOUNS[subject][0 if count == 1 else 1]
+                text = f"{name} " + words.format(n=count, noun=noun)
                 items.append(
                     {
                         "kind": kind,
+                        "subject": subject,
                         "server_shown": shown(name, NAME_LIMIT),
                         "count": count,
                         "text_shown": shown(text, SUMMARY_LIMIT),
@@ -3536,16 +3570,31 @@ def _onboarding_row(answer: Mapping[str, Any], mode: str = "declarative") -> dic
     }
 
 
+def _offered(report: Mapping[str, Any]) -> dict[str, list[str]]:
+    """What each server's upstream offers beyond tools, by name, from a health report's gateway
+    rows (the gateway's latest status): a server it hasn't seen a handshake of isn't named."""
+    section = report.get("gateway")
+    rows = [] if section is None else section["servers"]
+    return {row["name"]: row["offered"] for row in rows if "offered" in row}
+
+
 def _server_row(
-    listed: Listed, pins: Mapping[str, tuple[str | None, bool]] | None = None
+    listed: Listed,
+    pins: Mapping[str, tuple[str | None, bool]] | None = None,
+    offered: Collection[str] | None = None,
+    *,
+    managed: bool = False,
 ) -> dict[str, Any]:
     """A server of the running policy as a row (K.1): its state, the tools it serves and to
     which clients, its included ``approve`` tools (each with **Allow without asking**, the pin
     it allows and whether a review the vault holds shows that definition, ``pins``; M6 design
-    J3, J.4), and what to do next."""
+    J3, J.4), and what to do next. A remote row has ``offered_not_served``, what the upstream
+    ``offered`` (the gateway's latest status; None with none) that its ``enable`` doesn't
+    serve, and its next steps end with J12's way to serve it in the ``managed`` mode or not."""
     approve = [name for name in listed.tools.approve if name in listed.tools.include]
     pins = pins or {}
-    return {
+    not_served = offered_not_served(listed, offered)
+    row: dict[str, Any] = {
         "server": listed.name,
         "name_shown": shown(listed.name, NAME_LIMIT),
         "kind": listed.kind,
@@ -3562,8 +3611,11 @@ def _server_row(
             }
             for name in approve
         ],
-        "next": [step.answer() for step in listed_next(listed)],
+        "next": [step.answer() for step in listed_next(listed, not_served, managed=managed)],
     }
+    if listed.kind == "remote":
+        row["offered_not_served"] = list(not_served)
+    return row
 
 
 def connectors_view(policy: Policy) -> list[dict[str, Any]]:

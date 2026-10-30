@@ -38,16 +38,27 @@ its ``changed_declined`` and ``missing``. :meth:`ServerStatus.attention` reads t
 one decision (``attention.loaded``), so the vault never decides attention itself. ``blocked`` is
 the gateway's own word that ``on_drift: fail`` stopped the server (``pins.evaluate``), which a
 held mark on a tool no longer listed, or an included tool listed invalid, can trigger too.
+
+A server that enables prompts or resources also has ``kinds`` (M6 design K.1, D-216): an object
+of at most the three kinds beyond tools (:data:`KIND_RULES`), each holding exactly the attention
+decision's five lists (:data:`KIND_LISTS`), names only. Each name is held to its kind's own policy
+rule (a prompt's is a tool name's, a template ``fields.uri_template``, a fixed resource
+``fields.resource_uri``): a name that isn't one drops that entry and counts in ``dropped``, and
+any other shape refuses the server. :attr:`ServerStatus.kinds` holds each kind's decision (read
+with ``attention.loaded``); :meth:`ServerStatus.attention` stays the tools'. A server with no
+``kinds`` is read as before.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
+from ..common.pinhash import DefinitionKind
+from ..common.policy import fields as policy_fields
 from ..common.policy.attention import Attention, loaded
 from ..common.policy.schema import NAME_PATTERN
 from ..common.reviewreport import NAMES_MAX
@@ -84,6 +95,10 @@ SERVER_KEYS: Final = frozenset(
 )
 # The name lists of a server entry, by K.1's names.
 NAME_LISTS: Final = ("marked", "declined_changed", "drift", "missing", "invalid")
+# A server that enables a kind beyond tools has one more key (D-216), holding per kind the
+# attention decision's lists, by their own names (``Attention.as_dict``).
+KINDS_KEY: Final = "kinds"
+KIND_LISTS: Final = frozenset({"drifted", "marked", "new", "changed_declined", "missing"})
 KINDS: Final = frozenset({"remote", "toolkit"})
 ERAS: Final = frozenset({"legacy", "modern"})
 MODES: Final = frozenset({"managed", "declarative", "unknown"})
@@ -106,6 +121,37 @@ _NAME: Final = re.compile(NAME_PATTERN)
 _TOOL: Final = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _DIGEST: Final = re.compile(r"sha256:[0-9a-f]{64}")
 _DEPLOYMENT: Final = re.compile(r"[0-9a-f]{32}")
+
+
+Rule = Callable[[str], bool]
+
+
+def _tool_name(name: str) -> bool:
+    return _TOOL.fullmatch(name) is not None
+
+
+def _passes(form: Callable[[str], str]) -> Rule:
+    """Whether a name passes one of ``fields``' URI forms, which raise ``ValueError``."""
+
+    def holds(name: str) -> bool:
+        try:
+            form(name)
+        except ValueError:
+            return False
+        return True
+
+    return holds
+
+
+# Each kind beyond tools, and the rule its names are held to (L.1): a prompt's name is a tool
+# name's (``schema.PromptName``), a template and a fixed resource are their policy forms.
+KIND_RULES: Final[Mapping[DefinitionKind, Rule]] = MappingProxyType(
+    {
+        "prompt": _tool_name,
+        "resource_template": _passes(policy_fields.uri_template),
+        "resource": _passes(policy_fields.resource_uri),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -178,6 +224,8 @@ class ServerStatus:
     offered: Mapping[str, bool] | None = None
     dropped: int = 0
     blocked: bool = False
+    # Each kind beyond tools the server enables, with the gateway's decision for it (D-216).
+    kinds: Mapping[DefinitionKind, Attention] = field(default_factory=dict)
 
     def attention(self) -> Attention:
         """The gateway's attention decision for the server, as its status names it."""
@@ -287,7 +335,7 @@ def _witness(value: Any) -> dict[str, int]:
 
 def _server(entry: Any, max_tools: int) -> ServerStatus:
     """One server's entry, or :class:`_Bad`. Its bad names and pins are dropped and counted."""
-    if not isinstance(entry, dict) or set(entry) != SERVER_KEYS:
+    if not isinstance(entry, dict) or set(entry) - {KINDS_KEY} != SERVER_KEYS:
         raise _Bad
     kind, era = entry["kind"], entry["era"]
     if not isinstance(kind, str) or kind not in KINDS:
@@ -319,6 +367,7 @@ def _server(entry: Any, max_tools: int) -> ServerStatus:
         lists[key] = names
         dropped += bad
     unreviewed, bad = _pinned(entry["unreviewed"], max_tools)
+    kinds, unnamed_kinds = _kinds(entry.get(KINDS_KEY, {}), max_tools)
     return ServerStatus(
         kind=kind,
         state=tuple(sorted(set(state))),
@@ -329,23 +378,45 @@ def _server(entry: Any, max_tools: int) -> ServerStatus:
         invalid_unnamed=unnamed[0],
         duplicate_unnamed=unnamed[1],
         offered=_offered(entry["offered"]),
-        dropped=dropped + bad,
+        dropped=dropped + bad + unnamed_kinds,
         marked=lists["marked"],
         declined_changed=lists["declined_changed"],
         drift=lists["drift"],
         missing=lists["missing"],
         invalid=lists["invalid"],
         blocked=entry["blocked"],
+        kinds=kinds,
     )
 
 
-def _names(value: Any, max_tools: int) -> tuple[tuple[str, ...], int]:
-    """A list of tool names, sorted and without repeats, and how many entries weren't one."""
+def _names(value: Any, max_tools: int, rule: Rule = _tool_name) -> tuple[tuple[str, ...], int]:
+    """A list of names, sorted and without repeats, and how many entries weren't one: tool
+    names, or with ``rule`` the names of another kind (:data:`KIND_RULES`)."""
     if not isinstance(value, list) or len(value) > max_tools:
         raise _Bad
-    names = {name for name in value if isinstance(name, str) and _TOOL.fullmatch(name)}
-    bad = sum(not (isinstance(name, str) and _TOOL.fullmatch(name)) for name in value)
+    names = {name for name in value if isinstance(name, str) and rule(name)}
+    bad = sum(not (isinstance(name, str) and rule(name)) for name in value)
     return tuple(sorted(names)), bad
+
+
+def _kinds(value: Any, max_tools: int) -> tuple[Mapping[DefinitionKind, Attention], int]:
+    """The ``kinds`` object: each kind's decision, and how many names weren't its kind's."""
+    if not isinstance(value, dict) or not set(value) <= set(KIND_RULES):
+        raise _Bad
+    found: dict[DefinitionKind, Attention] = {}
+    dropped = 0
+    for kind, rule in KIND_RULES.items():
+        if kind not in value:
+            continue
+        lists = value[kind]
+        if not isinstance(lists, dict) or set(lists) != KIND_LISTS:
+            raise _Bad
+        held: dict[str, tuple[str, ...]] = {}
+        for member, names in lists.items():
+            held[member], bad = _names(names, max_tools, rule)
+            dropped += bad
+        found[kind] = loaded(held)
+    return MappingProxyType(found), dropped
 
 
 def _pinned(value: Any, max_tools: int) -> tuple[tuple[tuple[str, str], ...], int]:

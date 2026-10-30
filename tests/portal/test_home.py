@@ -6,7 +6,10 @@ one. ``GET /api/attention`` lists, per server, what the gateway's attention deci
 the operator, each item with its one action, a review of the server; a bridge's state is an
 item while it isn't ready; the list holds at most 64. ``GET /api/health``'s checklist carries
 the same server's findings under the ``gateway`` section, which the page words (app.js's
-``SECTION``), as it words every section the report has.
+``SECTION``), as it words every section the report has. A server enabling prompts or resources
+(D-216) has the same items for each kind, ``subject`` naming what each counts, a marked prompt's
+action a clear; and its MCP servers row says what its upstream offers and it doesn't serve, with
+J12's way to serve it (``offered_not_served``).
 """
 
 from __future__ import annotations
@@ -21,7 +24,10 @@ import pytest
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.fakes.browser import Page
 from tests.unit.test_portal_static import code_of, read
+from zoeymcp.common.policy.attention import Attention
+from zoeymcp.common.policy.schema import Tools
 from zoeymcp.portal import app as portal_app
+from zoeymcp.vault.onboarding import Listed
 from zoeymcp.vault.statusreport import Report, ServerStatus
 
 from .flows import set_up, status_reason
@@ -244,3 +250,156 @@ def test_an_unreviewed_tool_counts_once() -> None:
     )
     [item] = found["items"]
     assert (item["kind"], item["count"]) == ("unreviewed", 3)
+
+
+# --- prompts and resources (D-216, J12) ---------------------------------------------------------
+
+TEMPLATE = "notes://notes/{id}"
+KINDS: dict[str, Any] = {
+    **GATEWAY,
+    "gateway": {
+        "servers": {
+            "notes": {
+                "kind": "remote",
+                "route": "notes",
+                "on_drift": "fail",
+                "enable": ["prompts", "resources"],
+            },
+            "fetch": {"kind": "remote", "route": "fetch"},
+        }
+    },
+}
+OFFERS = {"prompts": True, "resources": True, "completions": True, "logging": True}
+
+
+@pytest.fixture
+def kinds_home(tmp_path: Path) -> Iterator[tuple[PortalRig, Page]]:
+    with running(tmp_path, policy=KINDS) as rig:
+        page = rig.browser().page(rig.origin)
+        set_up(rig, page, SoftAuthenticator())
+        yield rig, page
+
+
+def test_each_kinds_items_name_it(kinds_home: tuple[PortalRig, Page]) -> None:
+    """Each kind the gateway reports has the tools' items, after them, its words naming the kind
+    and ``subject`` saying which; a marked prompt is cleared as a tool is (the clear job clears
+    every kind); a blocked server serves no tool, prompt or resource (Q20 (a))."""
+    rig, page = kinds_home
+    kinds = {
+        "prompt": Attention(drifted=("summarize",), marked=("brainstorm",), new=("a", "b")),
+        "resource_template": Attention(drifted=(TEMPLATE,), missing=("notes://x/{y}",)),
+        "resource": Attention(changed_declined=("notes://index",)),
+    }
+    reported(rig, notes=server(drift=("echo",), kinds=kinds, blocked=True))
+    found = attention(page)["items"]
+    assert [
+        (item["kind"], item["subject"], item["count"], item["text_shown"]) for item in found
+    ] == [
+        ("drifted", "tool", 1, "notes changed 1 included tool since the review"),
+        ("drifted", "prompt", 1, "notes changed 1 included prompt since the review"),
+        ("marked", "prompt", 1, "notes has 1 included prompt hidden by a drift mark"),
+        ("unreviewed", "prompt", 2, "notes lists 2 prompts nobody reviewed"),
+        (
+            "drifted",
+            "resource_template",
+            1,
+            "notes changed 1 included resource template since the review",
+        ),
+        (
+            "missing",
+            "resource_template",
+            1,
+            "notes no longer lists 1 included resource template",
+        ),
+        ("unreviewed", "resource", 1, "notes lists 1 resource nobody reviewed"),
+        (
+            "blocked",
+            "tool",
+            1,
+            "notes is blocked (on_drift: fail): it serves no tool, prompt or resource",
+        ),
+    ]
+    marked = [item for item in found if item["kind"] == "marked"]
+    assert [item["action"] for item in marked] == [clear("notes")]
+    assert all(item["action"] == review("notes") for item in found if item not in marked)
+    # Health's checklist names the same kinds (M.5): the same findings, Home's list the same.
+    health = page.fetch("GET", "/api/health").json()
+    texts = [f["text_shown"] for f in health["checklist"] if f["section"] == "gateway"]
+    assert "notes lists 2 prompts nobody reviewed" in texts
+    assert (
+        "notes is blocked (on_drift: fail): none of its tools, prompts or resources are served"
+        in texts
+    )
+
+
+def test_a_tools_only_items_subject_is_tool() -> None:
+    found = portal_app.attention_items(
+        {"gateway": {"reported_ago": 0, "servers": [row("notes", new=["a"], marked=["b"])]}}
+    )
+    assert [(item["kind"], item["subject"]) for item in found["items"]] == [
+        ("marked", "tool"),
+        ("unreviewed", "tool"),
+    ]
+    blocked = {**row("notes"), "blocked": True}
+    [item] = portal_app.attention_items({"gateway": {"reported_ago": 0, "servers": [blocked]}})[
+        "items"
+    ]
+    assert item["text_shown"] == "notes is blocked (on_drift: fail): it serves no tool"
+
+
+def test_the_kinds_items_count_toward_the_cap() -> None:
+    kinds = {"prompt": Attention(new=("a",)).as_dict()}
+    rows = [{**row(f"s{n:02}", new=["a"]), "kinds": kinds} for n in range(40)]
+    found = portal_app.attention_items({"gateway": {"reported_ago": 3, "servers": rows}})
+    assert len(found["items"]) == portal_app.ATTENTION_MAX
+    assert found["more"] == 80 - 64
+    assert [item["subject"] for item in found["items"][:2]] == ["tool", "prompt"]
+
+
+def servers_row(page: Page, name: str) -> dict[str, Any]:
+    answer = page.fetch("GET", "/api/servers")
+    assert answer.status_code == 200, answer.text
+    [found] = [r for r in answer.json()["servers"] if r.get("server") == name]
+    result: dict[str, Any] = found
+    return result
+
+
+def test_the_row_says_what_is_offered_and_not_served(home: tuple[PortalRig, Page]) -> None:
+    """J12's row: before ``enable`` is added, the MCP servers row of a server whose upstream
+    offers prompts, resources and completions names them (never logging), and its last step is
+    the declarative way to serve them, text only; nothing before the gateway reports."""
+    rig, page = home
+    before = servers_row(page, "notes")
+    assert before["offered_not_served"] == []
+    assert all(step["do"] != "enable_kinds" for step in before["next"])
+    reported(rig, notes=server(offered=OFFERS), fetch=server())
+    row = servers_row(page, "notes")
+    assert row["offered_not_served"] == ["prompts", "resources", "completions"]
+    assert row["next"][-1] == {
+        "do": "enable_kinds",
+        "label": "Add enable: [prompts, resources, completions] to notes in your policy and reload",
+    }
+    assert servers_row(page, "fetch")["offered_not_served"] == []  # its status offered nothing
+
+
+def test_the_row_names_only_what_enable_leaves_out(kinds_home: tuple[PortalRig, Page]) -> None:
+    rig, page = kinds_home
+    reported(rig, notes=server(offered=OFFERS))
+    row = servers_row(page, "notes")
+    assert row["offered_not_served"] == ["completions"]
+    assert row["next"][-1]["label"] == (
+        "Add enable: [completions] to notes in your policy and reload"
+    )
+
+
+def test_a_managed_row_says_export_and_import() -> None:
+    """J12's managed text: ``enable`` is wider, so the host's export, edit and import."""
+    listed = Listed("notes", "remote", Tools(), "hide")
+    found = portal_app._server_row(listed, None, ["prompts", "logging"], managed=True)
+    assert found["offered_not_served"] == ["prompts"]
+    assert found["next"][-1] == {
+        "do": "enable_kinds",
+        "label": "Export, add enable: [prompts] to notes, import",
+    }
+    toolkit = Listed("kit", "toolkit", Tools(), "hide")
+    assert "offered_not_served" not in portal_app._server_row(toolkit, None, ["prompts"])

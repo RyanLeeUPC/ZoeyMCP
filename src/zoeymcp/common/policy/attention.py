@@ -24,19 +24,25 @@ disagree.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Set
+from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, fields
 from typing import Any, Protocol
 
-from .schema import Tools
+
+class Included(Protocol):
+    """A server's ``tools`` block, or one kind's block beyond tools: what it includes."""
+
+    @property
+    def include(self) -> Sequence[str]: ...
 
 
 class Server(Protocol):
-    """What :func:`attention` reads of a server: a view's remote or toolkit server, or a
-    ``pinning: off`` toolkit's own pins."""
+    """What :func:`attention` reads of a server: a view's remote or toolkit server, a
+    ``pinning: off`` toolkit's own pins, or one kind of a remote server's beyond tools (its
+    prompts, templates or fixed resources, M6 design L.4), each read as its tools are."""
 
     @property
-    def tools(self) -> Tools: ...
+    def tools(self) -> Included: ...
 
     @property
     def review(self) -> Mapping[str, str]: ...

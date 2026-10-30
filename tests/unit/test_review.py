@@ -986,3 +986,133 @@ def test_a_kinds_mark_makes_the_review_unclean() -> None:
     answer = kinds_answer(marked)
     assert answer["marked"] == []  # tools only
     assert answer["clean"] is False
+
+
+# --- what the upstream offers and the server doesn't serve (M6 design J12, D-216) ------------
+
+OFFERS = {"prompts": True, "resources": True, "completions": True, "logging": True}
+
+
+def test_the_review_says_what_is_offered_and_not_served() -> None:
+    """One line after the tools, from the report alone, with J12's way to serve the kinds in the
+    mode (never logging, which ``enable`` doesn't name); it changes no exit code."""
+    answer = reviewed([tool("a")], policy(["a"], {"a": pin("a")}), offered=OFFERS)
+    every = "prompts, resources and completions, not served: "
+    declarative = (
+        f"notes offers {every}add enable: [prompts, resources, completions] to notes in your "
+        "policy and reload"
+    )
+    lines = view.render(answer, view.Choices())
+    assert lines[2] == declarative  # the server's line, the tool's, then this one
+    managed = view.render(answer, view.Choices(), managed=True)
+    assert managed[-1] == (
+        f"notes offers {every}export, add enable: [prompts, resources, completions] to notes, "
+        "import"
+    )
+    assert view.exit_code(answer) == 0
+    assert view.offered_line(answer) == declarative
+    some = {**OFFERS, "resources": False, "completions": False}
+    assert view.offered_line({**answer, "offered": some}) == (
+        "notes offers prompts, not served: add enable: [prompts] to notes in your policy and reload"
+    )
+
+
+@pytest.mark.parametrize(
+    ("listings", "kinds"),
+    [
+        (["prompt"], "resources"),
+        (["resource_template"], "prompts"),
+        (["resource"], "prompts"),
+        (["prompt", "resource_template", "resource"], None),
+    ],
+)
+def test_what_the_server_enables_is_left_out(listings: list[str], kinds: str | None) -> None:
+    """An older gateway's report holds no ``enable``: its ``listings`` names exactly the kinds
+    the server enables; once it enables one, whether it enables completions can't be told from
+    the report, so they are never named then."""
+    made = kinds_answer()
+    older = {key: value for key, value in made["policy"].items() if key != "enable"}
+    listed: dict[str, Any] = {kind: {} for kind in listings}
+    answer = {**made, "policy": older, "offered": OFFERS, "listings": listed}
+    expected = (
+        None
+        if kinds is None
+        else f"notes offers {kinds}, not served: add enable: [{kinds}] to notes in your policy "
+        "and reload"
+    )
+    assert view.offered_line(answer) == expected
+
+
+def with_enable(enable: list[str], *, templates: list[str] | None = None) -> dict[str, Any]:
+    """:func:`kinds_answer` as a gateway reports a server with this ``enable``, its upstream
+    offering every kind, and the resource templates its policy includes."""
+    made = kinds_answer()
+    policy = {**made["policy"], "enable": enable}
+    resources = policy["resources"]
+    policy["resources"] = {**resources, "templates": {**resources["templates"]}}
+    policy["resources"]["templates"]["include"] = templates or []
+    return {**made, "policy": policy, "offered": OFFERS}
+
+
+def test_the_reports_enable_says_what_is_served() -> None:
+    """The gateway's report holds the server's ``enable`` once it lists any, so a server that
+    enables prompts and resources is told its upstream's completions aren't served (J12),
+    whatever its ``listings`` say."""
+    made = kinds_answer()
+    assert made["policy"]["enable"] == ["prompts", "resources"]
+    assert "enable" not in reviewed([tool("a")], policy(["a"], {"a": pin("a")}))["policy"]
+    assert view.offered_line({**made, "offered": OFFERS}) == (
+        "notes offers completions, not served: add enable: [completions] to notes in your "
+        "policy and reload"
+    )
+    assert view.offered_line({**with_enable(["prompts"]), "listings": {}}) == (
+        "notes offers resources and completions, not served: add enable: [resources, "
+        "completions] to notes in your policy and reload"
+    )
+    every = with_enable(["prompts", "resources", "completions"])
+    assert view.offered_line(every) is None
+    lines = view.render(with_enable(["prompts"]), view.Choices(), managed=True)
+    assert (
+        "notes offers resources and completions, not served: export, add enable: [resources, "
+        "completions] to notes, import"
+    ) in lines
+
+
+def test_completions_are_added_only_where_check_takes_them() -> None:
+    """A.2 row 5c: completions need prompts, or resources with a template included."""
+    plain = with_enable(["resources"])
+    assert view.offered_line(plain) == (
+        "notes offers prompts and completions, not served: add enable: [prompts, completions] "
+        "to notes in your policy and reload"
+    )
+    alone = {**plain, "offered": {**OFFERS, "prompts": False}}
+    assert view.offered_line(alone) == (
+        "notes offers completions, not served: completions need prompts enabled, or a resource "
+        "template included"
+    )
+    templated = {
+        **with_enable(["resources"], templates=["notes://notes/{id}"]),
+        "offered": alone["offered"],
+    }
+    assert view.offered_line(templated, managed=True) == (
+        "notes offers completions, not served: export, add enable: [completions] to notes, import"
+    )
+    tools_only = reviewed(
+        [tool("a")], policy(["a"], {"a": pin("a")}), offered={**OFFERS, "prompts": False}
+    )
+    assert view.offered_line(tools_only) == (
+        "notes offers resources and completions, not served: add enable: [resources] to notes "
+        "in your policy and reload"
+    )
+
+
+def test_no_line_without_an_offer() -> None:
+    answer = reviewed([tool("a")], policy(["a"], {"a": pin("a")}))
+    assert "offered" not in answer  # the handshake wasn't seen
+    assert view.offered_line(answer) is None
+    assert view.offered_line({**answer, "offered": None}) is None
+    nothing = dict.fromkeys(OFFERS, False)
+    assert view.offered_line({**answer, "offered": {**nothing, "logging": True}}) is None
+    assert not any("offers" in line for line in view.render(answer, view.Choices()))
+    toolkit = {"kind": "toolkit", "server": "kit", "offered": OFFERS}
+    assert view.offered_line(toolkit) is None

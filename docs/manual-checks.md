@@ -463,7 +463,11 @@ view.
     --prompts --resources --switch inject_kinds`, so it lists two prompts (`brainstorm`,
     `summarize_note`), a resource template (`notes://notes/{id}`) and a fixed resource
     (`notes://index`), and one more of each kind carrying item 16's hostile text
-    (`hostile_prompt`, `notes://hostile/{id}`, `notes://hostile`). Add `enable: [prompts,
+    (`hostile_prompt`, `notes://hostile/{id}`, `notes://hostile`). Before `enable` is added, once
+    an agent has listed the server's tools, the server's row on **MCP servers** reads "offered,
+    not served: prompts, resources, completions", its last step "Add enable: [prompts, resources,
+    completions] to notes in your policy and reload" (in managed mode, "Export, add enable:
+    [prompts, resources, completions] to notes, import"). Add `enable: [prompts,
     resources, completions]` to the server (operations.md §12), commit it and reload. In Chrome or
     Edge with the Console open (no Trusted Types or Content Security Policy violation throughout),
     choose **Review again** on the server's row. Pass:
@@ -485,6 +489,9 @@ view.
       side by side and the vault's diff under them, every string shown as text; **Accept the new
       definition** on both and **Generate**: the new pins under each block's `review:`, each with
       a `# changed:` line; **Clear** unticks every kind's box as it does the tools';
+    - after that restart, before the new pins are committed, Home's list names "notes changed 1
+      included prompt since the review" and "notes changed 1 included resource template since
+      the review", each with **Review**, and `zoeymcp health` has both under `drift_marked`;
     - in managed mode (item 20's vault, `enable` added by a host export, edit and import as
       operations.md §12 says), the same review and **Save**: the dialog's rows name
       `gateway.servers.notes.prompts.include` and each kind's `review` pin, an accepted re-pin

@@ -70,7 +70,13 @@ read back with :meth:`~.statusreport.ServerStatus.attention`, never decided here
 that drifted, are hidden by a drift mark or are no longer listed, each a warning whose action is
 ``review`` with the ``server``, so ``zoeymcp review``'s exit code, these findings and Home's list
 agree (Y29); a tool nobody reviewed is counted, not named, since its upstream chose the name.
-``server_blocked`` is a server the gateway says ``on_drift: fail`` blocked;
+For a server that enables prompts or resources, the same two fire for each kind the gateway
+reports (``ServerStatus.kinds``, D-216), their text naming the kind ("notes lists 2 prompts
+nobody reviewed"), and the row carries each kind's decision in ``kinds``; the row carries
+``offered`` too, what the upstream advertises beyond tools, once the gateway has seen it, so the
+portal's server row can say what is offered and not served (J12).
+``server_blocked`` is a server the gateway says ``on_drift: fail`` blocked, none of whose tools,
+prompts or resources are served (Q20 (a));
 ``server_listing_invalid`` a server the gateway lists tools for that it can't name, or that it
 reports invalid and no drift finding names already (counted), or whose status the vault refused
 (T-7).
@@ -110,7 +116,9 @@ from typing import Any, Final, Literal
 from urllib.parse import urlsplit
 
 from ..common import egresslist
+from ..common.pinhash import DefinitionKind
 from ..common.policy import fields as policy_fields
+from ..common.policy.attention import Attention
 from ..common.policy.check import local_mcp_routes, secret_references
 from ..common.policy.schema import (
     Credential,
@@ -974,27 +982,22 @@ def _gateway(
             if entry is None:
                 continue
             found = entry.attention()
-            unreviewed = found.unreviewed()
-            if unreviewed:
-                # Counted, not named: the upstream chose the names (M.5, Y13); review names them.
-                text = f"{name} lists {_tools(len(unreviewed))} nobody reviewed"
-                findings.append(_finding("tools_unreviewed", "warning", text, review))
-            parts = [
-                f"{len(names)} {words} ({_some(names)})"
-                for names, words in (
-                    (found.drifted, "changed since the review"),
-                    (found.marked, "hidden by a drift mark"),
-                    (found.missing, "no longer listed"),
-                )
-                if names
-            ]
-            if parts:
-                text = f"{name}: included tools {'; '.join(parts)}"
-                findings.append(_finding("drift_marked", "warning", text, review))
+            # Each kind beyond tools the server enables as its tools (D-216).
+            kinds: list[tuple[DefinitionKind, Attention]] = [("tool", found), *entry.kinds.items()]
+            for kind, decided in kinds:
+                unreviewed, drifted = _attended(name, kind, decided)
+                if unreviewed is not None:
+                    findings.append(_finding("tools_unreviewed", "warning", unreviewed, review))
+                if drifted is not None:
+                    findings.append(_finding("drift_marked", "warning", drifted, review))
             # The gateway's own word (pins.evaluate): a held mark on a tool no longer listed, or an
-            # included tool listed invalid, blocks it too.
+            # included tool listed invalid, blocks it too; and every kind with it (Q20 (a)).
             if entry.blocked:
-                text = f"{name} is blocked (on_drift: fail): none of its tools are served"
+                enabled = set(server.enable) if isinstance(server, RemoteServer) else set()
+                served = (
+                    "tools, prompts or resources are" if KIND_ENABLES & enabled else "tools are"
+                )
+                text = f"{name} is blocked (on_drift: fail): none of its {served} served"
                 findings.append(_finding("server_blocked", "warning", text, review))
             # An included tool the gateway lists invalid is drifted already: counted once, there.
             invalid = sorted(set(entry.invalid) - set(found.drifted))
@@ -1008,19 +1011,23 @@ def _gateway(
                     )
                 findings.append(_finding("server_listing_invalid", "warning", text, review))
             upstream = upstreams.get(server.route) if isinstance(server, RemoteServer) else None
-            servers.append(
-                {
-                    "name": name,
-                    "kind": entry.kind,
-                    "bridge": upstream is not None and _bridge_of(upstream) is not None,
-                    "state": list(entry.state),
-                    "era": entry.era,
-                    "attention": found.as_dict(),
-                    "blocked": entry.blocked,
-                    "invalid": invalid,
-                    "unnamed": entry.unnamed,
-                }
-            )
+            row: dict[str, Any] = {
+                "name": name,
+                "kind": entry.kind,
+                "bridge": upstream is not None and _bridge_of(upstream) is not None,
+                "state": list(entry.state),
+                "era": entry.era,
+                "attention": found.as_dict(),
+                "blocked": entry.blocked,
+                "invalid": invalid,
+                "unnamed": entry.unnamed,
+            }
+            # Only when present, so a tools-only server's row is as before.
+            if entry.kinds:
+                row["kinds"] = {kind: each.as_dict() for kind, each in entry.kinds.items()}
+            if entry.offered is not None:
+                row["offered"] = [what for what, flag in entry.offered.items() if flag]
+            servers.append(row)
         if report.unnamed_servers:
             text = (
                 f"the gateway's status names {report.unnamed_servers} server(s) by names that "
@@ -1038,7 +1045,45 @@ def _gateway(
 
 
 def _tools(count: int) -> str:
-    return f"{count} tool{'' if count == 1 else 's'}"
+    return _counted(count, "tool")
+
+
+# What each kind is called in a finding's text, one and more than one.
+NOUNS: Final[Mapping[DefinitionKind, tuple[str, str]]] = {
+    "tool": ("tool", "tools"),
+    "prompt": ("prompt", "prompts"),
+    "resource_template": ("resource template", "resource templates"),
+    "resource": ("resource", "resources"),
+}
+# The enable entries that make a server list a kind beyond tools.
+KIND_ENABLES: Final = frozenset({"prompts", "resources"})
+
+
+def _counted(count: int, kind: DefinitionKind) -> str:
+    one, more = NOUNS[kind]
+    return f"{count} {one if count == 1 else more}"
+
+
+def _attended(name: str, kind: DefinitionKind, found: Attention) -> tuple[str | None, str | None]:
+    """The texts of ``tools_unreviewed`` and ``drift_marked`` for one kind of a server's
+    listing, or None for one that has nothing: what nobody reviewed, counted, and the included
+    entries that drifted, are marked or are missing, named."""
+    unreviewed = found.unreviewed()
+    # Counted, not named: the upstream chose the names (M.5, Y13); review names them.
+    nobody = (
+        f"{name} lists {_counted(len(unreviewed), kind)} nobody reviewed" if unreviewed else None
+    )
+    parts = [
+        f"{len(names)} {words} ({_some(names)})"
+        for names, words in (
+            (found.drifted, "changed since the review"),
+            (found.marked, "hidden by a drift mark"),
+            (found.missing, "no longer listed"),
+        )
+        if names
+    ]
+    drifted = f"{name}: included {NOUNS[kind][1]} {'; '.join(parts)}" if parts else None
+    return nobody, drifted
 
 
 def _some(names: Sequence[str]) -> str:

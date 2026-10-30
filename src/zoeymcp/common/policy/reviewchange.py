@@ -35,13 +35,18 @@ A definition is shown as ``json.dumps(definition, ensure_ascii=True, indent=2, s
 split into lines, each line split again into chunks of :data:`CHUNK` code points with **nothing
 cut** (M7 F.6, CR-2, TI-5): every character outside ASCII, a bidi control or a hidden one among
 them, is a visible ``\\uXXXX`` escape, and the chunks of a line joined are the line.
+
+What an upstream offers beyond tools that the server's ``enable`` doesn't list is named on the
+portal's server row and by ``zoeymcp review`` with J12's way to serve it (M6 design J12, D-216):
+:func:`not_served_line` and :func:`serve_text`, which add ``completions`` only where ``check``
+would take them (A.2 row 5c), the CLI and the vault building the same text here.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
@@ -49,7 +54,7 @@ from ..suggest import Suggestion, suggestion
 from . import fields
 from .change import Comment, PolicyChange, SetServerReview
 from .ratchet import DefKey
-from .schema import PromptsPolicy, ResourceSet, ResourcesPolicy, Tools
+from .schema import Capability, PromptsPolicy, ResourceSet, ResourcesPolicy, Tools
 
 TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 PIN = re.compile(r"sha256:[0-9a-f]{64}")
@@ -339,6 +344,55 @@ def second_title(server: str, *, declined: bool = False, kinds: Sequence[str] = 
         f"review of {server} (2 of 2). Replace the {_blocks(declined, kinds)} of "
         f"gateway.servers.{server}, then assign {server} to its clients."
     )
+
+
+# The ``enable`` entries an upstream may offer that a row or a review names as not served (M6
+# design J12), in this order: never ``logging``, which ``enable`` doesn't name.
+OFFERABLE: Final[tuple[Capability, ...]] = ("prompts", "resources", "completions")
+# J12's step when only completions are offered and ``check`` would refuse them (A.2 row 5c).
+COMPLETIONS_NEED: Final = "completions need prompts enabled, or a resource template included"
+
+
+def enableable(
+    kinds: Sequence[str], enable: Collection[str], *, templates: bool
+) -> tuple[str, ...]:
+    """The ``kinds`` J12's step adds to ``enable``: ``completions`` only where ``check`` takes
+    them once added (A.2 row 5c), with ``prompts`` enabled or ``resources`` enabled and a
+    template included (``templates``)."""
+    after = {*enable, *kinds}
+    usable = "prompts" in after or ("resources" in after and templates)
+    return tuple(kind for kind in kinds if kind != "completions" or usable)
+
+
+def _listed(kinds: Sequence[str]) -> str:
+    """``prompts``, ``prompts and resources``, ``prompts, resources and completions``."""
+    return " and ".join(filter(None, (", ".join(kinds[:-1]), kinds[-1])))
+
+
+def enable_text(server: str, kinds: Sequence[str], *, managed: bool) -> str:
+    """J12's way to serve ``kinds`` of ``server``: in managed mode the host's export, edit and
+    import (``enable`` is wider, so host-only), in declarative mode the policy and a reload."""
+    entries = f"enable: [{', '.join(kinds)}]"
+    if managed:
+        return f"export, add {entries} to {server}, import"
+    return f"add {entries} to {server} in your policy and reload"
+
+
+def serve_text(
+    server: str, kinds: Sequence[str], enable: Collection[str], *, templates: bool, managed: bool
+) -> str:
+    """J12's way to serve the offered ``kinds`` the server's ``enable`` doesn't list: the
+    :func:`enableable` ones, or :data:`COMPLETIONS_NEED` when there are none."""
+    adding = enableable(kinds, enable, templates=templates)
+    return enable_text(server, adding, managed=managed) if adding else COMPLETIONS_NEED
+
+
+def not_served_line(
+    server: str, kinds: Sequence[str], enable: Collection[str], *, templates: bool, managed: bool
+) -> str:
+    """``zoeymcp review``'s line for what ``server`` offers and doesn't serve (J12)."""
+    way = serve_text(server, kinds, enable, templates=templates, managed=managed)
+    return f"{server} offers {_listed(kinds)}, not served: {way}"
 
 
 def fragment(

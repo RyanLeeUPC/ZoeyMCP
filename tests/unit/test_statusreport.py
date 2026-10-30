@@ -3,16 +3,20 @@
 The model: the frame refused whole, each server judged on its own, every cap both sides, a
 definition or a token hash in a report refused, a bad tool name dropping only its own entry
 (``test_bad_name_drops_only_its_entry``), a witness revision above ``REVISION_MAX`` refusing the
-report, and the attention decision read back as the gateway made it.
+report, and the attention decision read back as the gateway made it; and a server enabling
+prompts or resources (D-216): its ``kinds`` each held to its kind's own name rule, a bad name
+dropped and counted, any other shape refusing the server, and no ``kinds`` read as before.
 """
 
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 import pytest
 
+from zoeymcp.common.pinhash import DefinitionKind
 from zoeymcp.common.policy.attention import Attention, attention, quiet
 from zoeymcp.common.policy.schema import Tools, hash_token
 from zoeymcp.common.reviewreport import NAMES_MAX
@@ -402,6 +406,140 @@ def test_a_server_without_a_policy_name_is_counted_not_named() -> None:
         2,
         (),
     )
+
+
+# --- each kind beyond tools (D-216) -------------------------------------------------------------
+
+TEMPLATE = "notes://notes/{id}"
+FIXED = "notes://index"
+
+
+def plain_id(value: Any) -> str:
+    """A test ID pytest can find again by its node ID (as ``test_policyseal.py``'s)."""
+    return re.sub(r"[^A-Za-z0-9_.:=, -]+", "_", repr(value))[:60]
+
+
+def lists(**names: Any) -> dict[str, Any]:
+    """One kind's five lists, as ``Attention.as_dict`` names them."""
+    return {member: names.get(member, []) for member in sorted(statusreport.KIND_LISTS)}
+
+
+def test_the_kinds_lists_and_rules() -> None:
+    assert set(Attention().as_dict()) == statusreport.KIND_LISTS
+    assert list(statusreport.KIND_RULES) == ["prompt", "resource_template", "resource"]
+    assert statusreport.KINDS_KEY == "kinds"
+
+
+def test_no_kinds_reads_as_before() -> None:
+    entry = read(report(), MAX_TOOLS).servers["notes"]
+    assert entry.kinds == {}
+    assert read(report(servers={"notes": server(kinds={})}), MAX_TOOLS).servers["notes"] == entry
+
+
+def test_each_kind_reads_as_the_gateway_decided_it() -> None:
+    """Each kind's decision reads back whole, apart from the tools' (which stays the one
+    :meth:`ServerStatus.attention` reads), names sorted once."""
+    kinds = {
+        "prompt": lists(drifted=["summarize"], new=["b", "a", "b"], changed_declined=["c"]),
+        "resource_template": lists(marked=[TEMPLATE], missing=["notes://notes/{id}/x"]),
+        "resource": lists(new=[FIXED]),
+    }
+    entry = read(report(servers={"notes": server(drift=["t"], kinds=kinds)}), MAX_TOOLS)
+    found = entry.servers["notes"]
+    assert found.kinds == {
+        "prompt": Attention(drifted=("summarize",), new=("a", "b"), changed_declined=("c",)),
+        "resource_template": Attention(marked=(TEMPLATE,), missing=("notes://notes/{id}/x",)),
+        "resource": Attention(new=(FIXED,)),
+    }
+    assert list(found.kinds) == ["prompt", "resource_template", "resource"]
+    assert found.attention() == Attention(drifted=("t",))
+    assert found.dropped == 0
+    alone = read(report(servers={"notes": server(kinds={"resource": lists()})}), MAX_TOOLS)
+    assert alone.servers["notes"].kinds == {"resource": Attention()}
+
+
+@pytest.mark.parametrize(
+    ("kind", "good", "bad"),
+    [
+        ("prompt", "summarize.v2", "a b"),
+        ("prompt", "x" * 128, "x" * 129),
+        ("prompt", "summarize", TEMPLATE),
+        ("resource_template", TEMPLATE, "notes://notes/{+id}"),  # an operator: not level 1
+        ("resource_template", "notes://index", "notes://notes/{id}?q=1"),
+        ("resource_template", TEMPLATE, "summarize"),  # no scheme
+        ("resource", FIXED, "notes://index#top"),  # a fragment
+        ("resource", "https://notes.example/a", "https://user@notes.example/a"),  # user info
+        ("resource", FIXED, "summarize"),
+        ("resource", FIXED, 3),
+        ("prompt", "summarize", None),
+    ],
+    ids=plain_id,
+)
+def test_each_kinds_names_are_held_to_its_own_rule(
+    kind: DefinitionKind, good: str, bad: Any
+) -> None:
+    """A name that isn't one of its kind's (L.1) drops that entry alone, counted, in every list;
+    the rest of the server stays."""
+    for member in sorted(statusreport.KIND_LISTS):
+        kinds = {kind: lists(**{member: [good, bad]})}
+        entry = read(report(servers={"notes": server(kinds=kinds)}), MAX_TOOLS).servers["notes"]
+        assert getattr(entry.kinds[kind], member) == (good,), member
+        assert (entry.dropped, entry.unnamed) == (1, 1), member
+
+
+def test_bad_names_of_every_kind_are_counted_with_the_tools() -> None:
+    kinds = {
+        "prompt": lists(new=["a b"], drifted=["x y"]),
+        "resource_template": lists(missing=["no scheme"]),
+        "resource": lists(marked=["ok://fine", "#"]),
+    }
+    entry = read(report(servers={"notes": server(drift=["b c"], kinds=kinds)}), MAX_TOOLS).servers[
+        "notes"
+    ]
+    assert entry.dropped == 5
+    assert entry.kinds["resource"] == Attention(marked=("ok://fine",))
+
+
+@pytest.mark.parametrize(
+    "kinds",
+    [
+        [],
+        None,
+        "prompt",
+        {"tool": lists()},  # the tools are the entry's own lists
+        {"completion": lists()},
+        {"prompt": lists(), "prompts": lists()},
+        {"prompt": []},
+        {"prompt": None},
+        {"prompt": {k: v for k, v in lists().items() if k != "missing"}},
+        {"prompt": {**lists(), "unreviewed": []}},  # a sixth list
+        {"prompt": {**lists(), "pins": {}}},  # never a pin
+        {"prompt": lists(new="summarize")},
+        {"resource": lists(new=[FIXED] * (MAX_TOOLS + 1))},
+        {"resource_template": lists(drifted={TEMPLATE: A})},
+    ],
+)
+def test_a_bad_kinds_shape_refuses_the_server(kinds: Any) -> None:
+    found = read(report(servers={"notes": server(kinds=kinds), "mail": server()}), MAX_TOOLS)
+    assert found.refused_servers == ("notes",)
+    assert list(found.servers) == ["mail"]
+
+
+def test_each_kinds_cap_takes_its_edge() -> None:
+    full = [f"p{n}" for n in range(MAX_TOOLS)]
+    kinds = {kind: lists(new=full) for kind in ("prompt",)}
+    entry = read(report(servers={"notes": server(kinds=kinds)}), MAX_TOOLS).servers["notes"]
+    assert entry.kinds["prompt"].new == tuple(full)
+
+
+def test_a_toolkit_entry_with_kinds_reads_too() -> None:
+    """The vault holds the shape, not who may send it: the gateway sends ``kinds`` for a remote
+    server alone, and nothing reads a toolkit's."""
+    entry = read(
+        report(servers={"kit": server(kind="toolkit", era=None, kinds={"prompt": lists()})}),
+        MAX_TOOLS,
+    ).servers["kit"]
+    assert entry.kinds == {"prompt": Attention()}
 
 
 # --- the attention decision, as the gateway made it (J.5, Y29) ----------------------------------

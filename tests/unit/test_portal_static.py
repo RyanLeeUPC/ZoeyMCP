@@ -860,7 +860,7 @@ def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
     # Home's button by the action's kind; the MCP servers rows take each server's items.
     assert re.findall(r"\bitem\.action\.([a-z_]+)", drift) == ["kind", "server"]
     assert item["action"] == {"kind": "review", "server": "notes"}
-    assert set(item) == {"kind", "server_shown", "count", "text_shown", "action"}
+    assert set(item) == {"kind", "subject", "server_shown", "count", "text_shown", "action"}
     # A marked tool's one action is a clear of the server's marks (M6 J.4, J13), the only kind
     # besides review, and drift.js words both.
     marked = gateway_row()

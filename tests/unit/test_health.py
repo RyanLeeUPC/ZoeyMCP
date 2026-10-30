@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from zoeymcp.common.policy import Policy
+from zoeymcp.common.policy.attention import Attention
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import OAuth2Credential
 from zoeymcp.common.yamlload import load_mapping
@@ -2532,6 +2533,118 @@ def test_a_toolkits_row_reads_the_gateways_blocked() -> None:
         ("kit", False, False),
         ("pinned", True, False),
     ]
+
+
+# --- prompts and resources in the gateway's status (D-216) -------------------------------------
+
+TEMPLATE = "notes://notes/{id}"
+
+
+def enabling(*enable: str, toolkit: bool = False) -> Policy:
+    """The gateway policy with notes enabling ``enable``; with ``toolkit``, a toolkit ``kit``."""
+    raw = gateway_policy("fail").model_dump(mode="json", exclude_defaults=True, by_alias=True)
+    raw["gateway"]["servers"]["notes"]["enable"] = list(enable)
+    if toolkit:
+        raw["gateway"]["servers"]["kit"] = {
+            "kind": "toolkit",
+            "module": "examples.kit",
+            "on_drift": "fail",
+        }
+    return Policy.model_validate(raw)
+
+
+def test_each_kind_raises_the_tools_findings() -> None:
+    """``tools_unreviewed`` and ``drift_marked`` fire per kind the gateway reports, after the
+    tools' own, the text naming the kind: what nobody reviewed counted, the included entries
+    that drifted, are marked or are missing named (M.5, Y13); no new code."""
+    kinds = {
+        "prompt": Attention(new=("a", "b"), changed_declined=("c",), drifted=("summarize",)),
+        "resource_template": Attention(drifted=(TEMPLATE,), new=("notes://x/{y}",)),
+        "resource": Attention(marked=("notes://index",), missing=("notes://a", "notes://b")),
+    }
+    entry = server_status(drift=("echo",), kinds=kinds)
+    section = gateway({"notes": entry}, policy=enabling("prompts", "resources"))
+    assert [(f["code"], f["text"]) for f in section["findings"]] == [
+        ("drift_marked", "notes: included tools 1 changed since the review (echo)"),
+        ("tools_unreviewed", "notes lists 3 prompts nobody reviewed"),
+        ("drift_marked", "notes: included prompts 1 changed since the review (summarize)"),
+        ("tools_unreviewed", "notes lists 1 resource template nobody reviewed"),
+        (
+            "drift_marked",
+            f"notes: included resource templates 1 changed since the review ({TEMPLATE})",
+        ),
+        (
+            "drift_marked",
+            "notes: included resources 1 hidden by a drift mark (notes://index); 2 no longer "
+            "listed (notes://a, notes://b)",
+        ),
+    ]
+    assert all(f["action"] == REVIEW_NOTES for f in section["findings"])
+    assert all(f["level"] == "warning" for f in section["findings"])
+
+
+def test_each_kinds_count_is_its_own_noun() -> None:
+    for kind, one, more in (
+        ("prompt", "1 prompt", "2 prompts"),
+        ("resource_template", "1 resource template", "2 resource templates"),
+        ("resource", "1 resource", "2 resources"),
+    ):
+        for names, words in ((("a",), one), (("a", "b"), more)):
+            entry = server_status(kinds={kind: Attention(new=names)})
+            [found] = gateway({"notes": entry})["findings"]
+            assert found["text"] == f"notes lists {words} nobody reviewed"
+
+
+def test_a_quiet_kind_raises_nothing() -> None:
+    kinds = {"prompt": Attention(), "resource": Attention()}
+    section = gateway({"notes": server_status(kinds=kinds)}, policy=enabling("prompts"))
+    assert (section["level"], section["findings"]) == ("ok", [])
+
+
+@pytest.mark.parametrize(
+    ("enable", "served"),
+    [
+        (("prompts",), "tools, prompts or resources are"),
+        (("resources",), "tools, prompts or resources are"),
+        (("prompts", "resources", "completions"), "tools, prompts or resources are"),
+        (("completions",), "tools are"),  # completions list nothing of their own
+        ((), "tools are"),
+    ],
+)
+def test_a_blocked_server_that_enables_a_kind(enable: tuple[str, ...], served: str) -> None:
+    """Q20 (a): ``on_drift: fail`` blocks every kind, and the text says so for a server that
+    enables one."""
+    section = gateway({"notes": server_status(blocked=True)}, policy=enabling(*enable))
+    [found] = [f for f in section["findings"] if f["code"] == "server_blocked"]
+    assert found["text"] == f"notes is blocked (on_drift: fail): none of its {served} served"
+
+
+def test_a_blocked_toolkit_serves_no_tool() -> None:
+    toolkit = {"kind": "toolkit", "state": ("loaded",), "era": None, "blocked": True}
+    section = gateway({"kit": server_status(**toolkit)}, policy=enabling("prompts", toolkit=True))
+    [found] = section["findings"]
+    assert found["text"] == "kit is blocked (on_drift: fail): none of its tools are served"
+
+
+def test_a_row_carries_kinds_and_offered_only_when_reported() -> None:
+    """Each kind's decision in the row's ``kinds``, and what the upstream offers beyond tools in
+    ``offered`` (the true flags), each only when the gateway reported it: a tools-only row is
+    as before (``test_a_quiet_gateway``)."""
+    offered = {"completions": False, "logging": True, "prompts": True, "resources": True}
+    kinds = {"prompt": Attention(new=("a",)), "resource": Attention()}
+    entry = server_status(kinds=kinds, offered=offered)
+    [row] = [r for r in gateway({"notes": entry})["servers"] if r["name"] == "notes"]
+    assert row["kinds"] == {
+        "prompt": Attention(new=("a",)).as_dict(),
+        "resource": Attention().as_dict(),
+    }
+    assert row["offered"] == ["logging", "prompts", "resources"]
+    none = server_status(offered=dict.fromkeys(offered, False))
+    [bare] = gateway({"notes": none})["servers"]
+    assert (bare["offered"], "kinds" in bare) == ([], False)
+    [plain] = gateway({"notes": server_status()})["servers"]
+    assert "offered" not in plain
+    assert "kinds" not in plain
 
 
 def test_the_summary_counts_the_gateway() -> None:

@@ -17,9 +17,11 @@ included for display only; they are never forwarded to an agent.
 A server that enables prompts or resources (M6 design L.4) is reported with an entry per prompt,
 resource template and fixed resource beside its tools, each with the states a tool has, its
 projection and pin, and its findings; the policy block carries its ``prompts`` and ``resources``
-blocks, and ``listings`` how each kind's walk went. The review's ``resources/list`` is the
-upstream's whole list under the listing caps, so a fixed resource nobody included yet shows as
-``unreviewed`` at the pin the review learned (OPS-11); a list cut at a cap says so.
+blocks, and ``listings`` how each kind's walk went. A server whose ``enable`` lists anything has
+it in the policy block too, so ``zoeymcp review`` can say what the upstream offers that isn't
+served (J12, D-216). The review's ``resources/list`` is the upstream's whole list under the
+listing caps, so a fixed resource nobody included yet shows as ``unreviewed`` at the pin the
+review learned (OPS-11); a list cut at a cap says so.
 
 ``--clear`` lists again and, only if every included tool matches its pin, clears the server's
 drift marks and re-evaluates the server's live connections, so the tools come back for agents,
@@ -352,6 +354,8 @@ def report(
         "review": dict(policy.review),
         "declined": dict(policy.declined),
     }
+    if policy.enable:  # what it serves beyond tools, so the CLI can say what isn't (J12)
+        block["enable"] = list(policy.enable)
     for member in ("prompts", "resources"):
         if member in policy.enable:
             block[member] = getattr(policy, member).model_dump()
