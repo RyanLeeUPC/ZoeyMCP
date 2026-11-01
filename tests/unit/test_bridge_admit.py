@@ -501,6 +501,16 @@ def test_decode_name() -> None:
             "mcp-name",
         ),
         (
+            # A payload that isn't ASCII, as a latin-1 header can be: refused, not raised (D-245).
+            {
+                "mcp_protocol_version": MODERN,
+                "mcp_method": "tools/call",
+                "mcp_name": "=?base64?é?=",
+            },
+            modern("tools/call", {"name": "a"}),
+            "mcp-name",
+        ),
+        (
             {"mcp_protocol_version": MODERN, "mcp_method": "resources/read", "mcp_name": "a"},
             modern("resources/read", {"name": "a"}),
             "mcp-name",

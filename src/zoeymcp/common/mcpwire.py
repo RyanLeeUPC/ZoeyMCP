@@ -17,7 +17,6 @@ Pure and standard library only.
 from __future__ import annotations
 
 import base64
-import binascii
 import re
 from collections.abc import Mapping
 from typing import Any, Final
@@ -83,7 +82,7 @@ def decode_name(value: str) -> str | None:
     payload = found.group(1)
     try:
         decoded = base64.b64decode(payload)
-    except binascii.Error:
+    except ValueError:  # binascii.Error, or a payload that isn't ASCII (register D-245)
         return None
     # Canonical: it encodes back to exactly the payload, so no stray or misplaced character
     # (which a lenient decode drops) and no padding variant passes.
