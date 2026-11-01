@@ -36,8 +36,9 @@ jobs:
     name: tests (Python ${{ matrix.python }})
     runs-on: ubuntu-24.04
     # The acceptance tests run here too, S9's walks among them; a hung one ends the job (register
-    # D-170).
-    timeout-minutes: 40
+    # D-170). Headroom (D-225): a commit whose test leg passes about 75% of this (45 of 60
+    # minutes) raises it or trims the tests in that commit.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

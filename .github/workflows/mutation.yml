@@ -48,20 +48,23 @@ jobs:
         run: |
           patterns="$(uv run --locked python scripts/mutation-shard.py --shard "${{ matrix.shard }}" --of "$SHARDS")"
           echo "modules: $patterns"
+          # mutmut's exit status isn't the verdict; the .meta files are. A failed clean run leaves
+          # them with no result, and the last line fails this shard on that (register D-204).
           # shellcheck disable=SC2086
-          uv run --locked mutmut run --max-children 4 $patterns > mutmut.log 2>&1 || true
+          uv run --locked mutmut run --max-children 4 $patterns > mutmut.log 2>&1 || echo "mutmut exited $?"
           tail -c 4000 mutmut.log | tr '\r' '\n' | tail -20
-      - run: uv run --locked mutmut export-cicd-stats
+          uv run --locked python scripts/mutation-merge.py --shard mutants/src
       - name: Diffs of surviving mutants
         run: uv run --locked python scripts/mutation-diffs.py | tee survivors.txt
-      - run: cp mutants/mutmut-cicd-stats.json "stats-${{ matrix.shard }}.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # Also after a failed clean run, so the gate can name this shard.
+        if: ${{ !cancelled() }}
         with:
           name: mutation-shard-${{ matrix.shard }}
-          # The .meta files hold each mutant's result and run time: the merge's source, and the
-          # source for mutation-shard.py's weights.
+          # The .meta files hold each mutant's result and run time: the source for the merge and
+          # the gate, and for mutation-weights.py, which writes mutation-shard.py's WEIGHTS.
+          # survivors.txt is for reading.
           path: |
-            stats-${{ matrix.shard }}.json
             survivors.txt
             mutants/src/**/*.meta
           retention-days: 14
@@ -76,16 +79,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Every shard finished
-        if: ${{ needs.shard.result != 'success' }}
-        run: |
-          echo "a mutation shard didn't finish: ${{ needs.shard.result }}" >&2
-          exit 1
+      # The merge and the gate run after a failed shard too, so the gate names a shard whose clean
+      # run failed; the last step fails the job for any shard that didn't succeed.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ !cancelled() }}
         with:
           pattern: mutation-shard-*
           path: shards
       - name: Merge
+        if: ${{ !cancelled() }}
         run: python3 scripts/mutation-merge.py merged.json shards
       - name: Gate
+        if: ${{ !cancelled() }}
         run: python3 scripts/mutation-gate.py merged.json --min-score 95
+      - name: Every shard finished
+        if: ${{ always() && needs.shard.result != 'success' }}
+        run: |
+          echo "a mutation shard didn't finish: ${{ needs.shard.result }}" >&2
+          exit 1

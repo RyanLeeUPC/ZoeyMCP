@@ -11,11 +11,11 @@ dropped and counted, any other shape refusing the server, and no ``kinds`` read 
 from __future__ import annotations
 
 import copy
-import re
 from typing import Any
 
 import pytest
 
+from tests.unit.plainid import plain_id
 from zoeymcp.common.pinhash import DefinitionKind
 from zoeymcp.common.policy.attention import Attention, attention, quiet
 from zoeymcp.common.policy.schema import Tools, hash_token
@@ -412,11 +412,6 @@ def test_a_server_without_a_policy_name_is_counted_not_named() -> None:
 
 TEMPLATE = "notes://notes/{id}"
 FIXED = "notes://index"
-
-
-def plain_id(value: Any) -> str:
-    """A test ID pytest can find again by its node ID (as ``test_policyseal.py``'s)."""
-    return re.sub(r"[^A-Za-z0-9_.:=, -]+", "_", repr(value))[:60]
 
 
 def lists(**names: Any) -> dict[str, Any]:

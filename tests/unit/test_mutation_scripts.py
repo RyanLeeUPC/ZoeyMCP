@@ -1,6 +1,7 @@
 """The mutation workflow's scripts: shards cover every mutated module once, the merge counts each
-mutant once from the shards' .meta files, and the gate fails a mutant no shard ran, a low overall
-score and a module below its floor."""
+mutant once from the shards' .meta files, a shard whose .meta files hold no result fails its own
+job, and the gate fails a mutant no shard ran (naming a shard whose clean run failed), a low
+overall score and a module below its floor."""
 
 from __future__ import annotations
 
@@ -145,6 +146,7 @@ def test_a_split_module_counts_each_mutant_once(tmp_path: Path) -> None:
     assert merged["modules"]["zoeymcp.vault.peer"]["killed"] == 1
     assert (merged["killed"], merged["total"], merged["not_checked"]) == (2, 5, 0)
     assert merged["seconds_by_shard"] == {"mutation-shard-0": 3.0, "mutation-shard-1": 4.0}
+    assert merged["results_by_shard"] == {"mutation-shard-0": 2, "mutation-shard-1": 3}
     assert merged["shards"] == 2
 
 
@@ -174,6 +176,29 @@ def test_the_merge_cli_writes_the_stats(
     assert "mutation-shard-0: 2 s of test time" in capsys.readouterr().out
     monkeypatch.setattr(sys, "argv", ["mutation-merge.py", str(out)])
     assert merge.main() == 2
+
+
+def test_a_shard_with_no_result_fails_its_own_job(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-204: a failed clean run leaves every .meta with no result, and the shard step fails."""
+    src = tmp_path / "shard" / "mutants" / "src"
+
+    def check(root: Path) -> int:
+        monkeypatch.setattr(sys, "argv", ["mutation-merge.py", "--shard", str(root)])
+        result: int = merge.main()
+        return result
+
+    assert check(tmp_path / "none") == 1
+    assert "no .meta files under" in capsys.readouterr().err
+    write_meta(tmp_path, "shard", "zoeymcp.vault.peer", {"a": None, "b": None})
+    assert check(src) == 1
+    assert capsys.readouterr().err == (
+        f"no mutant under {src} has a result: mutmut's clean run failed (its log says why)\n"
+    )
+    write_meta(tmp_path, "shard", "zoeymcp.vault.store", {"c": 33})
+    assert check(src) == 0
+    assert capsys.readouterr().out == "1 of 3 mutants have a result\n"
 
 
 def stats(**modules: dict[str, int]) -> dict[str, Any]:
@@ -212,6 +237,31 @@ def test_the_gate_needs_every_mutant_run_once(
     assert run_gate(tmp_path, monkeypatch, low) == 1
     untested = stats(a_x={"no_tests": 10})
     assert run_gate(tmp_path, monkeypatch, untested) == 1
+
+
+def test_the_gate_names_a_shard_whose_clean_run_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    half = stats(a_x={"killed": 5})
+    assert run_gate(tmp_path, monkeypatch, half) == 1
+    assert capsys.readouterr().err == (
+        "5 mutant(s) have no result: the shards don't cover the modules\n"
+    )
+    half["results_by_shard"] = {"mutation-shard-1": 0, "mutation-shard-0": 5}
+    assert run_gate(tmp_path, monkeypatch, half) == 1
+    assert capsys.readouterr().err == (
+        "5 mutant(s) have no result: "
+        "the clean run failed in mutation-shard-1 (its mutmut log says why)\n"
+    )
+    none = {**stats(a_x={}), "results_by_shard": {"mutation-shard-0": 0, "mutation-shard-1": 0}}
+    assert run_gate(tmp_path, monkeypatch, none) == 1
+    assert capsys.readouterr().err == (
+        "no mutant was tested: the clean run failed in mutation-shard-0, mutation-shard-1 "
+        "(its mutmut log says why)\n"
+    )
+    del none["results_by_shard"]
+    assert run_gate(tmp_path, monkeypatch, none) == 1
+    assert capsys.readouterr().err == "no mutant was tested: the mutation run is broken\n"
 
 
 def test_a_module_below_its_floor_fails_alone(

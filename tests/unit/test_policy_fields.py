@@ -27,6 +27,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.unit.plainid import plain_id
 from zoeymcp.common.policy import fields
 from zoeymcp.common.policy.fields import (
     AUTHORIZE_PARAMS,
@@ -430,12 +431,6 @@ def test_the_form_is_named_in_the_refusal() -> None:
 
 
 # --- resource templates and fixed resources (M6 design L.1) -------------------------------------
-
-
-def plain_id(value: object) -> str:
-    """A test ID pytest can find again by its node ID (as test_policyseal.py's): no escapes, line
-    breaks or characters outside ASCII."""
-    return re.sub(r"[^A-Za-z0-9_.:=, -]+", "_", repr(value))[:60]
 
 
 LONG_TEMPLATE = "notes://h/" + "a" * (TEMPLATE_MAX - len("notes://h//{id}")) + "/{id}"

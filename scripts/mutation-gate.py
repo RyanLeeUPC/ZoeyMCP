@@ -5,7 +5,9 @@ Usage: python scripts/mutation-gate.py STATS_JSON --min-score PERCENT [--pyproje
 STATS_JSON is mutation-merge.py's output. The per-module floors are pyproject.toml's
 ``[tool.zoeymcp.mutation-floors]``: a glob over dotted module names to a percentage, like
 ``"zoeymcp.portal.*" = 90``. A module must reach every floor whose glob matches it, and a floor
-that matches no module fails, so a renamed module can't drop its floor unnoticed.
+that matches no module fails, so a renamed module can't drop its floor unnoticed. A mutant with
+no result fails too, and the message names each shard whose clean run failed (a shard with no
+result in ``results_by_shard``), not only the shards' coverage.
 """
 
 from __future__ import annotations
@@ -32,6 +34,15 @@ def score(stats: dict[str, Any]) -> tuple[int, float]:
     """The mutants tested, and the percentage killed (a timeout counts as a kill)."""
     tested: int = stats["killed"] + stats["survived"] + stats["timeout"] + stats["suspicious"]
     return tested, 100.0 * (stats["killed"] + stats["timeout"]) / tested if tested else 0.0
+
+
+def clean_runs_failed(stats: dict[str, Any]) -> str:
+    """Names the shards whose .meta files hold no result, as a failed clean run leaves them
+    (register D-204), or "" when every shard ran mutants."""
+    empty = sorted(name for name, count in stats.get("results_by_shard", {}).items() if not count)
+    if not empty:
+        return ""
+    return f"the clean run failed in {', '.join(empty)} (its mutmut log says why)"
 
 
 def main() -> int:
@@ -82,14 +93,13 @@ def main() -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write(report + "\n")
+    failed = clean_runs_failed(stats)
     if tested == 0:
-        print("no mutant was tested: the mutation run is broken", file=sys.stderr)
+        print(f"no mutant was tested: {failed or 'the mutation run is broken'}", file=sys.stderr)
         return 1
     if stats["not_checked"]:
-        print(
-            f"{stats['not_checked']} mutant(s) have no result: the shards don't cover the modules",
-            file=sys.stderr,
-        )
+        cause = failed or "the shards don't cover the modules"
+        print(f"{stats['not_checked']} mutant(s) have no result: {cause}", file=sys.stderr)
         return 1
     if stats.get("segfault"):
         print("mutation run had segfaults", file=sys.stderr)

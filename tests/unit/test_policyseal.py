@@ -15,13 +15,13 @@ import hashlib
 import hmac
 import io
 import json
-import re
 from dataclasses import replace
 from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from tests.unit.plainid import plain_id
 from zoeymcp.common import logs
 from zoeymcp.common.canonical import digest, dumps_canonical
 from zoeymcp.vault import policyseal
@@ -83,12 +83,6 @@ POLICY: dict[str, Any] = {
     "routes": [{"name": "notes", "placeholder": SENTINEL}],
 }
 RATCHET: dict[str, Any] = {"egress_key_floor": 1, "gateway_key_floor": 1}
-
-
-def plain_id(value: Any) -> str:
-    """A test ID pytest can find again by its node ID: escapes, line breaks and characters
-    outside ASCII in a ``repr`` make mutmut's rerun by ID fail ("not found")."""
-    return re.sub(r"[^A-Za-z0-9_.:=, -]+", "_", repr(value))[:60]
 
 
 def body(**changes: Any) -> bytes:
@@ -580,7 +574,7 @@ BAD_HEADERS: list[dict[str, Any]] = [
 ]
 
 
-@pytest.mark.parametrize("changes", BAD_HEADERS, ids=repr)
+@pytest.mark.parametrize("changes", BAD_HEADERS, ids=plain_id)
 def test_a_header_unseal_refuses_seal_refuses_too(changes: dict[str, Any]) -> None:
     head = header(**changes)
     error = refused(forged_revision(head))
@@ -618,7 +612,7 @@ def test_a_header_with_another_field_is_refused() -> None:
         # policy seed --state on a used volume (F.3).
         {**form("seed"), "author": {"by": "host", "via": "offline"}},
     ],
-    ids=repr,
+    ids=plain_id,
 )
 def test_every_header_form_round_trips(changes: dict[str, Any]) -> None:
     data = seal_revision(header(**changes), body(), keys=KEYS, nonce=NONCE)
@@ -710,7 +704,7 @@ def test_a_head_round_trips_as_d2_states_it() -> None:
         replace(HEAD, revision=REVISION_MAX),
         replace(HEAD, revision=1),
     ],
-    ids=repr,
+    ids=plain_id,
 )
 def test_every_head_form_round_trips(head: Head) -> None:
     assert unseal_head(seal_head(head, KEYS), KEYS, None) == head
@@ -734,7 +728,7 @@ BAD_HEADS: list[dict[str, Any]] = [
 ]
 
 
-@pytest.mark.parametrize("changes", BAD_HEADS, ids=repr)
+@pytest.mark.parametrize("changes", BAD_HEADS, ids=plain_id)
 def test_a_head_unseal_refuses_seal_refuses_too(changes: dict[str, Any]) -> None:
     document = {**json.loads(seal_head(HEAD, KEYS)), **changes}
     with pytest.raises(SealRefused) as caught:
@@ -814,7 +808,7 @@ def test_an_anchor_round_trips_as_d2_states_it() -> None:
         replace(ANCHOR, retired_key_id=OLD.key_id),
         replace(ANCHOR, retired_key_id=KEYS.key_id),
     ],
-    ids=repr,
+    ids=plain_id,
 )
 def test_every_anchor_form_round_trips(anchor: Anchor) -> None:
     """A retired key naming the anchor's own key is read: refusing it is the start's (D.6 row 1)."""
@@ -836,7 +830,7 @@ BAD_ANCHORS: list[dict[str, Any]] = [
 ]
 
 
-@pytest.mark.parametrize("changes", BAD_ANCHORS, ids=repr)
+@pytest.mark.parametrize("changes", BAD_ANCHORS, ids=plain_id)
 def test_an_anchor_unseal_refuses_seal_refuses_too(changes: dict[str, Any]) -> None:
     document = {**json.loads(seal_anchor(ANCHOR, KEYS)), **changes}
     with pytest.raises(SealRefused) as caught:

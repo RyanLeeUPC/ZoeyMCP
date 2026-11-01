@@ -3,15 +3,13 @@ name: advisories
 # Known advisories against uv.lock, on dev. Dependabot reads only the default branch, which holds
 # the initial commit until the first pull request into main, so this job is the advisory signal
 # until then (register D-96). A failing run means a locked package has an advisory: fix it with an
-# exclude-newer-package exception and a relock, as pyproject.toml's [tool.uv] does.
+# exclude-newer-package exception and a relock, as pyproject.toml's [tool.uv] does. It runs on
+# every dev push, not only a lock change: an advisory can be published against an unchanged lock,
+# and the schedule below runs only once this file is on main.
 
 on:
   push:
     branches: [dev]
-    paths:
-      - uv.lock
-      - pyproject.toml
-      - .github/workflows/advisories.yml
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:

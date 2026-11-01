@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tests.unit.plainid import plain_id
 from zoeymcp.common import canonical
 from zoeymcp.common.policy.view import MODE_HEADER, REVISION_HEADER
 from zoeymcp.gateway import logs
@@ -44,12 +45,6 @@ B = "b" * 32
 
 def deployment(n: int) -> str:
     return f"{n:032x}"
-
-
-def plain_id(value: Any) -> str:
-    """A test ID pytest finds again: the value's repr, ASCII only and no backslash, ``/`` in its
-    place (mutmut reruns by node ID)."""
-    return repr(value).encode("ascii", "backslashreplace").decode().replace("\\", "/")
 
 
 @pytest.fixture
