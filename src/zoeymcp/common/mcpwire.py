@@ -3,7 +3,8 @@
 One place for both, so the gateway's egress filter (:mod:`zoeymcp.gateway.egressrules`), the
 bridge's admission (:mod:`zoeymcp.bridge.admit`) and the vault's envelope reader (M8) read the
 same method sets, ``_meta`` keys and header allowlist, and decode ``Mcp-Name`` the same way. Each
-moved here unchanged:
+moved here with its behaviour unchanged (M8 step 3 reshaped :func:`decode_name` and
+:func:`mismatch` so that a mutation test can tell every one of their mutants apart):
 
 - the requests, notifications, ``_meta`` keys and headers the egress filter lets out (M3 design
   F.2; M6 design L.4, L.6 for the kinds beyond tools);
@@ -81,13 +82,15 @@ def decode_name(value: str) -> str | None:
         return value
     payload = found.group(1)
     try:
-        decoded = base64.b64decode(payload, validate=True)
+        decoded = base64.b64decode(payload)
     except binascii.Error:
         return None
-    if base64.b64encode(decoded).decode("ascii") != payload:
+    # Canonical: it encodes back to exactly the payload, so no stray or misplaced character
+    # (which a lenient decode drops) and no padding variant passes.
+    if base64.b64encode(decoded) != payload.encode():
         return None
     try:
-        return decoded.decode("utf-8")
+        return decoded.decode()
     except UnicodeDecodeError:
         return None
 
@@ -97,20 +100,25 @@ def mismatch(routing: Mapping[str, tuple[str, ...]], message: Mapping[str, Any])
     header must be sent once and equal its body field; ``Mcp-Name`` only on the methods that
     name something."""
     for name in ROUTING_HEADERS:
-        if len(routing.get(name, ())) > 1:
+        if len(_sent(routing, name)) > 1:
             return f"{name} appears more than once"
     params = message.get("params", {})
     meta = params.get("_meta")
     version = meta.get(PROTOCOL_VERSION_META) if isinstance(meta, dict) else None
-    if routing.get(VERSION_HEADER, ()) != (version,):
+    if _sent(routing, VERSION_HEADER) != (version,):
         return f"{VERSION_HEADER} doesn't match the request's _meta protocol version"
-    if routing.get(METHOD_HEADER, ()) != (message["method"],):
+    if _sent(routing, METHOD_HEADER) != (message["method"],):
         return f"{METHOD_HEADER} doesn't match the request's method"
     key = NAME_BEARING.get(message["method"])
     if key is None:
         return None
-    names = routing.get(NAME_HEADER, ())
+    names = _sent(routing, NAME_HEADER)
     decoded = decode_name(names[0]) if names else None
     if decoded is None or decoded != params.get(key):
         return f"{NAME_HEADER} doesn't match the request's {key}"
     return None
+
+
+def _sent(routing: Mapping[str, tuple[str, ...]], name: str) -> tuple[str, ...]:
+    """The values sent for one routing header, none when it wasn't sent."""
+    return routing.get(name) or ()

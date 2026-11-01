@@ -43,6 +43,7 @@ Decision = Literal[
     "changed",
     "shutdown",
 ]
+How = Literal["elicitation", "relay"]
 # The one list of decisions that start a cooldown (E.1). The others weren't a human's refusal,
 # and the hourly cap still bounds a cycle of ask and cancel.
 COOLDOWN_DECISIONS: Final = frozenset(
@@ -164,6 +165,9 @@ class Pending:
     expires_at: float
     hard_deadline: float
     decision: Decision | None = None
+    # How it is asked (M8 design C.1): on the agent's own session, or relayed to an out-of-band
+    # approver (M8 step 12b). Every record is elicited until relays exist.
+    how: How = "elicitation"
 
     def __repr__(self) -> str:
         return f"Pending(ref={self.ref}, decision={self.decision})"

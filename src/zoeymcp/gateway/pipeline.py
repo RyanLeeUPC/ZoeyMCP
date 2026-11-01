@@ -7,9 +7,9 @@
 3. **Canonicalize** them, so the object validated is the object sent.
 4. **Validate** against the pinned schema. The answer names the agent's own key and the
    keyword, never a value.
-5. **Decide** from policy, never annotations: ``allow`` continues; ``approve`` goes to the
-   approval decision point (:mod:`.approve`), which asks the human and runs the accepted call
-   itself; anything unclassified is refused.
+5. **Decide** from policy, never annotations (:func:`.routing.decide`): ``allow`` continues;
+   ``approve`` goes to the approval decision point (:mod:`.approve`), which asks the human and
+   runs the accepted call itself; anything unclassified is refused.
 6. **Call** with the validated object, registered with the egress filter, under the pin it was
    validated under. A policy change that takes the client's access to the server away stops the
    call (M3 design D.3), which cancels it upstream too.
@@ -37,8 +37,9 @@ from ..common import canonical
 from ..common.approvaltext import Plan
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway
-from . import logs, schemas
+from . import logs, routing, schemas
 from .approve import Approvals, Asking, AskSession
+from .approvers import NO_APPROVALS as NO_APPROVALS
 from .connstate import Era
 from .sanitize import map_upstream, sanitize_result
 from .toolkitsource import ToolkitSource, ToolkitUnavailable
@@ -50,7 +51,6 @@ UNKNOWN_TOOL = "Unknown tool"
 UNCLASSIFIED = "refused: this tool is not classified"
 UNEXPECTED_INPUT = "refused: unexpected input responses"
 STATE_REFUSED = "refused: approval expired or already used"
-NO_APPROVALS = "refused: no approver for this client"
 TOOLKIT_UNAVAILABLE = "toolkit unavailable"
 REVOKED = (
     "refused: this client's access to the server changed while the call ran; "
@@ -208,23 +208,20 @@ async def call_tool(
             log("refused", "arguments")
             return refused(f"arguments refused: at {problem}")
     # 5. Decide, from policy only
-    request_state = approval.request_state if approval is not None else None
-    inputs = approval.input_responses if approval is not None else None
-    if call.era == "legacy" and (request_state is not None or inputs):
-        log("refused", "unexpected_input")
-        return refused(f"{UNEXPECTED_INPUT} (ref {ref})")
-    if name in call.policy.tools.approve:
-        if approval is None:
-            log("refused", "unattended")
-            return refused(f"{NO_APPROVALS} (ref {ref})")
+    route = routing.decide(
+        tool=name,
+        tools=call.policy.tools,
+        client=approval.gateway.clients.get(call.client) if approval is not None else None,
+        era=call.era,
+        request_state=approval is not None and approval.request_state is not None,
+        inputs=approval is not None and bool(approval.input_responses),
+    )
+    if isinstance(route, routing.AskElicitation) and approval is not None:
         return await _approve(source, call, name, shaped, exposed, ref, progress, approval, log)
-    if request_state is not None:
-        # A handle is good only for the approve tool it was issued for (D.6).
-        log("refused", "unexpected_state")
-        return refused(STATE_REFUSED)
-    if name not in call.policy.tools.allow:
-        log("refused", "unclassified")
-        return refused(UNCLASSIFIED)
+    if not isinstance(route, routing.Allow):
+        # The route asks only with an approval context: it names the client, or carries a handle.
+        reason = route.reason if isinstance(route, routing.Refuse) else "no_approvals"
+        return _refused_route(reason, call, name, ref, log)
     # 6. Call
     with (in_flight or InFlight()).track(call.client, call.server) as scope:
         try:
@@ -255,6 +252,32 @@ async def call_tool(
     result_bytes = sum(len(getattr(block, "text", "")) for block in result.content)
     log("tool_error" if result.is_error else "ok", result_bytes=result_bytes)
     return result
+
+
+def _refused_route(
+    reason: routing.RefuseReason, call: Call, name: str, ref: str, log: Any
+) -> CallToolResult:
+    """Step 5's refusals, each worded and logged as before the route was its own module."""
+    if reason == "unexpected_input":
+        log("refused", "unexpected_input")
+        return refused(f"{UNEXPECTED_INPUT} (ref {ref})")
+    if reason == "unexpected_state":
+        # A handle is good only for the approve tool it was issued for (D.6).
+        log("refused", "unexpected_state")
+        return refused(STATE_REFUSED)
+    if reason == "no_approvals":
+        logs.event(
+            "approval_refused",
+            client=call.client,
+            server=call.server,
+            tool=name,
+            ref=ref,
+            reason="unattended",
+        )
+        log("refused", "unattended")
+        return refused(f"{NO_APPROVALS} (ref {ref})")
+    log("refused", "unclassified")
+    return refused(UNCLASSIFIED)
 
 
 def _sanitized(

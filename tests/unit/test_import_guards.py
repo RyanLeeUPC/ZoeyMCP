@@ -535,6 +535,39 @@ def test_serverpaths_uses_the_standard_library_and_the_policy_package_only() -> 
     assert not [m for m in loaded if not m.startswith("zoeymcp.common") and m != "zoeymcp"]
 
 
+# The gateway's pure approval modules (M8 design C.1): the routing decision and the rules for a
+# waiting prompt. Of ours they stand on the policy package and the approval core only.
+GATEWAY_PURE = ("routing", "approvalrules")
+GATEWAY_PURE_OURS = ("zoeymcp.common.policy.", "zoeymcp.gateway.approvals")
+# What the policy package's closure needs beyond the standard library.
+POLICY_PACKAGES = ("pydantic", "pydantic_core", "yaml", "idna")
+
+
+@pytest.mark.parametrize("name", GATEWAY_PURE)
+def test_a_pure_gateway_module_does_no_io_and_needs_no_sdk(name: str) -> None:
+    path = PACKAGE / "gateway" / f"{name}.py"
+    names = list(imported_modules(path, module_name(path, PACKAGE.parent)))
+    assert "zoeymcp.gateway.approvals" in names
+    found = [
+        imported
+        for imported in names
+        if not imported.startswith(GATEWAY_PURE_OURS)
+        and (
+            (top := imported.partition(".")[0]) not in (*sys.stdlib_module_names, "__future__")
+            or top in IO_MODULES
+        )
+    ]
+    assert found == []
+    loaded = closure(PACKAGE.parent, f"zoeymcp.gateway.{name}")
+    assert beyond(loaded, POLICY_PACKAGES) == []
+    assert {m for m in loaded if not m.startswith("zoeymcp.common")} == {
+        "zoeymcp",
+        "zoeymcp.gateway",
+        "zoeymcp.gateway.approvals",
+        f"zoeymcp.gateway.{name}",
+    }
+
+
 # --- what importing it loads --------------------------------------------------------------------
 
 # Imports every module of the named packages (a missing package is skipped) in a fresh

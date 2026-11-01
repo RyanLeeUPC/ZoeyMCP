@@ -120,6 +120,7 @@ def test_the_egress_filter_and_the_bridge_read_the_same_objects() -> None:
         ("=?base64?aGk?=", None),  # not padded
         ("=?base64?aGl=?=", None),  # not canonical
         ("=?base64?a*k=?=", None),  # not Base64
+        ("=?base64?a Gk=?=", None),  # a stray character, which a lenient decode would drop
         ("=?base64?/w==?=", None),  # not UTF-8
         ("x=?base64?aGk=?=", "x=?base64?aGk=?="),  # not the whole value: as written
         ("=?base64?aGk=?=x", "=?base64?aGk=?=x"),

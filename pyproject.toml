@@ -191,6 +191,8 @@ only_mutate = [
     "*zoeymcp/gateway/connstate.py",
     "*zoeymcp/gateway/egressrules.py",
     "*zoeymcp/gateway/approvals.py",
+    "*zoeymcp/gateway/approvalrules.py",
+    "*zoeymcp/gateway/routing.py",
     "*zoeymcp/gateway/reporting.py",
     "*zoeymcp/gateway/capabilities.py",
     "*zoeymcp/gateway/witness.py",
@@ -301,3 +303,4 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.gateway.resourcematch" = 95
 "zoeymcp.gateway.sanitize" = 95
 "zoeymcp.gateway.connstate" = 95
+"zoeymcp.common.policy.serverpaths" = 95

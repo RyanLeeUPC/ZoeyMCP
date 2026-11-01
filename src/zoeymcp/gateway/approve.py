@@ -4,7 +4,8 @@ A call to a tool the policy classifies ``approve`` reaches :meth:`Approvals.hand
 pipeline has admitted, shaped, canonicalized and validated it. In order (B.2):
 
 5.1 a modern retry (``requestState``) goes to :meth:`Approvals._retry` (D.6);
-5.2 the client must be attended, and the approver ``elicitation``;
+5.2 the client must be attended (the pipeline's route, :mod:`.routing`), and the approver
+    ``elicitation``;
 5.3 the gateway must not be stopping;
 5.4 the client must be able to show a form-mode prompt on this request (D.1);
 5.6-5.7 the prompt is rendered by the gateway and checked; a text that could hide anything is
@@ -17,7 +18,8 @@ pipeline has admitted, shaped, canonicalized and validated it. In order (B.2):
     fsynced, the forward, the outcome, the lock's release; any other answer declines.
 
 Only an explicit ``accept`` runs the call. Every answer the agent sees ends with the ref the
-prompt, the ledger and the logs share.
+prompt, the ledger and the logs share. The transports that ask live in :mod:`.approvers`, and the
+rules for a waiting prompt after a policy change in :mod:`.approvalrules` (M8 design C.5).
 """
 
 from __future__ import annotations
@@ -31,17 +33,22 @@ from typing import Any, Literal, Protocol
 
 import anyio
 import mcp_types
-import pydantic
-from mcp.shared.exceptions import MCPError, NoBackChannelError
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult
 
 from ..common import approvaltext, canonical
-from ..common.approvaltext import ApprovalText, Header, Plan
+from ..common.approvaltext import Header, Plan
 from ..common.committed import Committed, CommittedCancelled
 from ..common.policy.schema import ClientApprovals
 from ..common.policy.view import ViewGateway
-from . import approvals, logs
-from .approvals import ConfirmCode, Decision, Key, Pending, Settings
+from . import approvalrules, approvals, logs
+from .approvals import Decision, Key, Pending, Settings
+from .approvers import CANT_SHOW as CANT_SHOW
+from .approvers import CHANGED as CHANGED
+from .approvers import DECISION_TEXTS as DECISION_TEXTS
+from .approvers import EXPIRED as EXPIRED
+from .approvers import NO_APPROVALS, Decided, ElicitationLegacy, ElicitationModern, Shown
+from .approvers import refused as refused
+from .approvers import with_ref as with_ref
 from .ledger import Ledger, LedgerUnavailable
 from .policyclient import Snapshot
 from .sanitize import map_upstream
@@ -62,34 +69,8 @@ OUTCOME_MARGIN = 10.0  # seconds after the forward's deadline for writing its ou
 SWEEP_INTERVAL = 1.0
 FINISH_GRACE = 2.0  # seconds a cancelled handler gets to free its lock and record why
 
-NO_APPROVER = "refused: no approver for this client"
 STOPPING = "refused: the gateway is stopping; try again shortly"
-CANT_SHOW = "refused: this client can't show approvals"
-UNEXPECTED_INPUT = "refused: unexpected input responses"
 LEDGER_DOWN = "refused: the approval ledger can't be written"
-EXPIRED = "refused: approval expired or already used"
-CHANGED = "refused: the tool or policy changed while waiting for approval"
-DECISION_TEXTS: Mapping[str, str] = {
-    "decline": "declined by operator",
-    "dismiss": "declined by operator",
-    "code_mismatch": "declined: the confirmation code didn't match",
-    "timeout": "no answer in time",
-    "withdrawn": "refused: the policy changed; call the tool again",
-    "stream_lost": "refused: the approval prompt's stream was lost",
-    "unavailable": CANT_SHOW,
-    "error": "refused: the approval request failed",
-    "mismatch": "refused: this approval belongs to a different call",
-    "changed": CHANGED,
-    "shutdown": "refused: the gateway is stopping",
-}
-
-
-def refused(text: str) -> CallToolResult:
-    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
-
-
-def with_ref(text: str, ref: str) -> CallToolResult:
-    return refused(f"{text} (ref {ref})")
 
 
 class AskSession(Protocol):
@@ -142,18 +123,9 @@ class Asking:
 
 
 @dataclass
-class _Shown:
-    """What a waiting prompt showed, kept so a modern re-ask is the same prompt."""
-
-    text: ApprovalText
-    schema: dict[str, Any]
-    settings: Settings
-    asked_wall: float
-
-
-@dataclass
 class Approvals:
-    """Every approval of one gateway process: the table, the prompts shown, the waits."""
+    """Every approval of one gateway process: the table, the prompts shown, the waits, and the
+    two transports that ask (:mod:`.approvers`), which share them."""
 
     ledger: Ledger | None
     committed: Committed
@@ -162,19 +134,25 @@ class Approvals:
     clock: Callable[[], float] = time.monotonic
     wall: Callable[[], float] = time.time
     table: approvals.Table = field(default_factory=approvals.Table)
-    _shown: dict[str, _Shown] = field(default_factory=dict)
+    _shown: dict[str, Shown] = field(default_factory=dict)
     _waits: dict[str, anyio.CancelScope] = field(default_factory=dict)
+    legacy: ElicitationLegacy = field(init=False)
+    modern: ElicitationModern = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.legacy = ElicitationLegacy(self.table, self._waits, self.clock, self._abandoned)
+        self.modern = ElicitationModern(
+            self.table, self._shown, self.clock, self._close, self._gate
+        )
 
     # --- the entry point ---------------------------------------------------------------------
 
     async def handle(self, asking: Asking) -> CallToolResult | mcp_types.InputRequiredResult:
+        """A call the pipeline's route sent here (:mod:`.routing`): a legacy request carrying
+        MRTR input never arrives, and an unattended client's call arrives only as a retry."""
         if asking.request_state is not None:
-            if asking.era == "legacy":
-                return self._refuse(asking, "unexpected_input", UNEXPECTED_INPUT)
             return await self._retry(asking)
         if asking.input_responses:
-            if asking.era == "legacy":
-                return self._refuse(asking, "unexpected_input", UNEXPECTED_INPUT)
             # Answers count only through a live handle (D.6): these are ignored, and asked anew.
             logs.event(
                 "approval_unsolicited_answer",
@@ -184,7 +162,9 @@ class Approvals:
             )
         own = _client_settings(asking.gateway, asking.client)
         if own is None or not own.attended or asking.gateway.approvals.approver != "elicitation":
-            return self._refuse(asking, "unattended", NO_APPROVER)
+            # A backstop: the route asks only for an attended client, and check refuses any
+            # approver but elicitation.
+            return self._refuse(asking, "unattended", NO_APPROVALS)
         if self.stopping():
             return self._refuse(asking, "stopping", STOPPING)
         refusal = self._gate(asking)
@@ -235,7 +215,8 @@ class Approvals:
         if not isinstance(begun, Pending):
             return self._refuse_begin(asking, begun)
         schema = CODE_SCHEMA if code is not None else EMPTY_SCHEMA
-        self._shown[asking.ref] = _Shown(text, schema, settings, asked_wall)
+        shown = Shown(text, schema, settings, asked_wall)
+        self._shown[asking.ref] = shown
         try:
             await self.ledger.write(
                 "asked",
@@ -269,9 +250,9 @@ class Approvals:
             code=code is not None,
         )
         if handle is not None:
-            return _input_required(text, schema, handle)
-        decision = await self._ask_legacy(asking, begun, text, schema)
-        return await self._decided(asking, begun, decision)
+            return self.modern.ask(shown, handle)
+        decided = await self.legacy.ask(asking, begun, shown)
+        return await self._decided(asking, decided.record, decided.decision)
 
     # --- refusals before anyone is asked -------------------------------------------------------
 
@@ -327,100 +308,19 @@ class Approvals:
             )
         return self._refuse(asking, "table_full", "refused: too many approvals are waiting")
 
-    # --- asking --------------------------------------------------------------------------------
-
-    async def _ask_legacy(
-        self, asking: Asking, record: Pending, text: ApprovalText, schema: dict[str, Any]
-    ) -> Decision:
-        """D.2 and D.4: the prompt on the call's stream, raced against the stream's loss and a
-        withdrawal. An agent cancel cancels this handler: the decision is then ``withdrawn``."""
-        found: list[Decision] = []
-
-        async def ask() -> None:
-            remaining = max(0.001, record.expires_at - self.clock())
-            try:
-                answer = await asking.session.elicit(text.value, schema, remaining)
-            except NoBackChannelError:  # a subclass of MCPError: caught first
-                found.append("unavailable")
-            except MCPError as exc:
-                found.append("timeout" if exc.error.code == mcp_types.REQUEST_TIMEOUT else "error")
-            except pydantic.ValidationError:
-                found.append("error")
-            else:
-                found.append(_decide(answer, record.code))
-            group.cancel_scope.cancel()
-
-        async def watch(event: anyio.Event) -> None:
-            await event.wait()
-            found.append("stream_lost")
-            group.cancel_scope.cancel()
-
-        try:
-            with anyio.CancelScope() as wait:
-                self._waits[record.ref] = wait
-                async with anyio.create_task_group() as group:
-                    group.start_soon(ask)
-                    if asking.disconnected is not None:
-                        group.start_soon(watch, asking.disconnected)
-        except BaseException:
-            # The agent cancelled its call, or the handler failed: nothing is sent.
-            with anyio.CancelScope(shield=True), anyio.move_on_after(FINISH_GRACE):
-                await self._close(record, "withdrawn")
-            raise
-        finally:
-            self._waits.pop(record.ref, None)
-        current = self.table.get(record.ref)
-        if current is not None and current.decision is not None:
-            return current.decision  # withdrawn by a policy change, or a shutdown
-        return found[0] if found else "error"
+    # --- asking, through the transports ------------------------------------------------------
 
     async def _retry(self, asking: Asking) -> CallToolResult | mcp_types.InputRequiredResult:
-        """D.6: a modern retry. Steps 1-6 are :func:`.approvals.retry`; 7-9 are here."""
-        result = approvals.retry(
-            self.table,
-            asking.request_state,
-            key=asking.key,
-            args_digest=canonical.digest(asking.args),
-            pin=asking.pin,
-            now=self.clock(),
-        )
-        if isinstance(result, approvals.Foreign):
-            logs.event("approval_state_foreign", client=asking.client, server=asking.server)
-            return refused(EXPIRED)
-        if isinstance(result, approvals.Unknown):
-            return refused(EXPIRED)
-        if isinstance(result, approvals.Buried):
-            return refused(DECISION_TEXTS["timeout"] if result.reason == "expired" else EXPIRED)
-        if isinstance(result, approvals.Closed):
-            record = result.record
-            await self._close(record, record.decision or "error")
-            return with_ref(DECISION_TEXTS[record.decision or "error"], record.ref)
-        record = result.record
-        responses = dict(asking.input_responses or {})
-        answer = responses.pop(approvals.INPUT_KEY, None)
-        if responses:
-            logs.event("approval_unknown_answers", ref=record.ref, count=len(responses))
-        if answer is None:
-            return await self._reask(asking, record)
-        if not isinstance(answer, mcp_types.ElicitResult):
-            return await self._decided(asking, record, "error")
-        return await self._decided(asking, record, _decide(answer, record.code))
+        """D.6: a modern retry, through the modern transport; an answer is decided here."""
+        found = await self.modern.retry(asking)
+        if isinstance(found, Decided):
+            return await self._decided(asking, found.record, found.decision)
+        return found
 
-    async def _reask(
-        self, asking: Asking, record: Pending
-    ) -> CallToolResult | mcp_types.InputRequiredResult:
-        """No answer came: ask again with a new handle, the same ref, text, code and expiry."""
-        if self._gate(asking) is not None:
-            return await self._decided(asking, record, "unavailable")
-        if not approvals.may_reask(record):
-            return await self._decided(asking, record, "error")
-        shown = self._shown.get(record.ref)
-        if shown is None:
-            return await self._decided(asking, record, "error")
-        handle = approvals.new_handle()
-        record = self.table.reask(record.ref, handle.sha256())
-        logs.event("approval_reasked", ref=record.ref, asks=record.asks)
-        return _input_required(shown.text, shown.schema, handle)
+    async def _abandoned(self, record: Pending) -> None:
+        """A legacy wait the agent cancelled, or whose handler failed: nothing is sent."""
+        with anyio.CancelScope(shield=True), anyio.move_on_after(FINISH_GRACE):
+            await self._close(record, "withdrawn")
 
     # --- deciding ------------------------------------------------------------------------------
 
@@ -488,7 +388,7 @@ class Approvals:
         """B.5: the view is still fresh, still assigns the server and lists the tool in
         ``approve``, the client is still attended, and the tool is admitted under the same pin."""
         snapshot = self.fresh()
-        if snapshot is None or not _still_allowed(snapshot.view.gateway, record.key):
+        if snapshot is None or not approvalrules.still_asked(snapshot.view.gateway, record.key):
             return True
         try:
             return await asking.admit() != record.pin
@@ -571,12 +471,10 @@ class Approvals:
         retrying: set[str] = set()
 
         def picks(record: Pending) -> bool:
-            # Seen before deciding: deciding clears the handle, so the record can't tell after.
-            if not matches(record):
-                return False
-            if record.handle_sha256 is None:
+            picked, mid_retry = approvalrules.withdraw_picks(record, matches)
+            if mid_retry:
                 retrying.add(record.ref)
-            return True
+            return picked
 
         found = self.table.withdraw(picks, decision, self.clock())
         for record in found:
@@ -607,7 +505,9 @@ class Approvals:
     async def withdraw_unallowed(self, gateway: ViewGateway) -> int:
         """After a policy change: prompts whose tool left ``approve`` (removed, or moved to
         ``allow``: Q32 (b)), or whose assignment or attendance went (M3 D.3)."""
-        return await self.withdraw(lambda p: not _still_allowed(gateway, p.key), "withdrawn")
+        return await self.withdraw(
+            lambda p: not approvalrules.still_asked(gateway, p.key), "withdrawn"
+        )
 
     async def sweep(self) -> None:
         swept = self.table.sweep(self.clock())
@@ -649,33 +549,6 @@ def _budget(gateway: ViewGateway, own: ClientApprovals) -> int:
 def _header(asking: Asking, deadline_wall: float) -> Header:
     deadline = datetime.fromtimestamp(deadline_wall, UTC)
     return Header(asking.ref, asking.client, asking.server, asking.tool, deadline)
-
-
-def _still_allowed(gateway: ViewGateway, key: Key) -> bool:
-    client = gateway.clients.get(key.client)
-    server = gateway.servers.get(key.server)
-    if client is None or server is None or key.server not in client.servers:
-        return False
-    if client.approvals is None or not client.approvals.attended:
-        return False
-    tools = getattr(server, "tools", None)
-    return tools is not None and key.tool in tools.approve
-
-
-def _decide(answer: Any, code: ConfirmCode | None) -> Decision:
-    if not isinstance(answer, mcp_types.ElicitResult):
-        return "error"
-    return approvals.decide_answer(answer.action, answer.content, code)
-
-
-def _input_required(
-    text: ApprovalText, schema: dict[str, Any], handle: approvals.Handle
-) -> mcp_types.InputRequiredResult:
-    params = mcp_types.ElicitRequestFormParams(message=text.value, requested_schema=schema)
-    return mcp_types.InputRequiredResult(
-        input_requests={approvals.INPUT_KEY: mcp_types.ElicitRequest(params=params)},
-        request_state=handle.reveal(),
-    )
 
 
 def _upstream_outcome(exc: UpstreamError) -> dict[str, Any]:
