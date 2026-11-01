@@ -18,6 +18,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from tests.fakes.telegram import BotApi
+
 
 @dataclass
 class Seen:
@@ -143,28 +145,21 @@ class LastFmFake(Fake):
 
 @dataclass
 class TelegramFake(Fake):
+    """The fake Bot API (``tests/fakes/telegram.py``, M8 design O.1) behind this module's
+    recording: an unknown method's 404 repeats the path, token included."""
+
     token: str = ""
+    bot: BotApi = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.bot = BotApi(self.token)
 
     def app(self) -> Starlette:
         return Starlette(routes=[Route("/{bot}/{method}", self.api, methods=["GET", "POST"])])
 
     async def api(self, request: Request) -> Response:
-        seen = await self.record(request)
-        if request.path_params["bot"] != f"bot{self.token}":
-            return JSONResponse(
-                {"ok": False, "error_code": 401, "description": "Unauthorized"}, status_code=401
-            )
-        method = request.path_params["method"]
-        if method == "getMe":
-            return JSONResponse(
-                {"ok": True, "result": {"id": 42, "is_bot": True, "username": "example_bot"}}
-            )
-        if method == "sendMessage":
-            return JSONResponse({"ok": True, "result": {"message_id": 7}})
-        return JSONResponse(
-            {"ok": False, "error_code": 404, "description": f"Not Found: {seen.path}"},
-            status_code=404,
-        )
+        await self.record(request)
+        return await self.bot.endpoint(request)
 
 
 # --- S4: Atlassian-style basic auth ------------------------------------------------------------

@@ -65,6 +65,7 @@ from .mcp_server import (
     UNSUPPORTED_VERSION,
     ZERO_WIDTH,
     AddTools,
+    Ask,
     BackChannel,
     BackChannelAnswer,
     BackChannelStream,
@@ -1295,6 +1296,103 @@ async def test_modern_input_required_with_only_request_state() -> None:
     assert text_of(result) == "hi"
     assert [call.retry for call in fake.calls] == [False, False, True]
     assert fake.requests("tools/call")[-1].params["requestState"] == REQUEST_STATE
+
+
+# A script of several asks on both streams (M8 design O.1, register D-75): an elicitation on the
+# call stream and on the GET stream, then sampling.
+SCRIPT = [Ask("elicit_form", "call"), Ask("elicit_form", "get"), Ask("sampling", "call")]
+
+
+@pytest.mark.parametrize(("callbacks", "outcome"), [(False, "error -32600"), (True, "answered")])
+async def test_legacy_back_channel_script_asks_each_in_order_on_its_stream(
+    callbacks: bool, outcome: str
+) -> None:
+    fake = McpFake(back_channels=list(SCRIPT))
+    options = CALLBACKS if callbacks else {}
+    with running(fake) as url:
+        async with connect(url, mode="legacy", **options) as client:
+            await client.list_tools()
+            await until(lambda: any(r.method == "GET" and r.status == 200 for r in fake.received))
+            result = await client.call_tool("echo", {"text": "hi"})
+    assert text_of(result) == "hi"
+    assert fake.answers == [BackChannelAnswer(ask.kind, ask.stream, outcome) for ask in SCRIPT]
+    [call] = fake.requests("tools/call")
+    [get] = [item for item in fake.received if item.method == "GET" and item.status == 200]
+    assert sent_methods(call) == ["elicitation/create", "sampling/createMessage"]
+    assert sent_methods(get) == ["elicitation/create"]
+
+
+async def test_back_channel_asks_before_the_script() -> None:
+    fake = McpFake(back_channel="roots", back_channels=[Ask("sampling")])
+    assert fake.asks() == [Ask("roots", "call"), Ask("sampling", "call")]
+    with running(fake) as url:
+        async with connect(url, mode="legacy") as client:
+            await client.list_tools()
+            await client.call_tool("echo", {"text": "hi"})
+    assert [answer.kind for answer in fake.answers] == ["roots", "sampling"]
+
+
+async def test_modern_back_channel_script_is_one_input_required() -> None:
+    fake = McpFake(back_channels=[*SCRIPT, Ask("state_only")])
+    with running(fake) as url:
+        response = echo_call(url)
+        async with connect(url, **CALLBACKS) as client:
+            await client.list_tools()
+            result = await client.call_tool("echo", {"text": "hi"})
+    requests = response.json()["result"]["inputRequests"]
+    assert {key: request["method"] for key, request in requests.items()} == {
+        "ask-1": "elicitation/create",
+        "ask-2": "elicitation/create",
+        "ask-3": "sampling/createMessage",
+    }
+    assert text_of(result) == "hi"
+    assert [call.retry for call in fake.calls] == [False, False, True]
+    retry = fake.requests("tools/call")[-1].params
+    assert sorted(retry["inputResponses"]) == ["ask-1", "ask-2", "ask-3"]
+    # The modern era has no stream to ask on: nothing is recorded as a legacy answer.
+    assert fake.answers == []
+
+
+# A script imitating a gateway prompt (D-75's anti-spoofing rows): its own text on both streams,
+# with two URL elicitations that must not share an id.
+SPOOF = "ZoeyMCP: approve this call in the portal."
+SPOOFING = [
+    Ask("elicit_url", "call", SPOOF),
+    Ask("elicit_url", "get", SPOOF),
+    Ask("sampling", "call", SPOOF),
+]
+
+
+def sent_params(record: Recorded) -> list[Any]:
+    """The params of the server-to-client requests the fake sent in answer to ``record``."""
+    return [m["params"] for m in sse_messages(record.response.decode()) if "method" in m]
+
+
+async def test_legacy_script_messages_reach_the_client_on_both_streams() -> None:
+    fake = McpFake(back_channels=list(SPOOFING))
+    with running(fake) as url:
+        async with connect(url, mode="legacy", **CALLBACKS) as client:
+            await client.list_tools()
+            await until(lambda: any(r.method == "GET" and r.status == 200 for r in fake.received))
+            await client.call_tool("echo", {"text": "hi"})
+    [call] = fake.requests("tools/call")
+    [get] = [item for item in fake.received if item.method == "GET" and item.status == 200]
+    [first, sampling] = sent_params(call)
+    [second] = sent_params(get)
+    assert (first["message"], first["elicitationId"]) == (SPOOF, "elicit-1")
+    assert (second["message"], second["elicitationId"]) == (SPOOF, "elicit-2")
+    assert sampling["messages"][0]["content"]["text"] == SPOOF
+    assert [answer.outcome for answer in fake.answers] == ["answered"] * 3
+
+
+async def test_modern_script_messages_reach_the_client_in_input_required() -> None:
+    fake = McpFake(back_channels=list(SPOOFING))
+    with running(fake) as url:
+        response = echo_call(url)
+    requests = response.json()["result"]["inputRequests"]
+    assert requests["ask-1"]["params"]["message"] == SPOOF
+    assert requests["ask-2"]["params"]["message"] == SPOOF
+    assert requests["ask-3"]["params"]["messages"][0]["content"]["text"] == SPOOF
 
 
 # --- secret echo --------------------------------------------------------------------------------
