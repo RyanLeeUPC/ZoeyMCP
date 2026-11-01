@@ -6,7 +6,7 @@ newline), ``ts`` (UTC milliseconds), ``ref``, ``kind`` and ``writer``. Arguments
 appear only as keyed digests (``hmac-sha256:``), never as values.
 
 This module is pure and standard library only, so the gateway writes these records and M8's vault
-can write the same ones. :mod:`zoeymcp.gateway.ledger` does the file I/O around it.
+can write the same ones. :mod:`.ledgerfile` does the file I/O around it.
 """
 
 from __future__ import annotations

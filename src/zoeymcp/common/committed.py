@@ -7,6 +7,9 @@ The request only waits for the result, so an agent cancel, a disconnect, a revoc
 view or uvicorn's shutdown leaves the call running. Shutdown waits for the registry to empty
 before anything else stops, up to the latest entry's deadline, and only then cancels what is
 left: the one cancel that may reach a committed call.
+
+It moved here from the gateway unchanged (M8 design step 2), so the vault's held calls can use the
+same registry.
 """
 
 from __future__ import annotations

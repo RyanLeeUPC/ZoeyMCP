@@ -332,7 +332,7 @@ def broken_disk(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(*args: Any, **kwargs: Any) -> int:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr("zoeymcp.gateway.ledger.os.open", refuse)
+    monkeypatch.setattr("zoeymcp.common.ledgerfile.os.open", refuse)
 
 
 async def test_a_critical_record_that_cant_be_written_raises(

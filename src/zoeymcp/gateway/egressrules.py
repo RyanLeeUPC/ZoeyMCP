@@ -14,6 +14,9 @@ pipeline validated: its ``(name, digest(arguments))`` must match a registration,
 A server that enables prompts, resources or completions is also asked for them (M6 design L.4,
 L.6): its connection's target names what it enables, and only those kinds' requests go out on
 it, each with only its own params (no ``requestState`` or ``inputResponses`` retry).
+
+The method sets, the ``_meta`` keys and the header allowlist live in :mod:`zoeymcp.common.mcpwire`
+(M8 design G-19), which the vault's envelope reader shares.
 """
 
 from __future__ import annotations
@@ -24,47 +27,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..common import canonical
+from ..common.mcpwire import HEADERS as HEADERS
+from ..common.mcpwire import KIND_REQUESTS as KIND_REQUESTS
+from ..common.mcpwire import META_KEYS as META_KEYS
+from ..common.mcpwire import NOTIFICATIONS as NOTIFICATIONS
+from ..common.mcpwire import REQUESTS as REQUESTS
 from .access import SUPPORTED_VERSIONS
 
 METHODS = frozenset({"POST", "GET", "DELETE"})
-HEADERS = frozenset(
-    {
-        "host",
-        "accept",
-        "accept-encoding",
-        "connection",
-        "content-type",
-        "content-length",
-        "user-agent",
-        "mcp-protocol-version",
-        "mcp-session-id",
-        "mcp-method",
-        "mcp-name",
-        "last-event-id",
-    }
-)
 PARAM_HEADER_PREFIX = "mcp-param-"
 GATEWAY_KEY_HEADER = "x-zoeymcp-gateway"  # hardened tier only
 # The SDK sends this on the legacy GET stream, with this value only.
 CACHE_CONTROL = ("cache-control", "no-store")
-REQUESTS = frozenset(
-    {"initialize", "server/discover", "tools/list", "tools/call", "subscriptions/listen", "ping"}
-)
-# The requests of the kinds beyond tools, by the enable entry that allows them (L.4, L.6).
-KIND_REQUESTS: Mapping[str, frozenset[str]] = {
-    "prompts": frozenset({"prompts/list", "prompts/get"}),
-    "resources": frozenset({"resources/list", "resources/templates/list", "resources/read"}),
-    "completions": frozenset({"completion/complete"}),
-}
-NOTIFICATIONS = frozenset({"notifications/initialized", "notifications/cancelled"})
-META_KEYS = frozenset(
-    {
-        "io.modelcontextprotocol/protocolVersion",
-        "io.modelcontextprotocol/clientCapabilities",
-        "io.modelcontextprotocol/clientInfo",
-        "progressToken",
-    }
-)
 CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 CALL_PARAMS = frozenset({"name", "arguments", "_meta"})
 # What each request beyond tools that names something may carry (L.6).

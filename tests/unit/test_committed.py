@@ -7,8 +7,8 @@ import asyncio
 import anyio
 import pytest
 
-from zoeymcp.gateway import committed as committed_module
-from zoeymcp.gateway.committed import Committed, CommittedCancelled
+from zoeymcp.common import committed as committed_module
+from zoeymcp.common.committed import Committed, CommittedCancelled
 
 pytestmark = pytest.mark.anyio
 

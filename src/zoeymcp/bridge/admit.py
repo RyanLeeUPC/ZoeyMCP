@@ -17,7 +17,9 @@ message without one with 400. A modern bridge refuses ``initialize`` (400 ``-320
 its body (400 ``-32020``; ``Mcp-Name`` in the Base64 sentinel form decoded first; any
 ``Mcp-Param-*`` header is passed on unchecked, SPEC-5). Every notification is answered 202 with
 an empty body in both eras (SPEC-4); only a legacy ``notifications/initialized`` reaches the
-child as it is, and a legacy ``notifications/cancelled`` through the relay.
+child as it is, and a legacy ``notifications/cancelled`` through the relay. The routing-header
+rule is :func:`zoeymcp.common.mcpwire.mismatch`, which the vault's envelope reader shares (M8
+design G-19).
 
 ``Host`` is never read: over a standard-tier bridge's socket the vault sends ``bridge.invalid``
 for every bridge (``vault/netclient.py``'s ``BRIDGE_BASE``), in the hardened tier it names the
@@ -28,8 +30,6 @@ compared in constant time with ``ZOEYMCP_BRIDGE_TOKEN_SHA256`` (:class:`BridgeTo
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import hmac
 import json
@@ -39,6 +39,10 @@ from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
 from ..common.logs import refuse_type
+from ..common.mcpwire import PROTOCOL_VERSION_META as PROTOCOL_VERSION_META
+from ..common.mcpwire import ROUTING_HEADERS, VERSION_HEADER
+from ..common.mcpwire import decode_name as decode_name
+from ..common.mcpwire import mismatch as mismatch
 from .framing import LEGACY_VERSIONS, MESSAGE_MAX, MODERN_VERSIONS, Era, Message, parse
 
 PATH: Final = "/mcp"
@@ -48,24 +52,11 @@ METHODS: Final = ("POST", "GET", "DELETE")
 INVALID_REQUEST: Final = -32600
 HEADER_MISMATCH: Final = -32020
 UNSUPPORTED_PROTOCOL_VERSION: Final = -32022
-PROTOCOL_VERSION_META: Final = "io.modelcontextprotocol/protocolVersion"
-# The routing headers a modern request carries, by their lower-case names.
-VERSION_HEADER: Final = "mcp-protocol-version"
-METHOD_HEADER: Final = "mcp-method"
-NAME_HEADER: Final = "mcp-name"
-ROUTING_HEADERS: Final = (VERSION_HEADER, METHOD_HEADER, NAME_HEADER)
 SESSION_HEADER: Final = "mcp-session-id"
-# The methods whose Mcp-Name mirrors a body parameter, and which one.
-NAME_BEARING: Final[Mapping[str, str]] = {
-    "tools/call": "name",
-    "prompts/get": "name",
-    "resources/read": "uri",
-}
 INITIALIZED: Final = "notifications/initialized"
 CANCELLED: Final = "notifications/cancelled"
 
 _HASH = re.compile(r"sha256:([0-9a-f]{64})")
-_SENTINEL = re.compile(r"=\?base64\?(.*)\?=")
 _LENGTH = re.compile(r"[0-9]{1,20}")
 _JSON_TYPES: Final = ("application/json", "application/json;charset=utf-8")
 
@@ -250,49 +241,6 @@ def head[S](
     if session is None:
         return SESSION_UNKNOWN
     return Head(method, session)
-
-
-def decode_name(value: str) -> str | None:
-    """An ``Mcp-Name`` value: as written, or decoded from the ``=?base64?...?=`` sentinel. A
-    sentinel that isn't canonical Base64 of UTF-8 is None, so it never matches by accident."""
-    found = _SENTINEL.fullmatch(value)
-    if found is None:
-        return value
-    payload = found.group(1)
-    try:
-        decoded = base64.b64decode(payload, validate=True)
-    except binascii.Error:
-        return None
-    if base64.b64encode(decoded).decode("ascii") != payload:
-        return None
-    try:
-        return decoded.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def mismatch(routing: Mapping[str, tuple[str, ...]], message: Mapping[str, Any]) -> str | None:
-    """Row 7: why a modern request's routing headers disagree with its body, or None. Each
-    header must be sent once and equal its body field; ``Mcp-Name`` only on the methods that
-    name something."""
-    for name in ROUTING_HEADERS:
-        if len(routing.get(name, ())) > 1:
-            return f"{name} appears more than once"
-    params = message.get("params", {})
-    meta = params.get("_meta")
-    version = meta.get(PROTOCOL_VERSION_META) if isinstance(meta, dict) else None
-    if routing.get(VERSION_HEADER, ()) != (version,):
-        return f"{VERSION_HEADER} doesn't match the request's _meta protocol version"
-    if routing.get(METHOD_HEADER, ()) != (message["method"],):
-        return f"{METHOD_HEADER} doesn't match the request's method"
-    key = NAME_BEARING.get(message["method"])
-    if key is None:
-        return None
-    names = routing.get(NAME_HEADER, ())
-    decoded = decode_name(names[0]) if names else None
-    if decoded is None or decoded != params.get(key):
-        return f"{NAME_HEADER} doesn't match the request's {key}"
-    return None
 
 
 def _unsupported(message: Mapping[str, Any]) -> Refusal:

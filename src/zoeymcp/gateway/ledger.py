@@ -1,6 +1,8 @@
 """The approval ledger on disk (M4 design F.3 to F.5).
 
-Records come from :mod:`zoeymcp.common.ledgerformat`; this module does the file I/O around them:
+Records come from :mod:`zoeymcp.common.ledgerformat`, and :mod:`zoeymcp.common.ledgerfile` does
+the file I/O around them (files, rotation, the open-ref index, recovery, reading back; M8 design
+J.1). This module wraps that file layer with the gateway's key and its failure rules:
 
 - **Files** ``ledger/<first seq, 12 digits>.jsonl``, mode 0600, one record per line, each written
   and fsynced before the call that needed it goes on. A new file starts at 4 MiB; the oldest files
@@ -21,36 +23,31 @@ Records come from :mod:`zoeymcp.common.ledgerformat`; this module does the file 
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
-import json
-import os
-import re
 import secrets
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
 import anyio
 
-from ..common import canonical, files, ledgerformat
-from ..common.ledgerformat import GENESIS, Kind, LedgerFormatError, Record
+from ..common import canonical, files
+from ..common.ledgerfile import INDEX_FILE as INDEX_FILE
+from ..common.ledgerfile import ROTATE_BYTES as ROTATE_BYTES
+from ..common.ledgerfile import Anchor as Anchor
+from ..common.ledgerfile import LedgerFile
+from ..common.ledgerfile import Recovery as Recovery
+from ..common.ledgerformat import Kind, LedgerFormatError
 from ..common.logs import refuse_type
 from . import logs
 
 LEDGER_DIR: Final = "ledger"
 KEY_FILE: Final = "ledger.key"
-INDEX_FILE: Final = "open.json"
-ROTATE_BYTES: Final = 4 * 2**20
 MAX_QUEUED: Final = 1024
 RETRY_SECONDS: Final = 5.0
-MAX_READ: Final = 10_000
-_FILE = re.compile(r"^(\d{12})\.jsonl$")
-# O_BINARY: without it, Windows turns each newline into CR LF (it is 0 elsewhere).
-_APPEND_FLAGS: Final = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
 
 
 class LedgerUnavailable(RuntimeError):
@@ -90,29 +87,11 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-@dataclass(frozen=True)
-class Anchor:
-    """A written record's place in the chain, for the log line that cites it (F.2)."""
-
-    seq: int
-    hash: str
-
-
 @dataclass
 class _Queued:
     kind: Kind
     ref: str | None
     fields: dict[str, Any]
-
-
-@dataclass
-class Recovery:
-    """What start-up found and did."""
-
-    torn_bytes: int = 0
-    chain_broken_at: int | None = None
-    index_rebuilt: bool = False
-    closed: dict[str, int] = field(default_factory=dict)  # recovered counts, when any were open
 
 
 class Ledger:
@@ -121,21 +100,47 @@ class Ledger:
     def __init__(
         self, state_dir: Path, *, max_bytes: int, clock: Callable[[], int] = now_ms
     ) -> None:
-        self.dir = state_dir / LEDGER_DIR
+        self.file = LedgerFile(
+            state_dir / LEDGER_DIR,
+            max_bytes=max_bytes,
+            clock=clock,
+            event=logs.event,
+            writer="gateway",
+            rotate_bytes=ROTATE_BYTES,
+        )
         self.key = load_key(state_dir / KEY_FILE)
-        self.max_bytes = max_bytes
-        self.clock = clock
-        self.next_seq = 0
-        self.prev = GENESIS
-        self.open: dict[str, list[str]] = {}  # ref -> kinds written so far
         self.queue: list[_Queued] = []
         self._lock = anyio.Lock()
-        self._current: Path | None = None
-        self._current_size = 0
         # Appends seen on the event loop, and the event the reporter waits on for the next one.
         # Both change only on the loop, after the worker thread's append returns (J.3).
         self.appended = 0
         self._appended_event: anyio.Event | None = None
+
+    # The file layer's state, through the wrapper; the limit changes on a reload.
+
+    @property
+    def max_bytes(self) -> int:
+        return self.file.max_bytes
+
+    @max_bytes.setter
+    def max_bytes(self, value: int) -> None:
+        self.file.max_bytes = value
+
+    @property
+    def next_seq(self) -> int:
+        return self.file.next_seq
+
+    @next_seq.setter
+    def next_seq(self, value: int) -> None:
+        self.file.next_seq = value
+
+    @property
+    def prev(self) -> str:
+        return self.file.prev
+
+    @property
+    def open(self) -> dict[str, list[str]]:
+        return self.file.open
 
     # --- start-up ----------------------------------------------------------------------------
 
@@ -146,100 +151,7 @@ class Ledger:
         """Open the ledger and recover it (F.5), before the listener opens."""
         state_dir.joinpath(LEDGER_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
         ledger = cls(state_dir, max_bytes=max_bytes, clock=clock)
-        return ledger, ledger._recover()
-
-    def _files(self) -> list[Path]:
-        return sorted(p for p in self.dir.iterdir() if _FILE.fullmatch(p.name))
-
-    def _recover(self) -> Recovery:
-        report = Recovery()
-        found = self._files()
-        if found:
-            newest = found[-1]
-            data = newest.read_bytes()
-            torn = ledgerformat.torn_tail(data)
-            if torn:
-                aside = self.dir / f"torn-{self.clock()}.bin"
-                aside.write_bytes(data[-torn:])
-                os.chmod(aside, 0o600)
-                with open(newest, "r+b") as handle:
-                    handle.truncate(len(data) - torn)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                data = data[:-torn]
-                report.torn_bytes = torn
-            lines = data.splitlines(keepends=True)
-            start_seq = int(_FILE.fullmatch(newest.name).group(1))  # type: ignore[union-attr]
-            start_prev = self._last_hash(found[-2]) if len(found) > 1 else None
-            if start_prev is None:
-                start_prev = self._first_prev(lines)
-            verified = ledgerformat.verify(lines, prev=start_prev, seq=start_seq)
-            self.next_seq, self.prev = verified.head_seq + 1, verified.head_hash
-            if verified.broken_at is not None:
-                report.chain_broken_at = verified.broken_at
-                logs.event("ledger_chain_broken", seq=verified.broken_at, level="critical")
-                if verified.records == 0:
-                    newest.rename(self.dir / f"broken-{self.clock()}-{newest.name}")
-                self._current = None  # the next record starts a new file
-            else:
-                self._current, self._current_size = newest, len(data)
-        # The index first: every record appended from here on rewrites it.
-        self.open, report.index_rebuilt = self._load_index()
-        if report.torn_bytes:
-            self._append("repaired", None, {"torn_bytes": report.torn_bytes})
-            logs.event("ledger_repaired", torn_bytes=report.torn_bytes)
-        open_records = self._open_records()
-        steps = ledgerformat.recovery_plan(open_records)
-        for step in steps:
-            self._append(step.kind, step.ref, dict(step.fields))
-        if steps:
-            report.closed = dict(steps[-1].fields)
-            logs.event("ledger_recovered", **report.closed)
-        return report
-
-    def _last_hash(self, path: Path) -> str | None:
-        lines = path.read_bytes().splitlines()
-        for line in reversed(lines):
-            try:
-                return ledgerformat.parse(line).hash
-            except LedgerFormatError:
-                continue
-        return None
-
-    @staticmethod
-    def _first_prev(lines: list[bytes]) -> str:
-        """The chain's start when no earlier file is left: what the first record says."""
-        if not lines:
-            return GENESIS
-        try:
-            return ledgerformat.parse(lines[0]).prev
-        except LedgerFormatError:
-            return GENESIS
-
-    def _load_index(self) -> tuple[dict[str, list[str]], bool]:
-        """The open refs from the index if it matches the files, else from a full scan."""
-        path = self.dir / INDEX_FILE
-        try:
-            index = json.loads(path.read_bytes())
-            if index.get("v") == 1 and index.get("head_seq") == self.next_seq - 1:
-                refs = index.get("refs")
-                if isinstance(refs, dict) and all(isinstance(v, list) for v in refs.values()):
-                    return {str(k): [str(x) for x in v] for k, v in refs.items()}, False
-        except (OSError, ValueError, AttributeError):
-            pass
-        found = ledgerformat.open_refs(self._records())
-        return {ref: [r.kind for r in records] for ref, records in found.items()}, True
-
-    def _open_records(self) -> dict[str, list[Record]]:
-        """The open refs' records, read back from the files (the index has only their kinds)."""
-        if not self.open:
-            return {}
-        wanted = set(self.open)
-        found: dict[str, list[Record]] = {}
-        for record in self._records():
-            if record.ref in wanted:
-                found.setdefault(record.ref, []).append(record)
-        return {ref: records for ref, records in found.items() if records[0].kind == "asked"}
+        return ledger, ledger.file.recover()
 
     # --- writing ------------------------------------------------------------------------------
 
@@ -266,7 +178,7 @@ class Ledger:
                 return None
             written = self.next_seq
             try:
-                return await anyio.to_thread.run_sync(self._append, kind, ref, fields)
+                return await anyio.to_thread.run_sync(self.file.append, kind, ref, fields)
             except (OSError, LedgerFormatError) as exc:
                 logs.event(
                     "ledger_write_failed",
@@ -291,7 +203,7 @@ class Ledger:
                     item = self.queue[0]
                     try:
                         await anyio.to_thread.run_sync(
-                            self._append, item.kind, item.ref, item.fields
+                            self.file.append, item.kind, item.ref, item.fields
                         )
                     except OSError:
                         break
@@ -302,8 +214,8 @@ class Ledger:
 
     def _notify(self, written: int) -> None:
         """Wake the reporter if records reached the disk since ``next_seq`` was ``written``.
-        Called on the event loop only: ``_append`` runs in a worker thread and never touches the
-        event (J.3)."""
+        Called on the event loop only: the file layer's append runs in a worker thread and never
+        touches the event (J.3)."""
         if self.next_seq == written:
             return
         self.appended += 1
@@ -328,98 +240,12 @@ class Ledger:
             if self.queue:
                 await self.flush_queue()
 
-    def _append(self, kind: Kind, ref: str | None, fields: dict[str, Any]) -> Anchor:
-        line = ledgerformat.encode(
-            kind, seq=self.next_seq, prev=self.prev, ts=self.clock(), ref=ref, **fields
-        )
-        if self._current is None or (
-            self._current_size + len(line) > ROTATE_BYTES and self._current_size
-        ):
-            self._current, self._current_size = self.dir / f"{self.next_seq:012d}.jsonl", 0
-        descriptor = os.open(self._current, _APPEND_FLAGS, 0o600)
-        try:
-            written = os.write(descriptor, line)
-            if written != len(line):
-                raise OSError("short write to the ledger")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        anchor = Anchor(self.next_seq, ledgerformat.line_hash(line))
-        self.next_seq, self.prev = anchor.seq + 1, anchor.hash
-        self._current_size += len(line)
-        if ref is not None:
-            if kind == "outcome":
-                self.open.pop(ref, None)
-            else:
-                self.open.setdefault(ref, []).append(kind)
-        self._write_index()
-        self._prune()
-        return anchor
-
-    def _write_index(self) -> None:
-        index = {"v": 1, "head_seq": self.next_seq - 1, "refs": self.open}
-        files.write_atomic(self.dir / INDEX_FILE, canonical.dumps_canonical(index), prefix=".open-")
-
-    def _prune(self) -> None:
-        found = self._files()
-        sizes = {p: p.stat().st_size for p in found}
-        total = sum(sizes.values())
-        for path in found[:-1]:
-            if total <= self.max_bytes:
-                break
-            first = int(_FILE.fullmatch(path.name).group(1))  # type: ignore[union-attr]
-            last = self._last_seq(path)
-            with contextlib.suppress(OSError):
-                path.unlink()
-                total -= sizes[path]
-                logs.event("ledger_pruned", first_seq=first, last_seq=last)
-
-    def _last_seq(self, path: Path) -> int | None:
-        for line in reversed(path.read_bytes().splitlines()):
-            try:
-                return ledgerformat.parse(line).seq
-            except LedgerFormatError:
-                continue
-        return None
-
     # --- reading ------------------------------------------------------------------------------
 
-    def _records(self) -> Iterator[Record]:
-        for path in self._files():
-            for line in path.read_bytes().splitlines():
-                try:
-                    yield ledgerformat.parse(line)
-                except LedgerFormatError:
-                    continue
-
     def lines(self, after: int, limit: int) -> list[bytes]:
-        """Up to ``limit`` stored lines with a seq above ``after``, oldest first, each as it is
-        on disk without its newline: what the reporter sends (J.3). Only records whose append had
-        returned when the read began are read, so each is whole and fsynced; a line that doesn't
-        parse is left out, as :meth:`read` leaves it."""
-        below = self.next_seq  # an append under way writes this seq, and is left for next time
-        found: list[bytes] = []
-        paths = self._files()
-        starts = [int(_FILE.fullmatch(p.name).group(1)) for p in paths]  # type: ignore[union-attr]
-        for index, path in enumerate(paths):
-            if index + 1 < len(paths) and starts[index + 1] - 1 <= after:
-                continue  # every record in this file is at or below ``after``
-            try:
-                data = path.read_bytes()
-            except FileNotFoundError:
-                continue  # pruned since it was listed
-            for line in data.splitlines():
-                try:
-                    record = ledgerformat.parse(line)
-                except LedgerFormatError:
-                    continue
-                if record.seq >= below:
-                    return found
-                if record.seq > after:
-                    found.append(record.line)
-                    if len(found) >= limit:
-                        return found
-        return found
+        """The file layer's :meth:`~zoeymcp.common.ledgerfile.LedgerFile.lines`: what the
+        reporter sends (J.3)."""
+        return self.file.lines(after, limit)
 
     def read(
         self,
@@ -432,47 +258,15 @@ class Ledger:
     ) -> list[dict[str, Any]]:
         """Records after ``after``, oldest first, as JSON objects. The filters keep the records of
         refs whose ``asked`` record matches; ledger-level records always pass."""
-        limit = max(1, min(limit, MAX_READ))
-        wanted: dict[str, bool] = {}
-        found: list[dict[str, Any]] = []
-        for record in self._records():
-            if record.kind == "asked":
-                fields = record.fields
-                wanted[record.ref or ""] = (
-                    (client is None or fields["client"] == client)
-                    and (server is None or fields["server"] == server)
-                    and (tool is None or fields["tool"] == tool)
-                )
-            if record.seq <= after:
-                continue
-            if record.ref is not None and not wanted.get(
-                record.ref, client is None and server is None and tool is None
-            ):
-                continue
-            found.append(json.loads(record.line))
-            if len(found) >= limit:
-                break
-        return found
+        return self.file.read(after=after, limit=limit, client=client, server=server, tool=tool)
 
     def verify(self) -> dict[str, Any]:
         """Walk every file's chain in order (F.2), from what the oldest file says it follows."""
-        lines: list[bytes] = []
-        for path in self._files():
-            lines.extend(path.read_bytes().splitlines(keepends=True))
-        start = self._first_prev(lines)
-        first_seq = ledgerformat.parse(lines[0]).seq if lines else 0
-        result = ledgerformat.verify(lines, prev=start, seq=first_seq)
-        return {
-            "records": result.records,
-            "head_seq": result.head_seq,
-            "head_hash": result.head_hash,
-            "broken_at": result.broken_at,
-            "ok": result.broken_at is None,
-        }
+        return self.file.verify()
 
     def check(self, ref: str, args: canonical.JSONValue) -> dict[str, Any]:
         """Whether ``args`` are the arguments the ``asked`` record of ``ref`` was made for (F.4)."""
-        for record in self._records():
+        for record in self.file.records():
             if record.ref == ref and record.kind == "asked":
                 return {
                     "ref": ref,

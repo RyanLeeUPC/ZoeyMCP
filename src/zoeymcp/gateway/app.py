@@ -79,13 +79,13 @@ from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
 from ..common import canonical
+from ..common.committed import Committed
 from ..common.pinhash import DefinitionKind
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway, ViewRemoteServer, ViewToolkitServer
 from . import access, capabilities, logs, pins, pipeline, resourcematch, sanitize
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
-from .committed import Committed
 from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier

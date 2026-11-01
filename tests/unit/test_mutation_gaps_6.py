@@ -276,20 +276,22 @@ EQUIVALENT: Final[dict[str, str]] = {
     # --- bridge.admit
     "zoeymcp.bridge.admit.x__values__mutmut_4": _CASE,
     "zoeymcp.bridge.admit.x__values__mutmut_8": _CASE,
-    "zoeymcp.bridge.admit.x_decode_name__mutmut_9": (
+    # decode_name and mismatch moved, unchanged, to common.mcpwire (M8 step 2), and their mutants
+    # with them.
+    "zoeymcp.common.mcpwire.x_decode_name__mutmut_9": (
         "validate=None: a payload with characters outside the alphabet decodes to bytes that "
         "don't encode back to it, which the next check refuses"
     ),
-    "zoeymcp.bridge.admit.x_decode_name__mutmut_11": "no validate: as mutant 9",
-    "zoeymcp.bridge.admit.x_decode_name__mutmut_12": "validate=False: as mutant 9",
-    "zoeymcp.bridge.admit.x_decode_name__mutmut_16": _CASE,
-    "zoeymcp.bridge.admit.x_decode_name__mutmut_20": _CASE,
-    "zoeymcp.bridge.admit.x_mismatch__mutmut_19": _GET_NONE,
-    "zoeymcp.bridge.admit.x_mismatch__mutmut_21": _GET_NONE,
-    "zoeymcp.bridge.admit.x_mismatch__mutmut_24": _GET_NONE,
-    "zoeymcp.bridge.admit.x_mismatch__mutmut_26": _GET_NONE,
-    "zoeymcp.bridge.admit.x_mismatch__mutmut_37": _GET_NONE,
-    "zoeymcp.bridge.admit.x_mismatch__mutmut_39": _GET_NONE,
+    "zoeymcp.common.mcpwire.x_decode_name__mutmut_11": "no validate: as mutant 9",
+    "zoeymcp.common.mcpwire.x_decode_name__mutmut_12": "validate=False: as mutant 9",
+    "zoeymcp.common.mcpwire.x_decode_name__mutmut_16": _CASE,
+    "zoeymcp.common.mcpwire.x_decode_name__mutmut_20": _CASE,
+    "zoeymcp.common.mcpwire.x_mismatch__mutmut_19": _GET_NONE,
+    "zoeymcp.common.mcpwire.x_mismatch__mutmut_21": _GET_NONE,
+    "zoeymcp.common.mcpwire.x_mismatch__mutmut_24": _GET_NONE,
+    "zoeymcp.common.mcpwire.x_mismatch__mutmut_26": _GET_NONE,
+    "zoeymcp.common.mcpwire.x_mismatch__mutmut_37": _GET_NONE,
+    "zoeymcp.common.mcpwire.x_mismatch__mutmut_39": _GET_NONE,
     "zoeymcp.bridge.admit.xǁBridgeTokenHashǁadmits__mutmut_20": _CASE,
     "zoeymcp.bridge.admit.xǁRefusalǁbody__mutmut_28": _CASE,
     # --- bridge.framing

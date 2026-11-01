@@ -13,10 +13,10 @@ from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 from .. import canonical, netguard
-from . import fields
+from . import fields, serverpaths
 from .callback import callback_address, callback_origin
 from .findings import Finding
-from .match import NormalizedPath, path_matches
+from .match import NormalizedPath
 from .paths import PathPatternError, parse_path_pattern
 from .schema import (
     Admin,
@@ -33,7 +33,6 @@ from .schema import (
     ResourcesPolicy,
     Route,
     RouteProgram,
-    Rule,
     ToolkitRule,
     ToolkitServer,
     hash_token,
@@ -1167,7 +1166,6 @@ def _loopback_or_wildcard(host: str) -> bool:
 
 # --- gateway -----------------------------------------------------------------------------------
 
-_MCP_SERVER_PATH = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 # The methods the gateway sends on an MCP server's path.
 _MCP_METHODS = ("POST", "GET", "DELETE")
 
@@ -1184,7 +1182,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
     server_paths: dict[str, list[NormalizedPath]] = defaultdict(list)
     for server in gateway.servers.values():
         if isinstance(server, RemoteServer):
-            request_path = _request_path(server.path)
+            request_path = serverpaths.request_path(server.path)
             if request_path is not None:
                 server_paths[server.route].append(request_path)
     for name, server in gateway.servers.items():
@@ -1356,26 +1354,6 @@ def _check_approvals(gateway: Gateway, report: _Report) -> None:
             )
 
 
-def _request_path(path: str) -> NormalizedPath | None:
-    """A gateway server's ``path`` as the vault matches it, or ``None`` if the vault refuses it."""
-    if not _MCP_SERVER_PATH.fullmatch(path):
-        return None
-    try:
-        # The pattern above leaves out '*' and braces, so every segment is a literal.
-        parsed = parse_path_pattern(path)
-    except PathPatternError:
-        return None
-    return NormalizedPath(tuple(s.value for s in parsed.segments), parsed.trailing_slash)
-
-
-def _reaches(rule: Rule, source: str, path: NormalizedPath) -> bool:
-    """Whether the vault lets ``source`` (one of ``rule``'s paths) reach ``path``."""
-    try:
-        return path_matches(rule, source, path)
-    except PathPatternError:
-        return False  # reported with the route's rules
-
-
 def _check_mcp_route(
     policy: Policy,
     path: str,
@@ -1385,7 +1363,7 @@ def _check_mcp_route(
     report: _Report,
 ) -> None:
     """``server_paths`` are the valid paths of every gateway server on ``route``."""
-    request_path = _request_path(server.path)
+    request_path = serverpaths.request_path(server.path)
     if request_path is None:
         report.error(f"{path}.path", "must be a plain absolute path")
     if route.connector is not None:
@@ -1408,7 +1386,7 @@ def _check_mcp_route(
         method
         for rule in route.rules
         for source in rule.paths
-        if _reaches(rule, source, request_path)
+        if serverpaths.reaches(rule, source, request_path)
         for method in rule.methods
     }
     if "POST" not in allowed:
@@ -1426,8 +1404,8 @@ def _check_mcp_route(
     broad: list[str] = []
     for rule in route.rules:
         for source in rule.paths:
-            used = any(_reaches(rule, source, p) for p in server_paths)
-            # _reaches has parsed a used source. A pattern reaches more than the gateway's paths.
+            used = any(serverpaths.reaches(rule, source, p) for p in server_paths)
+            # reaches has parsed a used source. A pattern reaches more than the gateway's paths.
             pattern = used and any(s.kind != "literal" for s in parse_path_pattern(source).segments)
             for method in rule.methods:
                 entry = f"{method} {source}"

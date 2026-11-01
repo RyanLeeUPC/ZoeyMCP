@@ -20,6 +20,8 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import zoeymcp
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -414,6 +416,123 @@ def test_netguard_uses_the_standard_library_only() -> None:
         if (top := name.partition(".")[0]) not in sys.stdlib_module_names and top != "__future__"
     ]
     assert found == []
+
+
+# --- the shared layers (M8 design J.1, A.3) -----------------------------------------------------
+
+# Shared modules the vault's chain and envelope reader build on: nothing beyond the standard
+# library, through every module of ours they load.
+STDLIB_ONLY = ("ledgerfile", "mcpwire", "approvaltext", "ledgerformat", "canonical")
+# Standard library modules that do I/O, which a pure module never imports.
+IO_MODULES = frozenset(
+    {"asyncio", "http", "io", "os", "pathlib", "selectors", "shutil", "socket", "ssl", "subprocess"}
+    | {"tempfile", "threading"}
+)
+
+
+def module_path(root: Path, name: str) -> Path | None:
+    """The file of the module ``name`` names under ``root``, or of the module that holds it when
+    ``name`` is an attribute (``from .canonical import JSONValue``)."""
+    parts = name.split(".")
+    while parts:
+        base = root.joinpath(*parts)
+        for candidate in (base.parent / f"{base.name}.py", base / "__init__.py"):
+            if candidate.is_file():
+                return candidate
+        parts.pop()
+    return None
+
+
+def closure(root: Path, module: str) -> dict[str, set[str]]:
+    """Every module of ours that importing ``module`` loads (the packages on each one's way
+    included, as Python runs them), with the names each one's imports give."""
+    found: dict[str, set[str]] = {}
+    pending = [module]
+    while pending:
+        path = module_path(root, pending.pop())
+        assert path is not None
+        name = module_name(path, root)
+        if name in found:
+            continue
+        found[name] = set(imported_modules(path, name))
+        parts = name.split(".")
+        pending.extend(".".join(parts[:end]) for end in range(1, len(parts)))
+        pending.extend(n for n in found[name] if n.partition(".")[0] == "zoeymcp")
+    return found
+
+
+def beyond(found: Mapping[str, set[str]], packages: Iterable[str] = ()) -> list[str]:
+    """``module: name`` for each import in ``found`` of a package that is neither ours, the
+    standard library nor one of ``packages``."""
+    allowed = {*sys.stdlib_module_names, "__future__", "zoeymcp", *packages}
+    return [
+        f"{module}: {name}"
+        for module, names in sorted(found.items())
+        for name in sorted(names)
+        if name.partition(".")[0] not in allowed
+    ]
+
+
+def test_the_closure_follows_our_imports_and_their_packages(tmp_path: Path) -> None:
+    common = tmp_path / "zoeymcp" / "common"
+    common.mkdir(parents=True, mode=0o700)
+    (tmp_path / "zoeymcp" / "__init__.py").write_bytes(b"")
+    (common / "__init__.py").write_bytes(b"import json\n")
+    (common / "a.py").write_bytes(b"from .b import Thing\nimport re\n")
+    (common / "b.py").write_bytes(b"def lazy() -> None:\n    import yaml\n")
+    found = closure(tmp_path, "zoeymcp.common.a")
+    assert found == {
+        "zoeymcp": set(),
+        "zoeymcp.common": {"json"},
+        "zoeymcp.common.a": {"zoeymcp.common.b", "zoeymcp.common.b.Thing", "re"},
+        "zoeymcp.common.b": {"yaml"},
+    }
+    assert beyond(found) == ["zoeymcp.common.b: yaml"]
+    assert beyond(found, ["yaml"]) == []
+    assert module_path(tmp_path, "zoeymcp.absent") == tmp_path / "zoeymcp" / "__init__.py"
+
+
+@pytest.mark.parametrize("name", STDLIB_ONLY)
+def test_a_shared_layer_loads_the_standard_library_only(name: str) -> None:
+    found = closure(PACKAGE.parent, f"zoeymcp.common.{name}")
+    assert f"zoeymcp.common.{name}" in found
+    assert beyond(found) == []
+    # Nothing of ours beyond common: no role's code, and no policy package (pydantic).
+    assert {m for m in found if not m.startswith("zoeymcp.common")} == {"zoeymcp"}
+    assert not [m for m in found if m.startswith("zoeymcp.common.policy")]
+
+
+def test_the_ledger_file_layer_is_built_on_the_record_format() -> None:
+    """Not vacuous: the walk reaches the modules the file layer stands on."""
+    found = closure(PACKAGE.parent, "zoeymcp.common.ledgerfile")
+    assert {"zoeymcp.common.ledgerformat", "zoeymcp.common.canonical"} <= set(found)
+
+
+def test_the_committed_registry_uses_the_standard_library_and_anyio_only() -> None:
+    found = closure(PACKAGE.parent, "zoeymcp.common.committed")
+    assert "anyio" in found["zoeymcp.common.committed"]
+    assert beyond(found, ["anyio"]) == []
+    assert {m for m in found if not m.startswith("zoeymcp.common")} == {"zoeymcp"}
+
+
+def test_serverpaths_uses_the_standard_library_and_the_policy_package_only() -> None:
+    """Pure: no I/O, and of ours only the policy package, whose closure reaches no role's code
+    (it stands on match.py and the pydantic schema, so it isn't standard library only)."""
+    path = PACKAGE / "common" / "policy" / "serverpaths.py"
+    names = list(imported_modules(path, module_name(path, PACKAGE.parent)))
+    assert "zoeymcp.common.policy.match" in names
+    found = [
+        name
+        for name in names
+        if not name.startswith("zoeymcp.common.policy.")
+        and (
+            (top := name.partition(".")[0]) not in (*sys.stdlib_module_names, "__future__")
+            or top in IO_MODULES
+        )
+    ]
+    assert found == []
+    loaded = closure(PACKAGE.parent, "zoeymcp.common.policy.serverpaths")
+    assert not [m for m in loaded if not m.startswith("zoeymcp.common") and m != "zoeymcp"]
 
 
 # --- what importing it loads --------------------------------------------------------------------

@@ -23,8 +23,8 @@ fallback is taken: recorded, and the state-only long poll stays an option, not b
 flips when an SDK bump changes it.
 
 Contract 66 (B.2 E11): the ``_meta`` keys the SDK puts in a modern ``tools/call`` are exactly
-the egress filter's ``META_KEYS`` (``gateway/egressrules.py``, which step 2 moves to
-``common/mcpwire.py``); a legacy call carries only ``progressToken``.
+the egress filter's ``META_KEYS`` (``common/mcpwire.py`` since step 2, which
+``gateway/egressrules.py`` imports); a legacy call carries only ``progressToken``.
 
 Contract 67 (G.1): ``str()`` of the ``httpx.HTTPStatusError`` that ``raise_for_status`` raises
 holds the request URL, so a Bot API token in the path would be printed. ``str()`` of a
@@ -65,7 +65,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tests.fakes.harness import serve
 from tests.fakes.mcp_server import PATH, McpFake, Recorded
-from zoeymcp.gateway.egressrules import META_KEYS
+from zoeymcp.common.mcpwire import META_KEYS
 
 from .test_client_contract import LATEST_LEGACY, connect, text_of, until
 from .test_server_contract import Shaped
