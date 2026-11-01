@@ -103,19 +103,29 @@ dialog {
   max-width: 40rem;
 }
 
+/* A long label (a definition's first row names its pin) wraps in its column, at most 40% of
+   the list, so the values keep the rest instead of one character a line. */
 dl {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(40%) minmax(0, 1fr);
   gap: 0.25rem 1rem;
 }
 
 dt {
   font-weight: bold;
+  overflow-wrap: anywhere;
 }
 
 dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+/* A confirm's values as the vault sent them: a definition's rows keep their JSON indentation
+   (M6 G.7 row 2). */
+#confirm-summary dd,
+#confirm-now dd {
+  white-space: pre-wrap;
 }
 
 /* The MCP servers section (M7 K.1). A box and its words on one line; a step's hosts and Squid

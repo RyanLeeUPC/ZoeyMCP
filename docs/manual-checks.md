@@ -312,18 +312,26 @@ view.
     - restarted with `--drift annotations` in place of `--drift description`, **Review again**:
       `echo` now says it is destructive and not read-only (the markup as text in both columns
       again), and **Accept the new definition** on it says approve is proposed and sets its row to
-      approve (unticking it puts allow back); **Generate** with allow chosen again gives the new pin under `review:`, `# changed: echo (was sha256:...)` and
-      `# kept: echo (allow: ...)`, and with approve left as accepted, `echo` under `approve:`;
-    - after a restart of the gateway (it keeps reviewed copies in memory) and **Review again**,
-      `echo`'s row says the gateway no longer has the reviewed copy and shows the new definition
-      whole;
+      approve (unticking it puts allow back); **Generate** with **Accept** still ticked and the
+      row's choice set back to allow gives the new pin under `review:`, `# changed: echo (was
+      sha256:...)` and `# kept: echo (allow: ...)`, and with approve left as accepted, `echo`
+      under `approve:`;
+    - after a restart of the gateway and **Review again**, `echo` still shows both columns: the
+      gateway keeps reviewed copies in its state directory (`defs/`), not in memory. With the old
+      copy removed (as the gateway's uid: `rm /state-gateway/defs/<old pin's hex>.json`) and
+      **Review again**, `echo`'s row says the gateway no longer has the reviewed copy and shows
+      the new definition whole;
     - **Clear** then **Select suggested**: `read_01` comes back ticked at approve, its
       classification, the other read-only tools at allow, and **Generate** puts no tool the
       policy has in `approve:` under `allow:`;
     - with **Record the rest as declined** ticked, **Generate** writes every listed tool left out
       under `declined:` at its pin (not `summarize`, which has an error finding); unticked,
-      **Decline** on one tool writes that one alone; and after another fragment for the server is
-      committed and reloaded, **Generate** on the old review is refused `review_stale`.
+      **Decline** on one tool adds that one alone to the declines the policy already has (only a
+      tool the policy doesn't include has **Decline**, so take two such tools out of `declined:`
+      first, decline one, and the other stays out); and after another fragment for the server is
+      committed and reloaded, **Generate** on the old review is refused `review_stale` (this needs
+      a reload with the vault running: in the compose tiers a reload is a recreate, which drops
+      the review held in memory).
 20. **Managed saves: the re-pin and approve -> allow summaries** (the review screen's **Save**,
     M6). Item 19's setup with the vault's policy set to `mode: managed` on a fresh state
     directory, so its first start seeds revision 1 from the file (operations.md §34), the fake
@@ -352,11 +360,14 @@ view.
       dialog for read_02; **Close** writes nothing;
     - **Review again**, untick `read_02` (approve, read-only), **Save** and confirm; then
       **Review again**, **Clear** and **Select suggested**: `read_02`, dropped and once approve,
-      comes back ticked at approve, every tool the policy includes at its classification and
-      the other read-only tools at allow, and **Save** shows no "approve -> allow" or "was
-      approve in an earlier revision" row;
+      comes back ticked at approve, every read-only tool the policy includes at its
+      classification and the other read-only tools at allow (a tool the server doesn't mark
+      read-only, such as `add`, stays unticked, so the save drops it), and **Save** shows no
+      "approve -> allow" or "was approve in an earlier revision" row;
     - a second browser signed in on the same origin saves first: this browser's confirm shows
-      "The policy moved to revision N ... press Save again", and nothing is written.
+      "Something changed since you prepared this (shown below)" and, under "What the vault finds
+      now", "The policy moved to revision N ... press Save again" with the plan on revision N,
+      and nothing is written.
 21. **History, a diff and a rollback** (the Policy page in managed mode, M6). Item 20's vault
     after its saves, the fake started with `--switch large --switch markup_echo`, and a client
     added and then removed by two host imports, so the history has a client to bring back: stop
@@ -412,10 +423,15 @@ view.
       draws the page again, saying the policy moved to revision N since it showed revision M
       ("press the connector's button again"), and nothing more is written.
 23. **Onboarding in managed mode, and Give to clients** (the MCP servers page in managed mode,
-    M6). A managed vault on a fresh state directory with a gateway that polls it (item 20's
-    setup), started through `tests/acceptance/procs.py`'s launcher with item 17's CA and name map
-    and its two fakes running, its policy giving a client `agent1` (a `token_sha256` from
-    `zoeymcp client-token`) no server. In Chrome or Edge with the Console open (no Trusted Types
+    M6). A managed vault on a fresh state directory with a gateway that polls it, the vault
+    started through `tests/acceptance/procs.py`'s launcher with item 17's CA and name map, the
+    gateway as a process beside it (`zoeymcp gateway --vault http://127.0.0.1:<port>` with
+    `ZOEYMCP_GATEWAY_KEY` from `KeySet.from_text(master).gateway_key(1)`), its policy giving a
+    client `agent1` (a `token_sha256` from `zoeymcp client-token`) no server. Item 17's two fakes
+    don't do here as two processes: the MCP fake's `--static-key` refuses the provider's tokens,
+    so the review after **Connect** fails. Run them in one process as S9 does, the MCP fake built
+    with `authorize=` the provider's `access_ok` (`tests/acceptance/test_onboard_shape.py`). In
+    Chrome or Edge with the Console open (no Trusted Types
     or Content Security Policy violation throughout), set up a passkey and open **MCP servers**.
     Pass:
     - **Add a server by URL** with `https://mcp.notes.example:9444/mcp` and, in **More options**,
@@ -613,3 +629,9 @@ such server is available, record it as not run.
 | 9 | d754563 | 2026-10-23 | Firefox, Windows | http://localhost:8081 | Pass | The link opened example.com in a new tab; there `[window.opener, document.referrer]` was `[null, ""]` (Firefox's developer tools don't follow a new tab, so the referrer is read from the page) |
 | 10 | d754563 | 2026-10-23 | Firefox, Windows | http://localhost:8081 | Pass | The console showed the CORS error (`Access-Control-Allow-Origin` missing, 403); each load of the neighbour page logged `portal_refused` `cross_site` with `count: 2` (the read and the sign-out), and the portal tab stayed signed in. The cookie replay with curl wasn't repeated (it doesn't depend on the browser) |
 | Live S9 | cfdeb04 | 2026-10-22 | - | - | Not run | No public server with dynamic registration was used yet; the fakes' run is S9 (`tests/acceptance/test_onboard_shape.py`) |
+| 19 | 82a7522 | 2026-10-31 | Chrome 155, Windows | http://localhost:8081 | Pass | The standard tier (deploy/compose.yaml, the image built at 82a7522) with the fake as `fake`, declarative; a reload is a recreate there. No Trusted Types or Content Security Policy violation, no alert, no request for `x`; the console's only error was the page's first `GET /api/servers` 401 after the container was recreated. Description drift: `echo` read `drift` with both columns whole and the markup as text in both and in the diff; `summarize` as item 16. Annotations drift: destructive and not read-only; **Accept** proposed approve (unticked, allow came back); **Generate** with Accept ticked and allow chosen gave the new pin, `# changed:` and `# kept: echo (allow: the new definition isn't marked read-only: proposed approve)`; with approve, `echo` under `approve:`. Found: the reviewed copies are on disk (`/state-gateway/defs/`), so a gateway restart keeps them (both columns still shown); with the old copy removed, the row said the gateway no longer has it and showed the new definition whole. **Clear** then **Select suggested**: `read_01` at approve, `read_02`-`read_63` at allow, no approve tool under `allow:`. Record the rest as declined (on by default, design G-19): every left-out tool declined at its pin, not `summarize` or `bad_tool`. Unticked, with `counter` and `lookup` taken out of `declined:`: **Decline** on `lookup` added it alone, `counter` stayed `# not included`. Not run by hand: `review_stale` (needs a reload with the vault running; covered by test_reviewview, test_reviewjobs, test_drift). The item's text was corrected for the restart, the Accept step and Decline |
+| 20 | 82a7522 + the confirm's layout fix | 2026-10-31 | Chrome 155, Windows | http://localhost:8081 | Pass | Item 19's stack, managed, on a fresh state: the start seeded revision 1. The first **Save**: "Revision 2, from 1 (by the seed, ...: 1 is the head)", written with a passkey; the texts say managed, no Generate, no text to commit, reload or generate. Re-pin of `echo` after `--drift description`: both pins, "re-pinned: you read both definitions", "No restart needed"; logged `step_up_confirmed` `tool.repin`, `tool_repinned`. `add` and `slow` approve -> allow: the two moves listed first, each with its sentence and its definition; **Close** wrote nothing (head stayed 3), confirmed: `tool_allowed` for each. **Allow read_01 without asking**: its move and definition; `tool.allow`. After a vault restart, **Allow read_02 without asking** ran a review first, then the dialog; **Close** wrote nothing. `read_02` dropped (and declined), then **Clear** and **Select suggested**: `read_02` back at approve, `read_01` kept allow, no move row and no "was approve" row; `add` and `slow` (not read-only) stayed unticked, so the plan dropped them (the item's text said every included tool comes back, corrected). A second browser's `tool.allow` first: this browser's confirm was refused `changed` (`policy_moved` in the log), "What the vault finds now" led with "The policy moved to revision 8 ... press Save again" and the plan on 8; nothing written. Found and fixed: the confirm dialog's label column was `max-content`, so a label naming a pin was wider than the dialog and squeezed every value to a character a line, and values lost their JSON indentation (app.css: labels `fit-content(40%)` and wrapping, values `pre-wrap`; test_portal_static pins both) |
+| 21 | 82a7522 + the confirm's layout fix | 2026-10-31 | Chrome 155, Windows | http://localhost:8081 | Pass | Item 20's vault: `ci-runner` added (reason `add ci-runner <b>x</b>`) and removed by two offline host imports (`run --rm --no-deps --user 10001:10001 ... policy import --state /state`). Item 20's run had dropped `add` and `slow` (revision 7), so a rollback past it would revive their pins (`pin_retired`, host-only): a third host import put them back at allow (`--allow-revive pin:fake/tool/add`, `pin:fake/tool/slow`) so the history matches the item's. The page named the head and the gateway's revision, the export command with `docker compose exec` and `-T`, no commit, reload or generate text; history newest first with who and what, the reason's markup as text; **Show the changes** on the moves to allow and on the seed (token hash `(set)`). Rollback to 3: no "(wider)" row, **Close** wrote nothing, confirmed: `add` and `slow` approve, `policy_rolled_back` with `target: 3`. Rollback to 9 refused `rollback_revives` before any passkey prompt. Rollback to 4 (`add` and `slow` at allow, every pin still held): "The portal can't widen gateway.servers.fake.tools.allow through a rollback: export, edit and import with zoeymcp policy import." Rollbacks to 8 and later were refused `pin_retired` first (they would revive the `read_*` pins the rollback to 3 dropped): pick a widening target whose pins the head still holds |
+| 22 | 82a7522 + the confirm's layout fix | 2026-10-31 | Chrome 155, Windows | http://localhost:8081 | Pass | Item 21's vault given `mail` (the shape of profiles/smtp-implicit-tls.yaml) by an offline host import. **Connectors** listed `mail: sending.` with its three limits and nothing of its host, sender or recipients. **Pause**, **Resume** (**Close** first wrote nothing) and "Sends a day" 20 -> 50 each wrote a `connector.limits` revision (`step_up_confirmed` and `policy_saved` with `write_kind: connector.limits`); 0 was refused `bad_body` and the same values `no_change`, both before any passkey prompt. A second browser paused first: this browser's **Pause** drew the page again with the moved text and wrote nothing (policy.js compares the head with the revision it showed before preparing). The first try at that step drew the page again before pressing the button, so it planned on the new head and wrote a revision: keep the first browser on the page, unreloaded |
+| 23 | 82a7522 + the confirm's layout fix | 2026-10-31 | Chrome 155, Windows | http://localhost:8081 | Pass | Processes on Windows: the vault through procs.py's launcher (the fakes' CA and name map), managed, `agent1` given no server; a gateway polling it over http with the gateway key. Found: the item's two fakes as separate processes can't work past **Connect**: `--static-key` makes the MCP fake accept only that key, so the provider's tokens got 401 and every review failed (`review_failed`, `upstream`, "bad gateway" on the page). Run instead as S9 runs them, in one process with the MCP fake's bearer check the provider's `access_ok`, from a fresh state. Then: `public-check` (no secret) planned **Save** with no registration and no passkey, **Cancel** wrote nothing; with no client ID, **Register its client** (passkey), no fragment, `needs_save`; **Save**: revision 2 from the seed, the three blocks "added (wider)", `needs_connect`. **Connect**: back to the portal, passkey, the review queued itself (6 tools); the review saved with its "Give to clients" ending; **Give to clients**: one box, the sentence naming 2 included tools, **Close** wrote nothing, served, then removed with no "(wider)" row; a second browser gave first: refused `policy_moved` before any passkey prompt. Confirms in order: `onboard.register`, `policy.save`, `oauth.complete`, `policy.save`, `client.servers`. The restore banner: the state copied after revision 2 put back while the gateway had applied 6: `policy_behind_witness` (head 2, witness 6) and the banner on every page with its command; `policy acknowledge-restore --state` (typed 7) "Acknowledged the restore as revision 7."; started again, the banner went and the history shows 7 after 2. The banner's command said `exec vault` here because ZOEYMCP_EXEC_SERVICE wasn't set for this native run |
+| 24 | 82a7522 + the confirm's layout fix | 2026-10-31 | Chrome 155, Windows | http://localhost:8081 | Pass | Item 19's stack (declarative; the server is `fake`), the fake with `--prompts --resources --switch inject_kinds`. Before `enable`, after an agent's listing, the row read "offered, not served: prompts, resources, completions" with the step "Add enable: [prompts, resources, completions] to fake in your policy and reload". With `enable`, the review: **Prompts**, **Resource templates**, **Resources** headings, no classification control; the hostile prompt, template and resource as text with their marks, refused (error findings). Fragment 2 named the `prompts:` and `resources:` blocks, `# added: ... (prompt)` and so on, `# can't be included, error finding: hostile_prompt (prompt; review fake shows why)` for each hostile entry; committed, `zoeymcp review fake` showed the four `ok`. With `--change-kind prompt --change-kind resource_template`: `zoeymcp health` had both `drift_marked` lines; `brainstorm` and `notes://notes/{id}` read drift; **Accept** on both and **Generate** gave the new pins with `# changed: brainstorm (prompt, was sha256:...)` and the template's. Managed (a fresh managed stack, `enable` added by an offline export, edit and import): the review's **Save** named the kinds' `include` and `review` paths, `policy.save` confirmed, an agent on `/s/fake/mcp` listed the included prompts, template and resource; the re-pin of both after `--change-kind` showed both pins and was written as `policy.save`. Seen: no `tool_repinned` line is logged for a prompt's or a resource template's re-pin (`_log_tools` logs tools only) |

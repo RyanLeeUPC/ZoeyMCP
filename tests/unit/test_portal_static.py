@@ -902,6 +902,24 @@ def test_record_the_rest_as_declined_is_ticked_by_default() -> None:
     assert 'decline_rest: $("review-decline-rest").checked' in code_of(read("drift.js"))
 
 
+def test_a_confirms_values_keep_their_indentation() -> None:
+    """M6 G.7 row 2: a definition's summary rows are its JSON lines, indented; the confirm draws
+    each value as text in a ``dd``, which would collapse the leading spaces (manual item 20)."""
+    css = read("app.css")
+    start = css.index("#confirm-summary dd,\n#confirm-now dd {")
+    assert "white-space: pre-wrap;" in css[start : css.index("}", start)]
+    # A label wider than the dialog (the first row names a 71-character pin) wraps in a column
+    # of at most 40%, so the values aren't squeezed to a character a line.
+    start = css.index("\ndl {")
+    assert (
+        "grid-template-columns: fit-content(40%) minmax(0, 1fr);"
+        in css[start : css.index("}", start)]
+    )
+    start = css.index("\ndt {")
+    assert "overflow-wrap: anywhere;" in css[start : css.index("}", start)]
+    assert "value.textContent = pair[1];" in code_of(read("app.js"))
+
+
 def test_prompts_and_resources_are_rows_whose_choices_go_under_kinds() -> None:
     """M6 L.7 (BP-3): a server's prompts and resources are review.js's rows, drawn by its row
     renderer; drift.js's row hook draws the kind's heading over the first of each kind (the
