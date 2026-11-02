@@ -1,13 +1,14 @@
 """What MCP traffic the gateway sends, and the routing-header rule (M8 design G-19, B.2).
 
 One place for both, so the gateway's egress filter (:mod:`zoeymcp.gateway.egressrules`), the
-bridge's admission (:mod:`zoeymcp.bridge.admit`) and the vault's envelope reader (M8) read the
-same method sets, ``_meta`` keys and header allowlist, and decode ``Mcp-Name`` the same way. Each
-moved here with its behaviour unchanged (M8 step 3 reshaped :func:`decode_name` and
-:func:`mismatch` so that a mutation test can tell every one of their mutants apart):
+bridge's admission (:mod:`zoeymcp.bridge.admit`) and the vault's envelope reader
+(:mod:`zoeymcp.common.envelope`) read the same method sets, ``_meta`` keys and header allowlist,
+and decode ``Mcp-Name`` the same way. Each moved here with its behaviour unchanged (M8 step 3
+reshaped :func:`decode_name` and :func:`mismatch` so that a mutation test can tell every one of
+their mutants apart):
 
 - the requests, notifications, ``_meta`` keys and headers the egress filter lets out (M3 design
-  F.2; M6 design L.4, L.6 for the kinds beyond tools);
+  F.2; M6 design L.4, L.6 for the kinds beyond tools), and :data:`METHODS`, all of them at once;
 - the routing headers of a modern request, and :func:`mismatch`, why they disagree with its body
   (M7 design C.4 row 7), with :func:`decode_name` for ``Mcp-Name``'s Base64 sentinel form.
 
@@ -48,6 +49,10 @@ KIND_REQUESTS: Mapping[str, frozenset[str]] = {
     "completions": frozenset({"completion/complete"}),
 }
 NOTIFICATIONS = frozenset({"notifications/initialized", "notifications/cancelled"})
+# Every method the gateway sends: its requests, of each kind, and its notifications (B.2 E6).
+METHODS = REQUESTS.union(*KIND_REQUESTS.values(), NOTIFICATIONS)
+# The headers a modern request mirrors parameters into, which the egress filter lets out too.
+PARAM_HEADER_PREFIX: Final = "mcp-param-"
 META_KEYS = frozenset(
     {
         "io.modelcontextprotocol/protocolVersion",

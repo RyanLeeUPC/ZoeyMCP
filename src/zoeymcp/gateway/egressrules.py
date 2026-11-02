@@ -31,11 +31,11 @@ from ..common.mcpwire import HEADERS as HEADERS
 from ..common.mcpwire import KIND_REQUESTS as KIND_REQUESTS
 from ..common.mcpwire import META_KEYS as META_KEYS
 from ..common.mcpwire import NOTIFICATIONS as NOTIFICATIONS
+from ..common.mcpwire import PARAM_HEADER_PREFIX as PARAM_HEADER_PREFIX
 from ..common.mcpwire import REQUESTS as REQUESTS
 from .access import SUPPORTED_VERSIONS
 
 METHODS = frozenset({"POST", "GET", "DELETE"})
-PARAM_HEADER_PREFIX = "mcp-param-"
 GATEWAY_KEY_HEADER = "x-zoeymcp-gateway"  # hardened tier only
 # The SDK sends this on the legacy GET stream, with this value only.
 CACHE_CONTROL = ("cache-control", "no-store")

@@ -77,9 +77,31 @@ def test_the_sets_are_the_egress_filters() -> None:
         "io.modelcontextprotocol/clientInfo",
         "progressToken",
     } == mcpwire.META_KEYS
+    assert mcpwire.PARAM_HEADER_PREFIX == "mcp-param-"
     sets = (mcpwire.HEADERS, mcpwire.REQUESTS, mcpwire.NOTIFICATIONS, mcpwire.META_KEYS)
     assert all(isinstance(value, frozenset) for value in sets)
     assert all(isinstance(value, frozenset) for value in mcpwire.KIND_REQUESTS.values())
+
+
+def test_methods_is_every_method_the_gateway_sends() -> None:
+    """B.2 E6: the requests of every kind and the notifications, and nothing else."""
+    assert {
+        "initialize",
+        "server/discover",
+        "tools/list",
+        "tools/call",
+        "subscriptions/listen",
+        "ping",
+        "prompts/list",
+        "prompts/get",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+        "completion/complete",
+        "notifications/initialized",
+        "notifications/cancelled",
+    } == mcpwire.METHODS
+    assert isinstance(mcpwire.METHODS, frozenset)
 
 
 def test_the_routing_names_are_the_bridges() -> None:
@@ -101,6 +123,7 @@ def test_the_egress_filter_and_the_bridge_read_the_same_objects() -> None:
     assert egressrules.KIND_REQUESTS is mcpwire.KIND_REQUESTS
     assert egressrules.NOTIFICATIONS is mcpwire.NOTIFICATIONS
     assert egressrules.META_KEYS is mcpwire.META_KEYS
+    assert egressrules.PARAM_HEADER_PREFIX is mcpwire.PARAM_HEADER_PREFIX
     assert admit.decode_name is mcpwire.decode_name
     assert admit.mismatch is mcpwire.mismatch
     assert admit.PROTOCOL_VERSION_META is mcpwire.PROTOCOL_VERSION_META

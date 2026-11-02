@@ -422,7 +422,7 @@ def test_netguard_uses_the_standard_library_only() -> None:
 
 # Shared modules the vault's chain and envelope reader build on: nothing beyond the standard
 # library, through every module of ours they load.
-STDLIB_ONLY = ("ledgerfile", "mcpwire", "approvaltext", "ledgerformat", "canonical")
+STDLIB_ONLY = ("ledgerfile", "mcpwire", "approvaltext", "ledgerformat", "canonical", "envelope")
 # Standard library modules that do I/O, which a pure module never imports.
 IO_MODULES = frozenset(
     {"asyncio", "http", "io", "os", "pathlib", "selectors", "shutil", "socket", "ssl", "subprocess"}
@@ -506,6 +506,18 @@ def test_the_ledger_file_layer_is_built_on_the_record_format() -> None:
     """Not vacuous: the walk reaches the modules the file layer stands on."""
     found = closure(PACKAGE.parent, "zoeymcp.common.ledgerfile")
     assert {"zoeymcp.common.ledgerformat", "zoeymcp.common.canonical"} <= set(found)
+
+
+def test_the_envelope_reader_is_pure_and_built_on_the_shared_wire_rules() -> None:
+    """M8 design B.2, F8: no I/O, and not vacuous: the walk reaches mcpwire and canonical."""
+    found = closure(PACKAGE.parent, "zoeymcp.common.envelope")
+    assert {"zoeymcp.common.mcpwire", "zoeymcp.common.canonical"} <= set(found)
+    assert not [
+        f"{module}: {name}"
+        for module, names in found.items()
+        for name in names
+        if name.partition(".")[0] in IO_MODULES
+    ]
 
 
 def test_the_committed_registry_uses_the_standard_library_and_anyio_only() -> None:

@@ -159,6 +159,7 @@ only_mutate = [
     "*zoeymcp/common/ledgerformat.py",
     "*zoeymcp/common/ledgerjoin.py",
     "*zoeymcp/common/mcpwire.py",
+    "*zoeymcp/common/envelope.py",
     "*zoeymcp/common/files.py",
     "*zoeymcp/common/netguard.py",
     "*zoeymcp/common/egresslist.py",
@@ -310,3 +311,4 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.gateway.approvalrules" = 95
 "zoeymcp.common.approvaltext" = 95
 "zoeymcp.common.ledgerformat" = 95
+"zoeymcp.common.policy.held" = 95
