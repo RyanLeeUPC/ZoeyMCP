@@ -19,13 +19,17 @@ pipeline has admitted, shaped, canonicalized and validated it. In order (B.2):
 
 Only an explicit ``accept`` runs the call. Every answer the agent sees ends with the ref the
 prompt, the ledger and the logs share. The transports that ask live in :mod:`.approvers`, and the
-rules for a waiting prompt after a policy change in :mod:`.approvalrules` (M8 design C.5).
+rules for a waiting prompt after a policy change in :mod:`.approvalrules` (M8 design C.5). A call
+the vault holds (:mod:`.elsewhere`) shares the table, the ledger and the caps, and is never
+withdrawn here: the vault decides it (Z7).
 """
 
 from __future__ import annotations
 
 import hashlib
+import secrets
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -92,6 +96,9 @@ class AskSession(Protocol):
 
 
 Forward = Callable[[Grant], Awaitable[CallToolResult]]
+# Tells the vault a held call's caller left (ref, client, reason): its ``approvals/withdraw``
+# (M8 design B.6, E.2), which the out-of-band client binds (step 12a).
+TellWithdrawn = Callable[[str, str, str], Awaitable[None]]
 
 
 @dataclass
@@ -134,6 +141,13 @@ class Approvals:
     clock: Callable[[], float] = time.monotonic
     wall: Callable[[], float] = time.time
     table: approvals.Table = field(default_factory=approvals.Table)
+    # M8 (C.2, C.3): the view fetched at once, not by the long poll; the process's start id,
+    # which every held call's marker carries (I.3); the vault told of an abandoned held call;
+    # and per server, the held calls that came back without the vault's approval.
+    refetch: Callable[[], Awaitable[Snapshot | None]] | None = None
+    epoch: str = field(default_factory=lambda: secrets.token_hex(6))
+    tell_withdrawn: TellWithdrawn | None = None
+    unheld: Counter[str] = field(default_factory=Counter)
     _shown: dict[str, Shown] = field(default_factory=dict)
     _waits: dict[str, anyio.CancelScope] = field(default_factory=dict)
     legacy: ElicitationLegacy = field(init=False)
@@ -281,32 +295,7 @@ class Approvals:
         return self._refuse(asking, reason, CANT_SHOW)
 
     def _refuse_begin(self, asking: Asking, refusal: approvals.Refusal) -> CallToolResult:
-        if isinstance(refusal, approvals.Busy):
-            return self._refuse(
-                asking,
-                "busy",
-                "refused: another call to this tool is waiting or running "
-                f"(ref {refusal.holder_ref}, frees within {refusal.seconds_left} s)",
-            )
-        if isinstance(refusal, approvals.PendingCap):
-            return self._refuse(
-                asking,
-                "pending_cap",
-                "refused: an approval is already waiting for this client "
-                f"(ref {refusal.holder_ref})",
-            )
-        if isinstance(refusal, approvals.HourlyCap):
-            return self._refuse(
-                asking, "hourly_cap", "refused: too many approval requests this hour"
-            )
-        if isinstance(refusal, approvals.Cooldown):
-            return self._refuse(
-                asking,
-                "cooldown",
-                "refused: this tool was declined moments ago; "
-                f"try again in {refusal.seconds_left} s",
-            )
-        return self._refuse(asking, "table_full", "refused: too many approvals are waiting")
+        return self._refuse(asking, *begin_refusal(refusal))
 
     # --- asking, through the transports ------------------------------------------------------
 
@@ -476,7 +465,12 @@ class Approvals:
                 retrying.add(record.ref)
             return picked
 
-        found = self.table.withdraw(picks, decision, self.clock())
+        def gateway_held(record: Pending) -> bool:
+            # A call the vault holds is the vault's to withdraw (Z7, C.5); its handler records
+            # its own ending.
+            return record.how != "elsewhere" and picks(record)
+
+        found = self.table.withdraw(gateway_held, decision, self.clock())
         for record in found:
             wait = self._waits.get(record.ref)
             if wait is not None:
@@ -515,6 +509,11 @@ class Approvals:
             await self._close(record, "timeout")
         for record in swept.freed:
             self._shown.pop(record.ref, None)
+            if record.how == "elsewhere" and record.pending_until is not None:
+                # D.2: a pending held call's lock ends at its hard deadline; the vault's chain
+                # holds how it ended, which the gateway learns sooner from step 12a on.
+                await self._outcome(record, "unknown", None)
+                continue
             logs.event("approval_lock_expired", ref=record.ref, level="error")
 
     async def sweep_forever(self) -> None:
@@ -524,6 +523,37 @@ class Approvals:
 
 
 # --- helpers --------------------------------------------------------------------------------------
+
+
+def begin_refusal(refusal: approvals.Refusal) -> tuple[str, str]:
+    """Why :meth:`.approvals.Table.begin` refused, as ``(reason, text)``: the log's reason and
+    what the agent reads. A tool whose call waits out of band names the ref to collect (OPS-3)."""
+    if isinstance(refusal, approvals.Busy):
+        if refusal.pending:
+            ref = refusal.holder_ref
+            return (
+                "busy",
+                f"refused: a call to this tool is waiting for approval (ref {ref}); "
+                f'call check_approval with {{"id": "{ref}"}}',
+            )
+        return (
+            "busy",
+            "refused: another call to this tool is waiting or running "
+            f"(ref {refusal.holder_ref}, frees within {refusal.seconds_left} s)",
+        )
+    if isinstance(refusal, approvals.PendingCap):
+        return (
+            "pending_cap",
+            f"refused: an approval is already waiting for this client (ref {refusal.holder_ref})",
+        )
+    if isinstance(refusal, approvals.HourlyCap):
+        return "hourly_cap", "refused: too many approval requests this hour"
+    if isinstance(refusal, approvals.Cooldown):
+        return (
+            "cooldown",
+            f"refused: this tool was declined moments ago; try again in {refusal.seconds_left} s",
+        )
+    return "table_full", "refused: too many approvals are waiting"
 
 
 def _client_settings(gateway: ViewGateway, client: str) -> ClientApprovals | None:

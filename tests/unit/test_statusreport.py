@@ -592,6 +592,95 @@ def test_a_quiet_server_reads_quiet() -> None:
     assert quiet(read(report(), MAX_TOOLS).servers["notes"].attention())
 
 
+# --- held calls (M8 design K.1) ------------------------------------------------------------------
+
+
+def test_the_held_key_and_members() -> None:
+    assert statusreport.HELD_KEY == "held"
+    assert sorted(statusreport.HELD_MEMBERS) == ["elsewhere_unheld", "header_params"]
+
+
+def test_no_held_reads_as_before() -> None:
+    entry = read(report(), MAX_TOOLS).servers["notes"]
+    assert (entry.elsewhere_unheld, entry.header_params) == (0, ())
+    assert read(report(servers={"notes": server(held={})}), MAX_TOOLS).servers["notes"] == entry
+
+
+def test_held_reads_its_count_and_names() -> None:
+    held = {"elsewhere_unheld": 3, "header_params": ["place_order", "b c", "cancel", "cancel"]}
+    entry = read(report(servers={"notes": server(held=held)}), MAX_TOOLS).servers["notes"]
+    assert entry.elsewhere_unheld == 3
+    assert entry.header_params == ("cancel", "place_order")
+    assert entry.dropped == 1  # the name that isn't a tool name, counted with the others
+    alone = read(report(servers={"notes": server(held={"header_params": ["t"]})}), MAX_TOOLS)
+    assert (alone.servers["notes"].elsewhere_unheld, alone.servers["notes"].header_params) == (
+        0,
+        ("t",),
+    )
+    counted = read(report(servers={"notes": server(held={"elsewhere_unheld": 1})}), MAX_TOOLS)
+    assert (counted.servers["notes"].elsewhere_unheld, counted.servers["notes"].header_params) == (
+        1,
+        (),
+    )
+    edge = {"elsewhere_unheld": statusreport.COUNT_MAX, "header_params": ["t"] * MAX_TOOLS}
+    assert read(report(servers={"notes": server(held=edge)}), MAX_TOOLS).servers["notes"] == (
+        ServerStatus(
+            kind="remote",
+            state=("ready",),
+            era="modern",
+            included=2,
+            exposed=1,
+            elsewhere_unheld=statusreport.COUNT_MAX,
+            header_params=("t",),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        [],
+        None,
+        {"unheld": 1},
+        {"elsewhere_unheld": -1},
+        {"elsewhere_unheld": statusreport.COUNT_MAX + 1},
+        {"elsewhere_unheld": True},
+        {"elsewhere_unheld": "1"},
+        {"header_params": "t"},
+        {"header_params": ["t"] * (MAX_TOOLS + 1)},
+    ],
+    ids=plain_id,
+)
+def test_a_bad_held_shape_refuses_the_server(held: Any) -> None:
+    found = read(report(servers={"notes": server(held=held), "mail": server()}), MAX_TOOLS)
+    assert found.refused_servers == ("notes",)
+    assert list(found.servers) == ["mail"]
+
+
+def test_the_gateways_held_entry_reads_back() -> None:
+    """``statuspush`` sends ``held`` only while it says something, each member only when set,
+    and the vault reads back what it sent."""
+    entry = {"kind": "remote", "state": ["ready"], "era": "modern", "reports": {}}
+    quiet_status = {"view": VIEW, "servers": {"notes": {**entry, "held": {}}}}
+    sent = statuspush.content(quiet_status, started=5, max_tools=MAX_TOOLS)
+    assert sent is not None
+    assert "held" not in sent["servers"]["notes"]
+    held = {"elsewhere_unheld": 2, "header_params": ["place_order", "not a name"]}
+    status = {"view": VIEW, "servers": {"notes": {**entry, "held": held}}}
+    document = statuspush.content(status, started=5, max_tools=MAX_TOOLS)
+    assert document is not None
+    assert document["servers"]["notes"]["held"] == {
+        "elsewhere_unheld": 2,
+        "header_params": ["place_order"],
+    }
+    found = read(copy.deepcopy(document), MAX_TOOLS).servers["notes"]
+    assert (found.elsewhere_unheld, found.header_params) == (2, ("place_order",))
+    only = {"view": VIEW, "servers": {"notes": {**entry, "held": {"elsewhere_unheld": 1}}}}
+    once = statuspush.content(only, started=5, max_tools=MAX_TOOLS)
+    assert once is not None
+    assert once["servers"]["notes"]["held"] == {"elsewhere_unheld": 1}
+
+
 def test_the_gateway_status_holds_the_report_and_its_age() -> None:
     held = GatewayStatus(read(report(), MAX_TOOLS), 3.5)
     assert held.age == 3.5

@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx2
 import pytest
 
@@ -533,6 +534,82 @@ async def test_the_same_view_again_is_not_reapplied() -> None:
     await client.fetch_once()
     await client.fetch_once()
     assert len(applied) == 1
+
+
+def gated_client(
+    vault: Vault, applied: Applied, release: anyio.Event, active: list[int]
+) -> PolicyClient:
+    """A policy client whose apply waits for ``release``; ``active`` counts the applies under
+    way, and the most there ever were."""
+
+    async def apply(snapshot: Snapshot, previous: Snapshot | None) -> None:
+        active[0] += 1
+        active[1] = max(active[1], active[0])
+        try:
+            await release.wait()
+            applied.append((snapshot, previous))
+        finally:
+            active[0] -= 1
+
+    http = view_client(parse_link("unix:/run/v.sock"), None, inner=httpx2.MockTransport(vault))
+    return PolicyClient(http, apply, clock=lambda: 0.0)
+
+
+async def until(check: Callable[[], bool]) -> None:
+    while not check():
+        await anyio.sleep(0.01)
+
+
+async def test_an_apply_runs_to_its_end_when_its_fetch_is_cancelled() -> None:
+    """M8 design C.3: a fetch on demand runs on a request's task, which the view it applies may
+    itself cancel (a revocation). The apply runs to its end: the snapshot is set, so the next
+    long poll's 304 would never apply it again."""
+    vault, applied, _ = scripted()
+    release, active = anyio.Event(), [0, 0]
+    client = gated_client(vault, applied, release, active)
+    vault.answers = [httpx2.Response(200, content=view_bytes())]
+    scopes: list[anyio.CancelScope] = []
+
+    async def fetch() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await client.fetch_once(wait=0)
+
+    with anyio.fail_after(5):
+        async with anyio.create_task_group() as group:
+            group.start_soon(fetch)
+            await until(lambda: active[0] == 1)
+            scopes[0].cancel()
+            await anyio.sleep(0.05)
+            release.set()
+    assert scopes[0].cancel_called
+    [(snapshot, previous)] = applied
+    assert previous is None
+    assert client.snapshot is snapshot
+
+
+async def test_one_view_is_applied_at_a_time() -> None:
+    """The long poll and a fetch on demand (C.3) never apply at once: the second waits for the
+    first, and is applied with it as its previous."""
+    vault, applied, _ = scripted()
+    release, active = anyio.Event(), [0, 0]
+    client = gated_client(vault, applied, release, active)
+    vault.answers = [
+        httpx2.Response(200, content=view_bytes(1)),
+        httpx2.Response(200, content=view_bytes(2)),
+    ]
+    with anyio.fail_after(5):
+        async with anyio.create_task_group() as group:
+            group.start_soon(client.fetch_once)
+            await until(lambda: active[0] == 1)
+            group.start_soon(client.fetch_once, 0)
+            await until(lambda: len(vault.requests) == 2)
+            await anyio.sleep(0.05)
+            assert applied == []
+            release.set()
+    assert active[1] == 1
+    assert [len(s.view.gateway.clients) for s, _ in applied] == [1, 2]
+    assert applied[1][1] is applied[0][0]
 
 
 async def test_a_304_before_any_view_is_not_contact() -> None:

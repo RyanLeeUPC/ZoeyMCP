@@ -13,12 +13,20 @@ most 1 MiB, ``Accept`` and ``Content-Type`` and, for a write through an smtp slo
 4 MiB; anything else, a redirect included, is a :class:`VaultError`. No request is ever retried.
 At most 4 are in flight per call.
 
+Under an Elsewhere grant (a ``vault_approval`` tool, M8 design B.7, C.2) the body runs as an
+accepted one, and its one write leaves marked for the vault to hold: the slot registers the write
+with the call's marker, the transport adds the marker only after its own checks passed for that
+registration, and the vault's answer is kept on the call (:attr:`CallState.held`). An
+``approved: true`` rule is then used only toward a connector, which the vault holds (H11); any
+other such use is refused.
+
 This is the gateway enforcing on itself: it stops toolkit bugs and model-driven misuse, not a
 compromised gateway.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
@@ -30,12 +38,14 @@ import httpx2
 from ..common import canonical
 from ..common.approvaltext import Write
 from ..common.canonical import JSONValue
+from ..common.envelope import Marker
 from ..common.policy.match import RequestRejected, normalize_path
 from ..common.policy.view import ViewSlot, ViewToolkitServer
 from ..toolkit import rules
 from ..toolkit.context import VaultError
 from ..toolkit.plan import Claim, SendLedger
 from . import logs
+from .upstream import Held
 from .vaultlink import (
     TOOLKIT_MAX_ANSWER_BYTES,
     TOOLKIT_MAX_REQUEST_BYTES,
@@ -44,6 +54,7 @@ from .vaultlink import (
     ResponseTooLarge,
     UpstreamBlocked,
     UpstreamRedirect,
+    held_answer,
     toolkit_client,
     vault_refusal_code,
 )
@@ -77,9 +88,19 @@ class CallState:
     phase: rules.Phase
     ledger: SendLedger
     gate: anyio.Semaphore = field(default_factory=lambda: anyio.Semaphore(MAX_IN_FLIGHT))
+    # An Elsewhere grant's marker, and once its write is answered, the vault's answer (C.2).
+    held: Held | None = None
 
     def close(self) -> None:
         self.phase = "closed"
+
+
+# A held write's registration: method, path, the body's SHA-256 and its Idempotency-Key.
+MarkKey = tuple[str, str, str, str | None]
+
+
+def _mark_key(method: str, path: str, body: bytes, idempotency: str | None) -> MarkKey:
+    return (method, path, hashlib.sha256(body).hexdigest(), idempotency)
 
 
 class ToolkitVault:
@@ -97,9 +118,37 @@ class ToolkitVault:
         self.server = server
         self.slots = dict(slots)
         self._prefixes = {slot.prefix.lstrip("/") for slot in self.slots.values()}
+        # Held writes registered and not yet sent, by (method, path, SHA-256 of the body, and
+        # the Idempotency-Key, which names the call's ref): one registration per key (Z27).
+        self._marked: dict[MarkKey, Marker] = {}
         self.client = toolkit_client(
-            link, keys, server=server, check=self._transport_check, inner=inner
+            link,
+            keys,
+            server=server,
+            check=self._transport_check,
+            inner=inner,
+            held=self._take_marked,
         )
+
+    def mark(
+        self, method: str, path: str, body: bytes, idempotency: str | None, marker: Marker
+    ) -> MarkKey | None:
+        """Register a held write for the transport to mark once its checks pass (C.2); None,
+        and nothing registered, while the same write of the same call is registered."""
+        key = _mark_key(method, path, body, idempotency)
+        if key in self._marked:
+            return None
+        self._marked[key] = marker
+        return key
+
+    def unmark(self, key: MarkKey) -> None:
+        """A registered write whose request ended, sent or not."""
+        self._marked.pop(key, None)
+
+    def _take_marked(
+        self, method: str, path: str, body: bytes, idempotency: str | None
+    ) -> Marker | None:
+        return self._marked.pop(_mark_key(method, path, body, idempotency), None)
 
     def _transport_check(self, method: str, raw_path: str) -> str | None:
         """The transport's own last look: a method the SDK uses, a path the vault reads the same
@@ -154,7 +203,12 @@ class BoundSlot:
         reason = rules.check_call(self._slot, self._state.phase, method, path, plan_write=claim)
         if reason is not None:
             raise self._blocked(method, reason)
+        held = self._state.held
+        if held is not None and claim is not None and self._slot.connector != "smtp":
+            # H11 under an Elsewhere grant: an approved write goes only to a held connector.
+            raise self._blocked(method, "not_held")
         target = rules.join(self._slot.prefix, path).encoded()
+        unqueried = target  # the transport reads the path without its query
         if query:
             encoded = urlencode(sorted(query.items()))
             if len(encoded) > MAX_QUERY_BYTES:
@@ -168,7 +222,20 @@ class BoundSlot:
         if self._slot.connector == "smtp" and method != "GET":
             headers["idempotency-key"] = f"{self._state.ref}.{number or 1}"
         async with self._state.gate:
+            marked = None
             try:
+                if held is not None and claim is not None:
+                    # Registered here, after every check of its own, so each path out of the
+                    # request ends the registration in the finally below.
+                    marked = self._vault.mark(
+                        method,
+                        unqueried,
+                        body or b"",
+                        headers.get("idempotency-key"),
+                        held.marker,
+                    )
+                    if marked is None:
+                        raise self._blocked(method, "held_busy")
                 response = await self._vault.client.request(
                     method, target, content=body, headers=headers
                 )
@@ -181,6 +248,11 @@ class BoundSlot:
                 raise VaultError(502, "too_large") from None
             except httpx2.HTTPError:
                 raise VaultError(502, "unreachable") from None
+            finally:
+                if marked is not None:
+                    self._vault.unmark(marked)
+        if held is not None and marked is not None:
+            held.answer = held_answer(response.status_code, response.headers, data)
         if not 200 <= response.status_code < 300:
             raise VaultError(response.status_code, vault_refusal_code(data))
         if not response.headers.get("content-type", "").startswith("application/json"):

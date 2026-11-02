@@ -17,7 +17,9 @@ module does the I/O around them:
   won't announce its changes. Any change signal makes the connection ``STALE`` at once, and
   nothing is admitted until the listing has been compared again;
 - **call** with the validated arguments registered with the egress filter first, under a hard
-  deadline. A legacy session that expired is re-opened, and the call that hit the 404 is retried
+  deadline; a call the vault holds is registered with its marker, and the vault's answer to it is
+  kept by its ref for that call alone (M8 design C.2, Z27), never in the connection's refusal
+  slot. A legacy session that expired is re-opened, and the call that hit the 404 is retried
   once if the tool is still admitted with the same pin. Nothing else is ever retried but the
   requests of the kinds beyond tools (M6 design L.6: ``prompts/get``, ``resources/read`` and
   ``completion/complete``), which change nothing, and are retried the same way;
@@ -47,7 +49,8 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, Implementation, Tool
 from pydantic import BaseModel, ValidationError
 
-from ..common import canonical
+from ..common import canonical, envelope
+from ..common.envelope import Marker
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway, ViewRemoteServer
 from . import logs, pins
@@ -78,7 +81,15 @@ from .defstore import DefinitionStore, changed_members
 from .egressrules import CallRegistry
 from .marks import DriftMarks
 from .sanitize import Outcome
-from .vaultlink import REFUSAL_HEADER, KeySource, Link, upstream_client, vault_refusal_code
+from .vaultlink import (
+    REFUSAL_HEADER,
+    HeldAnswer,
+    KeySource,
+    Link,
+    held_answer,
+    upstream_client,
+    vault_refusal_code,
+)
 
 CLIENT_INFO = Implementation(name="zoeymcp-gateway", version="1")
 COALESCE = 5.0  # seconds between listings of one connection, at least
@@ -116,6 +127,21 @@ class NotAdmitted(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class HeldBusy(Exception):
+    """An identical held call is in flight on this connection: nothing was sent (C.2)."""
+
+
+@dataclass
+class Held:
+    """A call the vault holds (C.2): its marker; ``wait``, the seconds the vault may hold it
+    before it forwards, which the read waits out too (I.1); and once the call returns or
+    raises, what the vault answered it (None: no answer named it)."""
+
+    marker: Marker
+    wait: float = 0.0
+    answer: HeldAnswer | None = None
 
 
 class ListingFailed(Exception):
@@ -175,6 +201,8 @@ class Connection:
         # Why the connection failed, and the vault's last refusal (status, code), for review.
         self.failure: str | None = None
         self.vault_refusal: tuple[int, str | None] | None = None
+        # The vault's answer to each held call in flight, by the marker's ref (Z27).
+        self.held_answers: dict[str, HeldAnswer] = {}
         self.in_flight = 0
         self.holds = 0  # downstream listeners that keep this connection open
         # Each call's cancel scope, with its deadline if it is committed (None if not).
@@ -259,8 +287,24 @@ class Connection:
     # --- notes from the transport and the SDK -------------------------------------------------
 
     def noted(self, request: Any, response: Any) -> None:
-        """Called by the egress transport for every answer."""
-        if response.headers.get(REFUSAL_HEADER) == "refused":
+        """Called by the egress transport for every answer. A held call's is kept by its
+        marker's ref, for that call alone; any other refusal is the connection's last."""
+        marker = envelope.marker(list(request.headers.multi_items()))
+        refused = response.headers.get(REFUSAL_HEADER) == "refused"
+        if isinstance(marker, Marker):
+            if self.registry.flying(marker):
+                body = response.content if refused else None  # a refusal's body is read already
+                answer = held_answer(response.status_code, response.headers, body)
+                self.held_answers[marker.ref] = answer
+            else:
+                # Its call ended (cancelled, timed out) while the SDK's writer kept the POST.
+                logs.event(
+                    "held_answer_dropped",
+                    server=self.server,
+                    ref=marker.ref,
+                    status=response.status_code,
+                )
+        elif refused:
             self.vault_refusal = (response.status_code, vault_refusal_code(response.content))
         session = response.headers.get("mcp-session-id")
         if session:
@@ -270,7 +314,13 @@ class Connection:
                 self.session_id = session
                 logs.event("upstream_session_changed", server=self.server, key=self.label)
                 self.change("new_session")
-        if response.status_code == 404 and request.headers.get("mcp-session-id"):
+        # The vault's own 404 to a held call (held_path) says nothing of the upstream's session.
+        held_refusal = refused and isinstance(marker, Marker)
+        if (
+            response.status_code == 404
+            and request.headers.get("mcp-session-id")
+            and not held_refusal
+        ):
             self._expired = True
             if self.state.phase in (Phase.READY, Phase.STALE):
                 self._set(on_session_expired(self.state))
@@ -671,14 +721,22 @@ class Connection:
         timeout: float,
         progress: Progress | None = None,
         committed: bool = False,
+        held: Held | None = None,
     ) -> CallToolResult:
         """One call. A committed call (an approved one) keeps the session open until it ends:
-        a close waits for it. Any other call is cut when the connection closes."""
+        a close waits for it. Any other call is cut when the connection closes. A ``held`` call
+        is registered with its marker (:class:`HeldBusy` while an identical call is under way),
+        and ``held.answer`` is the vault's answer to it once the call returns or raises (C.2); a
+        plain call identical to a held one under way is refused ``unavailable``, nothing sent."""
         client = self.client
         if client is None or self.closing:
             raise UpstreamError("unavailable", "not connected")
         digest = canonical.digest(arguments)
-        self.registry.register(tool, digest)
+        marker = held.marker if held is not None else None
+        if not self.registry.register(tool, digest, marker):
+            if marker is None:  # an identical held call is under way: nothing was sent
+                raise UpstreamError("unavailable", "held_in_flight")
+            raise HeldBusy()
         self.in_flight += 1
         self.last_used = self.pool.clock()
         scope = anyio.CancelScope()
@@ -695,10 +753,14 @@ class Connection:
                 except BaseException as exc:
                     # A registration that never went out is withdrawn. If it did go out and
                     # the call then failed, this may withdraw a concurrent identical call's
-                    # registration, which then fails closed.
-                    self.registry.withdraw(tool, digest)
+                    # registration, which then fails closed. A held one is released below.
+                    if marker is None:
+                        self.registry.withdraw(tool, digest)
                     raise self._call_error(exc) from exc
         finally:
+            if held is not None and marker is not None:
+                self.registry.release(tool, digest, marker)
+                held.answer = self.held_answers.pop(marker.ref, None)
             self.in_flight -= 1
             self.last_used = self.pool.clock()
             del self._calls[scope]
@@ -973,9 +1035,10 @@ class UpstreamPool:
         progress: Progress | None = None,
         committed: bool = False,
         retry_expired: bool = True,
+        held: Held | None = None,
     ) -> CallToolResult:
         """Admit and call. A legacy session that expired is re-opened and the call retried once,
-        if the tool is still admitted with the same pin.
+        if the tool is still admitted with the same pin; a ``held`` call never is (C.2).
 
         ``pin`` is the one the arguments were validated under: if the tool is admitted under
         another one now, nothing is sent. An approved call is ``committed`` (a close waits for
@@ -988,12 +1051,14 @@ class UpstreamPool:
         if pin is not None and admitted != pin:
             raise NotAdmitted("pin changed after validation")
         pin = admitted
+        if held is not None:
+            timeout += held.wait  # the vault's block ends first (I.1)
         try:
             return await connection.call(
-                tool, arguments, timeout=timeout, progress=progress, committed=committed
+                tool, arguments, timeout=timeout, progress=progress, committed=committed, held=held
             )
         except _SessionExpired as exc:
-            if not retry_expired:
+            if not retry_expired or held is not None:
                 raise UpstreamError("connection_lost", "session_expired") from exc
         connection = self.connection(server, policy, client)
         if await self.admit(connection, tool) != pin:

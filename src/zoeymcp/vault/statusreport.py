@@ -47,6 +47,12 @@ rule (a prompt's is a tool name's, a template ``fields.uri_template``, a fixed r
 any other shape refuses the server. :attr:`ServerStatus.kinds` holds each kind's decision (read
 with ``attention.loaded``); :meth:`ServerStatus.attention` stays the tools'. A server with no
 ``kinds`` is read as before.
+
+A server with ``vault_approval`` tools may also have ``held`` (M8 design K.1): an object of at
+most ``elsewhere_unheld``, a count of the held calls that came back without the vault's approval,
+and ``header_params``, the held tools whose pinned schema mirrors parameters into headers, names
+held to the tool-name rule as the other lists are. Any other shape refuses the server; a server
+with no ``held`` is read as before.
 """
 
 from __future__ import annotations
@@ -99,6 +105,9 @@ NAME_LISTS: Final = ("marked", "declined_changed", "drift", "missing", "invalid"
 # attention decision's lists, by their own names (``Attention.as_dict``).
 KINDS_KEY: Final = "kinds"
 KIND_LISTS: Final = frozenset({"drifted", "marked", "new", "changed_declined", "missing"})
+# And a server with held tools, one more (M8 design K.1): what its held calls say.
+HELD_KEY: Final = "held"
+HELD_MEMBERS: Final = frozenset({"elsewhere_unheld", "header_params"})
 KINDS: Final = frozenset({"remote", "toolkit"})
 ERAS: Final = frozenset({"legacy", "modern"})
 MODES: Final = frozenset({"managed", "declarative", "unknown"})
@@ -226,6 +235,10 @@ class ServerStatus:
     blocked: bool = False
     # Each kind beyond tools the server enables, with the gateway's decision for it (D-216).
     kinds: Mapping[DefinitionKind, Attention] = field(default_factory=dict)
+    # M8 (K.1): held calls that came back without the vault's approval, and held tools whose
+    # schema mirrors parameters into headers.
+    elsewhere_unheld: int = 0
+    header_params: tuple[str, ...] = ()
 
     def attention(self) -> Attention:
         """The gateway's attention decision for the server, as its status names it."""
@@ -335,7 +348,7 @@ def _witness(value: Any) -> dict[str, int]:
 
 def _server(entry: Any, max_tools: int) -> ServerStatus:
     """One server's entry, or :class:`_Bad`. Its bad names and pins are dropped and counted."""
-    if not isinstance(entry, dict) or set(entry) - {KINDS_KEY} != SERVER_KEYS:
+    if not isinstance(entry, dict) or set(entry) - {KINDS_KEY, HELD_KEY} != SERVER_KEYS:
         raise _Bad
     kind, era = entry["kind"], entry["era"]
     if not isinstance(kind, str) or kind not in KINDS:
@@ -368,6 +381,7 @@ def _server(entry: Any, max_tools: int) -> ServerStatus:
         dropped += bad
     unreviewed, bad = _pinned(entry["unreviewed"], max_tools)
     kinds, unnamed_kinds = _kinds(entry.get(KINDS_KEY, {}), max_tools)
+    unheld, header_params, unnamed_held = _held(entry.get(HELD_KEY, {}), max_tools)
     return ServerStatus(
         kind=kind,
         state=tuple(sorted(set(state))),
@@ -378,7 +392,7 @@ def _server(entry: Any, max_tools: int) -> ServerStatus:
         invalid_unnamed=unnamed[0],
         duplicate_unnamed=unnamed[1],
         offered=_offered(entry["offered"]),
-        dropped=dropped + bad + unnamed_kinds,
+        dropped=dropped + bad + unnamed_kinds + unnamed_held,
         marked=lists["marked"],
         declined_changed=lists["declined_changed"],
         drift=lists["drift"],
@@ -386,6 +400,8 @@ def _server(entry: Any, max_tools: int) -> ServerStatus:
         invalid=lists["invalid"],
         blocked=entry["blocked"],
         kinds=kinds,
+        elsewhere_unheld=unheld,
+        header_params=header_params,
     )
 
 
@@ -417,6 +433,18 @@ def _kinds(value: Any, max_tools: int) -> tuple[Mapping[DefinitionKind, Attentio
             dropped += bad
         found[kind] = loaded(held)
     return MappingProxyType(found), dropped
+
+
+def _held(value: Any, max_tools: int) -> tuple[int, tuple[str, ...], int]:
+    """The ``held`` object: the unheld count, the held tools that mirror parameters into
+    headers, and how many of those names weren't tool names."""
+    if not isinstance(value, dict) or not set(value) <= HELD_MEMBERS:
+        raise _Bad
+    unheld = value.get("elsewhere_unheld", 0)
+    if not _integer(unheld) or not 0 <= unheld <= COUNT_MAX:
+        raise _Bad
+    names, bad = _names(value.get("header_params", []), max_tools)
+    return unheld, names, bad
 
 
 def _pinned(value: Any, max_tools: int) -> tuple[tuple[tuple[str, str], ...], int]:

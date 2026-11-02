@@ -80,6 +80,10 @@ prompts or resources are served (Q20 (a));
 ``server_listing_invalid`` a server the gateway lists tools for that it can't name, or that it
 reports invalid and no drift finding names already (counted), or whose status the vault refused
 (T-7).
+For a server with ``vault_approval`` tools (M8 design K.1, C.2): ``elsewhere_unheld`` (error), held
+calls the gateway says came back without the vault's approval, and
+``vault_approval_header_params`` (warning), the held tools whose pinned schema mirrors parameters
+into headers, so the gateway refuses their calls (Q27); only the names the policy holds are shown.
 A gateway that hasn't reported for :data:`STATUS_STALE` seconds is ``gateway_status_stale``
 (info): its findings are then as old. In managed mode, a gateway whose reported view is still
 another revision's than the head's after ``vault/managed.py``'s ``GATEWAY_APPLY_GRACE`` is
@@ -142,7 +146,7 @@ from .netclient import destination_key, guard_key, private_hint
 from .oauth.protocol import GRANT_WARN_DAYS
 from .onboarding import onboard_again, widen_scope
 from .secretplan import binding_refusal
-from .statusreport import GatewayStatus
+from .statusreport import GatewayStatus, ServerStatus
 from .store import EntryMeta, canonical_origin
 
 Level = Literal["error", "warning", "info"]
@@ -1056,6 +1060,7 @@ def _gateway(
                         else ""
                     )
                 findings.append(_finding("server_listing_invalid", "warning", text, review))
+            findings.extend(_held_findings(name, server.tools.vault_approval, entry))
             upstream = upstreams.get(server.route) if isinstance(server, RemoteServer) else None
             row: dict[str, Any] = {
                 "name": name,
@@ -1092,6 +1097,30 @@ def _gateway(
 
 def _tools(count: int) -> str:
     return _counted(count, "tool")
+
+
+def _held_findings(name: str, held: Sequence[str], entry: ServerStatus) -> list[Finding]:
+    """What the gateway says of a server's held calls (M8 design K.1): calls that came back
+    without the vault's approval, and held tools whose schema mirrors parameters into headers,
+    named only when the policy holds them (the gateway's report names nothing else here)."""
+    findings: list[Finding] = []
+    if entry.elsewhere_unheld:
+        text = (
+            f"{name}: {entry.elsewhere_unheld} held call(s) came back without the vault's "
+            "approval: stop the gateway, check that the vault and the gateway run the same "
+            "release and that the vault's policy has the tool, and report it"
+        )
+        findings.append(_finding("elsewhere_unheld", "error", text, {"kind": "check_gateway"}))
+    mirrored = sorted(set(entry.header_params) & set(held))
+    if mirrored:
+        text = (
+            f"{name}: {_some(mirrored)}: a vault_approval tool's schema mirrors parameters into "
+            "headers, so its calls are refused (Q27): remove it from vault_approval, or ask its "
+            "server for a version without x-mcp-header"
+        )
+        action = _act("fix_policy", "server", name)
+        findings.append(_finding("vault_approval_header_params", "warning", text, action))
+    return findings
 
 
 # What each kind is called in a finding's text, one and more than one.

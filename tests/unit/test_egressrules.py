@@ -1,4 +1,4 @@
-"""The egress filter's decisions (M3 design F.2)."""
+"""The egress filter's decisions (M3 design F.2), held registrations included (M8 design C.2)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import pytest
 from mcp import types
 
 from tests.sdk import test_client_contract as contract
-from zoeymcp.common import canonical
+from zoeymcp.common import canonical, envelope
+from zoeymcp.common.envelope import MARKER_HEADER, Marker
 from zoeymcp.gateway import egressrules
 from zoeymcp.gateway.egressrules import (
     CallRegistry,
@@ -18,6 +19,7 @@ from zoeymcp.gateway.egressrules import (
     Verdict,
     check,
     check_headers,
+    marker_header,
 )
 
 TARGET = Target(scheme="http", host="vault.invalid", port=None, path="/notes/mcp")
@@ -570,3 +572,118 @@ def test_withdraw() -> None:
     assert len(registry) == 0
     assert not registry.consume("a", "d1")
     assert not registry._pending  # nothing left behind, even for refused lookups
+
+
+# --- held calls (M8 design C.2, Z27; FM-24) --------------------------------------------------
+
+MARKER = Marker("0123456789abcdef", "agent1", "pending", "a1b2c3d4e5f6", None)
+OTHER = Marker("fedcba9876543210", "agent2", "pending", "a1b2c3d4e5f6", None)
+ARGS = {"item": "kettle", "qty": 2}
+
+
+def held(arguments: dict[str, Any] = ARGS, marker: Marker = MARKER) -> CallRegistry:
+    registry = CallRegistry()
+    assert registry.register("order", canonical.digest(arguments), marker)
+    return registry
+
+
+def test_marker_only_after_registration() -> None:
+    """FM-24: a marker the SDK side built never passes the filter; a held registration's request
+    passes as any registered call, and only its verdict carries the marker, for the transport to
+    add after the filter. A marked call nobody registered is refused, and a plain registration
+    gives no marker."""
+    sdk_built = [*BASE_HEADERS, (MARKER_HEADER, marker_header(MARKER))]
+    registry = held()
+    assert verdict(request(call("order", ARGS), headers=sdk_built), registry) == Verdict(
+        False, f"header {MARKER_HEADER} not allowed"
+    )
+    assert len(registry) == 1  # the registration is still there, unconsumed
+    assert verdict(request(call("order", ARGS)), registry) == Verdict(
+        True, kind="request tools/call", held=MARKER
+    )
+    assert verdict(request(call("order", ARGS)), registry) == Verdict(
+        False, "tools/call not registered by the pipeline", "request tools/call"
+    )
+    plain = registered("order", ARGS)
+    assert verdict(request(call("order", ARGS)), plain) == Verdict(True, kind="request tools/call")
+
+
+def test_one_identical_held_call_per_connection() -> None:
+    """C.2: a second held registration of the same (tool, digest) is refused while the first is
+    registered and while it is in flight; once released, the pair is free again. Other
+    arguments and another tool are unaffected."""
+    digest = canonical.digest(ARGS)
+    registry = held()
+    assert not registry.register("order", digest, OTHER)
+    assert registry.register("order", canonical.digest({"item": "cup"}), OTHER)
+    assert registry.register("other", digest, OTHER)
+    assert len(registry) == 3
+    assert not registry.flying(MARKER)
+    assert registry.claim("order", digest) == Verdict(True, held=MARKER)
+    assert registry.flying(MARKER)
+    assert not registry.register("order", digest, OTHER)  # in flight
+    registry.release("order", digest, OTHER)  # another call's marker frees nothing
+    assert not registry.register("order", digest, OTHER)
+    registry.release("order", digest, MARKER)
+    assert not registry.flying(MARKER)
+    assert registry.register("order", digest, OTHER)
+    assert registry.claim("order", digest) == Verdict(True, held=OTHER)
+    assert registry.claim("order", digest) is None
+
+
+def test_a_held_and_a_plain_registration_of_one_call_exclude_each_other() -> None:
+    """Z27: a plain registration of a (tool, digest) is refused while a held one is registered
+    or in flight on the connection, and a held one while a plain one is registered, so no other
+    request can take the marker (a tool held in the new view and allowed in the old one, called
+    twice with the same arguments)."""
+    digest = canonical.digest(ARGS)
+    registry = held()
+    assert not registry.register("order", digest)  # held, not sent yet
+    assert registry.claim("order", digest) == Verdict(True, held=MARKER)
+    assert not registry.register("order", digest)  # held, in flight
+    registry.release("order", digest, MARKER)
+    assert registry.register("order", digest)
+    assert not registry.register("order", digest, OTHER)  # a plain one is registered
+    assert registry.register("order", digest)  # plain ones are counted as before
+    assert len(registry) == 2
+    assert registry.claim("order", digest) == Verdict(True)
+    assert registry.claim("order", digest) == Verdict(True)
+    assert registry.register("order", digest, OTHER)
+    assert registry.claim("order", digest) == Verdict(True, held=OTHER)
+
+
+def test_a_held_call_never_sent_is_released() -> None:
+    digest = canonical.digest(ARGS)
+    registry = held()
+    registry.release("order", digest, MARKER)
+    assert len(registry) == 0
+    assert registry.claim("order", digest) is None
+    assert registry.register("order", digest, MARKER)
+
+
+def test_a_held_call_refused_before_consuming_keeps_its_registration() -> None:
+    registry = held()
+    body = call("order", ARGS, _meta={"traceparent": "00-x"})
+    assert verdict(request(body), registry) == Verdict(
+        False, "_meta key not allowed", "request tools/call"
+    )
+    assert verdict(request(call("order", ARGS)), registry).held == MARKER
+
+
+BLOCKING = Marker("00000000000000ff", "a-b_c", "block", "000000000000", None)
+TOOLKIT = Marker("0123456789abcdef", "mailer", "block", "abcdefabcdef", "send.v2")
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param(MARKER, id="pending"),
+        pytest.param(BLOCKING, id="block"),
+        pytest.param(TOOLKIT, id="tool"),
+    ],
+)
+def test_the_marker_header_reads_back(marker: Marker) -> None:
+    value = marker_header(marker)
+    assert envelope.marker([(MARKER_HEADER, value)]) == marker
+    assert value.startswith(f"v1; ref={marker.ref}; client={marker.client}; ")
+    assert ("; tool=" in value) == (marker.tool is not None)

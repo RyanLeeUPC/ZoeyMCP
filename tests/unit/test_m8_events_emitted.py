@@ -45,6 +45,12 @@ EVENTS = {
     "approver_surface_failed": "vault",
     "approval_forward_failed": "vault",
     "approval_hold_failed": "vault",
+    # Step 10: the gateway's Elsewhere (C.2's last row), and the builder's failure event for a
+    # withdraw the vault couldn't be told of (its error type only), and the vault's answer to a
+    # held call that ended before it came (its ref and status only).
+    "elsewhere_unheld": "gateway",
+    "approval_withdraw_failed": "gateway",
+    "held_answer_dropped": "gateway",
 }
 
 

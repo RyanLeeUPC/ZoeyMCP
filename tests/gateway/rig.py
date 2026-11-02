@@ -103,10 +103,14 @@ def raw_policy(
     approvals: dict[str, dict[str, Any]] | None = None,
     gateway_approvals: dict[str, Any] | None = None,
     declined: dict[str, str] | None = None,
+    vault_approval: list[str] | None = None,
+    approvers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The rig's policy. ``servers`` adds gateway servers; ``assigned`` overrides a client's
     server list (each client gets ``[SERVER]`` otherwise); ``declined`` is the server's
-    declined block (M6 design J.5), left out when not given."""
+    declined block (M6 design J.5), left out when not given; ``vault_approval`` the server's
+    tools the vault holds and ``approvers`` the out-of-band approvers block (M8 design A.1),
+    each left out when not given."""
     approve = approve or []
     gateway: dict[str, Any] = {
         "limits": limits or {},
@@ -132,6 +136,7 @@ def raw_policy(
                     "include": include,
                     "allow": [name for name in include if name not in approve],
                     "approve": approve,
+                    **({"vault_approval": vault_approval} if vault_approval else {}),
                 },
                 "review": review,
                 **({"declined": declined} if declined is not None else {}),
@@ -146,6 +151,7 @@ def raw_policy(
     if origins is not None:
         gateway["origins"] = origins
     return {
+        **({"approvers": approvers} if approvers is not None else {}),
         "version": 1,
         "mode": "declarative",
         "gateway_key_generation": 1,
@@ -261,10 +267,12 @@ def deployment_with(
     *,
     reports: ReportStore | None = None,
     wrap: Callable[[ASGIApp], ASGIApp] | None = None,
+    vault: dict[str, Any] | None = None,
 ) -> Iterator[Deployed]:
     """:func:`deployment` with ``raw_policy`` ``options``, where ``reports`` is the vault's copy
-    of the gateway's ledger (the report path answers 503 without one) and ``wrap`` wraps the
-    vault's app, for a test that changes how it answers."""
+    of the gateway's ledger (the report path answers 503 without one), ``wrap`` wraps the
+    vault's app, for a test that changes how it answers, and ``vault`` adds arguments to the
+    vault's app (M8: its chain, approver hub and hold clock)."""
     log = io.StringIO()
     logs.set_stream(log)
     try:
@@ -274,7 +282,13 @@ def deployment_with(
             store.load()
             store.put("notes-key", fake.secret, derive_binding(policy, "notes-key"))
             app = VaultApp(
-                policy, store, KEYS, client=httpx.AsyncClient(), environ={}, reports=reports
+                policy,
+                store,
+                KEYS,
+                client=httpx.AsyncClient(),
+                environ={},
+                reports=reports,
+                **(vault or {}),
             )
             setup = SetupCodes(tmp_path / "vault", KEYS.portal_key)
             admin = VaultAdmin(

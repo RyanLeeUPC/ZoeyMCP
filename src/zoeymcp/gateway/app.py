@@ -390,10 +390,19 @@ class GatewayApp:
             fresh=self.policy.fresh,
             stopping=lambda: self.stop_requested,
             clock=clock,
+            refetch=self._refetch_view,
         )
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
+
+    async def _refetch_view(self) -> Snapshot | None:
+        """The view fetched now, not by the long poll: a held call the vault says it holds no
+        longer is decided once more on it (M8 design C.3). A new view is applied under the
+        policy client's lock, shielded, so the long poll's apply never overlaps it and this
+        request's cancel (a revocation it applies, say) never cuts it short."""
+        await self.policy.fetch_once(wait=0)
+        return self.policy.fresh()
 
     def _limits(self) -> GatewayLimits:
         snapshot = self.policy.snapshot

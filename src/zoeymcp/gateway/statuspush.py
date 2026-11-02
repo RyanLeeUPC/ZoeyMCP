@@ -19,8 +19,11 @@ blocked it, counts, ``offered`` and the attention decision's lists (``drift``, `
 server that enables prompts or resources also has ``kinds``: per kind it enables, the attention
 decision for that kind in its plain form (``drifted``, ``marked``, ``new``, ``changed_declined``,
 ``missing``), names only and no pins; a server that enables neither, and every toolkit, has no
-``kinds``, so its entry is as before (M6 design K.1, D-216). A kind's names can be URIs of up to
-2,048 characters, where a tool's are 128, so ``kinds`` alone never takes a report over
+``kinds``, so its entry is as before (M6 design K.1, D-216). A server with ``vault_approval`` tools
+has ``held`` only while it has something to say (M8 design K.1): ``elsewhere_unheld``, a count,
+and ``header_params``, held tool names (capped as the other lists), each only when set. A kind's
+names can be URIs of up to 2,048 characters, where a tool's are 128, so ``kinds`` alone never
+takes a report over
 :data:`MAX_BYTES`: its lists are cut from the end until it fits (:func:`_fitted`), first the names
 health and Home only count (``new``, ``changed_declined``), then those they name, each list
 keeping one name while any other can go, so every finding still fires. Never a definition, a
@@ -61,6 +64,7 @@ STEP: Final = 1.0  # how often the content is looked at
 LOG_EVERY: Final = 60.0  # status_push_failed at most this often
 MAX_BYTES: Final = 256 * 1024  # the vault's STATUS_MAX_BYTES
 _TOOL: Final = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+HELD_COUNT_MAX: Final = 2**31 - 1  # the vault's COUNT_MAX
 
 Status = Callable[[Any], Mapping[str, Any]]
 
@@ -146,6 +150,16 @@ def _server(entry: Mapping[str, Any], max_tools: int) -> dict[str, Any]:
             kind: {member: capped(names) for member, names in loaded(lists).as_dict().items()}
             for kind, lists in kinds.items()
         }
+    held: Mapping[str, Any] = entry.get("held") or {}
+    if held:  # likewise, only while a held tool has something to say (M8 design K.1)
+        said: dict[str, Any] = {}
+        if held.get("elsewhere_unheld"):
+            said["elsewhere_unheld"] = min(held["elsewhere_unheld"], HELD_COUNT_MAX)
+        named = capped(name for name in held.get("header_params", ()) if _TOOL.fullmatch(name))
+        if named:
+            said["header_params"] = named
+        if said:
+            sent["held"] = said
     return sent
 
 

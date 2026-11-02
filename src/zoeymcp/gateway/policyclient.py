@@ -6,7 +6,11 @@ or 304 is contact. With no contact for ``limits.policy_max_stale``, the view is 
 agent request gets 503 until contact resumes: revocation can't lapse while the vault is away.
 
 A view the gateway can't parse (from a newer vault, say) is refused and the last good one stays.
-Failures back off 1, 2, 4 ... 30 s, jittered. SIGHUP asks for a fetch at once.
+Failures back off 1, 2, 4 ... 30 s, jittered. SIGHUP asks for a fetch at once. A fetch made on
+demand beside the long poll (a held call the vault holds no longer, M8 design C.3) applies its
+view under the same lock, one apply at a time, and an apply once begun runs to its end even if
+the task that fetched it is cancelled: the snapshot it set would otherwise answer the next long
+poll 304 with the view half applied.
 
 The vault states its mode beside every view answer, the 200 and the 304, in the header
 ``x-zoeymcp-policy-mode`` (M6 design K.3, G.9). The client keeps the last one it read with
@@ -156,6 +160,7 @@ class PolicyClient:
         # Made in run(): an anyio event needs the loop it will be used on.
         self._wake: anyio.Event | None = None
         self._stale_reported = False
+        self._applying = anyio.Lock()  # one view applied at a time (C.3)
 
     # --- freshness ------------------------------------------------------------------------
 
@@ -208,19 +213,22 @@ class PolicyClient:
         except ViewError as exc:
             logs.event("policy_refused", reason=str(exc))
             return False
-        previous = self.snapshot
-        snapshot = Snapshot(view, self._clock())
-        self.snapshot = snapshot
-        self._read_mode(response)
-        self._contact()
-        if previous is None or previous.view.digest != view.digest:
-            logs.event(
-                "policy_applied",
-                digest=view.digest,
-                clients=len(view.gateway.clients),
-                servers=len(view.gateway.servers),
-            )
-            await self._apply(snapshot, previous)
+        async with self._applying:
+            # Shielded: the snapshot and its apply go together, whoever's task fetched it.
+            with anyio.CancelScope(shield=True):
+                previous = self.snapshot
+                snapshot = Snapshot(view, self._clock())
+                self.snapshot = snapshot
+                self._read_mode(response)
+                self._contact()
+                if previous is None or previous.view.digest != view.digest:
+                    logs.event(
+                        "policy_applied",
+                        digest=view.digest,
+                        clients=len(view.gateway.clients),
+                        servers=len(view.gateway.servers),
+                    )
+                    await self._apply(snapshot, previous)
         return True
 
     def _read_mode(self, response: httpx2.Response) -> None:

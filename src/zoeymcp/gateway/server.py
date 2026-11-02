@@ -50,6 +50,7 @@ from .ledger import Ledger
 from .marks import DriftMarks, MarksError
 from .pins import Entries, enabled_kinds, entries
 from .policyclient import Witness
+from .schemas import mcp_headers
 from .toolkits import Loaded, Toolkits
 from .upstream import Connection, UpstreamPool
 from .vaultlink import (
@@ -189,13 +190,19 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
     K.1, Y29), names only; a server that enables neither has no ``kinds``. With ``pins``, each
     server's ``unreviewed_pins`` is the pin each of its unreviewed tools is listed at, for the
     status report (:func:`pushed_status`). ``policy_mode`` is the mode the vault last stated
-    beside the view (M6 design K.3)."""
+    beside the view (M6 design K.3). A server with ``vault_approval`` tools has ``held`` while it
+    has something to say (M8 design K.1): ``elsewhere_unheld``, how many held calls came back
+    without the vault's approval, and ``header_params``, its held tools whose pinned schema
+    mirrors parameters into headers, so their calls are refused (Q27)."""
     snapshot = app.policy.snapshot
     servers: dict[str, Any] = {}
     if snapshot is not None:
         for name, server in snapshot.view.gateway.servers.items():
             if isinstance(server, ViewToolkitServer):
                 servers[name] = _toolkit_status(app, name, server, pins=pins)
+                held = _held_status(app, name, server.tools.vault_approval, [])
+                if held:
+                    servers[name]["held"] = held
                 continue
             connections = [c for c in app.pool.connections() if c.server == name]
             phases = sorted({c.state.phase.value for c in connections})
@@ -242,6 +249,9 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
             kinds = _kinds_status(app, name, server, connections)
             if kinds:
                 servers[name]["kinds"] = kinds
+            held = _held_status(app, name, server.tools.vault_approval, connections)
+            if held:
+                servers[name]["held"] = held
             if pins:
                 servers[name]["unreviewed_pins"] = _pins_of(decided, listed)
     return {
@@ -251,6 +261,33 @@ def status(app: GatewayApp, *, pins: bool = False) -> dict[str, Any]:
         "servers": servers,
         "policy_mode": app.policy.mode,
     }
+
+
+def _held_status(
+    app: GatewayApp, name: str, held: list[str], connections: list[Connection]
+) -> dict[str, Any]:
+    """A server's held calls the vault didn't hold, and its held tools whose pinned schema
+    declares ``x-mcp-header`` (M8 design K.1); empty when there is neither, and for a server
+    that holds nothing."""
+    if not held:
+        return {}
+    unheld = app.approvals.unheld.get(name, 0)
+    mirrored: set[str] = set()
+    for connection in connections:
+        evaluation = connection.state.evaluation
+        if evaluation is None:
+            continue
+        for tool in held:
+            exposed = evaluation.exposed.get(tool)
+            schema = exposed.definition.get("inputSchema") if exposed is not None else None
+            if isinstance(schema, dict) and mcp_headers(schema):
+                mirrored.add(tool)
+    found: dict[str, Any] = {}
+    if unheld:
+        found["elsewhere_unheld"] = unheld
+    if mirrored:
+        found["header_params"] = sorted(mirrored)
+    return found
 
 
 @dataclass(frozen=True)

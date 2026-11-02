@@ -11,6 +11,13 @@ pipeline validated: its ``(name, digest(arguments))`` must match a registration,
 (G9). Nothing that would open a back channel goes out: no declared client capability, no
 ``requestState`` or ``inputResponses`` retry, no trace context.
 
+A call the vault holds (M8 design C.2, Z27) is registered with its marker: the filter checks it as
+any ``tools/call``, and only a request that consumed a held registration gets the marker, which
+the transport adds after the filter (:attr:`Verdict.held`), so ``HEADERS`` still refuses any
+``x-zoeymcp-*`` header the SDK built. One identical held call is in flight per connection, so a
+marker always maps to one outgoing request: a held and a plain registration of one call are
+never pending together either, so no other request can take the marker.
+
 A server that enables prompts, resources or completions is also asked for them (M6 design L.4,
 L.6): its connection's target names what it enables, and only those kinds' requests go out on
 it, each with only its own params (no ``requestState`` or ``inputResponses`` retry).
@@ -27,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..common import canonical
+from ..common.envelope import Marker
 from ..common.mcpwire import HEADERS as HEADERS
 from ..common.mcpwire import KIND_REQUESTS as KIND_REQUESTS
 from ..common.mcpwire import META_KEYS as META_KEYS
@@ -83,16 +91,55 @@ class Verdict:
     reason: str = ""
     # For a POST: "request <method>", "notification <method>" or "response", for the log.
     kind: str = ""
+    # The marker of the held registration the request consumed, which the transport adds.
+    held: Marker | None = None
 
 
 @dataclass
 class CallRegistry:
-    """The ``(tool, digest(arguments))`` pairs the pipeline validated and may send, once each."""
+    """The ``(tool, digest(arguments))`` pairs the pipeline validated and may send, once each;
+    a held one with its marker, at most one per pair from :meth:`register` to :meth:`release`,
+    and never beside a plain one of the same pair."""
 
     _pending: Counter[tuple[str, str]] = field(default_factory=Counter)
+    _held: dict[tuple[str, str], Marker] = field(default_factory=dict)  # not sent yet
+    _flying: dict[tuple[str, str], Marker] = field(default_factory=dict)  # sent, not ended
 
-    def register(self, tool: str, digest: str) -> None:
-        self._pending[(tool, digest)] += 1
+    def register(self, tool: str, digest: str, held: Marker | None = None) -> bool:
+        """Register a call; False, and nothing registered, while an identical held call is
+        registered or in flight on this connection (C.2), or, for a held one, while an
+        identical plain one is registered: a request of either could take the other's place."""
+        key = (tool, digest)
+        if key in self._held or key in self._flying:
+            return False
+        if held is None:
+            self._pending[key] += 1
+            return True
+        if self._pending[key] > 0:
+            return False
+        self._held[key] = held
+        return True
+
+    def flying(self, marker: Marker) -> bool:
+        """Whether a held call with ``marker`` is in flight: sent, and its call not ended."""
+        return marker in self._flying.values()
+
+    def release(self, tool: str, digest: str, held: Marker) -> None:
+        """A held call ended, sent or not: its registration goes, if it is still its own."""
+        key = (tool, digest)
+        for table in (self._held, self._flying):
+            if table.get(key) == held:
+                del table[key]
+
+    def claim(self, tool: str, digest: str) -> Verdict | None:
+        """Use a registration up: a held one, whose marker the verdict carries, or a plain one
+        (never both of one pair); None when there is none."""
+        key = (tool, digest)
+        marker = self._held.pop(key, None)
+        if marker is not None:
+            self._flying[key] = marker
+            return Verdict(True, held=marker)
+        return Verdict(True) if self.consume(tool, digest) else None
 
     def withdraw(self, tool: str, digest: str) -> None:
         """A registered call that never went out (cancelled, or refused before sending)."""
@@ -109,7 +156,16 @@ class CallRegistry:
         return True
 
     def __len__(self) -> int:
-        return sum(self._pending.values())
+        return sum(self._pending.values()) + len(self._held)
+
+
+def marker_header(marker: Marker) -> str:
+    """The marker as ``x-zoeymcp-held`` carries it (M8 design B.2 E14), which
+    :func:`zoeymcp.common.envelope.marker` reads back to ``marker``."""
+    value = (
+        f"v1; ref={marker.ref}; client={marker.client}; wait={marker.wait}; epoch={marker.epoch}"
+    )
+    return value if marker.tool is None else f"{value}; tool={marker.tool}"
 
 
 def _refuse(reason: str, kind: str = "") -> Verdict:
@@ -177,8 +233,10 @@ def _check_request(
         arguments = params.get("arguments", {})
         if not isinstance(name, str) or not isinstance(arguments, dict):
             return _refuse("tools/call name or arguments malformed", kind)
-        if not registry.consume(name, canonical.digest(arguments)):
+        claimed = registry.claim(name, canonical.digest(arguments))
+        if claimed is None:
             return _refuse("tools/call not registered by the pipeline", kind)
+        return Verdict(True, kind=kind, held=claimed.held)
     return Verdict(True, kind=kind)
 
 

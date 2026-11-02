@@ -16,7 +16,7 @@ from mcp.types import CallToolResult
 
 from ..common.policy.view import ViewRemoteServer, ViewToolkitServer
 from .pins import Evaluation, ExposedTool
-from .upstream import NotAdmitted, Progress, UpstreamPool
+from .upstream import Held, NotAdmitted, Progress, UpstreamPool
 
 # The server kinds a source serves.
 ServedServer = ViewRemoteServer | ViewToolkitServer
@@ -56,9 +56,12 @@ class ToolSource(Protocol):
         progress: Progress | None = None,
         grant: Grant | None = None,
         ref: str | None = None,
+        held: Held | None = None,
     ) -> CallToolResult:
         """Run the call, refusing (:class:`NotAdmitted`) if ``tool`` is no longer admitted under
-        ``pin``. ``ref`` is the call's log reference (a toolkit's ``ctx.ref``)."""
+        ``pin``. ``ref`` is the call's log reference (a toolkit's ``ctx.ref``). A ``held`` call
+        goes to the vault marked, and ``held.answer`` says what the vault answered (M8 design
+        C.2)."""
         ...
 
     def input_schema(self, client: str, server: str, tool: str) -> dict[str, Any] | None:
@@ -99,10 +102,12 @@ class RemoteSource:
         progress: Progress | None = None,
         grant: Grant | None = None,
         ref: str | None = None,
+        held: Held | None = None,
     ) -> CallToolResult:
         assert isinstance(policy, ViewRemoteServer)  # noqa: S101 - this source serves remotes
-        # An approved call is committed (a close waits for it) and never retried (B.6).
-        approved = grant is not None
+        # An approved call is committed (a close waits for it) and never retried (B.6); so is
+        # one the vault holds, which it may approve and forward (M8 design C.2, fold-in 2.5).
+        committed = grant is not None or held is not None
         return await self.pool.call(
             server,
             policy,
@@ -111,8 +116,9 @@ class RemoteSource:
             arguments,
             pin=pin,
             progress=progress,
-            committed=approved,
-            retry_expired=not approved,
+            committed=committed,
+            retry_expired=not committed,
+            held=held,
         )
 
     def input_schema(self, client: str, server: str, tool: str) -> dict[str, Any] | None:

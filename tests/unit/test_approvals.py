@@ -417,6 +417,67 @@ def test_tombstones_expire_and_are_bounded() -> None:
     assert f"h{MAX_TOMBSTONES + 4}" in table._tombstones
 
 
+# --- out-of-band records (M8 design D.2) ---------------------------------------------------------
+
+
+def held_begin(table: Table, key: Key = KEY, *, ref: str = "r1", now: float = 0.0) -> Pending:
+    found = table.begin(
+        key,
+        settings=SETTINGS,
+        now=now,
+        ref=ref,
+        era="modern",
+        args={"subject": "Hi"},
+        args_digest=DIGEST,
+        pin=PIN,
+        text_sha256="t",
+        how="elsewhere",
+    )
+    assert isinstance(found, Pending)
+    return found
+
+
+def test_a_held_record_is_begun_as_its_kind() -> None:
+    table = Table()
+    record = held_begin(table)
+    assert (record.how, record.pending_until) == ("elsewhere", None)
+    assert record.hard_deadline == 300 + 60 + 30  # deadline + call_timeout + 30 (D.2)
+    assert begin(table, Key("agent2", "mail", "send_note"), ref="r2").how == "elicitation"
+
+
+def test_pend_keeps_the_lock_and_the_pending_cap() -> None:
+    table = Table()
+    held_begin(table)
+    record = table.pend("r1", 1_800_000_000.0)
+    assert (record.pending_until, record.decision) == (1_800_000_000.0, None)
+    assert table.get("r1") == record
+    # The lock stays held, and the record still counts against the client's pending cap.
+    assert begin(table, Key("agent1", "mail", "other"), ref="r2") == PendingCap("r1")
+
+
+def test_lookup_identical_finds_only_a_pending_record_for_the_same_arguments() -> None:
+    table = Table()
+    held_begin(table)
+    assert table.lookup_identical(KEY, DIGEST) is None  # not pending yet: still being asked
+    pended = table.pend("r1", 100.0)
+    assert table.lookup_identical(KEY, DIGEST) == pended
+    assert table.lookup_identical(KEY, "sha256:" + "c" * 64) is None  # other arguments
+    assert table.lookup_identical(Key("agent2", "mail", "send_note"), DIGEST) is None
+    table.decide("r1", "decline", 1.0)
+    assert table.lookup_identical(KEY, DIGEST) is None  # decided: no longer waiting
+    assert table.lookup_identical(Key("agent9", "x", "y"), DIGEST) is None
+
+
+def test_busy_says_when_the_holder_waits_out_of_band() -> None:
+    table = Table()
+    held_begin(table)
+    assert begin(table, ref="r2", now=10.0) == Busy("r1", 380)
+    table.pend("r1", 100.0)
+    assert begin(table, ref="r2", now=10.0) == Busy("r1", 380, pending=True)
+    table.decide("r1", "accept", 11.0)
+    assert begin(table, ref="r2", now=12.0) == Busy("r1", 378)  # decided: running, not waiting
+
+
 # --- the gate and the answer ---------------------------------------------------------------------
 
 

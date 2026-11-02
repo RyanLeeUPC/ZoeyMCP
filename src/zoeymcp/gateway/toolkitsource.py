@@ -3,7 +3,8 @@
 The listing is the evaluation made when the toolkit loaded: it changes only with the image or
 the policy, so there is no watcher. A call runs the tool's body under the server's
 ``call_timeout``, with slots bound to the call's phase (:mod:`.toolkitvault`); an approved call's
-body gets the accepted plan and may send its writes once each. What the body raises becomes one of
+body gets the accepted plan and may send its writes once each, and so does a call the vault holds,
+whose one write leaves marked (M8 design B.7, C.2). What the body raises becomes one of
 G.7's fixed texts: an exception's message can hold argument values, so it is never shown or
 logged.
 """
@@ -29,7 +30,7 @@ from .pins import Evaluation, ExposedTool
 from .toolkits import Loaded, Toolkits
 from .toolkitvault import CallState
 from .toolsource import Grant, ServedServer
-from .upstream import NotAdmitted, Progress
+from .upstream import Held, NotAdmitted, Progress
 
 PREPARE_TIMEOUT = 10.0
 
@@ -118,6 +119,7 @@ class ToolkitSource:
         progress: Progress | None = None,
         grant: Grant | None = None,
         ref: str | None = None,
+        held: Held | None = None,
     ) -> CallToolResult:
         loaded = self._loaded(server)
         exposed = loaded.evaluation.exposed.get(tool)
@@ -127,7 +129,7 @@ class ToolkitSource:
         call_ref = grant.ref if grant is not None else (ref or "-")
         plan = grant.plan if grant is not None and isinstance(grant.plan, Plan) else None
         phase: Phase = "approve" if grant is not None else "allow"
-        state = CallState(tool, call_ref, phase, SendLedger(plan))
+        state = CallState(tool, call_ref, phase, SendLedger(plan), held=held)
 
         async def report(done: int, total: int) -> None:
             if progress is not None:

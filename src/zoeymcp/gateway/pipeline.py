@@ -9,7 +9,11 @@
    keyword, never a value.
 5. **Decide** from policy, never annotations (:func:`.routing.decide`): ``allow`` continues;
    ``approve`` goes to the approval decision point (:mod:`.approve`), which asks the human and
-   runs the accepted call itself; anything unclassified is refused.
+   runs the accepted call itself; a ``vault_approval`` tool goes to the vault marked
+   (:mod:`.elsewhere`), which holds it and asks the operator's approvers (M8 design C.2); a
+   call nobody can approve, and anything unclassified, is refused. When the vault says it holds
+   the tool no longer (``view_stale``), the view is fetched at once and the call decided once more
+   (C.3): asked here if the tool left ``vault_approval``, else refused.
 6. **Call** with the validated object, registered with the egress filter, under the pin it was
    validated under. A policy change that takes the client's access to the server away stops the
    call (M3 design D.3), which cancels it upstream too.
@@ -37,7 +41,7 @@ from ..common import canonical
 from ..common.approvaltext import Plan
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway
-from . import logs, routing, schemas
+from . import elsewhere, logs, routing, schemas
 from .approve import Approvals, Asking, AskSession
 from .approvers import NO_APPROVALS as NO_APPROVALS
 from .connstate import Era
@@ -55,6 +59,16 @@ TOOLKIT_UNAVAILABLE = "toolkit unavailable"
 REVOKED = (
     "refused: this client's access to the server changed while the call ran; "
     "it may or may not have run"
+)
+# M8 design C.1's texts for a vault_approval tool (G-9), so the agent and the operator can tell
+# which setting is missing.
+NO_OUT_OF_BAND = (
+    "refused: this tool is approved out of band, and this client isn't allowed to raise "
+    "out-of-band prompts"
+)
+NO_APPROVER = "refused: no out-of-band approver is configured for this call"
+HEADER_PARAMS = (
+    "refused: this tool sends parameters as headers, which a call the vault approves can't carry"
 )
 
 
@@ -208,18 +222,18 @@ async def call_tool(
             log("refused", "arguments")
             return refused(f"arguments refused: at {problem}")
     # 5. Decide, from policy only
-    route = routing.decide(
-        tool=name,
-        tools=call.policy.tools,
-        client=approval.gateway.clients.get(call.client) if approval is not None else None,
-        era=call.era,
-        request_state=approval is not None and approval.request_state is not None,
-        inputs=approval is not None and bool(approval.input_responses),
-    )
+    route = _route(source, call, name, exposed, approval)
+    if isinstance(route, routing.Elsewhere) and approval is not None:
+        held = await _elsewhere(source, call, name, shaped, exposed, ref, route, approval, budget)
+        if not isinstance(held, elsewhere.Stale):
+            log("tool_error" if held.is_error else "ok", "elsewhere")
+            return held
+        return await _restale(source, call, name, shaped, exposed, ref, progress, approval, log)
     if isinstance(route, routing.AskElicitation) and approval is not None:
         return await _approve(source, call, name, shaped, exposed, ref, progress, approval, log)
     if not isinstance(route, routing.Allow):
         # The route asks only with an approval context: it names the client, or carries a handle.
+        # A relay (AskOutOfBand) has no transport until M8 step 12b: nobody answers for it yet.
         reason = route.reason if isinstance(route, routing.Refuse) else "no_approvals"
         return _refused_route(reason, call, name, ref, log)
     # 6. Call
@@ -254,6 +268,119 @@ async def call_tool(
     return result
 
 
+def _route(
+    source: ToolSource, call: Call, name: str, exposed: Any, approval: Approval | None
+) -> routing.Route:
+    """Step 5's decision, from the view the request started with (or the one :func:`_restale`
+    fetched): the tool lists, the client, the era, MRTR input, whether an out-of-band approver
+    is configured and whether the pinned schema mirrors parameters into headers (Q27)."""
+    gateway = approval.gateway if approval is not None else None
+    schema = exposed.definition.get("inputSchema")
+    held = name in call.policy.tools.vault_approval  # only a held tool's route reads the schema
+    return routing.decide(
+        tool=name,
+        tools=call.policy.tools,
+        client=gateway.clients.get(call.client) if gateway is not None else None,
+        era=call.era,
+        request_state=approval is not None and approval.request_state is not None,
+        inputs=approval is not None and bool(approval.input_responses),
+        out_of_band_configured=gateway is not None and gateway.approvals.out_of_band is not None,
+        header_params=held and isinstance(schema, dict) and bool(schemas.mcp_headers(schema)),
+        toolkit=isinstance(source, ToolkitSource),
+    )
+
+
+async def _elsewhere(
+    source: ToolSource,
+    call: Call,
+    name: str,
+    shaped: dict[str, Any],
+    exposed: Any,
+    ref: str,
+    route: routing.Elsewhere,
+    approval: Approval,
+    budget: schemas.Budget,
+) -> CallToolResult | elsewhere.Stale:
+    """Step 5 for a ``vault_approval`` tool (M8 design C.2): forwarded marked, under the pin it
+    was validated under; an approved answer is finished as a direct call's (step 7)."""
+
+    async def forward(held: Any, grant: Grant) -> CallToolResult:
+        return await source.forward(
+            call.client,
+            call.server,
+            call.policy,
+            name,
+            grant.args,
+            pin=exposed.pin,
+            grant=grant,
+            ref=ref,
+            held=held,
+        )
+
+    prepare = None
+    if isinstance(source, ToolkitSource):
+        toolkits = source
+
+        async def prepare() -> Plan | CallToolResult | None:
+            return await toolkits.prepare(call.client, call.server, name, shaped, ref)
+
+    return await elsewhere.run(
+        approval.approvals,
+        elsewhere.HeldCall(
+            ref=ref,
+            client=call.client,
+            server=call.server,
+            tool=name,
+            era=call.era,
+            policy=call.policy,
+            gateway=approval.gateway,
+            args=shaped,
+            pin=exposed.pin,
+            wait=route.wait,
+            forward=forward,
+            finish=lambda raw: _sanitized(raw, call, name, exposed, ref, budget),
+            prepare=prepare,
+        ),
+    )
+
+
+async def _restale(
+    source: ToolSource,
+    call: Call,
+    name: str,
+    shaped: dict[str, Any],
+    exposed: Any,
+    ref: str,
+    progress: Progress | None,
+    approval: Approval,
+    log: Any,
+) -> CallToolResult | mcp_types.InputRequiredResult:
+    """C.3: the vault holds the tool no longer. The view is fetched at once, and the call decided
+    once more on it: asked here when the tool left ``vault_approval`` for ``approve``, else
+    refused ``view_stale``. It never loops."""
+    refetch = approval.approvals.refetch
+    snapshot = await refetch() if refetch is not None else approval.approvals.fresh()
+    gateway = snapshot.view.gateway if snapshot is not None else None
+    policy = gateway.servers.get(call.server) if gateway is not None else None
+    if gateway is not None and policy is not None and policy.kind == call.policy.kind:
+        fresh_call = Call(call.client, call.server, policy, gateway.limits, call.era)
+        fresh = Approval(
+            approvals=approval.approvals,
+            session=approval.session,
+            gateway=gateway,
+            session_sha256=approval.session_sha256,
+            disconnected=approval.disconnected,
+        )
+        route = _route(source, fresh_call, name, exposed, fresh)
+        if isinstance(route, routing.AskElicitation):
+            return await _approve(
+                source, fresh_call, name, shaped, exposed, ref, progress, fresh, log
+            )
+    result = await elsewhere.stale_refused(approval.approvals, ref, call.client, call.server, name)
+    log("refused", "view_stale")
+    return result
+
+
 def _refused_route(
     reason: routing.RefuseReason, call: Call, name: str, ref: str, log: Any
 ) -> CallToolResult:
@@ -265,19 +392,28 @@ def _refused_route(
         # A handle is good only for the approve tool it was issued for (D.6).
         log("refused", "unexpected_state")
         return refused(STATE_REFUSED)
-    if reason == "no_approvals":
+    if reason in ("no_approvals", "no_out_of_band", "no_approver", "header_params"):
+        why = "unattended" if reason == "no_approvals" else reason
         logs.event(
             "approval_refused",
             client=call.client,
             server=call.server,
             tool=name,
             ref=ref,
-            reason="unattended",
+            reason=why,
         )
-        log("refused", "unattended")
-        return refused(f"{NO_APPROVALS} (ref {ref})")
+        log("refused", why)
+        return refused(f"{_ROUTE_TEXTS[reason]} (ref {ref})")
     log("refused", "unclassified")
     return refused(UNCLASSIFIED)
+
+
+_ROUTE_TEXTS = {
+    "no_approvals": NO_APPROVALS,
+    "no_out_of_band": NO_OUT_OF_BAND,
+    "no_approver": NO_APPROVER,
+    "header_params": HEADER_PARAMS,
+}
 
 
 def _sanitized(

@@ -2449,6 +2449,56 @@ def test_a_blocked_server(on_drift: str, fields: dict[str, Any], blocked: bool) 
     assert found == ([expected] if blocked else [])
 
 
+def held_policy(held: list[str]) -> Policy:
+    """:func:`gateway_policy` with notes's ``place_order`` and ``cancel_order`` approved and
+    ``held`` of them held by the vault (M8 design A.1)."""
+    raw = gateway_policy().model_dump(mode="json", exclude_defaults=True, by_alias=True)
+    raw["gateway"]["servers"]["notes"]["tools"] = {
+        "include": ["place_order", "cancel_order"],
+        "approve": ["place_order", "cancel_order"],
+        "vault_approval": held,
+    }
+    return Policy.model_validate(raw)
+
+
+def test_held_calls_the_vault_didnt_hold() -> None:
+    """K.1: ``elsewhere_unheld`` (error) counts the held calls the gateway says came back
+    without the vault's approval; ``vault_approval_header_params`` (warning) names the held tools
+    whose schema mirrors parameters into headers, only those the policy holds."""
+    entry = server_status(
+        elsewhere_unheld=2, header_params=("cancel_order", "place_order", "upstream_named")
+    )
+    section = gateway({"notes": entry}, policy=held_policy(["place_order"]))
+    assert codes(section) == ["elsewhere_unheld", "vault_approval_header_params"]
+    assert section["findings"] == [
+        finding(
+            "elsewhere_unheld",
+            "error",
+            "notes: 2 held call(s) came back without the vault's approval: stop the gateway, "
+            "check that the vault and the gateway run the same release and that the vault's "
+            "policy has the tool, and report it",
+            {"kind": "check_gateway"},
+        ),
+        finding(
+            "vault_approval_header_params",
+            "warning",
+            "notes: place_order: a vault_approval tool's schema mirrors parameters into headers, "
+            "so its calls are refused (Q27): remove it from vault_approval, or ask its server for "
+            "a version without x-mcp-header",
+            {"kind": "fix_policy", "server": "notes"},
+        ),
+    ]
+    assert section["level"] == "error"
+
+
+def test_no_held_findings_without_anything_to_say() -> None:
+    quiet = gateway({"notes": server_status()}, policy=held_policy(["place_order"]))
+    assert codes(quiet) == []
+    # A name the policy doesn't hold is never shown: the gateway's report names it.
+    unheld = server_status(header_params=("cancel_order",))
+    assert codes(gateway({"notes": unheld}, policy=held_policy(["place_order"]))) == []
+
+
 def test_a_listing_it_cant_name() -> None:
     """T-7: counted, not named; an included tool listed invalid is drifted, named once there."""
     entry = server_status(drift=("list_notes",), invalid=("list_notes", "odd"), invalid_unnamed=2)

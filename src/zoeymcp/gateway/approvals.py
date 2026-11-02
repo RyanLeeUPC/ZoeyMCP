@@ -12,6 +12,10 @@ I/O, so :mod:`.approve` serializes calls with one lock and the rules can be test
   timeout or mismatch), and refuses that tool for the client until it ends.
 - **Handles** (modern) are single-use: the table keeps only their SHA-256, and a consumed or
   expired handle leaves a tombstone, so a replay reads "already used" or "no answer in time".
+- **Out-of-band records** (M8 design D.2): a call the vault holds (``elsewhere``) takes the same
+  lock and counts against the same caps. Once the vault says it waits (:meth:`Table.pend`), an
+  identical call is answered that record's ``pending <ref>`` again
+  (:meth:`Table.lookup_identical`), and any other call to the tool is ``busy`` naming it.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ Decision = Literal[
     "changed",
     "shutdown",
 ]
-How = Literal["elicitation", "relay"]
+How = Literal["elicitation", "relay", "elsewhere"]
 # The one list of decisions that start a cooldown (E.1). The others weren't a human's refusal,
 # and the hourly cap still bounds a cycle of ask and cancel.
 COOLDOWN_DECISIONS: Final = frozenset(
@@ -165,9 +169,11 @@ class Pending:
     expires_at: float
     hard_deadline: float
     decision: Decision | None = None
-    # How it is asked (M8 design C.1): on the agent's own session, or relayed to an out-of-band
-    # approver (M8 step 12b). Every record is elicited until relays exist.
+    # How it is asked (M8 design C.1): on the agent's own session, relayed to an out-of-band
+    # approver (M8 step 12b), or by the vault, which holds the call (C.2).
     how: How = "elicitation"
+    # The wall time an out-of-band record waits until, once its holder said it is pending (D.2).
+    pending_until: float | None = None
 
     def __repr__(self) -> str:
         return f"Pending(ref={self.ref}, decision={self.decision})"
@@ -187,10 +193,12 @@ class Tombstone:
 
 @dataclass(frozen=True)
 class Busy:
-    """Another call to this tool is waiting or running."""
+    """Another call to this tool is waiting or running; ``pending``: it waits out of band for an
+    approval, and is collected by its ref (D.2, OPS-3)."""
 
     holder_ref: str
     seconds_left: int
+    pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -293,11 +301,13 @@ class Table:
         code: ConfirmCode | None = None,
         session_sha256: str | None = None,
         handle_sha256: str | None = None,
+        how: How = "elicitation",
     ) -> Pending | Refusal:
         """Take the lock for ``key`` and record the prompt, or say why not (B.2 step 5.8)."""
         holder = self._by_key.get(key)
         if holder is not None:
-            return Busy(holder.ref, _seconds(holder.hard_deadline - now))
+            pending = holder.pending_until is not None and holder.decision is None
+            return Busy(holder.ref, _seconds(holder.hard_deadline - now), pending)
         waiting = [
             p for p in self._by_key.values() if p.key.client == key.client and p.decision is None
         ]
@@ -328,6 +338,7 @@ class Table:
             asked_at=now,
             expires_at=expires,
             hard_deadline=expires + settings.call_timeout + HARD_DEADLINE_MARGIN,
+            how=how,
         )
         self._by_key[key] = record
         self._by_ref[ref] = key
@@ -350,6 +361,19 @@ class Table:
             self._by_handle.pop(record.handle_sha256, None)
         self._by_handle[new_handle_sha256] = ref
         return self._update(ref, handle_sha256=new_handle_sha256, asks=record.asks + 1)
+
+    def lookup_identical(self, key: Key, args_digest: str) -> Pending | None:
+        """The record holding ``key`` if it waits out of band for the same arguments (D.2): the
+        call is answered with its ref again, not ``busy``."""
+        holder = self._by_key.get(key)
+        if holder is None or holder.decision is not None or holder.pending_until is None:
+            return None
+        return holder if holder.args_digest == args_digest else None
+
+    def pend(self, ref: str, until: float) -> Pending:
+        """The record's holder says it waits for an approval until ``until`` (wall time): the
+        lock stays held, and the record keeps counting against the pending cap (D.2)."""
+        return self._update(ref, pending_until=until)
 
     def decide(self, ref: str, decision: Decision, now: float) -> Pending:
         """Record the decision. The prompt stops counting against the pending cap; the lock stays

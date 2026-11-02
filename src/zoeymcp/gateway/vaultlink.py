@@ -9,7 +9,10 @@ Everything the gateway sends upstream goes through the vault, on one of two link
 
 Each upstream connection gets its own HTTP client, whose transport is the egress filter: every
 request is checked against :mod:`.egressrules` before it is sent, a redirect ends the connection,
-cookies are never kept, and a JSON response is cut off past the upstream message limit.
+cookies are never kept, and a JSON response is cut off past the upstream message limit. A call
+the vault holds gets its ``x-zoeymcp-held`` marker here, after the filter passed it as the held
+registration it consumed (M8 design C.2, Z27); a toolkit's held write gets it the same way, after
+the toolkit transport's own checks.
 """
 
 from __future__ import annotations
@@ -26,15 +29,19 @@ from urllib.parse import parse_qsl, urlsplit
 import httpx2
 
 from ..common import canonical
+from ..common.envelope import MARKER_HEADER, Marker
 from ..common.ledgerreport import PATH as REPORT_PATH
 from ..common.logs import refuse_type
 from ..common.policy.fields import VAULT_ONLY_ENV
 from . import logs
-from .egressrules import CallRegistry, Outgoing, Target, check
+from .egressrules import CallRegistry, Outgoing, Target, check, marker_header
 
 VIEW_PATH = "/_zoeymcp/gateway/v1/view"
 GATEWAY_HEADER = "x-zoeymcp-gateway"
 REFUSAL_HEADER = "x-zoeymcp-vault"
+# What the vault adds to its answer to an approved held call (M8 design B.6, M.1).
+APPROVAL_HEADER = "x-zoeymcp-approval"
+HELD_REF_HEADER = "x-zoeymcp-held-ref"
 UNIX_BASE = "http://vault.invalid"
 KEY_PATTERN = re.compile(r"zgw1-[A-Za-z0-9_-]{43}")
 KEY_ENV = "ZOEYMCP_GATEWAY_KEY"
@@ -226,12 +233,64 @@ def is_redirect(status: int) -> bool:
 
 def vault_refusal_code(body: bytes) -> str | None:
     """The stable ``code`` in a vault refusal body, if it has a plain one."""
+    return _refusal_field(body, "code", _CODE)
+
+
+def _refusal_field(body: bytes, name: str, form: re.Pattern[str]) -> str | None:
     try:
         document = canonical.loads_strict(body, max_bytes=65536)
     except canonical.JSONRejected:
         return None
-    code = document.get("code") if isinstance(document, dict) else None
-    return code if isinstance(code, str) and _CODE.fullmatch(code) else None
+    value = document.get(name) if isinstance(document, dict) else None
+    return value if isinstance(value, str) and form.fullmatch(value) else None
+
+
+# A held refusal's deadline (ISO 8601, seconds, UTC) and JSON pointer, as the vault writes them.
+_DEADLINE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
+_POINTER = re.compile(r"(?:/[A-Za-z0-9_.~-]{0,128}){0,16}")
+
+
+@dataclass(frozen=True)
+class HeldAnswer:
+    """What the vault answered one held call (M8 design C.2): its status, whether the vault
+    refused it (``x-zoeymcp-vault``) or approved it (``x-zoeymcp-approval``), the ref it names
+    (``x-zoeymcp-held-ref``), and from a refusal's body its code, deadline and pointer, and the
+    seconds of its ``Retry-After``. Never a value of the call or of its answer."""
+
+    status: int
+    refused: bool
+    approved: bool
+    ref: str | None = None
+    code: str | None = None
+    deadline: str | None = None
+    pointer: str | None = None
+    retry_after: int | None = None
+
+
+def held_answer(status: int, headers: httpx2.Headers, body: bytes | None) -> HeldAnswer:
+    """The vault's answer to a held call, from its status and headers, and for a refusal its
+    body (an approved answer's body is the upstream's, never read here)."""
+    refused = headers.get(REFUSAL_HEADER) == "refused"
+    retry = headers.get("retry-after", "")
+    found = HeldAnswer(
+        status,
+        refused,
+        headers.get(APPROVAL_HEADER) == "approved",
+        headers.get(HELD_REF_HEADER),
+        retry_after=int(retry) if retry.isdigit() and len(retry) <= 6 else None,
+    )
+    if not refused or body is None:
+        return found
+    return HeldAnswer(
+        status,
+        True,
+        found.approved,
+        found.ref,
+        vault_refusal_code(body),
+        _refusal_field(body, "deadline", _DEADLINE),
+        _refusal_field(body, "pointer", _POINTER),
+        found.retry_after,
+    )
 
 
 class EgressTransport(httpx2.AsyncBaseTransport):
@@ -274,6 +333,9 @@ class EgressTransport(httpx2.AsyncBaseTransport):
         if not verdict.allowed:
             logs.event("upstream_request_blocked", server=self._server, reason=verdict.reason)
             raise UpstreamBlocked(verdict.reason)
+        if verdict.held is not None:
+            # After the filter, which refuses any x-zoeymcp-* header the SDK built (Z27).
+            request.headers[MARKER_HEADER] = marker_header(verdict.held)
         if verdict.kind == "response" and b'"error"' in body:
             logs.event("upstream_request_refused", server=self._server)
         response = await self._inner.handle_async_request(request)
@@ -648,12 +710,17 @@ _TOOLKIT_HEADERS = frozenset(
     }
 )
 ToolkitCheck = Callable[[str, str], str | None]
+# The marker of a held write the toolkit vault registered for this request (method, path, body,
+# Idempotency-Key), used up; None for any other request (M8 design C.2, CR-3).
+ToolkitHeld = Callable[[str, str, bytes, str | None], Marker | None]
 
 
 class ToolkitTransport(httpx2.AsyncBaseTransport):
     """A toolkit's requests to the vault: only to the link, only what ``check`` allows, with no
     header from anywhere but the gateway itself. Redirects end the request; a JSON answer is cut
-    off past 4 MiB; a vault refusal reloads the gateway key, as for upstream connections."""
+    off past 4 MiB; a vault refusal reloads the gateway key, as for upstream connections. A held
+    write's marker is added only after every check passed, from the registration ``held`` hands
+    back, so a marker the toolkit built is still refused ``header``."""
 
     def __init__(
         self,
@@ -663,18 +730,21 @@ class ToolkitTransport(httpx2.AsyncBaseTransport):
         server: str,
         check: ToolkitCheck,
         keys: KeySource | None = None,
+        held: ToolkitHeld | None = None,
     ) -> None:
         self._inner = inner
         self._link = link
         self._server = server
         self._check = check
         self._keys = keys
+        self._held = held
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         url = request.url
         raw_path, _, _ = url.raw_path.partition(b"?")
         path = raw_path.decode("ascii", "replace")
         reason = None
+        body = b""
         if (url.scheme, url.host, url.port) != (
             self._link.scheme,
             self._link.host,
@@ -692,6 +762,12 @@ class ToolkitTransport(httpx2.AsyncBaseTransport):
         if reason is not None:
             logs.event("toolkit_request_blocked", server=self._server, reason=reason)
             raise UpstreamBlocked(reason)
+        marker = None
+        if self._held is not None:
+            idempotency = request.headers.get("idempotency-key")
+            marker = self._held(request.method, path, body, idempotency)
+        if marker is not None:
+            request.headers[MARKER_HEADER] = marker_header(marker)
         response = await self._inner.handle_async_request(request)
         if is_redirect(response.status_code):
             await response.aclose()
@@ -738,9 +814,11 @@ def toolkit_client(
     server: str,
     check: ToolkitCheck,
     inner: httpx2.AsyncBaseTransport | None = None,
+    held: ToolkitHeld | None = None,
 ) -> httpx2.AsyncClient:
     """The HTTP client of one toolkit server: M3's link, key hook, redirect refusal and refusal
-    handling, with ``check`` in place of the MCP egress rules (M4 design H.4)."""
+    handling, with ``check`` in place of the MCP egress rules (M4 design H.4), and ``held``
+    giving a held write its marker (M8 design C.2)."""
     return httpx2.AsyncClient(
         transport=ToolkitTransport(
             inner if inner is not None else _inner_transport(link),
@@ -748,6 +826,7 @@ def toolkit_client(
             server=server,
             check=check,
             keys=keys,
+            held=held,
         ),
         base_url=link.base_url,
         follow_redirects=False,
