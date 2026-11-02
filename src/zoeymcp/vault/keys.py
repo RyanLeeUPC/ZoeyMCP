@@ -39,6 +39,8 @@ CONTEXT_AUDIT = "zoeymcp/audit/v1"
 CONTEXT_PORTAL = "zoeymcp/portal/v1"
 # The managed policy's revisions are encrypted with this (M6 design D.2, D.3).
 CONTEXT_POLICY = "zoeymcp/policy/v1"
+# The vault's approval chain keys its argument and text digests with this (M8 design J.1).
+CONTEXT_LEDGER_VAULT = "zoeymcp/ledger-vault/v1"
 # AES-GCM's nonce for a policy revision. ``AESGCM`` itself takes 8 to 128 bytes (contract 61).
 POLICY_NONCE_BYTES = 12
 
@@ -97,6 +99,25 @@ class AuditKey:
 
 
 refuse_type(AuditKey)
+
+
+class ChainKey:
+    """The vault chain's HMAC key (M8 design J.1): its records hold keyed digests only. Its
+    ``repr`` hides it, and logging it raises."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: bytes) -> None:
+        self._key = key
+
+    def digest(self, data: bytes) -> str:
+        return "hmac-sha256:" + hmac.new(self._key, data, hashlib.sha256).hexdigest()
+
+    def __repr__(self) -> str:
+        return "ChainKey(<hidden>)"
+
+
+refuse_type(ChainKey)
 
 
 class PortalKey:
@@ -214,6 +235,12 @@ class KeySet:
     def audit_key(self) -> AuditKey:
         """The key the SMTP connector's send journal digests requests under."""
         return AuditKey(derive(self._master, CONTEXT_AUDIT))
+
+    @property
+    def chain_key(self) -> ChainKey:
+        """The key the vault's approval chain digests arguments and texts under (M8 design
+        J.1)."""
+        return ChainKey(derive(self._master, CONTEXT_LEDGER_VAULT))
 
     @property
     def portal_key(self) -> PortalKey:

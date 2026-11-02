@@ -314,3 +314,4 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.common.approvaltext" = 95
 "zoeymcp.common.ledgerformat" = 95
 "zoeymcp.common.policy.held" = 95
+"zoeymcp.common.envelope" = 95

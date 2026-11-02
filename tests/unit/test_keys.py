@@ -17,10 +17,12 @@ from zoeymcp.vault.keys import (
     CONTEXT_EGRESS,
     CONTEXT_GATEWAY,
     CONTEXT_KEY_ID,
+    CONTEXT_LEDGER_VAULT,
     CONTEXT_POLICY,
     CONTEXT_PORTAL,
     CONTEXT_STORE,
     POLICY_NONCE_BYTES,
+    ChainKey,
     ConfigMac,
     KeySet,
     MasterKeyError,
@@ -71,10 +73,11 @@ def test_contexts_give_independent_keys() -> None:
         derive(MASTER, CONTEXT_AUDIT),
         derive(MASTER, CONTEXT_PORTAL),
         derive(MASTER, CONTEXT_POLICY),
+        derive(MASTER, CONTEXT_LEDGER_VAULT),
         keys.egress_key(1).encode(),
         keys.egress_key(2).encode(),
     }
-    assert len(derived) == 10
+    assert len(derived) == 11
     assert MASTER not in derived
     assert keys.store_key == derive(MASTER, CONTEXT_STORE)
     assert keys.config_key == derive(MASTER, CONTEXT_CONFIG)
@@ -134,6 +137,40 @@ def test_the_portal_key_never_shows() -> None:
         logs.set_stream(None)
     assert buffer.getvalue() == ""
     assert PortalKey in logs.refused_types()
+
+
+# --- the vault chain's key (M8 design J.1) ------------------------------------------------------
+
+
+def test_the_chain_key_is_its_own_and_pinned() -> None:
+    """An HKDF context of its own: the chain's digests can't be tested under another key, and
+    another master key gives others."""
+    assert CONTEXT_LEDGER_VAULT == "zoeymcp/ledger-vault/v1"
+    assert derive(MASTER, CONTEXT_LEDGER_VAULT).hex() == (
+        "798748d3bd9ea306f379d8ab0a7d77a4a9625ba4a2442fc6c5d182ae2952ce6e"
+    )
+    chain = KeySet.from_master(MASTER).chain_key
+    assert isinstance(chain, ChainKey)
+    expected = hmac.new(derive(MASTER, CONTEXT_LEDGER_VAULT), b"data", hashlib.sha256).hexdigest()
+    assert chain.digest(b"data") == "hmac-sha256:" + expected
+    assert chain.digest(b"data") != KeySet.from_master(MASTER).audit_key.digest(b"data")
+    assert KeySet.from_master(bytes(32)).chain_key.digest(b"data") != chain.digest(b"data")
+
+
+def test_the_chain_key_never_shows() -> None:
+    chain = KeySet.from_master(MASTER).chain_key
+    assert repr(chain) == "ChainKey(<hidden>)"
+    assert derive(MASTER, CONTEXT_LEDGER_VAULT).hex() not in repr(chain)
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        for value in (chain, [chain], {"k": (chain,)}):
+            with pytest.raises(TypeError, match=r"refusing to log a secret \(ChainKey\)"):
+                logs.Log("vault").event("probe", key=value)
+    finally:
+        logs.set_stream(None)
+    assert buffer.getvalue() == ""
+    assert ChainKey in logs.refused_types()
 
 
 # --- the egress key (M7 design G.3) -------------------------------------------------------------

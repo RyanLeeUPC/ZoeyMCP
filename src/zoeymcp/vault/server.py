@@ -96,6 +96,7 @@ from .policystart import Commands, Ok, Refused, SeedIgnored
 from .policystore import PolicyStore, StoreRefused
 from .reportstore import ReportStore
 from .store import SecretStore, StoreError
+from .vaultledger import VaultLedger
 
 if sys.platform != "win32":
     import fcntl
@@ -1098,6 +1099,7 @@ class Vault:
     admin: AdminApp | None
     admin_socket: Path | None
     portal: Portal | None
+    chain: VaultLedger
     managed: ManagedPolicy | None = None
 
 
@@ -1161,10 +1163,11 @@ def build(
     bridges: Mapping[str, int] | None = None,
 ) -> Vault:
     """With the state lock held: keys, policy, store, gateway keys, the link directory, the
-    journals and the copy, the portal's state files, then the portal (M5 design B.4). Nothing
-    listens yet. ``bridges`` are the bridges the launcher started, by name, with their uids.
-    In managed mode the policy's holder (``vault/managed.py``) is built on the app, with the
-    revision-to-view-digest map's first entry, the head's (M6 design F.2, K.1)."""
+    journals and the copy, the vault's chain (M8 design J.1), the portal's state files, then the
+    portal (M5 design B.4). Nothing listens yet. ``bridges`` are the bridges the launcher
+    started, by name, with their uids. In managed mode the policy's holder
+    (``vault/managed.py``) is built on the app, with the revision-to-view-digest map's first
+    entry, the head's (M6 design F.2, K.1)."""
     named = frozenset(bridges or ())
     runtime = load_runtime(
         config, state_dir, environ, standard=gateway_socket is not None, bridges=named
@@ -1194,6 +1197,12 @@ def build(
         app.connectors.recover(connector_names(runtime.policy.connectors))
     except OSError as exc:
         raise StartupError(f"can't recover the SMTP connectors' send journals: {exc}") from exc
+    # Before any listener opens: a hold has no life after a restart, so the vault's chain closes
+    # every call a kill left open, and reads back the recent endings (M8 design J.1).
+    try:
+        chain = VaultLedger.open_at(state_dir, runtime.keys.chain_key)
+    except OSError as exc:
+        raise StartupError(f"can't open or recover the vault's approval chain: {exc}") from exc
     # One set of pending logins for every surface, so the flow limit is shared (M5 design H.2).
     login = LoginService(app.tokens)
     # Likewise one set of onboardings, so their limits and owners hold across surfaces (M7
@@ -1345,6 +1354,7 @@ def build(
         admin,
         admin_socket,
         portal,
+        chain,
         managed,
     )
 

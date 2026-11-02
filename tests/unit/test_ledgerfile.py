@@ -51,15 +51,18 @@ def chain(
     max_bytes: int = 2**26,
     rotate_bytes: int = 4 * 2**20,
     writer: str = "gateway",
+    clock: Clock | None = None,
+    keep_ms: int | None = None,
 ) -> LedgerFile:
     directory.mkdir(mode=0o700, exist_ok=True)
     return LedgerFile(
         directory,
         max_bytes=max_bytes,
-        clock=Clock(),
+        clock=clock or Clock(),
         event=events or Events(),
         rotate_bytes=rotate_bytes,
         writer=writer,
+        keep_ms=keep_ms,
     )
 
 
@@ -227,6 +230,36 @@ def test_old_files_are_pruned_and_noted(tmp_path: Path) -> None:
     assert records(directory)[0].seq == pruned[-1]["last_seq"] + 1
     assert found.verify()["ok"]  # the chain starts where the oldest file left says it does
     assert records(directory)[-1].seq == 29
+    assert found.size == total
+    assert found.prunable_at is None
+
+
+def test_with_keep_ms_a_file_goes_only_once_its_last_record_is_that_old(tmp_path: Path) -> None:
+    """The vault's chain (M8 design J.1): over ``max_bytes``, a file whose last record is
+    ``keep_ms`` old or less stays, and ``prunable_at`` says when it may go; past that, the next
+    append prunes it."""
+    directory = tmp_path / "ledger"
+    events, clock = Events(), Clock()
+    found = opened(
+        directory, events, max_bytes=3000, rotate_bytes=1200, clock=clock, keep_ms=10_000
+    )
+    for index in range(10):
+        call(found, f"{index:016x}")
+    assert events.named("ledger_pruned") == []
+    assert found.size == sum(p.stat().st_size for p in found.files()) > 3000
+    oldest_end = ledgerformat.parse(found.files()[0].read_bytes().splitlines()[-1]).ts
+    assert found.prunable_at == oldest_end + 10_000
+    # The append's ts reads the clock once and the prune once more: exactly that old, it stays.
+    clock.now = oldest_end + 10_000 - 2
+    call(found, REF_A, decision=None, outcome=None)
+    assert events.named("ledger_pruned") == []
+    clock.now = oldest_end + 20_000  # every file is past it now, so pruning stops at the cap
+    call(found, REF_B, decision=None, outcome=None)
+    pruned = events.named("ledger_pruned")
+    assert pruned[0]["first_seq"] == 0
+    assert found.size == sum(p.stat().st_size for p in found.files()) <= 3000
+    assert found.prunable_at is None
+    assert found.verify()["ok"]
 
 
 # --- the open-ref index -------------------------------------------------------------------------
@@ -342,8 +375,10 @@ def test_recovery_closes_every_open_ref_once(tmp_path: Path) -> None:
     ]
     assert again.open == {}
     assert events.named("ledger_recovered") == [report.closed]
+    assert report.ended == {REF_A: "not_sent", REF_B: "unknown", REF_C: "not_sent"}
     third = chain(directory)
-    assert third.recover().closed == {}  # nothing left to close
+    rest = third.recover()
+    assert (rest.closed, rest.ended) == ({}, {})  # nothing left to close
     assert third.next_seq == again.next_seq
 
 

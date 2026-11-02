@@ -54,6 +54,10 @@ reaches that bridge's environment and the vault's, never the gateway's, another 
 command line or a log line; and ``launcher_bridge_refused`` holds no value from ARGS, a token
 hash or an ``ENV_*`` variable, whatever shape refused it.
 
+The vault's approval chain (M8 design J.1, O.6, step 8) holds a hold's argument values and its
+approval text only as digests under the chain key, which no file holds, and its log lines (a
+failed write, a prune, a torn tail, recovery, a broken chain) hold no record, digest or name.
+
 A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
 token, a placeholder, a token header, a forced query value, a connector username and a recipient,
 holds none of them in its file, its head or its anchor, and its salted ``body_digest`` differs
@@ -135,7 +139,7 @@ from zoeymcp.portal.routes import STATIC
 from zoeymcp.vault import logs, policyseal, policystart, policystore, reviewjobs
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import EGRESS_HEADER, VaultApp
-from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.keys import CONTEXT_LEDGER_VAULT, KeySet, derive
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.oauth.tokens import TokenManager
 from zoeymcp.vault.reportstore import ReportStore
@@ -143,6 +147,7 @@ from zoeymcp.vault.request import oauth_client_variants
 from zoeymcp.vault.secretops import Revoker
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
+from zoeymcp.vault.vaultledger import CHAIN_DIR, ChainUnavailable, VaultLedger
 
 from .test_admin import KEYS as ADMIN_KEYS
 from .test_admin import AdminRig, example_policy
@@ -1232,6 +1237,93 @@ async def test_no_ledger_line_reaches_the_vault_logs(tmp_path: Path) -> None:
         assert line.decode()[:60] not in text
     for secret in (DIGEST, PIN, "n" * 127 + "1", "hmac-sha256:"):
         assert secret not in text
+
+
+CHAIN_ARGUMENT = "leak-chain-argument-sentinel-01"
+CHAIN_TEXT = "leak-chain-approval-text-sentinel-01"
+CHAIN_CLIENT = "leak-chain-client-01"
+
+
+async def test_the_vault_chain_holds_no_value_and_logs_no_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vault's chain (M8 design J.1, O.6): a hold's argument values and approval text reach
+    its files only as digests under the chain key, which no file holds; and its log lines (a
+    write that failed, a prune, a torn tail, recovery and a broken chain) hold seqs, counts and
+    reasons, never a record, a digest, a name from one or the key."""
+    pin = "sha256:" + "e" * 64
+
+    async def held(chain: VaultLedger, ref: str, *, decided: bool = True) -> None:
+        asked = {
+            "client": CHAIN_CLIENT,
+            "server": "shop",
+            "tool": "place_order",
+            "where": "vault",
+            "era": "modern",
+            "args": chain.digest({"item": CHAIN_ARGUMENT}),
+            "pin": pin,
+            "text": chain.text_digest(CHAIN_TEXT),
+            "chars": len(CHAIN_TEXT),
+            "writes": 1,
+            "expires": 1,
+        }
+        await chain.write("asked", ref, critical=True, **asked)
+        if decided:
+            decision = {"decision": "accept", "waited_ms": 1, "via": "telegram"}
+            await chain.write("decided", ref, critical=True, **decision)
+
+    master = bytes(range(32))
+    key = KeySet.from_master(master).chain_key
+    ticks = iter(range(1_767_276_000_000, 1_767_277_000_000))
+    options: dict[str, Any] = {"clock": lambda: next(ticks), "max_bytes": 3000}
+    buffer = io.StringIO()
+    logs.set_stream(buffer)
+    try:
+        with anyio.fail_after(30):
+            # Every file is old enough to prune at once.
+            chain = VaultLedger.open_at(tmp_path, key, rotate_bytes=1200, keep_ms=0, **options)
+            for index in range(8):
+                await held(chain, f"{index:016x}")
+            with monkeypatch.context() as patched:
+                patched.setattr("zoeymcp.common.ledgerfile.os.open", _no_space)
+                with pytest.raises(ChainUnavailable):
+                    await held(chain, "00000000000000ff", decided=False)
+            newest = sorted((tmp_path / CHAIN_DIR).glob("*.jsonl"))[-1]
+            newest.write_bytes(newest.read_bytes() + b'{"v":1,"seq":99,"cli')
+            again = VaultLedger.open_at(tmp_path, key, rotate_bytes=1200, **options)
+            await held(again, "00000000000000fe")
+            # The last record no longer follows the one before it: the chain breaks there.
+            newest = sorted((tmp_path / CHAIN_DIR).glob("*.jsonl"))[-1]
+            *kept, last = newest.read_bytes().splitlines(keepends=True)
+            other = b'"prev":"sha256:' + b"1" * 64 + b'"'
+            newest.write_bytes(
+                b"".join(kept) + re.sub(rb'"prev":"sha256:[0-9a-f]{64}"', other, last)
+            )
+            VaultLedger.open_at(tmp_path, key, rotate_bytes=1200, **options)
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    for event in (
+        "ledger_write_failed",
+        "ledger_pruned",
+        "ledger_repaired",
+        "ledger_recovered",
+        "ledger_chain_broken",
+    ):
+        assert f'"event":"{event}"' in text
+    material = derive(master, CONTEXT_LEDGER_VAULT)
+    files = b"".join(p.read_bytes() for p in (tmp_path / CHAIN_DIR).iterdir() if p.is_file())
+    for value in (CHAIN_ARGUMENT, CHAIN_TEXT, material.hex()):
+        assert value.encode() not in files
+        assert value not in text
+    assert chain.digest({"item": CHAIN_ARGUMENT}).encode() in files
+    for secret in (CHAIN_CLIENT, pin, "hmac-sha256:", '{"v":1'):
+        assert secret not in text
+    assert repr(key) == "ChainKey(<hidden>)"
+
+
+def _no_space(*args: Any, **kwargs: Any) -> int:
+    raise OSError(28, "No space left on device")
 
 
 async def callback(world: World, url: str, binder: str | None) -> httpx.Response:

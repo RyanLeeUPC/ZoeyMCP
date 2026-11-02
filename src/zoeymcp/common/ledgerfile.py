@@ -7,11 +7,14 @@ chain uses the same files; each role wraps it with its own key and its own failu
 
 - **Files** ``<first seq, 12 digits>.jsonl`` in the chain's directory, mode 0600, one record per
   line, each written and fsynced before :meth:`LedgerFile.append` returns. A new file starts at
-  ``rotate_bytes``; the oldest files are deleted beyond ``max_bytes``.
+  ``rotate_bytes``; the oldest files are deleted beyond ``max_bytes``, and with ``keep_ms`` (the
+  vault's chain, M8 design J.1) only once their last record is that old, so the files may stay
+  over ``max_bytes`` until then.
 - **The open-ref index** ``open.json`` lists refs with an ``asked`` record and no ``outcome``,
   rewritten atomically after each record, so start-up needn't read every file.
 - **Recovery** before the listener opens: a torn last line is moved aside, the newest file's
-  chain is checked, and every open ref is closed with exactly one ``outcome``.
+  chain is checked, and every open ref is closed with exactly one ``outcome``; the report names
+  each ref closed and its outcome.
 - **Reading** back: the records, the stored lines after a seq (the report's), and the chain's
   walk.
 
@@ -57,11 +60,13 @@ class Recovery:
     chain_broken_at: int | None = None
     index_rebuilt: bool = False
     closed: dict[str, int] = field(default_factory=dict)  # recovered counts, when any were open
+    ended: dict[str, str] = field(default_factory=dict)  # each ref closed -> its outcome
 
 
 class LedgerFile:
     """One chain's files in ``directory``, which must exist. ``event`` writes the role's log
-    lines; ``writer`` is the records' ``writer`` field."""
+    lines; ``writer`` is the records' ``writer`` field. With ``keep_ms``, a file is pruned only
+    once its last record's ``ts`` is more than that before ``clock()``."""
 
     def __init__(
         self,
@@ -72,6 +77,7 @@ class LedgerFile:
         event: Callable[..., None],
         writer: str,
         rotate_bytes: int = ROTATE_BYTES,
+        keep_ms: int | None = None,
     ) -> None:
         self.dir = directory
         self.max_bytes = max_bytes
@@ -79,6 +85,11 @@ class LedgerFile:
         self.event = event
         self.rotate_bytes = rotate_bytes
         self.writer = writer
+        self.keep_ms = keep_ms
+        # After each prune: the files' bytes, and when the oldest file keep_ms held back from a
+        # prune may go (on ``clock``), or None when none was held back.
+        self.size = 0
+        self.prunable_at: int | None = None
         self.next_seq = 0
         self.prev = GENESIS
         self.open: dict[str, list[str]] = {}  # ref -> kinds written so far
@@ -134,6 +145,11 @@ class LedgerFile:
             self.append(step.kind, step.ref, dict(step.fields))
         if steps:
             report.closed = dict(steps[-1].fields)
+            report.ended = {
+                step.ref: step.fields["outcome"]
+                for step in steps
+                if step.kind == "outcome" and step.ref is not None
+            }
             self.event("ledger_recovered", **report.closed)
         return report
 
@@ -185,7 +201,8 @@ class LedgerFile:
 
     def append(self, kind: Kind, ref: str | None, fields: dict[str, Any]) -> Anchor:
         """Write and fsync one record, then the index. Raises ``OSError`` or
-        :class:`~.ledgerformat.LedgerFormatError`, and then nothing has moved on."""
+        :class:`~.ledgerformat.LedgerFormatError`, and then nothing has moved on; once the record
+        is on disk it doesn't raise, so a caller never writes it again (M8 design J.1)."""
         line = ledgerformat.encode(
             kind,
             seq=self.next_seq,
@@ -215,32 +232,46 @@ class LedgerFile:
                 self.open.pop(ref, None)
             else:
                 self.open.setdefault(ref, []).append(kind)
-        self._write_index()
-        self._prune()
+        # The record is durable. An index that couldn't be rewritten is rebuilt at start (its
+        # head_seq won't match), and the next append prunes again.
+        with contextlib.suppress(OSError):
+            self._write_index()
+        with contextlib.suppress(OSError):
+            self.prune()
         return anchor
 
     def _write_index(self) -> None:
         index = {"v": 1, "head_seq": self.next_seq - 1, "refs": self.open}
         files.write_atomic(self.dir / INDEX_FILE, canonical.dumps_canonical(index), prefix=".open-")
 
-    def _prune(self) -> None:
+    def prune(self) -> None:
+        """Delete the oldest files while the files are over ``max_bytes``, never the newest,
+        which takes the next record; with ``keep_ms``, stop at a file whose last record is that
+        recent. Each append ends with it."""
         found = self.files()
         sizes = {p: p.stat().st_size for p in found}
         total = sum(sizes.values())
+        self.prunable_at = None
         for path in found[:-1]:
             if total <= self.max_bytes:
                 break
             first = int(_FILE.fullmatch(path.name).group(1))  # type: ignore[union-attr]
-            last = self._last_seq(path)
+            last = self._last_record(path)
+            keep = self.keep_ms
+            if keep is not None and last is not None and self.clock() - last.ts <= keep:
+                self.prunable_at = last.ts + keep
+                break
             with contextlib.suppress(OSError):
                 path.unlink()
                 total -= sizes[path]
-                self.event("ledger_pruned", first_seq=first, last_seq=last)
+                seq = None if last is None else last.seq
+                self.event("ledger_pruned", first_seq=first, last_seq=seq)
+        self.size = total
 
-    def _last_seq(self, path: Path) -> int | None:
+    def _last_record(self, path: Path) -> Record | None:
         for line in reversed(path.read_bytes().splitlines()):
             try:
-                return ledgerformat.parse(line).seq
+                return ledgerformat.parse(line)
             except LedgerFormatError:
                 continue
         return None
