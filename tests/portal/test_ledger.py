@@ -7,11 +7,14 @@ every row says the gateway reported it (or, from M8, which record the vault wrot
 string from the gateway, a journal or ``head.json`` is shown with its hidden characters
 revealed. While the copy refuses reports, every page has its banner, and ``ledger.restart``,
 planned with every epoch it deletes and confirmed with a passkey, archives the chain, which the
-page still reads. Hidden characters are written with ``chr()`` (the hygiene test).
+page still reads. From M8 (design J.2, J.3) the vault's own chain joins each call by ref (FM-42),
+a call only it holds is listed on its own, and the orphan check's span is on the vault's clock.
+Hidden characters are written with ``chr()`` (the hygiene test).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Iterator
@@ -25,7 +28,14 @@ from tests.fakes.browser import Page
 from tests.unit.test_ledgerjoin import RECORDS, REF_D, T, record
 from zoeymcp.common import canonical, ledgerformat, ledgerreport
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
-from zoeymcp.portal.app import LEDGER_BANNERS, ORPHAN_FLAGS, _ledger_view, _row_view
+from zoeymcp.portal.app import (
+    CHAIN_UNREADABLE,
+    LEDGER_BANNERS,
+    ORPHAN_FLAGS,
+    VAULT_ONLY_FLAGS,
+    _ledger_view,
+    _row_view,
+)
 from zoeymcp.portal.refusals import CATALOGUE
 from zoeymcp.vault import ledgerview
 from zoeymcp.vault.connectors import sendjournal
@@ -40,6 +50,7 @@ DIGEST = "hmac-sha256:" + "1" * 64
 PIN = "sha256:" + "2" * 64
 REFS = [f"{n:016x}" for n in range(0xA0, 0xA8)]
 BIDI = chr(0x202E)
+PARTWAY = "sha256:" + "a" * 64  # a first prev that isn't genesis: a chain taken partway through
 
 
 def policy() -> dict[str, Any]:
@@ -101,14 +112,16 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def asked(ref: str, *, client: str = "agent1", tool: str = "send_note") -> dict[str, Any]:
+def asked(
+    ref: str, *, client: str = "agent1", tool: str = "send_note", where: str = "gateway"
+) -> dict[str, Any]:
     return {
         "kind": "asked",
         "ref": ref,
         "client": client,
         "server": "mail",
         "tool": tool,
-        "where": "gateway",
+        "where": where,
         "era": "modern",
         "args": DIGEST,
         "pin": PIN,
@@ -128,10 +141,10 @@ def outcome(ref: str) -> dict[str, Any]:
     return {"kind": "outcome", "ref": ref, **fields}
 
 
-def chain(records: list[dict[str, Any]], *, ts: int) -> list[bytes]:
-    """The records as one chain from seq 0, a millisecond apart from ``ts``."""
+def chain(records: list[dict[str, Any]], *, ts: int, prev: str = GENESIS) -> list[bytes]:
+    """The records as one chain from seq 0, a millisecond apart from ``ts``, the first after
+    ``prev`` (the genesis hash: the gateway's first record)."""
     lines: list[bytes] = []
-    prev = GENESIS
     for seq, fields in enumerate(records):
         line = ledgerformat.encode(seq=seq, prev=prev, ts=ts + seq, **fields)[:-1]
         lines.append(line)
@@ -355,8 +368,8 @@ def test_records_the_vault_wrote_are_rendered() -> None:
     accepted = by_ref[REF_D]
     assert accepted["decision"] == "accept"
     assert accepted["text_shown"].endswith(
-        "decision accept; outcome none yet; 1 write(s) asked; asked reported by the gateway, "
-        "decided written by the vault."
+        "decision accept via telegram; outcome none yet; 1 write(s) asked; asked reported by the "
+        "gateway, decided written by the vault."
     )
     pending = by_ref[REFS[7]]
     assert "decision pending;" in pending["text_shown"]
@@ -376,7 +389,9 @@ def test_hidden_characters_are_revealed() -> None:
         "server": "x" * 130,
         "tool": f"send{chr(0x200B)}",
         "era": "modern",
+        "where": "gateway",
         "decision": None,
+        "via": None,
         "waited_ms": None,
         "outcome": None,
         "detail": None,
@@ -384,6 +399,8 @@ def test_hidden_characters_are_revealed() -> None:
         "writes_sent": None,
         "writes_unknown": None,
         "writers": {"asked": "gateway"},
+        "others": [],
+        "disagree": False,
         "not_in_policy": ["client"],
         "journal": [{"key": f"k{BIDI}.1", "state": "sent", "smtp_code": None, "at": "t"}],
     }
@@ -528,26 +545,39 @@ def test_orphans_are_judged_against_the_kept_archives_too(
     rig: PortalRig, signed_in: tuple[Page, SoftAuthenticator], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """J.4, J.5: after a restart, a send whose call is in the archived epoch isn't an orphan; one
-    begun before the earliest record the copy keeps can't be checked (``older_than_copy``); a
-    send no call explains inside that span is still ``no_ledger_record``, however old. Once a
-    restart deletes the epoch, its sends are older than the copy. The archives are read for the
-    first page only, and an archive that can't be read is a copy that can't be."""
+    begun before the copy's span can't be checked (``older_than_copy``); a send no call explains
+    inside that span is ``no_ledger_record``. M8 design J.3: the span is on the vault's clock,
+    never the records' ``ts``; for chains taken partway through it starts when the vault received
+    the first line of the earliest file kept, here the archived epoch's (received over two
+    reports: its first counts, not its last). Once a restart deletes the epoch, nothing
+    begun before the vault last received what it deleted can be checked, even beside a chain
+    from the gateway's first record. The archives are read for the first page only, and an
+    archive that can't be read is a copy that can't be."""
     page, _ = signed_in
     copy = copy_of(rig)
-    ts = now_ms() - 3_600_000
-    report(rig, chain([asked(REFS[0]), decided(REFS[0]), outcome(REFS[0])], ts=ts))
-    assert report(rig, chain([asked(REFS[1])], ts=ts + 500)).reason == "fork"
+    now = [T + 1_000_000]  # the vault's clock
+    monkeypatch.setattr(copy, "clock", lambda: now[0])
+    received = now[0]
+    ts = received + 10**9  # the gateway's: far ahead, and it moves nothing
+    archived_lines = chain(
+        [asked(REFS[0]), decided(REFS[0]), outcome(REFS[0])], ts=ts, prev=PARTWAY
+    )
+    report(rig, archived_lines[:1])
+    now[0] = received + 200  # the epoch's last receipt: the span doesn't start here
+    report(rig, archived_lines[1:])
+    assert report(rig, chain([asked(REFS[1])], ts=ts, prev=PARTWAY)).reason == "fork"
     rig.call(lambda: copy.restart())
-    report(rig, chain([asked(REFS[1]), decided(REFS[1])], ts=ts + 500))  # a new chain
+    now[0] = received + 1000
+    report(rig, chain([asked(REFS[1]), decided(REFS[1])], ts=ts, prev=PARTWAY))  # a new chain
     archived, live, older, inside, later = (f"{REFS[n]}.1" for n in (0, 1, 5, 6, 7))
     journal(
         rig,
-        sending(older, ts - 1),  # a millisecond before the earliest record kept
-        sending(inside, ts),  # exactly at it: inside the span, and no call explains it
-        sending(archived, ts + 1),
-        sent(archived, ts + 2),
-        sending(live, ts + 600),
-        sending(later, ts + 700),
+        sending(archived, received - 5),
+        sent(archived, received - 4),
+        sending(older, received - 1),  # a millisecond before the vault began the epoch
+        sending(inside, received),  # exactly then: inside the span, and no call explains it
+        sending(live, received + 500),
+        sending(later, received + 2000),  # after the copy's latest report
     )
     reads: list[str] = []
     real = copy.archived_coverage
@@ -559,12 +589,12 @@ def test_orphans_are_judged_against_the_kept_archives_too(
     monkeypatch.setattr(copy, "archived_coverage", counted)
     answer = ledger(page)
     assert [(o["key_shown"], o["flag"]) for o in answer["orphans"]] == [
-        (later, "no_ledger_record"),
+        (later, "not_yet_reported"),
         (inside, "no_ledger_record"),
         (older, "older_than_copy"),
     ]
     assert answer["orphans"][2]["text_shown"] == (
-        f"{ledgerview.when(ts - 1)} send {older} on mail-out: sending; "
+        f"{ledgerview.when(received - 1)} send {older} on mail-out: sending; "
         f"{ORPHAN_FLAGS['older_than_copy']}."
     )
     assert ORPHAN_FLAGS["older_than_copy"].startswith(
@@ -576,18 +606,20 @@ def test_orphans_are_judged_against_the_kept_archives_too(
     assert ledger(page, "?before=1")["orphans"] == []
     assert reads == ["archives"]  # only the live chain's first page reads them
 
-    # A restart that deletes the archived epoch: its sends are older than the copy now.
+    # A restart that deletes both chains it held; the gateway's ledger starts again from its
+    # first record. What the vault last received of the deleted ones bounds the span.
     copy.archive_max_bytes = 1
-    assert report(rig, chain([asked(REFS[2])], ts=ts + 900)).reason == "fork"
+    assert report(rig, chain([asked(REFS[2])], ts=ts, prev=PARTWAY)).reason == "fork"
     rig.call(lambda: copy.restart())
-    report(rig, chain([asked(REFS[3])], ts=ts + 650))
+    now[0] = received + 3000
+    report(rig, chain([asked(REFS[3])], ts=ts))
     flags = [(o["key_shown"], o["flag"]) for o in ledger(page)["orphans"]]
     assert flags == [
         (later, "no_ledger_record"),
         (live, "older_than_copy"),
-        (archived, "older_than_copy"),
         (inside, "older_than_copy"),
         (older, "older_than_copy"),
+        (archived, "older_than_copy"),
     ]
 
     def unreadable() -> ledgerview.Coverage:
@@ -596,6 +628,150 @@ def test_orphans_are_judged_against_the_kept_archives_too(
     monkeypatch.setattr(copy, "archived_coverage", unreadable)
     assert ledger(page)["state"]["state"] == "unavailable"
     assert [row["seq"] for row in ledger(page, "?before=1")["rows"]] == [0]
+
+
+# --- the vault's own chain (M8 design J.2, J.3) --------------------------------------------------
+
+
+def vault_wrote(rig: PortalRig, *records: dict[str, Any]) -> None:
+    """Records the vault's own chain writes as it holds and relays calls (J.1), on its loop."""
+    chain_ = rig.vault.chain
+    for fields in records:
+        rest = {k: v for k, v in fields.items() if k not in ("kind", "ref")}
+        write = chain_.write(fields["kind"], fields["ref"], critical=True, **rest)
+        asyncio.run_coroutine_threadsafe(write, rig.loop).result(30)
+
+
+def accepted(ref: str, via: str) -> dict[str, Any]:
+    return {**decided(ref), "via": via}
+
+
+def test_a_relay_and_a_held_call_join_across_both_chains(
+    rig: PortalRig, signed_in: tuple[Page, SoftAuthenticator]
+) -> None:
+    """FM-42: one row per call, joined by ref: the vault's decision with the surface it came
+    through, the vault's outcome for the call it held and the gateway's for the relay, who wrote
+    each, the other chain's records as lines, and a disagreement flagged with both shown. A send
+    whose call only the vault's chain holds, accepted, is no orphan (J.3); that call has no row,
+    since the rows page by the copy's seqs, and is listed on its own with its send and flag. A
+    send whose call the vault declined is an orphan, in words that say so. No keyed digest or pin
+    from either chain is in the page."""
+    page, _ = signed_in
+    held, relay, disputed, unreported, declined = REFS[0], REFS[1], REFS[2], REFS[3], REFS[4]
+    ts = now_ms()
+    journal(
+        rig,
+        sending(f"{unreported}.1", ts - 1000),
+        sent(f"{unreported}.1", ts - 900),
+        sending(f"{declined}.1", ts - 800),
+    )
+    report(
+        rig,
+        chain(
+            [
+                asked(held, where="vault"),
+                asked(relay),
+                asked(disputed, where="vault"),
+                decided(held, "approved_elsewhere"),
+                outcome(held),
+                decided(relay),
+                outcome(relay),
+                decided(disputed, "decline"),
+            ],
+            ts=ts - 120_000,
+        ),
+    )
+    relayed = {**outcome(relay), "outcome": "unknown", "detail": "relayed", "writes_sent": 0}
+    vault_wrote(
+        rig,
+        asked(held, where="vault"),
+        accepted(held, "telegram"),
+        outcome(held),
+        asked(relay),
+        accepted(relay, "portal"),
+        relayed,
+        asked(disputed, where="vault"),
+        accepted(disputed, "telegram"),
+        outcome(disputed),
+        asked(unreported, where="vault"),
+        accepted(unreported, "telegram"),
+        asked(declined, where="vault"),
+        {**decided(declined, "decline"), "via": "telegram"},
+    )
+    answer = ledger(page)
+    assert [(row["ref"], row["seq"]) for row in answer["rows"]] == [
+        (disputed, 2),
+        (relay, 1),
+        (held, 0),
+    ]
+    rows = {row["ref"]: row for row in answer["rows"]}
+    at = ledgerview.when(ts - 120_000)
+    assert rows[held]["text_shown"] == (
+        f"{at} call {held} (seq 0): agent1 asked for mail/send_note (modern, held by the vault); "
+        "decision accept via telegram; outcome ok (sent); 1 write(s) asked, 1 sent, 0 unknown; "
+        "asked reported by the gateway, decided written by the vault, outcome written by the "
+        "vault."
+    )
+    assert rows[held]["lines_shown"] == [
+        "Also decided approved_elsewhere, reported by the gateway.",
+        "Also outcome ok (sent), reported by the gateway.",
+    ]
+    assert rows[relay]["text_shown"].endswith(
+        "(modern); decision accept via portal; outcome ok (sent); 1 write(s) asked, 1 sent, 0 "
+        "unknown; asked reported by the gateway, decided written by the vault, outcome reported "
+        "by the gateway."
+    )
+    assert rows[relay]["lines_shown"] == [
+        "Also decided accept, reported by the gateway.",
+        "Also outcome unknown (relayed), written by the vault.",
+    ]
+    assert (rows[disputed]["disagree"], rows[held]["disagree"]) == (True, False)
+    assert rows[disputed]["lines_shown"] == [
+        "The chains disagree: the vault's decision and the gateway's differ.",
+        "Also decided decline, reported by the gateway.",
+    ]
+    [orphan] = answer["orphans"]
+    assert orphan["text_shown"] == (
+        f"{ledgerview.when(ts - 800)} send {declined}.1 on mail-out: sending; no ledger record: "
+        "the copy has had reports since this send began and holds no record of its call, and "
+        "the vault's own chain holds no accept of it (a gateway that didn't record it, a record "
+        "that was lost, or a call the vault didn't approve)."
+    )
+    assert [row["ref"] for row in answer["vault_only"]] == [declined, unreported]
+    alone = answer["vault_only"][1]
+    assert alone["flag"] == "not_yet_reported"  # the copy's last report came before it
+    assert " (vault chain seq " in alone["text_shown"]
+    assert alone["text_shown"].endswith(
+        "agent1 asked for mail/send_note (modern, held by the vault); decision accept via "
+        "telegram; outcome none yet; 1 write(s) asked; asked written by the vault, decided "
+        "written by the vault."
+    )
+    assert alone["lines_shown"] == [
+        VAULT_ONLY_FLAGS["not_yet_reported"],
+        f"Send {unreported}.1: sent, SMTP 250, at {ledgerview.when(ts - 900)}.",
+    ]
+    assert ledger(page, "?before=1")["vault_only"] == []
+    text = json.dumps(answer)
+    assert "hmac-sha256" not in text
+    assert PIN not in text
+
+
+def test_a_chain_that_cant_be_read_leaves_the_copys_rows(
+    rig: PortalRig, signed_in: tuple[Page, SoftAuthenticator], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vault's own chain failing to read isn't the copy failing: the page keeps the copy's
+    rows, alone, and says so."""
+    page, _ = signed_in
+    report(rig, chain([asked(REFS[0]), decided(REFS[0])], ts=now_ms() - 1000))
+
+    def unreadable() -> list[dict[str, Any]]:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(rig.vault.chain, "records", unreadable)
+    answer = ledger(page)
+    assert answer["state"]["state"] == "ok"
+    assert [row["ref"] for row in answer["rows"]] == [REFS[0]]
+    assert answer["state_shown"].endswith(" " + CHAIN_UNREADABLE)
 
 
 def test_a_restart_that_deletes_lists_each_epoch(

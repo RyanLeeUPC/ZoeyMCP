@@ -439,6 +439,24 @@ def test_records_skip_lines_that_dont_parse(tmp_path: Path) -> None:
     assert [r.seq for r in found.records()] == [0, 1, 2]
 
 
+def test_records_skip_a_file_pruned_since_it_was_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reader in another thread (the portal's Ledger page reads the vault's chain while it
+    appends, M8 design J.2) lists the files, then a prune removes the oldest before it is read:
+    the rest are still read, as :meth:`LedgerFile.lines` reads them."""
+    directory = tmp_path / "ledger"
+    found = opened(directory, rotate_bytes=1200)
+    for index in range(4):
+        call(found, f"{index:016x}")
+    listed = found.files()
+    assert len(listed) > 2
+    later = [r.seq for r in records(directory)][int(listed[1].name[:12]) :]
+    listed[0].unlink()  # pruned once listed
+    monkeypatch.setattr(found, "files", lambda: listed)
+    assert [r.seq for r in found.records()] == later
+
+
 def test_lines_are_the_stored_bytes_after_a_seq(tmp_path: Path) -> None:
     directory = tmp_path / "ledger"
     found = opened(directory, rotate_bytes=1200)

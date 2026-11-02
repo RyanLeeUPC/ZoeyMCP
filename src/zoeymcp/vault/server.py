@@ -778,12 +778,12 @@ def build_portal(
     any ``--listen`` is warned about (``admin_listener_shared``). ``secrets`` is what its Secrets
     area writes through, the admin socket's store, token manager and policy; ``health`` what
     its health checklist reads, as the socket's ``GET /health`` does; ``ledger`` the reported
-    copy and the send journals its Ledger page reads, as ``zoeymcp ledger --vault`` does;
-    ``source`` where the policy came from, for its policy view, and in managed mode
-    ``policy_header`` the running revision's header (M6 design A.4); and ``onboard`` and
-    ``reviews`` the onboardings and review jobs its MCP servers section shares with the socket
-    (M7 K); and in managed mode ``managed``, the policy's holder its saves write through (M6
-    design G.6)."""
+    copy and the send journals its Ledger page reads, as ``zoeymcp ledger --vault`` does, and
+    the vault's own chain it joins them with (M8 design J.2); ``source`` where the policy came
+    from, for its policy view, and in managed mode ``policy_header`` the running revision's
+    header (M6 design A.4); and ``onboard`` and ``reviews`` the onboardings and review jobs its
+    MCP servers section shares with the socket (M7 K); and in managed mode ``managed``, the
+    policy's holder its saves write through (M6 design G.6)."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -1293,8 +1293,8 @@ def build(
         policy_state=policy_state,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
-    # (M5 design J.5); the policy view says where the policy came from (L), in managed mode the
-    # revision that runs (M6 design A.4, G.10).
+    # (M5 design J.5) and the vault's own chain (M8 design J.2); the policy view says where the
+    # policy came from (L), in managed mode the revision that runs (M6 design A.4, G.10).
     source: Source = "stdin" if config == "-" else "env" if config is None else "file"
     if managed is not None:
         source = "managed"
@@ -1306,7 +1306,7 @@ def build(
         login=login,
         secrets=secrets,
         health=health,
-        ledger=Ledger(reports, app.connectors),
+        ledger=Ledger(reports, app.connectors, chain),
         source=source,
         policy_header=None if managed is None else (lambda: _header(managed)),
         # The same onboardings and review jobs as the socket's (M7 design D.8, F.2).
@@ -1329,6 +1329,8 @@ def build(
             connectors=app.connectors,
             env_names=lambda: app.env_names,
             reports=reports,
+            # zoeymcp ledger --vault joins the vault's own chain, as the portal does (M8 J.2).
+            chain=chain,
             passkeys=passkeys,
             portal=None if portal is None else portal.app,
             onboard=onboard,

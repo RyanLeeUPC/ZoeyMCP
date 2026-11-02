@@ -61,6 +61,7 @@ from zoeymcp.vault.oauth.protocol import CREDENTIAL_UNAVAILABLE
 from zoeymcp.vault.oauth.tokens import OAuthUnavailable, TokenManager
 from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.store import SecretStore
+from zoeymcp.vault.vaultledger import VaultLedger
 
 from .conftest import EXAMPLE_POLICY
 from .test_passkeys import NOW, credential
@@ -1750,7 +1751,9 @@ async def test_health_without_the_token_manager(tmp_path: Path) -> None:
 # --- the reported ledger (M5 design J.4, J.5) ----------------------------------------------------
 
 
-def reported_rig(tmp_path: Path, clock: list[int] | None = None) -> tuple[AdminRig, ReportStore]:
+def reported_rig(
+    tmp_path: Path, clock: list[int] | None = None, chain: VaultLedger | None = None
+) -> tuple[AdminRig, ReportStore]:
     now = clock or [T0]
     copy = ReportStore.open(tmp_path, clock=lambda: now[0])
     connectors = SmtpConnectors(tmp_path, KEYS, clock_ms=lambda: now[0])
@@ -1763,6 +1766,7 @@ def reported_rig(tmp_path: Path, clock: list[int] | None = None) -> tuple[AdminR
         rig.tokens,
         connectors=connectors,
         reports=copy,
+        chain=chain,
     )
     return rig, copy
 
@@ -1771,9 +1775,8 @@ def report(lines: list[bytes]) -> Any:
     return canonical.loads_strict(ledgerreport.encode(lines))
 
 
-def chained(count: int, *, tick: int = 0) -> list[bytes]:
+def chained(count: int, *, tick: int = 0, prev: str = GENESIS) -> list[bytes]:
     lines: list[bytes] = []
-    prev = GENESIS
     for n in range(count):
         lines.append(asked_line(n, prev, tick + n + 1))
         prev = line_hash(lines[-1])
@@ -1830,13 +1833,24 @@ async def test_the_reported_copy_joins_the_send_journals(tmp_path: Path) -> None
 @pytest.mark.anyio
 async def test_the_orphans_are_judged_against_the_kept_archives(tmp_path: Path) -> None:
     """J.5: after a restart, a send whose call is archived isn't an orphan; one begun before the
-    earliest record kept is ``older_than_copy``; one inside that span no call explains is
-    ``no_ledger_record``. Only the first page has orphans."""
-    rig, copy = reported_rig(tmp_path, [T0 + 10_000])
-    copy.report(report(chained(3)))
-    copy.report(report(chained(3, tick=100)[1:]))
+    copy's span is ``older_than_copy``; one inside that span no call explains is
+    ``no_ledger_record``. Only the first page has orphans. M8 design J.3: the span is on the
+    vault's clock; for chains taken partway through, it starts when the vault received the
+    first line of the earliest file kept (the archived epoch's, here, received over two
+    reports), whatever the records' ``ts``. The vault's own chain joins in (J.2, as the
+    portal's page does): a send whose call it accepted is no orphan, and that call, which only
+    the vault's chain holds, is listed."""
+    clock = [T0 + 10_000]
+    vault = VaultLedger.open_at(tmp_path, KEYS.chain_key)
+    rig, copy = reported_rig(tmp_path, clock, vault)
+    partway = "sha256:" + "a" * 64  # not the genesis hash: the gateway's chain began before
+    copy.report(report(chained(3, prev=partway)[:1]))
+    clock[0] = T0 + 15_000  # the epoch's last receipt: its span doesn't start here
+    copy.report(report(chained(3, prev=partway)[1:]))
+    copy.report(report(chained(3, tick=100, prev=partway)[1:]))
     copy.restart()
-    copy.report(report(chained(2, tick=200)))
+    clock[0] = T0 + 20_000
+    copy.report(report(chained(2, tick=200, prev=partway)))
     journal = tmp_path / "connectors" / "mail-out"
     journal.mkdir(parents=True)
     common = {
@@ -1845,7 +1859,19 @@ async def test_the_orphans_are_judged_against_the_kept_archives(tmp_path: Path) 
         "subject_chars": 1,
         "body_chars": 1,
     }
-    sends = [("0000000000000001.1", T0 + 1), (f"{0xA1:016x}.1", T0), (f"{0xA2:016x}.1", T0 + 1)]
+    sends = [
+        ("0000000000000001.1", T0 + 1),
+        (f"{0xA1:016x}.1", T0 + 9_999),
+        (f"{0xA2:016x}.1", T0 + 10_000),
+        (f"{0xA3:016x}.1", T0 + 10_001),  # its call only the vault's chain holds, accepted
+    ]
+    names = {"client": "agent1", "server": "mail", "tool": "send_note"}
+    digests = {"args": "hmac-sha256:" + "0" * 64, "text": "hmac-sha256:" + "0" * 64}
+    held: dict[str, Any] = {**names, **digests, "where": "vault", "era": "modern"}
+    held |= {"pin": "sha256:" + "0" * 64, "chars": 1, "writes": 1, "expires": 1}
+    vault.file.append("asked", f"{0xA3:016x}", held)
+    accept = {"decision": "accept", "waited_ms": 5, "via": "telegram"}
+    vault.file.append("decided", f"{0xA3:016x}", accept)
     lines = [sendjournal.encode("sending", ts=ts, key=key, **common) for key, ts in sends]
     (journal / "journal-0000000000001.jsonl").write_bytes(b"".join(lines))
     page = (await rig.call("GET", "/ledger/reported")).json()
@@ -1854,7 +1880,25 @@ async def test_the_orphans_are_judged_against_the_kept_archives(tmp_path: Path) 
         (f"{0xA1:016x}.1", "older_than_copy"),
     ]
     assert [row["seq"] for row in page["rows"]] == [1, 0]  # the live chain's rows only
-    assert (await rig.call("GET", "/ledger/reported?before=1")).json()["orphans"] == []
+    [alone] = page["vault_only"]
+    assert (alone["ref"], alone["seq"], alone["decision"], alone["via"]) == (
+        f"{0xA3:016x}",
+        0,
+        "accept",
+        "telegram",
+    )
+    assert [send["key"] for send in alone["journal"]] == [f"{0xA3:016x}.1"]
+    assert (page["vault_only_more"], page["chain_readable"]) == (0, True)
+    later = (await rig.call("GET", "/ledger/reported?before=1")).json()
+    assert (later["orphans"], later["vault_only"]) == ([], [])
+
+    def unreadable() -> list[dict[str, Any]]:
+        raise PermissionError(13, "denied")
+
+    vault.records = unreadable  # type: ignore[method-assign]
+    page = (await rig.call("GET", "/ledger/reported")).json()
+    assert (page["chain_readable"], page["vault_only"]) == (False, [])
+    assert [row["seq"] for row in page["rows"]] == [1, 0]  # the copy's rows, alone
     await rig.token_client.aclose()
 
 

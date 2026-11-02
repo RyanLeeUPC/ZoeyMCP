@@ -279,9 +279,14 @@ class LedgerFile:
     # --- reading ------------------------------------------------------------------------------
 
     def records(self) -> Iterator[Record]:
-        """Every record in the files, oldest first; a line that doesn't parse is left out."""
+        """Every record in the files, oldest first; a line that doesn't parse is left out, and
+        so is a file pruned since it was listed (a reader in another thread, M8 design J.2)."""
         for path in self.files():
-            for line in path.read_bytes().splitlines():
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                continue  # pruned since it was listed
+            for line in data.splitlines():
                 try:
                     yield ledgerformat.parse(line)
                 except LedgerFormatError:

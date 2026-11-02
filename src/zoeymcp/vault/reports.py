@@ -53,11 +53,13 @@ Reason = Literal[
 
 @dataclass(frozen=True)
 class LiveFile:
-    """One file of the live chain: its size, and when the vault received its last line (ms)."""
+    """One file of the live chain: its size, when the vault received its last line (ms), and
+    when it received its first (M8 design J.3; None when ``head.json`` didn't record it)."""
 
     name: str
     size: int
     received_ms: int
+    first_received_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -227,7 +229,8 @@ def _room(
 @dataclass(frozen=True)
 class Epoch:
     """An archived chain: its seq range, when the vault last received a line of it (ms), its
-    size. A dropped epoch's head stays in ``head.json`` and the log as an anchor."""
+    size, and when the vault received its earliest file's first line (M8 design J.3; None when
+    not recorded). A dropped epoch's head stays in ``head.json`` and the log as an anchor."""
 
     name: str
     first_seq: int
@@ -235,6 +238,7 @@ class Epoch:
     head_hash: str
     received_ms: int
     size: int
+    first_received_ms: int | None = None
 
 
 def archive(held: Held, name: str) -> Epoch | None:
@@ -242,7 +246,8 @@ def archive(held: Held, name: str) -> Epoch | None:
     if held.head_seq is None or held.head_hash is None or held.received_ms is None:
         return None
     first = held.head_seq if held.start_seq is None else held.start_seq
-    return Epoch(name, first, held.head_seq, held.head_hash, held.received_ms, held.size)
+    began = held.files[0].first_received_ms
+    return Epoch(name, first, held.head_seq, held.head_hash, held.received_ms, held.size, began)
 
 
 def plan_restart(

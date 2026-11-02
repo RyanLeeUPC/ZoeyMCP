@@ -1922,7 +1922,8 @@ PAGE_LINES = [
     "  not in the current policy: client",
     "  send 3f9c0000000000aa.1 sent 250 2026-10-19T09:12:05Z",
     "orphan send a1b2000000000000.1 on mail: sent at 2026-10-19T08:01:00Z "
-    "(no_ledger_record: no ledger record holds its call)",
+    "(no_ledger_record: no ledger record holds its call, and the vault's own chain holds no "
+    "accept of it)",
     "orphan send a1b3000000000000.1 on mail: sent at 2026-10-19T07:01:00Z "
     "(older_than_copy: older than the ledger copy: can't be checked)",
     "orphan send a1b4000000000000.1 on mail: sending at 2026-10-19T06:01:00Z "
@@ -1970,6 +1971,115 @@ def test_ledger_vault_says_what_is_wrong(admin: FakeAdmin) -> None:
         "zoeymcp ledger --vault --restart-chain",
         f"archived archive-1767276000000: seq 0-9 (head {HEAD}), last received "
         "2026-01-01 14:00:00Z, 5450 bytes, files dropped",
+    ]
+
+
+def test_ledger_vault_shows_both_chains(admin: FakeAdmin) -> None:
+    """M8 design J.2: a row the vault's own chain joined says the vault held the call, which
+    records the vault wrote, the surface a decision came through, the other chain's records,
+    and where the two chains disagree; the last line says not every record is the gateway's."""
+    held = {
+        **CALL_ROW,
+        "tool": "send_note",
+        "where": "vault",
+        "via": "telegram",
+        "writers": {"asked": "gateway", "decided": "vault", "outcome": "vault"},
+        "others": [
+            {"kind": "decided", "writer": "gateway", "decision": "decline"},
+            {"kind": "outcome", "writer": "gateway", "outcome": "unknown", "detail": "restart"},
+        ],
+        "disagree": True,
+        "not_in_policy": [],
+        "journal": [],
+    }
+    relay = {
+        **held,
+        "ref": "3f9c0000000000ab",
+        "where": "gateway",
+        "decision": "timeout",
+        "via": "none",
+        "outcome": None,
+        "detail": None,
+        "writers": {"asked": "gateway", "decided": "vault"},
+        "others": [
+            {"kind": "decided", "writer": "gateway", "decision": "accept"},
+            {"kind": "outcome", "writer": "vault", "outcome": "unknown", "detail": "relayed"},
+        ],
+        "disagree": False,
+    }
+    page = {**PAGE, "rows": [relay, held], "orphans": [], "next": None, "archives": []}
+    admin.answers[("GET", "/ledger/reported")] = (200, page)
+    code, out, err = cli(["ledger", "--vault", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert out.splitlines() == [
+        f"copy: ok, head seq 12 ({HEAD}), chain from seq 0, head moved 12 s ago",
+        "2026-10-19T09:12:03Z 3f9c0000000000aa agent1 mail/send_note modern accept via telegram "
+        "ok (sent)",
+        "  held by the vault",
+        "  written by the vault: decided, outcome",
+        "  the chains disagree: the vault's decision and the gateway's differ",
+        "  also decided decline, reported by the gateway",
+        "  also outcome unknown (restart), reported by the gateway",
+        "2026-10-19T09:12:03Z 3f9c0000000000ab agent1 mail/send_note modern timeout -",
+        "  written by the vault: decided",
+        "  also decided accept, reported by the gateway",
+        "  also outcome unknown (relayed), written by the vault",
+        "each row is as reported by the gateway, but for what it says the vault wrote",
+    ]
+    # A ledger-level record the vault wrote says so too; one of the gateway's alone doesn't.
+    vault_level = {**LEDGER_ROW, "writer": "vault"}
+    admin.answers[("GET", "/ledger/reported")] = (200, {**page, "rows": [vault_level]})
+    last = cli(["ledger", "--vault", "--socket", "x"])[1].splitlines()[-1]
+    assert last == "each row is as reported by the gateway, but for what it says the vault wrote"
+    admin.answers[("GET", "/ledger/reported")] = (200, {**page, "rows": [LEDGER_ROW]})
+    last = cli(["ledger", "--vault", "--socket", "x"])[1].splitlines()[-1]
+    assert last == "each row is as reported by the gateway"
+    gateway_others = {**held, "writers": {"asked": "gateway"}, "disagree": False}
+    gateway_others["others"] = [held["others"][0]]  # type: ignore[index]
+    admin.answers[("GET", "/ledger/reported")] = (200, {**page, "rows": [gateway_others]})
+    last = cli(["ledger", "--vault", "--socket", "x"])[1].splitlines()[-1]
+    assert last == "each row is as reported by the gateway"
+
+
+def test_ledger_vault_shows_the_calls_only_the_vaults_chain_holds(admin: FakeAdmin) -> None:
+    """M8 design J.2, J.3: after the orphans, oldest first, each call only the vault's own chain
+    holds, with its flag in words (one this CLI doesn't know as it is) and how many older ones
+    weren't sent; a chain that can't be read is said once, after the copy's state."""
+    alone = {
+        **CALL_ROW,
+        "seq": 40,
+        "tool": "send_note",
+        "where": "vault",
+        "via": "telegram",
+        "writers": {"asked": "vault", "decided": "vault"},
+        "others": [],
+        "disagree": False,
+        "not_in_policy": [],
+        "flag": "no_ledger_record",
+    }
+    newer = {**alone, "seq": 41, "ref": "3f9c0000000000ab", "flag": "a_later_flag", "journal": []}
+    page = {**PAGE, "rows": [], "orphans": [], "next": None, "archives": []}
+    page |= {"vault_only": [newer, alone], "vault_only_more": 3, "chain_readable": False}
+    admin.answers[("GET", "/ledger/reported")] = (200, page)
+    code, out, err = cli(["ledger", "--vault", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert out.splitlines() == [
+        f"copy: ok, head seq 12 ({HEAD}), chain from seq 0, head moved 12 s ago",
+        "vault chain: can't be read, so each row is the copy's alone",
+        "2026-10-19T09:12:03Z 3f9c0000000000aa agent1 mail/send_note modern accept via telegram "
+        "ok (sent)",
+        "  only the vault's own chain holds this call (no_ledger_record: the copy has had reports "
+        "since and holds no record of it)",
+        "  held by the vault",
+        "  written by the vault: asked, decided",
+        "  send 3f9c0000000000aa.1 sent 250 2026-10-19T09:12:05Z",
+        "2026-10-19T09:12:03Z 3f9c0000000000ab agent1 mail/send_note modern accept via telegram "
+        "ok (sent)",
+        "  only the vault's own chain holds this call (a_later_flag)",
+        "  held by the vault",
+        "  written by the vault: asked, decided",
+        "3 older call(s) only the vault's own chain holds",
+        "each row is as reported by the gateway, but for what it says the vault wrote",
     ]
 
 

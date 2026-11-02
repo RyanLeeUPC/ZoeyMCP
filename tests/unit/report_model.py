@@ -141,18 +141,22 @@ class CopyModel:
             return
         sizes = {name: sum(len(line) + 1 for line in lines) for name, lines in self.files.items()}
         received = {f.name: f.received_ms for f in self.held.files if f.name in self.files}
+        began = {f.name: f.first_received_ms for f in self.held.files if f.name in self.files}
         current = next(reversed(self.files), None)
         for seq, line in enumerate(accepted.lines, start=accepted.from_seq):
             size = len(line) + 1
             if current is None or (sizes[current] and sizes[current] + size > self.rotate_bytes):
                 current = f"{seq:012d}.jsonl"
                 self.files[current], sizes[current] = [], 0
+                began[current] = now
             self.files[current].append(line)
             sizes[current] += size
             received[current] = now
         self.accepted.extend(accepted.lines)
         start = self.held.start_seq if accepted.start is None else accepted.start[0]
-        live = tuple(LiveFile(name, sizes[name], received[name]) for name in self.files)
+        live = tuple(
+            LiveFile(name, sizes[name], received[name], began[name]) for name in self.files
+        )
         self.held = Held("ok", start, accepted.head.seq, accepted.head.hash, live)
 
     def restart(self, now: int) -> tuple[Epoch, ...]:

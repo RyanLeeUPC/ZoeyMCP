@@ -11,6 +11,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -770,6 +771,25 @@ def test_the_pinned_reported_head_still_loads(tmp_path: Path) -> None:
     assert head.read_bytes() == GOLDEN_REPORTED_HEAD.read_bytes()  # nothing rebuilt
     assert (again.state, again.held, again.refused) == (store.state, store.held, store.refused)
     assert again.archives() == store.archives()
+
+
+def test_a_reported_head_from_before_m8_still_loads(tmp_path: Path) -> None:
+    """M8 design J.3 added ``first_received``; a head written before it loads with none
+    recorded (each read as its last receipt), its sticky state and anchors kept, unrewritten."""
+    store = golden_copy(tmp_path)
+    value = loads_strict(GOLDEN_REPORTED_HEAD.read_bytes())
+    del value["first_received"]
+    old = dumps_canonical(value)
+    head = tmp_path / "ledger-reported" / "head.json"
+    head.write_bytes(old)
+    again = ReportStore.open(tmp_path)
+    assert head.read_bytes() == old  # nothing rebuilt
+    assert (again.state, again.refused) == (store.state, store.refused)
+    assert again.held == replace(
+        store.held, files=tuple(replace(f, first_received_ms=None) for f in store.held.files)
+    )
+    assert again.archives() == store.archives()
+    assert [item.epoch.first_received_ms for item in again.archived] == [None, None]
 
 
 # --- the managed policy's revision, head and anchor (M6 design D.2) -----------------------------

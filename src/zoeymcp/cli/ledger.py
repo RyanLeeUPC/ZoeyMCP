@@ -7,7 +7,9 @@ imports the gateway: the CLI may run in the vault's environment.
 
 ``zoeymcp ledger --vault`` reads the vault's reported copy instead (M5 design J.5): the rows the
 vault's view makes, each with its sends, and the copy's state; :func:`vault_lines` renders them
-and :func:`restart_lines` a chain restart's plan. Their strings are the gateway's: the CLI writes
+(from M8, a row's records the vault's own chain wrote, the other chain's records, where the
+two chains disagree and the calls only the vault's chain holds, M8 design J.2) and
+:func:`restart_lines` a chain restart's plan. Their strings are the gateway's: the CLI writes
 them through ``review.write_lines``, which shows control characters as text.
 """
 
@@ -56,10 +58,9 @@ def lines(records: Iterable[dict[str, Any]], *, since: int | None = None) -> lis
             detail = " ".join(f"{k}={v}" for k, v in sorted(fields.items()))
             out.append(f"{_when(entry['ts'])} ledger {entry['kind']} {detail}".rstrip())
             continue
-        call = entry.records
-        asked = call["asked"]
-        decided = call.get("decided", {}).get("decision", "-")
-        outcome = call.get("outcome")
+        asked = next(iter(entry.records.values()))  # an entry starts with its asked record
+        decided = (entry.get("decided") or {}).get("decision", "-")
+        outcome = entry.get("outcome")
         result = "-" if outcome is None else outcome["outcome"]
         if outcome is not None and outcome.get("detail"):
             result += f" ({outcome['detail']})"
@@ -101,14 +102,22 @@ def write_json(out: TextIO, records: Iterable[dict[str, Any]]) -> None:
 RESTART_HINT = "after deciding why, run: zoeymcp ledger --vault --restart-chain"
 # An orphan send's flag (J.5), in words; one this CLI doesn't know is printed as it is.
 ORPHAN_WORDS = {
-    "no_ledger_record": "no ledger record holds its call",
+    "no_ledger_record": "no ledger record holds its call, and the vault's own chain holds no "
+    "accept of it",
+    "not_yet_reported": "not reported yet",
+    "older_than_copy": "older than the ledger copy: can't be checked",
+}
+# A call only the vault's own chain holds (M8 design J.2, J.3), by the same flags.
+VAULT_ONLY_WORDS = {
+    "no_ledger_record": "the copy has had reports since and holds no record of it",
     "not_yet_reported": "not reported yet",
     "older_than_copy": "older than the ledger copy: can't be checked",
 }
 
 
 def vault_lines(page: dict[str, Any]) -> list[str]:
-    """The copy's state, then a page of rows oldest first, its orphan sends and archives."""
+    """The copy's state, then a page of rows oldest first, its orphan sends, the calls only the
+    vault's own chain holds, oldest first, and archives."""
     state = page["state"]
     if state["head_seq"] is None:
         out = [f"copy: {state['state']}, nothing reported yet"]
@@ -124,6 +133,8 @@ def vault_lines(page: dict[str, Any]) -> list[str]:
     refused = page.get("refused")
     if refused:
         out.append(f"refused: {_refusal(refused)}; {RESTART_HINT}")
+    if page.get("chain_readable") is False:
+        out.append("vault chain: can't be read, so each row is the copy's alone")
     for row in reversed(page["rows"]):
         out.extend(_row_lines(row))
     for orphan in page["orphans"]:
@@ -133,14 +144,33 @@ def vault_lines(page: dict[str, Any]) -> list[str]:
             f"orphan send {orphan['key']} on {orphan['connector']}: {orphan['state']} at "
             f"{orphan['at']} ({words})"
         )
+    alone = page.get("vault_only", [])
+    for row in reversed(alone):
+        flag = row["flag"]
+        words = f"{flag}: {VAULT_ONLY_WORDS[flag]}" if flag in VAULT_ONLY_WORDS else flag
+        first, *rest = _row_lines(row)
+        out.extend([first, f"  only the vault's own chain holds this call ({words})", *rest])
+    if page.get("vault_only_more"):
+        out.append(f"{page['vault_only_more']} older call(s) only the vault's own chain holds")
     for epoch in page.get("archives", []):
         line = f"archived {epoch['name']}: {_epoch(epoch)}"
         out.append(line + (", files dropped" if epoch["dropped"] else ""))
     if page["next"] is not None:
         out.append(f"older rows: zoeymcp ledger --vault --before {page['next']}")
-    if page["rows"]:
+    if any(_vault_wrote(row) for row in [*page["rows"], *alone]):
+        out.append("each row is as reported by the gateway, but for what it says the vault wrote")
+    elif page["rows"]:
         out.append("each row is as reported by the gateway")
     return out
+
+
+def _vault_wrote(row: dict[str, Any]) -> bool:
+    if row["kind"] != "call":
+        return bool(row["writer"] != "gateway")
+    others = row.get("others", [])
+    return any(w != "gateway" for w in row["writers"].values()) or any(
+        other["writer"] != "gateway" for other in others
+    )
 
 
 def _refusal(refused: dict[str, Any]) -> str:
@@ -157,10 +187,27 @@ def _row_lines(row: dict[str, Any]) -> list[str]:
     result = row["outcome"] or "-"
     if row["detail"]:
         result += f" ({row['detail']})"
+    decision = row["decision"] or "-"
+    if row.get("via") not in (None, "none"):
+        decision += f" via {row['via']}"
     out = [
         f"{row['at']} {row['ref']} {row['client']} {row['server']}/{row['tool']} {row['era']} "
-        f"{row['decision'] or '-'} {result}"
+        f"{decision} {result}"
     ]
+    # M8 (J.2): where the vault held it, who wrote what, the other chain's records, a dispute.
+    vault = sorted(kind for kind, writer in row["writers"].items() if writer != "gateway")
+    if row.get("where") == "vault":
+        out.append("  held by the vault")
+    if vault:
+        out.append(f"  written by the vault: {', '.join(vault)}")
+    if row.get("disagree"):
+        out.append("  the chains disagree: the vault's decision and the gateway's differ")
+    for other in row.get("others", []):
+        value = other.get("decision") or other.get("outcome")
+        if other.get("detail"):
+            value += f" ({other['detail']})"
+        by = "reported by the gateway" if other["writer"] == "gateway" else "written by the vault"
+        out.append(f"  also {other['kind']} {value}, {by}")
     if row["not_in_policy"]:
         out.append(f"  not in the current policy: {', '.join(row['not_in_policy'])}")
     for send in row["journal"]:

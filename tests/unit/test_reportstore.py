@@ -120,6 +120,7 @@ def test_a_new_copy_is_empty_and_writes_its_head(tmp_path: Path) -> None:
         "refused": None,
         "files": {},
         "archives": [],
+        "first_received": {},
     }
 
 
@@ -135,12 +136,13 @@ def test_the_first_report_is_kept_as_received(tmp_path: Path, captured: io.Strin
     if os.name != "nt":
         assert stat_mode(copy_dir(tmp_path) / "000000000000.jsonl") == 0o600
     assert store.held == Held(
-        "ok", 0, 2, line_hash(LINES[2]), (LiveFile("000000000000.jsonl", 3 * SIZE, T0),)
+        "ok", 0, 2, line_hash(LINES[2]), (LiveFile("000000000000.jsonl", 3 * SIZE, T0, T0),)
     )
     saved = head_json(tmp_path)
     assert (saved["start_seq"], saved["start_prev"]) == (0, GENESIS)
     assert (saved["head_seq"], saved["head_hash"]) == (2, line_hash(LINES[2]))
     assert saved["files"] == {"000000000000.jsonl": T0}
+    assert saved["first_received"] == {"000000000000.jsonl": T0}  # M8 design J.3
     [line] = events(captured, "ledger_report_accepted")
     assert line["from_seq"] == 0
     assert (line["head_seq"], line["head_hash"], line["pruned"]) == (2, line_hash(LINES[2]), 0)
@@ -392,12 +394,12 @@ def test_a_restart_archives_the_chain_and_starts_again(
     plan = store.plan_restart()
     clock.now += 10
     assert store.plan_restart() == plan
-    live_epoch = Epoch("", 0, 3, line_hash(LINES[3]), T0, 4 * SIZE)
+    live_epoch = Epoch("", 0, 3, line_hash(LINES[3]), T0, 4 * SIZE, T0)
     assert (plan.state, plan.archive, plan.drop) == ("fork", live_epoch, ())
     assert plan.to_json()["archive"]["name"] is None
     done = store.restart(plan)
     name = f"archive-{T0 + 10:013d}"
-    assert done.archive == Epoch(name, 0, 3, line_hash(LINES[3]), T0, 4 * SIZE)
+    assert done.archive == Epoch(name, 0, 3, line_hash(LINES[3]), T0, 4 * SIZE, T0)
     assert live(tmp_path) == {}
     assert sorted(p.name for p in (copy_dir(tmp_path) / name).iterdir()) == [
         "000000000000.jsonl",
@@ -417,6 +419,7 @@ def test_a_restart_archives_the_chain_and_starts_again(
             "dropped": False,
         }
     ]
+    assert saved["first_received"] == {name: T0}
     [line] = events(captured, "ledger_reported_restarted")
     assert line["lifted"] == "fork"
     assert line["archived"] == {
@@ -547,32 +550,67 @@ def refs(*ticks: int) -> frozenset[str]:
 
 
 def test_the_kept_archives_coverage(tmp_path: Path) -> None:
-    """J.5's orphan check: every kept archived epoch's refs and earliest record, read from its
-    files; a dropped epoch's anchor holds neither, and one dropped meanwhile is left out."""
+    """J.5's orphan check: every kept archived epoch's refs and its span, read from its files;
+    M8 design J.3: the span is on the vault's clock, from when the epoch was last received,
+    unless it holds the gateway's first record (then it spans everything), and a dropped epoch's
+    anchor, one dropped meanwhile too, gives only when it was last received."""
     clock = Clock()
     store = forked(tmp_path, clock, rotate_bytes=2 * SIZE, archive_max_bytes=5 * SIZE)
     assert store.archived_coverage() == Coverage()  # nothing archived yet
     first = store.restart()
     assert first.archive is not None
-    assert store.archived_coverage() == Coverage(refs(1, 2, 3, 4), T0 + 1)
+    assert store.archived_coverage() == Coverage(refs(1, 2, 3, 4), 0, T0)  # from genesis
+    clock.now = T0 + 50
     store.report(body(LINES[2:4]))  # the new chain, on trust: not an archive
-    assert store.archived_coverage() == Coverage(refs(1, 2, 3, 4), T0 + 1)
+    assert store.archived_coverage() == Coverage(refs(1, 2, 3, 4), 0, T0)
     store.report(body(OTHER[3:4]))
     clock.now += 1
     second = store.restart()
     assert second.archive is not None
     assert [epoch.name for epoch in second.drop] == [first.archive.name]
-    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 3)  # the first is dropped
+    # The first is dropped; the second, taken partway through, spans from its receipt.
+    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 50, T0 + 50, T0)
     # A line that doesn't parse is left out, as the archive's page leaves it.
     target = copy_dir(tmp_path) / second.archive.name
     [path] = sorted(target.iterdir())
     path.write_bytes(b"not a record\n" + path.read_bytes())
-    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 3)
-    # Gone since the list was read (a restart dropping it meanwhile): left out.
+    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 50, T0 + 50, T0)
+    # Gone since the list was read (a restart dropping it meanwhile): an anchor now.
     path.unlink()
     target.rmdir()
-    assert store.archived_coverage() == Coverage()
-    assert opened(tmp_path).archived_coverage() == Coverage()  # recovery marks it dropped
+    assert store.archived_coverage() == Coverage(deleted_ms=T0 + 50)
+    assert opened(tmp_path).archived_coverage() == Coverage(deleted_ms=T0 + 50)
+
+
+def test_each_file_keeps_when_its_first_line_came(tmp_path: Path) -> None:
+    """M8 design J.3: a live file's first receipt is set when its first line arrives and kept
+    (through ``head.json`` too) while its last receipt moves; an archived epoch keeps its earliest
+    file's, and its span starts there, not at its last receipt."""
+    clock = Clock()
+    store = opened(tmp_path, clock, rotate_bytes=2 * SIZE)
+    store.report(body(LINES[:1]))
+    clock.now = T0 + 10
+    store.report(body(LINES[1:3]))  # fills the first file and starts the second
+    assert [(f.name, f.received_ms, f.first_received_ms) for f in store.held.files] == [
+        ("000000000000.jsonl", T0 + 10, T0),
+        ("000000000002.jsonl", T0 + 10, T0 + 10),
+    ]
+    assert opened(tmp_path, clock).held == store.held
+    # A chain taken partway through, received over two reports, then archived.
+    clock = Clock()
+    other = tmp_path / "other"
+    store = forked(other, clock, archive_max_bytes=5 * SIZE)
+    store.restart()
+    clock.now = T0 + 50
+    store.report(body(LINES[2:3]))  # the new chain, on trust
+    clock.now = T0 + 60
+    store.report(body(LINES[3:4]))
+    store.report(body(OTHER[3:4]))
+    done = store.restart()
+    assert done.archive is not None
+    assert (done.archive.first_received_ms, done.archive.received_ms) == (T0 + 50, T0 + 60)
+    assert store.archived_coverage() == Coverage(refs(3, 4), T0 + 50, T0 + 60, T0)
+    assert opened(other).archived == store.archived
 
 
 def test_an_unreadable_copy_has_no_coverage(tmp_path: Path) -> None:

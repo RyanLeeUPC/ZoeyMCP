@@ -168,6 +168,7 @@ from .secretplan import NOT_WRITTEN as NOT_WRITTEN
 from .secretplan import SecretRefusal
 from .statusreport import GatewayStatus
 from .store import SecretStore
+from .vaultledger import VaultLedger
 
 MAX_BODY = 128 * 1024
 MAX_COMPLETE_BODY = 8 * 1024
@@ -612,6 +613,7 @@ class AdminApp:
         connectors: SmtpConnectors | None = None,
         env_names: Callable[[], Collection[str]] | None = None,
         reports: ReportStore | None = None,
+        chain: VaultLedger | None = None,
         passkeys: Passkeys | None = None,
         portal: PortalSessions | None = None,
         onboard: OnboardService | None = None,
@@ -633,6 +635,9 @@ class AdminApp:
 
         ``reports`` is the reported copy of the gateway's ledger, for ``/ledger/reported`` and
         health. Without it, those routes answer 503 and health has no ``ledger_copy``.
+        ``chain`` is the vault's own chain, which ``/ledger/reported`` joins with the copy by
+        ref, as the portal's Ledger page does (M8 design J.2, J.3); without it each row is the
+        copy's alone.
 
         ``passkeys`` is the portal's passkey file, shared with the portal. Without it,
         ``/passkeys`` answers 503 and health has no ``passkeys``.
@@ -676,6 +681,7 @@ class AdminApp:
         self._portal = portal
         self._passkeys = passkeys
         self._reports = reports
+        self._chain = chain
         self._connectors = connectors
         self._keys = keys
         self._gateway_keys = gateway_keys
@@ -1132,8 +1138,11 @@ class AdminApp:
     # --- the reported ledger (M5 design J.4, J.5) -----------------------------------------------
 
     async def _ledger_reported(self, request: Request) -> Response:
-        """A page of the copy, newest first: ``?before=SEQ&limit=N`` (1 to 200). The first
-        page's orphans are judged against the live chain and every kept archived epoch."""
+        """A page of the copy, newest first: ``?before=SEQ&limit=N`` (1 to 200), each call
+        joined by ref with the vault's own chain (M8 design J.2). The first page's orphans are
+        judged against the live chain, every kept archived epoch and the vault chain's accepts
+        (J.3), and it lists the calls only the vault's chain holds. ``chain_readable`` is false
+        when that chain can't be read: the rows are then the copy's alone."""
         copy = self._reports
         if copy is None:
             return _reason(503, "the vault keeps no reported copy", "unavailable")
@@ -1152,25 +1161,35 @@ class AdminApp:
         def read() -> tuple[list[dict[str, Any]], ledgerview.Coverage | None]:
             return copy.records(), None if before is not None else copy.archived_coverage()
 
+        def read_chain() -> list[dict[str, Any]] | None:
+            try:
+                return [] if self._chain is None else self._chain.records()
+            except OSError:
+                return None  # the copy's rows are still worth showing
+
         try:
             records, archived = await asyncio.to_thread(read)
         except (CopyUnavailable, OSError):
             view = ledgerview.state(copy.held, now=copy.clock())
             view["state"] = "unavailable"
             answer: dict[str, Any] = {"state": view, "rows": [], "orphans": [], "next": None}
+            answer |= {"vault_only": [], "vault_only_more": 0, "chain_readable": True}
             answer |= {"refused": None, "archives": []}
             return JSONResponse(answer)
+        chain = await asyncio.to_thread(read_chain)
         page = ledgerview.page(
             records,
             held=copy.held,
             journals=journals,
             now=copy.clock(),
+            chain=() if chain is None else chain,
             before=before,
             limit=ledgerview.MAX_LIMIT if limit is None else limit,
             broken_at=copy.broken_at,
             archived=archived,
         )
-        return JSONResponse({**page, "refused": copy.refused, "archives": copy.archives()})
+        answer = {**page, "chain_readable": chain is not None, "refused": copy.refused}
+        return JSONResponse({**answer, "archives": copy.archives()})
 
     def _journals(self, policy: Policy) -> dict[str, list[dict[str, Any]]]:
         """Each connector's journal records; one that can't be read is left out."""

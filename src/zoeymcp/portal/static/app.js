@@ -751,6 +751,7 @@
       older = { archive: page.archive === null ? undefined : page.archive, before: page.next };
       renderLines($("ledger-rows"), page.rows);
       renderLines($("ledger-orphans"), page.orphans);
+      renderLines($("ledger-vault-only"), page.vault_only);
       renderLines($("ledger-archives"), page.archives,
         (epoch) => epoch.dropped ? "" : button("Show its rows", () => showLedger(epoch.name)));
     });

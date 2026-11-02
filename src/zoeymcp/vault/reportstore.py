@@ -8,9 +8,12 @@ module keeps what :func:`.reports.decide` accepts, in ``/state/ledger-reported/`
   4 MiB.
 - **``head.json``**, through ``write_atomic`` after the lines: ``{"v": 1, "state", "start_seq",
   "start_prev", "head_seq", "head_hash", "refused", "files": {name: last received ms},
-  "archives": [...]}``. The lines are the truth and ``head.json`` a cache, except for what only
-  it holds: the sticky state, when the vault received each file, and the archived epochs (a
-  dropped one stays listed as an anchor, ``dropped: true``).
+  "archives": [...], "first_received": {name: first received ms}}``. The lines are the truth and
+  ``head.json`` a cache, except for what only it holds: the sticky state, when the vault received
+  each file's last line and its first (by name, each live file's and each archived epoch's
+  earliest, for the orphan check's span, M8 design J.3; a ``head.json`` written before M8 has no
+  ``first_received`` and reads as none recorded), and the archived epochs (a dropped one stays
+  listed as an anchor, ``dropped: true``).
 - **Archives** ``archive-<ms>/``: the live files a restart set aside, still readable.
 - **Torn tails** ``torn-<ms>.bin``: a last line that recovery cut.
 
@@ -152,6 +155,7 @@ class _Saved:
     refused: dict[str, Any] | None
     files: dict[str, int]
     archives: tuple[Archived, ...]
+    first_received: dict[str, int]
 
 
 class ReportStore:
@@ -249,8 +253,14 @@ class ReportStore:
             if verified.broken_at is not None:
                 logs.event("ledger_reported_broken", seq=verified.broken_at, level="critical")
         received = {} if saved is None else saved.files
+        began = {} if saved is None else saved.first_received
         live = tuple(
-            LiveFile(path.name, path.stat().st_size, received.get(path.name, _mtime_ms(path)))
+            LiveFile(
+                path.name,
+                path.stat().st_size,
+                received.get(path.name, _mtime_ms(path)),
+                began.get(path.name),
+            )
             for path in found
         )
         state: State = "ok" if saved is None else saved.state
@@ -381,6 +391,7 @@ class ReportStore:
         kept = [file for file in self.held.files if file.name not in accepted.prune]
         sizes = {file.name: file.size for file in kept}
         received = {file.name: file.received_ms for file in kept}
+        began = {file.name: file.first_received_ms for file in kept}
         current = kept[-1].name if kept else None
         batches: dict[str, list[bytes]] = {}
         for seq, line in enumerate(accepted.lines, start=accepted.from_seq):
@@ -388,6 +399,7 @@ class ReportStore:
             if current is None or (sizes[current] and sizes[current] + size > self.rotate_bytes):
                 current = f"{seq:012d}.jsonl"
                 sizes[current] = 0
+                began[current] = now  # its first line arrives now (M8 design J.3)
             batches.setdefault(current, []).append(line + b"\n")
             sizes[current] += size
             received[current] = now
@@ -401,7 +413,9 @@ class ReportStore:
             self.start_prev = accepted.start[1]
         else:
             start_seq = self.held.start_seq
-        live = tuple(LiveFile(name, sizes[name], received[name]) for name in sorted(sizes))
+        live = tuple(
+            LiveFile(name, sizes[name], received[name], began[name]) for name in sorted(sizes)
+        )
         head = accepted.head
         self.held = Held("ok", start_seq, head.seq, head.hash, live)
         self._write_head()
@@ -509,24 +523,35 @@ class ReportStore:
         return [json.loads(record.line) for record in self._epoch_records(name)]
 
     def archived_coverage(self) -> ledgerview.Coverage:
-        """What every kept archived epoch holds, for the view's orphan check (J.5): the refs of
-        its records and the earliest record's ``ts``. Read-only and a record at a time, so it
-        costs at most the archives' bound. An epoch a restart drops meanwhile is left out; any
-        other ``OSError`` is raised, since an orphan judged without it could be a false one."""
+        """What every kept archived epoch holds, for the view's orphan check (J.5; M8 design
+        J.3): the refs of its records and its span on the vault's clock, from when the vault
+        received its earliest file's first line (its last receipt when that wasn't recorded),
+        and when the vault last received a line of a dropped one. Read-only and a record at a
+        time, so it costs at most the archives' bound. An epoch a restart drops meanwhile is an
+        anchor like a dropped one; any other ``OSError`` is raised, since an orphan judged
+        without it could be a false one."""
         if not self.available:
             raise CopyUnavailable
         covered = ledgerview.Coverage()
         for item in list(self.archived):
+            received = item.epoch.received_ms
+            began = item.epoch.first_received_ms
             if item.dropped:
+                covered |= ledgerview.Coverage(deleted_ms=received)
                 continue
             held = (
-                {"ref": record.ref, "ts": record.ts}
+                {"ref": record.ref, "prev": record.prev}
                 for record in self._epoch_records(item.epoch.name)
             )
             try:
-                covered |= ledgerview.coverage(held)
+                covered |= ledgerview.coverage(
+                    held,
+                    received_ms=received,
+                    first_received_ms=received if began is None else began,
+                )
             except FileNotFoundError:
-                continue  # dropped by a restart since the list was read
+                # Dropped by a restart since the list was read: an anchor now.
+                covered |= ledgerview.Coverage(deleted_ms=received)
         return covered
 
     def _epoch_records(self, name: str) -> Iterator[Record]:
@@ -554,6 +579,7 @@ class ReportStore:
             self.refused,
             {file.name: file.received_ms for file in self.held.files},
             tuple(self.archived),
+            self._first_received(),
         )
 
     def head_json(self) -> dict[str, Any]:
@@ -568,7 +594,15 @@ class ReportStore:
             "refused": self.refused,
             "files": {file.name: file.received_ms for file in held.files},
             "archives": self.archives(),
+            "first_received": self._first_received(),
         }
+
+    def _first_received(self) -> dict[str, int]:
+        """When the vault received each live file's first line, and each archived epoch's
+        earliest file's, by name, where that was recorded (M8 design J.3)."""
+        found = {file.name: file.first_received_ms for file in self.held.files}
+        found |= {item.epoch.name: item.epoch.first_received_ms for item in self.archived}
+        return {name: ms for name, ms in found.items() if ms is not None}
 
     def _write_head(self) -> None:
         data = canonical.dumps_canonical(self.head_json())
@@ -617,9 +651,11 @@ def _hash(value: Any) -> bool:
 
 
 def _parse_head(value: Any) -> _Saved | None:
-    """``head.json`` as written, or None for anything else (it is then rebuilt)."""
+    """``head.json`` as written, or None for anything else (it is then rebuilt). One written
+    before M8 has no ``first_received``: it parses, with none recorded."""
     keys = {"v", "state", "start_seq", "start_prev", "head_seq", "head_hash", "refused"}
-    if not isinstance(value, dict) or set(value) != keys | {"files", "archives"}:
+    keys |= {"files", "archives"}
+    if not isinstance(value, dict) or set(value) - {"first_received"} != keys:
         return None
     if value["v"] != HEAD_VERSION or value["state"] not in STATES:
         return None
@@ -637,9 +673,19 @@ def _parse_head(value: Any) -> _Saved | None:
         _FILE.fullmatch(name) and _count(ms) for name, ms in received.items()
     ):
         return None
+    began = value.get("first_received", {})
+    if not isinstance(began, dict) or not all(
+        (_FILE.fullmatch(name) or _ARCHIVE.fullmatch(name)) and _count(ms)
+        for name, ms in began.items()
+    ):
+        return None
     archives = _parse_archives(value["archives"])
     if archives is None:
         return None
+    archives = tuple(
+        replace(item, epoch=replace(item.epoch, first_received_ms=began.get(item.epoch.name)))
+        for item in archives
+    )
     return _Saved(
         cast(State, value["state"]),
         value["start_seq"],
@@ -649,6 +695,7 @@ def _parse_head(value: Any) -> _Saved | None:
         refused,
         received,
         archives,
+        began,
     )
 
 

@@ -370,8 +370,10 @@ class World:
             env_names=lambda: self.vault.env_names,
         )
         # The portal, sharing the socket's store, token manager, policy and logins (M5 G), and
-        # reading a copy of the gateway's ledger whose records carry keyed digests (M5 J.5).
+        # reading a copy of the gateway's ledger whose records carry keyed digests (M5 J.5),
+        # joined with the vault's own chain, whose records carry its own (M8 design J.2).
         self.copy = ReportStore.open(tmp_path)
+        self.chain = VaultLedger.open_at(tmp_path, KEYS.chain_key)
         (tmp_path / "portal").mkdir(mode=0o700)
         self.portal_app = PortalApp(
             [ORIGIN],
@@ -386,7 +388,7 @@ class World:
                 login,
                 env_names=lambda: self.vault.env_names,
             ).report,
-            ledger=Ledger(self.copy, self.vault.connectors),
+            ledger=Ledger(self.copy, self.vault.connectors, self.chain),
         )
         self.passkey = KeptAuthenticator()
         self.page: Kept | None = None
@@ -770,17 +772,43 @@ async def test_nothing_secret_leaves_the_vault(
         response = await page.client.get(path, headers={"Host": "localhost:8081"})
         world.portal_answers.append(response.text + repr(response.headers.multi_items()))
     # The policy and the ledger pages (M5 L, J.5): the reported records' keyed digests and pins
-    # stay in the gateway's ledger (Q12).
+    # stay in the gateway's ledger (Q12), and the vault chain's, joined in by ref, in the vault's
+    # (M8 design J.2): neither its digests, nor the values they are of, reach a row.
     reported, prev = [], GENESIS
     for n in range(3):
         reported.append(asked_line(n, prev, n + 1))
         prev = line_hash(reported[-1])
     world.copy.report({"v": 1, "lines": [line.decode() for line in reported]})
+    chain = world.chain
+    held_ref = f"{2:016x}"
+    vault_asked = {
+        "client": "agent1",
+        "server": "agent1",
+        "tool": "agent1",
+        "where": "vault",
+        "era": "modern",
+        "args": chain.digest({"item": CHAIN_ARGUMENT}),
+        "pin": PIN,
+        "text": chain.text_digest(CHAIN_TEXT),
+        "chars": len(CHAIN_TEXT),
+        "writes": 1,
+        "expires": 1,
+    }
+    await chain.write("asked", held_ref, critical=True, **vault_asked)
+    accept = {"decision": "accept", "waited_ms": 1, "via": "telegram"}
+    await chain.write("decided", held_ref, critical=True, **accept)
+    # And a call only the vault's chain holds, listed on its own.
+    alone_ref = f"{9:016x}"
+    await chain.write("asked", alone_ref, critical=True, **vault_asked)
+    await chain.write("decided", alone_ref, critical=True, **accept)
     assert (await page.call("GET", "/api/policy")).is_success
     ledger = await page.call("GET", "/api/ledger")
     assert [row["seq"] for row in ledger.json()["rows"]] == [2, 1, 0]
+    joined = ledger.json()["rows"][1]
+    assert (joined["ref"], joined["decision"], joined["via"]) == (held_ref, "accept", "telegram")
+    assert [row["ref"] for row in ledger.json()["vault_only"]] == [alone_ref]
     for text in world.portal_answers:
-        for digest in (DIGEST, PIN, "hmac-sha256:"):
+        for digest in (DIGEST, PIN, "hmac-sha256:", CHAIN_ARGUMENT, CHAIN_TEXT):
             assert digest not in text
     assert (await world.cli(["health"]))[1]
     assert (await world.cli(["health", "--json"]))[1]

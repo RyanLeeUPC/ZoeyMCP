@@ -58,8 +58,9 @@ one.
 
 The policy and the ledger (L, J.5): ``GET /api/policy`` shows the running policy, read-only,
 built from an allowlist of its fields (``portal/policyview.py``). ``GET /api/ledger`` pages the
-vault's copy of the gateway's ledger, or an archived epoch of it, with each call's sends from the
-connectors' journals and the sends no call explains; no keyed digest or pin is in it. While the
+vault's copy of the gateway's ledger, or an archived epoch of it, each call joined by ref with the
+vault's own chain (M8 design J.2) and with its sends from the connectors' journals, and the sends
+no call explains; no keyed digest or pin is in it. While the
 copy refuses every report, each page has its banner, and ``ledger.restart``, planned with every
 epoch it deletes, restarts the chain once the operator has decided why.
 
@@ -314,6 +315,7 @@ if TYPE_CHECKING:
     from ..vault.onboard import OnboardService
     from ..vault.reportstore import ReportStore
     from ..vault.store import EntryMeta, SecretStore
+    from ..vault.vaultledger import VaultLedger
     from .passkeys import Passkeys
 
 BODY_DEADLINE: Final = 10.0  # seconds to receive a body, once the app starts reading it
@@ -445,18 +447,37 @@ LEDGER_BANNERS: Final[Mapping[str, str]] = MappingProxyType(
         + _LEDGER_RESTART,
     }
 )
-# An orphan send's flag (J.5, D-25), in words.
+# An orphan send's flag (J.5, D-25; M8 design J.3), in words.
 ORPHAN_FLAGS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "no_ledger_record": "no ledger record: the copy has had reports since this send began, "
-        "and none holds its call (a caller other than the gateway, or a gateway that didn't "
-        "record it)",
+        "no_ledger_record": "no ledger record: the copy has had reports since this send began "
+        "and holds no record of its call, and the vault's own chain holds no accept of it (a "
+        "gateway that didn't record it, a record that was lost, or a call the vault didn't "
+        "approve)",
         "not_yet_reported": "not reported yet: no report has reached the copy since this send "
         "began",
         "older_than_copy": "older than the ledger copy: can't be checked, since the send began "
-        "before the earliest record the copy still holds (older files pruned, or an archived "
-        "chain deleted at a restart)",
+        "before the vault received the earliest records the copy still holds (older files "
+        "pruned, a chain taken partway through, or an archived chain deleted at a restart)",
     }
+)
+# A call only the vault's own chain holds (M8 design J.2, J.3), by the flag an orphan would
+# have, in words.
+VAULT_ONLY_FLAGS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "no_ledger_record": "Only the vault's own chain holds this call: the copy has had reports "
+        "since the vault asked it, and holds no record of it (a gateway that didn't record it, "
+        "or a record that was lost).",
+        "not_yet_reported": "Only the vault's own chain holds this call: no report has reached "
+        "the copy since the vault asked it.",
+        "older_than_copy": "Only the vault's own chain holds this call: the vault asked it before "
+        "it received the earliest records the copy still holds.",
+    }
+)
+# What the Ledger page says when the vault's own chain can't be read (M8 design J.2).
+CHAIN_UNREADABLE: Final = (
+    "The vault's own chain can't be read: each row is the copy's alone, and a send the vault "
+    "approved may show as an orphan."
 )
 # The ledger page's query (J.5): each at most once, all optional.
 LEDGER_QUERY: Final = frozenset({"archive", "before", "limit"})
@@ -608,11 +629,13 @@ class Secrets:
 @dataclass(frozen=True)
 class Ledger:
     """What the Ledger page reads (J.5): the vault's copy of the gateway's ledger, the one the
-    report path writes and ``zoeymcp ledger --vault`` reads, and the SMTP connectors whose send
-    journals it joins by ref (D-25; without them it shows no sends)."""
+    report path writes and ``zoeymcp ledger --vault`` reads, the SMTP connectors whose send
+    journals it joins by ref (D-25; without them it shows no sends), and the vault's own chain,
+    joined by ref too (M8 design J.2; without it each row is the copy's alone)."""
 
     copy: ReportStore
     connectors: SmtpConnectors | None = None
+    chain: VaultLedger | None = None
 
 
 @dataclass(frozen=True)
@@ -1917,11 +1940,14 @@ class PortalApp:
 
     async def _ledger_page(self, call: Call) -> Reply | Refusal:
         """J.5: a page of the vault's copy, newest first, ``?before=SEQ&limit=N``; with
-        ``archive=NAME``, an archived epoch's (J.4). Each call is one row joined with its sends,
-        and the sends whose call the copy doesn't hold are orphans (D-25), on the live chain's
-        first page, judged against the live chain and every kept archived epoch, which that page
-        reads too. No keyed digest or pin is in a row (Q12), and every string from the gateway
-        or a journal is shown (K.1). A copy that can't be read is a page that says so."""
+        ``archive=NAME``, an archived epoch's (J.4). Each call is one row joined with the vault's
+        own chain's records of it (M8 design J.2) and with its sends, and the sends whose call
+        neither the copy holds nor the vault's chain accepted are orphans (D-25, J.3), on the
+        live chain's first page, judged against the live chain and every kept archived epoch,
+        which that page reads too, as are the calls only the vault's chain holds. No keyed
+        digest or pin is in a row (Q12), and every string from the gateway or a journal is
+        shown (K.1). A copy that can't be read is a page that says so; a chain that can't be
+        read leaves the copy's rows, and the page says that."""
         query = _ledger_query(call.query)
         if isinstance(query, Refusal):
             return query
@@ -1936,12 +1962,19 @@ class PortalApp:
             first = archive is None and before is None  # the page with the orphans
             return records, copy.archived_coverage() if first else None
 
+        def read_chain() -> list[dict[str, Any]] | None:
+            try:
+                return [] if ledger.chain is None else ledger.chain.records()
+            except OSError:
+                return None  # the copy's rows are still worth showing
+
         try:
             records, archived = await asyncio.to_thread(read)
         except KeyError:
             return refusal("not_found")  # not an archive the copy lists, or one dropped
         except (CopyUnavailable, OSError):
             records = None
+        chain = None if records is None else await asyncio.to_thread(read_chain)
         now = copy.clock()
         if records is None:
             state = ledgerview.state(copy.held, now=now)
@@ -1949,6 +1982,8 @@ class PortalApp:
                 "state": {**state, "state": "unavailable"},
                 "rows": [],
                 "orphans": [],
+                "vault_only": [],
+                "vault_only_more": 0,
                 "next": None,
             }
         else:
@@ -1957,6 +1992,7 @@ class PortalApp:
                 held=copy.held,
                 journals=journals,
                 now=now,
+                chain=() if chain is None else chain,
                 before=before,
                 limit=ledgerview.MAX_LIMIT if limit is None else limit,
                 known=ledgerview.known(policy),
@@ -1964,8 +2000,12 @@ class PortalApp:
                 archived=archived,
             )
             if archive is not None:
-                page["orphans"] = []  # orphans are on the live chain's first page only
-        return Reply(_ledger_view(page, copy.refused, copy.archives(), archive))
+                # Orphans and calls only the vault's chain holds: the live chain's first page.
+                page |= {"orphans": [], "vault_only": [], "vault_only_more": 0}
+        view = _ledger_view(page, copy.refused, copy.archives(), archive)
+        if records is not None and chain is None:
+            view["state_shown"] += " " + CHAIN_UNREADABLE
+        return Reply(view)
 
     def _plan_restart(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
         """``ledger.restart`` (J.4, Q3): the copy refuses every report (a fork, a gap, or full),
@@ -3296,10 +3336,15 @@ def _ledger_view(
     archives: Sequence[Mapping[str, Any]],
     archive: str | None,
 ) -> dict[str, Any]:
-    """``ledgerview.page``'s answer fit to show (K.1): each row and orphan with its text and
-    every name from the gateway or a journal shown, the copy's state in words, whether it can
-    be restarted, and the archived epochs, each a dropped one's anchor."""
+    """``ledgerview.page``'s answer fit to show (K.1): each row, orphan and call only the
+    vault's chain holds with its text and every name from the gateway or a journal shown (and
+    how many more of those calls there are, as a last item), the copy's state in words, whether
+    it can be restarted, and the archived epochs, each a dropped one's anchor."""
     state = page["state"]
+    alone = [_vault_only_view(row) for row in page["vault_only"]]
+    if page["vault_only_more"]:
+        more = f"{page['vault_only_more']} older call(s) only the vault's own chain holds."
+        alone.append({"text_shown": more, "lines_shown": []})
     return {
         "state": state,
         "state_shown": _state_words(state, refused),
@@ -3307,6 +3352,7 @@ def _ledger_view(
         "archive": archive,
         "rows": [_row_view(row) for row in page["rows"]],
         "orphans": [_orphan_view(orphan) for orphan in page["orphans"]],
+        "vault_only": alone,
         "next": page["next"],
         "archives": [_archive_view(epoch) for epoch in archives],
     }
@@ -3358,11 +3404,25 @@ def _writers(writers: Mapping[str, str]) -> str:
     """Who wrote a row's records (J.6): the gateway reported them, unless M8's vault wrote one."""
     if set(writers.values()) == {"gateway"}:
         return "reported by the gateway"
-    return ", ".join(
-        f"{kind} "
-        + ("reported by the gateway" if writer == "gateway" else f"written by the {writer}")
-        for kind, writer in writers.items()
-    )
+    return ", ".join(f"{kind} {_by(writer)}" for kind, writer in writers.items())
+
+
+def _by(writer: str) -> str:
+    return "reported by the gateway" if writer == "gateway" else f"written by the {writer}"
+
+
+def _decision(decision: str, via: str | None) -> str:
+    """A decision, with the surface it came through when a human decided (M8 design J.1)."""
+    return decision if via in (None, "none") else f"{decision} via {via}"
+
+
+def _other_words(record: Mapping[str, Any]) -> str:
+    """A record of a call its row doesn't show (M8 design J.2): the other chain's."""
+    if record["kind"] == "decided":
+        value = record["decision"]
+    else:
+        value = record["outcome"] + (f" ({record['detail']})" if record["detail"] else "")
+    return f"Also {record['kind']} {value}, {_by(record['writer'])}."
 
 
 def _row_view(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -3383,13 +3443,19 @@ def _row_view(row: Mapping[str, Any]) -> dict[str, Any]:
     writes = f"{row['writes']} write(s) asked"
     if row["writes_sent"] is not None:
         writes += f", {row['writes_sent']} sent, {row['writes_unknown']} unknown"
+    era = row["era"] + (", held by the vault" if row["where"] == "vault" else "")
+    decision = "none yet" if row["decision"] is None else _decision(row["decision"], row["via"])
+    # A call only the vault's chain holds has that chain's seq (M8 design J.2).
+    seq = ("" if row["writers"]["asked"] == "gateway" else "vault chain ") + f"seq {row['seq']}"
     text = (
-        f"{row['at']} call {row['ref']} (seq {row['seq']}): {names['client_shown']} asked for "
-        f"{names['server_shown']}/{names['tool_shown']} ({row['era']}); decision "
-        f"{row['decision'] or 'none yet'}; outcome {result}; {writes}; "
-        f"{_writers(row['writers'])}."
+        f"{row['at']} call {row['ref']} ({seq}): {names['client_shown']} asked for "
+        f"{names['server_shown']}/{names['tool_shown']} ({era}); decision {decision}; outcome "
+        f"{result}; {writes}; {_writers(row['writers'])}."
     )
     lines = []
+    if row["disagree"]:
+        lines.append("The chains disagree: the vault's decision and the gateway's differ.")
+    lines.extend(_other_words(record) for record in row["others"])
     if row["not_in_policy"]:
         missing = ", ".join(f"{key} {names[key + '_shown']}" for key in row["not_in_policy"])
         lines.append(f"Not in the current policy: {missing}.")
@@ -3401,6 +3467,12 @@ def _row_view(row: Mapping[str, Any]) -> dict[str, Any]:
         journal.append({**{k: v for k, v in send.items() if k != "key"}, "key_shown": key})
     view = {key: value for key, value in row.items() if key not in (*ledgerview.NAMED, "journal")}
     return {**view, **names, "journal": journal, "text_shown": text, "lines_shown": lines}
+
+
+def _vault_only_view(row: Mapping[str, Any]) -> dict[str, Any]:
+    """A call only the vault's own chain holds (M8 design J.2, J.3), flagged."""
+    view = _row_view(row)
+    return {**view, "lines_shown": [VAULT_ONLY_FLAGS[row["flag"]], *view["lines_shown"]]}
 
 
 def _orphan_view(orphan: Mapping[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,8 @@
-"""The approval ledger's records joined by ref (M5 design J.5, J.6)."""
+"""The approval ledger's records joined by ref (M5 design J.5, J.6; M8 design J.2).
+
+From M8 a call's records are keyed by kind and writer: the vault's chain's records of a call join
+the gateway's entry for it, whichever comes first, and one writer behaves as before (F-53).
+"""
 
 from __future__ import annotations
 
@@ -28,16 +32,19 @@ def asked(
     client: str = "agent1",
     tool: str = "send_note",
     era: str = "legacy",
+    writer: str = "gateway",
+    where: str = "gateway",
 ) -> dict[str, Any]:
     return record(
         seq,
         ts,
         ref,
         "asked",
+        writer=writer,
         client=client,
         server="mail",
         tool=tool,
-        where="gateway",
+        where=where,
         era=era,
         args="hmac-sha256:" + "1" * 64,
         pin="sha256:" + "2" * 64,
@@ -48,14 +55,16 @@ def asked(
     )
 
 
-def outcome(seq: int, ts: int, ref: str, result: str, detail: str | None) -> dict[str, Any]:
+def outcome(
+    seq: int, ts: int, ref: str, result: str, detail: str | None, *, writer: str = "gateway"
+) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "outcome": result,
         "detail": detail,
         "writes_sent": 0,
         "writes_unknown": 0,
     }
-    return record(seq, ts, ref, "outcome", **fields)
+    return record(seq, ts, ref, "outcome", writer=writer, **fields)
 
 
 # Every shape the join and its renderers meet: ledger-level records at either end, a call with an
@@ -90,10 +99,19 @@ RECORDS = [
 def shape(entries: list[Call | Any]) -> list[Any]:
     """Each entry as (ref, [(kind, seq), ...]) for a call, or the seq of a ledger-level record."""
     return [
-        (e.ref, [(kind, r["seq"]) for kind, r in e.records.items()])
+        (e.ref, [(kind, r["seq"]) for (kind, _), r in e.records.items()])
         if isinstance(e, Call)
         else e["seq"]
         for e in entries
+    ]
+
+
+def writers(entries: list[Call | Any]) -> list[Any]:
+    """Each call as (ref, [(kind, writer, seq), ...])."""
+    return [
+        (e.ref, [(kind, writer, r["seq"]) for (kind, writer), r in e.records.items()])
+        for e in entries
+        if isinstance(e, Call)
     ]
 
 
@@ -111,15 +129,16 @@ def test_one_entry_per_ref_in_asked_order() -> None:
     assert entries[-1] is RECORDS[-1]
     first = entries[1]
     assert isinstance(first, Call)
-    assert first.records["outcome"] is RECORDS[4]
+    assert first.records[("outcome", "gateway")] is RECORDS[4]
 
 
 def test_each_record_keeps_its_writer() -> None:
     call = join(RECORDS)[4]
     assert isinstance(call, Call)
-    assert call.records["asked"]["writer"] == "gateway"
-    assert call.records["decided"]["writer"] == "vault"
-    assert call.records["decided"]["decision"] == "accept"
+    assert list(call.records) == [("asked", "gateway"), ("decided", "vault")]
+    assert call.records[("asked", "gateway")]["writer"] == "gateway"
+    assert call.records[("decided", "vault")]["writer"] == "vault"
+    assert call.records[("decided", "vault")]["decision"] == "accept"
 
 
 def test_no_records() -> None:
@@ -195,3 +214,150 @@ def test_a_call_is_frozen() -> None:
     call = Call(REF_A, {})
     with pytest.raises(dataclasses.FrozenInstanceError):
         call.ref = REF_B  # type: ignore[misc]
+
+
+# --- two writers (M8 design J.2) -----------------------------------------------------------------
+
+
+def decided(seq: int, ref: str, decision: str, *, writer: str = "gateway") -> dict[str, Any]:
+    via = {"via": "telegram"} if writer == "vault" else {}
+    return record(
+        seq, T + seq, ref, "decided", writer=writer, decision=decision, waited_ms=1, **via
+    )
+
+
+# A held call, as the copy (seq from 0) and the vault's chain (seq from 40) record it: both ask,
+# the vault decides and sends, the gateway records its own approved_elsewhere and outcome.
+GATEWAY = [
+    asked(0, T, REF_A, where="vault"),
+    decided(1, REF_A, "approved_elsewhere"),
+    outcome(2, T + 2, REF_A, "ok", None),
+]
+VAULT = [
+    asked(40, T + 1, REF_A, writer="vault", where="vault"),
+    decided(41, REF_A, "accept", writer="vault"),
+    outcome(42, T + 3, REF_A, "ok", None, writer="vault"),
+]
+
+
+def test_the_other_writers_asked_joins_the_entry() -> None:
+    """F-53's fix: the vault's ``asked`` for a ref the gateway asked is the same call, so one
+    entry holds both writers' records, each under its own writer."""
+    assert writers(join([*GATEWAY, *VAULT])) == [
+        (
+            REF_A,
+            [
+                ("asked", "gateway", 0),
+                ("decided", "gateway", 1),
+                ("outcome", "gateway", 2),
+                ("asked", "vault", 40),
+                ("decided", "vault", 41),
+                ("outcome", "vault", 42),
+            ],
+        )
+    ]
+
+
+@pytest.mark.parametrize("vault_first", [True, False])
+def test_the_two_chains_join_in_either_order(vault_first: bool) -> None:
+    """Chains join by ref, not by order: the vault's records first make the same entry, which
+    starts with the vault's ``asked``, and neither writer's records replace the other's."""
+    first, second = (VAULT, GATEWAY) if vault_first else (GATEWAY, VAULT)
+    [call] = join([*first, *second])
+    assert isinstance(call, Call)
+    assert next(iter(call.records)) == ("asked", "vault" if vault_first else "gateway")
+    assert {key: r["seq"] for key, r in call.records.items()} == {
+        ("asked", "gateway"): 0,
+        ("decided", "gateway"): 1,
+        ("outcome", "gateway"): 2,
+        ("asked", "vault"): 40,
+        ("decided", "vault"): 41,
+        ("outcome", "vault"): 42,
+    }
+
+
+def test_interleaved_chains_join() -> None:
+    records = [GATEWAY[0], VAULT[0], VAULT[1], GATEWAY[1], VAULT[2], GATEWAY[2]]
+    assert writers(join(records)) == [
+        (
+            REF_A,
+            [
+                ("asked", "gateway", 0),
+                ("asked", "vault", 40),
+                ("decided", "vault", 41),
+                ("decided", "gateway", 1),
+                ("outcome", "vault", 42),
+                ("outcome", "gateway", 2),
+            ],
+        )
+    ]
+
+
+def test_a_later_record_replaces_only_its_own_writers() -> None:
+    entries = join(
+        [
+            asked(0, T, REF_A),
+            decided(1, REF_A, "pending"),
+            asked(40, T, REF_A, writer="vault"),
+            decided(41, REF_A, "accept", writer="vault"),
+            decided(2, REF_A, "approved_elsewhere"),
+        ]
+    )
+    assert writers(entries) == [
+        (
+            REF_A,
+            [
+                ("asked", "gateway", 0),
+                ("decided", "gateway", 2),
+                ("asked", "vault", 40),
+                ("decided", "vault", 41),
+            ],
+        )
+    ]
+
+
+def test_one_writers_second_asked_still_starts_a_new_entry() -> None:
+    """One writer behaves as before: its second ``asked`` for a ref starts a new entry, dropping
+    the first entry's records of both writers; the other writer's records after it join it."""
+    entries = join(
+        [
+            asked(0, T, REF_A),
+            asked(40, T, REF_A, writer="vault"),
+            decided(41, REF_A, "accept", writer="vault"),
+            asked(1, T + 1, REF_A, client="agent2"),
+            asked(42, T + 1, REF_A, writer="vault"),
+        ]
+    )
+    latest = (REF_A, [("asked", "gateway", 1), ("asked", "vault", 42)])
+    assert writers(entries) == [latest, latest]
+    vault_twice = join([asked(40, T, REF_A, writer="vault"), asked(41, T, REF_A, writer="vault")])
+    assert writers(vault_twice) == [(REF_A, [("asked", "vault", 41)])] * 2
+
+
+def test_a_record_with_no_writer_is_dropped() -> None:
+    nameless = {**decided(1, REF_A, "accept"), "writer": None}
+    numbered = {**asked(2, T, REF_B), "writer": 3}
+    assert shape(join([asked(0, T, REF_A), nameless, numbered])) == [(REF_A, [("asked", 0)])]
+
+
+def test_the_other_writers_asked_joins_whatever_its_time() -> None:
+    """``since`` is read on the asked record that starts an entry: the vault's clock isn't the
+    gateway's, so the other chain's ``asked`` joins a kept entry whatever its ``ts``."""
+    entries = join([asked(0, T + 5, REF_A), asked(40, T, REF_A, writer="vault")], since=T + 5)
+    assert writers(entries) == [(REF_A, [("asked", "gateway", 0), ("asked", "vault", 40)])]
+
+
+def test_get_picks_by_writer() -> None:
+    [call] = join([*VAULT, *GATEWAY])
+    assert isinstance(call, Call)
+    assert call.get("decided", "vault", "gateway") is VAULT[1]
+    assert call.get("decided", "gateway", "vault") is GATEWAY[1]
+    assert call.get("outcome", "gateway") is GATEWAY[2]
+    assert call.get("decided") is VAULT[1]  # no writer named: the first written
+    assert call.get("asked") is VAULT[0]
+    [alone] = join(GATEWAY[:1])
+    assert isinstance(alone, Call)
+    assert alone.get("decided") is None
+    assert alone.get("decided", "vault") is None
+    assert alone.get("asked", "vault", "gateway") is GATEWAY[0]
+    assert alone.get("asked", "vault") is None

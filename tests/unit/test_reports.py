@@ -6,6 +6,7 @@ reports, resends, prunes, restores, lost volumes, time and restarts.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -391,6 +392,9 @@ def test_held() -> None:
 def test_the_live_chain_as_an_epoch() -> None:
     held = Held("full", 3, 9, HASHES[1], files((10, 7), (20, 30)))
     assert archive(held, "archive-1") == Epoch("archive-1", 3, 9, HASHES[1], 30, 30)
+    # M8 design J.3: when the vault received the earliest file's first line, if recorded.
+    began = (LiveFile("f0", 10, 7, 2), LiveFile("f1", 20, 30, 8))
+    assert archive(replace(held, files=began), "a") == Epoch("a", 3, 9, HASHES[1], 30, 30, 2)
     assert archive(Held(), "archive-1") is None
     # A copy that holds no head, or no files, has nothing to archive.
     assert (

@@ -1,9 +1,13 @@
-"""The ledger view: rows, pages, flags and the journal join (M5 design J.5, J.6).
+"""The ledger view: rows, pages, flags and the journal join (M5 design J.5, J.6; M8 J.2, J.3).
 
 The records are ``test_ledgerjoin``'s, which ``zoeymcp ledger`` is pinned against too: a vault
-written ``accept`` is among them, and a ``pending`` decision is shown its own. An orphan is judged
-against the live chain and the kept archived epochs (their :class:`Coverage`), each flag at its
-boundaries.
+written ``accept`` is among them, and a ``pending`` decision is shown its own. The vault's own
+chain joins the copy's calls by ref (FM-42): one row per call, the right record of each kind
+shown, the other chain's in ``others``, and a disagreement flagged; a call only the vault's
+chain holds is listed in ``vault_only``. An orphan is judged against the live chain, the kept
+archived epochs (their :class:`Coverage`) and the vault chain's accepted refs, each flag at its
+boundaries, on the vault's clock (J.3), the span starting when the vault received the earliest
+kept file's first line.
 """
 
 from __future__ import annotations
@@ -13,7 +17,18 @@ from typing import Any
 
 import pytest
 
-from tests.unit.test_ledgerjoin import RECORDS, REF_A, REF_B, REF_C, REF_D, REF_E, T, asked, record
+from tests.unit.test_ledgerjoin import (
+    RECORDS,
+    REF_A,
+    REF_B,
+    REF_C,
+    REF_D,
+    REF_E,
+    T,
+    asked,
+    outcome,
+    record,
+)
 from zoeymcp.common.policy.schema import Policy
 from zoeymcp.vault.ledgerview import (
     MAX_LIMIT,
@@ -26,6 +41,7 @@ from zoeymcp.vault.ledgerview import (
     page,
     sends,
     state,
+    verdict,
     when,
 )
 from zoeymcp.vault.reports import Held, LiveFile
@@ -33,6 +49,8 @@ from zoeymcp.vault.reports import Held, LiveFile
 HASH = "sha256:" + "f" * 64
 NOW = T + 2 * 86_400_000
 HELD = Held("ok", 0, 11, HASH, (LiveFile("000000000000.jsonl", 900, NOW - 12_345),))
+RECEIVED = NOW - 12_345  # when the vault received HELD's file
+LATER = "sha256:" + "a" * 64  # a prev that isn't the genesis hash: a chain taken partway through
 
 
 def sending(ts: int, key: str) -> dict[str, Any]:
@@ -123,7 +141,9 @@ def test_a_finished_call() -> None:
         "server": "mail",
         "tool": "send_note",
         "era": "legacy",
+        "where": "gateway",
         "decision": "accept",
+        "via": None,
         "waited_ms": 8123,
         "outcome": "ok",
         "detail": "sent",
@@ -131,6 +151,8 @@ def test_a_finished_call() -> None:
         "writes_sent": 0,
         "writes_unknown": 0,
         "writers": {"asked": "gateway", "decided": "gateway", "outcome": "gateway"},
+        "others": [],
+        "disagree": False,
         "not_in_policy": [],
         "journal": [],
     }
@@ -150,6 +172,7 @@ def test_a_decision_the_vault_wrote_says_so() -> None:
     row = view()["rows"][1]
     assert (row["ref"], row["decision"], row["waited_ms"]) == (REF_D, "accept", 0)
     assert row["writers"] == {"asked": "gateway", "decided": "vault"}
+    assert (row["via"], row["others"], row["disagree"]) == ("telegram", [], False)
 
 
 def test_a_pending_decision_renders() -> None:
@@ -175,7 +198,6 @@ def test_no_keyed_digest_or_pin_is_shown() -> None:
     for hidden in ("hmac-sha256", "sha256:2", '"args"', '"text"', '"pin"', "message_id", "<a@b>"):
         assert hidden not in text
     assert '"chars"' not in text
-    assert '"where"' not in text
     assert '"expires"' not in text
 
 
@@ -319,7 +341,7 @@ def test_orphans() -> None:
         Send("mail", "3333333333333333.1", "unknown", None, received + 1, received + 1),
         Send("mail", f"{REF_A}.1", "sent", 250, received - 9, received - 9),
     ]
-    assert orphans(found, Coverage(frozenset({REF_A})), received) == [
+    assert orphans(found, Coverage(frozenset({REF_A}), received_ms=received)) == [
         {
             "connector": "mail",
             "key": "3333333333333333.1",
@@ -342,7 +364,7 @@ def test_orphans() -> None:
             "flag": "no_ledger_record",  # the copy received a report after it began
         },
     ]
-    assert [o["flag"] for o in orphans(found, Coverage(), None)] == ["not_yet_reported"] * 4
+    assert [o["flag"] for o in orphans(found, Coverage())] == ["not_yet_reported"] * 4
 
 
 def test_a_send_older_than_the_copy_cant_be_checked() -> None:
@@ -357,8 +379,8 @@ def test_a_send_older_than_the_copy_cant_be_checked() -> None:
         Send("mail", "3333333333333333.1", "failed", 554, first - 99, first - 98),
         Send("mail", f"{REF_A}.1", "sent", 250, first - 50, first - 49),  # its call is held
     ]
-    covered = Coverage(frozenset({REF_A}), first)
-    assert orphans(found, covered, received) == [
+    covered = Coverage(frozenset({REF_A}), first, received)
+    assert orphans(found, covered) == [
         {
             "connector": "mail",
             "key": "1111111111111111.1",
@@ -382,63 +404,163 @@ def test_a_send_older_than_the_copy_cant_be_checked() -> None:
         },
     ]
     # Not reported since: not_yet_reported, however old.
-    flags = [o["flag"] for o in orphans(found, covered, first - 1)]
+    flags = [o["flag"] for o in orphans(found, Coverage(covered.refs, first, first - 1))]
     assert flags == ["not_yet_reported", "not_yet_reported", "older_than_copy"]
-    assert [o["flag"] for o in orphans(found, covered, None)] == ["not_yet_reported"] * 3
+    unreported = Coverage(covered.refs, first)
+    assert [o["flag"] for o in orphans(found, unreported)] == ["not_yet_reported"] * 3
     # A copy that holds no record has no span to be older than.
-    assert [o["flag"] for o in orphans(found, Coverage(), received)] == ["no_ledger_record"] * 4
+    nothing = Coverage(received_ms=received)
+    assert [o["flag"] for o in orphans(found, nothing)] == ["no_ledger_record"] * 4
 
 
-def test_coverage_is_the_refs_and_the_earliest_record() -> None:
-    assert Coverage() == Coverage(frozenset(), None)
+def taken(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``records`` as a chain the copy took partway through: its first doesn't follow genesis."""
+    return [{**records[0], "prev": LATER}, *records[1:]]
+
+
+def test_coverage_is_the_refs_and_a_span_on_the_vaults_clock() -> None:
+    """J.3 (C-9): the span starts on the vault's clock, never at a record's ``ts``: at 0 for a
+    chain held from the gateway's first record (nothing came before it), else when the vault
+    received the earliest file holding it; ``received_ms`` is when it last received any."""
+    assert Coverage() == Coverage(frozenset(), None, None, None)
     assert coverage([]) == Coverage()
-    records = [
-        record(0, T + 5, None, "repaired", torn_bytes=1),
-        asked(1, T + 2, REF_A),
-        asked(2, T + 9, REF_B),
-        record(3, T + 3, REF_A, "decided", decision="accept", waited_ms=1),
-    ]
-    assert coverage(records) == Coverage(frozenset({REF_A, REF_B}), T + 2)
-    assert coverage(records[:1]) == Coverage(frozenset(), T + 5)  # a ledger-level record only
-    assert coverage(RECORDS) == Coverage(frozenset({REF_A, REF_B, REF_C, REF_D, REF_E}), T - 60_000)
+    assert coverage([], received_ms=5, first_received_ms=3) == Coverage()
+    records = taken(
+        [
+            record(0, T + 5, None, "repaired", torn_bytes=1),
+            asked(1, T + 2, REF_A),
+            asked(2, T + 9, REF_B),
+            record(3, T + 3, REF_A, "decided", decision="accept", waited_ms=1),
+        ]
+    )
+    both = frozenset({REF_A, REF_B})
+    assert coverage(records, received_ms=NOW, first_received_ms=NOW - 50) == Coverage(
+        both, NOW - 50, NOW
+    )
+    assert coverage(records) == Coverage(both)  # no receipt times: no span
+    only = coverage(records[:1], received_ms=NOW, first_received_ms=NOW - 50)
+    assert only == Coverage(frozenset(), NOW - 50, NOW)  # a ledger-level record only
+    # The records' own times move nothing: a gateway's clock can't push the span.
+    shifted = [{**r, "ts": r["ts"] + 10**12} for r in records]
+    assert coverage(shifted, received_ms=NOW, first_received_ms=NOW - 50).first_ms == NOW - 50
+    # Held from the gateway's first record: the span is everything, whenever the file came.
+    held = coverage(RECORDS, received_ms=NOW, first_received_ms=NOW - 50)
+    assert held == Coverage(frozenset({REF_A, REF_B, REF_C, REF_D, REF_E}), 0, NOW)
+    # Only the first record's prev counts.
+    assert coverage([*records, *RECORDS], first_received_ms=7).first_ms == 7
+    assert coverage([*RECORDS, *records], first_received_ms=7).first_ms == 0
 
 
 @pytest.mark.parametrize(
     ("left", "right", "both"),
     [
         (Coverage(), Coverage(), Coverage()),
-        (Coverage(frozenset("a"), 5), Coverage(), Coverage(frozenset("a"), 5)),
-        (Coverage(), Coverage(frozenset("b"), 3), Coverage(frozenset("b"), 3)),
-        (Coverage(frozenset("a"), 5), Coverage(frozenset("b"), 3), Coverage(frozenset("ab"), 3)),
-        (Coverage(frozenset("a"), 3), Coverage(frozenset("ab"), 5), Coverage(frozenset("ab"), 3)),
+        (Coverage(frozenset("a"), 5, 9, 2), Coverage(), Coverage(frozenset("a"), 5, 9, 2)),
+        (Coverage(), Coverage(frozenset("b"), 3, 4, 1), Coverage(frozenset("b"), 3, 4, 1)),
+        (
+            Coverage(frozenset("a"), 5, 9, 1),
+            Coverage(frozenset("b"), 3, 4, 2),
+            Coverage(frozenset("ab"), 3, 9, 2),
+        ),
+        (
+            Coverage(frozenset("a"), 3, 4, 2),
+            Coverage(frozenset("ab"), 5, 9, 1),
+            Coverage(frozenset("ab"), 3, 9, 2),
+        ),
+        (Coverage(first_ms=0), Coverage(first_ms=5), Coverage(first_ms=0)),
+        (Coverage(received_ms=0), Coverage(received_ms=5), Coverage(received_ms=5)),
+        (Coverage(deleted_ms=0), Coverage(deleted_ms=5), Coverage(deleted_ms=5)),
     ],
 )
 def test_coverages_join(left: Coverage, right: Coverage, both: Coverage) -> None:
+    """The refs together, the earliest span, the latest receipt, the latest deleted epoch."""
     assert left | right == both
     assert right | left == both
 
 
+@pytest.mark.parametrize(
+    ("first", "deleted", "start"),
+    [
+        (None, None, None),
+        (None, 0, 0),
+        (5, None, 5),
+        (0, None, 0),
+        (None, 5, 5),
+        (0, 5, 5),
+        (3, 5, 5),
+        (5, 3, 5),
+        (5, 5, 5),
+    ],
+)
+def test_the_span_never_starts_before_a_deleted_epoch(
+    first: int | None, deleted: int | None, start: int | None
+) -> None:
+    assert Coverage(first_ms=first, deleted_ms=deleted).start_ms == start
+
+
+def test_nothing_before_a_deleted_epoch_can_be_checked() -> None:
+    """A restart that deleted an archived epoch: a send begun before the vault last received a
+    line of it can't be checked, even beside a chain held from the gateway's first record (the
+    gateway's ledger may have started again)."""
+    found = [
+        Send("mail", "1111111111111111.1", "sent", 250, RECEIVED - 101, RECEIVED - 99),
+        Send("mail", "2222222222222222.1", "sent", 250, RECEIVED - 100, RECEIVED - 98),
+    ]
+    covered = Coverage(frozenset(), 0, RECEIVED, deleted_ms=RECEIVED - 100)
+    assert [(o["key"], o["flag"]) for o in orphans(found, covered)] == [
+        ("2222222222222222.1", "no_ledger_record"),
+        ("1111111111111111.1", "older_than_copy"),
+    ]
+
+
 def test_the_archives_are_part_of_the_copy() -> None:
     """A send whose call only an archived epoch holds isn't an orphan; the span starts at the
-    earliest record of the live chain and the archives together."""
+    earliest of the live chain's and the archives' (each on the vault's clock)."""
     archived, older, inside = "a" * 16, "b" * 16, "c" * 16
     journals = {
         "mail": [
-            sending(T - 90_000, f"{archived}.1"),
-            sending(T - 70_001, f"{older}.1"),
-            sending(T - 70_000, f"{inside}.1"),
+            sending(RECEIVED - 90_000, f"{archived}.1"),
+            sending(RECEIVED - 70_001, f"{older}.1"),
+            sending(RECEIVED - 70_000, f"{inside}.1"),
         ]
     }
-    flags = {o["key"]: o["flag"] for o in view(journals=journals)["orphans"]}
-    assert flags == {f"{key}.1": "older_than_copy" for key in (archived, older, inside)}
-    held = Coverage(frozenset({archived}), T - 70_000)
-    flags = {o["key"]: o["flag"] for o in view(journals=journals, archived=held)["orphans"]}
-    assert flags == {f"{older}.1": "older_than_copy", f"{inside}.1": "no_ledger_record"}
-    # The live chain's earliest record starts the span when it is the earlier one.
-    later = Coverage(frozenset({archived}), T)
-    flags = {o["key"]: o["flag"] for o in view(journals=journals, archived=later)["orphans"]}
-    assert flags == {f"{older}.1": "older_than_copy", f"{inside}.1": "older_than_copy"}
-    assert view(journals=journals, archived=held, before=8)["orphans"] == []
+    live = taken(RECORDS)  # its span starts when the vault received its file: after all three
+
+    def flags(**kwargs: Any) -> dict[str, str]:
+        result = page(live, held=HELD, journals=journals, now=NOW, **kwargs)
+        return {o["key"]: o["flag"] for o in result["orphans"]}
+
+    assert flags() == {f"{key}.1": "older_than_copy" for key in (archived, older, inside)}
+    held = Coverage(frozenset({archived}), RECEIVED - 70_000, RECEIVED - 60_000)
+    assert flags(archived=held) == {
+        f"{older}.1": "older_than_copy",
+        f"{inside}.1": "no_ledger_record",
+    }
+    # The live chain's span starts the copy's when it is the earlier one.
+    later = Coverage(frozenset({archived}), RECEIVED + 5, RECEIVED + 5)
+    assert flags(archived=later) == {
+        f"{older}.1": "older_than_copy",
+        f"{inside}.1": "older_than_copy",
+    }
+    # A live chain held from the gateway's first record: every send can be checked.
+    result = page(RECORDS, held=HELD, journals=journals, now=NOW)
+    assert {o["flag"] for o in result["orphans"]} == {"no_ledger_record"}
+    assert flags(archived=held, before=8) == {}
+
+
+def test_a_report_into_an_archived_epoch_counts() -> None:
+    """``not_yet_reported`` reads every chain the copy holds (D-165): right after a restart, with
+    nothing in the new live chain, a send begun before the archived epoch's last report is judged
+    against it."""
+    journals = {"mail": [sending(RECEIVED - 1, "1111111111111111.1"), sending(RECEIVED, "x.1")]}
+    archived = Coverage(frozenset(), 0, RECEIVED)
+    result = page([], held=Held(), journals=journals, now=NOW, archived=archived)
+    assert [(o["key"], o["flag"]) for o in result["orphans"]] == [
+        ("x.1", "not_yet_reported"),
+        ("1111111111111111.1", "no_ledger_record"),
+    ]
+    alone = page([], held=Held(), journals=journals, now=NOW)
+    assert {o["flag"] for o in alone["orphans"]} == {"not_yet_reported"}
 
 
 def test_any_record_of_a_ref_holds_it() -> None:
@@ -458,3 +580,321 @@ def test_orphans_are_on_the_first_page() -> None:
     assert len(view(journals=journals, limit=1)["orphans"]) == 1
     assert view(journals=journals, before=8)["orphans"] == []
     assert view(journals=journals)["orphans"][0]["flag"] == "no_ledger_record"
+
+
+# --- the vault's own chain (M8 design J.2, J.3; FM-42) -------------------------------------------
+
+
+def decided(seq: int, ref: str, decision: str, *, writer: str = "gateway", via: str = "") -> Any:
+    fields: dict[str, Any] = {"decision": decision, "waited_ms": 5}
+    if writer == "vault":
+        fields["via"] = via or "telegram"
+    return record(seq, T + seq, ref, "decided", writer=writer, **fields)
+
+
+HELD_REF, RELAY_REF, DISPUTED, VAULT_ONLY = "1" * 16, "2" * 16, "3" * 16, "4" * 16
+# A call the vault held, a relay, and a call the two chains disagree on, as the copy holds them.
+COPY = [
+    asked(0, T, HELD_REF, where="vault"),
+    asked(1, T + 1, RELAY_REF),
+    asked(2, T + 2, DISPUTED, where="vault"),
+    decided(3, HELD_REF, "approved_elsewhere"),
+    outcome(4, T + 4, HELD_REF, "ok", None),
+    decided(5, RELAY_REF, "accept"),
+    outcome(6, T + 6, RELAY_REF, "ok", "sent"),
+    decided(7, DISPUTED, "decline"),
+]
+# The vault's chain, numbered on its own: it asked each before its surfaces, decided, and closed.
+CHAIN = [
+    record(0, T, None, "recovered", abandoned=0, not_sent=0, unknown=0, writer="vault"),
+    asked(1, T + 1, HELD_REF, writer="vault", where="vault"),
+    decided(2, HELD_REF, "accept", writer="vault"),
+    outcome(3, T + 3, HELD_REF, "ok", None, writer="vault"),
+    asked(4, T + 4, RELAY_REF, writer="vault"),
+    decided(5, RELAY_REF, "accept", writer="vault", via="portal"),
+    outcome(6, T + 6, RELAY_REF, "unknown", "relayed", writer="vault"),
+    asked(7, T + 7, DISPUTED, writer="vault", where="vault"),
+    decided(8, DISPUTED, "accept", writer="vault"),
+    outcome(9, T + 9, DISPUTED, "ok", None, writer="vault"),
+    asked(10, T + 10, VAULT_ONLY, writer="vault", where="vault"),
+    decided(11, VAULT_ONLY, "accept", writer="vault"),
+]
+
+
+def joined(**kwargs: Any) -> dict[str, Any]:
+    return page(
+        COPY, held=HELD, journals=kwargs.pop("journals", {}), now=NOW, chain=CHAIN, **kwargs
+    )
+
+
+def test_a_held_call_and_a_relay_join_across_both_chains() -> None:
+    """FM-42: one row per call, by ref: the vault's decision (with its surface), the vault's
+    outcome for the call it held and the gateway's for the relay, who wrote each, and the other
+    chain's records beside them. The chain's own ledger-level records aren't rows, and a call
+    only the vault's chain holds isn't a row (the rows page by the copy's seqs): it is in
+    ``vault_only``, with the vault chain's seq and records, flagged by when the vault asked it."""
+    result = joined()
+    rows = result["rows"]
+    assert [row["ref"] for row in rows] == [DISPUTED, RELAY_REF, HELD_REF]
+    [alone] = result["vault_only"]
+    assert {key: alone[key] for key in ("ref", "seq", "where", "decision", "via", "flag")} == {
+        "ref": VAULT_ONLY,
+        "seq": 10,
+        "where": "vault",
+        "decision": "accept",
+        "via": "telegram",
+        "flag": "no_ledger_record",  # the copy, held from genesis, has had reports since
+    }
+    assert alone["writers"] == {"asked": "vault", "decided": "vault"}
+    assert (alone["others"], alone["disagree"], result["vault_only_more"]) == ([], False, 0)
+    assert (joined(before=8)["vault_only"], joined(before=8)["vault_only_more"]) == ([], 0)
+    held = rows[2]
+    assert {key: held[key] for key in ("seq", "where", "decision", "via", "waited_ms")} == {
+        "seq": 0,
+        "where": "vault",
+        "decision": "accept",
+        "via": "telegram",
+        "waited_ms": 5,
+    }
+    assert (held["outcome"], held["detail"], held["disagree"]) == ("ok", None, False)
+    assert held["writers"] == {"asked": "gateway", "decided": "vault", "outcome": "vault"}
+    assert held["others"] == [
+        {"kind": "decided", "writer": "gateway", "decision": "approved_elsewhere"},
+        {"kind": "outcome", "writer": "gateway", "outcome": "ok", "detail": None},
+    ]
+    relay = rows[1]
+    assert (relay["seq"], relay["where"], relay["decision"], relay["via"]) == (
+        1,
+        "gateway",
+        "accept",
+        "portal",
+    )
+    assert (relay["outcome"], relay["detail"], relay["disagree"]) == ("ok", "sent", False)
+    assert relay["writers"] == {"asked": "gateway", "decided": "vault", "outcome": "gateway"}
+    assert relay["others"] == [
+        {"kind": "decided", "writer": "gateway", "decision": "accept"},
+        {"kind": "outcome", "writer": "vault", "outcome": "unknown", "detail": "relayed"},
+    ]
+
+
+def test_the_chains_disagree_and_both_are_shown() -> None:
+    """J.2: an accept in the vault and a decline at the gateway flag the row; both are in it."""
+    row = joined()["rows"][0]
+    assert (row["ref"], row["disagree"], row["decision"], row["via"]) == (
+        DISPUTED,
+        True,
+        "accept",
+        "telegram",
+    )
+    assert row["others"] == [{"kind": "decided", "writer": "gateway", "decision": "decline"}]
+    assert row["outcome"] == "ok"  # the vault's: it held the call and sent it
+
+
+def test_without_the_vault_chain_the_rows_are_the_copys() -> None:
+    rows = page(COPY, held=HELD, journals={}, now=NOW)["rows"]
+    held = rows[2]
+    assert (held["decision"], held["via"], held["outcome"]) == ("approved_elsewhere", None, "ok")
+    assert held["writers"] == {"asked": "gateway", "decided": "gateway", "outcome": "gateway"}
+    assert (held["where"], held["others"], held["disagree"]) == ("vault", [], False)
+
+
+def test_the_vaults_outcome_alone_is_shown() -> None:
+    """A held call the gateway hasn't closed yet shows the vault's outcome; a relay the gateway
+    hasn't closed shows the vault's ``unknown, relayed`` until it does."""
+    records = [asked(0, T, HELD_REF, where="vault"), asked(1, T, RELAY_REF)]
+    chain = [CHAIN[3], CHAIN[6]]
+    rows = page(records, held=HELD, journals={}, now=NOW, chain=chain)["rows"]
+    assert [(row["ref"], row["outcome"], row["detail"]) for row in rows] == [
+        (RELAY_REF, "unknown", "relayed"),
+        (HELD_REF, "ok", None),
+    ]
+    assert [row["writers"] for row in rows] == [{"asked": "gateway", "outcome": "vault"}] * 2
+
+
+def test_the_vaults_asked_decides_where_the_call_was_held() -> None:
+    records = [asked(0, T, HELD_REF)]
+    chain = [asked(1, T, HELD_REF, writer="vault", where="vault")]
+    [row] = page(records, held=HELD, journals={}, now=NOW, chain=chain)["rows"]
+    assert row["where"] == "vault"
+    assert row["writers"] == {"asked": "gateway"}
+
+
+@pytest.mark.parametrize(
+    ("vault", "gateway", "disagree"),
+    [
+        ("accept", "approved_elsewhere", False),
+        ("accept", "pending", False),
+        ("accept", "accept", False),
+        ("accept", "decline", True),
+        ("accept", "withdrawn", True),
+        ("accept", "timeout", True),
+        ("accept", "stream_lost", True),
+        ("accept", "error", False),
+        ("accept", "unavailable", False),
+        ("accept", "abandoned", False),  # the gateway's restart: it never heard the decision
+        ("decline", "approved_elsewhere", True),
+        ("timeout", "accept", True),
+        ("abandoned", "approved_elsewhere", True),  # the vault's own: it never forwarded
+        ("decline", "decline", False),
+        ("timeout", "withdrawn", False),
+        ("withdrawn", "error", False),
+        ("accept", None, False),
+        (None, "decline", False),
+    ],
+)
+def test_which_decisions_disagree(vault: str | None, gateway: str | None, disagree: bool) -> None:
+    records = [asked(0, T, HELD_REF, where="vault")]
+    chain = [asked(1, T, HELD_REF, writer="vault", where="vault")]
+    if gateway is not None:
+        records.append(decided(2, HELD_REF, gateway))
+    if vault is not None:
+        chain.append(decided(3, HELD_REF, vault, writer="vault"))
+    [row] = page(records, held=HELD, journals={}, now=NOW, chain=chain)["rows"]
+    assert row["disagree"] is disagree
+
+
+@pytest.mark.parametrize(
+    ("decision", "writer", "says"),
+    [
+        (None, "vault", None),
+        ("accept", "vault", True),
+        ("approved_elsewhere", "gateway", True),
+        ("pending", "gateway", None),
+        ("error", "vault", None),
+        ("unavailable", "gateway", None),
+        ("abandoned", "gateway", None),
+        ("abandoned", "vault", False),
+        ("decline", "gateway", False),
+        ("dismiss", "gateway", False),
+        ("shutdown", "vault", False),
+    ],
+)
+def test_a_decisions_verdict(decision: str | None, writer: str, says: bool | None) -> None:
+    assert verdict(decision, writer) is says
+
+
+def test_a_send_the_vault_accepted_is_no_orphan() -> None:
+    """J.3: a send whose ref the vault's chain holds as ``decided accept`` isn't an orphan,
+    whatever the copy says; one it declined, or only asked, still is."""
+    declined, waiting = "5" * 16, "6" * 16
+    chain = [
+        *CHAIN,
+        asked(12, T, declined, writer="vault", where="vault"),
+        decided(13, declined, "decline", writer="vault"),
+        asked(14, T, waiting, writer="vault", where="vault"),
+    ]
+    journals = {
+        "mail": [
+            sending(RECEIVED - 3, f"{VAULT_ONLY}.1"),
+            sending(RECEIVED - 2, f"{declined}.1"),
+            sending(RECEIVED - 1, f"{waiting}.1"),
+        ]
+    }
+    result = page(COPY, held=HELD, journals=journals, now=NOW, chain=chain)
+    assert [(o["key"], o["flag"]) for o in result["orphans"]] == [
+        (f"{waiting}.1", "no_ledger_record"),
+        (f"{declined}.1", "no_ledger_record"),
+    ]
+    # Each call is still shown: only the vault's chain holds them (F1 of step 8b's review).
+    assert [
+        (row["ref"], row["decision"], [send["key"] for send in row["journal"]])
+        for row in result["vault_only"]
+    ] == [
+        (waiting, None, [f"{waiting}.1"]),
+        (declined, "decline", [f"{declined}.1"]),
+        (VAULT_ONLY, "accept", [f"{VAULT_ONLY}.1"]),
+    ]
+    alone = page(COPY, held=HELD, journals=journals, now=NOW)
+    assert len(alone["orphans"]) == 3
+    assert alone["vault_only"] == []
+
+
+def test_a_call_only_the_vault_holds_is_flagged_by_when_it_was_asked() -> None:
+    """Against a copy taken partway through, whose earliest file the vault began receiving at
+    ``first``: asked before it, ``older_than_copy``; from it until the copy's last report,
+    ``no_ledger_record``; after that, ``not_yet_reported``. A ref an archived epoch holds, or
+    one the copy holds by any record, isn't the vault's alone."""
+    first = RECEIVED - 1_000
+    held = Held("ok", 0, 11, HASH, (LiveFile("000000000000.jsonl", 900, RECEIVED, first),))
+    asks = {"7" * 16: first - 1, "8" * 16: first, "9" * 16: RECEIVED - 1, "a" * 16: RECEIVED}
+    chain = [
+        asked(seq, ts, ref, writer="vault", where="vault")
+        for seq, (ref, ts) in enumerate(asks.items())
+    ]
+    chain.append(asked(9, RECEIVED, REF_A, writer="vault", where="vault"))  # the copy holds it
+    result = page(taken(RECORDS), held=held, journals={}, now=NOW, chain=chain)
+    assert [(row["ref"], row["flag"]) for row in result["vault_only"]] == [
+        ("a" * 16, "not_yet_reported"),
+        ("9" * 16, "no_ledger_record"),
+        ("8" * 16, "no_ledger_record"),
+        ("7" * 16, "older_than_copy"),
+    ]
+    archived = Coverage(frozenset({"7" * 16, "8" * 16}))
+    result = page(taken(RECORDS), held=held, journals={}, now=NOW, chain=chain, archived=archived)
+    assert [row["ref"] for row in result["vault_only"]] == ["a" * 16, "9" * 16]
+
+
+def test_the_calls_only_the_vault_holds_are_bounded() -> None:
+    """The newest :data:`MAX_LIMIT`, the rest counted."""
+    chain = [asked(seq, T + seq, f"{seq + 1:016x}", writer="vault") for seq in range(MAX_LIMIT + 2)]
+    result = page([], held=Held(), journals={}, now=NOW, chain=chain)
+    assert [row["seq"] for row in result["vault_only"]] == list(range(MAX_LIMIT + 1, 1, -1))
+    assert result["vault_only_more"] == 2
+    exact = page([], held=Held(), journals={}, now=NOW, chain=chain[:MAX_LIMIT])
+    assert (len(exact["vault_only"]), exact["vault_only_more"]) == (MAX_LIMIT, 0)
+
+
+def test_the_vault_asking_a_ref_again_keeps_the_copys_row() -> None:
+    """Each chain is read alone: the vault asking a ref again (a resend after its endings
+    expired) starts that ref's vault records again, and never hides the copy's call."""
+    chain = [*CHAIN[:4], asked(12, T + 12, HELD_REF, writer="vault", where="vault")]
+    rows = page(COPY, held=HELD, journals={}, now=NOW, chain=chain)["rows"]
+    assert [row["ref"] for row in rows] == [DISPUTED, RELAY_REF, HELD_REF]
+    held = rows[2]
+    assert (held["decision"], held["outcome"], held["others"]) == ("approved_elsewhere", "ok", [])
+    assert held["writers"] == {"asked": "gateway", "decided": "gateway", "outcome": "gateway"}
+    # The gateway asking it again, after the vault's records of it: still one row.
+    again = [*COPY, asked(8, T + 8, HELD_REF, where="vault")]
+    rows = page(again, held=HELD, journals={}, now=NOW, chain=CHAIN)["rows"]
+    assert [(row["ref"], row["seq"]) for row in rows] == [
+        (HELD_REF, 8),
+        (DISPUTED, 2),
+        (RELAY_REF, 1),
+    ]
+    assert (rows[0]["decision"], rows[0]["via"]) == ("accept", "telegram")
+
+
+def test_a_partway_copys_span_starts_at_its_first_receipt() -> None:
+    """J.3 with one live file still taking reports: the span starts when the vault received
+    that file's first line, so a send begun since, with no call in the copy, is
+    ``no_ledger_record``; without that time recorded, the span starts at its last receipt."""
+    first = RECEIVED - 1_000
+    held = Held("ok", 0, 11, HASH, (LiveFile("000000000000.jsonl", 900, RECEIVED, first),))
+    journals = {
+        "mail": [
+            sending(first - 1, "1111111111111111.1"),
+            sending(first, "2222222222222222.1"),
+            sending(RECEIVED, "3333333333333333.1"),
+        ]
+    }
+    result = page(taken(RECORDS), held=held, journals=journals, now=NOW)
+    assert [(o["key"], o["flag"]) for o in result["orphans"]] == [
+        ("3333333333333333.1", "not_yet_reported"),
+        ("2222222222222222.1", "no_ledger_record"),
+        ("1111111111111111.1", "older_than_copy"),
+    ]
+    unrecorded = page(taken(RECORDS), held=HELD, journals=journals, now=NOW)
+    assert [o["flag"] for o in unrecorded["orphans"]] == [
+        "not_yet_reported",
+        "older_than_copy",
+        "older_than_copy",
+    ]
+    # Only the earliest kept file's first receipt counts.
+    later = LiveFile("000000000009.jsonl", 10, RECEIVED, RECEIVED - 1)
+    two = Held("ok", 0, 11, HASH, (held.files[0], later))
+    result = page(taken(RECORDS), held=two, journals=journals, now=NOW)
+    assert [o["flag"] for o in result["orphans"]] == [
+        "not_yet_reported",
+        "no_ledger_record",
+        "older_than_copy",
+    ]

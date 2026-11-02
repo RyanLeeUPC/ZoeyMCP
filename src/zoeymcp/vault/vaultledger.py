@@ -33,6 +33,7 @@ runs before the event loop starts.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -266,6 +267,11 @@ class VaultLedger:
     def read(self, *, after: int = -1, limit: int = 1000) -> list[dict[str, Any]]:
         """Records after ``after``, oldest first, as JSON objects."""
         return self.file.read(after=after, limit=limit)
+
+    def records(self) -> list[dict[str, Any]]:
+        """Every record, oldest first, as JSON objects: the ledger view's second source (J.2).
+        A line that doesn't parse is left out."""
+        return [json.loads(record.line) for record in self.file.records()]
 
     def verify(self) -> dict[str, Any]:
         """Walk every file's chain in order, from what the oldest file says it follows."""
