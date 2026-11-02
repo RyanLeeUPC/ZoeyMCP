@@ -316,6 +316,7 @@ HELD_METHODS = (
     "_held_connector",
     "_hold",
     "_block_over",
+    "_pending",
     "_mcp_forward",
 )
 
