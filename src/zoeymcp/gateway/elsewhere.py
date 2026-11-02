@@ -24,13 +24,14 @@ operator's approvers and forwards it once approved. Here, after the pipeline's s
    carries neither the vault's approval nor its refusal is ``elsewhere_unheld``, its result
    withheld.
 
-A pending call's ending, once the gateway learns it (``check_approval``'s collect, F.5), closes
-its record as the vault decided it (:func:`collected`).
+A pending call's ending, once the gateway learns it (the vault's decisions poll, E.2, or
+``check_approval``'s collect, F.5), closes its record as the vault decided it, once
+(:func:`collected`).
 
 An Elsewhere call the agent abandons (its handler cancelled) is withdrawn in the gateway's ledger,
 ``outcome unknown`` since the vault may still forward it, and the vault is told
 (``withdraw caller_cancelled``, B.6) through :attr:`.approve.Approvals.tell_withdrawn`, which the
-out-of-band client binds (step 12a). Every answer ends with the call's ref.
+app binds to :meth:`.outofband.OutOfBandClient.withdraw`. Every answer ends with the call's ref.
 """
 
 from __future__ import annotations
@@ -398,8 +399,9 @@ async def collected(
 ) -> None:
     """A pending held call's ending, as the gateway learned it from the vault (F.5, D.2): its
     own ``decided`` and ``outcome`` records, the lock freed with the cooldown a decline or an
-    expiry starts, and its upstream session let go (F.6). A ref with no pending record of a
-    held call here changes nothing."""
+    expiry starts, and its upstream session let go (F.6). A call the vault ran keeps its pin for
+    the agent's collect of its result (Z17, :meth:`.approve.Approvals.keep_ran`). A ref with no
+    pending record of a held call here changes nothing."""
     record = approvals.table.get(ref)
     if (
         record is None
@@ -412,6 +414,8 @@ async def collected(
     # Decided in this synchronous section: a second collect of the same ending records nothing.
     approvals.table.decide(ref, table, approvals.clock())
     approvals.release_kept(ref)
+    if decision == "approved_elsewhere":
+        approvals.keep_ran(record)
     kept = detail if detail in ledgerformat.DETAILS else None
     await _decided(approvals, record, decision)
     await _finish(approvals, record, outcome, kept, cooldown, table)
@@ -461,12 +465,17 @@ async def _abandoned(
     answer: HeldAnswer | None,
 ) -> None:
     """The agent left (its handler cancelled): the vault is told, and the gateway's ledger says
-    withdrawn, ``outcome unknown``, since the vault may have approved and forwarded it."""
+    withdrawn, ``outcome unknown``, since the vault may have approved and forwarded it. Telling
+    the vault gets :data:`.approve.FINISH_GRACE` of the grace, so a vault slow to answer never
+    leaves the records unwritten or the lock held."""
     if approvals.tell_withdrawn is not None and (answer is None or not answer.refused):
-        try:
-            await approvals.tell_withdrawn(call.ref, call.client, "caller_cancelled")
-        except Exception as exc:  # the vault's own cancel rules still apply (B.6)
-            logs.event("approval_withdraw_failed", ref=call.ref, error_type=type(exc).__name__)
+        with anyio.move_on_after(FINISH_GRACE) as telling:
+            try:
+                await approvals.tell_withdrawn(call.ref, call.client, "caller_cancelled")
+            except Exception as exc:  # the vault's own cancel rules still apply (B.6)
+                logs.event("approval_withdraw_failed", ref=call.ref, error_type=type(exc).__name__)
+        if telling.cancelled_caught:
+            logs.event("approval_withdraw_failed", ref=call.ref, error_type="timeout")
     await _decided(approvals, record, "withdrawn")
     await _finish(approvals, record, "unknown", None, settings.cooldown, "withdrawn")
 

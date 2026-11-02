@@ -24,7 +24,11 @@ socket: a long poll that a reload or an onboarding's allowance change wakes (I.3
 keeps when the role last fetched and the digest it holds, for health's
 ``egress_allowlist_stale`` (J) and for an onboarding through the role, which waits for it to
 fetch a widened list (:meth:`VaultApp.role_fetched`). Whether ``egress_proxy`` is the role is
-the startup policy's ``egress_proxy_kind``, never guessed from the fetches. The rest are 404.
+the startup policy's ``egress_proxy_kind``, never guessed from the fetches. The gateway's
+approvals paths (M8 design E.2) collect a held call's result, poll for the endings of held calls,
+withdraw a call the gateway abandoned and detach its blocking calls at its stop; each carries the
+gateway's epoch, whose rule (G-15) withdraws what only an earlier gateway could use. The rest are
+404.
 :meth:`VaultApp.queue_review`, :meth:`VaultApp.queue_clear` and :meth:`VaultApp.review_job` queue
 and read the jobs for the admin socket and the portal, on :mod:`.reviewjobs`' table; a clear job
 (M6 design J.4) goes only to a poll that advertised it runs one.
@@ -74,7 +78,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, NoReturn
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -130,7 +134,17 @@ from .approvers import EDIT_GRACE, ApproverHub, NotShown
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .heldcommit import OUTCOME_MARGIN, HeldCommits, read_answer
-from .holds import CapRefusal, Decided, DecideRefusal, Hold, HoldRequest, HoldTable, Limits, Via
+from .holds import (
+    CapRefusal,
+    Decided,
+    DecideRefusal,
+    Hold,
+    HoldRequest,
+    HoldTable,
+    Limits,
+    Via,
+    from_earlier_epoch,
+)
 from .holds import toolkit_block as _toolkit_block
 from .keys import KeySet
 from .oauth.discovery import Challenge, parse_challenge
@@ -847,6 +861,15 @@ class VaultApp:
         self._entered = asyncio.Event()
         # The approvers block holds were begun under, for Z7's withdraw on its change.
         self._approvers: Approvers | None = None
+        # The gateway's approvals paths (E.2): the gateway epochs seen (the epoch rule, G-15),
+        # the vault's own epoch (one per start), the endings the decisions poll answers, the
+        # event that wakes it (each ending sets it and puts a new one in its place), and how
+        # many polls wait.
+        self._epochs = internal.Epochs()
+        self._vault_epoch = secrets.token_hex(6)
+        self._feed = internal.Feed()
+        self._feed_changed = asyncio.Event()
+        self._decision_waiters = 0
         if chain is not None:
             chain.remember(self._holds, self._clock())
         self._install(policy)
@@ -968,13 +991,20 @@ class VaultApp:
         """How many long polls of the allowlists are waiting."""
         return self._allowlist_waiters
 
+    @property
+    def decision_waiters(self) -> int:
+        """How many decisions polls are waiting (M8 design E.2)."""
+        return self._decision_waiters
+
     def stop_view_waits(self) -> None:
         """Answer every long poll of the view, of the review jobs and of the allowlists now, and
         the socket's review waits and an onboarding's wait for the egress role, and wait no
         more. For shutdown: the servers wait for requests in flight, and a long poll would hold
-        them for up to 25 s. Every undecided hold is withdrawn too (M8 design I.2)."""
+        them for up to 25 s. Every undecided hold is withdrawn too, and the decisions poll
+        answered (M8 design I.2)."""
         self._view_stopping = True
         self.stop_holds()
+        self._wake_decisions()
         self._wake_view_waiters()
         self._wake_reviews()
         self._wake_allowlist()
@@ -1435,6 +1465,12 @@ class VaultApp:
             return await self._status_report(request, log)
         if decided is internal.COLLECT:
             return await self._collect(request, log)
+        if decided is internal.DECISIONS:
+            return await self._decisions(request, log)
+        if decided is internal.WITHDRAW:
+            return await self._withdraw(request, log)
+        if decided is internal.DETACH:
+            return await self._detach(request, log)
         return await self._view_answer(request, log)
 
     def _egress_key_presented(self, request: Request) -> bool:
@@ -1752,20 +1788,13 @@ class VaultApp:
         - else ``state: unknown``, as for another client's ref (T34).
 
         With no ref, the client's own calls on the server (Q46): their statuses, never a
-        result."""
-        if request.scope.get("query_string"):
-            raise Refused(400, "the collect path takes no query")
-        most = internal.COLLECT_MAX_BYTES
-        if _json_length(request, kind="a collect") > most:
-            raise Refused(413, "a collect is at most 1 KiB", code="too_large")
-        too_large = ("a collect is at most 1 KiB", "too_large")
-        body = await _read_json_body(request, most, REPORT_DEADLINE, too_large, kind="the collect")
+        result. The body's epoch is seen first (E.2's epoch rule)."""
+        document = await _approvals_body(request, internal.COLLECT_MAX_BYTES, "collect", "1 KiB")
         try:
-            asked = internal.collect_body(canonical.loads_strict(body, max_bytes=most))
+            asked = internal.collect_body(document)
         except RequestRejected as exc:
             raise Refused(400, exc.reason, code="invalid") from exc
-        except ValueError as exc:
-            raise Refused(400, "the collect isn't strict JSON", code="invalid") from exc
+        self._gateway_epoch(asked.epoch)
         now = _wall_ms()
         no_store = {"cache-control": "no-store"}
         if asked.ref is None:
@@ -1811,6 +1840,159 @@ class VaultApp:
             "lost": status.lost,
             "detail": ending.detail if ending is not None else None,
         }
+
+    # --- the gateway's epochs, endings, withdrawals and detaches (M8 design E.2) ---------------
+
+    def _gateway_epoch(self, epoch: str) -> None:
+        """E.2's epoch rule (G-15, I.3): the first request with a gateway epoch the vault hasn't
+        seen makes it the current one, and withdraws (``gateway_restarted``) every relay and
+        every undecided held call whose request carried a legacy ``Mcp-Session-Id``, from the
+        earlier epochs: no gateway is left to forward those relays, and nobody keeps those
+        sessions open. A modern held call stays, collectable through the new gateway."""
+        previous = self._epochs.current
+        if not self._epochs.arrive(epoch):
+            return
+        gone = self._holds.withdraw(self._clock(), from_earlier_epoch(epoch), "gateway_restarted")
+        for hold in gone:
+            self._spawn(self._ended(hold))
+        if previous is not None:
+            logs.event("gateway_epoch_changed", withdrawn=len(gone))
+
+    def _endings_for(self, epoch: str, after: int) -> list[internal.Ended]:
+        """The endings a decisions poll of ``epoch`` gets after ``after``: none for a gateway
+        whose epoch isn't the current one."""
+        return self._feed.since(epoch, after) if self._epochs.current == epoch else []
+
+    def _feed_ending(self, hold: Hold, status: internal.EndedStatus, outcome: str) -> None:
+        """A held call's ending, for the decisions poll of the gateway whose marker it carried
+        (E.2, OPS-3): only a call that may answer pending, the one kind whose record the gateway
+        keeps past its answer, so it can free its lock without the agent collecting."""
+        if hold.kind != "held" or hold.epoch is None or hold.client is None:
+            return
+        if hold.wait != "pending":
+            return
+        self._feed.add(hold.epoch, hold.ref, status, outcome)
+        self._wake_decisions()
+
+    def _wake_decisions(self) -> None:
+        woken, self._feed_changed = self._feed_changed, asyncio.Event()
+        woken.set()
+
+    def _withdraw_one(self, hold_id: str, reason: str) -> None:
+        """Withdraw hold ``hold_id`` if it is undecided, and write and tell its ending."""
+        for gone in self._holds.withdraw(self._clock(), lambda h: h.id == hold_id, reason):
+            self._spawn(self._ended(gone))
+
+    async def _decisions(self, request: Request, log: dict[str, Any]) -> Response:
+        """``GET /_zoeymcp/gateway/v1/approvals/decisions?epoch=<e>&after=<seq>&wait=N`` (E.2,
+        X12): the endings of held calls whose marker carried the gateway's current epoch, after
+        seq ``after``, as ``{"seq", "ref", "status", "outcome"}`` (never a result, which stays for
+        collect), once there are any, or none after N seconds (at most 25), at shutdown, or when
+        the caller leaves; with the vault's own ``epoch``, one per start, so the gateway knows a
+        restarted vault. The poll's epoch is seen first (the epoch rule). One poll waits at a
+        time (429); a stopping vault answers a new one 503 ``stopping``, so the gateway backs
+        off rather than poll again at once for as long as the vault drains."""
+        try:
+            epoch, after, wait = internal.decisions_query(
+                parse_query(request.scope.get("query_string", b""))
+            )
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason, code="invalid") from exc
+        self._gateway_epoch(epoch)
+        if self._view_stopping:
+            raise Refused(503, "the vault is stopping", code="stopping")
+        if self._decision_waiters >= internal.DECISIONS_WAITERS:
+            raise Refused(429, "a decisions poll is already waiting", retry_after=1)
+        self._decision_waiters += 1
+        gone = asyncio.ensure_future(_disconnected(request.receive))
+        try:
+            deadline = time.monotonic() + wait
+            while not self._endings_for(epoch, after) and not self._view_stopping:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                woken = asyncio.ensure_future(self._feed_changed.wait())
+                try:
+                    await asyncio.wait(
+                        (woken, gone), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    woken.cancel()
+                if gone.done():
+                    log["disconnected"] = True
+                    break
+        finally:
+            self._decision_waiters -= 1
+            # On a task that has already failed, cancel() also marks its error as retrieved.
+            gone.cancel()
+        endings = [ended.wire() for ended in self._endings_for(epoch, after)]
+        log["endings"] = len(endings)
+        return JSONResponse(
+            {"v": 1, "epoch": self._vault_epoch, "endings": endings},
+            headers={"cache-control": "no-store"},
+        )
+
+    async def _withdraw(self, request: Request, log: dict[str, Any]) -> Response:
+        """``POST /_zoeymcp/gateway/v1/approvals/withdraw`` (E.2, B.6; SC-1): the gateway
+        abandoned an Elsewhere call (``caller_cancelled``), in any era. Read as a collect is,
+        within 1 KiB (:func:`.internal.withdraw_body`). The undecided hold of that ref, for the
+        client the gateway reported, is withdrawn: a blocking one's request is answered
+        ``approval_withdrawn`` and a pending one's record says withdrawn; nothing is sent. An
+        approved call is committed and runs on (Z9). The answer is the call's state now
+        (``withdrawn``, or the state of a call it didn't withdraw, or how it ended), or
+        ``unknown``, as for another client's ref (T34)."""
+        document = await _approvals_body(request, internal.WITHDRAW_MAX_BYTES, "withdraw", "1 KiB")
+        try:
+            asked = internal.withdraw_body(document)
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason, code="invalid") from exc
+        self._gateway_epoch(asked.epoch)
+        ref = log["ref"] = asked.ref
+        hold, state = self._holds.by_ref(ref), "unknown"
+        if hold is not None and hold.client == asked.client:
+            self._withdraw_one(hold.id, asked.reason)
+            current = self._holds.get(hold.id)
+            state = "withdrawn" if current is None else current.state
+        else:
+            ending = self._holds.ending(ref)
+            if ending is not None and ending.client == asked.client:
+                state = ending.state
+        log["held"] = state
+        return JSONResponse(
+            {"v": 1, "ref": ref, "state": state}, headers={"cache-control": "no-store"}
+        )
+
+    async def _detach(self, request: Request, log: dict[str, Any]) -> Response:
+        """``POST /_zoeymcp/gateway/v1/approvals/detach`` (E.2, I.2; G-16, Q40): the gateway is
+        stopping, and names its blocking held calls (at most 64, within 16 KiB), each by ref and
+        the client it reported. An undecided one whose marker said ``wait=pending`` detaches: its
+        request is answered ``approval_pending`` now, so the agent gets ``pending <ref>``, and the
+        hold waits on, collectable (B.6). One that said ``wait=block`` is withdrawn
+        (``gateway_stopped``). Any other call is left as it is: an approved one runs on, and its
+        answer goes to its request, or to the result store if that leaves (FM-13). The answer
+        names the refs it detached."""
+        document = await _approvals_body(request, internal.DETACH_MAX_BYTES, "detach", "16 KiB")
+        try:
+            asked = internal.detach_body(document)
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason, code="invalid") from exc
+        self._gateway_epoch(asked.epoch)
+        detached: list[str] = []
+        for ref, client in asked.calls:
+            hold = self._holds.by_ref(ref)
+            if hold is None or hold.client != client or hold.kind != "held":
+                continue
+            if hold.state != "held" or hold.detached:
+                continue
+            if hold.wait != "pending":
+                self._withdraw_one(hold.id, "gateway_stopped")
+                continue
+            self._holds.detach(self._clock(), hold.id)
+            logs.event("approval_detached", ref=ref, reason="gateway_stop")
+            self._wake(hold.id)
+            detached.append(ref)
+        log["detached"] = len(detached)
+        return JSONResponse({"v": 1, "detached": detached}, headers={"cache-control": "no-store"})
 
     def _status_refused(self, code: str | None) -> None:
         """``status_refused`` with N.3's reason, at most once a minute."""
@@ -2249,9 +2431,12 @@ class VaultApp:
     async def _hold(self, request: Request, ask: _Ask, log: dict[str, Any]) -> Response:
         """Hold one call (B.3-B.6): no chain, no hold; the vault's own text; the caps, and room
         for a ``wait=pending`` call's pending record (F.2); ``asked`` on disk; the surfaces
-        asked; then the wait, with the caller watched."""
+        asked; then the wait, with the caller watched. A marker's epoch is seen first (E.2's
+        epoch rule)."""
         if self._view_stopping:
             raise Refused(503, "the vault is stopping", code="stopping")
+        if ask.epoch is not None:
+            self._gateway_epoch(ask.epoch)
         chain = self._chain
         if chain is None or not chain.writable():
             raise Refused(
@@ -2386,13 +2571,16 @@ class VaultApp:
     async def _wait_hold(
         self, hold_id: str, wait: _Wait, departure: Departure, log: dict[str, Any]
     ) -> Response:
-        """B.6: the first of a decision, the block's end, an ending, and the caller leaving."""
+        """B.6: the first of a decision, the block's end, an ending, the gateway's stop detaching
+        it (I.2), and the caller leaving."""
         watching = True
         while True:
             wait.changed.clear()
             hold = self._holds.get(hold_id)
             if hold is None or hold.state != "held":
                 break
+            if hold.detached:  # the gateway's stop detached it (approvals/detach)
+                self._pending(hold, wait)
             now = self._clock()
             if now >= hold.block_until:
                 self._block_over(hold, wait, now)
@@ -2439,6 +2627,11 @@ class VaultApp:
             return
         self._holds.detach(now, hold.id)
         logs.event("approval_detached", ref=hold.ref, reason="block_over")
+        self._pending(hold, wait)
+
+    def _pending(self, hold: Hold, wait: _Wait) -> NoReturn:
+        """A detached hold's request is answered ``approval_pending``, with the deadline (B.6);
+        a legacy-era caller that left gets nothing."""
         if wait.left:
             raise CallerGone("headers")
         raise Refused(
@@ -2574,6 +2767,7 @@ class VaultApp:
         current = self._holds.get(hold.id) or hold
         self._holds.done(self._clock(), hold.id, done.outcome)
         self._advance(hold.ref, "done", done.outcome, done.stored if current.detached else None)
+        self._feed_ending(hold, "done", done.outcome)
         self._deliver(hold.id, done.response)
         await self._hub.close(replace(current, state="done", detail=done.outcome), "done")
 
@@ -2622,6 +2816,9 @@ class VaultApp:
                 self._advance(hold.ref, hold.state)
         finally:
             code = _ENDED_CODES.get(hold.state, "approval_withdrawn")
+            if hold.state in ("denied", "expired", "withdrawn"):
+                # Fed even when its records couldn't be written: the hold has ended all the same.
+                self._feed_ending(hold, hold.state, "not_sent")
             self._deliver(hold.id, Refused(409, f"the held call ended {hold.state}", code=code))
         await self._hub.close(hold, hold.state)
 
@@ -3231,6 +3428,23 @@ async def _read_json_body(
     if size != int(request.headers["content-length"]):
         raise Refused(400, f"{kind} isn't as long as it said", code="bad_body")
     return b"".join(chunks)
+
+
+async def _approvals_body(request: Request, most: int, noun: str, size: str) -> object:
+    """An approvals path's strict-JSON body (M8 design E.2), checked before any byte is read: no
+    query (400), one ``Content-Type: application/json`` (415) and one ``Content-Length`` (411) of
+    at most ``most`` bytes, ``size`` in words (413 ``too_large``); then read within
+    :data:`REPORT_DEADLINE`, and parsed (400 ``invalid``)."""
+    if request.scope.get("query_string"):
+        raise Refused(400, f"the {noun} path takes no query")
+    too_large = (f"a {noun} is at most {size}", "too_large")
+    if _json_length(request, kind=f"a {noun}") > most:
+        raise Refused(413, too_large[0], code=too_large[1])
+    body = await _read_json_body(request, most, REPORT_DEADLINE, too_large, kind=f"the {noun}")
+    try:
+        return canonical.loads_strict(body, max_bytes=most)
+    except ValueError as exc:
+        raise Refused(400, f"the {noun} isn't strict JSON", code="invalid") from exc
 
 
 def view_wait(params: list[tuple[str, str]]) -> int:

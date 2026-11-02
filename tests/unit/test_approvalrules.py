@@ -1,6 +1,8 @@
 """The rules for a waiting prompt after a policy change (M8 design C.1, O.3
 ``test_approvalrules.py``): :func:`still_asked`, moved from ``approve.py``'s ``_still_allowed``,
-and :func:`withdraw_picks`, lifted from the closure in ``Approvals.withdraw``.
+:func:`withdraw_picks`, lifted from the closure in ``Approvals.withdraw``, and (step 12a)
+:func:`ending_records`, the records the decisions poller writes for the vault's ending of a held
+call (E.2, D.2).
 ``tests/gateway/test_approval_recheck.py`` pins both through the gateway (M6 Q32 (b)).
 """
 
@@ -10,9 +12,10 @@ from typing import Any
 
 import pytest
 
+from zoeymcp.common import ledgerformat
 from zoeymcp.common.policy.schema import Approvals, GatewayLimits
 from zoeymcp.common.policy.view import ViewGateway
-from zoeymcp.gateway.approvalrules import still_asked, withdraw_picks
+from zoeymcp.gateway.approvalrules import ENDINGS, ending_records, still_asked, withdraw_picks
 from zoeymcp.gateway.approvals import Key, Pending, Settings, Table
 
 PIN = "sha256:" + "1" * 64
@@ -184,3 +187,56 @@ def test_every_record_is_elicited_until_relays_exist() -> None:
     )
     assert isinstance(begun, Pending)
     assert begun.how == "elicitation"
+
+
+# --- ending_records -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "decision", "cooldown"),
+    [
+        ("denied", "decline", True),
+        ("expired", "timeout", True),
+        ("withdrawn", "withdrawn", False),
+    ],
+)
+def test_an_ending_that_sent_nothing_is_not_sent(
+    status: str, decision: str, cooldown: bool
+) -> None:
+    """A decline and an expiry start the cooldown, as for a call the gateway asked about itself
+    (E.1); a withdrawal doesn't. Whatever outcome the vault named, nothing was sent."""
+    assert ending_records(status, "not_sent") == (decision, "not_sent", cooldown)
+    assert ending_records(status, "ok") == (decision, "not_sent", cooldown)
+
+
+@pytest.mark.parametrize("outcome", sorted(ledgerformat.OUTCOMES))
+def test_a_forwarded_call_keeps_the_vaults_outcome(outcome: str) -> None:
+    assert ending_records("done", outcome) == ("approved_elsewhere", outcome, False)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["pending", "approved", "forwarding", "held", "unknown", "Done", "", None, 1, ["done"]],
+    ids=[
+        "pending",
+        "approved",
+        "forwarding",
+        "held",
+        "unknown",
+        "case",
+        "empty",
+        "null",
+        "number",
+        "list",
+    ],
+)
+def test_a_status_that_isnt_an_ending_writes_nothing(status: object) -> None:
+    assert ending_records(status, "ok") is None
+
+
+def test_every_ending_the_vault_reports_has_its_row() -> None:
+    """The vault's four endings (``vault/internal.py``'s ``EndedStatus``), each one decision the
+    gateway's ledger knows."""
+    assert set(ENDINGS) == {"done", "denied", "expired", "withdrawn"}
+    for decision, _ in ENDINGS.values():
+        assert decision in ledgerformat.DECISIONS

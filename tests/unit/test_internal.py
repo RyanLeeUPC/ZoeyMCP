@@ -2,11 +2,14 @@
 any body byte is read, the review jobs poll's query (F.2, CR-8), (step 17b) the egress role's
 allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21), (M6 step 7)
 the gateway's status path, one report at a time and at most one accepted per 5 s (K.1, T-12,
-FM-19), and (M8 step 11) the collect path and its body (E.2, F.5, Q46)."""
+FM-19), (M8 step 11) the collect path and its body (E.2, F.5, Q46), and (M8 step 12a) the
+decisions poll's query, the withdraw's and the detach's bodies, the epoch rule and the endings
+the poll answers (E.2, G-15, G-16, OPS-3)."""
 
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import pytest
 
@@ -16,31 +19,52 @@ from zoeymcp.vault import app, internal
 from zoeymcp.vault.internal import (
     ALLOWLISTS,
     COLLECT,
+    DECISIONS,
+    DETACH,
     ENDPOINTS,
     LEDGER,
     REVIEW_JOBS,
     REVIEW_REPORT,
     STATUS,
     VIEW,
+    WITHDRAW,
     Collect,
+    Detach,
+    Ended,
     Endpoint,
+    Epochs,
+    Feed,
     Refusal,
     StatusGate,
+    Withdraw,
     _egress_path,
     _path,
     allowlist_wait,
     collect_body,
     decide,
+    decisions_query,
+    detach_body,
     find,
     jobs_query,
     wait_seconds,
+    withdraw_body,
 )
 from zoeymcp.vault.reviewjobs import OLDER
 
 DIGEST = "sha256:" + "ab" * 32
 TAKES = "the review jobs path takes wait, view and kinds, once each"
 KINDS = "kinds is review, or review,clear"
-GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS, COLLECT)
+GATEWAY_ENDPOINTS = (
+    VIEW,
+    LEDGER,
+    REVIEW_JOBS,
+    REVIEW_REPORT,
+    STATUS,
+    COLLECT,
+    DECISIONS,
+    WITHDRAW,
+    DETACH,
+)
 
 
 def path(text: str) -> NormalizedPath:
@@ -52,8 +76,8 @@ def path(text: str) -> NormalizedPath:
 
 def test_the_table_is_g1s() -> None:
     """Path, methods, identity, body cap and waiters, as G.1 lists them, M6 K.1's status path
-    after the gateway's other rows, M8 E.2's collect after it, the egress row last (step
-    17b)."""
+    after the gateway's other rows, M8 E.2's collect after it and then its other paths (step
+    12a), the egress row last (step 17b)."""
     rows = [
         (e.path.text, e.methods, e.identity, e.body_cap, e.waiters, e.name, e.label)
         for e in ENDPOINTS
@@ -106,6 +130,33 @@ def test_the_table_is_g1s() -> None:
             "the collect path",
         ),
         (
+            "/_zoeymcp/gateway/v1/approvals/decisions",
+            ("GET",),
+            "gateway",
+            0,
+            1,
+            "approvals_decisions",
+            "the decisions path",
+        ),
+        (
+            "/_zoeymcp/gateway/v1/approvals/withdraw",
+            ("POST",),
+            "gateway",
+            1024,
+            None,
+            "approvals_withdraw",
+            "the withdraw path",
+        ),
+        (
+            "/_zoeymcp/gateway/v1/approvals/detach",
+            ("POST",),
+            "gateway",
+            16 * 1024,
+            None,
+            "approvals_detach",
+            "the detach path",
+        ),
+        (
             "/_zoeymcp/egress/v1/allowlists",
             ("GET",),
             "egress",
@@ -120,6 +171,9 @@ def test_the_table_is_g1s() -> None:
     assert ALLOWLISTS.waiters == internal.ALLOWLIST_WAITERS
     assert STATUS.body_cap == internal.STATUS_MAX_BYTES
     assert COLLECT.body_cap == internal.COLLECT_MAX_BYTES == 1024
+    assert DECISIONS.waiters == internal.DECISIONS_WAITERS == 1
+    assert WITHDRAW.body_cap == internal.WITHDRAW_MAX_BYTES == 1024
+    assert DETACH.body_cap == internal.DETACH_MAX_BYTES == 16 * 1024
     assert (*GATEWAY_ENDPOINTS, ALLOWLISTS) == ENDPOINTS
 
 
@@ -140,6 +194,9 @@ def test_the_constants() -> None:
     assert (internal.VIEW_MAX_WAIT, internal.VIEW_MAX_WAITERS) == (25, 4)
     assert (internal.ALLOWLIST_WAIT, internal.ALLOWLIST_WAITERS) == (25, 2)
     assert internal.ALLOWLIST_MAX_STALE == 300
+    assert (internal.DECISIONS_WAIT, internal.DETACH_MAX_CALLS) == (25, 64)
+    assert (internal.ENDINGS_KEPT, internal.EPOCHS_KEPT) == (1024, 64)
+    assert frozenset({"caller_cancelled"}) == internal.WITHDRAW_REASONS
     assert app.ALLOWLIST_PATH is ALLOWLISTS.path
     assert app.ALLOWLIST_PATH.text == "/_zoeymcp/egress/v1/allowlists"
     assert (app.VIEW_MAX_WAIT, app.VIEW_MAX_WAITERS) == (25, 4)
@@ -183,6 +240,10 @@ def test_each_path_finds_its_row(endpoint: Endpoint) -> None:
         "/_zoeymcp/gateway/v1/approvals/Collect",
         "/_zoeymcp/gateway/v1/collect",
         "/_zoeymcp/gateway/v1/approvals/collect/x",
+        "/_zoeymcp/gateway/v1/approvals/ask",
+        "/_zoeymcp/gateway/v1/approvals/decision",
+        "/_zoeymcp/gateway/v1/approvals/Withdraw",
+        "/_zoeymcp/gateway/v1/approvals/detach/x",
     ],
 )
 def test_anything_else_is_404(text: str) -> None:
@@ -221,6 +282,9 @@ def test_the_gateway_reaches_each_method(endpoint: Endpoint, listener: internal.
         (REVIEW_REPORT, "the review report path is for the gateway only"),
         (STATUS, "the status path is for the gateway only"),
         (COLLECT, "the collect path is for the gateway only"),
+        (DECISIONS, "the decisions path is for the gateway only"),
+        (WITHDRAW, "the withdraw path is for the gateway only"),
+        (DETACH, "the detach path is for the gateway only"),
     ],
 )
 @pytest.mark.parametrize("listener", ["gateway", "tcp"])
@@ -243,6 +307,9 @@ def test_no_identity_is_the_bare_403_before_the_method(
         (STATUS, "GET", "the status path takes POST only", "POST"),
         (STATUS, "PUT", "the status path takes POST only", "POST"),
         (COLLECT, "GET", "the collect path takes POST only", "POST"),
+        (DECISIONS, "POST", "the decisions path takes GET only", "GET"),
+        (WITHDRAW, "GET", "the withdraw path takes POST only", "POST"),
+        (DETACH, "PUT", "the detach path takes POST only", "POST"),
     ],
 )
 def test_another_method_is_405_with_allow(
@@ -569,3 +636,288 @@ def test_the_refusals_name_what_is_wrong() -> None:
     with pytest.raises(RequestRejected) as caught:
         collect_body({"epoch": EPOCH})
     assert caught.value.reason == "a collect names epoch, client, server and, for one call, ref"
+
+
+# --- the withdraw's body (M8 design E.2, B.6) -----------------------------------------------------
+
+WITHDRAWN = {"epoch": EPOCH, "ref": REF, "client": "agent1", "reason": "caller_cancelled"}
+
+
+def test_a_withdraw_names_one_call_and_why() -> None:
+    assert withdraw_body(WITHDRAWN) == Withdraw(EPOCH, REF, "agent1", "caller_cancelled")
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [WITHDRAWN],
+        "x",
+        None,
+        {},
+        {**WITHDRAWN, "extra": "1"},
+        {key: value for key, value in WITHDRAWN.items() if key != "reason"},
+        {key: value for key, value in WITHDRAWN.items() if key != "epoch"},
+    ],
+    ids=["array", "string", "null", "empty", "extra", "no-reason", "no-epoch"],
+)
+def test_a_withdraw_names_its_fields_exactly(document: object) -> None:
+    with pytest.raises(RequestRejected):
+        withdraw_body(document)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("epoch", "0123456789a"),
+        ("epoch", "0123456789AB"),
+        ("epoch", None),
+        ("ref", "0123456789abcde"),
+        ("ref", "0123456789ABCDEF"),
+        ("ref", 1),
+        ("client", "Agent1"),
+        ("client", ""),
+        ("client", ["agent1"]),
+    ],
+    ids=[
+        "epoch-short",
+        "epoch-upper",
+        "epoch-null",
+        "ref-short",
+        "ref-upper",
+        "ref-number",
+        "client-upper",
+        "client-empty",
+        "client-list",
+    ],
+)
+def test_each_withdraw_field_has_its_form(key: str, value: object) -> None:
+    with pytest.raises(RequestRejected) as caught:
+        withdraw_body({**WITHDRAWN, key: value})
+    assert caught.value.reason == f"a withdraw's {key} isn't of its form"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["changed", "Caller_cancelled", "", None, ["caller_cancelled"]],
+    ids=["changed", "case", "empty", "null", "list"],
+)
+def test_a_withdraw_gives_a_known_reason(reason: object) -> None:
+    with pytest.raises(RequestRejected) as caught:
+        withdraw_body({**WITHDRAWN, "reason": reason})
+    assert caught.value.reason == "a withdraw's reason is caller_cancelled"
+
+
+def test_the_withdraw_refusals_name_what_is_wrong() -> None:
+    with pytest.raises(RequestRejected) as caught:
+        withdraw_body([])
+    assert caught.value.reason == "a withdraw is a JSON object"
+    with pytest.raises(RequestRejected) as caught:
+        withdraw_body({"epoch": EPOCH})
+    assert caught.value.reason == "a withdraw names epoch, ref, client and reason"
+
+
+# --- the detach's body (E.2, I.2, G-16) ----------------------------------------------------------
+
+
+def calls(count: int) -> list[dict[str, str]]:
+    return [{"ref": f"{n:016x}", "client": "agent1"} for n in range(count)]
+
+
+def test_a_detach_names_its_calls_in_order() -> None:
+    other = {"ref": "fedcba9876543210", "client": "agent2"}
+    found = detach_body({"epoch": EPOCH, "calls": [{"ref": REF, "client": "agent1"}, other]})
+    assert found == Detach(EPOCH, ((REF, "agent1"), ("fedcba9876543210", "agent2")))
+
+
+def test_a_detach_names_one_to_sixty_four_calls() -> None:
+    assert len(detach_body({"epoch": EPOCH, "calls": calls(1)}).calls) == 1
+    assert len(detach_body({"epoch": EPOCH, "calls": calls(64)}).calls) == 64
+    for count in (0, 65):
+        with pytest.raises(RequestRejected) as caught:
+            detach_body({"epoch": EPOCH, "calls": calls(count)})
+        assert caught.value.reason == "a detach names 1 to 64 calls"
+
+
+ONE_CALL = {"ref": REF, "client": "agent1"}
+
+
+@pytest.mark.parametrize(
+    ("document", "reason"),
+    [
+        ([], "a detach is a JSON object"),
+        ({"epoch": EPOCH}, "a detach names epoch and calls"),
+        ({"epoch": EPOCH, "calls": calls(1), "x": 1}, "a detach names epoch and calls"),
+        ({"epoch": "x", "calls": calls(1)}, "a detach's epoch isn't of its form"),
+        ({"epoch": EPOCH, "calls": ONE_CALL}, "a detach names 1 to 64 calls"),
+        ({"epoch": EPOCH, "calls": [REF]}, "a detach's call names ref and client"),
+        ({"epoch": EPOCH, "calls": [{"ref": REF}]}, "a detach's call names ref and client"),
+        (
+            {"epoch": EPOCH, "calls": [{**ONE_CALL, "wait": "pending"}]},
+            "a detach's call names ref and client",
+        ),
+        (
+            {"epoch": EPOCH, "calls": [{"ref": "x", "client": "agent1"}]},
+            "a detach's ref isn't of its form",
+        ),
+        (
+            {"epoch": EPOCH, "calls": [{"ref": REF, "client": "A"}]},
+            "a detach's client isn't of its form",
+        ),
+        ({"epoch": EPOCH, "calls": [ONE_CALL, ONE_CALL]}, "a detach names each call once"),
+        (
+            {"epoch": EPOCH, "calls": [ONE_CALL, {**ONE_CALL, "client": "agent2"}]},
+            "a detach names each call once",
+        ),
+    ],
+    ids=[
+        "array",
+        "no-calls",
+        "extra",
+        "epoch",
+        "calls-object",
+        "call-string",
+        "no-client",
+        "call-extra",
+        "ref",
+        "client",
+        "twice",
+        "ref-twice",
+    ],
+)
+def test_a_detach_refuses_what_it_cant_read(document: object, reason: str) -> None:
+    with pytest.raises(RequestRejected) as caught:
+        detach_body(document)
+    assert caught.value.reason == reason
+
+
+# --- the decisions poll's query (E.2) ------------------------------------------------------------
+
+
+def test_the_poll_names_its_epoch_where_it_is_and_how_long_it_waits() -> None:
+    query = [("epoch", EPOCH), ("after", "17"), ("wait", "25")]
+    assert decisions_query(query) == (EPOCH, 17, 25)
+    assert decisions_query([("wait", "3"), ("epoch", EPOCH), ("after", "0")]) == (EPOCH, 0, 3)
+
+
+def test_after_and_wait_default_to_the_start_and_at_once() -> None:
+    assert decisions_query([("epoch", EPOCH)]) == (EPOCH, 0, 0)
+    assert decisions_query([("epoch", EPOCH), ("wait", "99")]) == (EPOCH, 0, 25)
+    assert decisions_query([("epoch", EPOCH), ("after", "9" * 18)]) == (EPOCH, 10**18 - 1, 0)
+    assert decisions_query([("epoch", EPOCH), ("after", "007")]) == (EPOCH, 7, 0)
+
+
+POLL = "the decisions path takes epoch, after and wait, once each"
+
+
+@pytest.mark.parametrize(
+    ("params", "reason"),
+    [
+        ([], "the decisions path needs the gateway's epoch"),
+        ([("after", "1")], "the decisions path needs the gateway's epoch"),
+        ([("epoch", EPOCH), ("epoch", EPOCH)], POLL),
+        ([("epoch", EPOCH), ("after", "1"), ("after", "1")], POLL),
+        ([("epoch", EPOCH), ("ref", REF)], POLL),
+        ([("Epoch", EPOCH)], POLL),
+        ([("epoch", "0123456789a")], "epoch must be 12 lowercase hex digits"),
+        ([("epoch", "0123456789AB")], "epoch must be 12 lowercase hex digits"),
+        ([("epoch", "")], "epoch must be 12 lowercase hex digits"),
+        ([("epoch", EPOCH), ("after", "")], "after must be a sequence number"),
+        ([("epoch", EPOCH), ("after", "-1")], "after must be a sequence number"),
+        ([("epoch", EPOCH), ("after", "1.0")], "after must be a sequence number"),
+        ([("epoch", EPOCH), ("after", "9" * 19)], "after must be a sequence number"),
+        ([("epoch", EPOCH), ("wait", "x")], "wait must be a number of seconds"),
+    ],
+    ids=[
+        "none",
+        "no-epoch",
+        "epoch-twice",
+        "after-twice",
+        "other",
+        "epoch-case",
+        "epoch-short",
+        "epoch-upper",
+        "epoch-empty",
+        "after-empty",
+        "after-negative",
+        "after-decimal",
+        "after-too-long",
+        "wait",
+    ],
+)
+def test_a_bad_poll_is_refused(params: list[tuple[str, str]], reason: str) -> None:
+    with pytest.raises(RequestRejected) as caught:
+        decisions_query(params)
+    assert caught.value.reason == reason
+
+
+# --- the epoch rule (E.2, G-15) and the endings the poll answers (OPS-3) --------------------------
+
+LATER = "ba9876543210"
+
+
+def test_the_first_epoch_seen_is_the_current_one() -> None:
+    epochs = Epochs()
+    assert epochs.current is None
+    assert epochs.arrive(EPOCH) is True
+    assert epochs.current == EPOCH
+    assert epochs.arrive(EPOCH) is False  # seen: nothing to withdraw again
+
+
+def test_a_new_epoch_replaces_it_and_a_late_one_changes_nothing() -> None:
+    epochs = Epochs()
+    assert epochs.arrive(EPOCH)
+    assert epochs.arrive(LATER)
+    assert epochs.current == LATER
+    assert epochs.arrive(EPOCH) is False  # a late request from the earlier gateway
+    assert epochs.current == LATER
+
+
+def test_the_last_sixty_four_epochs_are_remembered() -> None:
+    epochs = Epochs()
+    seen = [f"{n:012x}" for n in range(internal.EPOCHS_KEPT + 1)]
+    for epoch in seen:
+        assert epochs.arrive(epoch)
+    assert not epochs.arrive(seen[1])  # still remembered
+    assert epochs.current == seen[-1]
+    assert epochs.arrive(seen[0])  # forgotten: new again
+    assert epochs.current == seen[0]
+
+
+def test_the_feed_numbers_each_ending_from_one() -> None:
+    feed = Feed()
+    assert feed.last == 0
+    first = feed.add(EPOCH, REF, "done", "ok")
+    second = feed.add(EPOCH, "fedcba9876543210", "denied", "not_sent")
+    assert (first.seq, second.seq, feed.last) == (1, 2, 2)
+    assert first == Ended(1, EPOCH, REF, "done", "ok")
+    assert first.wire() == {"seq": 1, "ref": REF, "status": "done", "outcome": "ok"}
+    assert feed.since(EPOCH, 0) == [first, second]
+    assert feed.since(EPOCH, 1) == [second]
+    assert feed.since(EPOCH, 2) == []
+
+
+def test_the_feed_answers_a_gateway_its_own_calls_only() -> None:
+    feed = Feed()
+    mine = feed.add(EPOCH, REF, "expired", "not_sent")
+    feed.add(LATER, "fedcba9876543210", "withdrawn", "not_sent")
+    assert feed.since(EPOCH, 0) == [mine]
+    assert [ended.seq for ended in feed.since(LATER, 0)] == [2]
+
+
+def test_the_feed_keeps_the_last_endings() -> None:
+    feed = Feed(kept=2)
+    for n in range(3):
+        feed.add(EPOCH, f"{n:016x}", "done", "ok")
+    assert [ended.seq for ended in feed.since(EPOCH, 0)] == [2, 3]
+    assert feed.last == 3
+    default = Feed()
+    for n in range(internal.ENDINGS_KEPT + 1):
+        default.add(EPOCH, f"{n:016x}", "done", "ok")
+    kept = default.since(EPOCH, 0)
+    assert (len(kept), kept[0].seq) == (internal.ENDINGS_KEPT, 2)
+
+
+def test_an_ending_cannot_be_changed() -> None:
+    ended: Any = Feed().add(EPOCH, REF, "done", "ok")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ended.seq = 2

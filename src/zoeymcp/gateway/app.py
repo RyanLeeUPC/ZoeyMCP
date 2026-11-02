@@ -92,6 +92,7 @@ from .approve import Approvals
 from .connstate import Era
 from .ledger import Ledger
 from .notify import Notifier
+from .outofband import OutOfBandClient
 from .policyclient import PolicyClient, Snapshot, Witness
 from .reporter import Reporter
 from .reviewpoll import ReviewPoller
@@ -315,7 +316,8 @@ class GatewayApp:
     status: ``server.pushed_status``; M6 design K.1) and, once the first view has arrived, the
     SDK's session manager. With ``witness``, the policy client hands it the head each view
     answer states (the restore witness, M6 design K.3). ``approvals_http`` is its client of the
-    vault's approvals paths (M8 design E.3), the pool's link's by default. At shutdown it closes
+    vault's approvals paths (M8 design E.3), the pool's link's by default, on which the lifespan
+    runs the decisions poller (:class:`.outofband.OutOfBandClient`). At shutdown it closes
     every client it holds on the vault link (D-166)."""
 
     def __init__(
@@ -401,8 +403,12 @@ class GatewayApp:
             clock=clock,
             refetch=self._refetch_view,
         )
-        # check_approval (M8 design F): the agent's collect of a call the vault held.
+        # check_approval (M8 design F): the agent's collect of a call the vault held. The vault's
+        # other approvals paths (E.2, E.3): an abandoned held call withdrawn there, the stop's
+        # detach, and the decisions poller, run in the lifespan.
         self.checker = checkapproval.Checker(self.approvals, approvals_http, self._definition)
+        self.out_of_band = OutOfBandClient(self.approvals, approvals_http)
+        self.approvals.tell_withdrawn = self.out_of_band.withdraw
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
@@ -580,6 +586,7 @@ class GatewayApp:
                 # Committed calls run in this group, out of reach of uvicorn's request cancels.
                 self.committed.attach(group)
                 group.start_soon(self.approvals.sweep_forever)
+                group.start_soon(self.out_of_band.run)
 
                 def withdraw_on_stop() -> None:
                     group.start_soon(self.approvals.withdraw, lambda _: True, "shutdown")

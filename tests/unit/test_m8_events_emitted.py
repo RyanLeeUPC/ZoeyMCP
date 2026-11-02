@@ -57,6 +57,10 @@ EVENTS = {
     "approval_collected": "vault",
     "reserved_tool_name": "gateway",
     "approval_collect_failed": "gateway",
+    # Step 12a: the epoch rule's withdrawals (K.2, the withdrawn count only), and the builder's
+    # failure event for a decisions poll the vault couldn't answer (its reason only).
+    "gateway_epoch_changed": "vault",
+    "approval_decisions_failed": "gateway",
 }
 
 

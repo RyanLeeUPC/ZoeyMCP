@@ -691,6 +691,8 @@ APPROVALS_POSTS = frozenset(
 )
 APPROVALS_DECISIONS = APPROVALS_PREFIX + "decisions"
 COLLECT_PATH = APPROVALS_PREFIX + "collect"
+WITHDRAW_PATH = APPROVALS_PREFIX + "withdraw"
+DETACH_PATH = APPROVALS_PREFIX + "detach"
 # A 4 MiB result in base64, and its status around it (E.3).
 APPROVALS_MAX_ANSWER_BYTES = 6 * 2**20
 
@@ -749,7 +751,8 @@ def approvals_client(
     link: Link, keys: KeySource | None, inner: httpx2.AsyncBaseTransport | None = None
 ) -> httpx2.AsyncClient:
     """The HTTP client of the out-of-band approvals (M8 design E.3), built like
-    :func:`report_client`: ``check_approval``'s collect (F.5), and step 12's paths."""
+    :func:`report_client`: ``check_approval``'s collect (F.5), and the decisions poll, withdraw
+    and detach (:mod:`.outofband`)."""
     return httpx2.AsyncClient(
         transport=_ApprovalsOnly(inner if inner is not None else _inner_transport(link), link),
         base_url=link.base_url,

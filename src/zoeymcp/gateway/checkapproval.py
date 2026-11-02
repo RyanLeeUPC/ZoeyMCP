@@ -18,7 +18,10 @@ as soon as it is approved, whoever waits; the agent gets its result here, once.
   a direct call's is (:func:`.pipeline.finished`: sanitized, the tool's pinned output schema,
   wrapped); a status answers a tool error that says what it is.
 - **Endings.** A call's ending the collect shows closes this gateway's pending record of it as
-  the vault decided (:func:`.elsewhere.collected`), freeing its lock (D.2).
+  the vault decided (:func:`.elsewhere.collected`), freeing its lock (D.2), unless the decisions
+  poller (:mod:`.outofband`) closed it first. A call the vault ran whose record closed so is
+  still known by its client, server, tool and pin (:meth:`.approve.Approvals.ran_call`), so its
+  result is checked against the pin it was called under (Z17).
 - **No id** (Q46): the client's own calls on this server, by ref, tool, status and deadline;
   never a result or a text.
 """
@@ -42,7 +45,7 @@ from pydantic import ValidationError
 from ..common import canonical, heldresult, ledgerformat
 from ..common.policy.view import ViewGateway, ViewOutOfBand
 from . import elsewhere, logs, pipeline
-from .approve import Approvals
+from .approve import Approvals, Ran
 from .approvers import with_ref
 from .pins import ExposedTool
 from .sanitize import map_upstream
@@ -86,6 +89,7 @@ WITHDRAWN: Final[Mapping[str, str]] = {
     "restart": "the vault restarted",
     "stream_lost": "the call was cancelled",
     "caller_cancelled": "the call was cancelled",
+    "gateway_restarted": "the gateway restarted",
 }
 _STATES: Final = frozenset(
     {"pending", "approved", "forwarding", "done", "denied", "expired", "withdrawn"}
@@ -171,17 +175,21 @@ class Checker:
             log("ok" if answer is not None else "upstream_error", "listed")
             return _listed(answer) if answer is not None else _text(UNREACHABLE)
         record = self.approvals.table.get(ref)
+        ran = self.approvals.ran_call(ref) if record is None else None
         if record is not None and (
             (record.key.client, record.key.server) != (call.client, call.server)
             or record.how != "elsewhere"
         ):
             log("refused", "unknown")  # another client's, or a prompt this gateway asks itself
             return with_ref(UNKNOWN, ref)
+        if ran is not None and (ran.key.client, ran.key.server) != (call.client, call.server):
+            log("refused", "unknown")  # another client's call, its record closed
+            return with_ref(UNKNOWN, ref)
         answer = await self._collect(call, ref)
         if answer is None:
             log("upstream_error", "vault")
             return with_ref(UNREACHABLE, ref)
-        result, reason = await self._answer(call, gateway, ref, answer, record)
+        result, reason = await self._answer(call, gateway, ref, answer, record, ran)
         log("tool_error" if result.is_error else "ok", reason)
         return result
 
@@ -230,6 +238,7 @@ class Checker:
         ref: str,
         answer: Mapping[str, Any],
         record: Any,
+        ran: Ran | None,
     ) -> tuple[CallToolResult, str]:
         """The agent's answer for one call's collect, and the log's reason; an ending closes
         this gateway's record of it."""
@@ -279,7 +288,7 @@ class Checker:
             return failed, "collected"
         await elsewhere.collected(self.approvals, ref, "approved_elsewhere", outcome, None, 0.0)
         if isinstance(stored, dict):
-            return await self._result(call, ref, answer, stored, record), "collected"
+            return await self._result(call, ref, answer, stored, record, ran), "collected"
         if answer.get("lost") == "too_large":
             return with_ref(elsewhere.TOO_LARGE, ref), "too_large"
         if answer.get("lost") is not None:
@@ -293,6 +302,7 @@ class Checker:
         answer: Mapping[str, Any],
         stored: Mapping[str, Any],
         record: Any,
+        ran: Ran | None,
     ) -> CallToolResult:
         """The collected result as the agent gets it (F.5 steps 5, 6): read as the one
         response to the held request, then finished as a direct call's result."""
@@ -322,10 +332,13 @@ class Checker:
             return map_upstream("unsupported_result", ref)
         if raw.result_type not in (None, "complete"):
             return map_upstream("unsupported_result", ref)
-        tool = record.key.tool if record is not None else answer.get("tool")
+        # The pin the call was made under: its record's, or once that closed, the one kept for
+        # it (Z17); only a call this gateway never knew (it restarted) takes the view's.
+        known = record if record is not None else ran
+        tool = known.key.tool if known is not None else answer.get("tool")
         if not isinstance(tool, str):
             return map_upstream("output_refused", ref)
-        pin = record.pin if record is not None else call.policy.review.get(tool)
+        pin = known.pin if known is not None else call.policy.review.get(tool)
         found_definition = await self.definitions(tool, pin) if pin is not None else None
         if found_definition is None or pin is None:
             # The original tool's pinned output schema can't be checked: never delivered so.

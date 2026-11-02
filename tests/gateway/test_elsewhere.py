@@ -45,6 +45,7 @@ from tests.gateway.rig import (
     deployment_with,
     gateway,
     token_for,
+    until,
 )
 from tests.gateway.test_upstream import review
 from tests.unit.plainid import plain_id
@@ -369,6 +370,9 @@ async def test_pending_then_the_same_ref_then_busy(tmp_path: Path) -> None:
             [hold] = await rig.surface.holds(1)
             await rig.decide(hold)
             await rig.settled()
+            # The vault's ending closes the record, with nobody collecting (step 12a, OPS-3).
+            table = rig.running.app.approvals.table
+            await until(lambda: table.get(hold.ref) is None, BOUND)
     ref = ref_of(first)
     assert ref == hold.ref
     assert first.is_error
@@ -385,7 +389,12 @@ async def test_pending_then_the_same_ref_then_busy(tmp_path: Path) -> None:
     )
     assert len(rig.surface.shown) == 1
     assert rig.calls() == [{"text": "hi"}]
-    assert rig.ledger(ref) == [("asked", "vault"), ("decided", "pending")]
+    assert rig.ledger(ref) == [
+        ("asked", "vault"),
+        ("decided", "pending"),
+        ("decided", "approved_elsewhere"),
+        ("outcome", ("ok", None)),
+    ]
     assert rig.chain(ref)[-2:] == [("decided", "accept"), ("outcome", "ok")]
 
 

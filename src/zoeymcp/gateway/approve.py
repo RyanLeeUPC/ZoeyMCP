@@ -35,7 +35,7 @@ import hashlib
 import math
 import secrets
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -81,6 +81,9 @@ FINISH_GRACE = 2.0  # seconds a cancelled handler gets to free its lock and reco
 # A blocking out-of-band wait's progress (M8 design F.1, M.3): how often, and what it says.
 PROGRESS_EVERY: Final = 15.0
 PROGRESS_MESSAGE: Final = "waiting for the operator's approval"
+# The longest ``approvers.result_ttl`` the policy allows: how long a closed pending held call's
+# pin is kept with no view to read its own from (Z17).
+RESULT_TTL_MAX: Final = 86400.0
 
 STOPPING = "refused: the gateway is stopping; try again shortly"
 LEDGER_DOWN = "refused: the approval ledger can't be written"
@@ -106,7 +109,7 @@ class AskSession(Protocol):
 
 Forward = Callable[[Grant], Awaitable[CallToolResult]]
 # Tells the vault a held call's caller left (ref, client, reason): its ``approvals/withdraw``
-# (M8 design B.6, E.2), which the out-of-band client binds (step 12a).
+# (M8 design B.6, E.2), bound to :meth:`.outofband.OutOfBandClient.withdraw` by the app.
 TellWithdrawn = Callable[[str, str, str], Awaitable[None]]
 # Sends the agent one progress notification: the seconds waited, and the message (F.1).
 Tick = Callable[[float, str], Awaitable[None]]
@@ -140,6 +143,16 @@ class Asking:
         return Key(self.client, self.server, self.tool)
 
 
+@dataclass(frozen=True)
+class Ran:
+    """A pending held call whose record closed before the agent collected it (Z17, F.5 step 6):
+    whose call it was, and the pin its result is checked against, until ``until`` (the clock's)."""
+
+    key: Key
+    pin: str
+    until: float
+
+
 @dataclass
 class Approvals:
     """Every approval of one gateway process: the table, the prompts shown, the waits, and the
@@ -162,6 +175,9 @@ class Approvals:
     # A pending held call's legacy upstream session, kept open for the vault's forward (F.6): by
     # ref, what lets it close again once the call's outcome is known.
     kept: dict[str, Callable[[], None]] = field(default_factory=dict)
+    # A pending held call whose record closed before the agent collected its result: by ref,
+    # what check_approval checks that result against while the vault keeps it (Z17).
+    ran: OrderedDict[str, Ran] = field(default_factory=OrderedDict)
     _shown: dict[str, Shown] = field(default_factory=dict)
     _waits: dict[str, anyio.CancelScope] = field(default_factory=dict)
     legacy: ElicitationLegacy = field(init=False)
@@ -524,10 +540,13 @@ class Approvals:
         for record in swept.freed:
             self._shown.pop(record.ref, None)
             if record.how == "elsewhere" and record.pending_until is not None:
-                # D.2: a pending held call's lock ends at its hard deadline; the vault's chain
-                # holds how it ended, which the gateway learns sooner when the agent collects it
-                # (check_approval), and from step 12a on.
+                # D.2: a pending held call's lock ends at its hard deadline at the latest; the
+                # gateway learns how it ended sooner, from the vault's decisions poll
+                # (:mod:`.outofband`) or the agent's collect (check_approval), and only one that
+                # never came (the vault restarted, or couldn't be polled) ends here, unknown: the
+                # vault's chain holds how it ended.
                 self.release_kept(record.ref)
+                self.keep_ran(record)
                 await self._outcome(record, "unknown", None)
                 continue
             logs.event("approval_lock_expired", ref=record.ref, level="error")
@@ -542,6 +561,34 @@ class Approvals:
         release = self.kept.pop(ref, None)
         if release is not None:
             release()
+
+    def keep_ran(self, record: Pending) -> None:
+        """Z17, F.5 step 6: a pending held call's record closed (its ending, or its hard
+        deadline) before the agent collected its result, which is still checked against the pin
+        the call was made under, not the view's of now. Kept while the vault keeps the result
+        (``approvers.result_ttl``, the policy's longest with no view, and the hard deadline's
+        margin), the last :data:`.approvals.MAX_RECORDS`."""
+        now = self.clock()
+        snapshot = self.fresh()
+        out = None if snapshot is None else snapshot.view.gateway.approvals.out_of_band
+        ttl = float(out.result_ttl) if out is not None else RESULT_TTL_MAX
+        self.ran.pop(record.ref, None)
+        self.ran[record.ref] = Ran(
+            record.key, record.pin, now + ttl + approvals.HARD_DEADLINE_MARGIN
+        )
+        self._prune_ran(now)
+
+    def ran_call(self, ref: str) -> Ran | None:
+        """The closed pending held call ``ref`` (:meth:`keep_ran`), while its result may still
+        be collected."""
+        self._prune_ran(self.clock())
+        return self.ran.get(ref)
+
+    def _prune_ran(self, now: float) -> None:
+        for ref in [ref for ref, ran in self.ran.items() if ran.until <= now]:
+            del self.ran[ref]
+        while len(self.ran) > approvals.MAX_RECORDS:
+            self.ran.popitem(last=False)
 
 
 # --- progress while a call blocks (M8 design F.1) ------------------------------------------------
