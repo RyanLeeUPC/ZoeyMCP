@@ -422,7 +422,15 @@ def test_netguard_uses_the_standard_library_only() -> None:
 
 # Shared modules the vault's chain and envelope reader build on: nothing beyond the standard
 # library, through every module of ours they load.
-STDLIB_ONLY = ("ledgerfile", "mcpwire", "approvaltext", "ledgerformat", "canonical", "envelope")
+STDLIB_ONLY = (
+    "ledgerfile",
+    "mcpwire",
+    "approvaltext",
+    "ledgerformat",
+    "canonical",
+    "envelope",
+    "resultstore",
+)
 # Standard library modules that do I/O, which a pure module never imports.
 IO_MODULES = frozenset(
     {"asyncio", "http", "io", "os", "pathlib", "selectors", "shutil", "socket", "ssl", "subprocess"}
@@ -518,6 +526,42 @@ def test_the_envelope_reader_is_pure_and_built_on_the_shared_wire_rules() -> Non
         for name in names
         if name.partition(".")[0] in IO_MODULES
     ]
+
+
+def own_io(module: str) -> list[str]:
+    """The I/O modules ``module`` itself imports (the shared log module it may lean on writes
+    log lines, which isn't the module's own I/O)."""
+    path = module_path(PACKAGE.parent, module)
+    assert path is not None
+    names = list(imported_modules(path, module))
+    assert names
+    return [name for name in names if name.partition(".")[0] in IO_MODULES]
+
+
+def test_the_result_store_is_pure() -> None:
+    """M8 design F.2, F8: both roles keep one; it does no I/O of its own. Not vacuous: the walk
+    reaches the log module whose refusals it registers."""
+    assert own_io("zoeymcp.common.resultstore") == []
+    assert "zoeymcp.common.logs" in closure(PACKAGE.parent, "zoeymcp.common.resultstore")
+
+
+def test_the_hold_table_is_pure_and_stands_on_common_only() -> None:
+    """M8 design B.4, F8: the vault's hold table does no I/O of its own, and of ours loads only
+    the shared layers (the approval text it holds): no other vault module, no policy package."""
+    assert own_io("zoeymcp.vault.holds") == []
+    found = closure(PACKAGE.parent, "zoeymcp.vault.holds")
+    assert "zoeymcp.common.approvaltext" in found
+    assert beyond(found) == []
+    assert {m for m in found if not m.startswith("zoeymcp.common")} == {
+        "zoeymcp",
+        "zoeymcp.vault",
+        "zoeymcp.vault.holds",
+    }
+    assert not [m for m in found if m.startswith("zoeymcp.common.policy")]
+
+
+def test_own_io_sees_the_modules_own_imports() -> None:
+    assert own_io("zoeymcp.common.ledgerfile") != []
 
 
 def test_the_committed_registry_uses_the_standard_library_and_anyio_only() -> None:
