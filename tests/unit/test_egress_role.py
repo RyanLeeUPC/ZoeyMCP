@@ -285,8 +285,10 @@ async def test_the_role_sends_its_key_and_long_polls() -> None:
 
 async def test_vault_unreachable(lines: io.StringIO) -> None:
     """FM-26: the last lists serve until 300 s without contact, then every tunnel is refused;
-    the vault's return is contact at once (the first request after a failure doesn't wait)."""
-    with anyio.fail_after(30):
+    the vault's return is contact at once (the first request after a failure doesn't wait).
+    Nothing wakes the role while the vault is down, so its next fetch after the return can be a
+    whole backoff away: up to BACKOFF_MAX on a loaded runner (register D-246)."""
+    with anyio.fail_after(30 + 2 * allowlist.BACKOFF_MAX):
         async with rig(lists={"vault": [("api.example", 443)]}) as r:
             r.serve("api.example")
             r.fake.set_down(True)
@@ -297,7 +299,10 @@ async def test_vault_unreachable(lines: io.StringIO) -> None:
             r.clock.advance(2)
             assert await refusal(r.port(), "api.example:443") == 503
             r.fake.set_down(False)
-            await until(lambda: r.role.allowlist.last_contact == r.clock())
+            await until(
+                lambda: r.role.allowlist.last_contact == r.clock(),
+                timeout=allowlist.BACKOFF_MAX + 10,
+            )
             async with tunnel(r.port(), "api.example:443") as (reader, writer):
                 assert await echoes(reader, writer)
     retried = [s for s in r.fake.seen if s.if_none_match is not None and not s.query]
