@@ -162,6 +162,7 @@ only_mutate = [
     "*zoeymcp/common/mcpwire.py",
     "*zoeymcp/common/envelope.py",
     "*zoeymcp/common/resultstore.py",
+    "*zoeymcp/common/heldresult.py",
     "*zoeymcp/common/files.py",
     "*zoeymcp/common/netguard.py",
     "*zoeymcp/common/egresslist.py",

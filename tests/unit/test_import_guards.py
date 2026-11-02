@@ -430,6 +430,7 @@ STDLIB_ONLY = (
     "canonical",
     "envelope",
     "resultstore",
+    "heldresult",
 )
 # Standard library modules that do I/O, which a pure module never imports.
 IO_MODULES = frozenset(
@@ -543,6 +544,14 @@ def test_the_result_store_is_pure() -> None:
     reaches the log module whose refusals it registers."""
     assert own_io("zoeymcp.common.resultstore") == []
     assert "zoeymcp.common.logs" in closure(PACKAGE.parent, "zoeymcp.common.resultstore")
+
+
+def test_the_stored_answers_reader_is_pure() -> None:
+    """M8 design F.5 step 5, F8: the vault and the gateway read a held call's answer with it, so
+    it is in common and does no I/O of its own. Not vacuous: the walk reaches the log module
+    whose refusals it registers."""
+    assert own_io("zoeymcp.common.heldresult") == []
+    assert "zoeymcp.common.logs" in closure(PACKAGE.parent, "zoeymcp.common.heldresult")
 
 
 def test_the_hold_table_is_pure_and_stands_on_common_only() -> None:

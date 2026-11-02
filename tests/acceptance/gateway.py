@@ -44,6 +44,7 @@ from zoeymcp.gateway.vaultlink import (
     status_client,
     view_client,
 )
+from zoeymcp.vault.keys import KeySet
 
 from .conftest import Clock, Deployment, _HTTPTransport
 from .helpers import Seen, wait_until
@@ -134,7 +135,11 @@ class GatewayDeployment:
     ``server`` is the profile's one server, which its placeholder client is assigned; with
     ``socket_clients`` the vault reaches a ``unix:`` route's bridge as ``--bridge`` has it (M7
     design B.2, S11), and with ``guarded`` its routes on its own guarded clients
-    (``Deployment``).
+    (``Deployment``); ``held`` gives the vault what it holds calls with (M8, ``Deployment``).
+
+    :meth:`running` runs the vault, then the gateway on it; :meth:`vault_running` and
+    :meth:`gateway` run them apart, so a gateway can stop and another start on the same vault and
+    state, as a gateway's restart does (M8 FM-39).
     """
 
     def __init__(
@@ -161,6 +166,7 @@ class GatewayDeployment:
         server: str = SERVER,
         socket_clients: Callable[[str], httpx.AsyncClient | None] | None = None,
         guarded: bool = False,
+        held: Callable[[Path, KeySet], Mapping[str, Any]] | None = None,
     ) -> None:
         self.state = tmp_path / "gateway"
         self.link = link
@@ -190,6 +196,7 @@ class GatewayDeployment:
             extra=extra,
             socket_clients=socket_clients,
             guarded=guarded,
+            held=held,
         )
 
     @property
@@ -210,43 +217,55 @@ class GatewayDeployment:
     @contextmanager
     def running(self, *, ready: bool = True) -> Iterator[Running]:
         """The vault, then the gateway on it; waits for a fresh view unless ``ready`` is off."""
+        with self.vault_running() as vault, self.gateway(vault, ready=ready) as running:
+            yield running
+
+    @contextmanager
+    def vault_running(self) -> Iterator[httpx.Client]:
+        """The vault alone, every log line of both roles to :attr:`seen` until it stops."""
         logs.set_stream(self.seen.log)
         try:
             with self.vault.running() as vault:
-                if self.link == "unix":
-                    assert self.vault.link_socket is not None
-                    link = parse_link(f"unix:{self.vault.link_socket}")
-                    keys = None
-                else:
-                    link = parse_link(str(vault.base_url).rstrip("/"))
-                    keys = KeySource(self.vault.keys.gateway_key(1))
-                limits = build_view(self.vault.policy).gateway.limits
-                marks = DriftMarks.load(self.state)
-                pool = UpstreamPool(
-                    link, keys, marks, DefinitionStore(self.state), limits=limits,
-                )  # fmt: skip
-                toolkits = None
-                if self.toolkits:
-                    toolkits = Toolkits(
-                        link, keys, marks, entry_points=lambda: ENTRY_POINTS, allow_writable=True
-                    )
-                app = GatewayApp(
-                    pool,
-                    view_client(link, keys),
-                    policy_wait=1,
-                    toolkits=toolkits,
-                    report_http=report_client(link, keys) if self.reporter else None,
-                    status_http=status_client(link, keys) if self.status_push else None,
-                    status=pushed_status,
-                )
-                app.ledger, _ = Ledger.open_at(self.state, max_bytes=limits.ledger_max_bytes)
-                with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
-                    running = Running(app, url)
-                    if ready:
-                        wait_healthy(running)
-                    yield running
+                yield vault
         finally:
             logs.set_stream(None)
+
+    @contextmanager
+    def gateway(self, vault: httpx.Client, *, ready: bool = True) -> Iterator[Running]:
+        """A gateway on the running ``vault``, on this deployment's state; waits for a fresh
+        view unless ``ready`` is off."""
+        if self.link == "unix":
+            assert self.vault.link_socket is not None
+            link = parse_link(f"unix:{self.vault.link_socket}")
+            keys = None
+        else:
+            link = parse_link(str(vault.base_url).rstrip("/"))
+            keys = KeySource(self.vault.keys.gateway_key(1))
+        limits = build_view(self.vault.policy).gateway.limits
+        marks = DriftMarks.load(self.state)
+        pool = UpstreamPool(
+            link, keys, marks, DefinitionStore(self.state), limits=limits,
+        )  # fmt: skip
+        toolkits = None
+        if self.toolkits:
+            toolkits = Toolkits(
+                link, keys, marks, entry_points=lambda: ENTRY_POINTS, allow_writable=True
+            )
+        app = GatewayApp(
+            pool,
+            view_client(link, keys),
+            policy_wait=1,
+            toolkits=toolkits,
+            report_http=report_client(link, keys) if self.reporter else None,
+            status_http=status_client(link, keys) if self.status_push else None,
+            status=pushed_status,
+        )
+        app.ledger, _ = Ledger.open_at(self.state, max_bytes=limits.ledger_max_bytes)
+        with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
+            running = Running(app, url)
+            if ready:
+                wait_healthy(running)
+            yield running
 
     def cli(self, running: Running, *argv: str) -> tuple[int, str, str]:
         """``zoeymcp <argv>`` against the running gateway's admin socket; output is recorded."""

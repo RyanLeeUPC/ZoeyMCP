@@ -11,7 +11,8 @@ in, and every write first drops the records past their time, so none of them cou
 bound.
 
 - **Bound to its client.** Every read names the client; another client's ref reads exactly as an
-  unknown one (T34).
+  unknown one (T34), and so does one held for another server, when the read names the server
+  (Z17: a result is collected on its own server's path).
 - **Delivered once.** :meth:`ResultStore.collect` hands the result over and drops its bytes; a
   later read says it was collected. :meth:`ResultStore.peek` reads the status without consuming
   it (the tasks seam, D-239).
@@ -59,13 +60,15 @@ ENDED: Final[frozenset[CallStatus]] = frozenset({"done", "denied", "expired", "w
 @dataclass(frozen=True, repr=False)
 class StoredResult:
     """A forwarded call's answer, already scrubbed (B.8): its HTTP status, content type and
-    bytes. ``lost`` says why the bytes are gone: over :data:`MAX_RESULT_BYTES`, or not kept (an
+    bytes, and the JSON-RPC id of the request it answers, which its reader binds it to (F.5 step
+    5). ``lost`` says why the bytes are gone: over :data:`MAX_RESULT_BYTES`, or not kept (an
     eviction, or a full store). Logging it raises."""
 
     status: int
     content_type: str
     body: bytes = b""
     lost: Lost | None = None
+    request_id: str | int | None = None
 
     def __repr__(self) -> str:
         return f"StoredResult(status={self.status}, lost={self.lost})"
@@ -173,9 +176,12 @@ class ResultStore:
         """The bytes the store's records hold."""
         return sum(len(r.result.body) for r in self._records.values() if r.result is not None)
 
-    def collect(self, now: int, ref: str, client: str) -> Collected | Status | Unknown:
-        """The result once, then its status (Z17)."""
-        record = self._find(now, ref, client)
+    def collect(
+        self, now: int, ref: str, client: str, server: str | None = None
+    ) -> Collected | Status | Unknown:
+        """The result once, then its status (Z17). With ``server``, a record held for another
+        server reads as an unknown one: the result is collected on its own server's path."""
+        record = self._find(now, ref, client, server)
         if record is None:
             return Unknown()
         result = record.result
@@ -185,8 +191,8 @@ class ResultStore:
         self._records[ref] = replace(record, collected=True, result=replace(result, body=b""))
         return Collected(ref, result)
 
-    def peek(self, now: int, ref: str, client: str) -> Status | Unknown:
-        record = self._find(now, ref, client)
+    def peek(self, now: int, ref: str, client: str, server: str | None = None) -> Status | Unknown:
+        record = self._find(now, ref, client, server)
         return Unknown() if record is None else _status(record)
 
     def list_for(self, now: int, client: str, server: str) -> list[Status]:
@@ -264,9 +270,13 @@ class ResultStore:
             ended = record.deadline_ms + self.grace_ms
         return now < ended + self.ttl_ms
 
-    def _find(self, now: int, ref: str, client: str) -> PendingCall | None:
+    def _find(
+        self, now: int, ref: str, client: str, server: str | None = None
+    ) -> PendingCall | None:
         record = self._records.get(ref)
         if record is None or record.client != client or not self._live(now, record):
+            return None
+        if server is not None and record.server != server:
             return None
         return record
 

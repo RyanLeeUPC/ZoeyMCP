@@ -11,15 +11,21 @@ operator's approvers and forwards it once approved. Here, after the pipeline's s
    the ledger with ``where: vault``, the arguments' keyed digest and the empty text's (the gateway
    showed nothing), fsynced;
 3. the forward carries the marker (:class:`.upstream.Held`): committed, never retried, its read
-   waiting out the vault's block (I.1). The egress transport adds the marker only after its filter
+   waiting out the vault's block (I.1), with progress sent while it blocks (F.1,
+   :func:`.approve.ticking`). The egress transport adds the marker only after its filter
    consumed the call's held registration, and the vault's answer is kept by its ref for this call
    alone (Z27);
 4. the answer is mapped (:func:`settle`, C.2's table): approved runs on as a direct call
-   (sanitized, ``decided approved_elsewhere`` written only now, C.4); ``approval_pending`` is the
-   pending answer (F.1), the record waiting with its lock until it ends; the vault's refusals each
-   get their fixed text; ``view_stale`` goes back to the pipeline (C.3, :class:`Stale`); and an
-   answer that carries neither the vault's approval nor its refusal is ``elsewhere_unheld``, its
-   result withheld.
+   (sanitized, ``decided approved_elsewhere`` written only now, C.4), and an approved forward that
+   failed is the forward's failure, as the vault's outcome of it says; ``approval_pending`` is
+   the pending answer (F.1), the record waiting with its lock until it ends, and a legacy
+   upstream session kept open for the vault's forward (F.6); the vault's refusals each get their
+   fixed text; ``view_stale`` goes back to the pipeline (C.3, :class:`Stale`); and an answer that
+   carries neither the vault's approval nor its refusal is ``elsewhere_unheld``, its result
+   withheld.
+
+A pending call's ending, once the gateway learns it (``check_approval``'s collect, F.5), closes
+its record as the vault decided it (:func:`collected`).
 
 An Elsewhere call the agent abandons (its handler cancelled) is withdrawn in the gateway's ledger,
 ``outcome unknown`` since the vault may still forward it, and the vault is told
@@ -39,19 +45,28 @@ from typing import Any, Final, Literal
 import anyio
 from mcp.types import CallToolResult, TextContent
 
-from ..common import canonical
+from ..common import canonical, ledgerformat
 from ..common.approvaltext import Plan
 from ..common.envelope import Marker
 from ..common.policy.view import ViewGateway, ViewOutOfBand
 from . import logs
 from .approvals import Decision, Key, Pending, Settings
-from .approve import FINISH_GRACE, LEDGER_DOWN, OUTCOME_MARGIN, STOPPING, Approvals, begin_refusal
+from .approve import (
+    FINISH_GRACE,
+    LEDGER_DOWN,
+    OUTCOME_MARGIN,
+    STOPPING,
+    Approvals,
+    Tick,
+    begin_refusal,
+    ticking,
+)
 from .approvers import with_ref
 from .ledger import LedgerUnavailable
 from .sanitize import map_upstream
 from .toolkitsource import ToolkitUnavailable
 from .toolsource import Grant, ServedServer
-from .upstream import Held, HeldBusy, NotAdmitted, UpstreamError
+from .upstream import Connection, Held, HeldBusy, NotAdmitted, UpstreamError
 from .vaultlink import HeldAnswer
 
 Era = Literal["legacy", "modern"]
@@ -65,8 +80,8 @@ UNREAD: Final = "refused: the vault couldn't read this call unambiguously"
 REFUSED_BY_VAULT: Final = "refused by the vault"
 # C.2's table: a vault code, the gateway's decision, and the agent's text. The outcome is
 # not_sent for each, the call having gone nowhere. A refusal the table doesn't name is unknown:
-# the vault answers a forward that failed after its approval with a plain refusal (a 502), so the
-# call may have run.
+# the vault's refusal of a forward that failed after its approval carries the approval's headers
+# (settle reads it as approved), but one that lost them may have run too.
 VAULT_ANSWERS: Final[dict[str, tuple[Decision, str]]] = {
     "approval_declined": ("decline", "refused: the operator declined this call"),
     "approval_expired": ("timeout", "refused: no answer before the deadline"),
@@ -127,6 +142,7 @@ class HeldCall:
     forward: Forward
     finish: Finish
     prepare: Callable[[], Awaitable[Plan | CallToolResult | None]] | None = None
+    tick: Tick | None = None  # the agent's progress, while the call blocks (F.1)
 
     @property
     def key(self) -> Key:
@@ -195,7 +211,7 @@ async def run(approvals: Approvals, call: HeldCall) -> CallToolResult | Stale:
             expires=int((asked_wall + settings.timeout) * 1000),
         )
     except LedgerUnavailable:
-        _release(approvals, begun, "error", settings)
+        _release(approvals, begun, "error", settings.cooldown)
         return _refuse(call, "ledger_unavailable", LEDGER_DOWN)
     logs.event(
         "approval_asked",
@@ -217,8 +233,9 @@ async def run(approvals: Approvals, call: HeldCall) -> CallToolResult | Stale:
     held = Held(marker, 0.0 if call.toolkit else out.block_seconds + OUTCOME_MARGIN)
     failure: BaseException | None = None
     raw: CallToolResult | None = None
+    grant = Grant(call.ref, call.args, plan)
     try:
-        raw = await call.forward(held, Grant(call.ref, call.args, plan))
+        raw = await ticking(lambda: call.forward(held, grant), call.tick, approvals.clock)
     except HeldBusy:
         await _ended(approvals, begun, "error", "not_sent", settings)
         return _refuse(call, "identical_in_flight", IDENTICAL_IN_FLIGHT)
@@ -228,7 +245,17 @@ async def run(approvals: Approvals, call: HeldCall) -> CallToolResult | Stale:
         with anyio.CancelScope(shield=True), anyio.move_on_after(FINISH_GRACE * 2):
             await _abandoned(approvals, call, begun, settings, held.answer)
         raise
-    return await settle(approvals, call, begun, settings, held.answer, raw, failure, asked_wall)
+    return await settle(
+        approvals,
+        call,
+        begun,
+        settings,
+        held.answer,
+        raw,
+        failure,
+        asked_wall,
+        connection=held.connection,
+    )
 
 
 async def settle(
@@ -240,33 +267,46 @@ async def settle(
     raw: CallToolResult | None,
     failure: BaseException | None,
     asked_wall: float,
+    *,
+    connection: Connection | None = None,
 ) -> CallToolResult | Stale:
-    """C.2's table: the vault's answer to the call, with the ledger's records for it."""
+    """C.2's table: the vault's answer to the call, with the ledger's records for it.
+    ``connection`` is the upstream connection the call went out on, if it went out."""
     ref = call.ref
-    if answer is not None and answer.refused:
-        return await _refused(approvals, call, record, settings, answer, asked_wall)
-    if answer is not None and answer.approved and answer.ref == ref:
+    approved = answer is not None and answer.approved and answer.ref == ref
+    if answer is not None and answer.refused and not approved:
+        return await _refused(approvals, call, record, settings, answer, asked_wall, connection)
+    if answer is not None and approved:
         await _decided(approvals, record, "approved_elsewhere")
+        if answer.refused and answer.code == "held_result_too_large":
+            await _finish(approvals, record, "unknown", None, settings.cooldown, "accept")
+            return with_ref(TOO_LARGE, ref)
+        if answer.refused:
+            # The vault forwarded it, and the forward failed: its own refusal, after the
+            # approval, says how the forward ended on its chain (the SDK's error for it doesn't).
+            outcome, detail, result = approved_failure(answer.outcome, ref)
+            await _finish(approvals, record, outcome, detail, settings.cooldown, "accept")
+            return result
         if failure is not None:
             outcome, detail, result = _failed(failure, ref)
-            await _finish(approvals, record, outcome, detail, settings, "accept")
+            await _finish(approvals, record, outcome, detail, settings.cooldown, "accept")
             return result
         assert raw is not None  # noqa: S101 - the forward returned, or it raised
         result = call.finish(raw)
         outcome = "tool_error" if result.is_error else "ok"
-        await _finish(approvals, record, outcome, None, settings, "accept")
+        await _finish(approvals, record, outcome, None, settings.cooldown, "accept")
         return result
     if answer is None and raw is None:
         # Nothing answered the call: it failed before the vault, or on the way back.
         assert failure is not None  # noqa: S101 - the forward returned, or it raised
         await _decided(approvals, record, "error")
         outcome, detail, result = _failed(failure, ref, sent=False)
-        await _finish(approvals, record, outcome, detail, settings, "error")
+        await _finish(approvals, record, outcome, detail, settings.cooldown, "error")
         return result
     if answer is None and call.toolkit:
         # The toolkit's body sent no held write: nothing was held, nothing asked.
         await _decided(approvals, record, "error")
-        await _finish(approvals, record, "not_sent", None, settings, "error")
+        await _finish(approvals, record, "not_sent", None, settings.cooldown, "error")
         assert raw is not None  # noqa: S101 - no answer, and no failure
         return call.finish(raw)
     # An answer without the vault's approval or refusal, or none at all for a call that came
@@ -282,7 +322,7 @@ async def settle(
         level="error",
     )
     await _decided(approvals, record, "error")
-    await _finish(approvals, record, "unknown", None, settings, "error")
+    await _finish(approvals, record, "unknown", None, settings.cooldown, "error")
     return with_ref(UNHELD, ref)
 
 
@@ -293,8 +333,10 @@ async def _refused(
     settings: Settings,
     answer: HeldAnswer,
     asked_wall: float,
+    connection: Connection | None,
 ) -> CallToolResult | Stale:
-    """A refusal the vault made itself (``x-zoeymcp-vault: refused``), by its code."""
+    """A refusal the vault made itself (``x-zoeymcp-vault: refused``) before any approval, by
+    its code."""
     ref, code = call.ref, answer.code
     outcome = "not_sent"
     if code == "view_stale":
@@ -305,11 +347,13 @@ async def _refused(
         assert out is not None  # noqa: S101 - run() checked it
         until = _deadline(answer.deadline, asked_wall + settings.timeout)
         current = approvals.table.pend(ref, until)
+        if connection is not None and connection.era == "legacy":
+            _keep(approvals, connection, ref, until, settings.call_timeout)
         await _decided(approvals, current, "pending")
         return pending_answer(ref, call.tool, until, out)
     if code == "held_result_too_large":
         await _decided(approvals, record, "error")
-        await _finish(approvals, record, "unknown", None, settings, "error")
+        await _finish(approvals, record, "unknown", None, settings.cooldown, "error")
         return with_ref(TOO_LARGE, ref)
     known = VAULT_ANSWERS.get(code or "")
     if known is not None:
@@ -329,8 +373,58 @@ async def _refused(
         _log_refused(call, "vault_refused", code, "warning")
         decision, text, outcome = "error", REFUSED_BY_VAULT, "unknown"
     await _decided(approvals, record, _ledgered(decision))
-    await _finish(approvals, record, outcome, None, settings, decision)
+    await _finish(approvals, record, outcome, None, settings.cooldown, decision)
     return with_ref(text, ref)
+
+
+def _keep(
+    approvals: Approvals, connection: Connection, ref: str, until: float, call_timeout: float
+) -> None:
+    """F.6: a pending call's legacy upstream session stays open for the vault's forward, until
+    its outcome is known or its deadline and ``call_timeout`` passed. A session that ends anyway
+    fails that forward ``upstream_error session_expired``, never retried (D-228)."""
+    left = max(0.0, until - approvals.wall()) + call_timeout
+    connection.keep_for(ref, connection.pool.clock() + left)
+    approvals.kept[ref] = lambda: connection.unkeep(ref)
+
+
+async def collected(
+    approvals: Approvals,
+    ref: str,
+    decision: LedgerDecision,
+    outcome: str,
+    detail: str | None,
+    cooldown: float,
+) -> None:
+    """A pending held call's ending, as the gateway learned it from the vault (F.5, D.2): its
+    own ``decided`` and ``outcome`` records, the lock freed with the cooldown a decline or an
+    expiry starts, and its upstream session let go (F.6). A ref with no pending record of a
+    held call here changes nothing."""
+    record = approvals.table.get(ref)
+    if (
+        record is None
+        or record.how != "elsewhere"
+        or record.pending_until is None
+        or record.decision is not None
+    ):
+        return
+    table: Decision = "accept" if decision == "approved_elsewhere" else _undecided(decision)
+    # Decided in this synchronous section: a second collect of the same ending records nothing.
+    approvals.table.decide(ref, table, approvals.clock())
+    approvals.release_kept(ref)
+    kept = detail if detail in ledgerformat.DETAILS else None
+    await _decided(approvals, record, decision)
+    await _finish(approvals, record, outcome, kept, cooldown, table)
+
+
+def _undecided(decision: LedgerDecision) -> Decision:
+    """The table's decision for an ending the vault decided against the call."""
+    ended: dict[str, Decision] = {
+        "decline": "decline",
+        "timeout": "timeout",
+        "withdrawn": "withdrawn",
+    }
+    return ended.get(decision, "error")
 
 
 async def stale_refused(
@@ -374,7 +468,7 @@ async def _abandoned(
         except Exception as exc:  # the vault's own cancel rules still apply (B.6)
             logs.event("approval_withdraw_failed", ref=call.ref, error_type=type(exc).__name__)
     await _decided(approvals, record, "withdrawn")
-    await _finish(approvals, record, "unknown", None, settings, "withdrawn")
+    await _finish(approvals, record, "unknown", None, settings.cooldown, "withdrawn")
 
 
 # --- the pending answer (F.1) -------------------------------------------------------------------
@@ -460,7 +554,7 @@ async def _finish(
     record: Pending,
     outcome: str,
     detail: str | None,
-    settings: Settings,
+    cooldown: float,
     decision: Decision,
 ) -> None:
     """The call's outcome on the ledger, then the lock freed, with the cooldown its decision
@@ -489,22 +583,22 @@ async def _finish(
             ledger_hash=anchor.hash if anchor is not None else None,
         )
     finally:
-        _release(approvals, record, decision, settings)
+        _release(approvals, record, decision, cooldown)
 
 
 async def _ended(
     approvals: Approvals, record: Pending, decision: Decision, outcome: str, settings: Settings
 ) -> None:
     await _decided(approvals, record, _ledgered(decision))
-    await _finish(approvals, record, outcome, None, settings, decision)
+    await _finish(approvals, record, outcome, None, settings.cooldown, decision)
 
 
-def _release(approvals: Approvals, record: Pending, decision: Decision, settings: Settings) -> None:
+def _release(approvals: Approvals, record: Pending, decision: Decision, cooldown: float) -> None:
     """Decide the record as the vault did (the first decision stands) and free its lock."""
     now = approvals.clock()
     if approvals.table.get(record.ref) is not None:
         approvals.table.decide(record.ref, decision, now)
-    approvals.table.finish(record.key, record.ref, now, settings_cooldown=settings.cooldown)
+    approvals.table.finish(record.key, record.ref, now, settings_cooldown=cooldown)
 
 
 # --- the agent's texts ----------------------------------------------------------------------------
@@ -533,6 +627,22 @@ def _refuse(call: HeldCall, reason: str, text: str) -> CallToolResult:
         reason=reason,
     )
     return with_ref(text, call.ref)
+
+
+def approved_failure(
+    outcome: object, ref: str, status: int | None = None
+) -> tuple[str, str | None, CallToolResult]:
+    """The ledger's outcome and the agent's answer for an approved held call whose forward
+    failed, from the vault's outcome of it (B.8): never sent; an upstream that answered with an
+    error (with ``status`` 404, the session the forward went out on was gone: F.6, D-228); or
+    one that may have run, as is any outcome the vault didn't name."""
+    if outcome == "not_sent":
+        return "not_sent", None, map_upstream("unavailable", ref)
+    if outcome == "upstream_error" and status == 404:
+        return "upstream_error", "session_expired", map_upstream("connection_lost", ref)
+    if outcome == "upstream_error":
+        return "upstream_error", None, map_upstream("rpc_error", ref)
+    return "unknown", None, map_upstream("connection_lost", ref)
 
 
 def _failed(

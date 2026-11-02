@@ -116,7 +116,14 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from ..common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
-from ..common.resultstore import Full, PendingCall, ResultStore, StoredResult
+from ..common.resultstore import (
+    Collected,
+    Full,
+    PendingCall,
+    ResultStore,
+    Status,
+    StoredResult,
+)
 from ..common.reviewreport import RemoteReport, ToolkitReport
 from . import internal, logs, netclient, secretops, statusreport
 from .approvers import EDIT_GRACE, ApproverHub, NotShown
@@ -270,6 +277,9 @@ class Refused(Exception):
 
     ``code`` is a stable code for the response body, set only after identity and a rule matched.
     ``retry_after`` (seconds) becomes a ``Retry-After`` header, and ``allow`` an ``Allow`` header.
+    ``approved`` is the ref of the held call an approval forwarded, whose forward ended in this
+    refusal: the answer carries the approval's headers too (M8 design B.6, C.2), and its body the
+    forward's outcome on the chain, so the gateway records the call as approved, as it ended.
     """
 
     def __init__(
@@ -281,12 +291,14 @@ class Refused(Exception):
         retry_after: int | None = None,
         allow: str | None = None,
         extra: Mapping[str, Any] | None = None,
+        approved: str | None = None,
     ) -> None:
         self.status = status
         self.reason = reason
         self.code = code
         self.retry_after = retry_after
         self.allow = allow
+        self.approved = approved
         # Fields the body carries beside the code: a held call's JSON pointer or deadline, never
         # a value (M8 design B.2, B.6).
         self.extra = dict(extra or {})
@@ -1115,6 +1127,8 @@ class VaultApp:
                 headers["retry-after"] = str(refusal.retry_after)
             if refusal.allow is not None:
                 headers["allow"] = refusal.allow
+            if refusal.approved is not None:
+                headers.update((k.decode(), v.decode()) for k, v in _approved(refusal.approved))
             response = JSONResponse(body, status_code=refusal.status, headers=headers)
         else:
             log["status"] = response.status_code
@@ -1419,6 +1433,8 @@ class VaultApp:
             return await self._review_report(request, log)
         if decided is internal.STATUS:
             return await self._status_report(request, log)
+        if decided is internal.COLLECT:
+            return await self._collect(request, log)
         return await self._view_answer(request, log)
 
     def _egress_key_presented(self, request: Request) -> bool:
@@ -1715,6 +1731,86 @@ class VaultApp:
         if self._status_sparse("received"):
             logs.event("status_received", servers=len(report.servers), bytes=len(body))
         return JSONResponse({"v": 1}, headers={"cache-control": "no-store"})
+
+    # --- collecting a held call's result (M8 design E.2, F.5) ---------------------------------
+
+    async def _collect(self, request: Request, log: dict[str, Any]) -> Response:
+        """``POST /_zoeymcp/gateway/v1/approvals/collect``: a held call's result, or its status,
+        for the client the gateway reported and the server it was held for (E.2, F.5; T34).
+
+        Before any body byte is read: no query (400), one ``Content-Type: application/json``
+        (415) and one ``Content-Length`` (411) of at most 1 KiB (413 ``too_large``). The body is
+        :func:`.internal.collect_body`'s (400 ``invalid``). The answer is always 200:
+
+        - the result, once (``state: done``; its status, content type, the id of the request it
+          answers, and its bytes in base64, as the forward's answer was kept, scrubbed: B.8),
+          logged ``approval_collected``;
+        - else the call's status (its state, outcome and deadline, whether it was collected
+          already, why its result was lost; a withdrawal's reason);
+        - else, for a ref the store doesn't hold but the start's recent endings do, from the same
+          client, how it ended (``restarted``: F.5 step 4);
+        - else ``state: unknown``, as for another client's ref (T34).
+
+        With no ref, the client's own calls on the server (Q46): their statuses, never a
+        result."""
+        if request.scope.get("query_string"):
+            raise Refused(400, "the collect path takes no query")
+        most = internal.COLLECT_MAX_BYTES
+        if _json_length(request, kind="a collect") > most:
+            raise Refused(413, "a collect is at most 1 KiB", code="too_large")
+        too_large = ("a collect is at most 1 KiB", "too_large")
+        body = await _read_json_body(request, most, REPORT_DEADLINE, too_large, kind="the collect")
+        try:
+            asked = internal.collect_body(canonical.loads_strict(body, max_bytes=most))
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason, code="invalid") from exc
+        except ValueError as exc:
+            raise Refused(400, "the collect isn't strict JSON", code="invalid") from exc
+        now = _wall_ms()
+        no_store = {"cache-control": "no-store"}
+        if asked.ref is None:
+            listed = self._results.list_for(now, asked.client, asked.server)
+            calls = [self._collect_status(found) for found in listed]
+            return JSONResponse({"v": 1, "calls": calls}, headers=no_store)
+        ref = log["ref"] = asked.ref
+        found = self._results.collect(now, ref, asked.client, asked.server)
+        if isinstance(found, Collected):
+            logs.event("approval_collected", ref=ref)
+            status = self._results.peek(now, ref, asked.client, asked.server)
+            answer: dict[str, Any] = {"ref": ref}
+            if isinstance(status, Status):
+                answer = self._collect_status(status)
+            stored = found.result
+            answer["result"] = {
+                "status": stored.status,
+                "content_type": stored.content_type,
+                "request_id": stored.request_id,
+                "body": base64.b64encode(stored.body).decode("ascii"),
+            }
+            return JSONResponse({"v": 1, **answer}, headers=no_store)
+        if isinstance(found, Status):
+            return JSONResponse({"v": 1, **self._collect_status(found)}, headers=no_store)
+        ending = self._holds.ending(ref)
+        if ending is not None and ending.id is None and ending.client == asked.client:
+            # Rebuilt from the chain at start: whatever it held in memory is gone (F.5 step 4).
+            ended = {"ref": ref, "state": ending.state, "detail": ending.detail}
+            return JSONResponse({"v": 1, **ended, "restarted": True}, headers=no_store)
+        return JSONResponse({"v": 1, "ref": ref, "state": "unknown"}, headers=no_store)
+
+    def _collect_status(self, status: Status) -> dict[str, Any]:
+        """A collect's answer for a record whose result it doesn't hand over: no result, no text
+        (Q46). A withdrawn call names its reason, as its hold's ending recorded it."""
+        ending = self._holds.ending(status.ref) if status.status == "withdrawn" else None
+        return {
+            "ref": status.ref,
+            "tool": status.tool,
+            "state": status.status,
+            "outcome": status.outcome,
+            "deadline": _iso_ms(status.deadline_ms),
+            "collected": status.collected,
+            "lost": status.lost,
+            "detail": ending.detail if ending is not None else None,
+        }
 
     def _status_refused(self, code: str | None) -> None:
         """``status_refused`` with N.3's reason, at most once a minute."""
@@ -2467,6 +2563,12 @@ class VaultApp:
             writes_unknown=done.writes_unknown,
         )
         logs.event("approval_forwarded", ref=hold.ref, outcome=done.outcome)
+        if isinstance(done.response, Refused):
+            # A forward that ended in the vault's own refusal was still approved (C.2): its answer
+            # says so, with the approval's headers and the chain's outcome (never sent, may have
+            # run, or the upstream's error), so the gateway's ledger records it as this one does.
+            done.response.approved = hold.ref
+            done.response.extra["outcome"] = done.outcome
         # One synchronous section: the caller is still waiting for this answer, or it left. A
         # pending record of a caller that got the answer itself keeps the outcome alone.
         current = self._holds.get(hold.id) or hold
@@ -2581,10 +2683,14 @@ class VaultApp:
                 failed = Refused(502, f"upstream response failed: {type(exc).__name__}")
                 return _failed(failed, "unknown")
             if answer.too_large:
-                stored = StoredResult(answer.status, answer.content_type, lost="too_large")
+                stored = StoredResult(
+                    answer.status, answer.content_type, lost="too_large", request_id=call.id
+                )
                 too_large = Refused(502, "the answer was over 4 MiB", code="held_result_too_large")
                 return _Done(too_large, answer.outcome, None, 0, 0, stored)
-            stored = StoredResult(answer.status, answer.content_type, answer.body)
+            stored = StoredResult(
+                answer.status, answer.content_type, answer.body, request_id=call.id
+            )
             response = Response(answer.body, status_code=answer.status)
             response.raw_headers = [
                 *_raw(list(answer.headers)),

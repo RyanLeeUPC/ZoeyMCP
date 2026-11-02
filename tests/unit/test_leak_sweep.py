@@ -61,7 +61,9 @@ The vault hold (step 9: B.3, B.6, B.8, FM-33) shows a held call's argument value
 approver surface only (Z14): no log line, refusal, chain file or health report holds one, nor the
 route's credential, which reaches the upstream once approved and nothing else; an upstream's echo
 of it is scrubbed from the waiting caller's answer and from a detached result in the result store,
-and a held send's mail password reaches the transport alone.
+and a held send's mail password reaches the transport alone. A detached result, collected through
+the collect path (step 11: F.5, O.6), holds the echo only scrubbed, and its bytes reach no log
+line.
 
 A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
 token, a placeholder, a token header, a forced query value, a connector username and a recipient,
@@ -134,7 +136,6 @@ from zoeymcp.common.policy.plan import WritePlan, normalize
 from zoeymcp.common.policy.ratchet import initial
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
-from zoeymcp.common.resultstore import Collected
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.egress.allowlist import Allowlist, KeySource
 from zoeymcp.entrypoint import launcher
@@ -1364,7 +1365,8 @@ def _no_space(*args: Any, **kwargs: Any) -> int:
 async def test_a_held_call_leaks_nothing(tmp_path: Path) -> None:
     """The vault hold's new secret-bearing paths (M8 design O.6, FM-33): the credential added
     after an approval, the upstream's answer echoing it (to a waiting caller, and detached to the
-    result store), a held send's password, and the argument values the surface shows."""
+    result store, then collected through the collect path: a pending result's bytes), a held
+    send's password, and the argument values the surface shows."""
     argument = "held-argument-sentinel-41c7"
     rig = hold_rig.HoldRig(tmp_path, {"block_seconds": 0, "mail": True}, link="asgi")
     rig.upstream.echo = True
@@ -1390,9 +1392,19 @@ async def test_a_held_call_leaks_nothing(tmp_path: Path) -> None:
                 assert argument in hold.text.value  # the surface's, alone (Z14)
                 await rig.decide(hold)
                 await rig.settled()
-                kept = rig.app.results.collect(rig.now_ms(), hold.ref, "agent1")
-                assert isinstance(kept, Collected)
-                answers.append(kept.result.body.decode())
+                asked = {"epoch": hold_rig.EPOCH, "client": "agent1", "server": "shop"}
+                collect = "/_zoeymcp/gateway/v1/approvals/collect"
+                result_bytes = b""
+                for sent_body in ({**asked, "ref": hold.ref}, asked, {**asked, "ref": hold.ref}):
+                    collected = await http.post(
+                        collect,
+                        content=canonical.dumps_canonical(sent_body),
+                        headers={"content-type": "application/json"},
+                    )
+                    answers.append(collected.text + repr(collected.headers.multi_items()))
+                    if "result" in collected.json():
+                        result_bytes = base64.b64decode(collected.json()["result"]["body"])
+                answers.append(result_bytes.decode())
                 # Approved while its caller waits: the echo is scrubbed from that answer too.
                 await rig.reload(block_seconds=120)
                 waiting = hold_rig.Answer()
@@ -1441,7 +1453,10 @@ async def test_a_held_call_leaks_nothing(tmp_path: Path) -> None:
         assert value.encode() not in files
         for seen in answers:
             assert value not in seen
-    assert b"[REDACTED]" in kept.result.body
+    assert b"[REDACTED]" in result_bytes
+    # The pending result's bytes reach no log line (O.6).
+    assert b"you sent" in result_bytes
+    assert "you sent" not in text
     # Each secret reached what it is for, and only that.
     assert len(rig.upstream.received) == 2
     for _, _, sent_headers, _ in rig.upstream.received:

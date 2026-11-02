@@ -1,8 +1,8 @@
 """The vault's own endpoints (M7 design G.1; O.2 ``test_internal.py``): one table, decided before
 any body byte is read, the review jobs poll's query (F.2, CR-8), (step 17b) the egress role's
-allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21), and (M6 step 7)
+allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21), (M6 step 7)
 the gateway's status path, one report at a time and at most one accepted per 5 s (K.1, T-12,
-FM-19)."""
+FM-19), and (M8 step 11) the collect path and its body (E.2, F.5, Q46)."""
 
 from __future__ import annotations
 
@@ -15,18 +15,21 @@ from zoeymcp.common.policy.match import NormalizedPath, RequestRejected
 from zoeymcp.vault import app, internal
 from zoeymcp.vault.internal import (
     ALLOWLISTS,
+    COLLECT,
     ENDPOINTS,
     LEDGER,
     REVIEW_JOBS,
     REVIEW_REPORT,
     STATUS,
     VIEW,
+    Collect,
     Endpoint,
     Refusal,
     StatusGate,
     _egress_path,
     _path,
     allowlist_wait,
+    collect_body,
     decide,
     find,
     jobs_query,
@@ -37,7 +40,7 @@ from zoeymcp.vault.reviewjobs import OLDER
 DIGEST = "sha256:" + "ab" * 32
 TAKES = "the review jobs path takes wait, view and kinds, once each"
 KINDS = "kinds is review, or review,clear"
-GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS)
+GATEWAY_ENDPOINTS = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS, COLLECT)
 
 
 def path(text: str) -> NormalizedPath:
@@ -49,7 +52,8 @@ def path(text: str) -> NormalizedPath:
 
 def test_the_table_is_g1s() -> None:
     """Path, methods, identity, body cap and waiters, as G.1 lists them, M6 K.1's status path
-    after the gateway's other rows, the egress row last (step 17b)."""
+    after the gateway's other rows, M8 E.2's collect after it, the egress row last (step
+    17b)."""
     rows = [
         (e.path.text, e.methods, e.identity, e.body_cap, e.waiters, e.name, e.label)
         for e in ENDPOINTS
@@ -93,6 +97,15 @@ def test_the_table_is_g1s() -> None:
             "the status path",
         ),
         (
+            "/_zoeymcp/gateway/v1/approvals/collect",
+            ("POST",),
+            "gateway",
+            1024,
+            None,
+            "approvals_collect",
+            "the collect path",
+        ),
+        (
             "/_zoeymcp/egress/v1/allowlists",
             ("GET",),
             "egress",
@@ -106,6 +119,7 @@ def test_the_table_is_g1s() -> None:
     assert REVIEW_JOBS.waiters == internal.REVIEW_WAITERS
     assert ALLOWLISTS.waiters == internal.ALLOWLIST_WAITERS
     assert STATUS.body_cap == internal.STATUS_MAX_BYTES
+    assert COLLECT.body_cap == internal.COLLECT_MAX_BYTES == 1024
     assert (*GATEWAY_ENDPOINTS, ALLOWLISTS) == ENDPOINTS
 
 
@@ -165,6 +179,10 @@ def test_each_path_finds_its_row(endpoint: Endpoint) -> None:
         "/_zoeymcp/egress/v1/allowlists/vault",
         "/_zoeymcp/gateway/v1/allowlists",
         "/_zoeymcp/egress/v1/view",
+        "/_zoeymcp/gateway/v1/approvals",
+        "/_zoeymcp/gateway/v1/approvals/Collect",
+        "/_zoeymcp/gateway/v1/collect",
+        "/_zoeymcp/gateway/v1/approvals/collect/x",
     ],
 )
 def test_anything_else_is_404(text: str) -> None:
@@ -202,6 +220,7 @@ def test_the_gateway_reaches_each_method(endpoint: Endpoint, listener: internal.
         (REVIEW_JOBS, "the review jobs path is for the gateway only"),
         (REVIEW_REPORT, "the review report path is for the gateway only"),
         (STATUS, "the status path is for the gateway only"),
+        (COLLECT, "the collect path is for the gateway only"),
     ],
 )
 @pytest.mark.parametrize("listener", ["gateway", "tcp"])
@@ -223,6 +242,7 @@ def test_no_identity_is_the_bare_403_before_the_method(
         (REVIEW_REPORT, "post", "the review report path takes POST only", "POST"),
         (STATUS, "GET", "the status path takes POST only", "POST"),
         (STATUS, "PUT", "the status path takes POST only", "POST"),
+        (COLLECT, "GET", "the collect path takes POST only", "POST"),
     ],
 )
 def test_another_method_is_405_with_allow(
@@ -455,3 +475,97 @@ def test_a_refused_report_doesnt_start_the_interval() -> None:
     gate.end(106.5, accepted=False)  # refused: invalid, say
     assert gate.accepted_at == 100.0
     assert gate.begin(106.5) is None
+
+
+# --- the collect path's body (M8 design E.2, F.5, Q46) --------------------------------------------
+
+EPOCH = "0123456789ab"
+REF = "0123456789abcdef"
+ONE = {"epoch": EPOCH, "client": "agent1", "server": "shop", "ref": REF}
+
+
+def test_a_collect_names_one_call() -> None:
+    assert collect_body(ONE) == Collect(EPOCH, "agent1", "shop", REF)
+
+
+def test_a_collect_with_no_ref_lists_the_clients_calls() -> None:
+    listed = {key: value for key, value in ONE.items() if key != "ref"}
+    assert collect_body(listed) == Collect(EPOCH, "agent1", "shop", None)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [ONE],
+        "x",
+        None,
+        {},
+        {**ONE, "extra": "1"},
+        {key: value for key, value in ONE.items() if key != "epoch"},
+        {key: value for key, value in ONE.items() if key != "client"},
+        {key: value for key, value in ONE.items() if key != "server"},
+        {"ref": REF, "epoch": EPOCH},
+    ],
+    ids=["array", "string", "null", "empty", "extra", "no-epoch", "no-client", "no-server", "two"],
+)
+def test_a_collect_names_its_fields_exactly(document: object) -> None:
+    with pytest.raises(RequestRejected):
+        collect_body(document)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("epoch", "0123456789a"),
+        ("epoch", "0123456789abc"),
+        ("epoch", "0123456789AB"),
+        ("epoch", 123456789012),
+        ("ref", "0123456789abcde"),
+        ("ref", "0123456789abcdef0"),
+        ("ref", "0123456789ABCDEF"),
+        ("ref", "0123456789abcdeg"),
+        ("ref", None),
+        ("client", "Agent1"),
+        ("client", "-agent"),
+        ("client", ""),
+        ("client", "a" * 64),
+        ("client", ["agent1"]),
+        ("server", "shop/x"),
+        ("server", "shop\n"),
+    ],
+    ids=[
+        "epoch-short",
+        "epoch-long",
+        "epoch-upper",
+        "epoch-number",
+        "ref-short",
+        "ref-long",
+        "ref-upper",
+        "ref-not-hex",
+        "ref-null",
+        "client-upper",
+        "client-dash-first",
+        "client-empty",
+        "client-too-long",
+        "client-list",
+        "server-slash",
+        "server-line-break",
+    ],
+)
+def test_each_field_has_its_form(key: str, value: object) -> None:
+    with pytest.raises(RequestRejected, match=f"a collect's {key} isn't of its form"):
+        collect_body({**ONE, key: value})
+
+
+def test_the_longest_names_are_taken() -> None:
+    name = "a" + "b" * 62
+    assert collect_body({**ONE, "client": name, "server": name}).client == name
+
+
+def test_the_refusals_name_what_is_wrong() -> None:
+    with pytest.raises(RequestRejected) as caught:
+        collect_body([])
+    assert caught.value.reason == "a collect is a JSON object"
+    with pytest.raises(RequestRejected) as caught:
+        collect_body({"epoch": EPOCH})
+    assert caught.value.reason == "a collect names epoch, client, server and, for one call, ref"

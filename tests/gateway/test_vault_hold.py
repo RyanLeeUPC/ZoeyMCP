@@ -17,12 +17,17 @@ both links (TCP with the gateway key, and the link socket on Linux; D-72's requi
   30 s; a flood is bounded and told once (FM-19); a policy change withdraws what it no longer
   holds as it was (Z7's rows);
 - a stop drains a forward approved just before it (I.2), and a surface that fails leaves the hold
-  waiting to its deadline (G.3, J8).
+  waiting to its deadline (G.3, J8);
+- (step 11) a forward that fails after its approval is refused with the approval's headers too
+  (C.2); and the collect path (E.2, F.5): a result handed over once, to its client on its server
+  only (T34), a call's status and a withdrawal's reason, the client's own calls (Q46), how a call
+  ended across a restart (F.5 step 4), and the body's rules.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import io
 import json
@@ -37,6 +42,7 @@ import pytest
 
 from tests.gateway.holdrig import (
     BOUND,
+    EPOCH,
     LINKS,
     MODERN,
     OTHER_PIN,
@@ -64,13 +70,14 @@ from zoeymcp.vault import app as vault_app
 from zoeymcp.vault import heldcommit, logs
 from zoeymcp.vault.admin import HealthReader
 from zoeymcp.vault.approvers import NOTICE, NotShown
-from zoeymcp.vault.heldcommit import outcome_of, read_answer
+from zoeymcp.vault.heldcommit import read_answer
 from zoeymcp.vault.holds import MAX_PER_TOOL, Decided, DecideRefusal, Hold
 from zoeymcp.vault.request import SSEScrubber
 
 pytestmark = pytest.mark.anyio
 REF_A, REF_B, REF_C, REF_D = (f"00000000000000b{n}" for n in "abcd")
 SHOP = "/shop/mcp"
+COLLECT = "/_zoeymcp/gateway/v1/approvals/collect"
 
 
 @pytest.fixture
@@ -939,42 +946,7 @@ async def test_change_withdraws(tmp_path: Path, link: str, change: dict[str, Any
 
 
 # --- what a forward's answer was (B.8) and who shows a hold (D.1) --------------------------------
-
-
-@pytest.mark.parametrize(
-    ("status", "content_type", "body", "outcome"),
-    [
-        (200, "application/json", b'{"jsonrpc":"2.0","id":1,"result":{"isError":false}}', "ok"),
-        (
-            200,
-            "application/json",
-            b'{"jsonrpc":"2.0","id":1,"result":{"isError":true}}',
-            "tool_error",
-        ),
-        (
-            200,
-            "application/json",
-            b'{"jsonrpc":"2.0","id":1,"error":{"code":-1}}',
-            "upstream_error",
-        ),
-        (200, "application/json", b'{"jsonrpc":"2.0","id":2,"result":{}}', "upstream_error"),
-        (500, "application/json", b'{"jsonrpc":"2.0","id":1,"result":{}}', "upstream_error"),
-        (200, "text/plain", b"ok", "upstream_error"),
-        (
-            200,
-            "text/event-stream",
-            b'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
-            b'data: {"jsonrpc":"2.0","id":1,\ndata: "result":{"isError":true}}\n\n',
-            "tool_error",
-        ),
-        (200, "text/event-stream", b"data: not json\n\n", "upstream_error"),
-    ],
-    ids=["ok", "is-error", "rpc-error", "other-id", "status", "not-json", "sse", "sse-garbage"],
-)
-def test_the_outcome_is_read_from_the_whole_answer(
-    status: int, content_type: str, body: bytes, outcome: str
-) -> None:
-    assert outcome_of(status, content_type, body, 1) == outcome
+# (Its outcome, read by common/heldresult.py, is tested in tests/unit/test_heldresult.py.)
 
 
 @pytest.mark.parametrize(("status", "outcome"), [(200, "unknown"), (500, "upstream_error")])
@@ -1112,3 +1084,213 @@ async def test_stop_waits_for_an_approval_being_recorded(
     assert rig.kinds(REF_A) == [("asked", None), ("decided", "accept"), ("outcome", "ok")]
     assert answer.json()["result"]["isError"] is False
     assert len(rig.upstream.posts()) == 1
+
+
+# --- a forward that fails after its approval (C.2; step 10's deviation 17) ------------------------
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_failed_forward_still_says_approved(tmp_path: Path, link: str) -> None:
+    """The upstream answers the approved forward with a redirect, which the vault never
+    follows: its refusal carries the approval's headers, and the outcome its chain says
+    (``upstream_error``), so the gateway records the call approved as it ended."""
+    rig = HoldRig(tmp_path, link=link)
+    rig.upstream.redirect = True
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            answer = Answer()
+            async with anyio.create_task_group() as group:
+                group.start_soon(answer.post, http, SHOP, call(), headers(held=marker(REF_A)))
+                [hold] = await rig.surface.holds(1)
+                await rig.decide(hold)
+            await rig.settled()
+    response = answer.response
+    assert response is not None
+    assert response.status_code == 502
+    assert response.headers["x-zoeymcp-vault"] == "refused"
+    assert response.headers["x-zoeymcp-approval"] == "approved"
+    assert response.headers["x-zoeymcp-held-ref"] == REF_A
+    assert response.json()["outcome"] == "upstream_error"
+    assert rig.kinds(REF_A)[1:] == [("decided", "accept"), ("outcome", "upstream_error")]
+    assert len(rig.upstream.posts()) == 1
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_refusal_before_any_approval_says_nothing_of_one(tmp_path: Path, link: str) -> None:
+    rig = HoldRig(tmp_path, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            response = await http.post(SHOP, content=b"[]", headers=headers(held=marker(REF_A)))
+    assert response.headers["x-zoeymcp-vault"] == "refused"
+    assert "x-zoeymcp-approval" not in response.headers
+    assert "x-zoeymcp-held-ref" not in response.headers
+    assert "outcome" not in response.json()
+
+
+# --- collecting a held call's result (E.2, F.5) -----------------------------------------------
+
+
+async def collect(
+    http: Any, ref: str | None, *, client: str = "agent1", server: str = "shop"
+) -> dict[str, Any]:
+    """The collect path's answer for ``ref`` (None: the client's own calls on ``server``)."""
+    body: dict[str, str] = {"epoch": EPOCH, "client": client, "server": server}
+    if ref is not None:
+        body["ref"] = ref
+    sent = {"content-type": "application/json"}
+    response = await http.post(COLLECT, content=canonical.dumps_canonical(body), headers=sent)
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    found: dict[str, Any] = response.json()
+    assert found["v"] == 1
+    return found
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_collect_hands_the_result_over_once(
+    tmp_path: Path, link: str, log: io.StringIO
+) -> None:
+    """F.5: a call that answered pending, approved with nobody waiting: its result once, with the
+    id of the request it answers; then its status, ``collected``. Another client, or another
+    server, reads it as unknown, and takes nothing (T34, Z17)."""
+    rig = HoldRig(tmp_path, {"block_seconds": 0}, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            sent = headers(held=marker(REF_A, wait="pending"))
+            response = await http.post(SHOP, content=call(id="call-7"), headers=sent)
+            assert response.json()["code"] == "approval_pending"
+            waiting = await collect(http, REF_A)
+            [hold] = await rig.surface.holds(1)
+            await rig.decide(hold)
+            await until(lambda: rig.app.holds.get(hold.id) is None, BOUND)
+            await rig.settled()
+            other_client = await collect(http, REF_A, client="agent2")
+            other_server = await collect(http, REF_A, server="notes")
+            first = await collect(http, REF_A)
+            again = await collect(http, REF_A)
+            listed = await collect(http, None)
+            none_listed = await collect(http, None, client="agent2")
+    assert (waiting["state"], waiting["outcome"], waiting["collected"]) == ("pending", None, False)
+    assert waiting["tool"] == "place_order"
+    assert waiting["deadline"].endswith("+00:00")
+    assert "result" not in waiting
+    assert other_client == {"v": 1, "ref": REF_A, "state": "unknown"}
+    assert other_server == other_client
+    assert (first["state"], first["outcome"]) == ("done", "ok")
+    result = first["result"]
+    assert (result["status"], result["content_type"], result["request_id"]) == (
+        200,
+        "application/json",
+        "call-7",
+    )
+    answered = json.loads(base64.b64decode(result["body"]))
+    assert answered["result"]["content"][0]["text"] == "done"
+    assert (again["state"], again["collected"]) == ("done", True)
+    assert "result" not in again
+    [row] = listed["calls"]
+    assert (row["ref"], row["tool"], row["state"], row["collected"]) == (
+        REF_A,
+        "place_order",
+        "done",
+        True,
+    )
+    assert "result" not in row
+    assert none_listed == {"v": 1, "calls": []}
+    assert [e["ref"] for e in events(log, "approval_collected")] == [REF_A]
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_collect_names_a_withdrawals_reason(tmp_path: Path, link: str) -> None:
+    """F.5 step 7: a pending call a policy change withdrew says so, with its reason."""
+    rig = HoldRig(tmp_path, {"block_seconds": 0}, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            sent = headers(held=marker(REF_A, wait="pending"))
+            await http.post(SHOP, content=call(), headers=sent)
+            await rig.surface.holds(1)
+            await rig.reload(held=())
+            await rig.settled()
+            found = await collect(http, REF_A)
+    assert (found["state"], found["detail"], found["outcome"]) == ("withdrawn", "changed", None)
+    assert "restarted" not in found
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_collect_after_a_restart_says_how_the_call_ended(tmp_path: Path, link: str) -> None:
+    """F.5 step 4, J10: after a restart the result store is empty, and the chain's recent
+    endings say how each call ended, to its own client only: one approved and run before (its
+    result lost with the process), and one the restart ended unsent."""
+    first = HoldRig(tmp_path, link=link)
+    chain = first.chain
+    asked = {
+        "client": "agent1",
+        "server": "shop",
+        "tool": "place_order",
+        "where": "vault",
+        "era": "modern",
+        "args": chain.digest({"item": "kettle"}),
+        "pin": PIN,
+        "text": chain.text_digest("t"),
+        "chars": 1,
+        "writes": 0,
+        "expires": HoldRig.now_ms() + 3_600_000,
+    }
+    for ref in (REF_A, REF_B):
+        await chain.write("asked", ref, critical=True, **asked)
+    await chain.write("decided", REF_A, critical=True, decision="accept", waited_ms=1, via="portal")
+    await chain.write(
+        "outcome",
+        REF_A,
+        critical=True,
+        outcome="ok",
+        detail=None,
+        writes_sent=0,
+        writes_unknown=0,
+    )
+    rig = HoldRig(tmp_path, link=link)  # a new vault process on the same chain
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            ran = await collect(http, REF_A)
+            unsent = await collect(http, REF_B)
+            other = await collect(http, REF_A, client="agent2")
+            again = await collect(http, REF_A)
+    assert ran == {"v": 1, "ref": REF_A, "state": "done", "detail": "ok", "restarted": True}
+    assert unsent == {
+        "v": 1,
+        "ref": REF_B,
+        "state": "withdrawn",
+        "detail": "restart",
+        "restarted": True,
+    }
+    assert other == {"v": 1, "ref": REF_A, "state": "unknown"}
+    assert again == ran  # no result to hand over, so nothing is used up
+
+
+@pytest.mark.parametrize("link", LINKS)
+@pytest.mark.parametrize(
+    ("body", "sent", "status", "code"),
+    [
+        (b"{}", {"content-type": "application/json"}, 400, "invalid"),
+        (b"not json", {"content-type": "application/json"}, 400, "invalid"),
+        (b'{"epoch":"0123456789ab","client":"agent1","server":"shop","ref":"x"}', {}, 400, None),
+        (b"{}", {"content-type": "text/plain"}, 415, "content_type"),
+        (b"{" + b" " * 1024 + b"}", {"content-type": "application/json"}, 413, "too_large"),
+    ],
+    ids=["no-fields", "not-json", "bad-ref", "content-type", "too-large"],
+)
+async def test_collect_refuses_a_body_it_cant_read(
+    tmp_path: Path, link: str, body: bytes, sent: dict[str, str], status: int, code: str | None
+) -> None:
+    rig = HoldRig(tmp_path, link=link)
+    sent = {"content-type": "application/json", **sent}
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            response = await http.post(COLLECT, content=body, headers=sent)
+            queried = await http.post(
+                COLLECT + "?ref=x", content=b"{}", headers={"content-type": "application/json"}
+            )
+            got = await http.get(COLLECT)
+    assert response.status_code == status, response.text
+    assert response.json().get("code") == (code or "invalid")
+    assert queried.status_code == 400
+    assert (got.status_code, got.headers["allow"]) == (405, "POST")

@@ -51,6 +51,12 @@ EVENTS = {
     "elsewhere_unheld": "gateway",
     "approval_withdraw_failed": "gateway",
     "held_answer_dropped": "gateway",
+    # Step 11: check_approval (F; K.2): the vault hands a result over once, the gateway names an
+    # upstream tool that takes the gateway's own tool's name (F.4), and the builder's failure
+    # event for a collect the vault couldn't answer (its status or error type only).
+    "approval_collected": "vault",
+    "reserved_tool_name": "gateway",
+    "approval_collect_failed": "gateway",
 }
 
 

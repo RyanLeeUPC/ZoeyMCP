@@ -25,7 +25,10 @@ module does the I/O around them:
   ``completion/complete``), which change nothing, and are retried the same way;
 - **close** idle connections, the least recently used at the session limit, and those a policy
   change affects. A close cuts the connection's calls at once, except committed ones (approved
-  calls, M4 design B.6): the session ends only after they finish, each within its deadline.
+  calls, M4 design B.6): the session ends only after they finish, each within its deadline. A
+  legacy session the vault will forward a pending held call on is kept from the idle reaper
+  until that call's outcome is known, or its deadline and ``call_timeout`` passed (M8 design
+  F.6, :meth:`Connection.keep_for`).
 """
 
 from __future__ import annotations
@@ -99,6 +102,8 @@ REAP_INTERVAL = 30.0
 PROGRESS_INTERVAL = 0.1  # at most 10 progress notifications a second
 LISTEN_BACKOFF_MAX = 300.0
 REVIEW_KEY = "review"
+# The gateway's own tool (M8 design F.4): an upstream's tool of that name is never served.
+RESERVED_TOOL = "check_approval"
 # A legacy session's list_changed for a kind beyond tools, by the enable entry that lists it.
 LIST_CHANGED: Final[Mapping[str, str]] = {
     "notifications/prompts/list_changed": "prompts",
@@ -136,12 +141,14 @@ class HeldBusy(Exception):
 @dataclass
 class Held:
     """A call the vault holds (C.2): its marker; ``wait``, the seconds the vault may hold it
-    before it forwards, which the read waits out too (I.1); and once the call returns or
-    raises, what the vault answered it (None: no answer named it)."""
+    before it forwards, which the read waits out too (I.1); once the call returns or raises,
+    what the vault answered it (None: no answer named it); and the connection it went out on,
+    which a pending call's legacy session keeps open (F.6)."""
 
     marker: Marker
     wait: float = 0.0
     answer: HeldAnswer | None = None
+    connection: Connection | None = None
 
 
 class ListingFailed(Exception):
@@ -204,7 +211,9 @@ class Connection:
         # The vault's answer to each held call in flight, by the marker's ref (Z27).
         self.held_answers: dict[str, HeldAnswer] = {}
         self.in_flight = 0
-        self.holds = 0  # downstream listeners that keep this connection open
+        self.holds = 0  # downstream listeners, and pending held calls, that keep it open
+        # Pending held calls whose forward the vault makes on this session (F.6): ref -> until.
+        self._kept: dict[str, float] = {}
         # Each call's cancel scope, with its deadline if it is committed (None if not).
         self._calls: dict[anyio.CancelScope, float | None] = {}
         self.closing = False
@@ -237,6 +246,23 @@ class Connection:
 
     def idle(self, now: float, timeout: float) -> bool:
         return self.in_flight == 0 and self.holds == 0 and now - self.last_used > timeout
+
+    def keep_for(self, ref: str, until: float) -> None:
+        """F.6: the vault may forward the pending held call ``ref`` on this session until
+        ``until`` (the pool's clock), so the idle reaper leaves it open till then."""
+        if ref not in self._kept:
+            self.holds += 1
+        self._kept[ref] = until
+
+    def unkeep(self, ref: str) -> None:
+        """The pending held call ``ref`` ended: it no longer keeps the session open."""
+        if self._kept.pop(ref, None) is not None:
+            self.holds -= 1
+
+    def unkeep_expired(self, now: float) -> None:
+        for ref, until in list(self._kept.items()):
+            if until <= now:
+                self.unkeep(ref)
 
     @property
     def committed(self) -> int:
@@ -761,6 +787,7 @@ class Connection:
             if held is not None and marker is not None:
                 self.registry.release(tool, digest, marker)
                 held.answer = self.held_answers.pop(marker.ref, None)
+                held.connection = self
             self.in_flight -= 1
             self.last_used = self.pool.clock()
             del self._calls[scope]
@@ -977,6 +1004,7 @@ class UpstreamPool:
     def reap(self) -> None:
         now = self.clock()
         for key, connection in list(self._connections.items()):
+            connection.unkeep_expired(now)
             if connection.state.phase is Phase.CLOSED and not connection.running:
                 self._connections.pop(key, None)
             elif connection.idle(now, self.limits.upstream_idle_timeout):
@@ -1107,6 +1135,9 @@ class UpstreamPool:
         """Every kind of one listing (L.4), with each kind's marks updated, its matching
         definitions kept, and its reports logged."""
         listings = listings or {}
+        if any(tool.name == RESERVED_TOOL for tool in tools):
+            # Never served: check refuses the name in a policy, so it can't be included (F.4).
+            logs.event("reserved_tool_name", server=server, tool=RESERVED_TOOL)
         marks = {kind: self.marks.for_server(server, kind) for kind in ("tool", *listings)}
         evaluation = pins.evaluate_server(tools, listings, policy, marks, self.limits)
         evaluated: list[tuple[pins.DefinitionKind, pins.Evaluation]] = [("tool", evaluation)]

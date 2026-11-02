@@ -10,6 +10,7 @@ it is for, its body cap and how many of its long polls may wait.
 | ``/_zoeymcp/gateway/v1/review/jobs`` | GET | gateway | 0 | 1 |
 | ``/_zoeymcp/gateway/v1/report/review`` | POST | gateway | from the limits | (one at a time) |
 | ``/_zoeymcp/gateway/v1/report/status`` | POST | gateway | 256 KiB | (one at a time) |
+| ``/_zoeymcp/gateway/v1/approvals/collect`` | POST | gateway | 1 KiB | - |
 | ``/_zoeymcp/egress/v1/allowlists`` | GET | egress | 0 | 2 |
 
 Anything else under ``/_zoeymcp/`` is 404. :func:`decide` takes the identity the listener and the
@@ -22,10 +23,16 @@ the running limits (:func:`.reviewreport.report_max`, GR-30).
 The gateway's status report (M6 design K.1, D-29) is read one at a time, and at most one is
 accepted per :data:`STATUS_MIN_INTERVAL`, whatever the gateway's own debounce: a report sooner
 is a 429 (:class:`StatusGate`, T-12).
+
+The gateway collects a held call's result, or its status, by its ref and the client it reported
+(M8 design E.2, F.5): :func:`collect_body` reads the request, and a body that names no ref asks
+for the client's own calls on that server instead (Q46). The vault answers only for the client
+and the server the call was held for, so another client's ref reads as an unknown one (T34).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -33,6 +40,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from ..common import ledgerreport
 from ..common.policy.match import NormalizedPath, RequestRejected
+from ..common.policy.schema import NAME_PATTERN
 from ..common.policy.view import Digest
 from .reviewjobs import OLDER, WORKS, Work
 
@@ -58,6 +66,12 @@ ALLOWLIST_MAX_STALE: Final = 300
 # accepted reports.
 STATUS_MAX_BYTES: Final = 256 * 1024
 STATUS_MIN_INTERVAL: Final = 5.0
+# A collect's body cap (M8 design E.2), and what its fields are: the gateway process's epoch (12
+# hex), the call's ref (16 hex), and a client's and a server's policy names.
+COLLECT_MAX_BYTES: Final = 1024
+_EPOCH: Final = re.compile(r"[0-9a-f]{12}")
+_REF: Final = re.compile(r"[0-9a-f]{16}")
+_NAME: Final = re.compile(NAME_PATTERN.removeprefix("^").removesuffix("$"))
 
 _DIGEST: Final[TypeAdapter[str]] = TypeAdapter(Digest)
 # How a refusal names who an endpoint is for.
@@ -136,6 +150,15 @@ STATUS: Final = Endpoint(
     STATUS_MAX_BYTES,
     None,
 )
+COLLECT: Final = Endpoint(
+    "approvals_collect",
+    "the collect path",
+    _path("approvals", "collect"),
+    ("POST",),
+    "gateway",
+    COLLECT_MAX_BYTES,
+    None,
+)
 ALLOWLISTS: Final = Endpoint(
     "egress_allowlists",
     "the allowlist path",
@@ -145,7 +168,7 @@ ALLOWLISTS: Final = Endpoint(
     0,
     ALLOWLIST_WAITERS,
 )
-ENDPOINTS: Final = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS, ALLOWLISTS)
+ENDPOINTS: Final = (VIEW, LEDGER, REVIEW_JOBS, REVIEW_REPORT, STATUS, COLLECT, ALLOWLISTS)
 
 
 def find(path: NormalizedPath) -> Endpoint | None:
@@ -248,3 +271,30 @@ class StatusGate:
         self.reading = False
         if accepted:
             self.accepted_at = now
+
+
+@dataclass(frozen=True)
+class Collect:
+    """A collect's request: the gateway's ``epoch``, the ``client`` it reported, the ``server``
+    the call was for, and the call's ``ref``; None asks for the client's own calls there."""
+
+    epoch: str
+    client: str
+    server: str
+    ref: str | None
+
+
+def collect_body(document: object) -> Collect:
+    """A collect's strict-JSON body: an object of exactly ``epoch``, ``client``, ``server`` and,
+    for one call, ``ref``, each a string of its form. Raises :class:`RequestRejected`."""
+    if not isinstance(document, dict):
+        raise RequestRejected("a collect is a JSON object")
+    keys = set(document)
+    if keys not in ({"epoch", "client", "server", "ref"}, {"epoch", "client", "server"}):
+        raise RequestRejected("a collect names epoch, client, server and, for one call, ref")
+    fields = {"epoch": _EPOCH, "client": _NAME, "server": _NAME, "ref": _REF}
+    for key in sorted(keys):
+        value = document[key]
+        if not isinstance(value, str) or fields[key].fullmatch(value) is None:
+            raise RequestRejected(f"a collect's {key} isn't of its form")
+    return Collect(document["epoch"], document["client"], document["server"], document.get("ref"))

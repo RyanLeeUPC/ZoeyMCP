@@ -288,11 +288,13 @@ class Surface:
 class Upstream:
     """The echo MCP upstream: records every request, and answers a ``tools/call`` with a result
     (that echoes the credential it was sent, with ``echo``). With ``gate`` set, a POST waits for
-    it before it answers."""
+    it before it answers; with ``redirect``, a POST is answered a redirect, which the vault never
+    follows (a forward that fails after its approval)."""
 
     def __init__(self) -> None:
         self.received: list[tuple[str, str, dict[str, str], bytes]] = []
         self.echo = False
+        self.redirect = False
         self.gate: threading.Event | None = None
         self.answering = threading.Event()
 
@@ -310,6 +312,8 @@ class Upstream:
         if self.gate is not None:
             gate = self.gate
             await anyio.to_thread.run_sync(lambda: gate.wait(BOUND))
+        if self.redirect:
+            return Response(status_code=307, headers={"location": "https://elsewhere.example/"})
         message = json.loads(body)
         text = "done"
         if self.echo:

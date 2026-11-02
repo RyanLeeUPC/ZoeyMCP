@@ -28,7 +28,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import httpx2
 
-from ..common import canonical
+from ..common import canonical, ledgerformat
 from ..common.envelope import MARKER_HEADER, Marker
 from ..common.ledgerreport import PATH as REPORT_PATH
 from ..common.logs import refuse_type
@@ -248,14 +248,17 @@ def _refusal_field(body: bytes, name: str, form: re.Pattern[str]) -> str | None:
 # A held refusal's deadline (ISO 8601, seconds, UTC) and JSON pointer, as the vault writes them.
 _DEADLINE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
 _POINTER = re.compile(r"(?:/[A-Za-z0-9_.~-]{0,128}){0,16}")
+# The forward's outcome an approved refusal names, one of the ledger's (M8 design C.2).
+_OUTCOME = re.compile("|".join(sorted(ledgerformat.OUTCOMES)))
 
 
 @dataclass(frozen=True)
 class HeldAnswer:
     """What the vault answered one held call (M8 design C.2): its status, whether the vault
     refused it (``x-zoeymcp-vault``) or approved it (``x-zoeymcp-approval``), the ref it names
-    (``x-zoeymcp-held-ref``), and from a refusal's body its code, deadline and pointer, and the
-    seconds of its ``Retry-After``. Never a value of the call or of its answer."""
+    (``x-zoeymcp-held-ref``), and from a refusal's body its code, deadline and pointer, the
+    outcome of a forward that failed after the approval, and the seconds of its
+    ``Retry-After``. Never a value of the call or of its answer."""
 
     status: int
     refused: bool
@@ -265,6 +268,7 @@ class HeldAnswer:
     deadline: str | None = None
     pointer: str | None = None
     retry_after: int | None = None
+    outcome: str | None = None
 
 
 def held_answer(status: int, headers: httpx2.Headers, body: bytes | None) -> HeldAnswer:
@@ -290,6 +294,7 @@ def held_answer(status: int, headers: httpx2.Headers, body: bytes | None) -> Hel
         _refusal_field(body, "deadline", _DEADLINE),
         _refusal_field(body, "pointer", _POINTER),
         found.retry_after,
+        _refusal_field(body, "outcome", _OUTCOME) if found.approved else None,
     )
 
 
@@ -675,6 +680,83 @@ def status_client(
         max_redirects=0,
         trust_env=False,
         timeout=STATUS_TIMEOUT,
+        event_hooks=_hooks(link, keys),
+    )
+
+
+# The out-of-band approvals' paths (M8 design E.2, E.3): one locked client for all five.
+APPROVALS_PREFIX = "/_zoeymcp/gateway/v1/approvals/"
+APPROVALS_POSTS = frozenset(
+    APPROVALS_PREFIX + name for name in ("ask", "withdraw", "detach", "collect")
+)
+APPROVALS_DECISIONS = APPROVALS_PREFIX + "decisions"
+COLLECT_PATH = APPROVALS_PREFIX + "collect"
+# A 4 MiB result in base64, and its status around it (E.3).
+APPROVALS_MAX_ANSWER_BYTES = 6 * 2**20
+
+
+class _ApprovalsOnly(httpx2.AsyncBaseTransport):
+    """The approvals client's transport (E.3): a POST of exactly ``ask``, ``withdraw``,
+    ``detach`` or ``collect``, with no query, or a GET of ``decisions``, on the link's scheme,
+    host and port, and nothing else. An answer is cut off past
+    :data:`APPROVALS_MAX_ANSWER_BYTES`."""
+
+    def __init__(self, inner: httpx2.AsyncBaseTransport, link: Link) -> None:
+        self._inner = inner
+        self._link = link
+
+    def _allowed(self, request: httpx2.Request) -> bool:
+        url = request.url
+        if (url.scheme, url.host, url.port) != (
+            self._link.scheme,
+            self._link.host,
+            self._link.port,
+        ):
+            return False
+        raw_path, question, _ = url.raw_path.partition(b"?")
+        if request.method == "GET":
+            return raw_path == APPROVALS_DECISIONS.encode()
+        return (
+            request.method == "POST"
+            and not question
+            and raw_path.decode("ascii", "replace") in APPROVALS_POSTS
+        )
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        if not self._allowed(request):
+            raise UpstreamBlocked("the approvals client only reaches the approvals paths")
+        response = await self._inner.handle_async_request(request)
+        if is_redirect(response.status_code):
+            await response.aclose()
+            raise UpstreamRedirect(str(response.status_code))
+        return httpx2.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=_Capped(response.stream, APPROVALS_MAX_ANSWER_BYTES),  # type: ignore[arg-type]
+            extensions=response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+# A collect is answered at once; a decisions poll waits up to 25 s (E.2).
+APPROVALS_TIMEOUT = httpx2.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+
+
+def approvals_client(
+    link: Link, keys: KeySource | None, inner: httpx2.AsyncBaseTransport | None = None
+) -> httpx2.AsyncClient:
+    """The HTTP client of the out-of-band approvals (M8 design E.3), built like
+    :func:`report_client`: ``check_approval``'s collect (F.5), and step 12's paths."""
+    return httpx2.AsyncClient(
+        transport=_ApprovalsOnly(inner if inner is not None else _inner_transport(link), link),
+        base_url=link.base_url,
+        follow_redirects=False,
+        max_redirects=0,
+        trust_env=False,
+        timeout=APPROVALS_TIMEOUT,
         event_hooks=_hooks(link, keys),
     )
 

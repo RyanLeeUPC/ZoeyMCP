@@ -1,5 +1,6 @@
 """The gateway's Elsewhere: a call the vault holds, end to end (M8 design C.2-C.4, D.2; Z5, Z9,
-Z27; J2 with a scripted surface; FM-8, FM-9, FM-12, FM-23).
+Z27; J2 with a scripted surface; FM-8, FM-9, FM-12, FM-23), and (step 11) an approved forward that
+failed, which the vault's answer says was approved (C.2; step 10's deviation 17).
 
 A real vault with its chain and a scripted approver surface (:class:`tests.gateway.holdrig.
 Surface`) routes the fake MCP server, and the whole gateway runs on it; the agent is the SDK
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import anyio
+import httpx
 import httpx2
 import pytest
 from anyio.abc import TaskGroup
@@ -61,7 +63,8 @@ from zoeymcp.gateway.ledger import LEDGER_DIR, Ledger
 from zoeymcp.gateway.pipeline import HEADER_PARAMS
 from zoeymcp.gateway.server import status
 from zoeymcp.gateway.upstream import UpstreamError
-from zoeymcp.gateway.vaultlink import VIEW_PATH, HeldAnswer
+from zoeymcp.gateway.vaultlink import VIEW_PATH, HeldAnswer, held_answer
+from zoeymcp.vault.app import Refused
 from zoeymcp.vault.approvers import ApproverHub
 from zoeymcp.vault.holds import Hold
 from zoeymcp.vault.vaultledger import CHAIN_DIR, VaultLedger
@@ -521,6 +524,57 @@ async def test_no_404_retry(tmp_path: Path) -> None:
     ]
 
 
+# --- an approved forward that failed (C.2; step 10's deviation 17) -------------------------------
+
+
+async def _cut(*args: Any, **kwargs: Any) -> Any:
+    raise httpx.ReadError("the upstream connection was cut")
+
+
+async def _unauthorized(*args: Any, **kwargs: Any) -> Any:
+    raise Refused(502, "the credential was refused")
+
+
+@pytest.mark.parametrize(
+    ("method", "failing", "outcome", "said"),
+    [
+        ("_send", _cut, "unknown", "upstream connection lost; the call may or may not have run"),
+        ("_authorize", _unauthorized, "not_sent", "upstream unavailable"),
+    ],
+    ids=["cut", "never-sent"],
+)
+async def test_an_approved_forward_that_failed_is_the_forwards_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    failing: Callable[..., Awaitable[Any]],
+    outcome: str,
+    said: str,
+) -> None:
+    """The vault forwards the approved call, and the forward fails: its request upstream cut
+    (it may have run), or its credential refused before anything was sent. The vault's 502
+    carries the approval's headers and its chain's outcome, so the gateway writes
+    ``approved_elsewhere`` and the same outcome, never "refused by the vault"."""
+    with anyio.fail_after(BOUND), holding(tmp_path) as rig:
+        async with agent(rig.running.mcp(), headers=headers()) as client:
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "hi"}))
+                [hold] = await rig.surface.holds(1)
+                monkeypatch.setattr(rig.deployed.vault, method, failing)
+                await rig.decide(hold)
+            await rig.settled()
+    [result] = answer
+    assert result.is_error
+    assert text(result) == f"{said} (ref {hold.ref})"
+    assert rig.ledger(hold.ref)[1:] == [
+        ("decided", "approved_elsewhere"),
+        ("outcome", (outcome, None)),
+    ]
+    assert rig.chain(hold.ref)[1:] == [("decided", "accept"), ("outcome", outcome)]
+    refusals = [e for e in rig.deployed.events("approval_refused") if e.get("ref") == hold.ref]
+    assert refusals == []
+
+
 # --- C.2's last row ---------------------------------------------------------------------------
 
 
@@ -620,6 +674,18 @@ def refused(code: str | None, status: int = 409, **fields: Any) -> HeldAnswer:
     return HeldAnswer(status, True, False, None, code, **fields)
 
 
+def approved_refusal(code: str | None, outcome: str | None = None) -> HeldAnswer:
+    """The vault's refusal of a forward that failed after its approval (B.6), which carries the
+    approval's headers for the call's ref, and the forward's outcome on the vault's chain."""
+    return HeldAnswer(502, True, True, "0123456789abcdef", code, outcome=outcome)
+
+
+LOST = "upstream connection lost; the call may or may not have run"
+APPROVED = {
+    "x-zoeymcp-vault": "refused",
+    "x-zoeymcp-approval": "approved",
+    "x-zoeymcp-held-ref": "0123456789abcdef",
+}
 # Each answer the vault may give, the gateway's decision and outcome for it, and the agent's text
 # (without its ref).
 ROWS: list[Any] = [
@@ -714,11 +780,41 @@ ROWS: list[Any] = [
     (refused("held_path", 404), "error", "not_sent", elsewhere.UNREAD),
     (refused("held_too_large", 413), "error", "not_sent", elsewhere.UNREAD),
     (refused("held_content_type", 415), "error", "not_sent", elsewhere.UNREAD),
-    # Any other refusal may come after the vault's approval (a forward that failed answers a
-    # plain 502), so the call may have run.
+    # Any other refusal is unknown: the vault's refusal of a forward that failed after its
+    # approval carries the approval's headers, but one that lost them may have run too.
     (refused("something_new", 409), "error", "unknown", elsewhere.REFUSED_BY_VAULT),
     (refused(None, 403), "error", "unknown", elsewhere.REFUSED_BY_VAULT),
     (refused(None, 502), "error", "unknown", elsewhere.REFUSED_BY_VAULT),
+    # The vault approved and forwarded it, and the forward failed: approved_elsewhere, and the
+    # outcome the vault's chain records (never the SDK's error for the vault's 502); one it
+    # doesn't name may have run.
+    (
+        approved_refusal(None, "not_sent"),
+        "approved_elsewhere",
+        "not_sent",
+        "upstream unavailable",
+    ),
+    (approved_refusal(None, "unknown"), "approved_elsewhere", "unknown", LOST),
+    (
+        approved_refusal(None, "upstream_error"),
+        "approved_elsewhere",
+        "upstream_error",
+        "upstream error",
+    ),
+    (approved_refusal(None), "approved_elsewhere", "unknown", LOST),
+    (
+        approved_refusal("held_result_too_large"),
+        "approved_elsewhere",
+        "unknown",
+        elsewhere.TOO_LARGE,
+    ),
+    # Approved for another ref: never this call's approval.
+    (
+        HeldAnswer(502, True, True, "fedcba9876543210", None),
+        "error",
+        "unknown",
+        elsewhere.REFUSED_BY_VAULT,
+    ),
     (HeldAnswer(200, False, False), "error", "unknown", elsewhere.UNHELD),
     (HeldAnswer(200, False, True, "fedcba9876543210"), "error", "unknown", elsewhere.UNHELD),
     (None, "error", "unknown", elsewhere.UNHELD),
@@ -830,6 +926,28 @@ async def test_each_vault_answer_maps_to_its_text(
     cooled = decision in ("decline", "timeout")
     assert (Key("agent1", "notes", "echo") in held.approvals.table._cooldowns) is cooled
     assert held.approvals.unheld["notes"] == (1 if said == elsewhere.UNHELD else 0)
+
+
+@pytest.mark.parametrize(
+    ("headers", "body", "outcome"),
+    [
+        (APPROVED, b'{"error":"bad gateway","outcome":"not_sent"}', "not_sent"),
+        (APPROVED, b'{"error":"bad gateway","outcome":"upstream_error"}', "upstream_error"),
+        (APPROVED, b'{"error":"bad gateway","outcome":"sent"}', None),
+        (APPROVED, b'{"error":"bad gateway","outcome":1}', None),
+        (APPROVED, b'{"error":"bad gateway"}', None),
+        ({"x-zoeymcp-vault": "refused"}, b'{"error":"bad gateway","outcome":"not_sent"}', None),
+    ],
+    ids=["not-sent", "upstream-error", "not-an-outcome", "not-a-string", "none", "not-approved"],
+)
+def test_an_approved_refusal_names_the_forwards_outcome(
+    headers: dict[str, str], body: bytes, outcome: str | None
+) -> None:
+    """The outcome is read only from a refusal that carries the approval's headers, and only
+    as one of the ledger's outcomes."""
+    found = held_answer(502, httpx2.Headers(headers), body)
+    assert found.refused
+    assert found.outcome == outcome
 
 
 async def test_view_stale_is_left_to_the_pipeline(tmp_path: Path) -> None:

@@ -42,7 +42,7 @@ from ..common.approvaltext import Plan
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway
 from . import elsewhere, logs, routing, schemas
-from .approve import Approvals, Asking, AskSession
+from .approve import Approvals, Asking, AskSession, Tick
 from .approvers import NO_APPROVALS as NO_APPROVALS
 from .connstate import Era
 from .sanitize import map_upstream, sanitize_result
@@ -112,6 +112,7 @@ class Approval:
     input_responses: Mapping[str, Any] | None = None
     session_sha256: str | None = None
     disconnected: anyio.Event | None = None
+    tick: Tick | None = None  # progress while a held call blocks (M8 design F.1)
 
 
 @dataclass(frozen=True)
@@ -340,6 +341,7 @@ async def _elsewhere(
             forward=forward,
             finish=lambda raw: _sanitized(raw, call, name, exposed, ref, budget),
             prepare=prepare,
+            tick=approval.tick,
         ),
     )
 
@@ -414,6 +416,13 @@ _ROUTE_TEXTS = {
     "no_approver": NO_APPROVER,
     "header_params": HEADER_PARAMS,
 }
+
+
+def finished(raw: CallToolResult, call: Call, name: str, exposed: Any, ref: str) -> CallToolResult:
+    """Step 7 for a held call's result that ``check_approval`` collected (M8 design F.5 step 6):
+    sanitized, checked against the tool's pinned output schema and wrapped, as a direct call's
+    result is; never forwarded again."""
+    return _sanitized(raw, call, name, exposed, ref, schemas.Budget.start())
 
 
 def _sanitized(

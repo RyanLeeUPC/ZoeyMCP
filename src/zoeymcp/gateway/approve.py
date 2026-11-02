@@ -22,18 +22,24 @@ prompt, the ledger and the logs share. The transports that ask live in :mod:`.ap
 rules for a waiting prompt after a policy change in :mod:`.approvalrules` (M8 design C.5). A call
 the vault holds (:mod:`.elsewhere`) shares the table, the ledger and the caps, and is never
 withdrawn here: the vault decides it (Z7).
+
+While such a call blocks, the agent is sent progress (M8 design F.1, G-29; :func:`ticking`):
+every :data:`PROGRESS_EVERY` seconds the seconds waited so far, strictly increasing, with no
+total, never relied on to stretch the wait. The ticker stops in the synchronous section the
+wait's answer comes back in, so nothing follows the answer or names its finished token.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 import anyio
 import mcp_types
@@ -72,6 +78,9 @@ CODE_SCHEMA: dict[str, Any] = {
 OUTCOME_MARGIN = 10.0  # seconds after the forward's deadline for writing its outcome
 SWEEP_INTERVAL = 1.0
 FINISH_GRACE = 2.0  # seconds a cancelled handler gets to free its lock and record why
+# A blocking out-of-band wait's progress (M8 design F.1, M.3): how often, and what it says.
+PROGRESS_EVERY: Final = 15.0
+PROGRESS_MESSAGE: Final = "waiting for the operator's approval"
 
 STOPPING = "refused: the gateway is stopping; try again shortly"
 LEDGER_DOWN = "refused: the approval ledger can't be written"
@@ -99,6 +108,8 @@ Forward = Callable[[Grant], Awaitable[CallToolResult]]
 # Tells the vault a held call's caller left (ref, client, reason): its ``approvals/withdraw``
 # (M8 design B.6, E.2), which the out-of-band client binds (step 12a).
 TellWithdrawn = Callable[[str, str, str], Awaitable[None]]
+# Sends the agent one progress notification: the seconds waited, and the message (F.1).
+Tick = Callable[[float, str], Awaitable[None]]
 
 
 @dataclass
@@ -148,6 +159,9 @@ class Approvals:
     epoch: str = field(default_factory=lambda: secrets.token_hex(6))
     tell_withdrawn: TellWithdrawn | None = None
     unheld: Counter[str] = field(default_factory=Counter)
+    # A pending held call's legacy upstream session, kept open for the vault's forward (F.6): by
+    # ref, what lets it close again once the call's outcome is known.
+    kept: dict[str, Callable[[], None]] = field(default_factory=dict)
     _shown: dict[str, Shown] = field(default_factory=dict)
     _waits: dict[str, anyio.CancelScope] = field(default_factory=dict)
     legacy: ElicitationLegacy = field(init=False)
@@ -511,7 +525,9 @@ class Approvals:
             self._shown.pop(record.ref, None)
             if record.how == "elsewhere" and record.pending_until is not None:
                 # D.2: a pending held call's lock ends at its hard deadline; the vault's chain
-                # holds how it ended, which the gateway learns sooner from step 12a on.
+                # holds how it ended, which the gateway learns sooner when the agent collects it
+                # (check_approval), and from step 12a on.
+                self.release_kept(record.ref)
                 await self._outcome(record, "unknown", None)
                 continue
             logs.event("approval_lock_expired", ref=record.ref, level="error")
@@ -520,6 +536,66 @@ class Approvals:
         while True:
             await anyio.sleep(SWEEP_INTERVAL)
             await self.sweep()
+
+    def release_kept(self, ref: str) -> None:
+        """A pending held call ended, or its lock did: its upstream session may close (F.6)."""
+        release = self.kept.pop(ref, None)
+        if release is not None:
+            release()
+
+
+# --- progress while a call blocks (M8 design F.1) ------------------------------------------------
+
+
+class _Ticker:
+    """The progress of one blocking wait, until it is :attr:`stopped`."""
+
+    def __init__(self, tick: Tick, clock: Callable[[], float], every: float) -> None:
+        self._tick = tick
+        self._clock = clock
+        self._every = every
+        self._started = clock()
+        self._last = 0
+        self.stopped = False
+
+    async def run(self) -> None:
+        while True:
+            await anyio.sleep(self._every)
+            if self.stopped:
+                return
+            # Whole seconds waited, each notification more than the last (SC-9).
+            self._last = max(self._last + 1, math.floor(self._clock() - self._started))
+            try:
+                await self._tick(float(self._last), PROGRESS_MESSAGE)
+            except Exception:  # never relied on: a notification that fails ends the ticking
+                return
+
+
+async def ticking[T](
+    work: Callable[[], Awaitable[T]],
+    tick: Tick | None,
+    clock: Callable[[], float],
+    every: float = PROGRESS_EVERY,
+) -> T:
+    """``work``'s answer, with progress sent through ``tick`` while it runs (F.1). The ticker is
+    stopped, and a notification it is sending cut, in the synchronous section ``work`` returns
+    or raises in, before its answer goes anywhere."""
+    if tick is None:
+        return await work()
+    ticker = _Ticker(tick, clock, every)
+    failure: Exception | None = None
+    async with anyio.create_task_group() as group:
+        group.start_soon(ticker.run)
+        try:
+            result = await work()
+        except Exception as exc:  # raised as it was, not inside the group's exception group
+            failure = exc
+        finally:
+            ticker.stopped = True
+            group.cancel_scope.cancel()
+    if failure is not None:
+        raise failure
+    return result
 
 
 # --- helpers --------------------------------------------------------------------------------------

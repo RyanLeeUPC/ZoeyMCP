@@ -22,6 +22,9 @@ named ``zoeymcp/<server>``, and no ``instructions`` are sent.
 Prompts, resources and completions (L.6) are served from the connection's latest evaluation:
 what is included, pinned, matching and unmarked of each kind, each answer rebuilt by
 :mod:`.sanitize`, a read only of a URI :mod:`.resourcematch` allows.
+
+A path also lists and serves the gateway's own ``check_approval`` where M8 design F.4 says
+(:func:`.checkapproval.served`), beside the upstream's tools: the one tool the gateway makes.
 """
 
 from __future__ import annotations
@@ -83,7 +86,7 @@ from ..common.committed import Committed
 from ..common.pinhash import DefinitionKind
 from ..common.policy.schema import GatewayLimits
 from ..common.policy.view import ViewGateway, ViewRemoteServer, ViewToolkitServer
-from . import access, capabilities, logs, pins, pipeline, resourcematch, sanitize
+from . import access, capabilities, checkapproval, logs, pins, pipeline, resourcematch, sanitize
 from .approvals import HANDLE_PATTERN, handle_sha256
 from .approve import Approvals
 from .connstate import Era
@@ -97,6 +100,7 @@ from .toolkits import Toolkits
 from .toolkitsource import ToolkitSource, ToolkitUnavailable
 from .toolsource import RemoteSource, ServedServer, ToolSource
 from .upstream import NotAdmitted, UpstreamError, UpstreamPool
+from .vaultlink import approvals_client
 
 HEALTH_PATH = "/healthz"
 SDK_MAX_SESSIONS = 1024
@@ -310,8 +314,9 @@ class GatewayApp:
     design F.3), the status pusher (with ``status_http`` and ``status``, which reads the app's
     status: ``server.pushed_status``; M6 design K.1) and, once the first view has arrived, the
     SDK's session manager. With ``witness``, the policy client hands it the head each view
-    answer states (the restore witness, M6 design K.3). At shutdown it closes every client it
-    holds on the vault link (D-166)."""
+    answer states (the restore witness, M6 design K.3). ``approvals_http`` is its client of the
+    vault's approvals paths (M8 design E.3), the pool's link's by default. At shutdown it closes
+    every client it holds on the vault link (D-166)."""
 
     def __init__(
         self,
@@ -327,9 +332,13 @@ class GatewayApp:
         status_http: httpx2.AsyncClient | None = None,
         status: Status | None = None,
         witness: Witness | None = None,
+        approvals_http: httpx2.AsyncClient | None = None,
     ) -> None:
         self.pool = pool
         self.policy_http = policy_http
+        if approvals_http is None:
+            approvals_http = approvals_client(pool.link, pool.keys, pool.inner_transport())
+        self.approvals_http = approvals_http
         # The ledger's reporter, made in the lifespan once the ledger is open (M5 design J.3).
         self.report_http = report_http
         self.reporter: Reporter | None = None
@@ -392,6 +401,8 @@ class GatewayApp:
             clock=clock,
             refetch=self._refetch_view,
         )
+        # check_approval (M8 design F): the agent's collect of a call the vault held.
+        self.checker = checkapproval.Checker(self.approvals, approvals_http, self._definition)
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None
@@ -602,9 +613,15 @@ class GatewayApp:
         await pusher.run()
 
     async def _close_vault_clients(self) -> None:
-        """The view's, the reporter's, the review poller's and the status pusher's clients
-        (D-166); the pool and the toolkits close their own."""
-        for http in (self.policy_http, self.report_http, self.review_http, self.status_http):
+        """The view's, the reporter's, the review poller's, the status pusher's and the
+        approvals' clients (D-166); the pool and the toolkits close their own."""
+        for http in (
+            self.policy_http,
+            self.report_http,
+            self.review_http,
+            self.status_http,
+            self.approvals_http,
+        ):
             if http is not None:
                 await http.aclose()
 
@@ -956,6 +973,10 @@ class GatewayApp:
             ):
                 del definition["outputSchema"]
             tools.append(Tool.model_validate(definition))
+        gateway = request.snapshot.view.gateway
+        out = gateway.approvals.out_of_band
+        if out is not None and checkapproval.served(gateway, request.client, request.policy):
+            tools.append(Tool.model_validate(checkapproval.definition(out)))
         logs.event(
             "request",
             client=request.client,
@@ -982,19 +1003,30 @@ class GatewayApp:
             request.era,
         )
 
+        gateway = request.snapshot.view.gateway
+        if params.name == checkapproval.NAME and checkapproval.served(
+            gateway, request.client, request.policy
+        ):
+            return await self.checker.check(call, gateway, params.arguments)
+
         async def progress(value: float, total: float | None) -> None:
             await ctx.session.report_progress(value, total)
+
+        async def tick(seconds: float, message: str) -> None:
+            # No total: a wait for a human has none (M8 design F.1).
+            await ctx.session.report_progress(seconds, None, message)
 
         approval = pipeline.Approval(
             approvals=self.approvals,
             session=_AskSession(ctx),
-            gateway=request.snapshot.view.gateway,
+            gateway=gateway,
             request_state=params.request_state,
             input_responses=params.input_responses,
             session_sha256=(
                 handle_sha256(request.session_id) if request.session_id is not None else None
             ),
             disconnected=request.disconnected,
+            tick=tick,
         )
         return await pipeline.call_tool(
             self.source(request.policy),
@@ -1357,7 +1389,30 @@ class GatewayApp:
         request = CURRENT.get()
         if request is None:
             return None
+        gateway = request.snapshot.view.gateway
+        if name == checkapproval.NAME and checkapproval.served(
+            gateway, request.client, request.policy
+        ):
+            return dict(checkapproval.DEFINITION["inputSchema"])
         return self.source(request.policy).input_schema(request.client, request.server, name)
+
+    async def _definition(self, tool: str, pin: str) -> dict[str, Any] | None:
+        """The definition of ``tool`` pinned ``pin``, for a collected result's output schema
+        (M8 design F.5 step 6): as the definition store keeps it, else as a toolkit serves it
+        now under that pin. None when neither has it."""
+        found = self.pool.defs.get(pin, "tool")
+        if found is not None:
+            return found
+        request = CURRENT.get()
+        if request is None:
+            return None
+        try:
+            exposed = await self.source(request.policy).admit(
+                request.client, request.server, request.policy, tool
+            )
+        except (NotAdmitted, UpstreamError, ToolkitUnavailable):
+            return None
+        return dict(exposed.definition) if exposed.pin == pin else None
 
     def source(self, policy: ServedServer) -> ToolSource:
         """Where a server's tools come from: its kind's source."""

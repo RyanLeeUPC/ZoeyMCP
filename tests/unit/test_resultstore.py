@@ -216,6 +216,37 @@ def test_another_clients_ref_reads_as_unknown() -> None:
     assert store.total_bytes() == 10  # nothing was handed over
 
 
+def test_a_read_naming_another_server_reads_as_unknown() -> None:
+    """Z17: a result is collected on its own server's path, so a read that names another server
+    finds nothing and hands nothing over; one naming its own, or none, finds it."""
+    store = ResultStore(TTL, GRACE)
+    assert ran(store, 1, 10) == []
+    assert store.peek(4_000, ref(1), "agent", "other") == Unknown()
+    assert store.collect(4_000, ref(1), "agent", "other") == Unknown()
+    assert store.total_bytes() == 10
+    found = store.peek(4_000, ref(1), "agent", "mail")
+    assert isinstance(found, Status)
+    assert found.status == "done"
+    assert store.peek(4_000, ref(1), "agent") == found
+    collected = store.collect(4_000, ref(1), "agent", "mail")
+    assert isinstance(collected, Collected)
+    assert collected.result.body == answer(10).body
+    assert store.collect(4_000, ref(1), "other", "mail") == Unknown()
+
+
+def test_a_result_keeps_the_id_of_the_request_it_answers() -> None:
+    """F.5 step 5: the reader binds the result to the held request's JSON-RPC id."""
+    store = ResultStore(TTL, GRACE)
+    opened(store, 1)
+    kept = StoredResult(200, "application/json", b"{}", request_id="r-7")
+    assert store.advance(3_000, ref(1), "approved") == []
+    assert store.advance(3_000, ref(1), "done", "ok", kept) == []
+    collected = store.collect(4_000, ref(1), "agent")
+    assert isinstance(collected, Collected)
+    assert collected.result.request_id == "r-7"
+    assert StoredResult(200, "application/json").request_id is None
+
+
 def test_list_for_names_the_clients_own_records_on_the_server() -> None:
     store = ResultStore(TTL, GRACE)
     opened(store, 1)

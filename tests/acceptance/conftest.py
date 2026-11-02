@@ -165,6 +165,10 @@ class Deployment:
     ``guarded`` the vault reaches its routes on its own guarded clients, as ``zoeymcp vault``
     does (B.2: certifi's roots, the address guard and ``egress_private``); the test points
     ``certifi.where`` at its CA first, as ``procs.py``'s launcher does.
+
+    ``held`` gives the vault app's arguments for holding calls (M8: its chain, approver hub and
+    hold clock), from the vault's state directory and keys; it is asked again at each
+    :meth:`restart`, as a new vault process opens its chain again.
     """
 
     def __init__(
@@ -185,8 +189,10 @@ class Deployment:
         extra: Mapping[str, Any] | None = None,
         socket_clients: Callable[[str], httpx.AsyncClient | None] | None = None,
         guarded: bool = False,
+        held: Callable[[Path, KeySet], Mapping[str, Any]] | None = None,
     ) -> None:
         self.state = tmp_path
+        self.held = held
         self.socket_clients = socket_clients
         self.guarded = guarded
         self.with_reports = reports
@@ -269,6 +275,7 @@ class Deployment:
             connectors=connectors,
             reports=self.reports,
             socket_clients=self.socket_clients,
+            **(self.held(self.state, self.keys) if self.held is not None else {}),
         )
         self.login = LoginService(self.tokens, clock=self.clock.monotonic, wall=self.clock.wall)
         self.setup = SetupCodes(self.state, self.keys.portal_key)

@@ -1244,7 +1244,8 @@ def test_review_via_vault_prints_the_gateways_review(
 ) -> None:
     """The gateway's poller runs the same review as its admin socket, on a real upstream; the
     second read through the vault is the same report, and the gateway closes every vault-link
-    client at shutdown (D-166), the status pusher's among them (M6 design K.1)."""
+    client at shutdown (D-166), the status pusher's among them (M6 design K.1), and the
+    approvals' (M8 design E.3)."""
     fake = McpFake()
     review_pins = {name: pin_of_fake(fake, name) for name in TOOLS}
     rest = pins_of_the_rest(fake, TOOLS)
@@ -1286,7 +1287,13 @@ def test_review_via_vault_prints_the_gateways_review(
     assert again == through_vault
     assert text.count('"event":"review_job_done"') == 1
     assert '"event":"review_requested"' in text
-    for http in (app.policy_http, app.report_http, app.review_http, app.status_http):
+    for http in (
+        app.policy_http,
+        app.report_http,
+        app.review_http,
+        app.status_http,
+        app.approvals_http,
+    ):
         assert http is not None
         assert http.is_closed
 
