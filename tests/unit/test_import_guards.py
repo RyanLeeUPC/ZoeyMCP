@@ -535,6 +535,28 @@ def test_serverpaths_uses_the_standard_library_and_the_policy_package_only() -> 
     assert not [m for m in loaded if not m.startswith("zoeymcp.common") and m != "zoeymcp"]
 
 
+def test_held_uses_the_standard_library_and_the_policy_package_only() -> None:
+    """M8 design A.3, F8: which tools the vault holds is pure, on serverpaths: no I/O, and of
+    ours only the policy package (it takes the pydantic Policy, so it isn't standard library
+    only)."""
+    path = PACKAGE / "common" / "policy" / "held.py"
+    names = list(imported_modules(path, module_name(path, PACKAGE.parent)))
+    assert "zoeymcp.common.policy.serverpaths" in names
+    found = [
+        name
+        for name in names
+        if not name.startswith("zoeymcp.common.policy.")
+        and (
+            (top := name.partition(".")[0]) not in (*sys.stdlib_module_names, "__future__")
+            or top in IO_MODULES
+        )
+    ]
+    assert found == []
+    loaded = closure(PACKAGE.parent, "zoeymcp.common.policy.held")
+    assert not [m for m in loaded if not m.startswith("zoeymcp.common") and m != "zoeymcp"]
+    assert beyond(loaded, POLICY_PACKAGES) == []
+
+
 # The gateway's pure approval modules (M8 design C.1): the routing decision and the rules for a
 # waiting prompt. Of ours they stand on the policy package and the approval core only.
 GATEWAY_PURE = ("routing", "approvalrules")

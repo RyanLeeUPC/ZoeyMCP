@@ -76,6 +76,8 @@ WriteKind = Literal[
     "policy.resume",
     "policy.reseed",
     "policy.acknowledge",
+    # M8 design A.4: vault_approval off, a step-up of its own (written in step 18).
+    "tool.vault_approval_off",
 ]
 # host: the vault's own start acting on the host's source (a resume, F.4).
 Surface = Literal["portal", "socket", "offline", "host"]
@@ -124,7 +126,9 @@ COMMANDS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
 # The host's way for what the portal can't do (G.5 rules 2 and 5).
 HOST_NEXT: Final = "zoeymcp policy export, edit, zoeymcp policy import"
 # Fields no portal write changes at all (G.5 rule 2 (a), I.1), at the top and under gateway.
-_HOST_FIELDS: Final = frozenset({"admin", "egress_proxy", "egress_proxy_kind", "egress_proxy_acls"})
+_HOST_FIELDS: Final = frozenset(
+    {"admin", "egress_proxy", "egress_proxy_kind", "egress_proxy_acls", "approvers"}
+)
 _HOST_GATEWAY: Final = frozenset({"approvals", "limits", "hosts", "origins"})
 _SERVER_MODELS: Final = frozenset({"RemoteServer", "ToolkitServer"})
 # A server's prompts and its resource sets, each pinned and declined as its tools are (L.1); the

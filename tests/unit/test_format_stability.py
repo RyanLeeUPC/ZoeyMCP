@@ -347,6 +347,70 @@ def test_empty_prompts_and_resources_blocks_leave_the_m7_view() -> None:
     assert b'"resources"' not in VIEW_BYTES
 
 
+# M8 design A.1: a held tool, an out-of-band client and the approvers' three waits are in the
+# digest and the bytes only once set (an approvers block only once it names a surface); the token
+# reference, the ids and the surface never are.
+VIEW_POLICY_M8: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+VIEW_POLICY_M8["gateway"]["servers"]["notes-read"]["tools"]["vault_approval"] = ["search_notes"]
+VIEW_POLICY_M8["gateway"]["clients"]["agent1"]["approvals"] = {
+    "attended": False,
+    "out_of_band": True,
+}
+VIEW_POLICY_M8["approvers"] = {
+    "telegram": {"bot_token": "store:approver-bot", "user_id": 7362915048, "chat_id": 7362915048},
+    "timeout": 7200,
+    "block_seconds": 60,
+    "result_ttl": 900,
+}
+VIEW_DIGEST_M8 = "sha256:b09004e4e0b0c7e31ec942eead9532bb493f6e7be48eb075c2e996ebae4b92bd"
+VIEW_BYTES_M8 = (
+    VIEW_BYTES.replace(VIEW_DIGEST.encode(), VIEW_DIGEST_M8.encode())
+    .replace(
+        b'"max_prompts_per_hour":30,',
+        b'"max_prompts_per_hour":30,'
+        b'"out_of_band":{"block_seconds":60,"result_ttl":900,"timeout":7200},',
+    )
+    .replace(
+        b'"agent1":{"approvals":null,',
+        b'"agent1":{"approvals":{"attended":false,"budget_chars":null,"confirm_code":false,'
+        b'"out_of_band":true,"renders":"markdown","timeout":null},',
+    )
+    .replace(
+        b'"include":["search_notes"]},"vault_path"',
+        b'"include":["search_notes"],"vault_approval":["search_notes"]},"vault_path"',
+    )
+)
+
+
+def test_a_view_with_m8_fields_is_pinned() -> None:
+    view = build_view(Policy.model_validate(VIEW_POLICY_M8))
+    assert view.digest == VIEW_DIGEST_M8
+    assert dump_view(view) == VIEW_BYTES_M8
+    assert parse_view(VIEW_BYTES_M8).digest == VIEW_DIGEST_M8
+    for absent in (b"approver-bot", b"7362915048", b"telegram"):
+        assert absent not in VIEW_BYTES_M8
+
+
+def test_empty_m8_fields_leave_the_m7_view() -> None:
+    """Written but empty, false, or an approvers block naming no surface: the M7 digest and
+    bytes."""
+    policy: dict[str, Any] = json.loads(json.dumps(VIEW_POLICY))
+    for server in policy["gateway"]["servers"].values():
+        server.setdefault("tools", {})["vault_approval"] = []
+    policy["gateway"]["clients"]["agent1"]["approvals"] = {"attended": False, "out_of_band": False}
+    policy["approvers"] = {"timeout": 7200}
+    expected = VIEW_BYTES.replace(
+        b'"agent1":{"approvals":null,',
+        b'"agent1":{"approvals":{"attended":false,"budget_chars":null,"confirm_code":false,'
+        b'"renders":"markdown","timeout":null},',
+    )
+    view = build_view(Policy.model_validate(policy))
+    assert dump_view(view).replace(view.digest.encode(), VIEW_DIGEST.encode()) == expected
+    del policy["gateway"]["clients"]["agent1"]["approvals"]
+    view = build_view(Policy.model_validate(policy))
+    assert (view.digest, dump_view(view)) == (VIEW_DIGEST, VIEW_BYTES)
+
+
 def test_one_entry_puts_its_whole_block_in_the_view() -> None:
     """A block is left out only while every set in it is empty: one declined fixed resource
     brings in the resources block, its empty template set too, and not the prompts block."""

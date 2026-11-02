@@ -213,6 +213,7 @@ def test_a_whole_entry_is_its_model_with_its_hidden_fields_only_set() -> None:
             "budget_chars": None,
             "confirm_code": False,
             "renders": "markdown",
+            "out_of_band": False,
         },
     }
     gone = diff_rows(make(add), BASE)

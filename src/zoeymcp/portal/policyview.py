@@ -14,7 +14,9 @@ Hidden fields show only that they are set, never their value:
 - a connector's ``username`` and ``from``, and its ``to`` as a count: recipients aren't shown,
   and usernames are account details; a basic credential's ``username`` likewise;
 - an OAuth credential's ``token_headers`` and a route's forced query values, by name only: both
-  are free text sent upstream, where a literal credential could sit.
+  are free text sent upstream, where a literal credential could sit;
+- the Telegram approver's bot token reference and its user and chat ids (M8 design A.4, Y13):
+  the ids are account details, and shown "set" as a connector's recipients are counted.
 
 Secret references (``store:x``, ``env:X``) show as written: they name a secret, never hold one.
 Every string, dictionary keys included, goes through :func:`~.display.shown`. The answer lists
@@ -148,7 +150,7 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
         # written above, as any upstream does.
         "RouteProgram": _fields("egress", "egress_private", "holds_secret"),
         "ClientApprovals": _fields(
-            "attended", "timeout", "budget_chars", "confirm_code", "renders"
+            "attended", "timeout", "budget_chars", "confirm_code", "renders", "out_of_band"
         ),
         "Client": _fields("servers", "sources", "approvals", token=HIDDEN, token_sha256=HIDDEN),
         "Approvals": _fields(
@@ -159,7 +161,7 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
             "max_pending_per_client",
             "max_prompts_per_hour",
         ),
-        "Tools": _fields("include", "allow", "approve"),
+        "Tools": _fields("include", "allow", "approve", "vault_approval"),
         # A server's prompts and resources (M6 design A.4): names, URIs and pins, as tools are.
         "PromptsPolicy": _fields("include", "review", "declined", "assistant"),
         "ResourceSet": _fields("include", "review", "declined"),
@@ -203,6 +205,9 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
             "ledger_max_bytes",
         ),
         "Gateway": _fields("clients", "approvals", "servers", "hosts", "origins", "limits"),
+        # The out-of-band approvers (M8 design A.4): the surfaces and the waits are shown.
+        "TelegramApprover": _fields(bot_token=HIDDEN, user_id=HIDDEN, chat_id=HIDDEN),
+        "Approvers": _fields("telegram", "portal", "timeout", "block_seconds", "result_ttl"),
         "Admin": _fields("listen", "origins"),
         "Policy": _fields(
             "version",
@@ -218,6 +223,7 @@ FIELDS: Final[Mapping[str, Mapping[str, Treatment]]] = MappingProxyType(
             "connectors",
             "routes",
             "gateway",
+            "approvers",
         ),
     }
 )
@@ -264,10 +270,12 @@ def rendered(value: Any, treatment: Treatment = "shown") -> Any:
 
 def _model(model: BaseModel, path: str, hidden: list[str]) -> dict[str, Any]:
     """One model's fields in the schema's order, each as :data:`FIELDS` says, under its name in
-    the document (``from``, not ``from_``)."""
-    table = FIELDS[type(model).__name__]
+    the document (``from``, not ``from_``). A model with no fields (``approvers.portal``) shows
+    as an empty object."""
+    fields = type(model).model_fields
+    table = FIELDS[type(model).__name__] if fields else {}
     out: dict[str, Any] = {}
-    for name, info in type(model).model_fields.items():
+    for name, info in fields.items():
         treatment = table[name]
         key = info.alias or name
         where = f"{path}.{key}" if path else key

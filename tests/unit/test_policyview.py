@@ -225,6 +225,9 @@ def test_only_the_decided_fields_are_hidden() -> None:
         ("QueryPolicy", "force"): "names",
         ("Client", "token"): "hidden",
         ("Client", "token_sha256"): "hidden",
+        ("TelegramApprover", "bot_token"): "hidden",
+        ("TelegramApprover", "user_id"): "hidden",
+        ("TelegramApprover", "chat_id"): "hidden",
     }
 
 
@@ -321,6 +324,56 @@ def test_each_hidden_value_shows_only_that_it_is_set() -> None:
         "gateway.clients.literal.token",
         "gateway.clients.hashed.token_sha256",
     ]
+
+
+APPROVER_TOKEN = "store:hidden-approver-bot"
+APPROVER_ID = 7362915048
+
+
+def test_the_approvers_show_their_surfaces_and_waits_and_hide_the_rest() -> None:
+    """M8 design A.4, Y13: the bot token's reference and the Telegram ids show only as set, the
+    portal's queue as an empty object, the waits as written; a held tool and an out-of-band
+    client as the policy says."""
+    raw = document()
+    telegram = {"bot_token": APPROVER_TOKEN, "user_id": APPROVER_ID, "chat_id": APPROVER_ID}
+    raw["approvers"] = {"telegram": telegram, "portal": {}, "block_seconds": 30}
+    raw["gateway"]["clients"]["hashed"]["approvals"]["out_of_band"] = True
+    tools = {"include": ["t"], "approve": ["t"], "vault_approval": ["t"]}
+    raw["gateway"]["servers"]["remote"]["tools"] = tools
+    answer = rendered(raw)
+    policy = answer["policy"]
+    assert policy["approvers"] == {
+        "telegram": {"bot_token": SET, "user_id": SET, "chat_id": SET},
+        "portal": {},
+        "timeout": 3600,
+        "block_seconds": 30,
+        "result_ttl": 3600,
+    }
+    assert answer["hidden"][-3:] == [
+        "approvers.telegram.bot_token",
+        "approvers.telegram.user_id",
+        "approvers.telegram.chat_id",
+    ]
+    text = json.dumps(answer)
+    assert "hidden-approver-bot" not in text
+    assert str(APPROVER_ID) not in text
+    assert policy["gateway"]["clients"]["hashed"]["approvals"]["out_of_band"] is True
+    assert policy["gateway"]["clients"]["literal"]["approvals"] is None
+    assert policy["gateway"]["servers"]["remote"]["tools"] == {
+        "include": ["t"],
+        "allow": [],
+        "approve": ["t"],
+        "vault_approval": ["t"],
+    }
+    raw["approvers"] = {"portal": {}}
+    assert rendered(raw)["policy"]["approvers"] == {
+        "telegram": None,
+        "portal": {},
+        "timeout": 3600,
+        "block_seconds": 120,
+        "result_ttl": 3600,
+    }
+    assert rendered()["policy"]["approvers"] is None
 
 
 def test_one_address_and_nothing_to_hide() -> None:

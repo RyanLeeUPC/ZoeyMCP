@@ -15,6 +15,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from tests.dark import lit
 from zoeymcp.common.policy import Finding, PolicyError, check, check_policy, fields, parse_policy
 from zoeymcp.common.policy.schema import (
     Client,
@@ -3847,11 +3848,13 @@ def _agent1(raw: Raw) -> Raw:
     [
         (
             lambda r: r["gateway"]["approvals"].update(approver="portal"),
-            "gateway.approvals.approver: telegram and portal approvers arrive in M8",
+            "gateway.approvals.approver: out-of-band approvers are set under approvers: and "
+            "opted into per client with approvals.out_of_band",
         ),
         (
             lambda r: r["gateway"]["approvals"].update(approver="telegram"),
-            "gateway.approvals.approver: telegram and portal approvers arrive in M8",
+            "gateway.approvals.approver: out-of-band approvers are set under approvers: and "
+            "opted into per client with approvals.out_of_band",
         ),
         (
             lambda r: r["gateway"]["approvals"].update(timeout=601),
@@ -4182,3 +4185,499 @@ def test_the_loopback_literal_warning(uri: str) -> None:
         "(passkeys need a name); to use its callback, register "
         "http://localhost:8081/oauth/callback/calendar and set that, or keep pasting"
     ]
+
+
+# --- M8: vault-held tools and out-of-band approvers (M8 design A.2, built dark: G-2) ------------
+#
+# Each row both ways: m8() is the example with M8's fields in use, which lit checks clean, and
+# each case changes one thing from it and must give its finding. Dark, the same policy gives
+# row 0's error at each field and nothing else new.
+
+TG_ID = 7362915048
+DARK = "arrives in a later M8 step"
+
+
+def m8(raw: Raw) -> Raw:
+    """The example with broker-trade's tools and mail's send held, and the portal's queue."""
+    raw = copy.deepcopy(raw)
+    raw["approvers"] = {"portal": {}}
+    servers = raw["gateway"]["servers"]
+    servers["broker-read"]["path"] = "/read"
+    route(raw, "broker-mcp")["rules"] = [
+        {"methods": ["GET", "POST", "DELETE"], "paths": ["/mcp", "/read"]}
+    ]
+    servers["broker-trade"]["tools"]["vault_approval"] = ["place_order", "cancel_order"]
+    servers["mail"]["tools"]["vault_approval"] = ["send_note"]
+    return raw
+
+
+def lit_run(raw: Raw) -> list[Finding]:
+    with lit():
+        return run(raw)
+
+
+def telegram(raw: Raw, **fields: Any) -> Raw:
+    raw["approvers"]["telegram"] = {
+        "bot_token": "store:approver-bot",
+        "user_id": TG_ID,
+        "chat_id": TG_ID,
+        **fields,
+    }
+    return raw
+
+
+def out_of_band(raw: Raw, **fields: Any) -> Raw:
+    _agent1(raw)["approvals"].update(out_of_band=True, **fields)
+    return raw
+
+
+def unheld(raw: Raw) -> Raw:
+    for server in raw["gateway"]["servers"].values():
+        server["tools"].pop("vault_approval", None)
+    return raw
+
+
+def test_the_m8_example_is_clean_lit_and_refused_dark(example_raw: Raw) -> None:
+    raw = m8(example_raw)
+    findings = lit_run(raw)
+    assert errors(findings) == []
+    assert warnings(findings) == warnings(run(example_raw))
+    assert errors(run(raw)) == [
+        f"approvers: {DARK}",
+        f"gateway.servers.broker-trade.tools.vault_approval: {DARK}",
+        f"gateway.servers.mail.tools.vault_approval: {DARK}",
+    ]
+
+
+def test_out_of_band_is_dark_too(example_raw: Raw) -> None:
+    raw = m8(example_raw)
+    out_of_band(raw)
+    assert f"gateway.clients.agent1.approvals.out_of_band: {DARK}" in errors(run(raw))
+    assert not any(DARK in e for e in errors(lit_run(raw)))
+
+
+def test_only_set_m8_fields_are_dark(example_raw: Raw) -> None:
+    """An empty vault_approval and a false out_of_band are as before (A.5)."""
+    raw = copy.deepcopy(example_raw)
+    for server in raw["gateway"]["servers"].values():
+        server["tools"]["vault_approval"] = []
+    _agent1(raw)["approvals"]["out_of_band"] = False
+    assert errors(run(raw)) == []
+
+
+def test_the_dark_table_names_the_three_fields() -> None:
+    assert dict(check._DARK) == dict.fromkeys(
+        (
+            "gateway.servers.*.tools.vault_approval",
+            "approvers",
+            "gateway.clients.*.approvals.out_of_band",
+        ),
+        DARK,
+    )
+
+
+def _shared_path(raw: Raw) -> None:
+    raw["gateway"]["servers"]["broker-read"]["path"] = "/mcp"
+
+
+def _second_writer(raw: Raw) -> None:
+    raw["gateway"]["servers"]["mail2"] = copy.deepcopy(raw["gateway"]["servers"]["mail"])
+    del raw["gateway"]["servers"]["mail2"]["tools"]["vault_approval"]
+    _agent1(raw)["servers"].append("mail2")
+
+
+def _second_tool(raw: Raw) -> None:
+    mail = raw["gateway"]["servers"]["mail"]
+    mail["tools"].update(include=["send_note", "reply_note"], approve=["send_note", "reply_note"])
+    mail["review"]["reply_note"] = "sha256:" + "e" * 64
+
+
+def _http_slot(raw: Raw) -> None:
+    raw["routes"].append(
+        {
+            "name": "files",
+            "prefix": "/files",
+            "upstream": "https://api.files.example",
+            "callers": ["gateway"],
+            "rules": [{"methods": ["POST"], "paths": ["/upload"]}],
+        }
+    )
+    raw["gateway"]["servers"]["mail"]["slots"]["files"] = {
+        "route": "files",
+        "rules": [{"methods": ["POST"], "paths": ["/upload"], "approved": True}],
+    }
+
+
+def _broker_rule(rule: Raw) -> Callable[[Raw], None]:
+    def edit(raw: Raw) -> None:
+        route(raw, "broker-mcp")["rules"].append(rule)
+
+    return edit
+
+
+def _another_route(**fields: Any) -> Callable[[Raw], None]:
+    def edit(raw: Raw) -> None:
+        raw["routes"].append(
+            {
+                "name": "broker-direct",
+                "prefix": "/direct",
+                "upstream": "https://MCP.broker.example:443",
+                "callers": [{"placeholder": "ph-broker-direct-0001"}],
+                "rules": [{"methods": ["POST"], "paths": ["/mcp"]}],
+                **fields,
+            }
+        )
+
+    return edit
+
+
+def _second_connector_route(raw: Raw) -> None:
+    raw["routes"].append(
+        {
+            "name": "mail-again",
+            "prefix": "/mail2",
+            "connector": "mail-out",
+            "callers": ["gateway"],
+            "rules": [{"methods": ["POST"], "paths": ["/send"]}],
+        }
+    )
+
+
+HELD_EXACT = (
+    "a route carrying a vault-held server allows only its servers' exact paths; list those instead"
+)
+NO_SURFACE = "nobody would be asked: set approvers.telegram or approvers.portal"
+SAME_UPSTREAM = (
+    "routes[3]: route 'broker-direct' reaches the same upstream as 'broker-mcp' with the same "
+    "credential, so a call through it would skip the vault's hold"
+)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (  # row 1
+            lambda r: r["gateway"]["servers"]["broker-trade"]["tools"]["vault_approval"].append(
+                "get_quote"
+            ),
+            "gateway.servers.broker-trade.tools.vault_approval: 'get_quote' is in vault_approval "
+            "but not in approve",
+        ),
+        (  # row 2
+            lambda r: r.pop("approvers"),
+            f"gateway.servers.broker-trade.tools.vault_approval: a held call needs someone to "
+            f"ask, and {NO_SURFACE}",
+        ),
+        (
+            lambda r: r.update(approvers={"timeout": 600}),
+            f"gateway.servers.mail.tools.vault_approval: a held call needs someone to ask, and "
+            f"{NO_SURFACE}",
+        ),
+        (  # row 3
+            _shared_path,
+            "gateway.servers.broker-read.path: broker-read, broker-trade share this path of route "
+            "'broker-mcp', which the vault holds: it couldn't tell whose tools a call is for; "
+            "give each its own path",
+        ),
+        (
+            _shared_path,
+            "gateway.servers.broker-trade.path: broker-read, broker-trade share this path",
+        ),
+        (  # row 4
+            _second_tool,
+            "gateway.servers.mail.tools.vault_approval: route 'mail-send' is a held connector, "
+            "held for every approve tool of every toolkit that sends through it or for none: add "
+            "'reply_note', or take the others out",
+        ),
+        (
+            _second_writer,
+            "gateway.servers.mail2.tools.vault_approval: route 'mail-send' is a held connector",
+        ),
+        (  # row 5
+            _http_slot,
+            "gateway.servers.mail.slots.files: vault_approval on a toolkit covers sends through a "
+            "connector in M8 (D-55); holding one approve tool of this toolkit holds all of them",
+        ),
+        (  # row 8
+            lambda r: (r.pop("approvers"), unheld(r), out_of_band(r)),
+            f"gateway.clients.agent1.approvals.out_of_band: out of band, {NO_SURFACE}",
+        ),
+        (
+            lambda r: (r.update(approvers={"timeout": 600}), unheld(r), out_of_band(r)),
+            f"gateway.clients.agent1.approvals.out_of_band: out of band, {NO_SURFACE}",
+        ),
+        (  # row 9
+            lambda r: telegram(r, bot_token="store:music-stats"),
+            "approvers.telegram.bot_token: store:music-stats is also used by "
+            "credentials.music-stats.secret: the approver needs a bot of its own; one bot token "
+            "has one update consumer, and an agent route on it could read or race the operator's "
+            "presses",
+        ),
+        (
+            lambda r: telegram(r, bot_token="store:mail-pass"),
+            "approvers.telegram.bot_token: store:mail-pass is also used by "
+            "connectors.mail-out.password",
+        ),
+        (  # row 10
+            lambda r: telegram(r, bot_token="env:APPROVER_BOT"),
+            "approvers.telegram.bot_token: the bot token must come from the store, where it is "
+            "bound to https://api.telegram.org; enter it with zoeymcp secret set",
+        ),
+        (
+            lambda r: telegram(r, bot_token="store:oauth.x"),
+            "approvers.telegram.bot_token: the store:oauth. prefix is reserved for entries the "
+            "vault manages",
+        ),
+        (  # row 11
+            lambda r: telegram(r, chat_id=TG_ID + 1),
+            "approvers.telegram.chat_id: the approver acts in the operator's private chat with "
+            "the bot, whose id is the user's",
+        ),
+        (  # row 13: Telegram the only surface
+            lambda r: (
+                r["approvers"].pop("portal"),
+                telegram(r),
+                r["gateway"]["approvals"].update(budget_chars=3601),
+            ),
+            "gateway.approvals.budget_chars: agent1 may be asked in Telegram, which shows at most "
+            "3600 characters, and its budget is 3601: lower it, or add approvers.portal",
+        ),
+        (
+            lambda r: (
+                r["approvers"].pop("portal"),
+                telegram(r),
+                unheld(r),
+                out_of_band(r, budget_chars=3700),
+                r["gateway"]["approvals"].update(budget_chars=4000),
+            ),
+            "gateway.clients.agent1.approvals.budget_chars: agent1 may be asked in Telegram, "
+            "which shows at most 3600 characters, and its budget is 3700",
+        ),
+        (  # row 14
+            lambda r: r["approvers"].update(timeout=60, block_seconds=61),
+            "approvers.block_seconds: must be at most approvers.timeout (60): a call can't wait "
+            "past its approval's deadline",
+        ),
+        (  # row 18
+            lambda r: r.pop("admin"),
+            "approvers.portal: the Approvals queue is the portal's: add an admin block, or remove "
+            "approvers.portal",
+        ),
+        (  # row 21
+            _broker_rule({"methods": ["GET"], "paths": ["/mcp/*"]}),
+            f"routes[1].rules[1].paths[0]: {HELD_EXACT}",
+        ),
+        (
+            _broker_rule({"methods": ["POST"], "paths": ["/read", "/other"]}),
+            f"routes[1].rules[1].paths[1]: {HELD_EXACT}",
+        ),
+        (
+            _broker_rule({"methods": ["POST"], "paths": ["/mcp/"]}),
+            f"routes[1].rules[1].paths[0]: {HELD_EXACT}",
+        ),
+        (  # a path that doesn't parse is the rules' own error; the next is still read
+            _broker_rule({"methods": ["GET"], "paths": ["/a b", "/mcp/*"]}),
+            f"routes[1].rules[1].paths[1]: {HELD_EXACT}",
+        ),
+        (  # row 22
+            _another_route(credential="broker-mcp"),
+            SAME_UPSTREAM,
+        ),
+        (
+            lambda r: (
+                r["credentials"].update(other=copy.deepcopy(r["credentials"]["broker-mcp"])),
+                r["credentials"]["other"].update(token_url="https://auth.broker.example/t2"),
+                _another_route(credential="other")(r),
+            ),
+            SAME_UPSTREAM,
+        ),
+        (
+            _second_connector_route,
+            "routes[3]: route 'mail-again' reaches the same upstream as 'mail-send' with the same "
+            "credential, so a call through it would skip the vault's hold",
+        ),
+    ],
+)
+def test_m8_errors(example_raw: Raw, mutate: Callable[[Raw], object], expected: str) -> None:
+    raw = m8(example_raw)
+    assert not any(e.startswith(expected) for e in errors(lit_run(raw)))
+    mutate(raw)
+    found = errors(lit_run(raw))
+    assert any(e.startswith(expected) for e in found), found
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (  # row 6
+            lambda r: route(r, "broker-mcp").pop("credential"),
+            "gateway.servers.broker-trade.tools.vault_approval: in the standard tier the gateway "
+            "shares the vault's network and can reach this upstream itself; vault_approval holds "
+            "here only in the hardened tier",
+        ),
+        (  # row 7
+            lambda r: _agent1(r)["approvals"].update(attended=False),
+            "gateway.clients.agent1: calls agent1 makes to broker-trade.place_order will be "
+            "refused: nobody answers for this client. If a person watches it, set "
+            "approvals.attended; for a scheduled or unattended client set approvals.out_of_band "
+            "(its other approve tools are then asked on your approvers too). Don't set attended "
+            "on a client nobody watches.",
+        ),
+        (
+            lambda r: _agent1(r).pop("approvals"),
+            "gateway.clients.agent1: calls agent1 makes to mail.send_note will be refused",
+        ),
+        (  # row 13: the portal decides the longer ones
+            lambda r: (telegram(r), r["gateway"]["approvals"].update(budget_chars=3601)),
+            "gateway.approvals.budget_chars: agent1 may be asked in Telegram, which shows at most "
+            "3600 characters, and its budget is 3601; longer texts are decided in the portal only",
+        ),
+        (  # row 15
+            lambda r: r["gateway"]["servers"]["broker-trade"].update(call_timeout=301),
+            "gateway.servers.broker-trade.call_timeout: a call the vault holds may run 301 s once "
+            "approved and the vault's stop waits for it, but its shipped stop window covers 300 s; "
+            "raise the vault's stop_grace_period",
+        ),
+        (  # row 17
+            out_of_band,
+            "gateway.clients.agent1.approvals.attended: attended is unused for gateway-held tools "
+            "while out_of_band is on: their prompts go out of band",
+        ),
+        (  # row 20
+            lambda r: r["gateway"]["servers"]["mail"].update(call_timeout=149),
+            "gateway.servers.mail.call_timeout: a held write through this connector waits at most "
+            "call_timeout - 30 s (119 s) for your answer; raise this toolkit's call_timeout for a "
+            "longer wait",
+        ),
+        (
+            lambda r: r["gateway"]["servers"]["mail"].update(call_timeout=20),
+            "gateway.servers.mail.call_timeout: a held write through this connector waits at most "
+            "call_timeout - 30 s (0 s)",
+        ),
+        (
+            lambda r: r["gateway"].setdefault("limits", {}).update(call_timeout=100),
+            "gateway.servers.mail.call_timeout: a held write through this connector waits at most "
+            "call_timeout - 30 s (70 s)",
+        ),
+        (  # row 23
+            _another_route(credential="music-stats"),
+            "routes[3]: route 'broker-direct' reaches the same upstream as 'broker-mcp' with "
+            "another credential; make sure that credential can't call cancel_order, place_order",
+        ),
+        (
+            _another_route(),
+            "routes[3]: route 'broker-direct' reaches the same upstream as 'broker-mcp' with "
+            "another credential",
+        ),
+    ],
+)
+def test_m8_warnings(example_raw: Raw, mutate: Callable[[Raw], object], expected: str) -> None:
+    raw = m8(example_raw)
+    assert not any(w.startswith(expected) for w in warnings(lit_run(raw)))
+    mutate(raw)
+    found = warnings(lit_run(raw))
+    assert any(w.startswith(expected) for w in found), found
+
+
+@pytest.mark.parametrize(
+    ("where", "tools"),
+    [
+        ("tools", {"include": ["check_approval"], "allow": ["check_approval"]}),
+        ("tools", {"include": ["x"], "approve": ["x", "check_approval"]}),
+        ("tools", {"include": ["x"], "allow": ["check_approval"]}),
+        ("tools", {"include": ["x"], "vault_approval": ["check_approval"]}),
+        ("review", {"check_approval": "sha256:" + "1" * 64}),
+        ("declined", {"check_approval": "sha256:" + "1" * 64}),
+    ],
+    ids=["include", "approve", "allow", "vault_approval", "review", "declined"],
+)
+def test_check_approval_is_reserved_in_every_list(
+    example_raw: Raw, where: str, tools: dict[str, Any]
+) -> None:
+    """Row 12, dark or not: the name is the gateway's own tool's (Z18), in a toolkit too."""
+    for server in ("broker-read", "mail"):
+        raw = copy.deepcopy(example_raw)
+        raw["gateway"]["servers"][server][where] = tools
+        found = errors(lit_run(raw))
+        places = [where]
+        if where == "tools":
+            places = [f"tools.{name}" for name, names in tools.items() if "check_approval" in names]
+        assert places
+        for place in places:
+            expected = (
+                f"gateway.servers.{server}.{place}: check_approval is reserved for the gateway's "
+                "own tool (M8)"
+            )
+            assert expected in found, found
+    assert not any("reserved" in e for e in errors(run(example_raw)))
+
+
+def test_the_budget_boundary_and_who_may_be_asked(example_raw: Raw) -> None:
+    """Row 13: 3,600 is within Telegram's prompt; a client that is never asked out of band, or a
+    policy without Telegram, isn't counted."""
+    raw = m8(example_raw)
+    raw["approvers"].pop("portal")
+    telegram(raw)
+    raw["gateway"]["approvals"]["budget_chars"] = 3600
+    assert errors(lit_run(raw)) == []
+    raw["gateway"]["approvals"]["budget_chars"] = 3601
+    assert errors(lit_run(raw))
+    unheld(raw)  # agent1 is attended, with nothing held: asked by elicitation only
+    assert not any("Telegram" in e for e in errors(lit_run(raw)))
+    raw = m8(example_raw)
+    raw["gateway"]["approvals"]["budget_chars"] = 3601
+    out_of_band(raw)
+    assert not any("Telegram" in f.message for f in lit_run(raw))
+    telegram(raw)
+    _agent1(raw)["approvals"] = {"attended": False}  # refused, so never asked
+    assert not any("Telegram" in f.message for f in lit_run(raw))
+
+
+def test_the_held_write_and_block_boundaries(example_raw: Raw) -> None:
+    """Rows 14 and 20 at their edges: a block as long as the deadline, and a toolkit call_timeout
+    of HELD_WRITE_TIMEOUT."""
+    raw = m8(example_raw)
+    raw["approvers"].update(timeout=600, block_seconds=600)
+    raw["gateway"]["servers"]["mail"]["call_timeout"] = 150
+    findings = lit_run(raw)
+    assert errors(findings) == []
+    assert not any("held write" in w for w in warnings(findings))
+    assert (check.TELEGRAM_BUDGET_MAX, check.HELD_WRITE_TIMEOUT, check.TOOLKIT_HOLD_MARGIN) == (
+        3600,
+        150,
+        30,
+    )
+
+
+def test_an_out_of_band_client_is_asked_and_not_unattended(example_raw: Raw) -> None:
+    """Row 19: an out_of_band client with approve tools isn't the unattended warning's, and its
+    sources aren't warned about as an attended client's are."""
+    raw = m8(example_raw)
+    _agent1(raw)["approvals"] = {"attended": False, "out_of_band": True}
+    del _agent1(raw)["sources"]
+    findings = lit_run(raw)
+    assert errors(findings) == []
+    found = warnings(findings)
+    assert not any("not attended" in w or "will be refused" in w for w in found), found
+    assert not any(w.startswith("gateway.clients.agent1.sources") for w in found), found
+
+
+def test_the_held_route_findings_need_a_hold(example_raw: Raw) -> None:
+    """Rows 3, 21 and 22 apply only to a route the vault holds: unheld, the example's shared path,
+    a pattern rule and a second route to the same upstream are as before."""
+    raw = m8(example_raw)
+    unheld(raw)
+    _shared_path(raw)
+    _broker_rule({"methods": ["GET"], "paths": ["/mcp/*"]})(raw)
+    _another_route(credential="broker-mcp")(raw)
+    _second_connector_route(raw)
+    found = lit_run(raw)
+    assert not any("vault" in f.message for f in found), found
+
+
+def test_a_unix_upstream_without_a_credential_isnt_the_tier_warning(example_raw: Raw) -> None:
+    """Row 6: a bridge's socket is the vault's to reach in either tier."""
+    raw = m8(example_raw)
+    route(raw, "broker-mcp").update(upstream="unix:/run/zoeymcp-bridge-broker/mcp.sock")
+    route(raw, "broker-mcp").pop("credential")
+    assert not any("standard tier" in w for w in warnings(lit_run(raw)))

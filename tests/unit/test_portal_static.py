@@ -1044,7 +1044,7 @@ def test_policy_js_reads_what_the_vault_sends() -> None:
     code = code_of(read("policy.js"))
     kinds = code[code.index("const KIND_TEXT = {") :]
     kinds = kinds[: kinds.index("};")]
-    assert set(re.findall(r'"([a-z.]+)":', kinds)) == set(typing.get_args(WriteKind))
+    assert set(re.findall(r'"([a-z._]+)":', kinds)) == set(typing.get_args(WriteKind))
     states = code[code.index("const GATEWAY_TEXT = {") :]
     states = states[: states.index("};")]
     assert set(re.findall(r"^\s+([a-z]+):", states, flags=re.M)) == {

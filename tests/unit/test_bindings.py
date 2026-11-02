@@ -204,6 +204,55 @@ def test_conflicting_uses_are_refused() -> None:
     )
 
 
+# --- the Telegram approver's bot token (M8 design A.2 row 10, Z15) --------------------------------
+
+
+def approver(bot_token: str, **changes: Any) -> Policy:
+    raw = example_policy().model_dump(by_alias=True)
+    raw["approvers"] = {"telegram": {"bot_token": bot_token, "user_id": 7, "chat_id": 7}}
+    for path, value in changes.items():
+        owner, name, field = path.split(".")
+        raw[owner][name][field] = value
+    return Policy.model_validate(raw)
+
+
+def test_the_approvers_bot_token_binds_to_the_bot_api_alone() -> None:
+    assert derive_binding(approver("store:approver-bot"), "approver-bot") == {
+        "origins": ["https://api.telegram.org:443"]
+    }
+    # Another name is bound as before: the approver's use is its own name's only.
+    assert derive_binding(approver("store:approver-bot"), "music-stats") == {
+        "origins": ["https://api.stats.example:443"]
+    }
+    plain = example_policy().model_dump(by_alias=True)
+    plain["approvers"] = {"portal": {}}
+    assert binding_error(Policy.model_validate(plain), "approver-bot", "unbound")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"credentials.music-stats.secret": "store:approver-bot"},
+        {"connectors.mail-out.password": "store:approver-bot"},
+        {"credentials.broker-mcp.refresh_token": "store:approver-bot"},
+    ],
+    ids=["credential", "connector", "oauth"],
+)
+def test_a_bot_token_used_by_anything_else_is_refused(changes: dict[str, str]) -> None:
+    assert binding_error(approver("store:approver-bot", **changes), "approver-bot", "conflict") == (
+        "'approver-bot' is the Telegram approver's bot token and is also used by a credential or "
+        "a connector; the approver needs a bot of its own"
+    )
+
+
+def test_a_bot_token_in_a_vault_managed_slot_is_refused() -> None:
+    """check refuses it first; the binding refuses it too, before the slot's own OAuth branch."""
+    name = f"{VAULT_PREFIX}broker-mcp.live"
+    assert binding_error(approver(f"store:{name}"), name, "conflict") == (
+        f"{name!r} is the Telegram approver's bot token, but the vault manages that name"
+    )
+
+
 # --- OAuth secrets -----------------------------------------------------------------------------
 
 

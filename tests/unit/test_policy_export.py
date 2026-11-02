@@ -23,6 +23,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from pydantic import BaseModel
 
+from tests.dark import lit
 from zoeymcp.common.policy import export as export_module
 from zoeymcp.common.policy import schema
 from zoeymcp.common.policy.emit import COMPOSE_INDENT
@@ -57,6 +58,8 @@ CREATED = 1_792_836_000
 LITERAL_TOKEN = "export-literal-token-0001"
 PIN = "sha256:" + "d" * 64
 ENVIRON = {"HOME": "/root"}
+# A Telegram id the approvers block holds (M8 design A.1).
+TG_ID = 7362915048
 
 
 def raw_policy(example_raw: dict[str, Any]) -> dict[str, Any]:
@@ -109,6 +112,35 @@ def test_the_table_names_every_field_of_every_schema_model_in_the_schemas_order(
         assert name in EXPORT_FIELDS, f"{name} isn't in EXPORT_FIELDS: decide how it exports"
         assert list(EXPORT_FIELDS[name]) == list(model.model_fields), name
     assert set(EXPORT_FIELDS) <= set(found)
+
+
+def test_the_approvers_export_whole_and_come_back(example_raw: dict[str, Any]) -> None:
+    """M8 design A.4: the host's export writes the approvers block (R61's fourth exception: the
+    ids and the token reference are the host's), the portal's queue as an empty block, and an
+    import reads it back the same; a held tool and an out-of-band client too."""
+    raw = raw_policy(example_raw)
+    raw["approvers"] = {
+        "telegram": {"bot_token": "store:approver-bot", "user_id": TG_ID, "chat_id": TG_ID},
+        "portal": {},
+        "result_ttl": 600,
+    }
+    raw["gateway"]["clients"]["agent1"]["approvals"]["out_of_band"] = True
+    raw["gateway"]["servers"]["mail"]["tools"]["vault_approval"] = ["send_note"]
+    policy = made(raw)
+    text = exported(policy)
+    assert text.endswith(
+        "approvers:\n"
+        "  telegram:\n"
+        '    bot_token: "store:approver-bot"\n'
+        f"    user_id: {TG_ID}\n"
+        f"    chat_id: {TG_ID}\n"
+        "  portal: {}\n"
+        "  result_ttl: 600\n"
+    )
+    assert '      vault_approval: ["send_note"]\n' in text
+    assert "out_of_band: true" in text
+    with lit():
+        assert admitted(text) == normalize(policy)
 
 
 def test_a_model_or_field_the_table_doesnt_name_is_never_exported(

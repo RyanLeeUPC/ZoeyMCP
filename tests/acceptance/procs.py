@@ -6,9 +6,11 @@ test CA, so the vault's TLS clients (the SMTP connector included) trust the fake
 hooks file the guarded clients answer names from the fake resolver's map (M7 design B.2, BP-1),
 so a name reaches a loopback fake through the address guard; with a sockets directory a
 bridge's socket client finds its socket there, while the policy keeps the fixed
-``unix:/run/zoeymcp-bridge-<name>/mcp.sock`` (B.2's ``socket_path`` hook); and with a holds file
+``unix:/run/zoeymcp-bridge-<name>/mcp.sock`` (B.2's ``socket_path`` hook); with a holds file
 the managed policy store holds after a write until it is killed (``tests/fakes/policyholds.py``,
-M6 design O.1). All happen in the launcher below, never in ZoeyMCP's code.
+M6 design O.1); and with ``lit`` no M8 policy field is dark, as ``tests/dark.py``'s ``lit()``
+makes it in a test's own process (M8 design A.2 row 0, G-2). All happen in the launcher below,
+never in ZoeyMCP's code.
 
 :class:`ManagedVault` is a managed vault on one state directory, started, killed and started
 again, with the host's ``zoeymcp`` commands run beside it (M6 design O.1, O.5), and, on Linux,
@@ -31,7 +33,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 # argv: the CA file or "", the hooks file (tests/fakes/resolver.py's FakeResolver.save) or "",
 # the bridges' sockets directory (tests/fakes/resolver.py's install_sockets) or "", the policy
-# store's holds file (tests/fakes/policyholds.py's save) or "", then zoeymcp's own arguments.
+# store's holds file (tests/fakes/policyholds.py's save) or "", "lit" (check's M8 fields lit) or
+# "", then zoeymcp's own arguments.
 LAUNCHER = f"""
 import sys
 import certifi
@@ -48,8 +51,11 @@ if sys.argv[3]:
 if sys.argv[4]:
     from tests.fakes.policyholds import install as install_holds
     install_holds(sys.argv[4])
+if sys.argv[5]:
+    from zoeymcp.common.policy import check
+    check._DARK = {{}}
 from zoeymcp.cli.main import main
-sys.exit(main(sys.argv[5:]))
+sys.exit(main(sys.argv[6:]))
 """
 # What a child needs from the test's environment to start at all, and nothing secret.
 PASSED = ("PATH", "SYSTEMROOT", "PYTHONPATH", "TEMP", "TMP", "HOME", "USERPROFILE")
@@ -100,11 +106,12 @@ def start(
     hooks: Path | None = None,
     sockets: Path | None = None,
     holds: Path | None = None,
+    lit: bool = False,
 ) -> Process:
     """``zoeymcp <argv>`` in its own process, with only ``env`` and the basics. ``hooks`` is a
     fake resolver's saved map, for the guarded clients; ``sockets`` the directory that holds
     each bridge's socket, as ``zoeymcp-bridge-<name>/mcp.sock``; ``holds`` the policy store's
-    holds file."""
+    holds file; ``lit`` lights M8's dark policy fields."""
     environment = {name: os.environ[name] for name in PASSED if name in os.environ}
     environment.update(env)
     handle = log.open("ab")
@@ -117,6 +124,7 @@ def start(
             str(hooks or ""),
             str(sockets or ""),
             str(holds or ""),
+            "lit" if lit else "",
             *argv,
         ],
         env=environment,
@@ -191,6 +199,8 @@ class ManagedVault:
     link_socket: bool = False
     # A fake resolver's saved map, for the guarded clients (``start``'s ``hooks``).
     hooks: Path | None = None
+    # With M8's dark policy fields lit (``start``'s ``lit``), for it and for :meth:`cli`.
+    lit: bool = False
 
     @property
     def state(self) -> Path:
@@ -233,7 +243,13 @@ class ManagedVault:
             self.link.parent.mkdir(mode=0o700, exist_ok=True)
             argv += ["--gateway-socket", str(self.link), "--gateway-uid", str(own_uid())]
         self.process = start(
-            argv, env=self.environ(), log=self.log, ca=self.ca, hooks=self.hooks, holds=held
+            argv,
+            env=self.environ(),
+            log=self.log,
+            ca=self.ca,
+            hooks=self.hooks,
+            holds=held,
+            lit=self.lit,
         )
         return self.process
 
@@ -274,7 +290,7 @@ class ManagedVault:
         environment = {name: os.environ[name] for name in PASSED if name in os.environ}
         environment.update(self.environ())
         done = subprocess.run(  # noqa: S603 - our own interpreter and arguments
-            [sys.executable, "-c", LAUNCHER, "", "", "", "", *argv],
+            [sys.executable, "-c", LAUNCHER, "", "", "", "", "lit" if self.lit else "", *argv],
             env=environment,
             input=(stdin or "").encode(),
             capture_output=True,

@@ -16,6 +16,11 @@ policy's mode isn't in the view: the vault states it beside every view answer, i
 :data:`MODE_HEADER` (M6 design K.3, G.9), so a mode alone moves no view, digest or review job;
 a managed vault states its head the same way (:data:`REVISION_HEADER`), so a save that doesn't
 change the gateway's part doesn't change the view either.
+M8's fields are left out the same way (M8 design A.1): a server's ``tools.vault_approval`` while
+empty, a client's ``approvals.out_of_band`` while false, and ``approvals.out_of_band`` at the
+gateway, which only the view has, while the policy's ``approvers`` names neither Telegram nor the
+portal. That one holds the three waits the gateway needs and nothing else of ``approvers``: no
+token reference, account id or surface enters the view.
 The module is pure and needs only pydantic, so the vault builds the view without the gateway's
 dependencies, and the gateway parses it with the same models.
 """
@@ -32,6 +37,8 @@ from .. import canonical
 from .findings import format_location
 from .schema import (
     Approvals,
+    ApprovalWait,
+    BlockSeconds,
     Capability,
     ClientApprovals,
     Gateway,
@@ -140,11 +147,28 @@ class ViewToolkitServer(_Model):
 ViewServer = Annotated[ViewRemoteServer | ViewToolkitServer, Field(discriminator="kind")]
 
 
+class ViewOutOfBand(_Model):
+    """The waits of the policy's ``approvers`` the gateway needs (M8 design A.1, E-9): for its
+    read timeouts, its pending text and check_approval's description."""
+
+    timeout: ApprovalWait
+    block_seconds: BlockSeconds
+    result_ttl: ApprovalWait
+
+
+class ViewApprovals(Approvals):
+    """The gateway's approvals, with ``out_of_band`` derived from ``approvers`` when it names
+    Telegram or the portal: only the view has it, so it is never an operator's field under
+    ``gateway.approvals`` (C-2)."""
+
+    out_of_band: ViewOutOfBand | None = None
+
+
 class ViewGateway(_Model):
     hosts: Annotated[list[str], Field(min_length=1)]
     origins: list[Origin]
     limits: GatewayLimits
-    approvals: Approvals
+    approvals: ViewApprovals
     clients: dict[Name, ViewClient]
     servers: dict[Name, ViewServer]
 
@@ -182,12 +206,20 @@ def _empty(value: Any) -> bool:
 
 
 def _dumped(gateway: ViewGateway) -> dict[str, Any]:
-    """The view's content as plain data, with each of a server's new fields left out while empty."""
+    """The view's content as plain data, with each of a server's new fields left out while empty,
+    and M8's while empty, false or absent (the module docstring)."""
     data = gateway.model_dump()
     for server in data["servers"].values():
         for member in _OMITTED_WHEN_EMPTY:
             if member in server and _empty(server[member]):
                 del server[member]
+        if not server["tools"]["vault_approval"]:
+            del server["tools"]["vault_approval"]
+    for client in data["clients"].values():
+        if client["approvals"] is not None and not client["approvals"]["out_of_band"]:
+            del client["approvals"]["out_of_band"]
+    if data["approvals"]["out_of_band"] is None:
+        del data["approvals"]["out_of_band"]
     return data
 
 
@@ -261,11 +293,19 @@ def build_view(policy: Policy) -> GatewayView:
     """
     gateway = policy.gateway or Gateway()
     prefixes = {route.name: route.prefix for route in policy.routes}
+    approvers = policy.approvers
+    out_of_band = None
+    if approvers is not None and approvers.any_surface:
+        out_of_band = ViewOutOfBand(
+            timeout=approvers.timeout,
+            block_seconds=approvers.block_seconds,
+            result_ttl=approvers.result_ttl,
+        )
     body = ViewGateway(
         hosts=list(gateway.hosts),
         origins=list(gateway.origins),
         limits=gateway.limits,
-        approvals=gateway.approvals,
+        approvals=ViewApprovals(**gateway.approvals.model_dump(), out_of_band=out_of_band),
         clients={
             name: ViewClient(
                 token_sha256=client.token_hash,

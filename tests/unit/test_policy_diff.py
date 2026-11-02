@@ -424,6 +424,9 @@ ALWAYS_WIDER: dict[str, tuple[str, ...]] = {
     "Gateway": ("approvals", "limits"),
     "Admin": ("listen", "origins"),
     "Policy": ("version", "mode", "egress_proxy", "egress_proxy_kind", "egress_proxy_acls"),
+    # M8 design A.4: the approver's surfaces, its bot token and its ids.
+    "TelegramApprover": ("bot_token", "user_id", "chat_id"),
+    "Approvers": ("telegram", "portal"),
 }
 
 
@@ -461,6 +464,7 @@ ROWS: list[Row] = [
     ("Policy", "connectors", "added", None, {"kind": "smtp"}, "wider", "narrower"),
     ("Policy", "routes", "added", None, {"name": "r"}, "wider", "narrower"),
     ("Policy", "gateway", "changed", None, {"servers": {}}, "wider", "narrower"),
+    ("Policy", "approvers", "changed", None, {"portal": {}}, "wider", "narrower"),
     (
         "SMTPConnector",
         "to",
@@ -498,6 +502,7 @@ ROWS: list[Row] = [
     ("ClientApprovals", "timeout", "changed", 60, None, "wider", "narrower"),
     ("ClientApprovals", "budget_chars", "changed", 500, None, "wider", "narrower"),
     ("ClientApprovals", "confirm_code", "changed", True, False, "wider", "narrower"),
+    ("ClientApprovals", "out_of_band", "changed", False, True, "wider", "narrower"),
     ("Client", "servers", "added", None, "notes", "wider", "narrower"),
     ("Client", "sources", "changed", ["192.0.2.0/24"], [], "wider", "narrower"),
     ("Client", "approvals", "changed", None, {"attended": False}, "wider", "narrower"),
@@ -509,6 +514,11 @@ ROWS: list[Row] = [
     ("Tools", "include", "added", None, "read", "wider", "narrower"),
     ("Tools", "allow", "added", None, "read", "wider", "narrower"),
     ("Tools", "approve", "added", None, "read", "neutral", "neutral"),
+    # M8 design A.4: a name held by the vault is narrower, one let go wider.
+    ("Tools", "vault_approval", "added", None, "write", "narrower", "wider"),
+    ("Approvers", "timeout", "changed", 3600, 7200, "wider", "narrower"),
+    ("Approvers", "block_seconds", "changed", 120, 600, "wider", "narrower"),
+    ("Approvers", "result_ttl", "changed", 3600, 86400, "wider", "narrower"),
     # Prompts and resources (step 18): an include or an assistant prompt added is wider (H.2).
     ("PromptsPolicy", "include", "added", None, "summarize", "wider", "narrower"),
     ("PromptsPolicy", "assistant", "added", None, "summarize", "wider", "narrower"),
@@ -613,6 +623,52 @@ def test_a_re_include_as_allow_of_an_approved_definition_is_wider() -> None:
     tools = ("gateway", "servers", "notes", "tools")
     assert found[(*tools, "include")] == found[(*tools, "allow")] == "wider"
     assert found[("gateway", "servers", "notes", "review", "write")] == "neutral"
+
+
+def held(raw: dict[str, Any]) -> None:
+    notes(raw)["tools"]["vault_approval"] = ["write"]
+
+
+def test_holding_a_tool_in_the_vault_is_narrower_and_letting_it_go_wider() -> None:
+    """M8 design A.4: vault_approval is a set of names; one added is narrower, one removed wider,
+    and a client's out_of_band turned on is wider."""
+    tools = ("gateway", "servers", "notes", "tools", "vault_approval")
+    assert directions(BASE, make(held)) == [(tools, "narrower")]
+    assert directions(make(held), BASE) == [(tools, "wider")]
+    [change] = structured(make(held), BASE)
+    assert (change.op, change.old, change.model, change.field) == (
+        "removed",
+        "write",
+        "Tools",
+        "vault_approval",
+    )
+
+    def out_of_band(raw: dict[str, Any]) -> None:
+        raw["gateway"]["clients"]["ci"]["approvals"] = {"attended": False, "out_of_band": True}
+
+    def asked(raw: dict[str, Any]) -> None:
+        raw["gateway"]["clients"]["ci"]["approvals"] = {"attended": False}
+
+    approvals = ("gateway", "clients", "ci", "approvals", "out_of_band")
+    assert directions(make(asked), make(out_of_band)) == [(approvals, "wider")]
+
+
+def test_the_approvers_block_is_walked_field_by_field() -> None:
+    """M8 design A.4: the block added or dropped whole, then each surface and wait by itself."""
+
+    def portal(raw: dict[str, Any]) -> None:
+        raw["approvers"] = {"portal": {}}
+
+    def telegram(raw: dict[str, Any]) -> None:
+        bot = {"bot_token": "store:bot", "user_id": 7, "chat_id": 7}
+        raw["approvers"] = {"portal": {}, "telegram": bot, "block_seconds": 30}
+
+    assert directions(BASE, make(portal)) == [(("approvers",), "wider")]
+    assert directions(make(portal), BASE) == [(("approvers",), "narrower")]
+    assert directions(make(portal), make(telegram)) == [
+        (("approvers", "telegram"), "wider"),
+        (("approvers", "block_seconds"), "narrower"),
+    ]
 
 
 def test_dropping_a_tool_is_narrower() -> None:

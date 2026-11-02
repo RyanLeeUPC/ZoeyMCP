@@ -156,7 +156,14 @@ EXPORT_FIELDS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             "allow_insecure_upstream",
             "program",
         ),
-        "ClientApprovals": ("attended", "timeout", "budget_chars", "confirm_code", "renders"),
+        "ClientApprovals": (
+            "attended",
+            "timeout",
+            "budget_chars",
+            "confirm_code",
+            "renders",
+            "out_of_band",
+        ),
         "Client": ("token", "token_sha256", "servers", "sources", "approvals"),
         "Approvals": (
             "approver",
@@ -166,7 +173,7 @@ EXPORT_FIELDS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             "max_pending_per_client",
             "max_prompts_per_hour",
         ),
-        "Tools": ("include", "allow", "approve"),
+        "Tools": ("include", "allow", "approve", "vault_approval"),
         "PromptsPolicy": ("include", "review", "declined", "assistant"),
         "ResourceSet": ("include", "review", "declined"),
         "ResourcesPolicy": ("templates", "fixed"),
@@ -209,6 +216,8 @@ EXPORT_FIELDS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             "ledger_max_bytes",
         ),
         "Gateway": ("clients", "approvals", "servers", "hosts", "origins", "limits"),
+        "TelegramApprover": ("bot_token", "user_id", "chat_id"),
+        "Approvers": ("telegram", "portal", "timeout", "block_seconds", "result_ttl"),
         "Admin": ("listen", "origins"),
         "Policy": (
             "version",
@@ -224,6 +233,7 @@ EXPORT_FIELDS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             "connectors",
             "routes",
             "gateway",
+            "approvers",
         ),
     }
 )
@@ -297,10 +307,11 @@ def notes(
 
 def _model(model: BaseModel, data: Mapping[str, Any]) -> dict[str, Any]:
     """``model``'s fields that ``data`` (its plain form) holds, in :data:`EXPORT_FIELDS`' order;
-    a field the table doesn't name raises ``KeyError``."""
+    a field the table doesn't name raises ``KeyError``. A model with no fields
+    (``approvers.portal``, there or not) has nothing to name."""
     name = type(model).__name__
-    table = EXPORT_FIELDS[name]
     fields = type(model).model_fields
+    table = EXPORT_FIELDS[name] if fields else ()
     for field in fields:
         if field not in table:
             raise KeyError(f"{name}.{field}")

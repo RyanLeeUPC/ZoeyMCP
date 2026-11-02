@@ -10,17 +10,22 @@ import ipaddress
 import re
 from collections import defaultdict
 from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Final
 from urllib.parse import urlsplit
 
 from .. import canonical, netguard
-from . import fields, serverpaths
+from . import fields, held, serverpaths
 from .callback import callback_address, callback_origin
 from .findings import Finding
 from .match import NormalizedPath
 from .paths import PathPatternError, parse_path_pattern
 from .schema import (
+    TELEGRAM_API,
     Admin,
+    Approvers,
     BasicCredential,
+    Client,
     Gateway,
     HeaderCredential,
     OAuth2Credential,
@@ -33,6 +38,7 @@ from .schema import (
     ResourcesPolicy,
     Route,
     RouteProgram,
+    Server,
     ToolkitRule,
     ToolkitServer,
     hash_token,
@@ -126,6 +132,28 @@ _COMPLETIONS_NEED = (
 _SHARED_KINDS = (
     "a shared legacy session serves every client's prompts and reads the same upstream session"
 )
+# The longest prompt a Telegram approver shows, in code points: within its 4,096 UTF-16 units with
+# the frame's own lines and some astral characters (M8 design M.3, Z14).
+TELEGRAM_BUDGET_MAX = 3600
+# The gateway's own tool (M8 design Z18), whose name no list of a server's may hold.
+CHECK_APPROVAL = "check_approval"
+# A held toolkit write waits its toolkit's call_timeout less this for an answer (M8 design B.7);
+# under HELD_WRITE_TIMEOUT that is less than two minutes, which check says (A.2 row 20).
+TOOLKIT_HOLD_MARGIN = 30
+HELD_WRITE_TIMEOUT = 150
+# M8 design A.2 row 0 (G-2): each M8 field by its path, refused while listed here. Tests light it
+# with tests/dark.py's lit(), which empties the table; step 18 deletes it.
+_DARK: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "gateway.servers.*.tools.vault_approval": "arrives in a later M8 step",
+        "approvers": "arrives in a later M8 step",
+        "gateway.clients.*.approvals.out_of_band": "arrives in a later M8 step",
+    }
+)
+_NO_SURFACE = "nobody would be asked: set approvers.telegram or approvers.portal"
+_HELD_EXACT = (
+    "a route carrying a vault-held server allows only its servers' exact paths; list those instead"
+)
 
 
 class _Report:
@@ -150,6 +178,8 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
     _check_routes(policy, report)
     _check_tokens(policy, report)
     _check_gateway(policy, report)
+    _check_approvers(policy, report)
+    _check_dark(policy, report)
     _check_egress(policy, report)
     if policy.admin is not None:
         _check_admin(policy.admin, report)
@@ -1177,7 +1207,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
     routes = {r.name: r for r in policy.routes}
     remote_routes = _remote_routes(policy)
     _check_clients(gateway, report)
-    _check_approvals(gateway, report)
+    _check_approvals(gateway, policy.approvers, report)
     assigned = {s for client in gateway.clients.values() for s in client.servers}
     server_paths: dict[str, list[NormalizedPath]] = defaultdict(list)
     for server in gateway.servers.values():
@@ -1196,6 +1226,8 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
             else:
                 _check_mcp_route(policy, path, server, route, server_paths[route.name], report)
         _check_stop_window(path, server, gateway.limits.call_timeout, report)
+        _check_reserved(path, server, report)
+        _check_vault_approval(policy, path, server, routes, report)
         if isinstance(server, RemoteServer):
             _check_upstream_server(path, server, report)
             _check_tools(
@@ -1205,6 +1237,7 @@ def _check_gateway(policy: Policy, report: _Report) -> None:
         else:
             _check_toolkit(path, server, routes, remote_routes, report)
         _check_declined(path, server, report)
+    _check_held_routes(policy, gateway.servers, report)
     limits = gateway.limits
     if limits.max_result_bytes > limits.max_upstream_message_bytes:
         report.error(
@@ -1287,13 +1320,22 @@ def _check_stop_window(
     path: str, server: RemoteServer | ToolkitServer, default: int, report: _Report
 ) -> None:
     timeout = server.call_timeout or default
-    if server.tools.approve and timeout > STOP_WINDOW_CALL_TIMEOUT:
-        where = f"{path}.call_timeout" if server.call_timeout else "gateway.limits.call_timeout"
+    if not server.tools.approve or timeout <= STOP_WINDOW_CALL_TIMEOUT:
+        return
+    where = f"{path}.call_timeout" if server.call_timeout else "gateway.limits.call_timeout"
+    if server.tools.vault_approval:  # M8 design A.2 row 15: the vault runs a held call
         report.warning(
             where,
-            f"an approved call may run {timeout} s and a stop waits for it, but the shipped "
-            f"stop windows cover {STOP_WINDOW_CALL_TIMEOUT} s; raise stop_grace_period",
+            f"a call the vault holds may run {timeout} s once approved and the vault's stop "
+            f"waits for it, but its shipped stop window covers {STOP_WINDOW_CALL_TIMEOUT} s; "
+            "raise the vault's stop_grace_period",
         )
+        return
+    report.warning(
+        where,
+        f"an approved call may run {timeout} s and a stop waits for it, but the shipped "
+        f"stop windows cover {STOP_WINDOW_CALL_TIMEOUT} s; raise stop_grace_period",
+    )
 
 
 def _check_clients(gateway: Gateway, report: _Report) -> None:
@@ -1306,11 +1348,15 @@ def _check_clients(gateway: Gateway, report: _Report) -> None:
                 report.error(path, f"unknown server {server_name!r}")
 
 
-def _check_approvals(gateway: Gateway, report: _Report) -> None:
+def _check_approvals(gateway: Gateway, approvers: Approvers | None, report: _Report) -> None:
     approvals = gateway.approvals
     path = "gateway.approvals"
-    if approvals.approver != "elicitation":
-        report.error(f"{path}.approver", "telegram and portal approvers arrive in M8")
+    if approvals.approver != "elicitation":  # M8 design A.2 row 16
+        report.error(
+            f"{path}.approver",
+            "out-of-band approvers are set under approvers: and opted into per client with "
+            "approvals.out_of_band",
+        )
     elif approvals.timeout > MAX_ELICITATION_TIMEOUT:
         report.error(f"{path}.timeout", "a prompt can't outlive the client's tool call (§6.1)")
     elif approvals.timeout > 300:
@@ -1325,6 +1371,7 @@ def _check_approvals(gateway: Gateway, report: _Report) -> None:
     for name, client in gateway.clients.items():
         c_path = f"gateway.clients.{name}"
         own = client.approvals
+        _check_out_of_band(gateway, approvers, name, client, report)
         if own is not None:
             if own.timeout is not None and own.timeout > approvals.timeout:
                 report.error(f"{c_path}.approvals.timeout", "a client setting can only lower it")
@@ -1332,14 +1379,14 @@ def _check_approvals(gateway: Gateway, report: _Report) -> None:
                 report.error(
                     f"{c_path}.approvals.budget_chars", "a client setting can only lower it"
                 )
-        if own is not None and own.attended:
-            if not client.sources:
-                report.warning(
-                    f"{c_path}.sources",
-                    "anyone holding this client's token can make calls and answer their "
-                    "prompts, with or without confirm_code; keep the token out of the agent's "
-                    "sandbox and pin a source",
-                )
+        if own is not None and own.attended and not client.sources:
+            report.warning(
+                f"{c_path}.sources",
+                "anyone holding this client's token can make calls and answer their prompts, "
+                "with or without confirm_code; keep the token out of the agent's sandbox and pin "
+                "a source",
+            )
+        if own is not None and (own.attended or own.out_of_band):  # M8 design A.2 row 19
             continue
         asks = [
             s
@@ -1508,3 +1555,281 @@ def _check_pins(path: str, include: list[str], review: Mapping[str, str], report
         report.error(f"{path}.review", f"{tool!r} is included but has no review pin")
     for tool in sorted(set(review) - set(include)):
         report.warning(f"{path}.review", f"pin for {tool!r}, which isn't included")
+
+
+# --- M8: vault-held tools and out-of-band approvers (M8 design A.2) -----------------------------
+
+
+def _check_dark(policy: Policy, report: _Report) -> None:
+    """Row 0: an M8 field set before the step that serves it (built dark, G-2)."""
+    found = [("approvers", "approvers")] if policy.approvers is not None else []
+    gateway = policy.gateway
+    if gateway is not None:
+        found += [
+            (
+                "gateway.servers.*.tools.vault_approval",
+                f"gateway.servers.{name}.tools.vault_approval",
+            )
+            for name, server in gateway.servers.items()
+            if server.tools.vault_approval
+        ]
+        found += [
+            (
+                "gateway.clients.*.approvals.out_of_band",
+                f"gateway.clients.{name}.approvals.out_of_band",
+            )
+            for name, client in gateway.clients.items()
+            if client.approvals is not None and client.approvals.out_of_band
+        ]
+    for pattern, path in found:
+        if pattern in _DARK:
+            report.error(path, _DARK[pattern])
+
+
+def _check_approvers(policy: Policy, report: _Report) -> None:
+    """Rows 9-11, 14 and 18: the ``approvers`` block itself."""
+    approvers = policy.approvers
+    if approvers is None:
+        return
+    if approvers.block_seconds > approvers.timeout:
+        report.error(
+            "approvers.block_seconds",
+            f"must be at most approvers.timeout ({approvers.timeout}): a call can't wait past "
+            "its approval's deadline",
+        )
+    if approvers.portal is not None and policy.admin is None:
+        report.error(
+            "approvers.portal",
+            "the Approvals queue is the portal's: add an admin block, or remove approvers.portal",
+        )
+    telegram = approvers.telegram
+    if telegram is None:
+        return
+    path = "approvers.telegram"
+    token = telegram.bot_token
+    if not token.startswith("store:"):
+        report.error(
+            f"{path}.bot_token",
+            f"the bot token must come from the store, where it is bound to {TELEGRAM_API}; "
+            "enter it with zoeymcp secret set",
+        )
+    elif token.startswith(_VAULT_PREFIX):
+        # Not in secret_references, so _check_secret_refs doesn't see it.
+        report.error(
+            f"{path}.bot_token", "the store:oauth. prefix is reserved for entries the vault manages"
+        )
+    users = [where for where, ref, _ in secret_references(policy) if ref == token]
+    if users:
+        report.error(
+            f"{path}.bot_token",
+            f"{token} is also used by {', '.join(users)}: the approver needs a bot of its own; "
+            "one bot token has one update consumer, and an agent route on it could read or race "
+            "the operator's presses",
+        )
+    if telegram.chat_id != telegram.user_id:
+        report.error(
+            f"{path}.chat_id",
+            "the approver acts in the operator's private chat with the bot, whose id is the user's",
+        )
+
+
+def _check_reserved(path: str, server: RemoteServer | ToolkitServer, report: _Report) -> None:
+    """Row 12: no list of a server's tools names the gateway's own tool."""
+    tools = server.tools
+    for where, names in (
+        ("tools.include", tools.include),
+        ("tools.allow", tools.allow),
+        ("tools.approve", tools.approve),
+        ("tools.vault_approval", tools.vault_approval),
+        ("review", server.review),
+        ("declined", server.declined),
+    ):
+        if CHECK_APPROVAL in names:
+            report.error(
+                f"{path}.{where}", f"{CHECK_APPROVAL} is reserved for the gateway's own tool (M8)"
+            )
+
+
+def _check_vault_approval(
+    policy: Policy,
+    path: str,
+    server: RemoteServer | ToolkitServer,
+    routes: Mapping[str, Route],
+    report: _Report,
+) -> None:
+    """Rows 1, 2, 5, 6 and 20: one server's ``vault_approval``."""
+    held_tools = server.tools.vault_approval
+    if not held_tools:
+        return
+    v_path = f"{path}.tools.vault_approval"
+    for tool in sorted(set(held_tools) - set(server.tools.approve)):
+        report.error(v_path, f"{tool!r} is in vault_approval but not in approve")
+    if policy.approvers is None or not policy.approvers.any_surface:
+        report.error(v_path, f"a held call needs someone to ask, and {_NO_SURFACE}")
+    if isinstance(server, RemoteServer):
+        route = routes.get(server.route)
+        if (
+            route is not None
+            and route.credential is None
+            and route.connector is None
+            and not _is_unix(route.upstream or "")
+        ):
+            report.warning(
+                v_path,
+                "in the standard tier the gateway shares the vault's network and can reach this "
+                "upstream itself; vault_approval holds here only in the hardened tier",
+            )
+        return
+    for slot, binding in sorted(server.slots.items()):
+        route = routes.get(binding.route)
+        if route is not None and route.connector is None and any(r.approved for r in binding.rules):
+            report.error(
+                f"{path}.slots.{slot}",
+                "vault_approval on a toolkit covers sends through a connector in M8 (D-55); "
+                "holding one approve tool of this toolkit holds all of them",
+            )
+    assert policy.gateway is not None  # noqa: S101 - only a gateway's servers get here
+    timeout = server.call_timeout or policy.gateway.limits.call_timeout
+    if timeout < HELD_WRITE_TIMEOUT:
+        wait = max(timeout - TOOLKIT_HOLD_MARGIN, 0)
+        report.warning(
+            f"{path}.call_timeout",
+            f"a held write through this connector waits at most call_timeout - "
+            f"{TOOLKIT_HOLD_MARGIN} s ({wait} s) for your answer; raise this toolkit's "
+            "call_timeout for a longer wait",
+        )
+
+
+def _check_held_routes(policy: Policy, servers: Mapping[str, Server], report: _Report) -> None:
+    """Rows 3, 4 and 21-23: the routes the vault holds, as ``held.held_map`` finds them."""
+    holds = held.held_map(policy)
+    paths = held.server_paths(policy)
+    for route, hold in sorted(holds.items()):
+        if isinstance(hold, held.HeldConnector):
+            _check_held_connector(route, hold, servers, report)
+            continue
+        for names in paths[route].values():
+            if len(names) > 1:
+                for name in names:
+                    report.error(
+                        f"gateway.servers.{name}.path",
+                        f"{', '.join(names)} share this path of route {route!r}, which the vault "
+                        "holds: it couldn't tell whose tools a call is for; give each its own path",
+                    )
+    for index, home in enumerate(policy.routes):
+        found = holds.get(home.name)
+        if found is None:
+            continue
+        if isinstance(found, held.HeldRoute):
+            _check_held_rules(index, home, set(paths[home.name]), report)
+        _check_same_upstream(policy, index, home, found.names, report)
+
+
+def _check_held_connector(
+    route: str, hold: held.HeldConnector, servers: Mapping[str, Server], report: _Report
+) -> None:
+    """Row 4: a connector is held for every approve tool of every toolkit that sends through it,
+    or for none (C-6)."""
+    for name in hold.writers:
+        tools = servers[name].tools
+        missing = sorted(set(tools.approve) - set(tools.vault_approval))
+        if missing:
+            report.error(
+                f"gateway.servers.{name}.tools.vault_approval",
+                f"route {route!r} is a held connector, held for every approve tool of every "
+                f"toolkit that sends through it or for none: add {', '.join(map(repr, missing))}, "
+                "or take the others out",
+            )
+
+
+def _check_held_rules(
+    index: int, route: Route, exact: set[tuple[str, ...]], report: _Report
+) -> None:
+    """Row 21: a held route allows its servers' exact paths and no pattern (T-1)."""
+    for r_index, rule in enumerate(route.rules):
+        for p_index, source in enumerate(rule.paths):
+            try:
+                parsed = parse_path_pattern(source)
+            except PathPatternError:
+                continue  # reported with the route's rules
+            segments = tuple(s.value for s in parsed.segments)
+            key = held.path_key(NormalizedPath(segments, parsed.trailing_slash))
+            pattern = any(s.kind != "literal" for s in parsed.segments)
+            if pattern or ("POST" in rule.methods and key not in exact):
+                report.error(f"routes[{index}].rules[{r_index}].paths[{p_index}]", _HELD_EXACT)
+
+
+def _check_same_upstream(
+    policy: Policy, home_index: int, home: Route, names: frozenset[str], report: _Report
+) -> None:
+    """Rows 22 and 23: another route, of any caller, to what a held route reaches."""
+    where = held.target(home)
+    if where is None:
+        return
+    for index, route in enumerate(policy.routes):
+        if index == home_index or held.target(route) != where:
+            continue
+        if held.same_credential(policy, route, home):
+            report.error(
+                f"routes[{index}]",
+                f"route {route.name!r} reaches the same upstream as {home.name!r} with the same "
+                "credential, so a call through it would skip the vault's hold",
+            )
+        else:
+            report.warning(
+                f"routes[{index}]",
+                f"route {route.name!r} reaches the same upstream as {home.name!r} with another "
+                f"credential; make sure that credential can't call {', '.join(sorted(names))}",
+            )
+
+
+def _check_out_of_band(
+    gateway: Gateway, approvers: Approvers | None, name: str, client: Client, report: _Report
+) -> None:
+    """Rows 7, 8, 13 and 17: who answers for a client, and where."""
+    c_path = f"gateway.clients.{name}"
+    own = client.approvals
+    attended = own is not None and own.attended
+    out_of_band = own is not None and own.out_of_band
+    held_tools = [
+        (server_name, tool)
+        for server_name in client.servers
+        if (server := gateway.servers.get(server_name)) is not None
+        for tool in server.tools.vault_approval
+    ]
+    if not attended and not out_of_band:
+        for server_name, tool in held_tools:
+            report.warning(
+                c_path,
+                f"calls {name} makes to {server_name}.{tool} will be refused: nobody answers for "
+                "this client. If a person watches it, set approvals.attended; for a scheduled or "
+                "unattended client set approvals.out_of_band (its other approve tools are then "
+                "asked on your approvers too). Don't set attended on a client nobody watches.",
+            )
+    if out_of_band and (approvers is None or not approvers.any_surface):
+        report.error(f"{c_path}.approvals.out_of_band", f"out of band, {_NO_SURFACE}")
+    if out_of_band and attended:
+        report.warning(
+            f"{c_path}.approvals.attended",
+            "attended is unused for gateway-held tools while out_of_band is on: their prompts go "
+            "out of band",
+        )
+    asked = out_of_band or (attended and bool(held_tools))
+    if own is None or approvers is None or approvers.telegram is None or not asked:
+        return
+    budget = own.budget_chars or gateway.approvals.budget_chars
+    if budget <= TELEGRAM_BUDGET_MAX:
+        return
+    where = (
+        f"{c_path}.approvals.budget_chars"
+        if own.budget_chars is not None
+        else "gateway.approvals.budget_chars"
+    )
+    said = (
+        f"{name} may be asked in Telegram, which shows at most {TELEGRAM_BUDGET_MAX} characters, "
+        f"and its budget is {budget}"
+    )
+    if approvers.portal is None:
+        report.error(where, f"{said}: lower it, or add approvers.portal")
+    else:
+        report.warning(where, f"{said}; longer texts are decided in the portal only")

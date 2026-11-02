@@ -42,6 +42,7 @@ NAME_SETS: Final = frozenset(
         ("Tools", "include"),
         ("Tools", "allow"),
         ("Tools", "approve"),
+        ("Tools", "vault_approval"),
         ("Client", "servers"),
         ("RemoteServer", "enable"),
         ("PromptsPolicy", "include"),
@@ -147,6 +148,12 @@ def _entry(op: Op, old: Any, new: Any) -> Direction:
 def _name(op: Op, old: Any, new: Any) -> Direction:
     """A name in a set: added is wider, removed narrower."""
     return "wider" if op == "added" else "narrower"
+
+
+def _held(op: Op, old: Any, new: Any) -> Direction:
+    """A name in ``vault_approval`` (M8 design A.4): added is narrower (the vault approves it),
+    removed wider; the reverse of :func:`_name`."""
+    return "wider" if op == "removed" else "narrower"
 
 
 def _optional(op: Op, old: Any, new: Any) -> Direction:
@@ -330,6 +337,7 @@ _RULES: Final[dict[str, Mapping[str, Rule]]] = {
         "timeout": _raised,
         "budget_chars": _raised,
         "confirm_code": _to_false,
+        "out_of_band": _to_true,
     },
     "Client": {
         **dict.fromkeys(("token", "token_sha256"), _wider),
@@ -345,7 +353,7 @@ _RULES: Final[dict[str, Mapping[str, Rule]]] = {
         "max_pending_per_client": _raised,
         "max_prompts_per_hour": _raised,
     },
-    "Tools": {"include": _name, "allow": _name, "approve": _neutral},
+    "Tools": {"include": _name, "allow": _name, "approve": _neutral, "vault_approval": _held},
     # Prompts and resources as tools (M6 design L.1): an include, or a prompt allowed to speak as
     # the assistant, added is wider; a re-pin neutral; a decline as a tool's.
     "PromptsPolicy": {
@@ -402,6 +410,15 @@ _RULES: Final[dict[str, Mapping[str, Rule]]] = {
         "limits": _into,
     },
     "Admin": dict.fromkeys(("listen", "origins"), _wider),
+    # The out-of-band approvers (M8 design A.4), host-only: a longer wait is wider.
+    "TelegramApprover": dict.fromkeys(("bot_token", "user_id", "chat_id"), _wider),
+    "Approvers": {
+        "telegram": _wider,
+        "portal": _wider,
+        "timeout": _raised,
+        "block_seconds": _raised,
+        "result_ttl": _raised,
+    },
     "Policy": {
         **dict.fromkeys(
             ("version", "mode", "egress_proxy", "egress_proxy_kind", "egress_proxy_acls"),
@@ -415,6 +432,7 @@ _RULES: Final[dict[str, Mapping[str, Rule]]] = {
         "connectors": _entry,
         "routes": _entry,
         "gateway": _optional,
+        "approvers": _optional,
     },
 }
 DIRECTIONS: Final[Mapping[str, Mapping[str, Rule]]] = MappingProxyType(

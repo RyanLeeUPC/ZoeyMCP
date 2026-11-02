@@ -651,6 +651,9 @@ class ClientApprovals(_Model):
     confirm_code: bool = False
     # How the client shows a prompt; plain text needs fewer markup rules.
     renders: Literal["markdown", "plain"] = "markdown"
+    # M8 (Z11): this client's gateway-held approve prompts are relayed out of band, to the
+    # vault's approvers, and a vault_approval tool is asked there for it too.
+    out_of_band: bool = False
 
 
 class Client(_Model):
@@ -698,6 +701,8 @@ class Tools(_Model):
     include: list[ToolName] = []
     allow: list[ToolName] = []
     approve: list[ToolName] = []
+    # M8 (Z1, Z20): approved by the vault, never by the gateway. A subset of approve (check).
+    vault_approval: list[ToolName] = []
 
 
 # A server's prompts and resources (M6 design L.1), each kind as its tools are: included, pinned
@@ -892,6 +897,47 @@ class Gateway(_Model):
         return value
 
 
+# --- out-of-band approvers (M8) -----------------------------------------------------------------
+
+# The Bot API's origin, the only one an approver's bot token is bound to (M8 design Z15).
+TELEGRAM_API = "https://api.telegram.org"
+# A Telegram user or chat id: a positive integer the Bot API (and JavaScript) holds exactly.
+TelegramId = Annotated[int, Field(ge=1, le=2**53 - 1)]
+# How long an out-of-band approval may wait, and how long its result is kept, in seconds.
+ApprovalWait = Annotated[int, Field(ge=60, le=86400)]
+# How long a held call blocks before it answers pending, in seconds.
+BlockSeconds = Annotated[int, Field(ge=0, le=600)]
+
+
+class TelegramApprover(_Model):
+    """The Telegram approver (M8 design G): a bot of its own, the operator's account, and the
+    operator's private chat with the bot."""
+
+    bot_token: SecretRef  # store:<name> only (check), bound to TELEGRAM_API
+    user_id: TelegramId
+    chat_id: TelegramId  # the user's private chat with the bot, whose id is the user's (check)
+
+
+class PortalApprover(_Model):
+    """Present: the portal's Approvals queue decides too. It has nothing to set."""
+
+
+class Approvers(_Model):
+    """Out-of-band approvers, hosted in the vault (design.md 6.3). Host-only: no portal write
+    changes the block, and of it only the three waits reach the gateway's view (M8 design A.1)."""
+
+    telegram: TelegramApprover | None = None
+    portal: PortalApprover | None = None
+    timeout: ApprovalWait = 3600  # an out-of-band deadline
+    block_seconds: BlockSeconds = 120  # longer waits answer pending
+    result_ttl: ApprovalWait = 3600  # a result kept for check_approval
+
+    @property
+    def any_surface(self) -> bool:
+        """Whether a surface that asks someone is set: Telegram or the portal's queue."""
+        return self.telegram is not None or self.portal is not None
+
+
 # --- document ----------------------------------------------------------------------------------
 
 
@@ -952,6 +998,7 @@ class Policy(_Model):
     connectors: dict[Name, SMTPConnector] = {}
     routes: list[Route] = []
     gateway: Gateway | None = None
+    approvers: Approvers | None = None  # M8; top level, outside gateway, so out of the view (C-2)
 
     @model_validator(mode="after")
     def _callback_addresses(self) -> Policy:

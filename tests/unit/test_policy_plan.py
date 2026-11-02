@@ -1307,6 +1307,7 @@ ROUTE = {
             "change gateway.approvals.timeout",
         ),
         ((setting("gateway", "hosts", value=["localhost"]),), "change gateway.hosts"),
+        ((setting("approvers", "block_seconds", value=30),), "change approvers"),
         ((setting("gateway", "origins", value=["https://app.example"]),), "change gateway.origins"),
         (
             (setting("connectors", "mail", "to", value=["x@mail.example"]),),
@@ -1386,6 +1387,7 @@ ROUTE = {
         "limits",
         "approvals",
         "hosts",
+        "approvers",
         "origins",
         "connector-to",
         "connector-port",

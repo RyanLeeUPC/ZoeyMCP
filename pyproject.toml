@@ -171,6 +171,7 @@ only_mutate = [
     "*zoeymcp/common/policy/callback.py",
     "*zoeymcp/common/policy/match.py",
     "*zoeymcp/common/policy/serverpaths.py",
+    "*zoeymcp/common/policy/held.py",
     "*zoeymcp/common/policy/view.py",
     "*zoeymcp/common/policy/change.py",
     "*zoeymcp/common/policy/emit.py",
@@ -307,3 +308,5 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.common.mcpwire" = 95
 "zoeymcp.gateway.routing" = 95
 "zoeymcp.gateway.approvalrules" = 95
+"zoeymcp.common.approvaltext" = 95
+"zoeymcp.common.ledgerformat" = 95

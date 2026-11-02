@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from ..common.policy.schema import (
+    TELEGRAM_API,
     BasicCredential,
     HeaderCredential,
     OAuth2Credential,
@@ -94,9 +95,17 @@ def derive_oauth_binding(policy: Policy, credential: str) -> dict[str, Any]:
 
 
 def derive_binding(policy: Policy, name: str) -> dict[str, Any]:
-    if name.startswith(VAULT_PREFIX):
-        return derive_oauth_binding(policy, _live_slot_owner(policy, name))
     ref = f"store:{name}"
+    # The Telegram approver's bot token (M8 design A.2 row 10, Z15): bound to the Bot API alone.
+    telegram = policy.approvers.telegram if policy.approvers is not None else None
+    if name.startswith(VAULT_PREFIX):
+        if telegram is not None and telegram.bot_token == ref:
+            # check refuses it too; an approver must never read a slot the vault keeps.
+            raise BindingError(
+                f"{name!r} is the Telegram approver's bot token, but the vault manages that name",
+                "conflict",
+            )
+        return derive_oauth_binding(policy, _live_slot_owner(policy, name))
     origins: set[str] = set()
     smtp: list[dict[str, Any]] = []
     oauth: dict[str, OAuth2Credential] = {}
@@ -119,6 +128,14 @@ def derive_binding(policy: Policy, name: str) -> dict[str, Any]:
         if ref in (connector.password, connector.username):
             smtp.append(smtp_binding(connector.host, connector.port, connector.from_, connector.to))
 
+    if telegram is not None and telegram.bot_token == ref:
+        if oauth or smtp or static:
+            raise BindingError(
+                f"{name!r} is the Telegram approver's bot token and is also used by a credential "
+                "or a connector; the approver needs a bot of its own",
+                "conflict",
+            )
+        return origin_binding([TELEGRAM_API])
     if oauth:
         if smtp or static:
             raise BindingError(

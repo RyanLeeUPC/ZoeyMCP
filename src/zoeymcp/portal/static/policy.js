@@ -28,6 +28,7 @@
     "policy.resume": "a return to managed mode",
     "policy.reseed": "a reseed",
     "policy.acknowledge": "an acknowledgment",
+    "tool.vault_approval_off": "vault_approval turned off",
   };
   // Which revision the gateway runs (K.1): the head's, another, or none reported yet.
   const GATEWAY_TEXT = {

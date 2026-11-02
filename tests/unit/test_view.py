@@ -29,6 +29,8 @@ PIN_A = "sha256:" + "a" * 64
 PIN_B = "sha256:" + "b" * 64
 HASH_2 = "sha256:" + "2" * 64
 TOKEN_1 = "zgc1-fake-token-for-agent-one-000000000000000000"
+# A Telegram id, distinctive enough to look for in a view (M8 design A.1).
+ID = 7362915048
 
 
 def raw_policy() -> Raw:
@@ -293,9 +295,17 @@ EMPTY_SET: Raw = {"include": [], "review": {}, "declined": {}}
 
 def without_empty_m6_fields(view: GatewayView) -> Raw:
     """The view's content as M7 had it: a server's empty ``declined`` left out, and a remote
-    server's ``prompts`` and ``resources`` while every set in them is empty (M6 design A.3)."""
+    server's ``prompts`` and ``resources`` while every set in them is empty (M6 design A.3); and
+    M8's fields while empty, false or absent (M8 design A.1)."""
     gateway: Raw = view.gateway.model_dump(mode="json")
+    if gateway["approvals"]["out_of_band"] is None:
+        del gateway["approvals"]["out_of_band"]
+    for client in gateway["clients"].values():
+        if client["approvals"] is not None and not client["approvals"]["out_of_band"]:
+            del client["approvals"]["out_of_band"]
     for server in gateway["servers"].values():
+        if not server["tools"]["vault_approval"]:
+            del server["tools"]["vault_approval"]
         if not server["declined"]:
             del server["declined"]
         if server.get("prompts") == EMPTY_PROMPTS:
@@ -336,6 +346,93 @@ def test_an_empty_declined_block_is_left_out_of_the_digest_and_the_bytes() -> No
     assert all("declined" not in server for name, server in data["gateway"]["servers"].items()
                if name != "notes-read")  # fmt: skip
     assert parse_view(dump_view(built(raw))) == built(raw)
+
+
+def m8_fields(raw: Raw) -> None:
+    """Every M8 field written at the value that means "as before" (M8 design A.5)."""
+    for server in raw["gateway"]["servers"].values():
+        server.setdefault("tools", {})["vault_approval"] = []
+    raw["gateway"]["clients"]["agent1"]["approvals"] = {"attended": True, "out_of_band": False}
+    raw["approvers"] = {"timeout": 7200, "block_seconds": 30, "result_ttl": 600}
+
+
+def test_m8_fields_leave_old_digests() -> None:
+    """M8 design A.1, A.5: M8's fields written but empty, false, or an approvers block that names
+    no surface: the digest and the bytes of the view without them, which an M7 gateway parses."""
+    raw = raw_policy()
+    raw["gateway"]["clients"]["agent1"]["approvals"] = {"attended": True}
+    before = built(raw)
+    m8_fields(raw)
+    after = built(raw)
+    assert (after.digest, dump_view(after)) == (before.digest, dump_view(before))
+    for name in (b"vault_approval", b"out_of_band", b"approvers", b"block_seconds"):
+        assert name not in dump_view(after)
+    assert parse_view(dump_view(after)) == after
+
+
+@pytest.mark.parametrize(
+    "surfaces",
+    [
+        {"portal": {}},
+        {"telegram": {"bot_token": "store:approver-bot", "user_id": ID, "chat_id": ID}},
+    ],
+    ids=["portal", "telegram"],
+)
+def test_the_view_carries_the_waits_of_an_approver_and_nothing_else(surfaces: Raw) -> None:
+    """M8 design A.1, C-2, E-9: with an approver named, the gateway's approvals carry its three
+    waits; the token reference, the ids and which surface it is stay out of the view."""
+    raw = raw_policy()
+    raw["approvers"] = {**surfaces, "timeout": 7200, "block_seconds": 30, "result_ttl": 600}
+    view = built(raw)
+    out_of_band = {"timeout": 7200, "block_seconds": 30, "result_ttl": 600}
+    assert as_raw(view)["gateway"]["approvals"] == {
+        **EXPECTED_GATEWAY["approvals"],
+        "out_of_band": out_of_band,
+    }
+    assert view.digest != built().digest
+    served = dump_view(view)
+    for absent in (
+        b"approver-bot",
+        str(ID).encode(),
+        b"telegram",
+        b'"portal":',
+        b"user_id",
+        b"chat_id",
+    ):
+        assert absent not in served
+    assert parse_view(served) == view
+    parsed = parse_view(served).gateway.approvals.out_of_band
+    assert parsed is not None
+    assert parsed.model_dump() == out_of_band
+
+
+def test_held_tools_and_out_of_band_clients_are_carried() -> None:
+    """M8 design A.1: tools.vault_approval and a client's out_of_band reach the view through
+    the schema's own models, and change the digest once set."""
+    raw = raw_policy()
+    raw["gateway"]["servers"]["notes-write"]["tools"]["vault_approval"] = ["create"]
+    raw["gateway"]["clients"]["agent1"]["approvals"] = {"attended": False, "out_of_band": True}
+    view = built(raw)
+    served = as_raw(view)["gateway"]
+    assert served["servers"]["notes-write"]["tools"] == {
+        "include": ["create"],
+        "allow": [],
+        "approve": ["create"],
+        "vault_approval": ["create"],
+    }
+    assert "vault_approval" not in served["servers"]["notes-read"]["tools"]
+    assert served["clients"]["agent1"]["approvals"]["out_of_band"] is True
+    assert served["clients"]["agent2"]["approvals"] is None
+    assert view.digest != built().digest
+    assert parse_view(dump_view(view)) == view
+
+
+def test_the_view_has_no_operator_field_for_out_of_band() -> None:
+    """C-2: out_of_band under gateway.approvals is the view's alone; the policy refuses it."""
+    raw = raw_policy()
+    raw["gateway"]["approvals"]["out_of_band"] = {"timeout": 60, "block_seconds": 0}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Policy.model_validate(raw)
 
 
 def test_the_digest_ignores_document_order() -> None:
@@ -643,7 +740,7 @@ def test_every_vault_path_check_allows_builds_and_parses(prefix: str, path: str)
     raw["routes"][0]["rules"][0]["paths"] = [path]
     raw["gateway"]["servers"]["notes-read"]["path"] = path
     raw["gateway"]["servers"]["notes-write"]["path"] = path
-    raw["gateway"]["approvals"]["approver"] = "elicitation"  # check refuses others until M8
+    raw["gateway"]["approvals"]["approver"] = "elicitation"  # check refuses the others (M8)
     policy = Policy.model_validate(raw)
     assert [f for f in check_policy(policy) if f.level == "error"] == []
     view = build_view(policy)

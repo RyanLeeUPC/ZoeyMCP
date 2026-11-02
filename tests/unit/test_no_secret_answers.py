@@ -50,6 +50,7 @@ import pytest
 from starlette.routing import Route as StarletteRoute
 
 import zoeymcp.portal
+from tests.dark import lit
 from tests.fakes.authenticator import SoftAuthenticator
 from tests.unit import onboard_model
 from zoeymcp.common.policy.schema import GatewayLimits, hash_token
@@ -649,14 +650,26 @@ gateway:
   servers:
     notes: {{kind: remote, route: notes, path: /mcp, era: modern}}
 """
+# M8 design O.6: the Telegram approver's ids and its bot token's reference, which the portal
+# shows only as set (built dark: walked lit, G-2).
+TELEGRAM_ID = 7362915048
+APPROVER_BOT = "approver-bot-sentinel"
+MANAGED_PORTAL_M8 = (
+    MANAGED_PORTAL
+    + f"""approvers:
+  telegram: {{bot_token: "store:{APPROVER_BOT}", user_id: {TELEGRAM_ID}, chat_id: {TELEGRAM_ID}}}
+"""
+)
 
 
-async def managed_portal(tmp_path: Path) -> tuple[PortalApp, Any, Reviews]:
-    """A managed vault (``test_managed.start``) and its portal, whose review jobs hold a done
-    review of notes for the portal."""
+async def managed_portal(
+    tmp_path: Path, policy: str = MANAGED_PORTAL
+) -> tuple[PortalApp, Any, Reviews]:
+    """A managed vault (``test_managed.start``) on ``policy`` and its portal, whose review jobs
+    hold a done review of notes for the portal."""
     from .test_managed import start
 
-    vault = start(tmp_path, MANAGED_PORTAL)
+    vault = start(tmp_path, policy)
     (tmp_path / "portal").mkdir(mode=0o700)
     passkeys = Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json")
     reviews = Reviews()
@@ -689,39 +702,46 @@ async def test_no_managed_portal_answer_carries_a_token_or_a_placeholder(tmp_pat
     a server from the client with the token (step 15c), a refused prepare and a stale draft,
     then every route walked, the history and the seed's diff from an empty policy among them
     (step 15b): no answer carries the client's literal token, its hash or the caller's
-    placeholder, the draft's and the plan's summaries included."""
-    app, vault, reviews = await managed_portal(tmp_path)
-    answers: list[str] = []
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
-    page = Recording(client, answers)
-    authenticator = SoftAuthenticator()
-    await signed_in(page, app, authenticator)
-    job = reviews.portal_done.id
-    choices = {"include": ["list_notes"], "allow": [], "approve": ["list_notes"]}
-    draft = (await page.call("POST", f"/api/review/jobs/{job}/diff", choices)).json()
-    assert draft["kind"] == "policy.save", draft
-    data = {"draft": draft["draft"], "base": draft["base"]}
-    saved = await step_up(page, authenticator, "policy.save", data)
-    assert saved.status_code == 200, saved.text
-    assert saved.json()["revision"] == 2
-    # Give to clients (step 15c): its plan and answer name the client, never its token.
-    taken = {"base": 2, "client": "agent2", "servers": []}
-    given = await step_up(page, authenticator, "client.servers", taken)
-    assert given.status_code == 200, given.text
-    refused = await page.call("POST", "/api/actions", {"kind": "policy.save", "data": data})
-    assert refused.json()["reason"] == "draft_unknown"
-    # The head moved since that review ran: a draft from it is refused, stale.
-    again = await page.call("POST", f"/api/review/jobs/{job}/diff", choices)
-    assert again.json()["reason"] == "review_stale", again.text
-    params = {**PORTAL_PARAMS, "job": job}
-    await walk([page], [r for r in ROUTES if r.path not in ENDINGS], params)
-    credentials = {
-        MANAGED_TOKEN: "client token",
-        hash_token(MANAGED_TOKEN): "token hash",
-        MANAGED_PLACEHOLDER: "placeholder",
-    }
-    assert len(answers) > len(ROUTES)
-    for text in answers:
-        assert carried(text, credentials) == set()
-    await client.aclose()
-    await vault.app.aclose()
+    placeholder, the draft's and the plan's summaries included. Its seed names the Telegram
+    approver (M8 design O.6): no answer carries its ids or its bot token's reference either."""
+    with lit():
+        app, vault, reviews = await managed_portal(tmp_path, MANAGED_PORTAL_M8)
+        approvers = vault.app.policy.approvers
+        assert approvers is not None
+        assert approvers.telegram is not None
+        answers: list[str] = []
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN)
+        page = Recording(client, answers)
+        authenticator = SoftAuthenticator()
+        await signed_in(page, app, authenticator)
+        job = reviews.portal_done.id
+        choices = {"include": ["list_notes"], "allow": [], "approve": ["list_notes"]}
+        draft = (await page.call("POST", f"/api/review/jobs/{job}/diff", choices)).json()
+        assert draft["kind"] == "policy.save", draft
+        data = {"draft": draft["draft"], "base": draft["base"]}
+        saved = await step_up(page, authenticator, "policy.save", data)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["revision"] == 2
+        # Give to clients (step 15c): its plan and answer name the client, never its token.
+        taken = {"base": 2, "client": "agent2", "servers": []}
+        given = await step_up(page, authenticator, "client.servers", taken)
+        assert given.status_code == 200, given.text
+        refused = await page.call("POST", "/api/actions", {"kind": "policy.save", "data": data})
+        assert refused.json()["reason"] == "draft_unknown"
+        # The head moved since that review ran: a draft from it is refused, stale.
+        again = await page.call("POST", f"/api/review/jobs/{job}/diff", choices)
+        assert again.json()["reason"] == "review_stale", again.text
+        params = {**PORTAL_PARAMS, "job": job}
+        await walk([page], [r for r in ROUTES if r.path not in ENDINGS], params)
+        credentials = {
+            MANAGED_TOKEN: "client token",
+            hash_token(MANAGED_TOKEN): "token hash",
+            MANAGED_PLACEHOLDER: "placeholder",
+            str(TELEGRAM_ID): "telegram id",
+            APPROVER_BOT: "approver bot token reference",
+        }
+        assert len(answers) > len(ROUTES)
+        for text in answers:
+            assert carried(text, credentials) == set()
+        await client.aclose()
+        await vault.app.aclose()
