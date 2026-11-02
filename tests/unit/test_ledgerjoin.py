@@ -59,8 +59,9 @@ def outcome(seq: int, ts: int, ref: str, result: str, detail: str | None) -> dic
 
 
 # Every shape the join and its renderers meet: ledger-level records at either end, a call with an
-# outcome detail, one without, one never decided, one decided by the vault (M8's writer, J.6) with
-# no outcome, and an outcome whose ref was never asked. test_ledger_cli.py pins the CLI's text.
+# outcome detail, one without, one never decided, one the vault decided (M8's writer, J.6: its
+# `accept`, with `via`; the gateway's own record of that is `approved_elsewhere`, C.4) with no
+# outcome, and an outcome whose ref was never asked. test_ledger_cli.py pins the CLI's text.
 RECORDS = [
     record(0, T - 60_000, None, "repaired", torn_bytes=7),
     asked(1, T, REF_A),
@@ -77,8 +78,9 @@ RECORDS = [
         REF_D,
         "decided",
         writer="vault",
-        decision="approved_elsewhere",
+        decision="accept",
         waited_ms=0,
+        via="telegram",
     ),
     outcome(10, T + 3_600_002, REF_E, "unknown", "restart"),
     record(11, T + 86_400_000, None, "recovered", abandoned=1, not_sent=1, unknown=0),
@@ -117,7 +119,7 @@ def test_each_record_keeps_its_writer() -> None:
     assert isinstance(call, Call)
     assert call.records["asked"]["writer"] == "gateway"
     assert call.records["decided"]["writer"] == "vault"
-    assert call.records["decided"]["decision"] == "approved_elsewhere"
+    assert call.records["decided"]["decision"] == "accept"
 
 
 def test_no_records() -> None:

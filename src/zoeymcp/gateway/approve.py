@@ -179,7 +179,7 @@ class Approvals:
         settings = _settings(asking.gateway, own, asking.policy)
         code = approvals.new_code() if own.confirm_code else None
         asked_wall = self.wall()
-        header = _header(asking, asked_wall + settings.timeout)
+        header = _header(asking, asked_wall, asked_wall + settings.timeout)
         shown_code = code.reveal() if code is not None else None
         if plan is not None:
             text = approvaltext.render_plan(header, plan, code=shown_code)
@@ -546,9 +546,20 @@ def _budget(gateway: ViewGateway, own: ClientApprovals) -> int:
     return own.budget_chars if own.budget_chars is not None else gateway.approvals.budget_chars
 
 
-def _header(asking: Asking, deadline_wall: float) -> Header:
-    deadline = datetime.fromtimestamp(deadline_wall, UTC)
-    return Header(asking.ref, asking.client, asking.server, asking.tool, deadline)
+def _header(asking: Asking, asked_wall: float, deadline_wall: float) -> Header:
+    """The gateway's own frame for an elicitation: its client, no pin (M8 design E.5)."""
+    return Header(
+        asking.ref,
+        asking.client,
+        asking.server,
+        asking.tool,
+        datetime.fromtimestamp(deadline_wall, UTC),
+        asked_at=datetime.fromtimestamp(asked_wall, UTC),
+        rendered_by="gateway",
+        client_reported=False,
+        pin=None,
+        approver="elicitation",
+    )
 
 
 def _upstream_outcome(exc: UpstreamError) -> dict[str, Any]:

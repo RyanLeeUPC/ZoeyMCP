@@ -304,3 +304,6 @@ also_copy = [".github", "Dockerfile", "deploy", "docs", "examples", "profiles", 
 "zoeymcp.gateway.sanitize" = 95
 "zoeymcp.gateway.connstate" = 95
 "zoeymcp.common.policy.serverpaths" = 95
+"zoeymcp.common.mcpwire" = 95
+"zoeymcp.gateway.routing" = 95
+"zoeymcp.gateway.approvalrules" = 95

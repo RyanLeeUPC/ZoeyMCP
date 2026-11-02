@@ -6,8 +6,9 @@ code ``zoeymcp ledger`` prints with, and flattened into rows, newest first, a pa
 - **No keyed digests and no pin.** An ``asked`` record's ``args``, ``text`` and ``pin`` never
   reach a row; ``zoeymcp ledger check`` in the gateway's container checks arguments (Q12).
 - **Who wrote each record.** Every row carries each record's ``writer``: the gateway's, as
-  reported, and from M8 the vault's own chain joined in by ref (``approved_elsewhere``,
-  ``pending``). A row is a claim the gateway made, and the page says so.
+  reported, and from M8 the vault's own chain joined in by ref (its ``decided accept`` with
+  ``via``; ``approved_elsewhere`` and ``pending`` are the gateway's own records of a vault
+  decision, M8 design C.4). A row is a claim the gateway made, and the page says so.
 - **The journal join (D-25).** A send's ``Idempotency-Key`` up to its last dot is the call's ref.
   A row shows its sends' state, SMTP code and time, never the Message-ID or ``req_hmac``. A send
   whose ref the copy doesn't hold is an orphan, flagged ``not_yet_reported`` until the live chain

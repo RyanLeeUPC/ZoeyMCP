@@ -122,13 +122,14 @@ def test_the_text_output_is_pinned(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 # The CLI's text for every shape common/ledgerjoin.py meets, as it printed before the join moved
-# there (M5 step 4a): the output is unchanged byte for byte.
+# there (M5 step 4a): the output is unchanged byte for byte. M8 step 4 made the vault's record in
+# the fixture its own `accept` (M8 design C.4), so that line names it.
 GOLDEN = (
     "2026-01-01 13:59:00Z ledger repaired torn_bytes=7\n"
     "2026-01-01 14:00:00Z 000000000000000a agent1 mail/send_note legacy accept ok (sent)\n"
     "2026-01-01 14:00:01Z 000000000000000b agent2 mail/send_note modern decline not_sent\n"
     "2026-01-01 14:01:01Z 000000000000000c agent1 mail/list_notes legacy - -\n"
-    "2026-01-01 15:00:00Z 000000000000000d agent1 mail/send_note legacy approved_elsewhere -\n"
+    "2026-01-01 15:00:00Z 000000000000000d agent1 mail/send_note legacy accept -\n"
     "2026-01-02 14:00:00Z ledger recovered abandoned=1 not_sent=1 unknown=0\n"
 )
 

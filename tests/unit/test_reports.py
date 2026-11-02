@@ -154,8 +154,9 @@ def vault_line(seq: int, prev: str) -> bytes:
         ts=T0,
         ref="0" * 16,
         writer="vault",
-        decision="approved_elsewhere",
+        decision="accept",
         waited_ms=0,
+        via="telegram",
     )
     return line[:-1]
 

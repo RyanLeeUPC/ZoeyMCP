@@ -11,6 +11,7 @@ import json
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,26 @@ async def test_accept_runs_exactly_the_shown_call(tmp_path: Path, version: Versi
     [decided] = deployed.events("approval_decided")
     assert (decided["ref"], decided["decision"]) == (ref, "accept")
     assert decided["ledger_seq"] == 1
+
+
+async def test_a_prompt_that_crosses_midnight_utc_shows_the_date(tmp_path: Path) -> None:
+    """M8 design E.5: the deadline is dated against the wall time it was asked at, so a prompt
+    asked at 23:58 UTC with the default 300 second timeout names the next day."""
+    walls = [
+        datetime(2026, 11, 1, 23, 58, tzinfo=UTC).timestamp(),
+        datetime(2026, 11, 1, 12, 0, tzinfo=UTC).timestamp(),
+    ]
+    script = Script([ACCEPT])
+    with anyio.fail_after(30), approving(tmp_path) as (_, running):
+        running.app.approvals.wall = lambda: walls[len(script.prompts)]
+        async with agent(running.mcp(), script=script, headers=headers()) as client:
+            await client.call_tool("echo", {"text": "late"})
+            await client.call_tool("echo", {"text": "noon"})
+    answers = [prompt.message.split("\n")[3] for prompt in script.prompts]
+    assert answers == [
+        "Answer by 2026-11-02 00:03 UTC. Accept runs this one call, exactly as shown.",
+        "Answer by 12:05 UTC. Accept runs this one call, exactly as shown.",
+    ]
 
 
 @pytest.mark.parametrize("version", VERSIONS)

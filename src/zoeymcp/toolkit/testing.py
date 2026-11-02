@@ -199,8 +199,19 @@ async def run(
         )
     plan = None
     prompt: approvaltext.ApprovalText
-    deadline = datetime.now(UTC) + timedelta(seconds=300)
-    header = Header(ref, client, server, tool, deadline)
+    asked_at = datetime.now(UTC)
+    header = Header(
+        ref,
+        client,
+        server,
+        tool,
+        asked_at + timedelta(seconds=300),
+        asked_at=asked_at,
+        rendered_by="gateway",
+        client_reported=False,
+        pin=None,
+        approver="elicitation",
+    )
     if spec.prepare is not None:
         bound = {
             name: _Bound(fake, toolkit.slots[name], "prepare", ledger)

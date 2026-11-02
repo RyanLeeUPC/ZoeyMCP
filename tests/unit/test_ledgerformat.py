@@ -11,10 +11,13 @@ from hypothesis import strategies as st
 from zoeymcp.common import canonical
 from zoeymcp.common.ledgerformat import (
     DECISIONS,
+    DETAILS,
     GENESIS,
     MAX_LINE_BYTES,
+    VIAS,
     LedgerFormatError,
     Record,
+    Step,
     encode,
     line_hash,
     open_refs,
@@ -45,26 +48,39 @@ OUTCOME = {"outcome": "ok", "detail": "sent", "writes_sent": 1, "writes_unknown"
 
 
 class Chain:
-    """Builds a valid chain of lines."""
+    """Builds a valid chain of lines, all written by one writer."""
 
-    def __init__(self) -> None:
+    def __init__(self, writer: str = "gateway") -> None:
         self.lines: list[bytes] = []
         self.prev = GENESIS
+        self.writer = writer
 
     def add(self, kind: Any, ref: str | None, **fields: Any) -> bytes:
         line = encode(
-            kind, seq=len(self.lines), prev=self.prev, ts=1000 + len(self.lines), ref=ref, **fields
+            kind,
+            seq=len(self.lines),
+            prev=self.prev,
+            ts=1000 + len(self.lines),
+            ref=ref,
+            writer=self.writer,
+            **fields,
         )
         self.lines.append(line)
         self.prev = line_hash(line)
         return line
 
     def call(
-        self, ref: str, decision: str | None = None, outcome: dict[str, Any] | None = None
+        self,
+        ref: str,
+        decision: str | None = None,
+        outcome: dict[str, Any] | None = None,
+        *,
+        where: str = "gateway",
     ) -> None:
-        self.add("asked", ref, **ASKED)
+        self.add("asked", ref, **{**ASKED, "where": where})
         if decision is not None:
-            self.add("decided", ref, decision=decision, waited_ms=10)
+            via = {"via": "telegram"} if self.writer == "vault" else {}
+            self.add("decided", ref, decision=decision, waited_ms=10, **via)
         if outcome is not None:
             self.add("outcome", ref, **outcome)
 
@@ -115,6 +131,43 @@ def test_the_vault_may_write_the_same_records() -> None:
         "asked", seq=0, prev=GENESIS, ts=1, ref=REF, writer="vault", **{**ASKED, "where": "vault"}
     )
     assert parse(line).writer == "vault"
+
+
+def vault_decided(**fields: Any) -> bytes:
+    return encode("decided", seq=0, prev=GENESIS, ts=1, ref=REF, writer="vault", **fields)
+
+
+def test_a_vault_decision_names_the_surface_it_came_through() -> None:
+    """M8 design J.1: ``via`` is required on the vault's ``decided`` and absent on the
+    gateway's; no other kind carries it."""
+    decided: dict[str, Any] = {"decision": "accept", "waited_ms": 0}
+    assert {"telegram", "portal", "host", "none"} == VIAS
+    for via in sorted(VIAS):
+        assert parse(vault_decided(via=via, **decided)).fields == {**decided, "via": via}
+    for fields, message in [
+        (decided, "wrong fields"),
+        ({**decided, "via": "email"}, "bad via"),
+        ({**decided, "via": None}, "bad via"),
+    ]:
+        with pytest.raises(LedgerFormatError, match=message):
+            vault_decided(**fields)
+    with pytest.raises(LedgerFormatError, match="wrong fields"):
+        encode("decided", seq=0, prev=GENESIS, ts=1, ref=REF, via="telegram", **decided)
+    with pytest.raises(LedgerFormatError, match="wrong fields"):
+        encode("outcome", seq=0, prev=GENESIS, ts=1, ref=REF, writer="vault", via="none", **OUTCOME)
+    # A line the vault wrote without its via doesn't parse either.
+    line = vault_decided(via="host", **decided)
+    with pytest.raises(LedgerFormatError, match="wrong fields"):
+        parse(line.replace(b',"via":"host"', b""))
+
+
+def test_a_relay_and_a_lost_ledger_are_outcome_details() -> None:
+    """M8 design J.1: the vault's outcome for a relay, and a hold ended by its ledger."""
+    assert {"relayed", "ledger"} <= DETAILS
+    for detail in ("relayed", "ledger"):
+        fields = {**OUTCOME, "outcome": "unknown", "detail": detail, "writes_sent": 0}
+        line = encode("outcome", seq=0, prev=GENESIS, ts=1, ref=REF, writer="vault", **fields)
+        assert parse(line).fields["detail"] == detail
 
 
 @pytest.mark.parametrize(
@@ -278,29 +331,112 @@ def test_the_recovery_plan_closes_each_open_ref_once() -> None:
 
 
 def test_recovery_steps_encode_and_close_everything() -> None:
+    for writer in ("gateway", "vault"):
+        chain = Chain(writer)
+        chain.call(REF, "accept")
+        chain.call(OTHER)
+        for step in recovery_plan(open_refs(chain.records())):
+            chain.add(step.kind, step.ref, **step.fields)
+        assert open_refs(chain.records()) == {}
+        assert verify(chain.lines).broken_at is None
+
+
+def outcomes(steps: list[Step]) -> dict[str | None, tuple[str, int]]:
+    """Each closed ref's outcome and its writes_unknown."""
+    return {
+        s.ref: (s.fields["outcome"], s.fields["writes_unknown"])
+        for s in steps
+        if s.kind == "outcome"
+    }
+
+
+def decided(steps: list[Step]) -> list[tuple[str | None, dict[str, Any]]]:
+    return [(s.ref, dict(s.fields)) for s in steps if s.kind == "decided"]
+
+
+def test_a_call_the_vault_may_have_forwarded_closes_unknown() -> None:
+    """M8 design C.4: after the gateway's ``approved_elsewhere`` or ``pending``, or its
+    ``asked`` with ``where: vault`` and no decision, the vault may have held the call, been
+    approved and forwarded it."""
+    refs = [f"{n:016x}" for n in range(1, 7)]
     chain = Chain()
-    chain.call(REF, "accept")
-    chain.call(OTHER)
-    for step in recovery_plan(open_refs(chain.records())):
-        chain.add(step.kind, step.ref, **step.fields)
-    assert open_refs(chain.records()) == {}
-    assert verify(chain.lines).broken_at is None
+    chain.call(refs[0], "approved_elsewhere", where="vault")
+    chain.call(refs[1], "pending", where="vault")
+    chain.call(refs[2], where="vault")
+    chain.call(refs[3], "decline", where="vault")
+    chain.call(refs[4], "pending")  # a relay's detached wait: the gateway may have run it
+    chain.call(refs[5])
+    steps = recovery_plan(open_refs(chain.records()))
+    assert outcomes(steps) == {
+        refs[0]: ("unknown", 1),
+        refs[1]: ("unknown", 1),
+        refs[2]: ("unknown", 1),
+        refs[3]: ("not_sent", 0),
+        refs[4]: ("unknown", 1),
+        refs[5]: ("not_sent", 0),
+    }
+    abandoned = {"decision": "abandoned", "waited_ms": 0}
+    assert decided(steps) == [(refs[2], abandoned), (refs[5], abandoned)]
+    assert steps[-1].fields == {"abandoned": 2, "not_sent": 2, "unknown": 4}
+    assert all(s.fields["detail"] == "restart" for s in steps if s.kind == "outcome")
 
 
-_decisions = st.sampled_from(sorted(DECISIONS - {"pending", "approved_elsewhere"}))
+def test_the_vault_chain_closes_a_hold_with_no_life_after_a_restart() -> None:
+    """M8 design J.1: a vault ``asked`` with no decision, held or relayed, closes ``decided
+    abandoned`` via ``none``, then ``not_sent``; a vault ``accept`` closes ``unknown``."""
+    refs = [f"{n:016x}" for n in range(1, 4)]
+    chain = Chain("vault")
+    chain.call(refs[0], where="vault")
+    chain.call(refs[1])  # a relay
+    chain.call(refs[2], "accept", where="vault")
+    steps = recovery_plan(open_refs(chain.records()))
+    assert outcomes(steps) == {
+        refs[0]: ("not_sent", 0),
+        refs[1]: ("not_sent", 0),
+        refs[2]: ("unknown", 1),
+    }
+    abandoned = {"decision": "abandoned", "waited_ms": 0, "via": "none"}
+    assert decided(steps) == [(refs[0], abandoned), (refs[1], abandoned)]
+
+
+def test_a_ref_with_no_asked_record_still_closes() -> None:
+    """recovery_plan takes any open refs, not only open_refs': with no ``asked`` record it plans
+    no writes, adds no via and reads no where."""
+    accepted = encode("decided", seq=0, prev=GENESIS, ts=1, ref=REF, decision="accept", waited_ms=0)
+    assert outcomes(recovery_plan({REF: [parse(accepted)]})) == {REF: ("unknown", 0)}
+    pending = vault_decided(decision="pending", waited_ms=0, via="none")
+    assert outcomes(recovery_plan({REF: [parse(pending)]})) == {REF: ("unknown", 0)}
+    steps = recovery_plan({REF: []})
+    assert decided(steps) == [(REF, {"decision": "abandoned", "waited_ms": 0})]
+    assert outcomes(steps) == {REF: ("not_sent", 0)}
+
+
+_decisions = st.sampled_from(sorted(DECISIONS))
+_writers = st.sampled_from(["gateway", "vault"])
+_MAY_HAVE_RUN = {"accept", "approved_elsewhere", "pending"}
 
 
 @settings(max_examples=100, deadline=None)
-@given(st.lists(st.tuples(st.booleans(), st.none() | _decisions, st.booleans()), max_size=12))
-def test_recovery_is_deterministic_and_complete(calls: list[tuple[bool, str | None, bool]]) -> None:
-    chain = Chain()
-    for index, (_, decision, closed) in enumerate(calls):
-        chain.call(f"{index:016x}", decision, OUTCOME if closed and decision else None)
+@given(_writers, st.lists(st.tuples(_writers, st.none() | _decisions, st.booleans()), max_size=12))
+def test_recovery_is_deterministic_and_complete(
+    writer: str, calls: list[tuple[str, str | None, bool]]
+) -> None:
+    chain = Chain(writer)
+    expected: dict[str | None, str] = {}
+    for index, (where, decision, closed) in enumerate(calls):
+        ref = f"{index:016x}"
+        chain.call(ref, decision, OUTCOME if closed and decision else None, where=where)
+        if not (closed and decision):
+            unknown = decision in _MAY_HAVE_RUN or (
+                decision is None and writer == "gateway" and where == "vault"
+            )
+            expected[ref] = "unknown" if unknown else "not_sent"
     before = open_refs(chain.records())
     steps = recovery_plan(before)
     assert steps == recovery_plan(open_refs(chain.records()))
-    outcomes = [s.ref or "" for s in steps if s.kind == "outcome"]
-    assert sorted(outcomes) == sorted(before)  # exactly one outcome per open ref
+    found = [s.ref or "" for s in steps if s.kind == "outcome"]
+    assert sorted(found) == sorted(before)  # exactly one outcome per open ref
+    assert {ref: result for ref, (result, _) in outcomes(steps).items()} == expected
     for step in steps:
-        chain.add(step.kind, step.ref, **step.fields)
+        chain.add(step.kind, step.ref, **step.fields)  # the writer's own format takes each step
     assert open_refs(chain.records()) == {}

@@ -32,7 +32,16 @@ from zoeymcp.toolkit.params import check_arguments, description, parameters
 from zoeymcp.vault.connectors import mailmsg, sendjournal, tunnel
 from zoeymcp.vault.connectors.sendjournal import Journal, JournalError
 
-HEADER = Header("3f9c0a17d2b84e65", "agent1", "mail", "send_note", datetime(2026, 1, 1, tzinfo=UTC))
+FRAME: dict[str, Any] = {
+    "asked_at": datetime(2026, 1, 1, tzinfo=UTC),
+    "rendered_by": "gateway",
+    "client_reported": False,
+    "pin": None,
+    "approver": "elicitation",
+}
+HEADER = Header(
+    "3f9c0a17d2b84e65", "agent1", "mail", "send_note", datetime(2026, 1, 1, tzinfo=UTC), **FRAME
+)
 
 
 # --- toolkit.rules ------------------------------------------------------------------------------
@@ -226,8 +235,8 @@ def test_a_tab_in_text_that_refuses_tabs() -> None:
     ("build", "message"),
     [
         (
-            lambda: Header("r", "c", "s", "t", datetime(2026, 1, 1)),
-            "the deadline must be timezone-aware",
+            lambda: Header("r", "c", "s", "t", datetime(2026, 1, 1), **FRAME),
+            "the deadline and asked_at must be timezone-aware",
         ),
     ],
 )

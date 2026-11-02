@@ -341,28 +341,26 @@ HELD = Held("ok", 0, 12, "sha256:" + "f" * 64, (LiveFile("000000000000.jsonl", 9
 
 def test_records_the_vault_wrote_are_rendered() -> None:
     """J.6: M8's vault-written records arrive through their own chain, never the report path
-    (which refuses them), so the renderer is shown its fixtures: ``approved_elsewhere`` and
-    ``pending``, each labelled as the vault's."""
+    (which refuses them), so the renderer is shown its fixtures: the vault's ``accept``
+    labelled as the vault's (M8 design C.4), and the gateway's ``pending`` as the gateway's."""
     fields = {k: v for k, v in asked(REFS[7]).items() if k not in ("kind", "ref")}
     records = [
         *RECORDS,
         record(12, T + 90_000_000, REFS[7], "asked", **fields),
-        record(13, T + 90_000_001, REFS[7], "decided", writer="vault", decision="pending"),
+        record(13, T + 90_000_001, REFS[7], "decided", decision="pending", waited_ms=0),
     ]
     page = ledgerview.page(records, held=HELD, journals={}, now=T + 90_000_002)
     answer = _ledger_view(page, None, [], None)
     by_ref = {row.get("ref"): row for row in answer["rows"]}
-    elsewhere = by_ref[REF_D]
-    assert elsewhere["decision"] == "approved_elsewhere"
-    assert elsewhere["text_shown"].endswith(
-        "decision approved_elsewhere; outcome none yet; 1 write(s) asked; asked reported by the "
-        "gateway, decided written by the vault."
+    accepted = by_ref[REF_D]
+    assert accepted["decision"] == "accept"
+    assert accepted["text_shown"].endswith(
+        "decision accept; outcome none yet; 1 write(s) asked; asked reported by the gateway, "
+        "decided written by the vault."
     )
     pending = by_ref[REFS[7]]
     assert "decision pending;" in pending["text_shown"]
-    assert pending["text_shown"].endswith(
-        "asked reported by the gateway, decided written by the vault."
-    )
+    assert pending["text_shown"].endswith("1 write(s) asked; reported by the gateway.")
     assert "hmac-sha256" not in json.dumps(answer)
 
 

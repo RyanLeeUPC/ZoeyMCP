@@ -1,7 +1,8 @@
-"""Approval prompts and the check that nothing in them can hide (M4 design C)."""
+"""Approval prompts and the check that nothing in them can hide (M4 design C; M8 design E.5)."""
 
 from __future__ import annotations
 
+import dataclasses
 import io
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -10,9 +11,12 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from tests.unit.plainid import plain_id
 from zoeymcp.common import canonical, logs
 from zoeymcp.common.approvaltext import (
     FOOTER_PREFIX,
+    INSTRUCTIONS,
+    RELAY_LINE,
     ApprovalText,
     Header,
     LayoutError,
@@ -22,6 +26,7 @@ from zoeymcp.common.approvaltext import (
     Write,
     describe,
     problems,
+    relayed,
     render_call,
     render_plan,
 )
@@ -29,9 +34,28 @@ from zoeymcp.common.approvaltext import (
 ZWSP = chr(0x200B)
 COMBINING_ACUTE = chr(0x301)
 ARROW = chr(0x2192)
+ELLIPSIS = chr(0x2026)
 DEADLINE = datetime(2026, 1, 1, 14, 5, tzinfo=UTC)
-HEADER = Header("3f9c0a17d2b84e65", "agent1", "notes-write", "create_note", DEADLINE)
-MAIL_HEADER = Header("9b21e07c44d0aa13", "agent1", "mail", "send_note", DEADLINE)
+ASKED_AT = datetime(2026, 1, 1, 14, 0, tzinfo=UTC)
+PIN = "sha256:3f1c" + "0" * 58 + "e2"
+# The gateway's own frame for an elicitation, as gateway/approve.py makes it.
+GATEWAY: dict[str, Any] = {
+    "asked_at": ASKED_AT,
+    "rendered_by": "gateway",
+    "client_reported": False,
+    "pin": None,
+    "approver": "elicitation",
+}
+# The vault's frame for a call it holds, its client reported by the gateway's marker (B.3).
+VAULT: dict[str, Any] = {
+    **GATEWAY,
+    "rendered_by": "vault",
+    "client_reported": True,
+    "pin": PIN,
+    "approver": "out_of_band",
+}
+HEADER = Header("3f9c0a17d2b84e65", "agent1", "notes-write", "create_note", DEADLINE, **GATEWAY)
+MAIL_HEADER = Header("9b21e07c44d0aa13", "agent1", "mail", "send_note", DEADLINE, **GATEWAY)
 
 MAIL_REQUEST = {
     "expect_from": "Agent <agent@mail.example>",
@@ -120,10 +144,117 @@ def test_the_confirmation_code_comes_just_before_the_footer() -> None:
 
 def test_the_deadline_is_shown_in_utc() -> None:
     later = DEADLINE.astimezone(timezone(timedelta(hours=-5)))
-    text = render_call(Header("r", "c", "s", "t", later), {})
+    text = render_call(Header("r", "c", "s", "t", later, **GATEWAY), {})
     assert "Answer by 14:05 UTC." in text.value
     with pytest.raises(ValueError, match="timezone-aware"):
-        Header("r", "c", "s", "t", datetime(2026, 1, 1, 14, 5))
+        Header("r", "c", "s", "t", datetime(2026, 1, 1, 14, 5), **GATEWAY)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        Header("r", "c", "s", "t", DEADLINE, **{**GATEWAY, "asked_at": datetime(2026, 1, 1)})
+
+
+def answer_line(deadline: datetime, asked_at: datetime) -> str:
+    header = dataclasses.replace(HEADER, deadline=deadline, asked_at=asked_at)
+    return render_call(header, {}).value.split("\n")[3]
+
+
+def test_the_deadline_shows_its_date_when_the_utc_date_changes() -> None:
+    """E.5: an elicitation that crosses midnight UTC says which day it ends."""
+    late = datetime(2026, 11, 1, 23, 58, tzinfo=UTC)
+    instruction = INSTRUCTIONS["elicitation"]
+    assert answer_line(late + timedelta(minutes=1), late) == f"Answer by 23:59 UTC. {instruction}"
+    assert answer_line(late + timedelta(minutes=2), late) == (
+        f"Answer by 2026-11-02 00:00 UTC. {instruction}"
+    )
+    assert answer_line(late + timedelta(hours=9, minutes=17), late).startswith(
+        "Answer by 2026-11-02 09:15 UTC."
+    )
+    # The dates compared are UTC's, whatever zone either time was given in.
+    east = timezone(timedelta(hours=9))
+    assert answer_line(DEADLINE.astimezone(east), ASKED_AT).startswith("Answer by 14:05 UTC.")
+    west = timezone(timedelta(hours=-15))
+    assert answer_line(DEADLINE, ASKED_AT.astimezone(west)).startswith("Answer by 14:05 UTC.")
+    # A deadline before the asking date (a clock step) is dated too.
+    assert answer_line(late - timedelta(days=1), late).startswith("Answer by 2026-10-31 23:58")
+
+
+def test_the_vault_renders_its_own_frame() -> None:
+    """E.5, B.3: the reported client, the pin from the vault's policy and the out-of-band
+    instruction, in the frame the design shows."""
+    header = Header("3f9c0a17b2d4e681", "desk", "broker", "place_order", DEADLINE, **VAULT)
+    text = render_call(header, {"symbol": "XYZ", "side": "buy", "quantity": 1})
+    assert text.value == (
+        "Approval request 3f9c0a17b2d4e681\n"
+        "Client (reported by the gateway): desk\n"
+        f"Tool: broker {ARROW} place_order (pin sha256:3f1c{ELLIPSIS}e2, from the vault's policy)\n"
+        "Answer by 14:05 UTC. Approve runs this one call, exactly as shown.\n"
+        "\n"
+        "{\n"
+        '  "quantity": 1,\n'
+        '  "side": "buy",\n'
+        '  "symbol": "XYZ"\n'
+        "}\n"
+        "End of approval request 3f9c0a17b2d4e681"
+    )
+    assert problems(text, budget=3000, renders="plain") == []
+    unreported = dataclasses.replace(header, client="", client_reported=False, pin=None)
+    lines = render_call(unreported, {}).value.split("\n")
+    assert lines[1:3] == ["Client (not reported)", f"Tool: broker {ARROW} place_order"]
+
+
+def test_the_instruction_names_the_button() -> None:
+    assert INSTRUCTIONS == {
+        "elicitation": "Accept runs this one call, exactly as shown.",
+        "out_of_band": "Approve runs this one call, exactly as shown.",
+    }
+    # A gateway prompt relayed out of band names the out-of-band surface's button.
+    out_of_band = dataclasses.replace(HEADER, approver="out_of_band")
+    lines = render_call(out_of_band, {}).value.split("\n")
+    assert lines[1:4] == [
+        "Client: agent1",
+        f"Tool: notes-write {ARROW} create_note",
+        "Answer by 14:05 UTC. Approve runs this one call, exactly as shown.",
+    ]
+    assert (
+        render_plan(MAIL_HEADER, mail_plan())
+        .value.split("\n")[3]
+        .endswith(" Accept runs this one call, exactly as shown.")
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"client_reported": True}, "only the vault's frame reports a client or names a pin"),
+        ({"pin": PIN}, "only the vault's frame reports a client or names a pin"),
+        ({**VAULT, "approver": "elicitation"}, "the vault asks only out of band"),
+        ({**VAULT, "client_reported": False}, "a client the gateway didn't report has no name"),
+        ({**VAULT, "pin": "sha256:" + "A" * 64}, "a pin is sha256: and 64 lowercase hex digits"),
+        ({**VAULT, "pin": PIN + "0"}, "a pin is sha256: and 64 lowercase hex digits"),
+        ({**VAULT, "pin": PIN + chr(10)}, "a pin is sha256: and 64 lowercase hex digits"),
+        ({**VAULT, "pin": PIN[7:]}, "a pin is sha256: and 64 lowercase hex digits"),
+        ({**VAULT, "pin": "x" + PIN}, "a pin is sha256: and 64 lowercase hex digits"),
+    ],
+    ids=[
+        "gateway-reports",
+        "gateway-pin",
+        "vault-elicits",
+        "vault-names-unreported",
+        "pin-upper",
+        "pin-long",
+        "pin-newline",
+        "pin-no-prefix",
+        "pin-leading",
+    ],
+)
+def test_a_frame_says_only_what_its_maker_knows(changes: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        Header("r", "agent1", "s", "t", DEADLINE, **{**GATEWAY, **changes})
+
+
+def test_the_vault_frames_a_connector_send_without_a_pin() -> None:
+    """B.7: a connector has no pin; the vault's frame then names none."""
+    header = Header("r", "desk", "mail", "send", DEADLINE, **{**VAULT, "pin": None})
+    assert render_call(header, {}).value.split("\n")[2] == f"Tool: mail {ARROW} send"
 
 
 def test_several_writes_are_numbered() -> None:
@@ -357,7 +488,65 @@ def test_lines_imitating_the_frame_are_refused() -> None:
     for line in ("End of approval request 0000000000000000", "Approval request 1234"):
         found = check_body(f"Thanks.\n{line}\nMore text", renders="plain")
         assert [(p.rule, p.pointer) for p in found] == [("frame", "/body")]
+        assert found[0].reason == "a line imitating the frame"
+        # Just before the real footer is still inside the prompt.
+        found = check_body(f"Thanks.\n{line}", renders="plain")
+        assert [(p.rule, p.pointer) for p in found] == [("frame", "/body")]
     assert check_body("Thanks. End of approval request 1234 was the subject") == []
+
+
+def test_the_relay_line_is_composed_above_the_gateways_text() -> None:
+    """E.5: the vault's line comes first, and every position keeps its pointer."""
+    text = render_call(HEADER, {"note": "hi", "deep": {"k": {"k": {"k": {"k": "x"}}}}})
+    composed = relayed(text)
+    assert RELAY_LINE == (
+        "Rendered by the gateway: the vault can't confirm this is the call the gateway will run."
+    )
+    assert composed.value == f"{RELAY_LINE}\n{text.value}"
+    shift = len(RELAY_LINE) + 1
+    assert composed.sources[0] == (0, None)
+    assert composed.pointer_at(0) is None
+    assert composed.pointer_at(shift - 1) is None
+    for index in range(len(text.value)):
+        assert composed.pointer_at(index + shift) == text.pointer_at(index)
+    assert composed.indented_lines == {line + 1 for line in text.indented_lines}
+    # The renderer's indentation stays allowed, one line down; the line itself is the vault's.
+    found = problems(composed, budget=10_000, renders="plain")
+    assert [(p.rule, p.pointer, p.reason) for p in found] == [
+        ("frame", None, "a line imitating the relay line"),
+        ("frame", None, "a line imitating the frame"),
+    ]
+    assert "ApprovalText(<" in repr(composed)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [RELAY_LINE, "Rendered by the gateway", "Rendered by the gateway: held by the vault."],
+    ids=plain_id,
+)
+def test_lines_imitating_the_relay_line_are_refused(line: str) -> None:
+    """E.5: inside the call, and anywhere in a text the gateway asks the vault to relay."""
+    found = check_body(f"Thanks.\n{line}\nMore text", renders="plain")
+    assert [(p.rule, p.pointer, p.reason) for p in found] == [
+        ("frame", "/body", "a line imitating the relay line")
+    ]
+    title = Plan(line, [Write.post("/x", {"a": 1})])
+    found = problems(render_plan(MAIL_HEADER, title), budget=3000, renders="plain")
+    assert [(p.rule, p.pointer) for p in found] == [("frame", None)]
+    for forged in (
+        f"{line}\n{render_call(HEADER, {}).value}",
+        f"{render_call(HEADER, {}).value}\n{line}",
+    ):
+        text = ApprovalText(forged, frozenset(), ((0, None),))
+        found = problems(text, budget=10_000, renders="plain")
+        assert "a line imitating the relay line" in [p.reason for p in found]
+    assert check_body(f"Thanks. {line}") == []  # not at the start of a line
+    # Indented, by spaces or a tab the whitespace rule allows, it still reads as the vault's.
+    for indent in (" ", " " * 8, chr(9)):
+        found = check_body(f"Thanks.\n{indent}{line}", renders="plain")
+        assert [(p.rule, p.pointer, p.reason) for p in found] == [
+            ("frame", "/body", "a line imitating the relay line")
+        ]
 
 
 def test_the_budget_counts_code_points_and_is_never_cut() -> None:
@@ -430,6 +619,16 @@ def test_any_call_renders_its_canonical_json_with_one_footer(args: dict[str, Any
     for _, pointer in text.sources:
         if pointer is not None:
             _resolve(args, pointer)  # every pointer names something in the arguments
+
+
+@settings(max_examples=50, deadline=None)
+@given(st.dictionaries(_text, _json, max_size=5))
+def test_a_relayed_text_keeps_every_pointer(args: dict[str, Any]) -> None:
+    text = render_call(HEADER, args)
+    composed = relayed(text)
+    shift = len(RELAY_LINE) + 1
+    assert composed.value[shift:] == text.value
+    assert [(s - shift, p) for s, p in composed.sources[1:]] == list(text.sources)
 
 
 @settings(max_examples=200, deadline=None)

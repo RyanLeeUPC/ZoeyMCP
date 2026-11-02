@@ -24,7 +24,8 @@ MAX_LINE_BYTES: Final = 4096
 GENESIS: Final = "sha256:" + "0" * 64
 
 Kind = Literal["asked", "decided", "outcome", "recovered", "repaired"]
-# B.4's decisions; approved_elsewhere and pending are reserved for M8, so a v1 reader accepts them.
+# B.4's decisions, and the gateway's approved_elsewhere and pending (M8 design C.4), which M4
+# reserved so that a v1 reader accepts them.
 DECISIONS: Final = frozenset(
     {
         "accept",
@@ -56,8 +57,14 @@ DETAILS: Final = frozenset(
         "restart",
         "session_expired",
         "shutdown",
+        # M8 (J.1): the vault's outcome for a relay, whose call only the gateway can send, and a
+        # hold that ended because its decided record couldn't be written.
+        "relayed",
+        "ledger",
     }
 )
+# M8 (J.1): the surface a vault decision came through; ``none`` when no human decided.
+VIAS: Final = frozenset({"telegram", "portal", "host", "none"})
 
 _REF = re.compile(r"^[0-9a-f]{16}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -115,6 +122,8 @@ FIELDS: Final[Mapping[str, Mapping[str, Any]]] = {
     "recovered": {"abandoned": _count, "not_sent": _count, "unknown": _count},
     "repaired": {"torn_bytes": _count},
 }
+# The fields a vault record carries besides those (M8 design J.1); a gateway record never has them.
+VAULT_FIELDS: Final[Mapping[str, Mapping[str, Any]]] = {"decided": {"via": _member(VIAS)}}
 # Kinds about the ledger itself rather than one call carry no ref.
 _NO_REF: Final = frozenset({"recovered", "repaired"})
 
@@ -205,7 +214,8 @@ def _check(value: Mapping[str, Any]) -> None:
         raise LedgerFormatError("bad seq or ts")
     if not _pattern(_SHA256)(value.get("prev")):
         raise LedgerFormatError("bad prev")
-    if value.get("writer") not in ("gateway", "vault"):
+    writer = value.get("writer")
+    if writer not in ("gateway", "vault"):
         raise LedgerFormatError("bad writer")
     ref = value.get("ref")
     if kind in _NO_REF:
@@ -214,6 +224,8 @@ def _check(value: Mapping[str, Any]) -> None:
     elif not (isinstance(ref, str) and _REF.fullmatch(ref)):
         raise LedgerFormatError("bad ref")
     checks = FIELDS[kind]
+    if writer == "vault":
+        checks = {**checks, **VAULT_FIELDS.get(kind, {})}
     names = set(value) - set(_COMMON)
     if names != set(checks):
         raise LedgerFormatError(f"a {kind} record has the wrong fields")
@@ -299,26 +311,40 @@ class Step:
     fields: Mapping[str, Any]
 
 
+# The last decisions after which the call may have run, so recovery can't say it wasn't sent.
+_MAY_HAVE_RUN: Final = frozenset({"accept", "approved_elsewhere", "pending"})
+
+
 def recovery_plan(open_: Mapping[str, Sequence[Record]]) -> list[Step]:
     """Close every open ref with exactly one ``outcome``, then one ``recovered`` (F.5 step 4).
 
-    - ``asked`` and nothing else: ``decided abandoned``, then ``outcome not_sent``;
-    - a decision other than ``accept``: ``outcome not_sent``;
-    - ``decided accept``: ``outcome unknown``, since the call may have run.
+    - ``asked`` and nothing else: ``decided abandoned``, then ``outcome not_sent``; but when the
+      gateway asked with ``where: vault``, ``outcome unknown``, since the vault may have held the
+      call, been approved and forwarded it (M8 design C.4);
+    - a decision other than those below: ``outcome not_sent``;
+    - ``decided accept``: ``outcome unknown``, since the call may have run; likewise the gateway's
+      ``approved_elsewhere`` and ``pending``, since the vault may have forwarded it (C.4).
 
-    The same open refs always give the same steps, in ref order.
+    A vault chain's ``decided abandoned`` says ``via: none`` (J.1). The same open refs always give
+    the same steps, in ref order.
     """
     steps: list[Step] = []
     counts = {"abandoned": 0, "not_sent": 0, "unknown": 0}
     for ref in sorted(open_):
         records = open_[ref]
-        planned = next((r.fields["writes"] for r in records if r.kind == "asked"), 0)
+        asked = next((r for r in records if r.kind == "asked"), None)
+        planned = asked.fields["writes"] if asked is not None else 0
         decisions = [r.fields["decision"] for r in records if r.kind == "decided"]
         if not decisions:
-            steps.append(Step("decided", ref, {"decision": "abandoned", "waited_ms": 0}))
+            abandoned: dict[str, Any] = {"decision": "abandoned", "waited_ms": 0}
+            if asked is not None and asked.writer == "vault":
+                abandoned["via"] = "none"
+            steps.append(Step("decided", ref, abandoned))
             counts["abandoned"] += 1
             outcome = "not_sent"
-        elif decisions[-1] == "accept":
+            if asked is not None and asked.writer == "gateway" and asked.fields["where"] == "vault":
+                outcome = "unknown"
+        elif decisions[-1] in _MAY_HAVE_RUN:
             outcome = "unknown"
         else:
             outcome = "not_sent"

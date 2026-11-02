@@ -1,7 +1,7 @@
 """The ledger view: rows, pages, flags and the journal join (M5 design J.5, J.6).
 
 The records are ``test_ledgerjoin``'s, which ``zoeymcp ledger`` is pinned against too: a vault
-written ``approved_elsewhere`` and a ``pending`` decision are among them. An orphan is judged
+written ``accept`` is among them, and a ``pending`` decision is shown its own. An orphan is judged
 against the live chain and the kept archived epochs (their :class:`Coverage`), each flag at its
 boundaries.
 """
@@ -145,8 +145,10 @@ def test_a_call_not_yet_decided() -> None:
 
 
 def test_a_decision_the_vault_wrote_says_so() -> None:
+    """M8 design C.4: the vault's chain records ``decided accept``; ``approved_elsewhere`` is
+    the gateway's own record of that."""
     row = view()["rows"][1]
-    assert (row["ref"], row["decision"], row["waited_ms"]) == (REF_D, "approved_elsewhere", 0)
+    assert (row["ref"], row["decision"], row["waited_ms"]) == (REF_D, "accept", 0)
     assert row["writers"] == {"asked": "gateway", "decided": "vault"}
 
 

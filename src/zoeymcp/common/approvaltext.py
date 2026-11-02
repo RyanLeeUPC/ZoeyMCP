@@ -1,10 +1,12 @@
 """What a human is asked to approve, and the check that nothing in it can hide (M4 design C).
 
-The gateway renders every prompt itself: a fixed frame (a per-call ref, the client, the server
-and tool, an absolute deadline), then either the call's canonical arguments or a toolkit's plan of
-exact writes, then a footer that repeats the ref. :func:`problems` then refuses any text that
-could hide or disguise content; a refused text is never cut or cleaned, because a cleaned text
-would no longer be the exact call.
+Whoever holds a call renders its prompt itself: the gateway for a call it holds, the vault (M8)
+for a call it holds, from the bytes it holds. A prompt is a fixed frame (a per-call ref, the
+client, the server and tool, an absolute deadline), then either the call's canonical arguments or
+a toolkit's plan of exact writes, then a footer that repeats the ref. :func:`problems` then
+refuses any text that could hide or disguise content; a refused text is never cut or cleaned,
+because a cleaned text would no longer be the exact call. A gateway-held prompt asked out of band
+reaches the human under the vault's relay line (:func:`relayed`, M8 design E.5).
 
 A toolkit doesn't write free text. Its plan holds :class:`Write` objects, each an exact request
 body frozen as canonical bytes when built, with a layout of :class:`Show` items that must cover
@@ -21,9 +23,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from . import canonical
 from .canonical import JSONValue
@@ -31,10 +33,12 @@ from .logs import refuse_type
 from .textrules import find_violations
 
 ARROW = "\N{RIGHTWARDS ARROW}"
+_ELLIPSIS = "\N{HORIZONTAL ELLIPSIS}"
 HEADER_PREFIX = "Approval request "
 FOOTER_PREFIX = "End of approval request "
 CODE_LINE_PREFIX = "To approve, accept and type this code: "
-INSTRUCTION = "Accept runs this one call, exactly as shown."
+RELAY_PREFIX = "Rendered by the gateway"
+RELAY_LINE = f"{RELAY_PREFIX}: the vault can't confirm this is the call the gateway will run."
 LABEL = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,31}$")
 MAX_TITLE_CHARS = 120
 # The renderer's own JSON indentation, which the whitespace rule leaves alone.
@@ -44,6 +48,16 @@ _MAX_COMBINING = 3
 
 Renders = Literal["markdown", "plain"]
 Method = Literal["POST", "PUT", "PATCH"]
+RenderedBy = Literal["gateway", "vault"]
+Approver = Literal["elicitation", "out_of_band"]
+
+# The instruction names the button the human presses: an elicitation's Accept, or an out-of-band
+# surface's Approve (M8 design E.5).
+INSTRUCTIONS: Final[Mapping[Approver, str]] = {
+    "elicitation": "Accept runs this one call, exactly as shown.",
+    "out_of_band": "Approve runs this one call, exactly as shown.",
+}
+_PIN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class LayoutError(ValueError):
@@ -157,25 +171,76 @@ def _json_parts(value: JSONValue, pointer: str, level: int, out: _Builder) -> No
 
 @dataclass(frozen=True)
 class Header:
-    """Everything outside the call that a prompt shows. All of it is gateway-made."""
+    """Everything outside the call that a prompt shows, made by whoever renders the prompt.
+
+    The gateway makes it for a call it holds: the client is its own authenticated client, and it
+    names no pin. The vault makes it for a call it holds (M8 design B.3, E.5) and asks only out of
+    band: the client is only what the gateway's marker reported (``client_reported``; with no
+    marker it is shown as not reported and has no name), and the pin is from the vault's own
+    sealed policy. ``asked_at`` decides whether the deadline needs its date.
+    """
 
     ref: str
     client: str
     server: str
     tool: str
-    deadline: datetime  # aware; shown as HH:MM UTC
+    deadline: datetime  # aware; shown as HH:MM UTC, dated when not on asked_at's UTC date
+    _: KW_ONLY
+    asked_at: datetime  # aware
+    rendered_by: RenderedBy
+    client_reported: bool
+    pin: str | None
+    approver: Approver
 
     def __post_init__(self) -> None:
-        if self.deadline.tzinfo is None:
-            raise ValueError("the deadline must be timezone-aware")
+        if self.deadline.tzinfo is None or self.asked_at.tzinfo is None:
+            raise ValueError("the deadline and asked_at must be timezone-aware")
+        if self.rendered_by == "gateway":
+            if self.client_reported or self.pin is not None:
+                raise ValueError("only the vault's frame reports a client or names a pin")
+        else:
+            if self.approver != "out_of_band":
+                raise ValueError("the vault asks only out of band")
+            if not self.client_reported and self.client:
+                raise ValueError("a client the gateway didn't report has no name")
+        if self.pin is not None and not _PIN.fullmatch(self.pin):
+            raise ValueError("a pin is sha256: and 64 lowercase hex digits")
+
+
+def _deadline(header: Header) -> str:
+    """``HH:MM``, or ``YYYY-MM-DD HH:MM`` when its UTC date isn't the UTC date it was asked on."""
+    deadline = header.deadline.astimezone(UTC)
+    if deadline.date() == header.asked_at.astimezone(UTC).date():
+        return deadline.strftime("%H:%M")
+    return deadline.strftime("%Y-%m-%d %H:%M")
+
+
+def _client(header: Header) -> str:
+    if header.rendered_by == "gateway":
+        return f"Client: {header.client}"
+    if header.client_reported:
+        return f"Client (reported by the gateway): {header.client}"
+    return "Client (not reported)"
+
+
+def _tool(header: Header) -> str:
+    line = f"Tool: {header.server} {ARROW} {header.tool}"
+    if header.pin is not None:
+        line += f" (pin {_short_pin(header.pin)}, from the vault's policy)"
+    return line
+
+
+def _short_pin(pin: str) -> str:
+    """``sha256:3f1c…e2``: the digest's first four and last two hex digits, as E.5 shows it."""
+    digest = pin.removeprefix("sha256:")
+    return f"sha256:{digest[:4]}{_ELLIPSIS}{digest[-2:]}"
 
 
 def _open(header: Header, out: _Builder) -> None:
-    deadline = header.deadline.astimezone(UTC).strftime("%H:%M")
     out.add(f"{HEADER_PREFIX}{header.ref}\n")
-    out.add(f"Client: {header.client}\n")
-    out.add(f"Tool: {header.server} {ARROW} {header.tool}\n")
-    out.add(f"Answer by {deadline} UTC. {INSTRUCTION}\n")
+    out.add(f"{_client(header)}\n")
+    out.add(f"{_tool(header)}\n")
+    out.add(f"Answer by {_deadline(header)} UTC. {INSTRUCTIONS[header.approver]}\n")
     out.add("\n")
 
 
@@ -193,6 +258,21 @@ def render_call(header: Header, args: JSONValue, *, code: str | None = None) -> 
     out.json(args, "")
     _close(header, code, out)
     return out.build()
+
+
+def relayed(text: ApprovalText) -> ApprovalText:
+    """A gateway-rendered prompt as the vault shows it out of band: :data:`RELAY_LINE` above it.
+
+    The vault composes the line (M8 design E.5), so a gateway can't drop it or write another, and
+    the digest every surface binds is the digest of this whole text. Check the gateway's text with
+    :func:`problems` before composing: the composed text starts with a line the check refuses.
+    """
+    shift = len(RELAY_LINE) + 1
+    return ApprovalText(
+        f"{RELAY_LINE}\n{text.value}",
+        frozenset(line + 1 for line in text.indented_lines),
+        ((0, None), *((start + shift, pointer) for start, pointer in text.sources)),
+    )
 
 
 # --- toolkit plans -------------------------------------------------------------------------------
@@ -539,15 +619,23 @@ def _combining(text: ApprovalText) -> list[tuple[int, Problem]]:
 
 def _frame_imitations(text: ApprovalText) -> list[tuple[int, Problem]]:
     """A line inside the call that starts like the frame's first or last line could make a
-    reader think one prompt ended and another began; the ref already makes it detectable."""
+    reader think one prompt ended and another began; the ref already makes it detectable.
+
+    No line may start like the vault's relay line, the first included, even after leading
+    whitespace: in a relayed text it could pass the gateway's words off as the vault's (M8 design
+    E.5, Z12)."""
     found = []
     lines = text.value.split("\n")
-    offset = len(lines[0]) + 1
-    for line in lines[1:-1]:
-        if line.startswith((HEADER_PREFIX, FOOTER_PREFIX)):
-            found.append(
-                (offset, Problem("frame", text.pointer_at(offset), "a line imitating the frame"))
-            )
+    offset = 0
+    for number, line in enumerate(lines):
+        reason = None
+        # Indented too: a line the whitespace rule lets through still reads as the vault's.
+        if line.lstrip(" \t").startswith(RELAY_PREFIX):
+            reason = "a line imitating the relay line"
+        elif 0 < number < len(lines) - 1 and line.startswith((HEADER_PREFIX, FOOTER_PREFIX)):
+            reason = "a line imitating the frame"
+        if reason is not None:
+            found.append((offset, Problem("frame", text.pointer_at(offset), reason)))
         offset += len(line) + 1
     return found
 
