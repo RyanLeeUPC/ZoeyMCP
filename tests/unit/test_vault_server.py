@@ -1078,11 +1078,20 @@ def test_serve_closes_the_app_on_the_way_out(log_buffer: io.StringIO) -> None:
     calls: list[str] = []
 
     class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        async def drain_holds(self) -> None:
+            calls.append("drain_holds")
+
         async def aclose(self) -> None:
             calls.append("aclose")
 
     asyncio.run(server.serve(cast(VaultApp, App()), [], config=None, environ={}))
-    assert calls == ["aclose"]
+    # The held forwards drain before the clients close (M8 design I.2).
+    assert calls == ["drain_holds", "aclose"]
     assert _log_lines(log_buffer)[-1]["event"] == "vault_stopped"
 
 
@@ -1115,6 +1124,14 @@ def test_a_listen_address_in_use_is_a_startup_error(
         raise AssertionError("a server was built before every address was bound")
 
     class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        async def drain_holds(self) -> None:
+            pass
+
         async def aclose(self) -> None:
             pass
 
@@ -1523,6 +1540,14 @@ def test_serve_runs_and_stops_the_gateway_key_timer(
     log_buffer: io.StringIO, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        async def drain_holds(self) -> None:
+            pass
+
         async def aclose(self) -> None:
             pass
 
@@ -1571,6 +1596,14 @@ def test_serve_runs_and_stops_the_gateway_key_timer(
 
 def test_serve_without_a_ratchet_has_no_timer(monkeypatch: pytest.MonkeyPatch) -> None:
     class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        async def drain_holds(self) -> None:
+            pass
+
         async def aclose(self) -> None:
             pass
 
@@ -1963,6 +1996,14 @@ def test_a_portal_address_in_use_is_a_startup_error(
         raise AssertionError("a server was built before every address was bound")
 
     class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        async def drain_holds(self) -> None:
+            pass
+
         async def aclose(self) -> None:
             pass
 

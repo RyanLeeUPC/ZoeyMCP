@@ -58,6 +58,11 @@ _CALLBACK: Final = (
     "The portal didn't take this sign-in. Copy this tab's address and paste it into the "
     "portal's Connect dialog, or into zoeymcp login if you started it there."
 )
+# A held call the vault can't read with exactly one meaning (M8 design B.2's rules E1-E19).
+_UNREAD: Final = (
+    "The vault can't read this held call unambiguously, so nothing was sent: the gateway and the "
+    "vault may run different releases."
+)
 
 CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
     {
@@ -683,6 +688,65 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             409, "Revision {revision} is in quarantine: it can't be read, so it can't be used."
         ),
         "revision_unknown": Entry(409, "Revision {revision} is no longer kept, or never was."),
+        # The vault hold (M8 design M.2; vault/app.py): its answers to the gateway's held calls,
+        # each with the code the gateway maps (C.2).
+        "held_content_type": Entry(415, _UNREAD),
+        "held_too_large": Entry(413, "The held call is over 1 MiB, more than the vault reads."),
+        "held_path": Entry(
+            404, "The vault holds this route and answers only its servers' exact paths."
+        ),
+        "held_content_encoding": Entry(400, _UNREAD),
+        "held_encoding": Entry(400, _UNREAD),
+        "held_json": Entry(400, _UNREAD),
+        "held_batch": Entry(400, _UNREAD),
+        "held_not_object": Entry(400, _UNREAD),
+        "held_jsonrpc": Entry(400, _UNREAD),
+        "held_method_form": Entry(400, _UNREAD),
+        "held_method_case": Entry(400, _UNREAD),
+        "held_id": Entry(400, _UNREAD),
+        "held_number": Entry(400, _UNREAD),
+        "held_params": Entry(400, _UNREAD),
+        "held_meta": Entry(400, _UNREAD),
+        "held_header_mismatch": Entry(400, _UNREAD),
+        "held_param_headers": Entry(400, _UNREAD),
+        "held_marker": Entry(400, _UNREAD),
+        "held_name_variant": Entry(400, _UNREAD),
+        "held_header_extra": Entry(400, _UNREAD),
+        "held_query": Entry(400, _UNREAD),
+        "held_unlisted": Entry(400, _UNREAD),
+        "held_ref_reused": Entry(409, "A held call's ref is used once, so nothing was asked."),
+        "held_second_write": Entry(409, "A held call sends one write, so nothing was asked."),
+        "held_text_refused": Entry(
+            422, "The approval text broke a text rule at the place named, so nothing was asked."
+        ),
+        "held_capacity": Entry(429, "The approval queue is full, so nothing was asked."),
+        "held_busy": Entry(
+            429,
+            "This client already waits for an approval of this tool, or has no room left for a "
+            "pending result, so nothing was asked.",
+        ),
+        "held_hourly": Entry(
+            429, "This tool was asked too often in the last hour, so nothing was asked."
+        ),
+        "held_cooldown": Entry(
+            429,
+            "This tool is cooling down after a denial or an expiry, so nothing was asked. Try "
+            "again after the seconds given.",
+        ),
+        "held_ledger_down": Entry(
+            503, "The vault can't record approvals right now, so nothing was sent."
+        ),
+        "stopping": Entry(503, "The vault is stopping, so nothing was sent."),
+        "view_stale": Entry(
+            409, "The gateway's view of the policy is behind the vault's, so nothing was sent."
+        ),
+        "approval_pending": Entry(409, "The call waits for its approval; it runs once approved."),
+        "approval_declined": Entry(409, "The call was denied, so nothing was sent."),
+        "approval_expired": Entry(409, "Nobody answered in time, so nothing was sent."),
+        "approval_withdrawn": Entry(409, "The approval was withdrawn, so nothing was sent."),
+        "held_result_too_large": Entry(
+            502, "The call ran; its answer was over 4 MiB and wasn't kept."
+        ),
     }
 )
 

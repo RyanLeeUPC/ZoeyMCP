@@ -110,6 +110,8 @@ Binder = Callable[[str, int], list[socket.socket]]
 Lookup = Callable[[str], Sequence[str]]
 # How often the timer retires an expired previous gateway key, in seconds.
 GATEWAY_KEY_TICK = 5.0
+# How often the hold sweeper expires the holds past their end (M8 design I.4), in seconds.
+HOLD_SWEEP = 1.0
 # The launcher's control pipe: one command per line.
 # --bridge NAME=UID: the launcher's bridge name (C.10) and the uid it runs that bridge as.
 _BRIDGE = re.compile(r"([a-z0-9]{1,16})=([0-9]{1,10})")
@@ -957,6 +959,11 @@ async def serve(
     tasks = []
     if gateway_keys is not None:
         tasks.append(asyncio.create_task(gateway_key_timer(gateway_keys, GATEWAY_KEY_TICK)))
+    # The vault chain's queued records are retried, and the holds past their end expire, for as
+    # long as the vault serves (M8 design J.1, I.4).
+    if app.chain is not None:
+        tasks.append(asyncio.create_task(app.chain.retry_forever()))
+    tasks.append(asyncio.create_task(hold_sweeper(app, HOLD_SWEEP)))
     control = None
     try:
         if control_fd is not None:
@@ -969,7 +976,14 @@ async def serve(
         )
         if gateway_socket is not None and gateway_uid is not None:
             logs.event("gateway_socket_listening", path=str(gateway_socket), uid=gateway_uid)
-        await asyncio.gather(*(server.serve(sockets=listening.get(server)) for server in servers))
+        try:
+            await asyncio.gather(
+                *(server.serve(sockets=listening.get(server)) for server in servers)
+            )
+        finally:
+            # Before the clients close: each approved held call's forward runs to its deadline
+            # and its outcome reaches the chain (M8 design I.2, B.8).
+            await app.drain_holds()
     finally:
         # uvicorn closes a started server's sockets; these are the ones of a start cut short.
         for sockets in listening.values():
@@ -983,6 +997,14 @@ async def serve(
         # Refreshes in flight finish (and are saved) before the clients close (N5).
         await app.aclose()
         logs.event("vault_stopped")
+
+
+async def hold_sweeper(app: VaultApp, interval: float) -> None:
+    """Expire every hold past its end, once per ``interval`` (M8 design I.4): a detached hold has
+    no request whose wait would."""
+    while True:
+        await asyncio.sleep(interval)
+        app.sweep_holds()
 
 
 async def gateway_key_timer(gateway_keys: GatewayKeys, interval: float) -> None:
@@ -1203,6 +1225,8 @@ def build(
         chain = VaultLedger.open_at(state_dir, runtime.keys.chain_key)
     except OSError as exc:
         raise StartupError(f"can't open or recover the vault's approval chain: {exc}") from exc
+    # Calls are held on it from the first listener on; its recent endings keep each ref used.
+    app.use_chain(chain)
     # One set of pending logins for every surface, so the flow limit is shared (M5 design H.2).
     login = LoginService(app.tokens)
     # Likewise one set of onboardings, so their limits and owners hold across surfaces (M7
@@ -1291,6 +1315,8 @@ def build(
         bridges=tier,
         gateway_status=app.gateway_status,
         policy_state=policy_state,
+        chain=chain,
+        saturated=app.saturated,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
     # (M5 design J.5) and the vault's own chain (M8 design J.2); the policy view says where the

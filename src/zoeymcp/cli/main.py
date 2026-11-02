@@ -2222,6 +2222,13 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
         said = "no status yet" if ago is None else f"the gateway reported {duration(ago)} ago"
         lines.append(f"gateway: {gateway['level']} ({said})")
         lines += _finding_lines(gateway["findings"])
+    held = report.get("approvals")
+    if held is not None:
+        said = "the chain takes holds" if held["chain_writable"] else "the chain can't be written"
+        if held["saturated"]:
+            said += f", {held['saturated']} refused lately"
+        lines.append(f"approvals: {held['level']} ({said})")
+        lines += _finding_lines(held["findings"])
     counts = report["summary"]
     lines.append(
         f"health: {'ok' if ok else 'FAILED'} ({counts['error']} error(s), "

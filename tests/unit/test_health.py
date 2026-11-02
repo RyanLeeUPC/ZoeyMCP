@@ -34,8 +34,10 @@ from zoeymcp.vault.health import (
     DISPLAY_ONLY,
     ONBOARDING_SUFFIXES,
     REGRESSION_DAYS,
+    SATURATION_MINUTES,
     STALE_SECONDS,
     Bridges,
+    HoldState,
     Inputs,
     LedgerCopy,
     PasskeyState,
@@ -50,6 +52,7 @@ from zoeymcp.vault.health import (
     parse_time,
     sends,
 )
+from zoeymcp.vault.holds import SATURATION_WINDOW
 from zoeymcp.vault.internal import ALLOWLIST_MAX_STALE
 from zoeymcp.vault.statusreport import GatewayStatus, ServerStatus
 from zoeymcp.vault.statusreport import Report as StatusReport
@@ -2234,6 +2237,58 @@ def test_the_summary_counts_the_ledger_copy() -> None:
     assert found["summary"] == {"error": 2, "warning": 0, "info": 0}
     assert list(found)[-1] == "ledger_copy"
     assert "ledger_copy" not in report(make_policy({}))
+
+
+# --- the vault hold (M8 design K.1; FM-25) --------------------------------------------------------
+
+
+def test_a_chain_that_cant_be_written_refuses_every_hold() -> None:
+    """``vault_ledger_unavailable`` (G-10), an error with the volume to check, while the chain
+    takes no record; none while it does."""
+    found = report(make_policy({}), approvals=HoldState(chain_writable=False))
+    assert found["approvals"] == {
+        "chain_writable": False,
+        "saturated": 0,
+        "level": "error",
+        "findings": [
+            finding(
+                "vault_ledger_unavailable",
+                "error",
+                "the vault can't write its approval chain; held calls are refused: check the "
+                "volume",
+                {"kind": "check_volume"},
+            )
+        ],
+    }
+    assert found["summary"] == {"error": 1, "warning": 0, "info": 0}
+    assert list(found)[-1] == "approvals"
+    writable = report(make_policy({}), approvals=HoldState(chain_writable=True))
+    assert writable["approvals"] == {
+        "chain_writable": True,
+        "saturated": 0,
+        "level": "ok",
+        "findings": [],
+    }
+    assert writable["summary"] == {"error": 0, "warning": 0, "info": 0}
+    assert "approvals" not in report(make_policy({}))
+
+
+@pytest.mark.parametrize("refused", [1, 7])
+def test_a_flood_of_held_calls_is_an_error(refused: int) -> None:
+    """D.3, FM-19: holds the queue's caps refused in its window make ``approvals_saturated``."""
+    state = HoldState(chain_writable=True, saturated=refused)
+    found = report(make_policy({}), approvals=state)["approvals"]
+    assert found["findings"] == [
+        finding(
+            "approvals_saturated",
+            "error",
+            f"{refused} held call(s) refused in the last 10 min: a caller is flooding the "
+            "approval queue; if you didn't expect this many, check the gateway",
+            {"kind": "check_gateway"},
+        )
+    ]
+    assert (found["level"], found["saturated"]) == ("error", refused)
+    assert SATURATION_MINUTES * 60 == SATURATION_WINDOW
 
 
 # --- the gateway's status (M6 design K.1, M.5; Y21, Y29, T-7) ------------------------------------

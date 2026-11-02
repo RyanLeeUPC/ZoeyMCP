@@ -15,12 +15,12 @@ import dataclasses
 import inspect
 from string import Formatter
 from types import ModuleType
-from typing import get_args
+from typing import get_args, get_type_hints
 
 import pytest
 
 from zoeymcp.cli import policy as policy_cli
-from zoeymcp.common import reviewreport
+from zoeymcp.common import envelope, reviewreport
 from zoeymcp.common.policy import change, plan
 from zoeymcp.common.policy.ratchet import RATCHET_MAX
 from zoeymcp.common.textrules import find_violations
@@ -43,6 +43,7 @@ from zoeymcp.portal.refusals import (
 from zoeymcp.portal.refusals import login as login_refusal
 from zoeymcp.vault import (
     admin,
+    holds,
     managed,
     onboard,
     onboarding,
@@ -51,6 +52,7 @@ from zoeymcp.vault import (
     secretplan,
     store,
 )
+from zoeymcp.vault import app as vault_app
 from zoeymcp.vault.oauth import dcr, discovery, fetch, login, pkce
 from zoeymcp.vault.policyseal import REVISION_MAX
 from zoeymcp.vault.secretplan import SecretRefusal
@@ -264,6 +266,58 @@ SOCKET = {
 }
 # A managed review save in the portal (M6 design G.4, N.2; portal/drafts.py, step 15a).
 SAVE = {"draft_unknown": 404, "save_invalid": 422}
+# M8's M.2: the vault hold's answers to the gateway (vault/app.py, step 9), with M.2's statuses.
+UNREAD = [
+    "content_encoding",
+    "encoding",
+    "json",
+    "batch",
+    "not_object",
+    "jsonrpc",
+    "method_form",
+    "method_case",
+    "id",
+    "number",
+    "params",
+    "meta",
+    "header_mismatch",
+    "param_headers",
+    "marker",
+    "name_variant",
+    "header_extra",
+    "query",
+    "unlisted",
+]
+HELD = {
+    **{f"held_{reason}": 400 for reason in UNREAD},
+    "held_content_type": 415,
+    "held_too_large": 413,
+    "held_path": 404,
+    "held_ref_reused": 409,
+    "held_second_write": 409,
+    "held_text_refused": 422,
+    "held_capacity": 429,
+    "held_busy": 429,
+    "held_hourly": 429,
+    "held_cooldown": 429,
+    "held_ledger_down": 503,
+    "stopping": 503,
+    "view_stale": 409,
+    "approval_pending": 409,
+    "approval_declined": 409,
+    "approval_expired": 409,
+    "approval_withdrawn": 409,
+    "held_result_too_large": 502,
+}
+# The VaultApp methods of the held branch (M8 design B), whose literal codes are all M8's.
+HELD_METHODS = (
+    "_handle",
+    "_held_route",
+    "_held_connector",
+    "_hold",
+    "_block_over",
+    "_mcp_forward",
+)
 
 # M.2's quoted texts, exactly.
 TEXTS = {
@@ -417,7 +471,7 @@ def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
-    expected |= SOCKET | SAVE
+    expected |= SOCKET | SAVE | HELD
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -640,6 +694,43 @@ def test_every_socket_policy_reason_is_catalogued() -> None:
     # export_other_deployment is the CLI's own (the export header it reads, OPS-8).
     assert set(SOCKET) <= found | shaped | missing | {"export_other_deployment"}
     assert found | shaped | missing <= set(CATALOGUE)
+
+
+def held_codes() -> set[str]:
+    """The literal ``code=`` of every ``Refused`` in the held branch's methods."""
+    tree = ast.parse(inspect.getsource(vault_app))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)):
+            continue
+        if node.name not in HELD_METHODS:
+            continue
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
+                continue
+            if call.func.id != "Refused":
+                continue
+            for keyword in call.keywords:
+                value = keyword.value
+                if keyword.arg == "code" and isinstance(value, ast.Constant):
+                    found.add(str(value.value))
+    return found
+
+
+def test_every_held_reason_is_catalogued() -> None:
+    """M8 M.2: every code the vault hold answers with: each envelope rule's and each cap's as
+    ``held_<reason>``, each ending's, and every literal in the held branch."""
+    rules = {f"held_{reason}" for reason in get_args(envelope.Reason)}
+    caps = {f"held_{reason}" for reason in get_args(get_type_hints(holds.CapRefusal)["reason"])}
+    endings = set(vault_app._ENDED_CODES.values())
+    found = held_codes()
+    assert {"held_path", "view_stale", "held_ledger_down", "approval_pending"} <= found
+    assert rules | caps | endings | found == set(HELD)
+    assert set(HELD) <= set(CATALOGUE)
+    assert {reason: CATALOGUE[reason].status for reason in rules} == {
+        reason: envelope.Refuse(reason.removeprefix("held_")).status  # type: ignore[arg-type]
+        for reason in rules
+    }
 
 
 def test_the_offline_texts_name_the_vaults_uid() -> None:

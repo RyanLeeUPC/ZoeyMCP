@@ -115,6 +115,7 @@ from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
 from ..common.adminsocket import SOCKET_ENV as SOCKET_ENV
 from ..common.policy import PolicyError, gate
 from ..common.policy.gate import GateRefused
+from ..common.policy.held import held_map
 from ..common.policy.plan import WritePlan
 from ..common.policy.ratchet import Grants
 from ..common.policy.schema import Policy, hash_token
@@ -518,7 +519,9 @@ class HealthReader:
     ``gateway_status`` is the gateway's latest status report (``VaultApp``'s, M6 design K.1);
     without it, the report has no ``gateway`` section. ``policy_state`` is the policy store's
     (``vault/managed.py``, M6 design M.5); without it, or while it answers None (no store), the
-    report has no ``policy`` section."""
+    report has no ``policy`` section. ``chain`` is the vault's approval chain (M8 design J.1):
+    while the running policy holds a call, the report has an ``approvals`` section, with the
+    refusals the hold table's caps counted lately from ``saturated`` (D.3)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -532,6 +535,8 @@ class HealthReader:
     bridges: health.Bridges = field(default_factory=health.Bridges)
     gateway_status: Callable[[], GatewayStatus] | None = None
     policy_state: Callable[[], health.PolicyState | None] | None = None
+    chain: VaultLedger | None = None
+    saturated: Callable[[], int] | None = None
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -553,9 +558,18 @@ class HealthReader:
             bridges=self.bridges,
             gateway_status=None if self.gateway_status is None else self.gateway_status(),
             policy_state=None if self.policy_state is None else self.policy_state(),
+            approvals=self._approvals(policy),
         )
         report: dict[str, Any] = json_safe(health.assess(inputs))
         return report
+
+    def _approvals(self, policy: Policy) -> health.HoldState | None:
+        """The vault hold for health (M8 design K.1); None without a chain, or while the policy
+        holds no call."""
+        if self.chain is None or not held_map(policy):
+            return None
+        refused = 0 if self.saturated is None else self.saturated()
+        return health.HoldState(chain_writable=self.chain.writable(), saturated=refused)
 
     def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
         """The passkey file for health; None without one, or without a portal to use it."""

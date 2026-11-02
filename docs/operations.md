@@ -2687,6 +2687,43 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `nothing_to_acknowledge` | There is nothing to record: `<detail>`. |
 | 409 | `revision_unreadable` | Revision `<revision>` is in quarantine: it can't be read, so it can't be used. |
 | 409 | `revision_unknown` | Revision `<revision>` is no longer kept, or never was. |
+| 415 | `held_content_type` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 413 | `held_too_large` | The held call is over 1 MiB, more than the vault reads. |
+| 404 | `held_path` | The vault holds this route and answers only its servers' exact paths. |
+| 400 | `held_content_encoding` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_encoding` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_json` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_batch` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_not_object` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_jsonrpc` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_method_form` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_method_case` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_id` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_number` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_params` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_meta` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_header_mismatch` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_param_headers` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_marker` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_name_variant` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_header_extra` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_query` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 400 | `held_unlisted` | The vault can't read this held call unambiguously, so nothing was sent: the gateway and the vault may run different releases. |
+| 409 | `held_ref_reused` | A held call's ref is used once, so nothing was asked. |
+| 409 | `held_second_write` | A held call sends one write, so nothing was asked. |
+| 422 | `held_text_refused` | The approval text broke a text rule at the place named, so nothing was asked. |
+| 429 | `held_capacity` | The approval queue is full, so nothing was asked. |
+| 429 | `held_busy` | This client already waits for an approval of this tool, or has no room left for a pending result, so nothing was asked. |
+| 429 | `held_hourly` | This tool was asked too often in the last hour, so nothing was asked. |
+| 429 | `held_cooldown` | This tool is cooling down after a denial or an expiry, so nothing was asked. Try again after the seconds given. |
+| 503 | `held_ledger_down` | The vault can't record approvals right now, so nothing was sent. |
+| 503 | `stopping` | The vault is stopping, so nothing was sent. |
+| 409 | `view_stale` | The gateway's view of the policy is behind the vault's, so nothing was sent. |
+| 409 | `approval_pending` | The call waits for its approval; it runs once approved. |
+| 409 | `approval_declined` | The call was denied, so nothing was sent. |
+| 409 | `approval_expired` | Nobody answered in time, so nothing was sent. |
+| 409 | `approval_withdrawn` | The approval was withdrawn, so nothing was sent. |
+| 502 | `held_result_too_large` | The call ran; its answer was over 4 MiB and wasn't kept. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

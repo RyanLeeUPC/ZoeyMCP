@@ -57,6 +57,11 @@ hash or an ``ENV_*`` variable, whatever shape refused it.
 The vault's approval chain (M8 design J.1, O.6, step 8) holds a hold's argument values and its
 approval text only as digests under the chain key, which no file holds, and its log lines (a
 failed write, a prune, a torn tail, recovery, a broken chain) hold no record, digest or name.
+The vault hold (step 9: B.3, B.6, B.8, FM-33) shows a held call's argument values on its
+approver surface only (Z14): no log line, refusal, chain file or health report holds one, nor the
+route's credential, which reaches the upstream once approved and nothing else; an upstream's echo
+of it is scrubbed from the waiting caller's answer and from a detached result in the result store,
+and a held send's mail password reaches the transport alone.
 
 A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
 token, a placeholder, a token header, a forced query value, a connector username and a recipient,
@@ -109,6 +114,7 @@ from tests.fakes.oauth_server import (
     google_style,
     spotify_style,
 )
+from tests.gateway import holdrig as hold_rig
 from tests.unit import onboard_model
 from tests.unit.report_model import DIGEST, PIN, asked_line
 from zoeymcp.bridge.admit import BridgeTokenHash
@@ -117,7 +123,7 @@ from zoeymcp.bridge.main import Options, StartupError, check_options
 from zoeymcp.bridge.server import Bridge, Settings
 from zoeymcp.cli import onboard as onboard_cli
 from zoeymcp.cli.main import main
-from zoeymcp.common import ledgerreport, pinhash
+from zoeymcp.common import canonical, ledgerreport, pinhash
 from zoeymcp.common.canonical import digest as canonical_digest
 from zoeymcp.common.ledgerformat import GENESIS, line_hash
 from zoeymcp.common.policy import Policy
@@ -128,6 +134,7 @@ from zoeymcp.common.policy.plan import WritePlan, normalize
 from zoeymcp.common.policy.ratchet import initial
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import build_view, dump_view, parse_view
+from zoeymcp.common.resultstore import Collected
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.egress.allowlist import Allowlist, KeySource
 from zoeymcp.entrypoint import launcher
@@ -1352,6 +1359,95 @@ async def test_the_vault_chain_holds_no_value_and_logs_no_record(
 
 def _no_space(*args: Any, **kwargs: Any) -> int:
     raise OSError(28, "No space left on device")
+
+
+async def test_a_held_call_leaks_nothing(tmp_path: Path) -> None:
+    """The vault hold's new secret-bearing paths (M8 design O.6, FM-33): the credential added
+    after an approval, the upstream's answer echoing it (to a waiting caller, and detached to the
+    result store), a held send's password, and the argument values the surface shows."""
+    argument = "held-argument-sentinel-41c7"
+    rig = hold_rig.HoldRig(tmp_path, {"block_seconds": 0, "mail": True}, link="asgi")
+    rig.upstream.echo = True
+    health = HealthReader(rig.store, lambda: rig.app.policy, chain=rig.chain)
+    buffer = io.StringIO()
+    answers: list[str] = []
+    logs.set_stream(buffer)
+    try:
+        async with rig.running() as http:
+            with anyio.fail_after(30):
+                body = hold_rig.call(arguments={"item": argument})
+                # A refusal names a rule and a pointer, never the value.
+                bad = hold_rig.call(arguments={"item": argument, "qty": 1.50})
+                bad = bad.replace(b'"qty":1.5', b'"qty":1.50')
+                for sent in (bad, body):
+                    marker = hold_rig.marker(f"{len(answers):016x}", wait="pending")
+                    response = await http.post(
+                        "/shop/mcp", content=sent, headers=hold_rig.headers(held=marker)
+                    )
+                    answers.append(response.text + repr(response.headers.multi_items()))
+                # Detached at once (block_seconds 0): approved, its answer goes to the store.
+                [hold] = await rig.surface.holds(1)
+                assert argument in hold.text.value  # the surface's, alone (Z14)
+                await rig.decide(hold)
+                await rig.settled()
+                kept = rig.app.results.collect(rig.now_ms(), hold.ref, "agent1")
+                assert isinstance(kept, Collected)
+                answers.append(kept.result.body.decode())
+                # Approved while its caller waits: the echo is scrubbed from that answer too.
+                await rig.reload(block_seconds=120)
+                waiting = hold_rig.Answer()
+                marked = hold_rig.headers(held=hold_rig.marker("00000000000000ce"))
+                async with anyio.create_task_group() as group:
+                    group.start_soon(waiting.post, http, "/shop/mcp", body, marked)
+                    [_, waited] = await rig.surface.holds(2)
+                    await rig.decide(waited)
+                assert waiting.response is not None
+                assert waiting.response.status_code == 200
+                assert "[REDACTED]" in waiting.response.text
+                answers.append(waiting.response.text + repr(waiting.response.headers.multi_items()))
+                # A held send, approved while its caller waits (its tool's block, B.7).
+                mail_body = canonical.dumps_canonical(
+                    {
+                        "expect_from": hold_rig.SENDER,
+                        "expect_to": hold_rig.TO,
+                        "subject": "Hello",
+                        "body": argument,
+                    }
+                )
+                ref = "00000000000000cd"
+                sent_mail = {
+                    "content-type": "application/json",
+                    "idempotency-key": f"{ref}.1",
+                    "x-zoeymcp-held": hold_rig.marker(ref, tool="send_mail"),
+                }
+                answer = hold_rig.Answer()
+                async with anyio.create_task_group() as group:
+                    group.start_soon(answer.post, http, "/mail/send", mail_body, sent_mail)
+                    [_, _, mailed] = await rig.surface.holds(3)
+                    await rig.decide(mailed)
+                assert answer.response is not None
+                answers.append(answer.response.text + repr(answer.response.headers.multi_items()))
+                await rig.settled()
+                answers.append(json.dumps(health.report()))
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    assert '"event":"approval_forwarded"' in text
+    files = b"".join(
+        path.read_bytes() for path in (rig.state / CHAIN_DIR).iterdir() if path.is_file()
+    )
+    for value in (argument, hold_rig.SECRET, hold_rig.MAIL_PASSWORD):
+        assert value not in text
+        assert value.encode() not in files
+        for seen in answers:
+            assert value not in seen
+    assert b"[REDACTED]" in kept.result.body
+    # Each secret reached what it is for, and only that.
+    assert len(rig.upstream.received) == 2
+    for _, _, sent_headers, _ in rig.upstream.received:
+        assert sent_headers["authorization"] == f"Bearer {hold_rig.SECRET}"
+    [mail] = rig.mail
+    assert mail["password"] == hold_rig.MAIL_PASSWORD
 
 
 async def callback(world: World, url: str, binder: str | None) -> httpx.Response:

@@ -32,6 +32,19 @@ EVENTS = {
     "ledger_recovered": "vault",
     "ledger_pruned": "vault",
     "ledger_write_failed": "vault",
+    # Step 9: the vault hold (K.2), its decisions on the vault side (with via), and the
+    # builder's three failure events (a surface's error type, a forward or an ending that
+    # raised), none with a text, an argument, an id or a secret.
+    "approval_held": "vault",
+    "approval_decided": "vault",
+    "approval_detached": "vault",
+    "approval_forwarded": "vault",
+    "approval_withdrawn": "vault",
+    "approval_result_evicted": "vault",
+    "approvals_saturated": "vault",
+    "approver_surface_failed": "vault",
+    "approval_forward_failed": "vault",
+    "approval_hold_failed": "vault",
 }
 
 

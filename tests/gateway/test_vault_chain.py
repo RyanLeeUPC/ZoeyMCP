@@ -4,9 +4,11 @@ On ``tmp_path`` with the vault's chain key: records written as the vault (``via`
 decisions), keyed digests only, recovery closing every hold a kill left open and counting it for
 the two start findings, the recent endings read back and handed to the hold table, ``verify``,
 and no chain, no hold: an append that fails, a full retry queue and files over the cap with
-nothing old enough to prune each make the chain unwritable until an append succeeds; a record on
-disk is never written twice, and one that isn't valid is never queued. The vault's start recovers
-the chain before any listener (J10's chain half).
+nothing old enough to prune each make the chain unwritable until an append succeeds, and while it
+is the vault holds nothing: a held call is refused ``held_ledger_down``, nobody is asked, and
+health says ``vault_ledger_unavailable`` (FM-25); a record on disk is never written twice, and one
+that isn't valid is never queued. The vault's start recovers the chain before any listener (J10's
+chain half).
 """
 
 from __future__ import annotations
@@ -22,8 +24,10 @@ from typing import Any
 import anyio
 import pytest
 
+from tests.gateway.holdrig import HoldRig, call, headers, marker
 from zoeymcp.common import canonical, ledgerformat, logs
 from zoeymcp.vault import server, vaultledger
+from zoeymcp.vault.admin import HealthReader
 from zoeymcp.vault.holds import ENDINGS_SECONDS, HoldTable, Limits
 from zoeymcp.vault.keys import CONTEXT_LEDGER_VAULT, KeySet, derive, generate_master_key
 from zoeymcp.vault.vaultledger import (
@@ -405,9 +409,9 @@ async def test_an_edited_record_breaks_verify_and_is_noted(
 async def test_no_chain_no_hold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: io.StringIO
 ) -> None:
-    """FM-25's chain half: an append that fails makes the chain unwritable until one succeeds.
-    Step 9 extends it with the hold refused 503 ``held_ledger_down``, nothing asked, and the
-    health finding ``vault_ledger_unavailable``."""
+    """FM-25: an append that fails makes the chain unwritable until one succeeds; meanwhile a
+    held call is refused 503 ``held_ledger_down``, nothing is asked or sent, and health raises
+    ``vault_ledger_unavailable``, which goes once the disk is back."""
     chain = opened(tmp_path)
     with anyio.fail_after(BOUND):
         await chain.write("asked", REF_A, critical=True, **asked_fields(chain, {}))
@@ -433,6 +437,30 @@ async def test_no_chain_no_hold(
         ("vault", "decided", 1, "critical"),
     ]
     assert "do-not-log" not in log.getvalue()
+    # The vault's half: a held call while the chain can't be written (the in-process link: the
+    # links themselves are test_vault_hold.py's).
+    rig = HoldRig(tmp_path / "hold", link="asgi")
+    health = HealthReader(rig.store, lambda: rig.app.policy, chain=rig.chain)
+    assert health.report()["approvals"]["findings"] == []
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND), monkeypatch.context() as patched:
+            broken_disk(patched)
+            with pytest.raises(ChainUnavailable):
+                await rig.chain.write("asked", REF_C, critical=True, **asked_fields(rig.chain, {}))
+            answer = await http.post(
+                "/shop/mcp", content=call(), headers=headers(held=marker(REF_D))
+            )
+            assert answer.status_code == 503
+            assert answer.json()["code"] == "held_ledger_down"
+            assert answer.headers["x-zoeymcp-vault"] == "refused"
+            [finding] = health.report()["approvals"]["findings"]
+            assert (finding["code"], finding["level"]) == ("vault_ledger_unavailable", "error")
+        assert rig.surface.shown == []
+        assert rig.upstream.received == []
+        assert not rig.app.holds.knows(REF_D)  # nothing began: the ref is still unused
+        assert await rig.chain.flush_queue() == 0
+        await rig.chain.write("asked", REF_E, critical=True, **asked_fields(rig.chain, {}))
+        assert health.report()["approvals"]["findings"] == []
 
 
 async def test_a_record_that_isnt_valid_is_never_queued(

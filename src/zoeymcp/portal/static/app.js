@@ -46,7 +46,7 @@
     review_passkeys: "Review the passkeys", review: "Review" };
   const SECTION = { credential: "Credential", connector: "Connector", store: "The store",
     egress: "Egress", passkeys: "Passkeys", ledger_copy: "The reported ledger",
-    gateway: "The gateway reports", policy: "The policy" };
+    gateway: "The gateway reports", policy: "The policy", approvals: "Approvals" };
 
   let pending = null; // the action being confirmed: its ID, step-up options and what follows
   let creating = null; // a confirmed passkey.enrol's ceremony, until the passkey is created

@@ -10,6 +10,13 @@ The decisions are pure and live beside this module (:mod:`.mailmsg`, :mod:`.tunn
 The send runs in a worker thread, shielded from the caller: a gateway that hangs up doesn't cut a
 send half way. It is never retried. TLS is verified against the mail server's name before AUTH,
 and AUTH never goes out over a session without TLS.
+
+A connector the vault holds (M8 design B.7) takes the same path: :meth:`SmtpConnectors.check`
+runs rows 1-5 before the send is held, so nothing a human couldn't approve is asked, and once it
+is approved :meth:`SmtpConnectors.send` runs exactly as today inside the vault's committed
+registry (``vault/heldcommit.py``), under the writer server's deadline. Its key is
+``<ref>.<n>``, so the journal's ``sending`` record and the vault chain's ``decided`` name the same
+call; the caller's leaving (``Departure``) only stops the answer, never the send.
 """
 
 from __future__ import annotations
@@ -398,6 +405,29 @@ class SmtpConnectors:
             },
         )
 
+    def check(
+        self,
+        name: str,
+        connector: SMTPConnector,
+        *,
+        key: str | None,
+        content_type: str | None,
+        body: bytes,
+    ) -> mailmsg.SendRequest | Answer:
+        """J.2 rows 1-5, before the lock: the key, the request, the text rules, the expected
+        addresses and the pause. The request, or the refusal that sends nothing."""
+        if not mailmsg.key_ok(key):
+            return _refused(name, 400, "bad_request", field="Idempotency-Key", rule="format")
+        if (content_type or "").split(";")[0].strip().lower() != "application/json":
+            return _refused(name, 400, "bad_request", rule="content_type")
+        parsed = mailmsg.parse_send(body, connector)
+        if isinstance(parsed, mailmsg.Rejection):
+            extra = {k: v for k, v in (("field", parsed.field), ("rule", parsed.rule)) if v}
+            return _refused(name, parsed.status, parsed.code, **extra)
+        if connector.paused:
+            return _refused(name, 503, "connector_paused")
+        return parsed
+
     async def send(
         self,
         name: str,
@@ -410,17 +440,10 @@ class SmtpConnectors:
         credentials: Callable[[], tuple[str, str]],
     ) -> Answer:
         """``POST /send``, in J.2's order."""
-        if not mailmsg.key_ok(key):
-            return _refused(name, 400, "bad_request", field="Idempotency-Key", rule="format")
-        assert key is not None  # noqa: S101 - key_ok checked it
-        if (content_type or "").split(";")[0].strip().lower() != "application/json":
-            return _refused(name, 400, "bad_request", rule="content_type")
-        parsed = mailmsg.parse_send(body, connector)
-        if isinstance(parsed, mailmsg.Rejection):
-            extra = {k: v for k, v in (("field", parsed.field), ("rule", parsed.rule)) if v}
-            return _refused(name, parsed.status, parsed.code, **extra)
-        if connector.paused:
-            return _refused(name, 503, "connector_paused")
+        parsed = self.check(name, connector, key=key, content_type=content_type, body=body)
+        if isinstance(parsed, Answer):
+            return parsed
+        assert key is not None  # noqa: S101 - check refused a missing key
         lock = self._locks.setdefault(name, anyio.Lock())
         async with lock:
             return await self._send_locked(name, connector, key, parsed, proxy, credentials)

@@ -523,16 +523,26 @@ def test_control_command_words() -> None:
 
 class _App:
     """Stands in for VaultApp. Records whether the servers were still running when the view's
-    long polls were told to stop."""
+    long polls were told to stop, and that the held forwards were drained (M8 design I.2) before
+    the clients closed. It holds no call and has no chain."""
+
+    chain = None
 
     def __init__(self) -> None:
         self.waits_stopped: list[list[bool]] = []
+        self.calls: list[str] = []
 
     def stop_view_waits(self) -> None:
         self.waits_stopped.append([each.should_exit for each in FakeServer.made])
 
+    def sweep_holds(self) -> int:
+        return 0
+
+    async def drain_holds(self) -> None:
+        self.calls.append("drain_holds")
+
     async def aclose(self) -> None:
-        pass
+        self.calls.append("aclose")
 
 
 async def _until(condition: Callable[[], object], what: str) -> None:
@@ -643,6 +653,8 @@ def test_serve_reloads_and_stops_on_the_control_pipe(
     assert [s.should_exit for s in fake_servers] == [True]
     # The long polls stop first: the servers wait for requests in flight.
     assert app.waits_stopped == [[False]]
+    # Every approved held forward ends before the clients close (M8 design I.2).
+    assert app.calls == ["drain_holds", "aclose"]
 
 
 def test_serve_stops_when_the_control_pipe_fails(

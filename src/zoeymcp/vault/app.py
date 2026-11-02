@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import hmac
 import http.cookiejar
 import ipaddress
@@ -66,10 +67,13 @@ import json
 import math
 import os
 import re
+import secrets
 import time
 import urllib.request
-from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, Final, Literal
 from urllib.parse import quote, urlsplit
 
@@ -78,12 +82,26 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
-from ..common import canonical, egresslist, ledgerreport, reviewreport
+from ..common import approvaltext, canonical, egresslist, envelope, ledgerreport, reviewreport
+from ..common.approvaltext import ApprovalText, Header, Plan, Show, Write
 from ..common.egresslist import Allowance
+from ..common.mcpwire import VERSION_HEADER
 from ..common.policy import fields
 from ..common.policy.check import local_mcp_routes
+from ..common.policy.held import (
+    HeldConnector,
+    HeldMap,
+    HeldRoute,
+    HoldKey,
+    held_map,
+    lookup,
+    path_key,
+    same_hold,
+)
 from ..common.policy.match import NormalizedPath
 from ..common.policy.schema import (
+    Approvals,
+    Approvers,
     BasicCredential,
     EgressProxyKind,
     GatewayLimits,
@@ -98,10 +116,15 @@ from ..common.policy.schema import (
     is_secret_ref,
 )
 from ..common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
+from ..common.resultstore import Full, PendingCall, ResultStore, StoredResult
 from ..common.reviewreport import RemoteReport, ToolkitReport
 from . import internal, logs, netclient, secretops, statusreport
+from .approvers import EDIT_GRACE, ApproverHub, NotShown
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
+from .heldcommit import OUTCOME_MARGIN, HeldCommits, read_answer
+from .holds import CapRefusal, Decided, DecideRefusal, Hold, HoldRequest, HoldTable, Limits, Via
+from .holds import toolkit_block as _toolkit_block
 from .keys import KeySet
 from .oauth.discovery import Challenge, parse_challenge
 from .oauth.protocol import CREDENTIAL_UNAVAILABLE, OAUTH_UNAVAILABLE
@@ -136,6 +159,7 @@ from .reviewjobs import (
     read_result,
 )
 from .store import Secret, SecretStore, SecretUnavailable, smtp_binding
+from .vaultledger import ChainUnavailable, VaultLedger
 
 GATEWAY_HEADER = "x-zoeymcp-gateway"
 # The egress role's key, for the allowlists alone (M7 design G.3).
@@ -195,6 +219,50 @@ _SCRUBBED_TYPES = (
     "application/javascript",
     "application/x-www-form-urlencoded",
 )
+# The vault hold (M8 design B). The gateway's marker on an Elsewhere call (B.2 E14), and what the
+# vault adds to its own answer to an approved held call (B.6, M.1).
+MARKER_HEADER = envelope.MARKER_HEADER
+APPROVAL_HEADER = "x-zoeymcp-approval"
+HELD_REF_HEADER = "x-zoeymcp-held-ref"
+# A held connector send's headers (B.3's admitted-set rule, B.7): what the gateway's toolkit
+# transport sends (gateway/vaultlink.py), the key the hardened tier presents and the marker.
+CONNECTOR_HEADERS: Final = frozenset(
+    {
+        "content-type",
+        "accept",
+        "idempotency-key",
+        "content-length",
+        "accept-encoding",
+        "connection",
+        "user-agent",
+        "host",
+        GATEWAY_HEADER,
+        MARKER_HEADER,
+    }
+)
+# A held send's Idempotency-Key: its call's ref and its write's number (B.7).
+_HELD_KEY = re.compile(r"([0-9a-f]{16})\.([0-9]{1,6})")
+# The chain's asked record names a client and a pin: a call with no marker has no reported client,
+# and a connector send whose toolkit runs unpinned has no pin; these stand for none (no policy
+# name is "-", and no definition hashes to all zeros).
+UNREPORTED_CLIENT: Final = "-"
+NO_PIN: Final = "sha256:" + "0" * 64
+# How a hold that ended unforwarded is recorded (J.1): its state and detail to the decision and
+# the outcome's detail, and the refusal its waiting request gets (M.2).
+_ENDED_DECISIONS: Final[Mapping[str, tuple[str, str | None]]] = MappingProxyType(
+    {
+        "stream_lost": ("stream_lost", None),
+        "shutdown": ("shutdown", "shutdown"),
+        "changed": ("withdrawn", "changed"),
+    }
+)
+_ENDED_CODES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "denied": "approval_declined",
+        "expired": "approval_expired",
+        "withdrawn": "approval_withdrawn",
+    }
+)
 
 
 class Refused(Exception):
@@ -212,12 +280,16 @@ class Refused(Exception):
         code: str | None = None,
         retry_after: int | None = None,
         allow: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> None:
         self.status = status
         self.reason = reason
         self.code = code
         self.retry_after = retry_after
         self.allow = allow
+        # Fields the body carries beside the code: a held call's JSON pointer or deadline, never
+        # a value (M8 design B.2, B.6).
+        self.extra = dict(extra or {})
         super().__init__(reason)
 
 
@@ -243,6 +315,11 @@ class Departure:
 
     def __init__(self, receive: Receive) -> None:
         self._gone = asyncio.ensure_future(_disconnected(receive))
+
+    @property
+    def gone(self) -> asyncio.Future[None]:
+        """Done once the caller has left: what a held request's wait races (M8 design B.6)."""
+        return self._gone
 
     async def race[T](self, work: Awaitable[T], *, phase: Literal["headers", "relay"]) -> T:
         """Await ``work``. If the caller leaves first, cancel it and raise :class:`CallerGone`."""
@@ -315,6 +392,80 @@ class _ServedView:
 
 
 @dataclass(frozen=True)
+class _Authorized:
+    """A request with its credential (B.3's ``_authorize``): the URL, the headers and the secret
+    variants its answer is scrubbed for."""
+
+    url: str
+    headers: list[tuple[str, str]]
+    variants: list[bytes]
+    cred: Any
+    grant: Grant | None
+
+
+@dataclass(frozen=True, repr=False)
+class _Done:
+    """A held call's forward, ended: what the waiting request gets (an answer, or a refusal),
+    the outcome the chain records, and what the result store keeps for a request that left."""
+
+    response: Response | Refused
+    outcome: str
+    detail: str | None
+    writes_sent: int
+    writes_unknown: int
+    stored: StoredResult
+
+
+Forward = Callable[[Hold], Awaitable[_Done]]
+
+
+@dataclass(frozen=True, repr=False)
+class _Ask:
+    """What a held call asks for, before its hold begins (B.3, B.7)."""
+
+    route: str
+    key: HoldKey
+    server: str
+    tool: str
+    client: str | None  # the marker's, else not reported
+    ref: str | None  # the marker's or the send's key's; None: the vault mints one
+    epoch: str | None
+    wait: Literal["block", "pending"]
+    era: Literal["legacy", "modern"]
+    legacy_session: bool
+    # A dropped request stream is its cancel (2026-07-28, and a toolkit's send); at the earlier
+    # eras a disconnect isn't, and the agent's cancel arrives as a notification (B.6).
+    modern: bool
+    arguments: canonical.JSONValue
+    pin: str | None
+    writes: int
+    held_bytes: int
+    block_seconds: float | None
+    seconds: float  # the forward's deadline: call_timeout plus OUTCOME_MARGIN (B.8)
+    render: Callable[[Header], ApprovalText]
+    forward: Forward
+    request_key: tuple[str, str | None, str] | None = None
+
+
+@dataclass(eq=False)
+class _Wait:
+    """A hold's place and its delivery: the request waiting for it (if any) is woken through
+    ``changed`` and answered through ``answer``."""
+
+    key: HoldKey
+    forward: Forward
+    modern: bool
+    seconds: float
+    asked_ms: int
+    deadline_ms: int
+    answer: asyncio.Future[Response | Refused]
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    request_key: tuple[str, str | None, str] | None = None
+    # A legacy-era caller left while the call was held: its hold goes on, unanswered (B.6).
+    left: bool = False
+
+
+@dataclass(frozen=True)
 class _Caller:
     index: int
     placeholder: bytes
@@ -368,6 +519,141 @@ def _connector_response(answer: Answer, log: dict[str, Any]) -> Response:
     return JSONResponse(answer.body, status_code=answer.status, headers=headers)
 
 
+def _unread(reason: envelope.Reason) -> Refused:
+    """A held request the vault can't read unambiguously (B.2's rules), code ``held_<reason>``."""
+    return Refused(
+        envelope.Refuse(reason).status,
+        f"the vault can't read this request unambiguously ({reason})",
+        code=f"held_{reason}",
+    )
+
+
+def _hold_limits(policy: Policy) -> Limits:
+    """What the vault's own policy sets for every hold (I.1 step 3)."""
+    approvers = policy.approvers or Approvers()
+    approvals = Approvals() if policy.gateway is None else policy.gateway.approvals
+    return Limits(
+        timeout=float(approvers.timeout),
+        block_seconds=float(approvers.block_seconds),
+        cooldown=float(approvals.cooldown),
+        max_prompts_per_hour=approvals.max_prompts_per_hour,
+    )
+
+
+def _result_times(policy: Policy) -> tuple[int, int]:
+    """The result store's TTL (``approvers.result_ttl``) and its grace past a deadline: the
+    longest forward, the longest effective call_timeout plus OUTCOME_MARGIN (F.2), in ms."""
+    approvers = policy.approvers or Approvers()
+    gateway = policy.gateway
+    longest = 0 if gateway is None else gateway.limits.call_timeout
+    for server in () if gateway is None else gateway.servers.values():
+        longest = max(longest, server.call_timeout or 0)
+    return approvers.result_ttl * 1000, int((longest + OUTCOME_MARGIN) * 1000)
+
+
+def _approvers_kept(before: Approvers | None, after: Approvers | None) -> bool:
+    """Z7: whether holds begun under ``before`` may stay under ``after``. Any change to the block
+    withdraws them (its waits set their times, Z23, and a surface's settings where they are
+    shown), except a surface switched on or off, which B.5's surface rule decides."""
+    if before is None or after is None:
+        return True  # no surface is left, or none was: B.5's surface rule decides
+    for name in ("telegram", "portal"):
+        old, new = getattr(before, name), getattr(after, name)
+        if old is not None and new is not None and old != new:
+            return False
+    waits = ("timeout", "block_seconds", "result_ttl")
+    return all(getattr(before, name) == getattr(after, name) for name in waits)
+
+
+def _surfaces(policy: Policy) -> frozenset[Literal["telegram", "portal"]]:
+    """The surfaces ``approvers`` enables (D.4)."""
+    approvers = policy.approvers
+    found: set[Literal["telegram", "portal"]] = set()
+    if approvers is not None and approvers.telegram is not None:
+        found.add("telegram")
+    if approvers is not None and approvers.portal is not None:
+        found.add("portal")
+    return frozenset(found)
+
+
+def _request_key(
+    route: str, session: str | None, request_id: str | int
+) -> tuple[str, str | None, str]:
+    """A held request's place for a cancel (B.1 step 5): its route, its ``Mcp-Session-Id`` and
+    its JSON-RPC id, typed (the string "1" isn't the number 1)."""
+    return route, session, json.dumps(request_id)
+
+
+def _wall_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _iso_ms(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, UTC).isoformat(timespec="seconds")
+
+
+def _waited(hold: Hold) -> int:
+    decided = hold.decided_at if hold.decided_at is not None else hold.asked_at
+    return max(0, round((decided - hold.asked_at) * 1000))
+
+
+def _approved(ref: str) -> list[tuple[bytes, bytes]]:
+    """What the vault adds to its answer to an approved held call (B.6, M.1)."""
+    return [(APPROVAL_HEADER.encode(), b"approved"), (HELD_REF_HEADER.encode(), ref.encode())]
+
+
+def _failed(refused: Refused, outcome: str) -> _Done:
+    """A held forward that ended in the vault's own refusal, with its outcome on the chain."""
+    return _Done(refused, outcome, None, 0, 0, _refusal_result(refused))
+
+
+def _refusal_result(refused: Refused) -> StoredResult:
+    """A refused forward's answer as the result store keeps it: the vault's refusal body."""
+    body: dict[str, Any] = {"error": _PUBLIC_MESSAGES.get(refused.status, "error")}
+    if refused.code is not None:
+        body["code"] = refused.code
+    return StoredResult(refused.status, "application/json", json.dumps(body).encode())
+
+
+# A guard's refusal (netclient's AddressRefused, SocketRefused) is a ConnectError too.
+_UNSENT = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+def _not_sent(refused: Refused) -> bool:
+    """Whether a forward refused on its way out never reached the upstream: refused before the
+    request was built, or by a connection that didn't open."""
+    cause = refused.__cause__
+    return cause is None or isinstance(cause, _UNSENT)
+
+
+def _send_outcome(answer: Answer) -> tuple[str, str | None, int, int]:
+    """A held send's outcome on the chain, from the connector's answer (J.1, B.7): sent, its
+    outcome unknown, refused by the mail server, or refused before anything was sent."""
+    code = answer.body.get("code")
+    if answer.status == 200:
+        return "ok", "sent", 1, 0
+    if code == "smtp_outcome_unknown":
+        return "unknown", None, 0, 1
+    if isinstance(code, str) and code.startswith("smtp_"):
+        return "upstream_error", "smtp_refused" if code == "smtp_refused" else None, 0, 0
+    return "refused", None, 0, 0
+
+
+def _mail_plan(connector: str, value: Mapping[str, canonical.JSONValue]) -> Plan:
+    """The vault's own plan of a held send (B.7): no toolkit layout is trusted (M4 Q5's
+    ``pinning: off``), so the vault shows the expected addresses, the subject and the reply as
+    lines and the body as a block."""
+    show = [
+        Show.line("From", "/expect_from"),
+        Show.line("To", "/expect_to"),
+        Show.line("Subject", "/subject"),
+    ]
+    if "in_reply_to" in value:
+        show.append(Show.line("In reply to", "/in_reply_to"))
+    show.append(Show.block("/body"))
+    return Plan(f"Mail through {connector}", [Write.post("/send", value, show=show)])
+
+
 def snapshot_env_secrets(policy: Policy, environ: Mapping[str, str]) -> dict[str, Secret]:
     """Read every ``env:`` secret once at startup, so later env changes can't affect the vault.
 
@@ -404,6 +690,9 @@ class VaultApp:
         connectors: SmtpConnectors | None = None,
         reports: ReportStore | None = None,
         review_jobs: JobTable | None = None,
+        chain: VaultLedger | None = None,
+        hub: ApproverHub | None = None,
+        hold_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. By default both are :mod:`.netclient`'s guarded clients, with the
@@ -442,6 +731,11 @@ class VaultApp:
 
         ``review_jobs`` replaces the review job table (tests inject a clock). By default it is
         on the monotonic clock, started now.
+
+        ``chain`` is the vault's approval chain, recovered before the listeners open (M8 design
+        J.1); without one (or :meth:`use_chain`), every held call is refused ``held_ledger_down``
+        (no chain, no hold). ``hub`` holds the approver surfaces a hold is shown on (D.1), and
+        ``hold_clock`` the monotonic clock the hold table runs on (tests inject one).
         """
         self._gateway_link = gateway_link
         self._store = store
@@ -521,6 +815,28 @@ class VaultApp:
         self._started = time.monotonic()
         # A managed vault's head as its view answers state it (M6 design K.3); None: no header.
         self._head_stated: str | None = None
+        # The vault hold (M8 design B): the routes held, the hold table on its clock with each
+        # hold's place and delivery, the result store, the committed registry, the surfaces, and
+        # the tasks that write a hold's ending. Every hold is in memory only (Z10).
+        self._chain = chain
+        self._hub = hub or ApproverHub()
+        self._clock = hold_clock
+        self._held: HeldMap = MappingProxyType({})
+        self._holds = HoldTable(_hold_limits(policy))
+        self._results = ResultStore(*_result_times(policy))
+        self._commits = HeldCommits()
+        self._waits: dict[str, _Wait] = {}
+        # Each held request's place for a cancel, to the holds there (B.1 step 5).
+        self._requests: dict[tuple[str, str | None, str], set[str]] = {}
+        self._finishing: set[asyncio.Task[None]] = set()
+        # Approved holds whose forward hasn't entered the registry yet (its decided accept is
+        # being written), with that forward's deadline, and the event set as each enters.
+        self._approving: dict[str, float] = {}
+        self._entered = asyncio.Event()
+        # The approvers block holds were begun under, for Z7's withdraw on its change.
+        self._approvers: Approvers | None = None
+        if chain is not None:
+            chain.remember(self._holds, self._clock())
         self._install(policy)
 
     def _install(self, policy: Policy) -> list[str]:
@@ -539,9 +855,27 @@ class VaultApp:
         self._view = _ServedView(view.digest, dump_view(view))
         # A new generation retires the old egress key at once: there is no ratchet (G.3).
         self._egress_key = self._keys.egress_key(policy.egress_key_generation).encode()
+        self._install_holds(policy)
         self._wake_view_waiters()
         self._wake_allowlist()
         return self._tokens.configure(policy, self._env_secrets)
+
+    def _install_holds(self, policy: Policy) -> None:
+        """The held routes of ``policy``, its limits for new holds, and every undecided hold the
+        change no longer holds as it was, withdrawn ``changed`` (M8 design B.5, Z7): all of them
+        when the approvers block changed other than by a surface switched on or off."""
+        old, self._held = self._held, held_map(policy)
+        before, self._approvers = self._approvers, policy.approvers
+        self._holds.configure(_hold_limits(policy))
+        self._results.ttl_ms, self._results.grace_ms = _result_times(policy)
+        if not len(self._holds):
+            return
+        now = self._clock()
+        kept = _approvers_kept(before, policy.approvers)
+        for hold in self._holds.withdraw(
+            now, lambda h: not kept or not self._still_held(h, old, self._held, policy), "changed"
+        ):
+            self._spawn(self._ended(hold))
 
     def _private(self) -> frozenset[str]:
         """The running policy's ``egress_private``: the guarded clients read it at each
@@ -626,8 +960,9 @@ class VaultApp:
         """Answer every long poll of the view, of the review jobs and of the allowlists now, and
         the socket's review waits and an onboarding's wait for the egress role, and wait no
         more. For shutdown: the servers wait for requests in flight, and a long poll would hold
-        them for up to 25 s."""
+        them for up to 25 s. Every undecided hold is withdrawn too (M8 design I.2)."""
         self._view_stopping = True
+        self.stop_holds()
         self._wake_view_waiters()
         self._wake_reviews()
         self._wake_allowlist()
@@ -775,6 +1110,7 @@ class VaultApp:
             headers = {REFUSAL_HEADER: REFUSAL_MARKER}
             if refusal.code is not None:
                 body["code"] = log["code"] = refusal.code
+            body.update({k: v for k, v in refusal.extra.items() if v is not None})
             if refusal.retry_after is not None:
                 headers["retry-after"] = str(refusal.retry_after)
             if refusal.allow is not None:
@@ -817,11 +1153,40 @@ class VaultApp:
             raise Refused(403, "no rule allows this method and path")
         log["rule"] = rule_index
 
+        # M8 design B.1 step 2: held by route, never by path (T-1).
+        hold = lookup(self._held, route.name)
+        if isinstance(hold, HeldConnector) and route.connector is not None:
+            return await self._held_connector(request, route.connector, hold, rest, log)
+        if isinstance(hold, HeldRoute) and route.connector is None:
+            return await self._held_route(
+                request, route, hold, rest, params, (used_query, used_header), log
+            )
+        if hold is not None:  # a map built for another kind of route: fail closed
+            raise Refused(404, "a held route answers its own paths only", code="held_path")
+        if request.headers.getlist(MARKER_HEADER):
+            # B.1 step 3: a held call's marker on a route that holds nothing (Z5).
+            raise Refused(409, "a marked call on a route the vault doesn't hold", code="view_stale")
         if route.connector is not None:
             return await self._connector(request, route.connector, rest, log)
-        assert route.upstream is not None  # noqa: S101 - guaranteed by the schema
-
         body = await self._read_body(request)
+        return await self._forward(
+            request, route, rest, params, (used_query, used_header), body, caller, log
+        )
+
+    async def _authorize(
+        self,
+        route: Route,
+        incoming: Iterable[tuple[str, str]],
+        rest: NormalizedPath,
+        params: list[tuple[str, str]],
+        used: tuple[str | None, str | None],
+        log: dict[str, Any],
+    ) -> _Authorized:
+        """The request as it goes upstream, with the route's credential (M8 design B.3, Z2): the
+        plain path calls this at once, and a hold only after its approval. ``used`` is the
+        caller's query parameter and header that held its placeholder, dropped."""
+        assert route.upstream is not None  # noqa: S101 - guaranteed by the schema
+        used_query, used_header = used
         if route.upstream.startswith(fields.UNIX_PREFIX):
             # A bridge's socket is the whole upstream: the server's path is the HTTP path, on
             # the request base every bridge shares (its client is picked by name, in _send).
@@ -830,9 +1195,7 @@ class VaultApp:
             upstream = urlsplit(route.upstream)
             base_path = upstream.path.rstrip("/")
             upstream_origin = f"{upstream.scheme}://{upstream.netloc}"
-        headers = filter_request_headers(
-            request.headers.items(), drop=[used_header] if used_header else ()
-        )
+        headers = filter_request_headers(incoming, drop=[used_header] if used_header else ())
         remove = [used_query] if used_query else []
         add: list[tuple[str, str]] = []
         variants: list[bytes] = []
@@ -881,6 +1244,24 @@ class VaultApp:
         url = upstream_origin + base_path + path_prefix + rest.encoded()
         if query:
             url += "?" + encode_query(query)
+        return _Authorized(url, headers, variants, cred, grant)
+
+    async def _forward(
+        self,
+        request: Request,
+        route: Route,
+        rest: NormalizedPath,
+        params: list[tuple[str, str]],
+        used: tuple[str | None, str | None],
+        body: bytes,
+        caller: str,
+        log: dict[str, Any],
+    ) -> Response:
+        """Today's path (design §4.1): the credential at once, then the upstream, with the caller
+        watched while the vault waits."""
+        authorized = await self._authorize(route, request.headers.items(), rest, params, used, log)
+        url, headers, variants = authorized.url, authorized.headers, authorized.variants
+        cred, grant = authorized.cred, authorized.grant
         departure = Departure(request.receive)
         try:
             upstream_response = await self._send(
@@ -1511,6 +1892,879 @@ class VaultApp:
             # asyncio doesn't report it as never retrieved.
             gone.cancel()
 
+    # --- the vault hold (M8 design B) ---------------------------------------------------------
+
+    @property
+    def chain(self) -> VaultLedger | None:
+        """The vault's approval chain, or None: then no call is held (J.1, G-10)."""
+        return self._chain
+
+    def use_chain(self, chain: VaultLedger) -> None:
+        """Hold calls on ``chain``, which the start recovered (J.1). Its recent endings go to the
+        hold table, so each ref stays used (E19) and a late answer is told how it ended."""
+        self._chain = chain
+        chain.remember(self._holds, self._clock())
+
+    @property
+    def hub(self) -> ApproverHub:
+        """The approver surfaces holds are shown on (D.1)."""
+        return self._hub
+
+    @property
+    def holds(self) -> HoldTable:
+        return self._holds
+
+    @property
+    def results(self) -> ResultStore:
+        """The results of held calls that answered pending, or whose caller left (F.2)."""
+        return self._results
+
+    @property
+    def held_commits(self) -> HeldCommits:
+        """The registry approved forwards run in (B.8), which the stop drains."""
+        return self._commits
+
+    def decide(
+        self, id: str, decision: Literal["approve", "deny"], via: Via, text_sha256: str
+    ) -> Decided | DecideRefusal:
+        """A surface's decision on hold ``id`` (D.4): the first valid one wins, in one synchronous
+        section with its transition (M4 build note 6c). An approved hold's forward starts once its
+        ``decided accept`` is on disk (B.4); a refusal says what happened instead."""
+        result = self._holds.decide(self._clock(), id, decision, via, text_sha256)
+        if isinstance(result, Decided):
+            hold = result.hold
+            if hold.state == "approved":
+                # Its forward isn't in the registry until decided accept is on disk; the stop's
+                # drain waits for that too (I.2).
+                wait = self._waits.get(hold.id)
+                self._approving[hold.id] = 0.0 if wait is None else wait.seconds
+                self._spawn(self._decided(hold))
+            else:
+                self._spawn(self._ended(hold))
+            self._wake(hold.id)
+        return result
+
+    def saturated(self) -> int:
+        """Holds a cap refused in the last saturation window (D.3), for health."""
+        return self._holds.saturated(self._clock())
+
+    def sweep_holds(self) -> int:
+        """Expire every undecided hold past its end, and let each waiting request look at its
+        hold again: the sweeper's tick (I.4). Returns how many expired."""
+        expired = self._sweep(self._clock())
+        for wait in self._waits.values():
+            wait.changed.set()
+        return expired
+
+    def stop_holds(self) -> None:
+        """The vault stops (I.2): no hold begins any more (503 ``stopping``), and every undecided
+        one is withdrawn. An approved forward runs on; :meth:`drain_holds` waits for it."""
+        for hold in self._holds.withdraw(self._clock(), lambda _hold: True, "shutdown"):
+            self._spawn(self._ended(hold))
+
+    async def drain_holds(self) -> None:
+        """Wait for every approved forward up to its deadline (B.8), then for the endings'
+        records and surface edits, at most :data:`.approvers.EDIT_GRACE` more. A forward
+        approved just before the stop, whose ``decided accept`` is still being written, is
+        waited for to enter the registry first (or end unsent), at most its own deadline."""
+        if self._approving:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(max(self._approving.values())):
+                    while self._approving:
+                        await self._entered.wait()
+        await self._commits.drain()
+        if self._finishing:
+            await asyncio.wait(set(self._finishing), timeout=EDIT_GRACE)
+
+    async def settle(self) -> None:
+        """Wait until every ending begun so far is written and told (tests)."""
+        while self._finishing:
+            await asyncio.wait(set(self._finishing))
+
+    async def _held_route(
+        self,
+        request: Request,
+        route: Route,
+        hold: HeldRoute,
+        rest: NormalizedPath,
+        params: list[tuple[str, str]],
+        used: tuple[str | None, str | None],
+        log: dict[str, Any],
+    ) -> Response:
+        """B.1 step 5: a route that carries a vault-held server. Its servers' exact paths only;
+        their ``GET`` and ``DELETE`` pass (F-48), and every ``POST`` is read whole by
+        :func:`.envelope.admit` before anything goes upstream."""
+        place = hold.paths.get(path_key(rest))
+        marked = bool(request.headers.getlist(MARKER_HEADER))
+        if place is None or request.method not in ("GET", "DELETE", "POST"):
+            raise Refused(404, "not one of the held route's server paths", code="held_path")
+        log["server"] = place.server
+        if request.method != "POST":
+            if marked:
+                raise Refused(409, "a marked call that isn't a held call", code="view_stale")
+            body = await self._read_body(request)
+            return await self._forward(request, route, rest, params, used, body, "gateway", log)
+        body = await self._read_held_body(request)
+        headers = request.headers.items()
+        session = request.headers.get("mcp-session-id")
+        admitted = envelope.admit(
+            body,
+            headers,
+            request.scope.get("query_string", b"").decode("latin-1"),
+            place.tools,
+            place.listed,
+            hold.names,
+            lambda request_id: _request_key(route.name, session, request_id) in self._requests,
+            self._ref_used,
+        )
+        if isinstance(admitted, envelope.Refuse):
+            raise Refused(
+                admitted.status,
+                f"the vault can't read this request unambiguously ({admitted.reason})",
+                code=f"held_{admitted.reason}",
+                extra={"pointer": admitted.pointer},
+            )
+        if isinstance(admitted, envelope.Pass):
+            if admitted.marked:
+                raise Refused(409, "a marked call that isn't a held call", code="view_stale")
+            return await self._forward(request, route, rest, params, used, body, "gateway", log)
+        if isinstance(admitted, envelope.Cancel):
+            # B.1 step 5, F-54: consumed, never forwarded (the upstream never saw that id).
+            found = self._requests.get(_request_key(route.name, session, admitted.request_id))
+            for hold_id in sorted(found or ()):
+                current = self._holds.get(hold_id)
+                if current is not None and current.state == "held":
+                    self._caller_left(current.id)
+            log["held"] = "cancelled"
+            return Response(status_code=202)
+        call, marker = admitted.envelope, admitted.marker
+        modern = request.headers.get(VERSION_HEADER) == envelope.MODERN_VERSION
+        arguments: canonical.JSONValue = call.arguments
+        ask = _Ask(
+            route=route.name,
+            key=(route.name, place.path),
+            server=place.server,
+            tool=call.name,
+            client=None if marker is None else marker.client,
+            ref=None if marker is None else marker.ref,
+            epoch=None if marker is None else marker.epoch,
+            wait="block" if marker is None else marker.wait,
+            era="modern" if modern else "legacy",
+            legacy_session=session is not None,
+            modern=modern,
+            arguments=arguments,
+            pin=place.pins.get(call.name),
+            writes=0,
+            held_bytes=len(body),
+            block_seconds=None,
+            seconds=self._call_timeout(place.server) + OUTCOME_MARGIN,
+            render=lambda header: approvaltext.render_call(header, arguments),
+            forward=self._mcp_forward(route, call, headers, rest),
+            request_key=_request_key(route.name, session, call.id),
+        )
+        return await self._hold(request, ask, log)
+
+    async def _held_connector(
+        self,
+        request: Request,
+        name: str,
+        hold: HeldConnector,
+        rest: NormalizedPath,
+        log: dict[str, Any],
+    ) -> Response:
+        """B.7: a held connector holds every ``POST /send``. Its headers, query and marker are
+        read as a held MCP call's are, its key names its call's ref, and the send is checked as
+        today before a vault-made plan of it is held; on approval it runs exactly as today, in
+        the committed registry."""
+        connector = self._policy.connectors[name]
+        log["connector"] = name
+        marked = bool(request.headers.getlist(MARKER_HEADER))
+        endpoint = (request.method, rest.segments)
+        if endpoint != ("POST", ("send",)):
+            if marked:
+                raise Refused(409, "a marked call that isn't a held send", code="view_stale")
+            return await self._connector(request, name, rest, log)
+        headers = request.headers.items()
+        for header, _value in headers:
+            if header.lower() not in CONNECTOR_HEADERS:
+                raise _unread("header_extra")
+        if request.scope.get("query_string"):
+            raise _unread("query")
+        marker = envelope.marker(headers)
+        if isinstance(marker, envelope.Refuse):
+            raise _unread("marker")
+        body = await self._read_held_body(request)
+        key = request.headers.get("idempotency-key")
+        content_type = request.headers.get("content-type")
+        checked = self._connectors.check(
+            name, connector, key=key, content_type=content_type, body=body
+        )
+        if isinstance(checked, Answer):
+            return _connector_response(checked, log)
+        found = _HELD_KEY.fullmatch(key or "")
+        if found is None or (marker is not None and found.group(1) != marker.ref):
+            raise _unread("marker")  # the key carries the call's ref, as the marker does
+        ref, number = found.groups()
+        if number != "1" or self._ref_used(ref):
+            raise Refused(409, "one held write per call", code="held_second_write")
+        if marker is not None and marker.wait != "block":
+            raise _unread("marker")  # a toolkit's write blocks for as long as the tool may run
+        servers = self._servers()
+        writers = sorted(hold.writers, key=hold.writers.__getitem__)  # the longest timeout last
+        # A send that names no toolkit tool is the connector's own, with no pin, and waits
+        # approvers.block_seconds; its forward may run as long as the longest writer's.
+        server, tool, block, seconds = name, "send", None, float(max(hold.writers.values()))
+        pin = None
+        if marker is not None and marker.tool is not None:
+            writing = [w for w in writers if marker.tool in servers[w].tools.vault_approval]
+            if not writing:
+                raise _unread("marker")
+            server, tool = writing[-1], marker.tool
+            seconds = float(hold.writers[server])
+            block = _toolkit_block(seconds)
+            pin = servers[server].review.get(tool)
+        value: dict[str, canonical.JSONValue] = canonical.loads_strict(
+            body, max_bytes=len(body) + 1
+        )
+        plan = _mail_plan(name, value)
+        ask = _Ask(
+            route=hold.route,
+            key=(hold.route, ()),
+            server=server,
+            tool=tool,
+            client=None if marker is None else marker.client,
+            ref=ref,
+            epoch=None if marker is None else marker.epoch,
+            wait="block",
+            era="modern",
+            legacy_session=False,
+            modern=True,
+            arguments=value,
+            pin=pin,
+            writes=1,
+            held_bytes=len(body),
+            block_seconds=block,
+            seconds=seconds + OUTCOME_MARGIN,
+            render=lambda header: approvaltext.render_plan(header, plan),
+            forward=self._mail_forward(name, connector, key, content_type, body),
+        )
+        return await self._hold(request, ask, log)
+
+    async def _hold(self, request: Request, ask: _Ask, log: dict[str, Any]) -> Response:
+        """Hold one call (B.3-B.6): no chain, no hold; the vault's own text; the caps, and room
+        for a ``wait=pending`` call's pending record (F.2); ``asked`` on disk; the surfaces
+        asked; then the wait, with the caller watched."""
+        if self._view_stopping:
+            raise Refused(503, "the vault is stopping", code="stopping")
+        chain = self._chain
+        if chain is None or not chain.writable():
+            raise Refused(
+                503, "the vault's approval chain can't be written", code="held_ledger_down"
+            )
+        now, wall = self._clock(), time.time()
+        self._sweep(now)
+        ref = ask.ref if ask.ref is not None else self._mint_ref()
+        limits = self._holds.limits
+        deadline_wall = wall + limits.timeout
+        header = Header(
+            ref,
+            ask.client or "",
+            ask.server,
+            ask.tool,
+            datetime.fromtimestamp(deadline_wall, UTC),
+            asked_at=datetime.fromtimestamp(wall, UTC),
+            rendered_by="vault",
+            client_reported=ask.client is not None,
+            pin=ask.pin,
+            approver="out_of_band",
+        )
+        text = ask.render(header)
+        problems = approvaltext.problems(text, budget=self._budget(ask.client), renders="plain")
+        if problems:
+            raise Refused(
+                422,
+                "the approval text broke a text rule",
+                code="held_text_refused",
+                extra={"pointer": problems[0].pointer},
+            )
+        digest = hashlib.sha256(text.value.encode("utf-8")).hexdigest()
+        begun = self._holds.begin(
+            now,
+            HoldRequest(
+                ref=ref,
+                kind="held",
+                epoch=ask.epoch,
+                legacy_session=ask.legacy_session,
+                route=ask.route,
+                server=ask.server,
+                tool=ask.tool,
+                client=ask.client,
+                args_digest=chain.digest(ask.arguments),
+                text=text,
+                text_sha256=digest,
+                surfaces=_surfaces(self._policy),
+                wait=ask.wait,
+                held_bytes=ask.held_bytes,
+                block_seconds=ask.block_seconds,
+            ),
+        )
+        if isinstance(begun, CapRefusal):
+            self._saturation(now)
+            retry = begun.seconds_left or None
+            raise Refused(begun.status, f"held: {begun.reason}", code=begun.code, retry_after=retry)
+        hold = begun
+        # Its place first: an ending while asked is written (a sweep, a change) reaches it.
+        wait = _Wait(
+            key=ask.key,
+            forward=ask.forward,
+            modern=ask.modern,
+            seconds=ask.seconds,
+            asked_ms=int(wall * 1000),
+            deadline_ms=int(deadline_wall * 1000),
+            answer=asyncio.get_running_loop().create_future(),
+            request_key=ask.request_key,
+        )
+        self._waits[hold.id] = wait
+        if ask.request_key is not None:
+            # Two held calls may share a place (no session, one id): a cancel names both.
+            self._requests.setdefault(ask.request_key, set()).add(hold.id)
+        if hold.wait == "pending" and hold.client is not None and not self._keep(hold, wait):
+            # F.2: the store has no room for this client's pending record, so nobody is asked;
+            # the ref stays used (E19), as when the chain refuses it below.
+            self._holds.withdraw(self._clock(), lambda h: h.id == hold.id, "busy")
+            busy = Refused(429, "the result store has no room for this client", code="held_busy")
+            self._deliver(hold.id, busy)
+            raise busy
+        try:
+            await chain.write(
+                "asked",
+                ref,
+                critical=True,
+                client=ask.client or UNREPORTED_CLIENT,
+                server=ask.server,
+                tool=ask.tool,
+                where="vault",
+                era=ask.era,
+                args=hold.args_digest,
+                pin=ask.pin or NO_PIN,
+                text=chain.text_digest(text.value),
+                chars=len(text.value),
+                writes=ask.writes,
+                expires=int(deadline_wall * 1000),
+            )
+        except ChainUnavailable as exc:
+            # Nothing reached the chain or a surface; the ref stays used (E19).
+            self._holds.withdraw(self._clock(), lambda h: h.id == hold.id, "ledger")
+            self._deliver(hold.id, Refused(503, "no chain", code="held_ledger_down"))
+            raise Refused(
+                503, "the vault's approval chain can't be written", code="held_ledger_down"
+            ) from exc
+        log.update(ref=ref, held=hold.wait)
+        logs.event(
+            "approval_held",
+            ref=ref,
+            route=ask.route,
+            server=ask.server,
+            tool=ask.tool,
+            surfaces=sorted(hold.surfaces),
+            wait=hold.wait,
+        )
+        departure = Departure(request.receive)
+        try:
+            shown = await self._hub.show(hold) if self._holds.get(hold.id) is not None else []
+            live = self._holds.get(hold.id)
+            # Refused only when every surface said it can't show it; one that failed may still
+            # deliver it (G.3), so the hold waits on, to its deadline.
+            refusals = [each for each in shown if isinstance(each, NotShown)]
+            if shown and len(refusals) == len(shown) and live is not None and live.state == "held":
+                refusal = refusals[0]
+                for gone in self._holds.withdraw(
+                    self._clock(), lambda h: h.id == hold.id, "not_shown"
+                ):
+                    self._spawn(self._ended(gone))
+                raise Refused(refusal.status, "no approver could show it", code=refusal.code)
+            return await self._wait_hold(hold.id, wait, departure, log)
+        finally:
+            departure.close()
+
+    async def _wait_hold(
+        self, hold_id: str, wait: _Wait, departure: Departure, log: dict[str, Any]
+    ) -> Response:
+        """B.6: the first of a decision, the block's end, an ending, and the caller leaving."""
+        watching = True
+        while True:
+            wait.changed.clear()
+            hold = self._holds.get(hold_id)
+            if hold is None or hold.state != "held":
+                break
+            now = self._clock()
+            if now >= hold.block_until:
+                self._block_over(hold, wait, now)
+                continue
+            changed = asyncio.ensure_future(wait.changed.wait())
+            waits: set[asyncio.Future[Any]] = {changed}
+            if watching:
+                waits.add(departure.gone)
+            try:
+                await asyncio.wait(
+                    waits, timeout=hold.block_until - now, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                changed.cancel()
+            if watching and departure.gone.done():
+                watching = False
+                log["disconnected"] = True
+                if wait.modern:
+                    self._caller_left(hold_id)
+                    raise CallerGone("headers")
+                wait.left = True  # at the earlier eras a disconnect is not a cancel (B.6)
+        if wait.left:
+            self._caller_left(hold_id)
+            raise CallerGone("relay")
+        if not wait.answer.done():
+            either: set[asyncio.Future[Any]] = {wait.answer, departure.gone}
+            await asyncio.wait(either, return_when=asyncio.FIRST_COMPLETED)
+        if not wait.answer.done():
+            # Left after the approval: the forward finishes, and its answer is kept (FM-13).
+            log["disconnected"] = True
+            self._caller_left(hold_id)
+            raise CallerGone("relay")
+        answer = wait.answer.result()
+        if isinstance(answer, Refused):
+            raise answer
+        return answer
+
+    def _block_over(self, hold: Hold, wait: _Wait, now: float) -> None:
+        """The block ended undecided (B.6): a ``wait=pending`` hold detaches and answers
+        ``approval_pending`` (its pending record opened before it was asked); any other
+        expires."""
+        if hold.wait != "pending" or hold.client is None:
+            self._sweep(now)
+            return
+        self._holds.detach(now, hold.id)
+        logs.event("approval_detached", ref=hold.ref, reason="block_over")
+        if wait.left:
+            raise CallerGone("headers")
+        raise Refused(
+            409,
+            "the held call waits for its approval",
+            code="approval_pending",
+            extra={"ref": hold.ref, "deadline": _iso_ms(wait.deadline_ms)},
+        )
+
+    def _caller_left(self, hold_id: str) -> None:
+        """The caller is gone (B.6): an undecided hold is withdrawn (``stream_lost``); an approved
+        one detaches, and its answer goes to the result store."""
+        hold, wait = self._holds.get(hold_id), self._waits.get(hold_id)
+        if hold is None or wait is None:
+            return
+        gone = self._holds.caller_gone(self._clock(), hold_id)
+        if gone is not None:
+            self._spawn(self._ended(gone))
+            return
+        detached = self._holds.get(hold_id)
+        if detached is not None and detached.detached:
+            self._keep(detached, wait)
+
+    def _keep(self, hold: Hold, wait: _Wait) -> bool:
+        """Open the result store's record of ``hold`` (F.2), moved on to its state: a
+        ``wait=pending`` hold's before it is asked (so a full store refuses it ``busy`` before
+        anyone sees it), or a blocking one's whose caller left after the approval. Only a client
+        the gateway reported can collect it."""
+        if hold.client is None:
+            return False
+        if self._results.knows(hold.ref):
+            return True
+        call = PendingCall(
+            ref=hold.ref,
+            client=hold.client,
+            server=hold.server,
+            tool=hold.tool,
+            holder="vault",
+            args_digest=hold.args_digest,
+            text_sha256=hold.text_sha256,
+            surfaces=frozenset(hold.surfaces),
+            asked_ms=wait.asked_ms,
+            deadline_ms=wait.deadline_ms,
+            status="pending",
+        )
+        opened = self._results.open(_wall_ms(), call)
+        if isinstance(opened, Full):
+            return False
+        for evicted in opened:
+            logs.event("approval_result_evicted", ref=evicted.ref, reason=evicted.reason)
+        if hold.state in ("approved", "forwarding"):
+            self._advance(hold.ref, "approved")
+        if hold.state == "forwarding":
+            self._advance(hold.ref, "forwarding")
+        return True
+
+    def _advance(
+        self,
+        ref: str,
+        status: Literal["approved", "forwarding", "done", "denied", "expired", "withdrawn"],
+        outcome: str | None = None,
+        result: StoredResult | None = None,
+    ) -> None:
+        for evicted in self._results.advance(_wall_ms(), ref, status, outcome, result):
+            logs.event("approval_result_evicted", ref=evicted.ref, reason=evicted.reason)
+
+    async def _decided(self, hold: Hold) -> None:
+        """An approved hold (B.4, B.8): ``decided accept`` fsynced first, then the forward in the
+        committed registry, its outcome on the chain, and its answer to the waiting request or
+        the result store. A forward whose ``decided`` can't be written is not sent (J.1)."""
+        wait, chain = self._waits.get(hold.id), self._chain
+        try:
+            if wait is None or chain is None:  # pragma: no cover - a hold begins with both
+                return
+            try:
+                await chain.write(
+                    "decided",
+                    hold.ref,
+                    critical=True,
+                    decision="accept",
+                    waited_ms=_waited(hold),
+                    via=hold.via or "none",
+                )
+            except ChainUnavailable:
+                await self._ended(self._holds.unrecorded(self._clock(), hold.id))
+                return
+            logs.event(
+                "approval_decided",
+                ref=hold.ref,
+                decision="accept",
+                via=hold.via or "none",
+                waited_ms=_waited(hold),
+            )
+            self._holds.forwarding(hold.id)
+            self._advance(hold.ref, "approved")
+            self._advance(hold.ref, "forwarding")
+            self._spawn(self._hub.approved(hold))
+        finally:
+            # No await from here to the registry's entry, so the stop's drain sees it there.
+            self._approving.pop(hold.id, None)
+            entered, self._entered = self._entered, asyncio.Event()
+            entered.set()
+        forward = wait.forward
+        try:
+            done = await self._commits.run(hold.ref, wait.seconds, lambda: forward(hold))
+        except Exception as exc:  # a forward that fails still ends its hold
+            logs.event(
+                "approval_forward_failed",
+                ref=hold.ref,
+                error_type=type(exc).__name__,
+                level="error",
+            )
+            refused = Refused(502, "the held call's forward didn't finish")
+            done = _Done(refused, "unknown", None, 0, 0, _refusal_result(refused))
+        await chain.write(
+            "outcome",
+            hold.ref,
+            critical=False,
+            outcome=done.outcome,
+            detail=done.detail,
+            writes_sent=done.writes_sent,
+            writes_unknown=done.writes_unknown,
+        )
+        logs.event("approval_forwarded", ref=hold.ref, outcome=done.outcome)
+        # One synchronous section: the caller is still waiting for this answer, or it left. A
+        # pending record of a caller that got the answer itself keeps the outcome alone.
+        current = self._holds.get(hold.id) or hold
+        self._holds.done(self._clock(), hold.id, done.outcome)
+        self._advance(hold.ref, "done", done.outcome, done.stored if current.detached else None)
+        self._deliver(hold.id, done.response)
+        await self._hub.close(replace(current, state="done", detail=done.outcome), "done")
+
+    async def _ended(self, hold: Hold) -> None:
+        """A hold that ended unforwarded (B.5, J.1): its decision and ``outcome not_sent`` on the
+        chain, its pending record moved on, its surfaces closed and its request answered."""
+        try:
+            detail = hold.detail
+            if hold.state == "denied":
+                decision, said = "decline", None
+            elif hold.state == "expired":
+                decision, said = "timeout", None
+            else:
+                decision, said = _ENDED_DECISIONS.get(detail or "", ("withdrawn", None))
+            chain = self._chain
+            if chain is not None:
+                if detail != "ledger":  # else its decided accept is what couldn't be written
+                    await chain.write(
+                        "decided",
+                        hold.ref,
+                        critical=False,
+                        decision=decision,
+                        waited_ms=_waited(hold),
+                        via=hold.via or "none",
+                    )
+                await chain.write(
+                    "outcome",
+                    hold.ref,
+                    critical=False,
+                    outcome="not_sent",
+                    detail="ledger" if detail == "ledger" else said,
+                    writes_sent=0,
+                    writes_unknown=0,
+                )
+            if hold.state == "withdrawn":
+                logs.event("approval_withdrawn", ref=hold.ref, reason=detail or "withdrawn")
+            else:
+                logs.event(
+                    "approval_decided",
+                    ref=hold.ref,
+                    decision=decision,
+                    via=hold.via or "none",
+                    waited_ms=_waited(hold),
+                )
+            if hold.state in ("denied", "expired", "withdrawn"):
+                self._advance(hold.ref, hold.state)
+        finally:
+            code = _ENDED_CODES.get(hold.state, "approval_withdrawn")
+            self._deliver(hold.id, Refused(409, f"the held call ended {hold.state}", code=code))
+        await self._hub.close(hold, hold.state)
+
+    def _deliver(self, hold_id: str, answer: Response | Refused) -> None:
+        """Hand ``answer`` to the request waiting for hold ``hold_id``, if one still is, and
+        forget the hold's place."""
+        wait = self._waits.pop(hold_id, None)
+        if wait is None:
+            return
+        key = wait.request_key
+        place = None if key is None else self._requests.get(key)
+        if key is not None and place is not None:
+            place.discard(hold_id)  # only its own: another hold may share the place
+            if not place:
+                del self._requests[key]
+        if not wait.answer.done():
+            wait.answer.set_result(answer)
+        wait.changed.set()
+
+    def _mcp_forward(
+        self,
+        route: Route,
+        call: envelope.Envelope,
+        incoming: list[tuple[str, str]],
+        rest: NormalizedPath,
+    ) -> Forward:
+        """The forward of an approved held ``tools/call`` (B.3, B.8): ``call.canonical()``, with
+        only the headers E16 admitted and the credential added now, read to its end."""
+
+        async def forward(hold: Hold) -> _Done:
+            log: dict[str, Any] = {}
+            seconds = self._call_timeout(hold.server)
+            try:
+                authorized = await self._authorize(route, incoming, rest, [], (None, None), log)
+            except Refused as unauthorized:
+                return _failed(unauthorized, "not_sent")
+            body = call.canonical()
+            timeout = httpx.Timeout(seconds, connect=CONNECT_TIMEOUT)
+            try:
+                async with asyncio.timeout(seconds):
+                    upstream = await self._send(
+                        "POST",
+                        authorized.url,
+                        authorized.headers,
+                        body,
+                        route,
+                        None,
+                        timeout=timeout,
+                    )
+                    variants = await self._held_401(route, authorized, upstream, body, log)
+                    if 300 <= upstream.status_code <= 399:
+                        # Following it could take the gateway to another route (M3 design G14).
+                        await upstream.aclose()
+                        return _failed(Refused(502, "redirect refused"), "upstream_error")
+                    answer = await read_answer(upstream, variants, call.id)
+            except Refused as unsent:
+                return _failed(unsent, "not_sent" if _not_sent(unsent) else "unknown")
+            except (httpx.HTTPError, TimeoutError) as exc:
+                failed = Refused(502, f"upstream response failed: {type(exc).__name__}")
+                return _failed(failed, "unknown")
+            if answer.too_large:
+                stored = StoredResult(answer.status, answer.content_type, lost="too_large")
+                too_large = Refused(502, "the answer was over 4 MiB", code="held_result_too_large")
+                return _Done(too_large, answer.outcome, None, 0, 0, stored)
+            stored = StoredResult(answer.status, answer.content_type, answer.body)
+            response = Response(answer.body, status_code=answer.status)
+            response.raw_headers = [
+                *_raw(list(answer.headers)),
+                (b"content-length", str(len(answer.body)).encode()),
+                *_approved(hold.ref),
+            ]
+            return _Done(response, answer.outcome, None, 0, 0, stored)
+
+        return forward
+
+    async def _held_401(
+        self,
+        route: Route,
+        authorized: _Authorized,
+        upstream: httpx.Response,
+        body: bytes,
+        log: dict[str, Any],
+    ) -> list[bytes]:
+        """An OAuth route's 401 or 403 to a held call, noted as today's are (D.10); a POST is
+        never sent again, so only the next call gets a new token."""
+        grant, cred = authorized.grant, authorized.cred
+        if grant is None or route.credential is None or not isinstance(cred, OAuth2Credential):
+            return authorized.variants
+        if upstream.status_code in (401, 403):
+            self._note_challenge(route.credential, cred, upstream)
+        if upstream.status_code != 401:
+            return authorized.variants
+        _, variants = await self._after_401(
+            upstream,
+            route=route,
+            credential=route.credential,
+            grant=grant,
+            method="POST",
+            url=authorized.url,
+            headers=authorized.headers,
+            body=body,
+            variants=authorized.variants,
+            departure=None,
+            log=log,
+        )
+        return variants
+
+    def _mail_forward(
+        self,
+        name: str,
+        connector: SMTPConnector,
+        key: str | None,
+        content_type: str | None,
+        body: bytes,
+    ) -> Forward:
+        """The send of an approved held write (B.7): ``SmtpConnectors.send`` exactly as today
+        (journal, limits, ``paused``), whose journal shares the ref through the key."""
+
+        async def forward(hold: Hold) -> _Done:
+            answer = await self._connectors.send(
+                name,
+                connector,
+                key=key,
+                content_type=content_type,
+                body=body,
+                proxy=self._egress_proxy,  # the startup one, as every HTTP client's (D-61)
+                credentials=lambda: self._connector_credentials(connector),
+            )
+            outcome, detail, sent, unknown = _send_outcome(answer)
+            response = _connector_response(answer, {})
+            for header, value in _approved(hold.ref):
+                response.headers.append(header.decode(), value.decode())
+            stored = StoredResult(
+                answer.status, "application/json", json.dumps(answer.body).encode()
+            )
+            return _Done(response, outcome, detail, sent, unknown, stored)
+
+        return forward
+
+    async def _read_held_body(self, request: Request) -> bytes:
+        """A held call's body, within :data:`.envelope.MAX_HELD_BODY` (B.1 step 5: 413
+        ``held_too_large``)."""
+        most = envelope.MAX_HELD_BODY
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > most:
+            raise _unread("too_large")
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > most:
+                raise _unread("too_large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _spawn(self, work: Coroutine[Any, Any, None]) -> None:
+        """Run ``work`` (a hold's decision or ending) in a task of its own, kept until it ends."""
+        task = asyncio.ensure_future(work)
+        self._finishing.add(task)
+        task.add_done_callback(self._finished)
+
+    def _finished(self, task: asyncio.Task[None]) -> None:
+        self._finishing.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logs.event("approval_hold_failed", error_type=type(error).__name__, level="error")
+
+    def _wake(self, hold_id: str) -> None:
+        wait = self._waits.get(hold_id)
+        if wait is not None:
+            wait.changed.set()
+
+    def _sweep(self, now: float) -> int:
+        expired = self._holds.sweep(now)
+        for hold in expired:
+            self._spawn(self._ended(hold))
+        self._results.sweep(_wall_ms())
+        return len(expired)
+
+    def _saturation(self, now: float) -> None:
+        """A cap refused a hold: at most once per window, the surfaces are told (D.3)."""
+        count = self._holds.notice(now)
+        if count is not None:
+            logs.event("approvals_saturated", refused=count, level="error")
+            self._spawn(self._hub.notice(count))
+
+    def _ref_used(self, ref: str) -> bool:
+        """E19: ``ref`` is in the hold table (live or a recent ending), the result store, or the
+        chain's open refs (T-10)."""
+        chain = self._chain
+        return (
+            self._holds.knows(ref)
+            or self._results.knows(ref)
+            or (chain is not None and ref in chain.open)
+        )
+
+    def _mint_ref(self) -> str:
+        """A ref for a call with no marker (B.3): 8 random bytes, hex, never one in use."""
+        while True:
+            ref = secrets.token_hex(8)
+            if not self._ref_used(ref):
+                return ref
+
+    def _servers(self) -> Mapping[str, Any]:
+        gateway = self._policy.gateway
+        return {} if gateway is None else gateway.servers
+
+    def _call_timeout(self, server: str) -> float:
+        """A held server's (or writer's) effective call_timeout, from the vault's policy (I.1)."""
+        found = self._servers().get(server)
+        own = None if found is None else found.call_timeout
+        return float(own or self._limits().call_timeout)
+
+    def _budget(self, client: str | None) -> int:
+        """B.3: the gateway-wide ``budget_chars``, lowered by the reported client's own."""
+        gateway = self._policy.gateway
+        approvals = Approvals() if gateway is None else gateway.approvals
+        known = None if gateway is None or client is None else gateway.clients.get(client)
+        own = None if known is None or known.approvals is None else known.approvals.budget_chars
+        return min(approvals.budget_chars, own or approvals.budget_chars)
+
+    def _still_held(self, hold: Hold, old: HeldMap, new: HeldMap, policy: Policy) -> bool:
+        """Z7: the same server on the same path still holds the tool at the same pin (a connector:
+        the same writers), an enabled surface still shows it, and a reported client the policy has
+        is still ``attended`` or ``out_of_band``."""
+        wait = self._waits.get(hold.id)
+        if wait is None:
+            return False
+        before, after = old.get(wait.key[0]), new.get(wait.key[0])
+        if isinstance(before, HeldConnector) and hold.tool not in before.names:
+            # A send with no toolkit tool named: held while the connector's writers are.
+            if not isinstance(after, HeldConnector) or before.writers != after.writers:
+                return False
+        elif not same_hold(old, new, wait.key, hold.tool):
+            return False
+        if not hold.surfaces & _surfaces(policy):
+            return False
+        gateway = policy.gateway
+        client = (
+            None if gateway is None or hold.client is None else gateway.clients.get(hold.client)
+        )
+        if client is not None:
+            own = client.approvals
+            return own is not None and (own.attended or own.out_of_band)
+        return True
+
     async def _connector(
         self, request: Request, name: str, rest: NormalizedPath, log: dict[str, Any]
     ) -> Response:
@@ -1618,7 +2872,7 @@ class VaultApp:
         headers: list[tuple[str, str]],
         body: bytes,
         variants: list[bytes],
-        departure: Departure,
+        departure: Departure | None,
         log: dict[str, Any],
     ) -> tuple[httpx.Response, list[bytes]]:
         """The upstream refused the access token (design D.10).
@@ -1680,15 +2934,19 @@ class VaultApp:
         headers: list[tuple[str, str]],
         body: bytes,
         route: Route,
-        departure: Departure,
+        departure: Departure | None,
+        *,
+        timeout: httpx.Timeout | None = None,
     ) -> httpx.Response:
         """Send the request upstream. Returns once the status line and headers arrived, or
-        raises :class:`CallerGone` (and closes the request) if the caller leaves first.
+        raises :class:`CallerGone` (and closes the request) if the caller leaves first. With no
+        ``departure`` (a held call's committed forward, M8 design B.8) nobody is watched.
 
         A local MCP route of the running policy goes on the local client, a ``unix:`` one on its
         bridge's socket client, chosen by the bridge's name, and every other route on the
         ordinary client (M7 design B.2)."""
-        timeout = httpx.Timeout(None if route.stream else READ_TIMEOUT, connect=CONNECT_TIMEOUT)
+        if timeout is None:
+            timeout = httpx.Timeout(None if route.stream else READ_TIMEOUT, connect=CONNECT_TIMEOUT)
         local = route.name in self._local_routes
         client = self._local_client if local else self._client
         if route.upstream is not None and route.upstream.startswith(fields.UNIX_PREFIX):
@@ -1707,6 +2965,8 @@ class VaultApp:
             client = without_cookies(found)
         outgoing = client.build_request(method, url, headers=headers, content=body, timeout=timeout)
         try:
+            if departure is None:
+                return await client.send(outgoing, stream=True)
             return await departure.race(client.send(outgoing, stream=True), phase="headers")
         except netclient.SocketRefused as exc:
             # Nothing was written: the socket's listener isn't the uid the launcher gave it.

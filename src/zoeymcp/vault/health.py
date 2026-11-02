@@ -165,6 +165,8 @@ STALE_SECONDS: Final = 300
 STATUS_STALE: Final = 180
 # A finding names at most this many tools, then says how many more.
 NAMED_MAX: Final = 10
+# The vault hold's saturation window (holds.SATURATION_WINDOW), in minutes.
+SATURATION_MINUTES: Final = 10
 # The entries an onboarding stores before its fragment is committed: a confidential client's
 # secret (M7 design D.7) and a public client's ID (D.8), each named after the credential.
 ONBOARDING_SUFFIXES: Final = ("-client-secret", "-client-id")
@@ -239,6 +241,9 @@ class Inputs:
     # The policy store's state (M6 design M.5), or None without a store: the report then has no
     # policy section (vault/managed.py).
     policy_state: PolicyState | None = None
+    # The vault hold (M8 design K.1), or None while the policy holds nothing: the report then has
+    # no approvals section.
+    approvals: HoldState | None = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +280,17 @@ class PolicyState:
     witness_behind: int | None = None
     witness_other: int | None = None
     acknowledge: str = "zoeymcp policy acknowledge-restore"
+
+
+@dataclass(frozen=True)
+class HoldState:
+    """The vault hold, summed up for health (M8 design K.1): never a text, an argument or a
+    ref."""
+
+    # Whether the vault's approval chain takes a new hold (J.1's writable(), G-10).
+    chain_writable: bool
+    # Holds a cap refused in the saturation window (D.3, holds.SATURATION_WINDOW).
+    saturated: int = 0
 
 
 @dataclass(frozen=True)
@@ -347,6 +363,9 @@ def assess(inputs: Inputs) -> dict[str, Any]:
     if inputs.gateway_status is not None and policy.gateway is not None:
         report["gateway"] = _gateway(policy, inputs.gateway_status, inputs.policy_state)
         sections.append(report["gateway"])
+    if inputs.approvals is not None:
+        report["approvals"] = _approvals(inputs.approvals)
+        sections.append(report["approvals"])
     summary = {
         level: sum(f["level"] == level for s in sections for f in s["findings"]) for level in LEVELS
     }
@@ -847,6 +866,33 @@ def _ledger_copy(copy: LedgerCopy) -> dict[str, Any]:
         "head_seq": copy.head_seq,
         "reported_ago": copy.reported_ago,
         "broken_at": copy.broken_at,
+        "level": _level(findings),
+        "findings": findings,
+    }
+
+
+# --- the vault hold (M8 design K.1) -------------------------------------------------------------
+
+
+def _approvals(state: HoldState) -> dict[str, Any]:
+    """The vault hold: a chain that can't be written refuses every new hold (no chain, no hold,
+    G-10), until an append succeeds; and holds the queue's caps refused lately (D.3)."""
+    findings: list[Finding] = []
+    if not state.chain_writable:
+        text = "the vault can't write its approval chain; held calls are refused: check the volume"
+        findings.append(
+            _finding("vault_ledger_unavailable", "error", text, {"kind": "check_volume"})
+        )
+    if state.saturated:
+        text = (
+            f"{state.saturated} held call(s) refused in the last {SATURATION_MINUTES} min: a "
+            "caller is flooding the approval queue; if you didn't expect this many, check the "
+            "gateway"
+        )
+        findings.append(_finding("approvals_saturated", "error", text, {"kind": "check_gateway"}))
+    return {
+        "chain_writable": state.chain_writable,
+        "saturated": state.saturated,
         "level": _level(findings),
         "findings": findings,
     }
