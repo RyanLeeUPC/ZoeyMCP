@@ -37,14 +37,13 @@ app binds to :meth:`.outofband.OutOfBandClient.withdraw`. Every answer ends with
 from __future__ import annotations
 
 import hashlib
-import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Final, Literal
 
 import anyio
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult
 
 from ..common import canonical, ledgerformat
 from ..common.approvaltext import Plan
@@ -62,6 +61,7 @@ from .approve import (
     begin_refusal,
     ticking,
 )
+from .approvers import pending_answer as pending_answer
 from .approvers import with_ref
 from .ledger import LedgerUnavailable
 from .sanitize import map_upstream
@@ -480,21 +480,7 @@ async def _abandoned(
     await _finish(approvals, record, "unknown", None, settings.cooldown, "withdrawn")
 
 
-# --- the pending answer (F.1) -------------------------------------------------------------------
-
-
-def pending_answer(ref: str, tool: str, until: float, out: ViewOutOfBand) -> CallToolResult:
-    """The pending answer (F.1): an error result with no ``structuredContent``, which says it is
-    not a failure, so the agent collects the call instead of calling again."""
-    when = datetime.fromtimestamp(until, UTC).strftime("%Y-%m-%d %H:%M")
-    minutes = max(1, math.ceil(out.result_ttl / 60))
-    text = (
-        f"pending {ref}: waiting for the operator's approval until {when} UTC. It runs as soon "
-        f"as it is approved, whether or not you check. Do not call {tool} again; call "
-        f'check_approval with {{"id": "{ref}"}} to get the result; it is kept for {minutes} '
-        "minutes after the call runs and given once. This is not a failure."
-    )
-    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
+# --- the pending answer's deadline (F.1; the answer is :func:`.approvers.pending_answer`) -------
 
 
 def _deadline(stated: str | None, fallback: float) -> float:

@@ -409,6 +409,9 @@ class GatewayApp:
         self.checker = checkapproval.Checker(self.approvals, approvals_http, self._definition)
         self.out_of_band = OutOfBandClient(self.approvals, approvals_http)
         self.approvals.tell_withdrawn = self.out_of_band.withdraw
+        # The relay (M8 design E.4): its ask, and its withdraw when the gateway gives one up.
+        self.approvals.relays.ask_vault = self.out_of_band.ask
+        self.approvals.relays.tell_withdrawn = self.out_of_band.withdraw
         self.manager: StreamableHTTPSessionManager | None = None
         self.security: TransportSecuritySettings | None = None
         self._started_limits: tuple[int, int] | None = None

@@ -4,11 +4,13 @@ allowlists: its key there alone, never on the gateway's link (G.2, G.3, X21), (M
 the gateway's status path, one report at a time and at most one accepted per 5 s (K.1, T-12,
 FM-19), (M8 step 11) the collect path and its body (E.2, F.5, Q46), and (M8 step 12a) the
 decisions poll's query, the withdraw's and the detach's bodies, the epoch rule and the endings
-the poll answers (E.2, G-15, G-16, OPS-3)."""
+the poll answers (E.2, G-15, G-16, OPS-3), and (M8 step 12b) the ask's body and the relay
+decisions the poll answers beside the endings (E.2, E.4; G-23)."""
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 from typing import Any
 
 import pytest
@@ -18,6 +20,7 @@ from zoeymcp.common.policy.match import NormalizedPath, RequestRejected
 from zoeymcp.vault import app, internal
 from zoeymcp.vault.internal import (
     ALLOWLISTS,
+    ASK,
     COLLECT,
     DECISIONS,
     DETACH,
@@ -28,6 +31,7 @@ from zoeymcp.vault.internal import (
     STATUS,
     VIEW,
     WITHDRAW,
+    Ask,
     Collect,
     Detach,
     Ended,
@@ -35,11 +39,13 @@ from zoeymcp.vault.internal import (
     Epochs,
     Feed,
     Refusal,
+    Relayed,
     StatusGate,
     Withdraw,
     _egress_path,
     _path,
     allowlist_wait,
+    ask_body,
     collect_body,
     decide,
     decisions_query,
@@ -64,6 +70,7 @@ GATEWAY_ENDPOINTS = (
     DECISIONS,
     WITHDRAW,
     DETACH,
+    ASK,
 )
 
 
@@ -77,7 +84,7 @@ def path(text: str) -> NormalizedPath:
 def test_the_table_is_g1s() -> None:
     """Path, methods, identity, body cap and waiters, as G.1 lists them, M6 K.1's status path
     after the gateway's other rows, M8 E.2's collect after it and then its other paths (step
-    12a), the egress row last (step 17b)."""
+    12a), the ask after them (step 12b), the egress row last (step 17b)."""
     rows = [
         (e.path.text, e.methods, e.identity, e.body_cap, e.waiters, e.name, e.label)
         for e in ENDPOINTS
@@ -157,6 +164,15 @@ def test_the_table_is_g1s() -> None:
             "the detach path",
         ),
         (
+            "/_zoeymcp/gateway/v1/approvals/ask",
+            ("POST",),
+            "gateway",
+            96 * 1024,
+            None,
+            "approvals_ask",
+            "the ask path",
+        ),
+        (
             "/_zoeymcp/egress/v1/allowlists",
             ("GET",),
             "egress",
@@ -174,6 +190,7 @@ def test_the_table_is_g1s() -> None:
     assert DECISIONS.waiters == internal.DECISIONS_WAITERS == 1
     assert WITHDRAW.body_cap == internal.WITHDRAW_MAX_BYTES == 1024
     assert DETACH.body_cap == internal.DETACH_MAX_BYTES == 16 * 1024
+    assert ASK.body_cap == internal.ASK_MAX_BYTES == 96 * 1024
     assert (*GATEWAY_ENDPOINTS, ALLOWLISTS) == ENDPOINTS
 
 
@@ -240,7 +257,7 @@ def test_each_path_finds_its_row(endpoint: Endpoint) -> None:
         "/_zoeymcp/gateway/v1/approvals/Collect",
         "/_zoeymcp/gateway/v1/collect",
         "/_zoeymcp/gateway/v1/approvals/collect/x",
-        "/_zoeymcp/gateway/v1/approvals/ask",
+        "/_zoeymcp/gateway/v1/approvals/Ask",
         "/_zoeymcp/gateway/v1/approvals/decision",
         "/_zoeymcp/gateway/v1/approvals/Withdraw",
         "/_zoeymcp/gateway/v1/approvals/detach/x",
@@ -921,3 +938,180 @@ def test_an_ending_cannot_be_changed() -> None:
     ended: Any = Feed().add(EPOCH, REF, "done", "ok")
     with pytest.raises(dataclasses.FrozenInstanceError):
         ended.seq = 2
+
+
+# --- the ask's body (M8 design E.2, E.4) ----------------------------------------------------------
+
+TEXT = "Approval request 0123456789abcdef\nTool: shop \u2192 cancel_order"
+DIGEST_OF_TEXT = hashlib.sha256(TEXT.encode()).hexdigest()
+ASKED: dict[str, Any] = {
+    "v": 1,
+    "epoch": EPOCH,
+    "ref": REF,
+    "client": "agent1",
+    "server": "shop",
+    "tool": "cancel_order",
+    "text": TEXT,
+    "text_sha256": DIGEST_OF_TEXT,
+    "deadline_ms": 1_800_000_000_000,
+    "wait": "pending",
+}
+
+
+def test_an_ask_names_the_call_its_text_and_its_wait() -> None:
+    assert ask_body(ASKED) == Ask(
+        EPOCH,
+        REF,
+        "agent1",
+        "shop",
+        "cancel_order",
+        TEXT,
+        DIGEST_OF_TEXT,
+        1_800_000_000_000,
+        "pending",
+    )
+    blocking = ask_body({**ASKED, "wait": "block"})
+    assert blocking.wait == "block"
+    assert blocking.text == TEXT
+
+
+def test_an_ask_hides_its_text() -> None:
+    asked = ask_body(ASKED)
+    assert repr(asked) == f"Ask(ref={REF}, tool=cancel_order)"
+    assert TEXT not in repr(asked)
+
+
+def test_an_asks_tool_is_the_policys_tool_name() -> None:
+    longest = "T." * 64
+    assert ask_body({**ASKED, "tool": longest}).tool == longest
+    assert ask_body({**ASKED, "tool": "a"}).tool == "a"
+
+
+def test_an_asks_deadline_is_a_positive_safe_integer() -> None:
+    assert ask_body({**ASKED, "deadline_ms": 1}).deadline_ms == 1
+    assert ask_body({**ASKED, "deadline_ms": 2**53 - 1}).deadline_ms == 2**53 - 1
+
+
+@pytest.mark.parametrize(
+    ("document", "reason"),
+    [
+        ([ASKED], "an ask is a JSON object"),
+        (None, "an ask is a JSON object"),
+        (
+            {**ASKED, "extra": 1},
+            "an ask names v, epoch, ref, client, server, tool, text, text_sha256, deadline_ms "
+            "and wait",
+        ),
+        (
+            {key: value for key, value in ASKED.items() if key != "wait"},
+            "an ask names v, epoch, ref, client, server, tool, text, text_sha256, deadline_ms "
+            "and wait",
+        ),
+        ({**ASKED, "v": 2}, "an ask's v is 1"),
+        ({**ASKED, "v": True}, "an ask's v is 1"),
+        ({**ASKED, "v": "1"}, "an ask's v is 1"),
+        ({**ASKED, "v": 1.0}, "an ask's v is 1"),
+        ({**ASKED, "epoch": "0123456789AB"}, "an ask's epoch isn't of its form"),
+        ({**ASKED, "ref": "0123456789abcde"}, "an ask's ref isn't of its form"),
+        ({**ASKED, "client": "Agent1"}, "an ask's client isn't of its form"),
+        ({**ASKED, "server": ""}, "an ask's server isn't of its form"),
+        ({**ASKED, "tool": "cancel order"}, "an ask's tool isn't of its form"),
+        ({**ASKED, "tool": "t" * 129}, "an ask's tool isn't of its form"),
+        ({**ASKED, "tool": ""}, "an ask's tool isn't of its form"),
+        (
+            {**ASKED, "text_sha256": DIGEST_OF_TEXT.upper()},
+            "an ask's text_sha256 isn't of its form",
+        ),
+        ({**ASKED, "text_sha256": DIGEST_OF_TEXT[:63]}, "an ask's text_sha256 isn't of its form"),
+        ({**ASKED, "text_sha256": None}, "an ask's text_sha256 isn't of its form"),
+        (
+            {**ASKED, "text": "", "text_sha256": hashlib.sha256(b"").hexdigest()},
+            "an ask's text isn't of its form",
+        ),
+        ({**ASKED, "text": ["x"]}, "an ask's text isn't of its form"),
+        ({**ASKED, "text": "\ud800"}, "an ask's text isn't of its form"),
+        ({**ASKED, "text": TEXT + " "}, "an ask's text_sha256 isn't its text's"),
+        ({**ASKED, "deadline_ms": 0}, "an ask's deadline_ms isn't of its form"),
+        ({**ASKED, "deadline_ms": -1}, "an ask's deadline_ms isn't of its form"),
+        ({**ASKED, "deadline_ms": 2**53}, "an ask's deadline_ms isn't of its form"),
+        ({**ASKED, "deadline_ms": 1.5}, "an ask's deadline_ms isn't of its form"),
+        ({**ASKED, "deadline_ms": True}, "an ask's deadline_ms isn't of its form"),
+        ({**ASKED, "deadline_ms": "1"}, "an ask's deadline_ms isn't of its form"),
+        ({**ASKED, "wait": "Pending"}, "an ask's wait is block or pending"),
+        ({**ASKED, "wait": ""}, "an ask's wait is block or pending"),
+        ({**ASKED, "wait": ["block"]}, "an ask's wait is block or pending"),
+    ],
+    ids=[
+        "array",
+        "null",
+        "extra",
+        "no-wait",
+        "v-two",
+        "v-true",
+        "v-string",
+        "v-float",
+        "epoch",
+        "ref",
+        "client",
+        "server",
+        "tool-space",
+        "tool-long",
+        "tool-empty",
+        "digest-upper",
+        "digest-short",
+        "digest-null",
+        "text-empty",
+        "text-list",
+        "text-surrogate",
+        "digest-other",
+        "deadline-zero",
+        "deadline-negative",
+        "deadline-unsafe",
+        "deadline-float",
+        "deadline-true",
+        "deadline-string",
+        "wait-case",
+        "wait-empty",
+        "wait-list",
+    ],
+)
+def test_an_ask_refuses_what_it_cant_read(document: object, reason: str) -> None:
+    with pytest.raises(RequestRejected) as caught:
+        ask_body(document)
+    assert caught.value.reason == reason
+
+
+# --- the relay decisions the poll answers (E.2, G-23) ---------------------------------------------
+
+
+def test_a_relays_decision_is_numbered_with_the_endings() -> None:
+    feed = Feed()
+    ended = feed.add(EPOCH, REF, "done", "ok")
+    relayed = feed.relay(EPOCH, "fedcba9876543210", "accept", "portal", 1234, "e" * 64)
+    assert (ended.seq, relayed.seq, feed.last) == (1, 2, 2)
+    assert relayed == Relayed(2, EPOCH, "fedcba9876543210", "accept", "portal", 1234, "e" * 64)
+    assert relayed.wire() == {
+        "seq": 2,
+        "ref": "fedcba9876543210",
+        "decision": "accept",
+        "via": "portal",
+        "decided_ms": 1234,
+        "text_sha256": "e" * 64,
+    }
+    assert feed.since(EPOCH, 0) == [ended, relayed]
+    assert feed.since(EPOCH, 1) == [relayed]
+    assert feed.since(LATER, 0) == []  # another gateway's relays aren't its own
+
+
+def test_the_feed_keeps_relays_with_the_endings() -> None:
+    feed = Feed(kept=2)
+    feed.add(EPOCH, REF, "done", "ok")
+    feed.relay(EPOCH, "fedcba9876543210", "decline", "telegram", 1, "e" * 64)
+    feed.relay(EPOCH, "fedcba9876543211", "timeout", "none", 2, "f" * 64)
+    assert [item.seq for item in feed.since(EPOCH, 0)] == [2, 3]
+
+
+def test_a_relays_decision_cannot_be_changed() -> None:
+    relayed: Any = Feed().relay(EPOCH, REF, "withdrawn", "none", 0, "e" * 64)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        relayed.decision = "accept"

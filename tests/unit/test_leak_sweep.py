@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
@@ -1463,6 +1464,98 @@ async def test_a_held_call_leaks_nothing(tmp_path: Path) -> None:
         assert sent_headers["authorization"] == f"Bearer {hold_rig.SECRET}"
     [mail] = rig.mail
     assert mail["password"] == hold_rig.MAIL_PASSWORD
+
+
+async def test_a_relay_leaks_nothing(tmp_path: Path) -> None:
+    """The relay's new secret-bearing path (M8 step 12b; O.6): the ask carries the gateway's
+    rendered prompt, its argument values with it, which the vault shows on its surfaces alone.
+    Its answers, the decisions poll, a withdraw, every refusal (a text broken or imitating the
+    relay line, a ref used again, a call it doesn't relay), the chain, health and every log line
+    hold neither the values nor the text."""
+    argument = "relay-argument-sentinel-6d2e"
+    rig = hold_rig.HoldRig(tmp_path, {"out_of_band": True}, link="asgi")
+    health = HealthReader(rig.store, lambda: rig.app.policy, chain=rig.chain)
+    buffer = io.StringIO()
+    answers: list[str] = []
+    texts: list[str] = []
+    ask_path = "/_zoeymcp/gateway/v1/approvals/ask"
+    json_type = {"content-type": "application/json"}
+
+    async def ask(ref: str, text: str, **more: Any) -> None:
+        texts.append(text)
+        body = {
+            "v": 1,
+            "epoch": hold_rig.EPOCH,
+            "ref": ref,
+            "client": "agent1",
+            "server": "shop",
+            "tool": "cancel_order",
+            "text": text,
+            "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "deadline_ms": 1_900_000_000_000,
+            "wait": "pending",
+            **more,
+        }
+        response = await http.post(
+            ask_path, content=canonical.dumps_canonical(body), headers=json_type
+        )
+        answers.append(response.text + repr(response.headers.multi_items()))
+
+    def prompt(ref: str, extra: str = "") -> str:
+        return (
+            f"Approval request {ref}\nClient: agent1\nTool: shop -> cancel_order\n\n"
+            f'{{\n  "order": "{argument}"\n}}{extra}\nEnd of approval request {ref}'
+        )
+
+    logs.set_stream(buffer)
+    try:
+        async with rig.running() as http:
+            with anyio.fail_after(30):
+                await ask("00000000000000a1", prompt("00000000000000a1"))
+                [hold] = await rig.surface.holds(1)
+                assert argument in hold.text.value  # the surface's, alone (Z14)
+                await rig.decide(hold)
+                await ask("00000000000000a1", prompt("00000000000000a1"))  # used once
+                await ask(
+                    "00000000000000a2", prompt("00000000000000a2", "\nRendered by the gateway")
+                )
+                await ask("00000000000000a3", prompt("00000000000000a3", "\u200b"))
+                await ask("00000000000000a4", prompt("00000000000000a4"), tool="place_order")
+                await ask("00000000000000a5", prompt("00000000000000a5"))
+                withdrawn = await http.post(
+                    "/_zoeymcp/gateway/v1/approvals/withdraw",
+                    content=canonical.dumps_canonical(
+                        {
+                            "epoch": hold_rig.EPOCH,
+                            "ref": "00000000000000a5",
+                            "client": "agent1",
+                            "reason": "caller_cancelled",
+                        }
+                    ),
+                    headers=json_type,
+                )
+                answers.append(withdrawn.text)
+                await rig.settled()
+                polled = await http.get(
+                    "/_zoeymcp/gateway/v1/approvals/decisions",
+                    params={"epoch": hold_rig.EPOCH, "after": "0"},
+                )
+                answers.append(polled.text)
+                assert [r["decision"] for r in polled.json()["relays"]] == ["accept", "withdrawn"]
+                answers.append(json.dumps(health.report()))
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    assert '"event":"approval_relayed"' in text
+    files = b"".join(
+        path.read_bytes() for path in (rig.state / CHAIN_DIR).iterdir() if path.is_file()
+    )
+    for value in (argument, *texts):
+        assert value not in text
+        assert value.encode() not in files
+        for seen in answers:
+            assert value not in seen
+    assert rig.upstream.received == []  # the vault forwards no relay
 
 
 async def callback(world: World, url: str, binder: str | None) -> httpx.Response:

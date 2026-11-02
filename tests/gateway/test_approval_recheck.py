@@ -23,6 +23,10 @@ stream, and a modern one is answered by a retry carrying the prompt's handle.
 
 Each move is the managed write's own candidate, ``change.apply(..., managed=True)``, served to the
 running vault as a reload serves it: the gateway sees only the new view, whichever write made it.
+
+- (M8 step 12b; G-24, E-6) A **relay** of an ``out_of_band`` client survives a view change that
+  doesn't touch it: the rewritten rule asks a relayed record for ``out_of_band``, not
+  ``attended``, so the operator's approval still runs the call, once.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from mcp.types import CallToolResult
 from tests.fakes.agent import ACCEPT, DECLINE, Script, Version, agent
 from tests.fakes.mcp_server import McpFake
 from tests.gateway.rig import (
+    CLIENTS,
     RELOAD_PATH,
     SERVER,
     Deployed,
@@ -59,6 +64,7 @@ from tests.gateway.test_approvals_remote import (
     ref_of,
     text,
 )
+from tests.gateway.test_elsewhere import call_in, holding
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.change import MoveToAllow, PolicyChange, SetServerReview, apply
 from zoeymcp.common.policy.schema import RemoteServer, Tools
@@ -325,4 +331,42 @@ async def test_approve_to_allow_while_waiting_withdraws_the_prompt(
     assert upstream == [
         *([("slow", {"steps": 1})] if answer == "accept" else []),
         ("echo", {"text": "hi"}),
+    ]
+
+
+async def test_a_relay_survives_an_unrelated_view_change(tmp_path: Path) -> None:
+    """G-24, E-6: agent1 is ``out_of_band`` and not attended; while its relayed ``echo`` waits,
+    a change moves ``add`` to ``allow``. The gateway applies the new view and keeps the relay
+    (the old rule withdrew any record of a client that isn't attended), the vault keeps it too,
+    and the operator's approval runs the call once."""
+    options: dict[str, Any] = {
+        "vault_approval": [],
+        "approvals": {CLIENTS[0]: {"attended": False, "out_of_band": True}},
+    }
+    with anyio.fail_after(BOUND), holding(tmp_path, **options) as rig:
+        app = rig.running.app
+        async with agent(rig.running.mcp(), headers=headers()) as client:
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "kept"}))
+                [hold] = await rig.surface.holds(1)
+                await anyio.to_thread.run_sync(lambda: rig.deployed.reload(approve=["echo"]))
+
+                def applied() -> bool:
+                    snapshot = app.approvals.fresh()
+                    return snapshot is not None and snapshot.view.gateway.servers[
+                        SERVER
+                    ].tools.approve == ["echo"]
+
+                await until(applied)
+                assert app.approvals.table.get(hold.ref) is not None
+                await rig.decide(hold)
+            await rig.settled()
+    [result] = answer
+    assert not result.is_error, text(result)
+    assert text(result).endswith("kept")
+    assert [c.arguments for c in rig.deployed.fake.calls] == [{"text": "kept"}]
+    assert rig.ledger(hold.ref) == [
+        ("asked", "gateway"),
+        ("decided", "accept"),
+        ("outcome", ("ok", None)),
     ]

@@ -14,6 +14,7 @@ it is for, its body cap and how many of its long polls may wait.
 | ``/_zoeymcp/gateway/v1/approvals/decisions`` | GET | gateway | 0 | 1 |
 | ``/_zoeymcp/gateway/v1/approvals/withdraw`` | POST | gateway | 1 KiB | - |
 | ``/_zoeymcp/gateway/v1/approvals/detach`` | POST | gateway | 16 KiB | - |
+| ``/_zoeymcp/gateway/v1/approvals/ask`` | POST | gateway | 96 KiB | - |
 | ``/_zoeymcp/egress/v1/allowlists`` | GET | egress | 0 | 2 |
 
 Anything else under ``/_zoeymcp/`` is 404. :func:`decide` takes the identity the listener and the
@@ -38,10 +39,17 @@ abandoned a call, :func:`detach_body` its stop's list of blocking calls to answe
 carries the gateway process's epoch, and :class:`Epochs` keeps the epoch rule (G-15): the first
 request with a new one makes it the current gateway's, so the vault withdraws what only an
 earlier gateway could have used.
+
+A gateway-held prompt goes out of band through the ask (E.2, E.4; Q6 (B)): :func:`ask_body` reads
+the gateway's rendered text, its digest (recomputed here, and refused unless it matches) and the
+call it is for, and the vault relays the text to its approvers below its own relay line (E.5).
+The decisions poll answers each relay's decision beside the held calls' endings, in one
+numbering (:class:`Feed`), so the gateway that asked forwards the call, or doesn't.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -50,6 +58,7 @@ from typing import Any, Final, Literal
 from pydantic import TypeAdapter, ValidationError
 
 from ..common import ledgerreport
+from ..common.logs import refuse_type
 from ..common.policy.match import NormalizedPath, RequestRejected
 from ..common.policy.schema import NAME_PATTERN
 from ..common.policy.view import Digest
@@ -97,6 +106,16 @@ DECISIONS_WAITERS: Final = 1
 ENDINGS_KEPT: Final = 1024
 EPOCHS_KEPT: Final = 64
 _SEQ: Final = re.compile(r"[0-9]{1,18}")
+# The ask (E.2): its body cap (a text within the largest budget, with its JSON escapes), the
+# policy's tool names, a text's SHA-256 (64 lowercase hex), and the latest deadline (the largest
+# integer JSON carries exactly).
+ASK_MAX_BYTES: Final = 96 * 1024
+_TOOL: Final = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_SHA256: Final = re.compile(r"[0-9a-f]{64}")
+_SAFE_INTEGER: Final = 2**53 - 1
+_ASK_KEYS: Final = frozenset(
+    {"v", "epoch", "ref", "client", "server", "tool", "text", "text_sha256", "deadline_ms", "wait"}
+)
 
 _DIGEST: Final[TypeAdapter[str]] = TypeAdapter(Digest)
 # How a refusal names who an endpoint is for.
@@ -211,6 +230,15 @@ DETACH: Final = Endpoint(
     DETACH_MAX_BYTES,
     None,
 )
+ASK: Final = Endpoint(
+    "approvals_ask",
+    "the ask path",
+    _path("approvals", "ask"),
+    ("POST",),
+    "gateway",
+    ASK_MAX_BYTES,
+    None,
+)
 ALLOWLISTS: Final = Endpoint(
     "egress_allowlists",
     "the allowlist path",
@@ -230,6 +258,7 @@ ENDPOINTS: Final = (
     DECISIONS,
     WITHDRAW,
     DETACH,
+    ASK,
     ALLOWLISTS,
 )
 
@@ -365,9 +394,9 @@ def collect_body(document: object) -> Collect:
 
 def _form(kind: str, key: str, value: object, form: re.Pattern[str]) -> str:
     """``value``, a string of ``form``; else :class:`RequestRejected`, naming ``kind``'s
-    ``key``."""
+    ``key`` (``kind`` with its article: "a withdraw")."""
     if not isinstance(value, str) or form.fullmatch(value) is None:
-        raise RequestRejected(f"a {kind}'s {key} isn't of its form")
+        raise RequestRejected(f"{kind}'s {key} isn't of its form")
     return value
 
 
@@ -390,9 +419,9 @@ def withdraw_body(document: object) -> Withdraw:
         raise RequestRejected("a withdraw is a JSON object")
     if set(document) != {"epoch", "ref", "client", "reason"}:
         raise RequestRejected("a withdraw names epoch, ref, client and reason")
-    epoch = _form("withdraw", "epoch", document["epoch"], _EPOCH)
-    ref = _form("withdraw", "ref", document["ref"], _REF)
-    client = _form("withdraw", "client", document["client"], _NAME)
+    epoch = _form("a withdraw", "epoch", document["epoch"], _EPOCH)
+    ref = _form("a withdraw", "ref", document["ref"], _REF)
+    client = _form("a withdraw", "client", document["client"], _NAME)
     reason = document["reason"]
     if not isinstance(reason, str) or reason not in WITHDRAW_REASONS:
         raise RequestRejected("a withdraw's reason is caller_cancelled")
@@ -416,7 +445,7 @@ def detach_body(document: object) -> Detach:
         raise RequestRejected("a detach is a JSON object")
     if set(document) != {"epoch", "calls"}:
         raise RequestRejected("a detach names epoch and calls")
-    epoch = _form("detach", "epoch", document["epoch"], _EPOCH)
+    epoch = _form("a detach", "epoch", document["epoch"], _EPOCH)
     listed = document["calls"]
     if not isinstance(listed, list) or not 1 <= len(listed) <= DETACH_MAX_CALLS:
         raise RequestRejected(f"a detach names 1 to {DETACH_MAX_CALLS} calls")
@@ -424,11 +453,75 @@ def detach_body(document: object) -> Detach:
     for call in listed:
         if not isinstance(call, dict) or set(call) != {"ref", "client"}:
             raise RequestRejected("a detach's call names ref and client")
-        ref = _form("detach", "ref", call["ref"], _REF)
-        calls.append((ref, _form("detach", "client", call["client"], _NAME)))
+        ref = _form("a detach", "ref", call["ref"], _REF)
+        calls.append((ref, _form("a detach", "client", call["client"], _NAME)))
     if len({ref for ref, _ in calls}) != len(calls):
         raise RequestRejected("a detach names each call once")
     return Detach(epoch, tuple(calls))
+
+
+@dataclass(frozen=True, repr=False)
+class Ask:
+    """An ask's request (E.2): the gateway's rendered prompt ``text`` for the call ``ref`` that
+    ``client`` made to ``server``'s ``tool``, the gateway's own deadline for it (wall
+    milliseconds) and the wait it keeps. Logging it raises: it holds the text."""
+
+    epoch: str
+    ref: str
+    client: str
+    server: str
+    tool: str
+    text: str
+    text_sha256: str
+    deadline_ms: int
+    wait: Literal["block", "pending"]
+
+    def __repr__(self) -> str:
+        return f"Ask(ref={self.ref}, tool={self.tool})"
+
+
+refuse_type(Ask)
+
+
+def ask_body(document: object) -> Ask:
+    """An ask's strict-JSON body: an object of exactly ``v`` (1), ``epoch``, ``ref``, ``client``,
+    ``server``, ``tool``, ``text``, ``text_sha256``, ``deadline_ms`` and ``wait``, each of its
+    form, the text not empty and its SHA-256 (of its UTF-8) the one named: the vault recomputes
+    it. Raises :class:`RequestRejected`."""
+    if not isinstance(document, dict):
+        raise RequestRejected("an ask is a JSON object")
+    if set(document) != _ASK_KEYS:
+        raise RequestRejected(
+            "an ask names v, epoch, ref, client, server, tool, text, text_sha256, deadline_ms "
+            "and wait"
+        )
+    version = document["v"]
+    if type(version) is not int or version != 1:
+        raise RequestRejected("an ask's v is 1")
+    epoch = _form("an ask", "epoch", document["epoch"], _EPOCH)
+    ref = _form("an ask", "ref", document["ref"], _REF)
+    client = _form("an ask", "client", document["client"], _NAME)
+    server = _form("an ask", "server", document["server"], _NAME)
+    tool = _form("an ask", "tool", document["tool"], _TOOL)
+    digest = _form("an ask", "text_sha256", document["text_sha256"], _SHA256)
+    text = document["text"]
+    if not isinstance(text, str) or not text:
+        raise RequestRejected("an ask's text isn't of its form")
+    try:
+        encoded = text.encode()
+    except UnicodeEncodeError as exc:  # a lone surrogate: no UTF-8, so no digest to compare
+        raise RequestRejected("an ask's text isn't of its form") from exc
+    if hashlib.sha256(encoded).hexdigest() != digest:
+        raise RequestRejected("an ask's text_sha256 isn't its text's")
+    deadline = document["deadline_ms"]
+    if type(deadline) is not int or not 0 < deadline <= _SAFE_INTEGER:
+        raise RequestRejected("an ask's deadline_ms isn't of its form")
+    wait = document["wait"]
+    if wait == "block":
+        return Ask(epoch, ref, client, server, tool, text, digest, deadline, "block")
+    if wait == "pending":
+        return Ask(epoch, ref, client, server, tool, text, digest, deadline, "pending")
+    raise RequestRejected("an ask's wait is block or pending")
 
 
 def decisions_query(params: list[tuple[str, str]]) -> tuple[str, int, int]:
@@ -471,6 +564,9 @@ class Epochs:
 
 
 EndedStatus = Literal["done", "denied", "expired", "withdrawn"]
+# A relay's decision, in the words of the gateway's ledger (E.2): approved, denied, nobody
+# answered by its deadline, or withdrawn (a change, a stop, the gateway's own withdraw).
+RelayDecision = Literal["accept", "decline", "timeout", "withdrawn"]
 
 
 @dataclass(frozen=True)
@@ -488,13 +584,39 @@ class Ended:
         return {"seq": self.seq, "ref": self.ref, "status": self.status, "outcome": self.outcome}
 
 
+@dataclass(frozen=True)
+class Relayed:
+    """A relay's decision, as a decisions poll answers it (E.2): never its text, only the digest
+    of the text the surface decided on, which the gateway checks is the one it asked with
+    (G-23). ``epoch`` is the gateway epoch its ask carried, ``decided_ms`` the wall time."""
+
+    seq: int
+    epoch: str
+    ref: str
+    decision: RelayDecision
+    via: str
+    decided_ms: int
+    text_sha256: str
+
+    def wire(self) -> dict[str, Any]:
+        return {
+            "seq": self.seq,
+            "ref": self.ref,
+            "decision": self.decision,
+            "via": self.via,
+            "decided_ms": self.decided_ms,
+            "text_sha256": self.text_sha256,
+        }
+
+
 class Feed:
-    """The endings a decisions poll answers (E.2, OPS-3), numbered from 1 in the order they came;
-    the last :data:`ENDINGS_KEPT` are kept. :attr:`last` is the latest ``seq``."""
+    """The endings and the relay decisions a decisions poll answers (E.2, OPS-3), numbered
+    together from 1 in the order they came; the last :data:`ENDINGS_KEPT` are kept.
+    :attr:`last` is the latest ``seq``."""
 
     def __init__(self, kept: int = ENDINGS_KEPT) -> None:
         self.last = 0
-        self._endings: deque[Ended] = deque(maxlen=kept)
+        self._endings: deque[Ended | Relayed] = deque(maxlen=kept)
 
     def add(self, epoch: str, ref: str, status: EndedStatus, outcome: str) -> Ended:
         self.last += 1
@@ -502,6 +624,21 @@ class Feed:
         self._endings.append(ended)
         return ended
 
-    def since(self, epoch: str, after: int) -> list[Ended]:
-        """The endings kept after seq ``after`` of the calls whose marker carried ``epoch``."""
+    def relay(
+        self,
+        epoch: str,
+        ref: str,
+        decision: RelayDecision,
+        via: str,
+        decided_ms: int,
+        text_sha256: str,
+    ) -> Relayed:
+        self.last += 1
+        relayed = Relayed(self.last, epoch, ref, decision, via, decided_ms, text_sha256)
+        self._endings.append(relayed)
+        return relayed
+
+    def since(self, epoch: str, after: int) -> list[Ended | Relayed]:
+        """What is kept after seq ``after`` for the gateway of ``epoch``: the endings of the calls
+        its markers named, and the decisions on the relays it asked."""
         return [ended for ended in self._endings if ended.seq > after and ended.epoch == epoch]

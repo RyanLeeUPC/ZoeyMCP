@@ -268,6 +268,13 @@ _HELD_KEY = re.compile(r"([0-9a-f]{16})\.([0-9]{1,6})")
 # name is "-", and no definition hashes to all zeros).
 UNREPORTED_CLIENT: Final = "-"
 NO_PIN: Final = "sha256:" + "0" * 64
+# A relay has no route the vault forwards on: its caps count it on a place of its server's own
+# (D.3), which no route's name can be (a route's name has no colon).
+RELAY_ROUTE: Final = "relay:"
+# A relay's decision, as the gateway's ledger names it, for the hold states that end one (E.2).
+_RELAY_DECISIONS: Final[Mapping[str, internal.RelayDecision]] = MappingProxyType(
+    {"denied": "decline", "expired": "timeout", "withdrawn": "withdrawn"}
+)
 # How a hold that ended unforwarded is recorded (J.1): its state and detail to the decision and
 # the outcome's detail, and the refusal its waiting request gets (M.2).
 _ENDED_DECISIONS: Final[Mapping[str, tuple[str, str | None]]] = MappingProxyType(
@@ -600,6 +607,21 @@ def _surfaces(policy: Policy) -> frozenset[Literal["telegram", "portal"]]:
     if approvers is not None and approvers.portal is not None:
         found.add("portal")
     return frozenset(found)
+
+
+def _relayable(policy: Policy, client: str | None, server: str, tool: str) -> bool:
+    """Whether ``policy`` has the gateway hold ``tool`` of ``server`` (in its ``approve`` list
+    and not ``vault_approval``) for ``client``, which it assigns the server and lets raise
+    out-of-band prompts, with a surface to ask on (E.1, Z11): the calls a relay is for (Z7)."""
+    gateway = policy.gateway
+    if gateway is None or client is None or not _surfaces(policy):
+        return False
+    known, served = gateway.clients.get(client), gateway.servers.get(server)
+    if known is None or served is None or server not in known.servers:
+        return False
+    if known.approvals is None or not known.approvals.out_of_band:
+        return False
+    return tool in served.tools.approve and tool not in served.tools.vault_approval
 
 
 def _request_key(
@@ -1471,6 +1493,8 @@ class VaultApp:
             return await self._withdraw(request, log)
         if decided is internal.DETACH:
             return await self._detach(request, log)
+        if decided is internal.ASK:
+            return await self._ask(request, log)
         return await self._view_answer(request, log)
 
     def _egress_key_presented(self, request: Request) -> bool:
@@ -1858,9 +1882,9 @@ class VaultApp:
         if previous is not None:
             logs.event("gateway_epoch_changed", withdrawn=len(gone))
 
-    def _endings_for(self, epoch: str, after: int) -> list[internal.Ended]:
-        """The endings a decisions poll of ``epoch`` gets after ``after``: none for a gateway
-        whose epoch isn't the current one."""
+    def _endings_for(self, epoch: str, after: int) -> list[internal.Ended | internal.Relayed]:
+        """The endings and relay decisions a decisions poll of ``epoch`` gets after ``after``:
+        none for a gateway whose epoch isn't the current one."""
         return self._feed.since(epoch, after) if self._epochs.current == epoch else []
 
     def _feed_ending(self, hold: Hold, status: internal.EndedStatus, outcome: str) -> None:
@@ -1872,6 +1896,16 @@ class VaultApp:
         if hold.wait != "pending":
             return
         self._feed.add(hold.epoch, hold.ref, status, outcome)
+        self._wake_decisions()
+
+    def _feed_relay(self, hold: Hold, decision: internal.RelayDecision) -> None:
+        """A relay's decision, for the decisions poll of the gateway that asked it (E.2), with the
+        digest of the text decided on (G-23): the gateway forwards an approved one itself."""
+        if hold.kind != "relay" or hold.epoch is None:
+            return
+        self._feed.relay(
+            hold.epoch, hold.ref, decision, hold.via or "none", _wall_ms(), hold.text_sha256
+        )
         self._wake_decisions()
 
     def _wake_decisions(self) -> None:
@@ -1887,9 +1921,11 @@ class VaultApp:
         """``GET /_zoeymcp/gateway/v1/approvals/decisions?epoch=<e>&after=<seq>&wait=N`` (E.2,
         X12): the endings of held calls whose marker carried the gateway's current epoch, after
         seq ``after``, as ``{"seq", "ref", "status", "outcome"}`` (never a result, which stays for
-        collect), once there are any, or none after N seconds (at most 25), at shutdown, or when
-        the caller leaves; with the vault's own ``epoch``, one per start, so the gateway knows a
-        restarted vault. The poll's epoch is seen first (the epoch rule). One poll waits at a
+        collect), and the decisions on the relays it asked, as ``{"seq", "ref", "decision",
+        "via", "decided_ms", "text_sha256"}`` (never a text), numbered together, once there are
+        any, or none after N seconds (at most 25), at shutdown, or when the caller leaves; with
+        the vault's own ``epoch``, one per start, so the gateway knows a restarted vault, whose
+        relays are gone. The poll's epoch is seen first (the epoch rule). One poll waits at a
         time (429); a stopping vault answers a new one 503 ``stopping``, so the gateway backs
         off rather than poll again at once for as long as the vault drains."""
         try:
@@ -1925,10 +1961,12 @@ class VaultApp:
             self._decision_waiters -= 1
             # On a task that has already failed, cancel() also marks its error as retrieved.
             gone.cancel()
-        endings = [ended.wire() for ended in self._endings_for(epoch, after)]
-        log["endings"] = len(endings)
+        found = self._endings_for(epoch, after)
+        endings = [ended.wire() for ended in found if isinstance(ended, internal.Ended)]
+        relays = [relayed.wire() for relayed in found if isinstance(relayed, internal.Relayed)]
+        log["endings"], log["relays"] = len(endings), len(relays)
         return JSONResponse(
-            {"v": 1, "epoch": self._vault_epoch, "endings": endings},
+            {"v": 1, "epoch": self._vault_epoch, "endings": endings, "relays": relays},
             headers={"cache-control": "no-store"},
         )
 
@@ -1993,6 +2031,121 @@ class VaultApp:
             detached.append(ref)
         log["detached"] = len(detached)
         return JSONResponse({"v": 1, "detached": detached}, headers={"cache-control": "no-store"})
+
+    async def _ask(self, request: Request, log: dict[str, Any]) -> Response:
+        """``POST /_zoeymcp/gateway/v1/approvals/ask`` (E.2, E.4; Q6 (B)): the gateway relays a
+        prompt it holds itself to the operator's approvers. Read as a collect is, within 96 KiB
+        (:func:`.internal.ask_body`, whose digest of the text must be the one named: 400
+        ``invalid``). The body's epoch is seen first (the epoch rule), and an earlier gateway's
+        is refused (409 ``view_stale``: no poll would get its decision, E.2). Then, in order: a
+        stopping vault refuses (503 ``stopping``); no chain, no relay (503 ``held_ledger_down``,
+        Z19); a ref is used once (409 ``held_ref_reused``, E19); the call must be one the vault's
+        policy has the gateway hold, for a client it lets raise out-of-band prompts (409
+        ``view_stale``: else the change would withdraw it at once, Z7); the text is checked again
+        (plain, the budget) and a line imitating the relay line refused (422 ``text_refused``,
+        E.5); the caps (D.3). The vault composes its relay line above the gateway's text (Z12),
+        writes ``asked`` (``where: gateway``) to its chain and shows the whole on its surfaces.
+        201 answers the approval's id and the digest of the text as composed, which is what a
+        surface decides on; the decision comes back through the decisions poll. The vault never
+        sees the call's arguments, and forwards nothing."""
+        document = await _approvals_body(request, internal.ASK_MAX_BYTES, "ask", "96 KiB")
+        try:
+            asked = internal.ask_body(document)
+        except RequestRejected as exc:
+            raise Refused(400, exc.reason, code="invalid") from exc
+        self._gateway_epoch(asked.epoch)
+        if self._epochs.current != asked.epoch:
+            # An earlier gateway's: its relays were withdrawn, and no poll would get its decision.
+            raise Refused(409, "the ask is from an earlier gateway", code="view_stale")
+        if self._view_stopping:
+            raise Refused(503, "the vault is stopping", code="stopping")
+        chain = self._chain
+        if chain is None or not chain.writable():
+            raise Refused(
+                503, "the vault's approval chain can't be written", code="held_ledger_down"
+            )
+        ref = log["ref"] = asked.ref
+        now, wall = self._clock(), time.time()
+        self._sweep(now)
+        if self._ref_used(ref):
+            raise Refused(409, "the ref was used before", code="held_ref_reused")
+        if not _relayable(self._policy, asked.client, asked.server, asked.tool):
+            raise Refused(409, "the vault's policy doesn't relay this call", code="view_stale")
+        received = approvaltext.received(asked.text)
+        budget = self._budget(asked.client)
+        if approvaltext.problems(received, budget=budget, renders="plain"):
+            raise Refused(422, "the relayed text broke a text rule", code="text_refused")
+        text = approvaltext.relayed(received)
+        digest = hashlib.sha256(text.value.encode("utf-8")).hexdigest()
+        begun = self._holds.begin(
+            now,
+            HoldRequest(
+                ref=ref,
+                kind="relay",
+                epoch=asked.epoch,
+                legacy_session=False,
+                route=RELAY_ROUTE + asked.server,
+                server=asked.server,
+                tool=asked.tool,
+                client=asked.client,
+                args_digest=chain.digest(None),  # the vault never sees a relay's arguments
+                text=text,
+                text_sha256=digest,
+                surfaces=_surfaces(self._policy),
+                wait=asked.wait,
+                held_bytes=len(text.value.encode("utf-8")),
+            ),
+        )
+        if isinstance(begun, CapRefusal):
+            self._saturation(now)
+            retry = begun.seconds_left or None
+            raise Refused(begun.status, f"held: {begun.reason}", code=begun.code, retry_after=retry)
+        hold = begun
+        deadline_wall = wall + (hold.deadline - now)
+        try:
+            await chain.write(
+                "asked",
+                ref,
+                critical=True,
+                client=asked.client,
+                server=asked.server,
+                tool=asked.tool,
+                where="gateway",
+                era="modern",  # the ask names no era: the gateway's own chain has the call's
+                args=hold.args_digest,
+                pin=NO_PIN,
+                text=chain.text_digest(text.value),
+                chars=len(text.value),
+                writes=0,
+                expires=int(deadline_wall * 1000),
+            )
+        except ChainUnavailable as exc:
+            # Nothing reached the chain or a surface; the ref stays used (E19).
+            self._holds.withdraw(self._clock(), lambda h: h.id == hold.id, "ledger")
+            raise Refused(
+                503, "the vault's approval chain can't be written", code="held_ledger_down"
+            ) from exc
+        log["held"] = "relay"
+        logs.event(
+            "approval_relayed",
+            ref=ref,
+            server=asked.server,
+            tool=asked.tool,
+            surfaces=sorted(hold.surfaces),
+            wait=hold.wait,
+        )
+        shown = await self._hub.show(hold) if self._holds.get(hold.id) is not None else []
+        live = self._holds.get(hold.id)
+        refusals = [each for each in shown if isinstance(each, NotShown)]
+        if shown and len(refusals) == len(shown) and live is not None and live.state == "held":
+            for gone in self._holds.withdraw(self._clock(), lambda h: h.id == hold.id, "not_shown"):
+                self._spawn(self._ended(gone))
+            raise Refused(refusals[0].status, "no approver could show it", code=refusals[0].code)
+        return JSONResponse(
+            {"v": 1, "id": hold.id, "text_sha256": digest},
+            status_code=201,
+            headers={"cache-control": "no-store"},
+        )
 
     def _status_refused(self, code: str | None) -> None:
         """``status_refused`` with N.3's reason, at most once a minute."""
@@ -2216,7 +2369,8 @@ class VaultApp:
                 # drain waits for that too (I.2).
                 wait = self._waits.get(hold.id)
                 self._approving[hold.id] = 0.0 if wait is None else wait.seconds
-                self._spawn(self._decided(hold))
+                relay = hold.kind == "relay"
+                self._spawn(self._relay_decided(hold) if relay else self._decided(hold))
             else:
                 self._spawn(self._ended(hold))
             self._wake(hold.id)
@@ -2771,9 +2925,59 @@ class VaultApp:
         self._deliver(hold.id, done.response)
         await self._hub.close(replace(current, state="done", detail=done.outcome), "done")
 
+    async def _relay_decided(self, hold: Hold) -> None:
+        """An approved relay (E.2, J.1): ``decided accept`` fsynced with the surface it came
+        through, then the decision told to the gateway's decisions poll, which forwards the call
+        itself; the vault's outcome is ``unknown``, detail ``relayed`` (the gateway's chain holds
+        the real one). A relay whose ``decided`` can't be written is withdrawn, and the gateway
+        told so: it is never sent."""
+        chain = self._chain
+        try:
+            if chain is None:  # pragma: no cover - a relay begins with a chain
+                return
+            try:
+                await chain.write(
+                    "decided",
+                    hold.ref,
+                    critical=True,
+                    decision="accept",
+                    waited_ms=_waited(hold),
+                    via=hold.via or "none",
+                )
+            except ChainUnavailable:
+                await self._ended(self._holds.unrecorded(self._clock(), hold.id))
+                return
+            logs.event(
+                "approval_decided",
+                ref=hold.ref,
+                decision="accept",
+                via=hold.via or "none",
+                waited_ms=_waited(hold),
+            )
+            self._holds.forwarding(hold.id)
+            self._feed_relay(hold, "accept")
+        finally:
+            # Nothing of a relay's enters the registry: the stop's drain waits for this alone.
+            self._approving.pop(hold.id, None)
+            entered, self._entered = self._entered, asyncio.Event()
+            entered.set()
+        await chain.write(
+            "outcome",
+            hold.ref,
+            critical=False,
+            outcome="unknown",
+            detail="relayed",
+            writes_sent=0,
+            writes_unknown=0,
+        )
+        current = self._holds.get(hold.id) or hold
+        self._holds.done(self._clock(), hold.id, "relayed")
+        await self._hub.close(replace(current, state="done", detail="relayed"), "done")
+
     async def _ended(self, hold: Hold) -> None:
         """A hold that ended unforwarded (B.5, J.1): its decision and ``outcome not_sent`` on the
-        chain, its pending record moved on, its surfaces closed and its request answered."""
+        chain, its pending record moved on, its surfaces closed and its request answered; a
+        relay's decision told to the gateway that asked it."""
         try:
             detail = hold.detail
             if hold.state == "denied":
@@ -2819,6 +3023,7 @@ class VaultApp:
             if hold.state in ("denied", "expired", "withdrawn"):
                 # Fed even when its records couldn't be written: the hold has ended all the same.
                 self._feed_ending(hold, hold.state, "not_sent")
+                self._feed_relay(hold, _RELAY_DECISIONS[hold.state])
             self._deliver(hold.id, Refused(409, f"the held call ended {hold.state}", code=code))
         await self._hub.close(hold, hold.state)
 
@@ -3046,7 +3251,14 @@ class VaultApp:
     def _still_held(self, hold: Hold, old: HeldMap, new: HeldMap, policy: Policy) -> bool:
         """Z7: the same server on the same path still holds the tool at the same pin (a connector:
         the same writers), an enabled surface still shows it, and a reported client the policy has
-        is still ``attended`` or ``out_of_band``."""
+        is still ``attended`` or ``out_of_band``. A relay: an enabled surface still shows it, and
+        the policy still has the gateway hold its tool for its client, ``out_of_band``."""
+        if hold.kind == "relay":
+            # The surface rule, then the call's own: a relay is withdrawn when its client loses
+            # out_of_band, or its tool leaves approve or goes to vault_approval (B.5, Z7).
+            return bool(hold.surfaces & _surfaces(policy)) and _relayable(
+                policy, hold.client, hold.server, hold.tool
+            )
         wait = self._waits.get(hold.id)
         if wait is None:
             return False

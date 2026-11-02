@@ -309,6 +309,8 @@ HELD = {
     "approval_withdrawn": 409,
     "held_result_too_large": 502,
 }
+# M8 step 12b: the relay's ask (E.2; M.2's ``text_refused``); its other codes are the hold's.
+ASK = {"text_refused": 422}
 # The VaultApp methods of the held branch (M8 design B), whose literal codes are all M8's.
 HELD_METHODS = (
     "_handle",
@@ -472,7 +474,7 @@ def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
-    expected |= SOCKET | SAVE | HELD
+    expected |= SOCKET | SAVE | HELD | ASK
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -697,14 +699,15 @@ def test_every_socket_policy_reason_is_catalogued() -> None:
     assert found | shaped | missing <= set(CATALOGUE)
 
 
-def held_codes() -> set[str]:
-    """The literal ``code=`` of every ``Refused`` in the held branch's methods."""
+def held_codes(methods: tuple[str, ...] = HELD_METHODS) -> set[str]:
+    """The literal ``code=`` of every ``Refused`` in the held branch's methods, or in
+    ``methods``."""
     tree = ast.parse(inspect.getsource(vault_app))
     found: set[str] = set()
     for node in ast.walk(tree):
         if not (isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)):
             continue
-        if node.name not in HELD_METHODS:
+        if node.name not in methods:
             continue
         for call in ast.walk(node):
             if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
@@ -732,6 +735,22 @@ def test_every_held_reason_is_catalogued() -> None:
         reason: envelope.Refuse(reason.removeprefix("held_")).status  # type: ignore[arg-type]
         for reason in rules
     }
+
+
+def test_every_ask_reason_is_catalogued() -> None:
+    """M8 step 12b, M.2: the ask answers a body it can't read as every approvals path does
+    (``invalid``, ``too_large``), and otherwise with the hold's codes and its own."""
+    found = held_codes(("_ask",))
+    assert found == {
+        "invalid",
+        "stopping",
+        "held_ledger_down",
+        "held_ref_reused",
+        "view_stale",
+        "text_refused",
+    }
+    assert found - {"invalid"} <= set(HELD) | set(ASK)
+    assert found - {"invalid"} <= set(CATALOGUE)  # invalid: as collect's, withdraw's, detach's
 
 
 def test_the_offline_texts_name_the_vaults_uid() -> None:

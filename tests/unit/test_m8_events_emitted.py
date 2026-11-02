@@ -61,6 +61,12 @@ EVENTS = {
     # failure event for a decisions poll the vault couldn't answer (its reason only).
     "gateway_epoch_changed": "vault",
     "approval_decisions_failed": "gateway",
+    # Step 12b: the relay (K.2): the vault relays a gateway-held prompt (ref, server, tool,
+    # surfaces, wait), the gateway refuses an approval of another text, and the builder's
+    # failure event for an ask the vault couldn't be asked (its error type only).
+    "approval_relayed": "vault",
+    "relay_digest_mismatch": "gateway",
+    "approval_relay_failed": "gateway",
 }
 
 

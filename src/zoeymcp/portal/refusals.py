@@ -719,6 +719,11 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "held_text_refused": Entry(
             422, "The approval text broke a text rule at the place named, so nothing was asked."
         ),
+        "text_refused": Entry(
+            422,
+            "The gateway's approval text broke a text rule, or imitated the vault's relay line, "
+            "so nothing was asked.",
+        ),
         "held_capacity": Entry(429, "The approval queue is full, so nothing was asked."),
         "held_busy": Entry(
             429,

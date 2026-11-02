@@ -1,33 +1,40 @@
 """The rules for a waiting prompt after a policy change (M8 design C.1, O.3
-``test_approvalrules.py``): :func:`still_asked`, moved from ``approve.py``'s ``_still_allowed``,
-:func:`withdraw_picks`, lifted from the closure in ``Approvals.withdraw``, and (step 12a)
-:func:`ending_records`, the records the decisions poller writes for the vault's ending of a held
-call (E.2, D.2).
+``test_approvalrules.py``): :func:`still_asked`, moved from ``approve.py``'s ``_still_allowed``
+and (step 12b) rewritten for relays (G-24, E-6): an elicited record keeps the old rule's meaning,
+a relayed one needs its client ``out_of_band`` and an approver, and neither survives its tool
+going to ``vault_approval``; :func:`withdraw_picks`, lifted from the closure in
+``Approvals.withdraw``; and (step 12a) :func:`ending_records`, the records the decisions poller
+writes for the vault's ending of a held call (E.2, D.2).
 ``tests/gateway/test_approval_recheck.py`` pins both through the gateway (M6 Q32 (b)).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
 from zoeymcp.common import ledgerformat
 from zoeymcp.common.policy.schema import Approvals, GatewayLimits
-from zoeymcp.common.policy.view import ViewGateway
+from zoeymcp.common.policy.view import ViewGateway, ViewOutOfBand
 from zoeymcp.gateway.approvalrules import ENDINGS, ending_records, still_asked, withdraw_picks
 from zoeymcp.gateway.approvals import Key, Pending, Settings, Table
 
 PIN = "sha256:" + "1" * 64
 KEY = Key("agent1", "mail", "send")
+OUT_OF_BAND = ViewOutOfBand(timeout=3600, block_seconds=120, result_ttl=3600)
+RELAYED = {"attended": False, "out_of_band": True}
 
 
-def remote(approve: list[str], allow: list[str] | None = None) -> dict[str, Any]:
+def remote(
+    approve: list[str], allow: list[str] | None = None, *, held: list[str] | None = None
+) -> dict[str, Any]:
     allow = allow or []
+    tools = {"include": approve + allow, "allow": allow, "approve": approve}
     return {
         "kind": "remote",
         "vault_path": "/mail/mcp",
-        "tools": {"include": approve + allow, "allow": allow, "approve": approve},
+        "tools": {**tools, **({"vault_approval": held} if held is not None else {})},
         "review": dict.fromkeys(approve + allow, PIN),
         "on_drift": "hide",
         "shared_session": False,
@@ -59,6 +66,7 @@ def gateway(
     assigned: list[str] | None = None,
     approvals: dict[str, Any] | None = None,
     clients: bool = True,
+    out_of_band: bool = True,
 ) -> ViewGateway:
     client = {
         "token_sha256": "sha256:" + "0" * 64,
@@ -71,7 +79,10 @@ def gateway(
             "hosts": ["gateway.example"],
             "origins": [],
             "limits": GatewayLimits().model_dump(),
-            "approvals": Approvals().model_dump(),
+            "approvals": {
+                **Approvals().model_dump(),
+                **({"out_of_band": OUT_OF_BAND.model_dump()} if out_of_band else {}),
+            },
             "clients": {"agent1": client} if clients else {},
             "servers": {"mail": remote(["send"])} if servers is None else servers,
         }
@@ -109,7 +120,7 @@ def record(*, handle: str | None) -> Pending:
     ],
 )
 def test_an_assigned_attended_approve_tool_is_still_asked(servers: dict[str, Any]) -> None:
-    assert still_asked(gateway(servers=servers), KEY)
+    assert still_asked(gateway(servers=servers), KEY, "elicitation")
 
 
 @pytest.mark.parametrize(
@@ -126,18 +137,74 @@ def test_an_assigned_attended_approve_tool_is_still_asked(servers: dict[str, Any
     ],
 )
 def test_a_view_that_no_longer_allows_the_prompt_withdraws_it(view: ViewGateway) -> None:
-    assert not still_asked(view, KEY)
+    assert not still_asked(view, KEY, "elicitation")
 
 
 def test_a_client_without_approvals_is_never_asked() -> None:
-    view = gateway()
-    assert still_asked(view, KEY)
+    view = gateway(approvals={"attended": True, "out_of_band": True})
+    assert still_asked(view, KEY, "elicitation")
+    assert still_asked(view, KEY, "relay")
     unasked = view.model_copy(
         update={
             "clients": {"agent1": view.clients["agent1"].model_copy(update={"approvals": None})}
         }
     )
-    assert not still_asked(unasked, KEY)
+    assert not still_asked(unasked, KEY, "elicitation")
+    assert not still_asked(unasked, KEY, "relay")
+
+
+# --- still_asked for a relay (step 12b; G-24, E-6) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "servers",
+    [
+        pytest.param({"mail": remote(["send"])}, id="remote"),
+        pytest.param({"mail": toolkit(["send"])}, id="toolkit"),
+    ],
+)
+def test_an_out_of_band_clients_relay_is_still_asked(servers: dict[str, Any]) -> None:
+    """E-6: the old rule withdrew every relay of a client that isn't attended at each view
+    change; a relay needs the client ``out_of_band`` instead, and survives such a change."""
+    view = gateway(servers=servers, approvals=RELAYED)
+    assert still_asked(view, KEY, "relay")
+    assert not still_asked(view, KEY, "elicitation")  # nobody watches this client's session
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        pytest.param(gateway(approvals={"attended": True}), id="lost-out-of-band"),
+        pytest.param(gateway(approvals=RELAYED, out_of_band=False), id="approvers-removed"),
+        pytest.param(gateway(approvals=RELAYED, clients=False), id="client-removed"),
+        pytest.param(gateway(approvals=RELAYED, servers={}), id="server-removed"),
+        pytest.param(gateway(approvals=RELAYED, assigned=[]), id="unassigned"),
+        pytest.param(
+            gateway(approvals=RELAYED, servers={"mail": remote([], allow=["send"])}),
+            id="moved-to-allow",
+        ),
+        pytest.param(
+            gateway(approvals=RELAYED, servers={"mail": remote(["other"])}), id="tool-removed"
+        ),
+        pytest.param(
+            gateway(approvals=RELAYED, servers={"mail": remote(["send"], held=["send"])}),
+            id="now-vault-held",
+        ),
+    ],
+)
+def test_a_view_that_no_longer_relays_the_call_withdraws_it(view: ViewGateway) -> None:
+    """G-24: removing a client's ``out_of_band`` (or the approvers it is relayed to) withdraws
+    its relays, as does anything that withdraws an elicited prompt."""
+    assert not still_asked(view, KEY, "relay")
+
+
+def test_a_tool_the_vault_now_holds_is_asked_here_no_more() -> None:
+    """M6 Q32 (b), restated for M8: a tool moved to ``vault_approval`` is the vault's to ask
+    (Z1), so a prompt the gateway asks for it, either way, is withdrawn."""
+    held = {"mail": remote(["send"], held=["send"])}
+    assert not still_asked(gateway(servers=held), KEY, "elicitation")
+    assert not still_asked(gateway(servers=held, approvals=RELAYED), KEY, "relay")
+    assert still_asked(gateway(servers={"mail": remote(["send"], held=[])}), KEY, "elicitation")
 
 
 # --- withdraw_picks -----------------------------------------------------------------------------
@@ -163,9 +230,10 @@ def test_a_matched_record_is_picked_and_says_whether_it_is_mid_retry() -> None:
     assert seen == [waiting, consumed]
 
 
-def test_every_record_is_elicited_until_relays_exist() -> None:
-    """``Pending.how``, which step 12b's ``still_asked`` reads: set at ``begin``, and today always
-    ``elicitation``."""
+@pytest.mark.parametrize("how", ["elicitation", "relay"])
+def test_how_a_record_is_asked_is_set_at_begin(how: Literal["elicitation", "relay"]) -> None:
+    """``Pending.how``, which ``still_asked``'s callers pass: ``elicitation`` unless ``begin``
+    says otherwise (a relay, step 12b)."""
     assert record(handle=None).how == "elicitation"
     table = Table()
     begun = table.begin(
@@ -184,9 +252,10 @@ def test_every_record_is_elicited_until_relays_exist() -> None:
         args_digest="sha256:" + "a" * 64,
         pin=PIN,
         text_sha256="b" * 64,
+        how=how,
     )
     assert isinstance(begun, Pending)
-    assert begun.how == "elicitation"
+    assert begun.how == how
 
 
 # --- ending_records -----------------------------------------------------------------------------

@@ -2712,6 +2712,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `held_ref_reused` | A held call's ref is used once, so nothing was asked. |
 | 409 | `held_second_write` | A held call sends one write, so nothing was asked. |
 | 422 | `held_text_refused` | The approval text broke a text rule at the place named, so nothing was asked. |
+| 422 | `text_refused` | The gateway's approval text broke a text rule, or imitated the vault's relay line, so nothing was asked. |
 | 429 | `held_capacity` | The approval queue is full, so nothing was asked. |
 | 429 | `held_busy` | This client already waits for an approval of this tool, or has no room left for a pending result, so nothing was asked. |
 | 429 | `held_hourly` | This tool was asked too often in the last hour, so nothing was asked. |

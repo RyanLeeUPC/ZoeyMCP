@@ -22,8 +22,12 @@ as soon as it is approved, whoever waits; the agent gets its result here, once.
   poller (:mod:`.outofband`) closed it first. A call the vault ran whose record closed so is
   still known by its client, server, tool and pin (:meth:`.approve.Approvals.ran_call`), so its
   result is checked against the pin it was called under (Z17).
-- **No id** (Q46): the client's own calls on this server, by ref, tool, status and deadline;
-  never a result or a text.
+- **Relays** (M8 step 12b; F.2, F.5 step 2): a call this gateway relayed out of band and that
+  answered pending ran here, so its record and its result are in the gateway's own result store
+  (:attr:`.approve.Approvals.results`), collected there, bound to its client and server the
+  same way, already finished; the vault is never asked for one.
+- **No id** (Q46): the client's own calls on this server, by ref, tool, status and deadline,
+  the vault's and the relayed ones; never a result or a text.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from pydantic import ValidationError
 
 from ..common import canonical, heldresult, ledgerformat
 from ..common.policy.view import ViewGateway, ViewOutOfBand
+from ..common.resultstore import Collected, Status, Unknown
 from . import elsewhere, logs, pipeline
 from .approve import Approvals, Ran
 from .approvers import with_ref
@@ -170,18 +175,28 @@ class Checker:
             log("refused", "arguments")  # the id the agent sent is never logged
             return _text(ARGUMENTS)
         ref = asked
+        results, now = self.approvals.results, int(self.approvals.wall() * 1000)
         if ref is None:
             answer = await self._collect(call, None)
             log("ok" if answer is not None else "upstream_error", "listed")
-            return _listed(answer) if answer is not None else _text(UNREACHABLE)
+            if answer is None:
+                return _text(UNREACHABLE)
+            relayed = [_status(found) for found in results.list_for(now, call.client, call.server)]
+            calls = answer.get("calls")
+            return _listed({"calls": [*(calls if isinstance(calls, list) else []), *relayed]})
         record = self.approvals.table.get(ref)
         ran = self.approvals.ran_call(ref) if record is None else None
         if record is not None and (
             (record.key.client, record.key.server) != (call.client, call.server)
-            or record.how != "elsewhere"
+            or record.how == "elicitation"
         ):
-            log("refused", "unknown")  # another client's, or a prompt this gateway asks itself
+            log("refused", "unknown")  # another client's, or a prompt asked on its own session
             return with_ref(UNKNOWN, ref)
+        if (record is not None and record.how == "relay") or results.knows(ref):
+            # A relayed call (F.5 step 2): its record and result are this gateway's own.
+            result, reason = _relayed(ref, results.collect(now, ref, call.client, call.server))
+            log("tool_error" if result.is_error else "ok", reason)
+            return result
         if ran is not None and (ran.key.client, ran.key.server) != (call.client, call.server):
             log("refused", "unknown")  # another client's call, its record closed
             return with_ref(UNKNOWN, ref)
@@ -345,6 +360,52 @@ class Checker:
             return map_upstream("output_refused", ref)
         exposed = ExposedTool(found_definition, pin)
         return pipeline.finished(raw, call, tool, exposed, ref)
+
+
+def _status(found: Status) -> dict[str, Any]:
+    """A relayed call's status, as the vault's collect lists one of its own (Q46)."""
+    deadline = datetime.fromtimestamp(found.deadline_ms / 1000, UTC).isoformat(timespec="seconds")
+    return {
+        "ref": found.ref,
+        "tool": found.tool,
+        "state": found.status,
+        "deadline": deadline,
+        "collected": found.collected,
+        "lost": found.lost,
+    }
+
+
+def _relayed(ref: str, found: Collected | Status | Unknown) -> tuple[CallToolResult, str]:
+    """The agent's answer for a relayed call, from the gateway's own result store (F.2, F.5
+    step 2), and the log's reason: the result once, already finished as a direct call's when it
+    ran (sanitized, the pinned output schema, wrapped), or what became of the call."""
+    if isinstance(found, Unknown):
+        return with_ref(UNKNOWN, ref), "unknown"
+    if isinstance(found, Collected):
+        try:
+            return CallToolResult.model_validate_json(found.result.body), "collected"
+        except ValidationError:  # the gateway's own bytes: never happens
+            return map_upstream("unsupported_result", ref), "collected"
+    if found.status == "pending":
+        when = _when(_status(found)["deadline"])
+        until = f" until {when} UTC" if when is not None else ""
+        return with_ref(
+            f"still pending: waiting for the operator's approval{until}", ref
+        ), "pending"
+    if found.status in ("approved", "forwarding"):
+        return with_ref(RUNNING, ref), "running"
+    if found.status == "denied":
+        return with_ref(DECLINED, ref), "declined"
+    if found.status == "expired":
+        return with_ref(EXPIRED, ref), "expired"
+    if found.status == "withdrawn":
+        return with_ref("withdrawn: it was withdrawn; nothing was sent", ref), "withdrawn"
+    if found.lost == "too_large":
+        return with_ref(elsewhere.TOO_LARGE, ref), "too_large"
+    if found.lost is not None:
+        return with_ref(NOT_KEPT, ref), "not_kept"
+    # Ran, and given: collected here, or answered to the call itself within its block.
+    return with_ref(COLLECTED, ref), "collected_before"
 
 
 def _listed(answer: Mapping[str, Any]) -> CallToolResult:

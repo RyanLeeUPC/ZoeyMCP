@@ -8,9 +8,10 @@
 4. **Validate** against the pinned schema. The answer names the agent's own key and the
    keyword, never a value.
 5. **Decide** from policy, never annotations (:func:`.routing.decide`): ``allow`` continues;
-   ``approve`` goes to the approval decision point (:mod:`.approve`), which asks the human and
-   runs the accepted call itself; a ``vault_approval`` tool goes to the vault marked
-   (:mod:`.elsewhere`), which holds it and asks the operator's approvers (M8 design C.2); a
+   ``approve`` goes to the approval decision point (:mod:`.approve`), which asks the human (on
+   the agent's session, or for an ``out_of_band`` client relayed to the operator's approvers,
+   M8 design E.4) and runs the accepted call itself; a ``vault_approval`` tool goes to the
+   vault marked (:mod:`.elsewhere`), which holds it and asks the operator's approvers (C.2); a
    call nobody can approve, and anything unclassified, is refused. When the vault says it holds
    the tool no longer (``view_stale``), the view is fetched at once and the call decided once more
    (C.3): asked here if the tool left ``vault_approval``, else refused.
@@ -232,9 +233,12 @@ async def call_tool(
         return await _restale(source, call, name, shaped, exposed, ref, progress, approval, log)
     if isinstance(route, routing.AskElicitation) and approval is not None:
         return await _approve(source, call, name, shaped, exposed, ref, progress, approval, log)
+    if isinstance(route, routing.AskOutOfBand) and approval is not None:
+        return await _approve(
+            source, call, name, shaped, exposed, ref, progress, approval, log, relay=True
+        )
     if not isinstance(route, routing.Allow):
         # The route asks only with an approval context: it names the client, or carries a handle.
-        # A relay (AskOutOfBand) has no transport until M8 step 12b: nobody answers for it yet.
         reason = route.reason if isinstance(route, routing.Refuse) else "no_approvals"
         return _refused_route(reason, call, name, ref, log)
     # 6. Call
@@ -372,11 +376,13 @@ async def _restale(
             gateway=gateway,
             session_sha256=approval.session_sha256,
             disconnected=approval.disconnected,
+            tick=approval.tick,
         )
         route = _route(source, fresh_call, name, exposed, fresh)
-        if isinstance(route, routing.AskElicitation):
+        if isinstance(route, routing.AskElicitation | routing.AskOutOfBand):
+            relay = isinstance(route, routing.AskOutOfBand)
             return await _approve(
-                source, fresh_call, name, shaped, exposed, ref, progress, fresh, log
+                source, fresh_call, name, shaped, exposed, ref, progress, fresh, log, relay=relay
             )
     result = await elsewhere.stale_refused(approval.approvals, ref, call.client, call.server, name)
     log("refused", "view_stale")
@@ -480,9 +486,13 @@ async def _approve(
     progress: Progress | None,
     approval: Approval,
     log: Any,
+    *,
+    relay: bool = False,
 ) -> CallToolResult | mcp_types.InputRequiredResult:
-    """Step 5 for an ``approve`` tool: the approval decision point asks, and on ``accept``
-    forwards the stored canonical object itself, committed (M4 design B.2, B.6)."""
+    """Step 5 for an ``approve`` tool: the approval decision point asks, on the agent's session
+    or, with ``relay``, out of band (M8 design E.4), and on ``accept`` forwards the stored
+    canonical object itself, committed (M4 design B.2, B.6). A relayed call may run after its
+    request answered pending, so its forward relays no upstream progress."""
     budget = schemas.Budget.start()
 
     async def forward(grant: Grant) -> CallToolResult:
@@ -493,7 +503,7 @@ async def _approve(
             name,
             grant.args,
             pin=exposed.pin,
-            progress=progress,
+            progress=None if relay else progress,
             grant=grant,
             ref=ref,
         )
@@ -509,27 +519,31 @@ async def _approve(
         async def prepare() -> Plan | CallToolResult | None:
             return await toolkits.prepare(call.client, call.server, name, shaped, ref)
 
-    result = await approval.approvals.handle(
-        Asking(
-            ref=ref,
-            client=call.client,
-            server=call.server,
-            tool=name,
-            era=call.era,
-            policy=call.policy,
-            gateway=approval.gateway,
-            args=shaped,
-            pin=exposed.pin,
-            session=approval.session,
-            forward=forward,
-            admit=admit,
-            request_state=approval.request_state,
-            input_responses=approval.input_responses,
-            session_sha256=approval.session_sha256,
-            disconnected=approval.disconnected,
-            prepare=prepare,
-        )
+    asking = Asking(
+        ref=ref,
+        client=call.client,
+        server=call.server,
+        tool=name,
+        era=call.era,
+        policy=call.policy,
+        gateway=approval.gateway,
+        args=shaped,
+        pin=exposed.pin,
+        session=approval.session,
+        forward=forward,
+        admit=admit,
+        request_state=approval.request_state,
+        input_responses=approval.input_responses,
+        session_sha256=approval.session_sha256,
+        disconnected=approval.disconnected,
+        prepare=prepare,
+        tick=approval.tick if relay else None,
     )
+    if relay:
+        relayed = await approval.approvals.relay(asking)
+        log("tool_error" if relayed.is_error else "ok", "relay")
+        return relayed
+    result = await approval.approvals.handle(asking)
     if isinstance(result, mcp_types.InputRequiredResult):
         log("input_required", "approval")
     else:

@@ -16,6 +16,7 @@ from zoeymcp.common import canonical, logs
 from zoeymcp.common.approvaltext import (
     FOOTER_PREFIX,
     INSTRUCTIONS,
+    MAX_RECEIVED_INDENT,
     RELAY_LINE,
     ApprovalText,
     Header,
@@ -26,6 +27,7 @@ from zoeymcp.common.approvaltext import (
     Write,
     describe,
     problems,
+    received,
     relayed,
     render_call,
     render_plan,
@@ -547,6 +549,80 @@ def test_lines_imitating_the_relay_line_are_refused(line: str) -> None:
         assert [(p.rule, p.pointer, p.reason) for p in found] == [
             ("frame", "/body", "a line imitating the relay line")
         ]
+
+
+# --- a text the vault receives to relay (M8 step 12b; E.2, E.4) ---------------------------------
+
+
+def test_a_received_text_is_checked_as_its_renderer_checked_it() -> None:
+    """The vault holds the gateway's words as one run with no pointer, and takes the renderer's
+    own JSON indentation as indentation: a deeply nested call the gateway's check passed passes
+    the vault's, and the relay line composes above it as it would above the gateway's own."""
+    args = {"deep": {"k": {"k": {"k": {"k": {"k": "x"}}}}}}
+    text = render_call(HEADER, args)
+    assert problems(text, budget=10_000, renders="plain") == []
+    found = received(text.value)
+    assert found.value == text.value
+    assert found.sources == ((0, None),)
+    assert found.pointer_at(len(text.value) - 1) is None
+    assert found.indented_lines == {
+        n for n in text.indented_lines if text.value.split("\n")[n][:1] == " "
+    }
+    assert problems(found, budget=10_000, renders="plain") == []
+    assert relayed(found).value == f"{RELAY_LINE}\n{text.value}"
+    assert "ApprovalText(<" in repr(found)
+
+
+@pytest.mark.parametrize(
+    ("line", "indented"),
+    [
+        ("  x", True),
+        (" " * 2 * MAX_RECEIVED_INDENT + "x", True),
+        (" " * (2 * MAX_RECEIVED_INDENT + 2) + "x", False),
+        (" x", False),
+        ("   x", False),
+        ("x", False),
+        ("", False),
+        ("  ", True),
+        (chr(9) + "  x", False),
+        ("  " + chr(9) + "x", False),
+    ],
+    ids=[
+        "one",
+        "deepest",
+        "deeper",
+        "half",
+        "one-and-a-half",
+        "none",
+        "empty",
+        "only",
+        "tab",
+        "space-tab",
+    ],
+)
+def test_only_whole_indents_of_spaces_are_indentation(line: str, indented: bool) -> None:
+    """A part of an indent, a tab, or more than the deepest nesting is never the renderer's: a
+    wide run of it is refused as wide whitespace, as anywhere else."""
+    found = received(f"first\n{line}\nlast")
+    assert (1 in found.indented_lines) is indented
+    assert found.indented_lines <= {1}
+    assert received(line).indented_lines == (frozenset({0}) if indented else frozenset())
+
+
+def test_a_wide_indent_the_renderer_never_makes_is_refused() -> None:
+    wide = received("Approval request x\n" + " " * (2 * MAX_RECEIVED_INDENT + 2) + "x\nEnd")
+    found = problems(wide, budget=10_000, renders="plain")
+    assert [(p.rule, p.pointer) for p in found] == [("wide_space", None)]
+    allowed = received("Approval request x\n" + " " * 2 * MAX_RECEIVED_INDENT + "x\nEnd")
+    assert problems(allowed, budget=10_000, renders="plain") == []
+    assert MAX_RECEIVED_INDENT == 33
+
+
+def test_a_received_relay_line_is_refused() -> None:
+    """Z12: the gateway can't write the vault's line itself, first line or not."""
+    for forged in (f"{RELAY_LINE}\nApproval request x", f"Approval request x\n  {RELAY_LINE}"):
+        found = problems(received(forged), budget=10_000, renders="plain")
+        assert [(p.rule, p.reason) for p in found] == [("frame", "a line imitating the relay line")]
 
 
 def test_the_budget_counts_code_points_and_is_never_cut() -> None:

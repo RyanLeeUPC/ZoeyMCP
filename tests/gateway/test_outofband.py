@@ -17,20 +17,34 @@ Step 12a adds the vault's other approvals paths (E.2) and the gateway's client o
 - **the epoch rule** (G-15): a new gateway epoch withdraws an earlier epoch's legacy-session holds
   and keeps its modern ones collectable.
 
+Step 12b adds the relay (E.1, E.3-E.5; Q6 (B), G-23, G-24): an ``out_of_band`` client's
+gateway-held prompt is rendered by the gateway, asked through the vault's ask endpoint, shown on
+the operator's surfaces below the vault's own relay line (Z12) and decided there; the decision
+comes back through the decisions poll, numbered with the endings, and the gateway forwards the
+call itself, only for an approval of the text it asked with (FM-28). A relay ends with its
+decision, its caller leaving (``withdraw``), a change that takes its client's ``out_of_band``,
+or a new gateway epoch; past its block it answers pending and is collected from the gateway's
+own result store (S21's relay half is ``tests/acceptance/test_pending_shapes.py``'s). A client
+nobody answers for is refused (Z11).
+
 The vault-side tests run a real vault on both links (``tests/gateway/holdrig.py``; the link
 socket on Linux only), the gateway-side ones the whole gateway on it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import threading
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import anyio
 import httpx
@@ -55,13 +69,26 @@ from tests.gateway.test_elsewhere import (
 )
 from tests.gateway.test_elsewhere import headers as bearer
 from zoeymcp.common import canonical
+from zoeymcp.common.approvaltext import RELAY_LINE, ApprovalText, Header, render_call
 from zoeymcp.common.committed import Committed
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import build_view
 from zoeymcp.gateway import checkapproval, elsewhere, pipeline
 from zoeymcp.gateway import logs as gateway_logs
-from zoeymcp.gateway.approvals import MAX_RECORDS
-from zoeymcp.gateway.approve import RESULT_TTL_MAX, Approvals
+from zoeymcp.gateway.approvals import MAX_RECORDS, Key, Pending, Settings
+from zoeymcp.gateway.approve import LEDGER_DOWN, RESULT_TTL_MAX, Approvals, Asking
+from zoeymcp.gateway.approvers import (
+    NO_APPROVALS,
+    RELAY_MISMATCH,
+    RELAY_UNREACHABLE,
+    Asked,
+    AskRefused,
+    Decided,
+    Relayed,
+    RelayWait,
+    Shown,
+)
+from zoeymcp.gateway.ledger import LedgerUnavailable
 from zoeymcp.gateway.outofband import (
     IDLE_WAIT,
     ApprovalsFailed,
@@ -69,14 +96,16 @@ from zoeymcp.gateway.outofband import (
     OutOfBandClient,
     endings,
 )
-from zoeymcp.gateway.pipeline import NO_OUT_OF_BAND
+from zoeymcp.gateway.pipeline import NO_APPROVER, NO_OUT_OF_BAND
 from zoeymcp.gateway.policyclient import Snapshot
 from zoeymcp.gateway.vaultlink import KeySource, approvals_client, parse_link
+from zoeymcp.vault import internal
 from zoeymcp.vault import logs as vault_logs
+from zoeymcp.vault.app import NO_PIN, RELAY_ROUTE
 from zoeymcp.vault.holds import DecideRefusal
 
 pytestmark = pytest.mark.anyio
-REF_A, REF_B, REF_C = (f"00000000000000c{n}" for n in "abc")
+REF_A, REF_B, REF_C, REF_D = (f"00000000000000c{n}" for n in "abcd")
 SHOP = "/shop/mcp"
 APPROVALS = "/_zoeymcp/gateway/v1/approvals/"
 LATER = "ba9876543210"  # a restarted gateway's epoch
@@ -304,14 +333,16 @@ async def test_the_decisions_poll(tmp_path: Path, link: str) -> None:
         "v": 1,
         "epoch": epoch,
         "endings": [{"seq": 1, "ref": REF_A, "status": "denied", "outcome": "not_sent"}],
+        "relays": [],
     }
     assert after.json() == {
         "v": 1,
         "epoch": epoch,
         "endings": [{"seq": 2, "ref": REF_B, "status": "done", "outcome": "ok"}],
+        "relays": [],
     }
     assert blocking.json()["code"] == "approval_expired"
-    assert last.json() == {"v": 1, "epoch": epoch, "endings": []}
+    assert last.json() == {"v": 1, "epoch": epoch, "endings": [], "relays": []}
 
 
 @pytest.mark.parametrize("link", LINKS)
@@ -642,25 +673,63 @@ async def test_attended_reaches_held_tool(tmp_path: Path) -> None:
 
 
 def test_a_poll_answer_is_read_exactly() -> None:
-    """The decisions answer's shape (E.2): the vault's epoch and each ending exactly; an outcome
-    the ledger doesn't know reads ``unknown``."""
+    """The decisions answer's shape (E.2): the vault's epoch, each ending and each relay decision
+    exactly; an outcome the ledger doesn't know reads ``unknown``."""
     ending = {"seq": 3, "ref": REF_A, "status": "done", "outcome": "ok"}
     odd = {**ending, "seq": 4, "outcome": "exploded"}
-    assert endings({"v": 1, "epoch": EPOCH, "endings": [ending, odd]}) == (
+    relay = {
+        "seq": 5,
+        "ref": REF_B,
+        "decision": "accept",
+        "via": "portal",
+        "decided_ms": 0,
+        "text_sha256": "e" * 64,
+    }
+    assert endings({"v": 1, "epoch": EPOCH, "endings": [ending, odd], "relays": [relay]}) == (
         EPOCH,
         [Ending(3, REF_A, "done", "ok"), Ending(4, REF_A, "done", "unknown")],
+        [Relayed(5, REF_B, "accept", "portal", 0, "e" * 64)],
     )
+    for decision in ("decline", "timeout", "withdrawn"):
+        for via in ("telegram", "host", "none"):
+            found = endings(
+                {
+                    "v": 1,
+                    "epoch": EPOCH,
+                    "endings": [],
+                    "relays": [{**relay, "decision": decision, "via": via}],
+                }
+            )
+            assert found[2] == [Relayed(5, REF_B, decision, via, 0, "e" * 64)]
+    answer = {"v": 1, "epoch": EPOCH, "endings": [], "relays": []}
     bad: list[dict[str, Any]] = [
         {"v": 1, "epoch": EPOCH},
+        {"v": 1, "epoch": EPOCH, "endings": []},  # an answer from before step 12b
         {"v": 1, "epoch": EPOCH, "endings": [], "decisions": []},
-        {"v": 1, "epoch": "X", "endings": []},
-        {"v": 1, "epoch": EPOCH, "endings": {}},
-        {"v": 1, "epoch": EPOCH, "endings": [{**ending, "extra": 1}]},
-        {"v": 1, "epoch": EPOCH, "endings": [{**ending, "seq": 0}]},
-        {"v": 1, "epoch": EPOCH, "endings": [{**ending, "seq": True}]},
-        {"v": 1, "epoch": EPOCH, "endings": [{**ending, "ref": "x"}]},
-        {"v": 1, "epoch": EPOCH, "endings": [{**ending, "status": 1}]},
-        {"v": 1, "epoch": EPOCH, "endings": [{**ending, "outcome": None}]},
+        {**answer, "decisions": []},
+        {**answer, "epoch": "X"},
+        {**answer, "endings": {}},
+        {**answer, "relays": {}},
+        {**answer, "endings": [{**ending, "extra": 1}]},
+        {**answer, "endings": [{**ending, "seq": 0}]},
+        {**answer, "endings": [{**ending, "seq": True}]},
+        {**answer, "endings": [{**ending, "ref": "x"}]},
+        {**answer, "endings": [{**ending, "status": 1}]},
+        {**answer, "endings": [{**ending, "outcome": None}]},
+        {**answer, "endings": [relay]},
+        {**answer, "relays": [ending]},
+        {**answer, "relays": [{**relay, "extra": 1}]},
+        {**answer, "relays": [{**relay, "seq": 0}]},
+        {**answer, "relays": [{**relay, "ref": "x"}]},
+        {**answer, "relays": [{**relay, "decision": "approve"}]},
+        {**answer, "relays": [{**relay, "decision": None}]},
+        {**answer, "relays": [{**relay, "via": "mail"}]},
+        {**answer, "relays": [{**relay, "decided_ms": -1}]},
+        {**answer, "relays": [{**relay, "decided_ms": True}]},
+        {**answer, "relays": [{**relay, "decided_ms": "0"}]},
+        {**answer, "relays": [{**relay, "text_sha256": "E" * 64}]},
+        {**answer, "relays": [{**relay, "text_sha256": "e" * 63}]},
+        {**answer, "relays": [{**relay, "text_sha256": None}]},
     ]
     for value in bad:
         with pytest.raises(ApprovalsFailed):
@@ -682,7 +751,11 @@ class Polled:
         self.queries.append(dict(request.url.params))
         epoch, listed = self.answers.pop(0) if self.answers else (self.epoch, [])
         self.epoch = epoch
-        return httpx2.Response(200, json={"v": 1, "epoch": epoch, "endings": listed})
+        relays = [item for item in listed if "decision" in item]
+        ended = [item for item in listed if "decision" not in item]
+        return httpx2.Response(
+            200, json={"v": 1, "epoch": epoch, "endings": ended, "relays": relays}
+        )
 
 
 def ended(seq: int, ref: str = "0123456789abcdef", status: str = "done") -> dict[str, Any]:
@@ -921,3 +994,680 @@ async def test_a_vault_slow_to_hear_a_withdraw_leaves_nothing_held(
     assert held.approvals.table.get(call.ref) is None
     [failed] = events(captured, "approval_withdraw_failed")
     assert (failed["ref"], failed["error_type"]) == (call.ref, "timeout")
+
+
+# --- the ask, the vault's side (M8 step 12b; E.2, E.5) --------------------------------------------
+
+RELAYING = {"out_of_band": True}  # both of the rig's clients may raise out-of-band prompts
+
+
+def gateway_text(ref: str, tool: str = "cancel_order", client: str = "agent1") -> str:
+    """A prompt as the gateway renders one it holds itself and relays (E.4): its own frame,
+    the out-of-band instruction."""
+    asked = datetime.now(UTC)
+    header = Header(
+        ref,
+        client,
+        "shop",
+        tool,
+        datetime.fromtimestamp(asked.timestamp() + 3600, UTC),
+        asked_at=asked,
+        rendered_by="gateway",
+        client_reported=False,
+        pin=None,
+        approver="out_of_band",
+    )
+    return render_call(header, {"order": "A-1", "nested": {"a": {"b": [1, 2]}}}).value
+
+
+async def ask(
+    http: httpx.AsyncClient,
+    ref: str,
+    *,
+    client: str = "agent1",
+    tool: str = "cancel_order",
+    server: str = "shop",
+    text: str | None = None,
+    epoch: str = EPOCH,
+) -> httpx.Response:
+    said = gateway_text(ref, tool, client) if text is None else text
+    body = {
+        "v": 1,
+        "epoch": epoch,
+        "ref": ref,
+        "client": client,
+        "server": server,
+        "tool": tool,
+        "text": said,
+        "text_sha256": hashlib.sha256(said.encode()).hexdigest(),
+        "deadline_ms": int(time.time() * 1000) + 3_600_000,
+        "wait": "pending",
+    }
+    return await http.post(APPROVALS + "ask", content=canonical.dumps_canonical(body), headers=JSON)
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_the_ask_relays_the_gateways_text(
+    tmp_path: Path, link: str, log: io.StringIO
+) -> None:
+    """E.2, J6's vault half: the vault holds the gateway's prompt as a relay, shows it with its
+    own relay line above the gateway's text, and answers its id and the digest of the whole
+    composed text, which the surface decides on. Approved, its chain says ``accept`` with the
+    surface, then ``outcome unknown, relayed``: the vault sends nothing, and the gateway's
+    decisions poll gets the decision with that digest."""
+    rig = HoldRig(tmp_path, RELAYING, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            asked = await ask(http, REF_A)
+            [hold] = await rig.surface.holds(1)
+            await rig.decide(hold)
+            await rig.settled()
+            polled = await poll(http)
+    said = gateway_text(REF_A)
+    answer = asked.json()
+    assert asked.status_code == 201
+    assert asked.headers["cache-control"] == "no-store"
+    assert answer == {"v": 1, "id": hold.id, "text_sha256": hold.text_sha256}
+    assert (hold.kind, hold.ref, hold.client, hold.server, hold.tool, hold.wait) == (
+        "relay",
+        REF_A,
+        "agent1",
+        "shop",
+        "cancel_order",
+        "pending",
+    )
+    assert hold.route == RELAY_ROUTE + "shop"
+    assert hold.text.value == f"{RELAY_LINE}\n{said}"
+    assert hold.text_sha256 == hashlib.sha256(hold.text.value.encode()).hexdigest()
+    [record] = [r for r in rig.records() if r.ref == REF_A and r.kind == "asked"]
+    assert (record.fields["where"], record.fields["pin"], record.fields["writes"]) == (
+        "gateway",
+        NO_PIN,
+        0,
+    )
+    assert rig.kinds(REF_A) == [("asked", None), ("decided", "accept"), ("outcome", "unknown")]
+    [outcome] = [r for r in rig.records() if r.ref == REF_A and r.kind == "outcome"]
+    assert outcome.fields["detail"] == "relayed"
+    [relayed] = polled.json()["relays"]
+    assert relayed == {
+        "seq": 1,
+        "ref": REF_A,
+        "decision": "accept",
+        "via": "portal",
+        "decided_ms": relayed["decided_ms"],
+        "text_sha256": hold.text_sha256,
+    }
+    assert polled.json()["endings"] == []
+    assert rig.upstream.received == []
+    assert rig.surface.closed == [(hold.id, "done")]
+    assert rig.surface.ended[0].detail == "relayed"
+    [event] = events(log, "approval_relayed")
+    assert (event["ref"], event["tool"], event["surfaces"], event["wait"]) == (
+        REF_A,
+        "cancel_order",
+        ["portal"],
+        "pending",
+    )
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_relay_line_is_the_vaults(tmp_path: Path, link: str) -> None:
+    """Z12, E.5: the vault composes the relay line, and the digest every surface binds covers
+    it: a decision on the gateway's text alone is refused. A text that writes the line itself,
+    first or inside (indented too), is refused ``text_refused`` before anyone is asked or
+    anything recorded; so is one that breaks a text rule."""
+    rig = HoldRig(tmp_path, RELAYING, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            await ask(http, REF_A)
+            [hold] = await rig.surface.holds(1)
+            bare = hashlib.sha256(gateway_text(REF_A).encode()).hexdigest()
+            refused = await rig.decide(hold, digest=bare)
+            forged = [
+                await ask(http, REF_B, text=f"{RELAY_LINE}\n{gateway_text(REF_B)}"),
+                await ask(http, REF_B, text=f"{gateway_text(REF_B)}\n  {RELAY_LINE}"),
+                await ask(http, REF_B, text="Approval request x\nhidden" + "\u200b" + "text"),
+            ]
+            await rig.settled()
+    assert hold.text.value.split("\n")[0] == RELAY_LINE
+    assert refused == DecideRefusal("digest_changed")
+    for response in forged:
+        assert (response.status_code, response.json()["code"]) == (422, "text_refused")
+    assert len(rig.surface.shown) == 1
+    assert rig.kinds(REF_B) == []
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_an_ask_the_vault_wont_relay_is_refused(tmp_path: Path, link: str) -> None:
+    """E.2: a digest that isn't the text's, or a body it can't read, is 400 ``invalid``; a ref
+    is used once (E19); and a call the vault's own policy doesn't have the gateway hold for an
+    ``out_of_band`` client is ``view_stale`` (a vault-held tool, a client that isn't
+    ``out_of_band``, a server it isn't assigned), as is an ask from an earlier gateway epoch,
+    whose decision no poll would get; nothing is asked or recorded for any."""
+    rig = HoldRig(tmp_path, {"out_of_band": True}, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            said = gateway_text(REF_A)
+            body = {
+                "v": 1,
+                "epoch": EPOCH,
+                "ref": REF_A,
+                "client": "agent1",
+                "server": "shop",
+                "tool": "cancel_order",
+                "text": said,
+                "text_sha256": "0" * 64,
+                "deadline_ms": 1,
+                "wait": "pending",
+            }
+            wrong = await http.post(
+                APPROVALS + "ask", content=canonical.dumps_canonical(body), headers=JSON
+            )
+            large = await http.post(
+                APPROVALS + "ask", content=b"{" + b" " * 96 * 1024 + b"}", headers=JSON
+            )
+            first = await ask(http, REF_A)
+            again = await ask(http, REF_A)
+            held = await ask(http, REF_B, tool="place_order")
+            unknown = await ask(http, REF_B, server="nowhere")
+            unlisted = await ask(http, REF_B, tool="refund")
+            await poll(http, epoch=LATER)  # a restarted gateway: EPOCH is an earlier one now
+            earlier = await ask(http, REF_D)
+            await rig.reload(out_of_band=False)
+            unrelayed = await ask(http, REF_C, epoch=LATER)
+            await rig.settled()
+    assert (wrong.status_code, wrong.json()["code"]) == (400, "invalid")
+    assert (large.status_code, large.json()["code"]) == (413, "too_large")
+    assert first.status_code == 201
+    assert (again.status_code, again.json()["code"]) == (409, "held_ref_reused")
+    for refused in (held, unknown, unlisted, earlier, unrelayed):
+        assert (refused.status_code, refused.json()["code"]) == (409, "view_stale")
+    assert len(rig.surface.shown) == 1
+    assert rig.kinds(REF_B) == rig.kinds(REF_C) == rig.kinds(REF_D) == []
+
+
+@pytest.mark.parametrize("link", LINKS)
+@pytest.mark.parametrize("ending", ["deny", "expire", "withdraw", "out_of_band", "epoch"])
+async def test_each_relay_ending_is_told_to_its_gateway(
+    tmp_path: Path, link: str, ending: str
+) -> None:
+    """E.2, Z7: a relay denied, expired, withdrawn by its gateway, or left by a change that takes
+    its client's ``out_of_band``, is closed on the chain, unsent, and its decision goes to the
+    gateway that asked it; a new gateway epoch withdraws the earlier epoch's relays (G-15),
+    which no gateway is left to forward, and the new one's poll doesn't name them."""
+    rig = HoldRig(tmp_path, RELAYING, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            await ask(http, REF_A)
+            [hold] = await rig.surface.holds(1)
+            if ending == "deny":
+                await rig.decide(hold, "deny")
+            elif ending == "expire":
+                await rig.later(3601)
+            elif ending == "withdraw":
+                assert (await withdraw(http, REF_A))["state"] == "withdrawn"
+            elif ending == "out_of_band":
+                await rig.reload(out_of_band=False)
+            else:
+                await poll(http, epoch=LATER)
+            await rig.settled()
+            polled = await poll(http, epoch=LATER if ending == "epoch" else EPOCH)
+    decision, state = {
+        "deny": ("decline", "denied"),
+        "expire": ("timeout", "expired"),
+    }.get(ending, ("withdrawn", "withdrawn"))
+    assert rig.kinds(REF_A)[1:] == [("decided", decision), ("outcome", "not_sent")]
+    assert rig.surface.closed == [(hold.id, state)]
+    assert rig.upstream.received == []
+    if ending == "epoch":
+        assert polled.json()["relays"] == []
+        assert rig.surface.ended[0].detail == "gateway_restarted"
+        return
+    [relayed] = polled.json()["relays"]
+    assert (relayed["ref"], relayed["decision"], relayed["text_sha256"]) == (
+        REF_A,
+        decision,
+        hold.text_sha256,
+    )
+    assert relayed["via"] == ("portal" if ending == "deny" else "none")
+
+
+# --- the relay, end to end through the gateway (J6; Z11, Z12, FM-28) ------------------------------
+
+# agent1 raises out-of-band prompts and nobody watches its session; nothing is vault-held.
+OUT_OF_BAND: dict[str, Any] = {
+    "vault_approval": [],
+    "approvals": {CLIENTS[0]: {"attended": False, "out_of_band": True}},
+}
+
+
+@pytest.mark.parametrize("version", ["modern", "2025-11-25"])
+async def test_relay_end_to_end(tmp_path: Path, version: Any) -> None:
+    """J6: an ``out_of_band`` client's call to an ordinary ``approve`` tool is shown on the
+    operator's surface, the vault's line above the gateway's own prompt (its client, the
+    out-of-band instruction), never on the agent's session; approved there, the gateway runs it
+    once and the agent gets the result. The gateway's ledger has the call as one it asked
+    itself (``where: gateway``), the vault's chain the decision and ``outcome unknown``."""
+    script = Script([ACCEPT])
+    with anyio.fail_after(BOUND), holding(tmp_path, **OUT_OF_BAND) as rig:
+        async with agent(
+            rig.running.mcp(), version=version, script=script, headers=bearer()
+        ) as client:
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "relayed"}))
+                [hold] = await rig.surface.holds(1)
+                assert rig.calls() == []  # nothing upstream until it is approved
+                await rig.decide(hold)
+            await rig.settled()
+    [result] = answer
+    assert not result.is_error, text(result)
+    assert "relayed" in text(result)
+    assert script.prompts == []  # asked out of band only
+    lines = hold.text.value.split("\n")
+    assert lines[0] == RELAY_LINE
+    assert lines[1:3] == [f"Approval request {hold.ref}", f"Client: {CLIENTS[0]}"]
+    assert lines[4].endswith("UTC. Approve runs this one call, exactly as shown.")
+    assert (hold.kind, hold.client, hold.tool) == ("relay", CLIENTS[0], "echo")
+    assert rig.calls() == [{"text": "relayed"}]
+    assert rig.ledger(hold.ref) == [
+        ("asked", "gateway"),
+        ("decided", "accept"),
+        ("outcome", ("ok", None)),
+    ]
+    assert rig.chain(hold.ref) == [("asked", None), ("decided", "accept"), ("outcome", "unknown")]
+
+
+async def test_nobody_answers_is_refused(tmp_path: Path) -> None:
+    """Z11: with no out-of-band approver, an ``out_of_band`` client's call to a gateway-held
+    tool is refused ``no_approver``; a client neither ``attended`` nor ``out_of_band`` is
+    refused as before. Nothing is recorded, asked or sent for either."""
+    with anyio.fail_after(BOUND), holding(tmp_path, approvers=None, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            relayed = await client.call_tool("echo", {"text": "nobody"})
+        async with agent(rig.running.mcp(), headers=bearer(CLIENTS[1])) as other:
+            unattended = await other.call_tool("echo", {"text": "nobody"})
+    assert text(relayed) == f"{NO_APPROVER} (ref {ref_of(relayed)})"
+    assert text(unattended) == f"{NO_APPROVALS} (ref {ref_of(unattended)})"
+    assert rig.ledger(ref_of(relayed)) == rig.ledger(ref_of(unattended)) == []
+    assert rig.surface.shown == []
+    assert rig.calls() == []
+
+
+async def test_digest_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM-28, G-23: an approval whose digest isn't the one the vault answered the ask with (a
+    decision on another text) is refused, logged ``relay_digest_mismatch`` and recorded
+    ``decided error``; nothing is forwarded."""
+    wire = internal.Relayed.wire
+
+    def forged(relayed: internal.Relayed) -> dict[str, Any]:
+        return {**wire(relayed), "text_sha256": "0" * 64}
+
+    monkeypatch.setattr(internal.Relayed, "wire", forged)
+    with anyio.fail_after(BOUND), holding(tmp_path, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "hi"}))
+                [hold] = await rig.surface.holds(1)
+                await rig.decide(hold)
+            await rig.settled()
+    [result] = answer
+    assert text(result) == f"{RELAY_MISMATCH} (ref {hold.ref})"
+    assert rig.calls() == []
+    assert rig.ledger(hold.ref) == [
+        ("asked", "gateway"),
+        ("decided", "error"),
+        ("outcome", ("not_sent", None)),
+    ]
+    [mismatch] = rig.deployed.events("relay_digest_mismatch")
+    assert (mismatch["ref"], mismatch["tool"], mismatch["level"]) == (hold.ref, "echo", "error")
+
+
+async def test_a_pending_relay_runs_once_approved_and_is_collected(tmp_path: Path) -> None:
+    """F.1, F.2, D.2 for a relay: past its block the call answers ``pending <ref>``, and an
+    identical call the same ref; approved later, with nobody waiting, the gateway runs it once
+    and keeps the result in its own store, which ``check_approval`` gives once (the vault holds
+    no result of a relay), and lists."""
+    approvers = {"portal": {}, "block_seconds": 0, "result_ttl": 1800}
+    with anyio.fail_after(BOUND), holding(tmp_path, approvers=approvers, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            first = await client.call_tool("echo", {"text": "later"})
+            ref = ref_of(first)
+            again = await client.call_tool("echo", {"text": "later"})
+            waiting = await client.call_tool("check_approval", {"id": ref})
+            [hold] = await rig.surface.holds(1)
+            await rig.decide(hold)
+            await rig.settled()
+            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            collected = await client.call_tool("check_approval", {"id": ref})
+            twice = await client.call_tool("check_approval", {"id": ref})
+            listed = await client.call_tool("check_approval", {})
+    assert PENDING.match(text(first))
+    assert text(again) == text(first)
+    assert text(waiting).startswith("still pending: waiting for the operator's approval until ")
+    assert not collected.is_error, text(collected)
+    assert text(collected) == "later"
+    assert text(twice) == f"{checkapproval.COLLECTED} (ref {ref})"
+    assert f"{ref} (echo): collected" in text(listed)
+    assert len(rig.surface.shown) == 1
+    assert rig.calls() == [{"text": "later"}]
+    assert rig.ledger(ref) == [
+        ("asked", "gateway"),
+        ("decided", "pending"),
+        ("decided", "accept"),
+        ("outcome", ("ok", None)),
+    ]
+    assert rig.chain(ref) == [("asked", None), ("decided", "accept"), ("outcome", "unknown")]
+
+
+async def test_a_pending_relay_declined_says_so(tmp_path: Path) -> None:
+    """A pending relay the operator declines closes its record ``decline`` (its cooldown
+    started), sends nothing, and ``check_approval`` says it was declined."""
+    approvers = {"portal": {}, "block_seconds": 0}
+    with anyio.fail_after(BOUND), holding(tmp_path, approvers=approvers, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            ref = ref_of(await client.call_tool("echo", {"text": "no"}))
+            [hold] = await rig.surface.holds(1)
+            await rig.decide(hold, "deny")
+            await rig.settled()
+            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            declined = await client.call_tool("check_approval", {"id": ref})
+            later = await client.call_tool("echo", {"text": "no"})
+    assert text(declined) == f"{checkapproval.DECLINED} (ref {ref})"
+    assert "declined moments ago" in text(later)
+    assert rig.calls() == []
+    assert rig.ledger(ref)[1:] == [
+        ("decided", "pending"),
+        ("decided", "decline"),
+        ("outcome", ("not_sent", None)),
+    ]
+
+
+@pytest.mark.parametrize("version", ["modern", "2025-11-25"])
+async def test_an_abandoned_relay_is_withdrawn_at_the_vault(tmp_path: Path, version: Any) -> None:
+    """B.6, E.4: the agent abandons a call waiting for its relayed approval: the gateway records
+    it withdrawn and unsent (it forwards a relay itself, so nothing was) and tells the vault,
+    whose relay ends withdrawn; a later approval is refused."""
+    with anyio.fail_after(BOUND), holding(tmp_path, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), version=version, headers=bearer()) as client:
+            async with anyio.create_task_group() as group:
+                group.start_soon(lambda: client.call_tool("echo", {"text": "never"}))
+                [hold] = await rig.surface.holds(1)
+                group.cancel_scope.cancel()
+            await until(lambda: rig.running.app.approvals.table.get(hold.ref) is None, BOUND)
+            vault = rig.deployed.vault
+            assert vault is not None
+            await until(lambda: vault.holds.get(hold.id) is None, BOUND)
+            await rig.settled()
+            late = await rig.decide(hold)
+    assert late == DecideRefusal("withdrawn")
+    assert rig.calls() == []
+    assert rig.ledger(hold.ref) == [
+        ("asked", "gateway"),
+        ("decided", "withdrawn"),
+        ("outcome", ("not_sent", None)),
+    ]
+    assert rig.chain(hold.ref)[1:] == [("decided", "withdrawn"), ("outcome", "not_sent")]
+    [request] = told(rig)
+    assert request["status"] == 200
+
+
+async def test_losing_out_of_band_withdraws_the_relay(tmp_path: Path) -> None:
+    """G-24, Z7: a change that takes the client's ``out_of_band`` withdraws its waiting relay on
+    both sides; the agent is told the policy changed, nothing is sent, and a late approval is
+    refused."""
+    with anyio.fail_after(BOUND), holding(tmp_path, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "hi"}))
+                [hold] = await rig.surface.holds(1)
+                await anyio.to_thread.run_sync(
+                    lambda: rig.deployed.reload(approvals={CLIENTS[0]: {"attended": False}})
+                )
+            await rig.settled()
+            vault = rig.deployed.vault
+            assert vault is not None
+            await until(lambda: vault.holds.get(hold.id) is None, BOUND)
+            late = await rig.decide(hold)
+    [result] = answer
+    assert text(result) == f"refused: the policy changed; call the tool again (ref {hold.ref})"
+    assert late == DecideRefusal("withdrawn")
+    assert rig.calls() == []
+    assert rig.ledger(hold.ref) == [
+        ("asked", "gateway"),
+        ("decided", "withdrawn"),
+        ("outcome", ("not_sent", None)),
+    ]
+    assert rig.chain(hold.ref)[1:] == [("decided", "withdrawn"), ("outcome", "not_sent")]
+
+
+async def test_an_ask_that_fails_here_is_withdrawn_at_the_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E.2, D.3: an ask the vault took, but whose answer failed here (a malformed 201, a read
+    timeout), is refused with nothing sent, and the vault is told: no relay is left there that
+    nobody would forward, and the client's next identical call is asked, not refused
+    ``held_busy`` by the vault's fairness cap."""
+    real = OutOfBandClient.ask
+    failures = [ApprovalsFailed("bad_answer")]
+
+    async def failing(self: OutOfBandClient, body: Mapping[str, Any]) -> Asked | AskRefused:
+        asked = await real(self, body)
+        if failures:
+            raise failures.pop()
+        return asked
+
+    monkeypatch.setattr(OutOfBandClient, "ask", failing)
+    with anyio.fail_after(BOUND), holding(tmp_path, **OUT_OF_BAND) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            first = await client.call_tool("echo", {"text": "hi"})
+            [lost] = await rig.surface.holds(1)
+            vault = rig.deployed.vault
+            assert vault is not None
+            await until(lambda: vault.holds.get(lost.id) is None, BOUND)
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "hi"}))
+                [_, hold] = await rig.surface.holds(2)
+                await rig.decide(hold)
+            await rig.settled()
+    [result] = answer
+    assert text(first) == f"{RELAY_UNREACHABLE} (ref {lost.ref})"
+    assert not result.is_error, text(result)
+    assert rig.calls() == [{"text": "hi"}]
+    assert rig.ledger(lost.ref) == [
+        ("asked", "gateway"),
+        ("decided", "unavailable"),
+        ("outcome", ("not_sent", None)),
+    ]
+    assert rig.chain(lost.ref)[1:] == [("decided", "withdrawn"), ("outcome", "not_sent")]
+
+
+async def test_a_pending_relay_the_ledger_refuses_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F.5 step 7: a pending relay approved while the gateway's ledger refuses its ``decided
+    accept`` sends nothing, and ``check_approval`` gives the refusal the call would have
+    answered, once, never "already collected" for a result nobody had."""
+    approvers = {"portal": {}, "block_seconds": 0}
+    with anyio.fail_after(BOUND), holding(tmp_path, approvers=approvers, **OUT_OF_BAND) as rig:
+        ledger = rig.running.app.approvals.ledger
+        assert ledger is not None
+        write = ledger.write
+
+        async def refusing(kind: Any, ref: str | None, *, critical: bool, **fields: Any) -> Any:
+            if kind == "decided" and fields.get("decision") == "accept":
+                raise LedgerUnavailable("decided")
+            return await write(kind, ref, critical=critical, **fields)
+
+        monkeypatch.setattr(ledger, "write", refusing)
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            ref = ref_of(await client.call_tool("echo", {"text": "unsent"}))
+            [hold] = await rig.surface.holds(1)
+            await rig.decide(hold)
+            await rig.settled()
+            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            collected = await client.call_tool("check_approval", {"id": ref})
+            twice = await client.call_tool("check_approval", {"id": ref})
+    assert text(collected) == f"{LEDGER_DOWN} (ref {ref})"
+    assert text(twice) == f"{checkapproval.COLLECTED} (ref {ref})"
+    assert rig.calls() == []
+    assert rig.ledger(ref) == [
+        ("asked", "gateway"),
+        ("decided", "pending"),
+        ("outcome", ("not_sent", None)),
+    ]
+
+
+# --- the dispatcher, in process (E.3; Z10) --------------------------------------------------------
+
+RELAY_KEY = Key("agent1", "notes", "echo")
+
+
+def relay_record(approvals: Approvals, ref: str, client: str = "agent1") -> Pending:
+    begun = approvals.table.begin(
+        replace(RELAY_KEY, client=client),
+        settings=Settings(3600, 300, 15, 1, 30),
+        now=approvals.clock(),
+        ref=ref,
+        era="modern",
+        args={"text": "hi"},
+        args_digest="sha256:" + "2" * 64,
+        pin="sha256:" + "1" * 64,
+        text_sha256="t" * 64,
+        how="relay",
+    )
+    assert isinstance(begun, Pending)
+    return begun
+
+
+def telling(approvals: Approvals) -> list[tuple[str, str, str]]:
+    """What the gateway tells the vault it gave up, recorded in place of the vault."""
+    told: list[tuple[str, str, str]] = []
+
+    async def tell(ref: str, client: str, reason: str) -> None:
+        told.append((ref, client, reason))
+
+    approvals.relays.tell_withdrawn = tell
+    return told
+
+
+async def test_a_restarted_vault_withdraws_the_relays_here() -> None:
+    """E.2, Z10: a decisions poll answering another vault epoch means the vault restarted, and
+    every relay it had is gone: a call still in its block is woken withdrawn, and one that
+    answered pending is closed withdrawn now, with nothing sent; the poll starts over."""
+    approvals = Approvals(
+        ledger=None, committed=Committed(), fresh=lambda: None, stopping=lambda: False
+    )
+    blocking, detached = relay_record(approvals, REF_A), relay_record(approvals, REF_B, "agent2")
+    unused = cast(Asking, None)  # a withdrawn relay never runs its call
+    waiting = RelayWait(unused, blocking, digest="d" * 64)
+    pended = RelayWait(unused, detached, digest="d" * 64, detached=True)
+    pended.answered.set()
+    approvals.table.pend(REF_B, time.time() + 3600)
+    approvals.relays.waiting.update({REF_A: waiting, REF_B: pended})
+    told = telling(approvals)
+    vault = Polled(("aaaaaaaaaaaa", []), ("bbbbbbbbbbbb", []))
+    http = approvals_client(LINK, None, httpx2.MockTransport(vault.handle))
+    poller = OutOfBandClient(approvals, http)
+    with anyio.fail_after(BOUND):
+        await poller.poll_once(25)
+        first = poller.vault_restarted
+        await poller.poll_once(25)
+        restarted = poller.vault_restarted
+        await poller.run_all(approvals.relays_lost())
+    await http.aclose()
+    assert (first, restarted) == (False, True)
+    assert waiting.woken.is_set()
+    assert waiting.decided is not None
+    assert waiting.decided.decision == "withdrawn"
+    assert approvals.relays.settled(waiting).decision == "withdrawn"
+    assert approvals.table.get(REF_B) is None  # closed, its lock freed
+    assert approvals.relays.waiting == {REF_A: waiting}  # the blocking one's handler pops it
+    # The restarted vault may have been asked it anew: told (the blocking one's handler tells).
+    assert told == [(REF_B, "agent2", "caller_cancelled")]
+
+
+async def test_a_decision_wakes_its_call_once_and_only_its_own() -> None:
+    """E.3: the dispatcher hands a decision to the relay it names, once: a second one, or one
+    for a ref no relay waits on, changes nothing; ``_wanted`` polls while a relay waits."""
+    approvals = Approvals(
+        ledger=None, committed=Committed(), fresh=lambda: None, stopping=lambda: False
+    )
+    record = relay_record(approvals, REF_A)
+    waiting = RelayWait(cast(Asking, None), record, digest="d" * 64)
+    approvals.relays.waiting[REF_A] = waiting
+    approve = Relayed(1, REF_A, "accept", "portal", 0, "d" * 64)
+    async with httpx2.AsyncClient() as unused:
+        poller = OutOfBandClient(approvals, unused)
+        document = json.loads(json.dumps(VIEW_POLICY))
+        del document["approvers"]
+        del document["gateway"]["servers"]["notes"]["tools"]["vault_approval"]
+        snapshot = Snapshot(build_view(Policy.model_validate(document)), 0.0)
+        wanted = poller._wanted(snapshot)
+        await poller.relayed([approve, replace(approve, seq=2, decision="decline")])
+        await poller.relayed([replace(approve, ref=REF_B)])
+    assert wanted
+    assert waiting.decided == approve
+    assert waiting.woken.is_set()
+    assert approvals.relays.settled(waiting) == Decided(record, "accept")
+
+
+def clocked(now: list[float]) -> Approvals:
+    return Approvals(
+        ledger=None,
+        committed=Committed(),
+        fresh=lambda: None,
+        stopping=lambda: False,
+        clock=lambda: now[0],
+    )
+
+
+async def test_a_block_that_lasts_to_the_deadline_times_out() -> None:
+    """I.1 step 2, F.1: ``block_seconds`` may equal the timeout, and a block that lasted to the
+    deadline undecided is ``timeout``, with the vault told, never a pending answer for a call
+    that has already expired."""
+    now = [0.0]
+    approvals = clocked(now)
+    told = telling(approvals)
+    record = relay_record(approvals, REF_A)
+
+    async def ask_vault(body: Mapping[str, Any]) -> Asked:
+        now[0] = record.expires_at  # the whole block went by
+        return Asked("a" * 32, "d" * 64)
+
+    approvals.relays.ask_vault = ask_vault
+    out = SimpleNamespace(block_seconds=3600)
+    asking = SimpleNamespace(
+        gateway=SimpleNamespace(approvals=SimpleNamespace(out_of_band=out)),
+        client="agent1",
+        server="notes",
+        tool="echo",
+    )
+    settings = Settings(3600, 300, 15, 1, 30)
+    shown = Shown(cast(ApprovalText, SimpleNamespace(value="x")), {}, settings, time.time())
+    with anyio.fail_after(BOUND):
+        found = await approvals.relays.ask(cast(Asking, asking), record, shown)
+    assert found == Decided(record, "timeout")
+    assert told == [(REF_A, "agent1", "caller_cancelled")]
+    assert approvals.relays.waiting == {}
+
+
+async def test_the_sweep_closes_a_pending_relay_once_answered_and_tells_the_vault() -> None:
+    """F.1, E.2: a relay pending past its deadline with no decision is closed ``timeout`` by the
+    sweep, only after its ``decided pending`` record is written, and the vault, whose own
+    deadline may be later, is told."""
+    now = [0.0]
+    approvals = clocked(now)
+    told = telling(approvals)
+    record = relay_record(approvals, REF_A)
+    wait = RelayWait(cast(Asking, None), record, digest="d" * 64, detached=True)
+    approvals.relays.waiting[REF_A] = wait
+    now[0] = record.expires_at + 1
+    with anyio.fail_after(BOUND):
+        await approvals.sweep()
+        unanswered = (approvals.table.get(REF_A) is not None, list(told))
+        wait.answered.set()
+        await approvals.sweep()
+    assert unanswered == (True, [])
+    assert approvals.table.get(REF_A) is None
+    assert approvals.relays.waiting == {}
+    assert told == [(REF_A, "agent1", "caller_cancelled")]

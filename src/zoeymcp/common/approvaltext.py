@@ -43,6 +43,10 @@ LABEL = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,31}$")
 MAX_TITLE_CHARS = 120
 # The renderer's own JSON indentation, which the whitespace rule leaves alone.
 _INDENT = "  "
+# The deepest JSON indentation a received prompt may carry (:func:`received`), in indents: the
+# gateway's 32 levels of nesting (``pipeline.MAX_ARGUMENT_DEPTH``), and the object a plan's JSON
+# member is shown in.
+MAX_RECEIVED_INDENT = 33
 _MAX_COLUMNS = 8
 _MAX_COMBINING = 3
 
@@ -273,6 +277,24 @@ def relayed(text: ApprovalText) -> ApprovalText:
         frozenset(line + 1 for line in text.indented_lines),
         ((0, None), *((start + shift, pointer) for start, pointer in text.sources)),
     )
+
+
+def received(value: str) -> ApprovalText:
+    """A prompt another renderer made, as the vault receives it to relay (M8 design E.2, E.4),
+    ready for :func:`problems`: one run with no JSON pointer, and each line whose leading
+    whitespace is spaces only, a whole number of the renderer's indents and at most
+    :data:`MAX_RECEIVED_INDENT` of them, taken as its JSON indentation, as the gateway's own
+    check took it. Leading tabs, or a part of an indent, are never indentation."""
+    indented = frozenset(number for number, line in enumerate(value.split("\n")) if _indented(line))
+    return ApprovalText(value, indented, ((0, None),))
+
+
+def _indented(line: str) -> bool:
+    spaces = len(line) - len(line.lstrip(" "))
+    if spaces != len(line) - len(line.lstrip(" \t")):
+        return False  # a tab among the leading whitespace
+    levels, part = divmod(spaces, len(_INDENT))
+    return part == 0 and 0 < levels <= MAX_RECEIVED_INDENT
 
 
 # --- toolkit plans -------------------------------------------------------------------------------

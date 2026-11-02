@@ -21,8 +21,14 @@ nobody waiting, and the agent collects it:
 - a gateway restart: the new gateway holds no record, and still the owning client collects while
   another reads ``unknown or expired`` (FM-39).
 
+The gateway-held relay half (M8 step 12b; E.4, F.2, F.5 step 2): the same tools gateway-held,
+both clients ``out_of_band`` and nobody watching their sessions, so each call is relayed through
+the vault to the same surface and, unanswered in its block, answers ``pending <ref>``; the
+gateway runs it once approved and keeps its result in its own store, from which the owning
+client collects it once and another client learns nothing.
+
 Every test ends with S10's sweep: the key, the tokens and the session ids reach no log, answer or
-output. The gateway-held relay half of S21 is step 12b's.
+output.
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ from tests.dark import lit
 from tests.fakes.mcp_server import McpFake, Mode
 from tests.gateway.holdrig import Clock as HoldClock
 from tests.gateway.holdrig import Surface
-from tests.gateway.rig import Running, agent
+from tests.gateway.rig import Running, agent, until
 from zoeymcp.common import ledgerformat, resultstore
 from zoeymcp.gateway import checkapproval, elsewhere
 from zoeymcp.gateway.ledger import LEDGER_DIR
@@ -88,19 +94,19 @@ class Held:
         return self.surfaces[-1]
 
 
-def extra(*, result_ttl: int = 1800, max_pending: int = 1) -> dict[str, Any]:
+def extra(*, result_ttl: int = 1800, max_pending: int = 1, relay: bool = False) -> dict[str, Any]:
     """The policy beside S10's: the portal queue with no block (and the portal it is in), both
-    tools held, both clients attended."""
+    tools held, both clients attended; with ``relay``, both tools gateway-held and relayed, both
+    clients ``out_of_band`` and not attended."""
+    own = {"attended": False, "out_of_band": True} if relay else {"attended": True}
+    servers = {} if relay else {SERVER: {"tools": {"vault_approval": sorted(TOOLS)}}}
     return {
         "admin": {"listen": "127.0.0.1:8081", "origins": ["http://localhost:8081"]},
         "approvers": {"portal": {}, "block_seconds": 0, "result_ttl": result_ttl},
         "gateway": {
             "approvals": {"max_pending_per_client": max_pending},
-            "clients": {
-                "agent1": {"approvals": {"attended": True}},
-                "agent2": {"approvals": {"attended": True}},
-            },
-            "servers": {SERVER: {"tools": {"vault_approval": sorted(TOOLS)}}},
+            "clients": {"agent1": {"approvals": own}, "agent2": {"approvals": own}},
+            "servers": servers,
         },
     }
 
@@ -365,6 +371,66 @@ async def test_collect_after_a_gateway_restart(tmp_path: Path, ca: ProviderCA) -
     # The first gateway's ledger closed the call at its own restart (C.4): the vault may forward.
     assert ledger(gateway, ref)[:2] == [("asked", "vault"), ("decided", "pending")]
     assert ("outcome", "unknown") in ledger(gateway, ref)
+
+
+# --- S21's relay half (M8 step 12b) -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("link", LINKS)
+@pytest.mark.parametrize("era", sorted(ERAS))
+async def test_s21_relayed_then_collected_once(
+    tmp_path: Path, ca: ProviderCA, link: str, era: str
+) -> None:
+    """A gateway-held call relayed out of band (E.4) answers pending; approved on the vault's
+    surface, the gateway runs it once with nobody waiting, and ``check_approval`` gives its
+    result once from the gateway's own store (F.2, F.5 step 2), finished as a direct call's,
+    then ``already collected``; another client's collect reads ``unknown or expired`` (FM-16)
+    and takes nothing. The gateway's ledger has the call as one it asked itself."""
+    agent_mode, fake_mode = ERAS[era]
+    fake = McpFake(mode=fake_mode)
+    held = Held()
+    with (
+        held_deployment(tmp_path, ca, fake, held, link=link, relay=True) as gateway,
+        gateway.running() as running,
+    ):
+        with anyio.fail_after(BOUND):
+            async with (
+                agent(running, mode=agent_mode) as owner,
+                agent(running, "agent2", mode=agent_mode) as other,
+            ):
+                pending = await owner.call_tool("echo", {"text": "relayed at 3pm"})
+                ref = ref_of(pending)
+                still = await check(owner, ref)
+                crossed = await check(other, ref)
+                [hold] = await held.surface.holds(1)
+                await decide(gateway, hold)
+                await settled(gateway)
+                await until(lambda: running.app.approvals.table.get(ref) is None, BOUND)
+                ran = await check(other, ref)
+                collected = await check(owner, ref)
+                again = await check(owner, ref)
+                mine = await check(owner)
+        gateway.seen.outputs += [
+            text(r) for r in (pending, still, crossed, ran, collected, again, mine)
+        ]
+    assert hold.kind == "relay"
+    assert pending.is_error
+    assert pending.structured_content is None
+    assert text(still).startswith("still pending: waiting for the operator's approval until ")
+    assert text(crossed) == text(ran) == f"unknown or expired (ref {ref})"  # FM-16
+    assert not collected.is_error, text(collected)
+    assert text(collected) == "relayed at 3pm"
+    assert text(again) == f"already collected (ref {ref})"
+    assert f"{ref} (echo): collected" in text(mine)
+    assert [call.arguments for call in fake.calls if call.name == "echo"] == [
+        {"text": "relayed at 3pm"}
+    ]
+    assert ledger(gateway, ref) == [
+        ("asked", "gateway"),
+        ("decided", "pending"),
+        ("decided", "accept"),
+        ("outcome", "ok"),
+    ]
 
 
 def test_the_pending_text_names_the_tool_to_collect_with() -> None:
