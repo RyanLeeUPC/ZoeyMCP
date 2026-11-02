@@ -2724,6 +2724,8 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `approval_declined` | The call was denied, so nothing was sent. |
 | 409 | `approval_expired` | Nobody answered in time, so nothing was sent. |
 | 409 | `approval_withdrawn` | The approval was withdrawn, so nothing was sent. |
+| 422 | `telegram_too_long` | The approval text is too long to show in Telegram, and no portal queue takes it, so nothing was asked. |
+| 502 | `telegram_text_changed` | Telegram returned another text than the one the vault sent, so nothing was sent. |
 | 502 | `held_result_too_large` | The call ran; its answer was over 4 MiB and wasn't kept. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |

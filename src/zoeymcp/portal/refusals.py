@@ -749,6 +749,15 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "approval_declined": Entry(409, "The call was denied, so nothing was sent."),
         "approval_expired": Entry(409, "Nobody answered in time, so nothing was sent."),
         "approval_withdrawn": Entry(409, "The approval was withdrawn, so nothing was sent."),
+        # The Telegram approver's (G.4; vault/telegramwire.py).
+        "telegram_too_long": Entry(
+            422,
+            "The approval text is too long to show in Telegram, and no portal queue takes it, so "
+            "nothing was asked.",
+        ),
+        "telegram_text_changed": Entry(
+            502, "Telegram returned another text than the one the vault sent, so nothing was sent."
+        ),
         "held_result_too_large": Entry(
             502, "The call ran; its answer was over 4 MiB and wasn't kept."
         ),

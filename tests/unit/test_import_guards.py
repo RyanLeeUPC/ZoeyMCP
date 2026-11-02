@@ -569,6 +569,23 @@ def test_the_hold_table_is_pure_and_stands_on_common_only() -> None:
     assert not [m for m in found if m.startswith("zoeymcp.common.policy")]
 
 
+def test_the_telegram_wire_rules_are_pure_and_stand_on_the_hold_table_only() -> None:
+    """M8 design G, F8: the Telegram approver's rules do no I/O of their own (``telegram.py``
+    does it), and of ours load only the hold table they read and the shared layers under it: no
+    other vault module, no policy package. Not vacuous: the walk reaches the hold table."""
+    assert own_io("zoeymcp.vault.telegramwire") == []
+    found = closure(PACKAGE.parent, "zoeymcp.vault.telegramwire")
+    assert "zoeymcp.vault.holds" in found
+    assert beyond(found) == []
+    assert {m for m in found if not m.startswith("zoeymcp.common")} == {
+        "zoeymcp",
+        "zoeymcp.vault",
+        "zoeymcp.vault.holds",
+        "zoeymcp.vault.telegramwire",
+    }
+    assert not [m for m in found if m.startswith("zoeymcp.common.policy")]
+
+
 def test_own_io_sees_the_modules_own_imports() -> None:
     assert own_io("zoeymcp.common.ledgerfile") != []
 

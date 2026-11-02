@@ -51,6 +51,7 @@ from zoeymcp.vault import (
     reviewjobs,
     secretplan,
     store,
+    telegramwire,
 )
 from zoeymcp.vault import app as vault_app
 from zoeymcp.vault.oauth import dcr, discovery, fetch, login, pkce
@@ -307,6 +308,8 @@ HELD = {
     "approval_declined": 409,
     "approval_expired": 409,
     "approval_withdrawn": 409,
+    "telegram_too_long": 422,
+    "telegram_text_changed": 502,
     "held_result_too_large": 502,
 }
 # M8 step 12b: the relay's ask (E.2; M.2's ``text_refused``); its other codes are the hold's.
@@ -723,14 +726,20 @@ def held_codes(methods: tuple[str, ...] = HELD_METHODS) -> set[str]:
 
 def test_every_held_reason_is_catalogued() -> None:
     """M8 M.2: every code the vault hold answers with: each envelope rule's and each cap's as
-    ``held_<reason>``, each ending's, and every literal in the held branch."""
+    ``held_<reason>``, each ending's, every literal in the held branch, and the Telegram
+    surface's own (G.4: a text it can't show, or one it returned changed)."""
     rules = {f"held_{reason}" for reason in get_args(envelope.Reason)}
     caps = {f"held_{reason}" for reason in get_args(get_type_hints(holds.CapRefusal)["reason"])}
     endings = set(vault_app._ENDED_CODES.values())
     found = held_codes()
+    surface = {
+        telegramwire.TooLong.code: telegramwire.TooLong.status,
+        telegramwire.TextChanged.code: telegramwire.TextChanged.status,
+    }
     assert {"held_path", "view_stale", "held_ledger_down", "approval_pending"} <= found
-    assert rules | caps | endings | found == set(HELD)
+    assert rules | caps | endings | found | set(surface) == set(HELD)
     assert set(HELD) <= set(CATALOGUE)
+    assert {code: CATALOGUE[code].status for code in surface} == surface
     assert {reason: CATALOGUE[reason].status for reason in rules} == {
         reason: envelope.Refuse(reason.removeprefix("held_")).status  # type: ignore[arg-type]
         for reason in rules
