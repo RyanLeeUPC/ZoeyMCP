@@ -9,7 +9,8 @@
 #   5. the portal's static files are present in the vault's environment, as the official image
 #      has them;
 #   6. scripts/smoke-image.sh --derived OFFICIAL DERIVED passes, which also reviews the example's
-#      mail toolkit in the derived gateway, and serves the portal's files from both tiers.
+#      mail toolkit in the derived gateway, serves the portal's files from both tiers, and sends
+#      with the toolkit in both tiers under each approval mode, a send in flight on stop included.
 # Checks 3 and 4 read files without running them, so no .pth runs before it is checked.
 # Usage: examples/derived-image/verify.sh OFFICIAL DERIVED
 set -eu

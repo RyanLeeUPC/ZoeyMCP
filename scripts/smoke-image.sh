@@ -7,7 +7,10 @@
 # The hardened tier's egress-proxy profile runs the egress role, which the vault's SMTP connector
 # sends through, and probes show who can reach it and what it refuses (contract 52).
 # With --derived OFFICIAL, IMAGE is a derived image (examples/derived-image): its environments are
-# compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load.
+# compared with OFFICIAL's instead of with the fixed lists, and its toolkits must load; and
+# D-71's rows run last (M8 design P.2 step 20): the example mail toolkit sends through fake mail
+# and Bot API services in both tiers, under each approval mode, and a send in flight finishes on
+# stop.
 # With --bridge BRIDGE, BRIDGE is the bridge example's image built on IMAGE (examples/bridge), and
 # S11's container rows run last (M7 design L, O.5): a stdio server behind a bridge in the hardened
 # tier's shape, with the egress role and contracts 48 and 52's bridge rows, and in the standard
@@ -752,7 +755,8 @@ from zoeymcp.gateway.pins import project_and_pin
 out = Path(sys.argv[1])
 ca = make_ca(out)
 issue_cert(ca, "fake-upstream", out)
-issue_cert(ca, "fake-smtp", out)  # the mail server of contract 52
+issue_cert(ca, "fake-smtp", out)  # the mail server of contract 52 and D-71
+issue_cert(ca, "api.telegram.org", out)  # the fake Bot API of D-71
 (out / "bundle.pem").write_text(Path(certifi.where()).read_text() + ca.ca_file.read_text())
 for tool in base_tools():
     print(tool["name"], project_and_pin(mcp_types.Tool.model_validate(tool)).pin)
@@ -1803,11 +1807,19 @@ egress_fail() {
     fail "egress role: $*"
 }
 # The fake mail server: tests/fakes/smtp_server.py with implicit TLS on fake-smtp:4650, from the
-# smoke's CA, printing one line per session.
+# smoke's CA, printing one line per session. With a first argument, it answers a message's final
+# dot that many seconds late, after a line saying the dot came (D-71's stop while a send is in
+# flight); with a second, that many instead once /tmp/slow-dot exists.
 cat >"$work/tls/fake_smtp.py" <<'EOF'
-import asyncio, json, ssl
+import asyncio, json, os, ssl, sys
 from tests.fakes.smtp_server import SmtpFake
+WAITS = [float(wait) for wait in sys.argv[1:3]] + [0.0, 0.0]
 class Fake(SmtpFake):
+    async def _reply(self, writer, line):
+        if line.startswith("250 2.0.0 "):
+            print(json.dumps({"event": "smtp_dot"}, separators=(",", ":")), flush=True)
+            await asyncio.sleep(WAITS[1] if os.path.exists("/tmp/slow-dot") else WAITS[0])
+        await super()._reply(writer, line)
     async def _handle(self, reader, writer):
         index = len(self.sessions)
         await super()._handle(reader, writer)
@@ -2106,6 +2118,603 @@ fi
 existing_cleanup
 trap cleanup EXIT
 # --- end of contract 54 -------------------------------------------------------------------------
+
+# --- D-71: approved sends in both tiers, under each approval mode --------------------------------
+# With --derived only: the example mail toolkit is the derived image's. Each tier from its
+# compose file, with an override of this run's whose policy serves the toolkit twice, on two
+# connectors to one fake mail server (tests/fakes/smtp_server.py, implicit TLS, S13): as mail,
+# asked in the agent's own client (the gateway's approval), and as mail-held, whose send the
+# vault holds (vault_approval) and asks in Telegram, here the fake Bot API
+# (tests/fakes/run_telegram.py) serving api.telegram.org with a certificate from the smoke's CA,
+# which the vault trusts. The agent is tests/fakes/agent.py's SDK client. The fake mail server
+# answers a message's final dot late, so a stop can come while a send is in flight: in each
+# tier, under each mode, one accepted send is stopped there (the stop must come before the
+# message arrives) and must finish first, the gateway stopping before the vault, each exiting 0
+# in its compose file's window (D-35, M8 design I.2). Under the gateway's approval the gateway
+# drains the send itself; under vault_approval the dot comes later than the gateway's stop, which
+# cuts the agent's call, so the vault is stopped while its forward runs, which must finish and
+# be recorded sent on the vault's own chain (J9). Only the vault and the gateway are stopped: a
+# whole-project stop would stop the fakes and the egress role beside the gateway, and the role
+# cuts the tunnels open through it when it stops. The standard tier (deploy/compose.yaml, the
+# derived image) also does one S13 send; its vault reaches the Bot API through a CONNECT proxy
+# (tests/fakes/connect_proxy.py), since without a proxy the approver's client refuses a private
+# address (M8 design G.2). The hardened tier (deploy/compose.hardened.yaml, the egress-proxy
+# profile, the official vault and egress role and the derived gateway) runs S15's accept and
+# decline under vault_approval (D-74 rows 1 and 2); its vault reaches the Bot API through the
+# egress role, which lets api.telegram.org:443 through because derive lists it for the
+# approver, and lets it resolve to a compose network's address because egress_private marks it
+# private, as it does the mail server. Each tier removes all it starts, whatever happens, with
+# its own trap.
+if [ -n "$official" ]; then
+    # A test token; the fake Bot API checks it in every path, and the bot's id is its prefix.
+    bot_token="123456789:AAH-smoke-bot-token-0123456789"
+    # The fake's operator (tests/fakes/telegram.py's OPERATOR), whose private chat with the bot
+    # is the approver's.
+    operator_id=1001
+    # A message's final dot is answered this many seconds late: inside the 10 s the gateway gives
+    # a call in flight (operations.md §9).
+    dot_wait=5
+    # ... and this many once sends_slow ran, for vault_approval's stop in flight: past the
+    # gateway's stop (its detach, that 10 s and its cut call's records, about 12 s), so the vault
+    # is stopped while its forward runs, and inside the 30 s the vault waits for a mail server's
+    # answer (REPLY_TIMEOUT, vault/connectors/smtp.py). Only then: an agent waiting this long
+    # for its answer would meet its client's 30 s read timeout.
+    held_dot_wait=20
+    # The fake mail server's line for a message that arrived, over TLS from the AUTH on.
+    delivered='"rcpt_to":\["partner@mail.example"\],"tls_at_auth":\[true\],"data":true'
+    # The fake CONNECT proxy on fake-proxy:3128, printing each CONNECT's target.
+    cat >"$work/tls/fake_proxy.py" <<'EOF'
+import asyncio, json
+from tests.fakes.connect_proxy import ConnectProxy
+class Printed(list):
+    def append(self, target):
+        print(json.dumps({"event": "proxy_connect", "target": target}, separators=(",", ":")),
+              flush=True)
+        super().append(target)
+async def main():
+    proxy = ConnectProxy(targets=Printed())
+    server = await asyncio.start_server(proxy._handle, "0.0.0.0", 3128)
+    async with server:
+        await server.serve_forever()
+asyncio.run(main())
+EOF
+    chmod 0644 "$work/tls/fake_proxy.py"
+    # sends_server NAME ROUTE EXTRA: the example mail toolkit as server NAME, its slot on ROUTE,
+    # with EXTRA added to its tools.
+    sends_server() {
+        cat <<EOF
+            $1:
+              kind: toolkit
+              module: example_toolkits.mail
+              tools: {include: [send_note], approve: [send_note]$3}
+              review: {send_note: "$mail_pin"}
+              slots:
+                mail:
+                  route: $2
+                  rules:
+                    - {methods: [GET], paths: [/config]}
+                    - {methods: [POST], paths: [/send], approved: true}
+EOF
+    }
+    # sends_policy TIER: this block's policy, indented for ZOEYMCP_CONFIG: the tier's way out (the
+    # CONNECT proxy, or the egress role with the private marks), the two connectors and their
+    # routes, the Telegram approver, and the toolkit as mail and mail-held.
+    sends_policy() {
+        echo "        version: 1"
+        echo "        mode: declarative"
+        if [ "$1" = hardened ]; then
+            echo "        egress_proxy: http://egress-vault:3128"
+            echo "        egress_proxy_kind: role"
+            echo "        egress_private: [\"fake-smtp:4650\", \"api.telegram.org:443\"]"
+        else
+            echo "        egress_proxy: http://fake-proxy:3128"
+        fi
+        cat <<EOF
+        connectors:
+          mail-out:
+            {kind: smtp, host: fake-smtp, port: 4650, tls: implicit, from: agent@mail.example,
+             to: [partner@mail.example], username: agent@mail.example, password: store:mail-pass}
+          held-out:
+            {kind: smtp, host: fake-smtp, port: 4650, tls: implicit, from: agent@mail.example,
+             to: [partner@mail.example], username: agent@mail.example, password: store:held-pass}
+        routes:
+          - name: mail-send
+            prefix: /mail
+            connector: mail-out
+            callers: [gateway]
+            rules: [{methods: [GET], paths: [/config]}, {methods: [POST], paths: [/send]}]
+          - name: held-send
+            prefix: /held
+            connector: held-out
+            callers: [gateway]
+            rules: [{methods: [GET], paths: [/config]}, {methods: [POST], paths: [/send]}]
+        approvers:
+          telegram: {bot_token: store:approver-bot, user_id: $operator_id, chat_id: $operator_id}
+        gateway:
+          hosts: [gateway, localhost, 127.0.0.1]
+          clients:
+            agent1:
+              token_sha256: "$token_hash"
+              approvals: {attended: true}
+              servers: [mail, mail-held]
+          servers:
+$(sends_server mail mail-send "")
+$(sends_server mail-held held-send ", vault_approval: [send_note]")
+EOF
+    }
+    # sends_fakes TIER: the fake mail server, the fake Bot API as api.telegram.org and, in the
+    # standard tier, the CONNECT proxy: on the project's default network there, and on
+    # egress-out, the egress role's way out, in the hardened tier.
+    sends_fakes() {
+        sends_net=default
+        [ "$1" = standard ] || sends_net=egress-out
+        cat <<EOF
+  fake-smtp:
+    image: $fake_image
+    entrypoint: [/opt/zoeymcp-gateway/bin/python]
+    command: [/tls/fake_smtp.py, "$dot_wait", "$held_dot_wait"]
+    environment:
+      PYTHONPATH: /opt/src
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp:size=16m]
+    volumes: ["$tests:/opt/src/tests:ro", "$work/tls:/tls:ro"]
+    networks: [$sends_net]
+  fake-telegram:
+    image: $fake_image
+    entrypoint: [/opt/zoeymcp-gateway/bin/python]
+    command: [-m, tests.fakes.run_telegram, /tls/api.telegram.org.pem, /tls/api.telegram.org.key,
+              --token, "$bot_token", --host, 0.0.0.0, --port, "443"]
+    environment:
+      PYTHONPATH: /opt/src
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Port 443 as the image's uid, with no capability.
+    sysctls: [net.ipv4.ip_unprivileged_port_start=0]
+    tmpfs: [/tmp:size=16m]
+    volumes: ["$tests:/opt/src/tests:ro", "$work/tls:/tls:ro"]
+    networks: {$sends_net: {aliases: [api.telegram.org]}}
+EOF
+        [ "$1" = standard ] || return 0
+        cat <<EOF
+  fake-proxy:
+    image: $fake_image
+    entrypoint: [/opt/zoeymcp-gateway/bin/python]
+    command: [/tls/fake_proxy.py]
+    environment:
+      PYTHONPATH: /opt/src
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp:size=16m]
+    volumes: ["$tests:/opt/src/tests:ro", "$work/tls:/tls:ro"]
+EOF
+    }
+    sends_std_project="zoeymcp-smoke-sends-$$"
+    sends_std() {
+        ZOEYMCP_IMAGE="$image" ZOEYMCP_MASTER_KEY="${sends_std_master:-unset}" \
+            docker compose -p "$sends_std_project" -f "$deploy/compose.yaml" \
+            -f "$work/sends-standard.yaml" "$@"
+    }
+    sends_hard_project="zoeymcp-smoke-sends-hardened-$$"
+    # The hardened tier as the derived image's README recommends it: the official image for the
+    # vault and the egress role, the derived one for the gateway.
+    sends_hard() {
+        ZOEYMCP_IMAGE="$official" ZOEYMCP_GATEWAY_IMAGE="$image" \
+            ZOEYMCP_MASTER_KEY="${sends_hard_master:-unset}" \
+            ZOEYMCP_GATEWAY_KEY="${sends_gateway_key:-unset}" ZOEYMCP_EGRESS_KEY="${sends_egress_key:-}" \
+            docker compose -p "$sends_hard_project" -f "$deploy/compose.hardened.yaml" \
+            -f "$work/sends-hardened.yaml" --profile egress-proxy "$@"
+    }
+    sends_cleanup() {
+        if [ -f "$work/sends-standard.yaml" ]; then
+            sends_std down -v >/dev/null 2>&1 || true
+        fi
+        if [ -f "$work/sends-hardened.yaml" ]; then
+            sends_hard down -v >/dev/null 2>&1 || true
+        fi
+    }
+    trap 'sends_cleanup; cleanup' EXIT
+    sends_fail() {
+        if [ -f "$work/sends-standard.yaml" ]; then
+            sends_std logs >&2 2>/dev/null || true
+        fi
+        if [ -f "$work/sends-hardened.yaml" ]; then
+            sends_hard logs >&2 2>/dev/null || true
+        fi
+        fail "approvals: $*"
+    }
+    # One send_note through the gateway at URL, from tests/fakes/agent.py's SDK client (modern),
+    # with this run's client token; the agent's own prompts are answered ANSWER (accept or
+    # decline), and BODY is the note's body. Prints "ok" or "error", how many prompts the
+    # agent's own client was shown, and the answer's text; or "cut" and why, for a call that got
+    # no answer, as one a stop cuts, or none in 120 s.
+    sends_call='
+import sys
+import anyio
+from tests.fakes.agent import ACCEPT, DECLINE, Script, agent
+url, token, answer, body = sys.argv[1:5]
+async def main():
+    script = Script([ACCEPT if answer == "accept" else DECLINE])
+    with anyio.move_on_after(120):
+        try:
+            async with agent(url, script=script, headers={"authorization": f"Bearer {token}"}) as client:
+                result = await client.call_tool("send_note", {"subject": "Smoke", "body": body})
+        except Exception as exc:
+            print("cut", type(exc).__name__)
+            return
+        print("error" if result.is_error else "ok", len(script.prompts), result.content[0].text)
+        return
+    print("cut", "no answer in 120 s")
+anyio.run(main)
+'
+    # sends_agent NETWORK URL ANSWER BODY: sends_call from a container on NETWORK ("host" for the
+    # host's own), by the official image's gateway interpreter, the only one with the MCP SDK.
+    sends_agent() {
+        # shellcheck disable=SC2086
+        docker run --rm $hardened --network "$1" -e PYTHONPATH=/opt/src \
+            -v "$tests:/opt/src/tests:ro" --entrypoint /opt/zoeymcp-gateway/bin/python \
+            "$fake_image" -c "$sends_call" "$2" "$token" "$3" "$4"
+    }
+    # The operator, in the fake Bot API's own container: the one prompt not yet decided (Deny and
+    # Approve, never edited) whose text holds BODY, which must have come as G.4 sends it (one pre
+    # entity, previews off, protected content), pressed LABEL: press LABEL BODY. Prints the
+    # prompt's first line.
+    telegram_press='
+import http.client, json, ssl, sys, time
+label, body = sys.argv[1:3]
+context = ssl.create_default_context(cafile="/tls/bundle.pem")
+def ask(method, path, data=None):
+    connection = http.client.HTTPSConnection("api.telegram.org", 443, context=context, timeout=10)
+    sent = None if data is None else json.dumps(data).encode()
+    connection.request(method, path, body=sent, headers={"content-type": "application/json"})
+    answer = json.loads(connection.getresponse().read())
+    connection.close()
+    return answer
+for _ in range(200):
+    found = [
+        message for message in ask("GET", "/_fake/messages")["messages"]
+        if body in message["text"] and message["labels"] == ["Deny", "Approve"]
+        and not message["edited"] and not message["deleted"]
+    ]
+    if found:
+        break
+    time.sleep(0.3)
+else:
+    sys.exit(f"no prompt holding {body!r} came")
+if len(found) != 1:
+    sys.exit(f"{len(found)} prompts hold {body!r}")
+[prompt] = found
+if not (prompt["single_pre"] and prompt["previews_off"] and prompt["protected"]):
+    sys.exit(f"the prompt did not come as G.4 sends it: {prompt}")
+pressed = ask("POST", "/_fake/press", {"message_id": prompt["message_id"], "label": label})
+if pressed != {"queued": True}:
+    sys.exit(f"the press was not queued: {pressed}")
+print(prompt["text"].splitlines()[0])
+'
+    # sends_press TIER-COMMAND LABEL BODY: telegram_press in TIER's fake Bot API.
+    sends_press() {
+        "$1" exec -T fake-telegram /opt/zoeymcp-gateway/bin/python -I -c "$telegram_press" "$2" "$3"
+    }
+    # sends_count TIER-COMMAND SERVICE PATTERN: how many lines of SERVICE's log match PATTERN.
+    sends_count() {
+        sends_found="$("$1" logs "$2" 2>&1 | grep -c "$3")" || true
+        echo "${sends_found:-0}"
+    }
+    # sends_until TIER-COMMAND SERVICE PATTERN COUNT WHAT [FILE]: waits until COUNT lines of
+    # SERVICE's log match PATTERN, failing with WHAT, and FILE's text as it is then.
+    sends_until() {
+        i=0
+        until [ "$(sends_count "$1" "$2" "$3")" -ge "$4" ]; do
+            i=$((i + 1))
+            [ "$i" -lt 150 ] || sends_fail "$5${6:+: $(cat "$6")}"
+            sleep 0.2
+        done
+    }
+    # sends_secrets TIER-COMMAND SERVICE: both connectors' password and the bot's token, through
+    # the vault's admin socket in SERVICE.
+    sends_secrets() {
+        for sends_secret in mail-pass held-pass; do
+            printf '%s' app-password-0001 | "$1" exec -T "$2" zoeymcp secret set "$sends_secret" \
+                >"$work/out" 2>&1 || sends_fail "$sends_secret wasn't stored: $(cat "$work/out")"
+        done
+        printf '%s' "$bot_token" | "$1" exec -T "$2" zoeymcp secret set approver-bot \
+            >"$work/out" 2>&1 || sends_fail "the bot's token wasn't stored: $(cat "$work/out")"
+    }
+    # sends_ready TIER-COMMAND SERVICE: the vault's Telegram approver knows its bot, so getMe went
+    # through the tier's way out to the fake, as health --json shows it.
+    sends_ready() {
+        i=0
+        until "$1" exec -T "$2" zoeymcp health --json 2>/dev/null \
+            | grep -q '"username": *"example_bot"'; do
+            i=$((i + 1))
+            [ "$i" -lt 200 ] \
+                || sends_fail "the Telegram approver never reached the fake Bot API: $("$1" exec -T "$2" zoeymcp health 2>&1)"
+            sleep 0.5
+        done
+    }
+    # sends_answered WHAT EXPECTED: the agent's answer in $work/sends-call starts with EXPECTED.
+    sends_answered() {
+        case "$(cat "$work/sends-call")" in
+            "$2"*) ;;
+            *) sends_fail "$1 answered: $(cat "$work/sends-call")" ;;
+        esac
+    }
+    # sends_at TIER-COMMAND SERVICE PATTERN: when SERVICE logged its last line matching PATTERN,
+    # in nanoseconds by Docker's clock (GNU date, as on the CI runner), or nothing.
+    sends_at() {
+        sends_stamp="$("$1" logs -t --no-log-prefix "$2" 2>/dev/null | grep "$3" | tail -n 1 | cut -d ' ' -f 1)"
+        if [ -n "$sends_stamp" ]; then
+            date -d "$sends_stamp" +%s%N 2>/dev/null || true
+        fi
+    }
+    # sends_press_ref TIER-COMMAND BODY: sends_press Approve, leaving the ref its prompt names in
+    # $sends_ref.
+    sends_press_ref() {
+        sends_prompt="$(sends_press "$1" Approve "$2")" || sends_fail "no Approve in Telegram for: $2"
+        sends_ref="${sends_prompt#Approval request }"
+        case "$sends_ref" in
+            "" | *" "* | "$sends_prompt") sends_fail "the prompt for $2 named no ref: $sends_prompt" ;;
+        esac
+    }
+    # sends_recorded TIER-COMMAND SERVICE REF: the vault in SERVICE, started again, holds REF's
+    # send on its own chain as sent (ledger --vault --chain vault, M8 design J.1, K.3).
+    sends_recorded() {
+        i=0
+        until "$1" exec -T "$2" zoeymcp ledger --vault --chain vault 2>&1 \
+            | grep -F " $3 " | grep -q 'ok (sent)$'; do
+            i=$((i + 1))
+            [ "$i" -lt 100 ] \
+                || sends_fail "the vault's own chain doesn't hold $3 as sent: $("$1" exec -T "$2" zoeymcp ledger --vault --chain vault 2>&1)"
+            sleep 0.3
+        done
+    }
+    # sends_slow TIER-COMMAND: from now on, TIER's fake mail server answers the final dot
+    # $held_dot_wait s late.
+    sends_slow() {
+        "$1" exec -T fake-smtp /opt/zoeymcp-gateway/bin/python -c 'open("/tmp/slow-dot", "w").close()' \
+            || sends_fail "the fake mail server's wait at the dot wasn't lengthened"
+    }
+
+    step "approvals, standard tier: up, with the mail toolkit as mail and mail-held, and fake mail, proxy and Bot API services (D-71)"
+    cat >"$work/sends-standard.yaml" <<EOF
+services:
+  zoeymcp:
+$(vault_trust)
+    environment:
+      ZOEYMCP_CONFIG: |
+$(sends_policy standard)
+$(sends_fakes standard)
+EOF
+    sends_std_master="$(docker run --rm "$image" keygen | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+    [ -n "$sends_std_master" ] || sends_fail "keygen printed no key"
+    # sends_std_healthy: the standard tier's gateway answers.
+    sends_std_healthy() {
+        i=0
+        until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/healthz)" = "200" ]; do
+            i=$((i + 1))
+            [ "$i" -lt 100 ] || sends_fail "the standard tier's gateway didn't become ready"
+            sleep 0.3
+        done
+    }
+    sends_std up -d
+    sends_std_healthy
+    sends_secrets sends_std zoeymcp
+    # A restart, so the approver starts with its token stored (a missing one is looked for again
+    # only after the poller's longest backoff).
+    sends_std restart zoeymcp >/dev/null 2>&1 || sends_fail "the standard container didn't restart"
+    sends_std_healthy
+    sends_ready sends_std zoeymcp
+    sends_std_id="$(sends_std ps -q zoeymcp)"
+    [ -n "$sends_std_id" ] || sends_fail "no standard-tier container"
+    sends_std logs fake-proxy 2>&1 | grep -q '"target":"api.telegram.org:443"' \
+        || sends_fail "the vault didn't reach the Bot API through the proxy"
+
+    step "approvals, standard tier: one S13 send, implicit TLS through the proxy, accepted in the agent's own client (D-74 row 2)"
+    sends_agent host http://127.0.0.1:8090/s/mail/mcp accept "S13 from the standard tier." \
+        >"$work/sends-call" 2>&1 || sends_fail "the S13 send failed: $(cat "$work/sends-call")"
+    cat "$work/sends-call"
+    sends_answered "the S13 send" "ok 1 sent ("
+    sends_until sends_std fake-smtp "$delivered" 1 "the S13 send never arrived over TLS"
+    sends_std logs fake-proxy 2>&1 | grep -q '"target":"fake-smtp:4650"' \
+        || sends_fail "the S13 send didn't go through the proxy to fake-smtp:4650"
+
+    # sends_std_stopped PATH ANSWER BODY PROMPTS: one send to the server at PATH whose body is
+    # BODY, the agent's own prompts answered ANSWER and, unless PROMPTS (how many it is shown) is
+    # 1, held by the vault and approved in Telegram, the prompt's ref left in $sends_ref; once
+    # the fake mail server has the final dot, the standard container is stopped, before the
+    # message arrives. Its message arrives; the launcher stops the gateway, then the vault, each
+    # exiting 0, and the container has deploy/compose.yaml's window. Asked in the agent's client,
+    # the send answers sent (the gateway drains it); held, the gateway's stop cuts the agent's
+    # call and the gateway is gone before the message arrives, so the vault was stopped while
+    # its forward ran (J9).
+    sends_std_stopped() {
+        dots="$(sends_count sends_std fake-smtp '"event":"smtp_dot"')"
+        arrived="$(sends_count sends_std fake-smtp "$delivered")"
+        lines="$(sends_std logs zoeymcp 2>&1 | wc -l)"
+        sends_agent host "http://127.0.0.1:8090$1" "$2" "$3" >"$work/sends-call" 2>&1 &
+        sends_pid=$!
+        if [ "$4" != 1 ]; then
+            sends_press_ref sends_std "$3"
+        fi
+        sends_until sends_std fake-smtp '"event":"smtp_dot"' $((dots + 1)) \
+            "the send never reached the fake mail server's final dot" "$work/sends-call"
+        stop_at="$(date +%s%N)"
+        sends_std stop zoeymcp >/dev/null 2>&1 || sends_fail "the standard container didn't stop"
+        wait "$sends_pid" || sends_fail "the send in flight failed on stop: $(cat "$work/sends-call")"
+        cat "$work/sends-call"
+        if [ "$4" = 1 ]; then
+            sends_answered "the send in flight" "ok 1 sent ("
+        fi
+        sends_until sends_std fake-smtp "$delivered" $((arrived + 1)) "the send in flight never arrived"
+        delivered_at="$(sends_at sends_std fake-smtp "$delivered")"
+        [ -n "$delivered_at" ] && [ "$stop_at" -lt "$delivered_at" ] \
+            || sends_fail "the stop came after the send finished"
+        if [ "$4" != 1 ]; then
+            gateway_at="$(sends_at sends_std zoeymcp '"event":"child_exited","child":"gateway"')"
+            [ -n "$gateway_at" ] && [ "$gateway_at" -lt "$delivered_at" ] \
+                || sends_fail "the gateway outlived the held send, so the vault wasn't stopped while its forward ran"
+        fi
+        [ "$(docker inspect -f '{{.State.ExitCode}}' "$sends_std_id")" = "0" ] \
+            || sends_fail "the launcher exited non-zero"
+        [ "$(docker inspect -f '{{.Config.StopTimeout}}' "$sends_std_id")" = "680" ] \
+            || sends_fail "the standard container's stop window isn't deploy/compose.yaml's 680 s"
+        sends_std logs zoeymcp 2>&1 | tail -n "+$((lines + 1))" \
+            | grep -o '"event":"child_exited","child":"[^"]*","status":[0-9-]*' >"$work/sends-exits" || true
+        cat "$work/sends-exits"
+        [ "$(sed 's/.*"child":"\([^"]*\)","status":\(.*\)/\1 \2/' "$work/sends-exits" | tr '\n' ' ')" \
+            = "gateway 0 vault 0 " ] || sends_fail "the launcher didn't stop the gateway, then the vault, each exiting 0"
+    }
+
+    step "approvals, standard tier: an accepted send stopped in flight finishes first, asked in the agent's own client (D-71)"
+    sends_std_stopped /s/mail/mcp accept "Stopped in flight, the gateway's approval, standard tier." 1
+
+    step "approvals, standard tier: an accepted send stopped in flight finishes first, held by the vault and approved in Telegram (D-71)"
+    sends_std start zoeymcp >/dev/null 2>&1 || sends_fail "the standard container didn't start again"
+    sends_std_healthy
+    sends_ready sends_std zoeymcp
+    sends_slow sends_std
+    sends_std_stopped /s/mail-held/mcp decline "Stopped in flight, vault_approval, standard tier." 0
+    sends_std start zoeymcp >/dev/null 2>&1 || sends_fail "the standard container didn't start again"
+    sends_recorded sends_std zoeymcp "$sends_ref"
+
+    step "approvals, standard tier: the bot's token is in no log of the container (G.1)"
+    if sends_std logs zoeymcp 2>&1 | grep -qF "${bot_token#*:}"; then
+        sends_fail "the bot's token is in the standard container's log"
+    fi
+    sends_std down -v >/dev/null 2>&1
+
+    step "approvals, hardened tier: up, with the egress role, the mail toolkit as mail and mail-held, and fake mail and Bot API services (D-71)"
+    cat >"$work/sends-hardened.yaml" <<EOF
+services:
+  vault:
+$(vault_trust)
+    environment:
+      ZOEYMCP_CONFIG: |
+$(sends_policy hardened)
+$(sends_fakes hardened)
+EOF
+    sends_keys="$(docker run --rm "$official" keygen)"
+    sends_hard_master="$(echo "$sends_keys" | sed -n 's/^ZOEYMCP_MASTER_KEY=//p')"
+    sends_gateway_key="$(echo "$sends_keys" | sed -n 's/^ZOEYMCP_GATEWAY_KEY=//p')"
+    sends_hard up -d vault fake-smtp fake-telegram
+    i=0
+    until sends_egress_key="$(sends_hard exec -T vault zoeymcp egress-key 2>/dev/null \
+        | sed -n 's/^ZOEYMCP_EGRESS_KEY=//p')" && [ -n "$sends_egress_key" ]; do
+        i=$((i + 1))
+        [ "$i" -lt 100 ] || sends_fail "zoeymcp egress-key printed no key"
+        sleep 0.3
+    done
+    sends_secrets sends_hard vault
+    sends_hard up -d egress-proxy
+    sends_until sends_hard egress-proxy '"event":"egress_allowlist_applied"' 1 \
+        "the egress role never applied the vault's lists"
+    # A restart, so the approver starts with its token stored and the role up.
+    sends_hard restart vault >/dev/null 2>&1 || sends_fail "the vault didn't restart"
+    sends_hard up -d gateway
+    # sends_hard_ready: the gateway has a fresh view, and the approver its bot.
+    sends_hard_ready() {
+        i=0
+        until sends_hard exec -T gateway zoeymcp gateway-status 2>/dev/null \
+            | grep -q '^view sha256:[0-9a-f]*  fresh$'; do
+            i=$((i + 1))
+            [ "$i" -lt 100 ] || sends_fail "the hardened gateway never got a fresh view"
+            sleep 0.3
+        done
+        sends_ready sends_hard vault
+    }
+    sends_hard_ready
+    sends_vault_id="$(sends_hard ps -q vault)"
+    sends_gateway_id="$(sends_hard ps -q gateway)"
+    [ -n "$sends_vault_id" ] && [ -n "$sends_gateway_id" ] || sends_fail "no hardened vault or gateway"
+    [ "$(docker inspect -f '{{.Config.Image}}' "$sends_vault_id")" = "$official" ] \
+        && [ "$(docker inspect -f '{{.Config.Image}}' "$sends_gateway_id")" = "$image" ] \
+        || sends_fail "the hardened vault isn't the official image, or its gateway the derived one"
+    sends_agents="${sends_hard_project}_agents"
+
+    step "approvals, hardened tier: S15 accept under vault_approval, approved in Telegram (D-74 row 1)"
+    arrived="$(sends_count sends_hard fake-smtp "$delivered")"
+    sends_agent "$sends_agents" http://gateway:8090/s/mail-held/mcp decline "S15 accepted, hardened tier." \
+        >"$work/sends-call" 2>&1 &
+    sends_pid=$!
+    sends_press sends_hard Approve "S15 accepted, hardened tier." || sends_fail "no Approve in Telegram"
+    wait "$sends_pid" || sends_fail "the accepted send failed: $(cat "$work/sends-call")"
+    cat "$work/sends-call"
+    sends_answered "the accepted send" "ok 0 sent ("
+    sends_until sends_hard fake-smtp "$delivered" $((arrived + 1)) "the accepted send never arrived over TLS"
+
+    step "approvals, hardened tier: S15 decline under vault_approval, denied in Telegram, sends nothing (D-74 row 1)"
+    sessions="$(sends_count sends_hard fake-smtp '"event":"smtp_')"
+    sends_agent "$sends_agents" http://gateway:8090/s/mail-held/mcp decline "S15 declined, hardened tier." \
+        >"$work/sends-call" 2>&1 &
+    sends_pid=$!
+    sends_press sends_hard Deny "S15 declined, hardened tier." || sends_fail "no Deny in Telegram"
+    wait "$sends_pid" || sends_fail "the declined send failed: $(cat "$work/sends-call")"
+    cat "$work/sends-call"
+    sends_answered "the declined send" "error 0 refused: the operator declined this call (ref "
+    [ "$(sends_count sends_hard fake-smtp '"event":"smtp_')" = "$sessions" ] \
+        || sends_fail "the declined send reached the fake mail server"
+
+    # sends_hard_stopped PATH ANSWER BODY PROMPTS: as sends_std_stopped, from a container on the
+    # agents network, and the vault and the gateway stopped once the final dot came: each exits
+    # 0, the gateway first, each with deploy/compose.hardened.yaml's window.
+    sends_hard_stopped() {
+        dots="$(sends_count sends_hard fake-smtp '"event":"smtp_dot"')"
+        arrived="$(sends_count sends_hard fake-smtp "$delivered")"
+        sends_agent "$sends_agents" "http://gateway:8090$1" "$2" "$3" >"$work/sends-call" 2>&1 &
+        sends_pid=$!
+        if [ "$4" != 1 ]; then
+            sends_press_ref sends_hard "$3"
+        fi
+        sends_until sends_hard fake-smtp '"event":"smtp_dot"' $((dots + 1)) \
+            "the send never reached the fake mail server's final dot" "$work/sends-call"
+        stop_at="$(date +%s%N)"
+        sends_hard stop gateway vault >/dev/null 2>&1 || sends_fail "the vault and the gateway didn't stop"
+        wait "$sends_pid" || sends_fail "the send in flight failed on stop: $(cat "$work/sends-call")"
+        cat "$work/sends-call"
+        if [ "$4" = 1 ]; then
+            sends_answered "the send in flight" "ok 1 sent ("
+        fi
+        sends_until sends_hard fake-smtp "$delivered" $((arrived + 1)) "the send in flight never arrived"
+        delivered_at="$(sends_at sends_hard fake-smtp "$delivered")"
+        [ -n "$delivered_at" ] && [ "$stop_at" -lt "$delivered_at" ] \
+            || sends_fail "the stop came after the send finished"
+        for sends_id in "$sends_vault_id" "$sends_gateway_id"; do
+            [ "$(docker inspect -f '{{.State.ExitCode}}' "$sends_id")" = "0" ] \
+                || sends_fail "$(docker inspect -f '{{.Name}}' "$sends_id") exited non-zero"
+            [ "$(docker inspect -f '{{.Config.StopTimeout}}' "$sends_id")" = "330" ] \
+                || sends_fail "$(docker inspect -f '{{.Name}}' "$sends_id")'s stop window isn't the compose file's 330 s"
+        done
+        vault_stopped="$(date -d "$(docker inspect -f '{{.State.FinishedAt}}' "$sends_vault_id")" +%s%N)"
+        gateway_stopped="$(date -d "$(docker inspect -f '{{.State.FinishedAt}}' "$sends_gateway_id")" +%s%N)"
+        [ "$gateway_stopped" -lt "$vault_stopped" ] || sends_fail "the vault stopped before the gateway"
+        if [ "$4" != 1 ]; then
+            [ "$gateway_stopped" -lt "$delivered_at" ] \
+                || sends_fail "the gateway outlived the held send, so the vault wasn't stopped while its forward ran"
+        fi
+    }
+
+    step "approvals, hardened tier: an accepted send stopped in flight finishes first, asked in the agent's own client (D-71)"
+    sends_hard_stopped /s/mail/mcp accept "Stopped in flight, the gateway's approval, hardened tier." 1
+
+    step "approvals, hardened tier: an accepted send stopped in flight finishes first, held by the vault and approved in Telegram (D-71)"
+    sends_hard start vault gateway >/dev/null 2>&1 || sends_fail "the vault and the gateway didn't start again"
+    sends_hard_ready
+    sends_slow sends_hard
+    sends_hard_stopped /s/mail-held/mcp decline "Stopped in flight, vault_approval, hardened tier." 0
+    sends_hard start vault >/dev/null 2>&1 || sends_fail "the vault didn't start again"
+    sends_recorded sends_hard vault "$sends_ref"
+
+    step "approvals, hardened tier: the bot's token is in no log of the vault, the gateway or the egress role (G.1)"
+    if sends_hard logs vault gateway egress-proxy 2>&1 | grep -qF "${bot_token#*:}"; then
+        sends_fail "the bot's token is in the hardened tier's logs"
+    fi
+    sends_cleanup
+    trap cleanup EXIT
+fi
+# --- end of D-71's rows -------------------------------------------------------------------------
 
 # --- S11: the bridge in the hardened shape (A) and the standard one (B) -------------------------
 # With --bridge BRIDGE only: the bridge example's image (examples/bridge), the example server

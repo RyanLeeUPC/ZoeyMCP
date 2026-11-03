@@ -680,14 +680,14 @@ async def test_the_s3_fake_delegates_and_records() -> None:
 def test_the_runner_parses_its_options() -> None:
     plain = run_telegram.parse(["cert.pem", "key.pem", "--token", TOKEN])
     assert (plain.cert, plain.key, plain.port) == ("cert.pem", "key.pem", run_telegram.PORT)
+    assert plain.host == run_telegram.HOST == "127.0.0.1"
     assert run_telegram.fake_for(plain).switches == set()
-    argv = ["cert.pem", "key.pem", "--token", TOKEN, "--port", "9001"]
+    argv = ["cert.pem", "key.pem", "--token", TOKEN, "--host", "192.0.2.7", "--port", "9001"]
     argv += ["--switch", "conflict", "--switch", "manages_bots"]
     args = run_telegram.parse(argv)
     fake = run_telegram.fake_for(args)
-    assert (args.port, fake.token) == (9001, TOKEN)
+    assert (args.host, args.port, fake.token) == ("192.0.2.7", 9001, TOKEN)
     assert fake.switches == {Switch.CONFLICT, Switch.MANAGES_BOTS}
-    assert run_telegram.HOST == "127.0.0.1"
 
 
 def test_the_fake_over_https_and_its_control_routes(tmp_path: Path) -> None:

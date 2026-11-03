@@ -43,8 +43,11 @@ from files it can't write, inside its environment, and only if an entry point in
    toolkits; the gateway's holds every official distribution at its official version, and the
    added ones shadow no official module; the entry points are the expected ones; the example
    mail toolkit loads as the gateway's uid, with the origin check on, under the pin the example
-   policy commits, and `zoeymcp review mail` shows that pin; and both tiers serve the portal's
-   files.
+   policy commits, and `zoeymcp review mail` shows that pin; both tiers serve the portal's
+   files; and in both tiers (the hardened one with the official vault and the derived gateway)
+   the toolkit sends through a fake mail server under each approval mode, asked in the agent's
+   own client or held by the vault and approved in a fake Telegram, and a send in flight
+   finishes when the gateway and the vault stop.
 
 Checks 3 and 4 only read files, so nothing the new layer holds runs before it is checked.
 
