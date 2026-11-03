@@ -2338,15 +2338,22 @@ from tests.fakes.agent import ACCEPT, DECLINE, Script, agent
 url, token, answer, body = sys.argv[1:5]
 async def main():
     script = Script([ACCEPT if answer == "accept" else DECLINE])
+    result = None
     with anyio.move_on_after(120):
         try:
             async with agent(url, script=script, headers={"authorization": f"Bearer {token}"}) as client:
+                # Listed first, as an agent does: the SDK checks a result against the tool'"'"'s
+                # output schema and lists the tools after the call if it has not, which a
+                # stopping gateway refuses, losing an answer it gave.
+                await client.list_tools()
                 result = await client.call_tool("send_note", {"subject": "Smoke", "body": body})
         except Exception as exc:
-            print("cut", type(exc).__name__)
+            if result is None:  # a failure closing the session after the answer is not a cut
+                print("cut", type(exc).__name__)
+                return
+        if result is not None:
+            print("error" if result.is_error else "ok", len(script.prompts), result.content[0].text)
             return
-        print("error" if result.is_error else "ok", len(script.prompts), result.content[0].text)
-        return
     print("cut", "no answer in 120 s")
 anyio.run(main)
 '
