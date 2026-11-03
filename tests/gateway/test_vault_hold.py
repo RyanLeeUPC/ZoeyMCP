@@ -613,6 +613,7 @@ async def test_legacy_cancel_withdraws(tmp_path: Path, link: str) -> None:
             await rig.settled()
             late = await rig.decide(hold)
     assert answer.json()["code"] == "approval_withdrawn"
+    assert "reason" not in answer.json()  # the gateway names no stream_lost (step 16)
     assert late == DecideRefusal("withdrawn")
     assert rig.upstream.posts() == [cancel]  # only the other session's
     assert rig.kinds(REF_A) == [
@@ -648,6 +649,37 @@ async def test_a_shared_place_is_cancelled_whole(tmp_path: Path, link: str) -> N
     assert first.json()["code"] == "approval_declined"
     assert second.json()["code"] == "approval_withdrawn"
     assert rig.kinds(REF_B)[1:] == [("decided", "stream_lost"), ("outcome", "not_sent")]
+    assert rig.upstream.received == []
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_withdrawal_names_its_reason(tmp_path: Path, link: str) -> None:
+    """Step 10's deviation 18, vault side (M8 step 16, K.3): a waiting request's
+    ``approval_withdrawn`` names its reason from a closed set, ``operator`` for the host's
+    withdraw (via host on the chain) and ``changed`` for a policy change, so the gateway gives
+    each its own text."""
+    rig = HoldRig(tmp_path, link=link)
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            first, second = Answer(), Answer()
+            async with anyio.create_task_group() as group:
+                group.start_soon(first.post, http, SHOP, call(), headers(held=marker(REF_A)))
+                await rig.surface.holds(1)
+                other = headers(held=marker(REF_B, client="agent2"))
+                group.start_soon(second.post, http, SHOP, call(id=2), other)
+                await rig.surface.holds(2)
+                withdrawn = await rig.on_vault(
+                    lambda: rig.app.withdraw_by_host(lambda hold: hold.ref == REF_A)
+                )
+                assert [hold.ref for hold in withdrawn] == [REF_A]
+                await first.done.wait()
+                await rig.reload(held=())  # place_order leaves vault_approval
+            await rig.settled()
+    assert (first.json()["code"], first.json()["reason"]) == ("approval_withdrawn", "operator")
+    assert (second.json()["code"], second.json()["reason"]) == ("approval_withdrawn", "changed")
+    decided = {r.ref: r.fields for r in rig.records() if r.kind == "decided"}
+    assert (decided[REF_A]["decision"], decided[REF_A]["via"]) == ("withdrawn", "host")
+    assert (decided[REF_B]["decision"], decided[REF_B]["via"]) == ("withdrawn", "none")
     assert rig.upstream.received == []
 
 

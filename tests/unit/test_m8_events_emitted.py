@@ -80,6 +80,11 @@ EVENTS = {
     "approval_refused_too_long": "vault",
     "approver_started": "vault",
     "approver_stopped": "vault",
+    # Step 16: the host's Telegram enrolment (G.8, K.2): opened (the bot's username), enrolled
+    # (no ids) and the builder's line for one that stopped (its reason only).
+    "approver_enrolment_opened": "vault",
+    "approver_enrolled": "vault",
+    "approver_enrolment_failed": "vault",
 }
 
 

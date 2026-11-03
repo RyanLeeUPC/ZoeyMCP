@@ -51,6 +51,7 @@ from zoeymcp.vault import (
     reviewjobs,
     secretplan,
     store,
+    telegram,
     telegramwire,
 )
 from zoeymcp.vault import app as vault_app
@@ -322,6 +323,20 @@ QUEUE = {
     "withdrawn": 409,
     "digest_changed": 409,
 }
+# M8 step 16: the host's Telegram commands (G.8, M.2): an enrolment that stopped or never began,
+# and the probe with no approver.
+ENROL = {
+    "approver_not_set": 409,
+    "enrolment_contested": 409,
+    "enrolment_expired": 409,
+    "enrolment_unconfirmed": 409,
+    "enrolment_unreachable": 502,
+    "enrolment_secret": 404,
+    "enrolment_busy": 409,
+    "enrolment_unknown": 404,
+    "approver_can_manage_bots": 409,
+    "approver_token_shared": 409,
+}
 # The VaultApp methods of the held branch (M8 design B), whose literal codes are all M8's.
 HELD_METHODS = (
     "_handle",
@@ -486,7 +501,7 @@ def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
-    expected |= SOCKET | SAVE | HELD | ASK | QUEUE
+    expected |= SOCKET | SAVE | HELD | ASK | QUEUE | ENROL
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -784,6 +799,22 @@ def test_every_queue_reason_is_catalogued() -> None:
     assert {reason: CATALOGUE[reason].status for reason in QUEUE} == QUEUE
     text = refusal("already_decided", where="in Telegram", at="14:03 UTC", decision="approved")
     assert text.error == "Already decided in Telegram at 14:03 UTC: approved."
+
+
+def test_every_enrolment_reason_is_catalogued() -> None:
+    """M8 step 16, G.8, M.2: every reason an enrolment or the probe refuses with
+    (``vault/telegram.py``'s ``EnrolReason``) is catalogued with its status; M.2's five among
+    them."""
+    found = set(get_args(telegram.EnrolReason))
+    assert found == set(ENROL)
+    assert {reason: CATALOGUE[reason].status for reason in found} == ENROL
+    assert {
+        "enrolment_contested",
+        "enrolment_expired",
+        "enrolment_unconfirmed",
+        "approver_can_manage_bots",
+        "approver_token_shared",
+    } <= found
 
 
 def test_the_offline_texts_name_the_vaults_uid() -> None:

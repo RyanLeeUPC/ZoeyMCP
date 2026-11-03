@@ -937,6 +937,58 @@ async def test_each_vault_answer_maps_to_its_text(
     assert held.approvals.unheld["notes"] == (1 if said == elsewhere.UNHELD else 0)
 
 
+POLICY_CHANGED = "refused: the policy changed; call the tool again"
+
+
+@pytest.mark.parametrize(
+    ("reason", "said"),
+    [
+        ("changed", POLICY_CHANGED),
+        ("operator", "refused: the operator withdrew this call; nothing was sent"),
+        ("shutdown", POLICY_CHANGED),
+        (None, POLICY_CHANGED),
+    ],
+    ids=["changed", "operator", "unnamed", "none"],
+)
+async def test_a_withdrawal_says_why(tmp_path: Path, reason: str | None, said: str) -> None:
+    """Step 10's deviation 18 (M8 step 16): the vault's ``approval_withdrawn`` names its reason,
+    and each named one has its own text; the operator's withdraw (K.3, J15) says so, and a
+    policy change, a reason the gateway doesn't name yet (the stop's, step 17) or none keeps
+    "the policy changed". Each is recorded withdrawn, nothing sent."""
+    held = await in_process(tmp_path)
+    result = await settle(
+        held.approvals,
+        held.call,
+        held.record,
+        held.settings,
+        refused("approval_withdrawn", reason=reason),
+        None,
+        UpstreamError("rpc_error"),
+        0.0,
+    )
+    assert isinstance(result, CallToolResult)
+    assert text(result) == f"{said} (ref {held.call.ref})"
+    assert held.records() == [("asked", None), ("decided", "withdrawn"), ("outcome", "not_sent")]
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (b'{"error":"conflict","code":"approval_withdrawn","reason":"operator"}', "operator"),
+        (b'{"error":"conflict","code":"approval_withdrawn","reason":"changed"}', "changed"),
+        (b'{"error":"conflict","code":"approval_withdrawn","reason":"Operator!"}', None),
+        (b'{"error":"conflict","code":"approval_withdrawn","reason":1}', None),
+        (b'{"error":"conflict","code":"approval_withdrawn"}', None),
+    ],
+    ids=["operator", "changed", "not-a-name", "not-a-string", "none"],
+)
+def test_a_withdrawals_reason_is_read_as_a_name(body: bytes, reason: str | None) -> None:
+    """``held_answer`` reads a refusal's ``reason`` only in a name's form (lowercase letters and
+    underscores, at most 32): the gateway's own table gives it its text."""
+    found = held_answer(409, httpx2.Headers({"x-zoeymcp-vault": "refused"}), body)
+    assert (found.code, found.reason) == ("approval_withdrawn", reason)
+
+
 @pytest.mark.parametrize(
     ("headers", "body", "outcome"),
     [

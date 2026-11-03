@@ -95,6 +95,7 @@ WITHDRAWN: Final[Mapping[str, str]] = {
     "stream_lost": "the call was cancelled",
     "caller_cancelled": "the call was cancelled",
     "gateway_restarted": "the gateway restarted",
+    "operator": "the operator withdrew it",
 }
 _STATES: Final = frozenset(
     {"pending", "approved", "forwarding", "done", "denied", "expired", "withdrawn"}

@@ -2732,6 +2732,16 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 409 | `expired` | This approval expired at its deadline, so nothing was sent. |
 | 409 | `withdrawn` | This approval was withdrawn, so nothing was sent. |
 | 409 | `digest_changed` | This approval's text isn't the one you were shown, so nothing was decided: open it again in the queue. |
+| 409 | `enrolment_contested` | Someone else reads this bot's updates, or presented the enrolment code too, so nothing was enrolled: revoke the token with the bot-making account, store the new one, and enrol again. |
+| 409 | `enrolment_expired` | The enrolment ended before its code was presented (10 minutes, or it was stopped): enrol again. |
+| 409 | `enrolment_unconfirmed` | The confirmation code wasn't the one the bot sent, or came too late, so nothing was enrolled: enrol again. |
+| 502 | `enrolment_unreachable` | Telegram didn't answer the enrolment with this token: check the token and the egress allowlist, then enrol again. |
+| 404 | `enrolment_secret` | No store secret by that name holds a token for https://api.telegram.org: store it with zoeymcp secret set NAME --origin https://api.telegram.org. |
+| 409 | `enrolment_busy` | Another enrolment is open: finish it, or stop it first. |
+| 404 | `enrolment_unknown` | No enrolment by that ID: it ended, or the vault restarted. Enrol again. |
+| 409 | `approver_can_manage_bots` | This bot can manage other bots; use a plain bot for approvals. |
+| 409 | `approver_token_shared` | Another secret, credential, route or connector holds this bot's token or the same bot: give the approver a bot of its own. |
+| 409 | `approver_not_set` | The policy names no Telegram approver here: enrol one and add it first. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |
@@ -2820,6 +2830,17 @@ more needs nothing more. The bot's token is in each request's path, so the vault
 request line: it caps the HTTP libraries' own loggers at `WARNING`, and logs a failed Bot API call
 by its method, error type and status only. The self-test expects the destination but never
 reaches it.
+
+**The enrolment's allowance.** `zoeymcp approver telegram enrol` finds the operator's ids before
+the policy names the approver, so the policy can't allow its traffic yet. While an enrolment is
+open (10 minutes at most, until it is confirmed, refused or stopped with Ctrl-C), the vault adds
+`api.telegram.org:443` to its own list as a temporary allowance with the reason `approver`, the
+way an onboarding's allowance works. Through the egress role it needs nothing more: the role's
+long poll is answered at once, and the vault waits up to 5 s for the role to fetch the widened
+list. With a proxy of your own, which reads no list of the vault's, allow `api.telegram.org:443`
+for the vault before you enrol (`check --emit-egress-allowlist` shows it once the policy names
+the approver). The allowance is gone when the enrolment ends; the approver's own entry comes
+from the policy after that.
 
 **Setting it.** `egress_proxy` is `http://host:port`, with no path:
 

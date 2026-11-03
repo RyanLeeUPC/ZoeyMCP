@@ -208,11 +208,15 @@ def page(
     known: Mapping[str, Collection[str]] | None = None,
     broken_at: int | None = None,
     archived: Coverage | None = None,
+    vault_calls: bool = False,
 ) -> dict[str, Any]:
     """One page of the view: the rows whose seq is below ``before``, newest first, at most
     ``limit`` (1 to :data:`MAX_LIMIT`), and ``next``, the ``before`` of the page after it (None at
     the end). ``chain``: the vault's own chain's records, joined to the copy's calls by ref (J.2);
-    its ledger-level records aren't rows. Orphans and ``vault_only``, the newest
+    its ledger-level records aren't rows. ``vault_calls`` keeps only the rows of the calls that
+    chain holds (``ledger --vault --chain vault``, M8 design K.3): still joined against the whole
+    copy, so a call the copy holds is never one only the vault's chain holds. Orphans and
+    ``vault_only``, the newest
     :data:`MAX_LIMIT` calls only the vault's chain holds (``vault_only_more`` counts the rest),
     are on the first page, judged against ``records`` (the live chain, whose files ``held``
     lists), ``archived``, what the kept archived epochs hold, and for orphans the vault chain's
@@ -247,6 +251,8 @@ def page(
             calls.add(row["seq"])
         rows.append(row)
     rows.sort(key=lambda row: row["seq"], reverse=True)
+    if vault_calls:
+        rows = [row for row in rows if row.get("ref") in theirs]
     if before is not None:
         rows = [row for row in rows if row["seq"] < before]
     shown = rows[:limit]

@@ -82,6 +82,25 @@ claim (``nothing_to_acknowledge`` when the head is behind no claim and no other 
 number the host typed, which must be that plan's (``plan_changed`` otherwise). ``GET /policy``
 names what the witness holds. Every write is the host's, through ``ManagedPolicy.write`` (G.6);
 in declarative mode each answers ``policy_not_managed``.
+
+``zoeymcp approvals`` uses the ``/approvals`` routes (M8 design K.3): ``GET /approvals`` lists
+the holds waiting, oldest first, and those decided recently, by both identifiers (the ref and
+the approval id) and never with a text; ``GET /approvals/{id}`` one hold, its composed text
+whole (the one answer that carries one, Z14); ``POST /approvals/{id}/withdraw`` and ``POST
+/approvals/withdraw-all`` withdraw undecided holds as the host's (``via`` host): each message is
+edited and each agent told. ``{id}`` is either identifier (OPS-12): 16 lowercase hex digits is a
+ref, anything else an approval id. No route decides (Q13). ``zoeymcp ledger --vault --chain
+vault|copy|both`` reads ``GET /ledger/reported?chain=``, and ``--verify`` ``POST
+/ledger/vault/verify``, the vault chain's walk with the vault's key.
+
+``zoeymcp approver telegram`` uses the ``/approvers/telegram`` routes (G.8): ``POST .../enrol``
+with ``{secret}`` opens an enrolment and answers its ``t.me`` link, the one answer that carries
+its code; ``GET .../enrol/{enrolment}?wait=N`` its state, and once the code was presented who
+presented it; ``POST .../enrol/{enrolment}/confirm`` with ``{code}``, the code the bot sent that
+chat, answers the identity and the policy lines, or refuses ``enrolment_unconfirmed``;
+``DELETE .../enrol/{enrolment}`` stops it. An ``enrolment_busy`` refusal names the open one's
+``enrolment`` and ``expires``, so a host whose CLI lost it can stop it. ``POST .../test`` sends
+the probe. Their refusals are the catalogue's (M.2).
 """
 
 from __future__ import annotations
@@ -97,7 +116,7 @@ import secrets
 import stat
 import sys
 import time
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -108,7 +127,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from ..common import files
+from ..common import egresslist, files
 
 # The CLI reads these from common, so the gateway's entry path loads no vault code.
 from ..common.adminsocket import DEFAULT_SOCKET as DEFAULT_SOCKET
@@ -120,16 +139,19 @@ from ..common.policy.plan import WritePlan
 from ..common.policy.ratchet import Grants
 from ..common.policy.schema import Policy, hash_token
 from ..common.reviewreport import RemoteReport, ToolkitReport
+from ..portal import approvalsview, reviewview, setupcode
 from ..portal import passkeys as passkey_file
-from ..portal import reviewview, setupcode
 from ..portal.passkeys import PasskeyError, Passkeys
 from ..portal.refusals import Refusal, refusal
 from ..portal.routes import BODY_CHOICES
 from ..portal.sessions import SETUP_SESSION_MAX
 from ..portal.setupcode import Record, Redeemed, Refused, SetupCode
 from . import health, ledgerview, logs, secretops, secretplan
+from . import telegram as telegram_approver
+from .approvers import Closed
 from .connectors.smtp import SmtpConnectors
 from .gatewaykeys import GatewayKeyError, GatewayKeys
+from .holds import Ending, Hold, HoldTable
 from .keys import KeySet, PortalKey
 from .managed import (
     ManagedPolicy,
@@ -239,6 +261,14 @@ _PASSKEY_REFUSALS: Final = {
     "ambiguous_fingerprint": (409, "more than one passkey has that fingerprint; nothing removed"),
     "not_written": (500, "not written to disk; nothing changed; check the state volume"),
 }
+# The host's approvals and Telegram commands (M8 design K.3, G.8): a ref is 16 lowercase hex
+# digits, anything else an approval id (OPS-12); their bodies' cap; an enrolment's longest
+# ?wait=N; and the ledger's chains.
+_REF: Final = re.compile(r"[0-9a-f]{16}")
+APPROVALS_BODY_MAX: Final = 1024
+ENROL_WAIT_MAX: Final = 60
+NO_APPROVALS: Final = "this vault holds no approvals"
+CHAINS: Final = frozenset({"vault", "copy", "both"})
 # Login reasons answered with something other than 400.
 _LOGIN_STATUS = {
     "not_oauth": 404,
@@ -520,10 +550,10 @@ class HealthReader:
     without it, the report has no ``gateway`` section. ``policy_state`` is the policy store's
     (``vault/managed.py``, M6 design M.5); without it, or while it answers None (no store), the
     report has no ``policy`` section. ``chain`` is the vault's approval chain (M8 design J.1):
-    while the running policy holds a call or names ``approvers.telegram``, the report has an
-    ``approvals`` section, with the refusals the hold table's caps counted lately from
-    ``saturated`` (D.3), the holds ``waiting`` now, and the Telegram approver's state from
-    ``telegram`` (G.7)."""
+    while the running policy holds a call or names ``approvers.telegram``, or an enrolment
+    found the bot contested, the report has an ``approvals`` section, with the refusals the hold
+    table's caps counted lately from ``saturated`` (D.3), the holds ``waiting`` now, and the
+    Telegram approver's state from ``telegram`` (G.7, G.8)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -569,10 +599,14 @@ class HealthReader:
 
     def _approvals(self, policy: Policy) -> health.HoldState | None:
         """The vault hold for health (M8 design K.1); None without a chain, or while the policy
-        holds no call and names no Telegram approver."""
+        holds no call, names no Telegram approver, and no enrolment found the bot contested
+        (G.8 step 3)."""
         approvers = policy.approvers
-        telegram = None if approvers is None else approvers.telegram
-        if self.chain is None or not (held_map(policy) or telegram is not None):
+        named = approvers is not None and approvers.telegram is not None
+        state = None if self.telegram is None else self.telegram()
+        if not named and (state is None or not state.contested):
+            state = None
+        if self.chain is None or not (held_map(policy) or named or state is not None):
             return None
         refused = 0 if self.saturated is None else self.saturated()
         return health.HoldState(
@@ -580,7 +614,7 @@ class HealthReader:
             saturated=refused,
             waiting=0 if self.waiting is None else self.waiting(),
             portal=approvers is not None and approvers.portal is not None,
-            telegram=None if self.telegram is None or telegram is None else self.telegram(),
+            telegram=state,
         )
 
     def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
@@ -635,6 +669,58 @@ class HoldsHealth(Protocol):
     def approver_state(self) -> health.TelegramState | None: ...
 
 
+class HostApprovals(Protocol):
+    """What the host's approvals and Telegram commands reach (``VaultApp``'s, M8 design K.3,
+    G.8), on the loop both serve from."""
+
+    @property
+    def holds(self) -> HoldTable: ...
+
+    def hold_wall(self, at: float) -> float: ...
+
+    def telegram_delivered(self, hold_id: str) -> bool: ...
+
+    def closed(self) -> list[Closed]: ...
+
+    def withdraw_by_host(self, which: Callable[[Hold], bool]) -> list[Hold]: ...
+
+    async def probe_telegram(self) -> str | None: ...
+
+    @property
+    def enrolment(self) -> telegram_approver.Enrolment | None: ...
+
+    async def enrol(self, secret: str) -> tuple[telegram_approver.Enrolment, str]: ...
+
+
+def approvals_answer(
+    holds: Iterable[Hold],
+    closed: Iterable[Closed],
+    wall: approvalsview.Wall,
+    delivered: Callable[[str], bool],
+) -> dict[str, Any]:
+    """``GET /approvals`` (K.3): every hold waiting, on whatever surface, oldest first, and the
+    holds decided recently (running, then the last closed, newest first), each with both
+    identifiers; never a text."""
+    live = list(holds)
+    waiting = sorted((h for h in live if h.state == "held"), key=lambda hold: hold.asked_at)
+    running = [hold for hold in live if hold.state in approvalsview.APPROVED]
+    running.sort(key=lambda hold: hold.decided_at or 0.0, reverse=True)
+    ended: list[Hold | Closed] = [*running, *closed]
+    decided = [approvalsview.decided(hold, wall, approvalsview.HOST_WHERE) for hold in ended]
+    return {
+        "waiting": [approvalsview.row(hold, wall, delivered) for hold in waiting],
+        "decided": decided[: approvalsview.DECIDED_SHOWN],
+    }
+
+
+def find_hold(table: HoldTable, key: str) -> tuple[Hold | None, Ending | None]:
+    """The hold ``key`` names, live or ended (OPS-12): 16 lowercase hex digits is a ref,
+    anything else an approval id."""
+    if _REF.fullmatch(key):
+        return table.by_ref(key), table.ending(key)
+    return table.get(key), table.ended(key)
+
+
 class AdminApp:
     def __init__(
         self,
@@ -663,6 +749,7 @@ class AdminApp:
         source: Callable[[], tuple[str, str]] | None = None,
         random: Callable[[int], bytes] = secrets.token_bytes,
         holds: HoldsHealth | None = None,
+        approvals: HostApprovals | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -710,7 +797,10 @@ class AdminApp:
         ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests).
 
         ``holds`` is the vault hold's health (``VaultApp``'s, M8 design K.1, G.7): with it and
-        ``chain``, health has the ``approvals`` section the portal's has."""
+        ``chain``, health has the ``approvals`` section the portal's has. ``approvals`` is the
+        hold table and the Telegram approver as the host's commands reach them (K.3, G.8);
+        without it the ``/approvals`` and ``/approvers`` routes answer 503."""
+        self._approvals = approvals
         self._store = store
         self._random = random
         self._managed = managed
@@ -778,6 +868,22 @@ class AdminApp:
                 Route("/health", self._health, methods=["GET"]),
                 Route("/ledger/reported", self._ledger_reported, methods=["GET"]),
                 Route("/ledger/reported/restart", self._ledger_restart, methods=["POST"]),
+                Route("/ledger/vault/verify", self._ledger_verify, methods=["POST"]),
+                Route("/approvals", self._approvals_list, methods=["GET"]),
+                Route("/approvals/withdraw-all", self._withdraw_all, methods=["POST"]),
+                Route("/approvals/{id}", self._approval_show, methods=["GET"]),
+                Route("/approvals/{id}/withdraw", self._approval_withdraw, methods=["POST"]),
+                Route("/approvers/telegram/enrol", self._enrol, methods=["POST"]),
+                Route("/approvers/telegram/enrol/{enrolment}", self._enrolled, methods=["GET"]),
+                Route(
+                    "/approvers/telegram/enrol/{enrolment}/confirm",
+                    self._enrol_confirm,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/approvers/telegram/enrol/{enrolment}", self._enrol_stop, methods=["DELETE"]
+                ),
+                Route("/approvers/telegram/test", self._telegram_test, methods=["POST"]),
                 Route("/policy", self._policy_head, methods=["GET"]),
                 Route("/policy/revisions", self._policy_history, methods=["GET"]),
                 Route("/policy/revisions/{revision}", self._policy_revision, methods=["GET"]),
@@ -1186,19 +1292,25 @@ class AdminApp:
         joined by ref with the vault's own chain (M8 design J.2). The first page's orphans are
         judged against the live chain, every kept archived epoch and the vault chain's accepts
         (J.3), and it lists the calls only the vault's chain holds. ``chain_readable`` is false
-        when that chain can't be read: the rows are then the copy's alone."""
+        when that chain can't be read: the rows are then the copy's alone. ``?chain=`` picks
+        the chains (M8 design K.3): ``both`` (the default), ``copy`` (the copy's rows alone) or
+        ``vault`` (the calls the vault's chain holds alone, still joined against the copy, so
+        one the copy holds is a row and never in ``vault_only``)."""
         copy = self._reports
         if copy is None:
             return _reason(503, "the vault keeps no reported copy", "unavailable")
         query = dict(request.query_params)
-        if set(query) - {"before", "limit"} or len(request.query_params.multi_items()) != len(
-            query
-        ):
-            return _reason(400, "expected ?before=SEQ&limit=N", "bad_query")
+        if set(query) - {"before", "limit", "chain"} or len(
+            request.query_params.multi_items()
+        ) != len(query):
+            return _reason(400, "expected ?before=SEQ&limit=N&chain=C", "bad_query")
         try:
             before, limit = _number(query.get("before")), _number(query.get("limit"))
         except _BadNumber:
             return _reason(400, "before and limit are numbers", "bad_query")
+        chains = query.get("chain", "both")
+        if chains not in CHAINS:
+            return _reason(400, "chain is vault, copy or both", "bad_query")
         policy = self._policy()
         journals = self._journals(policy)
 
@@ -1207,7 +1319,7 @@ class AdminApp:
 
         def read_chain() -> list[dict[str, Any]] | None:
             try:
-                return [] if self._chain is None else self._chain.records()
+                return [] if self._chain is None or chains == "copy" else self._chain.records()
             except OSError:
                 return None  # the copy's rows are still worth showing
 
@@ -1231,9 +1343,188 @@ class AdminApp:
             limit=ledgerview.MAX_LIMIT if limit is None else limit,
             broken_at=copy.broken_at,
             archived=archived,
+            vault_calls=chains == "vault",
         )
         answer = {**page, "chain_readable": chain is not None, "refused": copy.refused}
-        return JSONResponse({**answer, "archives": copy.archives()})
+        return JSONResponse({**answer, "chain": chains, "archives": copy.archives()})
+
+    async def _ledger_verify(self, request: Request) -> Response:
+        """``zoeymcp ledger --vault --verify`` (K.3): the vault chain's walk, every file in
+        order, as the gateway's ``ledger --verify`` walks its own."""
+        chain = self._chain
+        if chain is None:
+            return _reason(503, "the vault keeps no approval chain", "unavailable")
+        try:
+            verified = await asyncio.to_thread(chain.verify)
+        except OSError:
+            return _reason(503, "the vault's approval chain can't be read", "unavailable")
+        return JSONResponse(verified)
+
+    # --- the host's approvals (M8 design K.3) ---------------------------------------------------
+
+    def _approvals_of(self) -> HostApprovals | Response:
+        if self._approvals is None:
+            return _reason(503, NO_APPROVALS, "unavailable")
+        return self._approvals
+
+    async def _approvals_list(self, request: Request) -> Response:
+        """Waiting and decided recently, by both identifiers, without texts."""
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        answer = approvals_answer(
+            approvals.holds.holds(),
+            approvals.closed(),
+            approvals.hold_wall,
+            approvals.telegram_delivered,
+        )
+        return JSONResponse(answer)
+
+    async def _approval_show(self, request: Request) -> Response:
+        """One hold by either identifier, its composed text whole (Z14): the one answer of the
+        socket's that carries a text. One that ended answers how."""
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        hold, ending = find_hold(approvals.holds, request.path_params["id"])
+        if hold is None:
+            return _queue_refused(approvalsview.gone(ending, approvals.hold_wall))
+        answer = approvalsview.detail(hold, approvals.hold_wall, approvals.telegram_delivered)
+        return JSONResponse(answer, headers={"cache-control": "no-store"})
+
+    async def _approval_withdraw(self, request: Request) -> Response:
+        """Withdraw one undecided hold by either identifier, as the host's (B.5): nothing is
+        sent. A decided one runs on and is refused by how it was decided."""
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        if await request.body() not in (b"", b"{}"):
+            return _reason(400, "a withdraw takes no body", "bad_body")
+        hold, ending = find_hold(approvals.holds, request.path_params["id"])
+        if hold is None:
+            return _queue_refused(approvalsview.gone(ending, approvals.hold_wall))
+        withdrawn = approvals.withdraw_by_host(lambda found: found.id == hold.id)
+        if not withdrawn:
+            # Decided already: refused as the queue refuses a decision on it (H.3).
+            refused = approvalsview.check(hold, None, "", now=0.0, wall=approvals.hold_wall)
+            return _queue_refused(refused or approvalsview.Refused("approval_unknown"))
+        return JSONResponse({"withdrawn": [_withdrawn(found) for found in withdrawn]})
+
+    async def _withdraw_all(self, request: Request) -> Response:
+        """J15's emergency stop: every undecided hold withdrawn as the host's."""
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        if await request.body() not in (b"", b"{}"):
+            return _reason(400, "a withdraw takes no body", "bad_body")
+        withdrawn = approvals.withdraw_by_host(lambda _hold: True)
+        return JSONResponse({"withdrawn": [_withdrawn(found) for found in withdrawn]})
+
+    # --- the Telegram approver's enrolment and probe (M8 design G.8) ----------------------------
+
+    def _enrolment_of(self, request: Request) -> telegram_approver.Enrolment | Response:
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        found = approvals.enrolment
+        if found is None or found.id != request.path_params["enrolment"]:
+            return _enrol_refused("enrolment_unknown")
+        return found
+
+    async def _enrol(self, request: Request) -> Response:
+        """``{secret}``: an enrolment opened, its temporary egress allowance with it, and its
+        ``t.me`` link, the one answer that carries the code."""
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        data = await _json_object(request, APPROVALS_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        name = data.get("secret")
+        if set(data) != {"secret"} or not isinstance(name, str):
+            return _reason(400, "expected {secret}", "bad_body")
+        if secretplan.check_name(name) is not None:
+            return _enrol_refused("enrolment_secret")
+        try:
+            enrolment, link = await approvals.enrol(name)
+        except telegram_approver.EnrolRefused as refused:
+            busy = approvals.enrolment
+            if refused.reason != "enrolment_busy" or busy is None:
+                return _enrol_refused(refused.reason)
+            # The host's socket alone: the open enrolment, so a host whose CLI lost it (a
+            # Ctrl-C while it opened, a closed session) can stop it rather than wait it out.
+            found = refusal(refused.reason)
+            body = {**found.body(), "enrolment": busy.id, "expires": busy.expires}
+            return JSONResponse(body, status_code=found.status)
+        allowance = f"{egresslist.TELEGRAM_HOST}:{egresslist.TELEGRAM_PORT}"
+        answer = {**enrolment.answer(), "link": link, "allowance": allowance}
+        return JSONResponse(answer, headers={"cache-control": "no-store"})
+
+    async def _enrolled(self, request: Request) -> Response:
+        """``?wait=N``: the enrolment once its code was presented or it ended, or after N
+        seconds (at most 60)."""
+        found = self._enrolment_of(request)
+        if isinstance(found, Response):
+            return found
+        query = dict(request.query_params)
+        if set(query) - {"wait"} or len(request.query_params.multi_items()) != len(query):
+            return _reason(400, "expected ?wait=N", "bad_query")
+        try:
+            wait = _number(query.get("wait"))
+        except _BadNumber:
+            return _reason(400, "wait is a number of seconds", "bad_query")
+        await found.wait(min(wait or 0, ENROL_WAIT_MAX))
+        return JSONResponse(found.answer(), headers={"cache-control": "no-store"})
+
+    async def _enrol_confirm(self, request: Request) -> Response:
+        """``{code}``: the confirmation code the host typed, once (T-12). A match answers who
+        enrolled and the policy lines; anything else stops the enrolment."""
+        found = self._enrolment_of(request)
+        if isinstance(found, Response):
+            return found
+        data = await _json_object(request, APPROVALS_BODY_MAX)
+        if isinstance(data, Response):
+            return data
+        code = data.get("code")
+        if set(data) != {"code"} or not isinstance(code, str):
+            return _reason(400, "expected {code}", "bad_body")
+        try:
+            identity = found.confirm(code)
+        except telegram_approver.EnrolRefused as refused:
+            return _enrol_refused(refused.reason)
+        approvers = self._policy().approvers
+        timeout, block = (
+            (3600, 120)
+            if approvers is None
+            else (
+                approvers.timeout,
+                approvers.block_seconds,
+            )
+        )
+        lines = telegram_approver.enrolment_lines(found.secret, identity, timeout, block)
+        answer = {**found.answer(), "secret": found.secret, "lines": lines}
+        return JSONResponse(answer, headers={"cache-control": "no-store"})
+
+    async def _enrol_stop(self, request: Request) -> Response:
+        """The host stopped it (Ctrl-C): its session and allowance close."""
+        found = self._enrolment_of(request)
+        if isinstance(found, Response):
+            return found
+        found.end("enrolment_expired")
+        return JSONResponse(found.answer())
+
+    async def _telegram_test(self, request: Request) -> Response:
+        """G.8's probe: ``{sent, finding}``, the finding None once Telegram took it."""
+        approvals = self._approvals_of()
+        if isinstance(approvals, Response):
+            return approvals
+        if await request.body() not in (b"", b"{}"):
+            return _reason(400, "the test takes no body", "bad_body")
+        try:
+            finding = await approvals.probe_telegram()
+        except LookupError:
+            return _enrol_refused("approver_not_set")
+        return JSONResponse({"sent": finding is None, "finding": finding})
 
     def _journals(self, policy: Policy) -> dict[str, list[dict[str, Any]]]:
         """Each connector's journal records; one that can't be read is left out."""
@@ -1713,6 +2004,26 @@ def _not_managed() -> JSONResponse:
 def _write_refused(refused: WriteRefused) -> JSONResponse:
     status, body = refused_body(refused)
     return JSONResponse(body, status_code=status)
+
+
+def _queue_refused(refused: approvalsview.Refused) -> JSONResponse:
+    """A hold that moved, refused as the portal's queue refuses it (H.3, M.2)."""
+    return _answer(refusal(refused.reason, **dict(refused.fields)))
+
+
+def _enrol_refused(reason: telegram_approver.EnrolReason) -> JSONResponse:
+    """A Telegram command's refusal (G.8, M.2)."""
+    return _answer(refusal(reason))
+
+
+def _withdrawn(hold: Hold) -> dict[str, Any]:
+    """A withdrawn hold, by both identifiers and what it was for: never its text."""
+    return {
+        "approval": hold.id,
+        "ref": hold.ref,
+        "server": hold.server,
+        "tool": hold.tool,
+    }
 
 
 def _onboard_refused(exc: OnboardError) -> JSONResponse:

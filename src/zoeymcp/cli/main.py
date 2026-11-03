@@ -703,9 +703,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "compare with the last anchor in the logs. 'ledger check REF FILE' proves whether "
             "FILE (JSON) holds the arguments that call was made with, without the key leaving "
             "the gateway. Never argument values or prompt text. --vault reads the vault's "
-            "copy of the ledger instead (inside the vault), which the gateway reports to it; "
-            "--restart-chain archives that copy's chain after a fork, gap or full, once you "
-            "have decided why, and asks first."
+            "copy of the ledger instead (inside the vault), which the gateway reports to it, "
+            "joined with the vault's own approval chain (--chain vault|copy|both; --verify walks "
+            "the vault chain); --restart-chain archives that copy's chain after a fork, gap or "
+            "full, once you have decided why, and asks first."
         ),
     )
     ledger.add_argument("action", nargs="?", metavar="check")
@@ -730,6 +731,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ledger.add_argument(
         "--before", type=int, metavar="SEQ", help="with --vault: the rows before this seq"
     )
+    ledger.add_argument(
+        "--chain",
+        choices=("vault", "copy", "both"),
+        help="with --vault: the vault's own approval chain, the reported copy, or both joined "
+        "(the default)",
+    )
     for sub in (review, gateway_status, ledger):
         sub.add_argument(
             "--socket",
@@ -740,6 +747,61 @@ def _build_parser() -> argparse.ArgumentParser:
                 "the vault's"
             ),
         )
+
+    approvals = commands.add_parser(
+        "approvals",
+        help="the held calls waiting and decided recently: list, show, withdraw (inside the vault)",
+        description=(
+            "The calls the vault holds for approval, as the host sees them: list them (the "
+            "default; waiting and decided recently, by ref and approval id, never a text), show "
+            "one's whole text by either identifier, or withdraw one, or every one with --all "
+            "(nothing is sent; the messages are edited and the agents told). No command here "
+            "approves: that takes the portal's passkey or the operator's Telegram."
+        ),
+    )
+    approvals.set_defaults(action=None, key=None, all=False, format="text", socket=None)
+    approvals_commands = approvals.add_subparsers(dest="action", metavar="action")
+    approvals_list = approvals_commands.add_parser(
+        "list", help="waiting and decided recently (the default)"
+    )
+    approvals_show = approvals_commands.add_parser("show", help="one call's whole text")
+    approvals_show.add_argument("key", metavar="REF-OR-ID")
+    approvals_withdraw = approvals_commands.add_parser(
+        "withdraw", help="withdraw a waiting call, or every one with --all"
+    )
+    approvals_withdraw.add_argument("key", nargs="?", metavar="REF-OR-ID")
+    approvals_withdraw.add_argument(
+        "--all", action="store_true", help="withdraw every waiting call (emergency stop)"
+    )
+    approver = commands.add_parser(
+        "approver",
+        help="enrol the Telegram approver, or probe it (inside the vault)",
+        description=(
+            "approver telegram enrol --secret NAME finds the operator's Telegram ids: open the "
+            "link it prints on the phone you will approve from, press Start, and type the "
+            "confirmation code the bot sends; with --apply in managed mode it plans a host "
+            "import and asks first. approver telegram test sends a message with no buttons and "
+            "exits 0 when Telegram took it, 1 otherwise."
+        ),
+    )
+    approver_kinds = approver.add_subparsers(dest="kind", required=True, metavar="approver")
+    telegram = approver_kinds.add_parser("telegram", help="the Telegram approver")
+    telegram_commands = telegram.add_subparsers(dest="action", required=True, metavar="action")
+    telegram_enrol = telegram_commands.add_parser(
+        "enrol", help="find the operator's ids with a one-time link and a confirmation code"
+    )
+    telegram_enrol.add_argument(
+        "--secret", required=True, metavar="NAME", help="the store secret holding the bot's token"
+    )
+    telegram_enrol.add_argument(
+        "--apply", action="store_true", help="in managed mode, plan a host import and ask"
+    )
+    telegram_test = telegram_commands.add_parser(
+        "test", help="send a message with no buttons to the operator's chat"
+    )
+    for sub in (approvals_list, approvals_show, approvals_withdraw, telegram_enrol, telegram_test):
+        sub.add_argument("--format", choices=("text", "json"), default="text")
+        sub.add_argument("--socket", metavar="PATH", help="admin socket path")
 
     login = commands.add_parser(
         "login",
@@ -1843,8 +1905,8 @@ def _cmd_gateway_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> i
 def _cmd_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
     if args.vault:
         return _cmd_vault_ledger(args, stdin, out, err)
-    if args.restart_chain or args.before is not None:
-        err.write("zoeymcp ledger: --restart-chain and --before go with --vault\n")
+    if args.restart_chain or args.before is not None or args.chain is not None:
+        err.write("zoeymcp ledger: --restart-chain, --before and --chain go with --vault\n")
         return EXIT_UNREADABLE
     socket = admin_client.gateway_socket_path(args.socket)
     if args.action not in (None, "check"):
@@ -1892,16 +1954,30 @@ def _cmd_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextI
 
 
 def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
-    """``ledger --vault [--restart-chain] [--before SEQ]``: the vault's reported copy."""
+    """``ledger --vault [--restart-chain] [--before SEQ] [--chain C] [--verify]``: the vault's
+    reported copy, joined with its own approval chain (M8 design K.3), or that chain's walk."""
     gateway_only = (args.action, args.ref, args.since, args.client, args.server, args.tool)
-    if any(value is not None for value in gateway_only) or args.verify:
-        err.write("zoeymcp ledger: --vault takes only --restart-chain, --before and --format\n")
+    if any(value is not None for value in gateway_only):
+        err.write(
+            "zoeymcp ledger: --vault takes only --restart-chain, --before, --chain, --verify and "
+            "--format\n"
+        )
+        return EXIT_UNREADABLE
+    if args.verify and (args.restart_chain or args.before is not None or args.chain is not None):
+        err.write("zoeymcp ledger: --verify with --vault walks the vault chain, alone\n")
         return EXIT_UNREADABLE
     socket = admin_client.socket_path(args.socket)
     try:
+        if args.verify:
+            verified = admin_client.vault_ledger_verify(socket)
+            if args.format == "json":
+                ledger_view.write_json(out, [verified])
+            else:
+                ledger_view.write(out, ledger_view.verify_lines(verified))
+            return EXIT_OK if verified["ok"] else EXIT_FINDINGS
         if args.restart_chain:
             return _restart_chain(socket, stdin, out, err)
-        page = admin_client.vault_ledger(socket, before=args.before)
+        page = admin_client.vault_ledger(socket, before=args.before, chain=args.chain)
     except admin_client.AdminUnavailable as exc:
         err.write(f"zoeymcp ledger: {exc}\n")
         return EXIT_UNREADABLE
@@ -2657,6 +2733,14 @@ def main(
         return _cmd_health(args, out, err)
     if args.command == "policy":
         return _cmd_policy(args, stdin, out, err)
+    if args.command == "approvals":
+        from . import approvals as approvals_cli
+
+        return approvals_cli.run(args, out, err)
+    if args.command == "approver":
+        from . import approver as approver_cli
+
+        return approver_cli.run(args, stdin, out, err)
     raise AssertionError(f"unhandled command {args.command}")  # pragma: no cover
 
 

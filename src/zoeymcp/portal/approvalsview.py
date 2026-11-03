@@ -53,6 +53,8 @@ NOT_DELIVERED: Final = "not delivered to Telegram"
 # Where a decision was taken: in Decided recently ("here" is this queue), and in a refusal.
 WHERE: Final[Mapping[str, str]] = {"portal": " here", "telegram": " in Telegram"}
 DECIDED_WHERE: Final[Mapping[str, str]] = {"portal": "in the portal", "telegram": "in Telegram"}
+# Where, as the host's list says it (K.3): no surface there is "here".
+HOST_WHERE: Final[Mapping[str, str]] = {"portal": " in the portal", "telegram": " in Telegram"}
 NOTHING_SENT: Final = "nothing was sent"
 # A forward's outcome, as Decided recently says it (G.6's words).
 RESULTS: Final[Mapping[str, str]] = {
@@ -182,13 +184,13 @@ def queue(
     live = list(holds)
     running = [hold for hold in live if hold.state in APPROVED and "portal" in hold.surfaces]
     running.sort(key=lambda hold: hold.decided_at or 0.0, reverse=True)
-    decided = [_decided(hold, wall) for hold in running]
-    decided += [_decided(hold, wall) for hold in closed]
+    decided_rows = [decided(hold, wall) for hold in running]
+    decided_rows += [decided(hold, wall) for hold in closed]
     return {
         "enabled": enabled,
         "notice": notice,
         "waiting": [row(hold, wall, delivered) for hold in waiting(live)],
-        "decided": decided[:DECIDED_SHOWN],
+        "decided": decided_rows[:DECIDED_SHOWN],
     }
 
 
@@ -204,9 +206,16 @@ def detail(hold: Hold, wall: Wall, delivered: Callable[[str], bool]) -> dict[str
     }
 
 
-def outcome(state: State, via: Via | None, detail: str | None, at: str) -> str:
-    """How a decided hold went, in words: where and when it was decided, then what was sent."""
-    where = WHERE.get(via or "", "")
+def outcome(
+    state: State,
+    via: Via | None,
+    detail: str | None,
+    at: str,
+    places: Mapping[str, str] = WHERE,
+) -> str:
+    """How a decided hold went, in words: where (by ``places``) and when it was decided, then
+    what was sent."""
+    where = places.get(via or "", "")
     if state in APPROVED:
         return f"approved{where} {at} UTC; sending"
     if state == "done":
@@ -235,12 +244,14 @@ def _names(hold: Hold | Closed) -> dict[str, Any]:
     }
 
 
-def _decided(hold: Hold | Closed, wall: Wall) -> dict[str, Any]:
+def decided(hold: Hold | Closed, wall: Wall, places: Mapping[str, str] = WHERE) -> dict[str, Any]:
+    """A decided hold, as Decided recently lists it (H.1), or the host's list with
+    :data:`HOST_WHERE` (K.3)."""
     at = "" if hold.decided_at is None else clock(wall(hold.decided_at))
     return {
         **_names(hold),
         "state": hold.state,
-        "outcome_shown": outcome(hold.state, hold.via, hold.detail, at),
+        "outcome_shown": outcome(hold.state, hold.via, hold.detail, at, places),
     }
 
 

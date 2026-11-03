@@ -85,8 +85,8 @@ class Surface(Protocol):
 
 @dataclass(frozen=True)
 class Closed:
-    """A hold the portal's queue showed, as it ended (H.1's Decided recently): its handle, what
-    it was for and how it ended, never its text, which leaves with the hold (Z10)."""
+    """A hold as it ended (H.1's Decided recently, the host's approvals list, K.3): its handle,
+    what it was for and how it ended, never its text, which leaves with the hold (Z10)."""
 
     id: str
     ref: str
@@ -98,6 +98,23 @@ class Closed:
     via: Via | None
     decided_at: float | None
     detail: str | None
+
+
+def closed_of(hold: Hold) -> Closed:
+    """``hold`` as it ended, without its text: the portal queue's Decided recently, and the
+    host's approvals list (K.3)."""
+    return Closed(
+        hold.id,
+        hold.ref,
+        hold.kind,
+        hold.server,
+        hold.tool,
+        hold.client,
+        hold.state,
+        hold.via,
+        hold.decided_at,
+        hold.detail,
+    )
 
 
 class PortalQueue:
@@ -124,20 +141,7 @@ class PortalQueue:
 
     async def close(self, hold: Hold, outcome: str) -> None:
         """``hold`` as it ended (its state is ``outcome``), kept without its text."""
-        self._closed.appendleft(
-            Closed(
-                hold.id,
-                hold.ref,
-                hold.kind,
-                hold.server,
-                hold.tool,
-                hold.client,
-                hold.state,
-                hold.via,
-                hold.decided_at,
-                hold.detail,
-            )
-        )
+        self._closed.appendleft(closed_of(hold))
 
     async def notice(self, text: str) -> None:
         self._notice = (text, self._clock())

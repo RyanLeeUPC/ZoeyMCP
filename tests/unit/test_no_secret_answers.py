@@ -124,6 +124,8 @@ SOCKET_PARAMS = {
     "flow": "0123456789abcdef",
     "credential": "broker-mcp",
     "revision": "1",
+    "id": "0123456789abcdef",
+    "enrolment": "0" * 16,
 }
 SOCKET_BODIES: dict[tuple[str, str], Any] = {
     ("PUT", "/secrets/{name}"): {"value": STATIC_VALUE},
@@ -138,6 +140,8 @@ SOCKET_BODIES: dict[tuple[str, str], Any] = {
     ("POST", "/onboard/{onboarding}/register"): {},
     ("POST", "/onboard/{onboarding}/fragment"): {"indent": 2},
     ("POST", "/review/jobs/{job}/diff"): {"include": [], "allow": [], "approve": []},
+    ("POST", "/approvers/telegram/enrol"): {"secret": "approver-bot"},
+    ("POST", "/approvers/telegram/enrol/{enrolment}/confirm"): {"code": "000000"},
 }
 
 
@@ -235,7 +239,8 @@ async def test_no_socket_answer_carries_a_credential_but_the_exceptions(
 async def test_no_socket_answer_carries_the_approver_token(tmp_path: Path) -> None:
     """M8 design G.1, G.7, O.6: with the Telegram approver set, its bot's token in the store and
     its state in health's approvals section, no socket answer carries the token, its secret
-    half or the operator's ids (shown "set")."""
+    half or the operator's ids (shown "set"); nor do the host's approvals and Telegram routes
+    (step 16: the list, the probe, and an enrolment Telegram didn't answer)."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(599)))
     rig = hold_rig.HoldRig(
         tmp_path, link="asgi", surfaces=("telegram",), telegram=Timings(), approver_client=client
@@ -247,6 +252,7 @@ async def test_no_socket_answer_carries_the_approver_token(tmp_path: Path) -> No
         SetupCodes(tmp_path, hold_rig.KEYS.portal_key),
         chain=rig.chain,
         holds=rig.app,
+        approvals=rig.app,
     )
     token = hold_rig.BOT_TOKEN
     hidden = (token, token.partition(":")[2], str(hold_rig.OPERATOR_ID))

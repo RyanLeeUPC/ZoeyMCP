@@ -32,7 +32,10 @@ where a test enables it, is a scripted surface.
   value another secret holds (every write stops until nothing shares it); hidden and shown again
   (the same surface runs again);
 - B.5: the approver switched off, its message edited, the hold kept in the portal alone; switched
-  on again, a press on the old message still reads how it ended.
+  on again, a press on the old message still reads how it ended;
+- the enrolment and the probe (G.8, J1, FM-38; step 16), over the admin socket on the test's
+  loop: J1 in its new order, a re-presented code (contested), a code presented only from another
+  account (unconfirmed), the refusals, a re-enrolment pausing the running poller, and the probe.
 """
 
 from __future__ import annotations
@@ -56,15 +59,27 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from tests.fakes.harness import serve
 from tests.fakes.resolver import FakeResolver
 from tests.fakes.telegram import FOREIGN_WEBHOOK, BotApi, Person, Stored, Switch, keyboard
-from tests.gateway.holdrig import BOT_TOKEN, EPOCH, OPERATOR_ID, HoldRig, call, headers, marker
+from tests.gateway.holdrig import (
+    BOT_TOKEN,
+    EPOCH,
+    OPERATOR_ID,
+    HoldRig,
+    call,
+    headers,
+    marker,
+    policy,
+)
+from tests.gateway.holdrig import KEYS as VAULT_KEYS
 from tests.gateway.rig import until
 from zoeymcp.common import canonical
 from zoeymcp.vault import logs, netclient, telegramwire
-from zoeymcp.vault.admin import HealthReader
+from zoeymcp.vault import telegram as telegram_approver
+from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.approvers import SurfaceName
 from zoeymcp.vault.holds import DecideRefusal, Hold
 from zoeymcp.vault.store import origin_binding
-from zoeymcp.vault.telegram import RESTARTED, SWITCHED_OFF, Timings
+from zoeymcp.vault.telegram import ALLOWED_UPDATES as ALLOWED
+from zoeymcp.vault.telegram import ENROL_UPDATES, PROBE, RESTARTED, SWITCHED_OFF, Timings
 
 from .tls import ProviderCA, issue_cert
 
@@ -860,3 +875,332 @@ async def test_the_bot_api_is_reached_through_the_guard(
     # The poller's start sequence (G.3); the writer's first send may go in between (its own task).
     polled = [c.method for c in api.calls if c.method in {"getWebhookInfo", "getMe", "getUpdates"}]
     assert polled[:3] == ["getWebhookInfo", "getMe", "getUpdates"]
+
+
+# --- enrolment and the probe (G.8, J1, K.3; step 16) ---------------------------------------------
+
+
+@asynccontextmanager
+async def socket(tmp_path: Path, rig: HoldRig) -> AsyncIterator[httpx.AsyncClient]:
+    """The vault's admin socket, on the test's loop, as ``zoeymcp approver telegram`` reaches
+    it."""
+    admin = AdminApp(
+        rig.store,
+        VAULT_KEYS,
+        lambda: rig.app.policy,
+        SetupCodes(tmp_path, VAULT_KEYS.portal_key),
+        chain=rig.chain,
+        holds=rig.app,
+        approvals=rig.app,
+    )
+    transport = httpx.ASGITransport(app=admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as http:
+        yield http
+
+
+ENROL = "/approvers/telegram/enrol"
+
+
+def allowed(rig: HoldRig) -> bool:
+    """Whether the vault's egress list names the Bot API."""
+    return "api.telegram.org" in json.dumps(rig.app.allowlist_document())
+
+
+async def opened(admin: httpx.AsyncClient, name: str = "approver-bot") -> tuple[str, str]:
+    """An enrolment opened with store secret ``name``: its id and its one-time code, read from
+    its link."""
+    answer = await admin.post(ENROL, json={"secret": name})
+    assert answer.status_code == 200, answer.text
+    found = answer.json()
+    return str(found["enrolment"]), str(found["link"]).partition("?start=")[2]
+
+
+async def state(admin: httpx.AsyncClient, enrolment: str, wait: int = 0) -> dict[str, Any]:
+    answer = await admin.get(f"{ENROL}/{enrolment}", params={"wait": wait})
+    assert answer.status_code == 200, answer.text
+    found: dict[str, Any] = answer.json()
+    return found
+
+
+def ended(rig: HoldRig) -> bool:
+    enrolment = rig.app.enrolment
+    return enrolment is not None and enrolment.state == "ended"
+
+
+async def test_setup(tmp_path: Path, log: io.StringIO) -> None:
+    """J1 in its new order (G.8, Q43): with no Telegram approver in the policy, the enrolment
+    opens its own temporary egress allowance and Bot API session, names the bot and its
+    one-time link, reads the operator's ``/start`` from messages alone, shows who pressed it and
+    sends that chat a confirmation code; the code typed, it answers the policy lines and closes
+    the allowance. The lines installed (as the import's install does), the surface starts
+    without a restart, the probe reaches the chat with no buttons, and health shows the bot."""
+    api = bot()
+    with anyio.fail_after(BOUND):
+        async with (
+            vault(tmp_path, api, surfaces=("portal",)) as (rig, _),
+            socket(tmp_path, rig) as admin,
+        ):
+            assert not allowed(rig)
+            answer = await admin.post(ENROL, json={"secret": "approver-bot"})
+            assert answer.status_code == 200, answer.text
+            found = answer.json()
+            assert (found["state"], found["bot"]) == ("waiting", "example_bot")
+            assert found["allowance"] == "api.telegram.org:443"
+            link = str(found["link"])
+            assert re.fullmatch(r"https://t\.me/example_bot\?start=[A-Za-z0-9_-]{22}", link)
+            assert allowed(rig)
+            await api.poll_began()
+            assert api.polls[-1].allowed_updates == ["message"]
+            api.operator.start(link.partition("?start=")[2])
+            seen = await state(admin, found["enrolment"], wait=BOUND)
+            assert seen["state"] == "seen"
+            assert seen["seen"] == {
+                "user_id": OPERATOR_ID,
+                "chat_id": OPERATOR_ID,
+                "name": "Operator",
+                "username": "operator_example",
+            }
+            code = api.operator.confirmation_code()
+            [sent] = [m for m in api.operator.messages() if code in m.text]
+            assert (sent.reply_markup, sent.protected) == (None, True)
+            confirmed = await admin.post(
+                f"{ENROL}/{found['enrolment']}/confirm", json={"code": code}
+            )
+            assert confirmed.status_code == 200, confirmed.text
+            assert confirmed.json()["state"] == "confirmed"
+            assert confirmed.json()["lines"] == [
+                "approvers:",
+                f"  telegram: {{bot_token: store:approver-bot, user_id: {OPERATOR_ID}, "
+                f"chat_id: {OPERATOR_ID}}}",
+                "  timeout: 3600",
+                "  block_seconds: 0",
+            ]
+            assert not allowed(rig)
+            # The lines in the policy: the install starts the surface, with no restart.
+            rig.app.reload(policy(**{**rig.options, "surfaces": ("portal", "telegram")}))
+            await until(lambda: any(p.allowed_updates == ALLOWED for p in api.polls), BOUND)
+            probe = await admin.post("/approvers/telegram/test")
+            assert probe.json() == {"sent": True, "finding": None}
+            [message] = [m for m in api.operator.messages() if m.text == PROBE]
+            assert message.reply_markup is None
+            health = (await admin.get("/health")).json()
+            assert health["approvals"]["telegram"]["username"] == "example_bot"
+    [enrolled] = events(log, "approver_enrolled")
+    assert str(OPERATOR_ID) not in json.dumps(enrolled)
+
+
+async def test_a_represented_code_aborts(tmp_path: Path) -> None:
+    """G.8 step 3, T33: a second presentation of the code while the enrolment is open (here
+    from a token holder's own account) aborts it ``enrolment_contested``, which raises
+    ``approver_contested``; the operator's confirmation code is refused, and nothing is
+    enrolled."""
+    api = bot()
+    with anyio.fail_after(BOUND):
+        async with (
+            vault(tmp_path, api, surfaces=("portal",)) as (rig, _),
+            socket(tmp_path, rig) as admin,
+        ):
+            enrolment, code = await opened(admin)
+            await api.poll_began()
+            api.operator.start(code)
+            assert (await state(admin, enrolment, wait=BOUND))["state"] == "seen"
+            api.attacker.present(code)
+            await until(lambda: ended(rig), BOUND)
+            assert (await state(admin, enrolment))["reason"] == "enrolment_contested"
+            typed = api.operator.confirmation_code()
+            refused = await admin.post(f"{ENROL}/{enrolment}/confirm", json={"code": typed})
+            assert (refused.status_code, refused.json()["reason"]) == (
+                409,
+                "enrolment_contested",
+            )
+            assert not allowed(rig)
+            health = (await admin.get("/health")).json()
+    codes = [finding["code"] for finding in health["approvals"]["findings"]]
+    assert "approver_contested" in codes
+
+
+OTHER_TOKEN = "511223344:AAF-other-bot-token-sentinel-9e0d7c61"  # another bot than the rig's
+
+
+async def test_a_contested_enrolment_names_its_own_bot(tmp_path: Path) -> None:
+    """G.8 step 3 with two bots: an enrolment of another bot than the running approver's, found
+    contested (a foreign webhook on it), names that bot's store secret in health, and the
+    approver's bot isn't marked contested, since its token isn't the one to revoke. A contested
+    re-enrolment of the approver's own bot marks it, and the other bot's finding goes with the
+    next enrolment."""
+    api = bot()
+    other = BotApi(OTHER_TOKEN, switches={Switch.FOREIGN_WEBHOOK}, second=SECOND)
+    apps = {OTHER_TOKEN: other.app(), BOT_TOKEN: api.app()}
+
+    async def either(scope: Scope, receive: Receive, send: Send) -> None:
+        mine = OTHER_TOKEN in str(scope.get("path", ""))
+        await apps[OTHER_TOKEN if mine else BOT_TOKEN](scope, receive, send)
+
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=either))
+    with anyio.fail_after(BOUND):
+        async with vault(tmp_path, api, client=client) as (rig, _), socket(tmp_path, rig) as admin:
+            await until(lambda: len(api.polls) >= 3, BOUND)
+            rig.store.put("other-bot", OTHER_TOKEN, BOT_API)
+            refused = await admin.post(ENROL, json={"secret": "other-bot"})
+            assert refused.json()["reason"] == "enrolment_contested"
+            found = (await admin.get("/health")).json()["approvals"]
+            assert found["telegram"]["username"] == "example_bot"
+            [contested] = found["findings"]
+            assert (contested["code"], contested["level"]) == ("approver_contested", "error")
+            assert "the bot stored as other-bot; revoke that bot's token" in contested["text"]
+            enrolment, code = await opened(admin)
+            await api.poll_began(len(api.polls) + 2)  # the enrolment's polls, the surface paused
+            api.operator.start(code)
+            assert (await state(admin, enrolment, wait=BOUND))["state"] == "seen"
+            api.attacker.present(code)
+            await until(lambda: ended(rig), BOUND)
+            found = (await admin.get("/health")).json()["approvals"]
+    [contested] = found["findings"]
+    assert contested["text"] == "another program reads this bot's updates; revoke the token"
+
+
+async def test_enrolment_confirmation(tmp_path: Path) -> None:
+    """FM-38, T-12: a token holder that took the code in a gap between polls presents it from its
+    own account, the only presentation the vault sees, under a look-alike name. The confirmation
+    code goes to that account's chat, the operator's phone gets none, and what the host types
+    doesn't match: ``enrolment_unconfirmed``, and no lines."""
+    api = bot()
+    with anyio.fail_after(BOUND):
+        async with (
+            vault(tmp_path, api, surfaces=("portal",)) as (rig, _),
+            socket(tmp_path, rig) as admin,
+        ):
+            enrolment, code = await opened(admin)
+            await api.poll_began()
+            api.attacker.present(code)
+            seen = await state(admin, enrolment, wait=BOUND)
+            assert seen["seen"]["user_id"] == ATTACKER.id
+            assert seen["seen"]["name"] == "Operator"  # easy to mimic: the code decides
+            [sent] = [m for m in api.sent() if m.chat_id == ATTACKER.id]
+            assert api.operator.messages() == []
+            theirs = re.search(r"\b(\d{6})\b", sent.text)
+            assert theirs is not None
+            guess = "123456" if theirs.group(1) != "123456" else "654321"
+            typed = await admin.post(f"{ENROL}/{enrolment}/confirm", json={"code": guess})
+            assert (typed.status_code, typed.json()["reason"]) == (409, "enrolment_unconfirmed")
+            again = await admin.post(f"{ENROL}/{enrolment}/confirm", json={"code": theirs.group(1)})
+            assert again.json()["reason"] == "enrolment_unconfirmed"  # single use
+            assert (await state(admin, enrolment))["state"] == "ended"
+            assert not allowed(rig)
+
+
+async def test_enrolment_refusals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """G.8 step 1 and M.2: a foreign webhook (contested), a bot that can manage other bots, a
+    name the store has no Bot API token under, a token another secret holds too, a second
+    enrolment while one is open, an unknown enrolment, and one that ends before its code is
+    presented; each closes the allowance it opened."""
+    api = bot()
+    with anyio.fail_after(BOUND):
+        async with (
+            vault(tmp_path, api, surfaces=("portal",)) as (rig, _),
+            socket(tmp_path, rig) as admin,
+        ):
+
+            async def refused(name: str = "approver-bot") -> tuple[int, str]:
+                answer = await admin.post(ENROL, json={"secret": name})
+                return answer.status_code, str(answer.json()["reason"])
+
+            api.switches = {Switch.FOREIGN_WEBHOOK}
+            assert await refused() == (409, "enrolment_contested")
+            api.switches = {Switch.MANAGES_BOTS}
+            assert await refused() == (409, "approver_can_manage_bots")
+            api.switches = set()
+            assert await refused("no-such-bot") == (404, "enrolment_secret")
+            assert await refused("shop-key") == (404, "enrolment_secret")  # another origin
+            rig.store.put("second-bot", BOT_TOKEN, BOT_API)
+            assert await refused() == (409, "approver_token_shared")
+            rig.store.delete("second-bot")
+            assert not allowed(rig)
+            enrolment, _ = await opened(admin)
+            assert await refused() == (409, "enrolment_busy")
+            stopped = await admin.delete(f"{ENROL}/{enrolment}")
+            assert stopped.json()["reason"] == "enrolment_expired"
+            assert not allowed(rig)
+            unknown = await admin.get(f"{ENROL}/{'0' * 16}")
+            assert (unknown.status_code, unknown.json()["reason"]) == (
+                404,
+                "enrolment_unknown",
+            )
+            monkeypatch.setattr(telegram_approver, "ENROL_TTL", 0.3)
+            enrolment, _ = await opened(admin)
+            found = await state(admin, enrolment, wait=BOUND)
+            assert (found["state"], found["reason"]) == ("ended", "enrolment_expired")
+            assert not allowed(rig)
+
+
+async def test_an_enrolment_ends_at_its_time_whatever_its_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G.8 step 4, Q43: an enrolment ends when its time is up even while a long poll is still
+    in flight, so the code typed after that is refused ``enrolment_unconfirmed``, and its
+    allowance went with it."""
+    monkeypatch.setattr(telegram_approver, "ENROL_TTL", 2.0)
+    api = bot()
+    with anyio.fail_after(BOUND):
+        async with (
+            vault(tmp_path, api, surfaces=("portal",)) as (rig, _),
+            socket(tmp_path, rig) as admin,
+        ):
+            enrolment, code = await opened(admin)
+            await api.poll_began()
+            api.operator.start(code)
+            assert (await state(admin, enrolment, wait=BOUND))["state"] == "seen"
+            api.second = 600.0  # the next long poll outlasts the enrolment's time
+            await api.poll_began(len(api.polls) + 1)
+            await until(lambda: ended(rig), BOUND)
+            assert (await state(admin, enrolment))["reason"] == "enrolment_unconfirmed"
+            assert not allowed(rig)
+            typed = api.operator.confirmation_code()
+            late = await admin.post(f"{ENROL}/{enrolment}/confirm", json={"code": typed})
+            assert (late.status_code, late.json()["reason"]) == (409, "enrolment_unconfirmed")
+
+
+async def test_a_re_enrolment_pauses_the_poller(tmp_path: Path) -> None:
+    """G.8 step 2: enrolling the bot the running surface polls pauses its poller for the
+    enrolment's life, so neither session's ``getUpdates`` ends the other's (no 409); confirmed,
+    the surface polls again from its start sequence."""
+    api = bot()
+    with anyio.fail_after(BOUND):
+        async with vault(tmp_path, api) as (rig, _):
+            await until(lambda: len(api.polls) >= 3, BOUND)
+            async with socket(tmp_path, rig) as admin:
+                enrolment, code = await opened(admin)
+                begun = len(api.polls)
+                await api.poll_began(begun + 2)
+                kinds = [p.allowed_updates for p in api.polls[begun:]]
+                assert kinds == [ENROL_UPDATES] * len(kinds)
+                api.operator.start(code)
+                assert (await state(admin, enrolment, wait=BOUND))["state"] == "seen"
+                typed = api.operator.confirmation_code()
+                confirmed = await admin.post(f"{ENROL}/{enrolment}/confirm", json={"code": typed})
+                assert confirmed.status_code == 200, confirmed.text
+                resumed = len(api.polls)
+                await until(lambda: len(api.polls) >= resumed + 2, BOUND)
+                assert api.polls[resumed].offset == -1  # the start sequence's backlog skip
+                assert api.polls[-1].allowed_updates == ALLOWED
+    assert all(c.status != 409 for c in api.calls)
+
+
+async def test_the_probe(tmp_path: Path) -> None:
+    """G.8's probe: Telegram took it, or the finding that says why not (a 429 is flood control,
+    not an unreachable Telegram); with no Telegram approver, ``approver_not_set``."""
+    api = bot(Switch.FORBIDDEN_SEND)
+    with anyio.fail_after(BOUND):
+        async with vault(tmp_path, api) as (rig, _), socket(tmp_path, rig) as admin:
+            await until(lambda: len(api.polls) >= 3, BOUND)
+            refused = await admin.post("/approvers/telegram/test")
+            assert refused.json() == {"sent": False, "finding": "approver_chat_unreachable"}
+            api.switches = set()
+            sent = await admin.post("/approvers/telegram/test")
+            assert sent.json() == {"sent": True, "finding": None}
+            api.switches = {Switch.RATE_LIMITED_SEND}
+            limited = await admin.post("/approvers/telegram/test")
+            assert limited.json() == {"sent": False, "finding": "approver_rate_limited"}
+            rig.app.reload(policy(**{**rig.options, "surfaces": ("portal",)}))
+            none = await admin.post("/approvers/telegram/test")
+            assert (none.status_code, none.json()["reason"]) == (409, "approver_not_set")

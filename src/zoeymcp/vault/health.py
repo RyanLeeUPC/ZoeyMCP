@@ -323,6 +323,9 @@ class TelegramState:
     chat_unreachable: bool = False
     # A 429 in the last 10 minutes.
     rate_limited: bool = False
+    # The store name of another bot's token, one an enrolment found contested (G.8 step 3):
+    # its own approver_contested, so the operator revokes that token, not this bot's.
+    other_contested: str | None = None
 
 
 @dataclass(frozen=True)
@@ -947,6 +950,13 @@ def _approvals(state: HoldState) -> dict[str, Any]:
     if state.telegram is not None:
         section["telegram"] = _telegram_row(state.telegram)
         findings += _telegram(state.telegram, state.waiting, portal=state.portal)
+        other = state.telegram.other_contested
+        if other is not None:
+            text = (
+                f"an enrolment found another program reading the updates of the bot stored as "
+                f"{other}; revoke that bot's token"
+            )
+            findings.append(_finding("approver_contested", "error", text, None))
     return {**section, "level": _level(findings), "findings": findings}
 
 

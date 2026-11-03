@@ -66,7 +66,10 @@ the collect path (step 11: F.5, O.6), holds the echo only scrubbed, and its byte
 line. The Telegram approver (step 14: G.1, G-8, O.6) sends the bot's token, the operator's ids, a
 held call's argument values and the buttons' MACs to the Bot API alone: no log line, the HTTP
 libraries' own included with root INFO logging on, no answer, health or chain file holds one,
-whatever Telegram answered.
+whatever Telegram answered. Its enrolment (step 16: G.8, O.6) shows the one-time code in the
+answer that opens it alone, the confirmation code in the operator's chat alone, and the
+operator's ids in the enrolment's own answers alone: no log line, health, approvals list,
+allowlist or chain file holds any of them, nor the token.
 
 A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
 token, a placeholder, a token header, a forced query value, a connector username and a recipient,
@@ -1666,6 +1669,108 @@ async def test_the_approver_token_leaks_nothing(tmp_path: Path) -> None:
         hold_rig.OPERATOR_ID
     }
     assert len(rig.upstream.posts()) == 1
+
+
+async def test_an_enrolment_leaks_nothing(tmp_path: Path) -> None:
+    """The Telegram enrolment's secret-bearing paths (M8 design G.8, O.6; step 16), with root
+    INFO logging on: the bot's token reaches the Bot API alone; the one-time code only the
+    answer that opens the enrolment (its link) and the operator's ``/start``; the confirmation
+    code only the operator's chat and the host's confirm; the operator's ids only the
+    enrolment's own answers, which exist to show them (the scoped exception, as ``approvals
+    show`` is for a text). No log line, health report, approvals list, allowlist or chain file
+    holds any of them, nor does a refused confirm."""
+    operator = Person(7300419911, "Operator", "operator_example")
+    api = BotApi(hold_rig.BOT_TOKEN, second=0.05, flood_interval=None, operator_account=operator)
+    timings = Timings(send_spacing=0.05, contested_backoff=0.2, backoff_max=0.1, poll_timeout=1)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app()))
+    rig = hold_rig.HoldRig(
+        tmp_path, {"block_seconds": 0}, link="asgi", telegram=timings, approver_client=client
+    )
+    admin = AdminApp(
+        rig.store,
+        hold_rig.KEYS,
+        lambda: rig.app.policy,
+        SetupCodes(tmp_path, hold_rig.KEYS.portal_key),
+        chain=rig.chain,
+        holds=rig.app,
+        approvals=rig.app,
+    )
+    stdlib = io.StringIO()
+    handler = logging.StreamHandler(stdlib)
+    root = logging.getLogger()
+    levels = {name: logging.getLogger(name).level for name in ("", *server.CLIENT_LOGGERS)}
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    server.cap_client_loggers()  # as serve() does first
+    buffer = io.StringIO()
+    shown: list[str] = []  # the enrolment's own answers
+    answers: list[str] = []  # every other
+    logs.set_stream(buffer)
+    transport = httpx.ASGITransport(app=admin.app)
+    try:
+        async with (
+            rig.running(),
+            httpx.AsyncClient(transport=transport, base_url="http://admin") as socket,
+        ):
+            with anyio.fail_after(30):
+                enrol = "/approvers/telegram/enrol"
+                opened = await socket.post(enrol, json={"secret": "approver-bot"})
+                link = str(opened.json()["link"])
+                code = link.partition("?start=")[2]
+                assert len(code) == 22
+                answers.append(json.dumps(rig.app.allowlist_document()))
+                enrolment = f"{enrol}/{opened.json()['enrolment']}"
+                await api.poll_began()
+                api.operator.start(code)
+                seen = await socket.get(enrolment, params={"wait": 30})
+                shown.append(seen.text)
+                confirm = api.operator.confirmation_code()
+                for path in ("/health", "/approvals"):
+                    answers.append((await socket.get(path)).text)
+                wrong = "000000" if confirm != "000000" else "111111"
+                refused = await socket.post(f"{enrolment}/confirm", json={"code": wrong})
+                assert refused.json()["reason"] == "enrolment_unconfirmed"
+                answers.append(refused.text)
+                # A second enrolment, confirmed.
+                opened = await socket.post(enrol, json={"secret": "approver-bot"})
+                second = str(opened.json()["link"]).partition("?start=")[2]
+                enrolment = f"{enrol}/{opened.json()['enrolment']}"
+                polled = len(api.polls)
+                await api.poll_began(polled + 1)
+                api.operator.start(second)
+                shown.append((await socket.get(enrolment, params={"wait": 30})).text)
+                typed = api.operator.confirmation_code()
+                confirmed = await socket.post(f"{enrolment}/confirm", json={"code": typed})
+                assert confirmed.status_code == 200, confirmed.text
+                shown.append(confirmed.text)
+                for path in ("/health", "/approvals"):
+                    answers.append((await socket.get(path)).text)
+                answers.append(json.dumps(rig.app.allowlist_document()))
+    finally:
+        logs.set_stream(None)
+        root.removeHandler(handler)
+        for name, level in levels.items():
+            logging.getLogger(name).setLevel(level)
+    text = buffer.getvalue() + stdlib.getvalue()
+    assert '"event":"approver_enrolled"' in text
+    files = b"".join(
+        path.read_bytes() for path in (rig.state / CHAIN_DIR).iterdir() if path.is_file()
+    )
+    token = hold_rig.BOT_TOKEN
+    ids = str(operator.id)
+    secret = (token, token.partition(":")[2], f"/bot{token}/", code, second, confirm, typed)
+    for value in (*secret, ids):
+        assert value not in text
+        assert value.encode() not in files
+        for said in answers:
+            assert value not in said
+    for value in secret:
+        for said in shown:
+            assert value not in said
+    assert all(ids in said for said in shown)  # who pressed Start: the enrolment's to show
+    # The codes reached the operator's chat and nothing else of Telegram's but their own calls.
+    starts = [c for c in api.calls if c.method == "sendMessage"]
+    assert {c.params["chat_id"] for c in starts} == {operator.id}
 
 
 async def test_the_portal_queue_leaks_nothing(tmp_path: Path) -> None:

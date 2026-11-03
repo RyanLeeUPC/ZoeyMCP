@@ -8,7 +8,8 @@ nothing old enough to prune each make the chain unwritable until an append succe
 is the vault holds nothing: a held call is refused ``held_ledger_down``, nobody is asked, and
 health says ``vault_ledger_unavailable`` (FM-25); a record on disk is never written twice, and one
 that isn't valid is never queued. The vault's start recovers the chain before any listener (J10's
-chain half).
+chain half). The host reads it (K.3, step 16): ``ledger --vault --chain vault|copy|both`` picks the
+chains the ledger page joins, and ``ledger --vault --verify`` walks the vault chain.
 """
 
 from __future__ import annotations
@@ -23,11 +24,17 @@ from typing import Any
 
 import anyio
 import pytest
+from anyio.from_thread import BlockingPortal, start_blocking_portal
 
 from tests.gateway.holdrig import HoldRig, call, headers, marker
+from tests.unit import test_admin as admin_test
+from tests.unit.report_model import T0
+from tests.unit.test_admin_policy import serve
+from zoeymcp.cli.main import main
 from zoeymcp.common import canonical, ledgerformat, logs
 from zoeymcp.vault import server, vaultledger
 from zoeymcp.vault.admin import HealthReader
+from zoeymcp.vault.connectors import sendjournal
 from zoeymcp.vault.holds import ENDINGS_SECONDS, HoldTable, Limits
 from zoeymcp.vault.keys import CONTEXT_LEDGER_VAULT, KeySet, derive, generate_master_key
 from zoeymcp.vault.vaultledger import (
@@ -624,3 +631,123 @@ def test_a_chain_that_cant_be_opened_refuses_the_start(tmp_path: Path) -> None:
     environ = {"ZOEYMCP_MASTER_KEY": generate_master_key()}
     with pytest.raises(server.StartupError, match="the vault's approval chain"):
         server.build(str(EXAMPLE_POLICY), ["127.0.0.1:8080"], state, environ, None)
+
+
+# --- ledger --vault --chain and --verify (K.3; step 16) ------------------------------------------
+
+
+def two_chains(tmp_path: Path) -> tuple[admin_test.AdminRig, VaultLedger]:
+    """The reported copy with two calls, and the vault's chain with what it wrote of the first
+    (a hold, accepted in Telegram) and a call only it holds."""
+    chain = VaultLedger.open_at(tmp_path, admin_test.KEYS.chain_key)
+    rig, copy = admin_test.reported_rig(tmp_path, chain=chain)
+    copy.report(admin_test.report(admin_test.chained(2)))
+    names = {"client": "agent1", "server": "mail", "tool": "send_note"}
+    digests = {"args": "hmac-sha256:" + "0" * 64, "text": "hmac-sha256:" + "0" * 64}
+    held: dict[str, Any] = {**names, **digests, "where": "vault", "era": "modern"}
+    held |= {"pin": PIN, "chars": 1, "writes": 1, "expires": 1}
+    accept = {"decision": "accept", "waited_ms": 5, "via": "telegram"}
+    for ref in (JOINED, VAULT_ONLY):
+        chain.file.append("asked", ref, held)
+        chain.file.append("decided", ref, accept)
+    return rig, chain
+
+
+JOINED, VAULT_ONLY = f"{1:016x}", f"{0xA3:016x}"
+
+
+def vault_wrote(row: dict[str, Any]) -> bool:
+    return any(writer == "vault" for writer in row["writers"].values())
+
+
+async def test_ledger_chain(tmp_path: Path) -> None:
+    """K.3: ``?chain=`` picks the chains the vault's ledger page reads: both joined by ref (the
+    default), the reported copy alone, or the calls the vault's own chain holds alone, still
+    joined against the copy: the call the copy holds is a row, never a call only the vault
+    holds, and a send whose call the copy holds is no orphan; another value is refused. ``POST
+    /ledger/vault/verify`` walks the vault chain, and an edited line breaks it."""
+    rig, _ = two_chains(tmp_path)
+    journal = tmp_path / "connectors" / "mail-out"
+    journal.mkdir(mode=0o700, parents=True)
+    common: dict[str, Any] = {"req_hmac": "hmac-sha256:" + "0" * 64, "key_id": "0" * 16}
+    common |= {"subject_chars": 1, "body_chars": 1}
+    send = sendjournal.encode("sending", ts=T0 - 1, key=f"{2:016x}.1", **common)
+    (journal / "journal-0000000000001.jsonl").write_bytes(send)
+    both = (await rig.call("GET", "/ledger/reported")).json()
+    assert both["chain"] == "both"
+    assert [(row["ref"], vault_wrote(row)) for row in both["rows"]] == [
+        (f"{2:016x}", False),
+        (JOINED, True),
+    ]
+    assert [row["ref"] for row in both["vault_only"]] == [VAULT_ONLY]
+    copy = (await rig.call("GET", "/ledger/reported?chain=copy")).json()
+    assert [(row["ref"], vault_wrote(row)) for row in copy["rows"]] == [
+        (f"{2:016x}", False),
+        (JOINED, False),
+    ]
+    assert (copy["chain"], copy["vault_only"]) == ("copy", [])
+    assert both["orphans"] == []
+    alone = (await rig.call("GET", "/ledger/reported?chain=vault")).json()
+    assert (alone["chain"], alone["orphans"]) == ("vault", [])
+    assert [(row["ref"], vault_wrote(row)) for row in alone["rows"]] == [(JOINED, True)]
+    assert [row["ref"] for row in alone["vault_only"]] == [VAULT_ONLY]
+    refused = await rig.call("GET", "/ledger/reported?chain=gateway")
+    assert (refused.status_code, refused.json()["reason"]) == (400, "bad_query")
+    verified = (await rig.call("POST", "/ledger/vault/verify")).json()
+    assert (verified["ok"], verified["records"], verified["head_seq"]) == (True, 4, 3)
+    [path] = sorted((tmp_path / CHAIN_DIR).glob("*.jsonl"))
+    lines = path.read_bytes().splitlines(keepends=True)
+    lines[1] = lines[1].replace(b'"waited_ms":5', b'"waited_ms":6')
+    path.write_bytes(b"".join(lines))
+    broken = (await rig.call("POST", "/ledger/vault/verify")).json()
+    assert (broken["ok"], broken["broken_at"]) == (False, 2)  # seq 2 no longer chains
+    await rig.token_client.aclose()
+
+
+@pytest.fixture
+def portal() -> Iterator[BlockingPortal]:
+    with start_blocking_portal() as found:
+        yield found
+
+
+def run_cli(argv: list[str]) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    code = main(argv, stdin=io.StringIO(), out=out, err=err)
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_ledger_chain_from_the_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """``zoeymcp ledger --vault --chain vault|copy|both`` and ``--vault --verify`` (K.3, D-171):
+    the vault's chain alone shows the call the copy holds too as a row, and only the other as its
+    own; the copy alone shows no record the vault wrote; the walk prints its head; ``--chain``
+    goes with ``--vault``."""
+    rig, _ = two_chains(tmp_path)
+    serve(monkeypatch, lambda: rig.admin.app, portal)
+    code, out, err = run_cli(["ledger", "--vault", "--chain", "vault"])
+    assert (code, err) == (0, "")
+    assert out.count("only the vault's own chain holds this call") == 1
+    assert f" {JOINED} " in out
+    assert f" {VAULT_ONLY} " in out
+    code, out, _ = run_cli(["ledger", "--vault", "--chain", "copy"])
+    assert "held by the vault" not in out
+    assert "only the vault's own chain" not in out
+    code, out, _ = run_cli(["ledger", "--vault", "--chain", "both", "--format", "json"])
+    assert json.loads(out)["chain"] == "both"
+    code, out, err = run_cli(["ledger", "--vault", "--verify"])
+    assert (code, err) == (0, "")
+    assert out.startswith("ok: 4 records chain; head seq 3, hash sha256:")
+    code, out, _ = run_cli(["ledger", "--vault", "--verify", "--format", "json"])
+    assert json.loads(out)["ok"] is True  # one object a line, as the gateway's
+    assert run_cli(["ledger", "--chain", "vault"]) == (
+        2,
+        "",
+        "zoeymcp ledger: --restart-chain, --before and --chain go with --vault\n",
+    )
+    assert run_cli(["ledger", "--vault", "--verify", "--chain", "vault"]) == (
+        2,
+        "",
+        "zoeymcp ledger: --verify with --vault walks the vault chain, alone\n",
+    )
+    portal.call(rig.token_client.aclose)

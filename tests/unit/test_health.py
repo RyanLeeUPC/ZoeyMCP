@@ -2363,6 +2363,28 @@ def test_a_contested_bot_says_to_revoke_its_token() -> None:
     ]
 
 
+OTHER_CONTESTED = finding(
+    "approver_contested",
+    "error",
+    "an enrolment found another program reading the updates of the bot stored as other-bot; "
+    "revoke that bot's token",
+    None,
+)
+
+
+def test_another_bots_contested_enrolment_names_that_bot() -> None:
+    """G.8 step 3: an enrolment of another bot found contested names that bot's store secret,
+    never the approver's, whose own findings stand beside it, even the one that stops it."""
+    found = telegram(other_contested="other-bot", unreachable=True, waiting=1)
+    assert [f["code"] for f in found["findings"]] == ["approver_unreachable", "approver_contested"]
+    assert found["findings"][1] == OTHER_CONTESTED
+    assert found["level"] == "error"
+    assert telegram(other_contested="other-bot", token_shared=True)["findings"][1:] == [
+        OTHER_CONTESTED
+    ]
+    assert telegram(other_contested="other-bot")["telegram"] == TELEGRAM_ROW
+
+
 @pytest.mark.parametrize(("waiting", "level"), [(0, "warning"), (1, "error")])
 def test_an_unreachable_bot_is_an_error_while_a_hold_waits(waiting: int, level: str) -> None:
     found = telegram(unreachable=True, waiting=waiting)

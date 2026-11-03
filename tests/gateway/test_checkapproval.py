@@ -390,6 +390,11 @@ ROWS: list[Any] = [
         ("withdrawn", "not_sent"),
     ),
     (
+        {**STATUS, "state": "withdrawn", "detail": "operator"},
+        "withdrawn: the operator withdrew it; nothing was sent",
+        ("withdrawn", "not_sent"),
+    ),
+    (
         {**STATUS, "state": "withdrawn", "detail": "busy"},
         "withdrawn: it was withdrawn; nothing was sent",
         ("withdrawn", "not_sent"),

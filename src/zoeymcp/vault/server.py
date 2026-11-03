@@ -1402,8 +1402,10 @@ def build(
             # configured policy for an import from it; standard input was read once, at start.
             managed=managed,
             source=None if config == "-" else (lambda: read_source(config, environ)),
-            # The vault hold's health, as the portal's (M8 design K.1, G.7).
+            # The vault hold's health, as the portal's (M8 design K.1, G.7), and the host's
+            # approvals and Telegram commands (K.3, G.8).
             holds=app,
+            approvals=app,
         )
     return Vault(
         app,

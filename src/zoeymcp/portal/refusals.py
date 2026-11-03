@@ -776,6 +776,49 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "This approval's text isn't the one you were shown, so nothing was decided: open it "
             "again in the queue.",
         ),
+        # The host's Telegram commands (M8 design G.8, M.2; vault/telegram.py's EnrolReason):
+        # an enrolment that stopped or never began, and the probe with no approver.
+        "enrolment_contested": Entry(
+            409,
+            "Someone else reads this bot's updates, or presented the enrolment code too, so "
+            "nothing was enrolled: revoke the token with the bot-making account, store the new "
+            "one, and enrol again.",
+        ),
+        "enrolment_expired": Entry(
+            409,
+            "The enrolment ended before its code was presented (10 minutes, or it was stopped): "
+            "enrol again.",
+        ),
+        "enrolment_unconfirmed": Entry(
+            409,
+            "The confirmation code wasn't the one the bot sent, or came too late, so nothing was "
+            "enrolled: enrol again.",
+        ),
+        "enrolment_unreachable": Entry(
+            502,
+            "Telegram didn't answer the enrolment with this token: check the token and the "
+            "egress allowlist, then enrol again.",
+        ),
+        "enrolment_secret": Entry(
+            404,
+            "No store secret by that name holds a token for https://api.telegram.org: store it "
+            "with zoeymcp secret set NAME --origin https://api.telegram.org.",
+        ),
+        "enrolment_busy": Entry(409, "Another enrolment is open: finish it, or stop it first."),
+        "enrolment_unknown": Entry(
+            404, "No enrolment by that ID: it ended, or the vault restarted. Enrol again."
+        ),
+        "approver_can_manage_bots": Entry(
+            409, "This bot can manage other bots; use a plain bot for approvals."
+        ),
+        "approver_token_shared": Entry(
+            409,
+            "Another secret, credential, route or connector holds this bot's token or the same "
+            "bot: give the approver a bot of its own.",
+        ),
+        "approver_not_set": Entry(
+            409, "The policy names no Telegram approver here: enrol one and add it first."
+        ),
     }
 )
 

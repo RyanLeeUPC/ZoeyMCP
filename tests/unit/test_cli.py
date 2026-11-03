@@ -2096,12 +2096,15 @@ def test_ledger_vault_when_the_vault_cant_be_asked(admin: FakeAdmin) -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["--vault", "--verify"],
+        # M8 step 16 (K.3): --vault --verify walks the vault chain, alone.
+        ["--vault", "--verify", "--before", "3"],
+        ["--vault", "--verify", "--chain", "vault"],
         ["--vault", "--since", "1d"],
         ["--vault", "--client", "agent1"],
         ["--vault", "check", "ref", "file"],
         ["--restart-chain"],
         ["--before", "3"],
+        ["--chain", "vault"],
     ],
 )
 def test_ledger_vault_flags_go_together(admin: FakeAdmin, argv: list[str]) -> None:

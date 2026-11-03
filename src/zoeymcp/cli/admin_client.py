@@ -42,6 +42,11 @@ ONBOARD_TIMEOUT: Final = 30 + 3 * 5 + 15
 # A host write does its file writes, with their fsyncs, and the install (M6 design G.6), then
 # deletes the entries --revoke-removed names, each waiting for a refresh in flight.
 POLICY_TIMEOUT: Final = REFRESH_BUDGET + 30
+# An enrolment's opening waits for the egress role to fetch its allowance (5 s), then makes two
+# Bot API calls on the approver's client (60 s read each); the probe waits up to the vault's
+# PROBE_WAIT (30 s) for Telegram (M8 design G.8).
+ENROL_TIMEOUT: Final = 5 + 2 * 60 + 15
+PROBE_TIMEOUT: Final = 30 + 15
 
 
 class AdminUnavailable(Exception):
@@ -334,11 +339,24 @@ def health(socket: str, transport: httpx.BaseTransport | None = None) -> dict[st
 
 
 def vault_ledger(
-    socket: str, *, before: int | None = None, transport: httpx.BaseTransport | None = None
+    socket: str,
+    *,
+    before: int | None = None,
+    chain: str | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
-    """A page of the vault's reported copy of the gateway's ledger, newest first."""
-    path = "/ledger/reported" + ("" if before is None else f"?before={before}")
-    return _request(socket, "GET", path, transport=transport)
+    """A page of the vault's reported copy of the gateway's ledger, newest first, joined with
+    the vault's own chain; ``chain`` (``vault``, ``copy`` or ``both``) picks the chains (M8
+    design K.3)."""
+    params = [(k, str(v)) for k, v in (("before", before), ("chain", chain)) if v is not None]
+    return _request(socket, "GET", "/ledger/reported", transport=transport, params=params)
+
+
+def vault_ledger_verify(
+    socket: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """The vault chain's walk with the vault's key (M8 design K.3)."""
+    return _request(socket, "POST", "/ledger/vault/verify", transport=transport)
 
 
 def vault_ledger_restart(
@@ -524,4 +542,78 @@ def policy_write(
         content=body,
         headers=headers,
         params=list(query),
+    )
+
+
+# --- the host's approvals and the Telegram approver (M8 design K.3, G.8) ------------------------
+
+
+def approvals(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    """Waiting and decided recently: ``{waiting, decided}``, never a text."""
+    return _request(socket, "GET", "/approvals", transport=transport)
+
+
+def approval(socket: str, key: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    """One hold by its ref or its approval id, its composed text whole."""
+    path = f"/approvals/{quote(key, safe='')}"
+    return _request(socket, "GET", path, transport=transport)
+
+
+def approval_withdraw(
+    socket: str, key: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Withdraw one undecided hold by its ref or its approval id: ``{withdrawn}``."""
+    path = f"/approvals/{quote(key, safe='')}/withdraw"
+    return _request(socket, "POST", path, transport=transport)
+
+
+def approvals_withdraw_all(
+    socket: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Withdraw every undecided hold (J15): ``{withdrawn}``."""
+    return _request(socket, "POST", "/approvals/withdraw-all", transport=transport)
+
+
+def telegram_enrol(
+    socket: str, secret: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """Open an enrolment with the store secret ``secret``: its state and its ``link``."""
+    body = {"secret": secret}
+    return _request(socket, "POST", "/approvers/telegram/enrol", body, transport, ENROL_TIMEOUT)
+
+
+def telegram_enrolment(
+    socket: str, enrolment: str, *, wait: int, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """The enrolment once its code was presented or it ended, or after ``wait`` seconds."""
+    path = f"/approvers/telegram/enrol/{quote(enrolment, safe='')}"
+    return _request(
+        socket,
+        "GET",
+        path,
+        transport=transport,
+        timeout=wait + DEFAULT_TIMEOUT,
+        params=[("wait", str(wait))],
+    )
+
+
+def telegram_confirm(
+    socket: str, enrolment: str, code: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    """The confirmation code the host typed: the identity and the policy ``lines``."""
+    path = f"/approvers/telegram/enrol/{quote(enrolment, safe='')}/confirm"
+    return _request(socket, "POST", path, {"code": code}, transport)
+
+
+def telegram_enrol_stop(
+    socket: str, enrolment: str, transport: httpx.BaseTransport | None = None
+) -> dict[str, Any]:
+    path = f"/approvers/telegram/enrol/{quote(enrolment, safe='')}"
+    return _request(socket, "DELETE", path, transport=transport)
+
+
+def telegram_test(socket: str, transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
+    """The probe: ``{sent, finding}``."""
+    return _request(
+        socket, "POST", "/approvers/telegram/test", transport=transport, timeout=PROBE_TIMEOUT
     )

@@ -698,6 +698,38 @@ def test_without_the_vault_chain_the_rows_are_the_copys() -> None:
     assert (held["where"], held["others"], held["disagree"]) == ("vault", [], False)
 
 
+def test_the_vault_chains_calls_alone() -> None:
+    """K.3's ``ledger --vault --chain vault``: the rows of the calls the vault's chain holds,
+    still joined against the whole copy, so a call the copy holds is a row and never one only
+    the vault's chain holds, and a send whose call the copy holds is no orphan. The copy's other
+    calls and its ledger-level records go; the rows still page by the copy's seqs."""
+    gateways = "5" * 16
+    recovered = record(9, T + 9, None, "recovered", abandoned=0, not_sent=0, unknown=0)
+    records = [*COPY, asked(8, T + 8, gateways), recovered]
+    journals = {"mail": [sending(RECEIVED - 1, f"{gateways}.1")]}
+
+    def vault(**kwargs: Any) -> dict[str, Any]:
+        return page(
+            records, held=HELD, journals=journals, now=NOW, chain=CHAIN, vault_calls=True, **kwargs
+        )
+
+    result = vault()
+    assert [row["ref"] for row in result["rows"]] == [DISPUTED, RELAY_REF, HELD_REF]
+    assert [row["ref"] for row in result["vault_only"]] == [VAULT_ONLY]
+    assert (result["orphans"], result["next"]) == ([], None)
+    first = vault(limit=1)
+    assert ([row["ref"] for row in first["rows"]], first["next"]) == ([DISPUTED], 2)
+    assert [row["ref"] for row in vault(before=2)["rows"]] == [RELAY_REF, HELD_REF]
+    both = page(records, held=HELD, journals=journals, now=NOW, chain=CHAIN)
+    assert [row.get("ref") for row in both["rows"]] == [
+        None,
+        gateways,
+        DISPUTED,
+        RELAY_REF,
+        HELD_REF,
+    ]
+
+
 def test_the_vaults_outcome_alone_is_shown() -> None:
     """A held call the gateway hasn't closed yet shows the vault's outcome; a relay the gateway
     hasn't closed shows the vault's ``unknown, relayed`` until it does."""

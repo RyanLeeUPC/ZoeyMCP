@@ -17,11 +17,13 @@ from zoeymcp.portal.approvalsview import (
     APPROVE_SENTENCE,
     CHUNK,
     DECIDED_SHOWN,
+    HOST_WHERE,
     Planned,
     Refused,
     check,
     clock,
     decide_plan,
+    decided,
     detail,
     gone,
     outcome,
@@ -279,6 +281,29 @@ def test_how_a_decided_hold_went(
     state: State, via: Via | None, detail_: str | None, words: str
 ) -> None:
     assert outcome(state, via, detail_, "16:39") == words
+
+
+def test_the_hosts_list_names_where_each_was_decided() -> None:
+    """K.3 (step 16): the host's list has no "here"; it names the portal as Telegram is named,
+    and the queue's own words keep "here"."""
+    assert HOST_WHERE == {"portal": " in the portal", "telegram": " in Telegram"}
+    words = outcome("denied", "portal", None, "16:39", HOST_WHERE)
+    assert words == "denied in the portal 16:39 UTC; nothing was sent"
+    words = outcome("done", "telegram", "ok", "16:39", HOST_WHERE)
+    assert words == "approved in Telegram 16:39 UTC; sent: ok"
+    ended = closed(1, "denied", "portal")
+    assert decided(ended, wall, HOST_WHERE) == {
+        "approval": "0000000000000001",
+        "ref": "0000000000000001",
+        "kind": "held",
+        "how_shown": "Held by the vault",
+        "server_shown": "shop",
+        "tool_shown": "place_order",
+        "client_shown": None,
+        "state": "denied",
+        "outcome_shown": "denied in the portal 16:00 UTC; nothing was sent",
+    }
+    assert decided(ended, wall)["outcome_shown"] == "denied here 16:00 UTC; nothing was sent"
 
 
 def test_a_decided_hold_with_no_time() -> None:

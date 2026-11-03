@@ -250,6 +250,9 @@ _DEADLINE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
 _POINTER = re.compile(r"(?:/[A-Za-z0-9_.~-]{0,128}){0,16}")
 # The forward's outcome an approved refusal names, one of the ledger's (M8 design C.2).
 _OUTCOME = re.compile("|".join(sorted(ledgerformat.OUTCOMES)))
+# A withdrawn call's reason, as the vault names it (a closed set there: M8 step 16): read in this
+# form, and given its own text by the table that knows it.
+_REASON = re.compile(r"[a-z_]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -257,8 +260,8 @@ class HeldAnswer:
     """What the vault answered one held call (M8 design C.2): its status, whether the vault
     refused it (``x-zoeymcp-vault``) or approved it (``x-zoeymcp-approval``), the ref it names
     (``x-zoeymcp-held-ref``), and from a refusal's body its code, deadline and pointer, the
-    outcome of a forward that failed after the approval, and the seconds of its
-    ``Retry-After``. Never a value of the call or of its answer."""
+    outcome of a forward that failed after the approval, a withdrawal's reason, and the seconds
+    of its ``Retry-After``. Never a value of the call or of its answer."""
 
     status: int
     refused: bool
@@ -269,6 +272,7 @@ class HeldAnswer:
     pointer: str | None = None
     retry_after: int | None = None
     outcome: str | None = None
+    reason: str | None = None
 
 
 def held_answer(status: int, headers: httpx2.Headers, body: bytes | None) -> HeldAnswer:
@@ -295,6 +299,7 @@ def held_answer(status: int, headers: httpx2.Headers, body: bytes | None) -> Hel
         _refusal_field(body, "pointer", _POINTER),
         found.retry_after,
         _refusal_field(body, "outcome", _OUTCOME) if found.approved else None,
+        _refusal_field(body, "reason", _REASON),
     )
 
 

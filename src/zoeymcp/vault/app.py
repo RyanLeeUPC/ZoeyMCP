@@ -74,6 +74,7 @@ import re
 import secrets
 import time
 import urllib.request
+from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -91,7 +92,7 @@ from ..common.approvaltext import ApprovalText, Header, Plan, Show, Write
 from ..common.egresslist import Allowance
 from ..common.mcpwire import VERSION_HEADER
 from ..common.policy import fields
-from ..common.policy.check import local_mcp_routes
+from ..common.policy.check import local_mcp_routes, secret_references
 from ..common.policy.held import (
     HeldConnector,
     HeldMap,
@@ -132,7 +133,17 @@ from ..common.resultstore import (
 from ..common.reviewreport import RemoteReport, ToolkitReport
 from . import internal, logs, netclient, secretops, statusreport, telegramwire
 from . import telegram as telegram_approver
-from .approvers import EDIT_GRACE, ApproverHub, NotShown, PortalQueue, Shown, Unconfirmed
+from .approvers import (
+    DECIDED_KEPT,
+    EDIT_GRACE,
+    ApproverHub,
+    Closed,
+    NotShown,
+    PortalQueue,
+    Shown,
+    Unconfirmed,
+    closed_of,
+)
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .health import TelegramState
@@ -285,6 +296,9 @@ _ENDED_DECISIONS: Final[Mapping[str, tuple[str, str | None]]] = MappingProxyType
         "stream_lost": ("stream_lost", None),
         "shutdown": ("shutdown", "shutdown"),
         "changed": ("withdrawn", "changed"),
+        # A host's withdraw is recorded as every withdrawal is (B.5); its own name stays on the
+        # hold, for the gateway's text.
+        "operator": ("withdrawn", "changed"),
     }
 )
 _ENDED_CODES: Final[Mapping[str, str]] = MappingProxyType(
@@ -294,6 +308,15 @@ _ENDED_CODES: Final[Mapping[str, str]] = MappingProxyType(
         "withdrawn": "approval_withdrawn",
     }
 )
+# The reasons an approval_withdrawn names in its body (step 10's deviation 18), each its own text
+# at the gateway: a closed set, which the stop's and the restart's join in step 17. A withdrawal
+# for any other reason names none.
+WITHDRAWN_REASONS: Final = frozenset({"changed", "operator"})
+# A host's withdraw (K.3): the hold's detail, with via host.
+OPERATOR: Final = "operator"
+# How long an enrolment through the egress role waits for the role to fetch its allowance
+# (onboarding's ALLOWANCE_WAIT, I.3).
+ENROL_ALLOWANCE_WAIT: Final = 5.0
 
 
 class Refused(Exception):
@@ -323,8 +346,8 @@ class Refused(Exception):
         self.retry_after = retry_after
         self.allow = allow
         self.approved = approved
-        # Fields the body carries beside the code: a held call's JSON pointer or deadline, never
-        # a value (M8 design B.2, B.6).
+        # Fields the body carries beside the code: a held call's JSON pointer or deadline, or a
+        # withdrawal's reason, never a value (M8 design B.2, B.6).
         self.extra = dict(extra or {})
         super().__init__(reason)
 
@@ -942,6 +965,12 @@ class VaultApp:
             PortalQueue(self._clock) if (hub is None if queue is None else queue) else None
         )
         self._wall_offset = time.time() - self._clock()
+        # The last holds closed on any surface, newest first, for the host's approvals list
+        # (K.3); the host's Telegram enrolment (G.8), open or not; and the secret an enrolment
+        # found contested, for health (approver_contested) until the next one opens.
+        self._closed: deque[Closed] = deque(maxlen=DECIDED_KEPT)
+        self._enrolment: telegram_approver.Enrolment | None = None
+        self._enrol_contested: str | None = None
         if chain is not None:
             chain.remember(self._holds, self._clock())
         self._install(policy)
@@ -1231,8 +1260,12 @@ class VaultApp:
 
     def allowlist_document(self) -> dict[str, Any]:
         """The allowlist endpoint's answer now (G.2): the running policy's lists with the live
-        allowances, as ``egresslist.document`` writes them."""
-        return egresslist.document(egresslist.derive(self._policy, self._allowances()))
+        allowances, an open Telegram enrolment's included (M8 design G.2), as
+        ``egresslist.document`` writes them."""
+        allowances = [*self._allowances()]
+        if self._enrolment is not None and self._enrolment.open:
+            allowances.append(egresslist.enrolment_allowance())  # G.2, Q43
+        return egresslist.document(egresslist.derive(self._policy, allowances))
 
     def lists_changed(self) -> None:
         """An onboarding's allowance changed: every waiting allowlist poll looks again."""
@@ -2572,8 +2605,142 @@ class VaultApp:
             await self._telegram.stop(EDIT_GRACE)
 
     def approver_state(self) -> TelegramState | None:
-        """The Telegram approver for health (G.7), or None when the policy names none."""
-        return None if self._telegram is None else self._telegram.state()
+        """The Telegram approver for health (G.7), or None when the policy names none and no
+        enrolment found the bot contested (G.8 step 3: ``approver_contested``). An enrolment of
+        another bot than the approver's is named apart, so its token is the one revoked."""
+        contested = self._enrol_contested
+        surface = self._telegram
+        if surface is None:
+            return None if contested is None else TelegramState(secret=contested, contested=True)
+        state = surface.state()
+        if contested is None:
+            return state
+        if self._same_bot(contested, surface):
+            return replace(state, contested=True)
+        return replace(state, other_contested=contested)
+
+    def _same_bot(self, secret: str, surface: telegram_approver.TelegramSurface) -> bool:
+        """Whether store secret ``secret`` is the running surface's, or holds its bot."""
+        if telegram_approver.secret_name(surface.settings) == secret:
+            return True
+        try:
+            token = self._store.get_for_origin(secret, telegramwire.API).reveal()
+        except SecretUnavailable:
+            return False
+        return telegram_approver.same_bot(token)(self._surface_token(surface))
+
+    # --- the host's approvals and Telegram commands (M8 design K.3, G.8) ------------------------
+
+    def closed(self) -> list[Closed]:
+        """The last holds closed on any surface, newest first, without their texts (K.3)."""
+        return list(self._closed)
+
+    def withdraw_by_host(self, which: Callable[[Hold], bool]) -> list[Hold]:
+        """``zoeymcp approvals withdraw`` (K.3, J15): every undecided hold ``which`` picks is
+        withdrawn ``operator``, via ``host``; each ending is written, its messages edited and its
+        agent told, as any withdrawal's (B.5). An approved one runs on (Z9)."""
+        withdrawn = self._holds.withdraw(self._clock(), which, OPERATOR, via="host")
+        for hold in withdrawn:
+            self._spawn(self._ended(hold))
+        return withdrawn
+
+    async def probe_telegram(self) -> str | None:
+        """``zoeymcp approver telegram test`` (G.8): None once Telegram took the probe, else
+        the finding that says why not. Raises :class:`LookupError` when no Telegram approver
+        runs here."""
+        surface = self._telegram
+        if surface is None:
+            raise LookupError("no Telegram approver")
+        if not self._telegram_shown or not surface.running:
+            return "approver_token_shared" if surface.token_shared() else "approver_unreachable"
+        return await surface.probe()
+
+    @property
+    def enrolment(self) -> telegram_approver.Enrolment | None:
+        """The host's Telegram enrolment, open or the last one (G.8)."""
+        return self._enrolment
+
+    async def enrol(self, secret: str) -> tuple[telegram_approver.Enrolment, str]:
+        """``zoeymcp approver telegram enrol --secret NAME`` (G.8 steps 1-2): the checks, the
+        temporary egress allowance, the enrolment's own session and its one-time code. Returns
+        the enrolment, polling, and its ``t.me`` link; raises
+        :class:`.telegram.EnrolRefused`. One enrolment is open at a time."""
+        if self._enrolment is not None and self._enrolment.open:
+            raise telegram_approver.EnrolRefused("enrolment_busy")
+        if self._approver_client is None:
+            raise telegram_approver.EnrolRefused("enrolment_unreachable")
+        try:
+            token = self._store.get_for_origin(secret, telegramwire.API).reveal()
+        except SecretUnavailable:
+            raise telegram_approver.EnrolRefused("enrolment_secret") from None
+        ref = telegram_approver.STORE_PREFIX + secret
+        # A.2 row 9 against the running policy, and T-5: no credential, route or connector
+        # uses the name, and no other secret holds the token or the same bot.
+        used = any(found == ref for _, found, _ in secret_references(self._policy))
+        settings = TelegramApprover.model_construct(bot_token=ref, user_id=1, chat_id=1)
+        if used or self._token_shared(settings, token):
+            raise telegram_approver.EnrolRefused("approver_token_shared")
+        enrolment = telegram_approver.Enrolment(
+            secret,
+            store=self._store,
+            client=self._approver_client,
+            ended=self._enrolment_ended,
+            timings=None if self._telegram_timings is False else self._telegram_timings,
+            ttl=telegram_approver.ENROL_TTL,
+        )
+        self._enrolment, self._enrol_contested = enrolment, None
+        surface = self._telegram
+        try:
+            same = surface is not None and telegram_approver.same_bot(token)(
+                self._surface_token(surface)
+            )
+            await self._enrolment_allowed()
+            if same and surface is not None:
+                surface.pause()  # G.8 step 2: the two sessions never end each other's polls
+            link = await enrolment.begin()
+        except telegram_approver.EnrolRefused as refused:
+            enrolment.end(refused.reason)
+            raise
+        except BaseException:  # the host left, or a failure: its allowance closes all the same
+            enrolment.end("enrolment_unreachable")
+            raise
+        enrolment.start()
+        logs.event("approver_enrolment_opened", bot=enrolment.username)
+        return enrolment, link
+
+    def _surface_token(self, surface: telegram_approver.TelegramSurface) -> str:
+        """The running surface's token, or nothing it can match."""
+        name = telegram_approver.secret_name(surface.settings)
+        if name is None:
+            return ""
+        try:
+            return self._store.get_for_origin(name, telegramwire.API).reveal()
+        except SecretUnavailable:
+            return ""
+
+    async def _enrolment_allowed(self) -> None:
+        """The enrolment's allowance is in the vault's list from now on (G.2): through the
+        egress role, wait up to :data:`ENROL_ALLOWANCE_WAIT` for the role to fetch it, then go
+        on either way (a refused tunnel is ``enrolment_unreachable``)."""
+        if self._egress_proxy is not None and self._egress_proxy_kind == "role":
+            await self.role_fetched(ENROL_ALLOWANCE_WAIT)
+        else:
+            self._wake_allowlist()
+
+    def _enrolment_ended(self, enrolment: telegram_approver.Enrolment) -> None:
+        """An enrolment ended (G.8 step 5): its allowance leaves the list, a surface it paused
+        polls again, and a contested one raises ``approver_contested`` until the next."""
+        self._wake_allowlist()
+        if self._telegram is not None:
+            self._telegram.resume()
+        reason = enrolment.reason
+        if reason == "enrolment_contested":
+            self._enrol_contested = enrolment.secret
+            logs.event("approver_contested", reason="enrolment", level="error")
+        if enrolment.state == "confirmed":
+            logs.event("approver_enrolled", bot=enrolment.username)
+        elif reason is not None:
+            logs.event("approver_enrolment_failed", reason=reason, level="warning")
 
     def waiting(self) -> int:
         """Holds waiting for a decision now (health: an unreachable approver is then an
@@ -3179,7 +3346,7 @@ class VaultApp:
         self._advance(hold.ref, "done", done.outcome, done.stored if current.detached else None)
         self._feed_ending(hold, "done", done.outcome)
         self._deliver(hold.id, done.response)
-        await self._hub.close(replace(current, state="done", detail=done.outcome), "done")
+        await self._close(replace(current, state="done", detail=done.outcome), "done")
 
     async def _relay_decided(self, hold: Hold) -> None:
         """An approved relay (E.2, J.1): ``decided accept`` fsynced with the surface it came
@@ -3228,7 +3395,7 @@ class VaultApp:
         )
         current = self._holds.get(hold.id) or hold
         self._holds.done(self._clock(), hold.id, "relayed")
-        await self._hub.close(replace(current, state="done", detail="relayed"), "done")
+        await self._close(replace(current, state="done", detail="relayed"), "done")
 
     async def _ended(self, hold: Hold) -> None:
         """A hold that ended unforwarded (B.5, J.1): its decision and ``outcome not_sent`` on the
@@ -3280,8 +3447,17 @@ class VaultApp:
                 # Fed even when its records couldn't be written: the hold has ended all the same.
                 self._feed_ending(hold, hold.state, "not_sent")
                 self._feed_relay(hold, _RELAY_DECISIONS[hold.state])
-            self._deliver(hold.id, Refused(409, f"the held call ended {hold.state}", code=code))
-        await self._hub.close(hold, hold.state)
+            # A withdrawal names its reason when the gateway has a text of its own for it.
+            named = hold.state == "withdrawn" and hold.detail in WITHDRAWN_REASONS
+            extra = {"reason": hold.detail} if named else None
+            ended = Refused(409, f"the held call ended {hold.state}", code=code, extra=extra)
+            self._deliver(hold.id, ended)
+        await self._close(hold, hold.state)
+
+    async def _close(self, hold: Hold, outcome: str) -> None:
+        """Close ``hold`` on its surfaces (G.6), kept for the host's list without its text."""
+        self._closed.appendleft(closed_of(hold))
+        await self._hub.close(hold, outcome)
 
     def _deliver(self, hold_id: str, answer: Response | Refused) -> None:
         """Hand ``answer`` to the request waiting for hold ``hold_id``, if one still is, and

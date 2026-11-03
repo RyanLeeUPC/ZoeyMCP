@@ -32,6 +32,23 @@ Every rule it follows is :mod:`.telegramwire`'s; this module sends, polls and ed
 
 Its timings are :class:`Timings`, the constructor's (M.3's defaults, :data:`TIMINGS`), so process
 tests pass short ones (BP-10).
+
+Two host commands use the Bot API besides (M8 design G.8, K.3; step 16):
+
+- **The probe** (:meth:`TelegramSurface.probe`, ``zoeymcp approver telegram test``): a message
+  with no buttons, through the write queue as any other, answered once Telegram took it or with
+  the finding that says why not.
+- **The enrolment** (:class:`Enrolment`, ``zoeymcp approver telegram enrol``): its own session
+  with the named store secret, independent of the policy, which may name no approver yet. It
+  refuses a foreign webhook (``enrolment_contested``) and a bot that can manage other bots
+  (``approver_can_manage_bots``), makes a one-time code (16 random bytes, kept only as its
+  SHA-256, for :data:`ENROL_TTL`) for the ``t.me`` link, and long-polls messages until one
+  ``/start <code>`` comes from a private chat. A second presentation of the code, or a 409 (a
+  webhook, or another reader) while it is open, aborts it ``enrolment_contested``. It then sends
+  that chat a 6-digit confirmation code (its SHA-256 alone kept), which the host types: a
+  mismatch, or the end of :data:`ENROL_TTL`, aborts it ``enrolment_unconfirmed``, and only a
+  match gives the identity it found (T-12, FM-38). The vault opens the temporary egress
+  allowance and pauses a surface polling the same bot for its life (``vault/app.py``).
 """
 
 from __future__ import annotations
@@ -39,6 +56,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
+import re
+import secrets
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine, Mapping
@@ -97,6 +117,24 @@ WITHDRAWN: Final[Mapping[str, str]] = {
     "ledger": "withdrawn: the vault couldn't record it",
 }
 WHERE: Final[Mapping[str, str]] = {"telegram": " in Telegram", "portal": " in the portal"}
+# The probe (G.8): no buttons, nothing to answer; its wait for Telegram's answer, in seconds.
+PROBE: Final = (
+    "ZoeyMCP test: approvals reach this chat. This message has no buttons and needs no answer."
+)
+PROBE_WAIT: Final = 30.0
+# The enrolment (G.8, M.3): its life, its one-time code's bytes (22 base64url characters), the
+# confirmation code's digits, and the updates it reads.
+ENROL_TTL: Final = 600.0
+ENROL_CODE_BYTES: Final = 16
+CONFIRM_DIGITS: Final = 6
+ENROL_UPDATES: Final = ["message"]
+CONFIRM_TEXT: Final = (
+    "ZoeyMCP enrolment: your confirmation code is {code}. Type it where you ran zoeymcp "
+    "approver telegram enrol. If you didn't, ignore this message."
+)
+START: Final = "/start "
+# A bot's username, as a t.me link names it.
+_USERNAME: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
 
 
 @dataclass(frozen=True)
@@ -201,6 +239,8 @@ class _Write:
     message: Message | None = None  # a send's
     attempts: int = 0
     retry_at: float = 0.0
+    # The probe's: None once Telegram took it, else the finding that says why not.
+    done: asyncio.Future[str | None] | None = None
 
 
 @dataclass
@@ -266,6 +306,7 @@ class TelegramSurface:
         self._poller: asyncio.Task[None] | None = None
         self._writer: asyncio.Task[None] | None = None
         self._stopping = False  # a stop waits for its edits: a start meanwhile cancels it
+        self._paused = False  # an enrolment of the same bot polls instead (G.8 step 2)
 
     @property
     def name(self) -> SurfaceName:
@@ -273,14 +314,14 @@ class TelegramSurface:
 
     @property
     def running(self) -> bool:
-        return self._poller is not None
+        return self._poller is not None or self._paused
 
     # --- lifecycle ------------------------------------------------------------------------------
 
     def start(self) -> None:
         """Start the poller and the write queue on the running loop (I.4). A stop still sending
         its edits (a surface hidden, then shown again) is called off: its writer runs on."""
-        self._stopping = False
+        self._stopping = self._paused = False
         loop = asyncio.get_running_loop()
         if self._writer is None:
             self._writer = loop.create_task(self._write())
@@ -295,11 +336,27 @@ class TelegramSurface:
         sends the edits already queued for at most ``grace`` seconds (best effort, I.2; none
         while the token is shared), then stops writing, unless a :meth:`start` came meanwhile."""
         self._stopping = True
+        self._paused = False
         poller, self._poller = self._poller, None
         if poller is not None:
             poller.cancel()
             logs.event("approver_stopped", surface="telegram")
         return self._stopped(poller, grace)
+
+    def pause(self) -> None:
+        """An enrolment of the same bot is open (G.8 step 2): no poll from here until
+        :meth:`resume`, so the two sessions never end each other's ``getUpdates``. Writes go
+        on."""
+        poller, self._poller = self._poller, None
+        if poller is not None:
+            poller.cancel()
+            self._paused = True
+
+    def resume(self) -> None:
+        """The enrolment closed: poll again, from the start sequence (the backlog skipped)."""
+        if self._paused:
+            self._paused = False
+            self._poller = asyncio.get_running_loop().create_task(self.poll_forever())
 
     async def _stopped(self, poller: asyncio.Task[None] | None, grace: float) -> None:
         if poller is not None:
@@ -408,6 +465,31 @@ class TelegramSurface:
         """D.3's saturation notice: a message with no buttons."""
         notice = Message(text)
         self._queue_send(_Write("sendMessage", notice.params(self.settings.chat_id), None, notice))
+
+    async def probe(self) -> str | None:
+        """``zoeymcp approver telegram test`` (G.8): a message with no buttons, queued as any
+        write to the chat. None once Telegram took it; else the finding that says why not
+        (G.7): the token missing or shared, the chat refusing it, flood control (a 429 for it,
+        or one that kept it waiting), or no answer from Telegram within :data:`PROBE_WAIT`."""
+        try:
+            token = self._token()
+        except _NoToken:
+            return "approver_token_missing"
+        if self._shared(token):
+            return "approver_token_shared"
+        probe = Message(PROBE)
+        write = _Write("sendMessage", probe.params(self.settings.chat_id), None, probe)
+        done = write.done = asyncio.get_running_loop().create_future()
+        self._queue_send(write)
+        try:
+            async with asyncio.timeout(PROBE_WAIT):
+                return await asyncio.shield(done)
+        except TimeoutError:
+            with contextlib.suppress(ValueError):
+                self._sends.remove(write)
+            if self.state().rate_limited:
+                return "approver_rate_limited"  # it waited behind flood control's window
+            return "approver_unreachable"
 
     def retire(self, ended: Mapping[str, Hold]) -> None:
         """The surface is switched off or replaced (B.5): each message still open becomes "This
@@ -632,6 +714,8 @@ class TelegramSurface:
                 self._write_failed(write, _failure(exc))
                 continue
             self._next_write = time.monotonic() + self.timings.send_spacing
+            if write.done is not None and not write.done.done():
+                write.done.set_result(None)
             if write.method == "sendMessage":
                 self._health.chat_unreachable = False
                 try:
@@ -682,11 +766,22 @@ class TelegramSurface:
             # Every write to the chat waits exactly retry_after, this one first again (FM-43).
             self._health.rate_limited_at = now
             self._next_write = now + (failed.retry_after or 1)
+            if write.done is not None:
+                # The probe: one try, and flood control is why Telegram didn't take it.
+                if not write.done.done():
+                    write.done.set_result("approver_rate_limited")
+                return
             (self._edits if write.method != "sendMessage" else self._sends).appendleft(write)
             return
         self._send_failed(write.method, failed)
+        if write.done is not None and not write.done.done():
+            # The probe: one try, its failure the finding it answers with.
+            if failed.status == 403:
+                self._health.chat_unreachable = True
+            found = "approver_chat_unreachable" if failed.status == 403 else "approver_unreachable"
+            write.done.set_result(found)
         if write.method != "sendMessage" or write.hold_id is None:
-            return  # an edit, a delete or a notice: a log line, never a state change
+            return  # an edit, a delete, a notice or the probe: a log line, never a state change
         prompt = self._prompts.get(write.hold_id)
         if prompt is None:
             return
@@ -726,30 +821,7 @@ class TelegramSurface:
             raise _NoToken from None
 
     async def _call(self, token: str, method: str, params: dict[str, Any]) -> Any:
-        """One Bot API call: its ``result``, or :class:`_Failed` with nothing of the URL or the
-        answer's text (G.1, contract 67)."""
-        try:
-            url = telegramwire.method_url(token, method)
-        except ValueError:
-            raise _Failed(0, "bad_token") from None
-        try:
-            response = await self._client.post(url.reveal(), json=params)
-        except httpx.HTTPError as exc:
-            raise _Failed(0, type(exc).__name__) from None
-        status = response.status_code
-        try:
-            body = response.json()
-        except ValueError:
-            raise _Failed(status, "unreadable") from None
-        if not isinstance(body, dict) or body.get("ok") is not True:
-            retry = None
-            parameters = body.get("parameters") if isinstance(body, dict) else None
-            if isinstance(parameters, dict):
-                found = parameters.get("retry_after")
-                if isinstance(found, int) and not isinstance(found, bool) and found >= 0:
-                    retry = found
-            raise _Failed(status if status != 200 else 0, "refused", retry)
-        return body.get("result")
+        return await _bot_call(self._client, token, method, params)
 
     # --- helpers --------------------------------------------------------------------------------
 
@@ -763,6 +835,331 @@ class TelegramSurface:
         self._ended.move_to_end(hold_id)
         while len(self._ended) > ENDINGS_KEPT:
             self._ended.popitem(last=False)
+
+
+# --- the enrolment (G.8) -------------------------------------------------------------------------
+
+# An enrolment's states: its code awaited, then seen (the confirmation code sent), then
+# confirmed, or ended by the refusal that stopped it (M.2).
+EnrolState = Literal["waiting", "seen", "confirmed", "ended"]
+# The host's Telegram commands' refusals (M.2): an enrolment's, and the probe's with no approver.
+EnrolReason = Literal[
+    "approver_not_set",
+    "enrolment_contested",
+    "enrolment_expired",
+    "enrolment_unconfirmed",
+    "enrolment_unreachable",
+    "enrolment_secret",
+    "enrolment_busy",
+    "enrolment_unknown",
+    "approver_can_manage_bots",
+    "approver_token_shared",
+]
+
+
+class EnrolRefused(Exception):
+    """Why an enrolment stopped, or never began: the catalogue's reason (M.2)."""
+
+    def __init__(self, reason: EnrolReason) -> None:
+        super().__init__(reason)
+        self.reason: EnrolReason = reason
+
+
+@dataclass(frozen=True, repr=False)
+class Identity:
+    """Who presented the code (G.8 step 3): for the confirmation and the policy lines alone,
+    never logged."""
+
+    user_id: int
+    chat_id: int
+    name: str
+    username: str | None
+
+    def __repr__(self) -> str:
+        return "Identity(<hidden>)"
+
+
+class Enrolment:
+    """One host-started enrolment (G.8): its own Bot API session with the store secret
+    ``secret``, the one-time code, the long poll of messages and the confirmation code.
+    ``ended`` is called once when it ends, however it ends, for the vault to close the egress
+    allowance and resume a paused surface. ``clock`` is monotonic; ``wall`` the clock its
+    expiry is shown on. Made on the running loop, where its expiry is timed: it ends at
+    ``ttl`` whatever its poll is doing, so neither it nor its allowance outlives that."""
+
+    def __init__(
+        self,
+        secret: str,
+        *,
+        store: SecretStore,
+        client: httpx.AsyncClient,
+        ended: Callable[[Enrolment], None],
+        timings: Timings | None = None,
+        ttl: float = ENROL_TTL,
+        clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
+    ) -> None:
+        self.id = secrets.token_urlsafe(12)
+        self.secret = secret
+        self._store = store
+        self._client = client
+        self._ended = ended
+        self.timings = timings or TIMINGS
+        self._clock = clock
+        self._deadline = clock() + ttl
+        self.expires = int(wall() + ttl)
+        self.state: EnrolState = "waiting"
+        self.reason: EnrolReason | None = None
+        self.username: str | None = None
+        self.identity: Identity | None = None
+        self._code = b""  # the one-time code's SHA-256
+        self._confirm: bytes | None = None  # the confirmation code's SHA-256
+        self._changed = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._timer = asyncio.get_running_loop().call_later(ttl, self._lapse)
+
+    @property
+    def open(self) -> bool:
+        return self.state in ("waiting", "seen")
+
+    def token(self) -> str:
+        """The bot's token, read from the store at each request, as the surface reads it."""
+        try:
+            return self._store.get_for_origin(self.secret, telegramwire.API).reveal()
+        except SecretUnavailable:
+            raise EnrolRefused("enrolment_secret") from None
+
+    async def begin(self) -> str:
+        """Steps 1 and 2: no webhook (a foreign one is ``enrolment_contested``), the bot by
+        ``getMe`` (one that can manage other bots is refused), then the one-time code. Returns
+        the ``t.me`` link, the one place the code ever appears."""
+        token = self.token()
+        try:
+            info = await _bot_call(self._client, token, "getWebhookInfo", {})
+            if isinstance(info, dict) and info.get("url"):
+                raise EnrolRefused("enrolment_contested")
+            me = await _bot_call(self._client, token, "getMe", {})
+        except _Failed as failed:
+            reason: EnrolReason = (
+                "enrolment_contested" if failed.status == 409 else "enrolment_unreachable"
+            )
+            raise EnrolRefused(reason) from None
+        if not isinstance(me, dict):
+            raise EnrolRefused("enrolment_unreachable")
+        if me.get("can_manage_bots") is True:
+            raise EnrolRefused("approver_can_manage_bots")
+        username = me.get("username")
+        if not isinstance(username, str) or not _USERNAME.fullmatch(username):
+            raise EnrolRefused("enrolment_unreachable")
+        self.username = username
+        code = secrets.token_urlsafe(ENROL_CODE_BYTES)
+        self._code = _sha256(code)
+        return f"https://t.me/{username}?start={code}"
+
+    def start(self) -> None:
+        """Step 3's long poll, on the running loop. A poll that fails for good ends the
+        enrolment, so its allowance never outlives it."""
+        self._task = asyncio.get_running_loop().create_task(self._poll())
+        self._task.add_done_callback(self._polled)
+
+    def _polled(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self.end("enrolment_unreachable")
+
+    async def wait(self, seconds: float) -> None:
+        """While its code is awaited: until someone presents it, it ends, or ``seconds`` pass."""
+        changed = self._changed
+        if self.state == "waiting" and seconds > 0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(changed.wait(), seconds)
+
+    def confirm(self, typed: str) -> Identity:
+        """Step 4: the code the host typed, once. A mismatch aborts it
+        ``enrolment_unconfirmed``, as does one typed after its time is up (step 4's timeout);
+        only a match in time gives the identity."""
+        if self._clock() >= self._deadline:
+            self._lapse()
+        if self.state != "seen" or self._confirm is None or self.identity is None:
+            raise EnrolRefused(self.reason or "enrolment_unconfirmed")
+        if not hmac.compare_digest(_sha256(typed.strip()), self._confirm):
+            self.end("enrolment_unconfirmed")
+            raise EnrolRefused("enrolment_unconfirmed")
+        self._finish("confirmed", None)
+        return self.identity
+
+    def end(self, reason: EnrolReason) -> None:
+        """Stop it, refused for ``reason`` (``enrolment_expired`` when the host stops it)."""
+        if self.open:
+            self._finish("ended", reason)
+
+    def _lapse(self) -> None:
+        """Its time is up (G.8 step 4): ``enrolment_expired`` while its code is awaited, else
+        ``enrolment_unconfirmed``."""
+        self.end("enrolment_expired" if self.state == "waiting" else "enrolment_unconfirmed")
+
+    def answer(self) -> dict[str, Any]:
+        """``GET /approvers/telegram/enrol/{enrolment}`` (G.8): its state, the bot, its expiry,
+        once seen who presented the code, and the reason it ended. Never a code."""
+        seen = self.identity
+        return {
+            "enrolment": self.id,
+            "state": self.state,
+            "bot": self.username,
+            "expires": self.expires,
+            "reason": self.reason,
+            "seen": None
+            if seen is None
+            else {
+                "user_id": seen.user_id,
+                "chat_id": seen.chat_id,
+                "name": seen.name,
+                "username": seen.username,
+            },
+        }
+
+    def _finish(self, state: EnrolState, reason: EnrolReason | None) -> None:
+        self.state, self.reason = state, reason
+        self._timer.cancel()
+        task, self._task = self._task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self._changed.set()
+        self._changed = asyncio.Event()
+        self._ended(self)
+
+    async def _poll(self) -> None:
+        offset: int | None = None
+        failures = 0
+        while self.open:
+            left = self._deadline - self._clock()
+            if left <= 0:
+                self._lapse()
+                return
+            params: dict[str, Any] = {
+                "timeout": max(1, min(self.timings.poll_timeout, int(left))),
+                "allowed_updates": ENROL_UPDATES,
+            }
+            if offset is not None:
+                params["offset"] = offset  # confirms every update read so far
+            try:
+                updates = await _bot_call(self._client, self.token(), "getUpdates", params)
+            except EnrolRefused as refused:
+                self.end(refused.reason)
+                return
+            except _Failed as failed:
+                if failed.status == 409:
+                    # Another reader of the bot's updates, or a webhook (T33).
+                    self.end("enrolment_contested")
+                    return
+                failures += 1
+                await asyncio.sleep(min(2.0 ** (failures - 1), self.timings.backoff_max, left))
+                continue
+            failures = 0
+            for update in updates if isinstance(updates, list) else ():
+                update_id = update.get("update_id") if isinstance(update, dict) else None
+                if isinstance(update_id, int) and not isinstance(update_id, bool):
+                    offset = update_id + 1
+                await self._read(update)
+                if not self.open:
+                    return
+
+    async def _read(self, update: object) -> None:
+        """One update: a ``/start`` with the code is a presentation; any other message is none
+        of the enrolment's business."""
+        message = update.get("message") if isinstance(update, dict) else None
+        if not isinstance(message, dict):
+            return
+        text = message.get("text")
+        if not isinstance(text, str) or not text.startswith(START):
+            return
+        if not hmac.compare_digest(_sha256(text.removeprefix(START).strip()), self._code):
+            return
+        found = _presenter(message)
+        if self.identity is not None or found is None:
+            # A second presentation, or one from no private chat: someone else has the code.
+            self.end("enrolment_contested")
+            return
+        code = f"{secrets.randbelow(10**CONFIRM_DIGITS):0{CONFIRM_DIGITS}d}"
+        params = {
+            "chat_id": found.chat_id,
+            "text": CONFIRM_TEXT.format(code=code),
+            "protect_content": True,
+        }
+        try:
+            await _bot_call(self._client, self.token(), "sendMessage", params)
+        except (_Failed, EnrolRefused):
+            self.end("enrolment_unreachable")
+            return
+        self._confirm, self.identity, self.state = _sha256(code), found, "seen"
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+
+def _presenter(message: Mapping[str, Any]) -> Identity | None:
+    """Who sent ``message``, in their private chat with the bot; None for any other chat, or a
+    bot."""
+    chat, sender = message.get("chat"), message.get("from")
+    if not isinstance(chat, dict) or not isinstance(sender, dict):
+        return None
+    if chat.get("type") != "private" or sender.get("is_bot") is not False:
+        return None
+    user_id, chat_id = sender.get("id"), chat.get("id")
+    if not isinstance(user_id, int) or not isinstance(chat_id, int):
+        return None
+    if isinstance(user_id, bool) or isinstance(chat_id, bool) or min(user_id, chat_id) < 1:
+        return None
+    names = (sender.get("first_name"), sender.get("last_name"))
+    name = " ".join(part for part in names if isinstance(part, str) and part)
+    username = sender.get("username")
+    return Identity(user_id, chat_id, name, username if isinstance(username, str) else None)
+
+
+def enrolment_lines(secret: str, identity: Identity, timeout: int, block_seconds: int) -> list[str]:
+    """The policy lines an enrolment found (G.8 step 5, J1), with the approvers block's waits
+    as the running policy has them."""
+    telegram = (
+        f"{{bot_token: {STORE_PREFIX}{secret}, user_id: {identity.user_id}, "
+        f"chat_id: {identity.chat_id}}}"
+    )
+    return [
+        "approvers:",
+        f"  telegram: {telegram}",
+        f"  timeout: {timeout}",
+        f"  block_seconds: {block_seconds}",
+    ]
+
+
+async def _bot_call(
+    client: httpx.AsyncClient, token: str, method: str, params: dict[str, Any]
+) -> Any:
+    """One Bot API call: its ``result``, or :class:`_Failed` with nothing of the URL or the
+    answer's text (G.1, contract 67)."""
+    try:
+        url = telegramwire.method_url(token, method)
+    except ValueError:
+        raise _Failed(0, "bad_token") from None
+    try:
+        response = await client.post(url.reveal(), json=params)
+    except httpx.HTTPError as exc:
+        raise _Failed(0, type(exc).__name__) from None
+    status = response.status_code
+    try:
+        body = response.json()
+    except ValueError:
+        raise _Failed(status, "unreadable") from None
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        retry = None
+        parameters = body.get("parameters") if isinstance(body, dict) else None
+        if isinstance(parameters, dict):
+            found = parameters.get("retry_after")
+            if isinstance(found, int) and not isinstance(found, bool) and found >= 0:
+                retry = found
+        raise _Failed(status if status != 200 else 0, "refused", retry)
+    return body.get("result")
+
+
+def _sha256(text: str) -> bytes:
+    return hashlib.sha256(text.encode("utf-8")).digest()
 
 
 def _failure(exc: Exception) -> _Failed:

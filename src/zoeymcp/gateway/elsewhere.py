@@ -37,9 +37,10 @@ app binds to :meth:`.outofband.OutOfBandClient.withdraw`. Every answer ends with
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Final, Literal
 
 import anyio
@@ -109,6 +110,14 @@ VAULT_ANSWERS: Final[dict[str, tuple[Decision, str]]] = {
         "refused: the approval text can't be shown as sent; nothing was sent",
     ),
 }
+# A withdrawal's text by the reason the vault names (step 10's deviation 18): the operator's
+# withdraw (K.3, J15) its own; a policy change, or a reason not named, VAULT_ANSWERS's.
+WITHDRAWN: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "changed": "refused: the policy changed; call the tool again",
+        "operator": "refused: the operator withdrew this call; nothing was sent",
+    }
+)
 TOO_LARGE: Final = "the call ran, but its answer was over 4 MiB and wasn't kept; see the Ledger"
 STALE: Final = "refused: the policy is changing; call the tool again"
 EMPTY_TEXT: Final = ""  # the gateway shows nothing: its asked record keys the empty text
@@ -359,6 +368,8 @@ async def _refused(
     known = VAULT_ANSWERS.get(code or "")
     if known is not None:
         decision, text = known
+        if code == "approval_withdrawn":
+            text = WITHDRAWN.get(answer.reason or "", text)
     elif code == "held_cooldown":
         seconds = answer.retry_after or 1
         decision, text = "unavailable", f"refused: declined moments ago; try again in {seconds} s"
