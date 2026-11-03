@@ -1056,14 +1056,14 @@ async def test_the_ask_relays_the_gateways_text(
     surface, then ``outcome unknown, relayed``: the vault sends nothing, and the gateway's
     decisions poll gets the decision with that digest."""
     rig = HoldRig(tmp_path, RELAYING, link=link)
+    said = gateway_text(REF_A)  # once: its deadline line names the minute it was rendered in
     async with rig.running() as http:
         with anyio.fail_after(BOUND):
-            asked = await ask(http, REF_A)
+            asked = await ask(http, REF_A, text=said)
             [hold] = await rig.surface.holds(1)
             await rig.decide(hold)
             await rig.settled()
             polled = await poll(http)
-    said = gateway_text(REF_A)
     answer = asked.json()
     assert asked.status_code == 201
     assert asked.headers["cache-control"] == "no-store"
@@ -1119,9 +1119,10 @@ async def test_relay_line_is_the_vaults(tmp_path: Path, link: str) -> None:
     rig = HoldRig(tmp_path, RELAYING, link=link)
     async with rig.running() as http:
         with anyio.fail_after(BOUND):
-            await ask(http, REF_A)
+            said = gateway_text(REF_A)  # once, as the test above
+            await ask(http, REF_A, text=said)
             [hold] = await rig.surface.holds(1)
-            bare = hashlib.sha256(gateway_text(REF_A).encode()).hexdigest()
+            bare = hashlib.sha256(said.encode()).hexdigest()
             refused = await rig.decide(hold, digest=bare)
             forged = [
                 await ask(http, REF_B, text=f"{RELAY_LINE}\n{gateway_text(REF_B)}"),

@@ -857,4 +857,6 @@ async def test_the_bot_api_is_reached_through_the_guard(
             await held(rig, http, "0000000000000701")
             await prompt(api)
     assert ("api.telegram.org", 443) in resolver.lookups
-    assert [c.method for c in api.calls][:3] == ["getWebhookInfo", "getMe", "getUpdates"]
+    # The poller's start sequence (G.3); the writer's first send may go in between (its own task).
+    polled = [c.method for c in api.calls if c.method in {"getWebhookInfo", "getMe", "getUpdates"}]
+    assert polled[:3] == ["getWebhookInfo", "getMe", "getUpdates"]

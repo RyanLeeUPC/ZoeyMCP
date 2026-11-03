@@ -173,6 +173,7 @@ from .test_no_secret_answers import Recording, signed_in, step_up
 from .test_no_secret_answers import Reviews as NoSecretReviews
 from .test_oauth_tokens import KEYS, FakeClock
 from .test_portal_wire import ORIGIN
+from .test_portal_wire import Page as PortalPage
 from .test_reviewjobs import Rig as ReviewRig
 from .test_reviewreport import unclassified
 
@@ -1630,7 +1631,12 @@ async def test_the_approver_token_leaks_nothing(tmp_path: Path) -> None:
                     answers.append(json.dumps(health.report()))
                 api.switches = set()
                 api.token = "730041977:AAF-revoked-for-the-sweep-0000000000"
-                await until(lambda: any(c.status == 401 for c in api.calls), 30)
+                # The poller's own 401 (a new token reruns its start sequence), not only a
+                # write's: the poller's failure is the line asserted below.
+                polls = {"getWebhookInfo", "getMe", "getUpdates"}
+                await until(
+                    lambda: any(c.status == 401 and c.method in polls for c in api.calls), 30
+                )
                 answers.append(json.dumps(health.report()))
                 rig.app.stop_holds()
                 await rig.app.drain_holds()
@@ -1660,6 +1666,128 @@ async def test_the_approver_token_leaks_nothing(tmp_path: Path) -> None:
         hold_rig.OPERATOR_ID
     }
     assert len(rig.upstream.posts()) == 1
+
+
+async def test_the_portal_queue_leaks_nothing(tmp_path: Path) -> None:
+    """The portal queue's new secret-bearing paths (M8 design H, O.6; Z14, PC-5): a held call's
+    argument values reach the queue's opened hold (its text) and ``approval.decide``'s prepare
+    answer and plan summary, and nothing else the portal answers, logs or writes: not the lists,
+    the count, Home's item, a deny's or a confirm's answer, a refusal, the chain or health. The
+    approver bot's token (as a value and in its ``/bot<token>/`` form), the operator's id and the
+    buttons' MACs reach no portal answer at all, those two included."""
+    argument = "queue-argument-sentinel-8b4f"
+    operator = Person(hold_rig.OPERATOR_ID, "Operator", "operator_example")
+    api = BotApi(hold_rig.BOT_TOKEN, second=0.05, flood_interval=None, operator_account=operator)
+    timings = Timings(send_spacing=0.05, contested_backoff=0.2, backoff_max=0.1, poll_timeout=1)
+    bot_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app()))
+    rig = hold_rig.HoldRig(
+        tmp_path / "vault",
+        {"block_seconds": 0},
+        link="asgi",
+        surfaces=("telegram", "portal"),
+        telegram=timings,
+        approver_client=bot_client,
+        queue=True,
+    )
+    (tmp_path / "portal").mkdir(mode=0o700)
+    passkeys = Passkeys(new_file(bytes(32)), KEYS.portal_key, tmp_path / "portal" / "p.json")
+    health = HealthReader(
+        rig.store,
+        lambda: rig.app.policy,
+        chain=rig.chain,
+        waiting=rig.app.waiting,
+        telegram=rig.app.approver_state,
+    )
+    portal_app = PortalApp(
+        [ORIGIN],
+        static=load_static(),
+        setup=SetupCodes(tmp_path, KEYS.portal_key),
+        passkeys=passkeys,
+        health=health.report,
+        approvals=rig.app,
+    )
+    buffer = io.StringIO()
+    answers: list[str] = []  # every portal answer but the two the text may reach
+    texts: list[str] = []  # those two
+    authenticator = SoftAuthenticator()
+    logs.set_stream(buffer)
+    try:
+        async with (
+            rig.running() as http,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=portal_app), base_url=ORIGIN
+            ) as client,
+        ):
+            rig.app.start_approvers()
+            with anyio.fail_after(30):
+                page = Recording(client, answers)
+                await signed_in(page, portal_app, authenticator)
+                body = hold_rig.call(arguments={"item": argument})
+                # Two clients' calls (one undecided hold per client and tool, D.3).
+                for ref, agent in (("00000000000000e1", "agent1"), ("00000000000000e2", "agent2")):
+                    marker = hold_rig.marker(ref, client=agent, wait="pending")
+                    held = await http.post(
+                        "/shop/mcp", content=body, headers=hold_rig.headers(held=marker)
+                    )
+                    assert held.status_code == 409, held.text
+                await until(lambda: len(api.operator.prompts()) >= 2, 30)
+                macs = [
+                    sent.data_for(label)
+                    for sent in api.operator.prompts()
+                    for label in ("Deny", "Approve")
+                ]
+                listed = await page.call("GET", "/api/approvals")
+                first, second = (row["approval"] for row in listed.json()["waiting"])
+                await page.call("GET", "/api/approvals/count")
+                await page.call("GET", "/api/attention")
+                digests = []
+                for approval in (first, second):
+                    # The queue's text field (Z14): kept apart, unrecorded.
+                    opened = await PortalPage.call(page, "GET", f"/api/approvals/{approval}")
+                    assert opened.status_code == 200, opened.text
+                    texts.append(opened.text + repr(opened.headers.multi_items()))
+                    assert argument in opened.json()["text"]
+                    digests.append(opened.json()["text_sha256"])
+                data = {"approval": first, "text_sha256": digests[0], "decision": "approve"}
+                action = {"kind": "approval.decide", "data": data}
+                prepared = await PortalPage.call(page, "POST", "/api/actions", action)
+                assert prepared.status_code == 200, prepared.text
+                texts.append(prepared.text + repr(prepared.headers.multi_items()))
+                assert argument in prepared.text  # the plan's summary is the whole text
+                assertion = authenticator.get(prepared.json()["options"], ORIGIN).body()
+                path = f"/api/actions/{prepared.json()['action']}/confirm"
+                assert (await page.call("POST", path, {"credential": assertion})).is_success
+                deny = f"/api/approvals/{second}/deny"
+                stale = await page.call("POST", deny, {"text_sha256": "x"})
+                assert stale.status_code == 409, stale.text
+                assert (await page.call("POST", deny, {"text_sha256": digests[1]})).is_success
+                late = await page.call("POST", deny, {"text_sha256": digests[1]})
+                assert late.status_code == 409, late.text
+                await rig.settled()
+                await page.call("GET", "/api/approvals")
+                await page.call("GET", f"/api/approvals/{second}")
+                answers.append(json.dumps(health.report()))
+                rig.app.stop_holds()
+                await rig.app.drain_holds()
+                await rig.app.stop_approvers()
+    finally:
+        logs.set_stream(None)
+    text = buffer.getvalue()
+    assert '"event":"step_up_confirmed"' in text
+    files = b"".join(
+        path.read_bytes() for path in (rig.state / CHAIN_DIR).iterdir() if path.is_file()
+    )
+    token = hold_rig.BOT_TOKEN
+    secrets = (token, token.partition(":")[2], f"/bot{token}/", str(hold_rig.OPERATOR_ID), *macs)
+    for value in (argument, *secrets):
+        assert value not in text
+        assert value.encode() not in files
+        for seen in answers:
+            assert value not in seen
+    for value in secrets:
+        for seen in texts:
+            assert value not in seen
+    assert len(rig.upstream.posts()) == 1  # the one approved
 
 
 async def callback(world: World, url: str, binder: str | None) -> httpx.Response:
