@@ -12,6 +12,7 @@ import base64
 import io
 import itertools
 import re
+import secrets
 from typing import Any, get_args
 
 import pytest
@@ -297,6 +298,15 @@ def test_new_ids_are_twelve_random_bytes() -> None:
     for value in values:
         assert ID.fullmatch(value)
         assert len(base64.urlsafe_b64decode(value)) == holds.ID_BYTES == 12
+
+
+def test_a_new_id_never_starts_with_a_dash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A command line reads ``-...`` as an option, so ``zoeymcp approvals show <id>`` would
+    fail: an id whose first byte encodes as ``-`` (0xf8 to 0xfb) is drawn again."""
+    draws = iter([b"\xf8" + bytes(11), b"\xfb" + bytes(11), b"\xfc" + bytes(11)])
+    monkeypatch.setattr(secrets, "token_bytes", lambda n: next(draws))
+    assert new_id() == "_" + "A" * 15
+    assert next(draws, None) is None
 
 
 def test_a_block_never_passes_the_deadline() -> None:

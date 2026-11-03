@@ -73,8 +73,12 @@ ID_BYTES: Final = 12  # 16 base64url characters: the surfaces' handle
 
 
 def new_id() -> str:
-    """A hold's id: 12 random bytes, base64url (16 characters, no padding)."""
-    return base64.urlsafe_b64encode(secrets.token_bytes(ID_BYTES)).decode()
+    """A hold's id: 12 random bytes, base64url (16 characters, no padding), never starting
+    with ``-``, which a command line would read as an option (``zoeymcp approvals show``)."""
+    while True:
+        found = base64.urlsafe_b64encode(secrets.token_bytes(ID_BYTES)).decode()
+        if not found.startswith("-"):
+            return found
 
 
 def toolkit_block(call_timeout: float) -> float:

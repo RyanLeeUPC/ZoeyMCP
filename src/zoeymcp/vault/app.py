@@ -3198,8 +3198,9 @@ class VaultApp:
     def _block_over(self, hold: Hold, wait: _Wait, now: float) -> None:
         """The block ended undecided (B.6): a ``wait=pending`` hold detaches and answers
         ``approval_pending`` (its pending record opened before it was asked); any other
-        expires."""
-        if hold.wait != "pending" or hold.client is None:
+        expires. A hold already past its deadline expires too: the clock can pass the block and
+        the deadline before the sweeper's tick, and an expired hold is never detached."""
+        if hold.wait != "pending" or hold.client is None or now >= hold.deadline:
             self._sweep(now)
             return
         self._holds.detach(now, hold.id)
