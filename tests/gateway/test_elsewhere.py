@@ -55,7 +55,7 @@ from zoeymcp.common.committed import Committed
 from zoeymcp.common.envelope import MARKER_HEADER, Marker
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import ViewGateway, build_view
-from zoeymcp.gateway import elsewhere, logs, statuspush
+from zoeymcp.gateway import checkapproval, elsewhere, logs, statuspush
 from zoeymcp.gateway.approvals import Key, Pending, Settings
 from zoeymcp.gateway.approve import Approvals
 from zoeymcp.gateway.egressrules import marker_header
@@ -65,7 +65,7 @@ from zoeymcp.gateway.pipeline import HEADER_PARAMS
 from zoeymcp.gateway.server import status
 from zoeymcp.gateway.upstream import UpstreamError
 from zoeymcp.gateway.vaultlink import VIEW_PATH, HeldAnswer, held_answer
-from zoeymcp.vault.app import Refused
+from zoeymcp.vault.app import WITHDRAWN_REASONS, Refused
 from zoeymcp.vault.approvers import ApproverHub
 from zoeymcp.vault.holds import Hold
 from zoeymcp.vault.vaultledger import CHAIN_DIR, VaultLedger
@@ -945,16 +945,34 @@ POLICY_CHANGED = "refused: the policy changed; call the tool again"
     [
         ("changed", POLICY_CHANGED),
         ("operator", "refused: the operator withdrew this call; nothing was sent"),
-        ("shutdown", POLICY_CHANGED),
+        ("shutdown", "refused: the vault stopped; nothing was sent; try again shortly"),
+        (
+            "gateway_stopped",
+            "refused: the gateway is stopping; nothing was sent; try again shortly",
+        ),
+        (
+            "gateway_restarted",
+            "refused: the gateway restarted; nothing was sent; call the tool again",
+        ),
+        ("stream_lost", POLICY_CHANGED),
         (None, POLICY_CHANGED),
     ],
-    ids=["changed", "operator", "unnamed", "none"],
+    ids=[
+        "changed",
+        "operator",
+        "shutdown",
+        "gateway-stopped",
+        "gateway-restarted",
+        "unnamed",
+        "none",
+    ],
 )
 async def test_a_withdrawal_says_why(tmp_path: Path, reason: str | None, said: str) -> None:
-    """Step 10's deviation 18 (M8 step 16): the vault's ``approval_withdrawn`` names its reason,
-    and each named one has its own text; the operator's withdraw (K.3, J15) says so, and a
-    policy change, a reason the gateway doesn't name yet (the stop's, step 17) or none keeps
-    "the policy changed". Each is recorded withdrawn, nothing sent."""
+    """Step 10's deviation 18 (M8 steps 16 and 17): the vault's ``approval_withdrawn`` names
+    its reason, and each named one has its own text: the operator's withdraw (K.3, J15), the
+    vault's stop, the gateway's own stop (a blocking call its detach withdrew, I.2) and a new
+    gateway epoch (G-15); a policy change, a reason the vault never names or none keeps "the
+    policy changed". Each is recorded withdrawn, nothing sent."""
     held = await in_process(tmp_path)
     result = await settle(
         held.approvals,
@@ -976,17 +994,33 @@ async def test_a_withdrawal_says_why(tmp_path: Path, reason: str | None, said: s
     [
         (b'{"error":"conflict","code":"approval_withdrawn","reason":"operator"}', "operator"),
         (b'{"error":"conflict","code":"approval_withdrawn","reason":"changed"}', "changed"),
+        (
+            b'{"error":"conflict","code":"approval_withdrawn","reason":"gateway_stopped"}',
+            "gateway_stopped",
+        ),
         (b'{"error":"conflict","code":"approval_withdrawn","reason":"Operator!"}', None),
         (b'{"error":"conflict","code":"approval_withdrawn","reason":1}', None),
         (b'{"error":"conflict","code":"approval_withdrawn"}', None),
     ],
-    ids=["operator", "changed", "not-a-name", "not-a-string", "none"],
+    ids=["operator", "changed", "gateway-stopped", "not-a-name", "not-a-string", "none"],
 )
 def test_a_withdrawals_reason_is_read_as_a_name(body: bytes, reason: str | None) -> None:
     """``held_answer`` reads a refusal's ``reason`` only in a name's form (lowercase letters and
     underscores, at most 32): the gateway's own table gives it its text."""
     found = held_answer(409, httpx2.Headers({"x-zoeymcp-vault": "refused"}), body)
     assert (found.code, found.reason) == ("approval_withdrawn", reason)
+
+
+def test_every_reason_the_vault_names_has_its_own_text() -> None:
+    """The vault's closed set of withdrawal reasons (step 10's deviation 18, M8 steps 16 and 17)
+    is the gateway's table, each in a name's form, and every one says nothing was sent but a
+    policy change's, which asks for the call again; ``check_approval`` names each too."""
+    assert set(elsewhere.WITHDRAWN) == WITHDRAWN_REASONS
+    for reason, said in elsewhere.WITHDRAWN.items():
+        assert re.fullmatch(r"[a-z_]{1,32}", reason)
+        assert said.startswith("refused: ")
+        assert reason in checkapproval.WITHDRAWN
+    assert elsewhere.WITHDRAWN["changed"] == elsewhere.VAULT_ANSWERS["approval_withdrawn"][1]
 
 
 @pytest.mark.parametrize(

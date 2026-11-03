@@ -18,7 +18,10 @@ Every rule it follows is :mod:`.telegramwire`'s; this module sends, polls and ed
   token; a 429 waits its ``retry_after``.
 - **One write queue for the chat** (G.3, G.4): sends, edits and deletes alike, spaced
   :data:`SEND_SPACING` apart, edits and deletes before sends (so a decided hold's message changes
-  before the next prompt goes); a 429 holds every write for exactly its ``retry_after``.
+  before the next prompt goes); a 429 holds every write for exactly its ``retry_after``. While
+  the poller runs, no send goes before its first start sequence has succeeded (one that fails is
+  run again, and skips the backlog again), so a press on a prompt is never in the backlog a start
+  skips unread.
   ``answerCallbackQuery`` answers the presser's own tap and goes at once. A send that fails
   otherwise is retried with backoff until the hold's deadline, a 403 gives up on the chat for
   that hold (the portal still shows it), and a failed edit is a log line.
@@ -307,6 +310,10 @@ class TelegramSurface:
         self._writer: asyncio.Task[None] | None = None
         self._stopping = False  # a stop waits for its edits: a start meanwhile cancels it
         self._paused = False  # an enrolment of the same bot polls instead (G.8 step 2)
+        # The poller's first start sequence succeeded: a send waits for it, so its backlog skip
+        # can't drop a press on a message sent before it (G.3, Z10). A start that fails is run
+        # again from the top, so the sends wait for that one.
+        self._begun = asyncio.Event()
 
     @property
     def name(self) -> SurfaceName:
@@ -351,6 +358,7 @@ class TelegramSurface:
         if poller is not None:
             poller.cancel()
             self._paused = True
+            self._work.set()  # a send waiting for the poller's start goes now
 
     def resume(self) -> None:
         """The enrolment closed: poll again, from the start sequence (the backlog skipped)."""
@@ -515,7 +523,9 @@ class TelegramSurface:
             try:
                 token = self._token()
             except _NoToken:
-                self._health.token_missing = True
+                if not self._health.token_missing:
+                    self._health.token_missing = True
+                    self._work.set()  # a send waiting for the start goes, and fails as it would
                 await asyncio.sleep(self.timings.backoff_max)
                 continue
             self._health.token_missing = False
@@ -531,6 +541,9 @@ class TelegramSurface:
                 if begun_for != digest:
                     offset = await self._begin(token)
                     begun_for = digest
+                    if not self._begun.is_set():
+                        self._begun.set()
+                        self._work.set()  # the backlog is skipped: the writer's sends may go
                 params: dict[str, Any] = {
                     "timeout": self.timings.poll_timeout,
                     "limit": POLL_LIMIT,
@@ -677,6 +690,8 @@ class TelegramSurface:
             return None, None
         if self._edits:
             return self._edits.popleft(), None
+        if self._unbegun():
+            return None, None  # the poller's start sets _work once it has run
         due: float | None = None
         for write in list(self._sends):
             prompt = None if write.hold_id is None else self._prompts.get(write.hold_id)
@@ -688,6 +703,13 @@ class TelegramSurface:
                 return write, None
             due = write.retry_at - now if due is None else min(due, write.retry_at - now)
         return None, due
+
+    def _unbegun(self) -> bool:
+        """Whether sends wait for the poller's first start sequence: while it runs and that
+        hasn't succeeded yet, with a token to run it with (a missing token's sends fail as
+        before)."""
+        polling = self._poller is not None and not self._health.token_missing
+        return polling and not self._begun.is_set()
 
     async def _write(self) -> None:
         """Every write to the chat, one at a time, :attr:`Timings.send_spacing` apart."""

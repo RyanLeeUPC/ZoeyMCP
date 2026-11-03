@@ -13,15 +13,18 @@ import httpx
 import pytest
 import yaml
 
+from tests.gateway import holdrig
 from zoeymcp.cli.main import EXIT_FINDINGS, EXIT_OK, main
 from zoeymcp.common import egresslist
 from zoeymcp.common.netguard import entry_key
 from zoeymcp.common.policy import Policy, parse_policy
 from zoeymcp.selftest import runner
+from zoeymcp.selftest.approver import StandIn
 from zoeymcp.selftest.cases import CaseFile, UpstreamExpectation, parse_cases
 from zoeymcp.selftest.echo import TokenClient, TokenEcho, endpoint_key
 from zoeymcp.selftest.runner import Rig, generate_mutants, mutate
 from zoeymcp.vault import app as app_module
+from zoeymcp.vault import netclient
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.connectors.smtp import SendResult
 
@@ -805,3 +808,132 @@ def test_a_local_route_is_exempt_from_the_allowlist_check_only_as_a_local_route(
         "bridge.invalid:80",
     }
     assert runner._local_destinations(example_policy()) == set()
+
+
+# --- held calls (M8 design I.5, Z22; step 17) ---------------------------------------------------
+
+HELD = "the operator approves every order"
+LISTED = "listing items needs nobody"
+FORWARDED: dict[str, Any] = {"status": 200, "upstream": {"path": "/base/mcp"}}
+
+
+def held_policy() -> Policy:
+    """The hold rig's policy (``tests/gateway/holdrig.py``): ``place_order`` held by the vault,
+    ``list_items`` allowed, both approvers on, and Telegram's bot token never in the store."""
+    return holdrig.policy(surfaces=("telegram", "portal"))
+
+
+def held_cases(held: dict[str, Any], listed: dict[str, Any]) -> CaseFile:
+    """Two calls through the gateway: the held ``place_order``, expecting ``held``, and the
+    allowed ``list_items``, expecting ``listed``."""
+
+    def tool_call(name: str) -> dict[str, Any]:
+        return {
+            "method": "POST",
+            "path": "/shop/mcp",
+            "caller": "gateway",
+            "headers": {"content-type": "application/json", "mcp-protocol-version": "2025-11-25"},
+            "body": holdrig.call(name).decode(),
+        }
+
+    cases = [
+        {"name": HELD, "request": tool_call("place_order"), "expect": held},
+        {"name": LISTED, "request": tool_call("list_items"), "expect": listed},
+    ]
+    return parse_cases(yaml.safe_dump({"cases": cases}))
+
+
+def test_held_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """I.5, Z22: the call to a held tool is held as in production, shown once on the stand-in
+    with the text the vault rendered, then withdrawn by the self-test, and the echo upstream saw
+    nothing of it; the allowed call is forwarded as ever. No Telegram client is built and the
+    Bot API is never reached, though the derived list names it, with reason ``approver``."""
+    made: list[StandIn] = []
+
+    class Kept(StandIn):
+        def __init__(self) -> None:
+            super().__init__()
+            made.append(self)
+
+    def no_bot_client(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a self-test built the Telegram approver's client")
+
+    monkeypatch.setattr(netclient, "approver_client", no_bot_client)
+    monkeypatch.setattr(runner, "StandIn", Kept)
+    policy = held_policy()
+    vault = egresslist.derive(policy)[egresslist.VAULT]
+    [bot] = [d for d in vault if (d.host, d.port) == ("api.telegram.org", 443)]
+    assert bot.reasons == {"approver"}
+    cases = held_cases({"held": True}, FORWARDED)
+    results = asyncio.run(Rig(policy, tmp_path).run(policy, cases))
+    assert [(r.name, r.problems) for r in results] == [(HELD, []), (LISTED, [])]
+    [stand_in] = made
+    [hold] = stand_in.shown
+    assert (hold.server, hold.tool, hold.state) == ("shop", "place_order", "held")
+    assert hold.surfaces == {"telegram", "portal"}
+    assert hold.ref in hold.text.value
+    assert "kettle" in hold.text.value
+
+
+@pytest.mark.parametrize("wait", [None, "block", "pending"], ids=["unmarked", "block", "pending"])
+def test_a_held_case_whose_block_ends_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wait: str | None
+) -> None:
+    """I.5 under ``approvers.block_seconds: 0`` (a valid policy): the vault ends the block as
+    soon as the hold is shown, before the self-test looks, so an unmarked or ``wait=block`` hold
+    expires and a ``wait=pending`` one detaches and answers ``approval_pending``. Each is still
+    ``held``, shown once and never forwarded, and the self-test withdraws what still waits, so
+    no undecided hold outlives its case."""
+    made: list[app_module.VaultApp] = []
+
+    class Kept(app_module.VaultApp):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(runner, "VaultApp", Kept)
+    policy = holdrig.policy(surfaces=("portal",), block_seconds=0)
+    cases = held_cases({"held": True}, FORWARDED)
+    if wait is not None:
+        marked = holdrig.marker("00000000000000a1", wait=wait)
+        cases.cases[0].request.headers["x-zoeymcp-held"] = marked
+    results = asyncio.run(Rig(policy, tmp_path).run(policy, cases))
+    assert [(r.name, r.problems) for r in results] == [(HELD, []), (LISTED, [])]
+    [vault] = made
+    assert [hold.state for hold in vault.holds.holds() if hold.state == "held"] == []
+
+
+@pytest.mark.parametrize(
+    ("held", "listed", "failed"),
+    [
+        ({"status": 200}, FORWARDED, (HELD, "the call was held, expected status 200")),
+        ({"status": 403}, FORWARDED, (HELD, "the call was held, expected status 403")),
+        ({"held": True}, {"held": True}, (LISTED, "the call wasn't held: status 200")),
+    ],
+    ids=["held-not-forwarded", "held-not-refused", "forwarded-not-held"],
+)
+def test_a_held_case_says_what_happened_instead(
+    tmp_path: Path, held: dict[str, Any], listed: dict[str, Any], failed: tuple[str, str]
+) -> None:
+    """A case expecting a status whose call the vault holds fails, its hold withdrawn all the
+    same and nothing sent; a case expecting ``held`` whose call is forwarded fails too."""
+    policy = held_policy()
+    results = asyncio.run(Rig(policy, tmp_path).run(policy, held_cases(held, listed)))
+    name, problem = failed
+    assert [(r.name, r.problems) for r in results if not r.ok] == [(name, [problem])]
+
+
+@pytest.mark.parametrize(
+    ("expect", "message"),
+    [
+        ("{held: true, status: 409}", "a held call answers no status"),
+        ("{held: false}", "expect needs a status, or held: true"),
+        ("{held: true, upstream: {path: /a}}", "forwarded request"),
+    ],
+    ids=["both", "neither", "held-with-upstream"],
+)
+def test_a_held_case_names_no_status(expect: str, message: str) -> None:
+    """``held`` is the outcome: a case gives it or a status, never both and never neither."""
+    request = "    request: {method: POST, path: /shop/mcp, caller: gateway}\n"
+    with pytest.raises(ValueError, match=message):
+        parse_cases(f"cases:\n  - name: x\n{request}    expect: {expect}\n")

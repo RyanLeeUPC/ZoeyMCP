@@ -111,11 +111,18 @@ VAULT_ANSWERS: Final[dict[str, tuple[Decision, str]]] = {
     ),
 }
 # A withdrawal's text by the reason the vault names (step 10's deviation 18): the operator's
-# withdraw (K.3, J15) its own; a policy change, or a reason not named, VAULT_ANSWERS's.
+# withdraw (K.3, J15), the vault's stop, this gateway's own stop (a blocking call its stop
+# detached, I.2) and a new gateway epoch (G-15) each their own; a policy change, or a reason not
+# named, VAULT_ANSWERS's.
 WITHDRAWN: Final[Mapping[str, str]] = MappingProxyType(
     {
         "changed": "refused: the policy changed; call the tool again",
         "operator": "refused: the operator withdrew this call; nothing was sent",
+        "shutdown": "refused: the vault stopped; nothing was sent; try again shortly",
+        "gateway_stopped": "refused: the gateway is stopping; nothing was sent; try again shortly",
+        "gateway_restarted": (
+            "refused: the gateway restarted; nothing was sent; call the tool again"
+        ),
     }
 )
 TOO_LARGE: Final = "the call ran, but its answer was over 4 MiB and wasn't kept; see the Ledger"
@@ -478,7 +485,10 @@ async def _abandoned(
     """The agent left (its handler cancelled): the vault is told, and the gateway's ledger says
     withdrawn, ``outcome unknown``, since the vault may have approved and forwarded it. Telling
     the vault gets :data:`.approve.FINISH_GRACE` of the grace, so a vault slow to answer never
-    leaves the records unwritten or the lock held."""
+    leaves the records unwritten or the lock held. Cut by the gateway's own stop (a call whose
+    answer didn't come before the stop's grace ran out, I.2 step 4), it says ``shutdown``, and
+    ``outcome unknown, detail shutdown``: the vault's chain has the real outcome."""
+    stopped = approvals.stopping()
     if approvals.tell_withdrawn is not None and (answer is None or not answer.refused):
         with anyio.move_on_after(FINISH_GRACE) as telling:
             try:
@@ -487,6 +497,10 @@ async def _abandoned(
                 logs.event("approval_withdraw_failed", ref=call.ref, error_type=type(exc).__name__)
         if telling.cancelled_caught:
             logs.event("approval_withdraw_failed", ref=call.ref, error_type="timeout")
+    if stopped:
+        await _decided(approvals, record, "shutdown")
+        await _finish(approvals, record, "unknown", "shutdown", settings.cooldown, "shutdown")
+        return
     await _decided(approvals, record, "withdrawn")
     await _finish(approvals, record, "unknown", None, settings.cooldown, "withdrawn")
 
@@ -522,7 +536,14 @@ def _settings(call: HeldCall, out: ViewOutOfBand) -> Settings:
 
 # The gateway's table keeps an approved held call as accept; the ledger says approved_elsewhere.
 LedgerDecision = Literal[
-    "approved_elsewhere", "pending", "decline", "timeout", "withdrawn", "error", "unavailable"
+    "approved_elsewhere",
+    "pending",
+    "decline",
+    "timeout",
+    "withdrawn",
+    "error",
+    "unavailable",
+    "shutdown",
 ]
 
 

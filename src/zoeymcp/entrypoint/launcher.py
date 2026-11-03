@@ -52,13 +52,16 @@ from . import env
 # The image's second environment, the only one with the gateway's dependencies (B.5).
 GATEWAY_PYTHON = "/opt/zoeymcp-gateway/bin/python"
 # Seconds the gateway gets to stop: an approved call accepted just before may run for the default
-# call_timeout (300 s), and its outcome is written after (M4 design B.6).
+# call_timeout (300 s), and its outcome is written after (M4 design B.6). Its detach of the calls
+# the vault holds for it is one request (M8 design I.2).
 GATEWAY_STOP_WAIT = 330.0
-# Seconds the vault gets after that: more than an SMTP send's 60 s.
-VAULT_STOP_WAIT = 75.0
+# Seconds the vault gets after that (M8 design I.2): a held call approved just before the stop
+# may run for STOP_WINDOW_CALL_TIMEOUT (300 s) plus OUTCOME_MARGIN (10 s), then 5 s of message
+# edits and 15 s of slack; an SMTP send's 60 s fits inside.
+VAULT_STOP_WAIT = 330.0
 # Seconds each bridge gets after that: its children's 4 s stop (M7 design C.3, C.10).
 BRIDGE_STOP_WAIT = 10.0
-# compose's stop_grace_period is 420 s.
+# compose's stop_grace_period is 680 s.
 STOP_WAIT = GATEWAY_STOP_WAIT + VAULT_STOP_WAIT + BRIDGE_STOP_WAIT
 POLL = 0.2
 STATUS_FILE = "/proc/self/status"

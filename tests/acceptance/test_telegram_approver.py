@@ -270,6 +270,68 @@ async def test_message_shape(tmp_path: Path) -> None:
     assert rig.upstream.received == []
 
 
+class Gated:
+    """The fake's app with ``getMe`` held until :attr:`opened` is set: the poller's start
+    sequence waits there, after ``getWebhookInfo``. The first ``fail`` calls to ``getMe`` answer
+    502 at once instead (a Bot API not reachable yet), so the start fails and runs again."""
+
+    def __init__(self, app: ASGIApp, *, fail: int = 0) -> None:
+        self.app = app
+        self.fail = fail
+        self.reached = anyio.Event()
+        self.opened = anyio.Event()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and str(scope["path"]).endswith("/getMe"):
+            if self.fail:
+                self.fail -= 1
+                body = b'{"ok": false, "error_code": 502, "description": "Bad Gateway"}'
+                headers = [(b"content-type", b"application/json")]
+                await send({"type": "http.response.start", "status": 502, "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+                return
+            self.reached.set()
+            await self.opened.wait()
+        await self.app(scope, receive, send)
+
+
+@pytest.mark.parametrize("fail", [0, 1], ids=["first_start", "after_a_failed_start"])
+async def test_the_first_send_waits_for_the_backlog_skip(tmp_path: Path, fail: int) -> None:
+    """G.3, Z10 (step 14's open minor, M8 step 17): a prompt shown while the poller's start
+    sequence still runs isn't sent until that start has skipped the backlog, so the operator's
+    press on it can never be in the backlog ``getUpdates(offset=-1)`` drops unread; the press
+    then decides the hold. A start that failed (``getMe`` refused once) releases nothing: the
+    prompt waits for the start that runs again and succeeds."""
+    api = bot()
+    gated = Gated(api.app(), fail=fail)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=gated))
+    with anyio.fail_after(BOUND):
+        async with vault(tmp_path, api, client=client) as (rig, http):
+            surface = rig.app.telegram
+            assert surface is not None
+            await gated.reached.wait()
+            async with anyio.create_task_group() as group:
+                group.start_soon(held, rig, http, "00000000000000f1")
+                await until(lambda: surface._prompts, BOUND)  # its show queued the send
+                await anyio.wait_all_tasks_blocked()  # and the writer had every chance
+                before = [c.method for c in api.calls]
+                gated.opened.set()
+            sent = await prompt(api)
+            api.operator.press(sent.message_id, "Approve")
+            await until(lambda: len(rig.upstream.posts()) == 1, BOUND)
+            await rig.settled()
+    # The prompt waited, though its show had queued it (a refused getMe never reaches the fake).
+    assert before == ["getWebhookInfo"] * (fail + 1)
+    skip = next(
+        i
+        for i, c in enumerate(api.calls)
+        if c.method == "getUpdates" and c.params.get("offset") == -1
+    )
+    assert [c.method for c in api.calls].index("sendMessage") > skip
+    assert answered(api) == ["Approved"]
+    assert rig.kinds("00000000000000f1")[1:] == [("decided", "accept"), ("outcome", "ok")]
+
+
 async def test_the_two_stage_edit(tmp_path: Path) -> None:
     """G.6, J2 step 4: approved in Telegram, the message says so and "Sending..." once its
     decided record is on disk, then the server's answer, with no keyboard; the call is forwarded
@@ -872,7 +934,8 @@ async def test_the_bot_api_is_reached_through_the_guard(
             await held(rig, http, "0000000000000701")
             await prompt(api)
     assert ("api.telegram.org", 443) in resolver.lookups
-    # The poller's start sequence (G.3); the writer's first send may go in between (its own task).
+    # The poller's start sequence (G.3); the writer's first send waits for it (M8 step 17), and
+    # may go before or after the first long poll begins.
     polled = [c.method for c in api.calls if c.method in {"getWebhookInfo", "getMe", "getUpdates"}]
     assert polled[:3] == ["getWebhookInfo", "getMe", "getUpdates"]
 

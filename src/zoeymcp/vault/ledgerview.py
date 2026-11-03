@@ -55,10 +55,12 @@ NAMED: Final = ("client", "server", "tool")  # the asked record's names a policy
 _COMMON: Final = frozenset({"v", "seq", "prev", "ts", "ref", "kind", "writer"})
 # A decision's verdict on its call, for J.2's disagreement flag: these approve it; these say
 # neither (a wait the vault answered pending, an error or a refusal before anyone was asked);
-# any other refuses it. The gateway's ``abandoned`` says neither too: its restart closed a call
-# whose vault decision it never heard (C.4), while the vault's own means it never forwarded.
+# any other refuses it. The gateway's ``abandoned`` and ``shutdown`` say neither too: its restart
+# closed a call whose vault decision it never heard (C.4), or its own stop cut the call before the
+# vault's answer came (I.2 step 4), while the vault's own means it never forwarded.
 APPROVING: Final = frozenset({"accept", "approved_elsewhere"})
 NEITHER: Final = frozenset({"pending", "error", "unavailable"})
+GATEWAY_NEITHER: Final = frozenset({"abandoned", "shutdown"})
 
 Flag = Literal["no_ledger_record", "not_yet_reported", "older_than_copy"]
 
@@ -324,7 +326,7 @@ def verdict(decision: str | None, writer: str) -> bool | None:
     neither (None, also when there is none)."""
     if decision is None or decision in NEITHER:
         return None
-    if decision == "abandoned" and writer == "gateway":
+    if decision in GATEWAY_NEITHER and writer == "gateway":
         return None
     return decision in APPROVING
 

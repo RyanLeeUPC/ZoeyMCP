@@ -1662,6 +1662,7 @@ def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
             "run: zoeymcp passkeys, and remove any you don't recognize",
         ),
         ({"kind": "reset_passkeys"}, "run: zoeymcp setup-code --reset"),
+        ({"kind": "list_approvals"}, "run: zoeymcp approvals list"),
         (
             {
                 "kind": "onboard_again",

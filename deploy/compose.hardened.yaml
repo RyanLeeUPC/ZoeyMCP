@@ -102,9 +102,10 @@ services:
     image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
     command: [vault, --listen, "0.0.0.0:8080"]
     user: "10001:10001"
-    # On stop, OAuth refreshes in flight finish and are saved (up to 45 s), and an SMTP send in
-    # flight finishes (up to 60 s), before the vault exits.
-    stop_grace_period: 75s
+    # On stop, calls waiting for an approval are withdrawn, a held call approved just before
+    # finishes (default call_timeout 300 s), OAuth refreshes in flight finish and are saved (up
+    # to 45 s), and an SMTP send in flight finishes (up to 60 s), before the vault exits.
+    stop_grace_period: 330s
     environment:
       ZOEYMCP_MASTER_KEY: ${ZOEYMCP_MASTER_KEY:?generate one with `zoeymcp keygen`}
       # The commands ZoeyMCP prints (a refused start's way out, the policy commands' next

@@ -6,6 +6,7 @@ reaches the vault over TCP with the gateway key, as the hardened tier does.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import io
 import json
@@ -379,8 +380,12 @@ class WithAdmin:
     def __init__(self, app: GatewayApp) -> None:
         self.app = app
         self.admin: ASGIApp = AdminApp(app)
+        # The loop uvicorn serves both on (the lifespan's first call records it), so a test can
+        # run the gateway's own code there, as the stop signal does.
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.loop = asyncio.get_running_loop()
         path = scope.get("path", "")
         if scope["type"] == "http" and path.startswith(ADMIN_PREFIX):
             await self.admin({**scope, "path": path[len(ADMIN_PREFIX) :]}, receive, send)
@@ -392,9 +397,23 @@ class WithAdmin:
 class Running:
     app: GatewayApp
     url: str  # the gateway's base URL
+    served: WithAdmin | None = None  # the app as uvicorn serves it, with its loop
 
     def mcp(self, server: str = SERVER) -> str:
         return f"{self.url}/s/{server}/mcp"
+
+    async def request_stop(self) -> None:
+        """The stop signal, run on the gateway's own loop as its handler is (``server.py``'s
+        ``stop``): its hooks start their work in the lifespan's task group, which only that loop
+        may run."""
+        loop = None if self.served is None else self.served.loop
+        assert loop is not None, "the gateway isn't served by this rig"
+
+        async def stop() -> None:
+            self.app.request_stop()
+
+        future = asyncio.run_coroutine_threadsafe(stop(), loop)
+        await anyio.to_thread.run_sync(lambda: future.result(10))
 
     @property
     def admin_url(self) -> str:
@@ -437,13 +456,14 @@ def gateway(
     app.ledger, _ = Ledger.open_at(
         deployed.state, max_bytes=deployed.view.gateway.limits.ledger_max_bytes
     )
-    with serve(WithAdmin(app), lifespan=True, proxy_headers=False) as url:
+    served = WithAdmin(app)
+    with serve(served, lifespan=True, proxy_headers=False) as url:
         deadline = time.monotonic() + 10
         while httpx.get(f"{url}/healthz", timeout=5).status_code != 200:
             if time.monotonic() > deadline:
                 raise RuntimeError("the gateway didn't become ready")
             time.sleep(0.05)
-        yield Running(app, url)
+        yield Running(app, url, served)
 
 
 @asynccontextmanager

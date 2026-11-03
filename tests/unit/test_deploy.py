@@ -29,10 +29,13 @@ from zoeymcp.egress.main import StartupError as EgressStartupError
 from zoeymcp.egress.main import build as build_egress
 from zoeymcp.entrypoint import env, launcher
 from zoeymcp.portal import listen
+from zoeymcp.vault import approvers, heldcommit
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
 COMPOSE_FILES = sorted(DEPLOY.glob("compose*.yaml"))
+# The existing-stack recipe, split into services as the hardened tier is (M7 design F-44).
+EXISTING_STACK = ROOT / "examples" / "existing-stack" / "compose.yaml"
 EGRESS_UID = 10006
 
 
@@ -337,14 +340,22 @@ def test_the_stop_windows_let_approved_calls_finish() -> None:
     # vault, so the gateway stops first and the windows cover the default call_timeout.
     standard = compose("compose.yaml")["services"]["zoeymcp"]
     assert _seconds(standard["stop_grace_period"]) > launcher.STOP_WAIT
-    # The standard tier's bridges get their 10 s after the vault's 75 s, still inside compose's
-    # 420 s (M7 design C.10, CR-B5).
+    # M8 design I.2: the vault's window covers a held call approved just before the stop, which
+    # the vault itself forwards: STOP_WINDOW_CALL_TIMEOUT, OUTCOME_MARGIN, 5 s of edits
+    # (EDIT_GRACE) and 15 s of slack, which holds the drain's second EDIT_GRACE (drain_holds'
+    # endings, then stop_approvers' Telegram stop). The standard tier's bridges get their 10 s
+    # after it, still inside compose's 680 s (M7 design C.10, CR-B5).
+    forward = policy_check.STOP_WINDOW_CALL_TIMEOUT + heldcommit.OUTCOME_MARGIN
+    assert launcher.VAULT_STOP_WAIT == forward + approvers.EDIT_GRACE + 15 == 330
+    assert approvers.EDIT_GRACE <= 15
     assert launcher.BRIDGE_STOP_WAIT == 10
-    assert launcher.STOP_WAIT == 330 + 75 + 10 < _seconds(standard["stop_grace_period"]) == 420
+    assert launcher.STOP_WAIT == 330 + 330 + 10 < _seconds(standard["stop_grace_period"]) == 680
     hardened = compose("compose.hardened.yaml")["services"]
-    assert _seconds(hardened["gateway"]["stop_grace_period"]) >= launcher.GATEWAY_STOP_WAIT
-    assert _seconds(hardened["vault"]["stop_grace_period"]) >= launcher.VAULT_STOP_WAIT
-    assert hardened["gateway"]["depends_on"] == {"vault": {"condition": "service_started"}}
+    existing = yaml.safe_load(interpolated(EXISTING_STACK.read_text(encoding="utf-8")))["services"]
+    for services in (hardened, existing):
+        assert _seconds(services["gateway"]["stop_grace_period"]) == launcher.GATEWAY_STOP_WAIT
+        assert _seconds(services["vault"]["stop_grace_period"]) == launcher.VAULT_STOP_WAIT
+        assert services["gateway"]["depends_on"]["vault"] == {"condition": "service_started"}
     assert GatewayLimits().call_timeout + 30 <= launcher.GATEWAY_STOP_WAIT
 
 

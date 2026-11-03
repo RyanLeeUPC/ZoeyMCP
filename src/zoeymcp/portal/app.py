@@ -432,6 +432,7 @@ ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
         "reset_passkeys": "Run zoeymcp setup-code --reset with host access.",
         "check_gateway": "Check that the gateway is running and reporting.",
         "read_ledger": "Read it on the Ledger page, or with zoeymcp ledger --vault.",
+        "list_approvals": "Open the Approvals page: Decided recently lists them.",
         "onboard_again": "Register a new client: run zoeymcp health with host access for "
         "the command.",
         "widen_scope": "Merge the scope fragment from zoeymcp health --json, check and reload "
@@ -682,6 +683,8 @@ class Approvals(Protocol):
     def hold_wall(self, at: float) -> float: ...
 
     def telegram_delivered(self, hold_id: str) -> bool: ...
+
+    def approvals_listed(self) -> None: ...
 
 
 class _Gone(Exception):
@@ -1744,8 +1747,10 @@ class PortalApp:
     # --- the Approvals queue (M8 design H) --------------------------------------------------------
 
     async def _approvals(self, call: Call) -> Reply | Refusal:
-        """Waiting, oldest first, and Decided recently (H.1), polled while the page is open."""
+        """Waiting, oldest first, and Decided recently (H.1), polled while the page is open.
+        The operator has opened the page: ``approvals_withdrawn_at_start`` clears (K.1)."""
         approvals = self._approvals_of()
+        approvals.approvals_listed()
         queue = approvals.queue
         answer = approvalsview.queue(
             approvals.holds.holds(),

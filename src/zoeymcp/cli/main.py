@@ -63,6 +63,7 @@ HEALTH_ACTIONS = {
     "check_mailbox": "check the mailbox for the sends with an unknown outcome",
     "check_gateway": "check that the gateway runs and reaches the vault",
     "read_ledger": "run: zoeymcp ledger --vault",
+    "list_approvals": "run: zoeymcp approvals list",
     "add_passkey": "run: zoeymcp setup-code, and enrol a second passkey with it",
     "review_passkeys": "run: zoeymcp passkeys, and remove any you don't recognize",
     "reset_passkeys": "run: zoeymcp setup-code --reset",

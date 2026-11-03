@@ -581,6 +581,8 @@ async def test_concurrent_race(tmp_path: Path, link: str, order: str) -> None:
         code
         == {"approve": None, "deny": "approval_declined", "withdraw": "approval_withdrawn"}[first]
     )
+    if first == "withdraw":
+        assert answer.json()["reason"] == "shutdown"  # the vault's stop names itself (step 17)
 
 
 # --- the caller's leaving (B.6; FM-13, FM-29, FM-30, FM-33; Z23) ---------------------------------

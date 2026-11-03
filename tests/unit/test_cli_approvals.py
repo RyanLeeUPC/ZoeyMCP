@@ -41,9 +41,11 @@ from zoeymcp.cli.main import main
 from zoeymcp.common.approvaltext import ApprovalText
 from zoeymcp.portal.approvalsview import utc
 from zoeymcp.vault.admin import AdminApp, SetupCodes
+from zoeymcp.vault.app import START_FINDINGS_SECONDS
 from zoeymcp.vault.approvers import SurfaceName
 from zoeymcp.vault.holds import Hold, HoldRequest
 from zoeymcp.vault.telegram import PROBE, Timings
+from zoeymcp.vault.vaultledger import Start
 
 from .test_admin_policy import serve
 
@@ -189,6 +191,34 @@ def test_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingP
     ]
     assert [(r["ref"], r["state"]) for r in listed["decided"]] == [(REFS[2], "denied")]
     assert "Approval request" not in out
+    rig.close()
+
+
+def test_list_clears_what_the_start_withdrew(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """K.1, J10 (step 16's deviation 9): health shows ``approvals_withdrawn_at_start`` until
+    the host lists the approvals, and ``approvals_outcome_unknown`` on; 24 hours after the start,
+    neither."""
+    rig = Rig(tmp_path, monkeypatch, portal)
+    rig.hold.chain.start = Start(withdrawn=2, outcome_unknown=(REFS[0],))
+
+    def found() -> dict[str, str]:
+        code, out, _ = run_cli(["health", "--json"])
+        assert code in (0, 1)
+        report = json.loads(out)["approvals"]
+        return {
+            f["code"]: f["text"] for f in report["findings"] if f["code"].startswith("approvals_")
+        }
+
+    before = found()
+    assert list(before) == ["approvals_withdrawn_at_start", "approvals_outcome_unknown"]
+    assert "withdrew 2 approval(s)" in before["approvals_withdrawn_at_start"]
+    assert f"(refs {REFS[0]})" in before["approvals_outcome_unknown"]
+    assert run_cli(["approvals", "list"])[0] == 0
+    assert list(found()) == ["approvals_outcome_unknown"]
+    rig.hold.clock.ahead += START_FINDINGS_SECONDS
+    assert found() == {}
     rig.close()
 
 

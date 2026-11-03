@@ -19,10 +19,23 @@ Example::
         request: {method: GET, path: /stats/2.0/, caller: {placeholder: guessed-value-0000}}
         expect: {status: 403}
 
+      - name: an order waits for the operator
+        request:
+          method: POST
+          path: /broker/mcp
+          caller: gateway
+          headers: {content-type: application/json, mcp-protocol-version: "2025-11-25"}
+          body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"place_order"}}'
+        expect: {held: true}
+
 ``caller`` is ``gateway``, ``none``, or ``{placeholder: ...}``; a placeholder is presented where
 the policy says that caller sends it (bearer, header or query), or as a bearer token if the
 policy doesn't know it. ``expect.upstream`` is only valid for a forwarded request.
 In ``query`` and ``headers``, ``null`` means "must be absent".
+
+``expect`` is a ``status``, or ``held: true`` for a call the vault holds for an approval (M8
+design I.5): the call is held and shown once, nothing reaches the upstream, and the self-test
+withdraws it, so it never answers with a status of its own.
 """
 
 from __future__ import annotations
@@ -61,12 +74,17 @@ class UpstreamExpectation(_Model):
 
 
 class Expectation(_Model):
-    status: Annotated[int, Field(ge=100, le=599)]
+    status: Annotated[int, Field(ge=100, le=599)] | None = None
+    held: bool = False
     upstream: UpstreamExpectation | None = None
 
     @model_validator(mode="after")
-    def _upstream_needs_success(self) -> Expectation:
-        if self.upstream is not None and self.status >= 400:
+    def _status_or_held(self) -> Expectation:
+        if self.held and self.status is not None:
+            raise ValueError("expect.held is the outcome: a held call answers no status")
+        if not self.held and self.status is None:
+            raise ValueError("expect needs a status, or held: true")
+        if self.upstream is not None and (self.status is None or self.status >= 400):
             raise ValueError("expect.upstream needs a forwarded request (status below 400)")
         return self
 

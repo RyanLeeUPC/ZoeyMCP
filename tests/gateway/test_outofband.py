@@ -68,13 +68,14 @@ from tests.gateway.test_elsewhere import (
     text,
 )
 from tests.gateway.test_elsewhere import headers as bearer
-from zoeymcp.common import canonical
+from zoeymcp.common import canonical, ledgerformat
 from zoeymcp.common.approvaltext import RELAY_LINE, ApprovalText, Header, render_call
 from zoeymcp.common.committed import Committed
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import build_view
-from zoeymcp.gateway import checkapproval, elsewhere, pipeline
+from zoeymcp.gateway import checkapproval, elsewhere, pipeline, server
 from zoeymcp.gateway import logs as gateway_logs
+from zoeymcp.gateway.app import STOP_DETACH_WAIT
 from zoeymcp.gateway.approvals import MAX_RECORDS, Key, Pending, Settings
 from zoeymcp.gateway.approve import LEDGER_DOWN, RESULT_TTL_MAX, Approvals, Asking
 from zoeymcp.gateway.approvers import (
@@ -88,7 +89,7 @@ from zoeymcp.gateway.approvers import (
     RelayWait,
     Shown,
 )
-from zoeymcp.gateway.ledger import LedgerUnavailable
+from zoeymcp.gateway.ledger import LEDGER_DIR, LedgerUnavailable
 from zoeymcp.gateway.outofband import (
     IDLE_WAIT,
     ApprovalsFailed,
@@ -278,6 +279,7 @@ async def test_detach_answers_pending_now(tmp_path: Path, link: str, log: io.Str
     assert collected["state"] == "done"
     assert "result" in collected
     assert blocking.json()["code"] == "approval_withdrawn"
+    assert blocking.json()["reason"] == "gateway_stopped"  # its own text at the gateway
     assert rig.kinds(REF_B)[1:] == [("decided", "withdrawn"), ("outcome", "not_sent")]
     assert rig.kinds(REF_A)[1:] == [("decided", "accept"), ("outcome", "ok")]
     assert len(rig.upstream.posts()) == 1
@@ -634,6 +636,42 @@ async def test_a_detached_wait_answers_pending_and_runs_once_approved(tmp_path: 
         ("decided", "approved_elsewhere"),
         ("outcome", ("ok", None)),
     ]
+
+
+async def test_the_gateways_stop_detaches_its_blocking_held_calls(tmp_path: Path) -> None:
+    """I.2 step 1, Q40 (M8 step 17; FM-27 in one process, ``test_held_crash.py`` across
+    processes): the stop signal names every Elsewhere call still blocking at the vault in one
+    detach, so the agent's call answers ``pending <ref>`` before its session closes, and the
+    hold goes on there: approved, it runs once and its ending closes the gateway's record."""
+    with anyio.fail_after(BOUND), holding(tmp_path) as rig:
+        async with agent(rig.running.mcp(), headers=bearer()) as client:
+            async with anyio.create_task_group() as group:
+                answer = await call_in(group, lambda: client.call_tool("echo", {"text": "kept"}))
+                [hold] = await rig.surface.holds(1)
+                app = rig.running.app
+                await rig.running.request_stop()  # on the gateway's loop, as the signal's is
+            [result] = answer
+            await rig.decide(hold)
+            await rig.settled()
+            await until(lambda: app.approvals.table.get(hold.ref) is None, BOUND)
+            [event] = rig.deployed.events("approvals_detached")
+    assert PENDING.match(text(result))
+    assert ref_of(result) == hold.ref
+    assert rig.calls() == [{"text": "kept"}]
+    assert rig.ledger(hold.ref) == [
+        ("asked", "vault"),
+        ("decided", "pending"),
+        ("decided", "approved_elsewhere"),
+        ("outcome", ("ok", None)),
+    ]
+    assert (event["asked"], event["detached"]) == (1, 1)
+
+
+def test_the_stops_detach_ends_well_inside_the_requests_grace() -> None:
+    """I.2 step 1, Q40: uvicorn cancels the requests in flight when its grace ends, so the stop's
+    detach is bounded well inside it, and the vault's ``pending`` answers still reach the
+    agents."""
+    assert STOP_DETACH_WAIT <= server.STOP_GRACE / 2
 
 
 async def test_attended_reaches_held_tool(tmp_path: Path) -> None:
@@ -994,6 +1032,51 @@ async def test_a_vault_slow_to_hear_a_withdraw_leaves_nothing_held(
     assert held.approvals.table.get(call.ref) is None
     [failed] = events(captured, "approval_withdraw_failed")
     assert (failed["ref"], failed["error_type"]) == (call.ref, "timeout")
+
+
+async def test_a_call_the_gateways_stop_cuts_is_recorded_shutdown(tmp_path: Path) -> None:
+    """I.2 step 4 (M8 step 17): a held call whose answer hadn't come when the gateway's stop cut
+    it is told withdrawn at the vault as any abandoned call is, and recorded ``decided
+    shutdown``, ``outcome unknown, detail shutdown``: the vault's chain has how it ended."""
+    held = await in_process(tmp_path)
+    held.approvals.table.finish(held.record.key, held.call.ref, 0.0, settings_cooldown=0.0)
+    forwarded = anyio.Event()
+    stopping = [False]
+    told: list[tuple[str, str, str]] = []
+
+    async def forward(marked: Any, grant: Any) -> CallToolResult:
+        forwarded.set()
+        await anyio.sleep_forever()
+        raise AssertionError("never answered")
+
+    async def tell(ref: str, client: str, reason: str) -> None:
+        told.append((ref, client, reason))
+
+    held.approvals.tell_withdrawn = tell
+    held.approvals.stopping = lambda: stopping[0]
+    call = replace(held.call, ref="00000000000000ac", forward=forward)
+    with anyio.fail_after(BOUND):
+        async with anyio.create_task_group() as group:
+            group.start_soon(elsewhere.run, held.approvals, call)
+            await forwarded.wait()
+            stopping[0] = True  # the stop signal came; its grace ran out
+            group.cancel_scope.cancel()
+    assert told == [(call.ref, "agent1", "caller_cancelled")]
+    records = [
+        ledgerformat.parse(line)
+        for path in sorted((tmp_path / LEDGER_DIR).glob("*.jsonl"))
+        for line in path.read_bytes().splitlines()
+    ]
+    assert [
+        (r.kind, r.fields.get("decision"), r.fields.get("outcome"), r.fields.get("detail"))
+        for r in records
+        if r.ref == call.ref
+    ] == [
+        ("asked", None, None, None),
+        ("decided", "shutdown", None, None),
+        ("outcome", None, "unknown", "shutdown"),
+    ]
+    assert held.approvals.table.get(call.ref) is None
 
 
 # --- the ask, the vault's side (M8 step 12b; E.2, E.5) --------------------------------------------

@@ -14,10 +14,10 @@ command. The kinds are :func:`~.oauth.login.hint_action`'s (``connect``, ``reset
 ``set_secret`` and ``restart`` with the ``ref``, ``fix_policy``, ``wait``), plus
 ``delete_secret``, ``check_volume`` and ``check_mailbox``, and for the passkeys ``add_passkey``,
 ``review_passkeys`` and ``reset_passkeys``, and for the reported ledger ``check_gateway`` and
-``read_ledger``; from M7, ``onboard_again`` with the ``command`` (``login --mcp URL
---reregister``, OPS-3), ``widen_scope`` with the union ``scope`` and the ``fragment`` that
-sets it (D.5's step-up, SPEC-11), which ``connect`` follows, and ``check_egress_role``; from
-M6, ``review`` with the ``server`` (M6 design M.5).
+``read_ledger``, and for the vault hold ``list_approvals``; from M7, ``onboard_again`` with the
+``command`` (``login --mcp URL --reregister``, OPS-3), ``widen_scope`` with the union ``scope``
+and the ``fragment`` that sets it (D.5's step-up, SPEC-11), which ``connect`` follows, and
+``check_egress_role``; from M6, ``review`` with the ``server`` (M6 design M.5).
 
 Stored bindings are judged by effect, not by equality (verifier V9), because the socket may store
 an explicit ``origins`` binding for any name: ``binding_changed`` means a use the policy makes now
@@ -91,7 +91,11 @@ another revision's than the head's after ``vault/managed.py``'s ``GATEWAY_APPLY_
 
 The ``approvals`` section (M8 design K.1) reads the vault hold: ``vault_ledger_unavailable``
 (error), a chain that takes no hold, and ``approvals_saturated`` (error), holds the caps refused
-lately. While the policy names ``approvers.telegram`` it shows the approver's bot and the age of
+lately; and what the last start's recovery closed (J.1, OPS-8): ``approvals_withdrawn_at_start``
+(info), the holds still waiting that it withdrew (nothing was sent), until the operator lists the
+approvals, and ``approvals_outcome_unknown`` (warning), the approved calls it closed ``outcome
+unknown``, named by ref, since each may have run (an order placed, a mail sent); each for 24
+hours. While the policy names ``approvers.telegram`` it shows the approver's bot and the age of
 its last good poll, the token, user and chat only as set (G.7), with G.3's findings:
 ``approver_token_shared`` (error: another secret holds the same token or bot, or a route to the
 Bot API carries the bot's id, so the surface doesn't poll, T-5), ``approver_token_missing``
@@ -330,8 +334,8 @@ class TelegramState:
 
 @dataclass(frozen=True)
 class HoldState:
-    """The vault hold, summed up for health (M8 design K.1): never a text, an argument or a
-    ref."""
+    """The vault hold, summed up for health (M8 design K.1): never a text or an argument, and a
+    ref only for an approved call whose outcome the start couldn't know (OPS-8)."""
 
     # Whether the vault's approval chain takes a new hold (J.1's writable(), G-10).
     chain_writable: bool
@@ -344,6 +348,11 @@ class HoldState:
     portal: bool = False
     # The Telegram approver, while the policy names one (G.7).
     telegram: TelegramState | None = None
+    # What the last start's recovery closed (J.1, OPS-8), each kept for 24 hours: the holds
+    # still waiting that it withdrew (none once the operator has listed the approvals), and the
+    # refs of the approved calls it closed outcome unknown.
+    withdrawn_at_start: int = 0
+    outcome_unknown: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -929,7 +938,8 @@ def _ledger_copy(copy: LedgerCopy) -> dict[str, Any]:
 
 def _approvals(state: HoldState) -> dict[str, Any]:
     """The vault hold: a chain that can't be written refuses every new hold (no chain, no hold,
-    G-10), until an append succeeds; and holds the queue's caps refused lately (D.3)."""
+    G-10), until an append succeeds; holds the queue's caps refused lately (D.3); and what the
+    last start closed (J.1, OPS-8)."""
     findings: list[Finding] = []
     if not state.chain_writable:
         text = "the vault can't write its approval chain; held calls are refused: check the volume"
@@ -943,6 +953,20 @@ def _approvals(state: HoldState) -> dict[str, Any]:
             "gateway"
         )
         findings.append(_finding("approvals_saturated", "error", text, {"kind": "check_gateway"}))
+    if state.withdrawn_at_start:
+        text = (
+            f"the last vault start withdrew {state.withdrawn_at_start} approval(s) that were "
+            "waiting (nothing was sent); see Decided recently"
+        )
+        action = {"kind": "list_approvals"}
+        findings.append(_finding("approvals_withdrawn_at_start", "info", text, action))
+    if state.outcome_unknown:
+        text = (
+            f"{len(state.outcome_unknown)} approved call(s) may have run before the vault stopped "
+            f"(refs {_some(state.outcome_unknown)}); check each upstream; see the Ledger"
+        )
+        action = {"kind": "read_ledger"}
+        findings.append(_finding("approvals_outcome_unknown", "warning", text, action))
     section: dict[str, Any] = {
         "chain_writable": state.chain_writable,
         "saturated": state.saturated,

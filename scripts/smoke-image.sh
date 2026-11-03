@@ -1211,7 +1211,7 @@ done
 standard logs zoeymcp | grep -q '"event":"reload_ok"' || fail "the vault didn't reload"
 
 step "standard tier: a graceful stop"
-standard stop -t 420 zoeymcp
+standard stop -t 680 zoeymcp
 [ "$(docker inspect -f '{{.State.ExitCode}}' "$std")" = "0" ] || fail "the launcher exited non-zero"
 for child in vault gateway; do
     standard logs zoeymcp | grep -q "\"event\":\"child_exited\",\"child\":\"$child\",\"status\":0" \
@@ -2887,7 +2887,7 @@ while True:
     s11 host "$std_url/other/mcp" tools/call wait '{"seconds":5}' >"$work/inflight" 2>&1 &
     inflight=$!
     stdb_logged 1 '"event":"bridge_stderr"' '"text":"waiting 5 s"'
-    stdb stop -t 420 zoeymcp >/dev/null 2>&1 || stdb_fail "the standard container didn't stop"
+    stdb stop -t 680 zoeymcp >/dev/null 2>&1 || stdb_fail "the standard container didn't stop"
     wait "$inflight" || stdb_fail "the call in flight failed on stop: $(cat "$work/inflight")"
     [ "$(cat "$work/inflight")" = "ok waited 5 s" ] \
         || stdb_fail "the call in flight answered: $(cat "$work/inflight")"

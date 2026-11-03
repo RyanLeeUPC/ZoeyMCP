@@ -305,9 +305,15 @@ and not started, and the vault and the gateway start anyway. Each bridge gets an
 environment with its token's hash and its own `ENV_*` values (never the master key,
 `ZOEYMCP_CONFIG` or another bridge's variables), and the vault is told each bridge's name and
 uid, so a route's `unix:` upstream connects only to a peer of that uid. A stop tells the gateway
-first (it gets up to 330 s, for an approved call still running), then the vault (75 s), and the
-bridges last (10 s), so a call in flight through the vault or a bridge finishes: at most 415 s in
-all, inside compose's `stop_grace_period: 420s`. A bridge that exits on
+first (it gets up to 330 s, for an approved call still running), then the vault (330 s), and the
+bridges last (10 s), so a call in flight through the vault or a bridge finishes: at most 670 s in
+all, inside compose's `stop_grace_period: 680s`. At its stop the gateway asks the vault to detach
+every call the vault still holds for it, so each answers `pending <ref>` before the agent's
+session closes and its approval goes on (one that blocks, a toolkit's write, is withdrawn), and
+withdraws its relayed prompts. The vault then refuses new holds, withdraws every hold still
+waiting (its messages edited, at most 5 s for the edits in all), and lets a held call approved
+just before the stop finish: its window is the 300 s call the shipped stop windows cover, 10 s
+for the outcome, the edits and 15 s of slack (M8). A bridge that exits on
 its own stays down (PID 1 can't start a process as another uid any more) and its route answers
 502 at once; the vault and the gateway carry on. The standard tier's departure from R35 is here:
 the bridge is in the vault's container, and its program is unconfined.

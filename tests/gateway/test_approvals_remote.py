@@ -514,7 +514,7 @@ async def test_a_stop_withdraws_a_waiting_prompt(tmp_path: Path) -> None:
             async with anyio.create_task_group() as group:
                 group.start_soon(call)
                 await until(lambda: len(script.prompts) == 1)
-                running.app.request_stop()
+                await running.request_stop()
     assert text(results[0]).startswith("refused: the gateway is stopping (ref ")
     assert deployed.fake.calls == []
 

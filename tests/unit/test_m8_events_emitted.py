@@ -85,6 +85,11 @@ EVENTS = {
     "approver_enrolment_opened": "vault",
     "approver_enrolled": "vault",
     "approver_enrolment_failed": "vault",
+    # Step 17: the gateway's stop detaches the calls the vault holds for it (I.2; how many it
+    # named and how many answer pending), and the builder's failure event for a detach the vault
+    # couldn't be asked (its error type only).
+    "approvals_detached": "gateway",
+    "approval_detach_failed": "gateway",
 }
 
 

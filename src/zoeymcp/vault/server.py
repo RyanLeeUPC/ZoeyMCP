@@ -1346,6 +1346,7 @@ def build(
         saturated=app.saturated,
         waiting=app.waiting,
         telegram=app.approver_state,
+        at_start=app.at_start,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
     # (M5 design J.5) and the vault's own chain (M8 design J.2); the policy view says where the

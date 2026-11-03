@@ -2292,6 +2292,35 @@ def test_a_flood_of_held_calls_is_an_error(refused: int) -> None:
     assert SATURATION_MINUTES * 60 == SATURATION_WINDOW
 
 
+def test_what_the_last_start_closed() -> None:
+    """J.1, J10, OPS-8: the waiting holds the start withdrew are ``approvals_withdrawn_at_start``
+    (info, nothing was sent; the operator lists the approvals), and each approved call it closed
+    ``outcome unknown`` is ``approvals_outcome_unknown`` (a warning naming the ref: it may have
+    run); none when the start closed nothing."""
+    refs = tuple(f"{n:016x}" for n in range(1, 13))
+    state = HoldState(chain_writable=True, withdrawn_at_start=2, outcome_unknown=refs)
+    found = report(make_policy({}), approvals=state)["approvals"]
+    assert found["findings"] == [
+        finding(
+            "approvals_withdrawn_at_start",
+            "info",
+            "the last vault start withdrew 2 approval(s) that were waiting (nothing was sent); "
+            "see Decided recently",
+            {"kind": "list_approvals"},
+        ),
+        finding(
+            "approvals_outcome_unknown",
+            "warning",
+            f"12 approved call(s) may have run before the vault stopped (refs "
+            f"{', '.join(refs[:10])} and 2 more); check each upstream; see the Ledger",
+            {"kind": "read_ledger"},
+        ),
+    ]
+    assert found["level"] == "warning"
+    quiet = report(make_policy({}), approvals=HoldState(chain_writable=True))["approvals"]
+    assert quiet["findings"] == []
+
+
 TELEGRAM_ROW = {
     "username": "example_bot",
     "last_poll_ago": 3,

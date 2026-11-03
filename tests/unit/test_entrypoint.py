@@ -1205,7 +1205,7 @@ def test_bridges_that_wont_stop_are_left_at_stop_wait() -> None:
     assert system.now == pytest.approx(launcher.STOP_WAIT + launcher.POLL, abs=launcher.POLL)
     assert system.written == [(5, b"TERM\n"), (4, b"TERM\n"), (6, b"TERM\n"), (7, b"TERM\n")]
     assert launcher.BRIDGE_STOP_WAIT == 10
-    assert launcher.STOP_WAIT == 415 < 420
+    assert launcher.STOP_WAIT == 670 < 680
 
 
 def test_hup_reaches_the_vault_and_the_gateway_only() -> None:

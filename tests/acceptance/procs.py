@@ -73,15 +73,20 @@ PASSED = ("PATH", "SYSTEMROOT", "PYTHONPATH", "TEMP", "TMP", "HOME", "USERPROFIL
 TELEGRAM_HOST = "api.telegram.org"
 
 
-def telegram_hooks(path: Path, port: int, **timings: float) -> Path:
+def telegram_hooks(
+    path: Path, port: int, *, names: Mapping[str, int] | None = None, **timings: float
+) -> Path:
     """A hooks file for a vault process whose Telegram approver reaches the fake Bot API on
     ``127.0.0.1:<port>`` (``run_telegram.py``, BP-9): ``api.telegram.org`` answers an address
     reserved for the run, which the dial map sends there, through the address guard unchanged.
+    ``names`` sends other names to other loopback ports the same way (a route's upstream).
     ``timings`` are ``vault/telegram.py``'s ``Timings`` fields, short for a test (BP-10)."""
     from tests.fakes.resolver import FakeResolver
 
     resolver = FakeResolver()
     resolver.serve(TELEGRAM_HOST, port)
+    for name, other in (names or {}).items():
+        resolver.serve(name, other)
     resolver.save(path)
     if timings:
         document = json.loads(path.read_bytes())

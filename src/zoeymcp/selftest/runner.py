@@ -10,6 +10,15 @@ empty send journal, so the cases see the same keys and limits every time. Every 
 vault reaches in a case, upstream, token endpoint or mail server, must be in the vault's list
 from ``egresslist.derive``, the one an egress proxy is given (M7 design I.2, fold-in C32).
 
+A call the vault holds for an approval (M8 design I.5) is held as in production, on a vault
+chain in the run's own directory, and shown on :class:`~.approver.StandIn`, which takes every
+approver surface's place and decides nothing: no Telegram client is built, and the Bot API,
+which the derived list names with reason ``approver`` when the policy names
+``approvers.telegram``, is never reached. A case expecting ``held`` passes when its call is held
+and shown once and nothing reaches the upstream; the self-test then withdraws it (under
+``approvers.block_seconds: 0`` its block may end it first: expired, or detached pending). A case
+expecting a status whose call is held instead fails, and its hold is withdrawn the same way.
+
 ``--mutate`` then breaks the policy one rule at a time (wider methods, wider paths, a dropped
 constraint, pin or forced parameter, a deleted rule) and reruns the cases. A mutant no case
 notices *survives*: the cases don't really test that rule.
@@ -17,6 +26,7 @@ notices *survives*: the cases don't really test that rule.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import copy
@@ -26,7 +36,7 @@ import ssl
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 import httpx
@@ -52,14 +62,24 @@ from ..vault import logs
 from ..vault.app import GATEWAY_HEADER, REPLAYED_HEADER, VaultApp
 from ..vault.bindings import BindingError, derive_binding
 from ..vault.connectors.smtp import SendResult, SmtpConnectors
+from ..vault.holds import Hold
 from ..vault.keys import KeySet, generate_master_key
 from ..vault.netclient import BRIDGE_BASE
 from ..vault.store import SecretStore
+from ..vault.vaultledger import VaultLedger
+from .approver import StandIn
 from .cases import Case, CaseFile, PlaceholderPresent
 from .echo import EchoUpstream, Received, TokenClient, TokenEcho
 
 ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 _DEFAULT_PORTS = {"https": 443, "http": 80}
+# How long a case waits for its call to be answered or held: a hold no surface is shown (a
+# policy with no approver) would otherwise wait for its block. Then every hold is withdrawn.
+HELD_WAIT: Final = 10.0
+# What the vault answers a held call that ended unforwarded (M.2): the self-test's withdrawal,
+# or, under approvers.block_seconds 0, the block's end before it, which expires an unmarked
+# hold and detaches a wait=pending one (B.6).
+NOT_FORWARDED: Final = frozenset({"approval_withdrawn", "approval_expired", "approval_pending"})
 
 
 @dataclass
@@ -162,6 +182,9 @@ class Rig:
         connectors = SmtpConnectors(
             Path(journals.name), self.keys, transport=recorder, message_id=recorder.message_id
         )
+        # Every run holds on a chain of its own, so each sees the same refs and caps (I.5).
+        chains = tempfile.TemporaryDirectory(prefix="chain-", dir=self.state_dir)
+        stand_in = StandIn()
         # The echo client for every role, a local MCP route's and a bridge's socket included, so
         # a case on one reaches the echo server like any other: no --bridge, no socket, no TCP
         # connection, and a dummy token never leaves the process (M7 design B.2).
@@ -175,20 +198,25 @@ class Rig:
             socket_clients=lambda _name: client,
             environ=self.environ,
             connectors=connectors,
+            chain=VaultLedger.open_at(Path(chains.name), self.keys.chain_key),
+            hub=stand_in.hub(),
         )
         results = []
-        with logs.quiet(), journals:
+        with logs.quiet(), journals, chains:
             try:
                 for case in cases.cases:
                     before, sends_before = len(echo.received), len(recorder.sends)
                     reached_before, mailed_before = len(reached), len(recorder.reached)
-                    response = await self._send(app, policy, case)
+                    response, held = await self._exchange(app, policy, case, stand_in)
                     received = echo.received[before:]
-                    if _is_connector(policy, case.request.path):
-                        sends = len(recorder.sends) - sends_before
-                        result = _evaluate_connector(case, response, received, sends)
+                    sends = len(recorder.sends) - sends_before
+                    expected = case.expect.status
+                    if held or expected is None:
+                        result = _evaluate_held(case, response, received, held, sends)
+                    elif _is_connector(policy, case.request.path):
+                        result = _evaluate_connector(case, expected, response, received, sends)
                     else:
-                        result = self._evaluate(policy, case, response, received, tokens)
+                        result = self._evaluate(policy, case, expected, response, received, tokens)
                     connected = reached[reached_before:] + recorder.reached[mailed_before:]
                     result.problems += [
                         f"the vault connected to {key}, which the egress allowlist derived "
@@ -224,6 +252,31 @@ class Rig:
             )
         return clients
 
+    async def _exchange(
+        self, app: VaultApp, policy: Policy, case: Case, stand_in: StandIn
+    ) -> tuple[httpx.Response, list[Hold]]:
+        """Send ``case``'s request, and withdraw what the vault holds for it (I.5): its call,
+        once the stand-in is shown it, or every hold, if :data:`HELD_WAIT` passed with neither
+        an answer nor a hold shown. A hold shown is withdrawn even when its request has been
+        answered (a block of 0 seconds ends before the stand-in is looked at: a detached
+        ``wait=pending`` hold would wait on, into the next case). Returns the answer and the
+        holds shown meanwhile."""
+        seen = len(stand_in.shown)
+        sending = asyncio.ensure_future(self._send(app, policy, case))
+        shown = asyncio.ensure_future(stand_in.beyond(seen))
+        try:
+            await asyncio.wait(
+                {sending, shown}, timeout=HELD_WAIT, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            shown.cancel()
+        if not sending.done() or len(stand_in.shown) > seen:
+            # Held: the stand-in decides nothing, so the call would wait for nobody.
+            app.withdraw_by_host(lambda _hold: True)
+        response = await sending
+        await app.settle()
+        return response, stand_in.shown[seen:]
+
     async def _send(self, app: VaultApp, policy: Policy, case: Case) -> httpx.Response:
         request = case.request
         headers = dict(request.headers)
@@ -250,17 +303,18 @@ class Rig:
         self,
         policy: Policy,
         case: Case,
+        status: int,
         response: httpx.Response,
         received: list[Received],
         tokens: TokenEcho,
     ) -> CaseResult:
         result = CaseResult(case.name)
         expect = case.expect
-        if response.status_code != expect.status:
-            result.problems.append(f"status {response.status_code}, expected {expect.status}")
-        if expect.status >= 400 and received:
+        if response.status_code != status:
+            result.problems.append(f"status {response.status_code}, expected {status}")
+        if status >= 400 and received:
             result.problems.append("a refused request reached the upstream")
-        if expect.status < 400 and len(received) != 1:
+        if status < 400 and len(received) != 1:
             result.problems.append(f"{len(received)} upstream request(s), expected 1")
         if expect.upstream is None or len(received) != 1:
             return result
@@ -348,15 +402,49 @@ def _is_connector(policy: Policy, path: str) -> bool:
     return route is not None and route.connector is not None
 
 
+def _evaluate_held(
+    case: Case, response: httpx.Response, received: list[Received], held: list[Hold], sends: int
+) -> CaseResult:
+    """I.5's ``held``: the call was held and shown once, with the text the vault rendered,
+    nothing went upstream or out as mail, and it ended unforwarded (the self-test's withdrawal,
+    or its block's end first, :data:`NOT_FORWARDED`). A case expecting a status whose call was
+    held fails."""
+    result = CaseResult(case.name)
+    if not case.expect.held:
+        result.problems.append(f"the call was held, expected status {case.expect.status}")
+    elif not held:
+        result.problems.append(f"the call wasn't held: status {response.status_code}")
+        return result
+    elif len(held) != 1 or not held[0].text.value:
+        result.problems.append(f"{len(held)} holds shown, expected 1 with its text")
+    elif _code(response) not in NOT_FORWARDED:
+        result.problems.append(f"the held call answered status {response.status_code}")
+    if received:
+        result.problems.append("a held call reached the upstream")
+    if sends:
+        result.problems.append(f"{sends} message(s) sent, expected 0")
+    return result
+
+
+def _code(response: httpx.Response) -> str | None:
+    """The vault's refusal code in ``response``'s body, if it has one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def _evaluate_connector(
-    case: Case, response: httpx.Response, received: list[Received], sends: int
+    case: Case, status: int, response: httpx.Response, received: list[Received], sends: int
 ) -> CaseResult:
     """A connector has no upstream: a ``200`` to ``POST /send`` is exactly one recorded send,
     and anything else is none."""
     result = CaseResult(case.name)
     expect = case.expect
-    if response.status_code != expect.status:
-        result.problems.append(f"status {response.status_code}, expected {expect.status}")
+    if response.status_code != status:
+        result.problems.append(f"status {response.status_code}, expected {status}")
     if received:
         result.problems.append("a connector request reached an upstream")
     sending = case.request.method == "POST" and case.request.path.split("?")[0].endswith("/send")

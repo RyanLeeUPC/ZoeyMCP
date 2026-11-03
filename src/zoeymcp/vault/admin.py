@@ -552,8 +552,9 @@ class HealthReader:
     report has no ``policy`` section. ``chain`` is the vault's approval chain (M8 design J.1):
     while the running policy holds a call or names ``approvers.telegram``, or an enrolment
     found the bot contested, the report has an ``approvals`` section, with the refusals the hold
-    table's caps counted lately from ``saturated`` (D.3), the holds ``waiting`` now, and the
-    Telegram approver's state from ``telegram`` (G.7, G.8)."""
+    table's caps counted lately from ``saturated`` (D.3), the holds ``waiting`` now, the
+    Telegram approver's state from ``telegram`` (G.7, G.8), and what the start's recovery closed
+    from ``at_start`` (J.1, OPS-8), which keeps the section while it has something to say."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -571,6 +572,7 @@ class HealthReader:
     saturated: Callable[[], int] | None = None
     waiting: Callable[[], int] | None = None
     telegram: Callable[[], health.TelegramState | None] | None = None
+    at_start: Callable[[], tuple[int, tuple[str, ...]]] | None = None
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -606,7 +608,9 @@ class HealthReader:
         state = None if self.telegram is None else self.telegram()
         if not named and (state is None or not state.contested):
             state = None
-        if self.chain is None or not (held_map(policy) or named or state is not None):
+        withdrawn, unknown = (0, ()) if self.at_start is None else self.at_start()
+        started = bool(withdrawn or unknown)
+        if self.chain is None or not (held_map(policy) or named or state is not None or started):
             return None
         refused = 0 if self.saturated is None else self.saturated()
         return health.HoldState(
@@ -615,6 +619,8 @@ class HealthReader:
             waiting=0 if self.waiting is None else self.waiting(),
             portal=approvers is not None and approvers.portal is not None,
             telegram=state,
+            withdrawn_at_start=withdrawn,
+            outcome_unknown=unknown,
         )
 
     def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
@@ -668,6 +674,8 @@ class HoldsHealth(Protocol):
 
     def approver_state(self) -> health.TelegramState | None: ...
 
+    def at_start(self) -> tuple[int, tuple[str, ...]]: ...
+
 
 class HostApprovals(Protocol):
     """What the host's approvals and Telegram commands reach (``VaultApp``'s, M8 design K.3,
@@ -683,6 +691,8 @@ class HostApprovals(Protocol):
     def closed(self) -> list[Closed]: ...
 
     def withdraw_by_host(self, which: Callable[[Hold], bool]) -> list[Hold]: ...
+
+    def approvals_listed(self) -> None: ...
 
     async def probe_telegram(self) -> str | None: ...
 
@@ -837,6 +847,7 @@ class AdminApp:
             saturated=None if holds is None else holds.saturated,
             waiting=None if holds is None else holds.waiting,
             telegram=None if holds is None else holds.approver_state,
+            at_start=None if holds is None else holds.at_start,
         )
         self.app = Starlette(
             routes=[
@@ -1368,10 +1379,12 @@ class AdminApp:
         return self._approvals
 
     async def _approvals_list(self, request: Request) -> Response:
-        """Waiting and decided recently, by both identifiers, without texts."""
+        """Waiting and decided recently, by both identifiers, without texts. The operator has
+        now seen what the last start withdrew: ``approvals_withdrawn_at_start`` clears (K.1)."""
         approvals = self._approvals_of()
         if isinstance(approvals, Response):
             return approvals
+        approvals.approvals_listed()
         answer = approvals_answer(
             approvals.holds.holds(),
             approvals.closed(),

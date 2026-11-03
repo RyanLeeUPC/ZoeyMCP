@@ -764,6 +764,7 @@ def test_the_vaults_asked_decides_where_the_call_was_held() -> None:
         ("accept", "error", False),
         ("accept", "unavailable", False),
         ("accept", "abandoned", False),  # the gateway's restart: it never heard the decision
+        ("accept", "shutdown", False),  # the gateway's stop cut the call before the answer came
         ("decline", "approved_elsewhere", True),
         ("timeout", "accept", True),
         ("abandoned", "approved_elsewhere", True),  # the vault's own: it never forwarded
@@ -796,6 +797,7 @@ def test_which_decisions_disagree(vault: str | None, gateway: str | None, disagr
         ("unavailable", "gateway", None),
         ("abandoned", "gateway", None),
         ("abandoned", "vault", False),
+        ("shutdown", "gateway", None),
         ("decline", "gateway", False),
         ("dismiss", "gateway", False),
         ("shutdown", "vault", False),

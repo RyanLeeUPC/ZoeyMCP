@@ -730,9 +730,9 @@ is unreachable.
 
 **Stopping.** Calls in flight get 10 s, but an approved call already running finishes (§20). The
 standard tier's launcher stops the gateway first and gives it up to 330 s, then the vault up to
-75 s, then each bridge 10 s, so a call in flight through the vault or a bridge finishes first:
-at most 415 s, inside the `stop_grace_period: 420s` compose sets. In the hardened tier compose
-stops the gateway (330 s), then the vault (75 s), then each bridge (§33).
+330 s, then each bridge 10 s, so a call in flight through the vault or a bridge finishes first:
+at most 670 s, inside the `stop_grace_period: 680s` compose sets. In the hardened tier compose
+stops the gateway (330 s), then the vault (330 s), then each bridge (§33).
 
 ## 10. Client tokens
 
@@ -1797,9 +1797,10 @@ mail toolkit: From, To, Subject, then the body as it will be sent).
 A stop waits for approved calls that are already running: their outcome is recorded before the
 gateway exits. The gateway stops first, then the vault, so a send the gateway waits on isn't cut.
 The shipped windows cover a 300 s `call_timeout`: the standard container's `stop_grace_period` is
-420 s (the gateway gets 330 s, then the vault 75 s); in the hardened compose the gateway has 330 s
-and the vault 75 s. If an `approve` tool's `call_timeout` is longer, `check` warns: raise the
-stop windows to match. A new approval asked during a stop is refused ("the gateway is stopping").
+680 s (the gateway gets 330 s, then the vault 330 s, which a call the vault holds and forwards
+itself needs); in the hardened compose the gateway has 330 s and the vault 330 s. If an `approve`
+tool's `call_timeout` is longer, `check` warns: raise the stop windows to match. A new approval
+asked during a stop is refused ("the gateway is stopping").
 
 ## 21. The approval ledger
 
@@ -3657,9 +3658,9 @@ settings, and can use up the container's memory, processes and CPU. Health says 
   answers 502 at once, and no other process can listen in its place. Restarting the container
   brings it back. A bridge has nothing to reload, so `SIGHUP` reaches only the vault and the
   gateway.
-- **Stopping**: the gateway first (up to 330 s), then the vault (up to 75 s), then each bridge
+- **Stopping**: the gateway first (up to 330 s), then the vault (up to 330 s), then each bridge
   (10 s), so a call in flight through a bridge finishes inside the vault's window; the launcher
-  waits at most 415 s, inside compose's `stop_grace_period: 420s`.
+  waits at most 670 s, inside compose's `stop_grace_period: 680s`.
 
 The launcher's log lines (`role: launcher`) about bridges:
 

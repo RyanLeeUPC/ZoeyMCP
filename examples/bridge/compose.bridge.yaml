@@ -17,7 +17,7 @@
 # compose keeps restarting it; the vault starts regardless.
 #
 # Compose stops the gateway, then the vault, then this bridge (the vault's depends_on below), so a
-# call in flight through the bridge finishes inside the vault's 75 s stop window. An override
+# call in flight through the bridge finishes inside the vault's 330 s stop window. An override
 # can't use the base file's x-hardened anchor, so the settings are written out. A program with no
 # egress drops egress-fetch, --egress-proxy and the role's second listener.
 networks:

@@ -307,6 +307,10 @@ class _AskSession:
 
 STALE_CHECK = 1.0  # seconds between staleness checks
 MAX_ANSWER_BYTES = 64 * 1024  # an agent's answer to a prompt (M4 design D.3)
+# The stop's detach (M8 design I.2): one request per 64 calls, well inside uvicorn's grace for the
+# requests in flight (server.STOP_GRACE, 10 s), which cancels their handlers when it ends, so the
+# vault's pending answers still reach the agents.
+STOP_DETACH_WAIT = 5.0
 
 
 class GatewayApp:
@@ -592,6 +596,9 @@ class GatewayApp:
                 group.start_soon(self.out_of_band.run)
 
                 def withdraw_on_stop() -> None:
+                    # M8 design I.2: the calls the vault holds for this gateway are detached
+                    # there first, then the prompts it asks itself and its relays withdrawn.
+                    group.start_soon(self.detach_on_stop)
                     group.start_soon(self.approvals.withdraw, lambda _: True, "shutdown")
 
                 self.stop_hooks.append(withdraw_on_stop)
@@ -611,6 +618,31 @@ class GatewayApp:
             with anyio.CancelScope(shield=True):
                 await self._close_vault_clients()
         await send({"type": "lifespan.shutdown.complete"})
+
+    async def detach_on_stop(self) -> None:
+        """M8 design I.2 step 1 (Q40): every Elsewhere call still waiting at the vault for its
+        approval is named in ``approvals/detach``, so one marked ``wait=pending`` answers
+        ``pending <ref>`` before the agent's session closes, and its hold goes on at the vault,
+        collectable through the next gateway; one marked ``wait=block`` (a toolkit's write) is
+        withdrawn there (``gateway_stopped``). A call already approved there runs on. A detach
+        that fails is logged (its error type only): those calls then end as their requests do,
+        with ``outcome unknown, detail shutdown`` once the stop's grace cuts them (step 4)."""
+        calls = [
+            (record.ref, record.key.client)
+            for record in self.approvals.table.records()
+            if record.how == "elsewhere"
+            and record.pending_until is None
+            and record.decision is None
+        ]
+        if not calls:
+            return
+        try:
+            with anyio.fail_after(STOP_DETACH_WAIT):
+                detached = await self.out_of_band.detach(calls)
+        except Exception as exc:  # the vault's own rules still end each hold
+            logs.event("approval_detach_failed", error_type=type(exc).__name__, level="warning")
+            return
+        logs.event("approvals_detached", asked=len(calls), detached=len(detached))
 
     async def _run_reviews(self, first_view: anyio.Event, poller: ReviewPoller) -> None:
         # A poll names the digest of the view the policy client holds: there is none before.

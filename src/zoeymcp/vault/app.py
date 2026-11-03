@@ -309,11 +309,17 @@ _ENDED_CODES: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 # The reasons an approval_withdrawn names in its body (step 10's deviation 18), each its own text
-# at the gateway: a closed set, which the stop's and the restart's join in step 17. A withdrawal
+# at the gateway: a closed set. A policy change, the host's withdraw, the vault's stop, the
+# gateway's stop (a blocking call it detached, I.2) and a new gateway epoch (G-15). A withdrawal
 # for any other reason names none.
-WITHDRAWN_REASONS: Final = frozenset({"changed", "operator"})
+WITHDRAWN_REASONS: Final = frozenset(
+    {"changed", "operator", "shutdown", "gateway_stopped", "gateway_restarted"}
+)
 # A host's withdraw (K.3): the hold's detail, with via host.
 OPERATOR: Final = "operator"
+# How long the start's two findings last (K.1, OPS-8): approvals_withdrawn_at_start, unless the
+# operator lists the approvals first, and approvals_outcome_unknown.
+START_FINDINGS_SECONDS: Final = 24 * 3600.0
 # How long an enrolment through the egress role waits for the role to fetch its allowance
 # (onboarding's ALLOWANCE_WAIT, I.3).
 ENROL_ALLOWANCE_WAIT: Final = 5.0
@@ -971,6 +977,10 @@ class VaultApp:
         self._closed: deque[Closed] = deque(maxlen=DECIDED_KEPT)
         self._enrolment: telegram_approver.Enrolment | None = None
         self._enrol_contested: str | None = None
+        # When the chain's start was taken on the hold clock, and whether the operator has
+        # listed the approvals since (approvals_withdrawn_at_start then clears, K.1).
+        self._chain_at = self._clock()
+        self._start_listed = False
         if chain is not None:
             chain.remember(self._holds, self._clock())
         self._install(policy)
@@ -2554,7 +2564,24 @@ class VaultApp:
         """Hold calls on ``chain``, which the start recovered (J.1). Its recent endings go to the
         hold table, so each ref stays used (E19) and a late answer is told how it ended."""
         self._chain = chain
+        self._chain_at = self._clock()
         chain.remember(self._holds, self._clock())
+
+    def at_start(self) -> tuple[int, tuple[str, ...]]:
+        """What the start's recovery closed (J.1, OPS-8), for health's two findings: how many
+        waiting holds it withdrew (``approvals_withdrawn_at_start``, until the operator lists
+        the approvals), and the refs of the approved calls it closed ``outcome unknown``
+        (``approvals_outcome_unknown``), each for :data:`START_FINDINGS_SECONDS`."""
+        chain = self._chain
+        if chain is None or self._clock() - self._chain_at >= START_FINDINGS_SECONDS:
+            return 0, ()
+        start = chain.start
+        return (0 if self._start_listed else start.withdrawn), start.outcome_unknown
+
+    def approvals_listed(self) -> None:
+        """The operator listed the approvals (the portal's Approvals page or ``zoeymcp
+        approvals list``): the start's withdrawals are seen, so their finding clears (K.1)."""
+        self._start_listed = True
 
     @property
     def hub(self) -> ApproverHub:

@@ -44,12 +44,13 @@ from tests.fakes.browser import Page
 from tests.fakes.harness import serve
 from tests.gateway import holdrig
 from zoeymcp.common.policy.schema import hash_token
-from zoeymcp.portal.app import REPLACED
+from zoeymcp.portal.app import ACTION_WORDS, REPLACED
 from zoeymcp.portal.approvalsview import APPROVE_SENTENCE
 from zoeymcp.vault.app import GATEWAY_HEADER
 from zoeymcp.vault.approvers import PortalQueue, Shown, SurfaceName
 from zoeymcp.vault.holds import Hold, Via
 from zoeymcp.vault.store import origin_binding
+from zoeymcp.vault.vaultledger import Start
 
 from .flows import prepared_action, set_up, status_reason
 from .rig import Clock, PortalRig, running
@@ -447,6 +448,35 @@ def test_a_policy_change_withdraws_the_hold(tmp_path: Path) -> None:
         decided = queue.decided(approval, "the policy changed")
         assert decided["outcome_shown"].endswith("the policy changed; nothing was sent")
         assert queue.upstream.posts() == []
+
+
+def test_opening_the_queue_clears_what_the_start_withdrew(tmp_path: Path) -> None:
+    """K.1, J10: Home's checklist shows ``approvals_withdrawn_at_start`` until the operator
+    opens the Approvals page (its list), with that page as its next step;
+    ``approvals_outcome_unknown`` stays, pointing at the Ledger."""
+    with queue_rig(tmp_path) as queue:
+        chain = queue.rig.vault.app.chain
+        assert chain is not None
+        chain.start = Start(withdrawn=1, outcome_unknown=("00000000000000c1",))
+
+        def checklist() -> dict[str, str | None]:
+            answer = queue.page.fetch("GET", "/api/health")
+            assert answer.status_code == 200, answer.text
+            return {
+                found["code"]: found["todo"]
+                for found in answer.json()["checklist"]
+                if found["code"].startswith("approvals_")
+            }
+
+        assert checklist() == {
+            "approvals_withdrawn_at_start": ACTION_WORDS["list_approvals"],
+            "approvals_outcome_unknown": ACTION_WORDS["read_ledger"],
+        }
+        assert ACTION_WORDS["list_approvals"] == (
+            "Open the Approvals page: Decided recently lists them."
+        )
+        queue.approver().queue()
+        assert list(checklist()) == ["approvals_outcome_unknown"]
 
 
 def test_the_queues_reads_leave_the_idle_clock(tmp_path: Path) -> None:
