@@ -12,8 +12,10 @@ So editing the file, moving ciphertexts, or changing a binding makes the entry u
 and a policy change that sends a secret somewhere new can't use it until it's entered again.
 
 Metadata (name, binding, times, key ID) is kept in the clear, so health can be shown without
-decrypting anything. There is deliberately no way to list secret values. Bindings and ``meta`` are
-copied on the way in and out: a caller changing its copy would otherwise break the entry's AAD.
+decrypting anything. There is deliberately no way to list secret values:
+:meth:`SecretStore.matching` answers only which other entries a test matches (M8 design G.7),
+never a value. Bindings and ``meta`` are copied on the way in and out: a caller changing its copy
+would otherwise break the entry's AAD.
 
 An entry may also carry a clear ``meta`` object (OAuth health). It is outside the authenticated
 data and is for display only: no decision reads it.
@@ -34,7 +36,7 @@ import json
 import os
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -318,6 +320,25 @@ class SecretStore:
                 name, "its connector constraints changed; enter it again to authorize them"
             )
         return self._decrypt(name, entry, self._keys)
+
+    def matching(self, name: str, test: Callable[[str], bool]) -> list[str]:
+        """The names of the entries other than ``name`` whose value ``test`` matches, sorted. No
+        value leaves the store: ``test`` sees each one and says only whether it matches (the
+        approver's ``approver_token_shared``, M8 design G.7). An entry that fails to decrypt is
+        no match."""
+        with self._lock:
+            entries = sorted(self._entries.items())
+        found: list[str] = []
+        for other, entry in entries:
+            if other == name:
+                continue
+            try:
+                value = self._decrypt(other, entry, self._keys)
+            except SecretUnavailable:
+                continue
+            if test(value.reveal()):
+                found.append(other)
+        return found
 
     def _entry(self, name: str) -> dict[str, Any]:
         with self._lock:

@@ -164,6 +164,34 @@ def test_ciphertext_moved_to_another_name_fails(tmp_path: Path) -> None:
         new_store(tmp_path).get_for_origin("other", "https://api.example")
 
 
+def test_matching_names_other_entries_and_shows_no_value(tmp_path: Path) -> None:
+    """The approver's shared-token check (M8 design G.7): which other entries a test matches,
+    never a value; ``name`` itself is never one, nor an entry that fails to decrypt."""
+    store = new_store(tmp_path)
+    store.put("approver-bot", "123:secret-a", API)
+    store.put("copy", "123:secret-a", API)
+    store.put("same-bot", "123:secret-b", API)
+    store.put("other", "456:secret-c", API)
+    seen: list[str] = []
+
+    def same_bot(value: str) -> bool:
+        seen.append(value)
+        return value.startswith("123:")
+
+    assert store.matching("approver-bot", same_bot) == ["copy", "same-bot"]
+    assert sorted(seen) == ["123:secret-a", "123:secret-b", "456:secret-c"]
+    assert store.matching("absent", lambda value: True) == [
+        "approver-bot",
+        "copy",
+        "other",
+        "same-bot",
+    ]
+    data = raw_file(tmp_path)
+    data["entries"]["copy"]["ciphertext"] = data["entries"]["other"]["ciphertext"]
+    write_raw(tmp_path, data)
+    assert new_store(tmp_path).matching("approver-bot", same_bot) == ["same-bot"]
+
+
 def test_widening_the_binding_on_disk_fails(tmp_path: Path) -> None:
     new_store(tmp_path).put("stats", "v", API)
     data = raw_file(tmp_path)

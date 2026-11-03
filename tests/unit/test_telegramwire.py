@@ -632,6 +632,18 @@ def test_a_method_is_a_name_of_letters(name: str, bad: str) -> None:
     assert str(caught.value) == "a Bot API method is a name of letters"
 
 
+@pytest.mark.parametrize(("name", "bad"), BAD_TOKENS, ids=[row[0] for row in BAD_TOKENS])
+def test_a_value_that_isnt_a_token_has_no_bot_id(name: str, bad: str) -> None:
+    assert telegramwire.bot_id(bad) is None
+
+
+def test_a_tokens_bot_id_is_its_digits_before_the_colon() -> None:
+    """G.7: another secret holding the same bot is found by this id (approver_token_shared)."""
+    assert telegramwire.bot_id(TOKEN) == TOKEN.partition(":")[0]
+    assert telegramwire.bot_id("123456789:another-secret_1") == "123456789"
+    assert telegramwire.bot_id("1" * 20 + ":" + "a" * 128) == "1" * 20
+
+
 def test_the_longest_token_and_method_are_taken() -> None:
     token = "1" * 20 + ":" + "a" * 128
     assert method_url(token, "a" * 64).reveal() == f"{API}/bot{token}/{'a' * 64}"

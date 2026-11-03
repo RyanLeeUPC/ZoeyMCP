@@ -25,9 +25,10 @@ Every client verifies against certifi's roots, through one ``ssl_context`` per c
 ``certifi.where()`` (B.6, X23), as the SMTP connector's ``default_tls`` does. Each is built once,
 at start, from the startup policy, so a reload that changes ``egress_proxy`` changes no client
 (D-61). Every client the vault uses is built here: the onboarding client, the revocation client
-(M7 design D.9), and the route and token clients (B.2's second stage). The last three read the
-running policy's ``egress_private`` at each connection, so a reload that lists a destination
-lets the next connection through without a restart.
+(M7 design D.9), the route and token clients (B.2's second stage), and the Telegram approver's
+(M8 design G.2, with no exception set). The revocation, route and token clients read the running
+policy's ``egress_private`` at each connection, so a reload that lists a destination lets the
+next connection through without a restart.
 
 A local MCP route (M7 design A.2 row 9) goes through :func:`local_client`, direct and never
 proxied, whose backend allows a connection only when every address the name resolves to is
@@ -83,6 +84,10 @@ ONBOARDING_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
 REVOCATION_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
 # The token client's (design D.14); each call sets its own deadline (TokenManager.post).
 TOKEN_TIMEOUT: Final = httpx.Timeout(ATTEMPT_DEADLINE, connect=TOKEN_CONNECT_TIMEOUT)
+# The Telegram approver's (M8 design G.2, M.3): a read longer than getUpdates' 50 s long poll,
+# and an idle connection dropped before a common proxy's idle close does it (D-228).
+APPROVER_TIMEOUT: Final = httpx.Timeout(60.0, connect=10.0)
+APPROVER_KEEPALIVE: Final = 4.0
 # A route's 502 code, a token call's failure reason, and the onboarding refusal (M7 design B.2).
 ADDRESS_REFUSED: Final = "address_refused"
 # The per-request exception (TI-10): (onboarding id, purpose, host:port).
@@ -278,11 +283,15 @@ def _pooled(
     *,
     keepalive: bool,
     uds: str | None = None,
+    keepalive_expiry: float | None = None,
 ) -> httpx.AsyncHTTPTransport:
     """httpx's transport, for its request and error mapping, over a pool with ``backend``, on
-    the Unix socket ``uds`` when given."""
+    the Unix socket ``uds`` when given; an idle connection is kept ``keepalive_expiry`` seconds
+    when given, else httpx's default."""
     transport = httpx.AsyncHTTPTransport(verify=context, trust_env=False)
     limits = httpx.Limits() if keepalive else httpx.Limits(max_keepalive_connections=0)
+    if keepalive_expiry is not None:
+        limits = httpx.Limits(keepalive_expiry=keepalive_expiry)
     transport._pool = httpcore.AsyncConnectionPool(
         ssl_context=context,
         max_connections=limits.max_connections,
@@ -385,6 +394,32 @@ def guarded_transport(
         return httpx.AsyncHTTPTransport(verify=context, proxy=egress_proxy, trust_env=False)
     hooks = HOOKS or Hooks()
     return GuardedTransport(context, exceptions, resolver=hooks.resolver, dial=hooks.dial)
+
+
+def approver_client(egress_proxy: str | None) -> httpx.AsyncClient:
+    """The client the Telegram approver reaches the Bot API on (M8 design G.2, Z22): guarded,
+    one resolve and every address checked, with no exception set (the Bot API is global),
+    certifi's roots, through the startup ``egress_proxy`` when it is set (D-61: built once, at
+    start). Its read timeout outlasts ``getUpdates``' long poll, and an idle connection is
+    dropped after :data:`APPROVER_KEEPALIVE` seconds (D-228). No redirects, no proxy variables,
+    no event hooks: a request's URL holds the bot token (G.1), so nothing here ever formats
+    one."""
+    context = ssl_context()
+    if egress_proxy is not None:
+        limits = httpx.Limits(keepalive_expiry=APPROVER_KEEPALIVE)
+        transport: httpx.AsyncBaseTransport = httpx.AsyncHTTPTransport(
+            verify=context, proxy=egress_proxy, trust_env=False, limits=limits
+        )
+    else:
+        hooks = HOOKS or Hooks()
+        backend = GuardedBackend(resolver=hooks.resolver, dial=hooks.dial)
+        transport = _pooled(context, backend, keepalive=True, keepalive_expiry=APPROVER_KEEPALIVE)
+    return httpx.AsyncClient(
+        transport=transport,
+        trust_env=False,
+        follow_redirects=False,
+        timeout=APPROVER_TIMEOUT,
+    )
 
 
 def onboarding_client(egress_proxy: str | None) -> httpx.AsyncClient:

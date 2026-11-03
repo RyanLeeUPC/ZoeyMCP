@@ -4,6 +4,7 @@ import asyncio
 import errno
 import io
 import json
+import logging
 import os
 import re
 import socket
@@ -1083,6 +1084,15 @@ def test_serve_closes_the_app_on_the_way_out(log_buffer: io.StringIO) -> None:
         def sweep_holds(self) -> int:
             return 0
 
+        def stop_holds(self) -> None:
+            calls.append("stop_holds")
+
+        def start_approvers(self) -> None:
+            calls.append("start_approvers")
+
+        async def stop_approvers(self) -> None:
+            calls.append("stop_approvers")
+
         async def drain_holds(self) -> None:
             calls.append("drain_holds")
 
@@ -1090,8 +1100,110 @@ def test_serve_closes_the_app_on_the_way_out(log_buffer: io.StringIO) -> None:
             calls.append("aclose")
 
     asyncio.run(server.serve(cast(VaultApp, App()), [], config=None, environ={}))
-    # The held forwards drain before the clients close (M8 design I.2).
-    assert calls == ["drain_holds", "aclose"]
+    # The approvers start with the tasks; at the stop every hold still waiting is withdrawn,
+    # the held forwards drain and the approvers' edits go before the clients close (M8 design
+    # I.2, I.4).
+    assert calls == ["start_approvers", "stop_holds", "drain_holds", "stop_approvers", "aclose"]
+    assert _log_lines(log_buffer)[-1]["event"] == "vault_stopped"
+
+
+def test_a_start_cut_short_closes_every_socket_it_bound(
+    tmp_path: Path, example_text: str, monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    """D-167 (M8 design I.4): a setup that fails after the binds (a server's config here) still
+    closes every socket bound, the portal's too, ends the holds and the approvers and closes the
+    clients, and the vault never says it started."""
+    calls: list[str] = []
+    bound: list[socket.socket] = []
+
+    def binder(host: str, port: int) -> list[socket.socket]:
+        sockets = server.bind_tcp(host, port)
+        bound.extend(sockets)
+        return sockets
+
+    def broken(config: Any) -> None:
+        raise RuntimeError("a setup step failed")
+
+    class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        def stop_holds(self) -> None:
+            calls.append("stop_holds")
+
+        def start_approvers(self) -> None:
+            calls.append("start_approvers")
+
+        async def stop_approvers(self) -> None:
+            calls.append("stop_approvers")
+
+        async def drain_holds(self) -> None:
+            calls.append("drain_holds")
+
+        async def aclose(self) -> None:
+            calls.append("aclose")
+
+    monkeypatch.setattr(server, "_Server", broken)
+    with _occupied() as free:  # a port free once this socket closes
+        port = free.getsockname()[1]
+    policy = _admin_policy(example_text, f"127.0.0.1:{port}")
+    portal = server.build_portal(policy, ["127.0.0.1:0"], **_portal_pieces(tmp_path))
+    assert portal is not None
+    with pytest.raises(RuntimeError, match="a setup step failed"):
+        asyncio.run(
+            server.serve(
+                cast(VaultApp, App()),
+                ["127.0.0.1:0"],
+                config=None,
+                environ={},
+                portal=portal,
+                binder=binder,
+            )
+        )
+    # The proxy's socket and the portal's, each bound before the setup failed.
+    assert len(bound) == 2
+    assert all(sock.fileno() == -1 for sock in bound)
+    assert calls == ["stop_holds", "drain_holds", "stop_approvers", "aclose"]
+    lines = [line["event"] for line in _log_lines(log_buffer)]
+    assert "vault_started" not in lines
+    assert "vault_stopped" not in lines
+
+
+def test_serve_caps_the_http_libraries_loggers(
+    monkeypatch: pytest.MonkeyPatch, log_buffer: io.StringIO
+) -> None:
+    """G.1, G-8: once the vault serves, httpx and httpcore log nothing below WARNING, so a root
+    handler at INFO never prints a request line (whose URL may hold the bot's token)."""
+    for name in ("httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+
+    class App:
+        chain = None
+
+        def sweep_holds(self) -> int:
+            return 0
+
+        def stop_holds(self) -> None:
+            pass
+
+        def start_approvers(self) -> None:
+            pass
+
+        async def stop_approvers(self) -> None:
+            pass
+
+        async def drain_holds(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    asyncio.run(server.serve(cast(VaultApp, App()), [], config=None, environ={}))
+    assert server.CLIENT_LOGGERS == ("httpx", "httpcore")
+    for name in server.CLIENT_LOGGERS:
+        assert logging.getLogger(name).level == logging.WARNING
     assert _log_lines(log_buffer)[-1]["event"] == "vault_stopped"
 
 
@@ -1128,6 +1240,15 @@ def test_a_listen_address_in_use_is_a_startup_error(
 
         def sweep_holds(self) -> int:
             return 0
+
+        def stop_holds(self) -> None:
+            pass
+
+        def start_approvers(self) -> None:
+            pass
+
+        async def stop_approvers(self) -> None:
+            pass
 
         async def drain_holds(self) -> None:
             pass
@@ -1545,6 +1666,15 @@ def test_serve_runs_and_stops_the_gateway_key_timer(
         def sweep_holds(self) -> int:
             return 0
 
+        def stop_holds(self) -> None:
+            pass
+
+        def start_approvers(self) -> None:
+            pass
+
+        async def stop_approvers(self) -> None:
+            pass
+
         async def drain_holds(self) -> None:
             pass
 
@@ -1600,6 +1730,15 @@ def test_serve_without_a_ratchet_has_no_timer(monkeypatch: pytest.MonkeyPatch) -
 
         def sweep_holds(self) -> int:
             return 0
+
+        def stop_holds(self) -> None:
+            pass
+
+        def start_approvers(self) -> None:
+            pass
+
+        async def stop_approvers(self) -> None:
+            pass
 
         async def drain_holds(self) -> None:
             pass
@@ -2000,6 +2139,15 @@ def test_a_portal_address_in_use_is_a_startup_error(
 
         def sweep_holds(self) -> int:
             return 0
+
+        def stop_holds(self) -> None:
+            pass
+
+        def start_approvers(self) -> None:
+            pass
+
+        async def stop_approvers(self) -> None:
+            pass
 
         async def drain_holds(self) -> None:
             pass

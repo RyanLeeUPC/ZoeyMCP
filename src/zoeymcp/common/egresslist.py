@@ -11,9 +11,13 @@ from it, so they can't disagree. Each source is a place connections start from; 
   through a proxy, and a ``unix:`` upstream has no ``host:port`` at all (B.2);
 - ``token`` and ``revocation``: every oauth2 ``token_url`` and ``revocation_url``;
 - ``connector``: every connector's ``host:port``;
+- ``approver``: the Bot API's ``api.telegram.org:443`` when the policy names
+  ``approvers.telegram`` (M8 design G.2, Z22);
 - ``onboarding``: each live onboarding's allowance (I.3), which only the vault's memory holds.
   An allowance is never private: the role can't tell which vault request a tunnel carries, so it
-  would give every vault connection to that ``host:port`` the exception (TI-10).
+  would give every vault connection to that ``host:port`` the exception (TI-10). A Telegram
+  enrolment's allowance (M8 design G.2, G.8, Q43) is one too, with the reason ``approver``: an
+  enrolment runs before the policy names the approver.
 
 Each route whose ``program.egress`` lists something is a source of its own, named by the route
 (the bridge's identity in the policy): each entry, ``program``, private when the program's own
@@ -44,11 +48,14 @@ from .policy.check import local_mcp_routes
 from .policy.schema import OAuth2Credential, Policy, RouteProgram
 
 SourceName = str  # "vault", or the name of a route whose program lists egress
-Reason = Literal["route", "token", "revocation", "connector", "program", "onboarding"]
+Reason = Literal["route", "token", "revocation", "connector", "approver", "program", "onboarding"]
 Format = Literal["text", "json", "squid"]
 VAULT: Final = "vault"
 _DEFAULT_PORTS: Final = {"https": 443, "http": 80}
 PLAIN_HTTP_NOTE: Final = "plain http: refused by a CONNECT-only proxy"
+# The Telegram approver's destination (M8 design G.2): the Bot API, over TLS.
+TELEGRAM_HOST: Final = "api.telegram.org"
+TELEGRAM_PORT: Final = 443
 
 
 @dataclass(frozen=True)
@@ -62,9 +69,16 @@ class Destination:
 
 @dataclass(frozen=True)
 class Allowance:
-    """One onboarding's allowance: the ``(host, port)`` pairs its phase 1 contacts (I.3)."""
+    """One onboarding's allowance: the ``(host, port)`` pairs its phase 1 contacts (I.3); or a
+    Telegram enrolment's, the Bot API's alone, with the reason ``approver`` (M8 design G.2)."""
 
     destinations: frozenset[tuple[str, int]]
+    reason: Literal["onboarding", "approver"] = "onboarding"
+
+
+def enrolment_allowance() -> Allowance:
+    """A host-started Telegram enrolment's allowance, while it is open (M8 design G.2, Q43)."""
+    return Allowance(frozenset({(TELEGRAM_HOST, TELEGRAM_PORT)}), reason="approver")
 
 
 Lists = Mapping[SourceName, tuple[Destination, ...]]
@@ -125,6 +139,8 @@ def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
                 add(*_url_destination(cred.revocation_url), "revocation")
     for conn in policy.connectors.values():
         add(conn.host, conn.port, False, "connector")
+    if policy.approvers is not None and policy.approvers.telegram is not None:
+        add(TELEGRAM_HOST, TELEGRAM_PORT, False, "approver")
     # Only the policy's own destinations can be private; an allowance never is (TI-10).
     exceptions = private_exceptions(policy)
     private = {
@@ -134,7 +150,7 @@ def derive(policy: Policy, allowances: Iterable[Allowance] = ()) -> Lists:
     }
     for allowance in allowances:
         for host, port in allowance.destinations:
-            add(host, port, False, "onboarding")
+            add(host, port, False, allowance.reason)
     vault = tuple(
         Destination(
             host=host,

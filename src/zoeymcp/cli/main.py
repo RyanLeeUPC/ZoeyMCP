@@ -2228,6 +2228,9 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
         if held["saturated"]:
             said += f", {held['saturated']} refused lately"
         lines.append(f"approvals: {held['level']} ({said})")
+        telegram = held.get("telegram")
+        if telegram is not None:
+            lines.append(telegram_line(telegram, held["findings"]))
         lines += _finding_lines(held["findings"])
     counts = report["summary"]
     lines.append(
@@ -2235,6 +2238,19 @@ def health_lines(report: dict[str, Any], *, ok: bool) -> list[str]:
         f"{counts['warning']} warning(s), {counts['info']} info)"
     )
     return lines
+
+
+def telegram_line(telegram: Mapping[str, Any], findings: list[dict[str, Any]]) -> str:
+    """The Telegram approver's line (M8 design G.7, J1): its findings' level, its bot and its
+    last good poll, as ``approver telegram: ok (@bot, last poll 3 s ago)``."""
+    own = [finding for finding in findings if str(finding["code"]).startswith("approver_")]
+    level = next(
+        (lv for lv in ("error", "warning", "info") if any(f["level"] == lv for f in own)), "ok"
+    )
+    ago = telegram["last_poll_ago"]
+    polled = "no poll yet" if ago is None else f"last poll {duration(ago)} ago"
+    bot = telegram["username"]
+    return f"approver telegram: {level} ({polled if bot is None else f'@{bot}, {polled}'})"
 
 
 def _finding_lines(findings: list[dict[str, Any]]) -> list[str]:

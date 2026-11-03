@@ -67,6 +67,19 @@ EVENTS = {
     "approval_relayed": "vault",
     "relay_digest_mismatch": "gateway",
     "approval_relay_failed": "gateway",
+    # Step 14: the Telegram surface (G.3, G.5, G.7, K.2): a press refused (its reason only), a
+    # poll or a write that failed (the method, an error type and a status only), another
+    # program reading the bot's updates, a token another secret shares, a text too long for
+    # Telegram with no portal to take it (ref, server, tool), and the builder's two lifecycle
+    # events (the surface's name only). None carries a text, an id, a token or a MAC.
+    "approver_press_refused": "vault",
+    "approver_poll_failed": "vault",
+    "approver_send_failed": "vault",
+    "approver_contested": "vault",
+    "approver_token_shared": "vault",
+    "approval_refused_too_long": "vault",
+    "approver_started": "vault",
+    "approver_stopped": "vault",
 }
 
 

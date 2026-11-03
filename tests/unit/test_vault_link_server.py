@@ -538,6 +538,15 @@ class _App:
     def sweep_holds(self) -> int:
         return 0
 
+    def stop_holds(self) -> None:
+        self.calls.append("stop_holds")
+
+    def start_approvers(self) -> None:
+        self.calls.append("start_approvers")
+
+    async def stop_approvers(self) -> None:
+        self.calls.append("stop_approvers")
+
     async def drain_holds(self) -> None:
         self.calls.append("drain_holds")
 
@@ -654,7 +663,13 @@ def test_serve_reloads_and_stops_on_the_control_pipe(
     # The long polls stop first: the servers wait for requests in flight.
     assert app.waits_stopped == [[False]]
     # Every approved held forward ends before the clients close (M8 design I.2).
-    assert app.calls == ["drain_holds", "aclose"]
+    assert app.calls == [
+        "start_approvers",
+        "stop_holds",
+        "drain_holds",
+        "stop_approvers",
+        "aclose",
+    ]
 
 
 def test_serve_stops_when_the_control_pipe_fails(

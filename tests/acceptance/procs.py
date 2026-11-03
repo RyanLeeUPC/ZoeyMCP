@@ -9,8 +9,10 @@ bridge's socket client finds its socket there, while the policy keeps the fixed
 ``unix:/run/zoeymcp-bridge-<name>/mcp.sock`` (B.2's ``socket_path`` hook); with a holds file
 the managed policy store holds after a write until it is killed (``tests/fakes/policyholds.py``,
 M6 design O.1); and with ``lit`` no M8 policy field is dark, as ``tests/dark.py``'s ``lit()``
-makes it in a test's own process (M8 design A.2 row 0, G-2). All happen in the launcher below,
-never in ZoeyMCP's code.
+makes it in a test's own process (M8 design A.2 row 0, G-2). A hooks file made by
+:func:`telegram_hooks` also sends ``api.telegram.org`` to the fake Bot API (``run_telegram.py``,
+M8 design BP-9) and gives the Telegram surface short timings (BP-10). All happen in the
+launcher below, never in ZoeyMCP's code.
 
 :class:`ManagedVault` is a managed vault on one state directory, started, killed and started
 again, with the host's ``zoeymcp`` commands run beside it (M6 design O.1, O.5), and, on Linux,
@@ -31,7 +33,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-# argv: the CA file or "", the hooks file (tests/fakes/resolver.py's FakeResolver.save) or "",
+# argv: the CA file or "", the hooks file (tests/fakes/resolver.py's FakeResolver.save, with the
+# Telegram surface's timings under "telegram" when telegram_hooks made it) or "",
 # the bridges' sockets directory (tests/fakes/resolver.py's install_sockets) or "", the policy
 # store's holds file (tests/fakes/policyholds.py's save) or "", "lit" (check's M8 fields lit) or
 # "", then zoeymcp's own arguments.
@@ -43,8 +46,13 @@ if sys.argv[1]:
 if sys.argv[2] or sys.argv[3] or sys.argv[4]:
     sys.path.insert(0, {str(ROOT)!r})
 if sys.argv[2]:
+    import json
     from tests.fakes.resolver import install
     install(sys.argv[2])
+    timings = json.loads(open(sys.argv[2], "rb").read()).get("telegram")
+    if timings:
+        from zoeymcp.vault import telegram
+        telegram.TIMINGS = telegram.Timings(**timings)
 if sys.argv[3]:
     from tests.fakes.resolver import install_sockets
     install_sockets(sys.argv[3])
@@ -59,6 +67,27 @@ sys.exit(main(sys.argv[6:]))
 """
 # What a child needs from the test's environment to start at all, and nothing secret.
 PASSED = ("PATH", "SYSTEMROOT", "PYTHONPATH", "TEMP", "TMP", "HOME", "USERPROFILE")
+
+
+# The Bot API's name, which a hooks file sends to the fake (M8 design G.2, BP-9).
+TELEGRAM_HOST = "api.telegram.org"
+
+
+def telegram_hooks(path: Path, port: int, **timings: float) -> Path:
+    """A hooks file for a vault process whose Telegram approver reaches the fake Bot API on
+    ``127.0.0.1:<port>`` (``run_telegram.py``, BP-9): ``api.telegram.org`` answers an address
+    reserved for the run, which the dial map sends there, through the address guard unchanged.
+    ``timings`` are ``vault/telegram.py``'s ``Timings`` fields, short for a test (BP-10)."""
+    from tests.fakes.resolver import FakeResolver
+
+    resolver = FakeResolver()
+    resolver.serve(TELEGRAM_HOST, port)
+    resolver.save(path)
+    if timings:
+        document = json.loads(path.read_bytes())
+        document["telegram"] = timings
+        path.write_bytes(json.dumps(document, indent=2).encode() + b"\n")
+    return path
 
 
 def free_port() -> int:

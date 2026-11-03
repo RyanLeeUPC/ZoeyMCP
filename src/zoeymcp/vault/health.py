@@ -89,6 +89,17 @@ A gateway that hasn't reported for :data:`STATUS_STALE` seconds is ``gateway_sta
 another revision's than the head's after ``vault/managed.py``'s ``GATEWAY_APPLY_GRACE`` is
 ``gateway_view_behind`` (info), naming that revision when this vault installed it (K.1, FM-18).
 
+The ``approvals`` section (M8 design K.1) reads the vault hold: ``vault_ledger_unavailable``
+(error), a chain that takes no hold, and ``approvals_saturated`` (error), holds the caps refused
+lately. While the policy names ``approvers.telegram`` it shows the approver's bot and the age of
+its last good poll, the token, user and chat only as set (G.7), with G.3's findings:
+``approver_token_shared`` (error: another secret holds the same token or bot, or a route to the
+Bot API carries the bot's id, so the surface doesn't poll, T-5), ``approver_token_missing``
+(warning), ``approver_contested`` (error: a 409 or a foreign webhook), ``approver_unreachable``
+(no good poll for :data:`UNREACHABLE_SECONDS`; error while a hold waits, else a warning; with no
+portal queue it says held calls expire), ``approver_chat_unreachable`` (warning: a 403 on a send)
+and ``approver_rate_limited`` (warning: a 429 lately).
+
 The ``policy`` section (M6 design M.5, F.4-F.6, G.6) reads the policy store's state
 (:class:`PolicyState`), only while there is a store: a declarative deployment that never ran
 managed has none, and its report is as before. In managed mode: ``policy_not_running`` (error), a
@@ -171,6 +182,10 @@ STATUS_STALE: Final = 180
 NAMED_MAX: Final = 10
 # The vault hold's saturation window (holds.SATURATION_WINDOW), in minutes.
 SATURATION_MINUTES: Final = 10
+# The Telegram approver's thresholds as health words them (vault/telegram.py's defaults, M.3):
+# no good poll for this long, and a 429 within this many minutes.
+UNREACHABLE_SECONDS: Final = 120
+RATE_LIMITED_MINUTES: Final = 10
 # The entries an onboarding stores before its fragment is committed: a confidential client's
 # secret (M7 design D.7) and a public client's ID (D.8), each named after the credential.
 ONBOARDING_SUFFIXES: Final = ("-client-secret", "-client-id")
@@ -287,6 +302,30 @@ class PolicyState:
 
 
 @dataclass(frozen=True)
+class TelegramState:
+    """The Telegram approver, summed up for health (M8 design G.3, G.7, K.1): the bot's username
+    and the age of the last good poll, never the token, an id or a text."""
+
+    # The store name of the bot's token (approvers.telegram.bot_token's), for set_secret.
+    secret: str
+    username: str | None = None
+    # Seconds since a getUpdates last succeeded; None: none has since the surface started.
+    last_poll_ago: float | None = None
+    # No poll has succeeded for the surface's unreachable threshold (G.3: 120 s).
+    unreachable: bool = False
+    # The store has no such secret.
+    token_missing: bool = False
+    # Another secret holds the same token or the same bot (T-5): the surface doesn't poll.
+    token_shared: bool = False
+    # A 409 or a webhook the vault didn't set: another program reads the bot's updates.
+    contested: bool = False
+    # The last send to the chat was refused 403: the chat wasn't started, or the bot is blocked.
+    chat_unreachable: bool = False
+    # A 429 in the last 10 minutes.
+    rate_limited: bool = False
+
+
+@dataclass(frozen=True)
 class HoldState:
     """The vault hold, summed up for health (M8 design K.1): never a text, an argument or a
     ref."""
@@ -295,6 +334,13 @@ class HoldState:
     chain_writable: bool
     # Holds a cap refused in the saturation window (D.3, holds.SATURATION_WINDOW).
     saturated: int = 0
+    # Holds waiting for a decision now.
+    waiting: int = 0
+    # Whether the policy enables the portal queue (approvers.portal): it decides when Telegram
+    # can't.
+    portal: bool = False
+    # The Telegram approver, while the policy names one (G.7).
+    telegram: TelegramState | None = None
 
 
 @dataclass(frozen=True)
@@ -894,12 +940,71 @@ def _approvals(state: HoldState) -> dict[str, Any]:
             "gateway"
         )
         findings.append(_finding("approvals_saturated", "error", text, {"kind": "check_gateway"}))
-    return {
+    section: dict[str, Any] = {
         "chain_writable": state.chain_writable,
         "saturated": state.saturated,
-        "level": _level(findings),
-        "findings": findings,
     }
+    if state.telegram is not None:
+        section["telegram"] = _telegram_row(state.telegram)
+        findings += _telegram(state.telegram, state.waiting, portal=state.portal)
+    return {**section, "level": _level(findings), "findings": findings}
+
+
+def _telegram_row(state: TelegramState) -> dict[str, Any]:
+    """What health shows of the Telegram approver (G.7): its bot and its last good poll; the
+    token, the user and the chat never, only that each is set."""
+    return {
+        "username": state.username,
+        "last_poll_ago": None if state.last_poll_ago is None else int(state.last_poll_ago),
+        "token": "missing" if state.token_missing else "set",
+        "user_id": "set",
+        "chat_id": "set",
+    }
+
+
+def _telegram(state: TelegramState, waiting: int, *, portal: bool) -> list[Finding]:
+    """G.3's and G.7's findings, each with its one next step (K.1). A token another secret
+    shares stops the surface, so it is the only one then. ``portal``: the portal queue decides
+    the held calls Telegram can't reach."""
+    if state.token_shared:
+        text = (
+            "another secret holds the approver bot's token or the same bot; give the approver a "
+            "bot of its own (operations.md §36.2)"
+        )
+        return [_finding("approver_token_shared", "error", text, {"kind": "fix_policy"})]
+    if state.token_missing:
+        text = f"the approver bot's token isn't in the store: store it as {state.secret}"
+        action = _act("set_secret", "secret", state.secret)
+        return [_finding("approver_token_missing", "warning", text, action)]
+    findings: list[Finding] = []
+    if state.contested:
+        text = "another program reads this bot's updates; revoke the token"
+        findings.append(_finding("approver_contested", "error", text, None))
+    elif state.unreachable:
+        meanwhile = (
+            "held calls are still decided in the portal, or expire"
+            if portal
+            else "held calls expire at their deadline"
+        )
+        text = (
+            f"Telegram hasn't answered the approver for {UNREACHABLE_SECONDS} s or more: check "
+            f"the egress allowlist; {meanwhile}"
+        )
+        level: Level = "error" if waiting else "warning"
+        findings.append(_finding("approver_unreachable", level, text, None))
+    if state.chat_unreachable:
+        text = (
+            "Telegram refused a message to the operator's chat: start the chat with the bot "
+            "(or unblock it)"
+        )
+        findings.append(_finding("approver_chat_unreachable", "warning", text, None))
+    if state.rate_limited:
+        text = (
+            f"Telegram's flood control slowed the approver in the last {RATE_LIMITED_MINUTES} "
+            "min: prompts and edits wait their turn"
+        )
+        findings.append(_finding("approver_rate_limited", "warning", text, {"kind": "wait"}))
+    return findings
 
 
 # --- the policy store (M6 design M.5) ----------------------------------------------------------

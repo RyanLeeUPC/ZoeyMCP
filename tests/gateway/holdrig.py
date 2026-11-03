@@ -6,7 +6,9 @@ hardened tier), ``unix`` (the link socket, Linux only) or ``asgi`` (in the test'
 the unit tests' leak sweep). Its upstream is an ASGI app on the vault's own HTTP client, which
 records every request it gets and answers a JSON-RPC result. The SMTP connector's transport is a
 recorder too. A :class:`Surface` records each hold it is shown and decides nothing until the test
-says, through :meth:`HoldRig.decide`, which runs on the vault's own event loop.
+says, through :meth:`HoldRig.decide`, which runs on the vault's own event loop. With
+``telegram`` timings the vault runs its own Telegram surface instead of a scripted one (M8 step
+14), on the approver client given, with the bot's token in its store.
 
 Every wait is a condition the test waits for in a worker thread, bounded; nothing sleeps.
 """
@@ -47,12 +49,16 @@ from zoeymcp.vault.holds import Hold
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore, origin_binding, smtp_binding
+from zoeymcp.vault.telegram import Timings
 from zoeymcp.vault.vaultledger import CHAIN_DIR, VaultLedger
 
 T = TypeVar("T")
 KEYS = KeySet.from_master(bytes(range(96, 128)))
 BOUND = 30  # seconds: every wait's own bound
 SECRET = "sk-live-hold-3f9c2a71d8e4"
+# The Telegram approver's: its bot's token, and the operator's account and chat (one id).
+BOT_TOKEN = "730041977:AAF-rig-bot-token-sentinel-5b81c2d0"
+OPERATOR_ID = 7300418265  # distinct: a leak-sweep sentinel (O.6)
 MAIL_PASSWORD = "mail-pass-7c1e9b2f"
 PIN = "sha256:" + "c" * 64
 OTHER_PIN = "sha256:" + "d" * 64
@@ -80,18 +86,26 @@ def document(
     cooldown: int = 15,
     per_hour: int = 30,
     mail: bool = False,
+    shop_secret: str = "store:shop-key",  # noqa: S107 - a reference, not a value
+    bot_route: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The rig's policy, as a document: route ``shop`` to the echo upstream, with server ``shop``
     on ``/mcp`` (``place_order`` held, ``cancel_order`` gateway-held, ``list_items`` allowed,
     ``refund`` declined) and ``notes`` on ``/notes`` (holding nothing); with ``mail``, the SMTP
-    connector ``mail-out`` on route ``mail``, held for its writer, the toolkit ``mailer``."""
+    connector ``mail-out`` on route ``mail``, held for its writer, the toolkit ``mailer``. The
+    route's credential reads ``shop_secret``. With ``bot_route`` (a credential), route ``bot``
+    goes to the Bot API with that credential (G.7's route clause)."""
     approve = ["place_order", "cancel_order"]
     approve = [tool for tool in approve if tool not in allow]
     approvers: dict[str, Any] = {"timeout": timeout, "block_seconds": block_seconds}
     if "portal" in surfaces:
         approvers["portal"] = {}
     if "telegram" in surfaces:
-        approvers["telegram"] = {"bot_token": "store:approver-bot", "user_id": 7, "chat_id": 7}
+        approvers["telegram"] = {
+            "bot_token": "store:approver-bot",
+            "user_id": OPERATOR_ID,
+            "chat_id": OPERATOR_ID,
+        }
     servers: dict[str, Any] = {
         "shop": {
             "kind": "remote",
@@ -164,11 +178,24 @@ def document(
                 ],
             }
         )
+    credentials: dict[str, Any] = {"shop-key": {"kind": "header", "secret": shop_secret}}
+    if bot_route is not None:
+        credentials["bot-key"] = bot_route
+        routes.append(
+            {
+                "name": "bot",
+                "prefix": "/bot",
+                "upstream": "https://api.telegram.org",
+                "credential": "bot-key",
+                "callers": ["gateway"],
+                "rules": [{"methods": ["POST"], "paths": ["/**"]}],
+            }
+        )
     own = {"attended": attended, "out_of_band": out_of_band, "renders": "plain"}
     return {
         "version": 1,
         "mode": "declarative",
-        "credentials": {"shop-key": {"kind": "header", "secret": "store:shop-key"}},
+        "credentials": credentials,
         "connectors": connectors,
         "routes": routes,
         "approvers": approvers,
@@ -357,6 +384,9 @@ class HoldRig:
         *,
         link: str = "tcp",
         surfaces: tuple[SurfaceName, ...] = ("portal",),
+        telegram: Timings | None = None,
+        approver_client: httpx.AsyncClient | None = None,
+        environ: dict[str, str] | None = None,
     ) -> None:
         self.link: Link = "asgi" if link == "asgi" else "unix" if link == "unix" else "tcp"
         self.options = {"surfaces": surfaces, **(options or {})}
@@ -367,10 +397,14 @@ class HoldRig:
         self.store.load()
         self.store.put("shop-key", SECRET, origin_binding(["https://shop.example"]))
         self.store.put("mail-pass", MAIL_PASSWORD, smtp_binding("mail.example", 465, SENDER, TO))
+        if telegram is not None:
+            self.store.put("approver-bot", BOT_TOKEN, origin_binding(["https://api.telegram.org"]))
         self.upstream = Upstream()
         self.mail: list[dict[str, Any]] = []
         self.chain = VaultLedger.open_at(self.state, KEYS.chain_key)
-        self.surfaces = {name: Surface(name) for name in surfaces}
+        # The vault's own Telegram surface, with timings: the rest are scripted.
+        scripted = [name for name in surfaces if telegram is None or name != "telegram"]
+        self.surfaces = {name: Surface(name) for name in scripted}
         self.clock = Clock()
         self.loop: asyncio.AbstractEventLoop | None = None
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.upstream.app()))
@@ -379,12 +413,14 @@ class HoldRig:
             self.store,
             KEYS,
             client=client,
-            environ={},
+            environ=environ or {},
             gateway_link=link == "unix",
             connectors=SmtpConnectors(self.state, KEYS, transport=self._send),
             chain=self.chain,
             hub=ApproverHub(self.surfaces.values()),
             hold_clock=self.clock,
+            telegram=False if telegram is None else telegram,
+            approver_client=approver_client,
         )
 
     @property

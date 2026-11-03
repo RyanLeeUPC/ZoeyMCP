@@ -74,7 +74,7 @@ import re
 import secrets
 import time
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -117,6 +117,7 @@ from ..common.policy.schema import (
     QueryCredential,
     Route,
     SMTPConnector,
+    TelegramApprover,
     is_secret_ref,
 )
 from ..common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
@@ -129,10 +130,12 @@ from ..common.resultstore import (
     StoredResult,
 )
 from ..common.reviewreport import RemoteReport, ToolkitReport
-from . import internal, logs, netclient, secretops, statusreport
-from .approvers import EDIT_GRACE, ApproverHub, NotShown
+from . import internal, logs, netclient, secretops, statusreport, telegramwire
+from . import telegram as telegram_approver
+from .approvers import EDIT_GRACE, ApproverHub, NotShown, Shown, Unconfirmed
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
+from .health import TelegramState
 from .heldcommit import OUTCOME_MARGIN, HeldCommits, read_answer
 from .holds import (
     CapRefusal,
@@ -598,6 +601,18 @@ def _approvers_kept(before: Approvers | None, after: Approvers | None) -> bool:
     return all(getattr(before, name) == getattr(after, name) for name in waits)
 
 
+def _not_shown(shown: Sequence[Shown | NotShown | Unconfirmed]) -> NotShown | None:
+    """The surfaces' answer that refuses a hold, or None: a text Telegram returned changed, as
+    G.4 says, whatever the other surfaces answered (the operator would read something else);
+    else every surface's own :class:`~.approvers.NotShown` (one that failed may still deliver
+    it, G.3, so the hold waits on, to its deadline)."""
+    refusals = [each for each in shown if isinstance(each, NotShown)]
+    for each in refusals:
+        if each.code == telegramwire.TextChanged.code:
+            return each
+    return refusals[0] if shown and len(refusals) == len(shown) else None
+
+
 def _surfaces(policy: Policy) -> frozenset[Literal["telegram", "portal"]]:
     """The surfaces ``approvers`` enables (D.4)."""
     approvers = policy.approvers
@@ -741,6 +756,8 @@ class VaultApp:
         chain: VaultLedger | None = None,
         hub: ApproverHub | None = None,
         hold_clock: Callable[[], float] = time.monotonic,
+        telegram: telegram_approver.Timings | Literal[False] | None = None,
+        approver_client: httpx.AsyncClient | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. By default both are :mod:`.netclient`'s guarded clients, with the
@@ -784,6 +801,13 @@ class VaultApp:
         J.1); without one (or :meth:`use_chain`), every held call is refused ``held_ledger_down``
         (no chain, no hold). ``hub`` holds the approver surfaces a hold is shown on (D.1), and
         ``hold_clock`` the monotonic clock the hold table runs on (tests inject one).
+
+        ``telegram`` is the Telegram surface's timings (G.3, BP-10): each install starts, stops
+        or restarts that surface in ``hub`` as ``approvers.telegram`` comes, goes or changes
+        (B.5, I.4). None is :data:`.telegram.TIMINGS`, or, with ``hub`` given, ``False``: the
+        test's hub holds its own surfaces. ``approver_client`` reaches the Bot API (G.2): by
+        default :func:`.netclient.approver_client`, on the startup ``egress_proxy`` (D-61), or
+        ``client`` when that is given.
         """
         self._gateway_link = gateway_link
         self._store = store
@@ -892,6 +916,21 @@ class VaultApp:
         self._feed = internal.Feed()
         self._feed_changed = asyncio.Event()
         self._decision_waiters = 0
+        # The Telegram approver (G.2, I.4): its timings, or False when the hub's surfaces are a
+        # test's; its client, built once from the startup policy (D-61); the surface the
+        # installs start, stop and restart, whether the hub shows holds on it (not while its
+        # token is shared, T-5), and whether serve() has started the surfaces' tasks.
+        if telegram is None:
+            telegram = False if hub is not None else telegram_approver.TIMINGS
+        self._telegram_timings: telegram_approver.Timings | Literal[False] = telegram
+        if approver_client is None and telegram is not False:
+            approver_client = self._client if injected else netclient.approver_client(proxy)
+        self._approver_client = approver_client
+        self._telegram: telegram_approver.TelegramSurface | None = None
+        self._telegram_shown = False
+        # The endings the last surface that went remembered, for the next one (G.6).
+        self._telegram_ended: dict[str, str] = {}
+        self._approvers_running = False
         if chain is not None:
             chain.remember(self._holds, self._clock())
         self._install(policy)
@@ -912,27 +951,148 @@ class VaultApp:
         self._view = _ServedView(view.digest, dump_view(view))
         # A new generation retires the old egress key at once: there is no ratchet (G.3).
         self._egress_key = self._keys.egress_key(policy.egress_key_generation).encode()
-        self._install_holds(policy)
+        withdrawn = self._install_holds(policy)
+        self._install_telegram(policy, withdrawn)
+        # B.5: a hold still shown on a surface left stays there alone (Z7).
+        self._holds.narrow(_surfaces(policy))
         self._wake_view_waiters()
         self._wake_allowlist()
         return self._tokens.configure(policy, self._env_secrets)
 
-    def _install_holds(self, policy: Policy) -> None:
+    def _install_holds(self, policy: Policy) -> list[Hold]:
         """The held routes of ``policy``, its limits for new holds, and every undecided hold the
         change no longer holds as it was, withdrawn ``changed`` (M8 design B.5, Z7): all of them
-        when the approvers block changed other than by a surface switched on or off."""
+        when the approvers block changed other than by a surface switched on or off. Returns
+        the holds withdrawn."""
         old, self._held = self._held, held_map(policy)
         before, self._approvers = self._approvers, policy.approvers
         self._holds.configure(_hold_limits(policy))
         self._results.ttl_ms, self._results.grace_ms = _result_times(policy)
         if not len(self._holds):
-            return
+            return []
         now = self._clock()
         kept = _approvers_kept(before, policy.approvers)
-        for hold in self._holds.withdraw(
+        withdrawn = self._holds.withdraw(
             now, lambda h: not kept or not self._still_held(h, old, self._held, policy), "changed"
-        ):
+        )
+        for hold in withdrawn:
             self._spawn(self._ended(hold))
+        return withdrawn
+
+    def _install_telegram(self, policy: Policy, withdrawn: Iterable[Hold]) -> None:
+        """Start, stop or restart the Telegram surface as ``approvers.telegram`` comes, goes or
+        changes (B.5, I.4), so a host import or a reload needs no restart. A surface that goes
+        edits each message still open ("This approver was switched off.", or the ending of a
+        hold this change withdrew), and its queued edits get :data:`.approvers.EDIT_GRACE`. A
+        token another secret shares is never polled (``approver_token_shared``, T-5), at this
+        install or a later one."""
+        if self._telegram_timings is False:
+            return
+        approvers = policy.approvers
+        settings = None if approvers is None else approvers.telegram
+        old = self._telegram
+        if old is not None and old.settings == settings:
+            self._telegram_check(old)
+            return
+        if old is not None:
+            old.retire({hold.id: hold for hold in withdrawn})
+            # A late press on a message it closed still reads how that hold ended (G.6).
+            self._telegram_ended = old.endings()
+            self._telegram_hide(old)
+            self._telegram = None
+        if settings is None or self._approver_client is None:
+            return
+        self._telegram = surface = telegram_approver.TelegramSurface(
+            settings,
+            store=self._store,
+            client=self._approver_client,
+            decide=self.decide,
+            shared=lambda token: self._token_shared(settings, token),
+            clock=self._clock,
+            timings=self._telegram_timings,
+            ended=self._telegram_ended,
+        )
+        self._telegram_check(surface)
+
+    def _telegram_check(self, surface: telegram_approver.TelegramSurface) -> None:
+        """Show holds on ``surface``, running, unless another secret holds its token or bot."""
+        shared = surface.token_shared()
+        if shared:
+            logs.event("approver_token_shared", surface="telegram", level="error")
+            if self._telegram_shown:
+                surface.retire({})
+                self._telegram_hide(surface)
+        elif not self._telegram_shown:
+            self._hub.install(surface)
+            self._telegram_shown = True
+            if self._approvers_running:
+                surface.start()
+
+    def _telegram_hide(self, surface: telegram_approver.TelegramSurface) -> None:
+        """No hold is shown on ``surface`` from now on; it stops once its queued edits went."""
+        if self._telegram_shown:
+            self._hub.remove("telegram")
+            self._telegram_shown = False
+        if surface.running:
+            self._spawn(surface.stop(EDIT_GRACE))
+
+    def _token_shared(self, settings: TelegramApprover, token: str) -> bool:
+        """G.7, T-5: another store secret, or an ``env:`` secret the policy reads, holds the
+        approver bot's token, a token of the same bot or the token's secret half; or a route to
+        the Bot API sends a credential that carries the bot's id. Store values are compared
+        inside the store; none is kept."""
+        matches = telegram_approver.same_bot(token)
+        if self._store.matching(telegram_approver.secret_name(settings) or "", matches):
+            return True
+        if any(matches(secret.reveal()) for secret in self._env_secrets.values()):
+            return True
+        return self._route_carries(token)
+
+    def _route_carries(self, token: str) -> bool:
+        """G.7's route clause: a route to ``api.telegram.org`` whose credential, as the route
+        would send it (its template's text with its secret in place), carries the approver
+        bot's id, ``<id>:``. A secret the route can't read counts as empty, so a template that
+        names the id alone is enough (fail closed)."""
+        bot = telegramwire.bot_id(token)
+        if bot is None:
+            return False
+        host = urlsplit(telegramwire.API).hostname
+        for route in self._policy.routes:
+            upstream = route.upstream
+            if upstream is None or route.credential is None:
+                continue
+            if upstream.startswith(fields.UNIX_PREFIX) or urlsplit(upstream).hostname != host:
+                continue
+            cred = self._policy.credentials.get(route.credential)
+            if cred is None or isinstance(cred, OAuth2Credential):
+                continue
+            if f"{bot}:" in self._credential_sent(cred, upstream):
+                return True
+        return False
+
+    def _credential_sent(
+        self,
+        cred: HeaderCredential | QueryCredential | PathCredential | BasicCredential,
+        upstream: str,
+    ) -> str:
+        """What a static credential puts on a request to ``upstream`` (unencoded), for
+        :meth:`_route_carries` alone; a secret it can't read is empty."""
+
+        def value(ref: str) -> str:
+            try:
+                return self._resolve(ref, upstream).reveal()
+            except Refused:
+                return ""
+
+        secret = value(cred.secret)
+        if isinstance(cred, HeaderCredential):
+            return cred.format.replace("{secret}", secret)
+        if isinstance(cred, PathCredential):
+            return cred.template.replace("{secret}", secret)
+        if isinstance(cred, BasicCredential):
+            user = value(cred.username) if is_secret_ref(cred.username) else cred.username
+            return f"{user}:{secret}"
+        return secret
 
     def _private(self) -> frozenset[str]:
         """The running policy's ``egress_private``: the guarded clients read it at each
@@ -1140,6 +1300,9 @@ class VaultApp:
                 await self._revoker.aclose()
         finally:
             await self._client.aclose()
+            approver = self._approver_client
+            if approver is not None and approver is not self._client:
+                await approver.aclose()
             if self._token_client is not None and self._token_client is not self._client:
                 await self._token_client.aclose()
             if self._onboarding_client is not self._client:
@@ -2076,6 +2239,8 @@ class VaultApp:
         if approvaltext.problems(received, budget=budget, renders="plain"):
             raise Refused(422, "the relayed text broke a text rule", code="text_refused")
         text = approvaltext.relayed(received)
+        surfaces = _surfaces(self._policy)
+        self._too_long(text, surfaces, ref, asked.server, asked.tool)
         digest = hashlib.sha256(text.value.encode("utf-8")).hexdigest()
         begun = self._holds.begin(
             now,
@@ -2091,7 +2256,7 @@ class VaultApp:
                 args_digest=chain.digest(None),  # the vault never sees a relay's arguments
                 text=text,
                 text_sha256=digest,
-                surfaces=_surfaces(self._policy),
+                surfaces=surfaces,
                 wait=asked.wait,
                 held_bytes=len(text.value.encode("utf-8")),
             ),
@@ -2136,11 +2301,11 @@ class VaultApp:
         )
         shown = await self._hub.show(hold) if self._holds.get(hold.id) is not None else []
         live = self._holds.get(hold.id)
-        refusals = [each for each in shown if isinstance(each, NotShown)]
-        if shown and len(refusals) == len(shown) and live is not None and live.state == "held":
+        refusal = _not_shown(shown)
+        if refusal is not None and live is not None and live.state == "held":
             for gone in self._holds.withdraw(self._clock(), lambda h: h.id == hold.id, "not_shown"):
                 self._spawn(self._ended(gone))
-            raise Refused(refusals[0].status, "no approver could show it", code=refusals[0].code)
+            raise Refused(refusal.status, "no approver could show it", code=refusal.code)
         return JSONResponse(
             {"v": 1, "id": hold.id, "text_sha256": digest},
             status_code=201,
@@ -2340,6 +2505,35 @@ class VaultApp:
     def hub(self) -> ApproverHub:
         """The approver surfaces holds are shown on (D.1)."""
         return self._hub
+
+    @property
+    def telegram(self) -> telegram_approver.TelegramSurface | None:
+        """The Telegram surface ``approvers.telegram`` names, shown on or not (G.7)."""
+        return self._telegram
+
+    def start_approvers(self) -> None:
+        """Start the surfaces' own tasks, the Telegram poller and write queue (I.4): ``serve()``
+        calls it once on its loop, after the first install; every later install starts, stops
+        or restarts them itself."""
+        self._approvers_running = True
+        if self._telegram is not None and self._telegram_shown:
+            self._telegram.start()
+
+    async def stop_approvers(self) -> None:
+        """The stop's last word to the surfaces (I.2): their queued edits get
+        :data:`.approvers.EDIT_GRACE` in all, then the poller stops."""
+        self._approvers_running = False
+        if self._telegram is not None:
+            await self._telegram.stop(EDIT_GRACE)
+
+    def approver_state(self) -> TelegramState | None:
+        """The Telegram approver for health (G.7), or None when the policy names none."""
+        return None if self._telegram is None else self._telegram.state()
+
+    def waiting(self) -> int:
+        """Holds waiting for a decision now (health: an unreachable approver is then an
+        error)."""
+        return sum(1 for hold in self._holds.holds() if hold.state == "held")
 
     @property
     def holds(self) -> HoldTable:
@@ -2622,6 +2816,8 @@ class VaultApp:
                 code="held_text_refused",
                 extra={"pointer": problems[0].pointer},
             )
+        surfaces = _surfaces(self._policy)
+        self._too_long(text, surfaces, ref, ask.server, ask.tool)
         digest = hashlib.sha256(text.value.encode("utf-8")).hexdigest()
         begun = self._holds.begin(
             now,
@@ -2637,7 +2833,7 @@ class VaultApp:
                 args_digest=chain.digest(ask.arguments),
                 text=text,
                 text_sha256=digest,
-                surfaces=_surfaces(self._policy),
+                surfaces=surfaces,
                 wait=ask.wait,
                 held_bytes=ask.held_bytes,
                 block_seconds=ask.block_seconds,
@@ -2708,11 +2904,11 @@ class VaultApp:
         try:
             shown = await self._hub.show(hold) if self._holds.get(hold.id) is not None else []
             live = self._holds.get(hold.id)
-            # Refused only when every surface said it can't show it; one that failed may still
-            # deliver it (G.3), so the hold waits on, to its deadline.
-            refusals = [each for each in shown if isinstance(each, NotShown)]
-            if shown and len(refusals) == len(shown) and live is not None and live.state == "held":
-                refusal = refusals[0]
+            # Refused when every surface said it can't show it, or Telegram returned its text
+            # changed (G.4); a surface that failed may still deliver it (G.3), so the hold
+            # waits on, to its deadline.
+            refusal = _not_shown(shown)
+            if refusal is not None and live is not None and live.state == "held":
                 for gone in self._holds.withdraw(
                     self._clock(), lambda h: h.id == hold.id, "not_shown"
                 ):
@@ -2721,6 +2917,21 @@ class VaultApp:
             return await self._wait_hold(hold.id, wait, departure, log)
         finally:
             departure.close()
+
+    def _too_long(
+        self, text: ApprovalText, surfaces: frozenset[str], ref: str, server: str, tool: str
+    ) -> None:
+        """G.4: a text Telegram can't carry, with no portal queue to take it, is refused before
+        the hold begins: nobody is asked, the ref isn't used and no cap counts it."""
+        if telegramwire.refused_too_long(text.value, surfaces):
+            logs.event(
+                "approval_refused_too_long", ref=ref, server=server, tool=tool, level="warning"
+            )
+            raise Refused(
+                telegramwire.TooLong.status,
+                "the approval text is too long for Telegram",
+                code=telegramwire.TooLong.code,
+            )
 
     async def _wait_hold(
         self, hold_id: str, wait: _Wait, departure: Departure, log: dict[str, Any]

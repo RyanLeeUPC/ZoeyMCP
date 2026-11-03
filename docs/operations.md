@@ -2797,11 +2797,24 @@ a verify script notices when the proxy's configuration and the policy part.
 **What goes through it.** Every HTTP request the vault makes: each route's upstream (so every
 `tools/list`, `tools/call` and the rest that the gateway sends to a remote server, and every call
 on a direct route), and every OAuth token request (`zoeymcp login`, the portal's connect, and each
-refresh). Each SMTP connector connects through it too, with `CONNECT host:port`. As M7's
-onboarding by URL lands, its discovery and registration requests, and the revocation of a deleted
-credential's grant, go the same way. The vault ignores `HTTP_PROXY`, `HTTPS_PROXY` and the rest:
-only `egress_proxy` counts. Nothing inbound goes through it: agents, the gateway's link and the
-portal reach the vault directly.
+refresh). Each SMTP connector connects through it too, with `CONNECT host:port`. Onboarding by
+URL's discovery and registration requests (§11), and the revocation of a deleted credential's
+grant, go the same way, and so does every Bot API call of the Telegram approver
+(`approvers.telegram`). The vault ignores `HTTP_PROXY`, `HTTPS_PROXY` and the rest: only
+`egress_proxy` counts. Nothing inbound goes through it: agents, the gateway's link and the portal
+reach the vault directly.
+
+**The approver's egress.** When the policy names `approvers.telegram`, the vault's list has the
+Bot API, `api.telegram.org:443`, in every form (`vault api.telegram.org:443` in the text form),
+and the egress role allows it from the vault's own lists. The vault reaches it on a client of its
+own, built at start like the others: through `egress_proxy` when it is set, else through the
+address guard (one lookup, every address checked, certifi's roots), with no exception for a
+private address. Its `getUpdates` long poll keeps a tunnel open for up to 50 seconds at a time,
+and an idle connection is closed after 4 seconds, so a proxy that cuts idle tunnels at a minute or
+more needs nothing more. The bot's token is in each request's path, so the vault never writes a
+request line: it caps the HTTP libraries' own loggers at `WARNING`, and logs a failed Bot API call
+by its method, error type and status only. The self-test expects the destination but never
+reaches it.
 
 **Setting it.** `egress_proxy` is `http://host:port`, with no path:
 
@@ -2850,11 +2863,12 @@ routes:
   and only once the reload takes effect (a refused reload logs none): recreate the vault right
   after changing it (§7).
 - **A policy change can outdate the allowlist.** A route upstream, token or revocation endpoint,
-  connector or `egress_private` entry added, changed or removed changes the vault's list; a route
-  program's `egress` or `egress_private` changes that program's list; and `egress_proxy_acls`
-  changes the Squid form's names. The vault can't tell your proxy: after such a change, run
-  `--check` (below) and regenerate the file if it differs. The egress role
-  (`egress_proxy_kind: role`) takes its lists from the vault, so it needs none of this.
+  connector or `egress_private` entry added, changed or removed, or `approvers.telegram` added or
+  removed, changes the vault's list; a route program's `egress` or `egress_private` changes that
+  program's list; and `egress_proxy_acls` changes the Squid form's names. The vault can't tell
+  your proxy: after such a change, run `--check` (below) and regenerate the file if it differs.
+  The egress role (`egress_proxy_kind: role`) takes its lists from the vault, so it needs none of
+  this.
 - **In managed mode** (§34) `egress_proxy`, `egress_proxy_kind` and `egress_proxy_acls` are the
   host's, as is `egress_private` beyond the entry onboarding adds for a server on your own network:
   set them in the compose policy before the first `up -d`, or later with an export, an edit and

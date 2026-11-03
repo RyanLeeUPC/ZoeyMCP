@@ -359,6 +359,50 @@ async def test_nothing_resolves_locally_with_a_proxy(
     assert set(lookups) <= {"127.0.0.1"}
 
 
+# --- the Telegram approver's client (M8 design G.2, Z22) ---------------------------------------
+
+BOT_API_URL = "https://api.telegram.org/bot123:token-sentinel/getMe"
+
+
+async def test_the_approver_client_is_guarded_with_no_exception(fake: FakeResolver) -> None:
+    """Z22: the Bot API's name resolves once and every address is checked, with no exception
+    set: a private answer is refused, nothing sent. Its read outlasts getUpdates' 50 s, an idle
+    connection is dropped after 4 s (D-228), and no redirect is followed."""
+    fake.answer("api.telegram.org", ["10.0.0.5"])
+    client = netclient.approver_client(None)
+    try:
+        assert (client.timeout.read, client.timeout.connect) == (60.0, 10.0)
+        assert not client.follow_redirects
+        assert client._transport._pool._keepalive_expiry == 4.0  # type: ignore[attr-defined]
+        with pytest.raises(AddressRefused) as caught:
+            await client.post(BOT_API_URL, json={})
+        assert caught.value.verdict.reason == "private"
+        assert "token-sentinel" not in str(caught.value)
+    finally:
+        await client.aclose()
+    assert fake.lookups == [("api.telegram.org", 443)]
+    assert fake.dialled == []
+
+
+async def test_the_approver_client_goes_through_the_startup_proxy(
+    fake: FakeResolver, lookups: list[Any]
+) -> None:
+    """D-61: with egress_proxy, CONNECT by name, nothing resolved here, the same 4 s idle
+    expiry."""
+    proxy = ConnectProxy({ProxySwitch.REFUSE_403})
+    with serve_proxy(proxy) as url:
+        client = netclient.approver_client(url)
+        try:
+            assert client._transport._pool._keepalive_expiry == 4.0  # type: ignore[attr-defined]
+            with pytest.raises(httpx.ProxyError):
+                await client.post(BOT_API_URL, json={})
+        finally:
+            await client.aclose()
+    assert proxy.targets == ["api.telegram.org:443"]
+    assert fake.lookups == []
+    assert set(lookups) <= {"127.0.0.1"}
+
+
 # --- X23: certifi's roots, and no others --------------------------------------------------------
 
 

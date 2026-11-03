@@ -833,6 +833,31 @@ def test_withdraw_takes_only_the_undecided_holds_it_picks() -> None:
     assert [(h.id, h.via, h.detail) for h in by_host] == [(left.id, "host", "host")]
 
 
+def test_a_surface_switched_off_narrows_every_live_hold() -> None:
+    """B.5: a hold still shown on a remaining surface stays there, and a decision through the
+    one that went is refused; a hold already on the enabled surfaces alone is left as it was."""
+    table = HoldTable(LIMITS)
+    both = begun(table, 0.0, 1, tool="a")
+    portal = begun(table, 0.0, 2, tool="b", surfaces=frozenset({"portal"}))
+    approved = approve(table, begun(table, 0.0, 3, tool="c"))
+    changed = table.narrow(frozenset({"portal"}))
+    assert [(h.id, h.surfaces) for h in changed] == [
+        (both.id, frozenset({"portal"})),
+        (approved.id, frozenset({"portal"})),
+    ]
+    assert table.get(both.id) == changed[0]
+    assert table.get(portal.id) == portal
+    live = table.get(approved.id)
+    assert live is not None
+    assert (live.state, live.via) == ("approved", "telegram")
+    refused = table.decide(5.0, both.id, "approve", "telegram", DIGEST)
+    assert refused == DecideRefusal("unknown")
+    assert table.narrow(frozenset({"portal"})) == []
+    gone = table.narrow(frozenset())
+    assert {h.id for h in gone} == {both.id, portal.id, approved.id}
+    assert all(h.surfaces == frozenset() for h in gone)
+
+
 def test_the_sweep_expires_undecided_holds_at_their_end() -> None:
     table = HoldTable(LIMITS)
     blocking = begun(table, 0.0, 1, wait="block")

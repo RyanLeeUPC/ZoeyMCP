@@ -393,6 +393,18 @@ class HoldTable:
         found = [hold for hold in self._live.values() if hold.state == "held" and which(hold)]
         return [self._move(hold, "withdrawn", now, via=via, detail=reason) for hold in found]
 
+    def narrow(self, enabled: frozenset[Surface]) -> list[Hold]:
+        """Surfaces switched off (B.5): every live hold is shown on those of ``enabled`` alone
+        from now on, so a decision through one that went is refused ``unknown``. Returns the
+        holds it changed; one left with no surface is the change's to withdraw (Z7)."""
+        changed: list[Hold] = []
+        for hold in list(self._live.values()):
+            kept = hold.surfaces & enabled
+            if kept != hold.surfaces:
+                self._live[hold.id] = narrowed = replace(hold, surfaces=kept)
+                changed.append(narrowed)
+        return changed
+
     def sweep(self, now: float) -> list[Hold]:
         """Every undecided hold past its end, expired (the sweeper runs once a second)."""
         found = [h for h in self._live.values() if h.state == "held" and now >= h.ends_at]

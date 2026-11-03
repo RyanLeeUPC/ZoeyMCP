@@ -44,6 +44,7 @@ from zoeymcp.cli.main import (
     main,
     merge_summary,
     new_client_token,
+    telegram_line,
 )
 from zoeymcp.common import egresslist, netguard
 from zoeymcp.common.adminsocket import SOCKET_ENV
@@ -2206,6 +2207,47 @@ def test_health_shows_the_ledger_copy(admin: FakeAdmin) -> None:
     ]
     assert health_action({"kind": "check_gateway"}) == (
         "check that the gateway runs and reaches the vault"
+    )
+
+
+def test_health_shows_the_telegram_approver(admin: FakeAdmin) -> None:
+    """M8 design G.7, J1 step 5: the approver's own line, its level its findings', its bot and
+    its last good poll; never the token or an id."""
+    finding = {
+        "code": "approver_rate_limited",
+        "level": "warning",
+        "advisory": False,
+        "text": "slowed",
+        "action": {"kind": "wait"},
+    }
+    other = {**finding, "code": "approvals_saturated", "level": "error"}
+    telegram = {
+        "username": "example_bot",
+        "last_poll_ago": 3,
+        "token": "set",
+        "user_id": "set",
+        "chat_id": "set",
+    }
+    empty = {"entries": 0, "level": "ok", "findings": []}
+    held = {"chain_writable": True, "saturated": 0, "telegram": telegram}
+    report = {
+        "summary": {"error": 1, "warning": 1, "info": 0},
+        "credentials": [],
+        "connectors": [],
+        "store": empty,
+        "approvals": {**held, "level": "error", "findings": [other, finding]},
+    }
+    admin.answers[("GET", "/health")] = (200, report)
+    code, out, _ = cli(["health", "--socket", "x"])
+    assert code == EXIT_FINDINGS
+    assert out.splitlines()[1:3] == [
+        "approvals: error (the chain takes holds)",
+        "approver telegram: warning (@example_bot, last poll 3 s ago)",
+    ]
+    quiet = {**telegram, "username": None, "last_poll_ago": None}
+    assert telegram_line(quiet, []) == "approver telegram: ok (no poll yet)"
+    assert telegram_line(telegram, [{**finding, "level": "error"}]) == (
+        "approver telegram: error (@example_bot, last poll 3 s ago)"
     )
 
 

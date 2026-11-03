@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import logging
 import os
 import re
 import signal
@@ -112,6 +113,8 @@ Lookup = Callable[[str], Sequence[str]]
 GATEWAY_KEY_TICK = 5.0
 # How often the hold sweeper expires the holds past their end (M8 design I.4), in seconds.
 HOLD_SWEEP = 1.0
+# The stdlib loggers capped at WARNING while the vault serves (M8 design G.1).
+CLIENT_LOGGERS = ("httpx", "httpcore")
 # The launcher's control pipe: one command per line.
 # --bridge NAME=UID: the launcher's bridge name (C.10) and the uid it runs that bridge as.
 _BRIDGE = re.compile(r"([a-z0-9]{1,16})=([0-9]{1,10})")
@@ -852,120 +855,130 @@ async def serve(
 ) -> None:
     """Serve every listener until a stop. ``stopper`` is for a caller off the main thread (tests):
     it is handed the stop function, and no signal handler is installed. A reload is
-    ``managed``'s in managed mode (F.6), else the declarative one."""
-    # Before any server starts, so an address in use stops the start with its name (B.3).
-    bound = bind_listens(listens, binder)
+    ``managed``'s in managed mode (F.6), else the declarative one.
+
+    Every bind, the servers' setup and every task are under one ``try`` (D-167, M8 design I.4,
+    the shape M7 gave the egress role): its ``finally`` closes every socket bound, withdraws the
+    holds still waiting, lets each approved forward finish to its deadline and the approver's
+    queued edits go (I.2), cancels the tasks and closes the clients, however far the start
+    got."""
+    cap_client_loggers()
+    bound: list[list[socket.socket]] = []
     portal_sockets: list[socket.socket] | None = None
-    if portal is not None:
-        try:
-            portal_sockets = binder(portal.address.address, portal.address.port)
-        except OSError as exc:
-            for sockets in bound:
-                _close(sockets)
-            raise StartupError(f"can't listen on {portal.bound} for the portal: {exc}") from exc
-    servers: list[_Server] = []
-    # Each TCP server's bound sockets; uvicorn serves them, and closes them when it stops.
-    listening: dict[_Server, list[socket.socket]] = {}
-    for listen, sockets in zip(listens, bound, strict=True):
-        host, port = _split_listen(listen)
-        tcp = _Server(
-            uvicorn.Config(
-                ListenerTag(app, "tcp"),
-                host=host,  # unused with sockets given; kept so the config names its address
-                port=port,
-                proxy_headers=False,  # never trust X-Forwarded-For: callers can't spoof
-                server_header=False,
-                date_header=False,
-                access_log=False,
-                log_level="warning",
-                lifespan="off",
-            )
-        )
-        servers.append(tcp)
-        listening[tcp] = sockets
-
-    if gateway_socket is not None and gateway_uid is not None:
-        servers.append(
-            _Server(
-                uvicorn.Config(
-                    ListenerTag(app, "gateway"),
-                    uds=str(gateway_socket),
-                    http=peer_checked(gateway_uid),
-                    proxy_headers=False,
-                    server_header=False,
-                    date_header=False,
-                    access_log=False,
-                    log_level="warning",
-                    lifespan="off",
-                )
-            )
-        )
-
-    if admin is not None and admin_socket is not None:
-        servers.append(
-            _Server(
-                uvicorn.Config(
-                    admin.app,
-                    uds=str(admin_socket),
-                    server_header=False,
-                    date_header=False,
-                    access_log=False,
-                    log_level="warning",
-                    lifespan="off",
-                )
-            )
-        )
-
-    if portal is not None and portal_sockets is not None:
-        web = _PortalServer(
-            uvicorn.Config(
-                portal.app,
-                host=portal.address.address,  # unused with sockets given, as for the proxy
-                port=portal.address.port,
-                http=portal_protocol(header_deadline=portal.header_deadline),
-                h11_max_incomplete_event_size=HEAD_LIMIT,
-                ws="none",
-                proxy_headers=False,  # the portal never reads X-Forwarded-* (C.5)
-                server_header=False,
-                date_header=False,
-                access_log=False,
-                log_level="warning",
-                lifespan="off",
-            ),
-            portal,
-        )
-        servers.append(web)
-        listening[web] = portal_sockets
-
-    def stop() -> None:
-        # Long polls first: the servers wait for every request in flight before they stop.
-        app.stop_view_waits()
-        for server in servers:
-            server.should_exit = True
-
-    def reload() -> None:
-        if managed is not None:
-            reload_managed(managed, config, environ)
-        else:
-            reload_policy(app, config, environ, portal=portal)
-
-    loop = asyncio.get_running_loop()
-    if stopper is not None:
-        stopper(stop)
-    elif sys.platform != "win32":
-        loop.add_signal_handler(signal.SIGTERM, stop)
-        loop.add_signal_handler(signal.SIGINT, stop)
-        loop.add_signal_handler(signal.SIGHUP, reload)
-    tasks = []
-    if gateway_keys is not None:
-        tasks.append(asyncio.create_task(gateway_key_timer(gateway_keys, GATEWAY_KEY_TICK)))
-    # The vault chain's queued records are retried, and the holds past their end expire, for as
-    # long as the vault serves (M8 design J.1, I.4).
-    if app.chain is not None:
-        tasks.append(asyncio.create_task(app.chain.retry_forever()))
-    tasks.append(asyncio.create_task(hold_sweeper(app, HOLD_SWEEP)))
+    tasks: list[asyncio.Task[None]] = []
     control = None
+    started = False
     try:
+        # Before any server starts, so an address in use stops the start with its name (B.3).
+        bound = bind_listens(listens, binder)
+        if portal is not None:
+            try:
+                portal_sockets = binder(portal.address.address, portal.address.port)
+            except OSError as exc:
+                raise StartupError(f"can't listen on {portal.bound} for the portal: {exc}") from exc
+        servers: list[_Server] = []
+        # Each TCP server's bound sockets; uvicorn serves them, and closes them when it stops.
+        listening: dict[_Server, list[socket.socket]] = {}
+        for listen, sockets in zip(listens, bound, strict=True):
+            host, port = _split_listen(listen)
+            tcp = _Server(
+                uvicorn.Config(
+                    ListenerTag(app, "tcp"),
+                    host=host,  # unused with sockets given; kept so the config names its address
+                    port=port,
+                    proxy_headers=False,  # never trust X-Forwarded-For: callers can't spoof
+                    server_header=False,
+                    date_header=False,
+                    access_log=False,
+                    log_level="warning",
+                    lifespan="off",
+                )
+            )
+            servers.append(tcp)
+            listening[tcp] = sockets
+
+        if gateway_socket is not None and gateway_uid is not None:
+            servers.append(
+                _Server(
+                    uvicorn.Config(
+                        ListenerTag(app, "gateway"),
+                        uds=str(gateway_socket),
+                        http=peer_checked(gateway_uid),
+                        proxy_headers=False,
+                        server_header=False,
+                        date_header=False,
+                        access_log=False,
+                        log_level="warning",
+                        lifespan="off",
+                    )
+                )
+            )
+
+        if admin is not None and admin_socket is not None:
+            servers.append(
+                _Server(
+                    uvicorn.Config(
+                        admin.app,
+                        uds=str(admin_socket),
+                        server_header=False,
+                        date_header=False,
+                        access_log=False,
+                        log_level="warning",
+                        lifespan="off",
+                    )
+                )
+            )
+
+        if portal is not None and portal_sockets is not None:
+            web = _PortalServer(
+                uvicorn.Config(
+                    portal.app,
+                    host=portal.address.address,  # unused with sockets given, as for the proxy
+                    port=portal.address.port,
+                    http=portal_protocol(header_deadline=portal.header_deadline),
+                    h11_max_incomplete_event_size=HEAD_LIMIT,
+                    ws="none",
+                    proxy_headers=False,  # the portal never reads X-Forwarded-* (C.5)
+                    server_header=False,
+                    date_header=False,
+                    access_log=False,
+                    log_level="warning",
+                    lifespan="off",
+                ),
+                portal,
+            )
+            servers.append(web)
+            listening[web] = portal_sockets
+
+        def stop() -> None:
+            # Long polls first: the servers wait for every request in flight before they stop.
+            app.stop_view_waits()
+            for server in servers:
+                server.should_exit = True
+
+        def reload() -> None:
+            if managed is not None:
+                reload_managed(managed, config, environ)
+            else:
+                reload_policy(app, config, environ, portal=portal)
+
+        loop = asyncio.get_running_loop()
+        if stopper is not None:
+            stopper(stop)
+        elif sys.platform != "win32":
+            loop.add_signal_handler(signal.SIGTERM, stop)
+            loop.add_signal_handler(signal.SIGINT, stop)
+            loop.add_signal_handler(signal.SIGHUP, reload)
+        if gateway_keys is not None:
+            tasks.append(asyncio.create_task(gateway_key_timer(gateway_keys, GATEWAY_KEY_TICK)))
+        # The vault chain's queued records are retried, and the holds (and the results) past
+        # their end expire, for as long as the vault serves (M8 design J.1, I.4); the approver
+        # surfaces the first install made start polling, and every later install starts, stops
+        # or restarts them (B.5).
+        if app.chain is not None:
+            tasks.append(asyncio.create_task(app.chain.retry_forever()))
+        tasks.append(asyncio.create_task(hold_sweeper(app, HOLD_SWEEP)))
+        app.start_approvers()
         if control_fd is not None:
             reader, control = await open_control(control_fd)
             tasks.append(asyncio.create_task(read_control(reader, reload=reload, stop=stop)))
@@ -974,20 +987,22 @@ async def serve(
             listen=listens,
             admin_socket=str(admin_socket) if admin_socket else None,
         )
+        started = True
         if gateway_socket is not None and gateway_uid is not None:
             logs.event("gateway_socket_listening", path=str(gateway_socket), uid=gateway_uid)
-        try:
-            await asyncio.gather(
-                *(server.serve(sockets=listening.get(server)) for server in servers)
-            )
-        finally:
-            # Before the clients close: each approved held call's forward runs to its deadline
-            # and its outcome reaches the chain (M8 design I.2, B.8).
-            await app.drain_holds()
+        await asyncio.gather(*(server.serve(sockets=listening.get(server)) for server in servers))
     finally:
         # uvicorn closes a started server's sockets; these are the ones of a start cut short.
-        for sockets in listening.values():
+        for sockets in bound:
             _close(sockets)
+        if portal_sockets is not None:
+            _close(portal_sockets)
+        # Before the clients close: every hold still waiting is withdrawn, each approved held
+        # call's forward runs to its deadline and its outcome reaches the chain, and the
+        # approver's edits go, at most EDIT_GRACE (M8 design I.2, B.8).
+        app.stop_holds()
+        await app.drain_holds()
+        await app.stop_approvers()
         for task in tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -996,7 +1011,16 @@ async def serve(
             control.close()
         # Refreshes in flight finish (and are saved) before the clients close (N5).
         await app.aclose()
-        logs.event("vault_stopped")
+        if started:
+            logs.event("vault_stopped")
+
+
+def cap_client_loggers() -> None:
+    """The HTTP libraries' own loggers at WARNING (M8 design G.1, G-8): at INFO httpx writes
+    each request line, and a Bot API URL holds the bot token, so a handler an embedding program
+    adds at INFO must not print one."""
+    for name in CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 async def hold_sweeper(app: VaultApp, interval: float) -> None:
@@ -1317,6 +1341,8 @@ def build(
         policy_state=policy_state,
         chain=chain,
         saturated=app.saturated,
+        waiting=app.waiting,
+        telegram=app.approver_state,
     )
     # The Ledger page reads the copy the report path writes, with the connectors' journals
     # (M5 design J.5) and the vault's own chain (M8 design J.2); the policy view says where the
@@ -1371,6 +1397,8 @@ def build(
             # configured policy for an import from it; standard input was read once, at start.
             managed=managed,
             source=None if config == "-" else (lambda: read_source(config, environ)),
+            # The vault hold's health, as the portal's (M8 design K.1, G.7).
+            holds=app,
         )
     return Vault(
         app,

@@ -15,6 +15,8 @@ Each walk takes its routes from the route table, so a route added later is walke
   every ``/policy`` route of the table is walked once a client's literal token was seeded and
   an import and its plan were made: the literal token is in no answer, and the token's hash and
   a caller's placeholder only in ``GET /policy/export``, R61's fourth scoped exception (DD-4).
+  With the Telegram approver (M8 design G.1, G.7, O.6, step 14), whose bot token is in the store
+  and whose state health shows, no answer carries the token or the operator's ids.
 - **The portal**: every route of ``routes.ROUTES``, and the static files, with a full session, a
   setup session and none; with secrets stored through the portal (a static one and an OAuth one),
   a live slot, a value held by a pending ``secret.put``, a given client secret stored through
@@ -25,7 +27,9 @@ Each walk takes its routes from the route table, so a route added later is walke
   beyond the one answer that mints it. A managed portal (M6 design G.4, O.6, step 15a), whose
   seed held a client's literal token and a caller's placeholder, walked once a review save was
   made: no answer, the drafts' and the plans' included, carries the token, its hash
-  or the placeholder.
+  or the placeholder. With the Telegram approver (M8 design G.1, G.7, O.6), whose state the
+  portal's health shows, no answer carries its bot token, the token's secret half or the
+  operator's ids.
 - **The portal's code**: an AST check finds no reference to ``SetupCodes.issue``, the gateway key,
   the egress key or a store read of a value anywhere in ``portal/``, so no portal route can reach
   an exception. Under mutmut the source also holds every function's mutants, named with
@@ -52,6 +56,7 @@ from starlette.routing import Route as StarletteRoute
 import zoeymcp.portal
 from tests.dark import lit
 from tests.fakes.authenticator import SoftAuthenticator
+from tests.gateway import holdrig as hold_rig
 from tests.unit import onboard_model
 from zoeymcp.common.policy.schema import GatewayLimits, hash_token
 from zoeymcp.common.reviewreport import RemoteReport, ToolkitReport
@@ -62,6 +67,7 @@ from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.oauth.login import LoginService
 from zoeymcp.vault.reportstore import ReportStore
 from zoeymcp.vault.reviewjobs import Job, JobTable, Owner, ServerKind, read_result
+from zoeymcp.vault.telegram import Timings
 
 from .test_admin import BROKER_BINDING, KEYS, AdminRig
 from .test_admin_policy import YAML, PolicyRig, deployment_of, witness_of
@@ -224,6 +230,47 @@ async def test_no_socket_answer_carries_a_credential_but_the_exceptions(
         route: {kind} for route, kind in EXCEPTIONS.items()
     }
     await rig.token_client.aclose()
+
+
+async def test_no_socket_answer_carries_the_approver_token(tmp_path: Path) -> None:
+    """M8 design G.1, G.7, O.6: with the Telegram approver set, its bot's token in the store and
+    its state in health's approvals section, no socket answer carries the token, its secret
+    half or the operator's ids (shown "set")."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(599)))
+    rig = hold_rig.HoldRig(
+        tmp_path, link="asgi", surfaces=("telegram",), telegram=Timings(), approver_client=client
+    )
+    admin = AdminApp(
+        rig.store,
+        hold_rig.KEYS,
+        lambda: rig.app.policy,
+        SetupCodes(tmp_path, hold_rig.KEYS.portal_key),
+        chain=rig.chain,
+        holds=rig.app,
+    )
+    token = hold_rig.BOT_TOKEN
+    hidden = (token, token.partition(":")[2], str(hold_rig.OPERATOR_ID))
+    transport = httpx.ASGITransport(app=admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://admin") as http:
+        walked = [
+            (method, route.path)
+            for route in admin.app.routes
+            if isinstance(route, StarletteRoute)
+            for method in sorted((route.methods or set()) - {"HEAD"})
+        ]
+        assert ("GET", "/health") in walked
+        answers = []
+        for method, template in walked:
+            path = template.format(**SOCKET_PARAMS, onboarding="0" * 16, job="0" * 16)
+            body = SOCKET_BODIES.get((method, template))
+            response = await http.request(method, path, json=body)
+            answers.append(response.text + repr(dict(response.headers)))
+        health = (await http.get("/health")).json()
+    assert health["approvals"]["telegram"]["user_id"] == "set"
+    for text in answers:
+        for value in hidden:
+            assert value not in text
+    await rig.app.aclose()
 
 
 async def test_no_socket_answer_carries_what_a_registration_issued(tmp_path: Path) -> None:
@@ -514,6 +561,56 @@ async def test_no_portal_answer_carries_a_value_a_code_a_key_or_another_half(
     for client in clients:
         await client.aclose()
     await rig.token_client.aclose()
+
+
+async def test_no_portal_answer_carries_the_approver_token(tmp_path: Path) -> None:
+    """M8 design G.1, G.7, O.6: the portal's health shows the Telegram approver too, so with
+    its bot's token in the store, every route walked from a full session and none: no answer
+    carries the token, its secret half or the operator's ids (shown "set")."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(599)))
+    rig = hold_rig.HoldRig(
+        tmp_path, link="asgi", surfaces=("telegram",), telegram=Timings(), approver_client=client
+    )
+    (tmp_path / "portal").mkdir(mode=0o700)
+    key = hold_rig.KEYS.portal_key
+    passkeys = Passkeys(new_file(bytes(32)), key, tmp_path / "portal" / "p.json")
+    app = PortalApp(
+        [ORIGIN],
+        static=load_static(),
+        setup=SetupCodes(tmp_path, key),
+        passkeys=passkeys,
+        login=LoginService(rig.app.tokens),
+        secrets=Secrets(rig.store, rig.app.tokens, lambda: rig.app.policy),
+        health=HealthReader(
+            rig.store,
+            lambda: rig.app.policy,
+            passkeys=passkeys,
+            chain=rig.chain,
+            waiting=rig.app.waiting,
+            telegram=rig.app.approver_state,
+        ).report,
+    )
+    answers: list[str] = []
+    transport = httpx.ASGITransport(app=app)
+    clients = [httpx.AsyncClient(transport=transport, base_url=ORIGIN) for _ in range(2)]
+    full, anonymous = (Recording(each, answers) for each in clients)
+    await signed_in(full, app, SoftAuthenticator())
+    health = (await full.call("GET", "/api/health")).json()
+    assert health["approvals"]["telegram"]["user_id"] == "set"
+    await walk((full, anonymous), [r for r in ROUTES if r.path not in ENDINGS])
+    await walk((full, anonymous), [r for path in ENDINGS for r in ROUTES if r.path == path])
+    assert len(answers) > 2 * len(ROUTES)
+    token = hold_rig.BOT_TOKEN
+    credentials = {
+        token: "bot token",
+        token.partition(":")[2]: "bot token's secret half",
+        str(hold_rig.OPERATOR_ID): "operator id",
+    }
+    for text in answers:
+        assert carried(text, credentials) == set()
+    for each in clients:
+        await each.aclose()
+    await rig.app.aclose()
 
 
 # --- the portal's code (D-115) ------------------------------------------------------------------

@@ -520,8 +520,10 @@ class HealthReader:
     without it, the report has no ``gateway`` section. ``policy_state`` is the policy store's
     (``vault/managed.py``, M6 design M.5); without it, or while it answers None (no store), the
     report has no ``policy`` section. ``chain`` is the vault's approval chain (M8 design J.1):
-    while the running policy holds a call, the report has an ``approvals`` section, with the
-    refusals the hold table's caps counted lately from ``saturated`` (D.3)."""
+    while the running policy holds a call or names ``approvers.telegram``, the report has an
+    ``approvals`` section, with the refusals the hold table's caps counted lately from
+    ``saturated`` (D.3), the holds ``waiting`` now, and the Telegram approver's state from
+    ``telegram`` (G.7)."""
 
     store: SecretStore
     policy: Callable[[], Policy]
@@ -537,6 +539,8 @@ class HealthReader:
     policy_state: Callable[[], health.PolicyState | None] | None = None
     chain: VaultLedger | None = None
     saturated: Callable[[], int] | None = None
+    waiting: Callable[[], int] | None = None
+    telegram: Callable[[], health.TelegramState | None] | None = None
 
     def report(self) -> dict[str, Any]:
         """:func:`.health.assess` now, with no number JSON can't carry."""
@@ -565,11 +569,19 @@ class HealthReader:
 
     def _approvals(self, policy: Policy) -> health.HoldState | None:
         """The vault hold for health (M8 design K.1); None without a chain, or while the policy
-        holds no call."""
-        if self.chain is None or not held_map(policy):
+        holds no call and names no Telegram approver."""
+        approvers = policy.approvers
+        telegram = None if approvers is None else approvers.telegram
+        if self.chain is None or not (held_map(policy) or telegram is not None):
             return None
         refused = 0 if self.saturated is None else self.saturated()
-        return health.HoldState(chain_writable=self.chain.writable(), saturated=refused)
+        return health.HoldState(
+            chain_writable=self.chain.writable(),
+            saturated=refused,
+            waiting=0 if self.waiting is None else self.waiting(),
+            portal=approvers is not None and approvers.portal is not None,
+            telegram=None if self.telegram is None or telegram is None else self.telegram(),
+        )
 
     def _passkey_state(self, policy: Policy) -> health.PasskeyState | None:
         """The passkey file for health; None without one, or without a portal to use it."""
@@ -613,6 +625,16 @@ class HealthReader:
         return found
 
 
+class HoldsHealth(Protocol):
+    """What health reads of the vault hold (``VaultApp``'s, M8 design K.1, G.7)."""
+
+    def saturated(self) -> int: ...
+
+    def waiting(self) -> int: ...
+
+    def approver_state(self) -> health.TelegramState | None: ...
+
+
 class AdminApp:
     def __init__(
         self,
@@ -640,6 +662,7 @@ class AdminApp:
         managed: ManagedPolicy | None = None,
         source: Callable[[], tuple[str, str]] | None = None,
         random: Callable[[int], bytes] = secrets.token_bytes,
+        holds: HoldsHealth | None = None,
     ) -> None:
         """``gateway_keys`` is the proxy's ratchet. Without it, ``GET /gateway-key`` answers from
         the policy and the previous key can't be retired here.
@@ -684,7 +707,10 @@ class AdminApp:
         (its text and label), for ``import?from_env=1`` (H.5, G-14); without it (the policy came
         on standard input, read once) that import is refused.
 
-        ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests)."""
+        ``random`` makes a generated token's bytes (``secrets.token_bytes``; tests).
+
+        ``holds`` is the vault hold's health (``VaultApp``'s, M8 design K.1, G.7): with it and
+        ``chain``, health has the ``approvals`` section the portal's has."""
         self._store = store
         self._random = random
         self._managed = managed
@@ -717,6 +743,10 @@ class AdminApp:
             bridges=bridges or health.Bridges(),
             gateway_status=gateway_status,
             policy_state=policy_state,
+            chain=None if holds is None else chain,
+            saturated=None if holds is None else holds.saturated,
+            waiting=None if holds is None else holds.waiting,
+            telegram=None if holds is None else holds.approver_state,
         )
         self.app = Starlette(
             routes=[

@@ -43,6 +43,7 @@ from zoeymcp.vault.health import (
     PasskeyState,
     PolicyState,
     Sends,
+    TelegramState,
     assess,
     failure_text,
     idle,
@@ -2289,6 +2290,128 @@ def test_a_flood_of_held_calls_is_an_error(refused: int) -> None:
     ]
     assert (found["level"], found["saturated"]) == ("error", refused)
     assert SATURATION_MINUTES * 60 == SATURATION_WINDOW
+
+
+TELEGRAM_ROW = {
+    "username": "example_bot",
+    "last_poll_ago": 3,
+    "token": "set",
+    "user_id": "set",
+    "chat_id": "set",
+}
+
+
+def telegram(*, waiting: int = 0, portal: bool = True, **fields: Any) -> dict[str, Any]:
+    """The approvals section with the Telegram approver in ``fields``' state, ``waiting`` holds
+    waiting, and the portal queue enabled or not."""
+    values = {"secret": "approver-bot", "username": "example_bot", "last_poll_ago": 3.7, **fields}
+    state = TelegramState(**values)
+    held = HoldState(chain_writable=True, waiting=waiting, portal=portal, telegram=state)
+    found: dict[str, Any] = report(make_policy({}), approvals=held)["approvals"]
+    return found
+
+
+def test_a_healthy_telegram_approver_shows_its_bot_and_its_last_poll() -> None:
+    """G.7: the bot's username and the last good poll's age; the token, the user and the chat
+    only as set, never a value."""
+    found = telegram()
+    assert found["telegram"] == TELEGRAM_ROW
+    assert (found["level"], found["findings"]) == ("ok", [])
+    never = telegram(last_poll_ago=None, username=None)["telegram"]
+    assert (never["last_poll_ago"], never["username"]) == (None, None)
+    assert "telegram" not in report(make_policy({}), approvals=HoldState(True))["approvals"]
+
+
+def test_a_shared_token_is_the_one_finding() -> None:
+    """T-5, FM-34: the surface doesn't start, so nothing else it would say is true."""
+    found = telegram(token_shared=True, contested=True, unreachable=True, rate_limited=True)
+    assert found["findings"] == [
+        finding(
+            "approver_token_shared",
+            "error",
+            "another secret holds the approver bot's token or the same bot; give the approver a "
+            "bot of its own (operations.md §36.2)",
+            {"kind": "fix_policy"},
+        )
+    ]
+    assert found["level"] == "error"
+
+
+def test_a_missing_token_is_stored_by_its_name() -> None:
+    found = telegram(token_missing=True, unreachable=True)
+    assert found["telegram"]["token"] == "missing"
+    assert found["findings"] == [
+        finding(
+            "approver_token_missing",
+            "warning",
+            "the approver bot's token isn't in the store: store it as approver-bot",
+            {"kind": "set_secret", "secret": "approver-bot"},
+        )
+    ]
+
+
+def test_a_contested_bot_says_to_revoke_its_token() -> None:
+    """G.3's 409 or foreign webhook: an error, which says what an unreachable poll would too."""
+    found = telegram(contested=True, unreachable=True, waiting=2)
+    assert found["findings"] == [
+        finding(
+            "approver_contested",
+            "error",
+            "another program reads this bot's updates; revoke the token",
+            None,
+        )
+    ]
+
+
+@pytest.mark.parametrize(("waiting", "level"), [(0, "warning"), (1, "error")])
+def test_an_unreachable_bot_is_an_error_while_a_hold_waits(waiting: int, level: str) -> None:
+    found = telegram(unreachable=True, waiting=waiting)
+    assert found["findings"] == [
+        finding(
+            "approver_unreachable",
+            level,
+            "Telegram hasn't answered the approver for 120 s or more: check the egress "
+            "allowlist; held calls are still decided in the portal, or expire",
+            None,
+        )
+    ]
+    assert found["level"] == level
+
+
+def test_an_unreachable_bot_with_no_portal_says_held_calls_expire() -> None:
+    """G.3's J8 row: with no portal queue, nothing else decides a held call Telegram can't
+    reach, so the finding says it expires."""
+    found = telegram(unreachable=True, waiting=1, portal=False)
+    assert found["findings"] == [
+        finding(
+            "approver_unreachable",
+            "error",
+            "Telegram hasn't answered the approver for 120 s or more: check the egress "
+            "allowlist; held calls expire at their deadline",
+            None,
+        )
+    ]
+
+
+def test_a_refused_chat_and_flood_control_are_warnings() -> None:
+    found = telegram(chat_unreachable=True, rate_limited=True)
+    assert found["findings"] == [
+        finding(
+            "approver_chat_unreachable",
+            "warning",
+            "Telegram refused a message to the operator's chat: start the chat with the bot (or "
+            "unblock it)",
+            None,
+        ),
+        finding(
+            "approver_rate_limited",
+            "warning",
+            "Telegram's flood control slowed the approver in the last 10 min: prompts and edits "
+            "wait their turn",
+            {"kind": "wait"},
+        ),
+    ]
+    assert found["level"] == "warning"
 
 
 # --- the gateway's status (M6 design K.1, M.5; Y21, Y29, T-7) ------------------------------------

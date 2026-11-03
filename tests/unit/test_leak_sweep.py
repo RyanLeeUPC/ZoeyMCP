@@ -63,7 +63,10 @@ route's credential, which reaches the upstream once approved and nothing else; a
 of it is scrubbed from the waiting caller's answer and from a detached result in the result store,
 and a held send's mail password reaches the transport alone. A detached result, collected through
 the collect path (step 11: F.5, O.6), holds the echo only scrubbed, and its bytes reach no log
-line.
+line. The Telegram approver (step 14: G.1, G-8, O.6) sends the bot's token, the operator's ids, a
+held call's argument values and the buttons' MACs to the Bot API alone: no log line, the HTTP
+libraries' own included with root INFO logging on, no answer, health or chain file holds one,
+whatever Telegram answered.
 
 A managed policy's revision (M6 design D.4, O.6, Y3, step 11a), sealed with a literal client
 token, a placeholder, a token header, a forced query value, a connector username and a recipient,
@@ -95,6 +98,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import stat
@@ -117,7 +121,9 @@ from tests.fakes.oauth_server import (
     google_style,
     spotify_style,
 )
+from tests.fakes.telegram import BotApi, Person, Switch
 from tests.gateway import holdrig as hold_rig
+from tests.gateway.rig import until
 from tests.unit import onboard_model
 from tests.unit.report_model import DIGEST, PIN, asked_line
 from zoeymcp.bridge.admit import BridgeTokenHash
@@ -145,7 +151,7 @@ from zoeymcp.portal.passkeys import Passkeys, new_file
 from zoeymcp.portal.policydiffview import rows as policy_diff_rows
 from zoeymcp.portal.policyview import view as policy_view
 from zoeymcp.portal.routes import STATIC
-from zoeymcp.vault import logs, policyseal, policystart, policystore, reviewjobs
+from zoeymcp.vault import logs, policyseal, policystart, policystore, reviewjobs, server
 from zoeymcp.vault.admin import AdminApp, HealthReader, SetupCodes
 from zoeymcp.vault.app import EGRESS_HEADER, VaultApp
 from zoeymcp.vault.keys import CONTEXT_LEDGER_VAULT, KeySet, derive
@@ -156,6 +162,7 @@ from zoeymcp.vault.request import oauth_client_variants
 from zoeymcp.vault.secretops import Revoker
 from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
+from zoeymcp.vault.telegram import Timings
 from zoeymcp.vault.vaultledger import CHAIN_DIR, ChainUnavailable, VaultLedger
 
 from .test_admin import KEYS as ADMIN_KEYS
@@ -1556,6 +1563,103 @@ async def test_a_relay_leaks_nothing(tmp_path: Path) -> None:
         for seen in answers:
             assert value not in seen
     assert rig.upstream.received == []  # the vault forwards no relay
+
+
+async def test_the_approver_token_leaks_nothing(tmp_path: Path) -> None:
+    """The Telegram approver's secret-bearing paths (M8 design G.1, G-8, O.6): the bot's token,
+    as a value and in its ``/bot<token>/`` form, the operator's user and chat id, the buttons'
+    MACs and a held call's argument values reach the Bot API, and nothing else, with root INFO
+    logging on: the vault caps the HTTP libraries' loggers at WARNING, which would otherwise
+    print each request line. Nor do Telegram's refusals (a 409, a 403, a 401 for a revoked
+    token, an outage's HTML page) reach a line: a failed call is logged by its method, type
+    and status."""
+    argument = "approver-argument-sentinel-3e9a"
+    operator = Person(hold_rig.OPERATOR_ID, "Operator", "operator_example")
+    api = BotApi(hold_rig.BOT_TOKEN, second=0.05, flood_interval=None, operator_account=operator)
+    timings = Timings(send_spacing=0.05, contested_backoff=0.2, backoff_max=0.1, poll_timeout=1)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app()))
+    rig = hold_rig.HoldRig(
+        tmp_path,
+        {"block_seconds": 0},
+        link="asgi",
+        surfaces=("telegram",),
+        telegram=timings,
+        approver_client=client,
+    )
+    health = HealthReader(
+        rig.store,
+        lambda: rig.app.policy,
+        chain=rig.chain,
+        waiting=rig.app.waiting,
+        telegram=rig.app.approver_state,
+    )
+    stdlib = io.StringIO()
+    handler = logging.StreamHandler(stdlib)
+    root = logging.getLogger()
+    levels = {name: logging.getLogger(name).level for name in ("", *server.CLIENT_LOGGERS)}
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    server.cap_client_loggers()  # as serve() does first
+    buffer = io.StringIO()
+    answers: list[str] = []
+    logs.set_stream(buffer)
+    try:
+        async with rig.running() as http:
+            rig.app.start_approvers()
+            with anyio.fail_after(30):
+                marked = hold_rig.headers(held=hold_rig.marker("00000000000000a7", wait="pending"))
+                body = hold_rig.call(arguments={"item": argument})
+                answer = await http.post("/shop/mcp", content=body, headers=marked)
+                answers.append(answer.text + repr(answer.headers.multi_items()))
+                await until(lambda: api.operator.prompts(), 30)
+                [sent] = api.operator.prompts()
+                macs = [sent.data_for(label) for label in ("Deny", "Approve")]
+                assert argument in sent.text  # the surface's, alone (Z14)
+                api.attacker.press(sent.message_id, "Approve")  # refused, unanswered
+                api.operator.press(sent.message_id, "Approve")
+                await until(lambda: len(api.answers) >= 1, 30)
+                await rig.settled()
+                for switch in (Switch.CONFLICT, Switch.FORBIDDEN_SEND, Switch.OUTAGE):
+                    api.switches = {switch}
+                    marked = hold_rig.headers(
+                        held=hold_rig.marker(f"00000000000000b{len(answers)}", wait="pending")
+                    )
+                    answer = await http.post("/shop/mcp", content=body, headers=marked)
+                    answers.append(answer.text + repr(answer.headers.multi_items()))
+                    await until(lambda: any(c.status >= 400 for c in api.calls[-3:]), 30)
+                    answers.append(json.dumps(health.report()))
+                api.switches = set()
+                api.token = "730041977:AAF-revoked-for-the-sweep-0000000000"
+                await until(lambda: any(c.status == 401 for c in api.calls), 30)
+                answers.append(json.dumps(health.report()))
+                rig.app.stop_holds()
+                await rig.app.drain_holds()
+                await rig.app.stop_approvers()
+    finally:
+        logs.set_stream(None)
+        root.removeHandler(handler)
+        for name, level in levels.items():
+            logging.getLogger(name).setLevel(level)
+    text = buffer.getvalue() + stdlib.getvalue()
+    assert '"event":"approver_send_failed"' in text
+    assert '"event":"approver_poll_failed"' in text
+    files = b"".join(
+        path.read_bytes() for path in (rig.state / CHAIN_DIR).iterdir() if path.is_file()
+    )
+    token = hold_rig.BOT_TOKEN
+    secret_half = token.partition(":")[2]
+    values = (token, secret_half, f"/bot{token}/", str(hold_rig.OPERATOR_ID), argument, *macs)
+    for value in values:
+        assert value not in text
+        assert value.encode() not in files
+        for seen in answers:
+            assert value not in seen
+    # Each reached the Bot API, and only that: the token in its paths (the fake checks it), the
+    # chat in each write, the argument values in the prompt.
+    assert {c.params["chat_id"] for c in api.calls if c.method == "sendMessage"} == {
+        hold_rig.OPERATOR_ID
+    }
+    assert len(rig.upstream.posts()) == 1
 
 
 async def callback(world: World, url: str, binder: str | None) -> httpx.Response:

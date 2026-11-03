@@ -25,6 +25,7 @@ from zoeymcp.common.egresslist import (
     derive,
     digest,
     document,
+    enrolment_allowance,
     private_exceptions,
     render,
 )
@@ -217,6 +218,67 @@ def test_an_allowance_adds_destinations_that_are_never_private() -> None:
 def test_an_allowance_keeps_a_policy_destinations_private_mark() -> None:
     found = derive(parse(policy_raw()), [Allowance(frozenset({("lan.example", 80)}))])["vault"]
     assert dest("lan.example", 80, "route", "onboarding", private=True, http=True) in found
+
+
+# --- the Telegram approver (M8 design G.2, Z22) --------------------------------------------------
+
+
+def telegram_raw(**changes: Any) -> Raw:
+    raw = policy_raw()
+    raw["approvers"] = {
+        "telegram": {"bot_token": "store:approver-bot", "user_id": 7, "chat_id": 7},
+        **changes,
+    }
+    return raw
+
+
+def test_the_telegram_approver_adds_the_bot_api_to_the_vaults_list() -> None:
+    """Derived, not reached (I.5): the role, check --emit-egress-allowlist and the self-test's
+    expectations all show it, from the one derivation."""
+    lists = derive(parse(telegram_raw()))
+    approver = dest("api.telegram.org", 443, "approver")
+    assert lists == {"vault": tuple(sorted((*EXPECTED, approver), key=lambda d: (d.host, d.port)))}
+    assert "vault api.telegram.org:443" in render(lists, "text").splitlines()
+    assert {"host": "api.telegram.org", "port": 443, "private": False} in document(lists)[
+        "sources"
+    ]["vault"]
+
+
+def test_no_telegram_approver_no_bot_api() -> None:
+    """The portal queue alone, or an approvers block with no surface, reaches nothing."""
+    assert derive(parse(telegram_raw(telegram=None, portal={}))) == {"vault": EXPECTED}
+    assert derive(parse(telegram_raw(telegram=None))) == {"vault": EXPECTED}
+
+
+def test_the_approvers_destination_merges_with_a_route_to_the_bot_api() -> None:
+    raw = telegram_raw()
+    raw["routes"].append(route("telegram", "https://api.telegram.org"))
+    [found] = [d for d in derive(parse(raw))["vault"] if d.host == "api.telegram.org"]
+    assert found == dest("api.telegram.org", 443, "route", "approver")
+
+
+def test_an_approver_destination_listed_private_is_private() -> None:
+    """As every policy destination: egress_private marks it (it never names the Bot API in
+    practice, which is global)."""
+    raw = telegram_raw()
+    raw["egress_private"] = ["api.telegram.org:443"]
+    [found] = [d for d in derive(parse(raw))["vault"] if d.host == "api.telegram.org"]
+    assert found == dest("api.telegram.org", 443, "approver", private=True)
+
+
+def test_an_enrolments_allowance_is_the_bot_api_for_the_approver() -> None:
+    """G.2, Q43: an enrolment runs before the policy names the approver, so its allowance says
+    ``approver``, and is never private."""
+    allowance = enrolment_allowance()
+    assert allowance == Allowance(frozenset({("api.telegram.org", 443)}), reason="approver")
+    assert Allowance(frozenset()).reason == "onboarding"
+    raw = policy_raw()
+    raw["egress_private"] = ["api.telegram.org:443"]
+    found = derive(parse(raw), [allowance])["vault"]
+    assert dest("api.telegram.org", 443, "approver") in found
+    both = derive(parse(telegram_raw()), [allowance])["vault"]
+    assert dest("api.telegram.org", 443, "approver") in both
+    assert len(both) == len(EXPECTED) + 1
 
 
 # --- the digest and the document ---------------------------------------------------------------

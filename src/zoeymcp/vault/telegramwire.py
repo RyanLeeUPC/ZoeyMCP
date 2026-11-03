@@ -143,6 +143,12 @@ def method_url(token: str, method: str) -> SecretUrl:
     return SecretUrl(token, method)
 
 
+def bot_id(value: str) -> str | None:
+    """The bot id of a value shaped as a bot token, the digits before its ``:``, or None for
+    any other value (G.7's ``approver_token_shared``: another secret holding the same bot)."""
+    return value.partition(":")[0] if _TOKEN.fullmatch(value) else None
+
+
 # --- a prompt ------------------------------------------------------------------------------------
 
 
