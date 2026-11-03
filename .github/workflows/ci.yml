@@ -87,7 +87,8 @@ jobs:
   image:
     name: image build and smoke test
     runs-on: ubuntu-24.04
-    # The bridge's rows (both shapes, M7 design L) run in the smoke test too.
+    # The bridge's rows (both shapes, M7 design L) run in the smoke test too, and the last step
+    # builds the image twice more (about 3 minutes; the job took 19 minutes before it).
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -96,6 +97,7 @@ jobs:
       - name: Build
         run: >-
           docker build
+          --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           --build-arg SOURCE_REVISION="$(git rev-parse HEAD)"
           --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')"
           -t zoeymcp:ci .
@@ -130,3 +132,74 @@ jobs:
             --build-context toolkit=examples/toolkits/dist \
             --build-arg OFFICIAL=zoeymcp:ci -t zoeymcp-derived:ci examples/derived-image
           sh examples/derived-image/verify.sh zoeymcp:ci zoeymcp-derived:ci
+      # R52's reproducible build (M8 design L.4): the commit built twice more, each from scratch on
+      # a fresh builder with a pinned BuildKit, to OCI layouts with rewrite-timestamp. A report for
+      # now: it says whether the two platform manifest digests match and, if not, what differs;
+      # the release dry run (L.2) enforces it. The index digest is never compared: it carries
+      # attestation timestamps.
+      - name: Reproducible build, twice from scratch (a report)
+        run: |
+          set -o pipefail
+          buildkit=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+          for build in first second; do
+            docker buildx create --name "repro-$build" --driver docker-container \
+              --driver-opt "image=$buildkit"
+            docker buildx build --builder "repro-$build" --platform linux/amd64 \
+              --provenance=false --sbom=false \
+              --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+              --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+              --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
+              --output "type=oci,dest=$RUNNER_TEMP/repro-$build,tar=false,rewrite-timestamp=true" .
+            docker buildx rm "repro-$build"
+          done
+          python3 -I - "$RUNNER_TEMP/repro-first" "$RUNNER_TEMP/repro-second" <<'PY' \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          import hashlib, json, os, sys, tarfile
+          def blob(layout, digest):
+              return os.path.join(layout, "blobs", *digest.split(":", 1))
+          def read(layout, digest):
+              with open(blob(layout, digest), "rb") as handle:
+                  return json.load(handle)
+          def platform(layout):
+              # index.json names the platform manifest, or an index that does; attestation
+              # manifests are platform unknown/unknown.
+              with open(os.path.join(layout, "index.json"), "rb") as handle:
+                  found = json.load(handle)["manifests"]
+              while True:
+                  [entry] = [m for m in found if m.get("platform", {}).get("os") != "unknown"]
+                  if "index" not in entry["mediaType"]:
+                      return entry["digest"]
+                  found = read(layout, entry["digest"])["manifests"]
+          def files(layout, digest):
+              found = {}
+              with tarfile.open(blob(layout, digest)) as layer:
+                  for member in layer:
+                      body = layer.extractfile(member) if member.isfile() else None
+                      content = hashlib.sha256(body.read()).hexdigest()[:12] if body else ""
+                      found[member.name] = (oct(member.mode), member.uid, member.gid,
+                                            member.mtime, member.linkname, content)
+              return found
+          layouts = sys.argv[1:3]
+          digests = [platform(layout) for layout in layouts]
+          print(f"Reproducible build: first {digests[0]}, second {digests[1]}")
+          if digests[0] == digests[1]:
+              print("The platform manifest digests match.")
+              sys.exit(0)
+          print("The platform manifest digests differ.")
+          manifests = [read(layout, digest) for layout, digest in zip(layouts, digests)]
+          configs = [read(layout, m["config"]["digest"]) for layout, m in zip(layouts, manifests)]
+          for key in sorted(set(configs[0]) | set(configs[1])):
+              if configs[0].get(key) != configs[1].get(key):
+                  print(f"- config: {key} differs")
+          layers = [m["layers"] for m in manifests]
+          if len(layers[0]) != len(layers[1]):
+              print(f"- layers: {len(layers[0])} and {len(layers[1])}")
+          for number, (one, two) in enumerate(zip(*layers), 1):
+              if one["digest"] == two["digest"]:
+                  continue
+              first, second = files(layouts[0], one["digest"]), files(layouts[1], two["digest"])
+              changed = sorted(n for n in set(first) | set(second) if first.get(n) != second.get(n))
+              print(f"- layer {number}: {len(changed)} entries differ")
+              for name in changed[:20]:
+                  print(f"  - {name}: {first.get(name)} / {second.get(name)}")
+          PY

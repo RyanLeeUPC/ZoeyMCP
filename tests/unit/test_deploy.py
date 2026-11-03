@@ -773,6 +773,61 @@ def test_the_official_image_drops_the_distrusted_root() -> None:
     assert 'name = "emSign_ECC_Root_CA_-_G3"' in verify
 
 
+def test_the_official_image_builds_reproducibly() -> None:
+    """M8 design L.4 (fold-in 2.38): SOURCE_DATE_EPOCH reaches both stages; the bytecode is
+    unchecked-hash, compiled by name with a fixed hash seed after the last install, not left to
+    uv (py_compile picks checked-hash once SOURCE_DATE_EPOCH is set), and the seed stays out of
+    the image's own environment; each account useradd makes gets a fixed last-change day, and its
+    backups and logs go in the same RUN. CI's image job builds twice more and compares the platform
+    manifest digests, every build with the commit's time."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    _, base, uv, build, final = re.split(r"^FROM ", dockerfile, flags=re.MULTILINE)
+    assert base.endswith(" AS base\n\n")
+    assert uv.endswith(" AS uv\n\n")
+    assert build.startswith("base AS build\n")
+    assert final.startswith("base\n")
+    for stage in (build, final):
+        assert "\nARG SOURCE_DATE_EPOCH\n" in stage
+    assert "UV_COMPILE_BYTECODE=" not in dockerfile
+    assert "    PYTHONHASHSEED=0\n" in build
+    assert "PYTHONHASHSEED" not in final
+    compile_all = (
+        "RUN python3 -m compileall -q -f --invalidation-mode unchecked-hash \\\n"
+        "        /opt/zoeymcp/lib /opt/zoeymcp-gateway/lib\n"
+    )
+    assert compile_all in build
+    assert build.index(compile_all) > build.rindex("uv sync")
+    # One instruction or comment line per piece: a continuation line starts with a space.
+    pieces = re.split(r"\n(?=\S)", final)
+    [users] = [piece for piece in pieces if piece.startswith("RUN ") and "useradd" in piece]
+    names = re.findall(r"^ && useradd .* (\w+) \\$", users, flags=re.MULTILINE)
+    assert names == ["vault", "gateway", "init", "bridge", "egress"]
+    fixed = (
+        ' && day="$(getent shadow root | cut -d: -f3)" \\\n'
+        f' && for user in {" ".join(names)}; do chage --lastday "$day" "$user"; done \\\n'
+        " && rm -f /etc/passwd- /etc/group- /etc/shadow- /etc/gshadow- /var/log/lastlog"
+        " /var/log/faillog \\\n"
+    )
+    assert fixed in users
+    assert users.index(fixed) > users.rindex("useradd")
+    assert users.count("useradd") == len(names)
+    # The image job: the smoke's image and both compared builds take the commit's time, and the
+    # compared builds are two, each on a fresh builder, with rewrite-timestamp.
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_bytes())
+    steps = {
+        step.get("name"): str(step.get("run", "")) for step in workflow["jobs"]["image"]["steps"]
+    }
+    epoch = '--build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"'
+    assert epoch in steps["Build"]
+    twice = steps["Reproducible build, twice from scratch (a report)"]
+    assert "for build in first second; do\n" in twice
+    assert '  docker buildx create --name "repro-$build" --driver docker-container' in twice
+    assert twice.count("docker buildx build ") == 1
+    assert twice.index(epoch) > twice.index('docker buildx build --builder "repro-$build"')
+    assert ',rewrite-timestamp=true" .\n' in twice
+    assert '  docker buildx rm "repro-$build"\ndone\n' in twice
+
+
 def test_the_example_images_pin_the_same_uv() -> None:
     """D-162: Dependabot bumps the root's uv stage and the examples' copies in one group."""
     [root] = _UV_STAGE.findall((ROOT / "Dockerfile").read_text(encoding="utf-8"))

@@ -11,17 +11,30 @@
 #
 #   docker build --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
 #                --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" -t zoeymcp .
+#
+# Reproducible (M8 design L.4): with SOURCE_DATE_EPOCH set to the commit's time and an OCI output
+# with rewrite-timestamp=true, two builds of one commit give one platform manifest digest. The
+# bytecode is unchecked-hash, the new accounts' last-change day is fixed, the files useradd leaves
+# behind are removed, and rewrite-timestamp clamps every file's time to it, the certificate store's
+# too.
+#
+#   docker buildx build --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+#       --build-arg SOURCE_REVISION=... --build-arg SOURCE_TREE=... \
+#       --output type=oci,dest=zoeymcp-oci,tar=false,rewrite-timestamp=true .
 
 FROM python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b AS base
 
 FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
 
 FROM base AS build
+ARG SOURCE_DATE_EPOCH
 COPY --from=uv /uv /usr/local/bin/uv
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy \
+# No UV_COMPILE_BYTECODE: with SOURCE_DATE_EPOCH set, py_compile would pick checked-hash, so the
+# bytecode is compiled below, its mode named.
+ENV UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
-    UV_PYTHON=/usr/local/bin/python3
+    UV_PYTHON=/usr/local/bin/python3 \
+    PYTHONHASHSEED=0
 WORKDIR /src
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN UV_PROJECT_ENVIRONMENT=/opt/zoeymcp \
@@ -33,12 +46,17 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/zoeymcp \
     uv sync --locked --no-dev --no-editable \
  && UV_PROJECT_ENVIRONMENT=/opt/zoeymcp-gateway \
     uv sync --locked --no-dev --no-editable --extra gateway
+# Unchecked-hash .pyc holds no source time, and the fixed hash seed orders set constants the same
+# way in every build; the image is never edited in place, so the source is never checked again.
+RUN python3 -m compileall -q -f --invalidation-mode unchecked-hash \
+        /opt/zoeymcp/lib /opt/zoeymcp-gateway/lib
 # What a derived image compiles its toolkits against, so a toolkit's dependency can never move one
 # of the gateway's (examples/derived-image).
 RUN uv pip freeze --python /opt/zoeymcp-gateway/bin/python \
         > /opt/zoeymcp-gateway/zoeymcp-constraints.txt
 
 FROM base
+ARG SOURCE_DATE_EPOCH
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_TREE=unknown
 LABEL org.opencontainers.image.title="ZoeyMCP" \
@@ -65,6 +83,10 @@ RUN grep -qx 'mozilla/emSign_ECC_Root_CA_-_G3.crt' /etc/ca-certificates.conf \
 # directories under /run are tmpfs mounts in compose; they exist here with the same owners and
 # modes for runtimes that ignore tmpfs options. The link socket's directory is group gateway and
 # 0750, with no setgid bit: uvicorn makes the socket 0666, so the directory is the gate.
+# For a reproducible build (M8 design L.4), each account's last password change is the base
+# image's day for root rather than the build's, and what useradd leaves behind goes in the same
+# RUN: the passwd-, group-, shadow- and gshadow- backups (shadow- holds the days useradd wrote)
+# and the lastlog and faillog records.
 RUN groupadd --gid 10001 vault \
  && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin vault \
  && groupadd --gid 10002 gateway \
@@ -75,6 +97,9 @@ RUN groupadd --gid 10001 vault \
  && useradd --uid 10005 --gid 10005 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin bridge \
  && groupadd --gid 10006 egress \
  && useradd --uid 10006 --gid 10006 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin egress \
+ && day="$(getent shadow root | cut -d: -f3)" \
+ && for user in vault gateway init bridge egress; do chage --lastday "$day" "$user"; done \
+ && rm -f /etc/passwd- /etc/group- /etc/shadow- /etc/gshadow- /var/log/lastlog /var/log/faillog \
  && mkdir -p /state /state-gateway /run/zoeymcp /run/zoeymcp-link /run/zoeymcp-gateway \
  && chown 10001:10001 /state /run/zoeymcp \
  && chmod 0700 /state /run/zoeymcp \
