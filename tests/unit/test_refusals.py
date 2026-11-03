@@ -230,6 +230,10 @@ PLAN = {
     "generation_raise_from_portal": 403,
     "summary_too_large": 413,
     "no_change": 400,
+    # M8 design A.4, M.2: a write that drops a held tool.
+    "vault_approval_off_needs_its_own_step": 409,
+    "rollback_drops_vault_approval": 409,
+    "resume_drops_vault_approval": 409,
 }
 # M6's N.2: a managed write or a reseed the policy store didn't make (vault/policystore.py,
 # steps 13a and 13c).

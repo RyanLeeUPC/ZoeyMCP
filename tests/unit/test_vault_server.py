@@ -17,6 +17,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+import yaml
 
 from tests.unit.report_model import asked_line
 from zoeymcp.common.ledgerformat import GENESIS
@@ -43,6 +44,7 @@ from zoeymcp.vault.server import (
 from zoeymcp.vault.store import SecretStore, origin_binding
 
 from .conftest import EXAMPLE_POLICY
+from .test_policy import m8
 
 
 def env(**extra: str) -> dict[str, str]:
@@ -459,6 +461,47 @@ def test_a_resume_below_a_floor_is_refused(
         "more."
     )
     assert _policy_events(log_buffer)[-1]["reason"] == "resume_generation_lowered"
+
+
+def _held(example_text: str, *, place_order: bool = True) -> str:
+    """The example with M8's fields in use (``test_policy.m8``); without ``place_order``, only
+    cancel_order of broker-trade's held."""
+    data = m8(yaml.safe_load(example_text))
+    if not place_order:
+        data["gateway"]["servers"]["broker-trade"]["tools"]["vault_approval"] = ["cancel_order"]
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+def test_a_resume_that_drops_a_held_tool_refuses_the_start(
+    tmp_path: Path, example_text: str, log_buffer: io.StringIO
+) -> None:
+    """M8 design A.4's host bullet (3), M.2: a resume has no acceptance flag, so a source that
+    would stop the vault holding a tool the parked head holds refuses the start
+    (``resume_drops_vault_approval``), naming the tool and the host's ways, and writes nothing;
+    the source that keeps it held resumes."""
+    master = env()
+    state = _state(tmp_path)
+    load_runtime(_config(tmp_path, _managed(_held(example_text))), state, master)
+    load_runtime(_config(tmp_path, _held(example_text), "declarative.yaml"), state, master)
+    dropping = _config(tmp_path, _managed(_held(example_text, place_order=False)), "drop.yaml")
+    assert _start_refusal(dropping, state, master) == (
+        "refused to start: the policy given would stop the vault holding "
+        "broker-trade.place_order. Start with them held, then turn each off on the server's "
+        "page or by export, edit and import with --accept-widening; or reseed offline with "
+        "--accept-widening"
+    )
+    assert _policy_events(log_buffer)[-1] == {
+        "event": "policy_refused",
+        "level": "critical",
+        "reason": "resume_drops_vault_approval",
+        "revision": 1,
+    }
+    assert not (state / "policy" / "revisions" / "0000000002.json").exists()
+    kept = load_runtime(
+        _config(tmp_path, _managed(_held(example_text)), "kept.yaml"), state, master
+    )
+    assert kept.policy_store is not None
+    assert kept.policy_store.head.revision == 2  # type: ignore[union-attr]
 
 
 def test_a_resume_below_the_gateway_key_state_writes_nothing(

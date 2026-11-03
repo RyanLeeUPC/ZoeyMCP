@@ -680,3 +680,27 @@ def test_the_review_line_lists_the_kinds() -> None:
     assert not_served_line(
         "notes", ["completions"], ["resources"], templates=False, managed=False
     ) == (f"notes offers completions, not served: {COMPLETIONS_NEED}")
+
+
+# --- the vault's holds (M8 design A.4; step 18) -------------------------------------------------
+
+
+def test_a_fragment_keeps_the_holds_of_the_tools_it_keeps_approved() -> None:
+    """A.4: a review's fragment replaces the server's tools whole, so it carries vault_approval:
+    the review's policy's own (``Changes.held`` None), or a managed review's choice, each kept
+    only for a tool the change leaves included in approve, in approve's order; with none left,
+    the list isn't written (a fragment of a server that holds nothing reads as before, A.5)."""
+    report = drifting()
+    report["policy"]["vault_approval"] = ["m", "b"]
+    assert op_of(fragment(report, Changes())).tools.vault_approval == ["b", "m"]
+    moved = op_of(fragment(report, Changes(moved={"m": "allow"})))
+    assert moved.tools.vault_approval == ["b"]
+    dropped = op_of(fragment(report, Changes(dropped=frozenset({"b"}))))
+    assert dropped.tools.vault_approval == ["m"]
+    chosen = op_of(fragment(report, Changes(held=frozenset({"m", "a"}))))
+    assert chosen.tools.vault_approval == ["m"]
+    none = fragment(report, Changes(held=frozenset()))
+    assert "vault_approval" not in op_of(none).tools.model_fields_set
+    assert "vault_approval" not in emit(none)
+    assert "vault_approval:" in emit(fragment(report, Changes()))
+    assert "vault_approval" not in emit(fragment(drifting(), Changes()))

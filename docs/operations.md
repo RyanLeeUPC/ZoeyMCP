@@ -2664,6 +2664,9 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 403 | `generation_raise_from_portal` | A key rotation is done on the host: raise `<detail>` with zoeymcp policy import. |
 | 413 | `summary_too_large` | This change is too long to confirm in the portal: `<detail>` (zoeymcp policy export, edit, zoeymcp policy import), where all of it is shown. |
 | 400 | `no_change` | Nothing would change. |
+| 409 | `vault_approval_off_needs_its_own_step` | The vault holds `<detail>`: turn that off on the server's page (one passkey per tool, or per held connector), then save again. |
+| 409 | `rollback_drops_vault_approval` | Rolling back to `<detail>`. Turn each off first on the server's page (one passkey per tool, or per held connector), then roll back. |
+| 409 | `resume_drops_vault_approval` | The policy given would stop the vault holding `<detail>`: start with them held, then turn each off, or import with --accept-widening. |
 | 500 | `policy_write_failed` | The revision couldn't be written; nothing changed. |
 | 400 | `revision_out_of_range` | A revision can't go above 9,999,999,999. |
 | 500 | `reseed_incomplete` | The reseed failed and couldn't put the old store back, so the vault won't start (`<detail>`). Put each file named back, then run the reseed again; if the old anchor can't be put back, run it with --new-ratchet. |
@@ -4094,6 +4097,7 @@ Every refusal names the file and the way on, as commands for your host. In short
 | `key_unknown`, `key_retired` | a file is sealed under another master key | after a rotation, set `ZOEYMCP_MASTER_KEY_PREVIOUS` to the old key and recreate the vault; otherwise restore or reseed |
 | `fails_check` | the head fails `check` in this container | set what it names (an `env:` variable), then start again |
 | `policy_resume_needs_source`, `resume_generation_lowered` | a parked store with no usable policy, or one that would lower a key generation | give the policy to resume from, with the generation at the floor or above |
+| `resume_drops_vault_approval` | the policy given would stop the vault holding a tool the parked head holds in `vault_approval` | start with each held, then turn it off on the server's page or by export, edit and import with `--accept-widening`; or reseed offline with `--accept-widening` |
 
 The reseed is `policy import --state /state --reseed - < policy-export.yaml`, with the vault
 stopped: keep an export (`zoeymcp policy export`) somewhere safe, since it holds your policy's
@@ -4460,6 +4464,7 @@ Its log lines:
 | `policy_exported` | `revision`, `via` (`socket`, or `offline` for `--state`): the host exported the policy |
 | `policy_imported` (a reseed) | `revision`, `write_kind` (`policy.reseed`), `origin` (`reseed`), `author` (`host`), `base` (the old head it was planned against, or none), `digest` and `deployment` (8 characters each), `effects` (none), `reseed` (true), `new_ratchet`, `from_env` |
 | `tool_allowed`, `tool_repinned` | `server`, `def_kind`, `name`, `revision`; `tool_allowed` also `kept` for an `allow` tool kept through a re-pin: one line per tool, whatever the change |
+| `tool_vault_approval_off` | `server`, `name`, `revision`: one line per tool a write stops the vault holding, the portal's `tool.vault_approval_off` or a host import with `--accept-widening` (warning) |
 | `policy_not_installed` | `revision`, `reason`: a saved revision couldn't be applied, and the previous one runs (critical) |
 | `policy_behind_witness` | `head`, `witness` (the revision the gateway has seen): when a status report first shows the head behind it, or behind another number (critical) |
 | `policy_deployment_changed` | `deployment` and `other` (8 characters each), `revision` (the other's, as the gateway saw it): when a status report first shows it (critical) |

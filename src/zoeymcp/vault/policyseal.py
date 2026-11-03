@@ -87,13 +87,22 @@ KINDS: Final = frozenset(
         "policy.resume",
         "policy.reseed",
         "policy.acknowledge",
+        # M8 design A.4: vault_approval off, the portal's step-up of its own.
+        "tool.vault_approval_off",
     }
 )
 # The kinds each origin writes: a save is one of the portal's changes, and every other origin is
 # its one command (D.2).
 ORIGIN_KINDS: Final[Mapping[str, frozenset[str]]] = {
     "save": frozenset(
-        {"policy.save", "tool.repin", "tool.allow", "client.servers", "connector.limits"}
+        {
+            "policy.save",
+            "tool.repin",
+            "tool.allow",
+            "client.servers",
+            "connector.limits",
+            "tool.vault_approval_off",
+        }
     ),
     **{origin: frozenset({f"policy.{origin}"}) for origin in ORIGINS - {"save"}},
 }

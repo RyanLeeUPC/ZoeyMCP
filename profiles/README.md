@@ -39,7 +39,7 @@ of the CLI:
 | --- | --- | --- |
 | `openai-compatible.yaml` | S1: static bearer, JSON, streamed responses | OpenAI-compatible inference APIs |
 | `lastfm.yaml` | S2: query-parameter key, a forced parameter | Last.fm |
-| `telegram-bot.yaml` | S3: secret in the URL path | Telegram Bot API |
+| `telegram-bot.yaml` | S3: secret in the URL path; never the approver's bot, which is a bot of its own that no route uses (operations.md §36.2) | Telegram Bot API |
 | `atlassian-basic.yaml` | S4: HTTP basic | Atlassian Cloud API tokens |
 | `google-oauth.yaml` | S5: OAuth, confidential client, non-rotating refresh tokens, a scope check | Google APIs (Calendar, read-only) |
 | `spotify-pkce.yaml` | S6: OAuth, public client with PKCE, rotating refresh tokens | Spotify Web API |
@@ -49,7 +49,7 @@ of the CLI:
 | `remote-mcp-oauth.yaml` | S6 x S10: a remote MCP server with OAuth behind the gateway: a client registered by hand, PKCE, rotating refresh tokens, the `resource` parameter, one allowed and one approved tool (also a `gateway:` fragment) | any MCP server whose OAuth client you register yourself (no discovery: for discovery, see S9 below) |
 | `remote-mcp-oauth-discovered.yaml` | S9: the same server onboarded by its URL: fragment 1 as `zoeymcp login --mcp` writes it from the server's protected-resource metadata and its authorization server's metadata, with a public client registered by the vault (DCR), the issuer required on the answer, and no tools until the review (also a `gateway:` fragment) | any MCP server that publishes its metadata (RFC 9728) and registers clients (RFC 7591) |
 | `stdio-bridge.yaml` | S11: a stdio MCP server behind a bridge: a vault route to the bridge with its token as the header credential, the program's egress list, and a remote server on that route, the same in every placement but the route's upstream (also a `gateway:` fragment) | any stdio-only MCP server, run by `zoeymcp bridge` (`examples/bridge/`) |
-| `smtp-implicit-tls.yaml` | S13: send mail with an app password, implicit TLS on 465, fixed recipients, optionally through CONNECT | any mail provider with app passwords |
-| `smtp-starttls.yaml` | S14: the same with STARTTLS on 587, required, never optional | any mail provider with app passwords |
-| `toolkit-mail.yaml` | S15: the example mail toolkit, each message approved as shown (with an SMTP profile; a `gateway:` fragment) | any of the SMTP profiles' providers |
+| `smtp-implicit-tls.yaml` | S13: send mail with an app password, implicit TLS on 465, fixed recipients, optionally through CONNECT; with the sending toolkit's tools in `vault_approval`, the vault holds each send for your approvers (every writer of the connector, or none) | any mail provider with app passwords |
+| `smtp-starttls.yaml` | S14: the same with STARTTLS on 587, required, never optional; `vault_approval` as for S13 | any mail provider with app passwords |
+| `toolkit-mail.yaml` | S15: the example mail toolkit, each message approved as shown (with an SMTP profile; a `gateway:` fragment); `send_note` in `vault_approval` has the vault approve it instead of the gateway (operations.md §36) | any of the SMTP profiles' providers |
 | `toolkit-records.yaml` | S16: the example records toolkit, batch reads and approved batch writes, no delete (also a `gateway:` fragment) | any JSON records API with a key |

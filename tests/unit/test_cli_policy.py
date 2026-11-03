@@ -40,6 +40,7 @@ from .conftest import EXAMPLE_POLICY
 from .test_admin_policy import Holder, PolicyRig, deployment_of, serve, witness_of
 from .test_managed import edited, import_
 from .test_managed import start as managed_start
+from .test_policy import m8
 
 TOKEN = "example-agent2-token-0123"
 # A client written with a literal token, which a revision holds as its hash (D.5).
@@ -1327,3 +1328,97 @@ def test_acknowledge_usage(master: dict[str, str], argv: list[str], said: str) -
         2,
         f"zoeymcp policy acknowledge-restore: {said}\n",
     )
+
+
+# --- M8: a held tool on the host (M8 design A.4, Z20, Q42 (a); step 18) --------------------------
+
+
+def held_text(*, place_order: bool = True) -> str:
+    """``managed_text()`` with M8's fields in use (``test_policy.m8``): broker-trade's two tools
+    and mail's send_note held in the vault, the portal's queue as the approver; without
+    ``place_order``, only cancel_order of broker-trade's."""
+    data = m8(yaml.safe_load(managed_text()))
+    if not place_order:
+        data["gateway"]["servers"]["broker-trade"]["tools"]["vault_approval"] = ["cancel_order"]
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+def held_store(tmp_path: Path, environ: dict[str, str]) -> Path:
+    """A managed store whose revision 1 holds place_order (:func:`held_text`)."""
+    rig = managed_start(tmp_path, held_text(), key=environ["ZOEYMCP_MASTER_KEY"], K="v")
+    asyncio.run(rig.app.aclose())
+    return rig.state
+
+
+OFF = (
+    "  gateway.servers.broker-trade.tools.vault_approval: place_order: vault_approval off. The "
+    "gateway will ask instead of the vault; a compromised gateway could then skip the approval. "
+    "Calls waiting now are withdrawn."
+)
+WIDENS = (
+    "This plan widens the policy (broker-trade.place_order: vault_approval off): with --yes it "
+    "needs --accept-widening too, or run it without --yes to read the plan and confirm it."
+)
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        ["import", "{file}", "--base", "1"],
+        ["import", "--from-env"],
+        ["import", "{file}", "--reseed"],
+        ["import", "{file}", "--reseed", "--new-ratchet"],
+    ],
+    ids=["import", "from-env", "reseed", "new-ratchet"],
+)
+def test_a_host_import_that_drops_a_held_tool_needs_accept_widening(
+    tmp_path: Path, master: dict[str, str], monkeypatch: pytest.MonkeyPatch, form: list[str]
+) -> None:
+    """A.4's host bullet (1), (2): an offline import, ``--from-env``, a planned reseed and a
+    ``--new-ratchet`` one (which never calls the planner, so it compares the held set itself)
+    each list the dropped pair with its sentence among the widenings, and ``--yes`` writes it
+    only with ``--accept-widening``."""
+    state = held_store(tmp_path, master)
+    text = held_text(place_order=False)
+    source = write(tmp_path, text, "dropped.yaml")
+    monkeypatch.setenv("ZOEYMCP_CONFIG", text)
+    argv = ["policy", *(source if part == "{file}" else part for part in form)]
+    argv += ["--state", str(state), "--yes"]
+    code, err = cli(argv)
+    assert (code, err.splitlines()[-1]) == (1, f"zoeymcp policy import: {WIDENS}"), err
+    assert OFF in err.splitlines()
+    assert reopened(state, master).head.revision == 1  # type: ignore[union-attr]
+    code, err = cli([*argv, "--accept-widening"])
+    assert code == 0, err
+    store = reopened(state, master)
+    assert isinstance(store.verdict, Ok)
+    trade = head_policy(store.verdict).gateway.servers["broker-trade"]  # type: ignore[union-attr]
+    assert trade.tools.vault_approval == ["cancel_order"]
+
+
+def test_a_host_rollback_that_drops_a_held_tool_is_refused(
+    tmp_path: Path, master: dict[str, str]
+) -> None:
+    """A.4 (Q42 (a)): only an import turns vault_approval off on the host; a rollback to before
+    the tools were held is refused ``rollback_drops_vault_approval``, naming each, a writer with
+    its connector, and nothing is written."""
+    rig = managed_start(tmp_path, managed_text(), key=master["ZOEYMCP_MASTER_KEY"], K="v")
+    holding = yaml.safe_load(held_text())
+
+    def hold(data: dict[str, Any]) -> None:
+        data["approvers"] = holding["approvers"]
+        data["routes"] = holding["routes"]
+        for name, server in holding["gateway"]["servers"].items():
+            data["gateway"]["servers"][name] = server
+
+    assert isinstance(import_(rig, edited(hold)), Written)
+    asyncio.run(rig.app.aclose())
+    code, err = cli(["policy", "rollback", "1", "--state", str(rig.state), "--yes"])
+    assert (code, err) == (
+        1,
+        "zoeymcp policy rollback: Rolling back to revision 1 would stop the vault holding "
+        "broker-trade.cancel_order, broker-trade.place_order, mail.send_note (connector "
+        "mail-out). Turn each off first on the server's page (one passkey per tool, or per held "
+        "connector), then roll back.\n",
+    )
+    assert reopened(rig.state, master).head.revision == 2  # type: ignore[union-attr]

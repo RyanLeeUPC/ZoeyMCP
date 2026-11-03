@@ -35,6 +35,7 @@ from anyio.from_thread import BlockingPortal, start_blocking_portal
 from tests.fakes.telegram import BotApi, Person
 from tests.gateway.holdrig import BOT_TOKEN, KEYS, OPERATOR_ID, HoldRig
 from tests.gateway.rig import until
+from zoeymcp.cli import admin_client
 from zoeymcp.cli import approver as approver_cli
 from zoeymcp.cli import main as main_module
 from zoeymcp.cli.main import main
@@ -47,7 +48,7 @@ from zoeymcp.vault.holds import Hold, HoldRequest
 from zoeymcp.vault.telegram import PROBE, Timings
 from zoeymcp.vault.vaultledger import Start
 
-from .test_admin_policy import serve
+from .test_admin_policy import PolicyRig, serve
 
 BOUND = 30
 TEXT = 'Approval request 3f9c0a17b2d4e681\nTool: shop -> place_order\n\n{\n  "qty": 2\n}'
@@ -460,6 +461,72 @@ def test_with_telegram_keeps_the_rest_of_the_export() -> None:
         },
     }
     assert "telegram" not in str(document)  # the export itself is unchanged
+
+
+# --- enrol --apply in managed mode (G.8 step 5; step 16's deviation 4, tested in step 18) ---------
+
+SEEN = {"user_id": OPERATOR_ID, "chat_id": OPERATOR_ID, "name": "Operator", "username": None}
+LINES = [
+    "approvers:",
+    f"  telegram: {{bot_token: store:approver-bot, user_id: {OPERATOR_ID}, "
+    f"chat_id: {OPERATOR_ID}}}",
+    "  timeout: 3600",
+    "  block_seconds: 120",
+]
+
+
+@pytest.mark.parametrize("answer", ["y", "n"], ids=["yes", "no"])
+def test_enrol_apply_in_managed_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal, answer: str
+) -> None:
+    """G.8 step 5, J1 managed: after "Confirmed." the lines, then a host import of the head's
+    export with ``approvers.telegram`` the enrolment's, planned over the socket and shown, then
+    ``[y/N]``: yes imports it (a widening the host confirmed, so accepted), no writes nothing.
+    The managed vault and its socket are real (``check`` admits ``approvers``, which until step
+    18 it refused); the enrolment's own answers are the vault's, stood in for (``test_enrol``
+    walks them against the fake Bot API)."""
+    rig = PolicyRig(tmp_path)
+    serve(monkeypatch, lambda: rig.admin.app, portal)
+    opened = {
+        "enrolment": "e" * 22,
+        "state": "seen",
+        "allowance": "api.telegram.org:443",
+        "bot": "example_bot",
+        "link": "https://t.me/example_bot?start=" + "c" * 22,
+        "seen": SEEN,
+    }
+    confirmed = {"state": "confirmed", "secret": "approver-bot", "seen": SEEN, "lines": LINES}
+    monkeypatch.setattr(admin_client, "telegram_enrol", lambda socket, secret: opened)
+    monkeypatch.setattr(admin_client, "telegram_confirm", lambda socket, enrolment, code: confirmed)
+    argv = ["approver", "telegram", "enrol", "--secret", "approver-bot", "--apply"]
+    args = main_module._build_parser().parse_args(argv)
+    out, err = io.StringIO(), io.StringIO()
+    code = approver_cli.run(args, io.StringIO(f"{answer}\n"), out, err, typed=lambda _: "123456")
+    said = out.getvalue().splitlines()
+    assert said[said.index("Confirmed.") + 1 :][: len(LINES) + 1] == [
+        *LINES,
+        "Planned on revision 1:",
+    ]
+    assert "  Revision: 2, from 1" in said
+    assert any(line.startswith("  approvers") for line in said)
+    asked = "Apply as a host import? [y/N] "
+    managed = rig.vault.managed
+    if answer == "y":
+        assert (code, err.getvalue()) == (0, "")
+        assert said[-1] == asked + "Imported revision 2: the approver starts now."
+        assert managed.revision == 2
+        approvers = managed.policy.approvers
+        assert approvers is not None
+        assert approvers.telegram is not None
+        assert (approvers.telegram.bot_token, approvers.telegram.user_id) == (
+            "store:approver-bot",
+            OPERATOR_ID,
+        )
+    else:
+        assert (code, err.getvalue()) == (1, "")
+        assert said[-1] == asked + "Nothing written."
+        assert managed.revision == 1
+        assert managed.policy.approvers is None
 
 
 # --- --format on every command (D-171, K.3) -------------------------------------------------------

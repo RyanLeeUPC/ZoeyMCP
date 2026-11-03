@@ -32,6 +32,19 @@ operator confirms and the commit writes, or the first :class:`PlanRefused` of G.
 6. ``no_change``: an empty diff, except the host's ``policy.acknowledge``, ``policy.resume``
    and ``policy.reseed``, whose revision is the point (F.3, F.4, J10, Y4).
 
+**The held set** (M8 design A.4, Z20; G-3, T-2) is checked for every write, before rule 1's
+``kind_mismatch``: a (server, tool) the vault holds in the head that the candidate doesn't hold,
+for any cause (the field edited, the tool dropped from ``include``, its server removed, a
+rollback), or that the candidate reaches unheld through another route or server
+(:func:`dropped`), is a removal, and wider whatever :func:`direction` says. Only
+``tool.vault_approval_off``, whose diff removes exactly one held pair or exactly one held
+connector's :func:`closed_set`, makes it from the portal; any other portal write is
+``vault_approval_off_needs_its_own_step``, a rollback from any surface
+``rollback_drops_vault_approval``, and a resume ``resume_drops_vault_approval``. A host import or
+reseed lists each dropped pair first among the weakenings (:data:`VAULT_OFF_TEXT`), so ``--yes``
+needs ``--accept-widening``. A pair the write adds is said in the turn-on lines ``turn_on``
+gives (J2), in place of its change's row.
+
 The rows keep ``Plan.summary``'s label/value shape (MISS-6) in G.7's order: the revision; the
 weakenings, the moves and kept allows first, each followed by its definition, one row per chunk of
 every line (``reviewchange.definition_lines``), nothing cut, the first naming the pin it allows
@@ -49,7 +62,7 @@ rollback's candidate from its target (H.4).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final, Literal
@@ -59,6 +72,7 @@ from ..suggest import Suggestion
 from . import diff
 from .change import CONNECTOR_LIMITS
 from .diff import Change
+from .held import connector_writers, held_pairs, unheld_reach
 from .ratchet import DefKey, Grants, Ratchet, Violation, advance, full, violations
 from .restart import Effect, Started, classify
 from .reviewchange import Lines
@@ -101,7 +115,13 @@ Reason = Literal[
     "generation_raise_from_portal",
     "summary_too_large",
     "no_change",
+    # M8 design A.4, M.2: a write that drops a held (server, tool).
+    "vault_approval_off_needs_its_own_step",
+    "rollback_drops_vault_approval",
+    "resume_drops_vault_approval",
 ]
+# A (server, tool) the vault holds (held.held_pairs).
+Pair = tuple[str, str]
 # The socket's names for what the portal answers as rollback_revives (N.2, verifier C1).
 HOST_ONLY: Final = frozenset({"revives_client", "revives_caller"})
 # The most rows a portal plan shows, every chunk row of every definition counted (N.4, Y9).
@@ -170,10 +190,22 @@ _RESTARTS: Final = frozenset({"vault_restart", "gateway_restart"})
 NO_RESTART: Final = ("No restart needed", "")
 # The host's kinds whose revision is the point, a change or none (rule 6; F.3, F.4, K.3).
 ALWAYS_WRITTEN: Final = frozenset({"policy.acknowledge", "policy.resume", "policy.reseed"})
+# M8 design A.4: the portal's one way to turn vault_approval off, and each dropped pair's row,
+# first among the weakenings; the connector form names each held connector it covers.
+VAULT_OFF: Final = "tool.vault_approval_off"
+VAULT_OFF_TEXT: Final = (
+    "{name}: vault_approval off. The gateway will ask instead of the vault; a compromised "
+    "gateway could then skip the approval. Calls waiting now are withdrawn."
+)
+VAULT_OFF_CONNECTOR_TEXT: Final = "vault_approval off for every approve tool of {servers}"
 
 
 def _unknown(subject: str) -> int | None:
     return None
+
+
+def _no_lines(policy: Policy, server: str, tool: str) -> tuple[str, ...]:
+    return ()
 
 
 @dataclass(frozen=True)
@@ -208,6 +240,9 @@ class PlanInput:
     # The revision that removed a retired client, caller or pin, by its grant subject
     # ("client:<name>"), from the store's history (the ratchet keeps no revision number, E.1).
     removed_in: Callable[[str], int | None] = _unknown
+    # M8 design A.4, J2: what holding a (server, tool) the write adds changes, as lines
+    # (``portal/approvalsview.turn_on_lines``, which the vault side calls); none here by default.
+    turn_on: Callable[[Policy, str, str], Sequence[str]] = _no_lines
 
 
 @dataclass(frozen=True)
@@ -225,6 +260,7 @@ class WritePlan:
     ratchet: Ratchet = field(repr=False)  # after this write
     rows: tuple[tuple[str, str], ...]  # the summary the operator confirms (G.7)
     policy: Policy = field(repr=False)  # the candidate as the revision holds it (D.5)
+    dropped: tuple[Pair, ...] = ()  # held pairs the write drops, each a widening (M8 A.4)
 
 
 @dataclass(frozen=True)
@@ -320,6 +356,164 @@ def _carry(block: dict[str, Any], include: list[str], before: _Pinned | None) ->
     return {name: pin for name, pin in sorted(declined.items()) if name not in include}
 
 
+# --- the held set (M8 design A.4, Z20) --------------------------------------------------------
+
+
+def dropped(head: Policy, candidate: Policy) -> frozenset[Pair]:
+    """The pairs the vault holds in ``head`` that a write to ``candidate`` drops (A.4, T-2):
+    those ``candidate`` doesn't hold, for any cause, and those it holds but also reaches
+    unheld."""
+    held = held_pairs(head)
+    return (held - held_pairs(candidate)) | (held & unheld_reach(candidate))
+
+
+def _held_connectors(policy: Policy, *, held: bool = True) -> dict[str, frozenset[str]]:
+    """Each connector route the vault holds (a writer lists ``vault_approval``), or with
+    ``held`` false every connector route a toolkit writes through, with its writers."""
+    servers = {} if policy.gateway is None else policy.gateway.servers
+    return {
+        route: frozenset(writers)
+        for route, writers in connector_writers(policy).items()
+        if not held or any(servers[name].tools.vault_approval for name in writers)
+    }
+
+
+def _connector_of(policy: Policy) -> dict[str, str]:
+    """Each connector route's connector, by the route's name."""
+    return {route.name: route.connector for route in policy.routes if route.connector is not None}
+
+
+def closed_set(
+    policy: Policy, connector: str, *, held: bool = True
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """The connector form's closed set (A.4): the writer servers of ``connector``'s held routes,
+    every held connector any of them writes through and that connector's writers, until nothing
+    new is added; as the servers and the connectors it covers, by name. Empty for a connector
+    the vault doesn't hold. With ``held`` false, the same over every connector route, held or
+    not: the set **Hold in the vault** turns on, since A.2 row 4 holds each connector it
+    reaches all or nothing."""
+    names = _connector_of(policy)
+    writes = _held_connectors(policy, held=held)
+    routes = {route for route in writes if names[route] == connector}
+    servers: set[str] = set()
+    while True:
+        servers |= {name for route in routes for name in writes[route]}
+        more = {route for route, writers in writes.items() if writers & servers} - routes
+        if not more:
+            return frozenset(servers), tuple(sorted({names[route] for route in routes}))
+        routes |= more
+
+
+def connector_pairs(policy: Policy, connector: str, *, held: bool = True) -> frozenset[Pair]:
+    """The held pairs of ``connector``'s closed set: every held tool of every server in it; with
+    ``held`` false, every included approve tool of every server in the wider set."""
+    servers, _ = closed_set(policy, connector, held=held)
+    if held:
+        return frozenset(pair for pair in held_pairs(policy) if pair[0] in servers)
+    found = {} if policy.gateway is None else policy.gateway.servers
+    return frozenset(
+        (name, tool)
+        for name in servers
+        for tool in found[name].tools.approve
+        if tool in found[name].tools.include
+    )
+
+
+def writes_through(policy: Policy, server: str) -> tuple[str, ...]:
+    """The connectors a toolkit server writes through with an ``approved: true`` rule (the
+    connector routes whose writer it is), by name."""
+    names = _connector_of(policy)
+    return tuple(
+        sorted(
+            {
+                names[route]
+                for route, writers in connector_writers(policy).items()
+                if server in writers
+            }
+        )
+    )
+
+
+def _turned_off(changes: tuple[Change, ...], head: Policy, lost: frozenset[Pair]) -> bool:
+    """Whether a diff is ``tool.vault_approval_off``'s (A.4, M6 Y7): only ``vault_approval``
+    removals, which are exactly the pairs the write drops, one pair or one held connector's
+    closed set."""
+    if not lost or any(
+        c.model != "Tools" or c.field != "vault_approval" or c.op != "removed" for c in changes
+    ):
+        return False
+    if frozenset((str(c.path[2]), str(c.old)) for c in changes) != lost:
+        return False
+    held, names = _held_connectors(head), _connector_of(head)
+    servers = {server for server, _ in lost}
+    connectors = {names[route] for route, writers in held.items() if writers & servers}
+    if connectors:  # a writer's: exactly its connector's closed set (A.2 row 4)
+        return any(connector_pairs(head, name) == lost for name in connectors)
+    return len(lost) == 1
+
+
+def held_names(policy: Policy, pairs: frozenset[Pair]) -> str:
+    """The pairs as a refusal names them (M.2): ``<server>.<tool>``, a writer of a held
+    connector as ``<server>.<tool> (connector <c>)``, so the operator knows its step is the
+    connector's."""
+    held, names = _held_connectors(policy), _connector_of(policy)
+    said = []
+    for server, tool in sorted(pairs):
+        through = sorted({names[route] for route, writers in held.items() if server in writers})
+        connector = "" if not through else f" (connector {', '.join(through)})"
+        said.append(f"{server}.{tool}{connector}")
+    return ", ".join(said)
+
+
+def _drops(i: PlanInput, required: WriteKind, lost: frozenset[Pair]) -> PlanRefused | None:
+    """A.4's refusal of a write that drops a held pair, or None: none for the kind that turns
+    them off, nor for a host import or reseed, which lists them (:func:`vault_off_rows`)."""
+    if not lost or (i.kind == VAULT_OFF and required == VAULT_OFF):
+        return None
+    names = held_names(i.head, lost)
+    subjects = tuple(f"{server}/tool/{tool}" for server, tool in sorted(lost))
+    if i.kind == "policy.rollback":
+        target = "the target" if i.target_revision is None else f"revision {i.target_revision}"
+        detail = f"{target} would stop the vault holding {names}"
+        return PlanRefused("rollback_drops_vault_approval", detail, subjects)
+    if i.kind == "policy.resume":
+        return PlanRefused("resume_drops_vault_approval", names, subjects)
+    if i.surface == "portal":
+        return PlanRefused("vault_approval_off_needs_its_own_step", names, subjects)
+    return None
+
+
+def vault_off_rows(head: Policy, lost: frozenset[Pair]) -> list[tuple[str, str]]:
+    """The rows of the pairs a write drops (A.4): each one's :data:`VAULT_OFF_TEXT`, then each
+    held connector they cover, with its closed set's servers."""
+    rows = [
+        (f"gateway.servers.{server}.tools.vault_approval", VAULT_OFF_TEXT.format(name=tool))
+        for server, tool in sorted(lost)
+    ]
+    servers = {server for server, _ in lost}
+    held, names = _held_connectors(head), _connector_of(head)
+    for connector in sorted({names[route] for route, writers in held.items() if writers & servers}):
+        covered, _ = closed_set(head, connector)
+        listed = ", ".join(sorted(covered))
+        rows.append((f"connector {connector}", VAULT_OFF_CONNECTOR_TEXT.format(servers=listed)))
+    return rows
+
+
+def vault_off_widenings(lost: frozenset[Pair]) -> list[str]:
+    """The pairs a write drops as widening rows name them (``vault/managed.widenings``)."""
+    return [f"{server}.{tool}: vault_approval off" for server, tool in sorted(lost)]
+
+
+def _off_change(change: Change, lost: frozenset[Pair]) -> bool:
+    """Whether ``change`` removes a dropped pair from ``vault_approval`` (its own row says it)."""
+    return (
+        change.model == "Tools"
+        and change.field == "vault_approval"
+        and change.op == "removed"
+        and (str(change.path[2]), str(change.old)) in lost
+    )
+
+
 # --- the kind (rule 1) -------------------------------------------------------------------------
 
 
@@ -405,14 +599,19 @@ def required_kind(
     *,
     drifted: frozenset[DefKey] = frozenset(),
     verified: frozenset[tuple[DefKey, str]] = frozenset(),
+    lost: frozenset[Pair] = frozenset(),
 ) -> WriteKind:
     """The kind G.3's ops make, read from the diff (Y7, G-12): ``tool.allow`` for exactly one
     move of an included ``approve`` tool at the head's pin and nothing else; ``tool.repin`` for
     only re-pins of ``drifted`` tools, each to a ``verified`` pin; ``connector.limits`` for only
     one connector's pause and limits; ``client.servers`` for only one client's servers;
+    ``tool.vault_approval_off`` for only ``vault_approval`` removals that are exactly the held
+    pairs the write drops (``lost``), one pair or one held connector's closed set (M8 A.4);
     ``policy.save`` for anything else, a lone re-include as ``allow`` included."""
     if not changes:
         return "policy.save"
+    if _turned_off(changes, head, lost):
+        return "tool.vault_approval_off"
     moves, reincludes = _moves(changes, ratchet)
     if len(changes) == 2 and len(moves) == 1 and not reincludes:
         server, _, name = moves[0]
@@ -467,6 +666,10 @@ def _permits(kind: str, change: Change) -> bool:
         return change.model == "SMTPConnector" and change.field in CONNECTOR_LIMITS
     if kind == "client.servers":
         return change.model == "Client" and change.field == "servers"
+    if kind == VAULT_OFF:
+        return (
+            change.model == "Tools" and change.field == "vault_approval" and change.op == "removed"
+        )
     return False
 
 
@@ -636,12 +839,15 @@ def _rows(
     reincludes: list[DefKey],
     granted: list[Violation],
 ) -> list[tuple[str, str]]:
-    """G.7's rows, in order."""
+    """G.7's rows, in order; a dropped held pair first among the weakenings (M8 A.4), and a
+    pair the write holds anew in its turn-on lines (J2)."""
     head = i.head_revision
     revision = f"{head + 1}, from {head}"
     if i.target_revision is not None:
         revision += f": the content of revision {i.target_revision}"
     rows = [("Revision", revision)]
+    lost: frozenset[Pair] = frozenset(parts["dropped"])
+    rows += vault_off_rows(i.head, lost)
     for key in (*parts["moves"], *parts["kept_allow"]):
         server, _, name = key
         if key in reincludes:
@@ -660,12 +866,19 @@ def _rows(
         if c.model == "Tools" and c.field == "allow" and _key(c) in parts["moves"]
     ]
     wider = [c for c in parts["changes"] if direction(c, candidate) == "wider" and c not in moved]
-    rows += [(_dotted(c.path), _weakening(c, i, candidate)) for c in wider]
     rows += [
-        (_dotted(c.path), _other(c, i))
-        for c in parts["changes"]
-        if c not in wider and c not in moved
+        (_dotted(c.path), _weakening(c, i, candidate)) for c in wider if not _off_change(c, lost)
     ]
+    added = held_pairs(candidate) - held_pairs(i.head)
+    for c in parts["changes"]:
+        if c in wider or c in moved:
+            continue
+        pair = (str(c.path[2]), str(c.new)) if c.field == "vault_approval" else None
+        lines = i.turn_on(candidate, *pair) if c.model == "Tools" and pair in added else ()
+        if pair is not None and lines:
+            rows += [(f"{pair[0]}.{pair[1]}", line) for line in lines]
+        else:
+            rows.append((_dotted(c.path), _other(c, i)))
     for effect in parts["effects"]:
         label = "Restart needed" if effect.kind in _RESTARTS else "Redeploy needed"
         rows.append((label, f"{effect.path}: {effect.text}"))
@@ -694,14 +907,22 @@ def plan(i: PlanInput) -> WritePlan | PlanRefused:
     portal = i.surface == "portal"
     changes = diff.structured(head, candidate)
     paths = [_dotted(c.path) for c in changes]
+    lost = dropped(head, candidate)
     # Rule 1: the kind is its diff; a rollback's, its target's carry-forward (H.4, Y11).
     required: WriteKind = i.kind
+    derived = i.kind not in COMMANDS[i.surface]
     if i.kind == "policy.rollback" and not _carried(i, candidate):
-        required = required_kind(changes, head, i.ratchet, drifted=i.drifted, verified=i.verified)
+        derived = True
     elif portal and i.target is not None:
-        required = "policy.rollback"
-    elif i.kind not in COMMANDS[i.surface]:
-        required = required_kind(changes, head, i.ratchet, drifted=i.drifted, verified=i.verified)
+        required, derived = "policy.rollback", False
+    if derived:
+        required = required_kind(
+            changes, head, i.ratchet, drifted=i.drifted, verified=i.verified, lost=lost
+        )
+    # The held set (M8 A.4), before the kind: a drop's reason is the step the operator takes.
+    held = _drops(i, required, lost)
+    if held is not None:
+        return held
     if required != i.kind:
         said = ", ".join(paths) or "nothing"
         return PlanRefused("kind_mismatch", f"{required}, not {i.kind}: {said}", (required, i.kind))
@@ -777,6 +998,7 @@ def plan(i: PlanInput) -> WritePlan | PlanRefused:
         "unused_slots": tuple(sorted(set(before) - set(after))),
         "moves": tuple(moves),
         "kept_allow": tuple(kept_allow),
+        "dropped": tuple(sorted(lost)),
     }
     rows = _rows(i, parts, candidate, reincludes, list(granted))
     # Rule 5: what one portal dialog can show.

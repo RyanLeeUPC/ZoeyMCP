@@ -1430,3 +1430,38 @@ def test_the_compose_form_doubles_a_dollar_in_a_resources_uri(
     assert isinstance(plain, dict)
     assert '"notes://a$b": "sha256:' in plain["diff"]["yaml"]
     assert "$$" not in plain["diff"]["yaml"]
+
+
+def test_a_managed_save_keeps_or_chooses_the_holds() -> None:
+    """M8 A.4: with no ``held`` list the server's own holds stay (so a review save never drops
+    one by leaving it out); a ``held`` list replaces them, kept only for an included approve
+    tool; a list that isn't one of tool names is ``bad_body``."""
+    report = held(large())
+    body = {"include": ["read_01", "add"], "allow": ["read_01"], "approve": ["add"]}
+    holding = replace(NOTES, tools=Tools(vault_approval=["add"]))
+
+    def holds(server: Listed | None, **more: Any) -> list[str]:
+        made = reviewview.change_of(report, server, {**body, **more}, most=512)
+        assert not isinstance(made, Refusal), made
+        [op] = [op for op in made.ops if isinstance(op, SetServerReview)]
+        return op.tools.vault_approval
+
+    assert holds(holding) == ["add"]
+    assert holds(NOTES) == []
+    assert holds(holding, held=[]) == []
+    assert holds(NOTES, held=["add", "read_01"]) == ["add"]
+    plain = reviewview.choices(body, 512)
+    assert isinstance(plain, Choices)
+    assert plain.held is None
+    assert reviewview.choices({**body, "held": ["add"]}, 512) == replace(
+        plain, held=frozenset({"add"})
+    )
+    bad = reviewview.change_of(report, holding, {**body, "held": "add"}, most=512)
+    assert detail(bad, "bad_body") == "held is a list of tool names"
+    # The declarative diff keeps them the same way; with no server, there are none to keep.
+    chosen = reviewview.choices(body, 512)
+    assert not isinstance(chosen, Refusal)
+    made = reviewview.changes(report, chosen)
+    assert not isinstance(made, Refusal)
+    assert reviewview._held(made, chosen, holding).held == frozenset({"add"})
+    assert reviewview._held(made, chosen, None).held == frozenset()

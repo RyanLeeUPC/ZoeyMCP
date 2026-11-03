@@ -5,8 +5,8 @@ orders: a stray ``requestState`` is refused before the ``allow`` and unclassifie
 and after the legacy row that precedes it; on an ``approve`` tool it is a retry, which the
 gateway's handle check answers (``approve.py``), so it is asked even for an unattended client, as
 before step 3; on a ``vault_approval`` tool, which is never given a handle, it is refused before
-rows 2-5, and so are modern ``inputResponses``. Rows 2-7 read M8's dark fields, so the last test
-reaches them through a policy ``check`` passes only lit (``tests/dark.py``).
+rows 2-5, and so are modern ``inputResponses``. Rows 2-7 read M8's fields, built dark until step
+18; the last test reaches them through a policy ``check`` passes.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.dark import lit
 from tests.unit.test_policy import errors, m8
 from zoeymcp.common.policy import check_policy, parse_policy
 from zoeymcp.common.policy.schema import Tools
@@ -313,20 +312,18 @@ def test_out_of_band_needs_an_approvals_block_that_says_so() -> None:
     assert not out_of_band(None)
 
 
-# --- rows 2-7 on a checked policy, lit -----------------------------------------------------------
+# --- rows 2-7 on a checked policy ----------------------------------------------------------------
 
 
-def test_a_checked_policy_reaches_rows_2_to_7_only_lit(example_raw: dict[str, Any]) -> None:
-    """The example with M8's fields (``test_policy.m8``): dark, ``check`` refuses it; lit, it
-    passes, and its view routes the held tools Elsewhere for the attended client (a toolkit's to
+def test_a_checked_policy_reaches_rows_2_to_7(example_raw: dict[str, Any]) -> None:
+    """The example with M8's fields (``test_policy.m8``): ``check`` passes it (step 18 turned
+    them on), and its view routes the held tools Elsewhere for the attended client (a toolkit's to
     block), and that client's other approve tools, once it is out of band, to a relay."""
     raw = m8(example_raw)
     raw["gateway"]["clients"]["agent1"]["approvals"]["out_of_band"] = True
     raw["gateway"]["servers"]["broker-trade"]["tools"]["vault_approval"] = ["place_order"]
     policy = parse_policy(yaml.safe_dump(raw, sort_keys=False), "test")
-    assert errors(check_policy(policy))  # dark: row 0
-    with lit():
-        assert errors(check_policy(policy)) == []
+    assert errors(check_policy(policy)) == []
     gateway = build_view(policy).gateway
     agent = gateway.clients["agent1"]
     configured = gateway.approvals.out_of_band is not None

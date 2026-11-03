@@ -44,9 +44,10 @@ The offline forms that make a policy store or replace one, run with the vault st
   ``--new-ratchet`` starts from the document's own ratchet instead, and lists what it forgets;
   it is the one way out of ``ratchet_full``, and the only way when the old head doesn't verify.
   Against a head that verifies, a planned reseed that widens needs ``--accept-widening`` with
-  ``--yes``, and any reseed that drops a passkey's origin or moves ``admin.listen`` asks the
-  typed confirmation, or ``--lockout-ok`` with ``--yes`` (I.1, Q41). The old head and revisions
-  go to ``quarantine/`` (``vault/policystore.py``).
+  ``--yes``, and so does a ``--new-ratchet`` one that drops a tool the old head holds in
+  ``vault_approval`` (M8 design A.4); any reseed that drops a passkey's origin or moves
+  ``admin.listen`` asks the typed confirmation, or ``--lockout-ok`` with ``--yes`` (I.1, Q41).
+  The old head and revisions go to ``quarantine/`` (``vault/policystore.py``).
 
 Every ``--state`` form refuses to run as root, since the vault's uid couldn't read what it wrote
 (``state_as_root``, OPS-5), and takes the state lock a running vault holds (``state_locked``:
@@ -91,9 +92,12 @@ from ..common.policy.plan import (
     PlanInput,
     PlanRefused,
     WritePlan,
+    dropped,
     normalize,
     normalized_digest,
     plan,
+    vault_off_rows,
+    vault_off_widenings,
 )
 from ..common.policy.ratchet import Grants, Ratchet, initial, reach, violations
 from ..common.policy.schema import Policy
@@ -548,6 +552,12 @@ def _reseed(
         rows = _summary(given, candidate)
         if old is not None:
             _floors(old, head_policy(old), candidate)
+            # The planner isn't called, so the held set is compared here (M8 design A.4): each
+            # held pair the document drops is a widening, which --yes takes only with
+            # --accept-widening.
+            lost = dropped(head_policy(old), candidate)
+            rows += vault_off_rows(head_policy(old), lost)
+            wider += vault_off_widenings(lost)
             rows += _forgotten(old.ratchet, ratchet)
             said = f"replacing revision {old.revision}"
         else:

@@ -356,6 +356,8 @@ def report(
     }
     if policy.enable:  # what it serves beyond tools, so the CLI can say what isn't (J12)
         block["enable"] = list(policy.enable)
+    if policy.tools.vault_approval:  # M8 A.4: a fragment keeps the holds; none, as before
+        block["vault_approval"] = list(policy.tools.vault_approval)
     for member in ("prompts", "resources"):
         if member in policy.enable:
             block[member] = getattr(policy, member).model_dump()
@@ -583,6 +585,8 @@ def toolkit_report(
             "on_drift": policy.on_drift,
             "review": dict(policy.review),
             "declined": dict(policy.declined),
+            # M8 A.4: a fragment keeps the holds; none, as before.
+            **({"vault_approval": held} if (held := list(policy.tools.vault_approval)) else {}),
         },
         "blocked": evaluation.blocked,
         "marked": sorted(marked),

@@ -258,6 +258,9 @@ class Changes:
     repin: frozenset[str] = frozenset()
     declined: Mapping[str, str] | None = None
     kinds: Mapping[str, KindChanges] = field(default_factory=dict)
+    # M8 design A.4: the tools held in the vault (a managed review's choice, or None for the
+    # review's policy's own); those the change leaves included in approve stay in vault_approval.
+    held: frozenset[str] | None = None
 
 
 def declined_block(
@@ -473,6 +476,17 @@ def fragment(
     if "resource_template" in blocks:
         resources = ResourcesPolicy(templates=blocks["resource_template"], fixed=blocks["resource"])
     tools = Tools(include=include, allow=classes["allow"], approve=classes["approve"])
+    held = changes.held
+    if held is None:
+        held = frozenset(policy.get("vault_approval", ()))
+    vault = [name for name in classes["approve"] if name in held]
+    if vault:  # written only when it holds a name, so a pre-M8 fragment stays as it was (A.5)
+        tools = Tools(
+            include=include,
+            allow=classes["allow"],
+            approve=classes["approve"],
+            vault_approval=vault,
+        )
     era = review.get("era") if review.get("era") in ("modern", "legacy") else None
     op = SetServerReview(
         server, tools, pins, era=era, declined=declined, prompts=prompts, resources=resources

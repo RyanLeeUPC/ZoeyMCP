@@ -190,12 +190,21 @@ from ..common.policy.change import (
     PolicyChange,
     SetClientServers,
     SetConnectorLimits,
+    SetVaultApproval,
     apply,
     from_portal,
 )
 from ..common.policy.fields import URL_MAX
+from ..common.policy.held import held_pairs
+from ..common.policy.plan import (
+    VAULT_OFF,
+    WriteKind,
+    WritePlan,
+    carry_forward,
+    connector_pairs,
+    writes_through,
+)
 from ..common.policy.plan import Reason as PlanReason
-from ..common.policy.plan import WriteKind, WritePlan, carry_forward
 from ..common.policy.ratchet import DefKey
 from ..common.policy.reviewchange import AllowRefused, definition_lines, listed
 from ..common.policy.schema import OAuth2Credential, split_scope
@@ -247,7 +256,17 @@ from . import approvalsview, reviewview
 from . import drafts as drafts_
 from . import passkeys as passkey_file
 from . import routes as api
-from .actions import ALLOW_FORMS, Action, ActionRefusal, Actions, changed, parse_request
+from .actions import (
+    ALLOW_FORMS,
+    SAVE_FORMS,
+    VAULT_OFF_FORMS,
+    Action,
+    ActionRefusal,
+    Actions,
+    changed,
+    in_form,
+    parse_request,
+)
 from .admission import (
     Admitted,
     Callback,
@@ -350,6 +369,10 @@ ROLLBACK: Final[WriteKind] = "policy.rollback"
 OWN_OPS: Final[tuple[WriteKind, ...]] = ("client.servers", "connector.limits")
 GIVE_TITLE: Final = "the servers client {name} reaches"
 LIMITS_TITLE: Final = "the limits of connector {name}"
+# M8 design A.4 (Z20): a server page's Hold in the vault, a save, and Turn off vault approval,
+# its own kind; each change built from the data, one tool or one connector's closed set.
+HOLD_TITLE: Final = "hold {name} in the vault"
+VAULT_OFF_TITLE: Final = "vault_approval off for {name}"
 # A head that moved, in the words of the page the save came from (N.2, OPS-18): Save, Roll back,
 # or a connector's own button.
 MOVED_WORDS: Final[Mapping[str, str]] = MappingProxyType(
@@ -1523,7 +1546,7 @@ class PortalApp:
             # limits, through the managed policy's write path (G.6).
             **{
                 name: ActionKind(self._plan_write(name), self._run_write(name))
-                for name in (*MANAGED_KINDS, ROLLBACK, *OWN_OPS)
+                for name in (*MANAGED_KINDS, ROLLBACK, *OWN_OPS, VAULT_OFF)
             },
         }
 
@@ -2215,6 +2238,7 @@ class PortalApp:
                 self._allow_pins(policy, listed),
                 offered.get(listed.name),
                 managed=self.mode == "managed",
+                vault=_vault_row(policy, listed) if self.managed is not None else None,
             )
             for listed in listed_servers(policy, names)
         ]
@@ -2367,6 +2391,9 @@ class PortalApp:
             report = job.report.model_dump(mode="json", exclude_unset=True)
             approved = self._approved(job.server)
             read = {**_job_view(job, self.mode), **reviewview.rows(report, approved)}
+            listed_now = listed_server(self._policy(), job.server)
+            if self.managed is not None and listed_now is not None:  # Hold in the vault (A.4)
+                read |= _vault_row(self._policy(), listed_now)
             if job.work == "clear":  # the tools whose marks it cleared (M6 design J.4)
                 read["cleared_shown"] = [shown(name, NAME_LIMIT) for name in report["cleared"]]
             return Reply(read)
@@ -2576,6 +2603,10 @@ class PortalApp:
             return self._rollback(base, data["revision"])
         if kind in OWN_OPS:
             return self._own_op(kind, base, data)
+        if kind == VAULT_OFF or (kind == "policy.save" and "draft" not in data):
+            return self._held_op(kind, base, data)
+        if kind == "policy.save" and not in_form(dict(data), SAVE_FORMS):
+            return refusal("bad_body")
         if kind == "tool.allow":
             given = frozenset(data) - {"base"}
             if given not in ALLOW_FORMS:
@@ -2674,6 +2705,44 @@ class PortalApp:
         if same and base == self._managed().revision:
             return refusal("no_change")
         return _Save(kind, base, change, self._evidence(Facts()))
+
+    def _held_op(self, kind: WriteKind, base: int, data: Mapping[str, Any]) -> _Save | Refusal:
+        """**Hold in the vault** (a ``policy.save``) or **Turn off vault approval**
+        (``tool.vault_approval_off``) from a server's page (M8 design A.4): ``{base, server,
+        tool}`` for one tool, or ``{base, connector}`` for every approve tool of the connector's
+        closed set (A.2 row 4 holds a connector all or nothing); a mixed or partial form is
+        ``bad_body``. The change is built from the data, never a draft; one that changes
+        nothing on the head is ``no_change``, and the planner holds the rest (the kind is its
+        diff, Y7)."""
+        if not in_form(dict(data), VAULT_OFF_FORMS):
+            return refusal("bad_body")
+        policy = self._managed().policy
+        held = kind == "policy.save"
+        now = held_pairs(policy)
+        server: str | None = None
+        try:
+            if "connector" in data:
+                name = data["connector"]
+                if not isinstance(name, str):
+                    return refusal("bad_body")
+                pairs = connector_pairs(policy, name, held=not held)
+                title = f"connector {name}"
+            else:
+                server, tool = data["server"], data["tool"]
+                pairs = frozenset({(server, tool)})
+                title = f"{server}.{tool}"
+            ops = tuple(
+                SetVaultApproval(at, tool, held)
+                for at, tool in sorted(pairs)
+                if ((at, tool) in now) != held
+            )
+        except (TypeError, ValueError):  # a name the schema refuses
+            return refusal("bad_body")
+        if not ops and base == self._managed().revision:
+            return refusal("no_change")
+        words = HOLD_TITLE if held else VAULT_OFF_TITLE
+        change = PolicyChange(words.format(name=title), ops)
+        return _Save(kind, base, change, self._evidence(Facts()), None, server)
 
     def _unassigned(self, server: str) -> bool:
         """Whether the head gives ``server`` to no client (J14 step 5)."""
@@ -3810,13 +3879,15 @@ def _server_row(
     offered: Collection[str] | None = None,
     *,
     managed: bool = False,
+    vault: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A server of the running policy as a row (K.1): its state, the tools it serves and to
     which clients, its included ``approve`` tools (each with **Allow without asking**, the pin
     it allows and whether a review the vault holds shows that definition, ``pins``; M6 design
     J3, J.4), and what to do next. A remote row has ``offered_not_served``, what the upstream
     ``offered`` (the gateway's latest status; None with none) that its ``enable`` doesn't
-    serve, and its next steps end with J12's way to serve it in the ``managed`` mode or not."""
+    serve, and its next steps end with J12's way to serve it in the ``managed`` mode or not.
+    A managed row also has ``vault``'s keys (:func:`_vault_row`, M8 design A.4)."""
     approve = [name for name in listed.tools.approve if name in listed.tools.include]
     pins = pins or {}
     not_served = offered_not_served(listed, offered)
@@ -3841,7 +3912,22 @@ def _server_row(
     }
     if listed.kind == "remote":
         row["offered_not_served"] = list(not_served)
+    if vault is not None:
+        row.update(vault)
     return row
+
+
+def _vault_row(policy: Policy, listed: Listed) -> dict[str, Any]:
+    """What a managed server row's **Hold in the vault** and **Turn off vault approval** read
+    (M8 design A.4, G-5): the approve tools the vault holds, the connectors a toolkit writes
+    through (whose writers each button holds or turns off together, A.2 row 4), and whether an
+    out-of-band approver is set, without which both are shown disabled."""
+    approvers = policy.approvers
+    return {
+        "vault_approval": list(listed.tools.vault_approval),
+        "connectors": list(writes_through(policy, listed.name)),
+        "approver": approvers is not None and approvers.any_surface,
+    }
 
 
 def connectors_view(policy: Policy) -> list[dict[str, Any]]:

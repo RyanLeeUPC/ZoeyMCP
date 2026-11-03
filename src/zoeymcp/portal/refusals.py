@@ -591,6 +591,23 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
             "edit, zoeymcp policy import), where all of it is shown.",
         ),
         "no_change": Entry(400, "Nothing would change."),
+        # M8 design A.4, M.2: a write that would stop the vault holding a tool. Only the kind
+        # tool.vault_approval_off turns it off from the portal; a resume is a start's refusal.
+        "vault_approval_off_needs_its_own_step": Entry(
+            409,
+            "The vault holds {detail}: turn that off on the server's page (one passkey per tool, "
+            "or per held connector), then save again.",
+        ),
+        "rollback_drops_vault_approval": Entry(
+            409,
+            "Rolling back to {detail}. Turn each off first on the server's page (one passkey per "
+            "tool, or per held connector), then roll back.",
+        ),
+        "resume_drops_vault_approval": Entry(
+            409,
+            "The policy given would stop the vault holding {detail}: start with them held, then "
+            "turn each off, or import with --accept-widening.",
+        ),
         # M6's N.2: a managed write the policy store didn't make (vault/policystore.py).
         "policy_write_failed": Entry(500, "The revision couldn't be written; nothing changed."),
         "revision_out_of_range": Entry(400, "A revision can't go above 9,999,999,999."),

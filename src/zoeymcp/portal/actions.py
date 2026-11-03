@@ -82,8 +82,15 @@ KINDS: Final[dict[str, Kind]] = {
         # M6 G.3, G.4, M.3: a managed review save, held as a draft by the review diff route, is
         # prepared by its ID and the revision it was planned on; tool.repin is one whose diff
         # only re-pins. tool.allow is one tool moved from approve to allow: from a server's page
-        # by the tool and the pin the operator was shown, or a draft whose only change it is.
-        Kind("policy.save", _DEFAULT_CAP, frozenset({"draft", "base"})),
+        # by the tool and the pin the operator was shown, or a draft whose only change it is. M8
+        # A.4: a server page's Hold in the vault is a save of one tool, or of one connector's
+        # writers (SAVE_FORMS).
+        Kind(
+            "policy.save",
+            _DEFAULT_CAP,
+            frozenset({"base"}),
+            frozenset({"draft", "server", "tool", "connector"}),
+        ),
         Kind("tool.repin", _DEFAULT_CAP, frozenset({"draft", "base"})),
         Kind(
             "tool.allow",
@@ -106,10 +113,28 @@ KINDS: Final[dict[str, Kind]] = {
         # M8 H.3 (Z16): an approval from the queue, of the hold and the text digest the operator
         # was shown; decision is only ever "approve" (deny has its own route, with no step-up).
         Kind("approval.decide", _DEFAULT_CAP, frozenset({"approval", "text_sha256", "decision"})),
+        # M8 A.4 (Z20): vault_approval off, its own step-up: one tool, or every writer of one
+        # held connector (VAULT_OFF_FORMS).
+        Kind(
+            "tool.vault_approval_off",
+            _DEFAULT_CAP,
+            frozenset({"base"}),
+            frozenset({"server", "tool", "connector"}),
+        ),
     )
 }
 # tool.allow's two forms of data (M6 J.4, M.3): its optional keys come all from one.
 ALLOW_FORMS: Final = (frozenset({"server", "kind", "name", "pin"}), frozenset({"draft"}))
+# tool.vault_approval_off's two forms (M8 A.4): one tool, or one held connector's writers; and
+# policy.save's: a draft, or a server page's Hold in the vault in either form.
+VAULT_OFF_FORMS: Final = (frozenset({"server", "tool"}), frozenset({"connector"}))
+SAVE_FORMS: Final = (frozenset({"draft"}), *VAULT_OFF_FORMS)
+
+
+def in_form(data: dict[str, Any], forms: tuple[frozenset[str], ...]) -> bool:
+    """Whether ``data``'s keys beyond ``base`` are exactly one of ``forms``: a kind whose
+    optional keys come from one form refuses a mixed or partial one ``bad_body`` (M.3)."""
+    return frozenset(data) - {"base"} in forms
 
 
 @dataclass(frozen=True)

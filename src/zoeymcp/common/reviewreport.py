@@ -224,6 +224,9 @@ class ReviewedPolicy(_Model):
     enable: Annotated[list[Capability], Field(max_length=len(get_args(Capability)))] | None = None
     prompts: PromptsPolicy = PromptsPolicy()
     resources: ResourcesPolicy = ResourcesPolicy()
+    # M8 design A.4: the tools held in the vault, when it holds any, so a review's fragment keeps
+    # them (none from a server that holds nothing, as before).
+    vault_approval: Names = []
 
 
 def _policy_of(policy: ReviewedPolicy, kind: DefinitionKind) -> tuple[list[str], dict[str, str]]:

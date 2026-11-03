@@ -119,6 +119,9 @@ NO_PIN: Final = "the server gave no definition the vault can pin"
 # detail names.
 LISTS: Final = ("include", "allow", "approve")
 OPTIONAL_LISTS: Final = ("repin", "decline")
+# M8 design A.4: a managed review's Hold in the vault, the approve tools it holds; with none
+# sent, the policy's own stay held.
+HELD: Final = "held"
 # A kind beyond tools takes these lists, each optional (L.7).
 KIND_LISTS: Final = ("include", "repin", "decline")
 # The heading over the first row of each kind beyond tools (L.7).
@@ -358,6 +361,7 @@ class Choices:
     decline: tuple[str, ...] = ()
     decline_rest: bool = False
     kinds: Mapping[str, KindChoice] = field(default_factory=dict)
+    held: frozenset[str] | None = None  # M8 A.4: None keeps the policy's vault_approval
 
     def classified(self, name: str) -> Classification:
         return "allow" if name in self.allow else "approve"
@@ -421,6 +425,12 @@ def choices(body: Mapping[str, Any], most: int) -> Choices | Refusal:
     rest = body.get("decline_rest", False)
     if not isinstance(rest, bool):
         return _bad_body("decline_rest is true or false")
+    held = None
+    if HELD in body:
+        names = _names_in(body[HELD], HELD, "tool", most)
+        if isinstance(names, Refusal):
+            return names
+        held = frozenset(names)
     return Choices(
         tuple(lists["include"]),
         frozenset(lists["allow"]),
@@ -431,6 +441,7 @@ def choices(body: Mapping[str, Any], most: int) -> Choices | Refusal:
         tuple(lists["decline"]),
         rest,
         kinds,
+        held,
     )
 
 
@@ -620,6 +631,7 @@ def diff(
     if isinstance(made, Refusal):
         return made
     name = report["server"]
+    made = _held(made, chosen, server)
     try:
         blocks = kind_blocks(report)
         heading = second_title(name, declined=made.declined is not None, kinds=blocks)
@@ -655,9 +667,19 @@ def change_of(
     if isinstance(made, Refusal):
         return made
     try:
-        return fragment(report, made)
+        return fragment(report, _held(made, chosen, server))
     except ValueError as exc:  # ChangeRefused is one
         return _invalid(str(exc))
+
+
+def _held(made: Changes, chosen: Choices, server: Listed | None) -> Changes:
+    """``made`` with the tools held in the vault (M8 design A.4): the choice's when it names
+    them, else the policy's own, so a review keeps every hold it doesn't untick; a hold the
+    change drops is the planner's to refuse (``vault_approval_off_needs_its_own_step``)."""
+    held = chosen.held
+    if held is None:
+        held = frozenset() if server is None else frozenset(server.tools.vault_approval)
+    return replace(made, held=held)
 
 
 def _found(findings: list[Finding]) -> list[dict[str, str]]:

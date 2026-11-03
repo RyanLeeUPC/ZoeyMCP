@@ -195,6 +195,7 @@ def test_the_constants() -> None:
         "policy.resume",
         "policy.reseed",
         "policy.acknowledge",
+        "tool.vault_approval_off",
     } == KINDS
     assert {"socket", "offline", "source"} == VIAS
     assert policyseal.SEED_AUTHORS == ({"by": "seed"}, {"by": "host", "via": "offline"})
@@ -617,6 +618,17 @@ def test_a_header_with_another_field_is_refused() -> None:
 def test_every_header_form_round_trips(changes: dict[str, Any]) -> None:
     data = seal_revision(header(**changes), body(), keys=KEYS, nonce=NONCE)
     assert unseal_revision(data, KEYS, None, deployment=DEPLOYMENT).header == header(**changes)
+
+
+def test_vault_approval_off_is_a_save() -> None:
+    """M8 design A.4: the portal's own kind is one of a save's (``policystore._origin`` writes a
+    non-``policy.`` kind with origin ``save``), so the first revision it writes seals and unseals;
+    no other origin names it (``BAD_HEADERS`` refuses it under each)."""
+    assert "tool.vault_approval_off" in ORIGIN_KINDS["save"]
+    assert [o for o in sorted(ORIGINS) if "tool.vault_approval_off" in ORIGIN_KINDS[o]] == ["save"]
+    made = header(**{**form("save"), "kind": "tool.vault_approval_off"})
+    data = seal_revision(made, body(), keys=KEYS, nonce=NONCE)
+    assert unseal_revision(data, KEYS, None, deployment=DEPLOYMENT).header == made
 
 
 def test_every_kind_belongs_to_one_origin() -> None:

@@ -32,6 +32,7 @@ from zoeymcp.common.policy.plan import (
     BindingState,
     PlanInput,
     PlanRefused,
+    Surface,
     WriteKind,
     WritePlan,
     carry_forward,
@@ -45,6 +46,7 @@ from zoeymcp.common.policy.ratchet import RATCHET_MAX, Grants, Violation, caller
 from zoeymcp.common.policy.restart import Started
 from zoeymcp.common.policy.reviewchange import Lines, definition_lines
 from zoeymcp.common.policy.schema import Policy, hash_token
+from zoeymcp.vault.managed import widenings
 
 PIN_READ = "sha256:" + "a" * 64
 PIN_WRITE = "sha256:" + "b" * 64
@@ -1892,3 +1894,303 @@ def test_a_server_the_policy_lacks_has_no_tools_pin_or_pinning() -> None:
     assert planner._pinning_off(bare, "kit") is False
     assert planner._pinning_off(HEAD, "absent") is False
     assert planner._pinning_off(HEAD, "kit") is True
+
+
+# --- M8: the held set (M8 design A.4, Z20, M6 Y7; step 18) ---------------------------------------
+#
+# HELD holds notes.write in the vault, with the portal's queue as its approver; MAILING adds two
+# toolkits writing through the mail connector, one of them through post too, every approve tool
+# of each held (A.2 row 4), so the mail connector's closed set is both toolkits and both
+# connectors.
+
+
+def held(data: dict[str, Any]) -> None:
+    data["approvers"] = {"portal": {}}
+    notes(data)["tools"]["vault_approval"] = ["write"]
+
+
+def _connector_route(name: str) -> dict[str, Any]:
+    return {
+        "name": f"{name}-send",
+        "prefix": f"/{name}",
+        "connector": name,
+        "callers": ["gateway"],
+        "rules": [{"methods": ["POST"], "paths": ["/send"]}],
+    }
+
+
+def _slot(route: str) -> dict[str, Any]:
+    return {"route": route, "rules": [{"methods": ["POST"], "paths": ["/send"], "approved": True}]}
+
+
+def mailing(data: dict[str, Any]) -> None:
+    data["connectors"]["post"] = {**data["connectors"]["mail"], "host": "smtp.post.example"}
+    data["routes"] += [_connector_route("mail"), _connector_route("post")]
+    servers = data["gateway"]["servers"]
+    servers["kit"]["slots"] = {"mail": _slot("mail-send")}
+    servers["kit"]["tools"]["vault_approval"] = ["send"]
+    servers["kit2"] = {
+        "kind": "toolkit",
+        "module": "kits.post",
+        "pinning": "off",
+        "tools": {
+            "include": ["post", "reply"],
+            "approve": ["post", "reply"],
+            "vault_approval": ["post", "reply"],
+        },
+        "slots": {"mail": _slot("mail-send"), "post": _slot("post-send")},
+    }
+
+
+def unheld(server: str, *names: str) -> Edit:
+    """``names`` out of ``server``'s ``vault_approval``."""
+
+    def edit(data: dict[str, Any]) -> None:
+        tools = data["gateway"]["servers"][server]["tools"]
+        tools["vault_approval"] = [t for t in tools["vault_approval"] if t not in names]
+
+    return edit
+
+
+def parallel(data: dict[str, Any]) -> None:
+    """A second route and server to notes' upstream with its credential, listing write unheld
+    (FM-44, T-2)."""
+    data["routes"].append({**data["routes"][0], "name": "notes-two", "prefix": "/notes-two"})
+    data["gateway"]["servers"]["notes2"] = {
+        "kind": "remote",
+        "route": "notes-two",
+        "tools": {"include": ["write"], "approve": ["write"]},
+        "review": {"write": PIN_WRITE},
+    }
+
+
+HELD = make(held)
+MAILING = make(held, mailing)
+OFF_ROW = (
+    "gateway.servers.notes.tools.vault_approval",
+    planner.VAULT_OFF_TEXT.format(name="write"),
+)
+GONE = setting("gateway", "servers", "notes", value={"kind": "remote", "route": "files"})
+
+
+def on(head: Policy, candidate: Policy, **fields: Any) -> WritePlan | PlanRefused:
+    """``candidate`` planned on ``head`` (``planned``'s defaults otherwise)."""
+    return planned(candidate, head=head, ratchet=initial(head), **fields)
+
+
+def test_the_held_set_drops_by_any_cause() -> None:
+    """A.4, Z20: a held pair the candidate doesn't hold, whatever the cause, or one it reaches
+    unheld through another route with the same credential (T-2), is dropped; holding more drops
+    nothing, and nothing is dropped from a head that holds nothing."""
+    assert planner.dropped(HELD, HELD) == frozenset()
+    pair = frozenset({("notes", "write")})
+    assert planner.dropped(HELD, make(held, unheld("notes", "write"))) == pair
+    assert planner.dropped(HELD, make(held, drop("write"))) == pair
+    assert planner.dropped(HELD, make(held, GONE)) == pair
+    assert planner.dropped(HELD, make(held, parallel)) == pair
+    more = setting(
+        "gateway", "servers", "notes", "tools", "vault_approval", value=["write", "list"]
+    )
+    assert planner.dropped(HELD, make(held, more)) == frozenset()
+    assert planner.dropped(HEAD, make(held, unheld("notes", "write"))) == frozenset()
+
+
+def test_a_connectors_closed_set() -> None:
+    """A.4 (T-8): the mail connector's writers, the post connector kit2 also writes through, and
+    its writers; from post, the same set. Holding it anew covers every connector route, held or
+    not; a connector nobody holds has an empty set."""
+    servers, connectors = planner.closed_set(MAILING, "mail")
+    assert (servers, connectors) == (frozenset({"kit", "kit2"}), ("mail", "post"))
+    assert planner.closed_set(MAILING, "post") == (servers, connectors)
+    pairs = {("kit", "send"), ("kit2", "post"), ("kit2", "reply")}
+    assert planner.connector_pairs(MAILING, "mail") == pairs
+    bare = make(mailing, unheld("kit", "send"), unheld("kit2", "post", "reply"))
+    assert planner.closed_set(bare, "mail") == (frozenset(), ())
+    assert planner.connector_pairs(bare, "mail", held=False) == pairs
+    assert planner.writes_through(MAILING, "kit2") == ("mail", "post")
+    assert planner.writes_through(MAILING, "notes") == ()
+
+
+def kind_on(head: Policy, candidate: Policy) -> WriteKind:
+    changes = structured(head, normalize(candidate))
+    lost = planner.dropped(head, candidate)
+    return required_kind(changes, head, initial(head), lost=lost)
+
+
+def test_vault_approval_off_is_its_diff() -> None:
+    """M6 Y7 for A.4: tool.vault_approval_off is a diff of vault_approval removals only, exactly
+    the pairs the write drops, one pair or one held connector's closed set; two unrelated pairs,
+    a partial writer set, or the connector form with any other change is a save."""
+    off = "tool.vault_approval_off"
+    assert kind_on(HELD, make(held, unheld("notes", "write"))) == off
+    assert kind_on(HELD, make(held, drop("write"))) == "policy.save"
+    two = setting("gateway", "servers", "notes", "tools", "vault_approval", value=["write", "list"])
+    both = make(held, two)
+    assert kind_on(both, make(held)) == off
+    assert kind_on(both, make(held, unheld("notes", "write", "list"))) == "policy.save"
+    closed = make(held, mailing, unheld("kit", "send"), unheld("kit2", "post", "reply"))
+    assert kind_on(MAILING, closed) == off
+    assert kind_on(MAILING, make(held, mailing, unheld("kit2", "post", "reply"))) == "policy.save"
+    assert kind_on(MAILING, make(held, mailing, unheld("kit", "send"))) == "policy.save"
+    more = make(
+        held,
+        mailing,
+        unheld("kit", "send"),
+        unheld("kit2", "post", "reply"),
+        repin("read", PIN_NEW),
+    )
+    assert kind_on(MAILING, more) == "policy.save"
+    # With nothing dropped, the kind isn't this one.
+    assert kind_on(HEAD, HEAD) == "policy.save"
+
+
+@pytest.mark.parametrize(
+    ("edits", "kind"),
+    [
+        ((unheld("notes", "write"),), "policy.save"),  # a review save that unticks
+        ((drop("write"),), "policy.save"),  # dropped from include
+        ((GONE,), "policy.save"),  # its server removed (another in its place)
+        ((parallel,), "policy.save"),  # FM-44
+        ((move("write"), unheld("notes", "write")), "tool.allow"),  # a move to allow
+        ((unheld("notes", "write"),), "tool.repin"),
+    ],
+    ids=["untick", "include", "server", "parallel", "allow", "repin"],
+)
+def test_a_portal_write_that_drops_a_held_pair_needs_its_own_step(
+    edits: tuple[Edit, ...], kind: WriteKind
+) -> None:
+    """A.4, J11, FM-20, FM-44: refused before the kind (so before the passkey), naming the tool:
+    only tool.vault_approval_off takes a pair off from the portal."""
+    found = on(HELD, make(held, *edits), kind=kind)
+    assert found == PlanRefused(
+        "vault_approval_off_needs_its_own_step", "notes.write", ("notes/tool/write",)
+    )
+
+
+def test_a_writer_of_a_held_connector_is_named_with_it() -> None:
+    """M.2: a writer's tool is named with its connector, so the operator knows its step is the
+    connector's."""
+    found = on(MAILING, make(held, mailing, drop("write"), unheld("kit", "send")))
+    assert isinstance(found, PlanRefused)
+    assert found.reason == "vault_approval_off_needs_its_own_step"
+    assert found.detail == "kit.send (connector mail), notes.write"
+    named = planner.held_names(MAILING, frozenset({("kit2", "post")}))
+    assert named == "kit2.post (connector mail, post)"
+
+
+@pytest.mark.parametrize("surface", ["portal", "socket", "offline"])
+def test_a_rollback_that_drops_a_held_pair_is_refused(surface: Surface) -> None:
+    """A.4's rollback rule, portal and host (Q42 (a)): to before the tool was held, and to before
+    it was included, each names the tools; once the tool is off, the same rollback plans."""
+    host = surface != "portal"
+    for target in (HEAD, make(drop("write"))):
+        carried = carry_forward(HELD, target, host=host)
+        found = on(
+            HELD,
+            carried,
+            kind="policy.rollback",
+            surface=surface,
+            target=target,
+            target_revision=21,
+        )
+        assert found == PlanRefused(
+            "rollback_drops_vault_approval",
+            "revision 21 would stop the vault holding notes.write",
+            ("notes/tool/write",),
+        )
+    off = make(held, unheld("notes", "write"))
+    target = make(setting("approvers", value={"portal": {}}), drop("write"))
+    carried = carry_forward(off, target, host=host)
+    rolled = on(off, carried, kind="policy.rollback", surface=surface, target=target)
+    assert isinstance(rolled, WritePlan)
+
+
+def test_a_resume_that_drops_a_held_pair_is_refused() -> None:
+    """A.4's host bullet (3): a resume has no acceptance flag, so it refuses the start."""
+    found = on(HELD, make(held, unheld("notes", "write")), kind="policy.resume", surface="host")
+    assert found == PlanRefused("resume_drops_vault_approval", "notes.write", ("notes/tool/write",))
+    assert isinstance(on(HELD, HELD, kind="policy.resume", surface="host"), WritePlan)
+
+
+@pytest.mark.parametrize(
+    ("kind", "surface"),
+    [("policy.import", "socket"), ("policy.import", "offline"), ("policy.reseed", "offline")],
+    ids=["socket", "offline", "reseed"],
+)
+def test_a_host_import_lists_each_dropped_pair_first(kind: WriteKind, surface: Surface) -> None:
+    """A.4 (1), (2): an import or a planned reseed may drop a held pair, listed first among the
+    weakenings with its sentence and as a widening (so --yes needs --accept-widening), its own
+    removal no other row; a drop by reach is listed the same."""
+    found = on(HELD, make(held, unheld("notes", "write")), kind=kind, surface=surface)
+    assert isinstance(found, WritePlan)
+    assert found.dropped == (("notes", "write"),)
+    assert found.rows[1] == OFF_ROW
+    assert [label for label, _ in found.rows].count(OFF_ROW[0]) == 1
+    assert widenings(found) == ["notes.write: vault_approval off"]
+    reach = on(HELD, make(held, parallel), kind=kind, surface=surface)
+    assert isinstance(reach, WritePlan)
+    assert reach.rows[1] == OFF_ROW
+    assert widenings(reach)[0] == "notes.write: vault_approval off"
+
+
+def test_vault_approval_off_from_the_portal() -> None:
+    """A.4 (Z20): one pair, its one sentence first among the weakenings; a connector's closed
+    set, one sentence per tool and the connectors it covers; permitted only as removals of
+    vault_approval (rule 2); the same input plans the same (a confirm compares equal)."""
+    off = on(HELD, make(held, unheld("notes", "write")), kind="tool.vault_approval_off")
+    assert isinstance(off, WritePlan)
+    assert off.kind == "tool.vault_approval_off"
+    assert off.rows[:2] == (("Revision", "18, from 17"), OFF_ROW)
+    assert off == on(HELD, make(held, unheld("notes", "write")), kind="tool.vault_approval_off")
+    closed = make(held, mailing, unheld("kit", "send"), unheld("kit2", "post", "reply"))
+    found = on(MAILING, closed, kind="tool.vault_approval_off")
+    assert isinstance(found, WritePlan)
+    text = planner.VAULT_OFF_TEXT.format
+    covers = planner.VAULT_OFF_CONNECTOR_TEXT.format(servers="kit, kit2")
+    assert found.rows[1:6] == (
+        ("gateway.servers.kit.tools.vault_approval", text(name="send")),
+        ("gateway.servers.kit2.tools.vault_approval", text(name="post")),
+        ("gateway.servers.kit2.tools.vault_approval", text(name="reply")),
+        ("connector mail", covers),
+        ("connector post", covers),
+    )
+    # Any other set: the kind's own refusal names the tools, as a save's would.
+    partial = make(held, mailing, unheld("kit", "send"))
+    found = on(MAILING, partial, kind="tool.vault_approval_off")
+    assert isinstance(found, PlanRefused)
+    assert found.reason == "vault_approval_off_needs_its_own_step"
+    change = structured(HELD, normalize(make(held, unheld("notes", "write"))))[0]
+    assert planner._permits("tool.vault_approval_off", change)
+    assert not planner._permits("policy.save", change)
+    moved = structured(HEAD, make(move("write")))[0]
+    assert not planner._permits("tool.vault_approval_off", moved)
+
+
+def test_holding_a_tool_is_a_narrowing_with_its_turn_on_lines() -> None:
+    """A.4's on (G-5, J2): a save that holds a tool is a narrowing any save makes; its plan says
+    the turn-on lines the vault side gives in place of the change's row, or the row itself with
+    none."""
+    head = make(setting("approvers", value={"portal": {}}))
+    lines = ("notes.write: vault_approval on.", "  ci (neither): refused, as before.")
+    found = on(head, HELD, turn_on=lambda policy, server, tool: lines)
+    assert isinstance(found, WritePlan)
+    assert found.dropped == ()
+    assert [row for row in found.rows if row[0] == "notes.write"] == [
+        ("notes.write", line) for line in lines
+    ]
+    bare = on(head, HELD)
+    assert isinstance(bare, WritePlan)
+    assert ("gateway.servers.notes.tools.vault_approval", "write added") in bare.rows
+
+
+def test_a_rollback_with_no_target_revision_names_the_target() -> None:
+    """A host rollback whose target has no revision of its own (an import's document read as
+    one) says "the target"; a seed has no head, so nothing is dropped from one."""
+    found = on(HELD, carry_forward(HELD, HEAD, host=True), kind="policy.rollback", surface="socket")
+    assert found == PlanRefused(
+        "rollback_drops_vault_approval",
+        "the target would stop the vault holding notes.write",
+        ("notes/tool/write",),
+    )
+    empty = Policy.model_validate({"version": 1, "mode": "managed"})
+    assert planner.dropped(empty, HELD) == frozenset()

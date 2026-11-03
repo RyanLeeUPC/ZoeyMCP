@@ -335,12 +335,12 @@
     if (held === null) {
       return;
     }
-    const chosen = picked(held);
+    const c = picked(held), vault = window.zoeyApprovals?.held(held); // M8 A.4: none, declarative
     let draft;
     try {
       draft = await api("POST", fill("/api/review/jobs/{job}/diff", { job: held.job }), {
-        include: chosen.include, allow: chosen.allow, approve: chosen.approve, repin: chosen.repin,
-        decline: chosen.decline, decline_rest: chosen.decline_rest, kinds: chosen.kinds });
+        include: c.include, allow: c.allow, approve: c.approve, repin: c.repin, held: vault,
+        decline: c.decline, decline_rest: c.decline_rest, kinds: c.kinds });
     } catch (error) {
       return afterFailure(error);
     }

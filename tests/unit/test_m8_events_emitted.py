@@ -90,6 +90,9 @@ EVENTS = {
     # couldn't be asked (its error type only).
     "approvals_detached": "gateway",
     "approval_detach_failed": "gateway",
+    # Step 18: a write that turns vault_approval off (A.4), per held pair it drops (server, tool
+    # and revision only), at warning.
+    "tool_vault_approval_off": "vault",
 }
 
 

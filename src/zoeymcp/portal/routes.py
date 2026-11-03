@@ -222,7 +222,7 @@ REVIEW_DIFF: Final = Route(
     FULL,
     BODY_CHOICES,
     frozenset({"include", "allow", "approve"}),
-    frozenset({"indent", "repin", "decline", "decline_rest", "kinds"}),
+    frozenset({"indent", "repin", "decline", "decline_rest", "kinds", "held"}),
 )
 # M6 step 7: Home's attention list (M6 M.2, M.7), from health's gateway section.
 ATTENTION: Final = Route("GET", "/api/attention", FULL)

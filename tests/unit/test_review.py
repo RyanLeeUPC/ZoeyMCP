@@ -19,6 +19,7 @@ from zoeymcp.cli import review as view
 from zoeymcp.cli.main import main
 from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.policy.view import ViewRemoteServer
+from zoeymcp.common.reviewreport import read
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.gateway import pins
 from zoeymcp.gateway import review as gateway_review
@@ -1116,3 +1117,24 @@ def test_no_line_without_an_offer() -> None:
     assert not any("offers" in line for line in view.render(answer, view.Choices()))
     toolkit = {"kind": "toolkit", "server": "kit", "offered": OFFERS}
     assert view.offered_line(toolkit) is None
+
+
+def test_a_held_servers_report_carries_its_holds() -> None:
+    """M8 design A.4 (step 18): the report's policy block names the tools the vault holds, so a
+    review's fragment, which writes the server's tools whole, keeps them; a server that holds
+    none has no such key, as before, and the vault reads either back."""
+    plain = policy(["a"], {"a": pin("a")})
+    held = ViewRemoteServer.model_validate(
+        {
+            **plain.model_dump(mode="json"),
+            "tools": {"include": ["a"], "approve": ["a"], "vault_approval": ["a"]},
+        }
+    )
+    answer = reviewed([tool("a")], held)
+    assert answer["policy"]["vault_approval"] == ["a"]
+    assert read(answer, LIMITS).policy.vault_approval == ["a"]
+    before = reviewed([tool("a")], plain)
+    assert "vault_approval" not in before["policy"]
+    found = read(before, LIMITS)
+    assert found.policy.vault_approval == []
+    assert "vault_approval" not in found.policy.model_fields_set

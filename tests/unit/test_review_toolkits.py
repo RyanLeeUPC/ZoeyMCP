@@ -142,3 +142,24 @@ def test_a_tool_the_policy_allows_against_the_code(
         "consequential in the toolkit's code, so it can't be in allow"
     }
     assert answer["clean"] is False
+
+
+def test_a_held_toolkits_report_and_snippet_keep_its_holds(
+    tmp_path: Path, example_raw: dict[str, Any]
+) -> None:
+    """M8 design A.4 (step 18): a toolkit whose send the vault holds says so in its report, and
+    the CLI's snippet, which writes the server's tools whole, keeps the hold; one that holds
+    nothing reports and writes no such key, as before."""
+    raw = copy.deepcopy(example_raw)
+    raw["approvers"] = {"portal": {}}
+    raw["gateway"]["servers"]["mail"]["tools"]["vault_approval"] = ["send_note"]
+    answer = reviewed(tmp_path, raw)
+    assert answer["policy"]["vault_approval"] == ["send_note"]
+    snippet = view.snippet(answer, view.Choices())
+    assert errors(pasted(raw, snippet)) == []
+    [line] = [line for line in snippet if "vault_approval" in line]
+    assert "send_note" in line
+    (tmp_path / "plain").mkdir(mode=0o700)
+    plain = reviewed(tmp_path / "plain", example_raw)
+    assert "vault_approval" not in plain["policy"]
+    assert not [line for line in view.snippet(plain, view.Choices()) if "vault_approval" in line]

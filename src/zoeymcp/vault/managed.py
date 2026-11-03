@@ -76,13 +76,14 @@ from ..common.policy.plan import (
     normalize,
     normalized_digest,
     plan,
+    vault_off_widenings,
 )
 from ..common.policy.ratchet import DefKey, Grants, Ratchet, violations
 from ..common.policy.restart import Effect
 from ..common.policy.reviewchange import Lines
 from ..common.policy.schema import Policy, ToolkitServer
 from ..common.suggest import Suggestion
-from ..portal import policydiffview
+from ..portal import approvalsview, policydiffview
 from ..portal.policyview import saved
 from ..portal.refusals import CATALOGUE, Refusal, refusal
 from . import gatewaykeys, health, logs
@@ -322,15 +323,22 @@ def lockout_rows(
 
 
 def widenings(planned: WritePlan) -> list[str]:
-    """A plan's widening rows by path (G.7 row 2, Q41): each move to allow, and each change the
-    planner's direction calls wider (a new client, caller or origin among them)."""
+    """A plan's widening rows by path (G.7 row 2, Q41): each held pair it drops, whatever the
+    cause (M8 design A.4), each move to allow, and each change the planner's direction calls
+    wider (a new client, caller or origin among them; a dropped pair's own removal is its
+    row)."""
+    lost = frozenset(planned.dropped)
+    off = vault_off_widenings(lost)
     moved = [f"{server}.{name}" for server, _, name in planned.moves]
     wider = [
         ".".join(str(part) for part in change.path)
         for change in planned.changes
         if direction(change, planned.policy) == "wider"
+        and not (
+            change.field == "vault_approval" and (str(change.path[2]), str(change.old)) in lost
+        )
     ]
-    return moved + [path for path in wider if path not in moved]
+    return off + moved + [path for path in wider if path not in moved]
 
 
 def widens(planned: WritePlan) -> bool:
@@ -398,11 +406,26 @@ def plan_on(
             target=evidence.target,
             target_revision=evidence.target_revision,
             removed_in=store.removed_lookup(candidate.policy),
+            turn_on=turn_on,
         )
     )
     if isinstance(planned, PlanRefused):
         return WriteRefused(planned.reason, planned.detail, planned.subjects, planned.next)
     return planned
+
+
+def turn_on(policy: Policy, server: str, tool: str) -> tuple[str, ...]:
+    """The turn-on lines of holding ``tool`` of ``server`` (M8 design A.4, J2), with the server
+    and the clients read here, on the vault side (portal code names no part of the gateway
+    block)."""
+    gateway = policy.gateway
+    if gateway is None:
+        return ()
+    served = gateway.servers.get(server)
+    lines = approvalsview.turn_on_lines(
+        policy, server, tool, served=served, clients=gateway.clients
+    )
+    return tuple(lines)
 
 
 def lowered(state: gatewaykeys.State | None, planned: WritePlan) -> WriteRefused | None:
@@ -995,8 +1018,13 @@ def log_saved(
 
 def _log_tools(planned: WritePlan, revision: int) -> None:
     """``tool_allowed`` per move to allow and, with ``kept``, per kept allow; ``tool_repinned``
-    per re-pin, whatever the write's kind (G.6 step 9, N.3, Q27). The definition's kind is
-    ``def_kind``: ``kind`` is the logger's own argument."""
+    per re-pin, whatever the write's kind (G.6 step 9, N.3, Q27); ``tool_vault_approval_off``
+    (warning) per held pair the write drops, a host import's included (M8 design A.4). The
+    definition's kind is ``def_kind``: ``kind`` is the logger's own argument."""
+    for server, name in planned.dropped:
+        logs.event(
+            "tool_vault_approval_off", level="warning", server=server, name=name, revision=revision
+        )
     for server, kind, name in planned.moves:
         logs.event("tool_allowed", server=server, def_kind=kind, name=name, revision=revision)
     for server, kind, name in planned.kept_allow:

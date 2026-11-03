@@ -9,7 +9,12 @@
 // for the count every 10 s while signed in, on routes that don't move the session's idle clock
 // (MISS-8); a countdown is the page's own, from the absolute deadline the vault sends. It uses
 // app.js's API, step-up and guard() (window.zoeyPortal), and app.js calls its Home hook
-// (window.zoeyApprovals) as it draws Home.
+// (window.zoeyApprovals) as it draws Home. In managed mode (M8 design A.4, G-5) review.js calls
+// its hooks for Hold in the vault: on a server row's approve tools, a policy.save the vault
+// plans as a narrowing, and Turn off vault approval, tool.vault_approval_off, one passkey for one
+// tool, or for every writer of a connector a toolkit writes through (A.2 row 4); and a box on each
+// tool of a review, which drift.js's Save sends as held. With no out-of-band approver the hold
+// controls are disabled, with the line that says why.
 "use strict";
 
 (function () {
@@ -25,6 +30,12 @@
   const GONE = "That approval no longer waits: Decided recently says how it went.";
   const APPROVED = "Approved: the vault runs that one call now, exactly as shown.";
   const DENIED = "Denied: nothing was sent.";
+  const NO_APPROVER = "Set up an approver first (Telegram or the Approvals queue): a host step, " +
+    "operations.md \u00a736.2";
+  const HOLD = "Hold in the vault";
+  const HOLD_OFF = "Turn off vault approval";
+  const HELD_SAVED = "Saved: the vault holds those calls now and asks you on your approvers.";
+  const OFF_SAVED = "Saved: the gateway asks for those calls again; any waiting were withdrawn.";
 
   // The hold opened: its ID and the digest of the text shown, which a decision is bound to.
   let open = null;
@@ -211,11 +222,85 @@
     quietly(badge);
   }
 
+  // Hold in the vault, or Turn off vault approval, on a managed server row (A.4): per approve
+  // tool, or per connector a toolkit writes through; holding is disabled with no approver.
+  function servers(list, rows) {
+    rows.forEach((listed, index) => {
+      if (!("vault_approval" in listed)) {
+        return; // declarative, or an onboarding's row
+      }
+      const controls = listed.connectors.length ? listed.connectors.map((name) => holdButton(
+        listed, { connector: name }, "connector " + name)) : listed.approve.map((named) =>
+        holdButton(listed, { server: listed.server, tool: named.name }, named.name_shown));
+      list.children[index].append(...controls);
+      if (controls.length && !listed.approver) {
+        list.children[index].append(make("p", NO_APPROVER));
+      }
+    });
+  }
+
+  function holdButton(listed, data, shown) {
+    const held = data.tool ? listed.vault_approval.includes(data.tool) :
+      listed.vault_approval.length > 0;
+    const control = button((held ? HOLD_OFF : HOLD) + ": " + shown, () => holdSaved(held, data));
+    control.disabled = !held && !listed.approver;
+    return control;
+  }
+
+  // The step-up for one button: its kind and the form its data takes, each a literal.
+  async function holdSaved(held, data) {
+    const base = (await api("GET", "/api/session")).revision;
+    const done = () => {
+      closeConfirm();
+      $("status").textContent = held ? OFF_SAVED : HELD_SAVED;
+      window.zoeyDrift.review();
+    };
+    if (held && data.connector) {
+      await prepare("tool.vault_approval_off", { base: base, connector: data.connector }, done);
+    } else if (held) {
+      await prepare("tool.vault_approval_off", { base: base, server: data.server,
+        tool: data.tool }, done);
+    } else if (data.connector) {
+      await prepare("policy.save", { base: base, connector: data.connector }, done);
+    } else {
+      await prepare("policy.save", { base: base, server: data.server, tool: data.tool }, done);
+    }
+  }
+
+  // review.js's hook once a managed review is drawn: Hold in the vault on each tool's row, ticked
+  // where the vault holds it. Unticking one is a save the vault refuses (turning it off is its
+  // own step, on the server's row); with no approver an unticked box is disabled.
+  function review(held, view) {
+    if (!("vault_approval" in view)) {
+      return;
+    }
+    for (const entry of held.entries.filter((each) => each.tool.kind === "tool" && each.box)) {
+      entry.hold = Object.assign(document.createElement("input"), { type: "checkbox" });
+      entry.hold.checked = view.vault_approval.includes(entry.tool.name);
+      entry.hold.disabled = !entry.hold.checked && !view.approver;
+      const label = make("label", "", "include");
+      label.append(entry.hold, " " + HOLD + " (approve only)");
+      entry.item.append(label);
+    }
+    if (!view.approver) {
+      $("review-drift").append(make("p", NO_APPROVER));
+    }
+  }
+
+  // What Save sends as held (drift.js's save): each ticked box of an included approve tool; none
+  // on a review drawn without boxes, so the vault keeps the policy's own.
+  function heldNames(held) {
+    const boxed = held.entries.filter((entry) => entry.hold);
+    return boxed.length ? boxed.filter((entry) => entry.hold.checked && entry.box.checked &&
+      entry.choice.value === "approve").map((entry) => entry.tool.name) : undefined;
+  }
+
   on("nav-approvals", showQueue);
   on("approvals-approve", approve);
   on("approvals-deny", deny);
   on("approvals-close", closeHold);
   setInterval(tickLists, LISTS_EVERY);
   setInterval(tickCount, COUNT_EVERY);
-  window.zoeyApprovals = Object.freeze({ home: home });
+  window.zoeyApprovals = Object.freeze({ home: home, servers: servers, review: review,
+    held: heldNames });
 })();

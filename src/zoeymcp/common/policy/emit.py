@@ -116,7 +116,8 @@ FIELDS: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
             prompts="PromptsPolicy",
             resources="ResourcesPolicy",
         ),
-        "Tools": _table(include=STRINGS, allow=STRINGS, approve=STRINGS),
+        # M8 A.4: a review keeps the server's holds (written only when it holds one).
+        "Tools": _table(include=STRINGS, allow=STRINGS, approve=STRINGS, vault_approval=STRINGS),
         # A review's prompts and resources blocks (M6 design A.4, L.7), each written whole.
         "PromptsPolicy": _table(
             include=STRINGS, review=STRING_MAP, declined=STRING_MAP, assistant=STRINGS

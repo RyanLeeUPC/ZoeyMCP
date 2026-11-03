@@ -112,7 +112,7 @@ K2 = (
         FULL,
         4 * 1024 * KIB,
         frozenset({"include", "allow", "approve"}),
-        frozenset({"indent", "repin", "decline", "decline_rest", "kinds"}),
+        frozenset({"indent", "repin", "decline", "decline_rest", "kinds", "held"}),
     ),
 )
 # M6 M.2's rows, as each step builds them: step 7's attention list, and step 15b's history and

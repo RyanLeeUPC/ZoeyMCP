@@ -198,6 +198,7 @@
       list.append(item);
     }
     await window.zoeyDrift.servers(list, rows, queueReview); // what the gateway reports, Allow
+    window.zoeyApprovals?.servers(list, rows); // M8 A.4: Hold in the vault, managed
     if (rows.length === 0) {
       list.append(make("li", "The policy has no remote or toolkit server yet."));
     }
@@ -499,6 +500,7 @@
     held.entries = answer.tools.map(toolEntry);
     $("review-tools").replaceChildren(...held.entries.map((entry) => entry.item));
     window.zoeyDrift.footer(held, answer, queueReview); // Review again, under the tools
+    window.zoeyApprovals?.review(held, answer); // M8 A.4: each tool's Hold in the vault box
     $("review-body").hidden = false;
     filter();
     tally();

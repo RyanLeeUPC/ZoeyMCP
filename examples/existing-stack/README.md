@@ -62,7 +62,9 @@ $c exec vault zoeymcp setup-code
 
 Agents on the stack's agent network use `http://zoeymcp-gateway:8090/s/<server>/mcp` with
 `Authorization: Bearer <client token>` (operations.md §10), and their runtime's own approval
-setting for that server at its least-prompting level, so the gateway's approval is the one prompt.
+setting for that server at its least-prompting level, so ZoeyMCP's approval is the one prompt:
+the gateway's, or for a tool in `vault_approval` the vault's, on your approvers (operations.md
+§36).
 
 ## The proxy
 

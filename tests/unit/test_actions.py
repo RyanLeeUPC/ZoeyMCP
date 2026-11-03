@@ -104,7 +104,7 @@ def test_the_registry_holds_f4s_kinds() -> None:
         "tool.clear": (4096, ["server"], []),
         # M6 G.4, M.3 (step 15a): a managed review save by its draft, and a move to allow from
         # a server's page or a draft.
-        "policy.save": (4096, ["base", "draft"], []),
+        "policy.save": (4096, ["base"], ["connector", "draft", "server", "tool"]),
         "tool.repin": (4096, ["base", "draft"], []),
         "tool.allow": (4096, ["base"], ["draft", "kind", "name", "pin", "server"]),
         # M6 H.3, M.3 (step 15b): a managed rollback to a kept revision, on the head shown.
@@ -119,6 +119,8 @@ def test_the_registry_holds_f4s_kinds() -> None:
         ),
         # M8 H.3 (step 15): an approval from the queue, bound to the hold and the text's digest.
         "approval.decide": (4096, ["approval", "decision", "text_sha256"], []),
+        # M8 A.4 (step 18): vault_approval off, one tool or one held connector's writers.
+        "tool.vault_approval_off": (4096, ["base"], ["connector", "server", "tool"]),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
     assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS
@@ -126,6 +128,36 @@ def test_the_registry_holds_f4s_kinds() -> None:
     forms = (frozenset({"server", "kind", "name", "pin"}), frozenset({"draft"}))
     assert forms == actions.ALLOW_FORMS
     assert frozenset().union(*actions.ALLOW_FORMS) == KINDS["tool.allow"].optional
+    # M8 A.4: vault_approval off's two forms, and a save's draft or Hold in the vault in either.
+    off = (frozenset({"server", "tool"}), frozenset({"connector"}))
+    assert off == actions.VAULT_OFF_FORMS
+    assert frozenset().union(*off) == KINDS["tool.vault_approval_off"].optional
+    assert (frozenset({"draft"}), *off) == actions.SAVE_FORMS
+    assert frozenset().union(*actions.SAVE_FORMS) == KINDS["policy.save"].optional
+
+
+@pytest.mark.parametrize(
+    ("data", "kept"),
+    [
+        ({"base": 1, "server": "s", "tool": "t"}, True),
+        ({"base": 1, "connector": "mail"}, True),
+        ({"base": 1, "server": "s"}, False),  # partial
+        ({"base": 1, "tool": "t"}, False),  # partial
+        ({"base": 1, "server": "s", "tool": "t", "connector": "mail"}, False),  # mixed
+        ({"base": 1, "connector": "mail", "tool": "t"}, False),  # mixed
+        ({"base": 1}, False),  # neither
+    ],
+    ids=["tool", "connector", "server-only", "tool-only", "both", "connector-tool", "none"],
+)
+def test_vault_approval_off_takes_one_whole_form(data: dict[str, Any], kept: bool) -> None:
+    """M8 A.4: a mixed or partial form passes the registry's keys but not its forms, which the
+    portal refuses ``bad_body`` (``portal/app.py``); the same for a save's Hold in the vault."""
+    request = parse_request({"kind": "tool.vault_approval_off", "data": data}, 2)
+    assert isinstance(request, Request)
+    assert actions.in_form(data, actions.VAULT_OFF_FORMS) is kept
+    assert actions.in_form(data, actions.SAVE_FORMS) is kept
+    assert actions.in_form({"base": 1, "draft": "d"}, actions.SAVE_FORMS)
+    assert not actions.in_form({"base": 1, "draft": "d"}, actions.VAULT_OFF_FORMS)
 
 
 def test_a_kinds_optional_keys_default_to_empty() -> None:

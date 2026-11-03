@@ -4187,11 +4187,11 @@ def test_the_loopback_literal_warning(uri: str) -> None:
     ]
 
 
-# --- M8: vault-held tools and out-of-band approvers (M8 design A.2, built dark: G-2) ------------
+# --- M8: vault-held tools and out-of-band approvers (M8 design A.2; built dark: G-2, lit in 18) --
 #
-# Each row both ways: m8() is the example with M8's fields in use, which lit checks clean, and
-# each case changes one thing from it and must give its finding. Dark, the same policy gives
-# row 0's error at each field and nothing else new.
+# Each row both ways: m8() is the example with M8's fields in use, which checks clean, and each
+# case changes one thing from it and must give its finding. Step 18 deleted row 0's dark table:
+# lit() does nothing now, and no field is refused for being new.
 
 TG_ID = 7362915048
 DARK = "arrives in a later M8 step"
@@ -4237,47 +4237,47 @@ def unheld(raw: Raw) -> Raw:
     return raw
 
 
-def test_the_m8_example_is_clean_lit_and_refused_dark(example_raw: Raw) -> None:
+def test_the_m8_example_is_clean(example_raw: Raw) -> None:
+    """Step 18 turned the fields on: the example with them in use checks clean with or without
+    lit(), with the example's own warnings and nothing of row 0's."""
     raw = m8(example_raw)
-    findings = lit_run(raw)
+    findings = run(raw)
     assert errors(findings) == []
     assert warnings(findings) == warnings(run(example_raw))
-    assert errors(run(raw)) == [
-        f"approvers: {DARK}",
-        f"gateway.servers.broker-trade.tools.vault_approval: {DARK}",
-        f"gateway.servers.mail.tools.vault_approval: {DARK}",
-    ]
+    assert lit_run(raw) == findings
+    assert not any(DARK in finding for finding in [*errors(findings), *warnings(findings)])
 
 
-def test_out_of_band_is_dark_too(example_raw: Raw) -> None:
+def test_out_of_band_is_served_too(example_raw: Raw) -> None:
     raw = m8(example_raw)
     out_of_band(raw)
-    assert f"gateway.clients.agent1.approvals.out_of_band: {DARK}" in errors(run(raw))
-    assert not any(DARK in e for e in errors(lit_run(raw)))
+    assert not any(DARK in e for e in errors(run(raw)))
+    assert errors(run(raw)) == errors(lit_run(raw))
 
 
-def test_only_set_m8_fields_are_dark(example_raw: Raw) -> None:
+def test_empty_m8_fields_are_as_before(example_raw: Raw) -> None:
     """An empty vault_approval and a false out_of_band are as before (A.5)."""
     raw = copy.deepcopy(example_raw)
     for server in raw["gateway"]["servers"].values():
         server["tools"]["vault_approval"] = []
     _agent1(raw)["approvals"]["out_of_band"] = False
-    assert errors(run(raw)) == []
+    assert run(raw) == run(example_raw)
 
 
-def test_the_dark_table_names_the_three_fields() -> None:
-    assert dict(check._DARK) == dict.fromkeys(
-        (
-            "gateway.servers.*.tools.vault_approval",
-            "approvers",
-            "gateway.clients.*.approvals.out_of_band",
-        ),
-        DARK,
-    )
+def test_the_dark_table_is_gone() -> None:
+    """Row 0 is removed in step 18 (A.2): no field is dark."""
+    assert not hasattr(check, "_DARK")
 
 
 def _shared_path(raw: Raw) -> None:
     raw["gateway"]["servers"]["broker-read"]["path"] = "/mcp"
+
+
+def _read_lists_held(raw: Raw) -> None:
+    read = raw["gateway"]["servers"]["broker-read"]
+    read["tools"]["include"].append("place_order")
+    read["tools"]["approve"] = ["place_order"]
+    read["review"]["place_order"] = "sha256:" + "f" * 64
 
 
 def _second_writer(raw: Raw) -> None:
@@ -4478,6 +4478,13 @@ SAME_UPSTREAM = (
         (  # a path that doesn't parse is the rules' own error; the next is still read
             _broker_rule({"methods": ["GET"], "paths": ["/a b", "/mcp/*"]}),
             f"routes[1].rules[1].paths[1]: {HELD_EXACT}",
+        ),
+        (  # row 21's second-server form (A.4): another server on the held route lists it unheld
+            _read_lists_held,
+            "gateway.servers.broker-read.tools.vault_approval: route 'broker-mcp' is held for "
+            "'place_order', which this server lists without holding, so a call through its path "
+            "would skip the vault's hold: add them to its vault_approval, or take them out of its "
+            "tools",
         ),
         (  # row 22
             _another_route(credential="broker-mcp"),

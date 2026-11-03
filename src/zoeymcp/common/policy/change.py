@@ -5,14 +5,16 @@ Onboarding's fragment 1, a review's fragment 2 and a re-registration are each a
 (``OAuth2Credential``, ``Route``, ``RemoteServer``, ``Tools``) or values checked against the
 schema's own types when the op is made, so a value that reaches the emitter (``emit.py``) has
 already passed its validator. There is no op that adds a client, a token, a caller or a secret
-value, so a change can't hold one (H.3). Three ops are managed mode's portal edits and nothing
+value, so a change can't hold one (H.3). Four ops are managed mode's portal edits and nothing
 else's (M6 G.3): :class:`MoveToAllow` (one included ``approve`` tool to ``allow``),
-:class:`SetClientServers` (the servers one existing client reaches) and
-:class:`SetConnectorLimits` (a connector's pause and limits, outside its secret's binding, F-15).
+:class:`SetClientServers` (the servers one existing client reaches),
+:class:`SetConnectorLimits` (a connector's pause and limits, outside its secret's binding, F-15)
+and :class:`SetVaultApproval` (one included ``approve`` tool into ``vault_approval`` or out of
+it, M8 design A.4).
 
 - :meth:`PolicyChange.data` is the change's plain form: what the fragment's YAML loads back to. A
-  :class:`MoveToAllow` has none: it moves a name between two lists a merge replaces whole, so only
-  :func:`apply`, which holds the policy, makes it.
+  :class:`MoveToAllow` or a :class:`SetVaultApproval` has none: each changes a list a merge
+  replaces whole, so only :func:`apply`, which holds the policy, makes it.
 - :meth:`PolicyChange.replace` names the blocks it replaces whole (H.4, CR-14).
 - :func:`apply` merges the plain form into the running policy with ``merge.merge``, the function
   ``zoeymcp check --with`` runs, and validates the result as a :class:`Policy`; :func:`validate`
@@ -228,6 +230,21 @@ class MoveToAllow:
 
 
 @dataclass(frozen=True)
+class SetVaultApproval:
+    """One included ``approve`` tool held in the vault (``held``), or no longer held (M8 design
+    A.4): a server page's **Hold in the vault** adds it in a ``policy.save`` (a narrowing), and
+    ``tool.vault_approval_off`` removes it, each built from the data, never a draft."""
+
+    server: str
+    tool: str
+    held: bool = True
+
+    def __post_init__(self) -> None:
+        _name(self.server)
+        _TOOL_NAME.validate_python(self.tool, strict=True)
+
+
+@dataclass(frozen=True)
 class SetClientServers:
     """The servers one existing client reaches, replaced whole (M6 design G.3, G-13)."""
 
@@ -300,6 +317,7 @@ Op = (
     | SetCredential
     | SetScope
     | MoveToAllow
+    | SetVaultApproval
     | SetClientServers
     | SetConnectorLimits
     | Comment
@@ -321,7 +339,7 @@ class PolicyChange:
         """The change's plain form: each model as the policy document writes it (JSON types),
         with only the fields its maker set, and no ``None``. A change holding a
         :class:`MoveToAllow` has none (only :func:`apply` makes the move)."""
-        if any(isinstance(op, MoveToAllow) for op in self.ops):
+        if any(isinstance(op, MoveToAllow | SetVaultApproval) for op in self.ops):
             raise ValueError("a move to allow has no fragment: only a managed write makes it")
         return self._data()
 
@@ -382,6 +400,8 @@ def _target(op: Op) -> Path:
         return ("gateway", "servers", op.name)
     if isinstance(op, MoveToAllow):
         return ("gateway", "servers", op.server)
+    if isinstance(op, SetVaultApproval):
+        return ("gateway", "servers", op.server, "tools", "vault_approval", op.tool)
     if isinstance(op, SetClientServers):
         return ("gateway", "clients", op.client)
     if isinstance(op, SetConnectorLimits):
@@ -415,6 +435,11 @@ def apply(policy: Policy, change: PolicyChange, *, managed: bool = False) -> Pol
         if isinstance(op, MoveToAllow):
             _servers(data)[op.server] = {"tools": _moved(_server(policy, op.server).tools, op)}
             paths += (("gateway", "servers", op.server, "tools"),)
+    held = [op for op in change.ops if isinstance(op, SetVaultApproval)]
+    for server in dict.fromkeys(op.server for op in held):
+        tools = _server(policy, server).tools
+        _servers(data)[server] = {"tools": _held(tools, [op for op in held if op.server == server])}
+        paths += (("gateway", "servers", server, "tools"),)
     merged = merge(base, data, replace=paths)
     # A route by a taken name, the only conflict, is name_taken above.
     assert isinstance(merged, Merged), merged  # noqa: S101
@@ -434,12 +459,29 @@ def _server(policy: Policy, name: str) -> RemoteServer | ToolkitServer:
 
 
 def _moved(tools: Tools, op: MoveToAllow) -> dict[str, list[str]]:
-    """A server's ``tools`` with ``op``'s tool moved from ``approve`` to ``allow``."""
-    return {
+    """A server's ``tools`` with ``op``'s tool moved from ``approve`` to ``allow``: the server's
+    other holds kept (the block is replaced whole), the moved tool's dropped (M8 design A.4)."""
+    held = [name for name in tools.vault_approval if name != op.name]
+    found = {
         "include": list(tools.include),
         "allow": [*tools.allow, op.name],
         "approve": [name for name in tools.approve if name != op.name],
     }
+    return {**found, "vault_approval": held} if held else found
+
+
+def _held(tools: Tools, ops: list[SetVaultApproval]) -> dict[str, list[str]]:
+    """A server's ``tools`` with each op's tool put into ``vault_approval`` or taken out, the
+    list written only when it holds a name (an empty one is as before, M8 design A.5)."""
+    held = list(tools.vault_approval)
+    for op in ops:
+        held = [name for name in held if name != op.tool] + ([op.tool] if op.held else [])
+    found = {
+        "include": list(tools.include),
+        "allow": list(tools.allow),
+        "approve": list(tools.approve),
+    }
+    return {**found, "vault_approval": held} if held else found
 
 
 def _declined_written(policy: Policy, change: PolicyChange) -> PolicyChange:
@@ -509,6 +551,8 @@ def _check_names(policy: Policy, change: PolicyChange) -> None:
             )
         if isinstance(op, MoveToAllow):
             _check_move(servers, op)
+        if isinstance(op, SetVaultApproval):
+            _check_held(servers, op)
         if isinstance(op, SetClientServers):
             _check_client(policy, op)
         if isinstance(op, SetConnectorLimits) and op.name not in policy.connectors:
@@ -531,6 +575,18 @@ def _check_move(servers: Mapping[str, RemoteServer | ToolkitServer], op: MoveToA
     if not off and entry.review.get(op.name) != op.pin:
         raise ChangeRefused(
             "diff_invalid", f"{where}.review.{op.name}", ("the policy pins another definition",)
+        )
+
+
+def _check_held(servers: Mapping[str, RemoteServer | ToolkitServer], op: SetVaultApproval) -> None:
+    """Holding a tool, or no longer, needs it included in ``approve`` (A.2 row 1)."""
+    where = f"gateway.servers.{op.server}"
+    entry = servers.get(op.server)
+    if entry is None:
+        raise ChangeRefused("diff_invalid", where, ("the policy has no such server",))
+    if op.tool not in entry.tools.include or op.tool not in entry.tools.approve:
+        raise ChangeRefused(
+            "diff_invalid", f"{where}.tools", (f"{op.tool} isn't an included approve tool",)
         )
 
 

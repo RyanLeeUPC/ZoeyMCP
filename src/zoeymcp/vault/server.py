@@ -115,6 +115,13 @@ GATEWAY_KEY_TICK = 5.0
 HOLD_SWEEP = 1.0
 # The stdlib loggers capped at WARNING while the vault serves (M8 design G.1).
 CLIENT_LOGGERS = ("httpx", "httpcore")
+# A resume that would drop a held pair (M8 design A.4, M.2): a start has no one to answer, so it
+# refuses, naming each tool and the host's ways.
+RESUME_DROPS = (
+    "refused to start: the policy given would stop the vault holding {tools}. Start with them "
+    "held, then turn each off on the server's page or by export, edit and import with "
+    "--accept-widening; or reseed offline with --accept-widening"
+)
 # The launcher's control pipe: one command per line.
 # --bridge NAME=UID: the launcher's bridge name (C.10) and the uid it runs that bridge as.
 _BRIDGE = re.compile(r"([a-z0-9]{1,16})=([0-9]{1,10})")
@@ -565,6 +572,8 @@ def _resume(
             removed_in=store.removed_lookup(candidate),
         )
     )
+    if isinstance(planned, PlanRefused) and planned.reason == "resume_drops_vault_approval":
+        _refuse(planned.reason, RESUME_DROPS.format(tools=planned.detail), revision=found.revision)
     if isinstance(planned, PlanRefused):
         text = f"refused to start: the policy given can't resume the parked store: {planned.detail}"
         _refuse(planned.reason, text, revision=found.revision)

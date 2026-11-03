@@ -36,6 +36,7 @@ from zoeymcp.common.policy.change import (
     SetCredential,
     SetScope,
     SetServerReview,
+    SetVaultApproval,
     apply,
     from_portal,
     validate,
@@ -960,3 +961,131 @@ def test_a_portal_route_with_no_credential_passes() -> None:
     bare = {key: value for key, value in NOTES_ROUTE.items() if key != "credential"}
     from_portal(PolicyChange("t", (AddRoute(Route.model_validate(bare)),)))
     from_portal(PolicyChange("t", (MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL),)))
+
+
+# --- M8 A.4: holding a tool in the vault, and no longer (step 18) ---------------------------------
+
+
+def test_set_vault_approval_holds_and_releases_one_tool() -> None:
+    """A.4: Hold in the vault puts one included approve tool into vault_approval, after the
+    names held already, and nothing else changes; held=False takes it out, and a list left
+    empty is not written (an unheld server's tools read as before, A.5). Several ops on one
+    server apply in order; the change has no fragment, and replaces nothing whole."""
+    policy = example()
+    hold = SetVaultApproval("broker-trade", "cancel_order")
+    assert hold.held is True
+    change = PolicyChange("t", (hold, SetVaultApproval("broker-trade", "place_order")))
+    merged = apply(policy, change)
+    assert merged.gateway is not None
+    assert policy.gateway is not None
+    server = merged.gateway.servers["broker-trade"]
+    assert server.tools == Tools(
+        include=["place_order", "cancel_order"],
+        approve=["place_order", "cancel_order"],
+        vault_approval=["cancel_order", "place_order"],
+    )
+    before = policy.gateway.servers["broker-trade"]
+    assert server.model_dump(exclude={"tools"}) == before.model_dump(exclude={"tools"})
+    for name, other in policy.gateway.servers.items():
+        if name != "broker-trade":
+            assert merged.gateway.servers[name] == other
+    assert change.replace() == ()
+    with pytest.raises(ValueError, match=r"^a move to allow has no fragment"):
+        change.data()
+    released = apply(merged, PolicyChange("t", (replace(hold, held=False),)))
+    assert released.gateway is not None
+    assert released.gateway.servers["broker-trade"].tools.vault_approval == ["place_order"]
+    off = SetVaultApproval("broker-trade", "place_order", held=False)
+    bare = apply(released, PolicyChange("t", (off,)))
+    assert bare.gateway is not None
+    tools = bare.gateway.servers["broker-trade"].tools
+    assert "vault_approval" not in tools.model_fields_set
+    assert bare.gateway.servers["broker-trade"] == policy.gateway.servers["broker-trade"]
+    # Holding a name held already keeps it once, last.
+    again = apply(merged, PolicyChange("t", (hold,)))
+    assert again.gateway is not None
+    assert again.gateway.servers["broker-trade"].tools.vault_approval == [
+        "place_order",
+        "cancel_order",
+    ]
+
+
+def test_a_move_to_allow_keeps_the_servers_other_holds() -> None:
+    """A.4: a move replaces the server's tools block whole, so it writes the holds back: an
+    unheld tool's move keeps every one, and a held tool's drops exactly its own (which the
+    planner then refuses as a drop)."""
+    held = apply(example(), PolicyChange("t", (SetVaultApproval("broker-trade", "place_order"),)))
+    cancel = MoveToAllow("broker-trade", "tool", "cancel_order", CANCEL)
+    moved = apply(held, PolicyChange("t", (cancel,)))
+    assert moved.gateway is not None
+    assert moved.gateway.servers["broker-trade"].tools == Tools(
+        include=["place_order", "cancel_order"],
+        allow=["cancel_order"],
+        approve=["place_order"],
+        vault_approval=["place_order"],
+    )
+    place = MoveToAllow("broker-trade", "tool", "place_order", PLACE)
+    own = apply(held, PolicyChange("t", (place,)))
+    assert own.gateway is not None
+    tools = own.gateway.servers["broker-trade"].tools
+    assert (tools.allow, tools.approve) == (["place_order"], ["cancel_order"])
+    assert "vault_approval" not in tools.model_fields_set
+
+
+def test_set_vault_approval_targets_one_tool() -> None:
+    """Two ops on one server are two targets, one per tool; the same tool twice is refused."""
+    one, two = SetVaultApproval("s", "a"), SetVaultApproval("s", "b")
+    assert PolicyChange("t", (one, two)).ops == (one, two)
+    with pytest.raises(ValueError, match=r"^the change names gateway\.servers\.s\.tools"):
+        PolicyChange("t", (one, replace(one, held=False)))
+
+
+@pytest.mark.parametrize(
+    ("op", "path", "message"),
+    [
+        (
+            SetVaultApproval("absent", "x"),
+            "gateway.servers.absent",
+            "the policy has no such server",
+        ),
+        (
+            SetVaultApproval("broker-read", "get_quote"),
+            "gateway.servers.broker-read.tools",
+            "get_quote isn't an included approve tool",
+        ),
+        (
+            SetVaultApproval("broker-trade", "other", held=False),
+            "gateway.servers.broker-trade.tools",
+            "other isn't an included approve tool",
+        ),
+    ],
+    ids=["no-server", "not-approve", "not-included"],
+)
+def test_a_hold_the_policy_cant_take_is_diff_invalid(op: Any, path: str, message: str) -> None:
+    with pytest.raises(ChangeRefused) as caught:
+        apply(example(), PolicyChange("t", (op,)))
+    assert (caught.value.reason, caught.value.path, caught.value.messages) == (
+        "diff_invalid",
+        path,
+        (message,),
+    )
+
+
+def test_a_hold_needs_the_tool_included_too() -> None:
+    raw = yaml.safe_load(EXAMPLE_POLICY.read_text(encoding="utf-8"))
+    raw["gateway"]["servers"]["broker-trade"]["tools"]["include"] = ["place_order"]
+    loose = parse_policy(yaml.safe_dump(raw, sort_keys=False), "example")
+    with pytest.raises(ChangeRefused, match="cancel_order isn't an included approve tool"):
+        apply(loose, PolicyChange("t", (SetVaultApproval("broker-trade", "cancel_order"),)))
+
+
+@pytest.mark.parametrize(
+    ("server", "tool", "match"),
+    [("Notes", "x", "isn't a policy name"), ("notes", "bad name", "String should match pattern")],
+    ids=["server", "tool"],
+)
+def test_set_vault_approval_holds_names_the_schema_takes(
+    server: str, tool: str, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        SetVaultApproval(server, tool)

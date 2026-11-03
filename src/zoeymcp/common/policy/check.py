@@ -10,8 +10,6 @@ import ipaddress
 import re
 from collections import defaultdict
 from collections.abc import Mapping
-from types import MappingProxyType
-from typing import Final
 from urllib.parse import urlsplit
 
 from .. import canonical, netguard
@@ -141,15 +139,6 @@ CHECK_APPROVAL = "check_approval"
 # under HELD_WRITE_TIMEOUT that is less than two minutes, which check says (A.2 row 20).
 TOOLKIT_HOLD_MARGIN = 30
 HELD_WRITE_TIMEOUT = 150
-# M8 design A.2 row 0 (G-2): each M8 field by its path, refused while listed here. Tests light it
-# with tests/dark.py's lit(), which empties the table; step 18 deletes it.
-_DARK: Final[Mapping[str, str]] = MappingProxyType(
-    {
-        "gateway.servers.*.tools.vault_approval": "arrives in a later M8 step",
-        "approvers": "arrives in a later M8 step",
-        "gateway.clients.*.approvals.out_of_band": "arrives in a later M8 step",
-    }
-)
 _NO_SURFACE = "nobody would be asked: set approvers.telegram or approvers.portal"
 _HELD_EXACT = (
     "a route carrying a vault-held server allows only its servers' exact paths; list those instead"
@@ -179,7 +168,6 @@ def check_policy(policy: Policy, *, environ: Mapping[str, str] | None = None) ->
     _check_tokens(policy, report)
     _check_gateway(policy, report)
     _check_approvers(policy, report)
-    _check_dark(policy, report)
     _check_egress(policy, report)
     if policy.admin is not None:
         _check_admin(policy.admin, report)
@@ -1560,32 +1548,6 @@ def _check_pins(path: str, include: list[str], review: Mapping[str, str], report
 # --- M8: vault-held tools and out-of-band approvers (M8 design A.2) -----------------------------
 
 
-def _check_dark(policy: Policy, report: _Report) -> None:
-    """Row 0: an M8 field set before the step that serves it (built dark, G-2)."""
-    found = [("approvers", "approvers")] if policy.approvers is not None else []
-    gateway = policy.gateway
-    if gateway is not None:
-        found += [
-            (
-                "gateway.servers.*.tools.vault_approval",
-                f"gateway.servers.{name}.tools.vault_approval",
-            )
-            for name, server in gateway.servers.items()
-            if server.tools.vault_approval
-        ]
-        found += [
-            (
-                "gateway.clients.*.approvals.out_of_band",
-                f"gateway.clients.{name}.approvals.out_of_band",
-            )
-            for name, client in gateway.clients.items()
-            if client.approvals is not None and client.approvals.out_of_band
-        ]
-    for pattern, path in found:
-        if pattern in _DARK:
-            report.error(path, _DARK[pattern])
-
-
 def _check_approvers(policy: Policy, report: _Report) -> None:
     """Rows 9-11, 14 and 18: the ``approvers`` block itself."""
     approvers = policy.approvers
@@ -1722,7 +1684,23 @@ def _check_held_routes(policy: Policy, servers: Mapping[str, Server], report: _R
             continue
         if isinstance(found, held.HeldRoute):
             _check_held_rules(index, home, set(paths[home.name]), report)
+            _check_held_listed(found, report)
         _check_same_upstream(policy, index, home, found.names, report)
+
+
+def _check_held_listed(hold: held.HeldRoute, report: _Report) -> None:
+    """Row 21's other half (A.4's second-server form, T-2): every server on a held route that
+    lists a tool the route holds holds it too, or a call to that server's path would reach it
+    unheld (``held.unheld_reach``, which the planner refuses in managed mode)."""
+    for _, path in sorted(hold.paths.items()):
+        loose = sorted(name for name in hold.names if name in path.listed - path.tools)
+        if loose:
+            report.error(
+                f"gateway.servers.{path.server}.tools.vault_approval",
+                f"route {hold.route!r} is held for {', '.join(map(repr, loose))}, which this "
+                "server lists without holding, so a call through its path would skip the vault's "
+                "hold: add them to its vault_approval, or take them out of its tools",
+            )
 
 
 def _check_held_connector(

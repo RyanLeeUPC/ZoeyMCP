@@ -1,7 +1,7 @@
-"""The launcher's ``lit`` hook (M8 design A.2 row 0, O.1; G-2, BP-2): a process test lights M8's
-dark policy fields in the fresh interpreter, as ``tests/dark.py``'s ``lit()`` does in a test's
-own, so a vault started on a policy that uses them admits it. Without the hook ``check`` refuses
-them, as a shipped build does until step 18.
+"""The launcher's ``lit`` hook after M8 step 18 (M8 design A.2 row 0, O.1; G-2, BP-2): the
+dark table is gone, so ``check`` admits M8's policy fields in a fresh interpreter with the hook or
+without it, as a shipped build does. The hook's slot stays and does nothing, as
+``tests/dark.py``'s ``lit()`` does in a test's own process.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from pathlib import Path
 
 import anyio
 import pytest
+
+from zoeymcp.common.policy import check
 
 from .procs import start
 
@@ -22,7 +24,7 @@ POLICY = {
     "admin": {"listen": "127.0.0.1:8081", "origins": ["http://localhost:8081"]},
     "approvers": {"portal": {}},
 }
-DARK = "approvers: arrives in a later M8 step"
+DARK = "arrives in a later M8 step"
 
 
 @pytest.fixture
@@ -45,10 +47,9 @@ async def _checked(tmp_path: Path, *, lit: bool) -> tuple[int, str]:
     return status, process.output()
 
 
-async def test_the_launcher_lights_the_dark_fields_only_when_asked(tmp_path: Path) -> None:
-    status, output = await _checked(tmp_path, lit=False)
-    assert status != 0, output
-    assert DARK in output
-    status, output = await _checked(tmp_path, lit=True)
-    assert status == 0, output
-    assert DARK not in output
+async def test_the_m8_fields_are_admitted_with_the_hook_or_without(tmp_path: Path) -> None:
+    assert not hasattr(check, "_DARK")
+    for lit in (False, True):
+        status, output = await _checked(tmp_path, lit=lit)
+        assert status == 0, output
+        assert DARK not in output

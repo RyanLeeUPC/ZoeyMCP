@@ -964,8 +964,11 @@ def test_prompts_and_resources_are_rows_whose_choices_go_under_kinds() -> None:
     assert "into.include.push(entry.tool.name);" in lists
     assert "into.repin.push(entry.tool.name);" in lists
     assert "into.decline.push(entry.tool.name);" in lists
-    # Save posts every list picked() holds, each key named (test_portal_wire reads the body).
-    assert "decline_rest: chosen.decline_rest, kinds: chosen.kinds });" in drift
+    # Save posts every list picked() holds, each key named (test_portal_wire reads the body),
+    # and approvals.js's held tools (M8 A.4; none in declarative mode, so the key isn't sent).
+    assert "decline: c.decline, decline_rest: c.decline_rest, kinds: c.kinds });" in drift
+    assert "repin: c.repin, held: vault," in drift
+    assert "const c = picked(held), vault = window.zoeyApprovals?.held(held);" in drift
     # Clear unticks the kinds' boxes too (review.js's unticks the tools'), and the footer's
     # "tools changed" counts tools only.
     cleared = "drawn?.entries.forEach((e) => e.pick && (e.pick.checked = false)));"
@@ -974,7 +977,11 @@ def test_prompts_and_resources_are_rows_whose_choices_go_under_kinds() -> None:
     review = code_of(read("review.js"))
     # And so does Generate.
     assert "decline_rest: lists.decline_rest,\n        kinds: lists.kinds });" in review
-    assert set(REVIEW_DIFF.optional) == {"indent", "repin", "decline", "decline_rest", "kinds"}
+    # Save's held is managed mode's alone (M8 A.4): Generate sends none, so the fragment keeps
+    # the policy's holds.
+    optional = {"indent", "repin", "decline", "decline_rest", "kinds", "held"}
+    assert set(REVIEW_DIFF.optional) == optional
+    assert "held:" not in review
     assert "entry.pick" not in review
 
 
@@ -1185,7 +1192,13 @@ def test_approvals_js_clicks_go_through_app_js_guard() -> None:
         "approvals-deny",
         "approvals-close",
     ]
-    assert re.findall(r'prepare\("([a-z.]+)"', code) == ["approval.decide"]
+    assert re.findall(r'prepare\("([a-z._]+)"', code) == [
+        "approval.decide",
+        "tool.vault_approval_off",
+        "tool.vault_approval_off",
+        "policy.save",
+        "policy.save",
+    ]
     assert (
         '{ approval: held.approval, text_sha256: held.text_sha256, decision: "approve" },' in code
     )
@@ -1199,12 +1212,39 @@ def test_approvals_js_clicks_go_through_app_js_guard() -> None:
     assert "const LISTS_EVERY = 5000;" in code
     assert "const COUNT_EVERY = 10000;" in code
     assert re.findall(r"window\.(zoey\w+) =", code) == ["zoeyApprovals"]
-    assert "window.zoeyApprovals = Object.freeze({ home: home });" in code
+    assert (
+        "window.zoeyApprovals = Object.freeze({ home: home, servers: servers, review: review,\n"
+        "    held: heldNames });" in code
+    )
     # The timers ask nothing before a full session's bar shows, and one ask at a time.
     start = code.index("async function quietly(work) {")
     body = code[start : code.index("\n  }\n", start)]
     assert "if (asking || !signedIn()) {" in body
     assert 'return !$("bar").hidden;' in code
+
+
+def test_hold_in_the_vault_is_two_literal_forms_and_review_hooks() -> None:
+    """M8 A.4 (step 18): a server row's Hold in the vault is a policy.save and Turn off vault
+    approval tool.vault_approval_off, each prepared with one of the two forms' literal keys
+    (``actions.VAULT_OFF_FORMS``); holding is disabled with no approver, with the design's line.
+    review.js calls the two hooks once each, after drift.js's (its rows, its footer)."""
+    code = code_of(read("approvals.js"))
+    for kind in ("tool.vault_approval_off", "policy.save"):
+        made = f'await prepare("{kind}", {{ base: base, '
+        assert made + "connector: data.connector }, done);" in code
+        assert made + "server: data.server," in code
+    assert "control.disabled = !held && !listed.approver;" in code
+    assert "entry.hold.disabled = !entry.hold.checked && !view.approver;" in code
+    assert (
+        'const NO_APPROVER = "Set up an approver first (Telegram or the Approvals queue): a host '
+        'step, " +\n    "operations.md \\u00a736.2";' in code
+    )
+    review = code_of(read("review.js"))
+    assert re.findall(r"window\.zoeyApprovals\?\.(\w+)\(", review) == ["servers", "review"]
+    rows = review.index("await window.zoeyDrift.servers(list, rows, queueReview);")
+    assert rows < review.index("window.zoeyApprovals?.servers(list, rows);")
+    footer = review.index("window.zoeyDrift.footer(held, answer, queueReview);")
+    assert footer < review.index("window.zoeyApprovals?.review(held, answer);")
 
 
 def test_app_js_gains_the_nav_entry_and_one_call() -> None:
