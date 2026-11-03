@@ -9,7 +9,9 @@ both links (TCP with the gateway key, and the link socket on Linux; D-72's requi
 - every request it can't read with exactly one meaning is refused with its rule's code and
   nothing goes upstream (FM-1 to FM-7, FM-22, FM-31, FM-32, FM-35, FM-36, FM-40);
 - deny, expire and withdraw send nothing and write one ending each (FM-10); two answers make one
-  forward, and a late one is refused by what happened (FM-11, Z6);
+  forward, and a late one is refused by what happened (FM-11, Z6); 20 decides and withdraws in
+  order make the first one's ending, and at once exactly one ending, and 20 collects at once
+  hand a result over once (D-78's vault point, M8 step 19);
 - the caller's leaving: at 2025-11-25 its cancel arrives as a notification the vault consumes
   (FM-29), at 2026-07-28 the dropped stream is the cancel (FM-30), and after an approval the
   forward finishes and its answer is kept, scrubbed (FM-13, FM-33);
@@ -78,6 +80,8 @@ pytestmark = pytest.mark.anyio
 REF_A, REF_B, REF_C, REF_D = (f"00000000000000b{n}" for n in "abcd")
 SHOP = "/shop/mcp"
 COLLECT = "/_zoeymcp/gateway/v1/approvals/collect"
+WITHDRAW = "/_zoeymcp/gateway/v1/approvals/withdraw"
+JSON = {"content-type": "application/json"}
 
 
 @pytest.fixture
@@ -541,8 +545,84 @@ async def test_late_answer_refused(tmp_path: Path, link: str) -> None:
 @pytest.mark.parametrize("link", LINKS)
 @pytest.mark.parametrize("order", ["approve-first", "deny-first", "withdraw-first"])
 async def test_concurrent_race(tmp_path: Path, link: str, order: str) -> None:
-    """FM-11, G-20: 20 decides and withdraws on the vault's loop at once. Exactly one of
-    "forwarded once" and "not sent" happens, with one decision and one outcome on the chain."""
+    """FM-11, G-20 (D-78's vault point): 20 decides and withdraws at once, each decide its own
+    task on the vault's loop from either surface, each withdraw the gateway's ``approvals/withdraw
+    caller_cancelled`` over the link, the schedule starting with ``order``'s kind. Whichever wins,
+    exactly one of "forwarded once" and "not sent" happens, as the chain's one decision and one
+    outcome say; every other decide is refused; the request is answered as that ending says; and
+    the client's slot for the tool is free again (D.3): its next call is held, not refused."""
+    # No cooldown after a decline, so the next call shows the slot alone.
+    rig = HoldRig(tmp_path, {"cooldown": 0}, link=link, surfaces=("portal", "telegram"))
+    first = order.removesuffix("-first")
+    kinds = ["approve", "deny", "withdraw"]
+    start = kinds.index(first)
+    moves = ((kinds[start:] + kinds[:start]) * 7)[:20]
+    found: list[Any] = [None] * len(moves)
+    withdrawals = {"epoch": EPOCH, "ref": REF_A, "client": "agent1", "reason": "caller_cancelled"}
+
+    async def move(index: int, kind: str, http: Any, hold: Hold) -> None:
+        if kind == "withdraw":
+            answer = await http.post(
+                WITHDRAW, content=canonical.dumps_canonical(withdrawals), headers=JSON
+            )
+            assert answer.status_code == 200, answer.text
+            found[index] = answer.json()["state"]
+            return
+        via: Literal["portal", "telegram"] = ("portal", "telegram")[index % 2]
+        decision: Literal["approve", "deny"] = "approve" if kind == "approve" else "deny"
+        found[index] = await rig.on_vault(
+            lambda: rig.app.decide(hold.id, decision, via, hold.text_sha256)
+        )
+
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            answer = Answer()
+            async with anyio.create_task_group() as group:
+                group.start_soon(answer.post, http, SHOP, call(), headers(held=marker(REF_A)))
+                [hold] = await rig.surface.holds(1)
+                async with anyio.create_task_group() as racing:
+                    for index, kind in enumerate(moves):
+                        racing.start_soon(move, index, kind, http, hold)
+            await rig.settled()
+            # The slot is free: the client's next call of the tool is held, then denied.
+            again = Answer()
+            async with anyio.create_task_group() as group:
+                group.start_soon(again.post, http, SHOP, call(id=2), headers(held=marker(REF_B)))
+                second = (await rig.surface.holds(2))[-1]
+                assert isinstance(await rig.decide(second, "deny"), Decided)
+            await rig.settled()
+    records = [r for r in rig.records() if r.ref == REF_A]
+    assert [r.kind for r in records] == ["asked", "decided", "outcome"]
+    decision = records[1].fields["decision"]
+    taken = [result for result in found if isinstance(result, Decided)]
+    refused = [result for result in found if isinstance(result, DecideRefusal)]
+    assert len(taken) + len(refused) == moves.count("approve") + moves.count("deny")
+    assert len(taken) == (0 if decision == "withdrawn" else 1)
+    assert {result.reason for result in refused} <= {"already_decided", "withdrawn"}
+    # Each withdraw is told the call's state as it found it: withdrawn only if a withdraw won.
+    states = {state for state, kind in zip(found, moves, strict=True) if kind == "withdraw"}
+    told = {"accept": {"approved", "forwarding", "done"}, "decline": {"denied"}}
+    assert states <= told.get(decision, {"withdrawn"}), (decision, states)
+    if decision == "accept":
+        assert len(rig.upstream.posts()) == 1  # once; the denied second call never
+        assert records[2].fields["outcome"] == "ok"
+        assert answer.json()["result"]["isError"] is False
+    else:
+        assert decision in ("decline", "withdrawn")
+        assert rig.upstream.posts() == []
+        assert records[2].fields["outcome"] == "not_sent"
+        code = {"decline": "approval_declined", "withdrawn": "approval_withdrawn"}[decision]
+        assert answer.json()["code"] == code
+    assert again.json()["code"] == "approval_declined"
+
+
+@pytest.mark.parametrize("link", LINKS)
+@pytest.mark.parametrize("order", ["approve-first", "deny-first", "withdraw-first"])
+async def test_moves_in_order(tmp_path: Path, link: str, order: str) -> None:
+    """FM-11: the same 20 moves in order, in one synchronous section on the vault's loop, each
+    withdraw the vault's own stop, so each schedule's first kind wins every run: approved, the
+    call is forwarded once; denied or stopped, nothing is sent; and a stop answers the waiting
+    request ``approval_withdrawn`` naming itself (step 17)."""
     rig = HoldRig(tmp_path, link=link, surfaces=("portal", "telegram"))
     first = order.removesuffix("-first")
     kinds = ["approve", "deny", "withdraw"]
@@ -583,6 +663,34 @@ async def test_concurrent_race(tmp_path: Path, link: str, order: str) -> None:
     )
     if first == "withdraw":
         assert answer.json()["reason"] == "shutdown"  # the vault's stop names itself (step 17)
+
+
+@pytest.mark.parametrize("link", LINKS)
+async def test_concurrent_collects_hand_the_result_over_once(tmp_path: Path, link: str) -> None:
+    """D-78's vault point: 20 collects of one approved pending call at once (an agent's
+    ``check_approval`` retried) hand its result over exactly once; the rest read it collected."""
+    rig = HoldRig(tmp_path, {"block_seconds": 0}, link=link)
+    found: list[dict[str, Any]] = []
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            sent = headers(held=marker(REF_A, wait="pending"))
+            response = await http.post(SHOP, content=call(), headers=sent)
+            assert response.json()["code"] == "approval_pending"
+            [hold] = await rig.surface.holds(1)
+            await rig.decide(hold)
+            await until(lambda: rig.app.holds.get(hold.id) is None, BOUND)
+            await rig.settled()
+
+            async def one() -> None:
+                found.append(await collect(http, REF_A))
+
+            async with anyio.create_task_group() as group:
+                for _ in range(20):
+                    group.start_soon(one)
+    given = [answer for answer in found if "result" in answer]
+    assert len(given) == 1
+    assert all((a["state"], a["collected"]) == ("done", True) for a in found if a not in given)
+    assert len(rig.upstream.posts()) == 1
 
 
 # --- the caller's leaving (B.6; FM-13, FM-29, FM-30, FM-33; Z23) ---------------------------------

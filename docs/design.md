@@ -1968,6 +1968,10 @@ The built shapes ship as profiles in `profiles/`; S5 is `google-oauth.yaml`, S6
 | S12 | **Hostile server** (fake only): tool definitions that change after review, injected instructions in descriptions and results, unrequested sampling and elicitation, secrets echoed in errors | — | M3 (refusals), M4 (approvals), M6 (the portal's review) |
 | S17 | **Managed policy lifecycle** (fake only): seed, saves of every kind, history, a rollback, export, edit and import, a rotation, a crash during a save, back to declarative and back, a restored volume | — | M6 |
 | S18 | **Prompts, resources and completions** (fake only): enabled and reviewed, served per path, hostile entries and contents, a prompt changed after review | — | M6 |
+| **Approvals** | | | |
+| S19 | **A vault-held MCP tool call** (fake only): approved, denied, expired and withdrawn, and the vault's refusals, from an attended and an out-of-band client | — | M8 |
+| S20 | **The portal queue approver** (fake only): approve with a passkey, deny with a session, a stale decision, both surfaces racing | — | M8 |
+| S21 | **`pending` and `check_approval`** (fake only): vault-held and relayed calls, collected once, another client's, expired, evicted, after a restart | — | M8 |
 | **SMTP** | | | |
 | S13 | Implicit TLS (465) via CONNECT, fixed recipient | Gmail app password | M4 |
 | S14 | STARTTLS (587) | generic | M4 |
@@ -2066,6 +2070,31 @@ until they are included, `review --choose` listing each kind, hostile entries re
 includable, the refusals of §5.1's table, a prompt changed after review hidden and marked, and,
 in managed mode, a portal save that makes a prompt served. The image smoke test runs the
 README's managed quickstart in both tiers.
+
+**M8's shapes as built.** **S19** (`tests/acceptance/test_vault_approval_shapes.py`) marks S10's
+`echo` `vault_approval` and runs it in both eras over both links: an attended client's call and
+an out-of-band client's each held by the vault, shown in the operator's Telegram chat (S3's fake
+Bot API, reached by the vault's own approver) in the vault's frame, approved there and forwarded
+once, the message edited as the call is sent and again with the server's answer; and both
+clients' calls denied, expired and withdrawn by a policy change, with nothing sent, each agent
+told why, and a deny or an expiry starting the cooldown. Over both links, the requests the vault
+can't read with exactly one meaning (§6.4), sent on the held route in either client's name, are
+each refused with its own code, nobody asked and nothing sent. **S20**
+(`tests/portal/test_approvals_queue.py`, and end to end through a real gateway in
+`test_vault_approval_shapes.py`) is the portal's Approvals queue: approved with a passkey and
+run once, denied with a session, a decision bound to a stale text refused, and Telegram deciding
+between the queue's prepare and its confirm, the first valid decision winning; Telegram is told
+how each call ended. **S21** (`tests/acceptance/test_pending_shapes.py`) is `pending` and
+`check_approval` in both eras over both links, for a call the vault holds and one the gateway
+relays out of band: the result given once, to the client that asked; another client's collect
+`unknown or expired`, over both links. Once each, over TCP: an expired call; a result evicted by
+its own client's bound; and how each call ended after a vault or a gateway restart. S13 and
+S14, as S15's transports (`tests/acceptance/test_toolkit_shapes.py`), run under both approval
+modes over both links: a send accepted, declined, or left unanswered past its deadline, only
+the accepted one sent; with `vault_approval` the vault holds the mail connector's send and its
+approver decides it, and the gateway records the call as approved elsewhere. Each ends with the
+sweep, which also finds no approver bot token. A vault or a gateway stopped or killed while
+calls wait is `tests/acceptance/test_held_crash.py` (Linux).
 
 ### 8.2 Other tests
 

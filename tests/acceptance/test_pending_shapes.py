@@ -25,7 +25,11 @@ The gateway-held relay half (M8 step 12b; E.4, F.2, F.5 step 2): the same tools 
 both clients ``out_of_band`` and nobody watching their sessions, so each call is relayed through
 the vault to the same surface and, unanswered in its block, answers ``pending <ref>``; the
 gateway runs it once approved and keeps its result in its own store, from which the owning
-client collects it once and another client learns nothing.
+client collects it once and another client learns nothing. Completed in M8 step 19 (O.5's S21:
+expired, evicted, after a restart): a relay nobody decided reads expired; a result past its
+client's bound in the gateway's store is evicted, and says it wasn't kept; and a relay outlives
+no gateway, since the next one's epoch withdraws it at the vault, so a late approval runs
+nothing.
 
 Every test ends with S10's sweep: the key, the tokens and the session ids reach no log, answer or
 output.
@@ -52,7 +56,7 @@ from zoeymcp.common import ledgerformat, resultstore
 from zoeymcp.gateway import checkapproval, elsewhere
 from zoeymcp.gateway.ledger import LEDGER_DIR
 from zoeymcp.vault.approvers import ApproverHub
-from zoeymcp.vault.holds import Hold
+from zoeymcp.vault.holds import DecideRefusal, Hold
 from zoeymcp.vault.keys import KeySet
 from zoeymcp.vault.vaultledger import VaultLedger
 
@@ -431,6 +435,106 @@ async def test_s21_relayed_then_collected_once(
         ("decided", "accept"),
         ("outcome", "ok"),
     ]
+
+
+async def test_an_expired_relay_says_so(tmp_path: Path, ca: ProviderCA) -> None:
+    """A relayed call nobody decided by the vault's deadline is closed at the gateway as the
+    vault ended it: ``check_approval`` says it expired, and nothing was run."""
+    fake = McpFake()
+    held = Held()
+    with (
+        held_deployment(tmp_path, ca, fake, held, relay=True) as gateway,
+        gateway.running() as running,
+    ):
+        with anyio.fail_after(BOUND):
+            async with agent(running) as owner:
+                ref = ref_of(await owner.call_tool("echo", {"text": "too late"}))
+                [hold] = await held.surface.holds(1)
+                held.clock.ahead += 3601  # past approvers.timeout, undecided
+                vault = gateway.vault
+                await anyio.to_thread.run_sync(lambda: vault.call(vault.app.sweep_holds))
+                await settled(gateway)
+                await until(lambda: running.app.approvals.table.get(ref) is None, BOUND)
+                expired = await check(owner, ref)
+        gateway.seen.outputs.append(text(expired))
+    assert hold.kind == "relay"
+    assert text(expired) == f"{checkapproval.EXPIRED} (ref {ref})"
+    assert ledger(gateway, ref)[2:] == [("decided", "timeout"), ("outcome", "not_sent")]
+    assert fake.calls == []
+
+
+async def test_a_relayed_result_the_clients_bound_evicted_says_it_wasnt_kept(
+    tmp_path: Path, ca: ProviderCA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F.2, Q44 (a), in the gateway's own store: a client's second relayed result past its own
+    bound evicts its first, whose collect says the call ran and its result wasn't kept; the
+    second is collected."""
+    fake = McpFake()
+    held = Held()
+    with (
+        held_deployment(tmp_path, ca, fake, held, relay=True, max_pending=2) as gateway,
+        gateway.running() as running,
+    ):
+        store = running.app.approvals.results
+        with anyio.fail_after(BOUND):
+            async with agent(running) as owner:
+                first = ref_of(await owner.call_tool("echo", {"text": "one"}))
+                second = ref_of(await owner.call_tool("add", {"a": 2, "b": 3}))
+                holds = {h.tool: h for h in await held.surface.holds(2)}
+                await decide(gateway, holds["echo"])
+                await settled(gateway)
+                await until(lambda: running.app.approvals.table.get(first) is None, BOUND)
+                size = store.total_bytes()
+                assert size > 0
+                # Room for one result: the next evicts the first (client_bound).
+                monkeypatch.setattr(resultstore, "MAX_CLIENT_BYTES", size * 3 // 2)
+                await decide(gateway, holds["add"])
+                await settled(gateway)
+                await until(lambda: running.app.approvals.table.get(second) is None, BOUND)
+                evicted = await check(owner, first)
+                kept = await check(owner, second)
+        gateway.seen.outputs += [text(evicted), text(kept)]
+    assert text(evicted) == f"{checkapproval.NOT_KEPT} (ref {first})"
+    assert not kept.is_error
+    assert text(kept) == "5"
+    evictions = [e for e in gateway.seen.events() if e.get("event") == "approval_result_evicted"]
+    assert [(e["ref"], e["reason"]) for e in evictions] == [(first, "client_bound")]
+
+
+async def test_a_gateway_restart_withdraws_a_waiting_relay(tmp_path: Path, ca: ProviderCA) -> None:
+    """A relay lives in the gateway that asked it (E.4): the gateway gone, a new one's epoch
+    withdraws it at the vault (G-15), so the operator's late approval runs nothing; the new
+    gateway holds no record or result of it, and the vault none for a relay, so the owner's
+    ``check_approval`` reads ``unknown or expired``."""
+    fake = McpFake()
+    held = Held()
+    with (
+        held_deployment(tmp_path, ca, fake, held, relay=True) as gateway,
+        gateway.vault_running() as vault,
+    ):
+        with gateway.gateway(vault) as first, anyio.fail_after(BOUND):
+            async with agent(first) as owner:
+                ref = ref_of(await owner.call_tool("echo", {"text": "lost with its gateway"}))
+        with gateway.gateway(vault) as second, anyio.fail_after(BOUND):
+            [hold] = await held.surface.holds(1)
+            await held.surface.until(lambda: bool(held.surface.closed))
+            await settled(gateway)
+            app = gateway.vault.app
+            late = await anyio.to_thread.run_sync(
+                lambda: gateway.vault.call(
+                    lambda: app.decide(hold.id, "approve", "portal", hold.text_sha256)
+                )
+            )
+            async with agent(second) as owner:
+                gone = await check(owner, ref)
+        gateway.seen.outputs.append(text(gone))
+    assert held.surface.closed == [(hold.id, "withdrawn")]
+    assert isinstance(late, DecideRefusal)
+    assert late.reason == "withdrawn"
+    assert gone.is_error
+    assert text(gone) == f"{checkapproval.UNKNOWN} (ref {ref})"
+    assert fake.calls == []
+    assert ledger(gateway, ref)[:2] == [("asked", "gateway"), ("decided", "pending")]
 
 
 def test_the_pending_text_names_the_tool_to_collect_with() -> None:
