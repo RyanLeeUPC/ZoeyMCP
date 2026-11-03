@@ -2133,9 +2133,9 @@ trap cleanup EXIT
 # in its compose file's window (D-35, M8 design I.2). Under the gateway's approval the gateway
 # drains the send itself; under vault_approval the dot comes later than the gateway's stop, which
 # cuts the agent's call, so the vault is stopped while its forward runs, which must finish and
-# be recorded sent on the vault's own chain (J9). Only the vault and the gateway are stopped: a
-# whole-project stop would stop the fakes and the egress role beside the gateway, and the role
-# cuts the tunnels open through it when it stops. The standard tier (deploy/compose.yaml, the
+# be recorded sent on the vault's own chain (J9). The fakes are left running; in the hardened
+# tier the egress role is stopped with the vault and the gateway, and must stop after the vault
+# (its depends_on, D-247), since the role cuts the tunnels open through it when it stops. The standard tier (deploy/compose.yaml, the
 # derived image) also does one S13 send; its vault reaches the Bot API through a CONNECT proxy
 # (tests/fakes/connect_proxy.py), since without a proxy the approver's client refuses a private
 # address (M8 design G.2). The hardened tier (deploy/compose.hardened.yaml, the egress-proxy
@@ -2635,6 +2635,7 @@ EOF
     sends_hard_ready
     sends_vault_id="$(sends_hard ps -q vault)"
     sends_gateway_id="$(sends_hard ps -q gateway)"
+    sends_role_id="$(sends_hard ps -q egress-proxy)"
     [ -n "$sends_vault_id" ] && [ -n "$sends_gateway_id" ] || sends_fail "no hardened vault or gateway"
     [ "$(docker inspect -f '{{.Config.Image}}' "$sends_vault_id")" = "$official" ] \
         && [ "$(docker inspect -f '{{.Config.Image}}' "$sends_gateway_id")" = "$image" ] \
@@ -2665,8 +2666,9 @@ EOF
         || sends_fail "the declined send reached the fake mail server"
 
     # sends_hard_stopped PATH ANSWER BODY PROMPTS: as sends_std_stopped, from a container on the
-    # agents network, and the vault and the gateway stopped once the final dot came: each exits
-    # 0, the gateway first, each with deploy/compose.hardened.yaml's window.
+    # agents network, and the gateway, the vault and the egress role stopped once the final dot
+    # came: the vault and the gateway each exit 0, the gateway first, each with
+    # deploy/compose.hardened.yaml's window, and the role last (D-247).
     sends_hard_stopped() {
         dots="$(sends_count sends_hard fake-smtp '"event":"smtp_dot"')"
         arrived="$(sends_count sends_hard fake-smtp "$delivered")"
@@ -2678,7 +2680,8 @@ EOF
         sends_until sends_hard fake-smtp '"event":"smtp_dot"' $((dots + 1)) \
             "the send never reached the fake mail server's final dot" "$work/sends-call"
         stop_at="$(date +%s%N)"
-        sends_hard stop gateway vault >/dev/null 2>&1 || sends_fail "the vault and the gateway didn't stop"
+        sends_hard stop gateway vault egress-proxy >/dev/null 2>&1 \
+            || sends_fail "the gateway, the vault and the egress role didn't stop"
         wait "$sends_pid" || sends_fail "the send in flight failed on stop: $(cat "$work/sends-call")"
         cat "$work/sends-call"
         if [ "$4" = 1 ]; then
@@ -2697,6 +2700,9 @@ EOF
         vault_stopped="$(date -d "$(docker inspect -f '{{.State.FinishedAt}}' "$sends_vault_id")" +%s%N)"
         gateway_stopped="$(date -d "$(docker inspect -f '{{.State.FinishedAt}}' "$sends_gateway_id")" +%s%N)"
         [ "$gateway_stopped" -lt "$vault_stopped" ] || sends_fail "the vault stopped before the gateway"
+        role_stopped="$(date -d "$(docker inspect -f '{{.State.FinishedAt}}' "$sends_role_id")" +%s%N)"
+        [ "$vault_stopped" -lt "$role_stopped" ] \
+            || sends_fail "the egress role stopped before the vault, cutting what the vault still sends (D-247)"
         if [ "$4" != 1 ]; then
             [ "$gateway_stopped" -lt "$delivered_at" ] \
                 || sends_fail "the gateway outlived the held send, so the vault wasn't stopped while its forward ran"
@@ -2707,11 +2713,13 @@ EOF
     sends_hard_stopped /s/mail/mcp accept "Stopped in flight, the gateway's approval, hardened tier." 1
 
     step "approvals, hardened tier: an accepted send stopped in flight finishes first, held by the vault and approved in Telegram (D-71)"
-    sends_hard start vault gateway >/dev/null 2>&1 || sends_fail "the vault and the gateway didn't start again"
+    sends_hard start egress-proxy vault gateway >/dev/null 2>&1 \
+        || sends_fail "the egress role, the vault and the gateway didn't start again"
     sends_hard_ready
     sends_slow sends_hard
     sends_hard_stopped /s/mail-held/mcp decline "Stopped in flight, vault_approval, hardened tier." 0
-    sends_hard start vault >/dev/null 2>&1 || sends_fail "the vault didn't start again"
+    sends_hard start egress-proxy vault >/dev/null 2>&1 \
+        || sends_fail "the egress role and the vault didn't start again"
     sends_recorded sends_hard vault "$sends_ref"
 
     step "approvals, hardened tier: the bot's token is in no log of the vault, the gateway or the egress role (G.1)"

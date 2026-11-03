@@ -467,9 +467,14 @@ def test_the_egress_role_is_a_profile_on_networks_of_its_own() -> None:
     # Its environment holds its key and nothing else: no master key, gateway key or policy.
     assert list(role["environment"]) == [egress_allowlist.KEY_ENV]
     assert _seconds(role["stop_grace_period"]) == 15
-    # With the profile off, nothing waits on it.
-    for service in services.values():
-        assert "egress-proxy" not in service.get("depends_on", {})
+    # D-247: only the vault waits on it, so compose stops it after the vault, whose sends on
+    # stop keep their tunnels; required: false, so with the profile off the vault starts alone.
+    assert vault["depends_on"]["egress-proxy"] == {
+        "condition": "service_started",
+        "required": False,
+    }
+    for name, service in services.items():
+        assert name == "vault" or "egress-proxy" not in service.get("depends_on", {})
 
 
 def test_the_egress_roles_uid_is_the_images_egress_user() -> None:
@@ -681,7 +686,10 @@ def test_the_hardened_override_adds_only_its_own_to_the_vault_and_the_role() -> 
     networks, services = document["networks"], document["services"]
     vault, before = services["vault"], base["vault"]
     assert vault["networks"] == {**before["networks"], "bridge-fetch": {}}
-    assert vault["depends_on"] == {"bridge-fetch": {"condition": "service_started"}}
+    assert vault["depends_on"] == {
+        **before["depends_on"],
+        "bridge-fetch": {"condition": "service_started"},
+    }
     assert {k: v for k, v in vault.items() if k not in ("networks", "depends_on")} == {
         k: v for k, v in before.items() if k not in ("networks", "depends_on")
     }
@@ -731,7 +739,10 @@ def test_compose_stops_a_hardened_bridge_after_the_vault() -> None:
     vault's window, and the bridge's own stop (its children's 4 s) fits its grace period."""
     services = merged("compose.hardened.yaml", "compose.bridge.yaml")["services"]
     assert services["gateway"]["depends_on"] == {"vault": {"condition": "service_started"}}
-    assert services["vault"]["depends_on"] == {"bridge-fetch": {"condition": "service_started"}}
+    assert services["vault"]["depends_on"] == {
+        "egress-proxy": {"condition": "service_started", "required": False},  # D-247
+        "bridge-fetch": {"condition": "service_started"},
+    }
     assert _seconds(services["vault"]["stop_grace_period"]) >= launcher.VAULT_STOP_WAIT
     assert _seconds(services["bridge-fetch"]["stop_grace_period"]) >= launcher.BRIDGE_STOP_WAIT
     assert "depends_on" not in services["bridge-fetch"]

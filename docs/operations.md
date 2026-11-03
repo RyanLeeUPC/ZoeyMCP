@@ -3641,6 +3641,11 @@ export ZOEYMCP_EGRESS_KEY=zeg1-...   # the line it printed
 docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
 ```
 
+- **Its place in the stop order.** The vault's `depends_on` names the role with `required: false`
+  (Compose 2.20 or later), so with the profile on compose starts the role before the vault and
+  stops it only after the vault: the role cuts the tunnels open through it when it stops, and
+  what the vault still sends in its stop window (an approved held call, an SMTP send, a Telegram
+  edit) keeps its tunnel. With the profile off the vault starts without it.
 - **Its container.** uid 10006 (the image's `egress` user, which owns no file), read-only, every
   capability dropped (it listens on 3128, so it needs no `NET_BIND_SERVICE`),
   `no-new-privileges`, no published port, and no ZoeyMCP setting but the key. Its command
