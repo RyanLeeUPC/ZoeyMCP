@@ -625,7 +625,8 @@ async def test_an_expiry_answers_a_waiting_poll(tmp_path: Path) -> None:
     table.start("cli", SERVER, Names("newco", "newco", "newco"), Options())
     due = table.allowances_expire_in()
     assert due is not None
-    assert ONBOARDING_TTL - 5 < due <= ONBOARDING_TTL
+    # Two readings of a real monotonic clock: their float difference can land one ulp over.
+    assert ONBOARDING_TTL - 5 < due <= ONBOARDING_TTL + 1e-6
     # Its expiry 0.3 s away.
     shift[0] = ONBOARDING_TTL - 0.3
     held = r.digest()
