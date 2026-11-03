@@ -335,9 +335,11 @@ def test_one_writers_second_asked_still_starts_a_new_entry() -> None:
 
 
 def test_a_record_with_no_writer_is_dropped() -> None:
+    """Dropped alone: the records after it still join."""
     nameless = {**decided(1, REF_A, "accept"), "writer": None}
     numbered = {**asked(2, T, REF_B), "writer": 3}
-    assert shape(join([asked(0, T, REF_A), nameless, numbered])) == [(REF_A, [("asked", 0)])]
+    entries = join([asked(0, T, REF_A), nameless, numbered, asked(3, T, REF_C)])
+    assert shape(entries) == [(REF_A, [("asked", 0)]), (REF_C, [("asked", 3)])]
 
 
 def test_the_other_writers_asked_joins_whatever_its_time() -> None:

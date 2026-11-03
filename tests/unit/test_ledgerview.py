@@ -876,6 +876,27 @@ def test_the_calls_only_the_vault_holds_are_bounded() -> None:
     assert result["vault_only_more"] == 2
     exact = page([], held=Held(), journals={}, now=NOW, chain=chain[:MAX_LIMIT])
     assert (len(exact["vault_only"]), exact["vault_only_more"]) == (MAX_LIMIT, 0)
+    later = page([], held=Held(), journals={}, now=NOW, chain=chain, before=MAX_LIMIT)
+    assert (later["vault_only"], later["vault_only_more"]) == ([], 0)  # the first page's only
+
+
+def test_the_gateways_records_are_read_by_writer_not_order() -> None:
+    """A copy holding the vault's asked and decided before the gateway's: the row is still the
+    gateway's asked, and the gateway's own decision is the one compared with the vault's."""
+    records = [
+        asked(0, T, HELD_REF, writer="vault", where="vault", client="agent2"),
+        asked(1, T + 1, HELD_REF, where="vault"),
+        decided(2, HELD_REF, "accept", writer="vault"),
+        decided(3, HELD_REF, "decline"),
+    ]
+    [row] = page(records, held=HELD, journals={}, now=NOW)["rows"]
+    assert (row["seq"], row["client"], row["decision"], row["disagree"]) == (
+        1,
+        "agent1",
+        "accept",
+        True,
+    )
+    assert row["writers"] == {"asked": "gateway", "decided": "vault"}
 
 
 def test_the_vault_asking_a_ref_again_keeps_the_copys_row() -> None:

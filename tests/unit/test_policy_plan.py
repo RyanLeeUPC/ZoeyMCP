@@ -2011,6 +2011,60 @@ def test_a_connectors_closed_set() -> None:
     assert planner.writes_through(MAILING, "notes") == ()
 
 
+def apart(data: dict[str, Any]) -> None:
+    """kit2 writes through post only, so mail and post share no writer."""
+    data["gateway"]["servers"]["kit2"]["slots"].pop("mail")
+
+
+def bridged(data: dict[str, Any]) -> None:
+    """With :func:`apart`: kit3 writes through mail and fax, kit4 through fax and post, neither
+    holding anything, so fax, which no writer holds, joins mail to post."""
+    data["connectors"]["fax"] = {**data["connectors"]["mail"], "host": "smtp.fax.example"}
+    data["routes"].append(_connector_route("fax"))
+    apart(data)
+    servers = data["gateway"]["servers"]
+    for name, through in (("kit3", ("mail", "fax")), ("kit4", ("fax", "post"))):
+        servers[name] = {
+            "kind": "toolkit",
+            "module": f"kits.{name}",
+            "pinning": "off",
+            "tools": {"include": ["ping"]},
+            "slots": {connector: _slot(f"{connector}-send") for connector in through},
+        }
+
+
+def test_a_closed_set_is_its_connectors_alone() -> None:
+    """A.4 (T-8): connectors that share no writer are each their own set, and a connector nobody
+    writes through has none; a connector the vault doesn't hold joins nothing to a held one, but
+    holding anew follows it; with no gateway, there is nothing."""
+    separate = make(held, mailing, apart)
+    assert planner.closed_set(separate, "mail") == (frozenset({"kit"}), ("mail",))
+    assert planner.closed_set(separate, "post") == (frozenset({"kit2"}), ("post",))
+    assert planner.closed_set(MAILING, "fax") == (frozenset(), ())
+    joined = make(held, mailing, bridged)
+    assert planner.closed_set(joined, "mail") == (frozenset({"kit", "kit3"}), ("mail",))
+    assert planner.connector_pairs(joined, "mail") == {("kit", "send")}
+    wider = planner.closed_set(joined, "mail", held=False)
+    assert wider == (frozenset({"kit", "kit2", "kit3", "kit4"}), ("fax", "mail", "post"))
+    none = Policy.model_validate({"version": 1, "mode": "managed"})
+    assert planner.closed_set(none, "mail") == (frozenset(), ())
+    assert planner.connector_pairs(none, "mail", held=False) == frozenset()
+
+
+def test_a_connectors_pairs_are_its_held_ones() -> None:
+    """Only the held tools of the closed set, unless asked for every approve tool; a writer of a
+    connector the vault doesn't hold is named alone."""
+    partial = make(held, mailing, unheld("kit2", "reply"))
+    assert planner.connector_pairs(partial, "mail") == {("kit", "send"), ("kit2", "post")}
+    assert planner.connector_pairs(partial, "mail", held=False) == {
+        ("kit", "send"),
+        ("kit2", "post"),
+        ("kit2", "reply"),
+    }
+    bare = make(mailing, unheld("kit", "send"), unheld("kit2", "post", "reply"))
+    assert planner.held_names(bare, frozenset({("kit", "send")})) == "kit.send"
+
+
 def kind_on(head: Policy, candidate: Policy) -> WriteKind:
     changes = structured(head, normalize(candidate))
     lost = planner.dropped(head, candidate)
@@ -2042,6 +2096,45 @@ def test_vault_approval_off_is_its_diff() -> None:
     assert kind_on(MAILING, more) == "policy.save"
     # With nothing dropped, the kind isn't this one.
     assert kind_on(HEAD, HEAD) == "policy.save"
+
+
+def untick(data: dict[str, Any]) -> None:
+    """write out of notes' include, approve and vault_approval, its pin kept: removals of Tools
+    lists only."""
+    tools = notes(data)["tools"]
+    for block in ("include", "approve", "vault_approval"):
+        tools[block] = [t for t in tools[block] if t != "write"]
+
+
+def test_vault_approval_off_is_its_removals_alone() -> None:
+    """The kind's diff is vault_approval removals and nothing else, even other Tools removals of
+    the same pair; removals that aren't every dropped pair aren't it; a pair that writes through
+    no connector is its own step even when the policy holds a connector."""
+    assert kind_on(HELD, make(held, untick)) == "policy.save"
+    changes = structured(HELD, normalize(make(held, unheld("notes", "write"))))
+    lost = frozenset({("notes", "write"), ("notes", "list")})
+    assert required_kind(changes, HELD, initial(HELD), lost=lost) == "policy.save"
+    off = make(held, mailing, unheld("notes", "write"))
+    assert kind_on(MAILING, off) == "tool.vault_approval_off"
+    assert planner.vault_off_rows(MAILING, frozenset({("notes", "write")})) == [OFF_ROW]
+    removed = structured(HELD, normalize(make(held, untick)))
+    assert [c.field for c in removed] == ["include", "approve", "vault_approval"]
+    assert not planner._permits("tool.vault_approval_off", removed[0])
+
+
+def test_a_vault_approval_removal_that_drops_nothing_is_its_own_row() -> None:
+    """A name taken out of vault_approval whose tool the head didn't hold (not included) drops
+    no pair, so it is shown as the weakening it is, not as a pair turned off."""
+    head = make(held, drop("write"))
+    found = on(
+        head,
+        make(held, drop("write"), unheld("notes", "write")),
+        kind="policy.import",
+        surface="socket",
+    )
+    assert isinstance(found, WritePlan)
+    assert found.dropped == ()
+    assert found.rows[1] == ("gateway.servers.notes.tools.vault_approval", "write removed (wider)")
 
 
 @pytest.mark.parametrize(
@@ -2175,6 +2268,7 @@ def test_holding_a_tool_is_a_narrowing_with_its_turn_on_lines() -> None:
     found = on(head, HELD, turn_on=lambda policy, server, tool: lines)
     assert isinstance(found, WritePlan)
     assert found.dropped == ()
+    assert found.rows[0] == ("Revision", "18, from 17")  # the lines add to the rows before them
     assert [row for row in found.rows if row[0] == "notes.write"] == [
         ("notes.write", line) for line in lines
     ]

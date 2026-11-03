@@ -970,9 +970,17 @@ def test_an_ask_names_the_call_its_text_and_its_wait() -> None:
         1_800_000_000_000,
         "pending",
     )
-    blocking = ask_body({**ASKED, "wait": "block"})
-    assert blocking.wait == "block"
-    assert blocking.text == TEXT
+    assert ask_body({**ASKED, "wait": "block"}) == Ask(
+        EPOCH,
+        REF,
+        "agent1",
+        "shop",
+        "cancel_order",
+        TEXT,
+        DIGEST_OF_TEXT,
+        1_800_000_000_000,
+        "block",
+    )
 
 
 def test_an_ask_hides_its_text() -> None:

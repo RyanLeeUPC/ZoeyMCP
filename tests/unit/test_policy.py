@@ -3997,6 +3997,19 @@ def test_unattended_clients_without_approve_tools_are_quiet(example_raw: Raw) ->
     assert not any("not attended" in w for w in warnings(run(raw)))
 
 
+def test_an_attended_client_doesnt_hide_a_later_unattended_one(example_raw: Raw) -> None:
+    """Row 19 passes over an attended client alone: the clients after it are still checked."""
+    raw = copy.deepcopy(example_raw)
+    agent2 = {"token_sha256": "sha256:" + "0" * 64, "servers": ["mail"]}
+    raw["gateway"]["clients"]["agent2"] = agent2
+    findings = run(raw)
+    assert errors(findings) == []
+    assert (
+        "gateway.clients.agent2: not attended, but assigned 'mail' with approve tools: they will "
+        "always be refused"
+    ) in warnings(findings)
+
+
 def test_approval_schema_bounds() -> None:
     approvals = Gateway.model_validate({}).approvals
     assert (approvals.cooldown, approvals.max_pending_per_client) == (15, 1)
@@ -4292,6 +4305,21 @@ def _read_lists_held(raw: Raw) -> None:
     read["review"]["place_order"] = "sha256:" + "f" * 64
 
 
+def _read_lists_both(raw: Raw) -> None:
+    _read_lists_held(raw)
+    read = raw["gateway"]["servers"]["broker-read"]
+    read["tools"]["include"].append("cancel_order")
+    read["tools"]["approve"].append("cancel_order")
+    read["review"]["cancel_order"] = "sha256:" + "e" * 64
+
+
+def _shared_after_connector(raw: Raw) -> None:
+    """Row 3's shared path, with the held connector's route renamed to sort before broker-mcp."""
+    route(raw, "mail-send")["name"] = "a-mail-send"
+    raw["gateway"]["servers"]["mail"]["slots"]["mail"]["route"] = "a-mail-send"
+    _shared_path(raw)
+
+
 def _second_writer(raw: Raw) -> None:
     raw["gateway"]["servers"]["mail2"] = copy.deepcopy(raw["gateway"]["servers"]["mail"])
     del raw["gateway"]["servers"]["mail2"]["tools"]["vault_approval"]
@@ -4302,6 +4330,14 @@ def _second_tool(raw: Raw) -> None:
     mail = raw["gateway"]["servers"]["mail"]
     mail["tools"].update(include=["send_note", "reply_note"], approve=["send_note", "reply_note"])
     mail["review"]["reply_note"] = "sha256:" + "e" * 64
+
+
+def _two_more_tools(raw: Raw) -> None:
+    _second_tool(raw)
+    mail = raw["gateway"]["servers"]["mail"]
+    mail["tools"]["include"].append("forward_note")
+    mail["tools"]["approve"].append("forward_note")
+    mail["review"]["forward_note"] = "sha256:" + "d" * 64
 
 
 def _http_slot(raw: Raw) -> None:
@@ -4395,11 +4431,21 @@ SAME_UPSTREAM = (
             _shared_path,
             "gateway.servers.broker-trade.path: broker-read, broker-trade share this path",
         ),
+        (  # a held connector's route sorting first doesn't end the routes' checks
+            _shared_after_connector,
+            "gateway.servers.broker-read.path: broker-read, broker-trade share this path",
+        ),
         (  # row 4
             _second_tool,
             "gateway.servers.mail.tools.vault_approval: route 'mail-send' is a held connector, "
             "held for every approve tool of every toolkit that sends through it or for none: add "
             "'reply_note', or take the others out",
+        ),
+        (
+            _two_more_tools,
+            "gateway.servers.mail.tools.vault_approval: route 'mail-send' is a held connector, "
+            "held for every approve tool of every toolkit that sends through it or for none: add "
+            "'forward_note', 'reply_note', or take the others out",
         ),
         (
             _second_writer,
@@ -4429,6 +4475,15 @@ SAME_UPSTREAM = (
             lambda r: telegram(r, bot_token="store:mail-pass"),
             "approvers.telegram.bot_token: store:mail-pass is also used by "
             "connectors.mail-out.password",
+        ),
+        (
+            lambda r: (
+                telegram(r, bot_token="store:music-stats"),
+                r["connectors"]["mail-out"].update(password="store:music-stats"),
+            ),
+            "approvers.telegram.bot_token: store:music-stats is also used by "
+            "credentials.music-stats.secret, connectors.mail-out.password: the approver needs a "
+            "bot of its own",
         ),
         (  # row 10
             lambda r: telegram(r, bot_token="env:APPROVER_BOT"),
@@ -4497,6 +4552,11 @@ SAME_UPSTREAM = (
             "'place_order', which this server lists without holding, so a call through its path "
             "would skip the vault's hold: add them to its vault_approval, or take them out of its "
             "tools",
+        ),
+        (
+            _read_lists_both,
+            "gateway.servers.broker-read.tools.vault_approval: route 'broker-mcp' is held for "
+            "'cancel_order', 'place_order', which this server lists without holding",
         ),
         (  # row 22
             _another_route(credential="broker-mcp"),
@@ -4679,6 +4739,20 @@ def test_an_out_of_band_client_is_asked_and_not_unattended(example_raw: Raw) -> 
     found = warnings(findings)
     assert not any("not attended" in w or "will be refused" in w for w in found), found
     assert not any(w.startswith("gateway.clients.agent1.sources") for w in found), found
+
+
+def test_an_attended_client_without_sources_is_warned(example_raw: Raw) -> None:
+    """Anyone with an attended client's token can answer its prompts: its sources say from where."""
+    raw = copy.deepcopy(example_raw)
+    del _agent1(raw)["sources"]
+    assert (
+        "gateway.clients.agent1.sources: anyone holding this client's token can make calls and "
+        "answer their prompts, with or without confirm_code; keep the token out of the agent's "
+        "sandbox and pin a source"
+    ) in warnings(run(raw))
+    assert not any(
+        w.startswith("gateway.clients.agent1.sources") for w in warnings(run(example_raw))
+    )
 
 
 def test_the_held_route_findings_need_a_hold(example_raw: Raw) -> None:
