@@ -1743,12 +1743,24 @@ ever logged.
 
 ## 19. Approvals
 
-An `approve` tool asks a human before each call, through the agent's own MCP client (an
-elicitation in form mode; see [clients.md](clients.md) for what to check in a client). Only a
-client whose policy entry has `approvals: {attended: true}` is ever asked; every other client's
-`approve` calls are refused at once ("refused: no approver for this client").
+An `approve` tool asks a human before each call. Who is asked is the client's setting, and the
+operator's statement that someone answers for it:
 
-What the human sees, rendered by the gateway and nothing else:
+- **`approvals: {attended: true}`:** the gateway asks through the agent's own MCP client (an
+  elicitation in form mode; see [clients.md](clients.md) for what to check in a client).
+- **`approvals: {attended: ..., out_of_band: true}`:** the gateway still renders and decides, but
+  asks on the vault's approvers instead (Telegram, the portal's Approvals queue, or both, §36),
+  so the agent's own client never sees the prompt. Every session of the client may then put a
+  prompt on your phone: ZoeyMCP can't tell a scheduled run from a conversation. A client with
+  both set is asked out of band (`check` warns that `attended` goes unused).
+- **Neither:** every `approve` call is refused at once ("refused: no approver for this client").
+
+A tool listed in its server's `tools.vault_approval` (a subset of `approve`) is approved by the
+vault, not the gateway, for a client that is `attended` or `out_of_band`; a client with neither
+is refused ("refused: this tool is approved out of band, and this client isn't allowed to raise
+out-of-band prompts"). §36 has the vault's side.
+
+What the human sees in an elicitation, rendered by the gateway and nothing else:
 
 ```text
 Approval request 3f9a2c41d07e8b15
@@ -1764,19 +1776,31 @@ End of approval request 3f9a2c41d07e8b15
 ```
 
 The ref heads and ends every prompt, is in the agent's answer and in the ledger, so one call can
-be followed from end to end. A toolkit shows a plan of exact writes instead of arguments (the
-mail toolkit: From, To, Subject, then the body as it will be sent).
+be followed from end to end. The deadline names the date too when it falls on another UTC day
+than the prompt was asked (`Answer by 2026-11-02 09:15 UTC.`). A toolkit shows a plan of exact
+writes instead of arguments (the mail toolkit: From, To, Subject, then the body as it will be
+sent). A prompt asked out of band says `Approve runs this one call, exactly as shown.`, to match
+its buttons, and one the vault renders itself also names the client "as reported by the gateway"
+and the tool's pin from the vault's policy (§36.5).
 
 - **Accept** runs exactly the call shown, once. Anything else (decline, dismiss, no answer before
   the deadline, the agent cancelling, the client losing the stream, a policy change, a stop)
   sends nothing, and the agent is told which.
 - **Busy:** while one call of a tool waits or runs, a second call of the same tool by the same
-  client is refused with the first one's ref and when it frees. A client has at most
-  `max_pending_per_client` prompts waiting (1), at most `max_prompts_per_hour` (30), and a
-  `cooldown` (15 s) after a decline before the same tool may ask again.
+  client is refused with the first one's ref and when it frees; an identical call (the same
+  arguments) while one answered `pending` gets that `pending <ref>` back instead. A client has at
+  most `max_pending_per_client` prompts waiting (1), out-of-band ones and calls the vault holds
+  included, at most `max_prompts_per_hour` (30), and a `cooldown` (15 s) before the same tool may
+  ask again after a `decline`, `dismiss`, `code_mismatch`, `timeout` or `mismatch`. The cost of
+  one lock per tool: one tool of one client is busy while its approval waits, up to
+  `approvers.timeout` (an hour by default) for an out-of-band one, and a modern client that drops
+  an elicitation without retrying holds the tool until its timeout and the cooldown pass. Raise
+  `max_pending_per_client` so the client's other tools can ask meanwhile.
 - **Timeouts:** `gateway.approvals.timeout` (300 s) must stay below the client's own tool-call
   timeout, or the client gives up before the human answers; a client's `approvals.timeout` may
-  only lower it. `check` refuses more than 600 s.
+  only lower it. `check` refuses more than 600 s. An out-of-band wait blocks the call only up to
+  `approvers.block_seconds` (120 s); past it the call answers `pending <ref>` and the agent
+  collects the result with `check_approval` (§36.4).
 - **Nothing hidden:** a prompt holding hidden characters, wide runs of spaces, stacked combining
   marks, or (for a client that renders Markdown, `renders: markdown`, the default) code fences,
   HTML or links, is refused before anyone is asked, as is one over `budget_chars` (3000; a
@@ -1787,10 +1811,17 @@ mail toolkit: From, To, Subject, then the body as it will be sent).
 - **Approve only what you read.** Keep routine calls in `allow`, so prompts stay rare enough to
   read.
 - **In managed mode** (§34) these settings (`gateway.approvals`, a client's `approvals`: whether
-  it is attended, its `renders`, `confirm_code` and its lower limits) are the host's: an export,
-  an edit and `zoeymcp policy import`. The portal classifies a tool `allow` or `approve` in a
-  review save, and moves one from `approve` to `allow` with a sentence of its own in the plan
-  (§12, §26).
+  it is attended or out of band, its `renders`, `confirm_code` and its lower limits) and the
+  whole `approvers` block (which approvers exist, the Telegram bot and ids, the waits) are the
+  host's: an export, an edit and `zoeymcp policy import` (`zoeymcp approver telegram enrol
+  --apply` plans that import for you, §36.2). The portal classifies a tool `allow` or `approve`
+  in a review save, moves one from `approve` to `allow` with a sentence of its own in the plan
+  (§12, §26), and turns `vault_approval` on in any save (**Hold in the vault**, a narrowing,
+  §36.1). Turning it off is its own act:
+  `vault_approval` goes off only through the portal's own step-up kind `tool.vault_approval_off`
+  (one tool, or every writer of one connector, per passkey, each with its own sentence) or a
+  host import with `--accept-widening`; a portal save, review save, `include` drop or rollback
+  that would drop a held tool is refused, and so is a host rollback.
 
 ## 20. Stopping with approved calls running
 
@@ -1801,6 +1832,32 @@ The shipped windows cover a 300 s `call_timeout`: the standard container's `stop
 itself needs); in the hardened compose the gateway has 330 s and the vault 330 s. If an `approve`
 tool's `call_timeout` is longer, `check` warns: raise the stop windows to match. A new approval
 asked during a stop is refused ("the gateway is stopping").
+
+**Approvals waiting across a stop, a restart or a reload** (§36):
+
+- **The gateway's stop** detaches the calls the vault holds for it that may answer `pending`: each
+  agent gets `pending <ref>` before the gateway closes its session, the vault keeps the hold, and
+  the next gateway hands the result over through `check_approval`. A held call that may only block
+  (a toolkit's mail send) and every relayed prompt are withdrawn, and their agents are told the
+  gateway is stopping; nothing was sent. A call the vault had already approved finishes in the
+  vault; the gateway records it `outcome unknown, detail shutdown`, and the vault's chain has the
+  real outcome.
+- **The vault's stop** refuses new holds (`stopping`), withdraws every undecided one (its message
+  edited "withdrawn: the vault stopped"; at most 5 s for every edit), and lets every approved
+  forward finish up to its deadline, which the vault's 330 s covers.
+- **A restart** of the vault withdraws everything undecided: holds, relays, pending records and
+  results live in memory only. Its chain survives, and at start the vault closes each call left
+  open and says so on Home and in `zoeymcp health` (`approvals_withdrawn_at_start`, and
+  `approvals_outcome_unknown` for an approved call the restart may have cut mid-forward: check
+  that upstream). A late press or approval names an approval that no longer exists, and is refused
+  with the reason. A **gateway restart** withdraws the relays and the legacy-session holds of the
+  gateway before it; a modern held call stays collectable through the new one.
+- **A reload, save, import or rollback** withdraws the holds a change touches: the tool taken out
+  of `vault_approval` or `approve`, moved to `allow`, re-pinned, or its route or server's path
+  changed; a change to the `approvers` block's waits or a kept approver's settings withdraws every
+  undecided hold; a client losing `out_of_band` (or `attended`, for a held call) loses its waiting
+  asks. Nothing is sent, the messages are edited, and the agent is told "the policy changed; call
+  the tool again".
 
 ## 21. The approval ledger
 
@@ -1822,6 +1879,40 @@ After a crash, the next start closes every call left open: a prompt that was wai
 line is moved aside. To anchor the chain, copy the head hash `--verify` prints somewhere the
 gateway can't write.
 
+**Two chains (M8).** A call the vault holds (`vault_approval`) or relays (an out-of-band client's
+prompt) is recorded twice. The gateway's chain has what it saw: `asked` with `where: vault` for a
+held call (it asked no one) or `where: gateway` for a relayed one, then `decided
+approved_elsewhere` (or `decline`, `timeout`, `withdrawn`, or `pending` while it waits) and its
+`outcome`. The vault writes its own chain in `/state/ledger-vault/`, in the same format with
+`writer: vault`, under a key of its own derived from the master key: `asked` before it asks
+anyone, `decided` with `via` (`telegram`, `portal`, `host` for a withdrawal from the host, or
+`none`) before it forwards, and `outcome` after the forward; a relay's vault outcome is always
+`unknown`, detail `relayed` (the gateway sent it, so its chain has the outcome). The vault's
+files rotate at 4 MiB. Past 64 MiB the oldest file is pruned, but only once its last record is
+30 days old by the vault's clock, so a flood can't push out recent history; until then new holds
+and relays are refused (below).
+Neither chain holds a prompt's text, an argument, a recipient or a chat or user id. **No chain,
+no hold:** while the vault can't write its chain (an I/O error, a full volume, or the chain's
+64 MiB full of records under 30 days old), every new hold
+and relay is refused `held_ledger_down`, nothing is sent, and health shows
+`vault_ledger_unavailable` until an append succeeds; a hold already asked can still be decided,
+but one whose `decided` can't be written is withdrawn and not forwarded. At start the vault
+recovers its chain as the gateway does its own: a hold that was waiting gets `decided abandoned`
+and `outcome not_sent` (`approvals_withdrawn_at_start` on Home), an approved one with no outcome
+gets `outcome unknown` (`approvals_outcome_unknown`, naming each ref: it may have run). A chain
+that can't be opened refuses the start, naming the path.
+
+The file layer of both chains logs the same lines (`role: gateway` for its chain, `role: vault`
+for the vault's):
+
+| Event | Fields |
+| --- | --- |
+| `ledger_write_failed` | `record_kind`, `error_type`, `queued` (records waiting to be written): a record couldn't be written; for a critical record nothing is asked or sent (critical) |
+| `ledger_chain_broken` | `seq`: the files stop chaining at that record; the next record starts a new file (critical) |
+| `ledger_repaired` | `torn_bytes`: a torn last line, moved aside at start |
+| `ledger_recovered` | `abandoned`, `not_sent`, `unknown`: how many calls the start closed, by how |
+| `ledger_pruned` | `first_seq`, `last_seq`: the records a pruned file held |
+
 **The vault's copy.** The gateway pushes each record, once it is on disk, to the vault over the
 link it already uses, and the vault keeps an append-only copy in `/state/ledger-reported/`, where
 the gateway can't write: a held head the gateway can't rewrite afterwards, and in the vault's own
@@ -1837,20 +1928,39 @@ vault, or on the portal's Ledger page (§26):
 zoeymcp ledger --vault                    # the copy's state, then the newest 200 calls with their sends
 zoeymcp ledger --vault --before 980       # older ones
 zoeymcp ledger --vault --format json
+zoeymcp ledger --vault --chain vault      # only the calls the vault's own chain holds
+zoeymcp ledger --vault --verify           # walk the vault's own chain with the vault's key
 ```
 
-Every row is as the gateway reported it. A send in a connector's journal whose call the copy
-doesn't hold is listed as an orphan. The copy here is the live chain and every archived chain a
-restart kept (below), so a send whose call was archived is no orphan. Each orphan has a flag:
+`--chain both` (the default) joins the vault's own chain to the copy by ref, never by digest
+(the two chains use different keys); `--chain copy` is the copy alone, and `--chain vault` the
+calls the vault's chain holds, joined to the copy. A held call's row then shows `asked` (the
+gateway, `where: vault`), `decided accept` via Telegram or the portal (written by the vault), the
+vault's `outcome`, and `approved_elsewhere` (the gateway's); a relayed call's outcome is the
+gateway's. Where the vault's decision and the gateway's differ (an accept in one, a decline or a
+withdrawal in the other), the row says "the chains disagree" and shows both. A call only the
+vault's chain holds (the gateway never reported it) is listed after the rows, newest 200, with a
+count of the rest. A vault chain that can't be read leaves the copy's rows as they are and says
+so.
+
+Every row is as the gateway reported it, but for what the vault wrote itself. A send in a
+connector's journal whose call the copy doesn't hold, and the vault's chain doesn't hold as
+`decided accept`, is listed as an orphan. The copy here is the live chain and every archived
+chain a restart kept (below), so a send whose call was archived is no orphan. The span the copy
+can check runs on the vault's clock (when it received each record), never the gateway's. Each
+orphan has a flag:
 
 | Flag | What it means |
 | --- | --- |
-| `not_yet_reported` | no report has reached the live chain since the send began: look again after the next one |
-| `older_than_copy` | the send began before the earliest record the copy still holds (the files holding its call were pruned after 30 days, or a restart deleted its archived chain), so it can't be checked |
-| `no_ledger_record` | the copy has had a report since the send began, covers its time, and holds no record of its call: a caller other than the gateway, or a gateway that didn't record it. However old the send, this stands |
+| `not_yet_reported` | no report has reached the copy since the send began: look again after the next one |
+| `older_than_copy` | the send began before the span the copy can check (the files holding its call were pruned after 30 days, or a restart deleted its archived chain), so it can't be checked |
+| `no_ledger_record` | the copy has had reports since the send began and holds no record of its call, and the vault's chain holds no accept of it: a gateway that didn't record it, a record that was lost, or a call the vault didn't approve |
 
 The journal keeps sends for 400 days and the copy may keep less, so `older_than_copy` is
-expected for old sends. No keyed digests are shown: check arguments with `zoeymcp ledger check` in the gateway.
+expected for old sends. The orphan check catches a send nobody recorded; it doesn't bound a
+compromised gateway, which picks each send's ref and can cover a send of its own with a record it
+makes up. Only the vault's own record of a call it held, under `vault_approval`, is beyond its
+reach. No keyed digests are shown: check arguments with `zoeymcp ledger check` in the gateway.
 The command exits 1 when the copy isn't `ok` or its files don't chain.
 
 The first report after an empty copy is taken on trust; after that every report must extend the
@@ -1903,6 +2013,10 @@ only the gateway, and only `GET /config` and `POST /send`.
   by the caller's `Idempotency-Key` (a toolkit uses its call's ref). A key is sent at most once:
   a repeat answers with the first result. A send cut after the final dot (or by a crash) is
   recorded `unknown` and never retried: check the recipient's mailbox before sending again.
+- **The approval shares the budget:** a send's approval text is the frame (the ref, the client,
+  the tool, the deadline and, held by the vault, the pin) plus From, To, Subject and the body,
+  all within `budget_chars`, so keep `max_body_chars` well below it: a body near the budget is
+  refused before anyone is asked, never cut.
 - **Kill switches**, fastest first: `paused: true` and reload (sends refused at once, no password
   needed to resume); drop the tool from the toolkit's `include`; revoke the app password at the
   provider.
@@ -1955,14 +2069,30 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 
 ## 24. What approvals can't do
 
+Each gap is closed by a mechanism, and only where that mechanism reaches (§36.6):
+
 - **A client can auto-accept.** The gateway can't tell a human's answer from software's: check
   each client ([clients.md](clients.md)) before marking it `attended`.
 - **A holder of an attended client's token can approve its own calls**, with or without a
-  confirmation code. Keep the token out of the agent's sandbox, and pin a source network where
-  the gateway sees the client directly; behind the `lan` proxy it sees only the proxy.
-- **A compromised gateway or toolkit can skip gateway approvals** until M8's out-of-band
-  approver. What the vault enforces still holds: fixed recipients, the limit, the pause, the
-  route allowlists, the send journal.
+  confirmation code, for every tool the gateway asks about by elicitation: the prompt goes back
+  to whoever made the call. Keep the token out of the agent's sandbox, and pin a source network
+  where the gateway sees the client directly; behind the `lan` proxy it sees only the proxy. The
+  out-of-band approvers close this: a `vault_approval` tool is asked on your approvers whichever
+  client calls it, and every `approve` tool of a client marked `out_of_band` is too, where the
+  token can't press a button. Such a token can still raise prompts on your phone, from any of the
+  client's sessions, within the caps.
+- **A compromised gateway or toolkit can skip the gateway's approvals**: every `approve` tool the
+  gateway asks about itself, relayed out-of-band prompts included (it renders their text and can
+  relay a false one, or not ask at all). Only `vault_approval` closes this, and only where the
+  vault holds what the call needs: a route with a credential, a connector, or a bridge; on a
+  route with no credential the standard tier's gateway can reach the upstream itself (`check`
+  warns), and another route to the same upstream with another credential is yours to check
+  (`check` warns). HTTP-route toolkit slots, toolkit plans of more than one write and tools that
+  mirror parameters into `Mcp-Param-*` headers can't be held. What the vault enforces still holds
+  everywhere: fixed recipients, the limit, the pause, the route allowlists, the send journal.
+- **A compromised gateway can still deny service** on a held tool: refuse to forward, flood the
+  vault's queue up to its caps, or report a false client name, which every approver shows as
+  "reported by the gateway". It can't approve, change the call or forward it twice.
 - **The standard tier shares egress** between the vault and the gateway (and so toolkits): use
   the hardened tier for toolkits with third-party dependencies.
 - **One gateway process:** approvals, locks and committed calls aren't shared between replicas.
@@ -1981,6 +2111,31 @@ gateway**: code in the gateway process can skip the gateway's approvals.
 | `refused: the tool or policy changed while waiting for approval` | a pin, policy or freshness change between ask and accept | `approval_decided`, the view |
 | `toolkit unavailable (ref ...)` | the module isn't registered, failed to import, or its slots don't match | `toolkit_unavailable` with `reason` |
 | `toolkit error: vault answered 403 blocked_<reason>` | the toolkit tried something its slots don't allow | `toolkit_vault_blocked` |
+| `pending <ref>: waiting for the operator's approval until ...` | not a failure: an out-of-band wait passed `approvers.block_seconds`, and the call runs when approved | §36.5; the agent calls `check_approval` |
+| `refused: this tool is approved out of band, and this client isn't allowed to raise out-of-band prompts` | a `vault_approval` tool, called by a client neither `attended` nor `out_of_band` | the client's `approvals` |
+| `refused: no out-of-band approver is configured for this call` | a `vault_approval` tool or an `out_of_band` client, and no `approvers.telegram` or `approvers.portal` | the `approvers` block (§36.2, §36.3) |
+| `refused: this tool sends parameters as headers, which a call the vault approves can't carry` | the tool's pinned schema mirrors parameters into `Mcp-Param-*` headers | `vault_approval_header_params` in health |
+| `refused: a vault-approved tool sends one write per call; nothing was sent` | a held toolkit's plan has more than one write | the toolkit |
+| `refused: the operator declined this call`, `refused: no answer before the deadline` | the vault's approver: a deny, or no answer by `approvers.timeout` | the ledger (both chains, §21) |
+| `refused: the policy changed; call the tool again`, `refused: the operator withdrew this call; nothing was sent`, `refused: the vault stopped; ...`, `refused: the gateway restarted; ...` | the hold was withdrawn: a change (§20), `zoeymcp approvals withdraw`, a stop or a restart | `approval_withdrawn` with `reason` |
+| `refused: the vault's approval queue is full`, `refused: too many approval requests this hour` | the vault's caps (§36.4) | `approvals_saturated` in health |
+| `refused: the vault can't record approvals right now; nothing was sent` | the vault's chain can't be written | `vault_ledger_unavailable` in health; the state volume |
+| `refused: the vault is restarting; nothing was sent; try again shortly` | the vault is stopping | try again |
+| `refused: too long to show in the operator's chat; nothing was sent` | the text is over Telegram's 4,096 units and the portal queue isn't on | `approval_refused_too_long`: enable the portal queue or lower `budget_chars` |
+| `refused: the approval text can't be shown as sent; nothing was sent` | Telegram returned another text than the vault sent | `approver_send_failed` with `error_type: text_changed` |
+| `refused: the vault couldn't read this call unambiguously` | the vault's envelope rules refused the request (a batch, another content type, an encoded body, a duplicate key, a header that disagrees, ...) | the vault's access log: the `held_<rule>` code |
+| `refused: the policy is changing; call the tool again` | the gateway's view and the vault's policy disagree on whether the tool is held (`view_stale`) | the next view; the gateway's link to the vault |
+| `refused: the vault didn't hold this call, so its result is withheld` | a held call came back without the vault's approval | `elsewhere_unheld` in health: stop the gateway and check both run the same release |
+| `refused: the vault couldn't be asked to relay this approval; nothing was sent` | the vault's ask endpoint didn't answer | `approval_relay_failed`; the gateway's link to the vault |
+| `refused: the approval was for another text than the one asked; nothing was sent` | the decision the vault returned names another text | `relay_digest_mismatch` (error): report it |
+| `refused: no room is left to keep this call's result; nothing was sent` | an `out_of_band` client's call: the gateway's result store is at its bounds, per client or in all, and nobody was asked | §36.4's result bounds; results waiting for `check_approval` |
+| `refused: an approval of this tool is already waiting at the vault; nothing was sent` | a relayed call: the vault's cap of one waiting per client and tool | `zoeymcp approvals list` (§36.7) |
+| `refused: this call's ref was used before; nothing was sent`, `refused: one held write per call; nothing was sent` | the vault saw this ref before: a toolkit's second held write in one call, a replayed ref, or a gateway or vault bug | the vault's access log: `held_ref_reused` or `held_second_write`; report it |
+| `refused: the approval text broke a rule; nothing was sent` (with ` at <place>` for a held call) | the vault checked the text again: a held call's rendering, or a relayed text that broke a text rule or imitated the vault's "Rendered by the gateway" line | the arguments; the client's `budget_chars` |
+| `refused: an identical call is being sent; try again` | an identical call to the same held tool is already in flight on this connection (Z27) | let the first one finish |
+| `refused: the vault couldn't be asked about this call; try again shortly` | `check_approval` couldn't reach the vault for a held call's status | the gateway's link to the vault |
+| `arguments refused: check_approval takes {"id": "<16 hex digits>"}, or nothing` | the agent called `check_approval` with other arguments | §36.5 |
+| `refused by the vault`, `refused by the vault; nothing was sent` | a code from the vault the gateway doesn't name, usually a gateway and a vault from different releases | `approval_refused` with `code`; check both run the same release |
 
 **A change while a prompt waits.** A save, an import or a reload can land while a prompt is
 still waiting. What the waiting call gets depends on the change, and on whether the client speaks
@@ -2397,15 +2552,20 @@ never a client secret, a fragment or a tool's definition.
 first, 200 rows a page (**Older rows** for more). Each call shows when it was asked, its client,
 server and tool, the decision, the outcome and how many writes it asked for and sent, and under
 it each of its sends from the SMTP connectors' journals: the state, the SMTP code and the time,
-never the Message-ID or the message's digest. Every row is as the gateway reported it; a record
-the vault wrote itself (from M8) says so. A client or server the current policy doesn't name is
-marked "Not in the current policy". Below the rows, on the first page, are the sends whose
-call neither the live chain nor a kept archived chain holds, each flagged in words (§21's
-table): "no ledger record" when the copy has had a report since the send began and covers its
-time (a caller other than the gateway, or a gateway that didn't record it), "not reported yet"
-when no report has reached it since, and "older than the ledger copy: can't be checked" when the
-send began before the earliest record the copy still holds. To judge them, the first page reads
-every kept archived chain too, at most 64 MiB. No keyed digest
+never the Message-ID or the message's digest. Every row is as the gateway reported it, joined by
+ref with the vault's own chain (§21): a call the vault held or relayed shows its decision with
+where it was made (Telegram, the portal, or the host's withdrawal), each record marked with who
+wrote it, and a row whose two chains' decisions differ says "the chains disagree". A client or
+server the current policy doesn't name is marked "Not in the current policy". Below the rows, on
+the first page, are the calls only the vault's chain holds (newest 200, then a count), and the
+sends whose call neither the copy (its live chain or a kept archived chain) nor the vault's chain
+explains, each flagged in words (§21's table): "no ledger record" when the copy has had reports
+since the send began and neither chain holds an accept of its call (a gateway that didn't record
+it, a record that was lost, or a call the vault didn't approve), "not reported yet" when no
+report has reached the copy since, and "older than the ledger copy: can't be checked" when the
+send began before the span the copy can check. To judge them, the first page reads every kept
+archived chain too, at most 64 MiB. A vault chain that can't be read leaves the copy's rows and
+says so. No keyed digest
 of a call's arguments or prompt is shown: check arguments with `zoeymcp ledger check REF FILE` in
 the gateway's container. The state line says where the copy's head is, when it last moved, and
 whether its files stop chaining. While the copy refuses reports (`fork`, `gap` or `full`, §21),
@@ -2417,6 +2577,34 @@ host, say), the vault refuses with what it finds now. Archived chains are listed
 each with **Show its rows**; a deleted one keeps only its head, as an anchor. A copy the vault
 can't read is shown as such, and can't be restarted until the state volume is fixed. Logs:
 `step_up_confirmed` with the action `ledger.restart`, then `ledger_reported_restarted`.
+
+**Approvals.** With `approvers.portal` in the policy, the Approvals page is the vault's queue of
+calls waiting for you (§36.3), and its nav entry shows how many. **Waiting** lists them oldest
+first: the ref, the server and tool, the client as the gateway reported it, held by the vault or
+relayed from the gateway, when it was asked and the absolute deadline in UTC, which approvers
+show it, and "not delivered to Telegram" where that is so. Opening one shows its whole text, as
+text. **Approve** shows the whole text again with "Approve runs this one call, exactly as shown."
+and asks for a passkey (`approval.decide`, one call per passkey; there is no bulk approve);
+**Deny** needs only your session. **Decided recently** lists the last 20 this queue closed, each
+with its outcome ("approved here 14:03 UTC; sent: ok"). A decision the other approver made first
+answers "Already decided in Telegram at ...", and one whose text changed answers
+`digest_changed`: open it again. Preparing an approval replaces a save prepared in another tab,
+and the dialog says so. The page's polls don't count as activity, so a queue left open doesn't
+keep a session alive past its idle limit. Home lists "N approvals waiting: the oldest must be
+answered by HH:MM UTC" with **Open the queue**, whether or not the gateway reports, and the
+findings of the last vault start (`approvals_withdrawn_at_start`, cleared by opening this page or
+`zoeymcp approvals list`, or after 24 hours, and `approvals_outcome_unknown`). Logs: `step_up_confirmed` with
+`approval.decide`, then the vault's `approval_decided` with `via: portal`; a deny logs
+`approval_decided` with `decision: decline` and `via: portal`.
+
+**Hold in the vault** (managed mode). On a server's page, an `approve` tool's row has **Hold in the
+vault**, and the review screen a box of the same name: a narrowing, saved as a `policy.save` whose
+plan says, before the passkey, how each client given the server will be asked and whether its
+route holds a credential (§36.1). **Turn off vault approval** prepares `tool.vault_approval_off`
+for that tool (for a held connector, for every writer of it), its plan reading "<tool>:
+vault_approval off. The gateway will ask instead of the vault; a compromised gateway could then
+skip the approval. Calls waiting now are withdrawn." Logs: `step_up_confirmed` with the kind,
+then `tool_vault_approval_off` for each tool (§34).
 
 **Policy.** The Policy page shows the running policy, read-only: this deployment's policy is
 declarative, so change it in its source (the file given with `--config`, `ZOEYMCP_CONFIG`, or
@@ -4117,6 +4305,13 @@ the vault compares them with its head. Nothing is refused on it: the gateway app
 either way, and the vault keeps running. Back up the vault's volume and the gateway's apart, so a
 restore of one leaves the other to notice.
 
+**A restore can turn `vault_approval` off.** A restored `/state` brings back the policy of its
+day, which may predate a tool's `vault_approval`: that tool is then the gateway's to approve
+again, and nothing refuses it. It also rolls back the vault's approval chain and the send journal
+together, so they still agree with each other. `policy_behind_witness` is the signal; after any
+restore, compare the head with your latest export (`zoeymcp policy export`), `vault_approval`
+lists included, and import the export to put back what the restore undid.
+
 **The whole `/state` restored, the gateway's volume not.** The vault starts on revision 27, the
 gateway has seen 31. Health (and a banner on every portal page) shows `policy_behind_witness`
 (error): "the gateway has applied revision 31; this vault holds 27. Was the state volume
@@ -4496,6 +4691,402 @@ hostile, a token that leaked), these stop it, fastest first. Each is undone the 
   then **Save** (one passkey each); the gateway refuses the client there at once. Then remove the
   client, or give it a new `token_sha256`, with an export, an edit and `zoeymcp policy import`
   (§10). In declarative mode, remove the client (or its `token_sha256`) and reload (§10).
+- **Withdraw every approval waiting** at the vault: `zoeymcp approvals withdraw --all` ("withdrew
+  3 approvals (3f9c…, 9a01…, 77e1…): nothing was sent; their messages were edited"); the agents
+  are told the operator withdrew their calls. One call: `zoeymcp approvals withdraw <ref>`. A call
+  already approved and running finishes. Nothing to undo: the agent calls again.
+- **Stop Telegram now**: revoke the bot's token with the bot-making account first. That stops it
+  at once, with no policy change: the vault's next poll fails, health shows
+  `approver_unreachable`, and every waiting call stays decidable in the portal queue or expires.
+  If Telegram should stay off, remove `approvers.telegram` (managed: a host import; declarative:
+  a reload); a call still shown in the portal queue stays there, and one left with no approver is
+  withdrawn and its message edited "This approver was switched off." If Telegram is your only
+  approver, `check` refuses the removal while any tool is `vault_approval` or any client
+  `out_of_band`: add `approvers.portal` in the same change, or turn those off too, which the
+  import's plan lists as widenings.
+- **The bot's token leaked** (`approver_contested`: another program reads the bot's updates):
+  revoke it with the bot-making account, then store the new one, `zoeymcp secret set
+  approver-bot`; the vault reads it at its next poll. A holder of the old token could only delay
+  approvals and send look-alike prompts, whose buttons approve nothing (§36.6).
 
 After any of these, read what happened: `zoeymcp health`, the ledger (§21) and the vault's and
 the gateway's logs.
+
+## 36. Vault-enforced and out-of-band approvals
+
+The vault hosts two approvers of its own: a **Telegram bot** that messages you, and the portal's
+**Approvals queue**. Either or both (`approvers.telegram`, `approvers.portal`); every approver
+shows every approval, and the first valid answer wins. They serve two kinds of call:
+
+- **A tool listed under `vault_approval`** is held and approved by the vault itself. The gateway
+  forwards the call without asking anyone, marked as approved elsewhere; the vault reads the
+  request, renders the approval from it, asks you, and forwards the call only once you approve,
+  injecting the credential only then. A compromised gateway can't skip it where only the vault
+  can make the call (a route with a credential, a connector or a bridge, or the hardened tier;
+  §36.6).
+- **Every `approve` tool of a client marked `out_of_band`** is asked on your approvers instead of
+  in the agent's own client. The gateway still renders, decides and forwards; the vault only
+  relays the prompt, marked "Rendered by the gateway", and your answer.
+
+Short waits block the call; longer ones answer `pending <ref>`, the call runs as soon as you
+approve, and the agent collects its result with the gateway's `check_approval` tool (§36.5).
+Everything waiting lives in memory: a restart withdraws it (§20).
+
+### 36.1 Marking a tool
+
+`vault_approval` is a subset of a server's `approve`, and needs an approver:
+
+```yaml
+approvers:
+  portal: {}                       # the Approvals queue (needs the admin block)
+  telegram: {bot_token: "store:approver-bot", user_id: 100000001, chat_id: 100000001}
+  timeout: 3600                    # the deadline of a held or relayed call, in seconds
+  block_seconds: 120               # how long a call blocks before it answers pending
+  result_ttl: 3600                 # how long a result waits for check_approval
+gateway:
+  clients:
+    desk: {token_sha256: "sha256:...", servers: [broker], approvals: {attended: true}}
+    nightly:
+      token_sha256: "sha256:..."
+      servers: [broker]
+      approvals: {attended: false, out_of_band: true}
+  servers:
+    broker:
+      tools:
+        include: [get_quote, place_order]
+        allow: [get_quote]
+        approve: [place_order]
+        vault_approval: [place_order]
+```
+
+Both `desk` (attended) and `nightly` (out of band) may call `place_order`, and each call is held
+by the vault; a client with neither is refused. `check` keeps a held tool bindable:
+
+- **errors:** a held name not in `approve`; `vault_approval` or `out_of_band` with no approver;
+  two servers on one route path while either holds a tool; a connector held for only some of the
+  toolkit servers that write through it; a held toolkit tool whose approved writes reach a route
+  that isn't a connector; a pattern rule, or a POST rule beyond its servers' exact paths, on a
+  route that carries a held server; another route to the same upstream with the same credential
+  or store name; a second server on a held route that lists a held tool without holding it; a
+  Telegram bot token that isn't a `store:` secret, or whose store name a credential, route or
+  connector also uses; `chat_id` other than `user_id`; `block_seconds` over `timeout`;
+  `approvers.portal` with no `admin` block; and the name `check_approval` anywhere in a server's
+  lists, since it is the gateway's own tool;
+- **warnings:** a held tool on a route with no credential that isn't a connector or a bridge (in
+  the standard tier the gateway can reach that upstream itself, so the hold binds only in the
+  hardened tier); another route to the same upstream with another credential (make sure it can't
+  call the held tool); a client given a held tool that is neither attended nor out of band (its
+  calls will be refused); a held server whose `call_timeout` is past the 300 s the stop windows
+  cover (§20); a held toolkit whose `call_timeout` is under 150 s (a held send waits at most
+  `call_timeout` minus 30 s for you); `budget_chars` over 3,600 with Telegram on (longer texts are
+  decided in the portal only; an error when Telegram is the only approver).
+
+**What the vault holds.** On a route that carries a held server the vault reads every POST before
+anything goes upstream, and refuses anything it can't read one way only: a batch, an array or a
+scalar, another content type than exactly `application/json` (with at most `charset=utf-8`), any
+`Content-Encoding`, a duplicate key, a number that doesn't round-trip, a method or tool name in
+another case or form, a tool the policy doesn't list, a routing header (`Mcp-Method`, `Mcp-Name`,
+`MCP-Protocol-Version`) that disagrees with the body, any `Mcp-Param-*` header, a header the
+gateway never sends, a query string, and a path outside the route's servers' exact paths. A
+`tools/call` of a held tool is held, whether the gateway marked it or not; other MCP methods pass.
+The vault renders the approval from the body it holds and the pin from its own policy, under the
+same text rules and budget as the gateway, and on Approve forwards the canonical form of exactly
+what it rendered. A held toolkit send (an approved write to a connector) is held the same way,
+from the connector's own fields. The forward runs to its own deadline (`call_timeout` plus 10 s)
+whether or not anyone still waits, is never retried, and its outcome is recorded in the vault's
+chain (§21).
+
+**In managed mode** a tool's row on its server's page has **Hold in the vault**, and the review
+screen a box of the same name (§26): a narrowing, allowed in any save. Its plan says, before the
+passkey, what changes for each client given the server:
+
+```text
+broker.place_order: vault_approval on.
+  The vault will hold every call to place_order and ask you on Telegram or in the Approvals
+  queue. The gateway will no longer ask in the agent's own client.
+  desk (attended): asked on your approvers instead of in its client.
+  nightly (out of band): asked on your approvers, as before.
+  batch (neither): refused, as before ("nobody answers for this client").
+```
+
+and then whether the tool's route holds a credential. With no approver set up, both controls
+are disabled: "Set up an approver first (Telegram or the Approvals queue): a host step,
+operations.md §36.2". A held connector is turned on, and off, for every writer at once. Turning a
+tool off is its own act (§19's rule): **Turn off vault approval**, one passkey per tool (or per
+held connector), or a host import with `--accept-widening`; a review save or rollback that would
+drop it is refused `vault_approval_off_needs_its_own_step` or `rollback_drops_vault_approval`, and
+a managed start that would drop it `resume_drops_vault_approval` (§34). Each tool turned off is
+logged `tool_vault_approval_off`, and every call waiting for it is withdrawn.
+
+**The self-test** (`zoeymcp selftest --cases`) expects a held call with `held: true` in place of a
+status: the call must be held (the self-test's stand-in approver sees it once), nothing reaches
+the upstream, and the self-test withdraws it. It never starts an approver; the allowlist it
+checks names `api.telegram.org:443` with the reason `approver` when the policy names Telegram.
+
+```yaml
+cases:
+  - name: an order waits for the operator
+    request:
+      method: POST
+      path: /broker/mcp
+      caller: gateway
+      headers: {content-type: application/json, mcp-protocol-version: "2025-11-25"}
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"place_order"}}'
+    expect: {held: true}
+```
+
+### 36.2 The Telegram approver
+
+1. **Make a bot of its own**, directly with Telegram's own bot-making account (@BotFather): never
+   through another bot (whoever manages a bot can fetch and replace its token, and a bot can't
+   tell that it is managed), never a bot an agent uses or can read the token of. Keep its privacy
+   mode on and never add it to a group. The vault can't check how the bot was made: this step is
+   yours.
+2. **Store its token** as a write-only secret, bound to the Bot API (the policy doesn't name it
+   yet, so give the origin):
+
+   ```text
+   $ docker compose -f deploy/compose.hardened.yaml exec -T vault zoeymcp secret set approver-bot --origin https://api.telegram.org
+   ```
+
+3. **Enrol your account.** `approver telegram enrol` finds your ids: it opens a temporary egress
+   allowance for the Bot API (§28), prints a one-time link (10 minutes, single use), and waits for
+   you to press Start in the bot's chat on the phone you will approve from. The bot then sends
+   that chat a confirmation code, which you type at the host, so a token holder who saw your
+   Start can't enrol its own account:
+
+   ```text
+   $ docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp approver telegram enrol --secret approver-bot --apply
+   Opened a temporary egress allowance: api.telegram.org:443 (approver, 10 minutes).
+   The bot is @<bot>. On the phone you'll approve from, open this link and press Start
+   (it works once, for 10 minutes): https://t.me/<bot>?start=<one-time code>
+   Waiting for /start ... (Ctrl-C to stop)
+   Seen: user 100000001 ("<first name>", @<username>) in its private chat 100000001.
+   The bot sent that chat a confirmation code. Type it here: ******
+   Confirmed.
+   ```
+
+   It then prints the `approvers` lines. With `--apply` in managed mode it plans a host import of
+   them, shows the plan and asks `[y/N]`; without it, or in declarative mode, add the lines
+   yourself and reload. Nothing is written before you answer. An enrolment stops with
+   `enrolment_contested` (and health raises `approver_contested`) if the code is presented twice,
+   or another program polls the bot or set a webhook on it; with `enrolment_unconfirmed` for a
+   wrong code; and is refused for a bot that can manage other bots (`approver_can_manage_bots`) or
+   whose token, or bot, another secret, credential, route or connector also holds
+   (`approver_token_shared`).
+4. **Check** the policy: `check --emit-egress-allowlist` now lists `vault api.telegram.org:443`,
+   the reason `approver`, for the egress role or your own proxy (§28).
+5. **Test it.** The import (managed) or the reload (declarative) starts the approver with no
+   restart. `zoeymcp approver telegram test` sends "ZoeyMCP test: approvals reach this chat. This
+   message has no buttons and needs no answer." and exits 0 when Telegram took it, 1 with the
+   reason otherwise; `zoeymcp health` reads `approver telegram: ok (@<bot>, last poll 3 s ago)`.
+
+A prompt is one monospaced block, with link previews off and forwarding and saving disabled, and
+two buttons, **Deny** then **Approve**:
+
+```text
+Approval request 3f9c0a17b2d4e681
+Client (reported by the gateway): desk
+Tool: broker → place_order (pin sha256:3f1c…e2, from the vault's policy)
+Answer by 16:39 UTC. Approve runs this one call, exactly as shown.
+
+{
+  "quantity": 1,
+  "side": "buy",
+  "symbol": "XYZ"
+}
+End of approval request 3f9c0a17b2d4e681
+```
+
+After an answer the message is cut down to its ref and outcome, with no buttons: "Approval
+request 3f9c0a17b2d4e681: approved 15:40 UTC in Telegram. Sending…", then "… Sent: the server
+answered ok."; a deny, an expiry or a withdrawal reads "denied … Nothing was sent.", "expired …",
+"withdrawn: the policy changed" and so on, and one decided in the portal says so. A press on a
+message that is no longer waiting gets "This request is no longer pending", and its message the
+reason. A text longer than a Telegram message (4,096 UTF-16 units) is never cut: with the portal
+queue on, Telegram gets a notice to decide it there; without it the call is refused before anyone
+is asked. Every write to the chat goes out at most one per 1.1 s, so a burst of prompts arrives
+over seconds rather than being refused.
+
+**Every press is checked** against the message the vault sent: from your account, not a bot, in
+your private chat, on the message it stored for that approval, never edited, its text's digest
+and its keyboard unchanged, its button data signed with a key the vault made at start, for an
+approval still waiting. Anything else is refused and logged by reason only, and a stranger's
+press gets no answer at all. So a leaked bot token can delay or drop approvals, and send
+look-alike prompts whose buttons approve nothing, but can't make a press approve anything the
+vault didn't send. **Rotate the token** with the bot-making account, then `zoeymcp secret set
+approver-bot`; the vault reads it at its next poll (§35).
+
+### 36.3 The portal queue
+
+`approvers: {portal: {}}` (with an `admin` block) turns on the portal's Approvals page (§26):
+approve with a passkey, one call per passkey; deny with your session. It is the stronger
+approver: a passkey assertion is fresh user verification, where a chat account isn't. It has no
+push: Home and the nav's count are how you learn of a waiting call, so pair it with Telegram for
+anything that must not wait. It is for your browser on `localhost`, an SSH tunnel or your own
+`https` proxy (§26), not for phones; Telegram is the phone approver.
+
+### 36.4 Waits and timeouts
+
+| Wait | Default | Bounds | Who ends it |
+| --- | --- | --- | --- |
+| `approvers.timeout`: a held or relayed call's deadline | 3,600 s | 60 s to 86,400 s | the vault: the call expires, nothing is sent, and a cooldown starts |
+| `approvers.block_seconds`: how long an MCP call blocks | 120 s | 0 to 600 s, and at most `timeout` | the vault: past it the call answers `pending <ref>` and stays waiting until `timeout` |
+| a held toolkit send's wait (blocks only, never pending) | its toolkit's `call_timeout` minus 30 s | | the vault: then it expires |
+| `approvers.result_ttl`: a result kept for `check_approval` | 3,600 s | 60 s to 86,400 s, after the call runs | the store: then `unknown or expired` |
+| an approved call's forward | the server's `call_timeout` plus 10 s | | the vault's own deadline; never retried |
+| `gateway.approvals.timeout`: an elicitation | 300 s | at most 600 s | the gateway (§19); unchanged for out-of-band waits |
+| the tool's lock for its client | until the call ends | at most `approvers.timeout` + `call_timeout` + 30 s | the gateway, as soon as it learns the call's ending |
+| an agent that leaves | | | a blocking call is withdrawn and never sent; a pending one runs when approved and its result waits |
+
+Keep `block_seconds` within what your clients allow a tool call ([clients.md](clients.md)): the
+gateway never relies on progress to stretch a wait. While a call blocks it sends a progress
+notification every 15 s if the client asked for progress, which a client may or may not count
+as activity.
+
+The vault's caps bound what a flood can do (a flood is refused and sends nothing): 64 held and
+relayed calls in all and 16 MiB of held bodies, 16 per route, 4 per tool, one waiting per client
+and tool, `gateway.approvals.max_prompts_per_hour` per tool and 300 an hour in all, and
+`gateway.approvals.cooldown` after a deny or an expiry. A cap that refuses raises
+`approvals_saturated` and sends each approver at most one notice per 10 minutes ("The approval
+queue is full: N requests were refused in the last 10 minutes. Nothing was sent."). Results
+waiting for `check_approval` are bounded too: 256 calls, 16 per client, 4 MiB per result,
+16 MiB per client and 64 MiB in all. A client over its bound loses its own oldest uncollected
+result first (`approval_result_evicted`), never another client's; a store full of other clients'
+results refuses the new call as busy.
+
+### 36.5 What the agent sees
+
+A call that waits past `block_seconds` answers at once with a tool error that says it isn't one:
+
+```text
+pending 3f9c0a17b2d4e681: waiting for the operator's approval until 2026-11-01 16:40 UTC. It runs
+as soon as it is approved, whether or not you check. Do not call place_order again; call
+check_approval with {"id": "3f9c0a17b2d4e681"} to get the result; it is kept for 60 minutes after
+the call runs and given once. This is not a failure.
+```
+
+It carries no `structuredContent`, even for a tool with an `outputSchema`, which the MCP SDKs
+accept (clients.md lists it as a known deviation). `check_approval` is the gateway's own tool,
+listed on a server with an `approve` tool for a client that may be asked out of band there, while
+an out-of-band approver is set; it is never pinned or reviewed, and an upstream tool of that name
+is never served (`reserved_tool_name`). With `{"id": "<ref>"}` it answers the call's result once,
+sanitized and checked against the tool's pinned `outputSchema` like a direct answer, or what
+happened: "approved: the call is running; call check_approval again shortly", "declined: the
+operator declined this call; nothing was sent", "expired: no answer before the deadline; nothing
+was sent", withdrawn with the reason, "already collected", "the call ran, but its result wasn't
+kept; see the Ledger", "ended when the vault restarted; nothing was sent", or "unknown or
+expired" for any ref that isn't this client's own on this server. With no `id` it lists the
+client's own calls there (ref, tool, status, deadline; never a result or a text). §25 lists the
+refusals.
+
+### 36.6 What an out-of-band approval trusts
+
+**Telegram sees every prompt.** Bot chats aren't end-to-end encrypted: Telegram can read each
+approval text, its arguments included, until the vault cuts the message down to its ref and
+outcome, and keeps what its own history keeps. Your chat account is an approval credential:
+whoever holds a live session of it (a linked desktop, a taken-over number, an unlocked phone) can
+approve whatever is sent there, with no fresh user verification. The portal queue's passkey is
+the stronger approver; enable the queue alone for the tools that matter most. The same holds for
+an agent client hosted by someone else: an elicitation passes through its service, and an
+`attended` client's prompts are as private as that service. Telegram's client is what shows you
+the text, and may make something in it a link even inside the monospaced block; previews are off,
+so it fetches nothing.
+
+M8 closes the approval gaps by mechanism and only within scope: a holder of an agent's token
+can't answer its own prompt for a `vault_approval` tool, or for any `approve` tool of an
+`out_of_band` client, and a compromised gateway or toolkit can't skip the approval of a
+`vault_approval` tool where only the vault can make the call (its route holds a credential, is a
+connector or a bridge, or the deployment is hardened); every other approval is the gateway's,
+which a compromised gateway or toolkit can still skip.
+
+So a relayed prompt (an `out_of_band` client's `approve` tool) stops an agent holding the
+client's token from approving its own calls; only `vault_approval` stops a compromised gateway,
+which renders a relayed prompt and could relay a false one, or not ask at all. That is why every
+relayed prompt starts with the vault's line "Rendered by the gateway: the vault can't confirm
+this is the call the gateway will run." The vault composes it, the gateway can't remove it, and
+a text that imitates it is refused. A held call's client is labelled "reported by the gateway",
+since the gateway says who called; the tool, its arguments and its pin are the vault's own. The
+pin is the one the vault's policy holds: the vault doesn't compare it with the upstream's current
+definition, so a compromised gateway could hide a held tool's drift from you.
+
+### 36.7 Troubleshooting
+
+| Health finding | What it means | What to do |
+| --- | --- | --- |
+| `vault_ledger_unavailable` (error) | the vault can't write its approval chain, so every new held call is refused | check the state volume (full, read-only), or whether the chain's 64 MiB is full of records under 30 days old (the oldest file is pruned once its last record is 30 days old) |
+| `approvals_saturated` (error) | the caps refused calls in the last 10 minutes | if you didn't expect this many, check the gateway |
+| `approvals_withdrawn_at_start` (info) | the last vault start withdrew calls that were waiting; nothing was sent | `zoeymcp approvals list` or the Approvals page (either clears it, or it clears after 24 hours); the agents call again |
+| `approvals_outcome_unknown` (warning, 24 hours) | approved calls (named by ref) may have run before the vault stopped | check each upstream; see the Ledger |
+| `approver_token_shared` (error) | another secret, or a route's credential, holds the bot's token or the same bot; Telegram isn't started | give the approver a bot of its own (§36.2) |
+| `approver_token_missing` (warning) | the bot's store secret is gone | store it again with `zoeymcp secret set` |
+| `approver_contested` (error) | another program reads the bot's updates, or set a webhook on it | revoke the token, then store the new one (§35) |
+| `approver_unreachable` (warning; error while a call waits) | no successful poll for 120 s | check the egress allowlist and the proxy (§28); the portal still decides, or the calls expire |
+| `approver_chat_unreachable` (warning) | Telegram refused a message to your chat | start the chat with the bot, or unblock it |
+| `approver_rate_limited` (warning) | Telegram's flood control slowed the bot | wait: prompts and edits queue |
+| `elsewhere_unheld` (error, from the gateway's report) | a held call came back without the vault's approval | stop the gateway; check that the vault and the gateway run the same release and that the vault's policy has the tool; report it |
+| `vault_approval_header_params` (warning, from the gateway's report) | a held tool's schema mirrors parameters into headers, so its calls are refused | take it out of `vault_approval`, or ask its server for a version without them |
+| `approval_refused_too_long` (a log line, warning) | a held call's text didn't fit Telegram and the portal queue isn't on, so it was refused | enable the portal queue, or lower `budget_chars` |
+
+**Two identifiers.** Each call has its **ref** (16 lowercase hex digits), the one the agent's
+texts, the ledger, Telegram's message and the queue's row show and `zoeymcp approvals` prints.
+The **approval id** (16 other characters) names the approval itself: the portal's address and a
+button's data carry it. `zoeymcp approvals show` and `withdraw` take either.
+
+**From the host** (inside the vault's container, over its admin socket; every command takes
+`--format text|json`):
+
+| Command | What it does |
+| --- | --- |
+| `zoeymcp approvals list` | the calls waiting and decided recently, by ref and approval id, never a text |
+| `zoeymcp approvals show <ref-or-id>` | one call's whole text, the one command that prints it |
+| `zoeymcp approvals withdraw <ref-or-id>`, `--all` | withdraws (nothing is sent, the messages are edited, the agents are told); `--all` is the emergency stop (§35) |
+| `zoeymcp approver telegram enrol --secret <name> [--apply]` | finds your Telegram ids (§36.2) |
+| `zoeymcp approver telegram test` | sends a message with no buttons; exits 0 when Telegram took it |
+| `zoeymcp ledger --vault --chain vault\|copy\|both`, `--verify` | the two chains joined, or one; `--verify` walks the vault's chain (§21) |
+
+No command approves: that takes your passkey or your Telegram account.
+
+The vault's log lines (`role: vault`):
+
+| Event | Fields |
+| --- | --- |
+| `approval_held` | `ref`, `route`, `server`, `tool`, `surfaces` (the approvers that show it), `wait` (`block` or `pending`) |
+| `approval_relayed` | `ref`, `server`, `tool`, `surfaces`, `wait`: an out-of-band client's prompt, relayed |
+| `approval_decided` | `ref`, `decision` (`accept`, `decline`, `timeout`), `via` (`telegram`, `portal` or `none`), `waited_ms` |
+| `approval_withdrawn` | `ref`, `reason` (`changed`, `operator`, `shutdown`, `gateway_stopped`, `gateway_restarted`, `caller_cancelled`, ...) |
+| `approval_detached` | `ref`, `reason` (`block_over`, or `gateway_stop`): the call now answers pending |
+| `approval_forwarded` | `ref`, `outcome`: an approved call's forward ended |
+| `approval_forward_failed` | `ref`, `error_type`: the forward raised; the outcome is recorded (error) |
+| `approval_hold_failed` | `error_type`: a held call failed before anyone was asked (error) |
+| `approval_collected` | `ref`: a result handed to `check_approval`, once |
+| `approval_result_evicted` | `ref`, `reason` (`client_bound` or `store_full`): a result not kept |
+| `approval_refused_too_long` | `ref`, `server`, `tool`: too long for Telegram, with no portal queue (warning) |
+| `approvals_saturated` | `refused`: a cap refused calls (error) |
+| `gateway_epoch_changed` | `withdrawn`: a new gateway process; its predecessor's relays and legacy-session calls were withdrawn |
+| `approver_started`, `approver_stopped` | `surface` (`telegram`) |
+| `approver_surface_failed` | `surface`, `call`, `error_type`: an approver failed to show or close a call (warning) |
+| `approver_press_refused` | `reason`: a press that failed a check (warning) |
+| `approver_poll_failed` | `error_type`, `status`: a poll of the Bot API failed |
+| `approver_send_failed` | `method`, `error_type`, `status`: a message, edit, delete or button answer failed (warning) |
+| `approver_contested` | `reason`: another program reads the bot's updates (error) |
+| `approver_token_shared` | `surface`: another secret holds the bot's token; Telegram isn't started (error) |
+| `approver_enrolment_opened`, `approver_enrolled` | `bot` (its username) |
+| `approver_enrolment_failed` | `reason`: an enrolment stopped (warning) |
+
+The gateway's log lines about them (`role: gateway`):
+
+| Event | Fields |
+| --- | --- |
+| `elsewhere_unheld` | `client`, `server`, `tool`, `ref`, `status`: a held call came back without the vault's approval (error) |
+| `held_answer_dropped` | `server`, `ref`, `status`: the vault's answer to a held call no request waits for any more |
+| `relay_digest_mismatch` | `client`, `server`, `tool`, `ref`: the vault's decision named another text; refused (error) |
+| `approval_relay_failed` | `ref`, `error_type`: the vault couldn't be asked to relay a prompt |
+| `approval_withdraw_failed` | `ref`, `error_type`: the vault couldn't be told of a withdrawn call |
+| `approval_collect_failed` | `ref`, `error_type` or `status`: `check_approval` couldn't ask the vault |
+| `approval_decisions_failed` | `reason`: a poll for the vault's decisions failed, at most once a minute (warning) |
+| `approvals_detached` | `asked`, `detached`: the gateway's stop handed its waiting held calls to pending |
+| `approval_detach_failed` | `error_type`: the stop couldn't ask the vault to detach them (warning) |
+| `reserved_tool_name` | `server`, `tool`: an upstream lists a tool named `check_approval`, which is never served |
+
+None carries a prompt's text, an argument, a chat or user id, a token, a code or a button's data.

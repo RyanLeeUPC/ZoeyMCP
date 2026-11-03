@@ -4,9 +4,10 @@ A self-hosted proxy that lets AI agents use outside APIs and MCP servers **witho
 real credential**, and that asks a human to approve the **exact arguments** of every consequential
 action.
 
-> **Not ready for use.** Early development: the vault, the gateway, approvals, toolkits, the
-> admin portal, onboarding by URL, drift review, managed mode, the egress role and the bridge
-> work, but out-of-band approvers don't exist yet, and nothing has been reviewed or released.
+> **Not ready for use.** Early development: the vault, the gateway, approvals (in the agent's
+> client, on a Telegram bot or in the portal, and held by the vault itself), toolkits, the admin
+> portal, onboarding by URL, drift review, managed mode, the egress role and the bridge work, but
+> nothing has been reviewed or released.
 > Don't deploy it. See [docs/design.md](docs/design.md) for where it's going,
 > [docs/threat-model.md](docs/threat-model.md) for what it defends against, and
 > [docs/operations.md](docs/operations.md) for running what exists.
@@ -77,6 +78,19 @@ Built so far:
   when it would bring back what was removed unless the host names it. A gateway volume that
   remembers the revisions it saw flags a restored vault. Servers may enable prompts, resources
   and completions, pinned and drift-reviewed like tools.
+- **M8, vault-enforced and out-of-band approvals** (image publishing is still to come): a tool
+  marked `vault_approval` is held by the vault, which reads the call itself (one JSON object,
+  nothing ambiguous), renders the approval from it, asks you, and forwards exactly what you saw
+  only once you approve, so a compromised gateway can't skip it where only the vault can make the
+  call (a route with a credential, a connector or a bridge, or the hardened tier; operations.md
+  §36.6). The vault's approvers: a Telegram
+  bot of your own, enrolled from the host with a one-time link and a confirmation code, whose
+  every button press is checked against the message it sent; and the portal's Approvals queue,
+  approve with a passkey, deny with your session. A client marked `out_of_band` (a scheduled run
+  nobody watches) has its prompts asked there too. Long waits answer `pending <ref>`, and the
+  agent collects the result once with `check_approval`. The vault keeps its own hash-chained
+  approval ledger beside the gateway's, joined on the Ledger page; `zoeymcp approvals` lists,
+  shows and withdraws from the host, and never approves.
 
 ## Quickstart (standard tier)
 
@@ -152,12 +166,14 @@ prints a fragment: `review` with `--add` or another choosing option, and `login 
 and name the portal, or `zoeymcp policy export`, an edit and `zoeymcp policy import`, instead
 (operations.md §11); `check` says it checks the document it is given, not the running revision.
 
-**When to move to the hardened tier** ([deploy/compose.hardened.yaml](deploy/compose.hardened.yaml)):
-for anything that moves money, sends mail or touches personal data. In the standard tier the
-gateway shares the vault's network namespace, so a compromised gateway has a way out; in the
-hardened tier it has none. Bridges work in both tiers; only the hardened tier confines them. Both
-are in [docs/operations.md](docs/operations.md) (§9 onwards); a stdio server behind a bridge, in
-each tier, is §33.
+**When to move to the hardened tier**
+([deploy/compose.hardened.yaml](deploy/compose.hardened.yaml)): for anything that moves money,
+sends mail or touches personal data. In the standard tier the gateway shares the vault's network
+namespace, so a compromised gateway has a way out; in the hardened tier it has none. That is also
+where `vault_approval` binds fully: in the standard tier a held tool on an upstream that takes no
+credential is one the gateway could call itself. Bridges work in both tiers; only the hardened tier
+confines them. Both are in [docs/operations.md](docs/operations.md) (§9 onwards); a stdio server
+behind a bridge, in each tier, is §33.
 
 **The portal** is at `http://localhost:8081` in a browser on the same host, in both tiers. Issue
 the one-time code that enrols your first passkey with
@@ -175,7 +191,8 @@ has the rest, including reaching it from another machine.
 - **Gateway:** an MCP server in front of your MCP servers, holding no secrets.
   - Per-agent tool allowlists, and pinned tool definitions, so a changed tool is hidden until you
     re-review it; prompts and resources too, on a server that enables them.
-  - Approvals that show you the exact arguments before a consequential call runs.
+  - Approvals that show you the exact arguments before a consequential call runs: in the
+    agent's own client, or on your phone and in the portal.
   - Your own Python tools, which run with no secrets.
 - **Admin portal:** passkey login, and a passkey prompt for every change.
   - Write-only secret entry: values go in and are never shown again.
@@ -187,6 +204,19 @@ has the rest, including reaching it from another machine.
     `approve` to `allow`, each confirmed with a passkey.
   - In managed mode, the portal is where the policy changes: revisions, history, diffs and
     rollback; the host exports and imports what the portal can't change.
+  - The Approvals queue: the calls the vault holds, each text whole, approved one at a time with
+    a passkey.
+- **Vault-enforced approvals:** a consequential tool can be held by the vault itself, which asks
+  you on a Telegram bot of your own or in the portal and forwards exactly what you approved, so
+  the approval holds even if the gateway is compromised, wherever only the vault can make the
+  call.
+  M8 closes the approval gaps by mechanism and only within scope: a holder of an agent's token
+  can't answer its own prompt for a `vault_approval` tool, or for any `approve` tool of an
+  `out_of_band` client, and a compromised gateway or toolkit can't skip the approval of a
+  `vault_approval` tool where only the vault can make the call (its route holds a credential, is a
+  connector or a bridge, or the deployment is hardened); every other approval is the gateway's,
+  which a compromised gateway or toolkit can still skip.
+  The rest is in [docs/threat-model.md](docs/threat-model.md).
 - **Bridge:** serves a stdio-only MCP server over HTTP, reached only through a vault route that
   injects its own token: in a container of its own on networks of its own (hardened), as a
   process of the standard tier's one container (unconfined), or on another host.

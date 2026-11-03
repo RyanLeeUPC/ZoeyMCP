@@ -8,21 +8,28 @@ callable it is given (``self.event(...)``), so its events are credited, besides,
 each module that builds a ``LedgerFile`` with ``event=logs.event``: the gateway's ledger and the
 vault's chain (M8 build note, step 2's deviation 8).
 
-Each step that adds an M8 event lists it here with its role, in that step's commit. The walk reads
-the source files of the installed package, so under mutmut it reads the mutated copy, whose
-original functions are kept beside their mutants.
+Each step that adds an M8 event lists it here with its role, in that step's commit, and puts it
+in one of operations.md's events tables (a table headed ``| Event | Fields |``) beside its
+siblings: the file layer's in the approval ledger's section (§21), the approvals' in §36, a
+policy write's in §34 (P.2's rule, PC-2; step 21 put in the ones steps 8 to 17 had listed here
+only). The walk reads the source files of the installed package, so under mutmut it reads the
+mutated copy, whose original functions are kept beside their mutants.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from .test_m6_events_emitted import PACKAGE, assignments, every_event, logs_role, strings
 
 LEDGER_FILE = PACKAGE / "common" / "ledgerfile.py"
+OPERATIONS = Path(__file__).resolve().parents[2] / "docs" / "operations.md"
+TABLE_HEAD = "| Event | Fields |"
 
 # M8's events, by the step that adds each, and the role whose log carries it.
 EVENTS = {
@@ -156,12 +163,44 @@ def emitted_by_role() -> dict[str, set[str | None]]:
     return found
 
 
+def documented(text: str) -> set[str]:
+    """Every event an events table names: each backticked name in a row's first cell, a row of
+    two names (``| `a`, `b` | ... |``) naming both."""
+    found: set[str] = set()
+    in_table = False
+    for line in text.splitlines():
+        if line == TABLE_HEAD:
+            in_table = True
+        elif in_table and line.startswith("|"):
+            found |= set(re.findall(r"`([a-z_]+)`", line.split("|")[1]))
+        else:
+            in_table = False
+    return found
+
+
 EMITTED = emitted_by_role()
+DOCUMENTED = documented(OPERATIONS.read_bytes().decode("utf-8"))
 
 
 @pytest.mark.parametrize("event", sorted(EVENTS))
 def test_each_event_is_emitted_by_its_role(event: str) -> None:
     assert EVENTS[event] in EMITTED.get(event, set()), f"no {EVENTS[event]} code logs {event}"
+
+
+@pytest.mark.parametrize("event", sorted(EVENTS))
+def test_each_event_is_in_an_events_table(event: str) -> None:
+    assert event in DOCUMENTED, f"operations.md has no events table row for {event}"
+
+
+def test_the_table_reader_reads_only_events_tables() -> None:
+    """A row's first cell under ``| Event | Fields |`` names its events, two in one row
+    included; another table's rows, a row's later cells and text after the table don't."""
+    text = (
+        "| Code | Meaning |\n| --- | --- |\n| `not_an_event` | x |\n\n"
+        "| Event | Fields |\n| --- | --- |\n| `one` | `field` |\n"
+        "| `two`, `three` (a note) | `other` |\n\nAfter `four` the table.\n"
+    )
+    assert documented(text) == {"one", "two", "three"}
 
 
 def test_the_file_layers_events_are_both_roles() -> None:

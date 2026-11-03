@@ -33,8 +33,16 @@ and again after any change to that feature's page code or to what the vault send
 | 22 | the Policy page in managed mode: a connector's pause and limits |
 | 23 | the MCP servers page in managed mode: onboarding, **Give to clients**, Home's attention list and the restore banner |
 | 24 | the review screen's prompts and resources |
+| 25-30 | the Approvals queue: a hostile text, approve, cancel, a stale decision, deny and expiry, the idle limit |
+| 31, 32 | the MCP servers page and the review screen in managed mode: **Hold in the vault** and **Turn off vault approval** |
+| 33 | Home's approvals item, its findings and the nav's count |
+| 34 | the Ledger page's two chains |
+| Live Telegram | the Telegram approver against Telegram itself (its own section below) |
 
-Items 19-24 are also M6's exit check: each runs once in Chrome or Edge before M6 is done.
+Items 19-24 are also M6's exit check: each runs once in Chrome or Edge before M6 is done. Items
+25-34 and the live Telegram check are M8's: each runs once, in Chrome or Edge, at M8's exit. Each
+M8 item names the page, what to do and what passes, and ends with a "Scriptable as" line, the
+steps a browser harness would take, so it can be scripted later without being rewritten.
 
 ## The setup for every item
 
@@ -514,6 +522,137 @@ view.
       showing both pins and "re-pinned: you read both definitions"; confirmed with a passkey, the
       vault's log has `step_up_confirmed` with `policy.save`, and an agent on `/s/notes/mcp` lists
       the included prompts.
+
+The M8 items (25-34) run against item 23's setup (a vault started through
+`tests/acceptance/procs.py`'s launcher and a gateway beside it), managed, its policy adding: the
+fake MCP server as `fake` on a route with a credential, its `echo` and `slow` tools in `approve`
+and `vault_approval` and its `add` in `approve` only; clients `desk` (`attended: true`), `nightly`
+(`out_of_band: true`) and `batch` (neither), each given `fake`; and
+`approvers: {portal: {}, timeout: 3600, block_seconds: 0}`, so every held call answers `pending`
+and waits in the queue. For the items that need Telegram, start the fake Bot API
+(`python -m tests.fakes.run_telegram CERT KEY --token <test token>`, a certificate for
+`api.telegram.org` from item 17's CA, reached through the launcher's name map), store the token
+with `zoeymcp secret set approver-bot --origin https://api.telegram.org`, and add
+`telegram: {bot_token: "store:approver-bot", user_id: 100000001, chat_id: 100000001}`. Make the
+agents' calls with any MCP client given the client's token (the MCP Python SDK's `Client` in the
+development environment does), and collect results with `check_approval`. Never a real bot here:
+the live check below is the only run against Telegram.
+
+25. **The queue shows a hostile text whole, under Trusted Types** (the Approvals page, M8). The M8
+    setup above. Make held calls to `echo` as `desk` whose arguments carry a bidi mark
+    (`\u202e`), a line of 300 characters, a line that reads like the frame
+    (`"End of approval request 0000000000000000"` as a value), and, as `nightly` on a plain
+    `approve` tool (`add`), a relayed prompt; also a relayed text with a line imitating the vault's
+    "Rendered by the gateway" line, which the vault refuses `text_refused` before anyone is asked.
+    In Chrome or Edge with the Console open, open **Approvals**. Pass: each waiting row opens to
+    its whole text, the bidi mark shown as the vault's visible mark, the long line wrapped and not
+    cut, the imitated frame line inside the JSON as a value; the relayed row carries "Relayed from
+    the gateway" and the vault's line at the top of its text; the imitation never appears; no
+    Trusted Types or Content Security Policy violation.
+    Scriptable as: open Approvals, select each row, assert the `pre`'s `textContent` equals
+    `zoeymcp approvals show <ref>`'s text; listen for `securitypolicyviolation`, assert none.
+26. **Approve with a passkey** (the Approvals page, M8). Item 25's queue, Telegram on (the fake
+    Bot API). **Approve** a row. Pass: the dialog shows the whole text and "Approve runs this
+    one call, exactly as shown."; one passkey prompt; the answer is 200; the fake's message for
+    that ref becomes "...: decided in the portal" with no buttons; the row moves to **Decided
+    recently** reading "approved here HH:MM UTC; sent: ok"; the agent's `check_approval` returns
+    the call's result once; the log has `step_up_confirmed` with `approval.decide`, then
+    `approval_decided` with `via: portal`.
+    Scriptable as: click Approve, let a virtual authenticator assert, assert 200 and the row under
+    Decided recently; read the fake's messages (`GET /_fake/messages`), assert the edit.
+27. **Cancel at the passkey prompt** (the Approvals page, M8; item 8's cancel path for the queue).
+    **Approve** a waiting row, then cancel the browser's passkey prompt. Pass: nothing is decided,
+    the row stays under **Waiting**, no `approval_decided` line; **Approve** again works.
+    Scriptable as: reject the WebAuthn call, assert the row's state is still waiting and no
+    `step_up_confirmed` line.
+28. **A stale decision** (the Approvals page, M8). With the confirm dialog of item 26 open, press
+    **Approve** for the same ref in the fake Bot API (`POST /_fake/press`). Pass: the confirm is
+    refused 409 `already_decided`, "Already decided in Telegram at HH:MM: approved", and nothing
+    more is sent. Then, in a second tab, prepare a review save; in the first, prepare an approval:
+    the dialog first says "This replaces the save you prepared in another tab; it was cancelled.",
+    and the second tab's confirm is refused.
+    Scriptable as: two browser contexts; assert the 409's reason and text; assert the `replaced`
+    line in the second prepare.
+29. **Deny with a session; an expired row** (the Approvals page, M8). **Deny** a waiting row.
+    Pass: no passkey prompt, the row moves to Decided recently as denied, the agent is told
+    "refused: the operator declined this call", nothing reaches the fake upstream. With
+    `approvers.timeout: 60`, leave a row past its deadline: it leaves **Waiting** as expired, and
+    an **Approve** opened before then is refused `expired`.
+    Scriptable as: click Deny, assert `denied`; wait past a 60 s deadline, assert `expired`.
+30. **An open queue doesn't keep the session alive** (M8). Leave the Approvals page open and
+    untouched for 20 minutes, while its polls run. Pass: the next action lands on the sign-in page
+    (the session's idle limit is 15 minutes; the queue's polls don't count as activity).
+    Scriptable as: wait 20 minutes with the page open, assert the sign-in page.
+31. **Turn-on: Hold in the vault** (the MCP servers page and the review screen in managed mode,
+    M8). The M8 setup in managed mode, `echo` in `approve` and not yet in `vault_approval`. Pass:
+    the server page's **Hold in the vault** on `echo` shows, before any passkey prompt, the plan's
+    lines ("fake.echo: vault_approval on.", one line for `desk`, `nightly` and `batch` each, then
+    the route's credential sentence); confirmed, `echo` is held. The review screen's box of the
+    same name shows the same lines in its save's plan. With `approvers` removed (a host import),
+    both controls are disabled, with "Set up an approver first (Telegram or the Approvals queue):
+    a host step, operations.md §36.2".
+    Scriptable as: open the server page, click Hold, assert the plan's lines before
+    `navigator.credentials.get`; with no approver, assert `disabled` and the line.
+32. **Turn-off and its refusals** (managed mode, M8). With `echo` held: **Turn off vault approval**
+    prepares `tool.vault_approval_off`, and the dialog shows "echo: vault_approval off. The gateway
+    will ask instead of the vault; a compromised gateway could then skip the approval. Calls
+    waiting now are withdrawn." whole; one passkey changes that one tool, and the log has
+    `tool_vault_approval_off`. Held again, a review save that unticks the box, and one that drops
+    `echo` from `include`, are refused `vault_approval_off_needs_its_own_step` before any passkey
+    prompt; a rollback to a revision before `echo` was held is refused
+    `rollback_drops_vault_approval`.
+    Scriptable as: click Turn off, assert the dialog text and one change; untick in review and
+    save, assert the refusal and no WebAuthn call; roll back, assert the refusal.
+33. **Home and the badge** (Home, M8). With two calls waiting, Home lists "2 approvals waiting: the
+    oldest must be answered by HH:MM UTC" with **Open the queue**, and the nav's Approvals entry
+    shows 2; with no gateway status report (the gateway stopped) the item still shows. After a
+    vault kill with a call waiting and another approved and running (the fake's `slow`, also held,
+    with a long count), the restarted vault's Home shows `approvals_withdrawn_at_start` (cleared by
+    opening Approvals) and `approvals_outcome_unknown` naming the running call's ref. Scriptable
+    as: open Home, assert the items and their actions; assert the badge's number.
+34. **The Ledger's two chains** (the Ledger page, M8). After items 26 and 25's relayed call is
+    approved in the fake Bot API. Pass: the held call is one row with asked (gateway, where vault),
+    decided accept via Telegram or the portal (written by the vault), the outcome and
+    `approved_elsewhere` (the gateway's), each marked with its writer; the relayed call's row
+    shows the gateway's outcome; no "the chains disagree" flag.
+    Scriptable as: open Ledger, assert the two rows and their per-writer cells.
+
+## Live Telegram approver
+
+Run once by hand at M8's exit, beside items 25-34, with a free bot of your own; CI never runs it.
+Record it in the results table as item `Live Telegram`: the commit, the date, the Telegram
+clients used (desktop, Android, iOS), and pass or fail per part. Record no bot token, chat id,
+user id, bot name or account name, and keep none: everything runs in a temporary state directory,
+and the bot is deleted afterwards.
+
+1. **The bot.** Create it directly with Telegram's own bot-making account (@BotFather), not
+   through another bot: the vault can't check this, so record that it was done this way. Keep
+   its privacy mode on.
+2. **Enrolment.** A vault with an admin socket (on Linux or in the hardened compose file) and
+   egress to `api.telegram.org`: `zoeymcp secret set approver-bot --origin
+   https://api.telegram.org`, then `zoeymcp approver telegram enrol --secret approver-bot`. Pass:
+   the printed link opens the bot's chat, Start sends `/start` with the code, the bot sends a
+   six-digit confirmation code to that chat, typing it prints the `approvers` lines with the
+   right ids; a wrong code ends `enrolment_unconfirmed`.
+3. **The probe.** With the lines in the policy, `zoeymcp approver telegram test` exits 0 and the
+   chat shows the test message with no buttons; `zoeymcp health` reads `approver telegram: ok`.
+4. **The message's shape.** Hold a call whose arguments hold `https://example.com/x`,
+   `example.com` and `t.me/x`. Pass: the message is one monospaced block, with no link preview,
+   on the desktop, Android and iOS clients; record, per client, whether anything inside the block
+   can be tapped as a link (D-44: if one can, the Telegram-only defang is a fix commit before M8
+   closes).
+5. **Approve and Deny.** Approve one call: the message becomes "...: approved HH:MM UTC in
+   Telegram. Sending…", then "… Sent: the server answered ok.", with no buttons. Deny another:
+   "...: denied HH:MM UTC in Telegram. Nothing was sent." A press on a decided message (from a
+   notification still on screen, say) is answered "This request is no longer pending".
+6. **A second poller.** While the vault runs, poll the same bot from another program
+   (`getUpdates` with the token): within a minute health shows `approver_contested`; stop it, and
+   revoke and rotate the token as operations.md §35 says.
+7. **An edited message.** With the bot's token, edit a waiting prompt's text
+   (`editMessageText`), then press its Approve: the press is refused (`edited` or
+   `text_changed` in `approver_press_refused`) and nothing is sent. Also change only its buttons
+   (`editMessageReplyMarkup`): record whether Telegram then sets `edit_date`; the press is refused
+   either way (`markup_changed` or `edited`).
 
 ## D-66: the live OAuth test against a real provider
 

@@ -92,22 +92,22 @@ say so.
 | ID | Requirement | Kind |
 | --- | --- | --- |
 | R40 | A tool marked **consequential** runs only after the operator approves the **exact arguments**, rendered by gateway code, not by text the model wrote | Must |
-| R41 | Approvals **fail closed**: no reply channel, timeout, error, or a client without elicitation support all mean declined. An approval covers **one call**, and nothing persists | Must |
+| R41 | Approvals **fail closed**: no reply channel, timeout, error, or a client without elicitation support that nobody asks out of band (M8, §6.3) all mean declined. An approval covers **one call**, and nothing persists | Must |
 | R42 | The rendered approval **can't hide content**: plain text only, Unicode format characters (category Cf: zero-width, bidi overrides, tags) and control characters other than newline and tab rejected, as are wide runs of spaces, stacked combining marks and, for clients that render Markdown (per client `renders`), code fences, HTML and links; the whole text under a configurable budget (default 3,000 characters). If it doesn't fit, the call is refused rather than truncated | Must |
 | R43 | The arguments executed are **byte-identical** to the arguments shown | Must |
-| R44 | One pending approval per tool per client: a second call while one waits is refused, so prompts can't be merged or confused. Also at most `max_pending_per_client` undecided prompts per client, at most `max_prompts_per_hour`, and a cooldown after a decline | Must |
-| R45 | Approver back ends: **MCP elicitation** (the default, synchronous; the prompt appears in the operator's own client) and **out-of-band approvers** hosted in the vault (Telegram, and an approval queue in the portal), for clients that shouldn't be trusted to relay approvals or for approvals that must wait | Should |
+| R44 | One pending approval per tool per client: a second call while one waits is refused, so prompts can't be merged or confused (an identical call while one waits out of band gets its `pending <ref>` again). Also at most `max_pending_per_client` undecided prompts per client, out-of-band ones included, at most `max_prompts_per_hour`, and a cooldown after a decline; the vault bounds what it holds with caps of its own (M8, §6.4) | Must |
+| R45 | Approver back ends: **MCP elicitation** (the default, synchronous; the prompt appears in the operator's own client) and **out-of-band approvers** hosted in the vault (a Telegram bot, and the portal's Approvals queue; M8), for a client the operator marks `out_of_band`, for every `vault_approval` tool, and for approvals that must wait: a wait past `block_seconds` answers `pending <ref>`, collected once with `check_approval` (§6.3) | Should |
 | R46 | A **ledger** of consequential calls: time, client, tool, keyed digest of the arguments and of the prompt, decision, result; hash-chained and written ahead of the call | Should |
-| R48 | **Vault-enforced approvals:** for routes marked `vault_approval`, the **vault** holds the request, renders the approval from the request itself, and forwards it only on approval, so even a fully compromised gateway can't skip it. Each approval happens in exactly one place: those routes skip the gateway's elicitation | Should |
+| R48 | **Vault-enforced approvals:** for a tool listed under its server's `vault_approval` (a subset of `approve`; M8), the **vault** holds the call, renders the approval from the request itself, and forwards it only on approval, so a fully compromised gateway can't skip it wherever only the vault can make the call (§6.4). Each approval happens in exactly one place: those tools skip the gateway's elicitation | Should |
 | R47 | Content from upstream is **data, not instructions**. The gateway can wrap results from a server in untrusted-content markers. Toolkits that need sender identity (e.g. mail) verify it in code and label failures | Should |
 
 ### 2.6 Admin portal
 
 | ID | Requirement | Kind |
 | --- | --- | --- |
-| R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, the gateway's status, and (in managed mode) policy saves, history and rollback (M6, §7.1) | Must |
+| R60 | The vault serves an **admin portal** on its admin listener: write-only secret entry, OAuth and MCP onboarding, credential health, the approval ledger, tool-drift review and re-pinning, the gateway's status, (in managed mode) policy saves, history and rollback (M6), and the Approvals queue (M8) (§7.1) | Must |
 | R61 | **No endpoint returns a secret**, to the portal, the CLI or anyone else. The portal shows metadata only, and its secret entry is write-only. Four scoped exceptions, on the admin socket only and reached by no portal route: `POST /setup-code` answers the new setup code (R65), `GET /gateway-key` the gateway key (§7.5), `GET /egress-key` the egress role's key (M7, §4.7), and `GET /policy/export` the managed policy as a document, which holds placeholders and client token hashes (M6, §4.6) | Must |
-| R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion, bound to the one change it confirms) for every security-relevant change; the step-up column of §7.1's table is the list: writing or deleting a secret, completing or resetting an OAuth connection, enrolling, renaming or removing a passkey, registering a client at a server being onboarded and discovering a server on the operator's own network (M7), clearing drift marks, and every managed **save** (M6). Step-up guards saves: in declarative mode a fragment that re-pins or reclassifies is guarded by the operator's commit, and in managed mode a move from `approve` to `allow` is stepped up as its own save (`tool.allow`) or inside a review save whose one assertion covers every move it lists, each a row of its own in the plan. A connector's bound constraints are changed only by the host (§4.6) | Must |
+| R62 | **Passkey login** (WebAuthn, user verification required). **Step-up** (a fresh passkey assertion, bound to the one change it confirms) for every security-relevant change; the step-up column of §7.1's table is the list: writing or deleting a secret, completing or resetting an OAuth connection, enrolling, renaming or removing a passkey, registering a client at a server being onboarded and discovering a server on the operator's own network (M7), clearing drift marks, every managed **save** (M6), approving a held call (`approval.decide`, one call per assertion) and turning `vault_approval` off (`tool.vault_approval_off`) (M8). Step-up guards saves: in declarative mode a fragment that re-pins or reclassifies is guarded by the operator's commit, and in managed mode a move from `approve` to `allow` is stepped up as its own save (`tool.allow`) or inside a review save whose one assertion covers every move it lists, each a row of its own in the plan. A connector's bound constraints are changed only by the host (§4.6) | Must |
 | R63 | **Browser hardening:** the exact origins the operator lists drive the `Host` and `Origin` checks (stopping DNS rebinding); every API request needs `Sec-Fetch-Site: same-origin`, and every state change is a `fetch()` with `POST` or `DELETE` carrying the page's own `Origin` (no forms); every answer carries a CSP with no inline script or style, `form-action 'none'`, `frame-ancestors 'none'` and Trusted Types, plus `nosniff`, `no-referrer`, `no-store`, COOP, CORP and `X-Frame-Options: DENY`; `SameSite=Strict` session cookies; no third-party assets. The OAuth callback is the only exception (§7.3) | Must |
 | R64 | **One source of truth for policy**, chosen per deployment: **managed** (the vault's revisions are the source, changed by the portal's saves within a bounded edit set, or by the host's export, edit and import over the admin socket) or **declarative** (a config file or env var is the source; the portal can't edit policy and produces diffs to commit instead). Never both: `mode` is required and chosen at start (§4.6) | Must |
 | R65 | **Bootstrap:** a random **one-time setup code**, issued on demand with `docker exec` (none exists until then), never logged, valid for 15 minutes, spent when it is redeemed, and invalidated when the first passkey is enrolled. Whether enrolling with it replaces every passkey is decided when it is issued (`--reset`). Recovery from lost passkeys follows the same path, so it needs host access | Must |
@@ -221,11 +221,12 @@ when the vault's image digest isn't an official release. Toolkits go into a deri
   networks don't stop spoofing, so an address is a hint, not an identity. All shipped containers
   drop `NET_RAW`.
 - **The approval channel is only as trustworthy as the client that renders it.** With elicitation,
-  a compromised agent runtime could auto-accept. For that threat, use the out-of-band approver
-  (§6.3, M8), which trusts no agent code.
-- **The client token is the approval credential.** An elicitation goes back to whoever made the
-  call, so anyone holding an attended client's token can make calls and answer their own prompts
-  (§6.2). Keep it out of the agent's sandbox.
+  a compromised agent runtime could auto-accept. For that threat, use the out-of-band approvers
+  (§6.3), which trust no agent code: mark the client `out_of_band`, or the tool `vault_approval`.
+- **The client token is the approval credential** for an elicited prompt. An elicitation goes back
+  to whoever made the call, so anyone holding an attended client's token can make calls and answer
+  their own prompts (§6.2). Keep it out of the agent's sandbox. An out-of-band prompt is answered
+  only from the operator's chat account or with a passkey, which the token can't reach.
 - **Operator → portal:** a passkey (§7.2), and a fresh assertion for every change; host access
   (the admin socket) is the recovery path.
 - **Vault → bridge (M7):** the bridge's **token**, a store secret (`zoeymcp secret set NAME
@@ -477,6 +478,15 @@ For each request, in order:
    | `/_zoeymcp/gateway/v1/review/jobs` | GET | gateway | review jobs for the gateway to run (M7, §7.4), long-polled, 1 waiter |
    | `/_zoeymcp/gateway/v1/report/review` | POST | gateway | a review job's report (M7), capped by the gateway's limits, one at a time |
    | `/_zoeymcp/egress/v1/allowlists` | GET | the egress key | the egress role's allowlists (M7, §4.7), long-polled, 2 waiters; never on the link socket |
+   | `/_zoeymcp/gateway/v1/approvals/ask` | POST | gateway | an out-of-band client's prompt for the vault to relay (M8, §6.3), at most 96 KiB |
+   | `/_zoeymcp/gateway/v1/approvals/decisions` | GET | gateway | relayed decisions and the endings of held calls (M8), long-polled, 1 waiter |
+   | `/_zoeymcp/gateway/v1/approvals/withdraw` | POST | gateway | a held or relayed call the gateway gave up on (M8), at most 1 KiB |
+   | `/_zoeymcp/gateway/v1/approvals/detach` | POST | gateway | the gateway's stop: its blocking held calls answer pending (M8), at most 16 KiB |
+   | `/_zoeymcp/gateway/v1/approvals/collect` | POST | gateway | a held call's status or result, once, for `check_approval` (M8), at most 1 KiB |
+
+   Every approvals body, and the decisions query, carries the gateway's `epoch`, random per gateway
+   process: the first one the vault hasn't seen withdraws the relays and legacy-session holds of
+   earlier ones, since no gateway is left to forward them.
 
    A report path checks, before reading any body byte, the identity, the method (405), then
    `Content-Type: application/json` (415) and one `Content-Length` (411) within its cap (413); it
@@ -511,7 +521,9 @@ For each request, in order:
    bridge's uid (§3.3). Streamed bodies (SSE) pass through unbuffered; a size limit applies to
    request bodies. The vault watches the caller while it waits for the upstream's headers **and**
    while it relays: a caller that leaves closes the upstream request in either phase (logged as
-   `outcome: cancelled`, with `phase`). For the gateway, an upstream redirect (any 3xx) becomes 502
+   `outcome: cancelled`, with `phase`), except a call the vault approved itself (§6.4), whose
+   forward is committed and finishes to its own deadline, with its answer kept for
+   `check_approval`. For the gateway, an upstream redirect (any 3xx) becomes 502
    "redirect refused": a hostile MCP server can't steer the gateway to another route.
 8. **Scrub the response.** Upstreams sometimes echo credentials in error bodies, especially
    query-parameter and path secrets that appear in echoed URLs.
@@ -885,15 +897,18 @@ start and whenever policy changes. That part contains no secrets, and the gatewa
 policy, in either mode.
 
 **The gateway's view** (`GET /_zoeymcp/gateway/v1/view`, `common/policy/view.py`): the hosts,
-origins, limits and approval settings; each client's `token_sha256`, servers and source pins
-(a literal `token` is hashed first); and per server its kind (`remote` or `toolkit`: a bridge is
-a remote server), `vault_path` (the route's prefix plus the server's path), tools, pins,
-declines, enabled kinds with their prompts and resources (each left out while empty, so an
-older policy's digest is unchanged) and settings. No routes, credentials, connectors, secret
-references, placeholders, upstream URLs, route programs or admin settings. A `digest` covers the
-rest. Beside the view, outside its body and digest, the vault states the mode it runs
-(`x-zoeymcp-policy-mode`) and, in managed mode, its deployment and the revision it runs
-(`x-zoeymcp-policy-revision`), on every 200 and 304.
+origins, limits and approval settings, with, from M8, the three out-of-band waits of `approvers`
+(`timeout`, `block_seconds`, `result_ttl`) while an approver is set, and nothing else of that block
+(not its bot token reference, ids or which approvers); each client's `token_sha256`, servers,
+source pins (a literal `token` is hashed first) and approval settings, `out_of_band` included; and
+per server its kind (`remote` or `toolkit`: a bridge is a remote server), `vault_path` (the route's
+prefix plus the server's path), tools, pins, declines, enabled kinds with their prompts and
+resources, `vault_approval` (M8) (each left out while empty, so an older policy's digest is
+unchanged) and settings. No routes, credentials, connectors, secret references, placeholders,
+upstream URLs, route programs or admin settings. A `digest` covers the rest. Beside the view,
+outside its body and digest, the vault states the mode it runs (`x-zoeymcp-policy-mode`) and, in
+managed mode, its deployment and the revision it runs (`x-zoeymcp-policy-revision`), on every 200
+and 304.
 
 - **Long poll:** the gateway sends `If-None-Match: "<digest>"` and `?wait=25`; the vault answers
   200 once the digest differs, or 304 after 25 s, and a reload wakes the waiters at once. At most
@@ -976,6 +991,11 @@ the examples and profiles stay declarative, as merge sources.
   entry back (`--allow-revive`, `--allow-env`), or drop the whole ratchet with a reseed's
   `--new-ratchet`, which lists what it forgets. So no rollback or import revives a retired key, a
   revoked token or a re-pinned definition, or opens a new path for an `env:` secret.
+  `vault_approval` isn't in the ratchet, since turning it off is allowed through its own kind; the
+  planner instead compares the held (server, tool) pairs of the head and the candidate on every
+  write, a tool the candidate reaches unheld through another route or server counted as dropped,
+  and treats each dropped pair as a widening that only `tool.vault_approval_off` or a host import
+  with `--accept-widening` may carry (§6.4, M8). The `approvers` block is the host's.
 - **Validation:** one gate for every policy that can run, in either mode: the strict loader, the
   schema, `check` with the vault's own environment, and the managed rules. It runs at a
   declarative load and reload, at the seed, at every managed start on the head, and at every
@@ -1354,8 +1374,11 @@ Each included tool has a policy: `allow` (no prompt) or `approve`.
    carries exactly that object, by value, and consumes the registration. The call runs under a
    hard deadline (`call_timeout`, 300 s).
 
-For an `approve` call, after step 3 (as built in M4: a client must be `attended`, and the
-operator's [operations.md](operations.md) §19 shows the prompt):
+For an `approve` call, after step 3 (a client must be `attended`, asked by elicitation, or
+`out_of_band`, asked on the vault's approvers, §6.3; the operator's
+[operations.md](operations.md) §19 shows the prompt). A `vault_approval` tool takes none of the
+steps below at the gateway but the lock and the ledger: the gateway locks, records `asked` with
+`where: vault`, and forwards the call marked as approved elsewhere, and the vault asks (§6.4):
 
 1. **Validate** as above.
 2. **Canonicalize** as above: the object that will be forwarded.
@@ -1367,15 +1390,16 @@ operator's [operations.md](operations.md) §19 shows the prompt):
 4. **Check the text:** no Cf or control characters (other than the renderer's own newlines), and
    under `budget_chars`. Otherwise the call is refused **before** anyone is asked.
 5. **Lock** the tool for this client. If it's already waiting, the call is refused as busy.
-6. **Ask** the configured approver. Anything but an explicit accept within `timeout` means
-   declined.
+6. **Ask** the client's approver: an elicitation, or a relay through the vault's approvers.
+   Anything but an explicit accept within the timeout means declined; an out-of-band wait past
+   `approvers.block_seconds` answers `pending <ref>` and goes on (§6.3).
 7. On accept, forward **the canonical object from step 2**: it's the same object that was rendered,
    so it can't differ from the text shown.
 8. **Ledger:** `asked`, `decided`, then exactly one `outcome`, hash-chained, with keyed digests
    of the arguments and the text; the accept is on disk before the call goes out. An accepted call
    then finishes even if the agent leaves or the gateway stops.
 9. **Return** the result, or a plain error: `declined by operator`, `no answer in time`,
-   `refused: <reason>`.
+   `refused: <reason>`, or `pending <ref>`.
 
 ### 5.3 Toolkits
 
@@ -1419,6 +1443,11 @@ async def send_note(ctx: ToolContext, subject: Subject, body: Body) -> str:
   marks text an outsider wrote. Errors become fixed texts.
 - **Plain HTTP endpoints** for toolkits are deferred to the first mailbox-reader toolkit, with
   capability URLs.
+- **Under `vault_approval`** (M8) a toolkit's one approved write to a held connector is held by
+  the vault (§6.4): the gateway prepares the plan and asks no one, and the vault renders the write
+  from the connector's own fields and approves it. Such a write blocks up to the toolkit's
+  `call_timeout` minus 30 s and never answers pending. Writes through an HTTP route and plans of
+  more than one write can't be held.
 
 v1 ships example toolkits only (mail, records, and an offline sender verifier). Real ones live in
 the operator's own repo and image. A toolkit is as trusted as the gateway (threat model T6).
@@ -1473,8 +1502,11 @@ authenticated content (e.g. mail) should verify the sender in code and say
 
 ### 6.1 `elicitation` (default)
 
-Only clients the operator marks `approvals.attended` are ever asked; any other client's `approve`
-call is refused at once, before anything is written to the ledger. The gateway asks in **form mode
+Only clients the operator marks `approvals.attended` are ever asked by elicitation. A client
+marked `out_of_band` has its gateway-held prompts relayed to the vault's approvers instead (§6.3),
+and either mark admits a call to a `vault_approval` tool, which the vault asks on its approvers
+(§6.4). A client with neither has its `approve` calls refused at once, before anything is written
+to the ledger. The gateway asks in **form mode
 only**, with the rendered text and an empty requested schema (or the code field below), in the
 agent's era. URL mode is never used for approvals: it would hand the decision to a page the
 gateway doesn't serve.
@@ -1508,7 +1540,7 @@ Elicitation is **synchronous**: it is a request/response tied to the client's ac
 and if the client times out the call, the prompt is orphaned anyway. Its timeout
 (`approvals.timeout`, 300 s by default; `check` refuses more than 600 s) is therefore kept within
 what clients allow for a tool call (typically 60–300 s). Approvals that must wait longer use an
-out-of-band approver (§6.3, from M8), which supports `pending` + `check_approval`.
+out-of-band approver (§6.3), which supports `pending` + `check_approval`.
 
 ### 6.2 What it trusts
 
@@ -1520,50 +1552,101 @@ check in a client before marking it `attended`, and which clients have been chec
 so anyone holding an attended client's token can make calls and answer their own prompts, with or
 without `confirm_code`. Keep the token out of the agent's sandbox, and pin the client's source
 network where the gateway sees the client directly; behind the `lan` proxy it sees only the
-proxy. A compromised gateway or toolkit can also skip the gateway's approvals; the out-of-band
-approvers and vault-enforced approvals (§6.3, §6.4, M8) close both gaps.
+proxy. The out-of-band approvers (§6.3) close this for the clients and tools they serve. A
+compromised gateway or toolkit can also skip every approval the gateway runs, a relayed one
+included; only vault-enforced approvals (§6.4) close that, for `vault_approval` tools where only
+the vault can make the call.
 
 ### 6.3 Out-of-band approvers (hosted in the vault)
 
-Out-of-band approvers run **in the vault**, which already holds the bot token and hosts the
-passkey-protected portal. That makes them independent of both the agent runtime and the gateway.
+Out-of-band approvers run **in the vault** (M8), which holds the bot token as a store secret and
+hosts the passkey-protected portal. That makes them independent of both the agent runtime and
+the gateway. The policy's top-level, host-only `approvers` block names them, and every one
+enabled shows every approval; the first valid decision wins and the others are closed.
 
-- **`telegram`:** a **dedicated bot** sends the operator a DM in plain text, with Approve / Deny
-  buttons.
-  - The vault long-polls the Bot API itself.
-  - It acts only on a button press from the configured user ID in the configured chat, carrying
-    the request's nonce, while the request is pending and unexpired.
-- **`portal`:** a pending-approvals queue in the admin portal. Approving one is a step-up action,
-  so it needs a fresh passkey assertion.
-- **Waiting:** approvals can wait longer (configurable, e.g. hours). While waiting, the tool call
-  either blocks (short waits) or returns `pending <id>`, with a `check_approval` tool on that
-  server for the result (long waits).
+- **`telegram`:** a **dedicated bot**, made directly with Telegram's own bot-making account,
+  sends the operator a message: the whole composed text in one monospaced block, link previews
+  off, with **Deny** and **Approve** buttons. A text Telegram can't carry (over 4,096 UTF-16
+  units) is never cut: Telegram gets a notice and the portal decides it, or, with no portal, the
+  call is refused before anyone is asked.
+  - The vault long-polls the Bot API itself, through its guarded client and the egress proxy;
+    there is no inbound listener.
+  - A press counts only from the enrolled user, not a bot, in the enrolled private chat, on the
+    message the vault stored for that approval, never edited, whose text digest and keyboard are
+    the ones sent, whose button data carries a MAC under a key the vault made at start, for an
+    approval still waiting. So a leaked bot token can delay or drop approvals, never change what
+    is approved. After the decision the message is cut down to its ref and outcome.
+  - `zoeymcp approver telegram enrol` finds the ids from the host: a one-time `/start` link and a
+    confirmation code the bot sends to the chat that pressed Start, which the host types.
+  - `check` refuses a bot token any credential, route or connector also names, and the vault one
+    another secret holds (`approver_token_shared`): one bot has one update reader.
+- **`portal`:** the portal's Approvals queue. Approving one is a step-up action
+  (`approval.decide`, bound to the call's ref and the text's digest, one call per assertion);
+  denying needs a session.
+- **Who is asked:** a client the operator marks `approvals.out_of_band` has its gateway-held
+  `approve` prompts relayed here: the gateway renders and decides as before, and the vault puts
+  its own line above the text on every approver, "Rendered by the gateway: the vault can't
+  confirm this is the call the gateway will run." A `vault_approval` tool (§6.4) is asked here
+  for any client that is `attended` or `out_of_band`. One client token serves every session of an
+  agent runtime, so the operator's mark is a statement about the whole client.
+- **Waiting:** a wait blocks the call up to `approvers.block_seconds` (120 s by default, at most
+  600 s); past it the call answers `pending <ref>`, an error result that says it isn't a failure,
+  and stays waiting up to `approvers.timeout` (an hour by default). The call runs when approved,
+  whether or not anyone still waits, and the gateway's `check_approval` tool, listed beside an
+  `approve` tool for a client that may be asked out of band, hands its result over once, to the
+  client that made the call, within `approvers.result_ttl`. Progress is sent while a call blocks
+  and is never relied on. Everything waiting lives in memory: a restart withdraws it (R41).
 
 More back ends (ntfy, Matrix, Web Push) can follow the same interface later.
 
 ### 6.4 Vault-enforced approvals
 
-A route marked `vault_approval: required` (typically send connectors, trading or payment tools) is
-approved **by the vault**, not the gateway:
+A tool listed under its server's `vault_approval` (a subset of `approve`; typically a send,
+trading or payment tool) is approved **by the vault**, not the gateway (M8). A connector route is
+held for all the toolkit servers that write through it or for none:
 
-1. **The gateway forwards** the call without eliciting: each approval happens in exactly one
-   place.
-2. **The vault parses what it will approve:**
+1. **The gateway forwards** the call without asking anyone, marked as approved elsewhere, for a
+   client that is `attended` or `out_of_band` (any other is refused): each approval happens in
+   exactly one place.
+2. **The vault reads what it will approve,** on every path of a route that carries a held server:
    - For a **connector**, it reads the connector's known fields.
    - For an upstream **MCP route**, it reads the JSON-RPC envelope with the stdlib `json` module
-     (never the MCP SDK). On these routes it accepts only a single, non-batched
-     `application/json` request. A `tools/call` for a tool listed under `vault_approval` is held;
-     any other method passes through only if the route's policy allows it. This is the one place
-     the vault reads MCP, and it reads only the envelope.
+     (never the MCP SDK). It admits only one JSON object, `Content-Type` exactly
+     `application/json` (at most `charset=utf-8`), no `Content-Encoding`, a strict parse in which
+     every number round-trips, a method in MCP's exact set, a tool name its own policy lists that
+     isn't another form of a held name, and routing headers that agree with the body; any
+     `Mcp-Param-*` header, any header the gateway never sends, a query string and a path outside
+     the route's servers' exact paths are refused. A `tools/call` of a held tool is held, marked
+     or not; other methods pass. This is the one place the vault reads MCP, and it reads only the
+     envelope.
 3. **It renders and checks** the approval text with the same rules and budget as §5.2: the shared
-   text-rule code lives in `common/`.
-4. **It asks** an out-of-band approver (§6.3).
-5. **On approval, it forwards exactly the bytes it held,** injecting the credential only then. Any
-   other answer means nothing is sent.
-6. **Ledger** entries are written by the vault.
+   text-rule code lives in `common/`. The text names the client "as reported by the gateway" and
+   the tool's pin from the vault's own policy.
+4. **It asks** its out-of-band approvers (§6.3).
+5. **On approval, it forwards the canonical re-serialization of exactly the envelope it rendered**
+   (`common/canonical.py`: the bytes executed are the bytes shown), injecting the credential only
+   then. The forward is committed: it finishes to its own deadline, is never retried, and its
+   answer passes the response filter and scrubber before it reaches a waiting caller or the
+   result store. Any other answer means nothing is sent.
+6. **Ledger** entries are written by the vault, in its own hash-chained ledger beside the
+   gateway's (§4.6, `/state/ledger-vault/`), joined to the gateway's by ref. If it can't write
+   them, it holds nothing.
 
-Even a fully compromised gateway can't skip these approvals. It can only queue requests, which the
-operator sees and denies.
+A fully compromised gateway can't skip these approvals where only the vault can make the call: the
+route holds a credential, or is a connector or a bridge, or the deployment is hardened (in the
+standard tier a credential-less upstream is reachable by the gateway itself, and `check` warns).
+It can only refuse to forward, or flood the vault's queue, which caps what it holds (64 in all, 4
+per tool, hourly limits and a cooldown) and sends one saturation notice per window: a flood
+denies service and sends nothing.
+
+**Turning it off.** On is a narrowing, allowed in any save. Off is wider, and its own act:
+`vault_approval` goes off only through the portal's own step-up kind `tool.vault_approval_off`
+(one tool, or every writer of one connector, per passkey, each with its own sentence) or a host
+import with `--accept-widening`; a portal save, review save, `include` drop or rollback that
+would drop a held tool is refused, and so is a host rollback.
+A held pair the candidate drops by any route (the field edited, an `include` drop, a server
+removed, a rollback, or a new route or server that reaches the held upstream with the tool
+unheld) counts, and a managed start that would drop one is refused.
 
 ## 7. Admin portal, onboarding and CLI
 
@@ -1583,11 +1666,18 @@ out and ending other sessions need none.
 | Credentials | per credential its routes, health and OAuth state; connect (paste, or the portal's callback), test a `client_credentials` grant, reset a failure state ("Try again") | complete a connect, reset | M5 |
 | Passkeys | enrol, rename and remove passkeys; the portal never removes the last one | enrol, rename, remove (a setup session's one enrolment has the setup code as its step-up) | M5 |
 | Sessions | list the signed-in browsers; end the others | — | M5 |
-| Ledger | the vault's copy of the gateway's ledger: each call's decision and result with its sends, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain | M5 |
+| Ledger | the vault's copy of the gateway's ledger, joined by ref with the vault's own approval chain (M8): each call's decision (where it was made, and by which writer) and result with its sends, the calls only the vault's chain holds, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain | M5; M8 (the vault's chain) |
 | Policy (declarative) | read-only view, built from a list of the fields it may show (no client token, placeholder, account detail or recipient) | — | M5 |
 | MCP servers | every remote and toolkit server with its state and what the gateway reports for it; onboard by URL (§7.4), with the plan and fragment 1; connect; the first-time tool review (filter, suggestions, each definition whole), classify `allow`/`approve`, fragment 2; drifted tools side by side (**Reviewed** and **Now**, each verified by the vault against its pin, with the vault's diff), **Accept the new definition**, decline, **Record the rest as declined**; prompts and resources under headings of their own; **Clear the marks**; **Allow without asking**; in managed mode **Save** in place of fragments, and **Give to clients** (which servers an existing client reaches, one client per save) | register a client (it may store a client secret), discover a server on the operator's network; clear the marks; in managed mode every save: a review's (with each move to `allow` a row of its own), a re-pin, a move to `allow`, onboarding's, giving a server to a client | M7 (onboarding and review), M6 (drift review, re-pin, declines, clearing, approve->allow, saves) |
-| Policy (managed) | the head (when, how and by whom it was written) and the revision the gateway runs; history with structured diffs; **Roll back** to any kept revision whose every difference is narrower or neutral (the head's `admin` kept); each SMTP connector's **Pause**, **Resume** and limits; the export command to run on the host. The portal edits nothing wider: new clients and callers, `admin`, approvals settings, `gateway.limits`, the egress settings and a connector's bound constraints (recipients, host, port, From) are the host's import, and there is no portal export or import | a rollback, a connector's limits or pause | M6 |
-| Approvals | the queue of pending vault-held and out-of-band approvals (§6.3, §6.4) | approve | M8 |
+| Policy (managed) | the head (when, how and by whom it was written) and the revision the gateway runs; history with structured diffs; **Roll back** to any kept revision whose every difference is narrower or neutral (the head's `admin` kept); each SMTP connector's **Pause**, **Resume** and limits; the export command to run on the host. The portal edits nothing wider: new clients and callers, `admin`, approvals settings, `gateway.limits`, the egress settings and a connector's bound constraints (recipients, host, port, From) are the host's import, and there is no portal export or import | a rollback, a connector's limits or pause; turning `vault_approval` off (`tool.vault_approval_off`, below) | M6; M8 |
+| Approvals | the calls the vault holds and the prompts it relays (§6.3, §6.4): Waiting (each text whole, held or relayed, the client as reported, the absolute deadline, whether Telegram has it) and Decided recently; **Approve** (`approval.decide`, one call per assertion, no bulk control) and **Deny** (a session); the nav entry's count and Home's item; on a server's page, **Hold in the vault** (a `policy.save`) and **Turn off vault approval** | approve; in managed mode the saves | M8 |
+
+In managed mode a `vault_approval` tool is turned on in any save, its plan saying before the
+passkey how each client will be asked. Turning it off is its own act:
+`vault_approval` goes off only through the portal's own step-up kind `tool.vault_approval_off`
+(one tool, or every writer of one connector, per passkey, each with its own sentence) or a host
+import with `--accept-widening`; a portal save, review save, `include` drop or rollback that
+would drop a held tool is refused, and so is a host rollback.
 
 ### 7.2 Authentication and bootstrap
 
@@ -1906,7 +1996,9 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp review [<server>]` | `docker exec` in the gateway, or in the vault with `--via vault` | with no server, one line per server from the gateway's status, with no upstream call. With one, the running gateway lists it on a fresh connection and shows per tool its state, pin and findings, a diff for drift, the upstream's `instructions` and `serverInfo` marked "never forwarded", and a YAML snippet to commit. `--tool T` shows only T, `--show T` / `--all` print definitions, `--add T` includes a tool (you still classify it), `--allow T` / `--approve T` / `--allow-read-only` classify as it includes (M7), `--repin T` takes a drifted tool's new pin, `--clear` clears the drift marks if every included tool matches, `--format json`. `--via vault` (M7) queues the review as a job on the vault's socket and reads its report (`--fresh` for a new one); `--choose [--suggest]` writes a choices file with a line per tool, and `--choices FILE` turns the edited file into fragment 2. `--decline T` and `--decline-rest` (M6) record the tools left out, with their pins; in managed mode every option that would print a fragment refuses and names the portal's save or the export and import (M6). Exit 0 when every included tool matches, nothing is marked and every listed tool is included or declined at its pin, 1 when something needs you, 2 when the review couldn't run |
 | `zoeymcp gateway-status [<server>]` | `docker exec` in the gateway | the view's digest and freshness, and per server its connections, era, exposed and included tools, reports and marks; never definitions or token hashes |
 | `zoeymcp ledger [--since AGE] [--client C] [--server S] [--tool T] [--verify]` / `ledger check REF FILE` | `docker exec` in the gateway | one line per call in the gateway's ledger (when, ref, client, server and tool, era, decision, outcome), never a value; `--verify` walks the hash chain and prints its head; `check` says whether FILE holds the arguments that call was shown with, without the key leaving the gateway |
-| `zoeymcp ledger --vault [--before SEQ] [--restart-chain]` | `docker exec` in the vault | the vault's reported copy (§4.6): its state, then the newest calls with their sends and the orphan sends; `--restart-chain` shows the plan and asks before archiving a refused chain |
+| `zoeymcp ledger --vault [--before SEQ] [--chain vault\|copy\|both] [--verify] [--restart-chain]` | `docker exec` in the vault | the vault's reported copy (§4.6): its state, then the newest calls with their sends and the orphan sends; `--chain` joins the vault's own approval chain by ref (the default `both`), or shows one (M8); `--verify` walks the vault's chain; `--restart-chain` shows the plan and asks before archiving a refused chain |
+| `zoeymcp approvals [list] \| show REF-OR-ID \| withdraw REF-OR-ID\|--all` | `docker exec` in the vault | the calls the vault holds, waiting and decided recently, never a text; `show` prints one call's whole text; `withdraw` withdraws one, or every one (`--all`, the emergency stop), sending nothing. No command approves (M8) |
+| `zoeymcp approver telegram enrol --secret NAME [--apply]` / `approver telegram test` | `docker exec` in the vault | finds the operator's Telegram ids with a one-time link and a confirmation code, and with `--apply` in managed mode plans a host import of the `approvers` lines; `test` sends a message with no buttons (M8) |
 | `zoeymcp policy [head]` | `docker exec` in the vault | the mode and, in managed mode, the head (revision, when, how and by whom, its deployment and digest), the revision the gateway runs and its witness (M6) |
 | `zoeymcp policy history [--before N] [--limit N]` / `policy diff N [--against M]` | `docker exec` in the vault | the kept revisions, newest first, a quarantined one as a gap; one revision's structured diff, rendered as the portal's policy view renders values (M6) |
 | `zoeymcp policy export [--revision N] [--mode managed\|declarative] [--for compose] [--force-tty]` | `docker exec -T` in the vault | the head's (or a kept revision's) policy as YAML, its first line naming the revision and deployment; it holds placeholders and token hashes, so it refuses a terminal; `--mode declarative --for compose` is the way back to a declarative deployment (M6) |
@@ -2119,9 +2211,15 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   - a route whose upstream changed can't use its old secret;
   - an echoed secret is scrubbed in each encoding (raw, percent-encoded, JSON-escaped, base64),
     including from a gzip-encoded body;
-  - on a `vault_approval` route, a batched request, a non-JSON body or a `tools/call` hidden
-    behind a different content type doesn't get past the hold, and a denied request sends
-    nothing upstream;
+  - on a route that carries a `vault_approval` tool (M8), a batched request, a non-JSON body, a
+    `tools/call` hidden behind a different content type or encoding, a duplicate key, a number
+    that doesn't round-trip, a tool name in another case or Unicode form, a path off the servers'
+    exact paths, an `Mcp-Method` or `Mcp-Name` header that disagrees with the body, an
+    `Mcp-Param-*` header, a header the gateway never sends and a query string don't get past the
+    hold; a denied, expired or withdrawn call sends nothing upstream; an approved one sends the
+    canonical form of what was shown, once, and finishes when its caller leaves; a forged or
+    replayed Telegram press, a stale portal decision and a flood past the caps send nothing; and a
+    result goes to `check_approval` once, to the client that made the call;
   - a retired gateway key generation stays retired across a vault restart;
   - **OAuth (M2):**
     - a new refresh token is in the store before its access token is used, with `rotates: false`
@@ -2356,6 +2454,64 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   `resources/read` is refused like a tool's; **X11**, extended to the reviewed side (Y10) and to
   prompts and resources; **X10**, holds for fragments, and the export has its own field table
   and the same quoting rule.
+- **Vault-enforced and out-of-band approvals (M8)**, each invariant with effect tests on real
+  processes or sockets (`tests/gateway/`, `tests/portal/`, `tests/acceptance/`), unit and property
+  tests of the pure modules, or, for Z26, a docs test (`tests/unit/test_docs_recipes.py`); Z24
+  and Z25 are planned, and get theirs with the publishing steps.
+  "Refused" means nothing was sent upstream, no approver was asked, and the answer names its
+  reason.
+
+  | ID | Invariant |
+  | --- | --- |
+  | Z1 | **One place.** Every call to an `approve` tool is approved in exactly one enforcement point: the vault for a `vault_approval` tool (the gateway never elicits for it, and marks it elsewhere), the gateway otherwise (a relay for an out-of-band client, an elicitation for an attended one); a held toolkit tool at its one held write |
+  | Z2 | **The vault approves what it holds.** It renders the text from the bytes it holds and the pin from its own policy, under the same rules and budget, and on approval forwards the canonical re-serialization of exactly the envelope it rendered, injecting the credential only then; any other answer sends nothing |
+  | Z3 | **Held routes admit no ambiguity.** Every POST on a route that carries a held server is read; only one JSON object, exact `application/json`, no encoding, a strict parse, round-tripping numbers, an exact MCP method and a listed tool name that isn't another form of a held one pass; a path outside the servers' exact paths is refused |
+  | Z4 | **Headers agree, and nothing else rides along.** The era header equals the body's; `Mcp-Method` and `Mcp-Name` equal the body's fields; any `Mcp-Param-*` header, any header outside the gateway's egress allowlist and any query string is refused; only admitted headers are forwarded |
+  | Z5 | **Skew fails closed.** A call marked elsewhere for a tool the vault doesn't hold is refused `view_stale` and re-decided on a fresh view; an unmarked call to a held tool is held anyway (asked twice, never zero) |
+  | Z6 | **One decision per hold**, in one synchronous section, bound to the approval id, route, server, tool, arguments' and text's digests and ref; a late, duplicate or second-surface answer never forwards twice; a ref is used once |
+  | Z7 | **Withdraw on change.** A change to the tool's hold, approval, pin, route, path or the `approvers` block, a client losing `out_of_band` (or `attended`, for a held call), and a new gateway epoch (its relays and legacy-session holds) withdraw what they touch: nothing sent, messages edited, the agent told |
+  | Z8 | **A bounded queue.** Caps the vault can verify (in all, per route, per tool, hourly, a cooldown after a deny or an expiry); caps keyed on the reported client are fairness only; one saturation notice per window; a flood sends nothing |
+  | Z9 | **Committed forwards finish, once,** in the vault's committed registry, shielded from the caller and the stop, read to their end, filtered and scrubbed, recorded, to the vault's own deadline, never retried |
+  | Z10 | **Nothing persists.** Holds, relays, pending records, results, the press key and the update offset live in memory; a restart withdraws everything undecided, and only the chain survives |
+  | Z11 | **Someone answers, or nobody is asked.** `attended` or `out_of_band` admits a client; neither is refused (`no_approvals`, `no_out_of_band`); no approver configured is `no_approver` |
+  | Z12 | **Relayed text is labelled by the vault,** with its own line inside the digest every approver binds; an imitation of the line is refused; a relay is recorded `where: gateway` and never called vault-enforced |
+  | Z13 | **A press is verified:** the enrolled user, not a bot, in the enrolled private chat, the stored message, no `edit_date`, the sent text's digest and keyboard, a MAC under the per-process key, a hold still waiting with Telegram among its approvers; anything else is refused and logged by reason only |
+  | Z14 | **What the human reads is exact, and only there:** one `pre` entity, no parse mode, previews off, never split or cut (refused, or a notice pointing to the queue); cut down to its ref and outcome afterwards; prompt text only on approver surfaces and `zoeymcp approvals show`, never in a log, health, an error or the chain |
+  | Z15 | **Bot-token custody:** a write-only store secret bound to the Bot API, never in a log, an exception text, an answer, health or the portal; `check` refuses a store name another credential, route or connector uses, and the vault any other secret or route holding the same token or bot (`approver_token_shared`) |
+  | Z16 | **A portal approval is one, bound:** `approval.decide` is bound to the approval id, the text digest and the decision; confirm re-reads the hold; one approval per assertion; no bulk control; deny needs a session and the digest |
+  | Z17 | **Pending is bound and delivered once:** the pending id is the call's ref; `check_approval` answers only the client that made the call, on that server's path, once, through sanitize, the pinned `outputSchema` and `wrap_results`, never by a second forward, within `result_ttl` and a byte bound |
+  | Z18 | **`check_approval` is gateway-made and fixed:** a constant definition, served only where a client may be asked out of band, never pinned, reviewed or drift-checked; `check` refuses the name in policy and an upstream tool of that name is never served |
+  | Z19 | **The vault's chain; no chain, no hold.** Its own hash-chained ledger under a key of its own, `asked` before asking, `decided` before forwarding, `outcome` after; while it can't write, no hold or relay begins (`held_ledger_down`); joined to the gateway's by ref only; no text, argument, recipient or account id |
+  | Z20 | **`vault_approval` off is its own act:** only `tool.vault_approval_off` (one tool, or the closed writer set of one held connector, per passkey) or a host import with `--accept-widening`; a save, review save, `tool.allow`, `include` drop, rollback (portal or host) or resume that would drop a held pair, by any cause, is refused; on is a narrowing |
+  | Z21 | **It binds where the vault holds what the call needs:** `check` warns for a held tool on a credential-less route that isn't a connector or a bridge, and for another route to the same upstream with another credential; refuses a connector held for some writers only, a toolkit writing through a non-connector route, broad rules on a held route, and another route to the same upstream with the same credential or store name |
+  | Z22 | **Approver egress is named and guarded:** the vault's guarded client and startup egress proxy; `api.telegram.org:443` in the vault's derived allowlist with the reason `approver`; the self-test never starts or reaches an approver |
+  | Z23 | **Waits are ordered:** a block of at most `block_seconds` (at most 600 s and `approvers.timeout`); a blocking hold whose caller is gone is withdrawn, never forwarded, except at the gateway's own stop, which detaches it as pending; a toolkit write blocks up to `call_timeout` minus 30 s; no deadline past `approvers.timeout` |
+  | Z24 | *(Planned for M8's publishing steps; not built yet.)* **Release integrity:** an image is to be pushed only from a `v*` tag on main, after an unprivileged guard, under a protected environment, built twice to the same digest with an SBOM and provenance; dev and pull requests push nothing |
+  | Z25 | *(Planned for M8's publishing steps; not built yet.)* **The official check is the host's,** against a tracked digest list and the attestations; nothing in the container claims to be official |
+  | Z26 | **No claim beyond what is built:** the public docs say T1 is closed for `vault_approval` tools and every `approve` tool of an out-of-band client, T4/T6 only for `vault_approval` tools within Z21's scope, and what stays open; none calls the gateway's approvals vault-enforced |
+  | Z27 | **One call, one marker, one answer:** the held marker leaves the gateway only on a call the pipeline registered as approved elsewhere, added after the egress filter; at most one identical held call in flight per connection; the vault's answer is read by that call alone |
+
+  M8 restates these earlier invariants: **H1**, "no unapproved consequential call; each is approved
+  in exactly one place" (Z1), an elsewhere call taking the gateway's lock and ledger but not its
+  prompt; **H3** and **H9**, extended to the vault (Z6, Z9), and an elsewhere call is never
+  404-retried by the gateway; **H6**, a restart now also means the vault's (Z10); **H7**, unchanged
+  at one per (client, server, tool), out-of-band records counting against `max_pending_per_client`,
+  an identical call while one waits pending getting the same ref; **H10**, two chains (Z19), the
+  gateway's recording `asked where=vault` and `decided approved_elsewhere`; **H11**, a toolkit's
+  `approved` slot under an elsewhere grant means "approved by the vault", and only to a held
+  connector; **H14**, prompt text now appears on the approver surfaces (Telegram, the queue page,
+  `approval.decide`'s prepare answer and confirm dialog) and in `zoeymcp approvals show` over the
+  admin socket, and still never in a log line, health, an error or the chain (Z14); **G1**, the view
+  gains `vault_approval`, `out_of_band` and the three out-of-band waits, never the rest of
+  `approvers`; **G2**, the gateway gains five vault paths, its egress filter unchanged and the
+  marker added after it (Z27); **G6** and **G7**, `check_approval` is the stated exception (Z18);
+  **G11**, a result `check_approval` delivers is sanitized, validated and wrapped as a direct one;
+  **G16**, view skew fails closed (Z5); **P1**, the queue's answers hold prompt text, and the bot
+  token and account ids join the hidden fields; **P6**, two more step-up kinds (`approval.decide`;
+  `tool.vault_approval_off`, managed) and one session-only route (deny); **X12**, the gateway still
+  starts every vault connection, the decision long poll included; **X16**, a new reason,
+  `approver`; **Y6** and **Y7**, `approvers` is host-only, `vault_approval` on a narrowing, off
+  only as Z20; **Y13**, the bot token and the Telegram ids are never on a public surface.
 - **`zoeymcp selftest --cases cases.yaml`** starts the vault with the operator's **real** policy,
   with every upstream replaced by an echo server that reports what it received, token endpoints
   by an in-process stand-in and mail servers by a recorder, so a self-test never reaches the
@@ -2364,7 +2520,10 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   which never goes through a proxy, so a policy whose allowlist would refuse
   its own traffic fails the self-test.
   - A case file lists requests and expected outcomes: status, forwarded path, forced parameters
-    present, credential injected, caller refused.
+    present, credential injected, caller refused, or, for a call to a `vault_approval` tool,
+    `held: true` (M8): the call is held and shown once to a stand-in approver that decides
+    nothing, nothing reaches the upstream, and the self-test withdraws it. No approver is
+    started; the allowlist it checks names the approver's host when the policy names one.
   - It is meant to run in CI and before every deploy, and to be **mutation-tested**: flip a rule,
     and the suite must fail.
 - **The project's own CI** mutation-tests the security-relevant modules with `mutmut` (the list
@@ -2408,6 +2567,13 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
     refusals and policy view, the vault's internal endpoint table, review jobs, health and
     gateway keys, and the gateway's pins, egress rules, admission, sanitizing and connection
     states, and the egress role's connect rules).
+  - **M8:** the MCP wire facts (`mcpwire`), the server-path mapping and the held-tool map, the
+    vault's envelope reader, the hold table and its caps, the result store and the stored-answer
+    reader, the gateway's routing decision and approval rules, the Telegram wire rules and the
+    portal's approvals view; and earlier modules M8 changed for security reasons hold or gain
+    their 95% floor (the approval text, the ledger format, the gateway's approval core and egress
+    rules, the vault's internal endpoint table and health, the bridge's admission, and the
+    policy checks, planner, diff, ledger join and ledger view).
 
   Security-relevant modules that hold mostly I/O (the vault's and gateway's apps and servers, the
   admin socket, the upstream pool, the toolkit loader, the CLI, and from M6 the policy store and
@@ -2532,9 +2698,13 @@ gateway:
       servers: [broker-read, broker-trade, mail]
       sources: []                           # optional pins on the direct peer address
       approvals: {attended: true}           # a human watches it, so it may be asked (§6.1)
+    nightly:                                # a scheduled run nobody watches (M8)
+      token_sha256: "sha256:…"
+      servers: [broker-trade]
+      approvals: {attended: false, out_of_band: true}   # asked on the vault's approvers (§6.3)
 
   approvals:
-    approver: elicitation
+    approver: elicitation                   # the only value: out-of-band approvers are below
     timeout: 300
     budget_chars: 3000
 
@@ -2563,6 +2733,7 @@ gateway:
       tools:
         include: [place_order, cancel_order]
         approve: [place_order, cancel_order]
+        vault_approval: [place_order]       # approved by the vault, not the gateway (M8, §6.4)
       review: {place_order: "sha256:…", cancel_order: "sha256:…"}
       on_drift: fail
 
@@ -2588,6 +2759,16 @@ gateway:
       era: legacy                           # the bridge's --era
       tools: {include: [], allow: [], approve: []}
       review: {}
+
+approvers:                                  # host-only; out-of-band approvers in the vault (M8)
+  telegram:
+    bot_token: "store:approver-bot"         # a bot of its own, bound to https://api.telegram.org
+    user_id: 100000001                      # found by `zoeymcp approver telegram enrol`
+    chat_id: 100000001                      # the operator's private chat with the bot
+  portal: {}                                # the portal's Approvals queue (needs `admin`)
+  timeout: 3600                             # a held or relayed call's deadline
+  block_seconds: 120                        # longer waits answer `pending <ref>`
+  result_ttl: 3600                          # a result kept for `check_approval`
 ```
 
 Unknown keys are errors. Source-address pins, where wanted, are an optional `sources:` list on a
@@ -2641,6 +2822,23 @@ resource may not be both included and declined, and a toolkit with `pinning: off
 a tool warns. A declarative reload that lowers `egress_key_generation` is refused, since it
 would revive a retired key.
 
+M8's `check` rules. Every `vault_approval` name is in its server's `approve`, and a held tool
+or an `out_of_band` client needs an approver (`approvers.telegram` or `approvers.portal`).
+Errors: two servers on one route path while either holds a tool; a connector held for only some
+of the toolkit servers whose approved writes reach it; a held toolkit whose approved writes reach
+a route that isn't a connector; a pattern rule, or a POST rule beyond its servers' exact paths,
+on a route that carries a held server; another route to a held route's upstream with the same
+credential or store name, and a second server on a held route that lists a held tool unheld; a
+bot token that isn't `store:`, or whose store name any credential, route or connector uses;
+`chat_id` other than `user_id`; `block_seconds` over `timeout`; `approvers.portal` without an
+`admin` block; `budget_chars` over 3,600 when Telegram is the only approver; `check_approval` in
+any server's lists; and `gateway.approvals.approver` other than `elicitation`. Warnings: a held
+tool on a credential-less route that isn't a connector or a bridge (it binds only in the
+hardened tier); another route to the same upstream with another credential; a client given a
+held tool that is neither attended nor out of band; `out_of_band` with `attended` (unused for
+gateway-held tools); a held server's `call_timeout` past the stop windows' 300 s; a held
+toolkit's `call_timeout` under 150 s; `budget_chars` over 3,600 when the portal is on too.
+
 M5's `admin` block is optional: without it there is no portal. `admin.origins` lists the exact
 origins the browser uses, 1 to 8 of them, each in browser form (lower case, no path, no default
 port). Each is the WebAuthn RP ID of the passkeys enrolled through it, so an IP address is
@@ -2667,7 +2865,11 @@ src/zoeymcp/
                 guard's tables (netguard) and the allowlist derivation, logging, the control
                 pipe, admin socket names; from M6 the strict YAML loader, and in common/policy/
                 the gate, the restart classifier, the attention decision, the review change, the
-                ratchet, the structured diff and its directions, the planner and the export
+                ratchet, the structured diff and its directions, the planner and the export;
+                from M8 the MCP wire facts (mcpwire), the envelope reader (envelope), the result
+                store (resultstore), the stored-answer reader (heldresult), the ledger's file
+                layer (ledgerfile), and in common/policy/ the server-path mapping (serverpaths)
+                and the held-tool map (held)
   vault/        app, request handling, the guarded HTTP clients (netclient), credentials, store +
                 keys, bindings, gateway and egress keys, the link socket's peer check, admin
                 socket, the internal endpoint table, secret writes (plan, then run), onboarding
@@ -2675,7 +2877,10 @@ src/zoeymcp/
                 (reports, reportstore) and its view, server (start-up and listeners); from M6
                 the gateway's status report (statusreport), managed policy: the seal
                 (policyseal), the start decision (policystart), the store (policystore) and
-                the write path (managed)
+                the write path (managed); from M8 the hold table and caps (holds), the
+                approver surfaces and their hub (approvers), the Telegram wire rules
+                (telegramwire) and client (telegram), the committed registry (heldcommit) and
+                the vault's own approval chain (vaultledger)
     oauth/      OAuth: protocol (pure), PKCE and flows, the token manager, login, discovery,
                 fetch, client registration
     connectors/ the SMTP connector: message, CONNECT tunnel, session flow, send journal
@@ -2685,18 +2890,23 @@ src/zoeymcp/
                 committed calls, the ledger and its reporter, toolkits (loader, source, vault
                 client), server; from M6 the capability filter (capabilities), the resource
                 matcher (resourcematch), the restore witness (witness) and the status pusher
-                (statuspush)
+                (statuspush); from M8 the routing decision (routing), the approval rules
+                (approvalrules), the approver transports (approvers), the elsewhere calls
+                (elsewhere), the decisions poller (outofband) and `check_approval`
+                (checkapproval)
   portal/       the admin portal, served by the vault: admission, routes, refusals, display,
                 sessions, limits, actions (step-up), WebAuthn, passkeys, setup codes, the
                 listener, the policy view, the review view, the app, from M6 drafts and the
-                policy diff's rows (policydiffview), and static/ (the page, its scripts, the
-                review screen's, the drift rows' and the managed Policy page's scripts and the
-                stylesheet, the callback pages)
+                policy diff's rows (policydiffview), from M8 the approvals queue's rows and
+                plans (approvalsview), and static/ (the page, its scripts, the review screen's,
+                the drift rows', the managed Policy page's and the Approvals page's scripts and
+                the stylesheet, the callback pages)
   toolkit/      the toolkit SDK: parameters, plans, slot rules, results, context, testing
   selftest/     the route self-test: cases, echo server, runner
   entrypoint/   the standard tier's launcher (env: pure checks, bridges' included; launcher: I/O)
   cli/          every command (main), the admin-socket client, review and ledger rendering,
-                onboarding's commands, the choices file, the policy commands (policy, M6)
+                onboarding's commands, the choices file, the policy commands (policy, M6), the
+                approvals and approver commands (approvals, approver; M8)
   bridge/       stdio ↔ streamable HTTP: admission, framing, the relay, sessions, the program's
                 environment (pure); the program, the listener, the server, main (I/O)
   egress/       the CONNECT-only allowlist proxy: connect rules (pure), allowlist, listeners,

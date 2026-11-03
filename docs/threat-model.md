@@ -1,10 +1,11 @@
 # ZoeyMCP threat model
 
 Who might attack a deployment, what each can reach, and the most each can gain once everything
-built so far (M1 to M7) holds. The mechanisms are in [design.md](design.md); the invariants the
-tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, the portal's are P1 to
-P22 (M5), onboarding's, the egress role's and the bridge's are X1 to X24 (M7), and managed
-policy's, drift review's and prompts' and resources' are Y1 to Y29 (M6) (§8.2).
+built so far (M1 to M7, and M8's approvals) holds. The mechanisms are in [design.md](design.md);
+the invariants the tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, the
+portal's are P1 to P22 (M5), onboarding's, the egress role's and the bridge's are X1 to X24 (M7),
+managed policy's, drift review's and prompts' and resources' are Y1 to Y29 (M6), and
+vault-enforced and out-of-band approvals' are Z1 to Z27 (M8) (§8.2).
 
 ## Actors
 
@@ -34,9 +35,12 @@ policy's, drift review's and prompts' and resources' are Y1 to Y29 (M6) (§8.2).
 - **T3** needs a 256-bit client token. The `lan` profile carries it over TLS; the standard tier
   publishes the gateway on loopback only. DNS rebinding fails on the `Host` and `Origin` checks.
   The `lan` proxy terminates TLS, so it sees client tokens, and holds no other secret.
-- **T4** can call any route bound to `caller: gateway`, inside that route's policy, until
-  vault-enforced approvals (M8). It can't read a secret, the store, the master key or the vault's
-  environment, and it can't write policy, in either mode (M6, below). Recovery: restart
+- **T4** can call any route bound to `caller: gateway`, inside that route's policy, except a
+  `vault_approval` tool's call where only the vault can make it (a route with a credential, a
+  connector or a bridge, or the hardened tier), which the vault holds until the operator approves
+  it (M8, below).
+  It can't read a secret, the store, the master key or the vault's environment, and it can't write
+  policy, in either mode (M6, below). Recovery: restart
   (standard tier), or rotate the gateway key (hardened), then rotate client tokens. In the
   standard tier it shares the vault's network namespace, so it has egress; the hardened tier has
   none.
@@ -63,7 +67,10 @@ At most:
   **If it holds the token of an attended client, it can make the call and answer its own prompt**,
   with or without `confirm_code`: the prompt goes back to whoever made the call. Keep the token
   out of the sandbox and pin the client's source where the gateway sees it directly
-  ([clients.md](clients.md)); M8's out-of-band approver closes this.
+  ([clients.md](clients.md)). The out-of-band approvers close this by mechanism (M8, below): a
+  `vault_approval` tool is asked on the operator's approvers whichever client calls it, and so is
+  every `approve` tool of a client marked `out_of_band`; an elicited prompt still goes back to
+  the caller.
 - **T1a** is a client that isn't attended, so it must not be marked `attended`. If it is, the
   confirmation code defeats a blind hook, but not an LLM that reads the message.
 - **T2** gains nothing new: its text never enters a prompt, and its own elicitation or
@@ -73,8 +80,11 @@ At most:
   vault: fixed sender and recipients, the expected-recipient check, the rolling limit, `paused`,
   route allowlists, and the send journal, which the gateway can't edit. In the standard tier a
   toolkit dependency also has the gateway's egress, which M7's egress role doesn't confine: it
-  confines hardened bridges only. The derived-image recipe lowers the chance of
-  T6; M8's vault-side approvals close the gap.
+  confines hardened bridges only. The derived-image recipe lowers the chance of T6. M8's
+  `vault_approval` covers a toolkit's calls to a held connector and to held MCP routes: the vault
+  holds the one write and approves it. It leaves open a toolkit patching or reading another in
+  the process, a toolkit's own egress in the standard tier, HTTP-route toolkit slots and plans of
+  more than one write, which can't be held.
 - **T7** sees names, refs, outcomes, counts and keyed digests; never argument values, prompt
   text, subjects, bodies, recipients, handles or secrets.
 - **T8** sees TLS only: certificates are verified against certifi's roots, AUTH never goes out
@@ -130,8 +140,9 @@ At most:
   stops further reports, visibly. It can't claim a record the vault wrote, and writes nothing but
   the copy. The orphan check on the Ledger page doesn't bound T4: the gateway picks each send's
   reference and writes the records, so it can cover a send of its own with a fabricated record.
-  The check catches a send by a caller that can't write the gateway's ledger. As a peer of the
-  standard tier's listener it is a T12.
+  The check catches a send nobody recorded (a record lost, or a gateway that didn't write one),
+  and only the vault's own chain, for a call it held under `vault_approval` (M8), is beyond the
+  gateway's reach. As a peer of the standard tier's listener it is a T12.
 - **T7** sees names, refs, decisions, outcomes, counts, bindings and health in the portal: never
   a value, a token, a recipient address, an SMTP username, a keyed digest or a Message-ID. The
   vault's copy files hold the gateway's keyed digests, as the gateway's ledger does. Logs gain no
@@ -385,9 +396,113 @@ At most:
   write causes is in its plan before the passkey or the `[y/N]`.
 
 What doesn't change: **declarative mode** keeps every earlier statement (the operator's commit is
-the guard, and no route writes policy); **T1, T4 and T6 stay open until M8**: moving a tool to
-`allow` closes no approval gap, and a compromised gateway or toolkit can still skip the gateway's
-approvals.
+the guard, and no route writes policy); moving a tool to `allow` closes no approval gap. T1, T4
+and T6 are closed only by M8's mechanisms and only within their scope (below): a compromised
+gateway or toolkit can still skip every approval the gateway runs itself.
+
+## Vault-enforced and out-of-band approvals (M8)
+
+M8 lets the vault hold a consequential call itself (`vault_approval`) and ask the operator out of
+band, on a Telegram bot the vault polls or in the portal's Approvals queue, and lets the operator
+send a client's gateway-held prompts there too (`out_of_band`). It restates T1, T2, T4, T6, T7,
+T10, T15, T16 and T24 for these surfaces and adds eight actors.
+
+M8 closes the approval gaps by mechanism and only within scope: a holder of an agent's token
+can't answer its own prompt for a `vault_approval` tool, or for any `approve` tool of an
+`out_of_band` client, and a compromised gateway or toolkit can't skip the approval of a
+`vault_approval` tool where only the vault can make the call (its route holds a credential, is a
+connector or a bridge, or the deployment is hardened); every other approval is the gateway's,
+which a compromised gateway or toolkit can still skip.
+
+| # | Actor | Has | Wants |
+| --- | --- | --- | --- |
+| T1 | **A holder of an agent client's token** (restated) | the token of an attended or an out-of-band client | to make a consequential call and answer its own prompt; for an out-of-band client, to raise prompts from a session nobody is in (a scheduled run that read untrusted mail) |
+| T2 | **A hostile upstream** (restated) | tool results, listings, error text | a result whose text imitates an approval prompt or `pending <id>`, to steer the model to `check_approval` with another client's id or to approve something; a listing that adds a tool named `check_approval` |
+| T4 | **A compromised gateway** (restated) | the gateway's process, its key or link socket, its view | to skip a vault-held approval; to show the human one call and forward another (a body the vault didn't render, a routing header that disagrees, a second forward after one approval, a retry); to omit the elsewhere marker or claim it for a tool the vault doesn't hold; to flood the vault's queue and the operator's chat; to assert a false client name; to relay a gateway-rendered text that lies; to collect results of vault-held calls |
+| T6 | **A compromised toolkit** (restated) | code in the gateway process | as T4, through the toolkit's slots (it is T4) |
+| T7 | **A curious reader** (restated) | logs, the vault's chain, an open Approvals page, `zoeymcp approvals show` output | prompt text, argument values, recipients |
+| T10 | **A stolen portal session** (restated) | a session, no passkey | to approve from the queue; to deny everything; to read every waiting approval's text |
+| T15 | **A passkey holder** (restated) | a session and fresh assertions | to approve a held call; to turn `vault_approval` off |
+| T16 | **A writer of `/state`** (restated) | every file in the vault's volume | to roll back or truncate the vault's approval chain and the send journal; to plant a record; to bring back an approval |
+| T24 | **A reader of `/state` or a backup** (restated) | the volume at rest | the vault chain's records |
+| T31 | **The chat service itself** (Telegram) | every approval text sent through it, the chat history, the delivery of presses | (not an adversary by default) to keep, read or leak prompt texts; to fetch a URL in a text (a link preview is a beacon); to deliver a press late |
+| T32 | **A taker of the operator's chat account** | a linked desktop session, a SIM swap, an unlocked phone | to press Approve on a genuine prompt, with no fresh user verification |
+| T33 | **A holder of the approver bot's token** (leaked, or shared with an agent route) | the Bot API as the bot | to consume presses and the update queue; to send look-alike prompts; to edit a genuine prompt's text above its buttons; to delete prompts; to read the operator's enrolment code |
+| T34 | **Another admitted agent** | its own client token, the model's context of a shared conversation | to call `check_approval` with an id another client got, to collect that client's result or learn its status |
+| T35 | **A release-pipeline attacker** | a pushed tag or branch, a pull request, an edited workflow, a compromised action or base image | to get an image published from unreviewed code, under the project's identity |
+| T36 | **A swapped image** | a registry mirror, a look-alike name, a local tag | to run a non-official image as the vault |
+| T37 | **A flooding caller** (T4's or T1's flood) | as many held or relayed asks as it can send | operator fatigue, a buried real prompt, the bot's rate limit, the vault's memory |
+| T38 | **The operator's own mistake** (not an adversary) | a policy that points the approver at an agent's bot, a budget too big for Telegram, a `vault_approval` tool whose route has no credential, a long `call_timeout` with short stop windows | an approval that can't be shown, a forward cut at a stop, a hold that binds nothing |
+
+At most:
+
+- **T1**, holding any client's token, can call a `vault_approval` tool and *cause* a prompt on
+  the operator's approver, but can't answer it: the answer comes only from the configured chat
+  account or a passkey. Holding an **out-of-band** client's token, the same holds for every
+  `approve` tool. It can still answer its own elicited prompt for a gateway-held tool of a client
+  that is only `attended`. It can raise out-of-band prompts from any session of that client
+  (ZoeyMCP can't tell sessions apart), each bounded by the caps; whether that is acceptable is
+  the operator's choice per client.
+- **T2** reaches the human only as JSON-escaped values in a rendered text, as before. A result
+  imitating `pending <id>` makes the model call `check_approval` with an id that is another
+  client's or unknown, and it gets "unknown or expired". An upstream tool named `check_approval`
+  is never served.
+- **T4 and T6** can't skip a vault-held approval: an unmarked call to a held tool is held anyway,
+  on any path of a route that carries a held server, and a request outside its servers' exact
+  paths is refused; another route to the held upstream with the same credential is refused by
+  `check` and by the planner; a marked call for a tool the vault doesn't hold, a held name in
+  another case or Unicode form, a tool the operator didn't list, a header or query parameter the
+  honest gateway never sends, and a ref already used are refused. They can't show one call and
+  forward another: the vault renders from the bytes it holds and forwards their canonical form,
+  and refuses any ambiguity in them and any routing header that disagrees. They can't approve,
+  retry an approved forward, replay an approval or stretch its deadline. They **can** refuse to
+  forward (a denial), flood the queue up to the vault's caps, claim a false client name (shown
+  "reported by the gateway"), relay a false text for a gateway-held prompt (shown under the
+  vault's line "Rendered by the gateway"), skip every approval of a tool not under
+  `vault_approval`, call a credential-less upstream directly in the standard tier, collect
+  results of held calls (which would have reached them anyway), and hide a held tool's drift from
+  the gateway's side (the prompt shows the pin from the vault's policy).
+- **T7** sees approval texts on an open Approvals page and in `zoeymcp approvals show` output,
+  which print them so the approver can read them; logs, health, errors and the vault's chain
+  carry refs, names, keyed digests and outcomes, never a text.
+- **T10** can deny any waiting approval (logged `approval_decided` with `via: portal`) and read
+  waiting texts; a deny sends nothing, and the session's 15-minute idle limit and 4-hour life
+  bound it. It can't approve: that needs a passkey assertion bound to the approval.
+- **T15** can approve one held call per assertion, and turn `vault_approval` off for one tool (or
+  every writer of one held connector) per assertion, each a logged, separately worded act; it
+  can't approve in bulk, or turn it off inside a save, an `include` drop or a rollback.
+- **T16** can roll the vault's chain and the send journal back with the volume (below); it can't
+  forge a record (each is keyed under a key derived from the master key) and can't bring back an
+  approval, since none is kept on disk.
+- **T24** reads the vault chain's refs, names, keyed digests, decisions and outcomes; never a
+  text, an argument, a bot token or an account id beyond the policy's own.
+- **T31** sees approval texts while a prompt waits, and its edited remainder (ref and outcome)
+  after; it fetches nothing, since link previews are off. operations.md §36.6 tells the operator.
+- **T32** can approve any prompt sent to Telegram while it holds the session. The portal queue's
+  passkey approval is the stronger approver, and an operator may enable the queue alone.
+- **T33** can delay or drop approvals (they fail closed at the deadline), send prompts whose
+  presses verify as nothing, and delete messages; it can't make a press approve a text the vault
+  didn't send, since the vault checks the pressed message's ids, `edit_date`, text digest and
+  keyboard and a MAC under a key it made at start. While an enrolment is open it could read the
+  operator's `/start` code and present it from its own account: the enrolment aborts on a second
+  presentation, a 409 or a foreign webhook, and nothing is written until the host types a
+  confirmation code the bot sent to the chat that presented it, which only the operator's phone
+  shows. Health shows a contested token.
+- **T34** gets "unknown or expired" for any id that isn't its own call's.
+- **T35 and T36** are for M8's publishing steps, which aren't built yet: no image is published
+  and there is no official-image check yet. This section will say what holds against them once
+  those steps are built.
+- **T37** is refused past the caps; the operator gets one saturation notice per window, not one
+  message per ask.
+- **T38** is caught by `check` before a reload or a save takes effect.
+
+What stays open after M8: every `approve` tool not under `vault_approval` against T4 and T6, a
+relayed prompt included; a toolkit's isolation from other toolkits (D-55's remainder);
+standard-tier egress for the gateway and toolkits (D-56, D-52); an agent runtime's own connector
+or MCP-install features, which reach servers without the gateway (D-211 (3)); `vault_approval` on
+a credential-less upstream in the standard tier; HTTP-route toolkit slots, toolkit plans of more
+than one write, and tools that mirror parameters into `Mcp-Param-*` headers, none of which can be
+held. The accepted limits below name the rest.
 
 ## The confused deputy
 
@@ -420,17 +535,55 @@ first.
   start (`passkeys_loaded`), so a lower number shows a restore. **After any restore, run
   `zoeymcp passkeys` and remove what shouldn't be there**, or `zoeymcp setup-code --reset`. The
   vault's copy of the gateway's ledger goes back too: the gateway refills it, or it refuses with
-  a `gap` if the gateway pruned records meanwhile.
+  a `gap` if the gateway pruned records meanwhile. **The vault's approval chain and the send
+  journal go back together** (M8): they still agree with each other, and only the gateway's
+  chain, on its own volume, would disagree; no counter detects it. **The same restore can turn
+  `vault_approval` off**: it may bring back a policy revision from before a tool was held, and
+  then the tool is the gateway's to approve again. In managed mode the gateway's witness
+  (`policy_behind_witness`) is the signal; after any restore, compare the head with your latest
+  export (operations.md §34, §36).
 - **Review findings are heuristics.** Reading the definition is the control.
 - **A client can auto-accept**, and a holder of an attended client's token can approve its own
-  calls (above). The gateway can't tell a human's answer from software's.
-- **A compromised gateway or toolkit can skip gateway approvals** until M8.
+  elicited calls (above). The gateway can't tell a human's answer from software's.
+- **A compromised gateway or toolkit can skip every approval the gateway runs**, relayed
+  out-of-band prompts included; only `vault_approval` takes an approval out of its reach, and
+  only where the vault holds what the call needs (M8, above).
+- **The vault approves what it renders, not the upstream's current tool** (M8): a held prompt
+  shows the tool's name, its arguments and the pin from the vault's policy, but the vault doesn't
+  compare that pin with the upstream's definition now, so a compromised gateway can hide a held
+  tool's drift (D-50).
+- **Another route to a held upstream with another credential** (a second account, a read-only key
+  the upstream accepts for writes) is only a warning: the vault can't know what a different
+  credential may do upstream, so the operator must make sure it can't call the held tool. In the
+  standard tier a held tool on a credential-less upstream binds nothing, since the gateway can
+  reach that upstream itself (`check` warns).
+- **The vault can't tell how the approver bot was made** (M8). A bot made through another bot can
+  have its token fetched and replaced by that bot's owner, and the Bot API gives a bot no way to
+  learn it is managed. Making it directly with Telegram's own bot-making account is the
+  operator's step (operations.md §36.2).
+- **The chat account is an approval credential** (M8): whoever holds a live session of it can
+  approve what is sent there, with no fresh user verification, and Telegram reads every text
+  until the vault edits it down (T31, T32).
+- **The pending answer relies on client behaviour** (M8): a tool with an `outputSchema` answers
+  `pending` as a tool error with no structured content, which the reference SDKs accept; a client
+  that validates error results too would reject it ([clients.md](clients.md)).
+- **A vault restart drops every wait** (M8): nothing waiting is kept on disk, so the agent calls
+  again.
+- **ZoeyMCP can't tell which session of an agent runtime asked** (M8): one client token serves
+  every session, so `attended` and `out_of_band` are statements about the whole client, and every
+  session of such a client can put a prompt on the operator's phone.
 - **Markdown clients** might render something the markup guard doesn't anticipate; `renders:
   markdown`, the default, refuses the known constructs.
 - **The portal (M5):**
   - **The authenticator shows nothing about the change.** A step-up confirms the summary the page
     shows; script controlling the page could show one change and ask for another. The CSP,
     Trusted Types and text-only rendering keep script off the page.
+  - **An approval's step-up binds what is approved, not what was seen** (M8). `approval.decide`
+    is bound to the call's ref and the digest of the text the vault rendered, so it approves
+    exactly that call; what the operator saw is what the page showed, under its CSP, Trusted Types
+    and text-only rendering, which are the trust root for it. In Telegram the trust root is
+    Telegram's client and the operator's account, and the client may make something in a text a
+    link even inside its monospaced block (D-44).
   - **The operator's machine is trusted** (T11): a process holding the portal's own `localhost`
     port can relay a sign-in and read a typed setup code. An `https` origin with a real
     certificate narrows this.
@@ -487,7 +640,7 @@ first.
   - **A compromised gateway can fake a review report** with consistent pins, and hide findings.
   - **A leaked sign-in link** works against a callback flow that onboarding set up as it does
     against any (the portal's limit above); standard-tier siblings reach the portal as before; and
-    the approval-bypass gaps stay open until M8.
+    the approval-bypass gaps are closed only where M8's mechanisms reach (above).
 - **Bridges (M7):**
   - **A bridge and its program are one trust domain** (the same uid). The bridge defends the vault
     and the gateway from the program, not itself; a program that ignores proxy settings or skips
@@ -517,25 +670,34 @@ first.
     principal.
 - **Managed policy, drift review, prompts and resources (M6):**
   - **A passkey widens what admitted agents may do.** In managed mode one assertion can include a
-    tool, move it to `allow`, onboard a server (with, after a stepped-up private discovery,
-    egress to a private address that takes effect at once) or give an admitted client another
-    server, which is more than a declarative deployment's passkey can do. It can't admit a new
-    agent, move a secret or lock the operator out. **One passkey covers every approve->allow move
-    a review save lists:** each is its own row in the plan, with its sentence and the pinned
-    definition, and each is logged `tool_allowed`, but whoever holds the passkey can make every
-    included tool unprompted in one save, as they could in several. M8's vault-enforced approvals
-    don't change this (a passkey could switch them off too); the hardened tier and the passkey's
-    own protection are the answer.
+    tool, move it to `allow`, onboard a server (with, after a stepped-up private discovery, egress
+    to a private address that takes effect at once) or give an admitted client another server,
+    which is more than a declarative deployment's passkey can do. It can't admit a new agent, move
+    a secret or lock the operator out. **One passkey covers every approve->allow move a review save
+    lists:** each is its own row in the plan, with its sentence and the pinned definition, and each
+    is logged `tool_allowed`, but whoever holds the passkey can make every included tool unprompted
+    in one save, as they could in several. M8's vault-enforced approvals don't change this, since a
+    passkey can switch them off too, one act at a time: `vault_approval` goes off only through the
+    portal's own step-up kind `tool.vault_approval_off` (one tool, or every writer of one
+    connector, per passkey, each with its own sentence) or a host import with `--accept-widening`;
+    a portal save, review save, `include` drop or rollback that would drop a held tool is refused,
+    and so is a host rollback. The hardened tier and the passkey's own protection are the answer.
   - **A relayed setup code now yields a passkey that can save policy** (T3, T12): in the standard
     tier the gateway and sibling containers still reach the portal's unauthenticated routes, and a
     code redeemed by one of them enrols a passkey that passes step-up for managed saves, within the
     portal's edit set above. This stays accepted: the hardened tier, which publishes the portal on
-    the host's loopback only, is the answer.
+    the host's loopback only, is the answer. With M8's portal queue, such a passkey can also
+    approve held calls through `approval.decide` and turn `vault_approval` off one tool at a time
+    through `tool.vault_approval_off`. Without a code, a sibling can only deny the portal's sign-in
+    with continuous traffic, which times held calls out (they fail closed), and only when the
+    portal is the sole approver.
   - **The authenticator shows nothing about the plan.** WebAuthn shows no transaction text: a
     save's plan, however long (every changed field, restart and binding, a rollback's whole
     difference), is rendered by the portal from the action it holds, so script running in the
     portal's origin could show one plan and confirm another. The CSP, Trusted Types and
-    text-only rendering keep script off the page.
+    text-only rendering keep script off the page. The same holds for M8's approvals: the binding
+    (the ref and the rendered text's digest) fixes what is approved, and the page is the trust
+    root for what the human saw.
   - **Who sets what, per mode.** In declarative mode the file's author sets everything, as
     before. In managed mode the settings the earlier limits leave to that author (a client's
     `renders` and the other approvals settings, `drift_check_interval`, a connector's host and
