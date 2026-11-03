@@ -16,6 +16,7 @@ import yaml
 from pydantic import ValidationError
 
 from tests.dark import lit
+from zoeymcp.common import egresslist
 from zoeymcp.common.policy import Finding, PolicyError, check, check_policy, fields, parse_policy
 from zoeymcp.common.policy.schema import (
     Client,
@@ -1674,6 +1675,17 @@ def test_egress_key_generation_counts_from_one(example_raw: Raw) -> None:
 
 def egress_findings(raw: Raw) -> list[str]:
     return [f"{f.level} {f.path}: {f.message}" for f in run(raw) if f.path.startswith("egress_")]
+
+
+def test_an_approvers_private_mark_is_used(example_raw: Raw) -> None:
+    """D-248: the Bot API is a vault destination once approvers.telegram is set, as egresslist
+    lists it (reason ``approver``), so marking it private draws no "unused" warning."""
+    raw = m8(example_raw)
+    raw["egress_private"] = ["api.telegram.org:443"]
+    unused = "warning egress_private[0]: unused: the vault never connects here"
+    assert egress_findings(raw) == [unused]
+    assert egress_findings(telegram(raw)) == []
+    assert (f"{egresslist.TELEGRAM_HOST}:{egresslist.TELEGRAM_PORT}") == check.TELEGRAM_DESTINATION
 
 
 def test_egress_private_names_vault_destinations(example_raw: Raw) -> None:

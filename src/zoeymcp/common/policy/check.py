@@ -1105,10 +1105,15 @@ def _check_squid_names(policy: Policy, report: _Report) -> None:
             )
 
 
+# The Telegram approver's destination, as egresslist.TELEGRAM_HOST and TELEGRAM_PORT write it
+# (that module imports this one, so the pair is pinned equal by a test; D-248).
+TELEGRAM_DESTINATION = "api.telegram.org:443"
+
+
 def _vault_destinations(policy: Policy) -> set[str]:
     """Every ``host:port`` the vault connects to, as ``egress_private`` writes it: the route
-    upstreams, the token and revocation endpoints, and the connectors. A ``unix:`` upstream is a
-    socket, with no ``host:port``."""
+    upstreams, the token and revocation endpoints, the connectors, and the Bot API when
+    ``approvers.telegram`` is set. A ``unix:`` upstream is a socket, with no ``host:port``."""
     urls = [
         r.upstream
         for r in policy.routes
@@ -1122,6 +1127,8 @@ def _vault_destinations(policy: Policy) -> set[str]:
     found = {_host_port(url) for url in urls}
     for conn in policy.connectors.values():
         found.add(_join_host_port(conn.host.lower(), conn.port))
+    if policy.approvers is not None and policy.approvers.telegram is not None:
+        found.add(TELEGRAM_DESTINATION)
     return found
 
 
