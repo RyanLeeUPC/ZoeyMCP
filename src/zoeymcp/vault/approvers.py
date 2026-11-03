@@ -1,7 +1,8 @@
 """The vault's approver surfaces, and the hub that shows a hold on each (M8 design D.1, D.3, D.4).
 
-A :class:`Surface` is one place a human decides: the portal's queue (passive: the queue lists the
-open holds, step 15) or Telegram (it sends and edits messages, step 14). D-38's later back ends
+A :class:`Surface` is one place a human decides: the portal's queue (:class:`PortalQueue`,
+passive: the queue lists the open holds, step 15) or Telegram (it sends and edits messages, step
+14). D-38's later back ends
 implement the same interface: render through :mod:`~zoeymcp.common.approvaltext`, bind the
 decision to the hold's id and text digest, one named egress source, a ``SecretRef``.
 
@@ -20,17 +21,20 @@ that no surface shows.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Iterable
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Final, Literal, Protocol
 
 from . import logs
-from .holds import SATURATION_WINDOW, Hold
+from .holds import SATURATION_WINDOW, Hold, Kind, State, Via
 
 SurfaceName = Literal["telegram", "portal"]
 # The longest the vault waits on one surface's show, close or notice, and on all of their edits
 # at its stop (M8 design I.2, M.3).
 EDIT_GRACE: Final = 5.0
+# The portal queue's Decided recently: the last 20 endings it showed (H.1).
+DECIDED_KEPT: Final = 20
 # D.3's notice, sent at most once per SATURATION_WINDOW to each surface.
 NOTICE: Final = (
     "The approval queue is full: {count} requests were refused in the last "
@@ -77,6 +81,76 @@ class Surface(Protocol):
     async def close(self, hold: Hold, outcome: str) -> None: ...
 
     async def notice(self, text: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class Closed:
+    """A hold the portal's queue showed, as it ended (H.1's Decided recently): its handle, what
+    it was for and how it ended, never its text, which leaves with the hold (Z10)."""
+
+    id: str
+    ref: str
+    kind: Kind
+    server: str
+    tool: str
+    client: str | None
+    state: State
+    via: Via | None
+    decided_at: float | None
+    detail: str | None
+
+
+class PortalQueue:
+    """The portal's Approvals queue (D.1, H.1): a passive surface. The page lists the open holds
+    from the hold table, and a decision there comes back through ``VaultApp.decide``, so a show
+    only says the hold is shown. It keeps the last :data:`DECIDED_KEPT` holds it closed, newest
+    first, for Decided recently, and the saturation notice for :data:`.holds.SATURATION_WINDOW`
+    on the hold table's clock."""
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._closed: deque[Closed] = deque(maxlen=DECIDED_KEPT)
+        self._notice: tuple[str, float] | None = None
+
+    @property
+    def name(self) -> SurfaceName:
+        return "portal"
+
+    async def show(self, hold: Hold) -> Shown:
+        return Shown("portal")
+
+    async def approved(self, hold: Hold) -> None:
+        """Nothing to edit: the queue reads an approved hold's forward from the hold table."""
+
+    async def close(self, hold: Hold, outcome: str) -> None:
+        """``hold`` as it ended (its state is ``outcome``), kept without its text."""
+        self._closed.appendleft(
+            Closed(
+                hold.id,
+                hold.ref,
+                hold.kind,
+                hold.server,
+                hold.tool,
+                hold.client,
+                hold.state,
+                hold.via,
+                hold.decided_at,
+                hold.detail,
+            )
+        )
+
+    async def notice(self, text: str) -> None:
+        self._notice = (text, self._clock())
+
+    def closed(self) -> list[Closed]:
+        """The holds it closed, newest first."""
+        return list(self._closed)
+
+    def current_notice(self) -> str | None:
+        """The saturation notice, while its window lasts."""
+        if self._notice is None or self._clock() - self._notice[1] >= SATURATION_WINDOW:
+            return None
+        return self._notice[0]
 
 
 class ApproverHub:

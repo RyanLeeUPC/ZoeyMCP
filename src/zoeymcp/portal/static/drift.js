@@ -129,7 +129,7 @@
   async function home() {
     await toggle();
     const answer = await api("GET", "/api/attention");
-    $("attention-block").hidden = !answer.gateway;
+    $("attention-block").hidden = !answer.shown;
     $("attention-text").textContent = reported(answer);
     const list = $("attention");
     list.replaceChildren();

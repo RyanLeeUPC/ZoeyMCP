@@ -110,7 +110,14 @@ def clear(server: str) -> dict[str, str]:
 
 def test_nothing_before_the_gateway_reports(home: tuple[PortalRig, Page]) -> None:
     _, page = home
-    assert attention(page) == {"gateway": True, "items": [], "more": 0, "reported_ago": None}
+    assert attention(page) == {
+        "gateway": True,
+        "shown": True,
+        "items": [],
+        "more": 0,
+        "reported_ago": None,
+        "approvals": None,
+    }
 
 
 def test_the_attention_list_one_action_each(home: tuple[PortalRig, Page]) -> None:
@@ -204,7 +211,14 @@ def test_no_gateway_no_list(tmp_path: Path) -> None:
     with running(tmp_path) as rig:
         page = rig.browser().page(rig.origin)
         set_up(rig, page, SoftAuthenticator())
-        assert attention(page) == {"gateway": False, "items": [], "more": 0, "reported_ago": None}
+        assert attention(page) == {
+            "gateway": False,
+            "shown": False,
+            "items": [],
+            "more": 0,
+            "reported_ago": None,
+            "approvals": None,
+        }
 
 
 def row(name: str, **attention: list[str]) -> dict[str, Any]:

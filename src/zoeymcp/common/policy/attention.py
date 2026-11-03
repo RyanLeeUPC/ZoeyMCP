@@ -20,12 +20,18 @@ can't be declined, so it is none of these: the listing reports it on its own. :f
 whether nothing needs the operator. The gateway's review report and status, ``zoeymcp
 review``'s exit code, and the vault's health and Home all call this one decision, so they can't
 disagree.
+
+Home's list has one item that isn't a server's (M8 design H.1, CR-11): :func:`approvals_item`,
+from the vault's own hold table, "N approvals waiting: the oldest must be answered by HH:MM UTC",
+whose one action is the queue; and :func:`block_shown` says when Home shows the list at all: with
+the gateway's report, or while approvals wait without one.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, fields
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 
@@ -127,3 +133,29 @@ def loaded(data: Mapping[str, Any]) -> Attention:
     """An :class:`Attention` from its plain form (:meth:`Attention.as_dict`); a list it doesn't
     hold is empty."""
     return Attention(*(tuple(sorted(data.get(member.name, ()))) for member in fields(Attention)))
+
+
+def approvals_item(waiting: int, deadline: float | None) -> dict[str, Any] | None:
+    """Home's approvals item (M8 design H.1): ``waiting`` holds the portal can decide, the
+    oldest of which must be answered by ``deadline`` (wall-clock seconds); None when none
+    waits. Its one action is the queue's (``approvals``)."""
+    if waiting < 1 or deadline is None:
+        return None
+    by = datetime.fromtimestamp(deadline, UTC).strftime("%H:%M")
+    if waiting == 1:
+        text = f"1 approval waiting: it must be answered by {by} UTC"
+    else:
+        text = f"{waiting} approvals waiting: the oldest must be answered by {by} UTC"
+    return {
+        "kind": "approvals",
+        "subject": "approval",
+        "count": waiting,
+        "text_shown": text,
+        "action": {"kind": "approvals"},
+    }
+
+
+def block_shown(gateway: bool, approvals: Mapping[str, Any] | None) -> bool:
+    """Whether Home shows its attention list: with the gateway's section of health, or while
+    approvals wait, with or without it (CR-11)."""
+    return gateway or approvals is not None

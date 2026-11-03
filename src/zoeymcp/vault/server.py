@@ -67,7 +67,7 @@ from ..common.policy.plan import PlanInput, PlanRefused, normalize, normalized_d
 from ..common.policy.ratchet import Grants, Ratchet, initial, violations
 from ..entrypoint.env import holds_secret_env
 from ..portal import listen as portal_listen
-from ..portal.app import Ledger, PortalApp, Secrets, StaticMissing, load_static
+from ..portal.app import Approvals, Ledger, PortalApp, Secrets, StaticMissing, load_static
 from ..portal.listen import RESOLVE_EVERY, RESOLVE_FOR, Address, ListenError
 from ..portal.passkeys import Passkeys
 from ..portal.policyview import Source
@@ -775,6 +775,7 @@ def build_portal(
     onboard: OnboardService | None = None,
     reviews: ReviewQueue | None = None,
     managed: ManagedPolicy | None = None,
+    approvals: Approvals | None = None,
     lookup: Lookup = lookup_addresses,
 ) -> Portal | None:
     """The portal for ``policy.admin``, or None (``portal_disabled``) without the block. Refused
@@ -787,8 +788,9 @@ def build_portal(
     the vault's own chain it joins them with (M8 design J.2); ``source`` where the policy came
     from, for its policy view, and in managed mode ``policy_header`` the running revision's
     header (M6 design A.4); and ``onboard`` and ``reviews`` the onboardings and review jobs its
-    MCP servers section shares with the socket (M7 K); and in managed mode ``managed``, the
-    policy's holder its saves write through (M6 design G.6)."""
+    MCP servers section shares with the socket (M7 K); in managed mode ``managed``, the
+    policy's holder its saves write through (M6 design G.6); and ``approvals`` the hold table and
+    queue its Approvals page decides through (M8 design H)."""
     admin = policy.admin
     if admin is None:
         logs.event("portal_disabled")
@@ -817,6 +819,7 @@ def build_portal(
         onboard=onboard,
         reviews=reviews,
         managed=managed,
+        approvals=approvals,
     )
     return Portal(app, address)
 
@@ -1366,6 +1369,8 @@ def build(
         reviews=app,
         # Its managed saves write through the policy's holder (M6 design G.6).
         managed=managed,
+        # Its Approvals queue reads and decides on the vault's own hold table (M8 design H).
+        approvals=app,
     )
     admin = None
     if admin_socket is not None:

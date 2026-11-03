@@ -586,6 +586,25 @@ def test_the_telegram_wire_rules_are_pure_and_stand_on_the_hold_table_only() -> 
     assert not [m for m in found if m.startswith("zoeymcp.common.policy")]
 
 
+def test_the_queue_view_is_pure_and_stands_on_the_hold_table() -> None:
+    """M8 design H, F8: the portal's Approvals queue data does no I/O of its own, and of ours
+    loads only the hold table it reads, the portal's display rule and the shared layers (the
+    policy package, for the turn-on lines): no other vault or portal module, so it never reaches
+    the vault app, the portal app or a surface. Not vacuous: the walk reaches the hold table."""
+    assert own_io("zoeymcp.portal.approvalsview") == []
+    found = closure(PACKAGE.parent, "zoeymcp.portal.approvalsview")
+    assert "zoeymcp.vault.holds" in found
+    assert beyond(found, ["idna", "pydantic", "pydantic_core", "yaml"]) == []
+    assert {m for m in found if not m.startswith("zoeymcp.common")} == {
+        "zoeymcp",
+        "zoeymcp.portal",
+        "zoeymcp.portal.approvalsview",
+        "zoeymcp.portal.display",
+        "zoeymcp.vault",
+        "zoeymcp.vault.holds",
+    }
+
+
 def test_own_io_sees_the_modules_own_imports() -> None:
     assert own_io("zoeymcp.common.ledgerfile") != []
 

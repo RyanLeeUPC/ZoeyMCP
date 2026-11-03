@@ -132,7 +132,7 @@ from ..common.resultstore import (
 from ..common.reviewreport import RemoteReport, ToolkitReport
 from . import internal, logs, netclient, secretops, statusreport, telegramwire
 from . import telegram as telegram_approver
-from .approvers import EDIT_GRACE, ApproverHub, NotShown, Shown, Unconfirmed
+from .approvers import EDIT_GRACE, ApproverHub, NotShown, PortalQueue, Shown, Unconfirmed
 from .connectors.smtp import Answer, SmtpConnectors
 from .gatewaykeys import GatewayKeys
 from .health import TelegramState
@@ -758,6 +758,7 @@ class VaultApp:
         hold_clock: Callable[[], float] = time.monotonic,
         telegram: telegram_approver.Timings | Literal[False] | None = None,
         approver_client: httpx.AsyncClient | None = None,
+        queue: bool | None = None,
     ) -> None:
         """``client`` reaches upstreams and ``token_client`` token endpoints; both get a jar that
         keeps no cookies. By default both are :mod:`.netclient`'s guarded clients, with the
@@ -808,6 +809,10 @@ class VaultApp:
         test's hub holds its own surfaces. ``approver_client`` reaches the Bot API (G.2): by
         default :func:`.netclient.approver_client`, on the startup ``egress_proxy`` (D-61), or
         ``client`` when that is given.
+
+        ``queue`` says whether this vault keeps the portal's Approvals queue (H.1), installed in
+        ``hub`` while ``approvers.portal`` is set: None is True, or, with ``hub`` given, False, as
+        for ``telegram``.
         """
         self._gateway_link = gateway_link
         self._store = store
@@ -931,6 +936,12 @@ class VaultApp:
         # The endings the last surface that went remembered, for the next one (G.6).
         self._telegram_ended: dict[str, str] = {}
         self._approvers_running = False
+        # The portal's queue (H.1), and the hold clock's offset from the wall clock, taken once,
+        # so a time the queue shows and a plan holds is the same on every read (M5 9a).
+        self._portal_queue = (
+            PortalQueue(self._clock) if (hub is None if queue is None else queue) else None
+        )
+        self._wall_offset = time.time() - self._clock()
         if chain is not None:
             chain.remember(self._holds, self._clock())
         self._install(policy)
@@ -953,6 +964,7 @@ class VaultApp:
         self._egress_key = self._keys.egress_key(policy.egress_key_generation).encode()
         withdrawn = self._install_holds(policy)
         self._install_telegram(policy, withdrawn)
+        self._install_queue(policy)
         # B.5: a hold still shown on a surface left stays there alone (Z7).
         self._holds.narrow(_surfaces(policy))
         self._wake_view_waiters()
@@ -978,6 +990,16 @@ class VaultApp:
         for hold in withdrawn:
             self._spawn(self._ended(hold))
         return withdrawn
+
+    def _install_queue(self, policy: Policy) -> None:
+        """Show holds on the portal's queue while ``approvers.portal`` is set (H.1); a hold
+        left with no surface when it goes is the install's to withdraw (B.5)."""
+        if self._portal_queue is None:
+            return
+        if "portal" in _surfaces(policy):
+            self._hub.install(self._portal_queue)
+        else:
+            self._hub.remove("portal")
 
     def _install_telegram(self, policy: Policy, withdrawn: Iterable[Hold]) -> None:
         """Start, stop or restart the Telegram surface as ``approvers.telegram`` comes, goes or
@@ -2510,6 +2532,29 @@ class VaultApp:
     def telegram(self) -> telegram_approver.TelegramSurface | None:
         """The Telegram surface ``approvers.telegram`` names, shown on or not (G.7)."""
         return self._telegram
+
+    @property
+    def queue(self) -> PortalQueue | None:
+        """The portal's Approvals queue (H.1), shown on or not; None when this vault keeps none."""
+        return self._portal_queue
+
+    def queue_shown(self) -> bool:
+        """Whether holds are shown on the portal's queue now (``approvers.portal`` is set)."""
+        return self._portal_queue is not None and "portal" in self._hub.names
+
+    def hold_now(self) -> float:
+        """The hold table's clock now (the queue's plan checks a deadline on it)."""
+        return self._clock()
+
+    def hold_wall(self, at: float) -> float:
+        """A time on the hold table's clock as wall-clock seconds, by one fixed offset."""
+        return at + self._wall_offset
+
+    def telegram_delivered(self, hold_id: str) -> bool:
+        """Whether Telegram took hold ``hold_id``'s prompt (the queue's "not delivered to
+        Telegram", G.3): never while the surface is off or its token shared."""
+        surface = self._telegram
+        return surface is not None and self._telegram_shown and surface.delivered(hold_id)
 
     def start_approvers(self) -> None:
         """Start the surfaces' own tasks, the Telegram poller and write queue (I.4): ``serve()``

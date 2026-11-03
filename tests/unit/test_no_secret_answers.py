@@ -452,6 +452,7 @@ PORTAL_PARAMS = {
     "job": "0" * 16,
     "server": "notes",
     "revision": "1",
+    "approval": "0" * 16,
 }
 PORTAL_BODIES: dict[str, Any] = {
     "/api/onboard/discover": {"url": onboard_model.SERVER_URL},

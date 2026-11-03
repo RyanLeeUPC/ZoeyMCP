@@ -260,6 +260,19 @@ def test_touch_neither_revives_nor_invents() -> None:
     assert len(table) == 1
 
 
+def test_an_idle_neutral_touch_leaves_the_clock() -> None:
+    """M8 H.2 (MISS-8): an idle-neutral route's touch answers the live session as it is and
+    moves nothing, so a queue tab's polls don't keep it alive; an ended one is still None."""
+    table = Sessions(counting())
+    minted = mint(table)
+    kept = table.touch(minted.session.id, T0 + 600, idle=False)
+    assert kept == minted.session
+    assert table.live(T0)[0].last_seen == T0
+    assert find(table, minted, T0 + SESSION_IDLE) is None
+    assert table.touch(minted.session.id, T0 + SESSION_IDLE, idle=False) is None
+    assert table.touch("ab" * 16, T0, idle=False) is None
+
+
 def test_the_absolute_clock_ends_at_its_second() -> None:
     table = Sessions(counting())
     minted = mint(table)

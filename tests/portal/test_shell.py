@@ -263,7 +263,8 @@ def test_each_listener_answers_as_itself(rig: PortalRig) -> None:
 
 
 # Where an agent would look for OAuth: the same list as tests/gateway/test_gateway.py's, its
-# path-suffixed metadata variants included (M7 GR-28), and the portal's own API prefix.
+# path-suffixed metadata variants included (M7 GR-28), the portal's own API prefix, and the
+# Approvals queue's (M8 design H.2, D-34's obligation for every new route).
 OAUTH_PATHS = (
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
@@ -276,6 +277,9 @@ OAUTH_PATHS = (
     "/authorize",
     "/api/token",
     "/api/register",
+    "/api/approvals/token",
+    "/api/approvals/register",
+    "/api/approvals/authorize/token",
 )
 
 

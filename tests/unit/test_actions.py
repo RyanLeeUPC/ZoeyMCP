@@ -117,6 +117,8 @@ def test_the_registry_holds_f4s_kinds() -> None:
             ["base", "connector"],
             ["max_body_chars", "max_per_day", "max_subject_chars", "paused"],
         ),
+        # M8 H.3 (step 15): an approval from the queue, bound to the hold and the text's digest.
+        "approval.decide": (4096, ["approval", "decision", "text_sha256"], []),
     }
     assert all(name == kind.name for name, kind in KINDS.items())
     assert KINDS["onboard.discover_private"].optional == DISCOVER_KEYS
@@ -250,6 +252,7 @@ def test_prepare_holds_the_action_for_its_ttl() -> None:
     assert action.expires == T0 + ACTION_TTL
     assert len(action.id) == 32
     assert len(action.nonce) == 32
+    assert action.replaced is None
     assert table.pending(SESSION, T0) == action
     assert len(table) == 1
 
@@ -300,6 +303,25 @@ def test_one_action_per_session() -> None:
     assert table.take(first.id, session=SESSION, origin=ORIGIN, now=T0) is None
     assert table.take(second.id, session=SESSION, origin=ORIGIN, now=T0) == second
     assert table.pending("ac" * 16, T0) == other
+
+
+def test_a_prepare_names_the_live_action_it_replaced() -> None:
+    """M8 H.3, G-11: an approval prepared in one tab replaces a save prepared in another, and the
+    reverse; the new action names the kind it replaced, while that one was live, and nothing
+    for another session's, an expired one or one already taken."""
+    table = Actions(counting())
+    save = prepare(table, kind="policy.save", data={"draft": "d", "base": 1})
+    other = prepare(table, session="ac" * 16)
+    approval = prepare(table, kind="approval.decide", data={"approval": "a"}, now=T0 + 1)
+    assert (save.replaced, other.replaced, approval.replaced) == (None, None, "policy.save")
+    again = prepare(table, now=T0 + 2)
+    assert again.replaced == "approval.decide"
+    assert table.take(again.id, session=SESSION, origin=ORIGIN, now=T0 + 2) == again
+    assert prepare(table, now=T0 + 3).replaced is None
+    late = prepare(table, now=T0 + 3 + ACTION_TTL)
+    assert late.replaced is None
+    # The kind it replaced is no part of what a passkey signs.
+    assert "replaced" not in late.binding()
 
 
 def test_cancel_drops_a_live_action() -> None:

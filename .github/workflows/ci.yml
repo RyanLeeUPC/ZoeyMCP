@@ -71,8 +71,8 @@ jobs:
       - run: uv sync --locked --all-extras --python 3.13
       - run: >-
           uv run --locked pytest tests/portal
-          tests/unit/test_actions.py tests/unit/test_admission.py tests/unit/test_display.py
-          tests/unit/test_drafts.py
+          tests/unit/test_actions.py tests/unit/test_admission.py tests/unit/test_approvalsview.py
+          tests/unit/test_display.py tests/unit/test_drafts.py
           tests/unit/test_limits.py tests/unit/test_listen.py tests/unit/test_mode_words.py
           tests/unit/test_mutation_gaps_5.py
           tests/unit/test_no_secret_answers.py tests/unit/test_passkeys.py

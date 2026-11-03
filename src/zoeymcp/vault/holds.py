@@ -277,6 +277,12 @@ class HoldTable:
     def ending(self, ref: str) -> Ending | None:
         return self._endings.get(ref)
 
+    def ended(self, id: str) -> Ending | None:
+        """How the hold of approval id ``id`` ended, while its ending is kept: what a surface's
+        late answer is told (H.3)."""
+        ref = self._ended_ids.get(id)
+        return self._endings.get(ref) if ref is not None else None
+
     def knows(self, ref: str) -> bool:
         """Whether ``ref`` is held or recently ended here (the table's half of E19)."""
         return ref in self._refs or ref in self._endings
@@ -476,8 +482,7 @@ class HoldTable:
 
     def _refusal(self, id: str) -> DecideRefusal:
         """A decision on a hold no longer in the table: what happened to it, when it's known."""
-        ref = self._ended_ids.get(id)
-        ending = self._endings.get(ref) if ref is not None else None
+        ending = self.ended(id)
         if ending is None:
             return DecideRefusal("unknown")
         if ending.state == "expired":

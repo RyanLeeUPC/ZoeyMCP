@@ -8,7 +8,8 @@ records every request it gets and answers a JSON-RPC result. The SMTP connector'
 recorder too. A :class:`Surface` records each hold it is shown and decides nothing until the test
 says, through :meth:`HoldRig.decide`, which runs on the vault's own event loop. With
 ``telegram`` timings the vault runs its own Telegram surface instead of a scripted one (M8 step
-14), on the approver client given, with the bot's token in its store.
+14), on the approver client given, with the bot's token in its store; with ``queue``, its own
+portal queue (M8 step 15), which the portal decides on.
 
 Every wait is a condition the test waits for in a worker thread, bounded; nothing sleeps.
 """
@@ -297,15 +298,15 @@ class Surface:
             self.notices.append(text)
             self._changed.notify_all()
 
+    def wait(self, ready: Callable[[], bool]) -> None:
+        """Wait in this thread until ``ready()`` (bounded): a test's thread, not the vault's."""
+        with self._changed:
+            if not self._changed.wait_for(ready, BOUND):
+                raise TimeoutError("the surface never saw it")
+
     async def until(self, ready: Callable[[], bool]) -> None:
         """Wait, in a worker thread, until ``ready()`` (bounded)."""
-
-        def wait() -> None:
-            with self._changed:
-                if not self._changed.wait_for(ready, BOUND):
-                    raise TimeoutError("the surface never saw it")
-
-        await anyio.to_thread.run_sync(wait)
+        await anyio.to_thread.run_sync(lambda: self.wait(ready))
 
     async def holds(self, count: int) -> list[Hold]:
         await self.until(lambda: len(self.shown) >= count)
@@ -387,6 +388,7 @@ class HoldRig:
         telegram: Timings | None = None,
         approver_client: httpx.AsyncClient | None = None,
         environ: dict[str, str] | None = None,
+        queue: bool = False,
     ) -> None:
         self.link: Link = "asgi" if link == "asgi" else "unix" if link == "unix" else "tcp"
         self.options = {"surfaces": surfaces, **(options or {})}
@@ -402,8 +404,12 @@ class HoldRig:
         self.upstream = Upstream()
         self.mail: list[dict[str, Any]] = []
         self.chain = VaultLedger.open_at(self.state, KEYS.chain_key)
-        # The vault's own Telegram surface, with timings: the rest are scripted.
-        scripted = [name for name in surfaces if telegram is None or name != "telegram"]
+        # The vault's own Telegram surface, with timings, and its own queue: the rest are scripted.
+        scripted = [
+            name
+            for name in surfaces
+            if (telegram is None or name != "telegram") and (not queue or name != "portal")
+        ]
         self.surfaces = {name: Surface(name) for name in scripted}
         self.clock = Clock()
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -421,6 +427,7 @@ class HoldRig:
             hold_clock=self.clock,
             telegram=False if telegram is None else telegram,
             approver_client=approver_client,
+            queue=queue,
         )
 
     @property

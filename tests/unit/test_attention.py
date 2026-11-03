@@ -1,5 +1,6 @@
 """The attention decision (M6 design J.5; G-20, Y20, Y29): every state, ``quiet()``, a declined
-tool whose pin moved, and the plain form the review report and the gateway's status carry."""
+tool whose pin moved, and the plain form the review report and the gateway's status carry; and
+Home's approvals item and when Home shows the list (M8 design H.1, CR-11)."""
 
 from __future__ import annotations
 
@@ -8,7 +9,15 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from zoeymcp.common.policy.attention import Attention, attention, combined, loaded, quiet
+from zoeymcp.common.policy.attention import (
+    Attention,
+    approvals_item,
+    attention,
+    block_shown,
+    combined,
+    loaded,
+    quiet,
+)
 from zoeymcp.common.policy.schema import Tools
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.gateway.toolkits import SelfPinned
@@ -222,3 +231,36 @@ def test_several_listings_combine_into_one() -> None:
     assert combined([one]) == one
     assert combined([]) == Attention()
     assert combined(iter([one, two])) == combined([two, one])
+
+
+# --- Home's approvals item (M8 design H.1, CR-11) ------------------------------------------------
+
+# 2026-11-01 16:39:59 UTC: the minute shown is the one the deadline falls in.
+DEADLINE = 1_793_551_199.0
+
+
+def test_the_approvals_item_counts_and_names_the_oldest_deadline() -> None:
+    assert approvals_item(2, DEADLINE) == {
+        "kind": "approvals",
+        "subject": "approval",
+        "count": 2,
+        "text_shown": "2 approvals waiting: the oldest must be answered by 16:39 UTC",
+        "action": {"kind": "approvals"},
+    }
+    one = approvals_item(1, DEADLINE)
+    assert one is not None
+    assert one["text_shown"] == "1 approval waiting: it must be answered by 16:39 UTC"
+    assert one["count"] == 1
+
+
+@pytest.mark.parametrize(("waiting", "deadline"), [(0, DEADLINE), (-1, DEADLINE), (1, None)])
+def test_no_approvals_item_when_none_waits(waiting: int, deadline: float | None) -> None:
+    assert approvals_item(waiting, deadline) is None
+
+
+def test_home_shows_the_list_with_a_report_or_while_approvals_wait() -> None:
+    item = approvals_item(1, DEADLINE)
+    assert block_shown(True, None) is True
+    assert block_shown(True, item) is True
+    assert block_shown(False, item) is True
+    assert block_shown(False, None) is False

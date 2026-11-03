@@ -19,15 +19,18 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.test_approvalsview import closed as closed_hold
+from tests.unit.test_approvalsview import hold as held_hold
 from tests.unit.test_review_choices import large
 from tests.unit.test_reviewview import held
+from zoeymcp.common.policy.attention import approvals_item
 from zoeymcp.common.policy.change import CONNECTOR_LIMITS
 from zoeymcp.common.policy.diff import Change
 from zoeymcp.common.policy.emit import INDENT_MAX
 from zoeymcp.common.policy.plan import WriteKind
 from zoeymcp.common.policy.schema import Policy
 from zoeymcp.portal import app as portal_app
-from zoeymcp.portal import policydiffview, reviewview
+from zoeymcp.portal import approvalsview, policydiffview, reviewview
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
 from zoeymcp.portal.routes import JAVASCRIPT, REVIEW_DIFF, ROUTES, STATIC
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
@@ -37,7 +40,11 @@ from zoeymcp.vault.oauth import dcr
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
 # Every script the map serves (M7 K.4), so a new one can't escape a check below.
 SCRIPTS = tuple(file.name for file in STATIC.values() if file.content_type == JAVASCRIPT)
-MAX_ASSETS = 128 * 1024
+# The static total's cap (M5 M.4). M8 (Q19 (a), owner): 160 KiB once a step measures the total
+# over 124 KiB. M6 left it at 123.9 KiB (126,862 bytes with 21a's per-kind rows and M8's one health
+# label); M8 step 15's Approvals queue (approvals.js, its section and two rules) takes it to 133.4
+# KiB (136,607 bytes), so the cap is 160 KiB from that step.
+MAX_ASSETS = 160 * 1024
 # Line caps, per file (M7 K.4); a script with no cap fails. K.2 set 1,000 lines for app.js and
 # webauthn.js together. Step 15's Ledger and Policy pages took them past it (998 before, 1,041
 # after) although every line they show is made by the server and the existing pages were folded
@@ -45,14 +52,15 @@ MAX_ASSETS = 128 * 1024
 # it, and gives review.js, the MCP servers section, its own. M6 (M.4, Q14): the owner raised
 # app.js and webauthn.js to 1,060 for the few lines Home and health need (1,048 before step 7,
 # 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450;
-# policy.js, the Policy page's managed half (step 15b), its own 500. The static total after 15c
-# is 122 KiB (125,162 bytes) and after 21a's per-kind rows 122.8 KiB (125,785 bytes), below M.4's
-# 124 KiB, so MAX_ASSETS stays 128 KiB.
+# policy.js, the Policy page's managed half (step 15b), its own 500. M8 (H.1, Q19 (a)):
+# approvals.js, the Approvals queue, the badge and Home's approvals item, its own 400, so app.js
+# gains the nav entry and one call (1,053 lines with webauthn.js, BP-12).
 LINE_CAPS = {
     ("app.js", "webauthn.js"): 1060,
     ("review.js",): 700,
     ("drift.js",): 450,
     ("policy.js",): 500,
+    ("approvals.js",): 400,
 }
 
 LT, GT, QUOTE = chr(0x3C), chr(0x3E), chr(0x22)
@@ -200,6 +208,7 @@ def test_index_html() -> None:
     assert sorted(page.assets) == [
         "/app.css",
         "/app.js",
+        "/approvals.js",
         "/drift.js",
         "/policy.js",
         "/review.js",
@@ -231,7 +240,7 @@ def test_the_refused_page_says_what_the_catalogue_says() -> None:
     assert text not in read("callback-received.html")
 
 
-@pytest.mark.parametrize("name", ["app.js", "review.js", "drift.js", "policy.js"])
+@pytest.mark.parametrize("name", ["app.js", "review.js", "drift.js", "policy.js", "approvals.js"])
 def test_every_element_the_script_names_exists(name: str) -> None:
     ids = parsed(read("index.html")).ids
     script = read(name)
@@ -306,11 +315,18 @@ def test_the_scripts_are_small_strict_and_hand_written() -> None:
 
 def test_the_scripts_are_derived_from_the_static_map() -> None:
     """M7 K.4: SCRIPTS is every text/javascript file the map serves, and index.html loads each
-    of them, review.js, drift.js and policy.js (M6 M.4) after the app.js whose helpers they
-    use."""
-    assert SCRIPTS == ("app.js", "webauthn.js", "review.js", "drift.js", "policy.js")
+    of them, review.js, drift.js and policy.js (M6 M.4) and approvals.js (M8 H.1) after the
+    app.js whose helpers they use."""
+    assert SCRIPTS == (
+        "app.js",
+        "webauthn.js",
+        "review.js",
+        "drift.js",
+        "policy.js",
+        "approvals.js",
+    )
     order = re.findall(r'<script src="/([a-z]+\.js)" defer></script>', read("index.html"))
-    assert order == ["webauthn.js", "app.js", "review.js", "drift.js", "policy.js"]
+    assert order == ["webauthn.js", "app.js", "review.js", "drift.js", "policy.js", "approvals.js"]
 
 
 def test_every_button_runs_its_handler_once_at_a_time() -> None:
@@ -851,9 +867,12 @@ def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
     assert 'const ACTION_TEXT = { review: "Review", clear: "Clear the marks" };' in drift
     assert "act(item.action, home)" in drift
     # Each item is shown through textContent, from the vault's text_shown alone, and every field
-    # the script reads of the answer and its items is one the vault sends.
+    # the script reads of the answer and its items is one the vault sends: the list's by
+    # drift.js, shown by the vault's rule (M8 CR-11), and the queue's own item by approvals.js.
     assert 'entry.textContent = item.text_shown + ". ";' in drift
-    assert set(re.findall(r"\banswer\.([a-z_]+)", drift)) == set(portal_app.attention_items({}))
+    assert '$("attention-block").hidden = !answer.shown;' in drift
+    sent = set(portal_app.attention_items({}))
+    assert set(re.findall(r"\banswer\.([a-z_]+)", drift)) == sent - {"gateway", "approvals"}
     report = {"gateway": {"reported_ago": 1, "servers": [gateway_row()]}}
     [item] = portal_app.attention_items(report)["items"]
     assert set(re.findall(r"\bitem\.([a-z_]+)", drift)) == {"text_shown", "action"}
@@ -1133,3 +1152,112 @@ def test_policy_js_shows_a_count_old_to_new() -> None:
         (True, None, "(changed)"),
         (True, None, "(removed)"),
     ]
+
+
+# --- the Approvals queue (M8 design H.1, BP-12, CR-11; step 15) -----------------------------------
+
+
+def test_approvals_js_clicks_go_through_app_js_guard() -> None:
+    """approvals.js draws its buttons with app.js's button() and binds its four through on()
+    (the nav entry, Approve, Deny, Close); it listens for nothing else. Approve is its one
+    prepare, approval.decide with the literal keys the kind takes, decision only ever approve;
+    Deny is its one POST, the text's digest alone: no control decides more than one. Its timers
+    run functions, and it publishes window.zoeyApprovals, frozen, with Home's hook alone."""
+    code = code_of(read("approvals.js"))
+    assert "addEventListener(" not in code
+    assert "function button(" not in code
+    assert "function guard(" not in code
+    taken = re.search(r"const \{([^}]*)\} = window\.zoeyPortal;", code)
+    assert taken
+    assert {word.strip() for word in taken.group(1).split(",")} == {
+        "api",
+        "fill",
+        "visit",
+        "afterFailure",
+        "button",
+        "prepare",
+        "closeConfirm",
+        "on",
+    }
+    assert re.findall(r"\bon\(\"([a-z-]+)\", ", code) == [
+        "nav-approvals",
+        "approvals-approve",
+        "approvals-deny",
+        "approvals-close",
+    ]
+    assert re.findall(r'prepare\("([a-z.]+)"', code) == ["approval.decide"]
+    assert (
+        '{ approval: held.approval, text_sha256: held.text_sha256, decision: "approve" },' in code
+    )
+    assert re.findall(r'api\("POST", fill\("([^"]+)"', code) == ["/api/approvals/{approval}/deny"]
+    assert code.count('api("POST"') == 1
+    assert "{ text_sha256: held.text_sha256 });" in code
+    assert re.findall(r"setInterval\((\w+), (\w+)\)", code) == [
+        ("tickLists", "LISTS_EVERY"),
+        ("tickCount", "COUNT_EVERY"),
+    ]
+    assert "const LISTS_EVERY = 5000;" in code
+    assert "const COUNT_EVERY = 10000;" in code
+    assert re.findall(r"window\.(zoey\w+) =", code) == ["zoeyApprovals"]
+    assert "window.zoeyApprovals = Object.freeze({ home: home });" in code
+    # The timers ask nothing before a full session's bar shows, and one ask at a time.
+    start = code.index("async function quietly(work) {")
+    body = code[start : code.index("\n  }\n", start)]
+    assert "if (asking || !signedIn()) {" in body
+    assert 'return !$("bar").hidden;' in code
+
+
+def test_app_js_gains_the_nav_entry_and_one_call() -> None:
+    """BP-12, Q19: app.js knows the Approvals page by name and calls Home's approvals hook once,
+    after drift.js's list and before Home shows; everything else of the queue is approvals.js's."""
+    app = code_of(read("app.js"))
+    pages = app[app.index("const PAGES = [") :]
+    assert '"approvals"' in pages[: pages.index("];")]
+    assert re.findall(r"window\.zoeyApprovals\.(\w+)\(", app) == ["home"]
+    assert "if (window.zoeyApprovals) await window.zoeyApprovals.home();" in app
+    enter = app[app.index("async function enter() {") :]
+    enter = enter[: enter.index("\n  }\n")]
+    assert enter.index("zoeyDrift.home()") < enter.index("zoeyApprovals.home()")
+    assert enter.index("zoeyApprovals.home()") < enter.index('show("home");')
+    page = read("index.html")
+    assert '<button type="button" id="nav-approvals">Approvals</button>' in page
+
+
+def test_approvals_js_reads_what_the_vault_sends() -> None:
+    """H.1: every field approvals.js reads of a row, an opened hold, the lists' answer, the
+    badge's and Home's item is one the vault sends; the text is drawn whole from its lines, as
+    the vault split them, through textContent, and the decision sends the digest the vault sent
+    (the page hashes nothing)."""
+    code = code_of(read("approvals.js"))
+    shown = approvalsview.detail(held_hold(), lambda at: at, lambda hold_id: True)
+    sent = approvalsview.queue(
+        [held_hold()],
+        [closed_hold(2, "done", "portal", "ok")],
+        lambda at: at,
+        lambda hold_id: True,
+        enabled=True,
+        notice=None,
+    )
+    rows = set(sent["waiting"][0]) | set(sent["decided"][0])
+    assert set(re.findall(r"\brow\.([a-z0-9_]+)", code)) <= rows
+    assert set(re.findall(r"\bshown\.([a-z0-9_]+)", code)) <= set(shown)
+    assert "text" not in re.findall(r"\bshown\.([a-z0-9_]+)", code)
+    assert (
+        '$("approvals-text").textContent =\n      shown.text_lines.map((line) => line.join(""))'
+        '.join("\\n");' in code
+    )
+    assert "open = { approval: shown.approval, text_sha256: shown.text_sha256 };" in code
+    assert "crypto" not in code
+    answers = set(re.findall(r"\banswer\.([a-z0-9_]+)", code))
+    item = approvals_item(1, 0.0)
+    assert item is not None
+    attention = set(portal_app.attention_items({}, item))
+    assert answers <= set(sent) | attention | {"count"}
+    assert "answer.approvals.text_shown" in code
+    assert "ACTION_TEXT[answer.approvals.action.kind]" in code
+    texts = code[code.index("const ACTION_TEXT = {") :]
+    assert set(re.findall(r"(\w+):", texts[: texts.index("};")])) == {item["action"]["kind"]}
+    assert '(await api("GET", "/api/approvals/count")).count' in code
+    # The relay's badge, by the hold's kind, is the page's; the vault's line is in the text.
+    assert "shown.kind !== RELAY" in code
+    assert 'const RELAY = "relay";' in code

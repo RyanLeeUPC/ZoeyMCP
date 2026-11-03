@@ -28,6 +28,7 @@ SAMPLE_PARAMS = {
     "job": "0123456789abcdef",
     "server": "notes",
     "revision": "1",
+    "approval": "0123456789abcdef",
 }
 LOGIN_BEGIN = "/api/login/begin"
 LOGIN_FINISH = "/api/login/finish"

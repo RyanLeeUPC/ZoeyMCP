@@ -2727,6 +2727,11 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 422 | `telegram_too_long` | The approval text is too long to show in Telegram, and no portal queue takes it, so nothing was asked. |
 | 502 | `telegram_text_changed` | Telegram returned another text than the one the vault sent, so nothing was sent. |
 | 502 | `held_result_too_large` | The call ran; its answer was over 4 MiB and wasn't kept. |
+| 404 | `approval_unknown` | No approval by that ID waits in this queue: it ended long ago, the vault restarted, or only another approver shows it. |
+| 409 | `already_decided` | Already decided `<where>` at `<at>`: `<decision>`. |
+| 409 | `expired` | This approval expired at its deadline, so nothing was sent. |
+| 409 | `withdrawn` | This approval was withdrawn, so nothing was sent. |
+| 409 | `digest_changed` | This approval's text isn't the one you were shown, so nothing was decided: open it again in the queue. |
 | 400 | `too_large` (enrolling a passkey) | The passkey's answer was too large. |
 | 400 | `bad_field` (enrolling a passkey) | The browser's answer didn't have the passkey fields expected. Try another browser. |
 | 400 | `client_data` (enrolling a passkey) | The browser's passkey data couldn't be read. Try another browser. |

@@ -8,7 +8,9 @@ them, and matching finds each row. M6 adds M.2's rows as each step builds them, 
 step 7 Home's attention list, and the static map ``drift.js``. Step 15a adds no route: in managed
 mode the review diff route answers a draft instead of fragment 2, and the saves are actions. Step
 15b adds the policy's history and a revision's diff, whose ``revision`` is a policy revision's
-number, and the static map ``policy.js``; a rollback is an action.
+number, and the static map ``policy.js``; a rollback is an action. M8's step 15 adds the Approvals
+queue's rows (M8 design H.2), the three reads idle-neutral, whose ``approval`` is a hold's id, and
+the static map ``approvals.js``; an approval is an action.
 """
 
 from __future__ import annotations
@@ -120,7 +122,15 @@ M6 = (
     Route("GET", "/api/policy/revisions", FULL),
     Route("GET", "/api/policy/revisions/{revision}", FULL),
 )
-TABLE = (*M1, *K2, *M6, *ACTION_ROWS)
+# M8 H.2's rows (step 15): the two lists, the badge's count and one hold, none of which moves the
+# idle clock, and a deny with the text's digest.
+M8 = (
+    Route("GET", "/api/approvals", FULL, neutral=True),
+    Route("GET", "/api/approvals/count", FULL, neutral=True),
+    Route("GET", "/api/approvals/{approval}", FULL, neutral=True),
+    Route("POST", "/api/approvals/{approval}/deny", FULL, 4 * KIB, frozenset({"text_sha256"})),
+)
+TABLE = (*M1, *K2, *M6, *M8, *ACTION_ROWS)
 SAMPLE = {
     "credential": "github",
     "flow": "Zm9vYmFyLWZsb3ctaWQx",
@@ -129,6 +139,7 @@ SAMPLE = {
     "job": "jQx_-000000000000000000000000000000000000001",
     "server": "notes",
     "revision": "17",
+    "approval": "Ab_-0123456789yZ",
 }
 
 
@@ -140,6 +151,7 @@ def test_the_static_map_is_fixed() -> None:
         "/review.js": StaticFile("review.js", "text/javascript; charset=utf-8"),
         "/drift.js": StaticFile("drift.js", "text/javascript; charset=utf-8"),
         "/policy.js": StaticFile("policy.js", "text/javascript; charset=utf-8"),
+        "/approvals.js": StaticFile("approvals.js", "text/javascript; charset=utf-8"),
         "/app.css": StaticFile("app.css", "text/css; charset=utf-8"),
         "/callback/received": StaticFile("callback-received.html", "text/html; charset=utf-8"),
         "/callback/refused": StaticFile("callback-refused.html", "text/html; charset=utf-8"),
@@ -221,6 +233,7 @@ def test_unauthenticated() -> None:
 def test_the_route_defaults() -> None:
     route = Route("GET", "/api/x", FULL)
     assert (route.cap, route.body, route.optional) == (0, frozenset(), frozenset())
+    assert route.neutral is False
 
 
 def test_nothing_matches_an_empty_table() -> None:
@@ -342,6 +355,7 @@ def test_the_parameters() -> None:
         "job",
         "server",
         "revision",
+        "approval",
     }
     assert PARAMS["server"].pattern == PARAMS["credential"].pattern
     assert PARAMS["onboarding"].pattern == PARAMS["job"].pattern == PARAMS["flow"].pattern
@@ -439,3 +453,48 @@ def test_every_parameter_of_a_path_is_returned() -> None:
     )
     assert match((both,), "GET", "/api/oauth/github/flows/a.c") is None
     assert match((both,), "GET", "/api/oauth/GitHub/flows/abc") is None
+
+
+# --- the Approvals queue (M8 design H.2; step 15) -------------------------------------------------
+
+
+def test_only_the_queues_reads_leave_the_idle_clock() -> None:
+    """MISS-8: an open queue tab polls its lists and the badge its count, so those reads, and
+    one hold's, don't move the session's idle clock; a deny and every action do."""
+    assert [(r.method, r.path) for r in ROUTES if r.neutral] == [
+        ("GET", "/api/approvals"),
+        ("GET", "/api/approvals/count"),
+        ("GET", "/api/approvals/{approval}"),
+    ]
+    assert all(route.scopes == FULL for route in M8)
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [
+        ("Ab_-0123456789yZ", True),
+        ("A" * 16, True),
+        ("A" * 15, False),
+        ("A" * 17, False),
+        ("Ab_-0123456789y.", False),
+        ("Ab_-0123456789y=", False),
+        ("Ab_-0123456789y+", False),
+        ("Ab_-0123456789y\n", False),
+        ("", False),
+    ],
+)
+def test_an_approval_is_a_holds_id(value: str, ok: bool) -> None:
+    """B.4: a hold's id is 12 random bytes in base64url, 16 characters, no padding."""
+    for route in (M8[2], M8[3]):
+        found = match(ROUTES, route.method, route.path.replace("{approval}", value))
+        assert (found is not None) == ok
+        if ok:
+            assert found == (route, {"approval": value})
+
+
+def test_the_count_is_its_own_route() -> None:
+    """``count`` is five characters, never an approval's id, so the badge's read is its own."""
+    assert match(ROUTES, "GET", "/api/approvals/count") == (M8[1], {})
+    assert match(ROUTES, "GET", "/api/approvals") == (M8[0], {})
+    assert match(ROUTES, "POST", "/api/approvals/count/deny") is None
+    assert match(ROUTES, "GET", "/api/approvals/" + "a" * 16 + "/deny") is None

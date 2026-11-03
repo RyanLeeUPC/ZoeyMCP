@@ -1154,9 +1154,18 @@ def ask(method, path, body=None):
     connection.close()
     print(method, path, status)
     return status, text
-# A sample each parameter pattern accepts, so the route is matched and its session checked.
-samples = {name: "x" if pattern.fullmatch("x") else "1" for name, pattern in PARAMS.items()}
-problems = []
+# A sample each parameter pattern accepts, so the route is matched and its session checked: by
+# name where neither "x" nor "1" fits (an approval is the 16-character id of a hold, M8 H.2),
+# else whichever of the two the pattern takes.
+named = {"approval": "x" * 16}
+samples = {
+    name: named.get(name) or ("x" if pattern.fullmatch("x") else "1")
+    for name, pattern in PARAMS.items()
+}
+problems = [
+    f"no sample fits {{{name}}}" for name, pattern in PARAMS.items()
+    if not pattern.fullmatch(samples[name])
+]
 for path in STATIC:
     if ask("GET", path)[0] != 200:
         problems.append(f"GET {path} is not the shell")

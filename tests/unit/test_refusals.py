@@ -24,7 +24,7 @@ from zoeymcp.common import envelope, reviewreport
 from zoeymcp.common.policy import change, plan
 from zoeymcp.common.policy.ratchet import RATCHET_MAX
 from zoeymcp.common.textrules import find_violations
-from zoeymcp.portal import passkeys, webauthn
+from zoeymcp.portal import approvalsview, passkeys, webauthn
 from zoeymcp.portal.refusals import (
     CATALOGUE,
     KEPT_IN_MEMORY,
@@ -314,6 +314,14 @@ HELD = {
 }
 # M8 step 12b: the relay's ask (E.2; M.2's ``text_refused``); its other codes are the hold's.
 ASK = {"text_refused": 422}
+# M8 step 15: the portal queue's decisions (H.3, M.2), each refused by what happened to the hold.
+QUEUE = {
+    "approval_unknown": 404,
+    "already_decided": 409,
+    "expired": 409,
+    "withdrawn": 409,
+    "digest_changed": 409,
+}
 # The VaultApp methods of the held branch (M8 design B), whose literal codes are all M8's.
 HELD_METHODS = (
     "_handle",
@@ -368,6 +376,7 @@ TEXTS = {
     "origins_on_oauth": "OAuth secrets take the policy's binding.",
 }
 FIELDS = {
+    "already_decided": {"where", "at", "decision"},
     "bad_origins": {"detail"},
     "unbound": {"name"},
     "no_route": {"detail"},
@@ -477,7 +486,7 @@ def test_every_listed_reason_has_its_status() -> None:
     expected = {reason: status for status, listed in STATUSES.items() for reason in listed}
     expected |= EXTRA | DISCOVERY | CHANGE | ONBOARDING | FETCH | SERVICE | LOGIN7 | SECOND_RUN
     expected |= MIXUP | DCR | REPORT | REVIEW | GENERATE | PLAN | STORE | MANAGED | OFFLINE
-    expected |= SOCKET | SAVE | HELD | ASK
+    expected |= SOCKET | SAVE | HELD | ASK | QUEUE
     assert {reason: entry.status for reason, entry in CATALOGUE.items()} == expected
 
 
@@ -760,6 +769,21 @@ def test_every_ask_reason_is_catalogued() -> None:
     }
     assert found - {"invalid"} <= set(HELD) | set(ASK)
     assert found - {"invalid"} <= set(CATALOGUE)  # invalid: as collect's, withdraw's, detach's
+
+
+def test_every_queue_reason_is_catalogued() -> None:
+    """M8 H.3: every reason the queue's plan and deny refuse with, ``HoldTable.decide``'s
+    refusals among them (``unknown`` as ``approval_unknown``), is catalogued with M.2's status;
+    already_decided names where, when and how it was decided."""
+    found = set(get_args(approvalsview.Reason)) - {"bad_body"}
+    decided = {
+        "approval_unknown" if reason == "unknown" else reason
+        for reason in get_args(get_type_hints(holds.DecideRefusal)["reason"])
+    }
+    assert found == decided == set(QUEUE)
+    assert {reason: CATALOGUE[reason].status for reason in QUEUE} == QUEUE
+    text = refusal("already_decided", where="in Telegram", at="14:03 UTC", decision="approved")
+    assert text.error == "Already decided in Telegram at 14:03 UTC: approved."
 
 
 def test_the_offline_texts_name_the_vaults_uid() -> None:

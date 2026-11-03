@@ -23,6 +23,7 @@ import pytest
 
 from tests.fakes.authenticator import SoftAuthenticator, Switch
 from tests.fakes.browser import Page
+from zoeymcp.portal.app import REPLACED
 from zoeymcp.portal.refusals import KEPT_IN_MEMORY
 from zoeymcp.vault.admin import AdminApp
 from zoeymcp.vault.keys import KeySet
@@ -285,11 +286,14 @@ def test_the_value_is_bound_to_the_confirm(
     rig: PortalRig, signed_in: tuple[Page, SoftAuthenticator]
 ) -> None:
     """The step-up's challenge commits to the held data, value included (F.3): preparing another
-    value replaces the action, and the first one's assertion confirms nothing."""
+    value replaces the action (and says so, H.3), and the first one's assertion confirms
+    nothing."""
     page, authenticator = signed_in
     first = prepared(page, "secret.put", {"name": "music-stats", "value": VALUE})
     second = prepared(page, "secret.put", {"name": "music-stats", "value": OTHER_VALUE})
-    assert first["summary"] == second["summary"]  # the value is never shown
+    assert second["replaced"] == "secret.put"
+    assert second["summary"][0] == ["Replaced", REPLACED.format(kind="secret.put")]
+    assert second["summary"][1:] == first["summary"]  # the value is never shown
     body = authenticator.get(first["options"], page.origin).body()
     assert status_reason(confirm(page, second["action"], body)) == (401, "step_up_refused")
     assert store(rig).names() == []

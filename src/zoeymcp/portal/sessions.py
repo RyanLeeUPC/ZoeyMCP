@@ -284,11 +284,14 @@ class Sessions:
         found = {session.id for session in self.by_cookie(cookies, now)}
         return self.end_where(lambda s: s.id in found, "replaced")
 
-    def touch(self, session_id: str, now: float) -> Session | None:
-        """Move a live session's idle clock to ``now`` (after C.2 row 12)."""
+    def touch(self, session_id: str, now: float, *, idle: bool = True) -> Session | None:
+        """Move a live session's idle clock to ``now`` (after C.2 row 12). With ``idle`` false,
+        for an idle-neutral route (M8 design H.2), the clock stays: only whether it is live."""
         session = self._by_id.get(session_id)
         if session is None or session.ended_by(now) is not None:
             return None
+        if not idle:
+            return session
         session = replace(session, last_seen=max(session.last_seen, now))
         self._by_id[session_id] = session
         return session

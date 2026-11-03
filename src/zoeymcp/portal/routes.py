@@ -8,8 +8,9 @@ script names. Every other path outside ``/api/`` is 404 (C.2 row 3).
 The API table grew with the build: each of steps 11 to 15 added the rows it built, so a walk of
 the table or a drift check against the page never met a route that wasn't built (verifier V40);
 from step 15 it is M.1's whole table, and a test checks that it equals M.1. M7 publishes its
-own rows, the MCP servers section's (M7 design K.2), which the same test pins, and M6 its own
-(M6 design M.2), each in the step that builds it. A path parameter is
+own rows, the MCP servers section's (M7 design K.2), which the same test pins, M6 its own
+(M6 design M.2) and M8 the Approvals queue's (M8 design H.2), each in the step that builds it.
+A route marked ``neutral`` leaves its session's idle clock where it was. A path parameter is
 checked against its pattern before a route matches, so a handler never sees a name the policy
 couldn't hold. A query string isn't part of a route: the routes that read one, the ledger and
 the policy's history and diffs, check it themselves.
@@ -55,6 +56,8 @@ STATIC: Final[Mapping[str, StaticFile]] = MappingProxyType(
         "/drift.js": StaticFile("drift.js", JAVASCRIPT),
         # M6 step 15b: the Policy page's managed half (M6 M.4), with its own cap.
         "/policy.js": StaticFile("policy.js", JAVASCRIPT),
+        # M8 step 15: the Approvals queue's script (M8 design H.1), with its own cap.
+        "/approvals.js": StaticFile("approvals.js", JAVASCRIPT),
         "/app.css": StaticFile("app.css", CSS),
         # Step 14b: where the callback sends the tab (C.7). No script, no text from the query.
         "/callback/received": StaticFile("callback-received.html", HTML),
@@ -86,7 +89,8 @@ class Route:
     ``path`` is a template whose ``{name}`` segments are parameters (:data:`PARAMS`). ``scopes``
     are the sessions that reach it, none for an unauthenticated route. ``cap`` is the body cap
     in bytes, 0 for a route that takes no body; ``body`` the keys its JSON object must have and
-    ``optional`` those it may have.
+    ``optional`` those it may have. A ``neutral`` route doesn't move its session's idle clock
+    (M8 design H.2), so a page that polls it doesn't keep the session alive (MISS-8).
     """
 
     method: Method
@@ -95,6 +99,7 @@ class Route:
     cap: int = 0
     body: frozenset[str] = frozenset()
     optional: frozenset[str] = frozenset()
+    neutral: bool = False
 
     @property
     def unauthenticated(self) -> bool:
@@ -103,7 +108,8 @@ class Route:
 
 # What a path parameter may be: a credential or a server is a policy name; a flow, an action, an
 # onboarding or a review job is the ID the vault gave it (base64url or hex); a revision is a
-# policy revision's number, ten digits at most (M6 design M.2, REVISION_MAX).
+# policy revision's number, ten digits at most (M6 design M.2, REVISION_MAX); an approval is a
+# hold's id, 12 random bytes in base64url (M8 design B.4, H.2).
 PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
     {
         "credential": re.compile(NAME_PATTERN),
@@ -113,6 +119,7 @@ PARAMS: Final[Mapping[str, re.Pattern[str]]] = MappingProxyType(
         "job": re.compile(r"[A-Za-z0-9_-]{1,64}"),
         "server": re.compile(NAME_PATTERN),
         "revision": re.compile(r"[1-9][0-9]{0,9}"),
+        "approval": re.compile(r"[A-Za-z0-9_-]{16}"),
     }
 )
 
@@ -224,6 +231,16 @@ ATTENTION: Final = Route("GET", "/api/attention", FULL)
 # Rolling back is the policy.rollback action.
 REVISIONS: Final = Route("GET", "/api/policy/revisions", FULL)
 REVISION: Final = Route("GET", "/api/policy/revisions/{revision}", FULL)
+# M8 step 15: the Approvals queue (M8 design H.2): the two lists, which the page polls every 5 s
+# while it is open, the badge's count, every 10 s, and one hold's composed text, none of which
+# moves the idle clock; a deny, with the session and the digest of the text shown (Q14 (a)). An
+# approval is the approval.decide action.
+APPROVALS: Final = Route("GET", "/api/approvals", FULL, neutral=True)
+APPROVALS_COUNT: Final = Route("GET", "/api/approvals/count", FULL, neutral=True)
+APPROVAL: Final = Route("GET", "/api/approvals/{approval}", FULL, neutral=True)
+APPROVAL_DENY: Final = Route(
+    "POST", "/api/approvals/{approval}/deny", FULL, BODY_DEFAULT, frozenset({"text_sha256"})
+)
 
 ROUTES: Final[tuple[Route, ...]] = (
     LOGIN_BEGIN,
@@ -255,6 +272,10 @@ ROUTES: Final[tuple[Route, ...]] = (
     ATTENTION,
     REVISIONS,
     REVISION,
+    APPROVALS,
+    APPROVALS_COUNT,
+    APPROVAL,
+    APPROVAL_DENY,
     ACTIONS,
     CONFIRM,
     CANCEL,

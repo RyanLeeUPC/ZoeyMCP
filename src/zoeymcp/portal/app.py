@@ -85,6 +85,14 @@ fails ``clear_not_clean``. A server row names its included ``approve`` tools, fo
 without asking**, which in declarative mode opens the review screen with that tool moved (J3).
 Home's attention list (M6 design M.7), ``GET /api/attention``, is what the gateway's status
 report says needs the operator, read from health's ``gateway`` section (``attention_items``).
+The Approvals queue (M8 design H): ``GET /api/approvals`` lists the holds waiting for the portal,
+oldest first, and the ones decided recently, ``GET /api/approvals/count`` the badge's count and
+``GET /api/approvals/{approval}`` one hold's composed text whole with its digest
+(``portal/approvalsview.py``), none of them moving the session's idle clock (MISS-8). Deny is
+``POST /api/approvals/{approval}/deny``, the session and the digest of the text shown (Q14 (a));
+an approval is the ``approval.decide`` action, whose plan is the whole text and whose confirm
+re-plans and decides in one synchronous section (Z16). Home's attention list carries the
+queue's item, and is shown while approvals wait, with or without the gateway's report (CR-11).
 Health's restore witness findings (M6 design K.3, J11: ``policy_behind_witness``,
 ``policy_deployment_changed``) are banners on every page of a full session, with their text.
 
@@ -167,7 +175,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, TypeGuard, get_args
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeGuard, get_args
 from urllib.parse import parse_qsl
 
 from starlette.types import Receive, Scope, Send
@@ -193,6 +201,7 @@ from ..common.policy.reviewchange import AllowRefused, definition_lines, listed
 from ..common.policy.schema import OAuth2Credential, split_scope
 from ..vault import ledgerview, logs, secretops, secretplan
 from ..vault.bindings import VAULT_PREFIX
+from ..vault.holds import DecideRefusal
 from ..vault.managed import (
     Evidence,
     WriteRefused,
@@ -234,9 +243,9 @@ from ..vault.reportstore import (
 )
 from ..vault.reviewjobs import Job, Owner, ReviewRefused
 from ..vault.secretplan import PutPlan, SecretRefusal
+from . import approvalsview, reviewview
 from . import drafts as drafts_
 from . import passkeys as passkey_file
-from . import reviewview
 from . import routes as api
 from .actions import ALLOW_FORMS, Action, ActionRefusal, Actions, changed, parse_request
 from .admission import (
@@ -308,7 +317,9 @@ from .webauthn import (
 if TYPE_CHECKING:
     from ..common.policy.schema import Policy
     from ..vault.admin import ReviewQueue, SetupCodes
+    from ..vault.approvers import PortalQueue
     from ..vault.connectors.smtp import SmtpConnectors
+    from ..vault.holds import Decided, HoldTable, Via
     from ..vault.managed import ManagedPolicy
     from ..vault.oauth.login import LoginService
     from ..vault.oauth.tokens import TokenManager
@@ -406,6 +417,9 @@ RETURNED_CHECK: Final = (
 # paste, or for client_credentials a test fetch; neither for a refresh token set by other means.
 CONNECT_BROWSER: Final = "browser"
 CONNECT_TEST: Final = "test"
+# What the step-up dialog says first when the prepare replaced the session's live action, which
+# another tab prepared (M8 design H.3, G-11): that one can no longer be confirmed.
+REPLACED: Final = "This replaces the {kind} you prepared in another tab; it was cancelled."
 # What a health finding's action asks of the operator when the page has no button for it (I.1;
 # the page's buttons: connect, reset, set_secret, delete_secret, add_passkey, review_passkeys).
 ACTION_WORDS: Final[Mapping[str, str]] = MappingProxyType(
@@ -647,6 +661,29 @@ class ActionKind:
     run: Callable[[Mapping[str, Any], Step], Awaitable[Reply | Refusal]]
 
 
+class Approvals(Protocol):
+    """What the Approvals queue reads and decides through (M8 design H): the vault's hold table,
+    its queue surface and its one decision, on the hold table's clock (``VaultApp``)."""
+
+    @property
+    def holds(self) -> HoldTable: ...
+
+    @property
+    def queue(self) -> PortalQueue | None: ...
+
+    def queue_shown(self) -> bool: ...
+
+    def decide(
+        self, id: str, decision: Literal["approve", "deny"], via: Via, text_sha256: str
+    ) -> Decided | DecideRefusal: ...
+
+    def hold_now(self) -> float: ...
+
+    def hold_wall(self, at: float) -> float: ...
+
+    def telegram_delivered(self, hold_id: str) -> bool: ...
+
+
 class _Gone(Exception):
     """The caller went away while its body was being read."""
 
@@ -697,7 +734,9 @@ class PortalApp:
     URL's service and ``reviews`` the review jobs, both shared with the admin socket (M7 design
     K); without them, the MCP servers routes and actions are a 500. ``managed`` is a managed
     vault's policy holder (M6 design G.6), which every managed save plans and writes through;
-    without it the managed kinds refuse ``policy_not_managed``.
+    without it the managed kinds refuse ``policy_not_managed``. ``approvals`` is the vault's hold
+    table and queue (M8 design H); without it the Approvals routes and ``approval.decide`` are a
+    500 and Home has no approvals item.
     ``routes`` and ``handlers`` are the API (M.1): by default :data:`~.routes.ROUTES` and this
     class's own handlers; a route without a handler answers 404. ``clock`` is monotonic (the
     limits); ``wall`` is the sessions' clock. ``body_deadline`` is :data:`BODY_DEADLINE` but for
@@ -723,6 +762,7 @@ class PortalApp:
         onboard: OnboardService | None = None,
         reviews: ReviewQueue | None = None,
         managed: ManagedPolicy | None = None,
+        approvals: Approvals | None = None,
         routes: Sequence[Route] = ROUTES,
         handlers: Mapping[Route, Handler] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -742,6 +782,7 @@ class PortalApp:
         self.onboard = onboard
         self.reviews = reviews
         self.managed = managed
+        self.approvals = approvals
         self._routes = tuple(routes)
         self._handlers = dict(self._own_handlers() if handlers is None else handlers)
         self._clock = clock
@@ -929,8 +970,9 @@ class PortalApp:
             size = len(raw) if isinstance(raw, bytes) else 0  # always bytes here
         if session is not None:
             # The session may have ended while its body arrived (a second logout, end-others
-            # from another tab): then this request is as one that came after, 401.
-            session = self.sessions.touch(session.id, self._wall())
+            # from another tab): then this request is as one that came after, 401. An
+            # idle-neutral route leaves its idle clock where it was (M8 design H.2).
+            session = self.sessions.touch(session.id, self._wall(), idle=not route.neutral)
             if session is None:
                 await self._refuse(exchange, refusal("no_session"))
                 return
@@ -1067,6 +1109,10 @@ class PortalApp:
             api.ATTENTION: self._attention,
             api.REVISIONS: self._revisions,
             api.REVISION: self._revision_diff,
+            api.APPROVALS: self._approvals,
+            api.APPROVALS_COUNT: self._approvals_count,
+            api.APPROVAL: self._approval,
+            api.APPROVAL_DENY: self._deny,
             api.ACTIONS: self._prepare,
             api.CONFIRM: self._confirm,
             api.CANCEL: self._cancel,
@@ -1380,12 +1426,17 @@ class PortalApp:
         options = request_options(
             challenge=action.challenge, rp_id=entry.rp_id, allow=holder.document.credentials
         )
+        summary = _summary(plan)
+        if action.replaced is not None:
+            # Said first in the dialog, and never part of the plan a confirm compares (H.3).
+            summary = [["Replaced", REPLACED.format(kind=action.replaced)], *summary]
         answer = {
             "action": action.id,
             "kind": action.kind,
             "expires": int(action.expires),
-            "summary": _summary(plan),
+            "summary": summary,
             "options": options,
+            "replaced": action.replaced,
         }
         return Reply(answer)
 
@@ -1463,6 +1514,8 @@ class PortalApp:
             ),
             "onboard.register": ActionKind(self._plan_register, self._run_register),
             "tool.clear": ActionKind(self._plan_clear, self._run_clear),
+            # M8 H.3: an approval from the queue (Z16).
+            "approval.decide": ActionKind(self._plan_decide, self._run_decide),
             # M6 G.3, H.3, M.3: managed saves, rollbacks, Give to clients and a connector's
             # limits, through the managed policy's write path (G.6).
             **{
@@ -1680,7 +1733,92 @@ class PortalApp:
         and ``zoeymcp review``'s exit code read the one attention decision (Y29)."""
         if self.health is None:
             raise RuntimeError("this portal has no health reader")
-        return Reply(attention_items(self.health()))
+        item = None
+        if self.approvals is not None:
+            approvals = self.approvals
+            waiting = approvalsview.waiting(approvals.holds.holds())
+            deadline = approvals.hold_wall(waiting[0].ends_at) if waiting else None
+            item = attention.approvals_item(len(waiting), deadline)
+        return Reply(attention_items(self.health(), item))
+
+    # --- the Approvals queue (M8 design H) --------------------------------------------------------
+
+    async def _approvals(self, call: Call) -> Reply | Refusal:
+        """Waiting, oldest first, and Decided recently (H.1), polled while the page is open."""
+        approvals = self._approvals_of()
+        queue = approvals.queue
+        answer = approvalsview.queue(
+            approvals.holds.holds(),
+            () if queue is None else queue.closed(),
+            approvals.hold_wall,
+            approvals.telegram_delivered,
+            enabled=approvals.queue_shown(),
+            notice=None if queue is None else queue.current_notice(),
+        )
+        return Reply(answer)
+
+    async def _approvals_count(self, call: Call) -> Reply | Refusal:
+        """The badge's count: the holds waiting for the portal."""
+        approvals = self._approvals_of()
+        return Reply({"count": len(approvalsview.waiting(approvals.holds.holds()))})
+
+    async def _approval(self, call: Call) -> Reply | Refusal:
+        """One hold shown on the portal, its composed text whole and the text's digest."""
+        approvals = self._approvals_of()
+        approval = call.params["approval"]
+        hold = approvals.holds.get(approval)
+        if hold is None:
+            ended = approvals.holds.ended(approval)
+            return _queue_refused(approvalsview.gone(ended, approvals.hold_wall))
+        if "portal" not in hold.surfaces:
+            return refusal("approval_unknown")
+        answer = approvalsview.detail(hold, approvals.hold_wall, approvals.telegram_delivered)
+        return Reply(answer)
+
+    async def _deny(self, call: Call) -> Reply | Refusal:
+        """Q14 (a): a deny needs the session and the digest of the text shown, and is bound to
+        it (``digest_changed`` otherwise); it sends nothing. Checked and decided in one
+        synchronous section, as ``HoldTable.decide`` checks again."""
+        approvals = self._approvals_of()
+        digest = _body(call)["text_sha256"]
+        if not isinstance(digest, str):
+            return refusal("bad_body")
+        approval = call.params["approval"]
+        refused = _decision_refused(approvals, approval, digest)
+        if refused is not None:
+            return refused
+        decided = approvals.decide(approval, "deny", "portal", digest)
+        if isinstance(decided, DecideRefusal):  # pragma: no cover - checked just before
+            return _decision_refused(approvals, approval, digest) or refusal("approval_unknown")
+        return Reply({"approval": approval, "state": decided.hold.state})
+
+    def _plan_decide(self, data: Mapping[str, Any], step: Step) -> Plan | Refusal:
+        """``approval.decide`` (H.3): the hold as the vault holds it now, refused by what
+        happened to it, and the whole text it would run."""
+        approvals = self._approvals_of()
+        approval = data["approval"]
+        known = isinstance(approval, str)
+        holds = approvals.holds
+        planned = approvalsview.decide_plan(
+            data,
+            holds.get(approval) if known else None,
+            holds.ended(approval) if known else None,
+            now=approvals.hold_now(),
+            wall=approvals.hold_wall,
+        )
+        if isinstance(planned, approvalsview.Refused):
+            return _queue_refused(planned)
+        return Plan(planned.summary, planned.facts)
+
+    async def _run_decide(self, data: Mapping[str, Any], step: Step) -> Reply | Refusal:
+        """The approval, in the confirm's synchronous section after its re-plan: the hold's
+        forward starts once its ``decided accept`` is on disk (B.4)."""
+        approvals = self._approvals_of()
+        approval, digest = data["approval"], data["text_sha256"]
+        decided = approvals.decide(approval, "approve", "portal", digest)
+        if isinstance(decided, DecideRefusal):  # pragma: no cover - re-planned just before
+            return _decision_refused(approvals, approval, digest) or refusal("approval_unknown")
+        return Reply({"approval": approval, "state": decided.hold.state})
 
     async def _oauth_list(self, call: Call) -> Reply | Refusal:
         """Every oauth2 credential as the logins see it (``LoginService.status``), and what the
@@ -2690,6 +2828,11 @@ class PortalApp:
             raise RuntimeError("this portal has no review jobs")
         return self.reviews
 
+    def _approvals_of(self) -> Approvals:
+        if self.approvals is None:
+            raise RuntimeError("this portal has no approvals queue")
+        return self.approvals
+
     def _ledger(self) -> Ledger:
         if self.ledger is None:
             raise RuntimeError("this portal has no reported copy")
@@ -3108,7 +3251,9 @@ SUBJECT_WORDS: Final = (
 )
 
 
-def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
+def attention_items(
+    report: Mapping[str, Any], approvals: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     """Home's list from a health report (M.7): per server the gateway reports, its drifted,
     missing and marked tools, the tools nobody reviewed, then the same for each kind beyond tools
     it enables (its row's ``kinds``, D-216), a blocked server and a bridge's state, each an item
@@ -3118,7 +3263,9 @@ def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
     ``resource_template`` or ``resource``; a blocked server and a bridge are the server's own,
     ``tool``). At most :data:`ATTENTION_MAX`, with how many more. ``gateway`` says whether
     health has a gateway section (a policy with a gateway), and ``reported_ago`` is the seconds
-    since the gateway's report, or None without one."""
+    since the gateway's report, or None without one. ``approvals`` is the queue's own item
+    (``attention.approvals_item``, M8 design H.1), which ``approvals.js`` draws, and ``shown``
+    whether Home shows the list: with a gateway section, or while approvals wait (CR-11)."""
     section = report.get("gateway")
     items: list[dict[str, Any]] = []
     for server in [] if section is None else section["servers"]:
@@ -3159,9 +3306,11 @@ def attention_items(report: Mapping[str, Any]) -> dict[str, Any]:
                 )
     return {
         "gateway": section is not None,
+        "shown": attention.block_shown(section is not None, approvals),
         "items": items[:ATTENTION_MAX],
         "more": max(0, len(items) - ATTENTION_MAX),
         "reported_ago": None if section is None else section["reported_ago"],
+        "approvals": approvals,
     }
 
 
@@ -3866,6 +4015,24 @@ def _review_refusal(reason: str, fields: Mapping[str, str], server: str | None) 
     """A review job refusal, with its way on for ``server`` when it is about one (D-200)."""
     steps = [step.answer() for step in refusal_next(server, reason)]
     return replace(refusal(reason, **fields), more=(("next", steps),))
+
+
+def _queue_refused(refused: approvalsview.Refused) -> Refusal:
+    """A queue decision's refusal (H.3), its text filled with the fields it names."""
+    return refusal(refused.reason, **dict(refused.fields))
+
+
+def _decision_refused(approvals: Approvals, approval: str, digest: str) -> Refusal | None:
+    """Why a portal decision on ``approval`` bound to ``digest`` isn't taken now, or None."""
+    holds = approvals.holds
+    refused = approvalsview.check(
+        holds.get(approval),
+        holds.ended(approval),
+        digest,
+        now=approvals.hold_now(),
+        wall=approvals.hold_wall,
+    )
+    return None if refused is None else _queue_refused(refused)
 
 
 def _session(call: Call) -> Session:

@@ -10,6 +10,7 @@
 <script src="/review.js" defer></script>
 <script src="/drift.js" defer></script>
 <script src="/policy.js" defer></script>
+<script src="/approvals.js" defer></script>
 </head>
 <body>
 <header id="bar" hidden>
@@ -19,6 +20,7 @@
 <span id="bar-health"></span>
 <nav id="nav">
 <button type="button" id="nav-home">Home</button>
+<button type="button" id="nav-approvals">Approvals</button>
 <button type="button" id="nav-credentials">Credentials</button>
 <button type="button" id="nav-servers">MCP servers</button>
 <button type="button" id="nav-sessions">Sessions</button>
@@ -77,12 +79,39 @@ shows. Now sign in with it, to check that it works.</p>
 <p id="home-ready"></p>
 <ul id="checklist"></ul>
 <div id="attention-block" hidden>
+<ul id="attention-approvals"></ul>
 <h3>The gateway's servers</h3>
 <p id="attention-text"></p>
 <ul id="attention"></ul>
 </div>
 <p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
 <p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
+</section>
+
+<section id="approvals" hidden>
+<h2>Approvals</h2>
+<p>Calls the vault holds for you, and the gateway's prompts relayed to the vault, oldest first.
+<b>Approve</b> asks for your passkey and runs that one call, exactly as shown; <b>Deny</b> sends
+nothing. Open a request to read it whole before you decide: the first decision, here or on
+another approver, is the one that counts. Nothing pushes a request to you from this page: pair the
+queue with Telegram for anything that must not wait.</p>
+<p id="approvals-off" hidden>The portal's queue is off: the policy's approvers block doesn't set
+portal, so no request is shown here.</p>
+<p id="approvals-notice" role="status" hidden></p>
+<h3>Waiting</h3>
+<ul id="approvals-waiting"></ul>
+<div id="approvals-open" hidden>
+<h3 id="approvals-open-title"></h3>
+<p id="approvals-open-how"></p>
+<p id="approvals-relayed" hidden><span class="badge">Rendered by the gateway</span> The gateway
+wrote this text; the vault added its own line.</p>
+<pre id="approvals-text"></pre>
+<button type="button" id="approvals-approve">Approve</button>
+<button type="button" id="approvals-deny">Deny</button>
+<button type="button" id="approvals-close">Close</button>
+</div>
+<h3>Decided recently</h3>
+<ul id="approvals-decided"></ul>
 </section>
 
 <section id="credentials" hidden>

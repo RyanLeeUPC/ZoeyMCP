@@ -707,6 +707,32 @@ def test_a_late_decision_is_told_what_happened() -> None:
     )
 
 
+def test_an_ended_hold_is_found_by_its_approval_id() -> None:
+    """H.3: the portal's queue tells a late decision how the hold ended, by its id: the ending
+    kept for it, with its ref and state; none for a live hold, an unknown id, or an ending
+    rebuilt from the chain (no id), and none once the ending is forgotten."""
+    table = HoldTable(LIMITS)
+    hold = begun(table, 0.0, 1)
+    assert table.ended(hold.id) is None
+    table.decide(5.0, hold.id, "deny", "portal", DIGEST)
+    ended = table.ended(hold.id)
+    assert ended is not None
+    assert (ended.ref, ended.id, ended.state, ended.via, ended.decided_at) == (
+        ref(1),
+        hold.id,
+        "denied",
+        "portal",
+        5.0,
+    )
+    assert ended == table.ending(ref(1))
+    assert table.ended("x" * 16) is None
+    table.remember(6.0, ref(2), "expired", client="agent", ended_at=6.0)
+    assert table.ending(ref(2)) is not None
+    assert table.ended(ref(2)) is None
+    table.sweep(5.0 + ENDINGS_SECONDS)
+    assert table.ended(hold.id) is None
+
+
 # --- the caller, detaching, the forward ----------------------------------------------------------
 
 

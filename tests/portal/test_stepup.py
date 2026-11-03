@@ -185,7 +185,8 @@ def test_preparing_changes_nothing_and_shows_what_will_happen(rig: PortalRig) ->
     world = two(rig)
     before = rig.vault.passkeys.document
     held = prepared(world.first, "passkey.rename", {"credential": world.b, "name": "desk"})
-    assert sorted(held) == ["action", "expires", "kind", "options", "summary"]
+    assert sorted(held) == ["action", "expires", "kind", "options", "replaced", "summary"]
+    assert held["replaced"] is None
     assert held["kind"] == "passkey.rename"
     assert held["summary"] == [
         ["Rename the passkey", world.b],
@@ -623,6 +624,9 @@ CANCELS = {
 # M7 K.3: fragment 1 (a given public client's, or a registered onboarding's again) and fragment
 # 2, each rendered from what the vault holds, writing nothing.
 RENDERS = {("POST", "/api/onboard/{onboarding}/fragment"), ("POST", "/api/review/jobs/{job}/diff")}
+# M8 H.3, Q14 (a): a deny from the Approvals queue needs a session and the text's digest, never a
+# passkey: it sends nothing, and a stolen session can only deny (T10).
+DENIES = {("POST", "/api/approvals/{approval}/deny")}
 # An OAuth credential whose sign-in a session can start (no token call until a confirm).
 OAUTH_POLICY: dict[str, Any] = {
     "credentials": {
@@ -677,7 +681,7 @@ def model_onboarding(vault: server.Vault) -> OnboardService:
 
 def test_every_change_is_an_action(tmp_path: Path) -> None:
     allowed = SESSION_LIFECYCLE | AUTHORIZED_ENROLMENT | ACTION_ROUTES | FLOW_STARTS | CANCELS
-    allowed |= RENDERS
+    allowed |= RENDERS | DENIES
     unsafe = {(r.method, r.path) for r in ROUTES if r.method != "GET"}
     assert unsafe <= allowed, sorted(unsafe - allowed)
     assert allowed <= unsafe, sorted(allowed - unsafe)  # the lists name only built routes

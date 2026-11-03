@@ -103,6 +103,9 @@ KINDS: Final[dict[str, Kind]] = {
             frozenset({"base", "connector"}),
             frozenset(CONNECTOR_LIMITS),
         ),
+        # M8 H.3 (Z16): an approval from the queue, of the hold and the text digest the operator
+        # was shown; decision is only ever "approve" (deny has its own route, with no step-up).
+        Kind("approval.decide", _DEFAULT_CAP, frozenset({"approval", "text_sha256", "decision"})),
     )
 }
 # tool.allow's two forms of data (M6 J.4, M.3): its optional keys come all from one.
@@ -170,7 +173,8 @@ refuse_type(HeldData)
 @dataclass(frozen=True, repr=False)
 class Action:
     """A prepared action. ``plan`` is what the kind's plan returned (its summary and what will
-    run); logging the action raises, since the plan can hold the data too."""
+    run); logging the action raises, since the plan can hold the data too. ``replaced`` is the
+    kind of the session's live action it replaced, prepared in another tab (M8 design H.3)."""
 
     id: str
     kind: str
@@ -180,6 +184,7 @@ class Action:
     origin: str
     nonce: bytes
     expires: float
+    replaced: str | None = None
 
     def binding(self) -> dict[str, Any]:
         return {
@@ -228,7 +233,9 @@ class Actions:
     def prepare(
         self, *, kind: str, data: Any, plan: Any, session: str, origin: str, now: float
     ) -> Action:
-        """Hold a planned action for :data:`ACTION_TTL`, replacing the session's earlier one."""
+        """Hold a planned action for :data:`ACTION_TTL`, replacing the session's earlier one,
+        whose kind it names while that one was live (G-11: the other tab's was cancelled)."""
+        earlier = self.pending(session, now)
         action = Action(
             id=new_id(self._random),
             kind=kind,
@@ -238,6 +245,7 @@ class Actions:
             origin=origin,
             nonce=self._random(NONCE_BYTES),
             expires=now + ACTION_TTL,
+            replaced=None if earlier is None else earlier.kind,
         )
         self._by_session[session] = action
         return action

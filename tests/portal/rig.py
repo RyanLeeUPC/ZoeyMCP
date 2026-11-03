@@ -207,6 +207,7 @@ def running(
                 onboard=app.onboard if onboard is None else onboard(vault),
                 reviews=app.reviews,
                 managed=app.managed,
+                approvals=app.approvals,
                 routes=routes,
                 handlers=handlers,
                 body_deadline=body_deadline,

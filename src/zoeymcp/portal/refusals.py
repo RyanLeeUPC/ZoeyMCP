@@ -761,6 +761,21 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "held_result_too_large": Entry(
             502, "The call ran; its answer was over 4 MiB and wasn't kept."
         ),
+        # The portal's Approvals queue (M8 design H.3, M.2): a decision on a hold that moved,
+        # each refused by what happened to it.
+        "approval_unknown": Entry(
+            404,
+            "No approval by that ID waits in this queue: it ended long ago, the vault restarted, "
+            "or only another approver shows it.",
+        ),
+        "already_decided": Entry(409, "Already decided {where} at {at}: {decision}."),
+        "expired": Entry(409, "This approval expired at its deadline, so nothing was sent."),
+        "withdrawn": Entry(409, "This approval was withdrawn, so nothing was sent."),
+        "digest_changed": Entry(
+            409,
+            "This approval's text isn't the one you were shown, so nothing was decided: open it "
+            "again in the queue.",
+        ),
     }
 )
 

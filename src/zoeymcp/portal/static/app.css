@@ -85,6 +85,7 @@ code {
 #passkey-list li,
 #secret-list li,
 #ledger li,
+#approvals li,
 #servers li {
   margin-bottom: 0.5rem;
   overflow-wrap: anywhere;
@@ -97,6 +98,12 @@ code {
 
 pre {
   overflow-x: auto;
+}
+
+/* An approval's composed text, whole: its lines kept, a long one wrapped (M8 design H.1). */
+#approvals-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 dialog {

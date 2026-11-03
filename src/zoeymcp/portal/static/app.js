@@ -12,7 +12,7 @@
   const TOKEN = "session";
   const HEADER = "X-ZoeyMCP-Session";
   const PAGES = ["blocked", "login", "setup", "home", "credentials", "sessions", "passkeys",
-    "secrets", "ledger", "policy", "servers"];
+    "secrets", "ledger", "policy", "servers", "approvals"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
@@ -234,6 +234,7 @@
         "What needs you, errors first:" : "Everything is ready.";
       renderFindings($("checklist"), health.checklist);
       if (window.zoeyDrift) await window.zoeyDrift.home(); // M6 M.7: Home's attention list
+      if (window.zoeyApprovals) await window.zoeyApprovals.home(); // M8 H.1: its approvals item
       show("home");
     } catch (error) {
       afterFailure(error);
