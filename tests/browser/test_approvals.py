@@ -469,15 +469,23 @@ def test_item_30_an_open_queue_doesnt_keep_the_session_alive(
     """Item 30 and the brief's row 9: the Approvals page left open while its polls run (every 5
     and 10 s of page time, fired here as the rig's clock moves on five minutes at a time): the
     polls don't count as activity, so once the session has idled its 15 minutes "the next action
-    lands on the sign-in page" (the queue's own poll, refused, takes the page there)."""
+    lands on the sign-in page" (the queue's own poll, refused, takes the page there).
+
+    A call arrives before each poll, so the test sees each poll land (one more waiting row)
+    before it moves the clock again: approvals.js skips a tick while its last ask is still out,
+    and a skipped tick past the idle limit would leave the page signed in (CI's Chromium did, on
+    6b9d45c)."""
     stack = clocked
     set_up(page, stack.rig)
     hold(stack, "0000000000003001")
     open_queue(page)
-    for _ in range(2):  # ten minutes, with the queue's polls
+    # Ten minutes, with the polls; each call from its own client (the vault holds one undecided
+    # call per client, server and tool).
+    for arrived, client in (("0000000000003003", "nightly"), ("0000000000003004", "ops")):
+        hold(stack, arrived, client=client)
         clock.advance(300)
         poll(page, COUNT_EVERY)
-        expect(waiting(page)).to_have_count(1)
+        expect(waiting_row(page, arrived)).to_have_count(1)
         heading(page, "Approvals")
     watch.allow(REFUSED_401, on=stack.rig.origin)  # the poll past the idle limit, refused
     clock.advance(SESSION_IDLE - 600)  # 15 minutes since the last use: signing in

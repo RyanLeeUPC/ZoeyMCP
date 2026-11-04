@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.portal.test_policy_managed import (
     LIST,
@@ -46,8 +46,6 @@ from .watch import Watch
 
 # A refused request's answer, which the browser itself reports on the console.
 REFUSED_409 = r"status of 409"
-# The review screen's own timer (review.js), in milliseconds of page time.
-REVIEW_EVERY = 2_000
 NO_APPROVER = (
     "Set up an approver first (Telegram or the Approvals queue): a host step, operations.md §36.2"
 )
@@ -161,13 +159,20 @@ def labelled(page: Page, label: str) -> list[str]:
 
 
 def review(page: Page, rig: PortalRig) -> Locator:
-    """**Review again** on notes' row, the gateway's review answered, and the review drawn at
-    the review screen's next poll: write's row."""
+    """**Review again** on notes' row, and the review drawn by the review screen's first poll,
+    held until the gateway's review is answered: write's row.
+
+    The poll is held, not left to the screen's timer: review.js asks once right after queueing,
+    and a tick that fires while that ask is still out is skipped, so a paused clock moved on
+    once could leave the review undrawn (CI's Chromium did, on 6b9d45c)."""
+
+    def answered(route: Route) -> None:
+        gateway_answers(rig, report_of([LIST, WRITE], [WRITE], [LIST]))
+        route.continue_()
+
     open_section(page, "MCP servers")
-    with page.expect_response(lambda answer: answer.url.endswith("/api/review/notes")):
-        notes_row(page).get_by_role("button", name="Review again", exact=True).click()
-    gateway_answers(rig, report_of([LIST, WRITE], [WRITE], [LIST]))
-    page.clock.run_for(REVIEW_EVERY)
+    page.route("**/api/review/jobs/*", answered, times=1)
+    notes_row(page).get_by_role("button", name="Review again", exact=True).click()
     tool = page.locator("#review-tools > li").filter(has_text="Writes a note.")
     expect(tool).to_have_count(1)
     return tool
