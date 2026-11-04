@@ -4,7 +4,9 @@ box its launcher insists on (M3 design B.2, B.3), the portal is published on the
 loopback only, on the hardened vault's ``egress`` network alone (M5 design B.1, B.2), the
 egress role is a profile of the hardened tier alone, on networks of its own (M7 design I.5, L),
 and the bridge example's overrides add a confined bridge to the hardened tier and an unconfined
-one to the standard tier's box, leaving the rest as it was (M7 design C.9, C.10, L)."""
+one to the standard tier's box, leaving the rest as it was (M7 design C.9, C.10, L), and each
+ZoeyMCP image line has a commented digest slot beside it, with the digest list holding releases
+only (M8 design L.5)."""
 
 from __future__ import annotations
 
@@ -826,6 +828,58 @@ def test_the_official_image_builds_reproducibly() -> None:
     assert twice.index(epoch) > twice.index('docker buildx build --builder "repro-$build"')
     assert ',rewrite-timestamp=true" .\n' in twice
     assert '  docker buildx rm "repro-$build"\ndone\n' in twice
+
+
+# --- the official image (M8 design L.5, Z25) ----------------------------------------------------
+
+DIGEST_SLOT = "    # image: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>"
+# Each file's ZoeyMCP services: the standard container; the hardened vault, gateway and egress
+# role; the existing stack's vault and gateway.
+ZOEYMCP_IMAGES = {
+    "standard": (DEPLOY / "compose.yaml", 1),
+    "hardened": (DEPLOY / "compose.hardened.yaml", 3),
+    "existing-stack": (EXISTING_STACK, 2),
+}
+DIGESTS = ROOT / "release" / "digests.txt"
+_RELEASE = re.compile(
+    r"[0-9]+\.[0-9]+\.[0-9]+ sha256:[0-9a-f]{64} sha256:[0-9a-f]{64} [0-9a-f]{40}"
+)
+NOT_YET = "No image has been published yet"
+IMAGE_SECTION = "## 37. Getting and verifying the image\n"
+
+
+@pytest.mark.parametrize("name", sorted(ZOEYMCP_IMAGES))
+def test_each_zoeymcp_image_has_its_digest_slot(name: str) -> None:
+    """F9: beside each ZoeyMCP image line, a commented slot for the release pass's digest, under
+    a comment naming operations.md §37, where pinning and the host check are. The default stays
+    zoeymcp:local until that pass (2.39)."""
+    path, expected = ZOEYMCP_IMAGES[name]
+    lines = path.read_text(encoding="utf-8").splitlines()
+    found = [i for i, line in enumerate(lines) if line.startswith("    image: ${ZOEYMCP_")]
+    assert len(found) == expected
+    for i in found:
+        assert lines[i].endswith(":-zoeymcp:local}") or lines[i].endswith(":-zoeymcp:local}}")
+        assert lines[i - 1] == DIGEST_SLOT
+        above = i - 1
+        while lines[above - 1].lstrip().startswith("#"):
+            above -= 1
+        assert "docs/operations.md §37" in " ".join(lines[above : i - 1])
+    assert "pin by digest: ghcr.io" not in "\n".join(lines)
+    operations = (ROOT / "docs" / "operations.md").read_bytes().decode("utf-8")
+    assert operations.count(IMAGE_SECTION) == 1
+
+
+def test_the_digest_list_holds_releases_only() -> None:
+    """L.5: release/digests.txt is one release per line in the host check's format, each index
+    digest once; until the first release it lists none, and it and operations.md §37 say so."""
+    text = DIGESTS.read_bytes().decode("utf-8")
+    releases = [line for line in text.splitlines() if line and not line.startswith("#")]
+    assert all(_RELEASE.fullmatch(line) for line in releases)
+    indexes = [line.split()[1] for line in releases]
+    assert len(set(indexes)) == len(indexes)
+    operations = (ROOT / "docs" / "operations.md").read_bytes().decode("utf-8")
+    section = operations[operations.index(IMAGE_SECTION) :]
+    assert (NOT_YET in text) == (releases == []) == (NOT_YET in section)
 
 
 def test_the_example_images_pin_the_same_uv() -> None:

@@ -6,8 +6,12 @@ Invisible and look-alike characters in source code or docs can hide what code do
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import unicodedata
 from pathlib import Path
+
+import pytest
 
 from zoeymcp.common.textrules import INVISIBLE_CHARACTERS, REJECTED_CATEGORIES
 
@@ -90,3 +94,21 @@ def test_source_uses_fullmatch_not_match() -> None:
             if ".match(" in line:
                 found.append(f"{path.relative_to(ROOT).as_posix()}:{number}")
     assert found == []
+
+
+def test_tracked_shell_scripts_are_executable() -> None:
+    # The docs run the shell scripts directly (scripts/check-official-image.sh, operations.md
+    # §37), so each is committed as 100755. With core.filemode false, as on Windows, a plain git
+    # add stages a new script as 100644; git add --chmod=+x stages it executable.
+    git = shutil.which("git")
+    if git is None or not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    listed = subprocess.run(  # noqa: S603 - git with fixed arguments
+        [git, "ls-files", "--stage", "--", "*.sh"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert listed
+    assert [line.split("\t")[-1] for line in listed if not line.startswith("100755 ")] == []

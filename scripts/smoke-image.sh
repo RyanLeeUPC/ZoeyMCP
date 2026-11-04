@@ -2119,6 +2119,126 @@ existing_cleanup
 trap cleanup EXIT
 # --- end of contract 54 -------------------------------------------------------------------------
 
+# --- contract 69: a Compose secret from the environment (M8 design L.7, O.2) -------------------
+# Without --derived only, so it runs once in CI's image job, against the official image. A
+# report, not a gate: step 24a moves the gateway and egress keys to their _FILE forms if it held
+# and documents those forms if not (Q41), so the result is printed, and added to the job's
+# summary in CI, either way. It holds when a top-level secrets: entry sourced from an environment
+# variable reaches a container of the hardened tier's shape (its x-hardened settings, a role's
+# uid: the gateway's and the egress role's) as a regular file under /run/secrets that the
+# role's user reads, with the variable's value; with no bind or volume mount there (no operator
+# bind mount; a mount of another kind there is printed, not counted); and with neither the
+# variable nor its value in docker inspect's Env. Each container prints what it found and exits.
+# This block removes all it starts, whatever happens, with its own trap.
+if [ -z "$official" ]; then
+    step "contract 69: a Compose secrets: entry from the environment is a file under /run/secrets (a report)"
+    secret_project="zoeymcp-smoke-secret-$$"
+    secret_value="zoeymcp-smoke-secret-$$-value"
+    secret_compose() {
+        ZOEYMCP_IMAGE="$image" ZOEYMCP_SMOKE_SECRET="$secret_value" \
+            docker compose -p "$secret_project" -f "$work/secret/compose.yaml" "$@"
+    }
+    secret_cleanup() {
+        secret_compose down -v >/dev/null 2>&1 || true
+    }
+    trap 'secret_cleanup; cleanup' EXIT
+    mkdir -p "$work/secret"
+    # $$ is compose's escape for a $ the container's shell reads.
+    cat >"$work/secret/compose.yaml" <<'EOF'
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  image: ${ZOEYMCP_IMAGE}
+  network_mode: none
+  tmpfs:
+    - /tmp:size=1m
+  secrets: [smoke_key]
+  entrypoint:
+    - sh
+    - -c
+    - >-
+      f=/run/secrets/smoke_key;
+      if [ -f "$$f" ] && [ -r "$$f" ]; then
+      echo "secret $$(id -u) $$(stat -c '%u:%g %a' "$$f") $$(sha256sum <"$$f" | cut -d' ' -f1)";
+      else echo "secret $$(id -u) unreadable"; ls -la /run/secrets; fi
+
+services:
+  gateway:
+    <<: *hardened
+    user: "10002:10002"
+  egress:
+    <<: *hardened
+    user: "10006:10006"
+
+secrets:
+  smoke_key:
+    environment: ZOEYMCP_SMOKE_SECRET
+EOF
+    secret_sha="$(printf '%s' "$secret_value" | sha256sum | cut -d' ' -f1)"
+    secret_reasons=""
+    secret_files=""
+    secret_notes=""
+    if ! secret_compose up -d >"$work/secret/up" 2>&1; then
+        secret_reasons=" compose up failed: $(tr '\n' ' ' <"$work/secret/up")"
+    else
+        for secret_service in gateway egress; do
+            secret_id="$(secret_compose ps -aq "$secret_service" 2>/dev/null || true)"
+            if [ -z "$secret_id" ]; then
+                secret_reasons="$secret_reasons no $secret_service container;"
+                continue
+            fi
+            docker wait "$secret_id" >/dev/null 2>&1 || true
+            secret_seen="$(docker logs "$secret_id" 2>&1 | grep '^secret ' || true)"
+            echo "$secret_service: $secret_seen"
+            secret_uid="$(echo "$secret_seen" | cut -d' ' -f2)"
+            secret_line_sha="$(echo "$secret_seen" | cut -d' ' -f5)"
+            secret_files="$secret_files, $secret_service's owned \
+$(echo "$secret_seen" | cut -d' ' -f3) mode $(echo "$secret_seen" | cut -d' ' -f4)"
+            if [ "$secret_line_sha" != "$secret_sha" ]; then
+                secret_reasons="$secret_reasons $secret_service (uid $secret_uid) didn't read the \
+value as a file under /run/secrets: ${secret_seen:-no line};"
+            fi
+            secret_mounts="$(docker inspect -f \
+                '{{range .Mounts}}{{.Type}} {{.Source}} {{.Destination}}{{"\n"}}{{end}}' \
+                "$secret_id" || true)"
+            # Type, source and destination: a destination at or under /run/secrets.
+            secret_there="$(echo "$secret_mounts" | grep -E ' /run/secrets(/[^ ]*)?$' || true)"
+            secret_bound="$(echo "$secret_there" | grep -E '^(bind|volume) ' || true)"
+            if [ -n "$secret_bound" ]; then
+                secret_reasons="$secret_reasons $secret_service has a bind or volume mount at \
+/run/secrets: $(echo "$secret_bound" | tr '\n' ' ');"
+            fi
+            secret_other="$(echo "$secret_there" | grep -Ev '^(bind|volume) ' || true)"
+            if [ -n "$secret_other" ]; then
+                secret_notes="$secret_notes $secret_service has a mount of another kind there: \
+$(echo "$secret_other" | tr '\n' ' ');"
+            fi
+            if docker inspect -f '{{json .Config.Env}}' "$secret_id" \
+                | grep -q -e "$secret_value" -e ZOEYMCP_SMOKE_SECRET; then
+                secret_reasons="$secret_reasons $secret_service's Env holds the secret;"
+            fi
+        done
+    fi
+    if [ -z "$secret_reasons" ]; then
+        secret_result="held (a file under /run/secrets each role's user reads$secret_files; no \
+bind or volume mount there; not in Env)"
+    else
+        secret_result="not held:$secret_reasons"
+    fi
+    if [ -n "$secret_notes" ]; then
+        secret_result="$secret_result; noted, not counted:$secret_notes"
+    fi
+    echo "CONTRACT 69: $secret_result"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        echo "Contract 69 (a Compose secrets: entry from the environment): $secret_result" \
+            >>"$GITHUB_STEP_SUMMARY"
+    fi
+    secret_cleanup
+    trap cleanup EXIT
+fi
+# --- end of contract 69 -------------------------------------------------------------------------
+
 # --- D-71: approved sends in both tiers, under each approval mode --------------------------------
 # With --derived only: the example mail toolkit is the derived image's. Each tier from its
 # compose file, with an override of this run's whose policy serves the toolkit twice, on two

@@ -8,9 +8,10 @@
 #       --build-arg OFFICIAL=OFFICIAL -t zoeymcp-bridge-fetch examples/bridge
 #   examples/bridge/verify.sh --bridge OFFICIAL zoeymcp-bridge-fetch
 #
-# In production OFFICIAL is the release by digest: <registry>/zoeymcp@sha256:<digest>. The same
-# image serves the hardened tier's bridge container (compose.bridge.yaml) and the whole standard
-# container (compose.standard.yaml), where it must pass verify.sh --bridge: the vault runs from it.
+# In production OFFICIAL is the official image by digest, checked on the host first
+# (docs/operations.md §37: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>). The same image serves the
+# hardened tier's bridge container (compose.bridge.yaml) and the whole standard container
+# (compose.standard.yaml), where it must pass verify.sh --bridge: the vault runs from it.
 #
 # A Node server (not built here): in the install stage, `npm ci --ignore-scripts` from a committed
 # package-lock.json with integrity hashes and NPM_CONFIG_UPDATE_NOTIFIER=false set in that stage

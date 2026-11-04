@@ -18,7 +18,7 @@ either tier. `docs/operations.md` §33 is the how-to, and §32 the bridge's refe
 ## Build and verify
 
 ```sh
-OFFICIAL=zoeymcp:local   # in production: <registry>/zoeymcp@sha256:<release digest>
+OFFICIAL=zoeymcp:local   # in production: the official image by digest (docs/operations.md §37)
 examples/bridge/lock.sh
 docker build -f examples/bridge/Dockerfile \
     --build-context server=examples/bridge/server/dist \

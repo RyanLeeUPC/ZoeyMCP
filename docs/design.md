@@ -194,9 +194,9 @@ gap: the vault itself holds the request until the operator approves it (§6.4).
 **The image matters as much as the process.** Python runs every `.pth` file in `site-packages` at
 interpreter start, before any ZoeyMCP code. If the vault ran an image with toolkit dependencies
 installed, those dependencies would run next to the master key. So the vault **always** runs the
-official image, unmodified. From M8, once official image digests are published, `check` will warn
-when the vault's image digest isn't an official release. Toolkits go into a derived image used
-**only** by the gateway.
+official image, unmodified. Before deploying, `scripts/check-official-image.sh` checks on the host
+that the compose file pins a digest listed in `release/digests.txt` and verifies its attestation;
+the container can't check itself. Toolkits go into a derived image used **only** by the gateway.
 
 ### 3.2 Identity
 
@@ -2456,8 +2456,9 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   and the same quoting rule.
 - **Vault-enforced and out-of-band approvals (M8)**, each invariant with effect tests on real
   processes or sockets (`tests/gateway/`, `tests/portal/`, `tests/acceptance/`), unit and property
-  tests of the pure modules, or, for Z26, a docs test (`tests/unit/test_docs_recipes.py`); Z24
-  and Z25 are planned, and get theirs with the publishing steps.
+  tests of the pure modules, or, for Z26, a docs test (`tests/unit/test_docs_recipes.py`), and,
+  for Z25, the host check run against stub tools (`tests/acceptance/test_official_check.py`); Z24
+  is planned, and gets its tests with the release workflow.
   "Refused" means nothing was sent upstream, no approver was asked, and the answer names its
   reason.
 
@@ -2487,7 +2488,7 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   | Z22 | **Approver egress is named and guarded:** the vault's guarded client and startup egress proxy; `api.telegram.org:443` in the vault's derived allowlist with the reason `approver`; the self-test never starts or reaches an approver |
   | Z23 | **Waits are ordered:** a block of at most `block_seconds` (at most 600 s and `approvers.timeout`); a blocking hold whose caller is gone is withdrawn, never forwarded, except at the gateway's own stop, which detaches it as pending; a toolkit write blocks up to `call_timeout` minus 30 s; no deadline past `approvers.timeout` |
   | Z24 | *(Planned for M8's publishing steps; not built yet.)* **Release integrity:** an image is to be pushed only from a `v*` tag on main, after an unprivileged guard, under a protected environment, built twice to the same digest with an SBOM and provenance; dev and pull requests push nothing |
-  | Z25 | *(Planned for M8's publishing steps; not built yet.)* **The official check is the host's,** against a tracked digest list and the attestations; nothing in the container claims to be official |
+  | Z25 | **The official check is the host's.** `scripts/check-official-image.sh` resolves a compose file's images as Compose does and, for each ZoeyMCP image, requires a digest pin listed in `release/digests.txt` as a release's index digest and verifies its provenance and SBOM attestations against the release workflow at that release's tag; an image named `zoeymcp` in another registry or namespace fails unless named as a mirror, and compose files with no ZoeyMCP image fail; nothing in the container claims to be official; a local build fails unless the operator says `--allow-local`. No image is published yet, so the list is empty and no digest is official |
   | Z26 | **No claim beyond what is built:** the public docs say T1 is closed for `vault_approval` tools and every `approve` tool of an out-of-band client, T4/T6 only for `vault_approval` tools within Z21's scope, and what stays open; none calls the gateway's approvals vault-enforced |
   | Z27 | **One call, one marker, one answer:** the held marker leaves the gateway only on a call the pipeline registered as approved elsewhere, added after the egress filter; at most one identical held call in flight per connection; the vault's answer is read by that call alone |
 
@@ -3151,7 +3152,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-73 | The SMTP shapes (S13, S14) through the gateway in both tiers | M8 |
 | D-75 | A fake client that answers several back-channel requests, and the approval rows that need it | M8 (§12.2) |
 | D-78 | Stress effect tests for H3 and H7 | M8, against both enforcement points |
-| D-96 | Dependabot doesn't cover Python dependencies (a weekly advisory scan of the lock runs on dev since M6) | M8, or earlier (§12.2) |
+| D-96 | Dependabot doesn't cover Python dependencies (an advisory scan of the lock runs on every dev push) | M8, or earlier (§12.2) |
 | D-98 | Python 3.14 isn't in the test matrix | M8, or when 3.14 support is claimed (§12.2) |
 | D-127 | The SMTP send journal records no caller | M8, with D-35 |
 | D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | Each milestone: done for M7 and M6, M8 next |

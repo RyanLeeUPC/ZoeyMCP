@@ -8,7 +8,7 @@ doesn't change: a derived image adds exactly one layer, which touches only
 ## Build
 
 ```sh
-OFFICIAL=zoeymcp:local   # in production: <registry>/zoeymcp@sha256:<release digest>
+OFFICIAL=zoeymcp:local   # in production: the official image by digest (docs/operations.md §37)
 examples/derived-image/lock.sh "$OFFICIAL"
 docker build -f examples/derived-image/Dockerfile \
     --build-context toolkit=examples/toolkits/dist \

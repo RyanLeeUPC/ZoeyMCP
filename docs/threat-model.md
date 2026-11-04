@@ -489,9 +489,19 @@ At most:
   confirmation code the bot sent to the chat that presented it, which only the operator's phone
   shows. Health shows a contested token.
 - **T34** gets "unknown or expired" for any id that isn't its own call's.
-- **T35 and T36** are for M8's publishing steps, which aren't built yet: no image is published
-  and there is no official-image check yet. This section will say what holds against them once
-  those steps are built.
+- **T35** is for M8's release pipeline, which isn't built yet: no image is published. This section
+  will say what holds against it once the release workflow is built.
+- **T36** is caught on the host, before the operator deploys, by the official-image check
+  (`scripts/check-official-image.sh`, operations.md §37): each ZoeyMCP image the compose files
+  name must be pinned by a digest that `release/digests.txt` lists as a release's, with its
+  provenance and SBOM attestations verified against the release workflow at that release's tag.
+  An image named `zoeymcp` in another registry or namespace (an unnamed mirror, a look-alike
+  name) fails unless the operator names it as a mirror, a local build fails unless the operator
+  allows one, and compose files with no ZoeyMCP image fail. An image under another name, such as
+  a derived toolkit or bridge image, is reported "not checked" for the operator to read: the check
+  applies to the official image it was built from. The container can't vouch for itself.
+  Until the first release the list is empty, so no digest passes, and the image is the operator's
+  own build.
 - **T37** is refused past the caps; the operator gets one saturation notice per window, not one
   message per ask.
 - **T38** is caught by `check` before a reload or a save takes effect.

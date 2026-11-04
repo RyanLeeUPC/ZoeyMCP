@@ -5095,3 +5095,143 @@ The gateway's log lines about them (`role: gateway`):
 | `reserved_tool_name` | `server`, `tool`: an upstream lists a tool named `check_approval`, which is never served |
 
 None carries a prompt's text, an argument, a chat or user id, a token, a code or a button's data.
+
+## 37. Getting and verifying the image
+
+The vault runs next to the master key, so it must run the official image, unmodified (design.md
+§3.1). An **official image** is one this repository's release workflow built from a `v*` tag on
+`main` and published to `ghcr.io/ryanleeupc/zoeymcp`: its index digest is listed in
+`release/digests.txt`, and the workflow attested it on GitHub with a build provenance and an SPDX
+SBOM. Nothing inside a container can tell whether its own image is official, so the check runs on
+the host, before you deploy.
+
+**What controls a release.** A `v*` tag push runs the release workflow as the workflow file is at
+the tagged commit, so whoever can push a branch and a tag can edit its own checks away: they catch
+mistakes, not an attacker. The controls are the repository's settings: a tag ruleset limiting who
+may create `v*` tags, immutable releases, and the `release` environment's protection rules (a
+required reviewer, and a deployment rule allowing only `v*` tags). GitHub creates that environment
+unprotected the first time a job names it, so **no `v*` tag may be pushed, to this repository or
+to a fork that publishes its own image, before those settings exist.** The release workflow isn't
+in the repository yet.
+
+**No image has been published yet.** `release/digests.txt` lists no release, the compose files
+default to `zoeymcp:local`, and the image is the one you build from the repository (`docker build
+-t zoeymcp:local .`, the first step of §30). The check reports that image as a local build, as it
+should. The rest of this section is how a released image is pinned and checked, and it applies
+from the first release on.
+
+### Pinning the image
+
+Pin the official image by its index digest, never by a tag: a tag can be moved, a digest can't.
+Each ZoeyMCP `image:` line in the three compose files has a commented slot beside it:
+
+```yaml
+    # image: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>
+    image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
+```
+
+Set `ZOEYMCP_IMAGE` (in your `.env`, say) to `ghcr.io/ryanleeupc/zoeymcp@sha256:<index digest>`,
+with the index digest from `release/digests.txt` or the release's notes, or fill in the slot and
+use it instead. A line of `release/digests.txt` is `<version> <index digest> <platform manifest
+digest> <source tree>`; the index digest is the one to pin, since it is what the attestations
+name.
+
+### The check
+
+```sh
+scripts/check-official-image.sh deploy/compose.hardened.yaml
+```
+
+Run it on the host from a clone of this repository's `main`, at any commit after the release's: a
+release's line lands in `release/digests.txt` in the commit after its tag, since a digest can't be
+in the commit it is built from, so a clone at the tag itself doesn't list it. The list is only
+where the check looks a digest's release up; what proves the image official is its attestations,
+verified against the release workflow at `refs/tags/v<version>`. Run it with the `.env` and
+variables you deploy with: Compose resolves the images from them, and refuses to without the `:?`
+ones. For every compose file you give (several are one project, as `docker compose -f a -f b`
+reads them), it:
+
+1. resolves the images with `docker compose -f <file>... config --images`, so your `.env`, nested
+   `${...:-...}` defaults and YAML anchors resolve exactly as they do at `up`. A service in a
+   profile counts when `COMPOSE_PROFILES` turns its profile on.
+2. checks only ZoeyMCP images: those under `ghcr.io/ryanleeupc/zoeymcp`, local builds (the name
+   `zoeymcp`, as in `zoeymcp:local`), any name you give with `--image` (a mirror of the official
+   image, say), and any other image named `zoeymcp` in another registry or namespace, which fails
+   as not the official name. Every other image is reported `not checked (third party)` and
+   doesn't fail the check; the compose files pin Caddy by its own digest. Files that name no
+   ZoeyMCP image at all fail: the vault must run one.
+3. for each ZoeyMCP image: requires it pinned by `@sha256:`, finds the digest in
+   `release/digests.txt` as a release's index digest, and runs `gh attestation verify` twice, for
+   the provenance and for the SBOM (`--predicate-type https://spdx.dev/Document/v2.3`), each
+   requiring the attestation to be signed by this repository's `.github/workflows/release.yml`
+   (`--repo RyanLeeUPC/ZoeyMCP --signer-workflow
+   RyanLeeUPC/ZoeyMCP/.github/workflows/release.yml`), built from that release's tag
+   (`--source-ref refs/tags/v<version>`), on a GitHub-hosted runner
+   (`--deny-self-hosted-runners`).
+
+It prints one line per image and a last line with the verdict, and exits 0 only when every
+ZoeyMCP image passes, 1 when any fails or the files name none, and 2 on a usage error, a digest
+list it can't read (a line that isn't a release is refused, not skipped), `gh` missing or too old,
+or images Compose couldn't resolve.
+
+| Line | What it means |
+| --- | --- |
+| `official: <image> (release <version>; ...)` | listed, and both attestations verified |
+| `not checked (third party): <image>` | not a ZoeyMCP image; it doesn't fail the check |
+| `FAIL <image>: not pinned by digest ...` | a tag, or no digest: pin the index digest |
+| `FAIL <image>: not an official release's digest ...` | the digest isn't a listed release's (or the list has none yet) |
+| `FAIL <image>: that is release <version>'s platform manifest digest ...` | pin the index digest instead, which the attestations name |
+| `FAIL <image>: release <version>'s provenance (or SBOM) attestation didn't verify:` | `gh`'s own words follow; don't deploy it |
+| `FAIL zoeymcp:local: not an official image (a local build) ...` | your own build; `--allow-local` passes it |
+| `FAIL <image>: not the official name ...` | an image named `zoeymcp` elsewhere, a mirror or a look-alike; pass `--image` with your mirror's name to check it |
+| `FAIL: no ZoeyMCP image in these files ...` | nothing was checked: the vault must run the official image or a mirror you name; a derived image is checked by its base (below) |
+
+A **local build** isn't official, and the check fails on it unless you pass `--allow-local`. To
+check a local build matches your source instead, compare its label with your tree:
+
+```sh
+docker inspect --format '{{ index .Config.Labels "io.zoeymcp.source-tree" }}' zoeymcp:local
+git rev-parse 'HEAD^{tree}'
+```
+
+| Option | What it does |
+| --- | --- |
+| `--image <name>` | checks images of that name as ZoeyMCP images too (repeatable), such as your registry's mirror of the official image |
+| `--bundle <file>` | verifies against an attestation bundle on disk instead of asking the GitHub API (below) |
+| `--trusted-root <file>` | the trusted root `gh` verifies with, for a host with no network to GitHub at all (below) |
+| `--digests <file>` | another digest list than the repository's `release/digests.txt` |
+| `--allow-local` | passes a local build, reported as one |
+
+### Prerequisites
+
+- **Docker Compose** with `config --images`, the same one you deploy with.
+- **`gh` 2.74.0 or later**, which the script checks. `gh attestation verify` asks the GitHub API
+  for the attestations, so `gh` must be signed in: `gh auth login`, or a token in `GH_TOKEN`.
+- **Without a GitHub account, or offline:** each release attaches its attestation bundle, one
+  JSON-lines file holding both the provenance and the SBOM attestation (the form `gh attestation
+  download` writes), and `--bundle <file>` passes it to `gh` for both verifications; each takes
+  the attestation of its own type from the file, against the file instead of the API, with no
+  account or token. On a host with no network to GitHub at all, also write the trusted
+  root on a connected host (`gh attestation trusted-root > trusted_root.jsonl`) and pass it with
+  `--trusted-root trusted_root.jsonl`. `gh` still reads the image's digest from the registry the
+  image comes from, which the host reaches anyway to pull it.
+
+### Derived images
+
+A **derived image** (toolkits, `examples/derived-image`; a bridge, `examples/bridge`) is the
+official image plus a layer of yours, so it isn't official by construction, and the check reports
+it `not checked (third party)`. What is checked is the official image it was built `FROM`: build
+with `OFFICIAL` pinned by digest, check that digest, and let the recipe's `verify.sh` prove the
+derived image is that image plus its one layer:
+
+```sh
+OFFICIAL=ghcr.io/ryanleeupc/zoeymcp@sha256:<index digest>
+ZOEYMCP_IMAGE="$OFFICIAL" scripts/check-official-image.sh deploy/compose.yaml
+examples/derived-image/verify.sh "$OFFICIAL" zoeymcp-derived
+```
+
+In the hardened tier the vault keeps the official image (`ZOEYMCP_IMAGE`) and only the gateway
+runs the derived one (`ZOEYMCP_GATEWAY_IMAGE`), so the check of the compose file itself checks the
+vault's image and reports the gateway's as not checked. In the standard tier with a derived image
+(a bridge's `compose.standard.yaml`, say), the one container runs the derived image, so those
+files name no ZoeyMCP image and the check of them fails; check the base as above.

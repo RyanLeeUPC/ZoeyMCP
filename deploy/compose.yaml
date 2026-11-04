@@ -46,7 +46,9 @@ x-caddy: &caddy-image caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229
 
 services:
   zoeymcp:
-    # For a real deployment, pin by digest: ghcr.io/ryanleeupc/zoeymcp@sha256:...
+    # For a real deployment, pin the official image by digest and check it on the host first
+    # (docs/operations.md §37, "Getting and verifying the image"), here or in ZOEYMCP_IMAGE:
+    # image: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>
     image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
     command: [standard, --gateway-listen, "0.0.0.0:8090"]
     user: "0:0"

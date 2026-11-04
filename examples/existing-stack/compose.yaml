@@ -57,7 +57,9 @@ networks:
 services:
   vault:
     <<: *hardened
-    # For a real deployment, pin by digest: ghcr.io/ryanleeupc/zoeymcp@sha256:...
+    # For a real deployment, pin the official image by digest and check it on the host first
+    # (docs/operations.md §37, "Getting and verifying the image"), here or in ZOEYMCP_IMAGE:
+    # image: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>
     image: ${ZOEYMCP_IMAGE:-zoeymcp:local}
     command: [vault, --listen, "0.0.0.0:8080"]
     user: "10001:10001"
@@ -124,6 +126,9 @@ services:
 
   gateway:
     <<: *hardened
+    # A derived image with toolkits (examples/derived-image), or the official image by digest
+    # (docs/operations.md §37):
+    # image: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>
     image: ${ZOEYMCP_GATEWAY_IMAGE:-${ZOEYMCP_IMAGE:-zoeymcp:local}}
     command: [gateway, --vault, "http://zoeymcp-vault:8080", --listen, "0.0.0.0:8090"]
     user: "10002:10002"

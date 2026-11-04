@@ -232,7 +232,8 @@ Built for one operator running a few agents. Multi-tenant features and SSO are n
 
 Requires [uv](https://docs.astral.sh/uv/). Dependencies are locked with hashes in `uv.lock`, and
 resolution ignores releases newer than the `exclude-newer` date in `pyproject.toml` (a
-supply-chain cooldown, moved forward deliberately).
+supply-chain cooldown, moved forward deliberately). Moving `exclude-newer` forward drops every
+`exclude-newer-package` exception it passes, or the exception becomes a silent cap on its package.
 
 ```sh
 uv sync --locked --all-extras                    # the gateway's extra too, as CI does

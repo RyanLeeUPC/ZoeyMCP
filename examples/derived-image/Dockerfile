@@ -8,7 +8,8 @@
 #       --build-arg OFFICIAL=OFFICIAL -t zoeymcp-derived examples/derived-image
 #   examples/derived-image/verify.sh OFFICIAL zoeymcp-derived
 #
-# In production OFFICIAL is the release by digest: <registry>/zoeymcp@sha256:<digest>.
+# In production OFFICIAL is the official image by digest, checked on the host first
+# (docs/operations.md §37: ghcr.io/ryanleeupc/zoeymcp@sha256:<digest>).
 ARG OFFICIAL=zoeymcp:local
 
 FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv

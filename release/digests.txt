@@ -1,0 +1,11 @@
+# ZoeyMCP's official image releases (docs/operations.md §37), checked on the host by
+# scripts/check-official-image.sh. One line per release:
+#
+#   <version> <index digest> <platform manifest digest> <source tree>
+#
+# the version without its v, the digests as sha256:<64 hex>, and the source tree as 40 hex
+# (git rev-parse 'v<version>^{tree}'). The index digest is what a compose file pins and what the
+# release's attestations name. A release's line lands in the commit after its tag, since a digest
+# can't be in the commit it is built from.
+#
+# No image has been published yet, so no line follows and no digest is official.
