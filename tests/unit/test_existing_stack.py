@@ -1,9 +1,10 @@
 """``examples/existing-stack/``: the declared shape of the existing-stack recipe (M7 design J6,
-L, P.2 step 3b). Its inline policy passes ``check``; the vault has no network that Compose
-would create with a route out; the gateway and the agents reach ZoeyMCP by aliases only it uses;
-only the portal relay publishes, on the host's loopback, from a network of its own; the relay
-holds no secret, keeps no access or error log and changes no header; and the committed Squid
-snippet is what the emitter prints for the policy.
+L, P.2 step 3b). Its inline policy passes ``check`` and stays declarative, which the README
+explains (M8 design L.7); the vault has no network that Compose would create with a route out;
+the gateway and the agents reach ZoeyMCP by aliases only it uses; only the portal relay
+publishes, on the host's loopback, from a network of its own; the relay holds no secret, keeps no
+access or error log and changes no header; and the committed Squid snippet is what the emitter
+prints for the policy.
 
 An external network's real setting is outside the file, so these tests can only refuse a
 network the file *declares* non-internal; the README's ``docker inspect`` probe checks the
@@ -51,6 +52,21 @@ def test_the_inline_policy_passes_check_and_names_the_stacks_proxy() -> None:
     assert [f for f in check_policy(policy) if f.level == "error"] == []
     assert policy.egress_proxy == "http://stack-proxy:3128"
     assert policy.egress_proxy_acls == {"vault": "stack_vault_net"}
+
+
+def test_the_policy_stays_declarative_and_the_readme_says_why() -> None:
+    """M8 design L.7 (fold-in 3.25): unlike the shipped deploy files, the recipe's inline policy
+    is the policy itself, so a stack kept in git keeps its policy there and the committed Squid
+    snippet keeps matching what runs; the README says so."""
+    policy = inline_policy(compose(), "compose.yaml")
+    assert policy.mode == "declarative"
+    readme = (EXAMPLE / "README.md").read_text(encoding="utf-8")
+    heading = "## Why the policy is declarative\n"
+    assert readme.count(heading) == 1
+    section = readme[readme.index(heading) : readme.index("\n## ", readme.index(heading) + 1)]
+    assert "keeps `mode: declarative`" in section
+    assert "kept in git" in section
+    assert "`zoeymcp-squid.conf`" in section
 
 
 def test_every_vault_network_is_internal_or_external() -> None:

@@ -222,7 +222,10 @@ services:
     depends_on:
       vault: {condition: service_started}
     environment:
-      # Or ZOEYMCP_GATEWAY_KEY_FILE, a file the gateway re-reads on HUP (a Docker secret, say).
+      # In the environment, where docker inspect shows it: Compose refuses a secret from the
+      # environment in a read-only service. ZOEYMCP_GATEWAY_KEY_FILE, a file the gateway
+      # re-reads on HUP, is the stronger form, in your own copy of this file
+      # (docs/operations.md §38).
       ZOEYMCP_GATEWAY_KEY: ${ZOEYMCP_GATEWAY_KEY:?print it with `zoeymcp keygen` or `zoeymcp gateway-key`}
       # This service's name, in the commands ZoeyMCP prints.
       ZOEYMCP_EXEC_SERVICE: gateway
@@ -249,7 +252,8 @@ services:
     user: "10006:10006"
     environment:
       # :- rather than :?, so compose commands with the profile off don't need it; the role
-      # refuses to start without a key, naming `zoeymcp egress-key`.
+      # refuses to start without a key, naming `zoeymcp egress-key`. ZOEYMCP_EGRESS_KEY_FILE in
+      # an override is the stronger form (docs/operations.md §38).
       ZOEYMCP_EGRESS_KEY: ${ZOEYMCP_EGRESS_KEY:-}
     networks:
       egress-ctl: {aliases: [egress-vault]}

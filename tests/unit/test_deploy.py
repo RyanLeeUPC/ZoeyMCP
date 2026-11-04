@@ -6,7 +6,8 @@ egress role is a profile of the hardened tier alone, on networks of its own (M7 
 and the bridge example's overrides add a confined bridge to the hardened tier and an unconfined
 one to the standard tier's box, leaving the rest as it was (M7 design C.9, C.10, L), and each
 ZoeyMCP image line has a commented digest slot beside it, with the digest list holding releases
-only (M8 design L.5)."""
+only (M8 design L.5), and the gateway and egress keys stay in the environment, their file forms
+documented as the stronger option (M8 design L.7, Q41)."""
 
 from __future__ import annotations
 
@@ -30,8 +31,9 @@ from zoeymcp.egress.main import Options as EgressOptions
 from zoeymcp.egress.main import StartupError as EgressStartupError
 from zoeymcp.egress.main import build as build_egress
 from zoeymcp.entrypoint import env, launcher
+from zoeymcp.gateway import vaultlink
 from zoeymcp.portal import listen
-from zoeymcp.vault import approvers, heldcommit
+from zoeymcp.vault import approvers, heldcommit, keys
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
@@ -889,6 +891,48 @@ def test_the_digest_list_holds_releases_only() -> None:
     operations = (ROOT / "docs" / "operations.md").read_bytes().decode("utf-8")
     section = operations[operations.index(IMAGE_SECTION) :]
     assert (NOT_YET in text) == (releases == []) == (NOT_YET in section)
+
+
+# --- D-65's decision (M8 design L.7, Q41) -------------------------------------------------------
+
+CONCESSIONS_SECTION = "## 38. What the containers concede\n"
+# Contract 69 didn't hold: Compose's reason, as operations.md §38 gives it.
+SECRET_REFUSED = (
+    'cannot create secret "<project>_<name>" in read-only service gateway: '
+    "`file` is the sole supported option"
+)
+
+
+def test_the_keys_stay_in_the_environment_with_their_file_forms_documented() -> None:
+    """L.7's branch (b): Compose refused a ``secrets:`` entry from the environment in a read-only
+    service (contract 69), so no compose file declares a secret, the gateway and egress keys stay
+    in the environment, and operations.md §38 gives Compose's reason and, as the stronger
+    option, the ``_FILE`` forms the two roles read; the master key has none."""
+    documents = {
+        "compose.yaml": compose("compose.yaml"),
+        "compose.hardened.yaml": compose("compose.hardened.yaml"),
+        "existing-stack": yaml.safe_load(interpolated(EXISTING_STACK.read_text(encoding="utf-8"))),
+    }
+    for document in documents.values():
+        assert "secrets" not in document
+        assert all("secrets" not in service for service in document["services"].values())
+    for name in ("compose.hardened.yaml", "existing-stack"):
+        gateway = documents[name]["services"]["gateway"]["environment"]
+        assert vaultlink.KEY_ENV in gateway
+        assert vaultlink.KEY_FILE_ENV not in gateway
+    role = documents["compose.hardened.yaml"]["services"]["egress-proxy"]["environment"]
+    assert list(role) == [egress_allowlist.KEY_ENV]
+    operations = (ROOT / "docs" / "operations.md").read_bytes().decode("utf-8")
+    assert operations.count(CONCESSIONS_SECTION) == 1
+    start = operations.index(CONCESSIONS_SECTION)
+    end = operations.find("\n## ", start + 1)
+    section = operations[start : end if end != -1 else None]
+    assert SECRET_REFUSED in section
+    for file_env in (vaultlink.KEY_FILE_ENV, egress_allowlist.KEY_FILE_ENV):
+        assert f"| `{file_env}` (below) |" in section
+        assert f"{file_env}: /run/secrets/" in section
+    assert f"`{keys.MASTER_KEY_ENV}` | the vault, in both tiers |" in section
+    assert f"{keys.MASTER_KEY_ENV}_FILE" not in section
 
 
 def test_the_example_images_pin_the_same_uv() -> None:

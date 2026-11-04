@@ -136,6 +136,8 @@ services:
     depends_on:
       vault: {condition: service_started}
     environment:
+      # In the environment, where docker inspect shows it; ZOEYMCP_GATEWAY_KEY_FILE, in your
+      # own copy of this file, is the stronger form (docs/operations.md §38).
       ZOEYMCP_GATEWAY_KEY: ${ZOEYMCP_GATEWAY_KEY:?print it with `zoeymcp keygen` or `zoeymcp gateway-key`}
       # This service's name, in the commands ZoeyMCP prints.
       ZOEYMCP_EXEC_SERVICE: gateway

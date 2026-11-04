@@ -3654,8 +3654,8 @@ docker compose -f deploy/compose.hardened.yaml --profile egress-proxy up -d
   profile off don't need the key; with the profile on and no key the role exits 2 naming
   `zoeymcp egress-key`, and compose keeps restarting it to no effect, since a restart keeps the
   environment the container was made with: set `ZOEYMCP_EGRESS_KEY` and run the `up -d` above
-  again, which recreates it with the key. For a key in a file (a Docker
-  secret, say), set `ZOEYMCP_EGRESS_KEY_FILE` in an override instead, and
+  again, which recreates it with the key. For a key in a file, the stronger form, set
+  `ZOEYMCP_EGRESS_KEY_FILE` in an override instead (§38), and
   `docker compose kill -s HUP egress-proxy` after changing it.
 - **Its networks.** `egress-ctl` is internal and holds the vault and the role: the role fetches
   the vault's lists there, and the vault reaches the role's one listener there, as
@@ -5235,3 +5235,55 @@ runs the derived one (`ZOEYMCP_GATEWAY_IMAGE`), so the check of the compose file
 vault's image and reports the gateway's as not checked. In the standard tier with a derived image
 (a bridge's `compose.standard.yaml`, say), the one container runs the derived image, so those
 files name no ZoeyMCP image and the check of them fails; check the base as above.
+
+## 38. What the containers concede
+
+The hardened tier's containers, and the `lan` profile's in both tiers, share one baseline:
+read-only, every capability dropped, `no-new-privileges`, a uid of their own, and no network they
+don't need (the standard tier's one container is its launcher's box instead, §9). These are the
+places the shipped compose files depart from it, why each stays, and the stronger option where
+there is one. The approvals of §36 add no container and no exception.
+
+| Concession | Where | Why it stays | The stronger option |
+| --- | --- | --- | --- |
+| The gateway key in the environment, `ZOEYMCP_GATEWAY_KEY` | the hardened tier's gateway, and the existing stack's (§29) | `docker inspect` and the container's process environment show it. A Compose `secrets:` entry sourced from the environment would make it a file under `/run/secrets` with nothing new for you to manage, but Compose refuses one for a read-only service: ``cannot create secret "<project>_<name>" in read-only service gateway: `file` is the sole supported option`` (the image's smoke test tries it on every run). A `secrets:` entry from a file does work there, but that file is one more for you to create, protect and replace on the host. | `ZOEYMCP_GATEWAY_KEY_FILE` (below) |
+| The egress key in the environment, `ZOEYMCP_EGRESS_KEY` | the egress role (§31) | the same | `ZOEYMCP_EGRESS_KEY_FILE` (below) |
+| The master key in the environment, `ZOEYMCP_MASTER_KEY` | the vault, in both tiers | It has no file form yet; adding one is a small change not yet made. Only the vault's process gets it: the gateway refuses to start with it (§9). | none yet |
+| `lan-init` runs as root, with `CHOWN` | the `lan` profile, in both tiers | It makes the `lan-data` volume Caddy's uid's (10004) and exits: read-only, no network, no other capability, `no-new-privileges`. | none needed |
+| Caddy keeps `NET_BIND_SERVICE` in its bounding set | `lan`, in both tiers; the existing stack's `portal-relay` | The pinned image's `caddy` binary carries the file capability `cap_net_bind_service` (rechecked against the pinned digest), and it can't be executed unless the bounding set holds it. It listens on 8443 (the relay on 8081) and never uses it. | none needed |
+| The Caddyfile in the environment, `ZOEYMCP_CADDYFILE` | the same | Compose can't place a config file in a read-only container without a bind mount, so the Caddyfile comes in the environment and is written to tmpfs at start. It holds no secret. A top-level `configs:` entry from `content:` or the environment goes through the same check as the keys' `secrets:` entry, so Compose refuses it for these read-only services (``cannot create config "<project>_<name>" in read-only service lan: `file` is the sole supported option``), and a `configs:` entry from a file is a bind mount. | none needed |
+
+### The keys in files
+
+Both roles read their key from a file when the `_FILE` variable names one, and re-read it on
+`SIGHUP` and after the vault refuses it (at most once per 10 s), so a new key needs no recreate
+(§14, §31). A key in a file under `/run/secrets` shows in neither `docker inspect` nor the
+process environment. The file is yours to manage: outside Swarm, Compose mounts a file secret as
+it is on the host, so it must hold the key alone (what follows `=` on the line `zoeymcp
+gateway-key` or `zoeymcp egress-key` prints), and be readable by the role's uid (10002 for the
+gateway, 10006 for the egress role) and by nobody else who shouldn't have it.
+
+**The egress role.** The compose file's `ZOEYMCP_EGRESS_KEY` is empty unless you set it, so an
+override is enough: leave `ZOEYMCP_EGRESS_KEY` unset and run with both files (`docker compose -f
+deploy/compose.hardened.yaml -f egress-key-file.yaml --profile egress-proxy up -d`):
+
+```yaml
+# egress-key-file.yaml
+services:
+  egress-proxy:
+    secrets: [egress-key]
+    environment:
+      ZOEYMCP_EGRESS_KEY_FILE: /run/secrets/egress-key
+secrets:
+  egress-key: {file: /etc/zoeymcp/egress.key}   # the key alone, readable by uid 10006
+```
+
+A new key is then a new file and `docker compose kill -s HUP egress-proxy`.
+
+**The gateway.** The compose file requires `ZOEYMCP_GATEWAY_KEY` (`:?`), and an override that
+adds the file leaves the variable beside it, where `docker inspect` still shows the key. Use your
+own copy of the compose file instead: in the gateway's `environment`, replace the
+`ZOEYMCP_GATEWAY_KEY` line with `ZOEYMCP_GATEWAY_KEY_FILE: /run/secrets/gateway-key`, give the
+service `secrets: [gateway-key]`, and add `gateway-key: {file: /etc/zoeymcp/gateway.key}` under a
+top-level `secrets:` (the key alone, readable by uid 10002). A new key (§14) is then a new file
+and `kill -s HUP gateway`.

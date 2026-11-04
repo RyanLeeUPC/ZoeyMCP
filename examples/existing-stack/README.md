@@ -66,6 +66,22 @@ setting for that server at its least-prompting level, so ZoeyMCP's approval is t
 the gateway's, or for a tool in `vault_approval` the vault's, on your approvers (operations.md
 §36).
 
+## Why the policy is declarative
+
+The shipped `deploy/` files run the policy managed (operations.md §34): their inline policy seeds
+the vault's first revision and is ignored afterwards, and the portal and `zoeymcp policy import`
+change it from then on. This recipe keeps `mode: declarative`, so its inline policy is the policy:
+a change is an edit of this file and a recreate of the vault (operations.md §7). A stack this
+recipe joins is usually kept in git and deployed from it, so the policy is reviewed, versioned and
+rolled back with the rest of the stack, and the file in the repository is what runs. Managed, the
+file would say only what the vault started with, and every later change would live in the vault's
+volume, out of the repository. The stack's proxy is held to `zoeymcp-squid.conf`, emitted from
+this file's policy, and the unit test and the probe below compare the two; with the policy changed
+in the portal, the committed snippet could fall behind what the vault sends, and neither would see
+it. The portal still runs, as in any declarative deployment: its Policy page shows the policy
+read-only, and a change goes into this file. To run it managed anyway, set `mode: managed` before
+the first `up -d` and follow operations.md §34.
+
 ## The proxy
 
 The snippet allows the vault's `CONNECT` to each destination the policy names, and nothing else.
