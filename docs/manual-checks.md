@@ -838,14 +838,18 @@ and the bot is deleted afterwards.
    Telegram. Sending…", then "… Sent: the server answered ok.", with no buttons. Deny another:
    "...: denied HH:MM UTC in Telegram. Nothing was sent." A press on a decided message (from a
    notification still on screen, say) is answered "This request is no longer pending".
-6. **A second poller.** While the vault runs, poll the same bot from another program
-   (`getUpdates` with the token): within a minute health shows `approver_contested`; stop it, and
-   revoke and rotate the token as operations.md §35 says.
-7. **An edited message.** With the bot's token, edit a waiting prompt's text
+6. **An edited message.** With the bot's token, edit a waiting prompt's text
    (`editMessageText`), then press its Approve: the press is refused (`edited` or
    `text_changed` in `approver_press_refused`) and nothing is sent. Also change only its buttons
    (`editMessageReplyMarkup`): record whether Telegram then sets `edit_date`; the press is refused
-   either way (`markup_changed` or `edited`).
+   either way (`markup_changed` or `edited`). An `editMessageText` without `reply_markup` drops
+   the buttons, leaving nothing to press, so the edit must send the prompt's own `reply_markup`;
+   its buttons' data is bound by a key only the running vault holds, so read the waiting prompt's
+   message id and `reply_markup` from the vault's process (the M8 run read them through a
+   loopback-only inspector beside the vault).
+7. **A second poller.** Last, since it ends with the token revoked: while the vault runs, poll
+   the same bot from another program (`getUpdates` with the token): within a minute health shows
+   `approver_contested`; stop it, and revoke and rotate the token as operations.md §35 says.
 
 ## D-66: the live OAuth test against a real provider
 
@@ -999,3 +1003,11 @@ such server is available, record it as not run.
 | 32 (browser tests) | 4798242 | 2026-11-04 | Chromium (Playwright 1.63), Linux; Edge, Windows (CI's browser jobs) | http://localhost on a free port, in process | Pass | Browser tests: the `test_item_32_*` tests in `test_managed.py`, CI 41875362144 (each passed in both jobs); the item's by-hand lines are not part of this row |
 | 33 (browser tests) | 4798242 | 2026-11-04 | Chromium (Playwright 1.63), Linux; Edge, Windows (CI's browser jobs) | http://localhost on a free port, in process | Pass | Browser tests: the `test_item_33_*` tests in `test_approvals.py`, CI 41875362144 (each passed in both jobs); the item's by-hand lines are not part of this row |
 | 34 (browser tests) | 4798242 | 2026-11-04 | Chromium (Playwright 1.63), Linux; Edge, Windows (CI's browser jobs) | http://localhost on a free port, in process | Pass | Browser tests: the `test_item_34_*` tests in `test_approvals.py`, CI 41875362144 (each passed in both jobs); the item's by-hand lines are not part of this row |
+| 27 | 35446ee | 2026-11-04 | Chrome 156, Windows | http://localhost on a free port | Pass | The by-hand line. The browser tests' queue stack (`tests/browser/stacks.py`'s `queue`) left running for a real browser, a synced passkey enrolled with a setup code. **Approve**, **Confirm with your passkey**, then **Cancel** pressed in the browser's own passkey dialog: the dialog said the passkey prompt was cancelled, the row stayed under **Waiting**, and the vault logged no `step_up_confirmed` and no `approval_decided`. **Approve** again, confirmed: `approval_decided` accept via the portal, `approval_forwarded` ok, the upstream given the call once |
+| Live Telegram (1) | 35446ee | 2026-11-04 | - | - | Pass | Made directly with @BotFather, privacy mode on |
+| Live Telegram (2) | 35446ee | 2026-11-04 | Telegram for Android | - | Pass, with a finding (D-252) | A vault run as `zoeymcp vault` runs it, with an admin socket, in WSL (Ubuntu), reaching the Bot API directly; held calls sent to its proxy listener as the gateway sends them, to an echo upstream. The printed link opened the bot's chat, Start presented the code, the bot sent a six-digit code to that chat, and typing it printed the `approvers` lines with the right ids; a wrong code ended `enrolment_unconfirmed`. Found: a code pasted at the hidden prompt reached the vault as one character and ended the enrolment as a wrong code does, three times, before a typed one worked (D-252) |
+| Live Telegram (3) | 35446ee | 2026-11-04 | Telegram Desktop (Windows), Telegram for Android | - | Pass, with a finding (D-253) | `approver telegram test` exited 0 and the chat showed the test message with no buttons; health read `approver telegram: ok (@<bot>, last poll 49 s ago)`. Found: health also listed `store:approver-bot` as `unreferenced` and said to delete it, though the policy's approver uses it (D-253) |
+| Live Telegram (4) | 35446ee | 2026-11-04 | Telegram Desktop (Windows), Telegram for Android | - | Pass | One monospaced block (one `pre` entity, the arguments whole), no link preview, and nothing inside it tappable or clickable as a link on either client: `https://example.com/x`, `example.com` and `t.me/x` drawn as plain text, so D-44's Telegram-only defang isn't needed. iOS not run (no device). Noted: Telegram Desktop's own copy button on a `pre` block copies the text, `protect_content` notwithstanding (it stops forwarding and saving) |
+| Live Telegram (5) | 35446ee | 2026-11-04 | Telegram Desktop (Windows), Telegram for Android | - | Pass (the stale press not reproduced) | Approved: the message read "approved HH:MM UTC in Telegram. Sending…", then "Sent: the server answered ok.", with no buttons (`approval_forwarded` ok). Denied: "denied HH:MM UTC in Telegram. Nothing was sent.", nothing forwarded. A press on a decided message couldn't be set up by hand: the other client dropped the buttons at once (the fake Bot API's tests cover the answer) |
+| Live Telegram (6) | 35446ee | 2026-11-04 | Telegram Desktop (Windows), Telegram for Android | - | Pass, with a finding (D-255) | Text edited (`editMessageText`, one character changed, the prompt's buttons sent back): `edit_date` set, **Approve** refused `edited`, nothing sent. Buttons only (`editMessageReplyMarkup`, the labels changed, their data kept): Telegram sets `edit_date`; **Approve** refused `edited`, nothing sent. The fake Bot API leaves `edit_date` unset on a buttons-only edit by default (D-255) |
+| Live Telegram (7) | 35446ee | 2026-11-04 | Telegram Desktop (Windows), Telegram for Android | - | Pass | A second `getUpdates` poller: the vault logged `approver_contested` at once and stopped polling (every one of the poller's calls answered ok); health: `approver_contested: another program reads this bot's updates; revoke the token`. The token was then revoked (the vault's next polls answered 401). Found on the way: one `held_busy` refusal (a second hold of the same tool by the same client while the first waited) raised `approvals_saturated` as an error in health and sent Telegram "The approval queue is full" (D-254) |
