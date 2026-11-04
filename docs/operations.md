@@ -9,8 +9,11 @@ one (§29), a first hardened deployment end to end (§30), the egress role (§31
 declined tools and clearing marks in the portal (§12), the gateway's status on Home (§13), moving
 a tool from `approve` to `allow` (§12, §26), prompts, resources and completions (§12), and
 managed policy (§34), the vault keeping the policy as revisions, which the shipped compose files
-use. §27 says which hosts are supported, and §35 lists the fast ways to stop something. The
-design and the reasons behind it are in [design.md](design.md); this page is the how-to.
+use; and M8: vault-enforced and out-of-band approvals (§36, with §19 to §26 for what they change
+in the gateway's approvals, the ledger and the portal), getting and verifying the image (§37;
+none is published yet), and what the containers concede and why (§38). §27 says which hosts are
+supported, and §35 lists the fast ways to stop something. The design and the reasons behind it
+are in [design.md](design.md); this page is the how-to.
 
 Admin commands run **inside the container** and talk to the vault or the gateway over its admin
 socket (`/run/zoeymcp/admin.sock` for the vault, `/run/zoeymcp-gateway/admin.sock` for the

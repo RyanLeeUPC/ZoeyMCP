@@ -1,11 +1,12 @@
 # ZoeyMCP threat model
 
 Who might attack a deployment, what each can reach, and the most each can gain once everything
-built so far (M1 to M7, and M8's approvals) holds. The mechanisms are in [design.md](design.md);
-the invariants the tests hold the gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, the
-portal's are P1 to P22 (M5), onboarding's, the egress role's and the bridge's are X1 to X24 (M7),
-managed policy's, drift review's and prompts' and resources' are Y1 to Y29 (M6), and
-vault-enforced and out-of-band approvals' are Z1 to Z27 (M8) (§8.2).
+built so far (M1 to M8, M8's image release pipeline included, though it has published nothing
+yet) holds. The mechanisms are in [design.md](design.md); the invariants the tests hold the
+gateway to are G1 to G21 (M3) and H1 to H16 (M4) there, the portal's are P1 to P22 (M5),
+onboarding's, the egress role's and the bridge's are X1 to X24 (M7), managed policy's, drift
+review's and prompts' and resources' are Y1 to Y29 (M6), and vault-enforced and out-of-band
+approvals' and the release pipeline's are Z1 to Z27 (M8) (§8.2).
 
 ## Actors
 

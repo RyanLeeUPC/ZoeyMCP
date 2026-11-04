@@ -6,11 +6,18 @@ elicitation, the approval ledger, the SMTP connector, toolkits and the derived i
 admin portal v1: passkeys, step-up, write-only secrets, OAuth connect, credential health, the ledger
 view and the read-only policy view), M7 (onboarding a remote MCP server by URL with its
 first-time tool review and policy fragments, the vault's address guard, revocation on delete, the
-egress role and the allowlist emitter, and the bridge in three placements) and M6 (drift review,
+egress role and the allowlist emitter, and the bridge in three placements), M6 (drift review,
 re-pinning, declined tools and clearing marks in the portal, the gateway's status report, moving a
 tool from `approve` to `allow`, managed mode with sealed revisions, history, rollback, export and
-import, the restore witness, and prompts, resources and completions) are built; everything else
-here is not yet (§11 says which milestone plans it). Operating the built parts is in
+import, the restore witness, and prompts, resources and completions) and M8 (vault-enforced
+approvals, out-of-band approvers in the vault (a Telegram bot and the portal's Approvals queue),
+`pending` and `check_approval`, the vault's own approval ledger, and the image's release pipeline:
+a build made twice and compared, its SBOM and attestations, the official-digest list and the
+host-side check) are built. M8 closes with its by-hand checks ([manual-checks.md](manual-checks.md)
+items 25-34 and the live Telegram check). No image is published and nothing has been reviewed or
+released: the release checklist before the first pull request into `main` records a security
+review, and the first release, from a tag on `main`, follows that pull request (§11). What is
+deferred or left out is in the register (§12.3). Operating the built parts is in
 [operations.md](operations.md), and the threat model in [threat-model.md](threat-model.md).
 
 ZoeyMCP is a self-hosted proxy that lets AI agents use outside services and MCP servers **without
@@ -398,7 +405,11 @@ volumes: {vault-state: {}, gateway-state: {}}
 Agents use `http://gateway:8090/s/<server>/mcp`, so `gateway.hosts` lists `gateway`. The key can
 also come from `ZOEYMCP_GATEWAY_KEY_FILE`, a file the gateway reads at start, on `SIGHUP`, and
 after a vault refusal (at most once every 10 s). There is no key-handoff endpoint: a fetch
-authenticated by the old key would hand the new key to whoever stole the old one.
+authenticated by the old key would hand the new key to whoever stole the old one. The shipped
+file keeps the key in the environment, which M8's review of the concessions kept: Compose refuses
+a `secrets:` entry sourced from the environment for a read-only service, and one sourced from a
+file is one more file for the operator to manage on the host, so the file form is documented as
+the stronger option ([operations.md](operations.md) §38).
 
 - **`agents` must be internal too.** A non-internal network would give the gateway internet egress
   through the back door. Docker doesn't publish ports from internal-only networks, so LAN access
@@ -452,10 +463,13 @@ Optional compose profiles:
 - Caddy terminates TLS, so it **sees client tokens**. It holds no other secret.
 - Caddy runs as uid 10004, read-only, `cap_drop: [ALL]`, `no-new-privileges`, tmpfs `/config`. A
   one-shot `lan-init` with only `CHOWN` and no network makes the data volume its own. Two
-  concessions to Docker: compose can't place a config file in a read-only container, so the
-  Caddyfile comes in an environment variable and is written to tmpfs at start; and the image's
-  `caddy` binary carries the file capability `cap_net_bind_service`, which it can't be executed
-  without, so the bounding set keeps `NET_BIND_SERVICE` (it listens on 8443 and doesn't use it).
+  concessions to Docker, both kept by M8's review ([operations.md](operations.md) §38 lists every
+  concession with its reason): compose can't place a config file in a read-only container
+  without a bind mount (a `configs:` entry from content or the environment meets the same refusal
+  as a `secrets:` one), so the Caddyfile, which holds no secret, comes in an environment variable
+  and is written to tmpfs at start; and the image's `caddy` binary carries the file capability
+  `cap_net_bind_service` (rechecked on the pinned digest), which it can't be executed without, so
+  the bounding set keeps `NET_BIND_SERVICE` (it listens on 8443 and doesn't use it).
 
 ## 4. The vault
 
@@ -2856,6 +2870,14 @@ grant.
 ## 10. Repository layout
 
 ```text
+.github/
+  workflows/    CI (lint and types, tests, the portal on Windows, the image and its smoke test,
+                the image release dry run), mutation testing, the advisory scan of the lock, and
+                from M8 the release (release.yml: a `v*` tag on `main` only)
+  actions/build-image/
+                the one image build the release and its dry run share (M8): built twice and
+                compared, the SBOM and provenance, the label and identity checks, the scan,
+                the recipes (oci.py reads the layouts)
 deploy/
   compose.yaml            standard tier (single container), with the lan profile
   compose.hardened.yaml   hardened tier (§3.4), with the lan and egress-proxy profiles
@@ -2914,6 +2936,9 @@ src/zoeymcp/
   egress/       the CONNECT-only allowlist proxy: connect rules (pure), allowlist, listeners,
                 tunnels, main
 profiles/       provider profiles, one per acceptance shape
+release/        digests.txt: each official release's digests, one line per release (M8)
+scripts/        the image smoke test (smoke-image.sh), the host-side official-image check
+                (check-official-image.sh, M8) and the mutation-testing scripts
 tests/
   fakes/        fake providers, one per shape; the fake MCP server, OAuth server, stdio server,
                 SMTP server, CONNECT proxy, resolver, allowlist, authenticator and browser
@@ -2945,9 +2970,13 @@ Dockerfile      multi-stage, hashed requirements, non-root, read-only friendly
 | M6 | **Portal v2:** tool-drift review and re-pin, reusing M7's review screen and fragments, with both definitions verified by the vault; declined tools and the new-tool signal; the gateway's status report on Home and in health; clearing marks from the portal; moving a tool from `approve` to `allow`; the strict YAML loader; **managed mode** with sealed revisions, the seed and its guard, history, structured diffs, rollback, export and import over the admin socket and offline, the ratchet, lockout recovery and the restore witness; the portal's edit set (review saves, onboarding's saves, giving a server to an existing client, a connector's limits and pause), with connector constraints a host import; prompts, resources and completions per server; the shipped compose files in managed mode | S12 (the portal's review), S17, S18; portal tests |
 | M8 | **Vault-enforced approvals** (§6.4); out-of-band approvers in the vault (Telegram, the portal queue); image publishing with digests and SBOM, the official-image check on the host and the reproducible-build check | S3 end to end as the approver; S13/S15 again under `vault_approval`; S19–S21 (a vault-held call, the portal queue approver, `pending` and `check_approval`) |
 
-M1 to M7 are built. After M5 the order was **M7, then M6, then M8**: an OAuth-protected remote
-MCP server matters more to a declarative deployment than managed mode, and M7's first-time review
-and fragments are what M6's drift review and re-pin reuse. Each milestone ships with its effect
+M1 to M8 are built; M8 closes with its by-hand checks ([manual-checks.md](manual-checks.md) items
+25-34 and the live Telegram check). After M5 the order was **M7, then M6, then M8**: an
+OAuth-protected remote MCP server matters more to a declarative deployment than managed mode, and
+M7's first-time review and fragments are what M6's drift review and re-pin reuse. M8 is the last
+feature milestone: after it come the release checklist (with a recorded security review) and the
+test-debt, docs and CI hygiene passes, then the first pull request into `main` and the first
+release, which publishes the first image (§12.3). Each milestone ships with its effect
 tests and its shapes' acceptance tests. Nothing merges with a failing mutation run on the policy
 modules. From M6 `mode` stays required, so nothing switches silently: the README's quickstart and
 both `deploy/` compose files say `managed`, while the examples (the existing-stack compose file
@@ -3108,57 +3137,78 @@ what moving a tool to `allow` does to a prompt already waiting for it.
 | The image smoke's deliberate breaks | every new managed row, and the earlier rows never shown failing (the egress role's, the portal alias's, the bridge's stop order), each shown failing under a break and passing once restored | §8.2 |
 | Mutation floors | the standing rule held: every pure module M6 added is at 95%, and so are the review-path modules it touched (sanitizing, connection states) | §8.2 |
 
+### 12.1.5 Decided for M8 (2026-11-01)
+
+The project owner answered six M8 questions before its design (one milestone; no browser harness;
+no image pushed from `dev`; whom out-of-band approvers serve; `vault_approval` as a per-tool field
+with its own way off; `pending` and `check_approval`) and took the recommended option on all forty
+asked after it. One answer waited on the build: whether Compose can hand the hardened tier's keys
+over as files. It can't for a read-only service, so the keys stay in the environment.
+
+| Question | Decision | Where |
+| --- | --- | --- |
+| One milestone or two | one: approvals first, image publishing last, with no dependency between them | §11 |
+| Browser checks of the Approvals queue | no browser harness in M8: by-hand items written so they can be scripted later, run once at M8's close | §8.2, [manual-checks.md](manual-checks.md) |
+| Where the image is published from | never from `dev`: a release workflow that runs on a `v*` tag, refuses a commit that isn't on `main` and pushes under a protected environment; every push to `dev` or `main` and every pull request runs the same build as a dry run that pushes nothing | §3.1, §8.2, [operations.md](operations.md) §37 |
+| Releases | SemVer 0.x, the first release 0.1.0; `ghcr.io`; GitHub artifact attestations, so no signing key to hold; amd64 only; one image (the bridge and derived recipes build on it); `release/digests.txt`; immutable releases | §3.1, [operations.md](operations.md) §37 |
+| A reproducible build | built twice from scratch and compared, in M8 | §8.2 |
+| Whom out-of-band approvers serve | the vault's held calls and, for a client the operator marks, the gateway's own `approve` prompts, relayed and labelled as the gateway's text | §6.3 |
+| The mark | per client, `approvals.out_of_band`, off by default; a client that is `attended` or `out_of_band` may call a `vault_approval` tool | §6.3, §6.4 |
+| Turning `vault_approval` off | a per-tool field; on is a narrowing in any save; off only through `tool.vault_approval_off` (one tool, or every writer of one held connector, per passkey) or a host import with `--accept-widening`; any rollback that would drop a held tool is refused, and a resume that would drop one refuses the start | §4.6, §6.4 |
+| Long waits | a call blocks up to `approvers.block_seconds` (120 s by default), then answers `pending <ref>`, an error result with no `structuredContent` (a known deviation, [clients.md](clients.md)); the gateway's `check_approval` tool, a reserved name, hands the result over once to the client that asked, and with no `id` lists that client's own calls; MCP tasks wait for SDK and client support | §6.3 |
+| Capacity | one waiting approval per client, server and tool; out-of-band waits count against `max_pending_per_client`; an identical call gets its `pending <ref>` again | R44, §5.2 |
+| The result store | bounded per client as well as in all; a client over its bound loses its own oldest results, never another client's, and a store full of other clients' results refuses the new call | §6.3, [operations.md](operations.md) §36.4 |
+| The vault's caps | constants: 64 held calls, 4 per tool, hourly limits and a cooldown | §6.4 |
+| Restarts and stops | waits live in memory only, so a restart withdraws them (R41); a gateway stop detaches its pending-mode waits; the vault's stop window is 330 s, and the standard tier's launcher waits 670 s in all, inside compose's 680 s | §3.3, §6.3 |
+| Several surfaces | every enabled one shows each approval; the first valid decision wins; a per-tool approver is backlog (D-38) | §6.3 |
+| The `approvers` block | top level and host-only, outside the gateway's view, its three waits mirrored into the view; `gateway.approvals.approver` stays, `elicitation` only | §9 |
+| The Telegram message | the whole rendered text, in one preformatted block with link previews off; no bytes changed for bare URLs (D-44), and Telegram alone gets a defanged copy only if the live check finds links made inside the block | §6.3 |
+| Finding the operator's Telegram ids | `zoeymcp approver telegram enrol` on the host: a one-time `/start` link and a confirmation code typed on the host, over its own short-lived Bot API session and egress allowance; a press key per vault process and no offset file | §6.3, §7.5 |
+| The host CLI | lists, shows and withdraws; never decides | §7.5 |
+| The portal queue | Approve with a passkey, Deny with the session; not meant for phones, since Telegram is the phone surface; `approvals.js` with a 400-line cap of its own, and the static files' cap raised to 160 KiB | §7.1 |
+| Toolkits under `vault_approval` | a toolkit's write to a held connector is held by the vault, the connector held for all its writers or none; toolkit writes only block, up to the server's `call_timeout` less 30 s (D-242) | §5.3, §6.4 |
+| Mirrored parameter headers | an `Mcp-Param-*` header on a held call is refused, by the gateway up front (D-241) | §6.4 |
+| Relayed decisions | recorded in the vault's own approval chain | §4.6, §6.3 |
+| Acceptance shapes | three new ones, S19-S21 | §8.1 |
+| An emergency stop of the Telegram approver | revoke the token first; no pause command | [operations.md](operations.md) §35 |
+| The live Telegram check | by hand, once, at M8's close | [manual-checks.md](manual-checks.md) |
+| The keys in files (decided by the build) | Compose refuses a `secrets:` or `configs:` entry sourced from the environment for a read-only service, so the gateway and egress keys stay in the environment with their `_FILE` forms documented as the stronger option, and so does the Caddyfile; the master key has no file form yet (D-240) | §3.4, [operations.md](operations.md) §38 |
+| Python dependency updates | the manual process under `exclude-newer`, no Dependabot for Python, and a staleness reminder in the CI hygiene pass | §12.3 (D-96) |
+| Python 3.14 | a unit-only 3.14 leg once the test job is split, with the classifiers; else a cap below 3.14 | §12.3 (D-98) |
+| Mutation shards | balanced by measured time in the CI hygiene pass; 16 until then | §12.3 (D-226) |
+| Before the first release | a recorded security review of the whole diff into `main`; one or two real clients the owner names checked by hand; a `SECURITY.md` pointing at private vulnerability reporting before the first image push | §12.3 (D-108, D-110, D-124) |
+
 ### 12.2 Open
 
 These questions belong to the project owner. Each stays with its item in the register (§12.3), and
 until it is answered the plan follows the default. New questions go there as the build raises
-them.
+them. Every M8 question is answered (§12.1.5); one earlier question is left.
 
 | Key | Question | Default if unanswered |
 | --- | --- | --- |
-| D-44 | Should bare URLs in approval prompts be refused or defanged, for clients that render Markdown and for M8's approvers? | Decided in M8 |
-| D-54 | Is an example mailbox-reader toolkit part of "useful end to end", and in which milestone? | Unscheduled |
-| D-64 | R52's reproducible-build check: in M8, or an earlier build-twice CI job? | M8 |
-| D-71 | M4's remaining image-smoke rows (a stop during an accepted forward, approved sends in both tiers): closed early as M4 debt, or in M8? | M8 |
-| D-75 | Do M4's approval rows that need a multi-request fake client block the PR into main, or wait for M8? | M8 |
-| D-96 | Python dependency updates: Dependabot with a cooldown, or the manual process with a staleness reminder? (Dependabot's security alerts are on since 2026-10-20.) | The manual process, with a reminder |
-| D-98 | Claim Python 3.14 support, or cap below 3.14 until it is tested? | Cap until tested |
-| D-108 | Which real MCP clients, and which versions, must be checked in [clients.md](clients.md) before the PR into main? | To be named |
-| D-110 | What is the bar for removing the README banner and opening the PR into main? Is a security review required before the first release? | After M8, with a review |
-| D-124 | Should a `SECURITY.md` point at GitHub's private vulnerability reporting? | Yes |
+| D-54 | Is an example mailbox-reader toolkit part of "useful end to end", and must it ship before the first release? | Unscheduled; asked in the release checklist |
 
 ### 12.3 Register of deferred work
 
 Everything deferred, left out or accepted as a limit, with the milestone that plans it or the
 event that brings it back. Keys are never reused or renumbered; an item that is done moves to
 "Closed" and keeps its key. The register is refreshed at the end of each milestone. The few keys
-not listed concern the maintainers' local setup, not ZoeyMCP.
+not listed concern the maintainers' local setup, not ZoeyMCP. M8 is the last feature milestone,
+so no item waits for a milestone any more: each is done, due before the first pull request into
+`main` (the release checklist, or the test-debt, docs or CI hygiene pass), or waits for its
+event or in the backlog, after the first release.
 
 **M6 (Portal v2).** None: every M6 item is done or moved to a later milestone.
 
 **M7.** None: every M7 item is done or moved to a later milestone.
 
-**M8.**
+**M8.** Every other M8 item is done (Closed) or due before the pull request into `main`
+(Triggered). Two close with M8's own last steps:
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-35 | Vault-enforced approvals (R48, `vault_approval`) | M8 |
-| D-36 | Out-of-band approvers (Telegram, the portal queue, `pending` and `check_approval`) | M8 |
-| D-37 | Closing the approval-bypass gaps: a holder of an attended client's token, and a compromised gateway or toolkit | M8 |
-| D-44 | Bare URLs in form-mode prompts | M8 (§12.2) |
-| D-64 | Image publishing: digests, SBOM, the official-image check and the reproducible-build check | M8 (§12.2) |
-| D-65 | The hardened and `lan` concessions (the gateway key in the environment, Caddy's bind capability, the Caddyfile through the environment) | M8, as a review |
-| D-71 | The image smoke's stop during an accepted forward, in both tiers, and the approved-send rows from D-74 | M8 (§12.2) |
-| D-72 | The approval acceptance tests over both vault links | M8 |
-| D-73 | The SMTP shapes (S13, S14) through the gateway in both tiers | M8 |
-| D-75 | A fake client that answers several back-channel requests, and the approval rows that need it | M8 (§12.2) |
-| D-78 | Stress effect tests for H3 and H7 | M8, against both enforcement points |
-| D-96 | Dependabot doesn't cover Python dependencies (an advisory scan of the lock runs on every dev push) | M8, or earlier (§12.2) |
-| D-98 | Python 3.14 isn't in the test matrix | M8, or when 3.14 support is claimed (§12.2) |
-| D-127 | The SMTP send journal records no caller | M8, with D-35 |
-| D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | Each milestone: done for M7 and M6, M8 next |
-| D-162 | Dependabot's docker entry didn't cover the example images | M8, with D-96: the Caddy pin in the compose files (M7 covered the example Dockerfiles) |
-| D-165 | The ledger view's flag for a send with no ledger record can be wrong near its coverage boundary, and the docs overstate it | M8, with D-35 and D-127 |
+| D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | M8's close: the floors of the modules M8 added (done for M7 and M6); afterwards the rule holds for every new decision module |
+| D-224 | No live check of the Telegram approver against the real Bot API | M8's close: by hand, once, beside the Approvals queue's items ([manual-checks.md](manual-checks.md)) |
 
 **Triggered by an event.**
 
@@ -3167,31 +3217,36 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-19 | DPoP and other non-Bearer tokens are unsupported (refused; onboarding refuses a server that requires them before registering) | The first provider that needs them |
 | D-21 | Accepted re-consent windows, and no real-process OAuth crash test | The next change to the store's write path or the token persist step |
 | D-27 | Readable ledger summaries (decided against for now) | After the ledger view is in use, if it isn't useful without them |
-| D-42 | Modern approval records have no early idle expiry, and the docs don't state the cost yet | A modern client that drops approvals without retrying, or reports of blocked `approve` tools |
-| D-43 | Unverified: whether progress keeps a client's idle timer alive during an approval wait | The first non-SDK client checked for [clients.md](clients.md), and before M8's `pending` design is final |
+| D-42 | Modern approval records have no early idle expiry, which keeps a tool busy until the timeout ([operations.md](operations.md) §19 states the cost) | A modern client that drops approvals without retrying, or reports of blocked `approve` tools |
 | D-45 | The protocol floor refuses 2025-03-26 and HTTP+SSE | An operator needs a 2025-03-26 agent or upstream |
 | D-53 | Plain HTTP endpoints (feeds) for toolkits, with capability URLs | The first mailbox-reader toolkit |
 | D-54 | No mailbox-reader toolkit ships | An OAuth read route for a mail API, or the owner's decision (§12.2) |
 | D-57 | Images in toolkit results; `outputSchema` for toolkit tools | The first toolkit that needs them |
 | D-60 | The policy's `extensions` field is left out | The first MCP extension worth supporting |
-| D-70 | A live SMTP smoke test (S13) | The release checklist before the PR into main, or M8 |
+| D-70 | A live SMTP smoke test (S13) | The release checklist before the PR into main |
+| D-72 | The existing approval and toolkit rigs over both vault links (M8's vault-held rows, and every vault endpoint M8 added, run over both) | The test-debt pass before the PR into main |
+| D-73 | The SMTP shapes' failure rows through the gateway (a replay, an unknown answer after the dot, no AUTH before TLS, a proxy stripping STARTTLS), S14's direct case, and a connector hold approved in the real portal queue (M8 runs S13 and S14 through the gateway under both kinds of approval) | The test-debt pass before the PR into main |
+| D-75 | The approval rows that need a fake client answering several back-channel requests in a row (M8 built the fake and the rows about text that imitates a prompt) | The test-debt pass before the PR into main |
 | D-76 | Effect tests for a tool that changes while its call waits (M6 built the rows for a re-pin, an upstream drift and a move to `allow` while a prompt waits) | The test-debt pass before the PR into main |
 | D-77 | End-to-end refusal rows covered only by unit tests | The test-debt pass before the PR into main |
+| D-78 | Stress effect tests for H3 and H7 at the gateway (M8 built the vault's: racing decisions, withdrawals and collections give one forward) | The test-debt pass before the PR into main |
 | D-79 | H16's toolkit-vault size caps are untested | The test-debt pass, or the next change to the toolkit link |
 | D-85 | A recorded by-hand smoke test of a real mail-toolkit deployment | The release checklist |
 | D-86 | Re-check the surviving mutants left as equivalent in M2 and M4 | The test-debt pass before the PR into main |
 | D-95 | The SDK bump procedure, and two pinned SDK-behaviour expected failures | The next `mcp` SDK bump |
-| D-108 | Checks of real MCP clients for approvals | The release checklist (§12.2); revisit at M8 |
-| D-110 | Release readiness: a security review, the first release, versioning, the README banner, the PR into main | "Useful end to end" (§12.2) |
-| D-124 | No `SECURITY.md` or changelog | The release checklist (§12.2) |
+| D-96 | Python dependency updates: the written procedure, a staleness reminder for `exclude-newer`, and a relock right before the first release (an advisory scan of the lock runs on every dev push; no Dependabot for Python, §12.1.5) | The release checklist and the CI hygiene pass before the PR into main |
+| D-98 | Python 3.14 isn't in the test matrix | The CI hygiene pass (a unit-only 3.14 leg) and the release checklist (the classifiers, or a cap below 3.14), §12.1.5 |
+| D-108 | Checks of real MCP clients for approvals, the `pending` answer's error result among them | The release checklist before the PR into main, with one or two clients the owner names (§12.1.5) |
+| D-110 | Release readiness: a security review, the first release, versioning, the README banner, the PR into main | The release checklist, after M8, with a recorded security review of the whole diff (§12.1.5) |
+| D-124 | No `SECURITY.md` or changelog | The release checklist, before the first image push: `SECURITY.md` points at private vulnerability reporting (§12.1.5) |
 | D-126 | The image smoke can't probe the portal from a real LAN host | The release checklist: one by-hand probe of both tiers from another machine |
-| D-144 | Browser checks of the portal not yet run by hand: M6's pages (items 19-24), and Safari, an https origin, a security key and other browsers for the earlier items ([manual-checks.md](manual-checks.md)) | M6's items before M6 closes (they wait on the owner, in Chrome or Edge); the rest before the PR into main |
-| D-145 | certifi trusted roots with compromised intermediates: fixed before M7, and the Debian root dropped from the image in M7; two cleanups are left | `exclude-newer` passing 2026-10-19 (drop certifi's exception); a Debian `ca-certificates` without emSign ECC Root CA - G3 (drop the image's line for it) |
+| D-144 | Browser checks of the portal not yet run by hand: M8's Approvals queue (items 25-34), and Safari, an https origin, a security key and other browsers for the earlier items ([manual-checks.md](manual-checks.md)) | M8's items at its close; the rest before the PR into main |
+| D-145 | certifi trusted roots with compromised intermediates: fixed before M7, and the Debian root dropped from the image in M7; two cleanups are left | `exclude-newer` passing 2026-10-21 (drop certifi's exception); a Debian `ca-certificates` without emSign ECC Root CA - G3 (drop the image's line for it) |
 | D-156 | Client ID Metadata Documents aren't supported | An authorization server that offers only them, or refuses both dynamic registration and a given client |
 | D-159 | The portal's reverse-proxy snippets, the `lan-cert.yaml` override and the 421 and 403 probes were never run against a real proxy | The by-hand checklist before the PR into main |
+| D-162 | Pins no updater covers: the Caddy pin in the compose files, the image smoke's proxy digest, the workflows' uv version and the release build's tool pins | The CI hygiene pass and the release checklist before the PR into main |
 | D-163 | No guide to connecting real agent clients to the gateway | The docs pass before the PR into main, with D-108 |
 | D-191 | The stdio fake's self-test once saw the fake's output end early on Linux (not reproduced) | The test failing in CI, or a bridge test seeing a child's output end early |
-| D-204 | A mutation shard whose first, clean run fails stays green; the failure shows only in the gate | The CI hygiene pass before the PR into main, or the next such failure |
 | D-210 | The onboarding crash tests' second runs can't review, and wait out the vault's 45 s start grace | The test-debt pass before the PR into main |
 | D-211 | Operator docs: a workaround until toolkits have feeds, and a warning that agent runtimes' own connector or MCP-install features reach servers without the gateway (the emergency stops are done in M6: [operations.md](operations.md) §35) | The docs pass before the PR into main, with D-163 and D-108 |
 | D-217 | The gateway's `result_sanitized` log line doesn't count the media it omitted | The consistency pass before the PR into main, or the next change to that line |
@@ -3199,22 +3254,34 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-219 | A managed change that needs a gateway restart isn't walked end to end as processes (the vault-restart half is) | The test-debt pass before the PR into main |
 | D-220 | The Policy page's history diff calls a dropped decline of a kind the newer revision doesn't enable "wider", while the plan that wrote it called it neutral | The next change to the history diff, or the consistency pass before the PR into main |
 | D-221 | About 160 surviving mutants in M6's modules, above their floors, are neither killed nor judged equivalent | The test-debt pass before the PR into main, with D-86 |
+| D-222 | The by-hand browser checks could mostly run as automated tests | The test-debt pass before the PR into main |
+| D-225 | Every leg of the CI test job repeats the slow process tests (M8 raised the job's timeout and set a 75% headroom rule) | The CI hygiene pass before the PR into main |
+| D-226 | CI and mutation testing together need more concurrent jobs than the free plan's 20, and the mutation shards are uneven | The CI hygiene pass before the PR into main: shards balanced by measured time (§12.1.5) |
+| D-228 | A request on a pooled upstream connection that the server's keep-alive just closed fails, and a lost re-listing ends the agents' connection (a held forward is never retried) | The test-debt pass before the PR into main |
+| D-229 | Mutated modules below 95% with no floor, their survivors not yet read | The test-debt pass before the PR into main |
+| D-231 | A reseed killed between its first quarantine move and the new head's rename leaves no head | The docs pass before the PR into main (the recovery lines); a crash-safe reseed is backlog |
+| D-232 | With two bad revision files, the start's chain walk can keep a sibling in place of the real revision (accepted) | The docs pass before the PR into main (the accepted limit); a stricter walk is backlog |
+| D-234 | `zoeymcp review` exits 1 while `review <server>` exits 0 for a tool that is invalid and not included | The test-debt or consistency pass before the PR into main |
+| D-236 | The rollback test for a parent that is gone uses a quarantined parent, not a pruned one | The test-debt pass before the PR into main |
+| D-237 | Repository settings for publishing: a `v*` tag ruleset, immutable releases, a release environment with a reviewer, the package's visibility | The release checklist: before the first `v*` tag (the package's visibility right after the first push) |
+| D-238 | Main's required checks must match the final CI job names | The CI hygiene pass, immediately before the PR into main |
+| D-239 | The MCP tasks extension for long approval waits (M8 answers `pending` and serves `check_approval`, shaped so tasks can be added) | The pinned MCP SDK and at least one mainstream client supporting it |
 
 **Backlog.**
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
 | D-18 | Confirm-before-store of unexpected scopes (an alternative not taken) | Only if D-17 is built and an operator asks |
-| D-38 | More approver back ends (ntfy, Matrix, Web Push) | After M8's approver interface |
+| D-38 | More approver back ends (ntfy, Matrix, Web Push), and a per-tool approver | After the first release: M8's approver interface is the seam |
 | D-39 | Relaying upstream form elicitation (sampling and roots are refused for good since M6) | An upstream an operator needs that elicits |
 | D-40 | Several gateway processes sharing approval state | Only if multi-replica deployment becomes a goal |
-| D-41 | A duplicate-call notice in approval prompts | With M8's approvers |
+| D-41 | A duplicate-call notice in approval prompts | The first duplicate-prompt report (an identical call waiting out of band gets its `pending` ref again, M8) |
 | D-47 | The gateway's session manager keeps the limits it started with: a raised request or idle limit waits for a gateway restart, which every plan says (M6), and its session cap is fixed at 1024 | If operators need a raised limit to apply live |
 | D-48 | A failed call's withdrawn egress registration can fail an identical concurrent call closed (accepted) | Backlog |
 | D-50 | Silent drift is caught only at the next timer check, with no re-list per call (accepted) | Backlog |
 | D-51 | Modern stateful upstreams see one principal for every client (accepted) | If per-client credential binding is ever added |
 | D-52 | Deliberate credential disclosure by an upstream; the standard tier's shared egress (accepted) | Backlog |
-| D-55 | Out-of-process toolkits | After M8's `vault_approval` |
+| D-55 | Out-of-process toolkits | When a toolkit's own data or results must be protected from another toolkit (M8's `vault_approval` holds a toolkit's write to a held connector) |
 | D-56 | Toolkits' outbound network in the standard tier is only documented (accepted); the egress role doesn't confine them either | Backlog |
 | D-61 | An `egress_proxy` change waits for a vault restart, which every plan and health say (M6); nothing rebuilds the clients live | Backlog |
 | D-67 | No live rotation test for Spotify (deliberate) | Backlog |
@@ -3227,10 +3294,10 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-97 | No lint, type or shell checks on `scripts/` and the workflows | The next CI hygiene pass, before the PR into main |
 | D-111 | Markdown clients the prompt guard doesn't anticipate (accepted) | With the client checks (D-108) |
 | D-125 | In the standard tier, sibling containers and the gateway can reach the portal's unauthenticated routes (accepted; the hardened tier is the answer; ZoeyMCP's own bridges are D-151) | Backlog (restated for M6: a relayed setup code now yields a passkey that can save policy) |
-| D-128 | Enrolment links for a second portal origin | With M8 |
+| D-128 | Enrolment links for a second portal origin | A second origin an operator needs (the Approvals queue isn't meant for phones: Telegram is the phone approver, §12.1.5) |
 | D-131 | Mutation testing for the remaining security-relevant modules | Each module when it is next changed for security reasons |
 | D-133 | A liveness probe for static secrets and connectors | Backlog |
-| D-134 | A dev-only headless browser check of the portal's static UI | A script past its cap (`review.js` 700 lines, `app.js` with `webauthn.js` 1,060, the drift review's 450, the managed Policy page's 500) or the static files past 128 KiB in all, or manual checks that keep finding regressions |
+| D-134 | A dev-only headless browser check of the portal's static UI | A script past its cap (`review.js` 700 lines, `app.js` with `webauthn.js` 1,060, the drift review's 450, the managed Policy page's 500, the Approvals page's 400) or the static files past 160 KiB in all, or manual checks that keep finding regressions |
 | D-135 | Other accepted limits of the portal, documented with it | Each when its mitigation changes |
 | D-137 | A leaked sign-in link and a page in the operator's browser can return an attacker's OAuth code first (accepted) | If a provider returns the account identity before the exchange |
 | D-139 | Two portal origins can share one host and port (`http://` and `https://`); the second is unreachable, and `check` doesn't warn | Backlog: a small `check` warning |
@@ -3239,10 +3306,8 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-154 | A recorded by-hand onboarding run against a real OAuth-protected MCP server | Backlog, with D-69: once before a release (recorded "not run" in [manual-checks.md](manual-checks.md)) |
 | D-155 | The dynamic client registration lifecycle (RFC 7592): registration access tokens, deregistration, cleanup of orphaned registrations | A per-client registration limit, or a provider that rotates registered secrets |
 | D-157 | Revocation on replace and re-login (M7 revokes on delete only) | An operator who hits a provider's per-client token limit, or asks |
-| D-158 | The ledger view rereads every kept archive for its first page, with no cache | M8's second vault chain, or slow first pages |
-| D-161 | Mutation shards upload a stats file that nothing reads | The next CI hygiene pass, with D-97 |
-| D-167 | The vault binds its listening sockets before the block that closes them on a setup error | The next change to the vault's startup |
-| D-168 | No test for the step-up routes' 503 when the passkey file is unavailable | A later milestone that reloads the passkey file while running |
+| D-158 | The ledger view rereads every kept archive for its first page, with no cache | Reports of slow Ledger first pages, or a change to how the view computes what its archives cover |
+| D-168 | No test for the step-up routes' 503 when the passkey file is unavailable | A change that reloads the passkey file while the vault runs |
 | D-171 | `health --json` beside `--format json` in every other command | A CLI consistency pass (M6's new commands use `--format`) |
 | D-172 | A token the server refuses reaches the agent as a generic "upstream error" | Backlog |
 | D-173 | Two minor paste and callback test gaps in the listener and framing code | Backlog |
@@ -3261,7 +3326,15 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-202 | Portal onboarding can't register a client again, or remove the client-ID entry a portal discovery leaves | Backlog: cheaper now that portal onboarding saves in managed mode |
 | D-213 | A whole-policy import through the portal (a passkey would then hold every power of a policy document) | If operators without host access need it |
 | D-214 | A policy export holds placeholders, token headers and client token hashes in clear, so it is a secret once it leaves the vault | If operators ask to keep exports in a repository |
-| D-215 | A writer of `/state` holding an older copy of the policy anchor can undo a park (accepted) | With a sealed manifest across the vault's files, or M8's approvals chain |
+| D-215 | A writer of `/state` holding an older copy of the policy anchor can undo a park (accepted) | With restore detection for the vault's approval chain and the SMTP send journal, or a sealed manifest across the vault's files |
+| D-223 | A prompt's or resource template's re-pin logs no `tool_repinned` line | The next change to the gateway's tool logging |
+| D-230 | A crash at one narrow point of a key rotation loses the record of the retired key (accepted) | A rework of the anchor or rotation writes, with D-215 |
+| D-233 | A review report over the whole-report cap only because of its reviewed copies is refused `review_too_large` | Backlog (a docs clause may go in the docs pass) |
+| D-235 | The review screen's "not annotated" chip matches prompt and resource rows, and drifted prompts and resources get no footer line | The next change to the review or drift screen |
+| D-240 | The master key has no `_FILE` form in the hardened compose | The first change to the compose files' secrets |
+| D-241 | A tool that mirrors its parameters into `Mcp-Param-*` headers can't be held by the vault | An operator who needs such a tool under `vault_approval` |
+| D-242 | Toolkit writes under `vault_approval` only block, and never answer `pending` | With D-55 |
+| D-244 | Official images are amd64 only; no arm64 image is published | An operator need for arm64 hosts, after the first release |
 
 **Closed.**
 
@@ -3289,22 +3362,30 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-23 | A credential's last failure isn't shown after a restart | Done in M5: the last failure is read from stored metadata |
 | D-24 | The portal's ledger view, and the authenticated path that carries the gateway's ledger records to the vault | Done in M5: the gateway pushes its records, and the vault keeps a bounded copy that the portal shows |
 | D-25 | The vault's SMTP send journal shown next to the ledger | Done in M5: the ledger view joins the journal and flags sends with no ledger record |
-| D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records are M8 (D-35) |
+| D-26 | No vault-side record of approved HTTP writes and remote MCP calls: an anchor of the reported ledger head, refusing a report that doesn't extend it | Done in M5 (the anchor); vault-side records done in M8: the vault's own approval chain (D-35) |
 | D-28 | The gateway's entry path still loads vault code | Done in M5 |
 | D-29 | Gateway status and drift marks in the portal | Done in M6: a status report the gateway pushes, shown on Home and in health, for tools and for each kind of prompt and resource a server enables (D-216) |
 | D-30 | The bridge for stdio MCP servers (R35, S11) | Done in M7: `zoeymcp bridge`, local MCP routes and `unix:` upstreams, the standard launcher's bridges, the bridge image and its verifier, S11 in every placement; each verifier check and smoke row shown failing under a deliberate break |
 | D-31 | The built-in egress role, the `egress-proxy` profile and `check --emit-egress-allowlist` | Done in M7 |
 | D-32 | MCP onboarding by URL (R21, R22, S9), with the first-time tool review and the YAML fragments | Done in M7: `login --mcp` and the portal's MCP servers page, walked end to end by S9 |
 | D-33 | Provider profiles for S9 and S11 | Done in M7 |
-| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | Done in M5, and held in M7: registration is the vault's, outbound only, and no new listener offers OAuth; the constraint stands through M8 |
+| D-34 | The confused-deputy constraint: no OAuth tokens or client registration for agents, with a test that no listener offers them | Done in M5, and held in M7 and M8: registration is the vault's, outbound only, and no new listener or route offers OAuth |
+| D-35 | Vault-enforced approvals (R48, `vault_approval`) | Done in M8 (§6.4): the vault holds the call, renders the approval from the request itself, asks, forwards exactly what was shown and records it in its own ledger; S13, S15 and S19 run under it |
+| D-36 | Out-of-band approvers (Telegram, the portal queue, `pending` and `check_approval`) | Done in M8 (§6.3): a Telegram bot and the portal's Approvals queue in the vault, `pending <ref>` and `check_approval`; S3 end to end as the approver, S20 and S21 |
+| D-37 | Closing the approval-bypass gaps: a holder of an attended client's token, and a compromised gateway or toolkit | Done in M8, by mechanism and only within scope ([threat-model.md](threat-model.md)): a token holder can't answer its own prompt for a `vault_approval` tool or an `out_of_band` client's `approve` tool, and a compromised gateway or toolkit can't skip a `vault_approval` tool's approval where only the vault can make the call; every other approval stays the gateway's |
+| D-43 | Unverified: whether progress keeps a client's idle timer alive during an approval wait | Decided in M8: progress is sent while a call blocks and never relied on, and past `approvers.block_seconds` a call answers `pending`; real clients are D-108's checks |
+| D-44 | Bare URLs in form-mode prompts | Done in M8: no bytes changed; Telegram gets one preformatted block with link previews off, the portal shows text only, and clients that render Markdown keep today's rule ([clients.md](clients.md)); reopened if the live Telegram check (D-224) finds links made inside the block |
 | D-46 | A modern upstream's tool-list change announced before the gateway's listen stream opened waited for the next timer check | Done in M6: a listing after every open of the stream |
 | D-49 | Designed log events that are never emitted (`server_unsupported`, `vault_link_refused`, `approval_unavailable`) | Done in M7: `server_unsupported` struck as obsolete, since no server kind is left unserved once `kind: bridge` is gone; `vault_link_refused` struck, covered by `policy_fetch_failed` with `status: 403` and `vault_refused`; `approval_unavailable` superseded by `approval_refused` |
 | D-58 | Managed mode: versioned policy, history, rollback, export and import | Done in M6 (§4.6) |
 | D-59 | R31: per-server enable of prompts, resources and completions | Done in M6: each kind enabled per server, pinned, drift-reviewed and served as tools are; sampling and roots refused for good; a server's row says what its upstream offers and isn't served, and how to serve it; resource subscriptions and content pins for prompts without arguments stay out (§12.1.4) |
 | D-62 | A restore of the whole state volume from an older backup goes undetected: documented as a limit | Done in M5 (the docs); detection is D-130 |
 | D-63 | Network filesystems are unsupported for state | Done |
+| D-64 | Image publishing: digests, SBOM, the official-image check and the reproducible-build check | Done in M8 ([operations.md](operations.md) §37): one build for the release and its dry run, made twice and compared, with an SBOM, a scan and attested provenance; `release/digests.txt` and the host-side check; the release guard's proving runs and the dry run's enforced compare land before M8 closes; the first image is published with the first release (D-110) |
+| D-65 | The hardened and `lan` concessions (the gateway key in the environment, Caddy's bind capability, the Caddyfile through the environment) | Done in M8: reviewed, and each kept with its reason and the stronger option ([operations.md](operations.md) §38); the master key's file form is D-240 |
 | D-66 | The live OAuth smoke test has never been run against a real provider: run it once and record the result | Done in M5: the portless redirect works with a real provider, recorded in [manual-checks.md](manual-checks.md) |
 | D-68 | No OAuth acceptance test runs the vault as a separate process | Done in M5: a test runs a real vault process through the portal's connect |
+| D-71 | The image smoke's stop during an accepted forward, in both tiers, and the approved-send rows from D-74 | Done in M8: the derived image's smoke test sends approved mail and stops an accepted send in flight, in both tiers and both kinds of approval |
 | D-74 | Image-smoke rows planned in M4 and not built: `review` of a toolkit through the uid switch, `ledger --verify`, and approved sends in both tiers | Done in M5 (review, ledger); the sends are D-71 |
 | D-80 | The image smoke never reaches an upstream MCP server (S10 against a fake upstream) | Done in M5: a fake upstream over HTTPS in both tiers |
 | D-81 | The `lan` smoke checks one SSE event through Caddy, not that events arrive one by one | Done in M5: the events are checked one by one |
@@ -3317,13 +3398,13 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-99 | The M4 invariants H1-H16 were missing from §8.2 | Done in M5 |
 | D-100 | design.md isn't fully updated for M4 as built (the CLI, layout, policy sketch and test lists) | Done in M5 |
 | D-101 | §6.1 and §6.2 contradicted M4 as built | Done in M5 |
-| D-102 | §3.1 claimed an official-image warning that doesn't exist yet | Done in M5 |
+| D-102 | §3.1 claimed an official-image warning that doesn't exist yet | Done in M5; from M8 the official check is the host's (`scripts/check-official-image.sh`, §3.1) |
 | D-103 | The recovery table in [operations.md](operations.md) lacks the SMTP connector row | Done in M5 |
-| D-104 | The README and the example policy describe unbuilt features as existing | Done in M5: the README says what exists, and M6 and M8 features are marked as planned (M7's since it was built) |
+| D-104 | The README and the example policy describe unbuilt features as existing | Done in M5: the README says what exists, each milestone's features listed once built (M8's included) |
 | D-105 | R38's docs note on clients loading tools lazily | Done in M5 |
 | D-106 | The `lan` profile's own-certificate and ACME alternatives are only mentioned | Done in M5: documented in [operations.md](operations.md) |
 | D-107 | Not every difference between Python's regex and ECMA-262 was listed in the docs | Done in M7: "Reading pinned schemas" in [operations.md](operations.md) §11 |
-| D-109 | This public register | Done in M5; refreshed at the end of each milestone, M7's and M6's included |
+| D-109 | This public register | Done in M5; refreshed at the end of each milestone, M7's, M6's and M8's included |
 | D-112 | Windows hosts' limits aren't recorded as a decision: Linux containers only, Windows and macOS for development | Done in M5: [operations.md](operations.md) lists the supported platforms, with M6's Windows rows |
 | D-115 | Two admin socket answers return a secret (the gateway key, a setup code): recorded as scoped exceptions to R61, absent from every portal route | Done in M5: R61 names the two exceptions |
 | D-116 | No acceptance test or profile for an OAuth credential on a gateway-served remote MCP route | Done in M5: a profile and acceptance tests, by CLI paste and by portal paste |
@@ -3334,6 +3415,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-121 | No machine-readable credential health output | Done in M5: `zoeymcp health --json` |
 | D-122 | No how-to for configuring the operator's own egress proxy (R5) | Done in M7: [operations.md](operations.md) §28 |
 | D-123 | How the portal's static UI is tested | Done in M5: a thin script tested through the API, static checks of the files, and a recorded by-hand checklist |
+| D-127 | The SMTP send journal records no caller | Closed in M8: subsumed by D-35, since a connector route accepts only the gateway; the vault's own approval chain records the approval that released a send |
 | D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | Done in M5; its by-hand checks passed at the start of M7 |
 | D-130 | Detect a restore of the state volume from an older backup | Done in M6: an anchor beside the store, the seed guard and the gateway as restore witness (§4.6); a sealed manifest across every state file wasn't chosen (D-215) |
 | D-132 | M5's safe cuts, if any was taken | Closed in M5: no cut was taken |
@@ -3349,8 +3431,11 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-151 | How the gateway reaches a bridge: a gateway-only vault route with the bridge's own token, in three placements, with confinement in the hardened tier only | Done in M7, with D-30 |
 | D-152 | [threat-model.md](threat-model.md) had no actors or limits for M7's surfaces | Done in M7 |
 | D-160 | Make the Windows portal job a required CI check | Done in M7: a required check on main since it stayed green over M7's runs |
+| D-161 | Mutation shards uploaded a stats file that nothing reads | Done in M8: removed |
 | D-164 | No end-to-end guide to a first hardened deployment, and no recipe for an existing stack with its own egress proxy | Done in M7: [operations.md](operations.md) §29 and §30, and `examples/existing-stack/` |
+| D-165 | The ledger view's flag for a send with no ledger record can be wrong near its coverage boundary, and the docs overstate it | Done in M8: the flag is raised only where the copy has had reports since the send began and the vault's own chain holds no approval of it ([operations.md](operations.md) §21) |
 | D-166 | The gateway's vault-link clients weren't closed at shutdown | Done in M7 |
+| D-167 | The vault binds its listening sockets before the block that closes them on a setup error | Done in M8: one block owns the binds, the setup and the tasks, and closes every bound socket |
 | D-169 | The hardened smoke's alias probe couldn't tell the vault's name from the portal's alias | Done in M7 |
 | D-170 | CI jobs had no `timeout-minutes` | Done in M7: every CI job has one |
 | D-177 | Two Docker networks per hardened bridge count against Docker's default address pools | Done in M7: [operations.md](operations.md) §33 says how many fit and how to widen the pools |
@@ -3369,6 +3454,7 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-200 | Done review jobs and review refusals carried no `next` | Done in M6 |
 | D-201 | A dead review-service setting and the second run's old exec form were kept | Done in M6: removed |
 | D-203 | The required Windows portal job ran a hand-kept test list with no guard | Done in M6: a test checks that every mutated portal module's tests are on it |
+| D-204 | A mutation shard whose first, clean run fails stays green; the failure shows only in the gate | Done in M8: such a shard fails its own job, and the gate names it |
 | D-205 | `opentelemetry-api` 1.45.0 had an advisory (unbounded tracestate parsing), unreachable as built | Done before M6: 1.45.1, with a test that the gateway's server drops the SDK's OpenTelemetry middleware |
 | D-206 | `httpcore` was imported but not declared | Done before M6 |
 | D-207 | The vault's guarded connect waited a full connect timeout per checked address | Done in M6: one deadline across the addresses |
@@ -3376,3 +3462,9 @@ not listed concern the maintainers' local setup, not ZoeyMCP.
 | D-209 | Deliberate-break runs weren't done for the egress role's smoke rows, the portal alias's row and the hardened bridge's stop order | Done in M6: each shown failing under a break and passing once restored |
 | D-212 | Docs: a registration endpoint on a host in `egress_private` passes discovery's check but is refused at connect | Done in M6: [operations.md](operations.md) §11 |
 | D-216 | Drifted prompts and resources weren't shown per kind in the gateway's status report, health and Home, and a server's row didn't say what it offers but isn't served | Done in M6: the status report carries each enabled kind's attention lists, health's findings and Home's items name the kind, and the server's row and `zoeymcp review` name what is offered and not served, with the way to serve it in each mode |
+| D-227 | No guard that test node ids are ones mutation testing can run again | Done in M8: collection refuses an id it couldn't, and one shared helper names parametrized cases |
+| D-243 | The Caddyfile reaches Caddy through the environment (D-65's remainder) | Answered in M8: Compose refuses a `configs:` entry from content or the environment for a read-only service, and one from a file is a bind mount, so the Caddyfile, which holds no secret, stays in the environment ([operations.md](operations.md) §38) |
+| D-245 | Decoding an `Mcp-Name` header with a non-ASCII payload raised instead of refusing it | Done in M8: refused as a header mismatch |
+| D-246 | The egress role's test with the vault unreachable could time out on a loaded runner | Done in M8: its waits cover one full backoff |
+| D-247 | A hardened stop with the `egress-proxy` profile could cut a send the vault was finishing | Done in M8: the vault depends on the egress role, so Compose stops the role after it ([operations.md](operations.md) §31) |
+| D-248 | `check` called the Telegram approver's `egress_private` entry unused | Done in M8: the approver's host counts as one of the vault's destinations |

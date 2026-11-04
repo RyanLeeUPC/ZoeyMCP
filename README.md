@@ -78,7 +78,7 @@ Built so far:
   when it would bring back what was removed unless the host names it. A gateway volume that
   remembers the revisions it saw flags a restored vault. Servers may enable prompts, resources
   and completions, pinned and drift-reviewed like tools.
-- **M8, vault-enforced and out-of-band approvals** (image publishing is still to come): a tool
+- **M8, vault-enforced and out-of-band approvals, and the image's release pipeline:** a tool
   marked `vault_approval` is held by the vault, which reads the call itself (one JSON object,
   nothing ambiguous), renders the approval from it, asks you, and forwards exactly what you saw
   only once you approve, so a compromised gateway can't skip it where only the vault can make the
@@ -90,7 +90,10 @@ Built so far:
   nobody watches) has its prompts asked there too. Long waits answer `pending <ref>`, and the
   agent collects the result once with `check_approval`. The vault keeps its own hash-chained
   approval ledger beside the gateway's, joined on the Ledger page; `zoeymcp approvals` lists,
-  shows and withdraws from the host, and never approves.
+  shows and withdraws from the host, and never approves. A release is built from a `v*` tag on
+  `main` only, twice and compared, with an SBOM, a scan and attested provenance, and
+  `scripts/check-official-image.sh` checks on the host that each ZoeyMCP image you pin is an
+  official release (operations.md §37). No image is published yet.
 
 ## Quickstart (standard tier)
 
@@ -238,8 +241,9 @@ supply-chain cooldown, moved forward deliberately). Moving `exclude-newer` forwa
 ```sh
 uv sync --locked --all-extras                    # the gateway's extra too, as CI does
 uv run pytest                                    # tests, including property tests
-uv run ruff check src tests examples/toolkits    # lint, the paths CI lints
-uv run ruff format src tests examples/toolkits   # format
+# lint, then format, the paths CI lints
+uv run ruff check src tests examples/toolkits examples/bridge .github/actions/build-image
+uv run ruff format src tests examples/toolkits examples/bridge .github/actions/build-image
 uv run mypy                                      # strict type checks
 uv run zoeymcp check --config examples/policy.yaml
 ```
