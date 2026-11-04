@@ -161,6 +161,17 @@ def ledger(gateway: GatewayDeployment, ref: str) -> list[tuple[str, Any]]:
     ]
 
 
+async def closed(running: Running, gateway: GatewayDeployment, ref: str) -> None:
+    """The gateway closed ``ref``'s record: its lock freed and its ``outcome`` written. The lock
+    frees as the ending is decided, before the records (D-250), so a test that reads the ledger
+    waits for both."""
+    table = running.app.approvals.table
+    await until(
+        lambda: table.get(ref) is None and any(k == "outcome" for k, _ in ledger(gateway, ref)),
+        BOUND,
+    )
+
+
 def connection_of(running: Running, client: str) -> Any:
     [found] = [c for c in running.app.pool.connections() if c.key[1] == client]
     return found
@@ -409,7 +420,7 @@ async def test_s21_relayed_then_collected_once(
                 [hold] = await held.surface.holds(1)
                 await decide(gateway, hold)
                 await settled(gateway)
-                await until(lambda: running.app.approvals.table.get(ref) is None, BOUND)
+                await closed(running, gateway, ref)
                 ran = await check(other, ref)
                 collected = await check(owner, ref)
                 again = await check(owner, ref)
@@ -454,7 +465,7 @@ async def test_an_expired_relay_says_so(tmp_path: Path, ca: ProviderCA) -> None:
                 vault = gateway.vault
                 await anyio.to_thread.run_sync(lambda: vault.call(vault.app.sweep_holds))
                 await settled(gateway)
-                await until(lambda: running.app.approvals.table.get(ref) is None, BOUND)
+                await closed(running, gateway, ref)
                 expired = await check(owner, ref)
         gateway.seen.outputs.append(text(expired))
     assert hold.kind == "relay"
@@ -483,14 +494,14 @@ async def test_a_relayed_result_the_clients_bound_evicted_says_it_wasnt_kept(
                 holds = {h.tool: h for h in await held.surface.holds(2)}
                 await decide(gateway, holds["echo"])
                 await settled(gateway)
-                await until(lambda: running.app.approvals.table.get(first) is None, BOUND)
+                await closed(running, gateway, first)
                 size = store.total_bytes()
                 assert size > 0
                 # Room for one result: the next evicts the first (client_bound).
                 monkeypatch.setattr(resultstore, "MAX_CLIENT_BYTES", size * 3 // 2)
                 await decide(gateway, holds["add"])
                 await settled(gateway)
-                await until(lambda: running.app.approvals.table.get(second) is None, BOUND)
+                await closed(running, gateway, second)
                 evicted = await check(owner, first)
                 kept = await check(owner, second)
         gateway.seen.outputs += [text(evicted), text(kept)]

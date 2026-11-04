@@ -487,8 +487,8 @@ async def own_client(rig: Vaulted) -> AsyncIterator[OutOfBandClient]:
 @pytest.mark.parametrize("ending", ["approve", "deny", "expire"])
 async def test_an_ending_closes_the_pending_record(tmp_path: Path, ending: str) -> None:
     """OPS-3, D.2: the agent's call answered pending; the vault ends it with nobody collecting,
-    and the gateway's decisions poller writes its records and frees the lock (a decline and an
-    expiry start the cooldown). A collect afterwards still gets the result, and writes nothing
+    and the gateway's decisions poller frees the lock (a decline and an expiry start the
+    cooldown) and writes its records. A collect afterwards still gets the result, and writes nothing
     again: the record is closed once."""
     approvers = {"portal": {}, "block_seconds": 0, "result_ttl": 1800}
     with anyio.fail_after(BOUND), holding(tmp_path, approvers=approvers) as rig:
@@ -503,7 +503,7 @@ async def test_an_ending_closes_the_pending_record(tmp_path: Path, ending: str) 
             else:
                 await rig.later(3601)
             await rig.settled()
-            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            await rig.closed(ref)
             closed = rig.ledger(ref)
             collected = await client.call_tool("check_approval", {"id": ref})
             later = await client.call_tool("echo", {"text": "again"})
@@ -542,7 +542,7 @@ async def test_an_abandoned_call_is_withdrawn_at_the_vault(tmp_path: Path, versi
                 group.start_soon(lambda: client.call_tool("echo", {"text": "never"}))
                 [hold] = await rig.surface.holds(1)
                 group.cancel_scope.cancel()
-            await until(lambda: rig.running.app.approvals.table.get(hold.ref) is None, BOUND)
+            await rig.closed(hold.ref)
             vault = rig.deployed.vault
             assert vault is not None
             await until(lambda: vault.holds.get(hold.id) is None, BOUND)
@@ -583,7 +583,8 @@ async def test_endings_close_the_records_once_the_approvers_are_removed(tmp_path
             await rig.settled()
             approvals = rig.running.app.approvals
             refs = [ref_of(first), ref_of(second)]
-            await until(lambda: all(approvals.table.get(ref) is None for ref in refs), BOUND)
+            for ref in refs:
+                await rig.closed(ref)
 
             def unapproved() -> bool:
                 snapshot = approvals.fresh()
@@ -623,7 +624,7 @@ async def test_a_detached_wait_answers_pending_and_runs_once_approved(tmp_path: 
             [result] = answer
             await rig.decide(hold)
             await rig.settled()
-            await until(lambda: rig.running.app.approvals.table.get(hold.ref) is None, BOUND)
+            await rig.closed(hold.ref)
             collected = await client.call_tool("check_approval", {"id": hold.ref})
     assert detached == {hold.ref}
     assert PENDING.match(text(result))
@@ -648,12 +649,11 @@ async def test_the_gateways_stop_detaches_its_blocking_held_calls(tmp_path: Path
             async with anyio.create_task_group() as group:
                 answer = await call_in(group, lambda: client.call_tool("echo", {"text": "kept"}))
                 [hold] = await rig.surface.holds(1)
-                app = rig.running.app
                 await rig.running.request_stop()  # on the gateway's loop, as the signal's is
             [result] = answer
             await rig.decide(hold)
             await rig.settled()
-            await until(lambda: app.approvals.table.get(hold.ref) is None, BOUND)
+            await rig.closed(hold.ref)
             [event] = rig.deployed.events("approvals_detached")
     assert PENDING.match(text(result))
     assert ref_of(result) == hold.ref
@@ -1483,7 +1483,7 @@ async def test_a_pending_relay_runs_once_approved_and_is_collected(tmp_path: Pat
             [hold] = await rig.surface.holds(1)
             await rig.decide(hold)
             await rig.settled()
-            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            await rig.closed(ref)
             collected = await client.call_tool("check_approval", {"id": ref})
             twice = await client.call_tool("check_approval", {"id": ref})
             listed = await client.call_tool("check_approval", {})
@@ -1515,7 +1515,7 @@ async def test_a_pending_relay_declined_says_so(tmp_path: Path) -> None:
             [hold] = await rig.surface.holds(1)
             await rig.decide(hold, "deny")
             await rig.settled()
-            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            await rig.closed(ref)
             declined = await client.call_tool("check_approval", {"id": ref})
             later = await client.call_tool("echo", {"text": "no"})
     assert text(declined) == f"{checkapproval.DECLINED} (ref {ref})"
@@ -1539,7 +1539,7 @@ async def test_an_abandoned_relay_is_withdrawn_at_the_vault(tmp_path: Path, vers
                 group.start_soon(lambda: client.call_tool("echo", {"text": "never"}))
                 [hold] = await rig.surface.holds(1)
                 group.cancel_scope.cancel()
-            await until(lambda: rig.running.app.approvals.table.get(hold.ref) is None, BOUND)
+            await rig.closed(hold.ref)
             vault = rig.deployed.vault
             assert vault is not None
             await until(lambda: vault.holds.get(hold.id) is None, BOUND)
@@ -1650,7 +1650,7 @@ async def test_a_pending_relay_the_ledger_refuses_says_so(
             [hold] = await rig.surface.holds(1)
             await rig.decide(hold)
             await rig.settled()
-            await until(lambda: rig.running.app.approvals.table.get(ref) is None, BOUND)
+            await rig.closed(ref)
             collected = await client.call_tool("check_approval", {"id": ref})
             twice = await client.call_tool("check_approval", {"id": ref})
     assert text(collected) == f"{LEDGER_DOWN} (ref {ref})"

@@ -221,6 +221,16 @@ class Vaulted:
                 rows.append(("outcome", (fields["outcome"], fields["detail"])))
         return rows
 
+    async def closed(self, ref: str) -> None:
+        """The gateway closed ``ref``'s record: its lock freed and its ``outcome`` written. The
+        lock frees as the ending is decided, before the records (D-250), so a test that reads
+        the ledger waits for both."""
+        table = self.running.app.approvals.table
+        await until(
+            lambda: table.get(ref) is None and any(k == "outcome" for k, _ in self.ledger(ref)),
+            BOUND,
+        )
+
     def calls(self, name: str = "echo") -> list[dict[str, Any]]:
         return [call.arguments for call in self.deployed.fake.calls if call.name == name]
 
@@ -371,8 +381,7 @@ async def test_pending_then_the_same_ref_then_busy(tmp_path: Path) -> None:
             await rig.decide(hold)
             await rig.settled()
             # The vault's ending closes the record, with nobody collecting (step 12a, OPS-3).
-            table = rig.running.app.approvals.table
-            await until(lambda: table.get(hold.ref) is None, BOUND)
+            await rig.closed(hold.ref)
     ref = ref_of(first)
     assert ref == hold.ref
     assert first.is_error
