@@ -932,15 +932,21 @@ def test_a_new_gateway_epoch_picks_relays_and_legacy_holds(
 # --- saturation ----------------------------------------------------------------------------------
 
 
+def full(table: HoldTable) -> None:
+    """The tool at :data:`MAX_PER_TOOL` live holds, from no reported client (no fairness key)."""
+    for number in range(1, MAX_PER_TOOL + 1):
+        begun(table, 0.0, number, client=None)
+
+
 def test_one_saturation_notice_per_window() -> None:
     table = HoldTable(OPEN)
     assert table.notice(0.0) is None
-    begun(table, 0.0, 1)
-    assert refused(table, 0.0, 2).reason == "busy"
-    assert refused(table, 0.0, 3).reason == "busy"
+    full(table)
+    assert refused(table, 0.0, 11, client=None).reason == "capacity"
+    assert refused(table, 0.0, 12, client=None).reason == "capacity"
     assert table.saturated(0.0) == 2
     assert table.notice(0.0) == 2
-    assert refused(table, 300.0, 4).reason == "busy"
+    assert refused(table, 300.0, 13, client=None).reason == "capacity"
     assert table.notice(300.0) is None
     assert table.notice(599.0) is None
     assert table.saturated(599.0) == 3
@@ -954,13 +960,24 @@ def test_one_saturation_notice_per_window() -> None:
 def test_refusals_are_pruned_without_a_reader() -> None:
     """Z8: a refusal flood is remembered for one window only, whoever polls ``saturated``."""
     table = HoldTable(OPEN)
-    begun(table, 0.0, 1)
-    for number in range(2, 202):
-        assert refused(table, float(number * 6), number).reason == "busy"
+    full(table)
+    for number in range(11, 211):
+        assert refused(table, float((number - 9) * 6), number, client=None).reason == "capacity"
     # A refusal every 6 s for 20 minutes, and no saturated() call: one window's worth is kept.
     assert len(table._refused) == SATURATION_WINDOW / 6
     table.sweep(1206.0 + SATURATION_WINDOW)
     assert len(table._refused) == 0
+
+
+def test_fairness_isnt_saturation() -> None:
+    """D-254: a client's call refused because its earlier one still waits (``held_busy``) is
+    answered as such, but isn't counted as a flood: no saturation, no notice."""
+    table = HoldTable(OPEN)
+    begun(table, 0.0, 1)
+    for number in range(2, 5):
+        assert refused(table, 0.0, number).reason == "busy"
+    assert table.saturated(0.0) == 0
+    assert table.notice(0.0) is None
 
 
 # --- secrets -------------------------------------------------------------------------------------

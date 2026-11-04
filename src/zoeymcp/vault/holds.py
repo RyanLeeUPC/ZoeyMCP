@@ -17,8 +17,10 @@ a check and its transition share one synchronous section on the vault's event lo
   and per (route, tool), an hourly count per (route, tool) and in all, and a cooldown after a deny
   or an expiry. The one cap keyed on the client the gateway reports (one undecided hold per
   reported client, server and tool) is fairness for an honest gateway only, and a call with no
-  reported client has no fairness key. Each cap refusal counts towards
-  the saturation notice, at most one per :data:`SATURATION_WINDOW` (:meth:`HoldTable.notice`).
+  reported client has no fairness key. Each cap refusal but fairness's counts towards the
+  saturation notice, at most one per :data:`SATURATION_WINDOW` (:meth:`HoldTable.notice`): an
+  agent retrying a call that still waits meets fairness in normal use, and that isn't a flood
+  (D-254).
 - **Endings.** A hold that ends leaves the table, and its text with it; its ref and how it ended
   are kept as an :class:`Ending`, up to :data:`RECENT_ENDINGS` refs for :data:`ENDINGS_SECONDS`,
   so a ref is used once (E19, T-10) and a late answer is told what happened (G.6, I.3).
@@ -300,7 +302,8 @@ class HoldTable:
             return CapRefusal("ref_reused")
         refused = self._capped(now, request)
         if refused is not None:
-            self._refused.append(now)
+            if refused.reason != "busy":  # a client's retry while it waits isn't a flood (D-254)
+                self._refused.append(now)
             return refused
         deadline = now + self.limits.timeout
         block = request.block_seconds

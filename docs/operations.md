@@ -4958,7 +4958,9 @@ relayed calls in all and 16 MiB of held bodies, 16 per route, 4 per tool, one wa
 and tool, `gateway.approvals.max_prompts_per_hour` per tool and 300 an hour in all, and
 `gateway.approvals.cooldown` after a deny or an expiry. A cap that refuses raises
 `approvals_saturated` and sends each approver at most one notice per 10 minutes ("The approval
-queue is full: N requests were refused in the last 10 minutes. Nothing was sent."). Results
+queue is full: N requests were refused in the last 10 minutes. Nothing was sent."), except the
+one waiting per client and tool: an agent that calls again while its call waits is answered
+`held_busy`, which isn't counted as a flood. Results
 waiting for `check_approval` are bounded too: 256 calls, 16 per client, 4 MiB per result,
 16 MiB per client and 64 MiB in all. A client over its bound loses its own oldest uncollected
 result first (`approval_result_evicted`), never another client's; a store full of other clients'
@@ -5024,7 +5026,7 @@ definition, so a compromised gateway could hide a held tool's drift from you.
 | Health finding | What it means | What to do |
 | --- | --- | --- |
 | `vault_ledger_unavailable` (error) | the vault can't write its approval chain, so every new held call is refused | check the state volume (full, read-only), or whether the chain's 64 MiB is full of records under 30 days old (the oldest file is pruned once its last record is 30 days old) |
-| `approvals_saturated` (error) | the caps refused calls in the last 10 minutes | if you didn't expect this many, check the gateway |
+| `approvals_saturated` (error) | the caps refused calls in the last 10 minutes (not counting `held_busy`, a client's call while its earlier one waits) | if you didn't expect this many, check the gateway |
 | `approvals_withdrawn_at_start` (info) | the last vault start withdrew calls that were waiting; nothing was sent | `zoeymcp approvals list` or the Approvals page (either clears it, or it clears after 24 hours); the agents call again |
 | `approvals_outcome_unknown` (warning, 24 hours) | approved calls (named by ref) may have run before the vault stopped | check each upstream; see the Ledger |
 | `approver_token_shared` (error) | another secret, or a route's credential, holds the bot's token or the same bot; Telegram isn't started | give the approver a bot of its own (§36.2) |
