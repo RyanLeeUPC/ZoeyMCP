@@ -40,9 +40,11 @@ and again after any change to that feature's page code or to what the vault send
 | Live Telegram | the Telegram approver against Telegram itself (its own section below) |
 
 Items 19-24 are also M6's exit check: each runs once in Chrome or Edge before M6 is done. Items
-25-34 and the live Telegram check are M8's: each runs once, in Chrome or Edge, at M8's exit. Each
-M8 item names the page, what to do and what passes, and ends with a "Scriptable as" line, the
-steps a browser harness would take, so it can be scripted later without being rewritten.
+25-34 and the live Telegram check are M8's. Each M8 item names the page, what to do and what
+passes, and ends with a "Scriptable as" line, the steps a browser harness takes; the browser
+tests run every line of items 25-34 a browser can check (each item names its tests), so at M8's
+exit only the lines each item leaves by hand, and the live Telegram check, are run by hand,
+once, in Chrome or Edge.
 
 ## Items a browser test runs
 
@@ -58,8 +60,8 @@ and the item's runs in Firefox and Safari, whose own passkey stacks the tests do
 
 On a development host, run one test at a time against the installed Chrome, which downloads
 nothing: `uv sync --locked --all-extras --group browser`, then
-`ZOEYMCP_BROWSER=chrome uv run pytest tests/browser/test_session.py::<test>`. Without
-`ZOEYMCP_BROWSER` the directory is skipped.
+`ZOEYMCP_BROWSER=chrome uv run pytest tests/browser/<file>::<test>` (`test_session.py`,
+`test_approvals.py`, `test_managed.py`). Without `ZOEYMCP_BROWSER` the directory is skipped.
 
 ## The setup for every item
 
@@ -569,6 +571,13 @@ agents' calls with any MCP client given the client's token (the MCP Python SDK's
 development environment does), and collect results with `check_approval`. Never a real bot here:
 the live check below is the only run against Telegram.
 
+The browser tests run these items against the same parts in one process
+(`tests/browser/stacks.py`): the vault and its portal on loopback, each held call sent to the
+vault's proxy listener as the gateway sends it (or, for `pending` and `check_approval`, a real
+gateway and an MCP SDK agent in front of it), the vault's own Telegram surface against the fake
+Bot API in process where an item has Telegram, and, for items 31 and 32, a managed vault whose
+server is `notes` and whose approve tool is `write` (the items' `fake` and `echo`).
+
 25. **The queue shows a hostile text whole, under Trusted Types** (the Approvals page, M8). The M8
     setup above. Make held calls to `echo` as `desk` whose arguments carry a bidi mark
     (`\u202e`), a line of 300 characters, a line that reads like the frame
@@ -576,26 +585,44 @@ the live check below is the only run against Telegram.
     `approve` tool (`add`), a relayed prompt; also a relayed text with a line imitating the vault's
     "Rendered by the gateway" line, which the vault refuses `text_refused` before anyone is asked.
     In Chrome or Edge with the Console open, open **Approvals**. Pass: each waiting row opens to
-    its whole text, the bidi mark shown as the vault's visible mark, the long line wrapped and not
-    cut, the imitated frame line inside the JSON as a value; the relayed row carries "Relayed from
-    the gateway" and the vault's line at the top of its text; the imitation never appears; no
-    Trusted Types or Content Security Policy violation.
+    its whole text, the long line wrapped and not cut, the imitated frame line inside the JSON as
+    a value; the call carrying the bidi mark was refused `held_text_refused` before anyone was
+    asked (no hidden character is shown, as a mark or otherwise) and never appears; the relayed
+    row carries "Relayed from the gateway" and the vault's line at the top of its text; the
+    imitation never appears; no Trusted Types or Content Security Policy violation.
     Scriptable as: open Approvals, select each row, assert the `pre`'s `textContent` equals
     `zoeymcp approvals show <ref>`'s text; listen for `securitypolicyviolation`, assert none.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_25_a_hostile_text_is_shown_whole_under_trusted_types` (markup,
+    nested JSON and bare addresses too, and the hostile row's confirm dialog showing the same text
+    whole, unsqueezed; the fakes' zero-width space and hostile text refused like the bidi mark,
+    each naming its value's pointer, and a value past the text budget refused; no dialog or
+    request off loopback); by hand there: nothing.
 26. **Approve with a passkey** (the Approvals page, M8). Item 25's queue, Telegram on (the fake
     Bot API). **Approve** a row. Pass: the dialog shows the whole text and "Approve runs this
     one call, exactly as shown."; one passkey prompt; the answer is 200; the fake's message for
-    that ref becomes "...: decided in the portal" with no buttons; the row moves to **Decided
+    that ref becomes "Approval request <ref>: approved HH:MM UTC in the portal. Sent: ..." with no
+    buttons; the row moves to **Decided
     recently** reading "approved here HH:MM UTC; sent: ok"; the agent's `check_approval` returns
     the call's result once; the log has `step_up_confirmed` with `approval.decide`, then
     `approval_decided` with `via: portal`.
     Scriptable as: click Approve, let a virtual authenticator assert, assert 200 and the row under
     Decided recently; read the fake's messages (`GET /_fake/messages`), assert the edit.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_26_approve_shows_the_whole_text_before_the_passkey_and_sends_it_once`
+    (the fake's message read in process, the held bytes at the upstream once, the vault's records
+    on the Ledger page) and, for `check_approval`, `test_pending_then_check_approval` (a real
+    gateway and agent); by hand there: nothing.
 27. **Cancel at the passkey prompt** (the Approvals page, M8; item 8's cancel path for the queue).
     **Approve** a waiting row, then cancel the browser's passkey prompt. Pass: nothing is decided,
     the row stays under **Waiting**, no `approval_decided` line; **Approve** again works.
     Scriptable as: reject the WebAuthn call, assert the row's state is still waiting and no
     `step_up_confirmed` line.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_27_a_cancelled_passkey_prompt_decides_nothing`, the ceremony
+    failed as a cancelled prompt fails it (the virtual authenticator's user verification off:
+    `NotAllowedError`, "The passkey prompt was cancelled"); by hand there: pressing **Cancel** in
+    the browser's own passkey dialog, which an automated browser doesn't show.
 28. **A stale decision** (the Approvals page, M8). With the confirm dialog of item 26 open, press
     **Approve** for the same ref in the fake Bot API (`POST /_fake/press`). Pass: the confirm is
     refused 409 `already_decided`, "Already decided in Telegram at HH:MM: approved", and nothing
@@ -604,16 +631,38 @@ the live check below is the only run against Telegram.
     and the second tab's confirm is refused.
     Scriptable as: two browser contexts; assert the 409's reason and text; assert the `replaced`
     line in the second prepare.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_28_telegram_deciding_while_the_dialog_is_open_wins` (the press
+    in the fake Bot API), `test_item_28_two_operators_the_second_is_refused` (a second browser
+    confirming second: "Already decided in the portal") and
+    `test_item_28_an_approval_replaces_a_change_prepared_in_another_tab` (a duplicated tab's
+    passkey rename stands in for the review save, which the queue's declarative vault doesn't
+    offer: one prepared action per session either way); by hand there: nothing.
 29. **Deny with a session; an expired row** (the Approvals page, M8). **Deny** a waiting row.
-    Pass: no passkey prompt, the row moves to Decided recently as denied, the agent is told
-    "refused: the operator declined this call", nothing reaches the fake upstream. With
+    Pass: no passkey prompt, the row moves to Decided recently as denied, the agent's
+    `check_approval` reads "declined: the operator declined this call; nothing was sent" (a call
+    still blocking is told "refused: the operator declined this call"), nothing reaches the fake
+    upstream. With
     `approvers.timeout: 60`, leave a row past its deadline: it leaves **Waiting** as expired, and
     an **Approve** opened before then is refused `expired`.
     Scriptable as: click Deny, assert `denied`; wait past a 60 s deadline, assert `expired`.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_29_deny_needs_no_passkey_and_sends_nothing`,
+    `test_item_29_a_row_past_its_deadline_cant_be_approved` (the hold table's clock moved past the
+    deadline with the dialog open) and, for the agent's line,
+    `test_a_pending_call_denied_in_the_browser_is_collected_as_declined`;
+    the blocking call's line is
+    `tests/acceptance/test_vault_approval_shapes.py::test_deny_expire_withdraw`'s (its deny case:
+    the same refusal, whichever surface denies); by hand there: nothing.
 30. **An open queue doesn't keep the session alive** (M8). Leave the Approvals page open and
     untouched for 20 minutes, while its polls run. Pass: the next action lands on the sign-in page
     (the session's idle limit is 15 minutes; the queue's polls don't count as activity).
     Scriptable as: wait 20 minutes with the page open, assert the sign-in page.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_30_an_open_queue_doesnt_keep_the_session_alive` (the page's
+    clock fires its polls, the vault's clock moves the minutes) and
+    `test_a_decision_prepared_in_one_tab_ends_when_another_tab_signs_in` (one tab per browser);
+    by hand there: nothing.
 31. **Turn-on: Hold in the vault** (the MCP servers page and the review screen in managed mode,
     M8). The M8 setup in managed mode, `echo` in `approve` and not yet in `vault_approval`. Pass:
     the server page's **Hold in the vault** on `echo` shows, before any passkey prompt, the plan's
@@ -624,6 +673,11 @@ the live check below is the only run against Telegram.
     a host step, operations.md §36.2".
     Scriptable as: open the server page, click Hold, assert the plan's lines before
     `navigator.credentials.get`; with no approver, assert `disabled` and the line.
+    In Chromium and Edge:
+    `test_managed.py::test_item_31_hold_in_the_vault_shows_the_turn_on_plan_before_the_passkey`,
+    `test_item_31_the_review_screens_box_shows_the_same_plan` and
+    `test_item_31_with_no_approver_both_controls_are_disabled` (a vault started with no
+    `approvers`); by hand there: nothing.
 32. **Turn-off and its refusals** (managed mode, M8). With `echo` held: **Turn off vault approval**
     prepares `tool.vault_approval_off`, and the dialog shows "echo: vault_approval off. The gateway
     will ask instead of the vault; a compromised gateway could then skip the approval. Calls
@@ -634,6 +688,12 @@ the live check below is the only run against Telegram.
     `rollback_drops_vault_approval`.
     Scriptable as: click Turn off, assert the dialog text and one change; untick in review and
     save, assert the refusal and no WebAuthn call; roll back, assert the refusal.
+    In Chromium and Edge:
+    `test_managed.py::test_item_32_turn_off_shows_its_sentence_and_changes_one_tool`,
+    `test_item_32_a_review_save_that_drops_the_hold_is_refused_before_the_passkey`,
+    `test_item_32_a_rollback_that_drops_the_hold_is_refused_before_the_passkey` and
+    `test_item_32_a_connectors_writers_turn_off_in_one_step_up` (a held connector's writers on and
+    off with one passkey each); by hand there: nothing.
 33. **Home and the badge** (Home, M8). With two calls waiting, Home lists "2 approvals waiting: the
     oldest must be answered by HH:MM UTC" with **Open the queue**, and the nav's Approvals entry
     shows 2; with no gateway status report (the gateway stopped) the item still shows. After a
@@ -641,12 +701,21 @@ the live check below is the only run against Telegram.
     with a long count), the restarted vault's Home shows `approvals_withdrawn_at_start` (cleared by
     opening Approvals) and `approvals_outcome_unknown` naming the running call's ref. Scriptable
     as: open Home, assert the items and their actions; assert the badge's number.
+    In Chromium and Edge:
+    `test_approvals.py::test_item_33_home_lists_the_waiting_calls_and_the_starts_findings` (with
+    and without the gateway's status report; the restart's findings drawn from the recovery's
+    result, whose kill and restart `tests/acceptance/test_held_crash.py` runs in processes on
+    Linux) and `test_an_arrival_shows_within_one_poll` (a new call counted within one poll); by
+    hand there: nothing.
 34. **The Ledger's two chains** (the Ledger page, M8). After items 26 and 25's relayed call is
     approved in the fake Bot API. Pass: the held call is one row with asked (gateway, where vault),
     decided accept via Telegram or the portal (written by the vault), the outcome and
     `approved_elsewhere` (the gateway's), each marked with its writer; the relayed call's row
     shows the gateway's outcome; no "the chains disagree" flag.
     Scriptable as: open Ledger, assert the two rows and their per-writer cells.
+    In Chromium and Edge: `test_approvals.py::test_item_34_the_ledger_joins_both_chains` (the
+    relayed call approved in the fake Bot API, the gateway's records posted to the vault as the
+    gateway reports them); by hand there: nothing.
 
 ## Live Telegram approver
 
