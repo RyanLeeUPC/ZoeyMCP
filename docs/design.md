@@ -2588,12 +2588,16 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
     reader, the gateway's routing decision and approval rules, the Telegram wire rules and the
     portal's approvals view; and earlier modules M8 changed for security reasons hold or gain
     their 95% floor (the approval text, the ledger format, the gateway's approval core and egress
-    rules, the vault's internal endpoint table and health, the bridge's admission, and the
-    policy checks, planner, diff, ledger join and ledger view).
+    rules, the allowlist derivation, the vault's internal endpoint table and health, the bridge's
+    admission, the portal's actions, and the policy checks, planner, diff, ledger join and ledger
+    view). At M8's close each of them scores 95% or more under its floor, and so does every other
+    mutated module M8 changed.
 
   Security-relevant modules that hold mostly I/O (the vault's and gateway's apps and servers, the
-  admin socket, the upstream pool, the toolkit loader, the CLI, and from M6 the policy store and
-  the managed write path) are covered by effect tests instead.
+  admin socket, the upstream pool, the toolkit loader, the CLI, from M6 the policy store and the
+  managed write path, and from M8 the vault's chain, committed registry and Telegram approver and
+  the gateway's Elsewhere path, out-of-band client and `check_approval` tool) are covered by
+  effect tests instead.
 - **SDK contract tests** (`tests/sdk/`) pin what the gateway relies on in the MCP SDK (no
   capability declared without a callback, server → client requests answered with errors,
   cancellation, concurrent calls, session expiry, parsed schemas, golden wire output, session
@@ -2604,8 +2608,20 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   header deadline and connection cap, pre-bound sockets) (M5); and, from M6, what the strict
   loader relies on in PyYAML, what the revisions' encryption relies on in `cryptography`'s
   AES-GCM, and the SDK's prompt, resource and completion parsing and handlers.
-- **Release checks:** dependency hashes, image content-hash label, SBOM, and a reproducible-build
-  check.
+- **Release checks:** dependency hashes, the image's source-tree label checked against the
+  commit, an SBOM, and a reproducible build. The image job builds every commit twice more from
+  scratch and reports whether the two platform manifest digests match, which they do. The job
+  `image release dry run` runs the release's own build action (`.github/actions/build-image`) on
+  every push to `dev` or `main` and every pull request and pushes nothing: two builds compared,
+  the SBOM extracted, the label and identity checks, an OS-package scan as a report only, the
+  bridge and derived recipes built on the candidate and verified, and the host check run against
+  a fixture digest list. Its compare stays a report until its own builds, which also carry
+  provenance and an SBOM, first match; then it is enforced, as `release.yml` always enforces it.
+  `tests/unit/test_release_workflow.py` reads the workflows and the action (the release's only
+  trigger, each job's exact permissions, every remote `uses:` pinned by SHA, no push in the
+  action), and `tests/acceptance/test_official_check.py` runs the host check,
+  `scripts/check-official-image.sh`, against fixture compose files and a fixture digest list,
+  with `gh` and Compose stubbed (Linux).
 
 ## 9. Policy sketch
 
@@ -3203,11 +3219,10 @@ event or in the backlog, after the first release.
 **M7.** None: every M7 item is done or moved to a later milestone.
 
 **M8.** Every other M8 item is done (Closed) or due before the pull request into `main`
-(Triggered). Two close with M8's own last steps:
+(Triggered). One closes with M8's own last step:
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
-| D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | M8's close: the floors of the modules M8 added (done for M7 and M6); afterwards the rule holds for every new decision module |
 | D-224 | No live check of the Telegram approver against the real Bot API | M8's close: by hand, once, beside the Approvals queue's items ([manual-checks.md](manual-checks.md)) |
 
 **Triggered by an event.**
@@ -3430,6 +3445,7 @@ event or in the backlog, after the first release.
 | D-150 | The onboarding YAML: its form, and one emitter for untrusted strings | Done in M7: one change object and one emitter for every fragment |
 | D-151 | How the gateway reaches a bridge: a gateway-only vault route with the bridge's own token, in three placements, with confinement in the hardened tier only | Done in M7, with D-30 |
 | D-152 | [threat-model.md](threat-model.md) had no actors or limits for M7's surfaces | Done in M7 |
+| D-153 | Mutation testing as a standing rule for each milestone's new decision modules (the rule is in §8.2 and §12.1.2) | Done in M8: every module M8 added, and every earlier one it changed for security reasons, is at 95% or more with its floor (done for M6 and M7 before it); the rule goes on holding for every new decision module |
 | D-160 | Make the Windows portal job a required CI check | Done in M7: a required check on main since it stayed green over M7's runs |
 | D-161 | Mutation shards uploaded a stats file that nothing reads | Done in M8: removed |
 | D-164 | No end-to-end guide to a first hardened deployment, and no recipe for an existing stack with its own egress proxy | Done in M7: [operations.md](operations.md) §29 and §30, and `examples/existing-stack/` |
