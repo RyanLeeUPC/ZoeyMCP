@@ -3229,14 +3229,8 @@ event or in the backlog, after the first release.
 
 **M7.** None: every M7 item is done or moved to a later milestone.
 
-**M8.** Every other M8 item is done (Closed) or due before the pull request into `main`
-(Triggered). Two close within M8: D-222 with its browser-test steps, D-224 with M8's own last
-step:
-
-| Key | Item | Target or trigger |
-| --- | --- | --- |
-| D-222 | The by-hand browser checks could mostly run as automated tests (the harness and its CI jobs are built, with items 3, 4, 6, 10, 11 and 12) | M8: items 25-34, then items 1-24, as browser tests |
-| D-224 | No live check of the Telegram approver against the real Bot API | M8's close: by hand, once, beside the Approvals queue's items ([manual-checks.md](manual-checks.md)) |
+**M8.** None: every M8 item is done (Closed) or due before the pull request into `main`
+(Triggered).
 
 **Triggered by an event.**
 
@@ -3293,6 +3287,7 @@ step:
 | D-237 | Repository settings for publishing: a `v*` tag ruleset, immutable releases, a release environment with a reviewer, the package's visibility | The release checklist: before the first `v*` tag (the package's visibility right after the first push) |
 | D-238 | Main's required checks must match the final CI job names | The CI hygiene pass, immediately before the PR into main |
 | D-239 | The MCP tasks extension for long approval waits (M8 answers `pending` and serves `check_approval`, shaped so tasks can be added) | The pinned MCP SDK and at least one mainstream client supporting it |
+| D-249 | The pinned Python base image has fixed High advisories, so a release's image scan would refuse it | The release checklist: refresh the base digest and re-run the release dry run until its scan has nothing gating |
 
 **Backlog.**
 
@@ -3490,9 +3485,17 @@ step:
 | D-209 | Deliberate-break runs weren't done for the egress role's smoke rows, the portal alias's row and the hardened bridge's stop order | Done in M6: each shown failing under a break and passing once restored |
 | D-212 | Docs: a registration endpoint on a host in `egress_private` passes discovery's check but is refused at connect | Done in M6: [operations.md](operations.md) §11 |
 | D-216 | Drifted prompts and resources weren't shown per kind in the gateway's status report, health and Home, and a server's row didn't say what it offers but isn't served | Done in M6: the status report carries each enabled kind's attention lists, health's findings and Home's items name the kind, and the server's row and `zoeymcp review` name what is offered and not served, with the way to serve it in each mode |
+| D-222 | The by-hand browser checks could mostly run as automated tests | Done in M8: items 1-34 run in Chromium on Linux and Edge on Windows on every push ([manual-checks.md](manual-checks.md)); what only a person can check stays by hand |
+| D-224 | No live check of the Telegram approver against the real Bot API | Done in M8: run by hand at M8's close on Telegram Desktop and Android; no client makes a link inside the prompt's block |
 | D-227 | No guard that test node ids are ones mutation testing can run again | Done in M8: collection refuses an id it couldn't, and one shared helper names parametrized cases |
 | D-243 | The Caddyfile reaches Caddy through the environment (D-65's remainder) | Answered in M8: Compose refuses a `configs:` entry from content or the environment for a read-only service, and one from a file is a bind mount, so the Caddyfile, which holds no secret, stays in the environment ([operations.md](operations.md) §38) |
 | D-245 | Decoding an `Mcp-Name` header with a non-ASCII payload raised instead of refusing it | Done in M8: refused as a header mismatch |
 | D-246 | The egress role's test with the vault unreachable could time out on a loaded runner | Done in M8: its waits cover one full backoff |
 | D-247 | A hardened stop with the `egress-proxy` profile could cut a send the vault was finishing | Done in M8: the vault depends on the egress role, so Compose stops the role after it ([operations.md](operations.md) §31) |
 | D-248 | `check` called the Telegram approver's `egress_private` entry unused | Done in M8: the approver's host counts as one of the vault's destinations |
+| D-250 | A tool's lock was still held for a moment after its pending call's result was collected | Done in M8: the gateway frees the lock as soon as it learns the call's ending |
+| D-251 | A save on the MCP servers page lost its confirmation as soon as the rows were drawn again | Done in M8: the status line is cleared only when the page shown changes |
+| D-252 | A confirmation code pasted at the hidden enrolment prompt could end the enrolment | Done in M8: what isn't six digits is asked for again and never sent |
+| D-253 | Health called the Telegram approver's token unreferenced and said to delete it | Done in M8: the approver's token counts as used |
+| D-254 | One call refused because the same client's call still waited read as a flood | Done in M8: that fairness refusal answers `held_busy` and isn't counted as saturation |
+| D-255 | The fake Bot API left `edit_date` unset on a buttons-only edit | Done in M8: it sets it, as Telegram does |
