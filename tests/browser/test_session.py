@@ -1,6 +1,7 @@
-"""Sessions, Fetch Metadata, the IP-literal redirect, a neighbour port, Trusted Types and a second
-port, in a real browser: manual items 3 (the lines a browser can run), 4, 6, 10, 11 and 12
-(M8 design step 27a; D-222).
+"""Enrolment, sessions, Fetch Metadata, the IP-literal redirect, a passkey's host name, a neighbour
+port, Trusted Types and a second port, in a real browser: manual items 1 and 3 (the lines a
+browser can run), 4, 6, 7 (its second origin through an in-process TLS front), 10, 11 and 12
+(M8 design steps 27a and 27c; D-222).
 
 The harness's own proof: each test drives the portal's real page with the browser's own
 WebAuthn stack (a CDP virtual authenticator) against the real vault and portal on loopback
@@ -22,11 +23,14 @@ import httpx
 import pytest
 from playwright.sync_api import BrowserContext, Error, Page, expect
 
+from tests.portal.flows import ENROL_FINISH
 from zoeymcp.portal.sessions import SESSION_IDLE
 
+from .engines import FRONT
 from .layout import assert_no_horizontal_overflow
 from .passkeys import CdpAuthenticator
 from .portal import (
+    NOT_ALLOWED,
     asks_to_sign_in,
     open_portal,
     open_section,
@@ -68,6 +72,21 @@ def clock() -> Clock:
 def clocked(tmp_path: Path, clock: Clock) -> Iterator[PortalRig]:
     """The rig on a clock the test moves (the idle limit)."""
     with portal(tmp_path, clock=clock) as running:
+        yield running
+
+
+@pytest.fixture
+def front(front_tls: tuple[Path, Path]) -> Iterator[Forwarder]:
+    """Item 7's TLS front, for ``https://<FRONT>:<its port>``."""
+    with Forwarder(tls=front_tls) as bound:
+        yield bound
+
+
+@pytest.fixture
+def fronted(tmp_path: Path, front: Forwarder) -> Iterator[PortalRig]:
+    """The portal with a second origin over https, the TLS front's, in its origins."""
+    with portal(tmp_path, extra_origins=[f"https://{FRONT}:{front.port}"]) as running:
+        front.start(running.address)
         yield running
 
 
@@ -129,6 +148,25 @@ def answers(context: BrowserContext, page: Page) -> Callable[[], dict[str, int]]
         return {asked[key]: status for key, status in statuses.items() if key in asked}
 
     return read
+
+
+# --- item 1: the algorithm the enrolment chose -------------------------------------------------
+
+
+def test_item_1_the_enrolment_answer_and_the_log_say_es256(rig: PortalRig, page: Page) -> None:
+    """Item 1's lines a browser can run: "the enrolment answer (Network panel) and
+    ``passkey_enrolled`` in the log show ``"alg": "ES256"``, and the prompt opened from the click
+    (no ``NotAllowedError`` from a missing user gesture)". The virtual authenticator makes P-256
+    keys only, so which algorithm a real platform authenticator or a security key picks stays by
+    hand."""
+    with page.expect_response(lambda answer: answer.url.endswith(ENROL_FINISH)) as finished:
+        passkeys = set_up(page, rig)
+    assert finished.value.status == 200
+    assert finished.value.json()["passkey"]["alg"] == "ES256"
+    [line] = rig.lines("passkey_enrolled")
+    assert (line["alg"], line["rp_id"], line["via"]) == ("ES256", "localhost", "setup_code")
+    assert [event for event, _ in passkeys.events] == ["credentialAdded", "credentialAsserted"]
+    expect(page.locator("#error")).to_be_hidden()
 
 
 # --- item 3: sessions across reloads and tabs ----------------------------------------------------
@@ -259,6 +297,35 @@ def test_item_6_a_loopback_literal_redirects_to_localhost(rig: PortalRig, page: 
     assert redirect.status == 308
     assert redirect.headers["location"] == f"{rig.origin}/"
     asks_to_sign_in(page)
+
+
+# --- item 7: a passkey belongs to its host name --------------------------------------------------
+
+
+def test_item_7_a_passkey_enrolled_on_localhost_isnt_offered_on_another_name(
+    fronted: PortalRig, front: Forwarder, page: Page
+) -> None:
+    """Item 7: "With a passkey enrolled on ``http://localhost:8081``, open
+    ``https://zoeymcp.tailnet.example/`` and choose **Sign in with a passkey**. Pass: the browser
+    doesn't offer the ``localhost`` passkey (it offers none, or only ones enrolled on that
+    name)", over an https origin the browser trusts (the TLS front, ``engines.FRONT``). The
+    sign-in fails as a prompt with nothing to choose does, nothing is asserted, and a passkey
+    enrolled on that name then signs in there, so the origin itself works. By hand: real LAN
+    https with a certificate the machine trusts."""
+    rig = fronted
+    passkeys = set_up(page, rig)
+    there = f"https://{FRONT}:{front.port}"
+    open_portal(page, there)
+    press(page, "Sign in with a passkey")
+    expect(page.locator("#error")).to_have_text(NOT_ALLOWED)
+    asks_to_sign_in(page)
+    assert passkeys.asserted() == 1  # the localhost sign-in only
+    set_up(page, rig, name="tailnet", origin=there, passkeys=passkeys)
+    assert sorted(credential["rpId"] for credential in passkeys.credentials()) == [
+        "localhost",
+        FRONT,
+    ]
+    assert [line["rp_id"] for line in rig.lines("portal_login")] == ["localhost", FRONT]
 
 
 # --- item 10: a neighbour on another localhost port ----------------------------------------------

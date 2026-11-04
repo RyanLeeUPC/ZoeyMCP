@@ -6,7 +6,20 @@ gateway in process against the MCP fake) and :class:`ManagedVault` (a vault proc
 acceptance rigs, for the later items. Two small servers of the harness's own, each on loopback
 with its socket bound before the test names its port: :class:`Neighbour`, a page on another
 ``localhost`` port (manual item 10), and :class:`Forwarder`, a byte-for-byte forwarder from a
-second port to the portal's listener, as an SSH tunnel is (item 12).
+second port to the portal's listener, as an SSH tunnel is (item 12), or, given a certificate, a
+TLS front there, as a TLS proxy in front of the portal is (item 7, ``engines.FRONT``).
+
+The review screen's items (step 27c, 16 and 19-24) play the gateway's side on the vault's loop,
+as ``tests/portal/test_review.py`` does: :func:`listed` is what the fake MCP server lists with the
+switches and drift an item names, and :func:`review_at_head` the gateway's review of it under the
+running policy's view of notes, with the reviewed copies a gateway's ``defs/`` would hold.
+
+Onboarding by URL (step 27c, items 17, 18 and 23): :func:`onboarding` is the rig with the vault's
+own onboarding service on an in-process network, as ``tests/portal/test_onboard.py`` builds it (the
+MCP server's model at ``mcp.notes.example``, a stateful ``FakeAuthServer`` at
+``auth.notes.example`` that publishes its metadata and registers clients), that fake also served
+over https at ``engines.PROVIDER`` on loopback, its endpoints there, so the browser follows its
+sign-in link to the provider's own site and back to the portal's callback.
 
 The Approvals queue's stacks (step 27b, items 25-30, 33 and 34): :func:`queue` is the portal rig
 holding calls, as ``tests/portal/test_approvals_queue.py`` runs it, with the calls sent as the
@@ -25,6 +38,7 @@ import contextlib
 import hashlib
 import http.server
 import socket
+import ssl
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -37,26 +51,35 @@ from unittest import mock
 
 import httpx
 from anyio.from_thread import BlockingPortal, start_blocking_portal
+from mcp.types import Tool
 
 from tests.acceptance.gateway import SERVER, GatewayDeployment
 from tests.acceptance.procs import ManagedVault
 from tests.acceptance.test_mcp_shapes import KEY, text
 from tests.acceptance.test_vault_approval_shapes import gateway_on, queue_policy, ref_of
 from tests.fakes.harness import serve
-from tests.fakes.mcp_server import McpFake
+from tests.fakes.mcp_server import Drift, DriftMember, McpFake, Switch
+from tests.fakes.oauth_server import FakeAuthServer
 from tests.fakes.telegram import BotApi, Person, Stored
 from tests.gateway import holdrig
 from tests.gateway.rig import agent, until
 from tests.portal.rig import Clock, PortalRig
 from tests.portal.rig import running as portal
+from tests.portal.test_onboard import CLIENT_ID, ISSUER, Hosts, onboarding_service
+from tests.unit.test_review import reviewed
 from zoeymcp.common import approvaltext, canonical
+from zoeymcp.common.policy.merge import Merged, merge, replace_paths
 from zoeymcp.common.policy.schema import hash_token
-from zoeymcp.gateway import checkapproval
+from zoeymcp.common.policy.view import ViewRemoteServer, build_view
+from zoeymcp.common.yamlload import load_mapping
+from zoeymcp.gateway import checkapproval, pins
 from zoeymcp.vault import netclient, telegramwire
 from zoeymcp.vault import telegram as telegram_approver
 from zoeymcp.vault.app import GATEWAY_HEADER
 from zoeymcp.vault.holds import Hold
 from zoeymcp.vault.store import origin_binding
+
+from .engines import PROVIDER
 
 __all__ = [
     "Clock",
@@ -65,11 +88,15 @@ __all__ = [
     "GatewayQueue",
     "ManagedVault",
     "Neighbour",
+    "Onboarding",
     "PortalRig",
     "QueueStack",
     "gateway_queue",
+    "listed",
+    "onboarding",
     "portal",
     "queue",
+    "review_at_head",
 ]
 
 CHUNK = 65536
@@ -154,9 +181,14 @@ class Neighbour:
 class Forwarder:
     """Forwards each connection to ``port`` to ``target``, byte for byte in both directions, and
     keeps the browser's ``Host``. Bind it first (``Forwarder()``), name its port in the portal's
-    origins, then :meth:`start` it once the target listens."""
+    origins, then :meth:`start` it once the target listens. With ``tls`` (a certificate and key
+    file), it is a TLS front: each connection's TLS ends here and its bytes go on in plain."""
 
-    def __init__(self) -> None:
+    def __init__(self, tls: tuple[Path, Path] | None = None) -> None:
+        self._tls: ssl.SSLContext | None = None
+        if tls is not None:
+            self._tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self._tls.load_cert_chain(*tls)
         self._sock = bound()
         self.port: int = self._sock.getsockname()[1]
         self._threads: list[threading.Thread] = []
@@ -178,20 +210,39 @@ class Forwarder:
                 client, _ = self._sock.accept()
             except OSError:
                 return  # closed
-            try:
-                upstream = socket.create_connection(target, timeout=10)
-            except OSError:
-                client.close()
-                continue
-            upstream.settimeout(None)
             with self._lock:
                 if self._closed:  # accepted as close() ran: nothing pumps it
                     client.close()
-                    upstream.close()
                     return
-                self._open.extend((client, upstream))
-            self._spawn(self._pump, client, upstream)
-            self._spawn(self._pump, upstream, client)
+                self._open.append(client)  # so close() can wake its handshake
+            self._spawn(self._connect, client, target)
+
+    def _connect(self, client: socket.socket, target: tuple[str, int]) -> None:
+        """One connection, on its own thread so a stalled one holds up no other: its TLS ended
+        here first (with ``tls``; a handshake not done in 10 s is dropped), then its upstream,
+        pumped both ways."""
+        if self._tls is not None:
+            try:
+                client.settimeout(10)
+                client = self._tls.wrap_socket(client, server_side=True)
+                client.settimeout(None)
+            except OSError:  # a handshake the browser gave up on, or never started
+                client.close()
+                return
+        try:
+            upstream = socket.create_connection(target, timeout=10)
+        except OSError:
+            client.close()
+            return
+        upstream.settimeout(None)
+        with self._lock:
+            if self._closed:  # connected as close() ran: nothing pumps it
+                client.close()
+                upstream.close()
+                return
+            self._open.extend((client, upstream))
+        self._spawn(self._pump, client, upstream)
+        self._spawn(self._pump, upstream, client)
 
     @staticmethod
     def _pump(source: socket.socket, sink: socket.socket) -> None:
@@ -225,6 +276,101 @@ class Forwarder:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+# --- the fake MCP server's tools, as the gateway reviews them (step 27c) -------------------------
+
+
+def listed(*switches: Switch, drift: DriftMember | None = None) -> list[Tool]:
+    """The tools the fake MCP server lists with ``switches``, changed by ``drift`` (its second
+    listing), as the gateway reads them."""
+    fake = McpFake(switches=set(switches), drift=None if drift is None else Drift(drift))
+    return [Tool.model_validate(wire) for wire in fake.tools_for(None, 2)]
+
+
+def review_at_head(rig: PortalRig, tools: list[Tool], copies: list[Tool]) -> dict[str, Any]:
+    """The gateway's review of notes listing ``tools`` under the running policy's view of notes,
+    holding a reviewed copy (``defs/``) of each of ``copies``' definitions."""
+    view = build_view(rig.vault.app.policy).gateway.servers["notes"]
+    assert isinstance(view, ViewRemoteServer)
+    held = (pins.project_and_pin(found) for found in copies)
+    return reviewed(tools, view, defs={each.pin: dict(each.definition) for each in held})
+
+
+# --- onboarding by URL (step 27c) ---------------------------------------------------------------
+
+
+@dataclass
+class Onboarding:
+    """The running rig, the provider's fake, and its origin as the browser reaches it (its
+    endpoints under it, at the path :func:`onboarding` chose)."""
+
+    rig: PortalRig
+    auth: FakeAuthServer
+    provider: str
+
+    @property
+    def endpoints(self) -> str:
+        """Where the provider's endpoints are: its origin, and their path."""
+        base = self.auth.endpoint_base
+        assert base is not None
+        return base
+
+    def commit(self, fragment: str) -> None:
+        """A fragment merged into the policy file as ``check --with`` merges it, then reloaded
+        (``SIGHUP``)."""
+        base = load_mapping(self.rig.policy_file.read_bytes().decode("utf-8"))
+        merged = merge(base, load_mapping(fragment), replace=replace_paths(fragment))
+        assert isinstance(merged, Merged)
+        self.rig.reload(merged.data)
+
+
+@contextlib.contextmanager
+def onboarding(
+    tmp_path: Path,
+    tls: tuple[Path, Path],
+    *,
+    policy: dict[str, Any] | None = None,
+    authorize_length: int = 0,
+) -> Iterator[Onboarding]:
+    """The rig with ``policy`` (managed, say) and the vault's onboarding service on the in-process
+    network (``tests/portal/test_onboard.py``'s ``Hosts``); the provider's fake (registration
+    open) served over https with ``tls`` for the browser, its endpoints at
+    ``https://<PROVIDER>:<its port>``, under a path that makes the authorization endpoint
+    ``authorize_length`` characters long when one is given (manual item 17's longest a policy
+    takes), and reached in process by the vault's token client."""
+    auth = FakeAuthServer(
+        time.time,
+        client_id=CLIENT_ID,
+        issuer=ISSUER,
+        iss_supported=True,
+        rotate=True,
+        scopes=("notes.read", "offline_access"),
+        registration="open",
+        prefix="fake-notes",
+    )
+    made: dict[str, Any] = {}
+
+    async def served(scope: Any, receive: Any, send: Any) -> None:
+        await made["app"](scope, receive, send)  # the fake's app, once its port is known
+
+    with serve(served, tls=tls) as url:
+        provider = f"https://{PROVIDER}:{url.rsplit(':', 1)[1]}"
+        path = ""
+        if authorize_length:
+            path = "/" + "p" * (authorize_length - len(f"{provider}//authorize"))
+        auth.endpoint_base = provider + path
+        made["app"] = auth.app()  # serves the endpoints under the path too
+        hosts = Hosts(auth)
+
+        def exchanges(*_: object) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=auth.app()))
+
+        with (
+            mock.patch.object(netclient, "token_client", exchanges),
+            portal(tmp_path, policy=policy, onboard=onboarding_service(hosts)) as rig,
+        ):
+            yield Onboarding(rig, auth, provider)
 
 
 # --- the Approvals queue (step 27b) --------------------------------------------------------------

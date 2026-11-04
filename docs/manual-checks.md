@@ -44,7 +44,8 @@ Items 19-24 are also M6's exit check: each runs once in Chrome or Edge before M6
 passes, and ends with a "Scriptable as" line, the steps a browser harness takes; the browser
 tests run every line of items 25-34 a browser can check (each item names its tests), so at M8's
 exit only the lines each item leaves by hand, and the live Telegram check, are run by hand,
-once, in Chrome or Edge.
+once, in Chrome or Edge. Items 1-24 name their tests too (M8 step 27c), each keeping only what a
+browser test can't show.
 
 ## Items a browser test runs
 
@@ -61,7 +62,16 @@ and the item's runs in Firefox and Safari, whose own passkey stacks the tests do
 On a development host, run one test at a time against the installed Chrome, which downloads
 nothing: `uv sync --locked --all-extras --group browser`, then
 `ZOEYMCP_BROWSER=chrome uv run pytest tests/browser/<file>::<test>` (`test_session.py`,
-`test_approvals.py`, `test_managed.py`). Without `ZOEYMCP_BROWSER` the directory is skipped.
+`test_stepup.py`, `test_callback.py`, `test_review.py`, `test_drift.py`, `test_managed.py`,
+`test_approvals.py`). Without `ZOEYMCP_BROWSER` the directory is skipped.
+
+Where an item needs an `https` site, the tests serve it on loopback under a test name with a
+certificate from a throwaway CA the browser trusts by its key, so nothing reaches the network: the
+fake OAuth provider at `auth.notes.example` (items 13, 14, 18, 23) and a TLS front to the portal at
+`zoeymcp.tailnet.example` (item 7). The fakes run in the test's own process: the fake MCP server's
+definitions reach the vault as the gateway's review reports them (its switches as the items name
+them, its reviewed copies kept or removed as a gateway's `defs/` would be), and the gateway's
+status report is the one the vault keeps.
 
 ## The setup for every item
 
@@ -96,6 +106,10 @@ view.
    **Create the passkey**. Pass: the enrolment answer (Network panel) and `passkey_enrolled` in
    the log show `"alg": "ES256"`, and the prompt opened from the click (no `NotAllowedError` from
    a missing user gesture). Remove the passkey afterwards with `zoeymcp passkeys --remove`.
+   In Chromium and Edge:
+   `test_session.py::test_item_1_the_enrolment_answer_and_the_log_say_es256`, over the virtual
+   authenticator; by hand there: the platform authenticator and the security key (the virtual
+   one makes P-256 keys only, so which algorithm a real one picks shows only by hand).
 2. **Safari with an EdDSA-only key.** In Safari, enrol a security key that only does EdDSA (or
    that is set to). Pass: the enrolment succeeds, `"alg": "EdDSA"`, and the posted
    `public_key` is `null` (Safari's `getPublicKey()` is null for EdDSA; the vault reads the key
@@ -124,7 +138,10 @@ view.
 7. **A passkey belongs to its host name.** With a passkey enrolled on `http://localhost:8081`,
    open `https://zoeymcp.tailnet.example/` and choose **Sign in with a passkey**. Pass: the
    browser doesn't offer the `localhost` passkey (it offers none, or only ones enrolled on that
-   name).
+   name). In Chromium and Edge:
+   `test_session.py::test_item_7_a_passkey_enrolled_on_localhost_isnt_offered_on_another_name`,
+   through an in-process TLS front (and a passkey enrolled on that name then signing in there);
+   by hand there: real LAN `https` with a certificate the machine trusts.
 8. **Step-up shows the summary first** (OAuth connect, step-up). With two passkeys enrolled, open
    **Passkeys**, choose **Rename** on one and give a new name. Pass: the dialog shows what the
    vault will do (the passkey, its name now, the new name) before any passkey prompt; choose
@@ -132,12 +149,19 @@ view.
    cancelled, **Close** it, and the passkey keeps its name (no `passkey_renamed` in the log).
    Then, with the policy below, open **Credentials**, choose **Connect** on `demo`, paste
    `http://127.0.0.1/callback?code=x&state=wrong` and choose **Check the address**. Pass: the
-   dialog says the address belongs to another login, and no passkey prompt opens.
+   dialog says the address belongs to another login, and no passkey prompt opens. In Chromium and
+   Edge:
+   `test_stepup.py::test_item_8_a_rename_shows_its_summary_first_and_a_cancelled_prompt_changes_nothing`
+   (the second passkey on a second authenticator, the cancel a failed user verification) and
+   `test_item_8_a_mismatched_paste_is_refused_with_no_prompt`; by hand there: pressing **Cancel**
+   in the browser's own passkey dialog, which an automated browser doesn't show.
 9. **The authorization link** (OAuth connect). Add the policy below to `portal.yaml`, restart the
    vault and sign in. Open **Credentials** and choose **Connect** on `demo`, then the dialog's
    link. Pass: it opens example.com in a new tab, and in that tab's console `window.opener` is
    `null`; the Network panel shows the request to example.com without a `Referer` header. Close
-   the tab and choose **Cancel** in the dialog.
+   the tab and choose **Cancel** in the dialog. In Chromium and Edge:
+   `test_stepup.py::test_item_9_the_link_opens_a_tab_with_no_opener_and_no_referrer` (example.com
+   answered in the browser, never reached); by hand there: nothing.
 
    ```yaml
    credentials:
@@ -248,17 +272,31 @@ view.
     `redirect_uri` to that origin's `/oauth/callback/<credential>`, reload, and repeat the first
     part from a session on that origin; the cookie is then `__Secure-zoeymcp-cb`, with `Secure`.
     Without such a client, record this part as not run.
+
+    In Chromium and Edge:
+    `test_callback.py::test_item_13_the_provider_sends_the_tab_back_and_a_passkey_connects`,
+    `test_item_13_after_a_consent_page_the_callback_carries_no_session_cookie` and
+    `test_item_13_the_address_opened_in_another_browser_is_refused_while_the_dialog_waits`, the
+    fake provider served over `https` on its own site; by hand there: what the history list shows
+    for the address (no browser API reads it), and the `https` callback address.
 14. **A stale callback address** (the OAuth callback). Take a callback address from item 13 whose
     login has ended (confirmed, cancelled or more than 10 minutes old) and type or paste it into the
     address bar. Pass: the request carries `Sec-Fetch-Site: none`; the refused page shows, with the
     address intact. Start a new **Connect** and paste that address into its dialog. Pass: refused as
     belonging to another login (`state_mismatch`) or as expired (`flow_unknown`), with no passkey
-    prompt.
+    prompt. In Chromium and Edge:
+    `test_callback.py::test_item_14_a_stale_callback_address_is_refused_typed_or_pasted` (a
+    confirmed login's address); by hand there: nothing.
 15. **The secret field isn't saved** (secrets). Sign in, open **Secrets**, enter a name and a
     value, choose **Set the secret**, confirm with the passkey. Pass: the value shows as dots while
     typed (in Chrome, Edge and Safari; other browsers may show it as typed); the browser doesn't
     offer to save it as a password (and no password manager fills or stores it); after the confirm
     the value field is empty; the page's elements (developer tools, Elements) hold no copy of it.
+    In Chromium and Edge:
+    `test_stepup.py::test_item_15_a_secret_is_masked_and_the_page_keeps_no_copy`
+    (the field's computed masking, emptied once sent, and no copy in the page, its fields or its
+    storage); by hand there: whether the browser offers to save it as a password (an automated
+    browser shows no password manager), and Safari's masking.
 16. **The review screen with hostile text, under Trusted Types** (the MCP servers page). A vault
     with its portal and a gateway that polls it (either tier's compose file with an `admin` block,
     say), whose policy serves the fake MCP server as a remote server, connected. Start the fake
@@ -278,6 +316,12 @@ view.
       the selection, and **Generate** counts what is included;
     - **Show definition** shows the whole definition, a long line continuing on marked lines
       under it with nothing cut, and every character outside ASCII as an escape.
+
+    In Chromium and Edge:
+    `test_review.py::test_item_16_a_large_server_counts_filters_and_selects_as_the_vault_says` and
+    `test_item_16_hostile_server_text_shows_as_text_under_trusted_types` (each string's text
+    compared with the vault's answer, and no element on the review screen the page didn't make);
+    by hand there: nothing.
 17. **Copy is the exact fragment** (the MCP servers page). Onboarding never fetches metadata from
     or registers with a provider on a private address, and refuses a single-label host such as
     `localhost` in metadata, so the fakes run under names that a name map gives the vault as
@@ -324,7 +368,10 @@ view.
     unticked, with no client ID. Make fragment 1, then choose **Copy** and paste into a text
     editor. Pass: the pasted text is the shown text, line for line and character for character,
     the 2,048-character URL whole on its line; the same after choosing the compose indent, and for
-    fragment 2.
+    fragment 2. In Chromium and Edge:
+    `test_review.py::test_item_17_copy_puts_exactly_the_shown_fragment_on_the_clipboard` (the
+    browser's clipboard read back after **Copy**; on Windows it holds the text with CRLF line ends)
+    and, for fragment 2, item 18's test; by hand there: pasting into a text editor.
 18. **The callback of a client the vault registered** (item 13 against a client from dynamic
     registration). Continue from item 17, whose fake offers registration (`--registration open`,
     the default): the plan's redirect address is this origin's `/oauth/callback/<credential>`.
@@ -334,6 +381,9 @@ view.
     server's row. Pass: as item 13's first part (the provider sends the tab back to the portal,
     which asks for the passkey), and once connected the page queues the server's review by itself
     (without a gateway polling the vault, the vault answers that request `review_unavailable`).
+    In Chromium and Edge:
+    `test_callback.py::test_item_18_a_registered_clients_callback_connects_and_the_review_queues_itself`
+    (a gateway's poll waiting, so the review runs, and fragment 2 copied); by hand there: nothing.
 19. **The drift review, under Trusted Types** (the review screen's drift rows, M6). Item 16's
     setup, the fake started as `python -m tests.fakes.run_mcp_server CERT KEY --switch large
     --switch markup_echo`, so `echo`'s description ends in markup a pin can hold (`<img src=x
@@ -373,6 +423,14 @@ view.
       committed and reloaded, **Generate** on the old review is refused `review_stale` (this needs
       a reload with the vault running: in the compose tiers a reload is a recreate, which drops
       the review held in memory).
+
+    In Chromium and Edge:
+    `test_drift.py::test_item_19_a_drifted_tool_shows_both_definitions_and_the_diff_as_text`,
+    `test_item_19_accepting_a_definition_no_longer_read_only_proposes_approve`,
+    `test_item_19_without_the_reviewed_copy_the_new_definition_shows_whole` (the gateway's report
+    with its reviewed copies, as a restarted gateway keeps them, and without the old one) and
+    `test_item_19_suggested_after_clear_declines_and_a_stale_review` (`review_stale` after a
+    reload with the vault running); by hand there: nothing.
 20. **Managed saves: the re-pin and approve -> allow summaries** (the review screen's **Save**,
     M6). Item 19's setup with the vault's policy set to `mode: managed` on a fresh state
     directory, so its first start seeds revision 1 from the file (operations.md §34), the fake
@@ -409,6 +467,15 @@ view.
       "Something changed since you prepared this (shown below)" and, under "What the vault finds
       now", "The policy moved to revision N ... press Save again" with the plan on revision N,
       and nothing is written.
+
+    In Chromium and Edge:
+    `test_managed.py::test_item_20_a_managed_review_is_saved_with_a_passkey_and_a_repin_says_so`,
+    `test_item_20_moves_to_allow_come_first_and_close_writes_nothing`,
+    `test_item_20_allow_without_asking_and_select_suggested_after_a_drop`,
+    `test_item_20_allow_without_asking_on_a_vault_holding_no_review_reviews_first` (a vault just
+    started holds no review, as a restarted one does) and
+    `test_item_20_a_second_browser_saving_first_changes_this_ones_confirm`; by hand there:
+    nothing.
 21. **History, a diff and a rollback** (the Policy page in managed mode, M6). Item 20's vault
     after its saves, the fake started with `--switch large --switch markup_echo`, and a client
     added and then removed by two host imports, so the history has a client to bring back: stop
@@ -440,6 +507,12 @@ view.
     - **Roll back to revision N** on the revision with `add` and `slow` at allow, now wider than
       the head: refused before any passkey prompt, "The portal can't widen ... through a
       rollback", with the host's export and import, and nothing is written.
+
+    In Chromium and Edge:
+    `test_managed.py::test_item_21_the_policy_page_names_the_head_and_lists_the_history`,
+    `test_item_21_a_rollback_is_planned_closed_then_confirmed` and
+    `test_item_21_a_rollback_that_revives_or_widens_is_refused_before_the_passkey` (the host's
+    imports written as the admin socket writes them); by hand there: nothing.
 22. **A connector's pause and limits** (the Policy page in managed mode, M6). Item 21's vault,
     stopped, given an SMTP connector by a host import: `zoeymcp policy export --state ./state >
     policy.yaml`, add under `connectors` a connector `mail` in the shape of
@@ -463,6 +536,10 @@ view.
     - a second browser signed in on the same origin pauses it first: this browser's **Resume**
       draws the page again, saying the policy moved to revision N since it showed revision M
       ("press the connector's button again"), and nothing more is written.
+
+    In Chromium and Edge:
+    `test_managed.py::test_item_22_pause_resume_and_limits_each_write_a_revision` and
+    `test_item_22_a_second_browser_pausing_first_draws_the_page_again`; by hand there: nothing.
 23. **Onboarding in managed mode, and Give to clients** (the MCP servers page in managed mode,
     M6). A managed vault on a fresh state directory with a gateway that polls it, the vault
     started through `tests/acceptance/procs.py`'s launcher with item 17's CA and name map, the
@@ -515,6 +592,14 @@ view.
       which it writes as "Acknowledged the restore as revision N + 1."), start the vault: once the
       gateway reports again the banner is gone, and **Policy**'s history shows N + 1 straight after
       2.
+
+    In Chromium and Edge:
+    `test_managed.py::test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step`,
+    `test_item_23_give_to_clients_closes_takes_away_and_meets_a_second_browser` and
+    `test_item_23_a_restored_state_shows_its_banner_on_every_page` (the gateway's status report
+    witnessing a newer revision, the acknowledgment written as the host writes it); by hand
+    there: the state copied aside and put back, and `zoeymcp policy acknowledge-restore` with the
+    vault stopped.
 24. **Prompts and resources on the review screen, under Trusted Types** (the review screen's kind
     rows, M6). Item 16's setup, the fake started as `python -m tests.fakes.run_mcp_server CERT KEY
     --prompts --resources --switch inject_kinds`, so it lists two prompts (`brainstorm`,
@@ -555,6 +640,14 @@ view.
       showing both pins and "re-pinned: you read both definitions"; confirmed with a passkey, the
       vault's log has `step_up_confirmed` with `policy.save`, and an agent on `/s/notes/mcp` lists
       the included prompts.
+
+    In Chromium and Edge:
+    `test_drift.py::test_item_24_prompts_and_resources_are_rows_of_their_own_and_hostile_ones_show_as_text`,
+    `test_item_24_a_changed_prompt_and_template_read_drift_and_clear_unticks_every_kind`,
+    `test_item_24_the_row_and_home_say_what_the_gateway_reports` and
+    `test_item_24_a_managed_save_names_each_kinds_paths_and_a_repin_shows_both_pins`; the agent's
+    listing is `tests/acceptance/test_prompts_resources_shape.py`'s; by hand there: `zoeymcp
+    review notes` and `zoeymcp health` (the CLI, not the page).
 
 The M8 items (25-34) run against item 23's setup (a vault started through
 `tests/acceptance/procs.py`'s launcher and a gateway beside it), managed, its policy adding: the

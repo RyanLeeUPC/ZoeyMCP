@@ -15,7 +15,9 @@ server time is the rig's ``Clock``. When the test fails the trace and a screensh
 page are kept under ``test-results/`` (CI uploads them; they hold only a throwaway vault's codes
 and sessions, never a real secret), and the watch isn't asserted on top of the failure; when it
 passes the watch must be clean, and an unclean watch keeps them too. A second browser
-(``other_context``) keeps its own, beside the first's.
+(``other_context``) keeps its own, beside the first's. The session's two certificates, the TLS
+front's (``front_tls``, for ``engines.FRONT``) and the fake provider's (``provider_tls``, for
+``engines.PROVIDER``), are made before the browser starts, which trusts their keys.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ from . import engines
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, Page, Playwright
+
+    from tests.acceptance.tls import ProviderCA
 
     from .watch import Watch
 
@@ -64,9 +68,40 @@ def playwright() -> Iterator[Playwright]:
 
 
 @pytest.fixture(scope="session")
-def browser(playwright: Playwright) -> Iterator[Browser]:
+def tls_ca(tmp_path_factory: pytest.TempPathFactory) -> ProviderCA:
+    """A throwaway CA made for this session (``tests.acceptance.tls``), which a test's own
+    client trusts to reach the https test names."""
+    from tests.acceptance.tls import make_ca
+
+    return make_ca(tmp_path_factory.mktemp("tls"))
+
+
+@pytest.fixture(scope="session")
+def certificates(tls_ca: ProviderCA) -> dict[str, tuple[Path, Path]]:
+    """A certificate and key for each https test name, from the session's CA."""
+    from tests.acceptance.tls import issue_cert
+
+    folder = tls_ca.ca_file.parent
+    return {name: issue_cert(tls_ca, name, folder) for name in (engines.FRONT, engines.PROVIDER)}
+
+
+@pytest.fixture(scope="session")
+def front_tls(certificates: dict[str, tuple[Path, Path]]) -> tuple[Path, Path]:
+    return certificates[engines.FRONT]
+
+
+@pytest.fixture(scope="session")
+def provider_tls(certificates: dict[str, tuple[Path, Path]]) -> tuple[Path, Path]:
+    return certificates[engines.PROVIDER]
+
+
+@pytest.fixture(scope="session")
+def browser(
+    playwright: Playwright, certificates: dict[str, tuple[Path, Path]]
+) -> Iterator[Browser]:
+    trusted = tuple(engines.spki(certificate) for certificate, _ in certificates.values())
     try:
-        options = engines.launch_options(ENGINE)
+        options = engines.launch_options(ENGINE, trusted=trusted)
     except ValueError as error:
         raise pytest.UsageError(str(error)) from None
     launched = playwright.chromium.launch(**options)

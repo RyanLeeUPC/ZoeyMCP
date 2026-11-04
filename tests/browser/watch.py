@@ -6,7 +6,9 @@ Python through a binding, so a navigation loses none), each console error, each 
 error, each dialog (dismissed at once: the portal never opens one) and each request. The
 context's fixture calls :meth:`Watch.assert_clean` when the test ends: no violation, no dialog,
 no request off loopback, and no console or page error but those the test allowed, each by a
-pattern and the page it comes from (a neighbour's page of its own, say).
+pattern and the page it comes from (a neighbour's page of its own, say). A host a test answers in
+process, by a route of its context (item 9's provider page), isn't off loopback: the request
+never leaves the browser.
 
 The init script runs outside the page's CSP (it goes through the DevTools protocol) and uses no
 Trusted Types sink, so recording a violation never makes one.
@@ -26,7 +28,7 @@ from .engines import LOOPBACK, NAMES
 BINDING = "zoeyHarnessViolation"
 # The browser's own request for a page's icon, which the portal doesn't serve: headless Chromium
 # logs its 404 as a console error, though the page never made the request.
-FAVICON = re.compile(r"status of 404 .*\(http://[^/)]+/favicon\.ico\)$")
+FAVICON = re.compile(r"status of 404 .*\(https?://[^/)]+/favicon\.ico\)$")
 RECORDER = (
     "window.addEventListener('securitypolicyviolation', (event) => {"
     f" window.{BINDING}({{directive: event.violatedDirective, blocked: event.blockedURI,"
@@ -43,6 +45,7 @@ class Watch:
     dialogs: list[tuple[str, str]] = field(default_factory=list)
     requests: list[Request] = field(default_factory=list)
     allowed: list[tuple[re.Pattern[str], str]] = field(default_factory=list)
+    answered: set[str] = field(default_factory=set)
 
     def attach(self, context: BrowserContext) -> None:
         """Record every page ``context`` opens from now on."""
@@ -83,8 +86,8 @@ class Watch:
         return [request for request in self.requests if request.method == "POST"]
 
     def stray(self) -> list[str]:
-        """Each request to a host that isn't a test name or loopback."""
-        hosts = {*NAMES, *LOOPBACK}
+        """Each request to a host that isn't a test name, loopback or answered in process."""
+        hosts = {*NAMES, *LOOPBACK, *self.answered}
         return [
             request.url
             for request in self.requests

@@ -72,10 +72,12 @@ class CdpAuthenticator:
 
         return record
 
-    def add_authenticator(self) -> str:
+    def add_authenticator(self, transport: str = "internal") -> str:
         """Another authenticator on the page (two passkeys, say): its id. The last one added
-        with presence simulated answers; :meth:`answering` picks."""
-        added = self._cdp.send("WebAuthn.addVirtualAuthenticator", {"options": OPTIONS})
+        with presence simulated answers; :meth:`answering` picks. Chrome takes one platform
+        (``internal``) authenticator a page, so a second is a security key (``usb``)."""
+        options = {**OPTIONS, "transport": transport}
+        added = self._cdp.send("WebAuthn.addVirtualAuthenticator", {"options": options})
         identifier: str = added["authenticatorId"]
         return identifier
 

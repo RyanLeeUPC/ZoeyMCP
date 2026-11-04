@@ -8,14 +8,24 @@ sleep. A setup code is issued as ``zoeymcp setup-code`` gets one, on the vault's
 from __future__ import annotations
 
 import re
+import sys
+from collections.abc import Callable
+from typing import Any
 
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Response, Route, expect
 
 from tests.portal.flows import issue
+from tests.portal.test_review import SERVER_URL, gateway_answers
 
 from .passkeys import CdpAuthenticator
 from .stacks import PortalRig
 
+# What the page says when the browser's passkey prompt failed with NotAllowedError (app.js's
+# BROWSER_TEXT): a cancelled prompt, or none for this address to choose.
+NOT_ALLOWED = (
+    "The passkey prompt was cancelled or timed out, or no passkey for this address was chosen. "
+    "Try again."
+)
 # The Approvals page's own timers (approvals.js), in milliseconds of page time: its lists, read
 # while it is open, and the nav's count, read while signed in.
 LISTS_EVERY = 5_000
@@ -47,12 +57,21 @@ def press(page: Page, name: str) -> None:
     page.get_by_role("button", name=name, exact=True).click()
 
 
-def set_up(page: Page, rig: PortalRig, *, name: str = "laptop") -> CdpAuthenticator:
+def set_up(
+    page: Page,
+    rig: PortalRig,
+    *,
+    name: str = "laptop",
+    origin: str = "",
+    passkeys: CdpAuthenticator | None = None,
+) -> CdpAuthenticator:
     """The first visit, as item 11 runs it: **I have a setup code**, a fresh code, the passkey's
-    name, **Create the passkey**, then **Sign in with the new passkey**. Returns the page's
-    authenticator, which holds the new passkey."""
-    passkeys = CdpAuthenticator(page)
-    open_portal(page, rig.origin)
+    name, **Create the passkey**, then **Sign in with the new passkey**; on the rig's origin
+    unless ``origin`` names another of its origins, with a new authenticator unless ``passkeys``
+    is the page's already. Returns the page's authenticator, which holds the new passkey."""
+    passkeys = passkeys or CdpAuthenticator(page)
+    origin = origin or rig.origin
+    open_portal(page, origin)
     press(page, "I have a setup code")
     page.get_by_label("Setup code").fill(issue(rig))
     press(page, "Use this code")
@@ -60,7 +79,7 @@ def set_up(page: Page, rig: PortalRig, *, name: str = "laptop") -> CdpAuthentica
     press(page, "Create the passkey")
     expect(page.get_by_text("Passkey enrolled.")).to_be_visible()
     press(page, "Sign in with the new passkey")
-    signed_in(page, rig.origin)
+    signed_in(page, origin)
     return passkeys
 
 
@@ -84,6 +103,102 @@ def open_section(page: Page, name: str) -> None:
 
 def session_cookie(rig: PortalRig) -> str:
     return f"zoeymcp-{rig.portal_port}-session"
+
+
+# --- the review screen (steps 27b, 27c) ----------------------------------------------------------
+
+
+def server_row(page: Page, label: str) -> Locator:
+    """A row of **MCP servers**, by its words (``notes (remote)``, say)."""
+    return page.locator("#server-list > li").filter(has_text=label)
+
+
+def held_review(
+    page: Page,
+    rig: PortalRig,
+    report: dict[str, Any] | Callable[[], dict[str, Any]],
+    start: Callable[[], None],
+) -> dict[str, Any]:
+    """``start`` queues a review (a row's **Review tools** or **Review again**, or a managed
+    save's confirm, after which the screen reviews the server again), and the review screen's
+    first poll is held until the gateway's side has answered it with ``report``
+    (``tests/portal/test_review.py``'s way, on the vault's loop; made then, if it is a function,
+    so a save's new head is in it), so that poll draws the review: the job's answer, as the page
+    read it.
+
+    The poll is held, not left to the screen's timer: review.js asks once right after queueing,
+    and a tick that fires while that ask is still out is skipped, so a paused clock moved on
+    once could leave the review undrawn (CI's Chromium did, on 6b9d45c)."""
+
+    def answered(route: Route) -> None:
+        gateway_answers(rig, report() if callable(report) else report)
+        route.continue_()
+
+    def polled(answer: Response) -> bool:
+        return answer.request.method == "GET" and "/api/review/jobs/" in answer.url
+
+    page.route("**/api/review/jobs/*", answered, times=1)
+    with page.expect_response(polled) as first:
+        start()
+    expect(page.locator("#review-body")).to_be_visible()
+    read: dict[str, Any] = first.value.json()
+    assert read["state"] == "done", read
+    return read
+
+
+# --- fragments, the clipboard and onboarding by URL (step 27c) ---------------------------------
+
+
+def clipboard(page: Page) -> str:
+    """What the browser's clipboard holds now. Windows' clipboard keeps text with CRLF line ends,
+    so a paste there is the text line for line; elsewhere it is the text as written."""
+    text: str = page.evaluate("navigator.clipboard.readText()")
+    return text.replace("\r\n", "\n") if sys.platform == "win32" else text
+
+
+def confirmed(answer: Response) -> bool:
+    return answer.request.method == "POST" and answer.url.endswith("/confirm")
+
+
+def fragment_text(page: Page) -> str:
+    """The fragment as the page shows it, character for character."""
+    expect(page.locator("#fragment")).to_be_visible()
+    shown = page.locator("#fragment-text").text_content()
+    assert shown is not None
+    return shown
+
+
+def shows(page: Page, text: str) -> None:
+    """Wait until the fragment shown is ``text`` exactly (``to_have_text`` folds whitespace,
+    and two indents differ only in it)."""
+    page.wait_for_function(
+        "(text) => document.getElementById('fragment-text').textContent === text", arg=text
+    )
+
+
+def copied(page: Page) -> str:
+    """**Copy**, then what the clipboard holds."""
+    press(page, "Copy")
+    expect(page.locator("#status")).to_have_text("Copied the fragment.")
+    return clipboard(page)
+
+
+def register_by_url(page: Page) -> str:
+    """**Add a server by URL** with the notes server's URL ("This server is on my network"
+    unticked, no client ID), **Discover**, then the plan's **Register and make the YAML** with
+    the passkey: fragment 1, as the vault answered it."""
+    open_section(page, "MCP servers")
+    page.get_by_label("The server's MCP URL").fill(SERVER_URL)
+    expect(page.get_by_label("This server is on my network", exact=False)).not_to_be_checked()
+    press(page, "Discover")
+    expect(page.locator("#plan-title")).to_have_text("What the vault found")
+    page.locator("#plan-next").get_by_role("button", name="Register and make the YAML").click()
+    expect(confirm_dialog(page)).to_be_visible()
+    with page.expect_response(confirmed) as made:
+        confirm(page)
+    expect(confirm_dialog(page)).to_be_hidden()
+    yaml: str = made.value.json()["diff"]["yaml"]
+    return yaml
 
 
 # --- the Approvals queue (step 27b) --------------------------------------------------------------
