@@ -1,7 +1,9 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
+    # The workflows, and the build action's own pins: a composite action in a folder of its own
+    # is updated only when its folder is listed.
+    directories: [/, /.github/actions/build-image]
     schedule:
       interval: weekly
     cooldown:

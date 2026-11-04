@@ -28,8 +28,13 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
       - run: uv sync --locked --all-extras --python 3.13
-      - run: uv run --locked ruff check src tests examples/toolkits examples/bridge
-      - run: uv run --locked ruff format --check src tests examples/toolkits examples/bridge
+      # The build action's oci.py too, which the release dry run and release.yml's publish run.
+      - run: >-
+          uv run --locked ruff check
+          src tests examples/toolkits examples/bridge .github/actions/build-image
+      - run: >-
+          uv run --locked ruff format --check
+          src tests examples/toolkits examples/bridge .github/actions/build-image
       - run: uv run --locked mypy
 
   test:
@@ -135,8 +140,9 @@ jobs:
       # R52's reproducible build (M8 design L.4): the commit built twice more, each from scratch on
       # a fresh builder with a pinned BuildKit, to OCI layouts with rewrite-timestamp. A report for
       # now: it says whether the two platform manifest digests match and, if not, what differs;
-      # the release dry run (L.2) enforces it. The index digest is never compared: it carries
-      # attestation timestamps.
+      # release.yml's build enforces it, and so does the release dry run below once its own first
+      # compare matches (L.2, BP-4). The index digest is never compared: it carries attestation
+      # timestamps.
       - name: Reproducible build, twice from scratch (a report)
         run: |
           set -o pipefail
@@ -203,3 +209,29 @@ jobs:
               for name in changed[:20]:
                   print(f"  - {name}: {first.get(name)} / {second.get(name)}")
           PY
+
+  # The release's build, run as a dry run on every push to dev or main and every pull request (M8
+  # design L.2): the same action release.yml's build job runs, with read access only and no OIDC
+  # token, pushing nothing. Its scan is a report, so an advisory published on an unrelated day
+  # never turns a change red (BP-4). A new job name: it fails open until main's protection lists
+  # it (register D-238).
+  release-dry-run:
+    name: image release dry run
+    runs-on: ubuntu-24.04
+    # Two builds with an SBOM and provenance each, the recipes and the scan.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-image
+        with:
+          ref: ${{ github.sha }}
+          # BP-4: a report until this job's own first compare reports that the platform manifest
+          # digests match (the image job's builds match, but these add provenance, an SBOM and a
+          # docker export); then this line alone becomes compare: enforce (release.yml always
+          # enforces).
+          compare: report
+          scan: report

@@ -1,0 +1,252 @@
+# The image build every caller shares (M8 design L.1, Z24): ci.yml's release dry run on every push
+# to dev or main and every pull request, and release.yml's build job. It builds the checked-out
+# commit twice, each from scratch on a fresh builder with a pinned BuildKit, to OCI layouts with an
+# SBOM and provenance; compares the two platform manifest digests; checks the label, the identity
+# allowlist and the recipes against the image; scans the SBOM; and runs the host's official-image
+# check against a fixture digest list. It never pushes and is given no token: pushing is
+# release.yml's publish job's alone, and every step here runs third-party tools, so only
+# unprivileged jobs call it (L.3, T-6). A composite action, not a reusable workflow, so each caller
+# keeps its own environment, permissions and later steps (E-5). The caller checks the commit out
+# first, since a local action is read from the checkout, and names it as ref: the action builds
+# the commit its own steps came from (SC-13). oci.py, beside this file, reads the layouts.
+name: Build the ZoeyMCP image
+description: Builds the checked-out commit twice, compares, checks and scans it, and never pushes.
+
+inputs:
+  ref:
+    description: The checked-out commit, a full SHA; any other HEAD is refused.
+    required: true
+  compare:
+    description: enforce (a difference between the two builds fails) or report (it is reported).
+    required: true
+  scan:
+    description: enforce (a fixed High or Critical OS-package advisory fails) or report.
+    required: true
+
+outputs:
+  layout:
+    description: The first build's OCI layout, the one compared, checked and scanned.
+    value: ${{ steps.digests.outputs.layout }}
+  index-digest:
+    description: The layout's image index digest, which the compose files pin and attestations name.
+    value: ${{ steps.digests.outputs.index-digest }}
+  platform-digest:
+    description: The layout's platform manifest digest, the one the two builds share.
+    value: ${{ steps.digests.outputs.platform-digest }}
+  source-tree:
+    description: The commit's tree, as the image's io.zoeymcp.source-tree label states it.
+    value: ${{ steps.digests.outputs.source-tree }}
+  sbom:
+    description: The SPDX SBOM taken from the layout's attestation manifest.
+    value: ${{ steps.sbom.outputs.sbom }}
+  buildkit:
+    description: The BuildKit image both builds ran on, by digest.
+    value: ${{ steps.pins.outputs.buildkit }}
+
+runs:
+  using: composite
+  steps:
+    # Each tool that touches the image is pinned by digest here: BuildKit (ci.yml's image job pins
+    # the same one), the SBOM generator and the scanner. diffoci is pinned by its file's digest in
+    # the compare step, the only place it runs.
+    - name: Pins and inputs
+      id: pins
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        COMPARE: ${{ inputs.compare }}
+        SCAN: ${{ inputs.scan }}
+      run: |
+        for value in "compare=$COMPARE" "scan=$SCAN"; do
+          case "${value#*=}" in
+            enforce | report) ;;
+            *) echo "build-image: ${value%%=*} must be enforce or report" >&2; exit 1 ;;
+          esac
+        done
+        head="$(git rev-parse HEAD)"
+        if [ "$head" != "$REF" ]; then
+          echo "build-image: HEAD is $head, not the ref $REF; check that commit out first" >&2
+          exit 1
+        fi
+        {
+          echo "buildkit=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c"
+          echo "syft=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9"
+          echo "grype=anchore/grype:v0.120.1@sha256:e4a44ef45d285b829ce6efe2642980329661bd2d18eab5fc539138d4adaebbbe"
+          echo "work=$RUNNER_TEMP/build-image"
+          echo "builder-id=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+        } >> "$GITHUB_OUTPUT"
+
+    # The recipes' lock scripts build their wheels with uv.
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.17"
+
+    # The docker-container driver, which attestations need, on the pinned BuildKit (SC-12). It
+    # isn't made the selected builder: the builds name it, and the recipes' plain docker build
+    # stays on the runner's docker driver, the only one that sees the image loaded into docker.
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      id: buildx
+      with:
+        driver: docker-container
+        driver-opts: image=${{ steps.pins.outputs.buildkit }}
+        use: false
+
+    # R52's reproducible build (L.1, L.4): the commit's time, the SBOM generator and provenance in
+    # max mode with this run as its builder id, an OCI layout with rewrite-timestamp, and the same
+    # image loaded into docker for the checks that run it. The second build runs on a builder made
+    # for it, so neither build has a cache.
+    - name: Build twice, each from scratch on a fresh builder
+      shell: bash
+      env:
+        FIRST_BUILDER: ${{ steps.buildx.outputs.name }}
+        BUILDKIT: ${{ steps.pins.outputs.buildkit }}
+        SYFT: ${{ steps.pins.outputs.syft }}
+        WORK: ${{ steps.pins.outputs.work }}
+        BUILDER_ID: ${{ steps.pins.outputs.builder-id }}
+      run: |
+        mkdir -p "$WORK"
+        docker buildx create --name build-image-again --driver docker-container \
+          --driver-opt "image=$BUILDKIT"
+        for build in image again; do
+          builder="$FIRST_BUILDER"
+          [ "$build" = image ] || builder=build-image-again
+          docker buildx build --builder "$builder" --platform linux/amd64 \
+            --provenance "mode=max,builder-id=$BUILDER_ID" \
+            --sbom "generator=$SYFT" \
+            --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+            --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
+            --output "type=oci,dest=$WORK/$build,tar=false,rewrite-timestamp=true" \
+            --output "type=docker,name=zoeymcp-candidate:$build,rewrite-timestamp=true" .
+        done
+        docker buildx rm build-image-again
+
+    # The index digest carries attestation timestamps and is never compared. On a difference,
+    # diffoci names it too; compare: enforce fails the step, compare: report passes it (BP-4). The
+    # report already names the differing config keys and layers, so a diffoci that can't be fetched
+    # or doesn't match its digest warns and is never run, and the decision is the same.
+    - name: The two builds' platform manifest digests match
+      shell: bash
+      env:
+        COMPARE: ${{ inputs.compare }}
+        WORK: ${{ steps.pins.outputs.work }}
+      run: |
+        if python3 -I "$GITHUB_ACTION_PATH/oci.py" compare "$WORK/image" "$WORK/again" \
+            | tee -a "$GITHUB_STEP_SUMMARY"; then
+          exit 0
+        fi
+        if curl -fsSL -o "$WORK/diffoci" \
+            https://github.com/reproducible-containers/diffoci/releases/download/v0.1.8/diffoci-v0.1.8.linux-amd64 \
+            && echo "01e6b50c1568c9d61c758ef6da81869f2c26c852698d73dca961b3617effe949  $WORK/diffoci" \
+            | sha256sum -c - \
+            && chmod +x "$WORK/diffoci"; then
+          "$WORK/diffoci" diff --semantic \
+            docker://zoeymcp-candidate:image docker://zoeymcp-candidate:again \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+        else
+          echo "::warning::diffoci unavailable; the report above names the differing config keys and layers"
+        fi
+        if [ "$COMPARE" = enforce ]; then
+          echo "build-image: the two builds of one commit differ (compare: enforce)" >&2
+          exit 1
+        fi
+        echo "::warning::the two builds of one commit differ (compare: report)"
+
+    - name: The loaded image is the layout's, and its digests
+      id: digests
+      shell: bash
+      env:
+        WORK: ${{ steps.pins.outputs.work }}
+      run: |
+        docker image inspect zoeymcp-candidate:image > "$WORK/candidate.json"
+        python3 -I "$GITHUB_ACTION_PATH/oci.py" candidate "$WORK/image" "$WORK/candidate.json"
+        python3 -I "$GITHUB_ACTION_PATH/oci.py" digests "$WORK/image" | tee -a "$GITHUB_OUTPUT"
+        echo "layout=$WORK/image" >> "$GITHUB_OUTPUT"
+
+    - name: Labels match the source
+      shell: bash
+      env:
+        TREE: ${{ steps.digests.outputs.source-tree }}
+      run: test "$TREE" = "$(git rev-parse 'HEAD^{tree}')"
+
+    # actions/attest's sbom-path needs a file; BuildKit's SBOM lives in the index (SC-12).
+    - name: The SBOM, as a file
+      id: sbom
+      shell: bash
+      env:
+        WORK: ${{ steps.pins.outputs.work }}
+      run: |
+        python3 -I "$GITHUB_ACTION_PATH/oci.py" sbom "$WORK/image" "$WORK/sbom.spdx.json"
+        echo "sbom=$WORK/sbom.spdx.json" >> "$GITHUB_OUTPUT"
+
+    # An allowlist, never a denylist, which in a public workflow would publish what it guards; a
+    # failure names the field, not its value (G-14).
+    - name: Identity allowlist
+      shell: bash
+      env:
+        WORK: ${{ steps.pins.outputs.work }}
+        BUILDER_ID: ${{ steps.pins.outputs.builder-id }}
+      run: |
+        python3 -I "$GITHUB_ACTION_PATH/oci.py" identity "$WORK/image" \
+          --sbom "$WORK/sbom.spdx.json" --pyproject pyproject.toml \
+          --revision "$(git rev-parse HEAD)" --tree "$(git rev-parse 'HEAD^{tree}')" \
+          --builder-id "$BUILDER_ID"
+
+    # Advisory data changes on any day, so scan: report keeps a scan result from turning an
+    # unrelated change red (BP-4); the release enforces it.
+    - name: Scan the SBOM's OS packages
+      shell: bash
+      env:
+        GRYPE: ${{ steps.pins.outputs.grype }}
+        SCAN: ${{ inputs.scan }}
+        WORK: ${{ steps.pins.outputs.work }}
+      run: |
+        docker run --rm -v "$WORK/sbom.spdx.json:/scan/sbom.spdx.json:ro" "$GRYPE" \
+          sbom:/scan/sbom.spdx.json --only-fixed --output json > "$WORK/grype.json"
+        python3 -I "$GITHUB_ACTION_PATH/oci.py" scan "$WORK/grype.json" "$SCAN" \
+          | tee -a "$GITHUB_STEP_SUMMARY"
+
+    # As ci.yml's image job does against zoeymcp:ci (F9).
+    - name: The bridge and derived recipes, built from this image and verified against it
+      shell: bash
+      run: |
+        sh examples/bridge/lock.sh
+        docker build -f examples/bridge/Dockerfile \
+          --build-context server=examples/bridge/server/dist \
+          --build-arg OFFICIAL=zoeymcp-candidate:image -t zoeymcp-bridge-fetch:candidate \
+          examples/bridge
+        sh examples/bridge/verify.sh --bridge zoeymcp-candidate:image zoeymcp-bridge-fetch:candidate
+        sh examples/derived-image/lock.sh zoeymcp-candidate:image
+        docker build -f examples/derived-image/Dockerfile \
+          --build-context toolkit=examples/toolkits/dist \
+          --build-arg OFFICIAL=zoeymcp-candidate:image -t zoeymcp-derived:candidate \
+          examples/derived-image
+        sh examples/derived-image/verify.sh zoeymcp-candidate:image zoeymcp-derived:candidate
+
+    # The host check (L.5) against a fixture list naming this build as release 0.0.0: it finds the
+    # index digest and refuses it, since nothing attested it (gh runs with no token here), knows
+    # the platform manifest digest for what it is, and leaves a third-party image unchecked.
+    - name: The official-image check, against a fixture digest list
+      shell: bash
+      env:
+        WORK: ${{ steps.pins.outputs.work }}
+        INDEX: ${{ steps.digests.outputs.index-digest }}
+        PLATFORM: ${{ steps.digests.outputs.platform-digest }}
+        TREE: ${{ steps.digests.outputs.source-tree }}
+      run: |
+        fixture="$WORK/official-check"
+        mkdir -p "$fixture"
+        image=ghcr.io/ryanleeupc/zoeymcp
+        echo "0.0.0 $INDEX $PLATFORM $TREE" > "$fixture/digests.txt"
+        printf 'services:\n  vault:\n    image: %s\n  gateway:\n    image: %s\n  proxy:\n    image: %s\n' \
+          "$image@$INDEX" "$image@$PLATFORM" docker.io/library/caddy:2 > "$fixture/compose.yaml"
+        status=0
+        env -u GH_TOKEN -u GITHUB_TOKEN sh scripts/check-official-image.sh "$fixture/compose.yaml" \
+          --digests "$fixture/digests.txt" > "$fixture/out.txt" 2>&1 || status=$?
+        cat "$fixture/out.txt"
+        test "$status" -eq 1
+        grep -Fqx "not checked (third party): docker.io/library/caddy:2" "$fixture/out.txt"
+        grep -Fqx "FAIL $image@$INDEX: release 0.0.0's provenance attestation didn't verify:" \
+          "$fixture/out.txt"
+        grep -Fq "FAIL $image@$PLATFORM: that is release 0.0.0's platform manifest digest" \
+          "$fixture/out.txt"

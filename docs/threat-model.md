@@ -489,8 +489,17 @@ At most:
   confirmation code the bot sent to the chat that presented it, which only the operator's phone
   shows. Health shows a contested token.
 - **T34** gets "unknown or expired" for any id that isn't its own call's.
-- **T35** is for M8's release pipeline, which isn't built yet: no image is published. This section
-  will say what holds against it once the release workflow is built.
+- **T35** can't publish from dev or a pull request: their dry run of the release's build has read
+  access only, no OIDC token, and pushes nothing. A tag that doesn't name a commit on `main` fails
+  the release workflow's unprivileged guard job before any privileged job starts, and the build job,
+  which runs every third-party build, scan and diff tool, holds no write permission and no OIDC
+  token, so a compromised build tool can sign nothing and push nothing; the publish job pushes the
+  compared layout by its digest and runs none of those tools. The guard is not the control against
+  T35: a `v*` tag push runs the workflow file as it is at the tagged commit, so whoever can push a
+  branch and a tag can rewrite the guard. The controls are the repository's settings: a tag
+  ruleset limiting who may create `v*` tags, immutable releases, and the `release` environment's
+  protection rules (a required reviewer and a deployment rule for `v*` tags), which must exist
+  before the first tag (operations.md §37). No tag has been pushed, so no image is published yet.
 - **T36** is caught on the host, before the operator deploys, by the official-image check
   (`scripts/check-official-image.sh`, operations.md §37): each ZoeyMCP image the compose files
   name must be pinned by a digest that `release/digests.txt` lists as a release's, with its

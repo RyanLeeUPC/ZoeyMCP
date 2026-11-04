@@ -5111,8 +5111,20 @@ mistakes, not an attacker. The controls are the repository's settings: a tag rul
 may create `v*` tags, immutable releases, and the `release` environment's protection rules (a
 required reviewer, and a deployment rule allowing only `v*` tags). GitHub creates that environment
 unprotected the first time a job names it, so **no `v*` tag may be pushed, to this repository or
-to a fork that publishes its own image, before those settings exist.** The release workflow isn't
-in the repository yet.
+to a fork that publishes its own image, before those settings exist.**
+
+**How a release is made.** `.github/workflows/release.yml` runs on a `v*` tag push and nothing
+else. Its `guard` job, with read access only, refuses a tag whose commit isn't on `main`, a tag
+that isn't `v<major>.<minor>.<patch>`, and a tag that isn't `pyproject.toml`'s version. Its `build`
+job, with no write permission and no OIDC token, builds the commit twice, each from scratch, and
+requires the same platform manifest digest, checks the labels and the SBOM's and provenance's
+identity fields against a list of allowed values, refuses a fixed High or Critical advisory in an
+OS package, and builds and verifies the bridge and derived recipes on the image. Its `publish` job,
+under the `release` environment, pushes that compared layout itself by its digest, reads the
+pushed index back, and attests its provenance and SBOM; `release-notes` creates the GitHub release
+with the index digest, the platform manifest digest, the source tree, the BuildKit version and
+the attestation bundle. Every push to `dev` or `main` and every pull request runs the same build
+as a dry run (CI's `image release dry run` job), which pushes nothing and reports its advisories.
 
 **No image has been published yet.** `release/digests.txt` lists no release, the compose files
 default to `zoeymcp:local`, and the image is the one you build from the repository (`docker build
