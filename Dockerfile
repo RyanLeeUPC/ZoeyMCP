@@ -46,6 +46,14 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/zoeymcp \
     uv sync --locked --no-dev --no-editable \
  && UV_PROJECT_ENVIRONMENT=/opt/zoeymcp-gateway \
     uv sync --locked --no-dev --no-editable --extra gateway
+# uv leaves the project's own cache key in its dist-info (uv_cache.json, which holds a time) and
+# lists it in RECORD; nothing reads either at run time, and both change from build to build.
+RUN set -e; \
+    for info in /opt/zoeymcp/lib/python3.13/site-packages/zoeymcp-*.dist-info \
+        /opt/zoeymcp-gateway/lib/python3.13/site-packages/zoeymcp-*.dist-info; do \
+        rm "$info/uv_cache.json"; \
+        sed -i '/^zoeymcp-[^/]*\.dist-info\/uv_cache\.json,/d' "$info/RECORD"; \
+    done
 # Unchecked-hash .pyc holds no source time, and the fixed hash seed orders set constants the same
 # way in every build; the image is never edited in place, so the source is never checked again.
 RUN python3 -m compileall -q -f --invalidation-mode unchecked-hash \

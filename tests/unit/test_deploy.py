@@ -799,6 +799,15 @@ def test_the_official_image_builds_reproducibly() -> None:
     )
     assert compile_all in build
     assert build.index(compile_all) > build.rindex("uv sync")
+    # uv's cache key for the project (a time in it) and its RECORD line go after the last install:
+    # the one difference CI's first compare found (d3a4d31).
+    cache_key = (
+        '        rm "$info/uv_cache.json"; \\\n'
+        "        sed -i '/^zoeymcp-[^/]*\\.dist-info\\/uv_cache\\.json,/d' \"$info/RECORD\"; \\\n"
+    )
+    assert cache_key in build
+    assert build.index(cache_key) > build.rindex("uv sync")
+    assert build.count("zoeymcp-*.dist-info") == 2
     # One instruction or comment line per piece: a continuation line starts with a space.
     pieces = re.split(r"\n(?=\S)", final)
     [users] = [piece for piece in pieces if piece.startswith("RUN ") and "useradd" in piece]
