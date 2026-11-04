@@ -341,9 +341,11 @@ async def test_an_edit_replaces_the_text_drops_the_keyboard_and_dates_it() -> No
         assert refused(same) == (400, NOT_MODIFIED)
 
 
-async def test_a_keyboard_edit_leaves_no_date_unless_switched() -> None:
+async def test_a_keyboard_edit_is_dated_as_telegram_dates_it() -> None:
+    """D-255: M8's live check saw Telegram set ``edit_date`` on a buttons-only edit."""
     with anyio.fail_after(LIMIT):
-        api = BotApi(TOKEN, flood_interval=None)
+        clock = Clock()
+        api = BotApi(TOKEN, clock=clock, flood_interval=None)
         message_id = (await send_prompt(api))["message_id"]
         swapped = keyboard(("Approve", DENY[1]), ("Deny", APPROVE[1]))
         edited = result(
@@ -356,7 +358,7 @@ async def test_a_keyboard_edit_leaves_no_date_unless_switched() -> None:
             )
         )
         assert edited["reply_markup"] == swapped
-        assert "edit_date" not in edited
+        assert edited["edit_date"] == 1000
 
 
 async def test_a_deleted_message_cant_be_edited_or_deleted_again() -> None:
@@ -468,12 +470,12 @@ async def text_changed(api: BotApi, clock: Clock) -> None:
     assert api.sent()[0].single_pre is True  # it judges what was sent
 
 
-async def markup_edit_dated(api: BotApi, clock: Clock) -> None:
+async def markup_edit_undated(api: BotApi, clock: Clock) -> None:
     message_id = (await send_prompt(api))["message_id"]
     clock.now += 2
     markup = keyboard(("Approve", APPROVE[1]))
     edit = {"chat_id": OPERATOR.id, "message_id": message_id, "reply_markup": markup}
-    assert result(await call(api, "editMessageReplyMarkup", **edit))["edit_date"] == 1002
+    assert "edit_date" not in result(await call(api, "editMessageReplyMarkup", **edit))
 
 
 async def manages_bots(api: BotApi, clock: Clock) -> None:
@@ -488,7 +490,7 @@ SWITCHES: dict[Switch, Callable[[BotApi, Clock], Any]] = {
     Switch.FORBIDDEN_SEND: forbidden_send,
     Switch.OUTAGE: outage,
     Switch.TEXT_CHANGED: text_changed,
-    Switch.MARKUP_EDIT_DATED: markup_edit_dated,
+    Switch.MARKUP_EDIT_UNDATED: markup_edit_undated,
     Switch.MANAGES_BOTS: manages_bots,
 }
 
@@ -568,8 +570,8 @@ async def test_the_attacker_edits_a_prompt_text_or_keyboard() -> None:
         pressed = api.operator.press(message_id, "Approve")
         assert pressed is not None
         assert pressed.body["message"]["text"].endswith("read_note\nend of request")
-        # A keyboard swap alone leaves no edit_date (without MARKUP_EDIT_DATED).
-        other = BotApi(TOKEN)
+        # A keyboard swap alone leaves no edit_date only with MARKUP_EDIT_UNDATED.
+        other = BotApi(TOKEN, switches={Switch.MARKUP_EDIT_UNDATED})
         other_id = (await send_prompt(other))["message_id"]
         swapped = keyboard(("Deny", APPROVE[1]), ("Approve", DENY[1]))
         assert "edit_date" not in other.attacker.edit_markup(other_id, swapped)

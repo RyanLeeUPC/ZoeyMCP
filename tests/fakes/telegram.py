@@ -24,7 +24,7 @@ The methods the approver uses:
   update the bot doesn't want when it is made is dropped, into :attr:`BotApi.dropped`). A second
   ``getUpdates`` while one waits ends the waiting one with 409, as Telegram does;
 - ``editMessageText`` (a new text, and the keyboard it is given or none), which sets
-  ``edit_date``; ``editMessageReplyMarkup``, which sets it only with ``MARKUP_EDIT_DATED``;
+  ``edit_date``; ``editMessageReplyMarkup``, which sets it too unless ``MARKUP_EDIT_UNDATED``;
   ``deleteMessage``; ``answerCallbackQuery``, once per query.
 
 Flood control is per chat across the writing methods (``sendMessage``, both edits,
@@ -128,8 +128,9 @@ class Switch(enum.StrEnum):
     OUTAGE = "outage"
     # sendMessage keeps and returns the text without its last character.
     TEXT_CHANGED = "text_changed"
-    # editMessageReplyMarkup sets edit_date (no contract pins which; the live check records it).
-    MARKUP_EDIT_DATED = "markup_edit_dated"
+    # editMessageReplyMarkup leaves edit_date unset. Telegram sets it (M8's live check, D-255);
+    # the switch keeps the case a press must refuse by its keyboard alone (FM-37).
+    MARKUP_EDIT_UNDATED = "markup_edit_undated"
     # getMe: can_manage_bots is true.
     MANAGES_BOTS = "manages_bots"
 
@@ -534,7 +535,7 @@ class BotApi:
             if limited:
                 self._write(stored.chat_id, Switch.RATE_LIMITED_EDIT)
             stored.reply_markup = markup
-            if Switch.MARKUP_EDIT_DATED in self.switches:
+            if Switch.MARKUP_EDIT_UNDATED not in self.switches:
                 stored.edit_date = int(self.clock())
         return stored.wire()
 

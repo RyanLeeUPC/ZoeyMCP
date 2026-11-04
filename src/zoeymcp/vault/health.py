@@ -845,6 +845,11 @@ def _store(inputs: Inputs) -> dict[str, Any]:
     policy = inputs.policy
     used = {ref.removeprefix("store:") for _, ref, _ in secret_references(policy)}
     used |= {live_slot(name) for name, cred in policy.credentials.items() if _seeded(cred)}
+    # The approver's token isn't among secret_references (its own sharing rules, check.py),
+    # yet the policy uses it (D-253).
+    telegram = policy.approvers.telegram if policy.approvers is not None else None
+    if telegram is not None:
+        used.add(telegram.bot_token.removeprefix("store:"))
     findings: list[Finding] = []
     for entry in inputs.entries:
         if entry.name in used:

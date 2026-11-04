@@ -25,7 +25,7 @@ import pytest
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.attention import Attention
 from zoeymcp.common.policy.merge import Merged, merge, replace_paths
-from zoeymcp.common.policy.schema import OAuth2Credential
+from zoeymcp.common.policy.schema import Approvers, OAuth2Credential
 from zoeymcp.common.yamlload import load_mapping
 from zoeymcp.vault import health
 from zoeymcp.vault.bindings import BindingError, client_secret_rebound, oauth_binding
@@ -889,6 +889,20 @@ def test_entries_nothing_uses() -> None:
     # A live slot is used only while its credential is seeded.
     unseeded = make_policy({"music": spotify()})
     assert codes(report(unseeded, [entry(LIVE, {"oauth": {}})])["store"]) == ["orphan_slot"]
+
+
+def test_the_telegram_approvers_token_is_used() -> None:
+    """D-253: the approver's bot token isn't among the policy's secret references (it has its
+    own sharing rules), yet the policy uses it: never ``unreferenced``, never to be deleted."""
+    bot = entry("approver-bot", origin_binding(["https://api.telegram.org"]))
+    without = make_policy({"notes": header()})
+    assert codes(report(without, [bot])["store"]) == ["unreferenced"]
+    ids = {"user_id": 100000001, "chat_id": 100000001}
+    telegram = {"bot_token": "store:approver-bot", **ids}
+    approving = without.model_copy(
+        update={"approvers": Approvers.model_validate({"telegram": telegram})}
+    )
+    assert codes(report(approving, [bot])["store"]) == []
 
 
 ONBOARDED = {

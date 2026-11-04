@@ -452,8 +452,10 @@ async def test_forged_presses(tmp_path: Path, log: io.StringIO) -> None:
     """G.5: a stranger's press (another account in the operator's chat, a copy of the prompt in
     its own) gets no answer at all; a press with the keyboard swapped (no ``edit_date``), with
     another hold's button, or on an edited message is refused by reason; nothing is decided, and
-    the operator's own press on a message as sent still is."""
-    api = bot()
+    the operator's own press on a message as sent still is. The keyboard swap is undated here
+    (``MARKUP_EDIT_UNDATED``), so its refusal is the keyboard's own: Telegram dates it (D-255),
+    which the vault refuses as ``edited``."""
+    api = bot(Switch.MARKUP_EDIT_UNDATED)
     with anyio.fail_after(BOUND):
         async with vault(tmp_path, api, held=BOTH_HELD) as (rig, http):
             await held(rig, http, "00000000000000f1", **KEYS[0])
