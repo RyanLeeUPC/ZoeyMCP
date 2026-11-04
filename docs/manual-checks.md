@@ -826,7 +826,8 @@ and the bot is deleted afterwards.
    https://api.telegram.org`, then `zoeymcp approver telegram enrol --secret approver-bot`. Pass:
    the printed link opens the bot's chat, Start sends `/start` with the code, the bot sends a
    six-digit confirmation code to that chat, typing it prints the `approvers` lines with the
-   right ids; a wrong code ends `enrolment_unconfirmed`.
+   right ids; a wrong code ends `enrolment_unconfirmed`, and what isn't six digits (a paste that
+   didn't reach the hidden prompt) is asked for again, unsent.
 3. **The probe.** With the lines in the policy, `zoeymcp approver telegram test` exits 0 and the
    chat shows the test message with no buttons; `zoeymcp health` reads `approver telegram: ok`.
 4. **The message's shape.** Hold a call whose arguments hold `https://example.com/x`,

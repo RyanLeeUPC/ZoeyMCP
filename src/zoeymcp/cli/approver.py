@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Final, TextIO
 
@@ -41,6 +42,15 @@ EXIT_OK: Final = 0
 EXIT_REFUSED: Final = 1
 # One long poll of the enrolment's state, in seconds (the vault's cap is 60).
 WAIT: Final = 50
+# The bot's confirmation code is six ASCII digits (the vault's CONFIRM_DIGITS). Anything else
+# can't be it, so it is asked for again, unsent, up to ASKS reads in all (D-252): a paste that
+# never reached the hidden prompt would otherwise end the enrolment as a wrong code does.
+CONFIRM_SHAPE: Final = re.compile(r"[0-9]{6}")
+ASKS: Final = 5
+NOT_A_CODE: Final = (
+    "That isn't six digits, so it wasn't sent. Type the code the bot sent (a paste may not reach "
+    "this hidden prompt): "
+)
 ALLOWANCE: Final = "Opened a temporary egress allowance: {allowance} (approver, 10 minutes)."
 FINDINGS: Final[Mapping[str, str]] = {
     "approver_token_missing": "the bot's token isn't in the store",
@@ -76,6 +86,21 @@ def read_code(stdin: TextIO) -> str:
     if stdin.isatty():
         return getpass.getpass("")
     return stdin.readline().strip()
+
+
+def _ask_code(stdin: TextIO, said: TextIO, typed: Callable[[TextIO], str]) -> str:
+    """The confirmation code, after its prompt: read again, unsent, while it isn't six digits,
+    at most :data:`ASKS` reads; the last is sent whatever it is, for the vault to judge."""
+    asked = 0
+    while True:
+        said.flush()
+        code = typed(stdin).strip()
+        asked += 1
+        if not stdin.isatty():
+            said.write("\n")  # at a terminal, the line ends with the code typed
+        if CONFIRM_SHAPE.fullmatch(code) or asked >= ASKS:
+            return code
+        said.write(NOT_A_CODE)
 
 
 def _test(args: argparse.Namespace, socket: str, out: TextIO) -> int:
@@ -119,10 +144,7 @@ def _enrol(
             return EXIT_REFUSED
         review_view.write_lines(seen_lines(state["seen"]), said)
         said.write("The bot sent that chat a confirmation code. Type it here: ")
-        said.flush()
-        code = typed(stdin)
-        if not stdin.isatty():
-            said.write("\n")  # at a terminal, the line ends with the code typed
+        code = _ask_code(stdin, said, typed)
         confirmed = admin_client.telegram_confirm(socket, enrolment, code)
     except KeyboardInterrupt:
         if opened is None:

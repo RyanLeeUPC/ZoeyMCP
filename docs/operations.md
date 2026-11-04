@@ -4879,7 +4879,8 @@ cases:
    yourself and reload. Nothing is written before you answer. An enrolment stops with
    `enrolment_contested` (and health raises `approver_contested`) if the code is presented twice,
    or another program polls the bot or set a webhook on it; with `enrolment_unconfirmed` for a
-   wrong code; and is refused for a bot that can manage other bots (`approver_can_manage_bots`) or
+   wrong code (type the code: a paste may not reach the hidden prompt, and what isn't six digits
+   is asked for again and never sent, up to five times); and is refused for a bot that can manage other bots (`approver_can_manage_bots`) or
    whose token, or bot, another secret, credential, route or connector also holds
    (`approver_token_shared`).
 4. **Check** the policy: `check --emit-egress-allowlist` now lists `vault api.telegram.org:443`,

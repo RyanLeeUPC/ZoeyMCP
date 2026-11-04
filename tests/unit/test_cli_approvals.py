@@ -24,7 +24,7 @@ from __future__ import annotations
 import io
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -354,16 +354,21 @@ async def press_start(api: BotApi, said: list[io.StringIO]) -> None:
     api.operator.start(found.group(1))
 
 
-def enrol(rig: Rig, argv: list[str], stdin: str = "") -> tuple[int, str, str]:
-    """``zoeymcp <argv>`` as ``main`` parses it, the host typing the code the operator's phone
-    shows (not a terminal), and ``stdin`` for anything else it asks."""
+def enrol(
+    rig: Rig, argv: list[str], stdin: str = "", answers: Sequence[str | None] = (None,)
+) -> tuple[int, str, str]:
+    """``zoeymcp <argv>`` as ``main`` parses it, the host typing ``answers`` in turn at the code's
+    prompt (``None``: the code the operator's phone shows; not a terminal), and ``stdin`` for
+    anything else it asks."""
     out, err = io.StringIO(), io.StringIO()
     rig.portal.start_task_soon(press_start, rig.api, [out, err])
     args = main_module._build_parser().parse_args(argv)
     phone = rig.api.operator
+    left = list(answers)
 
     def typed(_stdin: TextIO) -> str:
-        return phone.confirmation_code()
+        answer = left.pop(0)
+        return phone.confirmation_code() if answer is None else answer
 
     code = approver_cli.run(args, io.StringIO(stdin), out, err, typed=typed)
     return code, out.getvalue(), err.getvalue()
@@ -395,6 +400,36 @@ def test_enrol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: Blocking
         *approver_cli.RELOAD,
     ]
     assert out.count(found.group(1)) == 1
+    rig.close()
+
+
+def test_what_cant_be_a_code_is_asked_again_unsent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """D-252: what isn't six digits (a paste that reached the hidden prompt as one character,
+    the code with a space in it) is asked for again and never sent, so it doesn't end the
+    enrolment; the code then typed enrols."""
+    rig = Rig(tmp_path, monkeypatch, portal)
+    argv = ["approver", "telegram", "enrol", "--secret", "approver-bot"]
+    code, out, err = enrol(rig, argv, answers=["t", "123 456", None])
+    assert (code, err) == (0, "")
+    lines = out.splitlines()
+    prompt = lines.index("The bot sent that chat a confirmation code. Type it here: ")
+    assert lines[prompt + 1 : prompt + 4] == [approver_cli.NOT_A_CODE] * 2 + ["Confirmed."]
+    rig.close()
+
+
+def test_after_five_reads_the_last_is_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """D-252's bound: the code is read at most five times, and the fifth is sent whatever it is,
+    so a closed standard input ends the enrolment as a wrong code (``enrolment_unconfirmed``)."""
+    rig = Rig(tmp_path, monkeypatch, portal)
+    argv = ["approver", "telegram", "enrol", "--secret", "approver-bot"]
+    code, out, err = enrol(rig, argv, answers=[""] * approver_cli.ASKS)
+    assert code == 1
+    assert out.count(approver_cli.NOT_A_CODE) == approver_cli.ASKS - 1
+    assert "wasn't the one the bot sent" in err
     rig.close()
 
 
