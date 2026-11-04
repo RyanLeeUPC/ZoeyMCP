@@ -76,7 +76,7 @@ from zoeymcp.common.policy.view import build_view
 from zoeymcp.gateway import checkapproval, elsewhere, pipeline, server
 from zoeymcp.gateway import logs as gateway_logs
 from zoeymcp.gateway.app import STOP_DETACH_WAIT
-from zoeymcp.gateway.approvals import MAX_RECORDS, Key, Pending, Settings
+from zoeymcp.gateway.approvals import MAX_RECORDS, Cooldown, Key, Pending, Settings
 from zoeymcp.gateway.approve import LEDGER_DOWN, RESULT_TTL_MAX, Approvals, Asking
 from zoeymcp.gateway.approvers import (
     NO_APPROVALS,
@@ -864,6 +864,68 @@ async def test_an_ending_waits_for_its_pending_answer_and_closes_once(tmp_path: 
     assert held.records() == closed
     assert held.approvals.table.get(held.call.ref) is None
     assert poller.deferred == {}
+
+
+@pytest.mark.parametrize(
+    ("decision", "cooldown", "then"),
+    [("approved_elsewhere", 0.0, Pending), ("decline", 15.0, Cooldown)],
+    ids=["approved", "declined"],
+)
+async def test_an_ending_frees_the_lock_before_its_ledger_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: Any,
+    cooldown: float,
+    then: type,
+) -> None:
+    """D-250: the lock is freed as the ending is decided, in the same synchronous section, not
+    after the gateway's ``decided`` and ``outcome`` records are written ("released as soon as
+    the gateway learns the record's ending"). An agent whose collect meets an ending the
+    decisions poll is still recording may call the tool again at once: it begins (or meets the
+    cooldown a decline starts), never ``busy`` until the hard deadline."""
+    held = await in_process(tmp_path)
+    await pend(held)
+    ledger = held.approvals.ledger
+    assert ledger is not None
+    write = ledger.write
+    writing = anyio.Event()
+    written = anyio.Event()
+
+    async def held_open(*args: Any, **fields: Any) -> Any:
+        writing.set()
+        await written.wait()
+        return await write(*args, **fields)
+
+    monkeypatch.setattr(ledger, "write", held_open)
+    ref = held.call.ref
+    with anyio.fail_after(BOUND):
+        async with anyio.create_task_group() as group:
+            group.start_soon(
+                elsewhere.collected, held.approvals, ref, decision, "not_sent", None, cooldown
+            )
+            await writing.wait()
+            during = held.approvals.table.get(ref)
+            again = held.approvals.table.begin(
+                Key("agent1", "notes", "echo"),
+                settings=held.settings,
+                now=held.approvals.clock(),
+                ref="fedcba9876543210",
+                era="modern",
+                args=held.call.args,
+                args_digest="sha256:" + "2" * 64,
+                pin=held.call.pin,
+                text_sha256="t",
+                how="elsewhere",
+            )
+            written.set()
+    assert during is None
+    assert isinstance(again, then)
+    assert held.records() == [
+        ("asked", None),
+        ("decided", "pending"),
+        ("decided", decision),
+        ("outcome", "not_sent"),
+    ]
 
 
 async def test_an_ending_that_isnt_one_leaves_the_record_waiting(tmp_path: Path) -> None:

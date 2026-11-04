@@ -415,11 +415,11 @@ async def collected(
     detail: str | None,
     cooldown: float,
 ) -> None:
-    """A pending held call's ending, as the gateway learned it from the vault (F.5, D.2): its
-    own ``decided`` and ``outcome`` records, the lock freed with the cooldown a decline or an
-    expiry starts, and its upstream session let go (F.6). A call the vault ran keeps its pin for
-    the agent's collect of its result (Z17, :meth:`.approve.Approvals.keep_ran`). A ref with no
-    pending record of a held call here changes nothing."""
+    """A pending held call's ending, as the gateway learned it from the vault (F.5, D.2): the
+    lock freed at once, with the cooldown a decline or an expiry starts, its upstream session
+    let go (F.6), then its own ``decided`` and ``outcome`` records. A call the vault ran keeps
+    its pin for the agent's collect of its result (Z17, :meth:`.approve.Approvals.keep_ran`). A
+    ref with no pending record of a held call here changes nothing."""
     record = approvals.table.get(ref)
     if (
         record is None
@@ -429,14 +429,16 @@ async def collected(
     ):
         return
     table: Decision = "accept" if decision == "approved_elsewhere" else _undecided(decision)
-    # Decided in this synchronous section: a second collect of the same ending records nothing.
-    approvals.table.decide(ref, table, approvals.clock())
+    # Decided and the lock freed in this synchronous section (D-250): a second collect of the
+    # same ending records nothing, and an agent told the ending may call the tool again at once
+    # (with the cooldown a decline starts), before this gateway's own records are written.
+    _release(approvals, record, table, cooldown)
     approvals.release_kept(ref)
     if decision == "approved_elsewhere":
         approvals.keep_ran(record)
     kept = detail if detail in ledgerformat.DETAILS else None
     await _decided(approvals, record, decision)
-    await _finish(approvals, record, outcome, kept, cooldown, table)
+    await _outcome(approvals, record, outcome, kept)
 
 
 def _undecided(decision: LedgerDecision) -> Decision:
@@ -587,30 +589,35 @@ async def _finish(
     """The call's outcome on the ledger, then the lock freed, with the cooldown its decision
     starts (a decline or an expiry, E.1)."""
     try:
-        anchor = None
-        if approvals.ledger is not None:
-            try:
-                anchor = await approvals.ledger.write(
-                    "outcome",
-                    record.ref,
-                    critical=False,
-                    outcome=outcome,
-                    detail=detail,
-                    writes_sent=0,
-                    writes_unknown=0,
-                )
-            except LedgerUnavailable:
-                anchor = None
-        logs.event(
-            "approval_outcome",
-            ref=record.ref,
-            outcome=outcome,
-            detail=detail,
-            ledger_seq=anchor.seq if anchor is not None else None,
-            ledger_hash=anchor.hash if anchor is not None else None,
-        )
+        await _outcome(approvals, record, outcome, detail)
     finally:
         _release(approvals, record, decision, cooldown)
+
+
+async def _outcome(approvals: Approvals, record: Pending, outcome: str, detail: str | None) -> None:
+    """The call's ``outcome`` record on the ledger, and its log line."""
+    anchor = None
+    if approvals.ledger is not None:
+        try:
+            anchor = await approvals.ledger.write(
+                "outcome",
+                record.ref,
+                critical=False,
+                outcome=outcome,
+                detail=detail,
+                writes_sent=0,
+                writes_unknown=0,
+            )
+        except LedgerUnavailable:
+            anchor = None
+    logs.event(
+        "approval_outcome",
+        ref=record.ref,
+        outcome=outcome,
+        detail=detail,
+        ledger_seq=anchor.seq if anchor is not None else None,
+        ledger_hash=anchor.hash if anchor is not None else None,
+    )
 
 
 async def _ended(
