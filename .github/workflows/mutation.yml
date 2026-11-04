@@ -9,6 +9,8 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      # mutmut runs tests/unit only, so a change to the browser tests alone starts no shard.
+      - "!tests/browser/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/mutation.yml"

@@ -44,6 +44,23 @@ Items 19-24 are also M6's exit check: each runs once in Chrome or Edge before M6
 M8 item names the page, what to do and what passes, and ends with a "Scriptable as" line, the
 steps a browser harness would take, so it can be scripted later without being rewritten.
 
+## Items a browser test runs
+
+The browser tests (`tests/browser/`) run an item's lines on every push, in Chromium on Linux and
+in Edge on Windows (CI's two "portal in a browser" jobs): the real vault and portal on loopback,
+the browser's own passkey stack over a virtual authenticator, the page's Content Security Policy
+and Trusted Types in force, and every page watched for a violation, a console error, a dialog or
+a request that leaves loopback. The rule: an item a browser test covers names its test, its row
+in the results table names that test and the CI run that passed it, and the item keeps only the
+lines left by hand: what a virtual authenticator or an automated browser can't show (a platform
+authenticator's own prompt, a security key, reopening a closed tab, a password manager's offer),
+and the item's runs in Firefox and Safari, whose own passkey stacks the tests don't drive.
+
+On a development host, run one test at a time against the installed Chrome, which downloads
+nothing: `uv sync --locked --all-extras --group browser`, then
+`ZOEYMCP_BROWSER=chrome uv run pytest tests/browser/test_session.py::<test>`. Without
+`ZOEYMCP_BROWSER` the directory is skipped.
+
 ## The setup for every item
 
 A vault on the host, with no admin socket, its portal on `localhost:8081` and, for the `https`
@@ -86,16 +103,22 @@ view.
    "reopen closed tab" within 15 minutes: still signed in (closing a tab doesn't end a session).
    Sign out, reopen: it asks again; the same after 15 idle minutes without signing out. After
    **Sign out**, the Application panel's `sessionStorage` for the origin is empty and the session
-   cookie is gone. Pass: each step as written.
+   cookie is gone. Pass: each step as written. In Chromium and Edge every step but the reopened
+   tab is `tests/browser/test_session.py`'s `test_item_3_*` (with a restarted browser asking to
+   sign in, and one signed-in tab per browser); by hand there: the reopened tab only.
 4. **Fetch Metadata and `Origin`.** On any `POST` the page makes (sign in, sign out, end the
    other sessions), the request headers show `Sec-Fetch-Site: same-origin` and the real
    `Origin` (`http://localhost:8081`), not `null`, though the page sends no referrer. Pass: both,
-   on every `POST`.
+   on every `POST`. In Chromium and Edge:
+   `test_session.py::test_item_4_every_post_is_same_origin_and_carries_the_real_origin`, from
+   the headers as the browser sent them; by hand there: nothing.
 5. **The `http://localhost` cookie.** In Safari over `http://localhost:8081`: sign in. Pass: the
    cookie `zoeymcp-8081-session` (no `Secure`, `HttpOnly`, `SameSite=Strict`) is stored and sent
    on the next request, and the page stays signed in.
 6. **The IP-literal redirect.** Open `http://127.0.0.1:8081/`. Pass: the browser lands on
-   `http://localhost:8081/` (a 308), and the page loads.
+   `http://localhost:8081/` (a 308), and the page loads. In Chromium and Edge:
+   `test_session.py::test_item_6_a_loopback_literal_redirects_to_localhost`; by hand there:
+   nothing.
 7. **A passkey belongs to its host name.** With a passkey enrolled on `http://localhost:8081`,
    open `https://zoeymcp.tailnet.example/` and choose **Sign in with a passkey**. Pass: the
    browser doesn't offer the `localhost` passkey (it offers none, or only ones enrolled on that
@@ -155,15 +178,23 @@ view.
       -H 'Sec-Fetch-Site: same-origin' -H 'Cookie: zoeymcp-8081-session=<the value>'
     ```
 
-    Pass: `401` with `"reason":"no_session"`, and the portal tab is still signed in.
+    Pass: `401` with `"reason":"no_session"`, and the portal tab is still signed in. In Chromium:
+    `test_session.py::test_item_10_a_neighbour_port_gets_nothing_and_signs_nobody_out`, the
+    replay included. It doesn't run in Edge on Windows: there the vault's stop hangs once the
+    browser resets the refused sign-out's connection (the Windows event loop's connection-reset
+    fault of register D-142), so by hand there: the item in Edge, if a Windows result is wanted.
 11. **Trusted Types.** In Chrome or Edge (which enforce Trusted Types), with the Console open,
     run a full session: set up with a code, sign in with the new passkey, open Sessions, end the
     other sessions, sign out. Pass: no Trusted Types or Content Security Policy violation in the
-    console.
+    console. In Chromium and Edge:
+    `test_session.py::test_item_11_a_full_session_makes_no_violation` (the other sessions are a
+    second browser signed in with the same passkey); by hand: nothing.
 12. **Two `http://localhost` ports.** Add `http://localhost:8082` to `admin.origins` and restart
     the vault, then forward that port to the portal's listener, keeping the browser's `Host`:
     `ssh -N -L 8082:127.0.0.1:8081 localhost`. Pass: a passkey enrolled through
-    `http://localhost:8081` is offered and accepted on `http://localhost:8082`.
+    `http://localhost:8081` is offered and accepted on `http://localhost:8082`. In Chromium and
+    Edge: `test_session.py::test_item_12_a_passkey_enrolled_on_one_port_signs_in_on_another`,
+    through a byte-for-byte forwarder; by hand there: nothing.
 13. **The callback** (the OAuth callback). Stop the vault of the setup above. From the repository
     root, in the development environment, start the fake provider, which makes a throwaway CA,
     serves a fake OAuth server at `https://localhost:9443` whose registered redirect is

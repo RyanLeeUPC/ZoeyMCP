@@ -27,7 +27,8 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
-      - run: uv sync --locked --all-extras --python 3.13
+      # The browser group too, so strict mypy sees Playwright's types in tests/browser.
+      - run: uv sync --locked --all-extras --group browser --python 3.13
       # The build action's oci.py too, which the release dry run and release.yml's publish run.
       - run: >-
           uv run --locked ruff check
@@ -88,6 +89,61 @@ jobs:
           tests/unit/test_refusal_doc.py tests/unit/test_refusals.py tests/unit/test_reviewview.py
           tests/unit/test_routes.py tests/unit/test_sessions.py tests/unit/test_setupcode.py
           tests/unit/test_webauthn.py tests/fakes/test_authenticator.py tests/fakes/test_browser.py
+
+  # The portal in a real browser (M8 design step 27a; register D-222): the browser's own WebAuthn
+  # stack over a CDP virtual authenticator, the page's CSP and Trusted Types in force, every
+  # page watched, the network out of reach (tests/browser/engines.py). Playwright is the browser
+  # dependency group, which no other job syncs. Traces of a failed test are kept a week (they hold
+  # only a throwaway vault's codes and sessions). Both jobs are new names and not required until
+  # they have a green streak: main's protection lists required jobs by name (register D-238).
+  browser:
+    name: portal in a browser (Chromium)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --locked --all-extras --group browser --python 3.13
+      # The headless shell Playwright 1.63 pins, and the OS packages it needs; not cached
+      # (restoring takes about as long as downloading).
+      - run: uv run --locked playwright install --with-deps --only-shell chromium
+      - run: uv run --locked pytest tests/browser
+        env:
+          ZOEYMCP_BROWSER: chromium
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-traces-chromium
+          path: test-results/
+          retention-days: 7
+
+  # The same tests in the runner's installed Edge: nothing is downloaded, so the browser moves
+  # with the runner image, ahead of what Playwright was tested against.
+  browser-windows:
+    name: portal in a browser (Edge on Windows)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --locked --all-extras --group browser --python 3.13
+      - run: uv run --locked pytest tests/browser
+        env:
+          ZOEYMCP_BROWSER: msedge
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-traces-edge
+          path: test-results/
+          retention-days: 7
 
   image:
     name: image build and smoke test

@@ -57,6 +57,9 @@ dev = [
     "types-pyyaml>=6.0",
     "types-regex>=2024.9",
 ]
+# The real-browser tests (tests/browser, D-222), outside dev, so the image, mutation and the
+# ordinary test jobs never install it: the browser jobs and the lint job sync it by name.
+browser = ["playwright>=1.63,<2"]
 
 [build-system]
 requires = ["hatchling>=1.26"]

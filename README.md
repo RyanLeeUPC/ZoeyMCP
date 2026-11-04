@@ -239,8 +239,9 @@ supply-chain cooldown, moved forward deliberately). Moving `exclude-newer` forwa
 `exclude-newer-package` exception it passes, or the exception becomes a silent cap on its package.
 
 ```sh
-uv sync --locked --all-extras                    # the gateway's extra too, as CI does
+uv sync --locked --all-extras --group browser    # the gateway's extra and Playwright too
 uv run pytest                                    # tests, including property tests
+ZOEYMCP_BROWSER=chrome uv run pytest tests/browser/test_session.py::<test>  # one, in Chrome
 # lint, then format, the paths CI lints
 uv run ruff check src tests examples/toolkits examples/bridge .github/actions/build-image
 uv run ruff format src tests examples/toolkits examples/bridge .github/actions/build-image
@@ -251,8 +252,10 @@ uv run zoeymcp check --config examples/policy.yaml
 Security-relevant behavior is covered by effect tests (a refused request really reaches
 nothing), acceptance tests per service shape over real TLS (`tests/acceptance`, using the
 shipped `profiles/`), the portal's effect tests over real sockets (`tests/portal`), library
-contract tests for the MCP SDK and what the portal relies on (`tests/sdk`), a by-hand browser
-checklist ([docs/manual-checks.md](docs/manual-checks.md)), an image smoke test of both
+contract tests for the MCP SDK and what the portal relies on (`tests/sdk`), the portal's page in a
+real browser (`tests/browser`, skipped unless `ZOEYMCP_BROWSER` names one: `chromium`, `chrome`
+or `msedge`), a by-hand browser checklist for what those can't check
+([docs/manual-checks.md](docs/manual-checks.md)), an image smoke test of both
 deployment tiers (`scripts/smoke-image.sh`), and mutation testing of the security-critical
 modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and at a floor for each
 module, listed in `pyproject.toml`).

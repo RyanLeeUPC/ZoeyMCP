@@ -2348,7 +2348,18 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   - neither listener serves authorization-server metadata, a registration or a token endpoint;
   - the static files hold no HTML sink, inline script or style, or external URL, and every
     string the portal didn't write reaches the page through `textContent` only (static checks;
-    what only a browser shows is on the by-hand checklist, [manual-checks.md](manual-checks.md)).
+    what only a browser shows is on the by-hand checklist, [manual-checks.md](manual-checks.md));
+  - **in a real browser (M8):** `tests/browser/` drives the portal's own page with Playwright,
+    in Chromium on Linux and Edge on Windows on every push, against the real vault and portal on
+    loopback: the browser's own WebAuthn stack over a CDP virtual authenticator (two
+    authenticators, user verification off for a cancelled prompt, a credential copied to a
+    second tab or browser), the page's CSP and Trusted Types in force (never bypassed), and
+    every page watched for a policy violation, a console or page error, a dialog or a request
+    that leaves loopback (the browser resolves only the test names, to loopback); layout is
+    checked from rendered geometry, not screenshots. A manual item a browser test covers names
+    it and keeps only its lines left by hand. Playwright is a development dependency in its own
+    group, never in the image, mutation or the ordinary test jobs. This supersedes M5's "thin
+    script tested through the API" as the only test of the page (register D-134).
 
   Each of the portal's invariants has an effect test. "Refused" means the vault changed nothing.
 
@@ -3069,7 +3080,7 @@ is built beside paste, not left out.
 | Health | metadata only, no test fetch; `zoeymcp health --json --strict` over the socket, no unauthenticated endpoint | §7.5 |
 | The two socket answers that carry a credential | `POST /setup-code` and `GET /gateway-key`, recorded as R61's scoped exceptions | R61 |
 | Explicit bindings for names the policy uses | allowed; health judges a binding by its effect | operations.md §3 |
-| The static UI's tests | thin script tested through the API, static checks of the files, and a recorded by-hand checklist | §8.2 |
+| The static UI's tests | thin script tested through the API, static checks of the files, and a recorded by-hand checklist (M8 adds tests in a real browser, which run most of the checklist) | §8.2 |
 | Mutation floors | a standing rule: 95% overall, and 95% for every module a milestone adds or changes for security reasons; a new module joins under the overall gate and the next commit writes its measured floor (95%, or a recorded 90% to 95% when only survivors judged equivalent are left, raised or justified when the milestone closes); a survivor in a module a milestone adds, or in a review-path module it touches, is killed by a unit test or listed as equivalent with its reason in `tests/unit/test_mutation_gaps_*.py`; an earlier module it changes need only hold its floor | §8.2 |
 | Order after M5 | an OAuth credential on a remote MCP route without discovery inside M5; then M7, M6, M8 | §11 |
 
@@ -3164,7 +3175,7 @@ over as files. It can't for a read-only service, so the keys stay in the environ
 | Question | Decision | Where |
 | --- | --- | --- |
 | One milestone or two | one: approvals first, image publishing last, with no dependency between them | §11 |
-| Browser checks of the Approvals queue | no browser harness in M8: by-hand items written so they can be scripted later, run once at M8's close | §8.2, [manual-checks.md](manual-checks.md) |
+| Browser checks of the Approvals queue | changed by the owner on 2026-11-03: a real-browser harness is built in M8, and the manual items it can check run as tests; what a browser can't check stays by hand, run once at M8's close | §8.2, [manual-checks.md](manual-checks.md) |
 | Where the image is published from | never from `dev`: a release workflow that runs on a `v*` tag, refuses a commit that isn't on `main` and pushes under a protected environment; every push to `dev` or `main` and every pull request runs the same build as a dry run that pushes nothing | §3.1, §8.2, [operations.md](operations.md) §37 |
 | Releases | SemVer 0.x, the first release 0.1.0; `ghcr.io`; GitHub artifact attestations, so no signing key to hold; amd64 only; one image (the bridge and derived recipes build on it); `release/digests.txt`; immutable releases | §3.1, [operations.md](operations.md) §37 |
 | A reproducible build | built twice from scratch and compared, in M8 | §8.2 |
@@ -3219,10 +3230,12 @@ event or in the backlog, after the first release.
 **M7.** None: every M7 item is done or moved to a later milestone.
 
 **M8.** Every other M8 item is done (Closed) or due before the pull request into `main`
-(Triggered). One closes with M8's own last step:
+(Triggered). Two close within M8: D-222 with its browser-test steps, D-224 with M8's own last
+step:
 
 | Key | Item | Target or trigger |
 | --- | --- | --- |
+| D-222 | The by-hand browser checks could mostly run as automated tests (the harness and its CI jobs are built, with items 3, 4, 6, 10, 11 and 12) | M8: items 25-34, then items 1-24, as browser tests |
 | D-224 | No live check of the Telegram approver against the real Bot API | M8's close: by hand, once, beside the Approvals queue's items ([manual-checks.md](manual-checks.md)) |
 
 **Triggered by an event.**
@@ -3269,7 +3282,6 @@ event or in the backlog, after the first release.
 | D-219 | A managed change that needs a gateway restart isn't walked end to end as processes (the vault-restart half is) | The test-debt pass before the PR into main |
 | D-220 | The Policy page's history diff calls a dropped decline of a kind the newer revision doesn't enable "wider", while the plan that wrote it called it neutral | The next change to the history diff, or the consistency pass before the PR into main |
 | D-221 | About 160 surviving mutants in M6's modules, above their floors, are neither killed nor judged equivalent | The test-debt pass before the PR into main, with D-86 |
-| D-222 | The by-hand browser checks could mostly run as automated tests | The test-debt pass before the PR into main |
 | D-225 | Every leg of the CI test job repeats the slow process tests (M8 raised the job's timeout and set a 75% headroom rule) | The CI hygiene pass before the PR into main |
 | D-226 | CI and mutation testing together need more concurrent jobs than the free plan's 20, and the mutation shards are uneven | The CI hygiene pass before the PR into main: shards balanced by measured time (§12.1.5) |
 | D-228 | A request on a pooled upstream connection that the server's keep-alive just closed fails, and a lost re-listing ends the agents' connection (a held forward is never retried) | The test-debt pass before the PR into main |
@@ -3312,12 +3324,11 @@ event or in the backlog, after the first release.
 | D-128 | Enrolment links for a second portal origin | A second origin an operator needs (the Approvals queue isn't meant for phones: Telegram is the phone approver, §12.1.5) |
 | D-131 | Mutation testing for the remaining security-relevant modules | Each module when it is next changed for security reasons |
 | D-133 | A liveness probe for static secrets and connectors | Backlog |
-| D-134 | A dev-only headless browser check of the portal's static UI | A script past its cap (`review.js` 700 lines, `app.js` with `webauthn.js` 1,060, the drift review's 450, the managed Policy page's 500, the Approvals page's 400) or the static files past 160 KiB in all, or manual checks that keep finding regressions |
 | D-135 | Other accepted limits of the portal, documented with it | Each when its mitigation changes |
 | D-137 | A leaked sign-in link and a page in the operator's browser can return an attacker's OAuth code first (accepted) | If a provider returns the account identity before the exchange |
 | D-139 | Two portal origins can share one host and port (`http://` and `https://`); the second is unreachable, and `check` doesn't warn | Backlog: a small `check` warning |
 | D-140 | Cookies planted at longer paths from another `localhost` port can lock the operator out of the portal; a denial only (accepted for now) | Backlog |
-| D-142 | On Windows, asyncio prints connection-reset tracebacks to stderr, outside the JSON log | Backlog: Windows is a development host only |
+| D-142 | On Windows, asyncio prints connection-reset tracebacks to stderr, outside the JSON log, and the same fault can leave a server's stop waiting forever (the Edge browser job skips manual item 10 for it) | Backlog: Windows is a development host only |
 | D-154 | A recorded by-hand onboarding run against a real OAuth-protected MCP server | Backlog, with D-69: once before a release (recorded "not run" in [manual-checks.md](manual-checks.md)) |
 | D-155 | The dynamic client registration lifecycle (RFC 7592): registration access tokens, deregistration, cleanup of orphaned registrations | A per-client registration limit, or a provider that rotates registered secrets |
 | D-157 | Revocation on replace and re-login (M7 revokes on delete only) | An operator who hits a provider's per-client token limit, or asks |
@@ -3434,6 +3445,7 @@ event or in the backlog, after the first release.
 | D-129 | A portal OAuth callback route beside paste, for a credential registered with its own portal callback address | Done in M5; its by-hand checks passed at the start of M7 |
 | D-130 | Detect a restore of the state volume from an older backup | Done in M6: an anchor beside the store, the seed guard and the gateway as restore witness (§4.6); a sealed manifest across every state file wasn't chosen (D-215) |
 | D-132 | M5's safe cuts, if any was taken | Closed in M5: no cut was taken |
+| D-134 | A dev-only headless browser check of the portal's static UI | Superseded in M8 by D-222's real-browser harness (§8.2) |
 | D-136 | No mix-up defence for pasted OAuth answers | Done in M7: `iss` checked first, with each registration's own redirect address as a backstop |
 | D-138 | A trailing line break passed checks that must match a whole value | Done in M5: every such check matches the whole value, with a refusal test for each |
 | D-141 | A failed reload stopped the reader of the launcher's control pipe, so a later stop request was lost | Done in M5: the reader logs the failure and goes on |
