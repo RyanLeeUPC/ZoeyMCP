@@ -110,13 +110,18 @@ runs:
         for build in image again; do
           builder="$FIRST_BUILDER"
           [ "$build" = image ] || builder=build-image-again
-          docker buildx build --builder "$builder" --platform linux/amd64 \
-            --provenance "mode=max,builder-id=$BUILDER_ID" \
-            --sbom "generator=$SYFT" \
+          set -- --builder "$builder" --platform linux/amd64 \
             --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
             --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
-            --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
-            --output "type=oci,dest=$WORK/$build,tar=false,rewrite-timestamp=true" \
+            --build-arg SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          docker buildx build "$@" \
+            --provenance "mode=max,builder-id=$BUILDER_ID" \
+            --sbom "generator=$SYFT" \
+            --output "type=oci,dest=$WORK/$build,tar=false,rewrite-timestamp=true" .
+          # The docker exporter can't load an index, which attestations make, so the image the
+          # checks run is the same build again from the builder's cache without them; a later
+          # step requires its layers and config to be the layout's.
+          docker buildx build "$@" --provenance=false --sbom=false \
             --output "type=docker,name=zoeymcp-candidate:$build,rewrite-timestamp=true" .
         done
         docker buildx rm build-image-again

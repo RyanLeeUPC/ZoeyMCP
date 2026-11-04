@@ -337,7 +337,16 @@ def test_the_action_builds_twice_on_the_pinned_buildkit_and_compares() -> None:
         assert not re.search(r"buildx use|--use\b", text(step)), step.get("name")
     build = text(steps["Build twice, each from scratch on a fresh builder"])
     assert "for build in image again; do\n" in build
-    assert build.count("docker buildx build ") == 1
+    # Two calls a build: the attested OCI layout, then the same build from the cache with no
+    # attestations, loaded into docker (the docker exporter can't load an index).
+    assert build.count("docker buildx build ") == 2
+    attested, loaded = build.split("docker buildx build ")[1:]
+    assert '--output "type=oci,' in attested
+    assert "type=docker" not in attested
+    assert "--provenance=false --sbom=false \\\n" in loaded
+    assert '--output "type=docker,name=zoeymcp-candidate:$build,rewrite-timestamp=true"' in loaded
+    assert '--provenance "mode' not in loaded
+    assert '--sbom "generator' not in loaded
     assert '--provenance "mode=max,builder-id=$BUILDER_ID"' in build
     assert '--sbom "generator=$SYFT"' in build
     assert 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"' in build
