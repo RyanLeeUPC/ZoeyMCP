@@ -100,6 +100,8 @@ TURN_ON = [
 ]
 OFF_PATH = "gateway.servers.notes.tools.vault_approval"
 NEEDS_STEP = CATALOGUE["vault_approval_off_needs_its_own_step"].text.format(detail="notes.write")
+# approvals.js's words once a hold is saved.
+HELD_SAVED = "Saved: the vault holds those calls now and asks you on your approvers."
 
 
 def policy(*, held: bool = False, approver: bool = True, write: bool = True) -> dict[str, Any]:
@@ -229,6 +231,8 @@ def test_item_31_hold_in_the_vault_shows_the_turn_on_plan_before_the_passkey(
     expect(confirm_dialog(page)).to_be_hidden()
     off = notes_row(page).get_by_role("button", name="Turn off vault approval: write")
     expect(off).to_be_visible()
+    # The rows drawn again keep the save's words (the page shown again doesn't clear them).
+    assert page.locator("#status").text_content() == HELD_SAVED
     assert passkeys.asserted() == 2
     assert head(rig)["tools"]["vault_approval"] == ["write"]
     assert revision(rig) == 2

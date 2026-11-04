@@ -122,6 +122,8 @@
   // --- the page -------------------------------------------------------------------------------
 
   function show(page) {
+    // A save that draws its page again (drift.js saved, approvals.js holdSaved) keeps its words.
+    const again = !$(page).hidden;
     for (const id of PAGES) {
       $(id).hidden = id !== page;
     }
@@ -131,7 +133,7 @@
     if (page !== "servers") {
       $("add-client-secret").value = ""; // nor does a client secret for an onboarding (M7 K.1)
     }
-    $("status").textContent = "";
+    if (!again) $("status").textContent = "";
   }
 
   function step(id) {
