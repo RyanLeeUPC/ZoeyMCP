@@ -96,7 +96,20 @@ def sign_out(page: Page) -> None:
 
 
 def open_section(page: Page, name: str) -> None:
-    """A nav button (**Sessions**, **Passkeys**, ...), then its page."""
+    """A nav button (**Sessions**, **Passkeys**, ...), then its page, read afresh.
+
+    A page shows its section only once its reads are done (app.js ``visit``, ``enter``), so its
+    heading appearing is the sign they are. A section already shown has its heading up before
+    any read, and a click made while the reads are still out is undone when they finish and
+    show the section again (CI's Chromium on a118d56: **Open the queue** pressed while Home was
+    still being read, then Home shown again). So a section already shown is left for another
+    first: **Sessions**, or **Home** when Sessions is the one shown."""
+    if page.get_by_role("heading", name=name, exact=True).is_visible():
+        _open(page, "Home" if name == "Sessions" else "Sessions")
+    _open(page, name)
+
+
+def _open(page: Page, name: str) -> None:
     page.get_by_role("navigation").get_by_role("button", name=name, exact=True).click()
     heading(page, name)
 
