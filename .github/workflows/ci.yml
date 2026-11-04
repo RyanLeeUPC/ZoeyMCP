@@ -229,9 +229,7 @@ jobs:
       - uses: ./.github/actions/build-image
         with:
           ref: ${{ github.sha }}
-          # BP-4: a report until this job's own first compare reports that the platform manifest
-          # digests match (the image job's builds match, but these add provenance, an SBOM and a
-          # docker export); then this line alone becomes compare: enforce (release.yml always
-          # enforces).
-          compare: report
+          # BP-4: enforced since this job's own first compare matched (CI 41763084017, 2399668):
+          # a commit whose two builds differ fails here, as release.yml's build would.
+          compare: enforce
           scan: report
