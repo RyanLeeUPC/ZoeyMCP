@@ -83,7 +83,7 @@
       list.append(draw(row));
     }
     if (found.length === 0) {
-      list.append(make("li", empty));
+      list.append(make("li", empty, "z-list__empty"));
     }
   }
 
@@ -95,12 +95,13 @@
     $("approvals-notice").textContent = answer.notice === null ? "" : answer.notice;
     $("approvals-notice").hidden = answer.notice === null;
     rows($("approvals-waiting"), answer.waiting, NONE_WAITING, (row) => {
-      const entry = make("li", waitingText(row) + " ");
-      entry.append(button("Open", () => openHold(row.approval)));
+      const entry = make("li", "", "z-list__item");
+      entry.append(make("span", waitingText(row) + " ", "z-list__body"));
+      entry.append(button("Open", () => openHold(row.approval), "z-btn--primary"));
       return entry;
     });
     rows($("approvals-decided"), answer.decided, NONE_DECIDED,
-      (row) => make("li", named(row) + ": " + row.outcome_shown + "."));
+      (row) => make("li", named(row) + ": " + row.outcome_shown + ".", "z-list__item"));
     if (open !== null && !answer.waiting.some((row) => row.approval === open.approval)) {
       closeHold();
       $("status").textContent = GONE;
@@ -172,8 +173,11 @@
 
   // --- the count, and Home's item ---------------------------------------------------------------
 
+  // The nav's count, in its bubble; its name says it: "Approvals (N)".
   function count(waiting) {
-    $("nav-approvals").textContent = waiting ? "Approvals (" + waiting + ")" : "Approvals";
+    const nav = $("nav-approvals");
+    nav.replaceChildren("Approvals", ...(waiting ? [make("span", String(waiting), "z-count")] : []));
+    nav.ariaLabel = waiting ? "Approvals (" + waiting + ")" : null;
   }
 
   async function badge() {
@@ -186,9 +190,12 @@
     const answer = await api("GET", "/api/attention");
     const list = $("attention-approvals");
     list.replaceChildren();
-    if (answer.approvals !== null) {
-      const entry = make("li", answer.approvals.text_shown + ". ");
-      entry.append(button(ACTION_TEXT[answer.approvals.action.kind], showQueue));
+    if (answer.approvals !== null) { // a finding row: waiting on you, its words, its button
+      const entry = make("li", "", "z-finding");
+      entry.append(make("span", "Waiting", "z-tag z-tag--active"), make("p",
+        answer.approvals.text_shown + ".", "z-finding__text"), make("div", "", "z-finding__action"));
+      entry.lastChild.append(button(ACTION_TEXT[answer.approvals.action.kind], showQueue,
+        "z-btn--primary"));
       list.append(entry);
     }
     await badge();

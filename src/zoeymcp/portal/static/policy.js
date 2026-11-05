@@ -64,10 +64,11 @@
     return document.getElementById(id);
   }
 
-  // An element with its text (review.js's make()).
-  function make(tag, text) {
+  // An element with its text (review.js's make()), and its class if any.
+  function make(tag, text, className) {
     const element = document.createElement(tag);
     element.textContent = text;
+    element.className = className || "";
     return element;
   }
 
@@ -102,18 +103,24 @@
   // A connector's row (M.1, G.3): whether it sends, and its three limits, each in a field; Pause or
   // Resume, and Save limits with the fields' values, each connector.limits on the head the page
   // shows. Its recipients, host, port and sender are the host's (an import, COV-1).
+  // Each limit's field is labelled by its words (the design system's number fields, a row).
   function connectorRow(connector, head) {
-    const item = make("li", connector.name_shown + ": " + (connector.paused ? PAUSED : SENDING));
+    const item = make("li", "", "z-list__item z-connector");
+    item.append(make("span", connector.name_shown + ": " + (connector.paused ? PAUSED :
+      SENDING), "z-list__title"), make("div", "", "z-field-row"));
     const fields = Object.keys(LIMIT_TEXT).map((name) => {
-      const field = document.createElement("input");
+      const field = make("input", "", "z-input z-input--number z-input--small");
       field.type = "number";
       field.value = String(connector[name]);
-      item.append(" " + LIMIT_TEXT[name] + " ", field);
+      const label = make("label", LIMIT_TEXT[name], "z-field z-label");
+      label.append(field);
+      item.lastChild.append(label);
       return field;
     });
-    item.append(" ", button(connector.paused ? "Resume" : "Pause", () => limits(head, (done) =>
-      prepare("connector.limits", { base: head, connector: connector.name,
-        paused: !connector.paused }, done))), " ", button("Save limits", () => limits(head,
+    item.append(make("div", "", "z-list__actions"));
+    item.lastChild.append(button(connector.paused ? "Resume" : "Pause", () => limits(head,
+      (done) => prepare("connector.limits", { base: head, connector: connector.name,
+        paused: !connector.paused }, done))), button("Save limits", () => limits(head,
       (done) => prepare("connector.limits", { base: head, connector: connector.name,
         max_per_day: Number(fields[0].value), max_subject_chars: Number(fields[1].value),
         max_body_chars: Number(fields[2].value) }, done))));
@@ -157,11 +164,12 @@
       return;
     }
     block.replaceChildren(found.clients.length ? "" : NO_CLIENTS);
+    block.className = "z-btn-row";
     const boxes = found.clients.map((client) => {
       const box = document.createElement("input");
       box.type = "checkbox";
       box.checked = client.servers.includes(server);
-      const label = make("label", " " + client.name_shown);
+      const label = make("label", " " + client.name_shown, "z-check");
       label.prepend(box);
       block.append(label, " ");
       return { client: client, box: box };
@@ -218,7 +226,7 @@
   // kept or is in quarantine, whose changes can't be shown, is still a target (D.8, H.3).
   function revision(entry, head) {
     if (entry.gap) {
-      return make("li", "Revision " + entry.revision + ": " + GAP);
+      return make("li", "Revision " + entry.revision + ": " + GAP, "z-list__item z-list__meta");
     }
     const words = [entry.saved_shown.charAt(0).toUpperCase() + entry.saved_shown.slice(1) +
       ": " + (KIND_TEXT[entry.kind] || entry.kind)];
@@ -231,11 +239,12 @@
     if (entry.revision === head) {
       words.push("the head");
     }
-    const item = make("li", words.join(", ") + "." +
-      (entry.reason_shown === null ? "" : " Reason: " + entry.reason_shown));
-    item.append(" ", button("Show the changes", () => changes(entry.revision)));
+    const item = make("li", "", "z-list__item");
+    item.append(make("span", words.join(", ") + "." + (entry.reason_shown === null ? "" :
+      " Reason: " + entry.reason_shown), "z-list__body"), make("div", "", "z-list__actions"));
+    item.lastChild.append(button("Show the changes", () => changes(entry.revision)));
     if (entry.revision !== head) {
-      item.append(" ", button("Roll back to revision " + entry.revision,
+      item.lastChild.append(button("Roll back to revision " + entry.revision,
         () => rollback(entry.revision, head)));
     }
     return item;
@@ -257,8 +266,10 @@
     } else if (change.op === "changed" && !marked) {
       values = value(change.old) + " -> " + value(change.new);
     }
-    return make("li", change.path_shown.join(".") + ": " + change.op + ", " + change.direction +
-      ": " + values);
+    const item = make("li", change.path_shown.join(".") + ": " + change.op + ", " +
+      change.direction + ": " + values, "z-change");
+    item.dataset.direction = change.direction; // the stylesheet marks wider and narrower
+    return item;
   }
 
   // A revision's diff from its parent (H.2), each change on its row; then Roll back to this,

@@ -427,3 +427,35 @@ label.include {
 .z-tool__how:empty {
   display: none;
 }
+
+/* The policy's text, in a box of its own height that scrolls. */
+pre.z-codeblock--tall {
+  max-height: 32rem;
+  overflow: auto;
+}
+
+/* A policy change, marked by which way it moves the policy. */
+.z-change[data-direction="wider"] {
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+
+.z-change[data-direction="narrower"] {
+  box-shadow: inset 3px 0 0 var(--sage);
+}
+
+.z-changes > .z-change {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+/* A connector's row: its state, then its limits' fields, then its buttons. */
+.z-connector > .z-list__title,
+.z-connector > .z-field-row {
+  flex-basis: 100%;
+}
+
+.z-connector .z-field {
+  font-size: 14px;
+}

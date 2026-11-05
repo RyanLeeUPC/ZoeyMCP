@@ -783,7 +783,7 @@ def test_item_21_the_policy_page_names_the_head_and_lists_the_history(
     said = rows.all_text_contents()
     assert [text.split(",")[0] for text in said] == [f"Revision {n}" for n in (4, 3, 2, 1)]
     assert "by the host (socket): an import" in said[2]
-    assert said[2].split(" Show the changes")[0].endswith(f"Reason: {REASON}")
+    assert said[2].split("Show the changes")[0].rstrip().endswith(f"Reason: {REASON}")
     assert "the seed" in said[3]
     for number in (3, 2, 1):
         expect(
