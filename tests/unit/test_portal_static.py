@@ -1023,14 +1023,17 @@ def test_a_confirms_values_keep_their_indentation() -> None:
     start = css.index("#confirm-summary dd,\n#confirm-now dd {")
     assert "white-space: pre-wrap;" in css[start : css.index("}", start)]
     # A label wider than the dialog (the first row names a 71-character pin) wraps in a column
-    # of at most 40%, so the values aren't squeezed to a character a line.
-    start = css.index("\ndl {")
+    # of at most 40%, so the values aren't squeezed to a character a line: the design system's
+    # summary list (zoey.css), which every dl the page shows is.
+    zoey = read("zoey.css")
+    start = zoey.index("\n.z-summary {")
     assert (
         "grid-template-columns: fit-content(40%) minmax(0, 1fr);"
-        in css[start : css.index("}", start)]
+        in zoey[start : zoey.index("}", start)]
     )
-    start = css.index("\ndt {")
-    assert "overflow-wrap: anywhere;" in css[start : css.index("}", start)]
+    assert ".z-summary dt { font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }" in zoey
+    page = read("index.html")
+    assert page.count("<dl ") == page.count('<dl id="') == page.count('class="z-summary"')
     assert "value.textContent = pair[1];" in code_of(read("app.js"))
 
 

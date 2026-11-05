@@ -7,10 +7,6 @@
 body {
   margin: 0;
   min-height: 100vh;
-  /* Commands and names in the vault's sentences keep their characters: Manrope would join "--"
-     into a dash. */
-  font-variant-ligatures: none;
-  font-feature-settings: "calt" 0;
 }
 
 /* A list with nothing in it takes no room (a refusal's steps and findings, say). */
@@ -21,18 +17,6 @@ body {
 
 [hidden] {
   display: none !important;
-}
-
-/* An alert whose text is empty or hidden takes no room: the page's error and status lines. */
-.z-alert:has(> .z-alert__text[hidden]),
-.z-alert:has(> .z-alert__text:empty) {
-  display: none;
-}
-
-.z-alert__text {
-  margin: 0;
-  min-width: 0;
-  overflow-wrap: anywhere;
 }
 
 #page > .z-alert,
@@ -206,35 +190,6 @@ pre.z-codeblock {
   overflow-wrap: anywhere;
 }
 
-/* A long label (a definition's first row names its pin) wraps in its column, at most 40% of
-   the list, so the values keep the rest instead of one character a line. */
-dl {
-  display: grid;
-  grid-template-columns: fit-content(40%) minmax(0, 1fr);
-  gap: 0.25rem 1rem;
-}
-
-/* The design system's summary list, held to the same columns (manual item 20). */
-.z-summary {
-  grid-template-columns: fit-content(40%) minmax(0, 1fr);
-}
-
-@media (max-width: 30rem) {
-  .z-summary {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-dt {
-  font-weight: bold;
-  overflow-wrap: anywhere;
-}
-
-dd {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
 /* A confirm's values as the vault sent them: a definition's rows keep their JSON indentation
    (M6 G.7 row 2). */
 #confirm-summary dd,
@@ -372,11 +327,6 @@ label.include {
   grid-column: 1 / -1;
 }
 
-/* A summary list with nothing in it yet takes no room (the confirm's "what the vault finds now"). */
-.z-summary:empty {
-  display: none;
-}
-
 /* Rows a script draws without the design system's classes, in its lists, until it has them. */
 .z-list > li:not([class]),
 .z-log > li:not([class]),
@@ -417,13 +367,6 @@ label.include {
   margin: calc(-1 * var(--space-3)) calc(-1 * var(--space-4)) var(--space-2);
 }
 
-/* A server card's folded per-tool buttons, in a wrapping row. */
-.z-tool-actions > .z-disclosure__body {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
 .z-tool__how:empty {
   display: none;
 }
@@ -432,15 +375,6 @@ label.include {
 pre.z-codeblock--tall {
   max-height: 32rem;
   overflow: auto;
-}
-
-/* A policy change, marked by which way it moves the policy. */
-.z-change[data-direction="wider"] {
-  box-shadow: inset 3px 0 0 var(--warning);
-}
-
-.z-change[data-direction="narrower"] {
-  box-shadow: inset 3px 0 0 var(--sage);
 }
 
 .z-changes > .z-change {

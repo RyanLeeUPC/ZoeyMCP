@@ -6,6 +6,9 @@
 
 .z-root {
   background: var(--surface);
+  /* Literal text keeps its characters: Manrope would join "--" into a dash. */
+  font-variant-ligatures: none;
+  font-feature-settings: "calt" 0;
   color: var(--ink);
   font-family: var(--font-sans);
   font-size: 16px;
@@ -639,18 +642,21 @@
 /* SummaryList */
 .z-summary {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  /* A long term wraps in at most 40% of the list, so the values aren't squeezed to a character
+     a line (a term can name a 71-character pin). */
+  grid-template-columns: fit-content(40%) minmax(0, 1fr);
   gap: var(--space-3) var(--space-4);
   margin: 0;
   padding: var(--space-4);
   background: var(--surface-sunken);
   border-radius: var(--radius-md);
 }
-.z-summary dt { font-weight: 700; color: var(--ink); }
+.z-summary dt { font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.z-summary:empty { display: none; }
 .z-summary dd { margin: 0; overflow-wrap: anywhere; }
 .z-summary dd code { font-family: var(--font-mono); font-size: 14px; font-weight: 500; }
 @media (max-width: 30rem) {
-  .z-summary { grid-template-columns: 1fr; gap: var(--space-1); }
+  .z-summary { grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
   .z-summary dd { margin-bottom: var(--space-2); }
 }
 
@@ -968,6 +974,19 @@
 .z-standalone > main > * { margin: 0; }
 .z-standalone h1 { font-size: 28px; line-height: 36px; font-weight: 800; color: var(--ink-brand); }
 .z-standalone__mark { display: block; width: 40px; height: 40px; border-radius: var(--radius-md); }
+
+/* Learned in the build */
+/* An alert whose text is empty or hidden takes no room (a page's error and status lines). */
+.z-alert:has(> .z-alert__text[hidden]),
+.z-alert:has(> .z-alert__text:empty) { display: none; }
+.z-alert__text { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+/* ServerCard's folded per-tool actions, in a wrapping row. */
+.z-tool-actions > .z-disclosure__body { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+/* ChangeList: a change marked at its edge by the way it moves the policy (the words say it too). */
+.z-change[data-direction="wider"] { box-shadow: inset 3px 0 0 var(--warning); }
+.z-change[data-direction="narrower"] { box-shadow: inset 3px 0 0 var(--sage); }
 
 @media (prefers-reduced-motion: reduce) {
   .z-btn,
