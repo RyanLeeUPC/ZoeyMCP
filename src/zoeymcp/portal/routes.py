@@ -35,6 +35,8 @@ Scope = Literal["setup", "full"]
 HTML: Final = "text/html; charset=utf-8"
 JAVASCRIPT: Final = "text/javascript; charset=utf-8"
 CSS: Final = "text/css; charset=utf-8"
+WOFF2: Final = "font/woff2"
+SVG: Final = "image/svg+xml"
 
 
 @dataclass(frozen=True)
@@ -58,7 +60,15 @@ STATIC: Final[Mapping[str, StaticFile]] = MappingProxyType(
         "/policy.js": StaticFile("policy.js", JAVASCRIPT),
         # M8 step 15: the Approvals queue's script (M8 design H.1), with its own cap.
         "/approvals.js": StaticFile("approvals.js", JAVASCRIPT),
+        # The UX pass: the Zoey design system's tokens and components, then the portal's own
+        # rules; its fonts (OFL 1.1, their licences in portal/licenses/) and the app icon.
+        "/tokens.css": StaticFile("tokens.css", CSS),
+        "/zoey.css": StaticFile("zoey.css", CSS),
         "/app.css": StaticFile("app.css", CSS),
+        "/Manrope-Variable.woff2": StaticFile("Manrope-Variable.woff2", WOFF2),
+        "/IBMPlexMono-400.woff2": StaticFile("IBMPlexMono-400.woff2", WOFF2),
+        "/IBMPlexMono-500.woff2": StaticFile("IBMPlexMono-500.woff2", WOFF2),
+        "/zoey-icon.svg": StaticFile("zoey-icon.svg", SVG),
         # Step 14b: where the callback sends the tab (C.7). No script, no text from the query.
         "/callback/received": StaticFile("callback-received.html", HTML),
         "/callback/refused": StaticFile("callback-refused.html", HTML),

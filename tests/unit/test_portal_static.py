@@ -32,7 +32,7 @@ from zoeymcp.common.policy.schema import Policy
 from zoeymcp.portal import app as portal_app
 from zoeymcp.portal import approvalsview, policydiffview, reviewview
 from zoeymcp.portal.refusals import CATALOGUE, WEBAUTHN, reasons
-from zoeymcp.portal.routes import JAVASCRIPT, REVIEW_DIFF, ROUTES, STATIC
+from zoeymcp.portal.routes import CSS, JAVASCRIPT, REVIEW_DIFF, ROUTES, STATIC, WOFF2
 from zoeymcp.portal.webauthn import ASSERTION_FIELDS, REGISTRATION_FIELDS
 from zoeymcp.vault import onboarding
 from zoeymcp.vault.oauth import dcr
@@ -40,11 +40,17 @@ from zoeymcp.vault.oauth import dcr
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
 # Every script the map serves (M7 K.4), so a new one can't escape a check below.
 SCRIPTS = tuple(file.name for file in STATIC.values() if file.content_type == JAVASCRIPT)
+# And every stylesheet: the Zoey design system's tokens and components, then the portal's own.
+STYLESHEETS = tuple(file.name for file in STATIC.values() if file.content_type == CSS)
+# A stylesheet's url(): a quoted path the static map serves, nothing else (the UX pass, owner).
+CSS_URL = re.compile(r"url\(([^)]*)\)")
 # The static total's cap (M5 M.4). M8 (Q19 (a), owner): 160 KiB once a step measures the total
 # over 124 KiB. M6 left it at 123.9 KiB (126,862 bytes with 21a's per-kind rows and M8's one health
 # label); M8 step 15's Approvals queue (approvals.js, its section and two rules) takes it to 133.4
-# KiB (136,607 bytes), so the cap is 160 KiB from that step.
-MAX_ASSETS = 160 * 1024
+# KiB (136,607 bytes), so the cap is 160 KiB from that step. The UX pass (owner, 2026-11-05):
+# the Zoey design system's stylesheets, its self-hosted fonts (54,432 bytes) and the app icon;
+# the owner raised the cap for them, to 256 KiB.
+MAX_ASSETS = 256 * 1024
 # Line caps, per file (M7 K.4); a script with no cap fails. K.2 set 1,000 lines for app.js and
 # webauthn.js together. Step 15's Ledger and Policy pages took them past it (998 before, 1,041
 # after) although every line they show is made by the server and the existing pages were folded
@@ -204,7 +210,8 @@ def test_the_html_checker_catches_what_it_is_for() -> None:
 def test_index_html() -> None:
     page = parsed(read("index.html"))
     assert page.problems == []
-    # Every asset it loads is in the static map, and it loads every script and the stylesheet.
+    # Every asset it loads is in the static map, and it loads every script, the stylesheets and
+    # the icon.
     assert sorted(page.assets) == [
         "/app.css",
         "/app.js",
@@ -212,20 +219,31 @@ def test_index_html() -> None:
         "/drift.js",
         "/policy.js",
         "/review.js",
+        "/tokens.css",
         "/webauthn.js",
+        "/zoey-icon.svg",
+        "/zoey.css",
     ]
     assert set(page.assets) <= set(STATIC)
+    sheets = re.findall(r'<link rel="stylesheet" href="([^"]+)">', read("index.html"))
+    assert sheets == ["/tokens.css", "/zoey.css", "/app.css"]  # tokens, components, the portal's
 
 
 @pytest.mark.parametrize("name", ["callback-received.html", "callback-refused.html"])
 def test_the_callback_pages_run_no_script(name: str) -> None:
     """C.7, K.4: where the callback sends the tab, and the page a refusal answers in place.
     Fixed bytes with no script at all and no text from the query, the flow or the provider, so
-    P14 holds without escaping; they load only the stylesheet."""
+    P14 holds without escaping; they load only the stylesheets and the icon."""
     html = read(name)
     page = parsed(html)
     assert page.problems == []
-    assert page.assets == ["/app.css"]
+    assert page.assets == [
+        "/zoey-icon.svg",
+        "/tokens.css",
+        "/zoey.css",
+        "/app.css",
+        "/zoey-icon.svg",
+    ]
     assert "<script" not in html.lower()
     path = "/callback/" + name.removeprefix("callback-").removesuffix(".html")
     assert STATIC[path].name == name
@@ -287,7 +305,47 @@ def test_the_sink_checker_catches_what_it_is_for() -> None:
     assert not ABSOLUTE_URL.search('fetch("/api/session")')
 
 
-@pytest.mark.parametrize("name", [*SCRIPTS, "app.css"])
+def css_urls_outside_the_map(css: str) -> list[str]:
+    """Each url() in the stylesheet that isn't a quoted path the static map serves."""
+    found = []
+    for inner in CSS_URL.findall(css):
+        path = inner.strip()
+        if not (len(path) > 2 and path[0] == path[-1] == QUOTE and path[1:-1] in STATIC):
+            found.append(inner)
+    return found
+
+
+def test_the_css_url_checker_catches_what_it_is_for() -> None:
+    hostile = [
+        "src: url(https://fonts.example/x.woff2)",
+        "src: url(//fonts.example/x.woff2)",
+        f"src: url({QUOTE}/x.woff2{QUOTE})",
+        "src: url(/Manrope-Variable.woff2)",  # unquoted
+        f"src: url( {QUOTE}data:font/woff2,x{QUOTE} )",
+    ]
+    for css in hostile:
+        assert css_urls_outside_the_map(css), css
+    assert css_urls_outside_the_map(f"src: url({QUOTE}/Manrope-Variable.woff2{QUOTE})") == []
+
+
+def test_the_fonts_are_the_packages_own() -> None:
+    """The fonts are self-hosted (owner): tokens.css names each font file the map serves, and no
+    stylesheet loads anything but a font file."""
+    fonts = {path for path, file in STATIC.items() if file.content_type == WOFF2}
+    assert len(fonts) == 3
+    urls = {name: CSS_URL.findall(read(name)) for name in STYLESHEETS}
+    assert {inner.strip(QUOTE) for inner in urls["tokens.css"]} == fonts
+    assert all(urls[name] == [] for name in STYLESHEETS if name != "tokens.css")
+    licenses = STATIC_DIR.parent / "licenses"
+    assert sorted(path.name for path in licenses.iterdir()) == [
+        "OFL-IBM-Plex-Mono.txt",
+        "OFL-Manrope.txt",
+    ]
+    for path in licenses.iterdir():
+        assert "SIL Open Font License, Version 1.1" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("name", [*SCRIPTS, *STYLESHEETS])
 def test_no_sink_and_no_absolute_url(name: str) -> None:
     text = read(name)
     code = code_of(text) if name.endswith(".js") else text
@@ -297,7 +355,7 @@ def test_no_sink_and_no_absolute_url(name: str) -> None:
     assert ABSOLUTE_URL.findall(code) == []
     if name.endswith(".css"):
         assert "@import" not in text
-        assert "url(" not in text
+        assert css_urls_outside_the_map(text) == []
 
 
 def test_the_scripts_are_small_strict_and_hand_written() -> None:

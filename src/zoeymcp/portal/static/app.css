@@ -1,8 +1,7 @@
-/* The portal's one stylesheet: no inline styles anywhere (the CSP refuses them). */
+/* The portal's own rules, over the Zoey design system's tokens.css and zoey.css: no inline
+   styles anywhere (the CSP refuses them). */
 :root {
-  color-scheme: light dark;
-  font-family: system-ui, sans-serif;
-  line-height: 1.5;
+  font-synthesis: none; /* Manrope has no italic and Plex Mono ships 400 and 500: no faux faces */
 }
 
 body {

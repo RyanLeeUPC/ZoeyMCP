@@ -152,7 +152,13 @@ def test_the_static_map_is_fixed() -> None:
         "/drift.js": StaticFile("drift.js", "text/javascript; charset=utf-8"),
         "/policy.js": StaticFile("policy.js", "text/javascript; charset=utf-8"),
         "/approvals.js": StaticFile("approvals.js", "text/javascript; charset=utf-8"),
+        "/tokens.css": StaticFile("tokens.css", "text/css; charset=utf-8"),
+        "/zoey.css": StaticFile("zoey.css", "text/css; charset=utf-8"),
         "/app.css": StaticFile("app.css", "text/css; charset=utf-8"),
+        "/Manrope-Variable.woff2": StaticFile("Manrope-Variable.woff2", "font/woff2"),
+        "/IBMPlexMono-400.woff2": StaticFile("IBMPlexMono-400.woff2", "font/woff2"),
+        "/IBMPlexMono-500.woff2": StaticFile("IBMPlexMono-500.woff2", "font/woff2"),
+        "/zoey-icon.svg": StaticFile("zoey-icon.svg", "image/svg+xml"),
         "/callback/received": StaticFile("callback-received.html", "text/html; charset=utf-8"),
         "/callback/refused": StaticFile("callback-refused.html", "text/html; charset=utf-8"),
     }

@@ -1,0 +1,98 @@
+/* The Zoey design system's tokens (its tokens.json), for the portal. Light by default; dark
+   follows the browser's setting. The fonts are the package's own (OFL 1.1, licences in
+   portal/licenses/): nothing is loaded from anywhere else. */
+
+@font-face {
+  font-family: "Manrope";
+  src: url("/Manrope-Variable.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/IBMPlexMono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/IBMPlexMono-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+  --font-sans: "Manrope", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --surface: #f7f7f5;
+  --surface-raised: #ffffff;
+  --surface-sunken: #eeede9;
+  --ink: #1a191b;
+  --ink-brand: #251726;
+  --ink-muted: #5f5b61;
+  --line: #e4e3df;
+  --line-strong: #8a8690;
+  --accent: #7a52d9;
+  --accent-hover: #6440c4;
+  --on-accent: #ffffff;
+  --accent-soft: #ece6fa;
+  --accent-ink: #6d4c6f;
+  --sage: #5c664c;
+  --sage-soft: #e7ebdf;
+  --danger: #a3221b;
+  --danger-soft: #f8deda;
+  --warning: #7a4800;
+  --warning-soft: #f6e7c8;
+  --info: #1e587e;
+  --info-soft: #dde8f1;
+  --focus: #7a52d9;
+  --shadow-raised: 0 1px 2px rgba(26, 25, 27, 0.08), 0 2px 8px rgba(26, 25, 27, 0.05);
+  --shadow-dialog: 0 16px 48px rgba(26, 25, 27, 0.16);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface: #0d0e11;
+    --surface-raised: #16171d;
+    --surface-sunken: #08090b;
+    --ink: #ededec;
+    --ink-brand: #ededec;
+    --ink-muted: #a6a6ad;
+    --line: #262730;
+    --line-strong: #686977;
+    --accent: #7a52d9;
+    --accent-hover: #6440c4;
+    --on-accent: #ffffff;
+    --accent-soft: #38274c;
+    --accent-ink: #c4b5fd;
+    --sage: #6fcf97;
+    --sage-soft: #12291b;
+    --danger: #ff8a80;
+    --danger-soft: #3b1517;
+    --warning: #f2c062;
+    --warning-soft: #322610;
+    --info: #7cc0f0;
+    --info-soft: #10273a;
+    --focus: #c4b5fd;
+    --shadow-raised: 0 1px 2px rgba(0, 0, 0, 0.6);
+    --shadow-dialog: 0 16px 48px rgba(0, 0, 0, 0.7);
+  }
+}

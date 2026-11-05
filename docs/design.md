@@ -1840,7 +1840,8 @@ have passed:
   that session's step-up. A callback that consumed the `state` answers `303` to
   `/callback/received`, so the code leaves the address bar; one refused answers the fixed page
   `/callback/refused` in place, so the address can still be pasted. Both pages are static, run
-  no script and load only `/app.css`.
+  no script and load only the stylesheets (`/tokens.css`, `/zoey.css`, `/app.css`) and the
+  app icon.
 
 ### 7.4 OAuth and MCP onboarding
 
