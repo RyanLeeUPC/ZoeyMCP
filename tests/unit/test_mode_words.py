@@ -151,7 +151,7 @@ def test_drift_js_says_each_modes_words() -> None:
     assert declarative_only <= set(found)
     for name in declarative_only:
         assert MANAGED_WORDS.search(found[name]), name
-    assert 'make("p", mode === "managed" ? PROPOSED_SAVED : PROPOSED)' in code
+    assert 'make("p", mode === "managed" ? PROPOSED_SAVED : PROPOSED,' in code
     start = code.index("function then(asked, held) {")
     then = code[start : code.index("\n  }\n", start)]
     assert then.index("return allowReviewed(asked);") < then.index("move(")
