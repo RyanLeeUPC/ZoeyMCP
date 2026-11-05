@@ -28,7 +28,7 @@ from . import review as review_view
 
 EXIT_OK: Final = 0
 EXIT_REFUSED: Final = 1
-ELLIPSIS: Final = "\N{HORIZONTAL ELLIPSIS}"
+EXIT_USAGE: Final = 2
 
 
 def run(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
@@ -43,7 +43,7 @@ def run(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             usage = withdraw_usage(args.key, args.all)
             if usage is not None:
                 err.write(f"zoeymcp approvals withdraw: {usage}\n")
-                return EXIT_REFUSED
+                return EXIT_USAGE
             if args.all:
                 answer = admin_client.approvals_withdraw_all(socket)
             else:
@@ -54,7 +54,7 @@ def run(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             _write(args, answer, list_lines(answer), out)
     except admin_client.AdminUnavailable as exc:
         err.write(f"zoeymcp approvals: {exc}\n")
-        return EXIT_REFUSED
+        return admin_client.exit_code(exc)
     return EXIT_OK
 
 
@@ -91,14 +91,15 @@ def show_lines(answer: Mapping[str, Any]) -> list[str]:
 
 
 def withdrawn_lines(withdrawn: Sequence[Mapping[str, Any]]) -> list[str]:
-    """J15's line: how many, their refs (short), and that nothing was sent."""
+    """J15's line: how many, their refs (whole, to paste into ``approvals show``), and that
+    nothing was sent."""
     if not withdrawn:
-        return ["nothing was waiting: no approval withdrawn"]
-    refs = ", ".join(f"{row['ref'][:4]}{ELLIPSIS}" for row in withdrawn)
+        return ["Nothing was waiting: no approval withdrawn."]
+    refs = ", ".join(str(row["ref"]) for row in withdrawn)
     if len(withdrawn) == 1:
-        return [f"withdrew 1 approval ({refs}): nothing was sent; its message was edited"]
+        return [f"Withdrew 1 approval ({refs}): nothing was sent; its message was edited."]
     count = len(withdrawn)
-    return [f"withdrew {count} approvals ({refs}): nothing was sent; their messages were edited"]
+    return [f"Withdrew {count} approvals ({refs}): nothing was sent; their messages were edited."]
 
 
 def _write(

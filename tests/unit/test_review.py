@@ -495,9 +495,19 @@ def test_the_summary() -> None:
     drift = {**REMOTE, "reports": {"drift": ["a"]}}
     assert view.summary(status(notes=drift))[1] == 1
     stale = {**status(), "fresh": False}
-    assert view.summary(stale) == (
-        ["no gateway servers", "the gateway has no fresh view of the policy"],
-        1,
+    assert view.summary(stale) == ([view.NO_SERVERS, view.NOT_FRESH], 1)
+    # Each names the next step (D16).
+    assert view.NO_SERVERS == (
+        "No gateway servers. Add one in the portal's MCP servers, or with login --mcp URL "
+        "(declarative mode)."
+    )
+    assert view.NOT_FRESH == (
+        "The gateway has no fresh view of the policy: zoeymcp health (in the vault's container) "
+        "shows whether it reaches the vault, and the gateway's log says why not."
+    )
+    assert view.summary(status()) == (
+        [view.NO_SERVERS],
+        0,
     )
 
 
@@ -575,6 +585,7 @@ def test_review_errors(monkeypatch: pytest.MonkeyPatch) -> None:
             ("GET", "/status"): (200, status(notes=REMOTE)),
         }
     )
+    # A review the gateway can't run exits 2, a name it doesn't know 1 (D2).
     assert run_cli(monkeypatch, fake, "review", "gone") == (
         2,
         "",
@@ -589,7 +600,10 @@ def test_review_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (code, err) == (2, "zoeymcp review: --add zz: the server doesn't list it\n")
     assert run_cli(monkeypatch, fake, "review", "--all")[0] == 2
     code, _, err = run_cli(monkeypatch, fake, "gateway-status", "zz")
-    assert (code, err) == (2, "zoeymcp gateway-status: no gateway server named 'zz'\n")
+    assert (code, err) == (
+        1,
+        "zoeymcp gateway-status: no gateway server named 'zz'; known: notes\n",
+    )
     code, out, _ = run_cli(monkeypatch, fake, "gateway-status", "notes", "--format", "json")
     assert list(json.loads(out)["servers"]) == ["notes"]
     code, out, _ = run_cli(monkeypatch, fake, "review", "--format", "json")

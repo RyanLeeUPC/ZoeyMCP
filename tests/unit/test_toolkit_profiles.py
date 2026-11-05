@@ -56,7 +56,7 @@ def test_the_toolkit_profiles_pass_check(names: tuple[str, ...]) -> None:
     out = io.StringIO()
     document = io.StringIO(json.dumps(merged(*names)))
     assert main(["check", "--config", "-"], stdin=document, out=out) == 0
-    assert out.getvalue() == "<stdin>: ok (0 error(s), 0 warning(s))\n"
+    assert out.getvalue() == "<stdin>: ok (0 errors, 0 warnings)\n"
 
 
 def generated(toolkit: Toolkit) -> dict[str, str]:

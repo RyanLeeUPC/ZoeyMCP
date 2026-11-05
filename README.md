@@ -120,8 +120,8 @@ printf '%s' "$API_KEY" | docker compose -f deploy/compose.yaml exec -T zoeymcp z
 docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp setup-code
 ```
 
-Open `http://localhost:8081` in a browser on the same host, choose **Set up**, enter the code and
-enrol a passkey. On **MCP servers**, **Review** the `notes` server: include and classify each tool
+Open `http://localhost:8081` in a browser on the same host, choose **I have a setup code**, enter
+the code and enrol a passkey. On **MCP servers**, **Review** the `notes` server: include and classify each tool
 you want as `allow` or `approve`, leave **Record the rest as declined** ticked, and **Save**. One
 passkey prompt confirms the plan it shows ("Revision 2, from 1. ..."); no commit and no recreate.
 The gateway serves the tools within seconds. Point the agent at the server:

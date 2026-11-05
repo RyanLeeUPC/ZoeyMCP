@@ -518,7 +518,7 @@ class World:
             """Stdin that approves the URL the CLI printed and pastes where it led."""
 
             def readline(self, size: int = -1, /) -> str:  # type: ignore[override]
-                [url] = PRINTED_URL.findall(out.getvalue())
+                [url] = PRINTED_URL.findall(err.getvalue())  # the URL is on stderr (D10)
                 pasted = asyncio.run_coroutine_threadsafe(world.browse(url), loop)
                 return pasted.result(timeout=60) + "\n"
 
@@ -2379,7 +2379,7 @@ class Onboarding:
 
         class Paste(io.StringIO):
             def readline(self, size: int = -1, /) -> str:  # type: ignore[override]
-                [url] = PRINTED_URL.findall(out.getvalue())
+                [url] = PRINTED_URL.findall(err.getvalue())  # the URL is on stderr (D10)
                 pasted = asyncio.run_coroutine_threadsafe(world.browse(url), loop)
                 return pasted.result(60) + "\n"
 
@@ -3073,7 +3073,7 @@ def test_the_hosts_offline_seed_and_reseed_show_no_policy_value(
         err = io.StringIO()
         assert main(argv, stdin=io.StringIO(), out=io.StringIO(), err=err) == 0, err.getvalue()
         printed.append(err.getvalue())
-    assert "  Forgets: 1 retired client token(s)" in printed[2]
+    assert "  Forgets: 1 retired client token" in printed[2]
     events = [json.loads(line)["event"] for line in log_lines.getvalue().splitlines()]
     assert events.count("policy_imported") == 2
     assert "policy_seeded" in events

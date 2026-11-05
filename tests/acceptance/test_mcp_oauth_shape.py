@@ -84,7 +84,7 @@ def test_the_profile_passes_check() -> None:
     out = io.StringIO()
     document = io.StringIO(json.dumps({**BASE, **fragment()}))
     assert main(["check", "--config", "-"], stdin=document, out=out) == 0
-    assert out.getvalue() == "<stdin>: ok (0 error(s), 0 warning(s))\n"
+    assert out.getvalue() == "<stdin>: ok (0 errors, 0 warnings)\n"
 
 
 def test_the_profile_says_what_the_shape_needs() -> None:
@@ -181,7 +181,8 @@ def login(gateway: GatewayDeployment, ca: ProviderCA) -> tuple[int, str, str]:
     httpx.HTTPTransport = lambda **_: gateway.vault.admin_transport()  # type: ignore[assignment,misc]
     try:
         out, err = io.StringIO(), io.StringIO()
-        code = main(["login", CREDENTIAL], stdin=Browser(out, ca), out=out, err=err)
+        # The URL is on stderr (D10): the browser reads it there.
+        code = main(["login", CREDENTIAL], stdin=Browser(err, ca), out=out, err=err)
     finally:
         httpx.HTTPTransport = original  # type: ignore[misc]
     gateway.seen.outputs += [out.getvalue(), err.getvalue()]
@@ -272,9 +273,9 @@ async def test_login_calls_refreshes_a_refused_token_and_an_approval(
     with deployed(tmp_path, ca, auth, fake, clock, link) as gateway, gateway.running() as running:
         # The CLI paste: a PKCE login that asks for the server as the token's audience.
         code, out, err = login(gateway, ca)
-        assert (code, err) == (0, "")
+        assert code == 0, err
         assert f"Stored the refresh token for {CREDENTIAL} as {SLOT}.\n" in out
-        [url] = PRINTED_URL.findall(out)
+        [url] = PRINTED_URL.findall(err)
         check_the_login(auth, url)
         await the_calls(gateway, running, auth, fake, clock, script)
     check_the_calls(gateway, fake, script)

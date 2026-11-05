@@ -86,6 +86,8 @@ from ..common.suggest import suggestion
 from ..common.textrules import reveal_hidden
 from . import admin_client
 
+# The exit codes every command shares (docs/operations.md, "Exit codes"): a refusal, a
+# managed deployment's included, is the operator's to act on.
 EXIT_CLEAN = 0
 EXIT_NEEDS_OPERATOR = 1
 EXIT_COULD_NOT_RUN = 2
@@ -106,6 +108,11 @@ STATE_LABELS = {
 
 class UsageError(ValueError):
     """An option that doesn't fit what the review found."""
+
+
+def counted(count: int, noun: str) -> str:
+    """``1 error``, ``0 errors``, ``2 errors``: the count and the noun, plural unless one."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def untrusted(text: object, limit: int = MAX_SHOWN_CHARS) -> str:
@@ -342,7 +349,10 @@ def write_json(data: Any, out: TextIO) -> None:
 MANAGED_REFUSED: Final = (
     "this deployment is managed: save it in the portal, or export, edit and import"
 )
-MODE_UNKNOWN: Final = "the gateway hasn't received the policy from the vault yet: try again"
+MODE_UNKNOWN: Final = (
+    "the gateway hasn't received the policy from the vault yet: zoeymcp health shows whether it "
+    "reaches the vault; try again once gateway-status says fresh"
+)
 
 
 def answered_mode(answer: Mapping[str, Any]) -> str:
@@ -457,6 +467,16 @@ def counts_line(counts: Mapping[str, int]) -> str:
 # --- the summary and gateway-status --------------------------------------------------------------
 
 
+NO_SERVERS: Final = (
+    "No gateway servers. Add one in the portal's MCP servers, or with login --mcp URL "
+    "(declarative mode)."
+)
+NOT_FRESH: Final = (
+    "The gateway has no fresh view of the policy: zoeymcp health (in the vault's container) "
+    "shows whether it reaches the vault, and the gateway's log says why not."
+)
+
+
 def summary(status: dict[str, Any]) -> tuple[list[str], int]:
     """``review`` with no server: one line per server, from the gateway's status, with the
     tools it lists that nobody reviewed under it. Exit 1 when any server needs the operator, the
@@ -490,9 +510,9 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
         if unreviewed is not None:
             lines.append(f"  {unreviewed}")
     if not status["servers"]:
-        lines.append("no gateway servers")
+        lines.append(NO_SERVERS)
     if not status["fresh"]:
-        lines.append("the gateway has no fresh view of the policy")
+        lines.append(NOT_FRESH)
         code = EXIT_NEEDS_OPERATOR
     return lines, code
 

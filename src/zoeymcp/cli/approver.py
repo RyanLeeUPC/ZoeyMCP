@@ -17,8 +17,9 @@ Over the vault's admin socket, as the host (no step-up kind: host authority, lik
 - ``approver telegram test``: the probe, a message with no buttons; exit 0 when Telegram took it,
   1 with the finding that says why not (G.7), so a verify script can run it unattended.
 
-Both take ``--format text|json`` (D-171): with ``json`` the transcript goes to stderr and the
-answer to stdout. Every string from the vault or Telegram (a display name) goes out through
+Both take ``--format text|json`` (D-171). The transcript and its prompts go to stderr; stdout
+holds the answer: the policy lines in text mode, the JSON document with ``json``. Every string
+from the vault or Telegram (a display name) goes out through
 ``review.write_lines``, which shows control characters as text.
 """
 
@@ -78,7 +79,7 @@ def run(
         return _enrol(args, socket, stdin, out, err, typed or read_code)
     except admin_client.AdminUnavailable as exc:
         err.write(f"zoeymcp approver telegram {args.action}: {exc}\n")
-        return EXIT_REFUSED
+        return admin_client.exit_code(exc)
 
 
 def read_code(stdin: TextIO) -> str:
@@ -108,11 +109,11 @@ def _test(args: argparse.Namespace, socket: str, out: TextIO) -> int:
     if args.format == "json":
         review_view.write_json(answer, out)
     elif answer["sent"]:
-        out.write("sent: the test message reached the chat\n")
+        out.write("Sent: the test message reached the chat.\n")
     else:
         finding = str(answer["finding"])
         why = FINDINGS.get(finding, finding)
-        review_view.write_lines([f"not sent ({finding}): {why}"], out)
+        review_view.write_lines([f"Not sent ({finding}): {why}."], out)
     return EXIT_OK if answer["sent"] else EXIT_REFUSED
 
 
@@ -124,7 +125,7 @@ def _enrol(
     err: TextIO,
     typed: Callable[[TextIO], str],
 ) -> int:
-    said = err if args.format == "json" else out  # the transcript
+    said = err  # the transcript, and its prompts
     opened: Mapping[str, Any] | None = None
     try:
         try:
@@ -161,8 +162,11 @@ def _enrol(
         applied = _apply(socket, confirmed, lines, stdin, said)
         if applied is None:
             return EXIT_REFUSED
-    else:
+    elif args.format == "json":
         review_view.write_lines([*lines, *RELOAD], said)
+    else:
+        review_view.write_lines(lines, out)  # the answer: the lines to add
+        review_view.write_lines(RELOAD, said)
     if args.format == "json":
         review_view.write_json({**confirmed, "revision": applied}, out)
     return EXIT_OK
@@ -194,6 +198,12 @@ def _stop_busy(
     return True
 
 
+# A plan with a lockout row isn't applied here: the host imports it, the lines added by hand.
+LOCKOUT: Final = (
+    "This plan has a lockout row, so nothing was written: add the lines above to an export "
+    "(zoeymcp policy export > policy.yaml), then run zoeymcp policy import - < policy.yaml, "
+    "which shows the row and asks."
+)
 # The step after the lines, in declarative mode or without --apply.
 RELOAD: Final = (
     "Add these lines to the policy, then check it and reload the vault (managed: run this "
@@ -253,7 +263,7 @@ def _apply(
     rows = [f"  {label}: {value}" for label, value in plan["rows"]]
     review_view.write_lines(rows, said)
     if plan["lockout"]:
-        said.write("This plan has a lockout row: import it with zoeymcp policy import.\n")
+        said.write(f"{LOCKOUT}\n")
         return None
     said.write("Apply as a host import? [y/N] ")
     said.flush()

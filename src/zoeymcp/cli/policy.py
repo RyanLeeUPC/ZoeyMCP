@@ -145,7 +145,7 @@ from ..vault.server import (
 from ..vault.store import SecretStore, StoreError
 from . import admin_client
 from .onboard import Prefix, next_lines
-from .review import write_json
+from .review import counted, write_json
 
 # The refusals only these commands give; portal/refusals.py catalogues each (N.2).
 Reason = Literal[
@@ -265,7 +265,7 @@ def run(
     except admin_client.AdminUnavailable as exc:
         if exc.reason is None:
             err.write(f"{name}: {exc}\n")
-            return EXIT_UNREADABLE
+            return admin_client.exit_code(exc)
         refused = OfflineRefused.answered(exc.reason, str(exc), exc.data.get("subjects") or ())
         err.write(f"{name}: {refused.text()}\n")
         for flag in refused.flags:
@@ -728,13 +728,13 @@ def _forgotten(before: Ratchet, after: Ratchet) -> list[tuple[str, str]]:
     """Every entry the old ratchet holds that the new one doesn't (F.3), by name where the
     ratchet keeps one: a retired client or caller is a hash, so only counted."""
     rows = [
-        ("Forgets", f"pin:{server}/{kind}/{name}: {len(pins)} retired pin(s)")
+        ("Forgets", f"pin:{server}/{kind}/{name}: {counted(len(pins), 'retired pin')}")
         for (server, kind, name), pins in sorted(before.retired_pins.items())
     ]
     if before.retired_clients:
-        rows.append(("Forgets", f"{len(before.retired_clients)} retired client token(s)"))
+        rows.append(("Forgets", counted(len(before.retired_clients), "retired client token")))
     if before.retired_callers:
-        rows.append(("Forgets", f"{len(before.retired_callers)} retired caller placeholder(s)"))
+        rows.append(("Forgets", counted(len(before.retired_callers), "retired caller placeholder")))
     rows += [
         ("Forgets", f"approve: {server}/{kind}/{name}")
         for server, kind, name in sorted(before.approved - after.approved)

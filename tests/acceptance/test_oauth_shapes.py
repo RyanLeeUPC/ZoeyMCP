@@ -196,7 +196,8 @@ class World:
     def login(self, credential: str) -> tuple[int, str, str]:
         """``zoeymcp login`` in one go: approve in the browser and paste the address."""
         out, err = io.StringIO(), io.StringIO()
-        code = main(["login", credential], stdin=Browser(out, self.d.ca), out=out, err=err)
+        # The URL is on stderr (D10): the browser reads it there.
+        code = main(["login", credential], stdin=Browser(err, self.d.ca), out=out, err=err)
         self.said += [out.getvalue(), err.getvalue()]
         return code, out.getvalue(), err.getvalue()
 
@@ -306,7 +307,7 @@ def test_the_oauth_profiles_pass_check(profile: str) -> None:
     out = io.StringIO()
     document = io.StringIO(json.dumps({**BASE, **fragment}))
     assert main(["check", "--config", "-"], stdin=document, out=out) == 0
-    assert out.getvalue() == "<stdin>: ok (0 error(s), 0 warning(s))\n"
+    assert out.getvalue() == "<stdin>: ok (0 errors, 0 warnings)\n"
 
 
 def test_the_oauth_profiles_say_what_the_providers_do() -> None:
@@ -412,10 +413,11 @@ def test_s5_login_then_refresh_on_expiry(
         assert (auth.calls, w.api.received) == ([], [])
 
         code, out, err = w.login("google-calendar")
-        assert (code, err) == (0, "")
+        assert code == 0, err
         assert "Stored the refresh token for google-calendar as google-refresh.\n" in out
         assert f"Granted: {CALENDAR_SCOPE}\n" in out
-        [url] = PRINTED_URL.findall(out)
+        # The instructions and the URL lead to the paste, on stderr (D10).
+        [url] = PRINTED_URL.findall(err)
         query = dict(parse_qsl(urlsplit(url).query))
         assert query["redirect_uri"] == REDIRECT
         assert (query["access_type"], query["prompt"]) == ("offline", "consent")
@@ -492,13 +494,13 @@ def test_s5_scopes_narrower_and_wider(
         code, out, err = w.login("google-calendar")
         assert code == 0
         assert "Granted: (no scopes)\n" in out
-        assert err == f"missing: {CALENDAR_SCOPE}\n"
+        assert err.endswith(f"minutes):\nmissing: {CALENDAR_SCOPE}\n")
 
         # A wider grant is stored and flagged (K1).
         auth.granted_scopes = (CALENDAR_SCOPE, MAIL_SCOPE)
         code, out, err = w.login("google-calendar")
         assert code == 0
-        assert err == f"UNEXPECTED: {MAIL_SCOPE}\n"
+        assert err.endswith(f"minutes):\nUNEXPECTED: {MAIL_SCOPE}\n")
         assert w.status()["scopes"] == {"unexpected": [MAIL_SCOPE], "missing": []}
         code, out, _ = w.cli(["oauth", "status", "google-calendar"])
         assert f"  UNEXPECTED scopes: {MAIL_SCOPE}\n" in out
@@ -876,7 +878,7 @@ def test_s6_env_seed_promotion_and_reseeding(
             assert last_refresh() == ("live", "reseed_never")
             assert auth.refresh_calls[-1].refresh_token == live.rt.reveal()
             # Deleting the live slot re-seeds from the env value the vault started with.
-            assert w.cli(["secret", "delete", LIVE]) == (0, f"deleted {LIVE}\n", "")
+            assert w.cli(["secret", "delete", LIVE]) == (0, f"Deleted {LIVE}.\n", "")
             assert w.get(TOP).status_code == 200
             assert last_refresh() == ("seed", "no_live")
             assert auth.refresh_calls[-1].refresh_token == second

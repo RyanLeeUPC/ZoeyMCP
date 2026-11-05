@@ -46,6 +46,9 @@ from ..common.policy.emit import INDENT_MAX
 from ..vault.oauth import dcr
 from ..vault.onboarding import ONBOARDING_TTL, fragment_file, managed_next
 from . import admin_client
+from .admin_client import COMPOSE_CMD_ENV as COMPOSE_CMD_ENV
+from .admin_client import DEFAULT_COMPOSE_CMD as DEFAULT_COMPOSE_CMD
+from .admin_client import EXEC_SERVICE_ENV as EXEC_SERVICE_ENV
 from .review import (
     StillRunning,
     counts_line,
@@ -60,10 +63,7 @@ EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_USAGE = 2
 
-COMPOSE_CMD_ENV: Final = "ZOEYMCP_COMPOSE_CMD"
-EXEC_SERVICE_ENV: Final = "ZOEYMCP_EXEC_SERVICE"
-# The shipped hardened file's, when the container's environment names nothing (M.7).
-DEFAULT_COMPOSE_CMD: Final = "docker compose -f deploy/compose.hardened.yaml"
+# The shipped hardened file's service, when the container's environment names none (M.7).
 DEFAULT_EXEC_SERVICE: Final = "vault"
 # How long the second run waits for the review it queued (M.6).
 REPORT_WAIT: Final = 120
@@ -296,7 +296,8 @@ def login_mcp(
     environ: Mapping[str, str],
 ) -> int:
     """``login --mcp``: exit 0 once fragment 1 is written or the second run is done, 1 when
-    the vault refused or the operator declined, 2 for a usage error."""
+    the vault refused, the deployment is managed or the operator declined, 2 for a usage error
+    or a vault that can't be reached."""
     prefix = Prefix.from_environ(environ)
     problem = usage(args, argv, stdin, prefix)
     if problem is not None:
@@ -350,7 +351,7 @@ class _Run:
             self.answers["refused"] = {"error": reason, "mode": mode, "next": steps}
             if not self.json:
                 self.say(f"zoeymcp login: {reason}", *next_lines(steps, self.prefix))
-            return self.finish(EXIT_USAGE)
+            return self.finish(EXIT_FINDINGS)
         try:
             plan = admin_client.onboard_discover(self.socket, discover_body(self.args))
         except admin_client.AdminUnavailable as exc:
@@ -389,7 +390,7 @@ class _Run:
                 except admin_client.AdminUnavailable as exc:
                     self.cancel(onboarding)
                     self.say(f"zoeymcp login: {exc}")
-                    return self.finish(EXIT_FINDINGS)
+                    return self.finish(admin_client.exit_code(exc))
         indent: int | str = "compose" if self.args.target == "compose" else self.args.indent or 0
         registers = plan["stage"] != "registered" and plan["plan"].get("registration") == "dcr"
         stored_as = None
@@ -497,7 +498,7 @@ class _Run:
         except admin_client.AdminUnavailable as exc:
             self.answers["review"] = dict(exc.data) or {"error": str(exc)}
             self.say(f"The review didn't run: {untrusted(exc)}")
-            return EXIT_FINDINGS
+            return admin_client.exit_code(exc)
         except StillRunning as running:
             self.answers["review"] = running.job
             self.say(
@@ -526,9 +527,10 @@ class _Run:
                     acl = self.args.squid_src[-1].partition("=")[2]
                     step["squid"] = with_source(step["squid"], acl)
             steps.append(self.retry())
+        code = admin_client.exit_code(exc)
         if self.json:
             self.answers["refused"] = {**data, "next": steps} if steps else data
-            return self.finish(EXIT_FINDINGS)
+            return self.finish(code)
         lines = [f"zoeymcp login: {untrusted(exc)}"]
         reason = data.get("reason")
         if reason == "bad_body" and data.get("detail"):
@@ -548,7 +550,7 @@ class _Run:
         if data.get("secret_restored"):
             lines.append("  The client secret it replaced was put back; the policy still uses it.")
         self.say(*lines, *next_lines(steps, self.prefix))
-        return self.finish(EXIT_FINDINGS)
+        return self.finish(code)
 
     def retry(self) -> dict[str, Any]:
         """D.11's ``retry``: this run's own argv again, shell-quoted (TI-14), in the vault's

@@ -1371,7 +1371,8 @@ def standard_walk(tmp_path: Path, ca: ProviderCA) -> None:
             assert code == 0, err
             assert err.splitlines()[0] == (
                 "One-time code, valid for 15 minutes. "
-                f"Open http://localhost:{made.portal} and choose Set up."
+                f"Open http://localhost:{made.portal}, choose I have a setup code, and type the "
+                "code."
             )
             assert redeem(page, out.strip()).status_code == 200
             assert enrol(page, passkey).status_code == 200

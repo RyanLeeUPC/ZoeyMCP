@@ -310,7 +310,8 @@ async def test_a_review_that_cant_run_exits_2(
         toolkit = run("review", "mail")
     assert failed[0] == 2
     assert "the review couldn't list the server's tools (" in failed[2]
-    assert (unknown[0], unknown[2]) == (2, "zoeymcp review: no gateway server named 'nothing'\n")
+    # A name the gateway doesn't know is refused (exit 1); the rest couldn't run (2).
+    assert (unknown[0], unknown[2]) == (1, "zoeymcp review: no gateway server named 'nothing'\n")
     assert toolkit[0] == 2
     assert toolkit[2] == "zoeymcp review: the toolkit isn't loaded (not_registered)\n"
 
@@ -364,5 +365,9 @@ async def test_the_summary_and_status_make_no_upstream_call(
     assert status[1].startswith("view sha256:")
     assert f"{SERVER}  remote  ready" in status[1]
     assert list(json.loads(one[1])["servers"]) == [SERVER]
-    assert missing[0] == 2
+    assert missing == (
+        1,
+        "",
+        f"zoeymcp gateway-status: no gateway server named 'nothing'; known: mail, {SERVER}\n",
+    )
     assert bad == (2, "", "zoeymcp review: these options need a server\n")

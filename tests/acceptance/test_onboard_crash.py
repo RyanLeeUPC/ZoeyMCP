@@ -128,7 +128,7 @@ class Deployment:
         out, err = io.StringIO(), io.StringIO()
         given = stdin if stdin is not None else io.StringIO()
         if isinstance(given, Browser):
-            given.shown = out
+            given.shown = err  # login prints its URL on stderr (D10)
         code = main([*argv, "--socket", str(self.socket)], stdin=given, out=out, err=err)
         return code, out.getvalue(), err.getvalue()
 

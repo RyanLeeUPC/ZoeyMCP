@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from typing import Any, TextIO
 
 from ..common import ledgerjoin
+from .review import counted
 
 _SINCE = re.compile(r"^([0-9]{1,6})([mhd])$")
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
@@ -151,7 +152,8 @@ def vault_lines(page: dict[str, Any]) -> list[str]:
         first, *rest = _row_lines(row)
         out.extend([first, f"  only the vault's own chain holds this call ({words})", *rest])
     if page.get("vault_only_more"):
-        out.append(f"{page['vault_only_more']} older call(s) only the vault's own chain holds")
+        older = counted(page["vault_only_more"], "older call")
+        out.append(f"{older} only the vault's own chain holds")
     for epoch in page.get("archives", []):
         line = f"archived {epoch['name']}: {_epoch(epoch)}"
         out.append(line + (", files dropped" if epoch["dropped"] else ""))

@@ -1110,7 +1110,7 @@ step "standard tier: agents need a token; admin commands switch to the socket's 
     -d '{}' http://127.0.0.1:8090/s/notes/mcp)" = "401" ] || fail "no token wasn't 401"
 out="$(printf 'notes-smoke-0123456789' | docker exec -i "$std" zoeymcp secret set notes-key)"
 echo "$out"
-echo "$out" | grep -q "^stored notes-key" || fail "secret set didn't reach the vault as root"
+echo "$out" | grep -q "^Stored notes-key" || fail "secret set didn't reach the vault as root"
 out="$(docker exec "$std" zoeymcp review)" || fail "review (no server) didn't reach the gateway"
 echo "$out"
 echo "$out" | grep -q "^notes  " || fail "review lists no notes server"
@@ -1566,7 +1566,7 @@ grep -qx 'Mode: managed' "$work/head" && grep -q '^Revision 1, ' "$work/head" \
 step "managed, standard tier: the secret set and a setup code, with the README's commands"
 out="$(printf '%s' 'notes-smoke-0123456789' | quick exec -T zoeymcp zoeymcp secret set notes-key)"
 echo "$out"
-echo "$out" | grep -q "^stored notes-key" || fail "managed, standard tier: secret set failed"
+echo "$out" | grep -q "^Stored notes-key" || fail "managed, standard tier: secret set failed"
 code="$(quick exec -T zoeymcp zoeymcp setup-code)" \
     || fail "managed, standard tier: setup-code didn't reach the vault"
 portal_code "managed, standard tier" "$code" quick logs zoeymcp
@@ -1690,7 +1690,7 @@ quick_first_key="$quick_gateway_key"
 quick_hardened run --rm --no-deps -T vault check >"$work/out" 2>&1 \
     || { cat "$work/out"; fail "managed, hardened tier: check refused §30 step 3's policy"; }
 cat "$work/out"
-grep -qx '\$ZOEYMCP_CONFIG: ok (0 error(s), 2 warning(s))' "$work/out" \
+grep -qx '\$ZOEYMCP_CONFIG: ok (0 errors, 2 warnings)' "$work/out" \
     && grep -q '^warning mode: the vault seeds its first revision from this document' "$work/out" \
     && grep -q '^warning gateway.clients.agent1.servers: no servers' "$work/out" \
     || fail "managed, hardened tier: check didn't give §30's two warnings"
@@ -1711,7 +1711,7 @@ grep -q "$seed_head_line" "$work/logs" \
     || fail "managed, hardened tier: no policy_head line for the seeded revision 1"
 out="$(printf '%s' 'stats-smoke-0123456789' | quick_hardened exec -T vault zoeymcp secret set music-stats)"
 echo "$out"
-echo "$out" | grep -q "^stored music-stats" || fail "managed, hardened tier: secret set failed"
+echo "$out" | grep -q "^Stored music-stats" || fail "managed, hardened tier: secret set failed"
 code="$(quick_hardened exec -T vault zoeymcp setup-code)" \
     || fail "managed, hardened tier: setup-code didn't reach the vault"
 portal_code "managed, hardened tier" "$code" quick_hardened logs vault
@@ -1901,7 +1901,7 @@ until egress_key="$(egress_tier exec -T vault zoeymcp egress-key 2>/dev/null \
 done
 out="$(printf 'app-password-0001' | egress_tier exec -T vault zoeymcp secret set mail-pass)"
 echo "$out"
-echo "$out" | grep -q "^stored mail-pass" || egress_fail "the mail password wasn't stored"
+echo "$out" | grep -q "^Stored mail-pass" || egress_fail "the mail password wasn't stored"
 egress_tier up -d egress-proxy
 i=0
 until egress_tier logs egress-proxy 2>&1 | grep -q '"event":"egress_allowlist_applied"'; do

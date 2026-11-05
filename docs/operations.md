@@ -28,7 +28,24 @@ docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp oauth status
 ```
 
 The examples below shorten that to `zoeymcp ...`. `docker compose exec` gives the command a
-terminal, which the hidden prompts need. Add `-T` to pipe a value in instead.
+terminal, which the hidden prompts need. Add `-T` to pipe a value in instead. Run on the host, or
+in the wrong container, a command says it can't reach the admin socket, and prints the `exec`
+form that runs it in the right one. `zoeymcp --help` lists the commands by when you need them
+and says where each runs.
+
+## Exit codes
+
+Every command exits with one of three codes, so a script can tell them apart:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Done: what was asked happened, or found nothing that needs you. |
+| 1 | Findings, a refusal (the vault's, or the CLI's in the wrong mode), a prompt you declined, or nothing to do. |
+| 2 | A usage error, or the command can't run: the admin socket can't be reached, or the vault answers that it can't (it is starting or stopping, or lacks the part asked for). |
+
+A command's own help names what its 1 means (`health`: an error, or with `--strict` a warning;
+`review`: something needs you). The answer goes to stdout and everything else to stderr: the
+plan, the prompts, the notes and the errors.
 
 ## 1. The state volume
 
@@ -314,12 +331,12 @@ connector mail: ok (3 of 20 sends in 24 h)
 store: info (4 entries)
   info    unreferenced: nothing in the policy uses store:old-key
           run: zoeymcp secret delete old-key
-health: ok (0 error(s), 1 warning(s), 1 info)
+health: ok (0 errors, 1 warning, 1 info)
 ```
 
 It exits 0 with no error (with `--strict`, no warning either), 1 otherwise, and 2 when the vault
-can't be asked. `--json` prints the whole report, with a `summary` of counts per level and each
-finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
+can't be asked. `--format json` (or `--json`) prints the whole report, with a `summary` of counts
+per level and each finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
 `set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
 `check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys`,
 `reset_passkeys`, `onboard_again` (with the `command`, `login --mcp URL --reregister`),
@@ -787,7 +804,7 @@ apply: add the route, the credential and the server, and choose the server's too
 which saves each change, or export the policy, edit it and import it on the host (§34, "Importing
 a change"). The CLI knows which mode runs and prints no fragment for a managed deployment: `review`
 with `--add`, `--allow`, `--approve`, `--allow-read-only`, `--repin`, `--decline`,
-`--decline-rest` or `--choices`, and `login --mcp`, refuse (exit 2) and name the way instead:
+`--decline-rest` or `--choices`, and `login --mcp`, refuse (exit 1) and name the way instead:
 
 ```text
 $ zoeymcp review notes --add search_notes
@@ -2324,8 +2341,9 @@ sessions stay.
 
 **Sessions.** The Sessions page lists every signed-in browser, by fingerprint, with its origin,
 the passkey it signed in with, and when it was made and last used; **End the other sessions**
-ends every one but yours. `zoeymcp sessions` lists the same from the host, and
-`zoeymcp sessions --end-all` ends them all. At most 8 sessions are kept; a ninth sign-in ends the
+ends every one but yours. `zoeymcp sessions` lists the same from the host, one line a session
+(`--format json` for the vault's answer whole), and `zoeymcp sessions --end-all` ends them all,
+including any you are signed in with. At most 8 sessions are kept; a ninth sign-in ends the
 one used least recently.
 
 **Passkeys.** The Passkeys page lists every passkey that can sign in, by name and fingerprint:
@@ -3411,10 +3429,10 @@ below.
    `printf '%s' "$KEY" | $c exec -T vault zoeymcp secret set music-stats`. No reload: the policy
    names the secret, never its value.
 6. **The portal.** `$c exec vault zoeymcp setup-code` issues a one-time code, valid for 15
-   minutes: open `http://localhost:8081`, choose **Set up**, and enrol a passkey (§26). From now
-   on the portal and `zoeymcp policy import` are where the policy changes. Keep an export as a
-   backup, and keep it like a secret: `$c exec -T vault zoeymcp policy export >
-   policy-export.yaml` (§34).
+   minutes: open `http://localhost:8081`, choose **I have a setup code**, type the code, and
+   enrol a passkey (§26). From now on the portal and `zoeymcp policy import` are where the
+   policy changes. Keep an export as a backup, and keep it like a secret:
+   `$c exec -T vault zoeymcp policy export > policy-export.yaml` (§34).
 7. **A remote MCP server, by its URL**, in the portal (§11, "Onboarding by URL in the portal, in
    managed mode"): on **MCP servers**, **Add a server by URL** discovers the server and shows the
    plan, and **Register its client** registers a client after your passkey (a client you
@@ -4699,8 +4717,9 @@ hostile, a token that leaked), these stop it, fastest first. Each is undone the 
   then **Save** (one passkey each); the gateway refuses the client there at once. Then remove the
   client, or give it a new `token_sha256`, with an export, an edit and `zoeymcp policy import`
   (§10). In declarative mode, remove the client (or its `token_sha256`) and reload (§10).
-- **Withdraw every approval waiting** at the vault: `zoeymcp approvals withdraw --all` ("withdrew
-  3 approvals (3f9c…, 9a01…, 77e1…): nothing was sent; their messages were edited"); the agents
+- **Withdraw every approval waiting** at the vault: `zoeymcp approvals withdraw --all` ("Withdrew
+  3 approvals (3f9c0a17b2d4e681, 9a01c4e2d7b35f60, 77e1b0c93a5d2f48): nothing was sent; their
+  messages were edited."); the agents
   are told the operator withdrew their calls. One call: `zoeymcp approvals withdraw <ref>`. A call
   already approved and running finishes. Nothing to undo: the agent calls again.
 - **Stop Telegram now**: revoke the bot's token with the bot-making account first. That stops it

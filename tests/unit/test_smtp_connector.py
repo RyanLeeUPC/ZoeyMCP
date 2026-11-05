@@ -652,7 +652,7 @@ def test_the_smtp_profiles_pass_check(profile: str) -> None:
     # Alone, a connector profile has no toolkit to use it; profiles/toolkit-mail.yaml adds one.
     assert out.getvalue() == (
         "warning connectors.mail-out: no toolkit slot maps a route to it\n"
-        "<stdin>: ok (0 error(s), 1 warning(s))\n"
+        "<stdin>: ok (0 errors, 1 warning)\n"
     )
 
 

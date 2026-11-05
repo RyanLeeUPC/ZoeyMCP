@@ -1070,8 +1070,8 @@ def test_cli_over_the_socket(tmp_path: Path, socket_dir: Path) -> None:
         code, out, _ = cli(["secret", "set", "broker-refresh", "--socket", sock], stdin="rt-1")
         assert code == 0
         assert out == (
-            "stored broker-refresh, bound to token endpoint https://auth.broker.example:443, "
-            "access tokens to https://mcp.broker.example:443\n"
+            "Stored broker-refresh, bound to token endpoint https://auth.broker.example:443, "
+            "access tokens to https://mcp.broker.example:443.\n"
         )
         argv = ["secret", "set", "broker-refresh", "--origin", "https://x.example"]
         code, _, err = cli([*argv, "--socket", sock], stdin="rt-2")
@@ -1093,8 +1093,8 @@ def test_cli_secret_set_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     code, out, _ = cli(["secret", "set", "broker-refresh", "--socket", "x"], stdin="rt-1\n")
     assert code == 0
     assert out == (
-        "stored broker-refresh, bound to token endpoint https://auth.broker.example:443, "
-        "access tokens to https://mcp.broker.example:443\n"
+        "Stored broker-refresh, bound to token endpoint https://auth.broker.example:443, "
+        "access tokens to https://mcp.broker.example:443.\n"
     )
     argv = ["secret", "set", "broker-client-id", "--origin", "https://x.example", "--socket", "x"]
     code, out, err = cli(argv, stdin="id-2")
@@ -1105,8 +1105,10 @@ def test_cli_secret_set_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 def test_cli_reports_an_unreachable_socket(tmp_path: Path) -> None:
     code, _, err = cli(["secret", "list", "--socket", str(tmp_path / "absent.sock")])
-    assert code == 1
+    # It can't run (D2), and the error names where it runs (D1).
+    assert code == 2
     assert "can't reach the vault's admin socket" in err
+    assert "run it in the vault's container: " in err or "this is the vault's container" in err
 
 
 @posix_only

@@ -57,7 +57,6 @@ REFS = ("3f9c0a17b2d4e681", "9a01c4e2d7b35f60", "77e1b0c93a5d2f48")
 OPERATOR = Person(OPERATOR_ID, "Operator", "operator_example")
 TIMINGS = Timings(send_spacing=0.05, contested_backoff=0.3, backoff_max=0.2, poll_timeout=1)
 CODE = re.compile(r"\?start=([A-Za-z0-9_-]{22})")
-ELLIPSIS = "\N{HORIZONTAL ELLIPSIS}"
 WITHDRAWN = "zoeymcp approvals: This approval was withdrawn, so nothing was sent.\n"
 
 
@@ -268,7 +267,8 @@ def test_withdraw_by_either_identifier(
     approved = rig.begin(REFS[2], tool="cancel_order")
     code, out, err = run_cli(["approvals", "withdraw", REFS[0]])
     assert (code, err) == (0, "")
-    said = f"withdrew 1 approval (3f9c{ELLIPSIS}): nothing was sent; its message was edited\n"
+    # The whole ref, to paste into approvals show (D20), in a sentence (D8).
+    said = f"Withdrew 1 approval ({REFS[0]}): nothing was sent; its message was edited.\n"
     assert out == said
     code, out, _ = run_cli(["approvals", "withdraw", second.id, "--format", "json"])
     assert json.loads(out) == {
@@ -310,7 +310,8 @@ def test_withdraw_by_either_identifier(
     ids=["neither", "both"],
 )
 def test_withdraw_takes_one_identifier_or_all(argv: list[str], said: str) -> None:
-    assert run_cli(argv) == (1, "", f"zoeymcp approvals withdraw: {said}\n")
+    # A usage error exits 2, as every command's does (D2).
+    assert run_cli(argv) == (2, "", f"zoeymcp approvals withdraw: {said}\n")
 
 
 def test_withdraw_all(
@@ -325,8 +326,7 @@ def test_withdraw_all(
     code, out, err = run_cli(["approvals", "withdraw", "--all"])
     assert (code, err) == (0, "")
     assert out == (
-        f"withdrew 3 approvals (3f9c{ELLIPSIS}, 9a01{ELLIPSIS}, 77e1{ELLIPSIS}): nothing was "
-        "sent; their messages were edited\n"
+        f"Withdrew 3 approvals ({', '.join(REFS)}): nothing was sent; their messages were edited.\n"
     )
     rig.settle()
     _, out, _ = run_cli(["approvals", "list", "--format", "json"])
@@ -336,7 +336,7 @@ def test_withdraw_all(
     assert len(listed["decided"]) == 3
     assert run_cli(["approvals", "withdraw", "--all"]) == (
         0,
-        "nothing was waiting: no approval withdrawn\n",
+        "Nothing was waiting: no approval withdrawn.\n",
         "",
     )
     rig.close()
@@ -380,10 +380,18 @@ def test_enrol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: Blocking
     step. The code is in the link alone."""
     rig = Rig(tmp_path, monkeypatch, portal)
     code, out, err = enrol(rig, ["approver", "telegram", "enrol", "--secret", "approver-bot"])
-    assert (code, err) == (0, "")
-    found = CODE.search(out)
+    assert code == 0
+    found = CODE.search(err)
     assert found is not None
+    # The transcript and its prompts on stderr; the lines to add, the answer, on stdout (D10).
     assert out.splitlines() == [
+        "approvers:",
+        f"  telegram: {{bot_token: store:approver-bot, user_id: {OPERATOR_ID}, "
+        f"chat_id: {OPERATOR_ID}}}",
+        "  timeout: 3600",
+        "  block_seconds: 120",
+    ]
+    assert err.splitlines() == [
         "Opened a temporary egress allowance: api.telegram.org:443 (approver, 10 minutes).",
         "The bot is @example_bot. On the phone you'll approve from, open this link and press Start",
         f"(it works once, for 10 minutes): https://t.me/example_bot?start={found.group(1)}",
@@ -392,14 +400,9 @@ def test_enrol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: Blocking
         f"{OPERATOR_ID}.",
         "The bot sent that chat a confirmation code. Type it here: ",
         "Confirmed.",
-        "approvers:",
-        f"  telegram: {{bot_token: store:approver-bot, user_id: {OPERATOR_ID}, "
-        f"chat_id: {OPERATOR_ID}}}",
-        "  timeout: 3600",
-        "  block_seconds: 120",
         *approver_cli.RELOAD,
     ]
-    assert out.count(found.group(1)) == 1
+    assert (out + err).count(found.group(1)) == 1
     rig.close()
 
 
@@ -411,9 +414,9 @@ def test_what_cant_be_a_code_is_asked_again_unsent(
     enrolment; the code then typed enrols."""
     rig = Rig(tmp_path, monkeypatch, portal)
     argv = ["approver", "telegram", "enrol", "--secret", "approver-bot"]
-    code, out, err = enrol(rig, argv, answers=["t", "123 456", None])
-    assert (code, err) == (0, "")
-    lines = out.splitlines()
+    code, _, err = enrol(rig, argv, answers=["t", "123 456", None])
+    assert code == 0
+    lines = err.splitlines()
     prompt = lines.index("The bot sent that chat a confirmation code. Type it here: ")
     assert lines[prompt + 1 : prompt + 4] == [approver_cli.NOT_A_CODE] * 2 + ["Confirmed."]
     rig.close()
@@ -427,8 +430,8 @@ def test_after_five_reads_the_last_is_sent(
     rig = Rig(tmp_path, monkeypatch, portal)
     argv = ["approver", "telegram", "enrol", "--secret", "approver-bot"]
     code, out, err = enrol(rig, argv, answers=[""] * approver_cli.ASKS)
-    assert code == 1
-    assert out.count(approver_cli.NOT_A_CODE) == approver_cli.ASKS - 1
+    assert (code, out) == (1, "")
+    assert err.count(approver_cli.NOT_A_CODE) == approver_cli.ASKS - 1
     assert "wasn't the one the bot sent" in err
     rig.close()
 
@@ -449,16 +452,16 @@ def test_a_lost_enrolment_can_be_stopped(
     args = main_module._build_parser().parse_args(argv)
     said, why = io.StringIO(), io.StringIO()
     code = approver_cli.run(args, io.StringIO("n\n"), said, why)
-    assert (code, said.getvalue()) == (1, asked + "\n")
-    assert why.getvalue() == (
+    assert (code, said.getvalue()) == (1, "")
+    assert why.getvalue() == asked + "\n" + (
         "zoeymcp approver telegram enrol: Another enrolment is open: finish it, or stop it first.\n"
     )
     assert lost.open
     code, out, err = enrol(rig, argv, stdin="y\n")
-    assert (code, err) == (0, "")
-    assert out.startswith(asked + "\nStopped it.\nOpened a temporary egress allowance")
+    assert (code, out.startswith("approvers:\n")) == (0, True)
+    assert err.startswith(asked + "\nStopped it.\nOpened a temporary egress allowance")
     assert (lost.state, lost.reason) == ("ended", "enrolment_expired")
-    assert out.splitlines()[-1] == approver_cli.RELOAD[-1]
+    assert err.splitlines()[-1] == approver_cli.RELOAD[-1]
     rig.close()
 
 
@@ -469,7 +472,7 @@ def test_the_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: Bloc
     portal.call(until, lambda: len(rig.api.polls) >= 3, BOUND)
     assert run_cli(["approver", "telegram", "test"]) == (
         0,
-        "sent: the test message reached the chat\n",
+        "Sent: the test message reached the chat.\n",
         "",
     )
     assert [m.text for m in rig.api.operator.messages()] == [PROBE]
@@ -537,7 +540,9 @@ def test_enrol_apply_in_managed_mode(
     args = main_module._build_parser().parse_args(argv)
     out, err = io.StringIO(), io.StringIO()
     code = approver_cli.run(args, io.StringIO(f"{answer}\n"), out, err, typed=lambda _: "123456")
-    said = out.getvalue().splitlines()
+    # The plan and its question are the transcript, on stderr (D10); stdout stays empty.
+    assert out.getvalue() == ""
+    said = err.getvalue().splitlines()
     assert said[said.index("Confirmed.") + 1 :][: len(LINES) + 1] == [
         *LINES,
         "Planned on revision 1:",
@@ -547,7 +552,7 @@ def test_enrol_apply_in_managed_mode(
     asked = "Apply as a host import? [y/N] "
     managed = rig.vault.managed
     if answer == "y":
-        assert (code, err.getvalue()) == (0, "")
+        assert code == 0
         assert said[-1] == asked + "Imported revision 2: the approver starts now."
         assert managed.revision == 2
         approvers = managed.policy.approvers
@@ -558,7 +563,7 @@ def test_enrol_apply_in_managed_mode(
             OPERATOR_ID,
         )
     else:
-        assert (code, err.getvalue()) == (1, "")
+        assert code == 1
         assert said[-1] == asked + "Nothing written."
         assert managed.revision == 1
         assert managed.policy.approvers is None

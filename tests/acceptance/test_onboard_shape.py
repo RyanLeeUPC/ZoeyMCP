@@ -597,7 +597,7 @@ class S9:
         out, err = io.StringIO(), io.StringIO()
         given = stdin if stdin is not None else io.StringIO()
         if isinstance(given, Paste):
-            given.shown = out
+            given.shown = err  # login prints its URL on stderr (D10)
         try:
             code = main(argv, stdin=given, out=out, err=err)
         finally:
@@ -916,7 +916,7 @@ def test_the_profile_passes_check() -> None:
     # Fragment 1 assigns the server to no client (Q33): that is the operator's, after the review.
     assert out.getvalue() == (
         "warning gateway.servers.notes: not assigned to any client\n"
-        "<stdin>: ok (0 error(s), 1 warning(s))\n"
+        "<stdin>: ok (0 errors, 1 warning)\n"
     )
 
 

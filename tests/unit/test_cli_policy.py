@@ -419,7 +419,7 @@ def test_reseed_new_ratchet_lists_what_it_forgets(
     assert lines[0] == (
         "Reseeding as revision 3, its deployment kept, with a new ratchet, replacing revision 2:"
     )
-    assert "  Forgets: 1 retired client token(s)" in lines
+    assert "  Forgets: 1 retired client token" in lines
     assert "  Client tokens written as their hash: 1" in lines
     store = reopened(state, master)
     assert isinstance(store.verdict, Ok)

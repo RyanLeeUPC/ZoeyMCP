@@ -14,6 +14,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any, Final, TextIO
 from urllib.parse import quote
@@ -49,20 +50,73 @@ ENROL_TIMEOUT: Final = 5 + 2 * 60 + 15
 PROBE_TIMEOUT: Final = 30 + 15
 
 
+# Every command's exit codes (docs/operations.md, "Exit codes"): 0 done; 1 findings, refused,
+# declined or nothing to do; 2 a usage error, or the command can't run.
+EXIT_OK: Final = 0
+EXIT_REFUSED: Final = 1
+EXIT_CANNOT_RUN: Final = 2
+
+# The compose command and the service a shipped compose file names in the container's environment
+# (M7 design M.7), for the commands ZoeyMCP prints; the hardened file's when none is named.
+COMPOSE_CMD_ENV: Final = "ZOEYMCP_COMPOSE_CMD"
+EXEC_SERVICE_ENV: Final = "ZOEYMCP_EXEC_SERVICE"
+DEFAULT_COMPOSE_CMD: Final = "docker compose -f deploy/compose.hardened.yaml"
+STANDARD_COMPOSE_CMD: Final = "docker compose -f deploy/compose.yaml"
+# The standard tier's one service, which runs both roles.
+STANDARD_SERVICE: Final = "zoeymcp"
+# The command line this process was started with, after ``zoeymcp``: the way out of an
+# unreachable socket repeats it (:func:`way_out`). ``main`` sets it.
+INVOKED: list[str] = []
+
+
 class AdminUnavailable(Exception):
     """The admin socket can't be reached or answered with an error.
 
     ``data`` is the error answer, when there was one: OAuth errors carry a stable ``reason``.
+    ``cannot_run`` is true when there was no answer to act on: the socket can't be reached, its
+    answer can't be read, or it is a server error with no catalogued ``reason`` (the vault is
+    starting or stopping, or lacks the part asked for). Exit 2 then, not a refusal's 1
+    (:func:`exit_code`).
     """
 
-    def __init__(self, message: str, data: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, message: str, data: dict[str, Any] | None = None, *, cannot_run: bool = False
+    ) -> None:
         self.data = data or {}
+        self.cannot_run = cannot_run
         super().__init__(message)
 
     @property
     def reason(self) -> str | None:
         reason = self.data.get("reason")
         return reason if isinstance(reason, str) else None
+
+
+def exit_code(exc: AdminUnavailable) -> int:
+    """A failed admin call's exit code: 2 when the command couldn't run, 1 for a refusal."""
+    return EXIT_CANNOT_RUN if exc.cannot_run else EXIT_REFUSED
+
+
+def way_out(role: str, environ: Mapping[str, str] | None = None) -> str:
+    """Where to run the command that couldn't reach ``role``'s admin socket: in that role's
+    container, as typed on the host. On the host (no service named in the environment), both
+    tiers' forms; in the role's own container, how to see why it isn't answering."""
+    environ = os.environ if environ is None else environ
+    command = shlex.join(["zoeymcp", *INVOKED]) if INVOKED else "zoeymcp ..."
+    here = environ.get(EXEC_SERVICE_ENV)
+    if not here:
+        return (
+            f"run it in the {role}'s container: {STANDARD_COMPOSE_CMD} exec {STANDARD_SERVICE} "
+            f"{command} (standard tier), or {DEFAULT_COMPOSE_CMD} exec {role} {command} "
+            "(hardened tier)"
+        )
+    compose = environ.get(COMPOSE_CMD_ENV) or DEFAULT_COMPOSE_CMD
+    if here in (role, STANDARD_SERVICE):
+        return (
+            f"this is the {role}'s container, so the {role} isn't running or is still starting: "
+            f"{compose} logs {shlex.quote(here)} says which"
+        )
+    return f"run it in the {role}'s container: {compose} exec {role} {command}"
 
 
 def socket_path(explicit: str | None) -> str:
@@ -95,7 +149,8 @@ def become_socket_owner(socket: str, system: Any = os) -> None:
     except OSError as exc:
         raise AdminUnavailable(
             f"can't switch to uid {info.st_uid}, which owns {os.path.dirname(socket)} "
-            f"({exc.strerror}); run with -u {info.st_uid}"
+            f"({exc.strerror}); run with -u {info.st_uid}",
+            cannot_run=True,
         ) from exc
 
 
@@ -128,15 +183,22 @@ def _request(
                 response = client.request(method, path, json=body)
     except (httpx.HTTPError, OSError, RuntimeError) as exc:
         # RuntimeError: httpx on Windows, where Unix sockets aren't supported.
-        raise AdminUnavailable(f"can't reach the {role}'s admin socket at {socket}: {exc}") from exc
+        raise AdminUnavailable(
+            f"can't reach the {role}'s admin socket at {socket}: {exc}; {way_out(role)}",
+            cannot_run=True,
+        ) from exc
     if response.status_code == 204:
         return {}
     try:
         data: dict[str, Any] = response.json()
     except ValueError as exc:
-        raise AdminUnavailable(f"unexpected answer (HTTP {response.status_code})") from exc
+        raise AdminUnavailable(
+            f"unexpected answer (HTTP {response.status_code})", cannot_run=True
+        ) from exc
     if response.status_code >= 400:
-        raise AdminUnavailable(str(data.get("error", f"HTTP {response.status_code}")), data)
+        error = str(data.get("error", f"HTTP {response.status_code}"))
+        failed = response.status_code >= 500 and not isinstance(data.get("reason"), str)
+        raise AdminUnavailable(error, data, cannot_run=failed)
     return data
 
 

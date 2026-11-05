@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import getpass
 import inspect
@@ -96,20 +97,20 @@ def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
 def test_check_example_file() -> None:
     code, out = run(["check", "--config", str(EXAMPLE_POLICY)])
     assert code == EXIT_OK
-    assert out.strip().endswith("ok (0 error(s), 1 warning(s))")
+    assert out.strip().endswith("ok (0 errors, 1 warning)")
 
 
 def test_check_from_stdin(example_text: str) -> None:
     code, out = run(["check", "--config", "-"], stdin=example_text)
     assert code == EXIT_OK
-    assert out.splitlines()[-1] == "<stdin>: ok (0 error(s), 1 warning(s))"
+    assert out.splitlines()[-1] == "<stdin>: ok (0 errors, 1 warning)"
 
 
 def test_check_from_env(example_text: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZOEYMCP_CONFIG", example_text)
     code, out = run(["check"])
     assert code == EXIT_OK
-    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 1 warning(s))"
+    assert out.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 errors, 1 warning)"
 
 
 def test_check_reports_errors_as_json(example_text: str) -> None:
@@ -180,7 +181,7 @@ routes:
 """
 EMIT_FINDINGS = [
     "warning routes[1].upstream: plain http upstream",
-    "<stdin>: ok (0 error(s), 1 warning(s))",
+    "<stdin>: ok (0 errors, 1 warning)",
 ]
 
 
@@ -341,7 +342,7 @@ def test_emit_check_exits_0_when_equal_and_1_listing_the_differences(tmp_path: P
     assert out.splitlines() == [
         "missing: acl zoeymcp_vault_3 dstdomain -n zeta.example",
         "unexpected: acl zoeymcp_vault_3 x",
-        f"{conf}: out of date (2 difference(s)); regenerate it with check --emit-egress-allowlist",
+        f"{conf}: out of date (2 differences); regenerate it with check --emit-egress-allowlist",
     ]
     # The source ACL name is part of the comparison: --squid-src changes what is expected.
     conf.write_bytes(squid_text().encode())
@@ -396,7 +397,7 @@ def test_emit_reads_the_policy_from_the_environment(monkeypatch: pytest.MonkeyPa
     code, out, err = cli(["check", "--emit-egress-allowlist", "--allowlist-format", "squid"])
     assert code == EXIT_OK
     assert out == squid_text()
-    assert err.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 error(s), 1 warning(s))"
+    assert err.splitlines()[-1] == "$ZOEYMCP_CONFIG: ok (0 errors, 1 warning)"
 
 
 def test_emit_the_example_policy() -> None:
@@ -440,7 +441,7 @@ def test_check_with_a_policy_file(tmp_path: Path) -> None:
     assert lines[0] == f"policy from {EXAMPLE_POLICY}, {size:,} bytes"
     assert lines[1] == ADDS_NOTES
     assert lines[-1] == (
-        f"{EXAMPLE_POLICY} with onboard-notes-1.yaml merged: ok (0 error(s), 2 warning(s))"
+        f"{EXAMPLE_POLICY} with onboard-notes-1.yaml merged: ok (0 errors, 2 warnings)"
     )
     assert "warning gateway.servers.notes: not assigned to any client" in lines
 
@@ -464,7 +465,7 @@ def test_check_with_the_inline_policy(
     assert lines[0] == f"policy from ZOEYMCP_CONFIG, {len(example_text.encode()):,} bytes"
     assert lines[1] == ADDS_NOTES
     assert lines[-1] == (
-        "$ZOEYMCP_CONFIG with onboard-notes-1.yaml merged: ok (0 error(s), 2 warning(s))"
+        "$ZOEYMCP_CONFIG with onboard-notes-1.yaml merged: ok (0 errors, 2 warnings)"
     )
 
 
@@ -596,7 +597,7 @@ def test_check_with_errors_in_the_merged_policy_exits_1(tmp_path: Path) -> None:
     )
     assert code == EXIT_FINDINGS
     assert out.splitlines()[1].startswith("with onboard-notes-1.yaml merged: 1 error, ")
-    assert out.splitlines()[-1].endswith("merged: FAILED (1 error(s), 2 warning(s))")
+    assert out.splitlines()[-1].endswith("merged: FAILED (1 error, 2 warnings)")
 
 
 def test_print_merged_prints_nothing_for_a_merged_policy_with_errors(tmp_path: Path) -> None:
@@ -655,7 +656,7 @@ def test_check_with_a_base_that_wont_load_exits_1(tmp_path: Path) -> None:
         ["check", "--config", "-", "--with", notes_fragment(tmp_path)], io.StringIO("a: [\n")
     )
     assert code == EXIT_FINDINGS
-    assert out.splitlines()[-1] == "<stdin>: FAILED (1 error(s), 0 warning(s))"
+    assert out.splitlines()[-1] == "<stdin>: FAILED (1 error, 0 warnings)"
 
 
 def test_check_with_unreadable_files_exits_2(tmp_path: Path) -> None:
@@ -935,8 +936,9 @@ def cli(argv: list[str], stdin: io.StringIO | None = None) -> tuple[int, str, st
 def test_login_reads_one_stdin_line_off_a_terminal(admin: FakeAdmin) -> None:
     code, out, err = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\r\nmore\n"))
     assert code == EXIT_OK
-    assert out == HEADER + paste_text("one line on stdin") + STORED
-    assert err == "UNEXPECTED: admin\n"
+    # The instructions lead to the prompt, so they go to stderr; the answer to stdout (D10).
+    assert out == STORED
+    assert err == HEADER + paste_text("one line on stdin") + "UNEXPECTED: admin\n"
     assert admin.requests == [
         ("POST", "/oauth/music/login", {"rebind": False}),
         ("POST", "/oauth/music/complete", {"flow": "flow-0001", "redirect_url": PASTED}),
@@ -955,24 +957,22 @@ def test_login_says_where_a_callback_address_lands(admin: FakeAdmin) -> None:
     callback = "http://localhost:8081/oauth/callback/music"
     started = {**STARTED, "redirect_uri": callback, "callback": None, "callback_address": True}
     admin.answers[("POST", "/oauth/music/login")] = (200, started)
-    code, out, _ = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\n"))
-    assert code == EXIT_OK
-    assert (
-        out
-        == HEADER
+    code, out, err = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\n"))
+    assert (code, out) == (EXIT_OK, STORED)
+    assert err.startswith(
+        HEADER
         + (
             "\nYour browser will land on the portal's callback, which doesn't take a command-line "
             "login:\ncopy the full address from that tab's address bar and paste it here (one line "
             "on stdin, 10 minutes):\n"
         )
-        + STORED
     )
     # Without the key (an older vault) or with it false, the loopback text as before.
     for value in (False, None):
         started = {**STARTED, "callback": None, "callback_address": value}
         admin.answers[("POST", "/oauth/music/login")] = (200, started)
-        _, out, _ = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\n"))
-        assert out == HEADER + paste_text("one line on stdin") + STORED
+        _, out, err = cli(["login", "music", "--socket", "x"], io.StringIO(PASTED + "\n"))
+        assert (out, err.startswith(HEADER + paste_text("one line on stdin"))) == (STORED, True)
 
 
 def test_login_reads_the_paste_hidden_on_a_terminal(
@@ -988,7 +988,7 @@ def test_login_reads_the_paste_hidden_on_a_terminal(
     code, out, err = cli(["login", "music", "--socket", "x"], TTY())
     assert code == EXIT_OK
     assert prompts == ["> "]
-    assert out == HEADER + paste_text("input hidden") + STORED
+    assert (out, err.startswith(HEADER + paste_text("input hidden"))) == (STORED, True)
     assert admin.requests[-1] == (
         "POST",
         "/oauth/music/complete",
@@ -1079,7 +1079,7 @@ def test_login_describes_a_confidential_client_without_scopes(admin: FakeAdmin) 
 def test_login_without_a_paste_cancels_the_flow(admin: FakeAdmin, stdin: str) -> None:
     code, _, err = cli(["login", "music", "--socket", "x"], io.StringIO(stdin))
     assert code == EXIT_FINDINGS
-    assert err == "zoeymcp login: no address given\n"
+    assert err == HEADER + paste_text("one line on stdin") + "zoeymcp login: no address given\n"
     assert admin.requests[-1] == ("DELETE", "/oauth/flows/flow-0001", None)
 
 
@@ -1091,9 +1091,9 @@ def test_ctrl_c_cancels_the_flow(
         raise raised
 
     monkeypatch.setattr(getpass, "getpass", interrupted)
-    code, _, err = cli(["login", "music", "--socket", "x"], TTY())
-    assert code == EXIT_FINDINGS
-    assert err == "zoeymcp login: cancelled\n"
+    code, out, err = cli(["login", "music", "--socket", "x"], TTY())
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err == HEADER + paste_text("input hidden") + "zoeymcp login: cancelled\n"
     assert admin.requests[-1] == ("DELETE", "/oauth/flows/flow-0001", None)
     assert len(admin.requests) == 2
 
@@ -1126,7 +1126,7 @@ def test_a_failed_cancel_still_reports_the_interruption(
     monkeypatch.setattr(getpass, "getpass", interrupted)
     admin.answers[("DELETE", "/oauth/flows/flow-0001")] = (500, {"error": "boom"})
     code, _, err = cli(["login", "music", "--socket", "x"], TTY())
-    assert (code, err) == (EXIT_FINDINGS, "zoeymcp login: cancelled\n")
+    assert (code, err.endswith("\nzoeymcp login: cancelled\n")) == (EXIT_FINDINGS, True)
 
 
 def test_a_login_kept_only_in_memory_exits_1(admin: FakeAdmin) -> None:
@@ -1361,7 +1361,7 @@ def test_egress_key_prints_the_key(admin: FakeAdmin) -> None:
 def test_egress_key_without_the_vault(admin: FakeAdmin) -> None:
     admin.answers[("GET", "/egress-key")] = (503, {"error": "unavailable"})
     code, out, err = cli(["egress-key", "--socket", "x"])
-    assert code == EXIT_FINDINGS
+    assert code == EXIT_UNREADABLE
     assert out == ""
     assert err.startswith("zoeymcp egress-key: ")
 
@@ -1424,7 +1424,7 @@ def test_gateway_key_retire_previous_not_written(admin: FakeAdmin) -> None:
     error = {"error": "kept in memory, not written to disk; check the state volume"}
     admin.answers[("POST", "/gateway-key/retire-previous")] = (500, error)
     code, out, err = cli(["gateway-key", "--retire-previous", "--socket", "x"])
-    assert code == EXIT_FINDINGS
+    assert code == EXIT_UNREADABLE
     assert out == ""
     assert err == (
         "zoeymcp gateway-key: kept in memory, not written to disk; check the state volume\n"
@@ -1492,16 +1492,26 @@ def test_oauth_status_lists_or_filters(admin: FakeAdmin) -> None:
     assert (code, out) == (EXIT_OK, "files: ok\n")
     code, out, err = cli(["oauth", "status", "nope", "--socket", "x"])
     assert (code, out) == (EXIT_FINDINGS, "")
-    assert err == "zoeymcp oauth status: no oauth2 credential named 'nope'\n"
+    # The refusal lists the names there are (D16).
+    assert err == "zoeymcp oauth status: no oauth2 credential named 'nope'; known: files, music\n"
     admin.answers[("GET", "/oauth")] = (200, {"credentials": []})
-    assert cli(["oauth", "status", "--socket", "x"]) == (EXIT_OK, "no oauth2 credentials\n", "")
+    assert cli(["oauth", "status", "nope", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp oauth status: no oauth2 credential named 'nope'; none known\n",
+    )
+    assert cli(["oauth", "status", "--socket", "x"]) == (
+        EXIT_OK,
+        "",
+        "No oauth2 credentials in the policy.\n",
+    )
 
 
 def test_oauth_reset(admin: FakeAdmin) -> None:
     admin.answers[("POST", "/oauth/music/reset")] = (200, {"credential": "music", "reset": True})
     assert cli(["oauth", "reset", "music", "--socket", "x"]) == (
         EXIT_OK,
-        "reset music: the next request that needs a token tries once\n",
+        "Reset music: the next request that needs a token tries once.\n",
         "",
     )
     refusal = {"error": "no oauth2 credential named 'nope'", "reason": "not_oauth"}
@@ -1513,7 +1523,7 @@ def test_oauth_reset(admin: FakeAdmin) -> None:
     )
     admin.answers[("GET", "/oauth")] = (503, {"error": "OAuth needs the vault's token manager"})
     assert cli(["oauth", "status", "--socket", "x"]) == (
-        EXIT_FINDINGS,
+        EXIT_UNREADABLE,
         "",
         "zoeymcp oauth status: OAuth needs the vault's token manager\n",
     )
@@ -1575,7 +1585,7 @@ HEALTH_LINES = [
     "store: info (5 entries)",
     "  info    unreferenced: nothing in the policy uses store:old-key",
     "          run: zoeymcp secret delete old-key",
-    "health: FAILED (1 error(s), 2 warning(s), 2 info)",
+    "health: FAILED (1 error, 2 warnings, 2 info)",
 ]
 
 
@@ -1610,7 +1620,8 @@ def test_health_exit_codes(
     report = {"summary": counts, "credentials": [], "connectors": [], "store": empty}
     admin.answers[("GET", "/health")] = (200, report)
     verdict = "ok" if plain == EXIT_OK else "FAILED"
-    tail = f"({counts['error']} error(s), {counts['warning']} warning(s), {counts['info']} info)"
+    errors, warnings = main_module.counted(counts["error"], "error"), counts["warning"]
+    tail = f"({errors}, {main_module.counted(warnings, 'warning')}, {counts['info']} info)"
     assert cli(["health", "--socket", "x"]) == (
         plain,
         f"store: ok (0 entries)\nhealth: {verdict} {tail}\n",
@@ -2080,7 +2091,7 @@ def test_ledger_vault_shows_the_calls_only_the_vaults_chain_holds(admin: FakeAdm
         "  only the vault's own chain holds this call (a_later_flag)",
         "  held by the vault",
         "  written by the vault: asked, decided",
-        "3 older call(s) only the vault's own chain holds",
+        "3 older calls only the vault's own chain holds",
         "each row is as reported by the gateway, but for what it says the vault wrote",
     ]
 
@@ -2088,7 +2099,7 @@ def test_ledger_vault_shows_the_calls_only_the_vaults_chain_holds(admin: FakeAdm
 def test_ledger_vault_when_the_vault_cant_be_asked(admin: FakeAdmin) -> None:
     admin.answers[("GET", "/ledger/reported")] = (503, {"error": "no copy", "reason": "x"})
     assert cli(["ledger", "--vault", "--socket", "x"]) == (
-        EXIT_UNREADABLE,
+        EXIT_FINDINGS,
         "",
         "zoeymcp ledger: no copy\n",
     )
@@ -2136,8 +2147,9 @@ def test_restart_chain_shows_the_plan_and_asks(admin: FakeAdmin) -> None:
     code, out, err = cli(
         ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("n\n")
     )
-    assert (code, err) == (EXIT_FINDINGS, "zoeymcp ledger: not restarted\n")
-    assert out == "".join(f"{line}\n" for line in PLAN_LINES) + "Restart the chain? [y/N] "
+    # The plan and the question go to stderr (D10): stdout holds only the answer.
+    plan = "".join(f"{line}\n" for line in PLAN_LINES) + "Restart the chain? [y/N] "
+    assert (code, out, err) == (EXIT_FINDINGS, "", plan + "zoeymcp ledger: not restarted\n")
     assert admin.requests == [("POST", RESTART, {"dry_run": True})]
 
 
@@ -2148,9 +2160,9 @@ def test_restart_chain_runs_exactly_the_plan_shown(admin: FakeAdmin) -> None:
     code, out, err = cli(
         ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("yes\n")
     )
-    assert (code, err) == (EXIT_OK, "")
-    assert out.endswith(
-        "restarted: archived as archive-1767276000000; the next report starts a new chain\n"
+    assert (code, err.endswith("Restart the chain? [y/N] ")) == (EXIT_OK, True)
+    assert out == (
+        "Restarted: archived as archive-1767276000000; the next report starts a new chain.\n"
     )
     assert admin.requests[1] == ("POST", RESTART, {"plan": PLAN})
 
@@ -2162,14 +2174,16 @@ def test_restart_chain_refuses_a_plan_that_changed(admin: FakeAdmin) -> None:
         ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("y\n")
     )
     assert code == EXIT_FINDINGS
-    assert err == "zoeymcp ledger: the copy changed since this plan; nothing was done; run again\n"
+    assert err.endswith(
+        "[y/N] zoeymcp ledger: the copy changed since this plan; nothing was done; run again\n"
+    )
 
 
 def test_restart_chain_when_nothing_is_refused(admin: FakeAdmin) -> None:
     refused = {"error": "the copy takes reports", "reason": "not_restartable"}
     admin.answers[("POST", RESTART)] = (409, refused)
     code, out, err = cli(["ledger", "--vault", "--restart-chain", "--socket", "x"])
-    assert (code, out, err) == (EXIT_UNREADABLE, "", "zoeymcp ledger: the copy takes reports\n")
+    assert (code, out, err) == (EXIT_FINDINGS, "", "zoeymcp ledger: the copy takes reports\n")
 
 
 class InTurn(dict[tuple[str, str], tuple[int, dict[str, Any]]]):
@@ -2319,7 +2333,7 @@ def test_health_shows_the_egress_section_only_with_findings(admin: FakeAdmin) ->
     _, out, _ = cli(["health", "--socket", "x"])
     assert out.splitlines() == [
         "store: ok (0 entries)",
-        "health: ok (0 error(s), 0 warning(s), 0 info)",
+        "health: ok (0 errors, 0 warnings, 0 info)",
     ]
 
 
@@ -2387,7 +2401,7 @@ ISSUED: dict[str, Any] = {
 }
 FIRST_LINE = (
     "One-time code, valid for 15 minutes. Open http://localhost:8081 or "
-    "https://zoeymcp.tailnet.example and choose Set up.\n"
+    "https://zoeymcp.tailnet.example, choose I have a setup code, and type the code.\n"
 )
 REFUSED_LINE = (
     "If the portal refuses this code before you have used it, someone else has: run zoeymcp "
@@ -2448,7 +2462,10 @@ def test_setup_code_says_what_enrolling_does(
 @pytest.mark.parametrize(
     ("origins", "line"),
     [
-        (["http://localhost:8081"], "Open http://localhost:8081 and choose Set up."),
+        (
+            ["http://localhost:8081"],
+            "Open http://localhost:8081, choose I have a setup code, and type the code.",
+        ),
         ([], "The policy has no admin block, so no portal takes it yet."),
     ],
 )
@@ -2500,7 +2517,7 @@ def test_setup_code_wait_shows_the_enrolled_passkey(admin: FakeAdmin) -> None:
     assert code == EXIT_OK
     assert out == (
         f"{SETUP_CODE}\n"
-        "enrolled: 3f9a1c0e52d4b7a8 on http://localhost:8081 as laptop at 08:54:03 UTC\n"
+        "Enrolled 3f9a1c0e52d4b7a8 on http://localhost:8081 as laptop at 08:54:03 UTC.\n"
     )
     assert err == (
         FIRST_LINE
@@ -2561,7 +2578,7 @@ def test_setup_code_wait_stops_on_ctrl_c(admin: FakeAdmin, monkeypatch: pytest.M
 def test_setup_code_wait_when_the_vault_goes_away(admin: FakeAdmin) -> None:
     admin.answers = InTurn(iter([(200, ISSUED), (503, {"error": "stopping"})]))
     code, _, err = cli(["setup-code", "--wait", "--socket", "x"])
-    assert code == EXIT_FINDINGS
+    assert code == EXIT_UNREADABLE
     assert err.endswith(WAITING + "zoeymcp setup-code: stopping\n")
 
 
@@ -2584,9 +2601,10 @@ def test_setup_code_offline_writes_a_record_the_vault_redeems(
 
     code, out, err = cli(["setup-code", "--state", str(tmp_path), "--reset"])
     assert code == EXIT_OK
-    assert err == "One-time code, valid for 15 minutes. Open the portal and choose Set up.\n" + (
-        REFUSED_LINE
-    )
+    assert err == (
+        "One-time code, valid for 15 minutes. Open the portal, choose I have a setup code, and "
+        "type the code.\n"
+    ) + (REFUSED_LINE)
     typed = out.strip()
     key = KeySet.from_text(TEST_MASTER).portal_key
     record = setupcode.unseal((tmp_path / "setup.json").read_bytes(), key)
@@ -2713,7 +2731,11 @@ def test_passkeys_are_listed(admin: FakeAdmin) -> None:
     text = "".join(f"{line}\n" for line in LISTED_LINES)
     assert cli(["passkeys", "--socket", "x"]) == (EXIT_OK, text, "")
     admin.answers[("GET", "/passkeys")] = (200, {"passkeys": []})
-    assert cli(["passkeys", "--socket", "x"]) == (EXIT_OK, "no passkeys\n", "")
+    assert cli(["passkeys", "--socket", "x"]) == (
+        EXIT_OK,
+        "",
+        "No passkeys: the portal waits for a setup code. Issue one with: zoeymcp setup-code\n",
+    )
     unavailable = {"error": "the passkey file can't be verified", "reason": "unavailable"}
     admin.answers[("GET", "/passkeys")] = (503, unavailable)
     assert cli(["passkeys", "--socket", "x"]) == (
@@ -2729,12 +2751,12 @@ def test_a_passkey_is_removed(admin: FakeAdmin) -> None:
     admin.answers[("DELETE", path)] = (200, removed)
     assert cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"]) == (
         EXIT_OK,
-        f"removed {LISTED_LINES[0]}\n{LISTED_LINES[1]}\n2 session(s) ended; 1 passkey(s) left\n",
+        f"Removed {LISTED_LINES[0]}\n{LISTED_LINES[1]}\n2 sessions ended; 1 passkey left.\n",
         "",
     )
-    admin.answers[("DELETE", path)] = (200, {**removed, "remaining": 0})
+    admin.answers[("DELETE", path)] = (200, {**removed, "remaining": 0, "sessions_ended": 1})
     code, out, err = cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"])
-    assert (code, out.splitlines()[-1]) == (EXIT_OK, "2 session(s) ended; 0 passkey(s) left")
+    assert (code, out.splitlines()[-1]) == (EXIT_OK, "1 session ended; 0 passkeys left.")
     assert err == "No passkey is left: the portal waits for a setup code (zoeymcp setup-code).\n"
     admin.answers[("DELETE", "/passkeys/0000000000000000")] = (
         404,
@@ -2749,25 +2771,56 @@ def test_a_passkey_is_removed(admin: FakeAdmin) -> None:
     assert cli(["passkeys", "--remove", "a/b", "--socket", "x"])[0] == EXIT_FINDINGS
 
 
+SESSIONS = [
+    {
+        "fingerprint": "5e55a0b1c2d3e4f5",
+        "origin": "http://localhost:8081",
+        "scope": "full",
+        "credential": "3f9a1c0e52d4b7a8",
+        "created": 1_760_000_043,
+        "last_seen": 1_760_054_400,
+        "expires_at": 1_760_083_200,
+    },
+    {"fingerprint": "0000000000000001", "scope": "step-up\u202e", "created": None},
+]
+SESSION_LINES = [
+    "5e55a0b1c2d3e4f5  full  on http://localhost:8081, passkey 3f9a1c0e52d4b7a8; signed in "
+    "2025-10-09T08:54:03Z, last seen 2025-10-10T00:00:00Z, ends 2025-10-10T08:00:00Z",
+    "0000000000000001  step-up[U+202E]  on ?, passkey ?; signed in unknown, last seen unknown, "
+    "ends unknown",
+]
+
+
 def test_sessions_are_listed_and_ended(admin: FakeAdmin) -> None:
     admin.answers[("GET", "/sessions")] = (200, {"sessions": []})
-    assert cli(["sessions", "--socket", "x"]) == (EXIT_OK, "no portal sessions\n", "")
-    session = {"session": "ab12", "scope": "full"}
-    admin.answers[("GET", "/sessions")] = (200, {"sessions": [session]})
+    assert cli(["sessions", "--socket", "x"]) == (EXIT_OK, "", "No portal sessions.\n")
+    admin.answers[("GET", "/sessions")] = (200, {"sessions": SESSIONS})
+    # One line a session, as passkeys shows a passkey (D7); hidden characters shown escaped.
     assert cli(["sessions", "--socket", "x"]) == (
         EXIT_OK,
-        '{"scope": "full", "session": "ab12"}\n',
+        "".join(f"{line}\n" for line in SESSION_LINES),
+        "",
+    )
+    # The vault's answer whole behind --format json.
+    assert cli(["sessions", "--format", "json", "--socket", "x"]) == (
+        EXIT_OK,
+        json.dumps({"sessions": SESSIONS}, indent=2, sort_keys=True) + "\n",
         "",
     )
     admin.answers[("DELETE", "/sessions")] = (200, {"ended": 3})
     assert cli(["sessions", "--end-all", "--socket", "x"]) == (
         EXIT_OK,
-        "ended 3 portal session(s)\n",
+        "Ended 3 portal sessions.\n",
         "",
+    )
+    admin.answers[("DELETE", "/sessions")] = (200, {"ended": 1})
+    assert cli(["sessions", "--end-all", "--socket", "x"])[1] == "Ended 1 portal session.\n"
+    assert cli(["sessions", "--end-all", "--format", "json", "--socket", "x"])[1] == (
+        '{\n  "ended": 1\n}\n'
     )
     admin.answers[("DELETE", "/sessions")] = (503, {"error": "stopping"})
     assert cli(["sessions", "--end-all", "--socket", "x"]) == (
-        EXIT_FINDINGS,
+        EXIT_UNREADABLE,
         "",
         "zoeymcp sessions: stopping\n",
     )
@@ -3576,7 +3629,7 @@ def vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Vault]:
 
 def onboarded(vault: Vault, argv: list[str], text: str = "") -> tuple[int, str, str, Browser]:
     out, err = io.StringIO(), io.StringIO()
-    stdin = Browser(vault, out, text)
+    stdin = Browser(vault, err, text)  # login prints its URL on stderr (D10)
     code = main(argv, stdin=stdin, out=out, err=err)
     return code, out.getvalue(), err.getvalue(), stdin
 
@@ -3638,7 +3691,7 @@ def test_j3_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
     vault.commit(fragment)
     code, out, err, browser = onboarded(vault, J1)
     assert (code, browser.visits) == (EXIT_OK, 1), err
-    assert "(confidential client, PKCE S256" in out
+    assert "(confidential client, PKCE S256" in err
     assert "Stored the refresh token for notes as notes-refresh.\n" in out
     assert onboard_model.GIVEN_SECRET not in out + err + fragment
 
@@ -3747,7 +3800,7 @@ def test_the_shipped_static_key_notes_is_already_configured(vault: Vault) -> Non
     assert shipped.mode == "managed"
     vault.set_policy(shipped)
     code, out, err, _ = onboarded(vault, [*J1, "--client-id", onboard_model.CLIENT_ID, "--yes"])
-    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert (code, out) == (EXIT_FINDINGS, "")
     assert err.splitlines()[0] == (
         "zoeymcp login: this deployment is managed: save it in the portal, or export, edit and "
         "import"
@@ -4041,7 +4094,7 @@ def test_review_via_vault_clear_refused_shows_what_doesnt_match(admin: FakeAdmin
     }
     admin.answers[("POST", "/review/notes/clear")] = (409, unsupported)
     code, out, err = cli(["review", "notes", "--via", "vault", "--clear", "--socket", "x"])
-    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert (code, out) == (review_view.EXIT_NEEDS_OPERATOR, "")
     assert err == f"zoeymcp review: {unsupported['error']}\n"
 
 
@@ -4225,7 +4278,7 @@ def test_a_fragment_over_the_gateways_socket_follows_the_mode_it_names(
             (2, True) if "--repin" in options else (1, False)
         )
         return
-    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert (code, out) == (review_view.EXIT_NEEDS_OPERATOR, "")
     if mode == "managed":
         assert err == managed_refusal("review")
     else:
@@ -4242,7 +4295,7 @@ def test_the_standard_tiers_container_names_the_vaults_service(
     monkeypatch.setenv(onboard_cli.EXEC_SERVICE_ENV, "zoeymcp")
     admin.answers[("POST", "/review/notes")] = (200, {**vault_report(), "policy_mode": "managed"})
     code, out, err = cli(["review", "notes", "--add", "list_notes", "--socket", "x"])
-    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert (code, out) == (review_view.EXIT_NEEDS_OPERATOR, "")
     assert err == managed_refusal(
         "review", "docker compose -f deploy/compose.yaml exec -T zoeymcp "
     )
@@ -4274,7 +4327,7 @@ def test_a_clear_refused_on_the_gateways_socket_follows_the_mode_too(
     }
     admin.answers[("POST", "/review/notes/clear")] = (409, refused)
     code, out, err = cli(["review", "notes", "--clear", "--add", "list_notes", "--socket", "x"])
-    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert (code, out) == (review_view.EXIT_NEEDS_OPERATOR, "")
     assert err == (
         "zoeymcp review: --clear refused: not every included tool matches its pin: a\n"
         + managed_refusal("review")
@@ -4298,7 +4351,7 @@ def test_a_fragment_through_the_vault_asks_its_mode_first(
     admin.answers[("GET", "/policy")] = (200, {"mode": "managed", "revision": 3})
     argv = ["review", "notes", "--via", "vault", *options, "--socket", "x"]
     code, out, err = cli(argv, choices_for(vault_report(), "job-0001"))
-    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert (code, out) == (review_view.EXIT_NEEDS_OPERATOR, "")
     assert err == managed_refusal("review", IN_VAULT)
     assert admin.requests == [("GET", "/policy", None)]
 
@@ -4444,7 +4497,7 @@ def test_a_refusal_through_the_vault_prints_its_way_on(admin: FakeAdmin, no_pref
     busy = {"error": "Another review of notes is running.", "reason": "review_busy"}
     admin.answers[("POST", "/review/notes")] = (409, {**busy, "next": [again]})
     code, out, err = cli(["review", "notes", "--via", "vault", "--socket", "x"])
-    assert (code, out) == (review_view.EXIT_COULD_NOT_RUN, "")
+    assert (code, out) == (review_view.EXIT_NEEDS_OPERATOR, "")
     assert err == (
         "zoeymcp review: Another review of notes is running.\n"
         "Next:\n"
@@ -4458,10 +4511,10 @@ def test_login_mcp_refuses_in_managed_mode(onboard_admin: FakeAdmin) -> None:
     and refuses before anything is discovered, naming the portal and the host's import."""
     onboard_admin.answers[("GET", "/policy")] = (200, {"mode": "managed", "revision": 2})
     code, out, err = cli([*PUBLIC_ARGV, "--yes"])
-    assert (code, out) == (onboard_cli.EXIT_USAGE, "")
+    assert (code, out) == (EXIT_FINDINGS, "")
     assert err == managed_refusal("login", IN_VAULT)
     code, out, err = cli([*PUBLIC_ARGV, "--yes", "--format", "json"])
-    assert (code, err) == (onboard_cli.EXIT_USAGE, "")
+    assert (code, err) == (EXIT_FINDINGS, "")
     assert json.loads(out) == {
         "refused": {
             "error": review_view.MANAGED_REFUSED,
@@ -4472,7 +4525,7 @@ def test_login_mcp_refuses_in_managed_mode(onboard_admin: FakeAdmin) -> None:
     assert [request[1] for request in onboard_admin.requests] == ["/policy", "/policy"]
     onboard_admin.answers[("GET", "/policy")] = (503, {"error": "the vault is stopping"})
     code, out, err = cli([*PUBLIC_ARGV, "--yes"])
-    assert (code, out, err) == (EXIT_FINDINGS, "", "zoeymcp login: the vault is stopping\n")
+    assert (code, out, err) == (EXIT_UNREADABLE, "", "zoeymcp login: the vault is stopping\n")
 
 
 def managed_example() -> str:
@@ -4489,7 +4542,7 @@ def test_check_of_a_managed_document_says_it_isnt_the_running_revision(tmp_path:
     )
     code, out, err = cli(["check", "--config", "-"], io.StringIO(managed_example()))
     assert (code, err) == (EXIT_OK, said)
-    assert out.endswith(": ok (0 error(s), 2 warning(s))\n")
+    assert out.endswith(": ok (0 errors, 2 warnings)\n")
     assert cli(["check", "--config", str(EXAMPLE_POLICY)])[2] == ""
     code, out, err = cli(
         ["check", "--config", "-", "--emit-egress-allowlist"], io.StringIO(managed_example())
@@ -4505,9 +4558,12 @@ def test_check_of_a_managed_document_says_it_isnt_the_running_revision(tmp_path:
     code, out, err = cli(
         ["selftest", "--config", "-", "--cases", cases], io.StringIO(managed_example())
     )
-    assert err == f"zoeymcp selftest: {main_module.NOT_THE_HEAD}\n"
-    assert (code, out.startswith(f"zoeymcp selftest: can't use {cases}: ")) == (2, True)
-    assert cli(["selftest", "--config", str(EXAMPLE_POLICY), "--cases", cases])[2] == ""
+    # The selftest's own errors go to stderr too (D18), after the note.
+    said, _, rest = err.partition("\n")
+    assert said == f"zoeymcp selftest: {main_module.NOT_THE_HEAD}"
+    assert (code, out, rest.startswith(f"zoeymcp selftest: can't use {cases}: ")) == (2, "", True)
+    code, out, err = cli(["selftest", "--config", str(EXAMPLE_POLICY), "--cases", cases])
+    assert (code, out, err.startswith(f"zoeymcp selftest: can't use {cases}: ")) == (2, "", True)
 
 
 def test_the_counts_line() -> None:
@@ -4682,3 +4738,318 @@ async def test_generate_for_a_header_secret_of_the_example(tmp_path: Path) -> No
     await rig.token_client.aclose()
     assert answer.json()["sha256"] == hash_token(token)
     assert set(answer.json()) == {"name", "binding", "sha256"}
+
+
+# --- the UX pass: where a command runs, exit codes, help, output lines (D1-D23) -----------------
+
+STANDARD_EXEC = "docker compose -f deploy/compose.yaml exec zoeymcp"
+HARDENED_EXEC = "docker compose -f deploy/compose.hardened.yaml exec"
+
+
+@pytest.fixture
+def invoked(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The command line ``main`` records, put back afterwards; no compose variables."""
+    for name in (admin_client.COMPOSE_CMD_ENV, admin_client.EXEC_SERVICE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(admin_client, "INVOKED", [])
+    return admin_client.INVOKED
+
+
+def test_the_way_out_from_the_host_names_both_tiers(invoked: list[str]) -> None:
+    """D1: on the host (no service named), the command as typed in either tier's container."""
+    invoked[:] = ["secret", "set", "a key"]
+    command = "zoeymcp secret set 'a key'"
+    assert admin_client.way_out("vault", {}) == (
+        f"run it in the vault's container: {STANDARD_EXEC} {command} (standard tier), or "
+        f"{HARDENED_EXEC} vault {command} (hardened tier)"
+    )
+    assert admin_client.way_out("gateway", {admin_client.EXEC_SERVICE_ENV: ""}) == (
+        f"run it in the gateway's container: {STANDARD_EXEC} {command} (standard tier), or "
+        f"{HARDENED_EXEC} gateway {command} (hardened tier)"
+    )
+    invoked.clear()
+    assert admin_client.way_out("vault", {}).endswith(" exec vault zoeymcp ... (hardened tier)")
+
+
+@pytest.mark.parametrize(
+    ("here", "compose", "role", "said"),
+    [
+        (
+            "gateway",
+            None,
+            "vault",
+            f"run it in the vault's container: {HARDENED_EXEC} vault zoeymcp health",
+        ),
+        (
+            "vault",
+            "docker compose -f mine.yaml",
+            "gateway",
+            "run it in the gateway's container: docker compose -f mine.yaml exec gateway "
+            "zoeymcp health",
+        ),
+        (
+            "zoeymcp",
+            "docker compose -f deploy/compose.yaml",
+            "vault",
+            "this is the vault's container, so the vault isn't running or is still starting: "
+            "docker compose -f deploy/compose.yaml logs zoeymcp says which",
+        ),
+        (
+            "zoeymcp",
+            None,
+            "gateway",
+            "this is the gateway's container, so the gateway isn't running or is still "
+            "starting: docker compose -f deploy/compose.hardened.yaml logs zoeymcp says which",
+        ),
+        (
+            "vault",
+            None,
+            "vault",
+            "this is the vault's container, so the vault isn't running or is still starting: "
+            "docker compose -f deploy/compose.hardened.yaml logs vault says which",
+        ),
+    ],
+)
+def test_the_way_out_in_a_container_names_the_right_one(
+    invoked: list[str], here: str, compose: str | None, role: str, said: str
+) -> None:
+    """D1: in a container a shipped compose file made, the role's own service by its name, or,
+    in the role's own container, where to see why it isn't answering."""
+    invoked[:] = ["health"]
+    environ = {admin_client.EXEC_SERVICE_ENV: here}
+    if compose is not None:
+        environ[admin_client.COMPOSE_CMD_ENV] = compose
+    assert admin_client.way_out(role, environ) == said
+
+
+def test_an_unreachable_socket_says_where_to_run_it(invoked: list[str], tmp_path: Path) -> None:
+    """D1, D2: the error ends with the way out, as the command was typed, and exits 2."""
+    socket = str(tmp_path / "admin.sock")
+    code, out, err = cli(["health", "--socket", socket])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    command = shlex.join(["zoeymcp", "health", "--socket", socket])
+    assert err.startswith(f"zoeymcp health: can't reach the vault's admin socket at {socket}: ")
+    assert err.endswith(
+        f"; run it in the vault's container: {STANDARD_EXEC} {command} (standard tier), or "
+        f"{HARDENED_EXEC} vault {command} (hardened tier)\n"
+    )
+    code, _, err = cli(["gateway-status", "--socket", socket])
+    assert code == EXIT_UNREADABLE
+    assert "can't reach the gateway's admin socket" in err
+    assert f"{HARDENED_EXEC} gateway zoeymcp gateway-status" in err
+
+
+@pytest.mark.parametrize(
+    ("status", "answer", "code"),
+    [
+        (404, {"error": "no such thing"}, EXIT_FINDINGS),
+        (409, {"error": "refused", "reason": "x"}, EXIT_FINDINGS),
+        (503, {"error": "unavailable", "reason": "unavailable"}, EXIT_FINDINGS),
+        (500, {"error": "boom"}, EXIT_UNREADABLE),
+        (503, {"error": "starting"}, EXIT_UNREADABLE),
+        (503, {"error": "starting", "reason": None}, EXIT_UNREADABLE),
+    ],
+)
+def test_one_exit_code_rule(
+    admin: FakeAdmin, status: int, answer: dict[str, Any], code: int
+) -> None:
+    """D2: a refusal exits 1, a vault that couldn't do it (a server error with no reason) 2,
+    whichever command asked."""
+    for argv, path in (
+        (["passkeys"], ("GET", "/passkeys")),
+        (["secret", "list"], ("GET", "/secrets")),
+        (["approvals", "list"], ("GET", "/approvals")),
+        (["oauth", "status"], ("GET", "/oauth")),
+        (["health"], ("GET", "/health")),
+        (["policy", "head"], ("GET", "/policy")),
+    ):
+        admin.answers[path] = (status, answer)
+        assert cli([*argv, "--socket", "x"])[0] == code, argv
+
+
+def test_an_answer_that_isnt_json_cant_run() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(502, text="<html>"))
+    with pytest.raises(admin_client.AdminUnavailable) as info:
+        admin_client.passkeys("x", transport=transport)
+    assert (str(info.value), info.value.cannot_run) == ("unexpected answer (HTTP 502)", True)
+    assert admin_client.exit_code(info.value) == 2
+    assert admin_client.exit_code(admin_client.AdminUnavailable("refused")) == 1
+
+
+@pytest.mark.parametrize(
+    ("word", "said"),
+    [
+        ("helth", "no command 'helth'; did you mean health?"),
+        ("gateway_status", "no command 'gateway_status'; did you mean gateway-status or gateway?"),
+        ("xyzzy", "no command 'xyzzy';"),
+    ],
+)
+def test_an_unknown_command_gets_a_suggestion(word: str, said: str) -> None:
+    """D3: the closest commands, and where the list is; exit 2 with the usage line."""
+    err = io.StringIO()
+    with pytest.raises(SystemExit) as info, contextlib.redirect_stderr(err):
+        main([word, "--socket", "x"], out=io.StringIO(), err=io.StringIO())
+    assert info.value.code == 2
+    assert err.getvalue() == (
+        "usage: zoeymcp [-h] [--version] command ...\n"
+        f"zoeymcp: error: {said} zoeymcp --help lists every command\n"
+    )
+    parser = main_module._build_parser()
+    for argv in ([], ["--version"], ["health"], ["-h"]):
+        assert main_module.unknown_command(parser, argv) is None
+
+
+def test_the_help_groups_every_command_once() -> None:
+    """D3: ``zoeymcp --help`` lists each command once, in its group, then the exit codes."""
+    parser = main_module._build_parser()
+    grouped = [name for _, members in main_module.COMMAND_GROUPS for name, _ in members]
+    named = [*grouped, *main_module.ROLE_COMMANDS]
+    assert len(named) == len(set(named))
+    commands = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    assert set(named) == set(commands.choices)
+    text = parser.format_help()
+    for name in grouped:
+        assert text.count(f"\n  {name:<16}") == 1, name
+    assert text.count("  keygen") == 1  # no flat list of the commands besides the groups
+    assert main_module.EXIT_CODES in text
+    assert text.endswith(
+        "docs/operations.md is the how-to; zoeymcp COMMAND --help gives a command's options.\n"
+    )
+    assert main_module._epilog().splitlines()[:6] == [
+        "Where they run: a vault command in the vault's container, a gateway command in the",
+        "gateway's, from the host as",
+        f"  {STANDARD_EXEC} zoeymcp COMMAND          (standard tier)",
+        f"  {HARDENED_EXEC} vault zoeymcp COMMAND   (hardened tier)",
+        "In the hardened tier, a gateway command takes exec gateway.",
+        "",
+    ]
+    assert main_module.EXIT_CODES == (
+        "Exit codes, for every command: 0 done; 1 findings, refused, declined or nothing to do;\n"
+        "2 a usage error, or it can't run (the admin socket can't be reached, the vault isn't "
+        "running)."
+    )
+
+
+def test_the_help_shows_value_less_flags_bare() -> None:
+    """D15: ``--client-secret`` parses a value only to refuse it, and shows none; ``approver``
+    names its kind."""
+    parser = main_module._build_parser()
+    login = parser.parse_args(["login", "--mcp", URL]).client_secret
+    given = parser.parse_args(["login", "--mcp", URL, "--client-secret"]).client_secret
+    valued = parser.parse_args(["login", "--mcp", URL, "--client-secret=x"]).client_secret
+    assert (login, given, valued) == (False, True, "x")
+    with contextlib.redirect_stdout(io.StringIO()) as shown, pytest.raises(SystemExit):
+        parser.parse_args(["login", "--help"])
+    text = shown.getvalue()
+    assert "[--client-secret]" in text
+    assert "--client-secret " not in text.split("\n\n")[0]  # the usage
+    assert "\n  --client-secret       the client has a secret" in text
+    with contextlib.redirect_stdout(io.StringIO()) as shown, pytest.raises(SystemExit):
+        parser.parse_args(["approver", "--help"])
+    assert shown.getvalue().startswith("usage: zoeymcp approver [-h] {telegram} ...\n")
+
+
+def test_health_takes_format_json_and_keeps_json(admin: FakeAdmin) -> None:
+    """D6: ``--format json`` as every command takes it; ``--json`` stays its alias."""
+    report = health_report()
+    admin.answers[("GET", "/health")] = (200, report)
+    whole = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    assert cli(["health", "--format", "json", "--socket", "x"]) == (EXIT_FINDINGS, whole, "")
+    assert cli(["health", "--json", "--socket", "x"]) == (EXIT_FINDINGS, whole, "")
+    assert cli(["health", "--format", "text", "--socket", "x"])[1].startswith("notes (header)")
+
+
+def test_keygen_says_where_each_key_goes() -> None:
+    """D22: one line on stderr, and the answer alone on stdout."""
+    out, err = io.StringIO(), io.StringIO()
+    assert main(["keygen"], out=out, err=err) == EXIT_OK
+    assert len(out.getvalue().splitlines()) == 2
+    assert err.getvalue() == (
+        "Set ZOEYMCP_MASTER_KEY in the vault's environment and keep a copy; the hardened tier's "
+        "gateway takes ZOEYMCP_GATEWAY_KEY, which the standard tier doesn't need. Nothing was "
+        "written.\n"
+    )
+
+
+def test_secret_lines_are_sentences(admin: FakeAdmin) -> None:
+    """D8, D16: what was done as a sentence; an empty list says so on stderr and names the step."""
+    binding = {"origins": ["https://api.example:443"]}
+    admin.answers[("PUT", "/secrets/notes-key")] = (200, {"name": "notes-key", "binding": binding})
+    assert cli(["secret", "set", "notes-key", "--socket", "x"], io.StringIO("v")) == (
+        EXIT_OK,
+        "Stored notes-key, bound to origins https://api.example:443.\n",
+        "",
+    )
+    admin.answers[("DELETE", "/secrets/notes-key")] = (200, {})
+    assert cli(["secret", "delete", "notes-key", "--socket", "x"]) == (
+        EXIT_OK,
+        "Deleted notes-key.\n",
+        "",
+    )
+    admin.answers[("GET", "/secrets")] = (200, {"secrets": []})
+    assert cli(["secret", "list", "--socket", "x"]) == (
+        EXIT_OK,
+        "",
+        "No secrets stored. Store one with: zoeymcp secret set NAME\n",
+    )
+
+
+def test_a_name_refused_lists_the_known_ones() -> None:
+    assert main_module.known_names(["notes", "mail"]) == "known: mail, notes"
+    assert main_module.known_names([]) == "none known"
+
+
+@pytest.mark.parametrize(("count", "said"), [(0, "0 errors"), (1, "1 error"), (2, "2 errors")])
+def test_counted(count: int, said: str) -> None:
+    assert counted(count, "error") == said
+    assert review_view.counted(count, "error") == said
+
+
+def test_check_with_no_policy_names_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D23: no policy given is ``no policy``, not ``(none)``; the JSON keeps its source."""
+    monkeypatch.delenv("ZOEYMCP_CONFIG", raising=False)
+    code, out = run(["check"])
+    assert code == EXIT_UNREADABLE
+    assert out.splitlines()[-1] == "no policy: FAILED (1 error, 0 warnings)"
+    code, out = run(["check", "--format", "json"])
+    assert json.loads(out)["source"] == "(none)"
+
+
+@pytest.mark.parametrize(
+    ("answer", "code", "said"),
+    [
+        ({"sent": True, "finding": None}, 0, "Sent: the test message reached the chat.\n"),
+        (
+            {"sent": False, "finding": "approver_unreachable"},
+            1,
+            "Not sent (approver_unreachable): Telegram didn't take the message: check the egress "
+            "allowlist.\n",
+        ),
+        ({"sent": False, "finding": "new_code"}, 1, "Not sent (new_code): new_code.\n"),
+    ],
+)
+def test_the_probes_line(
+    monkeypatch: pytest.MonkeyPatch, answer: dict[str, Any], code: int, said: str
+) -> None:
+    monkeypatch.setattr(admin_client, "telegram_test", lambda socket: answer)
+    assert cli(["approver", "telegram", "test", "--socket", "x"]) == (code, said, "")
+
+
+def test_review_says_what_a_mode_it_cant_read_means() -> None:
+    """D16: the mode not known yet names the check, not just "try again"."""
+    assert review_view.MODE_UNKNOWN == (
+        "the gateway hasn't received the policy from the vault yet: zoeymcp health shows whether "
+        "it reaches the vault; try again once gateway-status says fresh"
+    )
+
+
+def test_a_lockout_plan_names_the_export_edit_import() -> None:
+    """D16: an enrolment whose plan has a lockout row writes the whole way: export, edit,
+    import."""
+    from zoeymcp.cli import approver as approver_cli
+
+    assert approver_cli.LOCKOUT == (
+        "This plan has a lockout row, so nothing was written: add the lines above to an export "
+        "(zoeymcp policy export > policy.yaml), then run zoeymcp policy import - < policy.yaml, "
+        "which shows the row and asks."
+    )
