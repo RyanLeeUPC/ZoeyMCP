@@ -77,7 +77,9 @@
       (row.telegram_shown === null ? "" : "; " + row.telegram_shown) + ".";
   }
 
+  // The list drawn again every 5 s: a button focused in it is focused again after, in its place.
   function rows(list, found, empty, draw) {
+    const at = Array.from(list.querySelectorAll("button")).indexOf(document.activeElement);
     list.replaceChildren();
     for (const row of found) {
       list.append(draw(row));
@@ -85,6 +87,8 @@
     if (found.length === 0) {
       list.append(make("li", empty, "z-list__empty"));
     }
+    const again = list.querySelectorAll("button");
+    if (at !== -1 && again.length) again[Math.min(at, again.length - 1)].focus();
   }
 
   // --- the lists (H.1) ------------------------------------------------------------------------

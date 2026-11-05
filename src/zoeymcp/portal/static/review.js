@@ -568,6 +568,7 @@
     if (entry.box !== null) {
       entry.choice = document.createElement("select");
       entry.choice.className = "z-select z-select--small z-tool__choice";
+      entry.choice.ariaLabel = "How " + tool.name_shown + " runs: allow or approve";
       for (const kind of ["allow", "approve"]) {
         const option = make("option", kind); // its value is its text
         option.disabled = kind === "allow" && tool.consequential === true;
