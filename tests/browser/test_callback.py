@@ -260,7 +260,7 @@ def test_item_13_the_provider_sends_the_tab_back_and_a_passkey_connects(
     confirm(page)
     expect(confirm_dialog(page)).to_be_hidden()
     expect(page.get_by_text("Connected notes: ")).to_be_visible()
-    expect(credential_row(page, "notes")).to_contain_text("notes (oauth2): ok")
+    expect(credential_row(page, "notes")).to_contain_text("notes (oauth2)OKUsed by notes.")
     assert world.fakes.notes.exchanges == 1
     assert store(rig).entry("notes-refresh") is not None
     assert rig.logged("step_up_confirmed", lambda line: line["action"] == "oauth.complete")
@@ -351,7 +351,7 @@ def test_item_14_a_stale_callback_address_is_refused_typed_or_pasted(
     assert typed.url == address
     typed.close()
     connect(page)
-    page.get_by_label("2. The address from that tab's address bar").fill(address)
+    page.get_by_label("Paste the address it sends you to").fill(address)
     page.get_by_role("button", name="Check the address", exact=True).click()
     expect(connect_dialog(page).get_by_role("alert")).to_have_text(STATE_MISMATCH)
     expect(confirm_dialog(page)).to_be_hidden()

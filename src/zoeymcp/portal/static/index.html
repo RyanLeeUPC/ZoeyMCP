@@ -16,366 +16,434 @@
 <script src="/approvals.js" defer></script>
 </head>
 <body class="z-root">
-<header id="bar" hidden>
-<span id="bar-origin"></span>
-<span id="bar-passkey"></span>
-<span id="bar-ends"></span>
-<span id="bar-health"></span>
-<nav id="nav">
-<button type="button" id="nav-home">Home</button>
-<button type="button" id="nav-approvals">Approvals</button>
-<button type="button" id="nav-credentials">Credentials</button>
-<button type="button" id="nav-servers">MCP servers</button>
-<button type="button" id="nav-sessions">Sessions</button>
-<button type="button" id="nav-passkeys">Passkeys</button>
-<button type="button" id="nav-secrets">Secrets</button>
-<button type="button" id="nav-ledger">Ledger</button>
-<button type="button" id="nav-policy">Policy</button>
+<header id="bar" class="z-appbar" hidden>
+<img class="z-appbar__logo" src="/zoey-icon.svg" alt="">
+<span class="z-appbar__brand">ZoeyMCP</span>
+<span class="z-appbar__meta"><code id="bar-origin"></code><span id="bar-passkey"></span><span id="bar-ends"></span></span>
+<nav id="nav" class="z-nav" aria-label="Portal">
+<button type="button" id="nav-home" class="z-nav__item">Home</button>
+<button type="button" id="nav-approvals" class="z-nav__item">Approvals</button>
+<button type="button" id="nav-credentials" class="z-nav__item">Credentials</button>
+<button type="button" id="nav-servers" class="z-nav__item">MCP servers</button>
+<button type="button" id="nav-sessions" class="z-nav__item">Sessions</button>
+<button type="button" id="nav-passkeys" class="z-nav__item">Passkeys</button>
+<button type="button" id="nav-secrets" class="z-nav__item">Secrets</button>
+<button type="button" id="nav-ledger" class="z-nav__item">Ledger</button>
+<button type="button" id="nav-policy" class="z-nav__item">Policy</button>
 </nav>
-<button type="button" id="sign-out">Sign out</button>
+<span class="z-appbar__end"><button type="button" id="bar-health" class="z-health" hidden></button><button type="button" id="sign-out" class="z-btn z-btn--secondary z-btn--small">Sign out</button></span>
 </header>
-<main id="page">
-<h1>ZoeyMCP</h1>
-<p id="status" role="status">Loading the portal.</p>
-<ul id="banners"></ul>
-<p id="error" role="alert" hidden></p>
+<main id="page" class="z-page">
+<h1 class="z-vh">ZoeyMCP</h1>
+<p id="loading" class="z-loading" role="status">Loading the portal.</p>
+<ul id="banners" class="z-alert-stack"></ul>
+<div class="z-alert z-alert--error"><span class="z-alert__mark" aria-hidden="true">!</span><p id="error" class="z-alert__text" role="alert" hidden></p></div>
+<div class="z-alert z-alert--success"><span class="z-alert__mark" aria-hidden="true">&#10003;</span><p id="status" class="z-alert__text" role="status"></p></div>
 
-<section id="blocked" hidden>
+<section id="blocked" class="z-blocking" hidden>
+<h2 class="z-blocking__title">Passkeys can't work on this page</h2>
 <p id="blocked-text"></p>
 </section>
 
-<section id="login" hidden>
-<h2>Sign in</h2>
-<p>Sign in with a passkey you enrolled on this address.</p>
-<button type="button" id="login-passkey">Sign in with a passkey</button>
-<button type="button" id="login-setup">I have a setup code</button>
+<section id="login" class="z-signin" hidden>
+<img class="z-signin__mark" src="/zoey-icon.svg" alt="">
+<h2 class="z-page__title">Sign in</h2>
+<p>Use a passkey enrolled on this address.</p>
+<div class="z-btn-row">
+<button type="button" id="login-passkey" class="z-btn z-btn--primary">Sign in with a passkey</button>
+<button type="button" id="login-setup" class="z-btn z-btn--secondary">I have a setup code</button>
+</div>
 </section>
 
-<section id="setup" hidden>
-<h2>Set up a passkey</h2>
-<div id="setup-code-step">
-<p>Run <code>zoeymcp setup-code</code> in the vault's container and type the code it prints.
-A code works once, for 15 minutes.</p>
-<label for="setup-code">Setup code</label>
-<input id="setup-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="64">
-<button type="button" id="setup-redeem">Use this code</button>
-<button type="button" id="setup-back">Back</button>
+<section id="setup" class="z-signin" hidden>
+<h2 class="z-page__title">Set up a passkey</h2>
+<ol id="setup-steps" class="z-stepper" aria-label="Set up a passkey"><li>Setup code</li><li>Name</li><li>Sign in</li></ol>
+<div id="setup-code-step" class="z-panel">
+<div class="z-field">
+<label class="z-label" for="setup-code">Setup code<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-setup-code">?<span class="z-vh"> About setup codes</span></button><span class="z-help__pop" id="help-setup-code" popover><span>Print one on the host with <code>zoeymcp setup-code</code>. Each code enrols one passkey.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about setup codes</span></a></span></span></label>
+<input aria-describedby="setup-code-hint" id="setup-code" class="z-input z-input--code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="64">
+<p class="z-hint" id="setup-code-hint">Works once, for 15 minutes.</p>
 </div>
-<div id="setup-name-step" hidden>
-<p id="setup-reset" hidden>This code is a reset: enrolling removes every other passkey and ends
-every session.</p>
-<label for="setup-name">Name for this passkey (for example, the device it is on)</label>
-<input id="setup-name" type="text" autocomplete="off" maxlength="64">
-<button type="button" id="setup-enrol">Create the passkey</button>
+<div class="z-btn-row">
+<button type="button" id="setup-redeem" class="z-btn z-btn--primary">Use this code</button>
+<button type="button" id="setup-back" class="z-btn z-btn--quiet">Back</button>
 </div>
-<div id="setup-done-step" hidden>
+</div>
+<div id="setup-name-step" class="z-panel" hidden>
+<p id="setup-reset" class="z-alert z-alert--warning" hidden><span class="z-alert__mark" aria-hidden="true">!</span><span><span class="z-alert__word">Reset:</span> enrolling removes every other passkey and ends every session.</span></p>
+<div class="z-field">
+<label class="z-label" for="setup-name">Name for this passkey</label>
+<input aria-describedby="setup-name-hint" id="setup-name" class="z-input" type="text" autocomplete="off" maxlength="64">
+<p class="z-hint" id="setup-name-hint">For example, the device it is on.</p>
+</div>
+<div class="z-btn-row"><button type="button" id="setup-enrol" class="z-btn z-btn--primary">Create the passkey</button></div>
+</div>
+<div id="setup-done-step" class="z-panel" hidden>
 <p>Passkey enrolled. Its fingerprint is <code id="setup-fingerprint"></code>.</p>
-<p>Compare it with what <code>zoeymcp passkeys</code> or <code>zoeymcp setup-code --wait</code>
-shows. Now sign in with it, to check that it works.</p>
-<button type="button" id="setup-login">Sign in with the new passkey</button>
+<p class="z-hint">Compare it with <code>zoeymcp passkeys</code> on the host.</p>
+<div class="z-btn-row"><button type="button" id="setup-login" class="z-btn z-btn--primary">Sign in with the new passkey</button></div>
 </div>
 </section>
 
 <section id="home" hidden>
-<h2>Home</h2>
-<p id="home-text"></p>
-<p id="home-ready"></p>
-<ul id="checklist"></ul>
+<h2 class="z-page__title">Home</h2>
+<div class="z-intro"><p id="home-text"></p></div>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title" id="home-ready"></h3></div>
+<ul id="checklist" class="z-findings"></ul>
+</section>
 <div id="attention-block" hidden>
-<ul id="attention-approvals"></ul>
-<h3>The gateway's servers</h3>
+<ul id="attention-approvals" class="z-findings"></ul>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">The gateway's servers</h3></div>
 <p id="attention-text"></p>
-<ul id="attention"></ul>
+<ul id="attention" class="z-findings"></ul>
+</section>
 </div>
-<p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
-<p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
+<p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> read-only here.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-declarative-home">?<span class="z-vh"> Declarative policy</span></button><span class="z-help__pop" id="help-declarative-home" popover><span>The policy file on the host is the source: change it there, then reload.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#7-reloading-the-policy" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> declarative policy</span></a></span></span></p>
+<p class="z-note" data-mode="managed" hidden><span class="z-note__word">Managed policy:</span> each save asks for your passkey.</p>
 </section>
 
 <section id="approvals" hidden>
-<h2>Approvals</h2>
-<p>Calls the vault holds for you, and the gateway's prompts relayed to the vault, oldest first.
-<b>Approve</b> asks for your passkey and runs that one call, exactly as shown; <b>Deny</b> sends
-nothing. Open a request to read it whole before you decide: the first decision, here or on
-another approver, is the one that counts. Nothing pushes a request to you from this page: pair the
-queue with Telegram for anything that must not wait.</p>
-<p id="approvals-off" hidden>The portal's queue is off: the policy's approvers block doesn't set
-portal, so no request is shown here.</p>
-<p id="approvals-notice" role="status" hidden></p>
-<h3>Waiting</h3>
-<ul id="approvals-waiting"></ul>
-<div id="approvals-open" hidden>
-<h3 id="approvals-open-title"></h3>
+<h2 class="z-page__title">Approvals</h2>
+<div class="z-intro"><p>Calls held for your decision, oldest first.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-approvals">?<span class="z-vh"> About approvals</span></button><span class="z-help__pop" id="help-approvals" popover><span><b>Approve</b> asks for your passkey and runs that one call, exactly as shown; <b>Deny</b> sends nothing. The first decision, here or on another approver, counts. This page doesn't notify you: pair it with Telegram for anything that can't wait.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#363-the-portal-queue" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about approvals</span></a></span></span></p></div>
+<p id="approvals-off" class="z-note" hidden>The portal queue is off: the policy's approvers block doesn't name portal.</p>
+<p id="approvals-notice" class="z-status" role="status" hidden></p>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Waiting</h3></div>
+<ul id="approvals-waiting" class="z-list"></ul>
+</section>
+<div id="approvals-open" class="z-panel" hidden>
+<div class="z-panel__head"><h3 id="approvals-open-title" class="z-panel__title"></h3></div>
 <p id="approvals-open-how"></p>
-<p id="approvals-relayed" hidden><span class="badge">Rendered by the gateway</span> The gateway
-wrote this text; the vault added its own line.</p>
-<pre id="approvals-text"></pre>
-<button type="button" id="approvals-approve">Approve</button>
-<button type="button" id="approvals-deny">Deny</button>
-<button type="button" id="approvals-close">Close</button>
+<p id="approvals-relayed" hidden><span class="z-tag z-tag--said">Rendered by the gateway</span> The gateway wrote this text; the vault added its own line.</p>
+<pre id="approvals-text" class="z-codeblock z-codeblock__pre"></pre>
+<div class="z-panel__footer">
+<button type="button" id="approvals-approve" class="z-btn z-btn--primary">Approve</button>
+<button type="button" id="approvals-deny" class="z-btn z-btn--danger">Deny</button>
+<button type="button" id="approvals-close" class="z-btn z-btn--quiet">Close</button>
 </div>
-<h3>Decided recently</h3>
-<ul id="approvals-decided"></ul>
+</div>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Decided recently</h3></div>
+<ul id="approvals-decided" class="z-list"></ul>
+</section>
 </section>
 
 <section id="credentials" hidden>
-<h2>Credentials</h2>
-<p>Every credential in the policy, the routes that use it, and what needs you. <b>Connect</b>
-signs in with an OAuth provider in a new tab, and you paste back the address it lands on (or,
-for a credential registered with the portal's callback address, the provider sends it back
-itself); the vault stores the grant after you confirm with your passkey. Nothing here shows a
-secret or a token.</p>
-<ul id="credential-list"></ul>
-<p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
-<p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
+<h2 class="z-page__title">Credentials</h2>
+<div class="z-intro"><p>Each credential, the routes that use it, and what needs you.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-credentials">?<span class="z-vh"> About Connect</span></button><span class="z-help__pop" id="help-credentials" popover><span><b>Connect</b> signs in at the OAuth provider in a new tab; you paste back the address it lands on, or the provider sends it back here. The vault stores the grant after your passkey confirms it. Nothing here shows a secret or a token.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#2-logging-in" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about Connect</span></a></span></span></p></div>
+<ul id="credential-list" class="z-list"></ul>
+<p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> read-only here.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-declarative-credentials">?<span class="z-vh"> Declarative policy</span></button><span class="z-help__pop" id="help-declarative-credentials" popover><span>The policy file on the host is the source: change it there, then reload.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#7-reloading-the-policy" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> declarative policy</span></a></span></span></p>
+<p class="z-note" data-mode="managed" hidden><span class="z-note__word">Managed policy:</span> each save asks for your passkey.</p>
 </section>
 
 <section id="servers" hidden>
-<h2>MCP servers</h2>
-<p>Every remote and toolkit server in the policy, and the one you are adding, each with its state
-and what to do next. The vault discovers a server by its URL and registers its client after you
-confirm with your passkey; review then shows the server's tools for you to choose.</p>
-<p data-mode="declarative">The vault makes the YAML, and nothing here changes the policy: you
-commit each fragment and reload.</p>
-<p data-mode="managed" hidden>Each save writes its change to the policy: it asks for your passkey
-and takes effect when it is written.</p>
-<ul id="server-list"></ul>
-<ul id="refusal-next"></ul>
-<ul id="refusal-check"></ul>
-<h3>Add a server by URL</h3>
-<label for="add-url">The server's MCP URL</label>
-<input id="add-url" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
-<details id="add-more">
+<h2 class="z-page__title">MCP servers</h2>
+<div class="z-intro"><p>Each server in the policy, its state and its next step.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-servers">?<span class="z-vh"> About adding servers</span></button><span class="z-help__pop" id="help-servers" popover><span>The vault discovers a server by its URL and registers its client after your passkey confirms it. Review then lists the server's tools for you to choose.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#onboarding-by-url" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about adding servers</span></a></span></span></p></div>
+<p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> the vault makes the YAML; you commit each fragment and reload.</p>
+<p class="z-note" data-mode="managed" hidden><span class="z-note__word">Managed policy:</span> each save writes its change to the policy: it asks for your passkey.</p>
+<ul id="server-list" class="z-servers"></ul>
+<ul id="refusal-next" class="z-nextsteps"></ul>
+<ul id="refusal-check" class="z-findings z-findings--compact"></ul>
+<section class="z-section z-panel">
+<div class="z-panel__head"><h3 class="z-panel__title">Add a server by URL</h3></div>
+<div class="z-field">
+<label class="z-label" for="add-url">The server's MCP URL</label>
+<input id="add-url" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+</div>
+<details id="add-more" class="z-disclosure">
 <summary>More options</summary>
-<label for="add-credential">Credential name (empty: from the server's host name)</label>
-<input id="add-credential" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
-<label for="add-route">Route name</label>
-<input id="add-route" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
-<label for="add-server">Server name</label>
-<input id="add-server" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
-<label for="add-client-id">Client ID, for a client registered at the provider already</label>
-<input id="add-client-id" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="512">
-<label for="add-client-auth">Its client authentication (basic or post takes the secret below)</label>
-<select id="add-client-auth">
+<div class="z-disclosure__body">
+<div class="z-field">
+<label class="z-label" for="add-credential">Credential name</label>
+<input aria-describedby="add-credential-hint" id="add-credential" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+<p class="z-hint" id="add-credential-hint">Empty: from the server's host name.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="add-route">Route name</label>
+<input id="add-route" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+</div>
+<div class="z-field">
+<label class="z-label" for="add-server">Server name</label>
+<input id="add-server" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+</div>
+<div class="z-field">
+<label class="z-label" for="add-client-id">Client ID</label>
+<input aria-describedby="add-client-id-hint" id="add-client-id" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="512">
+<p class="z-hint" id="add-client-id-hint">Only for a client registered at the provider already.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="add-client-auth">Client authentication</label>
+<span class="z-select-wrap"><select aria-describedby="add-client-auth-hint" id="add-client-auth" class="z-select">
 <option value="">not given</option>
 <option value="none">none (a public client)</option>
 <option value="basic">basic</option>
 <option value="post">post</option>
-</select>
-<label for="add-client-secret">Its client secret (cleared from this page once sent, whatever the answer)</label>
-<textarea id="add-client-secret" class="masked" rows="2" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="512" data-1p-ignore data-lpignore="true" data-bwignore></textarea>
-<label for="add-redirect">Its redirect address</label>
-<input id="add-redirect" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
-<label for="add-client-name">Client name for the provider's list of apps</label>
-<input id="add-client-name" type="text" autocomplete="off" maxlength="64">
-<label for="add-issuer">Issuer (required with a client secret)</label>
-<input id="add-issuer" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
-<label for="add-scope">Scopes, separated by spaces (empty: what the server asks for)</label>
-<input id="add-scope" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+</select></span>
+<p class="z-hint" id="add-client-auth-hint">basic and post take the client secret.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="add-client-secret">Client secret</label>
+<textarea aria-describedby="add-client-secret-hint" id="add-client-secret" class="z-input z-input--secret masked" rows="2" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="512" data-1p-ignore data-lpignore="true" data-bwignore></textarea>
+<p class="z-hint" id="add-client-secret-hint">Cleared from this page once sent.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="add-redirect">Redirect address</label>
+<input id="add-redirect" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+</div>
+<div class="z-field">
+<label class="z-label" for="add-client-name">Client name</label>
+<input aria-describedby="add-client-name-hint" id="add-client-name" class="z-input" type="text" autocomplete="off" maxlength="64">
+<p class="z-hint" id="add-client-name-hint">Shown in the provider's list of apps.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="add-issuer">Issuer</label>
+<input aria-describedby="add-issuer-hint" id="add-issuer" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+<p class="z-hint" id="add-issuer-hint">Required with a client secret.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="add-scope">Scopes</label>
+<input aria-describedby="add-scope-hint" id="add-scope" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2048">
+<p class="z-hint" id="add-scope-hint">Separated by spaces. Empty: what the server asks for.</p>
+</div>
+</div>
 </details>
-<label class="check"><input id="add-private" type="checkbox"> This server is on my network
-(the discovery then asks for your passkey: it lets the vault reach that address)</label>
-<button type="button" id="add-discover">Discover</button>
+<div class="z-field">
+<label class="z-check"><input id="add-private" type="checkbox" aria-describedby="add-private-hint"><span>This server is on my network</span></label>
+<p class="z-hint" id="add-private-hint">Discovery then asks for your passkey.</p>
+</div>
+<div class="z-btn-row"><button type="button" id="add-discover" class="z-btn z-btn--primary">Discover</button></div>
+</section>
 
-<div id="plan" hidden>
-<h3 id="plan-title"></h3>
+<div id="plan" class="z-panel" hidden>
+<div class="z-panel__head"><h3 id="plan-title" class="z-panel__title"></h3></div>
 <p id="plan-issuer" class="issuer"></p>
 <p id="plan-blocked"></p>
-<dl id="plan-rows"></dl>
+<dl id="plan-rows" class="z-summary"></dl>
 <p id="plan-allowance"></p>
-<ul id="plan-check"></ul>
-<ul id="plan-next" class="steps"></ul>
-<button type="button" id="plan-cancel">Cancel this onboarding</button>
+<ul id="plan-check" class="z-findings z-findings--compact"></ul>
+<ul id="plan-next" class="steps z-nextsteps"></ul>
+<div class="z-panel__footer"><button type="button" id="plan-cancel" class="z-btn z-btn--quiet">Cancel this onboarding</button></div>
 </div>
 
-<div id="review" hidden>
-<h3 id="review-title"></h3>
+<div id="review" class="z-panel" hidden>
+<div class="z-panel__head"><h3 id="review-title" class="z-panel__title"></h3></div>
 <p id="review-state" role="status"></p>
-<div id="review-body" hidden>
+<div id="review-body" class="z-review" hidden>
 <p id="review-info"></p>
 <p id="review-instructions" class="said"></p>
 <p id="review-notes"></p>
 <p id="review-counts"></p>
-<p>Nothing is included until you include it. A suggestion is the server's own annotation, not a
-judgement by ZoeyMCP: allow lets agents call the tool with no prompt, approve asks you first.</p>
-<div id="review-filters">
-<label class="check"><input id="review-chip-read-only" type="checkbox"> Suggested read-only</label>
-<label class="check"><input id="review-chip-unannotated" type="checkbox"> Not annotated</label>
-<label class="check"><input id="review-chip-findings" type="checkbox"> With findings</label>
-<label for="review-filter">Filter by name or title</label>
-<input id="review-filter" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+<p class="z-hint">Nothing is included until you include it.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-review">?<span class="z-vh"> About suggestions</span></button><span class="z-help__pop" id="help-review" popover><span>A suggestion is the server's own annotation, not a judgement by ZoeyMCP. <b>Allow</b> lets agents call the tool with no prompt; <b>Approve</b> asks you first.</span></span></span></p>
+<div id="review-filters" class="z-filterbar">
+<div class="z-field z-filterbar__search">
+<label class="z-label" for="review-filter">Filter by name or title</label>
+<input id="review-filter" class="z-input z-input--small" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
 </div>
-<button type="button" id="review-suggested">Select suggested</button>
-<button type="button" id="review-clear">Clear</button>
-<ul id="review-tools"></ul>
-<label class="check"><input id="review-decline-rest" type="checkbox" checked> Record the rest as
-declined: every listed tool you don't include, at the definition shown, so it counts again only
-if the server changes it</label>
+<label class="z-chip"><input id="review-chip-read-only" type="checkbox"><span>Suggested read-only</span></label>
+<label class="z-chip"><input id="review-chip-unannotated" type="checkbox"><span>Not annotated</span></label>
+<label class="z-chip"><input id="review-chip-findings" type="checkbox"><span>With findings</span></label>
+</div>
+<div class="z-btn-row">
+<button type="button" id="review-suggested" class="z-btn z-btn--secondary z-btn--small">Select suggested</button>
+<button type="button" id="review-clear" class="z-btn z-btn--quiet z-btn--small">Clear</button>
+</div>
+<ul id="review-tools" class="z-tools"></ul>
+<div class="z-actionbar">
+<label class="z-check"><input id="review-decline-rest" type="checkbox" checked aria-describedby="review-decline-hint"><span>Record the rest as declined</span></label>
+<p class="z-hint" id="review-decline-hint">Each tool you leave out, at the definition shown, counts again only if the server changes it.</p>
 <p id="review-drift"></p>
-<button type="button" id="review-generate" data-mode="declarative">Generate</button>
-<button type="button" id="review-save" data-mode="managed" hidden>Save</button>
+<div class="z-btn-row">
+<button type="button" id="review-generate" class="z-btn z-btn--primary" data-mode="declarative">Generate</button>
+<button type="button" id="review-save" class="z-btn z-btn--primary" data-mode="managed" hidden>Save</button>
+</div>
+</div>
 </div>
 </div>
 
-<div id="fragment" hidden>
-<h3 id="fragment-title"></h3>
-<dl id="fragment-summary"></dl>
-<label for="fragment-indent">Indent</label>
-<select id="fragment-indent">
+<div id="fragment" class="z-panel" hidden>
+<div class="z-panel__head"><h3 id="fragment-title" class="z-panel__title"></h3></div>
+<dl id="fragment-summary" class="z-summary"></dl>
+<div class="z-codeblock">
+<div class="z-codeblock__bar">
+<label class="z-label" for="fragment-indent">Indent</label>
+<span class="z-select-wrap z-select-wrap--inline"><select id="fragment-indent" class="z-select z-select--small">
 <option value="0">plain, for a policy file</option>
 <option value="2">indented 2 spaces</option>
 <option value="4">indented 4 spaces</option>
 <option value="8">indented 8 spaces</option>
 <option value="compose">the compose form, under ZOEYMCP_CONFIG</option>
-</select>
-<button type="button" id="fragment-copy">Copy</button>
-<pre id="fragment-text"></pre>
-<ul id="fragment-check"></ul>
-<p>Then, in order.</p>
-<p id="fragment-carries"><span data-mode="declarative">After fragment 1's commit and reload, this
+</select></span>
+<button type="button" id="fragment-copy" class="z-btn z-btn--secondary z-btn--small">Copy</button>
+</div>
+<pre id="fragment-text" class="z-codeblock__pre"></pre>
+</div>
+<ul id="fragment-check" class="z-findings z-findings--compact"></ul>
+<p class="z-label">Then, in order:</p>
+<p id="fragment-carries" class="z-hint"><span data-mode="declarative">After fragment 1's commit and reload, this
 section carries on by itself.</span><span data-mode="managed" hidden>After the save, this section
 carries on by itself.</span></p>
-<ul id="fragment-next" class="steps"></ul>
+<ul id="fragment-next" class="steps z-nextsteps"></ul>
 </div>
 </section>
 
 <section id="sessions" hidden>
-<h2>Sessions</h2>
-<p>Every signed-in browser. A session ends after 15 idle minutes, 4 hours in all, at sign-out,
-or when the vault restarts.</p>
-<ul id="session-list"></ul>
-<button type="button" id="end-others">End the other sessions</button>
+<h2 class="z-page__title">Sessions</h2>
+<div class="z-intro"><p>Every signed-in browser.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-sessions">?<span class="z-vh"> About sessions</span></button><span class="z-help__pop" id="help-sessions" popover><span>A session ends after 15 idle minutes, 4 hours in all, at sign-out, or when the vault restarts.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about sessions</span></a></span></span></p></div>
+<ul id="session-list" class="z-list"></ul>
+<div class="z-btn-row"><button type="button" id="end-others" class="z-btn z-btn--secondary">End the other sessions</button></div>
 </section>
 
 <section id="passkeys" hidden>
-<h2>Passkeys</h2>
-<p>Every passkey that can sign in to this vault. A passkey works on the host name it was enrolled
-on. Each change asks for a passkey first. The last passkey can't be removed here: enrol another
-first, or use <code>zoeymcp setup-code --reset</code>.</p>
-<ul id="passkey-list"></ul>
-<div id="rename" hidden>
-<p id="rename-which"></p>
-<label for="rename-name">New name</label>
-<input id="rename-name" type="text" autocomplete="off" maxlength="64">
-<button type="button" id="rename-prepare">Rename</button>
-<button type="button" id="rename-close">Cancel</button>
+<h2 class="z-page__title">Passkeys</h2>
+<div class="z-intro"><p>Every passkey that can sign in to this vault.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-passkeys">?<span class="z-vh"> About passkeys</span></button><span class="z-help__pop" id="help-passkeys" popover><span>A passkey works on the host name it was enrolled on, and each change asks for one. The last passkey can't be removed here: enrol another first, or use <code>zoeymcp setup-code --reset</code>.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about passkeys</span></a></span></span></p></div>
+<ul id="passkey-list" class="z-list"></ul>
+<div id="rename" class="z-rename" hidden>
+<p id="rename-which" class="z-label"></p>
+<div class="z-field">
+<label class="z-label" for="rename-name">New name</label>
+<input id="rename-name" class="z-input" type="text" autocomplete="off" maxlength="64">
 </div>
-<h3>Enrol another passkey</h3>
-<label for="passkey-name">Name for the new passkey (for example, the device it is on)</label>
-<input id="passkey-name" type="text" autocomplete="off" maxlength="64">
-<button type="button" id="passkey-enrol">Enrol a passkey</button>
+<div class="z-btn-row">
+<button type="button" id="rename-prepare" class="z-btn z-btn--primary z-btn--small">Rename</button>
+<button type="button" id="rename-close" class="z-btn z-btn--quiet z-btn--small">Cancel</button>
+</div>
+</div>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Enrol another passkey</h3></div>
+<div class="z-field">
+<label class="z-label" for="passkey-name">Name for the new passkey</label>
+<input aria-describedby="passkey-name-hint" id="passkey-name" class="z-input" type="text" autocomplete="off" maxlength="64">
+<p class="z-hint" id="passkey-name-hint">For example, the device it is on.</p>
+</div>
+<div class="z-btn-row"><button type="button" id="passkey-enrol" class="z-btn z-btn--secondary">Enrol a passkey</button></div>
+</section>
 </section>
 
 <section id="secrets" hidden>
-<h2>Secrets</h2>
-<p>Every secret in the vault's store, by name, and what it may be used for. The vault never shows
-a value, here or anywhere else: to change one, enter it again. Each change asks for a passkey
-first. A credential's tokens from Connect are the vault's own and aren't changed here.</p>
-<ul id="secret-list"></ul>
-<h3>Set or replace a secret</h3>
-<label for="secret-name">Name (NAME in the policy's store:NAME)</label>
-<input id="secret-name" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="128">
-<label for="secret-value">Value (cleared from this page once sent, whatever the answer)</label>
-<textarea id="secret-value" class="masked" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="65536" data-1p-ignore data-lpignore="true" data-bwignore></textarea>
-<label for="secret-origins">Origins it may be sent to, only for a name no route or connector uses
-(https URLs, separated by spaces)</label>
-<input id="secret-origins" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
-<button type="button" id="secret-prepare">Set the secret</button>
+<h2 class="z-page__title">Secrets</h2>
+<div class="z-intro"><p>Every secret in the vault's store, by name: a value is never shown.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-secrets">?<span class="z-vh"> About secrets</span></button><span class="z-help__pop" id="help-secrets" popover><span>To change a value, enter it again; each change asks for your passkey. A credential's tokens from Connect are the vault's own and aren't changed here.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about secrets</span></a></span></span></p></div>
+<ul id="secret-list" class="z-list"></ul>
+<section class="z-section z-panel">
+<div class="z-panel__head"><h3 class="z-panel__title">Set or replace a secret</h3></div>
+<div class="z-field">
+<label class="z-label" for="secret-name">Name</label>
+<input aria-describedby="secret-name-hint" id="secret-name" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="128">
+<p class="z-hint" id="secret-name-hint">NAME in the policy's <code>store:NAME</code>.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="secret-value">Value</label>
+<textarea aria-describedby="secret-value-hint" id="secret-value" class="z-input z-input--secret masked" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="65536" data-1p-ignore data-lpignore="true" data-bwignore></textarea>
+<p class="z-hint" id="secret-value-hint">Cleared from this page once sent.</p>
+</div>
+<div class="z-field">
+<label class="z-label" for="secret-origins">Origins it may be sent to</label>
+<input aria-describedby="secret-origins-hint" id="secret-origins" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+<p class="z-hint" id="secret-origins-hint">Only for a name no route or connector uses: https URLs, separated by spaces.</p>
+</div>
+<div class="z-btn-row"><button type="button" id="secret-prepare" class="z-btn z-btn--primary">Set the secret</button></div>
+</section>
 </section>
 
 <section id="ledger" hidden>
-<h2>Ledger</h2>
-<p>The vault's copy of the gateway's approval ledger, newest first. Every row is as the gateway
-reported it. A call shows its sends from the SMTP connectors' journals, and a send whose call the
-copy doesn't hold is listed below it. A call's arguments are only in the gateway's own ledger, as
-a keyed digest: check them with <code>zoeymcp ledger check REF FILE</code> in the gateway's
-container.</p>
+<h2 class="z-page__title">Ledger</h2>
+<div class="z-intro"><p>The gateway's approval ledger, as reported to the vault, newest first.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-ledger">?<span class="z-vh"> About the ledger</span></button><span class="z-help__pop" id="help-ledger" popover><span>A call shows its sends from the SMTP connectors' journals. Its arguments are only in the gateway's own ledger, as a keyed digest: check them with <code>zoeymcp ledger check REF FILE</code> in the gateway's container.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#21-the-approval-ledger" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about the ledger</span></a></span></span></p></div>
 <p id="ledger-state"></p>
-<button type="button" id="ledger-restart" hidden>Restart the chain</button>
-<ul id="ledger-rows"></ul>
-<button type="button" id="ledger-older" hidden>Older rows</button>
-<h3>Sends with no call in the copy</h3>
-<ul id="ledger-orphans"></ul>
-<h3>Calls only the vault's own chain holds</h3>
-<ul id="ledger-vault-only"></ul>
-<h3>Archived chains</h3>
-<ul id="ledger-archives"></ul>
-<p data-mode="declarative">This deployment's policy is declarative: the portal can't change it.</p>
-<p data-mode="managed" hidden>This deployment's policy is managed: each save asks for your passkey and takes effect when it is written.</p>
+<div class="z-btn-row"><button type="button" id="ledger-restart" class="z-btn z-btn--secondary" hidden>Restart the chain</button></div>
+<ul id="ledger-rows" class="z-log"></ul>
+<div class="z-pager"><button type="button" id="ledger-older" class="z-btn z-btn--secondary z-btn--small" hidden>Older rows</button></div>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Sends with no call in the copy</h3></div>
+<ul id="ledger-orphans" class="z-log"></ul>
+</section>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Calls only the vault's own chain holds</h3></div>
+<ul id="ledger-vault-only" class="z-log"></ul>
+</section>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Archived chains</h3></div>
+<ul id="ledger-archives" class="z-log"></ul>
+</section>
+<p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> read-only here.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-declarative-ledger">?<span class="z-vh"> Declarative policy</span></button><span class="z-help__pop" id="help-declarative-ledger" popover><span>The policy file on the host is the source: change it there, then reload.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#7-reloading-the-policy" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> declarative policy</span></a></span></span></p>
+<p class="z-note" data-mode="managed" hidden><span class="z-note__word">Managed policy:</span> each save asks for your passkey.</p>
 </section>
 
 <section id="policy" hidden>
-<h2>Policy</h2>
-<p data-mode="declarative">This deployment's policy is declarative: change it in its source and
-reload. The portal can't change it.</p>
-<p data-mode="managed" hidden>This deployment's policy is managed: the portal's saves and the
-host's imports write each revision.</p>
+<h2 class="z-page__title">Policy</h2>
+<p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> change it in its source and reload.</p>
+<p class="z-note" data-mode="managed" hidden><span class="z-note__word">Managed policy:</span> the portal's saves and the host's imports write each revision.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-managed">?<span class="z-vh"> About managed policy</span></button><span class="z-help__pop" id="help-managed" popover><span>Each revision is kept: see the history below.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#34-managed-policy" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about managed policy</span></a></span></span></p>
 <div id="policy-managed" data-mode="managed" hidden>
-<p id="policy-saved" role="status"></p>
+<p id="policy-saved" class="z-status z-status--success" role="status"></p>
 <p id="policy-head"></p>
 <p id="policy-gateway"></p>
 <p id="policy-export"></p>
-<h3>Connectors</h3>
-<p>Each SMTP connector, with whether it sends and its limits. <b>Pause</b> refuses every send
-at once and <b>Resume</b> lets them go out again; <b>Save limits</b> sets how many sends a day and
-how long a subject and a body may be. Each asks for your passkey and writes a revision. Its
-recipients, mail server and sender are the host's to change (zoeymcp policy import): its password
-is bound to them.</p>
-<ul id="policy-connectors"></ul>
-<h3>History</h3>
-<p>Every revision the vault keeps, newest first: what made it, who and when. <b>Show the
-changes</b> lists what a revision changed from the one before it, each change marked wider,
-narrower or neutral. <b>Roll back</b> plans a new revision with that revision's content, keeping
-the head's key generations, admin block and pins, and lists every change before your passkey
-confirms it. The portal rolls back only when nothing gets wider: a rollback that brings back
-something the policy removed, or widens anything, is the host's (zoeymcp policy rollback).</p>
-<ul id="policy-history"></ul>
-<button type="button" id="policy-older" hidden>Older revisions</button>
-<div id="policy-diff" hidden>
-<h3 id="policy-diff-title"></h3>
-<ul id="policy-diff-rows"></ul>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">Connectors</h3></div>
+<p>Each SMTP connector, whether it sends, and its limits.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-connectors">?<span class="z-vh"> About connectors</span></button><span class="z-help__pop" id="help-connectors" popover><span><b>Pause</b> refuses every send at once; <b>Resume</b> lets them go again; <b>Save limits</b> sets sends a day and subject and body lengths. Each asks for your passkey. Recipients, mail server and sender are the host's to change (<code>zoeymcp policy import</code>).</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#22-the-smtp-connector" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about connectors</span></a></span></span></p>
+<ul id="policy-connectors" class="z-list"></ul>
+</section>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">History</h3></div>
+<p>Every revision the vault keeps, newest first.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-history">?<span class="z-vh"> About history and rollback</span></button><span class="z-help__pop" id="help-history" popover><span><b>Show the changes</b> lists what a revision changed, each marked wider, narrower or neutral. <b>Roll back</b> plans a new revision with that one's content and lists every change before your passkey confirms it. A rollback that widens anything is the host's (<code>zoeymcp policy rollback</code>).</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#rolling-back" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about history and rollback</span></a></span></span></p>
+<ul id="policy-history" class="z-list"></ul>
+<div class="z-pager"><button type="button" id="policy-older" class="z-btn z-btn--secondary z-btn--small" hidden>Older revisions</button></div>
+<div id="policy-diff" class="z-panel" hidden>
+<div class="z-panel__head"><h3 id="policy-diff-title" class="z-panel__title"></h3></div>
+<ul id="policy-diff-rows" class="z-changes"></ul>
 <p id="policy-diff-actions"></p>
 </div>
+</section>
 </div>
-<p>It was read from <span id="policy-source"></span>.</p>
-<p id="policy-hidden"></p>
-<pre id="policy-text"></pre>
+<section class="z-section">
+<div class="z-section__head"><h3 class="z-section__title">The policy</h3><p class="z-hint">Read from <span id="policy-source"></span>.</p></div>
+<p id="policy-hidden" class="z-hint"></p>
+<pre id="policy-text" class="z-codeblock z-codeblock__pre z-codeblock--tall"></pre>
+</section>
 </section>
 </main>
 
-<dialog id="confirm" aria-labelledby="confirm-title">
-<h2 id="confirm-title">Confirm with your passkey</h2>
-<p>The vault will do this, and nothing else:</p>
-<dl id="confirm-summary"></dl>
-<p id="confirm-now-label" hidden>What the vault finds now:</p>
-<dl id="confirm-now"></dl>
-<p id="confirm-expires"></p>
-<p id="confirm-error" role="alert" hidden></p>
-<button type="button" id="confirm-passkey">Confirm with your passkey</button>
-<button type="button" id="confirm-create" hidden>Create the new passkey</button>
-<button type="button" id="confirm-cancel">Close</button>
+<dialog id="confirm" class="z-dialog" aria-labelledby="confirm-title">
+<h2 id="confirm-title" class="z-dialog__title">Confirm with your passkey</h2>
+<p class="z-dialog__lead">The vault will do this, and nothing else:</p>
+<dl id="confirm-summary" class="z-summary"></dl>
+<p id="confirm-now-label" class="z-dialog__lead" hidden>What the vault finds now:</p>
+<dl id="confirm-now" class="z-summary"></dl>
+<p id="confirm-expires" class="z-dialog__expires"></p>
+<div class="z-alert z-alert--error"><span class="z-alert__mark" aria-hidden="true">!</span><p id="confirm-error" class="z-alert__text" role="alert" hidden></p></div>
+<div class="z-dialog__actions">
+<button type="button" id="confirm-passkey" class="z-btn z-btn--primary">Confirm with your passkey</button>
+<button type="button" id="confirm-create" class="z-btn z-btn--primary" hidden>Create the new passkey</button>
+<button type="button" id="confirm-cancel" class="z-btn z-btn--quiet">Close</button>
+</div>
 </dialog>
 
-<dialog id="connect" aria-labelledby="connect-title">
-<h2 id="connect-title">Connect</h2>
-<dl id="connect-summary"></dl>
-<p id="connect-replaced"></p>
-<div id="connect-steps">
-<p>1. <a id="connect-link" target="_blank" rel="noopener noreferrer">Open the provider's sign-in
-page in a new tab</a>, and approve there.</p>
-<p id="connect-paste-text">The provider then sends that tab to an address starting with
-<code id="connect-redirect"></code>. That page won't load, which is expected: copy the whole
-address from that tab's address bar and paste it here, by <span id="connect-by"></span>.</p>
-<p id="connect-callback-text" hidden>The provider then sends that tab back to the portal, and
-this dialog asks for your passkey. If that page doesn't load, or says the portal didn't take the
-sign-in, copy its whole address from that tab's address bar and paste it here, by
-<span id="connect-by-callback"></span>.</p>
-<label for="connect-paste">2. The address from that tab's address bar</label>
-<input id="connect-paste" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="8000">
-<button type="button" id="connect-check">Check the address</button>
+<dialog id="connect" class="z-dialog" aria-labelledby="connect-title">
+<h2 id="connect-title" class="z-dialog__title">Connect</h2>
+<div class="z-dialog__body">
+<dl id="connect-summary" class="z-summary"></dl>
+<p id="connect-replaced" class="z-hint"></p>
+<ol id="connect-steps" class="z-nextsteps">
+<li class="z-nextstep z-nextstep--current"><div class="z-nextstep__body">
+<p class="z-nextstep__title">Sign in at the provider</p>
+<p><a id="connect-link" class="z-link z-link--external" target="_blank" rel="noopener noreferrer">Open the provider's sign-in page in a new tab</a></p>
+</div></li>
+<li class="z-nextstep"><div class="z-nextstep__body">
+<div class="z-field">
+<label class="z-label" for="connect-paste">Paste the address it sends you to</label>
+<input id="connect-paste" class="z-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="8000">
+<p id="connect-paste-text" class="z-hint">That tab goes to <code id="connect-redirect"></code>, which won't load: that's expected. Paste its whole address by <span id="connect-by"></span>.</p>
+<p id="connect-callback-text" class="z-hint" hidden>The provider sends that tab back here and this dialog asks for your passkey. If it doesn't, paste that tab's address by <span id="connect-by-callback"></span>.</p>
 </div>
-<p id="connect-error" role="alert" hidden></p>
-<button type="button" id="connect-rebind" hidden>Connect and rebind</button>
-<button type="button" id="connect-close">Cancel</button>
+<div class="z-btn-row"><button type="button" id="connect-check" class="z-btn z-btn--primary">Check the address</button></div>
+</div></li>
+</ol>
+<div class="z-alert z-alert--error"><span class="z-alert__mark" aria-hidden="true">!</span><p id="connect-error" class="z-alert__text" role="alert" hidden></p></div>
+</div>
+<div class="z-dialog__actions">
+<button type="button" id="connect-rebind" class="z-btn z-btn--primary" hidden>Connect and rebind</button>
+<button type="button" id="connect-close" class="z-btn z-btn--quiet">Cancel</button>
+</div>
 </dialog>
 </body>
 </html>

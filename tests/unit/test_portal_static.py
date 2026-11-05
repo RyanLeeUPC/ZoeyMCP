@@ -23,6 +23,7 @@ from tests.unit.test_approvalsview import closed as closed_hold
 from tests.unit.test_approvalsview import hold as held_hold
 from tests.unit.test_review_choices import large
 from tests.unit.test_reviewview import held
+from zoeymcp import __version__
 from zoeymcp.common.policy.attention import approvals_item
 from zoeymcp.common.policy.change import CONNECTOR_LIMITS
 from zoeymcp.common.policy.diff import Change
@@ -38,6 +39,7 @@ from zoeymcp.vault import onboarding
 from zoeymcp.vault.oauth import dcr
 
 STATIC_DIR = Path(__file__).resolve().parents[2] / "src" / "zoeymcp" / "portal" / "static"
+DOCS_DIR = Path(__file__).resolve().parents[2] / "docs"
 # Every script the map serves (M7 K.4), so a new one can't escape a check below.
 SCRIPTS = tuple(file.name for file in STATIC.values() if file.content_type == JAVASCRIPT)
 # And every stylesheet: the Zoey design system's tokens and components, then the portal's own.
@@ -49,8 +51,9 @@ CSS_URL = re.compile(r"url\(([^)]*)\)")
 # label); M8 step 15's Approvals queue (approvals.js, its section and two rules) takes it to 133.4
 # KiB (136,607 bytes), so the cap is 160 KiB from that step. The UX pass (owner, 2026-11-05):
 # the Zoey design system's stylesheets, its self-hosted fonts (54,432 bytes) and the app icon;
-# the owner raised the cap for them, to 256 KiB.
-MAX_ASSETS = 256 * 1024
+# the owner raised the cap for them (and for the help's short explanations in the page), to 288
+# KiB: 239,055 bytes with the assets, 260,579 with index.html's help.
+MAX_ASSETS = 288 * 1024
 # Line caps, per file (M7 K.4); a script with no cap fails. K.2 set 1,000 lines for app.js and
 # webauthn.js together. Step 15's Ledger and Policy pages took them past it (998 before, 1,041
 # after) although every line they show is made by the server and the existing pages were folded
@@ -60,9 +63,11 @@ MAX_ASSETS = 256 * 1024
 # 1,051 after), and drift.js, Home's attention list and the drift review, has its own 450;
 # policy.js, the Policy page's managed half (step 15b), its own 500. M8 (H.1, Q19 (a)):
 # approvals.js, the Approvals queue, the badge and Home's approvals item, its own 400, so app.js
-# gains the nav entry and one call (1,053 lines with webauthn.js, BP-12).
+# gains the nav entry and one call (1,053 lines with webauthn.js, BP-12). The UX pass (owner,
+# 2026-11-05, raising the caps for the design system's classes in the rows the scripts draw):
+# app.js and webauthn.js 1,150 (1,105 with its row, tag and finding builders and help links).
 LINE_CAPS = {
-    ("app.js", "webauthn.js"): 1060,
+    ("app.js", "webauthn.js"): 1150,
     ("review.js",): 700,
     ("drift.js",): 450,
     ("policy.js",): 500,
@@ -222,6 +227,8 @@ def test_index_html() -> None:
         "/tokens.css",
         "/webauthn.js",
         "/zoey-icon.svg",
+        "/zoey-icon.svg",
+        "/zoey-icon.svg",
         "/zoey.css",
     ]
     assert set(page.assets) <= set(STATIC)
@@ -345,13 +352,30 @@ def test_the_fonts_are_the_packages_own() -> None:
         assert "SIL Open Font License, Version 1.1" in path.read_text(encoding="utf-8")
 
 
+def docs_ref() -> str:
+    """The ref the help's links read the docs at: the release's tag, or dev's branch while the
+    version is a development one (UX pass, owner: GitHub's docs at the release tag)."""
+    return "dev" if ".dev" in __version__ else f"v{__version__}"
+
+
+def github_anchor(heading: str) -> str:
+    """GitHub's anchor for a Markdown heading: lower case, punctuation but hyphens dropped,
+    spaces as hyphens."""
+    text = heading.lstrip("#").strip().lower()
+    return re.sub(r"[^\w\- ]", "", text).replace(" ", "-")
+
+
 @pytest.mark.parametrize("name", [*SCRIPTS, *STYLESHEETS])
 def test_no_sink_and_no_absolute_url(name: str) -> None:
     text = read(name)
     code = code_of(text) if name.endswith(".js") else text
     assert sinks_in(code) == []
     # The https check of the authorization link (C.4) compares the protocol only, so the page
-    # holds no absolute URL at all.
+    # holds no absolute URL but the help's: app.js's DOCS, the docs at this release (UX pass).
+    if name == "app.js":
+        docs = f'  const DOCS = "https://github.com/RyanLeeUPC/ZoeyMCP/blob/{docs_ref()}/docs/";\n'
+        assert code.count(docs) == 1
+        code = code.replace(docs, "")
     assert ABSOLUTE_URL.findall(code) == []
     if name.endswith(".css"):
         assert "@import" not in text
@@ -410,7 +434,9 @@ def test_every_button_runs_its_handler_once_at_a_time() -> None:
     assert body.index("element.disabled = true;") < body.index("await handler(event);")
     assert body.index("await handler(event);") < body.index("} finally {")
     assert re.search(r"function on\(id, handler\) \{\s*guard\(\$\(id\), handler\);\s*\}", code)
-    assert re.search(r"function button\(label, handler\) \{[^}]*guard\(element, handler\);", code)
+    assert re.search(
+        r"function button\(label, handler, kind\) \{[^}]*guard\(element, handler\);", code
+    )
     # The others are the dialogs' Escape, which no click can repeat, and the connect dialog's
     # poll when the tab is shown again (C.4), which sends nothing while one is in flight.
     assert re.findall(r"addEventListener\(\"(\w+)\"", code) == [
@@ -421,7 +447,7 @@ def test_every_button_runs_its_handler_once_at_a_time() -> None:
 
 
 class Anchors(HTMLParser):
-    """Every <a>'s attributes, by its id."""
+    """Every <a>'s attributes, by its id (or its place, for one without)."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -429,8 +455,8 @@ class Anchors(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         found = dict(attrs)
-        if tag == "a" and found.get("id"):
-            self.anchors[str(found["id"])] = found
+        if tag == "a":
+            self.anchors[str(found.get("id") or f"anchor {len(self.anchors)}")] = found
 
 
 def test_the_authorization_link_opens_alone() -> None:
@@ -439,18 +465,27 @@ def test_the_authorization_link_opens_alone() -> None:
     the vault sent, never through a redirect or window.open."""
     parser = Anchors()
     parser.feed(read("index.html"))
-    assert parser.anchors == {
-        "connect-link": {
-            "id": "connect-link",
-            "target": "_blank",
-            "rel": "noopener noreferrer",
-        }
+    assert parser.anchors.pop("connect-link") == {
+        "id": "connect-link",
+        "class": "z-link z-link--external",
+        "target": "_blank",
+        "rel": "noopener noreferrer",
     }
     code = code_of(read("app.js"))
     check = code.index('const https = new URL(started.authorize_url).protocol === "https:";')
     assigned = code.index('$("connect-link").href = https ? started.authorize_url : "";')
     assert check < assigned
-    assert code.count(".href =") == 1
+    # The rest are the help's Learn more links: a new tab with no opener and no referrer, and an
+    # address app.js makes from DOCS and the section the link names, which docs/ has.
+    assert len(parser.anchors) > 5
+    for anchor in parser.anchors.values():
+        assert (anchor["target"], anchor["rel"]) == ("_blank", "noopener noreferrer"), anchor
+        assert "href" not in anchor
+        doc, section = str(anchor["data-doc"]).split("#")
+        headings = (DOCS_DIR / doc).read_text(encoding="utf-8").splitlines()
+        assert section in {github_anchor(h) for h in headings if h.startswith("#")}, section
+    assert code.count(".href =") == 2
+    assert "link.href = DOCS + link.dataset.doc;" in code
 
 
 class Inputs(HTMLParser):
@@ -790,7 +825,7 @@ def test_a_fragment_at_any_indent_the_routes_take() -> None:
     """K.1, OPS-2: a fragment again at an indent the fragment and diff routes take (0 to 16, or
     the compose form); fragment 1's last line shows under fragment 1 only."""
     page = read("index.html")
-    select = page[page.index('<select id="fragment-indent">') :]
+    select = page[page.index('<select id="fragment-indent" class="z-select z-select--small">') :]
     values = re.findall(r'<option value="([a-z0-9]+)">', select[: select.index("</select>")])
     assert (values[0], values[-1]) == ("0", "compose")
     assert len(values) > 2
@@ -1318,7 +1353,7 @@ def test_app_js_gains_the_nav_entry_and_one_call() -> None:
     assert enter.index("zoeyDrift.home()") < enter.index("zoeyApprovals.home()")
     assert enter.index("zoeyApprovals.home()") < enter.index('show("home");')
     page = read("index.html")
-    assert '<button type="button" id="nav-approvals">Approvals</button>' in page
+    assert '<button type="button" id="nav-approvals" class="z-nav__item">Approvals</button>' in page
 
 
 def test_approvals_js_reads_what_the_vault_sends() -> None:

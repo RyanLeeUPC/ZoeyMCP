@@ -14,6 +14,11 @@
   const PAGES = ["blocked", "login", "setup", "home", "credentials", "sessions", "passkeys",
     "secrets", "ledger", "policy", "servers", "approvals"];
   const SETUP_STEPS = ["setup-code-step", "setup-name-step", "setup-done-step"];
+  // The help's "Learn more" links: the docs at this release's tag (dev's while unreleased).
+  const DOCS = "https://github.com/RyanLeeUPC/ZoeyMCP/blob/dev/docs/";
+  // A finding's level, as its tag's word and tone (the Zoey design system's Tag).
+  const LEVEL = { error: ["Error", "z-tag--danger"], warning: ["Warning", "z-tag--warning"],
+    info: ["Info", ""] };
 
   // What the browser refuses, worded here (M.2); the vault words every other refusal.
   const BROWSER_TEXT = {
@@ -124,8 +129,11 @@
   function show(page) {
     // A save that draws its page again (drift.js saved, approvals.js holdSaved) keeps its words.
     const again = !$(page).hidden;
+    $("loading").hidden = true;
     for (const id of PAGES) {
       $(id).hidden = id !== page;
+      const nav = $("nav-" + id); // the nav's current page, for the eye and the screen reader
+      if (nav) nav.ariaCurrent = id === page ? "page" : null;
     }
     if (page !== "secrets") {
       $("secret-value").value = ""; // a value typed but not sent doesn't stay in the page
@@ -137,9 +145,13 @@
   }
 
   function step(id) {
-    for (const other of SETUP_STEPS) {
+    const at = SETUP_STEPS.indexOf(id);
+    SETUP_STEPS.forEach((other, n) => {
       $(other).hidden = other !== id;
-    }
+      const shown = $("setup-steps").children[n];
+      shown.ariaCurrent = n === at ? "step" : null;
+      shown.dataset.state = n < at ? "done" : "";
+    });
   }
 
   // An error line: its text, hidden when there is none.
@@ -161,6 +173,14 @@
     return new Date(seconds * 1000).toLocaleString();
   }
 
+  // An element with its classes and, if given, its text.
+  function make(tag, className, text) {
+    const element = document.createElement(tag);
+    element.className = className;
+    if (text !== undefined) element.textContent = text;
+    return element;
+  }
+
   function renderBar(session) {
     $("bar").hidden = session.scope !== "full";
     $("bar-origin").textContent = session.origin;
@@ -168,20 +188,25 @@
     $("bar-passkey").textContent =
       session.credential === null ? "" : "Passkey " + (name === null ? "" : name + " ") +
         "(" + session.credential + ")";
-    $("bar-ends").textContent =
-      "Session ends by " + when(session.expires_at) + ", or after 15 idle minutes";
+    $("bar-ends").textContent = "Ends by " + new Date(session.expires_at * 1000)
+      .toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + " or 15 idle minutes";
     const counts = session.health_summary;
-    $("bar-health").textContent = counts === null ? "" :
-      "Health: " + counts.error + " error(s), " + counts.warning + " warning(s)";
+    const health = $("bar-health");
+    health.hidden = counts === null;
+    if (counts === null) return;
+    health.textContent = counts.error ? counts.error + (counts.error > 1 ? " errors" : " error") :
+      counts.warning ? counts.warning + (counts.warning > 1 ? " warnings" : " warning") : "Healthy";
+    health.className = "z-health" + (counts.error ? " z-health--error" :
+      counts.warning ? " z-health--warning" : "");
   }
 
   function renderBanners(banners) {
     const list = $("banners");
     list.replaceChildren();
     for (const banner of banners) {
-      const item = document.createElement("li");
-      item.textContent = banner.text;
-      item.className = "banner";
+      const item = make("li", "banner z-alert z-alert--warning");
+      item.append(make("span", "z-alert__mark", "!"), make("p", "z-alert__text", banner.text));
+      item.firstChild.ariaHidden = "true";
       list.append(item);
     }
   }
@@ -259,16 +284,27 @@
     return run === undefined ? "" : button(ACTION_TEXT[action.kind], run);
   }
 
+  // A finding's row (the design system's FindingList): its level as a tag, what is found, its
+  // next step, and its action.
+  function finding(level, text, where, action) {
+    const item = make("li", "z-finding");
+    const body = make("div", "z-finding__body");
+    body.append(make("p", "z-finding__text", text));
+    if (where) body.append(make("p", "z-finding__where", where));
+    const [word, tone] = LEVEL[level] || [level, ""];
+    item.append(tag(word, tone), body);
+    if (action) item.append(make("div", "z-finding__action"));
+    if (action) item.lastChild.append(action);
+    return item;
+  }
+
   function renderFindings(list, findings) {
     list.replaceChildren();
-    for (const finding of findings) {
-      const item = document.createElement("li");
-      item.textContent = finding.level + ", " + SECTION[finding.section] +
-        (finding.name_shown === null ? "" : " " + finding.name_shown) + ": " +
-        finding.text_shown + (finding.advisory ? " (from stored metadata). " : ". ") +
-        (finding.todo === null ? "" : finding.todo + " ");
-      item.append(actionControl(finding.action));
-      list.append(item);
+    for (const found of findings) {
+      list.append(finding(found.level, SECTION[found.section] +
+        (found.name_shown === null ? "" : " " + found.name_shown) + ": " + found.text_shown +
+        (found.advisory ? " (from stored metadata)." : "."), found.todo,
+        actionControl(found.action)));
     }
   }
 
@@ -280,17 +316,16 @@
       list.replaceChildren();
       for (const credential of health.credentials) {
         const entry = oauth.credentials.find((one) => one.credential === credential.name);
-        const item = document.createElement("li");
-        item.textContent = credential.name_shown + " (" + credential.kind + "): " +
-          credential.level + "; used by " + (credential.routes.join(", ") || "no route") + "." +
-          (entry === undefined ? " " : " " + entry.text_shown + " ");
-        if (entry !== undefined && entry.connect !== null) {
-          item.append(button(entry.connect === "test" ? "Test it" : "Connect",
-            () => connect(entry.credential, false)));
-        }
-        const findings = document.createElement("ul");
+        const [word, tone] = credential.level === "error" || credential.level === "warning" ?
+          LEVEL[credential.level] : ["OK", "z-tag--ok"];
+        const item = row(credential.name_shown + " (" + credential.kind + ")", "Used by " +
+          (credential.routes.join(", ") || "no route") + "." +
+          (entry === undefined ? "" : " " + entry.text_shown), [tag(word, tone)],
+        entry !== undefined && entry.connect !== null ? [button(entry.connect === "test" ?
+          "Test it" : "Connect", () => connect(entry.credential, false), "z-btn--primary")] : []);
+        const findings = make("ul", "z-findings z-findings--compact");
         renderFindings(findings, credential.findings);
-        item.append(findings);
+        if (credential.findings.length) item.firstChild.append(findings);
         list.append(item);
       }
     });
@@ -491,13 +526,10 @@
       const list = $("session-list");
       list.replaceChildren();
       for (const session of answer.sessions) {
-        const item = document.createElement("li");
         const by = session.credential === null ? "a setup code" : "passkey " + session.credential;
-        item.textContent =
-          session.fingerprint + (session.this ? " (this browser)" : "") + ": " + session.origin +
-          ", signed in with " + by + " at " + when(session.created) + ", last used " +
-          when(session.last_seen);
-        list.append(item);
+        list.append(row(session.fingerprint, session.origin + ", signed in with " + by + " at " +
+          when(session.created) + ", last used " + when(session.last_seen) + ".",
+        session.this ? [tag("This browser", "z-tag--current")] : []));
       }
     });
   }
@@ -536,52 +568,72 @@
 
   // --- passkeys (D.5) -------------------------------------------------------------------------
 
-  function button(label, handler) {
-    const element = document.createElement("button");
+  // A row's button: secondary and small unless ``kind`` says otherwise.
+  function button(label, handler, kind) {
+    const element = make("button", "z-btn z-btn--small " + (kind || "z-btn--secondary"), label);
     element.type = "button";
-    element.textContent = label;
     guard(element, handler);
     return element;
+  }
+
+  function tag(text, tone) {
+    return make("span", "z-tag " + (tone || ""), text);
+  }
+
+  // A list row (the design system's ItemList): its title and tags, its facts, its buttons.
+  function row(title, meta, tags, actions) {
+    const item = make("li", "z-list__item");
+    const body = make("div", "z-list__body");
+    const head = make("span", "z-list__title", title);
+    head.append(...(tags || []));
+    body.append(head, make("span", "z-list__meta", meta));
+    item.append(body);
+    if (actions && actions.length) item.append(make("div", "z-list__actions"));
+    if (actions && actions.length) item.lastChild.append(...actions);
+    return item;
   }
 
   async function showPasskeys() {
     await visit("passkeys", async () => {
       const answer = await api("GET", "/api/passkeys");
+      closeRename(); // home again, before the row it may be in goes
       const list = $("passkey-list");
       list.replaceChildren();
       for (const passkey of answer.passkeys) {
-        const item = document.createElement("li");
-        const text = document.createElement("span");
         const transports = passkey.transports.length ? ", " + passkey.transports.join(" ") : "";
-        text.textContent =
-          passkey.name_shown + " (" + passkey.fingerprint + ")" +
-          (passkey.this ? ", signed in this session" : "") + ": works on " + passkey.rp_id +
-          ", " + passkey.alg + ", " + (passkey.synced ? "synced" : "device-bound") + transports +
-          "; enrolled " + VIA[passkey.via] + " on " + passkey.origin + " at " +
-          when(passkey.created) + "; last used " +
+        const item = row(passkey.name_shown, "Fingerprint " + passkey.fingerprint + "; works on " +
+          passkey.rp_id + ", " + passkey.alg + transports + "; enrolled " + VIA[passkey.via] +
+          " on " + passkey.origin + " at " + when(passkey.created) + "; last used " +
           (passkey.last_used === null ? "never" :
-            new Date(passkey.last_used * 1000).toLocaleDateString()) + ".";
-        item.append(
-          text,
-          button("Rename", () => openRename(passkey)),
+            new Date(passkey.last_used * 1000).toLocaleDateString()) + ".",
+        [tag(passkey.synced ? "Synced" : "Device-bound")].concat(
+          passkey.this ? [tag("This session", "z-tag--current")] : []), [
+          button("Rename", () => openRename(passkey, item)),
           button("Remove", () => prepare("passkey.remove", { credential: passkey.fingerprint },
-            afterRemove))
-        );
+            afterRemove), "z-btn--danger"),
+        ]);
         list.append(item);
       }
-      closeRename();
     });
   }
 
-  function openRename(passkey) {
+  // The rename form opens in the passkey's own row (the design system's RowEditor).
+  function openRename(passkey, item) {
+    closeRename();
     renaming = passkey.fingerprint;
     $("rename-which").textContent = "Rename " + passkey.name_shown + " (" + passkey.fingerprint + ")";
     $("rename-name").value = "";
+    item.classList.add("z-list__item--editing");
+    item.append($("rename"));
     $("rename").hidden = false;
+    $("rename-name").focus();
   }
 
   function closeRename() {
     renaming = null;
+    const editing = $("rename").closest("li");
+    if (editing) editing.classList.remove("z-list__item--editing");
+    $("passkey-list").after($("rename"));
     $("rename").hidden = true;
   }
 
@@ -659,27 +711,19 @@
       const list = $("secret-list");
       list.replaceChildren();
       for (const secret of answer.secrets) {
-        const item = document.createElement("li");
-        const text = document.createElement("span");
-        text.textContent =
-          secret.name_shown + ": " + secret.binding_shown + "; set " + secret.created +
+        list.append(row(secret.name_shown, secret.binding_shown + "; set " + secret.created +
           ", last replaced " + secret.updated + ", under key " + secret.key_id +
           (secret.live_slot ? "; the vault keeps a credential's live token here" : "") +
-          (secret.health_shown === null ? "" : "; health: " + secret.health_shown) + ".";
-        item.append(text);
-        if (!secret.live_slot) {
-          item.append(
-            button("Replace", () => replaceSecret(secret)),
-            button("Delete",
-              () => prepare("secret.delete", { name: secret.name }, afterSecretDeleted))
-          );
-        }
-        list.append(item);
+          (secret.health_shown === null ? "" : "; health: " + secret.health_shown) + ".", [],
+        secret.live_slot ? [] : [
+          button("Replace", () => replaceSecret(secret)),
+          button("Delete",
+            () => prepare("secret.delete", { name: secret.name }, afterSecretDeleted),
+            "z-btn--danger"),
+        ]));
       }
       if (answer.secrets.length === 0) {
-        const item = document.createElement("li");
-        item.textContent = "No secrets are stored yet.";
-        list.append(item);
+        list.append(make("li", "z-list__empty", "No secrets are stored yet."));
       }
     });
   }
@@ -732,8 +776,8 @@
   function renderLines(list, items, control) {
     list.replaceChildren();
     for (const item of items) {
-      const entry = document.createElement("li");
-      entry.textContent = [item.text_shown].concat(item.lines_shown || []).join("\n");
+      const entry = make("li", "z-log__entry",
+        [item.text_shown].concat(item.lines_shown || []).join("\n"));
       entry.append(control ? control(item) : "");
       list.append(entry);
     }
@@ -900,11 +944,13 @@
       }
       busy = true;
       element.disabled = true;
+      element.ariaBusy = "true";
       try {
         await handler(event);
       } finally {
         busy = false;
         element.disabled = false;
+        element.ariaBusy = null;
       }
     });
   }
@@ -920,6 +966,9 @@
       show("blocked");
       return;
     }
+    for (const link of document.querySelectorAll("a[data-doc]")) {
+      link.href = DOCS + link.dataset.doc;
+    }
     on("login-passkey", signIn);
     on("login-setup", function () {
       clearError();
@@ -934,6 +983,7 @@
     on("setup-enrol", enrol);
     on("setup-login", signIn);
     on("nav-home", enter);
+    on("bar-health", enter);
     on("nav-credentials", showCredentials);
     on("nav-sessions", showSessions);
     on("nav-passkeys", showPasskeys);

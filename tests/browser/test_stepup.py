@@ -12,6 +12,7 @@ by hand.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -75,7 +76,9 @@ def rig(tmp_path: Path) -> Iterator[PortalRig]:
 
 
 def passkey_row(page: Page, name: str) -> Locator:
-    return page.locator("#passkey-list > li").filter(has_text=f"{name} (")
+    """A passkey's row, by its name: the row's title, then its tags."""
+    tags = re.escape(name) + "(?:Synced|Device-bound)"
+    return page.locator("#passkey-list > li").filter(has_text=re.compile("^" + tags))
 
 
 def credential_row(page: Page, name: str) -> Locator:
@@ -162,7 +165,7 @@ def test_item_8_a_mismatched_paste_is_refused_with_no_prompt(
     passkeys = set_up(page, rig)
     connect_demo(page)
     watch.allow(REFUSED_400, on=rig.origin)  # the prepare's refusal, which the browser reports
-    page.get_by_label("2. The address from that tab's address bar").fill(FOREIGN)
+    page.get_by_label("Paste the address it sends you to").fill(FOREIGN)
     press(page, "Check the address")
     expect(connect_dialog(page).get_by_role("alert")).to_have_text(STATE_MISMATCH)
     expect(confirm_dialog(page)).to_be_hidden()
@@ -222,9 +225,9 @@ def test_item_15_a_secret_is_masked_and_the_page_keeps_no_copy(rig: PortalRig, p
     offers to save it stays by hand: an automated browser shows no password manager."""
     passkeys = set_up(page, rig)
     open_section(page, "Secrets")
-    field = page.get_by_label("Value (cleared from this page once sent, whatever the answer)")
+    field = page.get_by_label("Value", exact=True)
     assert field.evaluate("(element) => getComputedStyle(element).webkitTextSecurity") == "disc"
-    page.get_by_label("Name (NAME in the policy's store:NAME)").fill("browser-check")
+    page.get_by_label("Name", exact=True).fill("browser-check")
     field.fill(VALUE)
     page.get_by_label("Origins it may be sent to", exact=False).fill("https://x.example")
     press(page, "Set the secret")

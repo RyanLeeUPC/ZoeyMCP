@@ -996,9 +996,9 @@ def discover(page: Page, client_id: str = "") -> None:
     page.get_by_label("The server's MCP URL").fill(SERVER_URL)
     if not page.locator("#add-more").evaluate("(details) => details.open"):
         page.get_by_text("More options", exact=True).click()
-    page.get_by_label("Client ID, for a client registered at the provider already").fill(client_id)
+    page.get_by_label("Client ID", exact=True).fill(client_id)
     if client_id:
-        page.get_by_label("Its client authentication", exact=False).select_option("none")
+        page.get_by_label("Client authentication", exact=True).select_option("none")
     press(page, "Discover")
     expect(page.locator("#plan")).to_be_visible()
 

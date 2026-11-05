@@ -6,44 +6,156 @@
 
 body {
   margin: 0;
-}
-
-main {
-  max-width: 48rem;
-  margin: 0 auto;
-  padding: 1.5rem;
+  min-height: 100vh;
 }
 
 [hidden] {
   display: none !important;
 }
 
-header {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem 1rem;
-  align-items: center;
-  padding: 0.5rem 1.5rem;
-  border-bottom: 1px solid GrayText;
+/* An alert whose text is empty or hidden takes no room: the page's error and status lines. */
+.z-alert:has(> .z-alert__text[hidden]),
+.z-alert:has(> .z-alert__text:empty) {
+  display: none;
 }
 
-nav {
-  display: flex;
-  gap: 0.5rem;
+.z-alert__text {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
-label {
+#page > .z-alert,
+#page > .z-alert-stack:not(:empty) {
+  margin-bottom: var(--space-4);
+}
+
+/* A page's parts, one rhythm: 16px between them, 32px before a section or a panel. */
+#page > section > * {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+#page > section > * + * {
+  margin-top: var(--space-4);
+}
+
+#page > section > .z-section,
+#page > section > .z-panel,
+#page > section > div > .z-section {
+  margin-top: var(--space-8);
+}
+
+.z-section > * {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.z-section > * + * {
+  margin-top: var(--space-4);
+}
+
+/* Signing in and setting up: one card in the middle of the column. */
+.z-signin {
+  max-width: 32rem;
+  margin: var(--space-8) auto 0;
+  display: grid;
+  gap: var(--space-4);
+}
+
+#login {
+  padding: var(--space-8) var(--space-6);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raised);
+}
+
+#page > .z-signin > * + * {
+  margin-top: 0;
+}
+
+.z-signin__mark {
   display: block;
-  margin-top: 1rem;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-md);
 }
 
-input,
-select,
-textarea {
+.z-panel > .z-field,
+.z-disclosure__body > .z-field {
+  max-width: 24rem;
+}
+
+.z-disclosure__body {
+  gap: var(--space-4);
+  padding-top: var(--space-2);
+}
+
+/* A row opened to rename: the form under the row's facts. */
+.z-list__item--editing > .z-rename {
+  flex-basis: 100%;
+  display: grid;
+  gap: var(--space-3);
+}
+
+.z-rename > * {
+  margin: 0;
+}
+
+/* Controls a script draws without the design system's classes look like its own. */
+input:not([type="checkbox"]):not(.z-input),
+select:not(.z-select),
+textarea:not(.z-input) {
+  box-sizing: border-box;
   width: 100%;
   max-width: 24rem;
+  min-height: 36px;
+  padding: 0 var(--space-3);
   font: inherit;
-  margin-bottom: 0.5rem;
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--surface-raised);
+  border: 1.5px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+}
+
+button:not([class]) {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  margin: var(--space-1) var(--space-2) var(--space-1) 0;
+  padding: 0 var(--space-3);
+  border: 1.5px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:not([class]):hover {
+  background: var(--surface-sunken);
+}
+
+button:not([class]):disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button:not([class]):focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
 }
 
 /* A secret's value: a text area, which password managers don't offer to save or fill (a password
@@ -54,49 +166,28 @@ textarea.masked {
   resize: vertical;
 }
 
-button {
-  font: inherit;
-  margin: 0.25rem 0.5rem 0.25rem 0;
-}
-
 code {
   overflow-wrap: anywhere;
 }
 
-#error,
-#confirm-error {
-  border-left: 0.25rem solid #c62828;
-  padding-left: 0.75rem;
+pre {
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 20px;
 }
 
-#banners {
-  list-style: none;
-  padding: 0;
-}
-
-.banner {
-  border-left: 0.25rem solid #ef6c00;
-  padding-left: 0.75rem;
-  margin-bottom: 0.5rem;
-}
-
-#session-list li,
-#passkey-list li,
-#secret-list li,
-#ledger li,
-#approvals li,
-#servers li {
-  margin-bottom: 0.5rem;
-  overflow-wrap: anywhere;
+/* A block of literal text: the policy, an approval's text. */
+pre.z-codeblock {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
 }
 
 /* A ledger row's sends go on lines of their own under it. */
-#ledger li {
+.z-log__entry {
   white-space: pre-line;
-}
-
-pre {
-  overflow-x: auto;
+  overflow-wrap: anywhere;
 }
 
 /* An approval's composed text, whole: its lines kept, a long one wrapped (M8 design H.1). */
@@ -105,16 +196,23 @@ pre {
   overflow-wrap: anywhere;
 }
 
-dialog {
-  max-width: 40rem;
-}
-
 /* A long label (a definition's first row names its pin) wraps in its column, at most 40% of
    the list, so the values keep the rest instead of one character a line. */
 dl {
   display: grid;
   grid-template-columns: fit-content(40%) minmax(0, 1fr);
   gap: 0.25rem 1rem;
+}
+
+/* The design system's summary list, held to the same columns (manual item 20). */
+.z-summary {
+  grid-template-columns: fit-content(40%) minmax(0, 1fr);
+}
+
+@media (max-width: 30rem) {
+  .z-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 dt {
@@ -138,13 +236,11 @@ dd {
    lines, and the server's instructions, on lines of their own. */
 label.check,
 label.include {
-  display: inline-block;
-  margin: 0.5rem 1rem 0.5rem 0;
-}
-
-input[type="checkbox"] {
-  width: auto;
-  margin: 0 0.25rem 0 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) var(--space-4) var(--space-2) 0;
+  font-weight: 600;
 }
 
 .steps li,
@@ -156,25 +252,34 @@ input[type="checkbox"] {
 
 /* The authorization server's host, in large type (RFC 9728 7.8). */
 .issuer {
-  font-size: 1.5rem;
-  font-weight: bold;
+  font-family: var(--font-mono);
+  font-size: 24px;
+  line-height: 32px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .badge {
-  border: 1px solid GrayText;
-  border-radius: 0.25rem;
-  padding: 0 0.25rem;
-  margin-left: 0.5rem;
-}
-
-#review-tools {
-  list-style: none;
-  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 var(--space-2);
+  margin-left: var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 700;
 }
 
 #review-tools > li {
-  border-top: 1px solid GrayText;
-  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+  padding: var(--space-3) var(--space-4);
+}
+
+#review-tools > li:first-child {
+  border-top: 0;
 }
 
 /* A definition line's continuation chunks under it, marked; the text is the vault's, uncut. */
@@ -184,7 +289,7 @@ input[type="checkbox"] {
 
 .definition span.more {
   padding-left: 1ch;
-  border-left: 0.25rem solid GrayText;
+  border-left: 2px solid var(--line-strong);
 }
 
 /* A drifted tool (M6 J.2): the reviewed and the listed definition side by side, the vault's
@@ -202,4 +307,32 @@ input[type="checkbox"] {
 
 .drift .diff {
   grid-column: 1 / -1;
+}
+
+/* A summary list with nothing in it yet takes no room (the confirm's "what the vault finds now"). */
+.z-summary:empty {
+  display: none;
+}
+
+/* Rows a script draws without the design system's classes, in its lists, until it has them. */
+.z-list > li:not([class]),
+.z-log > li:not([class]),
+.z-findings > li:not([class]),
+.z-servers > li:not([class]) {
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.z-list > li:not([class]):first-child,
+.z-log > li:not([class]):first-child,
+.z-findings > li:not([class]):first-child {
+  border-top: 0;
+}
+
+.z-servers > li:not([class]) {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raised);
 }
