@@ -65,10 +65,11 @@ MAX_ASSETS = 288 * 1024
 # approvals.js, the Approvals queue, the badge and Home's approvals item, its own 400, so app.js
 # gains the nav entry and one call (1,053 lines with webauthn.js, BP-12). The UX pass (owner,
 # 2026-11-05, raising the caps for the design system's classes in the rows the scripts draw):
-# app.js and webauthn.js 1,150 (1,105 with its row, tag and finding builders and help links).
+# app.js and webauthn.js 1,150 (1,105 with its row, tag and finding builders and help links);
+# review.js 800 (740 with its server cards, next steps and tool rows).
 LINE_CAPS = {
     ("app.js", "webauthn.js"): 1150,
-    ("review.js",): 700,
+    ("review.js",): 800,
     ("drift.js",): 450,
     ("policy.js",): 500,
     ("approvals.js",): 400,

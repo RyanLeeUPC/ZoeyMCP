@@ -244,6 +244,7 @@
 <label class="z-chip"><input id="review-chip-read-only" type="checkbox"><span>Suggested read-only</span></label>
 <label class="z-chip"><input id="review-chip-unannotated" type="checkbox"><span>Not annotated</span></label>
 <label class="z-chip"><input id="review-chip-findings" type="checkbox"><span>With findings</span></label>
+<p id="review-shown" class="z-filterbar__count" aria-live="polite"></p>
 </div>
 <div class="z-btn-row">
 <button type="button" id="review-suggested" class="z-btn z-btn--secondary z-btn--small">Select suggested</button>
@@ -251,6 +252,7 @@
 </div>
 <ul id="review-tools" class="z-tools"></ul>
 <div class="z-actionbar">
+<p id="review-included" class="z-actionbar__summary"></p>
 <label class="z-check"><input id="review-decline-rest" type="checkbox" checked aria-describedby="review-decline-hint"><span>Record the rest as declined</span></label>
 <p class="z-hint" id="review-decline-hint">Each tool you leave out, at the definition shown, counts again only if the server changes it.</p>
 <p id="review-drift"></p>

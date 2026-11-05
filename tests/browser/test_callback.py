@@ -382,7 +382,7 @@ def test_item_18_a_registered_clients_callback_connects_and_the_review_queues_it
     boarding.commit(fragment)
     open_section(page, "MCP servers")
     row = server_row(page, "notes (remote)")
-    expect(row).to_contain_text("in the policy, not connected yet")
+    expect(row).to_contain_text("In the policy, not connected yet")
     row.get_by_role("button", name="Connect", exact=True).click()
     expect(connect_dialog(page)).to_be_visible()
     expect(page.locator("#connect-callback-text")).to_be_visible()

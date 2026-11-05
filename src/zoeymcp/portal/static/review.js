@@ -22,6 +22,13 @@
     reviewed: "reviewed",
     blocked: "stopped at your egress proxy",
   };
+  // Its tag: a word or two, and the tone (the design system's: your move, under way, stopped).
+  const TAGS = {
+    discovering: ["Discovering", "z-tag--info"], needs_register: ["Register", "z-tag--active"],
+    needs_commit: ["Commit", "z-tag--active"], needs_save: ["Save", "z-tag--active"],
+    needs_connect: ["Connect", "z-tag--active"], needs_review: ["Review", "z-tag--active"],
+    reviewed: ["Reviewed", "z-tag--ok"], blocked: ["Blocked", "z-tag--danger"],
+  };
   // Where a next step's command runs (M.7). The vault sends it without the compose command and
   // its files, which only the host knows (ZOEYMCP_COMPOSE_CMD): put yours in front.
   const VIA = {
@@ -119,15 +126,20 @@
     return runs[step.do] || null;
   }
 
+  // The design system's NextSteps: numbered, the first one the page can take as a button.
   function renderSteps(list, steps, context) {
     list.replaceChildren();
     steps.forEach((step, index) => {
       const run = index === 0 ? runner(step, context) : null;
-      const item = make("li", stepText(step, run === null));
+      const item = make("li", "", "z-nextstep" + (index === 0 ? " z-nextstep--current" : ""));
+      const body = make("div", "", "z-nextstep__body");
+      body.append(make("p", stepText(step, run === null)));
       if (run !== null) {
         const label = step.do === "allow_hosts" ? "Show the hosts to allow" : step.label;
-        item.prepend(button(label, run), " ");
+        body.prepend(make("div", "", "z-btn-row"));
+        body.firstChild.append(button(label, run, "z-btn--primary"));
       }
+      item.append(body);
       list.append(item);
     });
   }
@@ -135,7 +147,8 @@
   function renderChecks(list, findings) {
     list.replaceChildren();
     for (const finding of findings) {
-      list.append(make("li", finding.level + " at " + finding.path + ": " + finding.message_shown));
+      list.append(make("li", finding.level + " at " + finding.path + ": " + finding.message_shown,
+        "z-inline-note z-inline-note--" + (finding.level === "error" ? "danger" : "warning")));
     }
   }
 
@@ -149,7 +162,7 @@
     }
     renderSteps($("refusal-next"), Array.isArray(answer.next) ? answer.next : [], context);
     for (const issuer of Array.isArray(answer.issuers) ? answer.issuers : []) {
-      const item = make("li");
+      const item = make("li", "", "z-nextstep");
       item.append(button("Use " + issuer, () => useIssuer(issuer)));
       $("refusal-next").append(item);
     }
@@ -168,39 +181,49 @@
 
   // --- the rows (K.1) ------------------------------------------------------------------------
 
+  // A row's facts, after its name and tag: its state in words, or what a reviewed one serves.
   function rowText(row) {
-    const text = row.name_shown + " (" + row.kind + "): " + (STATES[row.state] || row.state);
+    const state = STATES[row.state] || row.state;
+    const text = state.charAt(0).toUpperCase() + state.slice(1);
     if ("onboarding" in row) {
       return text + ", until " + when(row.expires) + ". " + row.server_url;
     }
     const kinds = (row.offered_not_served || []).join(", "); // M6 J12, as the gateway reports
-    const served = row.state !== "reviewed" ? "" : ": " + row.tools + " tool" + (row.tools === 1 ?
+    const served = row.state !== "reviewed" ? text : row.tools + " tool" + (row.tools === 1 ?
       "" : "s") + " served to " + (row.clients_shown.join(", ") || "no client yet");
-    return text + served + (kinds && "; offered, not served: " + kinds) + ".";
+    return served + (kinds && "; offered, not served: " + kinds) + ".";
   }
 
+  // Each server as the design system's ServerCard: its name, kind and state, its facts, its
+  // next steps (the first a button), and drift.js's and approvals.js's parts under them.
   async function listServers() {
     rows = (await api("GET", "/api/servers")).servers;
     const list = $("server-list");
     list.replaceChildren();
     for (const row of rows) {
-      const item = make("li", rowText(row));
-      const steps = make("ul", "", "steps");
+      const item = make("li", "", "z-server");
+      const head = make("div", "", "z-server__head");
+      const [word, tone] = TAGS[row.state] || [row.state, ""];
+      head.append(make("h3", row.name_shown + " (" + row.kind + ")", "z-server__name"),
+        make("span", word, "z-tag " + tone));
+      const steps = make("ul", "", "steps z-nextsteps");
       renderSteps(steps, row.next, { row: true, boarding: row.onboarding, server: row.server,
         credential: row.credential });
-      item.append(steps);
+      item.append(head, make("p", rowText(row), "z-server__meta"), steps);
+      const actions = make("div", "", "z-btn-row");
       if (row.state === "blocked") {
-        item.append(button("Try again", () => retry(row)));
+        actions.append(button("Try again", () => retry(row)));
       }
       if ("onboarding" in row) {
-        item.append(button("Cancel", () => cancelOnboarding(row.onboarding)));
+        actions.append(button("Cancel", () => cancelOnboarding(row.onboarding), "z-btn--quiet"));
       }
+      if (actions.hasChildNodes()) item.append(actions);
       list.append(item);
     }
     await window.zoeyDrift.servers(list, rows, queueReview); // what the gateway reports, Allow
     window.zoeyApprovals?.servers(list, rows); // M8 A.4: Hold in the vault, managed
     if (rows.length === 0) {
-      list.append(make("li", "The policy has no remote or toolkit server yet."));
+      list.append(make("li", "The policy has no remote or toolkit server yet.", "z-empty"));
     }
   }
 
@@ -497,6 +520,7 @@
       "Its instructions:\n" + answer.instructions_shown;
     $("review-notes").textContent = answer.notes.map((note) => NOTES[note] || note).join(" ");
     $("review-counts").textContent = countText(answer.counts);
+    $("review-shown").textContent = "";
     held.entries = answer.tools.map(toolEntry);
     $("review-tools").replaceChildren(...held.entries.map((entry) => entry.item));
     window.zoeyDrift.footer(held, answer, queueReview); // Review again, under the tools
@@ -509,25 +533,32 @@
   // One tool (K.1): its include box, or why it can't be included; its classification, at its
   // row's prefill (M6 J.3) beside the server's suggestion, labelled as the server's (E-9); its
   // badges, its findings, its definition on request, and drift.js's columns and controls.
+  // The design system's ToolRow: the include box in its own column, then the rest.
   function toolEntry(tool) {
-    const item = make("li");
+    const item = make("li", "", "z-tool");
     const entry = { tool: tool, item: item, box: null, choice: null };
-    const head = make("p");
+    const head = make("p", "", "z-tool__head");
+    const main = make("div", "", "z-tool__main");
     if (tool.name !== null && (tool.pinnable || tool.included)) {
       entry.box = Object.assign(document.createElement("input"), { type: "checkbox" });
       entry.box.checked = tool.included;
-      const label = make("label", "", "include");
-      label.append(entry.box, " Include ");
-      head.append(label);
+      const label = make("label", "", "include z-check z-check--small");
+      label.append(entry.box, make("span", " Include ", "z-vh"));
+      item.append(label);
     } else {
-      head.append("Can't be included: " + (tool.not_pinnable || "its name isn't a tool name") +
-        ". ");
+      item.append(make("span"));
+      main.append(make("p", "Can't be included: " + (tool.not_pinnable ||
+        "its name isn't a tool name") + ".", "z-inline-note z-inline-note--danger"));
     }
-    head.append(make("b", tool.name_shown), tool.title_shown ? " " + tool.title_shown : "",
-      make("span", tool.state, "badge"), make("span", "suggested " + tool.suggested, "badge"));
-    item.append(head);
+    head.append(make("b", tool.name_shown, "z-tool__name"), tool.title_shown ? " " +
+      tool.title_shown : "", // a text node: no element is made of the server's title
+    make("span", tool.state, "badge z-tag" + (tool.state === "drift" ? " z-tag--warning" : "")),
+    make("span", "suggested " + tool.suggested, "badge z-tag z-tag--said"));
+    main.prepend(head);
+    item.append(main);
     if (entry.box !== null) {
       entry.choice = document.createElement("select");
+      entry.choice.className = "z-select z-select--small z-tool__choice";
       for (const kind of ["allow", "approve"]) {
         const option = make("option", kind); // its value is its text
         option.disabled = kind === "allow" && tool.consequential === true;
@@ -535,27 +566,33 @@
       }
       entry.choice.value = tool.prefill;
       entry.choice.hidden = !tool.included;
-      item.append(entry.choice, make("span", " suggested by the server: " + tool.suggested +
-        " (" + tool.suggested_why + ")"));
+      const choose = make("p", "", "z-tool__how");
+      choose.append(entry.choice, make("span", " suggested by the server: " + tool.suggested +
+        " (" + tool.suggested_why + ")", "z-hint"));
+      main.append(choose);
     }
     if (tool.description_shown) {
-      item.append(make("p", tool.description_shown, "description"));
+      main.append(make("p", tool.description_shown, "description z-tool__desc"));
     }
-    const findings = make("ul");
+    const findings = make("ul", "", "z-tool__findings");
     tool.findings.forEach((finding) => findings.append(make("li", finding.level + " at " +
-      finding.pointer_shown + ": " + finding.message_shown)));
-    item.append(findings);
+      finding.pointer_shown + ": " + finding.message_shown, "z-inline-note z-inline-note--" +
+      (finding.level === "error" ? "danger" : "warning"))));
+    main.append(findings);
     if (tool.definition_lines.length) {
-      const definition = make("pre", "", "definition");
+      const definition = make("pre", "", "definition z-codeblock z-codeblock__pre");
       definition.hidden = true;
       const toggle = button("Show definition", () => {
         if (!definition.hasChildNodes()) {
           renderDefinition(definition, tool.definition_lines);
         }
         definition.hidden = !definition.hidden;
+        toggle.ariaExpanded = String(!definition.hidden);
         toggle.textContent = definition.hidden ? "Show definition" : "Hide definition";
-      });
-      item.append(toggle, definition);
+      }, "z-btn--quiet");
+      toggle.ariaExpanded = "false";
+      main.append(make("div", "", "z-btn-row"), definition);
+      main.lastChild.previousSibling.append(toggle);
     }
     window.zoeyDrift.row(entry); // a drifted tool's two columns, re-pin and decline (M6 J.2)
     return entry;
@@ -585,6 +622,9 @@
       entry.item.hidden = !named.includes(text) ||
         (chips.length > 0 && !chips.some((chip) => chip[1](tool)));
     }
+    const all = reviewing === null ? [] : reviewing.entries;
+    $("review-shown").textContent = all.filter((entry) => !entry.item.hidden).length + " of " +
+      all.length + " shown";
   }
 
   function chosen() {
@@ -607,6 +647,7 @@
     $("review-generate").textContent = "Generate (" + count + (count === 1 ? " tool: " :
       " tools: ") + lists.allow.length + " allow, " + lists.approve.length + " approve)";
     $("review-generate").disabled = lists.allow.length + lists.approve.length < count;
+    $("review-included").textContent = count + (count === 1 ? " tool" : " tools") + " included";
   }
 
   // An include box ticked starts at its row's prefill: the policy's classification (M6 J.3).

@@ -7,6 +7,16 @@
 body {
   margin: 0;
   min-height: 100vh;
+  /* Commands and names in the vault's sentences keep their characters: Manrope would join "--"
+     into a dash. */
+  font-variant-ligatures: none;
+  font-feature-settings: "calt" 0;
+}
+
+/* A list with nothing in it takes no room (a refusal's steps and findings, say). */
+#page ul:empty,
+#page ol:empty {
+  display: none;
 }
 
 [hidden] {
@@ -259,7 +269,7 @@ label.include {
   overflow-wrap: anywhere;
 }
 
-.badge {
+.badge:not(.z-tag) {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
@@ -273,13 +283,66 @@ label.include {
   font-weight: 700;
 }
 
-#review-tools > li {
-  border-top: 1px solid var(--line);
-  padding: var(--space-3) var(--space-4);
+/* A tool's row: what drift.js and approvals.js add goes under its main column. */
+.z-tool > :nth-child(n + 3) {
+  grid-column: 2;
 }
 
-#review-tools > li:first-child {
-  border-top: 0;
+.z-tool__head > b.z-tool__name {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.z-tool__head > .badge:first-of-type {
+  margin-left: auto;
+}
+
+.z-tool__how {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.z-tool__how > select {
+  width: auto;
+}
+
+.z-tool__findings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* The review's controls and list: spaced as one panel's parts. */
+.z-review {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.z-review > * {
+  margin: 0;
+}
+
+.z-actionbar > .z-hint {
+  flex-basis: 100%;
+}
+
+.z-actionbar > p:empty {
+  display: none;
+}
+
+/* A server card's parts and what the other scripts add to it. */
+.z-server > ul:not([class]) {
+  margin: 0;
+  padding-left: var(--space-6);
+}
+
+.z-servers > .z-empty {
+  padding: var(--space-6);
 }
 
 /* A definition line's continuation chunks under it, marked; the text is the vault's, uncut. */
@@ -335,4 +398,15 @@ label.include {
   border-radius: var(--radius-lg);
   background: var(--surface-raised);
   box-shadow: var(--shadow-raised);
+}
+
+.z-tool > label.include {
+  align-self: start;
+  margin: 0;
+  padding-top: 1px;
+}
+
+.z-review > p:empty,
+.z-panel > p:empty {
+  display: none;
 }

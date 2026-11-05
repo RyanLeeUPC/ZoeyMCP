@@ -589,7 +589,7 @@ def test_item_20_a_managed_review_is_saved_with_a_passkey_and_a_repin_says_so(
     expect(page.locator("#status")).to_contain_text("The gateway takes the new view within seconds")
     assert head(rig)["review"]["echo"] == entry["pin"]
     open_section(page, "MCP servers")
-    expect(notes_row(page)).to_contain_text("notes (remote): reviewed")
+    expect(notes_row(page)).to_contain_text("notes (remote)Reviewed")
 
 
 def test_item_20_moves_to_allow_come_first_and_close_writes_nothing(
@@ -1015,7 +1015,7 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     boarding: Onboarding, page: Page, context: BrowserContext, watch: Watch
 ) -> None:
     """Item 23: "**Add a server by URL** with ... client ID ``public-check`` and no secret (a
-    public client): the row reads 'discovered, nothing sent or stored yet', and the plan's one
+    public client): the row reads 'Discovered, nothing sent or stored yet', and the plan's one
     button, like the row's, is **Save**, with no registration and no passkey prompt before it;
     **Cancel** it (nothing is written)"; with no client ID, "the plan's one button is **Register
     its client**; registered with a passkey, the page shows no fragment, and the row reads
@@ -1035,7 +1035,7 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     rig = boarding.rig
     passkeys = set_up(page, rig)
     discover(page, "public-check")
-    expect(server_row(page, "notes (")).to_contain_text("discovered, nothing sent or stored yet")
+    expect(server_row(page, "notes (")).to_contain_text("Discovered, nothing sent or stored yet")
     plan_buttons = page.locator("#plan-next button")
     expect(plan_buttons).to_have_text([SAVE_LABEL])
     expect(server_row(page, "notes (").locator("ul.steps button")).to_have_text([SAVE_LABEL])
@@ -1052,7 +1052,7 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     )
     expect(page.locator("#fragment")).to_be_hidden()
     row = server_row(page, "notes (")
-    expect(row).to_contain_text("registered, its credential, route and server not saved yet")
+    expect(row).to_contain_text("Registered, its credential, route and server not saved yet")
     words = shown_words(page)
     assert [w for w in ("commit", "reload", "generate", "fragment") if w in words] == []
     row.get_by_role("button", name=SAVE_LABEL).click()
@@ -1066,7 +1066,7 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
         NO_RESTART,
     ]
     confirm(page)
-    expect(notes_row(page)).to_contain_text("in the policy, not connected yet")
+    expect(notes_row(page)).to_contain_text("In the policy, not connected yet")
     notes_row(page).get_by_role("button", name="Connect", exact=True).click()
     with context.expect_page() as opened:
         page.get_by_role("link", name="Open the provider's sign-in page in a new tab").click()
@@ -1082,7 +1082,7 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     nobody = page.locator("#attention > li").filter(has_text="notes lists 2 tools nobody reviewed")
     expect(nobody.get_by_role("button", name="Review", exact=True)).to_be_visible()
     open_section(page, "MCP servers")
-    expect(notes_row(page)).to_contain_text("connected, its tools not reviewed yet")
+    expect(notes_row(page)).to_contain_text("Connected, its tools not reviewed yet")
     expect(notes_row(page).get_by_role("button", name="Give to clients")).to_be_visible()
     read = review_notes(page, rig, OLD)
     choose(page, read, {"echo": "allow", "add": "approve"})
@@ -1095,7 +1095,7 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     expect(page.locator("#attention > li").filter(has_text="notes ")).to_have_count(0)
     open_section(page, "MCP servers")
     expect(notes_row(page)).to_contain_text(
-        "notes (remote): reviewed: 2 tools served to no client yet."
+        "notes (remote)Reviewed2 tools served to no client yet."
     )
     block = gives(page, notes_row(page))
     box = block.get_by_label("agent1")
