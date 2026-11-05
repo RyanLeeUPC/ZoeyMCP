@@ -126,6 +126,16 @@ def server_row(page: Page, label: str) -> Locator:
     return page.locator("#server-list > li").filter(has_text=label)
 
 
+def tool_actions(row: Locator) -> Locator:
+    """A server card's per-tool buttons (**Allow ... without asking**, **Hold in the vault**),
+    folded under **Tool actions (N)**: opened, and open still when the rows are drawn again."""
+    folded = row.locator("details.z-tool-actions")
+    expect(folded).to_be_visible()
+    if folded.get_attribute("open") is None:
+        folded.locator("summary").click()
+    return folded
+
+
 def held_review(
     page: Page,
     rig: PortalRig,

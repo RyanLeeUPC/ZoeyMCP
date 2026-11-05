@@ -65,10 +65,18 @@
   // A checkbox with its words, appended to ``place``; the box, for lists() to read.
   function check(place, text) {
     const box = Object.assign(document.createElement("input"), { type: "checkbox" });
-    const label = make("label", "", "check");
-    label.append(box, " " + text);
+    const label = make("label", "", "check z-check");
+    label.append(box, make("span", text));
     place.append(label);
     return box;
+  }
+
+  // A per-tool button on a server's card, in its folded Tool actions, which counts them.
+  function toolAction(place, control) {
+    const tools = place.querySelector(".z-tool-actions");
+    tools.lastChild.append(control);
+    tools.firstChild.textContent = "Tool actions (" + tools.lastChild.children.length + ")";
+    tools.hidden = false;
   }
 
   // A server's review: the MCP servers page, where its row has Review.
@@ -134,11 +142,13 @@
     const list = $("attention");
     list.replaceChildren();
     for (const item of answer.items) {
-      const entry = document.createElement("li");
-      entry.textContent = item.text_shown + ". ";
+      const entry = make("li", "", "z-finding"); // the design system's FindingList row
+      entry.append(make("span", "Gateway", "z-tag z-tag--said"), make("div", "", "z-finding__body"));
+      entry.lastChild.append(make("p", item.text_shown + ".", "z-finding__text"));
       const label = ACTION_TEXT[item.action.kind];
       if (label !== undefined) {
-        entry.append(button(label, act(item.action, home)));
+        entry.append(make("div", "", "z-finding__action"));
+        entry.lastChild.append(button(label, act(item.action, home)));
       }
       list.append(entry);
     }
@@ -186,7 +196,7 @@
     rows.forEach((row, index) => {
       const place = list.children[index];
       for (const named of typeof row.server === "string" ? row.approve : []) {
-        place.append(button("Allow " + named.name_shown + " without asking",
+        toolAction(place, button("Allow " + named.name_shown + " without asking",
           () => allow(row.server, named, queue)));
       }
       if (mode === "managed" && typeof row.server === "string") {
@@ -206,7 +216,7 @@
       if (typeof row.server === "string" && said.length) {
         const steps = list.children[index].querySelector("ul.steps");
         steps.before(make("p", "The gateway reports: " +
-          said.map((each) => each.text_shown).join("; ") + "."));
+          said.map((each) => each.text_shown).join("; ") + ".", "z-inline-note z-inline-note--warning"));
         if (said.some((each) => each.action.kind === "clear")) {
           steps.before(button(ACTION_TEXT.clear, () => clear(row.server, () => queue(row.server,
             true))));
@@ -219,7 +229,9 @@
   // by the stylesheet (review.js's renderDefinition): a line's chunks joined are the line.
   function lines(pre, found) {
     for (const line of found) {
-      line.forEach((chunk, index) => pre.append(make("span", chunk, index ? "more" : "")));
+      const sign = { "+": " z-diff__line--add", "-": " z-diff__line--del" }[line[0][0]] || "";
+      line.forEach((chunk, index) => pre.append(make("span", chunk, index ? "more" :
+        pre.classList.contains("diff") ? "z-diff__line" + sign : "")));
     }
   }
 
@@ -228,17 +240,17 @@
   // the vault pinned itself; then the vault's line diff between them. Nothing cut.
   function columns(tool) {
     const block = make("div", "", "drift");
-    const reviewed = make("pre", "", "definition");
+    const reviewed = make("pre", "", "definition z-codeblock z-codeblock__pre");
     if (tool.reviewed_missing) {
       reviewed.append(make("span", MISSING));
     }
     lines(reviewed, tool.reviewed_lines);
-    const now = make("pre", "", "definition");
+    const now = make("pre", "", "definition z-codeblock z-codeblock__pre");
     lines(now, tool.definition_lines);
-    const diff = make("pre", "", "definition diff");
+    const diff = make("pre", "", "definition diff z-diff__lines");
     lines(diff, tool.diff_lines);
-    block.append(make("div", "Reviewed (" + tool.pinned + ")"), make("div", "Now (" + tool.pin +
-      ")"), reviewed, now, diff);
+    block.append(make("div", "Reviewed (" + tool.pinned + ")", "z-diff__label"), make("div",
+      "Now (" + tool.pin + ")", "z-diff__label"), reviewed, now, diff);
     return block;
   }
 
@@ -249,7 +261,7 @@
     const tool = entry.tool;
     const place = entry.item; // the row's list item
     if (tool.kind !== "tool") {
-      place.prepend(...(tool.heading ? [make("h3", tool.heading)] : []));
+      place.prepend(...(tool.heading ? [make("h3", tool.heading, "z-tool-group")] : []));
       place.querySelectorAll(".badge")[1].remove(); // the server's suggestion, a tool's
       [entry.choice?.nextSibling, entry.choice].forEach((node) => node?.remove());
       [entry.pick, entry.box, entry.choice] = [entry.box, null, null]; // review.js's: the tools'
@@ -259,7 +271,8 @@
       if (tool.pinnable && tool.name !== null) {
         entry.repin = check(place, "Accept the new definition");
         if (tool.proposed) {
-          place.append(make("p", mode === "managed" ? PROPOSED_SAVED : PROPOSED));
+          place.append(make("p", mode === "managed" ? PROPOSED_SAVED : PROPOSED,
+            "z-inline-note z-inline-note--warning"));
           entry.repin.addEventListener("change", () => {
             entry.choice.value = entry.repin.checked ? APPROVE : tool.prefill;
           });
@@ -305,7 +318,7 @@
     }
     const place = entry.item; // the row's list item
     entry.choice.value = ALLOW;
-    place.append(make("p", MOVED));
+    place.append(make("p", MOVED, "z-inline-note z-inline-note--warning"));
   }
 
   // --- managed saves (G.3, G.4, J3, J.4) --------------------------------------------------------

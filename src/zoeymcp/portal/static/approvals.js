@@ -232,7 +232,13 @@
       const controls = listed.connectors.length ? listed.connectors.map((name) => holdButton(
         listed, { connector: name }, "connector " + name)) : listed.approve.map((named) =>
         holdButton(listed, { server: listed.server, tool: named.name }, named.name_shown));
-      list.children[index].append(...controls);
+      const place = list.children[index]; // a tool's: its card's folded Tool actions, counted
+      const tools = listed.connectors.length ? null : place.querySelector(".z-tool-actions");
+      (tools === null ? place : tools.lastChild).append(...controls);
+      if (tools !== null && controls.length) {
+        tools.firstChild.textContent = "Tool actions (" + tools.lastChild.children.length + ")";
+        tools.hidden = false;
+      }
       if (controls.length && !listed.approver) {
         list.children[index].append(make("p", NO_APPROVER));
       }

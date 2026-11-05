@@ -66,11 +66,12 @@ MAX_ASSETS = 288 * 1024
 # gains the nav entry and one call (1,053 lines with webauthn.js, BP-12). The UX pass (owner,
 # 2026-11-05, raising the caps for the design system's classes in the rows the scripts draw):
 # app.js and webauthn.js 1,150 (1,105 with its row, tag and finding builders and help links);
-# review.js 800 (740 with its server cards, next steps and tool rows).
+# review.js 800 (740 with its server cards, next steps and tool rows); drift.js 520 (462 with
+# Home's gateway findings, the folded tool actions and the diff's line marks).
 LINE_CAPS = {
     ("app.js", "webauthn.js"): 1150,
     ("review.js",): 800,
-    ("drift.js",): 450,
+    ("drift.js",): 520,
     ("policy.js",): 500,
     ("approvals.js",): 400,
 }
@@ -963,7 +964,7 @@ def test_the_page_words_the_new_health_sections_and_the_review_action() -> None:
     # Each item is shown through textContent, from the vault's text_shown alone, and every field
     # the script reads of the answer and its items is one the vault sends: the list's by
     # drift.js, shown by the vault's rule (M8 CR-11), and the queue's own item by approvals.js.
-    assert 'entry.textContent = item.text_shown + ". ";' in drift
+    assert 'make("p", item.text_shown + ".", "z-finding__text")' in drift
     assert '$("attention-block").hidden = !answer.shown;' in drift
     sent = set(portal_app.attention_items({}))
     assert set(re.findall(r"\banswer\.([a-z_]+)", drift)) == sent - {"gateway", "approvals"}
@@ -1045,7 +1046,10 @@ def test_prompts_and_resources_are_rows_whose_choices_go_under_kinds() -> None:
     body = drift[start : drift.index("\n  }\n", start)]
     head = body[: body.index('if (tool.state === "drift") {')]
     assert 'if (tool.kind !== "tool") {' in head
-    assert 'place.prepend(...(tool.heading ? [make("h3", tool.heading)] : []));' in head
+    assert (
+        'place.prepend(...(tool.heading ? [make("h3", tool.heading, "z-tool-group")] : []));'
+        in (head)
+    )
     removed = "[entry.choice?.nextSibling, entry.choice].forEach((node) => node?.remove());"
     taken = "[entry.pick, entry.box, entry.choice] = [entry.box, null, null];"
     assert head.index(removed) < head.index(taken)

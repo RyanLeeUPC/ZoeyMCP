@@ -199,6 +199,7 @@
   async function listServers() {
     rows = (await api("GET", "/api/servers")).servers;
     const list = $("server-list");
+    const opened = Array.from(list.querySelectorAll(".z-tool-actions[open]"), (d) => d.dataset.server);
     list.replaceChildren();
     for (const row of rows) {
       const item = make("li", "", "z-server");
@@ -218,6 +219,14 @@
         actions.append(button("Cancel", () => cancelOnboarding(row.onboarding), "z-btn--quiet"));
       }
       if (actions.hasChildNodes()) item.append(actions);
+      // The per-tool buttons drift.js and approvals.js add, folded (the design system's
+      // ServerCard): shown once one is in it.
+      const tools = make("details", "", "z-disclosure z-tool-actions");
+      tools.hidden = true;
+      tools.dataset.server = row.server || "";
+      tools.open = opened.includes(tools.dataset.server); // open still, when drawn again
+      tools.append(make("summary", "Tool actions"), make("div", "", "z-disclosure__body"));
+      item.append(tools);
       list.append(item);
     }
     await window.zoeyDrift.servers(list, rows, queueReview); // what the gateway reports, Allow

@@ -78,6 +78,7 @@ from .portal import (
     sign_in,
     summary,
     summary_value,
+    tool_actions,
 )
 from .stacks import Onboarding, PortalRig, listed, onboarding, portal, review_at_head
 from .watch import Watch
@@ -175,6 +176,11 @@ def notes_row(page: Page) -> Locator:
     return server_row(page, "notes (remote)")
 
 
+def notes_tools(page: Page) -> Locator:
+    """Notes' per-tool buttons, under its card's Tool actions, opened."""
+    return tool_actions(notes_row(page))
+
+
 def held_tools(rig: PortalRig) -> dict[str, list[str]]:
     """Each server's tools the vault holds, where it holds any."""
     managed_ = rig.vault.managed
@@ -221,7 +227,7 @@ def test_item_31_hold_in_the_vault_shows_the_turn_on_plan_before_the_passkey(
     sentence); confirmed, ``echo`` is held"."""
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
-    hold = notes_row(page).get_by_role("button", name="Hold in the vault: write", exact=True)
+    hold = notes_tools(page).get_by_role("button", name="Hold in the vault: write", exact=True)
     expect(hold).to_be_enabled()
     hold.click()
     assert labelled(page, "notes.write") == TURN_ON
@@ -229,7 +235,7 @@ def test_item_31_hold_in_the_vault_shows_the_turn_on_plan_before_the_passkey(
     assert revision(rig) == 1
     confirm(page)
     expect(confirm_dialog(page)).to_be_hidden()
-    off = notes_row(page).get_by_role("button", name="Turn off vault approval: write")
+    off = notes_tools(page).get_by_role("button", name="Turn off vault approval: write")
     expect(off).to_be_visible()
     # The rows drawn again keep the save's words (the page shown again doesn't clear them).
     assert page.locator("#status").text_content() == HELD_SAVED
@@ -267,7 +273,8 @@ def test_item_31_with_no_approver_both_controls_are_disabled(
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
     row = notes_row(page)
-    expect(row.get_by_role("button", name="Hold in the vault: write", exact=True)).to_be_disabled()
+    hold = tool_actions(row).get_by_role("button", name="Hold in the vault: write", exact=True)
+    expect(hold).to_be_disabled()
     expect(row.get_by_text(NO_APPROVER, exact=True)).to_be_visible()
     tool = review(page, rig)
     expect(hold_box(tool)).to_be_disabled()
@@ -290,12 +297,12 @@ def test_item_32_turn_off_shows_its_sentence_and_changes_one_tool(
     rig = held
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
-    notes_row(page).get_by_role("button", name="Turn off vault approval: write").click()
+    notes_tools(page).get_by_role("button", name="Turn off vault approval: write").click()
     assert labelled(page, OFF_PATH) == [VAULT_OFF_TEXT.format(name="write")]
     assert passkeys.asserted() == 1
     confirm(page)
     expect(confirm_dialog(page)).to_be_hidden()
-    hold = notes_row(page).get_by_role("button", name="Hold in the vault: write", exact=True)
+    hold = notes_tools(page).get_by_role("button", name="Hold in the vault: write", exact=True)
     expect(hold).to_be_enabled()
     assert passkeys.asserted() == 2
     assert head(rig)["tools"].get("vault_approval") in (None, [])
@@ -349,9 +356,9 @@ def test_item_32_a_rollback_that_drops_the_hold_is_refused_before_the_passkey(
     assert host_import(rig, add_write) == 2
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
-    notes_row(page).get_by_role("button", name="Hold in the vault: write", exact=True).click()
+    notes_tools(page).get_by_role("button", name="Hold in the vault: write", exact=True).click()
     confirm(page)
-    off = notes_row(page).get_by_role("button", name="Turn off vault approval: write")
+    off = notes_tools(page).get_by_role("button", name="Turn off vault approval: write")
     expect(off).to_be_visible()
     assert revision(rig) == 3
     open_section(page, "Policy")
@@ -648,7 +655,7 @@ def test_item_20_allow_without_asking_and_select_suggested_after_a_drop(
     set_up(page, rig)
     review_notes(page, rig, OLD)  # the vault holds a review showing read_01's definition
     open_section(page, "MCP servers")
-    notes_row(page).get_by_role("button", name="Allow read_01 without asking").click()
+    notes_tools(page).get_by_role("button", name="Allow read_01 without asking").click()
     rows = summary(page)
     assert rows[1] == ("notes.read_01", MOVE_TEXT.format(name="read_01"))
     read_01 = next(t for t in OLD if t.name == "read_01")
@@ -686,7 +693,7 @@ def test_item_20_allow_without_asking_on_a_vault_holding_no_review_reviews_first
     rig = saved
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
-    allow = notes_row(page).get_by_role("button", name="Allow read_02 without asking")
+    allow = notes_tools(page).get_by_role("button", name="Allow read_02 without asking")
     held_review(page, rig, at_head(rig, OLD), allow.click)  # the review first
     rows = summary(page)
     assert rows[1] == ("notes.read_02", MOVE_TEXT.format(name="read_02"))
