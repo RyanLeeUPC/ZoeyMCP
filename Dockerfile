@@ -22,7 +22,7 @@
 #       --build-arg SOURCE_REVISION=... --build-arg SOURCE_TREE=... \
 #       --output type=oci,dest=zoeymcp-oci,tar=false,rewrite-timestamp=true .
 
-FROM python:3.13.16-slim-trixie@sha256:cf50a4f6ac4f026458b08d5222023d700ac806410dff5e9ca8728fa44f2b850f AS base
+FROM python:3.13.18-slim-trixie@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc AS base
 
 FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
 
