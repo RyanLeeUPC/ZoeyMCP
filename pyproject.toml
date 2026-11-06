@@ -330,7 +330,7 @@ also_copy = [
 "zoeymcp.gateway.routing" = 95
 "zoeymcp.gateway.approvalrules" = 95
 "zoeymcp.common.approvaltext" = 95
-"zoeymcp.common.ledgerformat" = 95
+"zoeymcp.common.ledgerformat" = 99
 "zoeymcp.common.policy.held" = 95
 "zoeymcp.common.envelope" = 95
 "zoeymcp.vault.holds" = 95
@@ -339,3 +339,9 @@ also_copy = [
 "zoeymcp.common.heldresult" = 95
 "zoeymcp.vault.telegramwire" = 95
 "zoeymcp.portal.approvalsview" = 95
+# Register D-229: the modules mutated since M3 or M4 with no floor, at what their equivalents leave
+# (test_mutation_gaps_9.py); tunnel's three equivalents of 57 keep it under 95.
+"zoeymcp.gateway.schemas" = 97
+"zoeymcp.common.canonical" = 96
+"zoeymcp.vault.connectors.sendjournal" = 99
+"zoeymcp.vault.connectors.tunnel" = 94
