@@ -8,11 +8,16 @@ agent's own client (elicitation), and ``vault_approval``, where the vault holds 
 send and its approver (a scripted portal surface) decides it, the gateway only marking the write
 and recording the call as approved elsewhere; the link is TCP with the gateway key, or the link
 socket on Linux. Each mode's send is accepted, declined, or left unanswered past its deadline,
-and only an accepted one is sent. S13/S14's failure matrix through the gateway (replay, unknown
-after the dot, a proxy stripping STARTTLS) and S14's direct case stay unit rows
-(``test_smtp_connector.py``) until the pre-main test-debt pass. S16: the example records
-toolkit's batches against the records API over real TLS. Then the H14 sweep over everything
-recorded. In each, the agent offers sampling and roots, and neither is ever called (M.1, D-75).
+and only an accepted one is sent. S13/S14's failure matrix through the gateway (the pre-main
+test-debt pass, D-73), under each approval mode: a drop after the final dot is told as unknown
+and never sent again, a server offering AUTH only before TLS and a proxy stripping STARTTLS
+are refused before AUTH, and S14 sends direct with no proxy; the agent reads the toolkit's own
+words in both modes, and under vault_approval the gateway's ledger has the vault chain's
+outcome (D-258). A replay of the gateway's own send sends nothing and says so, and the same key
+with another message is refused. J4's real portal queue is ``test_toolkit_queue.py``'s. S16: the
+example records toolkit's batches against the records API over real TLS. Then the H14 sweep over
+everything recorded. In each, the agent offers sampling and roots, and neither is ever called
+(M.1, D-75).
 """
 
 from __future__ import annotations
@@ -31,8 +36,9 @@ import pytest
 from mcp.types import CallToolResult, TextContent
 
 from tests.fakes.agent import ACCEPT, DECLINE, VERSIONS, Answer, Never, Script, Version, agent
+from tests.fakes.connect_proxy import ProxySwitch
 from tests.fakes.records_api import SECRET as RECORDS_SECRET
-from tests.fakes.smtp_server import PASSWORD, USERNAME
+from tests.fakes.smtp_server import PASSWORD, USERNAME, Switch
 from tests.gateway.rig import Running, token_for
 from zoeymcp.common import ledgerformat
 from zoeymcp.gateway.ledger import LEDGER_DIR
@@ -237,6 +243,122 @@ async def test_s15_an_unanswered_send_sends_nothing(deployed: ToolkitDeployment)
     ]
     assert deployed.smtp.sessions == []
     assert deployed.proxy.targets == []
+    sweep(deployed)
+
+
+# --- S13/S14's failure matrix, through the gateway (D-73) ----------------------------------------
+
+
+async def approved_send(deployed: ToolkitDeployment) -> CallToolResult:
+    """``send_note``, approved by the deployment's approver, over a running deployment."""
+    script, never = Script([ACCEPT]), Never()
+    with deployed.running() as running:
+        async with agent(
+            url(running, "mail"), script=script, headers=headers(), **never.options()
+        ) as client:
+            result, _ = await send(
+                deployed, client, {"subject": SUBJECT, "body": BODY}, script, "approve"
+            )
+    assert never.called == []
+    return result
+
+
+def outcomes(deployed: ToolkitDeployment) -> list[str]:
+    """The gateway ledger's outcome for each call."""
+    return [str(r.fields.get("outcome")) for r in ledger(deployed) if r.kind == "outcome"]
+
+
+def journal(deployed: ToolkitDeployment) -> list[str]:
+    """The kinds of the mail connector's send journal's records."""
+    found = (deployed.tmp_path / "vault" / "connectors" / "mail-out").glob("journal-*.jsonl")
+    return [json.loads(line)["kind"] for p in found for line in p.read_text().splitlines()]
+
+
+async def test_s13_a_drop_after_the_dot_is_unknown_and_never_sent_again(
+    tmp_path: Path, ca: ProviderCA, approval: Approval
+) -> None:
+    deployed = ToolkitDeployment(tmp_path, ca, approval=approval)
+    deployed.smtp.switches.add(Switch.DROP_AFTER_DOT)
+    result = await approved_send(deployed)
+    assert result.is_error
+    assert "the note may have arrived, so don't send it again without asking" in text(result)
+    assert len(deployed.smtp.sessions) == 1
+    assert journal(deployed) == ["sending", "unknown"]
+    # The gateway's ledger: the toolkit's error when the gateway asked; the chain's outcome
+    # when the vault held the send (D-258).
+    assert outcomes(deployed) == [{"gateway": "tool_error", "vault_approval": "unknown"}[approval]]
+    sweep(deployed)
+
+
+@pytest.mark.parametrize(
+    ("switch", "code"),
+    [
+        (Switch.AUTH_ONLY_BEFORE_TLS, "smtp_auth_unsupported"),
+        (ProxySwitch.STRIP_STARTTLS, "smtp_tls_failed"),
+    ],
+    ids=["AUTH only before TLS", "a proxy stripping STARTTLS"],
+)
+async def test_s14_no_auth_before_tls(
+    tmp_path: Path, ca: ProviderCA, approval: Approval, switch: Switch | ProxySwitch, code: str
+) -> None:
+    deployed = ToolkitDeployment(tmp_path, ca, mode="starttls", approval=approval)
+    if isinstance(switch, Switch):
+        deployed.smtp.switches.add(switch)
+    else:
+        deployed.proxy.switches.add(switch)
+    result = await approved_send(deployed)
+    assert result.is_error
+    assert f"not sent ({code})" in text(result), text(result)
+    assert deployed.smtp.sessions != []
+    assert all(s.tls_at_auth == [] for s in deployed.smtp.sessions)
+    assert deployed.smtp.messages == []
+    assert journal(deployed) == ["sending", "failed"]
+    expected = {"gateway": "tool_error", "vault_approval": "upstream_error"}[approval]
+    assert outcomes(deployed) == [expected]
+    sweep(deployed)
+
+
+async def test_s14_direct_with_no_proxy(tmp_path: Path, ca: ProviderCA, approval: Approval) -> None:
+    deployed = ToolkitDeployment(tmp_path, ca, mode="starttls", approval=approval, direct=True)
+    result = await approved_send(deployed)
+    assert not result.is_error, text(result)
+    assert deployed.proxy.targets == []
+    [raw] = deployed.smtp.messages
+    assert email.message_from_bytes(raw, policy=email.policy.SMTP)["Subject"] == SUBJECT
+    assert deployed.smtp.sessions[0].tls_at_auth == [True]
+    verbs = [c.split(" ")[0].upper() for c in deployed.smtp.sessions[0].commands[:3]]
+    assert verbs == ["EHLO", "STARTTLS", "EHLO"]
+    sweep(deployed)
+
+
+async def test_s13_a_replay_of_the_gateways_send_sends_nothing(
+    tmp_path: Path, ca: ProviderCA
+) -> None:
+    """The agent can't replay a send (each call's key is its own ref's), so the gateway's own
+    request is put to the vault again, as a gateway retrying after a lost answer would."""
+    deployed = ToolkitDeployment(tmp_path, ca)
+    script, never = Script([ACCEPT]), Never()
+    with deployed.running() as running:
+        async with agent(
+            url(running, "mail"), script=script, headers=headers(), **never.options()
+        ) as client:
+            result, _ = await send(
+                deployed, client, {"subject": SUBJECT, "body": BODY}, script, "approve"
+            )
+        [sent] = deployed.sent
+        vault_url = str(running.app.toolkits.link.base_url).rstrip("/")
+        kept = [(k, v) for k, v in sent.headers if k not in ("host", "content-length")]
+        again = httpx.post(vault_url + sent.path, content=sent.body, headers=kept, timeout=30)
+        other = json.loads(sent.body) | {"subject": "Something else"}
+        reused = httpx.post(vault_url + sent.path, json=other, headers=kept, timeout=30)
+    assert not result.is_error, text(result)
+    assert any(k == "idempotency-key" for k, _ in sent.headers)
+    assert again.status_code == 200, again.text
+    assert again.headers["x-zoeymcp-replayed"] == "1"
+    assert text(result) == f"sent ({again.json()['message_id']})"
+    assert (reused.status_code, reused.json()["code"]) == (409, "key_reused")
+    assert len(deployed.smtp.messages) == 1
+    assert len(deployed.smtp.sessions) == 1
     sweep(deployed)
 
 

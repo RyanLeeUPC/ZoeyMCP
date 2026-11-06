@@ -14,6 +14,10 @@ only when the test says, on a hold clock the test can move past a hold's end; an
 TCP with the gateway key (the hardened tier) or the link socket with the peer check (the
 standard tier, Linux only).
 
+For S13/S14's failure matrix (the pre-main test-debt pass, D-73): ``direct`` leaves the egress
+proxy out (S14's direct case), and :attr:`ToolkitDeployment.sent` records each connector send as
+the gateway put it to the vault, so a test can put it again (a replay).
+
 Every log line, CLI output and agent answer is recorded in :class:`Seen`, for the H14 sweep.
 """
 
@@ -27,12 +31,14 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import anyio
 import httpx
 import uvicorn
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tests.fakes.connect_proxy import ConnectProxy, serve_proxy
 from tests.fakes.records_api import SECRET as RECORDS_SECRET
@@ -110,9 +116,12 @@ class ToolkitDeployment:
         mode: Mode = "implicit",
         approval: Approval = "gateway",
         link: Link = "tcp",
+        direct: bool = False,
     ) -> None:
         self.tmp_path, self.ca, self.mode = tmp_path, ca, mode
-        self.approval, self.link = approval, link
+        self.approval, self.link, self.direct = approval, link, direct
+        # Each connector send the gateway put to the vault, in order.
+        self.sent: list[Sent] = []
         # The vault's approver, with vault_approval: it decides only through decide(), and its
         # holds end undecided only through expire().
         self.surface = Surface("portal")
@@ -132,7 +141,8 @@ class ToolkitDeployment:
         smtp_profile = "smtp-implicit-tls.yaml" if self.mode == "implicit" else "smtp-starttls.yaml"
         raw = merged(smtp_profile, "toolkit-mail.yaml", "toolkit-records.yaml")
         raw["connectors"]["mail-out"].update(host="localhost", port=smtp_port)
-        raw["egress_proxy"] = proxy_url
+        if not self.direct:
+            raw["egress_proxy"] = proxy_url
         for route in raw["routes"]:
             if route["name"] == "records":
                 route["upstream"] = records_url
@@ -188,7 +198,7 @@ class ToolkitDeployment:
                     **held,
                 )
                 with (
-                    _serve_vault(vault, socket) as (vault_url, self._vault_loop),
+                    _serve_vault(vault, socket, self.sent) as (vault_url, self._vault_loop),
                     self._gateway(vault_url) as running,
                 ):
                     yield running
@@ -258,6 +268,43 @@ class ToolkitDeployment:
         return code, out.getvalue(), err.getvalue()
 
 
+@dataclass(frozen=True)
+class Sent:
+    """A connector send as the gateway put it to the vault: its path, headers and body."""
+
+    path: str
+    headers: list[tuple[str, str]]
+    body: bytes
+
+
+class _Recorder:
+    """The vault's app, recording into ``sent`` each POST whose path ends in ``/send``."""
+
+    def __init__(self, app: ASGIApp, sent: list[Sent]) -> None:
+        self.app, self.sent = app, sent
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] != "http" or scope["method"] != "POST" or not path.endswith("/send"):
+            await self.app(scope, receive, send)
+            return
+        messages: list[Message] = []
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request" or not message.get("more_body"):
+                break
+        body = b"".join(m.get("body", b"") for m in messages)
+        headers = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in scope["headers"]]
+        self.sent.append(Sent(path, headers, body))
+        queued = list(messages)
+
+        async def replayed() -> Message:
+            return queued.pop(0) if queued else await receive()
+
+        await self.app(scope, replayed, send)
+
+
 def _own_uid() -> int:
     """The test's own uid, the only peer the link socket lets in (Linux)."""
     if sys.platform == "win32":
@@ -267,18 +314,19 @@ def _own_uid() -> int:
 
 @contextmanager
 def _serve_vault(
-    vault: VaultApp, socket: Path | None = None
+    vault: VaultApp, socket: Path | None = None, sent: list[Sent] | None = None
 ) -> Iterator[tuple[str, asyncio.AbstractEventLoop]]:
     """The vault's proxy app on its own loop and thread, as ``zoeymcp vault``: over TCP, or
-    on the link socket ``socket`` with the peer check (the standard tier, Linux only). Yields
-    the gateway's link to it, and its loop."""
+    on the link socket ``socket`` with the peer check (the standard tier, Linux only), each
+    connector send recorded into ``sent``. Yields the gateway's link to it, and its loop."""
+    app: ASGIApp = vault if sent is None else _Recorder(vault, sent)
     if socket is None:
         config = uvicorn.Config(
-            ListenerTag(vault, "tcp"), host="127.0.0.1", port=0, log_level="warning", lifespan="off"
+            ListenerTag(app, "tcp"), host="127.0.0.1", port=0, log_level="warning", lifespan="off"
         )
     else:
         config = uvicorn.Config(
-            ListenerTag(vault, "gateway"),
+            ListenerTag(app, "gateway"),
             uds=str(socket),
             http=peer_checked(_own_uid()),
             log_level="warning",
