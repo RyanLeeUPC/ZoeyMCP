@@ -58,7 +58,8 @@ plan, the prompts, the notes and the errors.
 
 A command that removes what you can't get back asks first, `[y/N]`, as a policy write does:
 `passkeys remove` (saying so when it is the last passkey, after which the portal waits for a
-setup code), `sessions end`, and `secret delete` of a secret the running policy uses. Give
+setup code), `sessions end`, `secret delete` of a secret the running policy uses, `gateway-key
+--retire-previous` and `ledger vault --restart-chain`. Give
 `--yes` in a script. Without it, off a terminal, there is no answer to read: nothing is done, the
 command names `--yes` and exits 1.
 
@@ -1650,7 +1651,8 @@ error's type), at most once a minute; it backs off from 1 s up to 30 s, and wait
    enough). Its first request with the new key retires the old one (`gateway_key_retired` in the
    vault's log).
 
-For a suspected leak, run `zoeymcp gateway-key --retire-previous` right after step 1. The gateway
+For a suspected leak, run `zoeymcp gateway-key --retire-previous` right after step 1 (it asks
+first; `--yes` in a script). The gateway
 is then down until step 3. If step 3 misses the 5 minutes, the gateway logs
 `policy_fetch_failed` with `status: 403` (and `vault_refused` with `status: 403` for a call in
 flight; there is no other event for a refused key), and answers 503 until it has the new key.

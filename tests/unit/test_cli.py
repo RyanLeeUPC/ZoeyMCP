@@ -1426,7 +1426,7 @@ def test_gateway_key_shows_a_pending_rotation(
 def test_gateway_key_retire_previous(admin: FakeAdmin, retired: int | None, line: str) -> None:
     path = "/gateway-key/retire-previous"
     admin.answers[("POST", path)] = (200, gateway_answer(None, retired=retired))
-    code, out, err = cli(["gateway-key", "--retire-previous", "--socket", "x"])
+    code, out, err = cli(["gateway-key", "--retire-previous", "--yes", "--socket", "x"])
     assert code == EXIT_OK
     assert out == f"ZOEYMCP_GATEWAY_KEY={GATEWAY_KEY}\n"
     assert err == "Generation 2.\n" + line
@@ -1437,12 +1437,39 @@ def test_gateway_key_retire_previous(admin: FakeAdmin, retired: int | None, line
 def test_gateway_key_retire_previous_not_written(admin: FakeAdmin) -> None:
     error = {"error": "kept in memory, not written to disk; check the state volume"}
     admin.answers[("POST", "/gateway-key/retire-previous")] = (500, error)
-    code, out, err = cli(["gateway-key", "--retire-previous", "--socket", "x"])
+    code, out, err = cli(["gateway-key", "--retire-previous", "--yes", "--socket", "x"])
     assert code == EXIT_UNREADABLE
     assert out == ""
     assert err == (
         "zoeymcp gateway-key: kept in memory, not written to disk; check the state volume\n"
     )
+
+
+def test_gateway_key_retire_previous_asks_first(admin: FakeAdmin) -> None:
+    """Retiring the previous key refuses a gateway still on it, so it asks at a terminal (the
+    owner, after D9); off one, nothing is retired without --yes. Printing the key never asks."""
+    path = "/gateway-key/retire-previous"
+    admin.answers[("POST", path)] = (200, gateway_answer(None, retired=1))
+    admin.answers[("GET", "/gateway-key")] = (200, gateway_answer(None))
+    question = (
+        "Stop accepting the previous gateway key now? A gateway still on it is refused until "
+        "it has the new one. [y/N] "
+    )
+    argv = ["gateway-key", "--retire-previous", "--socket", "x"]
+    assert cli(argv, Typed("n\n")) == (EXIT_FINDINGS, "", question + "Nothing retired.\n")
+    assert cli(argv) == (
+        EXIT_FINDINGS,
+        "",
+        "Nothing retired: standard input isn't a terminal, so there is no answer to read. Run "
+        "this again with --yes.\n",
+    )
+    assert admin.requests == []
+    code, out, err = cli(argv, Typed("y\n"))
+    assert (code, out) == (EXIT_OK, f"ZOEYMCP_GATEWAY_KEY={GATEWAY_KEY}\n")
+    assert err.startswith(question + "Generation 2.\n")
+    assert admin.requests == [("POST", path, None)]
+    assert cli(["gateway-key", "--socket", "x"])[0] == EXIT_OK  # no question, no --yes needed
+    assert admin.requests[-1] == ("GET", "/gateway-key", None)
 
 
 def test_format_status() -> None:
@@ -2159,35 +2186,47 @@ RESTART = "/ledger/reported/restart"
 
 def test_restart_chain_shows_the_plan_and_asks(admin: FakeAdmin) -> None:
     admin.answers[("POST", RESTART)] = (200, {"plan": PLAN})
-    code, out, err = cli(
-        ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("n\n")
-    )
+    code, out, err = cli(["ledger", "--vault", "--restart-chain", "--socket", "x"], Typed("n\n"))
     # The plan and the question go to stderr (D10): stdout holds only the answer.
-    plan = "".join(f"{line}\n" for line in PLAN_LINES) + "Restart the chain? [y/N] "
-    assert (code, out, err) == (EXIT_FINDINGS, "", plan + "zoeymcp ledger: not restarted\n")
+    plan = "".join(f"{line}\n" for line in PLAN_LINES)
+    question = "Restart the chain? [y/N] "
+    assert (code, out, err) == (EXIT_FINDINGS, "", plan + question + "Not restarted.\n")
     assert admin.requests == [("POST", RESTART, {"dry_run": True})]
+    # Off a terminal the plan is still shown, and nothing restarts without --yes (D9).
+    code, out, err = cli(["ledger", "vault", "--restart-chain", "--socket", "x"])
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err == plan + (
+        "Not restarted: standard input isn't a terminal, so there is no answer to read. Run "
+        "this again with --yes.\n"
+    )
+    assert [body for _, _, body in admin.requests] == [{"dry_run": True}] * 2
 
 
 def test_restart_chain_runs_exactly_the_plan_shown(admin: FakeAdmin) -> None:
     done = {"restarted": {**PLAN, "archive": ARCHIVED}, "head": {}}
     answers = iter([(200, {"plan": PLAN}), (200, done)])
     admin.answers = InTurn(answers)
-    code, out, err = cli(
-        ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("yes\n")
-    )
+    code, out, err = cli(["ledger", "--vault", "--restart-chain", "--socket", "x"], Typed("yes\n"))
     assert (code, err.endswith("Restart the chain? [y/N] ")) == (EXIT_OK, True)
     assert out == (
         "Restarted: archived as archive-1767276000000; the next report starts a new chain.\n"
     )
     assert admin.requests[1] == ("POST", RESTART, {"plan": PLAN})
+    # --yes, in either form, runs the plan without asking; the plan is still shown.
+    for argv in (
+        ["ledger", "vault", "--restart-chain", "--yes"],
+        ["ledger", "--vault", "--restart-chain", "--yes"],
+    ):
+        admin.answers = InTurn(iter([(200, {"plan": PLAN}), (200, done)]))
+        code, out, err = cli([*argv, "--socket", "x"])
+        assert (code, err) == (EXIT_OK, "".join(f"{line}\n" for line in PLAN_LINES))
+        assert admin.requests[-1] == ("POST", RESTART, {"plan": PLAN})
 
 
 def test_restart_chain_refuses_a_plan_that_changed(admin: FakeAdmin) -> None:
     changed = {"error": "changed", "reason": "changed", "plan": PLAN}
     admin.answers = InTurn(iter([(200, {"plan": PLAN}), (409, changed)]))
-    code, _, err = cli(
-        ["ledger", "--vault", "--restart-chain", "--socket", "x"], io.StringIO("y\n")
-    )
+    code, _, err = cli(["ledger", "--vault", "--restart-chain", "--socket", "x"], Typed("y\n"))
     assert code == EXIT_FINDINGS
     assert err.endswith(
         "[y/N] zoeymcp ledger: the copy changed since this plan; nothing was done; run again\n"

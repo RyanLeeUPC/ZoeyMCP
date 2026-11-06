@@ -929,8 +929,9 @@ def _build_parser() -> argparse.ArgumentParser:
     gateway_key.add_argument(
         "--retire-previous",
         action="store_true",
-        help="stop accepting the previous key now, for a suspected leak",
+        help="stop accepting the previous key now, for a suspected leak (asks first)",
     )
+    yes_option(gateway_key, "with --retire-previous, retire it without asking")
     command(
         "egress-key",
         "Print the egress role's key for the current egress_key_generation, as ZOEYMCP_EGRESS_KEY\n"
@@ -1095,6 +1096,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ledger.add_argument("--verify", action="store_true", help=argparse.SUPPRESS)
     ledger.add_argument("--vault", action="store_true", help=argparse.SUPPRESS)
     ledger.add_argument("--restart-chain", action="store_true", help=argparse.SUPPRESS)
+    ledger.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     ledger.add_argument("--before", type=int, metavar="SEQ", help=argparse.SUPPRESS)
     ledger.add_argument("--chain", choices=("vault", "copy", "both"), help=argparse.SUPPRESS)
     format_option(ledger, help=ledger_format_help)
@@ -1154,6 +1156,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="archive the copy's chain after a fork, gap or full (asks first)",
     )
+    yes_option(ledger_vault, "with --restart-chain, restart it without asking", under=True)
     ledger_vault.add_argument(
         "--before",
         type=int,
@@ -1712,6 +1715,15 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     socket = admin_client.socket_path(getattr(args, "socket", None))
     try:
         if args.command == "gateway-key":
+            if args.retire_previous and not admin_client.confirmed(
+                "Stop accepting the previous gateway key now? A gateway still on it is refused "
+                "until it has the new one.",
+                yes=args.yes,
+                stdin=stdin,
+                err=err,
+                nothing="Nothing retired",
+            ):
+                return EXIT_FINDINGS
             _gateway_key(socket, args.retire_previous, out, err)
         elif args.command == "egress-key":
             result = admin_client.egress_key(socket)
@@ -2508,7 +2520,7 @@ def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err:
                 review_view.write_lines(ledger_view.verify_lines(verified), out)
             return EXIT_OK if verified["ok"] else EXIT_FINDINGS
         if args.restart_chain:
-            return _restart_chain(socket, stdin, out, err)
+            return _restart_chain(socket, args.yes, stdin, out, err)
         page = admin_client.vault_ledger(socket, before=args.before, chain=args.chain)
     except admin_client.AdminUnavailable as exc:
         err.write(f"zoeymcp ledger: {exc}\n")
@@ -2522,14 +2534,14 @@ def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err:
     return EXIT_OK if state["state"] == "ok" and state["broken_at"] is None else EXIT_FINDINGS
 
 
-def _restart_chain(socket: str, stdin: TextIO, out: TextIO, err: TextIO) -> int:
-    """Show the restart's plan and ask, on stderr, then run exactly that plan."""
+def _restart_chain(socket: str, yes: bool, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    """Show the restart's plan, on stderr, and ask at a terminal unless ``--yes`` (D9); then run
+    exactly that plan."""
     plan = admin_client.vault_ledger_restart(socket, {"dry_run": True})["plan"]
     review_view.write_lines(ledger_view.restart_lines(plan), err)
-    err.write("Restart the chain? [y/N] ")
-    err.flush()
-    if stdin.readline().strip().lower() not in ("y", "yes"):
-        err.write("zoeymcp ledger: not restarted\n")
+    if not admin_client.confirmed(
+        "Restart the chain?", yes=yes, stdin=stdin, err=err, nothing="Not restarted"
+    ):
         return EXIT_FINDINGS
     try:
         done = admin_client.vault_ledger_restart(socket, {"plan": plan})["restarted"]
