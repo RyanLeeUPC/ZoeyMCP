@@ -182,8 +182,10 @@ def test_item_16_hostile_server_text_shows_as_text_under_trusted_types(
         for t in read["tools"]
         for f in t["findings"]
     ]
+    # The page's own help toggletip (its Learn more link) is markup, not the server's text.
     made: list[str] = page.locator("#review").evaluate(
-        "(review) => Array.from(review.querySelectorAll('*'), (element) => element.tagName)"
+        "(review) => Array.from(review.querySelectorAll('*'))"
+        ".filter((element) => !element.closest('.z-help')).map((element) => element.tagName)"
     )
     assert set(made) <= OWN_TAGS, set(made) - OWN_TAGS
     [summarize] = [t for t in read["tools"] if t["name"] == "summarize"]

@@ -327,9 +327,10 @@ def test_item_19_a_drifted_tool_shows_both_definitions_and_the_diff_as_text(
     row_said = page.locator("#review-tools > li").nth(read["tools"].index(summarize))
     expect(row_said.locator("p.description")).to_have_text(summarize["description_shown"])
     assert "[U+202E]" in summarize["description_shown"]
+    # The page's own help toggletip (its Learn more link) is markup, not the server's text.
     tags: list[str] = page.locator("#review").evaluate(
-        "(review) => Array.from(review.querySelectorAll('img, a, script, svg, iframe'),"
-        " (element) => element.tagName)"
+        "(review) => Array.from(review.querySelectorAll('img, a, script, svg, iframe'))"
+        ".filter((element) => !element.closest('.z-help')).map((element) => element.tagName)"
     )
     assert tags == []
     assert [r.url for r in watch.requests if urlsplit(r.url).path.endswith("/x")] == []
