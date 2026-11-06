@@ -8,7 +8,7 @@
 "use strict";
 
 (function () {
-  const { api, fill, visit, fail, textOf, afterFailure, button, on, prepare, closeConfirm,
+  const { api, fill, visit, report, fail, textOf, afterFailure, button, on, prepare, closeConfirm,
     renderSummary, connect, when } = window.zoeyPortal;
 
   // A row's state, in words (K.1); the vault decides which.
@@ -378,7 +378,7 @@
     hidePanels();
     clearNames(true);
     await listServers();
-    $("status").textContent = "Onboarding cancelled.";
+    report("Onboarding cancelled.");
   }
 
   // The client secret goes into the prepare's body and its field is emptied as soon as that
@@ -456,7 +456,7 @@
   async function copyFragment() {
     try {
       await navigator.clipboard.writeText(fragment.yaml);
-      $("status").textContent = "Copied the fragment.";
+      report("Copied the fragment.");
     } catch (error) {
       fail("The browser didn't let the page copy it: select the text and copy it yourself.");
     }

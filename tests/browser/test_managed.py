@@ -72,6 +72,7 @@ from .portal import (
     held_review,
     open_portal,
     open_section,
+    outcome,
     press,
     server_row,
     set_up,
@@ -238,7 +239,7 @@ def test_item_31_hold_in_the_vault_shows_the_turn_on_plan_before_the_passkey(
     off = notes_tools(page).get_by_role("button", name="Turn off vault approval: write")
     expect(off).to_be_visible()
     # The rows drawn again keep the save's words (the page shown again doesn't clear them).
-    assert page.locator("#status").text_content() == HELD_SAVED
+    assert outcome(page, "#servers").text_content() == HELD_SAVED
     assert passkeys.asserted() == 2
     assert head(rig)["tools"]["vault_approval"] == ["write"]
     assert revision(rig) == 2
@@ -324,7 +325,7 @@ def test_item_32_a_review_save_that_drops_the_hold_is_refused_before_the_passkey
     box = hold_box(tool)
     expect(box).to_be_checked()
     watch.allow(REFUSED_409, on=rig.origin)
-    error = page.locator("#error")
+    error = outcome(page, "#review .z-actionbar")
     box.uncheck()
     press(page, "Save")
     expect(error).to_have_text(NEEDS_STEP)
@@ -368,7 +369,7 @@ def test_item_32_a_rollback_that_drops_the_hold_is_refused_before_the_passkey(
         said = CATALOGUE["rollback_drops_vault_approval"].text.format(
             detail=f"revision {target} would stop the vault holding notes.write"
         )
-        expect(page.locator("#error")).to_have_text(said)
+        expect(outcome(page, "section:has(> #policy-history)")).to_have_text(said)
         expect(confirm_dialog(page)).to_be_hidden()
     assert passkeys.asserted() == 2  # sign-in and the hold's
     assert revision(rig) == 3
@@ -593,7 +594,9 @@ def test_item_20_a_managed_review_is_saved_with_a_passkey_and_a_repin_says_so(
     assert NO_RESTART in summary(page)
     held_review(page, rig, at_head(rig, DRIFTED), lambda: confirm(page))
     assert rig.logged("step_up_confirmed", lambda line: line["action"] == "tool.repin")
-    expect(page.locator("#status")).to_contain_text("The gateway takes the new view within seconds")
+    expect(outcome(page, "#review .z-actionbar")).to_contain_text(
+        "The gateway takes the new view within seconds"
+    )
     assert head(rig)["review"]["echo"] == entry["pin"]
     open_section(page, "MCP servers")
     expect(notes_row(page)).to_contain_text("notes (remote)Reviewed")
@@ -860,11 +863,15 @@ def test_item_21_a_rollback_that_revives_or_widens_is_refused_before_the_passkey
     revives = CATALOGUE["rollback_revives"].text.format(
         detail="revision 2 brings back client ci-runner, removed in revision 3"
     )
-    expect(page.locator("#error")).to_have_text(revives)
+    expect(outcome(page, "section:has(> #policy-history)")).to_have_text(revives)
     expect(confirm_dialog(page)).to_be_hidden()
     page.get_by_role("button", name="Roll back to revision 4", exact=True).click()
-    expect(page.locator("#error")).to_contain_text("The portal can't widen ")
-    expect(page.locator("#error")).to_contain_text(" through a rollback: export, edit and import")
+    expect(outcome(page, "section:has(> #policy-history)")).to_contain_text(
+        "The portal can't widen "
+    )
+    expect(outcome(page, "section:has(> #policy-history)")).to_contain_text(
+        " through a rollback: export, edit and import"
+    )
     expect(confirm_dialog(page)).to_be_hidden()
     assert passkeys.asserted() == asserted
     assert revision(rig) == 5
@@ -928,11 +935,13 @@ def test_item_22_pause_resume_and_limits_each_write_a_revision(
     watch.allow(REFUSED_400, on=rig.origin)
     connector_row(page).locator("input[type=number]").first.fill("0")
     connector_row(page).get_by_role("button", name="Save limits", exact=True).click()
-    expect(page.locator("#error")).to_have_text(CATALOGUE["bad_body"].text)
+    expect(outcome(page, "section:has(> #policy-connectors)")).to_have_text(
+        CATALOGUE["bad_body"].text
+    )
     expect(confirm_dialog(page)).to_be_hidden()
     connector_row(page).locator("input[type=number]").first.fill("50")
     connector_row(page).get_by_role("button", name="Save limits", exact=True).click()
-    expect(page.locator("#error")).to_have_text("Nothing would change.")
+    expect(outcome(page, "section:has(> #policy-connectors)")).to_have_text("Nothing would change.")
     assert (passkeys.asserted(), revision(rig)) == (asserted, written)
 
 
@@ -1048,13 +1057,13 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     expect(server_row(page, "notes (").locator("ul.steps button")).to_have_text([SAVE_LABEL])
     assert boarding.auth.registrations == []
     press(page, "Cancel this onboarding")
-    expect(page.locator("#status")).to_have_text("Onboarding cancelled.")
+    expect(outcome(page, "#servers")).to_have_text("Onboarding cancelled.")
     assert (revision(rig), passkeys.asserted()) == (1, 1)
     discover(page)
     expect(plan_buttons).to_have_text(["Register its client"])
     plan_buttons.click()
     confirm(page)
-    expect(page.locator("#status")).to_have_text(
+    expect(outcome(page, "#servers")).to_have_text(
         "Registered. Save on its row adds it to the policy, with your passkey."
     )
     expect(page.locator("#fragment")).to_be_hidden()
@@ -1096,7 +1105,9 @@ def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     page.get_by_label("Record the rest as declined", exact=False).uncheck()
     press(page, "Save")
     held_review(page, rig, at_head(rig, OLD), lambda: confirm(page))
-    expect(page.locator("#status")).to_contain_text(GIVE_LABEL.format(server="notes") + ".")
+    expect(outcome(page, "#review .z-actionbar")).to_contain_text(
+        GIVE_LABEL.format(server="notes") + "."
+    )
     reported(rig, notes=status())  # reviewed: the gateway reports nothing about notes
     open_section(page, "Home")
     expect(page.locator("#attention > li").filter(has_text="notes ")).to_have_count(0)
@@ -1172,7 +1183,7 @@ def test_item_23_give_to_clients_closes_takes_away_and_meets_a_second_browser(
     watch.allow(r"status of 409", on=rig.origin)
     block.get_by_label("agent1").check()
     block.get_by_role("button", name="Save", exact=True).click()
-    expect(page.locator("#error")).to_contain_text("press Save again to plan it on revision 4")
+    expect(outcome(page, "#servers")).to_contain_text("press Save again to plan it on revision 4")
     expect(confirm_dialog(page)).to_be_hidden()
     expect(block.get_by_label("agent1")).to_be_checked()  # drawn again at the head
     assert (passkeys.asserted(), revision(rig)) == (asserted, 4)

@@ -159,8 +159,47 @@
     $(id).textContent = text;
     $(id).hidden = text === "";
   }
-  const fail = (text) => say("error", text);
   const clearError = () => say("error", "");
+
+  // An outcome goes under the buttons that took it (StatusLine): the line of the nearest section
+  // around the last button pressed outside a dialog (a dialog's answer for the one that opened
+  // it). A line its panel hides, then or once the page is drawn again, hands on to the next one
+  // out. With nothing pressed running (a poll) or no line (the app bar), it goes to the top.
+  let outcomeLine = null, shownLine = null, acting = 0; // shownLine: cleared by the next action
+
+  function lineOf(element) {
+    for (let node = element.parentElement; node !== null; node = node.parentElement) {
+      const line = node.querySelector(":scope > .z-status[data-outcome]");
+      if (line !== null) return line;
+    }
+    return null;
+  }
+
+  function shownFrom(line) {
+    while (line !== null && line.closest("[hidden]") !== null) line = lineOf(line.parentElement);
+    return line;
+  }
+
+  function put(line, text, tone) {
+    if (line === null) {
+      return tone === "error" ? say("error", text) : $("status").replaceChildren(text);
+    }
+    line.className = "z-status z-status--" + tone;
+    line.textContent = text;
+    shownLine = line;
+  }
+
+  const outcome = (text, tone) => put(shownFrom(acting ? outcomeLine : null), text, tone);
+
+  function settle() { // after each click: an outcome the page then hid hands on
+    const line = shownLine;
+    if (line === null || line.textContent === "" || line.closest("[hidden]") === null) return;
+    const text = line.textContent, tone = line.className.split("z-status--")[1];
+    line.replaceChildren();
+    put(shownFrom(line), text, tone);
+  }
+  const report = (text) => outcome(text, "success");
+  const fail = (text) => outcome(text, "error");
   const connectError = (text) => say("connect-error", text);
   const confirmError = (text) => say("confirm-error", text);
 
@@ -346,7 +385,7 @@
     }
     if (started.flow === undefined) {
       await showCredentials();
-      $("status").textContent = "The client credentials work: " + started.text_shown;
+      report("The client credentials work: " + started.text_shown);
       return;
     }
     openConnect(name, started, null);
@@ -460,14 +499,14 @@
   async function afterConnected(result) {
     closeConfirm();
     await showCredentials();
-    $("status").textContent = "Connected " + result.name_shown + ": " + result.text_shown;
+    report("Connected " + result.name_shown + ": " + result.text_shown);
     await window.zoeyReview.connected(result.credential); // a server row's Connect reviews it
   }
 
   async function afterReset() {
     closeConfirm();
     await showCredentials();
-    $("status").textContent = "Failures cleared: the next request that needs a token tries once.";
+    report("Failures cleared: the next request that needs a token tries once.");
   }
 
   // --- login and setup (E, F.2) ---------------------------------------------------------------
@@ -539,7 +578,7 @@
     try {
       const answer = await api("POST", "/api/sessions/end-others", {});
       await showSessions();
-      $("status").textContent = "Ended " + answer.ended + " other session(s).";
+      report("Ended " + answer.ended + " other session(s).");
     } catch (error) {
       afterFailure(error);
     }
@@ -648,7 +687,7 @@
   async function afterRename() {
     closeConfirm();
     await showPasskeys();
-    $("status").textContent = "Passkey renamed.";
+    report("Passkey renamed.");
   }
 
   async function afterRemove(result) {
@@ -657,12 +696,11 @@
       // This session was made with the passkey removed, so it ended with it (F.2).
       sessionStorage.removeItem(TOKEN);
       showLogin();
-      $("status").textContent = "Passkey removed. This session used it, so sign in again.";
+      report("Passkey removed. This session used it, so sign in again.");
       return;
     }
     await showPasskeys();
-    $("status").textContent =
-      "Passkey removed; " + result.sessions_ended + " session(s) ended with it.";
+    report("Passkey removed; " + result.sessions_ended + " session(s) ended with it.");
   }
 
   // passkey.enrol's run begins an enrolment: the new passkey is created from a second click,
@@ -689,8 +727,7 @@
       closeConfirm();
       $("passkey-name").value = "";
       await showPasskeys();
-      $("status").textContent =
-        "Passkey enrolled. Its fingerprint is " + done.passkey.fingerprint + ".";
+      report("Passkey enrolled. Its fingerprint is " + done.passkey.fingerprint + ".");
     } catch (error) {
       if (signedOut(error)) {
         return afterFailure(error);
@@ -759,14 +796,13 @@
     $("secret-origins").value = "";
     await showSecrets();
     const secret = result.secret;
-    $("status").textContent =
-      secret === null ? "Secret stored." : "Secret stored, " + secret.binding_shown + ".";
+    report(secret === null ? "Secret stored." : "Secret stored, " + secret.binding_shown + ".");
   }
 
   async function afterSecretDeleted() {
     closeConfirm();
     await showSecrets();
-    $("status").textContent = "Secret deleted.";
+    report("Secret deleted.");
   }
 
   // --- the ledger (J.5) and the policy (L): the vault words every line ------------------------
@@ -807,7 +843,7 @@
   async function afterRestart() {
     closeConfirm();
     await showLedger();
-    $("status").textContent = "Chain restarted: the gateway's next report starts a new one.";
+    report("Chain restarted: the gateway's next report starts a new one.");
   }
 
   async function showPolicy() {
@@ -942,12 +978,21 @@
       if (busy) {
         return;
       }
+      // A new action, pressed by the person (not a page drawn again by a script's click()):
+      // the last outcome goes.
+      if (event.isTrusted && element.closest("dialog") === null) {
+        if (shownLine !== null) shownLine.replaceChildren();
+        outcomeLine = lineOf(element);
+      }
       busy = true;
+      acting += 1;
       element.disabled = true;
       element.ariaBusy = "true";
       try {
         await handler(event);
       } finally {
+        acting -= 1;
+        settle();
         busy = false;
         element.disabled = false;
         element.ariaBusy = null;
@@ -1017,7 +1062,7 @@
   }
 
   // What review.js shares (M7 K.4): the fetch wrapper, the step-up, Connect and the builders.
-  window.zoeyPortal = Object.freeze({ api, fill, visit, fail, textOf, afterFailure, button, on,
-    prepare, closeConfirm, renderSummary, connect, when });
+  window.zoeyPortal = Object.freeze({ api, fill, visit, report, fail, textOf, afterFailure, button,
+    on, prepare, closeConfirm, renderSummary, connect, when });
   start();
 })();

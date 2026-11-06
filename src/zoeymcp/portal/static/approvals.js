@@ -18,7 +18,8 @@
 "use strict";
 
 (function () {
-  const { api, fill, visit, afterFailure, button, prepare, closeConfirm, on } = window.zoeyPortal;
+  const { api, fill, visit, report, afterFailure, button, prepare, closeConfirm,
+    on } = window.zoeyPortal;
 
   const LISTS_EVERY = 5000;
   const COUNT_EVERY = 10000;
@@ -108,7 +109,7 @@
       (row) => make("li", named(row) + ": " + row.outcome_shown + ".", "z-list__item"));
     if (open !== null && !answer.waiting.some((row) => row.approval === open.approval)) {
       closeHold();
-      $("status").textContent = GONE;
+      report(GONE);
     }
     count(answer.waiting.length);
   }
@@ -154,7 +155,7 @@
         closeConfirm();
         closeHold();
         await lists();
-        $("status").textContent = APPROVED;
+        report(APPROVED);
       });
   }
 
@@ -169,7 +170,7 @@
         { text_sha256: held.text_sha256 });
       closeHold();
       await lists();
-      $("status").textContent = DENIED;
+      report(DENIED);
     } catch (error) {
       afterFailure(error);
     }
@@ -269,7 +270,7 @@
     const base = (await api("GET", "/api/session")).revision;
     const done = () => {
       closeConfirm();
-      $("status").textContent = held ? OFF_SAVED : HELD_SAVED;
+      report(held ? OFF_SAVED : HELD_SAVED);
       window.zoeyDrift.review();
     };
     if (held && data.connector) {

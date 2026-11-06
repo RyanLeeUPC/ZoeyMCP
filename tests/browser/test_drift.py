@@ -60,6 +60,7 @@ from .portal import (
     confirm_dialog,
     held_review,
     open_section,
+    outcome,
     press,
     server_row,
     set_up,
@@ -437,7 +438,7 @@ def test_item_19_suggested_after_clear_declines_and_a_stale_review(
     rig.reload(rig_policy(rig.portal_port, **notes_entries(**entry_of(OLD), on_drift="fail")))
     watch.allow(REFUSED_409, on=rig.origin)
     page.locator("#review-generate").click()
-    expect(page.locator("#error")).to_contain_text(CATALOGUE["review_stale"].text)
+    expect(outcome(page, "#review .z-actionbar")).to_contain_text(CATALOGUE["review_stale"].text)
 
 
 # --- item 24: prompts and resources --------------------------------------------------------------

@@ -199,10 +199,16 @@ def shows(page: Page, text: str) -> None:
     )
 
 
+def outcome(page: Page, section: str) -> Locator:
+    """The outcome line under ``section``'s actions (the design system's StatusLine): where the
+    portal says what a button there did."""
+    return page.locator(f"{section} > p[data-outcome]")
+
+
 def copied(page: Page) -> str:
     """**Copy**, then what the clipboard holds."""
     press(page, "Copy")
-    expect(page.locator("#status")).to_have_text("Copied the fragment.")
+    expect(outcome(page, "#fragment")).to_have_text("Copied the fragment.")
     return clipboard(page)
 
 

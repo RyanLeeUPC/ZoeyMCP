@@ -34,6 +34,7 @@ from .portal import (
     asks_to_sign_in,
     open_portal,
     open_section,
+    outcome,
     press,
     session_cookie,
     set_up,
@@ -317,7 +318,7 @@ def test_item_7_a_passkey_enrolled_on_localhost_isnt_offered_on_another_name(
     there = f"https://{FRONT}:{front.port}"
     open_portal(page, there)
     press(page, "Sign in with a passkey")
-    expect(page.locator("#error")).to_have_text(NOT_ALLOWED)
+    expect(outcome(page, "#login")).to_have_text(NOT_ALLOWED)
     asks_to_sign_in(page)
     assert passkeys.asserted() == 1  # the localhost sign-in only
     set_up(page, rig, name="tailnet", origin=there, passkeys=passkeys)

@@ -69,7 +69,7 @@ MAX_ASSETS = 288 * 1024
 # review.js 800 (740 with its server cards, next steps and tool rows); drift.js 520 (462 with
 # Home's gateway findings, the folded tool actions and the diff's line marks).
 LINE_CAPS = {
-    ("app.js", "webauthn.js"): 1150,
+    ("app.js", "webauthn.js"): 1200,
     ("review.js",): 800,
     ("drift.js",): 520,
     ("policy.js",): 500,
@@ -900,6 +900,7 @@ def test_drift_js_clicks_go_through_app_js_guard() -> None:
     assert {word.strip() for word in taken.group(1).split(",")} == {
         "api",
         "fill",
+        "report",
         "afterFailure",
         "button",
         "prepare",
@@ -1113,6 +1114,7 @@ def test_policy_js_clicks_go_through_app_js_guard() -> None:
     assert {word.strip() for word in taken.group(1).split(",")} == {
         "api",
         "fill",
+        "report",
         "afterFailure",
         "button",
         "prepare",
@@ -1281,6 +1283,7 @@ def test_approvals_js_clicks_go_through_app_js_guard() -> None:
         "api",
         "fill",
         "visit",
+        "report",
         "afterFailure",
         "button",
         "prepare",
@@ -1402,3 +1405,27 @@ def test_approvals_js_reads_what_the_vault_sends() -> None:
     # The relay's badge, by the hold's kind, is the page's; the vault's line is in the text.
     assert "shown.kind !== RELAY" in code
     assert 'const RELAY = "relay";' in code
+
+
+def test_each_outcome_shows_under_the_buttons_that_took_it() -> None:
+    """The design system's StatusLine: an action's outcome is written under its section's actions,
+    not at the top of the page. Each outcome line is an empty ``p.z-status`` with ``role="status"``
+    kept in the page (so a screen reader announces what is written into it), none in a dialog
+    (a dialog's buttons answer for the button that opened it). guard() picks the line from the
+    button pressed, and every success goes through report(), never straight to ``#status``."""
+    page = read("index.html")
+    lines = re.findall(r"<p [^>]*data-outcome[^>]*>[^<]*</p>", page)
+    assert len(lines) == 22
+    assert set(lines) == {'<p class="z-status" role="status" data-outcome></p>'}
+    for dialog in re.findall(r"<dialog .*?</dialog>", page, re.S):
+        assert "data-outcome" not in dialog
+    app = code_of(read("app.js"))
+    assert 'node.querySelector(":scope > .z-status[data-outcome]")' in app
+    assert 'if (event.isTrusted && element.closest("dialog") === null) {' in app
+    assert "outcomeLine = lineOf(element);" in app
+    assert "put(shownFrom(acting ? outcomeLine : null), text, tone)" in app
+    assert "line = lineOf(line.parentElement);" in app  # a hidden panel's line hands on
+    assert "settle();" in app  # also once the handler has drawn the page again
+    for name in ("app.js", "approvals.js", "drift.js", "policy.js", "review.js"):
+        code = code_of(read(name))
+        assert not re.search(r'\$\("status"\)\.textContent = (?!"";)', code), name

@@ -53,6 +53,7 @@
 <button type="button" id="login-passkey" class="z-btn z-btn--primary">Sign in with a passkey</button>
 <button type="button" id="login-setup" class="z-btn z-btn--secondary">I have a setup code</button>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 
 <section id="setup" class="z-signin" hidden>
@@ -68,6 +69,7 @@
 <button type="button" id="setup-redeem" class="z-btn z-btn--primary">Use this code</button>
 <button type="button" id="setup-back" class="z-btn z-btn--quiet">Back</button>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 </div>
 <div id="setup-name-step" class="z-panel" hidden>
 <p id="setup-reset" class="z-alert z-alert--warning" hidden><span class="z-alert__mark" aria-hidden="true">!</span><span><span class="z-alert__word">Reset:</span> enrolling removes every other passkey and ends every session.</span></p>
@@ -77,11 +79,13 @@
 <p class="z-hint" id="setup-name-hint">For example, the device it is on.</p>
 </div>
 <div class="z-btn-row"><button type="button" id="setup-enrol" class="z-btn z-btn--primary">Create the passkey</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </div>
 <div id="setup-done-step" class="z-panel" hidden>
 <p>Passkey enrolled. Its fingerprint is <code id="setup-fingerprint"></code>.</p>
 <p class="z-hint">Compare it with <code>zoeymcp passkeys</code> on the host.</p>
 <div class="z-btn-row"><button type="button" id="setup-login" class="z-btn z-btn--primary">Sign in with the new passkey</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </div>
 </section>
 
@@ -91,6 +95,7 @@
 <section class="z-section">
 <div class="z-section__head"><h3 class="z-section__title" id="home-ready"></h3></div>
 <ul id="checklist" class="z-findings"></ul>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 <div id="attention-block" hidden>
 <ul id="attention-approvals" class="z-findings"></ul>
@@ -98,6 +103,7 @@
 <div class="z-section__head"><h3 class="z-section__title">The gateway's servers</h3></div>
 <p id="attention-text"></p>
 <ul id="attention" class="z-findings"></ul>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 </div>
 <p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> read-only here.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-declarative-home">?<span class="z-vh"> Declarative policy</span></button><span class="z-help__pop" id="help-declarative-home" popover><span>The policy file on the host is the source: change it there, then reload.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#7-reloading-the-policy" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> declarative policy</span></a></span></span></p>
@@ -124,6 +130,7 @@
 <button type="button" id="approvals-close" class="z-btn z-btn--quiet">Close</button>
 </div>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 <section class="z-section">
 <div class="z-section__head"><h3 class="z-section__title">Decided recently</h3></div>
 <ul id="approvals-decided" class="z-list"></ul>
@@ -134,6 +141,7 @@
 <h2 class="z-page__title">Credentials</h2>
 <div class="z-intro"><p>Each credential, the routes that use it, and what needs you.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-credentials">?<span class="z-vh"> About Connect</span></button><span class="z-help__pop" id="help-credentials" popover><span><b>Connect</b> signs in at the OAuth provider in a new tab; you paste back the address it lands on, or the provider sends it back here. The vault stores the grant after your passkey confirms it. Nothing here shows a secret or a token.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#2-logging-in" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about Connect</span></a></span></span></p></div>
 <ul id="credential-list" class="z-list"></ul>
+<p class="z-status" role="status" data-outcome></p>
 <p class="z-note" data-mode="declarative"><span class="z-note__word">Declarative policy:</span> read-only here.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-declarative-credentials">?<span class="z-vh"> Declarative policy</span></button><span class="z-help__pop" id="help-declarative-credentials" popover><span>The policy file on the host is the source: change it there, then reload.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#7-reloading-the-policy" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> declarative policy</span></a></span></span></p>
 <p class="z-note" data-mode="managed" hidden><span class="z-note__word">Managed policy:</span> each save asks for your passkey.</p>
 </section>
@@ -146,6 +154,7 @@
 <ul id="server-list" class="z-servers"></ul>
 <ul id="refusal-next" class="z-nextsteps"></ul>
 <ul id="refusal-check" class="z-findings z-findings--compact"></ul>
+<p class="z-status" role="status" data-outcome></p>
 <section class="z-section z-panel">
 <div class="z-panel__head"><h3 class="z-panel__title">Add a server by URL</h3></div>
 <div class="z-field">
@@ -214,6 +223,7 @@
 <p class="z-hint" id="add-private-hint">Discovery then asks for your passkey.</p>
 </div>
 <div class="z-btn-row"><button type="button" id="add-discover" class="z-btn z-btn--primary">Discover</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 
 <div id="plan" class="z-panel" hidden>
@@ -225,6 +235,7 @@
 <ul id="plan-check" class="z-findings z-findings--compact"></ul>
 <ul id="plan-next" class="steps z-nextsteps"></ul>
 <div class="z-panel__footer"><button type="button" id="plan-cancel" class="z-btn z-btn--quiet">Cancel this onboarding</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </div>
 
 <div id="review" class="z-panel" hidden>
@@ -251,6 +262,7 @@
 <button type="button" id="review-clear" class="z-btn z-btn--quiet z-btn--small">Clear</button>
 </div>
 <ul id="review-tools" class="z-tools"></ul>
+<p class="z-status" role="status" data-outcome></p>
 <div class="z-actionbar">
 <p id="review-included" class="z-actionbar__summary"></p>
 <label class="z-check"><input id="review-decline-rest" type="checkbox" checked aria-describedby="review-decline-hint"><span>Record the rest as declined</span></label>
@@ -260,6 +272,7 @@
 <button type="button" id="review-generate" class="z-btn z-btn--primary" data-mode="declarative">Generate</button>
 <button type="button" id="review-save" class="z-btn z-btn--primary" data-mode="managed" hidden>Save</button>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 </div>
 </div>
 </div>
@@ -281,6 +294,7 @@
 </div>
 <pre id="fragment-text" class="z-codeblock__pre"></pre>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 <ul id="fragment-check" class="z-findings z-findings--compact"></ul>
 <p class="z-label">Then, in order:</p>
 <p id="fragment-carries" class="z-hint"><span data-mode="declarative">After fragment 1's commit and reload, this
@@ -295,6 +309,7 @@ carries on by itself.</span></p>
 <div class="z-intro"><p>Every signed-in browser.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-sessions">?<span class="z-vh"> About sessions</span></button><span class="z-help__pop" id="help-sessions" popover><span>A session ends after 15 idle minutes, 4 hours in all, at sign-out, or when the vault restarts.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about sessions</span></a></span></span></p></div>
 <ul id="session-list" class="z-list"></ul>
 <div class="z-btn-row"><button type="button" id="end-others" class="z-btn z-btn--secondary">End the other sessions</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 
 <section id="passkeys" hidden>
@@ -312,6 +327,7 @@ carries on by itself.</span></p>
 <button type="button" id="rename-close" class="z-btn z-btn--quiet z-btn--small">Cancel</button>
 </div>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 <section class="z-section">
 <div class="z-section__head"><h3 class="z-section__title">Enrol another passkey</h3></div>
 <div class="z-field">
@@ -320,6 +336,7 @@ carries on by itself.</span></p>
 <p class="z-hint" id="passkey-name-hint">For example, the device it is on.</p>
 </div>
 <div class="z-btn-row"><button type="button" id="passkey-enrol" class="z-btn z-btn--secondary">Enrol a passkey</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 </section>
 
@@ -327,6 +344,7 @@ carries on by itself.</span></p>
 <h2 class="z-page__title">Secrets</h2>
 <div class="z-intro"><p>Every secret in the vault's store, by name: a value is never shown.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-secrets">?<span class="z-vh"> About secrets</span></button><span class="z-help__pop" id="help-secrets" popover><span>To change a value, enter it again; each change asks for your passkey. A credential's tokens from Connect are the vault's own and aren't changed here.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about secrets</span></a></span></span></p></div>
 <ul id="secret-list" class="z-list"></ul>
+<p class="z-status" role="status" data-outcome></p>
 <section class="z-section z-panel">
 <div class="z-panel__head"><h3 class="z-panel__title">Set or replace a secret</h3></div>
 <div class="z-field">
@@ -345,6 +363,7 @@ carries on by itself.</span></p>
 <p class="z-hint" id="secret-origins-hint">Only for a name no route or connector uses: https URLs, separated by spaces.</p>
 </div>
 <div class="z-btn-row"><button type="button" id="secret-prepare" class="z-btn z-btn--primary">Set the secret</button></div>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 </section>
 
@@ -353,6 +372,7 @@ carries on by itself.</span></p>
 <div class="z-intro"><p>The gateway's approval ledger, as reported to the vault, newest first.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-ledger">?<span class="z-vh"> About the ledger</span></button><span class="z-help__pop" id="help-ledger" popover><span>A call shows its sends from the SMTP connectors' journals. Its arguments are only in the gateway's own ledger, as a keyed digest: check them with <code>zoeymcp ledger check REF FILE</code> in the gateway's container.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#21-the-approval-ledger" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about the ledger</span></a></span></span></p></div>
 <p id="ledger-state"></p>
 <div class="z-btn-row"><button type="button" id="ledger-restart" class="z-btn z-btn--secondary" hidden>Restart the chain</button></div>
+<p class="z-status" role="status" data-outcome></p>
 <ul id="ledger-rows" class="z-log"></ul>
 <div class="z-pager"><button type="button" id="ledger-older" class="z-btn z-btn--secondary z-btn--small" hidden>Older rows</button></div>
 <section class="z-section">
@@ -384,6 +404,7 @@ carries on by itself.</span></p>
 <div class="z-section__head"><h3 class="z-section__title">Connectors</h3></div>
 <p>Each SMTP connector, whether it sends, and its limits.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-connectors">?<span class="z-vh"> About connectors</span></button><span class="z-help__pop" id="help-connectors" popover><span><b>Pause</b> refuses every send at once; <b>Resume</b> lets them go again; <b>Save limits</b> sets sends a day and subject and body lengths. Each asks for your passkey. Recipients, mail server and sender are the host's to change (<code>zoeymcp policy import</code>).</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#22-the-smtp-connector" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about connectors</span></a></span></span></p>
 <ul id="policy-connectors" class="z-list"></ul>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 <section class="z-section">
 <div class="z-section__head"><h3 class="z-section__title">History</h3></div>
@@ -395,6 +416,7 @@ carries on by itself.</span></p>
 <ul id="policy-diff-rows" class="z-changes"></ul>
 <p id="policy-diff-actions"></p>
 </div>
+<p class="z-status" role="status" data-outcome></p>
 </section>
 </div>
 <section class="z-section">

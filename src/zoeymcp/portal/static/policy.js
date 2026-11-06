@@ -13,7 +13,7 @@
 "use strict";
 
 (function () {
-  const { api, fill, afterFailure, button, prepare, closeConfirm, on } = window.zoeyPortal;
+  const { api, fill, report, afterFailure, button, prepare, closeConfirm, on } = window.zoeyPortal;
 
   // What made a revision (H.1, J6): its kind (common/policy/plan.py's WriteKind), in words.
   const KIND_TEXT = {
@@ -191,7 +191,7 @@
     await prepare("client.servers", { base: base, client: changed[0].client.name,
       servers: servers }, (done) => {
       closeConfirm();
-      $("status").textContent = wrote(done);
+      report(wrote(done));
       return gave(server, block, changed.slice(1), done.revision);
     });
     if (!$("confirm").open) {

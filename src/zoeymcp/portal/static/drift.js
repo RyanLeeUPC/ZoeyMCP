@@ -12,7 +12,7 @@
 "use strict";
 
 (function () {
-  const { api, fill, afterFailure, button, prepare, closeConfirm, on } = window.zoeyPortal;
+  const { api, fill, report, afterFailure, button, prepare, closeConfirm, on } = window.zoeyPortal;
 
   // The buttons for an item's action; an unknown kind draws none.
   const ACTION_TEXT = { review: "Review", clear: "Clear the marks" };
@@ -101,7 +101,7 @@
   async function clear(server, after) {
     await prepare("tool.clear", { server: server }, async (job) => {
       closeConfirm();
-      $("status").textContent = "The gateway is listing the server's tools again.";
+      report("The gateway is listing the server's tools again.");
       for (let reads = 0; reads < CLEAR_READS; reads += 1) {
         let read;
         try {
@@ -110,13 +110,13 @@
           return afterFailure(error);
         }
         if (read.state === "done") {
-          $("status").textContent = "Cleared the drift marks of " + read.server_shown +
-            (read.cleared_shown.length ? ": " + read.cleared_shown.join(", ") : "") + ".";
+          report("Cleared the drift marks of " + read.server_shown +
+            (read.cleared_shown.length ? ": " + read.cleared_shown.join(", ") : "") + ".");
           return after();
         }
         await new Promise((resolve) => setTimeout(resolve, CLEAR_EVERY));
       }
-      $("status").textContent = "The gateway hasn't answered the clear yet: review the server.";
+      report("The gateway hasn't answered the clear yet: review the server.");
     });
   }
 
@@ -313,7 +313,7 @@
   function move(entry) {
     if (entry === undefined || entry.choice === null || !entry.box.checked ||
       entry.tool.classification !== APPROVE || entry.tool.consequential === true) {
-      $("status").textContent = NOT_MOVED;
+      report(NOT_MOVED);
       return;
     }
     const place = entry.item; // the row's list item
@@ -359,7 +359,7 @@
     }
     await SAVES[draft.kind](draft, async (done) => {
       closeConfirm();
-      $("status").textContent = savedText(done);
+      report(savedText(done));
       await again(held.server, true);
     });
   }
@@ -376,7 +376,7 @@
     const row = found.servers.find((each) => each.server === asked.server);
     const named = row ? row.approve.find((each) => each.name === asked.named.name) : undefined;
     if (named === undefined) {
-      $("status").textContent = NOT_MOVED;
+      report(NOT_MOVED);
       return;
     }
     await allowSaved(asked.server, named);
@@ -390,7 +390,7 @@
     await prepare("tool.allow", { base: session.revision, server: server, kind: "tool",
       name: named.name, pin: named.pin }, (done) => {
       closeConfirm();
-      $("status").textContent = savedText(done);
+      report(savedText(done));
     });
   }
 
@@ -404,7 +404,7 @@
   function saved(text) {
     closeConfirm();
     $("plan").hidden = true;
-    $("status").textContent = text;
+    report(text);
     review();
   }
 
