@@ -302,6 +302,11 @@ async def settle(
             # The vault forwarded it, and the forward failed: its own refusal, after the
             # approval, says how the forward ended on its chain (the SDK's error for it doesn't).
             outcome, detail, result = approved_failure(answer.outcome, ref)
+            if call.toolkit and raw is not None:
+                # A toolkit read the vault's refusal of its write and answered the call itself,
+                # as it does when the gateway asks: the agent gets the toolkit's words, the
+                # ledger the chain's outcome (D-258).
+                result = call.finish(raw)
             await _finish(approvals, record, outcome, detail, settings.cooldown, "accept")
             return result
         if failure is not None:
@@ -667,11 +672,12 @@ def approved_failure(
     outcome: object, ref: str, status: int | None = None
 ) -> tuple[str, str | None, CallToolResult]:
     """The ledger's outcome and the agent's answer for an approved held call whose forward
-    failed, from the vault's outcome of it (B.8): never sent; an upstream that answered with an
-    error (with ``status`` 404, the session the forward went out on was gone: F.6, D-228); or
-    one that may have run, as is any outcome the vault didn't name."""
-    if outcome == "not_sent":
-        return "not_sent", None, map_upstream("unavailable", ref)
+    failed, from the vault's outcome of it (B.8): never sent, or a connector's send refused
+    before anything was sent (B.7, D-258); an upstream that answered with an error (with
+    ``status`` 404, the session the forward went out on was gone: F.6, D-228); or one that may
+    have run, as is any outcome the vault didn't name."""
+    if outcome in ("not_sent", "refused"):
+        return outcome, None, map_upstream("unavailable", ref)
     if outcome == "upstream_error" and status == 404:
         return "upstream_error", "session_expired", map_upstream("connection_lost", ref)
     if outcome == "upstream_error":

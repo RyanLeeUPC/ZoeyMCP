@@ -403,6 +403,8 @@ class HoldRig:
             self.store.put("approver-bot", BOT_TOKEN, origin_binding(["https://api.telegram.org"]))
         self.upstream = Upstream()
         self.mail: list[dict[str, Any]] = []
+        # How the fake mail server ends each send: accepted, unless a test says otherwise.
+        self.mail_result = SendResult("final_reply", final_dot_written=True, reply_code=250)
         self.chain = VaultLedger.open_at(self.state, KEYS.chain_key)
         # The vault's own Telegram surface, with timings, and its own queue: the rest are scripted.
         scripted = [
@@ -441,7 +443,7 @@ class HoldRig:
 
     def _send(self, connector: Any, **sent: Any) -> SendResult:
         self.mail.append({k: v for k, v in sent.items() if k != "tls"})
-        return SendResult("final_reply", final_dot_written=True, reply_code=250)
+        return self.mail_result
 
     @asynccontextmanager
     async def running(self) -> AsyncIterator[httpx.AsyncClient]:

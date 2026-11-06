@@ -72,6 +72,7 @@ from zoeymcp.vault import app as vault_app
 from zoeymcp.vault import heldcommit, logs
 from zoeymcp.vault.admin import HealthReader
 from zoeymcp.vault.approvers import NOTICE, NotShown
+from zoeymcp.vault.connectors.smtp import SendResult
 from zoeymcp.vault.heldcommit import read_answer
 from zoeymcp.vault.holds import MAX_PER_TOOL, Decided, DecideRefusal, Hold
 from zoeymcp.vault.request import SSEScrubber
@@ -933,7 +934,7 @@ async def test_block_then_pending(tmp_path: Path, link: str, wait: str) -> None:
                 sent = headers(held=marker(REF_A, wait=wait))
                 group.start_soon(answer.post, http, SHOP, call(), sent)
                 [hold] = await rig.surface.holds(1)
-                assert hold.block_until - hold.asked_at == 120
+                assert hold.block_until - hold.asked_at == pytest.approx(120)
                 await rig.later(60)
                 assert rig.app.holds.get(hold.id) is not None  # not yet
                 await rig.later(61)
@@ -984,7 +985,7 @@ async def test_toolkit_block_is_the_tools(tmp_path: Path, link: str, tool: str |
             async with anyio.create_task_group() as group:
                 group.start_soon(answer.post, http, "/mail/send", body, sent)
                 [hold] = await rig.surface.holds(1)
-                assert hold.block_until - hold.asked_at == (70 if tool else 120)
+                assert hold.block_until - hold.asked_at == pytest.approx(70 if tool else 120)
                 assert (hold.server, hold.tool) == (
                     ("mailer", "send_mail") if tool else ("mail-out", "send")
                 )
@@ -1006,6 +1007,47 @@ async def test_toolkit_block_is_the_tools(tmp_path: Path, link: str, tool: str |
     outcome = [r for r in rig.records() if r.ref == REF_A][-1]
     assert (outcome.fields["outcome"], outcome.fields["detail"]) == ("ok", "sent")
     assert outcome.fields["writes_sent"] == 1
+
+
+@pytest.mark.parametrize(
+    ("result", "code", "outcome"),
+    [
+        (
+            SendResult("auth", code="smtp_auth_unsupported"),
+            "smtp_auth_unsupported",
+            "upstream_error",
+        ),
+        (SendResult("final_reply", final_dot_written=True), "smtp_outcome_unknown", "unknown"),
+    ],
+    ids=["refused-before-auth", "unknown-after-the-dot"],
+)
+async def test_a_failed_held_send_says_how_it_ended(
+    tmp_path: Path, result: SendResult, code: str, outcome: str
+) -> None:
+    """D-258: an approved send the mail server failed is answered with the connector's refusal,
+    the approval's headers and the chain's outcome, as a forward's own refusal is (C.2), so the
+    gateway's ledger records what the chain does."""
+    rig = HoldRig(tmp_path, {"mail": True})
+    rig.mail_result = result
+    body, sent = mail(REF_A)
+    sent["x-zoeymcp-held"] = marker(REF_A, tool="send_mail")
+    async with rig.running() as http:
+        with anyio.fail_after(BOUND):
+            answer = Answer()
+            async with anyio.create_task_group() as group:
+                group.start_soon(answer.post, http, "/mail/send", body, sent)
+                [hold] = await rig.surface.holds(1)
+                await rig.decide(hold)
+            await rig.settled()
+    response = answer.response
+    assert response is not None
+    assert response.status_code == 502
+    assert response.headers["x-zoeymcp-vault"] == "refused"
+    assert response.headers["x-zoeymcp-approval"] == "approved"
+    assert (response.json()["code"], response.json()["outcome"]) == (code, outcome)
+    assert len(rig.mail) == 1
+    ended = [r for r in rig.records() if r.ref == REF_A][-1]
+    assert ended.fields["outcome"] == outcome
 
 
 # --- a flood (D.3; FM-19) ------------------------------------------------------------------------

@@ -813,6 +813,13 @@ ROWS: list[Any] = [
         "upstream unavailable",
     ),
     (approved_refusal(None, "unknown"), "approved_elsewhere", "unknown", LOST),
+    # A connector's send refused before anything was sent (B.7, D-258).
+    (
+        approved_refusal("daily_limit", "refused"),
+        "approved_elsewhere",
+        "refused",
+        "upstream unavailable",
+    ),
     (
         approved_refusal(None, "upstream_error"),
         "approved_elsewhere",
@@ -944,6 +951,35 @@ async def test_each_vault_answer_maps_to_its_text(
     cooled = decision in ("decline", "timeout")
     assert (Key("agent1", "notes", "echo") in held.approvals.table._cooldowns) is cooled
     assert held.approvals.unheld["notes"] == (1 if said == elsewhere.UNHELD else 0)
+
+
+@pytest.mark.parametrize("outcome", ["upstream_error", "unknown", "refused"])
+async def test_a_toolkit_keeps_its_own_answer_to_a_failed_send(
+    tmp_path: Path, outcome: str
+) -> None:
+    """D-258: a toolkit whose held write the vault approved and the mail server then failed
+    answers the call itself, from the vault's refusal of the write, as it does when the gateway
+    asks; the agent gets the toolkit's words, and the ledger the vault chain's outcome."""
+    held = await in_process(tmp_path)
+
+    async def prepare() -> None:
+        return None
+
+    call = replace(held.call, prepare=prepare)
+    assert call.toolkit
+    said = CallToolResult(
+        content=[TextContent(type="text", text="not sent (smtp_auth_unsupported)")], is_error=True
+    )
+    answer = approved_refusal("smtp_auth_unsupported", outcome)
+    result = await settle(held.approvals, call, held.record, held.settings, answer, said, None, 0.0)
+    assert isinstance(result, CallToolResult)
+    assert result is said
+    assert held.records() == [
+        ("asked", None),
+        ("decided", "approved_elsewhere"),
+        ("outcome", outcome),
+    ]
+    assert held.approvals.table.get(call.ref) is None
 
 
 POLICY_CHANGED = "refused: the policy changed; call the tool again"

@@ -3617,7 +3617,12 @@ class VaultApp:
                 credentials=lambda: self._connector_credentials(connector),
             )
             outcome, detail, sent, unknown = _send_outcome(answer)
-            response = _connector_response(answer, {})
+            told = answer
+            if answer.status != 200:
+                # A refusal after the approval says how the send ended, as a forward's own
+                # refusal does (C.2), so the gateway's ledger records the chain's outcome (D-258).
+                told = replace(answer, body={**answer.body, "outcome": outcome})
+            response = _connector_response(told, {})
             for header, value in _approved(hold.ref):
                 response.headers.append(header.decode(), value.decode())
             stored = StoredResult(
