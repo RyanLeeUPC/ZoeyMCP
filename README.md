@@ -131,6 +131,11 @@ The gateway serves the tools within seconds. Point the agent at the server:
                           "headers": {"Authorization": "Bearer zgc1-..."}}}}
 ```
 
+[docs/clients.md](docs/clients.md) covers connecting other clients: from another host or a
+container, from a command line, or without a way to send the header; keeping the token out of
+the agent's reach; and turning off the runtime's own connector and MCP-install features, which
+reach servers without the gateway.
+
 **A server that signs in with OAuth** is added by its URL in the portal instead. Remove the
 example `notes` server, its route and its credential (and `notes` from the client's `servers`)
 before the first `up -d`; then, on **MCP servers**, **Add a server by URL**: register its client,

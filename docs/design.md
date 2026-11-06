@@ -174,7 +174,7 @@ say so.
 | **bridge** | `zoeymcp bridge -- <cmd> …` | no: the SHA-256 of its token; its program may hold a real secret, a flagged exception (R35) | a work directory on tmpfs | derived per stdio server |
 | **egress** (optional, hardened) | `zoeymcp egress` | no; it only tunnels TLS and never sees plaintext; its key reads the allowlists and nothing else | none | official |
 | **launcher** | `zoeymcp standard` | no, once the vault, the gateway and its bridges are started | none | official, or the derived bridge image |
-| **CLI** | `zoeymcp keygen / client-token / gateway-key / egress-key / setup-code / passkeys / sessions / secret set [--generate] / secret list / secret delete / login / login --mcp / oauth / health / review / gateway-status / ledger / ledger --vault / policy / check [--with] / selftest` | only while running, never written | none | official, or installed with `pip` |
+| **CLI** | `zoeymcp keygen / client-token / gateway-key / egress-key / setup-code / passkeys / sessions / secret set [--generate] / secret list / secret delete / login / onboard / oauth / health / review / gateway-status / ledger / ledger vault / policy / check [--with] / selftest` | only while running, never written | none | official, or installed with `pip` |
 
 ### 3.1 Why the vault is separate from the gateway
 
@@ -862,7 +862,7 @@ secret, a `client_id` ref) is bound to the token endpoint and the credential's r
   `{"v": 1, "rt": "<refresh token>", "seed_sha256": "<hex>" | null}`, so the seed's hash is
   hidden at rest, authenticated, and kept by master-key rotation.
 
-**Onboarding's client secrets (M7).** A confidential client's secret, given to `login --mcp` or
+**Onboarding's client secrets (M7).** A confidential client's secret, given to `onboard` or
 returned by a registration, is stored at once as `<credential>-client-secret`, before the policy
 names the credential, under the binding the plan **predicts** from the discovered token endpoint
 and the server's origin. A committed policy that derives another binding can't use it
@@ -1109,7 +1109,7 @@ way, duration), one per refusal with its reason, and one per list applied, never
 anything a tunnel carries.
 
 **Bring your own proxy:** `zoeymcp check --emit-egress-allowlist` prints the same per-source
-lists as text, JSON or a Squid snippet (`--allowlist-format`), and `--check FILE` compares an
+lists as text, JSON or a Squid snippet (`--allowlist-format`), and `--compare FILE` compares an
 emitted file with the policy. The Squid form writes per-destination `dstdomain -n` (or `dst -n`)
 ACLs, so an IP-literal CONNECT can't match a listed name through a reverse lookup, and a
 private-destination rule rendered from the vault's own address tables after the name match; an
@@ -1673,6 +1673,17 @@ passkey assertion bound to it (§7.2). Reading anything, starting an OAuth conne
 public server by URL, queueing a review, preparing a managed save and reading its plan, signing
 out and ending other sessions need none.
 
+Its look is the "Zoey" design system's: `tokens.css` (the system's tokens, light by default and
+dark when the browser asks), `zoey.css` (its components as plain classes, the system's bundle
+unchanged) and `app.css` (the portal's own rules), with the system's fonts (Manrope and IBM Plex
+Mono, OFL 1.1) and icon served by the vault like every other static file. Each page opens with
+one sentence; the how and why sit behind a **?** beside it, a toggletip (a popover, no script)
+whose **Learn more** links to the section of operations.md at the release's tag (dev's while the
+version is a development one). What decides safety stays in view: a confirm's summary,
+fingerprints, origins, a reset's warning. An action's outcome, done or refused, shows on the
+line under the buttons of the section that took it; polls and the app bar's buttons use the line
+at the top of the page.
+
 | Area | What it does | Step-up | Milestone |
 | --- | --- | --- | --- |
 | Home | what needs the operator: every health finding, errors first, with the action for each; the gateway's attention list (servers with drifted, marked, missing or unreviewed tools, blocked servers, a bridge that isn't ready), labelled as the gateway's report, each with its action | — | M5; M6 (the attention list) |
@@ -1682,9 +1693,9 @@ out and ending other sessions need none.
 | Sessions | list the signed-in browsers; end the others | — | M5 |
 | Ledger | the vault's copy of the gateway's ledger, joined by ref with the vault's own approval chain (M8): each call's decision (where it was made, and by which writer) and result with its sends, the calls only the vault's chain holds, sends no call explains, archived chains; no argument digest (checked in the gateway) | restart a refused chain | M5; M8 (the vault's chain) |
 | Policy (declarative) | read-only view, built from a list of the fields it may show (no client token, placeholder, account detail or recipient) | — | M5 |
-| MCP servers | every remote and toolkit server with its state and what the gateway reports for it; onboard by URL (§7.4), with the plan and fragment 1; connect; the first-time tool review (filter, suggestions, each definition whole), classify `allow`/`approve`, fragment 2; drifted tools side by side (**Reviewed** and **Now**, each verified by the vault against its pin, with the vault's diff), **Accept the new definition**, decline, **Record the rest as declined**; prompts and resources under headings of their own; **Clear the marks**; **Allow without asking**; in managed mode **Save** in place of fragments, and **Give to clients** (which servers an existing client reaches, one client per save) | register a client (it may store a client secret), discover a server on the operator's network; clear the marks; in managed mode every save: a review's (with each move to `allow` a row of its own), a re-pin, a move to `allow`, onboarding's, giving a server to a client | M7 (onboarding and review), M6 (drift review, re-pin, declines, clearing, approve->allow, saves) |
+| MCP servers | every remote and toolkit server with its state and what the gateway reports for it; onboard by URL (§7.4), with the plan and fragment 1; connect; the first-time tool review (filter, suggestions, each definition whole), classify `allow`/`approve`, fragment 2; drifted tools side by side (**Reviewed** and **Now**, each verified by the vault against its pin, with the vault's diff), **Accept the new definition**, decline, **Record the rest as declined**; prompts and resources under headings of their own; **Clear the marks**; **Allow without asking** (a server card's per-tool buttons fold under **Tool actions (N)**); in managed mode **Save** in place of fragments, and **Give to clients** (which servers an existing client reaches, one client per save) | register a client (it may store a client secret), discover a server on the operator's network; clear the marks; in managed mode every save: a review's (with each move to `allow` a row of its own), a re-pin, a move to `allow`, onboarding's, giving a server to a client | M7 (onboarding and review), M6 (drift review, re-pin, declines, clearing, approve->allow, saves) |
 | Policy (managed) | the head (when, how and by whom it was written) and the revision the gateway runs; history with structured diffs; **Roll back** to any kept revision whose every difference is narrower or neutral (the head's `admin` kept); each SMTP connector's **Pause**, **Resume** and limits; the export command to run on the host. The portal edits nothing wider: new clients and callers, `admin`, approvals settings, `gateway.limits`, the egress settings and a connector's bound constraints (recipients, host, port, From) are the host's import, and there is no portal export or import | a rollback, a connector's limits or pause; turning `vault_approval` off (`tool.vault_approval_off`, below) | M6; M8 |
-| Approvals | the calls the vault holds and the prompts it relays (§6.3, §6.4): Waiting (each text whole, held or relayed, the client as reported, the absolute deadline, whether Telegram has it) and Decided recently; **Approve** (`approval.decide`, one call per assertion, no bulk control) and **Deny** (a session); the nav entry's count and Home's item; on a server's page, **Hold in the vault** (a `policy.save`) and **Turn off vault approval** | approve; in managed mode the saves | M8 |
+| Approvals | the calls the vault holds and the prompts it relays (§6.3, §6.4): Waiting (each text whole, held or relayed, the client as reported, the absolute deadline, whether Telegram has it) and Decided recently; **Approve** (`approval.decide`, one call per assertion, no bulk control) and **Deny** (a session); the nav entry's count, a badge, and Home's item; on a server's page, **Hold in the vault** (a `policy.save`) and **Turn off vault approval** | approve; in managed mode the saves | M8 |
 
 In managed mode a `vault_approval` tool is turned on in any save, its plan saying before the
 passkey how each client will be asked. Turning it off is its own act:
@@ -1726,8 +1737,8 @@ would drop a held tool is refused, and so is a host rollback.
   whose enrolment removes every other passkey and ends every session; its creation options list
   no credential, so the authenticator being recovered may answer. It is also the way out of a
   passkey file that can't be verified, which is moved aside, never overwritten. `zoeymcp passkeys
-  --remove` removes one passkey and ends its sessions. Recovery needs host access, which is the
-  right bar.
+  remove FINGERPRINT` removes one passkey and ends its sessions, after asking. Recovery needs
+  host access, which is the right bar.
 - **Login:** a discoverable passkey (WebAuthn, `userVerification: required`). The login options
   list no credential, so nothing about the passkeys reaches a caller without a session. Several
   passkeys can be enrolled, at most 32.
@@ -1778,7 +1789,7 @@ would drop a held tool is refused, and so is a host rollback.
   everything again: if anything shown has changed in between, it refuses with both summaries
   and the operator prepares again. Logging out, ending other sessions and reading anything need
   no step-up; a setup session's one enrolment has none either, since the code was its step-up.
-  The portal never removes the last passkey (`zoeymcp passkeys --remove` may, since host access is
+  The portal never removes the last passkey (`zoeymcp passkeys remove` may, since host access is
   the recovery path). A stolen session, both halves of it, can browse and end sessions, but it
   can't change anything that matters without the operator's passkey.
 
@@ -1797,8 +1808,8 @@ have passed:
   any other request with a wrong `Host` gets `421`.
 - **Methods:** `GET`, `POST` and `DELETE` only. No preflight is answered and no
   `Access-Control-*` header is ever sent.
-- **Paths:** the static files (the page, its script and its stylesheet) are served to any
-  navigation; every other path outside `/api/` is `404`.
+- **Paths:** the static files (the page, its scripts, stylesheets, fonts and icon) are served to
+  any navigation; every other path outside `/api/` is `404`.
 - **`/api/`:** exactly one `Sec-Fetch-Site: same-origin` (a page on another localhost port is
   `same-site`, and refused). A `POST` or `DELETE` needs exactly one `Origin`, equal to the
   request's own origin; a form post under `no-referrer` sends `null`, which never matches.
@@ -1814,8 +1825,8 @@ have passed:
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
   `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin` and
   `X-Frame-Options: DENY`. The CSP is a header, never a `<meta>`, because `frame-ancestors` is
-  ignored there. The page loads its script and stylesheet from the vault only, with no inline
-  script, style or event handler, and every state change is a `fetch()` with
+  ignored there. The page loads its scripts, stylesheets and fonts from the vault only, with no
+  inline script, style or event handler, and every state change is a `fetch()` with
   `redirect: "error"`; there are no forms.
 - **Connections:** a request head must arrive within 10 seconds of the connection opening or of
   the previous answer, and at most 64 connections are open; a new one beyond that closes the one
@@ -1869,19 +1880,19 @@ have passed:
   4. It exchanges the code once, with no replay (a code is single use), through the egress proxy,
      sending the byte-identical `redirect_uri`. It stores the refresh token with its binding,
      caches the access token, shows the granted scopes and flags any outside `expected_scopes`.
-  - A flow is removed when it's used, so any failure needs a new login. Flows last 10 minutes;
-    one per credential is pending, at most 8 in all.
+  - A flow is removed when it's used, so after any failure the operator connects again. Flows
+    last 10 minutes; one per credential is pending, at most 8 in all.
   - **`--rebind`:** when the policy now derives a different binding than the stored grant's (a
     route moved, the token endpoint changed), login refuses and shows both until `--rebind`
     accepts the new one.
   - An answer with no refresh token is refused, with a hint: Google needs `access_type: offline`
     and `prompt: consent`; some providers need an `offline_access` scope.
   - **In the portal (M5), paste is the primary path too, for every credential.** Connect shows
-    the scopes asked for and expected and where the tokens will go, then the authorization URL as
-    a link to a new tab (no opener, no referrer, followed only if it is `https`) and the modal's
-    text: *after approving, copy the `http://127.0.0.1…` address from that tab's address bar (the
-    page won't load; that's expected) and paste it here*, with the credential's actual
-    `redirect_uri` and the deadline. The paste is the data of the `oauth.complete` step-up
+    the scopes asked for and expected and where the tokens will go, then two numbered steps: the
+    authorization URL as a link to a new tab (no opener, no referrer, followed only if it is
+    `https`), and the paste box, whose hint reads *That tab goes to `<redirect_uri>`, which won't
+    load: that's expected. Paste its whole address by <deadline>.*, with the credential's actual
+    `redirect_uri`. The paste is the data of the `oauth.complete` step-up
     action, and its plan runs every check of step 3 against the flow without spending it, so a
     mistyped paste is refused **before** the passkey prompt and can be pasted again; a provider
     `error` ends the flow. The plan also checks the binding, so a policy reloaded since the start
@@ -1902,9 +1913,9 @@ have passed:
     portal session's flow takes the callback, and only when the address is on the origin that
     session is on, where the start sets the binding cookie; the start answer says so
     (`callback`), and also whether the address is a callback address at all
-    (`callback_address`). The dialog's text is then *after approving, the provider sends that
-    tab back to the portal, and this dialog asks for your passkey; if that page doesn't load or
-    says the portal didn't take it, copy its address and paste it here*; the paste box stays.
+    (`callback_address`). The paste box's hint is then *The provider sends that tab back here and
+    this dialog asks for your passkey. If it doesn't, paste that tab's address by <deadline>.*;
+    the paste box stays.
     While the dialog is open it polls `GET /api/oauth/flows/{flow}` every 2 seconds and when the
     tab is shown again. When the code is back it prepares `oauth.complete` with
     `returned: true`, whose summary says where and when the sign-in came back and "Confirm only
@@ -1914,7 +1925,7 @@ have passed:
     for this sign-in. Nothing was stored. Connect again." A CLI flow never takes a callback;
     `zoeymcp login` says to paste the address from that tab when the credential's
     `redirect_uri` is a callback address.
-- **MCP server by URL** (M7: `zoeymcp login --mcp URL`, and the portal's MCP servers page). The
+- **MCP server by URL** (M7: `zoeymcp onboard URL`, and the portal's MCP servers page). The
   vault does the network work; the operator commits two fragments (§4.6), and nothing secret is
   sent before the first commit:
   1. **Discovery**, through the guarded client (§4.1, step 7): one probe of the URL (a modern
@@ -1969,9 +1980,9 @@ have passed:
      match is refused `choices_stale`. Assigning the server to a client stays the operator's edit.
   - **Redirect addresses:** a client the vault registers gets the credential's own address,
     `http://127.0.0.1/callback/<credential>` (paste) or a portal origin's
-    `/oauth/callback/<credential>`, so an answer pasted into another sign-in is refused; a given
-    client uses the address it was registered with (`--redirect-uri`, default the shared
-    `http://127.0.0.1/callback`), and the plan says when that backstop is off.
+    `/oauth/callback/<credential>`, so an answer pasted into another credential's connect is
+    refused; a given client uses the address it was registered with (`--redirect-uri`, default
+    the shared `http://127.0.0.1/callback`), and the plan says when that backstop is off.
   - **Through an egress proxy:** the operator's own refuses a host with `proxy_refused`, naming
     the hosts and the Squid lines to allow, and the same command carries on once they are; the
     built-in role widens the vault's list by itself (§4.7). A server on the operator's network
@@ -1982,9 +1993,9 @@ have passed:
   - **In managed mode** (M6) nothing is committed: in the portal, registering keeps its own
     passkey prompt, then **Save** plans fragment 1's change (the credential, the route for the
     gateway alone and the server) on the policy's head and writes it as a revision with a second
-    prompt, before the sign-in; the review's choices are a save of their own, and **Give to
+    prompt, before **Connect**; the review's choices are a save of their own, and **Give to
     clients** gives the server to a client, one client per save. Five prompts, each for one
-    thing; adding a client or changing its token stays a host import. The CLI's `login --mcp`
+    thing; adding a client or changing its token stays a host import. The CLI's `onboard`
     refuses in managed mode, since it would print a fragment nothing applies.
 - **Provider quirks:** some providers accept loopback redirects only for "desktop/native" client
   types. Provider profiles (§8.1) say which client type to register.
@@ -2000,18 +2011,18 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp client-token` | anywhere | prints a new client token (`zgc1-` and 32 random bytes) and the `token_sha256:` line for the policy; nothing is written |
 | `zoeymcp gateway-key [--retire-previous]` | `docker exec` in the vault | prints the gateway key for the current `gateway_key_generation`, and a `rotation pending` line on stderr while the previous one is accepted; `--retire-previous` stops accepting it now |
 | `zoeymcp setup-code [--reset] [--wait] [--state DIR]` | `docker exec` in the vault | prints a one-time setup code, and on stderr the origins to open and what enrolling with it does; `--reset` makes that enrolment remove every other passkey and end every session; `--wait` waits until a passkey is enrolled with it and prints that passkey's fingerprint, origin, name and time; `--state DIR` writes the code into a state directory without the admin socket, with the master key from the environment, and refuses to run as root |
-| `zoeymcp passkeys [--remove FINGERPRINT]` | `docker exec` in the vault | lists the portal's passkeys (fingerprint, name, algorithm, synced or device-bound, how and where enrolled, last used), never a key; `--remove` removes one, the last one too |
-| `zoeymcp sessions [--end-all]` | `docker exec` in the vault | lists the portal's sessions; `--end-all` ends every one |
+| `zoeymcp passkeys [list]` / `passkeys remove FINGERPRINT [--yes]` | `docker exec` in the vault | lists the portal's passkeys (fingerprint, name, algorithm, synced or device-bound, how and where enrolled, last used), never a key; `remove` removes one, the last one too, after asking `[y/N]` (saying so when it is the last) |
+| `zoeymcp sessions [list]` / `sessions end [--yes]` | `docker exec` in the vault | lists the portal's sessions, one a line; `end` ends every one, after asking `[y/N]` |
 | `zoeymcp secret set NAME [--origin URL …] [--generate]` | `docker exec` in the vault | reads the value from a prompt or stdin (never argv), stores it with its binding: the policy's, or the given origins for a name no route or connector uses. `--generate` (M7) stores 32 random bytes instead and prints only their `sha256:` line, for a bridge's token; it is refused for an OAuth secret or a connector's |
-| `zoeymcp secret list` / `secret delete NAME` | `docker exec` in the vault | lists each name, when it was last updated and its binding, never a value; deletes one entry (a live slot `oauth.<credential>.live` too, which forces a re-seed) |
-| `zoeymcp health [--json] [--strict]` | `docker exec` in the vault | what needs the operator, per credential, connector, store entry, the passkeys, the reported ledger copy, and from M6 the gateway's status report and the managed policy (a restart needed, a seed ignored, a store parked, a restore the witness flags), from metadata only; exit 0 with no error (`--strict`: no warning either), 1 otherwise, 2 when the vault can't be asked |
-| `zoeymcp login <credential> [--rebind] [--start \| --flow ID]` | `docker exec` in the vault | the OAuth onboarding of §7.4; tokens go straight into the store. `--start` prints the URL and the flow ID and exits, and `--flow ID` completes that flow from stdin. For `client_credentials`, a test fetch that stores nothing |
-| `zoeymcp oauth status [<credential>]` / `oauth reset <credential>` | `docker exec` in the vault | per credential: state, code, a hint, time since the last success, re-consent and scope warnings, never a value; `reset` clears a failure state so the next request tries once |
-| `zoeymcp login --mcp <url>` | `docker exec` in the vault | MCP onboarding by URL (§7.4, M7): the plan on stderr, then fragment 1 on stdout and the `Next:` commands, each as typed on the host (`ZOEYMCP_COMPOSE_CMD`). `--name` or `--credential`/`--route`/`--server`, `--client-id`, `--client-secret` (piped, with `--issuer` and `--client-auth`), `--redirect-uri`, `--callback-origin`, `--scope`, `--allow-private`, `--client-name`, `--plan-only`, `--yes`, `--reregister`, `--no-connect`, `--squid-src`, `--indent N` / `--for compose`, `--format json`. The second run compares, signs in and queues the review |
+| `zoeymcp secret [list]` / `secret delete NAME [--yes]` | `docker exec` in the vault | lists each name, when it was last updated and its binding, never a value; deletes one entry (a live slot `oauth.<credential>.live` too, which forces a re-seed), after asking `[y/N]` when the running policy uses it |
+| `zoeymcp health [--format json] [--strict]` | `docker exec` in the vault | what needs the operator, per credential, connector, store entry, the passkeys, the reported ledger copy, and from M6 the gateway's status report and the managed policy (a restart needed, a seed ignored, a store parked, a restore the witness flags), from metadata only; exit 0 with no error (`--strict`: no warning either), 1 otherwise, 2 when the vault can't be asked |
+| `zoeymcp login <credential> [--rebind] [--start \| --flow ID]` | `docker exec` in the vault | connects an OAuth credential, as the portal's **Connect** does (§7.4); tokens go straight into the store. `--start` prints the URL and the flow ID and exits, and `--flow ID` completes that flow from stdin. For `client_credentials`, a test fetch that stores nothing |
+| `zoeymcp oauth [status [<credential>]]` / `oauth reset <credential>` | `docker exec` in the vault | per credential: state, code, a hint, time since the last success, re-consent and scope warnings, never a value; `reset` clears a failure state so the next request tries once |
+| `zoeymcp onboard <url>` | `docker exec` in the vault | MCP onboarding by URL (§7.4, M7; `login --mcp <url>` is its older name): the plan on stderr, then fragment 1 on stdout and the `Next:` commands, each as typed on the host (`ZOEYMCP_COMPOSE_CMD`). `--name` or `--credential`/`--route`/`--server`, `--client-id`, `--client-secret` (piped, with `--issuer` and `--client-auth`), `--redirect-uri`, `--callback-origin`, `--scope`, `--allow-private`, `--client-name`, `--plan-only`, `--yes`, `--reregister`, `--no-connect`, `--squid-src`, `--indent N` / `--for compose`, `--format json`. The second run compares, connects and queues the review |
 | `zoeymcp review [<server>]` | `docker exec` in the gateway, or in the vault with `--via vault` | with no server, one line per server from the gateway's status, with no upstream call. With one, the running gateway lists it on a fresh connection and shows per tool its state, pin and findings, a diff for drift, the upstream's `instructions` and `serverInfo` marked "never forwarded", and a YAML snippet to commit. `--tool T` shows only T, `--show T` / `--all` print definitions, `--add T` includes a tool (you still classify it), `--allow T` / `--approve T` / `--allow-read-only` classify as it includes (M7), `--repin T` takes a drifted tool's new pin, `--clear` clears the drift marks if every included tool matches, `--format json`. `--via vault` (M7) queues the review as a job on the vault's socket and reads its report (`--fresh` for a new one); `--choose [--suggest]` writes a choices file with a line per tool, and `--choices FILE` turns the edited file into fragment 2. `--decline T` and `--decline-rest` (M6) record the tools left out, with their pins; in managed mode every option that would print a fragment refuses and names the portal's save or the export and import (M6). Exit 0 when every included tool matches, nothing is marked and every listed tool is included or declined at its pin, 1 when something needs you, 2 when the review couldn't run |
 | `zoeymcp gateway-status [<server>]` | `docker exec` in the gateway | the view's digest and freshness, and per server its connections, era, exposed and included tools, reports and marks; never definitions or token hashes |
-| `zoeymcp ledger [--since AGE] [--client C] [--server S] [--tool T] [--verify]` / `ledger check REF FILE` | `docker exec` in the gateway | one line per call in the gateway's ledger (when, ref, client, server and tool, era, decision, outcome), never a value; `--verify` walks the hash chain and prints its head; `check` says whether FILE holds the arguments that call was shown with, without the key leaving the gateway |
-| `zoeymcp ledger --vault [--before SEQ] [--chain vault\|copy\|both] [--verify] [--restart-chain]` | `docker exec` in the vault | the vault's reported copy (§4.6): its state, then the newest calls with their sends and the orphan sends; `--chain` joins the vault's own approval chain by ref (the default `both`), or shows one (M8); `--verify` walks the vault's chain; `--restart-chain` shows the plan and asks before archiving a refused chain |
+| `zoeymcp ledger [list] [--since AGE] [--client C] [--server S] [--tool T]` / `ledger verify` / `ledger check REF FILE` | `docker exec` in the gateway | one line per call in the gateway's ledger (when, ref, client, server and tool, era, decision, outcome), never a value; `verify` walks the hash chain and prints its head; `check` says whether FILE holds the arguments that call was shown with, without the key leaving the gateway |
+| `zoeymcp ledger vault [--before SEQ] [--chain vault\|copy\|both] [--verify] [--restart-chain]` | `docker exec` in the vault | the vault's reported copy (§4.6): its state, then the newest calls with their sends and the orphan sends; `--chain` joins the vault's own approval chain by ref (the default `both`), or shows one (M8); `--verify` walks the vault's chain; `--restart-chain` shows the plan and asks before archiving a refused chain |
 | `zoeymcp approvals [list] \| show REF-OR-ID \| withdraw REF-OR-ID\|--all` | `docker exec` in the vault | the calls the vault holds, waiting and decided recently, never a text; `show` prints one call's whole text; `withdraw` withdraws one, or every one (`--all`, the emergency stop), sending nothing. No command approves (M8) |
 | `zoeymcp approver telegram enrol --secret NAME [--apply]` / `approver telegram test` | `docker exec` in the vault | finds the operator's Telegram ids with a one-time link and a confirmation code, and with `--apply` in managed mode plans a host import of the `approvers` lines; `test` sends a message with no buttons (M8) |
 | `zoeymcp policy [head]` | `docker exec` in the vault | the mode and, in managed mode, the head (revision, when, how and by whom, its deployment and digest), the revision the gateway runs and its witness (M6) |
@@ -2020,10 +2031,14 @@ Everything the portal does is also scriptable, for headless setups:
 | `zoeymcp policy import FILE\|- [--from-env [--baseline-only]] [--base N] [--yes] [--accept-widening] [--lockout-ok] [--allow-revive ...] [--allow-env NAME] [--revoke-removed] [--reason TEXT]` | `docker exec -T` in the vault | plans the document against the revision its export line names (widenings first, every restart and broken binding, what the head kept), asks `[y/N]`, and writes it; `--yes` refuses a plan that widens without `--accept-widening`, and one that drops a passkey origin or moves `admin.listen` without `--lockout-ok`; `--from-env` imports the vault's own `ZOEYMCP_CONFIG`, and `--baseline-only` records it without applying anything (M6) |
 | `zoeymcp policy rollback N` | `docker exec` in the vault | revision N's content as the next revision, with the head's key generations and pins, and N's `admin`; the import's flags (M6) |
 | `zoeymcp policy acknowledge-restore [--to N] [--yes]` | `docker exec` in the vault | after a restore the gateway flagged, a revision numbered past its claim, the number typed or given (M6) |
-| `zoeymcp policy seed --state DIR` / `policy import --state DIR --reseed FILE\|- [--new-ratchet]` | a one-off container of the vault's service, with the vault stopped | seed revision 1 on a used volume; replace the store, planned against the old ratchet unless `--new-ratchet` (M6). `history`, `diff`, `export`, `import`, `rollback` and `acknowledge-restore` take `--state DIR` too, for a host with no admin socket; each refuses root and a running vault's lock |
-| `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --with FRAGMENT` (M7) checks the policy with a fragment merged and says what it adds or replaces, `--print-merged [--for compose]` prints the result; `check --emit-egress-allowlist` (M7) prints the per-source allowlists (`--allowlist-format text`, `json` or `squid`, `--squid-src`) for operators who run their own proxy, and `--check FILE` compares an emitted file with the policy |
+| `zoeymcp policy seed --state DIR [FILE\|-]` / `policy import --state DIR --reseed FILE\|- [--new-ratchet]` | a one-off container of the vault's service, with the vault stopped | seed revision 1 on a used volume, from FILE or `ZOEYMCP_CONFIG`; replace the store, planned against the old ratchet unless `--new-ratchet` (M6). `head`, `history`, `diff`, `export`, `import`, `rollback` and `acknowledge-restore` take `--state DIR` too, for a host with no admin socket; each refuses root and a running vault's lock |
+| `zoeymcp check` / `selftest` | anywhere | §2.7, §8; `check --with FRAGMENT` (M7) checks the policy with a fragment merged and says what it adds or replaces, `--print-merged [--for compose]` prints the result; `check --emit-egress-allowlist` (M7) prints the per-source allowlists (`--allowlist-format text`, `json` or `squid`, `--squid-src`) for operators who run their own proxy, and `--compare FILE` compares an emitted file with the policy |
 | `zoeymcp egress-key` | `docker exec` in the vault | prints `ZOEYMCP_EGRESS_KEY=...` for the policy's `egress_key_generation` (M7, §4.7) |
 | `zoeymcp egress` / `bridge` | the image's commands | run the egress role (`--vault`, `--listen SOURCE=NAME:PORT`, §4.7); run a bridge (`--listen`, `--era`, `--peer-uid`, `--env`, `--secret-env`, `--egress-proxy`, limits, then `-- <program>`; §5) (M7) |
+
+Every command exits 0 when done; 1 for findings, a refusal, a declined prompt or nothing to do;
+and 2 for a usage error or when it can't run (operations.md, "Exit codes"). Given no action, a
+command with actions lists (`policy` shows the head, `oauth` the status).
 
 Admin commands run inside the vault's or the gateway's container and use its local admin socket, so
 they need host access instead of a passkey. `review` and `gateway-status` ask the running gateway,
@@ -2140,7 +2155,7 @@ the real vault and gateway: a given public client, a given confidential client w
 (starting from `--plan-only`), a client the vault registers, a server with no protected-resource
 metadata, onboarding through an operator's own proxy (refused, then resumed from the printed
 command once the hosts are allowed), and the portal's MCP servers page from discovery to
-fragment 2; each through both fragments, `check --with`, the sign-in and the review, then an agent
+fragment 2; each through both fragments, `check --with`, the connect and the review, then an agent
 listing and calling the reviewed tools, in each of the fake's modes and, on one row, both agent
 eras and both links. It checks that nothing reached the authorization server before the first
 commit but the registration request, and ends with the leak sweep, which adds client secrets,
@@ -2318,7 +2333,7 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   | H11 | **Toolkit containment.** A toolkit reaches only its slots' rules. An `approved` rule takes only a plan write of an accepted call, once. The plan step reads only SMTP connector configuration. A classification mismatch hides the tool |
   | H12 | **Toolkit integrity.** Toolkits load only from registered entry points whose files the gateway uid can't write, inside the gateway environment. Their definitions are pinned, unless the server sets `pinning: off`. Their packages are absent from the vault environment |
   | H13 | **Still no back channel.** Upstream sampling, elicitation and `input_required` stay refused, during approved calls too. Agent answers, `inputResponses` and `requestState` never go upstream |
-  | H14 | **Logs.** No prompt text, argument value, subject, body, recipient, handle, confirmation code, or ledger or audit key in any log line, admin answer or CLI output. No unkeyed digest of arguments or text (`canonical.digest(args)`, `Pending.args_digest`) leaves process memory. The keyed ledger HMACs (`args`, `text`) appear only in the ledger file, its admin endpoints and `zoeymcp ledger` output, and from M5 in the vault's reported copy files (`/state/ledger-reported/`); never in a portal answer, `zoeymcp ledger --vault` output or a log line; log lines carry only `ledger_hash`, the hash of a whole record |
+  | H14 | **Logs.** No prompt text, argument value, subject, body, recipient, handle, confirmation code, or ledger or audit key in any log line, admin answer or CLI output. No unkeyed digest of arguments or text (`canonical.digest(args)`, `Pending.args_digest`) leaves process memory. The keyed ledger HMACs (`args`, `text`) appear only in the ledger file, its admin endpoints and `zoeymcp ledger` output, and from M5 in the vault's reported copy files (`/state/ledger-reported/`); never in a portal answer, `zoeymcp ledger vault` output or a log line; log lines carry only `ledger_hash`, the hash of a whole record |
   | H15 | **SMTP connector.** Fixed From and recipients (a request can only assert them). No caller headers or attachments. Verified TLS before AUTH. CONNECT when an egress proxy is set. All recipients or none. Each attempt journaled before connecting, at most one per key, never retried. A rolling limit and a pause |
   | H16 | **Bounded.** Pending records, tombstones, the ledger, toolkit vault answers, plans, connector bodies and the journal all have limits |
 - **Portal security tests (M5)**, as built, against the real portal app over real sockets
@@ -2666,7 +2681,7 @@ credentials:
     extra_params: {resource: https://mcp.broker.example/}
     expected_scopes: [read, trade]
     idle_expiry_days: 180                   # optional: the provider drops a grant unused this long
-  notes:                                    # as `zoeymcp login --mcp` writes it (§7.4)
+  notes:                                    # as `zoeymcp onboard` writes it (§7.4)
     kind: oauth2
     token_url: https://auth.notes.example/token
     authorize_url: https://auth.notes.example/authorize
@@ -2951,8 +2966,9 @@ src/zoeymcp/
                 listener, the policy view, the review view, the app, from M6 drafts and the
                 policy diff's rows (policydiffview), from M8 the approvals queue's rows and
                 plans (approvalsview), and static/ (the page, its scripts, the review screen's,
-                the drift rows', the managed Policy page's and the Approvals page's scripts and
-                the stylesheet, the callback pages)
+                the drift rows', the managed Policy page's and the Approvals page's scripts, the
+                Zoey design system's tokens.css and zoey.css, the portal's app.css, the fonts
+                and the icon, the callback pages); licenses/ (the fonts' OFL 1.1 licences)
   toolkit/      the toolkit SDK: parameters, plans, slot rules, results, context, testing
   selftest/     the route self-test: cases, echo server, runner
   entrypoint/   the standard tier's launcher (env: pure checks, bridges' included; launcher: I/O)

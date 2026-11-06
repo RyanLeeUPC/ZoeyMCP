@@ -25,7 +25,12 @@ and lists the store's names; :func:`verdict` decides, in D.6's order, the first 
 The chain below the head is walked from the head down, each revision the parent its successor
 names; past the first that isn't, from ``oldest`` up, from the parent the head names for it, up to
 that one. So one bad file costs that revision alone; with two, the revisions between them can't be
-shown to chain either way and are quarantined too.
+shown to chain either way and are quarantined too. The walk up checks only that each revision
+names the one below it as its parent, so with two bad files it can keep a sibling of the real
+revision (from a mixed or forked backup of the same deployment, sealed under the same key) in its
+place: the head is unaffected, History and the rollback targets can show the sibling, and a
+rollback to it still goes through a plan the passkey holder confirms. An accepted limit
+(threat-model.md, "The volume is its own witness only partly"); a stricter walk isn't built.
 
 An acknowledged restore (K.3) numbers its revision one above the gateway's claim, not one above
 the head, and names the head in ``jumped_from``: the numbers between are never written. Its

@@ -519,8 +519,9 @@ At most:
 What stays open after M8: every `approve` tool not under `vault_approval` against T4 and T6, a
 relayed prompt included; a toolkit's isolation from other toolkits (D-55's remainder);
 standard-tier egress for the gateway and toolkits (D-56, D-52); an agent runtime's own connector
-or MCP-install features, which reach servers without the gateway (D-211 (3)); `vault_approval` on
-a credential-less upstream in the standard tier; HTTP-route toolkit slots, toolkit plans of more
+or MCP-install features, which reach servers without the gateway (D-211 (3);
+[clients.md](clients.md) says to turn them off); `vault_approval` on a credential-less upstream
+in the standard tier; HTTP-route toolkit slots, toolkit plans of more
 than one write, and tools that mirror parameters into `Mcp-Param-*` headers, none of which can be
 held. The accepted limits below name the rest.
 
@@ -732,7 +733,12 @@ first.
     `/state` deleted seeds again from `ZOEYMCP_CONFIG` under a new deployment, bringing back
     everything removed since the seed. The gateway's witness catches each of these when the
     gateway's volume wasn't restored with it (`policy_behind_witness`,
-    `policy_deployment_changed`); restoring both volumes from one snapshot hides it. An older copy
+    `policy_deployment_changed`); restoring both volumes from one snapshot hides it. With two
+    revision files broken, the start's walk up from the oldest kept revision checks only that each
+    names the one below it as its parent, so a revision from a mixed or forked backup of the same
+    deployment, sealed under the same key, can be kept in place of the real one: the head is
+    unaffected, but History and the rollback targets can show it, and a rollback to it still goes
+    through a plan the passkey holder confirms. An older copy
     of the anchor put back after a declarative period undoes the park, so the next managed start
     runs the parked head instead of resuming from the file; `policy_seed_ignored` then says so.
     Back up and restore the vault's volume on its own, and compare the head with your latest

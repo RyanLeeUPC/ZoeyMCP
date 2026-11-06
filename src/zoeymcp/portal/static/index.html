@@ -61,7 +61,7 @@
 <ol id="setup-steps" class="z-stepper" aria-label="Set up a passkey"><li>Setup code</li><li>Name</li><li>Sign in</li></ol>
 <div id="setup-code-step" class="z-panel">
 <div class="z-field">
-<label class="z-label" for="setup-code">Setup code<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-setup-code">?<span class="z-vh"> About setup codes</span></button><span class="z-help__pop" id="help-setup-code" popover><span>Print one on the host with <code>zoeymcp setup-code</code>. Each code enrols one passkey.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about setup codes</span></a></span></span></label>
+<label class="z-label" for="setup-code">Setup code<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-setup-code">?<span class="z-vh"> About setup codes</span></button><span class="z-help__pop" id="help-setup-code" popover><span>Print one on the host with <code>zoeymcp setup-code</code>. Each code enrols one passkey.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#263-the-first-passkey" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about setup codes</span></a></span></span></label>
 <input aria-describedby="setup-code-hint" id="setup-code" class="z-input z-input--code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="64">
 <p class="z-hint" id="setup-code-hint">Works once, for 15 minutes.</p>
 </div>
@@ -246,7 +246,7 @@
 <p id="review-instructions" class="said"></p>
 <p id="review-notes"></p>
 <p id="review-counts"></p>
-<p class="z-hint">Nothing is included until you include it.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-review">?<span class="z-vh"> About suggestions</span></button><span class="z-help__pop" id="help-review" popover><span>A suggestion is the server's own annotation, not a judgement by ZoeyMCP. <b>Allow</b> lets agents call the tool with no prompt; <b>Approve</b> asks you first.</span></span></span></p>
+<p class="z-hint">Nothing is included until you include it.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-review">?<span class="z-vh"> About suggestions</span></button><span class="z-help__pop" id="help-review" popover><span>A suggestion is the server's own annotation, not a judgement by ZoeyMCP. <b>Allow</b> lets agents call the tool with no prompt; <b>Approve</b> asks you first.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#268-mcp-servers-and-the-review-screen" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about reviewing tools</span></a></span></span></p>
 <div id="review-filters" class="z-filterbar">
 <div class="z-field z-filterbar__search">
 <label class="z-label" for="review-filter">Filter by name or title</label>
@@ -306,7 +306,7 @@ carries on by itself.</span></p>
 
 <section id="sessions" hidden>
 <h2 class="z-page__title">Sessions</h2>
-<div class="z-intro"><p>Every signed-in browser.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-sessions">?<span class="z-vh"> About sessions</span></button><span class="z-help__pop" id="help-sessions" popover><span>A session ends after 15 idle minutes, 4 hours in all, at sign-out, or when the vault restarts.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about sessions</span></a></span></span></p></div>
+<div class="z-intro"><p>Every signed-in browser.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-sessions">?<span class="z-vh"> About sessions</span></button><span class="z-help__pop" id="help-sessions" popover><span>A session ends after 15 idle minutes, 4 hours in all, at sign-out, or when the vault restarts.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#264-signing-in-and-sessions" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about sessions</span></a></span></span></p></div>
 <ul id="session-list" class="z-list"></ul>
 <div class="z-btn-row"><button type="button" id="end-others" class="z-btn z-btn--secondary">End the other sessions</button></div>
 <p class="z-status" role="status" data-outcome></p>
@@ -314,7 +314,7 @@ carries on by itself.</span></p>
 
 <section id="passkeys" hidden>
 <h2 class="z-page__title">Passkeys</h2>
-<div class="z-intro"><p>Every passkey that can sign in to this vault.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-passkeys">?<span class="z-vh"> About passkeys</span></button><span class="z-help__pop" id="help-passkeys" popover><span>A passkey works on the host name it was enrolled on, and each change asks for one. The last passkey can't be removed here: enrol another first, or use <code>zoeymcp setup-code --reset</code>.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about passkeys</span></a></span></span></p></div>
+<div class="z-intro"><p>Every passkey that can sign in to this vault.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-passkeys">?<span class="z-vh"> About passkeys</span></button><span class="z-help__pop" id="help-passkeys" popover><span>A passkey works on the host name it was enrolled on, and each change asks for one. The last passkey can't be removed here: enrol another first, or use <code>zoeymcp setup-code --reset</code>.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#265-passkeys-and-step-up" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about passkeys</span></a></span></span></p></div>
 <ul id="passkey-list" class="z-list"></ul>
 <div id="rename" class="z-rename" hidden>
 <p id="rename-which" class="z-label"></p>
@@ -342,7 +342,7 @@ carries on by itself.</span></p>
 
 <section id="secrets" hidden>
 <h2 class="z-page__title">Secrets</h2>
-<div class="z-intro"><p>Every secret in the vault's store, by name: a value is never shown.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-secrets">?<span class="z-vh"> About secrets</span></button><span class="z-help__pop" id="help-secrets" popover><span>To change a value, enter it again; each change asks for your passkey. A credential's tokens from Connect are the vault's own and aren't changed here.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#26-the-portal" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about secrets</span></a></span></span></p></div>
+<div class="z-intro"><p>Every secret in the vault's store, by name: a value is never shown.<span class="z-help"><button type="button" class="z-help__btn" popovertarget="help-secrets">?<span class="z-vh"> About secrets</span></button><span class="z-help__pop" id="help-secrets" popover><span>To change a value, enter it again; each change asks for your passkey. A credential's tokens from Connect are the vault's own and aren't changed here.</span> <a class="z-link z-link--external z-help-link" data-doc="operations.md#266-secrets" target="_blank" rel="noopener noreferrer">Learn more<span class="z-vh"> about secrets</span></a></span></span></p></div>
 <ul id="secret-list" class="z-list"></ul>
 <p class="z-status" role="status" data-outcome></p>
 <section class="z-section z-panel">

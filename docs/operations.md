@@ -788,8 +788,11 @@ gateway:
       servers: [notes]
 ```
 
-Configure the agent's MCP client with the server's URL and the token as a bearer header. For an
-agent that reads a JSON MCP config, typically:
+Configure the agent's MCP client with the server's URL and the token as a bearer header.
+[clients.md](clients.md) is the guide to connecting a client: the URL for each place an agent
+runs, the CA, keeping the token out of the agent's reach, clients configured from a command line
+or unable to send the header, and the runtime features that reach servers without the gateway.
+For an agent that reads a JSON MCP config, typically:
 
 ```json
 {"mcpServers": {"notes": {"type": "http", "url": "http://localhost:8090/s/notes/mcp",
@@ -1360,7 +1363,11 @@ forgets every job. The vault reads a report under the gateway's limits and recom
 the definition beside it: one pin that isn't its definition's refuses the whole report
 (`pin_mismatch`, logged at `critical`: the gateway's own review never reports that). A report larger
 than the cap the gateway's limits give (`max_tools_per_server` x 16 KiB, within 8 and 64 MiB) isn't
-read at all, and the review fails `review_too_large`, naming the cap. Its log lines:
+read at all, and the review fails `review_too_large`, naming the cap. A drifted tool's entry
+carries its reviewed definition beside the new one, and both count toward the cap: the gateway
+drops a reviewed copy only when that copy alone is over the cap for one definition, so a large
+server with many big drifted tools can fail `review_too_large` though it would fit without them.
+Its log lines:
 
 | Event | Fields |
 | --- | --- |
@@ -2207,6 +2214,8 @@ ledger and the policy, in that order below. Everything here can also be done wit
 §2, §3, §11, §21, §34), and recovery is done only from the host. In managed mode (§34) the page
 says so where a declarative page says to commit or reload, and the review screen saves.
 
+### 26.1 Turning it on
+
 **Before the first start.** The portal is on only when the policy has an `admin` block:
 
 ```yaml
@@ -2227,7 +2236,9 @@ sign in, `setup_pending` ("run zoeymcp setup-code in the vault's container", or 
 when the passkey file can't be verified). No code exists until you issue one. Without an `admin`
 block the log has `portal_disabled`.
 
-**Reaching it.** Open one of the listed origins exactly as written. An IP address such as
+### 26.2 Reaching it
+
+Open one of the listed origins exactly as written. An IP address such as
 `http://127.0.0.1:8081/` is sent on to `http://localhost:8081/` when that origin is listed;
 any other address gets 421. Through an SSH tunnel, forward the same port number
 (`ssh -N -L 8081:127.0.0.1:8081 host`): the browser's address must be a listed origin, port
@@ -2323,7 +2334,7 @@ Both snippets assume the proxy runs on the vault's host and reaches the publishe
 `admin.origins` set to `[http://localhost:8081, https://zoeymcp.example.com]`, both addresses
 work, each with its own passkeys.
 
-**The first passkey.**
+### 26.3 The first passkey
 
 1. Run `zoeymcp setup-code` (add `--wait` to see the enrolment from the host).
 2. Open the portal, choose **I have a setup code**, and type the code. Case, spaces and dashes
@@ -2342,6 +2353,8 @@ whoever uses it first, so watch for it: `passkey_enrolled` with `via: setup_code
 `setup_code_reset`) is logged at level `warning`, and `--wait` prints the passkey's
 fingerprint, origin and name. A portal that refuses a code you haven't used means someone else
 used it: see §1.
+
+### 26.4 Signing in and sessions
 
 **Daily use.** **Sign in with a passkey** asks for any passkey of this address; the browser
 offers the ones it holds. A session has two halves: an `HttpOnly` cookie whose name carries the
@@ -2365,6 +2378,8 @@ ends every one but yours. `zoeymcp sessions` lists the same from the host, one l
 including any you are signed in with, after asking. At most 8 sessions are kept; a ninth sign-in ends the
 one used least recently.
 
+### 26.5 Passkeys and step-up
+
 **Passkeys.** The Passkeys page lists every passkey that can sign in, by name and fingerprint:
 the host name it works on (its RP ID), its key type, whether it is synced (a passkey provider
 copies it between devices) or device-bound, how and on which origin it was enrolled, when, and
@@ -2386,7 +2401,9 @@ refuses with what it finds now, and you prepare again. Logs: `step_up_confirmed`
 the passkey that confirmed it), `step_up_refused` (the reason), `action_changed`,
 `passkey_renamed` and `passkey_removed`; names are never logged.
 
-**Secrets.** The Secrets page lists every secret in the store by name: what it may be used for
+### 26.6 Secrets
+
+The Secrets page lists every secret in the store by name: what it may be used for
 (the origins it is sent to; for an OAuth secret, its token endpoint and where its access tokens
 go; for an SMTP password, the server, sender and recipients), when it was set and last
 replaced, the master key it is encrypted under, and its health: `ok`, or what `zoeymcp health`
@@ -2409,6 +2426,8 @@ policy is reloaded between the summary and the passkey prompt and the binding mo
 refuses with what it finds now. A write the state volume refuses is kept in memory and said so,
 as with the CLI. Logs: `secret_set` and `secret_deleted` with `via: "portal"` (or `"socket"`),
 never the value.
+
+### 26.7 Home and credentials
 
 **Home and health.** Home is the checklist of what needs you: every finding `zoeymcp health`
 reports (§3), errors first, then warnings, then information, each with what to do: a button
@@ -2435,6 +2454,8 @@ the verifier the vault keeps. Logs: `oauth_login_started`, `oauth_login_complete
 `oauth_login_failed` (the reason), `oauth_flow_replaced`, `step_up_confirmed` with the action
 `oauth.complete` or `oauth.reset`, and `oauth_cache_reset`; never a pasted address, a flow ID or
 a provider's description.
+
+### 26.8 MCP servers and the review screen
 
 **MCP servers.** The MCP servers page is §11's onboarding by URL and review, in the browser (M7).
 It lists every remote and toolkit server in the policy (a toolkit says so; a bridge is a remote
@@ -2588,7 +2609,9 @@ expired (30 minutes), the vault restarted or it was already used: review again. 
 `client.servers` too, each then `policy_saved`), and `review_requested` with `owner: portal`;
 never a client secret, a fragment or a tool's definition.
 
-**Ledger.** The Ledger page is the vault's copy of the gateway's approval ledger (§21), newest
+### 26.9 Ledger
+
+The Ledger page is the vault's copy of the gateway's approval ledger (§21), newest
 first, 200 rows a page (**Older rows** for more). Each call shows when it was asked, its client,
 server and tool, the decision, the outcome and how many writes it asked for and sent, and under
 it each of its sends from the SMTP connectors' journals: the state, the SMTP code and the time,
@@ -2618,7 +2641,9 @@ each with **Show its rows**; a deleted one keeps only its head, as an anchor. A 
 can't read is shown as such, and can't be restarted until the state volume is fixed. Logs:
 `step_up_confirmed` with the action `ledger.restart`, then `ledger_reported_restarted`.
 
-**Approvals.** With `approvers.portal` in the policy, the Approvals page is the vault's queue of
+### 26.10 Approvals
+
+With `approvers.portal` in the policy, the Approvals page is the vault's queue of
 calls waiting for you (§36.3), and its nav entry shows how many. **Waiting** lists them oldest
 first: the ref, the server and tool, the client as the gateway reported it, held by the vault or
 relayed from the gateway, when it was asked and the absolute deadline in UTC, which approvers
@@ -2646,7 +2671,9 @@ vault_approval off. The gateway will ask instead of the vault; a compromised gat
 skip the approval. Calls waiting now are withdrawn." Logs: `step_up_confirmed` with the kind,
 then `tool_vault_approval_off` for each tool (§34).
 
-**Policy.** The Policy page shows the running policy, read-only: this deployment's policy is
+### 26.11 Policy
+
+The Policy page shows the running policy, read-only: this deployment's policy is
 declarative, so change it in its source (the file given with `--config`, `ZOEYMCP_CONFIG`, or
 standard input) and reload (§7); the page shows the reloaded policy at once. It is built field by
 field from a list of what may be shown, so a field a later version adds stays out until that
@@ -2697,6 +2724,8 @@ the connector's button again"). Its recipients, mail server and sender are bound
 and are the host's to change (§34, "Importing a change"). Logs: `step_up_confirmed` with the
 action `connector.limits`, then `policy_saved` with `write_kind: connector.limits`.
 
+### 26.12 Origins and recovery
+
 **A second origin.** Add it to `admin.origins` and reload (§7): it is served at once, and
 removing one ends its sessions. Another `http://localhost` port takes the passkeys you have. A
 different host name has its own: issue a setup code and redeem it **on the new origin**.
@@ -2710,7 +2739,9 @@ removes every other passkey and ends every session; the old authenticator may be
 enrol again. After restoring the state volume from a backup, check `zoeymcp passkeys`: a passkey
 removed since the backup is back, and works (§1, §6).
 
-**What a stolen session can and can't do.** A session is the cookie and the tab's token together; a
+### 26.13 What a stolen session can and can't do
+
+A session is the cookie and the tab's token together; a
 page on another `localhost` port receives the cookie (cookies ignore ports) but not the token, and
 gets 401. Someone holding both halves, within the session's limits, can read what the portal shows
 (names, bindings, health, the policy view and, in managed mode, its history and diffs, the
@@ -2725,6 +2756,8 @@ client or take it away, pause, resume or change a connector's limits, or roll ba
 each needs a fresh passkey prompt bound to that change. If you think a session was taken, **End the other
 sessions** (or `zoeymcp sessions end` from the host); the threat model
 ([threat-model.md](threat-model.md)) has the rest.
+
+### 26.14 Checks and refusals
 
 **Checks for a verify script.** None of these changes anything:
 
@@ -4324,7 +4357,7 @@ Every refusal names the file and the way on, as commands for your host. In short
 | Refused | What happened | Recovery |
 | --- | --- | --- |
 | `policy_seed_needs_host` | a used volume, no revisions and no anchor | switching to managed: `policy seed --state /state` once; otherwise restore `/state` |
-| `policy_store_missing` | `/state/policy` is gone, the anchor names revisions | restore `/state` from one backup, or reseed from your latest export |
+| `policy_store_missing` | `/state/policy` is gone, the anchor names revisions; or a reseed was killed part-way, its old head in `quarantine/` | restore `/state` from one backup, or reseed from your latest export; after a killed reseed, put the old store back first to keep what it retired (below, "A reseed killed part-way") |
 | `policy_anchor_missing` | the anchor beside `/state/policy` is gone | the same |
 | `policy_head_behind`, `policy_anchor_behind` | the head or the anchor was restored from an older backup | restore the whole of `/state` from one backup |
 | `tampered`, `policy_anchor_tampered`, `head_dangling`, `files_above_head`, `policy_deployment_mismatch` | a file changed, or put back, outside the vault | restore `/state`, or reseed from your latest export |
@@ -4459,6 +4492,41 @@ shows, so no number is used twice. The deployment ID is kept while the anchor ve
 one is made when it doesn't. `--reason TEXT` is kept with the revision. A reseed that fails before
 its new head is written puts the old store back as it was; if even that fails, it says which files
 are still in quarantine (`reseed_incomplete`).
+
+**A reseed killed part-way.** A reseed whose process is killed, or whose host crashes, after its
+first move and before its new head is written puts nothing back: the old head is in quarantine,
+the anchor may already be the reseed's, and the start is refused `policy_store_missing`. Nothing
+is deleted. A reseed with `--new-ratchet` keeps nothing from the old store: run it again. A reseed
+planned against the old head can't simply be run again: with the old head in quarantine there is
+nothing to plan against, so it is refused `reseed_needs_new_ratchet`, and `--new-ratchet` would
+forget what the old store retired. Put the old store back first, with the vault stopped. List
+what is there:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml stop vault
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps --entrypoint ls vault -l /state/policy/quarantine /state/policy/revisions
+```
+
+If `revisions/` holds a file numbered above every `<n>.reseeded.json`, the reseed had written its
+new revision but not its head: remove it (`docker compose -f deploy/compose.hardened.yaml run
+--rm --no-deps --entrypoint rm vault /state/policy/revisions/0000000025.json`, with its own name),
+or the start is refused `files_above_head`. Then move the head and every revision back, each
+revision under its number written with 10 digits, and start the vault:
+
+```sh
+docker compose -f deploy/compose.hardened.yaml run --rm --no-deps --entrypoint sh vault -c 'cd /state/policy && mv quarantine/head.reseeded.json head.json && for f in quarantine/[0-9]*.reseeded.json; do [ -e "$f" ] || continue; n=${f#quarantine/}; mv "$f" "revisions/$(printf %010d "${n%%.*}").json"; done'
+docker compose -f deploy/compose.hardened.yaml up -d vault
+```
+
+In the standard tier the service is `zoeymcp` (`docker compose -f deploy/compose.yaml stop
+zoeymcp`), and each `run` adds `--user 10001:10001` after `--no-deps`. The vault then runs the old
+head again, and the reseed can be planned against it as before. The commands above are for a
+quarantine that held no `.reseeded` files from an earlier reseed: if it did, this reseed's are
+the copies with the highest suffix (`head.reseeded.2.json`, `<n>.reseeded.2.json`, and so on),
+which you move back one `mv` each. The anchor the reseed wrote names the old head's revision,
+under its deployment, unless the volume showed a higher number when the reseed ran (a file in
+quarantine above the head, say): then the start is refused `policy_head_behind`, and the ways on
+are a restore of `/state` from one backup or the reseed with `--new-ratchet`.
 
 ### What writes a revision
 

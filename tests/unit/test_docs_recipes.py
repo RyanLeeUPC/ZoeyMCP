@@ -16,6 +16,13 @@ Approvals section (§19, its managed-mode bullet) and threat-model.md's managed-
 scoped-claim sentence is in threat-model.md, the README and operations.md's §36, and no public
 doc calls the gateway's approvals vault-enforced (T-14). Line breaks and indentation don't count:
 each text is compared with its whitespace collapsed.
+
+Every operations.md section with a recipe that edits the policy and reloads or recreates the vault
+names its managed form too (an export, an edit and ``policy import``, or the portal's own change,
+"in managed mode"), or is one of the sections whose recipes §34's general rule covers, which
+opens "Managed policy" (M6 design P.1, D-218). The check is per section: a new section with such a
+recipe and no managed form fails, and so does a section that loses its managed form; a second
+recipe in a section that already names one isn't told apart.
 """
 
 from __future__ import annotations
@@ -169,6 +176,87 @@ def test_the_bridge_how_to_is_the_profile_in_each_tier() -> None:
     [route] = standard.routes
     assert route.upstream == "unix:/run/zoeymcp-bridge-fetch/mcp.sock"
     assert (route.allow_insecure_upstream, route.program) == (False, None)
+
+
+# A recipe that edits the policy and reloads or recreates the vault, in the guide's wordings
+# ("check and reload", "**Reload** the policy", "recreate the vault", `kill -s HUP vault`, ...).
+RECIPE = re.compile(
+    r"(?:\band|\bthen|,|\bor|\bfirst)\s+(?:reload|recreate (?:the vault|it|the container))\b"
+    r"|\*\*Reload\*\*|\breload the policy\b|\brecreat(?:e|ing) the vault\b"
+    r"|\bkill -s HUP vault\b|\bup -d vault\b",
+    re.IGNORECASE,
+)
+# Its managed form beside it: the host's import, or what managed mode does instead.
+MANAGED_FORM = re.compile(r"\bpolicy import\b|\bin managed mode\b", re.IGNORECASE)
+# §34's general rule, the first words of "Managed policy".
+GENERAL_RULE = (
+    'In managed mode, every "edit the policy and reload" in this guide is an export, an edit and '
+    "`zoeymcp policy import`, or the portal's own change where there is one."
+)
+# The sections the general rule covers: troubleshooting tables whose fix for a code is "fix the
+# policy and reload", where a managed form on every row would repeat the rule.
+COVERED_BY_THE_RULE = (
+    "Logging in",
+    "Credential health: `health`, `oauth status` and `oauth reset`",
+    "Codes",
+)
+
+
+def numbered_sections() -> list[str]:
+    """Every ``## <n>. <title>`` heading's title in operations.md, in order."""
+    text = OPERATIONS.read_bytes().decode("utf-8")
+    return re.findall(r"^## \d+\. (.+)\n", text, re.MULTILINE)
+
+
+def test_the_general_rule_opens_managed_policy() -> None:
+    assert flat(section("Managed policy")).startswith(f"**{GENERAL_RULE}**")
+
+
+def test_every_reload_recipe_has_its_managed_form_beside_it() -> None:
+    """A section that tells you to edit the policy and reload or recreate the vault also says
+    what to do in managed mode, unless it is one the general rule covers (D-218)."""
+    missing = [
+        title
+        for title in numbered_sections()
+        if title != "Managed policy"
+        and title not in COVERED_BY_THE_RULE
+        and RECIPE.search(flat(section(title)))
+        and not MANAGED_FORM.search(flat(section(title)))
+    ]
+    assert missing == [], "a reload recipe with no managed form beside it (§34's general rule)"
+
+
+@pytest.mark.parametrize("title", COVERED_BY_THE_RULE)
+def test_a_section_the_rule_covers_still_needs_it(title: str) -> None:
+    """Each listed section still has a recipe and no managed form of its own: one that gains a
+    managed form, or loses its recipe, comes off the list."""
+    text = flat(section(title))
+    assert RECIPE.search(text)
+    assert MANAGED_FORM.search(text) is None
+
+
+def test_the_recipe_guard_finds_what_it_is_for() -> None:
+    for said in (
+        "fix the policy (scope), reload, or `oauth reset`",
+        "list its `host:port` in `egress_private` and reload (§7)",
+        "4. **Reload** the policy (§7).",
+        "remove the client and reload the policy.",
+        "uncomment them and recreate the vault",
+        "commit it and recreate the container",
+        "For a policy file, `$c kill -s HUP vault` (§7).",
+        "applied by recreating the vault: `$c up -d vault`.",
+    ):
+        assert RECIPE.search(said), said
+    for said in (
+        "A reload that fails in some other way logs `reload_failed`",
+        "the gateway reloads its view",
+        "after a restart, sign in again",
+        "No reload: the policy names the secret",
+    ):
+        assert RECIPE.search(said) is None, said
+    assert MANAGED_FORM.search("an export, an edit and `zoeymcp policy import`")
+    assert MANAGED_FORM.search("In managed mode, **Pause** on the Policy page")
+    assert MANAGED_FORM.search("managed policy, §34") is None
 
 
 PLACES = {

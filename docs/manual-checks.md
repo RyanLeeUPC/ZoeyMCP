@@ -35,7 +35,7 @@ and again after any change to that feature's page code or to what the vault send
 | 24 | the review screen's prompts and resources |
 | 25-30 | the Approvals queue: a hostile text, approve, cancel, a stale decision, deny and expiry, the idle limit |
 | 31, 32 | the MCP servers page and the review screen in managed mode: **Hold in the vault** and **Turn off vault approval** |
-| 33 | Home's approvals item, its findings and the nav's count |
+| 33 | Home's approvals item, its findings and the nav's badge |
 | 34 | the Ledger page's two chains |
 | Live Telegram | the Telegram approver against Telegram itself (its own section below) |
 
@@ -81,7 +81,7 @@ for yours):
 
 ```sh
 mkdir -m 700 state
-export ZOEYMCP_MASTER_KEY="$(zoeymcp keygen)"
+export "$(zoeymcp keygen | head -n 1)"   # its first line: ZOEYMCP_MASTER_KEY=...
 cat > portal.yaml <<'EOF'
 version: 1
 mode: declarative
@@ -102,10 +102,11 @@ view.
 
 1. **ES256 is chosen.** With a platform authenticator (Windows Hello, Touch ID, a phone's
    passkey provider), and then with a security key that also does EdDSA: open
-   `http://localhost:8081/`, choose **I have a setup code**, type a fresh code, name the passkey,
-   **Create the passkey**. Pass: the enrolment answer (Network panel) and `passkey_enrolled` in
-   the log show `"alg": "ES256"`, and the prompt opened from the click (no `NotAllowedError` from
-   a missing user gesture). Remove the passkey afterwards with `zoeymcp passkeys --remove`.
+   `http://localhost:8081/`, choose **I have a setup code**, type a fresh code, **Use this code**,
+   name the passkey, **Create the passkey**. Pass: the enrolment answer (Network panel) and
+   `passkey_enrolled` in the log show `"alg": "ES256"`, and the prompt opened from the click (no
+   `NotAllowedError` from a missing user gesture). For the next authenticator, take the code
+   from `zoeymcp setup-code --reset --state ./state`: enrolling with it removes this passkey.
    In Chromium and Edge:
    `test_session.py::test_item_1_the_enrolment_answer_and_the_log_say_es256`, over the virtual
    authenticator; by hand there: the platform authenticator and the security key (the virtual
@@ -143,12 +144,14 @@ view.
    through an in-process TLS front (and a passkey enrolled on that name then signing in there);
    by hand there: real LAN `https` with a certificate the machine trusts.
 8. **Step-up shows the summary first** (OAuth connect, step-up). With two passkeys enrolled, open
-   **Passkeys**, choose **Rename** on one and give a new name. Pass: the dialog shows what the
+   **Passkeys**, choose **Rename** in one passkey's row, type a name in **New name**, which opens
+   in that row, and choose the row's **Rename**. Pass: the dialog shows what the
    vault will do (the passkey, its name now, the new name) before any passkey prompt; choose
    **Confirm with your passkey** and cancel the browser's prompt: the dialog says the prompt was
    cancelled, **Close** it, and the passkey keeps its name (no `passkey_renamed` in the log).
    Then, with the policy below, open **Credentials**, choose **Connect** on `demo`, paste
-   `http://127.0.0.1/callback?code=x&state=wrong` and choose **Check the address**. Pass: the
+   `http://127.0.0.1/callback?code=x&state=wrong` into **Paste the address it sends you to** and
+   choose **Check the address**. Pass: the
    dialog says the address belongs to another login, and no passkey prompt opens. In Chromium and
    Edge:
    `test_stepup.py::test_item_8_a_rename_shows_its_summary_first_and_a_cancelled_prompt_changes_nothing`
@@ -157,9 +160,9 @@ view.
    in the browser's own passkey dialog, which an automated browser doesn't show.
 9. **The authorization link** (OAuth connect). Add the policy below to `portal.yaml`, restart the
    vault and sign in. Open **Credentials** and choose **Connect** on `demo`, then the dialog's
-   link. Pass: it opens example.com in a new tab, and in that tab's console `window.opener` is
-   `null`; the Network panel shows the request to example.com without a `Referer` header. Close
-   the tab and choose **Cancel** in the dialog. In Chromium and Edge:
+   link, **Open the provider's sign-in page in a new tab**. Pass: it opens example.com in a new
+   tab, and in that tab's console `window.opener` is `null`; the Network panel shows the request
+   to example.com without a `Referer` header. Close the tab and choose **Cancel** in the dialog. In Chromium and Edge:
    `test_stepup.py::test_item_9_the_link_opens_a_tab_with_no_opener_and_no_referrer` (example.com
    answered in the browser, never reached); by hand there: nothing.
 
@@ -210,9 +213,9 @@ view.
     browser resets the refused sign-out's connection (the Windows event loop's connection-reset
     fault of register D-142), so by hand there: the item in Edge, if a Windows result is wanted.
 11. **Trusted Types.** In Chrome or Edge (which enforce Trusted Types), with the Console open,
-    run a full session: set up with a code, sign in with the new passkey, open Sessions, end the
-    other sessions, sign out. Pass: no Trusted Types or Content Security Policy violation in the
-    console. In Chromium and Edge:
+    run a full session: set up with a code, **Sign in with the new passkey**, open **Sessions**,
+    **End the other sessions**, **Sign out**. Pass: no Trusted Types or Content Security Policy
+    violation in the console. In Chromium and Edge:
     `test_session.py::test_item_11_a_full_session_makes_no_violation` (the other sessions are a
     second browser signed in with the same passkey); by hand: nothing.
 12. **Two `http://localhost` ports.** Add `http://localhost:8082` to `admin.origins` and restart
@@ -244,7 +247,7 @@ view.
     - within a few seconds the portal's tab asks for the passkey, its summary saying where and
       when the sign-in came back and "Confirm only if you have just finished approving in the
       provider's tab; if you haven't, cancel."; confirm, and **Credentials** shows `notes`
-      connected.
+      connected (its row tagged OK).
 
     The fake as started above answers `/authorize` with an immediate redirect, so the navigation
     starts and ends on the portal and the browser sends `zoeymcp-8081-session` anyway. For the
@@ -364,8 +367,10 @@ view.
     which trusts the CA and installs the name map (`python -c "$LAUNCHER" onboard-check/ca.pem
     onboard-check/hooks.json "" "" vault --config portal.yaml ...`, `LAUNCHER` printed by
     `python -c 'from tests.acceptance.procs import LAUNCHER; print(LAUNCHER)'`), and set up a
-    passkey. Add `https://mcp.notes.example:9444/mcp` by URL, "This server is on my network"
-    unticked, with no client ID. Make fragment 1, then choose **Copy** and paste into a text
+    passkey. On **MCP servers**, under **Add a server by URL**, enter
+    `https://mcp.notes.example:9444/mcp`, leave **This server is on my network** unticked and
+    **Client ID** (under **More options**) empty, and choose **Discover**; the plan's **Register
+    and make the YAML** (a passkey) makes fragment 1. Choose **Copy** and paste into a text
     editor. Pass: the pasted text is the shown text, line for line and character for character,
     the 2,048-character URL whole on its line; the same after choosing the compose indent, and for
     fragment 2. In Chromium and Edge:
@@ -420,7 +425,8 @@ view.
       **Decline** on one tool adds that one alone to the declines the policy already has (only a
       tool the policy doesn't include has **Decline**, so take two such tools out of `declined:`
       first, decline one, and the other stays out); and after another fragment for the server is
-      committed and reloaded, **Generate** on the old review is refused `review_stale` (this needs
+      committed and reloaded, **Generate** on the old review is refused `review_stale`, on the
+      line under the review's buttons (this needs
       a reload with the vault running: in the compose tiers a reload is a recreate, which drops
       the review held in memory).
 
@@ -444,19 +450,22 @@ view.
     - restarted with `--switch large --switch markup_echo --drift description`, **Review again**
       and **Accept the new definition** on `echo`, **Save**: the dialog's row shows both pins
       and "re-pinned: you read both definitions", and "No restart needed"; confirmed, the vault's
-      log line `step_up_confirmed` names the kind `tool.repin`, the answer says the gateway takes
-      the new view within seconds, and the server's row is `reviewed` again;
+      log line `step_up_confirmed` names the kind `tool.repin`, the line under the review's
+      buttons says the gateway takes the new view within seconds, and the server's row reads
+      Reviewed again;
     - **Review again**, change `add` and `slow` from approve to allow, **Save**: the dialog lists
       the two moves first, each with "approve -> allow. Calls to ... will run with no prompt" and
       every chunk of its definition below it (the first naming the pin), the markup in `echo`'s
       shown as text if it is moved too; **Close** (a cancel) writes nothing: the Policy page
       still shows revision 3's tools; **Save** again and confirm: both are allow;
-    - on the MCP servers page, **Allow read_01 without asking**: the dialog shows read_01's move
+    - on the MCP servers page, open the server's **Tool actions (N)** and choose **Allow read_01
+      without asking**: the dialog shows read_01's move
       and its definition as pinned; confirmed, it is allow (`step_up_confirmed` names
       `tool.allow`);
-    - restart the vault (it holds reviews in memory only), sign in, and on the MCP servers page
-      **Allow read_02 without asking**: the page reviews the server first, then opens the same
-      dialog for read_02; **Close** writes nothing;
+    - restart the vault (it holds reviews in memory only), sign in, and on the MCP servers page,
+      under the server's **Tool actions (N)**, **Allow read_02 without asking**: the page
+      reviews the server first, then opens the same dialog for read_02; **Close** writes
+      nothing;
     - **Review again**, untick `read_02` (approve, read-only), **Save** and confirm; then
       **Review again**, **Clear** and **Select suggested**: `read_02`, dropped and once approve,
       comes back ticked at approve, every read-only tool the policy includes at its
@@ -501,12 +510,12 @@ view.
       history's newest revision is the rollback with its target, and the vault's log has
       `step_up_confirmed` with `policy.rollback` and `policy_rolled_back` with `target`;
     - **Roll back to revision N** on the revision that added `ci-runner`: refused before any
-      passkey prompt, "Rolling back to revision N brings back client ci-runner, removed in
-      revision M: only the host can, with zoeymcp policy rollback and --allow-revive.", and
-      nothing is written;
+      passkey prompt, on the line under **History**'s list, "Rolling back to revision N brings
+      back client ci-runner, removed in revision M: only the host can, with zoeymcp policy
+      rollback and --allow-revive.", and nothing is written;
     - **Roll back to revision N** on the revision with `add` and `slow` at allow, now wider than
-      the head: refused before any passkey prompt, "The portal can't widen ... through a
-      rollback", with the host's export and import, and nothing is written.
+      the head: refused before any passkey prompt, on the same line, "The portal can't widen ...
+      through a rollback", with the host's export and import, and nothing is written.
 
     In Chromium and Edge:
     `test_managed.py::test_item_21_the_policy_page_names_the_head_and_lists_the_history`,
@@ -532,8 +541,9 @@ view.
       row still reads paused); **Resume** again and confirm: sending;
     - "Sends a day" set to 50, **Save limits**: the dialog's row reads "20 -> 50: raised";
       confirmed, the field shows 50; with 0 in a field, **Save limits** is refused before any
-      passkey prompt, and with the same values again, "Nothing would change.";
-    - a second browser signed in on the same origin pauses it first: this browser's **Resume**
+      passkey prompt, and with the same values again, "Nothing would change.", each on the line
+      under **Connectors**' list;
+    - a second browser signed in on the same origin pauses it first: this browser's **Pause**
       draws the page again, saying the policy moved to revision N since it showed revision M
       ("press the connector's button again"), and nothing more is written.
 
@@ -553,31 +563,34 @@ view.
     or Content Security Policy violation throughout), set up a passkey and open **MCP servers**.
     Pass:
     - **Add a server by URL** with `https://mcp.notes.example:9444/mcp` and, in **More options**,
-      client ID `public-check` and no secret (a public client): the row reads "discovered, nothing
-      sent or stored yet", and the plan's one button, like the row's, is **Save**, with no
-      registration and no passkey prompt before it; **Cancel** it (nothing is written);
+      **Client ID** `public-check` and no secret (a public client), then **Discover**: the row
+      reads "Discovered, nothing sent or stored yet", and the plan's one button, like the row's,
+      is **Save**, with no registration and no passkey prompt before it; **Cancel this
+      onboarding** (nothing is written);
     - **Add a server by URL** with `https://mcp.notes.example:9444/mcp` and no client ID: the
       plan's one button is **Register its client**; registered with a passkey, the page shows no
-      fragment, and the row reads `needs_save` with **Save**; no text says to commit, reload,
-      generate or make a fragment;
+      fragment, and the row reads "Registered, its credential, route and server not saved yet"
+      (`needs_save`) with **Save**; no text says to commit, reload, generate or make a fragment;
     - **Save**: the dialog's first row reads "Revision 2, from 1 (by the seed, ...: 1 is the
       head)", then `credentials.notes`, `routes.notes` and `gateway.servers.notes`, each "added
-      (wider)", and "No restart needed"; confirmed, the row reads `needs_connect` with no reload
-      or restart;
+      (wider)", and "No restart needed"; confirmed, the row reads "In the policy, not connected
+      yet" (`needs_connect`) with no reload or restart;
     - **Connect** (accept the certificate warning for `https://localtest.me:9443` once): the
       provider sends the tab back to the portal, a passkey confirms, and the page queues the
       server's review by itself; Home's attention list names the tools nobody reviewed, with
       **Review**; the row, not reviewed yet, already has **Give to clients**;
-    - the review, `echo` included as allow and `add` as approve, **Save**: the answer ends "Then
-      give notes to each client that should reach it: Give to clients, on the MCP servers page",
-      and the row reads reviewed, served to no client yet; Home's list no longer names notes;
+    - the review, `echo` included as allow and `add` as approve, **Save**: the line under the
+      review's buttons ends "Then give notes to each client that should reach it: Give to
+      clients, on the MCP servers page", and the row reads Reviewed, served to no client yet;
+      Home's list no longer names notes;
     - **Give to clients**: one box, `agent1`, unticked; ticked, **Save**: the dialog's row reads
       "agents holding client agent1's token can call notes's 2 included tools"; **Close** writes
       nothing; **Save** again and confirm: the row says served to agent1; unticked and saved
       again, the dialog shows `notes removed` and no row ending "(wider)";
     - **Give to clients** with the boxes shown, while a second browser signed in on the same
       origin gives notes to `agent1` first: this browser's `agent1` ticked and **Save** is
-      refused before any passkey prompt ("press Save again to plan it on revision N"), the boxes
+      refused before any passkey prompt ("press Save again to plan it on revision N", on the
+      line under the servers), the boxes
       are drawn again with `agent1` ticked, and nothing more is written;
     - the vault's log has `step_up_confirmed` with `onboard.register`, `policy.save`,
       `oauth.complete`, `policy.save` and `client.servers`, in that order;
@@ -615,7 +628,7 @@ view.
     choose **Review again** on the server's row. Pass:
     - after the tools, the rows sit under the headings **Prompts**, **Resource templates** and
       **Resources**, each row with its include box, **Show definition** and **Decline**, and no
-      allow or approve control; the counts and the footer's "N tools changed" count tools only;
+      allow or approve control; the counts and the action bar's "N tools changed" count tools only;
     - the three hostile rows show every hidden character as the visible mark the vault gives it
       and `<IMPORTANT>` as text, in the title, the description and an argument's title and
       description (the prompt), the description (the template), and the title and description
@@ -677,9 +690,9 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     (`"End of approval request 0000000000000000"` as a value), and, as `nightly` on a plain
     `approve` tool (`add`), a relayed prompt; also a relayed text with a line imitating the vault's
     "Rendered by the gateway" line, which the vault refuses `text_refused` before anyone is asked.
-    In Chrome or Edge with the Console open, open **Approvals**. Pass: each waiting row opens to
-    its whole text, the long line wrapped and not cut, the imitated frame line inside the JSON as
-    a value; the call carrying the bidi mark was refused `held_text_refused` before anyone was
+    In Chrome or Edge with the Console open, open **Approvals**. Pass: **Open** on each waiting
+    row shows its whole text, the long line wrapped and not cut, the imitated frame line inside
+    the JSON as a value; the call carrying the bidi mark was refused `held_text_refused` before anyone was
     asked (no hidden character is shown, as a mark or otherwise) and never appears; the relayed
     row carries "Relayed from the gateway" and the vault's line at the top of its text; the
     imitation never appears; no Trusted Types or Content Security Policy violation.
@@ -692,8 +705,8 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     each naming its value's pointer, and a value past the text budget refused; no dialog or
     request off loopback); by hand there: nothing.
 26. **Approve with a passkey** (the Approvals page, M8). Item 25's queue, Telegram on (the fake
-    Bot API). **Approve** a row. Pass: the dialog shows the whole text and "Approve runs this
-    one call, exactly as shown."; one passkey prompt; the answer is 200; the fake's message for
+    Bot API). **Open** a row and choose **Approve**. Pass: the dialog shows the whole text and
+    "Approve runs this one call, exactly as shown."; one passkey prompt; the answer is 200; the fake's message for
     that ref becomes "Approval request <ref>: approved HH:MM UTC in the portal. Sent: ..." with no
     buttons; the row moves to **Decided
     recently** reading "approved here HH:MM UTC; sent: ok"; the agent's `check_approval` returns
@@ -707,7 +720,8 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     on the Ledger page) and, for `check_approval`, `test_pending_then_check_approval` (a real
     gateway and agent); by hand there: nothing.
 27. **Cancel at the passkey prompt** (the Approvals page, M8; item 8's cancel path for the queue).
-    **Approve** a waiting row, then cancel the browser's passkey prompt. Pass: nothing is decided,
+    **Open** a waiting row, choose **Approve** and **Confirm with your passkey**, then cancel the
+    browser's passkey prompt. Pass: nothing is decided,
     the row stays under **Waiting**, no `approval_decided` line; **Approve** again works.
     Scriptable as: reject the WebAuthn call, assert the row's state is still waiting and no
     `step_up_confirmed` line.
@@ -731,7 +745,8 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     `test_item_28_an_approval_replaces_a_change_prepared_in_another_tab` (a duplicated tab's
     passkey rename stands in for the review save, which the queue's declarative vault doesn't
     offer: one prepared action per session either way); by hand there: nothing.
-29. **Deny with a session; an expired row** (the Approvals page, M8). **Deny** a waiting row.
+29. **Deny with a session; an expired row** (the Approvals page, M8). **Open** a waiting row and
+    choose **Deny**.
     Pass: no passkey prompt, the row moves to Decided recently as denied, the agent's
     `check_approval` reads "declined: the operator declined this call; nothing was sent" (a call
     still blocking is told "refused: the operator declined this call"), nothing reaches the fake
@@ -758,10 +773,11 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     by hand there: nothing.
 31. **Turn-on: Hold in the vault** (the MCP servers page and the review screen in managed mode,
     M8). The M8 setup in managed mode, `echo` in `approve` and not yet in `vault_approval`. Pass:
-    the server page's **Hold in the vault** on `echo` shows, before any passkey prompt, the plan's
-    lines ("fake.echo: vault_approval on.", one line for `desk`, `nightly` and `batch` each, then
-    the route's credential sentence); confirmed, `echo` is held. The review screen's box of the
-    same name shows the same lines in its save's plan. With `approvers` removed (a host import),
+    on the MCP servers page, the server's **Hold in the vault: echo** (under its **Tool actions
+    (N)**) shows, before any passkey prompt, the plan's lines ("fake.echo: vault_approval on.",
+    one line for `desk`, `nightly` and `batch` each, then the route's credential sentence);
+    confirmed, `echo` is held. The review screen's box of the same name shows the same lines in
+    its save's plan. With `approvers` removed (a host import),
     both controls are disabled, with "Set up an approver first (Telegram or the Approvals queue):
     a host step, operations.md §36.2".
     Scriptable as: open the server page, click Hold, assert the plan's lines before
@@ -771,9 +787,9 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     `test_item_31_the_review_screens_box_shows_the_same_plan` and
     `test_item_31_with_no_approver_both_controls_are_disabled` (a vault started with no
     `approvers`); by hand there: nothing.
-32. **Turn-off and its refusals** (managed mode, M8). With `echo` held: **Turn off vault approval**
-    prepares `tool.vault_approval_off`, and the dialog shows "echo: vault_approval off. The gateway
-    will ask instead of the vault; a compromised gateway could then skip the approval. Calls
+32. **Turn-off and its refusals** (managed mode, M8). With `echo` held: **Turn off vault approval:
+    echo** (under the server's **Tool actions (N)**) prepares `tool.vault_approval_off`, and the
+    dialog shows "echo: vault_approval off. The gateway will ask instead of the vault; a compromised gateway could then skip the approval. Calls
     waiting now are withdrawn." whole; one passkey changes that one tool, and the log has
     `tool_vault_approval_off`. Held again, a review save that unticks the box, and one that drops
     `echo` from `include`, are refused `vault_approval_off_needs_its_own_step` before any passkey
@@ -789,8 +805,8 @@ server is `notes` and whose approve tool is `write` (the items' `fake` and `echo
     off with one passkey each); by hand there: nothing.
 33. **Home and the badge** (Home, M8). With two calls waiting, Home lists "2 approvals waiting: the
     oldest must be answered by HH:MM UTC" with **Open the queue**, and the nav's Approvals entry
-    shows 2; with no gateway status report (the gateway stopped) the item still shows. After a
-    vault kill with a call waiting and another approved and running (the fake's `slow`, also held,
+    shows 2 in its badge (its accessible name "Approvals (2)"); with no gateway status report
+    (the gateway stopped) the item still shows. After a vault kill with a call waiting and another approved and running (the fake's `slow`, also held,
     with a long count), the restarted vault's Home shows `approvals_withdrawn_at_start` (cleared by
     opening Approvals) and `approvals_outcome_unknown` naming the running call's ref. Scriptable
     as: open Home, assert the items and their actions; assert the badge's number.
@@ -877,10 +893,10 @@ keep no token: everything below runs in a temporary directory.
    replaced by yours, the route's placeholder by any value) and the `admin` block of the setup
    above, sign in to the portal, and set `google-client-secret` on the **Secrets** page. On
    **Credentials**, choose **Connect** on `google-calendar`, open the link, approve, copy the
-   address the tab lands on (it doesn't load) and paste it. Pass: the dialog shows the summary,
-   the passkey confirms it, and the result says granted
-   `https://www.googleapis.com/auth/calendar.readonly`; **Credentials** shows the credential
-   `ok`; `zoeymcp oauth status google-calendar` agrees; the vault's log has
+   address the tab lands on (it doesn't load), paste it and choose **Check the address**. Pass:
+   the dialog shows the summary, the passkey confirms it, and the result, on the line under the
+   credentials, says granted `https://www.googleapis.com/auth/calendar.readonly`; **Credentials** shows the credential
+   tagged OK; `zoeymcp oauth status google-calendar` agrees; the vault's log has
    `oauth_login_completed` and no code, token or pasted address.
 3. **A refresh.** With the client secret and a refresh token of a throwaway grant:
 
@@ -911,7 +927,7 @@ such server is available, record it as not run.
 1. **Discovery and registration from the CLI.** A vault with an admin socket and a policy with
    an `admin` block (the setup above, without `--admin-socket none`, on Linux or in the hardened
    compose file), and its gateway:
-   `zoeymcp login --mcp <the server's URL> --name live > onboard-live-1.yaml`. Pass: the plan
+   `zoeymcp onboard <the server's URL> --name live > onboard-live-1.yaml`. Pass: the plan
    shows the resource from the protected-resource metadata, the issuer and its metadata URL,
    PKCE S256, the scopes and where they came from, a `Registration endpoint` row with the
    server's endpoint and a `Client` row reading `registered at <host> once you confirm (dynamic
@@ -921,16 +937,17 @@ such server is available, record it as not run.
    server's metadata, `onboard_planned` and `onboard_registered`, and no client ID, secret or
    registration access token.
 2. **Connect, `tools/list` and the review from the CLI.** Commit fragment 1, reload, run the same
-   command again. Pass: the comparison finds nothing changed, the sign-in link opens the
-   provider's consent page, the pasted address completes the sign-in, and the review's counts are
+   command again. Pass: the comparison finds nothing changed, the connect's link opens the
+   provider's consent page, the pasted address completes the connect, and the review's counts are
    printed; `review live --via vault --choose --suggest` writes a choices file whose names are the
    server's tools.
 3. **The same in the portal.** On a fresh state directory and the policy as it was before item 1
    (without fragment 1, or the URL is compared, not onboarded): **MCP servers**, **Add a server
-   by URL**, the plan, **Register and make the YAML** with the passkey, **Copy**, the commit and
-   reload, **Connect** (through the portal's callback, the passkey at completion), the review the
-   page queues, **Generate** with one tool included, the commit and reload. Pass: each step as
-   §26 of operations.md describes it, and the row ends `reviewed`. Then an agent lists the
+   by URL**, **Discover**, the plan, **Register and make the YAML** with the passkey, **Copy**,
+   the commit and reload, **Connect** (through the portal's callback, the passkey at
+   completion), the review the page queues, **Generate** with one tool included, the commit and
+   reload. Pass: each step as
+   §26 of operations.md describes it, and the row ends Reviewed. Then an agent lists the
    included tool through the gateway and calls it.
 
 ## Results
