@@ -135,9 +135,26 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
       - run: uv sync --locked --all-extras --group browser --python 3.13
-      - run: uv run --locked pytest tests/browser
+      # A load the runner itself refused, net::ERR_NO_BUFFER_SPACE (WSAENOBUFS on the hosted
+      # runner; the suite leaves about 600 sockets in TIME_WAIT, far below the port range), fails
+      # a test the portal didn't. Only then the failed tests run once more, warned, and must pass;
+      # any other failure, or one on the second run, fails the job (D-260).
+      - name: Browser tests
+        shell: bash
         env:
           ZOEYMCP_BROWSER: msedge
+        run: |
+          mkdir -p test-results
+          set +e
+          uv run --locked pytest tests/browser 2>&1 | tee test-results/edge-run-1.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 0 ]; then exit 0; fi
+          if [ "$status" -ne 1 ] || ! grep -q "ERR_NO_BUFFER_SPACE" test-results/edge-run-1.log; then
+            exit "$status"
+          fi
+          echo "::warning title=D-260::The runner refused a loopback load (ERR_NO_BUFFER_SPACE); running the failed tests once more"
+          uv run --locked pytest tests/browser --last-failed --last-failed-no-failures none
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
