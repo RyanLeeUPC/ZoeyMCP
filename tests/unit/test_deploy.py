@@ -764,17 +764,19 @@ def test_the_hardened_bridges_uid_is_the_images_bridge_user() -> None:
     assert BRIDGE_UID not in {env.VAULT_UID, env.GATEWAY_UID, env.INIT_UID, EGRESS_UID}
 
 
-def test_the_official_image_drops_the_distrusted_root() -> None:
-    """Q42, TI-9: the official image disables emSign ECC Root CA - G3 in Debian's store, and the
-    build fails unless the line was there to disable and the root is gone afterwards; the image
-    smoke and verify.sh --bridge check the built store."""
-    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "grep -qx 'mozilla/emSign_ECC_Root_CA_-_G3.crt' /etc/ca-certificates.conf" in dockerfile
-    assert "s|^mozilla/emSign_ECC_Root_CA_-_G3\\.crt$|!&|" in dockerfile
-    assert "update-ca-certificates --fresh" in dockerfile
-    assert "test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem" in dockerfile
-    verify = (BRIDGE_EXAMPLE / "verify.sh").read_text(encoding="utf-8")
-    assert 'name = "emSign_ECC_Root_CA_-_G3"' in verify
+def test_the_distrusted_root_stays_out_of_the_store() -> None:
+    """Q42, TI-9, D-145: emSign ECC Root CA - G3 is out of the official image's Debian store,
+    since the base's ca-certificates (20250419+deb13u1, D-249) no longer carries it, so the
+    Dockerfile has nothing to remove; the image smoke and verify.sh --bridge check the built store
+    by the root's fingerprint, in the bundle and in what the default context loads, never by a
+    file name Debian may drop."""
+    assert "emSign" not in (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    fingerprint = 'ROOT = "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"'
+    for script in (ROOT / "scripts" / "smoke-image.sh", BRIDGE_EXAMPLE / "verify.sh"):
+        text = script.read_text(encoding="utf-8")
+        assert fingerprint in text, script
+        assert "get_ca_certs(binary_form=True)" in text, script
+        assert "too few roots" in text, script
 
 
 def test_the_official_image_builds_reproducibly() -> None:

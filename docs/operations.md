@@ -4034,8 +4034,8 @@ same image is the hardened tier's bridge container and the whole standard contai
 prefix and nothing else: the official layers in order plus one, the same `User`, `Entrypoint`,
 `Cmd`, `Env` and `WorkingDir`, an added layer that touches only `/opt/stdio-server`, both
 zoeymcp environments byte for byte the official ones, nothing setuid, setgid or world-writable,
-the labels, and emSign ECC Root CA - G3 out of the Debian store (the official image drops it,
-since a bridge's program may read that store). In the standard tier the vault runs from this
+the labels, and emSign ECC Root CA - G3 out of the Debian store (Debian removed it, and a
+bridge's program may read that store). In the standard tier the vault runs from this
 image, so it **must** pass. A Node server is built the same way (`npm ci --ignore-scripts` from a
 lock with integrity hashes, in the build stage), with a pinned Node runtime copied into
 `/opt/node`, which `verify.sh --bridge --node` allows. Keep any package registry out of the

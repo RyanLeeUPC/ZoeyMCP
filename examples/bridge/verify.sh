@@ -9,7 +9,7 @@
 #      /etc/ld.so.preload, shared library, base interpreter or standard library;
 #   4. both zoeymcp environments are byte for byte the official image's, so no new .pth;
 #   5. nothing it added is setuid, setgid or world-writable;
-#   6. emSign ECC Root CA - G3 isn't in the image's Debian store (the official Dockerfile drops it);
+#   6. emSign ECC Root CA - G3 isn't in the image's Debian store (Debian removed it; D-145);
 #   7. the labels: the official io.zoeymcp.source-tree, and io.zoeymcp.bridge.command naming an
 #      executable file under /opt/stdio-server (or /opt/node).
 # Checks 1, 2, 3 and 5 read layer metadata and tar listings without running the image; 4, 6 and 7
@@ -118,22 +118,23 @@ cmp -s "$work/official.txt" "$work/image.txt" || {
 
 step "6: emSign ECC Root CA - G3 isn't in the Debian store"
 roots='
-import os, ssl, sys
-name = "emSign_ECC_Root_CA_-_G3"
-source = f"/usr/share/ca-certificates/mozilla/{name}.crt"
+import hashlib, ssl, sys
+# emSign ECC Root CA - G3 by its SHA-256 fingerprint (GHSA-6q48-6c7w-9gw2, D-145): Debian
+# removed it in ca-certificates 20250419+deb13u1, so no file name is left to look for.
+ROOT = "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"
+bundle = open("/etc/ssl/certs/ca-certificates.crt").read()
+blocks = bundle.split("-----BEGIN CERTIFICATE-----")[1:]
+pems = ["-----BEGIN CERTIFICATE-----" + b.split("-----END CERTIFICATE-----")[0]
+        + "-----END CERTIFICATE-----" for b in blocks]
+stored = {hashlib.sha256(ssl.PEM_cert_to_DER_cert(p)).hexdigest() for p in pems}
+context = ssl.create_default_context().get_ca_certs(binary_form=True)
+loaded = {hashlib.sha256(der).hexdigest() for der in context}
+if len(stored) < 100 or len(loaded) < 100:
+    sys.exit("the store holds too few roots for this check to prove anything")
 problems = []
-if not os.path.isfile(source):
-    sys.exit(f"{source} is gone: this check would prove nothing; name the root again")
-body = "".join(l for l in open(source) if not l.startswith("-----")).replace("\n", "")
-bundle = open("/etc/ssl/certs/ca-certificates.crt").read().replace("\n", "")
-if body in bundle:
+if ROOT in stored:
     problems.append("the root is in /etc/ssl/certs/ca-certificates.crt")
-if os.path.lexists(f"/etc/ssl/certs/{name}.pem"):
-    problems.append(f"/etc/ssl/certs/{name}.pem exists")
-if f"!mozilla/{name}.crt" not in open("/etc/ca-certificates.conf").read().splitlines():
-    problems.append("/etc/ca-certificates.conf does not disable it")
-loaded = ssl.create_default_context().get_ca_certs()
-if any("emSign ECC Root CA - G3" in str(cert.get("subject")) for cert in loaded):
+if ROOT in loaded:
     problems.append("the default SSL context loads it")
 if problems:
     sys.exit("; ".join(problems))

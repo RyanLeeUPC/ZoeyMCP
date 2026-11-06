@@ -2432,7 +2432,7 @@ calls wait is `tests/acceptance/test_held_crash.py` (Linux).
   | X20 | **Bounded.** Onboardings (4), requests per discovery (9), review jobs (2, one per server), the review poll (1 waiter), report size (from the gateway's limits: 8 MiB at the defaults, 64 MiB at most), bridge sessions (8 by default), ids in flight per program (256), standard-tier bridges (8 per container), tunnels (256 per listener, 1,024 in all), allowlist waiters (2) |
   | X21 | **Confinement is hardened-only, and said so.** No egress role in `compose.yaml`; the allowlists are never served on the link socket; a standard-tier bridge is a launcher child with an allowlisted environment (never the master key, `ZOEYMCP_CONFIG` or another bridge's variables), a uid of its own and a tmpfs of its own for its socket and work directory, and the docs and health (`program_unconfined`) call it unconfined; the launcher's box checks are unchanged |
   | X22 | **Restart is clean.** Onboardings, allowances, review jobs and bridge sessions are memory only; the only thing an interrupted onboarding can leave is a stored client secret no policy names, which health reports as unreferenced; a standard-tier bridge's exit never stops the vault or the gateway |
-  | X23 | **Root stores.** The vault's discovery, registration, token, revocation and route clients verify against `certifi`; a bridge's program uses its own runtime's store, usually the image's Debian store, from which the official image drops emSign ECC Root CA - G3; the egress role verifies nothing (it tunnels TLS); the gateway talks only to the vault |
+  | X23 | **Root stores.** The vault's discovery, registration, token, revocation and route clients verify against `certifi`; a bridge's program uses its own runtime's store, usually the image's Debian store, which no longer carries emSign ECC Root CA - G3 (Debian removed it in ca-certificates 20250419+deb13u1; the image smoke checks it by fingerprint); the egress role verifies nothing (it tunnels TLS); the gateway talks only to the vault |
   | X24 | **Onboarding state is owned.** An onboarding belongs to the CLI or one portal session; another owner's onboarding answers as an unknown one; a session's end cancels it |
 
   M7 restates five earlier invariants: **G2**, the gateway has two more vault paths, the review-job
@@ -3133,7 +3133,7 @@ listens on a Unix socket in a directory of its own rather than on a loopback por
 | Whether `egress_proxy` is the role (2026-10-22) | an explicit `egress_proxy_kind: own \| role` (default `own`), read at start, rather than a guess from the role's traffic | §4.6, §4.7 |
 | Revocation (formerly open) | on delete only, best effort, never blocking, only to the token endpoint's origin | §4.3 |
 | The review screen's script | a separate file with a line cap of its own | §7.1 |
-| The emSign ECC Root CA - G3 | dropped from the official image's Debian store, which a bridge's program may read | §8.2 (X23) |
+| The emSign ECC Root CA - G3 | out of the official image's Debian store, which a bridge's program may read (Debian removed it; the image smoke checks) | §8.2 (X23) |
 | Mutation floors for new modules | a new module joins under the overall gate; the next commit writes its measured floor | §8.2 |
 | The milestone split | onboarding by URL first, then the egress role and the bridge, both inside M7, before M6 | §11 |
 

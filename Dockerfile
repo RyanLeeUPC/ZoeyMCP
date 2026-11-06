@@ -74,15 +74,6 @@ LABEL org.opencontainers.image.title="ZoeyMCP" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       io.zoeymcp.source-tree="${SOURCE_TREE}"
 
-# Debian's store still carries emSign ECC Root CA - G3, whose intermediates had compromised keys
-# (GHSA-6q48-6c7w-9gw2; certifi dropped it in 2026.10.19). The vault trusts certifi alone, but a
-# bridge's program reads this store, so the root goes here: the build fails if its line isn't
-# there to disable, or if the root is still in the store afterwards.
-RUN grep -qx 'mozilla/emSign_ECC_Root_CA_-_G3.crt' /etc/ca-certificates.conf \
- && sed -i 's|^mozilla/emSign_ECC_Root_CA_-_G3\.crt$|!&|' /etc/ca-certificates.conf \
- && update-ca-certificates --fresh >/dev/null \
- && test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem
-
 # One uid per role, and 10003 for the standard tier's PID 1 once it drops root: it owns no files.
 # 10005 is a hardened bridge's (examples/bridge/compose.bridge.yaml) and 10006 the egress role's
 # (the hardened tier's egress-proxy profile); neither owns any file. A standard-tier bridge runs as

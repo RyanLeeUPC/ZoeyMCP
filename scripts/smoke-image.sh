@@ -397,21 +397,29 @@ found="$(docker run --rm --network none -u 0 --entrypoint find "$image" / -xdev 
 [ -z "$found" ] || fail "the bridge user owns files: $found"
 
 step "the Debian store has no emSign ECC Root CA - G3 (Q42), which a bridge's program would read"
-# The root's own file stays, so the check can't pass by finding nothing to look for.
+# By fingerprint, over the bundle and what the default context loads; a store too small to hold
+# the usual roots fails, so the check can't pass by finding nothing to look at.
 distrusted='
-import os, ssl, sys
-name = "emSign_ECC_Root_CA_-_G3"
-source = f"/usr/share/ca-certificates/mozilla/{name}.crt"
-if not os.path.isfile(source):
-    sys.exit(f"{source} is gone: name the root again")
-body = "".join(l for l in open(source) if not l.startswith("-----")).replace("\n", "")
-if body in open("/etc/ssl/certs/ca-certificates.crt").read().replace("\n", ""):
-    sys.exit("the root is in /etc/ssl/certs/ca-certificates.crt")
-if os.path.lexists(f"/etc/ssl/certs/{name}.pem"):
-    sys.exit(f"/etc/ssl/certs/{name}.pem exists")
-loaded = ssl.create_default_context().get_ca_certs()
-if any("emSign ECC Root CA - G3" in str(cert.get("subject")) for cert in loaded):
-    sys.exit("the default SSL context loads it")
+import hashlib, ssl, sys
+# emSign ECC Root CA - G3 by its SHA-256 fingerprint (GHSA-6q48-6c7w-9gw2, D-145): Debian
+# removed it in ca-certificates 20250419+deb13u1, so no file name is left to look for.
+ROOT = "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"
+bundle = open("/etc/ssl/certs/ca-certificates.crt").read()
+blocks = bundle.split("-----BEGIN CERTIFICATE-----")[1:]
+pems = ["-----BEGIN CERTIFICATE-----" + b.split("-----END CERTIFICATE-----")[0]
+        + "-----END CERTIFICATE-----" for b in blocks]
+stored = {hashlib.sha256(ssl.PEM_cert_to_DER_cert(p)).hexdigest() for p in pems}
+context = ssl.create_default_context().get_ca_certs(binary_form=True)
+loaded = {hashlib.sha256(der).hexdigest() for der in context}
+if len(stored) < 100 or len(loaded) < 100:
+    sys.exit("the store holds too few roots for this check to prove anything")
+problems = []
+if ROOT in stored:
+    problems.append("the root is in /etc/ssl/certs/ca-certificates.crt")
+if ROOT in loaded:
+    problems.append("the default SSL context loads it")
+if problems:
+    sys.exit("; ".join(problems))
 '
 docker run --rm --network none --entrypoint /usr/local/bin/python3 "$image" -I -c "$distrusted" \
     || fail "emSign ECC Root CA - G3 is still trusted"
