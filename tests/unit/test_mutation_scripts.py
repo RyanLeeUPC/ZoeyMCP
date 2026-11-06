@@ -71,8 +71,35 @@ def test_a_heavy_module_is_cut_by_last_digit() -> None:
     assert [p.pattern() for p in whole] == ["zoeymcp.toolkit.plan.*"]
 
 
+def test_a_cut_modules_digits_follow_their_measured_time() -> None:
+    """D-226: digits are weighted by DIGIT_WEIGHTS, not as ten equal tenths."""
+    name = "zoeymcp.common.policy.check"
+    measured = shard.DIGIT_WEIGHTS[name]
+    cut = {p.digits: p.weight for p in shard.parts(shard.modules(), 16) if p.module == name}
+    for digit, seconds in zip(shard.DIGITS, measured, strict=True):
+        assert cut[digit] == pytest.approx(shard.WEIGHTS[name] * seconds / sum(measured))
+    assert len(set(measured)) > 1  # the measured digits differ, so this isn't an even cut
+
+
+def test_a_cut_module_without_digit_weights_is_cut_evenly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shard, "DIGIT_WEIGHTS", {})
+    name = "zoeymcp.common.policy.check"
+    cut = [p.weight for p in shard.parts(shard.modules(), 16) if p.module == name]
+    assert cut == [pytest.approx(shard.WEIGHTS[name] / 10)] * 10
+
+
+def test_a_shards_digits_of_one_module_are_one_pattern() -> None:
+    for group in shard.shards(shard.modules(), 16):
+        modules = [part.module for part in group]
+        assert len(modules) == len(set(modules))
+        for part in group:
+            assert list(part.digits) == sorted(part.digits)
+
+
 def test_the_weights_name_real_modules() -> None:
     assert set(shard.WEIGHTS) <= set(shard.modules())
+    assert set(shard.DIGIT_WEIGHTS) <= set(shard.WEIGHTS)
+    assert all(len(each) == len(shard.DIGITS) for each in shard.DIGIT_WEIGHTS.values())
 
 
 def test_the_workflows_shards_are_balanced() -> None:
@@ -122,6 +149,23 @@ def test_weights_come_from_the_shard_that_ran_each_module(tmp_path: Path) -> Non
     meta("mutation-shard-2", "zoeymcp.vault.store", {"b__mutmut_1": 4.0})
     with pytest.raises(ValueError, match="two shards ran b__mutmut_1"):
         weights.weights(tmp_path)
+
+
+def test_the_weights_cli_prints_digit_weights_for_heavy_modules(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-226: a module with at least 1% of the time gets its time per last digit."""
+    heavy = {f"a__mutmut_{n}": float(n % 10) for n in range(1, 21)}
+    write_meta(tmp_path, "mutation-shard-0", "zoeymcp.vault.store", dict.fromkeys(heavy, 1), heavy)
+    light = {"b__mutmut_3": 0.5}
+    write_meta(tmp_path, "mutation-shard-1", "zoeymcp.vault.peer", dict.fromkeys(light, 1), light)
+    assert weights.by_digit(tmp_path)["zoeymcp.vault.store"] == [2 * d for d in range(10)]
+    monkeypatch.setattr(sys, "argv", ["mutation-weights.py", str(tmp_path)])
+    assert weights.main() == 0
+    out = capsys.readouterr().out
+    assert '"zoeymcp.vault.store": 90,' in out
+    assert '"zoeymcp.vault.store": (0, 2, 4, 6, 8, 10, 12, 14, 16, 18),' in out
+    assert out.count('"zoeymcp.vault.peer"') == 1  # 0.5 of 90.5 s is under 1%: no digit row
 
 
 def test_the_merge_has_mutmuts_exit_code_table() -> None:
