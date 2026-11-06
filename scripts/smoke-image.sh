@@ -1,4 +1,6 @@
 #!/bin/sh
+# Every `A && B || fail` here ends in fail or stdb_fail, which exit, so SC2015's case cannot arise.
+# shellcheck disable=SC2015
 # Smoke-test a built image: the vault the way the hardened tier runs it (read-only, no capabilities,
 # no-new-privileges, non-root), then the standard tier from deploy/compose.yaml. Both tiers reach
 # a fake upstream (tests/fakes/run_mcp_server.py) with one tools/list and one tools/call. Both
@@ -1698,6 +1700,7 @@ quick_first_key="$quick_gateway_key"
 quick_hardened run --rm --no-deps -T vault check >"$work/out" 2>&1 \
     || { cat "$work/out"; fail "managed, hardened tier: check refused §30 step 3's policy"; }
 cat "$work/out"
+# shellcheck disable=SC2016 # the literal text the check prints
 grep -qx '\$ZOEYMCP_CONFIG: ok (0 errors, 2 warnings)' "$work/out" \
     && grep -q '^warning mode: the vault seeds its first revision from this document' "$work/out" \
     && grep -q '^warning gateway.clients.agent1.servers: no servers' "$work/out" \
@@ -2375,7 +2378,7 @@ EOF
     # egress-out, the egress role's way out, in the hardened tier.
     sends_fakes() {
         sends_net=default
-        [ "$1" = standard ] || sends_net=egress-out
+        [ "$1" = standard ] || sends_net='egress-out'
         cat <<EOF
   fake-smtp:
     image: $fake_image
@@ -3297,7 +3300,7 @@ print("orphan", pid, "reaped by PID 1")
 
     # --- B: the standard shape --------------------------------------------------------------------
     step "bridge, standard: compose config passes with the bridges' hashes unset"
-    ZOEYMCP_MASTER_KEY=unset \
+    ZOEYMCP_MASTER_KEY='unset' \
         docker compose -f "$deploy/compose.yaml" -f "$examples/bridge/compose.standard.yaml" config -q \
         || fail "compose config failed on the standard bridge override"
     stdb_project="zoeymcp-smoke-stdbridge-$$"

@@ -58,8 +58,11 @@ jobs:
           tar -xzf "$sc" --strip-components=1 -C "$bin" "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
           tar -xzf "$al" -C "$bin" actionlint
           cd "$GITHUB_WORKSPACE"
-          git ls-files -z '*.sh' | xargs -0 "$bin/shellcheck"
-          PATH="$bin:$PATH" "$bin/actionlint"
+          # Both run, so one commit shows every finding.
+          status=0
+          git ls-files -z '*.sh' | xargs -0 "$bin/shellcheck" || status=1
+          PATH="$bin:$PATH" "$bin/actionlint" || status=1
+          exit "$status"
 
   test:
     name: tests (Python ${{ matrix.python }})
