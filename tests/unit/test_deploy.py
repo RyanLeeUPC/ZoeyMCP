@@ -942,10 +942,59 @@ def test_the_example_images_pin_the_same_uv() -> None:
     [root] = _UV_STAGE.findall((ROOT / "Dockerfile").read_text(encoding="utf-8"))
     assert "@sha256:" in root
     dependabot = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
-    assert "directories: [/, /examples/bridge, /examples/derived-image]" in dependabot
+    directories = "directories: [/, /examples/bridge, /examples/derived-image, /.github/pins]"
+    assert directories in dependabot
     for example in ("bridge", "derived-image"):
         path = ROOT / "examples" / example / "Dockerfile"
         assert _UV_STAGE.findall(path.read_text(encoding="utf-8")) == [root]
+
+
+_PIN_STAGE = re.compile(r"^FROM (\S+):\S+@sha256:[0-9a-f]{64} AS (\w+)$", re.MULTILINE)
+# Each image .github/pins/Dockerfile pins, and the files that carry a copy of it.
+_PIN_CONSUMERS = {
+    "caddy": [
+        "deploy/compose.yaml",
+        "deploy/compose.hardened.yaml",
+        "examples/existing-stack/compose.yaml",
+    ],
+    "squid": ["scripts/smoke-image.sh"],
+    "buildkit": [".github/actions/build-image/action.yml", ".github/workflows/ci.yml"],
+    "syft": [".github/actions/build-image/action.yml"],
+    "grype": [".github/actions/build-image/action.yml"],
+    "skopeo": [".github/workflows/release.yml"],
+}
+
+
+def test_every_image_pin_matches_the_stub() -> None:
+    """D-162: the images no updater reads in place are pinned in .github/pins/Dockerfile, which
+    Dependabot bumps; every copy must then say the same, so its pull request fails until each
+    named file is changed with it."""
+    stub = (ROOT / ".github" / "pins" / "Dockerfile").read_text(encoding="utf-8")
+    pins = {match[2]: match[0].split()[1] for match in _PIN_STAGE.finditer(stub)}
+    assert sorted(pins) == sorted(_PIN_CONSUMERS)
+    stale: list[str] = []
+    for stage, files in _PIN_CONSUMERS.items():
+        image = pins[stage].split(":")[0]
+        copy = re.compile(re.escape(image) + r":[^\s\"']+@sha256:[0-9a-f]{64}")
+        for name in files:
+            found = copy.findall((ROOT / name).read_text(encoding="utf-8"))
+            assert found, f"{name} no longer pins {image}: drop it from _PIN_CONSUMERS"
+            stale += [f"{name}: {ref}, not {pins[stage]}" for ref in found if ref != pins[stage]]
+    assert stale == []
+
+
+def test_the_workflows_set_up_the_dockerfiles_uv() -> None:
+    """D-162: setup-uv's version is a literal no updater reads, so it follows the root
+    Dockerfile's uv stage, which Dependabot bumps."""
+    [root] = _UV_STAGE.findall((ROOT / "Dockerfile").read_text(encoding="utf-8"))
+    version = root.split(":")[1].split("@")[0]
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert re.findall(r'^  UV_VERSION: "([^"]+)"$', ci, re.MULTILINE) == [version]
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        for literal in re.findall(r"^\s+version: (.+)$", text, re.MULTILINE):
+            uv = literal.strip('"')
+            assert uv in {version, "${{ env.UV_VERSION }}"}, f"{path.name}: {uv}"
 
 
 def _bridge_names(command: list[str]) -> list[str]:

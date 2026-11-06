@@ -14,7 +14,9 @@ updates:
   - package-ecosystem: docker
     # The official image, and the two example images' uv stages, pinned like the root's: one
     # group, so all three move in one pull request (a unit test keeps the three pins equal).
-    directories: [/, /examples/bridge, /examples/derived-image]
+    # .github/pins holds the images pinned where no updater reads (compose anchors, the smoke
+    # script, workflow literals); the same test names their copies to change with it (D-162).
+    directories: [/, /examples/bridge, /examples/derived-image, /.github/pins]
     schedule:
       interval: weekly
     cooldown:

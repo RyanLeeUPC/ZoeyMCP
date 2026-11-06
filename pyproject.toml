@@ -228,13 +228,15 @@ only_mutate = [
 pytest_add_cli_args_test_selection = ["tests/unit"]
 # The hygiene, import-guard, mutation-script and Windows-list tests check the repository itself
 # (the lock, the smoke script, scripts/, the workflows), which mutmut only partly copies; so does
-# test_deploy.py's distrusted-root test, which reads scripts/smoke-image.sh (D-145).
+# test_deploy.py's distrusted-root test, which reads scripts/smoke-image.sh (D-145), and its
+# image-pin test, which reads it too (D-162).
 pytest_add_cli_args = [
     "--ignore=tests/unit/test_source_hygiene.py",
     "--ignore=tests/unit/test_import_guards.py",
     "--ignore=tests/unit/test_mutation_scripts.py",
     "--ignore=tests/unit/test_portal_windows_list.py",
     "--deselect=tests/unit/test_deploy.py::test_the_distrusted_root_stays_out_of_the_store",
+    "--deselect=tests/unit/test_deploy.py::test_every_image_pin_matches_the_stub",
 ]
 # docs: test_refusal_doc.py checks operations.md's table against the refusal catalogue;
 # release: test_deploy.py checks the digest list.
